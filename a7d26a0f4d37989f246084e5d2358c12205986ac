@@ -1,0 +1,27 @@
+.github/workflows/release-npm.yml
+  5228086430eb2882 36,78,86,103
+.github/workflows/release-python.yml
+  5228086430eb2882 32,38,58,64,84,90,102,108
+.github/workflows/ci.yml
+  5228086430eb2882 14-16,31,40-42,59,68-70,85-87,102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "a7d26a0f4d37989f246084e5d2358c12205986ac",
+  "prompts": {
+    "5228086430eb2882": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f56a6515-4b2d-43ca-a235-34b660f84cb8",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 541,
+      "total_deletions": 339,
+      "accepted_lines": 541,
+      "overriden_lines": 0
+    }
+  }
+}
