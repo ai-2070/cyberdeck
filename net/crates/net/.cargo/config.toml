@@ -1,0 +1,24 @@
+# Cargo configuration for optimized builds
+#
+# Note: target-cpu=native generates binaries optimized for the current CPU.
+# For portable binaries, remove or comment out the rustflags below.
+
+# Uncomment for maximum performance on the local machine:
+# [build]
+# rustflags = ["-C", "target-cpu=native"]
+
+# Environment-specific overrides
+[target.'cfg(target_os = "linux")']
+# Linux-specific optimizations (e.g., for io_uring support in future)
+
+[target.'cfg(target_os = "macos")']
+# macOS-specific settings
+
+# Profile overrides for release builds
+[profile.release]
+# LTO and codegen-units are already set in Cargo.toml
+# Additional flags can be added here if needed
+
+# Alias for running benchmarks with native CPU
+[alias]
+bench-native = "bench --release"

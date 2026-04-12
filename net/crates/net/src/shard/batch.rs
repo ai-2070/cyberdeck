@@ -1,0 +1,376 @@
+//! Batch aggregation with adaptive sizing.
+//!
+//! The batch worker continuously drains events from a shard's ring buffer,
+//! assembles them into batches, and dispatches them to the adapter.
+//!
+//! # Adaptive Sizing
+//!
+//! Batch size is dynamically adjusted based on ingestion velocity:
+//! - High velocity → larger batches → fewer adapter calls → higher throughput
+//! - Low velocity → smaller batches → lower latency → faster flush
+
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+use crate::config::BatchConfig;
+use crate::event::{Batch, InternalEvent};
+
+/// Adaptive batch size calculator.
+///
+/// Tracks recent ingestion velocity and adjusts batch size accordingly.
+pub struct AdaptiveBatcher {
+    /// Configuration.
+    config: BatchConfig,
+    /// Current target batch size.
+    current_batch_size: usize,
+    /// Velocity samples: (timestamp, cumulative_count).
+    velocity_samples: VecDeque<(Instant, usize)>,
+    /// Total events seen (for velocity calculation).
+    total_events: usize,
+    /// Last recalculation time.
+    last_recalc: Instant,
+}
+
+impl AdaptiveBatcher {
+    /// Create a new adaptive batcher.
+    pub fn new(config: BatchConfig) -> Self {
+        Self {
+            current_batch_size: config.min_size,
+            velocity_samples: VecDeque::with_capacity(100),
+            total_events: 0,
+            last_recalc: Instant::now(),
+            config,
+        }
+    }
+
+    /// Record events and get the current target batch size.
+    ///
+    /// Call this each time events are drained from the ring buffer.
+    #[inline]
+    pub fn record_events(&mut self, count: usize) -> usize {
+        self.total_events += count;
+
+        if !self.config.adaptive {
+            return self.config.max_size;
+        }
+
+        let now = Instant::now();
+
+        // Add sample
+        self.velocity_samples.push_back((now, self.total_events));
+
+        // Remove old samples outside the window
+        let window_start = now - self.config.velocity_window;
+        while let Some(&(ts, _)) = self.velocity_samples.front() {
+            if ts < window_start {
+                self.velocity_samples.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // Recalculate batch size periodically (not on every call)
+        if now.duration_since(self.last_recalc) > Duration::from_millis(10) {
+            self.recalculate_batch_size();
+            self.last_recalc = now;
+        }
+
+        self.current_batch_size
+    }
+
+    /// Get the current target batch size.
+    #[inline]
+    pub fn batch_size(&self) -> usize {
+        self.current_batch_size
+    }
+
+    /// Calculate events per second based on recent samples.
+    fn calculate_velocity(&self) -> f64 {
+        if self.velocity_samples.len() < 2 {
+            return 0.0;
+        }
+
+        let (oldest_ts, oldest_count) = *self.velocity_samples.front().unwrap();
+        let (newest_ts, newest_count) = *self.velocity_samples.back().unwrap();
+
+        let elapsed = newest_ts.duration_since(oldest_ts);
+        if elapsed.is_zero() {
+            return 0.0;
+        }
+
+        let events = newest_count.saturating_sub(oldest_count);
+        events as f64 / elapsed.as_secs_f64()
+    }
+
+    /// Recalculate the optimal batch size based on recent velocity.
+    fn recalculate_batch_size(&mut self) {
+        let velocity = self.calculate_velocity();
+
+        // Scale batch size with velocity
+        // At 1M events/sec → batch size ~5,000
+        // At 10M events/sec → batch size ~50,000 (capped at max)
+        let target = if velocity > 0.0 {
+            ((velocity / 200.0) as usize).clamp(self.config.min_size, self.config.max_size)
+        } else {
+            self.config.min_size
+        };
+
+        // Smooth transitions using exponential moving average
+        // new = (old * 3 + target) / 4
+        self.current_batch_size = (self.current_batch_size * 3 + target) / 4;
+
+        // Ensure we stay within bounds
+        self.current_batch_size = self
+            .current_batch_size
+            .clamp(self.config.min_size, self.config.max_size);
+    }
+
+    /// Reset the batcher state.
+    pub fn reset(&mut self) {
+        self.velocity_samples.clear();
+        self.total_events = 0;
+        self.current_batch_size = self.config.min_size;
+        self.last_recalc = Instant::now();
+    }
+}
+
+/// Batch worker state.
+///
+/// Manages batch assembly for a single shard.
+pub struct BatchWorker {
+    /// Shard ID.
+    shard_id: u16,
+    /// Adaptive batcher.
+    batcher: AdaptiveBatcher,
+    /// Current batch being assembled.
+    current_batch: Vec<InternalEvent>,
+    /// Sequence number for the next batch.
+    next_sequence: u64,
+    /// Time when the current batch started.
+    batch_start: Option<Instant>,
+    /// Configuration.
+    config: BatchConfig,
+}
+
+impl BatchWorker {
+    /// Create a new batch worker.
+    pub fn new(shard_id: u16, config: BatchConfig) -> Self {
+        let capacity = config.max_size;
+        Self {
+            shard_id,
+            batcher: AdaptiveBatcher::new(config.clone()),
+            current_batch: Vec::with_capacity(capacity),
+            next_sequence: 0,
+            batch_start: None,
+            config,
+        }
+    }
+
+    /// Add events to the current batch.
+    ///
+    /// Returns a completed batch if thresholds are met, or None if more events are needed.
+    pub fn add_events(&mut self, events: Vec<InternalEvent>) -> Option<Batch> {
+        if events.is_empty() {
+            return self.check_timeout();
+        }
+
+        // Start batch timer if this is the first event
+        if self.current_batch.is_empty() {
+            self.batch_start = Some(Instant::now());
+        }
+
+        // Record events and get target batch size
+        let target_size = self.batcher.record_events(events.len());
+
+        // Add events to current batch
+        self.current_batch.extend(events);
+
+        // Check if we should flush
+        if self.current_batch.len() >= target_size {
+            return Some(self.flush());
+        }
+
+        // Check timeout
+        self.check_timeout()
+    }
+
+    /// Check if the batch should be flushed due to timeout.
+    fn check_timeout(&mut self) -> Option<Batch> {
+        if self.current_batch.is_empty() {
+            return None;
+        }
+
+        if let Some(start) = self.batch_start {
+            if start.elapsed() >= self.config.max_delay {
+                return Some(self.flush());
+            }
+        }
+
+        None
+    }
+
+    /// Force flush the current batch, even if thresholds aren't met.
+    pub fn flush(&mut self) -> Batch {
+        let events = std::mem::replace(
+            &mut self.current_batch,
+            Vec::with_capacity(self.config.max_size),
+        );
+
+        let sequence_start = self.next_sequence;
+        self.next_sequence += events.len() as u64;
+        self.batch_start = None;
+
+        Batch::new(self.shard_id, events, sequence_start)
+    }
+
+    /// Check if there are pending events.
+    pub fn has_pending(&self) -> bool {
+        !self.current_batch.is_empty()
+    }
+
+    /// Get the number of pending events.
+    pub fn pending_count(&self) -> usize {
+        self.current_batch.len()
+    }
+
+    /// Get the current target batch size.
+    pub fn target_batch_size(&self) -> usize {
+        self.batcher.batch_size()
+    }
+
+    /// Get time until the current batch times out.
+    pub fn time_until_timeout(&self) -> Option<Duration> {
+        self.batch_start.map(|start| {
+            let elapsed = start.elapsed();
+            self.config.max_delay.saturating_sub(elapsed)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn make_events(count: usize, shard_id: u16) -> Vec<InternalEvent> {
+        (0..count)
+            .map(|i| InternalEvent::from_value(json!({"i": i}), i as u64, shard_id))
+            .collect()
+    }
+
+    #[test]
+    fn test_batch_size_threshold() {
+        let config = BatchConfig {
+            min_size: 10,
+            max_size: 100,
+            max_delay: Duration::from_secs(10),
+            adaptive: false,
+            velocity_window: Duration::from_millis(100),
+        };
+
+        let mut worker = BatchWorker::new(0, config);
+
+        // Add 50 events - should not trigger flush (target is 100 when adaptive=false)
+        let batch = worker.add_events(make_events(50, 0));
+        assert!(batch.is_none());
+        assert_eq!(worker.pending_count(), 50);
+
+        // Add 50 more - should trigger flush
+        let batch = worker.add_events(make_events(50, 0));
+        assert!(batch.is_some());
+        let batch = batch.unwrap();
+        assert_eq!(batch.events.len(), 100);
+        assert_eq!(batch.shard_id, 0);
+    }
+
+    #[test]
+    fn test_batch_timeout() {
+        let config = BatchConfig {
+            min_size: 10,
+            max_size: 1000,
+            max_delay: Duration::from_millis(1),
+            adaptive: false,
+            velocity_window: Duration::from_millis(100),
+        };
+
+        let mut worker = BatchWorker::new(0, config);
+
+        // Add some events
+        let batch = worker.add_events(make_events(5, 0));
+        assert!(batch.is_none());
+
+        // Wait for timeout
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Check timeout triggers flush
+        let batch = worker.add_events(vec![]);
+        assert!(batch.is_some());
+        assert_eq!(batch.unwrap().events.len(), 5);
+    }
+
+    #[test]
+    fn test_adaptive_batch_sizing() {
+        let config = BatchConfig {
+            min_size: 100,
+            max_size: 10_000,
+            max_delay: Duration::from_secs(10),
+            adaptive: true,
+            velocity_window: Duration::from_millis(100),
+        };
+
+        let mut batcher = AdaptiveBatcher::new(config);
+
+        // Initially should be at min_size
+        assert_eq!(batcher.batch_size(), 100);
+
+        // Simulate high velocity (add lots of events quickly)
+        for _ in 0..100 {
+            batcher.record_events(10_000);
+            std::thread::sleep(Duration::from_micros(100));
+        }
+
+        // Batch size should have increased
+        assert!(batcher.batch_size() > 100);
+    }
+
+    #[test]
+    fn test_force_flush() {
+        let config = BatchConfig {
+            min_size: 100,
+            max_size: 1000,
+            max_delay: Duration::from_secs(10),
+            adaptive: false,
+            velocity_window: Duration::from_millis(100),
+        };
+
+        let mut worker = BatchWorker::new(0, config);
+
+        // Add some events (below threshold)
+        worker.add_events(make_events(50, 0));
+        assert_eq!(worker.pending_count(), 50);
+
+        // Force flush
+        let batch = worker.flush();
+        assert_eq!(batch.events.len(), 50);
+        assert!(!worker.has_pending());
+    }
+
+    #[test]
+    fn test_sequence_numbers() {
+        let config = BatchConfig::default();
+        let mut worker = BatchWorker::new(0, config.clone());
+
+        // Create batches and verify sequence numbers
+        worker.add_events(make_events(100, 0));
+        let batch1 = worker.flush();
+        assert_eq!(batch1.sequence_start, 0);
+
+        worker.add_events(make_events(50, 0));
+        let batch2 = worker.flush();
+        assert_eq!(batch2.sequence_start, 100);
+
+        worker.add_events(make_events(25, 0));
+        let batch3 = worker.flush();
+        assert_eq!(batch3.sequence_start, 150);
+    }
+}

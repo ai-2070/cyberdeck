@@ -1,0 +1,49 @@
+# Build artifacts
+/target
+debug/
+release/
+
+# Cargo lock for libraries (optional - some prefer to commit it)
+# Cargo.lock
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Benchmark results
+criterion/
+*.bench
+
+# Coverage reports
+coverage/
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+
+# Documentation build
+/doc/
+
+# Environment
+.env
+.env.local
+*.local
+
+# Logs
+*.log
+logs/
+
+# OS files
+Thumbs.db
+desktop.ini
+
+package-lock.json
+node_modules/
+*.node
+*.pyc
+*.pyd
+*.zip

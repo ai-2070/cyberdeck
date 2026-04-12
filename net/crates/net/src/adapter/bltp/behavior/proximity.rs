@@ -1,0 +1,1030 @@
+//! Phase 4H: Proximity Graph Integration (PINGWAVE++)
+//!
+//! This module integrates pingwave discovery with the behavior plane:
+//! - Enhanced pingwaves carrying capability summaries
+//! - Proximity-aware capability routing
+//! - Latency-weighted graph for routing decisions
+//! - Integration with load balancer for locality-aware selection
+//! - Automatic capability index updates from pingwave data
+
+use dashmap::DashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
+
+use super::capability::{CapabilityFilter, CapabilitySet};
+use super::loadbalance::{Endpoint, HealthStatus, LoadBalancer, LoadMetrics};
+use super::metadata::NodeId;
+
+/// Enhanced pingwave with capability summary
+#[derive(Debug, Clone)]
+pub struct EnhancedPingwave {
+    /// Originating node ID
+    pub origin_id: NodeId,
+    /// Sequence number (monotonic per origin)
+    pub seq: u64,
+    /// Time-to-live (hop count remaining)
+    pub ttl: u8,
+    /// Hops traversed so far
+    pub hop_count: u8,
+    /// Origin timestamp (microseconds since epoch)
+    pub origin_timestamp_us: u64,
+    /// Capability summary hash (for quick change detection)
+    pub capability_hash: u64,
+    /// Capability version
+    pub capability_version: u32,
+    /// Load summary (0-255, 0=idle, 255=overloaded)
+    pub load_level: u8,
+    /// Health status
+    pub health: HealthStatus,
+    /// Primary capabilities (compact representation)
+    pub primary_caps: PrimaryCapabilities,
+}
+
+/// Compact primary capabilities (fits in 8 bytes)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrimaryCapabilities {
+    /// Has GPU
+    pub gpu: bool,
+    /// Number of model slots
+    pub model_slots: u8,
+    /// Memory tier (0-7, 0=<1GB, 7=>256GB)
+    pub memory_tier: u8,
+    /// Available tools bitmap (first 8 common tools)
+    pub tools_bitmap: u8,
+    /// Custom flags
+    pub flags: u32,
+}
+
+impl PrimaryCapabilities {
+    /// Encode to 8 bytes
+    pub fn to_bytes(&self) -> [u8; 8] {
+        let mut buf = [0u8; 8];
+        buf[0] = if self.gpu { 1 } else { 0 };
+        buf[1] = self.model_slots;
+        buf[2] = self.memory_tier;
+        buf[3] = self.tools_bitmap;
+        buf[4..8].copy_from_slice(&self.flags.to_le_bytes());
+        buf
+    }
+
+    /// Decode from 8 bytes
+    pub fn from_bytes(buf: &[u8; 8]) -> Self {
+        Self {
+            gpu: buf[0] != 0,
+            model_slots: buf[1],
+            memory_tier: buf[2],
+            tools_bitmap: buf[3],
+            flags: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
+        }
+    }
+
+    /// Create from full capability set
+    pub fn from_capability_set(caps: &CapabilitySet) -> Self {
+        let memory_tier = match caps.hardware.memory_mb {
+            0..=1024 => 0,
+            1025..=4096 => 1,
+            4097..=8192 => 2,
+            8193..=16384 => 3,
+            16385..=32768 => 4,
+            32769..=65536 => 5,
+            65537..=131072 => 6,
+            _ => 7,
+        };
+
+        Self {
+            gpu: caps.hardware.gpu.is_some(),
+            model_slots: caps.models.len() as u8,
+            memory_tier,
+            tools_bitmap: 0, // Could map common tools to bits
+            flags: 0,
+        }
+    }
+
+    /// Quick check if this matches a filter
+    pub fn matches_basic(&self, filter: &CapabilityFilter) -> bool {
+        if filter.require_gpu && !self.gpu {
+            return false;
+        }
+        true
+    }
+}
+
+impl EnhancedPingwave {
+    /// Wire size in bytes
+    pub const SIZE: usize = 64;
+
+    /// Create a new enhanced pingwave
+    pub fn new(origin_id: NodeId, seq: u64, ttl: u8) -> Self {
+        Self {
+            origin_id,
+            seq,
+            ttl,
+            hop_count: 0,
+            origin_timestamp_us: current_time_us(),
+            capability_hash: 0,
+            capability_version: 0,
+            load_level: 0,
+            health: HealthStatus::Healthy,
+            primary_caps: PrimaryCapabilities::default(),
+        }
+    }
+
+    /// Set capability info
+    pub fn with_capabilities(
+        mut self,
+        hash: u64,
+        version: u32,
+        primary: PrimaryCapabilities,
+    ) -> Self {
+        self.capability_hash = hash;
+        self.capability_version = version;
+        self.primary_caps = primary;
+        self
+    }
+
+    /// Set load info
+    pub fn with_load(mut self, load_level: u8, health: HealthStatus) -> Self {
+        self.load_level = load_level;
+        self.health = health;
+        self
+    }
+
+    /// Serialize to bytes
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..32].copy_from_slice(&self.origin_id);
+        buf[32..40].copy_from_slice(&self.seq.to_le_bytes());
+        buf[40] = self.ttl;
+        buf[41] = self.hop_count;
+        buf[42..50].copy_from_slice(&self.origin_timestamp_us.to_le_bytes());
+        buf[50..58].copy_from_slice(&self.capability_hash.to_le_bytes());
+        buf[58..62].copy_from_slice(&self.capability_version.to_le_bytes());
+        buf[62] = self.load_level;
+        buf[63] = self.health as u8;
+        // primary_caps would go in extended data
+        buf
+    }
+
+    /// Deserialize from bytes
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        let mut origin_id = [0u8; 32];
+        origin_id.copy_from_slice(&buf[0..32]);
+
+        Some(Self {
+            origin_id,
+            seq: u64::from_le_bytes(buf[32..40].try_into().ok()?),
+            ttl: buf[40],
+            hop_count: buf[41],
+            origin_timestamp_us: u64::from_le_bytes(buf[42..50].try_into().ok()?),
+            capability_hash: u64::from_le_bytes(buf[50..58].try_into().ok()?),
+            capability_version: u32::from_le_bytes(buf[58..62].try_into().ok()?),
+            load_level: buf[62],
+            health: match buf[63] {
+                0 => HealthStatus::Healthy,
+                1 => HealthStatus::Degraded,
+                2 => HealthStatus::Unhealthy,
+                _ => HealthStatus::Unknown,
+            },
+            primary_caps: PrimaryCapabilities::default(),
+        })
+    }
+
+    /// Check if expired
+    pub fn is_expired(&self) -> bool {
+        self.ttl == 0
+    }
+
+    /// Forward (decrement TTL, increment hop count)
+    pub fn forward(&mut self) -> bool {
+        if self.ttl == 0 {
+            return false;
+        }
+        self.ttl -= 1;
+        self.hop_count += 1;
+        true
+    }
+
+    /// Calculate one-way latency estimate (microseconds)
+    pub fn latency_estimate_us(&self) -> u64 {
+        let now = current_time_us();
+        now.saturating_sub(self.origin_timestamp_us)
+    }
+}
+
+/// Proximity node info combining discovery and capability data
+#[derive(Debug)]
+pub struct ProximityNode {
+    /// Node ID
+    pub node_id: NodeId,
+    /// Network address
+    pub addr: SocketAddr,
+    /// Hop distance
+    pub hops: u8,
+    /// Estimated latency in microseconds
+    pub latency_us: u64,
+    /// Last seen timestamp
+    pub last_seen: Instant,
+    /// Latest pingwave sequence
+    pub last_seq: u64,
+    /// Capability hash (for change detection)
+    pub capability_hash: u64,
+    /// Capability version
+    pub capability_version: u32,
+    /// Primary capabilities (quick filter)
+    pub primary_caps: PrimaryCapabilities,
+    /// Current load level
+    pub load_level: u8,
+    /// Health status
+    pub health: HealthStatus,
+    /// Full capabilities (lazy loaded)
+    full_capabilities: RwLock<Option<CapabilitySet>>,
+}
+
+impl Clone for ProximityNode {
+    fn clone(&self) -> Self {
+        Self {
+            node_id: self.node_id,
+            addr: self.addr,
+            hops: self.hops,
+            latency_us: self.latency_us,
+            last_seen: self.last_seen,
+            last_seq: self.last_seq,
+            capability_hash: self.capability_hash,
+            capability_version: self.capability_version,
+            primary_caps: self.primary_caps,
+            load_level: self.load_level,
+            health: self.health,
+            full_capabilities: RwLock::new(self.full_capabilities.read().unwrap().clone()),
+        }
+    }
+}
+
+impl ProximityNode {
+    /// Create new proximity node from pingwave
+    pub fn from_pingwave(pw: &EnhancedPingwave, addr: SocketAddr) -> Self {
+        Self {
+            node_id: pw.origin_id,
+            addr,
+            hops: pw.hop_count + 1,
+            latency_us: pw.latency_estimate_us(),
+            last_seen: Instant::now(),
+            last_seq: pw.seq,
+            capability_hash: pw.capability_hash,
+            capability_version: pw.capability_version,
+            primary_caps: pw.primary_caps,
+            load_level: pw.load_level,
+            health: pw.health,
+            full_capabilities: RwLock::new(None),
+        }
+    }
+
+    /// Update from new pingwave
+    pub fn update_from_pingwave(&mut self, pw: &EnhancedPingwave, addr: SocketAddr) {
+        // Only update if newer sequence or better path
+        if pw.seq > self.last_seq || pw.hop_count + 1 < self.hops {
+            self.addr = addr;
+            self.hops = pw.hop_count + 1;
+            self.latency_us = pw.latency_estimate_us();
+            self.last_seq = pw.seq;
+        }
+
+        // Always update load/health from latest
+        self.load_level = pw.load_level;
+        self.health = pw.health;
+        self.last_seen = Instant::now();
+
+        // Check capability change
+        if pw.capability_version > self.capability_version {
+            self.capability_hash = pw.capability_hash;
+            self.capability_version = pw.capability_version;
+            self.primary_caps = pw.primary_caps;
+            // Clear cached full capabilities
+            *self.full_capabilities.write().unwrap() = None;
+        }
+    }
+
+    /// Check if node is stale
+    pub fn is_stale(&self, timeout: Duration) -> bool {
+        self.last_seen.elapsed() > timeout
+    }
+
+    /// Check if node is available for routing
+    pub fn is_available(&self) -> bool {
+        self.health.can_receive_traffic()
+    }
+
+    /// Get or fetch full capabilities
+    pub fn get_capabilities(&self) -> Option<CapabilitySet> {
+        self.full_capabilities.read().unwrap().clone()
+    }
+
+    /// Set full capabilities (after fetching)
+    pub fn set_capabilities(&self, caps: CapabilitySet) {
+        *self.full_capabilities.write().unwrap() = Some(caps);
+    }
+
+    /// Calculate routing score (lower is better)
+    pub fn routing_score(&self, prefer_low_latency: bool) -> f64 {
+        let latency_factor = if prefer_low_latency {
+            (self.latency_us as f64) / 1000.0 // Convert to ms
+        } else {
+            self.hops as f64 * 10.0 // 10ms per hop estimate
+        };
+
+        let load_factor = (self.load_level as f64) / 255.0 * 50.0; // 0-50 penalty
+
+        let health_factor = match self.health {
+            HealthStatus::Healthy => 0.0,
+            HealthStatus::Degraded => 25.0,
+            HealthStatus::Unhealthy => 1000.0,
+            HealthStatus::Unknown => 50.0,
+        };
+
+        latency_factor + load_factor + health_factor
+    }
+}
+
+/// Edge in the proximity graph
+#[derive(Debug, Clone)]
+pub struct ProximityEdge {
+    /// Source node
+    pub from: NodeId,
+    /// Destination node
+    pub to: NodeId,
+    /// Latency in microseconds
+    pub latency_us: u64,
+    /// Last updated
+    pub last_updated: Instant,
+    /// Reliability (0.0-1.0, based on packet loss)
+    pub reliability: f32,
+}
+
+/// Configuration for the proximity graph
+#[derive(Debug, Clone)]
+pub struct ProximityConfig {
+    /// Maximum hops to track
+    pub radius: u8,
+    /// Node timeout
+    pub node_timeout: Duration,
+    /// Pingwave dedup cache timeout
+    pub dedup_timeout: Duration,
+    /// Pingwave interval
+    pub pingwave_interval: Duration,
+    /// Whether to prefer low latency over hop count
+    pub prefer_low_latency: bool,
+    /// Maximum nodes to track
+    pub max_nodes: usize,
+    /// Whether to auto-update capability index
+    pub auto_index_update: bool,
+}
+
+impl Default for ProximityConfig {
+    fn default() -> Self {
+        Self {
+            radius: 3,
+            node_timeout: Duration::from_secs(30),
+            dedup_timeout: Duration::from_secs(10),
+            pingwave_interval: Duration::from_secs(5),
+            prefer_low_latency: true,
+            max_nodes: 10000,
+            auto_index_update: true,
+        }
+    }
+}
+
+/// Proximity graph integrating discovery with behavior plane
+pub struct ProximityGraph {
+    /// Local node ID
+    my_id: NodeId,
+    /// Configuration
+    config: ProximityConfig,
+    /// Known nodes
+    nodes: DashMap<NodeId, ProximityNode>,
+    /// Edges (from, to) -> edge info
+    edges: DashMap<(NodeId, NodeId), ProximityEdge>,
+    /// Seen pingwaves for deduplication
+    seen_pingwaves: DashMap<(NodeId, u64), Instant>,
+    /// Next pingwave sequence
+    next_seq: AtomicU64,
+    /// Local capability hash
+    local_capability_hash: AtomicU64,
+    /// Local capability version
+    local_capability_version: AtomicU64,
+    /// Local capabilities
+    local_capabilities: RwLock<Option<CapabilitySet>>,
+    /// Local load level
+    local_load_level: AtomicU64,
+    /// Statistics
+    stats: ProximityStats,
+}
+
+/// Proximity graph statistics
+#[derive(Debug, Default)]
+pub struct ProximityStats {
+    /// Number of ping waves initiated by this node
+    pub pingwaves_sent: AtomicU64,
+    /// Number of ping waves received from other nodes
+    pub pingwaves_received: AtomicU64,
+    /// Number of ping waves forwarded to neighbors
+    pub pingwaves_forwarded: AtomicU64,
+    /// Number of ping waves dropped due to deduplication or TTL expiry
+    pub pingwaves_dropped: AtomicU64,
+    /// Number of new nodes discovered through ping waves
+    pub nodes_discovered: AtomicU64,
+    /// Number of nodes removed after failing liveness checks
+    pub nodes_expired: AtomicU64,
+    /// Number of capability set updates processed
+    pub capability_updates: AtomicU64,
+}
+
+impl ProximityGraph {
+    /// Create a new proximity graph
+    pub fn new(my_id: NodeId, config: ProximityConfig) -> Self {
+        Self {
+            my_id,
+            config,
+            nodes: DashMap::new(),
+            edges: DashMap::new(),
+            seen_pingwaves: DashMap::new(),
+            next_seq: AtomicU64::new(1),
+            local_capability_hash: AtomicU64::new(0),
+            local_capability_version: AtomicU64::new(0),
+            local_capabilities: RwLock::new(None),
+            local_load_level: AtomicU64::new(0),
+            stats: ProximityStats::default(),
+        }
+    }
+
+    /// Get local node ID
+    pub fn my_id(&self) -> NodeId {
+        self.my_id
+    }
+
+    /// Set local capabilities
+    pub fn set_local_capabilities(&self, caps: CapabilitySet) {
+        let hash = hash_capabilities(&caps);
+        let version = self
+            .local_capability_version
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        self.local_capability_hash.store(hash, Ordering::Relaxed);
+        self.local_capability_version
+            .store(version, Ordering::Relaxed);
+        *self.local_capabilities.write().unwrap() = Some(caps);
+    }
+
+    /// Set local load level (0-255)
+    pub fn set_local_load(&self, load_level: u8) {
+        self.local_load_level
+            .store(load_level as u64, Ordering::Relaxed);
+    }
+
+    /// Create a pingwave to broadcast
+    pub fn create_pingwave(&self, health: HealthStatus) -> EnhancedPingwave {
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let caps = self.local_capabilities.read().unwrap();
+        let primary = caps
+            .as_ref()
+            .map(PrimaryCapabilities::from_capability_set)
+            .unwrap_or_default();
+
+        self.stats.pingwaves_sent.fetch_add(1, Ordering::Relaxed);
+
+        EnhancedPingwave::new(self.my_id, seq, self.config.radius)
+            .with_capabilities(
+                self.local_capability_hash.load(Ordering::Relaxed),
+                self.local_capability_version.load(Ordering::Relaxed) as u32,
+                primary,
+            )
+            .with_load(self.local_load_level.load(Ordering::Relaxed) as u8, health)
+    }
+
+    /// Process incoming pingwave
+    ///
+    /// Returns Some(pingwave) if it should be forwarded, None otherwise.
+    pub fn on_pingwave(
+        &self,
+        mut pw: EnhancedPingwave,
+        from: SocketAddr,
+    ) -> Option<EnhancedPingwave> {
+        self.stats
+            .pingwaves_received
+            .fetch_add(1, Ordering::Relaxed);
+
+        // Ignore our own pingwaves
+        if pw.origin_id == self.my_id {
+            return None;
+        }
+
+        // Check dedup cache
+        let key = (pw.origin_id, pw.seq);
+        if self.seen_pingwaves.contains_key(&key) {
+            self.stats.pingwaves_dropped.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        self.seen_pingwaves.insert(key, Instant::now());
+
+        // Update or create node
+        let _is_new = !self.nodes.contains_key(&pw.origin_id);
+        self.nodes
+            .entry(pw.origin_id)
+            .and_modify(|node| node.update_from_pingwave(&pw, from))
+            .or_insert_with(|| {
+                self.stats.nodes_discovered.fetch_add(1, Ordering::Relaxed);
+                ProximityNode::from_pingwave(&pw, from)
+            });
+
+        // Update edge from sender to origin (we learned about origin via from)
+        // This is an indirect edge observation
+        if pw.hop_count > 0 {
+            // The sender is 1 hop away from us, origin is hop_count+1 hops away
+            // We can infer an edge exists in the path
+        }
+
+        // Check if should forward
+        if pw.is_expired() {
+            return None;
+        }
+
+        // Forward
+        pw.forward();
+        self.stats
+            .pingwaves_forwarded
+            .fetch_add(1, Ordering::Relaxed);
+        Some(pw)
+    }
+
+    /// Update capabilities for a node (from full capability fetch)
+    pub fn update_node_capabilities(&self, node_id: &NodeId, caps: CapabilitySet) {
+        if let Some(node) = self.nodes.get(node_id) {
+            node.set_capabilities(caps);
+            self.stats
+                .capability_updates
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Get node info
+    pub fn get_node(&self, node_id: &NodeId) -> Option<ProximityNode> {
+        self.nodes.get(node_id).map(|r| r.clone())
+    }
+
+    /// Get all nodes
+    pub fn all_nodes(&self) -> Vec<ProximityNode> {
+        self.nodes.iter().map(|r| r.value().clone()).collect()
+    }
+
+    /// Get nodes within hop distance
+    pub fn nodes_within_hops(&self, max_hops: u8) -> Vec<ProximityNode> {
+        self.nodes
+            .iter()
+            .filter(|r| r.hops <= max_hops)
+            .map(|r| r.value().clone())
+            .collect()
+    }
+
+    /// Find nodes matching a capability filter (quick check using primary caps)
+    pub fn find_matching(&self, filter: &CapabilityFilter) -> Vec<ProximityNode> {
+        self.nodes
+            .iter()
+            .filter(|r| r.is_available() && r.primary_caps.matches_basic(filter))
+            .map(|r| r.value().clone())
+            .collect()
+    }
+
+    /// Find best node for a capability filter
+    pub fn find_best(&self, filter: &CapabilityFilter) -> Option<ProximityNode> {
+        self.find_matching(filter).into_iter().min_by(|a, b| {
+            a.routing_score(self.config.prefer_low_latency)
+                .partial_cmp(&b.routing_score(self.config.prefer_low_latency))
+                .unwrap()
+        })
+    }
+
+    /// Find k best nodes for a capability filter
+    pub fn find_k_best(&self, filter: &CapabilityFilter, k: usize) -> Vec<ProximityNode> {
+        let mut matching = self.find_matching(filter);
+        matching.sort_by(|a, b| {
+            a.routing_score(self.config.prefer_low_latency)
+                .partial_cmp(&b.routing_score(self.config.prefer_low_latency))
+                .unwrap()
+        });
+        matching.truncate(k);
+        matching
+    }
+
+    /// Get shortest path to node (BFS)
+    pub fn path_to(&self, dest: &NodeId) -> Option<Vec<NodeId>> {
+        if *dest == self.my_id {
+            return Some(vec![self.my_id]);
+        }
+
+        // Build adjacency from edges
+        let mut adjacency: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for edge in self.edges.iter() {
+            adjacency.entry(edge.from).or_default().push(edge.to);
+        }
+
+        // BFS
+        let mut visited: HashSet<NodeId> = HashSet::new();
+        let mut queue: VecDeque<Vec<NodeId>> = VecDeque::new();
+
+        queue.push_back(vec![self.my_id]);
+        visited.insert(self.my_id);
+
+        while let Some(path) = queue.pop_front() {
+            let current = *path.last()?;
+
+            if current == *dest {
+                return Some(path);
+            }
+
+            if let Some(neighbors) = adjacency.get(&current) {
+                for neighbor in neighbors {
+                    if !visited.contains(neighbor) {
+                        visited.insert(*neighbor);
+                        let mut new_path = path.clone();
+                        new_path.push(*neighbor);
+                        queue.push_back(new_path);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Create load balancer endpoints from proximity nodes
+    pub fn to_endpoints(&self, filter: Option<&CapabilityFilter>) -> Vec<Endpoint> {
+        self.nodes
+            .iter()
+            .filter(|r| {
+                r.is_available()
+                    && filter
+                        .map(|f| r.primary_caps.matches_basic(f))
+                        .unwrap_or(true)
+            })
+            .map(|r| {
+                let node = r.value();
+                // Weight inversely proportional to latency/hops
+                let base_weight = 1000u32;
+                let latency_penalty = (node.latency_us / 100) as u32; // 1 weight per 100us
+                let weight = base_weight.saturating_sub(latency_penalty).max(1);
+
+                Endpoint::new(node.node_id)
+                    .with_weight(weight)
+                    .with_priority(node.hops as u32)
+            })
+            .collect()
+    }
+
+    /// Update load balancer from proximity data
+    pub fn update_load_balancer(&self, lb: &LoadBalancer, filter: Option<&CapabilityFilter>) {
+        for entry in self.nodes.iter() {
+            let node = entry.value();
+
+            if !filter
+                .map(|f| node.primary_caps.matches_basic(f))
+                .unwrap_or(true)
+            {
+                continue;
+            }
+
+            // Update health
+            lb.update_health(&node.node_id, node.health);
+
+            // Update metrics
+            let metrics = LoadMetrics {
+                cpu_usage: (node.load_level as f64) / 255.0,
+                avg_response_time_ms: (node.latency_us as f64) / 1000.0,
+                ..Default::default()
+            };
+            lb.update_metrics(&node.node_id, metrics);
+        }
+    }
+
+    /// Sync discovered nodes to capability index
+    ///
+    /// Note: This requires the caller to handle index updates appropriately.
+    /// The CapabilityIndex uses announcements, so this returns nodes with capabilities
+    /// that need to be announced.
+    pub fn nodes_with_capabilities(&self) -> Vec<(NodeId, CapabilitySet)> {
+        self.nodes
+            .iter()
+            .filter_map(|entry| {
+                let node = entry.value();
+                node.get_capabilities().map(|caps| (node.node_id, caps))
+            })
+            .collect()
+    }
+
+    /// Clean up stale entries
+    pub fn cleanup(&self) -> CleanupStats {
+        let mut removed_nodes = 0;
+        let mut removed_pingwaves = 0;
+
+        // Remove stale nodes
+        self.nodes.retain(|_, node| {
+            if node.is_stale(self.config.node_timeout) {
+                removed_nodes += 1;
+                self.stats.nodes_expired.fetch_add(1, Ordering::Relaxed);
+                false
+            } else {
+                true
+            }
+        });
+
+        // Remove old dedup entries
+        self.seen_pingwaves.retain(|_, instant| {
+            if instant.elapsed() > self.config.dedup_timeout {
+                removed_pingwaves += 1;
+                false
+            } else {
+                true
+            }
+        });
+
+        CleanupStats {
+            removed_nodes,
+            removed_pingwaves,
+        }
+    }
+
+    /// Get statistics snapshot
+    pub fn stats(&self) -> ProximityStatsSnapshot {
+        ProximityStatsSnapshot {
+            node_count: self.nodes.len(),
+            edge_count: self.edges.len(),
+            dedup_cache_size: self.seen_pingwaves.len(),
+            pingwaves_sent: self.stats.pingwaves_sent.load(Ordering::Relaxed),
+            pingwaves_received: self.stats.pingwaves_received.load(Ordering::Relaxed),
+            pingwaves_forwarded: self.stats.pingwaves_forwarded.load(Ordering::Relaxed),
+            pingwaves_dropped: self.stats.pingwaves_dropped.load(Ordering::Relaxed),
+            nodes_discovered: self.stats.nodes_discovered.load(Ordering::Relaxed),
+            nodes_expired: self.stats.nodes_expired.load(Ordering::Relaxed),
+            capability_updates: self.stats.capability_updates.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Get node count
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+}
+
+/// Cleanup statistics
+#[derive(Debug, Clone, Default)]
+pub struct CleanupStats {
+    /// Number of expired nodes removed from the graph
+    pub removed_nodes: usize,
+    /// Number of stale ping wave deduplication entries removed
+    pub removed_pingwaves: usize,
+}
+
+/// Statistics snapshot
+#[derive(Debug, Clone, Default)]
+pub struct ProximityStatsSnapshot {
+    /// Number of nodes currently tracked in the proximity graph
+    pub node_count: usize,
+    /// Number of edges currently in the proximity graph
+    pub edge_count: usize,
+    /// Number of entries in the ping wave deduplication cache
+    pub dedup_cache_size: usize,
+    /// Total ping waves sent since startup
+    pub pingwaves_sent: u64,
+    /// Total ping waves received since startup
+    pub pingwaves_received: u64,
+    /// Total ping waves forwarded since startup
+    pub pingwaves_forwarded: u64,
+    /// Total ping waves dropped since startup
+    pub pingwaves_dropped: u64,
+    /// Total nodes discovered since startup
+    pub nodes_discovered: u64,
+    /// Total nodes expired since startup
+    pub nodes_expired: u64,
+    /// Total capability updates processed since startup
+    pub capability_updates: u64,
+}
+
+/// Get current time in microseconds
+fn current_time_us() -> u64 {
+    use std::time::SystemTime;
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
+/// Hash capabilities for quick comparison
+fn hash_capabilities(caps: &CapabilitySet) -> u64 {
+    // Simple FNV-1a hash of key capability fields
+    let mut hash: u64 = 0xcbf29ce484222325;
+
+    // Hash hardware memory
+    hash ^= caps.hardware.memory_mb as u64;
+    hash = hash.wrapping_mul(0x100000001b3);
+
+    // Hash GPU presence
+    hash ^= if caps.hardware.gpu.is_some() { 1 } else { 0 };
+    hash = hash.wrapping_mul(0x100000001b3);
+
+    // Hash accelerator count
+    hash ^= caps.hardware.accelerators.len() as u64;
+    hash = hash.wrapping_mul(0x100000001b3);
+
+    // Hash tool count
+    hash ^= caps.tools.len() as u64;
+    hash = hash.wrapping_mul(0x100000001b3);
+
+    // Hash model count
+    hash ^= caps.models.len() as u64;
+    hash = hash.wrapping_mul(0x100000001b3);
+
+    // Hash tag count
+    hash ^= caps.tags.len() as u64;
+    hash = hash.wrapping_mul(0x100000001b3);
+
+    hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_node_id(n: u8) -> NodeId {
+        let mut id = [0u8; 32];
+        id[0] = n;
+        id
+    }
+
+    #[test]
+    fn test_primary_capabilities_roundtrip() {
+        let caps = PrimaryCapabilities {
+            gpu: true,
+            model_slots: 4,
+            memory_tier: 5,
+            tools_bitmap: 0b10101010,
+            flags: 0x12345678,
+        };
+
+        let bytes = caps.to_bytes();
+        let parsed = PrimaryCapabilities::from_bytes(&bytes);
+
+        assert_eq!(caps, parsed);
+    }
+
+    #[test]
+    fn test_enhanced_pingwave_roundtrip() {
+        let pw = EnhancedPingwave::new(make_node_id(1), 42, 3)
+            .with_capabilities(0xDEADBEEF, 5, PrimaryCapabilities::default())
+            .with_load(128, HealthStatus::Healthy);
+
+        let bytes = pw.to_bytes();
+        let parsed = EnhancedPingwave::from_bytes(&bytes).unwrap();
+
+        assert_eq!(pw.origin_id, parsed.origin_id);
+        assert_eq!(pw.seq, parsed.seq);
+        assert_eq!(pw.ttl, parsed.ttl);
+        assert_eq!(pw.capability_hash, parsed.capability_hash);
+        assert_eq!(pw.load_level, parsed.load_level);
+    }
+
+    #[test]
+    fn test_pingwave_forward() {
+        let mut pw = EnhancedPingwave::new(make_node_id(1), 1, 3);
+        assert_eq!(pw.ttl, 3);
+        assert_eq!(pw.hop_count, 0);
+
+        assert!(pw.forward());
+        assert_eq!(pw.ttl, 2);
+        assert_eq!(pw.hop_count, 1);
+
+        assert!(pw.forward());
+        assert!(pw.forward());
+        assert_eq!(pw.ttl, 0);
+        assert!(!pw.forward()); // Can't forward when expired
+    }
+
+    #[test]
+    fn test_proximity_graph_pingwave_processing() {
+        let my_id = make_node_id(1);
+        let graph = ProximityGraph::new(my_id, ProximityConfig::default());
+
+        let pw = EnhancedPingwave::new(make_node_id(2), 1, 3);
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        // Process pingwave
+        let forwarded = graph.on_pingwave(pw, from);
+        assert!(forwarded.is_some());
+
+        // Node should be added
+        let node = graph.get_node(&make_node_id(2)).unwrap();
+        assert_eq!(node.hops, 1);
+
+        // Duplicate should be dropped
+        let pw2 = EnhancedPingwave::new(make_node_id(2), 1, 3);
+        assert!(graph.on_pingwave(pw2, from).is_none());
+
+        // New sequence should work
+        let pw3 = EnhancedPingwave::new(make_node_id(2), 2, 3);
+        assert!(graph.on_pingwave(pw3, from).is_some());
+    }
+
+    #[test]
+    fn test_proximity_graph_find_matching() {
+        let my_id = make_node_id(1);
+        let graph = ProximityGraph::new(my_id, ProximityConfig::default());
+
+        // Add some nodes via pingwaves
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        let mut pw1 = EnhancedPingwave::new(make_node_id(2), 1, 3);
+        pw1.primary_caps = PrimaryCapabilities {
+            gpu: true,
+            model_slots: 4,
+            ..Default::default()
+        };
+        graph.on_pingwave(pw1, from);
+
+        let mut pw2 = EnhancedPingwave::new(make_node_id(3), 1, 3);
+        pw2.primary_caps = PrimaryCapabilities {
+            gpu: false,
+            model_slots: 2,
+            ..Default::default()
+        };
+        graph.on_pingwave(pw2, from);
+
+        // Find GPU nodes
+        let filter = CapabilityFilter {
+            require_gpu: true,
+            ..Default::default()
+        };
+        let gpu_nodes = graph.find_matching(&filter);
+        assert_eq!(gpu_nodes.len(), 1);
+        assert_eq!(gpu_nodes[0].node_id, make_node_id(2));
+    }
+
+    #[test]
+    fn test_proximity_graph_to_endpoints() {
+        let my_id = make_node_id(1);
+        let graph = ProximityGraph::new(my_id, ProximityConfig::default());
+
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        // Add nodes
+        graph.on_pingwave(EnhancedPingwave::new(make_node_id(2), 1, 3), from);
+        graph.on_pingwave(EnhancedPingwave::new(make_node_id(3), 1, 3), from);
+
+        // Get endpoints
+        let endpoints = graph.to_endpoints(None);
+        assert_eq!(endpoints.len(), 2);
+    }
+
+    #[test]
+    fn test_routing_score() {
+        let pw = EnhancedPingwave::new(make_node_id(1), 1, 3);
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        let mut node = ProximityNode::from_pingwave(&pw, from);
+        node.latency_us = 1000; // 1ms
+        node.load_level = 128; // 50% load
+        node.health = HealthStatus::Healthy;
+
+        let score = node.routing_score(true);
+        assert!(score > 0.0);
+
+        // Degraded health should increase score
+        node.health = HealthStatus::Degraded;
+        let degraded_score = node.routing_score(true);
+        assert!(degraded_score > score);
+    }
+
+    #[test]
+    fn test_cleanup() {
+        let my_id = make_node_id(1);
+        let config = ProximityConfig {
+            node_timeout: Duration::from_millis(10),
+            dedup_timeout: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let graph = ProximityGraph::new(my_id, config);
+
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        graph.on_pingwave(EnhancedPingwave::new(make_node_id(2), 1, 3), from);
+
+        assert_eq!(graph.node_count(), 1);
+
+        // Wait for timeout
+        std::thread::sleep(Duration::from_millis(20));
+
+        let stats = graph.cleanup();
+        assert_eq!(stats.removed_nodes, 1);
+        assert_eq!(graph.node_count(), 0);
+    }
+}

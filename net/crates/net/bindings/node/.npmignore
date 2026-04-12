@@ -1,0 +1,37 @@
+# Source files
+src/
+Cargo.toml
+Cargo.lock
+build.rs
+
+# Build artifacts
+target/
+artifacts/
+npm/
+
+# Development files
+.cargo/
+*.rs
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# Test files
+test.js
+*.test.js
+*.spec.js
+__tests__/
+
+# Documentation source
+*.md
+!README.md
+
+# CI/CD
+.github/
+.travis.yml
+.gitlab-ci.yml

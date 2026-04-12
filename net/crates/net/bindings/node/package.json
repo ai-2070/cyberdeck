@@ -1,0 +1,57 @@
+{
+  "name": "@ai2070/blackstream",
+  "version": "0.5.0",
+  "description": "High-performance, schema-agnostic event bus for AI runtime workloads",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "binaryName": "blackstream",
+    "triples": {
+      "defaults": true,
+      "additional": [
+        "aarch64-unknown-linux-gnu",
+        "aarch64-unknown-linux-musl",
+        "x86_64-unknown-linux-musl"
+      ]
+    }
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ai-2070/blackstream"
+  },
+  "keywords": [
+    "event-bus",
+    "high-performance",
+    "streaming",
+    "ai",
+    "llm",
+    "rust",
+    "napi"
+  ],
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node"
+  ],
+  "devDependencies": {
+    "@napi-rs/cli": "^3.5.0",
+    "@types/node": "^24.0.0",
+    "typescript": "5.9.3",
+    "vitest": "^4.0.0"
+  },
+  "scripts": {
+    "artifacts": "napi artifacts",
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "prepublishOnly": "napi prepublish -t npm",
+    "test": "vitest run",
+    "test:integration": "RUN_INTEGRATION_TESTS=1 vitest run",
+    "test:watch": "vitest",
+    "universal": "napi universal",
+    "version": "napi version"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

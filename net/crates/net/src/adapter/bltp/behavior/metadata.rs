@@ -1,0 +1,1392 @@
+//! Phase 4C: Node Metadata Surface (NODE-META)
+//!
+//! This module provides structured node metadata with location awareness,
+//! topology hints, and fast indexing for node discovery and routing.
+
+use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Unique node identifier (32 bytes)
+pub type NodeId = [u8; 32];
+
+/// Geographic region identifier
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Region {
+    /// North America
+    NorthAmerica(String),
+    /// South America
+    SouthAmerica(String),
+    /// Europe
+    Europe(String),
+    /// Asia Pacific
+    AsiaPacific(String),
+    /// Middle East
+    MiddleEast(String),
+    /// Africa
+    Africa(String),
+    /// Custom region
+    Custom(String),
+}
+
+impl Region {
+    /// Get the continent name
+    pub fn continent(&self) -> &'static str {
+        match self {
+            Region::NorthAmerica(_) => "north_america",
+            Region::SouthAmerica(_) => "south_america",
+            Region::Europe(_) => "europe",
+            Region::AsiaPacific(_) => "asia_pacific",
+            Region::MiddleEast(_) => "middle_east",
+            Region::Africa(_) => "africa",
+            Region::Custom(_) => "custom",
+        }
+    }
+
+    /// Get the zone within the region
+    pub fn zone(&self) -> &str {
+        match self {
+            Region::NorthAmerica(z)
+            | Region::SouthAmerica(z)
+            | Region::Europe(z)
+            | Region::AsiaPacific(z)
+            | Region::MiddleEast(z)
+            | Region::Africa(z)
+            | Region::Custom(z) => z,
+        }
+    }
+}
+
+/// Geographic location information
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocationInfo {
+    /// Geographic region
+    pub region: Region,
+    /// Availability zone within region
+    pub zone: Option<String>,
+    /// Latitude (-90 to 90)
+    pub latitude: Option<f64>,
+    /// Longitude (-180 to 180)
+    pub longitude: Option<f64>,
+    /// Autonomous System Number
+    pub asn: Option<u32>,
+    /// ISP or cloud provider name
+    pub provider: Option<String>,
+    /// Data center identifier
+    pub datacenter: Option<String>,
+    /// Country code (ISO 3166-1 alpha-2)
+    pub country_code: Option<String>,
+    /// City name
+    pub city: Option<String>,
+}
+
+impl LocationInfo {
+    /// Create a new location with just region
+    pub fn new(region: Region) -> Self {
+        Self {
+            region,
+            zone: None,
+            latitude: None,
+            longitude: None,
+            asn: None,
+            provider: None,
+            datacenter: None,
+            country_code: None,
+            city: None,
+        }
+    }
+
+    /// Set coordinates
+    pub fn with_coordinates(mut self, lat: f64, lon: f64) -> Self {
+        self.latitude = Some(lat.clamp(-90.0, 90.0));
+        self.longitude = Some(lon.clamp(-180.0, 180.0));
+        self
+    }
+
+    /// Set ASN
+    pub fn with_asn(mut self, asn: u32) -> Self {
+        self.asn = Some(asn);
+        self
+    }
+
+    /// Set provider
+    pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
+        self.provider = Some(provider.into());
+        self
+    }
+
+    /// Calculate approximate distance to another location in kilometers
+    /// Uses Haversine formula
+    pub fn distance_to(&self, other: &LocationInfo) -> Option<f64> {
+        let (lat1, lon1) = (self.latitude?, self.longitude?);
+        let (lat2, lon2) = (other.latitude?, other.longitude?);
+
+        let r = 6371.0; // Earth's radius in km
+        let d_lat = (lat2 - lat1).to_radians();
+        let d_lon = (lon2 - lon1).to_radians();
+        let lat1_rad = lat1.to_radians();
+        let lat2_rad = lat2.to_radians();
+
+        let a = (d_lat / 2.0).sin().powi(2)
+            + lat1_rad.cos() * lat2_rad.cos() * (d_lon / 2.0).sin().powi(2);
+        let c = 2.0 * a.sqrt().asin();
+
+        Some(r * c)
+    }
+
+    /// Check if same continent
+    pub fn same_continent(&self, other: &LocationInfo) -> bool {
+        self.region.continent() == other.region.continent()
+    }
+
+    /// Check if same region
+    pub fn same_region(&self, other: &LocationInfo) -> bool {
+        self.region == other.region
+    }
+}
+
+/// NAT type for connectivity hints
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NatType {
+    /// No NAT - direct connectivity
+    None,
+    /// Full cone NAT
+    FullCone,
+    /// Restricted cone NAT
+    RestrictedCone,
+    /// Port-restricted cone NAT
+    PortRestrictedCone,
+    /// Symmetric NAT (hardest to traverse)
+    Symmetric,
+    /// Unknown NAT type
+    Unknown,
+}
+
+impl NatType {
+    /// NAT traversal difficulty (0 = easiest, 4 = hardest)
+    pub fn difficulty(&self) -> u8 {
+        match self {
+            NatType::None => 0,
+            NatType::FullCone => 1,
+            NatType::RestrictedCone => 2,
+            NatType::PortRestrictedCone => 3,
+            NatType::Symmetric => 4,
+            NatType::Unknown => 3,
+        }
+    }
+
+    /// Can establish direct connection with another NAT type
+    pub fn can_connect_direct(&self, other: &NatType) -> bool {
+        // At least one side should be easy to traverse
+        self.difficulty() + other.difficulty() < 5
+    }
+}
+
+/// Network tier classification
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+pub enum NetworkTier {
+    /// Edge device (mobile, IoT)
+    Edge = 0,
+    /// Consumer connection
+    Consumer = 1,
+    /// Business/prosumer connection
+    Business = 2,
+    /// Data center with standard connectivity
+    Datacenter = 3,
+    /// Premium data center with high bandwidth
+    Premium = 4,
+    /// Core infrastructure node
+    Core = 5,
+}
+
+impl NetworkTier {
+    /// Get relative priority for routing (higher = prefer)
+    pub fn priority(&self) -> u8 {
+        *self as u8
+    }
+}
+
+/// Topology hints for routing optimization
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopologyHints {
+    /// Preferred peer node IDs for routing
+    pub preferred_peers: Vec<NodeId>,
+    /// Network tier classification
+    pub tier: NetworkTier,
+    /// Uplink bandwidth in Mbps
+    pub uplink_mbps: Option<u32>,
+    /// Downlink bandwidth in Mbps
+    pub downlink_mbps: Option<u32>,
+    /// NAT type
+    pub nat_type: NatType,
+    /// Whether node can relay traffic
+    pub can_relay: bool,
+    /// Maximum relay connections
+    pub max_relay_connections: Option<u32>,
+    /// Known public addresses
+    pub public_addresses: Vec<IpAddr>,
+    /// STUN-discovered reflexive address
+    pub reflexive_address: Option<IpAddr>,
+    /// Average latency to known peers (node_id -> latency_ms)
+    #[serde(skip)]
+    pub peer_latencies: HashMap<NodeId, u32>,
+    /// Hop count to well-known nodes
+    pub hop_distances: HashMap<String, u8>,
+}
+
+impl Default for TopologyHints {
+    fn default() -> Self {
+        Self {
+            preferred_peers: Vec::new(),
+            tier: NetworkTier::Consumer,
+            uplink_mbps: None,
+            downlink_mbps: None,
+            nat_type: NatType::Unknown,
+            can_relay: false,
+            max_relay_connections: None,
+            public_addresses: Vec::new(),
+            reflexive_address: None,
+            peer_latencies: HashMap::new(),
+            hop_distances: HashMap::new(),
+        }
+    }
+}
+
+impl TopologyHints {
+    /// Create new topology hints
+    pub fn new(tier: NetworkTier) -> Self {
+        Self {
+            tier,
+            ..Default::default()
+        }
+    }
+
+    /// Set bandwidth
+    pub fn with_bandwidth(mut self, uplink: u32, downlink: u32) -> Self {
+        self.uplink_mbps = Some(uplink);
+        self.downlink_mbps = Some(downlink);
+        self
+    }
+
+    /// Set NAT type
+    pub fn with_nat(mut self, nat_type: NatType) -> Self {
+        self.nat_type = nat_type;
+        self
+    }
+
+    /// Enable relay capability
+    pub fn with_relay(mut self, max_connections: u32) -> Self {
+        self.can_relay = true;
+        self.max_relay_connections = Some(max_connections);
+        self
+    }
+
+    /// Add a preferred peer
+    pub fn add_preferred_peer(&mut self, peer: NodeId) {
+        if !self.preferred_peers.contains(&peer) {
+            self.preferred_peers.push(peer);
+        }
+    }
+
+    /// Update peer latency
+    pub fn update_latency(&mut self, peer: NodeId, latency_ms: u32) {
+        self.peer_latencies.insert(peer, latency_ms);
+    }
+
+    /// Get average latency to all known peers
+    pub fn average_latency(&self) -> Option<f64> {
+        if self.peer_latencies.is_empty() {
+            return None;
+        }
+        let sum: u64 = self.peer_latencies.values().map(|&v| v as u64).sum();
+        Some(sum as f64 / self.peer_latencies.len() as f64)
+    }
+
+    /// Estimate connectivity quality (0.0 - 1.0)
+    pub fn connectivity_score(&self) -> f64 {
+        let mut score = 0.0;
+
+        // Tier bonus (0-0.3)
+        score += (self.tier.priority() as f64) * 0.06;
+
+        // NAT type (0-0.2)
+        score += (4 - self.nat_type.difficulty()) as f64 * 0.05;
+
+        // Has public address (0.1)
+        if !self.public_addresses.is_empty() {
+            score += 0.1;
+        }
+
+        // Bandwidth (0-0.2)
+        if let Some(uplink) = self.uplink_mbps {
+            score += (uplink.min(1000) as f64 / 1000.0) * 0.2;
+        }
+
+        // Can relay (0.1)
+        if self.can_relay {
+            score += 0.1;
+        }
+
+        score.min(1.0)
+    }
+}
+
+/// Node operational status
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NodeStatus {
+    /// Fully operational
+    Online,
+    /// Operational but with reduced capacity
+    Degraded,
+    /// Draining connections, no new work
+    Draining,
+    /// Under maintenance, may return
+    Maintenance,
+    /// Not responding
+    Offline,
+    /// Starting up
+    Starting,
+    /// Gracefully shutting down
+    ShuttingDown,
+}
+
+impl NodeStatus {
+    /// Whether node can accept new work
+    pub fn accepts_work(&self) -> bool {
+        matches!(self, NodeStatus::Online | NodeStatus::Degraded)
+    }
+
+    /// Whether node is reachable
+    pub fn is_reachable(&self) -> bool {
+        !matches!(self, NodeStatus::Offline)
+    }
+
+    /// Priority for routing (higher = prefer)
+    pub fn routing_priority(&self) -> u8 {
+        match self {
+            NodeStatus::Online => 5,
+            NodeStatus::Degraded => 3,
+            NodeStatus::Draining => 1,
+            NodeStatus::ShuttingDown => 0,
+            NodeStatus::Starting => 2,
+            NodeStatus::Maintenance => 0,
+            NodeStatus::Offline => 0,
+        }
+    }
+}
+
+/// Complete node metadata
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeMetadata {
+    /// Unique node identifier
+    pub node_id: NodeId,
+    /// Human-readable node name
+    pub name: Option<String>,
+    /// Node description
+    pub description: Option<String>,
+    /// Owner identifier (org, user, etc.)
+    pub owner: Option<String>,
+    /// Geographic location
+    pub location: Option<LocationInfo>,
+    /// Topology hints
+    pub topology: TopologyHints,
+    /// Current status
+    pub status: NodeStatus,
+    /// Custom key-value metadata
+    pub custom: HashMap<String, String>,
+    /// Metadata version (monotonic)
+    pub version: u64,
+    /// Last update timestamp (Unix millis)
+    pub updated_at: u64,
+    /// Creation timestamp (Unix millis)
+    pub created_at: u64,
+    /// Tags for categorization
+    pub tags: HashSet<String>,
+    /// Node roles
+    pub roles: HashSet<String>,
+}
+
+impl NodeMetadata {
+    /// Create new node metadata
+    pub fn new(node_id: NodeId) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        Self {
+            node_id,
+            name: None,
+            description: None,
+            owner: None,
+            location: None,
+            topology: TopologyHints::default(),
+            status: NodeStatus::Starting,
+            custom: HashMap::new(),
+            version: 1,
+            updated_at: now,
+            created_at: now,
+            tags: HashSet::new(),
+            roles: HashSet::new(),
+        }
+    }
+
+    /// Set name
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Set owner
+    pub fn with_owner(mut self, owner: impl Into<String>) -> Self {
+        self.owner = Some(owner.into());
+        self
+    }
+
+    /// Set location
+    pub fn with_location(mut self, location: LocationInfo) -> Self {
+        self.location = Some(location);
+        self
+    }
+
+    /// Set topology
+    pub fn with_topology(mut self, topology: TopologyHints) -> Self {
+        self.topology = topology;
+        self
+    }
+
+    /// Set status
+    pub fn with_status(mut self, status: NodeStatus) -> Self {
+        self.status = status;
+        self
+    }
+
+    /// Add tag
+    pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
+        self.tags.insert(tag.into());
+        self
+    }
+
+    /// Add role
+    pub fn with_role(mut self, role: impl Into<String>) -> Self {
+        self.roles.insert(role.into());
+        self
+    }
+
+    /// Add custom metadata
+    pub fn with_custom(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.custom.insert(key.into(), value.into());
+        self
+    }
+
+    /// Update and increment version
+    pub fn touch(&mut self) {
+        self.version += 1;
+        self.updated_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+    }
+
+    /// Get age since last update
+    pub fn age(&self) -> Duration {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        Duration::from_millis(now.saturating_sub(self.updated_at))
+    }
+
+    /// Check if metadata is stale
+    pub fn is_stale(&self, max_age: Duration) -> bool {
+        self.age() > max_age
+    }
+
+    /// Calculate routing score for this node
+    pub fn routing_score(&self) -> f64 {
+        let mut score = 0.0;
+
+        // Status priority (0-0.5)
+        score += (self.status.routing_priority() as f64) * 0.1;
+
+        // Topology score (0-0.3)
+        score += self.topology.connectivity_score() * 0.3;
+
+        // Tier bonus (0-0.2)
+        score += (self.topology.tier.priority() as f64) * 0.04;
+
+        score.min(1.0)
+    }
+}
+
+/// Query filter for metadata store
+#[derive(Debug, Clone, Default)]
+pub struct MetadataQuery {
+    /// Filter by status
+    pub status: Option<NodeStatus>,
+    /// Filter by statuses (any match)
+    pub statuses: Option<Vec<NodeStatus>>,
+    /// Filter by region continent
+    pub continent: Option<String>,
+    /// Filter by region
+    pub region: Option<Region>,
+    /// Filter by minimum tier
+    pub min_tier: Option<NetworkTier>,
+    /// Filter by tag (all must match)
+    pub tags: Option<Vec<String>>,
+    /// Filter by role (all must match)
+    pub roles: Option<Vec<String>>,
+    /// Filter by owner
+    pub owner: Option<String>,
+    /// Maximum age since last update
+    pub max_age: Option<Duration>,
+    /// Must accept new work
+    pub accepts_work: Option<bool>,
+    /// Must be able to relay
+    pub can_relay: Option<bool>,
+    /// Maximum results
+    pub limit: Option<usize>,
+}
+
+impl MetadataQuery {
+    /// Create empty query
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Filter by status
+    pub fn with_status(mut self, status: NodeStatus) -> Self {
+        self.status = Some(status);
+        self
+    }
+
+    /// Filter by multiple statuses
+    pub fn with_statuses(mut self, statuses: Vec<NodeStatus>) -> Self {
+        self.statuses = Some(statuses);
+        self
+    }
+
+    /// Filter by continent
+    pub fn with_continent(mut self, continent: impl Into<String>) -> Self {
+        self.continent = Some(continent.into());
+        self
+    }
+
+    /// Filter by region
+    pub fn with_region(mut self, region: Region) -> Self {
+        self.region = Some(region);
+        self
+    }
+
+    /// Filter by minimum tier
+    pub fn with_min_tier(mut self, tier: NetworkTier) -> Self {
+        self.min_tier = Some(tier);
+        self
+    }
+
+    /// Filter by tags
+    pub fn with_tags(mut self, tags: Vec<String>) -> Self {
+        self.tags = Some(tags);
+        self
+    }
+
+    /// Filter by roles
+    pub fn with_roles(mut self, roles: Vec<String>) -> Self {
+        self.roles = Some(roles);
+        self
+    }
+
+    /// Filter by owner
+    pub fn with_owner(mut self, owner: impl Into<String>) -> Self {
+        self.owner = Some(owner.into());
+        self
+    }
+
+    /// Filter by max age
+    pub fn with_max_age(mut self, max_age: Duration) -> Self {
+        self.max_age = Some(max_age);
+        self
+    }
+
+    /// Filter nodes that accept work
+    pub fn accepting_work(mut self) -> Self {
+        self.accepts_work = Some(true);
+        self
+    }
+
+    /// Filter nodes that can relay
+    pub fn can_relay(mut self) -> Self {
+        self.can_relay = Some(true);
+        self
+    }
+
+    /// Limit results
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Check if metadata matches query
+    pub fn matches(&self, meta: &NodeMetadata) -> bool {
+        // Status filter
+        if let Some(status) = self.status {
+            if meta.status != status {
+                return false;
+            }
+        }
+
+        // Multiple statuses
+        if let Some(ref statuses) = self.statuses {
+            if !statuses.contains(&meta.status) {
+                return false;
+            }
+        }
+
+        // Continent filter
+        if let Some(ref continent) = self.continent {
+            if let Some(ref loc) = meta.location {
+                if loc.region.continent() != continent {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        // Region filter
+        if let Some(ref region) = self.region {
+            if let Some(ref loc) = meta.location {
+                if &loc.region != region {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        // Tier filter
+        if let Some(min_tier) = self.min_tier {
+            if meta.topology.tier < min_tier {
+                return false;
+            }
+        }
+
+        // Tags filter (all must match)
+        if let Some(ref tags) = self.tags {
+            for tag in tags {
+                if !meta.tags.contains(tag) {
+                    return false;
+                }
+            }
+        }
+
+        // Roles filter (all must match)
+        if let Some(ref roles) = self.roles {
+            for role in roles {
+                if !meta.roles.contains(role) {
+                    return false;
+                }
+            }
+        }
+
+        // Owner filter
+        if let Some(ref owner) = self.owner {
+            if meta.owner.as_ref() != Some(owner) {
+                return false;
+            }
+        }
+
+        // Age filter
+        if let Some(max_age) = self.max_age {
+            if meta.is_stale(max_age) {
+                return false;
+            }
+        }
+
+        // Accepts work filter
+        if let Some(accepts) = self.accepts_work {
+            if meta.status.accepts_work() != accepts {
+                return false;
+            }
+        }
+
+        // Can relay filter
+        if let Some(can_relay) = self.can_relay {
+            if meta.topology.can_relay != can_relay {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+/// Metadata store errors
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataError {
+    /// Node not found
+    NotFound(NodeId),
+    /// Version conflict
+    VersionConflict {
+        /// Expected metadata version
+        expected: u64,
+        /// Actual metadata version
+        actual: u64,
+    },
+    /// Invalid metadata
+    Invalid(String),
+    /// Store capacity exceeded
+    CapacityExceeded,
+}
+
+impl std::fmt::Display for MetadataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetadataError::NotFound(_) => write!(f, "Node not found"),
+            MetadataError::VersionConflict { expected, actual } => {
+                write!(f, "Version conflict: expected {}, got {}", expected, actual)
+            }
+            MetadataError::Invalid(msg) => write!(f, "Invalid metadata: {}", msg),
+            MetadataError::CapacityExceeded => write!(f, "Store capacity exceeded"),
+        }
+    }
+}
+
+impl std::error::Error for MetadataError {}
+
+/// Statistics for MetadataStore
+#[derive(Debug, Clone, Default)]
+pub struct MetadataStoreStats {
+    /// Total nodes stored
+    pub total_nodes: usize,
+    /// Nodes by status
+    pub by_status: HashMap<NodeStatus, usize>,
+    /// Nodes by tier
+    pub by_tier: HashMap<NetworkTier, usize>,
+    /// Nodes by continent
+    pub by_continent: HashMap<String, usize>,
+    /// Total queries performed
+    pub queries: u64,
+    /// Total updates performed
+    pub updates: u64,
+}
+
+/// High-performance metadata store with indexes
+pub struct MetadataStore {
+    /// Primary storage
+    nodes: DashMap<NodeId, Arc<NodeMetadata>>,
+    /// Index by status
+    by_status: DashMap<NodeStatus, HashSet<NodeId>>,
+    /// Index by tier
+    by_tier: DashMap<NetworkTier, HashSet<NodeId>>,
+    /// Index by continent
+    by_continent: DashMap<String, HashSet<NodeId>>,
+    /// Index by tag
+    by_tag: DashMap<String, HashSet<NodeId>>,
+    /// Index by role
+    by_role: DashMap<String, HashSet<NodeId>>,
+    /// Index by owner
+    by_owner: DashMap<String, HashSet<NodeId>>,
+    /// Query counter
+    query_count: AtomicU64,
+    /// Update counter
+    update_count: AtomicU64,
+    /// Maximum capacity
+    max_capacity: Option<usize>,
+}
+
+impl MetadataStore {
+    /// Create new metadata store
+    pub fn new() -> Self {
+        Self {
+            nodes: DashMap::new(),
+            by_status: DashMap::new(),
+            by_tier: DashMap::new(),
+            by_continent: DashMap::new(),
+            by_tag: DashMap::new(),
+            by_role: DashMap::new(),
+            by_owner: DashMap::new(),
+            query_count: AtomicU64::new(0),
+            update_count: AtomicU64::new(0),
+            max_capacity: None,
+        }
+    }
+
+    /// Create store with capacity limit
+    pub fn with_capacity(max_capacity: usize) -> Self {
+        let mut store = Self::new();
+        store.max_capacity = Some(max_capacity);
+        store
+    }
+
+    /// Insert or update node metadata
+    pub fn upsert(&self, metadata: NodeMetadata) -> Result<(), MetadataError> {
+        let node_id = metadata.node_id;
+
+        // Check capacity
+        if let Some(max) = self.max_capacity {
+            if !self.nodes.contains_key(&node_id) && self.nodes.len() >= max {
+                return Err(MetadataError::CapacityExceeded);
+            }
+        }
+
+        // Remove old indexes if updating
+        if let Some(old) = self.nodes.get(&node_id) {
+            self.remove_from_indexes(&old);
+        }
+
+        // Add to indexes
+        self.add_to_indexes(&metadata);
+
+        // Store
+        self.nodes.insert(node_id, Arc::new(metadata));
+        self.update_count.fetch_add(1, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// Update with version check (optimistic locking)
+    pub fn update_versioned(
+        &self,
+        metadata: NodeMetadata,
+        expected_version: u64,
+    ) -> Result<(), MetadataError> {
+        let node_id = metadata.node_id;
+
+        // Check version
+        if let Some(existing) = self.nodes.get(&node_id) {
+            if existing.version != expected_version {
+                return Err(MetadataError::VersionConflict {
+                    expected: expected_version,
+                    actual: existing.version,
+                });
+            }
+        }
+
+        self.upsert(metadata)
+    }
+
+    /// Get node metadata
+    pub fn get(&self, node_id: &NodeId) -> Option<Arc<NodeMetadata>> {
+        self.nodes.get(node_id).map(|r| Arc::clone(&r))
+    }
+
+    /// Remove node
+    pub fn remove(&self, node_id: &NodeId) -> Option<Arc<NodeMetadata>> {
+        if let Some((_, meta)) = self.nodes.remove(node_id) {
+            self.remove_from_indexes(&meta);
+            Some(meta)
+        } else {
+            None
+        }
+    }
+
+    /// Query nodes
+    pub fn query(&self, query: &MetadataQuery) -> Vec<Arc<NodeMetadata>> {
+        self.query_count.fetch_add(1, Ordering::Relaxed);
+
+        // Use indexes for initial filtering if possible
+        let candidates: Vec<NodeId> = if let Some(status) = query.status {
+            self.by_status
+                .get(&status)
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default()
+        } else if let Some(ref continent) = query.continent {
+            self.by_continent
+                .get(continent)
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default()
+        } else if let Some(min_tier) = query.min_tier {
+            // Collect all nodes at or above min_tier
+            let mut nodes = HashSet::new();
+            for tier in [
+                NetworkTier::Edge,
+                NetworkTier::Consumer,
+                NetworkTier::Business,
+                NetworkTier::Datacenter,
+                NetworkTier::Premium,
+                NetworkTier::Core,
+            ] {
+                if tier >= min_tier {
+                    if let Some(tier_nodes) = self.by_tier.get(&tier) {
+                        nodes.extend(tier_nodes.iter().copied());
+                    }
+                }
+            }
+            nodes.into_iter().collect()
+        } else {
+            // Full scan
+            self.nodes.iter().map(|r| *r.key()).collect()
+        };
+
+        // Filter and collect results
+        let mut results: Vec<Arc<NodeMetadata>> = candidates
+            .into_iter()
+            .filter_map(|id| self.nodes.get(&id).map(|r| Arc::clone(&r)))
+            .filter(|meta| query.matches(meta))
+            .collect();
+
+        // Apply limit
+        if let Some(limit) = query.limit {
+            results.truncate(limit);
+        }
+
+        results
+    }
+
+    /// Find nodes near a location
+    pub fn find_nearby(
+        &self,
+        location: &LocationInfo,
+        max_distance_km: f64,
+        limit: usize,
+    ) -> Vec<(Arc<NodeMetadata>, f64)> {
+        self.query_count.fetch_add(1, Ordering::Relaxed);
+
+        let mut results: Vec<(Arc<NodeMetadata>, f64)> = self
+            .nodes
+            .iter()
+            .filter_map(|r| {
+                let meta = Arc::clone(r.value());
+                meta.location
+                    .as_ref()
+                    .and_then(|loc| location.distance_to(loc))
+                    .filter(|&d| d <= max_distance_km)
+                    .map(|d| (meta, d))
+            })
+            .collect();
+
+        // Sort by distance
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit);
+
+        results
+    }
+
+    /// Find best nodes for routing
+    pub fn find_best_for_routing(&self, limit: usize) -> Vec<Arc<NodeMetadata>> {
+        self.query_count.fetch_add(1, Ordering::Relaxed);
+
+        let mut results: Vec<(Arc<NodeMetadata>, f64)> = self
+            .nodes
+            .iter()
+            .filter(|r| r.value().status.accepts_work())
+            .map(|r| {
+                let meta = Arc::clone(r.value());
+                let score = meta.routing_score();
+                (meta, score)
+            })
+            .collect();
+
+        // Sort by score descending
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit);
+
+        results.into_iter().map(|(m, _)| m).collect()
+    }
+
+    /// Find relay nodes
+    pub fn find_relays(&self) -> Vec<Arc<NodeMetadata>> {
+        self.query(&MetadataQuery::new().can_relay().accepting_work())
+    }
+
+    /// Get statistics
+    pub fn stats(&self) -> MetadataStoreStats {
+        let mut by_status: HashMap<NodeStatus, usize> = HashMap::new();
+        let mut by_tier: HashMap<NetworkTier, usize> = HashMap::new();
+        let mut by_continent: HashMap<String, usize> = HashMap::new();
+
+        for entry in self.nodes.iter() {
+            let meta = entry.value();
+            *by_status.entry(meta.status).or_default() += 1;
+            *by_tier.entry(meta.topology.tier).or_default() += 1;
+            if let Some(ref loc) = meta.location {
+                *by_continent
+                    .entry(loc.region.continent().to_string())
+                    .or_default() += 1;
+            }
+        }
+
+        MetadataStoreStats {
+            total_nodes: self.nodes.len(),
+            by_status,
+            by_tier,
+            by_continent,
+            queries: self.query_count.load(Ordering::Relaxed),
+            updates: self.update_count.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Number of nodes
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// Clear all nodes
+    pub fn clear(&self) {
+        self.nodes.clear();
+        self.by_status.clear();
+        self.by_tier.clear();
+        self.by_continent.clear();
+        self.by_tag.clear();
+        self.by_role.clear();
+        self.by_owner.clear();
+    }
+
+    // Private helper to add node to indexes
+    fn add_to_indexes(&self, meta: &NodeMetadata) {
+        let node_id = meta.node_id;
+
+        // Status index
+        self.by_status
+            .entry(meta.status)
+            .or_default()
+            .insert(node_id);
+
+        // Tier index
+        self.by_tier
+            .entry(meta.topology.tier)
+            .or_default()
+            .insert(node_id);
+
+        // Continent index
+        if let Some(ref loc) = meta.location {
+            self.by_continent
+                .entry(loc.region.continent().to_string())
+                .or_default()
+                .insert(node_id);
+        }
+
+        // Tag index
+        for tag in &meta.tags {
+            self.by_tag.entry(tag.clone()).or_default().insert(node_id);
+        }
+
+        // Role index
+        for role in &meta.roles {
+            self.by_role
+                .entry(role.clone())
+                .or_default()
+                .insert(node_id);
+        }
+
+        // Owner index
+        if let Some(ref owner) = meta.owner {
+            self.by_owner
+                .entry(owner.clone())
+                .or_default()
+                .insert(node_id);
+        }
+    }
+
+    // Private helper to remove node from indexes
+    fn remove_from_indexes(&self, meta: &NodeMetadata) {
+        let node_id = meta.node_id;
+
+        // Status index
+        if let Some(mut set) = self.by_status.get_mut(&meta.status) {
+            set.remove(&node_id);
+        }
+
+        // Tier index
+        if let Some(mut set) = self.by_tier.get_mut(&meta.topology.tier) {
+            set.remove(&node_id);
+        }
+
+        // Continent index
+        if let Some(ref loc) = meta.location {
+            if let Some(mut set) = self.by_continent.get_mut(loc.region.continent()) {
+                set.remove(&node_id);
+            }
+        }
+
+        // Tag index
+        for tag in &meta.tags {
+            if let Some(mut set) = self.by_tag.get_mut(tag) {
+                set.remove(&node_id);
+            }
+        }
+
+        // Role index
+        for role in &meta.roles {
+            if let Some(mut set) = self.by_role.get_mut(role) {
+                set.remove(&node_id);
+            }
+        }
+
+        // Owner index
+        if let Some(ref owner) = meta.owner {
+            if let Some(mut set) = self.by_owner.get_mut(owner) {
+                set.remove(&node_id);
+            }
+        }
+    }
+}
+
+impl Default for MetadataStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_node_id(n: u8) -> NodeId {
+        let mut id = [0u8; 32];
+        id[0] = n;
+        id
+    }
+
+    #[test]
+    fn test_location_distance() {
+        // New York
+        let ny = LocationInfo::new(Region::NorthAmerica("us-east".into()))
+            .with_coordinates(40.7128, -74.0060);
+
+        // Los Angeles
+        let la = LocationInfo::new(Region::NorthAmerica("us-west".into()))
+            .with_coordinates(34.0522, -118.2437);
+
+        // London
+        let london =
+            LocationInfo::new(Region::Europe("uk".into())).with_coordinates(51.5074, -0.1278);
+
+        let ny_la = ny.distance_to(&la).unwrap();
+        assert!(ny_la > 3900.0 && ny_la < 4000.0, "NY-LA: {}", ny_la);
+
+        let ny_london = ny.distance_to(&london).unwrap();
+        assert!(
+            ny_london > 5500.0 && ny_london < 5600.0,
+            "NY-London: {}",
+            ny_london
+        );
+
+        assert!(ny.same_continent(&la));
+        assert!(!ny.same_continent(&london));
+    }
+
+    #[test]
+    fn test_nat_connectivity() {
+        assert!(NatType::None.can_connect_direct(&NatType::Symmetric));
+        assert!(NatType::FullCone.can_connect_direct(&NatType::RestrictedCone));
+        assert!(!NatType::Symmetric.can_connect_direct(&NatType::Symmetric));
+    }
+
+    #[test]
+    fn test_topology_score() {
+        let basic = TopologyHints::new(NetworkTier::Consumer);
+        let premium = TopologyHints::new(NetworkTier::Premium)
+            .with_bandwidth(1000, 1000)
+            .with_nat(NatType::None)
+            .with_relay(100);
+
+        assert!(premium.connectivity_score() > basic.connectivity_score());
+    }
+
+    #[test]
+    fn test_node_metadata() {
+        let node = NodeMetadata::new(make_node_id(1))
+            .with_name("test-node")
+            .with_owner("test-org")
+            .with_tag("gpu")
+            .with_role("worker")
+            .with_status(NodeStatus::Online);
+
+        assert_eq!(node.name, Some("test-node".into()));
+        assert!(node.tags.contains("gpu"));
+        assert!(node.roles.contains("worker"));
+        assert!(node.status.accepts_work());
+    }
+
+    #[test]
+    fn test_metadata_store_basic() {
+        let store = MetadataStore::new();
+
+        let node1 = NodeMetadata::new(make_node_id(1))
+            .with_name("node1")
+            .with_status(NodeStatus::Online);
+
+        let node2 = NodeMetadata::new(make_node_id(2))
+            .with_name("node2")
+            .with_status(NodeStatus::Degraded);
+
+        store.upsert(node1).unwrap();
+        store.upsert(node2).unwrap();
+
+        assert_eq!(store.len(), 2);
+
+        let retrieved = store.get(&make_node_id(1)).unwrap();
+        assert_eq!(retrieved.name, Some("node1".into()));
+
+        store.remove(&make_node_id(1));
+        assert_eq!(store.len(), 1);
+        assert!(store.get(&make_node_id(1)).is_none());
+    }
+
+    #[test]
+    fn test_metadata_query() {
+        let store = MetadataStore::new();
+
+        // Add nodes with different properties
+        for i in 0..10 {
+            let status = if i < 5 {
+                NodeStatus::Online
+            } else {
+                NodeStatus::Degraded
+            };
+            let tier = if i < 3 {
+                NetworkTier::Core
+            } else {
+                NetworkTier::Consumer
+            };
+
+            let mut node = NodeMetadata::new(make_node_id(i))
+                .with_status(status)
+                .with_topology(TopologyHints::new(tier));
+
+            if i % 2 == 0 {
+                node.tags.insert("even".into());
+            }
+
+            store.upsert(node).unwrap();
+        }
+
+        // Query by status
+        let online = store.query(&MetadataQuery::new().with_status(NodeStatus::Online));
+        assert_eq!(online.len(), 5);
+
+        // Query by tier
+        let core = store.query(&MetadataQuery::new().with_min_tier(NetworkTier::Core));
+        assert_eq!(core.len(), 3);
+
+        // Query accepting work
+        let working = store.query(&MetadataQuery::new().accepting_work());
+        assert_eq!(working.len(), 10); // Both Online and Degraded accept work
+
+        // Query with limit
+        let limited = store.query(&MetadataQuery::new().with_limit(3));
+        assert_eq!(limited.len(), 3);
+    }
+
+    #[test]
+    fn test_find_nearby() {
+        let store = MetadataStore::new();
+
+        // Add nodes at different locations
+        let locations = [
+            (40.7128, -74.0060),  // NY
+            (34.0522, -118.2437), // LA
+            (51.5074, -0.1278),   // London
+        ];
+
+        for (i, (lat, lon)) in locations.iter().enumerate() {
+            let node = NodeMetadata::new(make_node_id(i as u8))
+                .with_location(
+                    LocationInfo::new(Region::NorthAmerica("test".into()))
+                        .with_coordinates(*lat, *lon),
+                )
+                .with_status(NodeStatus::Online);
+            store.upsert(node).unwrap();
+        }
+
+        // Find nodes near NY
+        let ny = LocationInfo::new(Region::NorthAmerica("test".into()))
+            .with_coordinates(40.7128, -74.0060);
+
+        let nearby = store.find_nearby(&ny, 100.0, 10);
+        assert_eq!(nearby.len(), 1); // Only NY itself is within 100km
+
+        let nearby = store.find_nearby(&ny, 5000.0, 10);
+        assert_eq!(nearby.len(), 2); // NY and LA within 5000km
+
+        let nearby = store.find_nearby(&ny, 10000.0, 10);
+        assert_eq!(nearby.len(), 3); // All within 10000km
+    }
+
+    #[test]
+    fn test_find_relays() {
+        let store = MetadataStore::new();
+
+        let relay_node = NodeMetadata::new(make_node_id(1))
+            .with_topology(TopologyHints::new(NetworkTier::Datacenter).with_relay(100))
+            .with_status(NodeStatus::Online);
+
+        let normal_node = NodeMetadata::new(make_node_id(2))
+            .with_topology(TopologyHints::new(NetworkTier::Consumer))
+            .with_status(NodeStatus::Online);
+
+        store.upsert(relay_node).unwrap();
+        store.upsert(normal_node).unwrap();
+
+        let relays = store.find_relays();
+        assert_eq!(relays.len(), 1);
+    }
+
+    #[test]
+    fn test_version_conflict() {
+        let store = MetadataStore::new();
+
+        let node = NodeMetadata::new(make_node_id(1));
+        store.upsert(node.clone()).unwrap();
+
+        // Try to update with wrong version
+        let result = store.update_versioned(node.clone(), 999);
+        assert!(matches!(result, Err(MetadataError::VersionConflict { .. })));
+
+        // Update with correct version
+        let result = store.update_versioned(node, 1);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_capacity_limit() {
+        let store = MetadataStore::with_capacity(2);
+
+        store.upsert(NodeMetadata::new(make_node_id(1))).unwrap();
+        store.upsert(NodeMetadata::new(make_node_id(2))).unwrap();
+
+        let result = store.upsert(NodeMetadata::new(make_node_id(3)));
+        assert!(matches!(result, Err(MetadataError::CapacityExceeded)));
+
+        // Can still update existing
+        store.upsert(NodeMetadata::new(make_node_id(1))).unwrap();
+    }
+
+    #[test]
+    fn test_stats() {
+        let store = MetadataStore::new();
+
+        for i in 0..5 {
+            let node = NodeMetadata::new(make_node_id(i))
+                .with_status(if i < 3 {
+                    NodeStatus::Online
+                } else {
+                    NodeStatus::Offline
+                })
+                .with_topology(TopologyHints::new(NetworkTier::Consumer));
+            store.upsert(node).unwrap();
+        }
+
+        // Perform some queries
+        store.query(&MetadataQuery::new());
+        store.query(&MetadataQuery::new());
+
+        let stats = store.stats();
+        assert_eq!(stats.total_nodes, 5);
+        assert_eq!(stats.by_status.get(&NodeStatus::Online), Some(&3));
+        assert_eq!(stats.by_status.get(&NodeStatus::Offline), Some(&2));
+        assert_eq!(stats.queries, 2);
+        assert_eq!(stats.updates, 5);
+    }
+}

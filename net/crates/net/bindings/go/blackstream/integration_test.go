@@ -1,0 +1,375 @@
+// Integration tests for Blackstream Go bindings with BLTP.
+//
+// Run tests:
+//
+//	RUN_INTEGRATION_TESTS=1 go test -v
+//
+// Environment variables:
+//
+//	RUN_INTEGRATION_TESTS - Set to "1" to run integration tests
+package blackstream
+
+import (
+	"fmt"
+	"os"
+	"testing"
+	"time"
+)
+
+var (
+	runTests = os.Getenv("RUN_INTEGRATION_TESTS") == "1"
+)
+
+func skipIfNotEnabled(t *testing.T) {
+	if !runTests {
+		t.Skip("Set RUN_INTEGRATION_TESTS=1 to run integration tests")
+	}
+}
+
+// BLTP Integration Tests
+
+// bltpAvailable checks if BLTP feature is available
+func bltpAvailable() bool {
+	_, err := GenerateBltpKeypair()
+	return err == nil
+}
+
+func skipIfBltpNotEnabled(t *testing.T) {
+	skipIfNotEnabled(t)
+	if !bltpAvailable() {
+		t.Skip("BLTP feature not available (build with BLTP feature enabled)")
+	}
+}
+
+// generatePSK generates a random 32-byte PSK as hex string
+func generatePSK() string {
+	// Use crypto/rand for secure random bytes
+	b := make([]byte, 32)
+	for i := range b {
+		b[i] = byte(time.Now().UnixNano() + int64(i))
+	}
+	return fmt.Sprintf("%x", b)
+}
+
+func TestBltpGenerateKeypair(t *testing.T) {
+	skipIfBltpNotEnabled(t)
+
+	keypair, err := GenerateBltpKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	// Keys should be 32 bytes hex-encoded (64 hex chars)
+	if len(keypair.PublicKey) != 64 {
+		t.Errorf("Expected public key length 64, got %d", len(keypair.PublicKey))
+	}
+	if len(keypair.SecretKey) != 64 {
+		t.Errorf("Expected secret key length 64, got %d", len(keypair.SecretKey))
+	}
+
+	// Each call should generate different keypairs
+	keypair2, err := GenerateBltpKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate second keypair: %v", err)
+	}
+
+	if keypair.PublicKey == keypair2.PublicKey {
+		t.Error("Expected different public keys for each generation")
+	}
+	if keypair.SecretKey == keypair2.SecretKey {
+		t.Error("Expected different secret keys for each generation")
+	}
+}
+
+func TestBltpExchangeEvents(t *testing.T) {
+	skipIfBltpNotEnabled(t)
+
+	// Generate keypair for responder
+	responderKeypair, err := GenerateBltpKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	// Generate shared PSK
+	psk := generatePSK()
+
+	// Create responder (binds first, waits for initiator)
+	responder, err := New(&Config{
+		NumShards: 1,
+		Bltp: &BltpConfig{
+			BindAddr:    "127.0.0.1:19200",
+			PeerAddr:    "127.0.0.1:19201",
+			PSK:         psk,
+			Role:        "responder",
+			SecretKey:   responderKeypair.SecretKey,
+			PublicKey:   responderKeypair.PublicKey,
+			Reliability: "light",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to create responder: %v", err)
+	}
+	defer responder.Shutdown()
+
+	// Small delay to ensure responder is ready
+	time.Sleep(50 * time.Millisecond)
+
+	// Create initiator
+	initiator, err := New(&Config{
+		NumShards: 1,
+		Bltp: &BltpConfig{
+			BindAddr:      "127.0.0.1:19201",
+			PeerAddr:      "127.0.0.1:19200",
+			PSK:           psk,
+			Role:          "initiator",
+			PeerPublicKey: responderKeypair.PublicKey,
+			Reliability:   "light",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to create initiator: %v", err)
+	}
+	defer initiator.Shutdown()
+
+	// Wait for handshake to complete
+	time.Sleep(200 * time.Millisecond)
+
+	// Initiator sends events to responder
+	for i := 0; i < 5; i++ {
+		err := initiator.IngestRaw(fmt.Sprintf(`{"source": "initiator", "index": %d}`, i))
+		if err != nil {
+			t.Fatalf("Failed to ingest from initiator: %v", err)
+		}
+	}
+
+	// Responder sends events to initiator
+	for i := 0; i < 5; i++ {
+		err := responder.IngestRaw(fmt.Sprintf(`{"source": "responder", "index": %d}`, i))
+		if err != nil {
+			t.Fatalf("Failed to ingest from responder: %v", err)
+		}
+	}
+
+	// Wait for events to propagate
+	time.Sleep(500 * time.Millisecond)
+
+	// Poll from both sides
+	initiatorEvents, err := initiator.Poll(100, "")
+	if err != nil {
+		t.Fatalf("Failed to poll from initiator: %v", err)
+	}
+
+	responderEvents, err := responder.Poll(100, "")
+	if err != nil {
+		t.Fatalf("Failed to poll from responder: %v", err)
+	}
+
+	// Both should have received events
+	if len(initiatorEvents.Events) == 0 {
+		t.Error("Initiator should have received events")
+	}
+	if len(responderEvents.Events) == 0 {
+		t.Error("Responder should have received events")
+	}
+}
+
+func TestBltpBatchIngestion(t *testing.T) {
+	skipIfBltpNotEnabled(t)
+
+	responderKeypair, err := GenerateBltpKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	psk := generatePSK()
+
+	responder, err := New(&Config{
+		NumShards: 1,
+		Bltp: &BltpConfig{
+			BindAddr:  "127.0.0.1:19202",
+			PeerAddr:  "127.0.0.1:19203",
+			PSK:       psk,
+			Role:      "responder",
+			SecretKey: responderKeypair.SecretKey,
+			PublicKey: responderKeypair.PublicKey,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to create responder: %v", err)
+	}
+	defer responder.Shutdown()
+
+	time.Sleep(50 * time.Millisecond)
+
+	initiator, err := New(&Config{
+		NumShards: 1,
+		Bltp: &BltpConfig{
+			BindAddr:      "127.0.0.1:19203",
+			PeerAddr:      "127.0.0.1:19202",
+			PSK:           psk,
+			Role:          "initiator",
+			PeerPublicKey: responderKeypair.PublicKey,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to create initiator: %v", err)
+	}
+	defer initiator.Shutdown()
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Batch ingest
+	events := make([]string, 20)
+	for i := 0; i < 20; i++ {
+		events[i] = fmt.Sprintf(`{"batch_index": %d}`, i)
+	}
+	count := initiator.IngestRawBatch(events)
+	if count != 20 {
+		t.Errorf("Expected 20 ingested, got %d", count)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	response, err := responder.Poll(100, "")
+	if err != nil {
+		t.Fatalf("Failed to poll: %v", err)
+	}
+
+	if len(response.Events) == 0 {
+		t.Error("Responder should have received batched events")
+	}
+}
+
+func TestBltpFullReliabilityMode(t *testing.T) {
+	skipIfBltpNotEnabled(t)
+
+	responderKeypair, err := GenerateBltpKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	psk := generatePSK()
+
+	responder, err := New(&Config{
+		NumShards: 1,
+		Bltp: &BltpConfig{
+			BindAddr:            "127.0.0.1:19204",
+			PeerAddr:            "127.0.0.1:19205",
+			PSK:                 psk,
+			Role:                "responder",
+			SecretKey:           responderKeypair.SecretKey,
+			PublicKey:           responderKeypair.PublicKey,
+			Reliability:         "full",
+			HeartbeatIntervalMs: 1000,
+			SessionTimeoutMs:    10000,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to create responder: %v", err)
+	}
+	defer responder.Shutdown()
+
+	time.Sleep(50 * time.Millisecond)
+
+	initiator, err := New(&Config{
+		NumShards: 1,
+		Bltp: &BltpConfig{
+			BindAddr:            "127.0.0.1:19205",
+			PeerAddr:            "127.0.0.1:19204",
+			PSK:                 psk,
+			Role:                "initiator",
+			PeerPublicKey:       responderKeypair.PublicKey,
+			Reliability:         "full",
+			HeartbeatIntervalMs: 1000,
+			SessionTimeoutMs:    10000,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to create initiator: %v", err)
+	}
+	defer initiator.Shutdown()
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Send events with full reliability
+	for i := 0; i < 10; i++ {
+		err := initiator.IngestRaw(fmt.Sprintf(`{"reliable": true, "seq": %d}`, i))
+		if err != nil {
+			t.Fatalf("Failed to ingest: %v", err)
+		}
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	response, err := responder.Poll(100, "")
+	if err != nil {
+		t.Fatalf("Failed to poll: %v", err)
+	}
+
+	if len(response.Events) == 0 {
+		t.Error("Responder should have received reliable events")
+	}
+}
+
+func TestBltpStats(t *testing.T) {
+	skipIfBltpNotEnabled(t)
+
+	responderKeypair, err := GenerateBltpKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	psk := generatePSK()
+
+	responder, err := New(&Config{
+		NumShards: 1,
+		Bltp: &BltpConfig{
+			BindAddr:  "127.0.0.1:19206",
+			PeerAddr:  "127.0.0.1:19207",
+			PSK:       psk,
+			Role:      "responder",
+			SecretKey: responderKeypair.SecretKey,
+			PublicKey: responderKeypair.PublicKey,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to create responder: %v", err)
+	}
+	defer responder.Shutdown()
+
+	time.Sleep(50 * time.Millisecond)
+
+	initiator, err := New(&Config{
+		NumShards: 1,
+		Bltp: &BltpConfig{
+			BindAddr:      "127.0.0.1:19207",
+			PeerAddr:      "127.0.0.1:19206",
+			PSK:           psk,
+			Role:          "initiator",
+			PeerPublicKey: responderKeypair.PublicKey,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to create initiator: %v", err)
+	}
+	defer initiator.Shutdown()
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Ingest some events
+	for i := 0; i < 25; i++ {
+		err := initiator.IngestRaw(fmt.Sprintf(`{"stat_index": %d}`, i))
+		if err != nil {
+			t.Fatalf("Failed to ingest: %v", err)
+		}
+	}
+
+	stats, err := initiator.Stats()
+	if err != nil {
+		t.Fatalf("Failed to get stats: %v", err)
+	}
+
+	if stats.EventsIngested < 25 {
+		t.Errorf("Expected at least 25 ingested events, got %d", stats.EventsIngested)
+	}
+}

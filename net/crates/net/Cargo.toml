@@ -1,0 +1,149 @@
+[workspace]
+members = [
+    ".",
+    "bindings/node",
+    "bindings/python",
+]
+
+[package]
+name = "blackstream"
+version = "0.5.0"
+edition = "2021"
+description = "High-performance, schema-agnostic, backend-agnostic event bus"
+license = "Apache-2.0"
+repository = "https://github.com/ai-2070/blackstream"
+keywords = ["event-bus", "high-performance", "streaming"]
+categories = ["asynchronous", "concurrency", "data-structures"]
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[features]
+default = ["redis"]
+redis = ["dep:redis"]
+jetstream = ["dep:async-nats"]
+bltp = [
+    "dep:chacha20poly1305",
+    "dep:snow",
+    "dep:getrandom",
+    "dep:dashmap",
+    "dep:crossbeam-queue",
+    "dep:socket2",
+    "dep:hex",
+    "dep:libc",
+    "dep:blake2",
+]
+regex = ["dep:regex"]
+ffi = []
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net"] }
+
+# JSON handling (schema-agnostic)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# High-performance primitives
+crossbeam-utils = "0.8"
+parking_lot = "0.12"
+
+# Hashing
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Zero-copy bytes
+bytes = "1"
+
+# Timestamp generation
+quanta = "0.12"
+
+# Base64 encoding for cursors
+base64 = "0.22"
+
+# Async utilities
+async-trait = "0.1"
+futures = "0.3"
+
+# Error handling
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+arc-swap = "1.7.1"
+
+# BLTP adapter (optional)
+chacha20poly1305 = { version = "0.10", optional = true }
+snow = { version = "0.10.0", optional = true }
+getrandom = { version = "0.4.2", optional = true }
+dashmap = { version = "6", optional = true }
+crossbeam-queue = { version = "0.3", optional = true }
+socket2 = { version = "0.6", features = ["all"], optional = true }
+hex = { version = "0.4", optional = true }
+libc = { version = "0.2", optional = true }
+blake2 = { version = "0.10", optional = true }
+regex = { version = "1", optional = true }
+
+# Redis adapter (optional)
+redis = { version = "1.2", features = ["tokio-comp", "connection-manager"], optional = true }
+
+# JetStream adapter (optional)
+async-nats = { version = "0.47", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
+rand = "0.10"
+
+[[bench]]
+name = "ingestion"
+harness = false
+
+[[bench]]
+name = "parallel"
+harness = false
+
+[[bench]]
+name = "bltp"
+harness = false
+required-features = ["bltp"]
+
+[[test]]
+name = "integration_redis"
+path = "tests/integration_redis.rs"
+required-features = ["redis"]
+
+[[test]]
+name = "integration_jetstream"
+path = "tests/integration_jetstream.rs"
+required-features = ["jetstream"]
+
+[[test]]
+name = "integration_bltp"
+path = "tests/integration_bltp.rs"
+required-features = ["bltp"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+
+[profile.bench]
+lto = true
+codegen-units = 1
+
+# Fast compile times for development
+[profile.dev]
+opt-level = 0
+debug = true
+
+# Release with debug symbols for profiling
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+
+# Maximum performance for local benchmarks
+# Use: RUSTFLAGS="-C target-cpu=native" cargo build --profile native
+[profile.native]
+inherits = "release"
+lto = "thin"  # Faster link times than full LTO
