@@ -33,7 +33,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     defaults:
       run:
-        working-directory: bindings/node
+        working-directory: net/crates/net/bindings/node
 
     steps:
       - uses: actions/checkout@v6
@@ -75,7 +75,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: bindings-${{ matrix.target }}
-          path: bindings/node/*.node
+          path: net/crates/net/bindings/node/*.node
           if-no-files-found: error
 
   publish:
@@ -83,7 +83,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: bindings/node
+        working-directory: net/crates/net/bindings/node
 
     steps:
       - uses: actions/checkout@v6
@@ -100,7 +100,7 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
-          path: bindings/node/artifacts
+          path: net/crates/net/bindings/node/artifacts
 
       - name: Move artifacts
         run: npm run artifacts

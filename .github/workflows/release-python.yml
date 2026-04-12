@@ -29,13 +29,13 @@ jobs:
           args: --release --out dist --find-interpreter --features redis
           sccache: "true"
           manylinux: auto
-          working-directory: bindings/python
+          working-directory: net/crates/net/bindings/python
 
       - name: Upload wheels
         uses: actions/upload-artifact@v7
         with:
           name: wheels-linux-${{ matrix.target }}
-          path: bindings/python/dist
+          path: net/crates/net/bindings/python/dist
 
   macos:
     runs-on: macos-latest
@@ -55,13 +55,13 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist --find-interpreter --features redis
           sccache: "true"
-          working-directory: bindings/python
+          working-directory: net/crates/net/bindings/python
 
       - name: Upload wheels
         uses: actions/upload-artifact@v7
         with:
           name: wheels-macos-${{ matrix.target }}
-          path: bindings/python/dist
+          path: net/crates/net/bindings/python/dist
 
   windows:
     runs-on: windows-latest
@@ -81,13 +81,13 @@ jobs:
         with:
           args: --release --out dist --find-interpreter --features redis
           sccache: "true"
-          working-directory: bindings/python
+          working-directory: net/crates/net/bindings/python
 
       - name: Upload wheels
         uses: actions/upload-artifact@v7
         with:
           name: wheels-windows-${{ matrix.target }}
-          path: bindings/python/dist
+          path: net/crates/net/bindings/python/dist
 
   sdist:
     runs-on: ubuntu-latest
@@ -99,13 +99,13 @@ jobs:
         with:
           command: sdist
           args: --out dist
-          working-directory: bindings/python
+          working-directory: net/crates/net/bindings/python
 
       - name: Upload sdist
         uses: actions/upload-artifact@v7
         with:
           name: wheels-sdist
-          path: bindings/python/dist
+          path: net/crates/net/bindings/python/dist
 
   publish:
     needs: [linux, macos, windows, sdist]
