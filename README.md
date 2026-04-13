@@ -42,23 +42,23 @@ This is the gap: a system that operates at hardware timescales, on commodity har
 
 ## Properties
 
-- **Latency-first.** The entire stack is designed so that "within the time window" is measured in nanoseconds. Sub-nanosecond header serialization. Nanosecond-scale heartbeats, forwarding hops, and failure recovery. The floor is low enough that packet scheduling operates at timescales traditionally reserved for local function calls. See [Benchmarks](#benchmarks) for measured numbers.
+**Latency-first.** The entire stack is designed so that "within the time window" is measured in nanoseconds. Sub-nanosecond header serialization. Nanosecond-scale heartbeats, forwarding hops, and failure recovery. The floor is low enough that packet scheduling operates at timescales traditionally reserved for local function calls. See [Benchmarks](#benchmarks) for measured numbers.
 
-- **Streaming-first.** Data is a continuous flow, not documents. The event bus, sharded ring buffers, and adaptive batching assume data is produced incrementally and consumed incrementally. There are no requests and responses. There are streams.
+**Streaming-first.** Data is a continuous flow, not documents. The event bus, sharded ring buffers, and adaptive batching assume data is produced incrementally and consumed incrementally. There are no requests and responses. There are streams.
 
-- **Zero-copy.** Ring buffers, no garbage collector, native Rust. Forwarding doesn't allocate or copy payload data. This is what makes the per-hop numbers possible and it's a design principle, not just an optimization.
+**Zero-copy.** Ring buffers, no garbage collector, native Rust. Forwarding doesn't allocate or copy payload data. This is what makes the per-hop numbers possible and it's a design principle, not just an optimization.
 
-- **Encrypted end-to-end.** Noise protocol handshakes for key exchange. ChaCha20-Poly1305 authenticated encryption. Every packet is encrypted between source and destination. Intermediate nodes never see plaintext.
+**Encrypted end-to-end.** Noise protocol handshakes for key exchange. ChaCha20-Poly1305 authenticated encryption. Every packet is encrypted between source and destination. Intermediate nodes never see plaintext.
 
-- **Untrusted relay.** Nodes forward packets without decrypting payloads. The mesh can route through infrastructure you don't trust. Combined with E2E encryption, this means the network can grow through adversarial nodes.
+**Untrusted relay.** Nodes forward packets without decrypting payloads. The mesh can route through infrastructure you don't trust. Combined with E2E encryption, this means the network can grow through adversarial nodes.
 
-- **Schema-agnostic.** The transport layer moves bytes, not structures. A raw event is payload plus hash. The protocol never inspects content. Structure is optional and emerges where participants agree on it - two nodes can negotiate typed, ordered streams while the rest of the mesh passes opaque bytes.
+**Schema-agnostic.** The transport layer moves bytes, not structures. A raw event is payload plus hash. The protocol never inspects content. Structure is optional and emerges where participants agree on it - two nodes can negotiate typed, ordered streams while the rest of the mesh passes opaque bytes.
 
-- **Optionally ordered.** Ordering is per-stream, not global. The unordered path is the fast path. Causal ordering is available when streams need it. The cost of ordering is paid only by streams that require it.
+**Optionally ordered.** Ordering is per-stream, not global. The unordered path is the fast path. Causal ordering is available when streams need it. The cost of ordering is paid only by streams that require it.
 
-- **Optionally typed.** The protocol doesn't care what's in the payload. The behavior plane can. Typing is a local agreement between nodes, not a network requirement.
+**Optionally typed.** The protocol doesn't care what's in the payload. The behavior plane can. Typing is a local agreement between nodes, not a network requirement.
 
-- **Native backpressure.** Nodes drop packets without reply. This isn't a failure mode - it's the design. The proximity graph makes silence a signal, not an error. A node that stops responding doesn't need to send an error. Its neighbors already know within a heartbeat interval.
+**Native backpressure.** Nodes drop packets without reply. This isn't a failure mode - it's the design. The proximity graph makes silence a signal, not an error. A node that stops responding doesn't need to send an error. Its neighbors already know within a heartbeat interval.
 
 ## Queues
 
