@@ -194,7 +194,7 @@ This means you can scale a deployment by adding cheap nodes for coverage and a f
 
 ## Security
 
-The mesh is encrypted end-to-end with no trusted intermediaries. This isn't a layer on top -- it's a consequence of how forwarding works.
+The mesh is encrypted end-to-end with no trusted intermediaries. This isn't a layer on top - it's a consequence of how forwarding works.
 
 **No plaintext on relays.** Zero-copy forwarding means relay nodes pass encrypted bytes through without decrypting. There's no moment where the payload is readable in memory on an untrusted node. Nothing to sniff, nothing to dump, nothing to log.
 
@@ -204,7 +204,7 @@ The mesh is encrypted end-to-end with no trusted intermediaries. This isn't a la
 
 **No connection state to hijack.** There's no TCP session to take over, no cookie to steal, no sequence number to predict. State propagates through the mesh, not through connections. There's nothing persistent on the wire to attack.
 
-This is different from TLS, where every hop that terminates TLS -- load balancers, proxies, CDNs -- sees plaintext. The standard web architecture is a chain of trusted intermediaries. Net has no trusted intermediaries. There's nothing to trust them with.
+This is different from TLS, where every hop that terminates TLS - load balancers, proxies, CDNs - sees plaintext. The standard web architecture is a chain of trusted intermediaries. Net has no trusted intermediaries. There's nothing to trust them with.
 
 ## Benchmarks
 
