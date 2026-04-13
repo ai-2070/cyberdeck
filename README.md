@@ -16,7 +16,7 @@ It's the wrong design for now. Data is abundant. Nodes are abundant. Bandwidth i
 
 TCP also presumes that most actors are good. The protocol is cooperative - it assumes both sides want the connection to succeed, that routers will forward honestly, that congestion control will be respected. The entire internet is built on this assumption. It works until it doesn't.
 
-Net makes no presumptions about actors. The only axiom is self-preservation: a node must survive by not getting overloaded. Everything else follows from that. Nodes drop what they can't handle. Relay nodes can't read what they forward. Capability announcements can be verified against behavior. Trust isn't assumed - it's derived from observation. A node that claims capacity it doesn't have will be routed around when its silence or latency betrays it.
+The Net makes no presumptions about actors. The only axiom is self-preservation: a node must survive by not getting overloaded. Everything else follows from that. Nodes drop what they can't handle. Relay nodes can't read what they forward. Capability announcements can be verified against behavior. Trust isn't assumed - it's derived from observation. A node that claims capacity it doesn't have will be routed around when its silence or latency betrays it.
 
 Net inverts the default. TCP starts with trust and detects abuse. Net starts with zero assumptions and lets trust emerge from consistent behavior.
 
