@@ -4,7 +4,6 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use super::crypto::StaticKeypair;
-use super::session::CipherMode;
 
 /// Reliability configuration for BLTP streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -76,8 +75,6 @@ pub struct BltpAdapterConfig {
     pub socket_send_buffer: Option<usize>,
     /// Number of shards (used to map stream IDs to shard IDs on receive)
     pub num_shards: u16,
-    /// Cipher mode (must match the remote peer)
-    pub cipher_mode: CipherMode,
 }
 
 impl BltpAdapterConfig {
@@ -122,7 +119,6 @@ impl BltpAdapterConfig {
             socket_recv_buffer: None,
             socket_send_buffer: None,
             num_shards: 1,
-            cipher_mode: CipherMode::default(),
         }
     }
 
@@ -152,19 +148,12 @@ impl BltpAdapterConfig {
             socket_recv_buffer: None,
             socket_send_buffer: None,
             num_shards: 1,
-            cipher_mode: CipherMode::default(),
         }
     }
 
     /// Set the number of shards
     pub fn with_num_shards(mut self, num_shards: u16) -> Self {
         self.num_shards = num_shards;
-        self
-    }
-
-    /// Set the cipher mode (must match the remote peer)
-    pub fn with_cipher_mode(mut self, cipher_mode: CipherMode) -> Self {
-        self.cipher_mode = cipher_mode;
         self
     }
 

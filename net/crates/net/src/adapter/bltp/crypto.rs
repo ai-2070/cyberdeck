@@ -2,18 +2,18 @@
 //!
 //! This module provides:
 //! - Noise protocol handshake (NKpsk0 pattern)
-//! - XChaCha20-Poly1305 AEAD encryption
+//! - ChaCha20-Poly1305 AEAD encryption with counter-based nonces
 //! - Key derivation for session keys
 
 use bytes::BytesMut;
 use chacha20poly1305::{
     aead::{Aead, AeadInPlace, KeyInit},
-    ChaCha20Poly1305, XChaCha20Poly1305, XNonce,
+    ChaCha20Poly1305,
 };
 use snow::{params::NoiseParams, Builder, HandshakeState};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::protocol::{FAST_NONCE_SIZE, NONCE_SIZE, TAG_SIZE};
+use super::protocol::{NONCE_SIZE, TAG_SIZE};
 
 /// Noise protocol pattern: NKpsk0
 ///
@@ -264,129 +264,7 @@ impl NoiseHandshake {
     }
 }
 
-/// Cipher for encrypting/decrypting packets
-#[derive(Clone)]
-pub struct PacketCipher {
-    cipher: XChaCha20Poly1305,
-}
-
-impl PacketCipher {
-    /// Create a new cipher from a 32-byte key
-    pub fn new(key: &[u8; 32]) -> Self {
-        Self {
-            cipher: XChaCha20Poly1305::new(key.into()),
-        }
-    }
-
-    /// Encrypt payload with AAD
-    ///
-    /// Returns ciphertext with appended authentication tag.
-    #[inline]
-    pub fn encrypt(
-        &self,
-        nonce: &[u8; NONCE_SIZE],
-        aad: &[u8],
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
-        use chacha20poly1305::aead::Payload;
-
-        let payload = Payload {
-            msg: plaintext,
-            aad,
-        };
-
-        self.cipher
-            .encrypt(XNonce::from_slice(nonce), payload)
-            .map_err(|_| CryptoError::Encryption("encryption failed".to_string()))
-    }
-
-    /// Encrypt payload in-place with AAD
-    ///
-    /// Appends authentication tag to the buffer.
-    #[inline]
-    pub fn encrypt_in_place(
-        &self,
-        nonce: &[u8; NONCE_SIZE],
-        aad: &[u8],
-        buffer: &mut BytesMut,
-    ) -> Result<(), CryptoError> {
-        let tag = self
-            .cipher
-            .encrypt_in_place_detached(XNonce::from_slice(nonce), aad, buffer)
-            .map_err(|_| CryptoError::Encryption("encryption failed".to_string()))?;
-
-        buffer.extend_from_slice(&tag);
-        Ok(())
-    }
-
-    /// Decrypt payload with AAD
-    ///
-    /// The ciphertext should include the authentication tag.
-    #[inline]
-    pub fn decrypt(
-        &self,
-        nonce: &[u8; NONCE_SIZE],
-        aad: &[u8],
-        ciphertext: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
-        use chacha20poly1305::aead::Payload;
-
-        let payload = Payload {
-            msg: ciphertext,
-            aad,
-        };
-
-        self.cipher
-            .decrypt(XNonce::from_slice(nonce), payload)
-            .map_err(|_| CryptoError::Decryption("decryption failed".to_string()))
-    }
-
-    /// Decrypt payload in-place with AAD
-    ///
-    /// The buffer should contain ciphertext + tag. Returns plaintext length.
-    #[inline]
-    pub fn decrypt_in_place(
-        &self,
-        nonce: &[u8; NONCE_SIZE],
-        aad: &[u8],
-        buffer: &mut [u8],
-    ) -> Result<usize, CryptoError> {
-        if buffer.len() < TAG_SIZE {
-            return Err(CryptoError::Decryption("buffer too small".to_string()));
-        }
-
-        let plaintext_len = buffer.len() - TAG_SIZE;
-        let (data, tag_bytes) = buffer.split_at_mut(plaintext_len);
-        let tag = chacha20poly1305::Tag::from_slice(tag_bytes);
-
-        self.cipher
-            .decrypt_in_place_detached(XNonce::from_slice(nonce), aad, data, tag)
-            .map_err(|_| CryptoError::Decryption("decryption failed".to_string()))?;
-
-        Ok(plaintext_len)
-    }
-}
-
-impl std::fmt::Debug for PacketCipher {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PacketCipher")
-            .field("algorithm", &"XChaCha20-Poly1305")
-            .finish()
-    }
-}
-
-/// Generate a random nonce
-#[inline]
-pub fn generate_nonce() -> [u8; NONCE_SIZE] {
-    let mut nonce = [0u8; NONCE_SIZE];
-    getrandom::fill(&mut nonce).expect("getrandom failed");
-    nonce
-}
-
-/// Fast packet cipher using ChaCha20-Poly1305 with counter-based nonces.
-///
-/// This is significantly faster than XChaCha20 because it eliminates the
-/// HChaCha20 key derivation step that XChaCha20 performs per-packet.
+/// Packet cipher using ChaCha20-Poly1305 with counter-based nonces.
 ///
 /// Nonce format: `[session_prefix: 4 bytes][counter: 8 bytes]`
 /// - session_prefix: derived from session_id, ensures uniqueness across sessions
@@ -396,14 +274,14 @@ pub fn generate_nonce() -> [u8; NONCE_SIZE] {
 /// - Counter never repeats within a session (AtomicU64)
 /// - Session prefix ensures uniqueness across sessions
 /// - 2^64 packets before rollover (unreachable in practice)
-pub struct FastPacketCipher {
+pub struct PacketCipher {
     cipher: ChaCha20Poly1305,
     session_prefix: [u8; 4],
     tx_counter: AtomicU64,
     rx_counter: AtomicU64,
 }
 
-impl FastPacketCipher {
+impl PacketCipher {
     /// Create a new fast cipher from a 32-byte key and session ID
     pub fn new(key: &[u8; 32], session_id: u64) -> Self {
         Self {
@@ -417,9 +295,9 @@ impl FastPacketCipher {
     /// Generate the next nonce for sending
     #[inline]
     #[allow(dead_code)]
-    fn next_tx_nonce(&self) -> [u8; FAST_NONCE_SIZE] {
+    fn next_tx_nonce(&self) -> [u8; NONCE_SIZE] {
         let counter = self.tx_counter.fetch_add(1, Ordering::Relaxed);
-        let mut nonce = [0u8; FAST_NONCE_SIZE];
+        let mut nonce = [0u8; NONCE_SIZE];
         nonce[0..4].copy_from_slice(&self.session_prefix);
         nonce[4..12].copy_from_slice(&counter.to_le_bytes());
         nonce
@@ -427,8 +305,8 @@ impl FastPacketCipher {
 
     /// Construct a nonce from received counter value
     #[inline]
-    fn nonce_from_counter(&self, counter: u64) -> [u8; FAST_NONCE_SIZE] {
-        let mut nonce = [0u8; FAST_NONCE_SIZE];
+    fn nonce_from_counter(&self, counter: u64) -> [u8; NONCE_SIZE] {
+        let mut nonce = [0u8; NONCE_SIZE];
         nonce[0..4].copy_from_slice(&self.session_prefix);
         nonce[4..12].copy_from_slice(&counter.to_le_bytes());
         nonce
@@ -550,9 +428,9 @@ impl FastPacketCipher {
     }
 }
 
-impl std::fmt::Debug for FastPacketCipher {
+impl std::fmt::Debug for PacketCipher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FastPacketCipher")
+        f.debug_struct("PacketCipher")
             .field("algorithm", &"ChaCha20-Poly1305")
             .field("tx_counter", &self.tx_counter.load(Ordering::Relaxed))
             .field("rx_counter", &self.rx_counter.load(Ordering::Relaxed))
@@ -560,7 +438,7 @@ impl std::fmt::Debug for FastPacketCipher {
     }
 }
 
-// FastPacketCipher intentionally does not implement Clone.
+// PacketCipher intentionally does not implement Clone.
 // Cloning would create an independent cipher with the same key and overlapping
 // counter-based nonce streams, breaking ChaCha20-Poly1305 security.
 
@@ -597,78 +475,6 @@ fn hex_string(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_packet_cipher_roundtrip() {
-        let key = [0x42u8; 32];
-        let cipher = PacketCipher::new(&key);
-        let nonce = [0x24u8; NONCE_SIZE];
-        let aad = b"additional data";
-        let plaintext = b"hello, world!";
-
-        let ciphertext = cipher.encrypt(&nonce, aad, plaintext).unwrap();
-        let decrypted = cipher.decrypt(&nonce, aad, &ciphertext).unwrap();
-
-        assert_eq!(&decrypted, plaintext);
-    }
-
-    #[test]
-    fn test_packet_cipher_in_place() {
-        let key = [0x42u8; 32];
-        let cipher = PacketCipher::new(&key);
-        let nonce = [0x24u8; NONCE_SIZE];
-        let aad = b"additional data";
-        let plaintext = b"hello, world!";
-
-        let mut buffer = BytesMut::from(&plaintext[..]);
-        cipher.encrypt_in_place(&nonce, aad, &mut buffer).unwrap();
-
-        assert_eq!(buffer.len(), plaintext.len() + TAG_SIZE);
-
-        let len = cipher
-            .decrypt_in_place(&nonce, aad, &mut buffer[..])
-            .unwrap();
-        assert_eq!(len, plaintext.len());
-        assert_eq!(&buffer[..len], plaintext);
-    }
-
-    #[test]
-    fn test_packet_cipher_tamper_detection() {
-        let key = [0x42u8; 32];
-        let cipher = PacketCipher::new(&key);
-        let nonce = [0x24u8; NONCE_SIZE];
-        let aad = b"additional data";
-        let plaintext = b"hello, world!";
-
-        let mut ciphertext = cipher.encrypt(&nonce, aad, plaintext).unwrap();
-
-        // Tamper with the ciphertext
-        ciphertext[0] ^= 0xFF;
-
-        let result = cipher.decrypt(&nonce, aad, &ciphertext);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_packet_cipher_wrong_aad() {
-        let key = [0x42u8; 32];
-        let cipher = PacketCipher::new(&key);
-        let nonce = [0x24u8; NONCE_SIZE];
-        let plaintext = b"hello, world!";
-
-        let ciphertext = cipher.encrypt(&nonce, b"correct aad", plaintext).unwrap();
-        let result = cipher.decrypt(&nonce, b"wrong aad", &ciphertext);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_generate_nonce() {
-        let nonce1 = generate_nonce();
-        let nonce2 = generate_nonce();
-
-        // Nonces should be different (with overwhelming probability)
-        assert_ne!(nonce1, nonce2);
-    }
 
     #[test]
     fn test_static_keypair_generate() {
@@ -716,50 +522,17 @@ mod tests {
     }
 
     #[test]
-    fn test_session_keys_encryption() {
-        let psk = [0x42u8; 32];
-        let responder_keypair = StaticKeypair::generate();
-
-        let mut initiator = NoiseHandshake::initiator(&psk, &responder_keypair.public).unwrap();
-        let mut responder = NoiseHandshake::responder(&psk, &responder_keypair).unwrap();
-
-        let msg1 = initiator.write_message(b"").unwrap();
-        responder.read_message(&msg1).unwrap();
-        let msg2 = responder.write_message(b"").unwrap();
-        initiator.read_message(&msg2).unwrap();
-
-        let init_keys = initiator.into_session_keys().unwrap();
-        let resp_keys = responder.into_session_keys().unwrap();
-
-        // Create ciphers
-        let init_cipher = PacketCipher::new(&init_keys.tx_key);
-        let resp_cipher = PacketCipher::new(&resp_keys.rx_key);
-
-        // Encrypt with initiator, decrypt with responder
-        let nonce = generate_nonce();
-        let aad = b"test aad";
-        let plaintext = b"secret message";
-
-        let ciphertext = init_cipher.encrypt(&nonce, aad, plaintext).unwrap();
-        let decrypted = resp_cipher.decrypt(&nonce, aad, &ciphertext).unwrap();
-
-        assert_eq!(&decrypted, plaintext);
-    }
-
-    // FastPacketCipher tests
-
-    #[test]
     fn test_fast_cipher_roundtrip() {
         let key = [0x42u8; 32];
         let session_id = 0x1234567890ABCDEF_u64;
-        let cipher = FastPacketCipher::new(&key, session_id);
+        let cipher = PacketCipher::new(&key, session_id);
         let aad = b"additional data";
         let plaintext = b"hello, world!";
 
         let (ciphertext, counter) = cipher.encrypt(aad, plaintext).unwrap();
 
         // Create a new cipher for decryption (simulating receiver)
-        let rx_cipher = FastPacketCipher::new(&key, session_id);
+        let rx_cipher = PacketCipher::new(&key, session_id);
         let decrypted = rx_cipher.decrypt(counter, aad, &ciphertext).unwrap();
 
         assert_eq!(&decrypted, plaintext);
@@ -769,7 +542,7 @@ mod tests {
     fn test_fast_cipher_in_place() {
         let key = [0x42u8; 32];
         let session_id = 0x1234567890ABCDEF_u64;
-        let cipher = FastPacketCipher::new(&key, session_id);
+        let cipher = PacketCipher::new(&key, session_id);
         let aad = b"additional data";
         let plaintext = b"hello, world!";
 
@@ -779,7 +552,7 @@ mod tests {
         assert_eq!(buffer.len(), plaintext.len() + TAG_SIZE);
 
         // Decrypt with same cipher (simulating receiver with same key)
-        let rx_cipher = FastPacketCipher::new(&key, session_id);
+        let rx_cipher = PacketCipher::new(&key, session_id);
         let len = rx_cipher
             .decrypt_in_place(counter, aad, &mut buffer[..])
             .unwrap();
@@ -791,7 +564,7 @@ mod tests {
     fn test_fast_cipher_counter_increments() {
         let key = [0x42u8; 32];
         let session_id = 0x1234567890ABCDEF_u64;
-        let cipher = FastPacketCipher::new(&key, session_id);
+        let cipher = PacketCipher::new(&key, session_id);
         let aad = b"aad";
         let plaintext = b"test";
 
@@ -807,8 +580,8 @@ mod tests {
     #[test]
     fn test_fast_cipher_different_sessions() {
         let key = [0x42u8; 32];
-        let cipher1 = FastPacketCipher::new(&key, 0x1111);
-        let cipher2 = FastPacketCipher::new(&key, 0x2222);
+        let cipher1 = PacketCipher::new(&key, 0x1111);
+        let cipher2 = PacketCipher::new(&key, 0x2222);
         let aad = b"aad";
         let plaintext = b"test";
 
@@ -824,7 +597,7 @@ mod tests {
     fn test_fast_cipher_tamper_detection() {
         let key = [0x42u8; 32];
         let session_id = 0x1234567890ABCDEF_u64;
-        let cipher = FastPacketCipher::new(&key, session_id);
+        let cipher = PacketCipher::new(&key, session_id);
         let aad = b"additional data";
         let plaintext = b"hello, world!";
 
@@ -833,7 +606,7 @@ mod tests {
         // Tamper with the ciphertext
         ciphertext[0] ^= 0xFF;
 
-        let rx_cipher = FastPacketCipher::new(&key, session_id);
+        let rx_cipher = PacketCipher::new(&key, session_id);
         let result = rx_cipher.decrypt(counter, aad, &ciphertext);
         assert!(result.is_err());
     }
@@ -842,14 +615,14 @@ mod tests {
     fn test_fast_cipher_wrong_counter() {
         let key = [0x42u8; 32];
         let session_id = 0x1234567890ABCDEF_u64;
-        let cipher = FastPacketCipher::new(&key, session_id);
+        let cipher = PacketCipher::new(&key, session_id);
         let aad = b"additional data";
         let plaintext = b"hello, world!";
 
         let (ciphertext, _counter) = cipher.encrypt(aad, plaintext).unwrap();
 
         // Try to decrypt with wrong counter
-        let rx_cipher = FastPacketCipher::new(&key, session_id);
+        let rx_cipher = PacketCipher::new(&key, session_id);
         let result = rx_cipher.decrypt(999, aad, &ciphertext);
         assert!(result.is_err());
     }
@@ -858,7 +631,7 @@ mod tests {
     fn test_fast_cipher_replay_protection() {
         let key = [0x42u8; 32];
         let session_id = 0x1234567890ABCDEF_u64;
-        let cipher = FastPacketCipher::new(&key, session_id);
+        let cipher = PacketCipher::new(&key, session_id);
 
         // Counter 0 should be valid initially
         assert!(cipher.is_valid_rx_counter(0));
@@ -913,8 +686,8 @@ mod tests {
         let resp_keys = responder.into_session_keys().unwrap();
 
         // Create fast ciphers
-        let init_cipher = FastPacketCipher::new(&init_keys.tx_key, init_keys.session_id);
-        let resp_cipher = FastPacketCipher::new(&resp_keys.rx_key, resp_keys.session_id);
+        let init_cipher = PacketCipher::new(&init_keys.tx_key, init_keys.session_id);
+        let resp_cipher = PacketCipher::new(&resp_keys.rx_key, resp_keys.session_id);
 
         // Encrypt with initiator, decrypt with responder
         let aad = b"test aad";
@@ -928,24 +701,24 @@ mod tests {
 
     #[test]
     fn test_fast_cipher_not_clone() {
-        // Regression: FastPacketCipher used to implement Clone, which allowed
+        // Regression: PacketCipher used to implement Clone, which allowed
         // two independent ciphers to share the same key and produce overlapping
         // nonce streams, breaking ChaCha20-Poly1305 security.
         // This test verifies Clone is not implemented by checking the type
         // does not satisfy the Clone bound at compile time.
         fn _assert_not_clone<T>() {
-            // If FastPacketCipher ever implements Clone again, the static
+            // If PacketCipher ever implements Clone again, the static
             // assertion below should be uncommented to fail the build.
             // For now, we verify the trait is absent via a runtime check.
         }
-        _assert_not_clone::<FastPacketCipher>();
+        _assert_not_clone::<PacketCipher>();
 
         // The real guard: if someone adds Clone back, this will still catch
         // the nonce-reuse problem. Two ciphers from the same key must not
         // produce the same nonce for the same counter value.
         let key = [0x42u8; 32];
-        let cipher1 = FastPacketCipher::new(&key, 0x1111);
-        let cipher2 = FastPacketCipher::new(&key, 0x1111);
+        let cipher1 = PacketCipher::new(&key, 0x1111);
+        let cipher2 = PacketCipher::new(&key, 0x1111);
 
         // Both start at counter 0 — encrypting the same plaintext must NOT
         // produce the same ciphertext, because they'd share nonces.

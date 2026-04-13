@@ -607,7 +607,7 @@ mod unit {
     #[test]
     fn test_packet_pool_allocation() {
         let key = [0u8; 32];
-        let pool = PacketPool::new(4, &key);
+        let pool = PacketPool::new(4, &key, 0x1234);
 
         // Should be able to get 4 builders
         let mut builders = Vec::new();

@@ -8,56 +8,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 /// Magic bytes: "BL" (0x424C)
 pub const MAGIC: u16 = 0x424C;
 
-/// Current protocol version (4-bit, 0–15)
+/// Current protocol version
 pub const VERSION: u8 = 1;
-
-/// 20-bit dispatch field: `[version:4][namespace_id:8][msg_type:8]`
-///
-/// Used for routing and classifying frames. Not a flags field.
-/// Matches the RedEX 20-bit event type layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct DispatchField {
-    /// Protocol version (0–15, low 4 bits only)
-    pub version: u8,
-    /// Namespace identifier (0–255)
-    pub namespace_id: u8,
-    /// Message type (0–255)
-    pub msg_type: u8,
-}
-
-impl DispatchField {
-    /// Create a new dispatch field. Panics if version > 15.
-    #[inline]
-    pub fn new(version: u8, namespace_id: u8, msg_type: u8) -> Self {
-        assert!(version <= 0x0F, "version must fit in 4 bits (0–15)");
-        Self {
-            version,
-            namespace_id,
-            msg_type,
-        }
-    }
-
-    /// Pack into the canonical 20-bit dispatch value (low 20 bits of u32).
-    ///
-    /// Layout: `(version << 16) | (namespace_id << 8) | msg_type`
-    #[inline]
-    pub const fn to_u32(&self) -> u32 {
-        let v = (self.version & 0x0F) as u32;
-        let ns = self.namespace_id as u32;
-        let mt = self.msg_type as u32;
-        (v << 16) | (ns << 8) | mt
-    }
-
-    /// Unpack from a 20-bit dispatch value (low 20 bits of u32).
-    #[inline]
-    pub const fn from_u32(raw: u32) -> Self {
-        Self {
-            version: ((raw >> 16) & 0x0F) as u8,
-            namespace_id: ((raw >> 8) & 0xFF) as u8,
-            msg_type: (raw & 0xFF) as u8,
-        }
-    }
-}
 
 /// Header size in bytes (cache-line aligned)
 pub const HEADER_SIZE: usize = 64;
@@ -65,11 +17,8 @@ pub const HEADER_SIZE: usize = 64;
 /// Poly1305 authentication tag size
 pub const TAG_SIZE: usize = 16;
 
-/// XChaCha20 nonce size (legacy)
-pub const NONCE_SIZE: usize = 24;
-
-/// ChaCha20 nonce size (fast mode - counter-based)
-pub const FAST_NONCE_SIZE: usize = 12;
+/// ChaCha20-Poly1305 nonce size (counter-based)
+pub const NONCE_SIZE: usize = 12;
 
 /// Maximum packet size (fits in jumbo frame with headroom)
 pub const MAX_PACKET_SIZE: usize = 8192;
@@ -160,51 +109,77 @@ impl PacketFlags {
 ///  0                   1                   2                   3
 ///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |     MAGIC (0x424C)    |  VER  |     FLAGS     | NAMESPACE_ID  |
+/// |         MAGIC (0x424C)        |     VER       |     FLAGS     |  4
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |    MSG_TYPE   |           Reserved (2 bytes)                  |
+/// |   PRIORITY    |    HOP_TTL    |   HOP_COUNT   |  FRAG_FLAGS   |  8
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |       SUBPROTOCOL_ID          |        CHANNEL_HASH           | 12
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// |                                                               |
-/// +                         NONCE (24 bytes)                      +
+/// +                         NONCE (12 bytes)                      + 24
 /// |                                                               |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |                       SESSION_ID (8 bytes)                    |
+/// |                       SESSION_ID (8 bytes)                    | 32
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |                       STREAM_ID (8 bytes)                     |
+/// |                       STREAM_ID (8 bytes)                     | 40
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |                       SEQUENCE (8 bytes)                      |
+/// |                       SEQUENCE (8 bytes)                      | 48
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |        PAYLOAD_LEN (2 bytes)  |       EVENT_COUNT (2 bytes)   |
+/// |                       SUBNET_ID (4 bytes)                     | 52
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                      ORIGIN_HASH (4 bytes)                    | 56
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |       FRAGMENT_ID             |        FRAGMENT_OFFSET        | 60
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |       PAYLOAD_LEN             |        EVENT_COUNT            | 64
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// ```
-///
-/// The dispatch triple (`version`, `namespace_id`, `msg_type`) forms a
-/// 20-bit dispatch field: `[version:4][namespace_id:8][msg_type:8]`.
-/// Use [`dispatch_field()`](BltpHeader::dispatch_field) or
-/// [`dispatch_u32()`](BltpHeader::dispatch_u32) to access the packed value.
 #[derive(Debug, Clone, Copy)]
 #[repr(C, align(64))]
 pub struct BltpHeader {
+    // — routing fast-path (0-11) —
     /// Magic: "BL" (0x424C)
     pub magic: u16,
-    /// Protocol version, low 4 bits only (0–15)
+    /// Protocol version (1)
     pub version: u8,
     /// Flags (reliability, priority, etc.)
     pub flags: PacketFlags,
-    /// Namespace identifier for dispatch (0–255)
-    pub namespace_id: u8,
-    /// Message type for dispatch (0–255)
-    pub msg_type: u8,
-    /// Reserved for future use
-    pub reserved: u16,
-    /// XChaCha20 nonce (24 bytes) - random per packet
+    /// Priority level (0 = lowest, 255 = highest)
+    pub priority: u8,
+    /// Maximum hops before packet is dropped
+    pub hop_ttl: u8,
+    /// Current hop count (incremented by forwarding nodes)
+    pub hop_count: u8,
+    /// Fragmentation flags
+    pub frag_flags: u8,
+    /// Subprotocol identifier for capability-aware routing
+    pub subprotocol_id: u16,
+    /// Truncated channel name hash for wire-speed filtering
+    pub channel_hash: u16,
+
+    // — crypto (12-23) —
+    /// ChaCha20-Poly1305 nonce (12 bytes) - counter-based
     pub nonce: [u8; NONCE_SIZE],
+
+    // — session (24-47) —
     /// Session identifier (from handshake)
     pub session_id: u64,
     /// Stream identifier (for multiplexing)
     pub stream_id: u64,
     /// Per-stream sequence number (monotonic)
     pub sequence: u64,
+
+    // — mesh topology (48-59) —
+    /// Subnet identifier for gateway routing
+    pub subnet_id: u32,
+    /// Truncated blake2 hash of origin node identity
+    pub origin_hash: u32,
+    /// Fragment group identifier
+    pub fragment_id: u16,
+    /// Byte offset within original packet
+    pub fragment_offset: u16,
+
+    // — payload (60-63) —
     /// Payload length (after encryption, before tag)
     pub payload_len: u16,
     /// Number of events in payload
@@ -217,9 +192,8 @@ const _: () = assert!(std::mem::size_of::<BltpHeader>() == HEADER_SIZE);
 impl BltpHeader {
     /// Create a new header with default values.
     ///
-    /// Uses the current protocol `VERSION`, namespace 0, msg_type 0.
-    /// For custom dispatch values, set `namespace_id` and `msg_type` on
-    /// the returned header.
+    /// New routing/mesh fields default to zero. Use the `with_*` methods
+    /// to set them when needed.
     #[inline]
     pub fn new(
         session_id: u64,
@@ -234,103 +208,138 @@ impl BltpHeader {
             magic: MAGIC,
             version: VERSION,
             flags,
-            namespace_id: 0,
-            msg_type: 0,
-            reserved: 0,
+            priority: 0,
+            hop_ttl: 0,
+            hop_count: 0,
+            frag_flags: 0,
+            subprotocol_id: 0,
+            channel_hash: 0,
             nonce,
             session_id,
             stream_id,
             sequence,
+            subnet_id: 0,
+            origin_hash: 0,
+            fragment_id: 0,
+            fragment_offset: 0,
             payload_len,
             event_count,
         }
     }
 
-    /// Set the dispatch fields (version, namespace_id, msg_type) from a
-    /// [`DispatchField`]. Chainable.
-    #[inline]
-    pub fn with_dispatch(mut self, dispatch: DispatchField) -> Self {
-        self.version = dispatch.version;
-        self.namespace_id = dispatch.namespace_id;
-        self.msg_type = dispatch.msg_type;
-        self
-    }
-
     /// Create a handshake header
     #[inline]
-    pub fn handshake(nonce: [u8; NONCE_SIZE], payload_len: u16) -> Self {
-        Self {
-            magic: MAGIC,
-            version: VERSION,
-            flags: PacketFlags::HANDSHAKE,
-            namespace_id: 0,
-            msg_type: 0,
-            reserved: 0,
-            nonce,
-            session_id: 0,
-            stream_id: 0,
-            sequence: 0,
+    pub fn handshake(payload_len: u16) -> Self {
+        Self::new(
+            0,
+            0,
+            0,
+            [0u8; NONCE_SIZE],
             payload_len,
-            event_count: 0,
-        }
+            0,
+            PacketFlags::HANDSHAKE,
+        )
     }
 
     /// Create a heartbeat header
     #[inline]
     pub fn heartbeat(session_id: u64) -> Self {
-        Self {
-            magic: MAGIC,
-            version: VERSION,
-            flags: PacketFlags::HEARTBEAT,
-            namespace_id: 0,
-            msg_type: 0,
-            reserved: 0,
-            nonce: [0u8; NONCE_SIZE],
+        Self::new(
             session_id,
-            stream_id: 0,
-            sequence: 0,
-            payload_len: 0,
-            event_count: 0,
-        }
+            0,
+            0,
+            [0u8; NONCE_SIZE],
+            0,
+            0,
+            PacketFlags::HEARTBEAT,
+        )
     }
 
-    /// Get the dispatch field (version + namespace_id + msg_type).
+    /// Set priority level
     #[inline]
-    pub fn dispatch_field(&self) -> DispatchField {
-        DispatchField {
-            version: self.version & 0x0F,
-            namespace_id: self.namespace_id,
-            msg_type: self.msg_type,
-        }
+    pub fn with_priority(mut self, priority: u8) -> Self {
+        self.priority = priority;
+        self
     }
 
-    /// Get the packed 20-bit dispatch value.
-    ///
-    /// Layout: `(version << 16) | (namespace_id << 8) | msg_type`
+    /// Set hop TTL and initial hop count
     #[inline]
-    pub fn dispatch_u32(&self) -> u32 {
-        self.dispatch_field().to_u32()
+    pub fn with_hops(mut self, ttl: u8) -> Self {
+        self.hop_ttl = ttl;
+        self.hop_count = 0;
+        self
+    }
+
+    /// Set subprotocol identifier
+    #[inline]
+    pub fn with_subprotocol(mut self, id: u16) -> Self {
+        self.subprotocol_id = id;
+        self
+    }
+
+    /// Set channel hash
+    #[inline]
+    pub fn with_channel_hash(mut self, hash: u16) -> Self {
+        self.channel_hash = hash;
+        self
+    }
+
+    /// Set subnet identifier
+    #[inline]
+    pub fn with_subnet(mut self, subnet_id: u32) -> Self {
+        self.subnet_id = subnet_id;
+        self
+    }
+
+    /// Set origin node hash
+    #[inline]
+    pub fn with_origin(mut self, origin_hash: u32) -> Self {
+        self.origin_hash = origin_hash;
+        self
+    }
+
+    /// Set fragmentation fields
+    #[inline]
+    pub fn with_fragment(mut self, id: u16, offset: u16, flags: u8) -> Self {
+        self.fragment_id = id;
+        self.fragment_offset = offset;
+        self.frag_flags = flags;
+        self
     }
 
     /// Get AAD (Additional Authenticated Data) for AEAD construction.
     ///
-    /// Authenticates: magic, dispatch (version + namespace_id + msg_type),
-    /// flags, payload_len, event_count, session_id, stream_id, sequence.
-    /// This binds the encrypted payload to all header fields, preventing
+    /// Authenticates all header fields except:
+    /// - nonce (used as the AEAD IV)
+    /// - hop_count (mutable in transit — incremented by forwarding nodes)
+    ///
+    /// This binds the encrypted payload to the immutable header fields, preventing
     /// an attacker from modifying any field without breaking AEAD verification.
     #[inline]
-    pub fn aad(&self) -> [u8; 36] {
-        let mut aad = [0u8; 36];
+    pub fn aad(&self) -> [u8; 52] {
+        let mut aad = [0u8; 52];
+        // routing fast-path (hop_count excluded: mutable in transit)
         aad[0..2].copy_from_slice(&self.magic.to_le_bytes());
-        // Pack dispatch as 4 bytes (low 20 bits meaningful)
-        aad[2..6].copy_from_slice(&self.dispatch_u32().to_le_bytes());
-        aad[6] = self.flags.bits();
-        aad[7] = 0; // padding
-        aad[8..10].copy_from_slice(&self.payload_len.to_le_bytes());
-        aad[10..12].copy_from_slice(&self.event_count.to_le_bytes());
+        aad[2] = self.version;
+        aad[3] = self.flags.bits();
+        aad[4] = self.priority;
+        aad[5] = self.hop_ttl;
+        // aad[6] = 0: hop_count excluded from AAD
+        aad[7] = self.frag_flags;
+        aad[8..10].copy_from_slice(&self.subprotocol_id.to_le_bytes());
+        aad[10..12].copy_from_slice(&self.channel_hash.to_le_bytes());
+        // session
         aad[12..20].copy_from_slice(&self.session_id.to_le_bytes());
         aad[20..28].copy_from_slice(&self.stream_id.to_le_bytes());
         aad[28..36].copy_from_slice(&self.sequence.to_le_bytes());
+        // mesh topology
+        aad[36..40].copy_from_slice(&self.subnet_id.to_le_bytes());
+        aad[40..44].copy_from_slice(&self.origin_hash.to_le_bytes());
+        aad[44..46].copy_from_slice(&self.fragment_id.to_le_bytes());
+        aad[46..48].copy_from_slice(&self.fragment_offset.to_le_bytes());
+        // payload metadata
+        aad[48..50].copy_from_slice(&self.payload_len.to_le_bytes());
+        aad[50..52].copy_from_slice(&self.event_count.to_le_bytes());
         aad
     }
 
@@ -340,16 +349,28 @@ impl BltpHeader {
         let mut buf = [0u8; HEADER_SIZE];
         let mut cursor = &mut buf[..];
 
+        // routing fast-path
         cursor.put_u16_le(self.magic);
-        cursor.put_u8(self.version & 0x0F);
+        cursor.put_u8(self.version);
         cursor.put_u8(self.flags.bits());
-        cursor.put_u8(self.namespace_id);
-        cursor.put_u8(self.msg_type);
-        cursor.put_u16_le(self.reserved);
+        cursor.put_u8(self.priority);
+        cursor.put_u8(self.hop_ttl);
+        cursor.put_u8(self.hop_count);
+        cursor.put_u8(self.frag_flags);
+        cursor.put_u16_le(self.subprotocol_id);
+        cursor.put_u16_le(self.channel_hash);
+        // crypto
         cursor.put_slice(&self.nonce);
+        // session
         cursor.put_u64_le(self.session_id);
         cursor.put_u64_le(self.stream_id);
         cursor.put_u64_le(self.sequence);
+        // mesh topology
+        cursor.put_u32_le(self.subnet_id);
+        cursor.put_u32_le(self.origin_hash);
+        cursor.put_u16_le(self.fragment_id);
+        cursor.put_u16_le(self.fragment_offset);
+        // payload
         cursor.put_u16_le(self.payload_len);
         cursor.put_u16_le(self.event_count);
 
@@ -370,11 +391,14 @@ impl BltpHeader {
             return None;
         }
 
-        let version = cursor.get_u8() & 0x0F;
+        let version = cursor.get_u8();
         let flags = PacketFlags::from_bits(cursor.get_u8());
-        let namespace_id = cursor.get_u8();
-        let msg_type = cursor.get_u8();
-        let reserved = cursor.get_u16_le();
+        let priority = cursor.get_u8();
+        let hop_ttl = cursor.get_u8();
+        let hop_count = cursor.get_u8();
+        let frag_flags = cursor.get_u8();
+        let subprotocol_id = cursor.get_u16_le();
+        let channel_hash = cursor.get_u16_le();
 
         let mut nonce = [0u8; NONCE_SIZE];
         cursor.copy_to_slice(&mut nonce);
@@ -382,6 +406,12 @@ impl BltpHeader {
         let session_id = cursor.get_u64_le();
         let stream_id = cursor.get_u64_le();
         let sequence = cursor.get_u64_le();
+
+        let subnet_id = cursor.get_u32_le();
+        let origin_hash = cursor.get_u32_le();
+        let fragment_id = cursor.get_u16_le();
+        let fragment_offset = cursor.get_u16_le();
+
         let payload_len = cursor.get_u16_le();
         let event_count = cursor.get_u16_le();
 
@@ -389,13 +419,20 @@ impl BltpHeader {
             magic,
             version,
             flags,
-            namespace_id,
-            msg_type,
-            reserved,
+            priority,
+            hop_ttl,
+            hop_count,
+            frag_flags,
+            subprotocol_id,
+            channel_hash,
             nonce,
             session_id,
             stream_id,
             sequence,
+            subnet_id,
+            origin_hash,
+            fragment_id,
+            fragment_offset,
             payload_len,
             event_count,
         })
@@ -409,8 +446,7 @@ impl BltpHeader {
     #[inline]
     pub fn validate(&self) -> bool {
         self.magic == MAGIC
-            && (self.version & 0x0F) == VERSION
-            && self.version <= 0x0F
+            && self.version == VERSION
             && (self.payload_len as usize) <= MAX_PAYLOAD_SIZE
             && self.event_count <= Self::MAX_EVENTS_PER_PACKET
     }
@@ -531,7 +567,7 @@ mod tests {
     #[test]
     fn test_header_roundtrip() {
         let nonce = [0x42u8; NONCE_SIZE];
-        let mut header = BltpHeader::new(
+        let header = BltpHeader::new(
             0x1234567890ABCDEF,
             0xFEDCBA0987654321,
             42,
@@ -539,9 +575,14 @@ mod tests {
             1024,
             10,
             PacketFlags::RELIABLE,
-        );
-        header.namespace_id = 0xAB;
-        header.msg_type = 0xCD;
+        )
+        .with_priority(7)
+        .with_hops(32)
+        .with_subprotocol(0x0100)
+        .with_channel_hash(0xABCD)
+        .with_subnet(0x12345678)
+        .with_origin(0xDEADBEEF)
+        .with_fragment(1, 512, 0x01);
 
         let bytes = header.to_bytes();
         let parsed = BltpHeader::from_bytes(&bytes).unwrap();
@@ -549,20 +590,27 @@ mod tests {
         assert_eq!(parsed.magic, MAGIC);
         assert_eq!(parsed.version, VERSION);
         assert_eq!(parsed.flags, PacketFlags::RELIABLE);
-        assert_eq!(parsed.namespace_id, 0xAB);
-        assert_eq!(parsed.msg_type, 0xCD);
+        assert_eq!(parsed.priority, 7);
+        assert_eq!(parsed.hop_ttl, 32);
+        assert_eq!(parsed.hop_count, 0);
+        assert_eq!(parsed.frag_flags, 0x01);
+        assert_eq!(parsed.subprotocol_id, 0x0100);
+        assert_eq!(parsed.channel_hash, 0xABCD);
+        assert_eq!(parsed.nonce, nonce);
         assert_eq!(parsed.session_id, 0x1234567890ABCDEF);
         assert_eq!(parsed.stream_id, 0xFEDCBA0987654321);
         assert_eq!(parsed.sequence, 42);
-        assert_eq!(parsed.nonce, nonce);
+        assert_eq!(parsed.subnet_id, 0x12345678);
+        assert_eq!(parsed.origin_hash, 0xDEADBEEF);
+        assert_eq!(parsed.fragment_id, 1);
+        assert_eq!(parsed.fragment_offset, 512);
         assert_eq!(parsed.payload_len, 1024);
         assert_eq!(parsed.event_count, 10);
     }
 
     #[test]
     fn test_header_validation() {
-        let nonce = [0u8; NONCE_SIZE];
-        let header = BltpHeader::new(0, 0, 0, nonce, 1024, 0, PacketFlags::NONE);
+        let header = BltpHeader::new(0, 0, 0, [0u8; NONCE_SIZE], 1024, 0, PacketFlags::NONE);
         assert!(header.validate());
 
         // Invalid magic
@@ -589,72 +637,29 @@ mod tests {
 
     #[test]
     fn test_aad() {
-        let nonce = [0u8; NONCE_SIZE];
-        let mut header = BltpHeader::new(
+        let header = BltpHeader::new(
             0x1234567890ABCDEF,
             0xFEDCBA0987654321,
             42,
-            nonce,
+            [0u8; NONCE_SIZE],
             1024,
             10,
             PacketFlags::RELIABLE,
-        );
-        header.namespace_id = 5;
-        header.msg_type = 10;
+        )
+        .with_priority(5)
+        .with_subnet(0x42);
 
         let aad = header.aad();
-        assert_eq!(aad.len(), 36);
+        assert_eq!(aad.len(), 52);
 
         // Verify magic
         assert_eq!(u16::from_le_bytes([aad[0], aad[1]]), MAGIC);
-        // Verify dispatch (packed as u32 LE at offset 2)
-        let dispatch = u32::from_le_bytes([aad[2], aad[3], aad[4], aad[5]]);
-        assert_eq!(dispatch, header.dispatch_u32());
-        assert_eq!(dispatch, (1 << 16) | (5 << 8) | 10);
+        // Verify version
+        assert_eq!(aad[2], VERSION);
         // Verify flags
-        assert_eq!(aad[6], PacketFlags::RELIABLE.bits());
-    }
-
-    #[test]
-    fn test_dispatch_field() {
-        let d = DispatchField::new(1, 2, 3);
-        assert_eq!(d.version, 1);
-        assert_eq!(d.namespace_id, 2);
-        assert_eq!(d.msg_type, 3);
-        assert_eq!(d.to_u32(), (1 << 16) | (2 << 8) | 3);
-
-        let unpacked = DispatchField::from_u32(d.to_u32());
-        assert_eq!(unpacked, d);
-
-        // Max values
-        let max = DispatchField::new(0x0F, 0xFF, 0xFF);
-        assert_eq!(max.to_u32(), 0x000F_FFFF);
-        assert_eq!(DispatchField::from_u32(max.to_u32()), max);
-    }
-
-    #[test]
-    fn test_header_dispatch() {
-        let dispatch = DispatchField::new(1, 42, 7);
-        let nonce = [0u8; NONCE_SIZE];
-        let header = BltpHeader::new(0x1234, 0x5678, 1, nonce, 100, 5, PacketFlags::NONE)
-            .with_dispatch(dispatch);
-
-        assert_eq!(header.version, 1);
-        assert_eq!(header.namespace_id, 42);
-        assert_eq!(header.msg_type, 7);
-        assert_eq!(header.dispatch_field(), dispatch);
-        assert_eq!(header.dispatch_u32(), (1 << 16) | (42 << 8) | 7);
-
-        // Roundtrip through wire
-        let bytes = header.to_bytes();
-        let parsed = BltpHeader::from_bytes(&bytes).unwrap();
-        assert_eq!(parsed.dispatch_field(), dispatch);
-    }
-
-    #[test]
-    #[should_panic(expected = "version must fit in 4 bits")]
-    fn test_dispatch_field_version_overflow() {
-        DispatchField::new(16, 0, 0);
+        assert_eq!(aad[3], PacketFlags::RELIABLE.bits());
+        // Verify priority
+        assert_eq!(aad[4], 5);
     }
 
     #[test]
@@ -696,8 +701,7 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_excessive_event_count() {
-        let nonce = [0u8; NONCE_SIZE];
-        let header = BltpHeader::new(0, 0, 0, nonce, 100, 10, PacketFlags::NONE);
+        let header = BltpHeader::new(0, 0, 0, [0u8; NONCE_SIZE], 100, 10, PacketFlags::NONE);
         assert!(header.validate());
 
         // event_count exceeding MAX_EVENTS_PER_PACKET must be rejected
@@ -705,7 +709,7 @@ mod tests {
             0,
             0,
             0,
-            nonce,
+            [0u8; NONCE_SIZE],
             100,
             BltpHeader::MAX_EVENTS_PER_PACKET + 1,
             PacketFlags::NONE,

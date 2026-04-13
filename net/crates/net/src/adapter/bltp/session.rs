@@ -12,33 +12,9 @@ use std::time::Duration;
 
 use crate::event::StoredEvent;
 
-use super::crypto::{FastPacketCipher, PacketCipher, SessionKeys};
-use super::pool::{SharedFastPacketPool, SharedPacketPool, SharedThreadLocalPool};
+use super::crypto::{PacketCipher, SessionKeys};
+use super::pool::{SharedLocalPool, SharedPacketPool};
 use super::reliability::{create_reliability_mode, ReliabilityMode};
-
-/// Cipher mode for the session
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CipherMode {
-    /// Fast mode using ChaCha20-Poly1305 with counter-based nonces (default)
-    /// ~20-40% faster than legacy mode
-    #[default]
-    Fast,
-    /// Legacy mode using XChaCha20-Poly1305 with random nonces
-    /// For backward compatibility with older peers
-    Legacy,
-}
-
-/// Session ciphers - either fast (counter-based) or legacy (random nonce)
-enum SessionCiphers {
-    Fast {
-        tx: FastPacketCipher,
-        rx: FastPacketCipher,
-    },
-    Legacy {
-        tx: PacketCipher,
-        rx: PacketCipher,
-    },
-}
 
 /// Session state after handshake completion.
 pub struct BltpSession {
@@ -46,94 +22,50 @@ pub struct BltpSession {
     session_id: u64,
     /// Remote peer address
     peer_addr: SocketAddr,
-    /// Session ciphers (fast or legacy mode)
-    ciphers: SessionCiphers,
+    /// TX cipher (ChaCha20-Poly1305 with counter-based nonces)
+    tx_cipher: PacketCipher,
+    /// RX cipher (ChaCha20-Poly1305 with counter-based nonces)
+    rx_cipher: PacketCipher,
     /// Per-stream state
     streams: DashMap<u64, StreamState>,
     /// Last activity timestamp (for session timeout)
     last_activity: AtomicU64,
-    /// Legacy packet pool for zero-allocation building (used in legacy mode)
+    /// Packet pool for zero-allocation building
     packet_pool: SharedPacketPool,
-    /// Fast packet pool for counter-based encryption (used in fast mode)
-    fast_packet_pool: Option<SharedFastPacketPool>,
-    /// Thread-local fast pool for zero-contention hot path (optional)
-    thread_local_pool: Option<SharedThreadLocalPool>,
+    /// Thread-local pool for zero-contention hot path
+    thread_local_pool: SharedLocalPool,
     /// Default reliability mode for new streams
     default_reliable: bool,
     /// Session is active
     active: AtomicBool,
-    /// Cipher mode in use
-    cipher_mode: CipherMode,
 }
 
 impl BltpSession {
-    /// Create a new session from handshake results (uses fast cipher mode by default)
+    /// Create a new session from handshake results
     pub fn new(
         keys: SessionKeys,
         peer_addr: SocketAddr,
-        packet_pool: SharedPacketPool,
+        pool_size: usize,
         default_reliable: bool,
     ) -> Self {
-        Self::with_cipher_mode(
-            keys,
-            peer_addr,
-            packet_pool,
-            default_reliable,
-            CipherMode::Fast,
-        )
-    }
+        let tx_cipher = PacketCipher::new(&keys.tx_key, keys.session_id);
+        let rx_cipher = PacketCipher::new(&keys.rx_key, keys.session_id);
 
-    /// Create a new session with specified cipher mode
-    pub fn with_cipher_mode(
-        keys: SessionKeys,
-        peer_addr: SocketAddr,
-        packet_pool: SharedPacketPool,
-        default_reliable: bool,
-        cipher_mode: CipherMode,
-    ) -> Self {
-        let ciphers = match cipher_mode {
-            CipherMode::Fast => SessionCiphers::Fast {
-                tx: FastPacketCipher::new(&keys.tx_key, keys.session_id),
-                rx: FastPacketCipher::new(&keys.rx_key, keys.session_id),
-            },
-            CipherMode::Legacy => SessionCiphers::Legacy {
-                tx: PacketCipher::new(&keys.tx_key),
-                rx: PacketCipher::new(&keys.rx_key),
-            },
-        };
-
-        // Create fast packet pool for fast cipher mode
-        let pool_size = packet_pool.capacity();
-        let (fast_packet_pool, thread_local_pool) = match cipher_mode {
-            CipherMode::Fast => {
-                // Create both fast pool and thread-local pool for maximum performance
-                let fast_pool = Some(super::pool::shared_fast_pool(
-                    pool_size,
-                    &keys.tx_key,
-                    keys.session_id,
-                ));
-                let tl_pool = Some(super::pool::shared_thread_local_pool(
-                    pool_size,
-                    &keys.tx_key,
-                    keys.session_id,
-                ));
-                (fast_pool, tl_pool)
-            }
-            CipherMode::Legacy => (None, None),
-        };
+        let packet_pool = super::pool::shared_pool(pool_size, &keys.tx_key, keys.session_id);
+        let thread_local_pool =
+            super::pool::shared_local_pool(pool_size, &keys.tx_key, keys.session_id);
 
         Self {
             session_id: keys.session_id,
             peer_addr,
-            ciphers,
+            tx_cipher,
+            rx_cipher,
             streams: DashMap::new(),
             last_activity: AtomicU64::new(current_timestamp()),
             packet_pool,
-            fast_packet_pool,
             thread_local_pool,
             default_reliable,
             active: AtomicBool::new(true),
-            cipher_mode,
         }
     }
 
@@ -149,52 +81,16 @@ impl BltpSession {
         self.peer_addr
     }
 
-    /// Get the cipher mode
+    /// Get the TX cipher
     #[inline]
-    pub fn cipher_mode(&self) -> CipherMode {
-        self.cipher_mode
+    pub fn tx_cipher(&self) -> &PacketCipher {
+        &self.tx_cipher
     }
 
-    /// Check if using fast cipher mode
+    /// Get the RX cipher
     #[inline]
-    pub fn is_fast_mode(&self) -> bool {
-        self.cipher_mode == CipherMode::Fast
-    }
-
-    /// Get the fast TX cipher (panics if not in fast mode)
-    #[inline]
-    pub fn fast_tx_cipher(&self) -> &FastPacketCipher {
-        match &self.ciphers {
-            SessionCiphers::Fast { tx, .. } => tx,
-            SessionCiphers::Legacy { .. } => panic!("not in fast cipher mode"),
-        }
-    }
-
-    /// Get the fast RX cipher (panics if not in fast mode)
-    #[inline]
-    pub fn fast_rx_cipher(&self) -> &FastPacketCipher {
-        match &self.ciphers {
-            SessionCiphers::Fast { rx, .. } => rx,
-            SessionCiphers::Legacy { .. } => panic!("not in fast cipher mode"),
-        }
-    }
-
-    /// Get the legacy TX cipher (panics if not in legacy mode)
-    #[inline]
-    pub fn legacy_tx_cipher(&self) -> &PacketCipher {
-        match &self.ciphers {
-            SessionCiphers::Legacy { tx, .. } => tx,
-            SessionCiphers::Fast { .. } => panic!("not in legacy cipher mode"),
-        }
-    }
-
-    /// Get the legacy RX cipher (panics if not in legacy mode)
-    #[inline]
-    pub fn legacy_rx_cipher(&self) -> &PacketCipher {
-        match &self.ciphers {
-            SessionCiphers::Legacy { rx, .. } => rx,
-            SessionCiphers::Fast { .. } => panic!("not in legacy cipher mode"),
-        }
+    pub fn rx_cipher(&self) -> &PacketCipher {
+        &self.rx_cipher
     }
 
     /// Get or create stream state
@@ -215,40 +111,16 @@ impl BltpSession {
         self.streams.get(&stream_id)
     }
 
-    /// Get the legacy packet pool
+    /// Get the packet pool
     #[inline]
     pub fn packet_pool(&self) -> &SharedPacketPool {
         &self.packet_pool
     }
 
-    /// Get the fast packet pool (panics if not in fast mode)
+    /// Get the thread-local pool for zero-contention packet building
     #[inline]
-    pub fn fast_packet_pool(&self) -> &SharedFastPacketPool {
-        self.fast_packet_pool
-            .as_ref()
-            .expect("fast packet pool not available in legacy mode")
-    }
-
-    /// Try to get the fast packet pool (returns None if not in fast mode)
-    #[inline]
-    pub fn try_fast_packet_pool(&self) -> Option<&SharedFastPacketPool> {
-        self.fast_packet_pool.as_ref()
-    }
-
-    /// Get the thread-local pool (panics if not in fast mode)
-    ///
-    /// The thread-local pool provides zero-contention packet building on the hot path.
-    #[inline]
-    pub fn thread_local_pool(&self) -> &SharedThreadLocalPool {
-        self.thread_local_pool
-            .as_ref()
-            .expect("thread-local pool not available in legacy mode")
-    }
-
-    /// Try to get the thread-local pool (returns None if not in fast mode)
-    #[inline]
-    pub fn try_thread_local_pool(&self) -> Option<&SharedThreadLocalPool> {
-        self.thread_local_pool.as_ref()
+    pub fn thread_local_pool(&self) -> &SharedLocalPool {
+        &self.thread_local_pool
     }
 
     /// Update last activity timestamp
@@ -488,7 +360,6 @@ fn current_timestamp() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::pool::PacketPool;
     use super::*;
 
     fn test_keys() -> SessionKeys {
@@ -502,10 +373,9 @@ mod tests {
     #[test]
     fn test_session_creation() {
         let keys = test_keys();
-        let pool = Arc::new(PacketPool::new(4, &keys.tx_key));
         let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
-        let session = BltpSession::new(keys.clone(), peer_addr, pool, false);
+        let session = BltpSession::new(keys.clone(), peer_addr, 4, false);
 
         assert_eq!(session.session_id(), keys.session_id);
         assert_eq!(session.peer_addr(), peer_addr);
@@ -541,10 +411,9 @@ mod tests {
     #[test]
     fn test_session_streams() {
         let keys = test_keys();
-        let pool = Arc::new(PacketPool::new(4, &keys.tx_key));
         let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
-        let session = BltpSession::new(keys, peer_addr, pool, false);
+        let session = BltpSession::new(keys, peer_addr, 4, false);
 
         // Create streams
         {
@@ -567,10 +436,9 @@ mod tests {
     #[test]
     fn test_session_timeout() {
         let keys = test_keys();
-        let pool = Arc::new(PacketPool::new(4, &keys.tx_key));
         let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
-        let session = BltpSession::new(keys, peer_addr, pool, false);
+        let session = BltpSession::new(keys, peer_addr, 4, false);
 
         // Should not be timed out immediately
         assert!(!session.is_timed_out(Duration::from_secs(1)));
@@ -587,9 +455,8 @@ mod tests {
         assert!(!manager.has_session());
 
         let keys = test_keys();
-        let pool = Arc::new(PacketPool::new(4, &keys.tx_key));
         let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        let session = BltpSession::new(keys, peer_addr, pool, false);
+        let session = BltpSession::new(keys, peer_addr, 4, false);
 
         manager.set_session(session);
         assert!(manager.has_session());
@@ -603,34 +470,22 @@ mod tests {
 
     #[test]
     fn test_session_manager_arc_shares_touch_updates() {
-        // Regression: set_session() was given a dummy BltpSession with zeroed
-        // keys instead of the real session Arc. The dummy never received touch()
-        // updates from packet processing, causing check_session() to falsely
-        // report timeouts.
-        //
-        // The fix uses set_session_arc() so the manager and the packet
-        // processing loop share the same Arc<BltpSession>.
         let manager = SessionManager::new(Duration::from_millis(50));
 
         let keys = test_keys();
-        let pool = Arc::new(PacketPool::new(4, &keys.tx_key));
         let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        let session = Arc::new(BltpSession::new(keys, peer_addr, pool, false));
+        let session = Arc::new(BltpSession::new(keys, peer_addr, 4, false));
 
-        // Use set_session_arc so manager holds the same Arc
         manager.set_session_arc(session.clone());
 
-        // Simulate packet processing touching the session
         std::thread::sleep(Duration::from_millis(30));
-        session.touch(); // This must be visible to check_session
+        session.touch();
 
-        // Even though 30ms passed, the touch should keep the session alive
         assert!(
             manager.check_session(),
             "session should be healthy because touch() updated the shared Arc"
         );
 
-        // Now let it truly time out
         std::thread::sleep(Duration::from_millis(60));
         assert!(
             !manager.check_session(),
