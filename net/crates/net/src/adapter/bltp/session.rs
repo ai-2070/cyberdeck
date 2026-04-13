@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use crate::event::StoredEvent;
 
-use super::crypto::{FastPacketCipher, SessionKeys};
-use super::pool::{SharedFastPacketPool, SharedThreadLocalPool};
+use super::crypto::{PacketCipher, SessionKeys};
+use super::pool::{SharedLocalPool, SharedPacketPool};
 use super::reliability::{create_reliability_mode, ReliabilityMode};
 
 /// Session state after handshake completion.
@@ -23,17 +23,17 @@ pub struct BltpSession {
     /// Remote peer address
     peer_addr: SocketAddr,
     /// TX cipher (ChaCha20-Poly1305 with counter-based nonces)
-    tx_cipher: FastPacketCipher,
+    tx_cipher: PacketCipher,
     /// RX cipher (ChaCha20-Poly1305 with counter-based nonces)
-    rx_cipher: FastPacketCipher,
+    rx_cipher: PacketCipher,
     /// Per-stream state
     streams: DashMap<u64, StreamState>,
     /// Last activity timestamp (for session timeout)
     last_activity: AtomicU64,
     /// Packet pool for zero-allocation building
-    packet_pool: SharedFastPacketPool,
+    packet_pool: SharedPacketPool,
     /// Thread-local pool for zero-contention hot path
-    thread_local_pool: SharedThreadLocalPool,
+    thread_local_pool: SharedLocalPool,
     /// Default reliability mode for new streams
     default_reliable: bool,
     /// Session is active
@@ -48,12 +48,12 @@ impl BltpSession {
         pool_size: usize,
         default_reliable: bool,
     ) -> Self {
-        let tx_cipher = FastPacketCipher::new(&keys.tx_key, keys.session_id);
-        let rx_cipher = FastPacketCipher::new(&keys.rx_key, keys.session_id);
+        let tx_cipher = PacketCipher::new(&keys.tx_key, keys.session_id);
+        let rx_cipher = PacketCipher::new(&keys.rx_key, keys.session_id);
 
-        let packet_pool = super::pool::shared_fast_pool(pool_size, &keys.tx_key, keys.session_id);
+        let packet_pool = super::pool::shared_pool(pool_size, &keys.tx_key, keys.session_id);
         let thread_local_pool =
-            super::pool::shared_thread_local_pool(pool_size, &keys.tx_key, keys.session_id);
+            super::pool::shared_local_pool(pool_size, &keys.tx_key, keys.session_id);
 
         Self {
             session_id: keys.session_id,
@@ -83,13 +83,13 @@ impl BltpSession {
 
     /// Get the TX cipher
     #[inline]
-    pub fn tx_cipher(&self) -> &FastPacketCipher {
+    pub fn tx_cipher(&self) -> &PacketCipher {
         &self.tx_cipher
     }
 
     /// Get the RX cipher
     #[inline]
-    pub fn rx_cipher(&self) -> &FastPacketCipher {
+    pub fn rx_cipher(&self) -> &PacketCipher {
         &self.rx_cipher
     }
 
@@ -113,13 +113,13 @@ impl BltpSession {
 
     /// Get the packet pool
     #[inline]
-    pub fn packet_pool(&self) -> &SharedFastPacketPool {
+    pub fn packet_pool(&self) -> &SharedPacketPool {
         &self.packet_pool
     }
 
     /// Get the thread-local pool for zero-contention packet building
     #[inline]
-    pub fn thread_local_pool(&self) -> &SharedThreadLocalPool {
+    pub fn thread_local_pool(&self) -> &SharedLocalPool {
         &self.thread_local_pool
     }
 

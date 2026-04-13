@@ -55,10 +55,7 @@ pub use failure::{
     CircuitBreaker, CircuitState, FailureDetector, FailureDetectorConfig, FailureStats,
     LossSimulator, NodeStatus, RecoveryAction, RecoveryManager, RecoveryStats,
 };
-pub use pool::{
-    FastPacketBuilder, FastPacketPool, SharedFastPacketPool, SharedThreadLocalPool,
-    ThreadLocalFastPool,
-};
+pub use pool::{PacketBuilder, PacketPool, SharedLocalPool, SharedPacketPool, ThreadLocalPool};
 pub use protocol::{
     BltpHeader, EventFrame, NackPayload, PacketFlags, HEADER_SIZE, NONCE_SIZE, TAG_SIZE,
 };
@@ -291,7 +288,7 @@ impl BltpAdapter {
                 .write_message(&[])
                 .map_err(|e| AdapterError::Connection(format!("write_message failed: {}", e)))?;
 
-            let mut builder = FastPacketBuilder::new(&[0u8; 32], 0);
+            let mut builder = PacketBuilder::new(&[0u8; 32], 0);
             let packet = builder.build_handshake(&msg1);
 
             socket
@@ -388,7 +385,7 @@ impl BltpAdapter {
                 .write_message(&[])
                 .map_err(|e| AdapterError::Connection(format!("write_message failed: {}", e)))?;
 
-            let mut builder = FastPacketBuilder::new(&[0u8; 32], 0);
+            let mut builder = PacketBuilder::new(&[0u8; 32], 0);
             let packet = builder.build_handshake(&msg2);
 
             // Reply to the actual source address (not the configured peer_addr),
@@ -581,7 +578,7 @@ impl BltpAdapter {
                 }
 
                 // Build and send heartbeat
-                let mut builder = FastPacketBuilder::new(&[0u8; 32], session.session_id());
+                let mut builder = PacketBuilder::new(&[0u8; 32], session.session_id());
                 let packet = builder.build_heartbeat();
 
                 if let Err(e) = socket.send_to(&packet, peer_addr).await {

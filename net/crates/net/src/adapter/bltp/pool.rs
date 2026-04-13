@@ -7,30 +7,30 @@ use bytes::{Bytes, BytesMut};
 use crossbeam_queue::ArrayQueue;
 use std::sync::Arc;
 
-use super::crypto::FastPacketCipher;
+use super::crypto::PacketCipher;
 use super::protocol::{
     BltpHeader, EventFrame, PacketFlags, MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE, NONCE_SIZE,
 };
 
 /// Pre-allocated packet builder using counter-based nonces for zero-allocation
 /// packet construction.
-pub struct FastPacketBuilder {
+pub struct PacketBuilder {
     /// Pre-allocated payload buffer
     payload: BytesMut,
     /// Fast cipher with counter-based nonces
-    cipher: FastPacketCipher,
+    cipher: PacketCipher,
     /// Scratch buffer for packet assembly
     packet: BytesMut,
     /// Session ID for this builder
     session_id: u64,
 }
 
-impl FastPacketBuilder {
+impl PacketBuilder {
     /// Create a new fast packet builder
     pub fn new(key: &[u8; 32], session_id: u64) -> Self {
         Self {
             payload: BytesMut::with_capacity(MAX_PAYLOAD_SIZE),
-            cipher: FastPacketCipher::new(key, session_id),
+            cipher: PacketCipher::new(key, session_id),
             packet: BytesMut::with_capacity(MAX_PACKET_SIZE),
             session_id,
         }
@@ -38,7 +38,7 @@ impl FastPacketBuilder {
 
     /// Update the encryption key and session ID
     pub fn set_key(&mut self, key: &[u8; 32], session_id: u64) {
-        self.cipher = FastPacketCipher::new(key, session_id);
+        self.cipher = PacketCipher::new(key, session_id);
         self.session_id = session_id;
     }
 
@@ -154,9 +154,9 @@ impl FastPacketBuilder {
     }
 }
 
-impl std::fmt::Debug for FastPacketBuilder {
+impl std::fmt::Debug for PacketBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FastPacketBuilder")
+        f.debug_struct("PacketBuilder")
             .field("session_id", &format!("{:016x}", self.session_id))
             .field("payload_capacity", &self.payload.capacity())
             .field("packet_capacity", &self.packet.capacity())
@@ -167,9 +167,9 @@ impl std::fmt::Debug for FastPacketBuilder {
 /// Pool of packet builders for amortized allocation.
 ///
 /// Uses counter-based nonces for zero-allocation packet construction.
-pub struct FastPacketPool {
+pub struct PacketPool {
     /// Queue of available builders
-    builders: ArrayQueue<FastPacketBuilder>,
+    builders: ArrayQueue<PacketBuilder>,
     /// Encryption key for new builders
     key: [u8; 32],
     /// Session ID for builders
@@ -178,14 +178,14 @@ pub struct FastPacketPool {
     capacity: usize,
 }
 
-impl FastPacketPool {
+impl PacketPool {
     /// Create a new fast packet pool
     pub fn new(size: usize, key: &[u8; 32], session_id: u64) -> Self {
         let builders = ArrayQueue::new(size);
 
         // Pre-populate the pool
         for _ in 0..size {
-            let _ = builders.push(FastPacketBuilder::new(key, session_id));
+            let _ = builders.push(PacketBuilder::new(key, session_id));
         }
 
         Self {
@@ -204,13 +204,13 @@ impl FastPacketPool {
 
     /// Get a builder from the pool
     #[inline]
-    pub fn get(&self) -> FastPooledBuilder<'_> {
+    pub fn get(&self) -> PooledBuilder<'_> {
         let builder = self
             .builders
             .pop()
-            .unwrap_or_else(|| FastPacketBuilder::new(&self.key, self.session_id));
+            .unwrap_or_else(|| PacketBuilder::new(&self.key, self.session_id));
 
-        FastPooledBuilder {
+        PooledBuilder {
             pool: self,
             builder: Some(builder),
         }
@@ -235,9 +235,9 @@ impl FastPacketPool {
     }
 }
 
-impl std::fmt::Debug for FastPacketPool {
+impl std::fmt::Debug for PacketPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FastPacketPool")
+        f.debug_struct("PacketPool")
             .field("capacity", &self.capacity)
             .field("available", &self.builders.len())
             .field("session_id", &format!("{:016x}", self.session_id))
@@ -246,12 +246,12 @@ impl std::fmt::Debug for FastPacketPool {
 }
 
 /// RAII guard for a fast pooled builder.
-pub struct FastPooledBuilder<'a> {
-    pool: &'a FastPacketPool,
-    builder: Option<FastPacketBuilder>,
+pub struct PooledBuilder<'a> {
+    pool: &'a PacketPool,
+    builder: Option<PacketBuilder>,
 }
 
-impl<'a> FastPooledBuilder<'a> {
+impl<'a> PooledBuilder<'a> {
     /// Build a packet from events
     #[inline]
     pub fn build(
@@ -295,7 +295,7 @@ impl<'a> FastPooledBuilder<'a> {
     }
 }
 
-impl Drop for FastPooledBuilder<'_> {
+impl Drop for PooledBuilder<'_> {
     fn drop(&mut self) {
         if let Some(mut builder) = self.builder.take() {
             // Update key/session if pool values have changed
@@ -308,20 +308,20 @@ impl Drop for FastPooledBuilder<'_> {
     }
 }
 
-impl std::fmt::Debug for FastPooledBuilder<'_> {
+impl std::fmt::Debug for PooledBuilder<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FastPooledBuilder")
+        f.debug_struct("PooledBuilder")
             .field("has_builder", &self.builder.is_some())
             .finish()
     }
 }
 
 /// Shared fast packet pool (thread-safe)
-pub type SharedFastPacketPool = Arc<FastPacketPool>;
+pub type SharedPacketPool = Arc<PacketPool>;
 
 /// Create a shared fast packet pool
-pub fn shared_fast_pool(size: usize, key: &[u8; 32], session_id: u64) -> SharedFastPacketPool {
-    Arc::new(FastPacketPool::new(size, key, session_id))
+pub fn shared_pool(size: usize, key: &[u8; 32], session_id: u64) -> SharedPacketPool {
+    Arc::new(PacketPool::new(size, key, session_id))
 }
 
 // ============================================================================
@@ -333,7 +333,7 @@ use std::cell::RefCell;
 thread_local! {
     /// Thread-local cache of fast packet builders.
     /// This eliminates atomic contention on the hot path.
-    static LOCAL_FAST_BUILDERS: RefCell<Vec<FastPacketBuilder>> = const { RefCell::new(Vec::new()) };
+    static LOCAL_BUILDERS: RefCell<Vec<PacketBuilder>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Thread-local fast packet pool for zero-contention packet building.
@@ -349,9 +349,9 @@ thread_local! {
 ///
 /// When the local cache is warm, `acquire()` and `release()` have zero atomic
 /// operations, making them ~10-15% faster than the shared pool under contention.
-pub struct ThreadLocalFastPool {
+pub struct ThreadLocalPool {
     /// Shared fallback pool
-    shared: ArrayQueue<FastPacketBuilder>,
+    shared: ArrayQueue<PacketBuilder>,
     /// Encryption key for new builders
     key: [u8; 32],
     /// Session ID for builders
@@ -362,7 +362,7 @@ pub struct ThreadLocalFastPool {
     capacity: usize,
 }
 
-impl ThreadLocalFastPool {
+impl ThreadLocalPool {
     /// Default number of builders to cache per thread
     pub const DEFAULT_LOCAL_CAPACITY: usize = 8;
 
@@ -382,7 +382,7 @@ impl ThreadLocalFastPool {
 
         // Pre-populate the shared pool
         for _ in 0..size {
-            let _ = shared.push(FastPacketBuilder::new(key, session_id));
+            let _ = shared.push(PacketBuilder::new(key, session_id));
         }
 
         Self {
@@ -399,8 +399,8 @@ impl ThreadLocalFastPool {
     /// First tries the thread-local cache (zero atomics), then falls back
     /// to the shared pool, refilling the local cache in batches.
     #[inline]
-    pub fn acquire(&self) -> FastPacketBuilder {
-        LOCAL_FAST_BUILDERS.with(|pool| {
+    pub fn acquire(&self) -> PacketBuilder {
+        LOCAL_BUILDERS.with(|pool| {
             let mut pool = pool.borrow_mut();
 
             // Fast path: pop from local cache (no atomics)
@@ -430,7 +430,7 @@ impl ThreadLocalFastPool {
                     }
                     b
                 })
-                .unwrap_or_else(|| FastPacketBuilder::new(&self.key, self.session_id))
+                .unwrap_or_else(|| PacketBuilder::new(&self.key, self.session_id))
         })
     }
 
@@ -439,13 +439,13 @@ impl ThreadLocalFastPool {
     /// Keeps builders in the thread-local cache up to `local_capacity * 2`,
     /// then returns excess to the shared pool.
     #[inline]
-    pub fn release(&self, mut builder: FastPacketBuilder) {
+    pub fn release(&self, mut builder: PacketBuilder) {
         // Update key/session if changed
         if builder.session_id() != self.session_id {
             builder.set_key(&self.key, self.session_id);
         }
 
-        LOCAL_FAST_BUILDERS.with(|pool| {
+        LOCAL_BUILDERS.with(|pool| {
             let mut pool = pool.borrow_mut();
 
             if pool.len() < self.local_capacity * 2 {
@@ -483,9 +483,9 @@ impl ThreadLocalFastPool {
     }
 }
 
-impl std::fmt::Debug for ThreadLocalFastPool {
+impl std::fmt::Debug for ThreadLocalPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ThreadLocalFastPool")
+        f.debug_struct("ThreadLocalPool")
             .field("capacity", &self.capacity)
             .field("shared_available", &self.shared.len())
             .field("local_capacity", &self.local_capacity)
@@ -496,8 +496,8 @@ impl std::fmt::Debug for ThreadLocalFastPool {
 
 /// RAII guard for a thread-local pooled builder.
 pub struct ThreadLocalPooledBuilder<'a> {
-    pool: &'a ThreadLocalFastPool,
-    builder: Option<FastPacketBuilder>,
+    pool: &'a ThreadLocalPool,
+    builder: Option<PacketBuilder>,
 }
 
 impl<'a> ThreadLocalPooledBuilder<'a> {
@@ -561,18 +561,14 @@ impl std::fmt::Debug for ThreadLocalPooledBuilder<'_> {
 }
 
 /// Shared thread-local pool (thread-safe)
-pub type SharedThreadLocalPool = Arc<ThreadLocalFastPool>;
+pub type SharedLocalPool = Arc<ThreadLocalPool>;
 
 /// Create a shared thread-local pool
-pub fn shared_thread_local_pool(
-    size: usize,
-    key: &[u8; 32],
-    session_id: u64,
-) -> SharedThreadLocalPool {
-    Arc::new(ThreadLocalFastPool::new(size, key, session_id))
+pub fn shared_local_pool(size: usize, key: &[u8; 32], session_id: u64) -> SharedLocalPool {
+    Arc::new(ThreadLocalPool::new(size, key, session_id))
 }
 
-impl ThreadLocalFastPool {
+impl ThreadLocalPool {
     /// Get a builder with RAII guard
     #[inline]
     pub fn get(&self) -> ThreadLocalPooledBuilder<'_> {
@@ -592,13 +588,13 @@ mod tests {
     fn test_thread_local_pool_basic() {
         let key = [0x42u8; 32];
         let session_id = 0x1234567890ABCDEF;
-        let pool = ThreadLocalFastPool::new(8, &key, session_id);
+        let pool = ThreadLocalPool::new(8, &key, session_id);
 
         assert_eq!(pool.capacity(), 8);
         assert_eq!(pool.session_id(), session_id);
         assert_eq!(
             pool.local_capacity(),
-            ThreadLocalFastPool::DEFAULT_LOCAL_CAPACITY
+            ThreadLocalPool::DEFAULT_LOCAL_CAPACITY
         );
     }
 
@@ -606,7 +602,7 @@ mod tests {
     fn test_thread_local_pool_acquire_release() {
         let key = [0x42u8; 32];
         let session_id = 0xDEADBEEF;
-        let pool = ThreadLocalFastPool::new(4, &key, session_id);
+        let pool = ThreadLocalPool::new(4, &key, session_id);
 
         // Acquire a builder
         let builder = pool.acquire();
@@ -625,7 +621,7 @@ mod tests {
     fn test_thread_local_pool_raii_guard() {
         let key = [0x42u8; 32];
         let session_id = 0xCAFEBABE;
-        let pool = ThreadLocalFastPool::new(4, &key, session_id);
+        let pool = ThreadLocalPool::new(4, &key, session_id);
 
         {
             let mut builder = pool.get();
@@ -645,7 +641,7 @@ mod tests {
     fn test_thread_local_pool_batch_refill() {
         let key = [0x42u8; 32];
         let session_id = 0x1111;
-        let pool = ThreadLocalFastPool::with_local_capacity(16, &key, session_id, 4);
+        let pool = ThreadLocalPool::with_local_capacity(16, &key, session_id, 4);
 
         // Acquire multiple builders to trigger batch refill
         let mut builders = Vec::new();
@@ -669,7 +665,7 @@ mod tests {
         let key = [0x42u8; 32];
         let session_id = 0x2222;
         // local_capacity = 2, so local cache holds up to 4 (2 * 2)
-        let pool = ThreadLocalFastPool::with_local_capacity(8, &key, session_id, 2);
+        let pool = ThreadLocalPool::with_local_capacity(8, &key, session_id, 2);
 
         // Acquire and release many builders
         for _ in 0..10 {
@@ -683,10 +679,10 @@ mod tests {
     }
 
     #[test]
-    fn test_shared_thread_local_pool() {
+    fn test_shared_local_pool() {
         let key = [0x42u8; 32];
         let session_id = 0x3333;
-        let pool = shared_thread_local_pool(8, &key, session_id);
+        let pool = shared_local_pool(8, &key, session_id);
 
         let pool_clone = pool.clone();
 

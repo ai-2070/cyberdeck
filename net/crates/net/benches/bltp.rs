@@ -39,17 +39,17 @@ use blackstream::adapter::bltp::{
     FailureDetector,
     FailureDetectorConfig,
     FairScheduler,
-    FastPacketPool,
     LocalGraph,
     LossSimulator,
     MultiHopPacketBuilder,
     PacketFlags,
+    PacketPool,
     Pingwave,
     RecoveryManager,
     RoutingHeader,
     RoutingTable,
     StaticKeypair,
-    ThreadLocalFastPool,
+    ThreadLocalPool,
     NONCE_SIZE,
     ROUTING_HEADER_SIZE,
 };
@@ -147,7 +147,7 @@ fn bench_packet_pool(c: &mut Criterion) {
     let key = [0u8; 32];
 
     for pool_size in [16, 64, 256].iter() {
-        let pool = FastPacketPool::new(*pool_size, &key, 0x1234);
+        let pool = PacketPool::new(*pool_size, &key, 0x1234);
 
         group.bench_with_input(
             BenchmarkId::new("get_return", pool_size),
@@ -169,7 +169,7 @@ fn bench_packet_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("bltp_packet_build");
 
     let key = [0u8; 32];
-    let pool = FastPacketPool::new(64, &key, 0x1234);
+    let pool = PacketPool::new(64, &key, 0x1234);
 
     for event_count in [1, 10, 50].iter() {
         let event_data = Bytes::from(vec![0x42u8; 64]);
@@ -197,7 +197,7 @@ fn bench_encryption(c: &mut Criterion) {
     let mut group = c.benchmark_group("bltp_encryption");
 
     let key = [0x42u8; 32];
-    let pool = FastPacketPool::new(64, &key, 0x1234);
+    let pool = PacketPool::new(64, &key, 0x1234);
 
     // Different payload sizes
     for payload_size in [64, 256, 1024, 4096].iter() {
@@ -247,7 +247,7 @@ fn bench_aad(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark: Legacy PacketPool vs ThreadLocalFastPool
+/// Benchmark: Legacy PacketPool vs ThreadLocalPool
 fn bench_pool_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("pool_comparison");
     group.throughput(Throughput::Elements(1));
@@ -256,7 +256,7 @@ fn bench_pool_comparison(c: &mut Criterion) {
     let session_id = 0x1234567890ABCDEF_u64;
 
     // Legacy PacketPool
-    let legacy_pool = FastPacketPool::new(64, &key, 0x1234);
+    let legacy_pool = PacketPool::new(64, &key, 0x1234);
     group.bench_function("legacy_pool_get_return", |b| {
         b.iter(|| {
             let builder = legacy_pool.get();
@@ -264,8 +264,8 @@ fn bench_pool_comparison(c: &mut Criterion) {
         });
     });
 
-    // ThreadLocalFastPool (should be faster due to thread-local caching)
-    let fast_pool = ThreadLocalFastPool::new(64, &key, session_id);
+    // ThreadLocalPool (should be faster due to thread-local caching)
+    let fast_pool = ThreadLocalPool::new(64, &key, session_id);
     group.bench_function("thread_local_pool_get_return", |b| {
         b.iter(|| {
             let builder = fast_pool.get();
@@ -310,7 +310,7 @@ fn bench_cipher_comparison(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(*payload_size as u64));
 
         // Legacy: XChaCha20-Poly1305 with random nonces
-        let legacy_pool = FastPacketPool::new(64, &key, 0x1234);
+        let legacy_pool = PacketPool::new(64, &key, 0x1234);
         group.bench_with_input(
             BenchmarkId::new("legacy_xchacha20", payload_size),
             &events,
@@ -323,7 +323,7 @@ fn bench_cipher_comparison(c: &mut Criterion) {
         );
 
         // Fast: ChaCha20-Poly1305 with counter-based nonces
-        let fast_pool = ThreadLocalFastPool::new(64, &key, session_id);
+        let fast_pool = ThreadLocalPool::new(64, &key, session_id);
         group.bench_with_input(
             BenchmarkId::new("fast_chacha20", payload_size),
             &events,
@@ -384,7 +384,7 @@ fn bench_e2e_packet_build(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(total_bytes as u64));
 
     // Legacy path
-    let legacy_pool = FastPacketPool::new(64, &key, 0x1234);
+    let legacy_pool = PacketPool::new(64, &key, 0x1234);
     group.bench_function("legacy_50_events", |b| {
         b.iter(|| {
             let mut builder = legacy_pool.get();
@@ -393,7 +393,7 @@ fn bench_e2e_packet_build(c: &mut Criterion) {
     });
 
     // Fast path (thread-local + counter nonces)
-    let fast_pool = ThreadLocalFastPool::new(64, &key, session_id);
+    let fast_pool = ThreadLocalPool::new(64, &key, session_id);
     group.bench_function("fast_50_events", |b| {
         b.iter(|| {
             let mut builder = fast_pool.get();
@@ -421,7 +421,7 @@ fn bench_multithread_packet_build(c: &mut Criterion) {
         group.throughput(Throughput::Elements(total_packets as u64));
 
         // Legacy PacketPool (shared, has contention)
-        let legacy_pool = Arc::new(FastPacketPool::new(256, &key, 0x1234));
+        let legacy_pool = Arc::new(PacketPool::new(256, &key, 0x1234));
         group.bench_with_input(
             BenchmarkId::new("legacy_pool", thread_count),
             thread_count,
@@ -453,8 +453,8 @@ fn bench_multithread_packet_build(c: &mut Criterion) {
             },
         );
 
-        // ThreadLocalFastPool (thread-local caching, less contention)
-        let fast_pool = Arc::new(ThreadLocalFastPool::new(256, &key, session_id));
+        // ThreadLocalPool (thread-local caching, less contention)
+        let fast_pool = Arc::new(ThreadLocalPool::new(256, &key, session_id));
         group.bench_with_input(
             BenchmarkId::new("thread_local_pool", thread_count),
             thread_count,
@@ -509,7 +509,7 @@ fn bench_multithread_mixed_frames(c: &mut Criterion) {
         group.throughput(Throughput::Elements(total_packets as u64));
 
         // Legacy pool with mixed frames
-        let legacy_pool = Arc::new(FastPacketPool::new(256, &key, 0x1234));
+        let legacy_pool = Arc::new(PacketPool::new(256, &key, 0x1234));
         let small = small_frame.clone();
         let medium = medium_frame.clone();
         let large = large_frame.clone();
@@ -553,7 +553,7 @@ fn bench_multithread_mixed_frames(c: &mut Criterion) {
         );
 
         // Fast pool with mixed frames
-        let fast_pool = Arc::new(ThreadLocalFastPool::new(256, &key, session_id));
+        let fast_pool = Arc::new(ThreadLocalPool::new(256, &key, session_id));
 
         group.bench_with_input(
             BenchmarkId::new("fast_mixed", thread_count),
@@ -611,7 +611,7 @@ fn bench_pool_contention(c: &mut Criterion) {
         group.throughput(Throughput::Elements(total_cycles as u64));
 
         // Legacy pool contention
-        let legacy_pool = Arc::new(FastPacketPool::new(64, &key, 0x1234));
+        let legacy_pool = Arc::new(PacketPool::new(64, &key, 0x1234));
         group.bench_with_input(
             BenchmarkId::new("legacy_acquire_release", thread_count),
             thread_count,
@@ -638,7 +638,7 @@ fn bench_pool_contention(c: &mut Criterion) {
         );
 
         // Fast pool contention (should show thread-local benefit)
-        let fast_pool = Arc::new(ThreadLocalFastPool::new(64, &key, session_id));
+        let fast_pool = Arc::new(ThreadLocalPool::new(64, &key, session_id));
         group.bench_with_input(
             BenchmarkId::new("fast_acquire_release", thread_count),
             thread_count,
@@ -685,7 +685,7 @@ fn bench_throughput_scaling(c: &mut Criterion) {
         let total_packets = packets_per_thread * *thread_count;
         group.throughput(Throughput::Elements(total_packets as u64));
 
-        let fast_pool = Arc::new(ThreadLocalFastPool::new(256, &key, session_id));
+        let fast_pool = Arc::new(ThreadLocalPool::new(256, &key, session_id));
         let events_template = vec![event_data.clone(); 10]; // Batch of 10
 
         group.bench_with_input(

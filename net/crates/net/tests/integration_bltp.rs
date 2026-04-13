@@ -567,9 +567,7 @@ async fn test_bltp_flush() {
 // Unit tests for low-level components
 mod unit {
     use super::*;
-    use blackstream::adapter::bltp::{
-        BltpHeader, EventFrame, FastPacketPool, HEADER_SIZE, NONCE_SIZE,
-    };
+    use blackstream::adapter::bltp::{BltpHeader, EventFrame, PacketPool, HEADER_SIZE, NONCE_SIZE};
     use bytes::{Bytes, BytesMut};
 
     #[test]
@@ -609,7 +607,7 @@ mod unit {
     #[test]
     fn test_packet_pool_allocation() {
         let key = [0u8; 32];
-        let pool = FastPacketPool::new(4, &key, 0x1234);
+        let pool = PacketPool::new(4, &key, 0x1234);
 
         // Should be able to get 4 builders
         let mut builders = Vec::new();
