@@ -24,18 +24,6 @@ Nodes reject work they can't process within a time window. Dropping a packet and
 
 This economic inversion has a physical consequence at the queue level.
 
-## Queues
-
-In best-effort networks, queues are a virtue. They absorb bursts, smooth jitter, and let slow consumers catch up. TCP's entire flow control model depends on buffers at every hop. Routers queue. Kernels queue. Applications queue. The queue is what makes the delivery guarantee possible - data waits in line until the receiver is ready.
-
-In latency-first networks, queues are failure. Every nanosecond a packet sits in a queue is latency added. A queue means a node accepted work it couldn't immediately process - it violated the self-preservation axiom. In Net, the queue is a ring buffer with a fixed capacity. When it's full, old data is evicted or new data is dropped. There is no unbounded growth. The queue is a speed buffer, not a waiting room.
-
-This creates an incompatibility. Latency-first systems cannot coexist with best-effort systems on the same transport. A latency-first node operating at 10M+ events/sec will fill a best-effort system's kernel socket buffer before a single context switch can happen. The best-effort node hasn't even woken up to read the queue and the queue is already full. From the best-effort node's perspective, this looks like a flood attack. From the latency-first node's perspective, it sent normal traffic to a node that couldn't keep up.
-
-The mismatch is fundamental. Best-effort systems use queues to decouple producers from consumers in time. Latency-first systems require producers and consumers to operate at the same timescale. When they meet, the latency-first system overwhelms the best-effort system's buffers, and the best-effort system's backpressure signals (TCP window scaling, congestion control) operate orders of magnitude too slowly to matter. By the time TCP tells the sender to slow down, the sender has already moved on.
-
-This is why Net runs its own transport (BLTP over UDP) rather than layering on TCP. It's not an optimization. It's a necessity. The two models are physically incompatible at the queue level.
-
 ## A new class of systems
 
 Existing networking falls into two categories:
@@ -51,6 +39,18 @@ The pieces exist independently as solved problems. Event sourcing (Kafka). Proce
 The benchmark numbers aren't performance metrics. They're existence proofs. They measure packet scheduling - the time to process, route, and queue a packet for transmission, not the wire time. But they demonstrate that the software layer is no longer the bottleneck. The scheduling overhead per packet is nanoseconds. The remaining latency is physics: NIC, wire, speed of light. The software got out of the way.
 
 This is the gap: a system that operates at hardware timescales, on commodity hardware, across untrusted infrastructure, with no central coordination, no global consensus, and no assumptions about the goodwill of participants. Best-effort networks can't do this because their queue model is incompatible. Real-time networks can't do this because their guarantees require owning the wire. Net sits in the space between them - fast enough to be real-time, open enough to be general-purpose, hostile enough to survive the actual internet.
+
+## Queues
+
+In best-effort networks, queues are a virtue. They absorb bursts, smooth jitter, and let slow consumers catch up. TCP's entire flow control model depends on buffers at every hop. Routers queue. Kernels queue. Applications queue. The queue is what makes the delivery guarantee possible - data waits in line until the receiver is ready.
+
+In latency-first networks, queues are failure. Every nanosecond a packet sits in a queue is latency added. A queue means a node accepted work it couldn't immediately process - it violated the self-preservation axiom. In Net, the queue is a ring buffer with a fixed capacity. When it's full, old data is evicted or new data is dropped. There is no unbounded growth. The queue is a speed buffer, not a waiting room.
+
+This creates an incompatibility. Latency-first systems cannot coexist with best-effort systems on the same transport. A latency-first node operating at 10M+ events/sec will fill a best-effort system's kernel socket buffer before a single context switch can happen. The best-effort node hasn't even woken up to read the queue and the queue is already full. From the best-effort node's perspective, this looks like a flood attack. From the latency-first node's perspective, it sent normal traffic to a node that couldn't keep up.
+
+The mismatch is fundamental. Best-effort systems use queues to decouple producers from consumers in time. Latency-first systems require producers and consumers to operate at the same timescale. When they meet, the latency-first system overwhelms the best-effort system's buffers, and the best-effort system's backpressure signals (TCP window scaling, congestion control) operate orders of magnitude too slowly to matter. By the time TCP tells the sender to slow down, the sender has already moved on.
+
+This is why Net runs its own transport (BLTP over UDP) rather than layering on TCP. It's not an optimization. It's a necessity. The two models are physically incompatible at the queue level.
 
 ## Properties
 
