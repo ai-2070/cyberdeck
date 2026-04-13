@@ -202,7 +202,7 @@ The value of Net doesn't appear in the protocol's revenue. It appears in the eff
 
 None of these systems need to be rebuilt. Net sits underneath them. The applications don't change. The coordination layer changes. Everything above it gets faster because the layer below it got out of the way.
 
-This is infrastructure investment in the classical sense. The Shinkansen didn't generate its value from ticket sales. It generated it from everything the Japanese economy could do because the train existed. Highways don't profit from tolls. They profit from the GDP of every business that ships on them. Net is the same class of investment - the value is in what runs on top of it, not in the protocol itself.
+This is infrastructure investment in the classical sense. The Shinkansen didn't generate its value from ticket sales. It generated it from everything the Japanese economy could do because the train existed. Highways don't profit from tolls. They profit from the GDP of every business that ships on them. Net is the same - the value is in what runs on top of it, not in the protocol itself.
 
 ## Security
 
