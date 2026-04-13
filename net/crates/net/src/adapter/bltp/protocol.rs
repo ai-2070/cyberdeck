@@ -309,19 +309,22 @@ impl BltpHeader {
 
     /// Get AAD (Additional Authenticated Data) for AEAD construction.
     ///
-    /// Authenticates all header fields except the nonce (which is the AEAD IV).
-    /// This binds the encrypted payload to the full header, preventing
+    /// Authenticates all header fields except:
+    /// - nonce (used as the AEAD IV)
+    /// - hop_count (mutable in transit — incremented by forwarding nodes)
+    ///
+    /// This binds the encrypted payload to the immutable header fields, preventing
     /// an attacker from modifying any field without breaking AEAD verification.
     #[inline]
     pub fn aad(&self) -> [u8; 52] {
         let mut aad = [0u8; 52];
-        // routing fast-path
+        // routing fast-path (hop_count excluded: mutable in transit)
         aad[0..2].copy_from_slice(&self.magic.to_le_bytes());
         aad[2] = self.version;
         aad[3] = self.flags.bits();
         aad[4] = self.priority;
         aad[5] = self.hop_ttl;
-        aad[6] = self.hop_count;
+        // aad[6] = 0: hop_count excluded from AAD
         aad[7] = self.frag_flags;
         aad[8..10].copy_from_slice(&self.subprotocol_id.to_le_bytes());
         aad[10..12].copy_from_slice(&self.channel_hash.to_le_bytes());
