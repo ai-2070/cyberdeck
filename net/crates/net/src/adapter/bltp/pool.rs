@@ -42,14 +42,15 @@ impl PacketBuilder {
         self.session_id = session_id;
     }
 
-    /// Build a packet from events using fast counter-based encryption.
+    /// Build a packet from events using counter-based encryption.
     ///
     /// This method:
     /// 1. Writes events to the payload buffer with length prefixes
-    /// 2. Encrypts the payload in-place using counter-based nonce
-    /// 3. Assembles the final packet with header + encrypted payload + tag
+    /// 2. Serializes the header once, derives AAD from the serialized bytes
+    /// 3. Encrypts the payload in-place using counter-based nonce
+    /// 4. Patches nonce and payload_len into the serialized header
+    /// 5. Assembles the final packet
     ///
-    /// The nonce counter is stored in the header's nonce field (first 12 bytes).
     /// Returns the complete packet as `Bytes`.
     #[inline]
     pub fn build(
@@ -66,20 +67,18 @@ impl PacketBuilder {
         // Write event frames to payload buffer
         EventFrame::write_events(events, &mut self.payload);
 
-        // Build header with placeholder nonce (will be filled with counter)
-        let mut nonce = [0u8; NONCE_SIZE];
-
-        // Get AAD before encryption (we'll update nonce after)
+        // Build and serialize header once (nonce is placeholder, will be patched)
         let header = BltpHeader::new(
             self.session_id,
             stream_id,
             sequence,
-            nonce,
+            [0u8; NONCE_SIZE],
             self.payload.len() as u16,
             events.len() as u16,
             flags,
         );
         let aad = header.aad();
+        let mut header_bytes = header.to_bytes();
 
         // Encrypt payload in-place and get the counter used
         let counter = self
@@ -87,27 +86,20 @@ impl PacketBuilder {
             .encrypt_in_place(&aad, &mut self.payload)
             .expect("encryption should not fail");
 
-        // Store counter in 12-byte nonce field
-        nonce[0..4].copy_from_slice(&(self.session_id as u32).to_le_bytes());
-        nonce[4..12].copy_from_slice(&counter.to_le_bytes());
+        // Patch nonce into serialized header (bytes 12..24)
+        header_bytes[12..16].copy_from_slice(&(self.session_id as u32).to_le_bytes());
+        header_bytes[16..24].copy_from_slice(&counter.to_le_bytes());
 
-        // Build final header with actual nonce
-        let final_header = BltpHeader::new(
-            self.session_id,
-            stream_id,
-            sequence,
-            nonce,
-            (self.payload.len() - 16) as u16, // payload len before tag
-            events.len() as u16,
-            flags,
-        );
+        // Patch payload_len to exclude the 16-byte auth tag (bytes 60..62)
+        let payload_len = (self.payload.len() - 16) as u16;
+        header_bytes[60..62].copy_from_slice(&payload_len.to_le_bytes());
 
         // Assemble packet: header + encrypted_payload + tag
-        self.packet.extend_from_slice(&final_header.to_bytes());
+        self.packet.extend_from_slice(&header_bytes);
         self.packet.extend_from_slice(&self.payload);
 
-        // Return as frozen Bytes (cheap clone)
-        self.packet.clone().freeze()
+        // split() transfers ownership without atomic ref-count bump
+        self.packet.split().freeze()
     }
 
     /// Build a handshake packet (unencrypted)
@@ -120,7 +112,7 @@ impl PacketBuilder {
         self.packet.extend_from_slice(&header.to_bytes());
         self.packet.extend_from_slice(payload);
 
-        self.packet.clone().freeze()
+        self.packet.split().freeze()
     }
 
     /// Build a heartbeat packet
@@ -131,7 +123,7 @@ impl PacketBuilder {
         let header = BltpHeader::heartbeat(self.session_id);
         self.packet.extend_from_slice(&header.to_bytes());
 
-        self.packet.clone().freeze()
+        self.packet.split().freeze()
     }
 
     /// Get the maximum number of events that can fit in a single packet
