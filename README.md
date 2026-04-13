@@ -8,7 +8,7 @@ The Net is a latency-first encrypted mesh network. Every computer, device, and a
 
 ## Why not best-effort
 
-ARPANET assumed scarcity. Net assumes abundance.
+ARPANET assumed scarcity. The Net assumes abundance.
 
 ARPANET was designed during the Cold War. Nuclear war was a real possibility. The network had to survive partial destruction, so TCP guarantees delivery: packets will arrive, eventually, in order, even if half the routers are gone. Nodes were scarce. Bandwidth was scarce. Routes were scarce. Every packet was precious because the infrastructure might not be there for the next one. That was the right design for 1969.
 
