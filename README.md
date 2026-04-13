@@ -192,6 +192,18 @@ This means you can scale a deployment by adding cheap nodes for coverage and a f
 
 **Multiplayer gaming.** No dedicated server. Players' devices form the mesh. Game state propagates peer-to-peer with causal ordering. A player drops, the mesh reroutes. Capability-aware routing means heavier computation - physics, collision, world state - routes toward the gaming PC, not the phone. The weakest device doesn't become the bottleneck; the mesh routes around its limitations the same way it routes around any other constraint. Ping is meaningless here - there's no fixed server to round-trip to. The relevant measurement is observation latency: the time from when a state change is produced to when another node can observe it.
 
+## Infrastructure value
+
+A protocol that operates at nanosecond timescales doesn't just make AI faster. It makes everything that depends on coordination faster.
+
+Manufacturing plants where sensor data reaches decision systems in time to prevent defects, not just log them. Port logistics networks where container routing adapts to delays before ships finish docking. City infrastructure where maintenance signals propagate before failures cascade into outages. Power grids where load balancing happens at the speed of demand, not the speed of SCADA polling. Financial settlement systems where latency isn't a competitive advantage - it's the difference between a correct settlement and a cascade failure.
+
+The value of Net doesn't appear in the protocol's revenue. It appears in the efficiency gain across every system that runs on it. A Toyota plant that catches a tolerance drift 10ms earlier saves a production run. A port that reroutes containers in real time instead of batch processing saves hours per ship. A smart grid that balances load at the edge instead of round-tripping to a central controller reduces peak infrastructure costs. A distributed AI deployment that runs on local mesh infrastructure doesn't depend on foreign cloud providers.
+
+None of these systems need to be rebuilt. Net sits underneath them. The applications don't change. The coordination layer changes. Everything above it gets faster because the layer below it got out of the way.
+
+This is infrastructure investment in the classical sense. The Shinkansen didn't generate its value from ticket sales. It generated it from everything the Japanese economy could do because the train existed. Highways don't profit from tolls. They profit from the GDP of every business that ships on them. Net is the same class of investment - the value is in what runs on top of it, not in the protocol itself.
+
 ## Security
 
 The mesh is encrypted end-to-end with no trusted intermediaries. This isn't a layer on top - it's a consequence of how forwarding works.
@@ -220,18 +232,6 @@ The Blackwall isn't one mechanism. It's the emergent effect of every constraint 
 - **Rate limiting.** Per-node, per-peer limits. One node cannot flood the mesh. Its neighbors enforce their own limits independently through device autonomy rules.
 
 Any single mechanism can be overwhelmed. All of them together form the wall. An event that bypasses backpressure hits the bounded queue. An event that fills the queue gets evicted. An event that propagates too far hits the TTL. An event that duplicates gets deduplicated. A node that floods gets rate-limited by every neighbor independently. There is no single point to breach because the wall is the mesh itself.
-
-## Infrastructure value
-
-A protocol that operates at nanosecond timescales doesn't just make AI faster. It makes everything that depends on coordination faster.
-
-Manufacturing plants where sensor data reaches decision systems in time to prevent defects, not just log them. Port logistics networks where container routing adapts to delays before ships finish docking. City infrastructure where maintenance signals propagate before failures cascade into outages. Power grids where load balancing happens at the speed of demand, not the speed of SCADA polling. Financial settlement systems where latency isn't a competitive advantage - it's the difference between a correct settlement and a cascade failure.
-
-The value of Net doesn't appear in the protocol's revenue. It appears in the efficiency gain across every system that runs on it. A Toyota plant that catches a tolerance drift 10ms earlier saves a production run. A port that reroutes containers in real time instead of batch processing saves hours per ship. A smart grid that balances load at the edge instead of round-tripping to a central controller reduces peak infrastructure costs. A distributed AI deployment that runs on local mesh infrastructure doesn't depend on foreign cloud providers.
-
-None of these systems need to be rebuilt. Net sits underneath them. The applications don't change. The coordination layer changes. Everything above it gets faster because the layer below it got out of the way.
-
-This is infrastructure investment in the classical sense. The Shinkansen didn't generate its value from ticket sales. It generated it from everything the Japanese economy could do because the train existed. Highways don't profit from tolls. They profit from the GDP of every business that ships on them. Net is the same class of investment - the value is in what runs on top of it, not in the protocol itself.
 
 ## Benchmarks
 
