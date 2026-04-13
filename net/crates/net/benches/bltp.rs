@@ -7,8 +7,7 @@
 //! - Encryption/decryption throughput
 //! - Event frame serialization
 //! - End-to-end send/receive throughput
-//! - Legacy vs Fast cipher comparison
-//! - Legacy vs Thread-local pool comparison
+//! - Shared vs Thread-local pool comparison
 //! - Multi-threaded concurrency (Phase 2)
 //! - Router and fair scheduler (Phase 3A)
 
@@ -256,10 +255,10 @@ fn bench_pool_comparison(c: &mut Criterion) {
     let session_id = 0x1234567890ABCDEF_u64;
 
     // Legacy PacketPool
-    let legacy_pool = PacketPool::new(64, &key, 0x1234);
-    group.bench_function("legacy_pool_get_return", |b| {
+    let shared_pool = PacketPool::new(64, &key, 0x1234);
+    group.bench_function("shared_pool_get_return", |b| {
         b.iter(|| {
-            let builder = legacy_pool.get();
+            let builder = shared_pool.get();
             drop(builder);
         });
     });
@@ -274,10 +273,10 @@ fn bench_pool_comparison(c: &mut Criterion) {
     });
 
     // Measure with contention simulation (multiple acquire/release)
-    group.bench_function("legacy_pool_10x", |b| {
+    group.bench_function("shared_pool_10x", |b| {
         b.iter(|| {
             for _ in 0..10 {
-                let builder = legacy_pool.get();
+                let builder = shared_pool.get();
                 drop(builder);
             }
         });
@@ -310,13 +309,13 @@ fn bench_cipher_comparison(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(*payload_size as u64));
 
         // Legacy: XChaCha20-Poly1305 with random nonces
-        let legacy_pool = PacketPool::new(64, &key, 0x1234);
+        let shared_pool = PacketPool::new(64, &key, 0x1234);
         group.bench_with_input(
-            BenchmarkId::new("legacy_xchacha20", payload_size),
+            BenchmarkId::new("shared_pool", payload_size),
             &events,
             |b, events| {
                 b.iter(|| {
-                    let mut builder = legacy_pool.get();
+                    let mut builder = shared_pool.get();
                     builder.build(0x5678, 42, events, PacketFlags::NONE)
                 });
             },
@@ -384,10 +383,10 @@ fn bench_e2e_packet_build(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(total_bytes as u64));
 
     // Legacy path
-    let legacy_pool = PacketPool::new(64, &key, 0x1234);
-    group.bench_function("legacy_50_events", |b| {
+    let shared_pool = PacketPool::new(64, &key, 0x1234);
+    group.bench_function("shared_pool_50_events", |b| {
         b.iter(|| {
-            let mut builder = legacy_pool.get();
+            let mut builder = shared_pool.get();
             builder.build(0x5678, 42, &events, PacketFlags::NONE)
         });
     });
@@ -421,15 +420,15 @@ fn bench_multithread_packet_build(c: &mut Criterion) {
         group.throughput(Throughput::Elements(total_packets as u64));
 
         // Legacy PacketPool (shared, has contention)
-        let legacy_pool = Arc::new(PacketPool::new(256, &key, 0x1234));
+        let shared_pool = Arc::new(PacketPool::new(256, &key, 0x1234));
         group.bench_with_input(
-            BenchmarkId::new("legacy_pool", thread_count),
+            BenchmarkId::new("shared_pool", thread_count),
             thread_count,
             |b, &thread_count| {
                 b.iter(|| {
                     let handles: Vec<_> = (0..thread_count)
                         .map(|_| {
-                            let pool = Arc::clone(&legacy_pool);
+                            let pool = Arc::clone(&shared_pool);
                             thread::spawn(move || {
                                 let event_data = Bytes::from(vec![0x42u8; 64]);
                                 let events = vec![event_data];
@@ -509,19 +508,19 @@ fn bench_multithread_mixed_frames(c: &mut Criterion) {
         group.throughput(Throughput::Elements(total_packets as u64));
 
         // Legacy pool with mixed frames
-        let legacy_pool = Arc::new(PacketPool::new(256, &key, 0x1234));
+        let shared_pool = Arc::new(PacketPool::new(256, &key, 0x1234));
         let small = small_frame.clone();
         let medium = medium_frame.clone();
         let large = large_frame.clone();
 
         group.bench_with_input(
-            BenchmarkId::new("legacy_mixed", thread_count),
+            BenchmarkId::new("shared_mixed", thread_count),
             thread_count,
             |b, &thread_count| {
                 b.iter(|| {
                     let handles: Vec<_> = (0..thread_count)
                         .map(|thread_id| {
-                            let pool = Arc::clone(&legacy_pool);
+                            let pool = Arc::clone(&shared_pool);
                             let s = small.clone();
                             let m = medium.clone();
                             let l = large.clone();
@@ -611,15 +610,15 @@ fn bench_pool_contention(c: &mut Criterion) {
         group.throughput(Throughput::Elements(total_cycles as u64));
 
         // Legacy pool contention
-        let legacy_pool = Arc::new(PacketPool::new(64, &key, 0x1234));
+        let shared_pool = Arc::new(PacketPool::new(64, &key, 0x1234));
         group.bench_with_input(
-            BenchmarkId::new("legacy_acquire_release", thread_count),
+            BenchmarkId::new("shared_acquire_release", thread_count),
             thread_count,
             |b, &thread_count| {
                 b.iter(|| {
                     let handles: Vec<_> = (0..thread_count)
                         .map(|_| {
-                            let pool = Arc::clone(&legacy_pool);
+                            let pool = Arc::clone(&shared_pool);
                             thread::spawn(move || {
                                 for _ in 0..cycles_per_thread {
                                     let builder = pool.get();
