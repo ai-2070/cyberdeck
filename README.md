@@ -1,10 +1,10 @@
-# The Net
+# Net
 
 Loosely inspired by the Net from Cyberpunk 2077 - a flat, encrypted mesh where every device is a first-class node. Not affiliated with CD Projekt Red or R. Talsorian Games. This is an engineering take on the concept, not a licensed adaptation.
 
 ## What it is
 
-The Net is a latency-first encrypted mesh network. Every computer, device, and application is an equal node on a flat topology. There are no clients, no servers, no coordinators. The mesh propagates state, not connections.
+Net is a latency-first encrypted mesh network. Every computer, device, and application is an equal node on a flat topology. There are no clients, no servers, no coordinators. The mesh propagates state, not connections.
 
 ## Why not best-effort
 
@@ -16,7 +16,7 @@ It's the wrong design for now. Data is abundant. Nodes are abundant. Bandwidth i
 
 TCP also presumes that most actors are good. The protocol is cooperative - it assumes both sides want the connection to succeed, that routers will forward honestly, that congestion control will be respected. The entire internet is built on this assumption. It works until it doesn't.
 
-The Net makes no presumptions about actors. The only axiom is self-preservation: a node must survive by not getting overloaded. Everything else follows from that. Nodes drop what they can't handle. Relay nodes can't read what they forward. Capability announcements can be verified against behavior. Trust isn't assumed - it's derived from observation. A node that claims capacity it doesn't have will be routed around when its silence or latency betrays it.
+Net makes no presumptions about actors. The only axiom is self-preservation: a node must survive by not getting overloaded. Everything else follows from that. Nodes drop what they can't handle. Relay nodes can't read what they forward. Capability announcements can be verified against behavior. Trust isn't assumed - it's derived from observation. A node that claims capacity it doesn't have will be routed around when its silence or latency betrays it.
 
 Net inverts the default. TCP starts with trust and detects abuse. Net starts with zero assumptions and lets trust emerge from consistent behavior.
 
