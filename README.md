@@ -102,6 +102,8 @@ No global consensus. No coordinator. No privileged node. Consistency emerges fro
 
 Everything in the mesh is either observable or derivable. A node doesn't need direct heartbeats from every peer. If it knows a gateway is alive and the gateway reports on its subnet, the subnet's state is derived. The mesh is an inference engine about its own state, not just a forwarding engine for events.
 
+The only authority the mesh respects is physics. Propagation speed, causal ordering, the speed of light. Everything else is negotiable.
+
 ## State, not connections
 
 Traditional networking treats the connection as the primary object. You establish a socket, maintain it, tear it down. If the connection breaks, the relationship breaks.
