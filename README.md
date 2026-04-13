@@ -6,6 +6,27 @@ Loosely inspired by the Net from Cyberpunk 2077 - a flat, encrypted mesh where e
 
 Net is a latency-first encrypted mesh network. Every computer, device, and application is an equal node on a flat topology. There are no clients, no servers, no coordinators. The mesh propagates state, not connections.
 
+## Contents
+
+- [Why not best-effort](#why-not-best-effort)
+- [A new class of systems](#a-new-class-of-systems)
+- [Properties](#properties)
+- [Queues](#queues)
+- [Backpressure](#backpressure)
+- [Rerouting](#rerouting)
+- [Topology](#topology)
+- [Consistency](#consistency)
+- [State, not connections](#state-not-connections)
+- [Invariants](#invariants)
+- [Device autonomy](#device-autonomy)
+- [Processing without storage](#processing-without-storage)
+- [Cost of devices](#cost-of-devices)
+- [Applications](#applications)
+- [Infrastructure value](#infrastructure-value)
+- [Security](#security)
+- [The Blackwall](#the-blackwall)
+- [Benchmarks](#benchmarks)
+
 ## Why not best-effort
 
 ARPANET assumed scarcity. The Net assumes abundance.
