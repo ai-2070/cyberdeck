@@ -9,6 +9,7 @@ Net is a latency-first encrypted mesh network. Every computer, device, and appli
 ## Contents
 
 - [Why not best-effort](#why-not-best-effort)
+- [Why not cloud](#why-not-cloud)
 - [A new class of systems](#a-new-class-of-systems)
 - [Properties](#properties)
 - [Queues](#queues)
@@ -238,6 +239,18 @@ The mesh is encrypted end-to-end with no trusted intermediaries. This isn't a la
 **No connection state to hijack.** There's no TCP session to take over, no cookie to steal, no sequence number to predict. State propagates through the mesh, not through connections. There's nothing persistent on the wire to attack.
 
 This is different from TLS, where every hop that terminates TLS - load balancers, proxies, CDNs - sees plaintext. The standard web architecture is a chain of trusted intermediaries. Net has no trusted intermediaries. There's nothing to trust them with.
+
+## Why not cloud
+
+Cloud infrastructure solves the wrong problem. It moves compute closer to a central provider. Net moves compute closer to the data and the work.
+
+Cloud adds a trusted intermediary by definition -- your traffic routes through someone else's infrastructure, on their terms, visible to their systems, subject to their availability. Net has no intermediaries. Relay nodes forward encrypted bytes they cannot read. There is no Cloudflare, no AWS, no Azure in the path because the path is yours.
+
+Cloud economics assume you don't own the hardware. Edge compute assumes the edge is theirs. Net assumes the edge is you -- your computer, your servers, your devices, your mesh.
+
+A manufacturing plant running on Net doesn't route sensor data to AWS us-east-1 and back. The sensor talks directly to the decision system on the factory floor. The latency is physics, not geography plus cloud overhead.
+
+This isn't anti-cloud. It's post-cloud. Cloud was the right answer when compute was scarce and hardware was expensive. Compute is abundant. Hardware is cheap. The coordination layer should reflect that.
 
 ## The Blackwall
 
