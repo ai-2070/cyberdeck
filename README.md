@@ -36,6 +36,22 @@ The mismatch is fundamental. Best-effort systems use queues to decouple producer
 
 This is why Net runs its own transport (BLTP over UDP) rather than layering on TCP. It's not an optimization. It's a necessity. The two models are physically incompatible at the queue level.
 
+## A new class of systems
+
+Existing networking falls into two categories:
+
+**Best-effort networks** (TCP/IP, HTTP, gRPC). Optimized for delivery. Queues absorb bursts. Backpressure is negotiated. Connections are stateful. Consistency is global or eventual. Trust is assumed. The sender slows down when the receiver can't keep up. This model dominates because it was designed first and everything was built on top of it.
+
+**Real-time networks** (CAN bus, EtherCAT, TSN, military MANETs). Optimized for deterministic timing. Fixed topologies. Dedicated hardware. Time-slotted access. These achieve low latency by controlling the physical layer - you get guaranteed timing because you own the wire. They don't scale to heterogeneous, dynamic, adversarial environments because they can't. The guarantees depend on controlling the infrastructure.
+
+Net is neither. It achieves real-time latencies on commodity hardware over commodity networks without controlling the physical layer. It doesn't guarantee timing through infrastructure control - it guarantees it through architectural choices: drop instead of queue, route around instead of wait, observe instead of coordinate, derive instead of query.
+
+The pieces exist independently as solved problems. Event sourcing (Kafka). Process migration (Erlang/OTP). Distributed state (CRDTs). Capability scheduling (Kubernetes). Self-healing mesh (military MANETs). Causal ordering (vector clocks). Nobody composed them into a single runtime at nanosecond speeds because nobody had a transport layer fast enough. You can't migrate state in microseconds if your network adds milliseconds. You can't detect failure in nanoseconds if your heartbeat protocol runs over TCP.
+
+The benchmark numbers aren't performance metrics. They're existence proofs. They measure packet scheduling - the time to process, route, and queue a packet for transmission, not the wire time. But they demonstrate that the software layer is no longer the bottleneck. The scheduling overhead per packet is nanoseconds. The remaining latency is physics: NIC, wire, speed of light. The software got out of the way.
+
+This is the gap: a system that operates at hardware timescales, on commodity hardware, across untrusted infrastructure, with no central coordination, no global consensus, and no assumptions about the goodwill of participants. Best-effort networks can't do this because their queue model is incompatible. Real-time networks can't do this because their guarantees require owning the wire. Net sits in the space between them - fast enough to be real-time, open enough to be general-purpose, hostile enough to survive the actual internet.
+
 ## Properties
 
 **Latency-first.** The entire stack is designed so that "within the time window" is measured in nanoseconds. Sub-nanosecond header serialization. Nanosecond-scale heartbeats, forwarding hops, and failure recovery. The floor is low enough that packet scheduling operates at timescales traditionally reserved for local function calls. See [Benchmarks](#benchmarks) for measured numbers.
@@ -125,22 +141,6 @@ Net propagates state. Connections are ephemeral transport - the current shortest
 ## Device autonomy
 
 Every node sets its own rules. A node can rate-limit, reject, redirect, or kill-switch independently. The mesh doesn't override a node's sovereignty. Autonomy rules, safety envelopes, and resource limits are local decisions, not network policy.
-
-## A new class of systems
-
-Existing networking falls into two categories:
-
-**Best-effort networks** (TCP/IP, HTTP, gRPC). Optimized for delivery. Queues absorb bursts. Backpressure is negotiated. Connections are stateful. Consistency is global or eventual. Trust is assumed. The sender slows down when the receiver can't keep up. This model dominates because it was designed first and everything was built on top of it.
-
-**Real-time networks** (CAN bus, EtherCAT, TSN, military MANETs). Optimized for deterministic timing. Fixed topologies. Dedicated hardware. Time-slotted access. These achieve low latency by controlling the physical layer - you get guaranteed timing because you own the wire. They don't scale to heterogeneous, dynamic, adversarial environments because they can't. The guarantees depend on controlling the infrastructure.
-
-Net is neither. It achieves real-time latencies on commodity hardware over commodity networks without controlling the physical layer. It doesn't guarantee timing through infrastructure control - it guarantees it through architectural choices: drop instead of queue, route around instead of wait, observe instead of coordinate, derive instead of query.
-
-The pieces exist independently as solved problems. Event sourcing (Kafka). Process migration (Erlang/OTP). Distributed state (CRDTs). Capability scheduling (Kubernetes). Self-healing mesh (military MANETs). Causal ordering (vector clocks). Nobody composed them into a single runtime at nanosecond speeds because nobody had a transport layer fast enough. You can't migrate state in microseconds if your network adds milliseconds. You can't detect failure in nanoseconds if your heartbeat protocol runs over TCP.
-
-The benchmark numbers aren't performance metrics. They're existence proofs. They measure packet scheduling - the time to process, route, and queue a packet for transmission, not the wire time. But they demonstrate that the software layer is no longer the bottleneck. The scheduling overhead per packet is nanoseconds. The remaining latency is physics: NIC, wire, speed of light. The software got out of the way.
-
-This is the gap: a system that operates at hardware timescales, on commodity hardware, across untrusted infrastructure, with no central coordination, no global consensus, and no assumptions about the goodwill of participants. Best-effort networks can't do this because their queue model is incompatible. Real-time networks can't do this because their guarantees require owning the wire. Net sits in the space between them - fast enough to be real-time, open enough to be general-purpose, hostile enough to survive the actual internet.
 
 ## Processing without storage
 
