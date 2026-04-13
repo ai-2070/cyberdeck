@@ -1,6 +1,6 @@
 # The Net
 
-Loosely inspired by the Net from Cyberpunk 2020/2077 - a flat, encrypted mesh where every device is a first-class node. Not affiliated with CD Projekt Red or R. Talsorian Games. This is an engineering take on the concept, not a licensed adaptation.
+Loosely inspired by the Net from Cyberpunk 2077 - a flat, encrypted mesh where every device is a first-class node. Not affiliated with CD Projekt Red or R. Talsorian Games. This is an engineering take on the concept, not a licensed adaptation.
 
 ## What it is
 
