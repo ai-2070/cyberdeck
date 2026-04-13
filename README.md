@@ -122,6 +122,20 @@ Net propagates state. Connections are ephemeral transport - the current shortest
 
 **Participation.** Relay is a cost of participation. If you're on the mesh, you forward traffic within your resource limits. This is cooperative, not economic - the current design assumes a mesh of your own machines and trusted participants. Incentive mechanisms for public, multi-party, or adversarial meshes are out of scope. Nodes enforce their own relay limits through the same autonomy rules that govern everything else.
 
+## Security
+
+The mesh is encrypted end-to-end with no trusted intermediaries. This isn't a layer on top -- it's a consequence of how forwarding works.
+
+**No plaintext on relays.** Zero-copy forwarding means relay nodes pass encrypted bytes through without decrypting. There's no moment where the payload is readable in memory on an untrusted node. Nothing to sniff, nothing to dump, nothing to log.
+
+**No parsing means no code execution surface.** A relay never interprets the payload. It doesn't know if it's forwarding JSON, binary, or garbage. It moves bytes. You can't exploit a parser bug in content the relay never parses. The attack surface of a relay is the routing header, not the content.
+
+**Compromise of a relay leaks nothing.** Even with full root access and memory dumps, an attacker who owns a relay gets encrypted bytes with no key material. Session keys are between source and destination. The relay was never part of the key exchange.
+
+**No connection state to hijack.** There's no TCP session to take over, no cookie to steal, no sequence number to predict. State propagates through the mesh, not through connections. There's nothing persistent on the wire to attack.
+
+This is different from TLS, where every hop that terminates TLS -- load balancers, proxies, CDNs -- sees plaintext. The standard web architecture is a chain of trusted intermediaries. Net has no trusted intermediaries. There's nothing to trust them with.
+
 ## Device autonomy
 
 Every node sets its own rules. A node can rate-limit, reject, redirect, or kill-switch independently. The mesh doesn't override a node's sovereignty. Autonomy rules, safety envelopes, and resource limits are local decisions, not network policy.
