@@ -206,6 +206,21 @@ The mesh is encrypted end-to-end with no trusted intermediaries. This isn't a la
 
 This is different from TLS, where every hop that terminates TLS - load balancers, proxies, CDNs - sees plaintext. The standard web architecture is a chain of trusted intermediaries. Net has no trusted intermediaries. There's nothing to trust them with.
 
+## The Blackwall
+
+In Cyberpunk, the Blackwall contains rogue AIs from consuming the Net. In this system, the Blackwall contains rogue traffic from consuming the mesh. Same function - containment of uncontrolled propagation - different threat model.
+
+The Blackwall isn't one mechanism. It's the emergent effect of every constraint working together:
+
+- **Backpressure.** Nodes limit in-flight events, prevent overload, and apply pushback by going silent. No node can be forced to accept more than it can process.
+- **Bounded queues.** No infinite buffers. Ring buffers have explicit capacity limits. Memory usage is predictable and fixed. A flood fills a buffer and gets evicted, it doesn't grow the buffer.
+- **Fanout limits.** Events don't propagate to everyone. Dissemination is controlled by the proximity graph and routing table. This prevents O(n²) explosion - an event reaches the nodes that need it, not every node on the mesh.
+- **Deduplication.** The same event doesn't explode repeatedly. Idempotency at the event level protects against loops and amplification.
+- **TTL and propagation limits.** Events expire. Pingwaves have a hop radius. Nothing propagates forever. A misbehaving node's traffic dies at the boundary of its TTL, not at the edge of the mesh.
+- **Rate limiting.** Per-node, per-peer limits. One node cannot flood the mesh. Its neighbors enforce their own limits independently through device autonomy rules.
+
+Any single mechanism can be overwhelmed. All of them together form the wall. An event that bypasses backpressure hits the bounded queue. An event that fills the queue gets evicted. An event that propagates too far hits the TTL. An event that duplicates gets deduplicated. A node that floods gets rate-limited by every neighbor independently. There is no single point to breach because the wall is the mesh itself.
+
 ## Benchmarks
 
 All numbers below measure **packet scheduling** - the time to process, route, encrypt, and queue a packet for transmission. They do not include NIC transfer, wire latency, or speed-of-light propagation. The software layer is what these benchmarks prove is no longer the bottleneck.
