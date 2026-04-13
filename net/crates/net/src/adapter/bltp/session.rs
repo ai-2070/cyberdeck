@@ -51,16 +51,9 @@ impl BltpSession {
         let tx_cipher = FastPacketCipher::new(&keys.tx_key, keys.session_id);
         let rx_cipher = FastPacketCipher::new(&keys.rx_key, keys.session_id);
 
-        let packet_pool = super::pool::shared_fast_pool(
-            pool_size,
-            &keys.tx_key,
-            keys.session_id,
-        );
-        let thread_local_pool = super::pool::shared_thread_local_pool(
-            pool_size,
-            &keys.tx_key,
-            keys.session_id,
-        );
+        let packet_pool = super::pool::shared_fast_pool(pool_size, &keys.tx_key, keys.session_id);
+        let thread_local_pool =
+            super::pool::shared_thread_local_pool(pool_size, &keys.tx_key, keys.session_id);
 
         Self {
             session_id: keys.session_id,

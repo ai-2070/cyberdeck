@@ -452,8 +452,7 @@ impl BltpAdapter {
 
         // Decrypt payload
         let aad = parsed.header.aad();
-        let counter =
-            u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
+        let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
         let rx_cipher = session.rx_cipher();
         if !rx_cipher.is_valid_rx_counter(counter) {
             return;
@@ -701,9 +700,7 @@ impl Adapter for BltpAdapter {
             let frame_size = EventFrame::LEN_SIZE + event_bytes.len();
 
             // Check if adding this event would exceed packet size
-            if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE
-                && !current_batch.is_empty()
-            {
+            if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE && !current_batch.is_empty() {
                 // Send current batch
                 let seq = stream.next_tx_seq();
                 let flags = if reliable {

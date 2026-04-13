@@ -230,13 +230,29 @@ impl BltpHeader {
     /// Create a handshake header
     #[inline]
     pub fn handshake(payload_len: u16) -> Self {
-        Self::new(0, 0, 0, [0u8; NONCE_SIZE], payload_len, 0, PacketFlags::HANDSHAKE)
+        Self::new(
+            0,
+            0,
+            0,
+            [0u8; NONCE_SIZE],
+            payload_len,
+            0,
+            PacketFlags::HANDSHAKE,
+        )
     }
 
     /// Create a heartbeat header
     #[inline]
     pub fn heartbeat(session_id: u64) -> Self {
-        Self::new(session_id, 0, 0, [0u8; NONCE_SIZE], 0, 0, PacketFlags::HEARTBEAT)
+        Self::new(
+            session_id,
+            0,
+            0,
+            [0u8; NONCE_SIZE],
+            0,
+            0,
+            PacketFlags::HEARTBEAT,
+        )
     }
 
     /// Set priority level

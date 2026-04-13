@@ -567,7 +567,9 @@ async fn test_bltp_flush() {
 // Unit tests for low-level components
 mod unit {
     use super::*;
-    use blackstream::adapter::bltp::{BltpHeader, EventFrame, FastPacketPool, HEADER_SIZE, NONCE_SIZE};
+    use blackstream::adapter::bltp::{
+        BltpHeader, EventFrame, FastPacketPool, HEADER_SIZE, NONCE_SIZE,
+    };
     use bytes::{Bytes, BytesMut};
 
     #[test]
