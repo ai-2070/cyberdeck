@@ -4,7 +4,7 @@ Loosely inspired by the Net from Cyberpunk 2020/2077 - a flat, encrypted mesh wh
 
 ## What it is
 
-Net is a latency-first encrypted mesh network. Every computer, device, and application is an equal node on a flat topology. There are no clients, no servers, no coordinators. The mesh propagates state, not connections.
+The Net is a latency-first encrypted mesh network. Every computer, device, and application is an equal node on a flat topology. There are no clients, no servers, no coordinators. The mesh propagates state, not connections.
 
 ## Why not best-effort
 
