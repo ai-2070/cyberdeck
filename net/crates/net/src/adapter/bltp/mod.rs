@@ -56,11 +56,11 @@ pub use failure::{
     LossSimulator, NodeStatus, RecoveryAction, RecoveryManager, RecoveryStats,
 };
 pub use pool::{
-    PacketBuilder, PacketPool, SharedPacketPool, SharedThreadLocalPool, ThreadLocalFastPool,
+    FastPacketBuilder, FastPacketPool, SharedFastPacketPool, SharedThreadLocalPool,
+    ThreadLocalFastPool,
 };
 pub use protocol::{
-    BltpHeader, DispatchField, EventFrame, NackPayload, PacketFlags, HEADER_SIZE, NONCE_SIZE,
-    TAG_SIZE,
+    BltpHeader, EventFrame, NackPayload, PacketFlags, HEADER_SIZE, NONCE_SIZE, TAG_SIZE,
 };
 pub use proxy::{
     BltpProxy, ForwardResult, HopStats, MultiHopPacketBuilder, ProxyConfig, ProxyError, ProxyStats,
@@ -91,7 +91,6 @@ use crate::error::AdapterError;
 use crate::event::{Batch, StoredEvent};
 
 use crypto::NoiseHandshake;
-use pool::shared_pool;
 use session::SessionManager as SessionMgr;
 use transport::BltpSocket as Socket;
 
@@ -292,7 +291,7 @@ impl BltpAdapter {
                 .write_message(&[])
                 .map_err(|e| AdapterError::Connection(format!("write_message failed: {}", e)))?;
 
-            let mut builder = PacketBuilder::new(&[0u8; 32]);
+            let mut builder = FastPacketBuilder::new(&[0u8; 32], 0);
             let packet = builder.build_handshake(&msg1);
 
             socket
@@ -389,7 +388,7 @@ impl BltpAdapter {
                 .write_message(&[])
                 .map_err(|e| AdapterError::Connection(format!("write_message failed: {}", e)))?;
 
-            let mut builder = PacketBuilder::new(&[0u8; 32]);
+            let mut builder = FastPacketBuilder::new(&[0u8; 32], 0);
             let packet = builder.build_handshake(&msg2);
 
             // Reply to the actual source address (not the configured peer_addr),
@@ -451,30 +450,20 @@ impl BltpAdapter {
             return;
         }
 
-        // Decrypt payload based on cipher mode
+        // Decrypt payload
         let aad = parsed.header.aad();
-        let decrypted = if session.is_fast_mode() {
-            let counter =
-                u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
-            let rx_cipher = session.fast_rx_cipher();
-            if !rx_cipher.is_valid_rx_counter(counter) {
-                return;
+        let counter =
+            u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
+        let rx_cipher = session.rx_cipher();
+        if !rx_cipher.is_valid_rx_counter(counter) {
+            return;
+        }
+        let decrypted = match rx_cipher.decrypt(counter, &aad, &parsed.payload) {
+            Ok(d) => {
+                rx_cipher.update_rx_counter(counter);
+                d
             }
-            match rx_cipher.decrypt(counter, &aad, &parsed.payload) {
-                Ok(d) => {
-                    rx_cipher.update_rx_counter(counter);
-                    d
-                }
-                Err(_) => return,
-            }
-        } else {
-            match session
-                .legacy_rx_cipher()
-                .decrypt(&parsed.header.nonce, &aad, &parsed.payload)
-            {
-                Ok(d) => d,
-                Err(_) => return,
-            }
+            Err(_) => return,
         };
 
         // Parse events
@@ -593,8 +582,8 @@ impl BltpAdapter {
                 }
 
                 // Build and send heartbeat
-                let mut builder = PacketBuilder::new(&[0u8; 32]);
-                let packet = builder.build_heartbeat(session.session_id());
+                let mut builder = FastPacketBuilder::new(&[0u8; 32], session.session_id());
+                let packet = builder.build_heartbeat();
 
                 if let Err(e) = socket.send_to(&packet, peer_addr).await {
                     tracing::warn!(error = %e, "heartbeat send failed");
@@ -633,16 +622,13 @@ impl Adapter for BltpAdapter {
         let (keys, actual_peer) = self.perform_handshake(&socket).await?;
 
         // Create packet pool with TX key
-        let pool = shared_pool(self.config.packet_pool_size, &keys.tx_key);
-
         // Create session with the actual peer address (not the configured one,
         // which may be stale or pre-NAT)
-        let session = Arc::new(BltpSession::with_cipher_mode(
+        let session = Arc::new(BltpSession::new(
             keys,
             actual_peer,
-            pool,
+            self.config.packet_pool_size,
             self.config.default_reliability.is_reliable(),
-            self.config.cipher_mode,
         ));
         self.session = Some(session.clone());
 
@@ -706,51 +692,19 @@ impl Adapter for BltpAdapter {
         let mut current_batch: Vec<Bytes> = Vec::with_capacity(64);
         let mut current_size = 0usize;
 
-        // Use fast path if in fast cipher mode, otherwise legacy path
-        if session.is_fast_mode() {
-            // Fast path: thread-local pool with counter-based nonces
-            // Zero contention + ~20-40% faster AEAD
-            let pool = session.thread_local_pool();
-            let mut builder = pool.get();
+        // Thread-local pool with counter-based nonces — zero contention
+        let pool = session.thread_local_pool();
+        let mut builder = pool.get();
 
-            for event in &batch.events {
-                let event_bytes = event.raw.clone();
-                let frame_size = EventFrame::LEN_SIZE + event_bytes.len();
+        for event in &batch.events {
+            let event_bytes = event.raw.clone();
+            let frame_size = EventFrame::LEN_SIZE + event_bytes.len();
 
-                // Check if adding this event would exceed packet size
-                if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE
-                    && !current_batch.is_empty()
-                {
-                    // Send current batch
-                    let seq = stream.next_tx_seq();
-                    let flags = if reliable {
-                        PacketFlags::RELIABLE
-                    } else {
-                        PacketFlags::NONE
-                    };
-
-                    let packet = builder.build(stream_id, seq, &current_batch, flags);
-
-                    socket
-                        .send_to(&packet, peer_addr)
-                        .await
-                        .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
-
-                    // Track for reliability
-                    if reliable {
-                        stream.with_reliability(|r| r.on_send(seq, packet));
-                    }
-
-                    current_batch.clear();
-                    current_size = 0;
-                }
-
-                current_batch.push(event_bytes);
-                current_size += frame_size;
-            }
-
-            // Send remaining events
-            if !current_batch.is_empty() {
+            // Check if adding this event would exceed packet size
+            if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE
+                && !current_batch.is_empty()
+            {
+                // Send current batch
                 let seq = stream.next_tx_seq();
                 let flags = if reliable {
                     PacketFlags::RELIABLE
@@ -765,72 +719,37 @@ impl Adapter for BltpAdapter {
                     .await
                     .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
 
+                // Track for reliability
                 if reliable {
                     stream.with_reliability(|r| r.on_send(seq, packet));
                 }
-            }
-        } else {
-            // Legacy path: random nonces (XChaCha20)
-            let pool = session.packet_pool();
-            let mut builder = pool.get();
 
-            for event in &batch.events {
-                let event_bytes = event.raw.clone();
-                let frame_size = EventFrame::LEN_SIZE + event_bytes.len();
-
-                // Check if adding this event would exceed packet size
-                if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE
-                    && !current_batch.is_empty()
-                {
-                    // Send current batch
-                    let seq = stream.next_tx_seq();
-                    let flags = if reliable {
-                        PacketFlags::RELIABLE
-                    } else {
-                        PacketFlags::NONE
-                    };
-
-                    let packet =
-                        builder.build(session.session_id(), stream_id, seq, &current_batch, flags);
-
-                    socket
-                        .send_to(&packet, peer_addr)
-                        .await
-                        .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
-
-                    // Track for reliability
-                    if reliable {
-                        stream.with_reliability(|r| r.on_send(seq, packet));
-                    }
-
-                    current_batch.clear();
-                    current_size = 0;
-                }
-
-                current_batch.push(event_bytes);
-                current_size += frame_size;
+                current_batch.clear();
+                current_size = 0;
             }
 
-            // Send remaining events
-            if !current_batch.is_empty() {
-                let seq = stream.next_tx_seq();
-                let flags = if reliable {
-                    PacketFlags::RELIABLE
-                } else {
-                    PacketFlags::NONE
-                };
+            current_batch.push(event_bytes);
+            current_size += frame_size;
+        }
 
-                let packet =
-                    builder.build(session.session_id(), stream_id, seq, &current_batch, flags);
+        // Send remaining events
+        if !current_batch.is_empty() {
+            let seq = stream.next_tx_seq();
+            let flags = if reliable {
+                PacketFlags::RELIABLE
+            } else {
+                PacketFlags::NONE
+            };
 
-                socket
-                    .send_to(&packet, peer_addr)
-                    .await
-                    .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
+            let packet = builder.build(stream_id, seq, &current_batch, flags);
 
-                if reliable {
-                    stream.with_reliability(|r| r.on_send(seq, packet));
-                }
+            socket
+                .send_to(&packet, peer_addr)
+                .await
+                .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
+
+            if reliable {
+                stream.with_reliability(|r| r.on_send(seq, packet));
             }
         }
 

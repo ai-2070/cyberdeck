@@ -185,13 +185,11 @@ async fn test_redis_filtering() {
 
     // All returned events should be token type
     for event in &response.events {
-        let value: serde_json::Value =
-            serde_json::from_slice(&event.raw).expect("Failed to parse event JSON");
         assert_eq!(
-            value.get("type").and_then(|v| v.as_str()),
+            event.raw.get("type").and_then(|v| v.as_str()),
             Some("token"),
             "Expected token type, got {:?}",
-            value
+            event.raw
         );
     }
 

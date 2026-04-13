@@ -43,7 +43,7 @@ use blackstream::adapter::bltp::{
     LossSimulator,
     MultiHopPacketBuilder,
     PacketFlags,
-    PacketPool,
+    FastPacketPool,
     Pingwave,
     RecoveryManager,
     RoutingHeader,
@@ -147,7 +147,7 @@ fn bench_packet_pool(c: &mut Criterion) {
     let key = [0u8; 32];
 
     for pool_size in [16, 64, 256].iter() {
-        let pool = PacketPool::new(*pool_size, &key);
+        let pool = FastPacketPool::new(*pool_size, &key, 0x1234);
 
         group.bench_with_input(
             BenchmarkId::new("get_return", pool_size),
@@ -169,7 +169,7 @@ fn bench_packet_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("bltp_packet_build");
 
     let key = [0u8; 32];
-    let pool = PacketPool::new(64, &key);
+    let pool = FastPacketPool::new(64, &key, 0x1234);
 
     for event_count in [1, 10, 50].iter() {
         let event_data = Bytes::from(vec![0x42u8; 64]);
@@ -183,7 +183,7 @@ fn bench_packet_build(c: &mut Criterion) {
             |b, events| {
                 b.iter(|| {
                     let mut builder = pool.get();
-                    builder.build(0x1234, 0x5678, 42, events, PacketFlags::NONE)
+                    builder.build(0x5678, 42, events, PacketFlags::NONE)
                 });
             },
         );
@@ -197,7 +197,7 @@ fn bench_encryption(c: &mut Criterion) {
     let mut group = c.benchmark_group("bltp_encryption");
 
     let key = [0x42u8; 32];
-    let pool = PacketPool::new(64, &key);
+    let pool = FastPacketPool::new(64, &key, 0x1234);
 
     // Different payload sizes
     for payload_size in [64, 256, 1024, 4096].iter() {
@@ -211,7 +211,7 @@ fn bench_encryption(c: &mut Criterion) {
             |b, events| {
                 b.iter(|| {
                     let mut builder = pool.get();
-                    builder.build(0x1234, 0x5678, 42, events, PacketFlags::NONE)
+                    builder.build(0x5678, 42, events, PacketFlags::NONE)
                 });
             },
         );
@@ -256,7 +256,7 @@ fn bench_pool_comparison(c: &mut Criterion) {
     let session_id = 0x1234567890ABCDEF_u64;
 
     // Legacy PacketPool
-    let legacy_pool = PacketPool::new(64, &key);
+    let legacy_pool = FastPacketPool::new(64, &key, 0x1234);
     group.bench_function("legacy_pool_get_return", |b| {
         b.iter(|| {
             let builder = legacy_pool.get();
@@ -310,14 +310,14 @@ fn bench_cipher_comparison(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(*payload_size as u64));
 
         // Legacy: XChaCha20-Poly1305 with random nonces
-        let legacy_pool = PacketPool::new(64, &key);
+        let legacy_pool = FastPacketPool::new(64, &key, 0x1234);
         group.bench_with_input(
             BenchmarkId::new("legacy_xchacha20", payload_size),
             &events,
             |b, events| {
                 b.iter(|| {
                     let mut builder = legacy_pool.get();
-                    builder.build(session_id, 0x5678, 42, events, PacketFlags::NONE)
+                    builder.build(0x5678, 42, events, PacketFlags::NONE)
                 });
             },
         );
@@ -384,11 +384,11 @@ fn bench_e2e_packet_build(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(total_bytes as u64));
 
     // Legacy path
-    let legacy_pool = PacketPool::new(64, &key);
+    let legacy_pool = FastPacketPool::new(64, &key, 0x1234);
     group.bench_function("legacy_50_events", |b| {
         b.iter(|| {
             let mut builder = legacy_pool.get();
-            builder.build(session_id, 0x5678, 42, &events, PacketFlags::NONE)
+            builder.build(0x5678, 42, &events, PacketFlags::NONE)
         });
     });
 
@@ -421,7 +421,7 @@ fn bench_multithread_packet_build(c: &mut Criterion) {
         group.throughput(Throughput::Elements(total_packets as u64));
 
         // Legacy PacketPool (shared, has contention)
-        let legacy_pool = Arc::new(PacketPool::new(256, &key));
+        let legacy_pool = Arc::new(FastPacketPool::new(256, &key, 0x1234));
         group.bench_with_input(
             BenchmarkId::new("legacy_pool", thread_count),
             thread_count,
@@ -436,7 +436,6 @@ fn bench_multithread_packet_build(c: &mut Criterion) {
                                 for seq in 0..iterations_per_thread {
                                     let mut builder = pool.get();
                                     let _packet = builder.build(
-                                        session_id,
                                         0x5678,
                                         seq as u64,
                                         &events,
@@ -510,7 +509,7 @@ fn bench_multithread_mixed_frames(c: &mut Criterion) {
         group.throughput(Throughput::Elements(total_packets as u64));
 
         // Legacy pool with mixed frames
-        let legacy_pool = Arc::new(PacketPool::new(256, &key));
+        let legacy_pool = Arc::new(FastPacketPool::new(256, &key, 0x1234));
         let small = small_frame.clone();
         let medium = medium_frame.clone();
         let large = large_frame.clone();
@@ -536,7 +535,6 @@ fn bench_multithread_mixed_frames(c: &mut Criterion) {
                                     };
                                     let mut builder = pool.get();
                                     let _packet = builder.build(
-                                        session_id,
                                         thread_id as u64,
                                         i as u64,
                                         &events,
@@ -613,7 +611,7 @@ fn bench_pool_contention(c: &mut Criterion) {
         group.throughput(Throughput::Elements(total_cycles as u64));
 
         // Legacy pool contention
-        let legacy_pool = Arc::new(PacketPool::new(64, &key));
+        let legacy_pool = Arc::new(FastPacketPool::new(64, &key, 0x1234));
         group.bench_with_input(
             BenchmarkId::new("legacy_acquire_release", thread_count),
             thread_count,
@@ -1535,7 +1533,8 @@ fn bench_capability_search(c: &mut Criterion) {
             caps = caps.with_tool("rust");
         }
 
-        graph.on_capability(CapabilityAd::new(0x2000 + i as u64, 1, caps));
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
+        graph.on_capability(CapabilityAd::new(0x2000 + i as u64, 1, caps), addr);
     }
 
     group.throughput(Throughput::Elements(1));

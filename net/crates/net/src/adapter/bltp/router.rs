@@ -385,7 +385,7 @@ impl BltpRouter {
         // Extract stream ID from BLTP header if present
         let stream_id = if data.len() >= ROUTING_HEADER_SIZE + HEADER_SIZE {
             let bltp_header = &data[ROUTING_HEADER_SIZE..ROUTING_HEADER_SIZE + HEADER_SIZE];
-            u64::from_le_bytes(bltp_header[40..48].try_into().unwrap_or([0; 8]))
+            u64::from_le_bytes(bltp_header[32..40].try_into().unwrap_or([0; 8]))
         } else {
             0
         };
@@ -734,7 +734,7 @@ mod tests {
             0xAAAA,             // session_id
             expected_stream_id, // stream_id
             1,                  // sequence
-            [0u8; 24],          // nonce
+            [0u8; 12],          // nonce
             0,                  // payload_len
             0,                  // event_count
             super::super::protocol::PacketFlags::NONE,
