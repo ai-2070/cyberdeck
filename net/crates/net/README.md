@@ -2,7 +2,7 @@
 
 High-performance encrypted mesh runtime in 831 KB.
 
-Net is the networking layer of the cyberdeck. It ingests, relays, and replays AI-generated streaming output at GPU-native speeds -- token streams, multi-agent event flows, tool-use results, guardrail decisions, consensus votes, and session lifecycle events.
+Net is the networking layer. It ingests, relays, and replays AI-generated streaming output at GPU-native speeds -- token streams, multi-agent event flows, tool-use results, guardrail decisions, consensus votes, and session lifecycle events.
 
 ## Stack
 
