@@ -59,25 +59,25 @@ Performance benchmarks for the Blackstream Rust core and BLTP transport layer.
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| 1 event | 739.56 ns | 82.529 MiB/s | 1.1398 Âus | 53.550 MiB/s |
-| 10 events | 2.5199 Âus | 242.21 MiB/s | 1.5049 Âus | 405.58 MiB/s |
-| 50 events | 10.820 Âus | 282.06 MiB/s | 2.9616 Âus | 1.0063 GiB/s |
+| 1 event | 739.56 ns | 82.529 MiB/s | 1.1398 us | 53.550 MiB/s |
+| 10 events | 2.5199 us | 242.21 MiB/s | 1.5049 us | 405.58 MiB/s |
+| 50 events | 10.820 us | 282.06 MiB/s | 2.9616 us | 1.0063 GiB/s |
 
 ## Encryption (ChaCha20-Poly1305)
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| 64B | 742.76 ns | 82.173 MiB/s | 1.1382 Âus | 53.623 MiB/s |
-| 256B | 1.3187 Âus | 185.14 MiB/s | 1.2106 Âus | 201.67 MiB/s |
-| 1KB | 3.6486 Âus | 267.66 MiB/s | 1.6028 Âus | 609.30 MiB/s |
-| 4KB | 12.944 Âus | 301.77 MiB/s | 3.1795 Âus | 1.1998 GiB/s |
+| 64B | 742.76 ns | 82.173 MiB/s | 1.1382 us | 53.623 MiB/s |
+| 256B | 1.3187 us | 185.14 MiB/s | 1.2106 us | 201.67 MiB/s |
+| 1KB | 3.6486 us | 267.66 MiB/s | 1.6028 us | 609.30 MiB/s |
+| 4KB | 12.944 us | 301.77 MiB/s | 3.1795 us | 1.1998 GiB/s |
 
 ### End-to-End Packet Build (50 events)
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| Shared pool | 10.869 Âus | 280.79 MiB/s | 2.9614 Âus | 1.0063 GiB/s |
-| Thread-local pool | 10.787 Âus | 282.90 MiB/s | 2.9145 Âus | 1.0225 GiB/s |
+| Shared pool | 10.869 us | 280.79 MiB/s | 2.9614 us | 1.0063 GiB/s |
+| Thread-local pool | 10.787 us | 282.90 MiB/s | 2.9145 us | 1.0225 GiB/s |
 
 ## Adaptive Batcher Overhead
 
@@ -91,7 +91,7 @@ Performance benchmarks for the Blackstream Rust core and BLTP transport layer.
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| Keypair generate | 34.651 Âus | 28.859 Kelem/s | 21.389 Âus | 46.752 Kelem/s |
+| Keypair generate | 34.651 us | 28.859 Kelem/s | 21.389 us | 46.752 Kelem/s |
 
 ## Multi-threaded Packet Build (1000 packets/thread)
 
@@ -111,7 +111,7 @@ Performance benchmarks for the Blackstream Rust core and BLTP transport layer.
 | Threads | Pool | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
 | 8 | Shared | 14.503 ms | 5.5161 Melem/s | 8.7283 ms | 9.1656 Melem/s |
-| 8 | Thread-local | 985.95 Âus | 81.140 Melem/s | 968.01 Âus | 82.644 Melem/s |
+| 8 | Thread-local | 985.95 us | 81.140 Melem/s | 968.01 us | 82.644 Melem/s |
 | 16 | Shared | 30.569 ms | 5.2341 Melem/s | 20.381 ms | 7.8504 Melem/s |
 | 16 | Thread-local | 1.5572 ms | 102.75 Melem/s | 1.3143 ms | 121.74 Melem/s |
 | 24 | Shared | 47.616 ms | 5.0403 Melem/s | 30.619 ms | 7.8383 Melem/s |
@@ -165,18 +165,18 @@ Performance benchmarks for the Blackstream Rust core and BLTP transport layer.
 | add_route | 302.00 ns | 3.3112 Melem/s | 239.05 ns | 4.1832 Melem/s |
 | record_in | 52.627 ns | 19.002 Melem/s | 42.015 ns | 23.801 Melem/s |
 | record_out | 19.720 ns | 50.710 Melem/s | 21.456 ns | 46.606 Melem/s |
-| aggregate_stats | 2.1794 Âus | 458.83 Kelem/s | 8.1608 Âus | 122.54 Kelem/s |
+| aggregate_stats | 2.1794 us | 458.83 Kelem/s | 8.1608 us | 122.54 Kelem/s |
 
 ### Concurrent Routing Lookup
 
 | Threads | Pool | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 4 | Lookup | 127.30 Âus | 31.423 Melem/s | 182.45 Âus | 21.924 Melem/s |
-| 4 | Stats | 308.32 Âus | 12.974 Melem/s | 269.30 Âus | 14.853 Melem/s |
-| 8 | Lookup | 209.67 Âus | 38.155 Melem/s | 314.17 Âus | 25.464 Melem/s |
-| 8 | Stats | 506.51 Âus | 15.794 Melem/s | 406.86 Âus | 19.663 Melem/s |
-| 16 | Lookup | 383.71 Âus | 41.698 Melem/s | 611.00 Âus | 26.187 Melem/s |
-| 16 | Stats | 1.0359 ms | 15.445 Melem/s | 687.85 Âus | 23.261 Melem/s |
+| 4 | Lookup | 127.30 us | 31.423 Melem/s | 182.45 us | 21.924 Melem/s |
+| 4 | Stats | 308.32 us | 12.974 Melem/s | 269.30 us | 14.853 Melem/s |
+| 8 | Lookup | 209.67 us | 38.155 Melem/s | 314.17 us | 25.464 Melem/s |
+| 8 | Stats | 506.51 us | 15.794 Melem/s | 406.86 us | 19.663 Melem/s |
+| 16 | Lookup | 383.71 us | 41.698 Melem/s | 611.00 us | 26.187 Melem/s |
+| 16 | Stats | 1.0359 ms | 15.445 Melem/s | 687.85 us | 23.261 Melem/s |
 
 ### Decision Pipeline
 
@@ -251,8 +251,8 @@ Performance benchmarks for the Blackstream Rust core and BLTP transport layer.
 
 | Threads | Pool | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 4 | Forward | 656.13 Âus | 6.0964 Melem/s | 1.1323 ms | 3.5325 Melem/s |
-| 8 | Forward | 1.6468 ms | 4.8578 Melem/s | 877.68 Âus | 9.1150 Melem/s |
+| 4 | Forward | 656.13 us | 6.0964 Melem/s | 1.1323 ms | 3.5325 Melem/s |
+| 8 | Forward | 1.6468 ms | 4.8578 Melem/s | 877.68 us | 9.1150 Melem/s |
 | 16 | Forward | 2.0272 ms | 7.8926 Melem/s | 1.1791 ms | 13.569 Melem/s |
 
 ## Swarm / Discovery
@@ -275,38 +275,38 @@ Performance benchmarks for the Blackstream Rust core and BLTP transport layer.
 | on_pingwave_duplicate | 23.160 ns | 43.178 Melem/s | 15.967 ns | 62.630 Melem/s |
 | get_node | 27.952 ns | 35.776 Melem/s | 15.568 ns | 64.236 Melem/s |
 | node_count | 209.67 ns | 4.7695 Melem/s | 979.30 ns | 1.0211 Melem/s |
-| stats | 628.82 ns | 1.5903 Melem/s | 2.9408 Âus | 340.05 Kelem/s |
+| stats | 628.82 ns | 1.5903 Melem/s | 2.9408 us | 340.05 Kelem/s |
 
 ### Graph Scaling
 
 | Nodes | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 100 | all_nodes | 2.4210 Âus | 41.304 Melem/s | 7.7085 Âus | 12.973 Melem/s |
-| 100 | nodes_within_hops | 2.9285 Âus | 34.147 Melem/s | 7.7721 Âus | 12.867 Melem/s |
-| 500 | all_nodes | 7.6763 Âus | 65.135 Melem/s | 17.100 Âus | 29.240 Melem/s |
-| 500 | nodes_within_hops | 9.8546 Âus | 50.738 Melem/s | 16.634 Âus | 30.060 Melem/s |
-| 1,000 | all_nodes | 150.46 Âus | 6.6463 Melem/s | 27.881 Âus | 35.866 Melem/s |
-| 1,000 | nodes_within_hops | 159.10 Âus | 6.2853 Melem/s | 28.009 Âus | 35.702 Melem/s |
-| 5,000 | all_nodes | 125.45 Âus | 39.855 Melem/s | 229.45 Âus | 21.791 Melem/s |
-| 5,000 | nodes_within_hops | 179.69 Âus | 27.825 Melem/s | 226.25 Âus | 22.100 Melem/s |
+| 100 | all_nodes | 2.4210 us | 41.304 Melem/s | 7.7085 us | 12.973 Melem/s |
+| 100 | nodes_within_hops | 2.9285 us | 34.147 Melem/s | 7.7721 us | 12.867 Melem/s |
+| 500 | all_nodes | 7.6763 us | 65.135 Melem/s | 17.100 us | 29.240 Melem/s |
+| 500 | nodes_within_hops | 9.8546 us | 50.738 Melem/s | 16.634 us | 30.060 Melem/s |
+| 1,000 | all_nodes | 150.46 us | 6.6463 Melem/s | 27.881 us | 35.866 Melem/s |
+| 1,000 | nodes_within_hops | 159.10 us | 6.2853 Melem/s | 28.009 us | 35.702 Melem/s |
+| 5,000 | all_nodes | 125.45 us | 39.855 Melem/s | 229.45 us | 21.791 Melem/s |
+| 5,000 | nodes_within_hops | 179.69 us | 27.825 Melem/s | 226.25 us | 22.100 Melem/s |
 
 ### Path Finding
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| path_1_hop | 1.6254 Âus | 615.22 Kelem/s | 5.8981 Âus | 169.55 Kelem/s |
-| path_2_hops | 1.7114 Âus | 584.32 Kelem/s | 5.8644 Âus | 170.52 Kelem/s |
-| path_4_hops | 1.9694 Âus | 507.77 Kelem/s | 6.1469 Âus | 162.68 Kelem/s |
-| path_not_found | 1.9593 Âus | 510.39 Kelem/s | 6.1103 Âus | 163.66 Kelem/s |
-| path_complex_graph | 352.00 Âus | 2.8409 Kelem/s | 304.93 Âus | 3.2795 Kelem/s |
+| path_1_hop | 1.6254 us | 615.22 Kelem/s | 5.8981 us | 169.55 Kelem/s |
+| path_2_hops | 1.7114 us | 584.32 Kelem/s | 5.8644 us | 170.52 Kelem/s |
+| path_4_hops | 1.9694 us | 507.77 Kelem/s | 6.1469 us | 162.68 Kelem/s |
+| path_not_found | 1.9593 us | 510.39 Kelem/s | 6.1103 us | 163.66 Kelem/s |
+| path_complex_graph | 352.00 us | 2.8409 Kelem/s | 304.93 us | 3.2795 Kelem/s |
 
 ### Concurrent Pingwave Processing
 
 | Threads | Pool | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 4 | Pingwave | 149.76 Âus | 13.354 Melem/s | 219.60 Âus | 9.1075 Melem/s |
-| 8 | Pingwave | 228.53 Âus | 17.503 Melem/s | 370.16 Âus | 10.806 Melem/s |
-| 16 | Pingwave | 417.55 Âus | 19.159 Melem/s | 668.69 Âus | 11.964 Melem/s |
+| 4 | Pingwave | 149.76 us | 13.354 Melem/s | 219.60 us | 9.1075 Melem/s |
+| 8 | Pingwave | 228.53 us | 17.503 Melem/s | 370.16 us | 10.806 Melem/s |
+| 16 | Pingwave | 417.55 us | 19.159 Melem/s | 668.69 us | 11.964 Melem/s |
 
 ## Failure Detection
 
@@ -360,22 +360,22 @@ Performance benchmarks for the Blackstream Rust core and BLTP transport layer.
 
 | Nodes | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 100 | check_all | 4.9581 Âus | 20.169 Melem/s | 9.0881 Âus | 11.003 Melem/s |
-| 100 | healthy_nodes | 1.7634 Âus | 56.709 Melem/s | 6.4434 Âus | 15.520 Melem/s |
-| 500 | check_all | 21.533 Âus | 23.220 Melem/s | 23.604 Âus | 21.183 Melem/s |
-| 500 | healthy_nodes | 7.2929 Âus | 68.560 Melem/s | 9.1803 Âus | 54.465 Melem/s |
-| 1,000 | check_all | 42.246 Âus | 23.671 Melem/s | 41.914 Âus | 23.858 Melem/s |
-| 1,000 | healthy_nodes | 10.715 Âus | 93.326 Melem/s | 12.931 Âus | 77.332 Melem/s |
-| 5,000 | check_all | 210.66 Âus | 23.735 Melem/s | 187.33 Âus | 26.691 Melem/s |
-| 5,000 | healthy_nodes | 51.587 Âus | 96.923 Melem/s | 42.962 Âus | 116.38 Melem/s |
+| 100 | check_all | 4.9581 us | 20.169 Melem/s | 9.0881 us | 11.003 Melem/s |
+| 100 | healthy_nodes | 1.7634 us | 56.709 Melem/s | 6.4434 us | 15.520 Melem/s |
+| 500 | check_all | 21.533 us | 23.220 Melem/s | 23.604 us | 21.183 Melem/s |
+| 500 | healthy_nodes | 7.2929 us | 68.560 Melem/s | 9.1803 us | 54.465 Melem/s |
+| 1,000 | check_all | 42.246 us | 23.671 Melem/s | 41.914 us | 23.858 Melem/s |
+| 1,000 | healthy_nodes | 10.715 us | 93.326 Melem/s | 12.931 us | 77.332 Melem/s |
+| 5,000 | check_all | 210.66 us | 23.735 Melem/s | 187.33 us | 26.691 Melem/s |
+| 5,000 | healthy_nodes | 51.587 us | 96.923 Melem/s | 42.962 us | 116.38 Melem/s |
 
 ### Concurrent Heartbeats
 
 | Threads | Pool | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 4 | Heartbeat | 214.98 Âus | 9.3031 Melem/s | 265.12 Âus | 7.5436 Melem/s |
-| 8 | Heartbeat | 331.04 Âus | 12.083 Melem/s | 408.56 Âus | 9.7904 Melem/s |
-| 16 | Heartbeat | 639.84 Âus | 12.503 Melem/s | 711.70 Âus | 11.241 Melem/s |
+| 4 | Heartbeat | 214.98 us | 9.3031 Melem/s | 265.12 us | 7.5436 Melem/s |
+| 8 | Heartbeat | 331.04 us | 12.083 Melem/s | 408.56 us | 9.7904 Melem/s |
+| 16 | Heartbeat | 639.84 us | 12.503 Melem/s | 711.70 us | 11.241 Melem/s |
 
 ## Stream Multiplexing
 
@@ -383,21 +383,21 @@ Performance benchmarks for the Blackstream Rust core and BLTP transport layer.
 |---|---|---|---|---|---|
 | 10 | Lookup | 127.34 ns | 78.529 Melem/s | 146.25 ns | 68.378 Melem/s |
 | 10 | Stats | 525.86 ns | 19.016 Melem/s | 419.31 ns | 23.849 Melem/s |
-| 100 | Lookup | 1.2897 Âus | 77.540 Melem/s | 1.4008 Âus | 71.385 Melem/s |
-| 100 | Stats | 5.3736 Âus | 18.609 Melem/s | 4.2109 Âus | 23.748 Melem/s |
-| 1,000 | Lookup | 13.122 Âus | 76.210 Melem/s | 14.556 Âus | 68.703 Melem/s |
-| 1,000 | Stats | 54.913 Âus | 18.211 Melem/s | 45.515 Âus | 21.971 Melem/s |
-| 10,000 | Lookup | 141.96 Âus | 70.440 Melem/s | 150.80 Âus | 66.311 Melem/s |
-| 10,000 | Stats | 617.02 Âus | 16.207 Melem/s | 483.49 Âus | 20.683 Melem/s |
+| 100 | Lookup | 1.2897 us | 77.540 Melem/s | 1.4008 us | 71.385 Melem/s |
+| 100 | Stats | 5.3736 us | 18.609 Melem/s | 4.2109 us | 23.748 Melem/s |
+| 1,000 | Lookup | 13.122 us | 76.210 Melem/s | 14.556 us | 68.703 Melem/s |
+| 1,000 | Stats | 54.913 us | 18.211 Melem/s | 45.515 us | 21.971 Melem/s |
+| 10,000 | Lookup | 141.96 us | 70.440 Melem/s | 150.80 us | 66.311 Melem/s |
+| 10,000 | Stats | 617.02 us | 16.207 Melem/s | 483.49 us | 20.683 Melem/s |
 
 ## Fair Scheduler
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| Creation | 302.08 ns | 3.3104 Melem/s | 1.6471 Âus | 607.13 Kelem/s |
+| Creation | 302.08 ns | 3.3104 Melem/s | 1.6471 us | 607.13 Kelem/s |
 | Stream count (empty) | 211.23 ns | 4.7341 Melem/s | 976.75 ns | 1.0238 Melem/s |
 | Total queued | 324.82 ps | 3.0786 Gelem/s | 202.86 ps | 4.9296 Gelem/s |
-| Cleanup (empty) | 208.74 ns | 4.7907 Melem/s | 1.2988 Âus | 769.94 Kelem/s |
+| Cleanup (empty) | 208.74 ns | 4.7907 Melem/s | 1.2988 us | 769.94 Kelem/s |
 
 ## Capability System
 
@@ -407,8 +407,8 @@ Performance benchmarks for the Blackstream Rust core and BLTP transport layer.
 |---|---|---|---|---|
 | create | 540.39 ns | 1.8505 Melem/s | 806.28 ns | 1.2403 Melem/s |
 | serialize | 962.64 ns | 1.0388 Melem/s | 721.65 ns | 1.3857 Melem/s |
-| deserialize | 1.8434 Âus | 542.49 Kelem/s | 3.1463 Âus | 317.84 Kelem/s |
-| roundtrip | 2.8648 Âus | 349.06 Kelem/s | 4.0612 Âus | 246.23 Kelem/s |
+| deserialize | 1.8434 us | 542.49 Kelem/s | 3.1463 us | 317.84 Kelem/s |
+| roundtrip | 2.8648 us | 349.06 Kelem/s | 4.0612 us | 246.23 Kelem/s |
 | has_tag | 782.12 ps | 1.2786 Gelem/s | 626.71 ps | 1.5956 Gelem/s |
 | has_model | 976.58 ps | 1.0240 Gelem/s | 441.79 ps | 2.2635 Gelem/s |
 | has_tool | 781.72 ps | 1.2792 Gelem/s | 635.13 ps | 1.5745 Gelem/s |
@@ -418,9 +418,9 @@ Performance benchmarks for the Blackstream Rust core and BLTP transport layer.
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| create | 407.16 ns | 2.4560 Melem/s | 1.5682 Âus | 637.66 Kelem/s |
-| serialize | 1.1187 Âus | 893.93 Kelem/s | 832.23 ns | 1.2016 Melem/s |
-| deserialize | 1.9950 Âus | 501.25 Kelem/s | 2.4731 Âus | 404.36 Kelem/s |
+| create | 407.16 ns | 2.4560 Melem/s | 1.5682 us | 637.66 Kelem/s |
+| serialize | 1.1187 us | 893.93 Kelem/s | 832.23 ns | 1.2016 Melem/s |
+| deserialize | 1.9950 us | 501.25 Kelem/s | 2.4731 us | 404.36 Kelem/s |
 | is_expired | 27.053 ns | 36.964 Melem/s | 22.463 ns | 44.519 Melem/s |
 
 ### Capability Serialization (Simple vs Complex)
@@ -447,7 +447,7 @@ Performance benchmarks for the Blackstream Rust core and BLTP transport layer.
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| 100 nodes | 124.08 Âus | 805.93 Kelem/s | 191.49 Âus | 522.21 Kelem/s |
+| 100 nodes | 124.08 us | 805.93 Kelem/s | 191.49 us | 522.21 Kelem/s |
 | 1,000 nodes | 1.3514 ms | 739.97 Kelem/s | 1.5759 ms | 634.54 Kelem/s |
 | 10,000 nodes | 22.069 ms | 453.12 Kelem/s | 20.038 ms | 499.06 Kelem/s |
 
@@ -455,40 +455,40 @@ Performance benchmarks for the Blackstream Rust core and BLTP transport layer.
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| single_tag | 260.79 Âus | 3.8345 Kelem/s | 190.15 Âus | 5.2591 Kelem/s |
-| require_gpu | 408.14 Âus | 2.4501 Kelem/s | 209.24 Âus | 4.7791 Kelem/s |
-| gpu_vendor | 1.0347 ms | 966.42 elem/s | 556.54 Âus | 1.7968 Kelem/s |
-| min_memory | 997.65 Âus | 1.0024 Kelem/s | 544.70 Âus | 1.8359 Kelem/s |
-| complex | 744.50 Âus | 1.3432 Kelem/s | 358.56 Âus | 2.7889 Kelem/s |
-| model | 109.38 Âus | 9.1425 Kelem/s | 104.98 Âus | 9.5254 Kelem/s |
-| tool | 1.0299 ms | 970.95 elem/s | 537.51 Âus | 1.8604 Kelem/s |
+| single_tag | 260.79 us | 3.8345 Kelem/s | 190.15 us | 5.2591 Kelem/s |
+| require_gpu | 408.14 us | 2.4501 Kelem/s | 209.24 us | 4.7791 Kelem/s |
+| gpu_vendor | 1.0347 ms | 966.42 elem/s | 556.54 us | 1.7968 Kelem/s |
+| min_memory | 997.65 us | 1.0024 Kelem/s | 544.70 us | 1.8359 Kelem/s |
+| complex | 744.50 us | 1.3432 Kelem/s | 358.56 us | 2.7889 Kelem/s |
+| model | 109.38 us | 9.1425 Kelem/s | 104.98 us | 9.5254 Kelem/s |
+| tool | 1.0299 ms | 970.95 elem/s | 537.51 us | 1.8604 Kelem/s |
 | no_results | 23.791 ns | 42.033 Melem/s | 26.752 ns | 37.381 Melem/s |
 
 ### Capability Index (Find Best)
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| Simple | 477.66 Âus | 2.0935 Kelem/s | 376.63 Âus | 2.6551 Kelem/s |
-| With preferences | 870.64 Âus | 1.1486 Kelem/s | 582.87 Âus | 1.7157 Kelem/s |
+| Simple | 477.66 us | 2.0935 Kelem/s | 376.63 us | 2.6551 Kelem/s |
+| With preferences | 870.64 us | 1.1486 Kelem/s | 582.87 us | 1.7157 Kelem/s |
 
 ### Capability Search (1,000 nodes)
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
-| find_with_gpu | 18.423 Âus | 54.279 Kelem/s | 31.728 Âus | 31.518 Kelem/s |
-| find_by_tool (Python) | 33.361 Âus | 29.975 Kelem/s | 62.902 Âus | 15.898 Kelem/s |
-| find_by_tool (Rust) | 42.520 Âus | 23.518 Kelem/s | 74.991 Âus | 13.335 Kelem/s |
+| find_with_gpu | 18.423 us | 54.279 Kelem/s | 31.728 us | 31.518 Kelem/s |
+| find_by_tool (Python) | 33.361 us | 29.975 Kelem/s | 62.902 us | 15.898 Kelem/s |
+| find_by_tool (Rust) | 42.520 us | 23.518 Kelem/s | 74.991 us | 13.335 Kelem/s |
 
 ### Capability Index Scaling
 
 | Nodes | Query Type | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 1,000 | Tag | 13.227 Âus | 75.604 Kelem/s | 10.841 Âus | 92.243 Kelem/s |
-| 1,000 | Complex | 42.524 Âus | 23.516 Kelem/s | 28.963 Âus | 34.527 Kelem/s |
-| 5,000 | Tag | 76.989 Âus | 12.989 Kelem/s | 58.625 Âus | 17.057 Kelem/s |
-| 5,000 | Complex | 287.24 Âus | 3.4814 Kelem/s | 144.55 Âus | 6.9178 Kelem/s |
-| 10,000 | Tag | 248.77 Âus | 4.0198 Kelem/s | 188.14 Âus | 5.3152 Kelem/s |
-| 10,000 | Complex | 676.70 Âus | 1.4778 Kelem/s | 363.66 Âus | 2.7498 Kelem/s |
+| 1,000 | Tag | 13.227 us | 75.604 Kelem/s | 10.841 us | 92.243 Kelem/s |
+| 1,000 | Complex | 42.524 us | 23.516 Kelem/s | 28.963 us | 34.527 Kelem/s |
+| 5,000 | Tag | 76.989 us | 12.989 Kelem/s | 58.625 us | 17.057 Kelem/s |
+| 5,000 | Complex | 287.24 us | 3.4814 Kelem/s | 144.55 us | 6.9178 Kelem/s |
+| 10,000 | Tag | 248.77 us | 4.0198 Kelem/s | 188.14 us | 5.3152 Kelem/s |
+| 10,000 | Complex | 676.70 us | 1.4778 Kelem/s | 363.66 us | 2.7498 Kelem/s |
 | 50,000 | Tag | 3.2346 ms | 309.15 elem/s | 1.8541 ms | 539.34 elem/s |
 | 50,000 | Complex | 4.9312 ms | 202.79 elem/s | 3.1590 ms | 316.56 elem/s |
 
@@ -496,9 +496,9 @@ Performance benchmarks for the Blackstream Rust core and BLTP transport layer.
 
 | Threads | Pool | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|---|
-| 4 | Insert | 437.42 Âus | 4.5723 Melem/s | 694.33 Âus | 2.8805 Melem/s |
+| 4 | Insert | 437.42 us | 4.5723 Melem/s | 694.33 us | 2.8805 Melem/s |
 | 4 | Query | 474.96 ms | 4.2109 Kelem/s | 270.68 ms | 7.3888 Kelem/s |
-| 8 | Insert | 686.91 Âus | 5.8232 Melem/s | 1.4484 ms | 2.7617 Melem/s |
+| 8 | Insert | 686.91 us | 5.8232 Melem/s | 1.4484 ms | 2.7617 Melem/s |
 | 8 | Query | 604.45 ms | 6.6176 Kelem/s | 347.95 ms | 11.496 Kelem/s |
 | 16 | Insert | 1.0935 ms | 7.3163 Melem/s | 1.9625 ms | 4.0765 Melem/s |
 | 16 | Query | 1.1437 s | 6.9951 Kelem/s | 465.83 ms | 17.174 Kelem/s |
