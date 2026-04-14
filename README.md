@@ -70,7 +70,7 @@ This is the gap: a system that operates at hardware timescales, on commodity har
 
 **Zero-copy.** Ring buffers, no garbage collector, native Rust. Forwarding doesn't allocate or copy payload data. This is what makes the per-hop numbers possible and it's a design principle, not just an optimization.
 
-**Encrypted end-to-end.** Noise protocol handshakes for key exchange. ChaCha20-Poly1305 authenticated encryption. Every packet is encrypted between source and destination. Intermediate nodes never see plaintext.
+**Encrypted end-to-end.** Noise protocol handshakes for key exchange. ChaCha20-Poly1305 authenticated encryption with counter-based nonces. Every packet is encrypted between source and destination. Intermediate nodes never see plaintext.
 
 **Untrusted relay.** Nodes forward packets without decrypting payloads. The mesh can route through infrastructure you don't trust. Combined with E2E encryption, this means the network can grow through adversarial nodes.
 
@@ -269,100 +269,101 @@ Any single mechanism can be overwhelmed. All of them together form the wall. An 
 
 ## Benchmarks
 
-All numbers below measure **packet scheduling** - the time to process, route, encrypt, and queue a packet for transmission. They do not include NIC transfer, wire latency, or speed-of-light propagation. The software layer is what these benchmarks prove is no longer the bottleneck.
+All numbers below measure **packet scheduling** — the time to process, route, encrypt, and queue a packet for transmission. They do not include NIC transfer, wire latency, or speed-of-light propagation. The software layer is what these benchmarks prove is no longer the bottleneck.
 
-**Test system:** Apple M1 Max, macOS.
+**Test systems:** Apple M1 Max (macOS) and Intel i9-14900K @5GHz (Windows 11). Full results in [BENCHMARKS.md](net/crates/net/BENCHMARKS.md).
 
 ### Routing
 
-| Operation | Latency | Throughput |
-|-----------|---------|------------|
-| Header serialize | 0.57 ns | **1.74G ops/sec** |
-| Header deserialize | 0.94 ns | **1.07G ops/sec** |
-| Routing lookup (hit) | 14.92 ns | **67.0M ops/sec** |
-| Routing lookup (miss) | 11.96 ns | **83.6M ops/sec** |
-| Decision pipeline (parse + lookup + forward) | 15.34 ns | **65.2M ops/sec** |
+| Operation | M1 Max | i9-14900K |
+|-----------|--------|-----------|
+| Header serialize | 2.05 ns / **487M ops/sec** | 1.25 ns / **803M ops/sec** |
+| Header deserialize | 2.18 ns / **458M ops/sec** | 1.25 ns / **800M ops/sec** |
+| Routing header serialize | 0.58 ns / **1.71G ops/sec** | 0.31 ns / **3.24G ops/sec** |
+| Routing header forward | 0.58 ns / **1.72G ops/sec** | 0.24 ns / **4.21G ops/sec** |
+| Routing lookup (hit) | 20.19 ns / **49.5M ops/sec** | 13.84 ns / **72.3M ops/sec** |
+| Decision pipeline | 17.96 ns / **55.7M ops/sec** | 14.38 ns / **69.6M ops/sec** |
 
 ### Multi-hop Forwarding
 
-| Hops | Latency | Throughput |
-|-----:|---------|------------|
-| 1 | 57.99 ns | **17.2M ops/sec** |
-| 2 | 113.61 ns | **8.80M ops/sec** |
-| 3 | 159.94 ns | **6.25M ops/sec** |
-| 5 | 276.92 ns | **3.61M ops/sec** |
+| Hops | M1 Max | i9-14900K |
+|-----:|--------|-----------|
+| 1 | 59.63 ns / **16.8M ops/sec** | 52.97 ns / **18.9M ops/sec** |
+| 2 | 118.82 ns / **8.42M ops/sec** | 85.62 ns / **11.7M ops/sec** |
+| 3 | 168.94 ns / **5.92M ops/sec** | 118.60 ns / **8.43M ops/sec** |
+| 5 | 290.57 ns / **3.44M ops/sec** | 187.23 ns / **5.34M ops/sec** |
 
-| Threads | Forwarding Throughput |
-|--------:|----------------------:|
-| 4 | 4.67 M/s |
-| 8 | 7.48 M/s |
-| 16 | 9.70 M/s |
+| Threads | M1 Max | i9-14900K |
+|--------:|--------|-----------|
+| 4 | 5.14 M/s | 3.53 M/s |
+| 8 | 6.60 M/s | 9.12 M/s |
+| 16 | 7.87 M/s | 13.6 M/s |
 
 ### Failure Detection & Recovery
 
-| Operation | Latency | Throughput |
-|-----------|---------|------------|
-| Heartbeat (existing node) | 29.22 ns | **34.2M ops/sec** |
-| Status check | 12.22 ns | **81.9M ops/sec** |
-| Circuit breaker check | 13.73 ns | **72.8M ops/sec** |
-| Recovery (evaluate alternates) | 278.80 ns | **3.59M ops/sec** |
-| Full fail + recover cycle | 312.53 ns | **3.20M ops/sec** |
+| Operation | M1 Max | i9-14900K |
+|-----------|--------|-----------|
+| Heartbeat (existing node) | 32.41 ns / **30.9M ops/sec** | 35.79 ns / **27.9M ops/sec** |
+| Status check | 12.87 ns / **77.7M ops/sec** | 13.45 ns / **74.3M ops/sec** |
+| Circuit breaker check | 10.60 ns / **94.3M ops/sec** | 10.60 ns / **94.4M ops/sec** |
+| Recovery (evaluate alternates) | 253.63 ns / **3.94M ops/sec** | 314.80 ns / **3.18M ops/sec** |
+| Full fail + recover cycle | 313.28 ns / **3.19M ops/sec** | 323.40 ns / **3.09M ops/sec** |
 
 ### Swarm / Discovery
 
-| Operation | Latency | Throughput |
-|-----------|---------|------------|
-| Pingwave serialize | 0.80 ns | **1.25G ops/sec** |
-| Pingwave roundtrip | 0.94 ns | **1.06G ops/sec** |
-| New peer discovery | 126.60 ns | **7.90M ops/sec** |
+| Operation | M1 Max | i9-14900K |
+|-----------|--------|-----------|
+| Pingwave serialize | 0.82 ns / **1.22G ops/sec** | 0.53 ns / **1.89G ops/sec** |
+| Pingwave roundtrip | 0.98 ns / **1.02G ops/sec** | 0.68 ns / **1.47G ops/sec** |
+| New peer discovery | 153.17 ns / **6.53M ops/sec** | 196.14 ns / **5.10M ops/sec** |
 
-| Nodes | Graph query | Path within hops |
-|------:|------------:|-----------------:|
-| 100 | 2.30 us | 2.76 us |
-| 500 | 7.35 us | 9.30 us |
-| 1,000 | 120.31 us | 122.69 us |
-| 5,000 | 173.43 us | 192.91 us |
+| Nodes | M1 Max (all_nodes) | i9-14900K (all_nodes) |
+|------:|-------------------:|----------------------:|
+| 100 | 7.43 us | 7.71 us |
+| 500 | 16.12 us | 17.10 us |
+| 1,000 | 27.60 us | 27.88 us |
+| 5,000 | 232.72 us | 229.45 us |
 
-### Encryption
+### Encryption (ChaCha20-Poly1305)
 
-| Payload | ChaCha20-Poly1305 | XChaCha20-Poly1305 |
-|--------:|------------------:|-------------------:|
-| 64B | 709 ns | 1,207 ns |
-| 256B | 1,284 ns | 1,790 ns |
-| 1KB | 3,486 ns | 4,002 ns |
-| 4KB | 12,440 ns | 12,980 ns |
+| Payload | M1 Max | i9-14900K |
+|--------:|--------|-----------|
+| 64B | 742.76 ns / 82.2 MiB/s | 1.14 us / 53.6 MiB/s |
+| 256B | 1.32 us / 185.1 MiB/s | 1.21 us / 201.7 MiB/s |
+| 1KB | 3.65 us / 267.7 MiB/s | 1.60 us / 609.3 MiB/s |
+| 4KB | 12.94 us / 301.8 MiB/s | 3.18 us / 1.20 GiB/s |
 
 ### Capability System
 
-| Operation | Latency | Throughput |
-|-----------|---------|------------|
-| Filter (single tag) | 10.02 ns | **99.8M ops/sec** |
-| Filter (require GPU) | 4.07 ns | **245.5M ops/sec** |
-| GPU check | 0.32 ns | **3.13G ops/sec** |
-| Capability announcement create | 388.80 ns | **2.57M ops/sec** |
+| Operation | M1 Max | i9-14900K |
+|-----------|--------|-----------|
+| Filter (single tag) | 10.65 ns / **93.9M ops/sec** | 3.66 ns / **273M ops/sec** |
+| Filter (require GPU) | 4.39 ns / **228M ops/sec** | 1.94 ns / **516M ops/sec** |
+| GPU check | 0.33 ns / **3.06G ops/sec** | 0.20 ns / **4.92G ops/sec** |
+| Capability announcement | 542.44 ns / **1.84M ops/sec** | 1.57 us / **638K ops/sec** |
 
-| Nodes | Tag query | Complex query |
-|------:|----------:|--------------:|
-| 1,000 | 12.69 us | 41.08 us |
-| 5,000 | 72.20 us | 211.51 us |
-| 10,000 | 170.05 us | 512.64 us |
-| 50,000 | 2.58 ms | 4.57 ms |
+| Nodes | M1 Max (tag query) | i9-14900K (tag query) |
+|------:|-------------------:|----------------------:|
+| 1,000 | 15.10 us | 10.84 us |
+| 5,000 | 76.25 us | 58.63 us |
+| 10,000 | 163.33 us | 188.14 us |
+| 50,000 | 1.82 ms | 1.85 ms |
 
-### Multi-threaded Scaling
+### Multi-threaded Scaling (thread-local pool)
 
-| Threads | Legacy Pool | Fast Pool | Speedup |
-|--------:|------------:|----------:|--------:|
-| 8 | 2.33 M/s | **8.68 M/s** | **3.7x** |
-| 16 | 1.82 M/s | **9.28 M/s** | **5.1x** |
-| 32 | 1.78 M/s | **9.90 M/s** | **5.6x** |
+| Threads | M1 Max | i9-14900K |
+|--------:|--------|-----------|
+| 8 | **5.96 M/s** | **5.16 M/s** |
+| 16 | **7.49 M/s** | **7.56 M/s** |
+| 32 | **8.36 M/s** | **8.61 M/s** |
 
-Pool contention (acquire/release):
+Pool contention (thread-local acquire/release):
 
-| Threads | Legacy Pool | Fast Pool | Speedup |
-|--------:|------------:|----------:|--------:|
-| 8 | 4.34 M/s | **117.1 M/s** | **27x** |
-| 16 | 4.34 M/s | **125.1 M/s** | **29x** |
-| 32 | 4.17 M/s | **135.5 M/s** | **32x** |
+| Threads | M1 Max | i9-14900K |
+|--------:|--------|-----------|
+| 8 | **80.6 M/s** | **82.6 M/s** |
+| 16 | **102.8 M/s** | **121.7 M/s** |
+| 32 | **114.2 M/s** | **142.7 M/s** |
 
 ### SDK Ingestion
 
