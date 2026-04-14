@@ -169,25 +169,25 @@ impl ChannelRegistry {
     /// collision was detected with an existing channel.
     pub fn register(&self, name: &str) -> Result<(ChannelId, bool), ChannelError> {
         let id = ChannelId::parse(name)?;
-
-        // Atomic insert — if name already exists, the entry API returns the
-        // existing value and we detect the duplicate without TOCTOU.
         let name_key = name.to_string();
+
+        // Hold the by_hash entry guard while inserting into by_name.
+        // This ensures both maps are updated atomically from the perspective
+        // of concurrent register/remove calls.
+        let mut hash_entry = self.by_hash.entry(id.hash()).or_default();
+        let collision = !hash_entry.is_empty();
+
         match self.by_name.entry(name_key) {
             dashmap::mapref::entry::Entry::Occupied(_) => {
+                // Drop hash_entry guard before returning — don't leave
+                // a dangling entry if the name already existed.
                 return Err(ChannelError::AlreadyExists(name.to_string()));
             }
             dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                hash_entry.push(id.clone());
                 vacant.insert(id.clone());
             }
         }
-
-        let collision = {
-            let mut entry = self.by_hash.entry(id.hash()).or_default();
-            let has_collision = !entry.is_empty();
-            entry.push(id.clone());
-            has_collision
-        };
 
         Ok((id, collision))
     }
@@ -206,15 +206,20 @@ impl ChannelRegistry {
     }
 
     /// Remove a channel by name.
+    ///
+    /// Holds the `by_hash` entry guard while removing from `by_name` to
+    /// prevent interleaved register/remove from leaving stale entries.
     pub fn remove(&self, name: &str) -> Option<ChannelId> {
-        if let Some((_, id)) = self.by_name.remove(name) {
-            if let Some(mut entry) = self.by_hash.get_mut(&id.hash()) {
-                entry.retain(|c| c.name().as_str() != name);
-            }
-            Some(id)
-        } else {
-            None
+        // Look up the id first to get the hash for locking
+        let id = self.by_name.get(name)?.clone();
+
+        // Hold by_hash guard while removing from both maps
+        if let Some(mut hash_entry) = self.by_hash.get_mut(&id.hash()) {
+            hash_entry.retain(|c| c.name().as_str() != name);
         }
+        self.by_name.remove(name);
+
+        Some(id)
     }
 
     /// Number of registered channels.

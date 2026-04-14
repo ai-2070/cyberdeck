@@ -44,6 +44,7 @@ mod reliability;
 mod route;
 mod router;
 mod session;
+pub mod state;
 pub mod subnet;
 mod swarm;
 mod transport;
@@ -80,6 +81,11 @@ pub use route::{
 };
 pub use router::{BltpRouter, FairScheduler, RouteAction, RouterConfig, RouterError, RouterStats};
 pub use session::{BltpSession, SessionManager, StreamState};
+pub use state::{
+    CausalChainBuilder, CausalEvent, CausalLink, ChainError, EntityLog, HorizonEncoder, LogError,
+    LogIndex, ObservedHorizon, SnapshotStore, StateSnapshot, CAUSAL_LINK_SIZE, SUBPROTOCOL_CAUSAL,
+    SUBPROTOCOL_SNAPSHOT,
+};
 pub use subnet::{DropReason, ForwardDecision, SubnetGateway, SubnetId, SubnetPolicy, SubnetRule};
 pub use swarm::{
     Capabilities, CapabilityAd, EdgeInfo, GraphStats, LocalGraph, NodeInfo, Pingwave, PINGWAVE_SIZE,

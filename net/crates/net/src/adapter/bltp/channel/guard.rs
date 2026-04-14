@@ -126,7 +126,10 @@ impl AuthGuard {
     /// Rebuild the bloom filter from the verified cache.
     ///
     /// Call this after many revocations to clear stale bloom bits.
-    pub fn rebuild_bloom(&self) {
+    /// Requires `&mut self` to prevent concurrent reads during the
+    /// clear-then-reinsert window, which would incorrectly deny
+    /// authorized traffic.
+    pub fn rebuild_bloom(&mut self) {
         // Clear all bits
         for byte in &self.bloom {
             byte.store(0, Ordering::Relaxed);
@@ -222,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_rebuild_bloom_after_revoke() {
-        let guard = AuthGuard::new();
+        let mut guard = AuthGuard::new();
         guard.authorize(0x1234, 0xABCD);
         guard.authorize(0x5678, 0xBEEF);
 
