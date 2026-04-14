@@ -84,7 +84,7 @@ pub struct ScopedToken {
 
 /// A signed, delegatable permission token.
 ///
-/// Wire format (154 bytes):
+/// Wire format (159 bytes):
 /// ```text
 /// issuer:           32 bytes (EntityId)
 /// subject:          32 bytes (EntityId)
@@ -199,6 +199,9 @@ impl PermissionToken {
         new_subject: EntityId,
         restricted_scope: TokenScope,
     ) -> Result<Self, TokenError> {
+        // Validate the parent token first
+        self.is_valid()?;
+
         // Check delegation is allowed
         if self.delegation_depth == 0 {
             return Err(TokenError::DelegationExhausted);
@@ -306,8 +309,21 @@ impl TokenCache {
         }
     }
 
-    /// Insert a token into the cache.
-    pub fn insert(&self, token: PermissionToken) {
+    /// Insert a token into the cache after verifying its signature.
+    ///
+    /// Returns an error if the token's signature is invalid. This prevents
+    /// self-signed or tampered tokens from being cached.
+    pub fn insert(&self, token: PermissionToken) -> Result<(), TokenError> {
+        token.verify()?;
+        let key = (*token.subject.as_bytes(), token.channel_hash);
+        self.tokens.insert(key, token);
+        Ok(())
+    }
+
+    /// Insert a token without verification (for trusted internal use).
+    ///
+    /// Only use this when the token is known to be valid (e.g., just issued locally).
+    pub fn insert_unchecked(&self, token: PermissionToken) {
         let key = (*token.subject.as_bytes(), token.channel_hash);
         self.tokens.insert(key, token);
     }
@@ -315,6 +331,8 @@ impl TokenCache {
     /// Check if an entity is authorized for an action on a channel.
     ///
     /// Returns `Ok(())` if a valid token exists, or an error explaining why not.
+    /// Checks channel-specific token first, then wildcard (channel_hash = 0).
+    /// An expired/invalid channel-specific token does NOT block the wildcard fallback.
     pub fn check(
         &self,
         subject: &EntityId,
@@ -323,15 +341,13 @@ impl TokenCache {
     ) -> Result<(), TokenError> {
         // Try exact channel match first
         if let Some(token) = self.tokens.get(&(*subject.as_bytes(), channel_hash)) {
-            token.is_valid()?;
-            if token.authorizes(action, channel_hash) {
+            if token.is_valid().is_ok() && token.authorizes(action, channel_hash) {
                 return Ok(());
             }
         }
         // Try wildcard (channel_hash = 0)
         if let Some(token) = self.tokens.get(&(*subject.as_bytes(), 0)) {
-            token.is_valid()?;
-            if token.authorizes(action, channel_hash) {
+            if token.is_valid().is_ok() && token.authorizes(action, channel_hash) {
                 return Ok(());
             }
         }

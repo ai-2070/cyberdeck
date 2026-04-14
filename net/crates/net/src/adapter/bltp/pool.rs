@@ -331,6 +331,8 @@ impl Drop for PooledBuilder<'_> {
             if builder.session_id() != self.pool.session_id {
                 builder.set_key(&self.pool.key, self.pool.session_id);
             }
+            // Sync origin_hash in case it changed
+            builder.set_origin_hash(self.pool.origin_hash);
             // Return to pool (ignore if full)
             let _ = self.pool.builders.push(builder);
         }
@@ -453,6 +455,8 @@ impl ThreadLocalPool {
                 if builder.session_id() != self.session_id {
                     builder.set_key(&self.key, self.session_id);
                 }
+                // Sync origin_hash in case it changed
+                builder.set_origin_hash(self.origin_hash);
                 return builder;
             }
 
@@ -472,6 +476,7 @@ impl ThreadLocalPool {
                     if b.session_id() != self.session_id {
                         b.set_key(&self.key, self.session_id);
                     }
+                    b.set_origin_hash(self.origin_hash);
                     b
                 })
                 .unwrap_or_else(|| {
@@ -490,6 +495,8 @@ impl ThreadLocalPool {
         if builder.session_id() != self.session_id {
             builder.set_key(&self.key, self.session_id);
         }
+        // Sync origin_hash
+        builder.set_origin_hash(self.origin_hash);
 
         LOCAL_BUILDERS.with(|pool| {
             let mut pool = pool.borrow_mut();
