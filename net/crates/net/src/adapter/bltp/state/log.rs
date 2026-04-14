@@ -80,7 +80,7 @@ impl EntityLog {
         }
 
         // For genesis on a fresh log, accept without parent validation
-        if current_head.is_genesis() && event.link.is_genesis() {
+        if self.events.is_empty() && current_head.is_genesis() && event.link.is_genesis() {
             // Accept genesis event
         } else if current_head.is_genesis() && event.link.sequence == 1 {
             // First real event after genesis — no parent_hash to validate
@@ -389,5 +389,32 @@ mod tests {
 
         let log = index.get(entity_a.origin_hash()).unwrap();
         assert_eq!(log.len(), 1);
+    }
+
+    // ---- Regression tests for Cubic AI findings ----
+
+    #[test]
+    fn test_regression_duplicate_genesis_rejected() {
+        // Regression: genesis events could be appended repeatedly because
+        // duplicate detection was skipped at seq 0 and genesis acceptance
+        // was not restricted to an empty log.
+        let (_, entity_id) = make_entity();
+        let origin_hash = entity_id.origin_hash();
+        let mut log = EntityLog::new(entity_id);
+        let mut builder = CausalChainBuilder::new(origin_hash);
+
+        let e1 = builder.append(Bytes::from_static(b"first"), 0);
+        log.append(e1).unwrap();
+
+        // Try to append another genesis — must be rejected
+        let genesis = CausalEvent {
+            link: CausalLink::genesis(origin_hash, 0),
+            payload: Bytes::from_static(b"fake genesis"),
+            received_at: 0,
+        };
+        assert!(
+            log.append(genesis).is_err(),
+            "duplicate genesis must be rejected after log has events"
+        );
     }
 }
