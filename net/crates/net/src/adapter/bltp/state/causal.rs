@@ -53,11 +53,12 @@ impl CausalLink {
 
     /// Create the next link in a chain given the previous link and payload.
     #[inline]
-    pub fn next(&self, payload: &[u8], horizon_encoded: u32) -> Self {
-        let next_seq = self
-            .sequence
-            .checked_add(1)
-            .expect("causal sequence overflow");
+    pub fn next(
+        &self,
+        payload: &[u8],
+        horizon_encoded: u32,
+    ) -> Self {
+        let next_seq = self.sequence.checked_add(1).expect("causal sequence overflow");
         Self {
             origin_hash: self.origin_hash,
             horizon_encoded,
@@ -204,13 +205,10 @@ pub fn validate_chain_link(
             got: new_link.origin_hash,
         });
     }
-    let expected_seq = prev_link
-        .sequence
-        .checked_add(1)
-        .ok_or(ChainError::SequenceGap {
-            expected: u64::MAX,
-            got: new_link.sequence,
-        })?;
+    let expected_seq = prev_link.sequence.checked_add(1).ok_or(ChainError::SequenceGap {
+        expected: u64::MAX,
+        got: new_link.sequence,
+    })?;
     if new_link.sequence != expected_seq {
         return Err(ChainError::SequenceGap {
             expected: expected_seq,
@@ -310,21 +308,13 @@ impl std::fmt::Display for ChainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::OriginMismatch { expected, got } => {
-                write!(
-                    f,
-                    "origin mismatch: expected {:#x}, got {:#x}",
-                    expected, got
-                )
+                write!(f, "origin mismatch: expected {:#x}, got {:#x}", expected, got)
             }
             Self::SequenceGap { expected, got } => {
                 write!(f, "sequence gap: expected {}, got {}", expected, got)
             }
             Self::ParentHashMismatch { expected, got } => {
-                write!(
-                    f,
-                    "parent hash mismatch: expected {:#x}, got {:#x}",
-                    expected, got
-                )
+                write!(f, "parent hash mismatch: expected {:#x}, got {:#x}", expected, got)
             }
         }
     }

@@ -130,9 +130,7 @@ pub fn write_manifest_entry(desc: &SubprotocolDescriptor, buf: &mut impl BufMut)
 }
 
 /// Deserialize a manifest entry from bytes.
-pub fn read_manifest_entry(
-    buf: &mut impl Buf,
-) -> Option<(u16, SubprotocolVersion, SubprotocolVersion)> {
+pub fn read_manifest_entry(buf: &mut impl Buf) -> Option<(u16, SubprotocolVersion, SubprotocolVersion)> {
     if buf.remaining() < MANIFEST_ENTRY_SIZE {
         return None;
     }

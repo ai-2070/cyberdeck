@@ -8,8 +8,8 @@ use dashmap::DashMap;
 
 use super::descriptor::{SubprotocolDescriptor, SubprotocolVersion};
 use crate::adapter::bltp::behavior::capability::CapabilityFilter;
-use crate::adapter::bltp::compute::SUBPROTOCOL_MIGRATION;
 use crate::adapter::bltp::state::causal::{SUBPROTOCOL_CAUSAL, SUBPROTOCOL_SNAPSHOT};
+use crate::adapter::bltp::compute::SUBPROTOCOL_MIGRATION;
 
 /// Registry of subprotocols supported by this node.
 ///
@@ -60,7 +60,8 @@ impl SubprotocolRegistry {
     /// If a subprotocol with the same ID is already registered, it is
     /// replaced (version upgrade). Returns the previous descriptor if any.
     pub fn register(&self, descriptor: SubprotocolDescriptor) -> Option<SubprotocolDescriptor> {
-        self.entries.insert(descriptor.id, descriptor)
+        self.entries
+            .insert(descriptor.id, descriptor)
     }
 
     /// Unregister a subprotocol by ID.
@@ -69,16 +70,15 @@ impl SubprotocolRegistry {
     }
 
     /// Look up a subprotocol by ID.
-    pub fn get(
-        &self,
-        id: u16,
-    ) -> Option<dashmap::mapref::one::Ref<'_, u16, SubprotocolDescriptor>> {
+    pub fn get(&self, id: u16) -> Option<dashmap::mapref::one::Ref<'_, u16, SubprotocolDescriptor>> {
         self.entries.get(&id)
     }
 
     /// Check if a handler is present for this subprotocol (not just forwarding).
     pub fn is_handled(&self, id: u16) -> bool {
-        self.entries.get(&id).is_some_and(|d| d.handler_present)
+        self.entries
+            .get(&id)
+            .is_some_and(|d| d.handler_present)
     }
 
     /// Check if a subprotocol ID is registered (handler or forwarding-only).
@@ -154,7 +154,11 @@ mod tests {
     #[test]
     fn test_register_and_lookup() {
         let reg = SubprotocolRegistry::new();
-        let desc = SubprotocolDescriptor::new(0x1000, "vendor-test", SubprotocolVersion::new(1, 0));
+        let desc = SubprotocolDescriptor::new(
+            0x1000,
+            "vendor-test",
+            SubprotocolVersion::new(1, 0),
+        );
 
         assert!(reg.register(desc).is_none()); // first registration
         assert!(reg.is_handled(0x1000));
@@ -236,16 +240,8 @@ mod tests {
     #[test]
     fn test_list() {
         let reg = SubprotocolRegistry::new();
-        reg.register(SubprotocolDescriptor::new(
-            0x1000,
-            "a",
-            SubprotocolVersion::new(1, 0),
-        ));
-        reg.register(SubprotocolDescriptor::new(
-            0x2000,
-            "b",
-            SubprotocolVersion::new(2, 0),
-        ));
+        reg.register(SubprotocolDescriptor::new(0x1000, "a", SubprotocolVersion::new(1, 0)));
+        reg.register(SubprotocolDescriptor::new(0x2000, "b", SubprotocolVersion::new(2, 0)));
 
         let list = reg.list();
         assert_eq!(list.len(), 2);

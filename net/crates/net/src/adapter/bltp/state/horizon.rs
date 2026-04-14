@@ -55,6 +55,11 @@ impl ObservedHorizon {
         self.logical_time
     }
 
+    /// Iterate over all (origin_hash, sequence) pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (&u32, &u64)> {
+        self.entries.iter()
+    }
+
     /// Merge another horizon into this one (take max of each entry).
     pub fn merge(&mut self, other: &ObservedHorizon) {
         for (&origin, &seq) in &other.entries {
@@ -121,12 +126,7 @@ impl HorizonEncoder {
     }
 
     /// Check if two events are potentially concurrent (neither observed the other).
-    pub fn potentially_concurrent(
-        horizon_a: u32,
-        origin_b: u32,
-        horizon_b: u32,
-        origin_a: u32,
-    ) -> bool {
+    pub fn potentially_concurrent(horizon_a: u32, origin_b: u32, horizon_b: u32, origin_a: u32) -> bool {
         !Self::might_contain(horizon_a, origin_b) && !Self::might_contain(horizon_b, origin_a)
     }
 }
@@ -265,18 +265,10 @@ mod tests {
         // Sequence 65536 encoded as 0, sequence 65537 encoded as 1.
         // Log-scale encoding now preserves monotonic ordering.
         let test_values: Vec<u64> = vec![
-            0,
-            1,
-            100,
-            1023,
-            1024, // exact range
-            65535,
-            65536,
-            65537, // old breakpoint
-            1_000_000,
-            1_000_000_000, // mid-range
-            u64::MAX / 2,
-            u64::MAX, // high range
+            0, 1, 100, 1023, 1024,     // exact range
+            65535, 65536, 65537,         // old breakpoint
+            1_000_000, 1_000_000_000,   // mid-range
+            u64::MAX / 2, u64::MAX,     // high range
         ];
 
         for i in 0..test_values.len() - 1 {
@@ -287,10 +279,7 @@ mod tests {
             assert!(
                 enc_a <= enc_b,
                 "encoding must preserve ordering: encode({}) = {} > encode({}) = {}",
-                a,
-                enc_a,
-                b,
-                enc_b
+                a, enc_a, b, enc_b
             );
         }
     }

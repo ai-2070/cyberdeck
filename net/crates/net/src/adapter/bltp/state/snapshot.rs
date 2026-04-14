@@ -152,10 +152,7 @@ impl SnapshotStore {
     }
 
     /// Get the latest snapshot for an entity.
-    pub fn get(
-        &self,
-        entity_id: &EntityId,
-    ) -> Option<dashmap::mapref::one::Ref<'_, [u8; 32], StateSnapshot>> {
+    pub fn get(&self, entity_id: &EntityId) -> Option<dashmap::mapref::one::Ref<'_, [u8; 32], StateSnapshot>> {
         self.snapshots.get(entity_id.as_bytes())
     }
 
