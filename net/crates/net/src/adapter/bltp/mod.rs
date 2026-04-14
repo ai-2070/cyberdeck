@@ -33,6 +33,7 @@
 mod batch;
 pub mod behavior;
 pub mod channel;
+pub mod compute;
 mod config;
 mod crypto;
 mod failure;
@@ -46,6 +47,7 @@ mod router;
 mod session;
 pub mod state;
 pub mod subnet;
+pub mod subprotocol;
 mod swarm;
 mod transport;
 
@@ -56,6 +58,11 @@ pub use batch::AdaptiveBatcher;
 pub use channel::{
     AuthGuard, AuthVerdict, ChannelConfig, ChannelConfigRegistry, ChannelError, ChannelId,
     ChannelName, ChannelRegistry, Visibility,
+};
+pub use compute::{
+    DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, DaemonStats, MeshDaemon,
+    MigrationError, MigrationPhase, MigrationState, PlacementDecision, Scheduler, SchedulerError,
+    SUBPROTOCOL_MIGRATION,
 };
 pub use config::{BltpAdapterConfig, ConnectionRole, ReliabilityConfig};
 pub use crypto::{CryptoError, SessionKeys, StaticKeypair};
@@ -87,6 +94,10 @@ pub use state::{
     SUBPROTOCOL_SNAPSHOT,
 };
 pub use subnet::{DropReason, ForwardDecision, SubnetGateway, SubnetId, SubnetPolicy, SubnetRule};
+pub use subprotocol::{
+    negotiate, NegotiatedSet, SubprotocolDescriptor, SubprotocolManifest, SubprotocolRegistry,
+    SubprotocolVersion, SUBPROTOCOL_NEGOTIATION,
+};
 pub use swarm::{
     Capabilities, CapabilityAd, EdgeInfo, GraphStats, LocalGraph, NodeInfo, Pingwave, PINGWAVE_SIZE,
 };

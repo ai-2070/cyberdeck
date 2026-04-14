@@ -1,0 +1,285 @@
+//! Subprotocol version negotiation.
+//!
+//! Peers exchange `SubprotocolManifest` messages during session setup to
+//! determine which subprotocols they can communicate on. The negotiation
+//! is a pure function — no network I/O.
+
+use std::collections::HashSet;
+
+use bytes::{Buf, BufMut};
+
+use super::descriptor::{
+    read_manifest_entry, write_manifest_entry, SubprotocolDescriptor, SubprotocolVersion,
+    MANIFEST_ENTRY_SIZE,
+};
+use super::registry::SubprotocolRegistry;
+
+/// A manifest of subprotocols supported by a peer.
+///
+/// Exchanged during session setup on `subprotocol_id = 0x0600`.
+#[derive(Debug, Clone)]
+pub struct SubprotocolManifest {
+    /// Entries describing each supported subprotocol.
+    pub entries: Vec<ManifestEntry>,
+}
+
+/// A single entry in a manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestEntry {
+    /// Subprotocol ID.
+    pub id: u16,
+    /// Handler version.
+    pub version: SubprotocolVersion,
+    /// Minimum compatible version.
+    pub min_compatible: SubprotocolVersion,
+}
+
+impl SubprotocolManifest {
+    /// Build a manifest from the local registry.
+    pub fn from_registry(registry: &SubprotocolRegistry) -> Self {
+        let entries = registry
+            .list()
+            .into_iter()
+            .map(|d| ManifestEntry {
+                id: d.id,
+                version: d.version,
+                min_compatible: d.min_compatible,
+            })
+            .collect();
+        Self { entries }
+    }
+
+    /// Serialize to bytes.
+    ///
+    /// Wire format: `[count: u16][entries: count * 6 bytes]`
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let count = u16::try_from(self.entries.len()).expect("too many subprotocols");
+        let mut buf = Vec::with_capacity(2 + self.entries.len() * MANIFEST_ENTRY_SIZE);
+        buf.put_u16_le(count);
+        for entry in &self.entries {
+            let desc = SubprotocolDescriptor {
+                id: entry.id,
+                name: String::new(),
+                version: entry.version,
+                min_compatible: entry.min_compatible,
+                handler_present: true,
+            };
+            write_manifest_entry(&desc, &mut buf);
+        }
+        buf
+    }
+
+    /// Deserialize from bytes.
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < 2 {
+            return None;
+        }
+        let mut cursor = data;
+        let count = cursor.get_u16_le() as usize;
+
+        if cursor.remaining() < count * MANIFEST_ENTRY_SIZE {
+            return None;
+        }
+
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (id, version, min_compatible) = read_manifest_entry(&mut cursor)?;
+            entries.push(ManifestEntry {
+                id,
+                version,
+                min_compatible,
+            });
+        }
+
+        Some(Self { entries })
+    }
+}
+
+/// Result of negotiation between two peers.
+#[derive(Debug, Clone)]
+pub struct NegotiatedSet {
+    /// Subprotocol IDs that both peers support at compatible versions.
+    pub compatible: HashSet<u16>,
+    /// Subprotocol IDs where version mismatch was detected.
+    /// Tuple: (id, local_version, remote_version).
+    pub incompatible: Vec<(u16, SubprotocolVersion, SubprotocolVersion)>,
+}
+
+impl NegotiatedSet {
+    /// Check if a subprotocol is negotiated (compatible on both sides).
+    #[inline]
+    pub fn is_compatible(&self, id: u16) -> bool {
+        self.compatible.contains(&id)
+    }
+
+    /// Number of compatible subprotocols.
+    #[inline]
+    pub fn compatible_count(&self) -> usize {
+        self.compatible.len()
+    }
+}
+
+/// Negotiate subprotocol compatibility between local and remote manifests.
+///
+/// Pure function — no I/O. For each subprotocol present on both sides,
+/// checks that each peer's version satisfies the other's minimum requirement.
+pub fn negotiate(local: &SubprotocolManifest, remote: &SubprotocolManifest) -> NegotiatedSet {
+    let mut compatible = HashSet::new();
+    let mut incompatible = Vec::new();
+
+    // Index remote entries by ID for O(1) lookup
+    let remote_by_id: std::collections::HashMap<u16, &ManifestEntry> =
+        remote.entries.iter().map(|e| (e.id, e)).collect();
+
+    for local_entry in &local.entries {
+        if let Some(remote_entry) = remote_by_id.get(&local_entry.id) {
+            // Both sides have this subprotocol — check version compatibility
+            if local_entry.version.satisfies(remote_entry.min_compatible)
+                && remote_entry.version.satisfies(local_entry.min_compatible)
+            {
+                compatible.insert(local_entry.id);
+            } else {
+                incompatible.push((local_entry.id, local_entry.version, remote_entry.version));
+            }
+        }
+        // If remote doesn't have it, skip — not an error, just not negotiated
+    }
+
+    NegotiatedSet {
+        compatible,
+        incompatible,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: u16, major: u8, minor: u8) -> ManifestEntry {
+        ManifestEntry {
+            id,
+            version: SubprotocolVersion::new(major, minor),
+            min_compatible: SubprotocolVersion::new(major, 0),
+        }
+    }
+
+    fn entry_strict(id: u16, major: u8, minor: u8) -> ManifestEntry {
+        ManifestEntry {
+            id,
+            version: SubprotocolVersion::new(major, minor),
+            min_compatible: SubprotocolVersion::new(major, minor),
+        }
+    }
+
+    #[test]
+    fn test_negotiate_compatible() {
+        let local = SubprotocolManifest {
+            entries: vec![entry(0x0400, 1, 1), entry(0x0500, 1, 0)],
+        };
+        let remote = SubprotocolManifest {
+            entries: vec![entry(0x0400, 1, 0), entry(0x0500, 1, 2)],
+        };
+
+        let result = negotiate(&local, &remote);
+        assert!(result.is_compatible(0x0400));
+        assert!(result.is_compatible(0x0500));
+        assert!(result.incompatible.is_empty());
+    }
+
+    #[test]
+    fn test_negotiate_incompatible() {
+        let local = SubprotocolManifest {
+            entries: vec![entry_strict(0x0400, 2, 0)],
+        };
+        let remote = SubprotocolManifest {
+            entries: vec![entry_strict(0x0400, 1, 0)],
+        };
+
+        let result = negotiate(&local, &remote);
+        assert!(!result.is_compatible(0x0400));
+        assert_eq!(result.incompatible.len(), 1);
+        assert_eq!(result.incompatible[0].0, 0x0400);
+    }
+
+    #[test]
+    fn test_negotiate_disjoint() {
+        let local = SubprotocolManifest {
+            entries: vec![entry(0x0400, 1, 0)],
+        };
+        let remote = SubprotocolManifest {
+            entries: vec![entry(0x0500, 1, 0)],
+        };
+
+        let result = negotiate(&local, &remote);
+        assert!(result.compatible.is_empty());
+        assert!(result.incompatible.is_empty()); // not incompatible, just absent
+    }
+
+    #[test]
+    fn test_negotiate_empty() {
+        let local = SubprotocolManifest { entries: vec![] };
+        let remote = SubprotocolManifest {
+            entries: vec![entry(0x0400, 1, 0)],
+        };
+
+        let result = negotiate(&local, &remote);
+        assert!(result.compatible.is_empty());
+    }
+
+    #[test]
+    fn test_manifest_roundtrip() {
+        let manifest = SubprotocolManifest {
+            entries: vec![
+                entry(0x0400, 1, 1),
+                entry(0x0500, 2, 3),
+                entry(0x1000, 1, 0),
+            ],
+        };
+
+        let bytes = manifest.to_bytes();
+        let parsed = SubprotocolManifest::from_bytes(&bytes).unwrap();
+
+        assert_eq!(parsed.entries.len(), 3);
+        assert_eq!(parsed.entries[0].id, 0x0400);
+        assert_eq!(parsed.entries[0].version, SubprotocolVersion::new(1, 1));
+        assert_eq!(parsed.entries[1].id, 0x0500);
+        assert_eq!(parsed.entries[2].id, 0x1000);
+    }
+
+    #[test]
+    fn test_manifest_from_bytes_too_short() {
+        assert!(SubprotocolManifest::from_bytes(&[]).is_none());
+        assert!(SubprotocolManifest::from_bytes(&[1]).is_none());
+
+        // count=1 but no entry data
+        assert!(SubprotocolManifest::from_bytes(&[1, 0]).is_none());
+    }
+
+    #[test]
+    fn test_from_registry() {
+        let reg = SubprotocolRegistry::with_defaults();
+        let manifest = SubprotocolManifest::from_registry(&reg);
+        assert!(manifest.entries.len() >= 4);
+    }
+
+    #[test]
+    fn test_negotiate_partial_overlap() {
+        let local = SubprotocolManifest {
+            entries: vec![
+                entry(0x0400, 1, 0),
+                entry(0x0500, 1, 0),
+                entry(0x1000, 1, 0),
+            ],
+        };
+        let remote = SubprotocolManifest {
+            entries: vec![entry(0x0400, 1, 0), entry(0x2000, 1, 0)],
+        };
+
+        let result = negotiate(&local, &remote);
+        assert_eq!(result.compatible_count(), 1);
+        assert!(result.is_compatible(0x0400));
+        assert!(!result.is_compatible(0x0500)); // local only
+        assert!(!result.is_compatible(0x1000)); // local only
+        assert!(!result.is_compatible(0x2000)); // remote only
+    }
+}
