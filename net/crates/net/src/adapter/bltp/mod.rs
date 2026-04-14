@@ -35,6 +35,7 @@ pub mod behavior;
 pub mod channel;
 pub mod compute;
 mod config;
+pub mod contested;
 pub mod continuity;
 mod crypto;
 mod failure;
@@ -66,6 +67,11 @@ pub use compute::{
     SUBPROTOCOL_MIGRATION,
 };
 pub use config::{BltpAdapterConfig, ConnectionRole, ReliabilityConfig};
+pub use contested::{
+    CorrelatedFailureConfig, CorrelatedFailureDetector, CorrelationVerdict, FailureCause,
+    PartitionDetector, PartitionPhase, PartitionRecord, ReconcileOutcome, Side,
+    SUBPROTOCOL_PARTITION,
+};
 pub use continuity::{
     assess_continuity, CausalCone, Causality, ContinuityProof, ContinuityStatus, Discontinuity,
     DiscontinuityReason, ForkRecord, HorizonDivergence, ObservationWindow, ProofError,
