@@ -143,16 +143,18 @@ pub fn reconcile_entity(
             let our_len = our_events.len() - idx;
             let their_len = their_events.len() - idx;
 
-            // Longest chain wins. Tie: lower parent_hash wins (deterministic).
+            // Longest chain wins. Tie: lower payload hash wins.
+            // parent_hash is identical at the divergence point (both diverge
+            // from the same parent), so we hash each side's divergent payload
+            // for a perspective-independent tiebreak.
             let winning_side = if our_len > their_len {
                 Side::Ours
             } else if their_len > our_len {
                 Side::Theirs
             } else {
-                // Equal length — deterministic tiebreak on parent_hash
-                let our_hash = our_events[idx].link.parent_hash;
-                let their_hash = their_events[idx].link.parent_hash;
-                if our_hash <= their_hash {
+                let our_payload_hash = xxhash_rust::xxh3::xxh3_64(&our_events[idx].payload);
+                let their_payload_hash = xxhash_rust::xxh3::xxh3_64(&their_events[idx].payload);
+                if our_payload_hash <= their_payload_hash {
                     Side::Ours
                 } else {
                     Side::Theirs
@@ -373,5 +375,67 @@ mod tests {
         events[1].link.parent_hash = 0xBADBADBAD;
 
         assert!(verify_remote_chain(&events).is_err());
+    }
+
+    // ---- Regression tests for Cubic AI findings ----
+
+    #[test]
+    fn test_regression_tiebreak_perspective_independent() {
+        // Regression: tiebreak used parent_hash, which is identical on both
+        // sides of a divergence (both diverge from the same parent). Each
+        // side would declare itself the winner. Now uses payload hash.
+        let (log, their_events, split_seq) = build_divergent_logs(3, 2, 2);
+
+        let result = reconcile_entity(&log, &their_events, split_seq);
+
+        // The result must be a conflict with a winner
+        let winning_side = match &result {
+            ReconcileOutcome::Conflict {
+                resolution: ConflictResolution::Winner { winning_side, .. },
+                ..
+            } => *winning_side,
+            other => panic!("expected Conflict, got {:?}", other),
+        };
+
+        // Now simulate the OTHER side's perspective: they have their_events
+        // in their log, and our post-split events are "theirs"
+        let our_post_split: Vec<CausalEvent> =
+            log.after(split_seq).iter().map(|e| (*e).clone()).collect();
+
+        // Build the other side's log
+        let kp = EntityKeypair::from_bytes([0x42u8; 32]); // deterministic for both sides
+        let origin = log.origin_hash();
+        let mut their_log = EntityLog::new(log.entity_id().clone());
+        let mut builder = CausalChainBuilder::new(origin);
+
+        // Replay shared prefix
+        for i in 0..3 {
+            let event = builder.append(Bytes::from(format!("shared-{}", i)), 0);
+            their_log.append(event).unwrap();
+        }
+
+        // Replay their divergent events
+        let mut their_builder =
+            CausalChainBuilder::from_head(*builder.head(), Bytes::from("shared-2".to_string()));
+        for event in &their_events {
+            their_log.append(event.clone()).unwrap();
+        }
+
+        let other_result = reconcile_entity(&their_log, &our_post_split, split_seq);
+
+        let other_winning_side = match &other_result {
+            ReconcileOutcome::Conflict {
+                resolution: ConflictResolution::Winner { winning_side, .. },
+                ..
+            } => *winning_side,
+            other => panic!("expected Conflict from other side, got {:?}", other),
+        };
+
+        // Both sides must agree on the same winner (from their own perspective)
+        // If we say "Ours wins", they must say "Theirs wins" (= us), and vice versa.
+        assert_ne!(
+            winning_side, other_winning_side,
+            "both sides must agree: if we say Ours, they must say Theirs"
+        );
     }
 }

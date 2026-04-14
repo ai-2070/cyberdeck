@@ -242,7 +242,9 @@ impl CorrelatedFailureDetector {
         }
 
         // Find the most specific subnet with the highest concentration
-        let threshold = (with_subnet as f32 * self.config.subnet_correlation_threshold) as usize;
+        // Ceiling to avoid false subnet correlation from rounding down
+        let threshold =
+            (with_subnet as f32 * self.config.subnet_correlation_threshold).ceil() as usize;
 
         let mut best_subnet = None;
         let mut best_depth = 0u8;
