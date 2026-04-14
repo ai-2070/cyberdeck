@@ -121,13 +121,12 @@ impl ChannelConfig {
             }
         }
         // Check token requirement
-        if self.require_token {
-            if token_cache
+        if self.require_token
+            && token_cache
                 .check(entity_id, TokenScope::PUBLISH, self.channel_id.hash())
                 .is_err()
-            {
-                return false;
-            }
+        {
+            return false;
         }
         true
     }
@@ -144,13 +143,12 @@ impl ChannelConfig {
                 return false;
             }
         }
-        if self.require_token {
-            if token_cache
+        if self.require_token
+            && token_cache
                 .check(entity_id, TokenScope::SUBSCRIBE, self.channel_id.hash())
                 .is_err()
-            {
-                return false;
-            }
+        {
+            return false;
         }
         true
     }
@@ -248,7 +246,7 @@ mod tests {
 
     #[test]
     fn test_open_channel() {
-        let id = ChannelId::from_str("sensors/lidar").unwrap();
+        let id = ChannelId::parse("sensors/lidar").unwrap();
         let config = ChannelConfig::new(id);
         let caps = make_caps(false);
         let entity = EntityKeypair::generate();
@@ -260,7 +258,7 @@ mod tests {
 
     #[test]
     fn test_capability_restricted_channel() {
-        let id = ChannelId::from_str("compute/gpu-tasks").unwrap();
+        let id = ChannelId::parse("compute/gpu-tasks").unwrap();
         let config =
             ChannelConfig::new(id).with_publish_caps(CapabilityFilter::new().require_gpu());
 
@@ -276,7 +274,7 @@ mod tests {
 
     #[test]
     fn test_token_required_channel() {
-        let id = ChannelId::from_str("control/estop").unwrap();
+        let id = ChannelId::parse("control/estop").unwrap();
         let config = ChannelConfig::new(id.clone()).with_require_token(true);
         let caps = make_caps(false);
         let issuer = EntityKeypair::generate();
@@ -303,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_caps_and_token_combined() {
-        let id = ChannelId::from_str("compute/secure").unwrap();
+        let id = ChannelId::parse("compute/secure").unwrap();
         let config = ChannelConfig::new(id.clone())
             .with_publish_caps(CapabilityFilter::new().require_gpu())
             .with_require_token(true);
@@ -336,7 +334,7 @@ mod tests {
     #[test]
     fn test_config_registry() {
         let reg = ChannelConfigRegistry::new();
-        let id = ChannelId::from_str("sensors/lidar").unwrap();
+        let id = ChannelId::parse("sensors/lidar").unwrap();
         let config = ChannelConfig::new(id.clone()).with_priority(5);
 
         reg.insert(config);
@@ -349,7 +347,7 @@ mod tests {
 
     #[test]
     fn test_visibility_default() {
-        let id = ChannelId::from_str("test").unwrap();
+        let id = ChannelId::parse("test").unwrap();
         let config = ChannelConfig::new(id);
         assert_eq!(config.visibility, Visibility::Global);
     }

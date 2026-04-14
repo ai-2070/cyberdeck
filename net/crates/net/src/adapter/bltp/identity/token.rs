@@ -6,7 +6,7 @@
 //! subscription time, not per-packet.
 
 use dashmap::DashMap;
-use ed25519_dalek::{Signature, Signer};
+use ed25519_dalek::Signature;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::entity::{EntityId, EntityKeypair};

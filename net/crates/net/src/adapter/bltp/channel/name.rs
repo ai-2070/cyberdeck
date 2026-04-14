@@ -118,7 +118,7 @@ impl ChannelId {
     }
 
     /// Create from a raw name string.
-    pub fn from_str(name: &str) -> Result<Self, ChannelError> {
+    pub fn parse(name: &str) -> Result<Self, ChannelError> {
         Ok(Self::new(ChannelName::new(name)?))
     }
 
@@ -174,7 +174,7 @@ impl ChannelRegistry {
             return Err(ChannelError::AlreadyExists(name.to_string()));
         }
 
-        let id = ChannelId::from_str(name)?;
+        let id = ChannelId::parse(name)?;
         let collision = {
             let mut entry = self.by_hash.entry(id.hash()).or_default();
             let has_collision = !entry.is_empty();
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn test_channel_id() {
-        let id = ChannelId::from_str("sensors/lidar").unwrap();
+        let id = ChannelId::parse("sensors/lidar").unwrap();
         assert_eq!(id.name().as_str(), "sensors/lidar");
         assert_eq!(id.hash(), channel_hash("sensors/lidar"));
     }
