@@ -44,6 +44,7 @@ mod reliability;
 mod route;
 mod router;
 mod session;
+pub mod subnet;
 mod swarm;
 mod transport;
 
@@ -79,6 +80,7 @@ pub use route::{
 };
 pub use router::{BltpRouter, FairScheduler, RouteAction, RouterConfig, RouterError, RouterStats};
 pub use session::{BltpSession, SessionManager, StreamState};
+pub use subnet::{DropReason, ForwardDecision, SubnetGateway, SubnetId, SubnetPolicy, SubnetRule};
 pub use swarm::{
     Capabilities, CapabilityAd, EdgeInfo, GraphStats, LocalGraph, NodeInfo, Pingwave, PINGWAVE_SIZE,
 };
