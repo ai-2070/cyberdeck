@@ -29,19 +29,19 @@ pub enum MigrationPhase {
 /// State of an in-progress migration.
 pub struct MigrationState {
     /// Origin hash of the daemon being migrated.
-    pub daemon_origin: u32,
+    daemon_origin: u32,
     /// Source node ID.
-    pub source_node: u64,
+    source_node: u64,
     /// Target node ID.
-    pub target_node: u64,
-    /// Current phase.
-    pub phase: MigrationPhase,
+    target_node: u64,
+    /// Current phase (only mutable through transition methods).
+    phase: MigrationPhase,
     /// Snapshot taken from source (set in Snapshot phase).
-    pub snapshot: Option<StateSnapshot>,
+    snapshot: Option<StateSnapshot>,
     /// Events buffered between snapshot and cutover.
-    pub buffered_events: Vec<CausalEvent>,
+    buffered_events: Vec<CausalEvent>,
     /// Timestamp when migration started (nanos).
-    pub started_at: u64,
+    started_at: u64,
 }
 
 impl MigrationState {
@@ -70,6 +70,14 @@ impl MigrationState {
                 expected: MigrationPhase::Snapshot,
                 got: self.phase,
             });
+        }
+        // Validate snapshot belongs to the daemon being migrated
+        if snapshot.entity_id.origin_hash() != self.daemon_origin {
+            return Err(MigrationError::StateFailed(format!(
+                "snapshot origin {:#x} does not match daemon {:#x}",
+                snapshot.entity_id.origin_hash(),
+                self.daemon_origin,
+            )));
         }
         self.snapshot = Some(snapshot);
         self.phase = MigrationPhase::Transfer;
@@ -137,6 +145,36 @@ impl MigrationState {
     /// Elapsed time in milliseconds.
     pub fn elapsed_ms(&self) -> u64 {
         (current_timestamp().saturating_sub(self.started_at)) / 1_000_000
+    }
+
+    /// Get the daemon origin hash.
+    #[inline]
+    pub fn daemon_origin(&self) -> u32 {
+        self.daemon_origin
+    }
+
+    /// Get the source node ID.
+    #[inline]
+    pub fn source_node(&self) -> u64 {
+        self.source_node
+    }
+
+    /// Get the target node ID.
+    #[inline]
+    pub fn target_node(&self) -> u64 {
+        self.target_node
+    }
+
+    /// Get the current phase.
+    #[inline]
+    pub fn phase(&self) -> MigrationPhase {
+        self.phase
+    }
+
+    /// Get the snapshot (if taken).
+    #[inline]
+    pub fn snapshot(&self) -> Option<&StateSnapshot> {
+        self.snapshot.as_ref()
     }
 }
 
@@ -221,36 +259,36 @@ mod tests {
 
     #[test]
     fn test_migration_phase_progression() {
-        let mut state = MigrationState::new(0xAAAA, 0x1111, 0x2222);
-        assert_eq!(state.phase, MigrationPhase::Snapshot);
+        let kp = crate::adapter::bltp::identity::EntityKeypair::generate();
+        let origin = kp.origin_hash();
+        let mut state = MigrationState::new(origin, 0x1111, 0x2222);
+        assert_eq!(state.phase(), MigrationPhase::Snapshot);
 
         // Can't skip phases
         assert!(state.transfer_complete().is_err());
 
         // Normal progression
         let snapshot = StateSnapshot::new(
-            crate::adapter::bltp::identity::EntityKeypair::generate()
-                .entity_id()
-                .clone(),
-            CausalLink::genesis(0xAAAA, 0),
+            kp.entity_id().clone(),
+            CausalLink::genesis(origin, 0),
             Bytes::from_static(b"state"),
             crate::adapter::bltp::state::horizon::ObservedHorizon::new(),
         );
 
         state.set_snapshot(snapshot).unwrap();
-        assert_eq!(state.phase, MigrationPhase::Transfer);
+        assert_eq!(state.phase(), MigrationPhase::Transfer);
 
         state.transfer_complete().unwrap();
-        assert_eq!(state.phase, MigrationPhase::Restore);
+        assert_eq!(state.phase(), MigrationPhase::Restore);
 
         state.restore_complete().unwrap();
-        assert_eq!(state.phase, MigrationPhase::Replay);
+        assert_eq!(state.phase(), MigrationPhase::Replay);
 
         state.replay_complete().unwrap();
-        assert_eq!(state.phase, MigrationPhase::Cutover);
+        assert_eq!(state.phase(), MigrationPhase::Cutover);
 
         state.cutover_complete().unwrap();
-        assert_eq!(state.phase, MigrationPhase::Complete);
+        assert_eq!(state.phase(), MigrationPhase::Complete);
         assert!(state.is_complete());
     }
 
@@ -278,6 +316,31 @@ mod tests {
                 expected: MigrationPhase::Restore,
                 got: MigrationPhase::Snapshot,
             }
+        );
+    }
+
+    // ---- Regression tests for Cubic AI findings ----
+
+    #[test]
+    fn test_regression_set_snapshot_rejects_wrong_origin() {
+        // Regression: set_snapshot accepted snapshots from any entity,
+        // allowing migration to bind state from the wrong daemon.
+        let kp = crate::adapter::bltp::identity::EntityKeypair::generate();
+        let wrong_origin = kp.origin_hash();
+
+        // Migration is for daemon 0xBBBB, but snapshot is for kp's origin
+        let mut state = MigrationState::new(0xBBBB, 0x1111, 0x2222);
+
+        let snapshot = StateSnapshot::new(
+            kp.entity_id().clone(),
+            CausalLink::genesis(wrong_origin, 0),
+            Bytes::from_static(b"state"),
+            crate::adapter::bltp::state::horizon::ObservedHorizon::new(),
+        );
+
+        assert!(
+            state.set_snapshot(snapshot).is_err(),
+            "set_snapshot must reject snapshot from a different daemon"
         );
     }
 }

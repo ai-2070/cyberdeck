@@ -4,8 +4,6 @@
 //! daemon outputs in CausalLinks. The daemon only sees events and
 //! produces payloads — all chain management is the host's job.
 
-use bytes::Bytes;
-
 use super::daemon::{DaemonError, DaemonHostConfig, DaemonStats, MeshDaemon};
 use crate::adapter::bltp::behavior::capability::CapabilityFilter;
 use crate::adapter::bltp::identity::EntityKeypair;
@@ -60,11 +58,21 @@ impl DaemonHost {
         snapshot: &StateSnapshot,
         config: DaemonHostConfig,
     ) -> Result<Self, DaemonError> {
+        // Validate snapshot belongs to this keypair
+        if snapshot.entity_id != *keypair.entity_id() {
+            return Err(DaemonError::RestoreFailed(format!(
+                "snapshot entity {:?} does not match keypair entity {:?}",
+                snapshot.entity_id,
+                keypair.entity_id()
+            )));
+        }
+
         // Restore daemon state
         daemon.restore(snapshot.state.clone())?;
 
-        // Rebuild chain from snapshot head
-        let chain = CausalChainBuilder::from_head(snapshot.chain_link, Bytes::new());
+        // Rebuild chain from snapshot head. Use the snapshot state as the
+        // head payload so the next event's parent_hash is computed correctly.
+        let chain = CausalChainBuilder::from_head(snapshot.chain_link, snapshot.state.clone());
 
         Ok(Self {
             daemon,
@@ -182,6 +190,7 @@ impl std::fmt::Debug for DaemonHost {
 mod tests {
     use super::*;
     use crate::adapter::bltp::state::causal::CausalLink;
+    use bytes::Bytes;
 
     /// A simple stateless echo daemon for testing.
     struct EchoDaemon;
@@ -366,5 +375,36 @@ mod tests {
 
         // Output should carry horizon info about the observed event
         assert_ne!(outputs[0].link.horizon_encoded, 0);
+    }
+
+    // ---- Regression tests for Cubic AI findings ----
+
+    #[test]
+    fn test_regression_from_snapshot_rejects_wrong_keypair() {
+        // Regression: from_snapshot accepted any snapshot regardless of
+        // entity identity, allowing chain/identity divergence.
+        let kp_a = EntityKeypair::generate();
+        let kp_b = EntityKeypair::generate();
+
+        // Create snapshot for entity A
+        let chain = CausalChainBuilder::new(kp_a.origin_hash());
+        let snapshot = StateSnapshot::new(
+            kp_a.entity_id().clone(),
+            *chain.head(),
+            Bytes::from_static(b"state"),
+            ObservedHorizon::new(),
+        );
+
+        // Try to restore on entity B — must fail
+        let result = DaemonHost::from_snapshot(
+            Box::new(EchoDaemon),
+            kp_b,
+            &snapshot,
+            DaemonHostConfig::default(),
+        );
+        assert!(
+            result.is_err(),
+            "from_snapshot must reject snapshot from a different entity"
+        );
     }
 }

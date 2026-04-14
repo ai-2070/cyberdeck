@@ -33,14 +33,16 @@ impl DaemonRegistry {
     /// Returns an error if a daemon with the same origin_hash is already registered.
     pub fn register(&self, host: DaemonHost) -> Result<(), DaemonError> {
         let origin_hash = host.origin_hash();
-        if self.daemons.contains_key(&origin_hash) {
-            return Err(DaemonError::ProcessFailed(format!(
+        match self.daemons.entry(origin_hash) {
+            dashmap::mapref::entry::Entry::Occupied(_) => Err(DaemonError::ProcessFailed(format!(
                 "daemon {:#x} already registered",
                 origin_hash
-            )));
+            ))),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(Mutex::new(host));
+                Ok(())
+            }
         }
-        self.daemons.insert(origin_hash, Mutex::new(host));
-        Ok(())
     }
 
     /// Unregister a daemon, returning the host.

@@ -47,6 +47,7 @@ mod router;
 mod session;
 pub mod state;
 pub mod subnet;
+pub mod subprotocol;
 mod swarm;
 mod transport;
 
@@ -93,6 +94,10 @@ pub use state::{
     SUBPROTOCOL_SNAPSHOT,
 };
 pub use subnet::{DropReason, ForwardDecision, SubnetGateway, SubnetId, SubnetPolicy, SubnetRule};
+pub use subprotocol::{
+    negotiate, NegotiatedSet, SubprotocolDescriptor, SubprotocolManifest, SubprotocolRegistry,
+    SubprotocolVersion, SUBPROTOCOL_NEGOTIATION,
+};
 pub use swarm::{
     Capabilities, CapabilityAd, EdgeInfo, GraphStats, LocalGraph, NodeInfo, Pingwave, PINGWAVE_SIZE,
 };
