@@ -55,6 +55,11 @@ impl ObservedHorizon {
         self.logical_time
     }
 
+    /// Iterate over all (origin_hash, sequence) pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (&u32, &u64)> {
+        self.entries.iter()
+    }
+
     /// Merge another horizon into this one (take max of each entry).
     pub fn merge(&mut self, other: &ObservedHorizon) {
         for (&origin, &seq) in &other.entries {

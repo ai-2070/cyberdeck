@@ -35,6 +35,7 @@ pub mod behavior;
 pub mod channel;
 pub mod compute;
 mod config;
+pub mod continuity;
 mod crypto;
 mod failure;
 pub mod identity;
@@ -65,6 +66,11 @@ pub use compute::{
     SUBPROTOCOL_MIGRATION,
 };
 pub use config::{BltpAdapterConfig, ConnectionRole, ReliabilityConfig};
+pub use continuity::{
+    assess_continuity, CausalCone, Causality, ContinuityProof, ContinuityStatus, Discontinuity,
+    DiscontinuityReason, ForkRecord, HorizonDivergence, ObservationWindow, ProofError,
+    PropagationModel, SuperpositionPhase, SuperpositionState, SUBPROTOCOL_CONTINUITY,
+};
 pub use crypto::{CryptoError, SessionKeys, StaticKeypair};
 pub use failure::{
     CircuitBreaker, CircuitState, FailureDetector, FailureDetectorConfig, FailureStats,
