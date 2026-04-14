@@ -153,7 +153,7 @@ impl BltpSocket {
         let (len, addr) = self.socket.recv_from(&mut self.recv_buf).await?;
         self.recv_buf.truncate(len);
 
-        Ok((self.recv_buf.clone().freeze(), addr))
+        Ok((self.recv_buf.split().freeze(), addr))
     }
 
     /// Receive a packet from the connected address
@@ -162,7 +162,7 @@ impl BltpSocket {
         let len = self.socket.recv(&mut self.recv_buf).await?;
         self.recv_buf.truncate(len);
 
-        Ok(self.recv_buf.clone().freeze())
+        Ok(self.recv_buf.split().freeze())
     }
 
     /// Try to receive a packet without blocking
@@ -171,7 +171,7 @@ impl BltpSocket {
         match self.socket.try_recv_from(&mut self.recv_buf) {
             Ok((len, addr)) => {
                 self.recv_buf.truncate(len);
-                Ok(Some((self.recv_buf.clone().freeze(), addr)))
+                Ok(Some((self.recv_buf.split().freeze(), addr)))
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(e),
@@ -251,7 +251,7 @@ impl PacketReceiver {
         let (len, addr) = self.socket.recv_from(&mut self.recv_buf).await?;
         self.recv_buf.truncate(len);
 
-        Ok((self.recv_buf.clone().freeze(), addr))
+        Ok((self.recv_buf.split().freeze(), addr))
     }
 
     /// Parse the next packet

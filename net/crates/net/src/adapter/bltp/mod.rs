@@ -483,16 +483,12 @@ impl BltpAdapter {
 
         // Queue events for poll_shard
         let queue = inbound.entry(shard_id).or_default();
+        let seq = parsed.header.sequence;
         for (i, event_data) in events.into_iter().enumerate() {
             use std::fmt::Write;
             let mut event_id = String::with_capacity(24);
-            let _ = write!(event_id, "{}:{}", parsed.header.sequence, i);
-            queue.push(StoredEvent::new(
-                event_id,
-                event_data,
-                parsed.header.sequence,
-                shard_id,
-            ));
+            let _ = write!(event_id, "{}:{}", seq, i);
+            queue.push(StoredEvent::new(event_id, event_data, seq, shard_id));
         }
 
         session.touch();
