@@ -18,37 +18,6 @@ Net is the networking layer. It ingests, relays, and replays AI-generated stream
 | **Observational Continuity** | Causal cones, propagation modeling, continuity proofs, honest discontinuity with deterministic forking, superposition during migration |
 | **Contested Environments** | Correlated failure detection, subnet-aware partition classification, partition healing with log reconciliation |
 
-439 tests. Clippy clean. 831 KB deployed binary (release, LTO).
-
-## Performance
-
-Benchmarked on Apple M1 Max, macOS.
-
-| Layer | Operation | Latency | Throughput |
-|-------|-----------|---------|------------|
-| **Core** | Event ingestion | < 1 us p99 | 10M+ events/sec sustained |
-| **BLTP** | Header serialize | 2.05 ns | 487M ops/sec |
-| **BLTP** | Packet build (50 events) | 10.8 us | -- |
-| **BLTP** | Encryption (ChaCha20) | 743 ns (64B) | -- |
-| **Routing** | Header roundtrip | 0.98 ns | 1.02G ops/sec |
-| **Routing** | Lookup hit | 20.2 ns | 49.5M ops/sec |
-| **Routing** | Decision pipeline | 18.0 ns | 55.7M ops/sec |
-| **Forwarding** | Per-hop (64B) | 30.4 ns | -- |
-| **Forwarding** | 5-hop chain | 291 ns | 3.4M ops/sec |
-| **Swarm** | Pingwave roundtrip | 0.98 ns | 1.02G ops/sec |
-| **Swarm** | Graph (5,000 nodes) | 125 us | 39.9M/sec |
-| **Failure** | Heartbeat | 32.4 ns | 30.9M ops/sec |
-| **Failure** | Full recovery cycle | 362 ns | 2.8M ops/sec |
-| **Capability** | Filter (single tag) | 10.5 ns | 95.5M ops/sec |
-| **Capability** | GPU check | 0.33 ns | 3.07G ops/sec |
-| **Auth** | Bloom filter check | < 10 ns | -- |
-| **SDK** | Go raw ingest | 377 ns | 2.65M/sec |
-| **SDK** | Python batch ingest | 0.36 us | 2.78M/sec |
-| **SDK** | Node.js push batch | 0.35 us | 2.89M/sec |
-| **SDK** | Bun batch ingest | 0.30 us | 3.37M/sec |
-
-Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns.
-
 ## Architecture
 
 ```
@@ -129,6 +98,37 @@ Every field is used by at least one layer. Forwarding nodes read one cache line,
 **Observation is local.** Each node's truth is what it can observe. Causal cones answer "what could have influenced this event?" Propagation modeling estimates latency by subnet distance. Continuity proofs (36 bytes) verify chain integrity without the full log.
 
 **Partitions heal honestly.** Correlated failure detection classifies mass failures by subnet correlation. When partitions heal, divergent entity logs are reconciled: longest chain wins, deterministic tiebreak, losing chains fork with documented lineage.
+
+439 tests. 831 KB deployed binary.
+
+## Performance
+
+Benchmarked on Apple M1 Max, macOS.
+
+| Layer | Operation | Latency | Throughput |
+|-------|-----------|---------|------------|
+| **Core** | Event ingestion | < 1 us p99 | 10M+ events/sec sustained |
+| **BLTP** | Header serialize | 2.05 ns | 487M ops/sec |
+| **BLTP** | Packet build (50 events) | 10.8 us | -- |
+| **BLTP** | Encryption (ChaCha20) | 743 ns (64B) | -- |
+| **Routing** | Header roundtrip | 0.98 ns | 1.02G ops/sec |
+| **Routing** | Lookup hit | 20.2 ns | 49.5M ops/sec |
+| **Routing** | Decision pipeline | 18.0 ns | 55.7M ops/sec |
+| **Forwarding** | Per-hop (64B) | 30.4 ns | -- |
+| **Forwarding** | 5-hop chain | 291 ns | 3.4M ops/sec |
+| **Swarm** | Pingwave roundtrip | 0.98 ns | 1.02G ops/sec |
+| **Swarm** | Graph (5,000 nodes) | 125 us | 39.9M/sec |
+| **Failure** | Heartbeat | 32.4 ns | 30.9M ops/sec |
+| **Failure** | Full recovery cycle | 362 ns | 2.8M ops/sec |
+| **Capability** | Filter (single tag) | 10.5 ns | 95.5M ops/sec |
+| **Capability** | GPU check | 0.33 ns | 3.07G ops/sec |
+| **Auth** | Bloom filter check | < 10 ns | -- |
+| **SDK** | Go raw ingest | 377 ns | 2.65M/sec |
+| **SDK** | Python batch ingest | 0.36 us | 2.78M/sec |
+| **SDK** | Node.js push batch | 0.35 us | 2.89M/sec |
+| **SDK** | Bun batch ingest | 0.30 us | 3.37M/sec |
+
+Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns.
 
 ## Adapters
 
