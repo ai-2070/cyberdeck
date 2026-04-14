@@ -32,6 +32,7 @@
 
 mod batch;
 pub mod behavior;
+pub mod channel;
 mod config;
 mod crypto;
 mod failure;
@@ -50,6 +51,10 @@ mod transport;
 mod linux;
 
 pub use batch::AdaptiveBatcher;
+pub use channel::{
+    AuthGuard, AuthVerdict, ChannelConfig, ChannelConfigRegistry, ChannelError, ChannelId,
+    ChannelName, ChannelRegistry, Visibility,
+};
 pub use config::{BltpAdapterConfig, ConnectionRole, ReliabilityConfig};
 pub use crypto::{CryptoError, SessionKeys, StaticKeypair};
 pub use failure::{

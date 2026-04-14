@@ -25,6 +25,8 @@ pub struct PacketBuilder {
     session_id: u64,
     /// Origin hash from entity identity (0 if no identity configured)
     origin_hash: u32,
+    /// Channel hash for the current stream (0 if not bound to a channel)
+    channel_hash: u16,
 }
 
 impl PacketBuilder {
@@ -36,6 +38,7 @@ impl PacketBuilder {
             packet: BytesMut::with_capacity(MAX_PACKET_SIZE),
             session_id,
             origin_hash: 0,
+            channel_hash: 0,
         }
     }
 
@@ -47,6 +50,7 @@ impl PacketBuilder {
             packet: BytesMut::with_capacity(MAX_PACKET_SIZE),
             session_id,
             origin_hash,
+            channel_hash: 0,
         }
     }
 
@@ -59,6 +63,11 @@ impl PacketBuilder {
     /// Set the origin hash
     pub fn set_origin_hash(&mut self, origin_hash: u32) {
         self.origin_hash = origin_hash;
+    }
+
+    /// Set the channel hash for outgoing packets
+    pub fn set_channel_hash(&mut self, channel_hash: u16) {
+        self.channel_hash = channel_hash;
     }
 
     /// Build a packet from events using counter-based encryption.
@@ -96,7 +105,8 @@ impl PacketBuilder {
             events.len() as u16,
             flags,
         )
-        .with_origin(self.origin_hash);
+        .with_origin(self.origin_hash)
+        .with_channel_hash(self.channel_hash);
         let aad = header.aad();
         let mut header_bytes = header.to_bytes();
 
