@@ -25,11 +25,9 @@ impl ChannelName {
         Ok(Self(name.to_string()))
     }
 
-    /// Create without validation (for trusted internal use).
-    ///
-    /// # Safety
-    /// Caller must ensure the name is valid.
-    pub fn new_unchecked(name: String) -> Self {
+    /// Create without validation (for testing).
+    #[cfg(test)]
+    pub(crate) fn new_unchecked(name: String) -> Self {
         Self(name)
     }
 
@@ -71,7 +69,9 @@ impl ChannelName {
             ));
         }
         if name.contains("//") {
-            return Err(ChannelError::InvalidFormat("must not contain '//'".into()));
+            return Err(ChannelError::InvalidFormat(
+                "must not contain '//'".into(),
+            ));
         }
         for ch in name.chars() {
             if !matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '/') {
@@ -170,11 +170,20 @@ impl ChannelRegistry {
     /// Register a channel. Returns the ChannelId and whether a hash
     /// collision was detected with an existing channel.
     pub fn register(&self, name: &str) -> Result<(ChannelId, bool), ChannelError> {
-        if self.by_name.contains_key(name) {
-            return Err(ChannelError::AlreadyExists(name.to_string()));
+        let id = ChannelId::parse(name)?;
+
+        // Atomic insert — if name already exists, the entry API returns the
+        // existing value and we detect the duplicate without TOCTOU.
+        let name_key = name.to_string();
+        match self.by_name.entry(name_key) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return Err(ChannelError::AlreadyExists(name.to_string()));
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(id.clone());
+            }
         }
 
-        let id = ChannelId::parse(name)?;
         let collision = {
             let mut entry = self.by_hash.entry(id.hash()).or_default();
             let has_collision = !entry.is_empty();
@@ -182,7 +191,6 @@ impl ChannelRegistry {
             has_collision
         };
 
-        self.by_name.insert(name.to_string(), id.clone());
         Ok((id, collision))
     }
 
@@ -294,23 +302,14 @@ mod tests {
             ChannelName::new("double//slash"),
             Err(ChannelError::InvalidFormat(_))
         ));
-        assert_eq!(
-            ChannelName::new("has space"),
-            Err(ChannelError::InvalidChar(' '))
-        );
-        assert_eq!(
-            ChannelName::new("has@symbol"),
-            Err(ChannelError::InvalidChar('@'))
-        );
+        assert_eq!(ChannelName::new("has space"), Err(ChannelError::InvalidChar(' ')));
+        assert_eq!(ChannelName::new("has@symbol"), Err(ChannelError::InvalidChar('@')));
     }
 
     #[test]
     fn test_name_too_long() {
         let long_name = "a".repeat(256);
-        assert!(matches!(
-            ChannelName::new(&long_name),
-            Err(ChannelError::TooLong(256))
-        ));
+        assert!(matches!(ChannelName::new(&long_name), Err(ChannelError::TooLong(256))));
 
         let max_name = "a".repeat(255);
         assert!(ChannelName::new(&max_name).is_ok());

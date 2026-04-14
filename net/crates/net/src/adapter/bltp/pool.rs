@@ -235,9 +235,10 @@ impl PacketPool {
     /// Get a builder from the pool
     #[inline]
     pub fn get(&self) -> PooledBuilder<'_> {
-        let builder = self.builders.pop().unwrap_or_else(|| {
-            PacketBuilder::with_origin(&self.key, self.session_id, self.origin_hash)
-        });
+        let builder = self
+            .builders
+            .pop()
+            .unwrap_or_else(|| PacketBuilder::with_origin(&self.key, self.session_id, self.origin_hash));
 
         PooledBuilder {
             pool: self,
@@ -406,13 +407,7 @@ impl ThreadLocalPool {
 
     /// Create a new thread-local pool with origin identity
     pub fn with_origin(size: usize, key: &[u8; 32], session_id: u64, origin_hash: u32) -> Self {
-        Self::with_local_capacity(
-            size,
-            key,
-            session_id,
-            origin_hash,
-            Self::DEFAULT_LOCAL_CAPACITY,
-        )
+        Self::with_local_capacity(size, key, session_id, origin_hash, Self::DEFAULT_LOCAL_CAPACITY)
     }
 
     /// Create a new thread-local pool with custom local capacity
@@ -479,9 +474,7 @@ impl ThreadLocalPool {
                     b.set_origin_hash(self.origin_hash);
                     b
                 })
-                .unwrap_or_else(|| {
-                    PacketBuilder::with_origin(&self.key, self.session_id, self.origin_hash)
-                })
+                .unwrap_or_else(|| PacketBuilder::with_origin(&self.key, self.session_id, self.origin_hash))
         })
     }
 
@@ -617,7 +610,11 @@ impl std::fmt::Debug for ThreadLocalPooledBuilder<'_> {
 pub type SharedLocalPool = Arc<ThreadLocalPool>;
 
 /// Create a shared thread-local pool
-pub fn shared_local_pool(size: usize, key: &[u8; 32], session_id: u64) -> SharedLocalPool {
+pub fn shared_local_pool(
+    size: usize,
+    key: &[u8; 32],
+    session_id: u64,
+) -> SharedLocalPool {
     Arc::new(ThreadLocalPool::new(size, key, session_id))
 }
 

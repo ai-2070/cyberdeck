@@ -176,10 +176,7 @@ impl ChannelConfigRegistry {
     }
 
     /// Look up a channel config by hash.
-    pub fn get(
-        &self,
-        channel_hash: u16,
-    ) -> Option<dashmap::mapref::one::Ref<'_, u16, ChannelConfig>> {
+    pub fn get(&self, channel_hash: u16) -> Option<dashmap::mapref::one::Ref<'_, u16, ChannelConfig>> {
         self.configs.get(&channel_hash)
     }
 
@@ -238,7 +235,9 @@ mod tests {
                 tensor_cores: 0,
                 fp16_tflops_x10: 0,
             };
-            CapabilitySet::new().with_hardware(HardwareCapabilities::new().with_gpu(gpu_info))
+            CapabilitySet::new().with_hardware(
+                HardwareCapabilities::new().with_gpu(gpu_info),
+            )
         } else {
             CapabilitySet::new()
         }
@@ -259,8 +258,8 @@ mod tests {
     #[test]
     fn test_capability_restricted_channel() {
         let id = ChannelId::parse("compute/gpu-tasks").unwrap();
-        let config =
-            ChannelConfig::new(id).with_publish_caps(CapabilityFilter::new().require_gpu());
+        let config = ChannelConfig::new(id)
+            .with_publish_caps(CapabilityFilter::new().require_gpu());
 
         let entity = EntityKeypair::generate();
         let cache = TokenCache::new();

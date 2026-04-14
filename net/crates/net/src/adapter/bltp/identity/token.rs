@@ -484,8 +484,8 @@ mod tests {
         );
 
         assert!(token.verify().is_ok()); // signature is valid
-                                         // Token may or may not be expired depending on timing,
-                                         // but with duration 0 and not_after = now, it's borderline
+        // Token may or may not be expired depending on timing,
+        // but with duration 0 and not_after = now, it's borderline
     }
 
     #[test]
@@ -691,5 +691,105 @@ mod tests {
         assert!(cache
             .check(subject.entity_id(), TokenScope::PUBLISH, 0x1234)
             .is_ok());
+    }
+
+    // ---- Regression tests for Cubic AI findings ----
+
+    #[test]
+    fn test_regression_wildcard_fallback_not_blocked_by_expired_channel_token() {
+        // Regression: token.is_valid()? short-circuited on an expired
+        // channel-specific token, preventing the wildcard fallback from
+        // being reached.
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let cache = TokenCache::new();
+
+        // Insert an expired channel-specific token
+        let mut expired_token = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0xABCD,
+            0, // expires immediately
+            0,
+        );
+        // Force expiry by setting not_after to the past
+        expired_token.not_after = 0;
+        // Re-sign with the modified field
+        let payload = expired_token.signed_payload();
+        expired_token.signature = issuer.sign(&payload).to_bytes();
+        cache.insert_unchecked(expired_token);
+
+        // Insert a valid wildcard token
+        let wildcard_token = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0, // wildcard
+            3600,
+            0,
+        );
+        cache.insert_unchecked(wildcard_token);
+
+        // The wildcard should be reached despite the expired channel token
+        assert!(
+            cache.check(subject.entity_id(), TokenScope::PUBLISH, 0xABCD).is_ok(),
+            "wildcard fallback must not be blocked by expired channel-specific token"
+        );
+    }
+
+    #[test]
+    fn test_regression_delegate_rejects_expired_parent() {
+        // Regression: delegate() minted child tokens from an invalid parent
+        // because it never called is_valid() on the parent.
+        let root = EntityKeypair::generate();
+        let node_a = EntityKeypair::generate();
+        let node_b = EntityKeypair::generate();
+
+        let mut token = PermissionToken::issue(
+            &root,
+            node_a.entity_id().clone(),
+            TokenScope::ALL,
+            0,
+            3600,
+            2,
+        );
+        // Force expiry
+        token.not_after = 0;
+        let payload = token.signed_payload();
+        token.signature = root.sign(&payload).to_bytes();
+
+        let result = token.delegate(&node_a, node_b.entity_id().clone(), TokenScope::PUBLISH);
+        assert_eq!(
+            result.unwrap_err(),
+            TokenError::Expired,
+            "delegation from expired parent must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_regression_insert_rejects_tampered_token() {
+        // Regression: insert() accepted self-signed/tampered tokens
+        // because it did not verify the signature.
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+
+        let mut token = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0,
+            3600,
+            0,
+        );
+        // Tamper: change scope after signing
+        token.scope = TokenScope::ADMIN;
+
+        let cache = TokenCache::new();
+        assert!(
+            cache.insert(token).is_err(),
+            "insert must reject tampered token"
+        );
+        assert_eq!(cache.len(), 0, "tampered token must not be cached");
     }
 }

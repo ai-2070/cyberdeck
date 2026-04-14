@@ -52,21 +52,18 @@ mod transport;
 mod linux;
 
 pub use batch::AdaptiveBatcher;
-pub use channel::{
-    AuthGuard, AuthVerdict, ChannelConfig, ChannelConfigRegistry, ChannelError, ChannelId,
-    ChannelName, ChannelRegistry, Visibility,
-};
+pub use channel::{AuthGuard, AuthVerdict, ChannelConfig, ChannelConfigRegistry, ChannelError, ChannelId, ChannelName, ChannelRegistry, Visibility};
 pub use config::{BltpAdapterConfig, ConnectionRole, ReliabilityConfig};
+pub use subnet::{DropReason, ForwardDecision, SubnetGateway, SubnetId, SubnetPolicy, SubnetRule};
 pub use crypto::{CryptoError, SessionKeys, StaticKeypair};
+pub use identity::{EntityError, EntityId, EntityKeypair, OriginStamp, PermissionToken, TokenCache, TokenError, TokenScope};
 pub use failure::{
     CircuitBreaker, CircuitState, FailureDetector, FailureDetectorConfig, FailureStats,
     LossSimulator, NodeStatus, RecoveryAction, RecoveryManager, RecoveryStats,
 };
-pub use identity::{
-    EntityError, EntityId, EntityKeypair, OriginStamp, PermissionToken, TokenCache, TokenError,
-    TokenScope,
+pub use pool::{
+    PacketBuilder, PacketPool, SharedPacketPool, SharedLocalPool, ThreadLocalPool,
 };
-pub use pool::{PacketBuilder, PacketPool, SharedLocalPool, SharedPacketPool, ThreadLocalPool};
 pub use protocol::{
     BltpHeader, EventFrame, NackPayload, PacketFlags, HEADER_SIZE, NONCE_SIZE, TAG_SIZE,
 };
@@ -80,7 +77,6 @@ pub use route::{
 };
 pub use router::{BltpRouter, FairScheduler, RouteAction, RouterConfig, RouterError, RouterStats};
 pub use session::{BltpSession, SessionManager, StreamState};
-pub use subnet::{DropReason, ForwardDecision, SubnetGateway, SubnetId, SubnetPolicy, SubnetRule};
 pub use swarm::{
     Capabilities, CapabilityAd, EdgeInfo, GraphStats, LocalGraph, NodeInfo, Pingwave, PINGWAVE_SIZE,
 };
@@ -461,7 +457,8 @@ impl BltpAdapter {
 
         // Decrypt payload
         let aad = parsed.header.aad();
-        let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
+        let counter =
+            u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
         let rx_cipher = session.rx_cipher();
         if !rx_cipher.is_valid_rx_counter(counter) {
             return;
@@ -500,7 +497,12 @@ impl BltpAdapter {
             use std::fmt::Write;
             let mut event_id = String::with_capacity(24);
             let _ = write!(event_id, "{}:{}", seq, i);
-            queue.push(StoredEvent::new(event_id, event_data, seq, shard_id));
+            queue.push(StoredEvent::new(
+                event_id,
+                event_data,
+                seq,
+                shard_id,
+            ));
         }
 
         session.touch();
@@ -705,7 +707,9 @@ impl Adapter for BltpAdapter {
             let frame_size = EventFrame::LEN_SIZE + event_bytes.len();
 
             // Check if adding this event would exceed packet size
-            if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE && !current_batch.is_empty() {
+            if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE
+                && !current_batch.is_empty()
+            {
                 // Send current batch
                 let seq = stream.next_tx_seq();
                 let flags = if reliable {

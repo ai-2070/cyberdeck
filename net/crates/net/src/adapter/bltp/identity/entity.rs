@@ -104,8 +104,10 @@ impl EntityKeypair {
         let mut rng_bytes = [0u8; 32];
         getrandom::fill(&mut rng_bytes).expect("getrandom failed");
         let signing_key = SigningKey::from_bytes(&rng_bytes);
-        // Zeroize secret material from stack
-        rng_bytes.fill(0);
+        // Zeroize secret material — volatile write prevents optimizer elision
+        for byte in rng_bytes.iter_mut() {
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
         Self::from_signing_key(signing_key)
     }
 

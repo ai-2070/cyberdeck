@@ -5,6 +5,8 @@
 //! time (slow path). The per-packet fast path probes the bloom filter with
 //! no crypto, no heap allocation, and no pointer chasing.
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use dashmap::DashMap;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -33,8 +35,9 @@ pub enum AuthVerdict {
 ///
 /// Total: <10ns for the Allowed/Denied paths.
 pub struct AuthGuard {
-    /// Bloom filter bits. Size is `1 << BLOOM_BITS` bits = `1 << (BLOOM_BITS - 3)` bytes.
-    bloom: Vec<u8>,
+    /// Bloom filter bits using atomics for safe concurrent access.
+    /// Size is `1 << (BLOOM_BITS - 3)` bytes. Fits in L1 cache.
+    bloom: Vec<AtomicU8>,
     /// Number of bits in the bloom filter (power of 2).
     bloom_mask: u64,
     /// Verified-positive cache: (origin_hash, channel_hash) -> authorized.
@@ -48,8 +51,9 @@ impl AuthGuard {
     /// Create a new authorization guard.
     pub fn new() -> Self {
         let num_bytes = 1usize << (BLOOM_BITS - 3);
+        let bloom = (0..num_bytes).map(|_| AtomicU8::new(0)).collect();
         Self {
-            bloom: vec![0u8; num_bytes],
+            bloom,
             bloom_mask: (1u64 << BLOOM_BITS) - 1,
             verified: DashMap::new(),
         }
@@ -66,8 +70,8 @@ impl AuthGuard {
         let h1 = (key & self.bloom_mask) as usize;
         let h2 = ((key >> BLOOM_BITS) & self.bloom_mask) as usize;
 
-        let bit1 = (self.bloom[h1 >> 3] >> (h1 & 7)) & 1;
-        let bit2 = (self.bloom[h2 >> 3] >> (h2 & 7)) & 1;
+        let bit1 = (self.bloom[h1 >> 3].load(Ordering::Relaxed) >> (h1 & 7)) & 1;
+        let bit2 = (self.bloom[h2 >> 3].load(Ordering::Relaxed) >> (h2 & 7)) & 1;
 
         if bit1 == 0 || bit2 == 0 {
             return AuthVerdict::Denied;
@@ -122,9 +126,11 @@ impl AuthGuard {
     /// Rebuild the bloom filter from the verified cache.
     ///
     /// Call this after many revocations to clear stale bloom bits.
-    pub fn rebuild_bloom(&mut self) {
+    pub fn rebuild_bloom(&self) {
         // Clear all bits
-        self.bloom.fill(0);
+        for byte in &self.bloom {
+            byte.store(0, Ordering::Relaxed);
+        }
 
         // Re-insert all verified pairs
         for entry in self.verified.iter() {
@@ -132,27 +138,17 @@ impl AuthGuard {
             let key = bloom_key(origin_hash, channel_hash);
             let h1 = (key & self.bloom_mask) as usize;
             let h2 = ((key >> BLOOM_BITS) & self.bloom_mask) as usize;
-            self.bloom[h1 >> 3] |= 1 << (h1 & 7);
-            self.bloom[h2 >> 3] |= 1 << (h2 & 7);
+            self.bloom[h1 >> 3].fetch_or(1 << (h1 & 7), Ordering::Relaxed);
+            self.bloom[h2 >> 3].fetch_or(1 << (h2 & 7), Ordering::Relaxed);
         }
     }
 
-    /// Set a bit in the bloom filter.
-    ///
-    /// Note: This is not thread-safe for concurrent writes, but authorization
-    /// (slow path) is not expected to be highly concurrent. The bloom filter
-    /// is append-only (bits are only set, never cleared), so the worst case
-    /// of a race is a missed set which will be caught by the verified cache.
+    /// Set a bit in the bloom filter using atomic fetch_or.
     #[inline]
     fn bloom_set(&self, bit_index: usize) {
         let byte_index = bit_index >> 3;
         let bit_offset = bit_index & 7;
-        // This is a benign data race: setting a bit that might already be set.
-        // We use a raw pointer to avoid needing &mut self.
-        unsafe {
-            let ptr = self.bloom.as_ptr().add(byte_index) as *mut u8;
-            *ptr |= 1 << bit_offset;
-        }
+        self.bloom[byte_index].fetch_or(1 << bit_offset, Ordering::Relaxed);
     }
 }
 
@@ -187,7 +183,10 @@ mod tests {
     #[test]
     fn test_empty_guard_denies() {
         let guard = AuthGuard::new();
-        assert_eq!(guard.check_fast(0x1234, 0xABCD), AuthVerdict::Denied);
+        assert_eq!(
+            guard.check_fast(0x1234, 0xABCD),
+            AuthVerdict::Denied
+        );
     }
 
     #[test]
@@ -195,7 +194,10 @@ mod tests {
         let guard = AuthGuard::new();
         guard.authorize(0x1234, 0xABCD);
 
-        assert_eq!(guard.check_fast(0x1234, 0xABCD), AuthVerdict::Allowed);
+        assert_eq!(
+            guard.check_fast(0x1234, 0xABCD),
+            AuthVerdict::Allowed
+        );
     }
 
     #[test]
@@ -204,9 +206,15 @@ mod tests {
         guard.authorize(0x1234, 0xABCD);
 
         // Different origin
-        assert_ne!(guard.check_fast(0x5678, 0xABCD), AuthVerdict::Allowed);
+        assert_ne!(
+            guard.check_fast(0x5678, 0xABCD),
+            AuthVerdict::Allowed
+        );
         // Different channel
-        assert_ne!(guard.check_fast(0x1234, 0x1111), AuthVerdict::Allowed);
+        assert_ne!(
+            guard.check_fast(0x1234, 0x1111),
+            AuthVerdict::Allowed
+        );
     }
 
     #[test]
@@ -226,7 +234,7 @@ mod tests {
 
     #[test]
     fn test_rebuild_bloom_after_revoke() {
-        let mut guard = AuthGuard::new();
+        let guard = AuthGuard::new();
         guard.authorize(0x1234, 0xABCD);
         guard.authorize(0x5678, 0xBEEF);
 
@@ -291,6 +299,60 @@ mod tests {
         }
 
         let fp_rate = false_positives as f64 / 10000.0;
-        assert!(fp_rate < 0.01, "false positive rate {} exceeds 1%", fp_rate);
+        assert!(
+            fp_rate < 0.01,
+            "false positive rate {} exceeds 1%",
+            fp_rate
+        );
+    }
+
+    // ---- Regression tests for Cubic AI findings ----
+
+    #[test]
+    fn test_regression_concurrent_authorize_and_check() {
+        // Regression: bloom filter used unsafe raw pointer mutation through
+        // &self, causing UB under concurrent access. Now uses AtomicU8.
+        use std::sync::Arc;
+        use std::thread;
+
+        let guard = Arc::new(AuthGuard::new());
+
+        // Spawn writers
+        let mut handles = Vec::new();
+        for t in 0..4u32 {
+            let g = Arc::clone(&guard);
+            handles.push(thread::spawn(move || {
+                for i in 0..250u32 {
+                    g.authorize(t * 1000 + i, (t * 1000 + i) as u16);
+                }
+            }));
+        }
+
+        // Spawn concurrent readers
+        for _ in 0..4 {
+            let g = Arc::clone(&guard);
+            handles.push(thread::spawn(move || {
+                for i in 0..1000u32 {
+                    let _ = g.check_fast(i, i as u16);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // All authorized pairs should be findable
+        assert_eq!(guard.authorized_count(), 1000);
+        for t in 0..4u32 {
+            for i in 0..250u32 {
+                assert!(
+                    guard.is_authorized(t * 1000 + i, (t * 1000 + i) as u16),
+                    "pair ({}, {}) should be authorized after concurrent insertion",
+                    t * 1000 + i,
+                    t * 1000 + i
+                );
+            }
+        }
     }
 }

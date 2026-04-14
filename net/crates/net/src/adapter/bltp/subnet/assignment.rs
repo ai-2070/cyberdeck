@@ -138,7 +138,11 @@ mod tests {
                     .map("us-west", 1)
                     .map("eu-central", 2),
             )
-            .add_rule(SubnetRule::new("fleet:", 1).map("alpha", 1).map("beta", 2));
+            .add_rule(
+                SubnetRule::new("fleet:", 1)
+                    .map("alpha", 1)
+                    .map("beta", 2),
+            );
 
         let caps = caps_with_tags(&["region:us-west", "fleet:beta"]);
         assert_eq!(policy.assign(&caps), SubnetId::new(&[1, 2]));
@@ -146,7 +150,9 @@ mod tests {
 
     #[test]
     fn test_unmatched_tag() {
-        let policy = SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0).map("us-west", 1));
+        let policy = SubnetPolicy::new().add_rule(
+            SubnetRule::new("region:", 0).map("us-west", 1),
+        );
 
         // Tag value not in the map
         let caps = caps_with_tags(&["region:unknown"]);
@@ -176,7 +182,12 @@ mod tests {
             .add_rule(SubnetRule::new("vehicle:", 2).map("v42", 3))
             .add_rule(SubnetRule::new("subsystem:", 3).map("lidar", 4));
 
-        let caps = caps_with_tags(&["region:us", "fleet:f1", "vehicle:v42", "subsystem:lidar"]);
+        let caps = caps_with_tags(&[
+            "region:us",
+            "fleet:f1",
+            "vehicle:v42",
+            "subsystem:lidar",
+        ]);
         assert_eq!(policy.assign(&caps), SubnetId::new(&[1, 2, 3, 4]));
     }
 }
