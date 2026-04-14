@@ -28,9 +28,18 @@ impl SubnetId {
     /// Create a subnet ID from hierarchy levels (up to 4).
     ///
     /// Levels are packed MSB-first: `&[3, 7]` becomes `0x03_07_00_00`.
+    ///
+    /// # Panics
+    /// Panics if more than 4 levels are provided.
     pub fn new(levels: &[u8]) -> Self {
+        assert!(
+            levels.len() <= MAX_DEPTH as usize,
+            "SubnetId supports at most {} levels, got {}",
+            MAX_DEPTH,
+            levels.len()
+        );
         let mut val = 0u32;
-        for (i, &level) in levels.iter().take(MAX_DEPTH as usize).enumerate() {
+        for (i, &level) in levels.iter().enumerate() {
             val |= (level as u32) << (24 - i * 8);
         }
         Self(val)
@@ -243,7 +252,7 @@ mod tests {
         assert!(fleet_a.is_sibling(fleet_b));
         assert!(!fleet_a.is_sibling(fleet_c)); // different region
         assert!(!fleet_a.is_sibling(fleet_a)); // self is not sibling
-        assert!(!fleet_a.is_sibling(region));  // different depth
+        assert!(!fleet_a.is_sibling(region)); // different depth
     }
 
     #[test]

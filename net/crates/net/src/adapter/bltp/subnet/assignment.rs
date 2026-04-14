@@ -42,7 +42,15 @@ impl SubnetPolicy {
     }
 
     /// Add a rule to the policy.
+    ///
+    /// # Panics
+    /// Panics if the rule's level is >= 4.
     pub fn add_rule(mut self, rule: SubnetRule) -> Self {
+        assert!(
+            rule.level < 4,
+            "subnet rule level must be 0-3, got {}",
+            rule.level
+        );
         self.rules.push(rule);
         self
     }
@@ -55,9 +63,6 @@ impl SubnetPolicy {
         let mut levels = [0u8; 4];
 
         for rule in &self.rules {
-            if rule.level >= 4 {
-                continue;
-            }
             for tag in &caps.tags {
                 if let Some(value) = tag.strip_prefix(&rule.tag_prefix) {
                     if let Some(&level_value) = rule.values.get(value) {
@@ -89,7 +94,14 @@ impl SubnetRule {
     }
 
     /// Map a tag value to a level value.
+    ///
+    /// # Panics
+    /// Panics if `level_value` is 0 (reserved for "unmatched / no restriction").
     pub fn map(mut self, tag_value: impl Into<String>, level_value: u8) -> Self {
+        assert!(
+            level_value != 0,
+            "level_value 0 is reserved for unmatched levels"
+        );
         self.values.insert(tag_value.into(), level_value);
         self
     }
@@ -138,11 +150,7 @@ mod tests {
                     .map("us-west", 1)
                     .map("eu-central", 2),
             )
-            .add_rule(
-                SubnetRule::new("fleet:", 1)
-                    .map("alpha", 1)
-                    .map("beta", 2),
-            );
+            .add_rule(SubnetRule::new("fleet:", 1).map("alpha", 1).map("beta", 2));
 
         let caps = caps_with_tags(&["region:us-west", "fleet:beta"]);
         assert_eq!(policy.assign(&caps), SubnetId::new(&[1, 2]));
@@ -150,9 +158,7 @@ mod tests {
 
     #[test]
     fn test_unmatched_tag() {
-        let policy = SubnetPolicy::new().add_rule(
-            SubnetRule::new("region:", 0).map("us-west", 1),
-        );
+        let policy = SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0).map("us-west", 1));
 
         // Tag value not in the map
         let caps = caps_with_tags(&["region:unknown"]);
@@ -182,12 +188,7 @@ mod tests {
             .add_rule(SubnetRule::new("vehicle:", 2).map("v42", 3))
             .add_rule(SubnetRule::new("subsystem:", 3).map("lidar", 4));
 
-        let caps = caps_with_tags(&[
-            "region:us",
-            "fleet:f1",
-            "vehicle:v42",
-            "subsystem:lidar",
-        ]);
+        let caps = caps_with_tags(&["region:us", "fleet:f1", "vehicle:v42", "subsystem:lidar"]);
         assert_eq!(policy.assign(&caps), SubnetId::new(&[1, 2, 3, 4]));
     }
 }

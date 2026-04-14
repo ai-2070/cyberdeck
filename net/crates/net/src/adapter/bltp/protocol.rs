@@ -230,13 +230,29 @@ impl BltpHeader {
     /// Create a handshake header
     #[inline]
     pub fn handshake(payload_len: u16) -> Self {
-        Self::new(0, 0, 0, [0u8; NONCE_SIZE], payload_len, 0, PacketFlags::HANDSHAKE)
+        Self::new(
+            0,
+            0,
+            0,
+            [0u8; NONCE_SIZE],
+            payload_len,
+            0,
+            PacketFlags::HANDSHAKE,
+        )
     }
 
     /// Create a heartbeat header
     #[inline]
     pub fn heartbeat(session_id: u64) -> Self {
-        Self::new(session_id, 0, 0, [0u8; NONCE_SIZE], 0, 0, PacketFlags::HEARTBEAT)
+        Self::new(
+            session_id,
+            0,
+            0,
+            [0u8; NONCE_SIZE],
+            0,
+            0,
+            PacketFlags::HEARTBEAT,
+        )
     }
 
     /// Set priority level
@@ -719,14 +735,20 @@ mod tests {
         // increment it in transit. Including it would break AEAD verification
         // on multi-hop paths.
         let header1 = BltpHeader::new(
-            0x1234, 0x5678, 42,
-            [0u8; NONCE_SIZE], 100, 5, PacketFlags::NONE,
+            0x1234,
+            0x5678,
+            42,
+            [0u8; NONCE_SIZE],
+            100,
+            5,
+            PacketFlags::NONE,
         );
         let mut header2 = header1;
         header2.hop_count = 99; // forwarding node incremented hop_count
 
         assert_eq!(
-            header1.aad(), header2.aad(),
+            header1.aad(),
+            header2.aad(),
             "AAD must be identical regardless of hop_count (mutable in transit)"
         );
     }

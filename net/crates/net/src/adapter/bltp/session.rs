@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::event::StoredEvent;
 
 use super::crypto::{PacketCipher, SessionKeys};
-use super::pool::{SharedPacketPool, SharedLocalPool};
+use super::pool::{SharedLocalPool, SharedPacketPool};
 use super::reliability::{create_reliability_mode, ReliabilityMode};
 
 /// Session state after handshake completion.
@@ -51,16 +51,9 @@ impl BltpSession {
         let tx_cipher = PacketCipher::new(&keys.tx_key, keys.session_id);
         let rx_cipher = PacketCipher::new(&keys.rx_key, keys.session_id);
 
-        let packet_pool = super::pool::shared_pool(
-            pool_size,
-            &keys.tx_key,
-            keys.session_id,
-        );
-        let thread_local_pool = super::pool::shared_local_pool(
-            pool_size,
-            &keys.tx_key,
-            keys.session_id,
-        );
+        let packet_pool = super::pool::shared_pool(pool_size, &keys.tx_key, keys.session_id);
+        let thread_local_pool =
+            super::pool::shared_local_pool(pool_size, &keys.tx_key, keys.session_id);
 
         Self {
             session_id: keys.session_id,

@@ -69,9 +69,7 @@ impl ChannelName {
             ));
         }
         if name.contains("//") {
-            return Err(ChannelError::InvalidFormat(
-                "must not contain '//'".into(),
-            ));
+            return Err(ChannelError::InvalidFormat("must not contain '//'".into()));
         }
         for ch in name.chars() {
             if !matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '/') {
@@ -302,14 +300,23 @@ mod tests {
             ChannelName::new("double//slash"),
             Err(ChannelError::InvalidFormat(_))
         ));
-        assert_eq!(ChannelName::new("has space"), Err(ChannelError::InvalidChar(' ')));
-        assert_eq!(ChannelName::new("has@symbol"), Err(ChannelError::InvalidChar('@')));
+        assert_eq!(
+            ChannelName::new("has space"),
+            Err(ChannelError::InvalidChar(' '))
+        );
+        assert_eq!(
+            ChannelName::new("has@symbol"),
+            Err(ChannelError::InvalidChar('@'))
+        );
     }
 
     #[test]
     fn test_name_too_long() {
         let long_name = "a".repeat(256);
-        assert!(matches!(ChannelName::new(&long_name), Err(ChannelError::TooLong(256))));
+        assert!(matches!(
+            ChannelName::new(&long_name),
+            Err(ChannelError::TooLong(256))
+        ));
 
         let max_name = "a".repeat(255);
         assert!(ChannelName::new(&max_name).is_ok());

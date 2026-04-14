@@ -183,10 +183,7 @@ mod tests {
     #[test]
     fn test_empty_guard_denies() {
         let guard = AuthGuard::new();
-        assert_eq!(
-            guard.check_fast(0x1234, 0xABCD),
-            AuthVerdict::Denied
-        );
+        assert_eq!(guard.check_fast(0x1234, 0xABCD), AuthVerdict::Denied);
     }
 
     #[test]
@@ -194,10 +191,7 @@ mod tests {
         let guard = AuthGuard::new();
         guard.authorize(0x1234, 0xABCD);
 
-        assert_eq!(
-            guard.check_fast(0x1234, 0xABCD),
-            AuthVerdict::Allowed
-        );
+        assert_eq!(guard.check_fast(0x1234, 0xABCD), AuthVerdict::Allowed);
     }
 
     #[test]
@@ -206,15 +200,9 @@ mod tests {
         guard.authorize(0x1234, 0xABCD);
 
         // Different origin
-        assert_ne!(
-            guard.check_fast(0x5678, 0xABCD),
-            AuthVerdict::Allowed
-        );
+        assert_ne!(guard.check_fast(0x5678, 0xABCD), AuthVerdict::Allowed);
         // Different channel
-        assert_ne!(
-            guard.check_fast(0x1234, 0x1111),
-            AuthVerdict::Allowed
-        );
+        assert_ne!(guard.check_fast(0x1234, 0x1111), AuthVerdict::Allowed);
     }
 
     #[test]
@@ -299,11 +287,7 @@ mod tests {
         }
 
         let fp_rate = false_positives as f64 / 10000.0;
-        assert!(
-            fp_rate < 0.01,
-            "false positive rate {} exceeds 1%",
-            fp_rate
-        );
+        assert!(fp_rate < 0.01, "false positive rate {} exceeds 1%", fp_rate);
     }
 
     // ---- Regression tests for Cubic AI findings ----

@@ -484,8 +484,8 @@ mod tests {
         );
 
         assert!(token.verify().is_ok()); // signature is valid
-        // Token may or may not be expired depending on timing,
-        // but with duration 0 and not_after = now, it's borderline
+                                         // Token may or may not be expired depending on timing,
+                                         // but with duration 0 and not_after = now, it's borderline
     }
 
     #[test]
@@ -733,7 +733,9 @@ mod tests {
 
         // The wildcard should be reached despite the expired channel token
         assert!(
-            cache.check(subject.entity_id(), TokenScope::PUBLISH, 0xABCD).is_ok(),
+            cache
+                .check(subject.entity_id(), TokenScope::PUBLISH, 0xABCD)
+                .is_ok(),
             "wildcard fallback must not be blocked by expired channel-specific token"
         );
     }
