@@ -23,16 +23,34 @@ pub struct PacketBuilder {
     packet: BytesMut,
     /// Session ID for this builder
     session_id: u64,
+    /// Origin hash from entity identity (0 if no identity configured)
+    origin_hash: u32,
+    /// Channel hash for the current stream (0 if not bound to a channel)
+    channel_hash: u16,
 }
 
 impl PacketBuilder {
-    /// Create a new fast packet builder
+    /// Create a new packet builder
     pub fn new(key: &[u8; 32], session_id: u64) -> Self {
         Self {
             payload: BytesMut::with_capacity(MAX_PAYLOAD_SIZE),
             cipher: PacketCipher::new(key, session_id),
             packet: BytesMut::with_capacity(MAX_PACKET_SIZE),
             session_id,
+            origin_hash: 0,
+            channel_hash: 0,
+        }
+    }
+
+    /// Create a new packet builder with origin identity
+    pub fn with_origin(key: &[u8; 32], session_id: u64, origin_hash: u32) -> Self {
+        Self {
+            payload: BytesMut::with_capacity(MAX_PAYLOAD_SIZE),
+            cipher: PacketCipher::new(key, session_id),
+            packet: BytesMut::with_capacity(MAX_PACKET_SIZE),
+            session_id,
+            origin_hash,
+            channel_hash: 0,
         }
     }
 
@@ -40,6 +58,16 @@ impl PacketBuilder {
     pub fn set_key(&mut self, key: &[u8; 32], session_id: u64) {
         self.cipher = PacketCipher::new(key, session_id);
         self.session_id = session_id;
+    }
+
+    /// Set the origin hash
+    pub fn set_origin_hash(&mut self, origin_hash: u32) {
+        self.origin_hash = origin_hash;
+    }
+
+    /// Set the channel hash for outgoing packets
+    pub fn set_channel_hash(&mut self, channel_hash: u16) {
+        self.channel_hash = channel_hash;
     }
 
     /// Build a packet from events using counter-based encryption.
@@ -76,7 +104,9 @@ impl PacketBuilder {
             self.payload.len() as u16,
             events.len() as u16,
             flags,
-        );
+        )
+        .with_origin(self.origin_hash)
+        .with_channel_hash(self.channel_hash);
         let aad = header.aad();
         let mut header_bytes = header.to_bytes();
 
@@ -166,24 +196,32 @@ pub struct PacketPool {
     key: [u8; 32],
     /// Session ID for builders
     session_id: u64,
+    /// Origin hash for L1 identity
+    origin_hash: u32,
     /// Pool capacity
     capacity: usize,
 }
 
 impl PacketPool {
-    /// Create a new fast packet pool
+    /// Create a new packet pool
     pub fn new(size: usize, key: &[u8; 32], session_id: u64) -> Self {
+        Self::with_origin(size, key, session_id, 0)
+    }
+
+    /// Create a new packet pool with origin identity
+    pub fn with_origin(size: usize, key: &[u8; 32], session_id: u64, origin_hash: u32) -> Self {
         let builders = ArrayQueue::new(size);
 
         // Pre-populate the pool
         for _ in 0..size {
-            let _ = builders.push(PacketBuilder::new(key, session_id));
+            let _ = builders.push(PacketBuilder::with_origin(key, session_id, origin_hash));
         }
 
         Self {
             builders,
             key: *key,
             session_id,
+            origin_hash,
             capacity: size,
         }
     }
@@ -197,10 +235,9 @@ impl PacketPool {
     /// Get a builder from the pool
     #[inline]
     pub fn get(&self) -> PooledBuilder<'_> {
-        let builder = self
-            .builders
-            .pop()
-            .unwrap_or_else(|| PacketBuilder::new(&self.key, self.session_id));
+        let builder = self.builders.pop().unwrap_or_else(|| {
+            PacketBuilder::with_origin(&self.key, self.session_id, self.origin_hash)
+        });
 
         PooledBuilder {
             pool: self,
@@ -294,6 +331,8 @@ impl Drop for PooledBuilder<'_> {
             if builder.session_id() != self.pool.session_id {
                 builder.set_key(&self.pool.key, self.pool.session_id);
             }
+            // Sync origin_hash in case it changed
+            builder.set_origin_hash(self.pool.origin_hash);
             // Return to pool (ignore if full)
             let _ = self.pool.builders.push(builder);
         }
@@ -348,6 +387,8 @@ pub struct ThreadLocalPool {
     key: [u8; 32],
     /// Session ID for builders
     session_id: u64,
+    /// Origin hash for L1 identity
+    origin_hash: u32,
     /// Maximum builders per thread-local cache
     local_capacity: usize,
     /// Total pool capacity
@@ -360,7 +401,18 @@ impl ThreadLocalPool {
 
     /// Create a new thread-local pool
     pub fn new(size: usize, key: &[u8; 32], session_id: u64) -> Self {
-        Self::with_local_capacity(size, key, session_id, Self::DEFAULT_LOCAL_CAPACITY)
+        Self::with_local_capacity(size, key, session_id, 0, Self::DEFAULT_LOCAL_CAPACITY)
+    }
+
+    /// Create a new thread-local pool with origin identity
+    pub fn with_origin(size: usize, key: &[u8; 32], session_id: u64, origin_hash: u32) -> Self {
+        Self::with_local_capacity(
+            size,
+            key,
+            session_id,
+            origin_hash,
+            Self::DEFAULT_LOCAL_CAPACITY,
+        )
     }
 
     /// Create a new thread-local pool with custom local capacity
@@ -368,19 +420,21 @@ impl ThreadLocalPool {
         size: usize,
         key: &[u8; 32],
         session_id: u64,
+        origin_hash: u32,
         local_capacity: usize,
     ) -> Self {
         let shared = ArrayQueue::new(size);
 
         // Pre-populate the shared pool
         for _ in 0..size {
-            let _ = shared.push(PacketBuilder::new(key, session_id));
+            let _ = shared.push(PacketBuilder::with_origin(key, session_id, origin_hash));
         }
 
         Self {
             shared,
             key: *key,
             session_id,
+            origin_hash,
             local_capacity,
             capacity: size,
         }
@@ -401,6 +455,8 @@ impl ThreadLocalPool {
                 if builder.session_id() != self.session_id {
                     builder.set_key(&self.key, self.session_id);
                 }
+                // Sync origin_hash in case it changed
+                builder.set_origin_hash(self.origin_hash);
                 return builder;
             }
 
@@ -420,9 +476,12 @@ impl ThreadLocalPool {
                     if b.session_id() != self.session_id {
                         b.set_key(&self.key, self.session_id);
                     }
+                    b.set_origin_hash(self.origin_hash);
                     b
                 })
-                .unwrap_or_else(|| PacketBuilder::new(&self.key, self.session_id))
+                .unwrap_or_else(|| {
+                    PacketBuilder::with_origin(&self.key, self.session_id, self.origin_hash)
+                })
         })
     }
 
@@ -436,6 +495,8 @@ impl ThreadLocalPool {
         if builder.session_id() != self.session_id {
             builder.set_key(&self.key, self.session_id);
         }
+        // Sync origin_hash
+        builder.set_origin_hash(self.origin_hash);
 
         LOCAL_BUILDERS.with(|pool| {
             let mut pool = pool.borrow_mut();
@@ -632,7 +693,7 @@ mod tests {
     fn test_thread_local_pool_batch_refill() {
         let key = [0x42u8; 32];
         let session_id = 0x1111;
-        let pool = ThreadLocalPool::with_local_capacity(16, &key, session_id, 4);
+        let pool = ThreadLocalPool::with_local_capacity(16, &key, session_id, 0, 4);
 
         // Acquire multiple builders to trigger batch refill
         let mut builders = Vec::new();
@@ -656,7 +717,7 @@ mod tests {
         let key = [0x42u8; 32];
         let session_id = 0x2222;
         // local_capacity = 2, so local cache holds up to 4 (2 * 2)
-        let pool = ThreadLocalPool::with_local_capacity(8, &key, session_id, 2);
+        let pool = ThreadLocalPool::with_local_capacity(8, &key, session_id, 0, 2);
 
         // Acquire and release many builders
         for _ in 0..10 {

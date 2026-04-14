@@ -726,4 +726,30 @@ mod tests {
         assert!(events.is_empty());
         assert!(events.capacity() <= 1);
     }
+
+    // ---- Regression tests for Cubic AI findings ----
+
+    #[test]
+    fn test_regression_hop_count_excluded_from_aad() {
+        // Regression: hop_count was included in AAD, but forwarding nodes
+        // increment it in transit. Including it would break AEAD verification
+        // on multi-hop paths.
+        let header1 = BltpHeader::new(
+            0x1234,
+            0x5678,
+            42,
+            [0u8; NONCE_SIZE],
+            100,
+            5,
+            PacketFlags::NONE,
+        );
+        let mut header2 = header1;
+        header2.hop_count = 99; // forwarding node incremented hop_count
+
+        assert_eq!(
+            header1.aad(),
+            header2.aad(),
+            "AAD must be identical regardless of hop_count (mutable in transit)"
+        );
+    }
 }

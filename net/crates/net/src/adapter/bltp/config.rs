@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use super::crypto::StaticKeypair;
+use super::identity::EntityKeypair;
 
 /// Reliability configuration for BLTP streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -75,6 +76,8 @@ pub struct BltpAdapterConfig {
     pub socket_send_buffer: Option<usize>,
     /// Number of shards (used to map stream IDs to shard IDs on receive)
     pub num_shards: u16,
+    /// Entity keypair for L1 identity (optional — if absent, origin_hash stays 0)
+    pub entity_keypair: Option<EntityKeypair>,
 }
 
 impl BltpAdapterConfig {
@@ -119,6 +122,7 @@ impl BltpAdapterConfig {
             socket_recv_buffer: None,
             socket_send_buffer: None,
             num_shards: 1,
+            entity_keypair: None,
         }
     }
 
@@ -148,12 +152,19 @@ impl BltpAdapterConfig {
             socket_recv_buffer: None,
             socket_send_buffer: None,
             num_shards: 1,
+            entity_keypair: None,
         }
     }
 
     /// Set the number of shards
     pub fn with_num_shards(mut self, num_shards: u16) -> Self {
         self.num_shards = num_shards;
+        self
+    }
+
+    /// Set the entity keypair for L1 identity
+    pub fn with_entity_keypair(mut self, keypair: EntityKeypair) -> Self {
+        self.entity_keypair = Some(keypair);
         self
     }
 

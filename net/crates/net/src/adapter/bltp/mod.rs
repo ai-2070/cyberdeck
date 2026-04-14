@@ -32,9 +32,11 @@
 
 mod batch;
 pub mod behavior;
+pub mod channel;
 mod config;
 mod crypto;
 mod failure;
+pub mod identity;
 mod pool;
 mod protocol;
 mod proxy;
@@ -42,6 +44,8 @@ mod reliability;
 mod route;
 mod router;
 mod session;
+pub mod state;
+pub mod subnet;
 mod swarm;
 mod transport;
 
@@ -49,11 +53,19 @@ mod transport;
 mod linux;
 
 pub use batch::AdaptiveBatcher;
+pub use channel::{
+    AuthGuard, AuthVerdict, ChannelConfig, ChannelConfigRegistry, ChannelError, ChannelId,
+    ChannelName, ChannelRegistry, Visibility,
+};
 pub use config::{BltpAdapterConfig, ConnectionRole, ReliabilityConfig};
 pub use crypto::{CryptoError, SessionKeys, StaticKeypair};
 pub use failure::{
     CircuitBreaker, CircuitState, FailureDetector, FailureDetectorConfig, FailureStats,
     LossSimulator, NodeStatus, RecoveryAction, RecoveryManager, RecoveryStats,
+};
+pub use identity::{
+    EntityError, EntityId, EntityKeypair, OriginStamp, PermissionToken, TokenCache, TokenError,
+    TokenScope,
 };
 pub use pool::{PacketBuilder, PacketPool, SharedLocalPool, SharedPacketPool, ThreadLocalPool};
 pub use protocol::{
@@ -69,6 +81,12 @@ pub use route::{
 };
 pub use router::{BltpRouter, FairScheduler, RouteAction, RouterConfig, RouterError, RouterStats};
 pub use session::{BltpSession, SessionManager, StreamState};
+pub use state::{
+    CausalChainBuilder, CausalEvent, CausalLink, ChainError, EntityLog, HorizonEncoder, LogError,
+    LogIndex, ObservedHorizon, SnapshotStore, StateSnapshot, CAUSAL_LINK_SIZE, SUBPROTOCOL_CAUSAL,
+    SUBPROTOCOL_SNAPSHOT,
+};
+pub use subnet::{DropReason, ForwardDecision, SubnetGateway, SubnetId, SubnetPolicy, SubnetRule};
 pub use swarm::{
     Capabilities, CapabilityAd, EdgeInfo, GraphStats, LocalGraph, NodeInfo, Pingwave, PINGWAVE_SIZE,
 };
