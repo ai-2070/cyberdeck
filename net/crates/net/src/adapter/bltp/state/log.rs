@@ -18,9 +18,10 @@ pub struct EntityLog {
     origin_hash: u32,
     /// Events in causal order (by sequence number).
     events: Vec<CausalEvent>,
-    /// Highest contiguous sequence held locally.
-    head_seq: u64,
-    /// Payload of the head event (for chain validation of next append).
+    /// Base link — genesis for new logs, snapshot head for restored logs.
+    /// Used as the validation anchor when `events` is empty.
+    base_link: CausalLink,
+    /// Payload of the base/head event (for chain validation of next append).
     head_payload: Bytes,
     /// Latest snapshot sequence (events before this can be pruned).
     snapshot_seq: u64,
@@ -34,7 +35,7 @@ impl EntityLog {
             entity_id,
             origin_hash,
             events: Vec::new(),
-            head_seq: 0,
+            base_link: CausalLink::genesis(origin_hash, 0),
             head_payload: Bytes::new(),
             snapshot_seq: 0,
         }
@@ -52,7 +53,7 @@ impl EntityLog {
             entity_id,
             origin_hash,
             events: Vec::new(),
-            head_seq: head_link.sequence,
+            base_link: head_link,
             head_payload,
             snapshot_seq,
         }
@@ -70,30 +71,25 @@ impl EntityLog {
             }));
         }
 
-        if self.events.is_empty() && self.head_seq == 0 {
-            // First event — accept genesis or seq 1
-            if !event.link.is_genesis() && event.link.sequence != 1 {
-                // If we have a snapshot, expect snapshot_seq + 1
-                if self.snapshot_seq > 0 && event.link.sequence != self.snapshot_seq + 1 {
-                    return Err(LogError::Chain(ChainError::SequenceGap {
-                        expected: self.snapshot_seq + 1,
-                        got: event.link.sequence,
-                    }));
-                }
-            }
-        } else {
-            // Validate against the current head
-            let head_link = self.head_link();
-            validate_chain_link(&head_link, &self.head_payload, &event.link)
-                .map_err(LogError::Chain)?;
-        }
+        let current_head = self.head_link();
+        let current_seq = current_head.sequence;
 
         // Duplicate check
-        if event.link.sequence <= self.head_seq && self.head_seq > 0 {
+        if current_seq > 0 && event.link.sequence <= current_seq {
             return Err(LogError::Duplicate(event.link.sequence));
         }
 
-        self.head_seq = event.link.sequence;
+        // For genesis on a fresh log, accept without parent validation
+        if current_head.is_genesis() && event.link.is_genesis() {
+            // Accept genesis event
+        } else if current_head.is_genesis() && event.link.sequence == 1 {
+            // First real event after genesis — no parent_hash to validate
+        } else {
+            // Validate chain linkage against current head
+            validate_chain_link(&current_head, &self.head_payload, &event.link)
+                .map_err(LogError::Chain)?;
+        }
+
         self.head_payload = event.payload.clone();
         self.events.push(event);
         Ok(())
@@ -117,16 +113,16 @@ impl EntityLog {
 
     /// Get the head (latest) link.
     pub fn head_link(&self) -> CausalLink {
-        self.events
-            .last()
-            .map(|e| e.link)
-            .unwrap_or_else(|| CausalLink::genesis(self.origin_hash, 0))
+        self.events.last().map(|e| e.link).unwrap_or(self.base_link)
     }
 
     /// Get the head sequence number.
     #[inline]
     pub fn head_seq(&self) -> u64 {
-        self.head_seq
+        self.events
+            .last()
+            .map(|e| e.link.sequence)
+            .unwrap_or(self.base_link.sequence)
     }
 
     /// Get the entity ID.
@@ -176,7 +172,7 @@ impl std::fmt::Debug for EntityLog {
             .field("entity_id", &self.entity_id)
             .field("origin_hash", &format!("{:#x}", self.origin_hash))
             .field("events", &self.events.len())
-            .field("head_seq", &self.head_seq)
+            .field("head_seq", &self.head_seq())
             .field("snapshot_seq", &self.snapshot_seq)
             .finish()
     }

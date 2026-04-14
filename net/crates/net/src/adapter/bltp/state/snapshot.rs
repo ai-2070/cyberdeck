@@ -67,7 +67,8 @@ impl StateSnapshot {
         buf.extend_from_slice(&self.through_seq.to_le_bytes());
         buf.extend_from_slice(&self.chain_link.to_bytes());
         buf.extend_from_slice(&self.created_at.to_le_bytes());
-        buf.extend_from_slice(&(self.state.len() as u32).to_le_bytes());
+        let state_len = u32::try_from(self.state.len()).expect("state snapshot exceeds 4 GiB");
+        buf.extend_from_slice(&state_len.to_le_bytes());
         buf.extend_from_slice(&self.state);
 
         buf
@@ -101,6 +102,14 @@ impl StateSnapshot {
 
         let state = Bytes::copy_from_slice(&cursor[..state_len]);
 
+        // Validate internal consistency
+        if chain_link.sequence != through_seq {
+            return None;
+        }
+        if chain_link.origin_hash != entity_id.origin_hash() {
+            return None;
+        }
+
         Some(Self {
             entity_id,
             through_seq,
@@ -122,8 +131,10 @@ impl StateSnapshot {
 }
 
 /// Snapshot store — holds the latest snapshot per entity.
+///
+/// Keyed by full EntityId (32 bytes) to avoid origin_hash collisions.
 pub struct SnapshotStore {
-    snapshots: dashmap::DashMap<u32, StateSnapshot>,
+    snapshots: dashmap::DashMap<[u8; 32], StateSnapshot>,
 }
 
 impl SnapshotStore {
@@ -136,21 +147,21 @@ impl SnapshotStore {
 
     /// Store a snapshot (replaces any existing snapshot for this entity).
     pub fn store(&self, snapshot: StateSnapshot) {
-        let origin_hash = snapshot.entity_id.origin_hash();
-        self.snapshots.insert(origin_hash, snapshot);
+        let key = *snapshot.entity_id.as_bytes();
+        self.snapshots.insert(key, snapshot);
     }
 
     /// Get the latest snapshot for an entity.
     pub fn get(
         &self,
-        origin_hash: u32,
-    ) -> Option<dashmap::mapref::one::Ref<'_, u32, StateSnapshot>> {
-        self.snapshots.get(&origin_hash)
+        entity_id: &EntityId,
+    ) -> Option<dashmap::mapref::one::Ref<'_, [u8; 32], StateSnapshot>> {
+        self.snapshots.get(entity_id.as_bytes())
     }
 
     /// Remove a snapshot.
-    pub fn remove(&self, origin_hash: u32) -> Option<StateSnapshot> {
-        self.snapshots.remove(&origin_hash).map(|(_, s)| s)
+    pub fn remove(&self, entity_id: &EntityId) -> Option<StateSnapshot> {
+        self.snapshots.remove(entity_id.as_bytes()).map(|(_, s)| s)
     }
 
     /// Number of stored snapshots.
@@ -226,7 +237,7 @@ mod tests {
         let link = CausalLink::genesis(origin_hash, 0);
 
         let snapshot = StateSnapshot::new(
-            entity_id,
+            entity_id.clone(),
             link,
             Bytes::from_static(b"state"),
             ObservedHorizon::new(),
@@ -235,7 +246,7 @@ mod tests {
         store.store(snapshot);
         assert_eq!(store.count(), 1);
 
-        let retrieved = store.get(origin_hash).unwrap();
+        let retrieved = store.get(&entity_id).unwrap();
         assert_eq!(retrieved.state, Bytes::from_static(b"state"));
     }
 
@@ -258,7 +269,7 @@ mod tests {
         builder.append(Bytes::from_static(b"e1"), 0);
 
         let snap2 = StateSnapshot::new(
-            entity_id,
+            entity_id.clone(),
             *builder.head(),
             Bytes::from_static(b"state-v2"),
             ObservedHorizon::new(),
@@ -266,7 +277,7 @@ mod tests {
         store.store(snap2);
 
         assert_eq!(store.count(), 1);
-        let retrieved = store.get(origin_hash).unwrap();
+        let retrieved = store.get(&entity_id).unwrap();
         assert_eq!(retrieved.state, Bytes::from_static(b"state-v2"));
         assert_eq!(retrieved.through_seq, 1);
     }
@@ -274,5 +285,33 @@ mod tests {
     #[test]
     fn test_from_bytes_too_short() {
         assert!(StateSnapshot::from_bytes(&[0u8; 10]).is_none());
+    }
+
+    // ---- Regression tests for Cubic AI findings ----
+
+    #[test]
+    fn test_regression_from_bytes_rejects_sequence_mismatch() {
+        // Regression: from_bytes accepted snapshots where
+        // chain_link.sequence != through_seq.
+        let kp = EntityKeypair::generate();
+        let entity_id = kp.entity_id().clone();
+        let mut builder = CausalChainBuilder::new(kp.origin_hash());
+        builder.append(Bytes::from_static(b"e1"), 0);
+
+        let snapshot = StateSnapshot::new(
+            entity_id,
+            *builder.head(),
+            Bytes::from_static(b"state"),
+            ObservedHorizon::new(),
+        );
+        let mut bytes = snapshot.to_bytes();
+
+        // Tamper: change through_seq (bytes 32..40) to a different value
+        bytes[32] = 0xFF;
+
+        assert!(
+            StateSnapshot::from_bytes(&bytes).is_none(),
+            "from_bytes must reject snapshot with sequence mismatch"
+        );
     }
 }

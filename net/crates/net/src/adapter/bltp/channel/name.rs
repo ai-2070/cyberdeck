@@ -217,9 +217,12 @@ impl ChannelRegistry {
         if let Some(mut hash_entry) = self.by_hash.get_mut(&id.hash()) {
             hash_entry.retain(|c| c.name().as_str() != name);
         }
-        self.by_name.remove(name);
 
-        Some(id)
+        if self.by_name.remove(name).is_some() {
+            Some(id)
+        } else {
+            None
+        }
     }
 
     /// Number of registered channels.

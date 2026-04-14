@@ -18,24 +18,26 @@ pub const CAUSAL_LINK_SIZE: usize = 24;
 
 /// Causal link — 24 bytes prepended to each event in causal-framed EventFrames.
 ///
-/// Wire format:
+/// Wire format (24 bytes, no padding):
 /// ```text
 /// origin_hash:      4 bytes (u32) — entity identity
+/// horizon_encoded:  4 bytes (u32) — compressed observed horizon
 /// sequence:         8 bytes (u64) — monotonic per-entity
 /// parent_hash:      8 bytes (u64) — xxh3 of (prev link ++ prev payload)
-/// horizon_encoded:  4 bytes (u32) — compressed observed horizon
 /// ```
+///
+/// Fields are ordered to avoid padding: two u32s first, then two u64s.
+/// Serialization uses explicit `to_bytes`/`from_bytes`, not transmute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
 pub struct CausalLink {
     /// Truncated entity identity (matches BLTP header origin_hash).
     pub origin_hash: u32,
+    /// Compressed observed horizon (bloom sketch).
+    pub horizon_encoded: u32,
     /// Monotonic sequence number from entity's reference frame.
     pub sequence: u64,
     /// xxh3 hash of the previous event's (CausalLink bytes ++ payload bytes).
     pub parent_hash: u64,
-    /// Compressed observed horizon (bloom sketch).
-    pub horizon_encoded: u32,
 }
 
 impl CausalLink {
@@ -43,20 +45,24 @@ impl CausalLink {
     pub fn genesis(origin_hash: u32, horizon_encoded: u32) -> Self {
         Self {
             origin_hash,
+            horizon_encoded,
             sequence: 0,
             parent_hash: 0,
-            horizon_encoded,
         }
     }
 
     /// Create the next link in a chain given the previous link and payload.
     #[inline]
     pub fn next(&self, payload: &[u8], horizon_encoded: u32) -> Self {
+        let next_seq = self
+            .sequence
+            .checked_add(1)
+            .expect("causal sequence overflow");
         Self {
             origin_hash: self.origin_hash,
-            sequence: self.sequence + 1,
-            parent_hash: compute_parent_hash(self, payload),
             horizon_encoded,
+            sequence: next_seq,
+            parent_hash: compute_parent_hash(self, payload),
         }
     }
 
@@ -66,9 +72,9 @@ impl CausalLink {
         let mut buf = [0u8; CAUSAL_LINK_SIZE];
         let mut cursor = &mut buf[..];
         cursor.put_u32_le(self.origin_hash);
+        cursor.put_u32_le(self.horizon_encoded);
         cursor.put_u64_le(self.sequence);
         cursor.put_u64_le(self.parent_hash);
-        cursor.put_u32_le(self.horizon_encoded);
         buf
     }
 
@@ -81,9 +87,9 @@ impl CausalLink {
         let mut cursor = &data[..CAUSAL_LINK_SIZE];
         Some(Self {
             origin_hash: cursor.get_u32_le(),
+            horizon_encoded: cursor.get_u32_le(),
             sequence: cursor.get_u64_le(),
             parent_hash: cursor.get_u64_le(),
-            horizon_encoded: cursor.get_u32_le(),
         })
     }
 
@@ -198,9 +204,16 @@ pub fn validate_chain_link(
             got: new_link.origin_hash,
         });
     }
-    if new_link.sequence != prev_link.sequence + 1 {
+    let expected_seq = prev_link
+        .sequence
+        .checked_add(1)
+        .ok_or(ChainError::SequenceGap {
+            expected: u64::MAX,
+            got: new_link.sequence,
+        })?;
+    if new_link.sequence != expected_seq {
         return Err(ChainError::SequenceGap {
-            expected: prev_link.sequence + 1,
+            expected: expected_seq,
             got: new_link.sequence,
         });
     }
@@ -221,7 +234,8 @@ pub fn write_causal_events(events: &[CausalEvent], buf: &mut BytesMut) -> usize 
     let start = buf.len();
     for event in events {
         let total_len = CAUSAL_LINK_SIZE + event.payload.len();
-        buf.put_u32_le(total_len as u32);
+        let total_len_u32 = u32::try_from(total_len).expect("causal event exceeds 4 GiB");
+        buf.put_u32_le(total_len_u32);
         buf.put_slice(&event.link.to_bytes());
         buf.put_slice(&event.payload);
     }
@@ -486,5 +500,25 @@ mod tests {
                 i
             );
         }
+    }
+
+    // ---- Regression tests for Cubic AI findings ----
+
+    #[test]
+    fn test_regression_causal_link_wire_size_is_24() {
+        // Regression: repr(C) with field order u32, u64, u64, u32 padded to 32 bytes.
+        // Fields were reordered to u32, u32, u64, u64 and repr(C) removed.
+        let link = CausalLink::genesis(0xDEADBEEF, 0xCAFE);
+        let bytes = link.to_bytes();
+        assert_eq!(
+            bytes.len(),
+            24,
+            "CausalLink wire size must be exactly 24 bytes"
+        );
+        assert_eq!(bytes.len(), CAUSAL_LINK_SIZE);
+
+        // Verify roundtrip preserves all fields
+        let parsed = CausalLink::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed, link);
     }
 }

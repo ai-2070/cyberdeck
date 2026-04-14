@@ -96,15 +96,17 @@ impl HorizonEncoder {
             }
         }
 
-        // Truncate max_seq to high 16 bits
-        let seq_compressed = (max_seq >> 48) as u16;
-        if seq_compressed == 0 && max_seq > 0 {
-            // For small sequences, use low bits instead
-            let seq_low = (max_seq & 0xFFFF) as u16;
-            ((bloom as u32) << 16) | (seq_low as u32)
-        } else {
-            ((bloom as u32) << 16) | (seq_compressed as u32)
-        }
+        // Encode max_seq as log-scale u16 to preserve ordering across full u64 range.
+        // Uses the position of the highest set bit (0-63) in the high 6 bits,
+        // and the next 10 significant bits as mantissa. This gives ~0.1% precision
+        // for large values and exact representation for values < 1024.
+        let seq_encoded = encode_seq_log(max_seq);
+        ((bloom as u32) << 16) | (seq_encoded as u32)
+    }
+
+    /// Decode the log-scale sequence from an encoded horizon.
+    pub fn decode_seq(encoded: u32) -> u64 {
+        decode_seq_log((encoded & 0xFFFF) as u16)
     }
 
     /// Check if an origin_hash is possibly in a compressed horizon.
@@ -127,6 +129,31 @@ impl HorizonEncoder {
     ) -> bool {
         !Self::might_contain(horizon_a, origin_b) && !Self::might_contain(horizon_b, origin_a)
     }
+}
+
+/// Encode a u64 sequence as a log-scale u16.
+///
+/// Format: [exponent: 6 bits][mantissa: 10 bits]
+/// Values < 1024 are encoded exactly. Larger values lose low bits
+/// but preserve ordering across the full u64 range.
+fn encode_seq_log(seq: u64) -> u16 {
+    if seq < 1024 {
+        return seq as u16;
+    }
+    let bits = 64 - seq.leading_zeros() as u16; // position of highest bit (1-64)
+    let exponent = bits - 10; // shift needed to get top 10 bits
+    let mantissa = (seq >> exponent) as u16 & 0x3FF;
+    (exponent << 10) | mantissa
+}
+
+/// Decode a log-scale u16 back to approximate u64 sequence.
+fn decode_seq_log(encoded: u16) -> u64 {
+    if encoded < 1024 {
+        return encoded as u64;
+    }
+    let exponent = (encoded >> 10) as u64;
+    let mantissa = (encoded & 0x3FF) as u64;
+    mantissa << exponent
 }
 
 #[cfg(test)]
@@ -227,5 +254,54 @@ mod tests {
         assert!(!HorizonEncoder::potentially_concurrent(
             enc_a2, 0xBBBB, enc_b, 0xAAAA
         ));
+    }
+
+    // ---- Regression tests for Cubic AI findings ----
+
+    #[test]
+    fn test_regression_seq_encoding_preserves_ordering() {
+        // Regression: old encoding used (max_seq >> 48) as u16 with a fallback
+        // to low bits, which broke ordering for values in [0x10000, 0xFFFF_FFFF_FFFF].
+        // Sequence 65536 encoded as 0, sequence 65537 encoded as 1.
+        // Log-scale encoding now preserves monotonic ordering.
+        let test_values: Vec<u64> = vec![
+            0,
+            1,
+            100,
+            1023,
+            1024, // exact range
+            65535,
+            65536,
+            65537, // old breakpoint
+            1_000_000,
+            1_000_000_000, // mid-range
+            u64::MAX / 2,
+            u64::MAX, // high range
+        ];
+
+        for i in 0..test_values.len() - 1 {
+            let a = test_values[i];
+            let b = test_values[i + 1];
+            let enc_a = encode_seq_log(a);
+            let enc_b = encode_seq_log(b);
+            assert!(
+                enc_a <= enc_b,
+                "encoding must preserve ordering: encode({}) = {} > encode({}) = {}",
+                a,
+                enc_a,
+                b,
+                enc_b
+            );
+        }
+    }
+
+    #[test]
+    fn test_regression_seq_roundtrip_exact_for_small() {
+        // Values < 1024 must roundtrip exactly.
+        for v in 0..1024u64 {
+            let encoded = encode_seq_log(v);
+            let decoded = decode_seq_log(encoded);
+            assert_eq!(decoded, v, "small value {} must roundtrip exactly", v);
+        }
     }
 }
