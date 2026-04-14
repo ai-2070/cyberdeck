@@ -42,7 +42,12 @@ impl EntityLog {
     }
 
     /// Create from a snapshot (for catchup — events after snapshot_seq will be appended).
-    pub fn from_snapshot(entity_id: EntityId, snapshot_seq: u64, head_link: CausalLink, head_payload: Bytes) -> Self {
+    pub fn from_snapshot(
+        entity_id: EntityId,
+        snapshot_seq: u64,
+        head_link: CausalLink,
+        head_payload: Bytes,
+    ) -> Self {
         let origin_hash = entity_id.origin_hash();
         Self {
             entity_id,
@@ -108,10 +113,7 @@ impl EntityLog {
 
     /// Get the head (latest) link.
     pub fn head_link(&self) -> CausalLink {
-        self.events
-            .last()
-            .map(|e| e.link)
-            .unwrap_or(self.base_link)
+        self.events.last().map(|e| e.link).unwrap_or(self.base_link)
     }
 
     /// Get the head sequence number.
@@ -192,7 +194,10 @@ impl LogIndex {
     }
 
     /// Get or create the log for an entity.
-    pub fn get_or_create(&self, entity_id: EntityId) -> dashmap::mapref::one::RefMut<'_, u32, EntityLog> {
+    pub fn get_or_create(
+        &self,
+        entity_id: EntityId,
+    ) -> dashmap::mapref::one::RefMut<'_, u32, EntityLog> {
         let origin_hash = entity_id.origin_hash();
         self.logs
             .entry(origin_hash)

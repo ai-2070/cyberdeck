@@ -46,7 +46,7 @@ pub enum ContinuityStatus {
     },
 }
 
-/// Compact proof of continuity that can be transmitted (40 bytes).
+/// Compact proof of continuity that can be transmitted (36 bytes).
 ///
 /// A node can send this to another node to prove its chain is intact
 /// over a given sequence range, without transferring the full log.
@@ -186,7 +186,7 @@ pub fn assess_continuity(log: &EntityLog) -> ContinuityStatus {
         if curr.link.sequence != prev.link.sequence + 1 {
             return ContinuityStatus::Unverifiable {
                 last_verified_seq: prev.link.sequence,
-                gap_start: curr.link.sequence,
+                gap_start: prev.link.sequence + 1,
             };
         }
 

@@ -89,7 +89,7 @@ impl ObservationWindow {
             Some(s) => s.as_nanos() as u64,
             None => return false,
         };
-        staleness <= max_delay_nanos + delay
+        staleness <= max_delay_nanos.saturating_add(delay)
     }
 
     /// Entities observed within a given hop radius.

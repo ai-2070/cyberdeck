@@ -106,21 +106,28 @@ impl CausalCone {
         }
 
         let first = &cones[0];
-        let mut merged_horizon = first.horizon.clone().unwrap_or_default();
+        let mut merged_horizon = first.horizon.clone();
+        let mut all_exact = first.horizon.is_some();
         let mut merged_encoded = first.horizon_encoded;
 
         for cone in &cones[1..] {
-            if let Some(ref h) = cone.horizon {
-                merged_horizon.merge(h);
+            match (&mut merged_horizon, &cone.horizon) {
+                (Some(merged), Some(h)) => merged.merge(h),
+                _ => all_exact = false,
             }
             // OR the bloom bits together for approximate merge
             merged_encoded |= cone.horizon_encoded;
         }
 
+        // Only keep full horizon if ALL inputs had exact data
+        if !all_exact {
+            merged_horizon = None;
+        }
+
         Some(CausalCone {
             origin_hash: first.origin_hash,
             sequence: first.sequence,
-            horizon: Some(merged_horizon),
+            horizon: merged_horizon,
             horizon_encoded: merged_encoded,
         })
     }
@@ -246,5 +253,25 @@ mod tests {
     #[test]
     fn test_merge_empty() {
         assert!(CausalCone::merge(&[]).is_none());
+    }
+
+    // ---- Regression tests for Cubic AI findings ----
+
+    #[test]
+    fn test_regression_merge_mixed_exact_approximate_not_exact() {
+        // Regression: merge() marked the result as exact (horizon: Some)
+        // even when some inputs lacked full horizons, producing false
+        // Definite causality results.
+        let mut h = ObservedHorizon::new();
+        h.observe(0xBBBB, 10);
+
+        let exact_cone = CausalCone::from_link_with_horizon(&make_link(0xAAAA, 1, h.encode()), &h);
+        let approx_cone = CausalCone::from_causal_link(&make_link(0xAAAA, 2, 0));
+
+        let merged = CausalCone::merge(&[exact_cone, approx_cone]).unwrap();
+        assert!(
+            !merged.is_exact(),
+            "merged cone with mixed exact/approximate inputs must not be marked exact"
+        );
     }
 }

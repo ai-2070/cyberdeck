@@ -86,8 +86,20 @@ impl PropagationModel {
             return;
         }
 
-        // Compute implied per-hop latency
-        let per_hop = measured_rtt_nanos / (2 * hop_count as u64); // RTT / 2 / hops
+        // Factor out the depth multiplier before updating base_hop_latency
+        let depth = crossing_depth(_source, _dest);
+        let multiplier = if (depth as usize) < self.level_multipliers.len() {
+            self.level_multipliers[depth as usize]
+        } else {
+            *self.level_multipliers.last().unwrap_or(&1.0)
+        };
+        if multiplier == 0.0 {
+            return;
+        }
+
+        // Compute implied per-hop base latency: RTT / 2 / hops / multiplier
+        let per_hop =
+            (measured_rtt_nanos as f64 / (2.0 * hop_count as f64 * multiplier as f64)) as u64;
         let alpha = if self.sample_count < 10 { 0.5 } else { 0.1 };
 
         self.base_hop_latency_nanos =

@@ -142,10 +142,19 @@ pub fn fork_entity(
 }
 
 impl ForkRecord {
-    /// Verify that this fork record has a valid sentinel.
-    pub fn verify_sentinel(&self) -> bool {
+    /// Verify that this fork record is structurally valid.
+    ///
+    /// Checks:
+    /// - Sentinel parent_hash matches the deterministic fork hash
+    /// - Fork genesis origin matches forked_origin
+    /// - Fork genesis sequence is 0 (genesis)
+    /// - Original and forked origins differ
+    pub fn verify(&self) -> bool {
         let expected = fork_sentinel(self.original_origin, self.fork_seq);
         self.fork_genesis.parent_hash == expected
+            && self.fork_genesis.origin_hash == self.forked_origin
+            && self.fork_genesis.sequence == 0
+            && self.original_origin != self.forked_origin
     }
 
     /// Wire size: 4 + 4 + 8 + 24 + 1 + 8 = 49 bytes max.
@@ -227,7 +236,7 @@ mod tests {
         assert_eq!(record.forked_origin, keypair.origin_hash());
         assert_eq!(record.fork_seq, 100);
         assert_eq!(record.from_snapshot_seq, Some(90));
-        assert!(record.verify_sentinel());
+        assert!(record.verify());
 
         // Builder should be ready to produce events
         assert_eq!(builder.origin_hash(), keypair.origin_hash());
@@ -246,7 +255,7 @@ mod tests {
         assert_eq!(parsed.fork_seq, record.fork_seq);
         assert_eq!(parsed.fork_genesis, record.fork_genesis);
         assert_eq!(parsed.from_snapshot_seq, None);
-        assert!(parsed.verify_sentinel());
+        assert!(parsed.verify());
     }
 
     #[test]
@@ -262,6 +271,6 @@ mod tests {
     fn test_tampered_sentinel_fails_verification() {
         let (_, mut record, _) = fork_entity(0xAAAA, 100, None);
         record.fork_genesis.parent_hash = 0xBADBADBAD;
-        assert!(!record.verify_sentinel());
+        assert!(!record.verify());
     }
 }

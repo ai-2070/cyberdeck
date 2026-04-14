@@ -252,7 +252,7 @@ mod tests {
         assert!(fleet_a.is_sibling(fleet_b));
         assert!(!fleet_a.is_sibling(fleet_c)); // different region
         assert!(!fleet_a.is_sibling(fleet_a)); // self is not sibling
-        assert!(!fleet_a.is_sibling(region));  // different depth
+        assert!(!fleet_a.is_sibling(region)); // different depth
     }
 
     #[test]

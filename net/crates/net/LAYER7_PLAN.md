@@ -45,7 +45,7 @@ pub enum ContinuityStatus {
     Migrated { migration_seq: u64, source_node: u64, target_node: u64 },
 }
 
-/// Compact proof of continuity (40 bytes), transmittable.
+/// Compact proof of continuity (36 bytes), transmittable.
 pub struct ContinuityProof {
     pub origin_hash: u32,
     pub from_seq: u64,

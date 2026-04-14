@@ -139,11 +139,7 @@ pub fn negotiate(local: &SubprotocolManifest, remote: &SubprotocolManifest) -> N
             {
                 compatible.insert(local_entry.id);
             } else {
-                incompatible.push((
-                    local_entry.id,
-                    local_entry.version,
-                    remote_entry.version,
-                ));
+                incompatible.push((local_entry.id, local_entry.version, remote_entry.version));
             }
         }
         // If remote doesn't have it, skip — not an error, just not negotiated
@@ -221,9 +217,7 @@ mod tests {
 
     #[test]
     fn test_negotiate_empty() {
-        let local = SubprotocolManifest {
-            entries: vec![],
-        };
+        let local = SubprotocolManifest { entries: vec![] };
         let remote = SubprotocolManifest {
             entries: vec![entry(0x0400, 1, 0)],
         };
@@ -278,10 +272,7 @@ mod tests {
             ],
         };
         let remote = SubprotocolManifest {
-            entries: vec![
-                entry(0x0400, 1, 0),
-                entry(0x2000, 1, 0),
-            ],
+            entries: vec![entry(0x0400, 1, 0), entry(0x2000, 1, 0)],
         };
 
         let result = negotiate(&local, &remote);
