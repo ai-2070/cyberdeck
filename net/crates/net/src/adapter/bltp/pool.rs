@@ -573,7 +573,6 @@ impl ThreadLocalPool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::protocol::{HEADER_SIZE, TAG_SIZE};
     use super::*;
 
     #[test]
