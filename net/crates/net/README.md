@@ -2,6 +2,8 @@
 
 High-performance encrypted mesh runtime.
 
+For the design philosophy, architecture rationale, and benchmarks, see the [project README](../../README.md).
+
 ## Key Concepts
 
 **Identity is cryptographic.** Every node has an ed25519 keypair. The public key IS the identity. `origin_hash` (truncated BLAKE2s) is stamped on every outgoing packet. Permission tokens are ed25519-signed, delegatable, and expirable.
