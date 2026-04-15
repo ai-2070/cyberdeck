@@ -225,6 +225,8 @@ The capability announcement system is what makes this work. A $5 sensor node adv
 
 This means you can scale a deployment by adding cheap nodes for coverage and a few expensive nodes for compute. The ratio adjusts dynamically - add more sensors and the compute nodes absorb the load. Add more compute and the sensors' data gets processed faster. Neither side needs to be reconfigured. The mesh adapts.
 
+Compare this to platforms like Nvidia Omniverse, which require DGX systems, certified OVX servers, NVLink interconnects, and dedicated networking. The hardware alone for a factory-scale deployment is millions before software licensing. Net requires anything that can read UDP and is already on the factory floor.
+
 ## Applications
 
 **AI runtime.** The original use case. Token streams, tool-call results, guardrail decisions, and consensus votes flowing across heterogeneous GPU nodes. Compute-heavy inference routes to whichever node has capacity. The mesh is the runtime - no orchestrator dispatching work, no queue broker mediating between models.
