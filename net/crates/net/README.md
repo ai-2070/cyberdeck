@@ -26,6 +26,18 @@ High-performance encrypted mesh runtime.
 
 **Event consumption is location-transparent.** A `MeshDaemon` receives events through the same `process(&CausalEvent)` interface regardless of whether the event originated locally, one hop away, or across the mesh. The mesh handles routing, decryption, and chain validation before the daemon sees the event. Code written for a single-node prototype runs unmodified on a multi-hop deployment. The topology is a runtime decision, not a code change.
 
+**Capability announcements drive routing.** Every node advertises what it can do — hardware (GPU model, VRAM, CPU cores), software (loaded models, tools, supported subprotocols), and capacity (available slots, current load). The `CapabilityIndex` indexes these announcements for sub-microsecond queries. Routing decisions use capability tags: a request for inference routes to the nearest node with a matching GPU, not to a fixed endpoint. `CapabilityDiff` propagates incremental updates — a node that loads a new model announces only the delta.
+
+**The proximity graph is the topology.** Each node maintains a `ProximityGraph` of its neighborhood built from direct observation and `EnhancedPingwave` broadcasts. Edges carry measured latency. The graph answers "who is nearby and how fast can I reach them?" without a global directory. Combined with capability announcements, it answers "who nearby can do what I need?" Routing follows the graph — traffic flows toward nodes that are close and capable.
+
+**Subnets partition the mesh hierarchically.** A `SubnetId` encodes 4 levels (region/fleet/vehicle/subsystem) in 4 bytes. Subnets constrain observation — a node observes its peers at its level and derives the rest through gateways. `SubnetGateway` nodes aggregate health, compress capability summaries, and enforce channel visibility at boundaries. `SubnetPolicy` assigns nodes to subnets from capability labels. This keeps observation cost bounded as the mesh grows.
+
+**Channels are the pub/sub layer.** `ChannelName` uses hierarchical hashing (`sensors/lidar/front`) with wildcard support. `ChannelConfig` sets per-channel policies: visibility (public, subnet-local, private), required capabilities, and retention. `AuthGuard` enforces access control at the channel boundary using a bloom filter — <10ns per-packet authorization checks. Channels are how applications structure communication without coupling to node identity.
+
+**Daemons are the compute unit.** The `MeshDaemon` trait defines a stateful event processor: receive a `CausalEvent`, produce output, maintain a causal chain. `DaemonHost` manages the lifecycle — initialization, event dispatch, chain production, horizon tracking, snapshot packaging. `DaemonRegistry` maps daemon types to constructors. The `PlacementScheduler` decides where to run daemons based on capability requirements. When a node fails, the migration state machine moves the daemon's state (snapshot + chain) to a new host in 6 phases, preserving continuity.
+
+**Safety envelopes enforce autonomy.** Every node runs a `SafetyEnforcer` that defines resource limits, rate caps, and kill-switch conditions via `ResourceEnvelope`. A `RuleEngine` evaluates device autonomy policies — declarative rules that determine what a node will accept, reject, or redirect. No external authority can override a node's safety envelope. The mesh routes around nodes that refuse work, it doesn't force them.
+
 ## Stack
 
 | Layer | What it does | Docs |
