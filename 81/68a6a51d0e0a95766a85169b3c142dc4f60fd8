@@ -1,0 +1,43 @@
+net/crates/net/docs/CHANNELS.md
+  75b8fbe288685b96 1-103
+net/crates/net/docs/CONTINUITY.md
+  75b8fbe288685b96 1-159
+net/crates/net/docs/STATE.md
+  75b8fbe288685b96 1-126
+net/crates/net/docs/TRANSPORT.md
+  75b8fbe288685b96 1-206
+net/crates/net/docs/COMPUTE.md
+  75b8fbe288685b96 1-99
+net/crates/net/docs/IDENTITY.md
+  75b8fbe288685b96 1-110
+net/crates/net/docs/BEHAVIOR.md
+  75b8fbe288685b96 1-223
+net/crates/net/docs/SUBPROTOCOLS.md
+  75b8fbe288685b96 1-87
+net/crates/net/README.md
+  75b8fbe288685b96 27-38
+net/crates/net/docs/SUBNETS.md
+  75b8fbe288685b96 1-104
+net/crates/net/docs/CONTESTED.md
+  75b8fbe288685b96 1-140
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "8168a6a51d0e0a95766a85169b3c142dc4f60fd8",
+  "prompts": {
+    "75b8fbe288685b96": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b75d121a-3dc9-4fa0-82a8-528ef83df651",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1369,
+      "total_deletions": 12,
+      "accepted_lines": 1376,
+      "overriden_lines": 0
+    }
+  }
+}
