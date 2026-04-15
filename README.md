@@ -23,6 +23,7 @@ Net is a latency-first encrypted mesh network. Every computer, device, and appli
 - [Cost of devices](#cost-of-devices)
 - [Applications](#applications)
 - [Infrastructure value](#infrastructure-value)
+- [The industrial latency gap](#the-industrial-latency-gap)
 - [Why not cloud](#why-not-cloud)
 - [Security](#security)
 - [The Blackwall](#the-blackwall)
