@@ -21,6 +21,7 @@ Net is a latency-first encrypted mesh network. Every computer, device, and appli
 - [Device autonomy](#device-autonomy)
 - [Processing without storage](#processing-without-storage)
 - [Non-localized event bus](#non-localized-event-bus)
+- [Infinite extensibility via subprotocols](#infinite-extensibility-via-subprotocols)
 - [Cost of devices](#cost-of-devices)
 - [Applications](#applications)
 - [Infrastructure value](#infrastructure-value)
