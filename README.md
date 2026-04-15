@@ -17,6 +17,7 @@ Net is a latency-first encrypted mesh network. Every computer, device, and appli
 - [Topology](#topology)
 - [Consistency](#consistency)
 - [State, not connections](#state-not-connections)
+- [Non-localized event bus](#non-localized-event-bus)
 - [Invariants](#invariants)
 - [Device autonomy](#device-autonomy)
 - [Processing without storage](#processing-without-storage)
@@ -148,6 +149,22 @@ The only authority the mesh respects is physics. Propagation speed, causal order
 Traditional networking treats the connection as the primary object. You establish a socket, maintain it, tear it down. If the connection breaks, the relationship breaks.
 
 Net propagates state. Connections are ephemeral transport - the current shortest path between where state is and where it needs to be. When a path breaks, state doesn't wait for recovery. It moves. The routing table updates, the proximity graph adjusts, the state continues on a different path. No reconnection, no session resumption, no handshake retry. Identity lives in the state chain, not in the socket.
+
+## Non-localized event bus
+
+Every prior event bus has a location. LMAX Disruptor is a single-process ring buffer. Kafka is a cluster of brokers at fixed addresses. Pulsar separates compute from storage but retains the broker model. In all cases, the bus is something you connect *to* - it has a process, a machine, a data center. Producers and consumers know where it is.
+
+Net's event bus has no location. The sharded ring buffers on each node are local speed buffers, but the logical event bus spans the mesh. A producer on node A and a consumer on node C interact through the same abstraction regardless of whether they're on the same machine, the same subnet, or separated by five relay hops. The mesh handles routing, encryption, forwarding, and failure recovery transparently. The bus isn't *at* a location - it *is* the mesh.
+
+Three consequences:
+
+**No broker.** There is nothing to provision, scale, or fail over. The bus exists wherever participating nodes exist. Adding a node adds capacity. Removing a node triggers rerouting, not an outage.
+
+**No plaintext at rest.** Broker-based systems hold plaintext at the broker - the broker must read messages to route them. Net's relay nodes forward encrypted bytes they cannot read. The event bus is encrypted end-to-end even though no single node is the "bus."
+
+**No partition-leader bottleneck.** Kafka orders events per partition, creating a single-leader bottleneck per partition. Net orders events per entity via causal chains. There is no partition leader. Every entity maintains its own chain independently. Ordering scales with the number of entities, not with the number of partitions a broker can handle.
+
+This is what makes "processing without storage" possible. The data isn't stored at the bus. The data is in transit through the mesh. Any node with matching capabilities can process it. If that node dies, another picks it up. Storage is a choice made by individual nodes via persistence adapters (Redis, JetStream), not an architectural requirement of the bus itself.
 
 ## Invariants
 
