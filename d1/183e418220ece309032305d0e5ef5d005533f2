@@ -1,0 +1,35 @@
+net/crates/net/Cargo.toml
+  16f62563c20d300d 4
+net/crates/net/sdk/src/net.rs
+  16f62563c20d300d 1-252
+net/crates/net/sdk/src/lib.rs
+  16f62563c20d300d 1-72
+net/crates/net/sdk/src/stream.rs
+  16f62563c20d300d 1-191
+net/crates/net/sdk/src/error.rs
+  16f62563c20d300d 1-47
+net/crates/net/sdk/Cargo.toml
+  16f62563c20d300d 1-23
+net/crates/net/sdk/src/config.rs
+  16f62563c20d300d 1-132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "d1183e418220ece309032305d0e5ef5d005533f2",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 947,
+      "total_deletions": 918,
+      "accepted_lines": 854,
+      "overriden_lines": 0
+    }
+  }
+}
