@@ -172,7 +172,7 @@ Benchmarked on Apple M1 Max, macOS.
 
 Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns.
 
-605 tests. 831 KB deployed binary.
+605 tests. ~860 KB deployed binary.
 
 ## Capabilities
 
