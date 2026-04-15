@@ -4,6 +4,29 @@ High-performance encrypted mesh runtime.
 
 For the design philosophy, architecture rationale, and benchmarks, see the [project README](../../README.md).
 
+## Contents
+
+- [Key Concepts](#key-concepts)
+- [Stack](#stack)
+- [Architecture](#architecture)
+- [Net Header](#net-header-64-bytes-cache-line-aligned)
+- [Performance](#performance)
+- [Capabilities](#capabilities)
+- [Proximity & Discovery](#proximity--discovery)
+- [Subnets](#subnets)
+- [Channels](#channels)
+- [Daemons](#daemons)
+- [Safety & Autonomy](#safety--autonomy)
+- [Module Map](#module-map)
+- [Adapters](#adapters)
+- [SDKs](#sdks)
+- [Features](#features)
+- [Building](#building)
+- [Tests](#tests)
+- [Benchmarks](#benchmarks)
+- [Subprotocol ID Space](#subprotocol-id-space)
+- [License](#license)
+
 ## Key Concepts
 
 **Identity is cryptographic.** Every node has an ed25519 keypair. The public key IS the identity. `origin_hash` (truncated BLAKE2s) is stamped on every outgoing packet. Permission tokens are ed25519-signed, delegatable, and expirable.
