@@ -149,6 +149,134 @@ Thread-local packet pools scale to **23x contention advantage** over shared pool
 
 605 tests. 831 KB deployed binary.
 
+## Capabilities
+
+Every node advertises what it can do. `HardwareCapabilities` describes the machine — GPU model, VRAM, CPU cores, available memory. The `CapabilityIndex` indexes all known nodes' capabilities for sub-microsecond queries.
+
+```
+Node A announces:
+  gpu: RTX 4090, vram: 24GB
+  models: [gemma-21b, llama-7b]
+  tags: [inference, cuda]
+  capacity: 8 slots available
+
+Node B queries:
+  CapabilityIndex::query(require_gpu(24GB) & tag("inference"))
+  → returns [Node A] in ~10ns
+```
+
+Capabilities are not static. When a node loads a new model, drops a tool, or runs out of capacity, it publishes a `CapabilityDiff` — an incremental update, not a full re-announcement. The `DiffEngine` computes minimal diffs. Neighbors propagate diffs through the proximity graph, so the mesh converges without flooding.
+
+Routing follows capabilities. A request tagged `subprotocol:0x1000` routes to the nearest node that advertises support for that subprotocol. An inference request routes to the nearest node with enough VRAM. The mesh doesn't have fixed endpoints — it has a capability graph, and traffic flows toward capability.
+
+The `CapabilityAd` struct is what travels on the wire: compact, versioned, and signed with the node's identity. A node that claims capabilities it doesn't have will be routed around when its behavior diverges from its advertisement — the proximity graph measures actual latency, not claimed latency.
+
+## Proximity & Discovery
+
+Nodes find each other through `Pingwave` — periodic broadcasts that propagate outward within a configurable hop radius. A pingwave carries the node's identity, capabilities summary, and a timestamp. If you can hear a node's pingwave, you know it exists, how far away it is, and what it can do.
+
+The `ProximityGraph` is built from direct observation. Each node maintains a local view of its neighborhood — not a global directory. Edges carry measured RTT latency. The graph is continuously updated from pingwave observations and direct communication.
+
+```
+ProximityGraph for Node A:
+  Node B — 0.3ms (direct neighbor)
+  Node C — 0.7ms (via B)
+  Node D — 1.2ms (via B → C)
+  Gateway G — 2.1ms (subnet boundary)
+```
+
+`EnhancedPingwave` extends the basic pingwave with capability summaries and load indicators, so routing decisions can be made from the proximity graph alone without querying the full `CapabilityIndex`.
+
+Discovery is emergent. There are no bootstrap servers, no DNS, no service registry. After first contact (manual address, LAN broadcast, QR code, cached peers), pingwaves propagate and the proximity graph builds itself. Nodes that go silent are pruned. Nodes that appear are integrated. The graph is always a reflection of current reality.
+
+## Subnets
+
+The mesh is logically flat but scales via hierarchical partitioning. A `SubnetId` packs 4 levels into 4 bytes:
+
+```
+SubnetId: [region: u8] [fleet: u8] [vehicle: u8] [subsystem: u8]
+
+Example: 10.3.7.2
+  region=10 (EU-West)
+  fleet=3   (Factory Floor A)
+  vehicle=7 (Robot Arm #7)
+  subsystem=2 (Gripper Controller)
+```
+
+`SubnetGateway` nodes sit at subnet boundaries. They aggregate health from their subnet, compress capability summaries for external consumption, and enforce channel visibility — a channel marked `subnet-local` doesn't leak through the gateway. Gateways are protocol-equal nodes that happen to be reachable from both sides of a boundary.
+
+`SubnetPolicy` assigns nodes to subnets automatically from capability labels. A node tagged `fleet:factory-a` and `role:robot-arm` gets assigned to the matching subnet without manual configuration.
+
+Subnets bound observation cost. A node observes its peers at its level. For everything beyond, it observes the gateway and derives the rest. A node doesn't need heartbeats from 10,000 peers — it needs heartbeats from its neighbors and health summaries from gateways. Observation scales with the depth of the hierarchy, not the size of the mesh.
+
+## Channels
+
+Channels are how applications structure communication. `ChannelName` uses hierarchical hashing with path components:
+
+```
+sensors/lidar/front     → ChannelId(0xa3f1)
+sensors/lidar/rear      → ChannelId(0xb7c2)
+sensors/*               → wildcard match on prefix
+alerts/temperature      → ChannelId(0x1e09)
+```
+
+`ChannelConfig` defines per-channel policy:
+- **Visibility**: public (mesh-wide), subnet-local (stays within subnet), private (explicit peer list)
+- **Required capabilities**: only nodes with matching capabilities can subscribe
+- **Retention**: how long events persist in adapters
+
+`AuthGuard` enforces authorization at the channel boundary. It combines capability filters with permission tokens. A node needs both the right capabilities (hardware, tags) and a valid token (ed25519-signed, delegatable, expirable) to access a channel. Authorization results are cached in a bloom filter — <10ns per-packet checks.
+
+Channels decouple applications from node identity. A producer emits to `sensors/temperature`. A consumer subscribes to `sensors/temperature`. Neither knows or cares which node the other is. The mesh connects them through the channel, the proximity graph finds the shortest path, and the auth guard ensures both sides are authorized.
+
+## Daemons
+
+A `MeshDaemon` is a stateful event processor — the compute unit of the mesh.
+
+```rust
+trait MeshDaemon: Send + Sync {
+    fn process(&mut self, event: &CausalEvent) -> DaemonOutput;
+    fn snapshot(&self) -> StateSnapshot;
+    fn restore(&mut self, snapshot: StateSnapshot);
+}
+```
+
+`DaemonHost` manages the runtime lifecycle: initialization, event dispatch, causal chain production, horizon tracking, and snapshot packaging. Every event a daemon produces is automatically linked into a causal chain with a 24-byte `CausalLink` (origin, sequence, parent hash, compressed horizon).
+
+`DaemonRegistry` maps daemon types to constructors. The `PlacementScheduler` decides where to run each daemon based on capability requirements — a daemon that needs a GPU is placed on a GPU node. If the best candidate is already loaded, the scheduler considers the next-best via the proximity graph.
+
+When a node fails, migration preserves continuity in 6 phases:
+
+1. **Detect** — failure detector marks node as dead
+2. **Select** — scheduler picks a new host from capability-matching candidates
+3. **Transfer** — last snapshot + chain tail sent to new host
+4. **Restore** — new host rebuilds daemon state from snapshot
+5. **Verify** — continuity proof validates chain integrity
+6. **Cutover** — routing table updates, new host takes over the stream
+
+The daemon's causal chain continues unbroken on the new host. During migration, a `SuperpositionState` tracks which phase the daemon is in — it exists on both nodes briefly, then collapses to the new host.
+
+## Safety & Autonomy
+
+Every node enforces its own rules. The `SafetyEnforcer` evaluates a `ResourceEnvelope` that defines:
+
+- **Rate limits**: max events/sec ingested, max events/sec forwarded
+- **Memory limits**: max ring buffer usage, max snapshot size
+- **Compute limits**: max concurrent daemons, max CPU time per event
+- **Kill switch**: conditions under which the node drops all traffic and goes silent
+
+The `RuleEngine` evaluates declarative `RuleSet` policies:
+
+```
+Rule: if load > 90% then reject(priority < 5)
+Rule: if peer.subnet != self.subnet then require(token.scope = "cross-subnet")
+Rule: if event.size > 64KB then drop
+```
+
+Rules are local decisions, not network policy. No external authority can override a node's safety envelope. A node that refuses work is routed around — the proximity graph reflects this within a heartbeat interval. The mesh adapts to the node's boundaries rather than forcing the node to adapt to the mesh.
+
+This is device autonomy in practice. A $5 sensor node sets tight limits — low rate, small buffer, no daemons. A $1500 GPU node sets generous limits — high rate, large buffer, many daemons. Both are equal participants on the mesh. The protocol treats them identically. Their capabilities and autonomy rules determine what they actually do.
+
 ## Module Map
 
 ```
