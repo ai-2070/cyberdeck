@@ -5,8 +5,8 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-/// Magic bytes: "BL" (0x424C)
-pub const MAGIC: u16 = 0x424C;
+/// Magic bytes: "NE" (0x4E45)
+pub const MAGIC: u16 = 0x4E45;
 
 /// Current protocol version
 pub const VERSION: u8 = 1;
@@ -109,7 +109,7 @@ impl PacketFlags {
 ///  0                   1                   2                   3
 ///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |         MAGIC (0x424C)        |     VER       |     FLAGS     |  4
+/// |         MAGIC (0x4E45)        |     VER       |     FLAGS     |  4
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// |   PRIORITY    |    HOP_TTL    |   HOP_COUNT   |  FRAG_FLAGS   |  8
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -138,7 +138,7 @@ impl PacketFlags {
 #[repr(C, align(64))]
 pub struct NetHeader {
     // — routing fast-path (0-11) —
-    /// Magic: "BL" (0x424C)
+    /// Magic: "NE" (0x4E45)
     pub magic: u16,
     /// Protocol version (1)
     pub version: u8,

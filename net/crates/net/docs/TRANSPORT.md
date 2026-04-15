@@ -10,7 +10,7 @@ Every Net packet starts with a 64-byte header aligned to a single CPU cache line
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|         MAGIC (0x424C)        |     VER       |     FLAGS     |
+|         MAGIC (0x4E45)        |     VER       |     FLAGS     |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |   PRIORITY    |    HOP_TTL    |   HOP_COUNT   |  FRAG_FLAGS   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -33,7 +33,7 @@ Every Net packet starts with a 64-byte header aligned to a single CPU cache line
 ```
 
 **Constants:**
-- Magic: `0x424C` (ASCII "BL")
+- Magic: `0x4E45` (ASCII "NE")
 - Version: 1
 - Max packet: 8,192 bytes
 - Max payload: 8,096 bytes (packet - header - Poly1305 tag)

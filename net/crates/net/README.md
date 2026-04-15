@@ -84,7 +84,7 @@ Every field is used by at least one layer. Forwarding nodes read one cache line,
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|         MAGIC (0x424C)        |     VER       |     FLAGS     |
+|         MAGIC (0x4E45)        |     VER       |     FLAGS     |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |   PRIORITY    |    HOP_TTL    |   HOP_COUNT   |  FRAG_FLAGS   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
