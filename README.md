@@ -221,7 +221,7 @@ The entire transport library - Noise protocol, ChaCha20-Poly1305 encryption, rou
 
 This inverts the economics of edge deployment. Today, every device that needs intelligence must contain intelligence - or pay for a round trip to a cloud that does. That means expensive hardware at the edge, or latency to a data center, or both. Net eliminates this choice. Devices can be cheap, dumb, and deterministic. They do one thing well - sense, actuate, relay - and the mesh provides the intelligence dynamically.
 
-The capability announcement system is what makes this work. A $5 sensor node advertises that it produces temperature data. A $500 GPU node three hops away advertises that it runs inference models. The mesh connects them automatically. The sensor node didn't need to know the GPU node exists. The GPU node didn't need to be configured to accept sensor data. The capability graph brought them together.
+The capability announcement system is what makes this work. A $5 sensor node advertises that it produces temperature data. A $1500 GPU node three hops away advertises that it runs inference models. The mesh connects them automatically. The sensor node didn't need to know the GPU node exists. The GPU node didn't need to be configured to accept sensor data. The capability graph brought them together.
 
 This means you can scale a deployment by adding cheap nodes for coverage and a few expensive nodes for compute. The ratio adjusts dynamically - add more sensors and the compute nodes absorb the load. Add more compute and the sensors' data gets processed faster. Neither side needs to be reconfigured. The mesh adapts.
 
