@@ -329,7 +329,7 @@ Any single mechanism can be overwhelmed. All of them together form the wall. An 
 
 ## SDKs
 
-All SDKs wrap the same Rust core. Every language gets the same performance — the SDK is the developer experience, the engine is Rust.
+All SDKs wrap the same Rust core. The SDK is the developer experience, the engine is Rust.
 
 | SDK | Package | Docs |
 |-----|---------|------|

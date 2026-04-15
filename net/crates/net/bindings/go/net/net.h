@@ -1,12 +1,12 @@
 /*
  * Net C API Header
- * 
+ *
  * High-performance event bus for AI runtime workloads.
  * This header provides C-compatible bindings for use with CGO.
  */
 
-#ifndef NET_H
-#define NET_H
+#ifndef NET_SDK_H
+#define NET_SDK_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -34,10 +34,10 @@ typedef enum {
 
 /*
  * Initialize a new event bus with optional JSON configuration.
- * 
+ *
  * @param config_json JSON configuration string (UTF-8, null-terminated), or NULL for defaults.
  * @return Handle to the event bus, or NULL on failure.
- * 
+ *
  * Example config:
  * {
  *   "num_shards": 8,
@@ -49,7 +49,7 @@ net_handle_t net_init(const char* config_json);
 
 /*
  * Ingest a single event (parses JSON).
- * 
+ *
  * @param handle Event bus handle.
  * @param event_json JSON event string.
  * @param len Length of the event string.
@@ -59,7 +59,7 @@ int net_ingest(net_handle_t handle, const char* event_json, size_t len);
 
 /*
  * Ingest a raw JSON string (fastest path, no parsing).
- * 
+ *
  * @param handle Event bus handle.
  * @param json JSON string.
  * @param len Length of the JSON string.
@@ -69,7 +69,7 @@ int net_ingest_raw(net_handle_t handle, const char* json, size_t len);
 
 /*
  * Ingest multiple raw JSON strings in a batch.
- * 
+ *
  * @param handle Event bus handle.
  * @param jsons Array of pointers to JSON strings.
  * @param lens Array of lengths for each JSON string.
@@ -85,7 +85,7 @@ int net_ingest_raw_batch(
 
 /*
  * Ingest multiple events from a JSON array.
- * 
+ *
  * @param handle Event bus handle.
  * @param events_json JSON array of events.
  * @return Number of ingested events, or negative error code.
@@ -94,7 +94,7 @@ int net_ingest_batch(net_handle_t handle, const char* events_json);
 
 /*
  * Poll events from the bus.
- * 
+ *
  * @param handle Event bus handle.
  * @param request_json JSON request (e.g., {"limit": 100}).
  * @param out_buffer Output buffer for JSON response.
@@ -110,7 +110,7 @@ int net_poll(
 
 /*
  * Get event bus statistics.
- * 
+ *
  * @param handle Event bus handle.
  * @param out_buffer Output buffer for JSON statistics.
  * @param buffer_len Size of output buffer.
@@ -120,7 +120,7 @@ int net_stats(net_handle_t handle, char* out_buffer, size_t buffer_len);
 
 /*
  * Flush pending batches to the adapter.
- * 
+ *
  * @param handle Event bus handle.
  * @return 0 on success, negative error code on failure.
  */
@@ -128,7 +128,7 @@ int net_flush(net_handle_t handle);
 
 /*
  * Get the number of shards.
- * 
+ *
  * @param handle Event bus handle.
  * @return Number of shards, or 0 if handle is null.
  */
@@ -136,7 +136,7 @@ uint16_t net_num_shards(net_handle_t handle);
 
 /*
  * Shut down the event bus and free resources.
- * 
+ *
  * @param handle Event bus handle (invalid after this call).
  * @return 0 on success, negative error code on failure.
  */
@@ -144,14 +144,14 @@ int net_shutdown(net_handle_t handle);
 
 /*
  * Get the library version.
- * 
+ *
  * @return Version string (static, do not free).
  */
 const char* net_version(void);
 
 /*
  * Generate a new Net keypair (requires Net feature).
- * 
+ *
  * @return JSON string with hex-encoded public_key and secret_key,
  *         or NULL if Net is not enabled. Caller must free with net_free_string.
  */
@@ -159,7 +159,7 @@ char* net_generate_keypair(void);
 
 /*
  * Free a string returned by Net functions.
- * 
+ *
  * @param s String to free (may be NULL).
  */
 void net_free_string(char* s);
@@ -168,4 +168,4 @@ void net_free_string(char* s);
 }
 #endif
 
-#endif /* NET_H */
+#endif /* NET_SDK_H */

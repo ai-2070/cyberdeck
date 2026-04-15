@@ -68,14 +68,15 @@ class EventStream:
             )
 
             if len(response) > 0:
-                backoff = self._opts.poll_interval
+                backoff = max(0.0, self._opts.poll_interval)
                 self._cursor = response.next_id
 
                 for event in response:
                     yield event
             else:
+                backoff = max(0.0, backoff)
                 time.sleep(backoff)
-                backoff = min(backoff * 2, self._opts.max_backoff)
+                backoff = min(backoff * 2, max(0.0, self._opts.max_backoff))
 
 
 class TypedEventStream(Generic[T]):

@@ -156,13 +156,19 @@ The C SDK does not manage threads. Use `net_poll_ex` in your own loop:
 char* cursor = NULL;
 while (running) {
     net_poll_result_t result;
-    net_poll_ex(node, 100, cursor, &result);
+    int rc = net_poll_ex(node, 100, cursor, &result);
+    if (rc < 0) break;
+
     for (size_t i = 0; i < result.count; i++) {
         process(&result.events[i]);
     }
-    cursor = result.next_id;  // pass to next poll
+
+    // Copy cursor before freeing the result.
+    free(cursor);
+    cursor = result.next_id ? strdup(result.next_id) : NULL;
     net_free_poll_result(&result);
 }
+free(cursor);
 ```
 
 ## License

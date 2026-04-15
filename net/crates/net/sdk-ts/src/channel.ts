@@ -48,8 +48,8 @@ export class TypedChannel<T> {
    */
   publish(event: T): boolean {
     const payload = JSON.stringify({
-      _channel: this.channelName,
       ...event as object,
+      _channel: this.channelName,
     });
     return this.bus.ingestFire(payload);
   }
@@ -61,8 +61,8 @@ export class TypedChannel<T> {
   publishBatch(events: T[]): number {
     const payloads = events.map((event) =>
       JSON.stringify({
-        _channel: this.channelName,
         ...event as object,
+        _channel: this.channelName,
       })
     );
     return this.bus.ingestBatchFire(payloads);
