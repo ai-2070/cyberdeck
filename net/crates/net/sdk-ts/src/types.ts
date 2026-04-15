@@ -12,7 +12,7 @@ import type {
   Stats as NapiStats,
   RedisOptions,
   JetStreamOptions,
-} from '@ai-2070/net';
+} from '@ai2070/net';
 
 // Re-export NAPI types that users may need.
 export type {

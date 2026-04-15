@@ -416,7 +416,7 @@ All SDKs wrap the same Rust core. Every language gets the same performance.
 | SDK | Package | Docs | Highlights |
 |-----|---------|------|------------|
 | **Rust** | [`net-sdk`](sdk/) | [README](sdk/README.md) | Builder pattern, async streams, typed subscriptions |
-| **TypeScript** | [`@ai-2070/net-sdk`](sdk-ts/) | [README](sdk-ts/README.md) | AsyncIterator, typed channels, Zod support |
+| **TypeScript** | [`@ai2070/net-sdk`](sdk-ts/) | [README](sdk-ts/README.md) | AsyncIterator, typed channels, Zod support |
 | **Python** | [`net-sdk`](sdk-py/) | [README](sdk-py/README.md) | Generators, dataclass/Pydantic, context manager |
 | **Go** | [`net`](bindings/go/) | [README](bindings/go/README.md) | CGO bindings, zero allocations on raw ingest |
 | **C** | [`net.h`](include/net.h) | [README](include/README.md) | One header, structured types, zero JSON overhead |
@@ -449,7 +449,7 @@ node.shutdown().await?;
 ### TypeScript
 
 ```typescript
-import { NetNode } from '@ai-2070/net-sdk';
+import { NetNode } from '@ai2070/net-sdk';
 
 const node = await NetNode.create({ shards: 4 });
 

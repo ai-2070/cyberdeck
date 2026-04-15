@@ -2,18 +2,18 @@
 
 Ergonomic TypeScript SDK for the Net mesh network.
 
-Wraps the `@ai-2070/net` NAPI bindings with streaming, typed channels, and a developer-friendly API.
+Wraps the `@ai2070/net` NAPI bindings with streaming, typed channels, and a developer-friendly API.
 
 ## Install
 
 ```bash
-npm install @ai-2070/net-sdk @ai-2070/net
+npm install @ai2070/net-sdk @ai2070/net
 ```
 
 ## Quick Start
 
 ```typescript
-import { NetNode } from '@ai-2070/net-sdk';
+import { NetNode } from '@ai2070/net-sdk';
 
 const node = await NetNode.create({ shards: 4 });
 

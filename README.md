@@ -337,7 +337,7 @@ All SDKs wrap the same Rust core. The SDK is the developer experience, the engin
 | SDK | Package | Docs |
 |-----|---------|------|
 | **Rust** | [`net-sdk`](net/crates/net/sdk) | [README](net/crates/net/sdk/README.md) |
-| **TypeScript** | [`@ai-2070/net-sdk`](net/crates/net/sdk-ts) | [README](net/crates/net/sdk-ts/README.md) |
+| **TypeScript** | [`@ai2070/net-sdk`](net/crates/net/sdk-ts) | [README](net/crates/net/sdk-ts/README.md) |
 | **Python** | [`net-sdk`](net/crates/net/sdk-py) | [README](net/crates/net/sdk-py/README.md) |
 | **C** | [`net.h`](net/crates/net/include/net.h) | [README](net/crates/net/include/README.md) |
 | **Go** | [`net`](net/crates/net/bindings/go) | [README](net/crates/net/bindings/go/README.md) |

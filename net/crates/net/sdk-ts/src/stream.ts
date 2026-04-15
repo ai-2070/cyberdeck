@@ -2,7 +2,7 @@
  * Async streaming event consumption.
  */
 
-import type { Net as NapiNet } from '@ai-2070/net';
+import type { Net as NapiNet } from '@ai2070/net';
 import type { StoredEvent, SubscribeOpts } from './types';
 
 const DEFAULT_POLL_INTERVAL = 1;

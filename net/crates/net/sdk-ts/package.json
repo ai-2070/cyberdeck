@@ -1,5 +1,5 @@
 {
-  "name": "@ai-2070/net-sdk",
+  "name": "@ai2070/net-sdk",
   "version": "0.1.0",
   "description": "Ergonomic TypeScript SDK for the Net mesh network",
   "main": "dist/index.js",
@@ -28,10 +28,10 @@
     "test:watch": "vitest"
   },
   "peerDependencies": {
-    "@ai-2070/net": ">=0.5.0"
+    "@ai2070/net": ">=0.5.0"
   },
   "devDependencies": {
-    "@ai-2070/net": "file:../bindings/node",
+    "@ai2070/net": "file:../bindings/node",
     "@types/node": "^24.0.0",
     "typescript": "5.9.3",
     "vitest": "^4.0.0"

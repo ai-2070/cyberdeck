@@ -5,7 +5,7 @@
  * There are no clients, no servers, no coordinators.
  */
 
-import { Net as NapiNet } from '@ai-2070/net';
+import { Net as NapiNet } from '@ai2070/net';
 import type {
   NetNodeConfig,
   Transport,

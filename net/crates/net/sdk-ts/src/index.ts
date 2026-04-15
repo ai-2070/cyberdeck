@@ -1,9 +1,9 @@
 /**
- * @ai-2070/net-sdk — Ergonomic TypeScript SDK for the Net mesh network.
+ * @ai2070/net-sdk — Ergonomic TypeScript SDK for the Net mesh network.
  *
  * @example
  * ```typescript
- * import { NetNode } from '@ai-2070/net-sdk';
+ * import { NetNode } from '@ai2070/net-sdk';
  *
  * const node = await NetNode.create({ shards: 4 });
  *
