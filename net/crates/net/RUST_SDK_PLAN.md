@@ -2,12 +2,12 @@
 
 Separate crate (`sdk/`) as a new workspace member. The core `net` crate is the engine. The SDK is what Rust developers actually import.
 
-## Phase 1: Core — NetClient + Builder
+## Phase 1: Core — Net + Builder
 
 ```rust
-use net_sdk::NetClient;
+use net_sdk::Net;
 
-let client = NetClient::builder()
+let client = Net::builder()
     .shards(4)
     .buffer_capacity(1 << 20)
     .backpressure(Backpressure::DropOldest)
@@ -129,7 +129,7 @@ sdk/
   Cargo.toml         # net-sdk crate, depends on net
   src/
     lib.rs           # re-exports, prelude
-    client.rs        # NetClient — the main handle
+    client.rs        # Net — the main handle
     config.rs        # NetConfig builder
     stream.rs        # EventStream, TypedEventStream<T>
     mesh.rs          # MeshHandle — mesh topology, capabilities, daemon hosting
