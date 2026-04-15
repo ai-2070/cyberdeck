@@ -22,6 +22,8 @@ High-performance encrypted mesh runtime.
 
 **Partitions heal honestly.** Correlated failure detection classifies mass failures by subnet correlation. When partitions heal, divergent entity logs are reconciled: longest chain wins, deterministic tiebreak, losing chains fork with documented lineage.
 
+**The event bus is non-localized.** Unlike broker-based systems (Kafka, Pulsar) or single-process ring buffers (LMAX Disruptor), the event bus has no fixed location. Local ring buffers are speed buffers; the logical bus spans the mesh. No broker to provision or fail over. No plaintext at relay nodes. No partition-leader bottleneck -- ordering is per-entity via causal chains, not per-partition via a single leader. Events exist in transit; storage is a choice via adapters, not an architectural requirement.
+
 ## Stack
 
 | Layer | What it does | Docs |
