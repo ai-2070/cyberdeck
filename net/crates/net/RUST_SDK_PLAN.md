@@ -7,7 +7,7 @@ Separate crate (`sdk/`) as a new workspace member. The core `net` crate is the e
 ```rust
 use net_sdk::Net;
 
-let net = Net::builder()
+let node = Net::builder()
     .shards(4)
     .buffer_capacity(1 << 20)
     .backpressure(Backpressure::DropOldest)
