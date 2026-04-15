@@ -24,7 +24,7 @@ cargo build --release
 ## Installation
 
 ```bash
-go get github.com/ai-2070/net/bindings/go/net
+go get github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net
 ```
 
 ## Usage
@@ -36,7 +36,7 @@ import (
     "fmt"
     "log"
 
-    "github.com/ai-2070/net/bindings/go/net"
+    "github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net"
 )
 
 func main() {
@@ -120,7 +120,7 @@ Net provides encrypted point-to-point UDP transport for high-performance scenari
 import (
     "crypto/rand"
     "encoding/hex"
-    "github.com/ai-2070/net/bindings/go/net"
+    "github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net"
 )
 
 // Generate keypair for responder
