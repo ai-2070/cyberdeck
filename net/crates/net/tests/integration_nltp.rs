@@ -13,9 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use net::adapter::nltp::{
-    NltpAdapterConfig, PacketFlags, ReliabilityConfig, StaticKeypair,
-};
+use net::adapter::nltp::{NltpAdapterConfig, PacketFlags, ReliabilityConfig, StaticKeypair};
 use net::adapter::Adapter;
 use net::event::{Batch, InternalEvent};
 use tokio::net::UdpSocket;
@@ -567,8 +565,8 @@ async fn test_nltp_flush() {
 // Unit tests for low-level components
 mod unit {
     use super::*;
-    use net::adapter::nltp::{NltpHeader, EventFrame, PacketPool, HEADER_SIZE, NONCE_SIZE};
     use bytes::{Bytes, BytesMut};
+    use net::adapter::nltp::{EventFrame, NltpHeader, PacketPool, HEADER_SIZE, NONCE_SIZE};
 
     #[test]
     fn test_event_frame_serialization() {

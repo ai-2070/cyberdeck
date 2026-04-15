@@ -397,11 +397,7 @@ pub extern "C" fn net_ingest(
 /// - `0` on success
 /// - Negative error code on failure
 #[unsafe(no_mangle)]
-pub extern "C" fn net_ingest_raw(
-    handle: *mut NetHandle,
-    json: *const c_char,
-    len: usize,
-) -> c_int {
+pub extern "C" fn net_ingest_raw(handle: *mut NetHandle, json: *const c_char, len: usize) -> c_int {
     if handle.is_null() || json.is_null() {
         return NetError::NullPointer.into();
     }
@@ -480,10 +476,7 @@ pub extern "C" fn net_ingest_raw_batch(
 ///
 /// Number of successfully ingested events, or negative error code.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_ingest_batch(
-    handle: *mut NetHandle,
-    events_json: *const c_char,
-) -> c_int {
+pub extern "C" fn net_ingest_batch(handle: *mut NetHandle, events_json: *const c_char) -> c_int {
     if handle.is_null() || events_json.is_null() {
         return NetError::NullPointer.into();
     }

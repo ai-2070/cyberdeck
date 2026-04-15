@@ -19,10 +19,10 @@ use crate::error::{AdapterError, ConsumerError, IngestionError, IngestionResult}
 use crate::event::{Batch, Event, RawEvent};
 use crate::shard::{BatchWorker, ScalingDecision, ShardManager, ShardMetrics};
 
-#[cfg(feature = "nltp")]
-use crate::adapter::NltpAdapter;
 #[cfg(feature = "jetstream")]
 use crate::adapter::JetStreamAdapter;
+#[cfg(feature = "nltp")]
+use crate::adapter::NltpAdapter;
 #[cfg(feature = "redis")]
 use crate::adapter::RedisAdapter;
 

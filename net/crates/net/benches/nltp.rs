@@ -15,6 +15,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use std::sync::Arc;
 use std::thread;
 
+use bytes::{Bytes, BytesMut};
 use net::adapter::nltp::{
     // Phase 4A-4G: Behavior Plane - Capabilities, Diffs, Metadata, APIs, Rules, Context & LoadBalancing
     behavior::{
@@ -30,7 +31,6 @@ use net::adapter::nltp::{
         ToolCapability, TopologyHints, TraceId,
     },
     AdaptiveBatcher,
-    NltpHeader,
     Capabilities,
     CapabilityAd,
     CircuitBreaker,
@@ -41,6 +41,7 @@ use net::adapter::nltp::{
     LocalGraph,
     LossSimulator,
     MultiHopPacketBuilder,
+    NltpHeader,
     PacketFlags,
     PacketPool,
     Pingwave,
@@ -52,7 +53,6 @@ use net::adapter::nltp::{
     NONCE_SIZE,
     ROUTING_HEADER_SIZE,
 };
-use bytes::{Bytes, BytesMut};
 
 /// Benchmark packet header serialization/deserialization.
 fn bench_header(c: &mut Criterion) {

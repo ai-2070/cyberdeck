@@ -66,7 +66,7 @@ pub use compute::{
     MigrationError, MigrationPhase, MigrationState, PlacementDecision, Scheduler, SchedulerError,
     SUBPROTOCOL_MIGRATION,
 };
-pub use config::{NltpAdapterConfig, ConnectionRole, ReliabilityConfig};
+pub use config::{ConnectionRole, NltpAdapterConfig, ReliabilityConfig};
 pub use contested::{
     CorrelatedFailureConfig, CorrelatedFailureDetector, CorrelationVerdict, FailureCause,
     PartitionDetector, PartitionPhase, PartitionRecord, ReconcileOutcome, Side,
@@ -88,17 +88,17 @@ pub use identity::{
 };
 pub use pool::{PacketBuilder, PacketPool, SharedLocalPool, SharedPacketPool, ThreadLocalPool};
 pub use protocol::{
-    NltpHeader, EventFrame, NackPayload, PacketFlags, HEADER_SIZE, NONCE_SIZE, TAG_SIZE,
+    EventFrame, NackPayload, NltpHeader, PacketFlags, HEADER_SIZE, NONCE_SIZE, TAG_SIZE,
 };
 pub use proxy::{
-    NltpProxy, ForwardResult, HopStats, MultiHopPacketBuilder, ProxyConfig, ProxyError, ProxyStats,
+    ForwardResult, HopStats, MultiHopPacketBuilder, NltpProxy, ProxyConfig, ProxyError, ProxyStats,
 };
 pub use reliability::{FireAndForget, ReliabilityMode, ReliableStream};
 pub use route::{
     AggregateStats, RouteEntry, RouteFlags, RoutingHeader, RoutingTable, StreamStats,
     ROUTING_HEADER_SIZE,
 };
-pub use router::{NltpRouter, FairScheduler, RouteAction, RouterConfig, RouterError, RouterStats};
+pub use router::{FairScheduler, NltpRouter, RouteAction, RouterConfig, RouterError, RouterStats};
 pub use session::{NltpSession, SessionManager, StreamState};
 pub use state::{
     CausalChainBuilder, CausalEvent, CausalLink, ChainError, EntityLog, HorizonEncoder, LogError,

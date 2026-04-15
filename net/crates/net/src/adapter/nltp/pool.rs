@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use super::crypto::PacketCipher;
 use super::protocol::{
-    NltpHeader, EventFrame, PacketFlags, MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE, NONCE_SIZE,
+    EventFrame, NltpHeader, PacketFlags, MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE, NONCE_SIZE,
 };
 
 /// Pre-allocated packet builder using counter-based nonces for zero-allocation
