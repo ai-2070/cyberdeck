@@ -1,0 +1,36 @@
+README.md
+  e33ca63076d0343d 224
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "2ae7d965abf2bb74797034dee14181c94545f018",
+  "prompts": {
+    "75b8fbe288685b96": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b75d121a-3dc9-4fa0-82a8-528ef83df651",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 156,
+      "overriden_lines": 0
+    },
+    "e33ca63076d0343d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "72a93451-3a46-4c03-8dd4-addc974f7ef5",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2,
+      "total_deletions": 2,
+      "accepted_lines": 459,
+      "overriden_lines": 0
+    }
+  }
+}
