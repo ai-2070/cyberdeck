@@ -1,0 +1,31 @@
+net/crates/net/sdk-py/src/net_sdk/node.py
+  16f62563c20d300d 1-310
+net/crates/net/sdk-py/pyproject.toml
+  16f62563c20d300d 1-38
+net/crates/net/sdk-py/src/net_sdk/stream.py
+  16f62563c20d300d 1-105
+net/crates/net/sdk-py/src/net_sdk/__init__.py
+  16f62563c20d300d 1-24
+net/crates/net/sdk-py/src/net_sdk/channel.py
+  16f62563c20d300d 1-99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "ce06138319c37b987e844f5578a659e952bda93a",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1152,
+      "total_deletions": 0,
+      "accepted_lines": 712,
+      "overriden_lines": 0
+    }
+  }
+}
