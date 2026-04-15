@@ -749,6 +749,355 @@ pub extern "C" fn net_free_string(s: *mut c_char) {
     }
 }
 
+// =========================================================================
+// Structured (non-JSON) API — _ex variants
+// =========================================================================
+
+/// Ingestion receipt for C consumers.
+#[repr(C)]
+pub struct NetReceipt {
+    pub shard_id: u16,
+    pub timestamp: u64,
+}
+
+/// A single stored event for C consumers.
+#[repr(C)]
+pub struct NetEvent {
+    pub id: *const c_char,
+    pub id_len: usize,
+    pub raw: *const c_char,
+    pub raw_len: usize,
+    pub insertion_ts: u64,
+    pub shard_id: u16,
+}
+
+/// Poll result for C consumers.
+#[repr(C)]
+pub struct NetPollResult {
+    pub events: *mut NetEvent,
+    pub count: usize,
+    pub next_id: *mut c_char,
+    pub has_more: c_int,
+}
+
+/// Stats for C consumers.
+#[repr(C)]
+pub struct NetStats {
+    pub events_ingested: u64,
+    pub events_dropped: u64,
+    pub batches_dispatched: u64,
+}
+
+/// Subscription handle (opaque).
+struct SubscriptionHandle {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Ingest raw JSON with structured receipt.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_ingest_raw_ex(
+    handle: *mut NetHandle,
+    json: *const c_char,
+    len: usize,
+    out: *mut NetReceipt,
+) -> c_int {
+    if handle.is_null() || json.is_null() {
+        return NetError::NullPointer.into();
+    }
+
+    let handle = unsafe { &*handle };
+
+    let json_bytes = unsafe { std::slice::from_raw_parts(json as *const u8, len) };
+    let json_str = match std::str::from_utf8(json_bytes) {
+        Ok(s) => s,
+        Err(_) => return NetError::InvalidUtf8.into(),
+    };
+
+    let raw = RawEvent::from_str(json_str);
+
+    match handle.bus.ingest_raw(raw) {
+        Ok((shard_id, timestamp)) => {
+            if !out.is_null() {
+                unsafe {
+                    (*out).shard_id = shard_id;
+                    (*out).timestamp = timestamp;
+                }
+            }
+            NetError::Success.into()
+        }
+        Err(_) => NetError::IngestionFailed.into(),
+    }
+}
+
+/// Poll events with structured result (no JSON overhead).
+///
+/// The caller must free the result with `net_free_poll_result`.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_poll_ex(
+    handle: *mut NetHandle,
+    limit: usize,
+    cursor: *const c_char,
+    out: *mut NetPollResult,
+) -> c_int {
+    if handle.is_null() || out.is_null() {
+        return NetError::NullPointer.into();
+    }
+
+    let handle = unsafe { &*handle };
+
+    let mut request = ConsumeRequest::new(limit);
+    if !cursor.is_null() {
+        if let Ok(s) = unsafe { CStr::from_ptr(cursor) }.to_str() {
+            if !s.is_empty() {
+                request = request.from(s);
+            }
+        }
+    }
+
+    let response = match handle.runtime.block_on(handle.bus.poll(request)) {
+        Ok(r) => r,
+        Err(_) => return NetError::PollFailed.into(),
+    };
+
+    let count = response.events.len();
+
+    // Allocate events array.
+    let events_ptr = if count > 0 {
+        let layout = std::alloc::Layout::array::<NetEvent>(count).unwrap();
+        let ptr = unsafe { std::alloc::alloc(layout) as *mut NetEvent };
+        if ptr.is_null() {
+            return NetError::Unknown.into();
+        }
+
+        for (i, event) in response.events.iter().enumerate() {
+            // Leak id and raw strings so they live until net_free_poll_result.
+            let id_bytes = event.id.as_bytes().to_vec().into_boxed_slice();
+            let id_len = id_bytes.len();
+            let id_ptr = Box::into_raw(id_bytes) as *const c_char;
+
+            let raw_bytes = event.raw.to_vec().into_boxed_slice();
+            let raw_len = raw_bytes.len();
+            let raw_ptr = Box::into_raw(raw_bytes) as *const c_char;
+
+            unsafe {
+                ptr.add(i).write(NetEvent {
+                    id: id_ptr,
+                    id_len,
+                    raw: raw_ptr,
+                    raw_len,
+                    insertion_ts: event.insertion_ts,
+                    shard_id: event.shard_id,
+                });
+            }
+        }
+        ptr
+    } else {
+        ptr::null_mut()
+    };
+
+    // Leak next_id if present.
+    let next_id_ptr = match response.next_id {
+        Some(ref s) => {
+            let c = std::ffi::CString::new(s.as_str()).unwrap_or_default();
+            c.into_raw()
+        }
+        None => ptr::null_mut(),
+    };
+
+    unsafe {
+        (*out).events = events_ptr;
+        (*out).count = count;
+        (*out).next_id = next_id_ptr;
+        (*out).has_more = if response.has_more { 1 } else { 0 };
+    }
+
+    NetError::Success.into()
+}
+
+/// Free a poll result returned by `net_poll_ex`.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_free_poll_result(result: *mut NetPollResult) {
+    if result.is_null() {
+        return;
+    }
+
+    let result = unsafe { &*result };
+
+    // Free each event's id and raw strings.
+    if !result.events.is_null() && result.count > 0 {
+        for i in 0..result.count {
+            let event = unsafe { &*result.events.add(i) };
+
+            if !event.id.is_null() {
+                unsafe {
+                    let _ = Box::from_raw(std::slice::from_raw_parts_mut(
+                        event.id as *mut u8,
+                        event.id_len,
+                    ));
+                }
+            }
+            if !event.raw.is_null() {
+                unsafe {
+                    let _ = Box::from_raw(std::slice::from_raw_parts_mut(
+                        event.raw as *mut u8,
+                        event.raw_len,
+                    ));
+                }
+            }
+        }
+
+        // Free the events array.
+        let layout = std::alloc::Layout::array::<NetEvent>(result.count).unwrap();
+        unsafe {
+            std::alloc::dealloc(result.events as *mut u8, layout);
+        }
+    }
+
+    // Free next_id.
+    if !result.next_id.is_null() {
+        unsafe {
+            drop(std::ffi::CString::from_raw(result.next_id));
+        }
+    }
+}
+
+/// Get stats without JSON serialization.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_stats_ex(handle: *mut NetHandle, out: *mut NetStats) -> c_int {
+    if handle.is_null() || out.is_null() {
+        return NetError::NullPointer.into();
+    }
+
+    let handle = unsafe { &*handle };
+    let stats = handle.bus.stats();
+
+    unsafe {
+        (*out).events_ingested = stats
+            .events_ingested
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (*out).events_dropped = stats
+            .events_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (*out).batches_dispatched = stats
+            .batches_dispatched
+            .load(std::sync::atomic::Ordering::Relaxed);
+    }
+
+    NetError::Success.into()
+}
+
+/// Subscribe to events with a callback.
+///
+/// Starts an internal thread that polls the bus and calls the callback
+/// for each event. Returns a subscription handle that must be freed
+/// with `net_unsubscribe`.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_subscribe(
+    handle: *mut NetHandle,
+    batch_limit: usize,
+    callback: Option<extern "C" fn(*const NetEvent, *mut std::ffi::c_void)>,
+    user_data: *mut std::ffi::c_void,
+) -> *mut std::ffi::c_void {
+    if handle.is_null() || callback.is_none() {
+        return ptr::null_mut();
+    }
+
+    let callback = callback.unwrap();
+
+    // Safety: we need the handle to live for the subscription's lifetime.
+    // The caller is responsible for not shutting down while subscriptions are active.
+    let handle = unsafe { &*handle };
+    let bus_ptr = &handle.bus as *const EventBus;
+    let runtime_ptr = &handle.runtime as *const Runtime;
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_clone = stop.clone();
+
+    // Wrap raw pointers in Send-able wrappers.
+    // Safety: EventBus and Runtime are thread-safe. The caller guarantees the
+    // handle outlives the subscription.
+    struct SendPtr<T>(*const T);
+    unsafe impl<T> Send for SendPtr<T> {}
+
+    struct SendMutPtr(*mut std::ffi::c_void);
+    unsafe impl Send for SendMutPtr {}
+
+    let bus_send = SendPtr(bus_ptr);
+    let runtime_send = SendPtr(runtime_ptr);
+    let user_data_send = SendMutPtr(user_data);
+
+    let thread = std::thread::spawn(move || {
+        let bus = unsafe { &*bus_send.0 };
+        let runtime = unsafe { &*runtime_send.0 };
+        let user_data_raw = user_data_send.0;
+        let mut cursor: Option<String> = None;
+        let mut backoff_us: u64 = 1000; // 1ms
+
+        while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut request = ConsumeRequest::new(batch_limit);
+            if let Some(ref c) = cursor {
+                request = request.from(c);
+            }
+
+            let response = match runtime.block_on(bus.poll(request)) {
+                Ok(r) => r,
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+            };
+
+            if response.events.is_empty() {
+                // Backoff
+                std::thread::sleep(std::time::Duration::from_micros(backoff_us));
+                backoff_us = (backoff_us * 2).min(100_000); // max 100ms
+            } else {
+                backoff_us = 1000; // reset
+                cursor = response.next_id.clone();
+
+                for event in &response.events {
+                    let id_bytes = event.id.as_bytes();
+                    let raw_bytes = event.raw.as_ref();
+
+                    let c_event = NetEvent {
+                        id: id_bytes.as_ptr() as *const c_char,
+                        id_len: id_bytes.len(),
+                        raw: raw_bytes.as_ptr() as *const c_char,
+                        raw_len: raw_bytes.len(),
+                        insertion_ts: event.insertion_ts,
+                        shard_id: event.shard_id,
+                    };
+
+                    callback(&c_event, user_data_raw);
+                }
+            }
+        }
+    });
+
+    let sub = Box::new(SubscriptionHandle {
+        stop,
+        thread: Some(thread),
+    });
+
+    Box::into_raw(sub) as *mut std::ffi::c_void
+}
+
+/// Stop a subscription and free its resources.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_unsubscribe(subscription: *mut std::ffi::c_void) {
+    if subscription.is_null() {
+        return;
+    }
+
+    let mut sub = unsafe { Box::from_raw(subscription as *mut SubscriptionHandle) };
+    sub.stop
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(thread) = sub.thread.take() {
+        let _ = thread.join();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
