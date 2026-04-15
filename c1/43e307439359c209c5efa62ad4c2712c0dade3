@@ -1,0 +1,23 @@
+net/crates/net/examples/basic.c
+  16f62563c20d300d 1-81
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "c143e307439359c209c5efa62ad4c2712c0dade3",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 13,
+      "total_deletions": 184,
+      "accepted_lines": 230,
+      "overriden_lines": 0
+    }
+  }
+}
