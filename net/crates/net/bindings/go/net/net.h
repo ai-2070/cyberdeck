@@ -5,8 +5,8 @@
  * This header provides C-compatible bindings for use with CGO.
  */
 
-#ifndef BLACKSTREAM_H
-#define BLACKSTREAM_H
+#ifndef NET_H
+#define NET_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -20,16 +20,16 @@ typedef void* net_handle_t;
 
 /* Error codes */
 typedef enum {
-    BLACKSTREAM_SUCCESS = 0,
-    BLACKSTREAM_ERR_NULL_POINTER = -1,
-    BLACKSTREAM_ERR_INVALID_UTF8 = -2,
-    BLACKSTREAM_ERR_INVALID_JSON = -3,
-    BLACKSTREAM_ERR_INIT_FAILED = -4,
-    BLACKSTREAM_ERR_INGESTION_FAILED = -5,
-    BLACKSTREAM_ERR_POLL_FAILED = -6,
-    BLACKSTREAM_ERR_BUFFER_TOO_SMALL = -7,
-    BLACKSTREAM_ERR_SHUTTING_DOWN = -8,
-    BLACKSTREAM_ERR_UNKNOWN = -99
+    NET_SUCCESS = 0,
+    NET_ERR_NULL_POINTER = -1,
+    NET_ERR_INVALID_UTF8 = -2,
+    NET_ERR_INVALID_JSON = -3,
+    NET_ERR_INIT_FAILED = -4,
+    NET_ERR_INGESTION_FAILED = -5,
+    NET_ERR_POLL_FAILED = -6,
+    NET_ERR_BUFFER_TOO_SMALL = -7,
+    NET_ERR_SHUTTING_DOWN = -8,
+    NET_ERR_UNKNOWN = -99
 } net_error_t;
 
 /*
@@ -168,4 +168,4 @@ void net_free_string(char* s);
 }
 #endif
 
-#endif /* BLACKSTREAM_H */
+#endif /* NET_H */
