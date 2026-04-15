@@ -316,7 +316,7 @@ func (bs *Net) Poll(limit int, cursor string) (*PollResponse, error) {
 			C.size_t(bufferSize),
 		)
 
-		if result == C.int(C.BLACKSTREAM_ERR_BUFFER_TOO_SMALL) {
+		if result == -7 { // NET_ERR_BUFFER_TOO_SMALL
 			bufferSize *= 2
 			if bufferSize > 64*1024*1024 { // 64MB max
 				return nil, ErrBufferTooSmall

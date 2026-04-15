@@ -749,6 +749,253 @@ pub extern "C" fn net_free_string(s: *mut c_char) {
     }
 }
 
+// =========================================================================
+// Structured (non-JSON) API — _ex variants
+// =========================================================================
+
+/// Ingestion receipt for C consumers.
+#[repr(C)]
+pub struct NetReceipt {
+    /// Shard the event was assigned to.
+    pub shard_id: u16,
+    /// Insertion timestamp (nanoseconds).
+    pub timestamp: u64,
+}
+
+/// A single stored event for C consumers.
+#[repr(C)]
+pub struct NetEvent {
+    /// Event ID (not null-terminated, use `id_len`).
+    pub id: *const c_char,
+    /// Length of the event ID.
+    pub id_len: usize,
+    /// Raw JSON payload (not null-terminated, use `raw_len`).
+    pub raw: *const c_char,
+    /// Length of the raw JSON payload.
+    pub raw_len: usize,
+    /// Insertion timestamp (nanoseconds).
+    pub insertion_ts: u64,
+    /// Shard ID.
+    pub shard_id: u16,
+}
+
+/// Poll result for C consumers.
+#[repr(C)]
+pub struct NetPollResult {
+    /// Array of events. Free with `net_free_poll_result`.
+    pub events: *mut NetEvent,
+    /// Number of events in the array.
+    pub count: usize,
+    /// Cursor for the next poll (null-terminated). NULL if no more.
+    pub next_id: *mut c_char,
+    /// 1 if more events are available, 0 otherwise.
+    pub has_more: c_int,
+}
+
+/// Stats for C consumers.
+#[repr(C)]
+pub struct NetStats {
+    /// Total events ingested.
+    pub events_ingested: u64,
+    /// Events dropped due to backpressure.
+    pub events_dropped: u64,
+    /// Batches dispatched to the adapter.
+    pub batches_dispatched: u64,
+}
+
+/// Ingest raw JSON with structured receipt.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_ingest_raw_ex(
+    handle: *mut NetHandle,
+    json: *const c_char,
+    len: usize,
+    out: *mut NetReceipt,
+) -> c_int {
+    if handle.is_null() || json.is_null() {
+        return NetError::NullPointer.into();
+    }
+
+    let handle = unsafe { &*handle };
+
+    let json_bytes = unsafe { std::slice::from_raw_parts(json as *const u8, len) };
+    let json_str = match std::str::from_utf8(json_bytes) {
+        Ok(s) => s,
+        Err(_) => return NetError::InvalidUtf8.into(),
+    };
+
+    let raw = RawEvent::from_str(json_str);
+
+    match handle.bus.ingest_raw(raw) {
+        Ok((shard_id, timestamp)) => {
+            if !out.is_null() {
+                unsafe {
+                    (*out).shard_id = shard_id;
+                    (*out).timestamp = timestamp;
+                }
+            }
+            NetError::Success.into()
+        }
+        Err(_) => NetError::IngestionFailed.into(),
+    }
+}
+
+/// Poll events with structured result (no JSON overhead).
+///
+/// The caller must free the result with `net_free_poll_result`.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_poll_ex(
+    handle: *mut NetHandle,
+    limit: usize,
+    cursor: *const c_char,
+    out: *mut NetPollResult,
+) -> c_int {
+    if handle.is_null() || out.is_null() {
+        return NetError::NullPointer.into();
+    }
+
+    let handle = unsafe { &*handle };
+
+    let mut request = ConsumeRequest::new(limit);
+    if !cursor.is_null() {
+        if let Ok(s) = unsafe { CStr::from_ptr(cursor) }.to_str() {
+            if !s.is_empty() {
+                request = request.from(s);
+            }
+        }
+    }
+
+    let response = match handle.runtime.block_on(handle.bus.poll(request)) {
+        Ok(r) => r,
+        Err(_) => return NetError::PollFailed.into(),
+    };
+
+    let count = response.events.len();
+
+    // Allocate events array.
+    let events_ptr = if count > 0 {
+        let layout = std::alloc::Layout::array::<NetEvent>(count).unwrap();
+        let ptr = unsafe { std::alloc::alloc(layout) as *mut NetEvent };
+        if ptr.is_null() {
+            return NetError::Unknown.into();
+        }
+
+        for (i, event) in response.events.iter().enumerate() {
+            // Leak id and raw strings so they live until net_free_poll_result.
+            let id_bytes = event.id.as_bytes().to_vec().into_boxed_slice();
+            let id_len = id_bytes.len();
+            let id_ptr = Box::into_raw(id_bytes) as *const c_char;
+
+            let raw_bytes = event.raw.to_vec().into_boxed_slice();
+            let raw_len = raw_bytes.len();
+            let raw_ptr = Box::into_raw(raw_bytes) as *const c_char;
+
+            unsafe {
+                ptr.add(i).write(NetEvent {
+                    id: id_ptr,
+                    id_len,
+                    raw: raw_ptr,
+                    raw_len,
+                    insertion_ts: event.insertion_ts,
+                    shard_id: event.shard_id,
+                });
+            }
+        }
+        ptr
+    } else {
+        ptr::null_mut()
+    };
+
+    // Leak next_id if present.
+    let next_id_ptr = match response.next_id {
+        Some(ref s) => {
+            let c = std::ffi::CString::new(s.as_str()).unwrap_or_default();
+            c.into_raw()
+        }
+        None => ptr::null_mut(),
+    };
+
+    unsafe {
+        (*out).events = events_ptr;
+        (*out).count = count;
+        (*out).next_id = next_id_ptr;
+        (*out).has_more = if response.has_more { 1 } else { 0 };
+    }
+
+    NetError::Success.into()
+}
+
+/// Free a poll result returned by `net_poll_ex`.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_free_poll_result(result: *mut NetPollResult) {
+    if result.is_null() {
+        return;
+    }
+
+    let result = unsafe { &*result };
+
+    // Free each event's id and raw strings.
+    if !result.events.is_null() && result.count > 0 {
+        for i in 0..result.count {
+            let event = unsafe { &*result.events.add(i) };
+
+            if !event.id.is_null() {
+                unsafe {
+                    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                        event.id as *mut u8,
+                        event.id_len,
+                    ));
+                }
+            }
+            if !event.raw.is_null() {
+                unsafe {
+                    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                        event.raw as *mut u8,
+                        event.raw_len,
+                    ));
+                }
+            }
+        }
+
+        // Free the events array.
+        let layout = std::alloc::Layout::array::<NetEvent>(result.count).unwrap();
+        unsafe {
+            std::alloc::dealloc(result.events as *mut u8, layout);
+        }
+    }
+
+    // Free next_id.
+    if !result.next_id.is_null() {
+        unsafe {
+            drop(std::ffi::CString::from_raw(result.next_id));
+        }
+    }
+}
+
+/// Get stats without JSON serialization.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_stats_ex(handle: *mut NetHandle, out: *mut NetStats) -> c_int {
+    if handle.is_null() || out.is_null() {
+        return NetError::NullPointer.into();
+    }
+
+    let handle = unsafe { &*handle };
+    let stats = handle.bus.stats();
+
+    unsafe {
+        (*out).events_ingested = stats
+            .events_ingested
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (*out).events_dropped = stats
+            .events_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (*out).batches_dispatched = stats
+            .batches_dispatched
+            .load(std::sync::atomic::Ordering::Relaxed);
+    }
+
+    NetError::Success.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

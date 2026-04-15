@@ -4,6 +4,8 @@
 
 Loosely inspired by the Net from Cyberpunk 2077 - a flat, encrypted mesh where every device is a first-class node. Not affiliated with CD Projekt Red or R. Talsorian Games. This is an engineering take on the concept, not a licensed adaptation.
 
+For implementation details — structs, traits, module map, code examples — see the [crate README](net/crates/net/README.md).
+
 ## What it is
 
 Net is what the internet would look like if it were built today, the network science fiction imagined and systems engineers said was impossible. It is a latency-first encrypted mesh network. Every computer, device, and application is an equal node on a flat topology. There are no clients, no servers, no coordinators. The mesh propagates state, not connections. Existing networks operate in milliseconds (10⁻³). Net operates in nanoseconds (10⁻⁹).
@@ -32,6 +34,7 @@ Net is what the internet would look like if it were built today, the network sci
 - [Security](#security)
 - [The Blackwall](#the-blackwall)
 - [Benchmarks](#benchmarks)
+- [SDKs](#sdks)
 
 ## Why not best-effort
 
@@ -323,6 +326,18 @@ The wall isn't one mechanism. It's the emergent effect of every constraint worki
 - **Rate limiting.** Per-node, per-peer limits. One node cannot flood the mesh. Its neighbors enforce their own limits independently through device autonomy rules.
 
 Any single mechanism can be overwhelmed. All of them together form the wall. An event that bypasses backpressure hits the bounded queue. An event that fills the queue gets evicted. An event that propagates too far hits the TTL. An event that duplicates gets deduplicated. A node that floods gets rate-limited by every neighbor independently. There is no single point to breach because the wall is the mesh itself.
+
+## SDKs
+
+All SDKs wrap the same Rust core. Every language gets the same performance — the SDK is the developer experience, the engine is Rust.
+
+| SDK | Package | Docs |
+|-----|---------|------|
+| **Rust** | [`net-sdk`](net/crates/net/sdk) | [README](net/crates/net/sdk/README.md) |
+| **TypeScript** | [`@ai-2070/net-sdk`](net/crates/net/sdk-ts) | [README](net/crates/net/sdk-ts/README.md) |
+| **Python** | [`net-sdk`](net/crates/net/sdk-py) | [README](net/crates/net/sdk-py/README.md) |
+| **C** | [`net.h`](net/crates/net/include/net.h) | [README](net/crates/net/include/README.md) |
+| **Go** | [`net`](net/crates/net/bindings/go) | [README](net/crates/net/bindings/go/README.md) |
 
 ## Benchmarks
 

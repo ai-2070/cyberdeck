@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "sdk",
     "bindings/node",
     "bindings/python",
 ]
