@@ -204,6 +204,74 @@ node.host(InferenceNode::new()
 let response = node.infer("inference/requests", prompt).await?;
 ```
 
+### Discovery
+
+Find nodes by what they can do:
+
+```rust
+use net_sdk::discover::Query;
+
+let gpu_nodes = node.discover(Query::capability("gpu").min_vram(16)).await;
+let nearby = node.discover(Query::within_hops(3)).await;
+let models = node.discover(Query::serves_model("gemma-21b")).await;
+```
+
+### Typed Channels
+
+Strongly typed pub/sub over named channels:
+
+```rust
+use net_sdk::channel::TypedChannel;
+
+let temps: TypedChannel<TemperatureReading> = node.channel("sensors/temperature");
+temps.publish(&reading)?;
+
+let mut sub = temps.subscribe();
+while let Some(reading) = sub.next().await {
+    process(reading?);
+}
+```
+
+### Testing Utilities
+
+Spin up a local mesh in tests. Simulate partitions, failures, recovery.
+
+```rust
+use net_sdk::testing::TestMesh;
+
+let mesh = TestMesh::new(3).await;  // 3 interconnected nodes
+mesh[0].emit(&event)?;
+let received = mesh[2].poll_one().await?;
+mesh.partition(0, 2);               // simulate network partition
+mesh.heal();                         // restore connectivity
+```
+
+### Metrics / Observability
+
+Built-in hooks for monitoring:
+
+```rust
+node.on_event(|metric| match metric {
+    Metric::EventIngested { latency, shard } => ...,
+    Metric::PeerDiscovered { node_id, hops } => ...,
+    Metric::DaemonMigrated { from, to, duration } => ...,
+    Metric::RouteChanged { stream, old, new } => ...,
+});
+```
+
+### Scheduled Events
+
+Time-based emission on the mesh:
+
+```rust
+use net_sdk::schedule::Cron;
+
+node.host(Cron::every(Duration::from_secs(30))
+    .emit_to("health/heartbeat")
+    .payload(|| node.stats())
+);
+```
+
 ## SDK vs FFI Parity
 
 | FFI SDKs (Go/Python/Node) | Rust SDK |
