@@ -1,0 +1,23 @@
+net/crates/net/README.md
+  16f62563c20d300d 389-391,393-399,401-421,423-434,436-439,441-443,445,451-466,472-486,489-494,496-499,501-510
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "0ca7c7222a178ab729becf125a5938e1a60ff9c9",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 107,
+      "total_deletions": 22,
+      "accepted_lines": 223,
+      "overriden_lines": 0
+    }
+  }
+}
