@@ -756,42 +756,51 @@ pub extern "C" fn net_free_string(s: *mut c_char) {
 /// Ingestion receipt for C consumers.
 #[repr(C)]
 pub struct NetReceipt {
+    /// Shard the event was assigned to.
     pub shard_id: u16,
+    /// Insertion timestamp (nanoseconds).
     pub timestamp: u64,
 }
 
 /// A single stored event for C consumers.
 #[repr(C)]
 pub struct NetEvent {
+    /// Event ID (not null-terminated, use `id_len`).
     pub id: *const c_char,
+    /// Length of the event ID.
     pub id_len: usize,
+    /// Raw JSON payload (not null-terminated, use `raw_len`).
     pub raw: *const c_char,
+    /// Length of the raw JSON payload.
     pub raw_len: usize,
+    /// Insertion timestamp (nanoseconds).
     pub insertion_ts: u64,
+    /// Shard ID.
     pub shard_id: u16,
 }
 
 /// Poll result for C consumers.
 #[repr(C)]
 pub struct NetPollResult {
+    /// Array of events. Free with `net_free_poll_result`.
     pub events: *mut NetEvent,
+    /// Number of events in the array.
     pub count: usize,
+    /// Cursor for the next poll (null-terminated). NULL if no more.
     pub next_id: *mut c_char,
+    /// 1 if more events are available, 0 otherwise.
     pub has_more: c_int,
 }
 
 /// Stats for C consumers.
 #[repr(C)]
 pub struct NetStats {
+    /// Total events ingested.
     pub events_ingested: u64,
+    /// Events dropped due to backpressure.
     pub events_dropped: u64,
+    /// Batches dispatched to the adapter.
     pub batches_dispatched: u64,
-}
-
-/// Subscription handle (opaque).
-struct SubscriptionHandle {
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Ingest raw JSON with structured receipt.
@@ -985,117 +994,6 @@ pub extern "C" fn net_stats_ex(handle: *mut NetHandle, out: *mut NetStats) -> c_
     }
 
     NetError::Success.into()
-}
-
-/// Subscribe to events with a callback.
-///
-/// Starts an internal thread that polls the bus and calls the callback
-/// for each event. Returns a subscription handle that must be freed
-/// with `net_unsubscribe`.
-#[unsafe(no_mangle)]
-pub extern "C" fn net_subscribe(
-    handle: *mut NetHandle,
-    batch_limit: usize,
-    callback: Option<extern "C" fn(*const NetEvent, *mut std::ffi::c_void)>,
-    user_data: *mut std::ffi::c_void,
-) -> *mut std::ffi::c_void {
-    if handle.is_null() || callback.is_none() {
-        return ptr::null_mut();
-    }
-
-    let callback = callback.unwrap();
-
-    // Safety: we need the handle to live for the subscription's lifetime.
-    // The caller is responsible for not shutting down while subscriptions are active.
-    let handle = unsafe { &*handle };
-    let bus_ptr = &handle.bus as *const EventBus;
-    let runtime_ptr = &handle.runtime as *const Runtime;
-
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_clone = stop.clone();
-
-    // Wrap raw pointers in Send-able wrappers.
-    // Safety: EventBus and Runtime are thread-safe. The caller guarantees the
-    // handle outlives the subscription.
-    struct SendPtr<T>(*const T);
-    unsafe impl<T> Send for SendPtr<T> {}
-
-    struct SendMutPtr(*mut std::ffi::c_void);
-    unsafe impl Send for SendMutPtr {}
-
-    let bus_send = SendPtr(bus_ptr);
-    let runtime_send = SendPtr(runtime_ptr);
-    let user_data_send = SendMutPtr(user_data);
-
-    let thread = std::thread::spawn(move || {
-        let bus = unsafe { &*bus_send.0 };
-        let runtime = unsafe { &*runtime_send.0 };
-        let user_data_raw = user_data_send.0;
-        let mut cursor: Option<String> = None;
-        let mut backoff_us: u64 = 1000; // 1ms
-
-        while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
-            let mut request = ConsumeRequest::new(batch_limit);
-            if let Some(ref c) = cursor {
-                request = request.from(c);
-            }
-
-            let response = match runtime.block_on(bus.poll(request)) {
-                Ok(r) => r,
-                Err(_) => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    continue;
-                }
-            };
-
-            if response.events.is_empty() {
-                // Backoff
-                std::thread::sleep(std::time::Duration::from_micros(backoff_us));
-                backoff_us = (backoff_us * 2).min(100_000); // max 100ms
-            } else {
-                backoff_us = 1000; // reset
-                cursor = response.next_id.clone();
-
-                for event in &response.events {
-                    let id_bytes = event.id.as_bytes();
-                    let raw_bytes = event.raw.as_ref();
-
-                    let c_event = NetEvent {
-                        id: id_bytes.as_ptr() as *const c_char,
-                        id_len: id_bytes.len(),
-                        raw: raw_bytes.as_ptr() as *const c_char,
-                        raw_len: raw_bytes.len(),
-                        insertion_ts: event.insertion_ts,
-                        shard_id: event.shard_id,
-                    };
-
-                    callback(&c_event, user_data_raw);
-                }
-            }
-        }
-    });
-
-    let sub = Box::new(SubscriptionHandle {
-        stop,
-        thread: Some(thread),
-    });
-
-    Box::into_raw(sub) as *mut std::ffi::c_void
-}
-
-/// Stop a subscription and free its resources.
-#[unsafe(no_mangle)]
-pub extern "C" fn net_unsubscribe(subscription: *mut std::ffi::c_void) {
-    if subscription.is_null() {
-        return;
-    }
-
-    let mut sub = unsafe { Box::from_raw(subscription as *mut SubscriptionHandle) };
-    sub.stop
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    if let Some(thread) = sub.thread.take() {
-        let _ = thread.join();
-    }
 }
 
 #[cfg(test)]
