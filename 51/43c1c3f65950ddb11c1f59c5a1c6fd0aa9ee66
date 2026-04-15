@@ -1,0 +1,45 @@
+net/crates/net/sdk/src/config.rs
+  16f62563c20d300d 19
+net/crates/net/sdk-py/src/net_sdk/stream.py
+  16f62563c20d300d 71,77,79
+net/crates/net/sdk-ts/src/channel.ts
+  16f62563c20d300d 52,65
+net/crates/net/README.md
+  16f62563c20d300d 221
+net/crates/net/sdk-py/README.md
+  16f62563c20d300d 88
+net/crates/net/include/README.md
+  16f62563c20d300d 159-161,165-168,171
+net/crates/net/sdk-py/src/net_sdk/channel.py
+  16f62563c20d300d 6,15-26,57-58,65-66,84,89-91
+net/crates/net/examples/basic.c
+  16f62563c20d300d 49-53,56-59
+net/crates/net/include/net.h
+  16f62563c20d300d 16-17,256
+net/crates/net/bindings/go/net/net.h
+  16f62563c20d300d 8-9,171
+README.md
+  16f62563c20d300d 332
+net/crates/net/sdk/src/stream.rs
+  16f62563c20d300d 71-73,75-77,90,95,102,104,132-141,143-145,147,150-153,155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "5143c1c3f65950ddb11c1f59c5a1c6fd0aa9ee66",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 6538,
+      "total_deletions": 475,
+      "accepted_lines": 183,
+      "overriden_lines": 19
+    }
+  }
+}
