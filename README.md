@@ -226,6 +226,16 @@ None of these systems need to be rebuilt. Net sits underneath them. The applicat
 
 This is infrastructure in the classical sense. The Shinkansen didn't generate its value from ticket sales. It generated it from everything the Japanese economy could do because the train existed. Highways don't profit from tolls. They profit from the GDP of every business that ships on them. Net is the same - the value is in what runs on top of it, not in the protocol itself.
 
+## The industrial latency gap
+
+Most industrial coordination is hyper-local. Factory floor, facility campus, vehicle fleet - within a few kilometers. The physics floor at 5km is around 33 microseconds round trip. Light in fiber, there and back. That's the hard limit. No protocol, no architecture, no amount of engineering can beat it.
+
+Current industrial systems don't come close. They route through data centers - cloud PLCs, centralized SCADA, remote monitoring dashboards. A sensor reading on a factory floor travels to a data center and back before anyone acts on it. That adds 10-50ms of round-trip latency on top of the physics. For coordination that is inherently local - two machines on the same floor, two vehicles in the same lot, two robots on the same assembly line - this is 300 to 1500 times slower than the physical limit.
+
+Net's scheduling overhead is nanoseconds. The remaining latency after Net processes a packet is the NIC, the wire, and the speed of light. For a 5km campus, that's ~33 microseconds. For a factory floor, it's single-digit microseconds. The software is no longer the bottleneck. The bottleneck is physics, which is where the bottleneck should be.
+
+This isn't a marginal improvement. It's a category change. When your coordination latency drops from 50ms to 33 microseconds, things that were impossible become trivial. Closed-loop control across a mesh of autonomous devices. Real-time consensus between robots on a factory floor. Swarm coordination where the mesh reacts faster than any individual node's control loop. These aren't theoretical. They're what happens when the software gets out of the way and the only remaining constraint is the speed of light.
+
 ## Why not cloud
 
 Cloud infrastructure solves the wrong problem. It moves compute closer to a central provider. Net moves compute closer to the data and the work.
