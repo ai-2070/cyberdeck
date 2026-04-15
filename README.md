@@ -192,6 +192,8 @@ Three consequences:
 
 **No partition-leader bottleneck.** Kafka orders events per partition, creating a single-leader bottleneck per partition. Net orders events per entity via causal chains. There is no partition leader. Every entity maintains its own chain independently. Ordering scales with the number of entities, not with the number of partitions a broker can handle.
 
+**Location-transparent consumption.** A daemon processing events doesn't know - and can't determine from the API - whether the event originated on the same node, a neighbor one hop away, or a node five hops and two subnet boundaries distant. The call signature is the same as a local function call: receive an event, return output. The mesh resolved routing, decrypted the payload, validated the causal chain, and delivered the event before the daemon saw it. From the daemon's perspective, every event is local. Code written for a single-node prototype runs unmodified on a multi-hop mesh. The deployment topology is a runtime decision, not a code change.
+
 This is what makes "processing without storage" possible. The data isn't stored at the bus. The data is in transit through the mesh. Any node with matching capabilities can process it. If that node dies, another picks it up. Storage is a choice made by individual nodes via persistence adapters (Redis, JetStream), not an architectural requirement of the bus itself.
 
 ## Cost of devices
