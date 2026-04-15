@@ -109,6 +109,101 @@ struct TokenEvent {
 }
 ```
 
+## Phase 5: Ready-Made Components
+
+The core crate is minimal. The SDK is not. Ship components that developers would otherwise build themselves.
+
+### Daemons
+
+Pre-built `MeshDaemon` implementations for common patterns:
+
+```rust
+use net_sdk::daemons::{Router, Aggregator, Mirror, Gateway};
+
+// Route events between channels based on rules
+node.host(Router::new()
+    .route("sensors/*", "analytics/ingest")
+    .route("alerts/*", "ops/alerts")
+);
+
+// Aggregate events over a time window
+node.host(Aggregator::new("sensors/temperature")
+    .window(Duration::from_secs(5))
+    .reduce(|events| avg(events))
+    .emit_to("analytics/temperature_avg")
+);
+
+// Mirror a channel to a persistence adapter
+node.host(Mirror::new("critical/*").to_redis("redis://localhost:6379"));
+
+// Bridge between subnets
+node.host(Gateway::new()
+    .expose("sensors/public/*")
+    .hide("sensors/internal/*")
+);
+```
+
+### Middleware
+
+Composable event processing pipeline:
+
+```rust
+use net_sdk::middleware::{Logger, RateLimit, Transform, Filter};
+
+let node = Net::builder()
+    .shards(4)
+    .mesh(mesh_config)
+    .middleware(Logger::new())
+    .middleware(RateLimit::per_second(10_000))
+    .middleware(Filter::channel("sensors/*"))
+    .middleware(Transform::map(|event| enrich(event)))
+    .build()
+    .await?;
+```
+
+### Primitives
+
+Building blocks for custom daemons:
+
+```rust
+use net_sdk::primitives::{
+    Fanout,          // one-to-many event distribution
+    Merge,           // many-to-one event collection
+    Dedup,           // idempotency by event hash
+    Buffer,          // bounded in-memory buffer with backpressure
+    Retry,           // retry with exponential backoff
+    CircuitBreaker,  // fail-fast on degraded peers
+    Ticker,          // periodic event emission
+    Watchdog,        // health monitoring with timeout
+};
+```
+
+### Inference
+
+First-class support for the primary use case:
+
+```rust
+use net_sdk::inference::{InferenceNode, ModelConfig};
+
+let node = Net::builder()
+    .mesh(mesh_config)
+    .build()
+    .await?;
+
+// Announce this node serves inference
+node.host(InferenceNode::new()
+    .model(ModelConfig::new("gemma-21b").vram_gb(24))
+    .max_concurrent(8)
+    .channel("inference/requests")
+    .respond_to("inference/responses")
+);
+```
+
+```rust
+// Request inference from the mesh (routes to best available node)
+let response = node.infer("inference/requests", prompt).await?;
+```
+
 ## SDK vs FFI Parity
 
 | FFI SDKs (Go/Python/Node) | Rust SDK |
