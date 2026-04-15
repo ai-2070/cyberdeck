@@ -1256,6 +1256,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-sdk"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "net",
+ "pin-project-lite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "nkeys"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
