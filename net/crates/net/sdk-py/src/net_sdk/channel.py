@@ -3,13 +3,25 @@
 from __future__ import annotations
 
 import json
-from typing import Callable, Generic, Iterator, Optional, TypeVar
+from typing import Any, Callable, Generic, Iterator, Optional, TypeVar
 
 from net import Net
 
 from net_sdk.stream import EventStream, SubscribeOpts, TypedEventStream
 
 T = TypeVar("T")
+
+
+def _to_dict(event: Any) -> dict:
+    """Convert an event to a dict copy, never mutating the original."""
+    if hasattr(event, "model_dump"):
+        return event.model_dump()
+    elif isinstance(event, dict):
+        return dict(event)
+    elif hasattr(event, "__dict__"):
+        return dict(event.__dict__)
+    else:
+        return {"_value": event}
 
 
 class TypedChannel(Generic[T]):
@@ -42,29 +54,16 @@ class TypedChannel(Generic[T]):
 
     def publish(self, event: T) -> None:
         """Publish a typed event to this channel."""
-        if hasattr(event, "model_dump"):
-            # Pydantic model
-            data = event.model_dump()  # type: ignore[union-attr]
-        elif hasattr(event, "__dict__"):
-            data = event.__dict__
-        else:
-            data = event  # type: ignore[assignment]
-
-        data["_channel"] = self._name  # type: ignore[index]
+        data = _to_dict(event)
+        data["_channel"] = self._name
         self._bus.ingest_raw(json.dumps(data))
 
     def publish_batch(self, events: list[T]) -> int:
         """Publish a batch of typed events. Returns number ingested."""
         payloads = []
         for event in events:
-            if hasattr(event, "model_dump"):
-                data = event.model_dump()  # type: ignore[union-attr]
-            elif hasattr(event, "__dict__"):
-                data = event.__dict__
-            else:
-                data = event  # type: ignore[assignment]
-
-            data["_channel"] = self._name  # type: ignore[index]
+            data = _to_dict(event)
+            data["_channel"] = self._name
             payloads.append(json.dumps(data))
         return self._bus.ingest_raw_batch(payloads)
 
@@ -82,11 +81,14 @@ class TypedChannel(Generic[T]):
 
             def parse_fn(raw: str) -> T:
                 data = json.loads(raw)
+                data.pop("_channel", None)
                 return model(**data)  # type: ignore[return-value]
         else:
 
             def parse_fn(raw: str) -> T:
-                return json.loads(raw)  # type: ignore[return-value]
+                data = json.loads(raw)
+                data.pop("_channel", None)
+                return data  # type: ignore[return-value]
 
         return TypedEventStream(self._bus, parse_fn, merged)
 

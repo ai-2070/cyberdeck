@@ -16,7 +16,7 @@ pub enum Backpressure {
     DropOldest,
     /// Fail the producer when buffer is full.
     FailProducer,
-    /// Sample events at the given rate (1 in N).
+    /// Sample events at the given rate (1 in N). Requires runtime support.
     Sample(u32),
 }
 

@@ -5,8 +5,8 @@
  * This header provides C-compatible bindings for use with CGO.
  */
 
-#ifndef NET_H
-#define NET_H
+#ifndef NET_MESH_SDK_H
+#define NET_MESH_SDK_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -168,4 +168,4 @@ void net_free_string(char* s);
 }
 #endif
 
-#endif /* NET_H */
+#endif /* NET_MESH_SDK_H */

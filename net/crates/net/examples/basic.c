@@ -46,10 +46,17 @@ int main(void) {
         strlen(events[2]),
     };
     int count = net_ingest_raw_batch(node, events, lens, 3);
-    printf("Batch ingested %d events\n", count);
+    if (count < 0) {
+        fprintf(stderr, "Batch ingest failed: %d\n", count);
+    } else {
+        printf("Batch ingested %d events\n", count);
+    }
 
     /* Flush to ensure events are available for polling */
-    net_flush(node);
+    rc = net_flush(node);
+    if (rc != NET_SUCCESS) {
+        fprintf(stderr, "Flush failed: %d\n", rc);
+    }
 
     /* Poll with structured API (no JSON overhead) */
     net_poll_result_t result;

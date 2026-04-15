@@ -85,7 +85,7 @@ from net_sdk import TypedChannel
 temps = node.channel('sensors/temperature', TemperatureReading)
 
 # Publish
-temps.publish(TemperatureReading(sensor_id='A1', celsius=22.5, timestamp=time.time()))
+temps.publish(TemperatureReading(sensor_id='A1', celsius=22.5, timestamp=1700000000.0))
 
 # Subscribe
 for reading in temps.subscribe():

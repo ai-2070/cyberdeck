@@ -218,7 +218,7 @@ Channels are how applications structure communication. `ChannelName` uses hierar
 ```
 sensors/lidar/front     → ChannelId(0xa3f1)
 sensors/lidar/rear      → ChannelId(0xb7c2)
-sensors/*               → wildcard match on prefix
+sensors                 → prefix match on hierarchical names
 alerts/temperature      → ChannelId(0x1e09)
 ```
 
