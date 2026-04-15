@@ -1,0 +1,223 @@
+# Behavior Plane
+
+The semantic layer on top of transport. Nodes declare what they are, what they can do, and what they offer. Nine submodules provide capability discovery, API schemas, device autonomy rules, distributed tracing, load balancing, proximity-aware routing, and safety enforcement.
+
+## Capability Announcements (CAP-ANN)
+
+Nodes announce hardware and software capabilities. The `CapabilityIndex` provides sub-microsecond lookup by capability filter.
+
+```rust
+pub struct HardwareCapabilities {
+    pub gpu: Option<GpuInfo>,
+    pub accelerators: Vec<AcceleratorInfo>,
+    pub memory_gb: f32,
+    pub cpu_cores: u16,
+}
+
+pub struct SoftwareCapabilities {
+    pub tools: Vec<ToolCapability>,
+    pub models: Vec<ModelCapability>,
+    pub modalities: Vec<Modality>,
+    pub tags: Vec<String>,
+}
+```
+
+`CapabilityFilter` matches against a `CapabilitySet` -- used by channel authorization, daemon placement, and API routing.
+
+`CapabilityIndex` stores all known nodes' capabilities in a `DashMap` with secondary indexes for fast GPU/tool/tag queries.
+
+**Benchmark:** Single tag filter in 10.5 ns, GPU check in 0.33 ns.
+
+## Capability Diffs (CAP-DIFF)
+
+`DiffEngine` computes minimal diffs when capabilities change, avoiding full re-announcement.
+
+```rust
+pub enum DiffOp {
+    Added { key: String, value: String },
+    Removed { key: String },
+    Modified { key: String, old: String, new: String },
+}
+
+pub struct CapabilityDiff {
+    pub node_id: u64,
+    pub ops: Vec<DiffOp>,
+    pub seq: u64,
+}
+```
+
+Diffs are sequenced for ordering. The receiver applies ops incrementally to its local `CapabilityIndex`.
+
+## Node Metadata (NODE-META)
+
+`MetadataStore` tracks per-node metadata beyond capabilities: location, network tier, NAT type, topology hints.
+
+```rust
+pub struct NodeMetadata {
+    pub node_id: NodeId,
+    pub status: NodeStatus,           // Online, Degraded, Offline, Unknown
+    pub location: Option<LocationInfo>,
+    pub network_tier: NetworkTier,    // EdgeDevice, EdgeGateway, Cloud, Unknown
+    pub nat_type: NatType,
+    pub topology_hints: TopologyHints,
+    pub last_seen: u64,
+}
+```
+
+`MetadataQuery` supports filtering by status, region, network tier, and custom predicates.
+
+## API Schema Registry (API-SCHEMA)
+
+Nodes register API endpoints with typed schemas. Other nodes discover and validate calls against the schema.
+
+```rust
+pub struct ApiSchema {
+    pub endpoints: Vec<ApiEndpoint>,
+    pub version: ApiVersion,
+}
+
+pub struct ApiEndpoint {
+    pub path: String,
+    pub method: ApiMethod,
+    pub parameters: Vec<ApiParameter>,
+    pub response_type: Option<SchemaType>,
+    pub description: String,
+}
+```
+
+`ApiRegistry` indexes schemas by node, path, and capability. `ApiAnnouncement` broadcasts schema availability. `ApiQuery` discovers endpoints matching a path pattern or capability requirement.
+
+## Device Autonomy Rules (DEVICE-RULES)
+
+`RuleEngine` enforces local policies on a node. Rules are condition-action pairs evaluated against a `RuleContext`.
+
+```rust
+pub struct Rule {
+    pub name: String,
+    pub priority: Priority,
+    pub condition: ConditionExpr,
+    pub action: Action,
+    pub rate_limit: Option<RateLimit>,
+}
+
+pub enum Action {
+    Allow,
+    Deny,
+    Log { level: LogLevel, message: String },
+    Alert { severity: AlertSeverity, message: String },
+    Scale { direction: ScaleDirection, target: String },
+    Custom(String),
+}
+```
+
+`ConditionExpr` supports boolean logic (`And`, `Or`, `Not`) over `Condition` predicates with `CompareOp` comparisons (Eq, Ne, Gt, Lt, Gte, Lte, Contains, Matches).
+
+`RuleSet` groups rules for batch evaluation. `RuleEngine` evaluates rules in priority order, returning the first matching `RuleResult`.
+
+## Context Fabric (CTXT-FABRIC)
+
+Distributed context propagation for cross-node tracing and correlation.
+
+```rust
+pub struct Context {
+    pub trace_id: TraceId,
+    pub span_id: SpanId,
+    pub trace_flags: TraceFlags,
+    pub baggage: Baggage,
+}
+
+pub struct Span {
+    pub span_id: SpanId,
+    pub parent_id: Option<SpanId>,
+    pub name: String,
+    pub kind: SpanKind,       // Client, Server, Producer, Consumer, Internal
+    pub status: SpanStatus,
+    pub events: Vec<SpanEvent>,
+    pub links: Vec<SpanLink>,
+    pub start_time: u64,
+    pub end_time: Option<u64>,
+}
+```
+
+`ContextStore` manages active contexts with `ContextScope` for automatic cleanup. `PropagationContext` carries trace state across network boundaries. `Sampler` controls trace volume via `SamplingStrategy` (AlwaysOn, AlwaysOff, Ratio, RateLimited).
+
+## Load Balancing (LOAD-BALANCE)
+
+`LoadBalancer` distributes requests across endpoints using pluggable strategies.
+
+```rust
+pub enum Strategy {
+    RoundRobin,
+    LeastConnections,
+    WeightedRoundRobin,
+    Random,
+    ConsistentHash,
+}
+
+pub struct Endpoint {
+    pub id: u64,
+    pub address: String,
+    pub weight: u32,
+    pub health: HealthStatus,
+    pub metrics: LoadMetrics,
+}
+```
+
+`Selection` returns the chosen endpoint with a `SelectionReason`. Health checks integrate with `FailureDetector` -- unhealthy endpoints are automatically excluded.
+
+## Proximity Graph (PINGWAVE++)
+
+`ProximityGraph` enhances the base `Pingwave` discovery with measured latency edges and capability-weighted routing.
+
+```rust
+pub struct ProximityNode {
+    pub node_id: u64,
+    pub capabilities: PrimaryCapabilities,
+    pub subnet: SubnetId,
+}
+
+pub struct ProximityEdge {
+    pub latency_us: u32,
+    pub jitter_us: u16,
+    pub loss_ratio: f32,
+}
+```
+
+`EnhancedPingwave` extends base Pingwave with latency measurement. `ProximityConfig` tunes TTL, measurement intervals, and cleanup thresholds. The graph provides nearest-neighbor queries weighted by both latency and capability match.
+
+## Safety Envelope Enforcement
+
+`SafetyEnforcer` enforces resource limits, rate limits, content policies, and kill switches.
+
+```rust
+pub struct SafetyEnvelope {
+    pub resource_envelope: ResourceEnvelope,
+    pub rate_envelope: RateEnvelope,
+    pub content_policy: ContentPolicy,
+    pub kill_switch: Option<KillSwitchConfig>,
+}
+```
+
+**Resource limits:** `ResourceEnvelope` caps CPU, memory, network, and storage per-node or per-daemon. `ResourceGuard` tracks claims and rejects requests that would exceed the envelope.
+
+**Rate limits:** `RateEnvelope` enforces per-entity, per-channel, and global rate limits with configurable burst allowances.
+
+**Content policy:** `ContentPolicy` with `ContentCheck` rules for payload validation.
+
+**Kill switch:** `KillSwitchConfig` for emergency shutdown of specific daemons, channels, or entire nodes. Audit trail via `AuditEntry` with `AuditEventType` and `AuditOutcome`.
+
+**Enforcement modes:** `EnforcementMode::Enforce` (reject violations), `EnforcementMode::Monitor` (log only), `EnforcementMode::Disabled`.
+
+## Source Files
+
+| File | Purpose |
+|------|---------|
+| `behavior/capability.rs` | `HardwareCapabilities`, `CapabilityIndex`, `CapabilityFilter` |
+| `behavior/diff.rs` | `CapabilityDiff`, `DiffEngine`, `DiffOp` |
+| `behavior/metadata.rs` | `NodeMetadata`, `MetadataStore`, `MetadataQuery` |
+| `behavior/api.rs` | `ApiRegistry`, `ApiSchema`, `ApiEndpoint`, validation |
+| `behavior/rules.rs` | `RuleEngine`, `RuleSet`, `ConditionExpr`, `Action` |
+| `behavior/context.rs` | `Context`, `ContextStore`, `Span`, `Sampler` |
+| `behavior/loadbalance.rs` | `LoadBalancer`, `Strategy`, `Endpoint`, health |
+| `behavior/proximity.rs` | `ProximityGraph`, `EnhancedPingwave`, latency edges |
+| `behavior/safety.rs` | `SafetyEnforcer`, `ResourceEnvelope`, `KillSwitchConfig` |

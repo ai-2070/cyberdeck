@@ -24,18 +24,18 @@ High-performance encrypted mesh runtime.
 
 ## Stack
 
-| Layer | What it does |
-|-------|--------------|
-| **Transport** | Encrypted UDP, 64-byte cache-line-aligned header, zero-alloc packet pools, multi-hop forwarding, adaptive batching, fair scheduling, failure detection, pingwave swarm discovery |
-| **Trust & Identity** | ed25519 entity identity, origin binding on every packet, permission tokens with delegation chains |
-| **Channels & Authorization** | Named hierarchical channels, capability-based access control, bloom filter authorization at <10ns per packet |
-| **Behavior Plane** | Capability announcements & indexing, capability diffs, node metadata, API schema registry, device autonomy rules, context fabric (distributed tracing), load balancing, proximity graph, safety envelope enforcement |
-| **Subnets & Hierarchy** | 4-level subnet hierarchy (8/8/8/8 encoding), label-based assignment, gateway visibility enforcement |
-| **Distributed State** | 24-byte causal links, compressed observed horizons, append-only entity logs with chain validation, state snapshots for migration |
-| **Compute Runtime** | MeshDaemon trait, daemon hosting with causal chain production, capability-based placement, 6-phase migration state machine |
-| **Subprotocols** | Formal protocol registry, version negotiation, capability-aware routing via tags, opaque forwarding guarantee |
-| **Observational Continuity** | Causal cones, propagation modeling, continuity proofs, honest discontinuity with deterministic forking, superposition during migration |
-| **Contested Environments** | Correlated failure detection, subnet-aware partition classification, partition healing with log reconciliation |
+| Layer | What it does | Docs |
+|-------|--------------|------|
+| **Transport** | Encrypted UDP, 64-byte cache-line-aligned header, zero-alloc packet pools, multi-hop forwarding, adaptive batching, fair scheduling, failure detection, pingwave swarm discovery | [TRANSPORT.md](docs/TRANSPORT.md) |
+| **Trust & Identity** | ed25519 entity identity, origin binding on every packet, permission tokens with delegation chains | [IDENTITY.md](docs/IDENTITY.md) |
+| **Channels & Authorization** | Named hierarchical channels, capability-based access control, bloom filter authorization at <10ns per packet | [CHANNELS.md](docs/CHANNELS.md) |
+| **Behavior Plane** | Capability announcements & indexing, capability diffs, node metadata, API schema registry, device autonomy rules, context fabric (distributed tracing), load balancing, proximity graph, safety envelope enforcement | [BEHAVIOR.md](docs/BEHAVIOR.md) |
+| **Subnets & Hierarchy** | 4-level subnet hierarchy (8/8/8/8 encoding), label-based assignment, gateway visibility enforcement | [SUBNETS.md](docs/SUBNETS.md) |
+| **Distributed State** | 24-byte causal links, compressed observed horizons, append-only entity logs with chain validation, state snapshots for migration | [STATE.md](docs/STATE.md) |
+| **Compute Runtime** | MeshDaemon trait, daemon hosting with causal chain production, capability-based placement, 6-phase migration state machine | [COMPUTE.md](docs/COMPUTE.md) |
+| **Subprotocols** | Formal protocol registry, version negotiation, capability-aware routing via tags, opaque forwarding guarantee | [SUBPROTOCOLS.md](docs/SUBPROTOCOLS.md) |
+| **Observational Continuity** | Causal cones, propagation modeling, continuity proofs, honest discontinuity with deterministic forking, superposition during migration | [CONTINUITY.md](docs/CONTINUITY.md) |
+| **Contested Environments** | Correlated failure detection, subnet-aware partition classification, partition healing with log reconciliation | [CONTESTED.md](docs/CONTESTED.md) |
 
 ## Architecture
 
