@@ -386,43 +386,128 @@ net = { path = ".", features = ["jetstream"] }
 net = { path = ".", features = ["net"] }
 ```
 
-## Language Bindings
+## SDKs
 
-All bindings wrap the same Rust core.
+All SDKs wrap the same Rust core. Every language gets the same performance.
 
-### Node.js / Bun
+| SDK | Package | Docs | Highlights |
+|-----|---------|------|------------|
+| **Rust** | [`net-sdk`](sdk/) | [README](sdk/README.md) | Builder pattern, async streams, typed subscriptions |
+| **TypeScript** | [`@ai-2070/net-sdk`](sdk-ts/) | [README](sdk-ts/README.md) | AsyncIterator, typed channels, Zod support |
+| **Python** | [`net-sdk`](sdk-py/) | [README](sdk-py/README.md) | Generators, dataclass/Pydantic, context manager |
+| **Go** | [`net`](bindings/go/) | [README](bindings/go/README.md) | CGO bindings, zero allocations on raw ingest |
+| **C** | [`net.h`](include/net.h) | [README](include/README.md) | One header, structured types, zero JSON overhead |
 
-```js
-const { Net } = require("@the/net");
-const bus = await Net.create({ numShards: 4 });
-bus.push(Buffer.from('{"token": "hello"}'));
+### Rust
+
+```rust
+use net_sdk::{Net, Backpressure};
+use futures::StreamExt;
+
+let node = Net::builder()
+    .shards(4)
+    .backpressure(Backpressure::DropOldest)
+    .memory()
+    .build()
+    .await?;
+
+// Emit
+node.emit(&serde_json::json!({"token": "hello"}))?;
+
+// Stream
+let mut stream = node.subscribe(Default::default());
+while let Some(event) = stream.next().await {
+    println!("{}", event?.raw_str());
+}
+
+node.shutdown().await?;
+```
+
+### TypeScript
+
+```typescript
+import { NetNode } from '@ai-2070/net-sdk';
+
+const node = await NetNode.create({ shards: 4 });
+
+// Emit
+node.emit({ token: 'hello', index: 0 });
+
+// Stream
+for await (const event of node.subscribe({ limit: 100 })) {
+  console.log(event.raw);
+}
+
+// Typed channels
+const temps = node.channel<{ celsius: number }>('sensors/temperature');
+temps.publish({ celsius: 22.5 });
+
+await node.shutdown();
 ```
 
 ### Python
 
 ```python
-from net import Net
-bus = Net(num_shards=4)
-bus.ingest_raw('{"token": "hello"}')
+from net_sdk import NetNode
+
+node = NetNode(shards=4)
+
+# Emit
+node.emit({'token': 'hello', 'index': 0})
+
+# Stream (generator)
+for event in node.subscribe(limit=100):
+    print(event.raw)
+
+# Typed channels with Pydantic
+temps = node.channel('sensors/temperature', TemperatureReading)
+temps.publish(TemperatureReading(sensor_id='A1', celsius=22.5))
+
+node.shutdown()
 ```
 
 ### Go
 
 ```go
-bus, _ := net.New(&net.Config{NumShards: 4})
-bus.IngestRaw(`{"token": "hello"}`)
+node, _ := net.New(&net.Config{NumShards: 4})
+defer node.Shutdown()
+
+// Ingest
+node.IngestRaw(`{"token": "hello"}`)
+
+// Batch (zero allocations on raw path)
+jsons := []string{`{"a":1}`, `{"a":2}`, `{"a":3}`}
+count := node.IngestRawBatch(jsons)
+
+// Poll
+response, _ := node.Poll(100, "")
+for _, event := range response.Events {
+    fmt.Println(string(event))
+}
 ```
 
-## SDKs
+### C
 
-Higher-level SDKs with streaming, typed events, and idiomatic APIs for each language.
+```c
+#include "net.h"
 
-| SDK | Package | Description |
-|-----|---------|-------------|
-| **Rust** | [`net-sdk`](sdk/) | Builder pattern, async streams, typed subscriptions |
-| **TypeScript** | [`@ai-2070/net-sdk`](sdk-ts/) | AsyncIterator, typed channels, Zod support |
-| **Python** | [`net-sdk`](sdk-py/) | Generators, dataclass/Pydantic, context manager |
-| **C** | [`net.h`](include/net.h) | One header, structured types, zero JSON overhead |
+net_handle_t node = net_init("{\"num_shards\": 4}");
+
+// Ingest with receipt
+const char* event = "{\"token\": \"hello\"}";
+net_receipt_t receipt;
+net_ingest_raw_ex(node, event, strlen(event), &receipt);
+
+// Poll (structured, no JSON parsing)
+net_poll_result_t result;
+net_poll_ex(node, 100, NULL, &result);
+for (size_t i = 0; i < result.count; i++) {
+    printf("%.*s\n", (int)result.events[i].raw_len, result.events[i].raw);
+}
+net_free_poll_result(&result);
+
+net_shutdown(node);
+```
 
 ## Features
 
