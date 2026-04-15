@@ -19,10 +19,10 @@ use crate::error::{AdapterError, ConsumerError, IngestionError, IngestionResult}
 use crate::event::{Batch, Event, RawEvent};
 use crate::shard::{BatchWorker, ScalingDecision, ShardManager, ShardMetrics};
 
-#[cfg(feature = "bltp")]
-use crate::adapter::BltpAdapter;
 #[cfg(feature = "jetstream")]
 use crate::adapter::JetStreamAdapter;
+#[cfg(feature = "net")]
+use crate::adapter::NetAdapter;
 #[cfg(feature = "redis")]
 use crate::adapter::RedisAdapter;
 
@@ -31,7 +31,7 @@ use crate::adapter::RedisAdapter;
 /// # Example
 ///
 /// ```rust,ignore
-/// use blackstream::{EventBus, EventBusConfig, Event};
+/// use net::{EventBus, EventBusConfig, Event};
 ///
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -99,10 +99,8 @@ impl EventBus {
             AdapterConfig::JetStream(js_config) => {
                 Box::new(JetStreamAdapter::new(js_config.clone())?)
             }
-            #[cfg(feature = "bltp")]
-            AdapterConfig::Bltp(bltp_config) => {
-                Box::new(BltpAdapter::new((**bltp_config).clone())?)
-            }
+            #[cfg(feature = "net")]
+            AdapterConfig::Net(net_config) => Box::new(NetAdapter::new((**net_config).clone())?),
         };
 
         // Initialize adapter (with timeout to prevent hanging on unreachable backends)

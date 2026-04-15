@@ -31,7 +31,7 @@ IS the proof.
 | **SuperpositionState** | **NEW** |
 | **Discontinuity/ForkRecord** | **NEW** |
 
-## New Module: `src/adapter/bltp/continuity/`
+## New Module: `src/adapter/net/continuity/`
 
 ### Phase 1: Chain Formalization
 

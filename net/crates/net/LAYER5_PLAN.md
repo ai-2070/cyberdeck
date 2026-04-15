@@ -35,7 +35,7 @@ Key decisions:
   only produces payloads. Runtime handles chain building.
 - **`requirements()` returns `CapabilityFilter`** — reuses existing L0 type directly
 
-## New Module: `src/adapter/bltp/compute/`
+## New Module: `src/adapter/net/compute/`
 
 ### Phase 1: Core (MVP — unblocks L6)
 

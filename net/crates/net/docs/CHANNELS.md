@@ -4,7 +4,7 @@ Named, hierarchical communication endpoints with wire-speed authorization. Chann
 
 ## Channel Names
 
-Channels use hierarchical names with `/` separators (e.g., `sensors/lidar/front`). The `channel_hash: u16` in the BLTP header is derived via xxh3 truncation for wire-speed filtering.
+Channels use hierarchical names with `/` separators (e.g., `sensors/lidar/front`). The `channel_hash: u16` in the Net header is derived via xxh3 truncation for wire-speed filtering.
 
 ```rust
 pub struct ChannelName(String);

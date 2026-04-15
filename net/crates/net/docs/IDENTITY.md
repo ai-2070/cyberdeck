@@ -10,13 +10,13 @@ Cryptographic identity for every node in the mesh. Identity is tied to an ed2551
 pub struct EntityId(pub [u8; 32]);
 
 impl EntityId {
-    fn origin_hash(&self) -> u32    // BLAKE2s-MAC keyed "bltp-origin-v1", truncated to 4 bytes
-    fn node_id(&self) -> u64        // BLAKE2s-MAC keyed "bltp-node-id-v1", truncated to 8 bytes
+    fn origin_hash(&self) -> u32    // BLAKE2s-MAC keyed "net-origin-v1", truncated to 4 bytes
+    fn node_id(&self) -> u64        // BLAKE2s-MAC keyed "net-node-id-v1", truncated to 8 bytes
     fn verify(&self, message: &[u8], signature: &Signature) -> Result<(), EntityError>
 }
 ```
 
-- `origin_hash()` maps to the `origin_hash` field in every BLTP header (4 bytes)
+- `origin_hash()` maps to the `origin_hash` field in every Net header (4 bytes)
 - `node_id()` replaces arbitrary u64 node IDs in swarm/routing (8 bytes)
 - Both use domain-separated BLAKE2s-MAC to prevent cross-domain collisions
 

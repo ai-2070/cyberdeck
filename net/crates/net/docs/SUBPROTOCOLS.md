@@ -1,10 +1,10 @@
 # Subprotocol Registry (Layer 6)
 
-Formalizes the 16-bit `subprotocol_id` field in every BLTP header. Provides a registry for protocol handlers, version negotiation between peers, and an opaque forwarding guarantee for unknown protocols.
+Formalizes the 16-bit `subprotocol_id` field in every Net header. Provides a registry for protocol handlers, version negotiation between peers, and an opaque forwarding guarantee for unknown protocols.
 
 ## Subprotocol IDs
 
-Every BLTP packet carries a `subprotocol_id: u16` identifying how the payload should be interpreted. The ID space is partitioned:
+Every Net packet carries a `subprotocol_id: u16` identifying how the payload should be interpreted. The ID space is partitioned:
 
 | Range | Purpose |
 |-------|---------|

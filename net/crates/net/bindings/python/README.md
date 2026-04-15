@@ -1,20 +1,20 @@
-# Blackstream Python
+# Net Python
 
 High-performance, schema-agnostic event bus for AI runtime workloads.
 
 ## Installation
 
 ```bash
-pip install blackstream
+pip install net
 ```
 
 ## Quick Start
 
 ```python
-from blackstream import Blackstream
+from net import Net
 
 # Create event bus (defaults to CPU core count shards)
-bus = Blackstream()
+bus = Net()
 
 # Ingest events - fast path with raw JSON strings (23M+ ops/sec)
 bus.ingest_raw('{"token": "hello", "index": 0}')
@@ -44,7 +44,7 @@ bus.shutdown()
 ## Context Manager
 
 ```python
-with Blackstream(num_shards=4) as bus:
+with Net(num_shards=4) as bus:
     bus.ingest_raw('{"data": "value"}')
 # Automatically shuts down
 ```
@@ -52,45 +52,45 @@ with Blackstream(num_shards=4) as bus:
 ## Configuration
 
 ```python
-bus = Blackstream(
+bus = Net(
     num_shards=8,                    # Number of parallel shards
     ring_buffer_capacity=1_048_576,  # Events per shard (must be power of 2)
     backpressure_mode="drop_oldest", # What to do when full
 )
 ```
 
-## BLTP Encrypted UDP Transport
+## Net Encrypted UDP Transport
 
-BLTP provides encrypted point-to-point UDP transport for high-performance scenarios:
+Net provides encrypted point-to-point UDP transport for high-performance scenarios:
 
 ```python
-from blackstream import Blackstream, generate_bltp_keypair
+from net import Net, generate_net_keypair
 import os
 
 # Generate keypair for responder
-keypair = generate_bltp_keypair()
+keypair = generate_net_keypair()
 psk = os.urandom(32).hex()
 
 # Responder side
-responder = Blackstream(
+responder = Net(
     num_shards=2,
-    bltp_bind_addr='127.0.0.1:9001',
-    bltp_peer_addr='127.0.0.1:9000',
-    bltp_psk=psk,
-    bltp_role='responder',
-    bltp_secret_key=keypair.secret_key,
-    bltp_public_key=keypair.public_key,
-    bltp_reliability='light',  # 'none', 'light', or 'full'
+    net_bind_addr='127.0.0.1:9001',
+    net_peer_addr='127.0.0.1:9000',
+    net_psk=psk,
+    net_role='responder',
+    net_secret_key=keypair.secret_key,
+    net_public_key=keypair.public_key,
+    net_reliability='light',  # 'none', 'light', or 'full'
 )
 
 # Initiator side (knows responder's public key)
-initiator = Blackstream(
+initiator = Net(
     num_shards=2,
-    bltp_bind_addr='127.0.0.1:9000',
-    bltp_peer_addr='127.0.0.1:9001',
-    bltp_psk=psk,
-    bltp_role='initiator',
-    bltp_peer_public_key=keypair.public_key,
+    net_bind_addr='127.0.0.1:9000',
+    net_peer_addr='127.0.0.1:9001',
+    net_psk=psk,
+    net_role='initiator',
+    net_peer_public_key=keypair.public_key,
 )
 
 # Use as normal

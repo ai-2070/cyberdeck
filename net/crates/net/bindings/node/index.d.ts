@@ -5,9 +5,9 @@
  *
  * Example usage:
  * ```typescript
- * import { Blackstream } from '@ai2070/blackstream';
+ * import { Net } from '@ai2070/net';
  *
- * const bus = await Blackstream.create({ numShards: 4 });
+ * const bus = await Net.create({ numShards: 4 });
  *
  * // Fast sync ingestion (no async overhead)
  * bus.ingestRawSync('{"token": "hello", "index": 0}');
@@ -21,9 +21,9 @@
  * await bus.shutdown();
  * ```
  */
-export declare class Blackstream {
-  /** Create a new Blackstream event bus. */
-  static create(options?: EventBusOptions | undefined | null): Promise<Blackstream>
+export declare class Net {
+  /** Create a new Net event bus. */
+  static create(options?: EventBusOptions | undefined | null): Promise<Net>
   /**
    * Pre-compute hash for an event buffer.
    *
@@ -112,7 +112,7 @@ export declare class Blackstream {
 export interface RedisOptions {
   /** Redis connection URL (e.g., "redis://localhost:6379") */
   url: string
-  /** Stream key prefix (default: "blackstream") */
+  /** Stream key prefix (default: "net") */
   prefix?: string
   /** Maximum commands per pipeline (default: 1000) */
   pipelineSize?: number
@@ -130,7 +130,7 @@ export interface RedisOptions {
 export interface JetStreamOptions {
   /** NATS server URL (e.g., "nats://localhost:4222") */
   url: string
-  /** Stream name prefix (default: "blackstream") */
+  /** Stream name prefix (default: "net") */
   prefix?: string
   /** Connection timeout in milliseconds (default: 5000) */
   connectTimeoutMs?: number

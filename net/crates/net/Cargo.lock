@@ -180,70 +180,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
-name = "blackstream"
-version = "0.5.0"
-dependencies = [
- "arc-swap",
- "async-nats",
- "async-trait",
- "base64",
- "blake2",
- "bytes",
- "chacha20poly1305",
- "criterion",
- "crossbeam-queue",
- "crossbeam-utils",
- "dashmap",
- "ed25519-dalek",
- "futures",
- "getrandom 0.4.2",
- "hex",
- "libc",
- "parking_lot",
- "quanta",
- "rand 0.10.1",
- "redis",
- "regex",
- "serde",
- "serde_json",
- "snow",
- "socket2",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "xxhash-rust",
-]
-
-[[package]]
-name = "blackstream-node"
-version = "0.5.0"
-dependencies = [
- "arc-swap",
- "blackstream",
- "bytes",
- "hex",
- "napi",
- "napi-build",
- "napi-derive",
- "serde_json",
- "tokio",
- "xxhash-rust",
-]
-
-[[package]]
-name = "blackstream-python"
-version = "0.5.0"
-dependencies = [
- "blackstream",
- "bytes",
- "hex",
- "pyo3",
- "pyo3-build-config",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "blake2"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1253,6 +1189,70 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8eb602b84d7c1edae45e50bbf1374696548f36ae179dfa667f577e384bb90c2b"
 dependencies = [
  "libloading",
+]
+
+[[package]]
+name = "net"
+version = "0.5.0"
+dependencies = [
+ "arc-swap",
+ "async-nats",
+ "async-trait",
+ "base64",
+ "blake2",
+ "bytes",
+ "chacha20poly1305",
+ "criterion",
+ "crossbeam-queue",
+ "crossbeam-utils",
+ "dashmap",
+ "ed25519-dalek",
+ "futures",
+ "getrandom 0.4.2",
+ "hex",
+ "libc",
+ "parking_lot",
+ "quanta",
+ "rand 0.10.1",
+ "redis",
+ "regex",
+ "serde",
+ "serde_json",
+ "snow",
+ "socket2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "net-node"
+version = "0.5.0"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "hex",
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "net",
+ "serde_json",
+ "tokio",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "net-python"
+version = "0.5.0"
+dependencies = [
+ "bytes",
+ "hex",
+ "net",
+ "pyo3",
+ "pyo3-build-config",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

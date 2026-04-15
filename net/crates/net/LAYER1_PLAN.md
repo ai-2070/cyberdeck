@@ -8,9 +8,9 @@ Only phases 1-3 are needed before L2 can begin. Phases 4-7 land incrementally af
 
 ## Phase 1: Entity Identity
 
-**New files:** `src/adapter/bltp/identity/mod.rs`, `identity/entity.rs`
+**New files:** `src/adapter/net/identity/mod.rs`, `identity/entity.rs`
 
-**New dependency:** `ed25519-dalek = { version = "2", features = ["rand_core"], optional = true }` gated behind `bltp` feature
+**New dependency:** `ed25519-dalek = { version = "2", features = ["rand_core"], optional = true }` gated behind `net` feature
 
 Core types:
 - `EntityId` — 32-byte ed25519 public key. The canonical identity.
@@ -70,7 +70,7 @@ PermissionToken {
 
 **New file:** `identity/provenance.rs`
 
-Per-event signing at origin. 128-byte provenance header prepended inside EventFrame (not the BLTP header). Opt-in via `subprotocol_id = 0x0001`. Batch signing via Merkle root for high-throughput streams.
+Per-event signing at origin. 128-byte provenance header prepended inside EventFrame (not the Net header). Opt-in via `subprotocol_id = 0x0001`. Batch signing via Merkle root for high-throughput streams.
 
 ### Phase 5: Trust Scoring
 

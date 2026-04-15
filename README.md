@@ -95,7 +95,7 @@ This creates an incompatibility. Latency-first systems cannot coexist with best-
 
 The mismatch is fundamental. Best-effort systems use queues to decouple producers from consumers in time. Latency-first systems require producers and consumers to operate at the same timescale. When they meet, the latency-first system overwhelms the best-effort system's buffers, and the best-effort system's backpressure signals (TCP window scaling, congestion control) operate orders of magnitude too slowly to matter. By the time TCP tells the sender to slow down, the sender has already moved on.
 
-This is why Net runs its own transport (BLTP over UDP) rather than layering on TCP. It's not an optimization. It's a necessity. The two models are physically incompatible at the queue level.
+This is why Net runs its own transport (Net over UDP) rather than layering on TCP. It's not an optimization. It's a necessity. The two models are physically incompatible at the queue level.
 
 ## Backpressure
 
@@ -199,7 +199,7 @@ This is what makes "processing without storage" possible. The data isn't stored 
 
 ## Infinite extensibility via subprotocols
 
-Every BLTP packet carries a `subprotocol_id` field. This is 16 bits in the header - 65,536 possible protocols - and it changes everything about how the mesh evolves.
+Every Net packet carries a `subprotocol_id` field. This is 16 bits in the header - 65,536 possible protocols - and it changes everything about how the mesh evolves.
 
 A vendor builds a custom inference protocol for their hardware. They pick an ID in the vendor range, implement the `MeshDaemon` trait, register it in the `SubprotocolRegistry`, and deploy. The mesh already knows how to route their traffic - the node advertises `subprotocol:0x1000` as a capability tag, the existing `CapabilityIndex` indexes it, and any node that needs that protocol can find a handler through the same query path used for GPU discovery or tool matching. No firmware update. No mesh-wide upgrade. No coordination with anyone.
 

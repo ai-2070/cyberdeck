@@ -1,11 +1,11 @@
-//! # Blackstream
+//! # Net
 //!
 //! High-performance, schema-agnostic, backend-agnostic event bus designed for
 //! AI runtime workloads.
 //!
 //! ## Primary Use Case
 //!
-//! Blackstream is fundamentally designed to **ingest, relay, and replay
+//! Net is fundamentally designed to **ingest, relay, and replay
 //! AI-generated streaming output** at GPU-native speeds. Target workloads include:
 //!
 //! - **Token streams**: LLM output tokens as they're generated
@@ -27,7 +27,7 @@
 //! ## Quick Start
 //!
 //! ```rust,ignore
-//! use blackstream::{EventBus, EventBusConfig, Event};
+//! use net::{EventBus, EventBusConfig, Event};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {

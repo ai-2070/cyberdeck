@@ -1,0 +1,755 @@
+//! Net wire protocol definitions.
+//!
+//! This module defines the packet format for the Net L0 Transport Protocol (Net).
+//! All packets use a fixed 64-byte cache-line aligned header for optimal memory access.
+
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+/// Magic bytes: "BL" (0x424C)
+pub const MAGIC: u16 = 0x424C;
+
+/// Current protocol version
+pub const VERSION: u8 = 1;
+
+/// Header size in bytes (cache-line aligned)
+pub const HEADER_SIZE: usize = 64;
+
+/// Poly1305 authentication tag size
+pub const TAG_SIZE: usize = 16;
+
+/// ChaCha20-Poly1305 nonce size (counter-based)
+pub const NONCE_SIZE: usize = 12;
+
+/// Maximum packet size (fits in jumbo frame with headroom)
+pub const MAX_PACKET_SIZE: usize = 8192;
+
+/// Maximum payload size (packet - header - tag)
+pub const MAX_PAYLOAD_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE - TAG_SIZE;
+
+/// Packet flags for protocol control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(transparent)]
+pub struct PacketFlags(u8);
+
+impl PacketFlags {
+    /// No flags set
+    pub const NONE: Self = Self(0);
+    /// Packet requires acknowledgment
+    pub const RELIABLE: Self = Self(0b0000_0001);
+    /// This is a NACK/retransmit request
+    pub const NACK: Self = Self(0b0000_0010);
+    /// High priority (bypass normal queuing)
+    pub const PRIORITY: Self = Self(0b0000_0100);
+    /// Final packet in batch
+    pub const FIN: Self = Self(0b0000_1000);
+    /// Handshake packet
+    pub const HANDSHAKE: Self = Self(0b0001_0000);
+    /// Heartbeat/keepalive
+    pub const HEARTBEAT: Self = Self(0b0010_0000);
+
+    /// Create flags from raw bits
+    #[inline]
+    pub const fn from_bits(bits: u8) -> Self {
+        Self(bits)
+    }
+
+    /// Get raw bits
+    #[inline]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Check if a flag is set
+    #[inline]
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    /// Set a flag
+    #[inline]
+    pub const fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Clear a flag
+    #[inline]
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    /// Check if this is a handshake packet
+    #[inline]
+    pub const fn is_handshake(self) -> bool {
+        self.contains(Self::HANDSHAKE)
+    }
+
+    /// Check if this is a heartbeat packet
+    #[inline]
+    pub const fn is_heartbeat(self) -> bool {
+        self.contains(Self::HEARTBEAT)
+    }
+
+    /// Check if reliability is requested
+    #[inline]
+    pub const fn is_reliable(self) -> bool {
+        self.contains(Self::RELIABLE)
+    }
+
+    /// Check if this is a NACK packet
+    #[inline]
+    pub const fn is_nack(self) -> bool {
+        self.contains(Self::NACK)
+    }
+}
+
+/// Net packet header - 64 bytes, cache-line aligned.
+///
+/// Wire format:
+/// ```text
+///  0                   1                   2                   3
+///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |         MAGIC (0x424C)        |     VER       |     FLAGS     |  4
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |   PRIORITY    |    HOP_TTL    |   HOP_COUNT   |  FRAG_FLAGS   |  8
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |       SUBPROTOCOL_ID          |        CHANNEL_HASH           | 12
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                                                               |
+/// +                         NONCE (12 bytes)                      + 24
+/// |                                                               |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                       SESSION_ID (8 bytes)                    | 32
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                       STREAM_ID (8 bytes)                     | 40
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                       SEQUENCE (8 bytes)                      | 48
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                       SUBNET_ID (4 bytes)                     | 52
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                      ORIGIN_HASH (4 bytes)                    | 56
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |       FRAGMENT_ID             |        FRAGMENT_OFFSET        | 60
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |       PAYLOAD_LEN             |        EVENT_COUNT            | 64
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// ```
+#[derive(Debug, Clone, Copy)]
+#[repr(C, align(64))]
+pub struct NetHeader {
+    // — routing fast-path (0-11) —
+    /// Magic: "BL" (0x424C)
+    pub magic: u16,
+    /// Protocol version (1)
+    pub version: u8,
+    /// Flags (reliability, priority, etc.)
+    pub flags: PacketFlags,
+    /// Priority level (0 = lowest, 255 = highest)
+    pub priority: u8,
+    /// Maximum hops before packet is dropped
+    pub hop_ttl: u8,
+    /// Current hop count (incremented by forwarding nodes)
+    pub hop_count: u8,
+    /// Fragmentation flags
+    pub frag_flags: u8,
+    /// Subprotocol identifier for capability-aware routing
+    pub subprotocol_id: u16,
+    /// Truncated channel name hash for wire-speed filtering
+    pub channel_hash: u16,
+
+    // — crypto (12-23) —
+    /// ChaCha20-Poly1305 nonce (12 bytes) - counter-based
+    pub nonce: [u8; NONCE_SIZE],
+
+    // — session (24-47) —
+    /// Session identifier (from handshake)
+    pub session_id: u64,
+    /// Stream identifier (for multiplexing)
+    pub stream_id: u64,
+    /// Per-stream sequence number (monotonic)
+    pub sequence: u64,
+
+    // — mesh topology (48-59) —
+    /// Subnet identifier for gateway routing
+    pub subnet_id: u32,
+    /// Truncated blake2 hash of origin node identity
+    pub origin_hash: u32,
+    /// Fragment group identifier
+    pub fragment_id: u16,
+    /// Byte offset within original packet
+    pub fragment_offset: u16,
+
+    // — payload (60-63) —
+    /// Payload length (after encryption, before tag)
+    pub payload_len: u16,
+    /// Number of events in payload
+    pub event_count: u16,
+}
+
+// Verify header size at compile time
+const _: () = assert!(std::mem::size_of::<NetHeader>() == HEADER_SIZE);
+
+impl NetHeader {
+    /// Create a new header with default values.
+    ///
+    /// New routing/mesh fields default to zero. Use the `with_*` methods
+    /// to set them when needed.
+    #[inline]
+    pub fn new(
+        session_id: u64,
+        stream_id: u64,
+        sequence: u64,
+        nonce: [u8; NONCE_SIZE],
+        payload_len: u16,
+        event_count: u16,
+        flags: PacketFlags,
+    ) -> Self {
+        Self {
+            magic: MAGIC,
+            version: VERSION,
+            flags,
+            priority: 0,
+            hop_ttl: 0,
+            hop_count: 0,
+            frag_flags: 0,
+            subprotocol_id: 0,
+            channel_hash: 0,
+            nonce,
+            session_id,
+            stream_id,
+            sequence,
+            subnet_id: 0,
+            origin_hash: 0,
+            fragment_id: 0,
+            fragment_offset: 0,
+            payload_len,
+            event_count,
+        }
+    }
+
+    /// Create a handshake header
+    #[inline]
+    pub fn handshake(payload_len: u16) -> Self {
+        Self::new(
+            0,
+            0,
+            0,
+            [0u8; NONCE_SIZE],
+            payload_len,
+            0,
+            PacketFlags::HANDSHAKE,
+        )
+    }
+
+    /// Create a heartbeat header
+    #[inline]
+    pub fn heartbeat(session_id: u64) -> Self {
+        Self::new(
+            session_id,
+            0,
+            0,
+            [0u8; NONCE_SIZE],
+            0,
+            0,
+            PacketFlags::HEARTBEAT,
+        )
+    }
+
+    /// Set priority level
+    #[inline]
+    pub fn with_priority(mut self, priority: u8) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Set hop TTL and initial hop count
+    #[inline]
+    pub fn with_hops(mut self, ttl: u8) -> Self {
+        self.hop_ttl = ttl;
+        self.hop_count = 0;
+        self
+    }
+
+    /// Set subprotocol identifier
+    #[inline]
+    pub fn with_subprotocol(mut self, id: u16) -> Self {
+        self.subprotocol_id = id;
+        self
+    }
+
+    /// Set channel hash
+    #[inline]
+    pub fn with_channel_hash(mut self, hash: u16) -> Self {
+        self.channel_hash = hash;
+        self
+    }
+
+    /// Set subnet identifier
+    #[inline]
+    pub fn with_subnet(mut self, subnet_id: u32) -> Self {
+        self.subnet_id = subnet_id;
+        self
+    }
+
+    /// Set origin node hash
+    #[inline]
+    pub fn with_origin(mut self, origin_hash: u32) -> Self {
+        self.origin_hash = origin_hash;
+        self
+    }
+
+    /// Set fragmentation fields
+    #[inline]
+    pub fn with_fragment(mut self, id: u16, offset: u16, flags: u8) -> Self {
+        self.fragment_id = id;
+        self.fragment_offset = offset;
+        self.frag_flags = flags;
+        self
+    }
+
+    /// Get AAD (Additional Authenticated Data) for AEAD construction.
+    ///
+    /// Authenticates all header fields except:
+    /// - nonce (used as the AEAD IV)
+    /// - hop_count (mutable in transit — incremented by forwarding nodes)
+    ///
+    /// This binds the encrypted payload to the immutable header fields, preventing
+    /// an attacker from modifying any field without breaking AEAD verification.
+    #[inline]
+    pub fn aad(&self) -> [u8; 52] {
+        let mut aad = [0u8; 52];
+        // routing fast-path (hop_count excluded: mutable in transit)
+        aad[0..2].copy_from_slice(&self.magic.to_le_bytes());
+        aad[2] = self.version;
+        aad[3] = self.flags.bits();
+        aad[4] = self.priority;
+        aad[5] = self.hop_ttl;
+        // aad[6] = 0: hop_count excluded from AAD
+        aad[7] = self.frag_flags;
+        aad[8..10].copy_from_slice(&self.subprotocol_id.to_le_bytes());
+        aad[10..12].copy_from_slice(&self.channel_hash.to_le_bytes());
+        // session
+        aad[12..20].copy_from_slice(&self.session_id.to_le_bytes());
+        aad[20..28].copy_from_slice(&self.stream_id.to_le_bytes());
+        aad[28..36].copy_from_slice(&self.sequence.to_le_bytes());
+        // mesh topology
+        aad[36..40].copy_from_slice(&self.subnet_id.to_le_bytes());
+        aad[40..44].copy_from_slice(&self.origin_hash.to_le_bytes());
+        aad[44..46].copy_from_slice(&self.fragment_id.to_le_bytes());
+        aad[46..48].copy_from_slice(&self.fragment_offset.to_le_bytes());
+        // payload metadata
+        aad[48..50].copy_from_slice(&self.payload_len.to_le_bytes());
+        aad[50..52].copy_from_slice(&self.event_count.to_le_bytes());
+        aad
+    }
+
+    /// Serialize header to bytes
+    #[inline]
+    pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
+        let mut buf = [0u8; HEADER_SIZE];
+        let mut cursor = &mut buf[..];
+
+        // routing fast-path
+        cursor.put_u16_le(self.magic);
+        cursor.put_u8(self.version);
+        cursor.put_u8(self.flags.bits());
+        cursor.put_u8(self.priority);
+        cursor.put_u8(self.hop_ttl);
+        cursor.put_u8(self.hop_count);
+        cursor.put_u8(self.frag_flags);
+        cursor.put_u16_le(self.subprotocol_id);
+        cursor.put_u16_le(self.channel_hash);
+        // crypto
+        cursor.put_slice(&self.nonce);
+        // session
+        cursor.put_u64_le(self.session_id);
+        cursor.put_u64_le(self.stream_id);
+        cursor.put_u64_le(self.sequence);
+        // mesh topology
+        cursor.put_u32_le(self.subnet_id);
+        cursor.put_u32_le(self.origin_hash);
+        cursor.put_u16_le(self.fragment_id);
+        cursor.put_u16_le(self.fragment_offset);
+        // payload
+        cursor.put_u16_le(self.payload_len);
+        cursor.put_u16_le(self.event_count);
+
+        buf
+    }
+
+    /// Parse header from bytes
+    #[inline]
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < HEADER_SIZE {
+            return None;
+        }
+
+        let mut cursor = &data[..HEADER_SIZE];
+
+        let magic = cursor.get_u16_le();
+        if magic != MAGIC {
+            return None;
+        }
+
+        let version = cursor.get_u8();
+        let flags = PacketFlags::from_bits(cursor.get_u8());
+        let priority = cursor.get_u8();
+        let hop_ttl = cursor.get_u8();
+        let hop_count = cursor.get_u8();
+        let frag_flags = cursor.get_u8();
+        let subprotocol_id = cursor.get_u16_le();
+        let channel_hash = cursor.get_u16_le();
+
+        let mut nonce = [0u8; NONCE_SIZE];
+        cursor.copy_to_slice(&mut nonce);
+
+        let session_id = cursor.get_u64_le();
+        let stream_id = cursor.get_u64_le();
+        let sequence = cursor.get_u64_le();
+
+        let subnet_id = cursor.get_u32_le();
+        let origin_hash = cursor.get_u32_le();
+        let fragment_id = cursor.get_u16_le();
+        let fragment_offset = cursor.get_u16_le();
+
+        let payload_len = cursor.get_u16_le();
+        let event_count = cursor.get_u16_le();
+
+        Some(Self {
+            magic,
+            version,
+            flags,
+            priority,
+            hop_ttl,
+            hop_count,
+            frag_flags,
+            subprotocol_id,
+            channel_hash,
+            nonce,
+            session_id,
+            stream_id,
+            sequence,
+            subnet_id,
+            origin_hash,
+            fragment_id,
+            fragment_offset,
+            payload_len,
+            event_count,
+        })
+    }
+
+    /// Maximum events per packet. Each event needs at least a 4-byte length
+    /// prefix, so this is bounded by MAX_PAYLOAD_SIZE / LEN_SIZE.
+    pub const MAX_EVENTS_PER_PACKET: u16 = (MAX_PAYLOAD_SIZE / EventFrame::LEN_SIZE) as u16;
+
+    /// Validate the header
+    #[inline]
+    pub fn validate(&self) -> bool {
+        self.magic == MAGIC
+            && self.version == VERSION
+            && (self.payload_len as usize) <= MAX_PAYLOAD_SIZE
+            && self.event_count <= Self::MAX_EVENTS_PER_PACKET
+    }
+}
+
+/// Event frame format for packing multiple events in a single packet.
+///
+/// Format: `[len: u32][data: [u8; len]]...`
+///
+/// Events are concatenated with 4-byte length prefixes. No additional framing.
+pub struct EventFrame;
+
+impl EventFrame {
+    /// Size of the length prefix
+    pub const LEN_SIZE: usize = 4;
+
+    /// Write events to a buffer, returning the total bytes written
+    #[inline]
+    pub fn write_events(events: &[Bytes], buf: &mut BytesMut) -> usize {
+        let start = buf.len();
+        for event in events {
+            buf.put_u32_le(event.len() as u32);
+            buf.put_slice(event);
+        }
+        buf.len() - start
+    }
+
+    /// Read events from a buffer
+    #[inline]
+    pub fn read_events(mut data: Bytes, count: u16) -> Vec<Bytes> {
+        // Cap pre-allocation to what the data can actually hold
+        let max_events = data.remaining() / Self::LEN_SIZE;
+        let mut events = Vec::with_capacity((count as usize).min(max_events));
+
+        for _ in 0..count {
+            if data.remaining() < Self::LEN_SIZE {
+                break;
+            }
+
+            let len = data.get_u32_le() as usize;
+            if data.remaining() < len {
+                break;
+            }
+
+            events.push(data.split_to(len));
+        }
+
+        events
+    }
+
+    /// Calculate total size for events
+    #[inline]
+    pub fn calculate_size(events: &[Bytes]) -> usize {
+        events.iter().map(|e| Self::LEN_SIZE + e.len()).sum()
+    }
+}
+
+/// NACK payload for reliable streams
+#[derive(Debug, Clone, Copy)]
+pub struct NackPayload {
+    /// Highest contiguous sequence received
+    pub ack_seq: u64,
+    /// Bitmap of missing sequences (relative to ack_seq + 1)
+    pub missing_bitmap: u64,
+}
+
+impl NackPayload {
+    /// Size of NACK payload
+    pub const SIZE: usize = 16;
+
+    /// Serialize to bytes
+    #[inline]
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..8].copy_from_slice(&self.ack_seq.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.missing_bitmap.to_le_bytes());
+        buf
+    }
+
+    /// Parse from bytes
+    #[inline]
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < Self::SIZE {
+            return None;
+        }
+
+        let ack_seq = u64::from_le_bytes(data[0..8].try_into().ok()?);
+        let missing_bitmap = u64::from_le_bytes(data[8..16].try_into().ok()?);
+
+        Some(Self {
+            ack_seq,
+            missing_bitmap,
+        })
+    }
+
+    /// Get missing sequence numbers
+    #[inline]
+    pub fn missing_sequences(&self) -> impl Iterator<Item = u64> + '_ {
+        (0..64).filter_map(move |i| {
+            if (self.missing_bitmap >> i) & 1 != 0 {
+                Some(self.ack_seq + 1 + i)
+            } else {
+                None
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_header_size() {
+        assert_eq!(std::mem::size_of::<NetHeader>(), HEADER_SIZE);
+    }
+
+    #[test]
+    fn test_header_roundtrip() {
+        let nonce = [0x42u8; NONCE_SIZE];
+        let header = NetHeader::new(
+            0x1234567890ABCDEF,
+            0xFEDCBA0987654321,
+            42,
+            nonce,
+            1024,
+            10,
+            PacketFlags::RELIABLE,
+        )
+        .with_priority(7)
+        .with_hops(32)
+        .with_subprotocol(0x0100)
+        .with_channel_hash(0xABCD)
+        .with_subnet(0x12345678)
+        .with_origin(0xDEADBEEF)
+        .with_fragment(1, 512, 0x01);
+
+        let bytes = header.to_bytes();
+        let parsed = NetHeader::from_bytes(&bytes).unwrap();
+
+        assert_eq!(parsed.magic, MAGIC);
+        assert_eq!(parsed.version, VERSION);
+        assert_eq!(parsed.flags, PacketFlags::RELIABLE);
+        assert_eq!(parsed.priority, 7);
+        assert_eq!(parsed.hop_ttl, 32);
+        assert_eq!(parsed.hop_count, 0);
+        assert_eq!(parsed.frag_flags, 0x01);
+        assert_eq!(parsed.subprotocol_id, 0x0100);
+        assert_eq!(parsed.channel_hash, 0xABCD);
+        assert_eq!(parsed.nonce, nonce);
+        assert_eq!(parsed.session_id, 0x1234567890ABCDEF);
+        assert_eq!(parsed.stream_id, 0xFEDCBA0987654321);
+        assert_eq!(parsed.sequence, 42);
+        assert_eq!(parsed.subnet_id, 0x12345678);
+        assert_eq!(parsed.origin_hash, 0xDEADBEEF);
+        assert_eq!(parsed.fragment_id, 1);
+        assert_eq!(parsed.fragment_offset, 512);
+        assert_eq!(parsed.payload_len, 1024);
+        assert_eq!(parsed.event_count, 10);
+    }
+
+    #[test]
+    fn test_header_validation() {
+        let header = NetHeader::new(0, 0, 0, [0u8; NONCE_SIZE], 1024, 0, PacketFlags::NONE);
+        assert!(header.validate());
+
+        // Invalid magic
+        let mut bytes = header.to_bytes();
+        bytes[0] = 0xFF;
+        let invalid = NetHeader::from_bytes(&bytes);
+        assert!(invalid.is_none());
+    }
+
+    #[test]
+    fn test_packet_flags() {
+        let flags = PacketFlags::NONE
+            .with(PacketFlags::RELIABLE)
+            .with(PacketFlags::PRIORITY);
+
+        assert!(flags.is_reliable());
+        assert!(flags.contains(PacketFlags::PRIORITY));
+        assert!(!flags.is_handshake());
+
+        let cleared = flags.without(PacketFlags::RELIABLE);
+        assert!(!cleared.is_reliable());
+        assert!(cleared.contains(PacketFlags::PRIORITY));
+    }
+
+    #[test]
+    fn test_aad() {
+        let header = NetHeader::new(
+            0x1234567890ABCDEF,
+            0xFEDCBA0987654321,
+            42,
+            [0u8; NONCE_SIZE],
+            1024,
+            10,
+            PacketFlags::RELIABLE,
+        )
+        .with_priority(5)
+        .with_subnet(0x42);
+
+        let aad = header.aad();
+        assert_eq!(aad.len(), 52);
+
+        // Verify magic
+        assert_eq!(u16::from_le_bytes([aad[0], aad[1]]), MAGIC);
+        // Verify version
+        assert_eq!(aad[2], VERSION);
+        // Verify flags
+        assert_eq!(aad[3], PacketFlags::RELIABLE.bits());
+        // Verify priority
+        assert_eq!(aad[4], 5);
+    }
+
+    #[test]
+    fn test_event_frame_roundtrip() {
+        let events = vec![
+            Bytes::from_static(b"event1"),
+            Bytes::from_static(b"event2"),
+            Bytes::from_static(b"event3"),
+        ];
+
+        let mut buf = BytesMut::with_capacity(256);
+        let size = EventFrame::write_events(&events, &mut buf);
+
+        assert_eq!(size, 3 * 4 + 6 + 6 + 6); // 3 length prefixes + event data
+
+        let parsed = EventFrame::read_events(buf.freeze(), 3);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(&parsed[0][..], b"event1");
+        assert_eq!(&parsed[1][..], b"event2");
+        assert_eq!(&parsed[2][..], b"event3");
+    }
+
+    #[test]
+    fn test_nack_payload_roundtrip() {
+        let nack = NackPayload {
+            ack_seq: 100,
+            missing_bitmap: 0b1010_0101,
+        };
+
+        let bytes = nack.to_bytes();
+        let parsed = NackPayload::from_bytes(&bytes).unwrap();
+
+        assert_eq!(parsed.ack_seq, 100);
+        assert_eq!(parsed.missing_bitmap, 0b1010_0101);
+
+        let missing: Vec<_> = parsed.missing_sequences().collect();
+        assert_eq!(missing, vec![101, 103, 106, 108]);
+    }
+
+    #[test]
+    fn test_validate_rejects_excessive_event_count() {
+        let header = NetHeader::new(0, 0, 0, [0u8; NONCE_SIZE], 100, 10, PacketFlags::NONE);
+        assert!(header.validate());
+
+        // event_count exceeding MAX_EVENTS_PER_PACKET must be rejected
+        let header = NetHeader::new(
+            0,
+            0,
+            0,
+            [0u8; NONCE_SIZE],
+            100,
+            NetHeader::MAX_EVENTS_PER_PACKET + 1,
+            PacketFlags::NONE,
+        );
+        assert!(!header.validate());
+    }
+
+    #[test]
+    fn test_read_events_caps_allocation() {
+        // Attacker-controlled count=65535 with tiny payload should not
+        // allocate 65535 slots
+        let data = Bytes::from_static(b"");
+        let events = EventFrame::read_events(data, u16::MAX);
+        assert!(events.is_empty());
+        assert!(events.capacity() <= 1);
+    }
+
+    // ---- Regression tests for Cubic AI findings ----
+
+    #[test]
+    fn test_regression_hop_count_excluded_from_aad() {
+        // Regression: hop_count was included in AAD, but forwarding nodes
+        // increment it in transit. Including it would break AEAD verification
+        // on multi-hop paths.
+        let header1 = NetHeader::new(
+            0x1234,
+            0x5678,
+            42,
+            [0u8; NONCE_SIZE],
+            100,
+            5,
+            PacketFlags::NONE,
+        );
+        let mut header2 = header1;
+        header2.hop_count = 99; // forwarding node incremented hop_count
+
+        assert_eq!(
+            header1.aad(),
+            header2.aad(),
+            "AAD must be identical regardless of hop_count (mutable in transit)"
+        );
+    }
+}

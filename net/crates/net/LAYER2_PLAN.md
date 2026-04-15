@@ -16,7 +16,7 @@ Channel policy uses the existing **capability system** (`CapabilityFilter`, `Cap
 
 ---
 
-## New Module: `src/adapter/bltp/channel/`
+## New Module: `src/adapter/net/channel/`
 
 ### Step 1: `channel/name.rs` — Named Typed Channels
 
@@ -102,7 +102,7 @@ false positive rate.
 | File | Change | Step |
 |------|--------|------|
 | `mod.rs` | Add `pub mod channel;`, re-exports | 1 |
-| `protocol.rs` | Add `BltpHeader::with_channel()` convenience | 1 |
+| `protocol.rs` | Add `NetHeader::with_channel()` convenience | 1 |
 | `pool.rs` | `PacketBuilder` gets `channel_hash: u16`, stamps in `build()` | 3 |
 | `router.rs` | Add `AuthGuard` check in `route_packet()`, upgrade `FairScheduler` | 3-4 |
 | `proxy.rs` | Same `AuthGuard` check in forwarding path | 3 |

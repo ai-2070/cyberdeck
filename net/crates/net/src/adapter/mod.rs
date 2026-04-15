@@ -18,7 +18,7 @@
 //! - `NoopAdapter`: Discards events (for testing/benchmarking)
 //! - `RedisAdapter`: Redis Streams backend (requires `redis` feature)
 //! - `JetStreamAdapter`: NATS JetStream backend (requires `jetstream` feature)
-//! - `BltpAdapter`: High-performance UDP transport (requires `bltp` feature)
+//! - `NetAdapter`: High-performance UDP transport (requires `net` feature)
 
 mod noop;
 
@@ -28,8 +28,8 @@ mod redis;
 #[cfg(feature = "jetstream")]
 mod jetstream;
 
-#[cfg(feature = "bltp")]
-pub mod bltp;
+#[cfg(feature = "net")]
+pub mod net;
 
 pub use noop::NoopAdapter;
 
@@ -39,8 +39,8 @@ pub use self::redis::RedisAdapter;
 #[cfg(feature = "jetstream")]
 pub use self::jetstream::JetStreamAdapter;
 
-#[cfg(feature = "bltp")]
-pub use self::bltp::{BltpAdapter, BltpAdapterConfig};
+#[cfg(feature = "net")]
+pub use self::net::{NetAdapter, NetAdapterConfig};
 
 use async_trait::async_trait;
 
