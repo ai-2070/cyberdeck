@@ -237,6 +237,12 @@ Net's scheduling overhead is nanoseconds. The remaining latency after Net proces
 
 This isn't a marginal improvement. It's a category change. When your coordination latency drops from 50ms to 33 microseconds, things that were impossible become trivial. Closed-loop control across a mesh of autonomous devices. Real-time consensus between robots on a factory floor. Swarm coordination where the mesh reacts faster than any individual node's control loop. These aren't theoretical. They're what happens when the software gets out of the way and the only remaining constraint is the speed of light.
 
+Not every event needs to stay local. A motor's torque feedback at 10kHz needs to close the loop in microseconds - that stays on the mesh, between the sensor and the actuator, never leaving the floor. But the vibration pattern that predicts bearing failure next week? That can travel to a data center where a model with 100GB of training data runs inference on it. The anomaly detection that requires comparing this motor's signature against a fleet of 10,000 motors across 200 facilities? That belongs in the cloud, where the compute and the historical data live.
+
+The mesh doesn't replace the data center. It separates what must be fast from what must be smart. Time-critical control loops run locally at microsecond latencies. Expensive analysis, model inference, fleet-wide correlation, long-term storage - those flow to the data center on the mesh's own terms, when the local node decides to send them, not when a polling interval fires. The local node is autonomous. It acts first, reports later. The data center adds intelligence, not authority.
+
+This is the split that current architectures can't make cleanly. When everything routes through the cloud, the 10kHz control loop and the weekly predictive model share the same 50ms round trip. One is 1500x too slow, the other doesn't care. Net lets each event find its natural home - the fast ones stay local, the complex ones travel to where the compute is. The subnet hierarchy, channel visibility, and capability-based routing make this split explicit in the protocol, not an afterthought bolted onto a cloud API.
+
 ## Why not cloud
 
 Cloud infrastructure solves the wrong problem. It moves compute closer to a central provider. Net moves compute closer to the data and the work.
