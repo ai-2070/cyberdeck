@@ -24,6 +24,8 @@ High-performance encrypted mesh runtime.
 
 **The event bus is non-localized.** Unlike broker-based systems (Kafka, Pulsar) or single-process ring buffers (LMAX Disruptor), the event bus has no fixed location. Local ring buffers are speed buffers; the logical bus spans the mesh. No broker to provision or fail over. No plaintext at relay nodes. No partition-leader bottleneck -- ordering is per-entity via causal chains, not per-partition via a single leader. Events exist in transit; storage is a choice via adapters, not an architectural requirement.
 
+**Event consumption is location-transparent.** A `MeshDaemon` receives events through the same `process(&CausalEvent)` interface regardless of whether the event originated locally, one hop away, or across the mesh. The mesh handles routing, decryption, and chain validation before the daemon sees the event. Code written for a single-node prototype runs unmodified on a multi-hop deployment. The topology is a runtime decision, not a code change.
+
 ## Stack
 
 | Layer | What it does | Docs |
