@@ -13,8 +13,8 @@
  *         Strings from net_generate_keypair() must be freed with net_free_string().
  */
 
-#ifndef NET_MESH_SDK_H
-#define NET_MESH_SDK_H
+#ifndef NET_SDK_H
+#define NET_SDK_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -253,4 +253,4 @@ void net_free_string(char* s);
 }
 #endif
 
-#endif /* NET_MESH_SDK_H */
+#endif /* NET_SDK_H */
