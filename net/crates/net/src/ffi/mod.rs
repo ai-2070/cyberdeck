@@ -940,7 +940,7 @@ pub extern "C" fn net_free_poll_result(result: *mut NetPollResult) {
 
             if !event.id.is_null() {
                 unsafe {
-                    let _ = Box::from_raw(std::slice::from_raw_parts_mut(
+                    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
                         event.id as *mut u8,
                         event.id_len,
                     ));
@@ -948,7 +948,7 @@ pub extern "C" fn net_free_poll_result(result: *mut NetPollResult) {
             }
             if !event.raw.is_null() {
                 unsafe {
-                    let _ = Box::from_raw(std::slice::from_raw_parts_mut(
+                    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
                         event.raw as *mut u8,
                         event.raw_len,
                     ));
