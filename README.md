@@ -196,6 +196,20 @@ Three consequences:
 
 This is what makes "processing without storage" possible. The data isn't stored at the bus. The data is in transit through the mesh. Any node with matching capabilities can process it. If that node dies, another picks it up. Storage is a choice made by individual nodes via persistence adapters (Redis, JetStream), not an architectural requirement of the bus itself.
 
+## Infinite extensibility via subprotocols
+
+Every BLTP packet carries a `subprotocol_id` field. This is 16 bits in the header - 65,536 possible protocols - and it changes everything about how the mesh evolves.
+
+A vendor builds a custom inference protocol for their hardware. They pick an ID in the vendor range, implement the `MeshDaemon` trait, register it in the `SubprotocolRegistry`, and deploy. The mesh already knows how to route their traffic - the node advertises `subprotocol:0x1000` as a capability tag, the existing `CapabilityIndex` indexes it, and any node that needs that protocol can find a handler through the same query path used for GPU discovery or tool matching. No firmware update. No mesh-wide upgrade. No coordination with anyone.
+
+The critical property is the **opaque forwarding guarantee**: nodes that don't understand a subprotocol forward it anyway. They read the routing header, decide the next hop, and pass the encrypted payload through without inspection. The intermediate node doesn't need to know what's inside. It doesn't need the handler installed. It doesn't even need to know the subprotocol exists. It forwards because the routing header says to, and it can't read the payload even if it wanted to.
+
+This means new protocols deploy incrementally. You upgrade the nodes that need to process the protocol. Every other node in the mesh - every relay, every gateway, every forwarding hop - continues working unchanged. There is no flag day. There is no "upgrade the mesh to support protocol X." The mesh already supports protocol X. It just doesn't know what X means, and it doesn't need to.
+
+Version negotiation happens at session establishment, not per-packet. Peers exchange manifests - compact lists of (protocol ID, version, minimum compatible version) - and compute a `NegotiatedSet` of protocols they both understand. This is a pure function. No coordinator, no registry server, no version authority. Two nodes meet, compare notes, and know what they can talk about.
+
+The consequence is that the mesh is not a fixed protocol. It is a protocol runtime. The transport, encryption, routing, forwarding, failure detection - those are fixed. Everything above them is a subprotocol that can be swapped, extended, versioned, and deployed independently. The mesh doesn't have features. It has a feature space.
+
 ## Cost of devices
 
 When processing can be offloaded to the mesh, edge devices don't need to be smart. They need to be present.
