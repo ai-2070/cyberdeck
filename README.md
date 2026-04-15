@@ -150,22 +150,6 @@ Traditional networking treats the connection as the primary object. You establis
 
 Net propagates state. Connections are ephemeral transport - the current shortest path between where state is and where it needs to be. When a path breaks, state doesn't wait for recovery. It moves. The routing table updates, the proximity graph adjusts, the state continues on a different path. No reconnection, no session resumption, no handshake retry. Identity lives in the state chain, not in the socket.
 
-## Non-localized event bus
-
-Every prior event bus has a location. LMAX Disruptor is a single-process ring buffer. Kafka is a cluster of brokers at fixed addresses. Pulsar separates compute from storage but retains the broker model. In all cases, the bus is something you connect *to* - it has a process, a machine, a data center. Producers and consumers know where it is.
-
-Net's event bus has no location. The sharded ring buffers on each node are local speed buffers, but the logical event bus spans the mesh. A producer on node A and a consumer on node C interact through the same abstraction regardless of whether they're on the same machine, the same subnet, or separated by five relay hops. The mesh handles routing, encryption, forwarding, and failure recovery transparently. The bus isn't *at* a location - it *is* the mesh.
-
-Three consequences:
-
-**No broker.** There is nothing to provision, scale, or fail over. The bus exists wherever participating nodes exist. Adding a node adds capacity. Removing a node triggers rerouting, not an outage.
-
-**No plaintext at rest.** Broker-based systems hold plaintext at the broker - the broker must read messages to route them. Net's relay nodes forward encrypted bytes they cannot read. The event bus is encrypted end-to-end even though no single node is the "bus."
-
-**No partition-leader bottleneck.** Kafka orders events per partition, creating a single-leader bottleneck per partition. Net orders events per entity via causal chains. There is no partition leader. Every entity maintains its own chain independently. Ordering scales with the number of entities, not with the number of partitions a broker can handle.
-
-This is what makes "processing without storage" possible. The data isn't stored at the bus. The data is in transit through the mesh. Any node with matching capabilities can process it. If that node dies, another picks it up. Storage is a choice made by individual nodes via persistence adapters (Redis, JetStream), not an architectural requirement of the bus itself.
-
 ## Invariants
 
 **Identity.** A node is its keypair. Every node has a long-lived cryptographic identity - the public key is the node ID, the private key is the authority to act as that node. Identity is cryptographic, not topological. A node can roam across networks, change IPs, traverse NAT, switch interfaces, and remain the same node. All communication is authenticated against this identity, independent of network location.
@@ -193,6 +177,22 @@ This means processing can happen anywhere without first solving "where is the da
 Storage becomes a choice, not an assumption. A node can choose to persist events to Redis. A node can choose to replay from JetStream. But the mesh itself doesn't require storage to function. Events exist in the ring buffers of the nodes they're passing through, for as long as they're relevant, and then they're gone. If you need them later, that's what the persistence adapters are for. But the processing path - the hot path - never touches disk, never queries a database, never waits on storage I/O.
 
 This is why the latency numbers are what they are. Processing isn't waiting on storage. Storage isn't blocking processing. They're independent decisions made by independent nodes.
+
+## Non-localized event bus
+
+Every prior event bus has a location. LMAX Disruptor is a single-process ring buffer. Kafka is a cluster of brokers at fixed addresses. Pulsar separates compute from storage but retains the broker model. In all cases, the bus is something you connect *to* - it has a process, a machine, a data center. Producers and consumers know where it is.
+
+Net's event bus has no location. The sharded ring buffers on each node are local speed buffers, but the logical event bus spans the mesh. A producer on node A and a consumer on node C interact through the same abstraction regardless of whether they're on the same machine, the same subnet, or separated by five relay hops. The mesh handles routing, encryption, forwarding, and failure recovery transparently. The bus isn't *at* a location - it *is* the mesh.
+
+Three consequences:
+
+**No broker.** There is nothing to provision, scale, or fail over. The bus exists wherever participating nodes exist. Adding a node adds capacity. Removing a node triggers rerouting, not an outage.
+
+**No plaintext at rest.** Broker-based systems hold plaintext at the broker - the broker must read messages to route them. Net's relay nodes forward encrypted bytes they cannot read. The event bus is encrypted end-to-end even though no single node is the "bus."
+
+**No partition-leader bottleneck.** Kafka orders events per partition, creating a single-leader bottleneck per partition. Net orders events per entity via causal chains. There is no partition leader. Every entity maintains its own chain independently. Ordering scales with the number of entities, not with the number of partitions a broker can handle.
+
+This is what makes "processing without storage" possible. The data isn't stored at the bus. The data is in transit through the mesh. Any node with matching capabilities can process it. If that node dies, another picks it up. Storage is a choice made by individual nodes via persistence adapters (Redis, JetStream), not an architectural requirement of the bus itself.
 
 ## Cost of devices
 
