@@ -260,7 +260,7 @@ Not every event needs to stay local. A motor's torque feedback at 10kHz needs to
 
 The mesh doesn't replace the data center. It separates what must be fast from what must be smart. Time-critical control loops run locally at microsecond latencies. Expensive analysis, model inference, fleet-wide correlation, long-term storage - those flow to the data center on the mesh's own terms, when the local node decides to send them, not when a polling interval fires. The local node is autonomous. It acts first, reports later. The data center adds intelligence, not authority.
 
-This is the split that current architectures can't make cleanly. When everything routes through the cloud, the 10kHz control loop and the weekly predictive model share the same 50ms round trip. One is 1500x too slow, the other doesn't care. Net lets each event find its natural home - the fast ones stay local, the complex ones travel to where the compute is. The subnet hierarchy, channel visibility, and capability-based routing make this split explicit in the protocol, not an afterthought bolted onto a cloud API.
+This is the split that current architectures can't make cleanly. When everything routes through the cloud, the 10kHz control loop and the weekly predictive model share the same 50ms round trip. One is 1500x too slow, the other doesn't care. Net uses tiered routing with proximity graphs to allow each event to find its natural home - the fast ones stay local, the complex ones travel to where the compute is. The subnet hierarchy, channel visibility, and capability-based routing make this split explicit in the protocol, not an afterthought bolted onto a cloud API.
 
 ## Why not cloud
 
