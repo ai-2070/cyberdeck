@@ -1,0 +1,23 @@
+net/crates/net/sdk-py/README.md
+  16f62563c20d300d 1-150
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "8e2baff2f154feb3abfab1a81652b2fd96e2eba4",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 358,
+      "overriden_lines": 0
+    }
+  }
+}

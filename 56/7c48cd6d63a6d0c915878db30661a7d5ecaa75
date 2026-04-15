@@ -1,0 +1,37 @@
+net/crates/net/sdk-ts/package.json
+  16f62563c20d300d 1-9,11-42
+net/crates/net/sdk-ts/src/index.ts
+  16f62563c20d300d 1-48
+net/crates/net/sdk-ts/src/stream.ts
+  16f62563c20d300d 1-113
+net/crates/net/sdk-ts/src/channel.ts
+  16f62563c20d300d 1-102
+.gitignore
+  16f62563c20d300d 1-2
+net/crates/net/sdk-ts/tsconfig.json
+  16f62563c20d300d 1-19
+net/crates/net/sdk-ts/src/node.ts
+  16f62563c20d300d 1-278
+net/crates/net/sdk-ts/src/types.ts
+  16f62563c20d300d 1-110
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "567c48cd6d63a6d0c915878db30661a7d5ecaa75",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2262,
+      "total_deletions": 1548,
+      "accepted_lines": 849,
+      "overriden_lines": 1
+    }
+  }
+}

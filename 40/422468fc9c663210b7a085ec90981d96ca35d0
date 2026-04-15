@@ -1,0 +1,42 @@
+net/crates/net/src/adapter/nltp/mod.rs
+  16f62563c20d300d 69,91,94,101
+net/crates/net/src/adapter/nltp/pool.rs
+  16f62563c20d300d 12
+net/crates/net/tests/integration_nltp.rs
+  16f62563c20d300d 16
+net/crates/net/src/ffi/mod.rs
+  16f62563c20d300d 400,479
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "40422468fc9c663210b7a085ec90981d96ca35d0",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 49506,
+      "overriden_lines": 0
+    },
+    "5228086430eb2882": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f56a6515-4b2d-43ca-a235-34b660f84cb8",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 541,
+      "overriden_lines": 0
+    }
+  }
+}

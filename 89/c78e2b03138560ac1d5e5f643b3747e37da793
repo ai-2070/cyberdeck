@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/protocol.rs
+  16f62563c20d300d 8-9,112,141
+net/crates/net/README.md
+  16f62563c20d300d 87
+net/crates/net/docs/TRANSPORT.md
+  16f62563c20d300d 13,36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "89c78e2b03138560ac1d5e5f643b3747e37da793",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 7,
+      "total_deletions": 7,
+      "accepted_lines": 143,
+      "overriden_lines": 0
+    }
+  }
+}

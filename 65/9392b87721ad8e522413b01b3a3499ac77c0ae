@@ -1,0 +1,23 @@
+net/crates/net/RUST_SDK_PLAN.md
+  16f62563c20d300d 5,8,10,132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "659392b87721ad8e522413b01b3a3499ac77c0ae",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 4,
+      "total_deletions": 4,
+      "accepted_lines": 140,
+      "overriden_lines": 0
+    }
+  }
+}

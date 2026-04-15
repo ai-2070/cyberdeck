@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/linux.rs
+  16f62563c20d300d 5
+net/crates/net/bindings/go/README.md
+  16f62563c20d300d 123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "8a076aaddf7127ed790a460b8d03f413b7e0a9fc",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2,
+      "total_deletions": 2,
+      "accepted_lines": 138,
+      "overriden_lines": 0
+    }
+  }
+}

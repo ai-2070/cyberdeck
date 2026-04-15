@@ -1,0 +1,23 @@
+net/crates/net/src/ffi/mod.rs
+  16f62563c20d300d 759,761,768,770,772,774,776,778,785,787,789,791,798,800,802
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "9778fe5232c070b2b5f53693efb4bc3103a9953b",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1044,
+      "total_deletions": 1161,
+      "accepted_lines": 151,
+      "overriden_lines": 0
+    }
+  }
+}

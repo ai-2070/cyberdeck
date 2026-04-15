@@ -1,0 +1,23 @@
+net/crates/net/TS_SDK_PLAN.md
+  16f62563c20d300d 1-328
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "df8386752b3112cd1819e61d22c174f068a372d5",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 328,
+      "total_deletions": 0,
+      "accepted_lines": 464,
+      "overriden_lines": 0
+    }
+  }
+}

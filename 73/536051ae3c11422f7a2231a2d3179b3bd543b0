@@ -1,0 +1,23 @@
+net/crates/net/bindings/go/net/net.go
+  16f62563c20d300d 319
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "73536051ae3c11422f7a2231a2d3179b3bd543b0",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 1,
+      "accepted_lines": 71,
+      "overriden_lines": 0
+    }
+  }
+}
