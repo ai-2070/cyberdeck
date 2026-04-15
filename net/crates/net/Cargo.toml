@@ -20,7 +20,7 @@ categories = ["asynchronous", "concurrency", "data-structures"]
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [features]
-default = ["redis"]
+default = []
 redis = ["dep:redis"]
 jetstream = ["dep:async-nats"]
 net = [
