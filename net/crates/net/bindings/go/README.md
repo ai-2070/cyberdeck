@@ -120,7 +120,7 @@ Net provides encrypted point-to-point UDP transport for high-performance scenari
 import (
     "crypto/rand"
     "encoding/hex"
-    "github.com/ai2070/net/bindings/go/net"
+    "github.com/ai-2070/net/bindings/go/net"
 )
 
 // Generate keypair for responder

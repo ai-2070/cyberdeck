@@ -2,7 +2,7 @@
 //!
 //! This module provides:
 //! - sendmmsg/recvmmsg for batched I/O
-//! - io_uring support (optional, requires `net-uring` feature)
+//! - io_uring support (optional)
 //! - Socket configuration for high-throughput
 
 use bytes::{Bytes, BytesMut};
