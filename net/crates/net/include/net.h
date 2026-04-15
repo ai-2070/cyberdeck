@@ -75,9 +75,6 @@ typedef struct {
     uint64_t batches_dispatched;
 } net_stats_t;
 
-/* Callback for subscription events. */
-typedef void (*net_event_callback_t)(const net_event_t* event, void* user_data);
-
 /* ========================================================================= */
 /* Lifecycle                                                                 */
 /* ========================================================================= */
@@ -206,34 +203,6 @@ int net_poll_ex(
  * Free a poll result returned by net_poll_ex().
  */
 void net_free_poll_result(net_poll_result_t* result);
-
-/* ========================================================================= */
-/* Subscription                                                              */
-/* ========================================================================= */
-
-/*
- * Subscribe to events with a callback.
- *
- * Starts an internal polling thread that calls the callback for each event.
- * The callback is invoked from the polling thread — keep it fast.
- *
- * @param handle      Node handle.
- * @param batch_limit Maximum events per poll batch.
- * @param callback    Function called for each event.
- * @param user_data   Passed through to callback (may be NULL).
- * @return  Subscription handle, or NULL on failure. Free with net_unsubscribe().
- */
-net_handle_t net_subscribe(
-    net_handle_t handle,
-    size_t batch_limit,
-    net_event_callback_t callback,
-    void* user_data
-);
-
-/*
- * Stop a subscription and free its resources.
- */
-void net_unsubscribe(net_handle_t subscription);
 
 /* ========================================================================= */
 /* Statistics                                                                */
