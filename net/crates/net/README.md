@@ -271,6 +271,17 @@ bus, _ := net.New(&net.Config{NumShards: 4})
 bus.IngestRaw(`{"token": "hello"}`)
 ```
 
+## SDKs
+
+Higher-level SDKs with streaming, typed events, and idiomatic APIs for each language.
+
+| SDK | Package | Description |
+|-----|---------|-------------|
+| **Rust** | [`net-sdk`](sdk/) | Builder pattern, async streams, typed subscriptions |
+| **TypeScript** | [`@ai-2070/net-sdk`](sdk-ts/) | AsyncIterator, typed channels, Zod support |
+| **Python** | [`net-sdk`](sdk-py/) | Generators, dataclass/Pydantic, context manager |
+| **C** | [`net.h`](include/net.h) | One header, structured types, zero JSON overhead |
+
 ## Features
 
 | Feature | Flag | Dependencies |
