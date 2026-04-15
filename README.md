@@ -305,9 +305,11 @@ This is different from TLS, where every hop that terminates TLS - load balancers
 
 ## The Blackwall
 
-In Cyberpunk, the Blackwall contains rogue AIs from consuming the Net. In this system, the Blackwall contains rogue traffic from consuming the mesh. Same function - containment of uncontrolled propagation - different threat model.
+In Cyberpunk, the Blackwall isn't a wall around the threats. It's a wall around the safe zone. The public net is a small, whitelisted set of servers that Netwatch has cleared. Everything outside - private corps nets, data forts, rogue AIs, uncleared infrastructure - is the vast majority. The wall protects the known from the unknown.
 
-The Blackwall isn't one mechanism. It's the emergent effect of every constraint working together:
+Net works the same way. The "safe mesh" is the part you can observe: nodes that respond within heartbeat intervals, honor their capability announcements, don't flood, respect TTL. Safety isn't declared by an authority. It's derived from consistent, observable behavior. The Blackwall is the boundary where observation ends - beyond your proximity graph, beyond your gateways' subnet summaries, beyond what you can derive. Not necessarily hostile. Just unknown. And unknown gets no trust by default.
+
+The wall isn't one mechanism. It's the emergent effect of every constraint working together:
 
 - **Backpressure.** Nodes limit in-flight events, prevent overload, and apply pushback by going silent. No node can be forced to accept more than it can process.
 - **Bounded queues.** No infinite buffers. Ring buffers have explicit capacity limits. Memory usage is predictable and fixed. A flood fills a buffer and gets evicted, it doesn't grow the buffer.
