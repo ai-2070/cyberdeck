@@ -1,21 +1,21 @@
 [package]
-name = "blackstream-node"
+name = "net-node"
 version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Node.js bindings for Blackstream event bus"
+description = "Node.js bindings for Net event bus"
 
 [lib]
 crate-type = ["cdylib"]
 
 [features]
 default = ["redis"]
-redis = ["blackstream/redis"]
-jetstream = ["blackstream/jetstream"]
-bltp = ["blackstream/bltp", "dep:hex"]
+redis = ["net/redis"]
+jetstream = ["net/jetstream"]
+nltp = ["net/nltp", "dep:hex"]
 
 [dependencies]
-blackstream = { path = "../..", default-features = false }
+net = { path = "../..", default-features = false }
 napi = { version = "3.7.0", default-features = false, features = ["napi4", "async", "tokio_rt"] }
 napi-derive = "3.4.0"
 tokio = { version = "1.48.0", features = ["rt-multi-thread"] }

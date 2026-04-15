@@ -1,5 +1,5 @@
 /**
- * Integration tests for Blackstream Node.js bindings with BLTP.
+ * Integration tests for Net Node.js bindings with NLTP.
  *
  * Run tests:
  *   npm test
@@ -10,11 +10,11 @@
 
 import { describe, it, expect, beforeAll } from "vitest";
 import {
-  Blackstream,
+  Net,
   StoredEvent,
   PollResponse,
-  generateBltpKeypair,
-  BltpKeypair,
+  generateNltpKeypair,
+  NltpKeypair,
 } from "../index";
 import * as crypto from "crypto";
 
@@ -28,22 +28,22 @@ async function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Check if BLTP feature is available
-let bltpAvailable = false;
+// Check if NLTP feature is available
+let nltpAvailable = false;
 try {
-  if (typeof generateBltpKeypair === "function") {
-    generateBltpKeypair();
-    bltpAvailable = true;
+  if (typeof generateNltpKeypair === "function") {
+    generateNltpKeypair();
+    nltpAvailable = true;
   }
 } catch {
-  bltpAvailable = false;
+  nltpAvailable = false;
 }
 
-describe.skipIf(!RUN_INTEGRATION_TESTS || !bltpAvailable)(
-  "BLTP Integration Tests",
+describe.skipIf(!RUN_INTEGRATION_TESTS || !nltpAvailable)(
+  "NLTP Integration Tests",
   () => {
     it("should generate valid keypairs", () => {
-      const keypair = generateBltpKeypair();
+      const keypair = generateNltpKeypair();
 
       expect(keypair).toBeDefined();
       expect(keypair.publicKey).toBeDefined();
@@ -58,22 +58,22 @@ describe.skipIf(!RUN_INTEGRATION_TESTS || !bltpAvailable)(
       expect(/^[0-9a-f]+$/i.test(keypair.secretKey)).toBe(true);
 
       // Each call should generate different keypairs
-      const keypair2 = generateBltpKeypair();
+      const keypair2 = generateNltpKeypair();
       expect(keypair2.publicKey).not.toBe(keypair.publicKey);
       expect(keypair2.secretKey).not.toBe(keypair.secretKey);
     });
 
     it("should exchange events between initiator and responder", async () => {
       // Generate keypair for responder
-      const responderKeypair = generateBltpKeypair();
+      const responderKeypair = generateNltpKeypair();
 
       // Generate shared PSK (32 bytes hex)
       const psk = crypto.randomBytes(32).toString("hex");
 
       // Create responder (binds first, waits for initiator)
-      const responder = await Blackstream.create({
+      const responder = await Net.create({
         numShards: 1,
-        bltp: {
+        nltp: {
           bindAddr: "127.0.0.1:19000",
           peerAddr: "127.0.0.1:19001",
           psk: psk,
@@ -88,9 +88,9 @@ describe.skipIf(!RUN_INTEGRATION_TESTS || !bltpAvailable)(
       await sleep(50);
 
       // Create initiator
-      const initiator = await Blackstream.create({
+      const initiator = await Net.create({
         numShards: 1,
-        bltp: {
+        nltp: {
           bindAddr: "127.0.0.1:19001",
           peerAddr: "127.0.0.1:19000",
           psk: psk,
@@ -134,13 +134,13 @@ describe.skipIf(!RUN_INTEGRATION_TESTS || !bltpAvailable)(
       }
     });
 
-    it("should support batch ingestion over BLTP", async () => {
-      const responderKeypair = generateBltpKeypair();
+    it("should support batch ingestion over NLTP", async () => {
+      const responderKeypair = generateNltpKeypair();
       const psk = crypto.randomBytes(32).toString("hex");
 
-      const responder = await Blackstream.create({
+      const responder = await Net.create({
         numShards: 1,
-        bltp: {
+        nltp: {
           bindAddr: "127.0.0.1:19002",
           peerAddr: "127.0.0.1:19003",
           psk: psk,
@@ -152,9 +152,9 @@ describe.skipIf(!RUN_INTEGRATION_TESTS || !bltpAvailable)(
 
       await sleep(50);
 
-      const initiator = await Blackstream.create({
+      const initiator = await Net.create({
         numShards: 1,
-        bltp: {
+        nltp: {
           bindAddr: "127.0.0.1:19003",
           peerAddr: "127.0.0.1:19002",
           psk: psk,
@@ -185,12 +185,12 @@ describe.skipIf(!RUN_INTEGRATION_TESTS || !bltpAvailable)(
     });
 
     it("should work with full reliability mode", async () => {
-      const responderKeypair = generateBltpKeypair();
+      const responderKeypair = generateNltpKeypair();
       const psk = crypto.randomBytes(32).toString("hex");
 
-      const responder = await Blackstream.create({
+      const responder = await Net.create({
         numShards: 1,
-        bltp: {
+        nltp: {
           bindAddr: "127.0.0.1:19004",
           peerAddr: "127.0.0.1:19005",
           psk: psk,
@@ -205,9 +205,9 @@ describe.skipIf(!RUN_INTEGRATION_TESTS || !bltpAvailable)(
 
       await sleep(50);
 
-      const initiator = await Blackstream.create({
+      const initiator = await Net.create({
         numShards: 1,
-        bltp: {
+        nltp: {
           bindAddr: "127.0.0.1:19005",
           peerAddr: "127.0.0.1:19004",
           psk: psk,

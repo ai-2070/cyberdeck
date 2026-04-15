@@ -1,0 +1,241 @@
+"""Type stubs for net native module."""
+
+from typing import Iterator, Optional
+
+class IngestResult:
+    """Result of an ingestion operation."""
+
+    @property
+    def shard_id(self) -> int:
+        """Shard the event was assigned to."""
+        ...
+
+    @property
+    def timestamp(self) -> int:
+        """Insertion timestamp (nanoseconds)."""
+        ...
+
+class StoredEvent:
+    """A stored event returned from polling."""
+
+    @property
+    def id(self) -> str:
+        """Backend-specific event ID."""
+        ...
+
+    @property
+    def raw(self) -> str:
+        """Raw JSON payload as string."""
+        ...
+
+    @property
+    def insertion_ts(self) -> int:
+        """Insertion timestamp (nanoseconds)."""
+        ...
+
+    @property
+    def shard_id(self) -> int:
+        """Shard ID."""
+        ...
+
+    def parse(self) -> dict:
+        """Parse the raw JSON into a Python dict."""
+        ...
+
+class PollResponse:
+    """Poll response containing events and cursor."""
+
+    @property
+    def events(self) -> list[StoredEvent]:
+        """List of events."""
+        ...
+
+    @property
+    def next_id(self) -> Optional[str]:
+        """Next ID for pagination (pass to next poll as cursor)."""
+        ...
+
+    @property
+    def has_more(self) -> bool:
+        """Whether there are more events available."""
+        ...
+
+    def __len__(self) -> int: ...
+    def __iter__(self) -> Iterator[StoredEvent]: ...
+
+class Stats:
+    """Ingestion statistics."""
+
+    @property
+    def events_ingested(self) -> int:
+        """Total events ingested."""
+        ...
+
+    @property
+    def events_dropped(self) -> int:
+        """Events dropped due to backpressure."""
+        ...
+
+class Net:
+    """
+    High-performance event bus for Python.
+
+    Example:
+        >>> from net import Net
+        >>> bus = Net(num_shards=4)
+        >>> bus.ingest_raw('{"token": "hello"}')
+        IngestResult(shard_id=2, timestamp=1234567890)
+        >>> bus.shutdown()
+
+    Can also be used as a context manager:
+        >>> with Net() as bus:
+        ...     bus.ingest_raw('{"data": "value"}')
+    """
+
+    def __init__(
+        self,
+        num_shards: Optional[int] = None,
+        ring_buffer_capacity: Optional[int] = None,
+        backpressure_mode: Optional[str] = None,
+        redis_url: Optional[str] = None,
+        redis_prefix: Optional[str] = None,
+        redis_pipeline_size: Optional[int] = None,
+        redis_pool_size: Optional[int] = None,
+        redis_connect_timeout_ms: Optional[int] = None,
+        redis_command_timeout_ms: Optional[int] = None,
+        redis_max_stream_len: Optional[int] = None,
+        jetstream_url: Optional[str] = None,
+        jetstream_prefix: Optional[str] = None,
+        jetstream_connect_timeout_ms: Optional[int] = None,
+        jetstream_request_timeout_ms: Optional[int] = None,
+        jetstream_max_messages: Optional[int] = None,
+        jetstream_max_bytes: Optional[int] = None,
+        jetstream_max_age_ms: Optional[int] = None,
+        jetstream_replicas: Optional[int] = None,
+        nltp_bind_addr: Optional[str] = None,
+        nltp_peer_addr: Optional[str] = None,
+        nltp_psk: Optional[str] = None,
+        nltp_role: Optional[str] = None,
+        nltp_peer_public_key: Optional[str] = None,
+        nltp_secret_key: Optional[str] = None,
+        nltp_public_key: Optional[str] = None,
+        nltp_reliability: Optional[str] = None,
+        nltp_heartbeat_interval_ms: Optional[int] = None,
+        nltp_session_timeout_ms: Optional[int] = None,
+        nltp_batched_io: Optional[bool] = None,
+        nltp_packet_pool_size: Optional[int] = None,
+    ) -> None:
+        """
+        Create a new Net event bus.
+
+        Args:
+            num_shards: Number of shards (defaults to CPU core count)
+            ring_buffer_capacity: Ring buffer capacity per shard (must be power of 2)
+            backpressure_mode: One of "drop_newest", "drop_oldest", "fail_producer"
+            redis_url: Redis connection URL (e.g., "redis://localhost:6379")
+            redis_prefix: Stream key prefix (default: "net")
+            redis_pipeline_size: Maximum commands per pipeline (default: 1000)
+            redis_pool_size: Connection pool size (default: num_shards)
+            redis_connect_timeout_ms: Connection timeout in milliseconds (default: 5000)
+            redis_command_timeout_ms: Command timeout in milliseconds (default: 1000)
+            redis_max_stream_len: Maximum stream length, unlimited if not set
+            jetstream_url: NATS JetStream URL (e.g., "nats://localhost:4222")
+            jetstream_prefix: Stream name prefix (default: "net")
+            jetstream_connect_timeout_ms: Connection timeout in milliseconds (default: 5000)
+            jetstream_request_timeout_ms: Request timeout in milliseconds (default: 5000)
+            jetstream_max_messages: Maximum messages per stream, unlimited if not set
+            jetstream_max_bytes: Maximum bytes per stream, unlimited if not set
+            jetstream_max_age_ms: Maximum age for messages in milliseconds, unlimited if not set
+            jetstream_replicas: Number of stream replicas (default: 1)
+            nltp_bind_addr: NLTP local bind address (e.g., "127.0.0.1:9000")
+            nltp_peer_addr: NLTP remote peer address (e.g., "127.0.0.1:9001")
+            nltp_psk: Hex-encoded 32-byte pre-shared key
+            nltp_role: Connection role - "initiator" or "responder"
+            nltp_peer_public_key: Hex-encoded peer's public key (required for initiator)
+            nltp_secret_key: Hex-encoded secret key (required for responder)
+            nltp_public_key: Hex-encoded public key (required for responder)
+            nltp_reliability: Reliability mode - "none", "light", or "full" (default: "none")
+            nltp_heartbeat_interval_ms: Heartbeat interval in milliseconds (default: 5000)
+            nltp_session_timeout_ms: Session timeout in milliseconds (default: 30000)
+            nltp_batched_io: Enable batched I/O for Linux (default: False)
+            nltp_packet_pool_size: Packet pool size (default: 64)
+        """
+        ...
+
+    def ingest_raw(self, json: str) -> IngestResult:
+        """
+        Ingest a raw JSON string (fastest path).
+
+        This is the recommended method for high-throughput ingestion.
+        The JSON string is stored directly without parsing.
+
+        Args:
+            json: JSON string to ingest
+
+        Returns:
+            IngestResult with shard_id and timestamp
+        """
+        ...
+
+    def ingest(self, event: dict) -> IngestResult:
+        """
+        Ingest a Python dict (convenience method).
+
+        The dict is serialized to JSON before ingestion.
+        For maximum performance, use `ingest_raw` with pre-serialized JSON.
+
+        Args:
+            event: Dict to ingest (will be JSON serialized)
+
+        Returns:
+            IngestResult with shard_id and timestamp
+        """
+        ...
+
+    def ingest_raw_batch(self, events: list[str]) -> int:
+        """
+        Ingest multiple raw JSON strings in a batch.
+
+        Args:
+            events: List of JSON strings to ingest
+
+        Returns:
+            Number of successfully ingested events
+        """
+        ...
+
+    def poll(
+        self,
+        limit: int,
+        cursor: Optional[str] = None,
+        filter: Optional[str] = None,
+        ordering: Optional[str] = None,
+    ) -> PollResponse:
+        """
+        Poll events from the bus.
+
+        Args:
+            limit: Maximum number of events to return
+            cursor: Optional cursor to resume from
+            filter: Optional JSON filter expression
+            ordering: Event ordering - "none" (default, fastest) or "insertion_ts" (cross-shard ordering by timestamp)
+
+        Returns:
+            PollResponse with events and pagination cursor
+        """
+        ...
+
+    def num_shards(self) -> int:
+        """Get the number of active shards."""
+        ...
+
+    def stats(self) -> Stats:
+        """Get ingestion statistics."""
+        ...
+
+    def shutdown(self) -> None:
+        """Gracefully shutdown the event bus."""
+        ...
+
+    def __enter__(self) -> "Net": ...
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool: ...

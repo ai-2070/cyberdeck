@@ -1,6 +1,6 @@
-# Blackstream Go Bindings
+# Net Go Bindings
 
-High-performance Go bindings for the Blackstream event bus.
+High-performance Go bindings for the Net event bus.
 
 ## Prerequisites
 
@@ -9,22 +9,22 @@ High-performance Go bindings for the Blackstream event bus.
 
 ## Building
 
-First, build the Blackstream shared library:
+First, build the Net shared library:
 
 ```bash
 # From the repository root
 cargo build --release
 
 # The library will be at:
-# - Linux: target/release/libblackstream.so
-# - macOS: target/release/libblackstream.dylib
-# - Windows: target/release/blackstream.dll
+# - Linux: target/release/libnet.so
+# - macOS: target/release/libnet.dylib
+# - Windows: target/release/net.dll
 ```
 
 ## Installation
 
 ```bash
-go get github.com/ai-2070/blackstream/bindings/go/blackstream
+go get github.com/ai-2070/net/bindings/go/net
 ```
 
 ## Usage
@@ -36,12 +36,12 @@ import (
     "fmt"
     "log"
 
-    "github.com/ai-2070/blackstream/bindings/go/blackstream"
+    "github.com/ai-2070/net/bindings/go/net"
 )
 
 func main() {
     // Create event bus with default configuration
-    bus, err := blackstream.New(nil)
+    bus, err := net.New(nil)
     if err != nil {
         log.Fatal(err)
     }
@@ -103,28 +103,28 @@ func main() {
 ## Configuration
 
 ```go
-config := &blackstream.Config{
+config := &net.Config{
     NumShards:          8,        // Number of parallel shards
     RingBufferCapacity: 1048576,  // Events per shard (must be power of 2)
     BackpressureMode:   "DropOldest", // or "DropNewest", "FailProducer"
 }
 
-bus, err := blackstream.New(config)
+bus, err := net.New(config)
 ```
 
-## BLTP Encrypted UDP Transport
+## NLTP Encrypted UDP Transport
 
-BLTP provides encrypted point-to-point UDP transport for high-performance scenarios:
+NLTP provides encrypted point-to-point UDP transport for high-performance scenarios:
 
 ```go
 import (
     "crypto/rand"
     "encoding/hex"
-    "github.com/ai2070/blackstream/bindings/go/blackstream"
+    "github.com/ai2070/net/bindings/go/net"
 )
 
 // Generate keypair for responder
-keypair, err := blackstream.GenerateBltpKeypair()
+keypair, err := net.GenerateNltpKeypair()
 if err != nil {
     log.Fatal(err)
 }
@@ -135,9 +135,9 @@ rand.Read(psk)
 pskHex := hex.EncodeToString(psk)
 
 // Responder side
-responder, err := blackstream.New(&blackstream.Config{
+responder, err := net.New(&net.Config{
     NumShards: 2,
-    Bltp: &blackstream.BltpConfig{
+    Nltp: &net.NltpConfig{
         BindAddr:    "127.0.0.1:9001",
         PeerAddr:    "127.0.0.1:9000",
         PSK:         pskHex,
@@ -149,9 +149,9 @@ responder, err := blackstream.New(&blackstream.Config{
 })
 
 // Initiator side (knows responder's public key)
-initiator, err := blackstream.New(&blackstream.Config{
+initiator, err := net.New(&net.Config{
     NumShards: 2,
-    Bltp: &blackstream.BltpConfig{
+    Nltp: &net.NltpConfig{
         BindAddr:      "127.0.0.1:9000",
         PeerAddr:      "127.0.0.1:9001",
         PSK:           pskHex,
@@ -168,18 +168,18 @@ initiator.IngestRaw(`{"event": "data"}`)
 
 ### Types
 
-- `Blackstream` - Event bus handle
+- `Net` - Event bus handle
 - `Config` - Configuration options
-- `BltpConfig` - BLTP encrypted UDP adapter configuration
-- `BltpKeypair` - Generated keypair for BLTP
+- `NltpConfig` - NLTP encrypted UDP adapter configuration
+- `NltpKeypair` - Generated keypair for NLTP
 - `PollResponse` - Result of a poll operation
 - `Stats` - Event bus statistics
 
 ### Functions
 
-- `New(config *Config) (*Blackstream, error)` - Create a new event bus
+- `New(config *Config) (*Net, error)` - Create a new event bus
 - `Version() string` - Get the library version
-- `GenerateBltpKeypair() (*BltpKeypair, error)` - Generate a new BLTP keypair
+- `GenerateNltpKeypair() (*NltpKeypair, error)` - Generate a new NLTP keypair
 
 ### Methods
 
@@ -216,4 +216,4 @@ go run main.go
 
 ## Thread Safety
 
-All methods on `Blackstream` are thread-safe and can be called from multiple goroutines concurrently.
+All methods on `Net` are thread-safe and can be called from multiple goroutines concurrently.

@@ -1,4 +1,4 @@
-//! Error types for the Blackstream event bus.
+//! Error types for the Net event bus.
 
 use thiserror::Error;
 

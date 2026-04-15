@@ -1,10 +1,10 @@
 # Transport Layer
 
-The foundational layer of the BLTP mesh. Encrypted UDP with zero-allocation hot paths, multi-hop forwarding, adaptive batching, fair scheduling, failure detection, and swarm discovery.
+The foundational layer of the NLTP mesh. Encrypted UDP with zero-allocation hot paths, multi-hop forwarding, adaptive batching, fair scheduling, failure detection, and swarm discovery.
 
 ## Wire Format
 
-Every BLTP packet starts with a 64-byte header aligned to a single CPU cache line. Forwarding nodes read one cache line, make a routing decision, and forward without decrypting the payload.
+Every NLTP packet starts with a 64-byte header aligned to a single CPU cache line. Forwarding nodes read one cache line, make a routing decision, and forward without decrypting the payload.
 
 ```
  0                   1                   2                   3
@@ -73,10 +73,10 @@ ThreadLocalPool::new(capacity: usize)   // Per-thread, zero contention
 
 ## Sessions
 
-`BltpSession` holds post-handshake state: TX/RX ciphers, per-stream sequence numbers, packet pool, and activity timestamps.
+`NltpSession` holds post-handshake state: TX/RX ciphers, per-stream sequence numbers, packet pool, and activity timestamps.
 
 ```rust
-pub struct BltpSession {
+pub struct NltpSession {
     session_id: u64,
     tx_cipher: Mutex<PacketCipher>,
     rx_cipher: Mutex<PacketCipher>,
@@ -104,7 +104,7 @@ Stream IDs are derived via xxh3 hashing of message keys, providing deterministic
 
 ## Multi-Hop Forwarding
 
-`BltpProxy` forwards packets without decrypting payloads. Reads the 64-byte header, decrements TTL, increments hop count, and forwards.
+`NltpProxy` forwards packets without decrypting payloads. Reads the 64-byte header, decrements TTL, increments hop count, and forwards.
 
 ```rust
 pub struct RoutingHeader {  // 16 bytes
@@ -176,7 +176,7 @@ pub struct Pingwave {
 
 ## Socket Layer
 
-`BltpSocket` wraps Tokio UDP with optimized buffer sizes:
+`NltpSocket` wraps Tokio UDP with optimized buffer sizes:
 
 | Buffer | Default | Testing |
 |--------|---------|---------|
@@ -192,15 +192,15 @@ On Linux, `BatchedPacketReceiver` uses `recvmmsg` to read up to 64 packets per s
 | `protocol.rs` | Wire format, header, EventFrame, NackPayload |
 | `crypto.rs` | Noise handshake, ChaCha20-Poly1305, SessionKeys |
 | `transport.rs` | UDP socket, PacketReceiver/Sender, buffer config |
-| `session.rs` | BltpSession, StreamState, SessionManager |
+| `session.rs` | NltpSession, StreamState, SessionManager |
 | `pool.rs` | PacketPool, PacketBuilder, ThreadLocalPool |
 | `router.rs` | FairScheduler, stream routing, priority bypass |
 | `route.rs` | RoutingTable, RoutingHeader, stream stats |
-| `proxy.rs` | BltpProxy, zero-copy forwarding, hop tracking |
+| `proxy.rs` | NltpProxy, zero-copy forwarding, hop tracking |
 | `batch.rs` | AdaptiveBatcher, latency-aware sizing |
 | `reliability.rs` | FireAndForget, ReliableStream, selective NACKs |
 | `failure.rs` | FailureDetector, RecoveryManager, CircuitBreaker |
 | `swarm.rs` | Pingwave, CapabilityAd, LocalGraph |
 | `linux.rs` | recvmmsg batch reads (Linux-only) |
-| `config.rs` | BltpAdapterConfig |
-| `mod.rs` | BltpAdapter, routing utilities |
+| `config.rs` | NltpAdapterConfig |
+| `mod.rs` | NltpAdapter, routing utilities |

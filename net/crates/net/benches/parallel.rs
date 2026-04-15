@@ -5,9 +5,9 @@ use serde_json::json;
 use std::sync::Arc;
 use std::thread;
 
-use blackstream::config::BackpressureMode;
-use blackstream::event::RawEvent;
-use blackstream::shard::ShardManager;
+use net::config::BackpressureMode;
+use net::event::RawEvent;
+use net::shard::ShardManager;
 
 /// Benchmark parallel ingestion throughput.
 fn bench_parallel_ingestion(c: &mut Criterion) {

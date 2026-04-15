@@ -6,7 +6,7 @@ Layer 4 introduces causal metadata, distributed event logs, state snapshots, and
 replication. No global coordinator — causal consistency by default, strong consensus
 opt-in. The causal chain IS the entity's identity.
 
-Events get a 24-byte `CausalLink` prefix inside EventFrame. The BLTP header stays
+Events get a 24-byte `CausalLink` prefix inside EventFrame. The NLTP header stays
 unchanged — L4 state is above L0 transport.
 
 ## CausalLink (24 bytes on wire)
@@ -14,7 +14,7 @@ unchanged — L4 state is above L0 transport.
 ```rust
 #[repr(C)]
 pub struct CausalLink {
-    pub origin_hash: u32,       // entity identity (matches BLTP header)
+    pub origin_hash: u32,       // entity identity (matches NLTP header)
     pub sequence: u64,          // monotonic per-entity
     pub parent_hash: u64,       // xxh3 of (prev CausalLink ++ prev payload)
     pub horizon_encoded: u32,   // compressed observed horizon (bloom sketch)
@@ -22,7 +22,7 @@ pub struct CausalLink {
 ```
 
 **parent_hash**: `xxh3_64(prev_causal_link_bytes ++ prev_payload)` — ~1ns, not crypto.
-Tamper resistance comes from BLTP's AEAD, not per-event signatures.
+Tamper resistance comes from NLTP's AEAD, not per-event signatures.
 
 **EventFrame format** with causal framing (signaled by `subprotocol_id = 0x0400`):
 ```
@@ -42,7 +42,7 @@ This gives O(1) approximate causality detection. For entities needing exact orde
 a full `ObservedHorizon` (HashMap-based vector clock) is exchanged out-of-band, not
 per-event.
 
-## New Module: `src/adapter/bltp/state/`
+## New Module: `src/adapter/nltp/state/`
 
 ### Phase 1: CausalLink + Causal Framing (MVP-critical)
 
@@ -97,7 +97,7 @@ pub struct StateSnapshot {
 ```
 
 - Snapshot creation API (called by L5 compute runtime)
-- Transfer via BLTP fragmentation (`subprotocol_id = 0x0401`)
+- Transfer via NLTP fragmentation (`subprotocol_id = 0x0401`)
 - Catchup protocol: snapshot + replay events after `through_seq`
 
 ### Phase 5: Replication Policy (deferrable past L5 MVP)
@@ -164,7 +164,7 @@ MVP = Phases 1-4. Phases 5-6 can wait until after L5 has basic daemons working.
 ## Key Design Decisions
 
 - **xxh3 for parent_hash, not blake2**: blake2 ~2GB/s vs xxh3 ~50GB/s. At 40M events/sec
-  blake2 would consume 2 CPU cores. Chain integrity comes from BLTP AEAD, not per-event crypto.
+  blake2 would consume 2 CPU cores. Chain integrity comes from NLTP AEAD, not per-event crypto.
 - **24 bytes, not smaller**: 8B parent_hash = 2^64 collision resistance. 8B sequence =
   584 years at 1B events/sec. Can't go smaller without sacrificing correctness.
 - **CausalLink in payload, not header**: Header is full at 64 bytes. Adding 24 bytes would

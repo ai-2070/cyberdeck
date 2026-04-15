@@ -1,4 +1,4 @@
-//! Configuration types for the Blackstream event bus.
+//! Configuration types for the Net event bus.
 
 use std::time::Duration;
 
@@ -314,10 +314,10 @@ pub enum AdapterConfig {
     #[cfg(feature = "jetstream")]
     JetStream(JetStreamAdapterConfig),
 
-    /// BLTP (Blackstream L0 Transport Protocol) adapter.
+    /// NLTP (Net L0 Transport Protocol) adapter.
     /// High-performance UDP transport for GPU-to-GPU communication.
-    #[cfg(feature = "bltp")]
-    Bltp(Box<crate::adapter::bltp::BltpAdapterConfig>),
+    #[cfg(feature = "nltp")]
+    Nltp(Box<crate::adapter::nltp::NltpAdapterConfig>),
 }
 
 /// Redis adapter configuration.
@@ -330,7 +330,7 @@ pub struct RedisAdapterConfig {
 
     /// Stream key prefix.
     /// Streams are named: "{prefix}:shard:{shard_id}"
-    /// Default: "blackstream"
+    /// Default: "net"
     pub prefix: String,
 
     /// Maximum commands per pipeline.
@@ -360,7 +360,7 @@ impl RedisAdapterConfig {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
-            prefix: "blackstream".into(),
+            prefix: "net".into(),
             pipeline_size: 1000,
             pool_size: None,
             connect_timeout: Duration::from_secs(5),
@@ -416,7 +416,7 @@ pub struct JetStreamAdapterConfig {
 
     /// Stream name prefix.
     /// Streams are named: "{prefix}_shard_{shard_id}"
-    /// Default: "blackstream"
+    /// Default: "net"
     pub prefix: String,
 
     /// Connection timeout.
@@ -450,7 +450,7 @@ impl JetStreamAdapterConfig {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
-            prefix: "blackstream".into(),
+            prefix: "net".into(),
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
             max_messages: None,

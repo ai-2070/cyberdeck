@@ -1,12 +1,12 @@
-# Blackstream Benchmarks
+# Net Benchmarks
 
-Performance benchmarks for the Blackstream Rust core and BLTP transport layer.
+Performance benchmarks for the Net Rust core and NLTP transport layer.
 
 **Test Systems:**
 - Apple M1 Max, macOS
 - Intel i9-14900K @5GHz, Windows 11
 
-## BLTP Header Operations
+## NLTP Header Operations
 
 | Operation | M1 Max | M1 Throughput | i9-14900K | i9 Throughput |
 |---|---|---|---|---|
@@ -506,13 +506,13 @@ Performance benchmarks for the Blackstream Rust core and BLTP transport layer.
 ## Running Benchmarks
 
 ```bash
-cargo bench --features bltp --bench bltp
+cargo bench --features nltp --bench nltp
 ```
 
 For native CPU optimizations:
 
 ```bash
-RUSTFLAGS="-C target-cpu=native" cargo bench --features bltp --bench bltp
+RUSTFLAGS="-C target-cpu=native" cargo bench --features nltp --bench nltp
 ```
 
 ## Key Insights

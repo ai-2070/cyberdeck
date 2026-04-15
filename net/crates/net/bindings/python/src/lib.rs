@@ -1,4 +1,4 @@
-//! Python bindings for Blackstream event bus.
+//! Python bindings for Net event bus.
 //!
 //! Provides high-performance event ingestion and consumption for Python.
 
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use tokio::runtime::Runtime;
 
-use blackstream::{
+use net::{
     config::{AdapterConfig, BackpressureMode, EventBusConfig},
     consumer::Ordering,
     event::RawEvent,
@@ -17,13 +17,13 @@ use blackstream::{
 };
 
 #[cfg(feature = "redis")]
-use blackstream::config::RedisAdapterConfig;
+use net::config::RedisAdapterConfig;
 
 #[cfg(feature = "jetstream")]
-use blackstream::config::JetStreamAdapterConfig;
+use net::config::JetStreamAdapterConfig;
 
-#[cfg(feature = "bltp")]
-use blackstream::adapter::bltp::{BltpAdapterConfig, ReliabilityConfig, StaticKeypair};
+#[cfg(feature = "nltp")]
+use net::adapter::nltp::{NltpAdapterConfig, ReliabilityConfig, StaticKeypair};
 
 /// Result of an ingestion operation.
 #[pyclass]
@@ -155,10 +155,10 @@ impl Stats {
     }
 }
 
-/// BLTP keypair for encrypted UDP transport.
+/// NLTP keypair for encrypted UDP transport.
 #[pyclass]
 #[derive(Clone)]
-pub struct BltpKeypair {
+pub struct NltpKeypair {
     /// Hex-encoded 32-byte public key
     #[pyo3(get)]
     pub public_key: String,
@@ -168,28 +168,28 @@ pub struct BltpKeypair {
 }
 
 #[pymethods]
-impl BltpKeypair {
+impl NltpKeypair {
     fn __repr__(&self) -> String {
         format!(
-            "BltpKeypair(public_key='{}...', secret_key='[REDACTED]')",
+            "NltpKeypair(public_key='{}...', secret_key='[REDACTED]')",
             &self.public_key[..8]
         )
     }
 }
 
-/// Generate a new BLTP keypair for encrypted UDP transport.
+/// Generate a new NLTP keypair for encrypted UDP transport.
 ///
-/// Returns a BltpKeypair with hex-encoded public and secret keys.
+/// Returns a NltpKeypair with hex-encoded public and secret keys.
 /// Use this to generate keys for a responder, then share the public key
 /// with the initiator.
 ///
 /// Returns:
-///     BltpKeypair with public_key and secret_key attributes
-#[cfg(feature = "bltp")]
+///     NltpKeypair with public_key and secret_key attributes
+#[cfg(feature = "nltp")]
 #[pyfunction]
-fn generate_bltp_keypair() -> BltpKeypair {
+fn generate_nltp_keypair() -> NltpKeypair {
     let keypair = StaticKeypair::generate();
-    BltpKeypair {
+    NltpKeypair {
         public_key: hex::encode(keypair.public_key()),
         secret_key: hex::encode(keypair.secret_key()),
     }
@@ -199,10 +199,10 @@ fn generate_bltp_keypair() -> BltpKeypair {
 ///
 /// Example usage:
 /// ```python
-/// from blackstream import Blackstream
+/// from net import Net
 ///
 /// # Create event bus
-/// bus = Blackstream(num_shards=4)
+/// bus = Net(num_shards=4)
 ///
 /// # Ingest events (fast path with raw JSON string)
 /// bus.ingest_raw('{"token": "hello", "index": 0}')
@@ -218,48 +218,48 @@ fn generate_bltp_keypair() -> BltpKeypair {
 /// bus.shutdown()
 /// ```
 #[pyclass]
-pub struct Blackstream {
+pub struct Net {
     bus: Arc<RwLock<Option<EventBus>>>,
     runtime: Arc<Runtime>,
 }
 
 #[pymethods]
-impl Blackstream {
-    /// Create a new Blackstream event bus.
+impl Net {
+    /// Create a new Net event bus.
     ///
     /// Args:
     ///     num_shards: Number of shards (defaults to CPU core count)
     ///     ring_buffer_capacity: Ring buffer capacity per shard (must be power of 2)
     ///     backpressure_mode: One of "drop_newest", "drop_oldest", "fail_producer"
     ///     redis_url: Redis connection URL (e.g., "redis://localhost:6379")
-    ///     redis_prefix: Stream key prefix (default: "blackstream")
+    ///     redis_prefix: Stream key prefix (default: "net")
     ///     redis_pipeline_size: Maximum commands per pipeline (default: 1000)
     ///     redis_pool_size: Connection pool size (default: num_shards)
     ///     redis_connect_timeout_ms: Connection timeout in milliseconds (default: 5000)
     ///     redis_command_timeout_ms: Command timeout in milliseconds (default: 1000)
     ///     redis_max_stream_len: Maximum stream length, unlimited if not set
     ///     jetstream_url: NATS JetStream URL (e.g., "nats://localhost:4222")
-    ///     jetstream_prefix: Stream name prefix (default: "blackstream")
+    ///     jetstream_prefix: Stream name prefix (default: "net")
     ///     jetstream_connect_timeout_ms: Connection timeout in milliseconds (default: 5000)
     ///     jetstream_request_timeout_ms: Request timeout in milliseconds (default: 5000)
     ///     jetstream_max_messages: Maximum messages per stream, unlimited if not set
     ///     jetstream_max_bytes: Maximum bytes per stream, unlimited if not set
     ///     jetstream_max_age_ms: Maximum age for messages in milliseconds, unlimited if not set
     ///     jetstream_replicas: Number of stream replicas (default: 1)
-    ///     bltp_bind_addr: BLTP local bind address (e.g., "127.0.0.1:9000")
-    ///     bltp_peer_addr: BLTP remote peer address (e.g., "127.0.0.1:9001")
-    ///     bltp_psk: Hex-encoded 32-byte pre-shared key
-    ///     bltp_role: Connection role - "initiator" or "responder"
-    ///     bltp_peer_public_key: Hex-encoded peer's public key (required for initiator)
-    ///     bltp_secret_key: Hex-encoded secret key (required for responder)
-    ///     bltp_public_key: Hex-encoded public key (required for responder)
-    ///     bltp_reliability: Reliability mode - "none", "light", or "full" (default: "none")
-    ///     bltp_heartbeat_interval_ms: Heartbeat interval in milliseconds (default: 5000)
-    ///     bltp_session_timeout_ms: Session timeout in milliseconds (default: 30000)
-    ///     bltp_batched_io: Enable batched I/O for Linux (default: False)
-    ///     bltp_packet_pool_size: Packet pool size (default: 64)
+    ///     nltp_bind_addr: NLTP local bind address (e.g., "127.0.0.1:9000")
+    ///     nltp_peer_addr: NLTP remote peer address (e.g., "127.0.0.1:9001")
+    ///     nltp_psk: Hex-encoded 32-byte pre-shared key
+    ///     nltp_role: Connection role - "initiator" or "responder"
+    ///     nltp_peer_public_key: Hex-encoded peer's public key (required for initiator)
+    ///     nltp_secret_key: Hex-encoded secret key (required for responder)
+    ///     nltp_public_key: Hex-encoded public key (required for responder)
+    ///     nltp_reliability: Reliability mode - "none", "light", or "full" (default: "none")
+    ///     nltp_heartbeat_interval_ms: Heartbeat interval in milliseconds (default: 5000)
+    ///     nltp_session_timeout_ms: Session timeout in milliseconds (default: 30000)
+    ///     nltp_batched_io: Enable batched I/O for Linux (default: False)
+    ///     nltp_packet_pool_size: Packet pool size (default: 64)
     #[new]
-    #[pyo3(signature = (num_shards=None, ring_buffer_capacity=None, backpressure_mode=None, redis_url=None, redis_prefix=None, redis_pipeline_size=None, redis_pool_size=None, redis_connect_timeout_ms=None, redis_command_timeout_ms=None, redis_max_stream_len=None, jetstream_url=None, jetstream_prefix=None, jetstream_connect_timeout_ms=None, jetstream_request_timeout_ms=None, jetstream_max_messages=None, jetstream_max_bytes=None, jetstream_max_age_ms=None, jetstream_replicas=None, bltp_bind_addr=None, bltp_peer_addr=None, bltp_psk=None, bltp_role=None, bltp_peer_public_key=None, bltp_secret_key=None, bltp_public_key=None, bltp_reliability=None, bltp_heartbeat_interval_ms=None, bltp_session_timeout_ms=None, bltp_batched_io=None, bltp_packet_pool_size=None))]
+    #[pyo3(signature = (num_shards=None, ring_buffer_capacity=None, backpressure_mode=None, redis_url=None, redis_prefix=None, redis_pipeline_size=None, redis_pool_size=None, redis_connect_timeout_ms=None, redis_command_timeout_ms=None, redis_max_stream_len=None, jetstream_url=None, jetstream_prefix=None, jetstream_connect_timeout_ms=None, jetstream_request_timeout_ms=None, jetstream_max_messages=None, jetstream_max_bytes=None, jetstream_max_age_ms=None, jetstream_replicas=None, nltp_bind_addr=None, nltp_peer_addr=None, nltp_psk=None, nltp_role=None, nltp_peer_public_key=None, nltp_secret_key=None, nltp_public_key=None, nltp_reliability=None, nltp_heartbeat_interval_ms=None, nltp_session_timeout_ms=None, nltp_batched_io=None, nltp_packet_pool_size=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         num_shards: Option<u16>,
@@ -280,18 +280,18 @@ impl Blackstream {
         jetstream_max_bytes: Option<i64>,
         jetstream_max_age_ms: Option<u64>,
         jetstream_replicas: Option<usize>,
-        bltp_bind_addr: Option<&str>,
-        bltp_peer_addr: Option<&str>,
-        bltp_psk: Option<&str>,
-        bltp_role: Option<&str>,
-        bltp_peer_public_key: Option<&str>,
-        bltp_secret_key: Option<&str>,
-        bltp_public_key: Option<&str>,
-        bltp_reliability: Option<&str>,
-        bltp_heartbeat_interval_ms: Option<u64>,
-        bltp_session_timeout_ms: Option<u64>,
-        bltp_batched_io: Option<bool>,
-        bltp_packet_pool_size: Option<usize>,
+        nltp_bind_addr: Option<&str>,
+        nltp_peer_addr: Option<&str>,
+        nltp_psk: Option<&str>,
+        nltp_role: Option<&str>,
+        nltp_peer_public_key: Option<&str>,
+        nltp_secret_key: Option<&str>,
+        nltp_public_key: Option<&str>,
+        nltp_reliability: Option<&str>,
+        nltp_heartbeat_interval_ms: Option<u64>,
+        nltp_session_timeout_ms: Option<u64>,
+        nltp_batched_io: Option<bool>,
+        nltp_packet_pool_size: Option<usize>,
     ) -> PyResult<Self> {
         let runtime = Runtime::new().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
@@ -407,127 +407,127 @@ impl Blackstream {
                     "JetStream support not enabled. Rebuild with --features jetstream",
                 ));
             }
-        } else if let Some(bind_addr_str) = bltp_bind_addr {
-            #[cfg(feature = "bltp")]
+        } else if let Some(bind_addr_str) = nltp_bind_addr {
+            #[cfg(feature = "nltp")]
             {
                 use std::time::Duration;
 
                 let bind_addr: std::net::SocketAddr = bind_addr_str
                     .parse()
-                    .map_err(|e| PyValueError::new_err(format!("Invalid bltp_bind_addr: {}", e)))?;
+                    .map_err(|e| PyValueError::new_err(format!("Invalid nltp_bind_addr: {}", e)))?;
 
-                let peer_addr: std::net::SocketAddr = bltp_peer_addr
-                    .ok_or_else(|| PyValueError::new_err("bltp_peer_addr is required"))?
+                let peer_addr: std::net::SocketAddr = nltp_peer_addr
+                    .ok_or_else(|| PyValueError::new_err("nltp_peer_addr is required"))?
                     .parse()
-                    .map_err(|e| PyValueError::new_err(format!("Invalid bltp_peer_addr: {}", e)))?;
+                    .map_err(|e| PyValueError::new_err(format!("Invalid nltp_peer_addr: {}", e)))?;
 
                 let psk_hex =
-                    bltp_psk.ok_or_else(|| PyValueError::new_err("bltp_psk is required"))?;
+                    nltp_psk.ok_or_else(|| PyValueError::new_err("nltp_psk is required"))?;
                 let psk: [u8; 32] = hex::decode(psk_hex)
-                    .map_err(|e| PyValueError::new_err(format!("Invalid bltp_psk hex: {}", e)))?
+                    .map_err(|e| PyValueError::new_err(format!("Invalid nltp_psk hex: {}", e)))?
                     .try_into()
-                    .map_err(|_| PyValueError::new_err("bltp_psk must be exactly 32 bytes"))?;
+                    .map_err(|_| PyValueError::new_err("nltp_psk must be exactly 32 bytes"))?;
 
                 let role =
-                    bltp_role.ok_or_else(|| PyValueError::new_err("bltp_role is required"))?;
+                    nltp_role.ok_or_else(|| PyValueError::new_err("nltp_role is required"))?;
 
-                let mut bltp_config = match role {
+                let mut nltp_config = match role {
                     "initiator" => {
-                        let peer_pubkey_hex = bltp_peer_public_key.ok_or_else(|| {
-                            PyValueError::new_err("bltp_peer_public_key is required for initiator")
+                        let peer_pubkey_hex = nltp_peer_public_key.ok_or_else(|| {
+                            PyValueError::new_err("nltp_peer_public_key is required for initiator")
                         })?;
                         let peer_pubkey: [u8; 32] = hex::decode(peer_pubkey_hex)
                             .map_err(|e| {
                                 PyValueError::new_err(format!(
-                                    "Invalid bltp_peer_public_key hex: {}",
+                                    "Invalid nltp_peer_public_key hex: {}",
                                     e
                                 ))
                             })?
                             .try_into()
                             .map_err(|_| {
                                 PyValueError::new_err(
-                                    "bltp_peer_public_key must be exactly 32 bytes",
+                                    "nltp_peer_public_key must be exactly 32 bytes",
                                 )
                             })?;
-                        BltpAdapterConfig::initiator(bind_addr, peer_addr, psk, peer_pubkey)
+                        NltpAdapterConfig::initiator(bind_addr, peer_addr, psk, peer_pubkey)
                     }
                     "responder" => {
-                        let secret_key_hex = bltp_secret_key.ok_or_else(|| {
-                            PyValueError::new_err("bltp_secret_key is required for responder")
+                        let secret_key_hex = nltp_secret_key.ok_or_else(|| {
+                            PyValueError::new_err("nltp_secret_key is required for responder")
                         })?;
-                        let public_key_hex = bltp_public_key.ok_or_else(|| {
-                            PyValueError::new_err("bltp_public_key is required for responder")
+                        let public_key_hex = nltp_public_key.ok_or_else(|| {
+                            PyValueError::new_err("nltp_public_key is required for responder")
                         })?;
                         let secret_key: [u8; 32] = hex::decode(secret_key_hex)
                             .map_err(|e| {
-                                PyValueError::new_err(format!("Invalid bltp_secret_key hex: {}", e))
+                                PyValueError::new_err(format!("Invalid nltp_secret_key hex: {}", e))
                             })?
                             .try_into()
                             .map_err(|_| {
-                                PyValueError::new_err("bltp_secret_key must be exactly 32 bytes")
+                                PyValueError::new_err("nltp_secret_key must be exactly 32 bytes")
                             })?;
                         let public_key: [u8; 32] = hex::decode(public_key_hex)
                             .map_err(|e| {
-                                PyValueError::new_err(format!("Invalid bltp_public_key hex: {}", e))
+                                PyValueError::new_err(format!("Invalid nltp_public_key hex: {}", e))
                             })?
                             .try_into()
                             .map_err(|_| {
-                                PyValueError::new_err("bltp_public_key must be exactly 32 bytes")
+                                PyValueError::new_err("nltp_public_key must be exactly 32 bytes")
                             })?;
                         let keypair = StaticKeypair::from_keys(secret_key, public_key);
-                        BltpAdapterConfig::responder(bind_addr, peer_addr, psk, keypair)
+                        NltpAdapterConfig::responder(bind_addr, peer_addr, psk, keypair)
                     }
                     _ => {
                         return Err(PyValueError::new_err(format!(
-                            "Invalid bltp_role: {}. Use 'initiator' or 'responder'",
+                            "Invalid nltp_role: {}. Use 'initiator' or 'responder'",
                             role
                         )));
                     }
                 };
 
                 // Apply optional settings
-                if let Some(reliability) = bltp_reliability {
-                    bltp_config = bltp_config.with_reliability(match reliability {
+                if let Some(reliability) = nltp_reliability {
+                    nltp_config = nltp_config.with_reliability(match reliability {
                         "light" => ReliabilityConfig::Light,
                         "full" => ReliabilityConfig::Full,
                         _ => ReliabilityConfig::None,
                     });
                 }
-                if let Some(interval_ms) = bltp_heartbeat_interval_ms {
-                    bltp_config =
-                        bltp_config.with_heartbeat_interval(Duration::from_millis(interval_ms));
+                if let Some(interval_ms) = nltp_heartbeat_interval_ms {
+                    nltp_config =
+                        nltp_config.with_heartbeat_interval(Duration::from_millis(interval_ms));
                 }
-                if let Some(timeout_ms) = bltp_session_timeout_ms {
-                    bltp_config =
-                        bltp_config.with_session_timeout(Duration::from_millis(timeout_ms));
+                if let Some(timeout_ms) = nltp_session_timeout_ms {
+                    nltp_config =
+                        nltp_config.with_session_timeout(Duration::from_millis(timeout_ms));
                 }
-                if let Some(batched) = bltp_batched_io {
-                    bltp_config = bltp_config.with_batched_io(batched);
+                if let Some(batched) = nltp_batched_io {
+                    nltp_config = nltp_config.with_batched_io(batched);
                 }
-                if let Some(pool_size) = bltp_packet_pool_size {
-                    bltp_config = bltp_config.with_pool_size(pool_size);
+                if let Some(pool_size) = nltp_packet_pool_size {
+                    nltp_config = nltp_config.with_pool_size(pool_size);
                 }
 
-                builder = builder.adapter(AdapterConfig::Bltp(Box::new(bltp_config)));
+                builder = builder.adapter(AdapterConfig::Nltp(Box::new(nltp_config)));
             }
-            #[cfg(not(feature = "bltp"))]
+            #[cfg(not(feature = "nltp"))]
             {
                 let _ = (
                     bind_addr_str,
-                    bltp_peer_addr,
-                    bltp_psk,
-                    bltp_role,
-                    bltp_peer_public_key,
-                    bltp_secret_key,
-                    bltp_public_key,
-                    bltp_reliability,
-                    bltp_heartbeat_interval_ms,
-                    bltp_session_timeout_ms,
-                    bltp_batched_io,
-                    bltp_packet_pool_size,
+                    nltp_peer_addr,
+                    nltp_psk,
+                    nltp_role,
+                    nltp_peer_public_key,
+                    nltp_secret_key,
+                    nltp_public_key,
+                    nltp_reliability,
+                    nltp_heartbeat_interval_ms,
+                    nltp_session_timeout_ms,
+                    nltp_batched_io,
+                    nltp_packet_pool_size,
                 );
                 return Err(PyRuntimeError::new_err(
-                    "BLTP support not enabled. Rebuild with --features bltp",
+                    "NLTP support not enabled. Rebuild with --features nltp",
                 ));
             }
         }
@@ -540,7 +540,7 @@ impl Blackstream {
             .block_on(EventBus::new(config))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        Ok(Blackstream {
+        Ok(Net {
             bus: Arc::new(RwLock::new(Some(bus))),
             runtime: Arc::new(runtime),
         })
@@ -740,9 +740,9 @@ impl Blackstream {
     fn __repr__(&self) -> String {
         let bus_guard = self.bus.read().ok();
         if bus_guard.map(|g| g.is_some()).unwrap_or(false) {
-            "Blackstream(active)".to_string()
+            "Net(active)".to_string()
         } else {
-            "Blackstream(shutdown)".to_string()
+            "Net(shutdown)".to_string()
         }
     }
 
@@ -762,16 +762,16 @@ impl Blackstream {
     }
 }
 
-/// Blackstream Python module.
+/// Net Python module.
 #[pymodule]
-fn _blackstream(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<Blackstream>()?;
+fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<Net>()?;
     m.add_class::<IngestResult>()?;
     m.add_class::<StoredEvent>()?;
     m.add_class::<PollResponse>()?;
     m.add_class::<Stats>()?;
-    m.add_class::<BltpKeypair>()?;
-    #[cfg(feature = "bltp")]
-    m.add_function(wrap_pyfunction!(generate_bltp_keypair, m)?)?;
+    m.add_class::<NltpKeypair>()?;
+    #[cfg(feature = "nltp")]
+    m.add_function(wrap_pyfunction!(generate_nltp_keypair, m)?)?;
     Ok(())
 }

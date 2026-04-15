@@ -70,13 +70,13 @@ function requireNative() {
   } else if (process.platform === 'android') {
     if (process.arch === 'arm64') {
       try {
-        return require('./blackstream.android-arm64.node')
+        return require('./net.android-arm64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ai2070/blackstream-android-arm64')
-        const bindingPackageVersion = require('@ai2070/blackstream-android-arm64/package.json').version
+        const binding = require('@ai2070/net-android-arm64')
+        const bindingPackageVersion = require('@ai2070/net-android-arm64/package.json').version
         if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -86,13 +86,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm') {
       try {
-        return require('./blackstream.android-arm-eabi.node')
+        return require('./net.android-arm-eabi.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ai2070/blackstream-android-arm-eabi')
-        const bindingPackageVersion = require('@ai2070/blackstream-android-arm-eabi/package.json').version
+        const binding = require('@ai2070/net-android-arm-eabi')
+        const bindingPackageVersion = require('@ai2070/net-android-arm-eabi/package.json').version
         if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -107,13 +107,13 @@ function requireNative() {
     if (process.arch === 'x64') {
       if (process.config?.variables?.shlib_suffix === 'dll.a' || process.config?.variables?.node_target_type === 'shared_library') {
         try {
-        return require('./blackstream.win32-x64-gnu.node')
+        return require('./net.win32-x64-gnu.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ai2070/blackstream-win32-x64-gnu')
-        const bindingPackageVersion = require('@ai2070/blackstream-win32-x64-gnu/package.json').version
+        const binding = require('@ai2070/net-win32-x64-gnu')
+        const bindingPackageVersion = require('@ai2070/net-win32-x64-gnu/package.json').version
         if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -123,13 +123,13 @@ function requireNative() {
       }
       } else {
         try {
-        return require('./blackstream.win32-x64-msvc.node')
+        return require('./net.win32-x64-msvc.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ai2070/blackstream-win32-x64-msvc')
-        const bindingPackageVersion = require('@ai2070/blackstream-win32-x64-msvc/package.json').version
+        const binding = require('@ai2070/net-win32-x64-msvc')
+        const bindingPackageVersion = require('@ai2070/net-win32-x64-msvc/package.json').version
         if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -140,13 +140,13 @@ function requireNative() {
       }
     } else if (process.arch === 'ia32') {
       try {
-        return require('./blackstream.win32-ia32-msvc.node')
+        return require('./net.win32-ia32-msvc.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ai2070/blackstream-win32-ia32-msvc')
-        const bindingPackageVersion = require('@ai2070/blackstream-win32-ia32-msvc/package.json').version
+        const binding = require('@ai2070/net-win32-ia32-msvc')
+        const bindingPackageVersion = require('@ai2070/net-win32-ia32-msvc/package.json').version
         if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -156,13 +156,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm64') {
       try {
-        return require('./blackstream.win32-arm64-msvc.node')
+        return require('./net.win32-arm64-msvc.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ai2070/blackstream-win32-arm64-msvc')
-        const bindingPackageVersion = require('@ai2070/blackstream-win32-arm64-msvc/package.json').version
+        const binding = require('@ai2070/net-win32-arm64-msvc')
+        const bindingPackageVersion = require('@ai2070/net-win32-arm64-msvc/package.json').version
         if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -175,13 +175,13 @@ function requireNative() {
     }
   } else if (process.platform === 'darwin') {
     try {
-      return require('./blackstream.darwin-universal.node')
+      return require('./net.darwin-universal.node')
     } catch (e) {
       loadErrors.push(e)
     }
     try {
-      const binding = require('@ai2070/blackstream-darwin-universal')
-      const bindingPackageVersion = require('@ai2070/blackstream-darwin-universal/package.json').version
+      const binding = require('@ai2070/net-darwin-universal')
+      const bindingPackageVersion = require('@ai2070/net-darwin-universal/package.json').version
       if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
         throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
       }
@@ -191,13 +191,13 @@ function requireNative() {
     }
     if (process.arch === 'x64') {
       try {
-        return require('./blackstream.darwin-x64.node')
+        return require('./net.darwin-x64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ai2070/blackstream-darwin-x64')
-        const bindingPackageVersion = require('@ai2070/blackstream-darwin-x64/package.json').version
+        const binding = require('@ai2070/net-darwin-x64')
+        const bindingPackageVersion = require('@ai2070/net-darwin-x64/package.json').version
         if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -207,13 +207,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm64') {
       try {
-        return require('./blackstream.darwin-arm64.node')
+        return require('./net.darwin-arm64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ai2070/blackstream-darwin-arm64')
-        const bindingPackageVersion = require('@ai2070/blackstream-darwin-arm64/package.json').version
+        const binding = require('@ai2070/net-darwin-arm64')
+        const bindingPackageVersion = require('@ai2070/net-darwin-arm64/package.json').version
         if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -227,13 +227,13 @@ function requireNative() {
   } else if (process.platform === 'freebsd') {
     if (process.arch === 'x64') {
       try {
-        return require('./blackstream.freebsd-x64.node')
+        return require('./net.freebsd-x64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ai2070/blackstream-freebsd-x64')
-        const bindingPackageVersion = require('@ai2070/blackstream-freebsd-x64/package.json').version
+        const binding = require('@ai2070/net-freebsd-x64')
+        const bindingPackageVersion = require('@ai2070/net-freebsd-x64/package.json').version
         if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -243,13 +243,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm64') {
       try {
-        return require('./blackstream.freebsd-arm64.node')
+        return require('./net.freebsd-arm64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ai2070/blackstream-freebsd-arm64')
-        const bindingPackageVersion = require('@ai2070/blackstream-freebsd-arm64/package.json').version
+        const binding = require('@ai2070/net-freebsd-arm64')
+        const bindingPackageVersion = require('@ai2070/net-freebsd-arm64/package.json').version
         if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -264,13 +264,13 @@ function requireNative() {
     if (process.arch === 'x64') {
       if (isMusl()) {
         try {
-          return require('./blackstream.linux-x64-musl.node')
+          return require('./net.linux-x64-musl.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ai2070/blackstream-linux-x64-musl')
-          const bindingPackageVersion = require('@ai2070/blackstream-linux-x64-musl/package.json').version
+          const binding = require('@ai2070/net-linux-x64-musl')
+          const bindingPackageVersion = require('@ai2070/net-linux-x64-musl/package.json').version
           if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -280,13 +280,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./blackstream.linux-x64-gnu.node')
+          return require('./net.linux-x64-gnu.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ai2070/blackstream-linux-x64-gnu')
-          const bindingPackageVersion = require('@ai2070/blackstream-linux-x64-gnu/package.json').version
+          const binding = require('@ai2070/net-linux-x64-gnu')
+          const bindingPackageVersion = require('@ai2070/net-linux-x64-gnu/package.json').version
           if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -298,13 +298,13 @@ function requireNative() {
     } else if (process.arch === 'arm64') {
       if (isMusl()) {
         try {
-          return require('./blackstream.linux-arm64-musl.node')
+          return require('./net.linux-arm64-musl.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ai2070/blackstream-linux-arm64-musl')
-          const bindingPackageVersion = require('@ai2070/blackstream-linux-arm64-musl/package.json').version
+          const binding = require('@ai2070/net-linux-arm64-musl')
+          const bindingPackageVersion = require('@ai2070/net-linux-arm64-musl/package.json').version
           if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -314,13 +314,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./blackstream.linux-arm64-gnu.node')
+          return require('./net.linux-arm64-gnu.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ai2070/blackstream-linux-arm64-gnu')
-          const bindingPackageVersion = require('@ai2070/blackstream-linux-arm64-gnu/package.json').version
+          const binding = require('@ai2070/net-linux-arm64-gnu')
+          const bindingPackageVersion = require('@ai2070/net-linux-arm64-gnu/package.json').version
           if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -332,13 +332,13 @@ function requireNative() {
     } else if (process.arch === 'arm') {
       if (isMusl()) {
         try {
-          return require('./blackstream.linux-arm-musleabihf.node')
+          return require('./net.linux-arm-musleabihf.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ai2070/blackstream-linux-arm-musleabihf')
-          const bindingPackageVersion = require('@ai2070/blackstream-linux-arm-musleabihf/package.json').version
+          const binding = require('@ai2070/net-linux-arm-musleabihf')
+          const bindingPackageVersion = require('@ai2070/net-linux-arm-musleabihf/package.json').version
           if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -348,13 +348,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./blackstream.linux-arm-gnueabihf.node')
+          return require('./net.linux-arm-gnueabihf.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ai2070/blackstream-linux-arm-gnueabihf')
-          const bindingPackageVersion = require('@ai2070/blackstream-linux-arm-gnueabihf/package.json').version
+          const binding = require('@ai2070/net-linux-arm-gnueabihf')
+          const bindingPackageVersion = require('@ai2070/net-linux-arm-gnueabihf/package.json').version
           if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -366,13 +366,13 @@ function requireNative() {
     } else if (process.arch === 'loong64') {
       if (isMusl()) {
         try {
-          return require('./blackstream.linux-loong64-musl.node')
+          return require('./net.linux-loong64-musl.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ai2070/blackstream-linux-loong64-musl')
-          const bindingPackageVersion = require('@ai2070/blackstream-linux-loong64-musl/package.json').version
+          const binding = require('@ai2070/net-linux-loong64-musl')
+          const bindingPackageVersion = require('@ai2070/net-linux-loong64-musl/package.json').version
           if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -382,13 +382,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./blackstream.linux-loong64-gnu.node')
+          return require('./net.linux-loong64-gnu.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ai2070/blackstream-linux-loong64-gnu')
-          const bindingPackageVersion = require('@ai2070/blackstream-linux-loong64-gnu/package.json').version
+          const binding = require('@ai2070/net-linux-loong64-gnu')
+          const bindingPackageVersion = require('@ai2070/net-linux-loong64-gnu/package.json').version
           if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -400,13 +400,13 @@ function requireNative() {
     } else if (process.arch === 'riscv64') {
       if (isMusl()) {
         try {
-          return require('./blackstream.linux-riscv64-musl.node')
+          return require('./net.linux-riscv64-musl.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ai2070/blackstream-linux-riscv64-musl')
-          const bindingPackageVersion = require('@ai2070/blackstream-linux-riscv64-musl/package.json').version
+          const binding = require('@ai2070/net-linux-riscv64-musl')
+          const bindingPackageVersion = require('@ai2070/net-linux-riscv64-musl/package.json').version
           if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -416,13 +416,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./blackstream.linux-riscv64-gnu.node')
+          return require('./net.linux-riscv64-gnu.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ai2070/blackstream-linux-riscv64-gnu')
-          const bindingPackageVersion = require('@ai2070/blackstream-linux-riscv64-gnu/package.json').version
+          const binding = require('@ai2070/net-linux-riscv64-gnu')
+          const bindingPackageVersion = require('@ai2070/net-linux-riscv64-gnu/package.json').version
           if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -433,13 +433,13 @@ function requireNative() {
       }
     } else if (process.arch === 'ppc64') {
       try {
-        return require('./blackstream.linux-ppc64-gnu.node')
+        return require('./net.linux-ppc64-gnu.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ai2070/blackstream-linux-ppc64-gnu')
-        const bindingPackageVersion = require('@ai2070/blackstream-linux-ppc64-gnu/package.json').version
+        const binding = require('@ai2070/net-linux-ppc64-gnu')
+        const bindingPackageVersion = require('@ai2070/net-linux-ppc64-gnu/package.json').version
         if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -449,13 +449,13 @@ function requireNative() {
       }
     } else if (process.arch === 's390x') {
       try {
-        return require('./blackstream.linux-s390x-gnu.node')
+        return require('./net.linux-s390x-gnu.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ai2070/blackstream-linux-s390x-gnu')
-        const bindingPackageVersion = require('@ai2070/blackstream-linux-s390x-gnu/package.json').version
+        const binding = require('@ai2070/net-linux-s390x-gnu')
+        const bindingPackageVersion = require('@ai2070/net-linux-s390x-gnu/package.json').version
         if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -469,13 +469,13 @@ function requireNative() {
   } else if (process.platform === 'openharmony') {
     if (process.arch === 'arm64') {
       try {
-        return require('./blackstream.openharmony-arm64.node')
+        return require('./net.openharmony-arm64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ai2070/blackstream-openharmony-arm64')
-        const bindingPackageVersion = require('@ai2070/blackstream-openharmony-arm64/package.json').version
+        const binding = require('@ai2070/net-openharmony-arm64')
+        const bindingPackageVersion = require('@ai2070/net-openharmony-arm64/package.json').version
         if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -485,13 +485,13 @@ function requireNative() {
       }
     } else if (process.arch === 'x64') {
       try {
-        return require('./blackstream.openharmony-x64.node')
+        return require('./net.openharmony-x64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ai2070/blackstream-openharmony-x64')
-        const bindingPackageVersion = require('@ai2070/blackstream-openharmony-x64/package.json').version
+        const binding = require('@ai2070/net-openharmony-x64')
+        const bindingPackageVersion = require('@ai2070/net-openharmony-x64/package.json').version
         if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -501,13 +501,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm') {
       try {
-        return require('./blackstream.openharmony-arm.node')
+        return require('./net.openharmony-arm.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ai2070/blackstream-openharmony-arm')
-        const bindingPackageVersion = require('@ai2070/blackstream-openharmony-arm/package.json').version
+        const binding = require('@ai2070/net-openharmony-arm')
+        const bindingPackageVersion = require('@ai2070/net-openharmony-arm/package.json').version
         if (bindingPackageVersion !== '0.5.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.5.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -529,7 +529,7 @@ if (!nativeBinding || process.env.NAPI_RS_FORCE_WASI) {
   let wasiBinding = null
   let wasiBindingError = null
   try {
-    wasiBinding = require('./blackstream.wasi.cjs')
+    wasiBinding = require('./net.wasi.cjs')
     nativeBinding = wasiBinding
   } catch (err) {
     if (process.env.NAPI_RS_FORCE_WASI) {
@@ -538,7 +538,7 @@ if (!nativeBinding || process.env.NAPI_RS_FORCE_WASI) {
   }
   if (!nativeBinding) {
     try {
-      wasiBinding = require('@ai2070/blackstream-wasm32-wasi')
+      wasiBinding = require('@ai2070/net-wasm32-wasi')
       nativeBinding = wasiBinding
     } catch (err) {
       if (process.env.NAPI_RS_FORCE_WASI) {
@@ -572,4 +572,4 @@ if (!nativeBinding) {
 }
 
 module.exports = nativeBinding
-module.exports.Blackstream = nativeBinding.Blackstream
+module.exports.Net = nativeBinding.Net

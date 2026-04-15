@@ -1,6 +1,6 @@
 //! C FFI bindings for cross-language integration.
 //!
-//! This module provides a C-compatible API for using Blackstream from
+//! This module provides a C-compatible API for using Net from
 //! other languages (Python, Node.js, Go, etc.).
 //!
 //! # Safety
@@ -11,7 +11,7 @@
 //! - Pointers are valid and properly aligned
 //! - String pointers point to valid UTF-8 data
 //! - Buffer sizes are accurate
-//! - Handles are not used after `blackstream_shutdown`
+//! - Handles are not used after `net_shutdown`
 //!
 //! # Thread Safety
 //!
@@ -20,30 +20,30 @@
 //!
 //! # Memory Management
 //!
-//! - Handles returned by `blackstream_init` must be freed with `blackstream_shutdown`
-//! - String buffers passed to `blackstream_poll` are owned by the caller
+//! - Handles returned by `net_init` must be freed with `net_shutdown`
+//! - String buffers passed to `net_poll` are owned by the caller
 //! - Error codes are returned as integers (0 = success, negative = error)
 //!
 //! # Example (C)
 //!
 //! ```c
-//! #include "blackstream.h"
+//! #include "net.h"
 //!
 //! int main() {
 //!     // Initialize with default config
-//!     void* bus = blackstream_init("{\"num_shards\": 4}");
+//!     void* bus = net_init("{\"num_shards\": 4}");
 //!     if (!bus) return 1;
 //!
 //!     // Ingest an event
-//!     int result = blackstream_ingest(bus, "{\"token\": \"hello\"}", 19);
+//!     int result = net_ingest(bus, "{\"token\": \"hello\"}", 19);
 //!     if (result < 0) { /* handle error */ }
 //!
 //!     // Poll events
 //!     char buffer[65536];
-//!     result = blackstream_poll(bus, "{\"limit\": 100}", buffer, sizeof(buffer));
+//!     result = net_poll(bus, "{\"limit\": 100}", buffer, sizeof(buffer));
 //!
 //!     // Shutdown
-//!     blackstream_shutdown(bus);
+//!     net_shutdown(bus);
 //!     return 0;
 //! }
 //! ```
@@ -63,26 +63,26 @@ use crate::config::{AdapterConfig, EventBusConfig};
 use crate::consumer::ConsumeRequest;
 use crate::event::{Event, RawEvent};
 
-#[cfg(feature = "bltp")]
-use crate::adapter::bltp::{BltpAdapterConfig, ReliabilityConfig, StaticKeypair};
+#[cfg(feature = "nltp")]
+use crate::adapter::nltp::{NltpAdapterConfig, ReliabilityConfig, StaticKeypair};
 #[cfg(feature = "jetstream")]
 use crate::config::JetStreamAdapterConfig;
 #[cfg(feature = "redis")]
 use crate::config::RedisAdapterConfig;
-#[cfg(feature = "bltp")]
+#[cfg(feature = "nltp")]
 use std::ffi::CString;
 
 /// Opaque handle to an event bus instance.
 ///
 /// This wraps the EventBus along with a Tokio runtime for async operations.
-pub struct BlackstreamHandle {
+pub struct NetHandle {
     bus: EventBus,
     runtime: Runtime,
 }
 
 /// Error codes returned by FFI functions.
 #[repr(C)]
-pub enum BlackstreamError {
+pub enum NetError {
     /// Success (no error).
     Success = 0,
     /// Null pointer passed.
@@ -105,8 +105,8 @@ pub enum BlackstreamError {
     Unknown = -99,
 }
 
-impl From<BlackstreamError> for c_int {
-    fn from(e: BlackstreamError) -> Self {
+impl From<NetError> for c_int {
+    fn from(e: NetError) -> Self {
         e as c_int
     }
 }
@@ -121,7 +121,7 @@ impl From<BlackstreamError> for c_int {
 /// # Returns
 ///
 /// Opaque handle to the event bus, or NULL on failure.
-/// The handle must be freed with `blackstream_shutdown`.
+/// The handle must be freed with `net_shutdown`.
 ///
 /// # Example Configuration
 ///
@@ -138,7 +138,7 @@ impl From<BlackstreamError> for c_int {
 /// }
 /// ```
 #[unsafe(no_mangle)]
-pub extern "C" fn blackstream_init(config_json: *const c_char) -> *mut BlackstreamHandle {
+pub extern "C" fn net_init(config_json: *const c_char) -> *mut NetHandle {
     // Create runtime
     let runtime = match Runtime::new() {
         Ok(rt) => rt,
@@ -164,7 +164,7 @@ pub extern "C" fn blackstream_init(config_json: *const c_char) -> *mut Blackstre
     create_with_config(runtime, config)
 }
 
-fn create_with_default(runtime: Runtime) -> *mut BlackstreamHandle {
+fn create_with_default(runtime: Runtime) -> *mut NetHandle {
     create_with_config(runtime, EventBusConfig::default())
 }
 
@@ -242,98 +242,98 @@ fn parse_config_json(json_str: &str) -> Option<EventBusConfig> {
         }
     }
 
-    // Parse BLTP config
-    #[cfg(feature = "bltp")]
-    if let Some(bltp) = value.get("bltp") {
-        let bind_addr: std::net::SocketAddr = bltp
+    // Parse NLTP config
+    #[cfg(feature = "nltp")]
+    if let Some(nltp) = value.get("nltp") {
+        let bind_addr: std::net::SocketAddr = nltp
             .get("bind_addr")
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse().ok())?;
 
-        let peer_addr: std::net::SocketAddr = bltp
+        let peer_addr: std::net::SocketAddr = nltp
             .get("peer_addr")
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse().ok())?;
 
-        let psk: [u8; 32] = bltp
+        let psk: [u8; 32] = nltp
             .get("psk")
             .and_then(|v| v.as_str())
             .and_then(|s| hex::decode(s).ok())
             .and_then(|v| v.try_into().ok())?;
 
-        let role = bltp
+        let role = nltp
             .get("role")
             .and_then(|v| v.as_str())
             .unwrap_or("initiator");
 
-        let mut bltp_config = match role {
+        let mut nltp_config = match role {
             "initiator" => {
-                let peer_pubkey: [u8; 32] = bltp
+                let peer_pubkey: [u8; 32] = nltp
                     .get("peer_public_key")
                     .and_then(|v| v.as_str())
                     .and_then(|s| hex::decode(s).ok())
                     .and_then(|v| v.try_into().ok())?;
-                BltpAdapterConfig::initiator(bind_addr, peer_addr, psk, peer_pubkey)
+                NltpAdapterConfig::initiator(bind_addr, peer_addr, psk, peer_pubkey)
             }
             "responder" => {
-                let secret_key: [u8; 32] = bltp
+                let secret_key: [u8; 32] = nltp
                     .get("secret_key")
                     .and_then(|v| v.as_str())
                     .and_then(|s| hex::decode(s).ok())
                     .and_then(|v| v.try_into().ok())?;
-                let public_key: [u8; 32] = bltp
+                let public_key: [u8; 32] = nltp
                     .get("public_key")
                     .and_then(|v| v.as_str())
                     .and_then(|s| hex::decode(s).ok())
                     .and_then(|v| v.try_into().ok())?;
                 let keypair = StaticKeypair::from_keys(secret_key, public_key);
-                BltpAdapterConfig::responder(bind_addr, peer_addr, psk, keypair)
+                NltpAdapterConfig::responder(bind_addr, peer_addr, psk, keypair)
             }
             _ => return None,
         };
 
         // Apply optional settings
-        if let Some(reliability) = bltp.get("reliability").and_then(|v| v.as_str()) {
-            bltp_config = bltp_config.with_reliability(match reliability {
+        if let Some(reliability) = nltp.get("reliability").and_then(|v| v.as_str()) {
+            nltp_config = nltp_config.with_reliability(match reliability {
                 "light" => ReliabilityConfig::Light,
                 "full" => ReliabilityConfig::Full,
                 _ => ReliabilityConfig::None,
             });
         }
 
-        if let Some(pool_size) = bltp.get("packet_pool_size").and_then(|v| v.as_u64()) {
+        if let Some(pool_size) = nltp.get("packet_pool_size").and_then(|v| v.as_u64()) {
             if let Ok(size) = usize::try_from(pool_size) {
-                bltp_config = bltp_config.with_pool_size(size);
+                nltp_config = nltp_config.with_pool_size(size);
             }
         }
 
-        if let Some(interval_ms) = bltp.get("heartbeat_interval_ms").and_then(|v| v.as_u64()) {
-            bltp_config =
-                bltp_config.with_heartbeat_interval(std::time::Duration::from_millis(interval_ms));
+        if let Some(interval_ms) = nltp.get("heartbeat_interval_ms").and_then(|v| v.as_u64()) {
+            nltp_config =
+                nltp_config.with_heartbeat_interval(std::time::Duration::from_millis(interval_ms));
         }
 
-        if let Some(timeout_ms) = bltp.get("session_timeout_ms").and_then(|v| v.as_u64()) {
-            bltp_config =
-                bltp_config.with_session_timeout(std::time::Duration::from_millis(timeout_ms));
+        if let Some(timeout_ms) = nltp.get("session_timeout_ms").and_then(|v| v.as_u64()) {
+            nltp_config =
+                nltp_config.with_session_timeout(std::time::Duration::from_millis(timeout_ms));
         }
 
-        if let Some(batched) = bltp.get("batched_io").and_then(|v| v.as_bool()) {
-            bltp_config = bltp_config.with_batched_io(batched);
+        if let Some(batched) = nltp.get("batched_io").and_then(|v| v.as_bool()) {
+            nltp_config = nltp_config.with_batched_io(batched);
         }
 
-        builder = builder.adapter(AdapterConfig::Bltp(Box::new(bltp_config)));
+        builder = builder.adapter(AdapterConfig::Nltp(Box::new(nltp_config)));
     }
 
     builder.build().ok()
 }
 
-fn create_with_config(runtime: Runtime, config: EventBusConfig) -> *mut BlackstreamHandle {
+fn create_with_config(runtime: Runtime, config: EventBusConfig) -> *mut NetHandle {
     let bus = match runtime.block_on(EventBus::new(config)) {
         Ok(bus) => bus,
         Err(_) => return ptr::null_mut(),
     };
 
-    let handle = Box::new(BlackstreamHandle { bus, runtime });
+    let handle = Box::new(NetHandle { bus, runtime });
 
     Box::into_raw(handle)
 }
@@ -342,7 +342,7 @@ fn create_with_config(runtime: Runtime, config: EventBusConfig) -> *mut Blackstr
 ///
 /// # Parameters
 ///
-/// - `handle`: Event bus handle from `blackstream_init`.
+/// - `handle`: Event bus handle from `net_init`.
 /// - `event_json`: JSON event string (UTF-8).
 /// - `len`: Length of the event string in bytes.
 ///
@@ -351,13 +351,13 @@ fn create_with_config(runtime: Runtime, config: EventBusConfig) -> *mut Blackstr
 /// - `0` on success
 /// - Negative error code on failure
 #[unsafe(no_mangle)]
-pub extern "C" fn blackstream_ingest(
-    handle: *mut BlackstreamHandle,
+pub extern "C" fn net_ingest(
+    handle: *mut NetHandle,
     event_json: *const c_char,
     len: usize,
 ) -> c_int {
     if handle.is_null() || event_json.is_null() {
-        return BlackstreamError::NullPointer.into();
+        return NetError::NullPointer.into();
     }
 
     let handle = unsafe { &*handle };
@@ -366,18 +366,18 @@ pub extern "C" fn blackstream_ingest(
     let json_bytes = unsafe { std::slice::from_raw_parts(event_json as *const u8, len) };
     let json_str = match std::str::from_utf8(json_bytes) {
         Ok(s) => s,
-        Err(_) => return BlackstreamError::InvalidUtf8.into(),
+        Err(_) => return NetError::InvalidUtf8.into(),
     };
 
     let event = match Event::from_str(json_str) {
         Ok(e) => e,
-        Err(_) => return BlackstreamError::InvalidJson.into(),
+        Err(_) => return NetError::InvalidJson.into(),
     };
 
     // Ingest
     match handle.bus.ingest(event) {
-        Ok(_) => BlackstreamError::Success.into(),
-        Err(_) => BlackstreamError::IngestionFailed.into(),
+        Ok(_) => NetError::Success.into(),
+        Err(_) => NetError::IngestionFailed.into(),
     }
 }
 
@@ -388,7 +388,7 @@ pub extern "C" fn blackstream_ingest(
 ///
 /// # Parameters
 ///
-/// - `handle`: Event bus handle from `blackstream_init`.
+/// - `handle`: Event bus handle from `net_init`.
 /// - `json`: JSON string (UTF-8).
 /// - `len`: Length of the JSON string in bytes.
 ///
@@ -397,13 +397,13 @@ pub extern "C" fn blackstream_ingest(
 /// - `0` on success
 /// - Negative error code on failure
 #[unsafe(no_mangle)]
-pub extern "C" fn blackstream_ingest_raw(
-    handle: *mut BlackstreamHandle,
+pub extern "C" fn net_ingest_raw(
+    handle: *mut NetHandle,
     json: *const c_char,
     len: usize,
 ) -> c_int {
     if handle.is_null() || json.is_null() {
-        return BlackstreamError::NullPointer.into();
+        return NetError::NullPointer.into();
     }
 
     let handle = unsafe { &*handle };
@@ -411,14 +411,14 @@ pub extern "C" fn blackstream_ingest_raw(
     let json_bytes = unsafe { std::slice::from_raw_parts(json as *const u8, len) };
     let json_str = match std::str::from_utf8(json_bytes) {
         Ok(s) => s,
-        Err(_) => return BlackstreamError::InvalidUtf8.into(),
+        Err(_) => return NetError::InvalidUtf8.into(),
     };
 
     let raw = RawEvent::from_str(json_str);
 
     match handle.bus.ingest_raw(raw) {
-        Ok(_) => BlackstreamError::Success.into(),
-        Err(_) => BlackstreamError::IngestionFailed.into(),
+        Ok(_) => NetError::Success.into(),
+        Err(_) => NetError::IngestionFailed.into(),
     }
 }
 
@@ -435,14 +435,14 @@ pub extern "C" fn blackstream_ingest_raw(
 ///
 /// Number of successfully ingested events, or negative error code.
 #[unsafe(no_mangle)]
-pub extern "C" fn blackstream_ingest_raw_batch(
-    handle: *mut BlackstreamHandle,
+pub extern "C" fn net_ingest_raw_batch(
+    handle: *mut NetHandle,
     jsons: *const *const c_char,
     lens: *const usize,
     count: usize,
 ) -> c_int {
     if handle.is_null() || jsons.is_null() || lens.is_null() {
-        return BlackstreamError::NullPointer.into();
+        return NetError::NullPointer.into();
     }
     if count == 0 {
         return 0;
@@ -480,25 +480,25 @@ pub extern "C" fn blackstream_ingest_raw_batch(
 ///
 /// Number of successfully ingested events, or negative error code.
 #[unsafe(no_mangle)]
-pub extern "C" fn blackstream_ingest_batch(
-    handle: *mut BlackstreamHandle,
+pub extern "C" fn net_ingest_batch(
+    handle: *mut NetHandle,
     events_json: *const c_char,
 ) -> c_int {
     if handle.is_null() || events_json.is_null() {
-        return BlackstreamError::NullPointer.into();
+        return NetError::NullPointer.into();
     }
 
     let handle = unsafe { &*handle };
 
     let json_str = match unsafe { CStr::from_ptr(events_json) }.to_str() {
         Ok(s) => s,
-        Err(_) => return BlackstreamError::InvalidUtf8.into(),
+        Err(_) => return NetError::InvalidUtf8.into(),
     };
 
     // Parse as JSON array
     let array: Vec<serde_json::Value> = match serde_json::from_str(json_str) {
         Ok(a) => a,
-        Err(_) => return BlackstreamError::InvalidJson.into(),
+        Err(_) => return NetError::InvalidJson.into(),
     };
 
     let events: Vec<Event> = array.into_iter().map(Event::new).collect();
@@ -522,14 +522,14 @@ pub extern "C" fn blackstream_ingest_batch(
 /// - Number of bytes written to buffer on success
 /// - Negative error code on failure
 #[unsafe(no_mangle)]
-pub extern "C" fn blackstream_poll(
-    handle: *mut BlackstreamHandle,
+pub extern "C" fn net_poll(
+    handle: *mut NetHandle,
     request_json: *const c_char,
     out_buffer: *mut c_char,
     buffer_len: usize,
 ) -> c_int {
     if handle.is_null() || out_buffer.is_null() {
-        return BlackstreamError::NullPointer.into();
+        return NetError::NullPointer.into();
     }
 
     let handle = unsafe { &*handle };
@@ -540,13 +540,13 @@ pub extern "C" fn blackstream_poll(
     } else {
         let json_str = match unsafe { CStr::from_ptr(request_json) }.to_str() {
             Ok(s) => s,
-            Err(_) => return BlackstreamError::InvalidUtf8.into(),
+            Err(_) => return NetError::InvalidUtf8.into(),
         };
 
         // Parse limit from JSON
         let value: serde_json::Value = match serde_json::from_str(json_str) {
             Ok(v) => v,
-            Err(_) => return BlackstreamError::InvalidJson.into(),
+            Err(_) => return NetError::InvalidJson.into(),
         };
 
         let limit = value.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
@@ -556,7 +556,7 @@ pub extern "C" fn blackstream_poll(
     // Poll
     let response = match handle.runtime.block_on(handle.bus.poll(request)) {
         Ok(r) => r,
-        Err(_) => return BlackstreamError::PollFailed.into(),
+        Err(_) => return NetError::PollFailed.into(),
     };
 
     // Serialize response
@@ -567,12 +567,12 @@ pub extern "C" fn blackstream_poll(
         "count": response.events.len(),
     })) {
         Ok(s) => s,
-        Err(_) => return BlackstreamError::Unknown.into(),
+        Err(_) => return NetError::Unknown.into(),
     };
 
     // Check buffer size
     if response_json.len() + 1 > buffer_len {
-        return BlackstreamError::BufferTooSmall.into();
+        return NetError::BufferTooSmall.into();
     }
 
     // Copy to output buffer
@@ -600,13 +600,13 @@ pub extern "C" fn blackstream_poll(
 ///
 /// Number of bytes written, or negative error code.
 #[unsafe(no_mangle)]
-pub extern "C" fn blackstream_stats(
-    handle: *mut BlackstreamHandle,
+pub extern "C" fn net_stats(
+    handle: *mut NetHandle,
     out_buffer: *mut c_char,
     buffer_len: usize,
 ) -> c_int {
     if handle.is_null() || out_buffer.is_null() {
-        return BlackstreamError::NullPointer.into();
+        return NetError::NullPointer.into();
     }
 
     let handle = unsafe { &*handle };
@@ -622,11 +622,11 @@ pub extern "C" fn blackstream_stats(
         "shard_batches_dispatched": shard_stats.batches_dispatched,
     })) {
         Ok(s) => s,
-        Err(_) => return BlackstreamError::Unknown.into(),
+        Err(_) => return NetError::Unknown.into(),
     };
 
     if stats_json.len() + 1 > buffer_len {
-        return BlackstreamError::BufferTooSmall.into();
+        return NetError::BufferTooSmall.into();
     }
 
     unsafe {
@@ -652,16 +652,16 @@ pub extern "C" fn blackstream_stats(
 /// - `0` on success
 /// - Negative error code on failure
 #[unsafe(no_mangle)]
-pub extern "C" fn blackstream_flush(handle: *mut BlackstreamHandle) -> c_int {
+pub extern "C" fn net_flush(handle: *mut NetHandle) -> c_int {
     if handle.is_null() {
-        return BlackstreamError::NullPointer.into();
+        return NetError::NullPointer.into();
     }
 
     let handle = unsafe { &*handle };
 
     match handle.runtime.block_on(handle.bus.flush()) {
-        Ok(_) => BlackstreamError::Success.into(),
-        Err(_) => BlackstreamError::Unknown.into(),
+        Ok(_) => NetError::Success.into(),
+        Err(_) => NetError::Unknown.into(),
     }
 }
 
@@ -676,9 +676,9 @@ pub extern "C" fn blackstream_flush(handle: *mut BlackstreamHandle) -> c_int {
 /// - `0` on success
 /// - Negative error code on failure
 #[unsafe(no_mangle)]
-pub extern "C" fn blackstream_shutdown(handle: *mut BlackstreamHandle) -> c_int {
+pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
     if handle.is_null() {
-        return BlackstreamError::NullPointer.into();
+        return NetError::NullPointer.into();
     }
 
     let handle = unsafe { Box::from_raw(handle) };
@@ -687,7 +687,7 @@ pub extern "C" fn blackstream_shutdown(handle: *mut BlackstreamHandle) -> c_int 
     // For now, just drop the handle which will clean up resources
     drop(handle);
 
-    BlackstreamError::Success.into()
+    NetError::Success.into()
 }
 
 /// Get the number of shards.
@@ -700,7 +700,7 @@ pub extern "C" fn blackstream_shutdown(handle: *mut BlackstreamHandle) -> c_int 
 ///
 /// Number of shards, or 0 if handle is null.
 #[unsafe(no_mangle)]
-pub extern "C" fn blackstream_num_shards(handle: *mut BlackstreamHandle) -> u16 {
+pub extern "C" fn net_num_shards(handle: *mut NetHandle) -> u16 {
     if handle.is_null() {
         return 0;
     }
@@ -714,21 +714,21 @@ pub extern "C" fn blackstream_num_shards(handle: *mut BlackstreamHandle) -> u16 
 ///
 /// Version string (static, do not free).
 #[unsafe(no_mangle)]
-pub extern "C" fn blackstream_version() -> *const c_char {
+pub extern "C" fn net_version() -> *const c_char {
     static VERSION: &[u8] = b"0.1.0\0";
     VERSION.as_ptr() as *const c_char
 }
 
-/// Generate a new BLTP keypair.
+/// Generate a new NLTP keypair.
 ///
 /// # Returns
 ///
 /// JSON string with hex-encoded public_key and secret_key.
-/// The caller must free the returned string with `blackstream_free_string`.
-/// Returns NULL if BLTP feature is not enabled.
-#[cfg(feature = "bltp")]
+/// The caller must free the returned string with `net_free_string`.
+/// Returns NULL if NLTP feature is not enabled.
+#[cfg(feature = "nltp")]
 #[unsafe(no_mangle)]
-pub extern "C" fn bltp_generate_keypair() -> *mut c_char {
+pub extern "C" fn nltp_generate_keypair() -> *mut c_char {
     let keypair = StaticKeypair::generate();
     let json = serde_json::json!({
         "public_key": hex::encode(keypair.public_key()),
@@ -741,14 +741,14 @@ pub extern "C" fn bltp_generate_keypair() -> *mut c_char {
     }
 }
 
-/// Free a string returned by BLTP functions.
+/// Free a string returned by NLTP functions.
 ///
 /// # Parameters
 ///
-/// - `s`: String pointer returned by `bltp_generate_keypair` or similar.
-#[cfg(feature = "bltp")]
+/// - `s`: String pointer returned by `nltp_generate_keypair` or similar.
+#[cfg(feature = "nltp")]
 #[unsafe(no_mangle)]
-pub extern "C" fn blackstream_free_string(s: *mut c_char) {
+pub extern "C" fn net_free_string(s: *mut c_char) {
     if !s.is_null() {
         unsafe {
             drop(CString::from_raw(s));

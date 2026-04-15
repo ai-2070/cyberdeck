@@ -1,11 +1,11 @@
-//! Event types for the Blackstream event bus.
+//! Event types for the Net event bus.
 //!
 //! Events are opaque JSON values - the event bus performs no schema validation
 //! or interpretation of event content.
 //!
 //! # Performance Optimization
 //!
-//! Since Blackstream is schema-agnostic, we offer multiple event representations:
+//! Since Net is schema-agnostic, we offer multiple event representations:
 //!
 //! - `Event`: Standard wrapper around `serde_json::Value` (convenient but slower)
 //! - `RawEvent`: Pre-serialized bytes with cached hash (fastest for high-throughput)
@@ -360,7 +360,7 @@ impl StoredEvent {
     /// Get the raw bytes as a string slice (for serialization).
     #[inline]
     pub fn raw_str(&self) -> &str {
-        // Safety: BLTP events are valid UTF-8 JSON
+        // Safety: NLTP events are valid UTF-8 JSON
         std::str::from_utf8(&self.raw).unwrap_or("{}")
     }
 }

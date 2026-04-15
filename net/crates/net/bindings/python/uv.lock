@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.10"
 
 [[package]]
-name = "blackstream"
+name = "net"
 version = "0.5.0"
 source = { editable = "." }
 

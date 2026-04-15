@@ -6,12 +6,12 @@ members = [
 ]
 
 [package]
-name = "blackstream"
+name = "net"
 version = "0.5.0"
 edition = "2021"
 description = "High-performance, schema-agnostic, backend-agnostic event bus"
 license = "Apache-2.0"
-repository = "https://github.com/ai-2070/blackstream"
+repository = "https://github.com/ai-2070/net"
 keywords = ["event-bus", "high-performance", "streaming"]
 categories = ["asynchronous", "concurrency", "data-structures"]
 
@@ -22,7 +22,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 default = ["redis"]
 redis = ["dep:redis"]
 jetstream = ["dep:async-nats"]
-bltp = [
+nltp = [
     "dep:chacha20poly1305",
     "dep:snow",
     "dep:getrandom",
@@ -72,7 +72,7 @@ thiserror = "2"
 tracing = "0.1"
 arc-swap = "1.7.1"
 
-# BLTP adapter (optional)
+# NLTP adapter (optional)
 chacha20poly1305 = { version = "0.10", optional = true }
 snow = { version = "0.10.0", optional = true }
 getrandom = { version = "0.4.2", optional = true }
@@ -105,9 +105,9 @@ name = "parallel"
 harness = false
 
 [[bench]]
-name = "bltp"
+name = "nltp"
 harness = false
-required-features = ["bltp"]
+required-features = ["nltp"]
 
 [[test]]
 name = "integration_redis"
@@ -120,9 +120,9 @@ path = "tests/integration_jetstream.rs"
 required-features = ["jetstream"]
 
 [[test]]
-name = "integration_bltp"
-path = "tests/integration_bltp.rs"
-required-features = ["bltp"]
+name = "integration_nltp"
+path = "tests/integration_nltp.rs"
+required-features = ["nltp"]
 
 [profile.release]
 lto = true

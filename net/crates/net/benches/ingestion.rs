@@ -3,9 +3,9 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::json;
 
-use blackstream::event::InternalEvent;
-use blackstream::shard::RingBuffer;
-use blackstream::timestamp::TimestampGenerator;
+use net::event::InternalEvent;
+use net::shard::RingBuffer;
+use net::timestamp::TimestampGenerator;
 
 /// Benchmark ring buffer push/pop operations.
 fn bench_ring_buffer(c: &mut Criterion) {

@@ -1,5 +1,5 @@
 """
-Integration tests for Blackstream Python bindings with BLTP.
+Integration tests for Net Python bindings with NLTP.
 
 Run tests:
   pytest tests/test_integration.py -v
@@ -14,31 +14,31 @@ import secrets
 import time
 
 import pytest
-from blackstream import Blackstream
+from net import Net
 
-# Check if BLTP feature is available
+# Check if NLTP feature is available
 try:
-    from blackstream import BltpKeypair, generate_bltp_keypair
+    from net import NltpKeypair, generate_nltp_keypair
 
-    BLTP_AVAILABLE = True
+    NLTP_AVAILABLE = True
 except ImportError:
-    BLTP_AVAILABLE = False
+    NLTP_AVAILABLE = False
 
 RUN_INTEGRATION_TESTS = os.environ.get("RUN_INTEGRATION_TESTS") == "1"
 
-skip_bltp = pytest.mark.skipif(
-    not RUN_INTEGRATION_TESTS or not BLTP_AVAILABLE,
-    reason="Set RUN_INTEGRATION_TESTS=1 and build with BLTP feature to run BLTP tests",
+skip_nltp = pytest.mark.skipif(
+    not RUN_INTEGRATION_TESTS or not NLTP_AVAILABLE,
+    reason="Set RUN_INTEGRATION_TESTS=1 and build with NLTP feature to run NLTP tests",
 )
 
 
-class TestBltpIntegration:
-    """Integration tests for BLTP adapter (encrypted UDP transport)."""
+class TestNltpIntegration:
+    """Integration tests for NLTP adapter (encrypted UDP transport)."""
 
-    @skip_bltp
+    @skip_nltp
     def test_generate_keypair(self):
-        """Test BLTP keypair generation."""
-        keypair = generate_bltp_keypair()
+        """Test NLTP keypair generation."""
+        keypair = generate_nltp_keypair()
 
         assert keypair is not None
         assert keypair.public_key is not None
@@ -53,43 +53,43 @@ class TestBltpIntegration:
         int(keypair.secret_key, 16)
 
         # Each call should generate different keypairs
-        keypair2 = generate_bltp_keypair()
+        keypair2 = generate_nltp_keypair()
         assert keypair2.public_key != keypair.public_key
         assert keypair2.secret_key != keypair.secret_key
 
-    @skip_bltp
+    @skip_nltp
     def test_exchange_events(self):
         """Test event exchange between initiator and responder."""
         # Generate keypair for responder
-        responder_keypair = generate_bltp_keypair()
+        responder_keypair = generate_nltp_keypair()
 
         # Generate shared PSK (32 bytes hex)
         psk = secrets.token_hex(32)
 
         # Create responder (binds first, waits for initiator)
-        responder = Blackstream(
+        responder = Net(
             num_shards=1,
-            bltp_bind_addr="127.0.0.1:19100",
-            bltp_peer_addr="127.0.0.1:19101",
-            bltp_psk=psk,
-            bltp_role="responder",
-            bltp_secret_key=responder_keypair.secret_key,
-            bltp_public_key=responder_keypair.public_key,
-            bltp_reliability="light",
+            nltp_bind_addr="127.0.0.1:19100",
+            nltp_peer_addr="127.0.0.1:19101",
+            nltp_psk=psk,
+            nltp_role="responder",
+            nltp_secret_key=responder_keypair.secret_key,
+            nltp_public_key=responder_keypair.public_key,
+            nltp_reliability="light",
         )
 
         # Small delay to ensure responder is ready
         time.sleep(0.05)
 
         # Create initiator
-        initiator = Blackstream(
+        initiator = Net(
             num_shards=1,
-            bltp_bind_addr="127.0.0.1:19101",
-            bltp_peer_addr="127.0.0.1:19100",
-            bltp_psk=psk,
-            bltp_role="initiator",
-            bltp_peer_public_key=responder_keypair.public_key,
-            bltp_reliability="light",
+            nltp_bind_addr="127.0.0.1:19101",
+            nltp_peer_addr="127.0.0.1:19100",
+            nltp_psk=psk,
+            nltp_role="initiator",
+            nltp_peer_public_key=responder_keypair.public_key,
+            nltp_reliability="light",
         )
 
         try:
@@ -118,31 +118,31 @@ class TestBltpIntegration:
             initiator.shutdown()
             responder.shutdown()
 
-    @skip_bltp
+    @skip_nltp
     def test_batch_ingestion(self):
-        """Test batch ingestion over BLTP."""
-        responder_keypair = generate_bltp_keypair()
+        """Test batch ingestion over NLTP."""
+        responder_keypair = generate_nltp_keypair()
         psk = secrets.token_hex(32)
 
-        responder = Blackstream(
+        responder = Net(
             num_shards=1,
-            bltp_bind_addr="127.0.0.1:19102",
-            bltp_peer_addr="127.0.0.1:19103",
-            bltp_psk=psk,
-            bltp_role="responder",
-            bltp_secret_key=responder_keypair.secret_key,
-            bltp_public_key=responder_keypair.public_key,
+            nltp_bind_addr="127.0.0.1:19102",
+            nltp_peer_addr="127.0.0.1:19103",
+            nltp_psk=psk,
+            nltp_role="responder",
+            nltp_secret_key=responder_keypair.secret_key,
+            nltp_public_key=responder_keypair.public_key,
         )
 
         time.sleep(0.05)
 
-        initiator = Blackstream(
+        initiator = Net(
             num_shards=1,
-            bltp_bind_addr="127.0.0.1:19103",
-            bltp_peer_addr="127.0.0.1:19102",
-            bltp_psk=psk,
-            bltp_role="initiator",
-            bltp_peer_public_key=responder_keypair.public_key,
+            nltp_bind_addr="127.0.0.1:19103",
+            nltp_peer_addr="127.0.0.1:19102",
+            nltp_psk=psk,
+            nltp_role="initiator",
+            nltp_peer_public_key=responder_keypair.public_key,
         )
 
         try:
@@ -161,37 +161,37 @@ class TestBltpIntegration:
             initiator.shutdown()
             responder.shutdown()
 
-    @skip_bltp
+    @skip_nltp
     def test_full_reliability_mode(self):
         """Test full reliability mode."""
-        responder_keypair = generate_bltp_keypair()
+        responder_keypair = generate_nltp_keypair()
         psk = secrets.token_hex(32)
 
-        responder = Blackstream(
+        responder = Net(
             num_shards=1,
-            bltp_bind_addr="127.0.0.1:19104",
-            bltp_peer_addr="127.0.0.1:19105",
-            bltp_psk=psk,
-            bltp_role="responder",
-            bltp_secret_key=responder_keypair.secret_key,
-            bltp_public_key=responder_keypair.public_key,
-            bltp_reliability="full",
-            bltp_heartbeat_interval_ms=1000,
-            bltp_session_timeout_ms=10000,
+            nltp_bind_addr="127.0.0.1:19104",
+            nltp_peer_addr="127.0.0.1:19105",
+            nltp_psk=psk,
+            nltp_role="responder",
+            nltp_secret_key=responder_keypair.secret_key,
+            nltp_public_key=responder_keypair.public_key,
+            nltp_reliability="full",
+            nltp_heartbeat_interval_ms=1000,
+            nltp_session_timeout_ms=10000,
         )
 
         time.sleep(0.05)
 
-        initiator = Blackstream(
+        initiator = Net(
             num_shards=1,
-            bltp_bind_addr="127.0.0.1:19105",
-            bltp_peer_addr="127.0.0.1:19104",
-            bltp_psk=psk,
-            bltp_role="initiator",
-            bltp_peer_public_key=responder_keypair.public_key,
-            bltp_reliability="full",
-            bltp_heartbeat_interval_ms=1000,
-            bltp_session_timeout_ms=10000,
+            nltp_bind_addr="127.0.0.1:19105",
+            nltp_peer_addr="127.0.0.1:19104",
+            nltp_psk=psk,
+            nltp_role="initiator",
+            nltp_peer_public_key=responder_keypair.public_key,
+            nltp_reliability="full",
+            nltp_heartbeat_interval_ms=1000,
+            nltp_session_timeout_ms=10000,
         )
 
         try:
@@ -209,30 +209,30 @@ class TestBltpIntegration:
             initiator.shutdown()
             responder.shutdown()
 
-    @skip_bltp
+    @skip_nltp
     def test_context_manager(self):
-        """Test context manager support with BLTP."""
-        responder_keypair = generate_bltp_keypair()
+        """Test context manager support with NLTP."""
+        responder_keypair = generate_nltp_keypair()
         psk = secrets.token_hex(32)
 
-        with Blackstream(
+        with Net(
             num_shards=1,
-            bltp_bind_addr="127.0.0.1:19106",
-            bltp_peer_addr="127.0.0.1:19107",
-            bltp_psk=psk,
-            bltp_role="responder",
-            bltp_secret_key=responder_keypair.secret_key,
-            bltp_public_key=responder_keypair.public_key,
+            nltp_bind_addr="127.0.0.1:19106",
+            nltp_peer_addr="127.0.0.1:19107",
+            nltp_psk=psk,
+            nltp_role="responder",
+            nltp_secret_key=responder_keypair.secret_key,
+            nltp_public_key=responder_keypair.public_key,
         ) as responder:
             time.sleep(0.05)
 
-            with Blackstream(
+            with Net(
                 num_shards=1,
-                bltp_bind_addr="127.0.0.1:19107",
-                bltp_peer_addr="127.0.0.1:19106",
-                bltp_psk=psk,
-                bltp_role="initiator",
-                bltp_peer_public_key=responder_keypair.public_key,
+                nltp_bind_addr="127.0.0.1:19107",
+                nltp_peer_addr="127.0.0.1:19106",
+                nltp_psk=psk,
+                nltp_role="initiator",
+                nltp_peer_public_key=responder_keypair.public_key,
             ) as initiator:
                 time.sleep(0.2)
 

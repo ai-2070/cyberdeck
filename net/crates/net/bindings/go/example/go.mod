@@ -1,7 +1,7 @@
-module github.com/ai-2070/blackstream/bindings/go/example
+module github.com/ai-2070/net/bindings/go/example
 
 go 1.21
 
-require github.com/ai-2070/blackstream/bindings/go/blackstream v0.0.0
+require github.com/ai-2070/net/bindings/go/net v0.0.0
 
-replace github.com/ai-2070/blackstream/bindings/go/blackstream => ../blackstream
+replace github.com/ai-2070/net/bindings/go/net => ../net

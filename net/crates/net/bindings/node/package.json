@@ -1,11 +1,11 @@
 {
-  "name": "@ai2070/blackstream",
+  "name": "@ai2070/net",
   "version": "0.5.0",
   "description": "High-performance, schema-agnostic event bus for AI runtime workloads",
   "main": "index.js",
   "types": "index.d.ts",
   "napi": {
-    "binaryName": "blackstream",
+    "binaryName": "net",
     "triples": {
       "defaults": true,
       "additional": [
@@ -18,7 +18,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ai-2070/blackstream"
+    "url": "https://github.com/ai-2070/net"
   },
   "keywords": [
     "event-bus",

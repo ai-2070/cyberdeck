@@ -9,7 +9,7 @@ traffic to develop against.
 1. **Correlated failure handling** — mass failure detection + throttled recovery
 2. **Partition healing** — detection, state tracking, log reconciliation
 
-## New Module: `src/adapter/bltp/contested/`
+## New Module: `src/adapter/nltp/contested/`
 
 ### Phase 1: `contested/correlation.rs` — Correlated Failure Detection
 

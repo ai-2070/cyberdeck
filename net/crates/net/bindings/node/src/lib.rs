@@ -1,4 +1,4 @@
-//! Node.js bindings for Blackstream event bus.
+//! Node.js bindings for Net event bus.
 //!
 //! Provides high-performance event ingestion and consumption for Node.js/TypeScript.
 
@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
 
-use blackstream::{
+use net::{
     config::{AdapterConfig, BackpressureMode, EventBusConfig},
     consumer::Ordering,
     event::RawEvent,
@@ -26,20 +26,20 @@ pub struct HashedEvent {
 }
 
 #[cfg(feature = "redis")]
-use blackstream::config::RedisAdapterConfig;
+use net::config::RedisAdapterConfig;
 
 #[cfg(feature = "jetstream")]
-use blackstream::config::JetStreamAdapterConfig;
+use net::config::JetStreamAdapterConfig;
 
-#[cfg(feature = "bltp")]
-use blackstream::adapter::bltp::{BltpAdapterConfig, ReliabilityConfig, StaticKeypair};
+#[cfg(feature = "nltp")]
+use net::adapter::nltp::{NltpAdapterConfig, ReliabilityConfig, StaticKeypair};
 
 /// Redis adapter configuration.
 #[napi(object)]
 pub struct RedisOptions {
     /// Redis connection URL (e.g., "redis://localhost:6379")
     pub url: String,
-    /// Stream key prefix (default: "blackstream")
+    /// Stream key prefix (default: "net")
     pub prefix: Option<String>,
     /// Maximum commands per pipeline (default: 1000)
     pub pipeline_size: Option<u32>,
@@ -58,7 +58,7 @@ pub struct RedisOptions {
 pub struct JetStreamOptions {
     /// NATS server URL (e.g., "nats://localhost:4222")
     pub url: String,
-    /// Stream name prefix (default: "blackstream")
+    /// Stream name prefix (default: "net")
     pub prefix: Option<String>,
     /// Connection timeout in milliseconds (default: 5000)
     pub connect_timeout_ms: Option<u32>,
@@ -74,18 +74,18 @@ pub struct JetStreamOptions {
     pub replicas: Option<u32>,
 }
 
-/// BLTP keypair for encrypted UDP transport.
+/// NLTP keypair for encrypted UDP transport.
 #[napi(object)]
-pub struct BltpKeypair {
+pub struct NltpKeypair {
     /// Hex-encoded 32-byte public key
     pub public_key: String,
     /// Hex-encoded 32-byte secret key
     pub secret_key: String,
 }
 
-/// BLTP adapter configuration for encrypted UDP transport.
+/// NLTP adapter configuration for encrypted UDP transport.
 #[napi(object)]
-pub struct BltpOptions {
+pub struct NltpOptions {
     /// Local bind address (e.g., "127.0.0.1:9000")
     pub bind_addr: String,
     /// Remote peer address (e.g., "127.0.0.1:9001")
@@ -125,8 +125,8 @@ pub struct EventBusOptions {
     pub redis: Option<RedisOptions>,
     /// NATS JetStream adapter configuration (alternative to Redis)
     pub jetstream: Option<JetStreamOptions>,
-    /// BLTP adapter configuration for encrypted UDP transport
-    pub bltp: Option<BltpOptions>,
+    /// NLTP adapter configuration for encrypted UDP transport
+    pub nltp: Option<NltpOptions>,
 }
 
 /// Options for polling events.
@@ -188,9 +188,9 @@ pub struct Stats {
 ///
 /// Example usage:
 /// ```typescript
-/// import { Blackstream } from '@ai2070/blackstream';
+/// import { Net } from '@ai2070/net';
 ///
-/// const bus = await Blackstream.create({ numShards: 4 });
+/// const bus = await Net.create({ numShards: 4 });
 ///
 /// // Fast sync ingestion (no async overhead)
 /// bus.ingestRawSync('{"token": "hello", "index": 0}');
@@ -204,24 +204,24 @@ pub struct Stats {
 /// await bus.shutdown();
 /// ```
 #[napi]
-pub struct Blackstream {
+pub struct Net {
     /// Lock-free bus handle using ArcSwap for maximum performance.
     /// ArcSwapOption allows atomic load/store without mutex overhead.
     bus: Arc<ArcSwapOption<EventBus>>,
 }
 
 #[napi]
-impl Blackstream {
-    /// Create a new Blackstream event bus.
+impl Net {
+    /// Create a new Net event bus.
     #[napi(factory)]
-    pub async fn create(options: Option<EventBusOptions>) -> Result<Blackstream> {
+    pub async fn create(options: Option<EventBusOptions>) -> Result<Net> {
         let config = build_config(options)?;
 
         let bus = EventBus::new(config)
             .await
             .map_err(|e| Error::from_reason(format!("Failed to create EventBus: {}", e)))?;
 
-        Ok(Blackstream {
+        Ok(Net {
             bus: Arc::new(ArcSwapOption::from_pointee(bus)),
         })
     }
@@ -533,16 +533,16 @@ impl Blackstream {
     }
 }
 
-/// Generate a new BLTP keypair for encrypted UDP transport.
+/// Generate a new NLTP keypair for encrypted UDP transport.
 ///
 /// Returns a keypair with hex-encoded public and secret keys.
 /// Use this to generate keys for a responder, then share the public key
 /// with the initiator.
-#[cfg(feature = "bltp")]
+#[cfg(feature = "nltp")]
 #[napi]
-pub fn generate_bltp_keypair() -> BltpKeypair {
+pub fn generate_nltp_keypair() -> NltpKeypair {
     let keypair = StaticKeypair::generate();
-    BltpKeypair {
+    NltpKeypair {
         public_key: hex::encode(keypair.public_key()),
         secret_key: hex::encode(keypair.secret_key()),
     }
@@ -652,29 +652,29 @@ fn build_config(options: Option<EventBusOptions>) -> Result<EventBusConfig> {
                     "JetStream support not enabled. Rebuild with --features jetstream".to_string(),
                 ));
             }
-        } else if let Some(bltp) = opts.bltp {
-            #[cfg(feature = "bltp")]
+        } else if let Some(nltp) = opts.nltp {
+            #[cfg(feature = "nltp")]
             {
                 use std::time::Duration;
 
-                let bind_addr: std::net::SocketAddr = bltp
+                let bind_addr: std::net::SocketAddr = nltp
                     .bind_addr
                     .parse()
                     .map_err(|e| Error::from_reason(format!("Invalid bind_addr: {}", e)))?;
 
-                let peer_addr: std::net::SocketAddr = bltp
+                let peer_addr: std::net::SocketAddr = nltp
                     .peer_addr
                     .parse()
                     .map_err(|e| Error::from_reason(format!("Invalid peer_addr: {}", e)))?;
 
-                let psk: [u8; 32] = hex::decode(&bltp.psk)
+                let psk: [u8; 32] = hex::decode(&nltp.psk)
                     .map_err(|e| Error::from_reason(format!("Invalid psk hex: {}", e)))?
                     .try_into()
                     .map_err(|_| Error::from_reason("psk must be exactly 32 bytes".to_string()))?;
 
-                let mut bltp_config = match bltp.role.as_str() {
+                let mut nltp_config = match nltp.role.as_str() {
                     "initiator" => {
-                        let peer_pubkey_hex = bltp.peer_public_key.ok_or_else(|| {
+                        let peer_pubkey_hex = nltp.peer_public_key.ok_or_else(|| {
                             Error::from_reason(
                                 "peer_public_key is required for initiator".to_string(),
                             )
@@ -689,13 +689,13 @@ fn build_config(options: Option<EventBusOptions>) -> Result<EventBusConfig> {
                                     "peer_public_key must be exactly 32 bytes".to_string(),
                                 )
                             })?;
-                        BltpAdapterConfig::initiator(bind_addr, peer_addr, psk, peer_pubkey)
+                        NltpAdapterConfig::initiator(bind_addr, peer_addr, psk, peer_pubkey)
                     }
                     "responder" => {
-                        let secret_key_hex = bltp.secret_key.ok_or_else(|| {
+                        let secret_key_hex = nltp.secret_key.ok_or_else(|| {
                             Error::from_reason("secret_key is required for responder".to_string())
                         })?;
-                        let public_key_hex = bltp.public_key.ok_or_else(|| {
+                        let public_key_hex = nltp.public_key.ok_or_else(|| {
                             Error::from_reason("public_key is required for responder".to_string())
                         })?;
                         let secret_key: [u8; 32] = hex::decode(&secret_key_hex)
@@ -719,46 +719,46 @@ fn build_config(options: Option<EventBusOptions>) -> Result<EventBusConfig> {
                                 )
                             })?;
                         let keypair = StaticKeypair::from_keys(secret_key, public_key);
-                        BltpAdapterConfig::responder(bind_addr, peer_addr, psk, keypair)
+                        NltpAdapterConfig::responder(bind_addr, peer_addr, psk, keypair)
                     }
                     _ => {
                         return Err(Error::from_reason(format!(
                             "Invalid role: {}. Use 'initiator' or 'responder'",
-                            bltp.role
+                            nltp.role
                         )));
                     }
                 };
 
                 // Apply optional settings
-                if let Some(reliability) = bltp.reliability {
-                    bltp_config = bltp_config.with_reliability(match reliability.as_str() {
+                if let Some(reliability) = nltp.reliability {
+                    nltp_config = nltp_config.with_reliability(match reliability.as_str() {
                         "light" => ReliabilityConfig::Light,
                         "full" => ReliabilityConfig::Full,
                         _ => ReliabilityConfig::None,
                     });
                 }
-                if let Some(interval_ms) = bltp.heartbeat_interval_ms {
-                    bltp_config = bltp_config
+                if let Some(interval_ms) = nltp.heartbeat_interval_ms {
+                    nltp_config = nltp_config
                         .with_heartbeat_interval(Duration::from_millis(interval_ms as u64));
                 }
-                if let Some(timeout_ms) = bltp.session_timeout_ms {
-                    bltp_config =
-                        bltp_config.with_session_timeout(Duration::from_millis(timeout_ms as u64));
+                if let Some(timeout_ms) = nltp.session_timeout_ms {
+                    nltp_config =
+                        nltp_config.with_session_timeout(Duration::from_millis(timeout_ms as u64));
                 }
-                if let Some(batched) = bltp.batched_io {
-                    bltp_config = bltp_config.with_batched_io(batched);
+                if let Some(batched) = nltp.batched_io {
+                    nltp_config = nltp_config.with_batched_io(batched);
                 }
-                if let Some(pool_size) = bltp.packet_pool_size {
-                    bltp_config = bltp_config.with_pool_size(pool_size as usize);
+                if let Some(pool_size) = nltp.packet_pool_size {
+                    nltp_config = nltp_config.with_pool_size(pool_size as usize);
                 }
 
-                builder = builder.adapter(AdapterConfig::Bltp(Box::new(bltp_config)));
+                builder = builder.adapter(AdapterConfig::Nltp(Box::new(nltp_config)));
             }
-            #[cfg(not(feature = "bltp"))]
+            #[cfg(not(feature = "nltp"))]
             {
-                let _ = bltp;
+                let _ = nltp;
                 return Err(Error::from_reason(
-                    "BLTP support not enabled. Rebuild with --features bltp".to_string(),
+                    "NLTP support not enabled. Rebuild with --features nltp".to_string(),
                 ));
             }
         }
