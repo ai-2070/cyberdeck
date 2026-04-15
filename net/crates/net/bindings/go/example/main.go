@@ -1,4 +1,4 @@
-// Example usage of the Blackstream Go bindings.
+// Example usage of the Net Go bindings.
 package main
 
 import (
@@ -7,14 +7,14 @@ import (
 	"log"
 	"time"
 
-	"github.com/ai-2070/blackstream/bindings/go/blackstream"
+	"github.com/ai-2070/net/bindings/go/net"
 )
 
 func main() {
-	fmt.Printf("Blackstream version: %s\n", blackstream.Version())
+	fmt.Printf("Net version: %s\n", net.Version())
 
 	// Create event bus with default configuration
-	bus, err := blackstream.New(nil)
+	bus, err := net.New(nil)
 	if err != nil {
 		log.Fatalf("Failed to create event bus: %v", err)
 	}

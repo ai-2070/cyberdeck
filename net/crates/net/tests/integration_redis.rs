@@ -9,7 +9,7 @@
 //! Run tests:
 //!   cargo test --features redis --test integration_redis -- --ignored
 
-use blackstream::{
+use net::{
     AdapterConfig, BackpressureMode, BatchConfig, ConsumeRequest, Event, EventBus, EventBusConfig,
     Filter, Ordering, RedisAdapterConfig,
 };

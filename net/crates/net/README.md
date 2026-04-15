@@ -52,13 +52,13 @@ High-performance encrypted mesh runtime.
               ┌────────────────┼────────────────┐
               │                │                │
         ┌─────┴─────┐   ┌─────┴─────┐   ┌──────┴──────┐
-        │   Redis    │   │ JetStream │   │    BLTP     │
+        │   Redis    │   │ JetStream │   │    Net     │
         │  Streams   │   │   (NATS)  │   │ (encrypted  │
         └───────────┘   └───────────┘   │  UDP mesh)  │
                                          └──────┬──────┘
                                                 │
 ┌───────────────────────────────────────────────────────────────────┐
-│                        BLTP Mesh Layers                          │
+│                        Net Mesh Layers                          │
 ├──────────┬──────────┬──────────┬──────────┬──────────┬───────────┤
 │ Identity │ Channels │ Behavior │  State   │ Compute  │ Contested │
 │ ed25519  │ AuthGuard│ CAP-ANN  │ Causal   │ Daemon   │ Partition │
@@ -70,7 +70,7 @@ High-performance encrypted mesh runtime.
 │           Subprotocols + Observational Continuity                │
 │        version negotiation, causal cones, fork records           │
 ├──────────────────────────────────────────────────────────────────┤
-│                       Transport (BLTP)                           │
+│                       Transport (Net)                           │
 │     64B header, ChaCha20-Poly1305, Noise NK, zero-alloc pools   │
 │     routing, swarm, failure detection, proximity graph           │
 └──────────────────────────────────────────────────────────────────┘
@@ -78,13 +78,13 @@ High-performance encrypted mesh runtime.
 
 Every field is used by at least one layer. Forwarding nodes read one cache line, make a routing decision, and forward without decrypting the payload.
 
-## BLTP Header (64 bytes, cache-line aligned)
+## Net Header (64 bytes, cache-line aligned)
 
 ```
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|         MAGIC (0x424C)        |     VER       |     FLAGS     |
+|         MAGIC (0x4E45)        |     VER       |     FLAGS     |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |   PRIORITY    |    HOP_TTL    |   HOP_COUNT   |  FRAG_FLAGS   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -113,9 +113,9 @@ Benchmarked on Apple M1 Max, macOS.
 | Layer | Operation | Latency | Throughput |
 |-------|-----------|---------|------------|
 | **Core** | Event ingestion | < 1 us p99 | 10M+ events/sec sustained |
-| **BLTP** | Header serialize | 2.05 ns | 487M ops/sec |
-| **BLTP** | Packet build (50 events) | 10.8 us | -- |
-| **BLTP** | Encryption (ChaCha20) | 743 ns (64B) | -- |
+| **Net** | Header serialize | 2.05 ns | 487M ops/sec |
+| **Net** | Packet build (50 events) | 10.8 us | -- |
+| **Net** | Encryption (ChaCha20) | 743 ns (64B) | -- |
 | **Routing** | Header roundtrip | 0.98 ns | 1.02G ops/sec |
 | **Routing** | Lookup hit | 20.2 ns | 49.5M ops/sec |
 | **Routing** | Decision pipeline | 18.0 ns | 55.7M ops/sec |
@@ -140,9 +140,9 @@ Thread-local packet pools scale to **23x contention advantage** over shared pool
 ## Module Map
 
 ```
-src/adapter/bltp/
-├── mod.rs                 # BltpAdapter, routing utilities
-├── config.rs              # BltpAdapterConfig
+src/adapter/net/
+├── mod.rs                 # NetAdapter, routing utilities
+├── config.rs              # NetAdapterConfig
 ├── crypto.rs              # Noise NKpsk0 handshake, ChaCha20-Poly1305 AEAD
 ├── protocol.rs            # 64-byte wire header, EventFrame, NackPayload
 ├── transport.rs           # UDP socket abstraction, batched I/O
@@ -220,7 +220,7 @@ src/adapter/bltp/
 ### In-Memory (default)
 
 ```rust
-use blackstream::{EventBus, EventBusConfig};
+use net::{EventBus, EventBusConfig};
 
 let bus = EventBus::new(EventBusConfig::default()).await?;
 bus.ingest(Event::from_str(r#"{"token": "hello"}"#)?)?;
@@ -229,19 +229,19 @@ bus.ingest(Event::from_str(r#"{"token": "hello"}"#)?)?;
 ### Redis
 
 ```toml
-blackstream = { path = ".", features = ["redis"] }
+net = { path = ".", features = ["redis"] }
 ```
 
 ### JetStream
 
 ```toml
-blackstream = { path = ".", features = ["jetstream"] }
+net = { path = ".", features = ["jetstream"] }
 ```
 
-### BLTP
+### Net
 
 ```toml
-blackstream = { path = ".", features = ["bltp"] }
+net = { path = ".", features = ["net"] }
 ```
 
 ## Language Bindings
@@ -251,23 +251,23 @@ All bindings wrap the same Rust core.
 ### Node.js / Bun
 
 ```js
-const { Blackstream } = require("@the/net");
-const bus = await Blackstream.create({ numShards: 4 });
+const { Net } = require("@the/net");
+const bus = await Net.create({ numShards: 4 });
 bus.push(Buffer.from('{"token": "hello"}'));
 ```
 
 ### Python
 
 ```python
-from blackstream import Blackstream
-bus = Blackstream(num_shards=4)
+from net import Net
+bus = Net(num_shards=4)
 bus.ingest_raw('{"token": "hello"}')
 ```
 
 ### Go
 
 ```go
-bus, _ := blackstream.New(&blackstream.Config{NumShards: 4})
+bus, _ := net.New(&net.Config{NumShards: 4})
 bus.IngestRaw(`{"token": "hello"}`)
 ```
 
@@ -277,7 +277,7 @@ bus.IngestRaw(`{"token": "hello"}`)
 |---------|------|--------------|
 | Redis Streams | `redis` | `redis` crate |
 | NATS JetStream | `jetstream` | `async-nats` |
-| BLTP transport | `bltp` | `chacha20poly1305`, `snow`, `blake2`, `dashmap`, `socket2`, `ed25519-dalek` |
+| Net transport | `net` | `chacha20poly1305`, `snow`, `blake2`, `dashmap`, `socket2`, `ed25519-dalek` |
 | Regex filters | `regex` | `regex` crate |
 | C FFI | `ffi` | -- |
 
@@ -289,8 +289,8 @@ Default feature is `redis`.
 # Default (Redis adapter)
 cargo build --release
 
-# BLTP only (831 KB binary)
-cargo build --release --no-default-features --features bltp
+# Net only (831 KB binary)
+cargo build --release --no-default-features --features net
 
 # Everything
 cargo build --release --all-features
@@ -300,10 +300,10 @@ cargo build --release --all-features
 
 ```bash
 # Unit tests (605 tests)
-cargo test --lib --features bltp
+cargo test --lib --features net
 
 # Integration (requires running services)
-cargo test --test integration_bltp --features bltp
+cargo test --test integration_net --features net
 cargo test --test integration_redis --features redis
 cargo test --test integration_jetstream --features jetstream
 ```
@@ -311,7 +311,7 @@ cargo test --test integration_jetstream --features jetstream
 ## Benchmarks
 
 ```bash
-cargo bench --features bltp --bench bltp
+cargo bench --features net --bench net
 cargo bench --bench ingestion
 cargo bench --bench parallel
 ```

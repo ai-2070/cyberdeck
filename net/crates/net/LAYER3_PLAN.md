@@ -3,7 +3,7 @@
 ## Core Design
 
 Subnets are label-based — nodes belong by identity/capability, not static configuration.
-The `subnet_id: u32` field is already in every BLTP header. Hierarchy is encoded as
+The `subnet_id: u32` field is already in every Net header. Hierarchy is encoded as
 fixed-width level packing (8/8/8/8) giving 4 levels with 256 values each.
 
 Gateway nodes sit at subnet boundaries and enforce visibility policy (filter/drop) without
@@ -36,7 +36,7 @@ impl SubnetId {
 }
 ```
 
-## New Module: `src/adapter/bltp/subnet/`
+## New Module: `src/adapter/net/subnet/`
 
 ### Phase 1: Foundation
 
@@ -82,7 +82,7 @@ Gateway logic per packet (reads only header fields, no decryption):
 - `Exported` → forward only to configured target subnets
 - `Global` → always forward
 
-Integration point: `BltpRouter::route_packet()` gains an optional `SubnetGateway`
+Integration point: `NetRouter::route_packet()` gains an optional `SubnetGateway`
 check between TTL validation and route lookup.
 
 ### Phase 3: Discovery
@@ -110,7 +110,7 @@ hierarchy). Uses `subprotocol_id = 0x0003`.
 |------|--------|-------|
 | `mod.rs` | Add `pub mod subnet;`, re-exports | 1 |
 | `swarm.rs` | Add `subnet_id` to `Pingwave` (reserved bytes), `NodeInfo` | 1, 3 |
-| `router.rs` | Add optional `SubnetGateway` to `BltpRouter`, subnet filtering in `route_packet` | 2 |
+| `router.rs` | Add optional `SubnetGateway` to `NetRouter`, subnet filtering in `route_packet` | 2 |
 | `channel/config.rs` | Add visibility-checking helpers against `SubnetId` pairs | 2 |
 | `route.rs` | Tag routes with subnet for subnet-aware lookup | 2 |
 

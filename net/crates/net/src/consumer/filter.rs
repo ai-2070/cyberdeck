@@ -117,7 +117,7 @@ impl Filter {
 ///
 /// ```
 /// use serde_json::json;
-/// use blackstream::consumer::filter::json_path_get;
+/// use net::consumer::filter::json_path_get;
 ///
 /// let value = json!({"user": {"name": "Alice", "age": 30}});
 /// assert_eq!(json_path_get(&value, "user.name"), Some(&json!("Alice")));

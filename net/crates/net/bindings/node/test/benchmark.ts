@@ -1,5 +1,5 @@
 /**
- * Throughput benchmarks for Blackstream Node.js SDK.
+ * Throughput benchmarks for Net Node.js SDK.
  *
  * Measures pure SDK throughput using in-memory noop adapter.
  *
@@ -8,7 +8,7 @@
  *   bun run test/benchmark.bun.ts  (Bun - faster)
  */
 
-import { Blackstream, EventBusOptions } from "../index";
+import { Net, EventBusOptions } from "../index";
 
 interface BenchmarkResult {
   name: string;
@@ -24,7 +24,7 @@ const BATCH_SIZE = 1000;
 
 // Type augmentation for new sync methods
 declare module "../index" {
-  interface Blackstream {
+  interface Net {
     ingestRawSync(json: string): { shardId: number; timestamp: number };
     ingestRawBatchSync(events: string[]): number;
     ingestFire(json: string): boolean;
@@ -65,23 +65,23 @@ const LARGE_EVENT = JSON.stringify({
     "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.",
 });
 
-async function createBus(numShards: number = 4): Promise<Blackstream> {
+async function createBus(numShards: number = 4): Promise<Net> {
   // No adapter config = uses noop in-memory adapter
-  return await Blackstream.create({
+  return await Net.create({
     numShards,
     ringBufferCapacity: 1 << 20, // 1M events per shard
     backpressureMode: "drop_oldest",
   });
 }
 
-async function warmup(bus: Blackstream, event: string): Promise<void> {
+async function warmup(bus: Net, event: string): Promise<void> {
   for (let i = 0; i < WARMUP_EVENTS; i++) {
     bus.ingestRawSync(event);
   }
 }
 
 async function benchmarkSingleIngestion(
-  bus: Blackstream,
+  bus: Net,
   event: string,
   count: number,
 ): Promise<BenchmarkResult> {
@@ -105,7 +105,7 @@ async function benchmarkSingleIngestion(
 }
 
 function benchmarkSyncIngestion(
-  bus: Blackstream,
+  bus: Net,
   event: string,
   count: number,
 ): BenchmarkResult {
@@ -129,7 +129,7 @@ function benchmarkSyncIngestion(
 }
 
 function benchmarkFireAndForgetSync(
-  bus: Blackstream,
+  bus: Net,
   event: string,
   count: number,
 ): BenchmarkResult {
@@ -153,7 +153,7 @@ function benchmarkFireAndForgetSync(
 }
 
 function benchmarkBatchSync(
-  bus: Blackstream,
+  bus: Net,
   event: string,
   totalEvents: number,
   batchSize: number,
@@ -186,7 +186,7 @@ function benchmarkBatchSync(
 // =========================================================================
 
 function benchmarkPush(
-  bus: Blackstream,
+  bus: Net,
   eventBuf: Buffer,
   count: number,
 ): BenchmarkResult {
@@ -210,7 +210,7 @@ function benchmarkPush(
 }
 
 function benchmarkPushBatch(
-  bus: Blackstream,
+  bus: Net,
   eventBuf: Buffer,
   totalEvents: number,
   batchSize: number,
@@ -239,7 +239,7 @@ function benchmarkPushBatch(
 }
 
 function benchmarkPushWithHash(
-  bus: Blackstream,
+  bus: Net,
   eventBuf: Buffer,
   count: number,
 ): BenchmarkResult {
@@ -266,7 +266,7 @@ function benchmarkPushWithHash(
 }
 
 async function benchmarkBatchIngestion(
-  bus: Blackstream,
+  bus: Net,
   event: string,
   totalEvents: number,
   batchSize: number,
@@ -295,7 +295,7 @@ async function benchmarkBatchIngestion(
 }
 
 async function benchmarkFireAndForget(
-  bus: Blackstream,
+  bus: Net,
   event: string,
   count: number,
 ): Promise<BenchmarkResult> {
@@ -519,7 +519,7 @@ async function runBatchSizeBenchmarks(): Promise<void> {
 
 async function main(): Promise<void> {
   console.log("=============================================");
-  console.log("   Blackstream Node.js SDK Throughput Benchmarks");
+  console.log("   Net Node.js SDK Throughput Benchmarks");
   console.log("   (In-memory adapter)");
   console.log("=============================================");
   console.log(`\nWarmup: ${formatNumber(WARMUP_EVENTS)} events`);

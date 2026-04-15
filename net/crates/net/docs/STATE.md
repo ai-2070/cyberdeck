@@ -1,6 +1,6 @@
 # Distributed State (Layer 4)
 
-Causal ordering for distributed events. Every event carries a 24-byte `CausalLink` chaining it to the previous event. The chain provides structural integrity via xxh3 hashing -- tamper resistance comes from BLTP's AEAD encryption.
+Causal ordering for distributed events. Every event carries a 24-byte `CausalLink` chaining it to the previous event. The chain provides structural integrity via xxh3 hashing -- tamper resistance comes from Net's AEAD encryption.
 
 ## Causal Links
 
@@ -16,7 +16,7 @@ Wire format (24 bytes, no padding):
 
 ```rust
 pub struct CausalLink {
-    pub origin_hash: u32,        // Matches BLTP header origin_hash
+    pub origin_hash: u32,        // Matches Net header origin_hash
     pub horizon_encoded: u32,    // Bloom sketch of observed horizon
     pub sequence: u64,           // Monotonic from entity's reference frame
     pub parent_hash: u64,        // xxh3(prev_link_bytes ++ prev_payload_bytes)

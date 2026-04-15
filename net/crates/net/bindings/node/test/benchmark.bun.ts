@@ -1,5 +1,5 @@
 /**
- * Bun-based throughput benchmarks for Blackstream Node.js SDK.
+ * Bun-based throughput benchmarks for Net Node.js SDK.
  *
  * Measures pure SDK throughput without hitting Redis or JetStream
  * (uses in-memory noop adapter).
@@ -7,11 +7,11 @@
  * Run with: bun run test/benchmark.bun.ts
  */
 
-import { Blackstream } from "../index";
+import { Net } from "../index";
 
 // Type augmentation for sync methods
 declare module "../index" {
-  interface Blackstream {
+  interface Net {
     ingestRawSync(json: string): { shardId: number; timestamp: number };
     ingestRawBatchSync(events: string[]): number;
     ingestFire(json: string): boolean;
@@ -127,12 +127,12 @@ function printResult(r: BenchResult, extra?: string): void {
 
 async function main() {
   console.log("=".repeat(60));
-  console.log("  Blackstream Bun Benchmarks");
+  console.log("  Net Bun Benchmarks");
   console.log("  Runtime:", Bun.version);
   console.log("=".repeat(60));
   console.log();
 
-  const bus = await Blackstream.create({
+  const bus = await Net.create({
     numShards: 4,
     ringBufferCapacity: 1 << 20,
     backpressureMode: "drop_oldest",
@@ -198,7 +198,7 @@ async function main() {
   console.log("\n--- Shard Scaling ---\n");
 
   for (const numShards of [1, 2, 4, 8]) {
-    const testBus = await Blackstream.create({
+    const testBus = await Net.create({
       numShards,
       ringBufferCapacity: 1 << 20,
       backpressureMode: "drop_oldest",

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Throughput benchmarks for Blackstream Python SDK.
+Throughput benchmarks for Net Python SDK.
 
 Measures pure SDK throughput using the in-memory noop adapter.
 
@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from typing import List
 
-from blackstream import Blackstream
+from net import Net
 
 
 @dataclass
@@ -60,23 +60,23 @@ LARGE_EVENT = json.dumps(
 )
 
 
-def create_bus(num_shards: int = 4) -> Blackstream:
+def create_bus(num_shards: int = 4) -> Net:
     """Create a bus with noop in-memory adapter."""
-    return Blackstream(
+    return Net(
         num_shards=num_shards,
         ring_buffer_capacity=1 << 20,  # 1M events per shard
         backpressure_mode="drop_oldest",
     )
 
 
-def warmup(bus: Blackstream, event: str) -> None:
+def warmup(bus: Net, event: str) -> None:
     """Warmup the bus with events."""
     for _ in range(WARMUP_EVENTS):
         bus.ingest_raw(event)
 
 
 def benchmark_single_ingestion(
-    bus: Blackstream, event: str, count: int
+    bus: Net, event: str, count: int
 ) -> BenchmarkResult:
     """Benchmark single event ingestion."""
     start = time.perf_counter()
@@ -99,7 +99,7 @@ def benchmark_single_ingestion(
 
 
 def benchmark_batch_ingestion(
-    bus: Blackstream, event: str, total_events: int, batch_size: int
+    bus: Net, event: str, total_events: int, batch_size: int
 ) -> BenchmarkResult:
     """Benchmark batch event ingestion."""
     batch = [event] * batch_size
@@ -137,7 +137,7 @@ def benchmark_batch_ingestion(
 
 
 def benchmark_dict_ingestion(
-    bus: Blackstream, event_dict: dict, count: int
+    bus: Net, event_dict: dict, count: int
 ) -> BenchmarkResult:
     """Benchmark dict/object ingestion (includes JSON serialization)."""
     start = time.perf_counter()
@@ -281,7 +281,7 @@ def run_raw_vs_dict_benchmarks() -> None:
 
 def main() -> None:
     print("=============================================")
-    print("   Blackstream Python SDK Throughput Benchmarks")
+    print("   Net Python SDK Throughput Benchmarks")
     print("   (In-memory adapter)")
     print("=============================================")
     print(f"\nWarmup: {format_number(WARMUP_EVENTS)} events")

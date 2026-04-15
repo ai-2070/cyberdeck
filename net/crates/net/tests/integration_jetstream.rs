@@ -10,7 +10,7 @@
 //!   cargo test --features jetstream --test integration_jetstream -- --ignored
 
 use async_nats::jetstream;
-use blackstream::{
+use net::{
     AdapterConfig, BackpressureMode, BatchConfig, ConsumeRequest, Event, EventBus, EventBusConfig,
     Filter, JetStreamAdapterConfig, Ordering,
 };
