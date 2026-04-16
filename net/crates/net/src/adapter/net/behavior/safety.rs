@@ -1106,9 +1106,7 @@ impl SafetyEnforcer {
             return Err(SafetyViolation::ResourceLimitExceeded {
                 resource: ResourceType::Cost,
                 requested: claim.cost_cents as u64,
-                available: limits
-                    .max_cost_per_hour_cents
-                    .saturating_sub(current_cost) as u64,
+                available: limits.max_cost_per_hour_cents.saturating_sub(current_cost) as u64,
             });
         }
 

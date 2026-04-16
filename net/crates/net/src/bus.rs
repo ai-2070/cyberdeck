@@ -600,6 +600,14 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
         loop {
             // Check shutdown
             if shutdown.load(AtomicOrdering::Acquire) {
+                // Drain any remaining events from the channel that the
+                // drain worker may have sent after we last checked.
+                // Without this, final events sent by the drain worker
+                // during its shutdown sweep could sit in the channel
+                // buffer and be silently dropped.
+                while let Ok(events) = rx.try_recv() {
+                    worker.add_events(events);
+                }
                 // Flush remaining events (best-effort, no retries)
                 if worker.has_pending() {
                     let batch = worker.flush();

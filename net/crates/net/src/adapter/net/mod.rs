@@ -845,25 +845,20 @@ impl Adapter for NetAdapter {
         limit: usize,
     ) -> Result<ShardPollResult, AdapterError> {
         let mut events = Vec::with_capacity(limit);
-        let mut requeue = Vec::new();
 
         if let Some(queue) = self.inbound.get(&shard_id) {
             while events.len() < limit {
                 if let Some(event) = queue.pop() {
                     if from_id.is_none() || event_id_gt(&event.id, from_id.unwrap_or("")) {
                         events.push(event);
-                    } else {
-                        // Event is at or before the cursor — put it back
-                        requeue.push(event);
                     }
+                    // Events at or before the cursor have already been
+                    // consumed — drop them instead of requeuing. Requeuing
+                    // caused unbounded memory growth because these events
+                    // can never pass an advancing cursor.
                 } else {
                     break;
                 }
-            }
-
-            // Re-enqueue events that didn't match the cursor filter
-            for event in requeue {
-                queue.push(event);
             }
         }
 
@@ -1321,10 +1316,11 @@ mod tests {
     }
 
     #[test]
-    fn test_poll_shard_cursor_requeue_preserves_events() {
-        // Verify that poll_shard with a cursor doesn't permanently lose
-        // events that are at or before the cursor position.
-        use dashmap::DashMap;
+    fn test_poll_shard_cursor_drops_consumed_events() {
+        // Verify that poll_shard with a cursor drops events at or before
+        // the cursor (they've already been consumed) and returns only
+        // events after the cursor. The queue should be empty afterward —
+        // no unbounded requeue growth.
         use std::sync::Arc;
 
         let (init_keys, resp_keys) = make_session_keys();
@@ -1346,37 +1342,30 @@ mod tests {
             NetAdapter::process_packet(packet, source, &resp_session, &inbound, 1);
         }
 
-        // Build a minimal adapter-like poll that exercises the cursor logic
-        let shard_id = 0u16;
-        let queue = inbound.get(&shard_id).unwrap();
+        let queue = inbound.get(&0u16).unwrap();
         assert_eq!(queue.len(), 3);
 
-        // Poll with cursor "0:0" — should return events after 0:0
+        // Simulate poll_shard with cursor "0:0" — drops event 0:0,
+        // returns events 1:0 and 2:0
         let from_id = "0:0";
         let mut events = Vec::new();
-        let mut requeue = Vec::new();
         while events.len() < 10 {
             if let Some(event) = queue.pop() {
                 if event_id_gt(&event.id, from_id) {
                     events.push(event);
-                } else {
-                    requeue.push(event);
                 }
+                // Events at/before cursor are dropped (not requeued)
             } else {
                 break;
             }
         }
-        for event in requeue {
-            queue.push(event);
-        }
 
-        // Should get events 1:0 and 2:0 (after cursor 0:0)
         assert_eq!(events.len(), 2, "should get 2 events after cursor 0:0");
+        assert_eq!(events[0].id, "1:0");
+        assert_eq!(events[1].id, "2:0");
 
-        // The requeued event (0:0) should still be in the queue
-        assert_eq!(queue.len(), 1, "requeued event should still be in queue");
-        let remaining = queue.pop().unwrap();
-        assert_eq!(remaining.id, "0:0");
+        // Queue should be empty — consumed events are dropped, not requeued
+        assert_eq!(queue.len(), 0, "queue should be empty after poll drains it");
     }
 
     #[test]

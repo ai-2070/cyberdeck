@@ -212,6 +212,9 @@ impl FairScheduler {
         // Re-collect keys so that streams added since the first snapshot
         // are also considered — using the stale `keys` vec would miss them.
         let keys: Vec<u64> = self.streams.iter().map(|e| *e.key()).collect();
+        if keys.is_empty() {
+            return None;
+        }
         let mut has_packets = false;
         for key in &keys {
             if let Some(queue) = self.streams.get(key) {

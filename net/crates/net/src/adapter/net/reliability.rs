@@ -134,6 +134,11 @@ pub struct ReliableStream {
     ack_seq: u64,
     /// Bitmap of received sequences beyond ack_seq (64-bit sliding window)
     sack_bitmap: u64,
+    /// Whether we have received at least one packet. Needed to distinguish
+    /// "never received anything" (ack_seq=0, received_first=false) from
+    /// "received seq 0" (ack_seq=0, received_first=true) so that
+    /// duplicate deliveries of sequence 0 are correctly rejected.
+    received_first: bool,
     /// Pending unacknowledged packets (bounded)
     pending: VecDeque<UnackedPacket>,
     /// Retransmit timeout
@@ -159,6 +164,7 @@ impl ReliableStream {
         Self {
             ack_seq: 0,
             sack_bitmap: 0,
+            received_first: false,
             pending: VecDeque::with_capacity(Self::DEFAULT_MAX_PENDING),
             rto: Self::DEFAULT_RTO,
             max_pending: Self::DEFAULT_MAX_PENDING,
@@ -171,6 +177,7 @@ impl ReliableStream {
         Self {
             ack_seq: 0,
             sack_bitmap: 0,
+            received_first: false,
             pending: VecDeque::with_capacity(max_pending),
             rto,
             max_pending,
@@ -247,9 +254,10 @@ impl ReliabilityMode for ReliableStream {
     }
 
     fn on_receive(&mut self, seq: u64) -> bool {
-        if seq == 0 && self.ack_seq == 0 {
-            // First packet (sequence 0 or 1 depending on convention)
-            self.ack_seq = seq;
+        if seq == 0 && !self.received_first {
+            // First packet ever received (sequence 0).
+            self.ack_seq = 0;
+            self.received_first = true;
             return true;
         }
 
@@ -733,7 +741,11 @@ mod tests {
         // The oldest packets (0, 1) should have been evicted;
         // the newest (2, 3, 4, 5) should be retained.
         let seqs: Vec<u64> = mode.pending.iter().map(|p| p.seq).collect();
-        assert_eq!(seqs, vec![2, 3, 4, 5], "should retain the most recent packets");
+        assert_eq!(
+            seqs,
+            vec![2, 3, 4, 5],
+            "should retain the most recent packets"
+        );
 
         // NACK for packet 5 should succeed (it's tracked)
         let nack = NackPayload {
@@ -743,5 +755,32 @@ mod tests {
         let retransmits = mode.on_nack(&nack);
         assert_eq!(retransmits.len(), 1);
         assert_eq!(&retransmits[0][..], b"pkt-5");
+    }
+
+    #[test]
+    fn test_regression_duplicate_seq_zero_rejected() {
+        // Regression: on_receive had a special case for seq=0 that checked
+        // `seq == 0 && self.ack_seq == 0`. After receiving seq 0, ack_seq
+        // was still 0, so a duplicate seq 0 hit the same early return and
+        // was accepted again — violating exactly-once delivery for reliable
+        // streams.
+        //
+        // Fix: added `received_first` flag to distinguish "never received
+        // anything" from "received seq 0".
+        let mut mode = ReliableStream::new();
+
+        // First reception of seq 0 should succeed
+        assert!(mode.on_receive(0), "first seq 0 should be accepted");
+        assert_eq!(mode.ack_seq(), 0);
+
+        // Duplicate seq 0 should be rejected
+        assert!(
+            !mode.on_receive(0),
+            "duplicate seq 0 must be rejected for exactly-once delivery"
+        );
+
+        // Normal continuation should still work
+        assert!(mode.on_receive(1));
+        assert_eq!(mode.ack_seq(), 1);
     }
 }
