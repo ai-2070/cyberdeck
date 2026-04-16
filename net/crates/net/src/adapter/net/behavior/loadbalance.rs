@@ -245,6 +245,9 @@ struct EndpointState {
     circuit_open: std::sync::atomic::AtomicBool,
     /// Circuit open time
     circuit_open_time: std::sync::Mutex<Option<Instant>>,
+    /// Whether a half-open probe request is currently in flight. Only one
+    /// request is admitted per recovery cycle to test the endpoint.
+    half_open_probe: std::sync::atomic::AtomicBool,
 }
 
 impl EndpointState {
@@ -265,6 +268,7 @@ impl EndpointState {
             consecutive_failures: AtomicU32::new(0),
             circuit_open: std::sync::atomic::AtomicBool::new(false),
             circuit_open_time: std::sync::Mutex::new(None),
+            half_open_probe: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -291,41 +295,89 @@ impl EndpointState {
         self.is_enabled() && self.health().can_receive_traffic()
     }
 
-    fn record_request(&self) {
-        self.connections.fetch_add(1, Ordering::Relaxed);
-        self.total_requests.fetch_add(1, Ordering::Relaxed);
-        *self.last_selected.lock().unwrap() = Instant::now();
+    /// Atomically reserve a connection slot if the endpoint is below cap.
+    ///
+    /// Returns `true` if the slot was reserved (caller now owns a connection
+    /// that must be released via `record_completion`), or `false` if the cap
+    /// was already reached. This replaces the prior check-then-increment
+    /// pattern that allowed concurrent selectors to exceed the cap.
+    fn try_record_request(&self, max_connections: u32) -> bool {
+        let reserved = self
+            .connections
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                if c >= max_connections {
+                    None
+                } else {
+                    Some(c + 1)
+                }
+            })
+            .is_ok();
+        if reserved {
+            self.total_requests.fetch_add(1, Ordering::Relaxed);
+            *self.last_selected.lock().unwrap() = Instant::now();
+        }
+        reserved
     }
 
     fn record_completion(&self, success: bool) {
-        self.connections.fetch_sub(1, Ordering::Relaxed);
+        self.connections.fetch_sub(1, Ordering::AcqRel);
+
+        // If this completion is for the half-open probe, it decides the
+        // circuit's fate. Clearing the flag with swap also guarantees only
+        // one completion is treated as the probe outcome.
+        if self.half_open_probe.swap(false, Ordering::AcqRel) {
+            if success {
+                self.circuit_open.store(false, Ordering::Release);
+                self.consecutive_failures.store(0, Ordering::Relaxed);
+                *self.circuit_open_time.lock().unwrap() = None;
+            } else {
+                self.failed_requests.fetch_add(1, Ordering::Relaxed);
+                // Probe failed — restart the recovery timer so the next
+                // probe is delayed by another full recovery_time window.
+                *self.circuit_open_time.lock().unwrap() = Some(Instant::now());
+            }
+            return;
+        }
+
         if success {
             self.consecutive_failures.store(0, Ordering::Relaxed);
         } else {
             self.failed_requests.fetch_add(1, Ordering::Relaxed);
             let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-            // Open circuit after 5 consecutive failures
-            if failures >= 5 {
-                self.circuit_open.store(true, Ordering::Relaxed);
+            // Open circuit after 5 consecutive failures. Use CAS so only
+            // the thread that causes the transition records the open time.
+            if failures >= 5
+                && self
+                    .circuit_open
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
                 *self.circuit_open_time.lock().unwrap() = Some(Instant::now());
             }
         }
     }
 
+    /// Returns true if new requests should be rejected for this endpoint.
+    ///
+    /// When the recovery window has elapsed, exactly one request is admitted
+    /// as a probe (half-open state). All others continue to see the circuit
+    /// as open until the probe's outcome is recorded via `record_completion`.
     fn is_circuit_open(&self, recovery_time: Duration) -> bool {
-        if !self.circuit_open.load(Ordering::Relaxed) {
+        if !self.circuit_open.load(Ordering::Acquire) {
             return false;
         }
-        // Check if recovery time has passed
-        if let Some(open_time) = *self.circuit_open_time.lock().unwrap() {
-            if open_time.elapsed() >= recovery_time {
-                // Half-open state - allow one request through
-                self.circuit_open.store(false, Ordering::Relaxed);
-                self.consecutive_failures.store(0, Ordering::Relaxed);
-                return false;
-            }
+        let open_time = match *self.circuit_open_time.lock().unwrap() {
+            Some(t) => t,
+            None => return true,
+        };
+        if open_time.elapsed() < recovery_time {
+            return true;
         }
-        true
+        // Recovery window elapsed — try to claim the single probe slot. If
+        // CAS fails, another probe is in flight and we keep rejecting.
+        self.half_open_probe
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
     }
 }
 
@@ -567,41 +619,56 @@ impl LoadBalancer {
         }
     }
 
-    /// Select an endpoint for a request
+    /// Select an endpoint for a request.
+    ///
+    /// The connection slot is reserved atomically as part of selection so
+    /// that concurrent selectors cannot collectively exceed
+    /// `max_connections_per_endpoint`. If a strategy picks an endpoint whose
+    /// cap was filled by a concurrent selector between availability filtering
+    /// and reservation, the selection is retried up to a bounded number of
+    /// times before giving up.
     pub fn select(&self, ctx: &RequestContext) -> Result<Selection, LoadBalancerError> {
         self.total_selections.fetch_add(1, Ordering::Relaxed);
 
-        // Get available endpoints
-        let available = self.get_available_endpoints(ctx)?;
+        const MAX_RESERVATION_RETRIES: usize = 4;
+        let max_conn = self.config.max_connections_per_endpoint;
 
-        if available.is_empty() {
-            self.failed_selections.fetch_add(1, Ordering::Relaxed);
-            return Err(LoadBalancerError::NoEndpointsAvailable);
-        }
+        for _ in 0..MAX_RESERVATION_RETRIES {
+            let available = self.get_available_endpoints(ctx)?;
 
-        // Apply strategy
-        let selection = match self.config.strategy {
-            Strategy::RoundRobin => self.select_round_robin(&available),
-            Strategy::WeightedRoundRobin => self.select_weighted_round_robin(&available),
-            Strategy::LeastConnections => self.select_least_connections(&available),
-            Strategy::WeightedLeastConnections => {
-                self.select_weighted_least_connections(&available)
+            if available.is_empty() {
+                self.failed_selections.fetch_add(1, Ordering::Relaxed);
+                return Err(LoadBalancerError::NoEndpointsAvailable);
             }
-            Strategy::Random => self.select_random(&available),
-            Strategy::WeightedRandom => self.select_weighted_random(&available),
-            Strategy::ConsistentHash => self.select_consistent_hash(&available, ctx),
-            Strategy::LeastLatency => self.select_least_latency(&available),
-            Strategy::LeastLoad => self.select_least_load(&available),
-            Strategy::PowerOfTwo => self.select_power_of_two(&available),
-            Strategy::Adaptive => self.select_adaptive(&available, ctx),
-        };
 
-        // Record selection
-        if let Some(state) = self.endpoints.get(&selection.node_id) {
-            state.record_request();
+            // Apply strategy
+            let selection = match self.config.strategy {
+                Strategy::RoundRobin => self.select_round_robin(&available),
+                Strategy::WeightedRoundRobin => self.select_weighted_round_robin(&available),
+                Strategy::LeastConnections => self.select_least_connections(&available),
+                Strategy::WeightedLeastConnections => {
+                    self.select_weighted_least_connections(&available)
+                }
+                Strategy::Random => self.select_random(&available),
+                Strategy::WeightedRandom => self.select_weighted_random(&available),
+                Strategy::ConsistentHash => self.select_consistent_hash(&available, ctx),
+                Strategy::LeastLatency => self.select_least_latency(&available),
+                Strategy::LeastLoad => self.select_least_load(&available),
+                Strategy::PowerOfTwo => self.select_power_of_two(&available),
+                Strategy::Adaptive => self.select_adaptive(&available, ctx),
+            };
+
+            // Atomically reserve the connection slot. If a concurrent
+            // selector filled the cap, re-run selection against fresh state.
+            if let Some(state) = self.endpoints.get(&selection.node_id) {
+                if state.try_record_request(max_conn) {
+                    return Ok(selection);
+                }
+            }
         }
 
-        Ok(selection)
+        self.failed_selections.fetch_add(1, Ordering::Relaxed);
+        Err(LoadBalancerError::NoEndpointsAvailable)
     }
 
     /// Record request completion
@@ -1020,10 +1087,15 @@ fn random_usize() -> usize {
     usize::from_le_bytes(bytes)
 }
 
-/// Generate random f64 between 0.0 and 1.0
+/// Generate random f64 uniformly in the half-open interval [0.0, 1.0).
+///
+/// Uses the top 53 bits of entropy (the f64 mantissa width) divided by
+/// `2^53`, which guarantees the result is strictly less than 1.0. The naive
+/// `r as f64 / u64::MAX as f64` approach can round up to exactly 1.0 because
+/// `u64::MAX as f64` itself rounds to `2^64`.
 fn random_f64() -> f64 {
     let r = random_usize() as u64;
-    (r as f64) / (u64::MAX as f64)
+    (r >> 11) as f64 / ((1u64 << 53) as f64)
 }
 
 #[cfg(test)]
@@ -1397,5 +1469,127 @@ mod tests {
             result.is_ok(),
             "with zone_fallback=true, cross-zone should succeed"
         );
+    }
+
+    #[test]
+    fn test_regression_random_f64_never_reaches_one() {
+        // Regression: `r as f64 / u64::MAX as f64` could return exactly 1.0
+        // because `u64::MAX as f64` rounds to 2^64. Now uses the 53-bit
+        // mantissa / 2^53 pattern which is strictly in [0, 1).
+        for _ in 0..10_000 {
+            let r = random_f64();
+            assert!((0.0..1.0).contains(&r), "random_f64 out of [0,1): {}", r);
+        }
+    }
+
+    #[test]
+    fn test_regression_max_connections_cap_enforced_concurrently() {
+        // Regression: the select() path loaded `connections` with Relaxed
+        // then incremented in record_request, allowing N concurrent
+        // selectors to all pass the check and collectively exceed the cap.
+        // Now reservation is atomic via fetch_update.
+        use std::sync::Arc;
+        use std::thread;
+
+        const CAP: u32 = 5;
+        const THREADS: u32 = 16;
+
+        let config = LoadBalancerConfig {
+            strategy: Strategy::RoundRobin,
+            max_connections_per_endpoint: CAP,
+            ..Default::default()
+        };
+        let lb = Arc::new(LoadBalancer::new(config));
+        // Single endpoint so every selection contends for the same cap.
+        lb.add_endpoint(Endpoint::new(make_node_id(1)));
+
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let lb = Arc::clone(&lb);
+            handles.push(thread::spawn(move || {
+                // Each thread tries to select one connection and holds it.
+                let ctx = RequestContext::new();
+                lb.select(&ctx).ok()
+            }));
+        }
+
+        let successes = handles
+            .into_iter()
+            .filter_map(|h| h.join().unwrap())
+            .count();
+
+        // At most CAP threads may have been granted a connection.
+        assert!(
+            successes <= CAP as usize,
+            "concurrent selectors exceeded cap: {} > {}",
+            successes,
+            CAP
+        );
+        // And the endpoint's connection count must equal successes.
+        let state = lb.endpoints.get(&make_node_id(1)).unwrap();
+        assert_eq!(
+            state.connections.load(Ordering::Acquire),
+            successes as u32,
+            "connection counter must match granted selections"
+        );
+    }
+
+    #[test]
+    fn test_regression_circuit_breaker_half_open_single_probe() {
+        // Regression: on recovery expiry, `is_circuit_open` fully closed
+        // the breaker, letting every concurrent request hit a possibly
+        // still-broken endpoint. Now exactly one probe is admitted and
+        // subsequent callers continue to see the breaker as open until the
+        // probe's outcome is recorded.
+        let config = LoadBalancerConfig {
+            strategy: Strategy::RoundRobin,
+            circuit_recovery_time_ms: 50,
+            ..Default::default()
+        };
+        let lb = LoadBalancer::new(config);
+        lb.add_endpoint(Endpoint::new(make_node_id(1)));
+        let ctx = RequestContext::new();
+
+        // Trip the breaker by driving 5 real selections that all fail. Going
+        // through select() keeps the connection counter consistent — calling
+        // record_completion() without a matching record_request() would
+        // underflow.
+        for _ in 0..5 {
+            let sel = lb.select(&ctx).expect("admitted before trip");
+            lb.record_completion(&sel.node_id, false);
+        }
+
+        // Before recovery: all requests rejected.
+        assert!(lb.select(&ctx).is_err(), "open breaker must reject");
+
+        // Wait past the recovery window.
+        std::thread::sleep(Duration::from_millis(75));
+
+        // First request after recovery: admitted as the probe.
+        let probe = lb.select(&ctx);
+        assert!(probe.is_ok(), "first request after recovery is the probe");
+
+        // Second request while probe is still in flight: must be rejected.
+        let second = lb.select(&ctx);
+        assert!(
+            second.is_err(),
+            "while probe is in flight, other requests must still be rejected"
+        );
+
+        // Probe reports failure → breaker re-opens and recovery timer resets.
+        lb.record_completion(&probe.unwrap().node_id, false);
+        assert!(
+            lb.select(&ctx).is_err(),
+            "failed probe must keep breaker open"
+        );
+
+        // After another recovery window, the next probe succeeds and closes
+        // the breaker.
+        std::thread::sleep(Duration::from_millis(75));
+        let probe2 = lb.select(&ctx).expect("second probe admitted");
+        lb.record_completion(&probe2.node_id, true);
+
+        // Breaker is now fully closed — subsequent requests go through.
+        assert!(lb.select(&ctx).is_ok(), "successful probe closes breaker");
     }
 }
