@@ -490,7 +490,7 @@ fn test_subprotocol_handler_cleanup_complete_dispatch() {
 fn test_reassembler_out_of_order_chunks() {
     let data = vec![0xABu8; MAX_SNAPSHOT_CHUNK_SIZE * 3 + 500];
     let total_len = data.len();
-    let chunks = chunk_snapshot(0xAAAA, data, 99);
+    let chunks = chunk_snapshot(0xAAAA, data, 99).unwrap();
     assert_eq!(chunks.len(), 4);
 
     let mut reassembler = SnapshotReassembler::new();
@@ -548,7 +548,7 @@ fn test_reassembler_out_of_order_chunks() {
 fn test_reassembler_duplicate_chunks_handled() {
     let data = vec![0xCDu8; MAX_SNAPSHOT_CHUNK_SIZE * 2 + 100];
     let total_len = data.len();
-    let chunks = chunk_snapshot(0xBBBB, data, 50);
+    let chunks = chunk_snapshot(0xBBBB, data, 50).unwrap();
     assert_eq!(chunks.len(), 3);
 
     let mut reassembler = SnapshotReassembler::new();
@@ -1223,21 +1223,21 @@ fn test_regression_multi_chunk_advances_past_snapshot_phase() {
     assert_eq!(orch.status(origin), Some(MigrationPhase::Replay));
 }
 
-/// Regression: chunk_snapshot used an unchecked `as u16` cast for total_chunks,
-/// which would silently overflow for snapshots > 457 MB. Verify that reasonable
-/// sizes work and the chunk count is correct.
+/// Regression: chunk_snapshot originally used an unchecked `as u16` cast.
+/// Now uses u32 chunks and returns Result. Verify chunk arithmetic and
+/// graceful error on the Result path.
 #[test]
-fn test_regression_chunk_count_u16_boundary() {
+fn test_regression_chunk_count_boundary() {
     // Exactly 1 chunk
-    let chunks = chunk_snapshot(0xAAAA, vec![0u8; MAX_SNAPSHOT_CHUNK_SIZE], 1);
+    let chunks = chunk_snapshot(0xAAAA, vec![0u8; MAX_SNAPSHOT_CHUNK_SIZE], 1).unwrap();
     assert_eq!(chunks.len(), 1);
 
     // Exactly 2 chunks
-    let chunks = chunk_snapshot(0xAAAA, vec![0u8; MAX_SNAPSHOT_CHUNK_SIZE + 1], 1);
+    let chunks = chunk_snapshot(0xAAAA, vec![0u8; MAX_SNAPSHOT_CHUNK_SIZE + 1], 1).unwrap();
     assert_eq!(chunks.len(), 2);
 
-    // Exactly at boundary
-    let chunks = chunk_snapshot(0xAAAA, vec![0u8; MAX_SNAPSHOT_CHUNK_SIZE * 100], 1);
+    // 100 chunks
+    let chunks = chunk_snapshot(0xAAAA, vec![0u8; MAX_SNAPSHOT_CHUNK_SIZE * 100], 1).unwrap();
     assert_eq!(chunks.len(), 100);
     for (i, chunk) in chunks.iter().enumerate() {
         if let MigrationMessage::SnapshotReady {
@@ -1246,7 +1246,7 @@ fn test_regression_chunk_count_u16_boundary() {
             ..
         } = chunk
         {
-            assert_eq!(*chunk_index, i as u16);
+            assert_eq!(*chunk_index, i as u32);
             assert_eq!(*total_chunks, 100);
         }
     }

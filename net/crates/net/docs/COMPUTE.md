@@ -135,7 +135,17 @@ Events arriving during migration are buffered and replayed after restore. This e
 
 ### Snapshot Chunking
 
-Snapshots larger than 7,000 bytes (fitting within the 8,192-byte MTU) are automatically chunked into multiple `SnapshotReady` messages. Each carries `chunk_index` and `total_chunks` metadata. The `SnapshotReassembler` on the receiving side collects chunks keyed by `(daemon_origin, seq_through)` and reassembles them in order. Chunks from different snapshot generations cannot be mixed.
+Snapshots larger than 7,000 bytes (fitting within the 8,192-byte MTU) are automatically chunked into multiple `SnapshotReady` messages. Each carries `chunk_index: u32` and `total_chunks: u32` metadata. The `SnapshotReassembler` on the receiving side collects chunks keyed by `(daemon_origin, seq_through)` and reassembles them in order. Chunks from different snapshot generations cannot be mixed.
+
+### Transfer Limits
+
+| Constraint | Limit | Source |
+|---|---|---|
+| `MAX_SNAPSHOT_CHUNK_SIZE` | 7,000 bytes per chunk | Wire overhead + 8,192-byte MTU |
+| `MAX_SNAPSHOT_SIZE` | ~28 TB (`u32::MAX` chunks x 7,000 bytes) | `chunk_index: u32` / `total_chunks: u32` |
+| `StateSnapshot` wire format | ~4 GB | `state_len: u32` in `to_bytes()` |
+
+The practical limit is the `StateSnapshot` serialization at ~4 GB. Oversized snapshots return `MigrationError::SnapshotTooLarge` with the actual and maximum sizes rather than panicking.
 
 ### Capability Advertisement
 

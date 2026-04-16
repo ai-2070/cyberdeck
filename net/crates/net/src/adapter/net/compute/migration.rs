@@ -218,6 +218,13 @@ pub enum MigrationError {
         /// Actual phase.
         got: MigrationPhase,
     },
+    /// Snapshot exceeds the maximum transferable size.
+    SnapshotTooLarge {
+        /// Actual size in bytes.
+        size: usize,
+        /// Maximum allowed size in bytes.
+        max: usize,
+    },
 }
 
 impl std::fmt::Display for MigrationError {
@@ -232,6 +239,13 @@ impl std::fmt::Display for MigrationError {
                     f,
                     "wrong migration phase: expected {:?}, got {:?}",
                     expected, got
+                )
+            }
+            Self::SnapshotTooLarge { size, max } => {
+                write!(
+                    f,
+                    "snapshot too large: {} bytes exceeds max {} bytes",
+                    size, max
                 )
             }
         }
