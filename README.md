@@ -485,6 +485,6 @@ Release build with `--features net` only, LTO on, single codegen unit, `panic = 
 | `libnet.rlib` | 17 MB | Rust static lib with metadata (consumed by Rust) |
 | `net.lib` | 29 MB | C/C++ static lib (pre-LTO, as expected for a `staticlib`) |
 
-Accurate as of April 17, 2025.
+Figures above accurate as of April 17, 2025.
 
 Measured on `x86_64-pc-windows-msvc`. The shipped cdylib fits comfortably under 1 MB despite bundling transport, routing, encryption, identity, load balancing, and the full consumer pipeline.
