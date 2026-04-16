@@ -562,6 +562,79 @@ async fn test_net_flush() {
     results.1.expect("initiator task panicked");
 }
 
+/// Test data transfer in the reverse direction: responder → initiator.
+/// The existing tests only verify initiator → responder. This catches
+/// key derivation bugs where the tx/rx key swap is incorrect.
+#[tokio::test]
+async fn test_net_responder_to_initiator() {
+    let (port1, port2) = find_available_ports().await;
+    let (initiator_config, responder_config) = create_config_pair(port1, port2);
+
+    let barrier = Arc::new(Barrier::new(2));
+
+    // Responder: sends events
+    let responder_barrier = barrier.clone();
+    let responder_handle = tokio::spawn(async move {
+        let mut adapter = net::adapter::net::NetAdapter::new(responder_config).unwrap();
+        responder_barrier.wait().await;
+        adapter.init().await.expect("responder init failed");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Send a batch (responder → initiator)
+        let events: Vec<InternalEvent> = (0..5)
+            .map(|i| {
+                let json = serde_json::json!({"from": "responder", "i": i});
+                InternalEvent::from_value(json, i as u64, 0)
+            })
+            .collect();
+        adapter
+            .on_batch(Batch {
+                shard_id: 0,
+                events,
+                sequence_start: 0,
+            })
+            .await
+            .expect("responder send failed");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        adapter.shutdown().await.expect("shutdown failed");
+    });
+
+    // Initiator: receives events
+    let initiator_barrier = barrier.clone();
+    let initiator_handle = tokio::spawn(async move {
+        let mut adapter = net::adapter::net::NetAdapter::new(initiator_config).unwrap();
+        initiator_barrier.wait().await;
+        adapter.init().await.expect("initiator init failed");
+
+        // Wait for responder's events to arrive
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let result = adapter.poll_shard(0, None, 100).await.expect("poll failed");
+        adapter.shutdown().await.expect("shutdown failed");
+        result.events.len()
+    });
+
+    let timeout = Duration::from_secs(10);
+    let results = tokio::time::timeout(
+        timeout,
+        futures::future::join(responder_handle, initiator_handle),
+    )
+    .await
+    .expect("test timed out");
+
+    let (resp_result, init_result) = results;
+    resp_result.expect("responder panicked");
+    let init_received = init_result.expect("initiator panicked");
+
+    assert!(
+        init_received > 0,
+        "initiator should receive responder's events, got {}",
+        init_received
+    );
+}
+
 // Unit tests for low-level components
 mod unit {
     use super::*;

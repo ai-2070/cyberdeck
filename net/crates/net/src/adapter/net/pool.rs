@@ -913,4 +913,60 @@ mod tests {
             "shared counter must prevent nonce reuse across threads"
         );
     }
+
+    #[test]
+    fn test_concurrent_pool_no_nonce_collision() {
+        // Stress test: 8 threads each build 100 packets concurrently
+        // from the same pool. No two packets should share a nonce.
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        use std::thread;
+
+        let key = [0x42u8; 32];
+        let session_id = 0xCCCC;
+        let pool = Arc::new(ThreadLocalPool::new(16, &key, session_id));
+        let nonces = Arc::new(Mutex::new(Vec::new()));
+
+        let num_threads = 8;
+        let packets_per_thread = 100;
+
+        let mut handles = Vec::new();
+        for _ in 0..num_threads {
+            let pool = pool.clone();
+            let nonces = nonces.clone();
+            handles.push(thread::spawn(move || {
+                let mut local_nonces = Vec::with_capacity(packets_per_thread);
+                for seq in 0..packets_per_thread {
+                    let mut b = pool.get();
+                    let pkt = b.build(
+                        0,
+                        seq as u64,
+                        &[Bytes::from_static(b"x")],
+                        PacketFlags::NONE,
+                    );
+                    // Extract nonce (bytes 12..24 of header)
+                    let mut nonce = [0u8; 12];
+                    nonce.copy_from_slice(&pkt[12..24]);
+                    local_nonces.push(nonce);
+                }
+                nonces.lock().unwrap().extend(local_nonces);
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let all_nonces = nonces.lock().unwrap();
+        assert_eq!(all_nonces.len(), num_threads * packets_per_thread);
+
+        let unique: HashSet<_> = all_nonces.iter().collect();
+        assert_eq!(
+            unique.len(),
+            all_nonces.len(),
+            "all {} nonces must be unique — found {} duplicates",
+            all_nonces.len(),
+            all_nonces.len() - unique.len()
+        );
+    }
 }

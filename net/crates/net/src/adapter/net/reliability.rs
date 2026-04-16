@@ -531,4 +531,110 @@ mod tests {
         let mode = create_reliability_mode(true);
         assert_eq!(mode.name(), "reliable");
     }
+
+    #[test]
+    fn test_reliable_stream_nack_retransmit_full_cycle() {
+        // Full cycle: send packets, receive out of order with gaps,
+        // build NACK, retransmit missing, fill gaps, verify ack_seq advances.
+        let mut sender = ReliableStream::new();
+        let mut receiver = ReliableStream::new();
+
+        // Sender sends packets 0..10
+        for seq in 0..10u64 {
+            sender.on_send(seq, Bytes::from(format!("pkt-{}", seq)));
+        }
+        assert!(sender.has_pending());
+
+        // Receiver gets packets 0, 1, 3, 5, 6, 7, 9 (missing 2, 4, 8)
+        assert!(receiver.on_receive(0));
+        assert!(receiver.on_receive(1));
+        assert!(receiver.on_receive(3)); // gap at 2
+        assert!(receiver.on_receive(5)); // gap at 4
+        assert!(receiver.on_receive(6));
+        assert!(receiver.on_receive(7));
+        assert!(receiver.on_receive(9)); // gap at 8
+
+        assert_eq!(receiver.ack_seq(), 1); // contiguous through 1
+
+        // Receiver builds NACK
+        let nack = receiver.build_nack().expect("should have gaps");
+        assert_eq!(nack.ack_seq, 1);
+        let missing: Vec<u64> = nack.missing_sequences().collect();
+        assert!(missing.contains(&2), "should report seq 2 missing");
+        assert!(missing.contains(&4), "should report seq 4 missing");
+        assert!(missing.contains(&8), "should report seq 8 missing");
+
+        // Sender processes NACK → retransmits missing packets
+        let retransmits = sender.on_nack(&nack);
+        assert_eq!(retransmits.len(), 3, "should retransmit 3 packets");
+
+        // Receiver fills gaps
+        assert!(receiver.on_receive(2));
+        // After receiving 2: ack_seq should advance through 3, 5, 6, 7
+        // Wait — 4 is still missing, so ack_seq advances to 3 then stops
+        assert_eq!(receiver.ack_seq(), 3, "should advance through contiguous 2,3");
+
+        assert!(receiver.on_receive(4));
+        // Now 4 fills gap: ack_seq advances through 5, 6, 7
+        assert_eq!(receiver.ack_seq(), 7, "should advance through 4,5,6,7");
+
+        assert!(receiver.on_receive(8));
+        // 8 fills gap: ack_seq advances through 9
+        assert_eq!(receiver.ack_seq(), 9, "should advance through 8,9");
+
+        // No more gaps
+        assert!(
+            receiver.build_nack().is_none(),
+            "no gaps remaining after retransmit"
+        );
+    }
+
+    #[test]
+    fn test_reliable_stream_retransmit_timeout() {
+        let mut mode = ReliableStream::with_settings(
+            Duration::from_millis(1), // 1ms RTO for fast test
+            32,
+            3,
+        );
+
+        mode.on_send(0, Bytes::from_static(b"pkt-0"));
+        mode.on_send(1, Bytes::from_static(b"pkt-1"));
+
+        // Wait for RTO to expire
+        std::thread::sleep(Duration::from_millis(5));
+
+        let timed_out = mode.get_timed_out();
+        assert_eq!(timed_out.len(), 2, "both packets should time out");
+        assert_eq!(&timed_out[0][..], b"pkt-0");
+        assert_eq!(&timed_out[1][..], b"pkt-1");
+
+        // Immediately after retransmit, they shouldn't time out again
+        let again = mode.get_timed_out();
+        assert!(again.is_empty(), "just retransmitted, shouldn't timeout yet");
+    }
+
+    #[test]
+    fn test_reliable_stream_max_retries_exhausted() {
+        let mut mode = ReliableStream::with_settings(
+            Duration::from_millis(1),
+            32,
+            2, // max 2 retries
+        );
+
+        mode.on_send(0, Bytes::from_static(b"pkt-0"));
+
+        // Exhaust retries
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(2));
+            let _ = mode.get_timed_out();
+        }
+
+        // After max_retries, the packet should no longer be retransmitted
+        std::thread::sleep(Duration::from_millis(2));
+        let timed_out = mode.get_timed_out();
+        assert!(
+            timed_out.is_empty(),
+            "packet should stop being retransmitted after max_retries"
+        );
+    }
 }

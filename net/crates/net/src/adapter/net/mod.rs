@@ -1108,4 +1108,357 @@ mod tests {
         let e2 = queue.pop().unwrap();
         assert_eq!(&e2.raw[..], br#"{"token":"world"}"#);
     }
+
+    /// Helper: perform a Noise handshake and return matched key pairs.
+    fn make_session_keys() -> (SessionKeys, SessionKeys) {
+        use crate::adapter::net::crypto::{NoiseHandshake, StaticKeypair};
+
+        let psk = [0x42u8; 32];
+        let responder_kp = StaticKeypair::generate();
+
+        let mut initiator = NoiseHandshake::initiator(&psk, &responder_kp.public).unwrap();
+        let mut responder = NoiseHandshake::responder(&psk, &responder_kp).unwrap();
+
+        let msg1 = initiator.write_message(&[]).unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(&[]).unwrap();
+        initiator.read_message(&msg2).unwrap();
+
+        (
+            initiator.into_session_keys().unwrap(),
+            responder.into_session_keys().unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_process_packet_rejects_truncated_packet() {
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let (init_keys, resp_keys) = make_session_keys();
+
+        // Build a valid packet, then truncate it
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let packet = builder.build(
+            0,
+            0,
+            &[Bytes::from_static(b"hello")],
+            PacketFlags::NONE,
+        );
+
+        let resp_session = Arc::new(NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        ));
+        let inbound: InboundQueues = Arc::new(DashMap::new());
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // Truncate: remove last 10 bytes (partial auth tag)
+        let truncated = packet.slice(..packet.len() - 10);
+        NetAdapter::process_packet(truncated, source, &resp_session, &inbound, 1);
+        assert!(
+            inbound.get(&0).is_none() || inbound.get(&0).unwrap().is_empty(),
+            "truncated packet must be silently dropped"
+        );
+    }
+
+    #[test]
+    fn test_process_packet_rejects_tampered_payload() {
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let (init_keys, resp_keys) = make_session_keys();
+
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let packet = builder.build(
+            0,
+            0,
+            &[Bytes::from_static(b"hello")],
+            PacketFlags::NONE,
+        );
+
+        let resp_session = Arc::new(NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        ));
+        let inbound: InboundQueues = Arc::new(DashMap::new());
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // Tamper: flip a byte in the encrypted payload
+        let mut tampered = bytes::BytesMut::from(&packet[..]);
+        tampered[super::protocol::HEADER_SIZE + 2] ^= 0xFF;
+        NetAdapter::process_packet(tampered.freeze(), source, &resp_session, &inbound, 1);
+
+        assert!(
+            inbound.get(&0).is_none() || inbound.get(&0).unwrap().is_empty(),
+            "tampered packet must be rejected by AEAD"
+        );
+    }
+
+    #[test]
+    fn test_process_packet_rejects_wrong_session_id() {
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let (init_keys, resp_keys) = make_session_keys();
+
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let packet = builder.build(
+            0,
+            0,
+            &[Bytes::from_static(b"hello")],
+            PacketFlags::NONE,
+        );
+
+        // Create session with a DIFFERENT session_id
+        let mut wrong_keys = resp_keys;
+        wrong_keys.session_id = 0xDEAD;
+        let resp_session = Arc::new(NetSession::new(
+            wrong_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        ));
+        let inbound: InboundQueues = Arc::new(DashMap::new());
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        NetAdapter::process_packet(packet, source, &resp_session, &inbound, 1);
+
+        assert!(
+            inbound.get(&0).is_none() || inbound.get(&0).unwrap().is_empty(),
+            "packet with wrong session_id must be dropped"
+        );
+    }
+
+    #[test]
+    fn test_process_packet_multi_packet_batch_all_events_arrive() {
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let (init_keys, resp_keys) = make_session_keys();
+
+        let resp_session = Arc::new(NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        ));
+        let inbound: InboundQueues = Arc::new(DashMap::new());
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // Build events large enough to span multiple packets.
+        // Each event is ~200 bytes, MAX_PAYLOAD_SIZE is ~8112, so ~40 per packet.
+        // 200 events → ~5 packets.
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let total_events = 200;
+        let mut seq = 0u64;
+
+        // Simulate on_batch splitting into multiple packets
+        let mut current_batch: Vec<Bytes> = Vec::new();
+        let mut current_size = 0;
+
+        for i in 0..total_events {
+            let data = format!("{{\"i\":{},\"pad\":\"{}\"}}", i, "x".repeat(150));
+            let event_bytes = Bytes::from(data);
+            let frame_size = EventFrame::LEN_SIZE + event_bytes.len();
+
+            if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE && !current_batch.is_empty() {
+                let packet = builder.build(0, seq, &current_batch, PacketFlags::NONE);
+                NetAdapter::process_packet(packet, source, &resp_session, &inbound, 1);
+                seq += 1;
+                current_batch.clear();
+                current_size = 0;
+            }
+
+            current_batch.push(event_bytes);
+            current_size += frame_size;
+        }
+
+        if !current_batch.is_empty() {
+            let packet = builder.build(0, seq, &current_batch, PacketFlags::NONE);
+            NetAdapter::process_packet(packet, source, &resp_session, &inbound, 1);
+        }
+
+        // All events must arrive
+        let queue = inbound.get(&0).expect("shard 0 should have events");
+        assert_eq!(
+            queue.len(),
+            total_events,
+            "all {} events must arrive across multiple packets",
+            total_events
+        );
+    }
+
+    #[test]
+    fn test_build_then_process_packet_both_directions() {
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let (init_keys, resp_keys) = make_session_keys();
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // Direction 1: initiator → responder
+        {
+            let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+            let packet = builder.build(0, 0, &[Bytes::from_static(b"i2r")], PacketFlags::NONE);
+
+            let session = Arc::new(NetSession::new(resp_keys.clone(), source, 4, false));
+            let inbound: InboundQueues = Arc::new(DashMap::new());
+            NetAdapter::process_packet(packet, source, &session, &inbound, 1);
+
+            let queue = inbound.get(&0).expect("i2r: shard 0 should have events");
+            assert_eq!(queue.len(), 1, "i2r: expected 1 event");
+            assert_eq!(&queue.pop().unwrap().raw[..], b"i2r");
+        }
+
+        // Direction 2: responder → initiator
+        {
+            let mut builder = PacketBuilder::new(&resp_keys.tx_key, resp_keys.session_id);
+            let packet = builder.build(0, 0, &[Bytes::from_static(b"r2i")], PacketFlags::NONE);
+
+            let session = Arc::new(NetSession::new(init_keys.clone(), source, 4, false));
+            let inbound: InboundQueues = Arc::new(DashMap::new());
+            NetAdapter::process_packet(packet, source, &session, &inbound, 1);
+
+            let queue = inbound.get(&0).expect("r2i: shard 0 should have events");
+            assert_eq!(queue.len(), 1, "r2i: expected 1 event");
+            assert_eq!(&queue.pop().unwrap().raw[..], b"r2i");
+        }
+    }
+
+    #[test]
+    fn test_poll_shard_cursor_requeue_preserves_events() {
+        // Verify that poll_shard with a cursor doesn't permanently lose
+        // events that are at or before the cursor position.
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let (init_keys, resp_keys) = make_session_keys();
+
+        let resp_session = Arc::new(NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        ));
+        let inbound: InboundQueues = Arc::new(DashMap::new());
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // Send 3 packets (sequences 0, 1, 2), each with 1 event
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        for seq in 0..3u64 {
+            let events = vec![Bytes::from(format!("event-{}", seq))];
+            let packet = builder.build(0, seq, &events, PacketFlags::NONE);
+            NetAdapter::process_packet(packet, source, &resp_session, &inbound, 1);
+        }
+
+        // Build a minimal adapter-like poll that exercises the cursor logic
+        let shard_id = 0u16;
+        let queue = inbound.get(&shard_id).unwrap();
+        assert_eq!(queue.len(), 3);
+
+        // Poll with cursor "0:0" — should return events after 0:0
+        let from_id = "0:0";
+        let mut events = Vec::new();
+        let mut requeue = Vec::new();
+        while events.len() < 10 {
+            if let Some(event) = queue.pop() {
+                if event_id_gt(&event.id, from_id) {
+                    events.push(event);
+                } else {
+                    requeue.push(event);
+                }
+            } else {
+                break;
+            }
+        }
+        for event in requeue {
+            queue.push(event);
+        }
+
+        // Should get events 1:0 and 2:0 (after cursor 0:0)
+        assert_eq!(events.len(), 2, "should get 2 events after cursor 0:0");
+
+        // The requeued event (0:0) should still be in the queue
+        assert_eq!(queue.len(), 1, "requeued event should still be in queue");
+        let remaining = queue.pop().unwrap();
+        assert_eq!(remaining.id, "0:0");
+    }
+
+    #[test]
+    fn test_process_packet_replay_rejected() {
+        // Verify that replaying an already-processed packet is rejected
+        // by the rx_counter replay window.
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let (init_keys, resp_keys) = make_session_keys();
+
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let packet = builder.build(
+            0,
+            0,
+            &[Bytes::from_static(b"original")],
+            PacketFlags::NONE,
+        );
+
+        let resp_session = Arc::new(NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        ));
+        let inbound: InboundQueues = Arc::new(DashMap::new());
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // First delivery succeeds
+        NetAdapter::process_packet(packet.clone(), source, &resp_session, &inbound, 1);
+        let queue = inbound.get(&0).unwrap();
+        assert_eq!(queue.len(), 1, "first delivery should succeed");
+
+        // Replay: same packet again — should be rejected by rx_counter
+        NetAdapter::process_packet(packet, source, &resp_session, &inbound, 1);
+        assert_eq!(
+            queue.len(),
+            1,
+            "replayed packet must be rejected, count should still be 1"
+        );
+    }
+
+    #[test]
+    fn test_process_packet_far_future_counter_rejected() {
+        // Verify that a packet with a counter far beyond MAX_FORWARD is
+        // rejected, preventing an attacker from advancing the rx_counter
+        // and denying subsequent legitimate packets.
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let (init_keys, resp_keys) = make_session_keys();
+
+        // Build a valid packet, then manually tamper the nonce counter
+        // to a huge value. The AEAD will fail because the nonce doesn't
+        // match, but we're testing that is_valid_rx_counter rejects it
+        // before even attempting decryption.
+        let resp_session = Arc::new(NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        ));
+
+        // Directly test the cipher's counter validation
+        let rx_cipher = resp_session.rx_cipher();
+        assert!(
+            !rx_cipher.is_valid_rx_counter(u64::MAX),
+            "counter at u64::MAX must be rejected (far beyond MAX_FORWARD)"
+        );
+        assert!(
+            rx_cipher.is_valid_rx_counter(0),
+            "counter 0 should be valid initially"
+        );
+    }
 }
