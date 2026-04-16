@@ -1,0 +1,49 @@
+net/crates/net/BUGS_4.md
+  3be36942824761fb 1-44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "3d01cd57f62cc83a92090493122584adf1486037",
+  "prompts": {
+    "3be36942824761fb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "19977bfa-68ed-4112-b98c-446e74695ee9",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 72,
+      "total_deletions": 1,
+      "accepted_lines": 72,
+      "overriden_lines": 0
+    },
+    "75b8fbe288685b96": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b75d121a-3dc9-4fa0-82a8-528ef83df651",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 156,
+      "overriden_lines": 0
+    },
+    "e33ca63076d0343d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "72a93451-3a46-4c03-8dd4-addc974f7ef5",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 471,
+      "overriden_lines": 0
+    }
+  }
+}
