@@ -196,9 +196,8 @@ impl PollMerger {
         // Calculate per-shard limit (over-fetch to account for filtering)
         // Use ceiling division to avoid truncating to 0 when limit < shard count
         let over_fetch_factor = if request.filter.is_some() { 3 } else { 2 };
-        let per_shard_limit = (((request.limit + shards.len() - 1) / shards.len()).max(1)
-            * over_fetch_factor)
-            .min(10_000);
+        let per_shard_limit =
+            (request.limit.div_ceil(shards.len()).max(1) * over_fetch_factor).min(10_000);
 
         // Poll all shards in parallel
         let poll_futures: Vec<_> = shards
