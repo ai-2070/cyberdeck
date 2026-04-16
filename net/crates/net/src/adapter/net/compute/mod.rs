@@ -8,11 +8,17 @@
 mod daemon;
 mod host;
 mod migration;
+pub mod migration_source;
+pub mod migration_target;
+pub mod orchestrator;
 mod registry;
 mod scheduler;
 
 pub use daemon::{DaemonError, DaemonHostConfig, DaemonStats, MeshDaemon};
 pub use host::DaemonHost;
 pub use migration::{MigrationError, MigrationPhase, MigrationState, SUBPROTOCOL_MIGRATION};
+pub use migration_source::MigrationSourceHandler;
+pub use migration_target::MigrationTargetHandler;
+pub use orchestrator::{MigrationMessage, MigrationOrchestrator};
 pub use registry::DaemonRegistry;
 pub use scheduler::{PlacementDecision, PlacementReason, Scheduler, SchedulerError};
