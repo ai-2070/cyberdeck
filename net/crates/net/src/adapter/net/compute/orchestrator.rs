@@ -314,9 +314,8 @@ pub mod wire {
                     }
                     let mut link_bytes = [0u8; CAUSAL_LINK_SIZE];
                     cur.copy_to_slice(&mut link_bytes);
-                    let link = CausalLink::from_bytes(&link_bytes).ok_or_else(|| {
-                        MigrationError::StateFailed("invalid causal link".into())
-                    })?;
+                    let link = CausalLink::from_bytes(&link_bytes)
+                        .ok_or_else(|| MigrationError::StateFailed("invalid causal link".into()))?;
                     let payload_len = cur.get_u32_le() as usize;
                     if cur.remaining() < payload_len + 8 {
                         return Err(MigrationError::StateFailed(
@@ -452,6 +451,29 @@ impl MigrationOrchestrator {
         }
     }
 
+    /// Initiate a migration with automatic target selection.
+    ///
+    /// Uses the scheduler to find the best migration-capable target node
+    /// based on the daemon's capability requirements. The scheduler queries
+    /// the `CapabilityIndex` for nodes advertising `subprotocol:0x0500`.
+    ///
+    /// Returns the target node ID and the first migration message.
+    pub fn start_migration_auto(
+        &self,
+        daemon_origin: u32,
+        source_node: u64,
+        scheduler: &super::Scheduler,
+        daemon_filter: &crate::adapter::net::behavior::capability::CapabilityFilter,
+    ) -> Result<(u64, MigrationMessage), MigrationError> {
+        let placement = scheduler
+            .place_migration(daemon_filter, source_node)
+            .map_err(|_| MigrationError::TargetUnavailable(0))?;
+
+        let target_node = placement.node_id;
+        let msg = self.start_migration(daemon_origin, source_node, target_node)?;
+        Ok((target_node, msg))
+    }
+
     /// Handle snapshot taken on source (phase 1→2).
     ///
     /// Validates and stores the snapshot, advances to Transfer phase.
@@ -470,9 +492,8 @@ impl MigrationOrchestrator {
         let mut record = entry.lock();
 
         // Parse snapshot to validate it
-        let snapshot = StateSnapshot::from_bytes(&snapshot_bytes).ok_or_else(|| {
-            MigrationError::StateFailed("failed to parse snapshot bytes".into())
-        })?;
+        let snapshot = StateSnapshot::from_bytes(&snapshot_bytes)
+            .ok_or_else(|| MigrationError::StateFailed("failed to parse snapshot bytes".into()))?;
 
         // If still in Snapshot phase, set the snapshot (advances to Transfer)
         if record.state.phase() == MigrationPhase::Snapshot {
@@ -480,9 +501,7 @@ impl MigrationOrchestrator {
         }
 
         // Update superposition
-        record
-            .superposition
-            .advance(MigrationPhase::Transfer);
+        record.superposition.advance(MigrationPhase::Transfer);
 
         // Forward to target
         Ok(MigrationMessage::SnapshotReady {
@@ -573,10 +592,7 @@ impl MigrationOrchestrator {
     /// Handle cutover acknowledged by source.
     ///
     /// Source has stopped accepting writes. Advances to Complete.
-    pub fn on_cutover_acknowledged(
-        &self,
-        daemon_origin: u32,
-    ) -> Result<(), MigrationError> {
+    pub fn on_cutover_acknowledged(&self, daemon_origin: u32) -> Result<(), MigrationError> {
         let entry = self
             .migrations
             .get(&daemon_origin)
@@ -597,10 +613,7 @@ impl MigrationOrchestrator {
     /// Handle cleanup complete from source.
     ///
     /// Removes the migration record entirely.
-    pub fn on_cleanup_complete(
-        &self,
-        daemon_origin: u32,
-    ) -> Result<(), MigrationError> {
+    pub fn on_cleanup_complete(&self, daemon_origin: u32) -> Result<(), MigrationError> {
         self.migrations
             .remove(&daemon_origin)
             .ok_or(MigrationError::DaemonNotFound(daemon_origin))?;
@@ -694,10 +707,10 @@ impl std::fmt::Debug for MigrationOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::net::behavior::capability::CapabilityFilter;
     use crate::adapter::net::compute::{
         DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, MeshDaemon,
     };
-    use crate::adapter::net::behavior::capability::CapabilityFilter;
     use crate::adapter::net::identity::EntityKeypair;
     use bytes::Bytes;
 
@@ -802,9 +815,7 @@ mod tests {
         orch.start_migration(origin, 0x1111, 0x2222).unwrap();
         assert!(orch.is_migrating(origin));
 
-        let msg = orch
-            .abort_migration(origin, "test abort".into())
-            .unwrap();
+        let msg = orch.abort_migration(origin, "test abort".into()).unwrap();
         match msg {
             MigrationMessage::MigrationFailed { reason, .. } => {
                 assert_eq!(reason, "test abort");
@@ -829,11 +840,14 @@ mod tests {
         };
 
         assert!(orch.buffer_event(origin, event));
-        assert!(!orch.buffer_event(0xDEAD, CausalEvent {
-            link: CausalLink::genesis(0xDEAD, 0),
-            payload: Bytes::from_static(b"nope"),
-            received_at: 0,
-        }));
+        assert!(!orch.buffer_event(
+            0xDEAD,
+            CausalEvent {
+                link: CausalLink::genesis(0xDEAD, 0),
+                payload: Bytes::from_static(b"nope"),
+                received_at: 0,
+            }
+        ));
     }
 
     #[test]

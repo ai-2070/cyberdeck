@@ -235,10 +235,7 @@ impl MigrationTargetHandler {
     }
 
     /// Drain pending events in sequence order, delivering to the daemon.
-    fn drain_pending(
-        &self,
-        state: &mut TargetMigrationState,
-    ) -> Result<(), MigrationError> {
+    fn drain_pending(&self, state: &mut TargetMigrationState) -> Result<(), MigrationError> {
         // Collect events to replay (contiguous from replayed_through + 1)
         let mut to_replay = Vec::new();
         let mut next_seq = state.replayed_through + 1;

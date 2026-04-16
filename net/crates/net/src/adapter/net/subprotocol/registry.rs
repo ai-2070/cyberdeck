@@ -7,7 +7,7 @@
 use dashmap::DashMap;
 
 use super::descriptor::{SubprotocolDescriptor, SubprotocolVersion};
-use crate::adapter::net::behavior::capability::CapabilityFilter;
+use crate::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use crate::adapter::net::compute::SUBPROTOCOL_MIGRATION;
 use crate::adapter::net::state::causal::{SUBPROTOCOL_CAUSAL, SUBPROTOCOL_SNAPSHOT};
 
@@ -114,6 +114,27 @@ impl SubprotocolRegistry {
             .map(|e| e.capability_tag())
             .collect()
     }
+
+    /// Enrich a `CapabilitySet` with tags for all handled subprotocols.
+    ///
+    /// Call this when building the local node's capability set before
+    /// broadcasting via `CapabilityAnnouncement` or `CapabilityAd`.
+    /// This ensures other nodes can discover which subprotocols this
+    /// node supports (including migration) through the capability graph.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let caps = CapabilitySet::new();
+    /// let caps = subprotocol_registry.enrich_capabilities(caps);
+    /// // caps now has tags like "subprotocol:0x0400", "subprotocol:0x0500", etc.
+    /// ```
+    pub fn enrich_capabilities(&self, mut caps: CapabilitySet) -> CapabilitySet {
+        for tag in self.capability_tags() {
+            caps = caps.add_tag(tag);
+        }
+        caps
+    }
 }
 
 impl Default for SubprotocolRegistry {
@@ -133,6 +154,7 @@ impl std::fmt::Debug for SubprotocolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::net::behavior::capability::CapabilitySet;
 
     #[test]
     fn test_empty_registry() {
@@ -249,5 +271,54 @@ mod tests {
 
         let list = reg.list();
         assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn test_enrich_capabilities() {
+        let reg = SubprotocolRegistry::new();
+        reg.register(SubprotocolDescriptor::new(
+            0x0500,
+            "migration",
+            SubprotocolVersion::new(1, 0),
+        ));
+        reg.register(
+            SubprotocolDescriptor::new(0x2000, "forwarded", SubprotocolVersion::new(1, 0))
+                .forwarding_only(),
+        );
+
+        let caps = CapabilitySet::new();
+        let enriched = reg.enrich_capabilities(caps);
+
+        // Only handled subprotocols get tags
+        assert!(enriched.has_tag("subprotocol:0x0500"));
+        assert!(!enriched.has_tag("subprotocol:0x2000")); // forwarding-only excluded
+    }
+
+    #[test]
+    fn test_enrich_capabilities_with_defaults() {
+        let reg = SubprotocolRegistry::with_defaults();
+        let caps = reg.enrich_capabilities(CapabilitySet::new());
+
+        // All default subprotocols should have tags
+        assert!(caps.has_tag("subprotocol:0x0400")); // causal
+        assert!(caps.has_tag("subprotocol:0x0401")); // snapshot
+        assert!(caps.has_tag("subprotocol:0x0500")); // migration
+        assert!(caps.has_tag("subprotocol:0x0600")); // negotiation
+    }
+
+    #[test]
+    fn test_enrich_preserves_existing_tags() {
+        let reg = SubprotocolRegistry::new();
+        reg.register(SubprotocolDescriptor::new(
+            0x0500,
+            "migration",
+            SubprotocolVersion::new(1, 0),
+        ));
+
+        let caps = CapabilitySet::new().add_tag("custom:my-tag");
+        let enriched = reg.enrich_capabilities(caps);
+
+        assert!(enriched.has_tag("custom:my-tag"));
+        assert!(enriched.has_tag("subprotocol:0x0500"));
     }
 }

@@ -5,11 +5,11 @@
 
 use std::sync::Arc;
 
+use crate::adapter::net::compute::orchestrator::wire;
 use crate::adapter::net::compute::{
     MigrationError, MigrationMessage, MigrationOrchestrator, MigrationSourceHandler,
     MigrationTargetHandler,
 };
-use crate::adapter::net::compute::orchestrator::wire;
 
 /// Outbound message with destination node.
 #[derive(Debug)]
@@ -127,8 +127,9 @@ impl MigrationSubprotocolHandler {
                 restored_seq,
             } => {
                 // Target has restored — orchestrator may send buffered events
-                if let Some(buffered_msg) =
-                    self.orchestrator.on_restore_complete(daemon_origin, restored_seq)?
+                if let Some(buffered_msg) = self
+                    .orchestrator
+                    .on_restore_complete(daemon_origin, restored_seq)?
                 {
                     outbound.push(OutboundMigrationMessage {
                         dest_node: from_node, // send back to target
@@ -210,9 +211,7 @@ impl MigrationSubprotocolHandler {
                 events,
             } => {
                 // We are the target — replay events
-                let replayed_seq = self
-                    .target_handler
-                    .replay_events(daemon_origin, events)?;
+                let replayed_seq = self.target_handler.replay_events(daemon_origin, events)?;
 
                 // Tell orchestrator we're done replaying
                 let reply = MigrationMessage::ReplayComplete {
@@ -256,12 +255,12 @@ impl std::fmt::Debug for MigrationSubprotocolHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::net::behavior::capability::CapabilityFilter;
+    use crate::adapter::net::compute::orchestrator::wire;
     use crate::adapter::net::compute::{
         DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, MeshDaemon,
         MigrationOrchestrator, MigrationSourceHandler, MigrationTargetHandler,
     };
-    use crate::adapter::net::compute::orchestrator::wire;
-    use crate::adapter::net::behavior::capability::CapabilityFilter;
     use crate::adapter::net::identity::EntityKeypair;
     use crate::adapter::net::state::causal::CausalEvent;
     use bytes::Bytes;
@@ -290,11 +289,7 @@ mod tests {
         }
     }
 
-    fn setup() -> (
-        MigrationSubprotocolHandler,
-        Arc<DaemonRegistry>,
-        u32,
-    ) {
+    fn setup() -> (MigrationSubprotocolHandler, Arc<DaemonRegistry>, u32) {
         let reg = Arc::new(DaemonRegistry::new());
         let kp = EntityKeypair::generate();
         let origin = kp.origin_hash();

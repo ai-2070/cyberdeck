@@ -208,9 +208,7 @@ impl std::fmt::Debug for MigrationSourceHandler {
 mod tests {
     use super::*;
     use crate::adapter::net::behavior::capability::CapabilityFilter;
-    use crate::adapter::net::compute::{
-        DaemonError, DaemonHost, DaemonHostConfig, MeshDaemon,
-    };
+    use crate::adapter::net::compute::{DaemonError, DaemonHost, DaemonHostConfig, MeshDaemon};
     use crate::adapter::net::identity::EntityKeypair;
     use crate::adapter::net::state::causal::CausalLink;
     use bytes::Bytes;
@@ -312,9 +310,7 @@ mod tests {
         let (reg, _origin) = setup();
         let handler = MigrationSourceHandler::new(reg);
 
-        let result = handler
-            .buffer_event(0xDEAD, make_event(0xDEAD, 1))
-            .unwrap();
+        let result = handler.buffer_event(0xDEAD, make_event(0xDEAD, 1)).unwrap();
         assert!(!result);
     }
 
