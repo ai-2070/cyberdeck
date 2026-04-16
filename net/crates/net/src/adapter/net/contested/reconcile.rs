@@ -403,7 +403,7 @@ mod tests {
             log.after(split_seq).iter().map(|e| (*e).clone()).collect();
 
         // Build the other side's log
-        let kp = EntityKeypair::from_bytes([0x42u8; 32]); // deterministic for both sides
+        let _kp = EntityKeypair::from_bytes([0x42u8; 32]); // deterministic for both sides
         let origin = log.origin_hash();
         let mut their_log = EntityLog::new(log.entity_id().clone());
         let mut builder = CausalChainBuilder::new(origin);
@@ -415,7 +415,7 @@ mod tests {
         }
 
         // Replay their divergent events
-        let mut their_builder =
+        let _their_builder =
             CausalChainBuilder::from_head(*builder.head(), Bytes::from("shared-2".to_string()));
         for event in &their_events {
             their_log.append(event.clone()).unwrap();

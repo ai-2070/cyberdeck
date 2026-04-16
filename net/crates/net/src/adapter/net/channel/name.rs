@@ -25,12 +25,6 @@ impl ChannelName {
         Ok(Self(name.to_string()))
     }
 
-    /// Create without validation (for testing).
-    #[cfg(test)]
-    pub(crate) fn new_unchecked(name: String) -> Self {
-        Self(name)
-    }
-
     /// Get the name as a string slice.
     #[inline]
     pub fn as_str(&self) -> &str {

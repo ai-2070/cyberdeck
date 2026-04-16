@@ -246,10 +246,16 @@ impl ShardManager {
 
         let shards: Vec<_> = (0..num_shards)
             .map(|id| {
-                let metrics = mapper.metrics_collector(id).unwrap();
-                parking_lot::Mutex::new(Shard::with_metrics(id, ring_buffer_capacity, metrics))
+                let metrics = mapper.metrics_collector(id).ok_or_else(|| {
+                    ScalingError::InvalidPolicy(format!("no metrics collector for shard {}", id))
+                })?;
+                Ok(parking_lot::Mutex::new(Shard::with_metrics(
+                    id,
+                    ring_buffer_capacity,
+                    metrics,
+                )))
             })
-            .collect();
+            .collect::<Result<Vec<_>, ScalingError>>()?;
 
         let shard_index: std::collections::HashMap<u16, usize> =
             (0..num_shards).map(|id| (id, id as usize)).collect();
@@ -317,7 +323,9 @@ impl ShardManager {
     /// Ingest an event into the appropriate shard.
     pub fn ingest(&self, event: JsonValue) -> Result<(u16, u64), IngestionError> {
         // Serialize once upfront - avoids clone on retry
-        let raw = Bytes::from(serde_json::to_vec(&event).unwrap());
+        let raw = Bytes::from(
+            serde_json::to_vec(&event).map_err(|e| IngestionError::Serialization(e.to_string()))?,
+        );
         let hash = xxhash_rust::xxh3::xxh3_64(&raw);
         let shard_id = self.select_shard_by_hash(hash);
 
@@ -345,9 +353,11 @@ impl ShardManager {
                 match self.backpressure_mode {
                     BackpressureMode::DropNewest => Err(IngestionError::Backpressure),
                     BackpressureMode::DropOldest => {
-                        // Pop one event to make room
+                        // try_push_raw already counted this as a drop, but
+                        // the incoming event isn't actually dropped — the oldest is.
+                        // The net effect is the same (1 drop), so no adjustment needed.
                         let _ = shard.try_pop();
-                        // Retry with the same bytes (cheap clone)
+                        // Retry with the same bytes (Bytes clone is ref-counted)
                         shard.try_push_raw(raw).map(|ts| (shard_id, ts))
                     }
                     BackpressureMode::FailProducer => Err(IngestionError::Backpressure),
@@ -394,7 +404,9 @@ impl ShardManager {
                 match self.backpressure_mode {
                     BackpressureMode::DropNewest => Err(IngestionError::Backpressure),
                     BackpressureMode::DropOldest => {
-                        // Pop one event to make room
+                        // try_push_raw already counted this as a drop, but
+                        // the incoming event isn't actually dropped — the oldest is.
+                        // The net effect is the same (1 drop), so no adjustment needed.
                         let _ = shard.try_pop();
                         // Retry the push
                         shard.try_push_raw(event.bytes()).map(|ts| (shard_id, ts))
@@ -472,7 +484,9 @@ impl ShardManager {
         let new_id = new_ids[0];
 
         // Create the actual shard
-        let metrics = mapper.metrics_collector(new_id).unwrap();
+        let metrics = mapper.metrics_collector(new_id).ok_or_else(|| {
+            ScalingError::InvalidPolicy(format!("no metrics collector for shard {}", new_id))
+        })?;
         let new_shard = Shard::with_metrics(new_id, self.ring_buffer_capacity, metrics);
 
         // Add to our collections
@@ -698,5 +712,70 @@ mod tests {
         let result = manager.drain_shard(0);
         assert!(result.is_err());
         assert!(matches!(result, Err(ScalingError::InvalidPolicy(_))));
+    }
+
+    #[test]
+    fn test_drop_oldest_counts_dropped_events() {
+        let manager = ShardManager::new(1, 4, BackpressureMode::DropOldest);
+
+        // Fill the buffer (capacity 4, usable 3)
+        for i in 0..3 {
+            manager.ingest(json!({"i": i})).unwrap();
+        }
+
+        // This should succeed by dropping the oldest event
+        manager.ingest(json!({"i": 999})).unwrap();
+
+        let stats = manager.stats();
+        assert_eq!(stats.events_ingested, 4);
+        // The initial push fails (counted as dropped), then retry succeeds
+        assert_eq!(
+            stats.events_dropped, 1,
+            "DropOldest cycle should count exactly one drop"
+        );
+    }
+
+    #[test]
+    fn test_drop_oldest_raw_counts_dropped_events() {
+        let manager = ShardManager::new(1, 4, BackpressureMode::DropOldest);
+
+        // Fill the buffer
+        for i in 0..3 {
+            let raw = RawEvent::from_str(&format!(r#"{{"i": {}}}"#, i));
+            manager.ingest_raw(raw).unwrap();
+        }
+
+        // This should succeed by dropping the oldest event
+        let raw = RawEvent::from_str(r#"{"i": 999}"#);
+        manager.ingest_raw(raw).unwrap();
+
+        let stats = manager.stats();
+        assert_eq!(stats.events_ingested, 4);
+        assert_eq!(
+            stats.events_dropped, 1,
+            "DropOldest cycle should count exactly one drop"
+        );
+    }
+
+    #[test]
+    fn test_drop_oldest_multiple_cycles() {
+        let manager = ShardManager::new(1, 4, BackpressureMode::DropOldest);
+
+        // Fill the buffer (usable capacity 3)
+        for i in 0..3 {
+            manager.ingest(json!({"i": i})).unwrap();
+        }
+
+        // Push 5 more events, each triggers a DropOldest cycle
+        for i in 3..8 {
+            manager.ingest(json!({"i": i})).unwrap();
+        }
+
+        let stats = manager.stats();
+        assert_eq!(stats.events_ingested, 8);
+        assert_eq!(
+            stats.events_dropped, 5,
+            "each DropOldest cycle should count one drop"
+        );
     }
 }

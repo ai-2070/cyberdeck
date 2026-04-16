@@ -186,8 +186,9 @@ async fn test_jetstream_filtering() {
 
     // All returned events should be token type
     for event in &response.events {
+        let parsed = event.parse().expect("valid JSON");
         assert_eq!(
-            event.raw.get("type").and_then(|v| v.as_str()),
+            parsed.get("type").and_then(|v| v.as_str()),
             Some("token"),
             "Expected token type, got {:?}",
             event.raw
