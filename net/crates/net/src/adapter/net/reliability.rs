@@ -572,7 +572,11 @@ mod tests {
         assert!(receiver.on_receive(2));
         // After receiving 2: ack_seq should advance through 3, 5, 6, 7
         // Wait — 4 is still missing, so ack_seq advances to 3 then stops
-        assert_eq!(receiver.ack_seq(), 3, "should advance through contiguous 2,3");
+        assert_eq!(
+            receiver.ack_seq(),
+            3,
+            "should advance through contiguous 2,3"
+        );
 
         assert!(receiver.on_receive(4));
         // Now 4 fills gap: ack_seq advances through 5, 6, 7
@@ -610,7 +614,10 @@ mod tests {
 
         // Immediately after retransmit, they shouldn't time out again
         let again = mode.get_timed_out();
-        assert!(again.is_empty(), "just retransmitted, shouldn't timeout yet");
+        assert!(
+            again.is_empty(),
+            "just retransmitted, shouldn't timeout yet"
+        );
     }
 
     #[test]

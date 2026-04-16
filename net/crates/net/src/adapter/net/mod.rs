@@ -1092,7 +1092,12 @@ mod tests {
         let packet = builder.build(0, 0, &events, PacketFlags::NONE);
 
         // Responder processes the packet
-        let resp_session = Arc::new(NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false));
+        let resp_session = Arc::new(NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        ));
         let inbound: InboundQueues = Arc::new(DashMap::new());
         let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
@@ -1139,12 +1144,7 @@ mod tests {
 
         // Build a valid packet, then truncate it
         let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
-        let packet = builder.build(
-            0,
-            0,
-            &[Bytes::from_static(b"hello")],
-            PacketFlags::NONE,
-        );
+        let packet = builder.build(0, 0, &[Bytes::from_static(b"hello")], PacketFlags::NONE);
 
         let resp_session = Arc::new(NetSession::new(
             resp_keys,
@@ -1172,12 +1172,7 @@ mod tests {
         let (init_keys, resp_keys) = make_session_keys();
 
         let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
-        let packet = builder.build(
-            0,
-            0,
-            &[Bytes::from_static(b"hello")],
-            PacketFlags::NONE,
-        );
+        let packet = builder.build(0, 0, &[Bytes::from_static(b"hello")], PacketFlags::NONE);
 
         let resp_session = Arc::new(NetSession::new(
             resp_keys,
@@ -1207,12 +1202,7 @@ mod tests {
         let (init_keys, resp_keys) = make_session_keys();
 
         let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
-        let packet = builder.build(
-            0,
-            0,
-            &[Bytes::from_static(b"hello")],
-            PacketFlags::NONE,
-        );
+        let packet = builder.build(0, 0, &[Bytes::from_static(b"hello")], PacketFlags::NONE);
 
         // Create session with a DIFFERENT session_id
         let mut wrong_keys = resp_keys;
@@ -1399,12 +1389,7 @@ mod tests {
         let (init_keys, resp_keys) = make_session_keys();
 
         let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
-        let packet = builder.build(
-            0,
-            0,
-            &[Bytes::from_static(b"original")],
-            PacketFlags::NONE,
-        );
+        let packet = builder.build(0, 0, &[Bytes::from_static(b"original")], PacketFlags::NONE);
 
         let resp_session = Arc::new(NetSession::new(
             resp_keys,

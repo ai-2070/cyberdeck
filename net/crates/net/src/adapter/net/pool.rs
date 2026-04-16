@@ -519,11 +519,7 @@ impl ThreadLocalPool {
             if let Some(mut builder) = pool.pop() {
                 // Update key/session if changed
                 if builder.session_id() != self.session_id {
-                    builder.set_key_shared(
-                        &self.key,
-                        self.session_id,
-                        self.tx_counter.clone(),
-                    );
+                    builder.set_key_shared(&self.key, self.session_id, self.tx_counter.clone());
                 }
                 // Sync origin_hash in case it changed
                 builder.set_origin_hash(self.origin_hash);
@@ -544,11 +540,7 @@ impl ThreadLocalPool {
             pool.pop()
                 .map(|mut b| {
                     if b.session_id() != self.session_id {
-                        b.set_key_shared(
-                            &self.key,
-                            self.session_id,
-                            self.tx_counter.clone(),
-                        );
+                        b.set_key_shared(&self.key, self.session_id, self.tx_counter.clone());
                     }
                     b.set_origin_hash(self.origin_hash);
                     b
@@ -572,11 +564,7 @@ impl ThreadLocalPool {
     pub fn release(&self, mut builder: PacketBuilder) {
         // Update key/session if changed
         if builder.session_id() != self.session_id {
-            builder.set_key_shared(
-                &self.key,
-                self.session_id,
-                self.tx_counter.clone(),
-            );
+            builder.set_key_shared(&self.key, self.session_id, self.tx_counter.clone());
         }
         // Sync origin_hash
         builder.set_origin_hash(self.origin_hash);
