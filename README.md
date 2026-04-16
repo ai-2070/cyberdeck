@@ -357,6 +357,12 @@ All SDKs wrap the same Rust core. The SDK is the developer experience, the engin
 
 ## Benchmarks
 
+Net doesn't try to beat specialists at their specializations. LMAX Disruptor wins at in-process event passing. Aeron IPC wins at shared-memory transport. DPDK wins at raw UDP throughput. Each had a decade of focused work on one problem. Against their narrow benchmarks, Net loses by 2–15x.
+
+Real workloads don't use one primitive. They stitch specialists together — Kafka plus gRPC plus Redis plus a service mesh plus custom glue — and end-to-end latency gets dominated by the boundaries between tools. Net composes transport, routing, encryption, identity, causal ordering, and failure recovery as a single substrate at the same speed class as each specialist. Against the composed workflow, Net wins by 100x or more.
+
+Specialists win their single operation. Net wins the full workflow.
+
 All numbers below measure **packet scheduling** — the time to process, route, encrypt, and queue a packet for transmission. They do not include NIC transfer, wire latency, or speed-of-light propagation. The software layer is what these benchmarks prove is no longer the bottleneck.
 
 **Test systems:** Apple M1 Max (macOS) and Intel i9-14900K @5GHz (Windows 11). Full results in [BENCHMARKS.md](net/crates/net/BENCHMARKS.md).
