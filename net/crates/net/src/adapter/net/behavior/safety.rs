@@ -918,11 +918,12 @@ impl SafetyEnforcer {
             .fetch_sub(claim.memory_mb, Ordering::Relaxed);
         // Release tokens and cost that were acquired — without this,
         // both counters grow monotonically, hitting limits prematurely.
-        let _ = self.usage.tokens.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_sub(claim.tokens as u64)),
-        );
+        let _ = self
+            .usage
+            .tokens
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(claim.tokens as u64))
+            });
         let _ = self.usage.cost_cents_per_hour.fetch_update(
             Ordering::Relaxed,
             Ordering::Relaxed,

@@ -235,9 +235,7 @@ impl ChannelConfigRegistry {
     /// Get the priority for a channel (0 if not configured).
     #[inline]
     pub fn priority(&self, channel_hash: u16) -> u8 {
-        self.get(channel_hash)
-            .map(|c| c.priority)
-            .unwrap_or(0)
+        self.get(channel_hash).map(|c| c.priority).unwrap_or(0)
     }
 }
 

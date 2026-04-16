@@ -1043,8 +1043,7 @@ mod tests {
             tools_bitmap: 0b10101010,
             flags: 0x12345678,
         };
-        let pw = EnhancedPingwave::new(make_node_id(1), 42, 3)
-            .with_capabilities(0xDEAD, 7, caps);
+        let pw = EnhancedPingwave::new(make_node_id(1), 42, 3).with_capabilities(0xDEAD, 7, caps);
 
         let bytes = pw.to_bytes();
         let parsed = EnhancedPingwave::from_bytes(&bytes).unwrap();
@@ -1069,8 +1068,7 @@ mod tests {
         let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
         // Add nodes with very high latency (edge case for routing_score)
-        let pw = EnhancedPingwave::new(make_node_id(2), 1, 3)
-            .with_load(0, HealthStatus::Healthy);
+        let pw = EnhancedPingwave::new(make_node_id(2), 1, 3).with_load(0, HealthStatus::Healthy);
         graph.on_pingwave(pw, from);
 
         let filter = CapabilityFilter::default();
