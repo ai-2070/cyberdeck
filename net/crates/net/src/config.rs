@@ -594,7 +594,7 @@ impl ScalingPolicy {
             push_latency_threshold_ns: 3,
             flush_latency_threshold_us: 500,
             min_shards: 4.min(cpus),
-            max_shards: cpus * 2, // Allow up to 2x CPU count for GPU workloads
+            max_shards: cpus.saturating_mul(2), // Allow up to 2x CPU count for GPU workloads
             cooldown: Duration::from_millis(500),
             scale_down_delay: Duration::from_secs(30),
             underutilized_threshold: 0.05,
@@ -659,7 +659,7 @@ impl ScalingPolicy {
 /// Get the number of CPU cores (fallback to 1).
 fn num_cpus() -> u16 {
     std::thread::available_parallelism()
-        .map(|n| n.get() as u16)
+        .map(|n| u16::try_from(n.get()).unwrap_or(u16::MAX))
         .unwrap_or(1)
 }
 
@@ -831,5 +831,14 @@ mod tests {
             .build();
 
         assert!(result2.is_err());
+    }
+
+    // Regression: high_throughput() used cpus * 2 which overflows u16
+    // on machines with >32K CPUs (BUGS_3 #7).
+    #[test]
+    fn test_high_throughput_max_shards_no_overflow() {
+        let policy = ScalingPolicy::high_throughput();
+        assert!(policy.max_shards >= policy.min_shards);
+        assert!(policy.validate().is_ok());
     }
 }

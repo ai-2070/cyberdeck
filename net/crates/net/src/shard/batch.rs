@@ -24,9 +24,9 @@ pub struct AdaptiveBatcher {
     /// Current target batch size.
     current_batch_size: usize,
     /// Velocity samples: (timestamp, cumulative_count).
-    velocity_samples: VecDeque<(Instant, usize)>,
+    velocity_samples: VecDeque<(Instant, u64)>,
     /// Total events seen (for velocity calculation).
-    total_events: usize,
+    total_events: u64,
     /// Last recalculation time.
     last_recalc: Instant,
 }
@@ -48,7 +48,7 @@ impl AdaptiveBatcher {
     /// Call this each time events are drained from the ring buffer.
     #[inline]
     pub fn record_events(&mut self, count: usize) -> usize {
-        self.total_events += count;
+        self.total_events += count as u64;
 
         if !self.config.adaptive {
             return self.config.max_size;

@@ -21,9 +21,9 @@ use async_nats::jetstream::{self, stream::Stream};
 use async_nats::Client;
 use async_trait::async_trait;
 use bytes::Bytes;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 
 use crate::adapter::{Adapter, ShardPollResult};
 use crate::config::JetStreamAdapterConfig;
@@ -111,7 +111,7 @@ impl JetStreamAdapter {
 
         // Check cache first
         {
-            let streams = self.streams.lock().unwrap();
+            let streams = self.streams.lock();
             if let Some(stream) = streams.get(&shard_id) {
                 return Ok(stream.clone());
             }
@@ -156,7 +156,7 @@ impl JetStreamAdapter {
 
         // Cache the stream
         {
-            let mut streams = self.streams.lock().unwrap();
+            let mut streams = self.streams.lock();
             streams.insert(shard_id, stream.clone());
         }
 
@@ -262,7 +262,7 @@ impl Adapter for JetStreamAdapter {
 
         // Clear stream cache
         {
-            let mut streams = self.streams.lock().unwrap();
+            let mut streams = self.streams.lock();
             streams.clear();
         }
 
@@ -277,7 +277,7 @@ impl Adapter for JetStreamAdapter {
         from_id: Option<&str>,
         limit: usize,
     ) -> Result<ShardPollResult, AdapterError> {
-        let stream = self.get_or_create_stream(shard_id).await?;
+        let mut stream = self.get_or_create_stream(shard_id).await?;
 
         // Parse the cursor (sequence number)
         let start_seq = from_id
@@ -291,7 +291,14 @@ impl Adapter for JetStreamAdapter {
         // Get messages directly from the stream
         let mut events = Vec::with_capacity(limit);
         let mut current_seq = start_seq;
-        let max_seq = start_seq + (fetch_limit as u64 * 10); // Limit gap search range
+
+        // Use the stream's actual last sequence to bound the search,
+        // rather than an arbitrary multiplier that can miss events in
+        // streams with large gaps (deletions, compaction).
+        let max_seq = match stream.info().await {
+            Ok(info) => info.state.last_sequence,
+            Err(_) => start_seq.saturating_add(fetch_limit as u64 * 10),
+        };
 
         // Use direct get to fetch messages by sequence
         // Use while loop so gaps don't consume our fetch count

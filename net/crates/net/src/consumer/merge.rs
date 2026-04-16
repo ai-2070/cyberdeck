@@ -748,7 +748,7 @@ mod tests {
 
         assert_eq!(response.events.len(), 2);
         for event in &response.events {
-            assert!(event.raw_str().contains("token"));
+            assert!(event.raw_str().unwrap().contains("token"));
         }
     }
 
