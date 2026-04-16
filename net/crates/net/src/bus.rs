@@ -606,7 +606,9 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                 // during its shutdown sweep could sit in the channel
                 // buffer and be silently dropped.
                 while let Ok(events) = rx.try_recv() {
-                    worker.add_events(events);
+                    if let Some(batch) = worker.add_events(events) {
+                        dispatch_batch(&*adapter, batch, shard_id, adapter_timeout, 0).await;
+                    }
                 }
                 // Flush remaining events (best-effort, no retries)
                 if worker.has_pending() {

@@ -254,11 +254,15 @@ impl ReliabilityMode for ReliableStream {
     }
 
     fn on_receive(&mut self, seq: u64) -> bool {
-        if seq == 0 && !self.received_first {
-            // First packet ever received (sequence 0).
-            self.ack_seq = 0;
-            self.received_first = true;
-            return true;
+        if seq == 0 {
+            if !self.received_first {
+                // First packet ever received (sequence 0).
+                self.ack_seq = 0;
+                self.received_first = true;
+                return true;
+            }
+            // Duplicate of seq 0 after it was already received
+            return false;
         }
 
         if seq == self.ack_seq + 1 {
@@ -782,5 +786,26 @@ mod tests {
         // Normal continuation should still work
         assert!(mode.on_receive(1));
         assert_eq!(mode.ack_seq(), 1);
+    }
+
+    #[test]
+    fn test_regression_seq_zero_after_higher_seqs_rejected() {
+        // Regression: seq 0 arriving after ack_seq had advanced (e.g., to 5)
+        // would pass the `seq == 0 && !received_first` check (false, so it
+        // fell through) and then hit `seq <= self.ack_seq` → duplicate.
+        // That path was correct, but an earlier version without received_first
+        // would have reset ack_seq to 0, moving the window backwards.
+        // This test ensures the fix holds.
+        let mut mode = ReliableStream::new();
+
+        // Receive 0..5 in order
+        for seq in 0..=5 {
+            assert!(mode.on_receive(seq));
+        }
+        assert_eq!(mode.ack_seq(), 5);
+
+        // Late/replayed seq 0 must be rejected and must NOT move ack_seq backwards
+        assert!(!mode.on_receive(0), "late seq 0 must be rejected");
+        assert_eq!(mode.ack_seq(), 5, "ack_seq must not move backwards");
     }
 }
