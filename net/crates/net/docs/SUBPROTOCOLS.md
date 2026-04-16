@@ -78,10 +78,29 @@ pub struct ManifestEntry {
 
 **Subprotocol ID for negotiation itself:** `0x0600`.
 
+## Capability Advertisement
+
+Nodes announce supported subprotocols through the capability graph. `SubprotocolRegistry::enrich_capabilities()` adds a tag `subprotocol:0x{id:04x}` for each handled subprotocol to the node's `CapabilitySet`. This enables capability-driven routing -- a migration request routes to the nearest node advertising `subprotocol:0x0500`.
+
+```rust
+// On node startup: enrich capabilities with subprotocol tags
+let caps = subprotocol_registry.enrich_capabilities(CapabilitySet::new());
+// caps now has tags: "subprotocol:0x0400", "subprotocol:0x0500", etc.
+
+// Other nodes discover migration-capable targets via the index
+let filter = SubprotocolRegistry::capability_filter_for(0x0500);
+let targets = capability_index.query(&filter);
+```
+
+## Migration Handler
+
+`MigrationSubprotocolHandler` dispatches inbound migration messages (0x0500) to the `MigrationOrchestrator`, `MigrationSourceHandler`, or `MigrationTargetHandler` as appropriate. It produces outbound messages with correct destination routing. See [COMPUTE.md](COMPUTE.md) for the full migration protocol.
+
 ## Source Files
 
 | File | Purpose |
 |------|---------|
 | `subprotocol/descriptor.rs` | `SubprotocolDescriptor`, `SubprotocolVersion` |
-| `subprotocol/registry.rs` | `SubprotocolRegistry`, ID-to-handler mapping |
+| `subprotocol/registry.rs` | `SubprotocolRegistry`, ID-to-handler mapping, `enrich_capabilities()` |
 | `subprotocol/negotiation.rs` | `SubprotocolManifest`, `NegotiatedSet`, version negotiation |
+| `subprotocol/migration_handler.rs` | `MigrationSubprotocolHandler`, migration message dispatch |

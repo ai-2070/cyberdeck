@@ -8,6 +8,7 @@
 //! subprotocol forward packets without inspecting the payload.
 
 mod descriptor;
+pub mod migration_handler;
 mod negotiation;
 mod registry;
 
@@ -15,5 +16,6 @@ mod registry;
 pub const SUBPROTOCOL_NEGOTIATION: u16 = 0x0600;
 
 pub use descriptor::{SubprotocolDescriptor, SubprotocolVersion, MANIFEST_ENTRY_SIZE};
+pub use migration_handler::{MigrationSubprotocolHandler, OutboundMigrationMessage};
 pub use negotiation::{negotiate, ManifestEntry, NegotiatedSet, SubprotocolManifest};
 pub use registry::SubprotocolRegistry;

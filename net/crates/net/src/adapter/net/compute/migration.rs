@@ -137,6 +137,15 @@ impl MigrationState {
         Ok(())
     }
 
+    /// Force the phase to a specific value without validation.
+    ///
+    /// Used for multi-chunk snapshots where the orchestrator needs to advance
+    /// past Snapshot without having the full snapshot for `set_snapshot()`.
+    /// The target will validate the reassembled snapshot.
+    pub(crate) fn force_phase(&mut self, phase: MigrationPhase) {
+        self.phase = phase;
+    }
+
     /// Check if migration is finished.
     pub fn is_complete(&self) -> bool {
         self.phase == MigrationPhase::Complete

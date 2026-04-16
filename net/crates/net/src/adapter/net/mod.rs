@@ -63,8 +63,9 @@ pub use channel::{
 };
 pub use compute::{
     DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, DaemonStats, MeshDaemon,
-    MigrationError, MigrationPhase, MigrationState, PlacementDecision, Scheduler, SchedulerError,
-    SUBPROTOCOL_MIGRATION,
+    MigrationError, MigrationMessage, MigrationOrchestrator, MigrationPhase,
+    MigrationSourceHandler, MigrationState, MigrationTargetHandler, PlacementDecision, Scheduler,
+    SchedulerError, SUBPROTOCOL_MIGRATION,
 };
 pub use config::{ConnectionRole, NetAdapterConfig, ReliabilityConfig};
 pub use contested::{
@@ -107,8 +108,9 @@ pub use state::{
 };
 pub use subnet::{DropReason, ForwardDecision, SubnetGateway, SubnetId, SubnetPolicy, SubnetRule};
 pub use subprotocol::{
-    negotiate, NegotiatedSet, SubprotocolDescriptor, SubprotocolManifest, SubprotocolRegistry,
-    SubprotocolVersion, SUBPROTOCOL_NEGOTIATION,
+    negotiate, MigrationSubprotocolHandler, NegotiatedSet, OutboundMigrationMessage,
+    SubprotocolDescriptor, SubprotocolManifest, SubprotocolRegistry, SubprotocolVersion,
+    SUBPROTOCOL_NEGOTIATION,
 };
 pub use swarm::{
     Capabilities, CapabilityAd, EdgeInfo, GraphStats, LocalGraph, NodeInfo, Pingwave, PINGWAVE_SIZE,
