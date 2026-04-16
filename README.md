@@ -19,6 +19,7 @@ Net is what the internet would look like if it were built today, the network sci
 - [Topology](#topology)
 - [Consistency](#consistency)
 - [State, not connections](#state-not-connections)
+- [Mikoshi](#mikoshi)
 - [Invariants](#invariants)
 - [Device autonomy](#device-autonomy)
 - [Processing without storage](#processing-without-storage)
@@ -30,7 +31,6 @@ Net is what the internet would look like if it were built today, the network sci
 - [The industrial latency gap](#the-industrial-latency-gap)
 - [Why not cloud](#why-not-cloud)
 - [Security](#security)
-- [Mikoshi](#mikoshi)
 - [The Blackwall](#the-blackwall)
 - [Implementation](#implementation)
 - [SDKs](#sdks)
@@ -155,6 +155,18 @@ The only authority the mesh respects is physics. Propagation speed, causal order
 Traditional networking treats the connection as the primary object. You establish a socket, maintain it, tear it down. If the connection breaks, the relationship breaks.
 
 Net propagates state. Connections are ephemeral transport - the current shortest path between where state is and where it needs to be. When a path breaks, state doesn't wait for recovery. It moves. The routing table updates, the proximity graph adjusts, the state continues on a different path. No reconnection, no session resumption, no handshake retry. Identity lives in the state chain, not in the socket.
+
+## Mikoshi
+
+In Cyberpunk, Mikoshi is Arasaka's construct for storing engrams — consciousness held in digital space, minds persisting outside their original hardware.
+
+Mikoshi in Net is how daemons move between machines. A running program on one node becomes a running program on another without losing its history, its pending work, or its place in the conversation. The source packages its state, the target unpacks it, and for a brief moment the entity exists on both nodes at once — spreading, superposed, then collapsed onto the target as routing cuts over.
+
+The daemon doesn't know it moved. Neither does anything talking to it. Observer nodes watching the stream see the same causal chain continue uninterrupted, the same sequence numbers, the same entity speaking. The hardware underneath shifted. The stream didn't notice.
+
+What moved wasn't a copy. It was the thing itself, carried across.
+
+A factory controller hops from a dying edge box to a healthy one mid-shift. An inference daemon follows its user from laptop to desktop as they move through the day. A trading agent migrates to a node closer to the exchange without dropping a single tick.
 
 ## Invariants
 
@@ -309,18 +321,6 @@ The mesh is encrypted end-to-end with no trusted intermediaries. This isn't a la
 **No connection state to hijack.** There's no TCP session to take over, no cookie to steal, no sequence number to predict. State propagates through the mesh, not through connections. There's nothing persistent on the wire to attack.
 
 This is different from TLS, where every hop that terminates TLS - load balancers, proxies, CDNs - sees plaintext. The standard web architecture is a chain of trusted intermediaries. Net has no trusted intermediaries. There's nothing to trust them with.
-
-## Mikoshi
-
-In Cyberpunk, Mikoshi is Arasaka's construct for storing engrams — consciousness held in digital space, minds persisting outside their original hardware.
-
-Mikoshi in Net is how daemons move between machines. A running program on one node becomes a running program on another without losing its history, its pending work, or its place in the conversation. The source packages its state, the target unpacks it, and for a brief moment the entity exists on both nodes at once — spreading, superposed, then collapsed onto the target as routing cuts over.
-
-The daemon doesn't know it moved. Neither does anything talking to it. Observer nodes watching the stream see the same causal chain continue uninterrupted, the same sequence numbers, the same entity speaking. The hardware underneath shifted. The stream didn't notice.
-
-What moved wasn't a copy. It was the thing itself, carried across.
-
-A factory controller hops from a dying edge box to a healthy one mid-shift. An inference daemon follows its user from laptop to desktop as they move through the day. A trading agent migrates to a node closer to the exchange without dropping a single tick.
 
 ## The Blackwall
 
