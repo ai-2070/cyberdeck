@@ -113,8 +113,8 @@ impl PrimaryCapabilities {
 }
 
 impl EnhancedPingwave {
-    /// Wire size in bytes
-    pub const SIZE: usize = 64;
+    /// Wire size in bytes (64 base + 8 primary_caps)
+    pub const SIZE: usize = 72;
 
     /// Create a new enhanced pingwave
     pub fn new(origin_id: NodeId, seq: u64, ttl: u8) -> Self {
@@ -164,7 +164,7 @@ impl EnhancedPingwave {
         buf[58..62].copy_from_slice(&self.capability_version.to_le_bytes());
         buf[62] = self.load_level;
         buf[63] = self.health as u8;
-        // primary_caps would go in extended data
+        buf[64..72].copy_from_slice(&self.primary_caps.to_bytes());
         buf
     }
 
@@ -175,6 +175,9 @@ impl EnhancedPingwave {
         }
         let mut origin_id = [0u8; 32];
         origin_id.copy_from_slice(&buf[0..32]);
+
+        let mut caps_buf = [0u8; 8];
+        caps_buf.copy_from_slice(&buf[64..72]);
 
         Some(Self {
             origin_id,
@@ -191,7 +194,7 @@ impl EnhancedPingwave {
                 2 => HealthStatus::Unhealthy,
                 _ => HealthStatus::Unknown,
             },
-            primary_caps: PrimaryCapabilities::default(),
+            primary_caps: PrimaryCapabilities::from_bytes(&caps_buf),
         })
     }
 
@@ -206,7 +209,7 @@ impl EnhancedPingwave {
             return false;
         }
         self.ttl -= 1;
-        self.hop_count += 1;
+        self.hop_count = self.hop_count.saturating_add(1);
         true
     }
 
@@ -602,8 +605,7 @@ impl ProximityGraph {
     pub fn find_best(&self, filter: &CapabilityFilter) -> Option<ProximityNode> {
         self.find_matching(filter).into_iter().min_by(|a, b| {
             a.routing_score(self.config.prefer_low_latency)
-                .partial_cmp(&b.routing_score(self.config.prefer_low_latency))
-                .unwrap()
+                .total_cmp(&b.routing_score(self.config.prefer_low_latency))
         })
     }
 
@@ -612,8 +614,7 @@ impl ProximityGraph {
         let mut matching = self.find_matching(filter);
         matching.sort_by(|a, b| {
             a.routing_score(self.config.prefer_low_latency)
-                .partial_cmp(&b.routing_score(self.config.prefer_low_latency))
-                .unwrap()
+                .total_cmp(&b.routing_score(self.config.prefer_low_latency))
         });
         matching.truncate(k);
         matching
@@ -1026,5 +1027,72 @@ mod tests {
         let stats = graph.cleanup();
         assert_eq!(stats.removed_nodes, 1);
         assert_eq!(graph.node_count(), 0);
+    }
+
+    #[test]
+    fn test_regression_pingwave_primary_caps_survive_roundtrip() {
+        // Regression: EnhancedPingwave::to_bytes/from_bytes did not
+        // serialize primary_caps (gpu, model_slots, etc.), so after
+        // crossing the wire all capabilities were reset to defaults.
+        // This made capability-based routing silently fail for remote
+        // nodes — e.g., `require_gpu: true` never matched anyone.
+        let caps = PrimaryCapabilities {
+            gpu: true,
+            model_slots: 4,
+            memory_tier: 5,
+            tools_bitmap: 0b10101010,
+            flags: 0x12345678,
+        };
+        let pw = EnhancedPingwave::new(make_node_id(1), 42, 3).with_capabilities(0xDEAD, 7, caps);
+
+        let bytes = pw.to_bytes();
+        let parsed = EnhancedPingwave::from_bytes(&bytes).unwrap();
+
+        assert_eq!(
+            parsed.primary_caps.gpu, true,
+            "gpu capability must survive serialization"
+        );
+        assert_eq!(parsed.primary_caps.model_slots, 4);
+        assert_eq!(parsed.primary_caps.memory_tier, 5);
+        assert_eq!(parsed.primary_caps.tools_bitmap, 0b10101010);
+        assert_eq!(parsed.primary_caps.flags, 0x12345678);
+    }
+
+    #[test]
+    fn test_regression_find_best_no_panic_on_nan() {
+        // Regression: find_best() used partial_cmp().unwrap() which
+        // panics on NaN routing scores. Now uses total_cmp().
+        let my_id = make_node_id(1);
+        let graph = ProximityGraph::new(my_id, ProximityConfig::default());
+
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        // Add nodes with very high latency (edge case for routing_score)
+        let pw = EnhancedPingwave::new(make_node_id(2), 1, 3).with_load(0, HealthStatus::Healthy);
+        graph.on_pingwave(pw, from);
+
+        let filter = CapabilityFilter::default();
+        // This should not panic
+        let _best = graph.find_best(&filter);
+        let _k_best = graph.find_k_best(&filter, 5);
+    }
+
+    #[test]
+    fn test_regression_hop_count_saturates() {
+        // Regression: forward() used `hop_count += 1` which wraps at
+        // u8::MAX (255 → 0), making a distant node appear 1 hop away.
+        // Now uses saturating_add.
+        let mut pw = EnhancedPingwave::new(make_node_id(1), 1, 255);
+        pw.hop_count = 254;
+
+        assert!(pw.forward());
+        assert_eq!(pw.hop_count, 255);
+
+        // At 255, saturating_add should keep it at 255
+        assert!(pw.forward());
+        assert_eq!(
+            pw.hop_count, 255,
+            "hop_count should saturate at 255, not wrap to 0"
+        );
     }
 }

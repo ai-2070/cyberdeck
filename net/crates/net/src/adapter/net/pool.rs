@@ -138,11 +138,18 @@ impl PacketBuilder {
         let aad = header.aad();
         let mut header_bytes = header.to_bytes();
 
-        // Encrypt payload in-place and get the counter used
-        let counter = self
-            .cipher
-            .encrypt_in_place(&aad, &mut self.payload)
-            .expect("encryption should not fail");
+        // Encrypt payload in-place and get the counter used.
+        // ChaCha20-Poly1305 encryption cannot fail with valid inputs —
+        // an error here indicates memory corruption or a cipher library bug.
+        let counter = match self.cipher.encrypt_in_place(&aad, &mut self.payload) {
+            Ok(c) => c,
+            Err(e) => panic!(
+                "BUG: ChaCha20-Poly1305 encryption failed (session={:016x}, payload_len={}): {}",
+                self.session_id,
+                self.payload.len(),
+                e
+            ),
+        };
 
         // Patch nonce into serialized header (bytes 12..24)
         header_bytes[12..16].copy_from_slice(&(self.session_id as u32).to_le_bytes());
@@ -265,12 +272,21 @@ impl PacketPool {
         }
     }
 
-    /// Update the encryption key and session ID
+    /// Update the encryption key and session ID.
+    ///
+    /// Drains all pooled builders so that no stale builder can encrypt
+    /// with the old key while sharing a counter that restarted at zero
+    /// (which would cause nonce reuse and break ChaCha20-Poly1305).
+    /// Builders are lazily re-created with the new key on the next `get()`.
     pub fn set_key(&mut self, key: &[u8; 32], session_id: u64) {
         self.key = *key;
         self.session_id = session_id;
         // Reset the shared counter for the new session
         self.tx_counter = Arc::new(AtomicU64::new(0));
+        // Drain all existing builders — they hold the old key and old
+        // counter Arc, so using them risks nonce reuse during the
+        // transition window.
+        while self.builders.pop().is_some() {}
     }
 
     /// Get a builder from the pool
@@ -338,7 +354,7 @@ impl<'a> PooledBuilder<'a> {
     ) -> Bytes {
         self.builder
             .as_mut()
-            .expect("builder taken")
+            .expect("BUG: PooledBuilder used after drop")
             .build(stream_id, sequence, events, flags)
     }
 
@@ -347,7 +363,7 @@ impl<'a> PooledBuilder<'a> {
     pub fn build_handshake(&mut self, payload: &[u8]) -> Bytes {
         self.builder
             .as_mut()
-            .expect("builder taken")
+            .expect("BUG: PooledBuilder used after drop")
             .build_handshake(payload)
     }
 
@@ -356,7 +372,7 @@ impl<'a> PooledBuilder<'a> {
     pub fn build_heartbeat(&mut self) -> Bytes {
         self.builder
             .as_mut()
-            .expect("builder taken")
+            .expect("BUG: PooledBuilder used after drop")
             .build_heartbeat()
     }
 
@@ -365,7 +381,7 @@ impl<'a> PooledBuilder<'a> {
     pub fn would_fit(&self, events: &[Bytes]) -> bool {
         self.builder
             .as_ref()
-            .expect("builder taken")
+            .expect("BUG: PooledBuilder used after drop")
             .would_fit(events)
     }
 }
@@ -636,7 +652,7 @@ impl<'a> ThreadLocalPooledBuilder<'a> {
     ) -> Bytes {
         self.builder
             .as_mut()
-            .expect("builder taken")
+            .expect("BUG: PooledBuilder used after drop")
             .build(stream_id, sequence, events, flags)
     }
 
@@ -645,7 +661,7 @@ impl<'a> ThreadLocalPooledBuilder<'a> {
     pub fn build_handshake(&mut self, payload: &[u8]) -> Bytes {
         self.builder
             .as_mut()
-            .expect("builder taken")
+            .expect("BUG: PooledBuilder used after drop")
             .build_handshake(payload)
     }
 
@@ -654,7 +670,7 @@ impl<'a> ThreadLocalPooledBuilder<'a> {
     pub fn build_heartbeat(&mut self) -> Bytes {
         self.builder
             .as_mut()
-            .expect("builder taken")
+            .expect("BUG: PooledBuilder used after drop")
             .build_heartbeat()
     }
 
@@ -663,7 +679,7 @@ impl<'a> ThreadLocalPooledBuilder<'a> {
     pub fn would_fit(&self, events: &[Bytes]) -> bool {
         self.builder
             .as_ref()
-            .expect("builder taken")
+            .expect("BUG: PooledBuilder used after drop")
             .would_fit(events)
     }
 }
@@ -953,6 +969,68 @@ mod tests {
             "all {} nonces must be unique — found {} duplicates",
             all_nonces.len(),
             all_nonces.len() - unique.len()
+        );
+    }
+
+    #[test]
+    fn test_regression_set_key_drains_stale_builders() {
+        // Regression: PacketPool::set_key created a new tx_counter starting
+        // at 0 but did not drain existing builders from the queue. Those
+        // stale builders still held the old counter (also starting at 0),
+        // so nonces from before and after the key rotation could collide
+        // — a catastrophic nonce-reuse vulnerability for ChaCha20-Poly1305.
+        //
+        // Fix: set_key now drains the queue so stale builders are never
+        // reused. New builders are lazily created with the correct key and
+        // counter on the next get().
+        use std::collections::HashSet;
+
+        let key1 = [0x11u8; 32];
+        let key2 = [0x22u8; 32];
+        let session1 = 0xAAAA;
+        let session2 = 0xBBBB;
+
+        let mut pool = PacketPool::new(4, &key1, session1);
+        let events = vec![Bytes::from_static(b"test")];
+
+        // Build packets with the first key
+        let mut nonces_before = Vec::new();
+        for seq in 0..3u64 {
+            let mut b = pool.get();
+            let pkt = b.build(0, seq, &events, PacketFlags::NONE);
+            let mut nonce = [0u8; 12];
+            nonce.copy_from_slice(&pkt[12..24]);
+            nonces_before.push(nonce);
+        }
+
+        // Rotate key
+        pool.set_key(&key2, session2);
+
+        // All pooled builders should have been drained
+        assert_eq!(
+            pool.available(),
+            0,
+            "set_key must drain stale builders from the pool"
+        );
+
+        // Build packets with the new key — counters restart at 0
+        let mut nonces_after = Vec::new();
+        for seq in 0..3u64 {
+            let mut b = pool.get();
+            let pkt = b.build(0, seq, &events, PacketFlags::NONE);
+            let mut nonce = [0u8; 12];
+            nonce.copy_from_slice(&pkt[12..24]);
+            nonces_after.push(nonce);
+        }
+
+        // Even though counters restarted at 0, the session_id prefix
+        // in the nonce changed, so all nonces must still be unique.
+        let all_nonces: Vec<_> = nonces_before.iter().chain(&nonces_after).collect();
+        let unique: HashSet<_> = all_nonces.iter().collect();
+        assert_eq!(
+            unique.len(),
+            all_nonces.len(),
+            "nonces must not collide across key rotations"
         );
     }
 }

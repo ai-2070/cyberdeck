@@ -11,7 +11,7 @@
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -399,10 +399,15 @@ impl ResourceGuard {
                 .tokens
                 .fetch_add(diff as u64, Ordering::Relaxed);
         } else if diff < 0 {
-            self.enforcer
-                .usage
-                .tokens
-                .fetch_sub((-diff) as u64, Ordering::Relaxed);
+            // Use fetch_update with saturating subtraction to prevent
+            // underflow wrapping the u64 counter to near-MAX, which
+            // would permanently lock out all subsequent requests.
+            let sub = (-diff) as u64;
+            let _ = self.enforcer.usage.tokens.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(sub)),
+            );
         }
         self.claim.tokens = actual_tokens;
     }
@@ -648,7 +653,7 @@ pub trait AuditSink: Send + Sync {
 
 /// In-memory audit log
 struct AuditLog {
-    entries: RwLock<Vec<AuditEntry>>,
+    entries: RwLock<VecDeque<AuditEntry>>,
     config: AuditConfig,
     sink: Option<Box<dyn AuditSink>>,
 }
@@ -656,7 +661,7 @@ struct AuditLog {
 impl AuditLog {
     fn new(config: AuditConfig) -> Self {
         Self {
-            entries: RwLock::new(Vec::with_capacity(config.max_entries)),
+            entries: RwLock::new(VecDeque::with_capacity(config.max_entries)),
             config,
             sink: None,
         }
@@ -684,12 +689,12 @@ impl AuditLog {
             sink.write(&entry);
         }
 
-        // Store in memory
+        // Store in memory (O(1) eviction via VecDeque)
         let mut entries = self.entries.write().unwrap();
         if entries.len() >= self.config.max_entries {
-            entries.remove(0);
+            entries.pop_front();
         }
-        entries.push(entry);
+        entries.push_back(entry);
     }
 
     fn get_entries(&self, limit: usize) -> Vec<AuditEntry> {
@@ -911,6 +916,19 @@ impl SafetyEnforcer {
         self.usage
             .memory_mb
             .fetch_sub(claim.memory_mb, Ordering::Relaxed);
+        // Release tokens and cost that were acquired — without this,
+        // both counters grow monotonically, hitting limits prematurely.
+        let _ = self
+            .usage
+            .tokens
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(claim.tokens as u64))
+            });
+        let _ = self.usage.cost_cents_per_hour.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(claim.cost_cents)),
+        );
     }
 
     /// Trigger the kill switch
@@ -1062,14 +1080,16 @@ impl SafetyEnforcer {
         let limits = &envelope.resource_limits;
 
         // Check concurrent
+        // Use saturating arithmetic to prevent underflow when current > max
+        // (possible if limits were reduced while requests are in-flight).
         let current_concurrent = self.usage.concurrent.load(Ordering::Relaxed);
-        if current_concurrent + claim.concurrent_slots > limits.max_concurrent
+        if current_concurrent.saturating_add(claim.concurrent_slots) > limits.max_concurrent
             && envelope.mode == EnforcementMode::Enforce
         {
             return Err(SafetyViolation::ResourceLimitExceeded {
                 resource: ResourceType::Concurrent,
                 requested: claim.concurrent_slots as u64,
-                available: (limits.max_concurrent - current_concurrent) as u64,
+                available: limits.max_concurrent.saturating_sub(current_concurrent) as u64,
             });
         }
 
@@ -1085,26 +1105,26 @@ impl SafetyEnforcer {
 
         // Check memory
         let current_memory = self.usage.memory_mb.load(Ordering::Relaxed);
-        if current_memory + claim.memory_mb > limits.max_memory_mb
+        if current_memory.saturating_add(claim.memory_mb) > limits.max_memory_mb
             && envelope.mode == EnforcementMode::Enforce
         {
             return Err(SafetyViolation::ResourceLimitExceeded {
                 resource: ResourceType::Memory,
                 requested: claim.memory_mb as u64,
-                available: (limits.max_memory_mb - current_memory) as u64,
+                available: limits.max_memory_mb.saturating_sub(current_memory) as u64,
             });
         }
 
         // Check hourly cost
         self.usage.maybe_reset_hourly();
         let current_cost = self.usage.cost_cents_per_hour.load(Ordering::Relaxed);
-        if current_cost + claim.cost_cents > limits.max_cost_per_hour_cents
+        if current_cost.saturating_add(claim.cost_cents) > limits.max_cost_per_hour_cents
             && envelope.mode == EnforcementMode::Enforce
         {
             return Err(SafetyViolation::ResourceLimitExceeded {
                 resource: ResourceType::Cost,
                 requested: claim.cost_cents as u64,
-                available: (limits.max_cost_per_hour_cents - current_cost) as u64,
+                available: limits.max_cost_per_hour_cents.saturating_sub(current_cost) as u64,
             });
         }
 
@@ -1506,5 +1526,82 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn test_regression_release_decrements_tokens_and_cost() {
+        // Regression: release() only decremented concurrent slots and
+        // memory, but not tokens or cost_cents_per_hour. Both counters
+        // grew monotonically, hitting limits prematurely.
+        let enforcer = Arc::new(SafetyEnforcer::new());
+        let source = make_node_id(1);
+        let req = SafetyRequest::new().with_source(source).with_tokens(500);
+        let claim = ResourceClaim {
+            tokens: 500,
+            concurrent_slots: 1,
+            memory_mb: 100,
+            time_ms: 0,
+            cost_cents: 50,
+        };
+
+        let guard = enforcer.acquire(&req, claim).unwrap();
+
+        // Tokens and cost should be nonzero after acquire
+        assert!(enforcer.usage.tokens.load(Ordering::Relaxed) >= 500);
+        assert!(enforcer.usage.cost_cents_per_hour.load(Ordering::Relaxed) >= 50);
+
+        // Drop the guard (triggers release)
+        drop(guard);
+
+        // Tokens and cost should be decremented back
+        assert_eq!(
+            enforcer.usage.tokens.load(Ordering::Relaxed),
+            0,
+            "tokens should be released on drop"
+        );
+        assert_eq!(
+            enforcer.usage.cost_cents_per_hour.load(Ordering::Relaxed),
+            0,
+            "cost should be released on drop"
+        );
+    }
+
+    #[test]
+    fn test_regression_update_tokens_no_underflow() {
+        // Regression: update_tokens with a lower actual count used
+        // fetch_sub on the global AtomicU64 counter, which wraps to
+        // u64::MAX on underflow — permanently locking out all requests.
+        let enforcer = Arc::new(SafetyEnforcer::new());
+        let source = make_node_id(1);
+        let req = SafetyRequest::new().with_source(source).with_tokens(100);
+        let claim = ResourceClaim {
+            tokens: 100,
+            concurrent_slots: 1,
+            memory_mb: 10,
+            time_ms: 0,
+            cost_cents: 0,
+        };
+
+        let mut guard = enforcer.acquire(&req, claim).unwrap();
+
+        // Simulate actual usage being lower than estimated
+        guard.update_tokens(30);
+
+        // Counter should reflect the difference (subtracted 70)
+        let tokens = enforcer.usage.tokens.load(Ordering::Relaxed);
+        assert!(
+            tokens < u64::MAX / 2,
+            "token counter should not have underflowed (got {})",
+            tokens
+        );
+
+        drop(guard);
+
+        // After release, tokens should be 0 (saturating)
+        let final_tokens = enforcer.usage.tokens.load(Ordering::Relaxed);
+        assert_eq!(
+            final_tokens, 0,
+            "tokens should be 0 after release, not underflowed"
+        );
     }
 }

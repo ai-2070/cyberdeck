@@ -925,7 +925,7 @@ impl RuleEngine {
         // Add to sorted list and re-sort by priority
         self.rules.push(rule_arc);
         self.rules
-            .sort_by(|a, b| b.priority.value().cmp(&a.priority.value()));
+            .sort_by_key(|r| std::cmp::Reverse(r.priority.value()));
 
         Ok(())
     }

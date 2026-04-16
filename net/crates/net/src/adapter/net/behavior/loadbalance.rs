@@ -664,9 +664,10 @@ impl LoadBalancer {
             return Ok(zone_matches);
         }
 
-        // Fallback to any available if configured
-        if available.is_empty() && !zone_matches.is_empty() {
-            return Ok(zone_matches);
+        // No zone matches — check zone_fallback policy
+        if self.config.zone_aware && ctx.client_zone.is_some() && !self.config.zone_fallback {
+            // zone_fallback is disabled: don't fall back to non-zone endpoints
+            return Err(LoadBalancerError::NoEndpointsAvailable);
         }
 
         if available.is_empty() {
@@ -743,7 +744,7 @@ impl LoadBalancer {
                     a.connections.load(Ordering::Relaxed) as f64 / a.effective_weight().max(1.0);
                 let score_b =
                     b.connections.load(Ordering::Relaxed) as f64 / b.effective_weight().max(1.0);
-                score_a.partial_cmp(&score_b).unwrap()
+                score_a.total_cmp(&score_b)
             })
             .unwrap();
 
@@ -812,23 +813,23 @@ impl LoadBalancer {
         if let Some(key) = key {
             let hash = self.hash_key(key);
 
-            // Find nearest node in hash ring
-            for entry in self.hash_ring.iter() {
-                if *entry.key() >= hash {
-                    if let Some(state) = endpoints.iter().find(|e| e.node_id == *entry.value()) {
-                        return Selection {
-                            node_id: state.node_id,
-                            weight: state.weight,
-                            load_score: state.metrics().load_score(),
-                            reason: SelectionReason::ConsistentHash,
-                        };
-                    }
-                }
-            }
+            // Collect and sort hash ring entries — DashMap iteration order is
+            // arbitrary, but consistent hashing requires finding the smallest
+            // key >= hash.
+            let mut ring: Vec<(u64, NodeId)> = self
+                .hash_ring
+                .iter()
+                .map(|entry| (*entry.key(), *entry.value()))
+                .collect();
+            ring.sort_unstable_by_key(|&(k, _)| k);
 
-            // Wrap around to first
-            if let Some(entry) = self.hash_ring.iter().next() {
-                if let Some(state) = endpoints.iter().find(|e| e.node_id == *entry.value()) {
+            // Binary search for the first key >= hash
+            let idx = ring.partition_point(|&(k, _)| k < hash);
+
+            // Try from the found position, wrapping around
+            for i in 0..ring.len() {
+                let (_, node_id) = ring[(idx + i) % ring.len()];
+                if let Some(state) = endpoints.iter().find(|e| e.node_id == node_id) {
                     return Selection {
                         node_id: state.node_id,
                         weight: state.weight,
@@ -849,8 +850,7 @@ impl LoadBalancer {
             .min_by(|a, b| {
                 a.metrics()
                     .avg_response_time_ms
-                    .partial_cmp(&b.metrics().avg_response_time_ms)
-                    .unwrap()
+                    .total_cmp(&b.metrics().avg_response_time_ms)
             })
             .unwrap();
 
@@ -868,8 +868,7 @@ impl LoadBalancer {
             .min_by(|a, b| {
                 a.metrics()
                     .load_score()
-                    .partial_cmp(&b.metrics().load_score())
-                    .unwrap()
+                    .total_cmp(&b.metrics().load_score())
             })
             .unwrap();
 
@@ -1283,5 +1282,120 @@ mod tests {
             let selection = lb.select(&ctx).unwrap();
             assert_eq!(selection.node_id[0], 1);
         }
+    }
+
+    // ---- Regression tests ----
+
+    #[test]
+    fn test_regression_consistent_hash_deterministic() {
+        // Regression: consistent hash iterated DashMap in arbitrary order
+        // instead of sorted order, so the same key could map to different
+        // nodes across calls. Now uses sorted ring + binary search.
+        let lb = LoadBalancer::with_strategy(Strategy::ConsistentHash);
+
+        lb.add_endpoint(Endpoint::new(make_node_id(1)));
+        lb.add_endpoint(Endpoint::new(make_node_id(2)));
+        lb.add_endpoint(Endpoint::new(make_node_id(3)));
+        lb.add_endpoint(Endpoint::new(make_node_id(4)));
+
+        // Many different keys should each consistently map to the same node
+        for i in 0..50 {
+            let key = format!("session-{}", i);
+            let ctx = RequestContext::new().with_routing_key(&key);
+
+            let first = lb.select(&ctx).unwrap().node_id;
+            for _ in 0..20 {
+                let again = lb.select(&ctx).unwrap().node_id;
+                assert_eq!(
+                    first, again,
+                    "consistent hash must return same node for key '{}'",
+                    key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_regression_nan_metrics_no_panic() {
+        // Regression: partial_cmp().unwrap() panicked when metrics
+        // contained NaN. Now uses total_cmp() which handles NaN.
+        let lb = LoadBalancer::with_strategy(Strategy::LeastLatency);
+
+        let mut ep1 = Endpoint::new(make_node_id(1));
+        ep1.metrics.avg_response_time_ms = f64::NAN;
+        lb.add_endpoint(ep1);
+
+        let mut ep2 = Endpoint::new(make_node_id(2));
+        ep2.metrics.avg_response_time_ms = 50.0;
+        lb.add_endpoint(ep2);
+
+        let ctx = RequestContext::new();
+        // Must not panic
+        let result = lb.select(&ctx);
+        assert!(result.is_ok(), "NaN metrics must not panic");
+    }
+
+    #[test]
+    fn test_regression_nan_load_score_no_panic() {
+        // Same NaN regression for LeastLoad strategy.
+        let lb = LoadBalancer::with_strategy(Strategy::LeastLoad);
+
+        let mut ep1 = Endpoint::new(make_node_id(1));
+        ep1.metrics.cpu_usage = f64::NAN;
+        lb.add_endpoint(ep1);
+
+        lb.add_endpoint(Endpoint::new(make_node_id(2)));
+
+        let ctx = RequestContext::new();
+        let result = lb.select(&ctx);
+        assert!(result.is_ok(), "NaN load score must not panic");
+    }
+
+    #[test]
+    fn test_regression_zone_fallback_respected() {
+        // Regression: zone_fallback config was never read. When set to
+        // false, requests with a client_zone that matches no endpoint
+        // should fail, not silently fall back to non-zone endpoints.
+        let config = LoadBalancerConfig {
+            strategy: Strategy::RoundRobin,
+            zone_aware: true,
+            zone_fallback: false, // <-- this was previously ignored
+            ..Default::default()
+        };
+        let lb = LoadBalancer::new(config);
+
+        lb.add_endpoint(Endpoint::new(make_node_id(1)).with_zone("us-west"));
+        lb.add_endpoint(Endpoint::new(make_node_id(2)).with_zone("us-west"));
+
+        // Client is in eu-central — no endpoints match
+        let ctx = RequestContext::new().with_zone("eu-central");
+        let result = lb.select(&ctx);
+
+        assert!(
+            result.is_err(),
+            "with zone_fallback=false, mismatched zone must return error"
+        );
+    }
+
+    #[test]
+    fn test_zone_fallback_true_allows_cross_zone() {
+        // Verify that zone_fallback=true (default) still works correctly.
+        let config = LoadBalancerConfig {
+            strategy: Strategy::RoundRobin,
+            zone_aware: true,
+            zone_fallback: true,
+            ..Default::default()
+        };
+        let lb = LoadBalancer::new(config);
+
+        lb.add_endpoint(Endpoint::new(make_node_id(1)).with_zone("us-west"));
+
+        let ctx = RequestContext::new().with_zone("eu-central");
+        let result = lb.select(&ctx);
+
+        assert!(
+            result.is_ok(),
+            "with zone_fallback=true, cross-zone should succeed"
+        );
     }
 }

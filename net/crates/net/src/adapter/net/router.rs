@@ -208,7 +208,13 @@ impl FairScheduler {
             }
         }
 
-        // If all streams exhausted their quantum, reset and try again
+        // If all streams exhausted their quantum, reset and try again.
+        // Re-collect keys so that streams added since the first snapshot
+        // are also considered — using the stale `keys` vec would miss them.
+        let keys: Vec<u64> = self.streams.iter().map(|e| *e.key()).collect();
+        if keys.is_empty() {
+            return None;
+        }
         let mut has_packets = false;
         for key in &keys {
             if let Some(queue) = self.streams.get(key) {
@@ -220,7 +226,7 @@ impl FairScheduler {
         }
 
         if has_packets {
-            // Try again after reset, still starting from rotated position
+            let start = self.round_robin_idx.load(Ordering::Relaxed) as usize % keys.len();
             for i in 0..keys.len() {
                 let key = keys[(start + i) % keys.len()];
                 if let Some(queue) = self.streams.get(&key) {
@@ -490,11 +496,7 @@ impl NetRouter {
     pub fn stats(&self) -> RouterStats {
         let samples = self.latency_samples.load(Ordering::Relaxed);
         let total_latency = self.total_latency_ns.load(Ordering::Relaxed);
-        let avg_latency = if samples > 0 {
-            total_latency / samples
-        } else {
-            0
-        };
+        let avg_latency = total_latency.checked_div(samples).unwrap_or(0);
 
         RouterStats {
             packets_received: self.packets_received.load(Ordering::Relaxed),
@@ -756,6 +758,46 @@ mod tests {
             1,
             "stream stats should record 1 packet for stream_id 0x{:X}",
             expected_stream_id
+        );
+    }
+
+    #[test]
+    fn test_regression_scheduler_sees_streams_added_after_quantum_exhaustion() {
+        // Regression: dequeue() collected stream keys once, then reused
+        // the stale snapshot for the retry loop after quantum reset.
+        // Streams added between the two loops were invisible until the
+        // next dequeue() call, causing extra latency.
+        //
+        // Fix: re-collect keys before the retry loop.
+        let scheduler = FairScheduler::new(1, 16);
+
+        // Stream 0 with 1 packet (quantum = 1, so first pass drains it)
+        scheduler.enqueue(QueuedPacket {
+            data: Bytes::from_static(b"s0"),
+            dest: "127.0.0.1:9000".parse().unwrap(),
+            stream_id: 0,
+            priority: false,
+            queued_at: Instant::now(),
+        });
+
+        // Drain stream 0's quantum
+        let pkt = scheduler.dequeue().unwrap();
+        assert_eq!(pkt.stream_id, 0);
+
+        // Now add stream 1 while the scheduler is "between rounds"
+        scheduler.enqueue(QueuedPacket {
+            data: Bytes::from_static(b"s1"),
+            dest: "127.0.0.1:9000".parse().unwrap(),
+            stream_id: 1,
+            priority: false,
+            queued_at: Instant::now(),
+        });
+
+        // Next dequeue should find stream 1
+        let pkt = scheduler.dequeue().unwrap();
+        assert_eq!(
+            pkt.stream_id, 1,
+            "newly added stream should be visible after quantum reset"
         );
     }
 }
