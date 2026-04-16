@@ -73,7 +73,9 @@ impl AdaptiveBatcher {
             min_batch_size,
             max_batch_size,
             target_latency_us,
-            avg_batch_latency_us_x1000: AtomicU64::new(target_latency_us * 1000 / 2), // Start at half target
+            // Start at half target, using saturating arithmetic so an
+            // unusually large `target_latency_us` cannot wrap u64.
+            avg_batch_latency_us_x1000: AtomicU64::new(target_latency_us.saturating_mul(1000) / 2),
             queue_depth: AtomicU64::new(0),
             burst_detected: std::sync::atomic::AtomicBool::new(false),
             total_batches: AtomicU64::new(0),
@@ -122,9 +124,14 @@ impl AdaptiveBatcher {
     pub fn record(&self, batch_size: usize, latency_us: u64, queue_depth: usize) {
         // Update exponential moving average (alpha = 0.1)
         // EMA = alpha * new + (1 - alpha) * old
-        // Using fixed-point: new_x1000 = (100 * new + 900 * old) / 1000
+        // Using fixed-point: new_x1000 = (100 * new * 1000 + 900 * old) / 1000
+        //
+        // Saturating arithmetic prevents a pathological `latency_us` (e.g.
+        // from a stuck timer) from wrapping the u64 and corrupting the EMA.
         let old = self.avg_batch_latency_us_x1000.load(Ordering::Relaxed);
-        let new_x1000 = (100 * latency_us * 1000 + 900 * old) / 1000;
+        let new_scaled = latency_us.saturating_mul(100).saturating_mul(1000);
+        let old_scaled = old.saturating_mul(900);
+        let new_x1000 = new_scaled.saturating_add(old_scaled) / 1000;
         self.avg_batch_latency_us_x1000
             .store(new_x1000, Ordering::Relaxed);
 
@@ -355,5 +362,33 @@ mod tests {
         assert!(debug.contains("AdaptiveBatcher"));
         assert!(debug.contains("min_batch_size"));
         assert!(debug.contains("max_batch_size"));
+    }
+
+    #[test]
+    fn test_ema_init_does_not_overflow_on_huge_target() {
+        // Regression: `target_latency_us * 1000 / 2` previously wrapped for
+        // large `target_latency_us`. Saturating arithmetic must keep the
+        // seed within u64 and leave the batcher in a sane state.
+        let batcher = AdaptiveBatcher::with_config(1024, 8192, u64::MAX);
+        // No panic, and the seed is clamped rather than wrapped to a small value.
+        assert!(batcher.avg_latency_us() >= u64::MAX / 2000);
+    }
+
+    #[test]
+    fn test_ema_update_does_not_overflow_on_huge_latency() {
+        // Regression: `100 * latency_us * 1000 + 900 * old` previously
+        // wrapped u64 for pathological inputs. Saturating arithmetic must
+        // clamp to u64::MAX without corrupting the stored EMA.
+        let batcher = AdaptiveBatcher::with_config(1024, 8192, 100);
+        batcher.record(4096, u64::MAX, 10);
+        // No panic in debug; no wrapping in release. EMA should be huge,
+        // not a tiny wrapped value.
+        assert!(batcher.avg_latency_us() > 1_000_000);
+
+        // optimal_size must still return a value within bounds rather than
+        // panicking or returning 0 from an infinity cast.
+        let size = batcher.optimal_size();
+        assert!(size >= batcher.min_batch_size());
+        assert!(size <= batcher.max_batch_size());
     }
 }
