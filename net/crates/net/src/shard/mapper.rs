@@ -421,6 +421,10 @@ impl ShardMapper {
             .collect();
 
         // Use hash to pick among candidates for determinism
+        // Fallback to first active shard if tolerance filter excludes all (e.g. NaN weights)
+        if candidates.is_empty() {
+            return active[0].id;
+        }
         let idx = (event_hash as usize) % candidates.len();
         candidates[idx].id
     }

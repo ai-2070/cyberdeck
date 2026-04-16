@@ -873,7 +873,10 @@ pub extern "C" fn net_poll_ex(
 
     // Allocate events array.
     let events_ptr = if count > 0 {
-        let layout = std::alloc::Layout::array::<NetEvent>(count).unwrap();
+        let layout = match std::alloc::Layout::array::<NetEvent>(count) {
+            Ok(l) => l,
+            Err(_) => return NetError::Unknown.into(),
+        };
         let ptr = unsafe { std::alloc::alloc(layout) as *mut NetEvent };
         if ptr.is_null() {
             return NetError::Unknown.into();
@@ -907,10 +910,10 @@ pub extern "C" fn net_poll_ex(
 
     // Leak next_id if present.
     let next_id_ptr = match response.next_id {
-        Some(ref s) => {
-            let c = std::ffi::CString::new(s.as_str()).unwrap_or_default();
-            c.into_raw()
-        }
+        Some(ref s) => match std::ffi::CString::new(s.as_str()) {
+            Ok(c) => c.into_raw(),
+            Err(_) => return NetError::InvalidUtf8.into(),
+        },
         None => ptr::null_mut(),
     };
 
@@ -957,9 +960,10 @@ pub extern "C" fn net_free_poll_result(result: *mut NetPollResult) {
         }
 
         // Free the events array.
-        let layout = std::alloc::Layout::array::<NetEvent>(result.count).unwrap();
-        unsafe {
-            std::alloc::dealloc(result.events as *mut u8, layout);
+        if let Ok(layout) = std::alloc::Layout::array::<NetEvent>(result.count) {
+            unsafe {
+                std::alloc::dealloc(result.events as *mut u8, layout);
+            }
         }
     }
 
