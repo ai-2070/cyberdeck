@@ -446,13 +446,14 @@ impl SnapshotReassembler {
             return Some(snapshot_bytes);
         }
 
-        let state = self.pending.entry(daemon_origin).or_insert_with(|| {
-            ReassemblyState {
+        let state = self
+            .pending
+            .entry(daemon_origin)
+            .or_insert_with(|| ReassemblyState {
                 total_chunks,
                 seq_through,
                 chunks: std::collections::BTreeMap::new(),
-            }
-        });
+            });
 
         state.chunks.insert(chunk_index, snapshot_bytes);
 
@@ -530,10 +531,13 @@ impl MigrationOrchestrator {
         source_node: u64,
         target_node: u64,
     ) -> Result<MigrationMessage, MigrationError> {
-        // Reject if already migrating
-        if self.migrations.contains_key(&daemon_origin) {
-            return Err(MigrationError::AlreadyMigrating(daemon_origin));
-        }
+        // Atomic check-and-insert via entry() to prevent TOCTOU races
+        let entry = match self.migrations.entry(daemon_origin) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return Err(MigrationError::AlreadyMigrating(daemon_origin));
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => entry,
+        };
 
         let mut state = MigrationState::new(daemon_origin, source_node, target_node);
 
@@ -559,14 +563,11 @@ impl MigrationOrchestrator {
 
             let superposition = SuperpositionState::new(daemon_origin, source_head);
 
-            self.migrations.insert(
-                daemon_origin,
-                Mutex::new(MigrationRecord {
-                    state,
-                    superposition,
-                    started_at: Instant::now(),
-                }),
-            );
+            entry.insert(Mutex::new(MigrationRecord {
+                state,
+                superposition,
+                started_at: Instant::now(),
+            }));
 
             Ok(MigrationMessage::SnapshotReady {
                 daemon_origin,
@@ -579,14 +580,11 @@ impl MigrationOrchestrator {
             let source_head = CausalLink::genesis(daemon_origin, 0);
             let superposition = SuperpositionState::new(daemon_origin, source_head);
 
-            self.migrations.insert(
-                daemon_origin,
-                Mutex::new(MigrationRecord {
-                    state,
-                    superposition,
-                    started_at: Instant::now(),
-                }),
-            );
+            entry.insert(Mutex::new(MigrationRecord {
+                state,
+                superposition,
+                started_at: Instant::now(),
+            }));
 
             Ok(MigrationMessage::TakeSnapshot {
                 daemon_origin,
@@ -641,10 +639,9 @@ impl MigrationOrchestrator {
 
         // Only validate and advance phase on the first chunk
         if chunk_index == 0 && total_chunks == 1 {
-            let snapshot = StateSnapshot::from_bytes(&snapshot_bytes)
-                .ok_or_else(|| {
-                    MigrationError::StateFailed("failed to parse snapshot bytes".into())
-                })?;
+            let snapshot = StateSnapshot::from_bytes(&snapshot_bytes).ok_or_else(|| {
+                MigrationError::StateFailed("failed to parse snapshot bytes".into())
+            })?;
 
             if record.state.phase() == MigrationPhase::Snapshot {
                 record.state.set_snapshot(snapshot)?;
@@ -827,6 +824,13 @@ impl MigrationOrchestrator {
         self.migrations
             .get(&daemon_origin)
             .map(|entry| entry.lock().state.phase())
+    }
+
+    /// Get the source node for an in-flight migration.
+    pub fn source_node(&self, daemon_origin: u32) -> Option<u64> {
+        self.migrations
+            .get(&daemon_origin)
+            .map(|entry| entry.lock().state.source_node())
     }
 
     /// Get the target node for an in-flight migration.

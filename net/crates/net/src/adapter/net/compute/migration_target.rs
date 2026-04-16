@@ -166,7 +166,7 @@ impl MigrationTargetHandler {
         state.pending_events.insert(event.link.sequence, event);
 
         // Try to drain any contiguous events
-        let _ = self.drain_pending(&mut state);
+        self.drain_pending(&mut state)?;
 
         Ok(true)
     }
@@ -330,8 +330,12 @@ mod tests {
         }
     }
 
-    fn make_snapshot(kp: &EntityKeypair, _through_seq: u64, value: u64) -> StateSnapshot {
-        let chain = CausalChainBuilder::new(kp.origin_hash());
+    fn make_snapshot(kp: &EntityKeypair, through_seq: u64, value: u64) -> StateSnapshot {
+        let mut chain = CausalChainBuilder::new(kp.origin_hash());
+        // Advance the chain to the desired sequence so through_seq is correct
+        for _ in 0..through_seq {
+            chain.append(Bytes::from_static(b"x"), 0);
+        }
         StateSnapshot::new(
             kp.entity_id().clone(),
             *chain.head(),
@@ -363,14 +367,14 @@ mod tests {
         assert!(handler.is_migrating(origin));
         assert!(reg.contains(origin));
 
-        // Replay events (note: sequence starts after snapshot's through_seq)
+        // Replay events starting after snapshot's through_seq (10)
         let events = vec![
-            make_event(0xBBBB, 1),
-            make_event(0xBBBB, 2),
-            make_event(0xBBBB, 3),
+            make_event(0xBBBB, 11),
+            make_event(0xBBBB, 12),
+            make_event(0xBBBB, 13),
         ];
         let replayed = handler.replay_events(origin, events).unwrap();
-        assert_eq!(replayed, 3);
+        assert_eq!(replayed, 13);
     }
 
     #[test]

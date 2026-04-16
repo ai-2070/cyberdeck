@@ -60,9 +60,13 @@ impl MigrationSourceHandler {
         daemon_origin: u32,
         target_node: u64,
     ) -> Result<StateSnapshot, MigrationError> {
-        if self.migrations.contains_key(&daemon_origin) {
-            return Err(MigrationError::AlreadyMigrating(daemon_origin));
-        }
+        // Atomic check-and-reserve via entry() to prevent TOCTOU races
+        let entry = match self.migrations.entry(daemon_origin) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return Err(MigrationError::AlreadyMigrating(daemon_origin));
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => entry,
+        };
 
         if !self.daemon_registry.contains(daemon_origin) {
             return Err(MigrationError::DaemonNotFound(daemon_origin));
@@ -76,18 +80,15 @@ impl MigrationSourceHandler {
                 MigrationError::StateFailed("daemon is stateless or snapshot failed".into())
             })?;
 
-        self.migrations.insert(
+        entry.insert(Mutex::new(SourceMigrationState {
             daemon_origin,
-            Mutex::new(SourceMigrationState {
-                daemon_origin,
-                target_node,
-                phase: MigrationPhase::Snapshot,
-                snapshot: Some(snapshot.clone()),
-                buffered_events: Vec::new(),
-                last_buffered_seq: snapshot.through_seq,
-                started_at: Instant::now(),
-            }),
-        );
+            target_node,
+            phase: MigrationPhase::Snapshot,
+            snapshot: Some(snapshot.clone()),
+            buffered_events: Vec::new(),
+            last_buffered_seq: snapshot.through_seq,
+            started_at: Instant::now(),
+        }));
 
         Ok(snapshot)
     }

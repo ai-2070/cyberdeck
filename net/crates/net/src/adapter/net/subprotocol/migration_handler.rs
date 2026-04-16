@@ -145,11 +145,15 @@ impl MigrationSubprotocolHandler {
                     .orchestrator
                     .on_replay_complete(daemon_origin, replayed_seq)?;
 
-                // Send CutoverNotify to source
+                // Send CutoverNotify to source (from_node is the target that reported)
                 if let MigrationMessage::CutoverNotify { .. } = &cutover_msg {
-                    // Send cutover to source node (from_node is the target reporting)
+                    let source_node = self
+                        .orchestrator
+                        .source_node(daemon_origin)
+                        .unwrap_or(from_node);
+
                     outbound.push(OutboundMigrationMessage {
-                        dest_node: from_node,
+                        dest_node: source_node,
                         payload: wire::encode(&cutover_msg),
                     });
                 }
