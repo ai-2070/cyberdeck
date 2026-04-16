@@ -84,7 +84,11 @@ pub struct StaticKeypair {
 impl StaticKeypair {
     /// Generate a new random keypair
     pub fn generate() -> Self {
-        let builder = Builder::new(NOISE_PATTERN.parse().expect("static noise pattern is valid"));
+        let builder = Builder::new(
+            NOISE_PATTERN
+                .parse()
+                .expect("static noise pattern is valid"),
+        );
         let keypair = builder
             .generate_keypair()
             .expect("keypair generation from valid pattern");
