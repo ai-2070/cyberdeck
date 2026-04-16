@@ -1,0 +1,29 @@
+net/crates/net/src/adapter/net/subprotocol/migration_handler.rs
+  d37b393023401171 80-81,83-91,98-99,101,106-107
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  d37b393023401171 33-37,41,45-48,139-140,145-146,228-229,236-237,250-251,365-488,575-576,624-626,632-633,642-647,649-658,661-664,671-672,1048-1049,1058-1059,1064-1174
+net/crates/net/src/adapter/net/compute/mod.rs
+  d37b393023401171 22-25
+net/crates/net/tests/migration_integration.rs
+  d37b393023401171 1-832
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "dc4579de1288492e944f11e0201ed4e79a73da0c",
+  "prompts": {
+    "d37b393023401171": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8de24b1d-4937-4e8f-9712-eb9f68e7e6e4",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1150,
+      "total_deletions": 31,
+      "accepted_lines": 1150,
+      "overriden_lines": 0
+    }
+  }
+}
