@@ -373,16 +373,11 @@ impl EndpointState {
         if open_time.elapsed() < recovery_time {
             return true;
         }
-        // Recovery window elapsed — try to claim the single probe slot.
-        match self.half_open_probe.compare_exchange(
-            false,
-            true,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => false, // This caller is the probe; let it through.
-            Err(_) => true, // Another probe is already in flight.
-        }
+        // Recovery window elapsed — try to claim the single probe slot. If
+        // CAS fails, another probe is in flight and we keep rejecting.
+        self.half_open_probe
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
     }
 }
 
@@ -1483,7 +1478,7 @@ mod tests {
         // mantissa / 2^53 pattern which is strictly in [0, 1).
         for _ in 0..10_000 {
             let r = random_f64();
-            assert!(r >= 0.0 && r < 1.0, "random_f64 out of [0,1): {}", r);
+            assert!((0.0..1.0).contains(&r), "random_f64 out of [0,1): {}", r);
         }
     }
 

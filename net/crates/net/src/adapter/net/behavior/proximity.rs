@@ -1048,8 +1048,8 @@ mod tests {
         let bytes = pw.to_bytes();
         let parsed = EnhancedPingwave::from_bytes(&bytes).unwrap();
 
-        assert_eq!(
-            parsed.primary_caps.gpu, true,
+        assert!(
+            parsed.primary_caps.gpu,
             "gpu capability must survive serialization"
         );
         assert_eq!(parsed.primary_caps.model_slots, 4);
