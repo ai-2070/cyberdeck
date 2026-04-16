@@ -1,0 +1,42 @@
+net/crates/net/src/adapter/net/subprotocol/registry.rs
+  d37b393023401171 10,117-137,157,275-323
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  d37b393023401171 454-476
+net/crates/net/src/adapter/net/compute/scheduler.rs
+  d37b393023401171 10,130-197,297-331,333-387
+net/crates/net/src/adapter/net/subprotocol/migration_handler.rs
+  d9a8d3823a75929a 8,130-132,214,258-259,292
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "e283454e4faf6396fefeb0b31c0d71d641794951",
+  "prompts": {
+    "d37b393023401171": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8de24b1d-4937-4e8f-9712-eb9f68e7e6e4",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 345,
+      "total_deletions": 112,
+      "accepted_lines": 260,
+      "overriden_lines": 1
+    },
+    "d9a8d3823a75929a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a37fb0f6-febe-4c25-b7e2-01acc2fd6ce0",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1233,
+      "total_deletions": 71,
+      "accepted_lines": 12,
+      "overriden_lines": 0
+    }
+  }
+}
