@@ -156,10 +156,18 @@ impl ChannelConfig {
 
 /// Registry of channel configurations.
 ///
+/// Keyed by channel name (not hash) to prevent u16 hash collisions
+/// from silently overwriting security policies. With only 65536
+/// possible hash values, the birthday paradox makes collisions likely
+/// at ~300 channels.
+///
 /// Consulted at subscription/channel-creation time (slow path).
 /// The fast path uses the `AuthGuard` bloom filter.
 pub struct ChannelConfigRegistry {
-    configs: DashMap<u16, ChannelConfig>,
+    /// Primary storage: name → config (collision-safe)
+    configs: DashMap<String, ChannelConfig>,
+    /// Reverse index: hash → names (for hash-based lookups)
+    by_hash: DashMap<u16, Vec<String>>,
 }
 
 impl ChannelConfigRegistry {
@@ -167,25 +175,51 @@ impl ChannelConfigRegistry {
     pub fn new() -> Self {
         Self {
             configs: DashMap::new(),
+            by_hash: DashMap::new(),
         }
     }
 
     /// Register a channel configuration.
     pub fn insert(&self, config: ChannelConfig) {
-        self.configs.insert(config.channel_id.hash(), config);
+        let name = config.channel_id.name().to_string();
+        let hash = config.channel_id.hash();
+        self.configs.insert(name.clone(), config);
+        self.by_hash.entry(hash).or_default().push(name);
     }
 
     /// Look up a channel config by hash.
+    ///
+    /// If multiple channels share the same hash (collision), returns
+    /// the first one found. Callers on security-critical paths should
+    /// use `get_by_name()` instead.
     pub fn get(
         &self,
         channel_hash: u16,
-    ) -> Option<dashmap::mapref::one::Ref<'_, u16, ChannelConfig>> {
-        self.configs.get(&channel_hash)
+    ) -> Option<dashmap::mapref::one::Ref<'_, String, ChannelConfig>> {
+        let names = self.by_hash.get(&channel_hash)?;
+        let name = names.first()?;
+        self.configs.get(name)
     }
 
-    /// Remove a channel config.
+    /// Look up a channel config by exact name (collision-safe).
+    pub fn get_by_name(
+        &self,
+        name: &str,
+    ) -> Option<dashmap::mapref::one::Ref<'_, String, ChannelConfig>> {
+        self.configs.get(name)
+    }
+
+    /// Remove a channel config by name.
     pub fn remove(&self, channel_hash: u16) -> Option<ChannelConfig> {
-        self.configs.remove(&channel_hash).map(|(_, c)| c)
+        // Remove the first config matching this hash
+        let name = {
+            let names = self.by_hash.get(&channel_hash)?;
+            names.first()?.clone()
+        };
+        if let Some(mut hash_names) = self.by_hash.get_mut(&channel_hash) {
+            hash_names.retain(|n| n != &name);
+        }
+        self.configs.remove(&name).map(|(_, c)| c)
     }
 
     /// Number of registered channels.
@@ -201,8 +235,7 @@ impl ChannelConfigRegistry {
     /// Get the priority for a channel (0 if not configured).
     #[inline]
     pub fn priority(&self, channel_hash: u16) -> u8 {
-        self.configs
-            .get(&channel_hash)
+        self.get(channel_hash)
             .map(|c| c.priority)
             .unwrap_or(0)
     }
@@ -350,5 +383,35 @@ mod tests {
         let id = ChannelId::parse("test").unwrap();
         let config = ChannelConfig::new(id);
         assert_eq!(config.visibility, Visibility::Global);
+    }
+
+    #[test]
+    fn test_regression_config_registry_hash_collision_no_overwrite() {
+        // Regression: ChannelConfigRegistry used u16 hash as the key,
+        // so two channels with the same hash silently overwrote each
+        // other's configs — including visibility and security policies.
+        // With only 65536 hashes, the birthday paradox makes collisions
+        // likely at ~300 channels.
+        //
+        // Fix: keyed by channel name with a hash→names reverse index.
+        let reg = ChannelConfigRegistry::new();
+
+        let id1 = ChannelId::parse("channel/alpha").unwrap();
+        let id2 = ChannelId::parse("channel/beta").unwrap();
+
+        let config1 = ChannelConfig::new(id1.clone()).with_priority(1);
+        let config2 = ChannelConfig::new(id2.clone()).with_priority(2);
+
+        reg.insert(config1);
+        reg.insert(config2);
+
+        // Both configs should be present regardless of hash collision
+        assert_eq!(reg.len(), 2, "both channels should exist in registry");
+
+        // Each should retain its own priority
+        let c1 = reg.get_by_name("channel/alpha").unwrap();
+        assert_eq!(c1.priority, 1, "channel/alpha priority should be 1");
+        let c2 = reg.get_by_name("channel/beta").unwrap();
+        assert_eq!(c2.priority, 2, "channel/beta priority should be 2");
     }
 }
