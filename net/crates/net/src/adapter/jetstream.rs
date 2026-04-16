@@ -21,9 +21,9 @@ use async_nats::jetstream::{self, stream::Stream};
 use async_nats::Client;
 use async_trait::async_trait;
 use bytes::Bytes;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use parking_lot::Mutex;
 
 use crate::adapter::{Adapter, ShardPollResult};
 use crate::config::JetStreamAdapterConfig;
