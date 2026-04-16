@@ -320,6 +320,8 @@ The daemon doesn't know it moved. Neither does anything talking to it. Observer 
 
 What moved wasn't a copy. It was the thing itself, carried across.
 
+A factory controller hops from a dying edge box to a healthy one mid-shift. An inference daemon follows its user from laptop to desktop as they move through the day. A trading agent migrates to a node closer to the exchange without dropping a single tick.
+
 ## The Blackwall
 
 In Cyberpunk, the Blackwall isn't a wall around the threats. It's a wall around the safe zone. The public net is a small, whitelisted set of servers that Netwatch has cleared. Everything outside - private corps nets, data forts, rogue AIs, uncleared infrastructure - is the vast majority. The wall protects the known from the unknown.
