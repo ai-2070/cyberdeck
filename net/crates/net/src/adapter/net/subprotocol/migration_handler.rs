@@ -103,16 +103,7 @@ impl MigrationSubprotocolHandler {
                 if let MigrationMessage::SnapshotReady { .. } = &forward {
                     let target_node = self
                         .orchestrator
-                        .status(daemon_origin)
-                        .map(|_| {
-                            // Get target from migration list
-                            self.orchestrator
-                                .list_migrations()
-                                .iter()
-                                .find(|(origin, _, _)| *origin == daemon_origin)
-                                .map(|_| 0u64) // placeholder — target is known from start_migration
-                        })
-                        .flatten()
+                        .target_node(daemon_origin)
                         .unwrap_or(from_node);
 
                     outbound.push(OutboundMigrationMessage {

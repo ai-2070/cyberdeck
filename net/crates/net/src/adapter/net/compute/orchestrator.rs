@@ -667,6 +667,13 @@ impl MigrationOrchestrator {
             .map(|entry| entry.lock().state.phase())
     }
 
+    /// Get the target node for an in-flight migration.
+    pub fn target_node(&self, daemon_origin: u32) -> Option<u64> {
+        self.migrations
+            .get(&daemon_origin)
+            .map(|entry| entry.lock().state.target_node())
+    }
+
     /// Get superposition phase for a daemon.
     pub fn superposition_phase(
         &self,

@@ -203,7 +203,7 @@ impl MigrationTargetHandler {
 
     /// Abort migration — unregister daemon and clean up.
     pub fn abort(&self, daemon_origin: u32) -> Result<(), MigrationError> {
-        if let Some(_) = self.migrations.remove(&daemon_origin) {
+        if self.migrations.remove(&daemon_origin).is_some() {
             // Unregister daemon (it's not authoritative, source still has it)
             let _ = self.daemon_registry.unregister(daemon_origin);
         }
@@ -330,7 +330,7 @@ mod tests {
         }
     }
 
-    fn make_snapshot(kp: &EntityKeypair, through_seq: u64, value: u64) -> StateSnapshot {
+    fn make_snapshot(kp: &EntityKeypair, _through_seq: u64, value: u64) -> StateSnapshot {
         let chain = CausalChainBuilder::new(kp.origin_hash());
         StateSnapshot::new(
             kp.entity_id().clone(),
