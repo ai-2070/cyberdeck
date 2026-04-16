@@ -145,7 +145,7 @@ Snapshots larger than 7,000 bytes (fitting within the 8,192-byte MTU) are automa
 | `MAX_SNAPSHOT_SIZE` | ~28 TB (`u32::MAX` chunks x 7,000 bytes) | `chunk_index: u32` / `total_chunks: u32` |
 | `StateSnapshot` wire format | ~4 GB | `state_len: u32` in `to_bytes()` |
 
-The practical limit is the `StateSnapshot` serialization at ~4 GB. Oversized snapshots return `MigrationError::SnapshotTooLarge` with the actual and maximum sizes rather than panicking.
+The practical limit is the `StateSnapshot` serialization at ~4 GB (`state_len: u32`). At present, snapshots beyond that limit panic in `to_bytes()`; `MigrationError::SnapshotTooLarge` applies to chunk-count overflow at `MAX_SNAPSHOT_SIZE` (~28 TB).
 
 ### Capability Advertisement
 
