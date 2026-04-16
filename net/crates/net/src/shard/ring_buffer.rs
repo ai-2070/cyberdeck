@@ -51,9 +51,21 @@ pub struct RingBuffer<T> {
     head: CachePadded<AtomicUsize>,
     /// Read position (consumer).
     tail: CachePadded<AtomicUsize>,
+    /// Thread ID of the producer (debug-mode SPSC enforcement).
+    #[cfg(debug_assertions)]
+    producer_thread: std::sync::Mutex<Option<std::thread::ThreadId>>,
+    /// Thread ID of the consumer (debug-mode SPSC enforcement).
+    #[cfg(debug_assertions)]
+    consumer_thread: std::sync::Mutex<Option<std::thread::ThreadId>>,
 }
 
-// Safety: We ensure proper synchronization via atomics.
+// Safety: The ring buffer is SPSC (single-producer, single-consumer).
+// Atomics ensure correct visibility between the one producer and one
+// consumer thread. Callers MUST NOT call try_push / pop_batch from
+// multiple threads simultaneously — doing so is undefined behavior.
+// In debug builds, this invariant is checked at runtime via thread-ID
+// tracking; violations panic immediately.
+//
 // T must be Send because elements are transferred between threads.
 unsafe impl<T: Send> Send for RingBuffer<T> {}
 unsafe impl<T: Send> Sync for RingBuffer<T> {}
@@ -79,6 +91,10 @@ impl<T> RingBuffer<T> {
             mask: capacity - 1,
             head: CachePadded::new(AtomicUsize::new(0)),
             tail: CachePadded::new(AtomicUsize::new(0)),
+            #[cfg(debug_assertions)]
+            producer_thread: std::sync::Mutex::new(None),
+            #[cfg(debug_assertions)]
+            consumer_thread: std::sync::Mutex::new(None),
         }
     }
 
@@ -92,6 +108,23 @@ impl<T> RingBuffer<T> {
     /// external synchronization.
     #[inline]
     pub fn try_push(&self, value: T) -> Result<(), BufferFullError> {
+        #[cfg(debug_assertions)]
+        {
+            let current = std::thread::current().id();
+            let mut guard = self
+                .producer_thread
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(tid) = *guard {
+                assert_eq!(
+                    tid, current,
+                    "SPSC violation: try_push called from multiple threads"
+                );
+            } else {
+                *guard = Some(current);
+            }
+        }
+
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Acquire);
 
@@ -123,6 +156,23 @@ impl<T> RingBuffer<T> {
     /// external synchronization.
     #[inline]
     pub fn try_pop(&self) -> Option<T> {
+        #[cfg(debug_assertions)]
+        {
+            let current = std::thread::current().id();
+            let mut guard = self
+                .consumer_thread
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(tid) = *guard {
+                assert_eq!(
+                    tid, current,
+                    "SPSC violation: try_pop called from multiple threads"
+                );
+            } else {
+                *guard = Some(current);
+            }
+        }
+
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
 
@@ -147,6 +197,23 @@ impl<T> RingBuffer<T> {
     /// reduces atomic operations.
     #[inline]
     pub fn pop_batch(&self, max: usize) -> Vec<T> {
+        #[cfg(debug_assertions)]
+        {
+            let current = std::thread::current().id();
+            let mut guard = self
+                .consumer_thread
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(tid) = *guard {
+                assert_eq!(
+                    tid, current,
+                    "SPSC violation: pop_batch called from multiple threads"
+                );
+            } else {
+                *guard = Some(current);
+            }
+        }
+
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
 
@@ -209,6 +276,21 @@ impl<T> RingBuffer<T> {
 
 impl<T> Drop for RingBuffer<T> {
     fn drop(&mut self) {
+        // Reset thread tracking — &mut self guarantees exclusive access,
+        // so draining from any thread is safe here. unwrap_or_else
+        // recovers from poisoned mutexes (a spawned thread may have
+        // panicked during SPSC violation detection).
+        #[cfg(debug_assertions)]
+        {
+            *self
+                .producer_thread
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            *self
+                .consumer_thread
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+        }
         // Drop any remaining elements
         while self.try_pop().is_some() {}
     }
@@ -449,5 +531,62 @@ mod tests {
             }
             assert!(buf.is_empty());
         }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_regression_spsc_multi_producer_detected() {
+        // Regression: the SPSC ring buffer exposed &self methods with an
+        // unsafe Sync impl, meaning safe code could call try_push from
+        // multiple threads — causing silent data corruption.
+        //
+        // Fix: debug builds now track the producer/consumer thread IDs
+        // and panic on violation.
+        use std::sync::Arc;
+        use std::thread;
+
+        let buf = Arc::new(RingBuffer::new(1024));
+
+        // Pin the producer identity from thread A
+        buf.try_push(1).unwrap();
+
+        // Attempt push from thread B — should panic inside the thread
+        let buf2 = buf.clone();
+        let result = thread::spawn(move || {
+            buf2.try_push(2).unwrap();
+        })
+        .join();
+
+        assert!(
+            result.is_err(),
+            "SPSC violation should be detected when two threads push"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_regression_spsc_multi_consumer_detected() {
+        // Same as above but for the consumer side.
+        use std::sync::Arc;
+        use std::thread;
+
+        let buf = Arc::new(RingBuffer::new(1024));
+        buf.try_push(1).unwrap();
+        buf.try_push(2).unwrap();
+
+        // Pin the consumer identity from thread A
+        let _ = buf.try_pop();
+
+        // Attempt pop from thread B — should panic inside the thread
+        let buf2 = buf.clone();
+        let result = thread::spawn(move || {
+            let _ = buf2.try_pop();
+        })
+        .join();
+
+        assert!(
+            result.is_err(),
+            "SPSC violation should be detected when two threads pop"
+        );
     }
 }

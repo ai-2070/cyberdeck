@@ -202,8 +202,7 @@ impl ReliableStream {
 
     /// Check if there are gaps in received sequences
     fn has_gaps(&self) -> bool {
-        // If sack_bitmap has any zeros before the first set bit, there are gaps
-        self.sack_bitmap != 0 && self.sack_bitmap.trailing_zeros() > 0
+        self.missing_bitmap() != 0
     }
 
     /// Get bitmap of missing sequences
@@ -231,15 +230,20 @@ impl Default for ReliableStream {
 
 impl ReliabilityMode for ReliableStream {
     fn on_send(&mut self, seq: u64, packet: Bytes) {
-        // Only track if we have room
-        if self.pending.len() < self.max_pending {
-            self.pending.push_back(UnackedPacket {
-                seq,
-                packet,
-                sent_at: Instant::now(),
-                retries: 0,
-            });
+        // Evict oldest unacked packet if window is full so that the
+        // newest packet is always tracked for retransmission.  Without
+        // this, packets sent when the window is full are silently lost
+        // from the retransmit buffer even though they were sent on the
+        // wire — a gap the receiver can never recover via NACK.
+        if self.pending.len() >= self.max_pending {
+            self.pending.pop_front();
         }
+        self.pending.push_back(UnackedPacket {
+            seq,
+            packet,
+            sent_at: Instant::now(),
+            retries: 0,
+        });
     }
 
     fn on_receive(&mut self, seq: u64) -> bool {
@@ -651,5 +655,93 @@ mod tests {
             timed_out.is_empty(),
             "packet should stop being retransmitted after max_retries"
         );
+    }
+
+    #[test]
+    fn test_regression_has_gaps_misses_interior_holes() {
+        // Regression: has_gaps() used `trailing_zeros() > 0` which relied
+        // on the subtle invariant that bit 0 of sack_bitmap is always 0
+        // after on_receive returns. The old code was accidentally correct
+        // but fragile — any refactor of on_receive could silently break
+        // gap detection.
+        //
+        // Fix: has_gaps() now delegates to missing_bitmap() != 0, which
+        // is correct by construction regardless of bitmap invariants.
+        let mut mode = ReliableStream::new();
+
+        // Receive 1, 2, 4 — gap at 3
+        assert!(mode.on_receive(1));
+        assert!(mode.on_receive(2));
+        assert!(mode.on_receive(4));
+
+        assert_eq!(mode.ack_seq(), 2);
+
+        let nack = mode.build_nack().unwrap();
+        let missing: Vec<u64> = nack.missing_sequences().collect();
+        assert!(missing.contains(&3), "should detect gap at seq 3");
+    }
+
+    #[test]
+    fn test_regression_has_gaps_with_filled_first_slot() {
+        // Verify has_gaps detects interior holes even when sequences
+        // immediately after ack_seq are present.
+        let mut mode = ReliableStream::new();
+
+        // Receive 1, 3, 5, 7 — gaps at 2, 4, 6
+        assert!(mode.on_receive(1));
+        assert!(mode.on_receive(3));
+        assert!(mode.on_receive(5));
+        assert!(mode.on_receive(7));
+
+        assert_eq!(mode.ack_seq(), 1);
+
+        let nack = mode.build_nack().expect("should detect gaps");
+        let missing: Vec<u64> = nack.missing_sequences().collect();
+        assert!(missing.contains(&2), "should detect gap at seq 2");
+        assert!(missing.contains(&4), "should detect gap at seq 4");
+        assert!(missing.contains(&6), "should detect gap at seq 6");
+        assert_eq!(missing.len(), 3);
+    }
+
+    #[test]
+    fn test_regression_on_send_evicts_oldest_when_full() {
+        // Regression: on_send silently dropped packets when the pending
+        // queue was full. The packet was sent on the wire but never
+        // recorded for retransmission, so if lost it could never be
+        // recovered via NACK — silently degrading reliability.
+        //
+        // Fix: on_send now evicts the oldest unacked packet to make room,
+        // so the most recent packets are always tracked.
+        let mut mode = ReliableStream::with_settings(
+            Duration::from_millis(50),
+            4, // max 4 pending
+            3,
+        );
+
+        // Send 6 packets (exceeds max_pending of 4)
+        for seq in 0..6u64 {
+            mode.on_send(seq, Bytes::from(format!("pkt-{}", seq)));
+        }
+
+        // Should still have exactly max_pending packets tracked
+        assert_eq!(
+            mode.pending.len(),
+            4,
+            "pending queue should be at max_pending"
+        );
+
+        // The oldest packets (0, 1) should have been evicted;
+        // the newest (2, 3, 4, 5) should be retained.
+        let seqs: Vec<u64> = mode.pending.iter().map(|p| p.seq).collect();
+        assert_eq!(seqs, vec![2, 3, 4, 5], "should retain the most recent packets");
+
+        // NACK for packet 5 should succeed (it's tracked)
+        let nack = NackPayload {
+            ack_seq: 4,
+            missing_bitmap: 0b01, // missing seq 5
+        };
+        let retransmits = mode.on_nack(&nack);
+        assert_eq!(retransmits.len(), 1);
+        assert_eq!(&retransmits[0][..], b"pkt-5");
     }
 }

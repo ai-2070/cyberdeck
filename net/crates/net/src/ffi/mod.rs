@@ -80,6 +80,11 @@ use std::ffi::CString;
 pub struct NetHandle {
     bus: EventBus,
     runtime: Runtime,
+    /// Set to `true` once `net_shutdown` begins. All other FFI functions
+    /// check this flag and return `ShuttingDown` early, reducing the
+    /// window for use-after-free when a C caller races shutdown against
+    /// concurrent operations.
+    shutting_down: std::sync::atomic::AtomicBool,
 }
 
 /// Error codes returned by FFI functions.
@@ -110,6 +115,21 @@ pub enum NetError {
 impl From<NetError> for c_int {
     fn from(e: NetError) -> Self {
         e as c_int
+    }
+}
+
+/// Check whether the handle is shutting down. Returns `ShuttingDown` error
+/// code if the flag is set, reducing the use-after-free window when a C
+/// caller races `net_shutdown` against concurrent operations.
+#[inline]
+fn check_shutting_down(handle: &NetHandle) -> Option<c_int> {
+    if handle
+        .shutting_down
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        Some(NetError::ShuttingDown.into())
+    } else {
+        None
     }
 }
 
@@ -335,7 +355,11 @@ fn create_with_config(runtime: Runtime, config: EventBusConfig) -> *mut NetHandl
         Err(_) => return ptr::null_mut(),
     };
 
-    let handle = Box::new(NetHandle { bus, runtime });
+    let handle = Box::new(NetHandle {
+        bus,
+        runtime,
+        shutting_down: std::sync::atomic::AtomicBool::new(false),
+    });
 
     Box::into_raw(handle)
 }
@@ -363,6 +387,9 @@ pub extern "C" fn net_ingest(
     }
 
     let handle = unsafe { &*handle };
+    if let Some(err) = check_shutting_down(handle) {
+        return err;
+    }
 
     // Parse event JSON
     let json_bytes = unsafe { std::slice::from_raw_parts(event_json as *const u8, len) };
@@ -405,6 +432,9 @@ pub extern "C" fn net_ingest_raw(handle: *mut NetHandle, json: *const c_char, le
     }
 
     let handle = unsafe { &*handle };
+    if let Some(err) = check_shutting_down(handle) {
+        return err;
+    }
 
     let json_bytes = unsafe { std::slice::from_raw_parts(json as *const u8, len) };
     let json_str = match std::str::from_utf8(json_bytes) {
@@ -447,6 +477,9 @@ pub extern "C" fn net_ingest_raw_batch(
     }
 
     let handle = unsafe { &*handle };
+    if let Some(err) = check_shutting_down(handle) {
+        return err;
+    }
     let mut events = Vec::with_capacity(count);
 
     for i in 0..count {
@@ -484,6 +517,9 @@ pub extern "C" fn net_ingest_batch(handle: *mut NetHandle, events_json: *const c
     }
 
     let handle = unsafe { &*handle };
+    if let Some(err) = check_shutting_down(handle) {
+        return err;
+    }
 
     let json_str = match unsafe { CStr::from_ptr(events_json) }.to_str() {
         Ok(s) => s,
@@ -528,6 +564,9 @@ pub extern "C" fn net_poll(
     }
 
     let handle = unsafe { &*handle };
+    if let Some(err) = check_shutting_down(handle) {
+        return err;
+    }
 
     // Parse request
     let request = if request_json.is_null() {
@@ -613,6 +652,9 @@ pub extern "C" fn net_stats(
     }
 
     let handle = unsafe { &*handle };
+    if let Some(err) = check_shutting_down(handle) {
+        return err;
+    }
     let stats = handle.bus.stats();
     let shard_stats = handle.bus.shard_stats();
 
@@ -664,6 +706,9 @@ pub extern "C" fn net_flush(handle: *mut NetHandle) -> c_int {
     }
 
     let handle = unsafe { &*handle };
+    if let Some(err) = check_shutting_down(handle) {
+        return err;
+    }
 
     match handle.runtime.block_on(handle.bus.flush()) {
         Ok(_) => NetError::Success.into(),
@@ -687,8 +732,16 @@ pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
         return NetError::NullPointer.into();
     }
 
+    // Signal shutdown *before* taking ownership so that concurrent FFI
+    // calls on other threads see the flag and bail out early, reducing
+    // the use-after-free window.
+    let handle_ref = unsafe { &*handle };
+    handle_ref
+        .shutting_down
+        .store(true, std::sync::atomic::Ordering::Release);
+
     let handle = unsafe { Box::from_raw(handle) };
-    let NetHandle { bus, runtime } = *handle;
+    let NetHandle { bus, runtime, .. } = *handle;
 
     // Flush pending batches and gracefully shut down the adapter
     // before dropping the runtime. Without this, pending events in
@@ -716,6 +769,12 @@ pub extern "C" fn net_num_shards(handle: *mut NetHandle) -> u16 {
         return 0;
     }
     let handle = unsafe { &*handle };
+    if handle
+        .shutting_down
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return 0;
+    }
     handle.bus.num_shards()
 }
 
@@ -834,6 +893,9 @@ pub extern "C" fn net_ingest_raw_ex(
     }
 
     let handle = unsafe { &*handle };
+    if let Some(err) = check_shutting_down(handle) {
+        return err;
+    }
 
     let json_bytes = unsafe { std::slice::from_raw_parts(json as *const u8, len) };
     let json_str = match std::str::from_utf8(json_bytes) {
@@ -872,6 +934,9 @@ pub extern "C" fn net_poll_ex(
     }
 
     let handle = unsafe { &*handle };
+    if let Some(err) = check_shutting_down(handle) {
+        return err;
+    }
 
     let mut request = ConsumeRequest::new(limit);
     if !cursor.is_null() {
@@ -1008,6 +1073,9 @@ pub extern "C" fn net_stats_ex(handle: *mut NetHandle, out: *mut NetStats) -> c_
     }
 
     let handle = unsafe { &*handle };
+    if let Some(err) = check_shutting_down(handle) {
+        return err;
+    }
     let stats = handle.bus.stats();
 
     unsafe {
