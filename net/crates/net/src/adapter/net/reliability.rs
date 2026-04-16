@@ -268,6 +268,7 @@ impl ReliabilityMode for ReliableStream {
         if seq == self.ack_seq + 1 {
             // Next expected sequence
             self.ack_seq = seq;
+            self.received_first = true;
             // Shift bitmap since we advanced by 1
             self.sack_bitmap >>= 1;
 
@@ -281,6 +282,7 @@ impl ReliabilityMode for ReliableStream {
             // Future sequence within window - mark in SACK bitmap
             let offset = seq - self.ack_seq - 1;
             self.sack_bitmap |= 1 << offset;
+            self.received_first = true;
             true
         } else if seq <= self.ack_seq {
             // Duplicate (already received)
@@ -807,5 +809,24 @@ mod tests {
         // Late/replayed seq 0 must be rejected and must NOT move ack_seq backwards
         assert!(!mode.on_receive(0), "late seq 0 must be rejected");
         assert_eq!(mode.ack_seq(), 5, "ack_seq must not move backwards");
+    }
+
+    #[test]
+    fn test_regression_seq_zero_rejected_when_stream_starts_at_one() {
+        // Regression: received_first was only set in the seq==0 branch.
+        // If a stream starts at seq 1 (seq 0 never sent), received_first
+        // stayed false. A late/spurious seq 0 would then be accepted and
+        // reset ack_seq to 0, corrupting the entire stream window.
+        let mut mode = ReliableStream::new();
+
+        // Stream starts at seq 1 (seq 0 was never sent)
+        assert!(mode.on_receive(1));
+        assert!(mode.on_receive(2));
+        assert!(mode.on_receive(3));
+        assert_eq!(mode.ack_seq(), 3);
+
+        // Spurious seq 0 must be rejected
+        assert!(!mode.on_receive(0), "seq 0 must be rejected after stream advanced past it");
+        assert_eq!(mode.ack_seq(), 3, "ack_seq must not reset to 0");
     }
 }
