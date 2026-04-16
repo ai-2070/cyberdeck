@@ -24,6 +24,7 @@ For the design philosophy, architecture rationale, and benchmarks, see the [proj
 - [Building](#building)
 - [Tests](#tests)
 - [Benchmarks](#benchmarks)
+- [Test Architecture](#test-architecture)
 - [Subprotocol ID Space](#subprotocol-id-space)
 - [License](#license)
 
@@ -578,6 +579,28 @@ cargo test --test integration_redis --features redis
 cargo test --test integration_jetstream --features jetstream
 ```
 
+### Test Architecture
+
+Unit tests live in `#[cfg(test)]` modules alongside the code they test. Each migration module (orchestrator, source handler, target handler, subprotocol handler) has isolated tests covering happy paths, error paths, and edge cases.
+
+Integration tests in `tests/migration_integration.rs` exercise the full migration system across module boundaries:
+
+| Category | What it validates |
+|----------|-------------------|
+| **Phase chain** | All 6 phases sequenced end-to-end through the orchestrator, with and without buffered events |
+| **End-to-end** | Source handler → orchestrator → target handler composing correctly: snapshot, buffer, restore, replay, cutover, cleanup. Verifies daemon moves between registries. |
+| **Auto-target** | Scheduler-driven target selection via `CapabilityIndex` queries for `subprotocol:0x0500` |
+| **Handler dispatch** | Each `MigrationMessage` variant dispatched through `MigrationSubprotocolHandler`, verifying correct outbound message types |
+| **Handler routing** | Outbound `dest_node` assertions — CutoverNotify reaches source, SnapshotReady reaches target, CleanupComplete reaches orchestrator |
+| **Snapshot chunking** | Small (single-chunk), large (multi-chunk), out-of-order reassembly, duplicate chunks, chunk count boundaries |
+| **Event flow** | Events buffered on source during migration → drained → replayed on target → daemon stats verify processing |
+| **Concurrency** | Two daemons migrating simultaneously without interference |
+| **Abort** | Clean abort at every phase (Snapshot, Transfer, Replay, Cutover) |
+| **Capability discovery** | `enrich_capabilities()` → `CapabilityAnnouncement` → `CapabilityIndex` → `Scheduler.find_migration_targets()` |
+| **Wire format** | Encode/decode roundtrip for all 9 message variants including chunked SnapshotReady |
+
+Regression tests are prefixed `test_regression_` and tied to specific bugs found during review. Each documents the original bug in its doc comment and would fail if the fix were reverted.
+
 ## Benchmarks
 
 ```bash
@@ -585,6 +608,28 @@ cargo bench --features net --bench net
 cargo bench --bench ingestion
 cargo bench --bench parallel
 ```
+
+## Test Architecture
+
+Unit tests live in `#[cfg(test)]` modules alongside the code they test. Each migration module (orchestrator, source handler, target handler, subprotocol handler) has isolated tests covering happy paths, error paths, and edge cases.
+
+Integration tests in `tests/migration_integration.rs` exercise the full migration system across module boundaries:
+
+| Category | What it validates |
+|----------|-------------------|
+| **Phase chain** | All 6 phases sequenced end-to-end through the orchestrator, with and without buffered events |
+| **End-to-end** | Source handler → orchestrator → target handler composing correctly: snapshot, buffer, restore, replay, cutover, cleanup. Verifies daemon moves between registries. |
+| **Auto-target** | Scheduler-driven target selection via `CapabilityIndex` queries for `subprotocol:0x0500` |
+| **Handler dispatch** | Each `MigrationMessage` variant dispatched through `MigrationSubprotocolHandler`, verifying correct outbound message types |
+| **Handler routing** | Outbound `dest_node` assertions — CutoverNotify reaches source, SnapshotReady reaches target, CleanupComplete reaches orchestrator |
+| **Snapshot chunking** | Small (single-chunk), large (multi-chunk), out-of-order reassembly, duplicate chunks, chunk count boundaries |
+| **Event flow** | Events buffered on source during migration → drained → replayed on target → daemon stats verify processing |
+| **Concurrency** | Two daemons migrating simultaneously without interference |
+| **Abort** | Clean abort at every phase (Snapshot, Transfer, Replay, Cutover) |
+| **Capability discovery** | `enrich_capabilities()` → `CapabilityAnnouncement` → `CapabilityIndex` → `Scheduler.find_migration_targets()` |
+| **Wire format** | Encode/decode roundtrip for all 9 message variants including chunked SnapshotReady |
+
+Regression tests are prefixed `test_regression_` and tied to specific bugs found during review. Each documents the original bug in its doc comment and would fail if the fix were reverted.
 
 ## Subprotocol ID Space
 
