@@ -73,8 +73,8 @@ For the design philosophy, architecture rationale, and benchmarks, see the [proj
 | **Behavior Plane** | Capability announcements & indexing, capability diffs, node metadata, API schema registry, device autonomy rules, context fabric (distributed tracing), load balancing, proximity graph, safety envelope enforcement | [BEHAVIOR.md](docs/BEHAVIOR.md) |
 | **Subnets & Hierarchy** | 4-level subnet hierarchy (8/8/8/8 encoding), label-based assignment, gateway visibility enforcement | [SUBNETS.md](docs/SUBNETS.md) |
 | **Distributed State** | 24-byte causal links, compressed observed horizons, append-only entity logs with chain validation, state snapshots for migration | [STATE.md](docs/STATE.md) |
-| **Compute Runtime** | MeshDaemon trait, daemon hosting with causal chain production, capability-based placement, 6-phase migration state machine | [COMPUTE.md](docs/COMPUTE.md) |
-| **Subprotocols** | Formal protocol registry, version negotiation, capability-aware routing via tags, opaque forwarding guarantee | [SUBPROTOCOLS.md](docs/SUBPROTOCOLS.md) |
+| **Compute Runtime** | MeshDaemon trait, daemon hosting with causal chain production, capability-based placement, 6-phase migration with orchestrator/source/target handlers, snapshot chunking, capability-driven target discovery | [COMPUTE.md](docs/COMPUTE.md) |
+| **Subprotocols** | Formal protocol registry, version negotiation, capability-aware routing via tags, opaque forwarding guarantee, migration message dispatch | [SUBPROTOCOLS.md](docs/SUBPROTOCOLS.md) |
 | **Observational Continuity** | Causal cones, propagation modeling, continuity proofs, honest discontinuity with deterministic forking, superposition during migration | [CONTINUITY.md](docs/CONTINUITY.md) |
 | **Contested Environments** | Correlated failure detection, subnet-aware partition classification, partition healing with log reconciliation | [CONTESTED.md](docs/CONTESTED.md) |
 
@@ -172,7 +172,7 @@ Benchmarked on Apple M1 Max, macOS.
 
 Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns.
 
-605 tests. ~840 KB deployed binary.
+758 tests. ~840 KB deployed binary.
 
 ## Capabilities
 
@@ -270,14 +270,16 @@ trait MeshDaemon: Send + Sync {
 
 `DaemonRegistry` maps daemon types to constructors. The `PlacementScheduler` decides where to run each daemon based on capability requirements — a daemon that needs a GPU is placed on a GPU node. If the best candidate is already loaded, the scheduler considers the next-best via the proximity graph.
 
-When a node fails, migration preserves continuity in 6 phases:
+When a node fails or needs load balancing, migration preserves continuity in 6 phases:
 
-1. **Detect** — failure detector marks node as dead
-2. **Select** — scheduler picks a new host from capability-matching candidates
-3. **Transfer** — last snapshot + chain tail sent to new host
-4. **Restore** — new host rebuilds daemon state from snapshot
-5. **Verify** — continuity proof validates chain integrity
-6. **Cutover** — routing table updates, new host takes over the stream
+1. **Snapshot** — source captures daemon state, chain head, and horizon
+2. **Transfer** — snapshot sent to target (auto-chunked for large state)
+3. **Restore** — target rebuilds daemon from snapshot
+4. **Replay** — buffered events (arrived during transfer) replayed in causal order
+5. **Cutover** — routing switches, source stops writes
+6. **Complete** — source cleans up, target is authoritative
+
+The `MigrationOrchestrator` coordinates this across three nodes (source, target, controller). `MigrationSourceHandler` manages the source side (snapshot, buffer, quiesce). `MigrationTargetHandler` manages the target side (restore, ordered replay via `BTreeMap`, activate). Auto-target selection queries the `CapabilityIndex` for nodes advertising `subprotocol:0x0500`.
 
 The daemon's causal chain continues unbroken on the new host. During migration, a `SuperpositionState` tracks which phase the daemon is in — it exists on both nodes briefly, then collapses to the new host.
 
@@ -356,15 +358,19 @@ src/adapter/net/
 │
 ├── compute/               # Layer 5 — Compute Runtime
 │   ├── daemon.rs          #   MeshDaemon trait
-│   ├── host.rs            #   DaemonHost runtime
-│   ├── migration.rs       #   6-phase snapshot migration
+│   ├── host.rs            #   DaemonHost runtime, from_snapshot() restore
+│   ├── migration.rs       #   MigrationState, MigrationPhase, 6-phase state machine
+│   ├── orchestrator.rs    #   MigrationOrchestrator, wire protocol, snapshot chunking
+│   ├── migration_source.rs #  Source-side: snapshot, buffer, cutover, cleanup
+│   ├── migration_target.rs #  Target-side: restore, replay, activate
 │   ├── registry.rs        #   DaemonRegistry
-│   └── scheduler.rs       #   Capability-based placement, PlacementDecision
+│   └── scheduler.rs       #   Capability-based placement, migration target discovery
 │
 ├── subprotocol/           # Layer 6 — Subprotocol Registry
 │   ├── descriptor.rs      #   SubprotocolDescriptor, versioning
+│   ├── migration_handler.rs #  Migration message dispatch (0x0500)
 │   ├── negotiation.rs     #   Version negotiation, SubprotocolManifest
-│   └── registry.rs        #   SubprotocolRegistry, ID → handler mapping
+│   └── registry.rs        #   SubprotocolRegistry, capability enrichment
 │
 ├── continuity/            # Layer 7 — Observational Continuity
 │   ├── chain.rs           #   ContinuityProof (36B), ContinuityStatus
@@ -560,8 +566,11 @@ cargo build --release --all-features
 ## Tests
 
 ```bash
-# Unit tests (605 tests)
+# Unit tests (732 tests)
 cargo test --lib --features net
+
+# Migration integration tests (26 tests)
+cargo test --test migration_integration --features net
 
 # Integration (requires running services)
 cargo test --test integration_net --features net
