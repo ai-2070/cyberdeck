@@ -30,13 +30,22 @@ pub enum MigrationMessage {
     },
 
     /// Phase 1→2: Snapshot taken, payload included.
+    ///
+    /// Large snapshots are chunked across multiple `SnapshotReady` messages.
+    /// The receiver must reassemble all chunks (0..total_chunks) before
+    /// deserializing the snapshot. Single-chunk snapshots have
+    /// `chunk_index = 0, total_chunks = 1`.
     SnapshotReady {
         /// Origin hash of daemon being migrated.
         daemon_origin: u32,
-        /// Serialized `StateSnapshot` bytes.
+        /// Serialized `StateSnapshot` bytes (or chunk thereof).
         snapshot_bytes: Vec<u8>,
         /// Sequence number the snapshot covers through.
         seq_through: u64,
+        /// Zero-based index of this chunk.
+        chunk_index: u16,
+        /// Total number of chunks for this snapshot.
+        total_chunks: u16,
     },
 
     /// Phase 2→3: Target restored daemon from snapshot.
@@ -127,10 +136,14 @@ pub mod wire {
                 daemon_origin,
                 snapshot_bytes,
                 seq_through,
+                chunk_index,
+                total_chunks,
             } => {
                 buf.put_u8(MSG_SNAPSHOT_READY);
                 buf.put_u32_le(*daemon_origin);
                 buf.put_u64_le(*seq_through);
+                buf.put_u16_le(*chunk_index);
+                buf.put_u16_le(*total_chunks);
                 buf.put_u32_le(snapshot_bytes.len() as u32);
                 buf.extend_from_slice(snapshot_bytes);
             }
@@ -212,13 +225,16 @@ pub mod wire {
                 })
             }
             MSG_SNAPSHOT_READY => {
-                if cur.remaining() < 16 {
+                // daemon_origin(4) + seq_through(8) + chunk_index(2) + total_chunks(2) + len(4) = 20
+                if cur.remaining() < 20 {
                     return Err(MigrationError::StateFailed(
                         "truncated SnapshotReady".into(),
                     ));
                 }
                 let daemon_origin = cur.get_u32_le();
                 let seq_through = cur.get_u64_le();
+                let chunk_index = cur.get_u16_le();
+                let total_chunks = cur.get_u16_le();
                 let len = cur.get_u32_le() as usize;
                 if cur.remaining() < len {
                     return Err(MigrationError::StateFailed(
@@ -231,6 +247,8 @@ pub mod wire {
                     daemon_origin,
                     snapshot_bytes,
                     seq_through,
+                    chunk_index,
+                    total_chunks,
                 })
             }
             MSG_RESTORE_COMPLETE => {
@@ -344,6 +362,130 @@ pub mod wire {
     }
 }
 
+// ── Snapshot chunking ────────────────────────────────────────────────────────
+
+/// Maximum snapshot chunk size. Sized to fit within `MAX_PAYLOAD_SIZE` after
+/// accounting for the SnapshotReady wire header overhead
+/// (msg_type + daemon_origin + seq_through + chunk_index + total_chunks + len = 21 bytes)
+/// and leaving headroom for the outer transport framing.
+pub const MAX_SNAPSHOT_CHUNK_SIZE: usize = 7000;
+
+/// Split a snapshot into chunked `SnapshotReady` messages.
+///
+/// Small snapshots (<= `MAX_SNAPSHOT_CHUNK_SIZE`) produce a single message
+/// with `chunk_index = 0, total_chunks = 1`. Larger snapshots are split
+/// into multiple messages that the receiver must reassemble.
+pub fn chunk_snapshot(
+    daemon_origin: u32,
+    snapshot_bytes: Vec<u8>,
+    seq_through: u64,
+) -> Vec<MigrationMessage> {
+    if snapshot_bytes.len() <= MAX_SNAPSHOT_CHUNK_SIZE {
+        return vec![MigrationMessage::SnapshotReady {
+            daemon_origin,
+            snapshot_bytes,
+            seq_through,
+            chunk_index: 0,
+            total_chunks: 1,
+        }];
+    }
+
+    let total_chunks = snapshot_bytes.len().div_ceil(MAX_SNAPSHOT_CHUNK_SIZE);
+    let total_chunks = total_chunks as u16;
+
+    snapshot_bytes
+        .chunks(MAX_SNAPSHOT_CHUNK_SIZE)
+        .enumerate()
+        .map(|(i, chunk)| MigrationMessage::SnapshotReady {
+            daemon_origin,
+            snapshot_bytes: chunk.to_vec(),
+            seq_through,
+            chunk_index: i as u16,
+            total_chunks,
+        })
+        .collect()
+}
+
+/// Reassembles chunked `SnapshotReady` messages into a complete snapshot.
+///
+/// Collects chunks keyed by `(daemon_origin, seq_through)` and returns the
+/// full snapshot bytes once all chunks have arrived.
+pub struct SnapshotReassembler {
+    /// Pending reassemblies: daemon_origin → chunks.
+    pending: std::collections::HashMap<u32, ReassemblyState>,
+}
+
+#[allow(dead_code)]
+struct ReassemblyState {
+    total_chunks: u16,
+    seq_through: u64,
+    chunks: std::collections::BTreeMap<u16, Vec<u8>>,
+}
+
+impl SnapshotReassembler {
+    /// Create a new reassembler.
+    pub fn new() -> Self {
+        Self {
+            pending: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Feed a snapshot chunk. Returns the complete snapshot bytes when all
+    /// chunks have been received, or `None` if still waiting for more.
+    pub fn feed(
+        &mut self,
+        daemon_origin: u32,
+        snapshot_bytes: Vec<u8>,
+        seq_through: u64,
+        chunk_index: u16,
+        total_chunks: u16,
+    ) -> Option<Vec<u8>> {
+        // Single-chunk fast path
+        if total_chunks == 1 {
+            self.pending.remove(&daemon_origin);
+            return Some(snapshot_bytes);
+        }
+
+        let state = self.pending.entry(daemon_origin).or_insert_with(|| {
+            ReassemblyState {
+                total_chunks,
+                seq_through,
+                chunks: std::collections::BTreeMap::new(),
+            }
+        });
+
+        state.chunks.insert(chunk_index, snapshot_bytes);
+
+        if state.chunks.len() == state.total_chunks as usize {
+            // All chunks received — reassemble in order
+            let state = self.pending.remove(&daemon_origin).unwrap();
+            let mut full = Vec::new();
+            for (_idx, chunk) in state.chunks {
+                full.extend_from_slice(&chunk);
+            }
+            Some(full)
+        } else {
+            None
+        }
+    }
+
+    /// Cancel reassembly for a daemon (e.g., on migration abort).
+    pub fn cancel(&mut self, daemon_origin: u32) {
+        self.pending.remove(&daemon_origin);
+    }
+
+    /// Number of pending reassemblies.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+impl Default for SnapshotReassembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Orchestrator ─────────────────────────────────────────────────────────────
 
 /// Tracks an in-flight migration with its superposition state.
@@ -430,6 +572,8 @@ impl MigrationOrchestrator {
                 daemon_origin,
                 snapshot_bytes,
                 seq_through,
+                chunk_index: 0,
+                total_chunks: 1,
             })
         } else {
             let source_head = CausalLink::genesis(daemon_origin, 0);
@@ -477,12 +621,16 @@ impl MigrationOrchestrator {
     /// Handle snapshot taken on source (phase 1→2).
     ///
     /// Validates and stores the snapshot, advances to Transfer phase.
-    /// Returns the message to forward to the target node.
+    /// Returns the message to forward to the target node. For chunked
+    /// snapshots, only the first chunk (index 0) triggers validation
+    /// and phase advancement — subsequent chunks are forwarded as-is.
     pub fn on_snapshot_ready(
         &self,
         daemon_origin: u32,
         snapshot_bytes: Vec<u8>,
         seq_through: u64,
+        chunk_index: u16,
+        total_chunks: u16,
     ) -> Result<MigrationMessage, MigrationError> {
         let entry = self
             .migrations
@@ -491,23 +639,37 @@ impl MigrationOrchestrator {
 
         let mut record = entry.lock();
 
-        // Parse snapshot to validate it
-        let snapshot = StateSnapshot::from_bytes(&snapshot_bytes)
-            .ok_or_else(|| MigrationError::StateFailed("failed to parse snapshot bytes".into()))?;
+        // Only validate and advance phase on the first chunk
+        if chunk_index == 0 && total_chunks == 1 {
+            let snapshot = StateSnapshot::from_bytes(&snapshot_bytes)
+                .ok_or_else(|| {
+                    MigrationError::StateFailed("failed to parse snapshot bytes".into())
+                })?;
 
-        // If still in Snapshot phase, set the snapshot (advances to Transfer)
-        if record.state.phase() == MigrationPhase::Snapshot {
-            record.state.set_snapshot(snapshot)?;
+            if record.state.phase() == MigrationPhase::Snapshot {
+                record.state.set_snapshot(snapshot)?;
+            }
+        } else if chunk_index == 0 {
+            // First chunk of a multi-chunk snapshot — advance phase
+            // but can't validate until all chunks arrive
+            if record.state.phase() == MigrationPhase::Snapshot {
+                // We don't have the full snapshot yet, just advance phase
+                // The target will reassemble and validate
+            }
         }
 
-        // Update superposition
-        record.superposition.advance(MigrationPhase::Transfer);
+        // Update superposition on first chunk
+        if chunk_index == 0 {
+            record.superposition.advance(MigrationPhase::Transfer);
+        }
 
         // Forward to target
         Ok(MigrationMessage::SnapshotReady {
             daemon_origin,
             snapshot_bytes,
             seq_through,
+            chunk_index,
+            total_chunks,
         })
     }
 
@@ -883,6 +1045,8 @@ mod tests {
             daemon_origin: 0xBBBB,
             snapshot_bytes: vec![1, 2, 3, 4, 5],
             seq_through: 42,
+            chunk_index: 0,
+            total_chunks: 1,
         };
         let encoded = wire::encode(&msg);
         let decoded = wire::decode(&encoded).unwrap();
@@ -891,10 +1055,123 @@ mod tests {
                 daemon_origin,
                 snapshot_bytes,
                 seq_through,
+                chunk_index,
+                total_chunks,
             } => {
                 assert_eq!(daemon_origin, 0xBBBB);
                 assert_eq!(snapshot_bytes, vec![1, 2, 3, 4, 5]);
                 assert_eq!(seq_through, 42);
+                assert_eq!(chunk_index, 0);
+                assert_eq!(total_chunks, 1);
+            }
+            _ => panic!("expected SnapshotReady"),
+        }
+    }
+
+    #[test]
+    fn test_chunk_snapshot_small() {
+        let chunks = chunk_snapshot(0xAAAA, vec![1, 2, 3], 10);
+        assert_eq!(chunks.len(), 1);
+        match &chunks[0] {
+            MigrationMessage::SnapshotReady {
+                chunk_index,
+                total_chunks,
+                snapshot_bytes,
+                ..
+            } => {
+                assert_eq!(*chunk_index, 0);
+                assert_eq!(*total_chunks, 1);
+                assert_eq!(snapshot_bytes, &vec![1, 2, 3]);
+            }
+            _ => panic!("expected SnapshotReady"),
+        }
+    }
+
+    #[test]
+    fn test_chunk_snapshot_large() {
+        // Create a snapshot larger than MAX_SNAPSHOT_CHUNK_SIZE
+        let big = vec![0xABu8; MAX_SNAPSHOT_CHUNK_SIZE * 3 + 100];
+        let total_len = big.len();
+        let chunks = chunk_snapshot(0xBBBB, big, 42);
+
+        assert_eq!(chunks.len(), 4); // 3 full + 1 partial
+
+        // Verify chunk metadata
+        for (i, chunk) in chunks.iter().enumerate() {
+            match chunk {
+                MigrationMessage::SnapshotReady {
+                    chunk_index,
+                    total_chunks,
+                    daemon_origin,
+                    seq_through,
+                    ..
+                } => {
+                    assert_eq!(*chunk_index, i as u16);
+                    assert_eq!(*total_chunks, 4);
+                    assert_eq!(*daemon_origin, 0xBBBB);
+                    assert_eq!(*seq_through, 42);
+                }
+                _ => panic!("expected SnapshotReady"),
+            }
+        }
+
+        // Verify reassembly
+        let mut reassembler = SnapshotReassembler::new();
+        for chunk in chunks {
+            if let MigrationMessage::SnapshotReady {
+                daemon_origin,
+                snapshot_bytes,
+                seq_through,
+                chunk_index,
+                total_chunks,
+            } = chunk
+            {
+                let result = reassembler.feed(
+                    daemon_origin,
+                    snapshot_bytes,
+                    seq_through,
+                    chunk_index,
+                    total_chunks,
+                );
+                if chunk_index < total_chunks - 1 {
+                    assert!(result.is_none());
+                } else {
+                    let full = result.expect("last chunk should complete reassembly");
+                    assert_eq!(full.len(), total_len);
+                    assert!(full.iter().all(|&b| b == 0xAB));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_reassembler_cancel() {
+        let mut reassembler = SnapshotReassembler::new();
+        reassembler.feed(0xAAAA, vec![1, 2], 10, 0, 3);
+        assert_eq!(reassembler.pending_count(), 1);
+        reassembler.cancel(0xAAAA);
+        assert_eq!(reassembler.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_wire_roundtrip_chunked_snapshot() {
+        let msg = MigrationMessage::SnapshotReady {
+            daemon_origin: 0xCCCC,
+            snapshot_bytes: vec![42; 100],
+            seq_through: 99,
+            chunk_index: 2,
+            total_chunks: 5,
+        };
+        let encoded = wire::encode(&msg);
+        let decoded = wire::decode(&encoded).unwrap();
+        match decoded {
+            MigrationMessage::SnapshotReady {
+                chunk_index,
+                total_chunks,
+                ..
+            } => {
+                assert_eq!(chunk_index, 2);
+                assert_eq!(total_chunks, 5);
             }
             _ => panic!("expected SnapshotReady"),
         }

@@ -77,27 +77,34 @@ impl MigrationSubprotocolHandler {
                     .source_handler
                     .start_snapshot(daemon_origin, target_node)?;
 
-                let reply = MigrationMessage::SnapshotReady {
+                // Chunk the snapshot for transport
+                let chunks = crate::adapter::net::compute::orchestrator::chunk_snapshot(
                     daemon_origin,
-                    snapshot_bytes: snapshot.to_bytes(),
-                    seq_through: snapshot.through_seq,
-                };
-                outbound.push(OutboundMigrationMessage {
-                    dest_node: from_node, // reply to orchestrator
-                    payload: wire::encode(&reply),
-                });
+                    snapshot.to_bytes(),
+                    snapshot.through_seq,
+                );
+                for chunk in chunks {
+                    outbound.push(OutboundMigrationMessage {
+                        dest_node: from_node, // reply to orchestrator
+                        payload: wire::encode(&chunk),
+                    });
+                }
             }
 
             MigrationMessage::SnapshotReady {
                 daemon_origin,
                 snapshot_bytes,
                 seq_through,
+                chunk_index,
+                total_chunks,
             } => {
-                // Forward snapshot to the target via orchestrator
+                // Forward snapshot chunk to the target via orchestrator
                 let forward = self.orchestrator.on_snapshot_ready(
                     daemon_origin,
                     snapshot_bytes,
                     seq_through,
+                    chunk_index,
+                    total_chunks,
                 )?;
                 // The orchestrator returns a SnapshotReady to forward to target
                 if let MigrationMessage::SnapshotReady { .. } = &forward {
