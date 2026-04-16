@@ -606,7 +606,10 @@ mod tests {
 
         // Nothing should time out yet (we just sent)
         let too_early = mode.get_timed_out();
-        assert!(too_early.is_empty(), "packets should not time out before RTO");
+        assert!(
+            too_early.is_empty(),
+            "packets should not time out before RTO"
+        );
 
         // Wait well past RTO
         std::thread::sleep(Duration::from_millis(80));
