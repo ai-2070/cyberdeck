@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/compute/mod.rs
+  d37b393023401171 11-13,20-22
+net/crates/net/src/adapter/net/mod.rs
+  d37b393023401171 66-68,111-113
+net/crates/net/src/adapter/net/subprotocol/mod.rs
+  d37b393023401171 11,19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "90819446ae18b48ab5f6452a1fe8cc878bcb7874",
+  "prompts": {
+    "d37b393023401171": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8de24b1d-4937-4e8f-9712-eb9f68e7e6e4",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 31,
+      "overriden_lines": 0
+    }
+  }
+}
