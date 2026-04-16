@@ -1553,14 +1553,18 @@ mod tests {
         };
         let lb = LoadBalancer::new(config);
         lb.add_endpoint(Endpoint::new(make_node_id(1)));
+        let ctx = RequestContext::new();
 
-        // Trip the breaker.
+        // Trip the breaker by driving 5 real selections that all fail. Going
+        // through select() keeps the connection counter consistent — calling
+        // record_completion() without a matching record_request() would
+        // underflow.
         for _ in 0..5 {
-            lb.record_completion(&make_node_id(1), false);
+            let sel = lb.select(&ctx).expect("admitted before trip");
+            lb.record_completion(&sel.node_id, false);
         }
 
         // Before recovery: all requests rejected.
-        let ctx = RequestContext::new();
         assert!(lb.select(&ctx).is_err(), "open breaker must reject");
 
         // Wait past the recovery window.
