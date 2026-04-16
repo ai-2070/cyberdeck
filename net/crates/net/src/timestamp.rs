@@ -57,7 +57,14 @@ impl TimestampGenerator {
         // Ensure strict monotonicity via CAS loop
         loop {
             let last = self.last.load(Ordering::Acquire);
-            let ts = now.max(last.saturating_add(1));
+
+            // Guard against u64::MAX exhaustion: saturating_add(1) at MAX
+            // would return MAX again, breaking strict monotonicity.
+            let next = match last.checked_add(1) {
+                Some(inc) => inc,
+                None => panic!("TimestampGenerator: timestamp space exhausted (u64::MAX)"),
+            };
+            let ts = now.max(next);
 
             match self
                 .last
@@ -288,6 +295,17 @@ mod tests {
         for window in timestamps.windows(2) {
             assert!(window[1] > window[0]);
         }
+    }
+
+    // Regression: saturating_add(1) at u64::MAX used to silently return
+    // the same timestamp twice, breaking strict monotonicity (BUGS_3 #6).
+    #[test]
+    #[should_panic(expected = "timestamp space exhausted")]
+    fn test_next_panics_at_u64_max() {
+        let ts_gen = TimestampGenerator::new();
+        // Force last to u64::MAX
+        ts_gen.last.store(u64::MAX, Ordering::Release);
+        let _ = ts_gen.next();
     }
 
     #[test]

@@ -361,10 +361,12 @@ impl StoredEvent {
     }
 
     /// Get the raw bytes as a string slice (for serialization).
+    ///
+    /// Returns `Err` if the raw bytes are not valid UTF-8, rather than
+    /// silently substituting data.
     #[inline]
-    pub fn raw_str(&self) -> &str {
-        // Safety: Net events are valid UTF-8 JSON
-        std::str::from_utf8(&self.raw).unwrap_or("{}")
+    pub fn raw_str(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.raw)
     }
 }
 
@@ -576,5 +578,21 @@ mod tests {
         assert_eq!(parsed["key"], "value");
         assert_eq!(event.insertion_ts, 12345);
         assert_eq!(event.shard_id, 0);
+    }
+
+    // Regression: raw_str() used to silently return "{}" for invalid UTF-8
+    // instead of reporting an error (BUGS_3 #4).
+    #[test]
+    fn test_stored_event_raw_str_valid_utf8() {
+        let raw = Bytes::from(r#"{"key":"value"}"#);
+        let event = StoredEvent::new("id".to_string(), raw, 0, 0);
+        assert_eq!(event.raw_str().unwrap(), r#"{"key":"value"}"#);
+    }
+
+    #[test]
+    fn test_stored_event_raw_str_invalid_utf8_returns_err() {
+        let raw = Bytes::from(vec![0xff, 0xfe, 0xfd]);
+        let event = StoredEvent::new("id".to_string(), raw, 0, 0);
+        assert!(event.raw_str().is_err());
     }
 }

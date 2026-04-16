@@ -59,7 +59,7 @@ use std::ptr;
 use tokio::runtime::Runtime;
 
 use crate::bus::EventBus;
-use crate::config::{AdapterConfig, EventBusConfig};
+use crate::config::EventBusConfig;
 use crate::consumer::ConsumeRequest;
 use crate::event::{Event, RawEvent};
 
@@ -578,7 +578,10 @@ pub extern "C" fn net_poll(
         *out_buffer.add(response_json.len()) = 0; // Null terminate
     }
 
-    response_json.len() as c_int
+    match c_int::try_from(response_json.len()) {
+        Ok(n) => n,
+        Err(_) => NetError::BufferTooSmall.into(),
+    }
 }
 
 /// Get event bus statistics.
@@ -631,7 +634,10 @@ pub extern "C" fn net_stats(
         *out_buffer.add(stats_json.len()) = 0;
     }
 
-    stats_json.len() as c_int
+    match c_int::try_from(stats_json.len()) {
+        Ok(n) => n,
+        Err(_) => NetError::BufferTooSmall.into(),
+    }
 }
 
 /// Flush all pending batches to the adapter.
@@ -675,12 +681,17 @@ pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
     }
 
     let handle = unsafe { Box::from_raw(handle) };
+    let NetHandle { bus, runtime } = *handle;
 
-    // Shutdown is consuming, so we need to handle this carefully
-    // For now, just drop the handle which will clean up resources
-    drop(handle);
+    // Flush pending batches and gracefully shut down the adapter
+    // before dropping the runtime. Without this, pending events in
+    // ring buffers and batch workers would be silently lost.
+    let result = runtime.block_on(bus.shutdown());
 
-    NetError::Success.into()
+    match result {
+        Ok(()) => NetError::Success.into(),
+        Err(_) => NetError::Unknown.into(),
+    }
 }
 
 /// Get the number of shards.
@@ -912,7 +923,11 @@ pub extern "C" fn net_poll_ex(
     let next_id_ptr = match response.next_id {
         Some(ref s) => match std::ffi::CString::new(s.as_str()) {
             Ok(c) => c.into_raw(),
-            Err(_) => return NetError::InvalidUtf8.into(),
+            Err(_) => {
+                // Free already-allocated events before returning error
+                free_events_array(events_ptr, count);
+                return NetError::InvalidUtf8.into();
+            }
         },
         None => ptr::null_mut(),
     };
@@ -927,6 +942,37 @@ pub extern "C" fn net_poll_ex(
     NetError::Success.into()
 }
 
+/// Free an events array and all its id/raw allocations.
+fn free_events_array(events: *mut NetEvent, count: usize) {
+    if events.is_null() || count == 0 {
+        return;
+    }
+    for i in 0..count {
+        let event = unsafe { &*events.add(i) };
+        if !event.id.is_null() {
+            unsafe {
+                let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                    event.id as *mut u8,
+                    event.id_len,
+                ));
+            }
+        }
+        if !event.raw.is_null() {
+            unsafe {
+                let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                    event.raw as *mut u8,
+                    event.raw_len,
+                ));
+            }
+        }
+    }
+    if let Ok(layout) = std::alloc::Layout::array::<NetEvent>(count) {
+        unsafe {
+            std::alloc::dealloc(events as *mut u8, layout);
+        }
+    }
+}
+
 /// Free a poll result returned by `net_poll_ex`.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_free_poll_result(result: *mut NetPollResult) {
@@ -936,36 +982,8 @@ pub extern "C" fn net_free_poll_result(result: *mut NetPollResult) {
 
     let result = unsafe { &*result };
 
-    // Free each event's id and raw strings.
-    if !result.events.is_null() && result.count > 0 {
-        for i in 0..result.count {
-            let event = unsafe { &*result.events.add(i) };
-
-            if !event.id.is_null() {
-                unsafe {
-                    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                        event.id as *mut u8,
-                        event.id_len,
-                    ));
-                }
-            }
-            if !event.raw.is_null() {
-                unsafe {
-                    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                        event.raw as *mut u8,
-                        event.raw_len,
-                    ));
-                }
-            }
-        }
-
-        // Free the events array.
-        if let Ok(layout) = std::alloc::Layout::array::<NetEvent>(result.count) {
-            unsafe {
-                std::alloc::dealloc(result.events as *mut u8, layout);
-            }
-        }
-    }
+    // Free events array and all id/raw allocations.
+    free_events_array(result.events, result.count);
 
     // Free next_id.
     if !result.next_id.is_null() {
