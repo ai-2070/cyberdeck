@@ -5,6 +5,7 @@
 
 use bytes::{Bytes, BytesMut};
 use crossbeam_queue::ArrayQueue;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use super::crypto::PacketCipher;
@@ -54,9 +55,36 @@ impl PacketBuilder {
         }
     }
 
+    /// Create a packet builder that shares a TX counter with other builders.
+    ///
+    /// All builders sharing the same counter atomically increment it,
+    /// preventing nonce reuse when multiple builders encrypt with the
+    /// same key (e.g., in a `PacketPool` or `ThreadLocalPool`).
+    pub fn with_shared_counter(
+        key: &[u8; 32],
+        session_id: u64,
+        origin_hash: u32,
+        tx_counter: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            payload: BytesMut::with_capacity(MAX_PAYLOAD_SIZE),
+            cipher: PacketCipher::with_shared_tx_counter(key, session_id, tx_counter),
+            packet: BytesMut::with_capacity(MAX_PACKET_SIZE),
+            session_id,
+            origin_hash,
+            channel_hash: 0,
+        }
+    }
+
     /// Update the encryption key and session ID
     pub fn set_key(&mut self, key: &[u8; 32], session_id: u64) {
         self.cipher = PacketCipher::new(key, session_id);
+        self.session_id = session_id;
+    }
+
+    /// Update the encryption key, session ID, and shared counter
+    pub fn set_key_shared(&mut self, key: &[u8; 32], session_id: u64, tx_counter: Arc<AtomicU64>) {
+        self.cipher = PacketCipher::with_shared_tx_counter(key, session_id, tx_counter);
         self.session_id = session_id;
     }
 
@@ -189,6 +217,7 @@ impl std::fmt::Debug for PacketBuilder {
 /// Pool of packet builders for amortized allocation.
 ///
 /// Uses counter-based nonces for zero-allocation packet construction.
+/// All builders in the pool share a single TX counter to prevent nonce reuse.
 pub struct PacketPool {
     /// Queue of available builders
     builders: ArrayQueue<PacketBuilder>,
@@ -200,6 +229,9 @@ pub struct PacketPool {
     origin_hash: u32,
     /// Pool capacity
     capacity: usize,
+    /// Shared TX counter — all builders atomically increment this to prevent
+    /// nonce reuse when multiple builders encrypt with the same key.
+    tx_counter: Arc<AtomicU64>,
 }
 
 impl PacketPool {
@@ -210,11 +242,17 @@ impl PacketPool {
 
     /// Create a new packet pool with origin identity
     pub fn with_origin(size: usize, key: &[u8; 32], session_id: u64, origin_hash: u32) -> Self {
+        let tx_counter = Arc::new(AtomicU64::new(0));
         let builders = ArrayQueue::new(size);
 
-        // Pre-populate the pool
+        // Pre-populate the pool with builders sharing the same TX counter
         for _ in 0..size {
-            let _ = builders.push(PacketBuilder::with_origin(key, session_id, origin_hash));
+            let _ = builders.push(PacketBuilder::with_shared_counter(
+                key,
+                session_id,
+                origin_hash,
+                tx_counter.clone(),
+            ));
         }
 
         Self {
@@ -223,6 +261,7 @@ impl PacketPool {
             session_id,
             origin_hash,
             capacity: size,
+            tx_counter,
         }
     }
 
@@ -230,13 +269,20 @@ impl PacketPool {
     pub fn set_key(&mut self, key: &[u8; 32], session_id: u64) {
         self.key = *key;
         self.session_id = session_id;
+        // Reset the shared counter for the new session
+        self.tx_counter = Arc::new(AtomicU64::new(0));
     }
 
     /// Get a builder from the pool
     #[inline]
     pub fn get(&self) -> PooledBuilder<'_> {
         let builder = self.builders.pop().unwrap_or_else(|| {
-            PacketBuilder::with_origin(&self.key, self.session_id, self.origin_hash)
+            PacketBuilder::with_shared_counter(
+                &self.key,
+                self.session_id,
+                self.origin_hash,
+                self.tx_counter.clone(),
+            )
         });
 
         PooledBuilder {
@@ -329,7 +375,11 @@ impl Drop for PooledBuilder<'_> {
         if let Some(mut builder) = self.builder.take() {
             // Update key/session if pool values have changed
             if builder.session_id() != self.pool.session_id {
-                builder.set_key(&self.pool.key, self.pool.session_id);
+                builder.set_key_shared(
+                    &self.pool.key,
+                    self.pool.session_id,
+                    self.pool.tx_counter.clone(),
+                );
             }
             // Sync origin_hash in case it changed
             builder.set_origin_hash(self.pool.origin_hash);
@@ -380,6 +430,12 @@ thread_local! {
 ///
 /// When the local cache is warm, `acquire()` and `release()` have zero atomic
 /// operations, making them ~10-15% faster than the shared pool under contention.
+///
+/// # Nonce Safety
+///
+/// All builders in the pool (including those in thread-local caches) share a
+/// single TX counter. This prevents nonce reuse when different threads
+/// encrypt with the same key.
 pub struct ThreadLocalPool {
     /// Shared fallback pool
     shared: ArrayQueue<PacketBuilder>,
@@ -393,6 +449,9 @@ pub struct ThreadLocalPool {
     local_capacity: usize,
     /// Total pool capacity
     capacity: usize,
+    /// Shared TX counter — all builders atomically increment this to prevent
+    /// nonce reuse across threads.
+    tx_counter: Arc<AtomicU64>,
 }
 
 impl ThreadLocalPool {
@@ -423,11 +482,17 @@ impl ThreadLocalPool {
         origin_hash: u32,
         local_capacity: usize,
     ) -> Self {
+        let tx_counter = Arc::new(AtomicU64::new(0));
         let shared = ArrayQueue::new(size);
 
-        // Pre-populate the shared pool
+        // Pre-populate the shared pool with builders sharing the same TX counter
         for _ in 0..size {
-            let _ = shared.push(PacketBuilder::with_origin(key, session_id, origin_hash));
+            let _ = shared.push(PacketBuilder::with_shared_counter(
+                key,
+                session_id,
+                origin_hash,
+                tx_counter.clone(),
+            ));
         }
 
         Self {
@@ -437,6 +502,7 @@ impl ThreadLocalPool {
             origin_hash,
             local_capacity,
             capacity: size,
+            tx_counter,
         }
     }
 
@@ -453,7 +519,11 @@ impl ThreadLocalPool {
             if let Some(mut builder) = pool.pop() {
                 // Update key/session if changed
                 if builder.session_id() != self.session_id {
-                    builder.set_key(&self.key, self.session_id);
+                    builder.set_key_shared(
+                        &self.key,
+                        self.session_id,
+                        self.tx_counter.clone(),
+                    );
                 }
                 // Sync origin_hash in case it changed
                 builder.set_origin_hash(self.origin_hash);
@@ -474,13 +544,22 @@ impl ThreadLocalPool {
             pool.pop()
                 .map(|mut b| {
                     if b.session_id() != self.session_id {
-                        b.set_key(&self.key, self.session_id);
+                        b.set_key_shared(
+                            &self.key,
+                            self.session_id,
+                            self.tx_counter.clone(),
+                        );
                     }
                     b.set_origin_hash(self.origin_hash);
                     b
                 })
                 .unwrap_or_else(|| {
-                    PacketBuilder::with_origin(&self.key, self.session_id, self.origin_hash)
+                    PacketBuilder::with_shared_counter(
+                        &self.key,
+                        self.session_id,
+                        self.origin_hash,
+                        self.tx_counter.clone(),
+                    )
                 })
         })
     }
@@ -493,7 +572,11 @@ impl ThreadLocalPool {
     pub fn release(&self, mut builder: PacketBuilder) {
         // Update key/session if changed
         if builder.session_id() != self.session_id {
-            builder.set_key(&self.key, self.session_id);
+            builder.set_key_shared(
+                &self.key,
+                self.session_id,
+                self.tx_counter.clone(),
+            );
         }
         // Sync origin_hash
         builder.set_origin_hash(self.origin_hash);
@@ -741,5 +824,93 @@ mod tests {
         // Both references work
         let _b1 = pool.get();
         let _b2 = pool_clone.get();
+    }
+
+    // ---- Regression tests ----
+
+    #[test]
+    fn test_regression_pool_builders_share_tx_counter() {
+        // Regression: each PacketBuilder in the pool had an independent
+        // PacketCipher with its own counter starting at 0. Two builders
+        // from the same pool would produce overlapping nonces with the
+        // same key, catastrophically breaking ChaCha20-Poly1305 security
+        // (nonce reuse enables plaintext recovery via XOR).
+        //
+        // Fix: all builders in a pool share a single AtomicU64 TX counter.
+        let key = [0x42u8; 32];
+        let session_id = 0xAAAA;
+        let pool = PacketPool::new(4, &key, session_id);
+
+        let events = vec![Bytes::from_static(b"test")];
+
+        // Get two different builders from the pool
+        let mut b1 = pool.get();
+        let pkt1 = b1.build(0, 0, &events, PacketFlags::NONE);
+        drop(b1);
+
+        let mut b2 = pool.get();
+        let pkt2 = b2.build(0, 1, &events, PacketFlags::NONE);
+        drop(b2);
+
+        // Extract nonces from the two packets (bytes 12..24 of the header)
+        let nonce1 = &pkt1[12..24];
+        let nonce2 = &pkt2[12..24];
+
+        assert_ne!(
+            nonce1, nonce2,
+            "two builders from the same pool must produce different nonces"
+        );
+
+        // Verify counters are sequential (both share the same AtomicU64)
+        let counter1 = u64::from_le_bytes(nonce1[4..12].try_into().unwrap());
+        let counter2 = u64::from_le_bytes(nonce2[4..12].try_into().unwrap());
+        assert_eq!(counter1, 0, "first builder should use counter 0");
+        assert_eq!(counter2, 1, "second builder should use counter 1");
+    }
+
+    #[test]
+    fn test_regression_thread_local_pool_builders_share_tx_counter() {
+        // Same nonce-reuse regression as PacketPool, but for ThreadLocalPool.
+        // Different threads get different builders from the shared pool;
+        // without a shared counter they'd produce overlapping nonces.
+        let key = [0x42u8; 32];
+        let session_id = 0xBBBB;
+        let pool = Arc::new(ThreadLocalPool::new(4, &key, session_id));
+
+        let events = vec![Bytes::from_static(b"test")];
+
+        // Build packets from two different threads to ensure they get
+        // different builders (each thread has its own local cache).
+        let pool1 = pool.clone();
+        let pkt1 = std::thread::spawn(move || {
+            let mut b = pool1.get();
+            b.build(0, 0, &[Bytes::from_static(b"test")], PacketFlags::NONE)
+        })
+        .join()
+        .unwrap();
+
+        let pool2 = pool.clone();
+        let pkt2 = std::thread::spawn(move || {
+            let mut b = pool2.get();
+            b.build(0, 1, &[Bytes::from_static(b"test")], PacketFlags::NONE)
+        })
+        .join()
+        .unwrap();
+
+        let nonce1 = &pkt1[12..24];
+        let nonce2 = &pkt2[12..24];
+
+        assert_ne!(
+            nonce1, nonce2,
+            "builders from different threads must produce different nonces"
+        );
+
+        let counter1 = u64::from_le_bytes(nonce1[4..12].try_into().unwrap());
+        let counter2 = u64::from_le_bytes(nonce2[4..12].try_into().unwrap());
+        // Counters should be 0 and 1 (order depends on thread scheduling)
+        assert_ne!(
+            counter1, counter2,
+            "shared counter must prevent nonce reuse across threads"
+        );
     }
 }

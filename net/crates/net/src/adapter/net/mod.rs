@@ -122,6 +122,7 @@ use dashmap::DashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::adapter::{Adapter, ShardPollResult};
@@ -251,8 +252,10 @@ pub struct NetAdapter {
     inbound: InboundQueues,
     /// Background tasks
     tasks: TokioMutex<Vec<JoinHandle<()>>>,
-    /// Shutdown signal
+    /// Shutdown signal (flag for polling, Notify for waking blocked tasks)
     shutdown: Arc<AtomicBool>,
+    /// Notify to wake tasks blocked on I/O during shutdown
+    shutdown_notify: Arc<Notify>,
     /// Initialization state
     initialized: AtomicBool,
 }
@@ -272,6 +275,7 @@ impl NetAdapter {
             inbound: Arc::new(DashMap::new()),
             tasks: TokioMutex::new(Vec::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(Notify::new()),
             initialized: AtomicBool::new(false),
         })
     }
@@ -542,6 +546,7 @@ impl NetAdapter {
     #[cfg(target_os = "linux")]
     fn spawn_receiver(
         shutdown: Arc<AtomicBool>,
+        shutdown_notify: Arc<Notify>,
         socket: Arc<Socket>,
         session: Arc<NetSession>,
         inbound: InboundQueues,
@@ -551,18 +556,25 @@ impl NetAdapter {
 
         tokio::spawn(async move {
             while !shutdown.load(Ordering::Acquire) {
-                match receiver.recv().await {
-                    Ok((data, source)) => {
-                        Self::process_packet(data, source, &session, &inbound, num_shards);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
-                        tracing::warn!("batch receiver thread exited, stopping receiver");
-                        break;
-                    }
-                    Err(e) => {
-                        if !shutdown.load(Ordering::Acquire) {
-                            tracing::warn!(error = %e, "receive error");
+                tokio::select! {
+                    result = receiver.recv() => {
+                        match result {
+                            Ok((data, source)) => {
+                                Self::process_packet(data, source, &session, &inbound, num_shards);
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                                tracing::warn!("batch receiver thread exited, stopping receiver");
+                                break;
+                            }
+                            Err(e) => {
+                                if !shutdown.load(Ordering::Acquire) {
+                                    tracing::warn!(error = %e, "receive error");
+                                }
+                            }
                         }
+                    }
+                    _ = shutdown_notify.notified() => {
+                        break;
                     }
                 }
             }
@@ -573,6 +585,7 @@ impl NetAdapter {
     #[cfg(not(target_os = "linux"))]
     fn spawn_receiver(
         shutdown: Arc<AtomicBool>,
+        shutdown_notify: Arc<Notify>,
         socket: Arc<Socket>,
         session: Arc<NetSession>,
         inbound: InboundQueues,
@@ -582,14 +595,24 @@ impl NetAdapter {
             let mut receiver = PacketReceiver::new(socket.socket_arc());
 
             while !shutdown.load(Ordering::Acquire) {
-                match receiver.recv().await {
-                    Ok((data, source)) => {
-                        Self::process_packet(data, source, &session, &inbound, num_shards);
-                    }
-                    Err(e) => {
-                        if !shutdown.load(Ordering::Acquire) {
-                            tracing::warn!(error = %e, "receive error");
+                // Race recv against shutdown notification so the task
+                // can exit promptly instead of blocking on recv_from
+                // until a packet arrives.
+                tokio::select! {
+                    result = receiver.recv() => {
+                        match result {
+                            Ok((data, source)) => {
+                                Self::process_packet(data, source, &session, &inbound, num_shards);
+                            }
+                            Err(e) => {
+                                if !shutdown.load(Ordering::Acquire) {
+                                    tracing::warn!(error = %e, "receive error");
+                                }
+                            }
                         }
+                    }
+                    _ = shutdown_notify.notified() => {
+                        break;
                     }
                 }
             }
@@ -599,6 +622,7 @@ impl NetAdapter {
     /// Spawn heartbeat task.
     fn spawn_heartbeat(
         shutdown: Arc<AtomicBool>,
+        shutdown_notify: Arc<Notify>,
         socket: Arc<Socket>,
         session: Arc<NetSession>,
         interval: std::time::Duration,
@@ -607,19 +631,24 @@ impl NetAdapter {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
 
-            while !shutdown.load(Ordering::Acquire) {
-                ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if shutdown.load(Ordering::Acquire) || !session.is_active() {
+                            break;
+                        }
 
-                if !session.is_active() {
-                    break;
-                }
+                        // Build and send heartbeat
+                        let mut builder = PacketBuilder::new(&[0u8; 32], session.session_id());
+                        let packet = builder.build_heartbeat();
 
-                // Build and send heartbeat
-                let mut builder = PacketBuilder::new(&[0u8; 32], session.session_id());
-                let packet = builder.build_heartbeat();
-
-                if let Err(e) = socket.send_to(&packet, peer_addr).await {
-                    tracing::warn!(error = %e, "heartbeat send failed");
+                        if let Err(e) = socket.send_to(&packet, peer_addr).await {
+                            tracing::warn!(error = %e, "heartbeat send failed");
+                        }
+                    }
+                    _ = shutdown_notify.notified() => {
+                        break;
+                    }
                 }
             }
         })
@@ -671,6 +700,7 @@ impl Adapter for NetAdapter {
         // Spawn background tasks
         let recv_task = Self::spawn_receiver(
             self.shutdown.clone(),
+            self.shutdown_notify.clone(),
             socket.clone(),
             session.clone(),
             self.inbound.clone(),
@@ -679,6 +709,7 @@ impl Adapter for NetAdapter {
 
         let heartbeat_task = Self::spawn_heartbeat(
             self.shutdown.clone(),
+            self.shutdown_notify.clone(),
             socket,
             session,
             self.config.heartbeat_interval,
@@ -717,9 +748,14 @@ impl Adapter for NetAdapter {
         let stream_id = batch.shard_id as u64;
         let peer_addr = session.peer_addr();
 
-        // Get stream state
-        let stream = session.get_or_create_stream(stream_id);
-        let reliable = stream.with_reliability(|r| r.needs_ack());
+        // Read stream config under the lock, then drop it immediately.
+        // Holding the DashMap RefMut across .await would deadlock against
+        // the receiver task which also calls get_or_create_stream().
+        let reliable = {
+            let stream = session.get_or_create_stream(stream_id);
+            stream.with_reliability(|r| r.needs_ack())
+            // RefMut dropped here
+        };
 
         // Convert events to bytes and batch them
         let mut current_batch: Vec<Bytes> = Vec::with_capacity(64);
@@ -735,8 +771,13 @@ impl Adapter for NetAdapter {
 
             // Check if adding this event would exceed packet size
             if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE && !current_batch.is_empty() {
-                // Send current batch
-                let seq = stream.next_tx_seq();
+                // Acquire stream lock briefly for seq + reliability tracking
+                let seq;
+                {
+                    let stream = session.get_or_create_stream(stream_id);
+                    seq = stream.next_tx_seq();
+                }
+
                 let flags = if reliable {
                     PacketFlags::RELIABLE
                 } else {
@@ -745,13 +786,15 @@ impl Adapter for NetAdapter {
 
                 let packet = builder.build(stream_id, seq, &current_batch, flags);
 
+                // No DashMap lock held during this .await
                 socket
                     .send_to(&packet, peer_addr)
                     .await
                     .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
 
-                // Track for reliability
+                // Track for reliability (brief lock)
                 if reliable {
+                    let stream = session.get_or_create_stream(stream_id);
                     stream.with_reliability(|r| r.on_send(seq, packet));
                 }
 
@@ -765,7 +808,12 @@ impl Adapter for NetAdapter {
 
         // Send remaining events
         if !current_batch.is_empty() {
-            let seq = stream.next_tx_seq();
+            let seq;
+            {
+                let stream = session.get_or_create_stream(stream_id);
+                seq = stream.next_tx_seq();
+            }
+
             let flags = if reliable {
                 PacketFlags::RELIABLE
             } else {
@@ -780,6 +828,7 @@ impl Adapter for NetAdapter {
                 .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
 
             if reliable {
+                let stream = session.get_or_create_stream(stream_id);
                 stream.with_reliability(|r| r.on_send(seq, packet));
             }
         }
@@ -840,6 +889,10 @@ impl Adapter for NetAdapter {
 
     async fn shutdown(&self) -> Result<(), AdapterError> {
         self.shutdown.store(true, Ordering::Release);
+
+        // Wake all tasks blocked on I/O so they can observe the shutdown flag.
+        // notify_waiters wakes all current waiters (receiver + heartbeat).
+        self.shutdown_notify.notify_waiters();
 
         // Clear session
         self.session_manager.clear_session();
@@ -1003,5 +1056,56 @@ mod tests {
         // Malformed IDs fall back to string comparison
         assert!(event_id_gt("b", "a"));
         assert!(!event_id_gt("a", "b"));
+    }
+
+    /// Regression: packets built by PacketBuilder must survive process_packet.
+    /// This test bypasses the network and directly verifies the encrypt→decrypt
+    /// data path, catching AAD mismatches, nonce construction bugs, and key
+    /// derivation errors.
+    #[test]
+    fn test_build_then_process_packet_roundtrip() {
+        use crate::adapter::net::crypto::{NoiseHandshake, StaticKeypair};
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        // Perform a real handshake to get matching keys
+        let psk = [0x42u8; 32];
+        let responder_kp = StaticKeypair::generate();
+
+        let mut initiator = NoiseHandshake::initiator(&psk, &responder_kp.public).unwrap();
+        let mut responder = NoiseHandshake::responder(&psk, &responder_kp).unwrap();
+
+        let msg1 = initiator.write_message(&[]).unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(&[]).unwrap();
+        initiator.read_message(&msg2).unwrap();
+
+        let init_keys = initiator.into_session_keys().unwrap();
+        let resp_keys = responder.into_session_keys().unwrap();
+
+        // Initiator builds a packet
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let events = vec![
+            Bytes::from(r#"{"token":"hello"}"#),
+            Bytes::from(r#"{"token":"world"}"#),
+        ];
+        let packet = builder.build(0, 0, &events, PacketFlags::NONE);
+
+        // Responder processes the packet
+        let resp_session = Arc::new(NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false));
+        let inbound: InboundQueues = Arc::new(DashMap::new());
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        NetAdapter::process_packet(packet, source, &resp_session, &inbound, 1);
+
+        // Events should be queued in shard 0
+        let queue = inbound.get(&0).expect("shard 0 should have events");
+        assert_eq!(queue.len(), 2, "expected 2 events, got {}", queue.len());
+
+        let e1 = queue.pop().unwrap();
+        assert_eq!(&e1.raw[..], br#"{"token":"hello"}"#);
+
+        let e2 = queue.pop().unwrap();
+        assert_eq!(&e2.raw[..], br#"{"token":"world"}"#);
     }
 }

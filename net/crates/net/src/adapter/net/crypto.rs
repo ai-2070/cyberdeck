@@ -12,6 +12,7 @@ use chacha20poly1305::{
 };
 use snow::{params::NoiseParams, Builder, HandshakeState};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use super::protocol::{NONCE_SIZE, TAG_SIZE};
 
@@ -280,10 +281,15 @@ impl NoiseHandshake {
 /// - Counter never repeats within a session (AtomicU64)
 /// - Session prefix ensures uniqueness across sessions
 /// - 2^64 packets before rollover (unreachable in practice)
+///
+/// When used inside a `PacketPool`, the TX counter should be shared across
+/// all ciphers in the pool via `with_shared_tx_counter()` to prevent nonce
+/// reuse across concurrent builders.
 pub struct PacketCipher {
     cipher: ChaCha20Poly1305,
     session_prefix: [u8; 4],
-    tx_counter: AtomicU64,
+    /// TX counter — owned or shared with other ciphers in a pool.
+    tx_counter: Arc<AtomicU64>,
     rx_counter: AtomicU64,
 }
 
@@ -293,7 +299,25 @@ impl PacketCipher {
         Self {
             cipher: ChaCha20Poly1305::new(key.into()),
             session_prefix: (session_id as u32).to_le_bytes(),
-            tx_counter: AtomicU64::new(0),
+            tx_counter: Arc::new(AtomicU64::new(0)),
+            rx_counter: AtomicU64::new(0),
+        }
+    }
+
+    /// Create a new cipher that shares a TX counter with other ciphers.
+    ///
+    /// All ciphers sharing the same counter atomically increment it,
+    /// preventing nonce reuse when multiple builders encrypt with the
+    /// same key (e.g., in a `PacketPool`).
+    pub fn with_shared_tx_counter(
+        key: &[u8; 32],
+        session_id: u64,
+        tx_counter: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            cipher: ChaCha20Poly1305::new(key.into()),
+            session_prefix: (session_id as u32).to_le_bytes(),
+            tx_counter,
             rx_counter: AtomicU64::new(0),
         }
     }
