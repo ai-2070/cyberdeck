@@ -1,0 +1,71 @@
+net/crates/net/src/adapter/net/reliability.rs
+  3805edd10065742a 205,233-239,241-246,659-661,667-668,670-674,676-746
+  b1d5ae5a5d9bdfa4 662-666,669,675
+net/crates/net/src/adapter/net/pool.rs
+  3805edd10065742a 141-152,275-280,286-289,357,366,375,384,655,664,673,682,974-1035
+net/crates/net/src/adapter/net/router.rs
+  3805edd10065742a 211-214,226,764-803
+net/crates/net/src/shard/ring_buffer.rs
+  3805edd10065742a 54-59,62-68,94-97,111-127,159-175,200-216,279-293,535-591
+net/crates/net/src/ffi/mod.rs
+  3805edd10065742a 83-87,121-135,358-362,390-392,435-437,480-482,520-522,567-569,655-657,709-711,735-742,744,772-777,896-898,937-939,1076-1078
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "c0af821a4b2b9464dd40c39150e76163affcc0c2",
+  "prompts": {
+    "3805edd10065742a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e6ef9274-357f-4614-affc-4e4ac720b9f8",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 448,
+      "overriden_lines": 0
+    },
+    "75b8fbe288685b96": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b75d121a-3dc9-4fa0-82a8-528ef83df651",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 156,
+      "overriden_lines": 0
+    },
+    "b1d5ae5a5d9bdfa4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "800374d2-a809-4e4a-9adc-45d0b2598c75",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 754,
+      "total_deletions": 100,
+      "accepted_lines": 9,
+      "overriden_lines": 0
+    },
+    "e33ca63076d0343d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "72a93451-3a46-4c03-8dd4-addc974f7ef5",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 469,
+      "overriden_lines": 0
+    }
+  }
+}
