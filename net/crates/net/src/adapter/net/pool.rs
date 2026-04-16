@@ -865,8 +865,6 @@ mod tests {
         let session_id = 0xBBBB;
         let pool = Arc::new(ThreadLocalPool::new(4, &key, session_id));
 
-        let events = vec![Bytes::from_static(b"test")];
-
         // Build packets from two different threads to ensure they get
         // different builders (each thread has its own local cache).
         let pool1 = pool.clone();

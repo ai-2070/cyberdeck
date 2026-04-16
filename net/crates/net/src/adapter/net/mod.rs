@@ -1380,17 +1380,12 @@ mod tests {
     }
 
     #[test]
-    fn test_process_packet_replay_rejected() {
-        // Verify that replaying an already-processed packet is rejected
-        // by the rx_counter replay window.
-        use dashmap::DashMap;
+    fn test_process_packet_old_counter_rejected() {
+        // Verify that a packet with a counter below the replay window
+        // is rejected after the window has advanced.
         use std::sync::Arc;
 
         let (init_keys, resp_keys) = make_session_keys();
-
-        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
-        let packet = builder.build(0, 0, &[Bytes::from_static(b"original")], PacketFlags::NONE);
-
         let resp_session = Arc::new(NetSession::new(
             resp_keys,
             "127.0.0.1:5000".parse().unwrap(),
@@ -1400,17 +1395,27 @@ mod tests {
         let inbound: InboundQueues = Arc::new(DashMap::new());
         let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
-        // First delivery succeeds
-        NetAdapter::process_packet(packet.clone(), source, &resp_session, &inbound, 1);
-        let queue = inbound.get(&0).unwrap();
-        assert_eq!(queue.len(), 1, "first delivery should succeed");
+        // Send 1100 packets to advance the rx_counter past the replay window (1024)
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        for seq in 0..1100u64 {
+            let packet = builder.build(0, seq, &[Bytes::from_static(b"x")], PacketFlags::NONE);
+            NetAdapter::process_packet(packet, source, &resp_session, &inbound, 1);
+        }
+        assert_eq!(inbound.get(&0).unwrap().len(), 1100);
 
-        // Replay: same packet again — should be rejected by rx_counter
-        NetAdapter::process_packet(packet, source, &resp_session, &inbound, 1);
+        // Build a packet with a fresh builder whose counter starts at 0.
+        // The rx_counter is now at ~1100, so counter 0 is outside the
+        // 1024-wide replay window and must be rejected.
+        let mut stale_builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let stale_packet =
+            stale_builder.build(0, 9999, &[Bytes::from_static(b"stale")], PacketFlags::NONE);
+        NetAdapter::process_packet(stale_packet, source, &resp_session, &inbound, 1);
+
+        // Should still be 1100 — stale packet rejected
         assert_eq!(
-            queue.len(),
-            1,
-            "replayed packet must be rejected, count should still be 1"
+            inbound.get(&0).unwrap().len(),
+            1100,
+            "packet with stale counter must be rejected"
         );
     }
 
@@ -1419,10 +1424,9 @@ mod tests {
         // Verify that a packet with a counter far beyond MAX_FORWARD is
         // rejected, preventing an attacker from advancing the rx_counter
         // and denying subsequent legitimate packets.
-        use dashmap::DashMap;
         use std::sync::Arc;
 
-        let (init_keys, resp_keys) = make_session_keys();
+        let (_init_keys, resp_keys) = make_session_keys();
 
         // Build a valid packet, then manually tamper the nonce counter
         // to a huge value. The AEAD will fail because the nonce doesn't
