@@ -1154,3 +1154,100 @@ fn test_regression_full_handler_routing_chain() {
         }
     }
 }
+
+/// Regression: SnapshotReassembler was keyed only by daemon_origin, so chunks
+/// from different seq_through snapshots (e.g., a retry after abort) could be
+/// mixed, producing a corrupt reassembled snapshot. Now keyed by
+/// (daemon_origin, seq_through).
+#[test]
+fn test_regression_reassembler_rejects_mixed_seq_through() {
+    let mut reassembler = SnapshotReassembler::new();
+
+    // Start reassembly for daemon 0xAAAA, seq_through=100
+    let result = reassembler.feed(0xAAAA, vec![1, 2, 3], 100, 0, 2);
+    assert!(result.is_none());
+
+    // New snapshot for same daemon but seq_through=200 (e.g., after abort + retry)
+    let result = reassembler.feed(0xAAAA, vec![4, 5, 6], 200, 0, 2);
+    assert!(result.is_none());
+
+    // Complete the seq_through=200 reassembly
+    let result = reassembler.feed(0xAAAA, vec![7, 8, 9], 200, 1, 2);
+    assert!(result.is_some());
+    let full = result.unwrap();
+    // Must contain only chunks from seq_through=200, not mixed with seq_through=100
+    assert_eq!(full, vec![4, 5, 6, 7, 8, 9]);
+
+    // The stale seq_through=100 reassembly should still be pending (incomplete)
+    assert_eq!(reassembler.pending_count(), 1);
+
+    // Cancel cleans up all pending for this daemon
+    reassembler.cancel(0xAAAA);
+    assert_eq!(reassembler.pending_count(), 0);
+}
+
+/// Regression: Multi-chunk snapshot path in on_snapshot_ready never advanced
+/// MigrationState out of Snapshot phase, breaking subsequent phase transitions
+/// (on_restore_complete would fail with WrongPhase).
+#[test]
+fn test_regression_multi_chunk_advances_past_snapshot_phase() {
+    let reg = Arc::new(DaemonRegistry::new());
+    let (_, origin) = register_counter_daemon(&reg, 10);
+    let orch = MigrationOrchestrator::new(reg.clone(), 0x3333);
+
+    // Start migration (remote source)
+    orch.start_migration(origin, 0x1111, 0x2222).unwrap();
+    assert_eq!(orch.status(origin), Some(MigrationPhase::Snapshot));
+
+    // Simulate first chunk of a multi-chunk snapshot
+    orch.on_snapshot_ready(origin, vec![1, 2, 3], 10, 0, 3)
+        .unwrap();
+
+    // Phase MUST have advanced past Snapshot — otherwise on_restore_complete
+    // would fail because it expects Transfer phase
+    assert_ne!(
+        orch.status(origin),
+        Some(MigrationPhase::Snapshot),
+        "multi-chunk first chunk must advance phase past Snapshot"
+    );
+    assert_eq!(orch.status(origin), Some(MigrationPhase::Transfer));
+
+    // Subsequent chunks should not error
+    orch.on_snapshot_ready(origin, vec![4, 5, 6], 10, 1, 3)
+        .unwrap();
+    orch.on_snapshot_ready(origin, vec![7, 8], 10, 2, 3)
+        .unwrap();
+
+    // on_restore_complete should work now
+    orch.on_restore_complete(origin, 10).unwrap();
+    assert_eq!(orch.status(origin), Some(MigrationPhase::Replay));
+}
+
+/// Regression: chunk_snapshot used an unchecked `as u16` cast for total_chunks,
+/// which would silently overflow for snapshots > 457 MB. Verify that reasonable
+/// sizes work and the chunk count is correct.
+#[test]
+fn test_regression_chunk_count_u16_boundary() {
+    // Exactly 1 chunk
+    let chunks = chunk_snapshot(0xAAAA, vec![0u8; MAX_SNAPSHOT_CHUNK_SIZE], 1);
+    assert_eq!(chunks.len(), 1);
+
+    // Exactly 2 chunks
+    let chunks = chunk_snapshot(0xAAAA, vec![0u8; MAX_SNAPSHOT_CHUNK_SIZE + 1], 1);
+    assert_eq!(chunks.len(), 2);
+
+    // Exactly at boundary
+    let chunks = chunk_snapshot(0xAAAA, vec![0u8; MAX_SNAPSHOT_CHUNK_SIZE * 100], 1);
+    assert_eq!(chunks.len(), 100);
+    for (i, chunk) in chunks.iter().enumerate() {
+        if let MigrationMessage::SnapshotReady {
+            chunk_index,
+            total_chunks,
+            ..
+        } = chunk
+        {
+            assert_eq!(*chunk_index, i as u16);
+            assert_eq!(*total_chunks, 100);
+        }
+    }
+}

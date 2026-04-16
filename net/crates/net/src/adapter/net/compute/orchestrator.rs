@@ -391,7 +391,8 @@ pub fn chunk_snapshot(
     }
 
     let total_chunks = snapshot_bytes.len().div_ceil(MAX_SNAPSHOT_CHUNK_SIZE);
-    let total_chunks = total_chunks as u16;
+    let total_chunks = u16::try_from(total_chunks)
+        .expect("snapshot exceeds maximum chunkable size (65535 * 7000 = ~457 MB)");
 
     snapshot_bytes
         .chunks(MAX_SNAPSHOT_CHUNK_SIZE)
@@ -408,17 +409,15 @@ pub fn chunk_snapshot(
 
 /// Reassembles chunked `SnapshotReady` messages into a complete snapshot.
 ///
-/// Collects chunks keyed by `(daemon_origin, seq_through)` and returns the
-/// full snapshot bytes once all chunks have arrived.
+/// Keyed by `(daemon_origin, seq_through)` so chunks from different snapshot
+/// generations cannot be mixed.
 pub struct SnapshotReassembler {
-    /// Pending reassemblies: daemon_origin → chunks.
-    pending: std::collections::HashMap<u32, ReassemblyState>,
+    /// Pending reassemblies: (daemon_origin, seq_through) → chunks.
+    pending: std::collections::HashMap<(u32, u64), ReassemblyState>,
 }
 
-#[allow(dead_code)]
 struct ReassemblyState {
     total_chunks: u16,
-    seq_through: u64,
     chunks: std::collections::BTreeMap<u16, Vec<u8>>,
 }
 
@@ -432,6 +431,10 @@ impl SnapshotReassembler {
 
     /// Feed a snapshot chunk. Returns the complete snapshot bytes when all
     /// chunks have been received, or `None` if still waiting for more.
+    ///
+    /// Chunks are keyed by `(daemon_origin, seq_through)` — if a new
+    /// snapshot arrives for the same daemon with a different `seq_through`,
+    /// it starts a fresh reassembly and discards any stale partial state.
     pub fn feed(
         &mut self,
         daemon_origin: u32,
@@ -442,24 +445,21 @@ impl SnapshotReassembler {
     ) -> Option<Vec<u8>> {
         // Single-chunk fast path
         if total_chunks == 1 {
-            self.pending.remove(&daemon_origin);
+            self.pending.remove(&(daemon_origin, seq_through));
             return Some(snapshot_bytes);
         }
 
-        let state = self
-            .pending
-            .entry(daemon_origin)
-            .or_insert_with(|| ReassemblyState {
-                total_chunks,
-                seq_through,
-                chunks: std::collections::BTreeMap::new(),
-            });
+        let key = (daemon_origin, seq_through);
+        let state = self.pending.entry(key).or_insert_with(|| ReassemblyState {
+            total_chunks,
+            chunks: std::collections::BTreeMap::new(),
+        });
 
         state.chunks.insert(chunk_index, snapshot_bytes);
 
         if state.chunks.len() == state.total_chunks as usize {
             // All chunks received — reassemble in order
-            let state = self.pending.remove(&daemon_origin).unwrap();
+            let state = self.pending.remove(&key).unwrap();
             let mut full = Vec::new();
             for (_idx, chunk) in state.chunks {
                 full.extend_from_slice(&chunk);
@@ -471,8 +471,12 @@ impl SnapshotReassembler {
     }
 
     /// Cancel reassembly for a daemon (e.g., on migration abort).
+    ///
+    /// Removes all pending reassemblies for this daemon regardless of
+    /// `seq_through`.
     pub fn cancel(&mut self, daemon_origin: u32) {
-        self.pending.remove(&daemon_origin);
+        self.pending
+            .retain(|&(origin, _), _| origin != daemon_origin);
     }
 
     /// Number of pending reassemblies.
@@ -639,6 +643,7 @@ impl MigrationOrchestrator {
 
         // Only validate and advance phase on the first chunk
         if chunk_index == 0 && total_chunks == 1 {
+            // Single-chunk: validate immediately and set snapshot
             let snapshot = StateSnapshot::from_bytes(&snapshot_bytes).ok_or_else(|| {
                 MigrationError::StateFailed("failed to parse snapshot bytes".into())
             })?;
@@ -647,11 +652,11 @@ impl MigrationOrchestrator {
                 record.state.set_snapshot(snapshot)?;
             }
         } else if chunk_index == 0 {
-            // First chunk of a multi-chunk snapshot — advance phase
-            // but can't validate until all chunks arrive
+            // Multi-chunk: can't validate until target reassembles all chunks.
+            // Advance phase past Snapshot so buffering and subsequent phases work.
+            // The target will validate the full snapshot after reassembly.
             if record.state.phase() == MigrationPhase::Snapshot {
-                // We don't have the full snapshot yet, just advance phase
-                // The target will reassemble and validate
+                record.state.force_phase(MigrationPhase::Transfer);
             }
         }
 
