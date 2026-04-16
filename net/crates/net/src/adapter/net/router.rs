@@ -496,11 +496,7 @@ impl NetRouter {
     pub fn stats(&self) -> RouterStats {
         let samples = self.latency_samples.load(Ordering::Relaxed);
         let total_latency = self.total_latency_ns.load(Ordering::Relaxed);
-        let avg_latency = if samples > 0 {
-            total_latency / samples
-        } else {
-            0
-        };
+        let avg_latency = total_latency.checked_div(samples).unwrap_or(0);
 
         RouterStats {
             packets_received: self.packets_received.load(Ordering::Relaxed),

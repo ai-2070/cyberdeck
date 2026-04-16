@@ -349,11 +349,11 @@ impl NetProxy {
     /// Get proxy statistics
     pub fn stats(&self) -> ProxyStats {
         let samples = self.latency_samples.load(Ordering::Relaxed);
-        let avg_latency = if samples > 0 {
-            self.total_latency_ns.load(Ordering::Relaxed) / samples
-        } else {
-            0
-        };
+        let avg_latency = self
+            .total_latency_ns
+            .load(Ordering::Relaxed)
+            .checked_div(samples)
+            .unwrap_or(0);
 
         ProxyStats {
             packets_received: self.packets_received.load(Ordering::Relaxed),

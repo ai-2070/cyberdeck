@@ -737,7 +737,7 @@ impl RecoveryManager {
     pub fn stats(&self) -> RecoveryStats {
         let count = self.recovery_count.load(Ordering::Relaxed);
         let total_time = self.total_recovery_time_ms.load(Ordering::Relaxed);
-        let avg = if count > 0 { total_time / count } else { 0 };
+        let avg = total_time.checked_div(count).unwrap_or(0);
 
         RecoveryStats {
             reroutes: self.reroutes.load(Ordering::Relaxed),

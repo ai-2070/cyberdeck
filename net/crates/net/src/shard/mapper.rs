@@ -188,17 +188,9 @@ impl ShardMetricsCollector {
             0.0
         };
 
-        let avg_push_latency = if push_count > 0 {
-            push_latency_sum / push_count
-        } else {
-            0
-        };
+        let avg_push_latency = push_latency_sum.checked_div(push_count).unwrap_or(0);
 
-        let avg_flush_latency = if flush_count > 0 {
-            flush_latency_sum / flush_count
-        } else {
-            0
-        };
+        let avg_flush_latency = flush_latency_sum.checked_div(flush_count).unwrap_or(0);
 
         // Reset window
         *self.window_start.write() = Instant::now();
