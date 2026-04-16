@@ -826,7 +826,10 @@ mod tests {
         assert_eq!(mode.ack_seq(), 3);
 
         // Spurious seq 0 must be rejected
-        assert!(!mode.on_receive(0), "seq 0 must be rejected after stream advanced past it");
+        assert!(
+            !mode.on_receive(0),
+            "seq 0 must be rejected after stream advanced past it"
+        );
         assert_eq!(mode.ack_seq(), 3, "ack_seq must not reset to 0");
     }
 }
