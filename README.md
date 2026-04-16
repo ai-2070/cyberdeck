@@ -474,7 +474,7 @@ Pool contention (thread-local acquire/release):
 
 All SDKs exceed **2M events/sec** with optimal ingestion patterns. Go achieves zero allocations on raw ingestion. Node.js sync methods are 31x faster than async. Bun batch ingestion is ~17% faster than Node.js.
 
-## Binary size
+### Binary size
 
 Release build with `--features net` only, LTO on, single codegen unit, `panic = "abort"`, `opt-level = 3`:
 
@@ -484,6 +484,7 @@ Release build with `--features net` only, LTO on, single codegen unit, `panic = 
 | `net.pdb` | 1.6 MB | Debug symbols, shipped separately |
 | `libnet.rlib` | 17 MB | Rust static lib with metadata (consumed by Rust) |
 | `net.lib` | 29 MB | C/C++ static lib (pre-LTO, as expected for a `staticlib`) |
+
 Accurate as of April 17, 2025.
 
 Measured on `x86_64-pc-windows-msvc`. The shipped cdylib fits comfortably under 1 MB despite bundling transport, routing, encryption, identity, load balancing, and the full consumer pipeline.
