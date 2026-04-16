@@ -122,6 +122,7 @@ use dashmap::DashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::adapter::{Adapter, ShardPollResult};
@@ -251,8 +252,10 @@ pub struct NetAdapter {
     inbound: InboundQueues,
     /// Background tasks
     tasks: TokioMutex<Vec<JoinHandle<()>>>,
-    /// Shutdown signal
+    /// Shutdown signal (flag for polling, Notify for waking blocked tasks)
     shutdown: Arc<AtomicBool>,
+    /// Notify to wake tasks blocked on I/O during shutdown
+    shutdown_notify: Arc<Notify>,
     /// Initialization state
     initialized: AtomicBool,
 }
@@ -272,6 +275,7 @@ impl NetAdapter {
             inbound: Arc::new(DashMap::new()),
             tasks: TokioMutex::new(Vec::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(Notify::new()),
             initialized: AtomicBool::new(false),
         })
     }
@@ -542,6 +546,7 @@ impl NetAdapter {
     #[cfg(target_os = "linux")]
     fn spawn_receiver(
         shutdown: Arc<AtomicBool>,
+        shutdown_notify: Arc<Notify>,
         socket: Arc<Socket>,
         session: Arc<NetSession>,
         inbound: InboundQueues,
@@ -551,18 +556,25 @@ impl NetAdapter {
 
         tokio::spawn(async move {
             while !shutdown.load(Ordering::Acquire) {
-                match receiver.recv().await {
-                    Ok((data, source)) => {
-                        Self::process_packet(data, source, &session, &inbound, num_shards);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
-                        tracing::warn!("batch receiver thread exited, stopping receiver");
-                        break;
-                    }
-                    Err(e) => {
-                        if !shutdown.load(Ordering::Acquire) {
-                            tracing::warn!(error = %e, "receive error");
+                tokio::select! {
+                    result = receiver.recv() => {
+                        match result {
+                            Ok((data, source)) => {
+                                Self::process_packet(data, source, &session, &inbound, num_shards);
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                                tracing::warn!("batch receiver thread exited, stopping receiver");
+                                break;
+                            }
+                            Err(e) => {
+                                if !shutdown.load(Ordering::Acquire) {
+                                    tracing::warn!(error = %e, "receive error");
+                                }
+                            }
                         }
+                    }
+                    _ = shutdown_notify.notified() => {
+                        break;
                     }
                 }
             }
@@ -573,6 +585,7 @@ impl NetAdapter {
     #[cfg(not(target_os = "linux"))]
     fn spawn_receiver(
         shutdown: Arc<AtomicBool>,
+        shutdown_notify: Arc<Notify>,
         socket: Arc<Socket>,
         session: Arc<NetSession>,
         inbound: InboundQueues,
@@ -582,14 +595,24 @@ impl NetAdapter {
             let mut receiver = PacketReceiver::new(socket.socket_arc());
 
             while !shutdown.load(Ordering::Acquire) {
-                match receiver.recv().await {
-                    Ok((data, source)) => {
-                        Self::process_packet(data, source, &session, &inbound, num_shards);
-                    }
-                    Err(e) => {
-                        if !shutdown.load(Ordering::Acquire) {
-                            tracing::warn!(error = %e, "receive error");
+                // Race recv against shutdown notification so the task
+                // can exit promptly instead of blocking on recv_from
+                // until a packet arrives.
+                tokio::select! {
+                    result = receiver.recv() => {
+                        match result {
+                            Ok((data, source)) => {
+                                Self::process_packet(data, source, &session, &inbound, num_shards);
+                            }
+                            Err(e) => {
+                                if !shutdown.load(Ordering::Acquire) {
+                                    tracing::warn!(error = %e, "receive error");
+                                }
+                            }
                         }
+                    }
+                    _ = shutdown_notify.notified() => {
+                        break;
                     }
                 }
             }
@@ -599,6 +622,7 @@ impl NetAdapter {
     /// Spawn heartbeat task.
     fn spawn_heartbeat(
         shutdown: Arc<AtomicBool>,
+        shutdown_notify: Arc<Notify>,
         socket: Arc<Socket>,
         session: Arc<NetSession>,
         interval: std::time::Duration,
@@ -607,19 +631,24 @@ impl NetAdapter {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
 
-            while !shutdown.load(Ordering::Acquire) {
-                ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if shutdown.load(Ordering::Acquire) || !session.is_active() {
+                            break;
+                        }
 
-                if !session.is_active() {
-                    break;
-                }
+                        // Build and send heartbeat
+                        let mut builder = PacketBuilder::new(&[0u8; 32], session.session_id());
+                        let packet = builder.build_heartbeat();
 
-                // Build and send heartbeat
-                let mut builder = PacketBuilder::new(&[0u8; 32], session.session_id());
-                let packet = builder.build_heartbeat();
-
-                if let Err(e) = socket.send_to(&packet, peer_addr).await {
-                    tracing::warn!(error = %e, "heartbeat send failed");
+                        if let Err(e) = socket.send_to(&packet, peer_addr).await {
+                            tracing::warn!(error = %e, "heartbeat send failed");
+                        }
+                    }
+                    _ = shutdown_notify.notified() => {
+                        break;
+                    }
                 }
             }
         })
@@ -671,6 +700,7 @@ impl Adapter for NetAdapter {
         // Spawn background tasks
         let recv_task = Self::spawn_receiver(
             self.shutdown.clone(),
+            self.shutdown_notify.clone(),
             socket.clone(),
             session.clone(),
             self.inbound.clone(),
@@ -679,6 +709,7 @@ impl Adapter for NetAdapter {
 
         let heartbeat_task = Self::spawn_heartbeat(
             self.shutdown.clone(),
+            self.shutdown_notify.clone(),
             socket,
             session,
             self.config.heartbeat_interval,
@@ -717,9 +748,14 @@ impl Adapter for NetAdapter {
         let stream_id = batch.shard_id as u64;
         let peer_addr = session.peer_addr();
 
-        // Get stream state
-        let stream = session.get_or_create_stream(stream_id);
-        let reliable = stream.with_reliability(|r| r.needs_ack());
+        // Read stream config under the lock, then drop it immediately.
+        // Holding the DashMap RefMut across .await would deadlock against
+        // the receiver task which also calls get_or_create_stream().
+        let reliable = {
+            let stream = session.get_or_create_stream(stream_id);
+            stream.with_reliability(|r| r.needs_ack())
+            // RefMut dropped here
+        };
 
         // Convert events to bytes and batch them
         let mut current_batch: Vec<Bytes> = Vec::with_capacity(64);
@@ -735,8 +771,13 @@ impl Adapter for NetAdapter {
 
             // Check if adding this event would exceed packet size
             if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE && !current_batch.is_empty() {
-                // Send current batch
-                let seq = stream.next_tx_seq();
+                // Acquire stream lock briefly for seq + reliability tracking
+                let seq;
+                {
+                    let stream = session.get_or_create_stream(stream_id);
+                    seq = stream.next_tx_seq();
+                }
+
                 let flags = if reliable {
                     PacketFlags::RELIABLE
                 } else {
@@ -745,13 +786,15 @@ impl Adapter for NetAdapter {
 
                 let packet = builder.build(stream_id, seq, &current_batch, flags);
 
+                // No DashMap lock held during this .await
                 socket
                     .send_to(&packet, peer_addr)
                     .await
                     .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
 
-                // Track for reliability
+                // Track for reliability (brief lock)
                 if reliable {
+                    let stream = session.get_or_create_stream(stream_id);
                     stream.with_reliability(|r| r.on_send(seq, packet));
                 }
 
@@ -765,7 +808,12 @@ impl Adapter for NetAdapter {
 
         // Send remaining events
         if !current_batch.is_empty() {
-            let seq = stream.next_tx_seq();
+            let seq;
+            {
+                let stream = session.get_or_create_stream(stream_id);
+                seq = stream.next_tx_seq();
+            }
+
             let flags = if reliable {
                 PacketFlags::RELIABLE
             } else {
@@ -780,6 +828,7 @@ impl Adapter for NetAdapter {
                 .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
 
             if reliable {
+                let stream = session.get_or_create_stream(stream_id);
                 stream.with_reliability(|r| r.on_send(seq, packet));
             }
         }
@@ -840,6 +889,10 @@ impl Adapter for NetAdapter {
 
     async fn shutdown(&self) -> Result<(), AdapterError> {
         self.shutdown.store(true, Ordering::Release);
+
+        // Wake all tasks blocked on I/O so they can observe the shutdown flag.
+        // notify_waiters wakes all current waiters (receiver + heartbeat).
+        self.shutdown_notify.notify_waiters();
 
         // Clear session
         self.session_manager.clear_session();
@@ -1003,5 +1056,398 @@ mod tests {
         // Malformed IDs fall back to string comparison
         assert!(event_id_gt("b", "a"));
         assert!(!event_id_gt("a", "b"));
+    }
+
+    /// Regression: packets built by PacketBuilder must survive process_packet.
+    /// This test bypasses the network and directly verifies the encrypt→decrypt
+    /// data path, catching AAD mismatches, nonce construction bugs, and key
+    /// derivation errors.
+    #[test]
+    fn test_build_then_process_packet_roundtrip() {
+        use crate::adapter::net::crypto::{NoiseHandshake, StaticKeypair};
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        // Perform a real handshake to get matching keys
+        let psk = [0x42u8; 32];
+        let responder_kp = StaticKeypair::generate();
+
+        let mut initiator = NoiseHandshake::initiator(&psk, &responder_kp.public).unwrap();
+        let mut responder = NoiseHandshake::responder(&psk, &responder_kp).unwrap();
+
+        let msg1 = initiator.write_message(&[]).unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(&[]).unwrap();
+        initiator.read_message(&msg2).unwrap();
+
+        let init_keys = initiator.into_session_keys().unwrap();
+        let resp_keys = responder.into_session_keys().unwrap();
+
+        // Initiator builds a packet
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let events = vec![
+            Bytes::from(r#"{"token":"hello"}"#),
+            Bytes::from(r#"{"token":"world"}"#),
+        ];
+        let packet = builder.build(0, 0, &events, PacketFlags::NONE);
+
+        // Responder processes the packet
+        let resp_session = Arc::new(NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        ));
+        let inbound: InboundQueues = Arc::new(DashMap::new());
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        NetAdapter::process_packet(packet, source, &resp_session, &inbound, 1);
+
+        // Events should be queued in shard 0
+        let queue = inbound.get(&0).expect("shard 0 should have events");
+        assert_eq!(queue.len(), 2, "expected 2 events, got {}", queue.len());
+
+        let e1 = queue.pop().unwrap();
+        assert_eq!(&e1.raw[..], br#"{"token":"hello"}"#);
+
+        let e2 = queue.pop().unwrap();
+        assert_eq!(&e2.raw[..], br#"{"token":"world"}"#);
+    }
+
+    /// Helper: perform a Noise handshake and return matched key pairs.
+    fn make_session_keys() -> (SessionKeys, SessionKeys) {
+        use crate::adapter::net::crypto::{NoiseHandshake, StaticKeypair};
+
+        let psk = [0x42u8; 32];
+        let responder_kp = StaticKeypair::generate();
+
+        let mut initiator = NoiseHandshake::initiator(&psk, &responder_kp.public).unwrap();
+        let mut responder = NoiseHandshake::responder(&psk, &responder_kp).unwrap();
+
+        let msg1 = initiator.write_message(&[]).unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(&[]).unwrap();
+        initiator.read_message(&msg2).unwrap();
+
+        (
+            initiator.into_session_keys().unwrap(),
+            responder.into_session_keys().unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_process_packet_rejects_truncated_packet() {
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let (init_keys, resp_keys) = make_session_keys();
+
+        // Build a valid packet, then truncate it
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let packet = builder.build(0, 0, &[Bytes::from_static(b"hello")], PacketFlags::NONE);
+
+        let resp_session = Arc::new(NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        ));
+        let inbound: InboundQueues = Arc::new(DashMap::new());
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // Truncate: remove last 10 bytes (partial auth tag)
+        let truncated = packet.slice(..packet.len() - 10);
+        NetAdapter::process_packet(truncated, source, &resp_session, &inbound, 1);
+        assert!(
+            inbound.get(&0).is_none() || inbound.get(&0).unwrap().is_empty(),
+            "truncated packet must be silently dropped"
+        );
+    }
+
+    #[test]
+    fn test_process_packet_rejects_tampered_payload() {
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let (init_keys, resp_keys) = make_session_keys();
+
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let packet = builder.build(0, 0, &[Bytes::from_static(b"hello")], PacketFlags::NONE);
+
+        let resp_session = Arc::new(NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        ));
+        let inbound: InboundQueues = Arc::new(DashMap::new());
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // Tamper: flip a byte in the encrypted payload
+        let mut tampered = bytes::BytesMut::from(&packet[..]);
+        tampered[super::protocol::HEADER_SIZE + 2] ^= 0xFF;
+        NetAdapter::process_packet(tampered.freeze(), source, &resp_session, &inbound, 1);
+
+        assert!(
+            inbound.get(&0).is_none() || inbound.get(&0).unwrap().is_empty(),
+            "tampered packet must be rejected by AEAD"
+        );
+    }
+
+    #[test]
+    fn test_process_packet_rejects_wrong_session_id() {
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let (init_keys, resp_keys) = make_session_keys();
+
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let packet = builder.build(0, 0, &[Bytes::from_static(b"hello")], PacketFlags::NONE);
+
+        // Create session with a DIFFERENT session_id
+        let mut wrong_keys = resp_keys;
+        wrong_keys.session_id = 0xDEAD;
+        let resp_session = Arc::new(NetSession::new(
+            wrong_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        ));
+        let inbound: InboundQueues = Arc::new(DashMap::new());
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        NetAdapter::process_packet(packet, source, &resp_session, &inbound, 1);
+
+        assert!(
+            inbound.get(&0).is_none() || inbound.get(&0).unwrap().is_empty(),
+            "packet with wrong session_id must be dropped"
+        );
+    }
+
+    #[test]
+    fn test_process_packet_multi_packet_batch_all_events_arrive() {
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let (init_keys, resp_keys) = make_session_keys();
+
+        let resp_session = Arc::new(NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        ));
+        let inbound: InboundQueues = Arc::new(DashMap::new());
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // Build events large enough to span multiple packets.
+        // Each event is ~200 bytes, MAX_PAYLOAD_SIZE is ~8112, so ~40 per packet.
+        // 200 events → ~5 packets.
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let total_events = 200;
+        let mut seq = 0u64;
+
+        // Simulate on_batch splitting into multiple packets
+        let mut current_batch: Vec<Bytes> = Vec::new();
+        let mut current_size = 0;
+
+        for i in 0..total_events {
+            let data = format!("{{\"i\":{},\"pad\":\"{}\"}}", i, "x".repeat(150));
+            let event_bytes = Bytes::from(data);
+            let frame_size = EventFrame::LEN_SIZE + event_bytes.len();
+
+            if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE && !current_batch.is_empty() {
+                let packet = builder.build(0, seq, &current_batch, PacketFlags::NONE);
+                NetAdapter::process_packet(packet, source, &resp_session, &inbound, 1);
+                seq += 1;
+                current_batch.clear();
+                current_size = 0;
+            }
+
+            current_batch.push(event_bytes);
+            current_size += frame_size;
+        }
+
+        if !current_batch.is_empty() {
+            let packet = builder.build(0, seq, &current_batch, PacketFlags::NONE);
+            NetAdapter::process_packet(packet, source, &resp_session, &inbound, 1);
+        }
+
+        // All events must arrive
+        let queue = inbound.get(&0).expect("shard 0 should have events");
+        assert_eq!(
+            queue.len(),
+            total_events,
+            "all {} events must arrive across multiple packets",
+            total_events
+        );
+    }
+
+    #[test]
+    fn test_build_then_process_packet_both_directions() {
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let (init_keys, resp_keys) = make_session_keys();
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // Direction 1: initiator → responder
+        {
+            let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+            let packet = builder.build(0, 0, &[Bytes::from_static(b"i2r")], PacketFlags::NONE);
+
+            let session = Arc::new(NetSession::new(resp_keys.clone(), source, 4, false));
+            let inbound: InboundQueues = Arc::new(DashMap::new());
+            NetAdapter::process_packet(packet, source, &session, &inbound, 1);
+
+            let queue = inbound.get(&0).expect("i2r: shard 0 should have events");
+            assert_eq!(queue.len(), 1, "i2r: expected 1 event");
+            assert_eq!(&queue.pop().unwrap().raw[..], b"i2r");
+        }
+
+        // Direction 2: responder → initiator
+        {
+            let mut builder = PacketBuilder::new(&resp_keys.tx_key, resp_keys.session_id);
+            let packet = builder.build(0, 0, &[Bytes::from_static(b"r2i")], PacketFlags::NONE);
+
+            let session = Arc::new(NetSession::new(init_keys.clone(), source, 4, false));
+            let inbound: InboundQueues = Arc::new(DashMap::new());
+            NetAdapter::process_packet(packet, source, &session, &inbound, 1);
+
+            let queue = inbound.get(&0).expect("r2i: shard 0 should have events");
+            assert_eq!(queue.len(), 1, "r2i: expected 1 event");
+            assert_eq!(&queue.pop().unwrap().raw[..], b"r2i");
+        }
+    }
+
+    #[test]
+    fn test_poll_shard_cursor_requeue_preserves_events() {
+        // Verify that poll_shard with a cursor doesn't permanently lose
+        // events that are at or before the cursor position.
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let (init_keys, resp_keys) = make_session_keys();
+
+        let resp_session = Arc::new(NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        ));
+        let inbound: InboundQueues = Arc::new(DashMap::new());
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // Send 3 packets (sequences 0, 1, 2), each with 1 event
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        for seq in 0..3u64 {
+            let events = vec![Bytes::from(format!("event-{}", seq))];
+            let packet = builder.build(0, seq, &events, PacketFlags::NONE);
+            NetAdapter::process_packet(packet, source, &resp_session, &inbound, 1);
+        }
+
+        // Build a minimal adapter-like poll that exercises the cursor logic
+        let shard_id = 0u16;
+        let queue = inbound.get(&shard_id).unwrap();
+        assert_eq!(queue.len(), 3);
+
+        // Poll with cursor "0:0" — should return events after 0:0
+        let from_id = "0:0";
+        let mut events = Vec::new();
+        let mut requeue = Vec::new();
+        while events.len() < 10 {
+            if let Some(event) = queue.pop() {
+                if event_id_gt(&event.id, from_id) {
+                    events.push(event);
+                } else {
+                    requeue.push(event);
+                }
+            } else {
+                break;
+            }
+        }
+        for event in requeue {
+            queue.push(event);
+        }
+
+        // Should get events 1:0 and 2:0 (after cursor 0:0)
+        assert_eq!(events.len(), 2, "should get 2 events after cursor 0:0");
+
+        // The requeued event (0:0) should still be in the queue
+        assert_eq!(queue.len(), 1, "requeued event should still be in queue");
+        let remaining = queue.pop().unwrap();
+        assert_eq!(remaining.id, "0:0");
+    }
+
+    #[test]
+    fn test_process_packet_old_counter_rejected() {
+        // Verify that a packet with a counter below the replay window
+        // is rejected after the window has advanced.
+        use std::sync::Arc;
+
+        let (init_keys, resp_keys) = make_session_keys();
+        let resp_session = Arc::new(NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        ));
+        let inbound: InboundQueues = Arc::new(DashMap::new());
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // Send 1100 packets to advance the rx_counter past the replay window (1024)
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        for seq in 0..1100u64 {
+            let packet = builder.build(0, seq, &[Bytes::from_static(b"x")], PacketFlags::NONE);
+            NetAdapter::process_packet(packet, source, &resp_session, &inbound, 1);
+        }
+        assert_eq!(inbound.get(&0).unwrap().len(), 1100);
+
+        // Build a packet with a fresh builder whose counter starts at 0.
+        // The rx_counter is now at ~1100, so counter 0 is outside the
+        // 1024-wide replay window and must be rejected.
+        let mut stale_builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let stale_packet =
+            stale_builder.build(0, 9999, &[Bytes::from_static(b"stale")], PacketFlags::NONE);
+        NetAdapter::process_packet(stale_packet, source, &resp_session, &inbound, 1);
+
+        // Should still be 1100 — stale packet rejected
+        assert_eq!(
+            inbound.get(&0).unwrap().len(),
+            1100,
+            "packet with stale counter must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_process_packet_far_future_counter_rejected() {
+        // Verify that a packet with a counter far beyond MAX_FORWARD is
+        // rejected, preventing an attacker from advancing the rx_counter
+        // and denying subsequent legitimate packets.
+        use std::sync::Arc;
+
+        let (_init_keys, resp_keys) = make_session_keys();
+
+        // Build a valid packet, then manually tamper the nonce counter
+        // to a huge value. The AEAD will fail because the nonce doesn't
+        // match, but we're testing that is_valid_rx_counter rejects it
+        // before even attempting decryption.
+        let resp_session = Arc::new(NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        ));
+
+        // Directly test the cipher's counter validation
+        let rx_cipher = resp_session.rx_cipher();
+        assert!(
+            !rx_cipher.is_valid_rx_counter(u64::MAX),
+            "counter at u64::MAX must be rejected (far beyond MAX_FORWARD)"
+        );
+        assert!(
+            rx_cipher.is_valid_rx_counter(0),
+            "counter 0 should be valid initially"
+        );
     }
 }

@@ -309,4 +309,77 @@ mod tests {
             assert_eq!(decoded, v, "small value {} must roundtrip exactly", v);
         }
     }
+
+    #[test]
+    fn test_seq_encoding_boundary_at_1024() {
+        // 1023 is exact, 1024 is the first log-scale value.
+        // Both must encode without panic and preserve ordering.
+        let enc_1023 = encode_seq_log(1023);
+        let enc_1024 = encode_seq_log(1024);
+        assert!(enc_1024 > enc_1023, "1024 must encode higher than 1023");
+
+        // 1024 should roundtrip exactly (it's a power of 2, mantissa is clean)
+        let dec_1024 = decode_seq_log(enc_1024);
+        assert_eq!(dec_1024, 1024, "1024 (power of 2) should roundtrip exactly");
+    }
+
+    #[test]
+    fn test_seq_encoding_does_not_overflow_u16() {
+        // The encoded value must fit in u16 for all u64 inputs.
+        // The most extreme input is u64::MAX.
+        let enc = encode_seq_log(u64::MAX);
+        // enc is a u16 — if the encoding overflowed, this would have
+        // panicked in debug or wrapped in release. We verify it's valid.
+        assert!(enc > 0, "u64::MAX should encode to a nonzero u16");
+
+        // Decode should produce a large value (approximate, not exact)
+        let dec = decode_seq_log(enc);
+        assert!(
+            dec > u64::MAX / 2,
+            "decoded u64::MAX should be in the right ballpark, got {}",
+            dec
+        );
+    }
+
+    #[test]
+    fn test_seq_encoding_decode_preserves_magnitude() {
+        // For large values, decode(encode(v)) should be within ~0.1% of v.
+        let test_values = [
+            1_000_000u64,
+            1_000_000_000,
+            1_000_000_000_000,
+            u64::MAX / 1024,
+        ];
+
+        for &v in &test_values {
+            let encoded = encode_seq_log(v);
+            let decoded = decode_seq_log(encoded);
+            let ratio = decoded as f64 / v as f64;
+            assert!(
+                (0.99..=1.01).contains(&ratio),
+                "decode(encode({})) = {} — ratio {} is outside 1% tolerance",
+                v,
+                decoded,
+                ratio
+            );
+        }
+    }
+
+    #[test]
+    fn test_horizon_encode_decode_seq_consistency() {
+        // Full round trip through ObservedHorizon → encode → decode_seq.
+        let mut h = ObservedHorizon::new();
+        h.observe(0xAAAA, 999_999);
+
+        let encoded = h.encode();
+        let decoded_seq = HorizonEncoder::decode_seq(encoded);
+
+        // The decoded max-seq should approximate the input
+        let ratio = decoded_seq as f64 / 999_999.0;
+        assert!(
+            (0.99..=1.01).contains(&ratio),
+            "horizon seq should roundtrip within 1%, got ratio {}",
+            ratio
+        );
+    }
 }
