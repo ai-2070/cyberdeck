@@ -48,6 +48,27 @@ impl DaemonHost {
         }
     }
 
+    /// Create a host from a fork.
+    ///
+    /// Uses a pre-built `CausalChainBuilder` from `fork_entity()` whose
+    /// genesis link carries the fork sentinel as `parent_hash`. The daemon
+    /// starts fresh (no state to restore) but its chain documents lineage.
+    pub fn from_fork(
+        daemon: Box<dyn MeshDaemon>,
+        keypair: EntityKeypair,
+        chain: CausalChainBuilder,
+        config: DaemonHostConfig,
+    ) -> Self {
+        Self {
+            daemon,
+            keypair,
+            chain,
+            horizon: ObservedHorizon::new(),
+            config,
+            stats: DaemonStats::default(),
+        }
+    }
+
     /// Restore from an L4 `StateSnapshot`.
     ///
     /// Rebuilds the causal chain from the snapshot's head link and calls

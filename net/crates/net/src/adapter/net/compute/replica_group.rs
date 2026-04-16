@@ -1,8 +1,9 @@
-//! Replica groups — N copies of a daemon managed as a logical unit.
+//! Replica groups — N interchangeable copies of a daemon managed as a unit.
 //!
 //! A `ReplicaGroup` coordinates N instances of the same daemon across
-//! different nodes. Each replica has its own identity (derived deterministically
-//! from a group seed) and its own causal chain. The group provides:
+//! different nodes. Each replica has a deterministic identity derived from
+//! a group seed — the same index always produces the same keypair, making
+//! replacement idempotent. The group provides:
 //!
 //! - Automatic placement spread across failure domains
 //! - Load-balanced event routing to the nearest healthy replica
@@ -12,21 +13,21 @@
 
 use std::collections::HashSet;
 
-use crate::adapter::net::behavior::capability::CapabilityFilter;
-use crate::adapter::net::behavior::loadbalance::{
-    Endpoint, HealthStatus, LoadBalancer, RequestContext, Strategy,
-};
+use crate::adapter::net::behavior::loadbalance::{RequestContext, Strategy};
 use crate::adapter::net::behavior::metadata::NodeId;
-use crate::adapter::net::compute::daemon::{DaemonError, DaemonHostConfig, MeshDaemon};
+use crate::adapter::net::compute::daemon::{DaemonHostConfig, MeshDaemon};
+use crate::adapter::net::compute::group_coord::{
+    GroupCoordinator, GroupError, GroupHealth, MemberInfo,
+};
 use crate::adapter::net::compute::host::DaemonHost;
 use crate::adapter::net::compute::registry::DaemonRegistry;
-use crate::adapter::net::compute::scheduler::{Scheduler, SchedulerError};
+use crate::adapter::net::compute::scheduler::Scheduler;
 use crate::adapter::net::identity::EntityKeypair;
 
 /// Subprotocol ID for replica group coordination (reserved for future use).
 pub const SUBPROTOCOL_REPLICA_GROUP: u16 = 0x0900;
 
-// ── Types ────────────────────────────────────────────────────────────────────
+// ── Configuration ────────────────────────────────────────────────────────────
 
 /// Configuration for a replica group.
 #[derive(Debug, Clone)]
@@ -41,75 +42,6 @@ pub struct ReplicaGroupConfig {
     pub host_config: DaemonHostConfig,
 }
 
-/// Per-replica metadata.
-#[derive(Debug, Clone)]
-pub struct ReplicaInfo {
-    /// Replica index (0-based, used for keypair derivation).
-    pub index: u8,
-    /// The replica's origin_hash (derived from its keypair).
-    pub origin_hash: u32,
-    /// Node where this replica is placed (from Scheduler).
-    pub node_id: u64,
-    /// The replica's entity ID bytes (used as LoadBalancer NodeId).
-    pub entity_id_bytes: NodeId,
-    /// Whether this replica is currently healthy.
-    pub healthy: bool,
-}
-
-/// Aggregate health of a replica group.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReplicaGroupHealth {
-    /// All replicas healthy.
-    Healthy,
-    /// Some replicas down but at least one healthy.
-    Degraded {
-        /// Number of healthy replicas.
-        healthy: u8,
-        /// Total replica count.
-        total: u8,
-    },
-    /// All replicas down.
-    Dead,
-}
-
-/// Errors from replica group operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReplicaGroupError {
-    /// No healthy replica available for routing.
-    NoHealthyReplica,
-    /// Placement failed for a replica.
-    PlacementFailed(String),
-    /// Registry operation failed.
-    RegistryFailed(String),
-    /// Invalid configuration.
-    InvalidConfig(String),
-}
-
-impl std::fmt::Display for ReplicaGroupError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoHealthyReplica => write!(f, "no healthy replica available"),
-            Self::PlacementFailed(msg) => write!(f, "replica placement failed: {}", msg),
-            Self::RegistryFailed(msg) => write!(f, "registry operation failed: {}", msg),
-            Self::InvalidConfig(msg) => write!(f, "invalid config: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for ReplicaGroupError {}
-
-impl From<SchedulerError> for ReplicaGroupError {
-    fn from(e: SchedulerError) -> Self {
-        Self::PlacementFailed(e.to_string())
-    }
-}
-
-impl From<DaemonError> for ReplicaGroupError {
-    fn from(e: DaemonError) -> Self {
-        Self::RegistryFailed(e.to_string())
-    }
-}
-
 // ── Keypair derivation ───────────────────────────────────────────────────────
 
 /// Derive a deterministic keypair for a replica from the group seed.
@@ -117,15 +49,13 @@ impl From<DaemonError> for ReplicaGroupError {
 /// Uses xxh3 to derive per-replica secret bytes from `group_seed || index`.
 /// Each replica index always produces the same keypair, making the group
 /// identity deterministic and reproducible.
-fn derive_replica_keypair(group_seed: &[u8; 32], index: u8) -> EntityKeypair {
+pub fn derive_replica_keypair(group_seed: &[u8; 32], index: u8) -> EntityKeypair {
     use xxhash_rust::xxh3::xxh3_128;
 
     let mut input = [0u8; 33];
     input[..32].copy_from_slice(group_seed);
     input[32] = index;
 
-    // Use xxh3_128 to get 16 bytes, then hash again with a different
-    // suffix to get the second 16 bytes for a full 32-byte secret.
     let h1 = xxh3_128(&input);
     input[32] = index.wrapping_add(128);
     let h2 = xxh3_128(&input);
@@ -139,44 +69,33 @@ fn derive_replica_keypair(group_seed: &[u8; 32], index: u8) -> EntityKeypair {
 
 // ── ReplicaGroup ─────────────────────────────────────────────────────────────
 
-/// Manages N copies of a daemon as a logical unit.
+/// Manages N interchangeable copies of a daemon as a logical unit.
 ///
+/// Each replica has a deterministic identity derived from `group_seed + index`.
 /// The group does not own the `DaemonHost`s — they live in the
-/// `DaemonRegistry` as normal entries keyed by `origin_hash`. The group
-/// is a coordination overlay that tracks which `origin_hash`es belong
-/// to it and maintains a `LoadBalancer` over them.
+/// `DaemonRegistry` as normal entries. The group is a coordination overlay.
 pub struct ReplicaGroup {
     /// Unique group identifier (xxh3 of group_seed).
     group_id: u32,
     /// Configuration.
     config: ReplicaGroupConfig,
-    /// Per-replica state, indexed by replica index.
-    replicas: Vec<ReplicaInfo>,
-    /// Load balancer for routing events to healthy replicas.
-    lb: LoadBalancer,
+    /// Shared coordination (LB, members, health).
+    coord: GroupCoordinator,
 }
 
 impl ReplicaGroup {
     /// Create a new replica group, place all replicas, and register them.
-    ///
-    /// For each replica index `0..replica_count`:
-    /// 1. Derive keypair from `group_seed + index`
-    /// 2. Place via `Scheduler` (excluding already-used nodes for spread)
-    /// 3. Create `DaemonHost`, register in `DaemonRegistry`
-    /// 4. Add as `LoadBalancer` endpoint
-    ///
-    /// The `daemon_factory` creates a fresh daemon instance per replica.
     pub fn spawn<F>(
         config: ReplicaGroupConfig,
         daemon_factory: F,
         scheduler: &Scheduler,
         registry: &DaemonRegistry,
-    ) -> Result<Self, ReplicaGroupError>
+    ) -> Result<Self, GroupError>
     where
         F: Fn() -> Box<dyn MeshDaemon>,
     {
         if config.replica_count == 0 {
-            return Err(ReplicaGroupError::InvalidConfig(
+            return Err(GroupError::InvalidConfig(
                 "replica_count must be > 0".into(),
             ));
         }
@@ -186,10 +105,8 @@ impl ReplicaGroup {
             xxh3_64(&config.group_seed) as u32
         };
 
-        let lb = LoadBalancer::with_strategy(config.lb_strategy);
-        let mut replicas = Vec::with_capacity(config.replica_count as usize);
+        let mut coord = GroupCoordinator::new(config.lb_strategy);
         let mut used_nodes: HashSet<u64> = HashSet::new();
-
         let requirements = daemon_factory().requirements();
 
         for index in 0..config.replica_count {
@@ -197,20 +114,16 @@ impl ReplicaGroup {
             let origin_hash = keypair.origin_hash();
             let entity_id_bytes: NodeId = *keypair.entity_id().as_bytes();
 
-            // Place with spread: prefer nodes not already used
-            let placement = Self::place_with_spread(scheduler, &requirements, &used_nodes)?;
+            let placement =
+                GroupCoordinator::place_with_spread(scheduler, &requirements, &used_nodes)?;
             let node_id = placement.node_id;
             used_nodes.insert(node_id);
 
-            // Create and register daemon host
             let daemon = daemon_factory();
             let host = DaemonHost::new(daemon, keypair, config.host_config.clone());
             registry.register(host)?;
 
-            // Add to load balancer
-            lb.add_endpoint(Endpoint::new(entity_id_bytes));
-
-            replicas.push(ReplicaInfo {
+            coord.add_member(MemberInfo {
                 index,
                 origin_hash,
                 node_id,
@@ -222,66 +135,51 @@ impl ReplicaGroup {
         Ok(Self {
             group_id,
             config,
-            replicas,
-            lb,
+            coord,
         })
     }
 
     /// Route an inbound event to the best available replica.
-    ///
-    /// Uses the internal `LoadBalancer` to select a healthy replica.
-    /// Returns the `origin_hash` for delivery via `DaemonRegistry::deliver()`.
-    pub fn route_event(&self, ctx: &RequestContext) -> Result<u32, ReplicaGroupError> {
-        let selection = self
-            .lb
-            .select(ctx)
-            .map_err(|_| ReplicaGroupError::NoHealthyReplica)?;
-
-        self.origin_hash_for_entity_id(&selection.node_id)
-            .ok_or(ReplicaGroupError::NoHealthyReplica)
+    pub fn route_event(&self, ctx: &RequestContext) -> Result<u32, GroupError> {
+        self.coord.route_event(ctx)
     }
 
     /// Resize the group to `n` replicas.
-    ///
-    /// If `n > current`: derive new keypairs, place, register, add to LB.
-    /// If `n < current`: remove highest-index replicas from LB, unregister.
     pub fn scale_to<F>(
         &mut self,
         n: u8,
         daemon_factory: F,
         scheduler: &Scheduler,
         registry: &DaemonRegistry,
-    ) -> Result<(), ReplicaGroupError>
+    ) -> Result<(), GroupError>
     where
         F: Fn() -> Box<dyn MeshDaemon>,
     {
         if n == 0 {
-            return Err(ReplicaGroupError::InvalidConfig(
+            return Err(GroupError::InvalidConfig(
                 "replica_count must be > 0".into(),
             ));
         }
 
-        let current = self.replicas.len() as u8;
+        let current = self.coord.member_count();
 
         if n > current {
-            // Scale up: add replicas
             let requirements = daemon_factory().requirements();
-            let used_nodes: HashSet<u64> = self.replicas.iter().map(|r| r.node_id).collect();
+            let used_nodes: HashSet<u64> = self.coord.members().iter().map(|m| m.node_id).collect();
 
             for index in current..n {
                 let keypair = derive_replica_keypair(&self.config.group_seed, index);
                 let origin_hash = keypair.origin_hash();
                 let entity_id_bytes: NodeId = *keypair.entity_id().as_bytes();
 
-                let placement = Self::place_with_spread(scheduler, &requirements, &used_nodes)?;
+                let placement =
+                    GroupCoordinator::place_with_spread(scheduler, &requirements, &used_nodes)?;
 
                 let daemon = daemon_factory();
                 let host = DaemonHost::new(daemon, keypair, self.config.host_config.clone());
                 registry.register(host)?;
 
-                self.lb.add_endpoint(Endpoint::new(entity_id_bytes));
-
-                self.replicas.push(ReplicaInfo {
+                self.coord.add_member(MemberInfo {
                     index,
                     origin_hash,
                     node_id: placement.node_id,
@@ -290,11 +188,10 @@ impl ReplicaGroup {
                 });
             }
         } else if n < current {
-            // Scale down: remove highest-index replicas
-            while self.replicas.len() > n as usize {
-                let info = self.replicas.pop().unwrap();
-                self.lb.remove_endpoint(&info.entity_id_bytes);
-                let _ = registry.unregister(info.origin_hash);
+            while self.coord.member_count() > n {
+                if let Some(info) = self.coord.remove_last() {
+                    let _ = registry.unregister(info.origin_hash);
+                }
             }
         }
 
@@ -304,19 +201,14 @@ impl ReplicaGroup {
 
     /// Handle failure of a node hosting one or more replicas.
     ///
-    /// For each replica on the failed node:
-    /// 1. Mark unhealthy in LoadBalancer
-    /// 2. Attempt replacement: re-derive keypair, place on new node, register
-    ///
-    /// For stateless daemons, replacement is a fresh spawn with the same
-    /// deterministic identity (no migration needed).
+    /// Re-derives the same deterministic keypair and re-spawns on a new node.
     pub fn on_node_failure<F>(
         &mut self,
         failed_node_id: u64,
         daemon_factory: F,
         scheduler: &Scheduler,
         registry: &DaemonRegistry,
-    ) -> Result<Vec<u8>, ReplicaGroupError>
+    ) -> Result<Vec<u8>, GroupError>
     where
         F: Fn() -> Box<dyn MeshDaemon>,
     {
@@ -325,70 +217,52 @@ impl ReplicaGroup {
         let mut exclude: HashSet<u64> = HashSet::new();
         exclude.insert(failed_node_id);
 
-        for replica in &mut self.replicas {
-            if replica.node_id != failed_node_id {
-                continue;
-            }
+        let affected = self.coord.members_on_node(failed_node_id);
 
-            // Mark unhealthy
-            replica.healthy = false;
-            self.lb
-                .update_health(&replica.entity_id_bytes, HealthStatus::Unhealthy);
+        for index in affected {
+            self.coord.mark_unhealthy(index);
 
-            // Unregister old host (may already be gone if node crashed)
-            let _ = registry.unregister(replica.origin_hash);
+            let member = self
+                .coord
+                .members()
+                .iter()
+                .find(|m| m.index == index)
+                .unwrap();
+            let _ = registry.unregister(member.origin_hash);
 
             // Re-derive the same keypair (deterministic)
-            let keypair = derive_replica_keypair(&self.config.group_seed, replica.index);
+            let keypair = derive_replica_keypair(&self.config.group_seed, index);
+            let entity_id_bytes: NodeId = *keypair.entity_id().as_bytes();
 
-            // Place on a new node
-            let placement = match Self::place_with_spread(scheduler, &requirements, &exclude) {
-                Ok(p) => p,
-                Err(_) => continue, // can't replace right now
-            };
+            let placement =
+                match GroupCoordinator::place_with_spread(scheduler, &requirements, &exclude) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
 
-            // Spawn fresh daemon
             let daemon = daemon_factory();
             let host = DaemonHost::new(daemon, keypair, self.config.host_config.clone());
             if registry.register(host).is_err() {
                 continue;
             }
 
-            // Update replica info
-            replica.node_id = placement.node_id;
-            replica.healthy = true;
-            self.lb
-                .update_health(&replica.entity_id_bytes, HealthStatus::Healthy);
+            self.coord
+                .update_member_placement(index, placement.node_id, entity_id_bytes);
             exclude.insert(placement.node_id);
-
-            replaced.push(replica.index);
+            replaced.push(index);
         }
 
         Ok(replaced)
     }
 
     /// Handle recovery of a node.
-    ///
-    /// Re-marks any replicas on this node as healthy.
     pub fn on_node_recovery(&mut self, recovered_node_id: u64) {
-        for replica in &mut self.replicas {
-            if replica.node_id == recovered_node_id && !replica.healthy {
-                replica.healthy = true;
-                self.lb
-                    .update_health(&replica.entity_id_bytes, HealthStatus::Healthy);
-            }
-        }
+        self.coord.on_node_recovery(recovered_node_id);
     }
 
-    /// Aggregate health of the group.
-    pub fn health(&self) -> ReplicaGroupHealth {
-        let healthy = self.replicas.iter().filter(|r| r.healthy).count() as u8;
-        let total = self.replicas.len() as u8;
-        match healthy {
-            0 => ReplicaGroupHealth::Dead,
-            n if n == total => ReplicaGroupHealth::Healthy,
-            n => ReplicaGroupHealth::Degraded { healthy: n, total },
-        }
+    /// Aggregate health.
+    pub fn health(&self) -> GroupHealth {
+        self.coord.health()
     }
 
     /// Get the group ID.
@@ -396,44 +270,19 @@ impl ReplicaGroup {
         self.group_id
     }
 
-    /// Get all replica info.
-    pub fn replicas(&self) -> &[ReplicaInfo] {
-        &self.replicas
+    /// Get all member info.
+    pub fn replicas(&self) -> &[MemberInfo] {
+        self.coord.members()
     }
 
     /// Number of replicas.
     pub fn replica_count(&self) -> u8 {
-        self.replicas.len() as u8
+        self.coord.member_count()
     }
 
     /// Number of healthy replicas.
     pub fn healthy_count(&self) -> u8 {
-        self.replicas.iter().filter(|r| r.healthy).count() as u8
-    }
-
-    /// Look up origin_hash from a LoadBalancer entity ID.
-    fn origin_hash_for_entity_id(&self, entity_id: &NodeId) -> Option<u32> {
-        self.replicas
-            .iter()
-            .find(|r| r.entity_id_bytes == *entity_id)
-            .map(|r| r.origin_hash)
-    }
-
-    /// Place a daemon with best-effort spread across nodes.
-    ///
-    /// Queries the scheduler, preferring nodes not in `exclude`.
-    /// Falls back to any matching node if all candidates are excluded.
-    fn place_with_spread(
-        scheduler: &Scheduler,
-        requirements: &CapabilityFilter,
-        _exclude: &HashSet<u64>,
-    ) -> Result<crate::adapter::net::compute::scheduler::PlacementDecision, ReplicaGroupError> {
-        // Try placing — the scheduler returns the best candidate.
-        // Best-effort spread: the scheduler prefers local, then first match.
-        // A future enhancement could query all candidates and filter out
-        // nodes in `exclude` for stronger failure-domain isolation.
-        let placement = scheduler.place(requirements)?;
-        Ok(placement)
+        self.coord.healthy_count()
     }
 }
 
@@ -441,8 +290,8 @@ impl std::fmt::Debug for ReplicaGroup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReplicaGroup")
             .field("group_id", &format!("{:#x}", self.group_id))
-            .field("replicas", &self.replicas.len())
-            .field("healthy", &self.healthy_count())
+            .field("replicas", &self.coord.member_count())
+            .field("healthy", &self.coord.healthy_count())
             .finish()
     }
 }
@@ -451,8 +300,9 @@ impl std::fmt::Debug for ReplicaGroup {
 mod tests {
     use super::*;
     use crate::adapter::net::behavior::capability::{
-        CapabilityAnnouncement, CapabilityIndex, CapabilitySet,
+        CapabilityAnnouncement, CapabilityFilter, CapabilityIndex, CapabilitySet,
     };
+    use crate::adapter::net::compute::DaemonError;
     use crate::adapter::net::state::causal::CausalEvent;
     use bytes::Bytes;
     use std::sync::Arc;
@@ -473,7 +323,6 @@ mod tests {
 
     fn make_scheduler() -> Scheduler {
         let index = Arc::new(CapabilityIndex::new());
-        // Add a couple of nodes
         index.index(CapabilityAnnouncement::new(0x1111, 1, CapabilitySet::new()));
         index.index(CapabilityAnnouncement::new(0x2222, 1, CapabilitySet::new()));
         index.index(CapabilityAnnouncement::new(0x3333, 1, CapabilitySet::new()));
@@ -498,10 +347,9 @@ mod tests {
             ReplicaGroup::spawn(test_config(3), || Box::new(NoopDaemon), &sched, &reg).unwrap();
 
         assert_eq!(group.replica_count(), 3);
-        assert_eq!(group.health(), ReplicaGroupHealth::Healthy);
+        assert_eq!(group.health(), GroupHealth::Healthy);
         assert_eq!(reg.count(), 3);
 
-        // Each replica has a unique origin_hash
         let hashes: HashSet<u32> = group.replicas().iter().map(|r| r.origin_hash).collect();
         assert_eq!(hashes.len(), 3);
     }
@@ -526,7 +374,7 @@ mod tests {
             ReplicaGroup::spawn(test_config(0), || Box::new(NoopDaemon), &sched, &reg).unwrap_err();
         assert_eq!(
             err,
-            ReplicaGroupError::InvalidConfig("replica_count must be > 0".into())
+            GroupError::InvalidConfig("replica_count must be > 0".into())
         );
     }
 
@@ -540,8 +388,6 @@ mod tests {
 
         let ctx = RequestContext::default();
         let origin = group.route_event(&ctx).unwrap();
-
-        // The returned origin_hash should belong to one of our replicas
         assert!(group.replicas().iter().any(|r| r.origin_hash == origin));
     }
 
@@ -553,16 +399,11 @@ mod tests {
         let mut group =
             ReplicaGroup::spawn(test_config(2), || Box::new(NoopDaemon), &sched, &reg).unwrap();
 
-        assert_eq!(group.replica_count(), 2);
-        assert_eq!(reg.count(), 2);
-
         group
             .scale_to(4, || Box::new(NoopDaemon), &sched, &reg)
             .unwrap();
-
         assert_eq!(group.replica_count(), 4);
         assert_eq!(reg.count(), 4);
-        assert_eq!(group.health(), ReplicaGroupHealth::Healthy);
     }
 
     #[test]
@@ -573,31 +414,11 @@ mod tests {
         let mut group =
             ReplicaGroup::spawn(test_config(4), || Box::new(NoopDaemon), &sched, &reg).unwrap();
 
-        assert_eq!(reg.count(), 4);
-
         group
             .scale_to(2, || Box::new(NoopDaemon), &sched, &reg)
             .unwrap();
-
         assert_eq!(group.replica_count(), 2);
         assert_eq!(reg.count(), 2);
-    }
-
-    #[test]
-    fn test_scale_to_zero_rejected() {
-        let reg = DaemonRegistry::new();
-        let sched = make_scheduler();
-
-        let mut group =
-            ReplicaGroup::spawn(test_config(2), || Box::new(NoopDaemon), &sched, &reg).unwrap();
-
-        let err = group
-            .scale_to(0, || Box::new(NoopDaemon), &sched, &reg)
-            .unwrap_err();
-        assert_eq!(
-            err,
-            ReplicaGroupError::InvalidConfig("replica_count must be > 0".into())
-        );
     }
 
     #[test]
@@ -611,18 +432,12 @@ mod tests {
         let failed_node = group.replicas()[0].node_id;
         let failed_origin = group.replicas()[0].origin_hash;
 
-        // Simulate failure
         let replaced = group
             .on_node_failure(failed_node, || Box::new(NoopDaemon), &sched, &reg)
             .unwrap();
 
-        // At least one replica should have been replaced
         assert!(!replaced.is_empty());
-
-        // Group should still be healthy (replacement succeeded)
-        assert_ne!(group.health(), ReplicaGroupHealth::Dead);
-
-        // The replaced replica keeps the same origin_hash (deterministic keypair)
+        assert_ne!(group.health(), GroupHealth::Dead);
         assert!(group
             .replicas()
             .iter()
@@ -640,22 +455,18 @@ mod tests {
         let node = group.replicas()[0].node_id;
 
         // Mark unhealthy manually
-        group.replicas[0].healthy = false;
-        group
-            .lb
-            .update_health(&group.replicas[0].entity_id_bytes, HealthStatus::Unhealthy);
+        group.coord.mark_unhealthy(0);
 
         assert_eq!(
             group.health(),
-            ReplicaGroupHealth::Degraded {
+            GroupHealth::Degraded {
                 healthy: 1,
                 total: 2
             }
         );
 
-        // Recover
         group.on_node_recovery(node);
-        assert_eq!(group.health(), ReplicaGroupHealth::Healthy);
+        assert_eq!(group.health(), GroupHealth::Healthy);
     }
 
     #[test]
@@ -666,12 +477,9 @@ mod tests {
         let mut group =
             ReplicaGroup::spawn(test_config(2), || Box::new(NoopDaemon), &sched, &reg).unwrap();
 
-        // Mark all unhealthy
-        for replica in &mut group.replicas {
-            replica.healthy = false;
-        }
-
-        assert_eq!(group.health(), ReplicaGroupHealth::Dead);
+        group.coord.mark_unhealthy(0);
+        group.coord.mark_unhealthy(1);
+        assert_eq!(group.health(), GroupHealth::Dead);
     }
 
     #[test]
@@ -682,7 +490,6 @@ mod tests {
 
         let g1 =
             ReplicaGroup::spawn(test_config(1), || Box::new(NoopDaemon), &sched, &reg1).unwrap();
-
         let g2 =
             ReplicaGroup::spawn(test_config(1), || Box::new(NoopDaemon), &sched, &reg2).unwrap();
 

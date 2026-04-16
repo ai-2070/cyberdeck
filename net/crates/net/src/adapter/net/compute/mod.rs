@@ -6,6 +6,8 @@
 //! for snapshot-based daemon migration.
 
 mod daemon;
+pub mod fork_group;
+pub mod group_coord;
 mod host;
 mod migration;
 pub mod migration_source;
@@ -16,6 +18,8 @@ pub mod replica_group;
 mod scheduler;
 
 pub use daemon::{DaemonError, DaemonHostConfig, DaemonStats, MeshDaemon};
+pub use fork_group::{ForkGroup, ForkGroupConfig, ForkInfo};
+pub use group_coord::{GroupCoordinator, GroupError, GroupHealth, MemberInfo};
 pub use host::DaemonHost;
 pub use migration::{MigrationError, MigrationPhase, MigrationState, SUBPROTOCOL_MIGRATION};
 pub use migration_source::MigrationSourceHandler;
@@ -25,8 +29,5 @@ pub use orchestrator::{
     MAX_SNAPSHOT_CHUNK_SIZE, MAX_SNAPSHOT_SIZE,
 };
 pub use registry::DaemonRegistry;
-pub use replica_group::{
-    ReplicaGroup, ReplicaGroupConfig, ReplicaGroupError, ReplicaGroupHealth, ReplicaInfo,
-    SUBPROTOCOL_REPLICA_GROUP,
-};
+pub use replica_group::{ReplicaGroup, ReplicaGroupConfig, SUBPROTOCOL_REPLICA_GROUP};
 pub use scheduler::{PlacementDecision, PlacementReason, Scheduler, SchedulerError};
