@@ -65,6 +65,8 @@ use crate::event::{Event, RawEvent};
 
 #[cfg(feature = "net")]
 use crate::adapter::net::{NetAdapterConfig, ReliabilityConfig, StaticKeypair};
+#[cfg(any(feature = "redis", feature = "jetstream", feature = "net"))]
+use crate::config::AdapterConfig;
 #[cfg(feature = "jetstream")]
 use crate::config::JetStreamAdapterConfig;
 #[cfg(feature = "redis")]
@@ -552,12 +554,17 @@ pub extern "C" fn net_poll(
         Err(_) => return NetError::PollFailed.into(),
     };
 
-    // Serialize response
+    // Serialize response, skipping events with corrupt/unparseable raw bytes
+    let parsed_events: Vec<_> = response
+        .events
+        .iter()
+        .filter_map(|e| e.parse().ok())
+        .collect();
     let response_json = match serde_json::to_string(&serde_json::json!({
-        "events": response.events.iter().map(|e| e.parse().unwrap_or(serde_json::Value::Null)).collect::<Vec<_>>(),
+        "events": parsed_events,
         "next_id": response.next_id,
         "has_more": response.has_more,
-        "count": response.events.len(),
+        "count": parsed_events.len(),
     })) {
         Ok(s) => s,
         Err(_) => return NetError::Unknown.into(),

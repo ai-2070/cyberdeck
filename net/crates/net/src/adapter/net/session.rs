@@ -135,7 +135,8 @@ impl NetSession {
     pub fn is_timed_out(&self, timeout: Duration) -> bool {
         let last = self.last_activity.load(Ordering::Acquire);
         let now = current_timestamp();
-        now.saturating_sub(last) > timeout.as_nanos() as u64
+        let timeout_ns = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        now.saturating_sub(last) > timeout_ns
     }
 
     /// Check if session is active

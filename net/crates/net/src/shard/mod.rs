@@ -353,10 +353,13 @@ impl ShardManager {
                 match self.backpressure_mode {
                     BackpressureMode::DropNewest => Err(IngestionError::Backpressure),
                     BackpressureMode::DropOldest => {
-                        // try_push_raw already counted this as a drop, but
-                        // the incoming event isn't actually dropped — the oldest is.
-                        // The net effect is the same (1 drop), so no adjustment needed.
+                        // The failed try_push_raw incremented events_dropped for the
+                        // *new* event, but the new event isn't actually dropped — the
+                        // oldest is. Correct the stats: undo the spurious drop count,
+                        // pop the oldest (which is the real drop), and retry.
+                        shard.stats.events_dropped -= 1;
                         let _ = shard.try_pop();
+                        shard.stats.events_dropped += 1;
                         // Retry with the same bytes (Bytes clone is ref-counted)
                         shard.try_push_raw(raw).map(|ts| (shard_id, ts))
                     }
@@ -404,10 +407,9 @@ impl ShardManager {
                 match self.backpressure_mode {
                     BackpressureMode::DropNewest => Err(IngestionError::Backpressure),
                     BackpressureMode::DropOldest => {
-                        // try_push_raw already counted this as a drop, but
-                        // the incoming event isn't actually dropped — the oldest is.
-                        // The net effect is the same (1 drop), so no adjustment needed.
+                        shard.stats.events_dropped -= 1;
                         let _ = shard.try_pop();
+                        shard.stats.events_dropped += 1;
                         // Retry the push
                         shard.try_push_raw(event.bytes()).map(|ts| (shard_id, ts))
                     }

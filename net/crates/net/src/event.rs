@@ -378,8 +378,10 @@ impl Serialize for StoredEvent {
         use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("StoredEvent", 4)?;
         state.serialize_field("id", &self.id)?;
-        // Serialize raw bytes as a JSON value (parse then embed)
-        let value: JsonValue = serde_json::from_slice(&self.raw).unwrap_or(JsonValue::Null);
+        // Serialize raw bytes as a JSON value (parse then embed).
+        // Propagate errors rather than silently substituting null.
+        let value: JsonValue = serde_json::from_slice(&self.raw)
+            .map_err(|e| serde::ser::Error::custom(format!("invalid raw JSON: {}", e)))?;
         state.serialize_field("raw", &value)?;
         state.serialize_field("insertion_ts", &self.insertion_ts)?;
         state.serialize_field("shard_id", &self.shard_id)?;
@@ -594,5 +596,27 @@ mod tests {
         let raw = Bytes::from(vec![0xff, 0xfe, 0xfd]);
         let event = StoredEvent::new("id".to_string(), raw, 0, 0);
         assert!(event.raw_str().is_err());
+    }
+
+    // Regression: Serialize impl used to silently replace invalid raw bytes
+    // with null. Now it returns a serialization error (BUGS_4 #3).
+    #[test]
+    fn test_stored_event_serialize_valid() {
+        let raw = Bytes::from(r#"{"key":"value"}"#);
+        let event = StoredEvent::new("id".to_string(), raw, 123, 0);
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"key\""));
+        assert!(json.contains("\"value\""));
+    }
+
+    #[test]
+    fn test_stored_event_serialize_invalid_raw_returns_error() {
+        let raw = Bytes::from(b"not valid json".as_slice());
+        let event = StoredEvent::new("id".to_string(), raw, 0, 0);
+        let result = serde_json::to_string(&event);
+        assert!(
+            result.is_err(),
+            "serializing invalid raw bytes should error, not silently return null"
+        );
     }
 }
