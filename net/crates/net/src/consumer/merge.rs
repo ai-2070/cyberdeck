@@ -1093,4 +1093,33 @@ mod tests {
         // Should get remaining 4 events
         assert_eq!(response2.events.len(), 4, "Should get remaining 4 events");
     }
+
+    #[tokio::test]
+    async fn test_poll_merger_small_limit_many_shards() {
+        // Regression: limit < shard count caused integer division truncation to 0,
+        // making per-shard fetch too small. Now uses ceiling division.
+        let adapter = Arc::new(MockAdapter::new());
+        let num_shards = 8u16;
+
+        for shard_id in 0..num_shards {
+            adapter.add_events(
+                shard_id,
+                vec![StoredEvent::from_value(
+                    format!("{}-1", shard_id),
+                    json!({"shard": shard_id}),
+                    100,
+                    shard_id,
+                )],
+            );
+        }
+
+        let merger = PollMerger::new(adapter, num_shards);
+
+        // Request fewer events than shards — should still work
+        let request = ConsumeRequest::new(3);
+        let response = merger.poll(request).await.unwrap();
+
+        assert_eq!(response.events.len(), 3);
+        assert!(response.has_more);
+    }
 }
