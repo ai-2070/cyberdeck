@@ -596,7 +596,7 @@ mod tests {
     #[test]
     fn test_reliable_stream_retransmit_timeout() {
         let mut mode = ReliableStream::with_settings(
-            Duration::from_millis(1), // 1ms RTO for fast test
+            Duration::from_millis(50), // 50ms RTO — large enough to avoid CI jitter
             32,
             3,
         );
@@ -604,15 +604,20 @@ mod tests {
         mode.on_send(0, Bytes::from_static(b"pkt-0"));
         mode.on_send(1, Bytes::from_static(b"pkt-1"));
 
-        // Wait for RTO to expire
-        std::thread::sleep(Duration::from_millis(5));
+        // Nothing should time out yet (we just sent)
+        let too_early = mode.get_timed_out();
+        assert!(too_early.is_empty(), "packets should not time out before RTO");
+
+        // Wait well past RTO
+        std::thread::sleep(Duration::from_millis(80));
 
         let timed_out = mode.get_timed_out();
         assert_eq!(timed_out.len(), 2, "both packets should time out");
         assert_eq!(&timed_out[0][..], b"pkt-0");
         assert_eq!(&timed_out[1][..], b"pkt-1");
 
-        // Immediately after retransmit, they shouldn't time out again
+        // Immediately after retransmit, sent_at was reset — shouldn't time out
+        // again until another RTO elapses
         let again = mode.get_timed_out();
         assert!(
             again.is_empty(),
@@ -623,21 +628,21 @@ mod tests {
     #[test]
     fn test_reliable_stream_max_retries_exhausted() {
         let mut mode = ReliableStream::with_settings(
-            Duration::from_millis(1),
+            Duration::from_millis(50),
             32,
             2, // max 2 retries
         );
 
         mode.on_send(0, Bytes::from_static(b"pkt-0"));
 
-        // Exhaust retries
+        // Exhaust retries (each iteration waits past RTO then triggers retransmit)
         for _ in 0..3 {
-            std::thread::sleep(Duration::from_millis(2));
+            std::thread::sleep(Duration::from_millis(80));
             let _ = mode.get_timed_out();
         }
 
         // After max_retries, the packet should no longer be retransmitted
-        std::thread::sleep(Duration::from_millis(2));
+        std::thread::sleep(Duration::from_millis(80));
         let timed_out = mode.get_timed_out();
         assert!(
             timed_out.is_empty(),
