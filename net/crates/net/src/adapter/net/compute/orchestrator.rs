@@ -43,9 +43,9 @@ pub enum MigrationMessage {
         /// Sequence number the snapshot covers through.
         seq_through: u64,
         /// Zero-based index of this chunk.
-        chunk_index: u16,
+        chunk_index: u32,
         /// Total number of chunks for this snapshot.
-        total_chunks: u16,
+        total_chunks: u32,
     },
 
     /// Phase 2→3: Target restored daemon from snapshot.
@@ -142,8 +142,8 @@ pub mod wire {
                 buf.put_u8(MSG_SNAPSHOT_READY);
                 buf.put_u32_le(*daemon_origin);
                 buf.put_u64_le(*seq_through);
-                buf.put_u16_le(*chunk_index);
-                buf.put_u16_le(*total_chunks);
+                buf.put_u32_le(*chunk_index);
+                buf.put_u32_le(*total_chunks);
                 buf.put_u32_le(snapshot_bytes.len() as u32);
                 buf.extend_from_slice(snapshot_bytes);
             }
@@ -225,16 +225,16 @@ pub mod wire {
                 })
             }
             MSG_SNAPSHOT_READY => {
-                // daemon_origin(4) + seq_through(8) + chunk_index(2) + total_chunks(2) + len(4) = 20
-                if cur.remaining() < 20 {
+                // daemon_origin(4) + seq_through(8) + chunk_index(4) + total_chunks(4) + len(4) = 24
+                if cur.remaining() < 24 {
                     return Err(MigrationError::StateFailed(
                         "truncated SnapshotReady".into(),
                     ));
                 }
                 let daemon_origin = cur.get_u32_le();
                 let seq_through = cur.get_u64_le();
-                let chunk_index = cur.get_u16_le();
-                let total_chunks = cur.get_u16_le();
+                let chunk_index = cur.get_u32_le();
+                let total_chunks = cur.get_u32_le();
                 let len = cur.get_u32_le() as usize;
                 if cur.remaining() < len {
                     return Err(MigrationError::StateFailed(
@@ -366,45 +366,58 @@ pub mod wire {
 
 /// Maximum snapshot chunk size. Sized to fit within `MAX_PAYLOAD_SIZE` after
 /// accounting for the SnapshotReady wire header overhead
-/// (msg_type + daemon_origin + seq_through + chunk_index + total_chunks + len = 21 bytes)
+/// (msg_type + daemon_origin + seq_through + chunk_index + total_chunks + len = 25 bytes)
 /// and leaving headroom for the outer transport framing.
 pub const MAX_SNAPSHOT_CHUNK_SIZE: usize = 7000;
+
+/// Maximum transferable snapshot size: `u32::MAX` chunks * 7,000 bytes per chunk.
+///
+/// This is ~28 TB — effectively unlimited for daemon state. The `StateSnapshot`
+/// wire format itself caps at ~4 GB (`state_len: u32`), so in practice the
+/// snapshot serialization limit is reached first.
+pub const MAX_SNAPSHOT_SIZE: usize = u32::MAX as usize * MAX_SNAPSHOT_CHUNK_SIZE;
 
 /// Split a snapshot into chunked `SnapshotReady` messages.
 ///
 /// Small snapshots (<= `MAX_SNAPSHOT_CHUNK_SIZE`) produce a single message
 /// with `chunk_index = 0, total_chunks = 1`. Larger snapshots are split
 /// into multiple messages that the receiver must reassemble.
+///
+/// Returns `MigrationError::SnapshotTooLarge` if the snapshot exceeds
+/// `MAX_SNAPSHOT_SIZE` (~28 TB).
 pub fn chunk_snapshot(
     daemon_origin: u32,
     snapshot_bytes: Vec<u8>,
     seq_through: u64,
-) -> Vec<MigrationMessage> {
+) -> Result<Vec<MigrationMessage>, MigrationError> {
     if snapshot_bytes.len() <= MAX_SNAPSHOT_CHUNK_SIZE {
-        return vec![MigrationMessage::SnapshotReady {
+        return Ok(vec![MigrationMessage::SnapshotReady {
             daemon_origin,
             snapshot_bytes,
             seq_through,
             chunk_index: 0,
             total_chunks: 1,
-        }];
+        }]);
     }
 
     let total_chunks = snapshot_bytes.len().div_ceil(MAX_SNAPSHOT_CHUNK_SIZE);
-    let total_chunks = u16::try_from(total_chunks)
-        .expect("snapshot exceeds maximum chunkable size (65535 * 7000 = ~457 MB)");
+    let total_chunks =
+        u32::try_from(total_chunks).map_err(|_| MigrationError::SnapshotTooLarge {
+            size: snapshot_bytes.len(),
+            max: MAX_SNAPSHOT_SIZE,
+        })?;
 
-    snapshot_bytes
+    Ok(snapshot_bytes
         .chunks(MAX_SNAPSHOT_CHUNK_SIZE)
         .enumerate()
         .map(|(i, chunk)| MigrationMessage::SnapshotReady {
             daemon_origin,
             snapshot_bytes: chunk.to_vec(),
             seq_through,
-            chunk_index: i as u16,
+            chunk_index: i as u32,
             total_chunks,
         })
-        .collect()
+        .collect())
 }
 
 /// Reassembles chunked `SnapshotReady` messages into a complete snapshot.
@@ -417,8 +430,8 @@ pub struct SnapshotReassembler {
 }
 
 struct ReassemblyState {
-    total_chunks: u16,
-    chunks: std::collections::BTreeMap<u16, Vec<u8>>,
+    total_chunks: u32,
+    chunks: std::collections::BTreeMap<u32, Vec<u8>>,
 }
 
 impl SnapshotReassembler {
@@ -440,8 +453,8 @@ impl SnapshotReassembler {
         daemon_origin: u32,
         snapshot_bytes: Vec<u8>,
         seq_through: u64,
-        chunk_index: u16,
-        total_chunks: u16,
+        chunk_index: u32,
+        total_chunks: u32,
     ) -> Option<Vec<u8>> {
         // Single-chunk fast path
         if total_chunks == 1 {
@@ -631,8 +644,8 @@ impl MigrationOrchestrator {
         daemon_origin: u32,
         snapshot_bytes: Vec<u8>,
         seq_through: u64,
-        chunk_index: u16,
-        total_chunks: u16,
+        chunk_index: u32,
+        total_chunks: u32,
     ) -> Result<MigrationMessage, MigrationError> {
         let entry = self
             .migrations
@@ -1079,7 +1092,7 @@ mod tests {
 
     #[test]
     fn test_chunk_snapshot_small() {
-        let chunks = chunk_snapshot(0xAAAA, vec![1, 2, 3], 10);
+        let chunks = chunk_snapshot(0xAAAA, vec![1, 2, 3], 10).unwrap();
         assert_eq!(chunks.len(), 1);
         match &chunks[0] {
             MigrationMessage::SnapshotReady {
@@ -1090,7 +1103,7 @@ mod tests {
             } => {
                 assert_eq!(*chunk_index, 0);
                 assert_eq!(*total_chunks, 1);
-                assert_eq!(snapshot_bytes, &vec![1, 2, 3]);
+                assert_eq!(snapshot_bytes, &[1, 2, 3]);
             }
             _ => panic!("expected SnapshotReady"),
         }
@@ -1101,7 +1114,7 @@ mod tests {
         // Create a snapshot larger than MAX_SNAPSHOT_CHUNK_SIZE
         let big = vec![0xABu8; MAX_SNAPSHOT_CHUNK_SIZE * 3 + 100];
         let total_len = big.len();
-        let chunks = chunk_snapshot(0xBBBB, big, 42);
+        let chunks = chunk_snapshot(0xBBBB, big, 42).unwrap();
 
         assert_eq!(chunks.len(), 4); // 3 full + 1 partial
 
@@ -1115,7 +1128,7 @@ mod tests {
                     seq_through,
                     ..
                 } => {
-                    assert_eq!(*chunk_index, i as u16);
+                    assert_eq!(*chunk_index, i as u32);
                     assert_eq!(*total_chunks, 4);
                     assert_eq!(*daemon_origin, 0xBBBB);
                     assert_eq!(*seq_through, 42);

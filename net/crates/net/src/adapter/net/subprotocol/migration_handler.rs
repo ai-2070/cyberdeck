@@ -82,7 +82,7 @@ impl MigrationSubprotocolHandler {
                     daemon_origin,
                     snapshot.to_bytes(),
                     snapshot.through_seq,
-                );
+                )?;
                 for chunk in chunks {
                     outbound.push(OutboundMigrationMessage {
                         dest_node: from_node, // reply to orchestrator
