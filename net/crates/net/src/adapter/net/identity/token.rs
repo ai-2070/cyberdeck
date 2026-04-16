@@ -640,7 +640,7 @@ mod tests {
             3600,
             0,
         );
-        cache.insert(token);
+        let _ = cache.insert(token);
 
         assert_eq!(cache.len(), 1);
 
@@ -682,7 +682,7 @@ mod tests {
             3600,
             0,
         );
-        cache.insert(token);
+        let _ = cache.insert(token);
 
         // Should match any channel
         assert!(cache

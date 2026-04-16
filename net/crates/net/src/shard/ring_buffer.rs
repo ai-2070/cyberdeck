@@ -96,16 +96,6 @@ impl<T> RingBuffer<T> {
         let tail = self.tail.load(Ordering::Acquire);
 
         // Check if buffer is full
-        let next_head = head.wrapping_add(1);
-        if (next_head & self.mask) == (tail & self.mask) && next_head != tail {
-            // Actually check the count
-            let len = head.wrapping_sub(tail);
-            if len >= self.capacity - 1 {
-                return Err(BufferFullError);
-            }
-        }
-
-        // Calculate actual length
         let len = head.wrapping_sub(tail);
         if len >= self.capacity - 1 {
             return Err(BufferFullError);
@@ -413,5 +403,51 @@ mod tests {
     #[should_panic(expected = "at least 2")]
     fn test_capacity_too_small() {
         let _ = RingBuffer::<i32>::new(1);
+    }
+
+    #[test]
+    fn test_push_pop_at_exact_capacity() {
+        // Regression: ensure the full check works correctly at boundary
+        let buf = RingBuffer::new(4); // usable capacity = 3
+
+        // Fill to exactly full
+        buf.try_push(1).unwrap();
+        buf.try_push(2).unwrap();
+        buf.try_push(3).unwrap();
+        assert!(buf.is_full());
+        assert!(buf.try_push(4).is_err());
+
+        // Pop one and push one - should succeed
+        assert_eq!(buf.try_pop(), Some(1));
+        buf.try_push(4).unwrap();
+        assert!(buf.is_full());
+
+        // Verify order
+        assert_eq!(buf.try_pop(), Some(2));
+        assert_eq!(buf.try_pop(), Some(3));
+        assert_eq!(buf.try_pop(), Some(4));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_push_pop_boundary_stress() {
+        // Regression: repeated fill/drain cycles at exact capacity boundary
+        let buf = RingBuffer::new(4);
+
+        for round in 0..100 {
+            // Fill to capacity
+            for i in 0..3 {
+                buf.try_push(round * 3 + i)
+                    .unwrap_or_else(|_| panic!("push failed at round {} item {}", round, i));
+            }
+            assert!(buf.is_full());
+            assert!(buf.try_push(999).is_err());
+
+            // Drain completely
+            for i in 0..3 {
+                assert_eq!(buf.try_pop(), Some(round * 3 + i));
+            }
+            assert!(buf.is_empty());
+        }
     }
 }

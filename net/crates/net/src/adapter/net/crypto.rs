@@ -84,8 +84,14 @@ pub struct StaticKeypair {
 impl StaticKeypair {
     /// Generate a new random keypair
     pub fn generate() -> Self {
-        let builder = Builder::new(NOISE_PATTERN.parse().unwrap());
-        let keypair = builder.generate_keypair().unwrap();
+        let builder = Builder::new(
+            NOISE_PATTERN
+                .parse()
+                .expect("static noise pattern is valid"),
+        );
+        let keypair = builder
+            .generate_keypair()
+            .expect("keypair generation from valid pattern");
         let mut private = [0u8; 32];
         let mut public = [0u8; 32];
         private.copy_from_slice(&keypair.private);

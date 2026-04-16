@@ -16,6 +16,10 @@ pub enum IngestionError {
     /// The event bus has been shut down.
     #[error("event bus is shutting down")]
     ShuttingDown,
+
+    /// Serialization failed.
+    #[error("serialization error: {0}")]
+    Serialization(String),
 }
 
 /// Errors that can occur in adapter operations.

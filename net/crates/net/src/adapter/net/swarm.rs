@@ -808,7 +808,7 @@ mod tests {
         // More than 255 tools should be capped, not truncated via `as u8`
         let mut caps = Capabilities::new();
         for i in 0..300 {
-            caps = caps.with_tool(&format!("t{}", i));
+            caps = caps.with_tool(format!("t{}", i));
         }
 
         let bytes = caps.to_bytes();

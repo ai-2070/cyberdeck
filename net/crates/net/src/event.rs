@@ -144,7 +144,8 @@ impl RawEvent {
     /// This serializes the value once and caches the result.
     #[inline]
     pub fn from_value(value: JsonValue) -> Self {
-        let bytes = Bytes::from(serde_json::to_vec(&value).unwrap());
+        let bytes =
+            Bytes::from(serde_json::to_vec(&value).expect("Value serialization is infallible"));
         let hash = xxhash_rust::xxh3::xxh3_64(&bytes);
         Self { bytes, hash }
     }
@@ -249,7 +250,8 @@ impl InternalEvent {
     /// Create from a JSON value (serializes once).
     #[inline]
     pub fn from_value(value: JsonValue, insertion_ts: u64, shard_id: u16) -> Self {
-        let raw = Bytes::from(serde_json::to_vec(&value).unwrap());
+        let raw =
+            Bytes::from(serde_json::to_vec(&value).expect("Value serialization is infallible"));
         Self {
             raw,
             insertion_ts,
@@ -342,7 +344,8 @@ impl StoredEvent {
     /// Create a new stored event from a JSON value (serializes once).
     #[inline]
     pub fn from_value(id: String, value: JsonValue, insertion_ts: u64, shard_id: u16) -> Self {
-        let raw = Bytes::from(serde_json::to_vec(&value).unwrap());
+        let raw =
+            Bytes::from(serde_json::to_vec(&value).expect("Value serialization is infallible"));
         Self {
             id,
             raw,

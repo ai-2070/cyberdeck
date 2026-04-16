@@ -293,7 +293,7 @@ mod tests {
             3600,
             0,
         );
-        cache.insert(token);
+        let _ = cache.insert(token);
 
         // With token -> allowed
         assert!(config.can_publish(&caps, subject.entity_id(), &cache));
@@ -323,7 +323,7 @@ mod tests {
             3600,
             0,
         );
-        cache.insert(token);
+        let _ = cache.insert(token);
         let no_gpu = make_caps(false);
         assert!(!config.can_publish(&no_gpu, subject.entity_id(), &cache));
 
