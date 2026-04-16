@@ -1062,14 +1062,16 @@ impl SafetyEnforcer {
         let limits = &envelope.resource_limits;
 
         // Check concurrent
+        // Use saturating arithmetic to prevent underflow when current > max
+        // (possible if limits were reduced while requests are in-flight).
         let current_concurrent = self.usage.concurrent.load(Ordering::Relaxed);
-        if current_concurrent + claim.concurrent_slots > limits.max_concurrent
+        if current_concurrent.saturating_add(claim.concurrent_slots) > limits.max_concurrent
             && envelope.mode == EnforcementMode::Enforce
         {
             return Err(SafetyViolation::ResourceLimitExceeded {
                 resource: ResourceType::Concurrent,
                 requested: claim.concurrent_slots as u64,
-                available: (limits.max_concurrent - current_concurrent) as u64,
+                available: limits.max_concurrent.saturating_sub(current_concurrent) as u64,
             });
         }
 
@@ -1085,26 +1087,28 @@ impl SafetyEnforcer {
 
         // Check memory
         let current_memory = self.usage.memory_mb.load(Ordering::Relaxed);
-        if current_memory + claim.memory_mb > limits.max_memory_mb
+        if current_memory.saturating_add(claim.memory_mb) > limits.max_memory_mb
             && envelope.mode == EnforcementMode::Enforce
         {
             return Err(SafetyViolation::ResourceLimitExceeded {
                 resource: ResourceType::Memory,
                 requested: claim.memory_mb as u64,
-                available: (limits.max_memory_mb - current_memory) as u64,
+                available: limits.max_memory_mb.saturating_sub(current_memory) as u64,
             });
         }
 
         // Check hourly cost
         self.usage.maybe_reset_hourly();
         let current_cost = self.usage.cost_cents_per_hour.load(Ordering::Relaxed);
-        if current_cost + claim.cost_cents > limits.max_cost_per_hour_cents
+        if current_cost.saturating_add(claim.cost_cents) > limits.max_cost_per_hour_cents
             && envelope.mode == EnforcementMode::Enforce
         {
             return Err(SafetyViolation::ResourceLimitExceeded {
                 resource: ResourceType::Cost,
                 requested: claim.cost_cents as u64,
-                available: (limits.max_cost_per_hour_cents - current_cost) as u64,
+                available: limits
+                    .max_cost_per_hour_cents
+                    .saturating_sub(current_cost) as u64,
             });
         }
 
