@@ -277,7 +277,7 @@ impl Adapter for JetStreamAdapter {
         from_id: Option<&str>,
         limit: usize,
     ) -> Result<ShardPollResult, AdapterError> {
-        let stream = self.get_or_create_stream(shard_id).await?;
+        let mut stream = self.get_or_create_stream(shard_id).await?;
 
         // Parse the cursor (sequence number)
         let start_seq = from_id
