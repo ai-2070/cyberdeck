@@ -155,6 +155,34 @@ Nodes advertise migration support through the capability graph. `SubprotocolRegi
 
 During migration, a `SuperpositionState` (Layer 7) tracks the entity's observational phase. The entity exists on both nodes briefly during replay, then collapses to the target at cutover. See [CONTINUITY.md](CONTINUITY.md) for details.
 
+## Replica Groups
+
+Where migration moves a daemon 1:1, `ReplicaGroup` replicates a daemon 1:N. Each replica is a normal `DaemonHost` registered in the `DaemonRegistry` — the group is a coordination overlay, not a new runtime concept.
+
+**Identity is deterministic.** Replica keypairs derive from `group_seed + index` via xxh3. The same index always produces the same keypair, making replacement idempotent — a failed replica re-spawns with the same origin_hash on a different node, no migration needed.
+
+**Routing is load-balanced.** Each replica is an `Endpoint` in an internal `LoadBalancer`. `route_event()` returns the `origin_hash` of the best replica for delivery via `DaemonRegistry::deliver()`. Any `LoadBalancer` strategy works: round-robin, least-connections, consistent-hash, least-latency.
+
+**Health is group-level.** The group is alive as long as at least one replica is healthy. `ReplicaGroupHealth::Degraded { healthy, total }` reports partial availability. On node failure, `on_node_failure()` marks affected replicas unhealthy, re-derives the same keypair, places on a new node, and re-spawns. On recovery, `on_node_recovery()` re-marks them healthy.
+
+**Scaling is deterministic.** `scale_to(n)` adds replicas at the next index or removes the highest-index ones. Because keypairs derive from `group_seed + index`, the identity of each replica is fixed by its position — no coordination needed.
+
+```
+ReplicaGroup (group_id: 0xABCD, seed: [...])
+├── Replica 0: origin_hash=0x1234, node=0xAAAA, healthy
+├── Replica 1: origin_hash=0x5678, node=0xBBBB, healthy
+└── Replica 2: origin_hash=0x9ABC, node=0xCCCC, healthy
+                    │
+                    ▼
+              LoadBalancer
+         (RoundRobin / LeastConn / ...)
+                    │
+                    ▼
+           DaemonRegistry::deliver(selected_origin_hash, event)
+```
+
+`SUBPROTOCOL_REPLICA_GROUP` (0x0900) is reserved for future cross-node group coordination (membership announcements, coordinated scaling). The current implementation operates as a local coordinator — all cross-node communication uses existing primitives.
+
 ## Source Files
 
 | File | Purpose |
@@ -165,6 +193,7 @@ During migration, a `SuperpositionState` (Layer 7) tracks the entity's observati
 | `compute/orchestrator.rs` | `MigrationOrchestrator`, `MigrationMessage` wire protocol, snapshot chunking, `SnapshotReassembler` |
 | `compute/migration_source.rs` | `MigrationSourceHandler`, source-side snapshot/buffer/cutover/cleanup |
 | `compute/migration_target.rs` | `MigrationTargetHandler`, target-side restore/replay/activate |
+| `compute/replica_group.rs` | `ReplicaGroup`, N-way replication with deterministic identity and LB routing |
 | `compute/registry.rs` | `DaemonRegistry`, local daemon tracking |
 | `compute/scheduler.rs` | `Scheduler`, `PlacementDecision`, capability-based placement, `find_migration_targets()`, `place_migration()` |
 | `subprotocol/migration_handler.rs` | `MigrationSubprotocolHandler`, message dispatch to orchestrator/source/target |

@@ -12,6 +12,7 @@ pub mod migration_source;
 pub mod migration_target;
 pub mod orchestrator;
 mod registry;
+pub mod replica_group;
 mod scheduler;
 
 pub use daemon::{DaemonError, DaemonHostConfig, DaemonStats, MeshDaemon};
@@ -24,4 +25,8 @@ pub use orchestrator::{
     MAX_SNAPSHOT_CHUNK_SIZE, MAX_SNAPSHOT_SIZE,
 };
 pub use registry::DaemonRegistry;
+pub use replica_group::{
+    ReplicaGroup, ReplicaGroupConfig, ReplicaGroupError, ReplicaGroupHealth, ReplicaInfo,
+    SUBPROTOCOL_REPLICA_GROUP,
+};
 pub use scheduler::{PlacementDecision, PlacementReason, Scheduler, SchedulerError};

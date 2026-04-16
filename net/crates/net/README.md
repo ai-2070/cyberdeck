@@ -42,6 +42,8 @@ For the design philosophy, architecture rationale, and benchmarks, see the [proj
 
 **Compute migrates.** The `MeshDaemon` trait defines event processors. The runtime handles causal chain production, horizon tracking, and snapshot packaging. Migration is a 6-phase state machine preserving chain continuity across nodes.
 
+**Compute replicates.** A `ReplicaGroup` manages N copies of a daemon as a logical unit. Each replica has its own identity (derived deterministically from a group seed) and its own causal chain. The group load-balances events across replicas, tracks group-level health, spreads placement across failure domains, and auto-replaces failed replicas without migration — stateless re-spawn with the same deterministic identity.
+
 **Subprotocols are extensible.** `subprotocol_id: u16` in every header. Formal registry with version negotiation. Unknown subprotocols are forwarded opaquely. Vendor protocols get IDs in `0x1000..0xEFFF`.
 
 **Observation is local.** Each node's truth is what it can observe. Causal cones answer "what could have influenced this event?" Propagation modeling estimates latency by subnet distance. Continuity proofs (36 bytes) verify chain integrity without the full log.
@@ -74,7 +76,7 @@ For the design philosophy, architecture rationale, and benchmarks, see the [proj
 | **Behavior Plane** | Capability announcements & indexing, capability diffs, node metadata, API schema registry, device autonomy rules, context fabric (distributed tracing), load balancing, proximity graph, safety envelope enforcement | [BEHAVIOR.md](docs/BEHAVIOR.md) |
 | **Subnets & Hierarchy** | 4-level subnet hierarchy (8/8/8/8 encoding), label-based assignment, gateway visibility enforcement | [SUBNETS.md](docs/SUBNETS.md) |
 | **Distributed State** | 24-byte causal links, compressed observed horizons, append-only entity logs with chain validation, state snapshots for migration | [STATE.md](docs/STATE.md) |
-| **Compute Runtime** | MeshDaemon trait, daemon hosting with causal chain production, capability-based placement, 6-phase migration with orchestrator/source/target handlers, snapshot chunking, capability-driven target discovery | [COMPUTE.md](docs/COMPUTE.md) |
+| **Compute Runtime** | MeshDaemon trait, daemon hosting with causal chain production, capability-based placement, 6-phase migration with orchestrator/source/target handlers, snapshot chunking, capability-driven target discovery, N-way replica groups with load-balanced routing and auto-replacement | [COMPUTE.md](docs/COMPUTE.md) |
 | **Subprotocols** | Formal protocol registry, version negotiation, capability-aware routing via tags, opaque forwarding guarantee, migration message dispatch | [SUBPROTOCOLS.md](docs/SUBPROTOCOLS.md) |
 | **Observational Continuity** | Causal cones, propagation modeling, continuity proofs, honest discontinuity with deterministic forking, superposition during migration | [CONTINUITY.md](docs/CONTINUITY.md) |
 | **Contested Environments** | Correlated failure detection, subnet-aware partition classification, partition healing with log reconciliation | [CONTESTED.md](docs/CONTESTED.md) |
@@ -173,7 +175,7 @@ Benchmarked on Apple M1 Max, macOS.
 
 Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns.
 
-758 tests. ~840 KB deployed binary.
+769 tests. ~840 KB deployed binary.
 
 ## Capabilities
 
@@ -284,6 +286,8 @@ The `MigrationOrchestrator` coordinates this across three nodes (source, target,
 
 The daemon's causal chain continues unbroken on the new host. During migration, a `SuperpositionState` tracks which phase the daemon is in — it exists on both nodes briefly, then collapses to the new host.
 
+For daemons that need horizontal scale rather than mobility, `ReplicaGroup` manages N copies as a logical unit. Each replica gets a deterministic identity derived from `group_seed + index` — the same index always produces the same keypair, making replacement idempotent. The group load-balances inbound events across replicas (round-robin, least-connections, consistent hash — any `LoadBalancer` strategy), tracks group-level health (alive as long as one replica is healthy), and spreads placement across nodes for failure-domain isolation. When a node fails, the group re-spawns the affected replicas on new nodes with the same deterministic identity — no migration protocol needed for stateless daemons. Scaling is `scale_to(n)`: scale up appends new replicas, scale down removes the highest-index ones deterministically.
+
 ## Safety & Autonomy
 
 Every node enforces its own rules. The `SafetyEnforcer` evaluates a `ResourceEnvelope` that defines:
@@ -364,6 +368,7 @@ src/adapter/net/
 │   ├── orchestrator.rs    #   MigrationOrchestrator, wire protocol, snapshot chunking
 │   ├── migration_source.rs #  Source-side: snapshot, buffer, cutover, cleanup
 │   ├── migration_target.rs #  Target-side: restore, replay, activate
+│   ├── replica_group.rs   #   ReplicaGroup, N-way replication with LB routing
 │   ├── registry.rs        #   DaemonRegistry
 │   └── scheduler.rs       #   Capability-based placement, migration target discovery
 │
@@ -567,7 +572,7 @@ cargo build --release --all-features
 ## Tests
 
 ```bash
-# Unit tests (732 tests)
+# Unit tests (743 tests)
 cargo test --lib --features net
 
 # Migration integration tests (26 tests)
@@ -643,6 +648,7 @@ Regression tests are prefixed `test_regression_` and tied to specific bugs found
 | `0x0600` | Subprotocol negotiation |
 | `0x0700..0x0702` | Continuity / fork / proof |
 | `0x0800..0x0801` | Partition / reconciliation |
+| `0x0900` | Replica group coordination |
 | `0x1000..0xEFFF` | Vendor / third-party |
 | `0xF000..0xFFFF` | Experimental / ephemeral |
 
