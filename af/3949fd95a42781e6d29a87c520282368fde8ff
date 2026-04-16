@@ -1,0 +1,54 @@
+net/crates/net/tests/integration_redis.rs
+  e33ca63076d0343d 188,190
+net/crates/net/src/shard/ring_buffer.rs
+  e33ca63076d0343d 407-452
+net/crates/net/src/error.rs
+  e33ca63076d0343d 19-22
+net/crates/net/tests/integration_jetstream.rs
+  e33ca63076d0343d 189,191
+net/crates/net/src/adapter/net/channel/config.rs
+  e33ca63076d0343d 296,326
+net/crates/net/src/event.rs
+  e33ca63076d0343d 147-148,253-254,347-348
+net/crates/net/src/adapter/net/contested/reconcile.rs
+  e33ca63076d0343d 406,418
+net/crates/net/src/shard/mod.rs
+  e33ca63076d0343d 249-256,258,326-328,356-358,360,407-409,487-489,716-780
+net/crates/net/src/adapter/net/identity/token.rs
+  e33ca63076d0343d 643,685
+net/crates/net/src/adapter/net/swarm.rs
+  e33ca63076d0343d 811
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "af3949fd95a42781e6d29a87c520282368fde8ff",
+  "prompts": {
+    "75b8fbe288685b96": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b75d121a-3dc9-4fa0-82a8-528ef83df651",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 156,
+      "overriden_lines": 0
+    },
+    "e33ca63076d0343d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "72a93451-3a46-4c03-8dd4-addc974f7ef5",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 655,
+      "overriden_lines": 0
+    }
+  }
+}
