@@ -1,0 +1,23 @@
+net/crates/net/tests/migration_integration.rs
+  d37b393023401171 15,17-20,22,1257-1572
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "e416fa2e05750e4baaaaaf70b64a2f787312c752",
+  "prompts": {
+    "d37b393023401171": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8de24b1d-4937-4e8f-9712-eb9f68e7e6e4",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 330,
+      "total_deletions": 12,
+      "accepted_lines": 332,
+      "overriden_lines": 0
+    }
+  }
+}
