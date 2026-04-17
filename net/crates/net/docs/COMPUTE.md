@@ -223,6 +223,53 @@ ForkGroup (parent: 0xAAAA, fork_seq: 100)
 
 **Composability with migration.** Forks are normal daemons in the `DaemonRegistry`. MIKOSHI can migrate a fork to another node — the migration system doesn't know or care that the daemon is a fork. The causal chain and fork lineage travel with the snapshot.
 
+## Standby Groups
+
+For stateful daemons that need fault tolerance without duplicate compute, `StandbyGroup` implements active-passive replication. One member processes events. The others hold readiness to promote. No duplicate event processing — standbys consume memory but zero compute.
+
+**The active processes, standbys wait.** Events route exclusively to the active via `active_origin()`. `on_event_delivered()` buffers each event for replay on promotion. Standbys are registered in the `DaemonRegistry` with their own identity but receive no events.
+
+**Sync is snapshot-based.** `sync_standbys()` snapshots the active daemon, records `synced_through` for each standby, and clears the event buffer. The protocol tracks the sequence each standby is synced to. Persistence of snapshot bytes to disk is an application concern — the protocol provides the bytes and the bookkeeping.
+
+**Promotion replays the gap.** On active failure, `promote()` picks the standby with the highest `synced_through` and replays buffered events (same mechanism as MIKOSHI's replay phase). The gap between "last sync" and "failure" is exactly the buffered events.
+
+```
+StandbyGroup (group_id: 0xABCD)
+├── Member 0 [ACTIVE]:  origin=0x1234, processing events, synced_through=100
+├── Member 1 [STANDBY]: origin=0x5678, idle, synced_through=100
+└── Member 2 [STANDBY]: origin=0x9ABC, idle, synced_through=100
+
+Active fails → promote Member 1:
+├── Member 0 [STANDBY]: marked unhealthy
+├── Member 1 [ACTIVE]:  replayed 3 buffered events, now at seq 103
+└── Member 2 [STANDBY]: synced_through=100 (will re-sync from new active)
+```
+
+**Protocol vs application responsibilities:**
+
+| Protocol (StandbyGroup) | Application |
+|---|---|
+| Active/standby role tracking | When to call `sync_standbys()` |
+| Event buffering for replay | Persisting snapshots to disk |
+| Promotion on failure | Consistency verification |
+| Standby re-placement | Eventual consistency for durable storage |
+| Deterministic identity | Snapshot frequency policy |
+
+## Group Comparison
+
+| | ReplicaGroup | ForkGroup | StandbyGroup |
+|---|---|---|---|
+| **Members** | Interchangeable | Independent, divergent | 1 active, N-1 passive |
+| **Event routing** | LB to any member | LB to any fork | Always to active only |
+| **Compute cost** | 1x (per event) | 1x (per event, per fork) | 1x (active only) |
+| **State** | Stateless | Stateless | Stateful |
+| **Identity** | Deterministic from seed | Random, stored | Deterministic from seed |
+| **Lineage** | None | ForkRecord with sentinel | None |
+| **Recovery** | Re-derive keypair | Re-create from stored secret | Promote standby + replay |
+| **Use case** | Horizontal scale | Fan-out, A/B | Fault-tolerant stateful |
+
+All three group types share `GroupCoordinator` for member management, health tracking, and placement. All three compose with MIKOSHI — any member of any group is a normal daemon that can be individually migrated.
+
 ## Source Files
 
 | File | Purpose |
@@ -236,6 +283,7 @@ ForkGroup (parent: 0xAAAA, fork_seq: 100)
 | `compute/group_coord.rs` | `GroupCoordinator`, shared LB/health/routing for replica and fork groups |
 | `compute/replica_group.rs` | `ReplicaGroup`, N-way replication with deterministic identity |
 | `compute/fork_group.rs` | `ForkGroup`, N-way forking with verifiable lineage and stored keypairs |
+| `compute/standby_group.rs` | `StandbyGroup`, active-passive stateful replication with snapshot sync |
 | `compute/registry.rs` | `DaemonRegistry`, local daemon tracking |
 | `compute/scheduler.rs` | `Scheduler`, `PlacementDecision`, capability-based placement, `find_migration_targets()`, `place_migration()` |
 | `subprotocol/migration_handler.rs` | `MigrationSubprotocolHandler`, message dispatch to orchestrator/source/target |
