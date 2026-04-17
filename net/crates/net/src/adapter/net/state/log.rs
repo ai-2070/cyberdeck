@@ -417,6 +417,36 @@ mod tests {
     // ---- Regression tests for Cubic AI findings ----
 
     #[test]
+    fn test_regression_prune_all_then_append() {
+        // Regression: prune_through with all events removed used to reset
+        // base_link to genesis, breaking chain validation for the next append.
+        let (_, entity_id) = make_entity();
+        let origin_hash = entity_id.origin_hash();
+        let mut log = EntityLog::new(entity_id);
+        let mut builder = CausalChainBuilder::new(origin_hash);
+
+        for i in 0..5 {
+            let event = builder.append(Bytes::from(format!("e{}", i)), 0).unwrap();
+            log.append(event).unwrap();
+        }
+
+        // Prune everything
+        log.prune_through(5);
+        assert_eq!(log.len(), 0);
+
+        // Append the next event — must succeed because base_link was set
+        // to the last pruned event's link, not reset to genesis.
+        let next = builder
+            .append(Bytes::from_static(b"after-prune"), 0)
+            .unwrap();
+        assert!(
+            log.append(next).is_ok(),
+            "append after full prune must succeed"
+        );
+        assert_eq!(log.len(), 1);
+    }
+
+    #[test]
     fn test_regression_duplicate_genesis_rejected() {
         // Regression: genesis events could be appended repeatedly because
         // duplicate detection was skipped at seq 0 and genesis acceptance
