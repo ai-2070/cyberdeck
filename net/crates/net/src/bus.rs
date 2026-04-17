@@ -736,10 +736,6 @@ fn spawn_drain_worker_for_shard(
     shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut backoff = Duration::from_micros(100);
-        const MAX_BACKOFF: Duration = Duration::from_millis(10);
-        const MIN_BACKOFF: Duration = Duration::from_micros(100);
-
         loop {
             if shutdown.load(AtomicOrdering::Acquire) {
                 // Final drain
@@ -757,15 +753,18 @@ fn spawn_drain_worker_for_shard(
 
             match events {
                 Some(events) if !events.is_empty() => {
-                    backoff = MIN_BACKOFF;
                     if sender.send(events).await.is_err() {
                         break;
                     }
                 }
                 Some(_) => {
-                    // No events, adaptive backoff to avoid busy-spinning
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    // No events — yield briefly. The 100μs sleep is deliberate:
+                    // this is a latency-first system where the drain loop is the
+                    // hot path. Longer backoff would add milliseconds of latency
+                    // to the first event after a quiet period, violating the
+                    // sub-microsecond design target. The CPU cost of 100μs polling
+                    // is acceptable for a system that processes 10M+ events/sec.
+                    tokio::time::sleep(Duration::from_micros(100)).await;
                 }
                 None => {
                     // Shard no longer exists (was removed)
