@@ -167,6 +167,57 @@ impl PacketBuilder {
         self.packet.split().freeze()
     }
 
+    /// Build a packet with a subprotocol identifier.
+    ///
+    /// Same as `build()` but sets `subprotocol_id` in the Net header,
+    /// which is included in the AEAD authenticated data.
+    #[inline]
+    pub fn build_subprotocol(
+        &mut self,
+        stream_id: u64,
+        sequence: u64,
+        events: &[Bytes],
+        flags: PacketFlags,
+        subprotocol_id: u16,
+    ) -> Bytes {
+        self.payload.clear();
+        self.packet.clear();
+
+        EventFrame::write_events(events, &mut self.payload);
+
+        let header = NetHeader::new(
+            self.session_id,
+            stream_id,
+            sequence,
+            [0u8; NONCE_SIZE],
+            self.payload.len() as u16,
+            events.len() as u16,
+            flags,
+        )
+        .with_origin(self.origin_hash)
+        .with_channel_hash(self.channel_hash)
+        .with_subprotocol(subprotocol_id);
+        let aad = header.aad();
+        let mut header_bytes = header.to_bytes();
+
+        let counter = match self.cipher.encrypt_in_place(&aad, &mut self.payload) {
+            Ok(c) => c,
+            Err(e) => panic!(
+                "BUG: ChaCha20-Poly1305 encryption failed (session={:016x}): {}",
+                self.session_id, e
+            ),
+        };
+
+        header_bytes[12..16].copy_from_slice(&(self.session_id as u32).to_le_bytes());
+        header_bytes[16..24].copy_from_slice(&counter.to_le_bytes());
+        let payload_len = (self.payload.len() - 16) as u16;
+        header_bytes[60..62].copy_from_slice(&payload_len.to_le_bytes());
+
+        self.packet.extend_from_slice(&header_bytes);
+        self.packet.extend_from_slice(&self.payload);
+        self.packet.split().freeze()
+    }
+
     /// Build a handshake packet (unencrypted)
     #[inline]
     pub fn build_handshake(&mut self, payload: &[u8]) -> Bytes {
@@ -683,6 +734,22 @@ impl<'a> ThreadLocalPooledBuilder<'a> {
             .as_mut()
             .expect("BUG: PooledBuilder used after drop")
             .build_heartbeat()
+    }
+
+    /// Build a packet with a subprotocol identifier
+    #[inline]
+    pub fn build_subprotocol(
+        &mut self,
+        stream_id: u64,
+        sequence: u64,
+        events: &[Bytes],
+        flags: PacketFlags,
+        subprotocol_id: u16,
+    ) -> Bytes {
+        self.builder
+            .as_mut()
+            .expect("BUG: PooledBuilder used after drop")
+            .build_subprotocol(stream_id, sequence, events, flags, subprotocol_id)
     }
 
     /// Check if events would fit in a single packet

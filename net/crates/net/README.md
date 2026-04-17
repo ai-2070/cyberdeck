@@ -177,7 +177,7 @@ Benchmarks accurate as of April 15, 2026.
 
 Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns.
 
-791 tests. ~840 KB deployed binary.
+894 tests. ~840 KB deployed binary.
 
 ## Capabilities
 
@@ -322,6 +322,7 @@ This is device autonomy in practice. A $5 sensor node sets tight limits — low 
 ```
 src/adapter/net/
 ├── mod.rs                 # NetAdapter, routing utilities
+├── mesh.rs                # MeshNode — multi-peer mesh runtime (single socket, forwarding, subprotocol dispatch)
 ├── config.rs              # NetAdapterConfig
 ├── crypto.rs              # Noise NKpsk0 handshake, ChaCha20-Poly1305 AEAD
 ├── protocol.rs            # 64-byte wire header, EventFrame, NackPayload
@@ -583,14 +584,19 @@ cargo build --release --all-features
 ## Tests
 
 ```bash
-# Unit tests (760 tests)
+# Unit tests (792 tests)
 cargo test --lib --features net
 
-# Migration & group integration tests (31 tests)
+# Migration & group integration tests (44 tests)
 cargo test --test migration_integration --features net
 
-# Integration (requires running services)
+# Three-node mesh integration tests (44 tests)
+cargo test --test three_node_integration --features net
+
+# Two-node transport integration
 cargo test --test integration_net --features net
+
+# Backend adapters (requires running services)
 cargo test --test integration_redis --features redis
 cargo test --test integration_jetstream --features jetstream
 ```
@@ -615,6 +621,21 @@ Integration tests in `tests/migration_integration.rs` exercise the full migratio
 | **Capability discovery** | `enrich_capabilities()` → `CapabilityAnnouncement` → `CapabilityIndex` → `Scheduler.find_migration_targets()` |
 | **Wire format** | Encode/decode roundtrip for all 9 message variants including chunked SnapshotReady |
 
+Three-node mesh tests in `tests/three_node_integration.rs` exercise the `MeshNode` runtime over real encrypted UDP:
+
+| Category | What it validates |
+|----------|-------------------|
+| **Mesh formation** | 3-way handshake, health isolation after node death |
+| **Data flow** | Point-to-point, bidirectional, stream isolation, full ring traffic, sustained throughput |
+| **Relay** | A→B→C forwarding without decryption, payload integrity over 100 events, **tamper detection** (AEAD rejects corrupted relay) |
+| **Rerouting** | Route update after node failure, no data loss across reroute boundary |
+| **Router** | Forward/local/TTL/hop-count decisions over real UDP, multi-hop with 2 routers |
+| **Full stack** | EventBus→NetAdapter→encrypted UDP→poll, bidirectional EventBus, backpressure flood |
+| **Subnet gateway** | SubnetLocal blocked, Global forwarded, Exported selective, ParentVisible ancestor-only |
+| **Failure detection** | Heartbeat→suspect→fail→recover lifecycle, correlated failure classification |
+| **Migration over wire** | TakeSnapshot→SnapshotReady round-trip through encrypted UDP, orchestrator phase advancement |
+| **Partition** | Detection via filter, healing with data flow recovery, asymmetric 3-node partition |
+
 Regression tests are prefixed `test_regression_` and tied to specific bugs found during review. Each documents the original bug in its doc comment and would fail if the fix were reverted.
 
 ## Benchmarks
@@ -624,28 +645,6 @@ cargo bench --features net --bench net
 cargo bench --bench ingestion
 cargo bench --bench parallel
 ```
-
-## Test Architecture
-
-Unit tests live in `#[cfg(test)]` modules alongside the code they test. Each migration module (orchestrator, source handler, target handler, subprotocol handler) has isolated tests covering happy paths, error paths, and edge cases.
-
-Integration tests in `tests/migration_integration.rs` exercise the full migration system across module boundaries:
-
-| Category | What it validates |
-|----------|-------------------|
-| **Phase chain** | All 6 phases sequenced end-to-end through the orchestrator, with and without buffered events |
-| **End-to-end** | Source handler → orchestrator → target handler composing correctly: snapshot, buffer, restore, replay, cutover, cleanup. Verifies daemon moves between registries. |
-| **Auto-target** | Scheduler-driven target selection via `CapabilityIndex` queries for `subprotocol:0x0500` |
-| **Handler dispatch** | Each `MigrationMessage` variant dispatched through `MigrationSubprotocolHandler`, verifying correct outbound message types |
-| **Handler routing** | Outbound `dest_node` assertions — CutoverNotify reaches source, SnapshotReady reaches target, CleanupComplete reaches orchestrator |
-| **Snapshot chunking** | Small (single-chunk), large (multi-chunk), out-of-order reassembly, duplicate chunks, chunk count boundaries |
-| **Event flow** | Events buffered on source during migration → drained → replayed on target → daemon stats verify processing |
-| **Concurrency** | Two daemons migrating simultaneously without interference |
-| **Abort** | Clean abort at every phase (Snapshot, Transfer, Replay, Cutover) |
-| **Capability discovery** | `enrich_capabilities()` → `CapabilityAnnouncement` → `CapabilityIndex` → `Scheduler.find_migration_targets()` |
-| **Wire format** | Encode/decode roundtrip for all 9 message variants including chunked SnapshotReady |
-
-Regression tests are prefixed `test_regression_` and tied to specific bugs found during review. Each documents the original bug in its doc comment and would fail if the fix were reverted.
 
 ## Subprotocol ID Space
 
