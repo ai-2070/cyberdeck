@@ -1,0 +1,42 @@
+net/crates/net/tests/three_node_integration.rs
+  a9d311afc8324224 2830-2838,2841,2847
+net/crates/net/README.md
+  a9d311afc8324224 180,325,587,590,593-596,598-599,624-637
+net/crates/net/src/adapter/net/mesh.rs
+  a9d311afc8324224 636,638,1142-1146,1148
+net/crates/net/docs/MESH_NODE_PLAN.md
+  a9d311afc8324224 80-82,135
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "db5327af7879c8930dd8dd5000754e9cdb04e204",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 70,
+      "overriden_lines": 0
+    },
+    "a9d311afc8324224": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8e12ea48-52c3-40e2-9655-6d0ab0878bb6",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 4866,
+      "total_deletions": 5196,
+      "accepted_lines": 1357,
+      "overriden_lines": 0
+    }
+  }
+}
