@@ -2618,3 +2618,135 @@ async fn test_mesh_node_reroute_no_data_loss() {
     a.shutdown().await.unwrap();
     c.shutdown().await.unwrap();
 }
+
+// ============================================================================
+// Phase 3: Migration over wire
+// ============================================================================
+
+use net::adapter::net::{
+    DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, MeshDaemon,
+    MigrationOrchestrator, MigrationSourceHandler, MigrationTargetHandler,
+    MigrationSubprotocolHandler, MigrationMessage, SUBPROTOCOL_MIGRATION,
+};
+use net::adapter::net::compute::orchestrator::wire as migration_wire;
+use net::adapter::net::state::causal::CausalEvent;
+use net::adapter::net::behavior::capability::CapabilityFilter;
+
+/// Simple stateful daemon for migration testing.
+struct CounterDaemon {
+    count: u64,
+}
+
+impl CounterDaemon {
+    fn with_count(count: u64) -> Self {
+        Self { count }
+    }
+}
+
+impl MeshDaemon for CounterDaemon {
+    fn name(&self) -> &str {
+        "counter"
+    }
+    fn requirements(&self) -> CapabilityFilter {
+        CapabilityFilter::default()
+    }
+    fn process(&mut self, _event: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
+        self.count += 1;
+        Ok(vec![Bytes::from(self.count.to_le_bytes().to_vec())])
+    }
+    fn snapshot(&self) -> Option<Bytes> {
+        Some(Bytes::from(self.count.to_le_bytes().to_vec()))
+    }
+    fn restore(&mut self, state: Bytes) -> Result<(), DaemonError> {
+        if state.len() != 8 {
+            return Err(DaemonError::RestoreFailed("bad state size".into()));
+        }
+        self.count = u64::from_le_bytes(state[..8].try_into().unwrap());
+        Ok(())
+    }
+}
+
+/// 7.1 — Migration snapshot request/response over encrypted UDP.
+///
+/// A sends TakeSnapshot to B over encrypted UDP. B's handler processes
+/// it and takes the snapshot. Verified by checking B's source handler
+/// state changed — proving the message survived wire encoding, encryption,
+/// UDP, decryption, and subprotocol dispatch.
+#[tokio::test]
+async fn test_migration_snapshot_over_wire() {
+    let ports = find_ports(2).await;
+    let psk = [0x42u8; 32];
+
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(10))
+    };
+
+    // B: source node with a daemon
+    let registry_b = Arc::new(DaemonRegistry::new());
+    let daemon_kp = EntityKeypair::generate();
+    let daemon_origin = daemon_kp.origin_hash();
+    let host = DaemonHost::new(
+        Box::new(CounterDaemon::with_count(42)),
+        daemon_kp,
+        DaemonHostConfig::default(),
+    );
+    registry_b.register(host).unwrap();
+
+    let orchestrator_b = Arc::new(MigrationOrchestrator::new(registry_b.clone(), nid_b));
+    let source_b = Arc::new(MigrationSourceHandler::new(registry_b.clone()));
+    let target_b = Arc::new(MigrationTargetHandler::new(registry_b.clone()));
+    let handler_b = Arc::new(MigrationSubprotocolHandler::new(
+        orchestrator_b, source_b.clone(), target_b, nid_b,
+    ));
+
+    let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let mut node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let pub_b = *node_b.public_key();
+
+    node_b.set_migration_handler(handler_b);
+
+    let (r1, r2) = tokio::join!(node_b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap(); r2.unwrap();
+
+    node_a.start();
+    node_b.start();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // A sends TakeSnapshot to B
+    let msg = MigrationMessage::TakeSnapshot {
+        daemon_origin,
+        target_node: nid_a,
+    };
+    let encoded = migration_wire::encode(&msg).unwrap();
+    node_a
+        .send_subprotocol(addr_b, SUBPROTOCOL_MIGRATION, &encoded)
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    // Verify B processed TakeSnapshot: source handler is in snapshot state
+    let second_try = source_b.start_snapshot(daemon_origin, 0x9999);
+    assert!(
+        second_try.is_err(),
+        "B should have processed TakeSnapshot over wire — source handler in snapshot state"
+    );
+
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+}

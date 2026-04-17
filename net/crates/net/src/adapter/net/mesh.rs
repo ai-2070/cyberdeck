@@ -45,10 +45,12 @@ use super::failure::{FailureDetector, FailureDetectorConfig};
 use super::identity::EntityKeypair;
 use super::pool::PacketBuilder;
 
+use super::compute::SUBPROTOCOL_MIGRATION;
 use super::protocol::{self, EventFrame, PacketFlags, MAGIC};
 use super::route::{RoutingHeader, ROUTING_HEADER_SIZE};
 use super::router::{NetRouter, RouterConfig};
 use super::session::NetSession;
+use super::subprotocol::MigrationSubprotocolHandler;
 use super::transport::{NetSocket, PacketReceiver, ParsedPacket, SocketBufferConfig};
 
 use crate::adapter::{Adapter, ShardPollResult};
@@ -66,6 +68,10 @@ struct DispatchCtx {
     failure_detector: Arc<FailureDetector>,
     inbound: InboundQueues,
     num_shards: u16,
+    /// Optional subprotocol handler for migration messages.
+    migration_handler: Option<Arc<MigrationSubprotocolHandler>>,
+    /// Socket for sending outbound subprotocol responses.
+    socket: Arc<NetSocket>,
 }
 
 /// Configuration for a MeshNode.
@@ -175,6 +181,8 @@ pub struct MeshNode {
     failure_detector: Arc<FailureDetector>,
     /// Inbound event queues (shared with receive loop)
     inbound: InboundQueues,
+    /// Optional migration subprotocol handler
+    migration_handler: Option<Arc<MigrationSubprotocolHandler>>,
     /// Background tasks
     tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
     /// Shutdown flag
@@ -239,6 +247,7 @@ impl MeshNode {
             router: Arc::new(router),
             failure_detector: Arc::new(failure_detector),
             inbound: Arc::new(DashMap::new()),
+            migration_handler: None,
             tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
@@ -264,6 +273,15 @@ impl MeshNode {
     /// Get the failure detector.
     pub fn failure_detector(&self) -> &Arc<FailureDetector> {
         &self.failure_detector
+    }
+
+    /// Set the migration subprotocol handler.
+    ///
+    /// Must be called before `start()`. When set, inbound packets with
+    /// `subprotocol_id == 0x0500` are dispatched to this handler instead
+    /// of being queued as events.
+    pub fn set_migration_handler(&mut self, handler: Arc<MigrationSubprotocolHandler>) {
+        self.migration_handler = Some(handler);
     }
 
     /// Number of connected peers.
@@ -379,6 +397,8 @@ impl MeshNode {
             failure_detector: self.failure_detector.clone(),
             inbound: self.inbound.clone(),
             num_shards: self.config.num_shards,
+            migration_handler: self.migration_handler.clone(),
+            socket: self.socket.clone(),
         };
 
         tokio::spawn(async move {
@@ -417,8 +437,6 @@ impl MeshNode {
         let peers = &ctx.peers;
         let router = &ctx.router;
         let failure_detector = &ctx.failure_detector;
-        let inbound = &ctx.inbound;
-        let num_shards = ctx.num_shards;
         // Distinguish routed packets from direct packets.
         //
         // Direct packets start with the Net header magic (0x4E45).
@@ -452,7 +470,7 @@ impl MeshNode {
                         .find(|e| e.value().session.session_id() == session_id)
                         .map(|e| e.value().session.clone());
                     if let Some(session) = matching_session {
-                        Self::process_local_packet(&parsed, &session, inbound, num_shards);
+                        Self::process_local_packet(&parsed, &session, ctx);
                         session.touch();
                     }
                 } else {
@@ -490,7 +508,7 @@ impl MeshNode {
             return;
         }
 
-        Self::process_local_packet(&parsed, &peer.session, inbound, num_shards);
+        Self::process_local_packet(&parsed, &peer.session, ctx);
         peer.session.touch();
     }
 
@@ -501,9 +519,10 @@ impl MeshNode {
     fn process_local_packet(
         parsed: &ParsedPacket,
         session: &NetSession,
-        inbound: &InboundQueues,
-        num_shards: u16,
+        ctx: &DispatchCtx,
     ) {
+        let inbound = &ctx.inbound;
+        let num_shards = ctx.num_shards;
         // Validate payload length
         if !parsed.header.flags.is_handshake()
             && !parsed.header.flags.is_heartbeat()
@@ -527,10 +546,71 @@ impl MeshNode {
             Err(_) => return,
         };
 
-        // Parse events
+        // Check subprotocol — migration messages are sent as single event frames
+        if parsed.header.subprotocol_id == SUBPROTOCOL_MIGRATION {
+            if let Some(ref handler) = ctx.migration_handler {
+                // Extract the payload from the event frame wrapper
+                let events =
+                    EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+                let payload = match events.into_iter().next() {
+                    Some(data) => data,
+                    None => return,
+                };
+
+                // Find the sender's node_id
+                let from_node = ctx
+                    .peers
+                    .iter()
+                    .find(|e| e.value().session.session_id() == session.session_id())
+                    .map(|e| e.value().node_id)
+                    .unwrap_or(0);
+
+                match handler.handle_message(&payload, from_node) {
+                    Ok(outbound) => {
+                        // Send outbound responses asynchronously
+                        for msg in outbound {
+                            let dest_session = ctx
+                                .peers
+                                .iter()
+                                .find(|e| e.value().node_id == msg.dest_node)
+                                .map(|e| (*e.key(), e.value().session.clone()));
+
+                            if let Some((dest_addr, dest_sess)) = dest_session {
+                                let socket = ctx.socket.clone();
+                                let payload = Bytes::from(msg.payload);
+                                // Fire-and-forget: send the response packet
+                                tokio::spawn(async move {
+                                    let pool = dest_sess.thread_local_pool();
+                                    let mut builder = pool.get();
+                                    let seq = {
+                                        let stream =
+                                            dest_sess.get_or_create_stream(SUBPROTOCOL_MIGRATION as u64);
+                                        stream.next_tx_seq()
+                                    };
+                                    let events = vec![payload];
+                                    let packet = builder.build_subprotocol(
+                                        SUBPROTOCOL_MIGRATION as u64,
+                                        seq,
+                                        &events,
+                                        PacketFlags::NONE,
+                                        SUBPROTOCOL_MIGRATION,
+                                    );
+                                    let _ = socket.send_to(&packet, dest_addr).await;
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "migration handler error");
+                    }
+                }
+            }
+            return;
+        }
+
+        // Standard event path: parse event frames and queue
         let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
 
-        // Map stream to shard
         let stream_id = parsed.header.stream_id;
         let shard_id = if num_shards > 0 {
             (stream_id % num_shards as u64) as u16
@@ -538,7 +618,6 @@ impl MeshNode {
             0
         };
 
-        // Update stream state
         {
             let stream = session.get_or_create_stream(stream_id);
             stream.with_reliability(|r| {
@@ -547,7 +626,6 @@ impl MeshNode {
             stream.update_rx_seq(parsed.header.sequence);
         }
 
-        // Queue events for poll_shard
         let queue = inbound.entry(shard_id).or_default();
         let seq = parsed.header.sequence;
         for (i, event_data) in events.into_iter().enumerate() {
@@ -762,6 +840,51 @@ impl MeshNode {
                 .await
                 .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
         }
+
+        drop(builder);
+        session.touch();
+        Ok(())
+    }
+
+    /// Send a raw subprotocol message to a peer.
+    ///
+    /// The payload is sent as a single event frame with the specified
+    /// `subprotocol_id` set in the Net header (included in AEAD AAD).
+    pub async fn send_subprotocol(
+        &self,
+        peer_addr: SocketAddr,
+        subprotocol_id: u16,
+        payload: &[u8],
+    ) -> Result<(), AdapterError> {
+        let peer = self
+            .peers
+            .get(&peer_addr)
+            .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
+
+        let session = &peer.session;
+        let stream_id = subprotocol_id as u64;
+
+        let pool = session.thread_local_pool();
+        let mut builder = pool.get();
+
+        let seq = {
+            let stream = session.get_or_create_stream(stream_id);
+            stream.next_tx_seq()
+        };
+
+        let events = vec![Bytes::copy_from_slice(payload)];
+        let packet = builder.build_subprotocol(
+            stream_id,
+            seq,
+            &events,
+            PacketFlags::NONE,
+            subprotocol_id,
+        );
+
+        self.socket
+            .send_to(&packet, peer_addr)
+            .await
+            .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
 
         drop(builder);
         session.touch();
