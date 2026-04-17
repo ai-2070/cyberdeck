@@ -181,19 +181,61 @@ ReplicaGroup (group_id: 0xABCD, seed: [...])
            DaemonRegistry::deliver(selected_origin_hash, event)
 ```
 
+Both `ReplicaGroup` and `ForkGroup` (below) delegate to a shared `GroupCoordinator` for load balancing, health tracking, member management, and routing. The coordinator is an internal primitive — the two group types own it and expose their own APIs.
+
 `SUBPROTOCOL_REPLICA_GROUP` (0x0900) is reserved for future cross-node group coordination (membership announcements, coordinated scaling). The current implementation operates as a local coordinator — all cross-node communication uses existing primitives.
+
+## Fork Groups
+
+Where replicas are interchangeable copies with arbitrary identity, forks are independent entities with cryptographically documented lineage. A `ForkGroup` creates N daemons forked from a common parent at a specific point in its causal chain.
+
+**Lineage is verifiable.** Each fork gets a `ForkRecord` with a sentinel hash: `parent_hash = xxh3(original_origin ++ fork_seq ++ "fork")`. Any node on the mesh can verify the fork by recomputing the sentinel. The fork record is created by `fork_entity()` from the continuity layer.
+
+**Identity is stored, not derived.** Unlike replicas (where keypairs derive deterministically from a seed), fork keypairs are generated randomly by `fork_entity()` and then stored for recovery. On node failure, the fork is re-created from the stored keypair secret — same `origin_hash`, same `ForkRecord`, fresh daemon and chain.
+
+**The chain documents the fork.** `DaemonHost::from_fork()` creates a host with a `CausalChainBuilder` whose genesis link carries the fork sentinel as `parent_hash`. Events produced by the fork chain back through this genesis to the parent's chain at the fork point.
+
+**Scaling works like replicas.** `scale_to(n)` adds new forks from the same parent at the same `fork_seq`, or removes the highest-index ones. Each new fork gets its own random keypair and `ForkRecord`.
+
+```
+ForkGroup (parent: 0xAAAA, fork_seq: 100)
+├── Fork 0: origin=0x1234, sentinel=xxh3(0xAAAA||100||"fork"), node=0xBBBB
+├── Fork 1: origin=0x5678, sentinel=xxh3(0xAAAA||100||"fork"), node=0xCCCC
+└── Fork 2: origin=0x9ABC, sentinel=xxh3(0xAAAA||100||"fork"), node=0xDDDD
+                    │
+                    ▼
+              LoadBalancer
+                    │
+                    ▼
+           DaemonRegistry::deliver(selected_origin_hash, event)
+```
+
+**Replicas vs Forks:**
+
+| | Replicas | Forks |
+|---|---|---|
+| Identity | Deterministic from seed | Random, stored for recovery |
+| Lineage | None | `ForkRecord` with verifiable sentinel |
+| Members | Interchangeable | Independent, divergent |
+| Recovery | Re-derive same keypair | Re-create from stored secret |
+| Chain genesis | Normal genesis | Fork genesis with sentinel `parent_hash` |
+| Use case | Horizontal scale, LB | Fan-out, A/B, specialization |
+
+**Composability with migration.** Forks are normal daemons in the `DaemonRegistry`. MIKOSHI can migrate a fork to another node — the migration system doesn't know or care that the daemon is a fork. The causal chain and fork lineage travel with the snapshot.
 
 ## Source Files
 
 | File | Purpose |
 |------|---------|
 | `compute/daemon.rs` | `MeshDaemon` trait, `DaemonError` |
-| `compute/host.rs` | `DaemonHost`, lifecycle management, `from_snapshot()` restore |
+| `compute/host.rs` | `DaemonHost`, lifecycle management, `from_snapshot()` restore, `from_fork()` |
 | `compute/migration.rs` | `MigrationState`, `MigrationPhase`, 6-phase state machine |
 | `compute/orchestrator.rs` | `MigrationOrchestrator`, `MigrationMessage` wire protocol, snapshot chunking, `SnapshotReassembler` |
 | `compute/migration_source.rs` | `MigrationSourceHandler`, source-side snapshot/buffer/cutover/cleanup |
 | `compute/migration_target.rs` | `MigrationTargetHandler`, target-side restore/replay/activate |
-| `compute/replica_group.rs` | `ReplicaGroup`, N-way replication with deterministic identity and LB routing |
+| `compute/group_coord.rs` | `GroupCoordinator`, shared LB/health/routing for replica and fork groups |
+| `compute/replica_group.rs` | `ReplicaGroup`, N-way replication with deterministic identity |
+| `compute/fork_group.rs` | `ForkGroup`, N-way forking with verifiable lineage and stored keypairs |
 | `compute/registry.rs` | `DaemonRegistry`, local daemon tracking |
 | `compute/scheduler.rs` | `Scheduler`, `PlacementDecision`, capability-based placement, `find_migration_targets()`, `place_migration()` |
 | `subprotocol/migration_handler.rs` | `MigrationSubprotocolHandler`, message dispatch to orchestrator/source/target |
