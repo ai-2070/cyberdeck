@@ -50,10 +50,7 @@ impl AdapterError {
     /// Returns true if this error is retryable.
     #[inline]
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::Transient(_) | Self::Backpressure | Self::Connection(_)
-        )
+        matches!(self, Self::Transient(_) | Self::Backpressure)
     }
 
     /// Returns true if this error is fatal.
@@ -97,7 +94,7 @@ mod tests {
         assert!(AdapterError::Transient("temp".into()).is_retryable());
         assert!(AdapterError::Backpressure.is_retryable());
         assert!(!AdapterError::Fatal("dead".into()).is_retryable());
-        assert!(AdapterError::Connection("refused".into()).is_retryable());
+        assert!(!AdapterError::Connection("refused".into()).is_retryable());
         assert!(!AdapterError::Serialization("bad json".into()).is_retryable());
     }
 
@@ -138,13 +135,13 @@ mod tests {
     }
 
     #[test]
-    fn test_regression_connection_error_is_retryable() {
-        // Regression: Connection errors were not included in is_retryable(),
-        // causing connection timeouts to be treated as permanent failures.
-        assert!(
-            AdapterError::Connection("timeout".into()).is_retryable(),
-            "Connection errors must be retryable"
-        );
+    fn test_connection_error_not_retryable() {
+        // Connection errors cover both transient failures ("send failed") and
+        // permanent ones ("adapter not initialized"). Since we can't distinguish
+        // them at the type level, Connection is conservatively non-retryable.
+        // The batch dispatch path retries all errors regardless of this flag.
+        assert!(!AdapterError::Connection("refused".into()).is_retryable());
+        assert!(!AdapterError::Connection("adapter not initialized".into()).is_retryable());
     }
 
     #[test]
