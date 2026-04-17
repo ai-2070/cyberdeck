@@ -24,7 +24,13 @@ use crate::adapter::net::compute::registry::DaemonRegistry;
 use crate::adapter::net::compute::scheduler::Scheduler;
 use crate::adapter::net::identity::EntityKeypair;
 
-/// Subprotocol ID for replica group coordination (reserved for future use).
+/// Subprotocol ID for replica group coordination (reserved, not yet registered).
+///
+/// Intentionally NOT in `SubprotocolRegistry::with_defaults()`. Groups
+/// currently operate as local coordinators — member placement uses the
+/// daemon's own `CapabilityFilter`, not a group-specific tag. Register
+/// this ID when cross-node group coordination is implemented (distributed
+/// membership, remote scale_to, coordinated failover).
 pub const SUBPROTOCOL_REPLICA_GROUP: u16 = 0x0900;
 
 // ── Configuration ────────────────────────────────────────────────────────────
