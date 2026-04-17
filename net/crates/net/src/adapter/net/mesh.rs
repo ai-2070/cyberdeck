@@ -633,8 +633,9 @@ impl MeshNode {
                         tracing::warn!(error = %e, "migration handler error");
                     }
                 }
+                return; // handler processed it
             }
-            return;
+            // No handler set — fall through to standard event path
         }
 
         // Standard event path: parse event frames and queue
@@ -1138,25 +1139,17 @@ impl Adapter for MeshNode {
 
         let mut events = Vec::with_capacity(limit.min(1000));
         let mut last_id = None;
-        let skip_until = from_id.map(|s| s.to_string());
+        // from_id is ignored — the SegQueue is consume-once, so every pop
+        // removes the event permanently. Cursor-based skipping would destroy
+        // events that have already been consumed. Callers should consume
+        // from the head without a cursor.
+        let _ = from_id;
 
-        // Drain from the concurrent queue
-        let mut skipping = skip_until.is_some();
-        let max_drain = limit * 2; // drain extra to handle skip
-        for _ in 0..max_drain {
+        for _ in 0..limit {
             match queue.pop() {
                 Some(event) => {
-                    if skipping {
-                        if Some(&event.id) == skip_until.as_ref() {
-                            skipping = false;
-                        }
-                        continue;
-                    }
                     last_id = Some(event.id.clone());
                     events.push(event);
-                    if events.len() >= limit {
-                        break;
-                    }
                 }
                 None => break,
             }

@@ -2827,15 +2827,24 @@ async fn test_migration_full_lifecycle_over_wire() {
         nid_b,
     ));
 
+    // C: target node — needs a handler to receive snapshot and restore
+    let registry_c = Arc::new(DaemonRegistry::new());
+    let handler_c = Arc::new(MigrationSubprotocolHandler::new(
+        Arc::new(MigrationOrchestrator::new(registry_c.clone(), nid_c)),
+        Arc::new(MigrationSourceHandler::new(registry_c.clone())),
+        Arc::new(MigrationTargetHandler::new(registry_c.clone())),
+        nid_c,
+    ));
+
     let mut node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
     let mut node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
-    // Node C exists for the triangle but isn't involved in this test
-    let node_c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let mut node_c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
     let pub_b = *node_b.public_key();
     let pub_c = *node_c.public_key();
 
     node_a.set_migration_handler(handler_a);
     node_b.set_migration_handler(handler_b);
+    node_c.set_migration_handler(handler_c);
 
     // Connect A↔B
     let (r1, r2) = tokio::join!(node_b.accept(nid_a), async {

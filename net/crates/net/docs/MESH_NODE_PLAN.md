@@ -77,8 +77,9 @@ recv(packet, source_addr)
   │
   ├─ if heartbeat packet → failure_detector.heartbeat(node_id, addr)
   │
-  ├─ lookup session by source_addr
-  │   └─ if no session → drop (unknown peer)
+  ├─ lookup session:
+  │   ├─ direct packets: by source_addr
+  │   └─ routed packets: by inner session_id (source is the relay, not the sender)
   │
   ├─ check routing header
   │   ├─ if dest_id == self.node_id → LOCAL
@@ -131,7 +132,7 @@ recv(packet, source_addr)
 
 ### Phase 3: Subprotocol dispatch
 
-7. **Wire `SubprotocolHandler` into the receive loop.** Packets with `subprotocol_id != 0x0000` are dispatched to the handler instead of queued as events.
+7. **Wire `SubprotocolHandler` into the receive loop.** Packets with `subprotocol_id == 0x0500` (migration) are dispatched to the migration handler. All other subprotocol IDs (causal `0x0400`, snapshots `0x0401`, unregistered, etc.) fall through to the standard event path or opaque forwarding.
 
 8. **Migration message flow.** The `MigrationSubprotocolHandler` receives snapshot chunks, buffered events, cutover notifications over real UDP.
 
