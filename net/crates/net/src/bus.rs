@@ -481,7 +481,7 @@ impl EventBus {
         let mut backoff = Duration::from_micros(100);
 
         loop {
-            let all_empty = (0..self.shard_manager.num_shards()).all(|shard_id| {
+            let all_empty = self.shard_manager.shard_ids().into_iter().all(|shard_id| {
                 self.shard_manager
                     .with_shard(shard_id, |shard| shard.is_empty())
                     .unwrap_or(true)

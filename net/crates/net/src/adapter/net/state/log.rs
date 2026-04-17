@@ -79,15 +79,11 @@ impl EntityLog {
             return Err(LogError::Duplicate(event.link.sequence));
         }
 
-        // For genesis on a fresh log, accept without parent validation
+        // For genesis on a fresh log, accept without parent validation.
+        // All other appends validate chain linkage (parent_hash, sequence, origin).
         if self.events.is_empty() && current_head.is_genesis() && event.link.is_genesis() {
             // Accept genesis event
-        } else if current_head.is_genesis() && event.link.sequence == 1 {
-            // First real event after genesis — validate parent_hash against genesis link.
-            validate_chain_link(&current_head, &self.head_payload, &event.link)
-                .map_err(LogError::Chain)?;
         } else {
-            // Validate chain linkage against current head
             validate_chain_link(&current_head, &self.head_payload, &event.link)
                 .map_err(LogError::Chain)?;
         }
@@ -155,17 +151,31 @@ impl EntityLog {
     ///
     /// Called after a snapshot is taken at that sequence.
     pub fn prune_through(&mut self, seq: u64) {
+        // Capture the last pruned event's link and payload so that base_link
+        // remains a valid chain anchor if all events are removed. Without this,
+        // the next append would fail chain validation because base_link wouldn't
+        // match the expected parent_hash.
+        let last_pruned = self
+            .events
+            .iter()
+            .rev()
+            .find(|e| e.link.sequence <= seq)
+            .map(|e| (e.link, e.payload.clone()));
+
         self.events.retain(|e| e.link.sequence > seq);
         if seq > self.snapshot_seq {
             self.snapshot_seq = seq;
         }
-        // Update base_link and head_payload to stay consistent after pruning.
+        // Update base_link to the new first remaining event, or to the last
+        // pruned event's link if everything was removed (so the next append
+        // can still chain correctly).
         if let Some(first) = self.events.first() {
             self.base_link = first.link;
-        } else {
-            self.base_link = CausalLink::genesis(self.origin_hash, 0);
-            self.head_payload = Bytes::new();
+        } else if let Some((link, payload)) = last_pruned {
+            self.base_link = link;
+            self.head_payload = payload;
         }
+        // If nothing was pruned and nothing remains, base_link stays as-is.
     }
 
     /// Get the snapshot sequence (events before this have been pruned).

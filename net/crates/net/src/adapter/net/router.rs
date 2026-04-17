@@ -271,11 +271,16 @@ impl FairScheduler {
         self.streams.len()
     }
 
-    /// Clean up empty stream queues
+    /// Clean up empty stream queues.
+    ///
+    /// Only removes queues that are both empty and have no outstanding
+    /// `Arc` references (strong_count == 1 means only the DashMap holds it).
+    /// This prevents a race where `enqueue` clones the Arc, cleanup removes
+    /// the entry, and the enqueued packet becomes unreachable.
     pub fn cleanup_empty(&self) -> usize {
         let mut removed = 0;
         self.streams.retain(|_, queue| {
-            if queue.is_empty() {
+            if queue.is_empty() && Arc::strong_count(queue) == 1 {
                 removed += 1;
                 false
             } else {

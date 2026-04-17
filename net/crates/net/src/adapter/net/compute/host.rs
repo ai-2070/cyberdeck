@@ -141,11 +141,11 @@ impl DaemonHost {
         let horizon_encoded = self.horizon.encode();
         let mut causal_outputs = Vec::with_capacity(outputs.len());
         for payload in outputs {
-            self.stats.events_emitted += 1;
             let event = self
                 .chain
                 .append(payload, horizon_encoded)
                 .ok_or_else(|| DaemonError::ProcessFailed("causal sequence overflow".into()))?;
+            self.stats.events_emitted += 1;
             causal_outputs.push(event);
         }
 

@@ -832,12 +832,10 @@ pub extern "C" fn net_num_shards(handle: *mut NetHandle) -> u16 {
         return 0;
     }
     let handle = unsafe { &*handle };
-    if handle
-        .shutting_down
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        return 0;
-    }
+    let _guard = match enter_ffi_op(handle) {
+        Ok(g) => g,
+        Err(_) => return 0,
+    };
     handle.bus.num_shards()
 }
 
