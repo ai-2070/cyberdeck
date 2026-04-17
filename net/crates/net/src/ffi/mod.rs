@@ -77,6 +77,8 @@ use std::ffi::CString;
 /// Opaque handle to an event bus instance.
 ///
 /// This wraps the EventBus along with a Tokio runtime for async operations.
+/// The handle is reference-counted so that concurrent FFI calls keep it alive
+/// even if `net_shutdown` races against them.
 pub struct NetHandle {
     bus: EventBus,
     runtime: Runtime,
@@ -85,6 +87,44 @@ pub struct NetHandle {
     /// window for use-after-free when a C caller races shutdown against
     /// concurrent operations.
     shutting_down: std::sync::atomic::AtomicBool,
+    /// Number of in-flight FFI operations (excluding shutdown itself).
+    /// `net_shutdown` spins until this drops to zero before deallocating.
+    active_ops: std::sync::atomic::AtomicU32,
+}
+
+/// RAII guard that increments `active_ops` on creation and decrements on drop.
+struct FfiOpGuard<'a> {
+    handle: &'a NetHandle,
+}
+
+impl<'a> FfiOpGuard<'a> {
+    /// Try to enter an FFI operation. Returns `None` if the handle is shutting down.
+    fn try_enter(handle: &'a NetHandle) -> Option<Self> {
+        handle
+            .active_ops
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        // Re-check shutdown after incrementing — if shutdown was signaled
+        // between our check_shutting_down and fetch_add, we must bail out.
+        if handle
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            handle
+                .active_ops
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            None
+        } else {
+            Some(Self { handle })
+        }
+    }
+}
+
+impl Drop for FfiOpGuard<'_> {
+    fn drop(&mut self) {
+        self.handle
+            .active_ops
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 /// Error codes returned by FFI functions.
@@ -118,19 +158,12 @@ impl From<NetError> for c_int {
     }
 }
 
-/// Check whether the handle is shutting down. Returns `ShuttingDown` error
-/// code if the flag is set, reducing the use-after-free window when a C
-/// caller races `net_shutdown` against concurrent operations.
+/// Enter an FFI operation with lifetime protection. Returns an `FfiOpGuard`
+/// that prevents `net_shutdown` from deallocating the handle until the guard
+/// is dropped. Returns `Err` with the error code if shutdown is in progress.
 #[inline]
-fn check_shutting_down(handle: &NetHandle) -> Option<c_int> {
-    if handle
-        .shutting_down
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        Some(NetError::ShuttingDown.into())
-    } else {
-        None
-    }
+fn enter_ffi_op(handle: &NetHandle) -> Result<FfiOpGuard<'_>, c_int> {
+    FfiOpGuard::try_enter(handle).ok_or(NetError::ShuttingDown.into())
 }
 
 /// Initialize a new event bus.
@@ -359,6 +392,7 @@ fn create_with_config(runtime: Runtime, config: EventBusConfig) -> *mut NetHandl
         bus,
         runtime,
         shutting_down: std::sync::atomic::AtomicBool::new(false),
+        active_ops: std::sync::atomic::AtomicU32::new(0),
     });
 
     Box::into_raw(handle)
@@ -387,9 +421,10 @@ pub extern "C" fn net_ingest(
     }
 
     let handle = unsafe { &*handle };
-    if let Some(err) = check_shutting_down(handle) {
-        return err;
-    }
+    let _guard = match enter_ffi_op(handle) {
+        Ok(g) => g,
+        Err(err) => return err,
+    };
 
     // Parse event JSON
     let json_bytes = unsafe { std::slice::from_raw_parts(event_json as *const u8, len) };
@@ -432,9 +467,10 @@ pub extern "C" fn net_ingest_raw(handle: *mut NetHandle, json: *const c_char, le
     }
 
     let handle = unsafe { &*handle };
-    if let Some(err) = check_shutting_down(handle) {
-        return err;
-    }
+    let _guard = match enter_ffi_op(handle) {
+        Ok(g) => g,
+        Err(err) => return err,
+    };
 
     let json_bytes = unsafe { std::slice::from_raw_parts(json as *const u8, len) };
     let json_str = match std::str::from_utf8(json_bytes) {
@@ -477,9 +513,10 @@ pub extern "C" fn net_ingest_raw_batch(
     }
 
     let handle = unsafe { &*handle };
-    if let Some(err) = check_shutting_down(handle) {
-        return err;
-    }
+    let _guard = match enter_ffi_op(handle) {
+        Ok(g) => g,
+        Err(err) => return err,
+    };
     let mut events = Vec::with_capacity(count);
 
     for i in 0..count {
@@ -517,9 +554,10 @@ pub extern "C" fn net_ingest_batch(handle: *mut NetHandle, events_json: *const c
     }
 
     let handle = unsafe { &*handle };
-    if let Some(err) = check_shutting_down(handle) {
-        return err;
-    }
+    let _guard = match enter_ffi_op(handle) {
+        Ok(g) => g,
+        Err(err) => return err,
+    };
 
     let json_str = match unsafe { CStr::from_ptr(events_json) }.to_str() {
         Ok(s) => s,
@@ -564,9 +602,10 @@ pub extern "C" fn net_poll(
     }
 
     let handle = unsafe { &*handle };
-    if let Some(err) = check_shutting_down(handle) {
-        return err;
-    }
+    let _guard = match enter_ffi_op(handle) {
+        Ok(g) => g,
+        Err(err) => return err,
+    };
 
     // Parse request
     let request = if request_json.is_null() {
@@ -593,17 +632,29 @@ pub extern "C" fn net_poll(
         Err(_) => return NetError::PollFailed.into(),
     };
 
-    // Serialize response, skipping events with corrupt/unparseable raw bytes
-    let parsed_events: Vec<_> = response
-        .events
-        .iter()
-        .filter_map(|e| e.parse().ok())
-        .collect();
+    // Serialize response. Events that fail to parse are included as raw
+    // strings so the caller can see all events and detect parse failures.
+    let total_events = response.events.len();
+    let mut parsed_events: Vec<serde_json::Value> = Vec::with_capacity(total_events);
+    let mut parse_errors: usize = 0;
+    for e in &response.events {
+        match e.parse() {
+            Ok(v) => parsed_events.push(v),
+            Err(_) => {
+                parse_errors += 1;
+                // Include the raw bytes as a string so the caller doesn't silently lose events
+                if let Ok(raw) = e.raw_str() {
+                    parsed_events.push(serde_json::Value::String(raw.to_string()));
+                }
+            }
+        }
+    }
     let response_json = match serde_json::to_string(&serde_json::json!({
         "events": parsed_events,
         "next_id": response.next_id,
         "has_more": response.has_more,
         "count": parsed_events.len(),
+        "parse_errors": parse_errors,
     })) {
         Ok(s) => s,
         Err(_) => return NetError::Unknown.into(),
@@ -652,9 +703,10 @@ pub extern "C" fn net_stats(
     }
 
     let handle = unsafe { &*handle };
-    if let Some(err) = check_shutting_down(handle) {
-        return err;
-    }
+    let _guard = match enter_ffi_op(handle) {
+        Ok(g) => g,
+        Err(err) => return err,
+    };
     let stats = handle.bus.stats();
     let shard_stats = handle.bus.shard_stats();
 
@@ -706,9 +758,10 @@ pub extern "C" fn net_flush(handle: *mut NetHandle) -> c_int {
     }
 
     let handle = unsafe { &*handle };
-    if let Some(err) = check_shutting_down(handle) {
-        return err;
-    }
+    let _guard = match enter_ffi_op(handle) {
+        Ok(g) => g,
+        Err(err) => return err,
+    };
 
     match handle.runtime.block_on(handle.bus.flush()) {
         Ok(_) => NetError::Success.into(),
@@ -733,12 +786,22 @@ pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
     }
 
     // Signal shutdown *before* taking ownership so that concurrent FFI
-    // calls on other threads see the flag and bail out early, reducing
-    // the use-after-free window.
+    // calls on other threads see the flag and bail out early.
     let handle_ref = unsafe { &*handle };
     handle_ref
         .shutting_down
         .store(true, std::sync::atomic::Ordering::Release);
+
+    // Spin-wait until all in-flight FFI operations have completed.
+    // Each operation holds an FfiOpGuard that decrements active_ops on drop,
+    // so this loop is bounded by the longest concurrent FFI call.
+    while handle_ref
+        .active_ops
+        .load(std::sync::atomic::Ordering::Acquire)
+        > 0
+    {
+        std::hint::spin_loop();
+    }
 
     let handle = unsafe { Box::from_raw(handle) };
     let NetHandle { bus, runtime, .. } = *handle;
@@ -769,12 +832,10 @@ pub extern "C" fn net_num_shards(handle: *mut NetHandle) -> u16 {
         return 0;
     }
     let handle = unsafe { &*handle };
-    if handle
-        .shutting_down
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        return 0;
-    }
+    let _guard = match enter_ffi_op(handle) {
+        Ok(g) => g,
+        Err(_) => return 0,
+    };
     handle.bus.num_shards()
 }
 
@@ -893,9 +954,10 @@ pub extern "C" fn net_ingest_raw_ex(
     }
 
     let handle = unsafe { &*handle };
-    if let Some(err) = check_shutting_down(handle) {
-        return err;
-    }
+    let _guard = match enter_ffi_op(handle) {
+        Ok(g) => g,
+        Err(err) => return err,
+    };
 
     let json_bytes = unsafe { std::slice::from_raw_parts(json as *const u8, len) };
     let json_str = match std::str::from_utf8(json_bytes) {
@@ -934,9 +996,10 @@ pub extern "C" fn net_poll_ex(
     }
 
     let handle = unsafe { &*handle };
-    if let Some(err) = check_shutting_down(handle) {
-        return err;
-    }
+    let _guard = match enter_ffi_op(handle) {
+        Ok(g) => g,
+        Err(err) => return err,
+    };
 
     let mut request = ConsumeRequest::new(limit);
     if !cursor.is_null() {
@@ -1045,7 +1108,12 @@ fn free_events_array(events: *mut NetEvent, count: usize) {
     }
 }
 
-/// Free a poll result returned by `net_poll_ex`.
+/// Free the internal allocations of a poll result returned by `net_poll_ex`.
+///
+/// This frees the events array (including each event's `id` and `raw` buffers)
+/// and the `next_id` string. It does **not** free the `NetPollResult` struct
+/// itself, which is caller-provided (typically stack-allocated or managed by
+/// the caller).
 #[unsafe(no_mangle)]
 pub extern "C" fn net_free_poll_result(result: *mut NetPollResult) {
     if result.is_null() {
@@ -1073,9 +1141,10 @@ pub extern "C" fn net_stats_ex(handle: *mut NetHandle, out: *mut NetStats) -> c_
     }
 
     let handle = unsafe { &*handle };
-    if let Some(err) = check_shutting_down(handle) {
-        return err;
-    }
+    let _guard = match enter_ffi_op(handle) {
+        Ok(g) => g,
+        Err(err) => return err,
+    };
     let stats = handle.bus.stats();
 
     unsafe {

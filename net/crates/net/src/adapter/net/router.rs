@@ -183,6 +183,16 @@ impl FairScheduler {
 
     /// Dequeue next packet (fair round-robin)
     pub fn dequeue(&self) -> Option<QueuedPacket> {
+        // Periodically clean up empty stream queues to prevent unbounded growth
+        // of the DashMap. Check every 1024 dequeue calls (cheap modular check).
+        if self
+            .round_robin_idx
+            .load(Ordering::Relaxed)
+            .is_multiple_of(1024)
+        {
+            self.cleanup_empty();
+        }
+
         // Priority queue first
         if let Some(packet) = self.priority_queue.pop() {
             return Some(packet);
@@ -261,11 +271,16 @@ impl FairScheduler {
         self.streams.len()
     }
 
-    /// Clean up empty stream queues
+    /// Clean up empty stream queues.
+    ///
+    /// Only removes queues that are both empty and have no outstanding
+    /// `Arc` references (strong_count == 1 means only the DashMap holds it).
+    /// This prevents a race where `enqueue` clones the Arc, cleanup removes
+    /// the entry, and the enqueued packet becomes unreachable.
     pub fn cleanup_empty(&self) -> usize {
         let mut removed = 0;
         self.streams.retain(|_, queue| {
-            if queue.is_empty() {
+            if queue.is_empty() && Arc::strong_count(queue) == 1 {
                 removed += 1;
                 false
             } else {
@@ -758,6 +773,57 @@ mod tests {
             1,
             "stream stats should record 1 packet for stream_id 0x{:X}",
             expected_stream_id
+        );
+    }
+
+    #[test]
+    fn test_regression_fair_scheduler_cleanup_called() {
+        // Regression: FairScheduler never removed empty stream queues from its
+        // DashMap. After many unique stream_ids passed through, the map grew
+        // without bound, causing O(n) iteration in dequeue() where n is the
+        // number of *ever-seen* streams rather than *active* streams. This
+        // degraded dequeue latency over time.
+        //
+        // Fix: dequeue() calls cleanup_empty() every 1024 iterations,
+        // removing streams whose queues have been fully drained.
+        let scheduler = FairScheduler::new(4, 16);
+
+        // Enqueue packets across many unique streams
+        let num_streams = 200u64;
+        for stream in 0..num_streams {
+            let packet = QueuedPacket {
+                data: Bytes::from(vec![0u8; 8]),
+                dest: "127.0.0.1:9000".parse().unwrap(),
+                stream_id: stream,
+                priority: false,
+                queued_at: Instant::now(),
+            };
+            assert!(scheduler.enqueue(packet));
+        }
+
+        assert_eq!(scheduler.stream_count(), num_streams as usize);
+
+        // Drain all packets
+        let mut drained = 0;
+        while scheduler.dequeue().is_some() {
+            drained += 1;
+        }
+        assert_eq!(drained, num_streams as usize);
+
+        // The cleanup triggers every 1024 dequeue calls. We need enough
+        // dequeue calls (even returning None) to cross the 1024 boundary.
+        // We already did `num_streams` dequeues above; do more no-op
+        // dequeues to push past the threshold.
+        for _ in 0..(1025 - drained) {
+            let _ = scheduler.dequeue();
+        }
+
+        // After cleanup, all empty stream queues should have been removed
+        assert_eq!(
+            scheduler.stream_count(),
+            0,
+            "empty stream queues must be cleaned up after enough dequeue \
+             iterations to prevent unbounded DashMap growth"
         );
     }
 

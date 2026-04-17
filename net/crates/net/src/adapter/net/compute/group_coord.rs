@@ -201,12 +201,17 @@ impl GroupCoordinator {
 
     /// Aggregate health of the group.
     pub fn health(&self) -> GroupHealth {
-        let healthy = self.members.iter().filter(|m| m.healthy).count() as u8;
-        let total = self.members.len() as u8;
-        match healthy {
-            0 => GroupHealth::Dead,
-            n if n == total => GroupHealth::Healthy,
-            n => GroupHealth::Degraded { healthy: n, total },
+        let healthy_count = self.members.iter().filter(|m| m.healthy).count();
+        let total_count = self.members.len();
+        // Compare at full precision before saturating to u8 for the return value.
+        let healthy = healthy_count.min(u8::MAX as usize) as u8;
+        let total = total_count.min(u8::MAX as usize) as u8;
+        if healthy_count == 0 {
+            GroupHealth::Dead
+        } else if healthy_count == total_count {
+            GroupHealth::Healthy
+        } else {
+            GroupHealth::Degraded { healthy, total }
         }
     }
 
@@ -217,12 +222,16 @@ impl GroupCoordinator {
 
     /// Number of members.
     pub fn member_count(&self) -> u8 {
-        self.members.len() as u8
+        self.members.len().min(u8::MAX as usize) as u8
     }
 
     /// Number of healthy members.
     pub fn healthy_count(&self) -> u8 {
-        self.members.iter().filter(|m| m.healthy).count() as u8
+        self.members
+            .iter()
+            .filter(|m| m.healthy)
+            .count()
+            .min(u8::MAX as usize) as u8
     }
 
     /// Indices of members on a given node.
@@ -246,10 +255,26 @@ impl GroupCoordinator {
     pub fn place_with_spread(
         scheduler: &Scheduler,
         requirements: &CapabilityFilter,
-        _exclude: &HashSet<u64>,
+        exclude: &HashSet<u64>,
     ) -> Result<crate::adapter::net::compute::scheduler::PlacementDecision, GroupError> {
         let placement = scheduler.place(requirements)?;
-        Ok(placement)
+        if !exclude.contains(&placement.node_id) {
+            return Ok(placement);
+        }
+        // Primary placement is excluded; query candidates and pick the first non-excluded.
+        let candidates = scheduler.query_candidates(requirements);
+        for node_id in candidates {
+            if !exclude.contains(&node_id) {
+                return Ok(crate::adapter::net::compute::scheduler::PlacementDecision {
+                    node_id,
+                    reason: crate::adapter::net::compute::scheduler::PlacementReason::FirstMatch,
+                });
+            }
+        }
+        // All candidates are in the exclusion set — no valid placement exists.
+        Err(GroupError::PlacementFailed(
+            "all candidate nodes are excluded by spread constraint".into(),
+        ))
     }
 }
 

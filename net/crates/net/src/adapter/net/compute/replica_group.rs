@@ -339,6 +339,7 @@ mod tests {
         index.index(CapabilityAnnouncement::new(0x1111, 1, CapabilitySet::new()));
         index.index(CapabilityAnnouncement::new(0x2222, 1, CapabilitySet::new()));
         index.index(CapabilityAnnouncement::new(0x3333, 1, CapabilitySet::new()));
+        index.index(CapabilityAnnouncement::new(0x4444, 1, CapabilitySet::new()));
         Scheduler::new(index, 0x1111, CapabilitySet::new())
     }
 

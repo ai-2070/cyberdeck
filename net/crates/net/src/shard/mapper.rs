@@ -174,6 +174,15 @@ impl ShardMetricsCollector {
     }
 
     /// Collect metrics and reset window counters.
+    ///
+    /// NOTE: The individual atomic swaps below are not collectively atomic with
+    /// respect to concurrent `record_push`/`record_flush` calls. This means a
+    /// push recorded between, say, the `events_in_window` swap and the
+    /// `push_count` swap could be counted in one counter but not the other for
+    /// a given window. This small inaccuracy is an accepted trade-off to
+    /// preserve the lock-free design of the hot path (`record_push` /
+    /// `record_flush`). Adding a `Mutex` here would serialize the hot path
+    /// and defeat the purpose of using atomics.
     pub fn collect_and_reset(&self) -> ShardMetrics {
         let current_len = self.current_len.load(AtomicOrdering::Relaxed);
         let events = self.events_in_window.swap(0, AtomicOrdering::Relaxed);
@@ -571,6 +580,7 @@ impl ShardMapper {
     /// Marks shards as draining so they stop receiving new events.
     /// Shards will be removed once they're empty.
     pub fn scale_down(&self, count: u16) -> Result<Vec<u16>, ScalingError> {
+        // Early check (may race, but avoids unnecessary lock acquisition)
         let current = self.active_count.load(AtomicOrdering::Acquire);
         if current <= self.policy.min_shards {
             return Err(ScalingError::AtMinShards);
@@ -592,6 +602,17 @@ impl ShardMapper {
         }
 
         let mut shards = self.shards.write();
+
+        // Re-check under the lock to prevent race conditions (double-check pattern)
+        let current = self.active_count.load(AtomicOrdering::Acquire);
+        if current <= self.policy.min_shards {
+            return Err(ScalingError::AtMinShards);
+        }
+        let to_drain = count.min(current - self.policy.min_shards);
+        if to_drain == 0 {
+            return Err(ScalingError::AtMinShards);
+        }
+
         let mut drained_ids = Vec::with_capacity(to_drain as usize);
 
         // Find shards with lowest weight (least utilized) to drain
@@ -630,9 +651,16 @@ impl ShardMapper {
 
         for shard in shards.iter_mut() {
             if shard.state == ShardState::Draining {
-                // Check if shard is empty (fill_ratio == 0 and no events)
-                let metrics = shard.metrics.collect_and_reset();
-                if metrics.fill_ratio == 0.0 && metrics.event_rate == 0 {
+                // Check if shard is empty by reading current_len directly,
+                // avoiding collect_and_reset() which destructively zeros all counters.
+                let current_len = shard.metrics.current_len.load(AtomicOrdering::Relaxed);
+                let fill_ratio = if shard.metrics.capacity > 0 {
+                    current_len as f64 / shard.metrics.capacity as f64
+                } else {
+                    0.0
+                };
+                let event_rate = shard.metrics.events_in_window.load(AtomicOrdering::Relaxed);
+                if fill_ratio == 0.0 && event_rate == 0 {
                     // Check if we've waited long enough
                     if let Some(drain_start) = shard.drain_started {
                         if drain_start.elapsed() > Duration::from_millis(100) {

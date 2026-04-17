@@ -266,7 +266,11 @@ impl Adapter for JetStreamAdapter {
             streams.clear();
         }
 
-        // Client cleanup is automatic on drop
+        // Drain the NATS client to flush pending messages and close cleanly.
+        if let Some(client) = &self.client {
+            let _ = client.drain().await;
+        }
+
         tracing::info!(adapter = "jetstream", "JetStream adapter shut down");
         Ok(())
     }

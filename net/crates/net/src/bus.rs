@@ -54,8 +54,8 @@ pub struct EventBus {
     adapter: Arc<dyn Adapter>,
     /// Poll merger for cross-shard consumption.
     poll_merger: arc_swap::ArcSwap<PollMerger>,
-    /// Batch worker handles.
-    batch_workers: parking_lot::Mutex<Vec<JoinHandle<()>>>,
+    /// Batch worker handles, keyed by shard ID for per-shard cleanup.
+    batch_workers: parking_lot::Mutex<std::collections::HashMap<u16, Vec<JoinHandle<()>>>>,
     /// Channels for sending batches to workers (shard_id -> sender).
     batch_senders: parking_lot::RwLock<
         std::collections::HashMap<u16, mpsc::Sender<Vec<crate::event::InternalEvent>>>,
@@ -136,7 +136,8 @@ impl EventBus {
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // Create batch workers for each shard
-        let mut batch_workers = Vec::with_capacity(config.num_shards as usize);
+        let mut batch_workers: std::collections::HashMap<u16, Vec<JoinHandle<()>>> =
+            std::collections::HashMap::with_capacity(config.num_shards as usize);
         let mut batch_senders =
             std::collections::HashMap::with_capacity(config.num_shards as usize);
 
@@ -154,14 +155,16 @@ impl EventBus {
                 batch_retries: config.adapter_batch_retries,
             });
 
-            batch_workers.push(worker);
+            batch_workers.entry(shard_id).or_default().push(worker);
             batch_senders.insert(shard_id, tx);
         }
 
         // Spawn drain workers that pull from ring buffers
-        let drain_workers =
-            spawn_drain_workers(shard_manager.clone(), &batch_senders, shutdown.clone());
-        batch_workers.extend(drain_workers);
+        for (shard_id, handle) in
+            spawn_drain_workers(shard_manager.clone(), &batch_senders, shutdown.clone())
+        {
+            batch_workers.entry(shard_id).or_default().push(handle);
+        }
 
         let bus = Self {
             shard_manager,
@@ -298,8 +301,9 @@ impl EventBus {
         // Add workers
         {
             let mut workers = self.batch_workers.lock();
-            workers.push(worker);
-            workers.push(drain_worker);
+            let handles = workers.entry(new_id).or_default();
+            handles.push(worker);
+            handles.push(drain_worker);
         }
 
         // Update poll merger
@@ -316,6 +320,9 @@ impl EventBus {
     async fn remove_shard_internal(&self, shard_id: u16) -> Result<(), AdapterError> {
         // Remove sender (workers will terminate when channel closes)
         self.batch_senders.write().remove(&shard_id);
+
+        // Remove and drop worker handles for this shard
+        self.batch_workers.lock().remove(&shard_id);
 
         // Remove from shard manager
         self.shard_manager
@@ -467,9 +474,39 @@ impl EventBus {
     }
 
     /// Flush all pending batches.
+    ///
+    /// Waits for all shard ring buffers to drain (up to 5 seconds) before
+    /// flushing the adapter, rather than relying on a fixed sleep.
     pub async fn flush(&self) -> Result<(), AdapterError> {
-        // Give drain workers time to process
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Wait until all ring buffers are empty, polling with adaptive backoff.
+        let start = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(5);
+        let mut backoff = Duration::from_micros(100);
+
+        loop {
+            let all_empty = self.shard_manager.shard_ids().into_iter().all(|shard_id| {
+                self.shard_manager
+                    .with_shard(shard_id, |shard| shard.is_empty())
+                    .unwrap_or(true)
+            });
+
+            if all_empty {
+                break;
+            }
+            if start.elapsed() >= timeout {
+                tracing::warn!("flush: ring buffers not fully drained after {:?}", timeout);
+                break;
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_millis(10));
+        }
+
+        // Ring buffers are empty, but events may still be in-flight in the
+        // drain→batch worker pipeline (mpsc channels, pending batches).
+        // Wait for the batch workers' max_delay to ensure any pending batch
+        // has been flushed to the adapter before we call adapter.flush().
+        tokio::time::sleep(self.config.batch.max_delay).await;
+
         self.adapter.flush().await
     }
 
@@ -485,9 +522,11 @@ impl EventBus {
         }
 
         // Take workers without holding lock across await
-        let workers: Vec<_> = std::mem::take(&mut *self.batch_workers.lock());
-        for handle in workers {
-            let _ = handle.await;
+        let workers = std::mem::take(&mut *self.batch_workers.lock());
+        for (_shard_id, handles) in workers {
+            for handle in handles {
+                let _ = handle.await;
+            }
         }
 
         // Flush and shutdown adapter (with timeout to prevent hanging)
@@ -533,6 +572,15 @@ impl EventBus {
         mapper
             .scale_down(count)
             .map_err(|e| AdapterError::Fatal(e.to_string()))
+    }
+}
+
+impl Drop for EventBus {
+    fn drop(&mut self) {
+        // Signal shutdown so background tasks (drain workers, batch workers,
+        // scaling monitor) observe the flag and exit. We cannot await futures
+        // in Drop, but setting the atomic flag triggers eventual termination.
+        self.shutdown.store(true, AtomicOrdering::Release);
     }
 }
 
@@ -669,11 +717,12 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
 }
 
 /// Spawn drain workers that pull from ring buffers.
+/// Returns `(shard_id, handle)` pairs for per-shard tracking.
 fn spawn_drain_workers(
     shard_manager: Arc<ShardManager>,
     senders: &std::collections::HashMap<u16, mpsc::Sender<Vec<crate::event::InternalEvent>>>,
     shutdown: Arc<AtomicBool>,
-) -> Vec<JoinHandle<()>> {
+) -> Vec<(u16, JoinHandle<()>)> {
     let mut handles = Vec::with_capacity(shard_manager.num_shards() as usize);
 
     for shard_id in 0..shard_manager.num_shards() {
@@ -685,7 +734,7 @@ fn spawn_drain_workers(
         let handle =
             spawn_drain_worker_for_shard(shard_id, shard_manager.clone(), sender, shutdown.clone());
 
-        handles.push(handle);
+        handles.push((shard_id, handle));
     }
 
     handles
@@ -721,7 +770,12 @@ fn spawn_drain_worker_for_shard(
                     }
                 }
                 Some(_) => {
-                    // No events, sleep briefly
+                    // No events — yield briefly. The 100μs sleep is deliberate:
+                    // this is a latency-first system where the drain loop is the
+                    // hot path. Longer backoff would add milliseconds of latency
+                    // to the first event after a quiet period, violating the
+                    // sub-microsecond design target. The CPU cost of 100μs polling
+                    // is acceptable for a system that processes 10M+ events/sec.
                     tokio::time::sleep(Duration::from_micros(100)).await;
                 }
                 None => {
@@ -886,6 +940,39 @@ mod tests {
         assert_eq!(metrics.len(), 2);
 
         bus.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_regression_eventbus_drop_signals_shutdown() {
+        // Regression: dropping an EventBus without calling shutdown() used to
+        // leave background tasks running indefinitely. The Drop impl now sets
+        // the shutdown flag so workers eventually exit.
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            let config = EventBusConfig::builder()
+                .num_shards(2)
+                .ring_buffer_capacity(1024)
+                .build()
+                .unwrap();
+
+            let bus = EventBus::new(config).await.unwrap();
+
+            // Ingest some events
+            for i in 0..10 {
+                let event = Event::new(json!({"index": i}));
+                bus.ingest(event).unwrap();
+            }
+
+            // Drop without calling shutdown()
+            drop(bus);
+
+            // If we reach here, the drop didn't hang
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "EventBus drop should not hang — Drop impl must signal shutdown"
+        );
     }
 
     #[tokio::test]

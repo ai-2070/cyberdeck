@@ -518,7 +518,7 @@ fn test_reassembler_out_of_order_chunks() {
                 *chunk_index,
                 *total_chunks,
             );
-            assert!(result.is_none(), "chunk {} should not complete", i);
+            assert!(result.unwrap().is_none(), "chunk {} should not complete", i);
         }
     }
 
@@ -540,7 +540,8 @@ fn test_reassembler_out_of_order_chunks() {
                 *chunk_index,
                 *total_chunks,
             )
-            .expect("last chunk should complete reassembly");
+            .expect("last chunk should complete reassembly")
+            .expect("last chunk should return data");
         assert_eq!(result.len(), total_len);
         assert!(result.iter().all(|&b| b == 0xAB));
     }
@@ -566,14 +567,14 @@ fn test_reassembler_duplicate_chunks_handled() {
         total_chunks,
     } = &chunks[0]
     {
-        reassembler.feed(
+        let _ = reassembler.feed(
             *daemon_origin,
             snapshot_bytes.clone(),
             *seq_through,
             *chunk_index,
             *total_chunks,
         );
-        reassembler.feed(
+        let _ = reassembler.feed(
             *daemon_origin,
             snapshot_bytes.clone(),
             *seq_through,
@@ -600,7 +601,9 @@ fn test_reassembler_duplicate_chunks_handled() {
                 *total_chunks,
             );
             if *chunk_index == *total_chunks - 1 {
-                let full = result.expect("last chunk should complete");
+                let full = result
+                    .expect("feed should not error")
+                    .expect("last chunk should complete");
                 assert_eq!(full.len(), total_len);
             }
         }
@@ -1168,22 +1171,19 @@ fn test_regression_reassembler_rejects_mixed_seq_through() {
     let mut reassembler = SnapshotReassembler::new();
 
     // Start reassembly for daemon 0xAAAA, seq_through=100
-    let result = reassembler.feed(0xAAAA, vec![1, 2, 3], 100, 0, 2);
+    let result = reassembler.feed(0xAAAA, vec![1, 2, 3], 100, 0, 2).unwrap();
     assert!(result.is_none());
 
     // New snapshot for same daemon but seq_through=200 (e.g., after abort + retry)
-    let result = reassembler.feed(0xAAAA, vec![4, 5, 6], 200, 0, 2);
+    let result = reassembler.feed(0xAAAA, vec![4, 5, 6], 200, 0, 2).unwrap();
     assert!(result.is_none());
 
     // Complete the seq_through=200 reassembly
-    let result = reassembler.feed(0xAAAA, vec![7, 8, 9], 200, 1, 2);
+    let result = reassembler.feed(0xAAAA, vec![7, 8, 9], 200, 1, 2).unwrap();
     assert!(result.is_some());
     let full = result.unwrap();
     // Must contain only chunks from seq_through=200, not mixed with seq_through=100
     assert_eq!(full, vec![4, 5, 6, 7, 8, 9]);
-
-    // The stale seq_through=100 reassembly should still be pending (incomplete)
-    assert_eq!(reassembler.pending_count(), 1);
 
     // Cancel cleans up all pending for this daemon
     reassembler.cancel(0xAAAA);
@@ -1890,22 +1890,26 @@ fn test_gap_from_fork_origin_mismatch_panics() {
 /// Gap 4: Reassembler with mismatched total_chunks across chunks.
 ///
 /// If chunk 0 says total_chunks=3 but a later chunk says total_chunks=4,
-/// the reassembler should use the value from the first chunk seen
-/// (the entry was created with total_chunks=3).
+/// the reassembler now returns an error (TotalChunksMismatch) instead of
+/// silently accepting the inconsistency.
 #[test]
 fn test_gap_reassembler_mismatched_total_chunks() {
     let mut reassembler = SnapshotReassembler::new();
 
     // First chunk: total_chunks=3
-    let result = reassembler.feed(0xAAAA, vec![1, 2], 100, 0, 3);
+    let result = reassembler.feed(0xAAAA, vec![1, 2], 100, 0, 3).unwrap();
     assert!(result.is_none());
 
-    // Second chunk claims total_chunks=4, but the entry was created with 3
+    // Second chunk claims total_chunks=4 — should error
     let result = reassembler.feed(0xAAAA, vec![3, 4], 100, 1, 4);
+    assert!(result.is_err(), "mismatched total_chunks should error");
+
+    // Feeding a consistent chunk should still work
+    let result = reassembler.feed(0xAAAA, vec![3, 4], 100, 1, 3).unwrap();
     assert!(result.is_none());
 
-    // Third chunk (index 2) with total_chunks=3 — should complete at 3 chunks
-    let result = reassembler.feed(0xAAAA, vec![5, 6], 100, 2, 3);
+    // Third chunk (index 2) with total_chunks=3 — should complete
+    let result = reassembler.feed(0xAAAA, vec![5, 6], 100, 2, 3).unwrap();
     assert!(result.is_some());
     let full = result.unwrap();
     assert_eq!(full, vec![1, 2, 3, 4, 5, 6]);

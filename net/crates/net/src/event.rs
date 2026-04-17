@@ -150,7 +150,8 @@ impl RawEvent {
         Self { bytes, hash }
     }
 
-    /// Create a raw event from a string.
+    /// Creates a RawEvent from a string. No validation is performed for
+    /// performance — see `from_bytes_validated` for a validating alternative.
     #[inline]
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {

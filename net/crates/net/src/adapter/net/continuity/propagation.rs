@@ -108,7 +108,9 @@ impl PropagationModel {
     }
 
     /// Maximum subnet depth reachable within a latency budget.
-    pub fn max_depth_within(&self, max_latency: Duration, hop_count: u8) -> u8 {
+    ///
+    /// Returns `None` if even depth 0 exceeds the budget.
+    pub fn max_depth_within(&self, max_latency: Duration, hop_count: u8) -> Option<u8> {
         let budget_nanos = max_latency.as_nanos() as u64;
         let hops = if hop_count == 0 { 1 } else { hop_count as u64 };
 
@@ -117,10 +119,10 @@ impl PropagationModel {
             let estimated =
                 (self.base_hop_latency_nanos as f64 * hops as f64 * multiplier as f64) as u64;
             if estimated <= budget_nanos {
-                return depth;
+                return Some(depth);
             }
         }
-        0
+        None
     }
 }
 
@@ -231,6 +233,6 @@ mod tests {
         // With default 100us base and 1 hop:
         // depth 0 = 100us, depth 1 = 500us, depth 2 = 5ms, depth 3 = 50ms
         let depth = model.max_depth_within(Duration::from_millis(1), 1);
-        assert!(depth >= 1); // 500us fits within 1ms
+        assert!(depth.unwrap() >= 1); // 500us fits within 1ms
     }
 }

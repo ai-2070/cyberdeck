@@ -79,13 +79,11 @@ impl EntityLog {
             return Err(LogError::Duplicate(event.link.sequence));
         }
 
-        // For genesis on a fresh log, accept without parent validation
+        // For genesis on a fresh log, accept without parent validation.
+        // All other appends validate chain linkage (parent_hash, sequence, origin).
         if self.events.is_empty() && current_head.is_genesis() && event.link.is_genesis() {
             // Accept genesis event
-        } else if current_head.is_genesis() && event.link.sequence == 1 {
-            // First real event after genesis — no parent_hash to validate
         } else {
-            // Validate chain linkage against current head
             validate_chain_link(&current_head, &self.head_payload, &event.link)
                 .map_err(LogError::Chain)?;
         }
@@ -153,9 +151,35 @@ impl EntityLog {
     ///
     /// Called after a snapshot is taken at that sequence.
     pub fn prune_through(&mut self, seq: u64) {
+        // Capture the last pruned event's link and payload so that base_link
+        // remains a valid chain anchor if all events are removed. Without this,
+        // the next append would fail chain validation because base_link wouldn't
+        // match the expected parent_hash.
+        let last_pruned = self
+            .events
+            .iter()
+            .rev()
+            .find(|e| e.link.sequence <= seq)
+            .map(|e| (e.link, e.payload.clone()));
+
         self.events.retain(|e| e.link.sequence > seq);
         if seq > self.snapshot_seq {
             self.snapshot_seq = seq;
+        }
+        // Update base_link (used as fallback when events is empty) and
+        // head_payload (used for chain validation of the next append).
+        //
+        // When events remain: head_payload is already correct — it tracks
+        // the last event's payload (set during append), and partial pruning
+        // only removes from the front. We don't need to update it.
+        //
+        // When all events are removed: set base_link and head_payload to
+        // the last pruned event so the next append can chain correctly.
+        if self.events.is_empty() {
+            if let Some((link, payload)) = last_pruned {
+                self.base_link = link;
+                self.head_payload = payload;
+            }
         }
     }
 
@@ -274,7 +298,9 @@ mod tests {
         let mut builder = CausalChainBuilder::new(origin_hash);
 
         for i in 0..5 {
-            let event = builder.append(Bytes::from(format!("event-{}", i)), 0);
+            let event = builder
+                .append(Bytes::from(format!("event-{}", i)), 0)
+                .unwrap();
             assert!(log.append(event).is_ok());
         }
 
@@ -289,12 +315,12 @@ mod tests {
         let mut log = EntityLog::new(entity_id);
         let mut builder = CausalChainBuilder::new(origin_hash);
 
-        let e1 = builder.append(Bytes::from_static(b"event1"), 0);
+        let e1 = builder.append(Bytes::from_static(b"event1"), 0).unwrap();
         log.append(e1).unwrap();
 
         // Skip an event and try to append e3 directly
-        let _e2 = builder.append(Bytes::from_static(b"event2"), 0);
-        let e3 = builder.append(Bytes::from_static(b"event3"), 0);
+        let _e2 = builder.append(Bytes::from_static(b"event2"), 0).unwrap();
+        let e3 = builder.append(Bytes::from_static(b"event3"), 0).unwrap();
 
         assert!(matches!(log.append(e3), Err(LogError::Chain(_))));
     }
@@ -306,7 +332,9 @@ mod tests {
         let mut log = EntityLog::new(entity_a);
 
         let mut builder = CausalChainBuilder::new(entity_b.origin_hash());
-        let event = builder.append(Bytes::from_static(b"wrong origin"), 0);
+        let event = builder
+            .append(Bytes::from_static(b"wrong origin"), 0)
+            .unwrap();
 
         assert!(matches!(
             log.append(event),
@@ -322,7 +350,7 @@ mod tests {
         let mut builder = CausalChainBuilder::new(origin_hash);
 
         for i in 0..10 {
-            let event = builder.append(Bytes::from(format!("e{}", i)), 0);
+            let event = builder.append(Bytes::from(format!("e{}", i)), 0).unwrap();
             log.append(event).unwrap();
         }
 
@@ -340,7 +368,7 @@ mod tests {
         let mut builder = CausalChainBuilder::new(origin_hash);
 
         for i in 0..5 {
-            let event = builder.append(Bytes::from(format!("e{}", i)), 0);
+            let event = builder.append(Bytes::from(format!("e{}", i)), 0).unwrap();
             log.append(event).unwrap();
         }
 
@@ -356,7 +384,7 @@ mod tests {
         let mut builder = CausalChainBuilder::new(origin_hash);
 
         for i in 0..10 {
-            let event = builder.append(Bytes::from(format!("e{}", i)), 0);
+            let event = builder.append(Bytes::from(format!("e{}", i)), 0).unwrap();
             log.append(event).unwrap();
         }
 
@@ -374,14 +402,14 @@ mod tests {
         {
             let mut log_a = index.get_or_create(entity_a.clone());
             let mut builder = CausalChainBuilder::new(log_a.origin_hash());
-            let event = builder.append(Bytes::from_static(b"hello"), 0);
+            let event = builder.append(Bytes::from_static(b"hello"), 0).unwrap();
             log_a.append(event).unwrap();
         }
 
         {
             let mut log_b = index.get_or_create(entity_b.clone());
             let mut builder = CausalChainBuilder::new(log_b.origin_hash());
-            let event = builder.append(Bytes::from_static(b"world"), 0);
+            let event = builder.append(Bytes::from_static(b"world"), 0).unwrap();
             log_b.append(event).unwrap();
         }
 
@@ -394,6 +422,36 @@ mod tests {
     // ---- Regression tests for Cubic AI findings ----
 
     #[test]
+    fn test_regression_prune_all_then_append() {
+        // Regression: prune_through with all events removed used to reset
+        // base_link to genesis, breaking chain validation for the next append.
+        let (_, entity_id) = make_entity();
+        let origin_hash = entity_id.origin_hash();
+        let mut log = EntityLog::new(entity_id);
+        let mut builder = CausalChainBuilder::new(origin_hash);
+
+        for i in 0..5 {
+            let event = builder.append(Bytes::from(format!("e{}", i)), 0).unwrap();
+            log.append(event).unwrap();
+        }
+
+        // Prune everything
+        log.prune_through(5);
+        assert_eq!(log.len(), 0);
+
+        // Append the next event — must succeed because base_link was set
+        // to the last pruned event's link, not reset to genesis.
+        let next = builder
+            .append(Bytes::from_static(b"after-prune"), 0)
+            .unwrap();
+        assert!(
+            log.append(next).is_ok(),
+            "append after full prune must succeed"
+        );
+        assert_eq!(log.len(), 1);
+    }
+
+    #[test]
     fn test_regression_duplicate_genesis_rejected() {
         // Regression: genesis events could be appended repeatedly because
         // duplicate detection was skipped at seq 0 and genesis acceptance
@@ -403,7 +461,7 @@ mod tests {
         let mut log = EntityLog::new(entity_id);
         let mut builder = CausalChainBuilder::new(origin_hash);
 
-        let e1 = builder.append(Bytes::from_static(b"first"), 0);
+        let e1 = builder.append(Bytes::from_static(b"first"), 0).unwrap();
         log.append(e1).unwrap();
 
         // Try to append another genesis — must be rejected

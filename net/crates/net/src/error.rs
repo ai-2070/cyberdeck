@@ -135,6 +135,16 @@ mod tests {
     }
 
     #[test]
+    fn test_connection_error_not_retryable() {
+        // Connection errors cover both transient failures ("send failed") and
+        // permanent ones ("adapter not initialized"). Since we can't distinguish
+        // them at the type level, Connection is conservatively non-retryable.
+        // The batch dispatch path retries all errors regardless of this flag.
+        assert!(!AdapterError::Connection("refused".into()).is_retryable());
+        assert!(!AdapterError::Connection("adapter not initialized".into()).is_retryable());
+    }
+
+    #[test]
     fn test_consumer_error_from_adapter() {
         let adapter_err = AdapterError::Connection("refused".into());
         let consumer_err: ConsumerError = adapter_err.into();

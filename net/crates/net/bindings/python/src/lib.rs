@@ -172,7 +172,7 @@ impl NetKeypair {
     fn __repr__(&self) -> String {
         format!(
             "NetKeypair(public_key='{}...', secret_key='[REDACTED]')",
-            &self.public_key[..8]
+            &self.public_key[..self.public_key.len().min(8)]
         )
     }
 }

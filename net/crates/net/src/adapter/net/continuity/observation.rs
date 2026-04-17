@@ -180,12 +180,7 @@ impl HorizonDivergence {
     }
 }
 
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-}
+use crate::adapter::net::current_timestamp;
 
 #[cfg(test)]
 mod tests {

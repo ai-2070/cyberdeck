@@ -22,7 +22,6 @@ use bytes::Bytes;
 use redis::aio::ConnectionManager;
 use redis::{Client, RedisError, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 
 use crate::adapter::{Adapter, ShardPollResult};
 use crate::config::RedisAdapterConfig;
@@ -37,10 +36,6 @@ pub struct RedisAdapter {
     conn: Option<ConnectionManager>,
     /// Configuration.
     config: RedisAdapterConfig,
-    /// Reusable serialization buffer (per-batch, not per-event).
-    /// Using std::sync::Mutex for Send safety across await points.
-    #[allow(dead_code)]
-    write_buffer: Mutex<Vec<u8>>,
     /// Whether the adapter has been initialized.
     initialized: AtomicBool,
 }
@@ -55,7 +50,6 @@ impl RedisAdapter {
             client,
             conn: None,
             config,
-            write_buffer: Mutex::new(Vec::with_capacity(64 * 1024)), // 64KB initial
             initialized: AtomicBool::new(false),
         })
     }

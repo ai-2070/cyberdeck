@@ -110,10 +110,6 @@ impl Default for TimestampGenerator {
     }
 }
 
-// Safety: The clock is internally synchronized, and we use atomics for `last`.
-unsafe impl Send for TimestampGenerator {}
-unsafe impl Sync for TimestampGenerator {}
-
 #[cfg(test)]
 mod tests {
     use super::*;

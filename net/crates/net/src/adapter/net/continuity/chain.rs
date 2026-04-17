@@ -263,7 +263,9 @@ mod tests {
         let mut builder = CausalChainBuilder::new(origin);
 
         for i in 0..count {
-            let event = builder.append(Bytes::from(format!("event-{}", i)), 0);
+            let event = builder
+                .append(Bytes::from(format!("event-{}", i)), 0)
+                .unwrap();
             log.append(event).unwrap();
         }
 

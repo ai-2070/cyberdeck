@@ -52,18 +52,17 @@ impl CausalLink {
     }
 
     /// Create the next link in a chain given the previous link and payload.
+    ///
+    /// Returns `None` if the sequence number would overflow `u64::MAX`.
     #[inline]
-    pub fn next(&self, payload: &[u8], horizon_encoded: u32) -> Self {
-        let next_seq = self
-            .sequence
-            .checked_add(1)
-            .expect("causal sequence overflow");
-        Self {
+    pub fn next(&self, payload: &[u8], horizon_encoded: u32) -> Option<Self> {
+        let next_seq = self.sequence.checked_add(1)?;
+        Some(Self {
             origin_hash: self.origin_hash,
             horizon_encoded,
             sequence: next_seq,
             parent_hash: compute_parent_hash(self, payload),
-        }
+        })
     }
 
     /// Serialize to 24 bytes.
@@ -156,8 +155,10 @@ impl CausalChainBuilder {
     }
 
     /// Produce the next event in the chain.
-    pub fn append(&mut self, payload: Bytes, horizon_encoded: u32) -> CausalEvent {
-        let next_link = self.head.next(&self.head_payload, horizon_encoded);
+    ///
+    /// Returns `None` if the sequence number would overflow.
+    pub fn append(&mut self, payload: Bytes, horizon_encoded: u32) -> Option<CausalEvent> {
+        let next_link = self.head.next(&self.head_payload, horizon_encoded)?;
         let event = CausalEvent {
             link: next_link,
             payload: payload.clone(),
@@ -165,7 +166,7 @@ impl CausalChainBuilder {
         };
         self.head = next_link;
         self.head_payload = payload;
-        event
+        Some(event)
     }
 
     /// Get the current head link.
@@ -249,21 +250,27 @@ pub fn read_causal_events(data: Bytes, count: u16) -> Vec<CausalEvent> {
     let cap = (count as usize).min(data.len() / (4 + CAUSAL_LINK_SIZE));
     let mut events = Vec::with_capacity(cap);
     let mut remaining = data;
+    let mut parse_errors: u64 = 0;
 
     for _ in 0..count {
         if remaining.len() < 4 {
+            parse_errors += 1;
             break;
         }
         let total_len = (&remaining[..4]).get_u32_le() as usize;
         remaining.advance(4);
 
         if remaining.len() < total_len || total_len < CAUSAL_LINK_SIZE {
+            parse_errors += 1;
             break;
         }
 
         let link = match CausalLink::from_bytes(&remaining[..CAUSAL_LINK_SIZE]) {
             Some(l) => l,
-            None => break,
+            None => {
+                parse_errors += 1;
+                break;
+            }
         };
         remaining.advance(CAUSAL_LINK_SIZE);
 
@@ -275,6 +282,15 @@ pub fn read_causal_events(data: Bytes, count: u16) -> Vec<CausalEvent> {
             payload,
             received_at: current_timestamp(),
         });
+    }
+
+    if parse_errors > 0 {
+        tracing::warn!(
+            parse_errors,
+            expected = count,
+            parsed = events.len(),
+            "read_causal_events dropped malformed events"
+        );
     }
 
     events
@@ -332,12 +348,7 @@ impl std::fmt::Display for ChainError {
 
 impl std::error::Error for ChainError {}
 
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-}
+use crate::adapter::net::current_timestamp;
 
 #[cfg(test)]
 mod tests {
@@ -371,7 +382,7 @@ mod tests {
     fn test_chain_next() {
         let genesis = CausalLink::genesis(0xABCD, 0);
         let payload = b"hello";
-        let next = genesis.next(payload, 0);
+        let next = genesis.next(payload, 0).unwrap();
 
         assert_eq!(next.sequence, 1);
         assert_eq!(next.origin_hash, 0xABCD);
@@ -383,11 +394,11 @@ mod tests {
         let mut builder = CausalChainBuilder::new(0xABCD);
         assert_eq!(builder.sequence(), 0);
 
-        let e1 = builder.append(Bytes::from_static(b"event1"), 0);
+        let e1 = builder.append(Bytes::from_static(b"event1"), 0).unwrap();
         assert_eq!(e1.link.sequence, 1);
         assert_eq!(builder.sequence(), 1);
 
-        let e2 = builder.append(Bytes::from_static(b"event2"), 0);
+        let e2 = builder.append(Bytes::from_static(b"event2"), 0).unwrap();
         assert_eq!(e2.link.sequence, 2);
 
         // Verify chain linkage
@@ -400,8 +411,8 @@ mod tests {
     #[test]
     fn test_validate_chain_link() {
         let mut builder = CausalChainBuilder::new(0xABCD);
-        let e1 = builder.append(Bytes::from_static(b"event1"), 0);
-        let e2 = builder.append(Bytes::from_static(b"event2"), 0);
+        let e1 = builder.append(Bytes::from_static(b"event1"), 0).unwrap();
+        let e2 = builder.append(Bytes::from_static(b"event2"), 0).unwrap();
 
         // Valid chain
         assert!(validate_chain_link(&e1.link, &e1.payload, &e2.link).is_ok());
@@ -410,7 +421,7 @@ mod tests {
     #[test]
     fn test_validate_rejects_origin_mismatch() {
         let link1 = CausalLink::genesis(0xAAAA, 0);
-        let mut link2 = link1.next(b"data", 0);
+        let mut link2 = link1.next(b"data", 0).unwrap();
         link2.origin_hash = 0xBBBB;
 
         assert!(matches!(
@@ -422,7 +433,7 @@ mod tests {
     #[test]
     fn test_validate_rejects_sequence_gap() {
         let link1 = CausalLink::genesis(0xAAAA, 0);
-        let mut link2 = link1.next(b"data", 0);
+        let mut link2 = link1.next(b"data", 0).unwrap();
         link2.sequence = 5; // should be 1
 
         assert!(matches!(
@@ -434,7 +445,7 @@ mod tests {
     #[test]
     fn test_validate_rejects_bad_parent_hash() {
         let link1 = CausalLink::genesis(0xAAAA, 0);
-        let mut link2 = link1.next(b"data", 0);
+        let mut link2 = link1.next(b"data", 0).unwrap();
         link2.parent_hash = 0xBADBADBAD;
 
         assert!(matches!(
@@ -447,7 +458,11 @@ mod tests {
     fn test_causal_event_framing_roundtrip() {
         let mut builder = CausalChainBuilder::new(0xABCD);
         let events: Vec<CausalEvent> = (0..3)
-            .map(|i| builder.append(Bytes::from(format!("event-{}", i)), 0))
+            .map(|i| {
+                builder
+                    .append(Bytes::from(format!("event-{}", i)), 0)
+                    .unwrap()
+            })
             .collect();
 
         let mut buf = BytesMut::new();
@@ -487,7 +502,9 @@ mod tests {
         let mut events = Vec::new();
 
         for i in 0..100 {
-            let event = builder.append(Bytes::from(format!("data-{}", i)), 0);
+            let event = builder
+                .append(Bytes::from(format!("data-{}", i)), 0)
+                .unwrap();
             events.push(event);
         }
 

@@ -182,7 +182,8 @@ impl ForkGroup {
 
         if n > current {
             let requirements = daemon_factory().requirements();
-            let used_nodes: HashSet<u64> = self.coord.members().iter().map(|m| m.node_id).collect();
+            let mut used_nodes: HashSet<u64> =
+                self.coord.members().iter().map(|m| m.node_id).collect();
 
             for index in current..n {
                 let (keypair, record, chain_builder) =
@@ -194,6 +195,8 @@ impl ForkGroup {
 
                 let placement =
                     GroupCoordinator::place_with_spread(scheduler, &requirements, &used_nodes)?;
+                let node_id = placement.node_id;
+                used_nodes.insert(node_id);
 
                 let daemon = daemon_factory();
                 let host = DaemonHost::from_fork(
@@ -207,7 +210,7 @@ impl ForkGroup {
                 self.coord.add_member(MemberInfo {
                     index,
                     origin_hash,
-                    node_id: placement.node_id,
+                    node_id,
                     entity_id_bytes,
                     healthy: true,
                 });
@@ -264,7 +267,13 @@ impl ForkGroup {
             let _ = registry.unregister(member.origin_hash);
 
             // Recover the same keypair from stored secret
-            let fork_info = &self.forks[index as usize];
+            let fork_info = match self.forks.get(index as usize) {
+                Some(info) => info,
+                None => {
+                    tracing::warn!(index, "on_node_failure: fork index out of bounds, skipping");
+                    continue;
+                }
+            };
             let keypair = EntityKeypair::from_bytes(fork_info.keypair_secret);
             let entity_id_bytes: NodeId = *keypair.entity_id().as_bytes();
 
@@ -390,6 +399,8 @@ mod tests {
         index.index(CapabilityAnnouncement::new(0x1111, 1, CapabilitySet::new()));
         index.index(CapabilityAnnouncement::new(0x2222, 1, CapabilitySet::new()));
         index.index(CapabilityAnnouncement::new(0x3333, 1, CapabilitySet::new()));
+        index.index(CapabilityAnnouncement::new(0x4444, 1, CapabilitySet::new()));
+        index.index(CapabilityAnnouncement::new(0x5555, 1, CapabilitySet::new()));
         Scheduler::new(index, 0x1111, CapabilitySet::new())
     }
 
@@ -629,5 +640,25 @@ mod tests {
             .map(|r| r.forked_origin)
             .collect();
         assert_eq!(forked.len(), 5);
+    }
+
+    #[test]
+    fn test_regression_spread_rejects_when_all_nodes_excluded() {
+        // Regression: place_with_spread used to silently fall back to an
+        // excluded node when all candidates were in the exclusion set,
+        // defeating the spread constraint.
+        let index = Arc::new(CapabilityIndex::new());
+        index.index(CapabilityAnnouncement::new(0x1111, 1, CapabilitySet::new()));
+        let sched = Scheduler::new(index, 0x1111, CapabilitySet::new());
+
+        let mut exclude = HashSet::new();
+        exclude.insert(0x1111); // exclude the only node
+
+        let result =
+            GroupCoordinator::place_with_spread(&sched, &CapabilityFilter::default(), &exclude);
+        assert!(
+            result.is_err(),
+            "must fail when all candidate nodes are excluded"
+        );
     }
 }
