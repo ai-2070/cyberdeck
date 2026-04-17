@@ -1,0 +1,40 @@
+net/crates/net/tests/three_node_integration.rs
+  a9d311afc8324224 2621-2752
+net/crates/net/src/adapter/net/mesh.rs
+  a9d311afc8324224 48,53,71-74,184-185,250,278-286,400-401,473,511,522,524-525,549-611,849-893
+net/crates/net/src/adapter/net/pool.rs
+  a9d311afc8324224 170-220,739-754
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "d9e72120080417ec498f49d638de95fdda11dbbc",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 70,
+      "overriden_lines": 0
+    },
+    "a9d311afc8324224": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8e12ea48-52c3-40e2-9655-6d0ab0878bb6",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 363,
+      "total_deletions": 41,
+      "accepted_lines": 1642,
+      "overriden_lines": 0
+    }
+  }
+}
