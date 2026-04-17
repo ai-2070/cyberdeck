@@ -153,7 +153,7 @@ Nodes advertise migration support through the capability graph. `SubprotocolRegi
 
 ### Superposition
 
-During migration, a `SuperpositionState` (Layer 7) tracks the entity's observational phase. The entity exists on both nodes briefly during replay, then collapses to the target at cutover. See [CONTINUITY.md](CONTINUITY.md) for details.
+During migration, a `SuperpositionState` tracks the entity's observational phase. The entity exists on both nodes briefly during replay, then collapses to the target at cutover. See [CONTINUITY.md](CONTINUITY.md) for details.
 
 ## Replica Groups
 
