@@ -86,7 +86,7 @@ impl MigrationSubprotocolHandler {
                 for chunk in chunks {
                     outbound.push(OutboundMigrationMessage {
                         dest_node: from_node, // reply to orchestrator
-                        payload: wire::encode(&chunk),
+                        payload: wire::encode(&chunk)?,
                     });
                 }
             }
@@ -115,7 +115,7 @@ impl MigrationSubprotocolHandler {
 
                     outbound.push(OutboundMigrationMessage {
                         dest_node: target_node,
-                        payload: wire::encode(&forward),
+                        payload: wire::encode(&forward)?,
                     });
                 }
             }
@@ -131,7 +131,7 @@ impl MigrationSubprotocolHandler {
                 {
                     outbound.push(OutboundMigrationMessage {
                         dest_node: from_node, // send back to target
-                        payload: wire::encode(&buffered_msg),
+                        payload: wire::encode(&buffered_msg)?,
                     });
                 }
             }
@@ -154,7 +154,7 @@ impl MigrationSubprotocolHandler {
 
                     outbound.push(OutboundMigrationMessage {
                         dest_node: source_node,
-                        payload: wire::encode(&cutover_msg),
+                        payload: wire::encode(&cutover_msg)?,
                     });
                 }
             }
@@ -174,7 +174,7 @@ impl MigrationSubprotocolHandler {
                     };
                     outbound.push(OutboundMigrationMessage {
                         dest_node: target_node,
-                        payload: wire::encode(&events_msg),
+                        payload: wire::encode(&events_msg)?,
                     });
                 }
 
@@ -187,7 +187,7 @@ impl MigrationSubprotocolHandler {
                 let cleanup_msg = MigrationMessage::CleanupComplete { daemon_origin };
                 outbound.push(OutboundMigrationMessage {
                     dest_node: from_node,
-                    payload: wire::encode(&cleanup_msg),
+                    payload: wire::encode(&cleanup_msg)?,
                 });
             }
 
@@ -222,7 +222,7 @@ impl MigrationSubprotocolHandler {
                 };
                 outbound.push(OutboundMigrationMessage {
                     dest_node: from_node,
-                    payload: wire::encode(&reply),
+                    payload: wire::encode(&reply)?,
                 });
             }
         }
@@ -318,7 +318,7 @@ mod tests {
             daemon_origin: origin,
             target_node: 0x2222,
         };
-        let encoded = wire::encode(&msg);
+        let encoded = wire::encode(&msg).unwrap();
 
         let outbound = handler.handle_message(&encoded, 0x3333).unwrap();
         assert!(!outbound.is_empty());
@@ -341,7 +341,7 @@ mod tests {
             daemon_origin: origin,
             reason: "test failure".into(),
         };
-        let encoded = wire::encode(&msg);
+        let encoded = wire::encode(&msg).unwrap();
 
         // Should not error — just cleans up
         let outbound = handler.handle_message(&encoded, 0x3333).unwrap();

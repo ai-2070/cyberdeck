@@ -346,7 +346,7 @@ fn test_subprotocol_handler_snapshot_ready_dispatch() {
         target_node: 0x2222,
     };
     let outbound = handler
-        .handle_message(&wire::encode(&take_msg), 0x3333)
+        .handle_message(&wire::encode(&take_msg).unwrap(), 0x3333)
         .unwrap();
     assert!(!outbound.is_empty());
 
@@ -394,7 +394,7 @@ fn test_subprotocol_handler_buffered_events_dispatch() {
         restored_seq: 10,
     };
     let outbound = handler
-        .handle_message(&wire::encode(&restore_msg), 0x2222)
+        .handle_message(&wire::encode(&restore_msg).unwrap(), 0x2222)
         .unwrap();
 
     // Should have BufferedEvents response
@@ -440,7 +440,7 @@ fn test_subprotocol_handler_cutover_notify_dispatch() {
         target_node: 0x2222,
     };
     let outbound = handler
-        .handle_message(&wire::encode(&cutover_msg), 0x3333)
+        .handle_message(&wire::encode(&cutover_msg).unwrap(), 0x3333)
         .unwrap();
 
     // Should have: BufferedEvents (final events) + CleanupComplete
@@ -482,7 +482,7 @@ fn test_subprotocol_handler_cleanup_complete_dispatch() {
         daemon_origin: origin,
     };
     let outbound = handler
-        .handle_message(&wire::encode(&cleanup_msg), 0x1111)
+        .handle_message(&wire::encode(&cleanup_msg).unwrap(), 0x1111)
         .unwrap();
     assert!(outbound.is_empty()); // no response needed
     assert!(!orch.is_migrating(origin)); // migration removed
@@ -777,7 +777,7 @@ fn test_wire_roundtrip_all_message_types() {
     ];
 
     for msg in &messages {
-        let encoded = wire::encode(msg);
+        let encoded = wire::encode(msg).unwrap();
         let decoded = wire::decode(&encoded).unwrap();
 
         // Verify message type matches by checking discriminant
@@ -882,7 +882,7 @@ fn test_regression_cutover_routed_to_source_not_target() {
         replayed_seq: 10,
     };
     let outbound = handler
-        .handle_message(&wire::encode(&replay_msg), target_node)
+        .handle_message(&wire::encode(&replay_msg).unwrap(), target_node)
         .unwrap();
 
     // Find the CutoverNotify in outbound
@@ -946,7 +946,7 @@ fn test_regression_snapshot_forwarded_to_actual_target() {
         total_chunks: 1,
     };
     let outbound = handler
-        .handle_message(&wire::encode(&snapshot_msg), source_node)
+        .handle_message(&wire::encode(&snapshot_msg).unwrap(), source_node)
         .unwrap();
 
     // The forwarded SnapshotReady must go to the TARGET (0x2222), not 0 or source
@@ -1113,7 +1113,7 @@ fn test_regression_full_handler_routing_chain() {
         replayed_seq: 20,
     };
     let outbound = handler
-        .handle_message(&wire::encode(&replay_msg), target_node)
+        .handle_message(&wire::encode(&replay_msg).unwrap(), target_node)
         .unwrap();
 
     // Verify: CutoverNotify goes to SOURCE
