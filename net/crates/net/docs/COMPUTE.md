@@ -270,6 +270,16 @@ Active fails → promote Member 1:
 
 All three group types share `GroupCoordinator` for member management, health tracking, and placement. All three compose with MIKOSHI — any member of any group is a normal daemon that can be individually migrated.
 
+## Capability Discovery
+
+Migration and groups use the capability graph differently.
+
+**Migration** requires capability-level discovery. A node that supports migration announces `subprotocol:0x0500` via `SubprotocolRegistry::enrich_capabilities()`. The `Scheduler` queries the `CapabilityIndex` for this tag when finding migration targets. Without this announcement, target discovery is impossible. This is wired up — see [Capability Advertisement](#capability-advertisement) above.
+
+**Groups** do not require group-level capability discovery. Replica, fork, and standby groups place members using the daemon's own `CapabilityFilter` (GPU, memory, tools, tags) — the same query path any daemon uses for placement. The group coordinator is a local primitive; it doesn't need to ask the mesh "who can run a replica group?" because it places replicas the same way it would place a single daemon.
+
+`SUBPROTOCOL_REPLICA_GROUP` (0x0900) is reserved but **intentionally not registered** in `SubprotocolRegistry::with_defaults()`. The current groups operate as local coordinators — all cross-node communication uses existing primitives (capability queries, failure detection, placement). The day cross-node group coordination is needed (distributed membership announcements, remote `scale_to()`, coordinated failover where the group coordinator itself migrates between nodes), 0x0900 gets registered, nodes start announcing the tag, and the `Scheduler` gains group-aware discovery. Until then, the reservation holds the ID space without polluting the capability graph with tags no one queries.
+
 ## Source Files
 
 | File | Purpose |
