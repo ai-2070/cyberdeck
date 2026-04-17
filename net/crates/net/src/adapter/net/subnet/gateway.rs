@@ -301,12 +301,10 @@ mod tests {
         //
         // Fix: default to `SubnetLocal` on `None`, so a collision forces a
         // drop rather than a permissive forward.
-        use crate::adapter::net::channel::name::channel_hash;
-
         let mut seen = std::collections::HashMap::<u16, String>::new();
         let (name1, name2) = loop {
             let name = format!("gw-ch-{}", seen.len());
-            let hash = channel_hash(&name);
+            let hash = ChannelId::parse(&name).unwrap().hash();
             if let Some(existing) = seen.get(&hash) {
                 break (existing.clone(), name);
             }
