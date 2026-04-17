@@ -173,13 +173,13 @@ Initially flagged: drain workers sleep only 100μs when idle, burning CPU.
 
 **Fix:** Track worker handles per shard in a `HashMap<u16, Vec<JoinHandle<()>>>`.
 
-### 20. Default scaling policy prevents scale-up
+### 20. ~~Default scaling policy prevents scale-up~~ (kept as-is)
 
 **File:** `src/config.rs:573-586`
 
-`default_for_cpus(cpus)` sets `max_shards = cpus`. When used via the builder's default path, the scaling policy's `max_shards` equals `num_shards`, so dynamic scaling is enabled but can never actually scale up.
+Initially flagged: `default_for_cpus(cpus)` sets `max_shards = cpus`, so `max_shards == num_shards` at startup.
 
-**Fix:** Set `max_shards` to `cpus * 2` or document that the default only allows scale-down.
+**Decision: not a bug.** Each shard has its own drain worker thread. More shards than cores means drain workers competing for the same cores, adding contention and context switches — exactly what a latency-first system avoids. The `Default` config starts at full CPU capacity (`num_shards = cpus, max_shards = cpus`), which is intentional. The builder path respects the user's explicit `num_shards` choice. Users who want scale-up headroom can set `max_shards` explicitly via `ScalingPolicy`.
 
 ### 21. Unnecessary `unsafe impl Send/Sync` for `TimestampGenerator`
 
