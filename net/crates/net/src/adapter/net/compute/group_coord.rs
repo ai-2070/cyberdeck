@@ -178,10 +178,20 @@ impl GroupCoordinator {
         }
     }
 
-    /// Re-mark all members on a recovered node as healthy.
-    pub fn on_node_recovery(&mut self, recovered_node_id: u64) {
+    /// Re-mark members on a recovered node as healthy, but only if they
+    /// are still registered in the `DaemonRegistry`. If `on_node_failure()`
+    /// unregistered a member and replacement failed, marking it healthy
+    /// would route events to an origin_hash that no longer exists.
+    pub fn on_node_recovery(
+        &mut self,
+        recovered_node_id: u64,
+        registry: &crate::adapter::net::compute::registry::DaemonRegistry,
+    ) {
         for member in &mut self.members {
-            if member.node_id == recovered_node_id && !member.healthy {
+            if member.node_id == recovered_node_id
+                && !member.healthy
+                && registry.contains(member.origin_hash)
+            {
                 member.healthy = true;
                 self.lb
                     .update_health(&member.entity_id_bytes, HealthStatus::Healthy);

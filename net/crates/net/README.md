@@ -288,7 +288,7 @@ The daemon's causal chain continues unbroken on the new host. During migration, 
 
 For daemons that need horizontal scale rather than mobility, `ReplicaGroup` manages N copies as a logical unit. Each replica gets a deterministic identity derived from `group_seed + index` — the same index always produces the same keypair, making replacement idempotent. The group load-balances inbound events across replicas (round-robin, least-connections, consistent hash — any `LoadBalancer` strategy), tracks group-level health (alive as long as one replica is healthy), and spreads placement across nodes for failure-domain isolation. When a node fails, the group re-spawns the affected replicas on new nodes with the same deterministic identity — no migration protocol needed for stateless daemons. Scaling is `scale_to(n)`: scale up appends new replicas, scale down removes the highest-index ones deterministically.
 
-For daemons that need to diverge rather than replicate, `ForkGroup` creates N independent entities forked from a common parent. Each fork has a `ForkRecord` with a cryptographically verifiable sentinel hash linking back to the parent's causal chain at the fork point. Unlike replicas (interchangeable, arbitrary identity), forks are independent entities with documented lineage — any node can verify the fork by recomputing the sentinel. Fork keypairs are stored for recovery on failure, preserving identity across re-spawns.
+For daemons that need to diverge rather than replicate, `ForkGroup` creates N independent entities forked from a common parent. Each fork has a `ForkRecord` with a cryptographically verifiable sentinel hash linking back to the parent's causal chain at the fork point. Unlike replicas (interchangeable, deterministic per-index identities), forks are independent entities with documented lineage — any node can verify the fork by recomputing the sentinel. Fork keypairs are stored for recovery on failure, preserving identity across re-spawns.
 
 For stateful daemons that need fault tolerance without duplicate compute, `StandbyGroup` implements active-passive replication. One member processes all events. The others hold readiness to promote — they consume memory for their snapshot but do zero event processing. Periodic `sync_standbys()` captures the active's state. On failure, the standby with the most recent snapshot promotes and replays the buffered events since that snapshot — the same replay mechanism MIKOSHI uses for migration. Persistence of snapshot bytes to disk is an application concern; the protocol provides the bytes and the bookkeeping.
 
@@ -657,7 +657,7 @@ Regression tests are prefixed `test_regression_` and tied to specific bugs found
 | `0x0600` | Subprotocol negotiation |
 | `0x0700..0x0702` | Continuity / fork / proof |
 | `0x0800..0x0801` | Partition / reconciliation |
-| `0x0900` | Replica group coordination |
+| `0x0900` | Replica group coordination (reserved) |
 | `0x1000..0xEFFF` | Vendor / third-party |
 | `0xF000..0xFFFF` | Experimental / ephemeral |
 

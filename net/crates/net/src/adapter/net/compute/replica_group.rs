@@ -46,23 +46,26 @@ pub struct ReplicaGroupConfig {
 
 /// Derive a deterministic keypair for a replica from the group seed.
 ///
-/// Uses xxh3 to derive per-replica secret bytes from `group_seed || index`.
+/// Uses BLAKE2s-MAC keyed with `"net-replica-v1"` to derive per-replica
+/// secret bytes from `group_seed || index`. This is a cryptographic KDF
+/// following the same pattern as `EntityId::blake2s_hash()`.
+///
 /// Each replica index always produces the same keypair, making the group
 /// identity deterministic and reproducible.
 pub fn derive_replica_keypair(group_seed: &[u8; 32], index: u8) -> EntityKeypair {
-    use xxhash_rust::xxh3::xxh3_128;
+    use blake2::{
+        digest::{consts::U32, Mac},
+        Blake2sMac,
+    };
 
     let mut input = [0u8; 33];
     input[..32].copy_from_slice(group_seed);
     input[32] = index;
 
-    let h1 = xxh3_128(&input);
-    input[32] = index.wrapping_add(128);
-    let h2 = xxh3_128(&input);
-
-    let mut secret = [0u8; 32];
-    secret[..16].copy_from_slice(&h1.to_le_bytes());
-    secret[16..].copy_from_slice(&h2.to_le_bytes());
+    let mut mac = <Blake2sMac<U32> as Mac>::new_from_slice(b"net-replica-v1")
+        .expect("BLAKE2s accepts variable-length keys");
+    Mac::update(&mut mac, &input);
+    let secret: [u8; 32] = mac.finalize().into_bytes().into();
 
     EntityKeypair::from_bytes(secret)
 }
@@ -256,8 +259,12 @@ impl ReplicaGroup {
     }
 
     /// Handle recovery of a node.
-    pub fn on_node_recovery(&mut self, recovered_node_id: u64) {
-        self.coord.on_node_recovery(recovered_node_id);
+    ///
+    /// Only re-marks members healthy if they are still registered in the
+    /// `DaemonRegistry`. Prevents routing to origin_hashes that were
+    /// unregistered during failure and never replaced.
+    pub fn on_node_recovery(&mut self, recovered_node_id: u64, registry: &DaemonRegistry) {
+        self.coord.on_node_recovery(recovered_node_id, registry);
     }
 
     /// Aggregate health.
@@ -465,7 +472,7 @@ mod tests {
             }
         );
 
-        group.on_node_recovery(node);
+        group.on_node_recovery(node, &reg);
         assert_eq!(group.health(), GroupHealth::Healthy);
     }
 

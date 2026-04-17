@@ -159,9 +159,9 @@ During migration, a `SuperpositionState` (Layer 7) tracks the entity's observati
 
 Where migration moves a daemon 1:1, `ReplicaGroup` replicates a daemon 1:N. Each replica is a normal `DaemonHost` registered in the `DaemonRegistry` — the group is a coordination overlay, not a new runtime concept.
 
-**Identity is deterministic.** Replica keypairs derive from `group_seed + index` via xxh3. The same index always produces the same keypair, making replacement idempotent — a failed replica re-spawns with the same origin_hash on a different node, no migration needed.
+**Identity is deterministic.** Replica keypairs derive from `group_seed + index` via BLAKE2s-MAC (keyed with `"net-replica-v1"`), following the same cryptographic KDF pattern as `EntityId` derivation. The same index always produces the same keypair, making replacement idempotent — a failed replica re-spawns with the same origin_hash on a different node, no migration needed.
 
-**Routing is load-balanced.** Each replica is an `Endpoint` in an internal `LoadBalancer`. `route_event()` returns the `origin_hash` of the best replica for delivery via `DaemonRegistry::deliver()`. Any `LoadBalancer` strategy works: round-robin, least-connections, consistent-hash, least-latency.
+**Routing is load-balanced.** For stateless or explicitly key-partitioned daemons, each replica is an `Endpoint` in an internal `LoadBalancer`. `route_event()` returns the `origin_hash` of the selected replica for delivery via `DaemonRegistry::deliver()`. Stateful daemons that need consistent state should use `StandbyGroup` (active-passive) instead, or use `ConsistentHash` strategy for sticky routing by key.
 
 **Health is group-level.** The group is alive as long as at least one replica is healthy. `ReplicaGroupHealth::Degraded { healthy, total }` reports partial availability. On node failure, `on_node_failure()` marks affected replicas unhealthy, re-derives the same keypair, places on a new node, and re-spawns. On recovery, `on_node_recovery()` re-marks them healthy.
 
@@ -187,7 +187,7 @@ Both `ReplicaGroup` and `ForkGroup` (below) delegate to a shared `GroupCoordinat
 
 ## Fork Groups
 
-Where replicas are interchangeable copies with arbitrary identity, forks are independent entities with cryptographically documented lineage. A `ForkGroup` creates N daemons forked from a common parent at a specific point in its causal chain.
+Where replicas are interchangeable copies with deterministic seed-derived identities, forks are independent entities with cryptographically documented lineage. A `ForkGroup` creates N daemons forked from a common parent at a specific point in its causal chain.
 
 **Lineage is verifiable.** Each fork gets a `ForkRecord` with a sentinel hash: `parent_hash = xxh3(original_origin ++ fork_seq ++ "fork")`. Any node on the mesh can verify the fork by recomputing the sentinel. The fork record is created by `fork_entity()` from the continuity layer.
 

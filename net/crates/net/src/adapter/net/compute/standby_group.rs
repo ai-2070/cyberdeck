@@ -347,8 +347,12 @@ impl StandbyGroup {
     }
 
     /// Handle recovery of a node.
-    pub fn on_node_recovery(&mut self, recovered_node_id: u64) {
-        self.coord.on_node_recovery(recovered_node_id);
+    ///
+    /// Only re-marks members healthy if they are still registered in the
+    /// `DaemonRegistry`. Prevents routing to origin_hashes that were
+    /// unregistered during failure and never replaced.
+    pub fn on_node_recovery(&mut self, recovered_node_id: u64, registry: &DaemonRegistry) {
+        self.coord.on_node_recovery(recovered_node_id, registry);
     }
 
     /// Aggregate health.
@@ -726,7 +730,7 @@ mod tests {
             }
         );
 
-        group.on_node_recovery(standby_node);
+        group.on_node_recovery(standby_node, &reg);
         assert_eq!(group.health(), GroupHealth::Healthy);
     }
 

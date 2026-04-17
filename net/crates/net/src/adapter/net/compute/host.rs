@@ -53,12 +53,22 @@ impl DaemonHost {
     /// Uses a pre-built `CausalChainBuilder` from `fork_entity()` whose
     /// genesis link carries the fork sentinel as `parent_hash`. The daemon
     /// starts fresh (no state to restore) but its chain documents lineage.
+    ///
+    /// Validates that the chain's origin_hash matches the keypair to prevent
+    /// identity/chain mismatches.
     pub fn from_fork(
         daemon: Box<dyn MeshDaemon>,
         keypair: EntityKeypair,
         chain: CausalChainBuilder,
         config: DaemonHostConfig,
     ) -> Self {
+        debug_assert_eq!(
+            chain.origin_hash(),
+            keypair.origin_hash(),
+            "fork chain origin {:#x} does not match keypair origin {:#x}",
+            chain.origin_hash(),
+            keypair.origin_hash(),
+        );
         Self {
             daemon,
             keypair,
