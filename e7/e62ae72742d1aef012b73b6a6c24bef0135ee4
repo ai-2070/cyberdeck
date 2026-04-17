@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/compute/host.rs
+  d37b393023401171 65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "e7e62ae72742d1aef012b73b6a6c24bef0135ee4",
+  "prompts": {
+    "d37b393023401171": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8de24b1d-4937-4e8f-9712-eb9f68e7e6e4",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 1,
+      "accepted_lines": 13,
+      "overriden_lines": 37
+    }
+  }
+}
