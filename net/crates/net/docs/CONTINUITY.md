@@ -1,4 +1,4 @@
-# Observational Continuity (Layer 7)
+# Observational Continuity
 
 Each node's truth is what it can observe. The causal chain IS identity. This layer formalizes what the chain provides: continuity proofs, causal cone queries, honest discontinuity with deterministic forking, propagation modeling, and superposition during migration.
 

@@ -1,4 +1,4 @@
-# Compute Runtime (Layer 5)
+# Compute Runtime
 
 Stateful event processors that run on the mesh. The `MeshDaemon` trait defines the processing contract. The runtime handles causal chain production, horizon tracking, snapshot packaging, capability-based placement, and 6-phase migration.
 

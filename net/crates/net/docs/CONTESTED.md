@@ -1,4 +1,4 @@
-# Contested Environments (Layer 8, Partial)
+# Contested Environments
 
 Correlated failure handling and partition healing. Detects when mass failures are correlated (subnet outage vs. broad infrastructure failure), tracks partition state, and reconciles divergent entity logs when partitions heal.
 

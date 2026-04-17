@@ -1,4 +1,4 @@
-# Channels & Authorization (Layer 2)
+# Channels & Authorization
 
 Named, hierarchical communication endpoints with wire-speed authorization. Channels carry policy -- access control is enforced via capability filters and permission tokens, cached in a bloom filter for <10ns per-packet checks.
 

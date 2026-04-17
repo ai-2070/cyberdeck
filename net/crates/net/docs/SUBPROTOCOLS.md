@@ -1,4 +1,4 @@
-# Subprotocol Registry (Layer 6)
+# Subprotocol Registry
 
 Formalizes the 16-bit `subprotocol_id` field in every Net header. Provides a registry for protocol handlers, version negotiation between peers, and an opaque forwarding guarantee for unknown protocols.
 
