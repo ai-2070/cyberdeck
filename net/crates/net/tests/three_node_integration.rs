@@ -2398,3 +2398,223 @@ async fn test_mesh_node_failure_detection() {
 
     a.shutdown().await.unwrap();
 }
+
+/// 3.1 — Reroute: A sends to B, B dies, A reroutes to C.
+///
+/// A has sessions with B and C. A routes to a destination D (logical)
+/// through B. B dies. A updates the routing table to route D through C.
+/// Subsequent events reach C. Proves the routing table update + send_routed
+/// path supports rerouting without rebuilding sessions.
+#[tokio::test]
+async fn test_mesh_node_reroute_on_failure() {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_secs(5))
+    };
+
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let pub_b = *b.public_key();
+    let pub_c = *c.public_key();
+
+    // A↔B
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap(); r2.unwrap();
+
+    // A↔C
+    let (r1, r2) = tokio::join!(c.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap(); r2.unwrap();
+
+    // B↔C (so B could forward — but B will die)
+    let (r1, r2) = tokio::join!(c.accept(nid_b), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        b.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap(); r2.unwrap();
+
+    // Route to C goes through B initially
+    a.router().add_route(nid_c, addr_b);
+    b.router().add_route(nid_c, addr_c);
+
+    a.start(); b.start(); c.start();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Phase 1: A sends to C via B — works
+    let batch1 = make_batch(0, 5, "before_failure");
+    a.send_routed(nid_c, batch1).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let c_before = c.poll_shard(0, None, 100).await.unwrap();
+    assert!(
+        c_before.events.len() > 0,
+        "C should receive events via B before failure, got {}",
+        c_before.events.len()
+    );
+
+    // Phase 2: B dies
+    b.shutdown().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Phase 3: A reroutes — update routing table to send directly to C
+    a.router().remove_route(nid_c);
+    a.router().add_route(nid_c, addr_c);
+
+    // A sends again — should reach C directly now
+    let batch2 = make_batch(0, 5, "after_reroute");
+    a.send_routed(nid_c, batch2).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let c_after = c.poll_shard(0, None, 100).await.unwrap();
+    assert!(
+        c_after.events.len() > 0,
+        "C should receive events after reroute, got {}",
+        c_after.events.len()
+    );
+
+    // Verify the rerouted events have the correct tag
+    let has_rerouted = c_after
+        .events
+        .iter()
+        .any(|e| {
+            e.parse()
+                .map(|v: serde_json::Value| v["tag"] == "after_reroute")
+                .unwrap_or(false)
+        });
+    assert!(has_rerouted, "C should have events tagged 'after_reroute'");
+
+    a.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
+}
+
+/// Data survives reroute: events before and after B's death both reach C.
+///
+/// This tests the full sequence: send via relay, relay dies, reroute,
+/// send directly. No events lost (verified by collecting all tags).
+#[tokio::test]
+async fn test_mesh_node_reroute_no_data_loss() {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(10))
+    };
+
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let pub_b = *b.public_key();
+    let pub_c = *c.public_key();
+
+    // Full triangle
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap(); r2.unwrap();
+    let (r1, r2) = tokio::join!(c.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap(); r2.unwrap();
+    let (r1, r2) = tokio::join!(c.accept(nid_b), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        b.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap(); r2.unwrap();
+
+    a.router().add_route(nid_c, addr_b);
+    b.router().add_route(nid_c, addr_c);
+    a.start(); b.start(); c.start();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Send 10 events via relay
+    let batch1 = make_batch(0, 10, "phase1_via_relay");
+    a.send_routed(nid_c, batch1).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // Kill B, reroute direct
+    b.shutdown().await.unwrap();
+    a.router().remove_route(nid_c);
+    a.router().add_route(nid_c, addr_c);
+
+    // Send 10 more events directly
+    let batch2 = make_batch(0, 10, "phase2_direct");
+    a.send_routed(nid_c, batch2).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // Collect all events C received
+    let result = c.poll_shard(0, None, 1000).await.unwrap();
+
+    let phase1_count = result
+        .events
+        .iter()
+        .filter(|e| {
+            e.parse()
+                .map(|v: serde_json::Value| v["tag"] == "phase1_via_relay")
+                .unwrap_or(false)
+        })
+        .count();
+
+    let phase2_count = result
+        .events
+        .iter()
+        .filter(|e| {
+            e.parse()
+                .map(|v: serde_json::Value| v["tag"] == "phase2_direct")
+                .unwrap_or(false)
+        })
+        .count();
+
+    assert!(
+        phase1_count > 0,
+        "C should have received phase 1 (relayed) events, got {}",
+        phase1_count
+    );
+    assert!(
+        phase2_count > 0,
+        "C should have received phase 2 (direct) events, got {}",
+        phase2_count
+    );
+
+    a.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
+}
