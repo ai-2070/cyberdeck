@@ -115,12 +115,17 @@ impl SubnetGateway {
             return ForwardDecision::Drop(DropReason::TtlExpired);
         }
 
-        // Look up channel visibility
+        // Look up channel visibility. `get()` returns `None` both for unknown
+        // channels and on u16-hash collisions. In either case the gateway
+        // cannot prove the channel is allowed to cross a subnet boundary,
+        // so we must drop rather than forward. Defaulting to `Global` would
+        // silently leak traffic when a `SubnetLocal` channel collides with
+        // any other config.
         let visibility = self
             .channel_configs
             .get(channel_hash)
             .map(|c| c.visibility)
-            .unwrap_or(Visibility::Global);
+            .unwrap_or(Visibility::SubnetLocal);
 
         let decision = match visibility {
             Visibility::SubnetLocal => ForwardDecision::Drop(DropReason::SubnetLocal),
@@ -273,12 +278,61 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_channel_defaults_global() {
+    fn test_unknown_channel_defaults_subnet_local() {
+        // Unknown channels cannot be proven safe to cross subnet boundaries,
+        // so the gateway drops them (SubnetLocal semantics). Previously this
+        // defaulted to Global, silently forwarding traffic for any hash the
+        // local node hadn't seen.
         let reg = ChannelConfigRegistry::new();
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
         let decision = gw.should_forward(SubnetId::new(&[1]), SubnetId::new(&[2]), 0x9999, 0, 0);
-        assert_eq!(decision, ForwardDecision::Forward);
+        assert_eq!(decision, ForwardDecision::Drop(DropReason::SubnetLocal));
+    }
+
+    #[test]
+    fn test_regression_collision_between_subnet_local_and_global_drops() {
+        // Regression: gateway used `unwrap_or(Visibility::Global)` when the
+        // registry returned `None`. After `ChannelConfigRegistry::get()` was
+        // fixed to return `None` on u16 hash collisions, that fallback
+        // recreated the exact leak the registry fix was meant to prevent —
+        // a `SubnetLocal` channel colliding with a `Global` channel would
+        // still be forwarded across subnet boundaries.
+        //
+        // Fix: default to `SubnetLocal` on `None`, so a collision forces a
+        // drop rather than a permissive forward.
+        use crate::adapter::net::channel::name::channel_hash;
+
+        let mut seen = std::collections::HashMap::<u16, String>::new();
+        let (name1, name2) = loop {
+            let name = format!("gw-ch-{}", seen.len());
+            let hash = channel_hash(&name);
+            if let Some(existing) = seen.get(&hash) {
+                break (existing.clone(), name);
+            }
+            seen.insert(hash, name);
+        };
+
+        let reg = ChannelConfigRegistry::new();
+        let id1 = ChannelId::parse(&name1).unwrap();
+        let id2 = ChannelId::parse(&name2).unwrap();
+        let colliding_hash = id1.hash();
+        assert_eq!(id1.hash(), id2.hash(), "precondition: hashes must collide");
+
+        reg.insert(ChannelConfig::new(id1).with_visibility(Visibility::SubnetLocal));
+        reg.insert(ChannelConfig::new(id2).with_visibility(Visibility::Global));
+
+        let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
+
+        // A colliding hash must not produce a permissive forward.
+        let decision = gw.should_forward(
+            SubnetId::new(&[1]),
+            SubnetId::new(&[2]),
+            colliding_hash,
+            0,
+            0,
+        );
+        assert_eq!(decision, ForwardDecision::Drop(DropReason::SubnetLocal));
     }
 
     #[test]

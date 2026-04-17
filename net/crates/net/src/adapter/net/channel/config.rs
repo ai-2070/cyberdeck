@@ -218,17 +218,37 @@ impl ChannelConfigRegistry {
         self.configs.get(name)
     }
 
-    /// Remove a channel config by name.
+    /// Remove a channel config by hash.
+    ///
+    /// Returns `None` if the hash is unknown **or** if multiple channels
+    /// share the same hash — mirroring the collision-safe semantics of
+    /// `get()`. Removing an arbitrary config on collision would silently
+    /// delete the wrong channel's policy (e.g. dropping a `SubnetLocal`
+    /// entry and leaving a `Global` sibling in place).
+    ///
+    /// Callers that need to remove a specific channel should use
+    /// [`remove_by_name`](Self::remove_by_name).
     pub fn remove(&self, channel_hash: u16) -> Option<ChannelConfig> {
-        // Remove the first config matching this hash
         let name = {
             let names = self.by_hash.get(&channel_hash)?;
+            if names.len() != 1 {
+                return None;
+            }
             names.first()?.clone()
         };
-        if let Some(mut hash_names) = self.by_hash.get_mut(&channel_hash) {
-            hash_names.retain(|n| n != &name);
+        self.remove_by_name(&name)
+    }
+
+    /// Remove a channel config by exact name (collision-safe).
+    ///
+    /// Returns the removed config if it existed.
+    pub fn remove_by_name(&self, name: &str) -> Option<ChannelConfig> {
+        let (_, removed) = self.configs.remove(name)?;
+        let hash = removed.channel_id.hash();
+        if let Some(mut hash_names) = self.by_hash.get_mut(&hash) {
+            hash_names.retain(|n| n != name);
         }
-        self.configs.remove(&name).map(|(_, c)| c)
+        Some(removed)
     }
 
     /// Number of registered channels.
@@ -470,5 +490,87 @@ mod tests {
         assert_eq!(c1.visibility, Visibility::SubnetLocal);
         let c2 = reg.get_by_name(&name2).unwrap();
         assert_eq!(c2.visibility, Visibility::Global);
+    }
+
+    #[test]
+    fn test_regression_remove_by_hash_returns_none_on_collision() {
+        // Regression: `remove(hash)` removed the *first* name bucketed under
+        // a colliding hash, silently deleting the wrong channel's config.
+        // A `SubnetLocal` entry could disappear while an unrelated `Global`
+        // sibling survived under the same hash — exactly the kind of silent
+        // policy swap that the `get()` fix was meant to prevent.
+        //
+        // Fix: `remove(hash)` now returns None on collision and leaves both
+        // configs in place. Callers that want to remove a specific entry
+        // must use `remove_by_name`.
+        use crate::adapter::net::channel::name::channel_hash;
+
+        let mut seen = std::collections::HashMap::<u16, String>::new();
+        let (name1, name2) = loop {
+            let name = format!("rm-{}", seen.len());
+            let hash = channel_hash(&name);
+            if let Some(existing) = seen.get(&hash) {
+                break (existing.clone(), name);
+            }
+            seen.insert(hash, name);
+        };
+
+        let reg = ChannelConfigRegistry::new();
+        let id1 = ChannelId::parse(&name1).unwrap();
+        let id2 = ChannelId::parse(&name2).unwrap();
+        let shared_hash = id1.hash();
+        assert_eq!(shared_hash, id2.hash(), "precondition: hashes must collide");
+
+        reg.insert(ChannelConfig::new(id1.clone()).with_visibility(Visibility::SubnetLocal));
+        reg.insert(ChannelConfig::new(id2.clone()).with_visibility(Visibility::Global));
+
+        // remove(hash) refuses on collision — both configs still present.
+        assert!(
+            reg.remove(shared_hash).is_none(),
+            "remove(hash) must refuse on collision"
+        );
+        assert_eq!(
+            reg.len(),
+            2,
+            "both configs must remain after refused remove"
+        );
+        assert_eq!(
+            reg.get_by_name(&name1).unwrap().visibility,
+            Visibility::SubnetLocal
+        );
+        assert_eq!(
+            reg.get_by_name(&name2).unwrap().visibility,
+            Visibility::Global
+        );
+
+        // remove_by_name works and does not disturb its colliding sibling.
+        let removed = reg.remove_by_name(&name1).unwrap();
+        assert_eq!(removed.visibility, Visibility::SubnetLocal);
+        assert!(reg.get_by_name(&name1).is_none(), "name1 should be gone");
+        assert_eq!(
+            reg.get_by_name(&name2).unwrap().visibility,
+            Visibility::Global,
+            "name2 must be untouched"
+        );
+
+        // With the collision resolved, remove(hash) works again.
+        let removed2 = reg.remove(shared_hash).unwrap();
+        assert_eq!(removed2.visibility, Visibility::Global);
+        assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn test_remove_by_hash_works_when_unique() {
+        // Baseline: `remove(hash)` still works for the common non-collision
+        // case — only refuses when ambiguous.
+        let reg = ChannelConfigRegistry::new();
+        let id = ChannelId::parse("sensors/only").unwrap();
+        let hash = id.hash();
+        reg.insert(ChannelConfig::new(id).with_priority(7));
+
+        let removed = reg.remove(hash).unwrap();
+        assert_eq!(removed.priority, 7);
+        assert_eq!(reg.len(), 0);
+        assert!(reg.get(hash).is_none());
     }
 }

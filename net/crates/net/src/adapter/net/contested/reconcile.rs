@@ -68,7 +68,10 @@ pub fn reconcile_entity(
     split_seq: u64,
 ) -> Result<ReconcileOutcome, ChainError> {
     // Validate the remote chain before trusting it for reconciliation.
-    verify_remote_chain(their_events)?;
+    // Pass the local origin so a remote cannot win a "longest chain"
+    // conflict by submitting a well-formed chain anchored to a fabricated
+    // origin_hash.
+    verify_remote_chain(our_log.origin_hash(), their_events)?;
 
     let our_events = our_log.after(split_seq);
 
@@ -183,11 +186,25 @@ pub fn reconcile_entity(
     })
 }
 
-/// Validate that a sequence of remote events forms a valid chain.
+/// Validate that a sequence of remote events forms a valid chain anchored
+/// to `expected_origin`.
 ///
-/// Checks parent_hash linkage between consecutive events.
-/// Returns Ok if valid, or the first chain error found.
-pub fn verify_remote_chain(events: &[CausalEvent]) -> Result<(), ChainError> {
+/// Checks two things:
+/// - the first event's `origin_hash` matches `expected_origin` (so an
+///   attacker cannot submit an internally well-formed chain for a
+///   fabricated entity and have it win a "longest chain" conflict), and
+/// - parent_hash / sequence / origin linkage between consecutive events.
+///
+/// Returns `Ok(())` on an empty slice (nothing to trust).
+pub fn verify_remote_chain(expected_origin: u32, events: &[CausalEvent]) -> Result<(), ChainError> {
+    if let Some(first) = events.first() {
+        if first.link.origin_hash != expected_origin {
+            return Err(ChainError::OriginMismatch {
+                expected: expected_origin,
+                got: first.link.origin_hash,
+            });
+        }
+    }
     for i in 1..events.len() {
         validate_chain_link(&events[i - 1].link, &events[i - 1].payload, &events[i].link)?;
     }
@@ -365,7 +382,7 @@ mod tests {
             .map(|i| builder.append(Bytes::from(format!("e{}", i)), 0))
             .collect();
 
-        assert!(verify_remote_chain(&events).is_ok());
+        assert!(verify_remote_chain(kp.origin_hash(), &events).is_ok());
     }
 
     #[test]
@@ -380,7 +397,13 @@ mod tests {
         // Tamper with the middle event
         events[1].link.parent_hash = 0xBADBADBAD;
 
-        assert!(verify_remote_chain(&events).is_err());
+        assert!(verify_remote_chain(kp.origin_hash(), &events).is_err());
+    }
+
+    #[test]
+    fn test_verify_remote_chain_empty_is_ok() {
+        // Nothing to trust, nothing to reject.
+        assert!(verify_remote_chain(0xDEADBEEF, &[]).is_ok());
     }
 
     // ---- Regression tests for Cubic AI findings ----
@@ -470,6 +493,68 @@ mod tests {
         assert!(
             result.is_err(),
             "reconcile_entity must reject events with broken chain linkage"
+        );
+    }
+
+    #[test]
+    fn test_regression_verify_remote_chain_rejects_origin_forgery() {
+        // Regression: verify_remote_chain only validated internal linkage
+        // (i in 1..len), so the first event's origin_hash was never checked
+        // against the local entity's origin_hash. A remote could submit an
+        // internally well-formed chain for a fabricated origin, and, because
+        // `reconcile_entity` uses longest-chain-wins, win the conflict —
+        // effectively replacing our entity's history.
+        //
+        // Fix: verify_remote_chain now takes an expected_origin and rejects
+        // chains whose first event does not match.
+        let ours = EntityKeypair::generate();
+        let theirs = EntityKeypair::generate();
+        assert_ne!(
+            ours.origin_hash(),
+            theirs.origin_hash(),
+            "precondition: distinct origin hashes"
+        );
+
+        // Build an internally-consistent chain anchored to a *different* origin.
+        let mut builder = CausalChainBuilder::new(theirs.origin_hash());
+        let forged: Vec<CausalEvent> = (0..5)
+            .map(|i| builder.append(Bytes::from(format!("forged-{}", i)), 0))
+            .collect();
+
+        // Chain itself is internally valid under `theirs`...
+        assert!(verify_remote_chain(theirs.origin_hash(), &forged).is_ok());
+
+        // ...but must be rejected when we claim it belongs to `ours`.
+        let rejected = verify_remote_chain(ours.origin_hash(), &forged);
+        assert!(
+            matches!(rejected, Err(ChainError::OriginMismatch { .. })),
+            "verify_remote_chain must reject a chain whose first event's origin \
+             doesn't match the expected origin, got {:?}",
+            rejected
+        );
+    }
+
+    #[test]
+    fn test_regression_reconcile_rejects_foreign_origin_chain() {
+        // Integration: reconcile_entity must refuse a chain that is internally
+        // valid but anchored to a foreign origin_hash. Without this, a longer
+        // foreign chain would win the longest-chain tiebreak and be accepted
+        // as our entity's truth.
+        let ours = EntityKeypair::generate();
+        let theirs = EntityKeypair::generate();
+
+        let our_log = EntityLog::new(ours.entity_id().clone());
+
+        let mut foreign_builder = CausalChainBuilder::new(theirs.origin_hash());
+        let foreign_events: Vec<CausalEvent> = (0..10)
+            .map(|i| foreign_builder.append(Bytes::from(format!("foreign-{}", i)), 0))
+            .collect();
+
+        let result = reconcile_entity(&our_log, &foreign_events, 0);
+        assert!(
+            matches!(result, Err(ChainError::OriginMismatch { .. })),
+            "reconcile_entity must reject chains anchored to a foreign origin, got {:?}",
+            result
         );
     }
 }
