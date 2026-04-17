@@ -177,7 +177,7 @@ Benchmarks accurate as of April 15, 2026.
 
 Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns.
 
-894 tests. ~840 KB deployed binary.
+900 tests. ~840 KB deployed binary.
 
 ## Capabilities
 
@@ -584,13 +584,13 @@ cargo build --release --all-features
 ## Tests
 
 ```bash
-# Unit tests (792 tests)
+# Unit tests (796 tests)
 cargo test --lib --features net
 
 # Migration & group integration tests (44 tests)
 cargo test --test migration_integration --features net
 
-# Three-node mesh integration tests (44 tests)
+# Three-node mesh integration tests (46 tests)
 cargo test --test three_node_integration --features net
 
 # Two-node transport integration
@@ -628,7 +628,7 @@ Three-node mesh tests in `tests/three_node_integration.rs` exercise the `MeshNod
 | **Mesh formation** | 3-way handshake, health isolation after node death |
 | **Data flow** | Point-to-point, bidirectional, stream isolation, full ring traffic, sustained throughput |
 | **Relay** | A→B→C forwarding without decryption, payload integrity over 100 events, **tamper detection** (AEAD rejects corrupted relay) |
-| **Rerouting** | Route update after node failure, no data loss across reroute boundary |
+| **Rerouting** | Manual route update after failure, **automatic reroute** via ReroutePolicy + failure detector, auto-recovery when peer returns |
 | **Router** | Forward/local/TTL/hop-count decisions over real UDP, multi-hop with 2 routers |
 | **Full stack** | EventBus→NetAdapter→encrypted UDP→poll, bidirectional EventBus, backpressure flood |
 | **Subnet gateway** | SubnetLocal blocked, Global forwarded, Exported selective, ParentVisible ancestor-only |

@@ -47,6 +47,7 @@ use super::pool::PacketBuilder;
 
 use super::compute::SUBPROTOCOL_MIGRATION;
 use super::protocol::{self, EventFrame, PacketFlags, MAGIC};
+use super::reroute::ReroutePolicy;
 use super::route::{RoutingHeader, ROUTING_HEADER_SIZE};
 use super::router::{NetRouter, RouterConfig};
 use super::session::NetSession;
@@ -192,6 +193,10 @@ pub struct MeshNode {
     inbound: InboundQueues,
     /// Optional migration subprotocol handler
     migration_handler: Option<Arc<MigrationSubprotocolHandler>>,
+    /// Automatic reroute policy
+    reroute_policy: Arc<ReroutePolicy>,
+    /// Node ID → SocketAddr map (shared with reroute policy)
+    peer_addrs: Arc<DashMap<u64, SocketAddr>>,
     /// Partition filter for simulating network splits
     partition_filter: PartitionFilter,
     /// Background tasks
@@ -241,12 +246,26 @@ impl MeshNode {
             .await
             .map_err(|e| AdapterError::Connection(format!("router bind failed: {}", e)))?;
 
+        let router = Arc::new(router);
+        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+
+        // Create reroute policy that watches failure detector
+        let reroute_policy = Arc::new(ReroutePolicy::new(
+            router.routing_table().clone(),
+            peer_addrs.clone(),
+        ));
+
+        // Wire failure detector with reroute callbacks
+        let rp_failure = reroute_policy.clone();
+        let rp_recovery = reroute_policy.clone();
         let failure_detector = FailureDetector::with_config(FailureDetectorConfig {
             timeout: config.session_timeout,
             miss_threshold: 3,
             suspicion_threshold: 2,
             cleanup_interval: Duration::from_secs(60),
-        });
+        })
+        .on_failure(move |node_id| rp_failure.on_failure(node_id))
+        .on_recovery(move |node_id| rp_recovery.on_recovery(node_id));
 
         Ok(Self {
             identity,
@@ -255,10 +274,12 @@ impl MeshNode {
             config,
             socket,
             peers: Arc::new(DashMap::new()),
-            router: Arc::new(router),
+            router,
             failure_detector: Arc::new(failure_detector),
             inbound: Arc::new(DashMap::new()),
             migration_handler: None,
+            reroute_policy,
+            peer_addrs,
             partition_filter: Arc::new(dashmap::DashSet::new()),
             tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -311,6 +332,11 @@ impl MeshNode {
         self.partition_filter.contains(addr)
     }
 
+    /// Get the reroute policy (for checking reroute stats in tests).
+    pub fn reroute_policy(&self) -> &Arc<ReroutePolicy> {
+        &self.reroute_policy
+    }
+
     /// Number of connected peers.
     pub fn peer_count(&self) -> usize {
         self.peers.len()
@@ -346,6 +372,9 @@ impl MeshNode {
             },
         );
 
+        // Register in peer address map (used by reroute policy)
+        self.peer_addrs.insert(peer_node_id, peer_addr);
+
         // Register with failure detector
         self.failure_detector.heartbeat(peer_node_id, peer_addr);
 
@@ -376,6 +405,7 @@ impl MeshNode {
             },
         );
 
+        self.peer_addrs.insert(peer_node_id, peer_addr);
         self.failure_detector.heartbeat(peer_node_id, peer_addr);
 
         Ok((peer_addr, peer_node_id))

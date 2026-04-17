@@ -3198,3 +3198,200 @@ async fn test_partition_asymmetric_three_node() {
     node_b.shutdown().await.unwrap();
     node_c.shutdown().await.unwrap();
 }
+
+// ============================================================================
+// Automatic rerouting
+// ============================================================================
+
+/// Auto-reroute: A sends to C via B. B dies. The reroute policy
+/// automatically updates the route to C directly. No manual
+/// add_route/remove_route calls — the failure detector triggers it.
+#[tokio::test]
+async fn test_mesh_node_auto_reroute() {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_millis(600))
+    };
+
+    let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let node_c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let pub_b = *node_b.public_key();
+    let pub_c = *node_c.public_key();
+
+    // Full triangle
+    let (r1, r2) = tokio::join!(node_b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap(); r2.unwrap();
+    let (r1, r2) = tokio::join!(node_c.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap(); r2.unwrap();
+    let (r1, r2) = tokio::join!(node_c.accept(nid_b), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_b.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap(); r2.unwrap();
+
+    // Route to C goes through B
+    node_a.router().add_route(nid_c, addr_b);
+    node_b.router().add_route(nid_c, addr_c);
+
+    node_a.start(); node_b.start(); node_c.start();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Verify reroute policy has no active reroutes
+    assert_eq!(node_a.reroute_policy().active_reroutes(), 0);
+
+    // Phase 1: send via B — works
+    let batch1 = make_batch(0, 5, "before_auto_reroute");
+    node_a.send_routed(nid_c, batch1).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let c_before = node_c.poll_shard(0, None, 100).await.unwrap();
+    assert!(c_before.events.len() > 0, "C should receive via B");
+
+    // Phase 2: kill B
+    node_b.shutdown().await.unwrap();
+
+    // Wait for failure detection + automatic reroute
+    // Heartbeat interval=200ms, timeout=600ms, miss_threshold=3
+    // Detection should happen within ~2s
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    node_a.failure_detector().check_all();
+
+    // The reroute policy should have triggered automatically
+    assert!(
+        node_a.reroute_policy().active_reroutes() > 0,
+        "reroute policy should have rerouted after B's failure"
+    );
+
+    // Phase 3: send again — should reach C via auto-rerouted path (direct)
+    // NO manual route update — the reroute policy did it automatically
+    let batch2 = make_batch(0, 5, "after_auto_reroute");
+    node_a.send_routed(nid_c, batch2).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let c_after = node_c.poll_shard(0, None, 100).await.unwrap();
+    let auto_events: Vec<_> = c_after
+        .events
+        .iter()
+        .filter(|e| {
+            e.parse()
+                .map(|v: serde_json::Value| v["tag"] == "after_auto_reroute")
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        !auto_events.is_empty(),
+        "C should receive events after automatic reroute (no manual route update)"
+    );
+
+    node_a.shutdown().await.unwrap();
+    node_c.shutdown().await.unwrap();
+}
+
+/// Auto-reroute recovery: B dies → auto-reroute → B comes back →
+/// original route restored automatically.
+#[tokio::test]
+async fn test_mesh_node_auto_reroute_recovery() {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_millis(600))
+    };
+
+    let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let node_c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let pub_b = *node_b.public_key();
+    let pub_c = *node_c.public_key();
+
+    // Full triangle
+    let (r1, r2) = tokio::join!(node_b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap(); r2.unwrap();
+    let (r1, r2) = tokio::join!(node_c.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap(); r2.unwrap();
+
+    // Route to C goes through B
+    node_a.router().add_route(nid_c, addr_b);
+
+    node_a.start(); node_b.start(); node_c.start();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Simulate B failure via partition (not shutdown — B stays alive for recovery)
+    node_a.block_peer(addr_b);
+    node_b.block_peer(addr_a);
+
+    // Wait for detection + auto-reroute
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    node_a.failure_detector().check_all();
+    assert!(node_a.reroute_policy().active_reroutes() > 0, "should auto-reroute");
+
+    // Heal partition — B sends heartbeats again → failure detector recovers B
+    node_a.unblock_peer(&addr_b);
+    node_b.unblock_peer(&addr_a);
+
+    // Wait for recovery heartbeats
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // Recovery should restore the original route
+    assert_eq!(
+        node_a.reroute_policy().active_reroutes(), 0,
+        "original route should be restored after B recovers"
+    );
+
+    // Verify the route points back to B
+    let next_hop = node_a.router().routing_table().lookup(nid_c);
+    assert_eq!(
+        next_hop,
+        Some(addr_b),
+        "route to C should be restored through B"
+    );
+
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+    node_c.shutdown().await.unwrap();
+}

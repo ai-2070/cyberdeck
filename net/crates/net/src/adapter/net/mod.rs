@@ -42,6 +42,7 @@ mod failure;
 pub mod identity;
 mod mesh;
 mod pool;
+mod reroute;
 mod protocol;
 mod proxy;
 mod reliability;
@@ -89,6 +90,7 @@ pub use identity::{
     TokenScope,
 };
 pub use mesh::{MeshNode, MeshNodeConfig, PartitionFilter};
+pub use reroute::ReroutePolicy;
 pub use pool::{PacketBuilder, PacketPool, SharedLocalPool, SharedPacketPool, ThreadLocalPool};
 pub use protocol::{
     EventFrame, NackPayload, NetHeader, PacketFlags, HEADER_SIZE, NONCE_SIZE, TAG_SIZE,

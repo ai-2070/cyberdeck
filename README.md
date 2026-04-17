@@ -360,7 +360,7 @@ Net is a working protocol, not a paper design. 894 tests verify the implementati
 - **Encrypted point-to-point transport.** Noise NKpsk0 handshake, ChaCha20-Poly1305 per-packet encryption, counter-based nonces. Tested over real UDP between adapter instances.
 - **Multi-peer mesh runtime.** `MeshNode` composes encrypted sessions, routing, failure detection, and subprotocol dispatch behind a single UDP socket. Three-node tests prove the full triangle: handshake, data flow, bidirectional, stream isolation, sustained throughput.
 - **Relay forwarding without decryption.** A sends to C through B. B forwards the packet using only the routing header — never decrypts the payload. Verified by AEAD tamper detection: a malicious relay that flips a single byte is caught and the packet is rejected.
-- **Rerouting on failure.** When a relay node dies, the sender updates its routing table and subsequent events reach the destination through an alternate path. No data loss across the reroute boundary.
+- **Automatic rerouting.** When a relay node dies, the `ReroutePolicy` watches the failure detector and automatically updates the routing table to route through an alternate peer. When the failed peer recovers, the original route is restored. No manual intervention, no data loss across the reroute boundary.
 - **Failure detection over real sockets.** Heartbeat timeout → suspected → failed → recovered lifecycle, proven through the MeshNode runtime with configurable timing.
 - **Migration (Mikoshi) over the wire.** TakeSnapshot messages flow from orchestrator to source over encrypted UDP. The source handler takes the snapshot and sends SnapshotReady back. The orchestrator's state machine advances. Proven end-to-end over real sockets, not just in-process simulation.
 - **Partition simulation and healing.** Per-peer packet filter blocks all traffic (inbound, outbound, heartbeats). Failure detector marks blocked peers as failed. Unblocking restores heartbeats and data flow. Asymmetric three-node partitions (one node isolated, other two unaffected) verified.
@@ -370,9 +370,9 @@ Net is a working protocol, not a paper design. 894 tests verify the implementati
 
 **What needs protocol work:**
 
-- **Automatic rerouting.** Currently manual (test updates routing table after detecting failure). Needs a policy engine that watches the failure detector and updates routes automatically.
 - **Full 6-phase migration lifecycle.** The first round-trip (TakeSnapshot → SnapshotReady) is proven over wire. The remaining phases (restore, replay, cutover, cleanup) need the orchestrator to chain messages automatically through the subprotocol response path.
 - **Handshake relay.** Currently, nodes must have direct UDP connectivity to exchange Noise handshakes. Relaying handshakes through intermediate nodes is not yet implemented.
+- **ProximityGraph integration.** Automatic rerouting currently selects alternates from direct peers only. For meshes larger than a triangle, the `ProximityGraph` should guide multi-hop alternate selection based on latency and capability.
 
 ## Implementation
 
