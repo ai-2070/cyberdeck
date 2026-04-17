@@ -52,10 +52,10 @@ pub struct RingBuffer<T> {
     /// Read position (consumer).
     tail: CachePadded<AtomicUsize>,
     /// Thread ID of the producer (debug-mode SPSC enforcement).
-    #[cfg(debug_assertions)]
+    #[cfg(test)]
     producer_thread: std::sync::Mutex<Option<std::thread::ThreadId>>,
     /// Thread ID of the consumer (debug-mode SPSC enforcement).
-    #[cfg(debug_assertions)]
+    #[cfg(test)]
     consumer_thread: std::sync::Mutex<Option<std::thread::ThreadId>>,
 }
 
@@ -63,7 +63,7 @@ pub struct RingBuffer<T> {
 // Atomics ensure correct visibility between the one producer and one
 // consumer thread. Callers MUST NOT call try_push / pop_batch from
 // multiple threads simultaneously — doing so is undefined behavior.
-// In debug builds, this invariant is checked at runtime via thread-ID
+// In test builds, this invariant is checked at runtime via thread-ID
 // tracking; violations panic immediately.
 //
 // T must be Send because elements are transferred between threads.
@@ -91,9 +91,9 @@ impl<T> RingBuffer<T> {
             mask: capacity - 1,
             head: CachePadded::new(AtomicUsize::new(0)),
             tail: CachePadded::new(AtomicUsize::new(0)),
-            #[cfg(debug_assertions)]
+            #[cfg(test)]
             producer_thread: std::sync::Mutex::new(None),
-            #[cfg(debug_assertions)]
+            #[cfg(test)]
             consumer_thread: std::sync::Mutex::new(None),
         }
     }
@@ -108,7 +108,7 @@ impl<T> RingBuffer<T> {
     /// external synchronization.
     #[inline]
     pub fn try_push(&self, value: T) -> Result<(), BufferFullError> {
-        #[cfg(debug_assertions)]
+        #[cfg(test)]
         {
             let current = std::thread::current().id();
             let mut guard = self
@@ -156,7 +156,7 @@ impl<T> RingBuffer<T> {
     /// external synchronization.
     #[inline]
     pub fn try_pop(&self) -> Option<T> {
-        #[cfg(debug_assertions)]
+        #[cfg(test)]
         {
             let current = std::thread::current().id();
             let mut guard = self
@@ -197,7 +197,7 @@ impl<T> RingBuffer<T> {
     /// reduces atomic operations.
     #[inline]
     pub fn pop_batch(&self, max: usize) -> Vec<T> {
-        #[cfg(debug_assertions)]
+        #[cfg(test)]
         {
             let current = std::thread::current().id();
             let mut guard = self
@@ -280,7 +280,7 @@ impl<T> Drop for RingBuffer<T> {
         // so draining from any thread is safe here. unwrap_or_else
         // recovers from poisoned mutexes (a spawned thread may have
         // panicked during SPSC violation detection).
-        #[cfg(debug_assertions)]
+        #[cfg(test)]
         {
             *self
                 .producer_thread
@@ -533,7 +533,7 @@ mod tests {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(test)]
     #[test]
     fn test_regression_spsc_multi_producer_detected() {
         // Regression: the SPSC ring buffer exposed &self methods with an
@@ -563,7 +563,7 @@ mod tests {
         );
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(test)]
     #[test]
     fn test_regression_spsc_multi_consumer_detected() {
         // Same as above but for the consumer side.

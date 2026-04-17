@@ -5,7 +5,7 @@
 
 use bytes::{Bytes, BytesMut};
 use crossbeam_queue::ArrayQueue;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::crypto::PacketCipher;
@@ -428,10 +428,15 @@ pub fn shared_pool(size: usize, key: &[u8; 32], session_id: u64) -> SharedPacket
 use std::cell::RefCell;
 
 thread_local! {
-    /// Thread-local cache of fast packet builders.
-    /// This eliminates atomic contention on the hot path.
-    static LOCAL_BUILDERS: RefCell<Vec<PacketBuilder>> = const { RefCell::new(Vec::new()) };
+    /// Thread-local cache of fast packet builders, keyed by a unique pool ID
+    /// to prevent cross-pool contamination when multiple `ThreadLocalPool`
+    /// instances exist (which may use different encryption keys).
+    static LOCAL_BUILDERS: RefCell<std::collections::HashMap<u64, Vec<PacketBuilder>>> =
+        RefCell::new(std::collections::HashMap::new());
 }
+
+/// Global counter for assigning unique IDs to each ThreadLocalPool instance.
+static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Thread-local fast packet pool for zero-contention packet building.
 ///
@@ -453,6 +458,9 @@ thread_local! {
 /// single TX counter. This prevents nonce reuse when different threads
 /// encrypt with the same key.
 pub struct ThreadLocalPool {
+    /// Unique ID for this pool instance — used as key in thread-local storage
+    /// to prevent cross-pool builder contamination.
+    pool_id: u64,
     /// Shared fallback pool
     shared: ArrayQueue<PacketBuilder>,
     /// Encryption key for new builders
@@ -512,6 +520,7 @@ impl ThreadLocalPool {
         }
 
         Self {
+            pool_id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
             shared,
             key: *key,
             session_id,
@@ -528,8 +537,9 @@ impl ThreadLocalPool {
     /// to the shared pool, refilling the local cache in batches.
     #[inline]
     pub fn acquire(&self) -> PacketBuilder {
-        LOCAL_BUILDERS.with(|pool| {
-            let mut pool = pool.borrow_mut();
+        LOCAL_BUILDERS.with(|pools| {
+            let mut pools = pools.borrow_mut();
+            let pool = pools.entry(self.pool_id).or_insert_with(Vec::new);
 
             // Fast path: pop from local cache (no atomics)
             if let Some(mut builder) = pool.pop() {
@@ -585,8 +595,9 @@ impl ThreadLocalPool {
         // Sync origin_hash
         builder.set_origin_hash(self.origin_hash);
 
-        LOCAL_BUILDERS.with(|pool| {
-            let mut pool = pool.borrow_mut();
+        LOCAL_BUILDERS.with(|pools| {
+            let mut pools = pools.borrow_mut();
+            let pool = pools.entry(self.pool_id).or_insert_with(Vec::new);
 
             if pool.len() < self.local_capacity * 2 {
                 // Keep in local cache
@@ -969,6 +980,50 @@ mod tests {
             "all {} nonces must be unique — found {} duplicates",
             all_nonces.len(),
             all_nonces.len() - unique.len()
+        );
+    }
+
+    #[test]
+    fn test_regression_thread_local_pool_isolation() {
+        // Regression: ThreadLocalPool used a single global Vec in thread-local
+        // storage without keying by pool instance. Two pools with DIFFERENT
+        // encryption keys would share the same builder cache, so a builder
+        // released to pool A could be acquired from pool B — silently
+        // encrypting with the wrong key.
+        //
+        // Fix: the thread-local cache is a HashMap<u64, Vec<PacketBuilder>>
+        // keyed by a unique pool_id assigned at construction time.
+        let key_a = [0xAAu8; 32];
+        let key_b = [0xBBu8; 32];
+        let session_a = 0x1111;
+        let session_b = 0x2222;
+
+        let pool_a = ThreadLocalPool::new(4, &key_a, session_a);
+        let pool_b = ThreadLocalPool::new(4, &key_b, session_b);
+
+        // Acquire from pool A, release back to pool A
+        let builder_a = pool_a.acquire();
+        assert_eq!(builder_a.session_id(), session_a);
+        pool_a.release(builder_a);
+
+        // Acquire from pool B — must get a builder with session_b,
+        // NOT the builder we just released to pool A.
+        let builder_b = pool_b.acquire();
+        assert_eq!(
+            builder_b.session_id(),
+            session_b,
+            "builder acquired from pool B must have pool B's session_id, \
+             not pool A's — thread-local cache must be keyed by pool_id"
+        );
+        pool_b.release(builder_b);
+
+        // Acquire from pool A again — should still get session_a
+        let builder_a2 = pool_a.acquire();
+        assert_eq!(
+            builder_a2.session_id(),
+            session_a,
+            "builder acquired from pool A after pool B activity must still \
+             have pool A's session_id"
         );
     }
 

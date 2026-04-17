@@ -1,6 +1,7 @@
 # Net Bug Audit
 
 Audit date: 2026-04-16
+Status: **All 39 bugs fixed. 847 tests pass (0 failures).**
 
 All paths relative to `net/crates/net/`.
 

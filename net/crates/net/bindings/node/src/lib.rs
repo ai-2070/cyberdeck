@@ -255,7 +255,11 @@ impl Net {
             None => return false,
         };
 
-        let (_, value, _) = hash.get_u64();
+        let (sign, value, lossless) = hash.get_u64();
+        // Reject negative or out-of-range BigInts to avoid silent wrong-shard routing
+        if sign || !lossless {
+            return false;
+        }
         let raw =
             RawEvent::from_bytes_with_hash(bytes::Bytes::copy_from_slice(data.as_ref()), value);
         bus.ingest_raw(raw).is_ok()
@@ -478,10 +482,12 @@ impl Net {
         Ok(Stats {
             events_ingested: stats
                 .events_ingested
-                .load(std::sync::atomic::Ordering::Relaxed) as i64,
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .min(i64::MAX as u64) as i64,
             events_dropped: stats
                 .events_dropped
-                .load(std::sync::atomic::Ordering::Relaxed) as i64,
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .min(i64::MAX as u64) as i64,
         })
     }
 
@@ -520,7 +526,10 @@ impl Net {
                         .await
                         .map_err(|e| Error::from_reason(format!("Shutdown failed: {}", e)))?;
                 }
-                Err(_arc) => {
+                Err(arc) => {
+                    // Put the bus back so it isn't permanently lost.
+                    // The caller can retry after outstanding operations complete.
+                    self.bus.store(Some(arc));
                     return Err(Error::from_reason(
                         "Cannot shutdown: outstanding references to EventBus exist. \
                          Ensure all async operations have completed before calling shutdown()."

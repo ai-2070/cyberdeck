@@ -201,8 +201,13 @@ impl GroupCoordinator {
 
     /// Aggregate health of the group.
     pub fn health(&self) -> GroupHealth {
-        let healthy = self.members.iter().filter(|m| m.healthy).count() as u8;
-        let total = self.members.len() as u8;
+        let healthy = self
+            .members
+            .iter()
+            .filter(|m| m.healthy)
+            .count()
+            .min(u8::MAX as usize) as u8;
+        let total = self.members.len().min(u8::MAX as usize) as u8;
         match healthy {
             0 => GroupHealth::Dead,
             n if n == total => GroupHealth::Healthy,
@@ -217,12 +222,16 @@ impl GroupCoordinator {
 
     /// Number of members.
     pub fn member_count(&self) -> u8 {
-        self.members.len() as u8
+        self.members.len().min(u8::MAX as usize) as u8
     }
 
     /// Number of healthy members.
     pub fn healthy_count(&self) -> u8 {
-        self.members.iter().filter(|m| m.healthy).count() as u8
+        self.members
+            .iter()
+            .filter(|m| m.healthy)
+            .count()
+            .min(u8::MAX as usize) as u8
     }
 
     /// Indices of members on a given node.
@@ -246,9 +255,23 @@ impl GroupCoordinator {
     pub fn place_with_spread(
         scheduler: &Scheduler,
         requirements: &CapabilityFilter,
-        _exclude: &HashSet<u64>,
+        exclude: &HashSet<u64>,
     ) -> Result<crate::adapter::net::compute::scheduler::PlacementDecision, GroupError> {
         let placement = scheduler.place(requirements)?;
+        if !exclude.contains(&placement.node_id) {
+            return Ok(placement);
+        }
+        // Primary placement is excluded; query candidates and pick the first non-excluded.
+        let candidates = scheduler.query_candidates(requirements);
+        for node_id in candidates {
+            if !exclude.contains(&node_id) {
+                return Ok(crate::adapter::net::compute::scheduler::PlacementDecision {
+                    node_id,
+                    reason: crate::adapter::net::compute::scheduler::PlacementReason::FirstMatch,
+                });
+            }
+        }
+        // Fall back to the original placement if all candidates are excluded.
         Ok(placement)
     }
 }

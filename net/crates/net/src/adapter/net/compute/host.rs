@@ -139,13 +139,15 @@ impl DaemonHost {
 
         // Wrap each output payload in a causal link
         let horizon_encoded = self.horizon.encode();
-        let causal_outputs: Vec<CausalEvent> = outputs
-            .into_iter()
-            .map(|payload| {
-                self.stats.events_emitted += 1;
-                self.chain.append(payload, horizon_encoded)
-            })
-            .collect();
+        let mut causal_outputs = Vec::with_capacity(outputs.len());
+        for payload in outputs {
+            self.stats.events_emitted += 1;
+            let event = self
+                .chain
+                .append(payload, horizon_encoded)
+                .ok_or_else(|| DaemonError::ProcessFailed("causal sequence overflow".into()))?;
+            causal_outputs.push(event);
+        }
 
         Ok(causal_outputs)
     }

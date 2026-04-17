@@ -247,7 +247,11 @@ impl PollMerger {
             }
         }
 
-        // Apply filter
+        // Apply filter.
+        // IMPORTANT: Use `new_cursor` (which tracks fetched positions) as the
+        // base cursor so that shards whose events are entirely filtered out
+        // still advance past those events. Without this, filtered-out events
+        // would be re-fetched on every subsequent poll, causing an infinite loop.
         if let Some(filter) = &request.filter {
             all_events.retain(|e| e.parse().map(|v| filter.matches(&v)).unwrap_or(false));
         }
@@ -266,10 +270,22 @@ impl PollMerger {
         let had_extra = all_events.len() > request.limit;
         all_events.truncate(request.limit);
 
-        // Update cursor based on events actually returned to the user.
-        // This ensures the next pagination request starts from where we left off,
-        // not from where we fetched up to (which could skip events if we over-fetched).
-        let mut final_cursor = cursor.clone();
+        // Build the final cursor.
+        //
+        // When filtering is active, use `new_cursor` (fetched positions) as the
+        // base so that shards whose events were entirely filtered out still
+        // advance past those events — preventing infinite re-fetch loops.
+        //
+        // When there is no filter, use the original `cursor` as the base so
+        // that shards with no returned events (due to truncation/limit) don't
+        // skip ahead to the fetched position.
+        let mut final_cursor = if request.filter.is_some() {
+            new_cursor.clone()
+        } else {
+            cursor.clone()
+        };
+        // Override with the position of the last *returned* event per shard,
+        // so we don't skip over-fetched events that weren't returned.
         for event in &all_events {
             final_cursor.set(event.shard_id, event.id.clone());
         }
@@ -1125,5 +1141,166 @@ mod tests {
 
         assert_eq!(response.events.len(), 3);
         assert!(response.has_more);
+    }
+
+    #[tokio::test]
+    async fn test_regression_filtered_shards_cursor_advances() {
+        // Bug 3: "Cursor never advances for filtered-out shards"
+        //
+        // When shard 1's events are entirely filtered out, the cursor for shard 1
+        // must still advance past those events. Otherwise, subsequent polls will
+        // re-fetch the same filtered-out events forever.
+        let adapter = Arc::new(MockAdapter::new());
+
+        // Shard 0: events matching the filter
+        adapter.add_events(
+            0,
+            vec![
+                StoredEvent::from_value("0-1".to_string(), json!({"type": "token"}), 100, 0),
+                StoredEvent::from_value("0-2".to_string(), json!({"type": "token"}), 200, 0),
+            ],
+        );
+
+        // Shard 1: events that will be filtered out
+        adapter.add_events(
+            1,
+            vec![
+                StoredEvent::from_value("1-1".to_string(), json!({"type": "message"}), 150, 1),
+                StoredEvent::from_value("1-2".to_string(), json!({"type": "message"}), 250, 1),
+            ],
+        );
+
+        let merger = PollMerger::new(adapter, 2);
+        let filter = Filter::eq("type", json!("token"));
+
+        // First poll: should return only the "token" events from shard 0
+        let response1 = merger
+            .poll(ConsumeRequest::new(100).filter(filter.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(response1.events.len(), 2, "Should get 2 token events");
+        for event in &response1.events {
+            assert_eq!(
+                event.shard_id, 0,
+                "All returned events should be from shard 0"
+            );
+        }
+
+        let cursor1 = response1
+            .next_id
+            .expect("Should have a cursor after first poll");
+
+        // Verify the cursor advanced for shard 1 even though its events were filtered out
+        let decoded = CompositeCursor::decode(&cursor1).unwrap();
+        assert!(
+            decoded.get(1).is_some(),
+            "Cursor must advance for shard 1 even though all its events were filtered out"
+        );
+        assert_eq!(
+            decoded.get(1),
+            Some("1-2"),
+            "Shard 1 cursor should point to its last fetched event"
+        );
+
+        // Second poll with the cursor: should NOT re-fetch shard 1's events
+        let response2 = merger
+            .poll(ConsumeRequest::new(100).filter(filter).from(cursor1))
+            .await
+            .unwrap();
+
+        assert!(
+            response2.events.is_empty(),
+            "Second poll should return no events (all events already consumed or filtered)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_regression_poll_merger_filter_does_not_infinite_loop() {
+        // Regression: when one shard has events matching the filter and another
+        // shard has events that are all filtered out, polling in pages must
+        // terminate and return all matching events without looping forever.
+        let adapter = Arc::new(MockAdapter::new());
+
+        // Shard 0: 100 events all matching filter
+        let shard0_events: Vec<_> = (1..=100)
+            .map(|i| {
+                StoredEvent::from_value(
+                    format!("0-{}", i),
+                    json!({"type": "token", "idx": i}),
+                    i as u64 * 10,
+                    0,
+                )
+            })
+            .collect();
+        adapter.add_events(0, shard0_events);
+
+        // Shard 1: 100 events none matching filter
+        let shard1_events: Vec<_> = (1..=100)
+            .map(|i| {
+                StoredEvent::from_value(
+                    format!("1-{}", i),
+                    json!({"type": "message", "idx": i}),
+                    i as u64 * 10 + 5,
+                    1,
+                )
+            })
+            .collect();
+        adapter.add_events(1, shard1_events);
+
+        let merger = PollMerger::new(adapter, 2);
+        let filter = Filter::eq("type", json!("token"));
+
+        let mut all_events = Vec::new();
+        let mut cursor: Option<String> = None;
+        let max_iterations = 50;
+        let mut iterations = 0;
+
+        loop {
+            iterations += 1;
+            if iterations > max_iterations {
+                panic!(
+                    "Infinite loop detected after {} iterations! Collected {} events so far.",
+                    max_iterations,
+                    all_events.len()
+                );
+            }
+
+            let mut request = ConsumeRequest::new(50).filter(filter.clone());
+            if let Some(c) = &cursor {
+                request = request.from(c.clone());
+            }
+
+            let response = merger.poll(request).await.unwrap();
+            all_events.extend(response.events);
+
+            if !response.has_more {
+                break;
+            }
+            cursor = response.next_id;
+        }
+
+        // Should have collected exactly 100 matching events from shard 0
+        assert_eq!(
+            all_events.len(),
+            100,
+            "Expected 100 matching events, got {}. Iterations: {}",
+            all_events.len(),
+            iterations
+        );
+
+        // All events should be from shard 0 (the "token" shard)
+        for event in &all_events {
+            assert_eq!(
+                event.shard_id, 0,
+                "All matching events should come from shard 0"
+            );
+        }
+
+        // Verify no duplicates
+        let mut ids: Vec<_> = all_events.iter().map(|e| e.id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 100, "Should have no duplicate events");
     }
 }

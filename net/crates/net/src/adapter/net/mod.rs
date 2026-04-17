@@ -138,6 +138,18 @@ use transport::NetSocket as Socket;
 // Re-export xxh3 utilities for stream routing
 pub use routing::{route_to_shard, stream_id_from_bytes, stream_id_from_key};
 
+/// Current timestamp in nanoseconds since the Unix epoch.
+///
+/// Shared utility — avoids duplicating this across `causal.rs`, `snapshot.rs`,
+/// `observation.rs`, `migration.rs`, `session.rs`, and `token.rs`.
+#[inline]
+pub(crate) fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
 /// Fast xxh3-based routing utilities for Net streams.
 ///
 /// Uses xxh3 (~50GB/s) for deterministic, high-performance stream routing.

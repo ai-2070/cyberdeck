@@ -230,7 +230,9 @@ mod tests {
 
         // Shared prefix
         for i in 0..shared_events {
-            let event = builder.append(Bytes::from(format!("shared-{}", i)), 0);
+            let event = builder
+                .append(Bytes::from(format!("shared-{}", i)), 0)
+                .unwrap();
             log.append(event).unwrap();
         }
 
@@ -242,7 +244,9 @@ mod tests {
             Bytes::from(format!("shared-{}", shared_events - 1)),
         );
         for i in 0..our_extra {
-            let event = our_builder.append(Bytes::from(format!("ours-{}", i)), 0);
+            let event = our_builder
+                .append(Bytes::from(format!("ours-{}", i)), 0)
+                .unwrap();
             log.append(event).unwrap();
         }
 
@@ -253,7 +257,9 @@ mod tests {
         );
         let mut their_events = Vec::new();
         for i in 0..their_extra {
-            let event = their_builder.append(Bytes::from(format!("theirs-{}", i)), 0);
+            let event = their_builder
+                .append(Bytes::from(format!("theirs-{}", i)), 0)
+                .unwrap();
             their_events.push(event);
         }
 
@@ -268,7 +274,7 @@ mod tests {
         let mut builder = CausalChainBuilder::new(origin);
 
         for i in 0..5 {
-            let event = builder.append(Bytes::from(format!("e{}", i)), 0);
+            let event = builder.append(Bytes::from(format!("e{}", i)), 0).unwrap();
             log.append(event).unwrap();
         }
 
@@ -286,7 +292,11 @@ mod tests {
 
         // They have events, we don't
         let their_events: Vec<CausalEvent> = (0..3)
-            .map(|i| builder.append(Bytes::from(format!("theirs-{}", i)), 0))
+            .map(|i| {
+                builder
+                    .append(Bytes::from(format!("theirs-{}", i)), 0)
+                    .unwrap()
+            })
             .collect();
 
         let result = reconcile_entity(&log, &their_events, 0).unwrap();
@@ -379,7 +389,7 @@ mod tests {
         let mut builder = CausalChainBuilder::new(kp.origin_hash());
 
         let events: Vec<CausalEvent> = (0..5)
-            .map(|i| builder.append(Bytes::from(format!("e{}", i)), 0))
+            .map(|i| builder.append(Bytes::from(format!("e{}", i)), 0).unwrap())
             .collect();
 
         assert!(verify_remote_chain(kp.origin_hash(), &events).is_ok());
@@ -391,7 +401,7 @@ mod tests {
         let mut builder = CausalChainBuilder::new(kp.origin_hash());
 
         let mut events: Vec<CausalEvent> = (0..3)
-            .map(|i| builder.append(Bytes::from(format!("e{}", i)), 0))
+            .map(|i| builder.append(Bytes::from(format!("e{}", i)), 0).unwrap())
             .collect();
 
         // Tamper with the middle event
@@ -439,7 +449,9 @@ mod tests {
 
         // Replay shared prefix
         for i in 0..3 {
-            let event = builder.append(Bytes::from(format!("shared-{}", i)), 0);
+            let event = builder
+                .append(Bytes::from(format!("shared-{}", i)), 0)
+                .unwrap();
             their_log.append(event).unwrap();
         }
 
@@ -483,7 +495,7 @@ mod tests {
         let mut builder = CausalChainBuilder::new(kp.origin_hash());
 
         let mut their_events: Vec<CausalEvent> = (0..3)
-            .map(|i| builder.append(Bytes::from(format!("e{}", i)), 0))
+            .map(|i| builder.append(Bytes::from(format!("e{}", i)), 0).unwrap())
             .collect();
 
         // Tamper with the chain — break parent-hash linkage
@@ -518,7 +530,11 @@ mod tests {
         // Build an internally-consistent chain anchored to a *different* origin.
         let mut builder = CausalChainBuilder::new(theirs.origin_hash());
         let forged: Vec<CausalEvent> = (0..5)
-            .map(|i| builder.append(Bytes::from(format!("forged-{}", i)), 0))
+            .map(|i| {
+                builder
+                    .append(Bytes::from(format!("forged-{}", i)), 0)
+                    .unwrap()
+            })
             .collect();
 
         // Chain itself is internally valid under `theirs`...
@@ -547,7 +563,11 @@ mod tests {
 
         let mut foreign_builder = CausalChainBuilder::new(theirs.origin_hash());
         let foreign_events: Vec<CausalEvent> = (0..10)
-            .map(|i| foreign_builder.append(Bytes::from(format!("foreign-{}", i)), 0))
+            .map(|i| {
+                foreign_builder
+                    .append(Bytes::from(format!("foreign-{}", i)), 0)
+                    .unwrap()
+            })
             .collect();
 
         let result = reconcile_entity(&our_log, &foreign_events, 0);

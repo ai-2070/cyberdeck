@@ -184,12 +184,7 @@ impl std::fmt::Debug for SnapshotStore {
     }
 }
 
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-}
+use crate::adapter::net::current_timestamp;
 
 #[cfg(test)]
 mod tests {
@@ -205,7 +200,9 @@ mod tests {
 
         // Build a short chain
         for i in 0..5 {
-            builder.append(Bytes::from(format!("event-{}", i)), 0);
+            builder
+                .append(Bytes::from(format!("event-{}", i)), 0)
+                .unwrap();
         }
 
         let state_data = Bytes::from_static(b"serialized daemon state here");
@@ -266,7 +263,7 @@ mod tests {
         store.store(snap1);
 
         let mut builder = CausalChainBuilder::new(origin_hash);
-        builder.append(Bytes::from_static(b"e1"), 0);
+        builder.append(Bytes::from_static(b"e1"), 0).unwrap();
 
         let snap2 = StateSnapshot::new(
             entity_id.clone(),
@@ -296,7 +293,7 @@ mod tests {
         let kp = EntityKeypair::generate();
         let entity_id = kp.entity_id().clone();
         let mut builder = CausalChainBuilder::new(kp.origin_hash());
-        builder.append(Bytes::from_static(b"e1"), 0);
+        builder.append(Bytes::from_static(b"e1"), 0).unwrap();
 
         let snapshot = StateSnapshot::new(
             entity_id,

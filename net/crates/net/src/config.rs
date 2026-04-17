@@ -576,7 +576,7 @@ impl ScalingPolicy {
             push_latency_threshold_ns: 5,
             flush_latency_threshold_us: 1000,
             min_shards: 1,
-            max_shards: cpus,
+            max_shards: cpus.saturating_mul(2),
             cooldown: Duration::from_secs(1),
             scale_down_delay: Duration::from_secs(10),
             underutilized_threshold: 0.1,
@@ -715,7 +715,8 @@ mod tests {
         assert!(config.scaling.is_some());
 
         let policy = config.scaling.unwrap();
-        assert_eq!(policy.max_shards, config.num_shards);
+        // max_shards is 2x num_shards to allow headroom for scale-up
+        assert_eq!(policy.max_shards, config.num_shards.saturating_mul(2));
         assert!(policy.auto_scale);
     }
 
@@ -725,7 +726,7 @@ mod tests {
 
         assert!(config.scaling.is_some());
         let policy = config.scaling.unwrap();
-        assert_eq!(policy.max_shards, 8);
+        assert_eq!(policy.max_shards, 16); // 2x headroom
     }
 
     #[test]
@@ -741,7 +742,7 @@ mod tests {
 
     #[test]
     fn test_with_dynamic_scaling_respects_num_shards() {
-        // with_dynamic_scaling() should use num_shards for max_shards, not CPU count
+        // with_dynamic_scaling() should use num_shards for max_shards (with 2x headroom)
         let config = EventBusConfig::builder()
             .num_shards(8)
             .with_dynamic_scaling()
@@ -750,7 +751,7 @@ mod tests {
 
         assert!(config.scaling.is_some());
         let policy = config.scaling.unwrap();
-        assert_eq!(policy.max_shards, 8);
+        assert_eq!(policy.max_shards, 16); // 2x headroom
 
         // Order shouldn't matter
         let config2 = EventBusConfig::builder()
@@ -761,7 +762,7 @@ mod tests {
 
         assert!(config2.scaling.is_some());
         let policy2 = config2.scaling.unwrap();
-        assert_eq!(policy2.max_shards, 16);
+        assert_eq!(policy2.max_shards, 32); // 2x headroom
     }
 
     #[test]

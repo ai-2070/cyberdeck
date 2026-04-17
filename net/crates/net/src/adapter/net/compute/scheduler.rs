@@ -120,6 +120,11 @@ impl Scheduler {
         })
     }
 
+    /// Query candidate node IDs matching a capability filter.
+    pub fn query_candidates(&self, filter: &CapabilityFilter) -> Vec<u64> {
+        self.capability_index.query(filter)
+    }
+
     /// Place a daemon on a specific node (pinning).
     pub fn pin(&self, node_id: u64) -> PlacementDecision {
         PlacementDecision {

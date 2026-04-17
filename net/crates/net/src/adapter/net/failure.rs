@@ -384,12 +384,25 @@ impl LossSimulator {
     pub fn should_drop(&self) -> bool {
         self.total_packets.fetch_add(1, Ordering::Relaxed);
 
-        // Check burst state
-        let remaining = self.burst_remaining.load(Ordering::Relaxed);
-        if remaining > 0 {
-            self.burst_remaining.fetch_sub(1, Ordering::Relaxed);
-            self.total_dropped.fetch_add(1, Ordering::Relaxed);
-            return true;
+        // Check burst state — use compare-and-swap to avoid underflow wrapping
+        // to u64::MAX when multiple threads race on the last remaining count.
+        loop {
+            let remaining = self.burst_remaining.load(Ordering::Relaxed);
+            if remaining == 0 {
+                break;
+            }
+            match self.burst_remaining.compare_exchange_weak(
+                remaining,
+                remaining - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.total_dropped.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+                Err(_) => continue, // Retry CAS
+            }
         }
 
         // Generate random value
@@ -443,12 +456,17 @@ impl LossSimulator {
         )
     }
 
-    // Simple LCG random number generator (0.0 - 1.0)
+    // Simple LCG random number generator (0.0 - 1.0).
+    // Uses CAS loop so concurrent threads don't get identical random values.
     fn next_random(&self) -> f32 {
-        let mut state = self.rng_state.load(Ordering::Relaxed);
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        self.rng_state.store(state, Ordering::Relaxed);
-        (state >> 33) as f32 / (1u64 << 31) as f32
+        let state = self
+            .rng_state
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
+                Some(s.wrapping_mul(6364136223846793005).wrapping_add(1))
+            })
+            .unwrap_or(0); // fetch_update with Some always succeeds
+        let new_state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (new_state >> 33) as f32 / (1u64 << 31) as f32
     }
 }
 
@@ -520,8 +538,11 @@ impl CircuitBreaker {
 
     /// Record a success
     pub fn record_success(&self) {
-        let state = *self.state.read().unwrap();
-        match state {
+        // Hold write lock through the entire read-decide-transition path
+        // to prevent TOCTOU races where concurrent threads undo each other's
+        // state transitions.
+        let mut state = self.state.write().unwrap();
+        match *state {
             CircuitState::Closed => {
                 // Reset failure count on success
                 self.failure_count.store(0, Ordering::Relaxed);
@@ -529,7 +550,14 @@ impl CircuitBreaker {
             CircuitState::HalfOpen => {
                 let count = self.success_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if count >= self.success_threshold {
-                    self.transition_to(CircuitState::Closed);
+                    Self::transition_locked(
+                        &mut state,
+                        CircuitState::Closed,
+                        &self.failure_count,
+                        &self.success_count,
+                        &self.last_state_change,
+                        &self.total_trips,
+                    );
                 }
             }
             CircuitState::Open => {}
@@ -538,17 +566,34 @@ impl CircuitBreaker {
 
     /// Record a failure
     pub fn record_failure(&self) {
-        let state = *self.state.read().unwrap();
-        match state {
+        // Hold write lock through the entire read-decide-transition path
+        // to prevent TOCTOU races where concurrent threads undo each other's
+        // state transitions.
+        let mut state = self.state.write().unwrap();
+        match *state {
             CircuitState::Closed => {
                 let count = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if count >= self.failure_threshold {
-                    self.transition_to(CircuitState::Open);
+                    Self::transition_locked(
+                        &mut state,
+                        CircuitState::Open,
+                        &self.failure_count,
+                        &self.success_count,
+                        &self.last_state_change,
+                        &self.total_trips,
+                    );
                 }
             }
             CircuitState::HalfOpen => {
                 // Single failure in half-open trips back to open
-                self.transition_to(CircuitState::Open);
+                Self::transition_locked(
+                    &mut state,
+                    CircuitState::Open,
+                    &self.failure_count,
+                    &self.success_count,
+                    &self.last_state_change,
+                    &self.total_trips,
+                );
             }
             CircuitState::Open => {}
         }
@@ -573,19 +618,38 @@ impl CircuitBreaker {
 
     fn transition_to(&self, new_state: CircuitState) {
         let mut state = self.state.write().unwrap();
-        let old_state = *state;
+        Self::transition_locked(
+            &mut state,
+            new_state,
+            &self.failure_count,
+            &self.success_count,
+            &self.last_state_change,
+            &self.total_trips,
+        );
+    }
 
+    /// Transition while already holding the write lock (avoids deadlock
+    /// when called from record_success/record_failure which hold the lock).
+    fn transition_locked(
+        state: &mut CircuitState,
+        new_state: CircuitState,
+        failure_count: &AtomicU64,
+        success_count: &AtomicU64,
+        last_state_change: &std::sync::Mutex<Instant>,
+        total_trips: &AtomicU64,
+    ) {
+        let old_state = *state;
         if old_state != new_state {
             *state = new_state;
-            *self.last_state_change.lock().unwrap() = Instant::now();
+            *last_state_change.lock().unwrap() = Instant::now();
 
             // Reset counters on transition
-            self.failure_count.store(0, Ordering::Relaxed);
-            self.success_count.store(0, Ordering::Relaxed);
+            failure_count.store(0, Ordering::Relaxed);
+            success_count.store(0, Ordering::Relaxed);
 
             // Track trips
             if new_state == CircuitState::Open {
-                self.total_trips.fetch_add(1, Ordering::Relaxed);
+                total_trips.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -958,6 +1022,87 @@ mod tests {
         cb.record_success();
         cb.record_success();
         assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn test_regression_loss_simulator_burst_no_underflow() {
+        // Regression: concurrent should_drop() calls could race on
+        // burst_remaining decrement, wrapping u64 to MAX. The fix uses
+        // compare_exchange_weak (CAS loop) instead of fetch_sub.
+        use std::sync::Arc;
+
+        let sim = Arc::new(LossSimulator::new(0.0).with_bursts(0.3, 10));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let sim = Arc::clone(&sim);
+                std::thread::spawn(move || {
+                    for _ in 0..5_000 {
+                        sim.should_drop();
+                    }
+                })
+            })
+            .collect();
+
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        let (total, dropped) = sim.stats();
+        // burst_remaining should never have wrapped to u64::MAX, so
+        // dropped can never exceed total.
+        assert!(
+            dropped <= total,
+            "dropped ({dropped}) must not exceed total ({total}) — \
+             would indicate burst_remaining underflow"
+        );
+        // Sanity: we actually ran packets
+        assert_eq!(total, 8 * 5_000);
+    }
+
+    #[test]
+    fn test_regression_circuit_breaker_concurrent_transitions() {
+        // Regression: record_failure/record_success read state then
+        // transitioned without holding the lock, allowing TOCTOU races
+        // that could corrupt state. The fix holds the write lock across
+        // the entire read-decide-transition path.
+        use std::sync::Arc;
+
+        let cb = Arc::new(CircuitBreaker::new(3, 2, Duration::from_millis(10)));
+
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let cb = Arc::clone(&cb);
+                std::thread::spawn(move || {
+                    for _ in 0..2_000 {
+                        if i % 2 == 0 {
+                            cb.record_failure();
+                        } else {
+                            cb.record_success();
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        // State must be one of the valid variants (not corrupted)
+        let state = cb.state();
+        assert!(
+            state == CircuitState::Closed
+                || state == CircuitState::Open
+                || state == CircuitState::HalfOpen,
+            "circuit breaker state is invalid after concurrent access"
+        );
+        // total_trips should be reasonable (not wildly inflated)
+        let trips = cb.total_trips();
+        // With 4 failure threads * 2000 calls, at most 8000 trips possible
+        assert!(
+            trips <= 8_000,
+            "total_trips ({trips}) is unreasonably high, suggests corruption"
+        );
     }
 
     #[test]

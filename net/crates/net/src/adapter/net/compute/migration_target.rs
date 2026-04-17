@@ -334,7 +334,7 @@ mod tests {
         let mut chain = CausalChainBuilder::new(kp.origin_hash());
         // Advance the chain to the desired sequence so through_seq is correct
         for _ in 0..through_seq {
-            chain.append(Bytes::from_static(b"x"), 0);
+            chain.append(Bytes::from_static(b"x"), 0).unwrap();
         }
         StateSnapshot::new(
             kp.entity_id().clone(),

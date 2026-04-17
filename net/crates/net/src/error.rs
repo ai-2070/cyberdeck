@@ -50,7 +50,10 @@ impl AdapterError {
     /// Returns true if this error is retryable.
     #[inline]
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Transient(_) | Self::Backpressure)
+        matches!(
+            self,
+            Self::Transient(_) | Self::Backpressure | Self::Connection(_)
+        )
     }
 
     /// Returns true if this error is fatal.
@@ -94,7 +97,7 @@ mod tests {
         assert!(AdapterError::Transient("temp".into()).is_retryable());
         assert!(AdapterError::Backpressure.is_retryable());
         assert!(!AdapterError::Fatal("dead".into()).is_retryable());
-        assert!(!AdapterError::Connection("refused".into()).is_retryable());
+        assert!(AdapterError::Connection("refused".into()).is_retryable());
         assert!(!AdapterError::Serialization("bad json".into()).is_retryable());
     }
 
@@ -131,6 +134,16 @@ mod tests {
         assert_eq!(
             AdapterError::Backpressure.to_string(),
             "backend backpressure"
+        );
+    }
+
+    #[test]
+    fn test_regression_connection_error_is_retryable() {
+        // Regression: Connection errors were not included in is_retryable(),
+        // causing connection timeouts to be treated as permanent failures.
+        assert!(
+            AdapterError::Connection("timeout".into()).is_retryable(),
+            "Connection errors must be retryable"
         );
     }
 
