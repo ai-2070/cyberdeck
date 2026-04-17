@@ -439,8 +439,11 @@ impl PacketCipher {
     /// Update the expected RX counter (for replay protection)
     #[inline]
     pub fn update_rx_counter(&self, received: u64) {
-        // Only update if received is higher (simple replay protection)
-        let _ = self.rx_counter.fetch_max(received + 1, Ordering::Release);
+        // Only update if received is higher (simple replay protection).
+        // saturating_add avoids wrapping to 0 if received == u64::MAX.
+        let _ = self
+            .rx_counter
+            .fetch_max(received.saturating_add(1), Ordering::Release);
     }
 
     /// Check if a received counter is valid (basic replay protection)
@@ -792,6 +795,31 @@ mod tests {
             key1[..8],
             key1[8..16],
             "output should not be trivially repeating"
+        );
+    }
+
+    #[test]
+    fn test_regression_rx_counter_u64_max_no_wrap() {
+        // Regression: update_rx_counter used `received + 1` which wraps to 0
+        // when received == u64::MAX. fetch_max(0) would be a no-op, but in
+        // debug mode the addition panics. Now uses saturating_add.
+        let key = [0x42u8; 32];
+        let cipher = PacketCipher::new(&key, 0x1234);
+
+        // Advance counter to a high value first
+        cipher.update_rx_counter(1000);
+
+        // u64::MAX would be rejected by is_valid_rx_counter (beyond
+        // MAX_FORWARD), but if it somehow reached update_rx_counter,
+        // it must not wrap the counter to 0.
+        cipher.update_rx_counter(u64::MAX);
+
+        // Counter should be u64::MAX (saturated), not 0 (wrapped)
+        let counter = cipher.rx_counter.load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(
+            counter,
+            u64::MAX,
+            "rx_counter must saturate at u64::MAX, not wrap to 0"
         );
     }
 }

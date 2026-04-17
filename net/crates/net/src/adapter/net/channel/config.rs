@@ -189,14 +189,23 @@ impl ChannelConfigRegistry {
 
     /// Look up a channel config by hash.
     ///
-    /// If multiple channels share the same hash (collision), returns
-    /// the first one found. Callers on security-critical paths should
-    /// use `get_by_name()` instead.
+    /// Returns `None` if the hash is unknown **or** if multiple channels
+    /// share the same hash (collision). Callers that need collision-safe
+    /// lookups should use `get_by_name()` with the full channel name.
+    ///
+    /// With only 65,536 possible u16 hash values, collisions become likely
+    /// at ~300 channels (birthday paradox). Returning `None` on collision
+    /// forces callers to fall back to safe defaults rather than silently
+    /// applying the wrong channel's security policy.
     pub fn get(
         &self,
         channel_hash: u16,
     ) -> Option<dashmap::mapref::one::Ref<'_, String, ChannelConfig>> {
         let names = self.by_hash.get(&channel_hash)?;
+        // Refuse to return an arbitrary config when hashes collide.
+        if names.len() != 1 {
+            return None;
+        }
         let name = names.first()?;
         self.configs.get(name)
     }
@@ -411,5 +420,55 @@ mod tests {
         assert_eq!(c1.priority, 1, "channel/alpha priority should be 1");
         let c2 = reg.get_by_name("channel/beta").unwrap();
         assert_eq!(c2.priority, 2, "channel/beta priority should be 2");
+    }
+
+    #[test]
+    fn test_regression_config_registry_get_returns_none_on_collision() {
+        // Regression: get() returned an arbitrary config when multiple
+        // channels shared the same u16 hash. A SubnetLocal channel
+        // colliding with a Global channel could silently receive the
+        // wrong visibility policy, leaking traffic across subnet
+        // boundaries.
+        //
+        // Fix: get() returns None when the hash maps to more than one
+        // channel name. Callers fall back to safe defaults or use
+        // get_by_name() for collision-safe lookups.
+        use crate::adapter::net::channel::name::channel_hash;
+
+        // Find two valid channel names that produce the same u16 hash.
+        // With 65536 possible values, birthday paradox gives a collision
+        // within ~300 names on average.
+        let mut seen = std::collections::HashMap::<u16, String>::new();
+        let (name1, name2) = loop {
+            let name = format!("ch-{}", seen.len());
+            let hash = channel_hash(&name);
+            if let Some(existing) = seen.get(&hash) {
+                break (existing.clone(), name);
+            }
+            seen.insert(hash, name);
+        };
+
+        let reg = ChannelConfigRegistry::new();
+        let id1 = ChannelId::parse(&name1).unwrap();
+        let id2 = ChannelId::parse(&name2).unwrap();
+        assert_eq!(id1.hash(), id2.hash(), "precondition: hashes must collide");
+
+        // Insert a SubnetLocal channel and a Global channel that collide
+        let config1 = ChannelConfig::new(id1.clone()).with_visibility(Visibility::SubnetLocal);
+        let config2 = ChannelConfig::new(id2.clone()).with_visibility(Visibility::Global);
+        reg.insert(config1);
+        reg.insert(config2);
+
+        // get() by hash must return None — not an arbitrary config
+        assert!(
+            reg.get(id1.hash()).is_none(),
+            "get() must return None when hash collides between channels"
+        );
+
+        // get_by_name() must still work for each channel individually
+        let c1 = reg.get_by_name(&name1).unwrap();
+        assert_eq!(c1.visibility, Visibility::SubnetLocal);
+        let c2 = reg.get_by_name(&name2).unwrap();
+        assert_eq!(c2.visibility, Visibility::Global);
     }
 }

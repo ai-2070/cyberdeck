@@ -57,35 +57,41 @@ pub enum ReconcileOutcome {
 /// Reconcile a single entity's log against remote events.
 ///
 /// `our_log`: local EntityLog.
-/// `their_events`: events from the remote side (must be chain-valid).
+/// `their_events`: events from the remote side.
 /// `split_seq`: sequence number at the partition point (from horizon snapshot).
+///
+/// Returns `Err` if `their_events` fail chain validation (broken parent-hash
+/// linkage). Callers should treat this as a protocol violation from the remote.
 pub fn reconcile_entity(
     our_log: &EntityLog,
     their_events: &[CausalEvent],
     split_seq: u64,
-) -> ReconcileOutcome {
+) -> Result<ReconcileOutcome, ChainError> {
+    // Validate the remote chain before trusting it for reconciliation.
+    verify_remote_chain(their_events)?;
+
     let our_events = our_log.after(split_seq);
 
     // Both sides empty after split — converged
     if our_events.is_empty() && their_events.is_empty() {
-        return ReconcileOutcome::AlreadyConverged;
+        return Ok(ReconcileOutcome::AlreadyConverged);
     }
 
     // Only one side has events — catchup
     if our_events.is_empty() {
-        return ReconcileOutcome::Catchup {
+        return Ok(ReconcileOutcome::Catchup {
             origin_hash: our_log.origin_hash(),
             missing_events: their_events.to_vec(),
             behind_side: Side::Ours,
-        };
+        });
     }
 
     if their_events.is_empty() {
-        return ReconcileOutcome::Catchup {
+        return Ok(ReconcileOutcome::Catchup {
             origin_hash: our_log.origin_hash(),
             missing_events: our_events.into_iter().cloned().collect(),
             behind_side: Side::Theirs,
-        };
+        });
     }
 
     // Both sides have events — find divergence point
@@ -106,7 +112,7 @@ pub fn reconcile_entity(
         }
     }
 
-    match diverge_idx {
+    Ok(match diverge_idx {
         None if our_events.len() == their_events.len() => {
             // Identical chains
             ReconcileOutcome::AlreadyConverged
@@ -174,7 +180,7 @@ pub fn reconcile_entity(
                 },
             }
         }
-    }
+    })
 }
 
 /// Validate that a sequence of remote events forms a valid chain.
@@ -250,7 +256,7 @@ mod tests {
         }
 
         // No events after split
-        let result = reconcile_entity(&log, &[], 5);
+        let result = reconcile_entity(&log, &[], 5).unwrap();
         assert!(matches!(result, ReconcileOutcome::AlreadyConverged));
     }
 
@@ -266,7 +272,7 @@ mod tests {
             .map(|i| builder.append(Bytes::from(format!("theirs-{}", i)), 0))
             .collect();
 
-        let result = reconcile_entity(&log, &their_events, 0);
+        let result = reconcile_entity(&log, &their_events, 0).unwrap();
         match result {
             ReconcileOutcome::Catchup {
                 behind_side,
@@ -284,7 +290,7 @@ mod tests {
     fn test_catchup_they_are_behind() {
         let (log, _, split_seq) = build_divergent_logs(3, 2, 0);
 
-        let result = reconcile_entity(&log, &[], split_seq);
+        let result = reconcile_entity(&log, &[], split_seq).unwrap();
         match result {
             ReconcileOutcome::Catchup {
                 behind_side,
@@ -302,7 +308,7 @@ mod tests {
     fn test_conflict_longest_wins() {
         let (log, their_events, split_seq) = build_divergent_logs(3, 5, 2);
 
-        let result = reconcile_entity(&log, &their_events, split_seq);
+        let result = reconcile_entity(&log, &their_events, split_seq).unwrap();
         match result {
             ReconcileOutcome::Conflict {
                 resolution:
@@ -323,7 +329,7 @@ mod tests {
     fn test_conflict_they_win() {
         let (log, their_events, split_seq) = build_divergent_logs(3, 1, 4);
 
-        let result = reconcile_entity(&log, &their_events, split_seq);
+        let result = reconcile_entity(&log, &their_events, split_seq).unwrap();
         match result {
             ReconcileOutcome::Conflict {
                 resolution: ConflictResolution::Winner { winning_side, .. },
@@ -340,7 +346,7 @@ mod tests {
         // Equal length chains — deterministic tiebreak on parent_hash
         let (log, their_events, split_seq) = build_divergent_logs(3, 2, 2);
 
-        let result = reconcile_entity(&log, &their_events, split_seq);
+        let result = reconcile_entity(&log, &their_events, split_seq).unwrap();
         assert!(matches!(
             result,
             ReconcileOutcome::Conflict {
@@ -386,7 +392,7 @@ mod tests {
         // side would declare itself the winner. Now uses payload hash.
         let (log, their_events, split_seq) = build_divergent_logs(3, 2, 2);
 
-        let result = reconcile_entity(&log, &their_events, split_seq);
+        let result = reconcile_entity(&log, &their_events, split_seq).unwrap();
 
         // The result must be a conflict with a winner
         let winning_side = match &result {
@@ -421,7 +427,7 @@ mod tests {
             their_log.append(event.clone()).unwrap();
         }
 
-        let other_result = reconcile_entity(&their_log, &our_post_split, split_seq);
+        let other_result = reconcile_entity(&their_log, &our_post_split, split_seq).unwrap();
 
         let other_winning_side = match &other_result {
             ReconcileOutcome::Conflict {
@@ -436,6 +442,34 @@ mod tests {
         assert_ne!(
             winning_side, other_winning_side,
             "both sides must agree: if we say Ours, they must say Theirs"
+        );
+    }
+
+    #[test]
+    fn test_regression_reconcile_rejects_broken_remote_chain() {
+        // Regression: reconcile_entity accepted remote events without
+        // validating chain integrity. A malicious or corrupted remote
+        // could send events with broken parent-hash linkage, and the
+        // reconciliation logic would trust them — potentially accepting
+        // a forged chain as the winner in a conflict.
+        //
+        // Fix: reconcile_entity now calls verify_remote_chain() before
+        // processing. Broken chains return Err(ChainError).
+        let kp = EntityKeypair::generate();
+        let log = EntityLog::new(kp.entity_id().clone());
+        let mut builder = CausalChainBuilder::new(kp.origin_hash());
+
+        let mut their_events: Vec<CausalEvent> = (0..3)
+            .map(|i| builder.append(Bytes::from(format!("e{}", i)), 0))
+            .collect();
+
+        // Tamper with the chain — break parent-hash linkage
+        their_events[2].link.parent_hash = 0xDEADBEEF;
+
+        let result = reconcile_entity(&log, &their_events, 0);
+        assert!(
+            result.is_err(),
+            "reconcile_entity must reject events with broken chain linkage"
         );
     }
 }
