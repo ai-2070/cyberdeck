@@ -569,7 +569,7 @@ impl Default for ScalingPolicy {
 
 impl ScalingPolicy {
     /// Create a default scaling policy based on CPU count.
-    /// Scales from 1 shard up to the number of physical cores.
+    /// Scales from 1 shard up to 2x the number of physical cores.
     pub fn default_for_cpus(cpus: u16) -> Self {
         Self {
             fill_ratio_threshold: 0.7,
