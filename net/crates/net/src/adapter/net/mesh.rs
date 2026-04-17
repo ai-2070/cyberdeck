@@ -605,9 +605,12 @@ impl MeshNode {
                                 .map(|e| (*e.key(), e.value().session.clone()));
 
                             if let Some((dest_addr, dest_sess)) = dest_session {
+                                // Respect partition filter on outbound path
+                                if ctx.partition_filter.contains(&dest_addr) {
+                                    continue;
+                                }
                                 let socket = ctx.socket.clone();
                                 let payload = Bytes::from(msg.payload);
-                                // Fire-and-forget: send the response packet
                                 tokio::spawn(async move {
                                     let pool = dest_sess.thread_local_pool();
                                     let mut builder = pool.get();
