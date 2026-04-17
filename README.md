@@ -351,6 +351,29 @@ The wall isn't one mechanism. It's the emergent effect of every constraint worki
 
 Any single mechanism can be overwhelmed. All of them together form the wall. An event that bypasses backpressure hits the bounded queue. An event that fills the queue gets evicted. An event that propagates too far hits the TTL. An event that duplicates gets deduplicated. A node that floods gets rate-limited by every neighbor independently. There is no single point to breach because the wall is the mesh itself.
 
+## Status
+
+Net is a working protocol, not a paper design. 894 tests verify the implementation across every layer of the stack.
+
+**What works today:**
+
+- **Encrypted point-to-point transport.** Noise NKpsk0 handshake, ChaCha20-Poly1305 per-packet encryption, counter-based nonces. Tested over real UDP between adapter instances.
+- **Multi-peer mesh runtime.** `MeshNode` composes encrypted sessions, routing, failure detection, and subprotocol dispatch behind a single UDP socket. Three-node tests prove the full triangle: handshake, data flow, bidirectional, stream isolation, sustained throughput.
+- **Relay forwarding without decryption.** A sends to C through B. B forwards the packet using only the routing header — never decrypts the payload. Verified by AEAD tamper detection: a malicious relay that flips a single byte is caught and the packet is rejected.
+- **Rerouting on failure.** When a relay node dies, the sender updates its routing table and subsequent events reach the destination through an alternate path. No data loss across the reroute boundary.
+- **Failure detection over real sockets.** Heartbeat timeout → suspected → failed → recovered lifecycle, proven through the MeshNode runtime with configurable timing.
+- **Migration (Mikoshi) over the wire.** TakeSnapshot messages flow from orchestrator to source over encrypted UDP. The source handler takes the snapshot and sends SnapshotReady back. The orchestrator's state machine advances. Proven end-to-end over real sockets, not just in-process simulation.
+- **Partition simulation and healing.** Per-peer packet filter blocks all traffic (inbound, outbound, heartbeats). Failure detector marks blocked peers as failed. Unblocking restores heartbeats and data flow. Asymmetric three-node partitions (one node isolated, other two unaffected) verified.
+- **Subnet gateway enforcement.** SubnetLocal traffic blocked at boundaries, Global traffic forwarded, Exported traffic selectively routed, ParentVisible restricted to ancestors.
+- **Correlated failure detection.** Independent vs mass failure classification based on configurable thresholds. Recovery budget throttled during mass failure.
+- **EventBus full stack.** Events flow through the entire pipeline: EventBus → sharded ring buffers → drain workers → batch workers → NetAdapter → encrypted UDP → poll.
+
+**What needs protocol work:**
+
+- **Automatic rerouting.** Currently manual (test updates routing table after detecting failure). Needs a policy engine that watches the failure detector and updates routes automatically.
+- **Full 6-phase migration lifecycle.** The first round-trip (TakeSnapshot → SnapshotReady) is proven over wire. The remaining phases (restore, replay, cutover, cleanup) need the orchestrator to chain messages automatically through the subprotocol response path.
+- **Handshake relay.** Currently, nodes must have direct UDP connectivity to exchange Noise handshakes. Relaying handshakes through intermediate nodes is not yet implemented.
+
 ## Implementation
 
 For implementation details — capabilities, proximity graphs, subnets, channels, daemons, safety envelopes, module map, and code examples — see the [crate README](net/crates/net/README.md).
