@@ -326,11 +326,11 @@ The mesh is encrypted end-to-end with no trusted intermediaries. This isn't a la
 
 **No parsing means no code execution surface.** A relay never interprets the payload. It doesn't know if it's forwarding JSON, binary, or garbage. It moves bytes. You can't exploit a parser bug in content the relay never parses. The attack surface of a relay is the routing header, not the content.
 
+**No clock dependency.** The protocol has no dependency on wall clocks, NTP, or synchronized time. Event ordering is causal — parent hashes, sequence numbers, vector clocks — not temporal. An attacker who manipulates a node's system clock, poisons its NTP source, or skews time across a subnet cannot disrupt causal ordering, cannot forge event sequences, and cannot collapse the mesh (zero time synchronization attack surface). A captured tower broadcasting adversarial timestamps disrupts clock-dependent protocols across its coverage area. Net is unaffected because protocol consistency does not depend on timestamp agreement. The network's consistency model is causal, not temporal. Ordering is cryptographic.
+
 **Compromise of a relay leaks nothing.** Even with full root access and memory dumps, an attacker who owns a relay gets encrypted bytes with no key material. Session keys are between source and destination. The relay was never part of the key exchange.
 
 **No connection state to hijack.** There's no TCP session to take over, no cookie to steal, no sequence number to predict. State propagates through the mesh, not through connections. There's nothing persistent on the wire to attack.
-
-**No clock dependency.** The protocol has no dependency on wall clocks, NTP, or synchronized time. Event ordering is causal — parent hashes, sequence numbers, vector clocks — not temporal. An attacker who manipulates a node's system clock, poisons its NTP source, or skews time across a subnet cannot disrupt causal ordering, cannot forge event sequences, and cannot collapse the mesh (zero time synchronization attack surface). A captured tower broadcasting adversarial timestamps disrupts clock-dependent protocols across its coverage area. Net is unaffected because protocol consistency does not depend on timestamp agreement. The network's consistency model is causal, not temporal. Ordering is cryptographic.
 
 This is different from TLS, where every hop that terminates TLS — load balancers, proxies, CDNs — sees plaintext. The standard web architecture is a chain of trusted intermediaries. Net has no trusted intermediaries. There's nothing to trust them with.
 
