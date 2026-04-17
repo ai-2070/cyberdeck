@@ -54,8 +54,8 @@ pub struct EventBus {
     adapter: Arc<dyn Adapter>,
     /// Poll merger for cross-shard consumption.
     poll_merger: arc_swap::ArcSwap<PollMerger>,
-    /// Batch worker handles.
-    batch_workers: parking_lot::Mutex<Vec<JoinHandle<()>>>,
+    /// Batch worker handles, keyed by shard ID for per-shard cleanup.
+    batch_workers: parking_lot::Mutex<std::collections::HashMap<u16, Vec<JoinHandle<()>>>>,
     /// Channels for sending batches to workers (shard_id -> sender).
     batch_senders: parking_lot::RwLock<
         std::collections::HashMap<u16, mpsc::Sender<Vec<crate::event::InternalEvent>>>,
@@ -136,7 +136,8 @@ impl EventBus {
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // Create batch workers for each shard
-        let mut batch_workers = Vec::with_capacity(config.num_shards as usize);
+        let mut batch_workers: std::collections::HashMap<u16, Vec<JoinHandle<()>>> =
+            std::collections::HashMap::with_capacity(config.num_shards as usize);
         let mut batch_senders =
             std::collections::HashMap::with_capacity(config.num_shards as usize);
 
@@ -154,14 +155,16 @@ impl EventBus {
                 batch_retries: config.adapter_batch_retries,
             });
 
-            batch_workers.push(worker);
+            batch_workers.entry(shard_id).or_default().push(worker);
             batch_senders.insert(shard_id, tx);
         }
 
         // Spawn drain workers that pull from ring buffers
-        let drain_workers =
-            spawn_drain_workers(shard_manager.clone(), &batch_senders, shutdown.clone());
-        batch_workers.extend(drain_workers);
+        for (shard_id, handle) in
+            spawn_drain_workers(shard_manager.clone(), &batch_senders, shutdown.clone())
+        {
+            batch_workers.entry(shard_id).or_default().push(handle);
+        }
 
         let bus = Self {
             shard_manager,
@@ -298,8 +301,9 @@ impl EventBus {
         // Add workers
         {
             let mut workers = self.batch_workers.lock();
-            workers.push(worker);
-            workers.push(drain_worker);
+            let handles = workers.entry(new_id).or_default();
+            handles.push(worker);
+            handles.push(drain_worker);
         }
 
         // Update poll merger
@@ -314,12 +318,11 @@ impl EventBus {
 
     /// Internal: Remove a stopped shard.
     async fn remove_shard_internal(&self, shard_id: u16) -> Result<(), AdapterError> {
-        // Remove sender (workers will terminate when channel closes).
-        // TODO: JoinHandles in `batch_workers` are not removed per-shard here,
-        // so they are leaked until shutdown. Tracking handles per shard would
-        // require significant refactoring; the handles are cleaned up on full
-        // shutdown so this is low severity.
+        // Remove sender (workers will terminate when channel closes)
         self.batch_senders.write().remove(&shard_id);
+
+        // Remove and drop worker handles for this shard
+        self.batch_workers.lock().remove(&shard_id);
 
         // Remove from shard manager
         self.shard_manager
@@ -513,9 +516,11 @@ impl EventBus {
         }
 
         // Take workers without holding lock across await
-        let workers: Vec<_> = std::mem::take(&mut *self.batch_workers.lock());
-        for handle in workers {
-            let _ = handle.await;
+        let workers = std::mem::take(&mut *self.batch_workers.lock());
+        for (_shard_id, handles) in workers {
+            for handle in handles {
+                let _ = handle.await;
+            }
         }
 
         // Flush and shutdown adapter (with timeout to prevent hanging)
@@ -706,11 +711,12 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
 }
 
 /// Spawn drain workers that pull from ring buffers.
+/// Returns `(shard_id, handle)` pairs for per-shard tracking.
 fn spawn_drain_workers(
     shard_manager: Arc<ShardManager>,
     senders: &std::collections::HashMap<u16, mpsc::Sender<Vec<crate::event::InternalEvent>>>,
     shutdown: Arc<AtomicBool>,
-) -> Vec<JoinHandle<()>> {
+) -> Vec<(u16, JoinHandle<()>)> {
     let mut handles = Vec::with_capacity(shard_manager.num_shards() as usize);
 
     for shard_id in 0..shard_manager.num_shards() {
@@ -722,7 +728,7 @@ fn spawn_drain_workers(
         let handle =
             spawn_drain_worker_for_shard(shard_id, shard_manager.clone(), sender, shutdown.clone());
 
-        handles.push(handle);
+        handles.push((shard_id, handle));
     }
 
     handles
