@@ -1,0 +1,23 @@
+net/crates/net/docs/COMPUTE.md
+  d37b393023401171 273-282
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "22f0e04331f034a00fbb8765a5dc7ed0bf318f8e",
+  "prompts": {
+    "d37b393023401171": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8de24b1d-4937-4e8f-9712-eb9f68e7e6e4",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 58,
+      "overriden_lines": 0
+    }
+  }
+}
