@@ -62,7 +62,7 @@ impl DaemonHost {
         chain: CausalChainBuilder,
         config: DaemonHostConfig,
     ) -> Self {
-        debug_assert_eq!(
+        assert_eq!(
             chain.origin_hash(),
             keypair.origin_hash(),
             "fork chain origin {:#x} does not match keypair origin {:#x}",
