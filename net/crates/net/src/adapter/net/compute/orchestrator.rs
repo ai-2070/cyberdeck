@@ -634,7 +634,7 @@ impl SnapshotReassembler {
         if self
             .latest_seq
             .get(&daemon_origin)
-            .map_or(true, |&latest| seq_through > latest)
+            .is_none_or(|&latest| seq_through > latest)
         {
             self.pending
                 .retain(|&(origin, seq), _| origin != daemon_origin || seq == seq_through);
