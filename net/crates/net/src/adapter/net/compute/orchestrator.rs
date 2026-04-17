@@ -257,6 +257,32 @@ pub mod wire {
                 let chunk_index = cur.get_u32_le();
                 let total_chunks = cur.get_u32_le();
                 let len = cur.get_u32_le() as usize;
+                // Reject structurally invalid chunks at the wire boundary so
+                // malformed messages never even reach the reassembler. The
+                // reassembler enforces the same invariants defensively.
+                if total_chunks == 0 {
+                    return Err(MigrationError::StateFailed(
+                        "SnapshotReady: total_chunks must be >= 1".into(),
+                    ));
+                }
+                if total_chunks > MAX_TOTAL_CHUNKS {
+                    return Err(MigrationError::StateFailed(format!(
+                        "SnapshotReady: total_chunks {} exceeds MAX_TOTAL_CHUNKS ({})",
+                        total_chunks, MAX_TOTAL_CHUNKS
+                    )));
+                }
+                if chunk_index >= total_chunks {
+                    return Err(MigrationError::StateFailed(format!(
+                        "SnapshotReady: chunk_index {} out of range for total_chunks {}",
+                        chunk_index, total_chunks
+                    )));
+                }
+                if len > MAX_SNAPSHOT_CHUNK_SIZE {
+                    return Err(MigrationError::StateFailed(format!(
+                        "SnapshotReady: chunk len {} exceeds MAX_SNAPSHOT_CHUNK_SIZE ({})",
+                        len, MAX_SNAPSHOT_CHUNK_SIZE
+                    )));
+                }
                 if cur.remaining() < len {
                     return Err(MigrationError::StateFailed(
                         "truncated snapshot payload".into(),
@@ -398,6 +424,16 @@ pub const MAX_SNAPSHOT_CHUNK_SIZE: usize = 7000;
 /// snapshot serialization limit is reached first.
 pub const MAX_SNAPSHOT_SIZE: usize = u32::MAX as usize * MAX_SNAPSHOT_CHUNK_SIZE;
 
+/// Maximum `total_chunks` the reassembler will accept per reassembly.
+///
+/// `StateSnapshot` wire format caps payload at ~4 GB (`state_len: u32`), so
+/// `ceil(u32::MAX / MAX_SNAPSHOT_CHUNK_SIZE)` ≈ 613,566 chunks is the largest
+/// legitimate value. We cap above that with headroom; anything higher is an
+/// attacker declaring a fake `total_chunks` to either flood us with
+/// BTreeMap insertions or stall the reassembler forever waiting for chunks
+/// that will never arrive.
+pub const MAX_TOTAL_CHUNKS: u32 = 700_000;
+
 /// Split a snapshot into chunked `SnapshotReady` messages.
 ///
 /// Small snapshots (<= `MAX_SNAPSHOT_CHUNK_SIZE`) produce a single message
@@ -441,13 +477,99 @@ pub fn chunk_snapshot(
         .collect())
 }
 
+/// Why a chunk was rejected by [`SnapshotReassembler::feed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReassemblyError {
+    /// `total_chunks == 0` — a well-formed message always declares at least one.
+    ZeroTotalChunks,
+    /// `chunk_index >= total_chunks` — attacker trying to smuggle out-of-range
+    /// indices past the "all chunks received" count check.
+    ChunkIndexOutOfRange {
+        /// The chunk index declared by the peer.
+        chunk_index: u32,
+        /// The `total_chunks` declared by the peer.
+        total_chunks: u32,
+    },
+    /// `total_chunks > MAX_TOTAL_CHUNKS` — peer declared more chunks than any
+    /// legitimate snapshot could produce.
+    TotalChunksTooLarge {
+        /// The `total_chunks` declared by the peer.
+        total_chunks: u32,
+    },
+    /// An individual chunk exceeds `MAX_SNAPSHOT_CHUNK_SIZE`.
+    ChunkTooLarge {
+        /// The chunk length observed.
+        len: usize,
+    },
+    /// A later chunk declared a different `total_chunks` than the first chunk
+    /// for the same `(daemon_origin, seq_through)`. Peer is either buggy or
+    /// trying to resize an in-flight reassembly to force extra allocations.
+    TotalChunksMismatch {
+        /// The value declared by the current chunk.
+        got: u32,
+        /// The value locked in by the first chunk.
+        expected: u32,
+    },
+    /// Peer sent a chunk for an older `seq_through` after we already
+    /// accepted a newer one for the same daemon.
+    StaleSeqThrough {
+        /// The `seq_through` on the incoming chunk.
+        got: u64,
+        /// The newest `seq_through` we've accepted for this daemon.
+        latest: u64,
+    },
+}
+
+impl std::fmt::Display for ReassemblyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroTotalChunks => write!(f, "total_chunks == 0"),
+            Self::ChunkIndexOutOfRange {
+                chunk_index,
+                total_chunks,
+            } => write!(
+                f,
+                "chunk_index {} out of range for total_chunks {}",
+                chunk_index, total_chunks
+            ),
+            Self::TotalChunksTooLarge { total_chunks } => write!(
+                f,
+                "total_chunks {} exceeds MAX_TOTAL_CHUNKS ({})",
+                total_chunks, MAX_TOTAL_CHUNKS
+            ),
+            Self::ChunkTooLarge { len } => write!(
+                f,
+                "chunk length {} exceeds MAX_SNAPSHOT_CHUNK_SIZE ({})",
+                len, MAX_SNAPSHOT_CHUNK_SIZE
+            ),
+            Self::TotalChunksMismatch { got, expected } => write!(
+                f,
+                "total_chunks {} does not match first chunk's declared {}",
+                got, expected
+            ),
+            Self::StaleSeqThrough { got, latest } => write!(
+                f,
+                "seq_through {} is older than latest accepted {} for this daemon",
+                got, latest
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReassemblyError {}
+
 /// Reassembles chunked `SnapshotReady` messages into a complete snapshot.
 ///
 /// Keyed by `(daemon_origin, seq_through)` so chunks from different snapshot
-/// generations cannot be mixed.
+/// generations cannot be mixed. At most one in-flight reassembly is kept
+/// per daemon — a chunk for a newer `seq_through` evicts any older pending
+/// state for that daemon, and chunks for older `seq_through` are rejected.
 pub struct SnapshotReassembler {
     /// Pending reassemblies: (daemon_origin, seq_through) → chunks.
     pending: std::collections::HashMap<(u32, u64), ReassemblyState>,
+    /// Latest `seq_through` accepted per daemon, for stale-chunk rejection
+    /// even after a reassembly completes and is evicted from `pending`.
+    latest_seq: std::collections::HashMap<u32, u64>,
 }
 
 struct ReassemblyState {
@@ -460,15 +582,17 @@ impl SnapshotReassembler {
     pub fn new() -> Self {
         Self {
             pending: std::collections::HashMap::new(),
+            latest_seq: std::collections::HashMap::new(),
         }
     }
 
-    /// Feed a snapshot chunk. Returns the complete snapshot bytes when all
-    /// chunks have been received, or `None` if still waiting for more.
+    /// Feed a snapshot chunk.
     ///
-    /// Chunks are keyed by `(daemon_origin, seq_through)` — if a new
-    /// snapshot arrives for the same daemon with a different `seq_through`,
-    /// it starts a fresh reassembly and discards any stale partial state.
+    /// Returns `Ok(Some(bytes))` when all chunks for the current
+    /// `(daemon_origin, seq_through)` have been received, `Ok(None)` while
+    /// still waiting, and `Err(ReassemblyError)` if the chunk is malformed or
+    /// part of an attacker-shaped sequence. Rejected chunks never mutate
+    /// in-flight state.
     pub fn feed(
         &mut self,
         daemon_origin: u32,
@@ -476,11 +600,51 @@ impl SnapshotReassembler {
         seq_through: u64,
         chunk_index: u32,
         total_chunks: u32,
-    ) -> Option<Vec<u8>> {
-        // Single-chunk fast path
+    ) -> Result<Option<Vec<u8>>, ReassemblyError> {
+        // ---- Per-chunk validation (no mutation until we've passed these) ----
+        if total_chunks == 0 {
+            return Err(ReassemblyError::ZeroTotalChunks);
+        }
+        if total_chunks > MAX_TOTAL_CHUNKS {
+            return Err(ReassemblyError::TotalChunksTooLarge { total_chunks });
+        }
+        if chunk_index >= total_chunks {
+            return Err(ReassemblyError::ChunkIndexOutOfRange {
+                chunk_index,
+                total_chunks,
+            });
+        }
+        if snapshot_bytes.len() > MAX_SNAPSHOT_CHUNK_SIZE {
+            return Err(ReassemblyError::ChunkTooLarge {
+                len: snapshot_bytes.len(),
+            });
+        }
+        if let Some(&latest) = self.latest_seq.get(&daemon_origin) {
+            if seq_through < latest {
+                return Err(ReassemblyError::StaleSeqThrough {
+                    got: seq_through,
+                    latest,
+                });
+            }
+        }
+
+        // A newer seq_through for the same daemon evicts older in-flight state.
+        // This is what the public docstring always claimed; without it, the
+        // `pending` map grew unbounded across seq_through values.
+        if self
+            .latest_seq
+            .get(&daemon_origin)
+            .map_or(true, |&latest| seq_through > latest)
+        {
+            self.pending
+                .retain(|&(origin, seq), _| origin != daemon_origin || seq == seq_through);
+            self.latest_seq.insert(daemon_origin, seq_through);
+        }
+
+        // Single-chunk fast path: no state to keep.
         if total_chunks == 1 {
             self.pending.remove(&(daemon_origin, seq_through));
-            return Some(snapshot_bytes);
+            return Ok(Some(snapshot_bytes));
         }
 
         let key = (daemon_origin, seq_through);
@@ -489,25 +653,36 @@ impl SnapshotReassembler {
             chunks: std::collections::BTreeMap::new(),
         });
 
+        // The first chunk fixes total_chunks; later chunks must agree.
+        if state.total_chunks != total_chunks {
+            return Err(ReassemblyError::TotalChunksMismatch {
+                got: total_chunks,
+                expected: state.total_chunks,
+            });
+        }
+
         state.chunks.insert(chunk_index, snapshot_bytes);
 
+        // With `chunk_index < total_chunks` enforced above, the BTreeMap's
+        // keys are all in 0..total_chunks. Reaching total_chunks entries
+        // therefore means we have every distinct index exactly once.
         if state.chunks.len() == state.total_chunks as usize {
-            // All chunks received — reassemble in order
             let state = self.pending.remove(&key).unwrap();
-            let mut full = Vec::new();
+            let mut full = Vec::with_capacity(state.chunks.values().map(|c| c.len()).sum());
             for (_idx, chunk) in state.chunks {
                 full.extend_from_slice(&chunk);
             }
-            Some(full)
+            Ok(Some(full))
         } else {
-            None
+            Ok(None)
         }
     }
 
     /// Cancel reassembly for a daemon (e.g., on migration abort).
     ///
     /// Removes all pending reassemblies for this daemon regardless of
-    /// `seq_through`.
+    /// `seq_through`. Does **not** reset `latest_seq`, so a subsequent
+    /// replay of old chunks is still rejected.
     pub fn cancel(&mut self, daemon_origin: u32) {
         self.pending
             .retain(|&(origin, _), _| origin != daemon_origin);
@@ -1169,13 +1344,15 @@ mod tests {
                 total_chunks,
             } = chunk
             {
-                let result = reassembler.feed(
-                    daemon_origin,
-                    snapshot_bytes,
-                    seq_through,
-                    chunk_index,
-                    total_chunks,
-                );
+                let result = reassembler
+                    .feed(
+                        daemon_origin,
+                        snapshot_bytes,
+                        seq_through,
+                        chunk_index,
+                        total_chunks,
+                    )
+                    .expect("legitimate chunks must not be rejected");
                 if chunk_index < total_chunks - 1 {
                     assert!(result.is_none());
                 } else {
@@ -1190,10 +1367,270 @@ mod tests {
     #[test]
     fn test_reassembler_cancel() {
         let mut reassembler = SnapshotReassembler::new();
-        reassembler.feed(0xAAAA, vec![1, 2], 10, 0, 3);
+        reassembler.feed(0xAAAA, vec![1, 2], 10, 0, 3).unwrap();
         assert_eq!(reassembler.pending_count(), 1);
         reassembler.cancel(0xAAAA);
         assert_eq!(reassembler.pending_count(), 0);
+    }
+
+    // ---- Regression tests: SnapshotReassembler DoS / forgery holes ----
+
+    #[test]
+    fn test_regression_reassembler_rejects_chunk_index_out_of_range() {
+        // Regression: feed() never checked that `chunk_index < total_chunks`,
+        // so an attacker could declare total_chunks=3 and feed indices
+        // {0, 5, 7}. The BTreeMap happily stored them, `chunks.len() == 3 ==
+        // total_chunks` fired "complete", and the reassembler concatenated
+        // three non-contiguous chunks as if they were chunks 0,1,2 —
+        // silently forging a snapshot from attacker-chosen partial content.
+        //
+        // Fix: feed() rejects any chunk with `chunk_index >= total_chunks`
+        // before touching state.
+        let mut reassembler = SnapshotReassembler::new();
+
+        let r0 = reassembler.feed(0xAAAA, vec![1; 10], 1, 0, 3);
+        assert!(r0.is_ok(), "in-range chunk must be accepted: {:?}", r0);
+
+        let forged = reassembler.feed(0xAAAA, vec![2; 10], 1, 5, 3);
+        assert!(
+            matches!(
+                forged,
+                Err(ReassemblyError::ChunkIndexOutOfRange {
+                    chunk_index: 5,
+                    total_chunks: 3,
+                })
+            ),
+            "chunk_index=5 with total_chunks=3 must be rejected, got {:?}",
+            forged
+        );
+
+        // The reassembly must not have "completed" from the forged chunk —
+        // still waiting for real chunks 1 and 2.
+        assert_eq!(
+            reassembler.pending_count(),
+            1,
+            "state must stay in-flight after rejected chunk"
+        );
+    }
+
+    #[test]
+    fn test_regression_reassembler_rejects_zero_total_chunks() {
+        // Regression: total_chunks == 0 created a ReassemblyState that
+        // could never complete (len check 0 == 0 never true after the
+        // first insert), leaking memory. Fix: reject at the entry point.
+        let mut reassembler = SnapshotReassembler::new();
+        let result = reassembler.feed(0xAAAA, vec![1; 10], 1, 0, 0);
+        assert!(matches!(result, Err(ReassemblyError::ZeroTotalChunks)));
+        assert_eq!(reassembler.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_regression_reassembler_caps_total_chunks() {
+        // Regression: an attacker could declare total_chunks = u32::MAX
+        // and flood the BTreeMap with up to ~4B insertions before any
+        // completion check would fire. Fix: cap total_chunks at
+        // MAX_TOTAL_CHUNKS (well above any legitimate snapshot).
+        let mut reassembler = SnapshotReassembler::new();
+        let result = reassembler.feed(0xAAAA, vec![1; 10], 1, 0, u32::MAX);
+        assert!(matches!(
+            result,
+            Err(ReassemblyError::TotalChunksTooLarge {
+                total_chunks: u32::MAX
+            })
+        ));
+        assert_eq!(reassembler.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_regression_reassembler_rejects_oversized_chunk() {
+        // Defense in depth: even if the transport framing lets a larger
+        // payload through, the reassembler refuses a single chunk bigger
+        // than MAX_SNAPSHOT_CHUNK_SIZE.
+        let mut reassembler = SnapshotReassembler::new();
+        let oversized = vec![0u8; MAX_SNAPSHOT_CHUNK_SIZE + 1];
+        let result = reassembler.feed(0xAAAA, oversized, 1, 0, 3);
+        assert!(
+            matches!(result, Err(ReassemblyError::ChunkTooLarge { .. })),
+            "got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_regression_reassembler_rejects_total_chunks_mismatch() {
+        // Regression: an attacker who opened a reassembly with
+        // total_chunks=3 could send a later chunk declaring total_chunks=100
+        // and the code would just keep inserting. Fix: the first chunk's
+        // total_chunks is locked in; later chunks must agree.
+        let mut reassembler = SnapshotReassembler::new();
+        reassembler.feed(0xAAAA, vec![1; 10], 1, 0, 3).unwrap();
+        let result = reassembler.feed(0xAAAA, vec![2; 10], 1, 1, 100);
+        assert!(
+            matches!(
+                result,
+                Err(ReassemblyError::TotalChunksMismatch {
+                    got: 100,
+                    expected: 3,
+                })
+            ),
+            "got {:?}",
+            result
+        );
+        assert_eq!(reassembler.pending_count(), 1);
+    }
+
+    #[test]
+    fn test_regression_reassembler_evicts_older_seq_per_daemon() {
+        // Regression: `pending` was keyed by (daemon_origin, seq_through)
+        // and a fresh seq_through did NOT evict older pending reassemblies
+        // for the same daemon. A peer could open unbounded in-flight
+        // entries by incrementing seq_through forever.
+        //
+        // Fix: at most one in-flight reassembly per daemon. A newer
+        // seq_through evicts older ones; older seq_through values are
+        // rejected as stale.
+        let mut reassembler = SnapshotReassembler::new();
+
+        reassembler.feed(0xAAAA, vec![1; 10], 10, 0, 3).unwrap();
+        reassembler.feed(0xAAAA, vec![1; 10], 11, 0, 3).unwrap();
+        reassembler.feed(0xAAAA, vec![1; 10], 12, 0, 3).unwrap();
+
+        assert_eq!(
+            reassembler.pending_count(),
+            1,
+            "only the newest seq_through for a daemon should remain in flight"
+        );
+
+        // A stale seq_through is rejected — not silently dropped on the floor.
+        let stale = reassembler.feed(0xAAAA, vec![1; 10], 5, 0, 3);
+        assert!(
+            matches!(
+                stale,
+                Err(ReassemblyError::StaleSeqThrough { got: 5, latest: 12 })
+            ),
+            "stale seq_through must be rejected, got {:?}",
+            stale
+        );
+        assert_eq!(reassembler.pending_count(), 1);
+    }
+
+    #[test]
+    fn test_regression_reassembler_distinct_daemons_coexist() {
+        // Eviction is per-daemon, not global — parallel migrations of
+        // different daemons must be able to share the reassembler.
+        let mut reassembler = SnapshotReassembler::new();
+        reassembler.feed(0x1111, vec![1; 10], 1, 0, 3).unwrap();
+        reassembler.feed(0x2222, vec![2; 10], 7, 0, 3).unwrap();
+        reassembler.feed(0x3333, vec![3; 10], 9, 0, 3).unwrap();
+        assert_eq!(reassembler.pending_count(), 3);
+    }
+
+    #[test]
+    fn test_regression_wire_decode_rejects_zero_total_chunks() {
+        // Regression: the wire decoder accepted any u32 for total_chunks
+        // and chunk_index, including nonsense like total_chunks=0. A
+        // defensive validation at the wire boundary stops malformed
+        // messages from ever reaching the reassembler.
+        use bytes::BufMut;
+        let mut buf = Vec::new();
+        buf.put_u8(wire::MSG_SNAPSHOT_READY);
+        buf.put_u32_le(0xAAAA); // daemon_origin
+        buf.put_u64_le(1); // seq_through
+        buf.put_u32_le(0); // chunk_index
+        buf.put_u32_le(0); // total_chunks — invalid
+        buf.put_u32_le(0); // len
+        let err = wire::decode(&buf).expect_err("total_chunks=0 must be rejected");
+        let err_msg = format!("{}", err);
+        assert!(
+            err_msg.contains("total_chunks"),
+            "error must mention total_chunks, got {:?}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_regression_wire_decode_rejects_chunk_index_out_of_range() {
+        use bytes::BufMut;
+        let mut buf = Vec::new();
+        buf.put_u8(wire::MSG_SNAPSHOT_READY);
+        buf.put_u32_le(0xAAAA);
+        buf.put_u64_le(1);
+        buf.put_u32_le(5); // chunk_index
+        buf.put_u32_le(3); // total_chunks — index out of range
+        buf.put_u32_le(0);
+        let err = wire::decode(&buf).expect_err("chunk_index >= total_chunks must be rejected");
+        let err_msg = format!("{}", err);
+        assert!(
+            err_msg.contains("chunk_index"),
+            "error must mention chunk_index, got {:?}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_regression_wire_decode_rejects_total_chunks_overflow() {
+        use bytes::BufMut;
+        let mut buf = Vec::new();
+        buf.put_u8(wire::MSG_SNAPSHOT_READY);
+        buf.put_u32_le(0xAAAA);
+        buf.put_u64_le(1);
+        buf.put_u32_le(0);
+        buf.put_u32_le(u32::MAX); // total_chunks — exceeds MAX_TOTAL_CHUNKS
+        buf.put_u32_le(0);
+        let err = wire::decode(&buf).expect_err("total_chunks > MAX_TOTAL_CHUNKS must be rejected");
+        let err_msg = format!("{}", err);
+        assert!(
+            err_msg.contains("MAX_TOTAL_CHUNKS"),
+            "error must mention MAX_TOTAL_CHUNKS, got {:?}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_regression_reassembler_end_to_end_forged_chunk_cannot_complete() {
+        // Integration: simulate an attacker who learns total_chunks=4 from a
+        // legitimate first chunk and then tries to race ahead with forged
+        // content at indices beyond the range. Even if indices {0,5,7} each
+        // carry attacker-chosen bytes, the reassembler must never "complete"
+        // a snapshot without receiving every real index in 0..total_chunks.
+        let mut reassembler = SnapshotReassembler::new();
+
+        // Real chunk 0 — opens the reassembly at total_chunks=4.
+        let r0 = reassembler.feed(0xDEAD, vec![0xA0; 10], 1, 0, 4).unwrap();
+        assert!(r0.is_none());
+
+        // Forged out-of-range chunks — all rejected, none completes.
+        for bad_idx in [4, 5, 7, 999] {
+            let r = reassembler.feed(0xDEAD, vec![0xFF; 10], 1, bad_idx, 4);
+            assert!(
+                matches!(r, Err(ReassemblyError::ChunkIndexOutOfRange { .. })),
+                "index {} must be rejected, got {:?}",
+                bad_idx,
+                r
+            );
+        }
+
+        // A snapshot-like "complete" signal can only come from filling
+        // real indices 1, 2, 3.
+        assert!(reassembler
+            .feed(0xDEAD, vec![0xA1; 10], 1, 1, 4)
+            .unwrap()
+            .is_none());
+        assert!(reassembler
+            .feed(0xDEAD, vec![0xA2; 10], 1, 2, 4)
+            .unwrap()
+            .is_none());
+        let full = reassembler
+            .feed(0xDEAD, vec![0xA3; 10], 1, 3, 4)
+            .unwrap()
+            .expect("all four real chunks received — reassembly must complete");
+        // Concatenation order is by chunk_index ascending, so the payload
+        // is exactly the legitimate chunks 0,1,2,3 — not a forgery.
+        assert_eq!(full.len(), 40);
+        assert!(full[..10].iter().all(|&b| b == 0xA0));
+        assert!(full[10..20].iter().all(|&b| b == 0xA1));
+        assert!(full[20..30].iter().all(|&b| b == 0xA2));
+        assert!(full[30..].iter().all(|&b| b == 0xA3));
     }
 
     #[test]
