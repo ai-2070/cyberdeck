@@ -211,26 +211,11 @@ impl StandbyGroup {
         let through_seq = snapshot.through_seq;
         let now = Instant::now();
 
-        // Restore on each standby
-        for member_info in &self.members {
-            if member_info.role == MemberRole::Active {
-                continue;
-            }
-
-            let standby_origin = self.coord.members()[member_info.index as usize].origin_hash;
-
-            // Unregister the old standby and re-create from snapshot
-            let _ = registry.unregister(standby_origin);
-
-            // Standbys track the sync point but don't restore in-process.
-            // They are different entities holding readiness to promote.
-            // On promotion, the new active replays buffered events to
-            // catch up from synced_through to the current head.
-            //
-            // The snapshot bytes could be stored for cross-node standby
-            // seeding (an application-layer concern). The protocol's job
-            // is tracking what sequence each standby is synced through.
-        }
+        // Standbys remain registered — they track readiness to promote.
+        // On promotion, the new active replays buffered events to catch up
+        // from synced_through to the current head. The protocol's job is
+        // tracking what sequence each standby is synced through. Persistence
+        // of snapshot bytes to disk is an application concern.
 
         // Update sync tracking
         for member in &mut self.members {

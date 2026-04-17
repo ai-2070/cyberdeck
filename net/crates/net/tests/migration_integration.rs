@@ -15,9 +15,10 @@ use net::adapter::net::behavior::capability::{
 use net::adapter::net::behavior::loadbalance::{RequestContext, Strategy};
 use net::adapter::net::compute::{
     chunk_snapshot, DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, ForkGroup,
-    ForkGroupConfig, MeshDaemon, MigrationMessage, MigrationOrchestrator, MigrationPhase,
-    MigrationSourceHandler, MigrationTargetHandler, ReplicaGroup, ReplicaGroupConfig, Scheduler,
-    SnapshotReassembler, MAX_SNAPSHOT_CHUNK_SIZE,
+    ForkGroupConfig, MemberRole, MeshDaemon, MigrationMessage, MigrationOrchestrator,
+    MigrationPhase, MigrationSourceHandler, MigrationTargetHandler, ReplicaGroup,
+    ReplicaGroupConfig, Scheduler, SnapshotReassembler, StandbyGroup, StandbyGroupConfig,
+    MAX_SNAPSHOT_CHUNK_SIZE,
 };
 use net::adapter::net::continuity::discontinuity::fork_sentinel;
 use net::adapter::net::identity::EntityKeypair;
@@ -1569,4 +1570,191 @@ fn test_group_coordinator_route_delivers_to_daemon() {
 
     // Fork origin should NOT be the parent
     assert_ne!(fork_origin, 0xDDDD);
+}
+
+// ── Standby group integration tests ──────────────────────────────────────────
+
+/// Integration test: Sync → promote → state continuity.
+///
+/// Verifies that events processed by the active before sync, plus events
+/// buffered after sync, produce correct output on the promoted standby.
+/// This is the core promise of StandbyGroup — the new active continues
+/// from where the old active left off.
+#[test]
+fn test_standby_sync_promote_state_continuity() {
+    let reg = DaemonRegistry::new();
+    let sched = make_scheduler_for_groups();
+
+    let mut group = StandbyGroup::spawn(
+        StandbyGroupConfig {
+            member_count: 3,
+            group_seed: [77u8; 32],
+            host_config: DaemonHostConfig::default(),
+        },
+        || Box::new(CounterDaemon::new()),
+        &sched,
+        &reg,
+    )
+    .unwrap();
+
+    let active = group.active_origin();
+
+    // Phase 1: Process 10 events on the active
+    for seq in 1..=10 {
+        let event = make_event(0xFFFF, seq);
+        let outputs = reg.deliver(active, &event).unwrap();
+        // CounterDaemon increments: output should be seq
+        let val = u64::from_le_bytes(outputs[0].payload[..8].try_into().unwrap());
+        assert_eq!(val, seq);
+        group.on_event_delivered(event);
+    }
+
+    // Phase 2: Sync standbys — they're now caught up to seq 10
+    let synced = group.sync_standbys(&reg).unwrap();
+    assert_eq!(synced, 10);
+    assert_eq!(group.buffered_event_count(), 0);
+
+    // Phase 3: Process 3 more events after sync (these buffer for replay)
+    for seq in 11..=13 {
+        let event = make_event(0xFFFF, seq);
+        let outputs = reg.deliver(active, &event).unwrap();
+        let val = u64::from_le_bytes(outputs[0].payload[..8].try_into().unwrap());
+        assert_eq!(val, seq);
+        group.on_event_delivered(event);
+    }
+    assert_eq!(group.buffered_event_count(), 3);
+
+    // Phase 4: Promote — new active should replay the 3 buffered events
+    let new_active = group
+        .promote(|| Box::new(CounterDaemon::new()), &reg, &sched)
+        .unwrap();
+    assert_ne!(new_active, active);
+    assert_eq!(group.buffered_event_count(), 0);
+
+    // Phase 5: Deliver a new event to the promoted active
+    // The standby daemon started fresh (count=0) and replayed 3 buffered events
+    // (count became 3). Now delivering one more should produce count=4.
+    let event = make_event(0xFFFF, 14);
+    let outputs = reg.deliver(new_active, &event).unwrap();
+    assert_eq!(outputs.len(), 1);
+    let val = u64::from_le_bytes(outputs[0].payload[..8].try_into().unwrap());
+    assert_eq!(val, 4); // 3 replayed + 1 new
+
+    // The new active's output should carry its own origin_hash
+    assert_eq!(outputs[0].link.origin_hash, new_active);
+}
+
+/// Integration test: Promote then continue processing.
+///
+/// After promotion, the new active should accept a sustained stream of
+/// events and produce correct sequential output.
+#[test]
+fn test_standby_promote_then_continue() {
+    let reg = DaemonRegistry::new();
+    let sched = make_scheduler_for_groups();
+
+    let mut group = StandbyGroup::spawn(
+        StandbyGroupConfig {
+            member_count: 2,
+            group_seed: [88u8; 32],
+            host_config: DaemonHostConfig::default(),
+        },
+        || Box::new(CounterDaemon::new()),
+        &sched,
+        &reg,
+    )
+    .unwrap();
+
+    let active = group.active_origin();
+
+    // Process events and sync
+    for seq in 1..=5 {
+        let event = make_event(0xFFFF, seq);
+        reg.deliver(active, &event).unwrap();
+        group.on_event_delivered(event);
+    }
+    group.sync_standbys(&reg).unwrap();
+
+    // Promote
+    let new_active = group
+        .promote(|| Box::new(CounterDaemon::new()), &reg, &sched)
+        .unwrap();
+
+    // Deliver 10 more events to the new active — verify sequential output
+    for seq in 1..=10 {
+        let event = make_event(0xFFFF, 100 + seq);
+        let outputs = reg.deliver(new_active, &event).unwrap();
+        assert_eq!(outputs.len(), 1);
+        let val = u64::from_le_bytes(outputs[0].payload[..8].try_into().unwrap());
+        assert_eq!(val, seq); // fresh daemon counts from 0
+        assert_eq!(outputs[0].link.origin_hash, new_active);
+    }
+
+    // Verify the new active's role
+    assert_eq!(
+        group.member_role(group.active_index()),
+        Some(MemberRole::Active)
+    );
+    assert!(group.active_healthy());
+}
+
+/// Integration test: StandbyGroup + MIKOSHI compose.
+///
+/// The active is a normal daemon in the registry. MIKOSHI can start a
+/// migration on it without knowing it belongs to a standby group.
+#[test]
+fn test_standby_group_active_migrates_via_mikoshi() {
+    let reg = Arc::new(DaemonRegistry::new());
+    let sched = make_scheduler_for_groups();
+
+    let mut group = StandbyGroup::spawn(
+        StandbyGroupConfig {
+            member_count: 3,
+            group_seed: [99u8; 32],
+            host_config: DaemonHostConfig::default(),
+        },
+        || Box::new(CounterDaemon::new()),
+        &sched,
+        &reg,
+    )
+    .unwrap();
+
+    let active = group.active_origin();
+
+    // Process events on the active to build state
+    for seq in 1..=7 {
+        let event = make_event(0xFFFF, seq);
+        reg.deliver(active, &event).unwrap();
+        group.on_event_delivered(event);
+    }
+
+    // The active is a normal daemon — verify snapshot works
+    let snapshot = reg.snapshot(active).unwrap().unwrap();
+    assert_eq!(snapshot.through_seq, 7);
+
+    // Start a MIKOSHI migration on the active
+    let orch = MigrationOrchestrator::new(reg.clone(), 0x1111);
+    let msg = orch.start_migration(active, 0x1111, 0x2222).unwrap();
+
+    // Migration should succeed — it doesn't know this daemon is part of a group
+    assert!(orch.is_migrating(active));
+    match msg {
+        MigrationMessage::SnapshotReady {
+            daemon_origin,
+            seq_through,
+            ..
+        } => {
+            assert_eq!(daemon_origin, active);
+            assert_eq!(seq_through, 7);
+        }
+        _ => panic!("expected SnapshotReady"),
+    }
+
+    // The standby group still tracks the active (even though migration is in-flight)
+    assert_eq!(group.active_origin(), active);
+    assert!(group.active_healthy());
+
+    // Standbys are unaffected
+    assert_eq!(group.member_count(), 3);
+    assert_eq!(group.standby_count(), 2);
 }
