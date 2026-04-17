@@ -16,6 +16,7 @@ pub mod orchestrator;
 mod registry;
 pub mod replica_group;
 mod scheduler;
+pub mod standby_group;
 
 pub use daemon::{DaemonError, DaemonHostConfig, DaemonStats, MeshDaemon};
 pub use fork_group::{ForkGroup, ForkGroupConfig, ForkInfo};
@@ -31,3 +32,4 @@ pub use orchestrator::{
 pub use registry::DaemonRegistry;
 pub use replica_group::{ReplicaGroup, ReplicaGroupConfig, SUBPROTOCOL_REPLICA_GROUP};
 pub use scheduler::{PlacementDecision, PlacementReason, Scheduler, SchedulerError};
+pub use standby_group::{MemberRole, StandbyGroup, StandbyGroupConfig};
