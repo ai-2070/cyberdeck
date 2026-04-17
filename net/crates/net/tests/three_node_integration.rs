@@ -2625,7 +2625,7 @@ async fn test_mesh_node_reroute_no_data_loss() {
 
 use net::adapter::net::{
     DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, MeshDaemon,
-    MigrationOrchestrator, MigrationSourceHandler, MigrationTargetHandler,
+    MigrationOrchestrator, MigrationPhase, MigrationSourceHandler, MigrationTargetHandler,
     MigrationSubprotocolHandler, MigrationMessage, SUBPROTOCOL_MIGRATION,
 };
 use net::adapter::net::compute::orchestrator::wire as migration_wire;
@@ -2749,4 +2749,139 @@ async fn test_migration_snapshot_over_wire() {
 
     node_a.shutdown().await.unwrap();
     node_b.shutdown().await.unwrap();
+}
+
+/// 7.2 — Full migration lifecycle: orchestrator starts migration, snapshot
+/// flows from source to orchestrator over encrypted UDP.
+///
+/// A=orchestrator, B=source. A starts migration via the orchestrator API,
+/// sends TakeSnapshot to B. B processes it and sends SnapshotReady back.
+/// A's handler receives it and advances the orchestrator past Snapshot.
+///
+/// This proves the full round-trip: orchestrator → wire → source handler →
+/// snapshot → wire → orchestrator state machine.
+#[tokio::test]
+async fn test_migration_full_lifecycle_over_wire() {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(10))
+    };
+
+    // B: source node with a daemon
+    let registry_b = Arc::new(DaemonRegistry::new());
+    let daemon_kp = EntityKeypair::generate();
+    let daemon_origin = daemon_kp.origin_hash();
+    let host = DaemonHost::new(
+        Box::new(CounterDaemon::with_count(42)),
+        daemon_kp,
+        DaemonHostConfig::default(),
+    );
+    registry_b.register(host).unwrap();
+
+    // A: orchestrator
+    let registry_a = Arc::new(DaemonRegistry::new());
+
+    // Create handlers
+    let orch_a = Arc::new(MigrationOrchestrator::new(registry_a.clone(), nid_a));
+    let handler_a = Arc::new(MigrationSubprotocolHandler::new(
+        orch_a.clone(),
+        Arc::new(MigrationSourceHandler::new(registry_a.clone())),
+        Arc::new(MigrationTargetHandler::new(registry_a.clone())),
+        nid_a,
+    ));
+
+    let orch_b = Arc::new(MigrationOrchestrator::new(registry_b.clone(), nid_b));
+    let source_b = Arc::new(MigrationSourceHandler::new(registry_b.clone()));
+    let handler_b = Arc::new(MigrationSubprotocolHandler::new(
+        orch_b,
+        source_b.clone(),
+        Arc::new(MigrationTargetHandler::new(registry_b.clone())),
+        nid_b,
+    ));
+
+    let mut node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let mut node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    // Node C exists for the triangle but isn't involved in this test
+    let node_c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let pub_b = *node_b.public_key();
+    let pub_c = *node_c.public_key();
+
+    node_a.set_migration_handler(handler_a);
+    node_b.set_migration_handler(handler_b);
+
+    // Connect A↔B
+    let (r1, r2) = tokio::join!(node_b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap(); r2.unwrap();
+
+    // Connect A↔C (needed for orchestrator to route SnapshotReady to target)
+    let (r1, r2) = tokio::join!(node_c.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap(); r2.unwrap();
+
+    node_a.start(); node_b.start(); node_c.start();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Start migration on orchestrator (remote source at B, target at C)
+    orch_a.start_migration(daemon_origin, nid_b, nid_c).unwrap();
+    assert_eq!(orch_a.status(daemon_origin), Some(MigrationPhase::Snapshot));
+
+    // Send TakeSnapshot to B
+    let msg = MigrationMessage::TakeSnapshot {
+        daemon_origin,
+        target_node: nid_c,
+    };
+    let encoded = migration_wire::encode(&msg).unwrap();
+    node_a
+        .send_subprotocol(addr_b, SUBPROTOCOL_MIGRATION, &encoded)
+        .await
+        .unwrap();
+
+    // Wait for B to process TakeSnapshot and send SnapshotReady back to A.
+    // A's handler receives it and calls orch_a.on_snapshot_ready().
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+
+    // Verify B processed TakeSnapshot
+    let source_check = source_b.start_snapshot(daemon_origin, 0x9999);
+    assert!(source_check.is_err(), "B should have processed TakeSnapshot");
+
+    // Verify A's orchestrator advanced past Snapshot
+    let phase = orch_a.status(daemon_origin);
+    assert!(
+        phase.is_some(),
+        "orchestrator should still be tracking the migration"
+    );
+    let phase = phase.unwrap();
+    assert_ne!(
+        phase,
+        MigrationPhase::Snapshot,
+        "orchestrator should have advanced past Snapshot (got {:?}). \
+         SnapshotReady was received and processed over wire.",
+        phase
+    );
+
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+    node_c.shutdown().await.unwrap();
 }
