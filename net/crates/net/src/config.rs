@@ -569,14 +569,14 @@ impl Default for ScalingPolicy {
 
 impl ScalingPolicy {
     /// Create a default scaling policy based on CPU count.
-    /// Scales from 1 shard up to 2x the number of physical cores.
+    /// Scales from 1 shard up to the number of physical cores.
     pub fn default_for_cpus(cpus: u16) -> Self {
         Self {
             fill_ratio_threshold: 0.7,
             push_latency_threshold_ns: 5,
             flush_latency_threshold_us: 1000,
             min_shards: 1,
-            max_shards: cpus.saturating_mul(2),
+            max_shards: cpus,
             cooldown: Duration::from_secs(1),
             scale_down_delay: Duration::from_secs(10),
             underutilized_threshold: 0.1,
@@ -715,8 +715,7 @@ mod tests {
         assert!(config.scaling.is_some());
 
         let policy = config.scaling.unwrap();
-        // max_shards is 2x num_shards to allow headroom for scale-up
-        assert_eq!(policy.max_shards, config.num_shards.saturating_mul(2));
+        assert_eq!(policy.max_shards, config.num_shards);
         assert!(policy.auto_scale);
     }
 
@@ -726,7 +725,7 @@ mod tests {
 
         assert!(config.scaling.is_some());
         let policy = config.scaling.unwrap();
-        assert_eq!(policy.max_shards, 16); // 2x headroom
+        assert_eq!(policy.max_shards, 8);
     }
 
     #[test]
@@ -742,7 +741,7 @@ mod tests {
 
     #[test]
     fn test_with_dynamic_scaling_respects_num_shards() {
-        // with_dynamic_scaling() should use num_shards for max_shards (with 2x headroom)
+        // with_dynamic_scaling() should use num_shards for max_shards, not CPU count
         let config = EventBusConfig::builder()
             .num_shards(8)
             .with_dynamic_scaling()
@@ -751,7 +750,7 @@ mod tests {
 
         assert!(config.scaling.is_some());
         let policy = config.scaling.unwrap();
-        assert_eq!(policy.max_shards, 16); // 2x headroom
+        assert_eq!(policy.max_shards, 8);
 
         // Order shouldn't matter
         let config2 = EventBusConfig::builder()
@@ -762,7 +761,7 @@ mod tests {
 
         assert!(config2.scaling.is_some());
         let policy2 = config2.scaling.unwrap();
-        assert_eq!(policy2.max_shards, 32); // 2x headroom
+        assert_eq!(policy2.max_shards, 16);
     }
 
     #[test]
