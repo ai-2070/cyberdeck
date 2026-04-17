@@ -165,13 +165,13 @@ Initially flagged: drain workers sleep only 100μs when idle, burning CPU.
 
 **Decision: not a bug.** The 100μs poll is deliberate for a latency-first system. The drain loop is the hot path — adding adaptive backoff (e.g., up to 10ms) would add milliseconds of latency to the first event after a quiet period, violating the sub-microsecond design target. The CPU cost is acceptable for a system processing 10M+ events/sec. Added a comment explaining the trade-off.
 
-### 19. `JoinHandle`s leaked on scale-down
+### 19. `JoinHandle`s leaked on scale-down — fixed
 
 **File:** `src/bus.rs:316-333`
 
-`remove_shard_internal()` removes the batch sender but never removes the corresponding `JoinHandle`s from `self.batch_workers`. Stale handles accumulate over the lifetime of the EventBus.
+`remove_shard_internal()` removed the batch sender but never removed the corresponding `JoinHandle`s from `self.batch_workers`. Stale handles accumulated over the lifetime of the EventBus.
 
-**Fix:** Track worker handles per shard in a `HashMap<u16, Vec<JoinHandle<()>>>`.
+**Fix:** Changed `batch_workers` from `Vec<JoinHandle<()>>` to `HashMap<u16, Vec<JoinHandle<()>>>`. `remove_shard_internal` now removes handles for the specific shard. `spawn_drain_workers` returns `(shard_id, handle)` pairs for keyed insertion.
 
 ### 20. ~~Default scaling policy prevents scale-up~~ (kept as-is)
 
