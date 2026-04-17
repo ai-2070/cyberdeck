@@ -60,6 +60,13 @@ use crate::event::{Batch, StoredEvent};
 /// Inbound event queues (same type as NetAdapter uses).
 type InboundQueues = Arc<DashMap<u16, SegQueue<StoredEvent>>>;
 
+/// Set of peer addresses whose packets should be silently dropped.
+///
+/// Used by test harnesses to simulate network partitions. When a peer's
+/// address is in this set, both inbound and outbound packets are dropped
+/// as if the network link is severed.
+pub type PartitionFilter = Arc<dashmap::DashSet<SocketAddr>>;
+
 /// Shared context for the packet dispatch loop.
 struct DispatchCtx {
     local_node_id: u64,
@@ -72,6 +79,8 @@ struct DispatchCtx {
     migration_handler: Option<Arc<MigrationSubprotocolHandler>>,
     /// Socket for sending outbound subprotocol responses.
     socket: Arc<NetSocket>,
+    /// Partition filter — packets from blocked addresses are dropped.
+    partition_filter: PartitionFilter,
 }
 
 /// Configuration for a MeshNode.
@@ -183,6 +192,8 @@ pub struct MeshNode {
     inbound: InboundQueues,
     /// Optional migration subprotocol handler
     migration_handler: Option<Arc<MigrationSubprotocolHandler>>,
+    /// Partition filter for simulating network splits
+    partition_filter: PartitionFilter,
     /// Background tasks
     tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
     /// Shutdown flag
@@ -248,6 +259,7 @@ impl MeshNode {
             failure_detector: Arc::new(failure_detector),
             inbound: Arc::new(DashMap::new()),
             migration_handler: None,
+            partition_filter: Arc::new(dashmap::DashSet::new()),
             tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
@@ -282,6 +294,21 @@ impl MeshNode {
     /// of being queued as events.
     pub fn set_migration_handler(&mut self, handler: Arc<MigrationSubprotocolHandler>) {
         self.migration_handler = Some(handler);
+    }
+
+    /// Block packets from/to a peer address (simulates network partition).
+    pub fn block_peer(&self, addr: SocketAddr) {
+        self.partition_filter.insert(addr);
+    }
+
+    /// Unblock a peer address (simulates partition healing).
+    pub fn unblock_peer(&self, addr: &SocketAddr) {
+        self.partition_filter.remove(addr);
+    }
+
+    /// Check if a peer is blocked.
+    pub fn is_blocked(&self, addr: &SocketAddr) -> bool {
+        self.partition_filter.contains(addr)
     }
 
     /// Number of connected peers.
@@ -399,6 +426,7 @@ impl MeshNode {
             num_shards: self.config.num_shards,
             migration_handler: self.migration_handler.clone(),
             socket: self.socket.clone(),
+            partition_filter: self.partition_filter.clone(),
         };
 
         tokio::spawn(async move {
@@ -433,6 +461,11 @@ impl MeshNode {
     /// - Heartbeat packets update the failure detector
     /// - Data packets are decrypted if local, forwarded if not
     fn dispatch_packet(data: Bytes, source: SocketAddr, ctx: &DispatchCtx) {
+        // Partition filter: silently drop packets from blocked peers
+        if ctx.partition_filter.contains(&source) {
+            return;
+        }
+
         let local_node_id = ctx.local_node_id;
         let peers = &ctx.peers;
         let router = &ctx.router;
@@ -516,11 +549,7 @@ impl MeshNode {
     ///
     /// This is the same logic as `NetAdapter::process_packet` but extracted
     /// to work with the multi-session dispatch.
-    fn process_local_packet(
-        parsed: &ParsedPacket,
-        session: &NetSession,
-        ctx: &DispatchCtx,
-    ) {
+    fn process_local_packet(parsed: &ParsedPacket, session: &NetSession, ctx: &DispatchCtx) {
         let inbound = &ctx.inbound;
         let num_shards = ctx.num_shards;
         // Validate payload length
@@ -583,8 +612,8 @@ impl MeshNode {
                                     let pool = dest_sess.thread_local_pool();
                                     let mut builder = pool.get();
                                     let seq = {
-                                        let stream =
-                                            dest_sess.get_or_create_stream(SUBPROTOCOL_MIGRATION as u64);
+                                        let stream = dest_sess
+                                            .get_or_create_stream(SUBPROTOCOL_MIGRATION as u64);
                                         stream.next_tx_seq()
                                     };
                                     let events = vec![payload];
@@ -643,14 +672,18 @@ impl MeshNode {
         let interval = self.config.heartbeat_interval;
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
+        let partition_filter = self.partition_filter.clone();
 
         tokio::spawn(async move {
             while !shutdown.load(Ordering::Acquire) {
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
-                        // Send heartbeat to all peers
                         for entry in peers.iter() {
                             let peer_addr = *entry.key();
+                            // Skip blocked peers (partition simulation)
+                            if partition_filter.contains(&peer_addr) {
+                                continue;
+                            }
                             let session = &entry.value().session;
                             let mut builder =
                                 PacketBuilder::new(&[0u8; 32], session.session_id());
@@ -672,6 +705,11 @@ impl MeshNode {
         peer_addr: SocketAddr,
         batch: Batch,
     ) -> Result<(), AdapterError> {
+        // Partition filter: silently drop sends to blocked peers
+        if self.partition_filter.contains(&peer_addr) {
+            return Ok(());
+        }
+
         let peer = self
             .peers
             .get(&peer_addr)
@@ -856,6 +894,10 @@ impl MeshNode {
         subprotocol_id: u16,
         payload: &[u8],
     ) -> Result<(), AdapterError> {
+        if self.partition_filter.contains(&peer_addr) {
+            return Ok(());
+        }
+
         let peer = self
             .peers
             .get(&peer_addr)
@@ -873,13 +915,8 @@ impl MeshNode {
         };
 
         let events = vec![Bytes::copy_from_slice(payload)];
-        let packet = builder.build_subprotocol(
-            stream_id,
-            seq,
-            &events,
-            PacketFlags::NONE,
-            subprotocol_id,
-        );
+        let packet =
+            builder.build_subprotocol(stream_id, seq, &events, PacketFlags::NONE, subprotocol_id);
 
         self.socket
             .send_to(&packet, peer_addr)

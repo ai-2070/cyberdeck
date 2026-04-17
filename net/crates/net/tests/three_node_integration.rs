@@ -2440,27 +2440,32 @@ async fn test_mesh_node_reroute_on_failure() {
         tokio::time::sleep(Duration::from_millis(50)).await;
         a.connect(addr_b, &pub_b, nid_b).await
     });
-    r1.unwrap(); r2.unwrap();
+    r1.unwrap();
+    r2.unwrap();
 
     // A↔C
     let (r1, r2) = tokio::join!(c.accept(nid_a), async {
         tokio::time::sleep(Duration::from_millis(50)).await;
         a.connect(addr_c, &pub_c, nid_c).await
     });
-    r1.unwrap(); r2.unwrap();
+    r1.unwrap();
+    r2.unwrap();
 
     // B↔C (so B could forward — but B will die)
     let (r1, r2) = tokio::join!(c.accept(nid_b), async {
         tokio::time::sleep(Duration::from_millis(50)).await;
         b.connect(addr_c, &pub_c, nid_c).await
     });
-    r1.unwrap(); r2.unwrap();
+    r1.unwrap();
+    r2.unwrap();
 
     // Route to C goes through B initially
     a.router().add_route(nid_c, addr_b);
     b.router().add_route(nid_c, addr_c);
 
-    a.start(); b.start(); c.start();
+    a.start();
+    b.start();
+    c.start();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Phase 1: A sends to C via B — works
@@ -2496,14 +2501,11 @@ async fn test_mesh_node_reroute_on_failure() {
     );
 
     // Verify the rerouted events have the correct tag
-    let has_rerouted = c_after
-        .events
-        .iter()
-        .any(|e| {
-            e.parse()
-                .map(|v: serde_json::Value| v["tag"] == "after_reroute")
-                .unwrap_or(false)
-        });
+    let has_rerouted = c_after.events.iter().any(|e| {
+        e.parse()
+            .map(|v: serde_json::Value| v["tag"] == "after_reroute")
+            .unwrap_or(false)
+    });
     assert!(has_rerouted, "C should have events tagged 'after_reroute'");
 
     a.shutdown().await.unwrap();
@@ -2549,21 +2551,26 @@ async fn test_mesh_node_reroute_no_data_loss() {
         tokio::time::sleep(Duration::from_millis(50)).await;
         a.connect(addr_b, &pub_b, nid_b).await
     });
-    r1.unwrap(); r2.unwrap();
+    r1.unwrap();
+    r2.unwrap();
     let (r1, r2) = tokio::join!(c.accept(nid_a), async {
         tokio::time::sleep(Duration::from_millis(50)).await;
         a.connect(addr_c, &pub_c, nid_c).await
     });
-    r1.unwrap(); r2.unwrap();
+    r1.unwrap();
+    r2.unwrap();
     let (r1, r2) = tokio::join!(c.accept(nid_b), async {
         tokio::time::sleep(Duration::from_millis(50)).await;
         b.connect(addr_c, &pub_c, nid_c).await
     });
-    r1.unwrap(); r2.unwrap();
+    r1.unwrap();
+    r2.unwrap();
 
     a.router().add_route(nid_c, addr_b);
     b.router().add_route(nid_c, addr_c);
-    a.start(); b.start(); c.start();
+    a.start();
+    b.start();
+    c.start();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Send 10 events via relay
@@ -2623,14 +2630,14 @@ async fn test_mesh_node_reroute_no_data_loss() {
 // Phase 3: Migration over wire
 // ============================================================================
 
-use net::adapter::net::{
-    DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, MeshDaemon,
-    MigrationOrchestrator, MigrationPhase, MigrationSourceHandler, MigrationTargetHandler,
-    MigrationSubprotocolHandler, MigrationMessage, SUBPROTOCOL_MIGRATION,
-};
+use net::adapter::net::behavior::capability::CapabilityFilter;
 use net::adapter::net::compute::orchestrator::wire as migration_wire;
 use net::adapter::net::state::causal::CausalEvent;
-use net::adapter::net::behavior::capability::CapabilityFilter;
+use net::adapter::net::{
+    DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, MeshDaemon, MigrationMessage,
+    MigrationOrchestrator, MigrationPhase, MigrationSourceHandler, MigrationSubprotocolHandler,
+    MigrationTargetHandler, SUBPROTOCOL_MIGRATION,
+};
 
 /// Simple stateful daemon for migration testing.
 struct CounterDaemon {
@@ -2708,7 +2715,10 @@ async fn test_migration_snapshot_over_wire() {
     let source_b = Arc::new(MigrationSourceHandler::new(registry_b.clone()));
     let target_b = Arc::new(MigrationTargetHandler::new(registry_b.clone()));
     let handler_b = Arc::new(MigrationSubprotocolHandler::new(
-        orchestrator_b, source_b.clone(), target_b, nid_b,
+        orchestrator_b,
+        source_b.clone(),
+        target_b,
+        nid_b,
     ));
 
     let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
@@ -2721,7 +2731,8 @@ async fn test_migration_snapshot_over_wire() {
         tokio::time::sleep(Duration::from_millis(50)).await;
         node_a.connect(addr_b, &pub_b, nid_b).await
     });
-    r1.unwrap(); r2.unwrap();
+    r1.unwrap();
+    r2.unwrap();
 
     node_a.start();
     node_b.start();
@@ -2831,16 +2842,20 @@ async fn test_migration_full_lifecycle_over_wire() {
         tokio::time::sleep(Duration::from_millis(50)).await;
         node_a.connect(addr_b, &pub_b, nid_b).await
     });
-    r1.unwrap(); r2.unwrap();
+    r1.unwrap();
+    r2.unwrap();
 
     // Connect A↔C (needed for orchestrator to route SnapshotReady to target)
     let (r1, r2) = tokio::join!(node_c.accept(nid_a), async {
         tokio::time::sleep(Duration::from_millis(50)).await;
         node_a.connect(addr_c, &pub_c, nid_c).await
     });
-    r1.unwrap(); r2.unwrap();
+    r1.unwrap();
+    r2.unwrap();
 
-    node_a.start(); node_b.start(); node_c.start();
+    node_a.start();
+    node_b.start();
+    node_c.start();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Start migration on orchestrator (remote source at B, target at C)
@@ -2864,7 +2879,10 @@ async fn test_migration_full_lifecycle_over_wire() {
 
     // Verify B processed TakeSnapshot
     let source_check = source_b.start_snapshot(daemon_origin, 0x9999);
-    assert!(source_check.is_err(), "B should have processed TakeSnapshot");
+    assert!(
+        source_check.is_err(),
+        "B should have processed TakeSnapshot"
+    );
 
     // Verify A's orchestrator advanced past Snapshot
     let phase = orch_a.status(daemon_origin);
@@ -2879,6 +2897,292 @@ async fn test_migration_full_lifecycle_over_wire() {
         "orchestrator should have advanced past Snapshot (got {:?}). \
          SnapshotReady was received and processed over wire.",
         phase
+    );
+
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+    node_c.shutdown().await.unwrap();
+}
+
+// ============================================================================
+// Phase 4: Partition simulation
+// ============================================================================
+
+/// 8.1 — Partition: block traffic between A and B, verify detection.
+///
+/// A and B are connected. A blocks B's address via PartitionFilter.
+/// Heartbeats stop. A's failure detector marks B as failed.
+/// Proves partition simulation works through the MeshNode runtime.
+#[tokio::test]
+async fn test_partition_detection_via_filter() {
+    let ports = find_ports(2).await;
+    let psk = [0x42u8; 32];
+
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_millis(500))
+    };
+
+    let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let pub_b = *node_b.public_key();
+
+    let (r1, r2) = tokio::join!(node_b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    node_a.start();
+    node_b.start();
+
+    // Verify healthy
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(node_a.failure_detector().status(nid_b), NodeStatus::Healthy);
+
+    // Partition: A blocks B
+    node_a.block_peer(addr_b);
+    assert!(node_a.is_blocked(&addr_b));
+
+    // Wait for heartbeats to time out
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    node_a.failure_detector().check_all();
+
+    let status = node_a.failure_detector().status(nid_b);
+    assert!(
+        status == NodeStatus::Failed || status == NodeStatus::Suspected,
+        "A should detect B as failed during partition, got {:?}",
+        status
+    );
+
+    // Data should be silently dropped during partition
+    let batch = make_batch(0, 5, "during_partition");
+    node_a.send_to_peer(addr_b, batch).await.unwrap(); // succeeds silently
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let b_events = node_b.poll_shard(0, None, 100).await.unwrap();
+    // B might have events from before the partition but none tagged "during_partition"
+    let partition_events: Vec<_> = b_events
+        .events
+        .iter()
+        .filter(|e| {
+            e.parse()
+                .map(|v: serde_json::Value| v["tag"] == "during_partition")
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(
+        partition_events.len(),
+        0,
+        "B should not receive events sent during partition"
+    );
+
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+}
+
+/// 8.2 — Partition healing: unblock traffic, verify recovery.
+///
+/// A blocks B, then unblocks. After unblocking, heartbeats resume
+/// and A can send events to B again.
+#[tokio::test]
+async fn test_partition_healing() {
+    let ports = find_ports(2).await;
+    let psk = [0x42u8; 32];
+
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_millis(500))
+    };
+
+    let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let pub_b = *node_b.public_key();
+
+    let (r1, r2) = tokio::join!(node_b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    node_a.start();
+    node_b.start();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Partition
+    node_a.block_peer(addr_b);
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // Heal
+    node_a.unblock_peer(&addr_b);
+    assert!(!node_a.is_blocked(&addr_b));
+
+    // Wait for heartbeats to resume (B is still sending heartbeats;
+    // A was blocking them. Once unblocked, A will receive B's next heartbeat
+    // and the failure detector will recover B to Healthy.)
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // B sends heartbeats from its loop → A receives → failure_detector.heartbeat()
+    let status = node_a.failure_detector().status(nid_b);
+    assert_eq!(
+        status,
+        NodeStatus::Healthy,
+        "B should recover to Healthy after partition heals, got {:?}",
+        status
+    );
+
+    // Data should flow again
+    let batch = make_batch(0, 10, "after_healing");
+    node_a.send_to_peer(addr_b, batch).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let b_events = node_b.poll_shard(0, None, 100).await.unwrap();
+    let healed_events: Vec<_> = b_events
+        .events
+        .iter()
+        .filter(|e| {
+            e.parse()
+                .map(|v: serde_json::Value| v["tag"] == "after_healing")
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        !healed_events.is_empty(),
+        "B should receive events after partition heals"
+    );
+
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+}
+
+/// 8.3 — Three-node partition: A isolated from B and C.
+///
+/// A blocks both B and C. B and C can still communicate with each other.
+/// Proves asymmetric partition — one node isolated, the other two unaffected.
+#[tokio::test]
+async fn test_partition_asymmetric_three_node() {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_secs(5))
+    };
+
+    let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let node_c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let pub_b = *node_b.public_key();
+    let pub_c = *node_c.public_key();
+
+    // A↔B, A↔C, B↔C
+    let (r1, r2) = tokio::join!(node_b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    let (r1, r2) = tokio::join!(node_c.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    let (r1, r2) = tokio::join!(node_c.accept(nid_b), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_b.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    node_a.start();
+    node_b.start();
+    node_c.start();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Partition: A is isolated (blocks both B and C)
+    node_a.block_peer(addr_b);
+    node_a.block_peer(addr_c);
+    // Also block A on B and C side (partition is bidirectional)
+    node_b.block_peer(addr_a);
+    node_c.block_peer(addr_a);
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // B→C should still work (they're on the same side of the partition)
+    let batch = make_batch(0, 10, "b_to_c_during_partition");
+    node_b.send_to_peer(addr_c, batch).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let c_events = node_c.poll_shard(0, None, 100).await.unwrap();
+    let bc_events: Vec<_> = c_events
+        .events
+        .iter()
+        .filter(|e| {
+            e.parse()
+                .map(|v: serde_json::Value| v["tag"] == "b_to_c_during_partition")
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        !bc_events.is_empty(),
+        "B→C should work during A's partition, got {} events",
+        bc_events.len()
+    );
+
+    // A→B should be blocked
+    let batch = make_batch(0, 5, "a_to_b_blocked");
+    node_a.send_to_peer(addr_b, batch).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let b_events = node_b.poll_shard(0, None, 100).await.unwrap();
+    let blocked_events: Vec<_> = b_events
+        .events
+        .iter()
+        .filter(|e| {
+            e.parse()
+                .map(|v: serde_json::Value| v["tag"] == "a_to_b_blocked")
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(
+        blocked_events.len(),
+        0,
+        "A→B should be blocked during partition"
     );
 
     node_a.shutdown().await.unwrap();
