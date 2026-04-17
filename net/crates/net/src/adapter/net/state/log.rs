@@ -166,16 +166,21 @@ impl EntityLog {
         if seq > self.snapshot_seq {
             self.snapshot_seq = seq;
         }
-        // Update base_link to the new first remaining event, or to the last
-        // pruned event's link if everything was removed (so the next append
-        // can still chain correctly).
-        if let Some(first) = self.events.first() {
-            self.base_link = first.link;
-        } else if let Some((link, payload)) = last_pruned {
-            self.base_link = link;
-            self.head_payload = payload;
+        // Update base_link (used as fallback when events is empty) and
+        // head_payload (used for chain validation of the next append).
+        //
+        // When events remain: head_payload is already correct — it tracks
+        // the last event's payload (set during append), and partial pruning
+        // only removes from the front. We don't need to update it.
+        //
+        // When all events are removed: set base_link and head_payload to
+        // the last pruned event so the next append can chain correctly.
+        if self.events.is_empty() {
+            if let Some((link, payload)) = last_pruned {
+                self.base_link = link;
+                self.head_payload = payload;
+            }
         }
-        // If nothing was pruned and nothing remains, base_link stays as-is.
     }
 
     /// Get the snapshot sequence (events before this have been pruned).

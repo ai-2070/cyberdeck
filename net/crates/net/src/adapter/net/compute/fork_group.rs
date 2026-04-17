@@ -399,6 +399,8 @@ mod tests {
         index.index(CapabilityAnnouncement::new(0x1111, 1, CapabilitySet::new()));
         index.index(CapabilityAnnouncement::new(0x2222, 1, CapabilitySet::new()));
         index.index(CapabilityAnnouncement::new(0x3333, 1, CapabilitySet::new()));
+        index.index(CapabilityAnnouncement::new(0x4444, 1, CapabilitySet::new()));
+        index.index(CapabilityAnnouncement::new(0x5555, 1, CapabilitySet::new()));
         Scheduler::new(index, 0x1111, CapabilitySet::new())
     }
 
@@ -638,5 +640,25 @@ mod tests {
             .map(|r| r.forked_origin)
             .collect();
         assert_eq!(forked.len(), 5);
+    }
+
+    #[test]
+    fn test_regression_spread_rejects_when_all_nodes_excluded() {
+        // Regression: place_with_spread used to silently fall back to an
+        // excluded node when all candidates were in the exclusion set,
+        // defeating the spread constraint.
+        let index = Arc::new(CapabilityIndex::new());
+        index.index(CapabilityAnnouncement::new(0x1111, 1, CapabilitySet::new()));
+        let sched = Scheduler::new(index, 0x1111, CapabilitySet::new());
+
+        let mut exclude = HashSet::new();
+        exclude.insert(0x1111); // exclude the only node
+
+        let result =
+            GroupCoordinator::place_with_spread(&sched, &CapabilityFilter::default(), &exclude);
+        assert!(
+            result.is_err(),
+            "must fail when all candidate nodes are excluded"
+        );
     }
 }

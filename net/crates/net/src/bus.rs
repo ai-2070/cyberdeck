@@ -501,6 +501,12 @@ impl EventBus {
             backoff = (backoff * 2).min(Duration::from_millis(10));
         }
 
+        // Ring buffers are empty, but events may still be in-flight in the
+        // drain→batch worker pipeline (mpsc channels, pending batches).
+        // Wait for the batch workers' max_delay to ensure any pending batch
+        // has been flushed to the adapter before we call adapter.flush().
+        tokio::time::sleep(self.config.batch.max_delay).await;
+
         self.adapter.flush().await
     }
 

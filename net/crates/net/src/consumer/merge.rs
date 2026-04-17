@@ -272,29 +272,47 @@ impl PollMerger {
 
         // Build the final cursor.
         //
-        // When filtering is active, use `new_cursor` (fetched positions) as the
-        // base so that shards whose events were entirely filtered out still
-        // advance past those events — preventing infinite re-fetch loops.
+        // With filtering: start from `new_cursor` (fetched positions) so shards
+        // whose events were entirely filtered out advance past them. Then
+        // override with the last *returned* event per shard — this prevents
+        // skipping matching events that were fetched but truncated by the limit.
         //
-        // When there is no filter, use the original `cursor` as the base so
-        // that shards with no returned events (due to truncation/limit) don't
-        // skip ahead to the fetched position.
+        // Trade-off: the override can move a shard's cursor backward from the
+        // fetched position to the last returned (matching) event. This causes
+        // non-matching events between the last match and the fetch boundary to
+        // be re-fetched on the next poll. This is bounded and terminates:
+        // on the re-fetch, those events are filtered out again, no returned
+        // events override the cursor, so `new_cursor` advances past them.
+        // At most one extra fetch per shard per poll cycle.
+        //
+        // The alternative (keeping `new_cursor` without override) would skip
+        // matching events that were over-fetched but not returned due to the
+        // limit — a correctness violation.
+        //
+        // Without filtering: start from the original `cursor` so shards with
+        // no returned events (due to limit truncation) don't skip ahead.
         let mut final_cursor = if request.filter.is_some() {
             new_cursor.clone()
         } else {
             cursor.clone()
         };
-        // Override with the position of the last *returned* event per shard,
-        // so we don't skip over-fetched events that weren't returned.
         for event in &all_events {
             final_cursor.set(event.shard_id, event.id.clone());
         }
 
-        let has_more = any_has_more || had_extra;
-        let next_id = if all_events.is_empty() {
-            None
-        } else {
+        let cursor_advanced = final_cursor.positions != cursor.positions;
+        // When filtering removed everything but we did advance past fetched
+        // events, signal has_more so the caller keeps polling forward.
+        let all_filtered = request.filter.is_some() && all_events.is_empty() && cursor_advanced;
+        let has_more = any_has_more || had_extra || all_filtered;
+        // Return the cursor even when all events were filtered out, so the
+        // caller advances past the filtered region instead of re-fetching
+        // the same events forever. The cursor is None only when nothing was
+        // fetched at all (truly empty shards).
+        let next_id = if !all_events.is_empty() || cursor_advanced {
             Some(final_cursor.encode())
+        } else {
+            None
         };
 
         Ok(ConsumeResponse {
@@ -1302,5 +1320,36 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), 100, "Should have no duplicate events");
+    }
+
+    #[tokio::test]
+    async fn test_regression_all_events_filtered_returns_cursor() {
+        // Regression: when every fetched event was filtered out, next_id was
+        // None, leaving the caller stuck re-fetching the same events forever.
+        let adapter = Arc::new(MockAdapter::new());
+
+        // Only non-matching events
+        adapter.add_events(
+            0,
+            vec![
+                StoredEvent::from_value("0-1".to_string(), json!({"type": "noise"}), 100, 0),
+                StoredEvent::from_value("0-2".to_string(), json!({"type": "noise"}), 200, 0),
+            ],
+        );
+
+        let merger = PollMerger::new(adapter, 1);
+        let filter = Filter::eq("type", json!("signal"));
+
+        let response = merger
+            .poll(ConsumeRequest::new(100).filter(filter))
+            .await
+            .unwrap();
+
+        // No events match, but cursor must still advance
+        assert!(response.events.is_empty());
+        assert!(
+            response.next_id.is_some(),
+            "cursor must advance past filtered events even when none match"
+        );
     }
 }
