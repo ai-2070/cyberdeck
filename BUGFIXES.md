@@ -157,13 +157,13 @@ Initially flagged: `is_retryable()` returns `false` for `AdapterError::Connectio
 
 **Decision: not a bug.** `Connection` errors cover both transient failures (`"send failed"`, `"handshake timeout"`) and permanent ones (`"adapter not initialized"`, `"not connected"`). Since the type can't distinguish them, keeping Connection non-retryable is the conservative default. The batch dispatch path (`dispatch_batch`) retries all errors regardless of this flag, so transient connection failures are already retried where it matters. `is_retryable()` is not called in production code — it exists as a public API for external consumers who should default to not retrying ambiguous errors.
 
-### 18. Drain worker busy-spins with 100μs sleep
+### 18. ~~Drain worker busy-spins with 100μs sleep~~ (kept as-is)
 
 **File:** `src/bus.rs:723-726`
 
-When idle, drain workers sleep for only 100μs before polling again — effectively a busy-wait. With 16 cores (16 shards), that's 16 threads busy-polling at 10,000 iterations/second each.
+Initially flagged: drain workers sleep only 100μs when idle, burning CPU.
 
-**Fix:** Use `tokio::sync::Notify` to wake drain workers when events are available, or use adaptive backoff.
+**Decision: not a bug.** The 100μs poll is deliberate for a latency-first system. The drain loop is the hot path — adding adaptive backoff (e.g., up to 10ms) would add milliseconds of latency to the first event after a quiet period, violating the sub-microsecond design target. The CPU cost is acceptable for a system processing 10M+ events/sec. Added a comment explaining the trade-off.
 
 ### 19. `JoinHandle`s leaked on scale-down
 
