@@ -168,6 +168,16 @@ What moved wasn't a copy. It was the thing itself, carried across.
 
 A factory controller hops from a dying edge box to a healthy one mid-shift. An inference daemon follows its user from laptop to desktop as they move through the day. A trading agent migrates to a node closer to the exchange without dropping a single tick.
 
+Migration is 1:1 — one entity, one destination. But the same machinery composes into other patterns.
+
+A daemon that needs horizontal scale becomes a replica group — N interchangeable copies with deterministic identity, load-balanced across the mesh. Each replica has its own causal chain. Any can fail and be re-spawned with the same identity on a different node. No state to transfer, no migration protocol — just spawn a fresh copy with the same cryptographic seed. The mesh routes around the gap before the next event arrives.
+
+A daemon that needs to diverge becomes a fork group — N independent entities with documented lineage. Each fork carries a cryptographic sentinel linking its chain back to the parent at the fork point. Any node on the mesh can verify the lineage by recomputing the sentinel. The forks are siblings, not clones. They share a past but not a future.
+
+A daemon that needs fault tolerance without duplicate work becomes a standby group — one active, N-1 idle. The active processes events. The standbys hold readiness. Periodic snapshots capture how far each standby is synced. When the active dies, the standby with the most recent snapshot promotes and replays the gap — the same replay mechanism migration uses. Zero wasted compute. The standbys are warm, not hot.
+
+All three patterns compose with migration. Any member of any group is a normal daemon in the registry. Mikoshi can move it without knowing it belongs to a group. The group coordinates. The mesh routes. The daemon doesn't know the difference.
+
 ## Invariants
 
 **Identity.** A node is its keypair. Every node has a long-lived cryptographic identity - the public key is the node ID, the private key is the authority to act as that node. Identity is cryptographic, not topological. A node can roam across networks, change IPs, traverse NAT, switch interfaces, and remain the same node. All communication is authenticated against this identity, independent of network location.
