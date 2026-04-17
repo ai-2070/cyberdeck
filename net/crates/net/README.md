@@ -76,7 +76,7 @@ For the design philosophy, architecture rationale, and benchmarks, see the [proj
 | **Behavior Plane** | Capability announcements & indexing, capability diffs, node metadata, API schema registry, device autonomy rules, context fabric (distributed tracing), load balancing, proximity graph, safety envelope enforcement | [BEHAVIOR.md](docs/BEHAVIOR.md) |
 | **Subnets & Hierarchy** | 4-level subnet hierarchy (8/8/8/8 encoding), label-based assignment, gateway visibility enforcement | [SUBNETS.md](docs/SUBNETS.md) |
 | **Distributed State** | 24-byte causal links, compressed observed horizons, append-only entity logs with chain validation, state snapshots for migration | [STATE.md](docs/STATE.md) |
-| **Compute Runtime** | MeshDaemon trait, daemon hosting with causal chain production, capability-based placement, 6-phase migration with orchestrator/source/target handlers, snapshot chunking, capability-driven target discovery, N-way replica groups with load-balanced routing and auto-replacement | [COMPUTE.md](docs/COMPUTE.md) |
+| **Compute Runtime** | MeshDaemon trait, daemon hosting, capability-based placement, 6-phase migration with snapshot chunking, N-way replica groups, fork groups with verifiable lineage, shared group coordination with LB routing | [COMPUTE.md](docs/COMPUTE.md) |
 | **Subprotocols** | Formal protocol registry, version negotiation, capability-aware routing via tags, opaque forwarding guarantee, migration message dispatch | [SUBPROTOCOLS.md](docs/SUBPROTOCOLS.md) |
 | **Observational Continuity** | Causal cones, propagation modeling, continuity proofs, honest discontinuity with deterministic forking, superposition during migration | [CONTINUITY.md](docs/CONTINUITY.md) |
 | **Contested Environments** | Correlated failure detection, subnet-aware partition classification, partition healing with log reconciliation | [CONTESTED.md](docs/CONTESTED.md) |
@@ -175,7 +175,7 @@ Benchmarked on Apple M1 Max, macOS.
 
 Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns.
 
-769 tests. ~840 KB deployed binary.
+782 tests. ~840 KB deployed binary.
 
 ## Capabilities
 
@@ -288,6 +288,8 @@ The daemon's causal chain continues unbroken on the new host. During migration, 
 
 For daemons that need horizontal scale rather than mobility, `ReplicaGroup` manages N copies as a logical unit. Each replica gets a deterministic identity derived from `group_seed + index` — the same index always produces the same keypair, making replacement idempotent. The group load-balances inbound events across replicas (round-robin, least-connections, consistent hash — any `LoadBalancer` strategy), tracks group-level health (alive as long as one replica is healthy), and spreads placement across nodes for failure-domain isolation. When a node fails, the group re-spawns the affected replicas on new nodes with the same deterministic identity — no migration protocol needed for stateless daemons. Scaling is `scale_to(n)`: scale up appends new replicas, scale down removes the highest-index ones deterministically.
 
+For daemons that need to diverge rather than replicate, `ForkGroup` creates N independent entities forked from a common parent. Each fork has a `ForkRecord` with a cryptographically verifiable sentinel hash linking back to the parent's causal chain at the fork point. Unlike replicas (interchangeable, arbitrary identity), forks are independent entities with documented lineage — any node can verify the fork by recomputing the sentinel. Fork keypairs are stored for recovery on failure, preserving identity across re-spawns. Both group types share coordination logic via `GroupCoordinator` — load balancing, health tracking, routing, and scaling work identically. A fork is also a normal daemon in the `DaemonRegistry`, so MIKOSHI can migrate it without knowing it's a fork.
+
 ## Safety & Autonomy
 
 Every node enforces its own rules. The `SafetyEnforcer` evaluates a `ResourceEnvelope` that defines:
@@ -363,12 +365,14 @@ src/adapter/net/
 │
 ├── compute/               # Layer 5 — Compute Runtime
 │   ├── daemon.rs          #   MeshDaemon trait
-│   ├── host.rs            #   DaemonHost runtime, from_snapshot() restore
+│   ├── host.rs            #   DaemonHost runtime, from_snapshot(), from_fork()
 │   ├── migration.rs       #   MigrationState, MigrationPhase, 6-phase state machine
 │   ├── orchestrator.rs    #   MigrationOrchestrator, wire protocol, snapshot chunking
 │   ├── migration_source.rs #  Source-side: snapshot, buffer, cutover, cleanup
 │   ├── migration_target.rs #  Target-side: restore, replay, activate
-│   ├── replica_group.rs   #   ReplicaGroup, N-way replication with LB routing
+│   ├── group_coord.rs     #   GroupCoordinator, shared LB/health/routing
+│   ├── replica_group.rs   #   ReplicaGroup, N-way replication, deterministic identity
+│   ├── fork_group.rs      #   ForkGroup, N-way forking, verifiable lineage
 │   ├── registry.rs        #   DaemonRegistry
 │   └── scheduler.rs       #   Capability-based placement, migration target discovery
 │
@@ -572,10 +576,10 @@ cargo build --release --all-features
 ## Tests
 
 ```bash
-# Unit tests (743 tests)
+# Unit tests (751 tests)
 cargo test --lib --features net
 
-# Migration integration tests (26 tests)
+# Migration & group integration tests (31 tests)
 cargo test --test migration_integration --features net
 
 # Integration (requires running services)
