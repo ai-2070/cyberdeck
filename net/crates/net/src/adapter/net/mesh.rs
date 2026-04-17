@@ -274,11 +274,11 @@ impl MeshNode {
             ProximityConfig::default(),
         ));
 
-        // Create reroute policy that watches failure detector
-        let reroute_policy = Arc::new(ReroutePolicy::new(
-            router.routing_table().clone(),
-            peer_addrs.clone(),
-        ));
+        // Create reroute policy with proximity graph for topology-aware alternates
+        let reroute_policy = Arc::new(
+            ReroutePolicy::new(router.routing_table().clone(), peer_addrs.clone())
+                .with_proximity_graph(proximity_graph.clone()),
+        );
 
         // Wire failure detector with reroute callbacks
         let rp_failure = reroute_policy.clone();

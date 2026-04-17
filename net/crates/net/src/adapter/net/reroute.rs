@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 
+use super::behavior::proximity::ProximityGraph;
 use super::route::RoutingTable;
 
 /// Saved original route before reroute, for recovery.
@@ -38,12 +39,26 @@ pub struct ReroutePolicy {
     routing_table: Arc<RoutingTable>,
     /// Connected peers (node_id → addr mapping)
     peer_addrs: Arc<DashMap<u64, SocketAddr>>,
+    /// Proximity graph for multi-hop alternate selection
+    proximity_graph: Option<Arc<ProximityGraph>>,
     /// Saved original routes for recovery (dest_node_id → saved route)
     saved_routes: DashMap<u64, SavedRoute>,
     /// Total reroutes performed
     pub reroute_count: AtomicU64,
     /// Total recoveries performed
     pub recovery_count: AtomicU64,
+}
+
+/// Convert a u64 node_id to a 32-byte graph NodeId.
+fn node_id_to_graph_id(node_id: u64) -> [u8; 32] {
+    let mut id = [0u8; 32];
+    id[0..8].copy_from_slice(&node_id.to_le_bytes());
+    id
+}
+
+/// Extract u64 node_id from a 32-byte graph NodeId.
+fn graph_id_to_node_id(id: &[u8; 32]) -> u64 {
+    u64::from_le_bytes(id[0..8].try_into().unwrap())
 }
 
 impl ReroutePolicy {
@@ -55,10 +70,17 @@ impl ReroutePolicy {
         Self {
             routing_table,
             peer_addrs,
+            proximity_graph: None,
             saved_routes: DashMap::new(),
             reroute_count: AtomicU64::new(0),
             recovery_count: AtomicU64::new(0),
         }
+    }
+
+    /// Set the proximity graph for multi-hop alternate selection.
+    pub fn with_proximity_graph(mut self, graph: Arc<ProximityGraph>) -> Self {
+        self.proximity_graph = Some(graph);
+        self
     }
 
     /// Called when the failure detector marks a peer as failed.
@@ -73,18 +95,6 @@ impl ReroutePolicy {
             None => return, // unknown node, nothing to reroute
         };
 
-        // Find an alternate peer (any peer that isn't the failed one)
-        let alternate = self
-            .peer_addrs
-            .iter()
-            .find(|e| *e.key() != failed_node_id)
-            .map(|e| (*e.key(), *e.value()));
-
-        let (_alt_node_id, alt_addr) = match alternate {
-            Some(a) => a,
-            None => return, // no alternates available
-        };
-
         // Find all routes whose next-hop is the failed peer
         let affected: Vec<u64> = self
             .routing_table
@@ -97,6 +107,23 @@ impl ReroutePolicy {
         if affected.is_empty() {
             return;
         }
+
+        // Find an alternate. Try the proximity graph first (topology-aware,
+        // picks the nearest node that can reach each destination), then
+        // fall back to any direct peer.
+        let alt_addr = self
+            .find_graph_alternate(failed_node_id, &affected)
+            .or_else(|| {
+                self.peer_addrs
+                    .iter()
+                    .find(|e| *e.key() != failed_node_id)
+                    .map(|e| *e.value())
+            });
+
+        let alt_addr = match alt_addr {
+            Some(a) => a,
+            None => return, // no alternates
+        };
 
         // Reroute each affected destination through the alternate
         for dest_id in &affected {
@@ -119,6 +146,66 @@ impl ReroutePolicy {
             "auto-rerouted {} routes away from failed peer",
             affected.len()
         );
+    }
+
+    /// Called when the failure detector marks a peer as recovered.
+    ///
+    /// Find an alternate via the proximity graph.
+    ///
+    /// For each affected destination, queries `path_to(dest)`. If a path
+    /// exists that doesn't go through the failed node, the first hop of
+    /// that path becomes the alternate. Falls back to the best-scored
+    /// node if no path is found.
+    ///
+    /// Returns the address of the best alternate, or None if the graph
+    /// has no suggestions.
+    fn find_graph_alternate(
+        &self,
+        failed_node_id: u64,
+        affected_dests: &[u64],
+    ) -> Option<SocketAddr> {
+        let graph = self.proximity_graph.as_ref()?;
+
+        for dest_id in affected_dests {
+            let dest_graph_id = node_id_to_graph_id(*dest_id);
+
+            // Try path_to — returns a Vec<NodeId> from self to dest
+            if let Some(path) = graph.path_to(&dest_graph_id) {
+                // path[0] is self, path[1] is the first hop
+                if path.len() >= 2 {
+                    let first_hop = graph_id_to_node_id(&path[1]);
+                    // Skip if the first hop IS the failed node
+                    if first_hop != failed_node_id {
+                        if let Some(addr) = self.peer_addrs.get(&first_hop) {
+                            return Some(*addr);
+                        }
+                    }
+                    // If path has 3+ hops, try the second hop
+                    if path.len() >= 3 {
+                        let second_hop = graph_id_to_node_id(&path[2]);
+                        if second_hop != failed_node_id {
+                            if let Some(addr) = self.peer_addrs.get(&second_hop) {
+                                return Some(*addr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: pick the best-scored node from the graph that we have
+        // a direct connection to and that isn't the failed node
+        let all_nodes = graph.all_nodes();
+        for node in &all_nodes {
+            let nid = graph_id_to_node_id(&node.node_id);
+            if nid != failed_node_id && nid != 0 {
+                if let Some(addr) = self.peer_addrs.get(&nid) {
+                    return Some(*addr);
+                }
+            }
+        }
+
+        None
     }
 
     /// Called when the failure detector marks a peer as recovered.
