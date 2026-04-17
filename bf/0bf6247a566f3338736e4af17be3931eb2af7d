@@ -1,0 +1,66 @@
+net/crates/net/tests/migration_integration.rs
+  d9a8d3823a75929a 349,397,443,485,780,885,949,1116
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  d9a8d3823a75929a 123-135,154,160,195-200,203,210,213,215,218,225,1071,1094,1208,1229,1266,1286-1303
+net/crates/net/src/adapter/net/subprotocol/migration_handler.rs
+  d9a8d3823a75929a 89,118,134,157,177,190,225,321,344
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "bf0bf6247a566f3338736e4af17be3931eb2af7d",
+  "prompts": {
+    "3071c7a8ff01afaf": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f7c44da2-5ca7-4b12-a72f-21f53a63e261",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 98,
+      "total_deletions": 0,
+      "accepted_lines": 58,
+      "overriden_lines": 0
+    },
+    "47d9ae1cad5453fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "07dfa6f4-729c-48d6-9e4d-4a4191544e39",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 784,
+      "overriden_lines": 0
+    },
+    "d37b393023401171": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8de24b1d-4937-4e8f-9712-eb9f68e7e6e4",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 10,
+      "overriden_lines": 0
+    },
+    "d9a8d3823a75929a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a37fb0f6-febe-4c25-b7e2-01acc2fd6ce0",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 140,
+      "total_deletions": 68,
+      "accepted_lines": 137,
+      "overriden_lines": 0
+    }
+  }
+}
