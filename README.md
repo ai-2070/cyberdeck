@@ -482,6 +482,8 @@ Pool contention (thread-local acquire/release):
 | Bun | Batch (1000) | **3.37M/sec** | 0.30 us |
 | Bun | push (single) | **2.05M/sec** | 0.49 us |
 
+Benchmarks accurate as of April 15, 2026.
+
 All SDKs exceed **2M events/sec** with optimal ingestion patterns. Go achieves zero allocations on raw ingestion. Node.js sync methods are 31x faster than async. Bun batch ingestion is ~17% faster than Node.js.
 
 ### Binary size
