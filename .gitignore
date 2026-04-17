@@ -1,4 +1,5 @@
 net/crates/net/sdk-ts/dist/
+.claude/
 
 # macOS cruft
 .DS_Store

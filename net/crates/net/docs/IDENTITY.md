@@ -1,4 +1,4 @@
-# Trust & Identity (Layer 1)
+# Trust & Identity
 
 Cryptographic identity for every node in the mesh. Identity is tied to an ed25519 keypair, not a network address. An entity can migrate across nodes and its identity follows.
 

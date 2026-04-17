@@ -1,4 +1,4 @@
-# Subprotocol Registry (Layer 6)
+# Subprotocol Registry
 
 Formalizes the 16-bit `subprotocol_id` field in every Net header. Provides a registry for protocol handlers, version negotiation between peers, and an opaque forwarding guarantee for unknown protocols.
 
@@ -19,6 +19,7 @@ Every Net packet carries a `subprotocol_id: u16` identifying how the payload sho
 | `0x0702` | Continuity proof transfer |
 | `0x0800` | Partition detection |
 | `0x0801` | Log reconciliation |
+| `0x0900` | Replica group coordination (reserved) |
 | `0x1000..0xEFFF` | Vendor / third-party |
 | `0xF000..0xFFFF` | Experimental / ephemeral |
 

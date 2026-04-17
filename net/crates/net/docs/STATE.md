@@ -1,4 +1,4 @@
-# Distributed State (Layer 4)
+# Distributed State
 
 Causal ordering for distributed events. Every event carries a 24-byte `CausalLink` chaining it to the previous event. The chain provides structural integrity via xxh3 hashing -- tamper resistance comes from Net's AEAD encryption.
 

@@ -1,4 +1,4 @@
-# Subnets & Hierarchy (Layer 3)
+# Subnets & Hierarchy
 
 Hierarchical 4-level subnet encoding in 4 bytes. Nodes are assigned to subnets by label-based rules, and gateways enforce channel visibility at subnet boundaries without decrypting payloads.
 
