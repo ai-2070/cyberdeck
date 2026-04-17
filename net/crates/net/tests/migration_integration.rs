@@ -15,10 +15,10 @@ use net::adapter::net::behavior::capability::{
 use net::adapter::net::behavior::loadbalance::{RequestContext, Strategy};
 use net::adapter::net::compute::{
     chunk_snapshot, DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, ForkGroup,
-    ForkGroupConfig, MemberRole, MeshDaemon, MigrationMessage, MigrationOrchestrator,
-    MigrationPhase, MigrationSourceHandler, MigrationTargetHandler, ReplicaGroup,
-    ReplicaGroupConfig, Scheduler, SnapshotReassembler, StandbyGroup, StandbyGroupConfig,
-    MAX_SNAPSHOT_CHUNK_SIZE,
+    ForkGroupConfig, GroupCoordinator, GroupError, GroupHealth, MemberInfo, MemberRole, MeshDaemon,
+    MigrationMessage, MigrationOrchestrator, MigrationPhase, MigrationSourceHandler,
+    MigrationTargetHandler, ReplicaGroup, ReplicaGroupConfig, Scheduler, SnapshotReassembler,
+    StandbyGroup, StandbyGroupConfig, MAX_SNAPSHOT_CHUNK_SIZE,
 };
 use net::adapter::net::continuity::discontinuity::fork_sentinel;
 use net::adapter::net::identity::EntityKeypair;
@@ -346,7 +346,7 @@ fn test_subprotocol_handler_snapshot_ready_dispatch() {
         target_node: 0x2222,
     };
     let outbound = handler
-        .handle_message(&wire::encode(&take_msg), 0x3333)
+        .handle_message(&wire::encode(&take_msg).unwrap(), 0x3333)
         .unwrap();
     assert!(!outbound.is_empty());
 
@@ -394,7 +394,7 @@ fn test_subprotocol_handler_buffered_events_dispatch() {
         restored_seq: 10,
     };
     let outbound = handler
-        .handle_message(&wire::encode(&restore_msg), 0x2222)
+        .handle_message(&wire::encode(&restore_msg).unwrap(), 0x2222)
         .unwrap();
 
     // Should have BufferedEvents response
@@ -440,7 +440,7 @@ fn test_subprotocol_handler_cutover_notify_dispatch() {
         target_node: 0x2222,
     };
     let outbound = handler
-        .handle_message(&wire::encode(&cutover_msg), 0x3333)
+        .handle_message(&wire::encode(&cutover_msg).unwrap(), 0x3333)
         .unwrap();
 
     // Should have: BufferedEvents (final events) + CleanupComplete
@@ -482,7 +482,7 @@ fn test_subprotocol_handler_cleanup_complete_dispatch() {
         daemon_origin: origin,
     };
     let outbound = handler
-        .handle_message(&wire::encode(&cleanup_msg), 0x1111)
+        .handle_message(&wire::encode(&cleanup_msg).unwrap(), 0x1111)
         .unwrap();
     assert!(outbound.is_empty()); // no response needed
     assert!(!orch.is_migrating(origin)); // migration removed
@@ -777,7 +777,7 @@ fn test_wire_roundtrip_all_message_types() {
     ];
 
     for msg in &messages {
-        let encoded = wire::encode(msg);
+        let encoded = wire::encode(msg).unwrap();
         let decoded = wire::decode(&encoded).unwrap();
 
         // Verify message type matches by checking discriminant
@@ -882,7 +882,7 @@ fn test_regression_cutover_routed_to_source_not_target() {
         replayed_seq: 10,
     };
     let outbound = handler
-        .handle_message(&wire::encode(&replay_msg), target_node)
+        .handle_message(&wire::encode(&replay_msg).unwrap(), target_node)
         .unwrap();
 
     // Find the CutoverNotify in outbound
@@ -946,7 +946,7 @@ fn test_regression_snapshot_forwarded_to_actual_target() {
         total_chunks: 1,
     };
     let outbound = handler
-        .handle_message(&wire::encode(&snapshot_msg), source_node)
+        .handle_message(&wire::encode(&snapshot_msg).unwrap(), source_node)
         .unwrap();
 
     // The forwarded SnapshotReady must go to the TARGET (0x2222), not 0 or source
@@ -1113,7 +1113,7 @@ fn test_regression_full_handler_routing_chain() {
         replayed_seq: 20,
     };
     let outbound = handler
-        .handle_message(&wire::encode(&replay_msg), target_node)
+        .handle_message(&wire::encode(&replay_msg).unwrap(), target_node)
         .unwrap();
 
     // Verify: CutoverNotify goes to SOURCE
@@ -1757,4 +1757,392 @@ fn test_standby_group_active_migrates_via_mikoshi() {
     // Standbys are unaffected
     assert_eq!(group.member_count(), 3);
     assert_eq!(group.standby_count(), 2);
+}
+
+// ── Test suite gap coverage ──────────────────────────────────────────────────
+
+/// Gap 1: on_node_recovery with unregistered member.
+///
+/// If on_node_failure unregistered a member and replacement failed,
+/// on_node_recovery should NOT mark it healthy — routing to an
+/// origin_hash that doesn't exist in the registry would fail.
+#[test]
+fn test_gap_recovery_skips_unregistered_member() {
+    let reg = DaemonRegistry::new();
+    let mut coord = GroupCoordinator::new(Strategy::RoundRobin);
+
+    // Add two members
+    let kp0 = EntityKeypair::generate();
+    let kp1 = EntityKeypair::generate();
+
+    // Register only kp1 in the registry (kp0 is "unregistered after failure")
+    let host1 = DaemonHost::new(
+        Box::new(CounterDaemon::new()),
+        kp1.clone(),
+        DaemonHostConfig::default(),
+    );
+    reg.register(host1).unwrap();
+
+    coord.add_member(MemberInfo {
+        index: 0,
+        origin_hash: kp0.origin_hash(),
+        node_id: 0x1111,
+        entity_id_bytes: *kp0.entity_id().as_bytes(),
+        healthy: false, // was marked unhealthy during failure
+    });
+    coord.add_member(MemberInfo {
+        index: 1,
+        origin_hash: kp1.origin_hash(),
+        node_id: 0x1111,
+        entity_id_bytes: *kp1.entity_id().as_bytes(),
+        healthy: false,
+    });
+
+    assert_eq!(coord.health(), GroupHealth::Dead);
+
+    // Recovery: kp0 is NOT in registry, kp1 IS
+    coord.on_node_recovery(0x1111, &reg);
+
+    // Only kp1 should be marked healthy
+    assert_eq!(
+        coord.health(),
+        GroupHealth::Degraded {
+            healthy: 1,
+            total: 2
+        },
+        "unregistered member should stay unhealthy after recovery"
+    );
+    assert!(
+        !coord.members()[0].healthy,
+        "kp0 not in registry, should stay unhealthy"
+    );
+    assert!(
+        coord.members()[1].healthy,
+        "kp1 in registry, should be healthy"
+    );
+}
+
+/// Gap 2: StandbyGroup promote with no healthy standbys.
+#[test]
+fn test_gap_promote_no_healthy_standbys() {
+    let reg = DaemonRegistry::new();
+    let sched = make_scheduler_for_groups();
+
+    let mut group = StandbyGroup::spawn(
+        StandbyGroupConfig {
+            member_count: 2,
+            group_seed: [202u8; 32],
+            host_config: DaemonHostConfig::default(),
+        },
+        || Box::new(CounterDaemon::new()),
+        &sched,
+        &reg,
+    )
+    .unwrap();
+
+    // First promote succeeds (standby 1 is healthy)
+    group
+        .promote(|| Box::new(CounterDaemon::new()), &reg, &sched)
+        .unwrap();
+
+    // Second promote: old active (0) was marked unhealthy by promote,
+    // current active (1) will be marked unhealthy — no healthy standbys left
+    let err = group
+        .promote(|| Box::new(CounterDaemon::new()), &reg, &sched)
+        .unwrap_err();
+    assert_eq!(err, GroupError::NoHealthyMember);
+}
+
+/// Gap 3: DaemonHost::from_fork panics on origin mismatch.
+#[test]
+#[should_panic(expected = "fork chain origin")]
+fn test_gap_from_fork_origin_mismatch_panics() {
+    use net::adapter::net::state::causal::CausalChainBuilder;
+
+    let keypair_a = EntityKeypair::generate();
+    let keypair_b = EntityKeypair::generate();
+
+    // Build a chain for keypair_a's origin
+    let chain = CausalChainBuilder::new(keypair_a.origin_hash());
+
+    struct NoopDaemon;
+    impl MeshDaemon for NoopDaemon {
+        fn name(&self) -> &str {
+            "noop"
+        }
+        fn requirements(&self) -> CapabilityFilter {
+            CapabilityFilter::default()
+        }
+        fn process(&mut self, _: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
+            Ok(vec![])
+        }
+    }
+
+    // Pass keypair_b but chain for keypair_a — should panic
+    let _host = DaemonHost::from_fork(
+        Box::new(NoopDaemon),
+        keypair_b,
+        chain,
+        DaemonHostConfig::default(),
+    );
+}
+
+/// Gap 4: Reassembler with mismatched total_chunks across chunks.
+///
+/// If chunk 0 says total_chunks=3 but a later chunk says total_chunks=4,
+/// the reassembler should use the value from the first chunk seen
+/// (the entry was created with total_chunks=3).
+#[test]
+fn test_gap_reassembler_mismatched_total_chunks() {
+    let mut reassembler = SnapshotReassembler::new();
+
+    // First chunk: total_chunks=3
+    let result = reassembler.feed(0xAAAA, vec![1, 2], 100, 0, 3);
+    assert!(result.is_none());
+
+    // Second chunk claims total_chunks=4, but the entry was created with 3
+    let result = reassembler.feed(0xAAAA, vec![3, 4], 100, 1, 4);
+    assert!(result.is_none());
+
+    // Third chunk (index 2) with total_chunks=3 — should complete at 3 chunks
+    let result = reassembler.feed(0xAAAA, vec![5, 6], 100, 2, 3);
+    assert!(result.is_some());
+    let full = result.unwrap();
+    assert_eq!(full, vec![1, 2, 3, 4, 5, 6]);
+}
+
+/// Gap 5: GroupCoordinator standalone tests.
+#[test]
+fn test_gap_group_coordinator_standalone() {
+    let mut coord = GroupCoordinator::new(Strategy::RoundRobin);
+    assert_eq!(coord.member_count(), 0);
+    assert_eq!(coord.health(), GroupHealth::Dead); // no members = dead
+
+    // Add members
+    let kp0 = EntityKeypair::generate();
+    let kp1 = EntityKeypair::generate();
+
+    coord.add_member(MemberInfo {
+        index: 0,
+        origin_hash: kp0.origin_hash(),
+        node_id: 0x1111,
+        entity_id_bytes: *kp0.entity_id().as_bytes(),
+        healthy: true,
+    });
+    coord.add_member(MemberInfo {
+        index: 1,
+        origin_hash: kp1.origin_hash(),
+        node_id: 0x2222,
+        entity_id_bytes: *kp1.entity_id().as_bytes(),
+        healthy: true,
+    });
+
+    assert_eq!(coord.member_count(), 2);
+    assert_eq!(coord.healthy_count(), 2);
+    assert_eq!(coord.health(), GroupHealth::Healthy);
+
+    // Mark unhealthy
+    coord.mark_unhealthy(0);
+    assert_eq!(coord.healthy_count(), 1);
+    assert_eq!(
+        coord.health(),
+        GroupHealth::Degraded {
+            healthy: 1,
+            total: 2
+        }
+    );
+
+    // Mark healthy again
+    coord.mark_healthy(0);
+    assert_eq!(coord.health(), GroupHealth::Healthy);
+
+    // members_on_node
+    assert_eq!(coord.members_on_node(0x1111), vec![0]);
+    assert_eq!(coord.members_on_node(0x2222), vec![1]);
+    assert_eq!(coord.members_on_node(0x9999), Vec::<u8>::new());
+
+    // remove_last
+    let removed = coord.remove_last().unwrap();
+    assert_eq!(removed.index, 1);
+    assert_eq!(coord.member_count(), 1);
+
+    // Route event
+    let ctx = RequestContext::default();
+    let origin = coord.route_event(&ctx).unwrap();
+    assert_eq!(origin, kp0.origin_hash());
+}
+
+/// Gap 6: scale_to same size is a no-op.
+#[test]
+fn test_gap_scale_to_same_size_noop() {
+    let reg = DaemonRegistry::new();
+    let sched = make_scheduler_for_groups();
+
+    // ReplicaGroup
+    let mut replica_group = ReplicaGroup::spawn(
+        ReplicaGroupConfig {
+            replica_count: 3,
+            group_seed: [206u8; 32],
+            lb_strategy: Strategy::RoundRobin,
+            host_config: DaemonHostConfig::default(),
+        },
+        || Box::new(CounterDaemon::new()),
+        &sched,
+        &reg,
+    )
+    .unwrap();
+
+    let origins_before: Vec<u32> = replica_group
+        .replicas()
+        .iter()
+        .map(|r| r.origin_hash)
+        .collect();
+    replica_group
+        .scale_to(3, || Box::new(CounterDaemon::new()), &sched, &reg)
+        .unwrap();
+    let origins_after: Vec<u32> = replica_group
+        .replicas()
+        .iter()
+        .map(|r| r.origin_hash)
+        .collect();
+    assert_eq!(origins_before, origins_after);
+    assert_eq!(reg.count(), 3);
+}
+
+/// Gap 7: sync_standbys when active daemon is stateless.
+#[test]
+fn test_gap_sync_stateless_active_errors() {
+    let reg = DaemonRegistry::new();
+    let sched = make_scheduler_for_groups();
+
+    struct StatelessDaemon;
+    impl MeshDaemon for StatelessDaemon {
+        fn name(&self) -> &str {
+            "stateless"
+        }
+        fn requirements(&self) -> CapabilityFilter {
+            CapabilityFilter::default()
+        }
+        fn process(&mut self, _: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
+            Ok(vec![])
+        }
+        // snapshot() returns None by default — stateless
+    }
+
+    let mut group = StandbyGroup::spawn(
+        StandbyGroupConfig {
+            member_count: 2,
+            group_seed: [207u8; 32],
+            host_config: DaemonHostConfig::default(),
+        },
+        || Box::new(StatelessDaemon),
+        &sched,
+        &reg,
+    )
+    .unwrap();
+
+    let err = group.sync_standbys(&reg).unwrap_err();
+    match err {
+        GroupError::RegistryFailed(msg) => {
+            assert!(
+                msg.contains("stateless"),
+                "expected stateless error, got: {}",
+                msg
+            );
+        }
+        _ => panic!("expected RegistryFailed, got {:?}", err),
+    }
+}
+
+/// Gap 8: chunk_snapshot with empty snapshot bytes.
+#[test]
+fn test_gap_chunk_empty_snapshot() {
+    let chunks = chunk_snapshot(0xAAAA, vec![], 0).unwrap();
+    assert_eq!(chunks.len(), 1);
+    match &chunks[0] {
+        MigrationMessage::SnapshotReady {
+            snapshot_bytes,
+            chunk_index,
+            total_chunks,
+            ..
+        } => {
+            assert!(snapshot_bytes.is_empty());
+            assert_eq!(*chunk_index, 0);
+            assert_eq!(*total_chunks, 1);
+        }
+        _ => panic!("expected SnapshotReady"),
+    }
+}
+
+/// Gap 9: Wire decode truncation for all message types.
+#[test]
+fn test_gap_wire_decode_truncated_messages() {
+    use net::adapter::net::compute::orchestrator::wire;
+
+    // Each message type with truncated data should return StateFailed
+    let test_cases: Vec<(&str, Vec<u8>)> = vec![
+        ("TakeSnapshot", vec![0]),    // type byte only, missing 12 bytes
+        ("SnapshotReady", vec![1]),   // type byte only, missing 24 bytes
+        ("RestoreComplete", vec![2]), // type byte only, missing 12 bytes
+        ("ReplayComplete", vec![3]),  // type byte only, missing 12 bytes
+        ("CutoverNotify", vec![4]),   // type byte only, missing 12 bytes
+        ("CleanupComplete", vec![5]), // type byte only, missing 4 bytes
+        ("MigrationFailed", vec![6]), // type byte only, missing 6 bytes
+        ("BufferedEvents", vec![7]),  // type byte only, missing 8 bytes
+        ("empty", vec![]),            // completely empty
+    ];
+
+    for (name, data) in test_cases {
+        let result = wire::decode(&data);
+        assert!(
+            result.is_err(),
+            "truncated {} should fail to decode, but got: {:?}",
+            name,
+            result,
+        );
+    }
+
+    // Unknown message type
+    let result = wire::decode(&[255]);
+    assert!(result.is_err());
+}
+
+/// Gap 10: StandbyGroup promote with empty buffer (no events to replay).
+#[test]
+fn test_gap_promote_empty_buffer() {
+    let reg = DaemonRegistry::new();
+    let sched = make_scheduler_for_groups();
+
+    let mut group = StandbyGroup::spawn(
+        StandbyGroupConfig {
+            member_count: 2,
+            group_seed: [210u8; 32],
+            host_config: DaemonHostConfig::default(),
+        },
+        || Box::new(CounterDaemon::new()),
+        &sched,
+        &reg,
+    )
+    .unwrap();
+
+    let active_before = group.active_origin();
+
+    // Sync with no events processed — standbys at seq 0
+    group.sync_standbys(&reg).unwrap();
+
+    // No events buffered after sync
+    assert_eq!(group.buffered_event_count(), 0);
+
+    // Promote — should succeed with nothing to replay
+    let new_active = group
+        .promote(|| Box::new(CounterDaemon::new()), &reg, &sched)
+        .unwrap();
+
+    assert_ne!(new_active, active_before);
+    assert_eq!(group.buffered_event_count(), 0);
+
+    // New active should accept events normally
+    let event = make_event(0xFFFF, 1);
+    let outputs = reg.deliver(new_active, &event).unwrap();
+    assert_eq!(outputs.len(), 1);
 }

@@ -120,7 +120,19 @@ pub mod wire {
     pub const MSG_BUFFERED_EVENTS: u8 = 7;
 
     /// Encode a migration message to bytes.
-    pub fn encode(msg: &MigrationMessage) -> Vec<u8> {
+    ///
+    /// Returns `MigrationError::StateFailed` when a length-prefixed field
+    /// would not fit in its on-wire width. Length prefixes are `u32` for
+    /// payloads and counts and `u16` for the failure reason string; silently
+    /// truncating to fit would corrupt the stream and confuse the decoder.
+    pub fn encode(msg: &MigrationMessage) -> Result<Vec<u8>, MigrationError> {
+        // Helper: convert a usize length to u32 with an error on overflow.
+        fn len_u32(field: &str, n: usize) -> Result<u32, MigrationError> {
+            u32::try_from(n).map_err(|_| {
+                MigrationError::StateFailed(format!("{} length {} exceeds u32::MAX", field, n))
+            })
+        }
+
         let mut buf = Vec::with_capacity(128);
 
         match msg {
@@ -139,12 +151,13 @@ pub mod wire {
                 chunk_index,
                 total_chunks,
             } => {
+                let payload_len = len_u32("snapshot_bytes", snapshot_bytes.len())?;
                 buf.put_u8(MSG_SNAPSHOT_READY);
                 buf.put_u32_le(*daemon_origin);
                 buf.put_u64_le(*seq_through);
                 buf.put_u32_le(*chunk_index);
                 buf.put_u32_le(*total_chunks);
-                buf.put_u32_le(snapshot_bytes.len() as u32);
+                buf.put_u32_le(payload_len);
                 buf.extend_from_slice(snapshot_bytes);
             }
             MigrationMessage::RestoreComplete {
@@ -179,29 +192,37 @@ pub mod wire {
                 daemon_origin,
                 reason,
             } => {
+                let reason_len = u16::try_from(reason.len()).map_err(|_| {
+                    MigrationError::StateFailed(format!(
+                        "reason length {} exceeds u16::MAX",
+                        reason.len()
+                    ))
+                })?;
                 buf.put_u8(MSG_FAILED);
                 buf.put_u32_le(*daemon_origin);
-                buf.put_u16_le(reason.len() as u16);
+                buf.put_u16_le(reason_len);
                 buf.extend_from_slice(reason.as_bytes());
             }
             MigrationMessage::BufferedEvents {
                 daemon_origin,
                 events,
             } => {
+                let event_count = len_u32("events", events.len())?;
                 buf.put_u8(MSG_BUFFERED_EVENTS);
                 buf.put_u32_le(*daemon_origin);
-                buf.put_u32_le(events.len() as u32);
+                buf.put_u32_le(event_count);
                 for event in events {
+                    let payload_len = len_u32("event payload", event.payload.len())?;
                     let link_bytes = event.link.to_bytes();
                     buf.extend_from_slice(&link_bytes);
-                    buf.put_u32_le(event.payload.len() as u32);
+                    buf.put_u32_le(payload_len);
                     buf.extend_from_slice(&event.payload);
                     buf.put_u64_le(event.received_at);
                 }
             }
         }
 
-        buf
+        Ok(buf)
     }
 
     /// Decode a migration message from bytes.
@@ -1047,7 +1068,7 @@ mod tests {
             daemon_origin: 0xAAAA,
             target_node: 0x2222,
         };
-        let encoded = wire::encode(&msg);
+        let encoded = wire::encode(&msg).unwrap();
         let decoded = wire::decode(&encoded).unwrap();
         match decoded {
             MigrationMessage::TakeSnapshot {
@@ -1070,7 +1091,7 @@ mod tests {
             chunk_index: 0,
             total_chunks: 1,
         };
-        let encoded = wire::encode(&msg);
+        let encoded = wire::encode(&msg).unwrap();
         let decoded = wire::decode(&encoded).unwrap();
         match decoded {
             MigrationMessage::SnapshotReady {
@@ -1184,7 +1205,7 @@ mod tests {
             chunk_index: 2,
             total_chunks: 5,
         };
-        let encoded = wire::encode(&msg);
+        let encoded = wire::encode(&msg).unwrap();
         let decoded = wire::decode(&encoded).unwrap();
         match decoded {
             MigrationMessage::SnapshotReady {
@@ -1205,7 +1226,7 @@ mod tests {
             daemon_origin: 0xCCCC,
             reason: "something broke".into(),
         };
-        let encoded = wire::encode(&msg);
+        let encoded = wire::encode(&msg).unwrap();
         let decoded = wire::decode(&encoded).unwrap();
         match decoded {
             MigrationMessage::MigrationFailed {
@@ -1242,7 +1263,7 @@ mod tests {
             daemon_origin: 0xAAAA,
             events,
         };
-        let encoded = wire::encode(&msg);
+        let encoded = wire::encode(&msg).unwrap();
         let decoded = wire::decode(&encoded).unwrap();
         match decoded {
             MigrationMessage::BufferedEvents {
@@ -1260,6 +1281,24 @@ mod tests {
             }
             _ => panic!("expected BufferedEvents"),
         }
+    }
+
+    #[test]
+    fn test_wire_encode_rejects_oversized_failure_reason() {
+        // Regression: `reason.len() as u16` previously truncated silently when
+        // the reason exceeded u16::MAX, producing a stream the decoder
+        // misparses. Encoding must now return an error.
+        let oversized = "x".repeat(u16::MAX as usize + 1);
+        let msg = MigrationMessage::MigrationFailed {
+            daemon_origin: 0xDEAD,
+            reason: oversized,
+        };
+        let result = wire::encode(&msg);
+        assert!(
+            matches!(result, Err(MigrationError::StateFailed(_))),
+            "encode of oversized reason must error, got {:?}",
+            result
+        );
     }
 
     #[test]
