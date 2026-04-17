@@ -173,6 +173,8 @@ Benchmarked on Apple M1 Max, macOS.
 | **SDK** | Node.js push batch | 0.35 us | 2.89M/sec |
 | **SDK** | Bun batch ingest | 0.30 us | 3.37M/sec |
 
+Benchmarks accurate as of April 15, 2026.
+
 Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns.
 
 791 tests. ~840 KB deployed binary.
