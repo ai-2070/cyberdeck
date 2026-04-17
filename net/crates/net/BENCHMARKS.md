@@ -2,6 +2,8 @@
 
 Performance benchmarks for the Net Rust core and Net transport layer.
 
+Benchmarks accurate as of April 15, 2026.
+
 **Test Systems:**
 - Apple M1 Max, macOS
 - Intel i9-14900K @5GHz, Windows 11
