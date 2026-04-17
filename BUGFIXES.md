@@ -149,13 +149,13 @@ Events that fail `parse()` are silently filtered out via `filter_map`. The calle
 
 ## Low
 
-### 17. `Connection` errors not marked retryable
+### 17. ~~`Connection` errors not marked retryable~~ (kept as-is)
 
 **File:** `src/error.rs:53`
 
-`is_retryable()` returns `false` for `AdapterError::Connection`. Connection errors are inherently transient and should generally be retryable.
+Initially flagged: `is_retryable()` returns `false` for `AdapterError::Connection`.
 
-**Fix:** Add `Self::Connection(_)` to the `is_retryable()` match arm.
+**Decision: not a bug.** `Connection` errors cover both transient failures (`"send failed"`, `"handshake timeout"`) and permanent ones (`"adapter not initialized"`, `"not connected"`). Since the type can't distinguish them, keeping Connection non-retryable is the conservative default. The batch dispatch path (`dispatch_batch`) retries all errors regardless of this flag, so transient connection failures are already retried where it matters. `is_retryable()` is not called in production code — it exists as a public API for external consumers who should default to not retrying ambiguous errors.
 
 ### 18. Drain worker busy-spins with 100μs sleep
 
