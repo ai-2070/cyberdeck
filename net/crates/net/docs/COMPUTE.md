@@ -195,6 +195,8 @@ Where replicas are interchangeable copies with deterministic seed-derived identi
 
 **The chain documents the fork.** `DaemonHost::from_fork()` creates a host with a `CausalChainBuilder` whose genesis link carries the fork sentinel as `parent_hash`. Events produced by the fork chain back through this genesis to the parent's chain at the fork point.
 
+**Keypair secrets are stored for recovery.** Unlike replicas (deterministic from seed), fork keypairs are generated randomly by `fork_entity()`. The `ForkGroup` stores each fork's 32-byte secret in `ForkInfo::keypair_secret` so `on_node_failure()` can re-create the same identity on a new node. The secret lives in memory for the lifetime of the `ForkGroup`. It is not persisted to disk, not transmitted over the wire, and not accessible through any public API. If the coordinator process itself dies, the secrets are lost and the forks cannot be identity-recovered — they would need to be re-forked as new entities. Applications that need durable fork identity should persist the secret bytes externally (this is an application concern, not a protocol one).
+
 **Scaling works like replicas.** `scale_to(n)` adds new forks from the same parent at the same `fork_seq`, or removes the highest-index ones. Each new fork gets its own random keypair and `ForkRecord`.
 
 ```
