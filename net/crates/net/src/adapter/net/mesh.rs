@@ -45,6 +45,8 @@ use super::failure::{FailureDetector, FailureDetectorConfig};
 use super::identity::EntityKeypair;
 use super::pool::PacketBuilder;
 
+use super::behavior::loadbalance::HealthStatus;
+use super::behavior::proximity::{EnhancedPingwave, ProximityConfig, ProximityGraph};
 use super::compute::SUBPROTOCOL_MIGRATION;
 use super::protocol::{self, EventFrame, PacketFlags, MAGIC};
 use super::reroute::ReroutePolicy;
@@ -60,6 +62,18 @@ use crate::event::{Batch, StoredEvent};
 
 /// Inbound event queues (same type as NetAdapter uses).
 type InboundQueues = Arc<DashMap<u16, SegQueue<StoredEvent>>>;
+
+/// Convert a u64 node_id to a 32-byte graph NodeId.
+///
+/// The proximity graph uses 32-byte ed25519 public keys as NodeId.
+/// For nodes where we only have the derived u64 node_id, we zero-pad
+/// it to 32 bytes. This preserves uniqueness for topology tracking
+/// without requiring the full public key exchange.
+fn node_id_to_graph_id(node_id: u64) -> [u8; 32] {
+    let mut id = [0u8; 32];
+    id[0..8].copy_from_slice(&node_id.to_le_bytes());
+    id
+}
 
 /// Set of peer addresses whose packets should be silently dropped.
 ///
@@ -80,6 +94,8 @@ struct DispatchCtx {
     migration_handler: Option<Arc<MigrationSubprotocolHandler>>,
     /// Socket for sending outbound subprotocol responses.
     socket: Arc<NetSocket>,
+    /// Proximity graph for topology awareness.
+    proximity_graph: Arc<ProximityGraph>,
     /// Partition filter — packets from blocked addresses are dropped.
     partition_filter: PartitionFilter,
 }
@@ -193,6 +209,8 @@ pub struct MeshNode {
     inbound: InboundQueues,
     /// Optional migration subprotocol handler
     migration_handler: Option<Arc<MigrationSubprotocolHandler>>,
+    /// Proximity graph — topology awareness from pingwave propagation
+    proximity_graph: Arc<ProximityGraph>,
     /// Automatic reroute policy
     reroute_policy: Arc<ReroutePolicy>,
     /// Node ID → SocketAddr map (shared with reroute policy)
@@ -249,6 +267,13 @@ impl MeshNode {
         let router = Arc::new(router);
         let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
 
+        // Create proximity graph for topology awareness
+        let graph_node_id: [u8; 32] = *identity.entity_id().as_bytes();
+        let proximity_graph = Arc::new(ProximityGraph::new(
+            graph_node_id,
+            ProximityConfig::default(),
+        ));
+
         // Create reroute policy that watches failure detector
         let reroute_policy = Arc::new(ReroutePolicy::new(
             router.routing_table().clone(),
@@ -278,6 +303,7 @@ impl MeshNode {
             failure_detector: Arc::new(failure_detector),
             inbound: Arc::new(DashMap::new()),
             migration_handler: None,
+            proximity_graph,
             reroute_policy,
             peer_addrs,
             partition_filter: Arc::new(dashmap::DashSet::new()),
@@ -332,6 +358,11 @@ impl MeshNode {
         self.partition_filter.contains(addr)
     }
 
+    /// Get the proximity graph.
+    pub fn proximity_graph(&self) -> &Arc<ProximityGraph> {
+        &self.proximity_graph
+    }
+
     /// Get the reroute policy (for checking reroute stats in tests).
     pub fn reroute_policy(&self) -> &Arc<ReroutePolicy> {
         &self.reroute_policy
@@ -375,6 +406,12 @@ impl MeshNode {
         // Register in peer address map (used by reroute policy)
         self.peer_addrs.insert(peer_node_id, peer_addr);
 
+        // Register in proximity graph (1-hop peer)
+        let peer_graph_id = node_id_to_graph_id(peer_node_id);
+        let pw = EnhancedPingwave::new(peer_graph_id, 0, 1)
+            .with_load(0, HealthStatus::Healthy);
+        self.proximity_graph.on_pingwave(pw, peer_addr);
+
         // Register with failure detector
         self.failure_detector.heartbeat(peer_node_id, peer_addr);
 
@@ -406,6 +443,12 @@ impl MeshNode {
         );
 
         self.peer_addrs.insert(peer_node_id, peer_addr);
+
+        let peer_graph_id = node_id_to_graph_id(peer_node_id);
+        let pw = EnhancedPingwave::new(peer_graph_id, 0, 1)
+            .with_load(0, HealthStatus::Healthy);
+        self.proximity_graph.on_pingwave(pw, peer_addr);
+
         self.failure_detector.heartbeat(peer_node_id, peer_addr);
 
         Ok((peer_addr, peer_node_id))
@@ -456,6 +499,7 @@ impl MeshNode {
             num_shards: self.config.num_shards,
             migration_handler: self.migration_handler.clone(),
             socket: self.socket.clone(),
+            proximity_graph: self.proximity_graph.clone(),
             partition_filter: self.partition_filter.clone(),
         };
 
@@ -494,6 +538,29 @@ impl MeshNode {
         // Partition filter: silently drop packets from blocked peers
         if ctx.partition_filter.contains(&source) {
             return;
+        }
+
+        // Check for pingwave (raw 72-byte packet, not a Net header)
+        if data.len() == EnhancedPingwave::SIZE {
+            if let Some(pw) = EnhancedPingwave::from_bytes(&data) {
+                // Process and optionally re-broadcast
+                if let Some(fwd_pw) = ctx.proximity_graph.on_pingwave(pw, source) {
+                    let fwd_bytes = fwd_pw.to_bytes();
+                    let socket = ctx.socket.clone();
+                    let peers = ctx.peers.clone();
+                    let filter = ctx.partition_filter.clone();
+                    // Re-broadcast to all peers except the sender
+                    tokio::spawn(async move {
+                        for entry in peers.iter() {
+                            let addr = *entry.key();
+                            if addr != source && !filter.contains(&addr) {
+                                let _ = socket.send_to(&fwd_bytes, addr).await;
+                            }
+                        }
+                    });
+                }
+                return;
+            }
         }
 
         let local_node_id = ctx.local_node_id;
@@ -707,22 +774,29 @@ impl MeshNode {
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
         let partition_filter = self.partition_filter.clone();
+        let proximity_graph = self.proximity_graph.clone();
 
         tokio::spawn(async move {
             while !shutdown.load(Ordering::Acquire) {
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
+                        // Create a pingwave for this heartbeat cycle
+                        let pw = proximity_graph.create_pingwave(HealthStatus::Healthy);
+                        let pw_bytes = pw.to_bytes();
+
                         for entry in peers.iter() {
                             let peer_addr = *entry.key();
-                            // Skip blocked peers (partition simulation)
                             if partition_filter.contains(&peer_addr) {
                                 continue;
                             }
                             let session = &entry.value().session;
                             let mut builder =
                                 PacketBuilder::new(&[0u8; 32], session.session_id());
+                            // Heartbeat
                             let packet = builder.build_heartbeat();
                             let _ = socket.send_to(&packet, peer_addr).await;
+                            // Pingwave (raw UDP — not encrypted, topology is public)
+                            let _ = socket.send_to(&pw_bytes, peer_addr).await;
                         }
                     }
                     _ = shutdown_notify.notified() => {

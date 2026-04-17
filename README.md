@@ -372,7 +372,7 @@ Net is a working protocol, not a paper design. 894 tests verify the implementati
 
 - **Full 6-phase migration lifecycle.** The first round-trip (TakeSnapshot → SnapshotReady) is proven over wire. The remaining phases (restore, replay, cutover, cleanup) need the orchestrator to chain messages automatically through the subprotocol response path.
 - **Handshake relay.** Currently, nodes must have direct UDP connectivity to exchange Noise handshakes. Relaying handshakes through intermediate nodes is not yet implemented.
-- **ProximityGraph integration.** Automatic rerouting currently selects alternates from direct peers only. For meshes larger than a triangle, the `ProximityGraph` should guide multi-hop alternate selection based on latency and capability.
+- **ProximityGraph-guided rerouting.** The `ProximityGraph` is integrated and populated via pingwave propagation (nodes discover peers-of-peers automatically). Rerouting currently selects alternates from direct peers. For larger meshes, `path_to()` can guide multi-hop alternate selection.
 
 ## Implementation
 

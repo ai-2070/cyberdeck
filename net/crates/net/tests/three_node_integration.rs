@@ -3395,3 +3395,70 @@ async fn test_mesh_node_auto_reroute_recovery() {
     node_b.shutdown().await.unwrap();
     node_c.shutdown().await.unwrap();
 }
+
+/// Proximity graph: A↔B↔C (no direct A↔C link). A discovers C through
+/// B's relayed pingwaves.
+#[tokio::test]
+async fn test_proximity_graph_pingwave_discovery() {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_secs(10))
+    };
+
+    let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let node_c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let pub_b = *node_b.public_key();
+    let pub_c = *node_c.public_key();
+
+    // A↔B only
+    let (r1, r2) = tokio::join!(node_b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap(); r2.unwrap();
+
+    // B↔C only (A has NO direct connection to C)
+    let (r1, r2) = tokio::join!(node_c.accept(nid_b), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_b.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap(); r2.unwrap();
+
+    node_a.start(); node_b.start(); node_c.start();
+
+    // A initially knows 1 peer (B)
+    assert_eq!(node_a.proximity_graph().node_count(), 1);
+
+    // Wait for pingwave propagation (C→B→A)
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // A should now know about C via B's relayed pingwave
+    let a_nodes = node_a.proximity_graph().node_count();
+    assert!(
+        a_nodes >= 2,
+        "A should discover C via B's pingwave relay, knows {} nodes",
+        a_nodes
+    );
+
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+    node_c.shutdown().await.unwrap();
+}

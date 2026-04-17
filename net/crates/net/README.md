@@ -177,7 +177,7 @@ Benchmarks accurate as of April 15, 2026.
 
 Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns.
 
-900 tests. ~840 KB deployed binary.
+901 tests. ~840 KB deployed binary.
 
 ## Capabilities
 
@@ -590,7 +590,7 @@ cargo test --lib --features net
 # Migration & group integration tests (44 tests)
 cargo test --test migration_integration --features net
 
-# Three-node mesh integration tests (46 tests)
+# Three-node mesh integration tests (47 tests)
 cargo test --test three_node_integration --features net
 
 # Two-node transport integration
