@@ -35,10 +35,26 @@ async fn main() -> net_sdk::error::Result<()> {
 
     // Publish temperature readings as typed structs.
     let readings = vec![
-        TemperatureReading { sensor_id: "A1".into(), celsius: 22.5, timestamp_ms: 1000 },
-        TemperatureReading { sensor_id: "A2".into(), celsius: 85.3, timestamp_ms: 1001 },
-        TemperatureReading { sensor_id: "B1".into(), celsius: 19.8, timestamp_ms: 1002 },
-        TemperatureReading { sensor_id: "A1".into(), celsius: 91.7, timestamp_ms: 1003 },
+        TemperatureReading {
+            sensor_id: "A1".into(),
+            celsius: 22.5,
+            timestamp_ms: 1000,
+        },
+        TemperatureReading {
+            sensor_id: "A2".into(),
+            celsius: 85.3,
+            timestamp_ms: 1001,
+        },
+        TemperatureReading {
+            sensor_id: "B1".into(),
+            celsius: 19.8,
+            timestamp_ms: 1002,
+        },
+        TemperatureReading {
+            sensor_id: "A1".into(),
+            celsius: 91.7,
+            timestamp_ms: 1003,
+        },
     ];
 
     println!("publishing {} temperature readings:", readings.len());
@@ -53,14 +69,25 @@ async fn main() -> net_sdk::error::Result<()> {
 
     // Publish alerts as a different type through the same bus.
     let alerts = vec![
-        Alert { source: "A2".into(), message: "temperature above threshold".into(), severity: 2 },
-        Alert { source: "A1".into(), message: "temperature critical".into(), severity: 1 },
+        Alert {
+            source: "A2".into(),
+            message: "temperature above threshold".into(),
+            severity: 2,
+        },
+        Alert {
+            source: "A1".into(),
+            message: "temperature critical".into(),
+            severity: 1,
+        },
     ];
 
     println!("\npublishing {} alerts:", alerts.len());
     for alert in &alerts {
         let r = node.emit(alert)?;
-        println!("  [sev={}] {} — {} -> shard {}", alert.severity, alert.source, alert.message, r.shard_id);
+        println!(
+            "  [sev={}] {} — {} -> shard {}",
+            alert.severity, alert.source, alert.message, r.shard_id
+        );
     }
 
     // Demonstrate that batch emit works with typed data.

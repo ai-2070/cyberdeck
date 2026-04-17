@@ -33,7 +33,9 @@ const HELLO_MS: u64 = 1000; // peer announcement interval
 const PEER_TIMEOUT_MS: u64 = 5000; // peer considered dead after this
 
 // Block characters for the plasma (dark → bright → dark)
-const SHADES: &[char] = &[' ', ' ', '·', ':', '░', '▒', '▓', '█', '▓', '▒', '░', ':', '·'];
+const SHADES: &[char] = &[
+    ' ', ' ', '·', ':', '░', '▒', '▓', '█', '▓', '▒', '░', ':', '·',
+];
 
 // ── peer state ──────────────────────────────────────────────────────────────
 
@@ -174,7 +176,8 @@ async fn recv_loop(
 ) {
     let mut buf = [0u8; 2048];
     while running.load(Ordering::Relaxed) {
-        let result = tokio::time::timeout(Duration::from_millis(100), sock.recv_from(&mut buf)).await;
+        let result =
+            tokio::time::timeout(Duration::from_millis(100), sock.recv_from(&mut buf)).await;
         if let Ok(Ok((len, addr))) = result {
             let msg = String::from_utf8_lossy(&buf[..len]);
             if let Some(name) = msg.strip_prefix("HELLO|") {
@@ -212,7 +215,10 @@ async fn main() {
     let _ = enable_ansi_support();
 
     println!("\x1b[2J\x1b[H"); // clear screen
-    println!("\x1b[1;36mNET MESH DEMO — starting as '{}' on port {}...\x1b[0m\n", name, PORT);
+    println!(
+        "\x1b[1;36mNET MESH DEMO — starting as '{}' on port {}...\x1b[0m\n",
+        name, PORT
+    );
 
     // Bind UDP socket.
     let sock = UdpSocket::bind(format!("0.0.0.0:{}", PORT))

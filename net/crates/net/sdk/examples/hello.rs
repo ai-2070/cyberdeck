@@ -39,7 +39,10 @@ async fn main() -> net_sdk::error::Result<()> {
 
     // Check stats.
     let stats = node.stats();
-    println!("\n{} events ingested, {} dropped", stats.events_ingested, stats.events_dropped);
+    println!(
+        "\n{} events ingested, {} dropped",
+        stats.events_ingested, stats.events_dropped
+    );
     assert_eq!(stats.events_ingested, 5);
     assert_eq!(stats.events_dropped, 0);
     println!("all events accepted across {} shards", node.shards());

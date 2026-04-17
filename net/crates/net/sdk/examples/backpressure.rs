@@ -64,7 +64,10 @@ async fn main() -> net_sdk::error::Result<()> {
     println!("emitted:   2000");
     println!("accepted:  {}", accepted);
     println!("rejected:  {}", rejected);
-    println!("note: buffer filled at {}, remaining {} events rejected", accepted, rejected);
+    println!(
+        "note: buffer filled at {}, remaining {} events rejected",
+        accepted, rejected
+    );
 
     node.shutdown().await?;
 

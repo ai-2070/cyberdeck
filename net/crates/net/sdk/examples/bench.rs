@@ -62,7 +62,10 @@ async fn main() -> net_sdk::error::Result<()> {
     let eps = total as f64 / elapsed.as_secs_f64();
     let ns_per = elapsed.as_nanos() as f64 / total as f64;
 
-    println!("\nbatch ingestion (emit_raw_batch, batch_size={})", batch_size);
+    println!(
+        "\nbatch ingestion (emit_raw_batch, batch_size={})",
+        batch_size
+    );
     println!("  events:     {}", total);
     println!("  elapsed:    {:.2?}", elapsed);
     println!("  throughput: {:.2}M events/sec", eps / 1_000_000.0);
