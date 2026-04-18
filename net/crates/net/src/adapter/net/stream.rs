@@ -167,10 +167,11 @@ pub struct StreamStats {
 
 /// A typed handle to a logical stream within a peer session.
 ///
-/// Created by [`MeshNode::open_stream`]; dropped at any point without
-/// affecting the underlying `StreamState` — the stream is removed only
-/// when [`MeshNode::close_stream`] is explicitly called, when it's
-/// idle-evicted, or when its parent session tears down.
+/// Created by [`crate::adapter::net::MeshNode::open_stream`]; dropped at any
+/// point without affecting the underlying `StreamState` — the stream is
+/// removed only when [`crate::adapter::net::MeshNode::close_stream`] is
+/// explicitly called, when it's idle-evicted, or when its parent session
+/// tears down.
 #[derive(Debug, Clone)]
 pub struct Stream {
     pub(crate) peer_node_id: u64,
