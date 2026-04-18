@@ -38,6 +38,7 @@ mod fold;
 mod query;
 mod state;
 mod types;
+mod watch;
 
 pub use adapter::TasksAdapter;
 pub use dispatch::{
@@ -48,3 +49,4 @@ pub use fold::TasksFold;
 pub use query::{OrderBy, TasksQuery};
 pub use state::TasksState;
 pub use types::{Task, TaskId, TaskStatus};
+pub use watch::TasksWatcher;

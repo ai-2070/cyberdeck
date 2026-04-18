@@ -23,154 +23,26 @@ use std::collections::HashSet;
 use super::state::TasksState;
 use super::types::{Task, TaskId, TaskStatus};
 
-/// Ordering for query results.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrderBy {
-    /// By `id`, ascending.
-    IdAsc,
-    /// By `id`, descending.
-    IdDesc,
-    /// By `created_ns`, ascending (oldest first).
-    CreatedAsc,
-    /// By `created_ns`, descending (newest first).
-    CreatedDesc,
-    /// By `updated_ns`, ascending.
-    UpdatedAsc,
-    /// By `updated_ns`, descending.
-    UpdatedDesc,
+/// Filter / order / limit configuration. Shared by
+/// [`TasksQuery`] (immediate execution over a borrowed state snapshot)
+/// and [`super::watch::TasksWatcher`] (repeated execution driven by
+/// the adapter's change stream).
+#[derive(Debug, Clone, Default)]
+pub(super) struct TasksFilterSpec {
+    pub status: Option<TaskStatus>,
+    pub id_in: Option<HashSet<TaskId>>,
+    pub created_after_ns: Option<u64>,
+    pub created_before_ns: Option<u64>,
+    pub updated_after_ns: Option<u64>,
+    pub updated_before_ns: Option<u64>,
+    pub title_contains: Option<String>,
+    pub order_by: Option<OrderBy>,
+    pub limit: Option<usize>,
 }
 
-/// Fluent query over `TasksState`.
-///
-/// Created via [`TasksState::query`].
-pub struct TasksQuery<'a> {
-    state: &'a TasksState,
-    status: Option<TaskStatus>,
-    id_in: Option<HashSet<TaskId>>,
-    created_after_ns: Option<u64>,
-    created_before_ns: Option<u64>,
-    updated_after_ns: Option<u64>,
-    updated_before_ns: Option<u64>,
-    title_contains: Option<String>,
-    order_by: Option<OrderBy>,
-    limit: Option<usize>,
-}
-
-impl TasksState {
-    /// Start a fluent query over this state snapshot.
-    pub fn query(&self) -> TasksQuery<'_> {
-        TasksQuery {
-            state: self,
-            status: None,
-            id_in: None,
-            created_after_ns: None,
-            created_before_ns: None,
-            updated_after_ns: None,
-            updated_before_ns: None,
-            title_contains: None,
-            order_by: None,
-            limit: None,
-        }
-    }
-}
-
-impl<'a> TasksQuery<'a> {
-    /// Restrict to tasks with the given status.
-    pub fn where_status(mut self, status: TaskStatus) -> Self {
-        self.status = Some(status);
-        self
-    }
-
-    /// Restrict to tasks whose id is in the provided collection.
-    pub fn where_id_in(mut self, ids: impl IntoIterator<Item = TaskId>) -> Self {
-        self.id_in = Some(ids.into_iter().collect());
-        self
-    }
-
-    /// Restrict to `created_ns > ns`.
-    pub fn created_after(mut self, ns: u64) -> Self {
-        self.created_after_ns = Some(ns);
-        self
-    }
-
-    /// Restrict to `created_ns < ns`.
-    pub fn created_before(mut self, ns: u64) -> Self {
-        self.created_before_ns = Some(ns);
-        self
-    }
-
-    /// Restrict to `updated_ns > ns`.
-    pub fn updated_after(mut self, ns: u64) -> Self {
-        self.updated_after_ns = Some(ns);
-        self
-    }
-
-    /// Restrict to `updated_ns < ns`.
-    pub fn updated_before(mut self, ns: u64) -> Self {
-        self.updated_before_ns = Some(ns);
-        self
-    }
-
-    /// Restrict to tasks whose title contains `needle` (case-insensitive).
-    pub fn title_contains(mut self, needle: impl Into<String>) -> Self {
-        self.title_contains = Some(needle.into().to_lowercase());
-        self
-    }
-
-    /// Order results. If unset, iteration order is unspecified (hash map).
-    pub fn order_by(mut self, order: OrderBy) -> Self {
-        self.order_by = Some(order);
-        self
-    }
-
-    /// Truncate to `n` results after ordering.
-    pub fn limit(mut self, n: usize) -> Self {
-        self.limit = Some(n);
-        self
-    }
-
-    /// Execute the query and collect matching tasks (cloned).
-    pub fn collect(self) -> Vec<Task> {
-        let mut out: Vec<Task> = self
-            .state
-            .tasks
-            .values()
-            .filter(|t| self.matches(t))
-            .cloned()
-            .collect();
-
-        if let Some(order) = self.order_by {
-            sort_tasks(&mut out, order);
-        }
-        if let Some(limit) = self.limit {
-            out.truncate(limit);
-        }
-        out
-    }
-
-    /// Return the number of matches. Ignores `limit`.
-    pub fn count(self) -> usize {
-        self.state
-            .tasks
-            .values()
-            .filter(|t| self.matches(t))
-            .count()
-    }
-
-    /// Return the first matching task in iteration order (after
-    /// applying `order_by` if set).
-    pub fn first(mut self) -> Option<Task> {
-        // Force a limit of 1 but still respect ordering.
-        self.limit = Some(1);
-        self.collect().into_iter().next()
-    }
-
-    /// True if any task matches. Short-circuits on first hit.
-    pub fn exists(self) -> bool {
-        self.state.tasks.values().any(|t| self.matches(t))
-    }
-
-    fn matches(&self, t: &Task) -> bool {
+impl TasksFilterSpec {
+    /// Apply all filter predicates to a single task.
+    pub(super) fn matches(&self, t: &Task) -> bool {
         if let Some(s) = self.status {
             if t.status != s {
                 return false;
@@ -208,9 +80,147 @@ impl<'a> TasksQuery<'a> {
         }
         true
     }
+
+    /// Collect matching tasks from state, applying order + limit.
+    pub(super) fn execute(&self, state: &TasksState) -> Vec<Task> {
+        let mut out: Vec<Task> = state
+            .tasks
+            .values()
+            .filter(|t| self.matches(t))
+            .cloned()
+            .collect();
+        if let Some(order) = self.order_by {
+            sort_tasks(&mut out, order);
+        }
+        if let Some(limit) = self.limit {
+            out.truncate(limit);
+        }
+        out
+    }
 }
 
-fn sort_tasks(tasks: &mut [Task], order: OrderBy) {
+/// Ordering for query results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderBy {
+    /// By `id`, ascending.
+    IdAsc,
+    /// By `id`, descending.
+    IdDesc,
+    /// By `created_ns`, ascending (oldest first).
+    CreatedAsc,
+    /// By `created_ns`, descending (newest first).
+    CreatedDesc,
+    /// By `updated_ns`, ascending.
+    UpdatedAsc,
+    /// By `updated_ns`, descending.
+    UpdatedDesc,
+}
+
+/// Fluent query over `TasksState`.
+///
+/// Created via [`TasksState::query`].
+pub struct TasksQuery<'a> {
+    state: &'a TasksState,
+    spec: TasksFilterSpec,
+}
+
+impl TasksState {
+    /// Start a fluent query over this state snapshot.
+    pub fn query(&self) -> TasksQuery<'_> {
+        TasksQuery {
+            state: self,
+            spec: TasksFilterSpec::default(),
+        }
+    }
+}
+
+impl<'a> TasksQuery<'a> {
+    /// Restrict to tasks with the given status.
+    pub fn where_status(mut self, status: TaskStatus) -> Self {
+        self.spec.status = Some(status);
+        self
+    }
+
+    /// Restrict to tasks whose id is in the provided collection.
+    pub fn where_id_in(mut self, ids: impl IntoIterator<Item = TaskId>) -> Self {
+        self.spec.id_in = Some(ids.into_iter().collect());
+        self
+    }
+
+    /// Restrict to `created_ns > ns`.
+    pub fn created_after(mut self, ns: u64) -> Self {
+        self.spec.created_after_ns = Some(ns);
+        self
+    }
+
+    /// Restrict to `created_ns < ns`.
+    pub fn created_before(mut self, ns: u64) -> Self {
+        self.spec.created_before_ns = Some(ns);
+        self
+    }
+
+    /// Restrict to `updated_ns > ns`.
+    pub fn updated_after(mut self, ns: u64) -> Self {
+        self.spec.updated_after_ns = Some(ns);
+        self
+    }
+
+    /// Restrict to `updated_ns < ns`.
+    pub fn updated_before(mut self, ns: u64) -> Self {
+        self.spec.updated_before_ns = Some(ns);
+        self
+    }
+
+    /// Restrict to tasks whose title contains `needle` (case-insensitive).
+    pub fn title_contains(mut self, needle: impl Into<String>) -> Self {
+        self.spec.title_contains = Some(needle.into().to_lowercase());
+        self
+    }
+
+    /// Order results. If unset, iteration order is unspecified (hash map).
+    pub fn order_by(mut self, order: OrderBy) -> Self {
+        self.spec.order_by = Some(order);
+        self
+    }
+
+    /// Truncate to `n` results after ordering.
+    pub fn limit(mut self, n: usize) -> Self {
+        self.spec.limit = Some(n);
+        self
+    }
+
+    /// Execute the query and collect matching tasks (cloned).
+    pub fn collect(self) -> Vec<Task> {
+        self.spec.execute(self.state)
+    }
+
+    /// Return the number of matches. Ignores `limit`.
+    pub fn count(self) -> usize {
+        self.state
+            .tasks
+            .values()
+            .filter(|t| self.spec.matches(t))
+            .count()
+    }
+
+    /// Return the first matching task in iteration order (after
+    /// applying `order_by` if set).
+    pub fn first(mut self) -> Option<Task> {
+        // Force a limit of 1 but still respect ordering.
+        self.spec.limit = Some(1);
+        self.collect().into_iter().next()
+    }
+
+    /// True if any task matches. Short-circuits on first hit.
+    pub fn exists(self) -> bool {
+        self.state
+            .tasks
+            .values()
+            .any(|t| self.spec.matches(t))
+    }
+}
+
+pub(super) fn sort_tasks(tasks: &mut [Task], order: OrderBy) {
     match order {
         OrderBy::IdAsc => tasks.sort_by_key(|t| t.id),
         OrderBy::IdDesc => tasks.sort_by(|a, b| b.id.cmp(&a.id)),

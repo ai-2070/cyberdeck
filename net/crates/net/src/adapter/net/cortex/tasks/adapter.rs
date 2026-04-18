@@ -23,6 +23,9 @@ use super::state::TasksState;
 use super::types::{
     TaskCompletedPayload, TaskCreatedPayload, TaskDeletedPayload, TaskId, TaskRenamedPayload,
 };
+use super::watch::TasksWatcher;
+
+use futures::StreamExt;
 
 /// Typed wrapper around `CortexAdapter<TasksState>` that exposes
 /// domain-level operations (`create`, `rename`, `complete`, `delete`)
@@ -141,6 +144,13 @@ impl TasksAdapter {
     /// lower-level surface.
     pub fn as_cortex(&self) -> &CortexAdapter<TasksState> {
         &self.inner
+    }
+
+    /// Start building a reactive watcher. See
+    /// [`TasksWatcher::stream`] for emission semantics (initial +
+    /// deduplicated on filter-result change).
+    pub fn watch(&self) -> TasksWatcher {
+        TasksWatcher::new(self.inner.state(), self.inner.changes().boxed())
     }
 
     /// Build the `EventEnvelope` + ingest. Keeps bincode serialization

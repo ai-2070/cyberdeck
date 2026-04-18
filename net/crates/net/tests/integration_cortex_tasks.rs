@@ -7,6 +7,7 @@
 
 #![cfg(feature = "cortex-tasks")]
 
+use futures::StreamExt;
 use net::adapter::net::cortex::tasks::{OrderBy, TaskStatus, TasksAdapter};
 use net::adapter::net::redex::Redex;
 #[cfg(feature = "redex-disk")]
@@ -242,6 +243,180 @@ async fn test_query_through_live_adapter() {
     // exists with no match.
     assert!(!guard.query().title_contains("does-not-exist").exists());
     assert!(guard.query().where_status(TaskStatus::Pending).exists());
+}
+
+#[tokio::test]
+async fn test_watch_initial_emission() {
+    // A watcher opened against a non-empty state should yield the
+    // current filter result on the first .next().await.
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+
+    // Pre-populate.
+    tasks.create(1, "a", 100).unwrap();
+    tasks.create(2, "b", 200).unwrap();
+    let seq = tasks.complete(2, 250).unwrap();
+    tasks.wait_for_seq(seq).await;
+
+    let mut stream = Box::pin(
+        tasks
+            .watch()
+            .where_status(TaskStatus::Pending)
+            .order_by(OrderBy::IdAsc)
+            .stream(),
+    );
+
+    let initial = stream.next().await.unwrap();
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0].id, 1);
+}
+
+#[tokio::test]
+async fn test_watch_emits_on_relevant_change() {
+    // After the initial emission, the stream should yield again when
+    // a new event changes the filter result.
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+
+    let mut stream = Box::pin(
+        tasks
+            .watch()
+            .where_status(TaskStatus::Pending)
+            .order_by(OrderBy::IdAsc)
+            .stream(),
+    );
+
+    // Initial: empty.
+    let initial = stream.next().await.unwrap();
+    assert!(initial.is_empty());
+
+    // Create one pending task → stream should yield [task-1].
+    tasks.create(1, "first", 100).unwrap();
+    let next = stream.next().await.unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].id, 1);
+
+    // Create another pending → [1, 2].
+    tasks.create(2, "second", 200).unwrap();
+    let next = stream.next().await.unwrap();
+    assert_eq!(next.len(), 2);
+    assert_eq!(next[0].id, 1);
+    assert_eq!(next[1].id, 2);
+
+    // Complete task 1 → no longer matches Pending; result becomes [2].
+    tasks.complete(1, 300).unwrap();
+    let next = stream.next().await.unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].id, 2);
+}
+
+#[tokio::test]
+async fn test_watch_dedupes_unchanged_results() {
+    // Events that advance the log but don't change the filter result
+    // must NOT cause a duplicate emission.
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+
+    // Seed one pending + one completed.
+    tasks.create(1, "p", 100).unwrap();
+    tasks.create(2, "c", 200).unwrap();
+    let seq = tasks.complete(2, 250).unwrap();
+    tasks.wait_for_seq(seq).await;
+
+    let mut stream = Box::pin(
+        tasks
+            .watch()
+            .where_status(TaskStatus::Pending)
+            .stream(),
+    );
+    let initial = stream.next().await.unwrap();
+    assert_eq!(initial.len(), 1);
+
+    // Append events that DON'T change the pending filter:
+    //   - complete on already-completed id 2 (refresh updated_ns, still completed)
+    //   - rename on completed id 2 (still completed, filter unaffected)
+    tasks.complete(2, 9999).unwrap();
+    let seq = tasks.rename(2, "c-renamed", 9999).unwrap();
+    tasks.wait_for_seq(seq).await;
+
+    // No duplicate should have fired. Assert the next emission only
+    // comes after we do something that DOES change Pending set.
+    tasks.create(3, "p2", 300).unwrap();
+    let next = stream.next().await.unwrap();
+    let ids: Vec<_> = next.iter().map(|t| t.id).collect();
+    assert!(ids.contains(&1));
+    assert!(ids.contains(&3));
+    assert_eq!(ids.len(), 2);
+}
+
+#[tokio::test]
+async fn test_watch_multiple_subscribers_independent() {
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+
+    let mut pending_stream = Box::pin(
+        tasks
+            .watch()
+            .where_status(TaskStatus::Pending)
+            .stream(),
+    );
+    let mut completed_stream = Box::pin(
+        tasks
+            .watch()
+            .where_status(TaskStatus::Completed)
+            .stream(),
+    );
+
+    // Both get an empty initial emission.
+    assert!(pending_stream.next().await.unwrap().is_empty());
+    assert!(completed_stream.next().await.unwrap().is_empty());
+
+    // Create → pending gets [1], completed stays empty (no emit).
+    tasks.create(1, "x", 100).unwrap();
+    let p = pending_stream.next().await.unwrap();
+    assert_eq!(p.len(), 1);
+
+    // Complete → pending becomes empty, completed becomes [1].
+    tasks.complete(1, 200).unwrap();
+    let p = pending_stream.next().await.unwrap();
+    assert!(p.is_empty());
+    let c = completed_stream.next().await.unwrap();
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].id, 1);
+}
+
+#[tokio::test]
+async fn test_watch_with_limit_and_order() {
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+
+    let mut stream = Box::pin(
+        tasks
+            .watch()
+            .where_status(TaskStatus::Pending)
+            .order_by(OrderBy::CreatedDesc)
+            .limit(2)
+            .stream(),
+    );
+
+    // Initial empty.
+    assert!(stream.next().await.unwrap().is_empty());
+
+    for id in 1..=5u64 {
+        tasks.create(id, format!("t-{}", id), 100 * id).unwrap();
+    }
+
+    // Drain until the result stabilizes at [5, 4] (newest two).
+    let mut last: Vec<_> = Vec::new();
+    for _ in 0..5 {
+        last = stream.next().await.unwrap();
+        if last.len() == 2 && last[0].id == 5 && last[1].id == 4 {
+            break;
+        }
+    }
+    assert_eq!(last.len(), 2);
+    assert_eq!(last[0].id, 5);
+    assert_eq!(last[1].id, 4);
 }
 
 #[tokio::test]

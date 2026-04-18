@@ -4,9 +4,10 @@
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use parking_lot::RwLock;
-use tokio::sync::Notify;
+use tokio::sync::{broadcast, Notify};
+use tokio_stream::wrappers::BroadcastStream;
 
 use super::super::channel::ChannelName;
 use super::super::redex::{Redex, RedexEvent, RedexFile, RedexFileConfig, RedexFold};
@@ -24,6 +25,11 @@ pub struct CortexAdapter<State> {
     inner: Arc<AdapterInner<State>>,
 }
 
+/// Capacity of the post-fold change-notification broadcast channel.
+/// A slow subscriber that falls more than this many events behind
+/// gets a `Lagged` signal and should re-read state fresh.
+const CHANGES_BROADCAST_CAP: usize = 64;
+
 struct AdapterInner<State> {
     file: RedexFile,
     state: Arc<RwLock<State>>,
@@ -36,6 +42,9 @@ struct AdapterInner<State> {
     closed: AtomicBool,
     notify: Notify,
     shutdown: Notify,
+    /// Broadcast of RedEX seqs after each successful (or LogAndContinue-skipped)
+    /// fold apply. Subscribers: see [`CortexAdapter::changes`].
+    changes_tx: broadcast::Sender<u64>,
 }
 
 impl<State> CortexAdapter<State> {
@@ -112,6 +121,25 @@ impl<State> CortexAdapter<State> {
         Ok(())
     }
 
+    /// Stream of RedEX sequences, one per successful (or
+    /// `LogAndContinue`-skipped) fold application. Used by reactive
+    /// queries: on each emission, the caller re-reads
+    /// [`Self::state`] to compute its current view.
+    ///
+    /// Lag semantics: if a subscriber falls more than
+    /// [`CHANGES_BROADCAST_CAP`] events behind, the underlying
+    /// broadcast channel drops intermediate events. This
+    /// implementation filters lag errors out silently — by the time
+    /// the subscriber catches up, `state()` reflects the latest
+    /// applied events regardless of how many signals were missed.
+    ///
+    /// The stream ends when all adapter handles have been dropped
+    /// and the fold task has exited.
+    pub fn changes(&self) -> impl Stream<Item = u64> + Send + 'static {
+        BroadcastStream::new(self.inner.changes_tx.subscribe())
+            .filter_map(|r| async move { r.ok() })
+    }
+
     /// Append an envelope. Projects to `(EventMeta, tail)`, builds the
     /// concatenated payload, calls [`RedexFile::append`], and returns
     /// the assigned RedEX sequence.
@@ -158,6 +186,7 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
         // so that `folded_through_seq >= start_seq` holds iff the seq
         // has actually been applied.
         let initial_watermark = (start_seq as i64).wrapping_sub(1);
+        let (changes_tx, _) = broadcast::channel(CHANGES_BROADCAST_CAP);
         let inner = Arc::new(AdapterInner {
             file: file.clone(),
             state: state.clone(),
@@ -167,6 +196,7 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
             closed: AtomicBool::new(false),
             notify: Notify::new(),
             shutdown: Notify::new(),
+            changes_tx,
         });
 
         let policy = adapter_config.on_fold_error;
@@ -252,6 +282,7 @@ where
                 .folded_through_seq
                 .store(seq as i64, Ordering::Release);
             inner.notify.notify_waiters();
+            let _ = inner.changes_tx.send(seq);
             false
         }
         Err(err) => {
@@ -266,6 +297,7 @@ where
                         .folded_through_seq
                         .store(seq as i64, Ordering::Release);
                     inner.notify.notify_waiters();
+                    let _ = inner.changes_tx.send(seq);
                     false
                 }
             }
