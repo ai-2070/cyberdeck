@@ -1,5 +1,7 @@
 # Handshake Relay (via Subprotocol)
 
+> **Status:** Implemented. `SUBPROTOCOL_HANDSHAKE = 0x0601` lives in `src/adapter/net/handshake_relay.rs`; `MeshNode::connect_via(relay_addr, dest_pubkey, dest_node_id)` is the entry point. Covered by `handshake_relay::tests` (4 unit tests) and `three_node_integration::test_mesh_handshake_via_relay` / `test_mesh_handshake_relay_bidirectional`.
+
 ## Problem
 
 `MeshNode::connect()` requires direct UDP connectivity for the Noise NKpsk0 handshake. If A wants a session with C and only B has direct paths to both, A can't establish the session.

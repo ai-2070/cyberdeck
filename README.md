@@ -358,16 +358,17 @@ For implementation details — capabilities, proximity graphs, subnets, channels
 
 ## Status
 
-Net is a working protocol, not a paper design. 894 tests verify the implementation across every layer of the stack.
+Net is a working protocol, not a paper design. 921 tests verify the implementation across every layer of the stack.
 
 **What works today:**
 
 - **Encrypted point-to-point transport.** Noise NKpsk0 handshake, ChaCha20-Poly1305 per-packet encryption, counter-based nonces. Tested over real UDP between adapter instances.
 - **Multi-peer mesh runtime.** `MeshNode` composes encrypted sessions, routing, failure detection, and subprotocol dispatch behind a single UDP socket. Three-node tests prove the full triangle: handshake, data flow, bidirectional, stream isolation, sustained throughput.
 - **Relay forwarding without decryption.** A sends to C through B. B forwards the packet using only the routing header — never decrypts the payload. Verified by AEAD tamper detection: a malicious relay that flips a single byte is caught and the packet is rejected.
+- **Handshake relay via subprotocol.** A node with no direct UDP path to its peer can complete a Noise NKpsk0 handshake through an already-connected relay. Handshake messages ride inside `SUBPROTOCOL_HANDSHAKE` over existing encrypted sessions; the relay sees the authenticated Noise bytes but can't forge them or derive the post-handshake session keys. After handshake, A↔C data flows through B via `send_routed`, with B unable to decrypt.
 - **Automatic rerouting.** When a relay node dies, the `ReroutePolicy` watches the failure detector and automatically updates the routing table to route through an alternate peer. When the failed peer recovers, the original route is restored. No manual intervention, no data loss across the reroute boundary.
 - **Failure detection over real sockets.** Heartbeat timeout → suspected → failed → recovered lifecycle, proven through the MeshNode runtime with configurable timing.
-- **Migration (Mikoshi) over the wire.** TakeSnapshot messages flow from orchestrator to source over encrypted UDP. The source handler takes the snapshot and sends SnapshotReady back. The orchestrator's state machine advances. Proven end-to-end over real sockets, not just in-process simulation.
+- **Full 6-phase migration lifecycle (Mikoshi).** The entire chain — TakeSnapshot → SnapshotReady → Restore → Replay → Cutover → Cleanup → Activate — runs autonomously over encrypted UDP. The orchestrator chains messages through the subprotocol response path; the target reassembles chunked snapshots, restores the daemon via a local `DaemonFactoryRegistry`, drains buffered events in causal order, and activates as the authoritative copy once the source has cleaned up. End-to-end three-node test (orchestrator A, source B, target C) verifies the daemon ends up registered on C, unregistered from B, and the orchestrator record is cleared.
 - **Partition simulation and healing.** Per-peer packet filter blocks all traffic (inbound, outbound, heartbeats). Failure detector marks blocked peers as failed. Unblocking restores heartbeats and data flow. Asymmetric three-node partitions (one node isolated, other two unaffected) verified.
 - **Subnet gateway enforcement.** SubnetLocal traffic blocked at boundaries, Global traffic forwarded, Exported traffic selectively routed, ParentVisible restricted to ancestors.
 - **Correlated failure detection.** Independent vs mass failure classification based on configurable thresholds. Recovery budget throttled during mass failure.
@@ -375,9 +376,9 @@ Net is a working protocol, not a paper design. 894 tests verify the implementati
 
 **What needs protocol work:**
 
-- **Full 6-phase migration lifecycle.** The first round-trip (TakeSnapshot → SnapshotReady) is proven over wire. The remaining phases (restore, replay, cutover, cleanup) need the orchestrator to chain messages automatically through the subprotocol response path.
-- **Handshake relay.** Currently, nodes must have direct UDP connectivity to exchange Noise handshakes. Relaying handshakes through intermediate nodes is not yet implemented.
 - **Multi-hop reroute testing.** ProximityGraph-guided rerouting is implemented — `path_to()` is queried for multi-hop alternates before falling back to direct peers. End-to-end tests require 4+ nodes to exercise the multi-hop path; current tests validate the mechanism with direct peers.
+- **Multi-hop handshake relay.** Handshake relay currently requires the relay to have a direct session with both initiator and responder. Chains longer than one relay would need the forwarding path to re-encrypt between successive hops, analogous to how routed data packets are forwarded today.
+- **Secure keypair transfer for migration.** The `DaemonFactoryRegistry` assumes the target has been provisioned with the daemon's `EntityKeypair` out-of-band. Transferring the private key securely from source to target at migration time is a separate security design problem.
 
 ## SDKs
 

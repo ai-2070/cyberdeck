@@ -66,11 +66,11 @@ Snapshot -> Transfer -> Restore -> Replay -> Cutover -> Complete
 | Phase | What happens |
 |-------|-------------|
 | **Snapshot** | Take `StateSnapshot` on source node (daemon state + chain head + horizon) |
-| **Transfer** | Send snapshot to target node via `SUBPROTOCOL_MIGRATION` (0x0500) |
-| **Restore** | Call `daemon.restore(state)` on target, start buffering new events |
-| **Replay** | Replay buffered events on target (events that arrived during transfer) |
-| **Cutover** | Atomic routing switch -- new events go to target |
-| **Complete** | Cleanup source, migration done |
+| **Transfer** | Send snapshot to target node via `SUBPROTOCOL_MIGRATION` (0x0500), chunked if needed |
+| **Restore** | Reassemble chunks, resolve local `DaemonFactoryRegistry` entry, call `DaemonHost::from_snapshot()` and register the daemon on target. Target starts buffering in-flight events. |
+| **Replay** | Target replays buffered events in strict sequence order from source, drains to daemon |
+| **Cutover** | Source stops accepting writes and cleans up; daemon is unregistered from source registry |
+| **Complete** | Orchestrator emits `ActivateTarget` to target; target calls `activate()`, drains remaining events, replies with `ActivateAck`; orchestrator removes the migration record |
 
 Phase transitions are validated -- calling `set_snapshot()` in the wrong phase returns `MigrationError::WrongPhase`. The snapshot's `origin_hash` is verified against the daemon being migrated.
 
@@ -114,13 +114,17 @@ Events arriving during migration are buffered and replayed after restore. This e
 ### Target Handler
 
 `MigrationTargetHandler` manages the target node's role:
-- Restores a daemon from a snapshot via `DaemonHost::from_snapshot()`
+- Restores a daemon from a snapshot via `DaemonHost::from_snapshot()`, using a factory + keypair + config resolved from a local `DaemonFactoryRegistry`
 - Replays buffered events in strict sequence order (uses `BTreeMap` for out-of-order arrival handling)
 - Activates as the authoritative copy after cutover
 
+### DaemonFactoryRegistry
+
+`DaemonHost::from_snapshot()` needs a freshly constructed daemon instance plus the daemon's `EntityKeypair` and host config. Neither can cross the wire (closures aren't serializable; key transfer is a separate security problem). The `DaemonFactoryRegistry` on each potential target resolves `origin_hash → {factory, keypair, config}` locally when a `SnapshotReady` arrives. Entries are consumed on `take()` so double-restore surfaces loudly instead of silently re-initialising state. Construct the handler with `MigrationTargetHandler::new_with_factories(registry, factories)` to enable auto-restore; `::new(registry)` keeps the registry empty for source-only nodes.
+
 ### Migration Wire Protocol
 
-8 message types over `SUBPROTOCOL_MIGRATION` (0x0500):
+10 message types over `SUBPROTOCOL_MIGRATION` (0x0500):
 
 | Message | Direction | Purpose |
 |---------|-----------|---------|
@@ -131,6 +135,8 @@ Events arriving during migration are buffered and replayed after restore. This e
 | `ReplayComplete` | Target → Orchestrator | Replay done |
 | `CutoverNotify` | Orchestrator → Source | Stop writes |
 | `CleanupComplete` | Source → Orchestrator | Source cleaned up |
+| `ActivateTarget` | Orchestrator → Target | Go live — drain remaining events and become authoritative |
+| `ActivateAck` | Target → Orchestrator | Activation complete; migration terminus |
 | `MigrationFailed` | Any → All | Abort |
 
 ### Snapshot Chunking

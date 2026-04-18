@@ -2634,9 +2634,9 @@ use net::adapter::net::behavior::capability::CapabilityFilter;
 use net::adapter::net::compute::orchestrator::wire as migration_wire;
 use net::adapter::net::state::causal::CausalEvent;
 use net::adapter::net::{
-    DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, MeshDaemon, MigrationMessage,
-    MigrationOrchestrator, MigrationPhase, MigrationSourceHandler, MigrationSubprotocolHandler,
-    MigrationTargetHandler, SUBPROTOCOL_MIGRATION,
+    DaemonError, DaemonFactoryRegistry, DaemonHost, DaemonHostConfig, DaemonRegistry, MeshDaemon,
+    MigrationMessage, MigrationOrchestrator, MigrationPhase, MigrationSourceHandler,
+    MigrationSubprotocolHandler, MigrationTargetHandler, SUBPROTOCOL_MIGRATION,
 };
 
 /// Simple stateful daemon for migration testing.
@@ -2801,7 +2801,7 @@ async fn test_migration_full_lifecycle_over_wire() {
     let daemon_origin = daemon_kp.origin_hash();
     let host = DaemonHost::new(
         Box::new(CounterDaemon::with_count(42)),
-        daemon_kp,
+        daemon_kp.clone(),
         DaemonHostConfig::default(),
     );
     registry_b.register(host).unwrap();
@@ -2827,12 +2827,23 @@ async fn test_migration_full_lifecycle_over_wire() {
         nid_b,
     ));
 
-    // C: target node — needs a handler to receive snapshot and restore
+    // C: target node — register a factory so the subprotocol handler can
+    // auto-restore the daemon when SnapshotReady arrives over the wire.
     let registry_c = Arc::new(DaemonRegistry::new());
+    let factories_c = Arc::new(DaemonFactoryRegistry::new());
+    factories_c.register(
+        daemon_origin,
+        daemon_kp.clone(),
+        DaemonHostConfig::default(),
+        || Box::new(CounterDaemon::with_count(0)),
+    );
     let handler_c = Arc::new(MigrationSubprotocolHandler::new(
         Arc::new(MigrationOrchestrator::new(registry_c.clone(), nid_c)),
         Arc::new(MigrationSourceHandler::new(registry_c.clone())),
-        Arc::new(MigrationTargetHandler::new(registry_c.clone())),
+        Arc::new(MigrationTargetHandler::new_with_factories(
+            registry_c.clone(),
+            factories_c.clone(),
+        )),
         nid_c,
     ));
 
@@ -2882,30 +2893,31 @@ async fn test_migration_full_lifecycle_over_wire() {
         .await
         .unwrap();
 
-    // Wait for B to process TakeSnapshot and send SnapshotReady back to A.
-    // A's handler receives it and calls orch_a.on_snapshot_ready().
+    // Wait for the full round trip: B takes snapshot, ships to A, A forwards
+    // to C, C restores, Restore/Replay/Cutover/Cleanup/Activate chain back.
     tokio::time::sleep(Duration::from_millis(3000)).await;
 
-    // Verify B processed TakeSnapshot
+    // Verify B processed TakeSnapshot (source_handler has an in-flight record).
     let source_check = source_b.start_snapshot(daemon_origin, 0x9999);
     assert!(
         source_check.is_err(),
         "B should have processed TakeSnapshot"
     );
 
-    // Verify A's orchestrator advanced past Snapshot
-    let phase = orch_a.status(daemon_origin);
+    // After the full lifecycle chains end-to-end, A's orchestrator record
+    // should have been torn down at ActivateAck. The daemon lives on C and
+    // has been unregistered from B by source_handler.cleanup.
     assert!(
-        phase.is_some(),
-        "orchestrator should still be tracking the migration"
+        !orch_a.is_migrating(daemon_origin),
+        "orchestrator record should be removed after ActivateAck"
     );
-    let phase = phase.unwrap();
-    assert_ne!(
-        phase,
-        MigrationPhase::Snapshot,
-        "orchestrator should have advanced past Snapshot (got {:?}). \
-         SnapshotReady was received and processed over wire.",
-        phase
+    assert!(
+        registry_c.contains(daemon_origin),
+        "daemon should be registered on target C after full lifecycle"
+    );
+    assert!(
+        !registry_b.contains(daemon_origin),
+        "daemon should be unregistered from source B after cleanup"
     );
 
     node_a.shutdown().await.unwrap();

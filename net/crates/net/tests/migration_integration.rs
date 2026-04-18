@@ -131,8 +131,16 @@ fn test_orchestrator_full_phase_chain() {
     orch.on_cutover_acknowledged(origin).unwrap();
     assert_eq!(orch.status(origin), Some(MigrationPhase::Complete));
 
-    // Phase 5: Cleanup complete
-    orch.on_cleanup_complete(origin).unwrap();
+    // Phase 5: Cleanup complete — orchestrator emits ActivateTarget
+    let activate = orch.on_cleanup_complete(origin).unwrap();
+    match activate {
+        MigrationMessage::ActivateTarget { daemon_origin } => {
+            assert_eq!(daemon_origin, origin);
+        }
+        _ => panic!("expected ActivateTarget"),
+    }
+    // Phase 6: Target acknowledges activation — migration terminus.
+    orch.on_activate_ack(origin, 42).unwrap();
     assert!(!orch.is_migrating(origin));
     assert_eq!(orch.active_count(), 0);
 }
@@ -169,6 +177,7 @@ fn test_orchestrator_phase_chain_with_buffered_events() {
     orch.on_replay_complete(origin, 15).unwrap();
     orch.on_cutover_acknowledged(origin).unwrap();
     orch.on_cleanup_complete(origin).unwrap();
+    orch.on_activate_ack(origin, 15).unwrap();
     assert!(!orch.is_migrating(origin));
 }
 
@@ -266,6 +275,7 @@ fn test_end_to_end_migration_local_source() {
     // Target completes
     target_handler.complete(origin).unwrap();
     orch.on_cleanup_complete(origin).unwrap();
+    orch.on_activate_ack(origin, 5).unwrap();
 
     // Verify: daemon lives on target, not on source
     assert!(target_reg.contains(origin));
@@ -477,15 +487,33 @@ fn test_subprotocol_handler_cleanup_complete_dispatch() {
     orch.on_cutover_acknowledged(origin).unwrap();
     assert!(orch.is_migrating(origin));
 
-    // Send CleanupComplete
+    // Send CleanupComplete — should emit ActivateTarget to target.
     let cleanup_msg = MigrationMessage::CleanupComplete {
         daemon_origin: origin,
     };
     let outbound = handler
         .handle_message(&wire::encode(&cleanup_msg).unwrap(), 0x1111)
         .unwrap();
-    assert!(outbound.is_empty()); // no response needed
-    assert!(!orch.is_migrating(origin)); // migration removed
+    assert_eq!(outbound.len(), 1);
+    assert_eq!(outbound[0].dest_node, 0x2222, "ActivateTarget to target");
+    match wire::decode(&outbound[0].payload).unwrap() {
+        MigrationMessage::ActivateTarget { daemon_origin } => {
+            assert_eq!(daemon_origin, origin);
+        }
+        other => panic!("expected ActivateTarget, got {:?}", other),
+    }
+    assert!(orch.is_migrating(origin), "record kept until activate ack");
+
+    // Now send ActivateAck — migration terminus.
+    let ack = MigrationMessage::ActivateAck {
+        daemon_origin: origin,
+        replayed_seq: 1,
+    };
+    let outbound = handler
+        .handle_message(&wire::encode(&ack).unwrap(), 0x2222)
+        .unwrap();
+    assert!(outbound.is_empty());
+    assert!(!orch.is_migrating(origin));
 }
 
 // ── 6. Reassembler with out-of-order chunks ──────────────────────────────────
@@ -690,6 +718,7 @@ fn test_concurrent_migrations_no_interference() {
     orch.on_replay_complete(origin_a, 100).unwrap();
     orch.on_cutover_acknowledged(origin_a).unwrap();
     orch.on_cleanup_complete(origin_a).unwrap();
+    orch.on_activate_ack(origin_a, 100).unwrap();
 
     // B should still be active
     assert!(!orch.is_migrating(origin_a));
@@ -701,6 +730,7 @@ fn test_concurrent_migrations_no_interference() {
     orch.on_replay_complete(origin_b, 200).unwrap();
     orch.on_cutover_acknowledged(origin_b).unwrap();
     orch.on_cleanup_complete(origin_b).unwrap();
+    orch.on_activate_ack(origin_b, 200).unwrap();
 
     assert_eq!(orch.active_count(), 0);
 }
@@ -2149,4 +2179,327 @@ fn test_gap_promote_empty_buffer() {
     let event = make_event(0xFFFF, 1);
     let outputs = reg.deliver(new_active, &event).unwrap();
     assert_eq!(outputs.len(), 1);
+}
+
+// ============================================================================
+// Full 6-phase lifecycle over the subprotocol
+// ============================================================================
+//
+// These tests drive the whole migration through the wire handler instead of
+// calling the source/target/orchestrator methods directly. Each node has its
+// own `MigrationSubprotocolHandler`; `OutboundMigrationMessage`s are ferried
+// between handlers by the test harness, emulating the receive loop.
+
+use net::adapter::net::compute::{DaemonFactoryRegistry, MigrationError};
+use net::adapter::net::subprotocol::{MigrationSubprotocolHandler, OutboundMigrationMessage};
+
+/// Node identity for wire-level tests: one handler plus direct access to the
+/// registries backing it. Each node holds its own orchestrator/source/target
+/// even though in production only the node initiating the migration has an
+/// "active" orchestrator record — the types are cheap so it keeps the harness
+/// uniform.
+struct WireNode {
+    node_id: u64,
+    reg: Arc<DaemonRegistry>,
+    factories: Arc<DaemonFactoryRegistry>,
+    handler: Arc<MigrationSubprotocolHandler>,
+    orch: Arc<MigrationOrchestrator>,
+}
+
+impl WireNode {
+    fn new(node_id: u64) -> Self {
+        let reg = Arc::new(DaemonRegistry::new());
+        let factories = Arc::new(DaemonFactoryRegistry::new());
+        let orch = Arc::new(MigrationOrchestrator::new(reg.clone(), node_id));
+        let source = Arc::new(MigrationSourceHandler::new(reg.clone()));
+        let target =
+            Arc::new(MigrationTargetHandler::new_with_factories(reg.clone(), factories.clone()));
+        let handler = Arc::new(MigrationSubprotocolHandler::new(
+            orch.clone(),
+            source,
+            target,
+            node_id,
+        ));
+        Self {
+            node_id,
+            reg,
+            factories,
+            handler,
+            orch,
+        }
+    }
+}
+
+/// Ferry outbound messages between nodes until no more are produced. The
+/// `nodes` map is keyed by node_id.
+fn pump_messages(
+    nodes: &std::collections::HashMap<u64, Arc<MigrationSubprotocolHandler>>,
+    mut queue: Vec<(u64, OutboundMigrationMessage)>,
+) -> Result<(), MigrationError> {
+    let mut iterations = 0;
+    while let Some((from, msg)) = queue.pop() {
+        iterations += 1;
+        assert!(
+            iterations < 100,
+            "message pump runaway — likely a feedback loop"
+        );
+        let dest = nodes
+            .get(&msg.dest_node)
+            .unwrap_or_else(|| panic!("no node for dest {:#x}", msg.dest_node));
+        let outbound = dest.handle_message(&msg.payload, from)?;
+        for out in outbound {
+            queue.push((msg.dest_node, out));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_migration_full_lifecycle_over_subprotocol_single_chunk() {
+    // Three nodes: O (orchestrator/source, 0x1111) and T (target, 0x2222).
+    // In this simple case the orchestrator and source are the same node.
+    let source = WireNode::new(0x1111);
+    let target = WireNode::new(0x2222);
+
+    // Register the daemon on source with some state built up.
+    let (kp, origin) = register_counter_daemon(&source.reg, 100);
+    for seq in 1..=5 {
+        source.reg.deliver(origin, &make_event(0xFFFF, seq)).unwrap();
+    }
+
+    // Register a factory on the target so the handler can construct a
+    // daemon instance when the snapshot arrives.
+    target.factories.register(
+        origin,
+        kp.clone(),
+        DaemonHostConfig::default(),
+        || Box::new(CounterDaemon::new()),
+    );
+
+    let nodes: std::collections::HashMap<u64, Arc<MigrationSubprotocolHandler>> = [
+        (source.node_id, source.handler.clone()),
+        (target.node_id, target.handler.clone()),
+    ]
+    .into_iter()
+    .collect();
+
+    // Kick off: orchestrator starts migration. Since the orchestrator is
+    // local to the source, this returns a SnapshotReady directly.
+    let start_msg = source
+        .orch
+        .start_migration(origin, source.node_id, target.node_id)
+        .unwrap();
+    let initial = OutboundMigrationMessage {
+        dest_node: source.node_id,
+        payload: net::adapter::net::compute::orchestrator::wire::encode(&start_msg).unwrap(),
+    };
+
+    pump_messages(&nodes, vec![(source.node_id, initial)]).unwrap();
+
+    // Assertions: daemon lives on target, gone from source, migration
+    // record cleared on both orchestrator and target.
+    assert!(target.reg.contains(origin), "daemon should be on target");
+    assert!(!source.reg.contains(origin), "daemon should be gone from source");
+    assert!(!source.orch.is_migrating(origin), "orchestrator record removed");
+    // Factory was consumed on restore.
+    assert!(!target.factories.contains(origin));
+}
+
+#[test]
+fn test_migration_full_lifecycle_over_subprotocol_multi_chunk() {
+    // Same shape as single-chunk, but with a state that's big enough to
+    // force snapshot chunking. The CounterDaemon only emits 8 bytes of
+    // state though — we can't easily force multi-chunk without changing
+    // the daemon. Instead, we test the reassembly path directly via a
+    // BigBlobDaemon whose state is large.
+    struct BigBlobDaemon {
+        state: Vec<u8>,
+    }
+    impl MeshDaemon for BigBlobDaemon {
+        fn name(&self) -> &str { "blob" }
+        fn requirements(&self) -> CapabilityFilter { CapabilityFilter::default() }
+        fn process(&mut self, _: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
+            Ok(vec![])
+        }
+        fn snapshot(&self) -> Option<Bytes> {
+            Some(Bytes::from(self.state.clone()))
+        }
+        fn restore(&mut self, s: Bytes) -> Result<(), DaemonError> {
+            self.state = s.to_vec();
+            Ok(())
+        }
+    }
+
+    let source = WireNode::new(0x1111);
+    let target = WireNode::new(0x2222);
+
+    let kp = EntityKeypair::generate();
+    let origin = kp.origin_hash();
+    // 3 full chunks + a tail.
+    let blob_size = MAX_SNAPSHOT_CHUNK_SIZE * 3 + 500;
+    let blob = vec![0xABu8; blob_size];
+    let host = DaemonHost::new(
+        Box::new(BigBlobDaemon { state: blob.clone() }),
+        kp.clone(),
+        DaemonHostConfig::default(),
+    );
+    source.reg.register(host).unwrap();
+
+    target.factories.register(
+        origin,
+        kp.clone(),
+        DaemonHostConfig::default(),
+        move || {
+            Box::new(BigBlobDaemon {
+                state: Vec::new(),
+            })
+        },
+    );
+
+    let nodes: std::collections::HashMap<u64, Arc<MigrationSubprotocolHandler>> = [
+        (source.node_id, source.handler.clone()),
+        (target.node_id, target.handler.clone()),
+    ]
+    .into_iter()
+    .collect();
+
+    // start_migration on the local source returns multi-chunk SnapshotReady?
+    // No — it returns a single SnapshotReady; the subprotocol handler's
+    // TakeSnapshot path is where chunking happens. So here we have to go
+    // through the wire: treat the orchestrator as if it were remote by
+    // sending a TakeSnapshot to ourselves first.
+    //
+    // Simpler: manually take the snapshot + chunk it + feed each chunk
+    // through the target handler as if they arrived over the wire.
+    let snapshot = source.reg.snapshot(origin).unwrap().unwrap();
+    assert!(snapshot.state.len() >= blob_size);
+    let snapshot_bytes = snapshot.to_bytes();
+    let chunks = chunk_snapshot(origin, snapshot_bytes, snapshot.through_seq).unwrap();
+    assert!(chunks.len() >= 2, "expected multi-chunk snapshot");
+
+    // Seed orchestrator record manually (start_migration won't chunk for
+    // local source).
+    source
+        .orch
+        .start_migration(origin, source.node_id, target.node_id)
+        .unwrap();
+
+    // Feed each chunk into the target via the handler.
+    let mut queue: Vec<(u64, OutboundMigrationMessage)> = Vec::new();
+    for chunk in chunks {
+        let encoded = net::adapter::net::compute::orchestrator::wire::encode(&chunk).unwrap();
+        queue.push((
+            source.node_id,
+            OutboundMigrationMessage {
+                dest_node: target.node_id,
+                payload: encoded,
+            },
+        ));
+    }
+    pump_messages(&nodes, queue).unwrap();
+
+    // After restore, target registry holds the daemon.
+    assert!(target.reg.contains(origin), "daemon restored on target");
+}
+
+#[test]
+fn test_migration_fails_when_no_factory_registered() {
+    let source = WireNode::new(0x1111);
+    let target = WireNode::new(0x2222);
+
+    let (_kp, origin) = register_counter_daemon(&source.reg, 7);
+
+    // Intentionally do NOT register a factory on target.
+
+    let nodes: std::collections::HashMap<u64, Arc<MigrationSubprotocolHandler>> = [
+        (source.node_id, source.handler.clone()),
+        (target.node_id, target.handler.clone()),
+    ]
+    .into_iter()
+    .collect();
+
+    let start_msg = source
+        .orch
+        .start_migration(origin, source.node_id, target.node_id)
+        .unwrap();
+    let initial = OutboundMigrationMessage {
+        dest_node: source.node_id,
+        payload: net::adapter::net::compute::orchestrator::wire::encode(&start_msg).unwrap(),
+    };
+    pump_messages(&nodes, vec![(source.node_id, initial)]).unwrap();
+
+    // Target should not have the daemon; source should still have it.
+    assert!(!target.reg.contains(origin), "target must not restore without factory");
+    assert!(source.reg.contains(origin), "source daemon preserved on failure");
+    // The orchestrator's migration record should be torn down (abort path).
+    assert!(!source.orch.is_migrating(origin));
+}
+
+#[test]
+fn test_migration_fails_on_corrupted_snapshot() {
+    // Hand-craft a SnapshotReady with garbage bytes and send it to a
+    // target. The handler should emit MigrationFailed and the target's
+    // registry must be untouched.
+    let source = WireNode::new(0x1111);
+    let target = WireNode::new(0x2222);
+
+    let kp = EntityKeypair::generate();
+    let origin = kp.origin_hash();
+    target.factories.register(
+        origin,
+        kp,
+        DaemonHostConfig::default(),
+        || Box::new(CounterDaemon::new()),
+    );
+
+    let junk = MigrationMessage::SnapshotReady {
+        daemon_origin: origin,
+        snapshot_bytes: vec![0xFFu8; 32], // too short to be a valid StateSnapshot
+        seq_through: 0,
+        chunk_index: 0,
+        total_chunks: 1,
+    };
+    let payload = net::adapter::net::compute::orchestrator::wire::encode(&junk).unwrap();
+    let outbound = target
+        .handler
+        .handle_message(&payload, source.node_id)
+        .unwrap();
+
+    let failed = outbound
+        .iter()
+        .find_map(|o| match net::adapter::net::compute::orchestrator::wire::decode(&o.payload)
+            .ok()?
+        {
+            MigrationMessage::MigrationFailed { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .expect("expected MigrationFailed");
+    assert!(
+        failed.contains("parse snapshot") || failed.contains("reassembly"),
+        "unexpected failure reason: {}",
+        failed
+    );
+    assert!(!target.reg.contains(origin));
+    // Factory should still be registered — the bad snapshot took nothing
+    // from the registry because restore never started.
+    assert!(target.factories.contains(origin));
+}
+
+#[test]
+fn test_activate_target_without_prior_restore_errors_gracefully() {
+    // ActivateTarget for an origin that was never restored should not
+    // panic. The target handler returns an error, which the subprotocol
+    // handler propagates up as a Result::Err.
+    let target = WireNode::new(0x2222);
+
+    let msg = MigrationMessage::ActivateTarget {
+        daemon_origin: 0xDEADBEEF,
+    };
+    let payload = net::adapter::net::compute::orchestrator::wire::encode(&msg).unwrap();
+    let result = target.handler.handle_message(&payload, 0x1111);
+    assert!(
+        matches!(result, Err(MigrationError::DaemonNotFound(0xDEADBEEF))),
+        "expected DaemonNotFound, got {:?}",
+        result
+    );
 }

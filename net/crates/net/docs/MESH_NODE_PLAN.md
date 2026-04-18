@@ -1,5 +1,7 @@
 # MeshNode: Composing the Protocol Layers
 
+> **Status:** Implemented. `MeshNode` lives in `src/adapter/net/mesh.rs` and is covered by `three_node_integration`'s 49 tests over real encrypted UDP. The gaps listed in the "Problem" section below (relay without decryption, auto-reroute, migration over transport, subnet-gateway enforcement on real packets, handshake relay) are now closed. This document is preserved for design rationale.
+
 ## Problem
 
 `NetAdapter` is point-to-point (one peer, one encrypted session). `NetRouter` is a standalone packet forwarder. `FailureDetector`, `SubprotocolHandler`, `SubnetGateway`, and `CapabilityIndex` are independent components. There is no runtime that composes them into a multi-peer mesh node.

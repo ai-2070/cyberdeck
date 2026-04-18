@@ -12,6 +12,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 
 use super::daemon::{DaemonHostConfig, MeshDaemon};
+use super::daemon_factory::DaemonFactoryRegistry;
 use super::host::DaemonHost;
 use super::migration::{MigrationError, MigrationPhase};
 use super::registry::DaemonRegistry;
@@ -45,15 +46,46 @@ pub struct MigrationTargetHandler {
     daemon_registry: Arc<DaemonRegistry>,
     /// Active migrations on this node as target: daemon_origin → state.
     migrations: DashMap<u32, Mutex<TargetMigrationState>>,
+    /// Factories for constructing daemon instances during restore.
+    ///
+    /// Consulted by the subprotocol handler when it has a reassembled
+    /// snapshot but needs a fresh daemon instance + keypair + config to
+    /// pass to [`MigrationTargetHandler::restore_snapshot`]. Empty when
+    /// the handler is created via `new()`.
+    factories: Arc<DaemonFactoryRegistry>,
 }
 
 impl MigrationTargetHandler {
-    /// Create a new target handler.
+    /// Create a new target handler with no daemon factories registered.
+    ///
+    /// Use this on nodes that are source-only, or in unit tests that call
+    /// `restore_snapshot` directly with an inline factory closure. For a
+    /// node that the subprotocol handler should auto-restore onto, use
+    /// [`MigrationTargetHandler::new_with_factories`] instead.
     pub fn new(daemon_registry: Arc<DaemonRegistry>) -> Self {
+        Self::new_with_factories(daemon_registry, DaemonFactoryRegistry::empty())
+    }
+
+    /// Create a target handler backed by a shared factory registry.
+    ///
+    /// The subprotocol handler resolves restore inputs through this
+    /// registry; if a migration arrives for an origin that hasn't been
+    /// registered, the handler fails the migration instead of silently
+    /// ignoring it.
+    pub fn new_with_factories(
+        daemon_registry: Arc<DaemonRegistry>,
+        factories: Arc<DaemonFactoryRegistry>,
+    ) -> Self {
         Self {
             daemon_registry,
             migrations: DashMap::new(),
+            factories,
         }
+    }
+
+    /// Access the factory registry (for the subprotocol handler).
+    pub fn factories(&self) -> &Arc<DaemonFactoryRegistry> {
+        &self.factories
     }
 
     /// Phase 2: Restore a daemon from a snapshot.

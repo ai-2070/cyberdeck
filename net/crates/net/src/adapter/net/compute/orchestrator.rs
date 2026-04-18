@@ -93,6 +93,24 @@ pub enum MigrationMessage {
         /// Events to replay, in causal order.
         events: Vec<CausalEvent>,
     },
+
+    /// Phase 5→6: Source has cleaned up; target should now go live.
+    ///
+    /// Emitted by the orchestrator once it observes `CleanupComplete`. The
+    /// target calls `MigrationTargetHandler::activate` in response and
+    /// replies with `ActivateAck`.
+    ActivateTarget {
+        /// Origin hash of daemon whose target should activate.
+        daemon_origin: u32,
+    },
+
+    /// Phase 6: Target has activated and is now authoritative.
+    ActivateAck {
+        /// Origin hash of daemon whose migration is complete.
+        daemon_origin: u32,
+        /// Sequence number the target is authoritative through.
+        replayed_seq: u64,
+    },
 }
 
 // ── Wire format ─────────────────────────────────────────────────────────────
@@ -118,6 +136,10 @@ pub mod wire {
     pub const MSG_FAILED: u8 = 6;
     /// Wire type: buffered events for replay.
     pub const MSG_BUFFERED_EVENTS: u8 = 7;
+    /// Wire type: orchestrator tells target to activate.
+    pub const MSG_ACTIVATE_TARGET: u8 = 8;
+    /// Wire type: target acknowledges activation.
+    pub const MSG_ACTIVATE_ACK: u8 = 9;
 
     /// Encode a migration message to bytes.
     ///
@@ -219,6 +241,18 @@ pub mod wire {
                     buf.extend_from_slice(&event.payload);
                     buf.put_u64_le(event.received_at);
                 }
+            }
+            MigrationMessage::ActivateTarget { daemon_origin } => {
+                buf.put_u8(MSG_ACTIVATE_TARGET);
+                buf.put_u32_le(*daemon_origin);
+            }
+            MigrationMessage::ActivateAck {
+                daemon_origin,
+                replayed_seq,
+            } => {
+                buf.put_u8(MSG_ACTIVATE_ACK);
+                buf.put_u32_le(*daemon_origin);
+                buf.put_u64_le(*replayed_seq);
             }
         }
 
@@ -399,6 +433,27 @@ pub mod wire {
                 Ok(MigrationMessage::BufferedEvents {
                     daemon_origin,
                     events,
+                })
+            }
+            MSG_ACTIVATE_TARGET => {
+                if cur.remaining() < 4 {
+                    return Err(MigrationError::StateFailed(
+                        "truncated ActivateTarget".into(),
+                    ));
+                }
+                Ok(MigrationMessage::ActivateTarget {
+                    daemon_origin: cur.get_u32_le(),
+                })
+            }
+            MSG_ACTIVATE_ACK => {
+                if cur.remaining() < 12 {
+                    return Err(MigrationError::StateFailed(
+                        "truncated ActivateAck".into(),
+                    ));
+                }
+                Ok(MigrationMessage::ActivateAck {
+                    daemon_origin: cur.get_u32_le(),
+                    replayed_seq: cur.get_u64_le(),
                 })
             }
             _ => Err(MigrationError::StateFailed(format!(
@@ -983,10 +1038,42 @@ impl MigrationOrchestrator {
         Ok(())
     }
 
-    /// Handle cleanup complete from source.
+    /// Handle cleanup complete from source (phase 5→6).
     ///
-    /// Removes the migration record entirely.
-    pub fn on_cleanup_complete(&self, daemon_origin: u32) -> Result<(), MigrationError> {
+    /// The source has stopped accepting writes and freed its local daemon
+    /// state. Advances Cutover→Complete on the orchestrator — the source's
+    /// local `on_cutover_acknowledged` call is a no-op when the orchestrator
+    /// lives on a different node (it operates on the source's local
+    /// orchestrator, which has no record), so `CleanupComplete` is the
+    /// authoritative signal on the orchestrator side. The record is kept in
+    /// place until the target acknowledges activation via `on_activate_ack`,
+    /// so the subprotocol handler still has somewhere to look up
+    /// `target_node` when it needs to route `ActivateTarget`.
+    pub fn on_cleanup_complete(
+        &self,
+        daemon_origin: u32,
+    ) -> Result<MigrationMessage, MigrationError> {
+        let entry = self
+            .migrations
+            .get(&daemon_origin)
+            .ok_or(MigrationError::DaemonNotFound(daemon_origin))?;
+        let mut record = entry.lock();
+        if record.state.phase() == MigrationPhase::Cutover {
+            record.state.cutover_complete()?;
+        }
+        Ok(MigrationMessage::ActivateTarget { daemon_origin })
+    }
+
+    /// Handle activation acknowledgement from target (phase 6 terminus).
+    ///
+    /// The target has drained remaining events and is now the authoritative
+    /// copy. This is the true end of the migration lifecycle; the record is
+    /// removed here, not in `on_cleanup_complete`.
+    pub fn on_activate_ack(
+        &self,
+        daemon_origin: u32,
+        _replayed_seq: u64,
+    ) -> Result<(), MigrationError> {
         self.migrations
             .remove(&daemon_origin)
             .ok_or(MigrationError::DaemonNotFound(daemon_origin))?;

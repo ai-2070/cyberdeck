@@ -1,5 +1,7 @@
 # Migration Lifecycle: Full 6-Phase Auto-Chaining
 
+> **Status:** Implemented. `DaemonFactoryRegistry` lives in `src/adapter/net/compute/daemon_factory.rs`; `ActivateTarget` / `ActivateAck` wire messages (tags 0x08 / 0x09) are in `compute/orchestrator.rs`; reassembly + target-side restore + activation branches are in `subprotocol/migration_handler.rs`. The wire-level three-node test is `three_node_integration::test_migration_full_lifecycle_over_wire`, and handler-level coverage is in `migration_integration::test_migration_full_lifecycle_over_subprotocol_*` (single-chunk, multi-chunk, no-factory, corrupt snapshot, activate-without-restore).
+
 ## Problem
 
 The migration state machine has 6 phases: **Snapshot → Transfer → Restore → Replay → Cutover → Complete**. Only the first round-trip (TakeSnapshot → SnapshotReady) runs autonomously through the subprotocol; the remaining phases are exercised only when a test drives them by calling `target_handler.restore_snapshot()`, `target_handler.activate()`, etc. directly.

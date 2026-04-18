@@ -14,6 +14,7 @@ Every Net packet carries a `subprotocol_id: u16` identifying how the payload sho
 | `0x0401` | State snapshots |
 | `0x0500` | Daemon migration |
 | `0x0600` | Subprotocol negotiation |
+| `0x0601` | Handshake relay (relayed Noise NKpsk0) |
 | `0x0700` | Continuity proofs |
 | `0x0701` | Fork announcements |
 | `0x0702` | Continuity proof transfer |

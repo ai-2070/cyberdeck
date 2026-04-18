@@ -65,10 +65,10 @@ pub use channel::{
     ChannelName, ChannelRegistry, Visibility,
 };
 pub use compute::{
-    DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, DaemonStats, MeshDaemon,
-    MigrationError, MigrationMessage, MigrationOrchestrator, MigrationPhase,
-    MigrationSourceHandler, MigrationState, MigrationTargetHandler, PlacementDecision, Scheduler,
-    SchedulerError, SUBPROTOCOL_MIGRATION,
+    DaemonError, DaemonFactoryRegistry, DaemonHost, DaemonHostConfig, DaemonRegistry, DaemonStats,
+    FactoryEntry, MeshDaemon, MigrationError, MigrationMessage, MigrationOrchestrator,
+    MigrationPhase, MigrationSourceHandler, MigrationState, MigrationTargetHandler,
+    PlacementDecision, Scheduler, SchedulerError, SUBPROTOCOL_MIGRATION,
 };
 pub use config::{ConnectionRole, NetAdapterConfig, ReliabilityConfig};
 pub use contested::{
