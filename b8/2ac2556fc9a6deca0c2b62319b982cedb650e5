@@ -1,0 +1,49 @@
+net/crates/net/docs/REDEX_PLAN.md
+  f3669361474f4cb8 1,7,9-11,15,20-21,27,31-34,36,38-39,45,48-49,51,55,68,82,86,88-89,93-108,110-128,131-149,151-155,158-159,162-163,165-171,175,177,179,183-186,191-192,197-225,229,231,242,244,246-248,250,252,254,256-267,269,271-274,276,278,280,282-293,295,297-303,305,307-308,311-312,314,316-322,324,326,328-331,335,337
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "b82ac2556fc9a6deca0c2b62319b982cedb650e5",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 70,
+      "overriden_lines": 0
+    },
+    "a9d311afc8324224": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8e12ea48-52c3-40e2-9655-6d0ab0878bb6",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": null,
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 506,
+      "overriden_lines": 0
+    },
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 508,
+      "total_deletions": 113,
+      "accepted_lines": 1853,
+      "overriden_lines": 0
+    }
+  }
+}
