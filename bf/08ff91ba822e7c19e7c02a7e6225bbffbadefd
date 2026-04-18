@@ -1,0 +1,38 @@
+net/crates/net/src/adapter/net/mesh.rs
+  f3669361474f4cb8 43,58,109-116,214-241,276-279,378,392,473-475,516,594-596,715-723,737-762,814-988,1401,1403-1411,1413-1414,1421-1452,1455-1473,1476-1477,1480-1481,1484-1485,1489-1493,1514-1533,1542,1547-1550,1565,1570-1578,1629-1632,1636,1647-1650,1678-1686
+net/crates/net/src/adapter/net/crypto.rs
+  f3669361474f4cb8 26-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "bf08ff91ba822e7c19e7c02a7e6225bbffbadefd",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 70,
+      "overriden_lines": 0
+    },
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 5304,
+      "total_deletions": 408,
+      "accepted_lines": 406,
+      "overriden_lines": 0
+    }
+  }
+}
