@@ -134,6 +134,20 @@ pub async fn connect_via(
 - `test_mesh_handshake_via_relay`: A↔B↔C, handshake via subprotocol, data flows after
 - `test_mesh_handshake_relay_bidirectional`: C sends data back to A after relayed handshake
 
+## Prerequisite: re-key peers by node_id
+
+The current `MeshNode` stores sessions in `peers: DashMap<SocketAddr, PeerInfo>`. When A connects to C via relay B, both the B session and the C-via-B session share B's address. Inserting the C session overwrites B's, breaking the relay.
+
+**Required refactor before handshake relay:**
+
+1. Change `peers: DashMap<SocketAddr, PeerInfo>` → `peers: DashMap<u64, PeerInfo>` (keyed by node_id)
+2. Add `addr_to_node: DashMap<SocketAddr, u64>` for dispatch_packet (source address → node_id lookup)
+3. Update `dispatch_packet` to resolve source → node_id via the reverse map
+4. Update send methods to resolve node_id → addr via `PeerInfo.addr` field
+5. Add `addr: SocketAddr` field to `PeerInfo`
+
+This is ~50 lines of refactoring, no new features. After this, handshake relay is straightforward — C stores the A session and B session under different node_ids even though they share B's address.
+
 ## Scope
 
-~150 lines new code, 2 tests. Reuses existing `send_subprotocol`, `build_subprotocol`, and the subprotocol dispatch path already proven by migration tests.
+With the prerequisite refactor: ~200 lines total (50 re-key + 100 handshake handler + 50 connect_via). 2 tests.
