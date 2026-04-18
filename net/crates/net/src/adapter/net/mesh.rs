@@ -438,8 +438,7 @@ impl MeshNode {
 
         // Register in proximity graph (1-hop peer)
         let peer_graph_id = node_id_to_graph_id(peer_node_id);
-        let pw = EnhancedPingwave::new(peer_graph_id, 0, 1)
-            .with_load(0, HealthStatus::Healthy);
+        let pw = EnhancedPingwave::new(peer_graph_id, 0, 1).with_load(0, HealthStatus::Healthy);
         self.proximity_graph.on_pingwave(pw, peer_addr);
 
         // Register with failure detector
@@ -477,8 +476,7 @@ impl MeshNode {
         self.peer_addrs.insert(peer_node_id, peer_addr);
 
         let peer_graph_id = node_id_to_graph_id(peer_node_id);
-        let pw = EnhancedPingwave::new(peer_graph_id, 0, 1)
-            .with_load(0, HealthStatus::Healthy);
+        let pw = EnhancedPingwave::new(peer_graph_id, 0, 1).with_load(0, HealthStatus::Healthy);
         self.proximity_graph.on_pingwave(pw, peer_addr);
 
         self.failure_detector.heartbeat(peer_node_id, peer_addr);
@@ -1133,9 +1131,10 @@ impl MeshNode {
         dest_pubkey: &[u8; 32],
         dest_node_id: u64,
     ) -> Result<u64, AdapterError> {
-        let handler = self.handshake_handler.clone().ok_or_else(|| {
-            AdapterError::Fatal("handshake handler not initialized".into())
-        })?;
+        let handler = self
+            .handshake_handler
+            .clone()
+            .ok_or_else(|| AdapterError::Fatal("handshake handler not initialized".into()))?;
 
         // Build msg1 and register waiter keyed by dest_node_id.
         let (payload, keys_rx) = handler
@@ -1154,7 +1153,10 @@ impl MeshNode {
             Ok(Ok(Ok(k))) => k,
             Ok(Ok(Err(e))) => {
                 handler.cancel_initiator(dest_node_id);
-                return Err(AdapterError::Fatal(format!("handshake relay failed: {}", e)));
+                return Err(AdapterError::Fatal(format!(
+                    "handshake relay failed: {}",
+                    e
+                )));
             }
             Ok(Err(_)) => {
                 handler.cancel_initiator(dest_node_id);

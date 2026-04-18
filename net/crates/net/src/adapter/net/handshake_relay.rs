@@ -128,13 +128,7 @@ impl HandshakeHandler {
         &self,
         dest_node_id: u64,
         dest_pubkey: &[u8; 32],
-    ) -> Result<
-        (
-            Bytes,
-            oneshot::Receiver<Result<SessionKeys, CryptoError>>,
-        ),
-        CryptoError,
-    > {
+    ) -> Result<(Bytes, oneshot::Receiver<Result<SessionKeys, CryptoError>>), CryptoError> {
         let mut noise = NoiseHandshake::initiator(&self.psk, dest_pubkey)?;
         let msg1 = noise.write_message(&[])?;
         let (tx, rx) = oneshot::channel();
@@ -278,7 +272,10 @@ mod tests {
 
         // 2. Initiator receives msg2 (also via relay).
         let actions = initiator.handle_message(&msg2_payload, dummy_relay_addr);
-        assert!(actions.is_empty(), "initiator should fire oneshot, not emit actions");
+        assert!(
+            actions.is_empty(),
+            "initiator should fire oneshot, not emit actions"
+        );
 
         let init_keys = keys_rx.await.unwrap().unwrap();
 

@@ -18,11 +18,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use dashmap::DashMap;
 use net::adapter::net::{
-    behavior::proximity::{EnhancedPingwave, ProximityConfig, ProximityGraph},
     behavior::loadbalance::HealthStatus,
-    RoutingTable, ReroutePolicy,
-    NetHeader, PacketFlags, NONCE_SIZE,
-    ROUTING_HEADER_SIZE,
+    behavior::proximity::{EnhancedPingwave, ProximityConfig, ProximityGraph},
+    NetHeader, PacketFlags, ReroutePolicy, RoutingTable, NONCE_SIZE, ROUTING_HEADER_SIZE,
 };
 
 // ============================================================================
@@ -48,10 +46,7 @@ fn make_reroute_setup(num_peers: usize, routes_per_peer: usize) -> (Arc<RerouteP
     }
 
     let graph = Arc::new(ProximityGraph::new([0u8; 32], ProximityConfig::default()));
-    let policy = Arc::new(
-        ReroutePolicy::new(rt, peers)
-            .with_proximity_graph(graph),
-    );
+    let policy = Arc::new(ReroutePolicy::new(rt, peers).with_proximity_graph(graph));
     (policy, peer_ids)
 }
 
@@ -105,8 +100,7 @@ fn bench_proximity_graph(c: &mut Criterion) {
         let mut node_id = [0u8; 32];
         node_id[0..8].copy_from_slice(&i.to_le_bytes());
         let addr: SocketAddr = format!("127.0.0.1:{}", 4000 + i).parse().unwrap();
-        let pw = EnhancedPingwave::new(node_id, i, 3)
-            .with_load(0, HealthStatus::Healthy);
+        let pw = EnhancedPingwave::new(node_id, i, 3).with_load(0, HealthStatus::Healthy);
         graph.on_pingwave(pw, addr);
     }
 
@@ -139,8 +133,7 @@ fn bench_proximity_graph(c: &mut Criterion) {
 
     // Pingwave serialization
     group.bench_function("pingwave_serialize", |b| {
-        let pw = EnhancedPingwave::new([0x42u8; 32], 1, 3)
-            .with_load(0, HealthStatus::Healthy);
+        let pw = EnhancedPingwave::new([0x42u8; 32], 1, 3).with_load(0, HealthStatus::Healthy);
         b.iter(|| pw.to_bytes());
     });
 
@@ -257,13 +250,9 @@ fn bench_routing_table(c: &mut Criterion) {
             let addr: SocketAddr = format!("127.0.0.1:{}", 6000 + (i % 50)).parse().unwrap();
             rt.add_route(i + 0x20000, addr);
         }
-        group.bench_with_input(
-            BenchmarkId::new("all_routes", count),
-            &count,
-            |b, _| {
-                b.iter(|| rt.all_routes());
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("all_routes", count), &count, |b, _| {
+            b.iter(|| rt.all_routes());
+        });
     }
 
     // add_route (atomic overwrite)
@@ -275,25 +264,13 @@ fn bench_routing_table(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    reroute_benches,
-    bench_reroute_policy,
-);
+criterion_group!(reroute_benches, bench_reroute_policy,);
 
-criterion_group!(
-    proximity_benches,
-    bench_proximity_graph,
-);
+criterion_group!(proximity_benches, bench_proximity_graph,);
 
-criterion_group!(
-    dispatch_benches,
-    bench_packet_discrimination,
-);
+criterion_group!(dispatch_benches, bench_packet_discrimination,);
 
-criterion_group!(
-    routing_benches,
-    bench_routing_table,
-);
+criterion_group!(routing_benches, bench_routing_table,);
 
 criterion_main!(
     reroute_benches,

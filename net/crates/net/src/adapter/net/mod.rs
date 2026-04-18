@@ -43,10 +43,10 @@ mod handshake_relay;
 pub mod identity;
 mod mesh;
 mod pool;
-mod reroute;
 mod protocol;
 mod proxy;
 mod reliability;
+mod reroute;
 mod route;
 mod router;
 mod session;
@@ -86,13 +86,12 @@ pub use failure::{
     CircuitBreaker, CircuitState, FailureDetector, FailureDetectorConfig, FailureStats,
     LossSimulator, NodeStatus, RecoveryAction, RecoveryManager, RecoveryStats,
 };
+pub use handshake_relay::SUBPROTOCOL_HANDSHAKE;
 pub use identity::{
     EntityError, EntityId, EntityKeypair, OriginStamp, PermissionToken, TokenCache, TokenError,
     TokenScope,
 };
-pub use handshake_relay::SUBPROTOCOL_HANDSHAKE;
 pub use mesh::{MeshNode, MeshNodeConfig, PartitionFilter};
-pub use reroute::ReroutePolicy;
 pub use pool::{PacketBuilder, PacketPool, SharedLocalPool, SharedPacketPool, ThreadLocalPool};
 pub use protocol::{
     EventFrame, NackPayload, NetHeader, PacketFlags, HEADER_SIZE, NONCE_SIZE, TAG_SIZE,
@@ -101,6 +100,7 @@ pub use proxy::{
     ForwardResult, HopStats, MultiHopPacketBuilder, NetProxy, ProxyConfig, ProxyError, ProxyStats,
 };
 pub use reliability::{FireAndForget, ReliabilityMode, ReliableStream};
+pub use reroute::ReroutePolicy;
 pub use route::{
     AggregateStats, RouteEntry, RouteFlags, RoutingHeader, RoutingTable, StreamStats,
     ROUTING_HEADER_SIZE,

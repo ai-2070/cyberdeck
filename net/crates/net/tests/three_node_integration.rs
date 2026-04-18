@@ -3241,23 +3241,28 @@ async fn test_mesh_node_auto_reroute() {
         tokio::time::sleep(Duration::from_millis(50)).await;
         node_a.connect(addr_b, &pub_b, nid_b).await
     });
-    r1.unwrap(); r2.unwrap();
+    r1.unwrap();
+    r2.unwrap();
     let (r1, r2) = tokio::join!(node_c.accept(nid_a), async {
         tokio::time::sleep(Duration::from_millis(50)).await;
         node_a.connect(addr_c, &pub_c, nid_c).await
     });
-    r1.unwrap(); r2.unwrap();
+    r1.unwrap();
+    r2.unwrap();
     let (r1, r2) = tokio::join!(node_c.accept(nid_b), async {
         tokio::time::sleep(Duration::from_millis(50)).await;
         node_b.connect(addr_c, &pub_c, nid_c).await
     });
-    r1.unwrap(); r2.unwrap();
+    r1.unwrap();
+    r2.unwrap();
 
     // Route to C goes through B
     node_a.router().add_route(nid_c, addr_b);
     node_b.router().add_route(nid_c, addr_c);
 
-    node_a.start(); node_b.start(); node_c.start();
+    node_a.start();
+    node_b.start();
+    node_c.start();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Verify reroute policy has no active reroutes
@@ -3348,17 +3353,21 @@ async fn test_mesh_node_auto_reroute_recovery() {
         tokio::time::sleep(Duration::from_millis(50)).await;
         node_a.connect(addr_b, &pub_b, nid_b).await
     });
-    r1.unwrap(); r2.unwrap();
+    r1.unwrap();
+    r2.unwrap();
     let (r1, r2) = tokio::join!(node_c.accept(nid_a), async {
         tokio::time::sleep(Duration::from_millis(50)).await;
         node_a.connect(addr_c, &pub_c, nid_c).await
     });
-    r1.unwrap(); r2.unwrap();
+    r1.unwrap();
+    r2.unwrap();
 
     // Route to C goes through B
     node_a.router().add_route(nid_c, addr_b);
 
-    node_a.start(); node_b.start(); node_c.start();
+    node_a.start();
+    node_b.start();
+    node_c.start();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Simulate B failure via partition (not shutdown — B stays alive for recovery)
@@ -3368,7 +3377,10 @@ async fn test_mesh_node_auto_reroute_recovery() {
     // Wait for detection + auto-reroute
     tokio::time::sleep(Duration::from_millis(2500)).await;
     node_a.failure_detector().check_all();
-    assert!(node_a.reroute_policy().active_reroutes() > 0, "should auto-reroute");
+    assert!(
+        node_a.reroute_policy().active_reroutes() > 0,
+        "should auto-reroute"
+    );
 
     // Heal partition — B sends heartbeats again → failure detector recovers B
     node_a.unblock_peer(&addr_b);
@@ -3379,7 +3391,8 @@ async fn test_mesh_node_auto_reroute_recovery() {
 
     // Recovery should restore the original route
     assert_eq!(
-        node_a.reroute_policy().active_reroutes(), 0,
+        node_a.reroute_policy().active_reroutes(),
+        0,
         "original route should be restored after B recovers"
     );
 
@@ -3433,16 +3446,20 @@ async fn test_proximity_graph_pingwave_discovery() {
         tokio::time::sleep(Duration::from_millis(50)).await;
         node_a.connect(addr_b, &pub_b, nid_b).await
     });
-    r1.unwrap(); r2.unwrap();
+    r1.unwrap();
+    r2.unwrap();
 
     // B↔C only (A has NO direct connection to C)
     let (r1, r2) = tokio::join!(node_c.accept(nid_b), async {
         tokio::time::sleep(Duration::from_millis(50)).await;
         node_b.connect(addr_c, &pub_c, nid_c).await
     });
-    r1.unwrap(); r2.unwrap();
+    r1.unwrap();
+    r2.unwrap();
 
-    node_a.start(); node_b.start(); node_c.start();
+    node_a.start();
+    node_b.start();
+    node_c.start();
 
     // A initially knows 1 peer (B)
     assert_eq!(node_a.proximity_graph().node_count(), 1);

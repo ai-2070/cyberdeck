@@ -176,22 +176,14 @@ impl Mesh {
     // ---- Sending ----
 
     /// Send a serializable event to a direct peer.
-    pub async fn send_to(
-        &self,
-        peer_addr: &str,
-        event: &impl Serialize,
-    ) -> Result<()> {
+    pub async fn send_to(&self, peer_addr: &str, event: &impl Serialize) -> Result<()> {
         let addr: SocketAddr = peer_addr
             .parse()
             .map_err(|e| SdkError::Config(format!("invalid address: {}", e)))?;
         let json = serde_json::to_vec(event)?;
         let batch = net::event::Batch {
             shard_id: 0,
-            events: vec![net::event::InternalEvent::new(
-                Bytes::from(json),
-                0,
-                0,
-            )],
+            events: vec![net::event::InternalEvent::new(Bytes::from(json), 0, 0)],
             sequence_start: 0,
         };
         self.node.send_to_peer(addr, batch).await?;
@@ -203,19 +195,11 @@ impl Mesh {
     /// The event is encrypted for the destination and forwarded through
     /// intermediate nodes if needed. Requires a route to `dest_node_id`
     /// in the routing table and a session with the destination.
-    pub async fn send(
-        &self,
-        dest_node_id: u64,
-        event: &impl Serialize,
-    ) -> Result<()> {
+    pub async fn send(&self, dest_node_id: u64, event: &impl Serialize) -> Result<()> {
         let json = serde_json::to_vec(event)?;
         let batch = net::event::Batch {
             shard_id: 0,
-            events: vec![net::event::InternalEvent::new(
-                Bytes::from(json),
-                0,
-                0,
-            )],
+            events: vec![net::event::InternalEvent::new(Bytes::from(json), 0, 0)],
             sequence_start: 0,
         };
         self.node.send_routed(dest_node_id, batch).await?;
@@ -223,11 +207,7 @@ impl Mesh {
     }
 
     /// Send raw bytes to a direct peer.
-    pub async fn send_raw_to(
-        &self,
-        peer_addr: &str,
-        data: &[u8],
-    ) -> Result<()> {
+    pub async fn send_raw_to(&self, peer_addr: &str, data: &[u8]) -> Result<()> {
         let addr: SocketAddr = peer_addr
             .parse()
             .map_err(|e| SdkError::Config(format!("invalid address: {}", e)))?;
