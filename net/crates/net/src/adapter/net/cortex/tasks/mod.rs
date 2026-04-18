@@ -35,6 +35,7 @@
 mod adapter;
 mod dispatch;
 mod fold;
+mod query;
 mod state;
 mod types;
 
@@ -44,5 +45,6 @@ pub use dispatch::{
     TASKS_CHANNEL,
 };
 pub use fold::TasksFold;
+pub use query::{OrderBy, TasksQuery};
 pub use state::TasksState;
 pub use types::{Task, TaskId, TaskStatus};

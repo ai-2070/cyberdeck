@@ -7,7 +7,7 @@
 
 #![cfg(feature = "cortex-tasks")]
 
-use net::adapter::net::cortex::tasks::{TaskStatus, TasksAdapter};
+use net::adapter::net::cortex::tasks::{OrderBy, TaskStatus, TasksAdapter};
 use net::adapter::net::redex::Redex;
 #[cfg(feature = "redex-disk")]
 use net::adapter::net::redex::RedexFileConfig;
@@ -172,6 +172,76 @@ async fn test_pending_and_completed_queries() {
     let mut completed_ids: Vec<_> = guard.completed().map(|t| t.id).collect();
     completed_ids.sort();
     assert_eq!(completed_ids, vec![2, 4, 6, 8, 10]);
+}
+
+#[tokio::test]
+async fn test_query_through_live_adapter() {
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+
+    // Build a mixed corpus.
+    for (id, title, now) in [
+        (1u64, "alpha", 1000u64),
+        (2, "beta", 2000),
+        (3, "gamma", 3000),
+        (4, "delta", 4000),
+        (5, "epsilon", 5000),
+    ] {
+        tasks.create(id, title, now).unwrap();
+    }
+    tasks.complete(2, 2500).unwrap();
+    tasks.complete(4, 4500).unwrap();
+    let last = tasks.rename(5, "EPSILON", 5500).unwrap();
+    tasks.wait_for_seq(last).await;
+
+    let state = tasks.state();
+    let guard = state.read();
+
+    // Pending only → ids 1, 3, 5.
+    let mut pending_ids: Vec<_> = guard
+        .query()
+        .where_status(TaskStatus::Pending)
+        .collect()
+        .iter()
+        .map(|t| t.id)
+        .collect();
+    pending_ids.sort();
+    assert_eq!(pending_ids, vec![1, 3, 5]);
+
+    // Completed, ordered by updated desc, limit 1 → id 4 (updated_ns 4500).
+    let top = guard
+        .query()
+        .where_status(TaskStatus::Completed)
+        .order_by(OrderBy::UpdatedDesc)
+        .first()
+        .unwrap();
+    assert_eq!(top.id, 4);
+
+    // Title contains "psi" (case-insensitive) → id 5 (EPSILON).
+    let match_title: Vec<_> = guard
+        .query()
+        .title_contains("PSI")
+        .collect()
+        .iter()
+        .map(|t| t.id)
+        .collect();
+    assert_eq!(match_title, vec![5]);
+
+    // created_after(2500) AND pending → id 3, 5.
+    let mut recent_pending: Vec<_> = guard
+        .query()
+        .created_after(2500)
+        .where_status(TaskStatus::Pending)
+        .collect()
+        .iter()
+        .map(|t| t.id)
+        .collect();
+    recent_pending.sort();
+    assert_eq!(recent_pending, vec![3, 5]);
+
+    // exists with no match.
+    assert!(!guard.query().title_contains("does-not-exist").exists());
+    assert!(guard.query().where_status(TaskStatus::Pending).exists());
 }
 
 #[tokio::test]
