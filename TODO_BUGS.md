@@ -169,3 +169,8 @@ P1 net/crates/net/src/adapter/net/subprotocol/migration_handler.rs:85-91, 292-30
 RestoreComplete and the later CleanupComplete/ActivateAck chain use from_node as the destination, but from_node is just the previous hop on the wire. In any topology where the migration messages are relayed, these acknowledgements go to the relay instead of the node that owns the migration record, so the state machine can stall waiting for responses that never reach the orchestrator.
 P1 net/crates/net/src/adapter/net/subprotocol/migration_handler.rs:307-320 - Activation is not retry-safe if the final ack is lost
 The target calls activate() and immediately complete() before sending ActivateAck. If the ack packet is dropped or the send fails, the target has already discarded its migration state, so a retry cannot be handled idempotently and the orchestrator can remain stuck waiting for completion.
+
+P1 net/crates/net/src/adapter/net/subprotocol/migration_handler.rs:478-491 - RestoreComplete is routed back to the previous hop instead of the orchestrator
+restore_on_target() builds RestoreComplete, but sends it to from_node, which is just the node that forwarded the SnapshotReady packet. In any relayed topology, that can be a relay with no migration record, so the migration state machine never advances and the rollout stalls.
+P1 net/crates/net/src/adapter/net/subprotocol/migration_handler.rs:463-470 - Successful migrations leave the daemon factory registered
+The target-side restore path keeps the DaemonFactoryRegistry entry alive after a successful restore, and complete() only clears migration tracking state. A stale or replayed SnapshotReady arriving after completion can therefore trigger another restore attempt against what should already be the authoritative copy.
