@@ -20,6 +20,11 @@ use crate::adapter::net::state::snapshot::StateSnapshot;
 struct SourceMigrationState {
     daemon_origin: u32,
     target_node: u64,
+    /// Node that initiated this migration. Replies (SnapshotReady,
+    /// CleanupComplete) are routed here, not to the immediate wire hop
+    /// — which, under future subprotocol relaying, may not be the
+    /// orchestrator.
+    orchestrator_node: u64,
     phase: MigrationPhase,
     snapshot: Option<StateSnapshot>,
     /// Events buffered between snapshot and cutover, in sequence order.
@@ -55,10 +60,14 @@ impl MigrationSourceHandler {
     /// Phase 0: Take snapshot of a local daemon.
     ///
     /// Registers the migration and returns the snapshot for transfer.
+    /// `orchestrator_node` is the node that initiated this migration;
+    /// SnapshotReady / CleanupComplete replies are routed to it rather
+    /// than to whatever hop forwarded the wire packet.
     pub fn start_snapshot(
         &self,
         daemon_origin: u32,
         target_node: u64,
+        orchestrator_node: u64,
     ) -> Result<StateSnapshot, MigrationError> {
         // Atomic check-and-reserve via entry() to prevent TOCTOU races
         let entry = match self.migrations.entry(daemon_origin) {
@@ -83,6 +92,7 @@ impl MigrationSourceHandler {
         entry.insert(Mutex::new(SourceMigrationState {
             daemon_origin,
             target_node,
+            orchestrator_node,
             phase: MigrationPhase::Snapshot,
             snapshot: Some(snapshot.clone()),
             buffered_events: Vec::new(),
@@ -91,6 +101,15 @@ impl MigrationSourceHandler {
         }));
 
         Ok(snapshot)
+    }
+
+    /// Recorded orchestrator for an active source-side migration.
+    ///
+    /// Returns `None` once the migration has been cleaned up.
+    pub fn orchestrator_node(&self, daemon_origin: u32) -> Option<u64> {
+        self.migrations
+            .get(&daemon_origin)
+            .map(|e| e.lock().orchestrator_node)
     }
 
     /// Buffer an event arriving for a daemon during migration.
@@ -269,7 +288,7 @@ mod tests {
         let (reg, origin) = setup();
         let handler = MigrationSourceHandler::new(reg);
 
-        let snapshot = handler.start_snapshot(origin, 0x2222).unwrap();
+        let snapshot = handler.start_snapshot(origin, 0x2222, 0x1111).unwrap();
         assert_eq!(snapshot.entity_id.origin_hash(), origin);
         assert!(handler.is_migrating(origin));
     }
@@ -278,7 +297,7 @@ mod tests {
     fn test_start_snapshot_not_found() {
         let reg = Arc::new(DaemonRegistry::new());
         let handler = MigrationSourceHandler::new(reg);
-        assert!(handler.start_snapshot(0xDEAD, 0x2222).is_err());
+        assert!(handler.start_snapshot(0xDEAD, 0x2222, 0x1111).is_err());
     }
 
     #[test]
@@ -286,8 +305,8 @@ mod tests {
         let (reg, origin) = setup();
         let handler = MigrationSourceHandler::new(reg);
 
-        handler.start_snapshot(origin, 0x2222).unwrap();
-        let err = handler.start_snapshot(origin, 0x3333).unwrap_err();
+        handler.start_snapshot(origin, 0x2222, 0x1111).unwrap();
+        let err = handler.start_snapshot(origin, 0x3333, 0x1111).unwrap_err();
         assert_eq!(err, MigrationError::AlreadyMigrating(origin));
     }
 
@@ -296,7 +315,7 @@ mod tests {
         let (reg, origin) = setup();
         let handler = MigrationSourceHandler::new(reg);
 
-        handler.start_snapshot(origin, 0x2222).unwrap();
+        handler.start_snapshot(origin, 0x2222, 0x1111).unwrap();
 
         assert!(handler.buffer_event(origin, make_event(origin, 1)).unwrap());
         assert!(handler.buffer_event(origin, make_event(origin, 2)).unwrap());
@@ -320,7 +339,7 @@ mod tests {
         let (reg, origin) = setup();
         let handler = MigrationSourceHandler::new(reg);
 
-        handler.start_snapshot(origin, 0x2222).unwrap();
+        handler.start_snapshot(origin, 0x2222, 0x1111).unwrap();
         handler.buffer_event(origin, make_event(origin, 1)).unwrap();
 
         // Cutover
@@ -339,7 +358,7 @@ mod tests {
         let (reg, origin) = setup();
         let handler = MigrationSourceHandler::new(reg.clone());
 
-        handler.start_snapshot(origin, 0x2222).unwrap();
+        handler.start_snapshot(origin, 0x2222, 0x1111).unwrap();
         handler.on_cutover(origin).unwrap();
         handler.cleanup(origin).unwrap();
 
@@ -352,7 +371,7 @@ mod tests {
         let (reg, origin) = setup();
         let handler = MigrationSourceHandler::new(reg.clone());
 
-        handler.start_snapshot(origin, 0x2222).unwrap();
+        handler.start_snapshot(origin, 0x2222, 0x1111).unwrap();
         handler.abort(origin).unwrap();
 
         assert!(!handler.is_migrating(origin));

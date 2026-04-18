@@ -221,6 +221,7 @@ fn test_end_to_end_migration_local_source() {
             origin,
             &snapshot,
             0x1111,
+            0x1111,
             kp.clone(),
             || Box::new(CounterDaemon::new()),
             DaemonHostConfig::default(),
@@ -229,7 +230,9 @@ fn test_end_to_end_migration_local_source() {
     assert!(target_reg.contains(origin));
 
     // Simulate events arriving during transfer
-    source_handler.start_snapshot(origin, 0x2222).unwrap();
+    source_handler
+        .start_snapshot(origin, 0x2222, 0x1111)
+        .unwrap();
     source_handler
         .buffer_event(origin, make_event(0xFFFF, 6))
         .unwrap();
@@ -433,7 +436,7 @@ fn test_subprotocol_handler_cutover_notify_dispatch() {
     let handler = MigrationSubprotocolHandler::new(orch.clone(), source.clone(), target, 0x1111);
 
     // Setup: source starts snapshot
-    source.start_snapshot(origin, 0x2222).unwrap();
+    source.start_snapshot(origin, 0x2222, 0x1111).unwrap();
 
     // Buffer an event on source
     source.buffer_event(origin, make_event(0xFFFF, 1)).unwrap();
@@ -658,7 +661,9 @@ fn test_event_buffer_flows_to_target_replay() {
     let target_handler = MigrationTargetHandler::new(target_reg.clone());
 
     // Source takes snapshot (daemon count = 10)
-    let snapshot = source_handler.start_snapshot(origin, 0x2222).unwrap();
+    let snapshot = source_handler
+        .start_snapshot(origin, 0x2222, 0x1111)
+        .unwrap();
 
     // Events arrive during migration
     for seq in 11..=15 {
@@ -672,6 +677,7 @@ fn test_event_buffer_flows_to_target_replay() {
         .restore_snapshot(
             origin,
             &snapshot,
+            0x1111,
             0x1111,
             kp.clone(),
             || Box::new(CounterDaemon::new()),
@@ -1032,10 +1038,10 @@ fn test_regression_start_snapshot_atomic_duplicate_check() {
     let handler = MigrationSourceHandler::new(reg.clone());
 
     // First call succeeds
-    handler.start_snapshot(origin, 0x2222).unwrap();
+    handler.start_snapshot(origin, 0x2222, 0x1111).unwrap();
 
     // Second call for same daemon must fail
-    let err = handler.start_snapshot(origin, 0x3333).unwrap_err();
+    let err = handler.start_snapshot(origin, 0x3333, 0x1111).unwrap_err();
     assert!(
         matches!(err, net::adapter::net::MigrationError::AlreadyMigrating(_)),
         "expected AlreadyMigrating, got {:?}",
@@ -1073,6 +1079,7 @@ fn test_regression_drain_pending_error_propagated() {
         .restore_snapshot(
             origin,
             &snapshot,
+            0x1111,
             0x1111,
             kp.clone(),
             || Box::new(CounterDaemon::new()),
@@ -1163,7 +1170,7 @@ fn test_regression_full_handler_routing_chain() {
 
     // ── Step 2: Source receives CutoverNotify ──
     // First, source must have started its migration tracking
-    source.start_snapshot(origin, target_node).unwrap();
+    source.start_snapshot(origin, target_node, 0x1111).unwrap();
 
     let cutover_outbound = handler
         .handle_message(&cutover_out.payload, 0xCCCC) // from orchestrator
@@ -2371,12 +2378,12 @@ fn test_migration_full_lifecycle_over_subprotocol_single_chunk() {
         !source.orch.is_migrating(origin),
         "orchestrator record removed"
     );
-    // Factory registration survives across the lifecycle — the handler no
-    // longer auto-removes it, so a transient delivery failure on
-    // `RestoreComplete` can retry without manual re-registration.
-    // Production callers that want single-shot semantics invoke
-    // `factories.remove` themselves after observing `ActivateAck`.
-    assert!(target.factories.contains(origin));
+    // After successful migration, the factory is auto-removed on
+    // `complete()` so a stale or replayed SnapshotReady can't re-trigger
+    // restore against what is already the authoritative copy on the
+    // target. Retry semantics while the migration is still in-flight are
+    // preserved because the registry stays live until `complete()`.
+    assert!(!target.factories.contains(origin));
 }
 
 #[test]

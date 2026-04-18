@@ -2752,7 +2752,7 @@ async fn test_migration_snapshot_over_wire() {
     tokio::time::sleep(Duration::from_millis(2000)).await;
 
     // Verify B processed TakeSnapshot: source handler is in snapshot state
-    let second_try = source_b.start_snapshot(daemon_origin, 0x9999);
+    let second_try = source_b.start_snapshot(daemon_origin, 0x9999, 0x1111);
     assert!(
         second_try.is_err(),
         "B should have processed TakeSnapshot over wire — source handler in snapshot state"
@@ -2895,7 +2895,7 @@ async fn test_migration_full_lifecycle_over_wire() {
     tokio::time::sleep(Duration::from_millis(3000)).await;
 
     // Verify B processed TakeSnapshot (source_handler has an in-flight record).
-    let source_check = source_b.start_snapshot(daemon_origin, 0x9999);
+    let source_check = source_b.start_snapshot(daemon_origin, 0x9999, 0x1111);
     assert!(
         source_check.is_err(),
         "B should have processed TakeSnapshot"
@@ -4194,8 +4194,16 @@ async fn test_regression_handshake_relay_registers_peer_after_msg2_sent() {
 
     a.connect_via(addr_b, &pub_c, nid_c).await.unwrap();
 
-    // Give the spawned msg2-send on C time to resolve before we inspect.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait for the spawned msg2-send on C to resolve before we inspect.
+    // Poll rather than sleep — scheduler jitter can easily exceed a
+    // 300 ms fixed delay under load.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while c.peer_count() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for C to register A after connect_via");
 
     // Happy path: A now has C registered, C now has A registered. Both
     // registrations ride on msg2 actually having been sent; without the

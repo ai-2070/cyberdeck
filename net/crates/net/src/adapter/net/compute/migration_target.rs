@@ -25,6 +25,9 @@ use crate::adapter::net::state::snapshot::StateSnapshot;
 struct TargetMigrationState {
     daemon_origin: u32,
     source_node: u64,
+    /// Node that initiated the migration. Replies
+    /// (RestoreComplete / ReplayComplete / ActivateAck) are routed here.
+    orchestrator_node: u64,
     phase: MigrationPhase,
     /// Sequence number through which events have been replayed.
     replayed_through: u64,
@@ -33,6 +36,17 @@ struct TargetMigrationState {
     /// Causal chain head on target after restore.
     target_head: CausalLink,
     started_at: Instant,
+}
+
+/// Target-side state retained after a successful migration completes,
+/// so that retried `ActivateTarget` packets (after a lost `ActivateAck`)
+/// can be handled idempotently by replaying the original result.
+#[derive(Debug, Clone, Copy)]
+struct CompletedTargetState {
+    orchestrator_node: u64,
+    replayed_through: u64,
+    #[allow(dead_code)]
+    completed_at: Instant,
 }
 
 /// Handles the target node's role in daemon migration.
@@ -53,6 +67,11 @@ pub struct MigrationTargetHandler {
     /// pass to [`MigrationTargetHandler::restore_snapshot`]. Empty when
     /// the handler is created via `new()`.
     factories: Arc<DaemonFactoryRegistry>,
+    /// Completed migrations retained for ActivateAck idempotency. A
+    /// retried `ActivateTarget` after a lost `ActivateAck` looks up the
+    /// stored `(orchestrator_node, replayed_through)` and re-sends the
+    /// same ack instead of failing with `DaemonNotFound`.
+    completed: DashMap<u32, CompletedTargetState>,
 }
 
 impl MigrationTargetHandler {
@@ -80,6 +99,7 @@ impl MigrationTargetHandler {
             daemon_registry,
             migrations: DashMap::new(),
             factories,
+            completed: DashMap::new(),
         }
     }
 
@@ -96,12 +116,15 @@ impl MigrationTargetHandler {
     ///
     /// The `daemon_factory` closure creates the daemon implementation that
     /// will be restored from the snapshot. The caller must provide the correct
-    /// daemon type matching the origin hash.
+    /// daemon type matching the origin hash. `orchestrator_node` is the
+    /// node that initiated this migration; reply messages route here, not
+    /// to the immediate wire hop.
     pub fn restore_snapshot<F>(
         &self,
         daemon_origin: u32,
         snapshot: &StateSnapshot,
         source_node: u64,
+        orchestrator_node: u64,
         keypair: EntityKeypair,
         daemon_factory: F,
         config: DaemonHostConfig,
@@ -141,6 +164,7 @@ impl MigrationTargetHandler {
             Mutex::new(TargetMigrationState {
                 daemon_origin,
                 source_node,
+                orchestrator_node,
                 phase: MigrationPhase::Restore,
                 replayed_through,
                 pending_events: BTreeMap::new(),
@@ -150,6 +174,17 @@ impl MigrationTargetHandler {
         );
 
         Ok(())
+    }
+
+    /// Recorded orchestrator for an active or recently-completed
+    /// target-side migration.
+    pub fn orchestrator_node(&self, daemon_origin: u32) -> Option<u64> {
+        if let Some(e) = self.migrations.get(&daemon_origin) {
+            return Some(e.lock().orchestrator_node);
+        }
+        self.completed
+            .get(&daemon_origin)
+            .map(|e| e.orchestrator_node)
     }
 
     /// Phase 3: Replay buffered events from the source.
@@ -206,8 +241,14 @@ impl MigrationTargetHandler {
     /// Phase 4: Activate — daemon goes live on this node.
     ///
     /// Drains any remaining pending events and marks the daemon as
-    /// the authoritative copy.
+    /// the authoritative copy. **Idempotent:** if the migration has
+    /// already been completed (e.g. a retried `ActivateTarget` after a
+    /// lost `ActivateAck`), returns the stored `replayed_through` so the
+    /// subprotocol handler can re-emit the same ack instead of failing.
     pub fn activate(&self, daemon_origin: u32) -> Result<u64, MigrationError> {
+        if let Some(done) = self.completed.get(&daemon_origin) {
+            return Ok(done.replayed_through);
+        }
         let entry = self
             .migrations
             .get(&daemon_origin)
@@ -222,15 +263,43 @@ impl MigrationTargetHandler {
         Ok(state.replayed_through)
     }
 
-    /// Mark migration as complete and remove tracking state.
+    /// Mark migration as complete and move tracking state into the
+    /// `completed` index so that a retried `ActivateTarget` after a lost
+    /// `ActivateAck` can be handled idempotently.
     ///
     /// The daemon remains registered in the daemon registry — it's now
-    /// the authoritative copy.
+    /// the authoritative copy. Also removes the factory entry, since the
+    /// target won't need to re-restore from an orchestrator retry once
+    /// the migration has successfully completed.
     pub fn complete(&self, daemon_origin: u32) -> Result<(), MigrationError> {
-        self.migrations
+        if self.completed.contains_key(&daemon_origin) {
+            return Ok(());
+        }
+        let (_, entry) = self
+            .migrations
             .remove(&daemon_origin)
             .ok_or(MigrationError::DaemonNotFound(daemon_origin))?;
+        let state = entry.into_inner();
+        self.completed.insert(
+            daemon_origin,
+            CompletedTargetState {
+                orchestrator_node: state.orchestrator_node,
+                replayed_through: state.replayed_through,
+                completed_at: Instant::now(),
+            },
+        );
+        // The factory is single-shot on a successful migration: keeping it
+        // registered would let a stale or replayed SnapshotReady re-trigger
+        // restore against what is now the authoritative copy.
+        self.factories.remove(daemon_origin);
         Ok(())
+    }
+
+    /// Forget a completed migration's retry-idempotency record. Safe to
+    /// call at any time; a subsequent retried `ActivateTarget` would
+    /// then fail normally with `DaemonNotFound`.
+    pub fn forget_completed(&self, daemon_origin: u32) -> bool {
+        self.completed.remove(&daemon_origin).is_some()
     }
 
     /// Abort migration — unregister daemon and clean up.
@@ -390,6 +459,7 @@ mod tests {
                 origin,
                 &snapshot,
                 0x1111,
+                0x2222,
                 kp.clone(),
                 || Box::new(AccumDaemon { total: 0 }),
                 DaemonHostConfig::default(),
@@ -423,6 +493,7 @@ mod tests {
                 0xDEAD,
                 &snapshot,
                 0x1111,
+                0x2222,
                 kp.clone(),
                 || Box::new(AccumDaemon { total: 0 }),
                 DaemonHostConfig::default(),
@@ -445,6 +516,7 @@ mod tests {
                 origin,
                 &snapshot,
                 0x1111,
+                0x2222,
                 kp.clone(),
                 || Box::new(AccumDaemon { total: 0 }),
                 DaemonHostConfig::default(),
@@ -474,6 +546,7 @@ mod tests {
                 origin,
                 &snapshot,
                 0x1111,
+                0x2222,
                 kp.clone(),
                 || Box::new(AccumDaemon { total: 0 }),
                 DaemonHostConfig::default(),
@@ -502,6 +575,7 @@ mod tests {
                 origin,
                 &snapshot,
                 0x1111,
+                0x2222,
                 kp.clone(),
                 || Box::new(AccumDaemon { total: 0 }),
                 DaemonHostConfig::default(),
