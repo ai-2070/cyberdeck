@@ -46,7 +46,7 @@ Design only. Fan-out ("same content to many peers") is deliberately **not** a tr
 
 ### Wire layer — `SUBPROTOCOL_CHANNEL_MEMBERSHIP`
 
-New subprotocol id `0x0A00` (next free range after replica group at `0x0900`). Payloads are length-prefixed CBOR-or-bincode, carried on existing encrypted sessions — these are routed, not broadcast:
+New subprotocol id `0x0A00` (next free range after replica group at `0x0900`). Payloads use a hand-rolled length-prefixed codec (see `channel/membership.rs`) — `u8` tag + `u64_le` nonce + `u8` length + UTF-8 channel name for Subscribe/Unsubscribe, `u8` tag + `u64_le` nonce + `u8` accepted-flag + `u8` reason for Ack. No CBOR, no bincode; chosen to keep the wire format tight and avoid pulling a general serializer onto the hot path. Carried on existing encrypted sessions — these are routed, not broadcast:
 
 ```rust
 pub const SUBPROTOCOL_CHANNEL_MEMBERSHIP: u16 = 0x0A00;
@@ -158,7 +158,7 @@ impl MeshNode {
 }
 ```
 
-These just pack a `MembershipMsg::Subscribe` / `Unsubscribe` into a `SUBPROTOCOL_CHANNEL_MEMBERSHIP` packet and `send_subprotocol` to the publisher. They return once the `Ack` is received (or after a short timeout → `AdapterError::Timeout`).
+These just pack a `MembershipMsg::Subscribe` / `Unsubscribe` into a `SUBPROTOCOL_CHANNEL_MEMBERSHIP` packet and `send_subprotocol` to the publisher. They return once the `Ack` is received (or after a short timeout → `AdapterError::Connection` — `AdapterError` has no dedicated `Timeout` variant today; the error message is prefixed with `membership ack timeout`).
 
 Subscriber identity for ACL purposes is the session origin: the publisher validates `subscribe_caps` against the *sender's* capability set, not against anything in the message itself. The wire message just names the channel.
 

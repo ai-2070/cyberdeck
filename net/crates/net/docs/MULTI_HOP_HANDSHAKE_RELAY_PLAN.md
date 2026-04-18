@@ -65,7 +65,8 @@ The routing header is unauthenticated metadata. A malicious relay could rewrite 
 Fix: both sides bind the routing header's `(src_id, dest_id)` into the Noise prologue via a domain-tagged construction:
 
 ```
-prologue = "net-handshake-v1\0\0\0\0" || src_id_LE(8) || dest_id_LE(8)
+prologue = "net-handshake-v1" || src_id_LE(8) || dest_id_LE(8)
+// total: 16 + 8 + 8 = 32 bytes, matching crypto::handshake_prologue().
 ```
 
 - **Initiator** uses `(src = self.node_id, dest = peer_node_id)`.
@@ -132,7 +133,7 @@ The existing `handshake_responder` loop already pulls handshake packets off the 
   - For **routed** handshakes: `(src = routing_header.src_id, dest = self.node_id)`.
 - For msg2 on the routed path:
   - Wrap the reply in a routing header with `src = self.node_id`, `dest = routing_header.src_id` (from the msg1 envelope).
-  - Send via the routing table's next-hop lookup — no special relay behavior.
+  - Send via the routing table's next-hop lookup, **falling back to the immediate upstream `source`** (the peer that delivered msg1) if no route to the initiator is known yet. At msg2 time the responder has not yet registered the initiator as a peer, so a pure routing-table lookup can dead-end; the upstream peer is guaranteed reachable by construction and has the symmetric return path.
 - Register the new session keyed by the resolved `peer_node_id`. For routed handshakes, `peer_node_id = routing_header.src_id`; for direct, the existing resolution stands.
 
 ### 4. Prologue helper in `crypto.rs`

@@ -169,7 +169,15 @@ pub fn decode(data: &[u8]) -> Result<MembershipMsg, MembershipCodecError> {
                 return Err(MembershipCodecError::Truncated("ack"));
             }
             let nonce = cur.get_u64_le();
-            let accepted = cur.get_u8() != 0;
+            // Strict boolean: reject any byte other than 0 or 1 instead of
+            // treating every non-zero value as "accepted". Prevents a
+            // malformed sender from making an otherwise-unknown reason
+            // code silently imply acceptance.
+            let accepted = match cur.get_u8() {
+                0 => false,
+                1 => true,
+                other => return Err(MembershipCodecError::UnknownType(other)),
+            };
             let reason_byte = cur.get_u8();
             let reason = match reason_byte {
                 ACK_REASON_OK => None,
@@ -296,6 +304,27 @@ mod tests {
         assert!(matches!(
             decode(&buf),
             Err(MembershipCodecError::Overflow(10, 3))
+        ));
+    }
+
+    #[test]
+    fn test_decode_ack_strict_boolean_rejects_non_01() {
+        // Valid ack with accepted=true (0x01), reason=OK — sanity check.
+        let mut buf = vec![MSG_ACK];
+        buf.extend_from_slice(&7u64.to_le_bytes());
+        buf.push(1);
+        buf.push(ACK_REASON_OK);
+        assert!(decode(&buf).is_ok());
+
+        // Same message but accepted=0xFF — must be rejected, not treated
+        // as `true`.
+        let mut buf = vec![MSG_ACK];
+        buf.extend_from_slice(&7u64.to_le_bytes());
+        buf.push(0xFF);
+        buf.push(ACK_REASON_OK);
+        assert!(matches!(
+            decode(&buf),
+            Err(MembershipCodecError::UnknownType(0xFF))
         ));
     }
 

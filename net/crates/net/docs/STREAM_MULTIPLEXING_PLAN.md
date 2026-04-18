@@ -2,7 +2,15 @@
 
 ## Status
 
-Design only. The transport-layer plumbing for per-stream state is already in place (sequence counters, reliability mode, fairness scheduling, AEAD binding). The gaps are all above that plumbing: there's no public API for callers to pick a stream, no lifecycle for stream state (it leaks forever under churn), no per-stream flow control, and no exposed statistics. This plan closes those gaps without touching wire format or the existing per-stream machinery.
+**Shipped.** The design below was implemented in full: `Stream` / `StreamConfig` on `MeshNode`, idempotent `open_stream` / `close_stream`, last-activity-driven idle eviction + `max_streams` LRU cap on the heartbeat loop, per-stream fairness weight threaded through `FairScheduler`, `StreamError::WouldBlock` surfaced on queue-full back-pressure, and public `stream_stats` / `all_stream_stats` accessors. The plan is retained as a frozen spec of the contract; see `TRANSPORT.md` for the caller-facing reference.
+
+The only design-time gap still outstanding is **explicit credit-window flow control** — `WouldBlock` is already returned on local queue-full, but there is no round-trip credit accounting between peers yet. That's a v2 increment.
+
+---
+
+*Original "Design only" header below is kept verbatim for change-history purposes. Everything listed in "Gaps this plan fills" has been addressed except where explicitly noted above.*
+
+The transport-layer plumbing for per-stream state is already in place (sequence counters, reliability mode, fairness scheduling, AEAD binding). The gaps are all above that plumbing: there's no public API for callers to pick a stream, no lifecycle for stream state (it leaks forever under churn), no per-stream flow control, and no exposed statistics. This plan closes those gaps without touching wire format or the existing per-stream machinery.
 
 ## What already works
 

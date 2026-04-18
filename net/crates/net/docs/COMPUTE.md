@@ -169,7 +169,7 @@ With all six phases wired over the subprotocol, a daemon's *worldline* — its c
 
 - **`EntityId`** — the ed25519 public key is part of the snapshot. Clients addressing the daemon by origin don't notice the move.
 - **Causal-chain sequence.** The target resumes at `snapshot.through_seq + 1`. Events produced before cutover and events produced after cutover form a single contiguous chain; observers can verify continuity via `CausalLink.parent_hash`.
-- **Observed horizon.** `StateSnapshot.horizon` travels with the daemon, so dependency tracking against other entities doesn't reset.
+- **Observed horizon.** `StateSnapshot.horizon` is preserved in memory on the source but not carried across the wire today — the compact snapshot format omits it, so the target reconstructs a fresh horizon on restore. Good enough for current workloads; worth tightening if cross-entity causal reasoning becomes load-bearing.
 - **In-flight events.** Events that arrived on the source while the migration was flying are buffered there, shipped to the target in `BufferedEvents`, and replayed in strict sequence order. Nothing is dropped.
 - **Routing.** Peers reach the daemon by its `origin_hash`, which didn't change. The routing plane (`SUBPROTOCOL_MIGRATION` cleanup on the source + the target's existing session plumbing) is the only thing that needs to update, and it does.
 

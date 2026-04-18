@@ -1042,10 +1042,16 @@ impl MeshNode {
         ctx.peer_addrs.insert(peer_node_id, source);
         ctx.router.add_route(peer_node_id, source);
 
-        // Spawn the send. If it fails, roll back the registration.
+        // Spawn the send. If it fails, roll back all three registrations
+        // (peer session, peer-addr map, and routing table entry). Leaving
+        // the route behind would silently blackhole future routed traffic
+        // for `peer_node_id` through an addr we never confirmed was
+        // reachable; removing peers without removing the route would also
+        // inject a stale entry into rerouting decisions.
         let socket = ctx.socket.clone();
         let peers = ctx.peers.clone();
         let peer_addrs = ctx.peer_addrs.clone();
+        let router = ctx.router.clone();
         let payload = routed.freeze();
         tokio::spawn(async move {
             if let Err(e) = socket.send_to(&payload, next_hop).await {
@@ -1056,6 +1062,7 @@ impl MeshNode {
                 );
                 peers.remove(&peer_node_id);
                 peer_addrs.remove(&peer_node_id);
+                router.routing_table().remove_route(peer_node_id);
             }
         });
     }
