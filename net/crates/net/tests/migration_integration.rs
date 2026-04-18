@@ -2141,6 +2141,66 @@ fn test_gap_wire_decode_truncated_messages() {
     assert!(result.is_err());
 }
 
+/// Regression: the `BufferedEvents` decoder used to call
+/// `Vec::with_capacity(count)` with `count` taken directly from the wire
+/// envelope, with no upper bound. A malformed packet claiming
+/// `count = u32::MAX` could force a ~4 GiB Vec allocation before the
+/// per-event truncation check fired — a cheap remote DoS against the
+/// migration subprotocol.
+///
+/// The fix validates `count` against (1) the remaining wire bytes (each
+/// event requires at least 36 bytes on the wire, so `count` can't exceed
+/// `remaining / 36`) and (2) a hard cap of 1 million events.
+#[test]
+fn test_regression_buffered_events_rejects_unbounded_count() {
+    use bytes::BufMut;
+    use net::adapter::net::compute::orchestrator::wire;
+
+    // Hand-craft a BufferedEvents with count = u32::MAX, no actual event
+    // bytes. Pre-fix, this allocated ~4 billion vec slots.
+    let mut bad = Vec::new();
+    bad.put_u8(7); // MSG_BUFFERED_EVENTS
+    bad.put_u32_le(0xAAAA_BBBB); // daemon_origin
+    bad.put_u32_le(u32::MAX); // count — unbounded!
+    // No event bytes follow.
+
+    let result = wire::decode(&bad);
+    assert!(
+        result.is_err(),
+        "decoder must reject count that exceeds remaining wire bytes; \
+         got {:?}",
+        result
+    );
+    let err = format!("{:?}", result.unwrap_err());
+    assert!(
+        err.contains("exceeds bound") || err.contains("count"),
+        "expected a count-bound error, got: {}",
+        err
+    );
+
+    // Slightly less extreme: count > MAX_BUFFERED_EVENTS but with a
+    // matching byte supply would still be rejected by the hard cap.
+    let mut bad2 = Vec::new();
+    bad2.put_u8(7);
+    bad2.put_u32_le(0);
+    bad2.put_u32_le(2_000_000); // > 1M hard cap
+    // Pad with enough filler bytes to defeat the remaining-bytes check.
+    bad2.resize(bad2.len() + 2_000_000 * 36, 0);
+    let result = wire::decode(&bad2);
+    assert!(
+        result.is_err(),
+        "decoder must reject count above the MAX_BUFFERED_EVENTS cap"
+    );
+
+    // Sanity: a well-formed BufferedEvents with count=0 still decodes.
+    let mut good = Vec::new();
+    good.put_u8(7);
+    good.put_u32_le(0x1234);
+    good.put_u32_le(0);
+    let result = wire::decode(&good);
+    assert!(result.is_ok(), "count=0 must still decode: {:?}", result);
+}
+
 /// Gap 10: StandbyGroup promote with empty buffer (no events to replay).
 #[test]
 fn test_gap_promote_empty_buffer() {

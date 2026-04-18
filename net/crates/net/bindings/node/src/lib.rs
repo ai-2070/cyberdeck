@@ -870,7 +870,13 @@ mod mesh_bindings {
                 config = config.with_session_timeout(Duration::from_millis(ms as u64));
             }
             if let Some(n) = options.num_shards {
-                config = config.with_num_shards(n as u16);
+                let n = u16::try_from(n).map_err(|_| {
+                    Error::from_reason(format!(
+                        "num_shards must be in [0, 65535]; got {}",
+                        n
+                    ))
+                })?;
+                config = config.with_num_shards(n);
             }
 
             let identity = EntityKeypair::generate();
@@ -893,11 +899,20 @@ mod mesh_bindings {
         }
 
         /// Get this node's ID.
+        ///
+        /// Returned as `i64` to fit JavaScript's `number` semantics. Fails
+        /// rather than wraps when the `u64` node_id exceeds `i64::MAX`,
+        /// which would otherwise silently flip sign on the JS side.
         #[napi]
         pub fn node_id(&self) -> Result<i64> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            Ok(node.node_id() as i64)
+            i64::try_from(node.node_id()).map_err(|_| {
+                Error::from_reason(format!(
+                    "node_id {} exceeds i64::MAX; JS has no lossless u64",
+                    node.node_id()
+                ))
+            })
         }
 
         /// Connect to a peer (initiator side).
@@ -922,7 +937,13 @@ mod mesh_bindings {
             let mut pubkey = [0u8; 32];
             pubkey.copy_from_slice(&pubkey_bytes);
 
-            node.connect(addr, &pubkey, peer_node_id as u64)
+            let peer_node_id = u64::try_from(peer_node_id).map_err(|_| {
+                Error::from_reason(format!(
+                    "peer_node_id must be non-negative; got {}",
+                    peer_node_id
+                ))
+            })?;
+            node.connect(addr, &pubkey, peer_node_id)
                 .await
                 .map_err(|e| Error::from_reason(format!("connect failed: {}", e)))?;
             Ok(())
@@ -933,8 +954,14 @@ mod mesh_bindings {
         pub async fn accept(&self, peer_node_id: i64) -> Result<String> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
+            let peer_node_id = u64::try_from(peer_node_id).map_err(|_| {
+                Error::from_reason(format!(
+                    "peer_node_id must be non-negative; got {}",
+                    peer_node_id
+                ))
+            })?;
             let (addr, _) = node
-                .accept(peer_node_id as u64)
+                .accept(peer_node_id)
                 .await
                 .map_err(|e| Error::from_reason(format!("accept failed: {}", e)))?;
             Ok(addr.to_string())
@@ -1014,7 +1041,13 @@ mod mesh_bindings {
             let addr: std::net::SocketAddr = next_hop_addr
                 .parse()
                 .map_err(|e| Error::from_reason(format!("invalid address: {}", e)))?;
-            node.router().add_route(dest_node_id as u64, addr);
+            let dest_node_id = u64::try_from(dest_node_id).map_err(|_| {
+                Error::from_reason(format!(
+                    "dest_node_id must be non-negative; got {}",
+                    dest_node_id
+                ))
+            })?;
+            node.router().add_route(dest_node_id, addr);
             Ok(())
         }
 

@@ -403,9 +403,35 @@ pub mod wire {
                 }
                 let daemon_origin = cur.get_u32_le();
                 let count = cur.get_u32_le() as usize;
+                // Bound `count` against the remaining wire bytes before
+                // allocating. Each event on the wire is at least
+                // CAUSAL_LINK_SIZE(24) + u32 payload_len(4) + u64
+                // received_at(8) = 36 bytes (empty payload). Without this
+                // check, a malformed packet could claim `count = u32::MAX`
+                // and force the decoder to allocate ~4G Vec slots before
+                // the per-event bound checks fire — a cheap DoS against
+                // the migration subprotocol.
+                use crate::adapter::net::state::causal::CAUSAL_LINK_SIZE;
+                const MIN_EVENT_WIRE_SIZE: usize = CAUSAL_LINK_SIZE + 4 + 8;
+                // Hard cap as defense-in-depth. Well above any realistic
+                // buffered-event batch (the orchestrator sends one
+                // per-daemon batch at restore-complete; millions of
+                // events per daemon per migration is already pathological).
+                const MAX_BUFFERED_EVENTS: usize = 1_000_000;
+                let max_possible = cur.remaining() / MIN_EVENT_WIRE_SIZE;
+                if count > max_possible || count > MAX_BUFFERED_EVENTS {
+                    return Err(MigrationError::StateFailed(format!(
+                        "BufferedEvents: count {} exceeds bound (remaining={}, \
+                         min_event_size={}, max_possible={}, hard_cap={})",
+                        count,
+                        cur.remaining(),
+                        MIN_EVENT_WIRE_SIZE,
+                        max_possible,
+                        MAX_BUFFERED_EVENTS,
+                    )));
+                }
                 let mut events = Vec::with_capacity(count);
                 for _ in 0..count {
-                    use crate::adapter::net::state::causal::CAUSAL_LINK_SIZE;
                     if cur.remaining() < CAUSAL_LINK_SIZE + 4 {
                         return Err(MigrationError::StateFailed(
                             "truncated buffered event".into(),

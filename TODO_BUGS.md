@@ -153,3 +153,14 @@ P2 net/crates/net/src/adapter/net/compute/orchestrator.rs:404 - BufferedEvents d
 MSG_BUFFERED_EVENTS reads the event count from the wire and immediately does Vec::with_capacity(count) before validating any upper bound. A malformed packet with a huge count can force a very large allocation attempt, creating a trivial memory-exhaustion DoS on the migration subprotocol.
 P1 net/crates/net/src/adapter/net/subprotocol/migration_handler.rs:307 and net/crates/net/src/adapter/net/compute/migration_target.rs:225 - Successful migration leaves the daemon factory registered, enabling stale re-restores
 After ActivateTarget, the target calls complete() and clears only the in-flight migration state, but the DaemonFactoryRegistry entry is never removed. That means the same daemon_origin can be restored again later from a stale or replayed SnapshotReady, even though the migration is already finished, which can resurrect an authoritative daemon unexpectedly.
+
+P1 net/crates/net/src/adapter/net/subprotocol/migration_handler.rs:478-491 - RestoreComplete is sent back to the previous hop instead of the orchestrator
+from_node is just the node that forwarded the SnapshotReady packet, not necessarily the migration orchestrator. In any relayed topology, this sends RestoreComplete to the relay, which does not own the migration record, so the lifecycle can stall waiting for an ack that reached the wrong node.
+P2 net/crates/net/src/adapter/net/subprotocol/migration_handler.rs:307-320 - Activation leaves the factory registry live after completion
+complete() removes only the target-side migration state, but the daemon factory entry remains registered indefinitely unless some external caller remembers to remove it. That makes the restore path retryable even after a successful migration, so a stale or replayed SnapshotReady can re-trigger restore logic unexpectedly.
+P2 net/crates/net/bindings/node/src/lib.rs:66-74 - num_shards is silently truncated to 16 bits
+options.num_shards arrives as a u32, but it is cast to u16 without validation. Values above 65,535 wrap, so JavaScript callers can create a node with a shard count very different from what they requested.
+P2 net/crates/net/bindings/node/src/lib.rs:95-100 - node_id() can return negative values for valid IDs
+The Rust node ID is a u64, but the binding exposes it as i64 via as. Any ID with the high bit set will appear negative in Node.js, which can break identity comparisons and routing logic in consumers.
+P2 net/crates/net/src/adapter/net/reroute.rs:111-146 - One alternate is reused for every failed route
+on_failure() computes a single alt_addr and applies it to all affected destinations, even though the topology may require different next hops per destination. In heterogeneous graphs, some of those destinations may not actually be reachable through the chosen alternate, causing traffic to be blackholed until recovery or manual intervention.
