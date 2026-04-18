@@ -67,6 +67,14 @@ fn parse_tasks_order_by(s: &str) -> PyResult<InnerTasksOrderBy> {
     }
 }
 
+fn cfg_from_persistent(persistent: bool) -> RedexFileConfig {
+    if persistent {
+        RedexFileConfig::default().with_persistent(true)
+    } else {
+        RedexFileConfig::default()
+    }
+}
+
 fn parse_memories_order_by(s: &str) -> PyResult<InnerMemoriesOrderBy> {
     match s.to_lowercase().as_str() {
         "id_asc" => Ok(InnerMemoriesOrderBy::IdAsc),
@@ -183,11 +191,7 @@ impl PyTasksAdapter {
     fn open(redex: &PyRedex, origin_hash: u32, persistent: bool) -> PyResult<Self> {
         let runtime = make_runtime()?;
         let redex_inner = redex.inner.clone();
-        let cfg = if persistent {
-            RedexFileConfig::default().with_persistent(true)
-        } else {
-            RedexFileConfig::default()
-        };
+        let cfg = cfg_from_persistent(persistent);
         let inner = runtime
             .block_on(
                 async move { InnerTasksAdapter::open_with_config(&redex_inner, origin_hash, cfg) },
@@ -197,6 +201,51 @@ impl PyTasksAdapter {
             inner: Arc::new(inner),
             runtime,
         })
+    }
+
+    /// Open from a snapshot captured via `snapshot()`. Skips replay
+    /// of events `[0, last_seq]` on the underlying file.
+    #[staticmethod]
+    #[pyo3(signature = (redex, origin_hash, state_bytes, last_seq = None, persistent = false))]
+    fn open_from_snapshot(
+        redex: &PyRedex,
+        origin_hash: u32,
+        state_bytes: &[u8],
+        last_seq: Option<u64>,
+        persistent: bool,
+    ) -> PyResult<Self> {
+        let runtime = make_runtime()?;
+        let redex_inner = redex.inner.clone();
+        let cfg = cfg_from_persistent(persistent);
+        let bytes = state_bytes.to_vec();
+        let inner = runtime
+            .block_on(async move {
+                InnerTasksAdapter::open_from_snapshot_with_config(
+                    &redex_inner,
+                    origin_hash,
+                    cfg,
+                    &bytes,
+                    last_seq,
+                )
+            })
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "TasksAdapter open_from_snapshot failed: {}",
+                    e
+                ))
+            })?;
+        Ok(Self {
+            inner: Arc::new(inner),
+            runtime,
+        })
+    }
+
+    /// Capture a state snapshot. Returns `(state_bytes, last_seq)`.
+    /// Persist both together; restore via `open_from_snapshot`.
+    fn snapshot(&self) -> PyResult<(Vec<u8>, Option<u64>)> {
+        self.inner
+            .snapshot()
+            .map_err(|e| PyRuntimeError::new_err(format!("snapshot failed: {}", e)))
     }
 
     /// Create a new task. Returns the RedEX sequence.
@@ -516,11 +565,7 @@ impl PyMemoriesAdapter {
     fn open(redex: &PyRedex, origin_hash: u32, persistent: bool) -> PyResult<Self> {
         let runtime = make_runtime()?;
         let redex_inner = redex.inner.clone();
-        let cfg = if persistent {
-            RedexFileConfig::default().with_persistent(true)
-        } else {
-            RedexFileConfig::default()
-        };
+        let cfg = cfg_from_persistent(persistent);
         let inner = runtime
             .block_on(async move {
                 InnerMemoriesAdapter::open_with_config(&redex_inner, origin_hash, cfg)
@@ -530,6 +575,49 @@ impl PyMemoriesAdapter {
             inner: Arc::new(inner),
             runtime,
         })
+    }
+
+    /// Open from a snapshot captured via `snapshot()`.
+    #[staticmethod]
+    #[pyo3(signature = (redex, origin_hash, state_bytes, last_seq = None, persistent = false))]
+    fn open_from_snapshot(
+        redex: &PyRedex,
+        origin_hash: u32,
+        state_bytes: &[u8],
+        last_seq: Option<u64>,
+        persistent: bool,
+    ) -> PyResult<Self> {
+        let runtime = make_runtime()?;
+        let redex_inner = redex.inner.clone();
+        let cfg = cfg_from_persistent(persistent);
+        let bytes = state_bytes.to_vec();
+        let inner = runtime
+            .block_on(async move {
+                InnerMemoriesAdapter::open_from_snapshot_with_config(
+                    &redex_inner,
+                    origin_hash,
+                    cfg,
+                    &bytes,
+                    last_seq,
+                )
+            })
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "MemoriesAdapter open_from_snapshot failed: {}",
+                    e
+                ))
+            })?;
+        Ok(Self {
+            inner: Arc::new(inner),
+            runtime,
+        })
+    }
+
+    /// Capture a state snapshot for restore via `open_from_snapshot`.
+    fn snapshot(&self) -> PyResult<(Vec<u8>, Option<u64>)> {
+        self.inner
+            .snapshot()
+            .map_err(|e| PyRuntimeError::new_err(format!("snapshot failed: {}", e)))
     }
 
     #[pyo3(signature = (id, content, tags, source, now_ns))]

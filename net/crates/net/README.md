@@ -662,10 +662,10 @@ cargo test --test integration_cortex_memories --features "cortex-memories cortex
 # Rust SDK smoke tests (2 async + 3 doctests)
 cargo test --features net -p net-sdk
 
-# Node SDK smoke tests (17 tests — CortEX tasks + memories over napi, incl. watch/AsyncIterator + disk durability round-trip)
+# Node SDK smoke tests (20 tests — CortEX tasks + memories over napi, incl. watch/AsyncIterator, disk durability, snapshot/restore round-trip)
 cd bindings/node && npx napi build --platform --no-default-features -F cortex && npx vitest run
 
-# Python SDK smoke tests (15 tests — CortEX tasks + memories via PyO3, incl. sync watch iterators + disk durability round-trip)
+# Python SDK smoke tests (18 tests — CortEX tasks + memories via PyO3, incl. sync watch iterators, disk durability, snapshot/restore round-trip)
 cd bindings/python && uv venv .venv && source .venv/bin/activate && \
     uv pip install -e '.[test]' maturin && \
     maturin develop --no-default-features --features cortex && \
@@ -676,7 +676,7 @@ cargo test --test integration_redis --features redis
 cargo test --test integration_jetstream --features jetstream
 ```
 
-**1,123 tests total across the Rust stack** — lib + migration + three_node + integration_net + integration_redex + integration_cortex_{adapter,tasks,memories} + SDK. Plus 17 Node SDK smoke tests (vitest) and 15 Python SDK smoke tests (pytest), both covering CRUD, filtered queries, reactive watchers, multi-model coexistence, and disk-durability round-trips via the `cortex` feature (which pulls in `redex-disk`).
+**1,126 tests total across the Rust stack** — lib + migration + three_node + integration_net + integration_redex + integration_cortex_{adapter,tasks,memories} + SDK. Plus 20 Node SDK smoke tests (vitest) and 18 Python SDK smoke tests (pytest), both covering CRUD, filtered queries, reactive watchers, multi-model coexistence, disk-durability round-trips, and snapshot/restore via `open_from_snapshot` — all via the `cortex` feature (which pulls in `redex-disk`).
 
 ### Test Architecture
 

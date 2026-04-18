@@ -281,6 +281,71 @@ def test_persistent_memories_round_trip(tmp_path) -> None:
     assert sorted(by_id[2].tags) == ["y", "z"]
 
 
+def test_snapshot_and_restore_tasks() -> None:
+    redex = Redex()
+    tasks = TasksAdapter.open(redex, ORIGIN)
+
+    tasks.create(1, "alpha", 100)
+    tasks.create(2, "beta", 200)
+    tasks.complete(1, 150)
+    seq = tasks.rename(2, "beta-v2", 250)
+    tasks.wait_for_seq(seq)
+
+    state_bytes, last_seq = tasks.snapshot()
+    assert last_seq == 3
+    assert len(state_bytes) > 0
+    tasks.close()
+
+    # Restore on the same Redex — file keeps seqs 0..=3; adapter
+    # tails at FromSeq(4). State comes from state_bytes.
+    tasks2 = TasksAdapter.open_from_snapshot(
+        redex, ORIGIN, state_bytes, last_seq=last_seq
+    )
+    all_tasks = tasks2.list_tasks()
+    assert len(all_tasks) == 2
+    by_id = {t.id: t for t in all_tasks}
+    assert by_id[1].status == "completed"
+    assert by_id[2].title == "beta-v2"
+
+    # Continuing ingest works; next seq is 4.
+    next_seq = tasks2.create(3, "gamma", 300)
+    assert next_seq == 4
+    tasks2.wait_for_seq(next_seq)
+    assert tasks2.count() == 3
+
+
+def test_snapshot_and_restore_memories() -> None:
+    redex = Redex()
+    memories = MemoriesAdapter.open(redex, ORIGIN)
+
+    memories.store(1, "alpha", ["x"], "alice", 100)
+    memories.pin(1, 110)
+    memories.store(2, "beta", ["y"], "alice", 200)
+    seq = memories.retag(2, ["y", "z"], 210)
+    memories.wait_for_seq(seq)
+
+    state_bytes, last_seq = memories.snapshot()
+    assert last_seq == 3
+    memories.close()
+
+    memories2 = MemoriesAdapter.open_from_snapshot(
+        redex, ORIGIN, state_bytes, last_seq=last_seq
+    )
+    all_m = memories2.list_memories()
+    assert len(all_m) == 2
+    by_id = {m.id: m for m in all_m}
+    assert by_id[1].pinned is True
+    assert sorted(by_id[2].tags) == ["y", "z"]
+
+
+def test_empty_state_snapshot_has_none_last_seq() -> None:
+    redex = Redex()
+    tasks = TasksAdapter.open(redex, ORIGIN)
+    state_bytes, last_seq = tasks.snapshot()
+    assert last_seq is None
+    assert len(state_bytes) > 0
+
+
 def test_persistent_without_dir_errors() -> None:
     redex = Redex()  # heap-only, no persistent_dir
     with pytest.raises(RuntimeError, match="persistent"):

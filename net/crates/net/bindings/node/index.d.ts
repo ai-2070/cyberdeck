@@ -7,6 +7,13 @@ export declare class MemoriesAdapter {
    * [`TasksAdapter::open`] for `persistent` semantics.
    */
   static open(redex: Redex, originHash: number, persistent?: boolean | undefined | null): Promise<MemoriesAdapter>
+  /** Open from a snapshot captured via [`Self::snapshot`]. */
+  static openFromSnapshot(redex: Redex, originHash: number, stateBytes: Buffer, lastSeq?: bigint | undefined | null, persistent?: boolean | undefined | null): Promise<MemoriesAdapter>
+  /**
+   * Capture a state snapshot for restore via
+   * [`Self::open_from_snapshot`].
+   */
+  snapshot(): CortexSnapshot
   /** Store a new memory. */
   store(id: bigint, content: string, tags: Array<string>, source: string, nowNs: bigint): bigint
   /**
@@ -192,6 +199,16 @@ export declare class TasksAdapter {
    * fold task via `tokio::spawn` and needs a live reactor.
    */
   static open(redex: Redex, originHash: number, persistent?: boolean | undefined | null): Promise<TasksAdapter>
+  /**
+   * Open from a snapshot captured via [`Self::snapshot`]. Skips
+   * replay of events `[0, lastSeq]` on the underlying file.
+   */
+  static openFromSnapshot(redex: Redex, originHash: number, stateBytes: Buffer, lastSeq?: bigint | undefined | null, persistent?: boolean | undefined | null): Promise<TasksAdapter>
+  /**
+   * Capture a state snapshot. Persist both fields together; restore
+   * via [`Self::open_from_snapshot`].
+   */
+  snapshot(): CortexSnapshot
   /** Create a new task. Returns the RedEX sequence of the append. */
   create(id: bigint, title: string, nowNs: bigint): bigint
   /** Rename an existing task. No-op at fold time if `id` is unknown. */
@@ -248,6 +265,20 @@ export declare class TaskWatchIter {
    * `null`. Idempotent.
    */
   close(): void
+}
+
+/**
+ * A captured CortEX adapter state snapshot, suitable for
+ * `openFromSnapshot`. Callers persist both fields together.
+ */
+export interface CortexSnapshot {
+  /** bincode-serialized materialized state. */
+  stateBytes: Buffer
+  /**
+   * Highest RedEX sequence folded into `state_bytes`. `null` if
+   * no event had been folded at snapshot time.
+   */
+  lastSeq?: bigint
 }
 
 /** Configuration options for creating an EventBus. */

@@ -40,6 +40,25 @@ fn bigint_u64(b: BigInt) -> u64 {
     b.get_u64().1
 }
 
+/// A captured CortEX adapter state snapshot, suitable for
+/// `openFromSnapshot`. Callers persist both fields together.
+#[napi(object)]
+pub struct CortexSnapshot {
+    /// bincode-serialized materialized state.
+    pub state_bytes: Buffer,
+    /// Highest RedEX sequence folded into `state_bytes`. `null` if
+    /// no event had been folded at snapshot time.
+    pub last_seq: Option<BigInt>,
+}
+
+fn redex_config_from_persistent(persistent: Option<bool>) -> RedexFileConfig {
+    if persistent.unwrap_or(false) {
+        RedexFileConfig::default().with_persistent(true)
+    } else {
+        RedexFileConfig::default()
+    }
+}
+
 // =========================================================================
 // Redex manager
 // =========================================================================
@@ -259,15 +278,52 @@ impl TasksAdapter {
     /// fold task via `tokio::spawn` and needs a live reactor.
     #[napi(factory)]
     pub async fn open(redex: &Redex, origin_hash: u32, persistent: Option<bool>) -> Result<Self> {
-        let cfg = if persistent.unwrap_or(false) {
-            RedexFileConfig::default().with_persistent(true)
-        } else {
-            RedexFileConfig::default()
-        };
+        let cfg = redex_config_from_persistent(persistent);
         let inner = InnerTasksAdapter::open_with_config(&redex.inner, origin_hash, cfg)
             .map_err(|e| Error::from_reason(format!("TasksAdapter open failed: {}", e)))?;
         Ok(Self {
             inner: Arc::new(inner),
+        })
+    }
+
+    /// Open from a snapshot captured via [`Self::snapshot`]. Skips
+    /// replay of events `[0, lastSeq]` on the underlying file.
+    #[napi(factory)]
+    pub async fn open_from_snapshot(
+        redex: &Redex,
+        origin_hash: u32,
+        state_bytes: Buffer,
+        last_seq: Option<BigInt>,
+        persistent: Option<bool>,
+    ) -> Result<Self> {
+        let cfg = redex_config_from_persistent(persistent);
+        let last = last_seq.map(bigint_u64);
+        let inner = InnerTasksAdapter::open_from_snapshot_with_config(
+            &redex.inner,
+            origin_hash,
+            cfg,
+            state_bytes.as_ref(),
+            last,
+        )
+        .map_err(|e| {
+            Error::from_reason(format!("TasksAdapter open_from_snapshot failed: {}", e))
+        })?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// Capture a state snapshot. Persist both fields together; restore
+    /// via [`Self::open_from_snapshot`].
+    #[napi]
+    pub fn snapshot(&self) -> Result<CortexSnapshot> {
+        let (bytes, last_seq) = self
+            .inner
+            .snapshot()
+            .map_err(|e| Error::from_reason(format!("snapshot failed: {}", e)))?;
+        Ok(CortexSnapshot {
+            state_bytes: Buffer::from(bytes),
+            last_seq: last_seq.map(BigInt::from),
         })
     }
 
@@ -569,15 +625,54 @@ impl MemoriesAdapter {
     /// [`TasksAdapter::open`] for `persistent` semantics.
     #[napi(factory)]
     pub async fn open(redex: &Redex, origin_hash: u32, persistent: Option<bool>) -> Result<Self> {
-        let cfg = if persistent.unwrap_or(false) {
-            RedexFileConfig::default().with_persistent(true)
-        } else {
-            RedexFileConfig::default()
-        };
+        let cfg = redex_config_from_persistent(persistent);
         let inner = InnerMemoriesAdapter::open_with_config(&redex.inner, origin_hash, cfg)
             .map_err(|e| Error::from_reason(format!("MemoriesAdapter open failed: {}", e)))?;
         Ok(Self {
             inner: Arc::new(inner),
+        })
+    }
+
+    /// Open from a snapshot captured via [`Self::snapshot`].
+    #[napi(factory)]
+    pub async fn open_from_snapshot(
+        redex: &Redex,
+        origin_hash: u32,
+        state_bytes: Buffer,
+        last_seq: Option<BigInt>,
+        persistent: Option<bool>,
+    ) -> Result<Self> {
+        let cfg = redex_config_from_persistent(persistent);
+        let last = last_seq.map(bigint_u64);
+        let inner = InnerMemoriesAdapter::open_from_snapshot_with_config(
+            &redex.inner,
+            origin_hash,
+            cfg,
+            state_bytes.as_ref(),
+            last,
+        )
+        .map_err(|e| {
+            Error::from_reason(format!(
+                "MemoriesAdapter open_from_snapshot failed: {}",
+                e
+            ))
+        })?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// Capture a state snapshot for restore via
+    /// [`Self::open_from_snapshot`].
+    #[napi]
+    pub fn snapshot(&self) -> Result<CortexSnapshot> {
+        let (bytes, last_seq) = self
+            .inner
+            .snapshot()
+            .map_err(|e| Error::from_reason(format!("snapshot failed: {}", e)))?;
+        Ok(CortexSnapshot {
+            state_bytes: Buffer::from(bytes),
+            last_seq: last_seq.map(BigInt::from),
         })
     }
 

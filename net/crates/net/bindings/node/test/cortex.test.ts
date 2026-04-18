@@ -410,6 +410,75 @@ describe('cortex persistence (redex-disk)', () => {
   })
 })
 
+describe('cortex snapshot / restore', () => {
+  it('tasks: snapshot and restore round-trip on same redex', async () => {
+    const redex = new Redex()
+    const tasks = await TasksAdapter.open(redex, ORIGIN)
+    tasks.create(1n, 'alpha', 100n)
+    tasks.create(2n, 'beta', 200n)
+    tasks.complete(1n, 150n)
+    const seq = tasks.rename(2n, 'beta-v2', 250n)
+    await tasks.waitForSeq(seq)
+
+    const snap = tasks.snapshot()
+    expect(snap.lastSeq).toBe(3n)
+    expect(snap.stateBytes.byteLength).toBeGreaterThan(0)
+    tasks.close()
+
+    // Reopen on the same redex — file still has seqs 0..=3; adapter
+    // tails FromSeq(4). State comes from stateBytes.
+    const tasks2 = await TasksAdapter.openFromSnapshot(
+      redex,
+      ORIGIN,
+      snap.stateBytes,
+      snap.lastSeq,
+    )
+    const restored = tasks2.listTasks(null)
+    expect(restored).toHaveLength(2)
+    expect(restored.find((t) => t.id === 1n)!.status).toBe(TaskStatus.Completed)
+    expect(restored.find((t) => t.id === 2n)!.title).toBe('beta-v2')
+
+    // Continuing ingest works; next seq is 4.
+    const nextSeq = tasks2.create(3n, 'gamma', 300n)
+    expect(nextSeq).toBe(4n)
+    await tasks2.waitForSeq(nextSeq)
+    expect(tasks2.count()).toBe(3)
+  })
+
+  it('memories: snapshot round-trip', async () => {
+    const redex = new Redex()
+    const memories = await MemoriesAdapter.open(redex, ORIGIN)
+    memories.store(1n, 'alpha', ['x'], 'alice', 100n)
+    memories.pin(1n, 110n)
+    memories.store(2n, 'beta', ['y'], 'alice', 200n)
+    const seq = memories.retag(2n, ['y', 'z'], 210n)
+    await memories.waitForSeq(seq)
+
+    const snap = memories.snapshot()
+    expect(snap.lastSeq).toBe(3n)
+    memories.close()
+
+    const memories2 = await MemoriesAdapter.openFromSnapshot(
+      redex,
+      ORIGIN,
+      snap.stateBytes,
+      snap.lastSeq,
+    )
+    const all = memories2.listMemories(null)
+    expect(all).toHaveLength(2)
+    expect(all.find((m) => m.id === 1n)!.pinned).toBe(true)
+    expect(all.find((m) => m.id === 2n)!.tags.slice().sort()).toEqual(['y', 'z'])
+  })
+
+  it('empty state snapshot has nullish lastSeq', async () => {
+    const redex = new Redex()
+    const tasks = await TasksAdapter.open(redex, ORIGIN)
+    const snap = tasks.snapshot()
+    // napi maps Rust `None` to JS `undefined`; accept either nullish.
+    expect(snap.lastSeq == null).toBe(true)
+  })
+})
+
 describe('cortex multi-model', () => {
   it('tasks and memories coexist on one Redex', async () => {
     const redex = new Redex()

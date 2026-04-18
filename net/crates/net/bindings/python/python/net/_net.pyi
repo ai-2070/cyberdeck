@@ -268,6 +268,15 @@ class TasksAdapter:
     def open(
         redex: Redex, origin_hash: int, persistent: bool = False
     ) -> "TasksAdapter": ...
+    @staticmethod
+    def open_from_snapshot(
+        redex: Redex,
+        origin_hash: int,
+        state_bytes: bytes,
+        last_seq: Optional[int] = None,
+        persistent: bool = False,
+    ) -> "TasksAdapter": ...
+    def snapshot(self) -> tuple[bytes, Optional[int]]: ...
     def create(self, id: int, title: str, now_ns: int) -> int: ...
     def rename(self, id: int, new_title: str, now_ns: int) -> int: ...
     def complete(self, id: int, now_ns: int) -> int: ...
@@ -321,6 +330,15 @@ class MemoriesAdapter:
     def open(
         redex: Redex, origin_hash: int, persistent: bool = False
     ) -> "MemoriesAdapter": ...
+    @staticmethod
+    def open_from_snapshot(
+        redex: Redex,
+        origin_hash: int,
+        state_bytes: bytes,
+        last_seq: Optional[int] = None,
+        persistent: bool = False,
+    ) -> "MemoriesAdapter": ...
+    def snapshot(self) -> tuple[bytes, Optional[int]]: ...
     def store(
         self,
         id: int,
