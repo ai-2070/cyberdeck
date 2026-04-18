@@ -358,7 +358,7 @@ For implementation details — capabilities, proximity graphs, subnets, channels
 
 ## Status
 
-Net is a working protocol, not a paper design. 984 tests verify the implementation across every layer of the stack.
+Net is a working protocol, not a paper design. 985 tests verify the implementation across every layer of the stack.
 
 **What works today:**
 
