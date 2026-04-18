@@ -42,6 +42,15 @@ This plan ships a real Backpressure signal in v1 without wire changes or per-pee
 
 ## Design
 
+### Option choice — counter on `StreamState` (Option A, chosen)
+
+Two viable v1 shapes, both local-only, both honoring the non-goals:
+
+- **Option A (chosen): a per-stream in-flight counter on `StreamState`.** `send_on_stream` reads the counter, returns `Backpressure` on over-budget, otherwise increments, sends, decrements. Minimal state, no coupling to the forwarding scheduler.
+- **Option B: route `send_on_stream` through `FairScheduler::enqueue` and surface its `bool` return as `Backpressure`.** Zero new state; one line of plumbing. But local outbound sends now depend on scheduler internals, the forwarding path's queue, and whatever drainer we wire to pull from it — and when v2 swaps local backpressure to bytes-in-flight + credit windows, we'd have to decouple again.
+
+Option A keeps `send_on_stream` synchronous-await-socket, the scheduler focused on forwarding, and the v2 swap local to `StreamState`. Option B buys us one fewer field in exchange for coupling that we'd later have to unwind. We pick A.
+
 ### v1 — per-stream in-flight counter on `StreamState`
 
 Add two fields to `StreamState`:
