@@ -323,12 +323,7 @@ async fn test_watch_dedupes_unchanged_results() {
     let seq = tasks.complete(2, 250).unwrap();
     tasks.wait_for_seq(seq).await;
 
-    let mut stream = Box::pin(
-        tasks
-            .watch()
-            .where_status(TaskStatus::Pending)
-            .stream(),
-    );
+    let mut stream = Box::pin(tasks.watch().where_status(TaskStatus::Pending).stream());
     let initial = stream.next().await.unwrap();
     assert_eq!(initial.len(), 1);
 
@@ -354,18 +349,8 @@ async fn test_watch_multiple_subscribers_independent() {
     let redex = Redex::new();
     let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
 
-    let mut pending_stream = Box::pin(
-        tasks
-            .watch()
-            .where_status(TaskStatus::Pending)
-            .stream(),
-    );
-    let mut completed_stream = Box::pin(
-        tasks
-            .watch()
-            .where_status(TaskStatus::Completed)
-            .stream(),
-    );
+    let mut pending_stream = Box::pin(tasks.watch().where_status(TaskStatus::Pending).stream());
+    let mut completed_stream = Box::pin(tasks.watch().where_status(TaskStatus::Completed).stream());
 
     // Both get an empty initial emission.
     assert!(pending_stream.next().await.unwrap().is_empty());

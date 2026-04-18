@@ -1,0 +1,178 @@
+//! `MemoriesAdapter` — typed wrapper over `CortexAdapter<MemoriesState>`
+//! with domain-level ingest helpers.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use bytes::Bytes;
+use parking_lot::RwLock;
+
+use super::super::super::channel::ChannelName;
+use super::super::super::redex::{Redex, RedexFileConfig};
+use super::super::adapter::CortexAdapter;
+use super::super::config::CortexAdapterConfig;
+use super::super::envelope::EventEnvelope;
+use super::super::error::CortexAdapterError;
+use super::super::meta::EventMeta;
+use super::dispatch::{
+    DISPATCH_MEMORY_DELETED, DISPATCH_MEMORY_PINNED, DISPATCH_MEMORY_RETAGGED,
+    DISPATCH_MEMORY_STORED, DISPATCH_MEMORY_UNPINNED, MEMORIES_CHANNEL,
+};
+use super::fold::MemoriesFold;
+use super::state::MemoriesState;
+use super::types::{
+    MemoryDeletedPayload, MemoryId, MemoryPinTogglePayload, MemoryRetaggedPayload,
+    MemoryStoredPayload,
+};
+
+/// Typed wrapper around `CortexAdapter<MemoriesState>` that exposes
+/// domain-level operations (`store`, `retag`, `pin`, `unpin`,
+/// `delete`) and hides the `EventMeta` + bincode plumbing.
+pub struct MemoriesAdapter {
+    inner: CortexAdapter<MemoriesState>,
+    /// Producer identity stamped on every `EventMeta`.
+    origin_hash: u32,
+    /// Monotonic per-origin counter for `EventMeta::seq_or_ts`.
+    app_seq: AtomicU64,
+}
+
+impl MemoriesAdapter {
+    /// Open the memories adapter against a `Redex` manager.
+    ///
+    /// Uses [`MEMORIES_CHANNEL`] (`"cortex/memories"`). Replays the
+    /// full history into state on open.
+    pub fn open(redex: &Redex, origin_hash: u32) -> Result<Self, CortexAdapterError> {
+        Self::open_with_config(redex, origin_hash, RedexFileConfig::default())
+    }
+
+    /// Like [`Self::open`] but with a caller-supplied `RedexFileConfig`.
+    pub fn open_with_config(
+        redex: &Redex,
+        origin_hash: u32,
+        redex_config: RedexFileConfig,
+    ) -> Result<Self, CortexAdapterError> {
+        let name = ChannelName::new(MEMORIES_CHANNEL).map_err(|e| {
+            CortexAdapterError::Redex(super::super::super::redex::RedexError::Channel(
+                e.to_string(),
+            ))
+        })?;
+        let inner = CortexAdapter::open(
+            redex,
+            &name,
+            redex_config,
+            CortexAdapterConfig::default(),
+            MemoriesFold,
+            MemoriesState::new(),
+        )?;
+        Ok(Self {
+            inner,
+            origin_hash,
+            app_seq: AtomicU64::new(0),
+        })
+    }
+
+    /// Store a new memory. Returns the RedEX seq of the append.
+    pub fn store(
+        &self,
+        id: MemoryId,
+        content: impl Into<String>,
+        tags: impl IntoIterator<Item = String>,
+        source: impl Into<String>,
+        now_ns: u64,
+    ) -> Result<u64, CortexAdapterError> {
+        let payload = MemoryStoredPayload {
+            id,
+            content: content.into(),
+            tags: tags.into_iter().collect(),
+            source: source.into(),
+            now_ns,
+        };
+        self.ingest_typed(DISPATCH_MEMORY_STORED, &payload)
+    }
+
+    /// Replace the tag set on an existing memory. No-op at fold time
+    /// if `id` is unknown.
+    pub fn retag(
+        &self,
+        id: MemoryId,
+        tags: impl IntoIterator<Item = String>,
+        now_ns: u64,
+    ) -> Result<u64, CortexAdapterError> {
+        let payload = MemoryRetaggedPayload {
+            id,
+            tags: tags.into_iter().collect(),
+            now_ns,
+        };
+        self.ingest_typed(DISPATCH_MEMORY_RETAGGED, &payload)
+    }
+
+    /// Pin a memory.
+    pub fn pin(&self, id: MemoryId, now_ns: u64) -> Result<u64, CortexAdapterError> {
+        let payload = MemoryPinTogglePayload { id, now_ns };
+        self.ingest_typed(DISPATCH_MEMORY_PINNED, &payload)
+    }
+
+    /// Unpin a memory.
+    pub fn unpin(&self, id: MemoryId, now_ns: u64) -> Result<u64, CortexAdapterError> {
+        let payload = MemoryPinTogglePayload { id, now_ns };
+        self.ingest_typed(DISPATCH_MEMORY_UNPINNED, &payload)
+    }
+
+    /// Delete a memory.
+    pub fn delete(&self, id: MemoryId) -> Result<u64, CortexAdapterError> {
+        let payload = MemoryDeletedPayload { id };
+        self.ingest_typed(DISPATCH_MEMORY_DELETED, &payload)
+    }
+
+    /// Read-only access to the materialized state.
+    pub fn state(&self) -> Arc<RwLock<MemoriesState>> {
+        self.inner.state()
+    }
+
+    /// Block until every event up through `seq` has been folded.
+    pub async fn wait_for_seq(&self, seq: u64) {
+        self.inner.wait_for_seq(seq).await;
+    }
+
+    /// Close the adapter. See [`CortexAdapter::close`].
+    pub fn close(&self) -> Result<(), CortexAdapterError> {
+        self.inner.close()
+    }
+
+    /// True if the fold task is currently running.
+    pub fn is_running(&self) -> bool {
+        self.inner.is_running()
+    }
+
+    /// Access the wrapped [`CortexAdapter`] for cases that need the
+    /// lower-level surface.
+    pub fn as_cortex(&self) -> &CortexAdapter<MemoriesState> {
+        &self.inner
+    }
+
+    fn ingest_typed<T: serde::Serialize>(
+        &self,
+        dispatch: u8,
+        payload: &T,
+    ) -> Result<u64, CortexAdapterError> {
+        let tail = bincode::serialize(payload).map_err(|e| {
+            CortexAdapterError::Redex(super::super::super::redex::RedexError::Encode(
+                e.to_string(),
+            ))
+        })?;
+        let app_seq = self.app_seq.fetch_add(1, Ordering::AcqRel);
+        let meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, 0);
+        let env = EventEnvelope::new(meta, Bytes::from(tail));
+        self.inner.ingest(env)
+    }
+}
+
+impl std::fmt::Debug for MemoriesAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoriesAdapter")
+            .field("origin_hash", &self.origin_hash)
+            .field("app_seq", &self.app_seq.load(Ordering::Acquire))
+            .field("inner", &self.inner)
+            .finish()
+    }
+}

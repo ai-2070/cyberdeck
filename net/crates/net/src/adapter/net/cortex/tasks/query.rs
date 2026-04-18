@@ -213,10 +213,7 @@ impl<'a> TasksQuery<'a> {
 
     /// True if any task matches. Short-circuits on first hit.
     pub fn exists(self) -> bool {
-        self.state
-            .tasks
-            .values()
-            .any(|t| self.spec.matches(t))
+        self.state.tasks.values().any(|t| self.spec.matches(t))
     }
 }
 

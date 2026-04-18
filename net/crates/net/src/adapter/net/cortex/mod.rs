@@ -23,6 +23,8 @@ mod envelope;
 mod error;
 mod meta;
 
+#[cfg(feature = "cortex-memories")]
+pub mod memories;
 #[cfg(feature = "cortex-tasks")]
 pub mod tasks;
 

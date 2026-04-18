@@ -41,10 +41,7 @@ pub struct TasksWatcher {
 impl TasksWatcher {
     /// Build a watcher from the adapter's state handle + change stream.
     /// Intended to be called only by [`super::TasksAdapter::watch`].
-    pub(super) fn new(
-        state: Arc<RwLock<TasksState>>,
-        changes: BoxStream<'static, u64>,
-    ) -> Self {
+    pub(super) fn new(state: Arc<RwLock<TasksState>>, changes: BoxStream<'static, u64>) -> Self {
         Self {
             state,
             changes,
