@@ -106,6 +106,58 @@ Net::builder().jetstream(JetStreamAdapterConfig::new("nats://localhost:4222"))
 Net::builder().mesh(NetAdapterConfig::initiator(bind, peer, psk, peer_pubkey))
 ```
 
+## Mesh Streams (multi-peer + back-pressure)
+
+For direct peer-to-peer messaging outside the event bus — open a typed
+stream to a specific peer, send batches, and react to back-pressure:
+
+```rust
+use net_sdk::{Mesh, MeshBuilder, StreamConfig, Reliability};
+use net_sdk::error::SdkError;
+use bytes::Bytes;
+
+let node = MeshBuilder::new("127.0.0.1:9000", &[0x42u8; 32])?
+    .build()
+    .await?;
+
+// ... handshake with a peer via node.inner().connect(...) ...
+
+// Open a per-peer stream with explicit reliability + back-pressure window.
+let stream = node.open_stream(
+    peer_node_id,
+    0x42,
+    StreamConfig::new()
+        .with_reliability(Reliability::Reliable)
+        .with_window_bytes(256),   // max in-flight packets before Backpressure
+)?;
+
+// Three canonical daemon patterns:
+
+// 1. Drop on pressure — best for telemetry / sampled streams.
+match node.send_on_stream(&stream, &[Bytes::from_static(b"{}")]).await {
+    Ok(()) => {}
+    Err(SdkError::Backpressure) => metrics::inc("stream.backpressure_drops"),
+    Err(SdkError::NotConnected) => {/* peer gone or stream closed */}
+    Err(e) => tracing::warn!(error = %e, "transport error"),
+}
+
+// 2. Retry with exponential backoff — best for important events.
+node.send_with_retry(&stream, &[Bytes::from_static(b"{}")], 8).await?;
+
+// 3. Block until the network lets up (bounded retry, ~13 min worst case).
+node.send_blocking(&stream, &[Bytes::from_static(b"{}")]).await?;
+
+// Live stats — per-stream tx/rx seq, in-flight, window, backpressure count.
+let stats = node.stream_stats(peer_node_id, 0x42);
+```
+
+`SdkError::Backpressure` is a signal, not a policy — the transport never
+retries or buffers on its own behalf. `StreamStats.backpressure_events`
+counts cumulative rejections for observability. See
+[`docs/TRANSPORT.md`](../docs/TRANSPORT.md) for the full contract and
+[`docs/STREAM_BACKPRESSURE_PLAN.md`](../docs/STREAM_BACKPRESSURE_PLAN.md)
+for the design.
+
 ## API
 
 | Method | Description |
