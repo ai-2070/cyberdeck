@@ -7,6 +7,7 @@
 
 #![cfg(feature = "cortex-memories")]
 
+use futures::StreamExt;
 use net::adapter::net::cortex::memories::{MemoriesAdapter, OrderBy};
 use net::adapter::net::redex::Redex;
 
@@ -265,6 +266,201 @@ async fn test_replay_after_close_reconstructs_state() {
     let m2 = guard.get(2).unwrap();
     assert!(!m2.pinned);
     assert_eq!(m2.tags, vec!["y".to_string(), "z".to_string()]);
+}
+
+#[tokio::test]
+async fn test_watch_initial_emission() {
+    let redex = Redex::new();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+
+    // Pre-populate with one pinned + one unpinned.
+    memories
+        .store(1, "pinned content", vec!["urgent".into()], "alice", 100)
+        .unwrap();
+    memories
+        .store(2, "other content", vec!["later".into()], "alice", 200)
+        .unwrap();
+    let seq = memories.pin(1, 210).unwrap();
+    memories.wait_for_seq(seq).await;
+
+    let mut stream = Box::pin(
+        memories
+            .watch()
+            .where_pinned(true)
+            .order_by(OrderBy::IdAsc)
+            .stream(),
+    );
+
+    let initial = stream.next().await.unwrap();
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0].id, 1);
+}
+
+#[tokio::test]
+async fn test_watch_emits_on_tag_change() {
+    let redex = Redex::new();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+
+    // Watch memories tagged "urgent".
+    let mut stream = Box::pin(
+        memories
+            .watch()
+            .where_tag("urgent")
+            .order_by(OrderBy::IdAsc)
+            .stream(),
+    );
+    let initial = stream.next().await.unwrap();
+    assert!(initial.is_empty());
+
+    // Store a memory without the "urgent" tag → no emission expected
+    // (the next tagged store should produce the next emission, not
+    // this irrelevant one).
+    memories
+        .store(1, "routine", vec!["later".into()], "alice", 100)
+        .unwrap();
+
+    // Store a matching memory → emission [1] where id=2 and has tag.
+    memories
+        .store(
+            2,
+            "fire in the datacenter",
+            vec!["urgent".into()],
+            "alice",
+            200,
+        )
+        .unwrap();
+    let next = stream.next().await.unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].id, 2);
+
+    // Retag #1 to include "urgent" → now it matches; emission [1, 2].
+    memories
+        .retag(1, vec!["later".into(), "urgent".into()], 300)
+        .unwrap();
+    let next = stream.next().await.unwrap();
+    let mut ids: Vec<_> = next.iter().map(|m| m.id).collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 2]);
+
+    // Retag #2 to drop "urgent" → drops out of filter; emission [1].
+    memories
+        .retag(2, vec!["resolved".into()], 400)
+        .unwrap();
+    let next = stream.next().await.unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].id, 1);
+}
+
+#[tokio::test]
+async fn test_watch_dedupes_unchanged_results() {
+    let redex = Redex::new();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+
+    // Seed one memory tagged "work" + one tagged "home".
+    memories
+        .store(1, "work note", vec!["work".into()], "alice", 100)
+        .unwrap();
+    memories
+        .store(2, "home note", vec!["home".into()], "alice", 200)
+        .unwrap();
+    let seq = memories.pin(2, 210).unwrap();
+    memories.wait_for_seq(seq).await;
+
+    let mut stream = Box::pin(memories.watch().where_tag("work").stream());
+    let initial = stream.next().await.unwrap();
+    assert_eq!(initial.len(), 1);
+
+    // Changes that DON'T affect the "work"-tagged set:
+    //   - pin/unpin the home memory
+    //   - retag the home memory (still tagged home)
+    memories.unpin(2, 300).unwrap();
+    memories.pin(2, 310).unwrap();
+    memories
+        .retag(2, vec!["home".into(), "archive".into()], 320)
+        .unwrap();
+
+    // Now make a change that DOES affect the "work" set: store a new
+    // work-tagged memory.
+    memories
+        .store(3, "another work note", vec!["work".into()], "alice", 400)
+        .unwrap();
+
+    let next = stream.next().await.unwrap();
+    let mut ids: Vec<_> = next.iter().map(|m| m.id).collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 3]);
+}
+
+#[tokio::test]
+async fn test_watch_multiple_subscribers_independent() {
+    let redex = Redex::new();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+
+    let mut pinned_stream =
+        Box::pin(memories.watch().where_pinned(true).stream());
+    let mut tagged_stream =
+        Box::pin(memories.watch().where_tag("flagged").stream());
+
+    // Both emit empty initial.
+    assert!(pinned_stream.next().await.unwrap().is_empty());
+    assert!(tagged_stream.next().await.unwrap().is_empty());
+
+    // Store a memory with tag "flagged" but not pinned.
+    memories
+        .store(1, "flagged mem", vec!["flagged".into()], "alice", 100)
+        .unwrap();
+
+    // tagged_stream yields [1]; pinned_stream stays empty (no emit).
+    let t = tagged_stream.next().await.unwrap();
+    assert_eq!(t.len(), 1);
+    assert_eq!(t[0].id, 1);
+
+    // Pin it. Now pinned_stream yields [1]; tagged_stream stays
+    // unchanged (still tagged flagged, no re-emission needed).
+    memories.pin(1, 200).unwrap();
+    let p = pinned_stream.next().await.unwrap();
+    assert_eq!(p.len(), 1);
+}
+
+#[tokio::test]
+async fn test_watch_with_limit_and_order() {
+    let redex = Redex::new();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+
+    let mut stream = Box::pin(
+        memories
+            .watch()
+            .where_pinned(true)
+            .order_by(OrderBy::CreatedDesc)
+            .limit(2)
+            .stream(),
+    );
+    assert!(stream.next().await.unwrap().is_empty());
+
+    for id in 1..=5u64 {
+        memories
+            .store(
+                id,
+                format!("m-{}", id),
+                Vec::<String>::new(),
+                "alice",
+                100 * id,
+            )
+            .unwrap();
+        memories.pin(id, 100 * id + 1).unwrap();
+    }
+
+    // Drain until we see the top-2 newest pinned: ids 5, 4.
+    let mut last: Vec<_> = Vec::new();
+    for _ in 0..20 {
+        last = stream.next().await.unwrap();
+        if last.len() == 2 && last[0].id == 5 && last[1].id == 4 {
+            break;
+        }
+    }
+    assert_eq!(last.len(), 2);
+    assert_eq!(last[0].id, 5);
+    assert_eq!(last[1].id, 4);
 }
 
 #[tokio::test]

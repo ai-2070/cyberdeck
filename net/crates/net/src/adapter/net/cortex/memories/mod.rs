@@ -25,6 +25,7 @@ mod fold;
 mod query;
 mod state;
 mod types;
+mod watch;
 
 pub use adapter::MemoriesAdapter;
 pub use dispatch::{
@@ -35,3 +36,4 @@ pub use fold::MemoriesFold;
 pub use query::{MemoriesQuery, OrderBy};
 pub use state::MemoriesState;
 pub use types::{Memory, MemoryId};
+pub use watch::MemoriesWatcher;

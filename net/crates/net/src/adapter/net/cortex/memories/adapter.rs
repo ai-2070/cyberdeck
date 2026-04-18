@@ -24,6 +24,9 @@ use super::types::{
     MemoryDeletedPayload, MemoryId, MemoryPinTogglePayload, MemoryRetaggedPayload,
     MemoryStoredPayload,
 };
+use super::watch::MemoriesWatcher;
+
+use futures::StreamExt;
 
 /// Typed wrapper around `CortexAdapter<MemoriesState>` that exposes
 /// domain-level operations (`store`, `retag`, `pin`, `unpin`,
@@ -148,6 +151,13 @@ impl MemoriesAdapter {
     /// lower-level surface.
     pub fn as_cortex(&self) -> &CortexAdapter<MemoriesState> {
         &self.inner
+    }
+
+    /// Start building a reactive watcher. See
+    /// [`MemoriesWatcher::stream`] for emission semantics (initial +
+    /// deduplicated on filter-result change).
+    pub fn watch(&self) -> MemoriesWatcher {
+        MemoriesWatcher::new(self.inner.state(), self.inner.changes().boxed())
     }
 
     fn ingest_typed<T: serde::Serialize>(
