@@ -136,17 +136,27 @@ pub async fn connect_via(
 
 ## Prerequisite: re-key peers by node_id
 
-The current `MeshNode` stores sessions in `peers: DashMap<SocketAddr, PeerInfo>`. When A connects to C via relay B, both the B session and the C-via-B session share B's address. Inserting the C session overwrites B's, breaking the relay.
+The current `MeshNode` stores sessions in `peers: DashMap<SocketAddr, PeerInfo>`. When A connects to C via relay B, both the B session and the C-via-B session share B's wire address. Inserting the C session overwrites B's, breaking the relay.
 
 **Required refactor before handshake relay:**
 
 1. Change `peers: DashMap<SocketAddr, PeerInfo>` → `peers: DashMap<u64, PeerInfo>` (keyed by node_id)
-2. Add `addr_to_node: DashMap<SocketAddr, u64>` for dispatch_packet (source address → node_id lookup)
-3. Update `dispatch_packet` to resolve source → node_id via the reverse map
-4. Update send methods to resolve node_id → addr via `PeerInfo.addr` field
-5. Add `addr: SocketAddr` field to `PeerInfo`
+2. Add `addr: SocketAddr` field to `PeerInfo` (where to send packets for this peer — for relay-reached peers, this is the relay's addr)
+3. Add `addr_to_node: DashMap<SocketAddr, u64>` as a **fast-path hint** for dispatch — not a sole dispatch key (see below)
+4. Update send methods to resolve node_id → addr via `PeerInfo.addr`
 
-This is ~50 lines of refactoring, no new features. After this, handshake relay is straightforward — C stores the A session and B session under different node_ids even though they share B's address.
+### Dispatch key: `session_id`, not source addr
+
+A SocketAddr-keyed map (or a one-to-one `addr → node_id` map) cannot distinguish a direct B session from a relayed C session when both share B's wire address. The authoritative logical key is the inner header's `session_id` (derived from the Noise handshake hash, distinct per session).
+
+`dispatch_packet` uses `session_id` in both branches:
+
+- **Routed packets** (have a routing header, detected by leading bytes ≠ Net magic): look up session by `session_id` directly — source addr is ignored.
+- **Direct packets** (start with Net magic): try `addr_to_node` as a fast path, then **validate** the resolved peer's `session.session_id()` matches the packet's `session_id`. On mismatch, fall back to a `session_id` scan of `peers`. `addr_to_node` never entries for relay-reached peers (the addr already points to the relay's own direct session).
+
+This keeps the common case O(1) while correctly handling the collision case — a packet for the relayed C session that happens to arrive from B's wire addr will still dispatch to C via the fallback scan.
+
+This is ~50 lines of refactoring, no new features. After it, handshake relay is straightforward — C stores the A session and B session under different node_ids even though they share B's wire address.
 
 ## Scope
 

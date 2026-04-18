@@ -48,6 +48,7 @@ use super::pool::PacketBuilder;
 use super::behavior::loadbalance::HealthStatus;
 use super::behavior::proximity::{EnhancedPingwave, ProximityConfig, ProximityGraph};
 use super::compute::SUBPROTOCOL_MIGRATION;
+use super::handshake_relay::{HandshakeAction, HandshakeHandler, SUBPROTOCOL_HANDSHAKE};
 use super::protocol::{self, EventFrame, PacketFlags, MAGIC};
 use super::reroute::ReroutePolicy;
 use super::route::{RoutingHeader, ROUTING_HEADER_SIZE};
@@ -85,19 +86,26 @@ pub type PartitionFilter = Arc<dashmap::DashSet<SocketAddr>>;
 /// Shared context for the packet dispatch loop.
 struct DispatchCtx {
     local_node_id: u64,
-    peers: Arc<DashMap<SocketAddr, PeerInfo>>,
+    peers: Arc<DashMap<u64, PeerInfo>>,
+    addr_to_node: Arc<DashMap<SocketAddr, u64>>,
     router: Arc<NetRouter>,
     failure_detector: Arc<FailureDetector>,
     inbound: InboundQueues,
     num_shards: u16,
     /// Optional subprotocol handler for migration messages.
     migration_handler: Option<Arc<MigrationSubprotocolHandler>>,
+    /// Optional subprotocol handler for relayed Noise handshakes.
+    handshake_handler: Option<Arc<HandshakeHandler>>,
     /// Socket for sending outbound subprotocol responses.
     socket: Arc<NetSocket>,
     /// Proximity graph for topology awareness.
     proximity_graph: Arc<ProximityGraph>,
     /// Partition filter — packets from blocked addresses are dropped.
     partition_filter: PartitionFilter,
+    /// Settings for sessions we create during inbound dispatch (relayed
+    /// handshake responder completes here).
+    packet_pool_size: usize,
+    default_reliable: bool,
 }
 
 /// Configuration for a MeshNode.
@@ -178,6 +186,9 @@ impl MeshNodeConfig {
 struct PeerInfo {
     /// Node ID (derived from keypair or assigned)
     node_id: u64,
+    /// Address used for direct sends. For peers reached via a relay, this
+    /// is the relay's address — packets to the destination go there first.
+    addr: SocketAddr,
     /// Encrypted session
     session: Arc<NetSession>,
 }
@@ -199,8 +210,15 @@ pub struct MeshNode {
     config: MeshNodeConfig,
     /// Shared UDP socket
     socket: Arc<NetSocket>,
-    /// Per-peer sessions keyed by peer address
-    peers: Arc<DashMap<SocketAddr, PeerInfo>>,
+    /// Per-peer sessions keyed by node_id. Keying by node_id (rather than
+    /// SocketAddr) is required for relayed sessions: if A connects to C via
+    /// relay B, both peers share B's wire address, so a SocketAddr-keyed map
+    /// would overwrite B's session with C's.
+    peers: Arc<DashMap<u64, PeerInfo>>,
+    /// Reverse lookup for dispatch: incoming source address → node_id. Only
+    /// populated for directly-connected peers; relayed peers are resolved by
+    /// session_id during dispatch.
+    addr_to_node: Arc<DashMap<SocketAddr, u64>>,
     /// Router for forwarding decisions
     router: Arc<NetRouter>,
     /// Failure detector
@@ -209,6 +227,8 @@ pub struct MeshNode {
     inbound: InboundQueues,
     /// Optional migration subprotocol handler
     migration_handler: Option<Arc<MigrationSubprotocolHandler>>,
+    /// Handles relayed Noise handshakes arriving as SUBPROTOCOL_HANDSHAKE.
+    handshake_handler: Option<Arc<HandshakeHandler>>,
     /// Proximity graph — topology awareness from pingwave propagation
     proximity_graph: Arc<ProximityGraph>,
     /// Automatic reroute policy
@@ -292,6 +312,12 @@ impl MeshNode {
         .on_failure(move |node_id| rp_failure.on_failure(node_id))
         .on_recovery(move |node_id| rp_recovery.on_recovery(node_id));
 
+        let handshake_handler = Some(Arc::new(HandshakeHandler::new(
+            node_id,
+            static_keypair.clone(),
+            config.psk,
+        )));
+
         Ok(Self {
             identity,
             static_keypair,
@@ -299,10 +325,12 @@ impl MeshNode {
             config,
             socket,
             peers: Arc::new(DashMap::new()),
+            addr_to_node: Arc::new(DashMap::new()),
             router,
             failure_detector: Arc::new(failure_detector),
             inbound: Arc::new(DashMap::new()),
             migration_handler: None,
+            handshake_handler,
             proximity_graph,
             reroute_policy,
             peer_addrs,
@@ -396,12 +424,14 @@ impl MeshNode {
         self.router.add_route(peer_node_id, peer_addr);
 
         self.peers.insert(
-            peer_addr,
+            peer_node_id,
             PeerInfo {
                 node_id: peer_node_id,
+                addr: peer_addr,
                 session,
             },
         );
+        self.addr_to_node.insert(peer_addr, peer_node_id);
 
         // Register in peer address map (used by reroute policy)
         self.peer_addrs.insert(peer_node_id, peer_addr);
@@ -435,12 +465,14 @@ impl MeshNode {
         self.router.add_route(peer_node_id, peer_addr);
 
         self.peers.insert(
-            peer_addr,
+            peer_node_id,
             PeerInfo {
                 node_id: peer_node_id,
+                addr: peer_addr,
                 session,
             },
         );
+        self.addr_to_node.insert(peer_addr, peer_node_id);
 
         self.peer_addrs.insert(peer_node_id, peer_addr);
 
@@ -493,14 +525,18 @@ impl MeshNode {
         let ctx = DispatchCtx {
             local_node_id: self.node_id,
             peers: self.peers.clone(),
+            addr_to_node: self.addr_to_node.clone(),
             router: self.router.clone(),
             failure_detector: self.failure_detector.clone(),
             inbound: self.inbound.clone(),
             num_shards: self.config.num_shards,
             migration_handler: self.migration_handler.clone(),
+            handshake_handler: self.handshake_handler.clone(),
             socket: self.socket.clone(),
             proximity_graph: self.proximity_graph.clone(),
             partition_filter: self.partition_filter.clone(),
+            packet_pool_size: self.config.packet_pool_size,
+            default_reliable: self.config.default_reliable,
         };
 
         tokio::spawn(async move {
@@ -552,7 +588,7 @@ impl MeshNode {
                     // Re-broadcast to all peers except the sender
                     tokio::spawn(async move {
                         for entry in peers.iter() {
-                            let addr = *entry.key();
+                            let addr = entry.value().addr;
                             if addr != source && !filter.contains(&addr) {
                                 let _ = socket.send_to(&fwd_bytes, addr).await;
                             }
@@ -611,7 +647,14 @@ impl MeshNode {
             return;
         }
 
-        // Direct packet (no routing header) — standard path
+        // Direct packet (no routing header) — standard path.
+        //
+        // `session_id` is the authoritative logical-peer key. `addr_to_node`
+        // gives a fast path when source addr maps to exactly one session,
+        // but we must still validate session_id against the resolved peer
+        // and fall back to a session_id scan if it doesn't match. Otherwise
+        // two peers that share a wire address (e.g., a direct peer and a
+        // relay-peer reachable via the same relay addr) would collide.
         let parsed = match ParsedPacket::parse(data, source) {
             Some(p) => p,
             None => return,
@@ -621,25 +664,33 @@ impl MeshNode {
             return;
         }
 
-        let peer = match peers.get(&source) {
-            Some(p) => p,
+        let session_id = parsed.header.session_id;
+        let matched = ctx
+            .addr_to_node
+            .get(&source)
+            .map(|e| *e.value())
+            .and_then(|nid| peers.get(&nid))
+            .filter(|p| p.session.session_id() == session_id)
+            .map(|p| (p.value().node_id, p.value().session.clone()))
+            .or_else(|| {
+                peers
+                    .iter()
+                    .find(|e| e.value().session.session_id() == session_id)
+                    .map(|e| (e.value().node_id, e.value().session.clone()))
+            });
+        let (peer_node_id, session) = match matched {
+            Some(x) => x,
             None => return,
         };
 
         if parsed.header.flags.is_heartbeat() {
-            if parsed.header.session_id == peer.session.session_id() {
-                failure_detector.heartbeat(peer.node_id, source);
-                peer.session.touch();
-            }
+            failure_detector.heartbeat(peer_node_id, source);
+            session.touch();
             return;
         }
 
-        if parsed.header.session_id != peer.session.session_id() {
-            return;
-        }
-
-        Self::process_local_packet(&parsed, &peer.session, ctx);
-        peer.session.touch();
+        Self::process_local_packet(&parsed, &session, ctx);
+        session.touch();
     }
 
     /// Process a locally-destined packet: decrypt and queue events.
@@ -697,9 +748,8 @@ impl MeshNode {
                         for msg in outbound {
                             let dest_session = ctx
                                 .peers
-                                .iter()
-                                .find(|e| e.value().node_id == msg.dest_node)
-                                .map(|e| (*e.key(), e.value().session.clone()));
+                                .get(&msg.dest_node)
+                                .map(|e| (e.value().addr, e.value().session.clone()));
 
                             if let Some((dest_addr, dest_sess)) = dest_session {
                                 // Respect partition filter on outbound path
@@ -736,6 +786,28 @@ impl MeshNode {
                 return; // handler processed it
             }
             // No handler set — fall through to standard event path
+        }
+
+        // Relayed Noise handshake
+        if parsed.header.subprotocol_id == SUBPROTOCOL_HANDSHAKE {
+            if let Some(ref handler) = ctx.handshake_handler {
+                let events =
+                    EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+                let payload = match events.into_iter().next() {
+                    Some(data) => data,
+                    None => return,
+                };
+
+                // Address of the peer that delivered this subprotocol message to
+                // us (the previous hop). Used as the wire addr for any new peer
+                // we learn about through this handshake.
+                let from_addr = session.peer_addr();
+                let actions = handler.handle_message(&payload, from_addr);
+                for action in actions {
+                    Self::execute_handshake_action(action, ctx);
+                }
+                return;
+            }
         }
 
         // Standard event path: parse event frames and queue
@@ -785,7 +857,7 @@ impl MeshNode {
                         let pw_bytes = pw.to_bytes();
 
                         for entry in peers.iter() {
-                            let peer_addr = *entry.key();
+                            let peer_addr = entry.value().addr;
                             if partition_filter.contains(&peer_addr) {
                                 continue;
                             }
@@ -818,9 +890,14 @@ impl MeshNode {
             return Ok(());
         }
 
+        let node_id = self
+            .addr_to_node
+            .get(&peer_addr)
+            .map(|e| *e.value())
+            .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
         let peer = self
             .peers
-            .get(&peer_addr)
+            .get(&node_id)
             .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
 
         let session = &peer.session;
@@ -902,9 +979,8 @@ impl MeshNode {
         // Find the session for the destination (needed for encryption)
         let (dest_addr, session) = self
             .peers
-            .iter()
-            .find(|e| e.value().node_id == dest_node_id)
-            .map(|e| (*e.key(), e.value().session.clone()))
+            .get(&dest_node_id)
+            .map(|e| (e.value().addr, e.value().session.clone()))
             .ok_or_else(|| {
                 AdapterError::Connection(format!("no session for node {:#x}", dest_node_id))
             })?;
@@ -1006,9 +1082,14 @@ impl MeshNode {
             return Ok(());
         }
 
+        let node_id = self
+            .addr_to_node
+            .get(&peer_addr)
+            .map(|e| *e.value())
+            .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
         let peer = self
             .peers
-            .get(&peer_addr)
+            .get(&node_id)
             .ok_or_else(|| AdapterError::Connection("unknown peer".into()))?;
 
         let session = &peer.session;
@@ -1034,6 +1115,186 @@ impl MeshNode {
         drop(builder);
         session.touch();
         Ok(())
+    }
+
+    /// Connect to a peer through an already-connected relay.
+    ///
+    /// The Noise NKpsk0 handshake is carried inside `SUBPROTOCOL_HANDSHAKE`
+    /// packets over the existing relay session. On success, a new peer entry
+    /// for `dest_node_id` is registered with `relay_addr` as the wire
+    /// address (packets go to the relay first), and a routing table entry
+    /// is added so `send_routed(dest_node_id, ...)` works end-to-end.
+    ///
+    /// `start()` must have been called before `connect_via` — the receive
+    /// loop has to be running to deliver msg2 back to us.
+    pub async fn connect_via(
+        &self,
+        relay_addr: SocketAddr,
+        dest_pubkey: &[u8; 32],
+        dest_node_id: u64,
+    ) -> Result<u64, AdapterError> {
+        let handler = self.handshake_handler.clone().ok_or_else(|| {
+            AdapterError::Fatal("handshake handler not initialized".into())
+        })?;
+
+        // Build msg1 and register waiter keyed by dest_node_id.
+        let (payload, keys_rx) = handler
+            .begin_initiator(dest_node_id, dest_pubkey)
+            .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
+
+        if let Err(e) = self
+            .send_subprotocol(relay_addr, SUBPROTOCOL_HANDSHAKE, &payload)
+            .await
+        {
+            handler.cancel_initiator(dest_node_id);
+            return Err(e);
+        }
+
+        let keys = match tokio::time::timeout(self.config.handshake_timeout, keys_rx).await {
+            Ok(Ok(Ok(k))) => k,
+            Ok(Ok(Err(e))) => {
+                handler.cancel_initiator(dest_node_id);
+                return Err(AdapterError::Fatal(format!("handshake relay failed: {}", e)));
+            }
+            Ok(Err(_)) => {
+                handler.cancel_initiator(dest_node_id);
+                return Err(AdapterError::Connection(
+                    "handshake relay channel dropped".into(),
+                ));
+            }
+            Err(_) => {
+                handler.cancel_initiator(dest_node_id);
+                return Err(AdapterError::Connection("handshake relay timeout".into()));
+            }
+        };
+
+        let session = Arc::new(NetSession::new(
+            keys,
+            relay_addr,
+            self.config.packet_pool_size,
+            self.config.default_reliable,
+        ));
+
+        // Route for dest goes via the relay. Don't overwrite addr_to_node —
+        // that already points `relay_addr` → relay's node_id, which is
+        // correct for direct packets from the relay itself.
+        self.router.add_route(dest_node_id, relay_addr);
+        self.peers.insert(
+            dest_node_id,
+            PeerInfo {
+                node_id: dest_node_id,
+                addr: relay_addr,
+                session,
+            },
+        );
+        self.peer_addrs.insert(dest_node_id, relay_addr);
+
+        Ok(dest_node_id)
+    }
+
+    /// Execute a single handshake-relay action produced by `HandshakeHandler`.
+    ///
+    /// Called from the receive loop's subprotocol dispatch path. Not `async`
+    /// because the dispatch path is synchronous — I/O is spawned onto the
+    /// runtime instead.
+    fn execute_handshake_action(action: HandshakeAction, ctx: &DispatchCtx) {
+        match action {
+            HandshakeAction::Forward { to_node, payload } => {
+                // Find a peer session we can use to re-encrypt toward the
+                // next hop. If we have a direct session with `to_node`, send
+                // there; otherwise drop (multi-hop handshake relay is not
+                // supported yet — would require more routing logic).
+                let next = ctx
+                    .peers
+                    .get(&to_node)
+                    .map(|e| (e.value().addr, e.value().session.clone()));
+                if let Some((next_addr, next_sess)) = next {
+                    if ctx.partition_filter.contains(&next_addr) {
+                        return;
+                    }
+                    let socket = ctx.socket.clone();
+                    tokio::spawn(async move {
+                        let pool = next_sess.thread_local_pool();
+                        let mut builder = pool.get();
+                        let seq = {
+                            let stream =
+                                next_sess.get_or_create_stream(SUBPROTOCOL_HANDSHAKE as u64);
+                            stream.next_tx_seq()
+                        };
+                        let events = vec![payload];
+                        let packet = builder.build_subprotocol(
+                            SUBPROTOCOL_HANDSHAKE as u64,
+                            seq,
+                            &events,
+                            PacketFlags::NONE,
+                            SUBPROTOCOL_HANDSHAKE,
+                        );
+                        let _ = socket.send_to(&packet, next_addr).await;
+                    });
+                } else {
+                    tracing::warn!(
+                        dest_node = format!("{:#x}", to_node),
+                        "handshake relay: no session to forward through"
+                    );
+                }
+            }
+            HandshakeAction::RegisterResponderPeer {
+                peer_node_id,
+                relay_addr,
+                keys,
+                response_payload,
+            } => {
+                // Register the new peer. `addr_to_node[relay_addr]` is not
+                // touched — it still points to the relay's node_id, which is
+                // the correct resolution for direct packets from that wire
+                // address. Packets for this new peer arrive via routed
+                // headers and are dispatched by session_id.
+                let session = Arc::new(NetSession::new(
+                    keys,
+                    relay_addr,
+                    ctx.packet_pool_size,
+                    ctx.default_reliable,
+                ));
+                ctx.peers.insert(
+                    peer_node_id,
+                    PeerInfo {
+                        node_id: peer_node_id,
+                        addr: relay_addr,
+                        session,
+                    },
+                );
+                ctx.router.add_route(peer_node_id, relay_addr);
+
+                // Send msg2 back along the same relay path.
+                let relay_node_id = ctx.addr_to_node.get(&relay_addr).map(|e| *e.value());
+                let relay_session = relay_node_id
+                    .and_then(|nid| ctx.peers.get(&nid).map(|e| e.value().session.clone()));
+                if let Some(relay_sess) = relay_session {
+                    if ctx.partition_filter.contains(&relay_addr) {
+                        return;
+                    }
+                    let socket = ctx.socket.clone();
+                    tokio::spawn(async move {
+                        let pool = relay_sess.thread_local_pool();
+                        let mut builder = pool.get();
+                        let seq = {
+                            let stream =
+                                relay_sess.get_or_create_stream(SUBPROTOCOL_HANDSHAKE as u64);
+                            stream.next_tx_seq()
+                        };
+                        let events = vec![response_payload];
+                        let packet = builder.build_subprotocol(
+                            SUBPROTOCOL_HANDSHAKE as u64,
+                            seq,
+                            &events,
+                            PacketFlags::NONE,
+                            SUBPROTOCOL_HANDSHAKE,
+                        );
+                        let _ = socket.send_to(&packet, relay_addr).await;
+                    });
+                }
+            }
+        }
     }
 
     // ── Handshake helpers ───────────────────────────────────────────────
@@ -1204,7 +1465,7 @@ impl Adapter for MeshNode {
             .peers
             .iter()
             .next()
-            .map(|e| *e.key())
+            .map(|e| e.value().addr)
             .ok_or_else(|| AdapterError::Connection("no peers connected".into()))?;
 
         self.send_to_peer(peer_addr, batch).await

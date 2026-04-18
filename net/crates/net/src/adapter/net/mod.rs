@@ -39,6 +39,7 @@ pub mod contested;
 pub mod continuity;
 mod crypto;
 mod failure;
+mod handshake_relay;
 pub mod identity;
 mod mesh;
 mod pool;
@@ -89,6 +90,7 @@ pub use identity::{
     EntityError, EntityId, EntityKeypair, OriginStamp, PermissionToken, TokenCache, TokenError,
     TokenScope,
 };
+pub use handshake_relay::SUBPROTOCOL_HANDSHAKE;
 pub use mesh::{MeshNode, MeshNodeConfig, PartitionFilter};
 pub use reroute::ReroutePolicy;
 pub use pool::{PacketBuilder, PacketPool, SharedLocalPool, SharedPacketPool, ThreadLocalPool};

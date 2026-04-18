@@ -3462,3 +3462,202 @@ async fn test_proximity_graph_pingwave_discovery() {
     node_b.shutdown().await.unwrap();
     node_c.shutdown().await.unwrap();
 }
+
+// ============================================================================
+// Handshake relay tests
+// ============================================================================
+
+/// A establishes a session with C via relay B without any direct A↔C
+/// UDP path. After the relayed handshake, A can send data to C via
+/// `send_routed`, and the payload arrives intact.
+#[tokio::test]
+async fn test_mesh_handshake_via_relay() {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(30))
+    };
+
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let pub_b = *b.public_key();
+    let pub_c = *c.public_key();
+
+    // A↔B direct session.
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.expect("B accept A failed");
+    r2.expect("A connect B failed");
+
+    // B↔C direct session (B is the relay — must have a path to C).
+    let (r1, r2) = tokio::join!(c.accept(nid_b), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        b.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.expect("C accept B failed");
+    r2.expect("B connect C failed");
+
+    // Start all nodes — receive loops must be running before connect_via.
+    a.start();
+    b.start();
+    c.start();
+
+    // A has no direct UDP path to C. Establish a session via B.
+    let result = a.connect_via(addr_b, &pub_c, nid_c).await;
+    result.expect("A connect_via B to C failed");
+
+    // Route for forwarded data: on B, A→C already exists from b.connect(C).
+    // On A, connect_via already inserted a route for C via B.
+    // On B, add a route for A→B so data C→A gets forwarded correctly.
+    b.router().add_route(nid_a, addr_a);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // A sends a batch to C over the newly established A↔C session, routed
+    // through B.
+    let batch = make_batch(0, 10, "via_relay_handshake");
+    a.send_routed(nid_c, batch)
+        .await
+        .expect("A send_routed to C failed");
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let c_result = c.poll_shard(0, None, 100).await.unwrap();
+    assert!(
+        !c_result.events.is_empty(),
+        "C should receive events from A via relayed-handshake session, got {}",
+        c_result.events.len()
+    );
+    for event in &c_result.events {
+        let json: serde_json::Value = event.parse().unwrap();
+        assert_eq!(json["tag"], "via_relay_handshake");
+    }
+
+    let b_result = b.poll_shard(0, None, 100).await.unwrap();
+    assert_eq!(
+        b_result.events.len(),
+        0,
+        "B should not decrypt A→C data — it only relays"
+    );
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
+}
+
+/// After a handshake established via relay B, data flows in both directions
+/// between A and C through B.
+#[tokio::test]
+async fn test_mesh_handshake_relay_bidirectional() {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(30))
+    };
+
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let pub_b = *b.public_key();
+    let pub_c = *c.public_key();
+
+    // A↔B and B↔C direct sessions.
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    let (r1, r2) = tokio::join!(c.accept(nid_b), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        b.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    a.start();
+    b.start();
+    c.start();
+
+    a.connect_via(addr_b, &pub_c, nid_c)
+        .await
+        .expect("connect_via failed");
+
+    // Routing: B already has A (from b.accept/add_route) and C (from
+    // b.connect/add_route). On C, the responder side added a route for A
+    // via B's addr during the handshake. On A, connect_via added the route
+    // for C via B. All four directions are covered.
+    b.router().add_route(nid_a, addr_a);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // A → C
+    a.send_routed(nid_c, make_batch(0, 5, "a_to_c"))
+        .await
+        .unwrap();
+    // C → A
+    c.send_routed(nid_a, make_batch(0, 5, "c_to_a"))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let c_events = c.poll_shard(0, None, 100).await.unwrap();
+    let a_events = a.poll_shard(0, None, 100).await.unwrap();
+
+    assert!(
+        !c_events.events.is_empty(),
+        "C should receive events from A via B"
+    );
+    assert!(
+        !a_events.events.is_empty(),
+        "A should receive events from C via B"
+    );
+    for event in &c_events.events {
+        let json: serde_json::Value = event.parse().unwrap();
+        assert_eq!(json["tag"], "a_to_c");
+    }
+    for event in &a_events.events {
+        let json: serde_json::Value = event.parse().unwrap();
+        assert_eq!(json["tag"], "c_to_a");
+    }
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
+}
