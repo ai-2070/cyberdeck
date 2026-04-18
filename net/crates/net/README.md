@@ -81,6 +81,8 @@ For the design philosophy, architecture rationale, and benchmarks, see the [proj
 | **Observational Continuity** | Causal cones, propagation modeling, continuity proofs, honest discontinuity with deterministic forking, superposition during migration | [CONTINUITY.md](docs/CONTINUITY.md) |
 | **Contested Environments** | Correlated failure detection, subnet-aware partition classification, partition healing with log reconciliation | [CONTESTED.md](docs/CONTESTED.md) |
 | **RedEX (local log)** | 20-byte append-only event records, inline + heap payload hybrid, `ChannelName`-bound files, atomic backfill-then-live tail, count + size retention, optional disk durability via `redex-disk` (torn-write truncation on reopen) | [REDEX_PLAN.md](docs/REDEX_PLAN.md) |
+| **CortEX adapter** | Seam between Net events and RedEX storage: 20-byte `EventMeta` prefix projection, fold-driver spawning on a tokio task, `changes()` broadcast primitive for reactive queries, `Arc<RwLock<State>>` as the NetDB read surface, start-position + fold-error policies | [CORTEX_ADAPTER_PLAN.md](docs/CORTEX_ADAPTER_PLAN.md) |
+| **CortEX models** | Concrete fold implementations: tasks (CRUD on `Task`) and memories (content + tags + pin, with single/any/all tag predicates). Each ships a Prisma-style query builder and a reactive watcher (initial + deduplicated emissions). Dispatches partitioned under `0x00..0x7F`. | [CORTEX_ADAPTER_PLAN.md](docs/CORTEX_ADAPTER_PLAN.md) |
 
 ## Architecture
 
@@ -178,7 +180,7 @@ Benchmarks accurate as of April 15, 2026.
 
 Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns.
 
-1,042 tests. ~840 KB deployed binary.
+1,123 tests. ~840 KB deployed binary.
 
 ## Capabilities
 
@@ -408,18 +410,44 @@ src/adapter/net/
 │   ├── partition.rs       #   PartitionDetector, PartitionPhase, healing
 │   └── reconcile.rs       #   Log reconciliation, longest-chain-wins, ForkRecord
 │
-└── redex/                 # RedEX v1 — local append-only event log (feature `redex`)
-    ├── mod.rs             #   Re-exports: Redex, RedexFile, RedexEvent, RedexError, ...
-    ├── entry.rs           #   20-byte RedexEntry codec, RedexFlags, payload_checksum
-    ├── config.rs          #   RedexFileConfig (persistent, retention, sync_interval)
-    ├── event.rs           #   RedexEvent { entry, payload }
-    ├── error.rs           #   RedexError (thiserror-derived)
-    ├── segment.rs         #   HeapSegment (append-only Vec<u8>, evict_prefix_to)
-    ├── retention.rs       #   compute_eviction_count (count + size policy)
-    ├── fold.rs            #   RedexFold<State> trait (CortEX / NetDB integration hook)
-    ├── file.rs            #   RedexFile (append / tail / read_range / close)
-    ├── manager.rs         #   Redex manager (open_file / get_file / with_persistent_dir)
-    └── disk.rs            #   DiskSegment (feature `redex-disk`): idx + dat append-only files, torn-write recovery
+├── redex/                 # RedEX v1 — local append-only event log (feature `redex`)
+│   ├── mod.rs             #   Re-exports: Redex, RedexFile, RedexEvent, RedexError, ...
+│   ├── entry.rs           #   20-byte RedexEntry codec, RedexFlags, payload_checksum
+│   ├── config.rs          #   RedexFileConfig (persistent, retention, sync_interval)
+│   ├── event.rs           #   RedexEvent { entry, payload }
+│   ├── error.rs           #   RedexError (thiserror-derived)
+│   ├── segment.rs         #   HeapSegment (append-only Vec<u8>, evict_prefix_to)
+│   ├── retention.rs       #   compute_eviction_count (count + size policy)
+│   ├── fold.rs            #   RedexFold<State> trait (CortEX / NetDB integration hook)
+│   ├── file.rs            #   RedexFile (append / tail / read_range / close)
+│   ├── manager.rs         #   Redex manager (open_file / get_file / with_persistent_dir)
+│   └── disk.rs            #   DiskSegment (feature `redex-disk`): idx + dat append-only files, torn-write recovery
+│
+└── cortex/                # CortEX adapter — NetDB fold driver (feature `cortex-adapter`)
+    ├── mod.rs             #   Re-exports: CortexAdapter, EventMeta, EventEnvelope, ...
+    ├── meta.rs            #   20-byte EventMeta prefix codec + dispatch/flag constants
+    ├── envelope.rs        #   EventEnvelope + IntoRedexPayload trait
+    ├── config.rs          #   CortexAdapterConfig, StartPosition, FoldErrorPolicy
+    ├── error.rs           #   CortexAdapterError
+    ├── adapter.rs         #   CortexAdapter<State>: fold task, wait_for_seq, changes() broadcast
+    │
+    ├── tasks/             # First CortEX model — mutate-by-id CRUD (feature `cortex-tasks`)
+    │   ├── types.rs       #     Task, TaskStatus, TaskId + serde payload structs
+    │   ├── dispatch.rs    #     DISPATCH_TASK_* (0x01..0x04), TASKS_CHANNEL
+    │   ├── state.rs       #     TasksState + basic accessors
+    │   ├── fold.rs        #     TasksFold (decodes EventMeta, routes by dispatch)
+    │   ├── query.rs       #     TasksQuery fluent builder + TasksFilterSpec + OrderBy
+    │   ├── watch.rs       #     TasksWatcher reactive stream (initial + dedup)
+    │   └── adapter.rs     #     TasksAdapter wrapper (typed ingest + watch)
+    │
+    └── memories/          # Second CortEX model — content + tags + pin (feature `cortex-memories`)
+        ├── types.rs       #     Memory, MemoryId + serde payload structs
+        ├── dispatch.rs    #     DISPATCH_MEMORY_* (0x10..0x14), MEMORIES_CHANNEL
+        ├── state.rs       #     MemoriesState + pinned/unpinned splits
+        ├── fold.rs        #     MemoriesFold
+        ├── query.rs       #     MemoriesQuery with single/any/all tag predicates
+        ├── watch.rs       #     MemoriesWatcher
+        └── adapter.rs     #     MemoriesAdapter wrapper
 ```
 
 ## Adapters
@@ -585,6 +613,9 @@ net_shutdown(node);
 | C FFI | `ffi` | -- |
 | RedEX (local append-only log) | `redex` | `net`, `tokio-stream`, `bincode` |
 | RedEX disk durability | `redex-disk` | `redex` |
+| CortEX adapter core | `cortex-adapter` | `redex` |
+| CortEX tasks model | `cortex-tasks` | `cortex-adapter` |
+| CortEX memories model | `cortex-memories` | `cortex-adapter` |
 
 Default feature is `redis`.
 
@@ -604,8 +635,8 @@ cargo build --release --all-features
 ## Tests
 
 ```bash
-# Unit tests (892 tests with net+redex+redex-disk)
-cargo test --lib --features "net redex redex-disk"
+# Unit tests (938 with every cortex/redex feature on)
+cargo test --lib --features "net redex redex-disk cortex-adapter cortex-tasks cortex-memories"
 
 # Migration & group integration tests (53 tests)
 cargo test --test migration_integration --features net
@@ -619,15 +650,27 @@ cargo test --test integration_net --features net
 # RedEX integration tests (14 tests: 8 heap + 6 persistent)
 cargo test --test integration_redex --features "redex redex-disk"
 
+# CortEX adapter core (8 tests)
+cargo test --test integration_cortex_adapter --features cortex-adapter
+
+# CortEX tasks model (14 tests: CRUD + query + watch + replay)
+cargo test --test integration_cortex_tasks --features cortex-tasks
+
+# CortEX memories model (13 tests: CRUD + tag queries + watch + coexistence)
+cargo test --test integration_cortex_memories --features "cortex-memories cortex-tasks"
+
 # Rust SDK smoke tests (2 async + 3 doctests)
 cargo test --features net -p net-sdk
+
+# Node SDK smoke tests (9 tests — CortEX tasks + memories over napi)
+cd bindings/node && npx napi build --platform --no-default-features -F cortex && npx vitest run
 
 # Backend adapters (requires running services)
 cargo test --test integration_redis --features redis
 cargo test --test integration_jetstream --features jetstream
 ```
 
-**1,042 tests total across the stack** — lib + migration + three_node + integration_net + integration_redex + SDK.
+**1,123 tests total across the Rust stack** — lib + migration + three_node + integration_net + integration_redex + integration_cortex_{adapter,tasks,memories} + SDK. Plus 9 Node SDK smoke tests via vitest.
 
 ### Test Architecture
 
