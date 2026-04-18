@@ -334,6 +334,82 @@ describe('cortex memories watch', () => {
   })
 })
 
+describe('cortex persistence (redex-disk)', () => {
+  function tmpDir(tag: string): string {
+    const path = `${require('node:os').tmpdir()}/cortex_sdk_${tag}_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    require('node:fs').mkdirSync(path, { recursive: true })
+    return path
+  }
+
+  it('tasks round-trip across reopen', async () => {
+    const dir = tmpDir('tasks')
+
+    // First process: create + persist.
+    {
+      const redex = new Redex(dir)
+      const tasks = await TasksAdapter.open(redex, ORIGIN, true)
+      tasks.create(1n, 'durable', 100n)
+      tasks.create(2n, 'also durable', 101n)
+      const seq = tasks.complete(1n, 102n)
+      await tasks.waitForSeq(seq)
+      tasks.close()
+    }
+
+    // Second process: reopen same dir, state replays from disk.
+    {
+      const redex = new Redex(dir)
+      const tasks = await TasksAdapter.open(redex, ORIGIN, true)
+      // 3 events were appended; wait for fold to catch up.
+      await tasks.waitForSeq(2n)
+      const all = tasks.listTasks(null)
+      expect(all).toHaveLength(2)
+      const t1 = all.find((t) => t.id === 1n)!
+      expect(t1.status).toBe(TaskStatus.Completed)
+      const t2 = all.find((t) => t.id === 2n)!
+      expect(t2.status).toBe(TaskStatus.Pending)
+      expect(t2.title).toBe('also durable')
+    }
+
+    require('node:fs').rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('memories round-trip across reopen', async () => {
+    const dir = tmpDir('mem')
+
+    {
+      const redex = new Redex(dir)
+      const memories = await MemoriesAdapter.open(redex, ORIGIN, true)
+      memories.store(1n, 'alpha', ['x'], 'alice', 100n)
+      memories.pin(1n, 110n)
+      memories.store(2n, 'beta', ['y'], 'alice', 200n)
+      const seq = memories.retag(2n, ['y', 'z'], 210n)
+      await memories.waitForSeq(seq)
+      memories.close()
+    }
+
+    {
+      const redex = new Redex(dir)
+      const memories = await MemoriesAdapter.open(redex, ORIGIN, true)
+      await memories.waitForSeq(3n)
+      const all = memories.listMemories(null)
+      expect(all).toHaveLength(2)
+      const m1 = all.find((m) => m.id === 1n)!
+      expect(m1.pinned).toBe(true)
+      const m2 = all.find((m) => m.id === 2n)!
+      expect(m2.tags.slice().sort()).toEqual(['y', 'z'])
+    }
+
+    require('node:fs').rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('persistent=true without persistentDir errors cleanly', async () => {
+    const redex = new Redex() // heap-only, no persistentDir
+    await expect(TasksAdapter.open(redex, ORIGIN, true)).rejects.toThrow(
+      /persistent/i,
+    )
+  })
+})
+
 describe('cortex multi-model', () => {
   it('tasks and memories coexist on one Redex', async () => {
     const redex = new Redex()

@@ -14,7 +14,7 @@ default = ["redis", "net"]
 redis = ["net/redis"]
 jetstream = ["net/jetstream"]
 net = ["net/net", "dep:hex"]
-cortex = ["net/cortex-tasks", "net/cortex-memories"]
+cortex = ["net/cortex-tasks", "net/cortex-memories", "net/redex-disk"]
 
 [dependencies]
 net = { path = "../..", default-features = false }

@@ -3,13 +3,10 @@
 /** Typed memories adapter handle. */
 export declare class MemoriesAdapter {
   /**
-   * Open the memories adapter against a Redex manager.
-   *
-   * Declared `async` so napi-rs runs it with its tokio runtime
-   * active — the underlying `CortexAdapter::open` spawns the
-   * fold task via `tokio::spawn` and needs a live reactor.
+   * Open the memories adapter against a Redex manager. See
+   * [`TasksAdapter::open`] for `persistent` semantics.
    */
-  static open(redex: Redex, originHash: number): Promise<MemoriesAdapter>
+  static open(redex: Redex, originHash: number, persistent?: boolean | undefined | null): Promise<MemoriesAdapter>
   /** Store a new memory. */
   store(id: bigint, content: string, tags: Array<string>, source: string, nowNs: bigint): bigint
   /**
@@ -171,10 +168,13 @@ export declare class Net {
  */
 export declare class Redex {
   /**
-   * Open a new, local-only Redex manager. Persistent directories
-   * (`redex-disk`) are not exposed from the Node bindings yet.
+   * Open a new Redex manager.
+   *
+   * `persistentDir`: if provided, files opened through adapters
+   * with `persistent: true` write to `<persistentDir>/<channel_path>/{idx,dat}`
+   * and replay from those files on reopen. Heap-only when omitted.
    */
-  constructor()
+  constructor(persistentDir?: string | undefined | null)
 }
 
 /** Typed tasks adapter handle. */
@@ -182,11 +182,16 @@ export declare class TasksAdapter {
   /**
    * Open the tasks adapter against a Redex manager.
    *
+   * `persistent` — when `true`, the file writes to disk under the
+   * Redex's configured persistent directory and replays from disk
+   * on reopen. Requires the Redex to have been constructed with
+   * `persistentDir`; otherwise `open()` errors.
+   *
    * Declared `async` so napi-rs runs it with its tokio runtime
    * active — the underlying `CortexAdapter::open` spawns the
    * fold task via `tokio::spawn` and needs a live reactor.
    */
-  static open(redex: Redex, originHash: number): Promise<TasksAdapter>
+  static open(redex: Redex, originHash: number, persistent?: boolean | undefined | null): Promise<TasksAdapter>
   /** Create a new task. Returns the RedEX sequence of the append. */
   create(id: bigint, title: string, nowNs: bigint): bigint
   /** Rename an existing task. No-op at fold time if `id` is unknown. */

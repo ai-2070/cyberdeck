@@ -247,8 +247,13 @@ class Net:
 from typing import Iterator, List, Optional
 
 class Redex:
-    """Local RedEX manager. One handle per node; shared by all adapters."""
-    def __init__(self) -> None: ...
+    """Local RedEX manager. One handle per node; shared by all adapters.
+
+    persistent_dir: when provided, adapters opened with persistent=True
+    write their channel's idx/dat files under this directory and
+    replay them on reopen.
+    """
+    def __init__(self, persistent_dir: Optional[str] = None) -> None: ...
 
 class Task:
     """A materialized task record."""
@@ -260,7 +265,9 @@ class Task:
 
 class TasksAdapter:
     @staticmethod
-    def open(redex: Redex, origin_hash: int) -> "TasksAdapter": ...
+    def open(
+        redex: Redex, origin_hash: int, persistent: bool = False
+    ) -> "TasksAdapter": ...
     def create(self, id: int, title: str, now_ns: int) -> int: ...
     def rename(self, id: int, new_title: str, now_ns: int) -> int: ...
     def complete(self, id: int, now_ns: int) -> int: ...
@@ -311,7 +318,9 @@ class Memory:
 
 class MemoriesAdapter:
     @staticmethod
-    def open(redex: Redex, origin_hash: int) -> "MemoriesAdapter": ...
+    def open(
+        redex: Redex, origin_hash: int, persistent: bool = False
+    ) -> "MemoriesAdapter": ...
     def store(
         self,
         id: int,

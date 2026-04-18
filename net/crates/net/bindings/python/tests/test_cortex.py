@@ -235,6 +235,58 @@ def test_watch_memories_tag_filter() -> None:
         it.close()
 
 
+def test_persistent_tasks_round_trip(tmp_path) -> None:
+    dir = str(tmp_path / "tasks")
+    # First process: create + persist.
+    redex1 = Redex(persistent_dir=dir)
+    tasks1 = TasksAdapter.open(redex1, ORIGIN, persistent=True)
+    tasks1.create(1, "durable", 100)
+    tasks1.create(2, "also durable", 101)
+    seq = tasks1.complete(1, 102)
+    tasks1.wait_for_seq(seq)
+    tasks1.close()
+    del redex1, tasks1
+
+    # Second process: reopen same dir, state replays from disk.
+    redex2 = Redex(persistent_dir=dir)
+    tasks2 = TasksAdapter.open(redex2, ORIGIN, persistent=True)
+    tasks2.wait_for_seq(2)
+    all_tasks = tasks2.list_tasks()
+    assert len(all_tasks) == 2
+    by_id = {t.id: t for t in all_tasks}
+    assert by_id[1].status == "completed"
+    assert by_id[2].status == "pending"
+    assert by_id[2].title == "also durable"
+
+
+def test_persistent_memories_round_trip(tmp_path) -> None:
+    dir = str(tmp_path / "mem")
+    redex1 = Redex(persistent_dir=dir)
+    memories1 = MemoriesAdapter.open(redex1, ORIGIN, persistent=True)
+    memories1.store(1, "alpha", ["x"], "alice", 100)
+    memories1.pin(1, 110)
+    memories1.store(2, "beta", ["y"], "alice", 200)
+    seq = memories1.retag(2, ["y", "z"], 210)
+    memories1.wait_for_seq(seq)
+    memories1.close()
+    del redex1, memories1
+
+    redex2 = Redex(persistent_dir=dir)
+    memories2 = MemoriesAdapter.open(redex2, ORIGIN, persistent=True)
+    memories2.wait_for_seq(3)
+    all_m = memories2.list_memories()
+    assert len(all_m) == 2
+    by_id = {m.id: m for m in all_m}
+    assert by_id[1].pinned is True
+    assert sorted(by_id[2].tags) == ["y", "z"]
+
+
+def test_persistent_without_dir_errors() -> None:
+    redex = Redex()  # heap-only, no persistent_dir
+    with pytest.raises(RuntimeError, match="persistent"):
+        TasksAdapter.open(redex, ORIGIN, persistent=True)
+
+
 def test_multi_model_coexistence() -> None:
     redex = Redex()
     tasks = TasksAdapter.open(redex, ORIGIN)

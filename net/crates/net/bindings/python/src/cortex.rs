@@ -23,7 +23,7 @@ use ::net::adapter::net::cortex::tasks::{
     OrderBy as InnerTasksOrderBy, Task as InnerTask, TaskStatus as InnerTaskStatus,
     TasksAdapter as InnerTasksAdapter,
 };
-use ::net::adapter::net::redex::Redex as InnerRedex;
+use ::net::adapter::net::redex::{Redex as InnerRedex, RedexFileConfig};
 
 // =========================================================================
 // Shared helpers
@@ -88,24 +88,37 @@ fn parse_memories_order_by(s: &str) -> PyResult<InnerMemoriesOrderBy> {
 // =========================================================================
 
 /// Local RedEX manager. One handle shared across all adapters on
-/// this node. Not thread-safe for Python's GIL purposes — typical
-/// Python usage is single-threaded.
+/// this node.
+///
+/// `persistent_dir`: if provided, files opened through adapters with
+/// `persistent=True` write to `<persistent_dir>/<channel_path>/{idx,dat}`
+/// and replay from those files on reopen. Heap-only when `None`.
 #[pyclass(name = "Redex")]
 pub struct PyRedex {
     inner: Arc<InnerRedex>,
+    persistent_dir: Option<String>,
 }
 
 #[pymethods]
 impl PyRedex {
     #[new]
-    fn new() -> Self {
+    #[pyo3(signature = (persistent_dir = None))]
+    fn new(persistent_dir: Option<String>) -> Self {
+        let inner = match &persistent_dir {
+            Some(dir) => InnerRedex::new().with_persistent_dir(dir),
+            None => InnerRedex::new(),
+        };
         Self {
-            inner: Arc::new(InnerRedex::new()),
+            inner: Arc::new(inner),
+            persistent_dir,
         }
     }
 
     fn __repr__(&self) -> String {
-        "Redex(local)".into()
+        match &self.persistent_dir {
+            Some(dir) => format!("Redex(persistent_dir={:?})", dir),
+            None => "Redex(local)".into(),
+        }
     }
 }
 
@@ -161,12 +174,25 @@ pub struct PyTasksAdapter {
 #[pymethods]
 impl PyTasksAdapter {
     /// Open the tasks adapter against a Redex manager.
+    ///
+    /// `persistent`: if `True`, the file writes to disk under the
+    /// Redex's configured `persistent_dir` and replays from disk on
+    /// reopen. Requires the Redex to have been constructed with
+    /// `persistent_dir`; otherwise raises `RuntimeError`.
     #[staticmethod]
-    fn open(redex: &PyRedex, origin_hash: u32) -> PyResult<Self> {
+    #[pyo3(signature = (redex, origin_hash, persistent = false))]
+    fn open(redex: &PyRedex, origin_hash: u32, persistent: bool) -> PyResult<Self> {
         let runtime = make_runtime()?;
         let redex_inner = redex.inner.clone();
+        let cfg = if persistent {
+            RedexFileConfig::default().with_persistent(true)
+        } else {
+            RedexFileConfig::default()
+        };
         let inner = runtime
-            .block_on(async move { InnerTasksAdapter::open(&redex_inner, origin_hash) })
+            .block_on(async move {
+                InnerTasksAdapter::open_with_config(&redex_inner, origin_hash, cfg)
+            })
             .map_err(|e| PyRuntimeError::new_err(format!("TasksAdapter open failed: {}", e)))?;
         Ok(Self {
             inner: Arc::new(inner),
@@ -484,12 +510,22 @@ pub struct PyMemoriesAdapter {
 
 #[pymethods]
 impl PyMemoriesAdapter {
+    /// Open the memories adapter against a Redex manager. See
+    /// `TasksAdapter.open` for `persistent` semantics.
     #[staticmethod]
-    fn open(redex: &PyRedex, origin_hash: u32) -> PyResult<Self> {
+    #[pyo3(signature = (redex, origin_hash, persistent = false))]
+    fn open(redex: &PyRedex, origin_hash: u32, persistent: bool) -> PyResult<Self> {
         let runtime = make_runtime()?;
         let redex_inner = redex.inner.clone();
+        let cfg = if persistent {
+            RedexFileConfig::default().with_persistent(true)
+        } else {
+            RedexFileConfig::default()
+        };
         let inner = runtime
-            .block_on(async move { InnerMemoriesAdapter::open(&redex_inner, origin_hash) })
+            .block_on(async move {
+                InnerMemoriesAdapter::open_with_config(&redex_inner, origin_hash, cfg)
+            })
             .map_err(|e| PyRuntimeError::new_err(format!("MemoriesAdapter open failed: {}", e)))?;
         Ok(Self {
             inner: Arc::new(inner),

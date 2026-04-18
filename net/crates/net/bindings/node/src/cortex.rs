@@ -29,7 +29,7 @@ use ::net::adapter::net::cortex::tasks::{
     OrderBy as InnerTasksOrderBy, Task as InnerTask, TaskStatus as InnerTaskStatus,
     TasksAdapter as InnerTasksAdapter,
 };
-use ::net::adapter::net::redex::Redex as InnerRedex;
+use ::net::adapter::net::redex::{Redex as InnerRedex, RedexFileConfig};
 
 // =========================================================================
 // Shared helpers
@@ -54,13 +54,20 @@ pub struct Redex {
 
 #[napi]
 impl Redex {
-    /// Open a new, local-only Redex manager. Persistent directories
-    /// (`redex-disk`) are not exposed from the Node bindings yet.
+    /// Open a new Redex manager.
+    ///
+    /// `persistentDir`: if provided, files opened through adapters
+    /// with `persistent: true` write to `<persistentDir>/<channel_path>/{idx,dat}`
+    /// and replay from those files on reopen. Heap-only when omitted.
     #[napi(constructor)]
     #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+    pub fn new(persistent_dir: Option<String>) -> Self {
+        let inner = match persistent_dir {
+            Some(dir) => InnerRedex::new().with_persistent_dir(dir),
+            None => InnerRedex::new(),
+        };
         Self {
-            inner: Arc::new(InnerRedex::new()),
+            inner: Arc::new(inner),
         }
     }
 }
@@ -242,12 +249,26 @@ pub struct TasksAdapter {
 impl TasksAdapter {
     /// Open the tasks adapter against a Redex manager.
     ///
+    /// `persistent` — when `true`, the file writes to disk under the
+    /// Redex's configured persistent directory and replays from disk
+    /// on reopen. Requires the Redex to have been constructed with
+    /// `persistentDir`; otherwise `open()` errors.
+    ///
     /// Declared `async` so napi-rs runs it with its tokio runtime
     /// active — the underlying `CortexAdapter::open` spawns the
     /// fold task via `tokio::spawn` and needs a live reactor.
     #[napi(factory)]
-    pub async fn open(redex: &Redex, origin_hash: u32) -> Result<Self> {
-        let inner = InnerTasksAdapter::open(&redex.inner, origin_hash)
+    pub async fn open(
+        redex: &Redex,
+        origin_hash: u32,
+        persistent: Option<bool>,
+    ) -> Result<Self> {
+        let cfg = if persistent.unwrap_or(false) {
+            RedexFileConfig::default().with_persistent(true)
+        } else {
+            RedexFileConfig::default()
+        };
+        let inner = InnerTasksAdapter::open_with_config(&redex.inner, origin_hash, cfg)
             .map_err(|e| Error::from_reason(format!("TasksAdapter open failed: {}", e)))?;
         Ok(Self {
             inner: Arc::new(inner),
@@ -548,14 +569,20 @@ pub struct MemoriesAdapter {
 
 #[napi]
 impl MemoriesAdapter {
-    /// Open the memories adapter against a Redex manager.
-    ///
-    /// Declared `async` so napi-rs runs it with its tokio runtime
-    /// active — the underlying `CortexAdapter::open` spawns the
-    /// fold task via `tokio::spawn` and needs a live reactor.
+    /// Open the memories adapter against a Redex manager. See
+    /// [`TasksAdapter::open`] for `persistent` semantics.
     #[napi(factory)]
-    pub async fn open(redex: &Redex, origin_hash: u32) -> Result<Self> {
-        let inner = InnerMemoriesAdapter::open(&redex.inner, origin_hash)
+    pub async fn open(
+        redex: &Redex,
+        origin_hash: u32,
+        persistent: Option<bool>,
+    ) -> Result<Self> {
+        let cfg = if persistent.unwrap_or(false) {
+            RedexFileConfig::default().with_persistent(true)
+        } else {
+            RedexFileConfig::default()
+        };
+        let inner = InnerMemoriesAdapter::open_with_config(&redex.inner, origin_hash, cfg)
             .map_err(|e| Error::from_reason(format!("MemoriesAdapter open failed: {}", e)))?;
         Ok(Self {
             inner: Arc::new(inner),
