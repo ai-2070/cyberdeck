@@ -1364,24 +1364,19 @@ async fn test_router_end_to_end_forwarding() {
 
     // C receives the forwarded packets
     let mut received = 0;
-    loop {
-        match tokio::time::timeout(Duration::from_millis(500), sock_c.recv_from(&mut recv_buf))
-            .await
-        {
-            Ok(Ok((n, _))) => {
-                // Verify it has a valid routing header
-                let hdr = RoutingHeader::from_bytes(&recv_buf[..n]);
-                assert!(
-                    hdr.is_some(),
-                    "forwarded packet should have valid routing header"
-                );
-                let hdr = hdr.unwrap();
-                assert_eq!(hdr.dest_id, node_c);
-                assert_eq!(hdr.hop_count, 1, "should have 1 hop from B");
-                received += 1;
-            }
-            _ => break,
-        }
+    while let Ok(Ok((n, _))) =
+        tokio::time::timeout(Duration::from_millis(500), sock_c.recv_from(&mut recv_buf)).await
+    {
+        // Verify it has a valid routing header
+        let hdr = RoutingHeader::from_bytes(&recv_buf[..n]);
+        assert!(
+            hdr.is_some(),
+            "forwarded packet should have valid routing header"
+        );
+        let hdr = hdr.unwrap();
+        assert_eq!(hdr.dest_id, node_c);
+        assert_eq!(hdr.hop_count, 1, "should have 1 hop from B");
+        received += 1;
     }
 
     assert!(

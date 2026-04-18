@@ -13,6 +13,7 @@ use net::adapter::net::behavior::capability::{
     CapabilityAnnouncement, CapabilityFilter, CapabilityIndex, CapabilitySet,
 };
 use net::adapter::net::behavior::loadbalance::{RequestContext, Strategy};
+use net::adapter::net::compute::migration_target::RestoreContext;
 use net::adapter::net::compute::{
     chunk_snapshot, DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, ForkGroup,
     ForkGroupConfig, GroupCoordinator, GroupError, GroupHealth, MemberInfo, MemberRole, MeshDaemon,
@@ -218,10 +219,12 @@ fn test_end_to_end_migration_local_source() {
     let snapshot = StateSnapshot::from_bytes(&snapshot_bytes).unwrap();
     target_handler
         .restore_snapshot(
-            origin,
-            &snapshot,
-            0x1111,
-            0x1111,
+            RestoreContext {
+                daemon_origin: origin,
+                snapshot: &snapshot,
+                source_node: 0x1111,
+                orchestrator_node: 0x1111,
+            },
             kp.clone(),
             || Box::new(CounterDaemon::new()),
             DaemonHostConfig::default(),
@@ -675,10 +678,12 @@ fn test_event_buffer_flows_to_target_replay() {
     // Target restores from snapshot
     target_handler
         .restore_snapshot(
-            origin,
-            &snapshot,
-            0x1111,
-            0x1111,
+            RestoreContext {
+                daemon_origin: origin,
+                snapshot: &snapshot,
+                source_node: 0x1111,
+                orchestrator_node: 0x1111,
+            },
             kp.clone(),
             || Box::new(CounterDaemon::new()),
             DaemonHostConfig::default(),
@@ -1077,10 +1082,12 @@ fn test_regression_drain_pending_error_propagated() {
 
     handler
         .restore_snapshot(
-            origin,
-            &snapshot,
-            0x1111,
-            0x1111,
+            RestoreContext {
+                daemon_origin: origin,
+                snapshot: &snapshot,
+                source_node: 0x1111,
+                orchestrator_node: 0x1111,
+            },
             kp.clone(),
             || Box::new(CounterDaemon::new()),
             DaemonHostConfig::default(),

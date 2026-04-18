@@ -49,6 +49,24 @@ struct CompletedTargetState {
     completed_at: Instant,
 }
 
+/// Scalar inputs for [`MigrationTargetHandler::restore_snapshot`]. Bundled
+/// into a struct to keep the call site under the "too many arguments"
+/// clippy limit; none of these fields are optional.
+#[derive(Debug, Clone, Copy)]
+pub struct RestoreContext<'a> {
+    /// `origin_hash` of the daemon being migrated. Must match
+    /// `snapshot.entity_id.origin_hash()`.
+    pub daemon_origin: u32,
+    /// The snapshot to restore from.
+    pub snapshot: &'a StateSnapshot,
+    /// Node the daemon is migrating from.
+    pub source_node: u64,
+    /// Node that initiated this migration. Reply messages
+    /// (RestoreComplete / ReplayComplete / ActivateAck) route here
+    /// instead of to the immediate wire hop.
+    pub orchestrator_node: u64,
+}
+
 /// Handles the target node's role in daemon migration.
 ///
 /// The target handler:
@@ -121,10 +139,7 @@ impl MigrationTargetHandler {
     /// to the immediate wire hop.
     pub fn restore_snapshot<F>(
         &self,
-        daemon_origin: u32,
-        snapshot: &StateSnapshot,
-        source_node: u64,
-        orchestrator_node: u64,
+        ctx: RestoreContext<'_>,
         keypair: EntityKeypair,
         daemon_factory: F,
         config: DaemonHostConfig,
@@ -132,6 +147,13 @@ impl MigrationTargetHandler {
     where
         F: FnOnce() -> Box<dyn MeshDaemon>,
     {
+        let RestoreContext {
+            daemon_origin,
+            snapshot,
+            source_node,
+            orchestrator_node,
+        } = ctx;
+
         if self.migrations.contains_key(&daemon_origin) {
             return Err(MigrationError::AlreadyMigrating(daemon_origin));
         }
@@ -456,10 +478,12 @@ mod tests {
 
         handler
             .restore_snapshot(
-                origin,
-                &snapshot,
-                0x1111,
-                0x2222,
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snapshot,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
                 kp.clone(),
                 || Box::new(AccumDaemon { total: 0 }),
                 DaemonHostConfig::default(),
@@ -490,10 +514,12 @@ mod tests {
         // Use a different origin hash
         let err = handler
             .restore_snapshot(
-                0xDEAD,
-                &snapshot,
-                0x1111,
-                0x2222,
+                RestoreContext {
+                    daemon_origin: 0xDEAD,
+                    snapshot: &snapshot,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
                 kp.clone(),
                 || Box::new(AccumDaemon { total: 0 }),
                 DaemonHostConfig::default(),
@@ -513,10 +539,12 @@ mod tests {
 
         handler
             .restore_snapshot(
-                origin,
-                &snapshot,
-                0x1111,
-                0x2222,
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snapshot,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
                 kp.clone(),
                 || Box::new(AccumDaemon { total: 0 }),
                 DaemonHostConfig::default(),
@@ -543,10 +571,12 @@ mod tests {
 
         handler
             .restore_snapshot(
-                origin,
-                &snapshot,
-                0x1111,
-                0x2222,
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snapshot,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
                 kp.clone(),
                 || Box::new(AccumDaemon { total: 0 }),
                 DaemonHostConfig::default(),
@@ -572,10 +602,12 @@ mod tests {
 
         handler
             .restore_snapshot(
-                origin,
-                &snapshot,
-                0x1111,
-                0x2222,
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snapshot,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
                 kp.clone(),
                 || Box::new(AccumDaemon { total: 0 }),
                 DaemonHostConfig::default(),

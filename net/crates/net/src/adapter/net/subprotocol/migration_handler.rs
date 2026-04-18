@@ -8,6 +8,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 
+use crate::adapter::net::compute::migration_target::RestoreContext;
 use crate::adapter::net::compute::orchestrator::wire;
 use crate::adapter::net::compute::{
     MigrationError, MigrationMessage, MigrationOrchestrator, MigrationSourceHandler,
@@ -489,10 +490,13 @@ impl MigrationSubprotocolHandler {
 
             let daemon = inputs.daemon;
             if let Err(e) = self.target_handler.restore_snapshot(
-                daemon_origin,
-                &snapshot,
-                source_node,
-                from_node, // orchestrator: whoever forwarded SnapshotReady to us
+                RestoreContext {
+                    daemon_origin,
+                    snapshot: &snapshot,
+                    source_node,
+                    // orchestrator: whoever forwarded SnapshotReady to us
+                    orchestrator_node: from_node,
+                },
                 inputs.keypair,
                 move || daemon,
                 inputs.config,
