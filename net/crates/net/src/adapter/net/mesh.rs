@@ -76,6 +76,14 @@ fn node_id_to_graph_id(node_id: u64) -> [u8; 32] {
     id
 }
 
+/// Inverse of `node_id_to_graph_id`: read the u64 back from the first 8
+/// bytes of a 32-byte proximity `NodeId`. Assumes the id was produced by
+/// `node_id_to_graph_id` (which is how every peer in this codebase is
+/// seeded into the graph).
+fn graph_id_to_node_id(graph_id: &[u8; 32]) -> u64 {
+    u64::from_le_bytes(graph_id[0..8].try_into().unwrap())
+}
+
 /// Set of peer addresses whose packets should be silently dropped.
 ///
 /// Used by test harnesses to simulate network partitions. When a peer's
@@ -289,6 +297,15 @@ impl MeshNode {
             .map_err(|e| AdapterError::Connection(format!("router bind failed: {}", e)))?;
 
         let router = Arc::new(router);
+
+        // Configure route staleness. Routes learned from pingwaves age
+        // out if a fresh pingwave hasn't refreshed them in this window;
+        // direct routes are refreshed by the heartbeat loop, so they
+        // stay fresh as long as the session is alive.
+        router
+            .routing_table()
+            .set_max_route_age(config.session_timeout.saturating_mul(3));
+
         let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
 
         // Create proximity graph for topology awareness.
@@ -595,6 +612,23 @@ impl MeshNode {
         // separate protocol concern.
         if data.len() == EnhancedPingwave::SIZE && u16::from_le_bytes([data[0], data[1]]) != MAGIC {
             if let Some(pw) = EnhancedPingwave::from_bytes(&data) {
+                // Before handing to the proximity graph, seed a routing
+                // entry for the origin if it's not us and not already a
+                // direct peer. `source` is the direct peer that just
+                // forwarded this pingwave to us, so it's a valid
+                // next-hop by construction. `hop_count` in the wire
+                // field is "hops the pingwave traversed before we
+                // received it"; real distance from origin is
+                // `hop_count + 1` (the final hop from `source` to us),
+                // and we add +1 more so direct routes (metric 1) always
+                // win over any indirect route.
+                let origin_nid = graph_id_to_node_id(&pw.origin_id);
+                if origin_nid != ctx.local_node_id {
+                    let metric = (pw.hop_count as u16).saturating_add(2);
+                    ctx.router
+                        .routing_table()
+                        .add_route_with_metric(origin_nid, source, metric);
+                }
                 // Process and optionally re-broadcast
                 if let Some(fwd_pw) = ctx.proximity_graph.on_pingwave(pw, source) {
                     let fwd_bytes = fwd_pw.to_bytes();
@@ -863,6 +897,12 @@ impl MeshNode {
         let shutdown_notify = self.shutdown_notify.clone();
         let partition_filter = self.partition_filter.clone();
         let proximity_graph = self.proximity_graph.clone();
+        let router = self.router.clone();
+        // Sweep routes that haven't been refreshed for 3× the session
+        // timeout. Direct routes are refreshed by this loop's own
+        // pingwave emission; indirect (pingwave-learned) routes age out
+        // here if their origin goes silent.
+        let max_route_age = self.config.session_timeout.saturating_mul(3);
 
         tokio::spawn(async move {
             while !shutdown.load(Ordering::Acquire) {
@@ -886,6 +926,10 @@ impl MeshNode {
                             // Pingwave (raw UDP — not encrypted, topology is public)
                             let _ = socket.send_to(&pw_bytes, peer_addr).await;
                         }
+
+                        // Drop routes whose `updated_at` is past the age
+                        // limit. Small scan of the routing table; cheap.
+                        router.routing_table().sweep_stale(max_route_age);
                     }
                     _ = shutdown_notify.notified() => {
                         break;

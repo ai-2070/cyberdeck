@@ -3689,6 +3689,107 @@ async fn test_mesh_handshake_relay_bidirectional() {
 }
 
 // ============================================================================
+// Multi-hop routing discovery
+// ============================================================================
+
+/// Pingwave-driven route install: a node learns routes to non-direct
+/// peers from pingwaves that arrive with `hop_count > 0`. On a 4-node
+/// chain A↔B↔C↔D where only adjacent pairs have direct sessions, A
+/// should eventually learn a next-hop toward D purely from pingwave
+/// propagation — no manual `add_route` needed.
+///
+/// The installer places `origin → from` (the immediate forwarder is the
+/// next hop) with metric `hop_count + 2`. Direct routes at metric 1
+/// remain authoritative and are not downgraded.
+#[tokio::test]
+async fn test_multi_hop_routing_pingwave_installs_indirect_route() {
+    let ports = find_ports(4).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let id_d = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+    let nid_d = id_d.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+    let addr_d: SocketAddr = format!("127.0.0.1:{}", ports[3]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_secs(30))
+    };
+
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let d = MeshNode::new(id_d, mk(addr_d)).await.unwrap();
+    let pub_b = *b.public_key();
+    let pub_c = *c.public_key();
+    let pub_d = *d.public_key();
+
+    // Build the chain: A↔B, B↔C, C↔D. No other direct sessions.
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    let (r1, r2) = tokio::join!(c.accept(nid_b), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        b.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    let (r1, r2) = tokio::join!(d.accept(nid_c), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        c.connect(addr_d, &pub_d, nid_d).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    // Start all nodes so pingwaves start flowing.
+    a.start();
+    b.start();
+    c.start();
+    d.start();
+
+    // Wait for enough heartbeat intervals that pingwaves have reached
+    // A from D (3 hops × 200ms plus some slack). The heartbeat loop
+    // fires on its interval; let a handful of them propagate.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // A's routing table must have a route for D pointing at B (the
+    // only peer A has that can get a pingwave from D to us first).
+    let lookup = a.router().routing_table().lookup(nid_d);
+    assert_eq!(
+        lookup,
+        Some(addr_b),
+        "A should have learned D via B from pingwave propagation; got {:?}",
+        lookup
+    );
+
+    // Direct routes must not have been disturbed. A's route to B is
+    // metric 1 (direct); the pingwave-carried route to B arriving via
+    // B itself would have metric 2 and must NOT win.
+    let b_lookup = a.router().routing_table().lookup(nid_b);
+    assert_eq!(b_lookup, Some(addr_b), "direct B route preserved");
+    let _ = nid_a;
+    let _ = nid_c;
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
+    d.shutdown().await.unwrap();
+}
+
+// ============================================================================
 // Regressions
 // ============================================================================
 
