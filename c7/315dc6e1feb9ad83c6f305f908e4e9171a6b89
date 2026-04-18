@@ -1,0 +1,73 @@
+net/crates/net/src/adapter/net/redex/retention.rs
+  f3669361474f4cb8 1-102
+net/crates/net/src/adapter/net/redex/mod.rs
+  f3669361474f4cb8 1-27
+net/crates/net/src/adapter/net/redex/entry.rs
+  f3669361474f4cb8 1-228
+net/crates/net/src/adapter/net/redex/event.rs
+  f3669361474f4cb8 1-19
+net/crates/net/src/adapter/net/redex/fold.rs
+  f3669361474f4cb8 1-18
+net/crates/net/tests/integration_redex.rs
+  f3669361474f4cb8 1-223
+net/crates/net/src/adapter/net/redex/manager.rs
+  f3669361474f4cb8 1-196
+net/crates/net/src/adapter/net/redex/file.rs
+  f3669361474f4cb8 1-565
+net/crates/net/Cargo.toml
+  f3669361474f4cb8 40-41,97-100,139-143
+net/crates/net/src/adapter/net/mod.rs
+  f3669361474f4cb8 47-48,104-107
+net/crates/net/src/adapter/net/redex/error.rs
+  f3669361474f4cb8 1-54
+net/crates/net/src/adapter/net/redex/config.rs
+  f3669361474f4cb8 1-68
+net/crates/net/src/adapter/net/redex/segment.rs
+  f3669361474f4cb8 1-178
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "c7315dc6e1feb9ad83c6f305f908e4e9171a6b89",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 70,
+      "overriden_lines": 0
+    },
+    "a9d311afc8324224": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8e12ea48-52c3-40e2-9655-6d0ab0878bb6",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": null,
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 506,
+      "overriden_lines": 0
+    },
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1885,
+      "total_deletions": 95,
+      "accepted_lines": 3040,
+      "overriden_lines": 0
+    }
+  }
+}
