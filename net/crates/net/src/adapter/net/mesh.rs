@@ -282,6 +282,16 @@ fn routing_id(node_id: u64) -> u64 {
 /// drops at zero.
 const DEFAULT_HANDSHAKE_TTL: u8 = 16;
 
+/// Maximum hop count a pingwave may carry on receipt. Pingwaves with
+/// `hop_count >= MAX_HOPS` are dropped — they install no route, no
+/// graph edge, and are not re-broadcast. TTL bounds forwarding at the
+/// emitter; `MAX_HOPS` is the receive-time counterpart that prevents
+/// an inflated-hop-count advertisement (malicious or buggy) from
+/// populating the routing table with an arbitrarily-distant entry.
+/// Value sized to accommodate the largest plausibly-useful mesh depth
+/// while still bounding count-to-infinity worst cases.
+const MAX_HOPS: u8 = 16;
+
 /// Multi-peer mesh node.
 ///
 /// Composes `NetSession` (per-peer encryption), `NetRouter` (forwarding),
@@ -567,7 +577,9 @@ impl MeshNode {
         // Register in peer address map (used by reroute policy)
         self.peer_addrs.insert(peer_node_id, peer_addr);
 
-        // Register in proximity graph (1-hop peer)
+        // Register in proximity graph (1-hop peer). The synthetic
+        // pingwave's `origin == peer`, so the back-compat shim
+        // attributes the edge correctly (`from_node = origin`).
         let peer_graph_id = node_id_to_graph_id(peer_node_id);
         let pw = EnhancedPingwave::new(peer_graph_id, 0, 1).with_load(0, HealthStatus::Healthy);
         self.proximity_graph.on_pingwave(pw, peer_addr);
@@ -722,36 +734,79 @@ impl MeshNode {
         // separate protocol concern.
         if data.len() == EnhancedPingwave::SIZE && u16::from_le_bytes([data[0], data[1]]) != MAGIC {
             if let Some(pw) = EnhancedPingwave::from_bytes(&data) {
-                // Before handing to the proximity graph, seed a routing
-                // entry for the origin if it's not us and not already a
-                // direct peer. `source` is the direct peer that just
-                // forwarded this pingwave to us, so it's a valid
-                // next-hop by construction. `hop_count` in the wire
-                // field is "hops the pingwave traversed before we
-                // received it"; real distance from origin is
-                // `hop_count + 1` (the final hop from `source` to us),
-                // and we add +1 more so direct routes (metric 1) always
-                // win over any indirect route.
                 let origin_nid = graph_id_to_node_id(&pw.origin_id);
-                if origin_nid != ctx.local_node_id {
-                    let metric = (pw.hop_count as u16).saturating_add(2);
-                    ctx.router
-                        .routing_table()
-                        .add_route_with_metric(origin_nid, source, metric);
+
+                // DV loop-avoidance rule 1: origin self-check. Drop
+                // any pingwave claiming `origin_id == self_id`. This
+                // defends against (a) a buggy peer echoing our own
+                // origin back at us, and (b) a stale buffered
+                // pingwave from a partitioned-then-healed peer.
+                if origin_nid == ctx.local_node_id {
+                    return;
                 }
-                // Process and optionally re-broadcast
-                if let Some(fwd_pw) = ctx.proximity_graph.on_pingwave(pw, source) {
+
+                // DV loop-avoidance rule 2: MAX_HOPS cap. TTL bounds
+                // forwarding; MAX_HOPS bounds install. A pingwave
+                // claiming an inflated hop_count can't populate a
+                // usable route or graph edge.
+                if pw.hop_count >= MAX_HOPS {
+                    return;
+                }
+
+                // Resolve the direct peer that forwarded this
+                // pingwave. If `source` isn't a registered peer
+                // (shouldn't happen post-handshake, but defensively),
+                // we can't split-horizon or attribute edges.
+                let from_node_id = ctx.addr_to_node.get(&source).map(|e| *e.value());
+
+                // Install an indirect route `(origin, via=source)`
+                // with metric `hop_count + 2`. The `+2` keeps direct
+                // routes (metric 1) strictly better than any pingwave
+                // route — `add_route_with_metric` preserves the
+                // better entry.
+                let metric = (pw.hop_count as u16).saturating_add(2);
+                ctx.router
+                    .routing_table()
+                    .add_route_with_metric(origin_nid, source, metric);
+
+                // Hand to the proximity graph to update nodes +
+                // edges. If we couldn't resolve the sender's
+                // node_id, fall back to the origin's graph id —
+                // the edge insert inside `on_pingwave` skips the
+                // self-loop case automatically.
+                let from_graph_id = from_node_id
+                    .map(node_id_to_graph_id)
+                    .unwrap_or(pw.origin_id);
+                if let Some(fwd_pw) =
+                    ctx.proximity_graph
+                        .on_pingwave_from(pw, from_graph_id, source)
+                {
                     let fwd_bytes = fwd_pw.to_bytes();
                     let socket = ctx.socket.clone();
                     let peers = ctx.peers.clone();
                     let filter = ctx.partition_filter.clone();
-                    // Re-broadcast to all peers except the sender
+                    let router = ctx.router.clone();
+                    // DV loop-avoidance rule 3: split horizon on
+                    // re-broadcast. If we installed `(origin_nid,
+                    // next_hop=X)` — i.e. we'd use X to reach the
+                    // origin — don't re-advertise the origin on the
+                    // link to X. Prevents X from learning "we can
+                    // reach origin in N+1 hops" and installing a
+                    // backward loop.
                     tokio::spawn(async move {
+                        let next_hop = router.routing_table().lookup(origin_nid);
                         for entry in peers.iter() {
                             let addr = entry.value().addr;
-                            if addr != source && !filter.contains(&addr) {
-                                let _ = socket.send_to(&fwd_bytes, addr).await;
+                            if addr == source {
+                                continue; // never send back to sender
                             }
+                            if Some(addr) == next_hop {
+                                continue; // split horizon: that's our path to origin
+                            }
+                            if filter.contains(&addr) {
+                                continue;
+                            }
+                            let _ = socket.send_to(&fwd_bytes, addr).await;
                         }
                     });
                 }
@@ -1267,6 +1322,14 @@ impl MeshNode {
                         // Drop routes whose `updated_at` is past the age
                         // limit. Small scan of the routing table; cheap.
                         router.routing_table().sweep_stale(max_route_age);
+
+                        // Age out proximity graph edges in lockstep
+                        // with the routing table. If the peer that
+                        // used to relay pingwaves for an origin went
+                        // silent, both the (peer→origin) edge and the
+                        // routing-table entry that depended on it
+                        // disappear on the same tick.
+                        proximity_graph.sweep_stale_edges(max_route_age);
 
                         // Sweep idle streams per-session and enforce the
                         // per-session `max_streams` cap. Each session is

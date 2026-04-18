@@ -4074,6 +4074,82 @@ async fn test_multi_hop_routing_pingwave_installs_indirect_route() {
     d.shutdown().await.unwrap();
 }
 
+/// DV plan: after pingwave propagation, `ProximityGraph::path_to` must
+/// return a real multi-hop path — not `None`. Previously `edges` was
+/// never populated, so `path_to` always returned `None` and
+/// `ReroutePolicy` fell back to "any direct peer". This is the primary
+/// before/after for the DV plan: `path_to` is now usable.
+#[tokio::test]
+async fn test_regression_dv_path_to_returns_multi_hop() {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_secs(30))
+    };
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let pub_b = *b.public_key();
+    let pub_c = *c.public_key();
+
+    // Chain: A↔B, B↔C. A has no direct session with C.
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    let (r1, r2) = tokio::join!(c.accept(nid_b), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        b.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    a.start();
+    b.start();
+    c.start();
+
+    // Wait for pingwaves from C to reach A via B.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // A's proximity graph should now have a multi-hop path to C.
+    // Graph-id encoding: low 8 bytes = u64 node_id LE, high 24 bytes
+    // zero (matches the `node_id_to_graph_id` convention used
+    // everywhere node_ids enter the proximity graph).
+    let mut c_graph_id = [0u8; 32];
+    c_graph_id[0..8].copy_from_slice(&nid_c.to_le_bytes());
+    let path = a.proximity_graph().path_to(&c_graph_id);
+    assert!(
+        path.is_some(),
+        "path_to(C) must be Some now that edges populate on pingwave receipt"
+    );
+    let path = path.unwrap();
+    assert!(
+        path.len() >= 2,
+        "path_to(C) should have at least 2 nodes (self + next hop); got {:?}",
+        path.len()
+    );
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
+}
+
 // ============================================================================
 // Regressions
 // ============================================================================

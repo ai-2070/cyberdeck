@@ -112,6 +112,19 @@ impl ReroutePolicy {
         // topology doesn't blackhole traffic through a peer that happens
         // to reach some but not all affected destinations.
         //
+        // Resolution order, per destination:
+        //   1. Routing table: `lookup_alternate(dest, failed_addr)`.
+        //      Today's table stores one entry per destination, so this
+        //      returns `None` when the affected entry *is* the
+        //      failed-peer entry — forward-compat scaffolding for a
+        //      future multi-route table.
+        //   2. Proximity graph: `find_graph_alternate_for(...)` BFS.
+        //   3. Last-resort fallback: any direct peer that isn't the
+        //      failed one. Best-effort — if the fallback peer can't
+        //      actually reach `dest_id`, the packet is dropped rather
+        //      than blackholed; the failure detector will mark that
+        //      peer dead next cycle if it's unreachable.
+        //
         // `saved_routes` preserves the *original* next_hop so that
         // recovery can restore the pre-failure route. Use
         // `entry().or_insert(...)`: if the same destination already has
@@ -120,26 +133,19 @@ impl ReroutePolicy {
         // next_hop and corrupt recovery.
         let mut rerouted = 0usize;
         for dest_id in &affected {
-            let alt_addr = match self.find_graph_alternate_for(failed_node_id, *dest_id) {
-                Some(a) => a,
-                None => {
-                    // No topology-aware alternate for this destination —
-                    // fall back to any direct peer that isn't the failed
-                    // one. This is best-effort: if the fallback peer
-                    // can't actually reach `dest_id`, the packet will be
-                    // dropped rather than blackholed indefinitely (the
-                    // failure detector will mark the fallback peer dead
-                    // next cycle if it's unreachable).
-                    match self
-                        .peer_addrs
+            let alt_addr = self
+                .routing_table
+                .lookup_alternate(*dest_id, failed_addr)
+                .or_else(|| self.find_graph_alternate_for(failed_node_id, *dest_id))
+                .or_else(|| {
+                    self.peer_addrs
                         .iter()
                         .find(|e| *e.key() != failed_node_id)
                         .map(|e| *e.value())
-                    {
-                        Some(a) => a,
-                        None => continue, // truly nothing to try
-                    }
-                }
+                });
+            let alt_addr = match alt_addr {
+                Some(a) => a,
+                None => continue, // truly nothing to try
             };
 
             self.saved_routes

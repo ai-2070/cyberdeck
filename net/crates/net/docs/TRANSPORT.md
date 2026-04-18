@@ -180,6 +180,28 @@ pub struct RoutingHeader {  // 16 bytes
 
 **Benchmark:** 30.4 ns per hop (64B payload), 291 ns for a 5-hop chain.
 
+## Routing
+
+`send_routed(dest_id, batch)` consults `RoutingTable::lookup(dest_id)` to get the next-hop `SocketAddr`. The routing table is the **single source of truth** for "how do I reach X?" — `ProximityGraph` is an input (pingwaves feed into it) and a fallback (used by `ReroutePolicy` on failure when the table has no alternate). No two truths about routing.
+
+**Pingwave-driven install.** When node X receives a pingwave originated by Y via direct peer Z, X calls `RoutingTable::add_route_with_metric(Y, next_hop=Z, metric=hop_count+2)`. The metric policy keeps the better (lower) entry, so direct routes (metric 1) always beat pingwave-installed routes. Routes age out via `RoutingTable::sweep_stale` on the heartbeat-loop tick; graph edges age out in lockstep via `ProximityGraph::sweep_stale_edges`.
+
+**Three cheap loop-avoidance rules** (applied in `mesh.rs` on pingwave receipt):
+
+1. **Origin self-check** — a pingwave with `origin_id == self_id` is dropped and installs no route. Defends against a peer echoing our own origin back at us, or a stale buffered pingwave replayed by a partitioned-then-healed peer.
+2. **`MAX_HOPS` cap** — a pingwave with `hop_count >= 16` is dropped on receipt. TTL bounds forwarding at the emitter; `MAX_HOPS` is the receive-time counterpart that keeps an inflated-hop-count advertisement out of the routing table.
+3. **Split horizon on re-broadcast** — before forwarding a pingwave to peer P, check `RoutingTable::lookup(origin)`. If the installed next-hop for `origin` is P's address, skip P. Prevents P from learning "we can reach origin in N+1 hops" and installing a backward loop.
+
+**Metric.** Primary: `hop_count + 2`. Secondary tie-break: EWMA latency per `(origin, next_hop)` edge, fed by `now_us − pw.origin_timestamp_us` with `α = 1/8`. Clock-skew-sensitive, so advisory only; unreliable estimates degrade to "arbitrary equal-hop choice", which is acceptable.
+
+**Reroute.** When the failure detector marks a peer failed, `ReroutePolicy::on_failure` walks the table's affected entries (entries whose `next_hop` matches the failed addr) and resolves a new next-hop in this order:
+
+1. `RoutingTable::lookup_alternate(dest, exclude=failed_addr)` — returns the current entry if its next-hop isn't the excluded one. Today's single-entry-per-dest table returns `None` for affected entries; forward-compat scaffolding for a future multi-route table.
+2. `ProximityGraph::path_to(dest)` — BFS over the topology graph. Returns the first hop of a path that isn't the failed node AND is a direct peer of ours.
+3. Any direct peer that isn't the failed one — last-resort fallback. Best-effort; if it can't reach the destination, the failure detector will catch it on the next cycle.
+
+The original `next_hop` is preserved in `saved_routes` so `on_recovery` can restore the pre-failure route when the failed peer comes back.
+
 ## Reliability
 
 Two modes implementing the `ReliabilityMode` trait:
