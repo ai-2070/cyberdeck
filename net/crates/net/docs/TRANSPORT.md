@@ -137,7 +137,28 @@ mesh.close_stream(peer_node_id, stream_id);
 
 **Not multicast.** A stream is one flow to one peer. Sending the same payload to multiple peers is an application / daemon / channel-layer concern, not transport.
 
-**Back-pressure.** v1 surfaces queue-full only on the forwarding path (router scheduler). Local outbound `send_on_stream` returns `StreamError::Transport` for socket-level failures; `StreamError::Backpressure` is reserved for a future credit-windowed flow-control swap that does not move the caller API.
+**Back-pressure.** `send_on_stream` returns `StreamError::Backpressure` when a per-stream in-flight counter would exceed the stream's configured `tx_window` (taken from `StreamConfig::window_bytes` at open time; `0` means unbounded and preserves the pre-backpressure behavior). Semantics are local-only: the window catches **concurrent callers** racing on the same stream. A single serial sender flooding the socket still sees `StreamError::Transport(String)` (the stringified socket error) when the kernel send buffer fills — v2 will extend the signal to network-speed via a per-peer credit window, without changing the caller API.
+
+*Backpressure is a signal, not a policy.* The transport never retries, sleeps, or buffers on its own. Daemons pick one of three patterns per stream:
+
+```rust
+// 1. Drop on pressure — best for telemetry / sampled streams.
+match mesh.send_on_stream(&stream, &[event]).await {
+    Ok(()) => {}
+    Err(StreamError::Backpressure) => metrics.inc("dropped_under_pressure"),
+    Err(StreamError::Transport(e)) => tracing::warn!(error = %e, "send failed"),
+    Err(StreamError::NotConnected) => {/* peer gone */}
+}
+
+// 2. Retry with backoff — best for important events.
+mesh.send_with_retry(&stream, &[event], 8).await?;
+// or: mesh.send_blocking(&stream, &[event]).await?;
+
+// 3. App-level buffer — daemon-local VecDeque drained by a background
+// task. Transport stays out of the policy; the app decides its own cap.
+```
+
+`send_with_retry(stream, events, max_retries)` and `send_blocking(stream, events)` apply a 5 ms → 200 ms exponential backoff to `Backpressure` only; `Transport` errors are returned immediately. `StreamStats.backpressure_events` counts cumulative rejections for observability.
 
 **Fairness weight.** `StreamConfig::fairness_weight` is a quantum multiplier on the `FairScheduler`. It takes effect when a packet for this stream transits this node as a forwarder. Local outbound traffic currently bypasses the scheduler; the weight is still persisted so that a future refactor routing local outbound through the scheduler makes it load-bearing end-to-end without API churn.
 
@@ -158,6 +179,55 @@ pub struct RoutingHeader {  // 16 bytes
 `MultiHopPacketBuilder` constructs routed packets with layered routing headers. Per-hop latency tracking is optional.
 
 **Benchmark:** 30.4 ns per hop (64B payload), 291 ns for a 5-hop chain.
+
+## Routing
+
+`send_routed(dest_id, batch)` consults `RoutingTable::lookup(dest_id)` to get the next-hop `SocketAddr`. The routing table is the **single source of truth** for "how do I reach X?" — `ProximityGraph` is an input (pingwaves feed into it) and a fallback (used by `ReroutePolicy` on failure when the table has no alternate). No two truths about routing.
+
+**Pingwave-driven install.** When node X receives a pingwave originated by Y via direct peer Z, X calls `RoutingTable::add_route_with_metric(Y, next_hop=Z, metric=hop_count+2)`. The metric policy keeps the better (lower) entry, so direct routes (metric 1) always beat pingwave-installed routes. Routes age out via `RoutingTable::sweep_stale` on the heartbeat-loop tick; graph edges age out in lockstep via `ProximityGraph::sweep_stale_edges`.
+
+**Three cheap loop-avoidance rules** (applied in `mesh.rs` on pingwave receipt):
+
+1. **Origin self-check** — a pingwave with `origin_id == self_id` is dropped and installs no route. Defends against a peer echoing our own origin back at us, or a stale buffered pingwave replayed by a partitioned-then-healed peer.
+2. **`MAX_HOPS` cap** — a pingwave with `hop_count >= 16` is dropped on receipt. TTL bounds forwarding at the emitter; `MAX_HOPS` is the receive-time counterpart that keeps an inflated-hop-count advertisement out of the routing table.
+3. **Split horizon on re-broadcast** — before forwarding a pingwave to peer P, check `RoutingTable::lookup(origin)`. If the installed next-hop for `origin` is P's address, skip P. Prevents P from learning "we can reach origin in N+1 hops" and installing a backward loop.
+
+**Metric.** Primary: `hop_count + 2`. Secondary tie-break: EWMA latency per `(origin, next_hop)` edge, fed by `now_us − pw.origin_timestamp_us` with `α = 1/8`. Clock-skew-sensitive, so advisory only; unreliable estimates degrade to "arbitrary equal-hop choice", which is acceptable.
+
+**Reroute.** When the failure detector marks a peer failed, `ReroutePolicy::on_failure` walks the table's affected entries (entries whose `next_hop` matches the failed addr) and resolves a new next-hop in this order:
+
+1. `RoutingTable::lookup_alternate(dest, exclude=failed_addr)` — returns the current entry if its next-hop isn't the excluded one. With the single-route-per-destination table this returns `None` whenever the affected entry *is* the failed-peer entry, which is the common case; the method is kept for clean API shape, not as a door to a deeper cache (see "Routing philosophy" below).
+2. `ProximityGraph::path_to(dest)` — BFS over the topology graph. Returns the first hop of a path that isn't the failed node AND is a direct peer of ours.
+3. Any direct peer that isn't the failed one — last-resort fallback. Best-effort; if it can't reach the destination, the failure detector will catch it on the next cycle.
+
+The original `next_hop` is preserved in `saved_routes` so `on_recovery` can restore the pre-failure route when the failed peer comes back.
+
+### Routing philosophy
+
+Net's routing plane is deliberately minimal: pingwaves drive installation, the `RoutingTable` holds **one best route per destination**, and `ProximityGraph` is a helper that can *recompute* paths when needed — never a second source of truth for the fast path. This is a design choice, not an unfinished optimization.
+
+**What this gives us.** Fast multi-hop routing with no separate control plane. Routing state that fits in a single `DashMap` entry per destination. Recomputation from pingwaves that completes in microseconds at our target scales. A fast path (`send_routed`) that only ever consults one data structure — no ranking, no cache-miss fallback, no stale-vs-fresh reconciliation.
+
+**Why one route per destination, deliberately.** The tempting alternative is a ranked alternates list, or a full TCP-Cubic-style persistent path cache, or an IGP-style link-state database where every node holds the whole topology. We chose not to go there. The reasoning:
+
+- In the **common case** (99% of the time), recomputing a path from fresh pingwaves + the local graph is so cheap that cached alternates save nanoseconds of decision time at the cost of real state. Not worth it.
+- In the **catastrophic case** (the 1% that actually matter — a vehicle losing its primary compute, a site losing half its links in a storm, an RF environment going hostile), an entire class of previously-good routes can become wrong at once. A deep cache of alternates is now a liability: it surfaces **stale confidence** into the fast path, hides the fact that there is currently no safe route, and delays convergence while the cache ages out entry by entry.
+
+Our bias: **"I don't know how to route this right now" is a better answer than "here's a route that was fine 5 seconds ago."** Recompute converges in a heartbeat interval; stale confidence can hide for as long as the TTL allows.
+
+The failure mode this defends against is not "routing loops" or "black holes" specifically — those are bounded by TTL, `MAX_HOPS`, and split horizon regardless of table depth. The failure mode is **stale confidence**: the system holding a plausible-looking wrong answer for longer than convergence would have taken to produce a correct one.
+
+**Graph as helper, not second truth.** `ProximityGraph` is an input to `RoutingTable` (pingwaves update both) and a fallback for `ReroutePolicy` (when the table has no usable alternate). It is never consulted on the fast path. There are not two sources of truth about routing — only one, with a derivation path that feeds it.
+
+**What we are not building.** Persistent multi-route caches (TCP-Cubic-style), link-state databases (OSPF-style — every node holding the whole graph), path-vector attribute lists (BGP-style), or ECMP ranking tables. All of these trade recomputation cost for cached state. At Net's scale the trade doesn't pencil out, and the cache's behavior under fast-changing topology is exactly where these systems tend to ship bugs. A simple, recomputable routing plane is cheaper to reason about and safer under the failures we actually care about.
+
+**Behavior under failure, summarized.**
+
+- Next-hop peer dies → table entries through it are rerouted via the graph or marked unreachable. Fast-path callers get `Err` until convergence; `send_with_retry` / `send_blocking` absorb the gap.
+- Half the mesh disappears → most cached routes are invalid anyway; pingwaves from the surviving subset rebuild a fresh picture within a few heartbeat intervals; the interim state is "no route," which is honest.
+- Origin goes quiet → route for that origin ages out via `sweep_stale`; graph edges age out via `sweep_stale_edges` in lockstep. No separate invalidation message needed.
+
+Predictable in the common case, safer in the catastrophic one.
 
 ## Reliability
 

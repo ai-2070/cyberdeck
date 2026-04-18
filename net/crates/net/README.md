@@ -177,7 +177,7 @@ Benchmarks accurate as of April 15, 2026.
 
 Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns.
 
-901 tests. ~840 KB deployed binary.
+985 tests. ~840 KB deployed binary.
 
 ## Capabilities
 
@@ -216,6 +216,8 @@ ProximityGraph for Node A:
 ```
 
 `EnhancedPingwave` extends the basic pingwave with capability summaries and load indicators, so routing decisions can be made from the proximity graph alone without querying the full `CapabilityIndex`.
+
+**Pingwaves install routes.** On receipt of a pingwave for origin Y forwarded by direct peer Z, node X calls `RoutingTable::add_route_with_metric(Y, next_hop=Z, metric=hop_count+2)` and inserts the `Z → Y` edge into `ProximityGraph::edges`. The `+2` metric keeps direct routes (metric 1) strictly better than any pingwave-installed route. Four loop-avoidance rules sit at the dispatch boundary: origin self-check (drop pingwaves with `origin == self_id`), `MAX_HOPS = 16` receive-time cap, split horizon (don't advertise a route back on the link used to reach it), and unregistered-source rejection (only registered direct peers can inject routing state). Latency EWMA per `(origin, next_hop)` edge provides an equal-hop tie-breaker for future multi-alternate ranking. See [`ROUTING_DV_PLAN.md`](docs/ROUTING_DV_PLAN.md).
 
 Discovery is emergent. There are no bootstrap servers, no DNS, no service registry. After first contact (manual address, LAN broadcast, QR code, cached peers), pingwaves propagate and the proximity graph builds itself. Nodes that go silent are pruned. Nodes that appear are integrated. The graph is always a reflection of current reality.
 
@@ -586,22 +588,27 @@ cargo build --release --all-features
 ## Tests
 
 ```bash
-# Unit tests (809 tests)
+# Unit tests (849 tests)
 cargo test --lib --features net
 
-# Migration & group integration tests (49 tests)
+# Migration & group integration tests (53 tests)
 cargo test --test migration_integration --features net
 
-# Three-node mesh integration tests (49 tests)
+# Three-node mesh integration tests (64 tests)
 cargo test --test three_node_integration --features net
 
-# Two-node transport integration
+# Two-node transport integration (13 tests)
 cargo test --test integration_net --features net
+
+# Rust SDK smoke tests (2 async + 3 doctests)
+cargo test --features net -p net-sdk
 
 # Backend adapters (requires running services)
 cargo test --test integration_redis --features redis
 cargo test --test integration_jetstream --features jetstream
 ```
+
+**984 tests total across the stack** — lib + migration + three_node + integration_net + SDK.
 
 ### Test Architecture
 
@@ -631,13 +638,17 @@ Three-node mesh tests in `tests/three_node_integration.rs` exercise the `MeshNod
 | **Mesh formation** | 3-way handshake, health isolation after node death |
 | **Data flow** | Point-to-point, bidirectional, stream isolation, full ring traffic, sustained throughput |
 | **Relay** | A→B→C forwarding without decryption, payload integrity over 100 events, **tamper detection** (AEAD rejects corrupted relay) |
-| **Rerouting** | Manual route update after failure, **automatic reroute** via ReroutePolicy + failure detector, auto-recovery when peer returns |
+| **Rerouting** | Manual route update after failure, **automatic reroute** via ReroutePolicy + failure detector, auto-recovery when peer returns. Resolution order: `RoutingTable::lookup_alternate` → `ProximityGraph::path_to` → any direct peer. |
 | **Router** | Forward/local/TTL/hop-count decisions over real UDP, multi-hop with 2 routers |
 | **Full stack** | EventBus→NetAdapter→encrypted UDP→poll, bidirectional EventBus, backpressure flood |
 | **Subnet gateway** | SubnetLocal blocked, Global forwarded, Exported selective, ParentVisible ancestor-only |
 | **Failure detection** | Heartbeat→suspect→fail→recover lifecycle, correlated failure classification |
-| **Migration over wire** | Full 6-phase lifecycle (TakeSnapshot → SnapshotReady → Restore → Replay → Cutover → Cleanup → Activate) runs autonomously over encrypted UDP. Three-node test asserts daemon ends up on target, absent from source, orchestrator record cleared. |
-| **Handshake relay** | `connect_via(relay_addr, …)` establishes a Noise NKpsk0 session with a peer that has no direct UDP path. Handshake messages ride inside `SUBPROTOCOL_HANDSHAKE` over the existing relay session; post-handshake data flows A↔C through B via `send_routed`. |
+| **Migration over wire** | Full 6-phase lifecycle (TakeSnapshot → SnapshotReady → Restore → Replay → Cutover → Cleanup → Activate) runs autonomously over encrypted UDP. Three-node test asserts daemon ends up on target, absent from source, orchestrator record cleared. Acks route to the recorded orchestrator, not the wire hop. |
+| **Handshake relay** | `connect_via(relay_addr, …)` establishes a Noise NKpsk0 session with a peer that has no direct UDP path. Handshake rides as a routed Net packet (`HANDSHAKE` flag) over existing relay sessions; post-handshake data flows A↔C through B via `send_routed`. |
+| **DV routing** | Pingwave-driven route install populates both `RoutingTable` and `ProximityGraph::edges`. 3-hop chain A→B→C→D: A learns the route to D via B; `path_to(D)` returns the full 3-hop path. Regression: `path_to` used to always return `None` because edges were never populated. |
+| **Stream multiplexing** | Multiple independent streams per peer, per-stream reliability + fairness weight, epoch-guarded handles reject sends after close+reopen, idle eviction + LRU cap |
+| **Stream back-pressure (v1)** | Concurrent callers on a window-sized stream: exactly one admission per slot; others get `StreamError::Backpressure`. `send_with_retry` absorbs the pressure and eventually succeeds. |
+| **Channel fan-out** | `ChannelPublisher` + `SubscriberRoster` over `SUBPROTOCOL_CHANNEL_MEMBERSHIP` — subscribe, publish fan-out reaches every subscriber, unsubscribe + peer-fail eviction from the roster |
 | **Partition** | Detection via filter, healing with data flow recovery, asymmetric 3-node partition |
 
 Regression tests are prefixed `test_regression_` and tied to specific bugs found during review. Each documents the original bug in its doc comment and would fail if the fix were reverted.
@@ -658,14 +669,17 @@ cargo bench --bench parallel
 | `0x0001..0x03FF` | Reserved for core |
 | `0x0400` | Causal events |
 | `0x0401` | State snapshots |
-| `0x0500` | Daemon migration |
+| `0x0500` | Daemon migration (Mikoshi) |
 | `0x0600` | Subprotocol negotiation |
-| `0x0601` | Handshake relay (relayed Noise NKpsk0) |
-| `0x0700..0x0702` | Continuity / fork / proof |
+| `0x0700..0x0702` | Continuity / fork announce / continuity proof |
 | `0x0800..0x0801` | Partition / reconciliation |
 | `0x0900` | Replica group coordination (reserved) |
+| `0x0A00` | Channel membership (subscribe / unsubscribe / ack) |
+| `0x0B00` | Stream credit window (v2 backpressure, reserved — see [`STREAM_BACKPRESSURE_PLAN_V2.md`](docs/STREAM_BACKPRESSURE_PLAN_V2.md)) |
 | `0x1000..0xEFFF` | Vendor / third-party |
 | `0xF000..0xFFFF` | Experimental / ephemeral |
+
+Note: handshake relay no longer consumes a subprotocol ID — it rides as a routed Net packet with the `HANDSHAKE` flag in the routing header, sharing the forwarding path with data packets.
 
 ## License
 

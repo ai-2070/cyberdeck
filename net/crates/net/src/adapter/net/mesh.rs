@@ -57,7 +57,7 @@ use super::protocol::{self, EventFrame, PacketFlags, MAGIC};
 use super::reroute::ReroutePolicy;
 use super::route::{RoutingHeader, ROUTING_HEADER_SIZE};
 use super::router::{NetRouter, RouterConfig};
-use super::session::NetSession;
+use super::session::{NetSession, TxAdmit};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subprotocol::MigrationSubprotocolHandler;
 use super::transport::{NetSocket, PacketReceiver, ParsedPacket, SocketBufferConfig};
@@ -281,6 +281,16 @@ fn routing_id(node_id: u64) -> u64 {
 /// packets. Far above any realistic relay chain; the routing layer
 /// drops at zero.
 const DEFAULT_HANDSHAKE_TTL: u8 = 16;
+
+/// Maximum hop count a pingwave may carry on receipt. Pingwaves with
+/// `hop_count >= MAX_HOPS` are dropped — they install no route, no
+/// graph edge, and are not re-broadcast. TTL bounds forwarding at the
+/// emitter; `MAX_HOPS` is the receive-time counterpart that prevents
+/// an inflated-hop-count advertisement (malicious or buggy) from
+/// populating the routing table with an arbitrarily-distant entry.
+/// Value sized to accommodate the largest plausibly-useful mesh depth
+/// while still bounding count-to-infinity worst cases.
+const MAX_HOPS: u8 = 16;
 
 /// Multi-peer mesh node.
 ///
@@ -567,7 +577,9 @@ impl MeshNode {
         // Register in peer address map (used by reroute policy)
         self.peer_addrs.insert(peer_node_id, peer_addr);
 
-        // Register in proximity graph (1-hop peer)
+        // Register in proximity graph (1-hop peer). The synthetic
+        // pingwave's `origin == peer`, so the back-compat shim
+        // attributes the edge correctly (`from_node = origin`).
         let peer_graph_id = node_id_to_graph_id(peer_node_id);
         let pw = EnhancedPingwave::new(peer_graph_id, 0, 1).with_load(0, HealthStatus::Healthy);
         self.proximity_graph.on_pingwave(pw, peer_addr);
@@ -722,36 +734,84 @@ impl MeshNode {
         // separate protocol concern.
         if data.len() == EnhancedPingwave::SIZE && u16::from_le_bytes([data[0], data[1]]) != MAGIC {
             if let Some(pw) = EnhancedPingwave::from_bytes(&data) {
-                // Before handing to the proximity graph, seed a routing
-                // entry for the origin if it's not us and not already a
-                // direct peer. `source` is the direct peer that just
-                // forwarded this pingwave to us, so it's a valid
-                // next-hop by construction. `hop_count` in the wire
-                // field is "hops the pingwave traversed before we
-                // received it"; real distance from origin is
-                // `hop_count + 1` (the final hop from `source` to us),
-                // and we add +1 more so direct routes (metric 1) always
-                // win over any indirect route.
                 let origin_nid = graph_id_to_node_id(&pw.origin_id);
-                if origin_nid != ctx.local_node_id {
-                    let metric = (pw.hop_count as u16).saturating_add(2);
-                    ctx.router
-                        .routing_table()
-                        .add_route_with_metric(origin_nid, source, metric);
+
+                // DV loop-avoidance rule 1: origin self-check. Drop
+                // any pingwave claiming `origin_id == self_id`. This
+                // defends against (a) a buggy peer echoing our own
+                // origin back at us, and (b) a stale buffered
+                // pingwave from a partitioned-then-healed peer.
+                if origin_nid == ctx.local_node_id {
+                    return;
                 }
-                // Process and optionally re-broadcast
-                if let Some(fwd_pw) = ctx.proximity_graph.on_pingwave(pw, source) {
+
+                // DV loop-avoidance rule 2: MAX_HOPS cap. TTL bounds
+                // forwarding; MAX_HOPS bounds install. A pingwave
+                // claiming an inflated hop_count can't populate a
+                // usable route or graph edge.
+                if pw.hop_count >= MAX_HOPS {
+                    return;
+                }
+
+                // DV loop-avoidance rule 4: only accept pingwaves
+                // from registered direct peers. An unknown source
+                // addr means either (a) a stale packet from before
+                // a handshake was torn down, (b) a peer that never
+                // handshaked, or (c) an attacker injecting forged
+                // pingwaves. In all three cases we refuse to install
+                // route or graph state — otherwise an unauthenticated
+                // sender could poison our routing table by claiming
+                // to be a next-hop for arbitrary origins.
+                let from_node_id = match ctx.addr_to_node.get(&source) {
+                    Some(e) => *e.value(),
+                    None => return,
+                };
+
+                // Install an indirect route `(origin, via=source)`
+                // with metric `hop_count + 2`. The `+2` keeps direct
+                // routes (metric 1) strictly better than any pingwave
+                // route — `add_route_with_metric` preserves the
+                // better entry.
+                let metric = (pw.hop_count as u16).saturating_add(2);
+                ctx.router
+                    .routing_table()
+                    .add_route_with_metric(origin_nid, source, metric);
+
+                // Hand to the proximity graph to update nodes +
+                // edges. `source` is guaranteed registered at this
+                // point, so `from_graph_id` faithfully attributes
+                // the edge to the forwarding peer's node_id.
+                let from_graph_id = node_id_to_graph_id(from_node_id);
+                if let Some(fwd_pw) =
+                    ctx.proximity_graph
+                        .on_pingwave_from(pw, from_graph_id, source)
+                {
                     let fwd_bytes = fwd_pw.to_bytes();
                     let socket = ctx.socket.clone();
                     let peers = ctx.peers.clone();
                     let filter = ctx.partition_filter.clone();
-                    // Re-broadcast to all peers except the sender
+                    let router = ctx.router.clone();
+                    // DV loop-avoidance rule 3: split horizon on
+                    // re-broadcast. If we installed `(origin_nid,
+                    // next_hop=X)` — i.e. we'd use X to reach the
+                    // origin — don't re-advertise the origin on the
+                    // link to X. Prevents X from learning "we can
+                    // reach origin in N+1 hops" and installing a
+                    // backward loop.
                     tokio::spawn(async move {
+                        let next_hop = router.routing_table().lookup(origin_nid);
                         for entry in peers.iter() {
                             let addr = entry.value().addr;
-                            if addr != source && !filter.contains(&addr) {
-                                let _ = socket.send_to(&fwd_bytes, addr).await;
+                            if addr == source {
+                                continue; // never send back to sender
                             }
+                            if Some(addr) == next_hop {
+                                continue; // split horizon: that's our path to origin
+                            }
+                            if filter.contains(&addr) {
+                                continue;
+                            }
+                            let _ = socket.send_to(&fwd_bytes, addr).await;
                         }
                     });
                 }
@@ -1267,6 +1327,14 @@ impl MeshNode {
                         // Drop routes whose `updated_at` is past the age
                         // limit. Small scan of the routing table; cheap.
                         router.routing_table().sweep_stale(max_route_age);
+
+                        // Age out proximity graph edges in lockstep
+                        // with the routing table. If the peer that
+                        // used to relay pingwaves for an origin went
+                        // silent, both the (peer→origin) edge and the
+                        // routing-table entry that depended on it
+                        // disappear on the same tick.
+                        proximity_graph.sweep_stale_edges(max_route_age);
 
                         // Sweep idle streams per-session and enforce the
                         // per-session `max_streams` cap. Each session is
@@ -1979,8 +2047,15 @@ impl MeshNode {
             ))
         })?;
         let reliable = config.reliability.is_reliable();
-        peer.session
-            .open_stream_with(stream_id, reliable, config.fairness_weight);
+        // Capture the freshly-allocated (or existing, on idempotent
+        // re-open) epoch so the returned `Stream` handle can later
+        // reject stale sends after a close+reopen.
+        let epoch = peer.session.open_stream_full(
+            stream_id,
+            reliable,
+            config.fairness_weight,
+            config.window_bytes,
+        );
         // Propagate the weight to the router's fair scheduler so
         // forwarded traffic on this stream (e.g., multi-hop relays
         // where we're an intermediate) respects the weight too. v1
@@ -2004,6 +2079,7 @@ impl MeshNode {
         Ok(Stream {
             peer_node_id,
             stream_id,
+            epoch,
             config,
         })
     }
@@ -2023,9 +2099,18 @@ impl MeshNode {
     /// Send a batch of events on an explicit stream.
     ///
     /// Uses the stream's reliability mode from its original `open_stream`
-    /// config. `Backpressure` is reserved for a future credit-windowed
-    /// flow-control implementation — v1 returns `Transport` for any
-    /// underlying send failure and success otherwise.
+    /// config. Returns `Backpressure` when the stream's in-flight count
+    /// (`tx_inflight`) would exceed its configured `tx_window`; the event
+    /// was not enqueued — the caller decides what to do (drop, retry,
+    /// or buffer at the app layer). `tx_window == 0` disables the check
+    /// and preserves pre-backpressure behavior. `Transport` is returned
+    /// for underlying socket send failures.
+    ///
+    /// Returns `NotConnected` when the stream was never opened or has
+    /// been closed since (`close_stream`, idle eviction, cap-exceeded
+    /// LRU). A previously-closed `Stream` handle is inert by design —
+    /// reusing it does NOT silently re-create the stream with default
+    /// config; the caller must explicitly re-open.
     pub async fn send_on_stream(
         &self,
         stream: &Stream,
@@ -2046,29 +2131,66 @@ impl MeshNode {
         let stream_id = stream.stream_id;
         let reliable = stream.config.reliability.is_reliable();
 
+        // Refuse to send on a stream that isn't currently open, OR
+        // whose live state has a different epoch than the handle. The
+        // second case covers the subtle "close + reopen with the same
+        // id" bug: the handle's epoch was captured at its original
+        // open, but a reopen allocates a fresh `StreamState` with a
+        // new epoch. A naive existence-only check would silently
+        // reroute the send onto the new stream — wrong config, wrong
+        // stats, wrong tx_window accounting.
+        match session.try_stream(stream_id) {
+            None => return Err(StreamError::NotConnected),
+            Some(state) if state.epoch() != stream.epoch => {
+                return Err(StreamError::NotConnected);
+            }
+            Some(_) => {}
+        }
+
         let pool = session.thread_local_pool();
         let mut builder = pool.get();
 
         let mut current_batch: Vec<Bytes> = Vec::with_capacity(64);
         let mut current_size = 0usize;
 
+        // Each socket send consumes one tx_window slot: acquire before
+        // building the packet, release after the socket send (success
+        // or failure). Failure to acquire immediately surfaces
+        // `StreamError::Backpressure` — no packets in this call have
+        // been sent yet, so the caller can cleanly retry or drop. If
+        // the stream disappears mid-call (e.g., another task races a
+        // `close_stream`), we surface `NotConnected`.
+        let flags = if reliable {
+            PacketFlags::RELIABLE
+        } else {
+            PacketFlags::NONE
+        };
+
+        // Admit + send + release on one-packet scope. The `_guard`
+        // binding is the RAII release: if the `.await` is cancelled
+        // (`tokio::select!` races a shutdown signal, caller drops the
+        // future) the guard's Drop still fires and decrements
+        // `tx_inflight`. Without this the slot would leak.
         for event in events {
             let frame_size = EventFrame::LEN_SIZE + event.len();
             if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE && !current_batch.is_empty() {
-                let seq = {
-                    let state = session.get_or_create_stream(stream_id);
-                    state.next_tx_seq()
-                };
-                let flags = if reliable {
-                    PacketFlags::RELIABLE
-                } else {
-                    PacketFlags::NONE
+                let (guard, seq) = match session
+                    .try_acquire_tx_slot_guard_matching_epoch(stream_id, stream.epoch)
+                {
+                    TxAdmit::Acquired(g) => {
+                        let seq = session
+                            .try_stream(stream_id)
+                            .ok_or(StreamError::NotConnected)?
+                            .next_tx_seq();
+                        (g, seq)
+                    }
+                    TxAdmit::WindowFull => return Err(StreamError::Backpressure),
+                    TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
                 };
                 let packet = builder.build(stream_id, seq, &current_batch, flags);
-                self.socket
-                    .send_to(&packet, peer_addr)
-                    .await
-                    .map_err(|e| StreamError::Transport(format!("send failed: {}", e)))?;
+                let send_res = self.socket.send_to(&packet, peer_addr).await;
+                drop(guard); // explicit — RAII also fires on cancellation
+                send_res.map_err(|e| StreamError::Transport(format!("send failed: {}", e)))?;
                 current_batch.clear();
                 current_size = 0;
             }
@@ -2077,25 +2199,73 @@ impl MeshNode {
         }
 
         if !current_batch.is_empty() {
-            let seq = {
-                let state = session.get_or_create_stream(stream_id);
-                state.next_tx_seq()
-            };
-            let flags = if reliable {
-                PacketFlags::RELIABLE
-            } else {
-                PacketFlags::NONE
-            };
+            let (guard, seq) =
+                match session.try_acquire_tx_slot_guard_matching_epoch(stream_id, stream.epoch) {
+                    TxAdmit::Acquired(g) => {
+                        let seq = session
+                            .try_stream(stream_id)
+                            .ok_or(StreamError::NotConnected)?
+                            .next_tx_seq();
+                        (g, seq)
+                    }
+                    TxAdmit::WindowFull => return Err(StreamError::Backpressure),
+                    TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
+                };
             let packet = builder.build(stream_id, seq, &current_batch, flags);
-            self.socket
-                .send_to(&packet, peer_addr)
-                .await
-                .map_err(|e| StreamError::Transport(format!("send failed: {}", e)))?;
+            let send_res = self.socket.send_to(&packet, peer_addr).await;
+            drop(guard);
+            send_res.map_err(|e| StreamError::Transport(format!("send failed: {}", e)))?;
         }
 
         drop(builder);
         session.touch();
         Ok(())
+    }
+
+    /// Send `events` on `stream`, retrying on `Backpressure` with
+    /// exponential backoff (5 ms → 200 ms, doubling) up to `max_retries`
+    /// times. Transport failures are returned immediately — they're a
+    /// real error, not a pressure signal, and retrying would just mask
+    /// them. Returns the final `Backpressure` error if the stream stays
+    /// saturated across every attempt.
+    pub async fn send_with_retry(
+        &self,
+        stream: &Stream,
+        events: &[Bytes],
+        max_retries: usize,
+    ) -> Result<(), StreamError> {
+        let mut delay = Duration::from_millis(5);
+        let cap = Duration::from_millis(200);
+        let mut last_backpressure: Option<StreamError> = None;
+        for _ in 0..max_retries.saturating_add(1) {
+            match self.send_on_stream(stream, events).await {
+                Ok(()) => return Ok(()),
+                Err(StreamError::Backpressure) => {
+                    last_backpressure = Some(StreamError::Backpressure);
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(cap);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_backpressure.unwrap_or(StreamError::Backpressure))
+    }
+
+    /// Convenience wrapper around [`send_with_retry`](Self::send_with_retry)
+    /// with a generous retry count. Blocks the calling task until the
+    /// send succeeds or a transport error occurs. Use when you'd rather
+    /// wait than drop; prefer `send_with_retry` if you need a concrete
+    /// upper bound on retry attempts.
+    pub async fn send_blocking(
+        &self,
+        stream: &Stream,
+        events: &[Bytes],
+    ) -> Result<(), StreamError> {
+        // 4096 retries × 200 ms cap = ~13 minutes in the worst case,
+        // effectively "block until the network lets up or something is
+        // actually wrong." Callers that need a tighter bound should use
+        // `send_with_retry` directly.
+        self.send_with_retry(stream, events, 4096).await
     }
 
     /// Snapshot of per-stream stats for a single stream.
@@ -2110,6 +2280,9 @@ impl MeshNode {
             inbound_pending: state.inbound_len() as u64,
             last_activity_ns: state.last_activity_ns(),
             active: state.is_active(),
+            backpressure_events: state.backpressure_events(),
+            tx_inflight: state.tx_inflight(),
+            tx_window: state.tx_window(),
         })
     }
 
@@ -2135,6 +2308,9 @@ impl MeshNode {
                         inbound_pending: state.inbound_len() as u64,
                         last_activity_ns: state.last_activity_ns(),
                         active: state.is_active(),
+                        backpressure_events: state.backpressure_events(),
+                        tx_inflight: state.tx_inflight(),
+                        tx_window: state.tx_window(),
                     },
                 ))
             })

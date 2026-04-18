@@ -26,7 +26,7 @@
 //! let mut stream = node.subscribe(Default::default());
 //! while let Some(event) = stream.next().await {
 //!     let event = event?;
-//!     println!("{}", event.raw_str());
+//!     println!("{}", event.raw_str().unwrap_or("<non-utf8>"));
 //! }
 //!
 //! node.shutdown().await?;
@@ -65,6 +65,11 @@ pub use ::net::config::JetStreamAdapterConfig;
 
 #[cfg(feature = "net")]
 pub use ::net::adapter::net::NetAdapterConfig;
+
+#[cfg(feature = "net")]
+pub use ::net::adapter::net::{
+    CloseBehavior, Reliability, Stream as MeshStream, StreamConfig, StreamStats,
+};
 
 #[cfg(feature = "net")]
 pub use crate::mesh::{Mesh, MeshBuilder};

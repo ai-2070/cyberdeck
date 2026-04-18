@@ -24,6 +24,30 @@ pub enum SdkError {
 
     #[error("mesh transport not available")]
     NoMesh,
+
+    /// Stream's per-stream in-flight window is full. The caller's events
+    /// were NOT sent — daemons decide whether to drop, retry, or buffer
+    /// at the app layer. See `Mesh::send_with_retry` / `send_blocking`
+    /// for the two built-in policies.
+    #[error("stream backpressure: queue full")]
+    Backpressure,
+
+    /// Stream's peer session is gone (peer disconnected, never
+    /// connected, or the stream was closed).
+    #[error("stream not connected")]
+    NotConnected,
+}
+
+#[cfg(feature = "net")]
+impl From<net::adapter::net::StreamError> for SdkError {
+    fn from(e: net::adapter::net::StreamError) -> Self {
+        use net::adapter::net::StreamError;
+        match e {
+            StreamError::Backpressure => SdkError::Backpressure,
+            StreamError::NotConnected => SdkError::NotConnected,
+            StreamError::Transport(msg) => SdkError::Adapter(msg),
+        }
+    }
 }
 
 impl From<net::error::IngestionError> for SdkError {

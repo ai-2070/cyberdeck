@@ -47,7 +47,7 @@ async fn main() -> net_sdk::error::Result<()> {
     sorted.sort_by_key(|&(id, _)| *id);
     for (shard_id, count) in &sorted {
         let pct = **count as f64 / stats.events_ingested as f64 * 100.0;
-        let bar: String = std::iter::repeat('#').take((pct / 2.0) as usize).collect();
+        let bar: String = std::iter::repeat_n('#', (pct / 2.0) as usize).collect();
         println!(
             "  shard {}: {:>5} events ({:>5.1}%) {}",
             shard_id, count, pct, bar

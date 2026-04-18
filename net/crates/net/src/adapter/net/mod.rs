@@ -106,7 +106,7 @@ pub use route::{
     ROUTING_HEADER_SIZE,
 };
 pub use router::{FairScheduler, NetRouter, RouteAction, RouterConfig, RouterError, RouterStats};
-pub use session::{NetSession, SessionManager, StreamState};
+pub use session::{NetSession, SessionManager, StreamState, TxAdmit, TxSlotGuard};
 pub use state::{
     CausalChainBuilder, CausalEvent, CausalLink, ChainError, EntityLog, HorizonEncoder, LogError,
     LogIndex, ObservedHorizon, SnapshotStore, StateSnapshot, CAUSAL_LINK_SIZE, SUBPROTOCOL_CAUSAL,

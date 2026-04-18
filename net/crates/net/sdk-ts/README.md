@@ -110,6 +110,57 @@ await NetNode.create({
 });
 ```
 
+## Mesh Streams (multi-peer + back-pressure)
+
+For direct peer-to-peer messaging — open a stream to a specific peer
+and react to back-pressure with first-class error classes:
+
+```typescript
+import { MeshNode, BackpressureError, NotConnectedError } from '@ai2070/net-sdk';
+
+const node = await MeshNode.create({
+  bindAddr: '127.0.0.1:9000',
+  psk: '0'.repeat(64),
+});
+// ... handshake (node.connect(...) / node.accept(...)) ...
+
+const stream = node.openStream(peerNodeId, {
+  streamId: 0x42n,
+  reliability: 'reliable',
+  windowBytes: 256,   // max in-flight packets before BackpressureError
+});
+
+// Three canonical daemon patterns:
+
+// 1. Drop on pressure.
+try {
+  await node.sendOnStream(stream, [Buffer.from('{}')]);
+} catch (e) {
+  if (e instanceof BackpressureError) {
+    metrics.inc('stream.backpressure_drops');
+  } else if (e instanceof NotConnectedError) {
+    // peer gone or stream closed — re-open if needed
+  } else {
+    throw e;
+  }
+}
+
+// 2. Retry with exponential backoff (5 ms → 200 ms, up to maxRetries).
+await node.sendWithRetry(stream, [Buffer.from('{}')], 8);
+
+// 3. Block until the network lets up (bounded retry, ~13 min worst case).
+await node.sendBlocking(stream, [Buffer.from('{}')]);
+
+// Live stats — tx/rx seq, in-flight, window, backpressure count (BigInts).
+const stats = node.streamStats(peerNodeId, 0x42n);
+```
+
+`BackpressureError` and `NotConnectedError` both extend `Error`, so
+`instanceof` and `try/catch` work as expected. The transport never
+retries or buffers on its own behalf — the helper methods are
+opt-in policies, not defaults. See `docs/TRANSPORT.md` for the full
+contract.
+
 ## API
 
 | Method | Description |

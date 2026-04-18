@@ -768,11 +768,105 @@ impl Net {
 // ============================================================================
 
 #[cfg(feature = "net")]
+pyo3::create_exception!(
+    _net,
+    BackpressureError,
+    pyo3::exceptions::PyException,
+    "Raised when a stream's per-stream in-flight window is full. The \
+     caller's events were NOT sent — decide whether to drop, retry, \
+     or buffer at the app layer. See send_with_retry / send_blocking \
+     for two built-in policies."
+);
+
+#[cfg(feature = "net")]
+pyo3::create_exception!(
+    _net,
+    NotConnectedError,
+    pyo3::exceptions::PyException,
+    "Raised when a stream's peer session is gone (never connected, \
+     disconnected, or the stream was closed)."
+);
+
+#[cfg(feature = "net")]
 mod mesh_bindings {
     use super::*;
-    use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig};
+    use net::adapter::net::{
+        EntityKeypair, MeshNode, MeshNodeConfig, Reliability, Stream as CoreStream, StreamConfig,
+        StreamError,
+    };
     use net::adapter::Adapter;
     use std::time::Duration;
+
+    pub(crate) fn stream_error_to_py(e: StreamError) -> PyErr {
+        match e {
+            StreamError::Backpressure => {
+                super::BackpressureError::new_err("stream would block (queue full)")
+            }
+            StreamError::NotConnected => super::NotConnectedError::new_err("stream not connected"),
+            StreamError::Transport(msg) => {
+                PyRuntimeError::new_err(format!("stream transport error: {}", msg))
+            }
+        }
+    }
+
+    /// Handle to an open stream. Opaque to Python callers.
+    #[pyclass]
+    pub struct NetStream {
+        pub(crate) peer_node_id: u64,
+        pub(crate) stream_id: u64,
+        pub(crate) core: CoreStream,
+    }
+
+    #[pymethods]
+    impl NetStream {
+        #[getter]
+        fn peer_node_id(&self) -> u64 {
+            self.peer_node_id
+        }
+        #[getter]
+        fn stream_id(&self) -> u64 {
+            self.stream_id
+        }
+        fn __repr__(&self) -> String {
+            format!(
+                "NetStream(peer_node_id={:#x}, stream_id={:#x})",
+                self.peer_node_id, self.stream_id
+            )
+        }
+    }
+
+    /// Snapshot of per-stream stats.
+    #[pyclass]
+    #[derive(Clone)]
+    pub struct NetStreamStats {
+        #[pyo3(get)]
+        pub tx_seq: u64,
+        #[pyo3(get)]
+        pub rx_seq: u64,
+        #[pyo3(get)]
+        pub inbound_pending: u64,
+        #[pyo3(get)]
+        pub last_activity_ns: u64,
+        #[pyo3(get)]
+        pub active: bool,
+        #[pyo3(get)]
+        pub backpressure_events: u64,
+        #[pyo3(get)]
+        pub tx_inflight: u32,
+        #[pyo3(get)]
+        pub tx_window: u32,
+    }
+
+    pub(crate) fn parse_reliability(s: Option<&str>) -> PyResult<Reliability> {
+        match s {
+            None | Some("fire_and_forget") => Ok(Reliability::FireAndForget),
+            Some("reliable") => Ok(Reliability::Reliable),
+            Some(other) => Err(PyValueError::new_err(format!(
+                "unknown reliability mode {:?}; expected \"fire_and_forget\" or \"reliable\"",
+                other
+            ))),
+        }
+    }
 
     /// A multi-peer mesh node for Python.
     ///
@@ -980,6 +1074,158 @@ mod mesh_bindings {
             Ok(self.get_node()?.proximity_graph().node_count())
         }
 
+        // ─── Stream API ────────────────────────────────────────────
+
+        /// Open (or look up) a logical stream to a connected peer.
+        ///
+        /// Repeated calls for the same (peer, stream_id) are
+        /// idempotent — the first open wins; later differing configs
+        /// are logged and ignored.
+        ///
+        /// Args:
+        ///     peer_node_id: node_id of a peer this node is connected to.
+        ///     stream_id: caller-chosen opaque u64.
+        ///     reliability: "fire_and_forget" (default) or "reliable".
+        ///     window_bytes: per-stream in-flight window cap. 0 = unbounded.
+        ///     fairness_weight: fair-scheduler quantum multiplier.
+        #[pyo3(signature = (
+            peer_node_id,
+            stream_id,
+            reliability=None,
+            window_bytes=0,
+            fairness_weight=1
+        ))]
+        fn open_stream(
+            &self,
+            peer_node_id: u64,
+            stream_id: u64,
+            reliability: Option<&str>,
+            window_bytes: u32,
+            fairness_weight: u8,
+        ) -> PyResult<NetStream> {
+            let node = self.get_node()?;
+            let rel = parse_reliability(reliability)?;
+            let config = StreamConfig::new()
+                .with_reliability(rel)
+                .with_window_bytes(window_bytes)
+                .with_fairness_weight(fairness_weight);
+            let core = node
+                .open_stream(peer_node_id, stream_id, config)
+                .map_err(|e| PyRuntimeError::new_err(format!("open_stream: {}", e)))?;
+            Ok(NetStream {
+                peer_node_id,
+                stream_id,
+                core,
+            })
+        }
+
+        /// Close a stream. Idempotent.
+        fn close_stream(&self, peer_node_id: u64, stream_id: u64) -> PyResult<()> {
+            let node = self.get_node()?;
+            node.close_stream(peer_node_id, stream_id);
+            Ok(())
+        }
+
+        /// Send a batch of events on an explicit stream. Each event is
+        /// a `bytes` payload.
+        ///
+        /// Raises:
+        ///     BackpressureError: stream's in-flight window is full (no
+        ///         events sent — the caller decides what to do).
+        ///     NotConnectedError: stream's peer session is gone.
+        ///     RuntimeError: underlying transport failure.
+        fn send_on_stream(
+            &self,
+            py: Python<'_>,
+            stream: &NetStream,
+            events: Vec<Vec<u8>>,
+        ) -> PyResult<()> {
+            let node = self.get_node()?;
+            let payloads: Vec<bytes::Bytes> = events.into_iter().map(bytes::Bytes::from).collect();
+            // Release the GIL while the runtime is actually awaiting the
+            // socket send. Without this, every other Python thread is
+            // blocked for the duration — matters even for a single round
+            // trip under contention, matters a lot for `send_with_retry`
+            // / `send_blocking`.
+            py.detach(|| {
+                self.runtime
+                    .block_on(node.send_on_stream(&stream.core, &payloads))
+            })
+            .map_err(stream_error_to_py)
+        }
+
+        /// Send events, retrying on `BackpressureError` with 5 ms → 200 ms
+        /// exponential backoff up to `max_retries` times. Transport
+        /// errors and `NotConnectedError` are raised immediately.
+        #[pyo3(signature = (stream, events, max_retries=8))]
+        fn send_with_retry(
+            &self,
+            py: Python<'_>,
+            stream: &NetStream,
+            events: Vec<Vec<u8>>,
+            max_retries: u32,
+        ) -> PyResult<()> {
+            let node = self.get_node()?;
+            let payloads: Vec<bytes::Bytes> = events.into_iter().map(bytes::Bytes::from).collect();
+            py.detach(|| {
+                self.runtime.block_on(node.send_with_retry(
+                    &stream.core,
+                    &payloads,
+                    max_retries as usize,
+                ))
+            })
+            .map_err(stream_error_to_py)
+        }
+
+        /// Block the calling task until the send succeeds or a
+        /// transport error occurs. Retries `BackpressureError` with
+        /// 5 ms → 200 ms exponential backoff up to 4096 times (~13 min
+        /// worst case) — effectively "block until the network lets up"
+        /// for practical workloads, but with a hard upper bound so
+        /// runaway pressure can't hang the caller forever. Use
+        /// `send_with_retry` for a tighter bound.
+        ///
+        /// Releases the GIL for the duration of the block — retries
+        /// can take arbitrarily long under sustained backpressure, so
+        /// other Python threads must be free to run (GC, signals,
+        /// other worker threads).
+        fn send_blocking(
+            &self,
+            py: Python<'_>,
+            stream: &NetStream,
+            events: Vec<Vec<u8>>,
+        ) -> PyResult<()> {
+            let node = self.get_node()?;
+            let payloads: Vec<bytes::Bytes> = events.into_iter().map(bytes::Bytes::from).collect();
+            py.detach(|| {
+                self.runtime
+                    .block_on(node.send_blocking(&stream.core, &payloads))
+            })
+            .map_err(stream_error_to_py)
+        }
+
+        /// Snapshot of per-stream stats. Returns None if the peer or
+        /// stream isn't registered.
+        fn stream_stats(
+            &self,
+            peer_node_id: u64,
+            stream_id: u64,
+        ) -> PyResult<Option<NetStreamStats>> {
+            let node = self.get_node()?;
+            Ok(node
+                .stream_stats(peer_node_id, stream_id)
+                .map(|s| NetStreamStats {
+                    tx_seq: s.tx_seq,
+                    rx_seq: s.rx_seq,
+                    inbound_pending: s.inbound_pending,
+                    last_activity_ns: s.last_activity_ns,
+                    active: s.active,
+                    backpressure_events: s.backpressure_events,
+                    tx_inflight: s.tx_inflight,
+                    tx_window: s.tx_window,
+                }))
+        }
+
         /// Shutdown the mesh node.
         fn shutdown(&mut self) -> PyResult<()> {
             let node = self
@@ -1042,5 +1288,13 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(generate_net_keypair, m)?)?;
     #[cfg(feature = "net")]
     m.add_class::<mesh_bindings::NetMesh>()?;
+    #[cfg(feature = "net")]
+    m.add_class::<mesh_bindings::NetStream>()?;
+    #[cfg(feature = "net")]
+    m.add_class::<mesh_bindings::NetStreamStats>()?;
+    #[cfg(feature = "net")]
+    m.add("BackpressureError", m.py().get_type::<BackpressureError>())?;
+    #[cfg(feature = "net")]
+    m.add("NotConnectedError", m.py().get_type::<NotConnectedError>())?;
     Ok(())
 }

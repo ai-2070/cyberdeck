@@ -13,12 +13,26 @@ Example:
 from net_sdk.node import NetNode
 from net_sdk.stream import EventStream, TypedEventStream
 from net_sdk.channel import TypedChannel
+from net_sdk.mesh import (
+    MeshNode,
+    MeshStream,
+    StreamStats,
+    Reliability,
+    BackpressureError,
+    NotConnectedError,
+)
 
 __all__ = [
     "NetNode",
     "EventStream",
     "TypedEventStream",
     "TypedChannel",
+    "MeshNode",
+    "MeshStream",
+    "StreamStats",
+    "Reliability",
+    "BackpressureError",
+    "NotConnectedError",
 ]
 
 __version__ = "0.1.0"

@@ -425,6 +425,32 @@ impl RoutingTable {
             .map(|r| r.next_hop)
     }
 
+    /// Like [`Self::lookup`], but returns `None` if the installed
+    /// route's `next_hop` equals `exclude_next_hop`. Used by
+    /// [`crate::adapter::net::ReroutePolicy`] so a single failed-peer
+    /// check against the routing table answers "do I have a usable
+    /// alternate?" — if `Some(addr)`, use it directly; if `None`,
+    /// fall back to a graph-based alternate lookup.
+    ///
+    /// Today the routing table stores one entry per destination, so
+    /// the "alternate" is either the current entry (if not excluded)
+    /// or nothing. When the table grows to hold ranked alternates
+    /// per destination, the signature stays the same and the
+    /// implementation picks the lowest-metric non-excluded entry.
+    pub fn lookup_alternate(
+        &self,
+        dest_id: u64,
+        exclude_next_hop: SocketAddr,
+    ) -> Option<SocketAddr> {
+        let max_age = self.max_route_age();
+        self.routes
+            .get(&dest_id)
+            .filter(|r| {
+                r.active && r.updated_at.elapsed() <= max_age && r.next_hop != exclude_next_hop
+            })
+            .map(|r| r.next_hop)
+    }
+
     /// Remove all routes whose `updated_at` is older than `max_age`.
     /// Returns the number of entries removed.
     ///
@@ -838,5 +864,40 @@ mod tests {
 
         // Rolling back a non-existent route is a no-op, returns false.
         assert!(!table.remove_route_if_next_hop_is(0x4444, newer));
+    }
+
+    #[test]
+    fn test_lookup_alternate() {
+        let table = RoutingTable::new(0x1);
+        let b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+
+        // Empty table — no alternate.
+        assert!(table.lookup_alternate(0x4444, b).is_none());
+
+        // Install `(0x4444 → B)`. Excluding B returns None; excluding
+        // C returns B (the installed entry).
+        table.add_route(0x4444, b);
+        assert_eq!(table.lookup_alternate(0x4444, b), None);
+        assert_eq!(table.lookup_alternate(0x4444, c), Some(b));
+    }
+
+    #[test]
+    fn test_lookup_alternate_respects_staleness() {
+        use std::time::Duration;
+        let table = RoutingTable::new(0x1);
+        let b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+
+        table.add_route(0x4444, b);
+        // Backdate the entry so `updated_at.elapsed() > max_route_age`.
+        {
+            let mut e = table.routes.get_mut(&0x4444).unwrap();
+            e.updated_at = Instant::now() - Duration::from_secs(3600);
+        }
+        table.set_max_route_age(Duration::from_secs(60));
+
+        // Even though the next_hop isn't excluded, staleness drops it.
+        assert!(table.lookup_alternate(0x4444, c).is_none());
     }
 }

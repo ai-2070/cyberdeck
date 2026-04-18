@@ -508,19 +508,44 @@ impl ProximityGraph {
             .with_load(self.local_load_level.load(Ordering::Relaxed) as u8, health)
     }
 
-    /// Process incoming pingwave
-    ///
-    /// Returns Some(pingwave) if it should be forwarded, None otherwise.
+    /// Back-compat shim: attribute the pingwave as if it arrived
+    /// directly from its origin (i.e. `from_node = pw.origin_id`).
+    /// Tests and benchmarks that don't model a separate forwarding
+    /// hop call this shape; production dispatch should use the full
+    /// [`Self::on_pingwave_from`] so multi-hop edge attribution is
+    /// correct.
     pub fn on_pingwave(
         &self,
+        pw: EnhancedPingwave,
+        from_addr: SocketAddr,
+    ) -> Option<EnhancedPingwave> {
+        let from_node = pw.origin_id;
+        self.on_pingwave_from(pw, from_node, from_addr)
+    }
+
+    /// Process incoming pingwave.
+    ///
+    /// `from_node` is the graph-id of the **direct peer** that just
+    /// forwarded this pingwave to us (i.e. the sender on the wire), not
+    /// the pingwave's origin. On multi-hop paths `from_node` differs
+    /// from `pw.origin_id`; on the first-hop case (a pingwave direct
+    /// from its origin) they match.
+    ///
+    /// Returns `Some(pingwave)` if it should be forwarded, `None`
+    /// otherwise.
+    pub fn on_pingwave_from(
+        &self,
         mut pw: EnhancedPingwave,
-        from: SocketAddr,
+        from_node: NodeId,
+        from_addr: SocketAddr,
     ) -> Option<EnhancedPingwave> {
         self.stats
             .pingwaves_received
             .fetch_add(1, Ordering::Relaxed);
 
-        // Ignore our own pingwaves
+        // Ignore our own pingwaves (origin self-check — also defends
+        // against a buffered pingwave we emitted earlier being replayed
+        // back at us by a partitioned-then-healed peer).
         if pw.origin_id == self.my_id {
             return None;
         }
@@ -537,17 +562,32 @@ impl ProximityGraph {
         let _is_new = !self.nodes.contains_key(&pw.origin_id);
         self.nodes
             .entry(pw.origin_id)
-            .and_modify(|node| node.update_from_pingwave(&pw, from))
+            .and_modify(|node| node.update_from_pingwave(&pw, from_addr))
             .or_insert_with(|| {
                 self.stats.nodes_discovered.fetch_add(1, Ordering::Relaxed);
-                ProximityNode::from_pingwave(&pw, from)
+                ProximityNode::from_pingwave(&pw, from_addr)
             });
 
-        // Update edge from sender to origin (we learned about origin via from)
-        // This is an indirect edge observation
-        if pw.hop_count > 0 {
-            // The sender is 1 hop away from us, origin is hop_count+1 hops away
-            // We can infer an edge exists in the path
+        // Topology edges: a pingwave carrying origin Y that we just
+        // received via direct peer Z tells us two facts:
+        //   * we have a direct edge to Z (already true by
+        //     construction — Z is our direct peer),
+        //   * Z has a route to Y (otherwise Z wouldn't be forwarding).
+        //
+        // The first is redundant after the initial insert; the
+        // `last_updated` refresh on re-insert is the cheap liveness
+        // signal. The second is what makes `path_to(Y)` able to
+        // return multi-hop paths.
+        //
+        // Latency estimate: `now_us − pw.origin_timestamp_us` is a
+        // noisy one-way delay; clock-skew-sensitive, but good enough
+        // as an equal-hop tiebreaker. EWMA (α = 1/8) smooths
+        // successive samples per `(from, to)` pair.
+        let now_us = current_time_us();
+        let sample_us = now_us.saturating_sub(pw.origin_timestamp_us);
+        self.insert_or_update_edge(self.my_id, from_node, 0);
+        if from_node != pw.origin_id {
+            self.insert_or_update_edge(from_node, pw.origin_id, sample_us);
         }
 
         // Check if should forward
@@ -561,6 +601,57 @@ impl ProximityGraph {
             .pingwaves_forwarded
             .fetch_add(1, Ordering::Relaxed);
         Some(pw)
+    }
+
+    /// Insert or refresh an edge. If the edge already exists, EWMA the
+    /// latency sample into `latency_us` (α = 1/8) and bump
+    /// `last_updated`. `sample_us == 0` means "no latency info" (e.g.
+    /// the self → peer edge added at session setup); leave the
+    /// existing latency alone in that case.
+    fn insert_or_update_edge(&self, from: NodeId, to: NodeId, sample_us: u64) {
+        self.edges
+            .entry((from, to))
+            .and_modify(|edge| {
+                if sample_us > 0 {
+                    // α = 1/8 EWMA on integer microseconds.
+                    let prev = edge.latency_us;
+                    edge.latency_us = prev - prev / 8 + sample_us / 8;
+                }
+                edge.last_updated = Instant::now();
+            })
+            .or_insert(ProximityEdge {
+                from,
+                to,
+                latency_us: sample_us,
+                last_updated: Instant::now(),
+                reliability: 1.0,
+            });
+    }
+
+    /// Drop edges whose `last_updated` is older than `max_age`. Called
+    /// from the heartbeat-loop tick alongside `RoutingTable::sweep_stale`
+    /// so the graph and the routing table age out in lockstep. Returns
+    /// the number of edges removed.
+    ///
+    /// Uses `DashMap::retain` so the staleness check + remove is
+    /// atomic per entry. A collect-stale-keys-then-remove shape would
+    /// race with concurrent pingwave receipt: another thread could
+    /// refresh an edge's `last_updated` between the collect and
+    /// remove phases, and we'd delete a freshly-alive edge.
+    pub fn sweep_stale_edges(&self, max_age: Duration) -> usize {
+        let cutoff = match Instant::now().checked_sub(max_age) {
+            Some(c) => c,
+            None => return 0,
+        };
+        let mut removed = 0usize;
+        self.edges.retain(|_, edge| {
+            let is_stale = edge.last_updated < cutoff;
+            if is_stale {
+                removed += 1;
+            }
+            !is_stale
+        });
+        removed
     }
 
     /// Update capabilities for a node (from full capability fetch)
@@ -1093,6 +1184,102 @@ mod tests {
         assert_eq!(
             pw.hop_count, 255,
             "hop_count should saturate at 255, not wrap to 0"
+        );
+    }
+
+    #[test]
+    fn test_edge_insert_on_pingwave_receipt() {
+        // On pingwave receipt for origin Y via peer Z, two edges
+        // materialize: (self → Z) and (Z → Y). `path_to(Y)` then
+        // returns the 3-step path [self, Z, Y].
+        let my_id = make_node_id(1);
+        let z = make_node_id(2);
+        let y = make_node_id(3);
+        let graph = ProximityGraph::new(my_id, ProximityConfig::default());
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        // Pingwave carries origin Y, arrived via Z (hop_count=1).
+        let pw = EnhancedPingwave::new(y, 1, 3).with_load(0, HealthStatus::Healthy);
+        let mut pw = pw;
+        pw.hop_count = 1;
+        graph.on_pingwave_from(pw, z, from);
+
+        let path = graph.path_to(&y).expect("path_to(y) should return Some");
+        assert_eq!(path, vec![my_id, z, y]);
+    }
+
+    #[test]
+    fn test_edge_sweep_removes_stale() {
+        use std::time::Duration;
+        let my_id = make_node_id(1);
+        let z = make_node_id(2);
+        let y = make_node_id(3);
+        let graph = ProximityGraph::new(my_id, ProximityConfig::default());
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        let mut pw = EnhancedPingwave::new(y, 1, 3).with_load(0, HealthStatus::Healthy);
+        pw.hop_count = 1;
+        graph.on_pingwave_from(pw, z, from);
+        assert!(graph.path_to(&y).is_some());
+
+        // Backdate both edges so the sweep finds them stale.
+        for mut entry in graph.edges.iter_mut() {
+            entry.last_updated = Instant::now() - Duration::from_secs(3600);
+        }
+        let removed = graph.sweep_stale_edges(Duration::from_secs(60));
+        assert_eq!(removed, 2, "both synthetic edges should be swept");
+        assert!(graph.path_to(&y).is_none());
+    }
+
+    #[test]
+    fn test_origin_self_check_drops_pingwave() {
+        // Pingwave claiming `origin == self_id` must be dropped.
+        // The graph's `on_pingwave` already has this check; the same
+        // rule is enforced in `mesh.rs` dispatch earlier.
+        let my_id = make_node_id(1);
+        let graph = ProximityGraph::new(my_id, ProximityConfig::default());
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        let pw = EnhancedPingwave::new(my_id, 1, 3);
+        let forwarded = graph.on_pingwave(pw, from);
+        assert!(forwarded.is_none(), "self-origin pingwave must be dropped");
+        assert!(graph.get_node(&my_id).is_none());
+    }
+
+    #[test]
+    fn test_latency_ewma_smooths_successive_samples() {
+        let my_id = make_node_id(1);
+        let z = make_node_id(2);
+        let y = make_node_id(3);
+        let graph = ProximityGraph::new(my_id, ProximityConfig::default());
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        // Two pingwaves with known timestamps → two latency samples.
+        let now = current_time_us();
+        let mut pw1 = EnhancedPingwave::new(y, 1, 3).with_load(0, HealthStatus::Healthy);
+        pw1.hop_count = 1;
+        pw1.origin_timestamp_us = now.saturating_sub(10_000); // 10 ms ago
+        graph.on_pingwave_from(pw1, z, from);
+
+        // Edge should have latency ≈ 10_000 us after first insert.
+        let edge1 = graph.edges.get(&(z, y)).expect("z→y edge");
+        assert!(edge1.latency_us > 0);
+        let first = edge1.latency_us;
+        drop(edge1);
+
+        // Second sample with a different latency — EWMA drags it.
+        let mut pw2 = EnhancedPingwave::new(y, 2, 3).with_load(0, HealthStatus::Healthy);
+        pw2.hop_count = 1;
+        pw2.origin_timestamp_us = current_time_us().saturating_sub(50_000); // 50 ms ago
+        graph.on_pingwave_from(pw2, z, from);
+
+        let edge2 = graph.edges.get(&(z, y)).unwrap();
+        // EWMA α=1/8 → edge.latency_us moved toward 50_000 from
+        // `first`, but not all the way.
+        assert_ne!(edge2.latency_us, first, "EWMA should shift latency");
+        assert!(
+            edge2.latency_us < 50_000,
+            "EWMA should not snap to the new sample"
         );
     }
 }

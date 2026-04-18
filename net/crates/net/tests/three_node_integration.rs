@@ -3871,6 +3871,108 @@ async fn test_stream_open_close_idempotency() {
     b.shutdown().await.unwrap();
 }
 
+/// Regression: `send_on_stream` used to call `session.get_or_create_stream`,
+/// which would silently revive a closed stream with *default* config
+/// (losing the caller's original `Reliability` / `tx_window` /
+/// `fairness_weight`) on the next send. A stale `Stream` handle
+/// reaching back into a closed session thus produced a stream the
+/// caller never explicitly opened.
+///
+/// Fix: `send_on_stream` now checks `session.try_stream(stream_id)`
+/// and returns `StreamError::NotConnected` if the stream isn't
+/// currently open. Callers that want auto-create behavior use
+/// `send_to_peer` / `send_routed` instead of the typed handle API.
+#[tokio::test]
+async fn test_regression_send_on_stream_rejects_closed_stream() {
+    use net::adapter::net::{Reliability, StreamConfig, StreamError};
+
+    let ports = find_ports(2).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+    };
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let pub_b = *b.public_key();
+
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    // Open a reliable stream, send once to prime state.
+    let stream = a
+        .open_stream(
+            nid_b,
+            123,
+            StreamConfig::new().with_reliability(Reliability::Reliable),
+        )
+        .unwrap();
+    a.send_on_stream(&stream, &[Bytes::from_static(b"{}")])
+        .await
+        .unwrap();
+
+    // Close the stream. The `stream` handle is now stale — the
+    // session no longer tracks stream_id 123.
+    a.close_stream(nid_b, 123);
+    assert!(a.stream_stats(nid_b, 123).is_none());
+
+    // Send on the stale handle. Must return NotConnected — NOT
+    // silently recreate with default (FireAndForget, tx_window=0)
+    // config and succeed.
+    let result = a
+        .send_on_stream(&stream, &[Bytes::from_static(b"{}")])
+        .await;
+    assert!(
+        matches!(result, Err(StreamError::NotConnected)),
+        "expected NotConnected for send on closed stream; got {:?}",
+        result
+    );
+    // And the session still has no entry for 123 — no silent
+    // recreation happened.
+    assert!(
+        a.stream_stats(nid_b, 123).is_none(),
+        "send on closed stream must NOT revive the stream"
+    );
+
+    // Now the trickier case: close a stream, reopen it with fresh
+    // config, and verify the ORIGINAL stale handle still refuses to
+    // operate on the new stream. The new `Stream` handle works
+    // normally; only the stale one is inert.
+    let fresh = a
+        .open_stream(
+            nid_b,
+            123,
+            StreamConfig::new().with_reliability(Reliability::FireAndForget),
+        )
+        .unwrap();
+    let stale_result = a
+        .send_on_stream(&stream, &[Bytes::from_static(b"{}")])
+        .await;
+    assert!(
+        matches!(stale_result, Err(StreamError::NotConnected)),
+        "stale handle from pre-reopen lifetime must still refuse; got {:?}",
+        stale_result
+    );
+    a.send_on_stream(&fresh, &[Bytes::from_static(b"{}")])
+        .await
+        .expect("fresh handle after reopen must work");
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
 // ============================================================================
 // Multi-hop routing discovery
 // ============================================================================
@@ -3970,6 +4072,176 @@ async fn test_multi_hop_routing_pingwave_installs_indirect_route() {
     b.shutdown().await.unwrap();
     c.shutdown().await.unwrap();
     d.shutdown().await.unwrap();
+}
+
+/// DV plan: after pingwave propagation, `ProximityGraph::path_to` must
+/// return a real multi-hop path — not `None`. Previously `edges` was
+/// never populated, so `path_to` always returned `None` and
+/// `ReroutePolicy` fell back to "any direct peer". This is the primary
+/// before/after for the DV plan: `path_to` is now usable.
+#[tokio::test]
+async fn test_regression_dv_path_to_returns_multi_hop() {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_secs(30))
+    };
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let pub_b = *b.public_key();
+    let pub_c = *c.public_key();
+
+    // Chain: A↔B, B↔C. A has no direct session with C.
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    let (r1, r2) = tokio::join!(c.accept(nid_b), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        b.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    a.start();
+    b.start();
+    c.start();
+
+    // Wait for pingwaves from C to reach A via B.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // A's proximity graph should now have a multi-hop path to C.
+    // Graph-id encoding: low 8 bytes = u64 node_id LE, high 24 bytes
+    // zero (matches the `node_id_to_graph_id` convention used
+    // everywhere node_ids enter the proximity graph).
+    let mut c_graph_id = [0u8; 32];
+    c_graph_id[0..8].copy_from_slice(&nid_c.to_le_bytes());
+    let path = a.proximity_graph().path_to(&c_graph_id);
+    assert!(
+        path.is_some(),
+        "path_to(C) must be Some now that edges populate on pingwave receipt"
+    );
+    let path = path.unwrap();
+    assert!(
+        path.len() >= 2,
+        "path_to(C) should have at least 2 nodes (self + next hop); got {:?}",
+        path.len()
+    );
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
+}
+
+/// Regression: the pingwave dispatch path used to accept pingwaves from
+/// any UDP source — including addresses that had never completed a
+/// handshake — and install both a `RoutingTable` entry and a
+/// `ProximityGraph` node for the forged origin. That let anyone on the
+/// wire poison the victim's routing/topology state by fabricating a
+/// pingwave claiming to be a next-hop for an arbitrary origin.
+///
+/// Fix: the dispatch now looks up `source` in `addr_to_node` and drops
+/// the pingwave if the source isn't a registered direct peer.
+///
+/// Before the fix, this test would have seen the forged origin appear
+/// in both the routing table and the proximity graph. After the fix,
+/// neither surface changes — the pingwave is silently dropped at the
+/// dispatch boundary.
+#[tokio::test]
+async fn test_regression_pingwave_from_unregistered_source_is_dropped() {
+    use net::adapter::net::behavior::EnhancedPingwave;
+    use tokio::net::UdpSocket;
+
+    let ports = find_ports(2).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let attacker_addr: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+
+    let a = MeshNode::new(
+        id_a,
+        MeshNodeConfig::new(addr_a, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(30)),
+    )
+    .await
+    .unwrap();
+    a.start();
+
+    // Bind a raw UDP socket that has NOT completed any handshake with A.
+    let attacker = UdpSocket::bind(attacker_addr).await.unwrap();
+
+    // Forge a pingwave claiming origin 0xDEADBEEF — a node the attacker
+    // wants A to install a route for. `hop_count = 1` is a lie; an
+    // honest intermediate would only be 1 hop away, but A has no way
+    // to verify the claim without authenticating the source.
+    let mut forged_origin_graph_id = [0u8; 32];
+    let forged_origin_nid: u64 = 0xDEAD_BEEF_CAFE_F00D;
+    forged_origin_graph_id[0..8].copy_from_slice(&forged_origin_nid.to_le_bytes());
+    let mut pw = EnhancedPingwave::new(forged_origin_graph_id, 1, 3);
+    pw.hop_count = 1;
+    let pw_bytes = pw.to_bytes();
+
+    // Send from the unregistered socket directly to A. A will dispatch
+    // it through the pingwave path.
+    attacker.send_to(&pw_bytes, addr_a).await.unwrap();
+
+    // Give A's receive loop a generous moment to process. The dispatch
+    // is synchronous after parse; 200 ms is plenty.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Assertion 1: no route for the forged origin was installed.
+    let lookup = a.router().routing_table().lookup(forged_origin_nid);
+    assert!(
+        lookup.is_none(),
+        "routing table must NOT install a route for a forged origin \
+         advertised from an unregistered source; got next_hop={:?}",
+        lookup
+    );
+
+    // Assertion 2: no proximity graph node materialized for the forged
+    // origin. Before the fix, `on_pingwave_from` would have added it.
+    assert!(
+        a.proximity_graph()
+            .get_node(&forged_origin_graph_id)
+            .is_none(),
+        "proximity graph must NOT contain a node for a forged origin \
+         advertised from an unregistered source"
+    );
+
+    // Assertion 3: no graph edge materialized. Even though the
+    // attacker's addr could resolve to some synthetic node, we expect
+    // the graph to stay empty of edges rooted at the attacker.
+    // (Checked indirectly: `path_to(forged_origin)` must be None.)
+    assert!(
+        a.proximity_graph()
+            .path_to(&forged_origin_graph_id)
+            .is_none(),
+        "path_to(forged_origin) must be None — no edge should have \
+         been installed by the dropped pingwave"
+    );
+
+    drop(attacker);
+    a.shutdown().await.unwrap();
 }
 
 // ============================================================================
@@ -4237,59 +4509,83 @@ async fn test_regression_handshake_relay_registers_peer_after_msg2_sent() {
 /// no longer swallows legitimate Net-header-shaped traffic.)
 #[tokio::test]
 async fn test_regression_pingwave_not_dispatched_on_net_magic_packet() {
-    let ports = find_ports(1).await;
+    let ports = find_ports(2).await;
     let psk = [0x42u8; 32];
-    let id = EntityKeypair::generate();
-    let addr: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
 
-    let node = MeshNode::new(id, MeshNodeConfig::new(addr, psk))
-        .await
-        .unwrap();
-    node.start();
+    // Handshaked peer B so we have a registered source for the
+    // "legitimate pingwave" sanity check below. Pingwaves from
+    // unregistered sources are dropped at the dispatch boundary
+    // (see `test_regression_pingwave_from_unregistered_source_is_dropped`),
+    // so the sanity leg needs a real peer.
+    let mk_config = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(10))
+    };
+    let node_a = MeshNode::new(id_a, mk_config(addr_a)).await.unwrap();
+    let node_b = MeshNode::new(id_b, mk_config(addr_b)).await.unwrap();
+    let pub_b = *node_b.public_key();
 
-    let before = node.proximity_graph().stats().pingwaves_received;
+    let (r1, r2) = tokio::join!(node_b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    node_a.start();
+    node_b.start();
 
-    // Craft a 72-byte packet whose first two bytes are the Net magic
-    // (0x4E45 little-endian = [0x45, 0x4E] = "EN"). Post-fix this must be
-    // rejected at the pingwave guard and NOT reach the proximity graph.
-    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let before = node_a.proximity_graph().stats().pingwaves_received;
+
+    // Leg 1: a 72-byte packet whose first two bytes are the Net magic
+    // (0x4E45 little-endian = [0x45, 0x4E] = "EN"), sent from an
+    // UNHANDSHAKED socket. Post-fix this must be rejected at the
+    // pingwave parse guard and NOT reach the proximity graph. The
+    // unregistered-source guard would also drop it, but the parse
+    // guard fires first and is what this test is about.
+    let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let mut pkt = [0u8; 72];
     pkt[0] = 0x45;
     pkt[1] = 0x4E;
-    sender.send_to(&pkt, addr).await.unwrap();
+    attacker.send_to(&pkt, addr_a).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let after = node.proximity_graph().stats().pingwaves_received;
+    let after = node_a.proximity_graph().stats().pingwaves_received;
     assert_eq!(
         before, after,
         "a 72-byte packet starting with the Net magic must not be \
          dispatched as a pingwave"
     );
 
-    // Sanity check: a 72-byte packet WITHOUT the Net magic is still
-    // accepted as a pingwave. If this fails, the guard is too aggressive.
-    let mut pw_pkt = [0u8; 72];
-    // Fill origin_id[0..8] with a recognisable node id; the remaining
-    // origin_id bytes (8..32) are zero — not the Net magic — so the
-    // pingwave guard lets it through.
-    pw_pkt[0..8].copy_from_slice(&0xDEADBEEFu64.to_le_bytes());
-    // Set TTL > 0 so the graph considers it live.
-    pw_pkt[40] = 4;
-    sender.send_to(&pw_pkt, addr).await.unwrap();
+    // Leg 2: legitimate pingwaves from B (a handshaked peer) must
+    // still be accepted. B's heartbeat loop emits a pingwave every
+    // `heartbeat_interval_ms` (500 ms by config); wait long enough
+    // for at least one to cross the wire. A's dispatch must parse it
+    // as a pingwave (the guard lets non-magic packets through) AND
+    // accept it (B is a registered peer). If this counter doesn't
+    // move, either the parse guard is too aggressive or the
+    // unregistered-source guard is rejecting traffic from a real
+    // peer.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let after_valid = node.proximity_graph().stats().pingwaves_received;
+    let after_valid = node_a.proximity_graph().stats().pingwaves_received;
     assert!(
         after_valid > after,
-        "legitimate pingwaves (no Net magic) must still be accepted; \
-         before={}, after={}",
+        "legitimate pingwaves from a handshaked peer must be accepted; \
+         before_valid_leg={}, after_valid_leg={}",
         after,
         after_valid
     );
 
-    node.shutdown().await.unwrap();
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
 }
 
 // ============================================================================
@@ -4503,4 +4799,175 @@ async fn test_channel_publisher_unsubscribe_idempotent() {
     node_a.shutdown().await.unwrap();
     node_b.shutdown().await.unwrap();
     node_c.shutdown().await.unwrap();
+}
+
+// ============================================================================
+// Stream backpressure (v1 local in-flight window)
+// ============================================================================
+
+use net::adapter::net::{StreamConfig, StreamError};
+
+/// Concurrent callers on the same stream with a window-1 cap: at least
+/// one caller per concurrent burst hits `StreamError::Backpressure` and
+/// `backpressure_events` increments. Multi-threaded runtime is required
+/// to force real concurrency between the acquire-send-release sequence
+/// across the window boundary (localhost UDP sends are too fast on a
+/// single-threaded runtime for the race to materialize).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_send_on_stream_backpressure_when_concurrent() {
+    let ports = find_ports(2).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(4)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(30))
+    };
+
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let pub_b = *b.public_key();
+
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    a.start();
+    b.start();
+
+    // Window-1 stream: at most one in-flight packet. With a single
+    // serial sender this is effectively unbounded (acquire/release
+    // round-trip per send) — so we need CONCURRENT senders to observe
+    // the cap.
+    let stream = a
+        .open_stream(nid_b, 7777, StreamConfig::new().with_window_bytes(1))
+        .unwrap();
+
+    // Spin up a batch of concurrent tasks sending on the same stream.
+    // Each event is a small payload.
+    let n_tasks: usize = 16;
+    let event = Bytes::from_static(b"{\"t\":\"bp\"}");
+    let mut handles = Vec::new();
+    for _ in 0..n_tasks {
+        let mesh = Arc::clone(&a);
+        let stream = stream.clone();
+        let payload = event.clone();
+        handles.push(tokio::spawn(async move {
+            mesh.send_on_stream(&stream, &[payload]).await
+        }));
+    }
+
+    let mut ok = 0usize;
+    let mut backpressure = 0usize;
+    let mut transport = 0usize;
+    for h in handles {
+        match h.await.unwrap() {
+            Ok(()) => ok += 1,
+            Err(StreamError::Backpressure) => backpressure += 1,
+            Err(StreamError::Transport(_)) => transport += 1,
+            Err(StreamError::NotConnected) => panic!("unexpected NotConnected"),
+        }
+    }
+    // At least one caller must have hit the cap. We don't assert an
+    // exact count — the scheduler's interleaving depends on the
+    // runtime — but with a window of 1 and 16 concurrent senders,
+    // backpressure is virtually guaranteed.
+    assert!(
+        backpressure > 0,
+        "expected at least one Backpressure in {} concurrent sends; got ok={}, bp={}, transport={}",
+        n_tasks,
+        ok,
+        backpressure,
+        transport
+    );
+    assert!(ok > 0, "expected at least one successful send");
+
+    // Stats mirror the backpressure counter we just observed.
+    let stats = a.stream_stats(nid_b, 7777).expect("stream stats");
+    assert!(
+        stats.backpressure_events >= backpressure as u64,
+        "stats.backpressure_events ({}) must be >= observed ({})",
+        stats.backpressure_events,
+        backpressure
+    );
+    assert_eq!(stats.tx_window, 1);
+
+    Arc::try_unwrap(a).ok().unwrap().shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// `send_with_retry` backs off on Backpressure and eventually succeeds
+/// once the window clears. Transport errors are returned immediately,
+/// not retried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_send_with_retry_eventually_succeeds_through_backpressure() {
+    let ports = find_ports(2).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(4)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(30))
+    };
+
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let pub_b = *b.public_key();
+
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    a.start();
+    b.start();
+
+    let stream = a
+        .open_stream(nid_b, 8888, StreamConfig::new().with_window_bytes(4))
+        .unwrap();
+
+    // Run 32 concurrent retry-sends. All must eventually succeed;
+    // none should surface as Backpressure at the caller because
+    // send_with_retry absorbs the transient pressure.
+    let n: usize = 32;
+    let mut handles = Vec::new();
+    for i in 0..n {
+        let mesh = Arc::clone(&a);
+        let stream = stream.clone();
+        let payload = Bytes::from(format!(r#"{{"i":{}}}"#, i));
+        handles.push(tokio::spawn(async move {
+            mesh.send_with_retry(&stream, &[payload], 64).await
+        }));
+    }
+    for h in handles {
+        h.await
+            .unwrap()
+            .expect("send_with_retry must eventually succeed");
+    }
+
+    // After the storm, the window should be fully released.
+    let stats = a.stream_stats(nid_b, 8888).expect("stream stats");
+    assert_eq!(stats.tx_inflight, 0);
+
+    Arc::try_unwrap(a).ok().unwrap().shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }

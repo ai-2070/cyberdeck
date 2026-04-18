@@ -125,6 +125,52 @@ node = NetNode(
 )
 ```
 
+## Mesh Streams (multi-peer + back-pressure)
+
+For direct peer-to-peer messaging — open a stream to a specific peer
+and catch back-pressure as a first-class exception:
+
+```python
+from net_sdk import MeshNode, BackpressureError, NotConnectedError
+
+node = MeshNode(bind_addr='127.0.0.1:9000', psk='00' * 32)
+# ... handshake (node.connect(...) / node.accept(...)) ...
+
+stream = node.open_stream(
+    peer_node_id=peer_id,
+    stream_id=0x42,
+    reliability='reliable',
+    window_bytes=256,    # max in-flight packets before BackpressureError
+)
+
+# Three canonical daemon patterns:
+
+# 1. Drop on pressure — best for telemetry / sampled streams.
+try:
+    node.send_on_stream(stream, [b'{}'])
+except BackpressureError:
+    metrics.inc('stream.backpressure_drops')
+except NotConnectedError:
+    # peer gone or stream closed — reopen if needed
+    pass
+
+# 2. Retry with exponential backoff (5 ms → 200 ms, up to max_retries).
+node.send_with_retry(stream, [b'{}'], max_retries=8)
+
+# 3. Block until the network lets up (bounded retry, ~13 min worst case).
+# Releases the GIL for the duration, so other Python threads keep running.
+node.send_blocking(stream, [b'{}'])
+
+# Live stats — tx/rx seq, in-flight, window, backpressure count.
+stats = node.stream_stats(peer_id, 0x42)
+```
+
+Both exceptions inherit from `Exception` and are re-exported from
+`net_sdk`, so `try`/`except` works as expected. The transport never
+retries or buffers on its own behalf — the helper methods are
+opt-in policies, not defaults. See `docs/TRANSPORT.md` for the full
+contract.
+
 ## API
 
 | Method | Description |

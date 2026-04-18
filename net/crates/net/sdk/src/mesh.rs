@@ -11,7 +11,7 @@
 //! use net_sdk::mesh::{Mesh, MeshBuilder};
 //!
 //! # async fn example() -> net_sdk::error::Result<()> {
-//! let mut node = Mesh::builder("127.0.0.1:9000", b"my-32-byte-preshared-key-here!!")
+//! let mut node = Mesh::builder("127.0.0.1:9000", b"my-32-byte-preshared-key-here!!!")?
 //!     .heartbeat_ms(200)
 //!     .session_timeout_ms(5000)
 //!     .build()
@@ -40,7 +40,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use serde::Serialize;
 
-use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, MigrationSubprotocolHandler};
+use net::adapter::net::{
+    EntityKeypair, MeshNode, MeshNodeConfig, MigrationSubprotocolHandler, Stream, StreamConfig,
+    StreamStats,
+};
 use net::adapter::Adapter;
 use net::event::StoredEvent;
 
@@ -288,6 +291,78 @@ impl Mesh {
     /// Number of active reroutes (routes using alternates after failure).
     pub fn active_reroutes(&self) -> usize {
         self.node.reroute_policy().active_reroutes()
+    }
+
+    // ---- Streams ----
+
+    /// Open (or look up) a logical stream to a peer. See
+    /// [`net::adapter::net::MeshNode::open_stream`] for the full contract.
+    /// Repeated calls for the same `(peer, stream_id)` are idempotent;
+    /// the first open wins and subsequent configs are logged and
+    /// ignored.
+    pub fn open_stream(
+        &self,
+        peer_node_id: u64,
+        stream_id: u64,
+        config: StreamConfig,
+    ) -> Result<Stream> {
+        self.node
+            .open_stream(peer_node_id, stream_id, config)
+            .map_err(SdkError::from)
+    }
+
+    /// Close a stream: drop its `StreamState` and free the window. Idempotent.
+    pub fn close_stream(&self, peer_node_id: u64, stream_id: u64) {
+        self.node.close_stream(peer_node_id, stream_id);
+    }
+
+    /// Send a batch of events on an explicit stream.
+    ///
+    /// Returns [`SdkError::Backpressure`] when the stream's per-stream
+    /// in-flight window is full (no events were sent — the caller
+    /// decides whether to drop, retry, or buffer). [`SdkError::NotConnected`]
+    /// when the peer session is gone. All other failures surface as
+    /// [`SdkError::Adapter`].
+    pub async fn send_on_stream(&self, stream: &Stream, events: &[Bytes]) -> Result<()> {
+        self.node
+            .send_on_stream(stream, events)
+            .await
+            .map_err(SdkError::from)
+    }
+
+    /// Send events, retrying on `Backpressure` with exponential backoff
+    /// (5 ms → 200 ms, doubling) up to `max_retries` times. Transport
+    /// errors and `NotConnected` are returned immediately.
+    pub async fn send_with_retry(
+        &self,
+        stream: &Stream,
+        events: &[Bytes],
+        max_retries: usize,
+    ) -> Result<()> {
+        self.node
+            .send_with_retry(stream, events, max_retries)
+            .await
+            .map_err(SdkError::from)
+    }
+
+    /// Block the calling task until the send succeeds or a transport
+    /// error occurs. See [`Mesh::send_with_retry`] for finer control.
+    pub async fn send_blocking(&self, stream: &Stream, events: &[Bytes]) -> Result<()> {
+        self.node
+            .send_blocking(stream, events)
+            .await
+            .map_err(SdkError::from)
+    }
+
+    /// Snapshot of per-stream stats (tx/rx seq, window, in-flight,
+    /// backpressure count, activity).
+    pub fn stream_stats(&self, peer_node_id: u64, stream_id: u64) -> Option<StreamStats> {
+        self.node.stream_stats(peer_node_id, stream_id)
+    }
+
+    /// Snapshot stats for every stream in the session to `peer_node_id`.
+    pub fn all_stream_stats(&self, peer_node_id: u64) -> Vec<(u64, StreamStats)> {
+        self.node.all_stream_stats(peer_node_id)
     }
 
     // ---- Lifecycle ----

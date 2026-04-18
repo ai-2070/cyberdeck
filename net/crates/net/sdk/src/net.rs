@@ -80,7 +80,7 @@ pub struct PollResponse {
 ///
 /// let response = node.poll(net_sdk::PollRequest { limit: 100, ..Default::default() }).await?;
 /// for event in &response.events {
-///     println!("{}", event.raw_str());
+///     println!("{}", event.raw_str().unwrap_or("<non-utf8>"));
 /// }
 ///
 /// node.shutdown().await?;
