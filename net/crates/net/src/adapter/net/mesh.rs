@@ -753,11 +753,19 @@ impl MeshNode {
                     return;
                 }
 
-                // Resolve the direct peer that forwarded this
-                // pingwave. If `source` isn't a registered peer
-                // (shouldn't happen post-handshake, but defensively),
-                // we can't split-horizon or attribute edges.
-                let from_node_id = ctx.addr_to_node.get(&source).map(|e| *e.value());
+                // DV loop-avoidance rule 4: only accept pingwaves
+                // from registered direct peers. An unknown source
+                // addr means either (a) a stale packet from before
+                // a handshake was torn down, (b) a peer that never
+                // handshaked, or (c) an attacker injecting forged
+                // pingwaves. In all three cases we refuse to install
+                // route or graph state — otherwise an unauthenticated
+                // sender could poison our routing table by claiming
+                // to be a next-hop for arbitrary origins.
+                let from_node_id = match ctx.addr_to_node.get(&source) {
+                    Some(e) => *e.value(),
+                    None => return,
+                };
 
                 // Install an indirect route `(origin, via=source)`
                 // with metric `hop_count + 2`. The `+2` keeps direct
@@ -770,13 +778,10 @@ impl MeshNode {
                     .add_route_with_metric(origin_nid, source, metric);
 
                 // Hand to the proximity graph to update nodes +
-                // edges. If we couldn't resolve the sender's
-                // node_id, fall back to the origin's graph id —
-                // the edge insert inside `on_pingwave` skips the
-                // self-loop case automatically.
-                let from_graph_id = from_node_id
-                    .map(node_id_to_graph_id)
-                    .unwrap_or(pw.origin_id);
+                // edges. `source` is guaranteed registered at this
+                // point, so `from_graph_id` faithfully attributes
+                // the edge to the forwarding peer's node_id.
+                let from_graph_id = node_id_to_graph_id(from_node_id);
                 if let Some(fwd_pw) =
                     ctx.proximity_graph
                         .on_pingwave_from(pw, from_graph_id, source)

@@ -632,18 +632,25 @@ impl ProximityGraph {
     /// from the heartbeat-loop tick alongside `RoutingTable::sweep_stale`
     /// so the graph and the routing table age out in lockstep. Returns
     /// the number of edges removed.
+    ///
+    /// Uses `DashMap::retain` so the staleness check + remove is
+    /// atomic per entry. A collect-stale-keys-then-remove shape would
+    /// race with concurrent pingwave receipt: another thread could
+    /// refresh an edge's `last_updated` between the collect and
+    /// remove phases, and we'd delete a freshly-alive edge.
     pub fn sweep_stale_edges(&self, max_age: Duration) -> usize {
-        let cutoff = Instant::now().checked_sub(max_age);
-        let stale: Vec<(NodeId, NodeId)> = self
-            .edges
-            .iter()
-            .filter(|e| cutoff.map(|c| e.value().last_updated < c).unwrap_or(false))
-            .map(|e| *e.key())
-            .collect();
-        let removed = stale.len();
-        for key in stale {
-            self.edges.remove(&key);
-        }
+        let cutoff = match Instant::now().checked_sub(max_age) {
+            Some(c) => c,
+            None => return 0,
+        };
+        let mut removed = 0usize;
+        self.edges.retain(|_, edge| {
+            let is_stale = edge.last_updated < cutoff;
+            if is_stale {
+                removed += 1;
+            }
+            !is_stale
+        });
         removed
     }
 
