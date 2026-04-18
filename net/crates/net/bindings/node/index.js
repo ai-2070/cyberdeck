@@ -577,9 +577,11 @@ if (!nativeBinding) {
 
 module.exports = nativeBinding
 module.exports.MemoriesAdapter = nativeBinding.MemoriesAdapter
+module.exports.MemoryWatchIter = nativeBinding.MemoryWatchIter
 module.exports.Net = nativeBinding.Net
 module.exports.Redex = nativeBinding.Redex
 module.exports.TasksAdapter = nativeBinding.TasksAdapter
+module.exports.TaskWatchIter = nativeBinding.TaskWatchIter
 module.exports.MemoriesOrderBy = nativeBinding.MemoriesOrderBy
 module.exports.TasksOrderBy = nativeBinding.TasksOrderBy
 module.exports.TaskStatus = nativeBinding.TaskStatus

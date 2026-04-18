@@ -8,11 +8,27 @@ import { describe, expect, it } from 'vitest'
 import {
   MemoriesAdapter,
   MemoriesOrderBy,
+  type MemoryWatchIter,
   Redex,
+  type Task,
   TaskStatus,
   TasksAdapter,
   TasksOrderBy,
+  type TaskWatchIter,
 } from '../index'
+
+// Five-line helper turning the napi iterator into a JS async iterable.
+// Users can paste this into their own code, or we can publish it as
+// part of a companion `@ai2070/net-cortex` package later.
+async function* toAsyncIterable<T>(
+  iter: { next(): Promise<T[] | null> },
+): AsyncGenerator<T[]> {
+  while (true) {
+    const value = await iter.next()
+    if (value === null) return
+    yield value
+  }
+}
 
 const ORIGIN = 0xabcdef01
 
@@ -187,6 +203,134 @@ describe('cortex memories', () => {
     const seq = memories.delete(1n)
     await memories.waitForSeq(seq)
     expect(memories.count()).toBe(0)
+  })
+})
+
+describe('cortex tasks watch', () => {
+  it('emits the initial filter result, then on change', async () => {
+    const redex = new Redex()
+    const tasks = await TasksAdapter.open(redex, ORIGIN)
+
+    // Pre-populate.
+    tasks.create(1n, 'alpha', 100n)
+    const seq = tasks.create(2n, 'beta', 200n)
+    await tasks.waitForSeq(seq)
+
+    const iter = await tasks.watchTasks({
+      status: TaskStatus.Pending,
+      orderBy: TasksOrderBy.IdAsc,
+    })
+
+    // Initial: both are pending.
+    const initial = (await iter.next())!
+    expect(initial.map((t) => t.id)).toEqual([1n, 2n])
+
+    // Complete #1 → pending set shrinks to [2].
+    tasks.complete(1n, 250n)
+    const next = (await iter.next())!
+    expect(next.map((t) => t.id)).toEqual([2n])
+
+    iter.close()
+  })
+
+  it('close() terminates pending next() with null', async () => {
+    const redex = new Redex()
+    const tasks = await TasksAdapter.open(redex, ORIGIN)
+
+    const iter = await tasks.watchTasks(null)
+    // Initial emission (empty).
+    const initial = (await iter.next())!
+    expect(initial).toEqual([])
+
+    // Nothing is coming — schedule a close then wait for next() to
+    // resolve to null.
+    const nextPromise = iter.next()
+    iter.close()
+    expect(await nextPromise).toBeNull()
+
+    // Subsequent next() calls stay null too.
+    expect(await iter.next()).toBeNull()
+  })
+
+  it('for-await-of via toAsyncIterable helper', async () => {
+    // Fast-fire events can coalesce into a single emission after the
+    // initial — the watcher only emits when the filter result CHANGES
+    // from the last emission, and two quick creates may produce just
+    // one [1,2] emission if the second arrives before the first is
+    // flushed. So instead of asserting exact emission count, we check
+    // that we observed the empty initial AND the target final state.
+    const redex = new Redex()
+    const tasks = await TasksAdapter.open(redex, ORIGIN)
+
+    const iter: TaskWatchIter = await tasks.watchTasks({
+      status: TaskStatus.Pending,
+    })
+
+    const seen = new Set<string>()
+    const stateKey = (ts: Task[]) =>
+      ts
+        .map((t) => String(t.id))
+        .sort()
+        .join(',')
+
+    const task = (async () => {
+      for await (const current of toAsyncIterable<Task>(iter)) {
+        seen.add(stateKey(current))
+        if (stateKey(current) === '1,2') {
+          iter.close()
+        }
+      }
+    })()
+
+    tasks.create(1n, 'a', 100n)
+    tasks.create(2n, 'b', 200n)
+    await task
+
+    // Initial empty + final two-item state must both have been observed.
+    expect(seen.has('')).toBe(true)
+    expect(seen.has('1,2')).toBe(true)
+  })
+})
+
+describe('cortex memories watch', () => {
+  it('emits on tag change and dedupes unchanged events', async () => {
+    const redex = new Redex()
+    const memories = await MemoriesAdapter.open(redex, ORIGIN)
+
+    const iter = await memories.watchMemories({ tag: 'urgent' })
+
+    // Initial: empty.
+    expect((await iter.next())!).toEqual([])
+
+    // Store memory NOT tagged urgent → no emit.
+    memories.store(1n, 'routine', ['later'], 'alice', 100n)
+
+    // Store memory tagged urgent → emit [2].
+    memories.store(2n, 'fire', ['urgent'], 'alice', 200n)
+    const a = (await iter.next())!
+    expect(a.map((m) => m.id)).toEqual([2n])
+
+    // Retag #1 to include urgent → emit [1, 2].
+    memories.retag(1n, ['urgent', 'later'], 300n)
+    const b = (await iter.next())!
+    const ids = b.map((m) => m.id).sort()
+    expect(ids).toEqual([1n, 2n])
+
+    iter.close()
+  })
+
+  it('close() is idempotent and for-await helper exits cleanly', async () => {
+    const redex = new Redex()
+    const memories = await MemoriesAdapter.open(redex, ORIGIN)
+
+    const iter: MemoryWatchIter = await memories.watchMemories({
+      pinned: true,
+    })
+    iter.close()
+    iter.close() // idempotent — no throw.
+
+    // next() returns null promptly because shutdown has already fired.
+    expect(await iter.next()).toBeNull()
   })
 })
 

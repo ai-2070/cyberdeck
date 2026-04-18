@@ -13,10 +13,14 @@
 //! Watch / `AsyncIterator` is deliberately deferred — the JS async
 //! iterator glue lands in a follow-up session.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use tokio::sync::{Mutex as TokioMutex, Notify};
 
 use ::net::adapter::net::cortex::memories::{
     MemoriesAdapter as InnerMemoriesAdapter, Memory as InnerMemory, OrderBy as InnerMemoriesOrderBy,
@@ -136,7 +140,8 @@ impl From<InnerTask> for Task {
     }
 }
 
-/// Filter for [`TasksAdapter::list_tasks`].
+/// Filter for [`TasksAdapter::list_tasks`] and
+/// [`TasksAdapter::watch_tasks`].
 #[napi(object)]
 pub struct TaskFilter {
     pub status: Option<TaskStatus>,
@@ -147,6 +152,84 @@ pub struct TaskFilter {
     pub updated_before_ns: Option<BigInt>,
     pub order_by: Option<TasksOrderBy>,
     pub limit: Option<u32>,
+}
+
+// =========================================================================
+// Task watch iterator (napi)
+// =========================================================================
+
+struct TaskWatchIterInner {
+    stream: TokioMutex<Option<BoxStream<'static, Vec<InnerTask>>>>,
+    shutdown: Notify,
+    /// Set by `close()` before notifying. `next()` pre-checks this
+    /// flag so a close that races ahead of `next()` is still observed
+    /// (raw `Notify::notify_waiters` only wakes currently-registered
+    /// waiters).
+    is_shutdown: AtomicBool,
+}
+
+/// Async iterator over a live task filter.
+///
+/// Rust returns `null` from [`Self::next`] when the underlying
+/// watcher ends; JS should treat that as `done: true`. Paired with
+/// the JS helper in the test suite below, this cleanly wraps into a
+/// `for await (const tasks of ...)` loop.
+#[napi]
+pub struct TaskWatchIter {
+    inner: Arc<TaskWatchIterInner>,
+}
+
+#[napi]
+impl TaskWatchIter {
+    /// Wait for the next filter result. Returns `null` when the
+    /// iterator has been closed or the underlying stream has ended.
+    #[napi]
+    pub async fn next(&self) -> Option<Vec<Task>> {
+        if self.inner.is_shutdown.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut guard = self.inner.stream.lock().await;
+        let stream = match guard.as_mut() {
+            Some(s) => s,
+            None => return None,
+        };
+
+        // Pre-register the shutdown waker before re-checking the flag
+        // so a close that fires between the check and the await is
+        // still observed.
+        let shutdown_fut = self.inner.shutdown.notified();
+        tokio::pin!(shutdown_fut);
+        shutdown_fut.as_mut().enable();
+
+        if self.inner.is_shutdown.load(Ordering::Acquire) {
+            *guard = None;
+            return None;
+        }
+
+        tokio::select! {
+            biased;
+            _ = shutdown_fut => {
+                *guard = None;
+                None
+            }
+            msg = stream.next() => match msg {
+                Some(items) => Some(items.into_iter().map(Task::from).collect()),
+                None => {
+                    *guard = None;
+                    None
+                }
+            }
+        }
+    }
+
+    /// Terminate the iterator early. Any pending `next()` call
+    /// resolves to `null`. Subsequent `next()` calls also return
+    /// `null`. Idempotent.
+    #[napi]
+    pub fn close(&self) {
+        self.inner.is_shutdown.store(true, Ordering::Release);
+        self.inner.shutdown.notify_waiters();
+    }
 }
 
 /// Typed tasks adapter handle.
@@ -269,6 +352,52 @@ impl TasksAdapter {
     pub fn count(&self) -> u32 {
         self.inner.state().read().len() as u32
     }
+
+    /// Open a reactive watcher over the filter. Returns an iterator
+    /// whose `.next()` yields the current filter result on first
+    /// call, then yields again whenever a fold tick produces a
+    /// different filter result (deduplicated).
+    ///
+    /// Declared `async` so the underlying watcher's `tokio::spawn`
+    /// fold-forwarding task runs inside napi's tokio runtime.
+    #[napi]
+    pub async fn watch_tasks(&self, filter: Option<TaskFilter>) -> TaskWatchIter {
+        let mut w = self.inner.watch();
+        if let Some(f) = filter {
+            if let Some(s) = f.status {
+                w = w.where_status(s.into());
+            }
+            if let Some(s) = f.title_contains {
+                w = w.title_contains(s);
+            }
+            if let Some(ns) = f.created_after_ns {
+                w = w.created_after(bigint_u64(ns));
+            }
+            if let Some(ns) = f.created_before_ns {
+                w = w.created_before(bigint_u64(ns));
+            }
+            if let Some(ns) = f.updated_after_ns {
+                w = w.updated_after(bigint_u64(ns));
+            }
+            if let Some(ns) = f.updated_before_ns {
+                w = w.updated_before(bigint_u64(ns));
+            }
+            if let Some(o) = f.order_by {
+                w = w.order_by(o.into());
+            }
+            if let Some(l) = f.limit {
+                w = w.limit(l as usize);
+            }
+        }
+        let stream: BoxStream<'static, Vec<InnerTask>> = w.stream().boxed();
+        TaskWatchIter {
+            inner: Arc::new(TaskWatchIterInner {
+                stream: TokioMutex::new(Some(stream)),
+                shutdown: Notify::new(),
+                is_shutdown: AtomicBool::new(false),
+            }),
+        }
+    }
 }
 
 // =========================================================================
@@ -325,7 +454,8 @@ impl From<InnerMemory> for Memory {
     }
 }
 
-/// Filter for [`MemoriesAdapter::list_memories`]. Tag predicates:
+/// Filter for [`MemoriesAdapter::list_memories`] and
+/// [`MemoriesAdapter::watch_memories`]. Tag predicates:
 ///
 /// - `tag` — must include this exact tag.
 /// - `any_tag` — must include at least one tag from the array.
@@ -344,6 +474,70 @@ pub struct MemoryFilter {
     pub updated_before_ns: Option<BigInt>,
     pub order_by: Option<MemoriesOrderBy>,
     pub limit: Option<u32>,
+}
+
+// =========================================================================
+// Memory watch iterator (napi)
+// =========================================================================
+
+struct MemoryWatchIterInner {
+    stream: TokioMutex<Option<BoxStream<'static, Vec<InnerMemory>>>>,
+    shutdown: Notify,
+    is_shutdown: AtomicBool,
+}
+
+/// Async iterator over a live memory filter.
+#[napi]
+pub struct MemoryWatchIter {
+    inner: Arc<MemoryWatchIterInner>,
+}
+
+#[napi]
+impl MemoryWatchIter {
+    /// Wait for the next filter result. Returns `null` when the
+    /// iterator has been closed or the underlying stream has ended.
+    #[napi]
+    pub async fn next(&self) -> Option<Vec<Memory>> {
+        if self.inner.is_shutdown.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut guard = self.inner.stream.lock().await;
+        let stream = match guard.as_mut() {
+            Some(s) => s,
+            None => return None,
+        };
+
+        let shutdown_fut = self.inner.shutdown.notified();
+        tokio::pin!(shutdown_fut);
+        shutdown_fut.as_mut().enable();
+
+        if self.inner.is_shutdown.load(Ordering::Acquire) {
+            *guard = None;
+            return None;
+        }
+
+        tokio::select! {
+            biased;
+            _ = shutdown_fut => {
+                *guard = None;
+                None
+            }
+            msg = stream.next() => match msg {
+                Some(items) => Some(items.into_iter().map(Memory::from).collect()),
+                None => {
+                    *guard = None;
+                    None
+                }
+            }
+        }
+    }
+
+    /// Terminate the iterator early. Idempotent.
+    #[napi]
+    pub fn close(&self) {
+        self.inner.is_shutdown.store(true, Ordering::Release);
+        self.inner.shutdown.notify_waiters();
+    }
 }
 
 /// Typed memories adapter handle.
@@ -492,5 +686,58 @@ impl MemoriesAdapter {
     #[napi]
     pub fn count(&self) -> u32 {
         self.inner.state().read().len() as u32
+    }
+
+    /// Open a reactive watcher over the filter. See
+    /// [`TasksAdapter::watch_tasks`] for emission semantics.
+    #[napi]
+    pub async fn watch_memories(&self, filter: Option<MemoryFilter>) -> MemoryWatchIter {
+        let mut w = self.inner.watch();
+        if let Some(f) = filter {
+            if let Some(s) = f.source {
+                w = w.where_source(s);
+            }
+            if let Some(s) = f.content_contains {
+                w = w.content_contains(s);
+            }
+            if let Some(tag) = f.tag {
+                w = w.where_tag(tag);
+            }
+            if let Some(tags) = f.any_tag {
+                w = w.where_any_tag(tags);
+            }
+            if let Some(tags) = f.all_tags {
+                w = w.where_all_tags(tags);
+            }
+            if let Some(pinned) = f.pinned {
+                w = w.where_pinned(pinned);
+            }
+            if let Some(ns) = f.created_after_ns {
+                w = w.created_after(bigint_u64(ns));
+            }
+            if let Some(ns) = f.created_before_ns {
+                w = w.created_before(bigint_u64(ns));
+            }
+            if let Some(ns) = f.updated_after_ns {
+                w = w.updated_after(bigint_u64(ns));
+            }
+            if let Some(ns) = f.updated_before_ns {
+                w = w.updated_before(bigint_u64(ns));
+            }
+            if let Some(o) = f.order_by {
+                w = w.order_by(o.into());
+            }
+            if let Some(l) = f.limit {
+                w = w.limit(l as usize);
+            }
+        }
+        let stream: BoxStream<'static, Vec<InnerMemory>> = w.stream().boxed();
+        MemoryWatchIter {
+            inner: Arc::new(MemoryWatchIterInner {
+                stream: TokioMutex::new(Some(stream)),
+                shutdown: Notify::new(),
+                is_shutdown: AtomicBool::new(false),
+            }),
+        }
     }
 }

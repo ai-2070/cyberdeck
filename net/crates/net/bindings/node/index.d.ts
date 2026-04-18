@@ -33,6 +33,22 @@ export declare class MemoriesAdapter {
   listMemories(filter?: MemoryFilter | undefined | null): Array<Memory>
   /** Total memory count in current state (ignores any filter). */
   count(): number
+  /**
+   * Open a reactive watcher over the filter. See
+   * [`TasksAdapter::watch_tasks`] for emission semantics.
+   */
+  watchMemories(filter?: MemoryFilter | undefined | null): Promise<MemoryWatchIter>
+}
+
+/** Async iterator over a live memory filter. */
+export declare class MemoryWatchIter {
+  /**
+   * Wait for the next filter result. Returns `null` when the
+   * iterator has been closed or the underlying stream has ended.
+   */
+  next(): Promise<Array<Memory> | null>
+  /** Terminate the iterator early. Idempotent. */
+  close(): void
 }
 
 /**
@@ -195,6 +211,38 @@ export declare class TasksAdapter {
   listTasks(filter?: TaskFilter | undefined | null): Array<Task>
   /** Total task count in current state (ignores any filter). */
   count(): number
+  /**
+   * Open a reactive watcher over the filter. Returns an iterator
+   * whose `.next()` yields the current filter result on first
+   * call, then yields again whenever a fold tick produces a
+   * different filter result (deduplicated).
+   *
+   * Declared `async` so the underlying watcher's `tokio::spawn`
+   * fold-forwarding task runs inside napi's tokio runtime.
+   */
+  watchTasks(filter?: TaskFilter | undefined | null): Promise<TaskWatchIter>
+}
+
+/**
+ * Async iterator over a live task filter.
+ *
+ * Rust returns `null` from [`Self::next`] when the underlying
+ * watcher ends; JS should treat that as `done: true`. Paired with
+ * the JS helper in the test suite below, this cleanly wraps into a
+ * `for await (const tasks of ...)` loop.
+ */
+export declare class TaskWatchIter {
+  /**
+   * Wait for the next filter result. Returns `null` when the
+   * iterator has been closed or the underlying stream has ended.
+   */
+  next(): Promise<Array<Task> | null>
+  /**
+   * Terminate the iterator early. Any pending `next()` call
+   * resolves to `null`. Subsequent `next()` calls also return
+   * `null`. Idempotent.
+   */
+  close(): void
 }
 
 /** Configuration options for creating an EventBus. */
@@ -274,7 +322,8 @@ export interface Memory {
 }
 
 /**
- * Filter for [`MemoriesAdapter::list_memories`]. Tag predicates:
+ * Filter for [`MemoriesAdapter::list_memories`] and
+ * [`MemoriesAdapter::watch_memories`]. Tag predicates:
  *
  * - `tag` — must include this exact tag.
  * - `any_tag` — must include at least one tag from the array.
@@ -410,7 +459,10 @@ export interface Task {
   updatedNs: bigint
 }
 
-/** Filter for [`TasksAdapter::list_tasks`]. */
+/**
+ * Filter for [`TasksAdapter::list_tasks`] and
+ * [`TasksAdapter::watch_tasks`].
+ */
 export interface TaskFilter {
   status?: TaskStatus
   titleContains?: string

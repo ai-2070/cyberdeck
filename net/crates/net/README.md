@@ -662,7 +662,7 @@ cargo test --test integration_cortex_memories --features "cortex-memories cortex
 # Rust SDK smoke tests (2 async + 3 doctests)
 cargo test --features net -p net-sdk
 
-# Node SDK smoke tests (9 tests — CortEX tasks + memories over napi)
+# Node SDK smoke tests (14 tests — CortEX tasks + memories over napi, incl. watch/AsyncIterator)
 cd bindings/node && npx napi build --platform --no-default-features -F cortex && npx vitest run
 
 # Backend adapters (requires running services)
@@ -670,7 +670,7 @@ cargo test --test integration_redis --features redis
 cargo test --test integration_jetstream --features jetstream
 ```
 
-**1,123 tests total across the Rust stack** — lib + migration + three_node + integration_net + integration_redex + integration_cortex_{adapter,tasks,memories} + SDK. Plus 9 Node SDK smoke tests via vitest.
+**1,123 tests total across the Rust stack** — lib + migration + three_node + integration_net + integration_redex + integration_cortex_{adapter,tasks,memories} + SDK. Plus 14 Node SDK smoke tests via vitest (CRUD, queries, watch/AsyncIterator, multi-model).
 
 ### Test Architecture
 
