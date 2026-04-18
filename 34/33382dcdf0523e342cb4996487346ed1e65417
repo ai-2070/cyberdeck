@@ -1,0 +1,36 @@
+net/crates/net/docs/STREAM_MULTIPLEXING_PLAN.md
+  f3669361474f4cb8 43,104,106,108,110-112,114,116,150-153,156,177,179-181,225,227,229-232,234
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "3433382dcdf0523e342cb4996487346ed1e65417",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 70,
+      "overriden_lines": 0
+    },
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 25,
+      "total_deletions": 20,
+      "accepted_lines": 25,
+      "overriden_lines": 0
+    }
+  }
+}
