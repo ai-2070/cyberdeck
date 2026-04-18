@@ -196,11 +196,38 @@ pub struct RoutingHeader {  // 16 bytes
 
 **Reroute.** When the failure detector marks a peer failed, `ReroutePolicy::on_failure` walks the table's affected entries (entries whose `next_hop` matches the failed addr) and resolves a new next-hop in this order:
 
-1. `RoutingTable::lookup_alternate(dest, exclude=failed_addr)` — returns the current entry if its next-hop isn't the excluded one. Today's single-entry-per-dest table returns `None` for affected entries; forward-compat scaffolding for a future multi-route table.
+1. `RoutingTable::lookup_alternate(dest, exclude=failed_addr)` — returns the current entry if its next-hop isn't the excluded one. With the single-route-per-destination table this returns `None` whenever the affected entry *is* the failed-peer entry, which is the common case; the method is kept for clean API shape, not as a door to a deeper cache (see "Routing philosophy" below).
 2. `ProximityGraph::path_to(dest)` — BFS over the topology graph. Returns the first hop of a path that isn't the failed node AND is a direct peer of ours.
 3. Any direct peer that isn't the failed one — last-resort fallback. Best-effort; if it can't reach the destination, the failure detector will catch it on the next cycle.
 
 The original `next_hop` is preserved in `saved_routes` so `on_recovery` can restore the pre-failure route when the failed peer comes back.
+
+### Routing philosophy
+
+Net's routing plane is deliberately minimal: pingwaves drive installation, the `RoutingTable` holds **one best route per destination**, and `ProximityGraph` is a helper that can *recompute* paths when needed — never a second source of truth for the fast path. This is a design choice, not an unfinished optimization.
+
+**What this gives us.** Fast multi-hop routing with no separate control plane. Routing state that fits in a single `DashMap` entry per destination. Recomputation from pingwaves that completes in microseconds at our target scales. A fast path (`send_routed`) that only ever consults one data structure — no ranking, no cache-miss fallback, no stale-vs-fresh reconciliation.
+
+**Why one route per destination, deliberately.** The tempting alternative is a ranked alternates list, or a full TCP-Cubic-style persistent path cache, or an IGP-style link-state database where every node holds the whole topology. We chose not to go there. The reasoning:
+
+- In the **common case** (99% of the time), recomputing a path from fresh pingwaves + the local graph is so cheap that cached alternates save nanoseconds of decision time at the cost of real state. Not worth it.
+- In the **catastrophic case** (the 1% that actually matter — a vehicle losing its primary compute, a site losing half its links in a storm, an RF environment going hostile), an entire class of previously-good routes can become wrong at once. A deep cache of alternates is now a liability: it surfaces **stale confidence** into the fast path, hides the fact that there is currently no safe route, and delays convergence while the cache ages out entry by entry.
+
+Our bias: **"I don't know how to route this right now" is a better answer than "here's a route that was fine 5 seconds ago."** Recompute converges in a heartbeat interval; stale confidence can hide for as long as the TTL allows.
+
+The failure mode this defends against is not "routing loops" or "black holes" specifically — those are bounded by TTL, `MAX_HOPS`, and split horizon regardless of table depth. The failure mode is **stale confidence**: the system holding a plausible-looking wrong answer for longer than convergence would have taken to produce a correct one.
+
+**Graph as helper, not second truth.** `ProximityGraph` is an input to `RoutingTable` (pingwaves update both) and a fallback for `ReroutePolicy` (when the table has no usable alternate). It is never consulted on the fast path. There are not two sources of truth about routing — only one, with a derivation path that feeds it.
+
+**What we are not building.** Persistent multi-route caches (TCP-Cubic-style), link-state databases (OSPF-style — every node holding the whole graph), path-vector attribute lists (BGP-style), or ECMP ranking tables. All of these trade recomputation cost for cached state. At Net's scale the trade doesn't pencil out, and the cache's behavior under fast-changing topology is exactly where these systems tend to ship bugs. A simple, recomputable routing plane is cheaper to reason about and safer under the failures we actually care about.
+
+**Behavior under failure, summarized.**
+
+- Next-hop peer dies → table entries through it are rerouted via the graph or marked unreachable. Fast-path callers get `Err` until convergence; `send_with_retry` / `send_blocking` absorb the gap.
+- Half the mesh disappears → most cached routes are invalid anyway; pingwaves from the surviving subset rebuild a fresh picture within a few heartbeat intervals; the interim state is "no route," which is honest.
+- Origin goes quiet → route for that origin ages out via `sweep_stale`; graph edges age out via `sweep_stale_edges` in lockstep. No separate invalidation message needed.
+
+Predictable in the common case, safer in the catastrophic one.
 
 ## Reliability
 
