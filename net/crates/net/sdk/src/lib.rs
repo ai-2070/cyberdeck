@@ -36,6 +36,8 @@
 
 pub mod config;
 pub mod error;
+#[cfg(feature = "net")]
+pub mod mesh;
 mod net;
 pub mod stream;
 
@@ -63,6 +65,9 @@ pub use ::net::config::JetStreamAdapterConfig;
 
 #[cfg(feature = "net")]
 pub use ::net::adapter::net::NetAdapterConfig;
+
+#[cfg(feature = "net")]
+pub use crate::mesh::{Mesh, MeshBuilder};
 
 impl NetBuilder {
     /// Build and start the node.
