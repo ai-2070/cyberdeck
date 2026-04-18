@@ -856,14 +856,21 @@ mod mesh_bindings {
     }
 
     /// Snapshot of per-stream stats.
+    ///
+    /// u64 fields are exposed as `BigInt` so values outside the JS
+    /// safe-integer range (notably `last_activity_ns`, which is
+    /// Unix-epoch nanoseconds and always well above `2^53`) don't
+    /// lose precision or trip the TS SDK's safe-integer guard. The
+    /// two u32 fields (`tx_inflight`, `tx_window`) are safe as
+    /// regular numbers.
     #[napi(object)]
     pub struct NetStreamStats {
-        pub tx_seq: i64,
-        pub rx_seq: i64,
-        pub inbound_pending: i64,
-        pub last_activity_ns: i64,
+        pub tx_seq: BigInt,
+        pub rx_seq: BigInt,
+        pub inbound_pending: BigInt,
+        pub last_activity_ns: BigInt,
         pub active: bool,
-        pub backpressure_events: i64,
+        pub backpressure_events: BigInt,
         pub tx_inflight: u32,
         pub tx_window: u32,
     }
@@ -1308,12 +1315,12 @@ mod mesh_bindings {
             Ok(node
                 .stream_stats(peer_u64, stream_u64)
                 .map(|s| NetStreamStats {
-                    tx_seq: s.tx_seq as i64,
-                    rx_seq: s.rx_seq as i64,
-                    inbound_pending: s.inbound_pending as i64,
-                    last_activity_ns: s.last_activity_ns as i64,
+                    tx_seq: BigInt::from(s.tx_seq),
+                    rx_seq: BigInt::from(s.rx_seq),
+                    inbound_pending: BigInt::from(s.inbound_pending),
+                    last_activity_ns: BigInt::from(s.last_activity_ns),
                     active: s.active,
-                    backpressure_events: s.backpressure_events as i64,
+                    backpressure_events: BigInt::from(s.backpressure_events),
                     tx_inflight: s.tx_inflight,
                     tx_window: s.tx_window,
                 }))

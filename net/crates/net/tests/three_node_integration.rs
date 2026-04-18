@@ -3946,6 +3946,29 @@ async fn test_regression_send_on_stream_rejects_closed_stream() {
         "send on closed stream must NOT revive the stream"
     );
 
+    // Now the trickier case: close a stream, reopen it with fresh
+    // config, and verify the ORIGINAL stale handle still refuses to
+    // operate on the new stream. The new `Stream` handle works
+    // normally; only the stale one is inert.
+    let fresh = a
+        .open_stream(
+            nid_b,
+            123,
+            StreamConfig::new().with_reliability(Reliability::FireAndForget),
+        )
+        .unwrap();
+    let stale_result = a
+        .send_on_stream(&stream, &[Bytes::from_static(b"{}")])
+        .await;
+    assert!(
+        matches!(stale_result, Err(StreamError::NotConnected)),
+        "stale handle from pre-reopen lifetime must still refuse; got {:?}",
+        stale_result
+    );
+    a.send_on_stream(&fresh, &[Bytes::from_static(b"{}")])
+        .await
+        .expect("fresh handle after reopen must work");
+
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
 }

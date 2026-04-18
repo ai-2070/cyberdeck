@@ -326,13 +326,18 @@ export class MeshNode {
       toSafeNumber('streamId', streamId),
     );
     if (!raw) return null;
+    // The napi binding marshals the u64 fields as `BigInt` so values
+    // that exceed `Number.MAX_SAFE_INTEGER` — especially
+    // `lastActivityNs`, which is Unix-epoch nanoseconds and is always
+    // well above 2^53 — survive the boundary without a precision
+    // trap. The two u32 fields stay as regular numbers.
     return {
-      txSeq: fromSafeNumber('stats.txSeq', raw.txSeq),
-      rxSeq: fromSafeNumber('stats.rxSeq', raw.rxSeq),
-      inboundPending: fromSafeNumber('stats.inboundPending', raw.inboundPending),
-      lastActivityNs: fromSafeNumber('stats.lastActivityNs', raw.lastActivityNs),
+      txSeq: raw.txSeq,
+      rxSeq: raw.rxSeq,
+      inboundPending: raw.inboundPending,
+      lastActivityNs: raw.lastActivityNs,
       active: raw.active,
-      backpressureEvents: fromSafeNumber('stats.backpressureEvents', raw.backpressureEvents),
+      backpressureEvents: raw.backpressureEvents,
       txInflight: raw.txInflight,
       txWindow: raw.txWindow,
     };

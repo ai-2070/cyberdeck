@@ -1196,4 +1196,88 @@ mod tests {
             "forget() skips the Drop release"
         );
     }
+
+    #[test]
+    fn test_regression_guard_drop_after_reopen_does_not_corrupt_new_stream() {
+        // Regression: `TxSlotGuard::drop` used to release by
+        // `stream_id` only. A stale guard whose stream was closed and
+        // reopened with the same id would decrement `tx_inflight` on
+        // the NEW stream — which never issued the slot — silently
+        // corrupting backpressure accounting.
+        //
+        // Fix: the guard captures the `StreamState`'s epoch at
+        // acquire time, and releases only when the live state's
+        // epoch still matches.
+        let sid = 0x42u64;
+        let session = session_with_stream(sid, 2);
+
+        // Acquire a guard on the first state.
+        let g = match session.try_acquire_tx_slot_guard(sid) {
+            TxAdmit::Acquired(g) => g,
+            other => panic!("expected Acquired, got {:?}", other),
+        };
+        let first_epoch = g.epoch_for_test();
+        assert_eq!(session.try_stream(sid).unwrap().tx_inflight(), 1);
+
+        // Close + reopen → fresh state with a new epoch.
+        session.close_stream(sid);
+        session.open_stream_full(sid, false, 1, 2);
+        let second_epoch = session.try_stream(sid).unwrap().epoch();
+        assert_ne!(first_epoch, second_epoch, "reopen allocates a new epoch");
+        assert_eq!(
+            session.try_stream(sid).unwrap().tx_inflight(),
+            0,
+            "the new stream has no in-flight packets"
+        );
+
+        // Drop the stale guard. If the epoch check regresses, this
+        // decrements into an underflow-protected 0 on the NEW
+        // stream's counter, violating accounting.
+        drop(g);
+        assert_eq!(
+            session.try_stream(sid).unwrap().tx_inflight(),
+            0,
+            "stale guard must NOT decrement the new stream's counter"
+        );
+    }
+
+    #[test]
+    fn test_regression_acquire_with_expected_epoch_rejects_after_reopen() {
+        // Regression pair: `send_on_stream` through the typed handle
+        // must reject acquisitions whose handle's epoch is stale —
+        // otherwise a handle held across close+reopen would happily
+        // admit against the new stream's state, using the new
+        // stream's config instead of the one the caller believes
+        // they have.
+        let sid = 0x88u64;
+        let session = session_with_stream(sid, 2);
+        let original_epoch = session.try_stream(sid).unwrap().epoch();
+
+        // Close + reopen → new epoch.
+        session.close_stream(sid);
+        session.open_stream_full(sid, false, 1, 2);
+
+        // Acquisition with the original (stale) epoch must be
+        // rejected as if the stream were closed.
+        assert!(matches!(
+            session.try_acquire_tx_slot_guard_matching_epoch(sid, original_epoch),
+            TxAdmit::StreamClosed
+        ));
+        // No side effect on the new stream's counter.
+        assert_eq!(session.try_stream(sid).unwrap().tx_inflight(), 0);
+
+        // Acquisition with the *current* epoch succeeds.
+        let cur_epoch = session.try_stream(sid).unwrap().epoch();
+        assert!(matches!(
+            session.try_acquire_tx_slot_guard_matching_epoch(sid, cur_epoch),
+            TxAdmit::Acquired(_)
+        ));
+    }
+
+    impl TxSlotGuard {
+        /// Test-only accessor for the captured epoch.
+        fn epoch_for_test(&self) -> u64 {
+            self.epoch
+        }
+    }
 }
