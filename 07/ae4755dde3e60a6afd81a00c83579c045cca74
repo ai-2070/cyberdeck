@@ -1,0 +1,44 @@
+net/crates/net/src/adapter/net/stream.rs
+  f3669361474f4cb8 166-176
+net/crates/net/src/adapter/net/mesh.rs
+  f3669361474f4cb8 1982-1987,2030-2035,2062-2072,2078-2080,2084-2088,2099-2101,2105-2109,2117-2162,2175-2177,2203-2205
+net/crates/net/src/adapter/net/session.rs
+  f3669361474f4cb8 9,106-114,123-135,142,150-151,157,324-336,347-351,361-363,393-450,829-877
+net/crates/net/docs/TRANSPORT.md
+  f3669361474f4cb8 140-161
+net/crates/net/tests/three_node_integration.rs
+  f3669361474f4cb8 4507-4677
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "07ae4755dde3e60a6afd81a00c83579c045cca74",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 70,
+      "overriden_lines": 0
+    },
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1346,
+      "total_deletions": 8749,
+      "accepted_lines": 462,
+      "overriden_lines": 0
+    }
+  }
+}
