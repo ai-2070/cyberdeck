@@ -46,6 +46,8 @@ mod protocol;
 mod proxy;
 #[cfg(feature = "redex")]
 pub mod redex;
+#[cfg(feature = "cortex-adapter")]
+pub mod cortex;
 mod reliability;
 mod reroute;
 mod route;
@@ -104,6 +106,11 @@ pub use proxy::{
 #[cfg(feature = "redex")]
 pub use redex::{
     Redex, RedexEntry, RedexError, RedexEvent, RedexFile, RedexFileConfig, RedexFlags, RedexFold,
+};
+#[cfg(feature = "cortex-adapter")]
+pub use cortex::{
+    CortexAdapter, CortexAdapterConfig, CortexAdapterError, EventEnvelope, EventMeta,
+    FoldErrorPolicy, IntoRedexPayload, StartPosition, EVENT_META_SIZE,
 };
 pub use reliability::{FireAndForget, ReliabilityMode, ReliableStream};
 pub use reroute::ReroutePolicy;

@@ -39,6 +39,7 @@ regex = ["dep:regex"]
 ffi = []
 redex = ["net", "dep:tokio-stream", "dep:bincode"]
 redex-disk = ["redex"]
+cortex-adapter = ["redex"]
 
 [dependencies]
 # Async runtime
@@ -140,6 +141,11 @@ required-features = ["net"]
 name = "integration_redex"
 path = "tests/integration_redex.rs"
 required-features = ["redex"]
+
+[[test]]
+name = "integration_cortex_adapter"
+path = "tests/integration_cortex_adapter.rs"
+required-features = ["cortex-adapter"]
 
 [profile.release]
 lto = true
