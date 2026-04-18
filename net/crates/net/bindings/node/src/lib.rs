@@ -1269,11 +1269,7 @@ mod mesh_bindings {
         /// Block the calling JS task until the send succeeds or a
         /// transport error occurs. Unbounded retry on `Backpressure`.
         #[napi]
-        pub async fn send_blocking(
-            &self,
-            stream: &NetStream,
-            events: Vec<Buffer>,
-        ) -> Result<()> {
+        pub async fn send_blocking(&self, stream: &NetStream, events: Vec<Buffer>) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             let payloads: Vec<bytes::Bytes> = events
@@ -1304,8 +1300,9 @@ mod mesh_bindings {
             let stream_u64 = u64::try_from(stream_id).map_err(|_| {
                 Error::from_reason(format!("stream_id must be non-negative; got {}", stream_id))
             })?;
-            Ok(node.stream_stats(peer_u64, stream_u64).map(|s| {
-                NetStreamStats {
+            Ok(node
+                .stream_stats(peer_u64, stream_u64)
+                .map(|s| NetStreamStats {
                     tx_seq: s.tx_seq as i64,
                     rx_seq: s.rx_seq as i64,
                     inbound_pending: s.inbound_pending as i64,
@@ -1314,8 +1311,7 @@ mod mesh_bindings {
                     backpressure_events: s.backpressure_events as i64,
                     tx_inflight: s.tx_inflight,
                     tx_window: s.tx_window,
-                }
-            }))
+                }))
         }
 
         /// Shutdown the mesh node.

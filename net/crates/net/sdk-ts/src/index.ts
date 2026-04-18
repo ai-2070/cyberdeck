@@ -35,6 +35,16 @@ export { EventStream, TypedEventStream } from './stream';
 // Typed channels.
 export { TypedChannel } from './channel';
 
+// Mesh + streams.
+export { MeshNode, BackpressureError, NotConnectedError } from './mesh';
+export type {
+  MeshNodeConfig,
+  MeshStream,
+  StreamConfig,
+  StreamStats,
+  Reliability,
+} from './mesh';
+
 // Types.
 export type {
   NetNodeConfig,
