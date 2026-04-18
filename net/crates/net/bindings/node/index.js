@@ -536,13 +536,17 @@ if (!nativeBinding || process.env.NAPI_RS_FORCE_WASI) {
       wasiBindingError = err
     }
   }
-  if (!nativeBinding) {
+  if (!nativeBinding || process.env.NAPI_RS_FORCE_WASI) {
     try {
       wasiBinding = require('@ai2070/net-wasm32-wasi')
       nativeBinding = wasiBinding
     } catch (err) {
       if (process.env.NAPI_RS_FORCE_WASI) {
-        wasiBindingError.cause = err
+        if (!wasiBindingError) {
+          wasiBindingError = err
+        } else {
+          wasiBindingError.cause = err
+        }
         loadErrors.push(err)
       }
     }
@@ -572,4 +576,10 @@ if (!nativeBinding) {
 }
 
 module.exports = nativeBinding
+module.exports.MemoriesAdapter = nativeBinding.MemoriesAdapter
 module.exports.Net = nativeBinding.Net
+module.exports.Redex = nativeBinding.Redex
+module.exports.TasksAdapter = nativeBinding.TasksAdapter
+module.exports.MemoriesOrderBy = nativeBinding.MemoriesOrderBy
+module.exports.TasksOrderBy = nativeBinding.TasksOrderBy
+module.exports.TaskStatus = nativeBinding.TaskStatus

@@ -41,10 +41,7 @@ pub struct MemoriesWatcher {
 impl MemoriesWatcher {
     /// Build a watcher from the adapter's state handle + change stream.
     /// Intended to be called only by [`super::MemoriesAdapter::watch`].
-    pub(super) fn new(
-        state: Arc<RwLock<MemoriesState>>,
-        changes: BoxStream<'static, u64>,
-    ) -> Self {
+    pub(super) fn new(state: Arc<RwLock<MemoriesState>>, changes: BoxStream<'static, u64>) -> Self {
         Self {
             state,
             changes,

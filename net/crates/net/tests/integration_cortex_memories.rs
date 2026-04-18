@@ -343,9 +343,7 @@ async fn test_watch_emits_on_tag_change() {
     assert_eq!(ids, vec![1, 2]);
 
     // Retag #2 to drop "urgent" → drops out of filter; emission [1].
-    memories
-        .retag(2, vec!["resolved".into()], 400)
-        .unwrap();
+    memories.retag(2, vec!["resolved".into()], 400).unwrap();
     let next = stream.next().await.unwrap();
     assert_eq!(next.len(), 1);
     assert_eq!(next[0].id, 1);
@@ -396,10 +394,8 @@ async fn test_watch_multiple_subscribers_independent() {
     let redex = Redex::new();
     let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
 
-    let mut pinned_stream =
-        Box::pin(memories.watch().where_pinned(true).stream());
-    let mut tagged_stream =
-        Box::pin(memories.watch().where_tag("flagged").stream());
+    let mut pinned_stream = Box::pin(memories.watch().where_pinned(true).stream());
+    let mut tagged_stream = Box::pin(memories.watch().where_tag("flagged").stream());
 
     // Both emit empty initial.
     assert!(pinned_stream.next().await.unwrap().is_empty());
