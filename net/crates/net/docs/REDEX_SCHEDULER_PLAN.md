@@ -2,7 +2,31 @@
 
 ## Status
 
-Design only. Companion to [`REDEX_PLAN.md`](REDEX_PLAN.md). Lands alongside or just after RedEX v1.
+**Parked — v2+.** Design captured; not implemented.
+
+RedEX v1 uses a raw `AtomicU64::fetch_add` seq allocator. That's nondeterministic under concurrent writers, but v1's workloads are mostly one main writer or a few threads in one process, and none of the consumers that would *benefit* from determinism exist yet:
+
+- No DST harness (fault-injection + simulated time).
+- No RedEX replication protocol / replica convergence path.
+- No CortEX fold runner that would demand reproducible replay.
+
+Until at least one of those lands, the scheduler is complexity without payoff. We accept nondeterministic seq under contention for v1; it doesn't hurt initial use cases.
+
+**When to revisit.** When we build a DST harness OR start work on RedEX replication OR CortEX wants cross-node fold reproducibility. At that point, re-open this doc, consider the refinements in §Refinements on revisit below, and implement.
+
+## Refinements on revisit
+
+Before implementing what's below, reconsider:
+
+1. **Don't over-specify `(origin_hash, local_tick)` yet.** In many workloads, "deterministic within a single process" is enough — just use submission order from a single thread, or one scheduler per process with a simple FIFO. The full `(origin_hash, local_tick)` pattern is more relevant once multiple independent components submit to the same file. Pick the weaker primitive first; extend if needed.
+2. **Consider single-threaded-per-process over per-file MPSC.** Instead of per-file MPSC + sort, a single `Sched` per process that owns all RedEX writes for that process may be simpler and sufficient. It deterministically orders submissions from within the process; cross-process convergence still needs protocol work, which is v2+ anyway.
+3. **The API shape below (`RedexScheduler::submit` + `drive_step`) is fine** as a target if the full design is warranted. Keep the `Backpressure` integration.
+
+The full design below is preserved as-is for reference. Treat it as a starting point, not a spec, when revisiting.
+
+---
+
+Companion to [`REDEX_PLAN.md`](REDEX_PLAN.md).
 
 ## Why determinism is a correctness property, not a nice-to-have
 
