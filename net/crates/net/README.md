@@ -177,7 +177,7 @@ Benchmarks accurate as of April 15, 2026.
 
 Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns.
 
-894 tests. ~840 KB deployed binary.
+901 tests. ~840 KB deployed binary.
 
 ## Capabilities
 
@@ -279,12 +279,12 @@ When a node fails or needs load balancing, migration preserves continuity in 6 p
 
 1. **Snapshot** — source captures daemon state, chain head, and horizon
 2. **Transfer** — snapshot sent to target (auto-chunked for large state)
-3. **Restore** — target rebuilds daemon from snapshot
+3. **Restore** — target reassembles chunks and rebuilds the daemon from the snapshot using a factory + keypair + config resolved from its local `DaemonFactoryRegistry`
 4. **Replay** — buffered events (arrived during transfer) replayed in causal order
-5. **Cutover** — routing switches, source stops writes
-6. **Complete** — source cleans up, target is authoritative
+5. **Cutover** — source stops writes and cleans up; source daemon unregistered
+6. **Complete** — orchestrator emits `ActivateTarget`; target drains remaining events, activates, replies with `ActivateAck`; migration record removed
 
-The `MigrationOrchestrator` coordinates this across three nodes (source, target, controller). `MigrationSourceHandler` manages the source side (snapshot, buffer, quiesce). `MigrationTargetHandler` manages the target side (restore, ordered replay via `BTreeMap`, activate). Auto-target selection queries the `CapabilityIndex` for nodes advertising `subprotocol:0x0500`.
+The full chain runs autonomously over `SUBPROTOCOL_MIGRATION` (0x0500); no manual orchestration is required once `start_migration()` is called. The `MigrationOrchestrator` coordinates across three nodes (source, target, controller). `MigrationSourceHandler` manages the source side (snapshot, buffer, quiesce, cleanup). `MigrationTargetHandler`, constructed via `new_with_factories(registry, factories)`, manages the target side (reassemble, restore, ordered replay via `BTreeMap`, activate). Auto-target selection queries the `CapabilityIndex` for nodes advertising `subprotocol:0x0500`.
 
 The daemon's causal chain continues unbroken on the new host. During migration, a `SuperpositionState` tracks which phase the daemon is in — it exists on both nodes briefly, then collapses to the new host.
 
@@ -325,6 +325,7 @@ src/adapter/net/
 ├── mesh.rs                # MeshNode — multi-peer mesh runtime (single socket, forwarding, subprotocol dispatch)
 ├── config.rs              # NetAdapterConfig
 ├── crypto.rs              # Noise NKpsk0 handshake, ChaCha20-Poly1305 AEAD
+├── handshake_relay.rs     # Handshake relay (SUBPROTOCOL_HANDSHAKE 0x0601), connect_via
 ├── protocol.rs            # 64-byte wire header, EventFrame, NackPayload
 ├── transport.rs           # UDP socket abstraction, batched I/O
 ├── session.rs             # Session state, stream multiplexing, thread-local pools
@@ -372,9 +373,10 @@ src/adapter/net/
 │
 ├── compute/               # Layer 5 — Compute Runtime
 │   ├── daemon.rs          #   MeshDaemon trait
+│   ├── daemon_factory.rs  #   DaemonFactoryRegistry (origin_hash → factory + keypair + config) for target-side restore
 │   ├── host.rs            #   DaemonHost runtime, from_snapshot(), from_fork()
 │   ├── migration.rs       #   MigrationState, MigrationPhase, 6-phase state machine
-│   ├── orchestrator.rs    #   MigrationOrchestrator, wire protocol, snapshot chunking
+│   ├── orchestrator.rs    #   MigrationOrchestrator, wire protocol, snapshot chunking, ActivateTarget/ActivateAck
 │   ├── migration_source.rs #  Source-side: snapshot, buffer, cutover, cleanup
 │   ├── migration_target.rs #  Target-side: restore, replay, activate
 │   ├── group_coord.rs     #   GroupCoordinator, shared LB/health/routing
@@ -584,13 +586,13 @@ cargo build --release --all-features
 ## Tests
 
 ```bash
-# Unit tests (792 tests)
+# Unit tests (809 tests)
 cargo test --lib --features net
 
-# Migration & group integration tests (44 tests)
+# Migration & group integration tests (49 tests)
 cargo test --test migration_integration --features net
 
-# Three-node mesh integration tests (44 tests)
+# Three-node mesh integration tests (49 tests)
 cargo test --test three_node_integration --features net
 
 # Two-node transport integration
@@ -619,7 +621,8 @@ Integration tests in `tests/migration_integration.rs` exercise the full migratio
 | **Concurrency** | Two daemons migrating simultaneously without interference |
 | **Abort** | Clean abort at every phase (Snapshot, Transfer, Replay, Cutover) |
 | **Capability discovery** | `enrich_capabilities()` → `CapabilityAnnouncement` → `CapabilityIndex` → `Scheduler.find_migration_targets()` |
-| **Wire format** | Encode/decode roundtrip for all 9 message variants including chunked SnapshotReady |
+| **Wire format** | Encode/decode roundtrip for all 10 message variants including chunked SnapshotReady, ActivateTarget, ActivateAck |
+| **Full lifecycle auto-chaining** | TakeSnapshot through ActivateAck runs end-to-end through the subprotocol handler with a mock message pump — single-chunk and multi-chunk. Failure paths verified: missing `DaemonFactoryRegistry` entry, corrupt snapshot bytes, `ActivateTarget` without prior restore. |
 
 Three-node mesh tests in `tests/three_node_integration.rs` exercise the `MeshNode` runtime over real encrypted UDP:
 
@@ -628,12 +631,13 @@ Three-node mesh tests in `tests/three_node_integration.rs` exercise the `MeshNod
 | **Mesh formation** | 3-way handshake, health isolation after node death |
 | **Data flow** | Point-to-point, bidirectional, stream isolation, full ring traffic, sustained throughput |
 | **Relay** | A→B→C forwarding without decryption, payload integrity over 100 events, **tamper detection** (AEAD rejects corrupted relay) |
-| **Rerouting** | Route update after node failure, no data loss across reroute boundary |
+| **Rerouting** | Manual route update after failure, **automatic reroute** via ReroutePolicy + failure detector, auto-recovery when peer returns |
 | **Router** | Forward/local/TTL/hop-count decisions over real UDP, multi-hop with 2 routers |
 | **Full stack** | EventBus→NetAdapter→encrypted UDP→poll, bidirectional EventBus, backpressure flood |
 | **Subnet gateway** | SubnetLocal blocked, Global forwarded, Exported selective, ParentVisible ancestor-only |
 | **Failure detection** | Heartbeat→suspect→fail→recover lifecycle, correlated failure classification |
-| **Migration over wire** | TakeSnapshot→SnapshotReady round-trip through encrypted UDP, orchestrator phase advancement |
+| **Migration over wire** | Full 6-phase lifecycle (TakeSnapshot → SnapshotReady → Restore → Replay → Cutover → Cleanup → Activate) runs autonomously over encrypted UDP. Three-node test asserts daemon ends up on target, absent from source, orchestrator record cleared. |
+| **Handshake relay** | `connect_via(relay_addr, …)` establishes a Noise NKpsk0 session with a peer that has no direct UDP path. Handshake messages ride inside `SUBPROTOCOL_HANDSHAKE` over the existing relay session; post-handshake data flows A↔C through B via `send_routed`. |
 | **Partition** | Detection via filter, healing with data flow recovery, asymmetric 3-node partition |
 
 Regression tests are prefixed `test_regression_` and tied to specific bugs found during review. Each documents the original bug in its doc comment and would fail if the fix were reverted.
@@ -656,6 +660,7 @@ cargo bench --bench parallel
 | `0x0401` | State snapshots |
 | `0x0500` | Daemon migration |
 | `0x0600` | Subprotocol negotiation |
+| `0x0601` | Handshake relay (relayed Noise NKpsk0) |
 | `0x0700..0x0702` | Continuity / fork / proof |
 | `0x0800..0x0801` | Partition / reconciliation |
 | `0x0900` | Replica group coordination (reserved) |

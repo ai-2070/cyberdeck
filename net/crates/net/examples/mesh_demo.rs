@@ -206,9 +206,7 @@ async fn recv_loop(
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     // Parse name from CLI.
-    let name = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| hostname_or_default());
+    let name = std::env::args().nth(1).unwrap_or_else(hostname_or_default);
 
     // Enable ANSI on Windows.
     #[cfg(windows)]

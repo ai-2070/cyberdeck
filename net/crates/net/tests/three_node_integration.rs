@@ -329,7 +329,7 @@ async fn test_data_flow_a_to_b() {
         .expect("B poll failed");
 
     assert!(
-        result.events.len() > 0,
+        !result.events.is_empty(),
         "B should receive events from A, got {}",
         result.events.len()
     );
@@ -375,8 +375,14 @@ async fn test_data_flow_a_to_b_and_c() {
         .await
         .expect("C poll failed");
 
-    assert!(b_result.events.len() > 0, "B should receive events from A");
-    assert!(c_result.events.len() > 0, "C should receive events from A");
+    assert!(
+        !b_result.events.is_empty(),
+        "B should receive events from A"
+    );
+    assert!(
+        !c_result.events.is_empty(),
+        "C should receive events from A"
+    );
 
     triangle.shutdown().await;
 }
@@ -431,12 +437,12 @@ async fn test_bidirectional_simultaneous() {
         .expect("A poll shard 0 failed");
 
     assert!(
-        b_received.events.len() > 0,
+        !b_received.events.is_empty(),
         "B should receive A's events, got {}",
         b_received.events.len()
     );
     assert!(
-        a_received.events.len() > 0,
+        !a_received.events.is_empty(),
         "A should receive B's events, got {}",
         a_received.events.len()
     );
@@ -509,8 +515,8 @@ async fn test_independent_streams_no_interference() {
         );
     }
 
-    assert!(b_events.events.len() > 0, "B should receive S1 events");
-    assert!(c_events.events.len() > 0, "C should receive S2 events");
+    assert!(!b_events.events.is_empty(), "B should receive S1 events");
+    assert!(!c_events.events.is_empty(), "C should receive S2 events");
 
     triangle.shutdown().await;
 }
@@ -579,17 +585,17 @@ async fn test_full_ring_traffic() {
         .expect("A poll failed");
 
     assert!(
-        b_got.events.len() > 0,
+        !b_got.events.is_empty(),
         "B should receive from A, got {}",
         b_got.events.len()
     );
     assert!(
-        c_got.events.len() > 0,
+        !c_got.events.is_empty(),
         "C should receive from B, got {}",
         c_got.events.len()
     );
     assert!(
-        a_got.events.len() > 0,
+        !a_got.events.is_empty(),
         "A should receive from C, got {}",
         a_got.events.len()
     );
@@ -764,7 +770,7 @@ async fn test_data_flow_survives_node_death() {
         .expect("C poll failed");
 
     assert!(
-        c_got.events.len() > 0,
+        !c_got.events.is_empty(),
         "C should receive events from A after B dies, got {}",
         c_got.events.len()
     );
@@ -1364,24 +1370,19 @@ async fn test_router_end_to_end_forwarding() {
 
     // C receives the forwarded packets
     let mut received = 0;
-    loop {
-        match tokio::time::timeout(Duration::from_millis(500), sock_c.recv_from(&mut recv_buf))
-            .await
-        {
-            Ok(Ok((n, _))) => {
-                // Verify it has a valid routing header
-                let hdr = RoutingHeader::from_bytes(&recv_buf[..n]);
-                assert!(
-                    hdr.is_some(),
-                    "forwarded packet should have valid routing header"
-                );
-                let hdr = hdr.unwrap();
-                assert_eq!(hdr.dest_id, node_c);
-                assert_eq!(hdr.hop_count, 1, "should have 1 hop from B");
-                received += 1;
-            }
-            _ => break,
-        }
+    while let Ok(Ok((n, _))) =
+        tokio::time::timeout(Duration::from_millis(500), sock_c.recv_from(&mut recv_buf)).await
+    {
+        // Verify it has a valid routing header
+        let hdr = RoutingHeader::from_bytes(&recv_buf[..n]);
+        assert!(
+            hdr.is_some(),
+            "forwarded packet should have valid routing header"
+        );
+        let hdr = hdr.unwrap();
+        assert_eq!(hdr.dest_id, node_c);
+        assert_eq!(hdr.hop_count, 1, "should have 1 hop from B");
+        received += 1;
     }
 
     assert!(
@@ -1971,7 +1972,7 @@ async fn test_mesh_node_two_node_data_exchange() {
     let result = node_b.poll_shard(0, None, 100).await.unwrap();
 
     assert!(
-        result.events.len() > 0,
+        !result.events.is_empty(),
         "B should receive events from A via MeshNode, got {}",
         result.events.len()
     );
@@ -2062,12 +2063,12 @@ async fn test_mesh_node_triangle() {
     let c_events = node_c.poll_shard(0, None, 100).await.unwrap();
 
     assert!(
-        b_events.events.len() > 0,
+        !b_events.events.is_empty(),
         "B should receive from A, got {}",
         b_events.events.len()
     );
     assert!(
-        c_events.events.len() > 0,
+        !c_events.events.is_empty(),
         "C should receive from A, got {}",
         c_events.events.len()
     );
@@ -2164,7 +2165,7 @@ async fn test_mesh_node_relay_through_middle() {
     // C should receive the events
     let c_result = node_c.poll_shard(0, None, 100).await.unwrap();
     assert!(
-        c_result.events.len() > 0,
+        !c_result.events.is_empty(),
         "C should receive relayed events from A through B, got {}",
         c_result.events.len()
     );
@@ -2475,7 +2476,7 @@ async fn test_mesh_node_reroute_on_failure() {
 
     let c_before = c.poll_shard(0, None, 100).await.unwrap();
     assert!(
-        c_before.events.len() > 0,
+        !c_before.events.is_empty(),
         "C should receive events via B before failure, got {}",
         c_before.events.len()
     );
@@ -2495,7 +2496,7 @@ async fn test_mesh_node_reroute_on_failure() {
 
     let c_after = c.poll_shard(0, None, 100).await.unwrap();
     assert!(
-        c_after.events.len() > 0,
+        !c_after.events.is_empty(),
         "C should receive events after reroute, got {}",
         c_after.events.len()
     );
@@ -2634,9 +2635,9 @@ use net::adapter::net::behavior::capability::CapabilityFilter;
 use net::adapter::net::compute::orchestrator::wire as migration_wire;
 use net::adapter::net::state::causal::CausalEvent;
 use net::adapter::net::{
-    DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, MeshDaemon, MigrationMessage,
-    MigrationOrchestrator, MigrationPhase, MigrationSourceHandler, MigrationSubprotocolHandler,
-    MigrationTargetHandler, SUBPROTOCOL_MIGRATION,
+    DaemonError, DaemonFactoryRegistry, DaemonHost, DaemonHostConfig, DaemonRegistry, MeshDaemon,
+    MigrationMessage, MigrationOrchestrator, MigrationPhase, MigrationSourceHandler,
+    MigrationSubprotocolHandler, MigrationTargetHandler, SUBPROTOCOL_MIGRATION,
 };
 
 /// Simple stateful daemon for migration testing.
@@ -2752,7 +2753,7 @@ async fn test_migration_snapshot_over_wire() {
     tokio::time::sleep(Duration::from_millis(2000)).await;
 
     // Verify B processed TakeSnapshot: source handler is in snapshot state
-    let second_try = source_b.start_snapshot(daemon_origin, 0x9999);
+    let second_try = source_b.start_snapshot(daemon_origin, 0x9999, 0x1111);
     assert!(
         second_try.is_err(),
         "B should have processed TakeSnapshot over wire — source handler in snapshot state"
@@ -2801,7 +2802,7 @@ async fn test_migration_full_lifecycle_over_wire() {
     let daemon_origin = daemon_kp.origin_hash();
     let host = DaemonHost::new(
         Box::new(CounterDaemon::with_count(42)),
-        daemon_kp,
+        daemon_kp.clone(),
         DaemonHostConfig::default(),
     );
     registry_b.register(host).unwrap();
@@ -2827,12 +2828,20 @@ async fn test_migration_full_lifecycle_over_wire() {
         nid_b,
     ));
 
-    // C: target node — needs a handler to receive snapshot and restore
+    // C: target node — register a factory so the subprotocol handler can
+    // auto-restore the daemon when SnapshotReady arrives over the wire.
     let registry_c = Arc::new(DaemonRegistry::new());
+    let factories_c = Arc::new(DaemonFactoryRegistry::new());
+    factories_c.register(daemon_kp.clone(), DaemonHostConfig::default(), || {
+        Box::new(CounterDaemon::with_count(0))
+    });
     let handler_c = Arc::new(MigrationSubprotocolHandler::new(
         Arc::new(MigrationOrchestrator::new(registry_c.clone(), nid_c)),
         Arc::new(MigrationSourceHandler::new(registry_c.clone())),
-        Arc::new(MigrationTargetHandler::new(registry_c.clone())),
+        Arc::new(MigrationTargetHandler::new_with_factories(
+            registry_c.clone(),
+            factories_c.clone(),
+        )),
         nid_c,
     ));
 
@@ -2882,30 +2891,31 @@ async fn test_migration_full_lifecycle_over_wire() {
         .await
         .unwrap();
 
-    // Wait for B to process TakeSnapshot and send SnapshotReady back to A.
-    // A's handler receives it and calls orch_a.on_snapshot_ready().
+    // Wait for the full round trip: B takes snapshot, ships to A, A forwards
+    // to C, C restores, Restore/Replay/Cutover/Cleanup/Activate chain back.
     tokio::time::sleep(Duration::from_millis(3000)).await;
 
-    // Verify B processed TakeSnapshot
-    let source_check = source_b.start_snapshot(daemon_origin, 0x9999);
+    // Verify B processed TakeSnapshot (source_handler has an in-flight record).
+    let source_check = source_b.start_snapshot(daemon_origin, 0x9999, 0x1111);
     assert!(
         source_check.is_err(),
         "B should have processed TakeSnapshot"
     );
 
-    // Verify A's orchestrator advanced past Snapshot
-    let phase = orch_a.status(daemon_origin);
+    // After the full lifecycle chains end-to-end, A's orchestrator record
+    // should have been torn down at ActivateAck. The daemon lives on C and
+    // has been unregistered from B by source_handler.cleanup.
     assert!(
-        phase.is_some(),
-        "orchestrator should still be tracking the migration"
+        !orch_a.is_migrating(daemon_origin),
+        "orchestrator record should be removed after ActivateAck"
     );
-    let phase = phase.unwrap();
-    assert_ne!(
-        phase,
-        MigrationPhase::Snapshot,
-        "orchestrator should have advanced past Snapshot (got {:?}). \
-         SnapshotReady was received and processed over wire.",
-        phase
+    assert!(
+        registry_c.contains(daemon_origin),
+        "daemon should be registered on target C after full lifecycle"
+    );
+    assert!(
+        !registry_b.contains(daemon_origin),
+        "daemon should be unregistered from source B after cleanup"
     );
 
     node_a.shutdown().await.unwrap();
@@ -3193,6 +3203,1302 @@ async fn test_partition_asymmetric_three_node() {
         0,
         "A→B should be blocked during partition"
     );
+
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+    node_c.shutdown().await.unwrap();
+}
+
+// ============================================================================
+// Automatic rerouting
+// ============================================================================
+
+/// Auto-reroute: A sends to C via B. B dies. The reroute policy
+/// automatically updates the route to C directly. No manual
+/// add_route/remove_route calls — the failure detector triggers it.
+#[tokio::test]
+async fn test_mesh_node_auto_reroute() {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_millis(600))
+    };
+
+    let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let node_c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let pub_b = *node_b.public_key();
+    let pub_c = *node_c.public_key();
+
+    // Full triangle
+    let (r1, r2) = tokio::join!(node_b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    let (r1, r2) = tokio::join!(node_c.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    let (r1, r2) = tokio::join!(node_c.accept(nid_b), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_b.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    // Route to C goes through B
+    node_a.router().add_route(nid_c, addr_b);
+    node_b.router().add_route(nid_c, addr_c);
+
+    node_a.start();
+    node_b.start();
+    node_c.start();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Verify reroute policy has no active reroutes
+    assert_eq!(node_a.reroute_policy().active_reroutes(), 0);
+
+    // Phase 1: send via B — works
+    let batch1 = make_batch(0, 5, "before_auto_reroute");
+    node_a.send_routed(nid_c, batch1).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let c_before = node_c.poll_shard(0, None, 100).await.unwrap();
+    assert!(!c_before.events.is_empty(), "C should receive via B");
+
+    // Phase 2: kill B
+    node_b.shutdown().await.unwrap();
+
+    // Wait for failure detection + automatic reroute
+    // Heartbeat interval=200ms, timeout=600ms, miss_threshold=3
+    // Detection should happen within ~2s
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    node_a.failure_detector().check_all();
+
+    // The reroute policy should have triggered automatically
+    assert!(
+        node_a.reroute_policy().active_reroutes() > 0,
+        "reroute policy should have rerouted after B's failure"
+    );
+
+    // Phase 3: send again — should reach C via auto-rerouted path (direct)
+    // NO manual route update — the reroute policy did it automatically
+    let batch2 = make_batch(0, 5, "after_auto_reroute");
+    node_a.send_routed(nid_c, batch2).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let c_after = node_c.poll_shard(0, None, 100).await.unwrap();
+    let auto_events: Vec<_> = c_after
+        .events
+        .iter()
+        .filter(|e| {
+            e.parse()
+                .map(|v: serde_json::Value| v["tag"] == "after_auto_reroute")
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        !auto_events.is_empty(),
+        "C should receive events after automatic reroute (no manual route update)"
+    );
+
+    node_a.shutdown().await.unwrap();
+    node_c.shutdown().await.unwrap();
+}
+
+/// Auto-reroute recovery: B dies → auto-reroute → B comes back →
+/// original route restored automatically.
+#[tokio::test]
+async fn test_mesh_node_auto_reroute_recovery() {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_millis(600))
+    };
+
+    let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let node_c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let pub_b = *node_b.public_key();
+    let pub_c = *node_c.public_key();
+
+    // Full triangle
+    let (r1, r2) = tokio::join!(node_b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    let (r1, r2) = tokio::join!(node_c.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    // Route to C goes through B
+    node_a.router().add_route(nid_c, addr_b);
+
+    node_a.start();
+    node_b.start();
+    node_c.start();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Simulate B failure via partition (not shutdown — B stays alive for recovery)
+    node_a.block_peer(addr_b);
+    node_b.block_peer(addr_a);
+
+    // Wait for detection + auto-reroute
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    node_a.failure_detector().check_all();
+    assert!(
+        node_a.reroute_policy().active_reroutes() > 0,
+        "should auto-reroute"
+    );
+
+    // Heal partition — B sends heartbeats again → failure detector recovers B
+    node_a.unblock_peer(&addr_b);
+    node_b.unblock_peer(&addr_a);
+
+    // Wait for recovery heartbeats
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // Recovery should restore the original route
+    assert_eq!(
+        node_a.reroute_policy().active_reroutes(),
+        0,
+        "original route should be restored after B recovers"
+    );
+
+    // Verify the route points back to B
+    let next_hop = node_a.router().routing_table().lookup(nid_c);
+    assert_eq!(
+        next_hop,
+        Some(addr_b),
+        "route to C should be restored through B"
+    );
+
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+    node_c.shutdown().await.unwrap();
+}
+
+/// Proximity graph: A↔B↔C (no direct A↔C link). A discovers C through
+/// B's relayed pingwaves.
+#[tokio::test]
+async fn test_proximity_graph_pingwave_discovery() {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_secs(10))
+    };
+
+    let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let node_c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let pub_b = *node_b.public_key();
+    let pub_c = *node_c.public_key();
+
+    // A↔B only
+    let (r1, r2) = tokio::join!(node_b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    // B↔C only (A has NO direct connection to C)
+    let (r1, r2) = tokio::join!(node_c.accept(nid_b), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_b.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    node_a.start();
+    node_b.start();
+    node_c.start();
+
+    // A initially knows 1 peer (B)
+    assert_eq!(node_a.proximity_graph().node_count(), 1);
+
+    // Wait for pingwave propagation (C→B→A)
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // A should now know about C via B's relayed pingwave
+    let a_nodes = node_a.proximity_graph().node_count();
+    assert!(
+        a_nodes >= 2,
+        "A should discover C via B's pingwave relay, knows {} nodes",
+        a_nodes
+    );
+
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+    node_c.shutdown().await.unwrap();
+}
+
+// ============================================================================
+// Handshake relay tests
+// ============================================================================
+
+/// A establishes a session with C via relay B without any direct A↔C
+/// UDP path. After the relayed handshake, A can send data to C via
+/// `send_routed`, and the payload arrives intact.
+#[tokio::test]
+async fn test_mesh_handshake_via_relay() {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(30))
+    };
+
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let pub_b = *b.public_key();
+    let pub_c = *c.public_key();
+
+    // A↔B direct session.
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.expect("B accept A failed");
+    r2.expect("A connect B failed");
+
+    // B↔C direct session (B is the relay — must have a path to C).
+    let (r1, r2) = tokio::join!(c.accept(nid_b), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        b.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.expect("C accept B failed");
+    r2.expect("B connect C failed");
+
+    // Start all nodes — receive loops must be running before connect_via.
+    a.start();
+    b.start();
+    c.start();
+
+    // A has no direct UDP path to C. Establish a session via B.
+    let result = a.connect_via(addr_b, &pub_c, nid_c).await;
+    result.expect("A connect_via B to C failed");
+
+    // Route for forwarded data: on B, A→C already exists from b.connect(C).
+    // On A, connect_via already inserted a route for C via B.
+    // On B, add a route for A→B so data C→A gets forwarded correctly.
+    b.router().add_route(nid_a, addr_a);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // A sends a batch to C over the newly established A↔C session, routed
+    // through B.
+    let batch = make_batch(0, 10, "via_relay_handshake");
+    a.send_routed(nid_c, batch)
+        .await
+        .expect("A send_routed to C failed");
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let c_result = c.poll_shard(0, None, 100).await.unwrap();
+    assert!(
+        !c_result.events.is_empty(),
+        "C should receive events from A via relayed-handshake session, got {}",
+        c_result.events.len()
+    );
+    for event in &c_result.events {
+        let json: serde_json::Value = event.parse().unwrap();
+        assert_eq!(json["tag"], "via_relay_handshake");
+    }
+
+    let b_result = b.poll_shard(0, None, 100).await.unwrap();
+    assert_eq!(
+        b_result.events.len(),
+        0,
+        "B should not decrypt A→C data — it only relays"
+    );
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
+}
+
+/// After a handshake established via relay B, data flows in both directions
+/// between A and C through B.
+#[tokio::test]
+async fn test_mesh_handshake_relay_bidirectional() {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(30))
+    };
+
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let pub_b = *b.public_key();
+    let pub_c = *c.public_key();
+
+    // A↔B and B↔C direct sessions.
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    let (r1, r2) = tokio::join!(c.accept(nid_b), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        b.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    a.start();
+    b.start();
+    c.start();
+
+    a.connect_via(addr_b, &pub_c, nid_c)
+        .await
+        .expect("connect_via failed");
+
+    // Routing: B already has A (from b.accept/add_route) and C (from
+    // b.connect/add_route). On C, the responder side added a route for A
+    // via B's addr during the handshake. On A, connect_via added the route
+    // for C via B. All four directions are covered.
+    b.router().add_route(nid_a, addr_a);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // A → C
+    a.send_routed(nid_c, make_batch(0, 5, "a_to_c"))
+        .await
+        .unwrap();
+    // C → A
+    c.send_routed(nid_a, make_batch(0, 5, "c_to_a"))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let c_events = c.poll_shard(0, None, 100).await.unwrap();
+    let a_events = a.poll_shard(0, None, 100).await.unwrap();
+
+    assert!(
+        !c_events.events.is_empty(),
+        "C should receive events from A via B"
+    );
+    assert!(
+        !a_events.events.is_empty(),
+        "A should receive events from C via B"
+    );
+    for event in &c_events.events {
+        let json: serde_json::Value = event.parse().unwrap();
+        assert_eq!(json["tag"], "a_to_c");
+    }
+    for event in &a_events.events {
+        let json: serde_json::Value = event.parse().unwrap();
+        assert_eq!(json["tag"], "c_to_a");
+    }
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
+}
+
+// ============================================================================
+// Stream multiplexing
+// ============================================================================
+
+/// Two streams between the same pair of peers, distinct stream IDs,
+/// distinct stream stats, and data flows on both. Verifies that:
+/// 1. `open_stream` returns a handle backed by per-stream state.
+/// 2. `send_on_stream` ships events that land in the right shard inbound.
+/// 3. `all_stream_stats` reports both streams' tx_seq independently.
+#[tokio::test]
+async fn test_stream_multiplex_two_streams_same_peer() {
+    use net::adapter::net::{Reliability, StreamConfig};
+
+    let ports = find_ports(2).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(4)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(30))
+    };
+
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let pub_b = *b.public_key();
+
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    a.start();
+    b.start();
+
+    // Open two streams with distinct reliability modes.
+    let s_fire = a
+        .open_stream(
+            nid_b,
+            111,
+            StreamConfig::new().with_reliability(Reliability::FireAndForget),
+        )
+        .unwrap();
+    let s_rel = a
+        .open_stream(
+            nid_b,
+            222,
+            StreamConfig::new().with_reliability(Reliability::Reliable),
+        )
+        .unwrap();
+
+    let events_fire: Vec<Bytes> = (0..3)
+        .map(|i| Bytes::from(format!(r#"{{"stream":"fire","i":{}}}"#, i)))
+        .collect();
+    let events_rel: Vec<Bytes> = (0..5)
+        .map(|i| Bytes::from(format!(r#"{{"stream":"rel","i":{}}}"#, i)))
+        .collect();
+
+    a.send_on_stream(&s_fire, &events_fire).await.unwrap();
+    a.send_on_stream(&s_rel, &events_rel).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Both streams recorded their sends independently.
+    let all = a.all_stream_stats(nid_b);
+    let fire_stats = all
+        .iter()
+        .find(|(sid, _)| *sid == 111)
+        .map(|(_, s)| *s)
+        .expect("stream 111 stats");
+    let rel_stats = all
+        .iter()
+        .find(|(sid, _)| *sid == 222)
+        .map(|(_, s)| *s)
+        .expect("stream 222 stats");
+    assert_eq!(
+        fire_stats.tx_seq, 1,
+        "fire stream sent 1 packet (3 events fit in one)"
+    );
+    assert_eq!(
+        rel_stats.tx_seq, 1,
+        "rel stream sent 1 packet (5 events fit in one)"
+    );
+    assert!(fire_stats.active);
+    assert!(rel_stats.active);
+
+    // Single-stream accessor matches.
+    let fire_solo = a.stream_stats(nid_b, 111).unwrap();
+    assert_eq!(fire_solo.tx_seq, 1);
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// `open_stream` is idempotent for a given `(peer, stream_id)`: re-opens
+/// return handles backed by the same underlying state. Closing and then
+/// re-opening creates fresh state.
+#[tokio::test]
+async fn test_stream_open_close_idempotency() {
+    use net::adapter::net::{Reliability, StreamConfig};
+
+    let ports = find_ports(2).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+    };
+
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let pub_b = *b.public_key();
+
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    // First open creates state.
+    let first = a
+        .open_stream(
+            nid_b,
+            77,
+            StreamConfig::new().with_reliability(Reliability::Reliable),
+        )
+        .unwrap();
+    assert_eq!(first.stream_id(), 77);
+    a.send_on_stream(&first, &[Bytes::from_static(b"{}")])
+        .await
+        .unwrap();
+    let stats1 = a.stream_stats(nid_b, 77).unwrap();
+    assert_eq!(stats1.tx_seq, 1);
+
+    // Second open: same tx_seq state — open is idempotent.
+    let second = a
+        .open_stream(
+            nid_b,
+            77,
+            StreamConfig::new().with_reliability(Reliability::Reliable),
+        )
+        .unwrap();
+    a.send_on_stream(&second, &[Bytes::from_static(b"{}")])
+        .await
+        .unwrap();
+    let stats2 = a.stream_stats(nid_b, 77).unwrap();
+    assert_eq!(
+        stats2.tx_seq, 2,
+        "second send on re-opened stream continues tx_seq"
+    );
+
+    // Close + re-open creates fresh state.
+    a.close_stream(nid_b, 77);
+    assert!(a.stream_stats(nid_b, 77).is_none());
+    let third = a.open_stream(nid_b, 77, StreamConfig::new()).unwrap();
+    a.send_on_stream(&third, &[Bytes::from_static(b"{}")])
+        .await
+        .unwrap();
+    let stats3 = a.stream_stats(nid_b, 77).unwrap();
+    assert_eq!(stats3.tx_seq, 1, "after close+reopen tx_seq resets");
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+// ============================================================================
+// Multi-hop routing discovery
+// ============================================================================
+
+/// Pingwave-driven route install: a node learns routes to non-direct
+/// peers from pingwaves that arrive with `hop_count > 0`. On a 4-node
+/// chain A↔B↔C↔D where only adjacent pairs have direct sessions, A
+/// should eventually learn a next-hop toward D purely from pingwave
+/// propagation — no manual `add_route` needed.
+///
+/// The installer places `origin → from` (the immediate forwarder is the
+/// next hop) with metric `hop_count + 2`. Direct routes at metric 1
+/// remain authoritative and are not downgraded.
+#[tokio::test]
+async fn test_multi_hop_routing_pingwave_installs_indirect_route() {
+    let ports = find_ports(4).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let id_d = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+    let nid_d = id_d.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+    let addr_d: SocketAddr = format!("127.0.0.1:{}", ports[3]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(200))
+            .with_session_timeout(Duration::from_secs(30))
+    };
+
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let d = MeshNode::new(id_d, mk(addr_d)).await.unwrap();
+    let pub_b = *b.public_key();
+    let pub_c = *c.public_key();
+    let pub_d = *d.public_key();
+
+    // Build the chain: A↔B, B↔C, C↔D. No other direct sessions.
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    let (r1, r2) = tokio::join!(c.accept(nid_b), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        b.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    let (r1, r2) = tokio::join!(d.accept(nid_c), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        c.connect(addr_d, &pub_d, nid_d).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    // Start all nodes so pingwaves start flowing.
+    a.start();
+    b.start();
+    c.start();
+    d.start();
+
+    // Wait for enough heartbeat intervals that pingwaves have reached
+    // A from D (3 hops × 200ms plus some slack). The heartbeat loop
+    // fires on its interval; let a handful of them propagate.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // A's routing table must have a route for D pointing at B (the
+    // only peer A has that can get a pingwave from D to us first).
+    let lookup = a.router().routing_table().lookup(nid_d);
+    assert_eq!(
+        lookup,
+        Some(addr_b),
+        "A should have learned D via B from pingwave propagation; got {:?}",
+        lookup
+    );
+
+    // Direct routes must not have been disturbed. A's route to B is
+    // metric 1 (direct); the pingwave-carried route to B arriving via
+    // B itself would have metric 2 and must NOT win.
+    let b_lookup = a.router().routing_table().lookup(nid_b);
+    assert_eq!(b_lookup, Some(addr_b), "direct B route preserved");
+    let _ = nid_a;
+    let _ = nid_c;
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
+    d.shutdown().await.unwrap();
+}
+
+// ============================================================================
+// Regressions
+// ============================================================================
+
+/// Regression: `MeshNode` used to seed its local proximity-graph identity as
+/// `entity_id().as_bytes()` while peers were seeded via the zero-padded
+/// `node_id` encoding (`node_id_to_graph_id`). That mismatch meant the
+/// graph stored the same logical node under two different keys — any
+/// `path_to(...)` or `all_nodes()` query that joined self with peers would
+/// see inconsistent identities.
+///
+/// The fix is to use `node_id_to_graph_id(node_id)` in both places. This
+/// test exercises the fix via the observable `create_pingwave()` output:
+/// the pingwave's `origin_id` is the local graph identity, and must equal
+/// `node_id.to_le_bytes()` zero-padded to 32 bytes.
+#[tokio::test]
+async fn test_regression_proximity_graph_local_id_matches_peer_encoding() {
+    use net::adapter::net::behavior::loadbalance::HealthStatus;
+
+    let ports = find_ports(1).await;
+    let psk = [0x42u8; 32];
+    let id = EntityKeypair::generate();
+    let expected_nid = id.node_id();
+    let addr: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+
+    let node = MeshNode::new(id, MeshNodeConfig::new(addr, psk))
+        .await
+        .unwrap();
+
+    let pw = node
+        .proximity_graph()
+        .create_pingwave(HealthStatus::Healthy);
+
+    let mut expected = [0u8; 32];
+    expected[0..8].copy_from_slice(&expected_nid.to_le_bytes());
+    assert_eq!(
+        pw.origin_id, expected,
+        "proximity graph's local id must use the zero-padded node_id \
+         encoding so it matches what peers see when they seed this node \
+         into their own graph"
+    );
+
+    node.shutdown().await.unwrap();
+}
+
+/// Regression: `HandshakeAction::Forward` used to require a direct peer
+/// session for the `to_node` — if the next hop toward the destination
+/// was a different intermediate node, the packet was silently dropped.
+/// That meant `connect_via` could only traverse one relay, contradicting
+/// the documented "chain of already-connected peers" design.
+///
+/// The fix looks up `to_node` in the routing table first; only if that
+/// misses does it fall back to the direct-peer entry. This test sets up
+/// a four-node chain A↔B↔C↔D, gives each relay the route to the far
+/// destination, and confirms that `a.connect_via(relay=B, D)` completes
+/// end-to-end with A gaining a peer entry for D.
+#[tokio::test]
+async fn test_regression_handshake_relay_multi_hop_via_routing_table() {
+    let ports = find_ports(4).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let id_d = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+    let nid_d = id_d.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+    let addr_d: SocketAddr = format!("127.0.0.1:{}", ports[3]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(30))
+    };
+
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let d = MeshNode::new(id_d, mk(addr_d)).await.unwrap();
+    let pub_b = *b.public_key();
+    let pub_c = *c.public_key();
+    let pub_d = *d.public_key();
+
+    // Build the chain: A↔B, B↔C, C↔D. No other direct sessions.
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    let (r1, r2) = tokio::join!(c.accept(nid_b), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        b.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    let (r1, r2) = tokio::join!(d.accept(nid_c), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        c.connect(addr_d, &pub_d, nid_d).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    // Routing table entries for the relays. The `connect`/`accept`
+    // calls above auto-install routes for direct peers only; we have to
+    // seed the cross-relay routes manually.
+    //
+    // msg1 path A→B→C→D:  B needs route D via C (C has D direct).
+    // msg2 path D→C→B→A:  C needs route A via B (B has A direct).
+    b.router().add_route(nid_d, addr_c);
+    c.router().add_route(nid_a, addr_b);
+
+    a.start();
+    b.start();
+    c.start();
+    d.start();
+
+    // Register a handshake handler factory on D? No — handshake relay
+    // doesn't use DaemonFactoryRegistry. D just needs to be running.
+    //
+    // Register D as a reachable peer on A's side (no direct session
+    // yet). After connect_via, A should have one.
+    let _before = a.peer_count();
+
+    // Drive the relayed handshake across two intermediate hops.
+    a.connect_via(addr_b, &pub_d, nid_d)
+        .await
+        .expect("A connect_via D (through B→C) failed");
+
+    // Give the spawned msg2-send tasks on D and C time to resolve.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // A now has sessions for B and for D (but not C — C was purely a
+    // transit hop as far as A is concerned).
+    assert!(
+        a.peer_count() >= 2,
+        "A must have at least B + D after multi-hop connect_via; got {}",
+        a.peer_count()
+    );
+    // D now has sessions for C and for A.
+    assert!(
+        d.peer_count() >= 2,
+        "D must have at least C + A after the relayed handshake completes; got {}",
+        d.peer_count()
+    );
+    let _ = nid_a;
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
+    d.shutdown().await.unwrap();
+}
+
+/// Regression: `execute_handshake_action::RegisterResponderPeer` used to
+/// insert the peer + session + route *before* the msg2 send was spawned,
+/// and the send result was ignored. If the spawned send failed (partition
+/// filter set, socket error, etc.), the responder would keep a half-open
+/// peer record: the initiator never sees msg2 and the responder has a
+/// session it will never be able to use.
+///
+/// The fix is to register the peer only after the msg2 send succeeds,
+/// inside the spawned task. This test asserts the happy path still
+/// registers — the converse (failure-path silence) is structurally
+/// guaranteed by the spawned-task ordering in
+/// `execute_handshake_action` and covered in a code review.
+#[tokio::test]
+async fn test_regression_handshake_relay_registers_peer_after_msg2_sent() {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(30))
+    };
+
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let pub_b = *b.public_key();
+    let pub_c = *c.public_key();
+
+    // A↔B and B↔C direct sessions.
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    let (r1, r2) = tokio::join!(c.accept(nid_b), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        b.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    // After direct connects, both sides should see exactly one peer.
+    assert_eq!(a.peer_count(), 1);
+    assert_eq!(c.peer_count(), 1);
+
+    a.start();
+    b.start();
+    c.start();
+
+    a.connect_via(addr_b, &pub_c, nid_c).await.unwrap();
+
+    // Wait for the spawned msg2-send on C to resolve before we inspect.
+    // Poll rather than sleep — scheduler jitter can easily exceed a
+    // 300 ms fixed delay under load.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while c.peer_count() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for C to register A after connect_via");
+
+    // Happy path: A now has C registered, C now has A registered. Both
+    // registrations ride on msg2 actually having been sent; without the
+    // fix, C's A-peer insertion races the send and can happen even if
+    // the send silently fails.
+    assert_eq!(a.peer_count(), 2, "A must have B and C");
+    assert_eq!(
+        c.peer_count(),
+        2,
+        "C must have B and A — the A entry is only inserted after the \
+         spawned msg2-send succeeds"
+    );
+    let _ = nid_a;
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
+}
+
+/// Regression: the receive loop used to dispatch any 72-byte UDP packet as
+/// a pingwave based on length alone. A packet whose leading bytes were the
+/// Net-header magic (`0x4E45`) would still be mis-handled as a pingwave,
+/// bypassing normal decryption and session-id validation.
+///
+/// The fix is a structural check: only dispatch as a pingwave when the
+/// leading two bytes are NOT the Net magic. A length-72 blob starting with
+/// the magic must NOT increment `pingwaves_received`. (This test does not
+/// address the broader issue of pingwave authentication, which is a
+/// separate protocol concern; it verifies that the length-only heuristic
+/// no longer swallows legitimate Net-header-shaped traffic.)
+#[tokio::test]
+async fn test_regression_pingwave_not_dispatched_on_net_magic_packet() {
+    let ports = find_ports(1).await;
+    let psk = [0x42u8; 32];
+    let id = EntityKeypair::generate();
+    let addr: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+
+    let node = MeshNode::new(id, MeshNodeConfig::new(addr, psk))
+        .await
+        .unwrap();
+    node.start();
+
+    let before = node.proximity_graph().stats().pingwaves_received;
+
+    // Craft a 72-byte packet whose first two bytes are the Net magic
+    // (0x4E45 little-endian = [0x45, 0x4E] = "EN"). Post-fix this must be
+    // rejected at the pingwave guard and NOT reach the proximity graph.
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut pkt = [0u8; 72];
+    pkt[0] = 0x45;
+    pkt[1] = 0x4E;
+    sender.send_to(&pkt, addr).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let after = node.proximity_graph().stats().pingwaves_received;
+    assert_eq!(
+        before, after,
+        "a 72-byte packet starting with the Net magic must not be \
+         dispatched as a pingwave"
+    );
+
+    // Sanity check: a 72-byte packet WITHOUT the Net magic is still
+    // accepted as a pingwave. If this fails, the guard is too aggressive.
+    let mut pw_pkt = [0u8; 72];
+    // Fill origin_id[0..8] with a recognisable node id; the remaining
+    // origin_id bytes (8..32) are zero — not the Net magic — so the
+    // pingwave guard lets it through.
+    pw_pkt[0..8].copy_from_slice(&0xDEADBEEFu64.to_le_bytes());
+    // Set TTL > 0 so the graph considers it live.
+    pw_pkt[40] = 4;
+    sender.send_to(&pw_pkt, addr).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let after_valid = node.proximity_graph().stats().pingwaves_received;
+    assert!(
+        after_valid > after,
+        "legitimate pingwaves (no Net magic) must still be accepted; \
+         before={}, after={}",
+        after,
+        after_valid
+    );
+
+    node.shutdown().await.unwrap();
+}
+
+// ============================================================================
+// Channel fan-out (ChannelPublisher) — three-node tests
+// ============================================================================
+
+use net::adapter::net::{ChannelName, OnFailure, PublishConfig, Reliability};
+
+/// Helper: build three nodes connected in a star (A as publisher, B and C
+/// as subscribers). Returns the three nodes plus their node_ids.
+async fn setup_publisher_with_two_subscribers() -> (MeshNode, MeshNode, MeshNode, u64, u64, u64) {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk_config = |addr: SocketAddr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(10))
+    };
+
+    let node_a = MeshNode::new(id_a, mk_config(addr_a)).await.unwrap();
+    let node_b = MeshNode::new(id_b, mk_config(addr_b)).await.unwrap();
+    let node_c = MeshNode::new(id_c, mk_config(addr_c)).await.unwrap();
+
+    let pub_b = *node_b.public_key();
+    let pub_c = *node_c.public_key();
+
+    // B subscribes to A → B accepts A, A connects B
+    let (accept_result, connect_result) = tokio::join!(node_b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_b, &pub_b, nid_b).await
+    });
+    accept_result.expect("B accept A failed");
+    connect_result.expect("A connect B failed");
+
+    // Same for C
+    let (accept_result, connect_result) = tokio::join!(node_c.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_c, &pub_c, nid_c).await
+    });
+    accept_result.expect("C accept A failed");
+    connect_result.expect("A connect C failed");
+
+    node_a.start();
+    node_b.start();
+    node_c.start();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    (node_a, node_b, node_c, nid_a, nid_b, nid_c)
+}
+
+/// `ChannelPublisher::publish` reaches every subscriber; the roster
+/// evicts peers that go `Failed` so the next publish skips them.
+#[tokio::test]
+async fn test_channel_publisher_fanout_reaches_all_subscribers() {
+    let (node_a, node_b, node_c, nid_a, _nid_b, _nid_c) =
+        setup_publisher_with_two_subscribers().await;
+
+    // B and C both subscribe to sensors/lidar on publisher A.
+    let channel = ChannelName::new("sensors/lidar").unwrap();
+    node_b
+        .subscribe_channel(nid_a, channel.clone())
+        .await
+        .expect("B subscribe failed");
+    node_c
+        .subscribe_channel(nid_a, channel.clone())
+        .await
+        .expect("C subscribe failed");
+
+    // Roster now has 2 subscribers.
+    let ch_id = net::adapter::net::ChannelId::new(channel.clone());
+    let members = node_a.roster().members(&ch_id);
+    assert_eq!(members.len(), 2, "A's roster should have 2 subscribers");
+
+    // Publish and verify the report.
+    let publisher = node_a.channel_publisher(
+        channel.clone(),
+        PublishConfig::new()
+            .with_reliability(Reliability::FireAndForget)
+            .with_on_failure(OnFailure::Collect),
+    );
+    let payload = bytes::Bytes::from_static(b"lidar-scan-0");
+    let report = node_a.publish(&publisher, payload).await.unwrap();
+
+    assert_eq!(
+        report.attempted, 2,
+        "should have attempted both subscribers"
+    );
+    assert_eq!(report.delivered, 2, "both per-peer sends should succeed");
+    assert!(report.errors.is_empty(), "no errors expected");
+
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+    node_c.shutdown().await.unwrap();
+}
+
+/// `Unsubscribe` removes the peer from the roster; the next publish
+/// does not target it.
+#[tokio::test]
+async fn test_channel_publisher_unsubscribe_evicts_from_roster() {
+    let (node_a, node_b, node_c, nid_a, nid_b, nid_c) =
+        setup_publisher_with_two_subscribers().await;
+
+    let channel = ChannelName::new("alerts").unwrap();
+    node_b
+        .subscribe_channel(nid_a, channel.clone())
+        .await
+        .unwrap();
+    node_c
+        .subscribe_channel(nid_a, channel.clone())
+        .await
+        .unwrap();
+
+    let ch_id = net::adapter::net::ChannelId::new(channel.clone());
+    assert_eq!(node_a.roster().members(&ch_id).len(), 2);
+
+    // B unsubscribes; A's roster should drop B.
+    node_b
+        .unsubscribe_channel(nid_a, channel.clone())
+        .await
+        .unwrap();
+
+    // Ack is processed asynchronously on A; poll briefly.
+    let mut members = Vec::new();
+    for _ in 0..20 {
+        members = node_a.roster().members(&ch_id);
+        if members.len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        members.len(),
+        1,
+        "after B unsubscribes, only C should remain"
+    );
+    assert_eq!(members[0], nid_c, "surviving subscriber should be C");
+
+    // Publish goes only to C.
+    let publisher = node_a.channel_publisher(
+        channel.clone(),
+        PublishConfig::new().with_on_failure(OnFailure::Collect),
+    );
+    let report = node_a
+        .publish(&publisher, bytes::Bytes::from_static(b"only-c"))
+        .await
+        .unwrap();
+    assert_eq!(report.attempted, 1);
+    assert_eq!(report.delivered, 1);
+
+    let _ = nid_a;
+    let _ = nid_b;
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+    node_c.shutdown().await.unwrap();
+}
+
+/// Empty roster → Ok with `attempted == 0`; not an error.
+#[tokio::test]
+async fn test_channel_publisher_empty_roster_is_ok() {
+    let (node_a, node_b, node_c, _nid_a, _nid_b, _nid_c) =
+        setup_publisher_with_two_subscribers().await;
+
+    let channel = ChannelName::new("nobody/listens").unwrap();
+    let publisher = node_a.channel_publisher(
+        channel,
+        PublishConfig::new().with_on_failure(OnFailure::Collect),
+    );
+    let report = node_a
+        .publish(&publisher, bytes::Bytes::from_static(b"x"))
+        .await
+        .unwrap();
+    assert_eq!(report.attempted, 0);
+    assert_eq!(report.delivered, 0);
+    assert!(report.errors.is_empty());
+    assert!(report.is_empty());
+
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+    node_c.shutdown().await.unwrap();
+}
+
+/// `MembershipAck` flows: an Unsubscribe for an unregistered subscriber
+/// is still accepted (idempotent), so the call returns Ok.
+#[tokio::test]
+async fn test_channel_publisher_unsubscribe_idempotent() {
+    let (node_a, node_b, node_c, nid_a, _nid_b, _nid_c) =
+        setup_publisher_with_two_subscribers().await;
+
+    let channel = ChannelName::new("ghosts").unwrap();
+    // B never subscribed; unsubscribe should still succeed.
+    node_b
+        .unsubscribe_channel(nid_a, channel.clone())
+        .await
+        .expect("unsubscribe must be idempotent");
 
     node_a.shutdown().await.unwrap();
     node_b.shutdown().await.unwrap();

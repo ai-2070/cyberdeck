@@ -3,7 +3,7 @@
 //! This module provides:
 //! - `RoutingHeader`: Fixed-size header for multi-hop routing
 //! - `RoutingTable`: Stream-to-destination mapping
-//! - `StreamStats`: Per-stream statistics for fairness monitoring
+//! - `SchedulerStreamStats`: Per-stream statistics for fairness monitoring
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
@@ -194,7 +194,7 @@ impl RoutingHeader {
 
 /// Per-stream statistics for fairness monitoring
 #[derive(Debug)]
-pub struct StreamStats {
+pub struct SchedulerStreamStats {
     /// Packets received
     pub packets_in: AtomicU64,
     /// Packets forwarded
@@ -209,7 +209,7 @@ pub struct StreamStats {
     last_activity: AtomicU64,
 }
 
-impl StreamStats {
+impl SchedulerStreamStats {
     /// Create new stream stats
     pub fn new() -> Self {
         Self {
@@ -277,7 +277,7 @@ impl StreamStats {
     }
 }
 
-impl Default for StreamStats {
+impl Default for SchedulerStreamStats {
     fn default() -> Self {
         Self::new()
     }
@@ -323,9 +323,14 @@ pub struct RoutingTable {
     /// Node ID -> next hop address
     routes: DashMap<u64, RouteEntry>,
     /// Stream ID -> per-stream stats
-    stream_stats: DashMap<u64, StreamStats>,
+    stream_stats: DashMap<u64, SchedulerStreamStats>,
     /// Local node ID
     local_id: u64,
+    /// Maximum age a route may have before `lookup` rejects it.
+    /// Stored as nanoseconds in an `AtomicU64` so `set_max_route_age` is
+    /// cheap and lock-free. Initialized to `u64::MAX` (effectively
+    /// disabled) — `MeshNode` sets this at construction.
+    max_route_age_nanos: AtomicU64,
 }
 
 impl RoutingTable {
@@ -335,6 +340,7 @@ impl RoutingTable {
             routes: DashMap::new(),
             stream_stats: DashMap::new(),
             local_id,
+            max_route_age_nanos: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -344,15 +350,48 @@ impl RoutingTable {
         self.local_id
     }
 
-    /// Add or update a route
+    /// Add or update a direct route.
+    ///
+    /// Called by `MeshNode::connect` and `::accept` as part of direct
+    /// session setup. Unconditionally inserts — a direct route is always
+    /// preferred over any indirect one (direct uses default metric 1;
+    /// indirect routes installed from pingwaves carry `hop_count + 2`, so
+    /// they're never below 2). Also refreshes `updated_at`.
     pub fn add_route(&self, dest_id: u64, next_hop: SocketAddr) {
         self.routes.insert(dest_id, RouteEntry::new(next_hop));
     }
 
-    /// Add route with metric
+    /// Add or update a route with an explicit metric.
+    ///
+    /// Used by the pingwave-driven route installer. The existing entry is
+    /// preserved (but its `updated_at` is refreshed) if its metric is
+    /// **strictly better** (lower) than the incoming one — this keeps a
+    /// direct route from being replaced by a worse indirect one, while
+    /// still letting a periodic refresh extend the direct route's
+    /// freshness window via the heartbeat loop.
+    ///
+    /// If the new metric is equal or better, the entry is replaced
+    /// (capturing any next-hop change and refreshing `updated_at`).
     pub fn add_route_with_metric(&self, dest_id: u64, next_hop: SocketAddr, metric: u16) {
-        self.routes
-            .insert(dest_id, RouteEntry::with_metric(next_hop, metric));
+        use dashmap::mapref::entry::Entry;
+        match self.routes.entry(dest_id) {
+            Entry::Vacant(v) => {
+                v.insert(RouteEntry::with_metric(next_hop, metric));
+            }
+            Entry::Occupied(mut o) => {
+                if metric <= o.get().metric {
+                    o.insert(RouteEntry::with_metric(next_hop, metric));
+                } else {
+                    // Existing route is strictly better. Keep it, but
+                    // refresh its freshness — if the better route is
+                    // still there, the worse one's arrival is evidence
+                    // the destination is reachable, so the direct route
+                    // shouldn't time out just because its heartbeat
+                    // happens less often than pingwaves.
+                    o.get_mut().updated_at = Instant::now();
+                }
+            }
+        }
     }
 
     /// Remove a route
@@ -360,12 +399,63 @@ impl RoutingTable {
         self.routes.remove(&dest_id).map(|(_, v)| v)
     }
 
-    /// Look up next hop for destination
+    /// Remove the route for `dest_id` only if its current `next_hop`
+    /// still equals `expected_next_hop`. Used by rollback paths that
+    /// registered a specific route and need to undo it without clobbering
+    /// a newer concurrently-written entry. Returns `true` if the entry
+    /// was removed.
+    pub fn remove_route_if_next_hop_is(&self, dest_id: u64, expected_next_hop: SocketAddr) -> bool {
+        self.routes
+            .remove_if(&dest_id, |_, entry| entry.next_hop == expected_next_hop)
+            .is_some()
+    }
+
+    /// Look up next hop for destination.
+    ///
+    /// Returns `None` for stale routes — an entry whose `updated_at` is
+    /// older than the configured `max_route_age` (default: very large;
+    /// call [`Self::set_max_route_age`] to enable expiry). Stale entries
+    /// stay in the map until a periodic [`Self::sweep_stale`] call removes
+    /// them.
     pub fn lookup(&self, dest_id: u64) -> Option<SocketAddr> {
+        let max_age = self.max_route_age();
         self.routes
             .get(&dest_id)
-            .filter(|r| r.active)
+            .filter(|r| r.active && r.updated_at.elapsed() <= max_age)
             .map(|r| r.next_hop)
+    }
+
+    /// Remove all routes whose `updated_at` is older than `max_age`.
+    /// Returns the number of entries removed.
+    ///
+    /// Called periodically from the heartbeat loop to keep dead routes
+    /// out of the table.
+    pub fn sweep_stale(&self, max_age: std::time::Duration) -> usize {
+        let mut removed = 0;
+        self.routes.retain(|_, entry| {
+            let keep = entry.updated_at.elapsed() <= max_age;
+            if !keep {
+                removed += 1;
+            }
+            keep
+        });
+        removed
+    }
+
+    /// Configure the maximum route age for `lookup` staleness checks.
+    ///
+    /// Defaults to `Duration::MAX` (effectively disabled). `MeshNode`
+    /// sets this to `3 × session_timeout` at construction.
+    pub fn set_max_route_age(&self, age: std::time::Duration) {
+        self.max_route_age_nanos.store(
+            age.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn max_route_age(&self) -> std::time::Duration {
+        let nanos = self.max_route_age_nanos.load(Ordering::Relaxed);
+        std::time::Duration::from_nanos(nanos)
     }
 
     /// Check if destination is local
@@ -378,7 +468,7 @@ impl RoutingTable {
     pub fn get_stream_stats(
         &self,
         stream_id: u64,
-    ) -> dashmap::mapref::one::Ref<'_, u64, StreamStats> {
+    ) -> dashmap::mapref::one::Ref<'_, u64, SchedulerStreamStats> {
         self.stream_stats.entry(stream_id).or_default().downgrade()
     }
 
@@ -614,7 +704,7 @@ mod tests {
 
     #[test]
     fn test_stream_stats() {
-        let stats = StreamStats::new();
+        let stats = SchedulerStreamStats::new();
 
         stats.record_in(100);
         stats.record_in(200);
@@ -641,5 +731,112 @@ mod tests {
         assert_eq!(stats.packets_in, 3);
         assert_eq!(stats.packets_out, 1);
         assert_eq!(stats.packets_dropped, 1);
+    }
+
+    /// A direct route (metric 1) must NOT be replaced by an indirect
+    /// route with a worse (higher) metric arriving later. This is the
+    /// precedence invariant that makes pingwave-driven install safe: a
+    /// pingwave from a far node via the same peer that IS our direct
+    /// peer for some other destination can't accidentally downgrade us.
+    #[test]
+    fn test_add_route_with_metric_preserves_better_direct_route() {
+        let table = RoutingTable::new(0x1111);
+        let direct: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let indirect: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+
+        // Direct insert (metric=1).
+        table.add_route(0x2222, direct);
+        assert_eq!(table.lookup(0x2222), Some(direct));
+
+        // Indirect arrives with worse metric — must be ignored.
+        table.add_route_with_metric(0x2222, indirect, 5);
+        assert_eq!(
+            table.lookup(0x2222),
+            Some(direct),
+            "worse indirect route must not displace the direct route"
+        );
+
+        // An equal-or-better metric DOES replace (captures a next-hop
+        // change, e.g., if the direct peer moved).
+        let better: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        table.add_route_with_metric(0x2222, better, 1);
+        assert_eq!(
+            table.lookup(0x2222),
+            Some(better),
+            "equal-metric update must replace next_hop"
+        );
+    }
+
+    /// Staleness: `lookup` must return `None` for entries whose
+    /// `updated_at` is older than `max_route_age`. `sweep_stale`
+    /// physically removes them.
+    #[test]
+    fn test_sweep_stale_and_staleness_aware_lookup() {
+        use std::time::Duration;
+
+        let table = RoutingTable::new(0x1111);
+        let addr_a: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+
+        table.add_route(0x2222, addr_a);
+        table.add_route(0x3333, addr_b);
+
+        // Backdate 0x2222's entry so it looks stale.
+        {
+            let mut e = table.routes.get_mut(&0x2222).unwrap();
+            e.updated_at = Instant::now() - Duration::from_secs(3600);
+        }
+
+        // With a small max-age, the backdated entry is stale but the
+        // fresh one is still visible.
+        table.set_max_route_age(Duration::from_secs(60));
+        assert_eq!(table.lookup(0x2222), None);
+        assert_eq!(table.lookup(0x3333), Some(addr_b));
+
+        // Sweep physically removes the stale entry.
+        let removed = table.sweep_stale(Duration::from_secs(60));
+        assert_eq!(removed, 1);
+        assert!(table.routes.get(&0x2222).is_none());
+        assert!(table.routes.get(&0x3333).is_some());
+    }
+
+    #[test]
+    fn test_regression_remove_route_if_next_hop_is() {
+        // Regression: rollback paths (e.g., routed-handshake msg2 send
+        // failure) used to call `remove_route` unconditionally and could
+        // clobber a newer valid route written concurrently for the same
+        // dest. `remove_route_if_next_hop_is` is the safe alternative —
+        // it only removes when the current next_hop still matches the
+        // address the caller wrote.
+        let table = RoutingTable::new(0x1111);
+        let original: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let newer: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+
+        // Install original route.
+        table.add_route(0x4444, original);
+
+        // Concurrent rewrite to a different next hop.
+        table.add_route(0x4444, newer);
+
+        // Rollback keyed on the original next_hop must NOT remove the
+        // newer entry.
+        let removed = table.remove_route_if_next_hop_is(0x4444, original);
+        assert!(
+            !removed,
+            "rollback must not evict an entry whose next_hop changed under us"
+        );
+        assert_eq!(
+            table.lookup(0x4444),
+            Some(newer),
+            "newer route must survive a stale rollback attempt"
+        );
+
+        // Rollback keyed on the current next_hop DOES remove it.
+        let removed = table.remove_route_if_next_hop_is(0x4444, newer);
+        assert!(removed);
+        assert!(table.lookup(0x4444).is_none());
+
+        // Rolling back a non-existent route is a no-op, returns false.
+        assert!(!table.remove_route_if_next_hop_is(0x4444, newer));
     }
 }

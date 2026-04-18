@@ -96,7 +96,7 @@ pub fn channel_hash(name: &str) -> u16 {
 }
 
 /// A channel identifier: name + cached hash.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ChannelId {
     name: ChannelName,
     hash: u16,

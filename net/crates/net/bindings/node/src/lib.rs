@@ -147,8 +147,14 @@ pub struct PollOptions {
 pub struct StoredEvent {
     /// Backend-specific event ID
     pub id: String,
-    /// Raw JSON payload as string
+    /// Raw payload as UTF-8. When the payload is not valid UTF-8
+    /// (binary payloads), this is the empty string and the original
+    /// bytes are in `raw_bytes` instead.
     pub raw: String,
+    /// Raw payload bytes. Always populated — consumers that need binary
+    /// fidelity should prefer this over `raw`. For UTF-8 payloads the
+    /// two fields carry the same content in different representations.
+    pub raw_bytes: Buffer,
     /// Insertion timestamp (nanoseconds)
     pub insertion_ts: i64,
     /// Shard ID
@@ -444,11 +450,16 @@ impl Net {
         let events: Vec<StoredEvent> = response
             .events
             .into_iter()
-            .map(|e| StoredEvent {
-                id: e.id,
-                raw: e.raw_str().to_owned(),
-                insertion_ts: e.insertion_ts as i64,
-                shard_id: e.shard_id as u32,
+            .map(|e| {
+                let raw = e.raw_str().unwrap_or("").to_string();
+                let raw_bytes = Buffer::from(e.raw.to_vec());
+                StoredEvent {
+                    id: e.id,
+                    raw,
+                    raw_bytes,
+                    insertion_ts: e.insertion_ts as i64,
+                    shard_id: e.shard_id as u32,
+                }
             })
             .collect();
 
@@ -777,3 +788,316 @@ fn build_config(options: Option<EventBusOptions>) -> Result<EventBusConfig> {
         .build()
         .map_err(|e| Error::from_reason(format!("Invalid configuration: {}", e)))
 }
+
+// ============================================================================
+// MeshNode bindings
+// ============================================================================
+
+#[cfg(feature = "net")]
+mod mesh_bindings {
+    use super::*;
+    use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig};
+    use net::adapter::Adapter;
+    use std::time::Duration;
+
+    /// Configuration for creating a MeshNode.
+    #[napi(object)]
+    pub struct MeshOptions {
+        /// Local bind address (e.g., "127.0.0.1:9000")
+        pub bind_addr: String,
+        /// Hex-encoded 32-byte pre-shared key
+        pub psk: String,
+        /// Heartbeat interval in milliseconds (default: 5000)
+        pub heartbeat_interval_ms: Option<u32>,
+        /// Session timeout in milliseconds (default: 30000)
+        pub session_timeout_ms: Option<u32>,
+        /// Number of inbound shards (default: 4)
+        pub num_shards: Option<u32>,
+    }
+
+    /// A multi-peer mesh node for Node.js.
+    ///
+    /// Manages encrypted connections to multiple peers over a single
+    /// UDP socket with automatic failure detection and rerouting.
+    ///
+    /// ```typescript
+    /// import { NetMesh } from '@ai2070/net';
+    ///
+    /// const node = await NetMesh.create({
+    ///   bindAddr: '127.0.0.1:9000',
+    ///   psk: '0'.repeat(64), // 32-byte hex
+    /// });
+    ///
+    /// console.log('public key:', node.publicKey());
+    ///
+    /// await node.connect('127.0.0.1:9001', peerPubkey, 0x2222);
+    /// node.start();
+    ///
+    /// node.pushTo('127.0.0.1:9001', Buffer.from('{"token":"hi"}'));
+    ///
+    /// const events = await node.poll(100);
+    ///
+    /// await node.shutdown();
+    /// ```
+    #[napi]
+    pub struct NetMesh {
+        node: Arc<ArcSwapOption<MeshNode>>,
+    }
+
+    #[napi]
+    impl NetMesh {
+        /// Create a new mesh node.
+        #[napi(factory)]
+        pub async fn create(options: MeshOptions) -> Result<NetMesh> {
+            let bind_addr: std::net::SocketAddr = options
+                .bind_addr
+                .parse()
+                .map_err(|e| Error::from_reason(format!("invalid bind address: {}", e)))?;
+
+            let psk_bytes = hex::decode(&options.psk)
+                .map_err(|e| Error::from_reason(format!("invalid PSK hex: {}", e)))?;
+            if psk_bytes.len() != 32 {
+                return Err(Error::from_reason("PSK must be 32 bytes (64 hex chars)"));
+            }
+            let mut psk = [0u8; 32];
+            psk.copy_from_slice(&psk_bytes);
+
+            let mut config = MeshNodeConfig::new(bind_addr, psk);
+            if let Some(ms) = options.heartbeat_interval_ms {
+                config = config.with_heartbeat_interval(Duration::from_millis(ms as u64));
+            }
+            if let Some(ms) = options.session_timeout_ms {
+                config = config.with_session_timeout(Duration::from_millis(ms as u64));
+            }
+            if let Some(n) = options.num_shards {
+                let n = u16::try_from(n).map_err(|_| {
+                    Error::from_reason(format!("num_shards must be in [0, 65535]; got {}", n))
+                })?;
+                config = config.with_num_shards(n);
+            }
+
+            let identity = EntityKeypair::generate();
+
+            let node = MeshNode::new(identity, config)
+                .await
+                .map_err(|e| Error::from_reason(format!("MeshNode creation failed: {}", e)))?;
+
+            Ok(NetMesh {
+                node: Arc::new(ArcSwapOption::from_pointee(node)),
+            })
+        }
+
+        /// Get this node's Noise public key (hex-encoded).
+        #[napi]
+        pub fn public_key(&self) -> Result<String> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            Ok(hex::encode(node.public_key()))
+        }
+
+        /// Get this node's ID.
+        ///
+        /// Returned as `i64` to fit JavaScript's `number` semantics. Fails
+        /// rather than wraps when the `u64` node_id exceeds `i64::MAX`,
+        /// which would otherwise silently flip sign on the JS side.
+        #[napi]
+        pub fn node_id(&self) -> Result<i64> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            i64::try_from(node.node_id()).map_err(|_| {
+                Error::from_reason(format!(
+                    "node_id {} exceeds i64::MAX; JS has no lossless u64",
+                    node.node_id()
+                ))
+            })
+        }
+
+        /// Connect to a peer (initiator side).
+        #[napi]
+        pub async fn connect(
+            &self,
+            peer_addr: String,
+            peer_public_key: String,
+            peer_node_id: i64,
+        ) -> Result<()> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let addr: std::net::SocketAddr = peer_addr
+                .parse()
+                .map_err(|e| Error::from_reason(format!("invalid peer address: {}", e)))?;
+
+            let pubkey_bytes = hex::decode(&peer_public_key)
+                .map_err(|e| Error::from_reason(format!("invalid public key hex: {}", e)))?;
+            if pubkey_bytes.len() != 32 {
+                return Err(Error::from_reason("public key must be 32 bytes"));
+            }
+            let mut pubkey = [0u8; 32];
+            pubkey.copy_from_slice(&pubkey_bytes);
+
+            let peer_node_id = u64::try_from(peer_node_id).map_err(|_| {
+                Error::from_reason(format!(
+                    "peer_node_id must be non-negative; got {}",
+                    peer_node_id
+                ))
+            })?;
+            node.connect(addr, &pubkey, peer_node_id)
+                .await
+                .map_err(|e| Error::from_reason(format!("connect failed: {}", e)))?;
+            Ok(())
+        }
+
+        /// Accept an incoming connection (responder side).
+        #[napi]
+        pub async fn accept(&self, peer_node_id: i64) -> Result<String> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let peer_node_id = u64::try_from(peer_node_id).map_err(|_| {
+                Error::from_reason(format!(
+                    "peer_node_id must be non-negative; got {}",
+                    peer_node_id
+                ))
+            })?;
+            let (addr, _) = node
+                .accept(peer_node_id)
+                .await
+                .map_err(|e| Error::from_reason(format!("accept failed: {}", e)))?;
+            Ok(addr.to_string())
+        }
+
+        /// Start the receive loop, heartbeats, and router.
+        #[napi]
+        pub fn start(&self) -> Result<()> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            node.start();
+            Ok(())
+        }
+
+        /// Send raw bytes to a direct peer.
+        #[napi]
+        pub async fn push_to(&self, peer_addr: String, data: Buffer) -> Result<bool> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let addr: std::net::SocketAddr = peer_addr
+                .parse()
+                .map_err(|e| Error::from_reason(format!("invalid address: {}", e)))?;
+
+            let batch = net::event::Batch {
+                shard_id: 0,
+                events: vec![net::event::InternalEvent::new(
+                    bytes::Bytes::copy_from_slice(data.as_ref()),
+                    0,
+                    0,
+                )],
+                sequence_start: 0,
+            };
+
+            node.send_to_peer(addr, batch)
+                .await
+                .map_err(|e| Error::from_reason(format!("send failed: {}", e)))?;
+            Ok(true)
+        }
+
+        /// Poll for received events.
+        #[napi]
+        pub async fn poll(&self, limit: u32) -> Result<Vec<StoredEvent>> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let result = node
+                .poll_shard(0, None, limit as usize)
+                .await
+                .map_err(|e| Error::from_reason(format!("poll failed: {}", e)))?;
+
+            Ok(result
+                .events
+                .into_iter()
+                .map(|e| {
+                    // Preserve binary payloads in `raw_bytes`. `raw` is
+                    // kept for back-compat with UTF-8 consumers but is
+                    // deliberately empty (not a silent UTF-8-lossy
+                    // substitution) when the payload isn't valid UTF-8 —
+                    // callers that need fidelity must use `raw_bytes`.
+                    let raw = e.raw_str().unwrap_or("").to_string();
+                    let raw_bytes = Buffer::from(e.raw.to_vec());
+                    StoredEvent {
+                        id: e.id,
+                        raw,
+                        raw_bytes,
+                        insertion_ts: e.insertion_ts as i64,
+                        shard_id: e.shard_id as u32,
+                    }
+                })
+                .collect())
+        }
+
+        /// Add a route to a destination node.
+        #[napi]
+        pub fn add_route(&self, dest_node_id: i64, next_hop_addr: String) -> Result<()> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let addr: std::net::SocketAddr = next_hop_addr
+                .parse()
+                .map_err(|e| Error::from_reason(format!("invalid address: {}", e)))?;
+            let dest_node_id = u64::try_from(dest_node_id).map_err(|_| {
+                Error::from_reason(format!(
+                    "dest_node_id must be non-negative; got {}",
+                    dest_node_id
+                ))
+            })?;
+            node.router().add_route(dest_node_id, addr);
+            Ok(())
+        }
+
+        /// Number of connected peers.
+        #[napi]
+        pub fn peer_count(&self) -> Result<u32> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            Ok(node.peer_count() as u32)
+        }
+
+        /// Number of nodes discovered via pingwave.
+        #[napi]
+        pub fn discovered_nodes(&self) -> Result<u32> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            Ok(node.proximity_graph().node_count() as u32)
+        }
+
+        /// Shutdown the mesh node.
+        #[napi]
+        pub async fn shutdown(&self) -> Result<()> {
+            let node_arc = self
+                .node
+                .swap(None)
+                .ok_or_else(|| Error::from_reason("already shut down"))?;
+
+            match Arc::try_unwrap(node_arc) {
+                Ok(node) => {
+                    node.shutdown()
+                        .await
+                        .map_err(|e| Error::from_reason(format!("shutdown failed: {}", e)))?;
+                }
+                Err(arc) => {
+                    // Put it back if there are outstanding references
+                    self.node.store(Some(arc));
+                    return Err(Error::from_reason(
+                        "cannot shutdown: outstanding references exist",
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        fn load_node(&self) -> Result<arc_swap::Guard<Option<Arc<MeshNode>>>> {
+            let guard = self.node.load();
+            if guard.is_none() {
+                return Err(Error::from_reason("MeshNode has been shut down"));
+            }
+            Ok(guard)
+        }
+    }
+}
+
+#[cfg(feature = "net")]
+pub use mesh_bindings::*;

@@ -66,11 +66,11 @@ Snapshot -> Transfer -> Restore -> Replay -> Cutover -> Complete
 | Phase | What happens |
 |-------|-------------|
 | **Snapshot** | Take `StateSnapshot` on source node (daemon state + chain head + horizon) |
-| **Transfer** | Send snapshot to target node via `SUBPROTOCOL_MIGRATION` (0x0500) |
-| **Restore** | Call `daemon.restore(state)` on target, start buffering new events |
-| **Replay** | Replay buffered events on target (events that arrived during transfer) |
-| **Cutover** | Atomic routing switch -- new events go to target |
-| **Complete** | Cleanup source, migration done |
+| **Transfer** | Send snapshot to target node via `SUBPROTOCOL_MIGRATION` (0x0500), chunked if needed |
+| **Restore** | Reassemble chunks, resolve local `DaemonFactoryRegistry` entry, call `DaemonHost::from_snapshot()` and register the daemon on target. Target starts buffering in-flight events. |
+| **Replay** | Target replays buffered events in strict sequence order from source, drains to daemon |
+| **Cutover** | Source stops accepting writes; routing switches so new events go to the target. Source does not tear down the daemon yet. |
+| **Complete** | Source unregisters the daemon from its local registry; orchestrator emits `ActivateTarget`; target calls `activate()`, drains remaining events, replies with `ActivateAck`; orchestrator removes the migration record |
 
 Phase transitions are validated -- calling `set_snapshot()` in the wrong phase returns `MigrationError::WrongPhase`. The snapshot's `origin_hash` is verified against the daemon being migrated.
 
@@ -114,13 +114,17 @@ Events arriving during migration are buffered and replayed after restore. This e
 ### Target Handler
 
 `MigrationTargetHandler` manages the target node's role:
-- Restores a daemon from a snapshot via `DaemonHost::from_snapshot()`
+- Restores a daemon from a snapshot via `DaemonHost::from_snapshot()`, using a factory + keypair + config resolved from a local `DaemonFactoryRegistry`
 - Replays buffered events in strict sequence order (uses `BTreeMap` for out-of-order arrival handling)
 - Activates as the authoritative copy after cutover
 
+### DaemonFactoryRegistry
+
+`DaemonHost::from_snapshot()` needs a freshly constructed daemon instance plus the daemon's `EntityKeypair` and host config. Neither can cross the wire (closures aren't serializable; key transfer is a separate security problem). The `DaemonFactoryRegistry` on each potential target resolves `origin_hash → {factory, keypair, config}` locally when a `SnapshotReady` arrives. Entries are consumed on `take()` so double-restore surfaces loudly instead of silently re-initialising state. Construct the handler with `MigrationTargetHandler::new_with_factories(registry, factories)` to enable auto-restore; `::new(registry)` keeps the registry empty for source-only nodes.
+
 ### Migration Wire Protocol
 
-8 message types over `SUBPROTOCOL_MIGRATION` (0x0500):
+10 message types over `SUBPROTOCOL_MIGRATION` (0x0500):
 
 | Message | Direction | Purpose |
 |---------|-----------|---------|
@@ -131,6 +135,8 @@ Events arriving during migration are buffered and replayed after restore. This e
 | `ReplayComplete` | Target → Orchestrator | Replay done |
 | `CutoverNotify` | Orchestrator → Source | Stop writes |
 | `CleanupComplete` | Source → Orchestrator | Source cleaned up |
+| `ActivateTarget` | Orchestrator → Target | Go live — drain remaining events and become authoritative |
+| `ActivateAck` | Target → Orchestrator | Activation complete; migration terminus |
 | `MigrationFailed` | Any → All | Abort |
 
 ### Snapshot Chunking
@@ -154,6 +160,32 @@ Nodes advertise migration support through the capability graph. `SubprotocolRegi
 ### Superposition
 
 During migration, a `SuperpositionState` tracks the entity's observational phase. The entity exists on both nodes briefly during replay, then collapses to the target at cutover. See [CONTINUITY.md](CONTINUITY.md) for details.
+
+### What this enables: immortal daemons
+
+With all six phases wired over the subprotocol, a daemon's *worldline* — its causal chain and entity identity — survives the host node going away. The orchestrator fires `start_migration(origin, source, target)` once; every subsequent step (snapshot, reassembly, restore, buffered-event drain, replay, cutover, source cleanup, target activation) chains autonomously through `SUBPROTOCOL_MIGRATION` messages. No human in the loop, no hand-off script, no per-migration state outside the nodes themselves.
+
+**What the daemon keeps across a move:**
+
+- **`EntityId`** — the ed25519 public key is part of the snapshot. Clients addressing the daemon by origin don't notice the move.
+- **Causal-chain sequence.** The target resumes at `snapshot.through_seq + 1`. Events produced before cutover and events produced after cutover form a single contiguous chain; observers can verify continuity via `CausalLink.parent_hash`.
+- **Observed horizon.** `StateSnapshot.horizon` is preserved in memory on the source but not carried across the wire today — the compact snapshot format omits it, so the target reconstructs a fresh horizon on restore. Good enough for current workloads; worth tightening if cross-entity causal reasoning becomes load-bearing.
+- **In-flight events.** Events that arrived on the source while the migration was flying are buffered there, shipped to the target in `BufferedEvents`, and replayed in strict sequence order. Nothing is dropped.
+- **Routing.** Peers reach the daemon by its `origin_hash`, which didn't change. The routing plane (`SUBPROTOCOL_MIGRATION` cleanup on the source + the target's existing session plumbing) is the only thing that needs to update, and it does.
+
+**What "immortal" does not cover:**
+
+- **Host crash before `SnapshotReady`.** If the source dies before it produces a snapshot the orchestrator can forward, there is no state to migrate. `ReplicaGroup` / `StandbyGroup` are the answer for workloads that cannot tolerate this — they keep a warm copy running.
+- **Keypair transport.** The target's `DaemonFactoryRegistry` must already carry the daemon's `EntityKeypair` — today that's an out-of-band provisioning step, intentionally out of scope for this subprotocol. Treating the private key as sensitive, and moving it from source to target securely at migration time, is a separate security problem.
+- **Byzantine orchestrators.** A malicious orchestrator could instruct targets to drop the daemon (`MigrationFailed`) or redirect to an attacker-controlled node. Orchestrator trust is a deployment concern, not a protocol guarantee.
+
+**How this composes with the group types:**
+
+- `ReplicaGroup` scales a *stateless* daemon horizontally; migration is unnecessary because any replica can be re-spawned deterministically from `group_seed + index`.
+- `StandbyGroup` keeps a *stateful* daemon fault-tolerant; on failure of the active, a standby promotes and replays buffered events using the **same** `BufferedEvents` machinery migration uses. Migration is what makes standby promotion safe against an active node that's still alive (a drain-and-hand-off), and standby is what makes it safe against an active that just crashed.
+- `ForkGroup` creates divergent lineages from a common parent; migration moves a single lineage, but the fork parent's `ContinuityProof` is still verifiable across the move because the pre-fork chain head rides inside `StateSnapshot.chain_link`.
+
+The coverage end-to-end is `tests/migration_integration.rs` (single-chunk and multi-chunk lifecycle via a mock message pump, plus `test_regression_*` cases for no-factory / corrupt-snapshot / retry-idempotency / activate-without-restore) and `tests/three_node_integration.rs::test_migration_full_lifecycle_over_wire` (three nodes, real encrypted UDP, full 6-phase chain).
 
 ## Replica Groups
 

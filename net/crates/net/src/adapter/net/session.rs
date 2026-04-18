@@ -103,6 +103,108 @@ impl NetSession {
             .or_insert_with(|| StreamState::new(self.default_reliable))
     }
 
+    /// Open a stream with an explicit reliability mode and fair-scheduler
+    /// weight.
+    ///
+    /// Idempotent: if the stream already exists, this is a no-op and the
+    /// caller's config is **ignored with a warning log** — the first open
+    /// wins. Callers that want to change a stream's config must close +
+    /// re-open it.
+    pub fn open_stream_with(&self, stream_id: u64, reliable: bool, fairness_weight: u8) {
+        use dashmap::mapref::entry::Entry;
+        match self.streams.entry(stream_id) {
+            Entry::Occupied(existing) => {
+                let existing = existing.get();
+                if existing.reliable_mode() != reliable
+                    || existing.fairness_weight() != fairness_weight.max(1)
+                {
+                    tracing::warn!(
+                        stream_id = format!("{:#x}", stream_id),
+                        existing_reliable = existing.reliable_mode(),
+                        new_reliable = reliable,
+                        existing_weight = existing.fairness_weight(),
+                        new_weight = fairness_weight,
+                        "open_stream: ignoring conflicting config; first open wins"
+                    );
+                }
+            }
+            Entry::Vacant(v) => {
+                v.insert(StreamState::new_with_weight(reliable, fairness_weight));
+            }
+        }
+    }
+
+    /// Close a stream: mark it inactive and remove its state.
+    ///
+    /// Idempotent — closing a non-existent stream is a no-op. After
+    /// close, a subsequent `open_stream_with` creates a fresh stream.
+    pub fn close_stream(&self, stream_id: u64) {
+        if let Some((_, state)) = self.streams.remove(&stream_id) {
+            state.deactivate();
+        }
+    }
+
+    /// Remove streams whose `last_activity` is older than `max_idle`,
+    /// keeping the active count at or below `max_streams` by LRU-evicting
+    /// the oldest if still over cap. Returns the number of streams
+    /// evicted. Called from the session owner's heartbeat loop.
+    pub fn evict_idle_streams(
+        &self,
+        max_idle: Duration,
+        max_streams: usize,
+        reason_tag: &'static str,
+    ) -> usize {
+        let mut evicted = 0;
+        let now = current_timestamp();
+        let max_idle_ns = u64::try_from(max_idle.as_nanos()).unwrap_or(u64::MAX);
+
+        // Pass 1: drop idle streams.
+        let idle: Vec<u64> = self
+            .streams
+            .iter()
+            .filter(|e| now.saturating_sub(e.value().last_activity_ns()) > max_idle_ns)
+            .map(|e| *e.key())
+            .collect();
+        for sid in idle {
+            if let Some((_, state)) = self.streams.remove(&sid) {
+                state.deactivate();
+                evicted += 1;
+                tracing::debug!(
+                    stream_id = format!("{:#x}", sid),
+                    reason = reason_tag,
+                    "stream evicted: idle timeout"
+                );
+            }
+        }
+
+        // Pass 2: if still over the cap, LRU-evict the oldest.
+        while self.streams.len() > max_streams {
+            let oldest = self
+                .streams
+                .iter()
+                .min_by_key(|e| e.value().last_activity_ns())
+                .map(|e| *e.key());
+            match oldest {
+                Some(sid) => {
+                    if let Some((_, state)) = self.streams.remove(&sid) {
+                        state.deactivate();
+                        evicted += 1;
+                        tracing::warn!(
+                            stream_id = format!("{:#x}", sid),
+                            reason = "cap_exceeded",
+                            total_streams = self.streams.len(),
+                            max_streams = max_streams,
+                            "stream evicted: max_streams cap"
+                        );
+                    }
+                }
+                None => break,
+            }
+        }
+
+        evicted
+    }
+
     /// Get stream state (read-only)
     pub fn get_stream(
         &self,
@@ -185,23 +287,67 @@ pub struct StreamState {
     inbound: SegQueue<StoredEvent>,
     /// Stream is active
     active: AtomicBool,
+    /// Nanoseconds since epoch of the last activity (send or receive).
+    /// Used by the session's idle-eviction sweep.
+    last_activity: AtomicU64,
+    /// Reliability mode this stream was created with. Stored so
+    /// `open_stream` can warn when a caller re-opens with a different
+    /// config (config is immutable for the stream's lifetime).
+    reliable_mode: bool,
+    /// Fair-scheduler quantum multiplier (1 = equal share).
+    fairness_weight: u8,
 }
 
 impl StreamState {
     /// Create a new stream state
     pub fn new(reliable: bool) -> Self {
+        Self::new_with_weight(reliable, 1)
+    }
+
+    /// Create a new stream state with a fair-scheduler weight.
+    pub fn new_with_weight(reliable: bool, fairness_weight: u8) -> Self {
         Self {
             tx_seq: AtomicU64::new(0),
             rx_seq: AtomicU64::new(0),
             reliability: parking_lot::Mutex::new(create_reliability_mode(reliable)),
             inbound: SegQueue::new(),
             active: AtomicBool::new(true),
+            last_activity: AtomicU64::new(current_timestamp()),
+            reliable_mode: reliable,
+            fairness_weight: fairness_weight.max(1),
         }
     }
 
-    /// Get and increment the TX sequence number
+    /// Refresh last-activity timestamp. Called on every send and on
+    /// every receive that lands packets/events into the stream.
+    #[inline]
+    pub fn touch(&self) {
+        self.last_activity
+            .store(current_timestamp(), Ordering::Release);
+    }
+
+    /// Nanoseconds since epoch of the last activity.
+    #[inline]
+    pub fn last_activity_ns(&self) -> u64 {
+        self.last_activity.load(Ordering::Acquire)
+    }
+
+    /// Reliability mode this stream was created with.
+    #[inline]
+    pub fn reliable_mode(&self) -> bool {
+        self.reliable_mode
+    }
+
+    /// Fair-scheduler weight for this stream.
+    #[inline]
+    pub fn fairness_weight(&self) -> u8 {
+        self.fairness_weight
+    }
+
+    /// Get and increment the TX sequence number. Refreshes `last_activity`.
     #[inline]
     pub fn next_tx_seq(&self) -> u64 {
+        self.touch();
         self.tx_seq.fetch_add(1, Ordering::Relaxed)
     }
 
@@ -211,9 +357,10 @@ impl StreamState {
         self.tx_seq.load(Ordering::Relaxed)
     }
 
-    /// Update the RX sequence number
+    /// Update the RX sequence number. Refreshes `last_activity`.
     #[inline]
     pub fn update_rx_seq(&self, seq: u64) {
+        self.touch();
         self.rx_seq.fetch_max(seq, Ordering::Relaxed);
     }
 
@@ -460,6 +607,95 @@ mod tests {
 
         manager.clear_session();
         assert!(!manager.has_session());
+    }
+
+    #[test]
+    fn test_open_stream_with_idempotent() {
+        let keys = test_keys();
+        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let session = NetSession::new(keys, peer_addr, 4, false);
+
+        // First open creates state.
+        session.open_stream_with(42, true, 3);
+        assert_eq!(session.stream_count(), 1);
+        let state = session.get_stream(42).unwrap();
+        assert!(state.reliable_mode());
+        assert_eq!(state.fairness_weight(), 3);
+        drop(state);
+
+        // Second open with matching config is a no-op.
+        session.open_stream_with(42, true, 3);
+        assert_eq!(session.stream_count(), 1);
+
+        // Second open with DIFFERENT config is also a no-op
+        // (first open wins). We log a warning but don't mutate.
+        session.open_stream_with(42, false, 7);
+        let state = session.get_stream(42).unwrap();
+        assert!(
+            state.reliable_mode(),
+            "first open wins — reliable still true"
+        );
+        assert_eq!(
+            state.fairness_weight(),
+            3,
+            "first open wins — weight still 3"
+        );
+    }
+
+    #[test]
+    fn test_close_stream_removes_state() {
+        let keys = test_keys();
+        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let session = NetSession::new(keys, peer_addr, 4, false);
+
+        session.open_stream_with(1, false, 1);
+        session.open_stream_with(2, true, 2);
+        assert_eq!(session.stream_count(), 2);
+
+        session.close_stream(1);
+        assert_eq!(session.stream_count(), 1);
+        assert!(session.get_stream(1).is_none());
+        assert!(session.get_stream(2).is_some());
+
+        // Closing a non-existent stream is a no-op.
+        session.close_stream(99);
+        assert_eq!(session.stream_count(), 1);
+
+        // Re-open after close creates fresh state with new config.
+        session.close_stream(2);
+        session.open_stream_with(2, false, 5);
+        let state = session.get_stream(2).unwrap();
+        assert!(!state.reliable_mode());
+        assert_eq!(state.fairness_weight(), 5);
+    }
+
+    #[test]
+    fn test_evict_idle_streams_timeout_and_cap() {
+        let keys = test_keys();
+        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let session = NetSession::new(keys, peer_addr, 4, false);
+
+        // Open three streams; touch only one so the other two look idle.
+        session.open_stream_with(1, false, 1);
+        session.open_stream_with(2, false, 1);
+        session.open_stream_with(3, false, 1);
+        std::thread::sleep(Duration::from_millis(10));
+        session.get_or_create_stream(2).touch();
+
+        // With a tight idle timeout, streams 1 and 3 should be evicted;
+        // stream 2 was just touched so it survives.
+        let evicted = session.evict_idle_streams(Duration::from_millis(5), usize::MAX, "test");
+        assert_eq!(evicted, 2);
+        assert_eq!(session.stream_count(), 1);
+        assert!(session.get_stream(2).is_some());
+
+        // Cap eviction: open two more streams so we have 3, then cap at 1.
+        session.open_stream_with(4, false, 1);
+        session.open_stream_with(5, false, 1);
+        assert_eq!(session.stream_count(), 3);
+        let evicted = session.evict_idle_streams(Duration::from_nanos(u64::MAX), 1, "test");
+        assert_eq!(evicted, 2);
+        assert_eq!(session.stream_count(), 1);
     }
 
     #[test]

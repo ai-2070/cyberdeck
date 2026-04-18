@@ -6,6 +6,7 @@
 //! for snapshot-based daemon migration.
 
 mod daemon;
+pub mod daemon_factory;
 pub mod fork_group;
 pub mod group_coord;
 mod host;
@@ -19,6 +20,7 @@ mod scheduler;
 pub mod standby_group;
 
 pub use daemon::{DaemonError, DaemonHostConfig, DaemonStats, MeshDaemon};
+pub use daemon_factory::{DaemonFactoryRegistry, FactoryEntry};
 pub use fork_group::{ForkGroup, ForkGroupConfig, ForkInfo};
 pub use group_coord::{GroupCoordinator, GroupError, GroupHealth, MemberInfo};
 pub use host::DaemonHost;

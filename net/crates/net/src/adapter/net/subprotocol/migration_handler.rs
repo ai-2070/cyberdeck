@@ -5,11 +5,16 @@
 
 use std::sync::Arc;
 
+use dashmap::DashMap;
+use parking_lot::Mutex;
+
+use crate::adapter::net::compute::migration_target::RestoreContext;
 use crate::adapter::net::compute::orchestrator::wire;
 use crate::adapter::net::compute::{
     MigrationError, MigrationMessage, MigrationOrchestrator, MigrationSourceHandler,
-    MigrationTargetHandler,
+    MigrationTargetHandler, SnapshotReassembler,
 };
+use crate::adapter::net::state::snapshot::StateSnapshot;
 
 /// Outbound message with destination node.
 #[derive(Debug)]
@@ -29,6 +34,13 @@ pub struct MigrationSubprotocolHandler {
     source_handler: Arc<MigrationSourceHandler>,
     target_handler: Arc<MigrationTargetHandler>,
     local_node_id: u64,
+    /// Per-target reassemblers for incoming snapshot chunks. One entry
+    /// per in-flight inbound migration. Lazily created on first chunk,
+    /// torn down after successful restore or failure.
+    ///
+    /// Wrapped in `Mutex` because `SnapshotReassembler::feed` requires
+    /// `&mut self`.
+    reassemblers: DashMap<u32, Mutex<SnapshotReassembler>>,
 }
 
 impl MigrationSubprotocolHandler {
@@ -44,6 +56,7 @@ impl MigrationSubprotocolHandler {
             source_handler,
             target_handler,
             local_node_id,
+            reassemblers: DashMap::new(),
         }
     }
 
@@ -72,10 +85,15 @@ impl MigrationSubprotocolHandler {
                 daemon_origin,
                 target_node,
             } => {
-                // We are the source — take snapshot and reply
-                let snapshot = self
-                    .source_handler
-                    .start_snapshot(daemon_origin, target_node)?;
+                // We are the source — take snapshot and reply.
+                // Record `from_node` as the orchestrator: it's the node
+                // that sent us TakeSnapshot, and replies (SnapshotReady,
+                // CleanupComplete) must reach it. The source-side handler
+                // stores this so subsequent replies don't drift if a
+                // future forwarding layer rewrites `from_node`.
+                let snapshot =
+                    self.source_handler
+                        .start_snapshot(daemon_origin, target_node, from_node)?;
 
                 // Chunk the snapshot for transport
                 let chunks = crate::adapter::net::compute::orchestrator::chunk_snapshot(
@@ -83,9 +101,13 @@ impl MigrationSubprotocolHandler {
                     snapshot.to_bytes(),
                     snapshot.through_seq,
                 )?;
+                let orch = self
+                    .source_handler
+                    .orchestrator_node(daemon_origin)
+                    .unwrap_or(from_node);
                 for chunk in chunks {
                     outbound.push(OutboundMigrationMessage {
-                        dest_node: from_node, // reply to orchestrator
+                        dest_node: orch,
                         payload: wire::encode(&chunk)?,
                     });
                 }
@@ -98,25 +120,85 @@ impl MigrationSubprotocolHandler {
                 chunk_index,
                 total_chunks,
             } => {
-                // Forward snapshot chunk to the target via orchestrator
-                let forward = self.orchestrator.on_snapshot_ready(
-                    daemon_origin,
-                    snapshot_bytes,
-                    seq_through,
-                    chunk_index,
-                    total_chunks,
-                )?;
-                // The orchestrator returns a SnapshotReady to forward to target
-                if let MigrationMessage::SnapshotReady { .. } = &forward {
-                    let target_node = self
-                        .orchestrator
-                        .target_node(daemon_origin)
-                        .unwrap_or(from_node);
+                // If the orchestrator is local, let it record this chunk and
+                // forward to target. `target_node` identifies where the
+                // snapshot should be restored; if that's us, we reassemble
+                // and restore instead of forwarding.
+                let orch_target = self.orchestrator.target_node(daemon_origin);
 
-                    outbound.push(OutboundMigrationMessage {
-                        dest_node: target_node,
-                        payload: wire::encode(&forward)?,
-                    });
+                match orch_target {
+                    Some(target) if target == self.local_node_id => {
+                        // We are the target — advance orchestrator state
+                        // (safe: on_snapshot_ready is idempotent on the
+                        // target side because it just re-derives the
+                        // forward message we ignore), then reassemble.
+                        //
+                        // Errors are informational: the restore path below
+                        // is the authoritative check for whether the
+                        // snapshot is usable. We log at `debug` rather
+                        // than ignore so non-idempotent failures (e.g.,
+                        // unexpected phase transitions on a stale record)
+                        // are observable during triage.
+                        if let Err(e) = self.orchestrator.on_snapshot_ready(
+                            daemon_origin,
+                            snapshot_bytes.clone(),
+                            seq_through,
+                            chunk_index,
+                            total_chunks,
+                        ) {
+                            tracing::debug!(
+                                ?e,
+                                origin = format!("{:#x}", daemon_origin),
+                                "on_snapshot_ready (local target): ignored"
+                            );
+                        }
+
+                        if let Some(out) = self.restore_on_target(
+                            daemon_origin,
+                            snapshot_bytes,
+                            seq_through,
+                            chunk_index,
+                            total_chunks,
+                            from_node,
+                        )? {
+                            outbound.extend(out);
+                        }
+                    }
+                    Some(target) => {
+                        // Middle of the chain (or orchestrator node forwarding
+                        // to a remote target). Let the orchestrator update its
+                        // own phase state and emit the forward.
+                        let forward = self.orchestrator.on_snapshot_ready(
+                            daemon_origin,
+                            snapshot_bytes,
+                            seq_through,
+                            chunk_index,
+                            total_chunks,
+                        )?;
+                        if let MigrationMessage::SnapshotReady { .. } = &forward {
+                            outbound.push(OutboundMigrationMessage {
+                                dest_node: target,
+                                payload: wire::encode(&forward)?,
+                            });
+                        }
+                    }
+                    None => {
+                        // No local migration record — this node may be a
+                        // target that has no orchestrator-side state (the
+                        // orchestrator lives on a different node). Try to
+                        // restore anyway; the factory registry is the
+                        // authority on whether this node should accept.
+                        if let Some(out) = self.restore_on_target(
+                            daemon_origin,
+                            snapshot_bytes,
+                            seq_through,
+                            chunk_index,
+                            total_chunks,
+                            from_node,
+                        )? {
+                            outbound.extend(out);
+                        }
+                    }
                 }
             }
 
@@ -124,16 +206,22 @@ impl MigrationSubprotocolHandler {
                 daemon_origin,
                 restored_seq,
             } => {
-                // Target has restored — orchestrator may send buffered events
-                if let Some(buffered_msg) = self
+                // Target has restored — orchestrator may send buffered events.
+                // If there are no buffered events, send an empty BufferedEvents
+                // anyway: the target's reply (ReplayComplete) is what drives
+                // the chain forward into Cutover. Dropping the message here
+                // would stall any migration whose source never buffered.
+                let buffered_msg = self
                     .orchestrator
                     .on_restore_complete(daemon_origin, restored_seq)?
-                {
-                    outbound.push(OutboundMigrationMessage {
-                        dest_node: from_node, // send back to target
-                        payload: wire::encode(&buffered_msg)?,
+                    .unwrap_or(MigrationMessage::BufferedEvents {
+                        daemon_origin,
+                        events: Vec::new(),
                     });
-                }
+                outbound.push(OutboundMigrationMessage {
+                    dest_node: from_node, // send back to target
+                    payload: wire::encode(&buffered_msg)?,
+                });
             }
 
             MigrationMessage::ReplayComplete {
@@ -163,8 +251,18 @@ impl MigrationSubprotocolHandler {
                 daemon_origin,
                 target_node,
             } => {
-                // We are the source — stop accepting writes
-                let final_events = self.source_handler.on_cutover(daemon_origin)?;
+                // We are the source — stop accepting writes.
+                //
+                // `on_cutover` returns `DaemonNotFound` if this node didn't
+                // handle a `TakeSnapshot` (the orchestrator took the snapshot
+                // locally and never involved `source_handler`). Treat that as
+                // "no buffered events to drain" rather than a hard error so
+                // local-source migrations can still reach cleanup.
+                let final_events = match self.source_handler.on_cutover(daemon_origin) {
+                    Ok(events) => events,
+                    Err(MigrationError::DaemonNotFound(_)) => Vec::new(),
+                    Err(e) => return Err(e),
+                };
 
                 // If there are last-moment events, send them to target
                 if !final_events.is_empty() {
@@ -178,22 +276,91 @@ impl MigrationSubprotocolHandler {
                     });
                 }
 
-                // Acknowledge cutover to orchestrator
-                self.orchestrator.on_cutover_acknowledged(daemon_origin)?;
+                // Acknowledge cutover to the local orchestrator. When the
+                // orchestrator lives on a different node, this local call
+                // has no record to advance; the remote orchestrator learns
+                // about cutover from `CleanupComplete`, which does the same
+                // phase advance there.
+                match self.orchestrator.on_cutover_acknowledged(daemon_origin) {
+                    Ok(()) => {}
+                    Err(MigrationError::DaemonNotFound(_)) => {}
+                    Err(e) => return Err(e),
+                }
 
-                // Cleanup source
-                self.source_handler.cleanup(daemon_origin)?;
+                // Capture the orchestrator BEFORE `cleanup()` clears the
+                // source-side migration record — once it's gone,
+                // `orchestrator_node()` returns None and we'd silently
+                // fall back to `from_node`, defeating the whole point of
+                // recording the orchestrator at `start_snapshot` time.
+                let dest = self
+                    .source_handler
+                    .orchestrator_node(daemon_origin)
+                    .unwrap_or(from_node);
+
+                // Cleanup source — also tolerant of missing source_handler
+                // state, and unregisters the local daemon even if no
+                // `source_handler.start_snapshot` was called.
+                let _ = self.source_handler.cleanup(daemon_origin);
 
                 let cleanup_msg = MigrationMessage::CleanupComplete { daemon_origin };
                 outbound.push(OutboundMigrationMessage {
-                    dest_node: from_node,
+                    dest_node: dest,
                     payload: wire::encode(&cleanup_msg)?,
                 });
             }
 
             MigrationMessage::CleanupComplete { daemon_origin } => {
-                // Source has cleaned up — migration is fully complete
-                self.orchestrator.on_cleanup_complete(daemon_origin)?;
+                // Source reports its cleanup done. The orchestrator now
+                // tells the target to activate.
+                let activate = self.orchestrator.on_cleanup_complete(daemon_origin)?;
+                // Route the ActivateTarget to whichever node is the target.
+                let target = self
+                    .orchestrator
+                    .target_node(daemon_origin)
+                    .unwrap_or(from_node);
+                outbound.push(OutboundMigrationMessage {
+                    dest_node: target,
+                    payload: wire::encode(&activate)?,
+                });
+            }
+
+            MigrationMessage::ActivateTarget { daemon_origin } => {
+                // We are the target — drain remaining events and go live.
+                // Retry-safe: `activate()` is idempotent once the migration
+                // has been completed, and we route the ack to the recorded
+                // orchestrator BEFORE `complete()` transitions state to the
+                // idempotency index. If the ack packet is lost, a retried
+                // ActivateTarget will find the completed record, return the
+                // same replayed_seq, and re-send the ack. The orchestrator
+                // therefore can't get wedged waiting for a completion that
+                // already happened.
+                let replayed_seq = self.target_handler.activate(daemon_origin)?;
+                let ack_dest = self
+                    .target_handler
+                    .orchestrator_node(daemon_origin)
+                    .unwrap_or(from_node);
+                let ack = MigrationMessage::ActivateAck {
+                    daemon_origin,
+                    replayed_seq,
+                };
+                outbound.push(OutboundMigrationMessage {
+                    dest_node: ack_dest,
+                    payload: wire::encode(&ack)?,
+                });
+                // `complete()` is idempotent: a retried ActivateTarget
+                // after a lost ack re-runs `activate()` (idempotent) and
+                // `complete()` (no-op once Complete).
+                let _ = self.target_handler.complete(daemon_origin);
+            }
+
+            MigrationMessage::ActivateAck {
+                daemon_origin,
+                replayed_seq,
+            } => {
+                // Target acknowledged — migration terminus on the
+                // orchestrator.
+                self.orchestrator
+                    .on_activate_ack(daemon_origin, replayed_seq)?;
             }
 
             MigrationMessage::MigrationFailed {
@@ -220,14 +387,179 @@ impl MigrationSubprotocolHandler {
                     daemon_origin,
                     replayed_seq,
                 };
+                let dest = self
+                    .target_handler
+                    .orchestrator_node(daemon_origin)
+                    .unwrap_or(from_node);
                 outbound.push(OutboundMigrationMessage {
-                    dest_node: from_node,
+                    dest_node: dest,
                     payload: wire::encode(&reply)?,
                 });
             }
         }
 
         Ok(outbound)
+    }
+
+    /// Feed a snapshot chunk into the target-side reassembler. When the
+    /// full snapshot is assembled, resolve a factory for the daemon and
+    /// call `restore_snapshot`, then emit `RestoreComplete` back to the
+    /// source node (`from_node`).
+    ///
+    /// Returns `Ok(None)` while waiting for more chunks, `Ok(Some(outbound))`
+    /// with the `RestoreComplete` (or a `MigrationFailed`) once restore has
+    /// been attempted.
+    fn restore_on_target(
+        &self,
+        daemon_origin: u32,
+        snapshot_bytes: Vec<u8>,
+        seq_through: u64,
+        chunk_index: u32,
+        total_chunks: u32,
+        from_node: u64,
+    ) -> Result<Option<Vec<OutboundMigrationMessage>>, MigrationError> {
+        let reassembler_entry = self
+            .reassemblers
+            .entry(daemon_origin)
+            .or_insert_with(|| Mutex::new(SnapshotReassembler::new()));
+
+        let assembled = {
+            let mut reassembler = reassembler_entry.lock();
+            reassembler
+                .feed(
+                    daemon_origin,
+                    snapshot_bytes,
+                    seq_through,
+                    chunk_index,
+                    total_chunks,
+                )
+                .map_err(|e| {
+                    MigrationError::StateFailed(format!("snapshot reassembly failed: {:?}", e))
+                })?
+        };
+        drop(reassembler_entry); // release DashMap read lock
+
+        let assembled_bytes = match assembled {
+            Some(bytes) => bytes,
+            None => return Ok(None), // still waiting for more chunks
+        };
+
+        // Drop the reassembler entry now that we've completed.
+        self.reassemblers.remove(&daemon_origin);
+
+        // Parse the snapshot. A parse failure is a hard migration failure.
+        let snapshot = match StateSnapshot::from_bytes(&assembled_bytes) {
+            Some(s) => s,
+            None => {
+                return Ok(Some(self.fail_migration(
+                    daemon_origin,
+                    from_node,
+                    "failed to parse snapshot bytes on target",
+                )?));
+            }
+        };
+
+        // `source_node` is the daemon's pre-migration host — tracked here
+        // only for the target-handler's internal bookkeeping. It is NOT
+        // where `RestoreComplete` gets sent (see below).
+        let source_node = self
+            .orchestrator
+            .source_node(daemon_origin)
+            .unwrap_or(from_node);
+
+        // If this origin is already under migration here, the source is
+        // retrying because our earlier `RestoreComplete` didn't make it
+        // back. Don't touch the already-restored daemon; just re-emit
+        // `RestoreComplete` so the orchestrator can advance. This also
+        // means we DO NOT consume the factory on the retry — the factory
+        // registration must survive until the migration is truly complete
+        // (`ActivateAck`), not just until the first locally-successful
+        // restore.
+        if !self.target_handler.is_migrating(daemon_origin) {
+            let inputs = match self.target_handler.factories().construct(daemon_origin) {
+                Some(i) => i,
+                None => {
+                    return Ok(Some(self.fail_migration(
+                        daemon_origin,
+                        from_node,
+                        &format!(
+                            "no daemon factory registered for origin {:#x}",
+                            daemon_origin
+                        ),
+                    )?));
+                }
+            };
+
+            let daemon = inputs.daemon;
+            if let Err(e) = self.target_handler.restore_snapshot(
+                RestoreContext {
+                    daemon_origin,
+                    snapshot: &snapshot,
+                    source_node,
+                    // orchestrator: whoever forwarded SnapshotReady to us
+                    orchestrator_node: from_node,
+                },
+                inputs.keypair,
+                move || daemon,
+                inputs.config,
+            ) {
+                // Factory is still registered — next `SnapshotReady` for
+                // this origin (e.g., from an orchestrator retry) can try
+                // again. On successful completion (`complete()`), the
+                // factory is auto-removed so a stale or replayed
+                // SnapshotReady can't re-trigger restore against what is
+                // already the authoritative copy.
+                return Ok(Some(self.fail_migration(
+                    daemon_origin,
+                    from_node,
+                    &format!("restore_snapshot failed: {:?}", e),
+                )?));
+            }
+        }
+
+        // Route `RestoreComplete` to the recorded orchestrator. Only the
+        // orchestrator holds the migration record; sending to a relay
+        // would stall the state machine. `from_node` is used as a
+        // fallback when the target-side record has been lost (e.g. a
+        // very late chunk after the migration record timed out).
+        let reply = MigrationMessage::RestoreComplete {
+            daemon_origin,
+            restored_seq: seq_through,
+        };
+        let dest = self
+            .target_handler
+            .orchestrator_node(daemon_origin)
+            .unwrap_or(from_node);
+        Ok(Some(vec![OutboundMigrationMessage {
+            dest_node: dest,
+            payload: wire::encode(&reply)?,
+        }]))
+    }
+
+    /// Build a `MigrationFailed` outbound message and clean up local state.
+    /// Used when the target can't accept a migration (no factory, parse
+    /// failure, etc).
+    fn fail_migration(
+        &self,
+        daemon_origin: u32,
+        from_node: u64,
+        reason: &str,
+    ) -> Result<Vec<OutboundMigrationMessage>, MigrationError> {
+        tracing::warn!(
+            daemon_origin = format!("{:#x}", daemon_origin),
+            reason = reason,
+            "migration failed on target"
+        );
+        self.reassemblers.remove(&daemon_origin);
+        let _ = self.target_handler.abort(daemon_origin);
+        let msg = MigrationMessage::MigrationFailed {
+            daemon_origin,
+            reason: reason.to_string(),
+        };
+        Ok(vec![OutboundMigrationMessage {
+            dest_node: from_node,
+            payload: wire::encode(&msg)?,
+        }])
     }
 
     /// Get a reference to the orchestrator.

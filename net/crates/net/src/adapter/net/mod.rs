@@ -45,10 +45,12 @@ mod pool;
 mod protocol;
 mod proxy;
 mod reliability;
+mod reroute;
 mod route;
 mod router;
 mod session;
 pub mod state;
+mod stream;
 pub mod subnet;
 pub mod subprotocol;
 mod swarm;
@@ -59,14 +61,15 @@ mod linux;
 
 pub use batch::AdaptiveBatcher;
 pub use channel::{
-    AuthGuard, AuthVerdict, ChannelConfig, ChannelConfigRegistry, ChannelError, ChannelId,
-    ChannelName, ChannelRegistry, Visibility,
+    AckReason, AuthGuard, AuthVerdict, ChannelConfig, ChannelConfigRegistry, ChannelError,
+    ChannelId, ChannelName, ChannelPublisher, ChannelRegistry, MembershipMsg, OnFailure,
+    PublishConfig, PublishReport, SubscriberRoster, Visibility, SUBPROTOCOL_CHANNEL_MEMBERSHIP,
 };
 pub use compute::{
-    DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, DaemonStats, MeshDaemon,
-    MigrationError, MigrationMessage, MigrationOrchestrator, MigrationPhase,
-    MigrationSourceHandler, MigrationState, MigrationTargetHandler, PlacementDecision, Scheduler,
-    SchedulerError, SUBPROTOCOL_MIGRATION,
+    DaemonError, DaemonFactoryRegistry, DaemonHost, DaemonHostConfig, DaemonRegistry, DaemonStats,
+    FactoryEntry, MeshDaemon, MigrationError, MigrationMessage, MigrationOrchestrator,
+    MigrationPhase, MigrationSourceHandler, MigrationState, MigrationTargetHandler,
+    PlacementDecision, Scheduler, SchedulerError, SUBPROTOCOL_MIGRATION,
 };
 pub use config::{ConnectionRole, NetAdapterConfig, ReliabilityConfig};
 pub use contested::{
@@ -97,8 +100,9 @@ pub use proxy::{
     ForwardResult, HopStats, MultiHopPacketBuilder, NetProxy, ProxyConfig, ProxyError, ProxyStats,
 };
 pub use reliability::{FireAndForget, ReliabilityMode, ReliableStream};
+pub use reroute::ReroutePolicy;
 pub use route::{
-    AggregateStats, RouteEntry, RouteFlags, RoutingHeader, RoutingTable, StreamStats,
+    AggregateStats, RouteEntry, RouteFlags, RoutingHeader, RoutingTable, SchedulerStreamStats,
     ROUTING_HEADER_SIZE,
 };
 pub use router::{FairScheduler, NetRouter, RouteAction, RouterConfig, RouterError, RouterStats};
@@ -108,6 +112,7 @@ pub use state::{
     LogIndex, ObservedHorizon, SnapshotStore, StateSnapshot, CAUSAL_LINK_SIZE, SUBPROTOCOL_CAUSAL,
     SUBPROTOCOL_SNAPSHOT,
 };
+pub use stream::{CloseBehavior, Reliability, Stream, StreamConfig, StreamError, StreamStats};
 pub use subnet::{DropReason, ForwardDecision, SubnetGateway, SubnetId, SubnetPolicy, SubnetRule};
 pub use subprotocol::{
     negotiate, MigrationSubprotocolHandler, NegotiatedSet, OutboundMigrationMessage,

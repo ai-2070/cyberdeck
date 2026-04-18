@@ -78,13 +78,22 @@ pub struct QueuedPacket {
 struct StreamQueue {
     queue: ArrayQueue<QueuedPacket>,
     packets_sent_this_round: AtomicU64,
+    /// Fairness weight (quantum multiplier). `1` is equal-share; higher
+    /// values let this stream ship `weight × session_quantum` packets
+    /// per round before round-reset. Always ≥ 1.
+    weight: AtomicU64,
 }
 
 impl StreamQueue {
     fn new(capacity: usize) -> Self {
+        Self::new_with_weight(capacity, 1)
+    }
+
+    fn new_with_weight(capacity: usize, weight: u8) -> Self {
         Self {
             queue: ArrayQueue::new(capacity),
             packets_sent_this_round: AtomicU64::new(0),
+            weight: AtomicU64::new(weight.max(1) as u64),
         }
     }
 
@@ -115,6 +124,15 @@ impl StreamQueue {
 
     fn sent_this_round(&self) -> u64 {
         self.packets_sent_this_round.load(Ordering::Relaxed)
+    }
+
+    fn weight(&self) -> u64 {
+        self.weight.load(Ordering::Relaxed).max(1)
+    }
+
+    #[allow(dead_code)]
+    fn set_weight(&self, weight: u8) {
+        self.weight.store(weight.max(1) as u64, Ordering::Relaxed);
     }
 }
 
@@ -151,6 +169,19 @@ impl FairScheduler {
             total_dropped: AtomicU64::new(0),
             round_robin_idx: AtomicU64::new(0),
         }
+    }
+
+    /// Set the fair-scheduling weight for a stream. `weight` is a quantum
+    /// multiplier: 1 = equal share (default), higher values give the
+    /// stream proportionally more packets per round. Creates the stream
+    /// queue if it doesn't exist yet, so callers can set the weight
+    /// before any traffic flows.
+    pub fn set_stream_weight(&self, stream_id: u64, weight: u8) {
+        let weight = weight.max(1);
+        self.streams
+            .entry(stream_id)
+            .and_modify(|q| q.set_weight(weight))
+            .or_insert_with(|| Arc::new(StreamQueue::new_with_weight(self.max_depth, weight)));
     }
 
     /// Enqueue a packet
@@ -205,11 +236,15 @@ impl FairScheduler {
         }
         let start = self.round_robin_idx.fetch_add(1, Ordering::Relaxed) as usize % keys.len();
 
-        // Round-robin across streams, starting from the rotated index
+        // Round-robin across streams, starting from the rotated index.
+        // Each stream's quantum is `base_quantum × stream.weight`, so
+        // a weight-4 stream gets 4× the packets per round of a weight-1
+        // stream before round-reset. Default weight is 1 = unchanged.
         for i in 0..keys.len() {
             let key = keys[(start + i) % keys.len()];
             if let Some(queue) = self.streams.get(&key) {
-                if queue.sent_this_round() < self.quantum as u64 && !queue.is_empty() {
+                let stream_quantum = (self.quantum as u64).saturating_mul(queue.weight());
+                if queue.sent_this_round() < stream_quantum && !queue.is_empty() {
                     if let Some(packet) = queue.pop() {
                         queue.increment_sent();
                         return Some(packet);
@@ -373,6 +408,12 @@ impl NetRouter {
     /// Get routing table
     pub fn routing_table(&self) -> &Arc<RoutingTable> {
         &self.routing_table
+    }
+
+    /// Get the fair scheduler. Exposed so `MeshNode::open_stream` can
+    /// propagate a stream's `fairness_weight` to the forwarding path.
+    pub fn scheduler(&self) -> &Arc<FairScheduler> {
+        &self.scheduler
     }
 
     /// Add a route
@@ -864,6 +905,59 @@ mod tests {
         assert_eq!(
             pkt.stream_id, 1,
             "newly added stream should be visible after quantum reset"
+        );
+    }
+
+    /// Fairness weight: a weight-4 stream should ship 4× the packets per
+    /// round of a weight-1 stream. With both queues full and one full
+    /// round of dequeues, we should see ~4:1 ratio before any round
+    /// reset fires.
+    #[test]
+    fn test_fair_scheduler_respects_stream_weight() {
+        // Base quantum = 1: every stream with weight 1 gets 1 packet per
+        // round; a weight-4 stream gets 4 packets per round.
+        let scheduler = FairScheduler::new(1, 64);
+
+        scheduler.set_stream_weight(1, 1);
+        scheduler.set_stream_weight(2, 4);
+
+        let dest: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        // Fill both streams with 8 packets each.
+        for stream_id in [1u64, 2u64] {
+            for _ in 0..8 {
+                scheduler.enqueue(QueuedPacket {
+                    data: Bytes::from_static(&[0u8; 16]),
+                    dest,
+                    stream_id,
+                    priority: false,
+                    queued_at: Instant::now(),
+                });
+            }
+        }
+
+        // Dequeue 5 packets. The weight-4 stream should ship at least
+        // 4 of those 5 in the first round (its quantum is 4; stream 1's
+        // quantum is 1). Depending on round-robin start, stream 1 may
+        // ship 1 packet in the middle.
+        let mut counts = [0u64; 3];
+        for _ in 0..5 {
+            if let Some(pkt) = scheduler.dequeue() {
+                counts[pkt.stream_id as usize] += 1;
+            }
+        }
+        assert_eq!(counts[0], 0);
+        assert!(
+            counts[2] >= 4,
+            "weight-4 stream should ship >= 4 packets in 5 dequeues; \
+             saw weight-1={} weight-4={}",
+            counts[1],
+            counts[2]
+        );
+        assert!(
+            counts[1] <= 1,
+            "weight-1 stream should ship <= 1 packet before round reset; \
+             saw {}",
+            counts[1]
         );
     }
 }

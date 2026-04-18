@@ -672,11 +672,14 @@ impl Net {
         let events: Vec<StoredEvent> = response
             .events
             .into_iter()
-            .map(|e| StoredEvent {
-                id: e.id,
-                raw: e.raw_str().to_owned(),
-                insertion_ts: e.insertion_ts,
-                shard_id: e.shard_id,
+            .map(|e| {
+                let raw = e.raw_str().unwrap_or("").to_string();
+                StoredEvent {
+                    id: e.id,
+                    raw,
+                    insertion_ts: e.insertion_ts,
+                    shard_id: e.shard_id,
+                }
             })
             .collect();
 
@@ -760,6 +763,272 @@ impl Net {
     }
 }
 
+// ============================================================================
+// MeshNode bindings
+// ============================================================================
+
+#[cfg(feature = "net")]
+mod mesh_bindings {
+    use super::*;
+    use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig};
+    use net::adapter::Adapter;
+    use std::time::Duration;
+
+    /// A multi-peer mesh node for Python.
+    ///
+    /// Manages encrypted connections to multiple peers over a single
+    /// UDP socket with automatic failure detection and rerouting.
+    ///
+    /// ```python
+    /// from net import NetMesh
+    ///
+    /// node = NetMesh("127.0.0.1:9000", "00" * 32)
+    /// print(f"public key: {node.public_key}")
+    ///
+    /// node.connect("127.0.0.1:9001", peer_pubkey, 0x2222)
+    /// node.start()
+    ///
+    /// node.push_to("127.0.0.1:9001", '{"token":"hi"}')
+    ///
+    /// events = node.poll(100)
+    /// node.shutdown()
+    /// ```
+    #[pyclass]
+    pub struct NetMesh {
+        node: Option<MeshNode>,
+        runtime: Arc<Runtime>,
+    }
+
+    #[pymethods]
+    impl NetMesh {
+        /// Create a new mesh node.
+        ///
+        /// Args:
+        ///     bind_addr: Local bind address (e.g., "127.0.0.1:9000")
+        ///     psk: Hex-encoded 32-byte pre-shared key
+        ///     heartbeat_interval_ms: Heartbeat interval (default: 5000)
+        ///     session_timeout_ms: Session timeout (default: 30000)
+        ///     num_shards: Number of inbound shards (default: 4)
+        #[new]
+        #[pyo3(signature = (bind_addr, psk, heartbeat_interval_ms=None, session_timeout_ms=None, num_shards=None))]
+        fn new(
+            bind_addr: &str,
+            psk: &str,
+            heartbeat_interval_ms: Option<u64>,
+            session_timeout_ms: Option<u64>,
+            num_shards: Option<u16>,
+        ) -> PyResult<Self> {
+            let addr: std::net::SocketAddr = bind_addr
+                .parse()
+                .map_err(|e| PyValueError::new_err(format!("invalid address: {}", e)))?;
+
+            let psk_bytes = hex::decode(psk)
+                .map_err(|e| PyValueError::new_err(format!("invalid PSK hex: {}", e)))?;
+            if psk_bytes.len() != 32 {
+                return Err(PyValueError::new_err("PSK must be 32 bytes (64 hex chars)"));
+            }
+            let mut psk_arr = [0u8; 32];
+            psk_arr.copy_from_slice(&psk_bytes);
+
+            let mut config = MeshNodeConfig::new(addr, psk_arr);
+            if let Some(ms) = heartbeat_interval_ms {
+                config = config.with_heartbeat_interval(Duration::from_millis(ms));
+            }
+            if let Some(ms) = session_timeout_ms {
+                config = config.with_session_timeout(Duration::from_millis(ms));
+            }
+            if let Some(n) = num_shards {
+                config = config.with_num_shards(n);
+            }
+
+            let runtime = Arc::new(
+                Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("runtime: {}", e)))?,
+            );
+
+            let identity = EntityKeypair::generate();
+            let node = runtime
+                .block_on(MeshNode::new(identity, config))
+                .map_err(|e| PyRuntimeError::new_err(format!("MeshNode: {}", e)))?;
+
+            Ok(Self {
+                node: Some(node),
+                runtime,
+            })
+        }
+
+        /// Get this node's Noise public key (hex-encoded).
+        #[getter]
+        fn public_key(&self) -> PyResult<String> {
+            let node = self.get_node()?;
+            Ok(hex::encode(node.public_key()))
+        }
+
+        /// Get this node's ID.
+        #[getter]
+        fn node_id(&self) -> PyResult<u64> {
+            let node = self.get_node()?;
+            Ok(node.node_id())
+        }
+
+        /// Connect to a peer (initiator side).
+        #[pyo3(signature = (peer_addr, peer_public_key, peer_node_id))]
+        fn connect(
+            &self,
+            peer_addr: &str,
+            peer_public_key: &str,
+            peer_node_id: u64,
+        ) -> PyResult<()> {
+            let node = self.get_node()?;
+            let addr: std::net::SocketAddr = peer_addr
+                .parse()
+                .map_err(|e| PyValueError::new_err(format!("invalid address: {}", e)))?;
+
+            let pubkey_bytes = hex::decode(peer_public_key)
+                .map_err(|e| PyValueError::new_err(format!("invalid hex: {}", e)))?;
+            if pubkey_bytes.len() != 32 {
+                return Err(PyValueError::new_err("public key must be 32 bytes"));
+            }
+            let mut pubkey = [0u8; 32];
+            pubkey.copy_from_slice(&pubkey_bytes);
+
+            self.runtime
+                .block_on(node.connect(addr, &pubkey, peer_node_id))
+                .map_err(|e| PyRuntimeError::new_err(format!("connect: {}", e)))?;
+            Ok(())
+        }
+
+        /// Accept an incoming connection (responder side).
+        fn accept(&self, peer_node_id: u64) -> PyResult<String> {
+            let node = self.get_node()?;
+            let (addr, _) = self
+                .runtime
+                .block_on(node.accept(peer_node_id))
+                .map_err(|e| PyRuntimeError::new_err(format!("accept: {}", e)))?;
+            Ok(addr.to_string())
+        }
+
+        /// Start the receive loop and heartbeats.
+        fn start(&self) -> PyResult<()> {
+            let node = self.get_node()?;
+            node.start();
+            Ok(())
+        }
+
+        /// Send raw JSON to a direct peer.
+        fn push_to(&self, peer_addr: &str, json: &str) -> PyResult<bool> {
+            let node = self.get_node()?;
+            let addr: std::net::SocketAddr = peer_addr
+                .parse()
+                .map_err(|e| PyValueError::new_err(format!("invalid address: {}", e)))?;
+
+            let batch = net::event::Batch {
+                shard_id: 0,
+                events: vec![net::event::InternalEvent::new(
+                    bytes::Bytes::copy_from_slice(json.as_bytes()),
+                    0,
+                    0,
+                )],
+                sequence_start: 0,
+            };
+
+            self.runtime
+                .block_on(node.send_to_peer(addr, batch))
+                .map_err(|e| PyRuntimeError::new_err(format!("send: {}", e)))?;
+            Ok(true)
+        }
+
+        /// Poll for received events.
+        fn poll(&self, limit: usize) -> PyResult<Vec<StoredEvent>> {
+            let node = self.get_node()?;
+            let result = self
+                .runtime
+                .block_on(node.poll_shard(0, None, limit))
+                .map_err(|e| PyRuntimeError::new_err(format!("poll: {}", e)))?;
+
+            Ok(result
+                .events
+                .into_iter()
+                .map(|e| {
+                    let raw = e.raw_str().unwrap_or("").to_string();
+                    StoredEvent {
+                        id: e.id,
+                        raw,
+                        insertion_ts: e.insertion_ts,
+                        shard_id: e.shard_id,
+                    }
+                })
+                .collect())
+        }
+
+        /// Add a route.
+        fn add_route(&self, dest_node_id: u64, next_hop_addr: &str) -> PyResult<()> {
+            let node = self.get_node()?;
+            let addr: std::net::SocketAddr = next_hop_addr
+                .parse()
+                .map_err(|e| PyValueError::new_err(format!("invalid address: {}", e)))?;
+            node.router().add_route(dest_node_id, addr);
+            Ok(())
+        }
+
+        /// Number of connected peers.
+        fn peer_count(&self) -> PyResult<usize> {
+            Ok(self.get_node()?.peer_count())
+        }
+
+        /// Number of nodes discovered via pingwave.
+        fn discovered_nodes(&self) -> PyResult<usize> {
+            Ok(self.get_node()?.proximity_graph().node_count())
+        }
+
+        /// Shutdown the mesh node.
+        fn shutdown(&mut self) -> PyResult<()> {
+            let node = self
+                .node
+                .take()
+                .ok_or_else(|| PyRuntimeError::new_err("already shut down"))?;
+            self.runtime
+                .block_on(node.shutdown())
+                .map_err(|e| PyRuntimeError::new_err(format!("shutdown: {}", e)))?;
+            Ok(())
+        }
+
+        fn __repr__(&self) -> String {
+            if let Some(node) = &self.node {
+                format!(
+                    "NetMesh(addr={}, peers={}, nodes={})",
+                    node.local_addr(),
+                    node.peer_count(),
+                    node.proximity_graph().node_count()
+                )
+            } else {
+                "NetMesh(shutdown)".to_string()
+            }
+        }
+
+        fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+            slf
+        }
+
+        fn __exit__(
+            &mut self,
+            _exc_type: Option<&Bound<'_, PyAny>>,
+            _exc_val: Option<&Bound<'_, PyAny>>,
+            _exc_tb: Option<&Bound<'_, PyAny>>,
+        ) -> PyResult<bool> {
+            self.shutdown()?;
+            Ok(false)
+        }
+    }
+
+    impl NetMesh {
+        fn get_node(&self) -> PyResult<&MeshNode> {
+            self.node
+                .as_ref()
+                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))
+        }
+    }
+}
+
 /// Net Python module.
 #[pymodule]
 fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -771,5 +1040,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NetKeypair>()?;
     #[cfg(feature = "net")]
     m.add_function(wrap_pyfunction!(generate_net_keypair, m)?)?;
+    #[cfg(feature = "net")]
+    m.add_class::<mesh_bindings::NetMesh>()?;
     Ok(())
 }
