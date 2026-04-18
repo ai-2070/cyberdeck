@@ -67,7 +67,7 @@ pub struct StreamConfig {
     pub reliability: Reliability,
     /// Outbound queue depth cap for this stream (packets). `0` means
     /// "inherit the router's configured `max_queue_depth`". Exceeding
-    /// the cap on `Stream::send` returns `StreamError::Backpressure`.
+    /// the cap on `Stream::send` returns `StreamError::WouldBlock`.
     pub window_bytes: u32,
     /// Fair-scheduler quantum multiplier. `1` is equal-share; higher
     /// means this stream gets proportionally more packets per round.
@@ -124,7 +124,7 @@ impl StreamConfig {
 pub enum StreamError {
     /// The stream's outbound queue is full. No packets were enqueued.
     /// Caller decides whether to retry, drop, or surface further.
-    Backpressure,
+    WouldBlock,
     /// The underlying session is gone (peer disconnected, never
     /// connected, or the stream was closed).
     NotConnected,
@@ -136,7 +136,7 @@ pub enum StreamError {
 impl fmt::Display for StreamError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StreamError::Backpressure => write!(f, "stream would block (queue full)"),
+            StreamError::WouldBlock => write!(f, "stream would block (queue full)"),
             StreamError::NotConnected => write!(f, "stream not connected"),
             StreamError::Transport(msg) => write!(f, "stream transport error: {}", msg),
         }

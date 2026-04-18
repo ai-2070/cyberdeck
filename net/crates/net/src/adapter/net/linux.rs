@@ -182,7 +182,7 @@ impl BatchedTransport {
 
         if received < 0 {
             let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Backpressure {
+            if err.kind() == io::ErrorKind::WouldBlock {
                 return Ok(Vec::new());
             }
             return Err(err);

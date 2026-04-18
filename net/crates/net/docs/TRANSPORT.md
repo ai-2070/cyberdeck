@@ -137,7 +137,7 @@ mesh.close_stream(peer_node_id, stream_id);
 
 **Not multicast.** A stream is one flow to one peer. Sending the same payload to multiple peers is an application / daemon / channel-layer concern, not transport.
 
-**Back-pressure.** v1 surfaces queue-full only on the forwarding path (router scheduler). Local outbound `send_on_stream` returns `StreamError::Transport` for socket-level failures; `StreamError::Backpressure` is reserved for a future credit-windowed flow-control swap that does not move the caller API.
+**Back-pressure.** v1 surfaces queue-full only on the forwarding path (router scheduler). Local outbound `send_on_stream` returns `StreamError::Transport` for socket-level failures; `StreamError::WouldBlock` is reserved for a future credit-windowed flow-control swap that does not move the caller API.
 
 **Fairness weight.** `StreamConfig::fairness_weight` is a quantum multiplier on the `FairScheduler`. It takes effect when a packet for this stream transits this node as a forwarder. Local outbound traffic currently bypasses the scheduler; the weight is still persisted so that a future refactor routing local outbound through the scheduler makes it load-bearing end-to-end without API churn.
 
