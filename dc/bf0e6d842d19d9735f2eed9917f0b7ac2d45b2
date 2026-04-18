@@ -1,0 +1,42 @@
+net/crates/net/bindings/node/src/lib.rs
+  f3669361474f4cb8 799-802,806-912,1177-1320
+net/crates/net/sdk/src/mesh.rs
+  f3669361474f4cb8 43-46,296-367
+net/crates/net/sdk/src/error.rs
+  f3669361474f4cb8 27-50
+net/crates/net/sdk/src/lib.rs
+  f3669361474f4cb8 70-73
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "dcbf0e6d842d19d9735f2eed9917f0b7ac2d45b2",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 70,
+      "overriden_lines": 0
+    },
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 360,
+      "total_deletions": 2,
+      "accepted_lines": 360,
+      "overriden_lines": 0
+    }
+  }
+}
