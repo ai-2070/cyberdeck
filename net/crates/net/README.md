@@ -177,7 +177,7 @@ Benchmarks accurate as of April 15, 2026.
 
 Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns.
 
-984 tests. ~840 KB deployed binary.
+985 tests. ~840 KB deployed binary.
 
 ## Capabilities
 
