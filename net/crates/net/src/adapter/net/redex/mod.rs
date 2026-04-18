@@ -9,6 +9,8 @@
 //! See `docs/REDEX_PLAN.md` for the full design.
 
 mod config;
+#[cfg(feature = "redex-disk")]
+mod disk;
 mod entry;
 mod error;
 mod event;

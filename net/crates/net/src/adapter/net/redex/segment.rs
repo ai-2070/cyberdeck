@@ -50,6 +50,17 @@ impl HeapSegment {
         }
     }
 
+    /// Build a segment from pre-existing payload bytes (e.g. replayed
+    /// from disk). The bytes become the live region starting at
+    /// absolute offset 0.
+    #[cfg(feature = "redex-disk")]
+    pub(super) fn from_existing(buf: Vec<u8>) -> Self {
+        Self {
+            buf,
+            base_offset: 0,
+        }
+    }
+
     /// Append `payload` and return the absolute offset it was written
     /// at (offset in the logical seq-space, not in the backing `Vec`).
     pub fn append(&mut self, payload: &[u8]) -> Result<u64, RedexError> {

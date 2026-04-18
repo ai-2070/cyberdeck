@@ -193,6 +193,199 @@ async fn test_redex_fold_smoke() {
     assert_eq!(state, 1 + 2 + 3 + 4);
 }
 
+#[cfg(feature = "redex-disk")]
+mod persistent {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "redex_int_{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn test_persistent_append_close_reopen() {
+        let base = tmpdir("reopen");
+        let name = cn("durable/basic");
+        let cfg = RedexFileConfig::default().with_persistent(true);
+
+        {
+            let r = Redex::new().with_persistent_dir(&base);
+            let f = r.open_file(&name, cfg).unwrap();
+            for i in 0..50u64 {
+                f.append(format!("d-{}", i).as_bytes()).unwrap();
+            }
+            // Close flushes to disk.
+            r.close_file(&name).unwrap();
+        }
+
+        // New manager, reopen — the index and payloads replay from disk.
+        let r2 = Redex::new().with_persistent_dir(&base);
+        let f2 = r2.open_file(&name, cfg).unwrap();
+        assert_eq!(f2.len(), 50);
+        assert_eq!(f2.next_seq(), 50);
+
+        let events = f2.read_range(0, 50);
+        assert_eq!(events.len(), 50);
+        for (i, ev) in events.iter().enumerate() {
+            assert_eq!(ev.entry.seq, i as u64);
+            assert_eq!(ev.payload.as_ref(), format!("d-{}", i).as_bytes());
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn test_persistent_inline_roundtrip_across_reopen() {
+        let base = tmpdir("inline");
+        let name = cn("durable/inline");
+        let cfg = RedexFileConfig::default().with_persistent(true);
+
+        {
+            let r = Redex::new().with_persistent_dir(&base);
+            let f = r.open_file(&name, cfg).unwrap();
+            for i in 0..100u64 {
+                f.append_inline(&i.to_le_bytes()).unwrap();
+            }
+            r.close_file(&name).unwrap();
+        }
+
+        let r2 = Redex::new().with_persistent_dir(&base);
+        let f2 = r2.open_file(&name, cfg).unwrap();
+        assert_eq!(f2.len(), 100);
+        let events = f2.read_range(0, 100);
+        for (i, ev) in events.iter().enumerate() {
+            assert!(ev.entry.is_inline());
+            assert_eq!(ev.payload.as_ref(), &(i as u64).to_le_bytes());
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn test_persistent_crash_recovery_drops_without_close() {
+        // Crash simulation: drop the handle without close(). Because
+        // writes go through the OS page cache (not per-append fsync),
+        // an OS-level crash could lose the tail. A plain drop in this
+        // process keeps writes in the page cache, which survives a
+        // handle drop — so we expect full recovery here.
+        let base = tmpdir("crash");
+        let name = cn("durable/crash");
+        let cfg = RedexFileConfig::default().with_persistent(true);
+
+        {
+            let r = Redex::new().with_persistent_dir(&base);
+            let f = r.open_file(&name, cfg).unwrap();
+            for i in 0..25u64 {
+                f.append(format!("c-{}", i).as_bytes()).unwrap();
+            }
+            // Force fsync before "crash" so we have a durable anchor.
+            f.sync().unwrap();
+            drop(f);
+            drop(r); // no close_file call — simulates crash
+        }
+
+        let r2 = Redex::new().with_persistent_dir(&base);
+        let f2 = r2.open_file(&name, cfg).unwrap();
+        assert_eq!(f2.len(), 25);
+        for (i, ev) in f2.read_range(0, 25).iter().enumerate() {
+            assert_eq!(ev.entry.seq, i as u64);
+            assert_eq!(ev.payload.as_ref(), format!("c-{}", i).as_bytes());
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn test_persistent_tail_works_after_reopen() {
+        // Tail after reopen should backfill from the persisted index
+        // and then pick up new live appends.
+        let base = tmpdir("tail");
+        let name = cn("durable/tail");
+        let cfg = RedexFileConfig::default().with_persistent(true);
+
+        {
+            let r = Redex::new().with_persistent_dir(&base);
+            let f = r.open_file(&name, cfg).unwrap();
+            for i in 0..5u64 {
+                f.append(format!("pre-{}", i).as_bytes()).unwrap();
+            }
+            r.close_file(&name).unwrap();
+        }
+
+        let r2 = Redex::new().with_persistent_dir(&base);
+        let f2 = r2.open_file(&name, cfg).unwrap();
+        let mut stream = Box::pin(f2.tail(0));
+        for i in 0..5u64 {
+            let ev = stream.next().await.unwrap().unwrap();
+            assert_eq!(ev.entry.seq, i);
+            assert_eq!(ev.payload.as_ref(), format!("pre-{}", i).as_bytes());
+        }
+
+        // Live append after reopen.
+        f2.append(b"post").unwrap();
+        let ev = stream.next().await.unwrap().unwrap();
+        assert_eq!(ev.entry.seq, 5);
+        assert_eq!(ev.payload.as_ref(), b"post");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_persistent_without_base_dir_errors() {
+        // Asking for persistent: true on a manager without a base dir
+        // must fail at open_file time with a helpful message.
+        let r = Redex::new();
+        let cfg = RedexFileConfig::default().with_persistent(true);
+        let err = r.open_file(&cn("no/basedir"), cfg).unwrap_err();
+        assert!(matches!(err, RedexError::Channel(_)));
+    }
+
+    #[tokio::test]
+    async fn test_persistent_mixed_inline_and_heap_recovery() {
+        // Verify inline + heap entries interleaved round-trip correctly
+        // through disk persistence and recovery.
+        let base = tmpdir("mixed");
+        let name = cn("durable/mixed");
+        let cfg = RedexFileConfig::default().with_persistent(true);
+
+        {
+            let r = Redex::new().with_persistent_dir(&base);
+            let f = r.open_file(&name, cfg).unwrap();
+            f.append_inline(b"inline01").unwrap();
+            f.append(b"this-is-heap-1").unwrap();
+            f.append_inline(b"inline02").unwrap();
+            f.append(b"this-is-heap-2").unwrap();
+            r.close_file(&name).unwrap();
+        }
+
+        let r2 = Redex::new().with_persistent_dir(&base);
+        let f2 = r2.open_file(&name, cfg).unwrap();
+        assert_eq!(f2.len(), 4);
+        let events = f2.read_range(0, 4);
+        assert!(events[0].entry.is_inline());
+        assert_eq!(events[0].payload.as_ref(), b"inline01");
+        assert!(!events[1].entry.is_inline());
+        assert_eq!(events[1].payload.as_ref(), b"this-is-heap-1");
+        assert!(events[2].entry.is_inline());
+        assert_eq!(events[2].payload.as_ref(), b"inline02");
+        assert!(!events[3].entry.is_inline());
+        assert_eq!(events[3].payload.as_ref(), b"this-is-heap-2");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
 #[tokio::test]
 async fn test_redex_append_batch_atomic_seq() {
     let r = Redex::new();

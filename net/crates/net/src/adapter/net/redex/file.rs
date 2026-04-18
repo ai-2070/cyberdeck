@@ -17,6 +17,11 @@ use super::event::RedexEvent;
 use super::retention::compute_eviction_count;
 use super::segment::HeapSegment;
 
+#[cfg(feature = "redex-disk")]
+use std::path::Path;
+#[cfg(feature = "redex-disk")]
+use super::disk::DiskSegment;
+
 /// A live tail subscription waiting for new events.
 struct TailWatcher {
     /// Minimum seq to deliver (inclusive).
@@ -40,6 +45,8 @@ struct RedexFileInner {
     next_seq: AtomicU64,
     state: Mutex<FileState>,
     closed: AtomicBool,
+    #[cfg(feature = "redex-disk")]
+    disk: Option<Arc<DiskSegment>>,
 }
 
 /// A handle to a RedEX file. Cheap to clone.
@@ -65,8 +72,51 @@ impl RedexFile {
                     watchers: Vec::new(),
                 }),
                 closed: AtomicBool::new(false),
+                #[cfg(feature = "redex-disk")]
+                disk: None,
             }),
         }
+    }
+
+    /// Open (or recover) a file with disk-backed durability.
+    ///
+    /// Reads `<base_dir>/<channel_path>/idx` and `.../dat` if they
+    /// exist, replays the full dat file into the heap segment, and
+    /// sets `next_seq` to one past the last recovered entry. New
+    /// appends are mirrored to disk.
+    ///
+    /// A partial trailing record in `idx` (torn write from a crash)
+    /// is truncated on reopen.
+    #[cfg(feature = "redex-disk")]
+    pub(super) fn open_persistent(
+        name: ChannelName,
+        config: RedexFileConfig,
+        base_dir: &Path,
+    ) -> Result<Self, RedexError> {
+        let recovered = DiskSegment::open(base_dir, &name)?;
+        let next_seq = recovered
+            .index
+            .last()
+            .map(|e| e.seq + 1)
+            .unwrap_or(0);
+
+        let segment = HeapSegment::from_existing(recovered.payload_bytes);
+        let state = FileState {
+            index: recovered.index,
+            segment,
+            watchers: Vec::new(),
+        };
+
+        Ok(Self {
+            inner: Arc::new(RedexFileInner {
+                name,
+                config,
+                next_seq: AtomicU64::new(next_seq),
+                state: Mutex::new(state),
+                closed: AtomicBool::new(false),
+                disk: Some(Arc::new(recovered.disk)),
+            }),
+        })
     }
 
     /// The channel name this file is bound to.
@@ -109,6 +159,11 @@ impl RedexFile {
             RedexEntry::new_heap(seq, truncate_u32(offset), payload.len() as u32, 0, cks);
         state.index.push(entry);
 
+        #[cfg(feature = "redex-disk")]
+        if let Some(disk) = self.disk() {
+            disk.append_entry(&entry, payload)?;
+        }
+
         let event = RedexEvent {
             entry,
             payload: Bytes::copy_from_slice(payload),
@@ -131,6 +186,11 @@ impl RedexFile {
 
         let mut state = self.inner.state.lock();
         state.index.push(entry);
+
+        #[cfg(feature = "redex-disk")]
+        if let Some(disk) = self.disk() {
+            disk.append_entry(&entry, payload)?;
+        }
 
         let event = RedexEvent {
             entry,
@@ -173,6 +233,16 @@ impl RedexFile {
                 payload: payload.clone(),
             });
         }
+
+        #[cfg(feature = "redex-disk")]
+        if let Some(disk) = self.disk() {
+            let pairs: Vec<(RedexEntry, &[u8])> = events
+                .iter()
+                .map(|e| (e.entry, e.payload.as_ref()))
+                .collect();
+            disk.append_entries(&pairs)?;
+        }
+
         for event in &events {
             notify_watchers(&mut state.watchers, event);
         }
@@ -290,6 +360,7 @@ impl RedexFile {
     }
 
     /// Close the file. Outstanding tail streams receive `RedexError::Closed`.
+    /// For persistent files, fsyncs the disk segment before returning.
     pub fn close(&self) -> Result<(), RedexError> {
         if self.inner.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
@@ -298,7 +369,29 @@ impl RedexFile {
         for w in state.watchers.drain(..) {
             let _ = w.sender.send(Err(RedexError::Closed));
         }
+        drop(state);
+
+        #[cfg(feature = "redex-disk")]
+        if let Some(disk) = self.disk() {
+            disk.sync()?;
+        }
+
         Ok(())
+    }
+
+    /// Fsync the disk segment (no-op for heap-only files).
+    #[cfg(feature = "redex-disk")]
+    pub fn sync(&self) -> Result<(), RedexError> {
+        if let Some(disk) = self.disk() {
+            disk.sync()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "redex-disk")]
+    #[inline]
+    fn disk(&self) -> Option<&Arc<DiskSegment>> {
+        self.inner.disk.as_ref()
     }
 
     #[inline]

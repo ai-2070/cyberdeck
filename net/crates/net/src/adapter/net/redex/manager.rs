@@ -13,11 +13,16 @@ use super::config::RedexFileConfig;
 use super::error::RedexError;
 use super::file::RedexFile;
 
+#[cfg(feature = "redex-disk")]
+use std::path::PathBuf;
+
 /// Manager for a set of RedEX files bound to channel names.
 pub struct Redex {
     files: DashMap<ChannelName, RedexFile>,
     auth: Option<Arc<AuthGuard>>,
     origin_hash: u32,
+    #[cfg(feature = "redex-disk")]
+    persistent_dir: Option<PathBuf>,
 }
 
 impl Redex {
@@ -28,6 +33,8 @@ impl Redex {
             files: DashMap::new(),
             auth: None,
             origin_hash: 0,
+            #[cfg(feature = "redex-disk")]
+            persistent_dir: None,
         }
     }
 
@@ -38,7 +45,18 @@ impl Redex {
             files: DashMap::new(),
             auth: Some(guard),
             origin_hash,
+            #[cfg(feature = "redex-disk")]
+            persistent_dir: None,
         }
+    }
+
+    /// Set the base directory for disk-backed (`persistent: true`)
+    /// files. All files opened with `persistent: true` use
+    /// `<dir>/<channel_path>/{idx,dat}` for durability.
+    #[cfg(feature = "redex-disk")]
+    pub fn with_persistent_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.persistent_dir = Some(dir.into());
+        self
     }
 
     /// Open (create if absent) a RedEX file bound to `name`.
@@ -46,6 +64,11 @@ impl Redex {
     /// Re-opening an existing name returns the existing handle. The
     /// `config` argument is honored only on first open; subsequent
     /// opens ignore it and return the live file.
+    ///
+    /// With `persistent: true`, the manager must have been configured
+    /// via [`Self::with_persistent_dir`] (feature `redex-disk`) —
+    /// otherwise `open_file` returns a [`RedexError::Channel`] that
+    /// describes the missing base dir.
     pub fn open_file(
         &self,
         name: &ChannelName,
@@ -61,11 +84,26 @@ impl Redex {
             return Ok(existing.clone());
         }
 
-        let entry = self
-            .files
-            .entry(name.clone())
-            .or_insert_with(|| RedexFile::new(name.clone(), config));
+        let file = self.build_file(name, config)?;
+        let entry = self.files.entry(name.clone()).or_insert(file);
         Ok(entry.clone())
+    }
+
+    fn build_file(
+        &self,
+        name: &ChannelName,
+        config: RedexFileConfig,
+    ) -> Result<RedexFile, RedexError> {
+        #[cfg(feature = "redex-disk")]
+        if config.persistent {
+            let dir = self.persistent_dir.as_ref().ok_or_else(|| {
+                RedexError::Channel(
+                    "config.persistent=true requires Redex::with_persistent_dir(...)".into(),
+                )
+            })?;
+            return RedexFile::open_persistent(name.clone(), config, dir);
+        }
+        Ok(RedexFile::new(name.clone(), config))
     }
 
     /// Look up an already-opened file.
@@ -104,11 +142,13 @@ impl Default for Redex {
 
 impl std::fmt::Debug for Redex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Redex")
-            .field("files", &self.files.len())
+        let mut dbg = f.debug_struct("Redex");
+        dbg.field("files", &self.files.len())
             .field("auth", &self.auth.is_some())
-            .field("origin_hash", &self.origin_hash)
-            .finish()
+            .field("origin_hash", &self.origin_hash);
+        #[cfg(feature = "redex-disk")]
+        dbg.field("persistent_dir", &self.persistent_dir);
+        dbg.finish()
     }
 }
 
