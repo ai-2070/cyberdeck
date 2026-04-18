@@ -2212,8 +2212,10 @@ impl WireNode {
         let factories = Arc::new(DaemonFactoryRegistry::new());
         let orch = Arc::new(MigrationOrchestrator::new(reg.clone(), node_id));
         let source = Arc::new(MigrationSourceHandler::new(reg.clone()));
-        let target =
-            Arc::new(MigrationTargetHandler::new_with_factories(reg.clone(), factories.clone()));
+        let target = Arc::new(MigrationTargetHandler::new_with_factories(
+            reg.clone(),
+            factories.clone(),
+        ));
         let handler = Arc::new(MigrationSubprotocolHandler::new(
             orch.clone(),
             source,
@@ -2264,17 +2266,19 @@ fn test_migration_full_lifecycle_over_subprotocol_single_chunk() {
     // Register the daemon on source with some state built up.
     let (kp, origin) = register_counter_daemon(&source.reg, 100);
     for seq in 1..=5 {
-        source.reg.deliver(origin, &make_event(0xFFFF, seq)).unwrap();
+        source
+            .reg
+            .deliver(origin, &make_event(0xFFFF, seq))
+            .unwrap();
     }
 
     // Register a factory on the target so the handler can construct a
     // daemon instance when the snapshot arrives.
-    target.factories.register(
-        origin,
-        kp.clone(),
-        DaemonHostConfig::default(),
-        || Box::new(CounterDaemon::new()),
-    );
+    target
+        .factories
+        .register(origin, kp.clone(), DaemonHostConfig::default(), || {
+            Box::new(CounterDaemon::new())
+        });
 
     let nodes: std::collections::HashMap<u64, Arc<MigrationSubprotocolHandler>> = [
         (source.node_id, source.handler.clone()),
@@ -2299,8 +2303,14 @@ fn test_migration_full_lifecycle_over_subprotocol_single_chunk() {
     // Assertions: daemon lives on target, gone from source, migration
     // record cleared on both orchestrator and target.
     assert!(target.reg.contains(origin), "daemon should be on target");
-    assert!(!source.reg.contains(origin), "daemon should be gone from source");
-    assert!(!source.orch.is_migrating(origin), "orchestrator record removed");
+    assert!(
+        !source.reg.contains(origin),
+        "daemon should be gone from source"
+    );
+    assert!(
+        !source.orch.is_migrating(origin),
+        "orchestrator record removed"
+    );
     // Factory was consumed on restore.
     assert!(!target.factories.contains(origin));
 }
@@ -2316,8 +2326,12 @@ fn test_migration_full_lifecycle_over_subprotocol_multi_chunk() {
         state: Vec<u8>,
     }
     impl MeshDaemon for BigBlobDaemon {
-        fn name(&self) -> &str { "blob" }
-        fn requirements(&self) -> CapabilityFilter { CapabilityFilter::default() }
+        fn name(&self) -> &str {
+            "blob"
+        }
+        fn requirements(&self) -> CapabilityFilter {
+            CapabilityFilter::default()
+        }
         fn process(&mut self, _: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
             Ok(vec![])
         }
@@ -2339,22 +2353,19 @@ fn test_migration_full_lifecycle_over_subprotocol_multi_chunk() {
     let blob_size = MAX_SNAPSHOT_CHUNK_SIZE * 3 + 500;
     let blob = vec![0xABu8; blob_size];
     let host = DaemonHost::new(
-        Box::new(BigBlobDaemon { state: blob.clone() }),
+        Box::new(BigBlobDaemon {
+            state: blob.clone(),
+        }),
         kp.clone(),
         DaemonHostConfig::default(),
     );
     source.reg.register(host).unwrap();
 
-    target.factories.register(
-        origin,
-        kp.clone(),
-        DaemonHostConfig::default(),
-        move || {
-            Box::new(BigBlobDaemon {
-                state: Vec::new(),
-            })
-        },
-    );
+    target
+        .factories
+        .register(origin, kp.clone(), DaemonHostConfig::default(), move || {
+            Box::new(BigBlobDaemon { state: Vec::new() })
+        });
 
     let nodes: std::collections::HashMap<u64, Arc<MigrationSubprotocolHandler>> = [
         (source.node_id, source.handler.clone()),
@@ -2429,8 +2440,14 @@ fn test_migration_fails_when_no_factory_registered() {
     pump_messages(&nodes, vec![(source.node_id, initial)]).unwrap();
 
     // Target should not have the daemon; source should still have it.
-    assert!(!target.reg.contains(origin), "target must not restore without factory");
-    assert!(source.reg.contains(origin), "source daemon preserved on failure");
+    assert!(
+        !target.reg.contains(origin),
+        "target must not restore without factory"
+    );
+    assert!(
+        source.reg.contains(origin),
+        "source daemon preserved on failure"
+    );
     // The orchestrator's migration record should be torn down (abort path).
     assert!(!source.orch.is_migrating(origin));
 }
@@ -2445,12 +2462,11 @@ fn test_migration_fails_on_corrupted_snapshot() {
 
     let kp = EntityKeypair::generate();
     let origin = kp.origin_hash();
-    target.factories.register(
-        origin,
-        kp,
-        DaemonHostConfig::default(),
-        || Box::new(CounterDaemon::new()),
-    );
+    target
+        .factories
+        .register(origin, kp, DaemonHostConfig::default(), || {
+            Box::new(CounterDaemon::new())
+        });
 
     let junk = MigrationMessage::SnapshotReady {
         daemon_origin: origin,
@@ -2467,11 +2483,11 @@ fn test_migration_fails_on_corrupted_snapshot() {
 
     let failed = outbound
         .iter()
-        .find_map(|o| match net::adapter::net::compute::orchestrator::wire::decode(&o.payload)
-            .ok()?
-        {
-            MigrationMessage::MigrationFailed { reason, .. } => Some(reason),
-            _ => None,
+        .find_map(|o| {
+            match net::adapter::net::compute::orchestrator::wire::decode(&o.payload).ok()? {
+                MigrationMessage::MigrationFailed { reason, .. } => Some(reason),
+                _ => None,
+            }
         })
         .expect("expected MigrationFailed");
     assert!(

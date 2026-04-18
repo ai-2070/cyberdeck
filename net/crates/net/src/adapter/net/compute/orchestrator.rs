@@ -447,9 +447,7 @@ pub mod wire {
             }
             MSG_ACTIVATE_ACK => {
                 if cur.remaining() < 12 {
-                    return Err(MigrationError::StateFailed(
-                        "truncated ActivateAck".into(),
-                    ));
+                    return Err(MigrationError::StateFailed("truncated ActivateAck".into()));
                 }
                 Ok(MigrationMessage::ActivateAck {
                     daemon_origin: cur.get_u32_le(),
