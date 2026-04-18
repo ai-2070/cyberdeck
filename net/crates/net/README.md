@@ -665,12 +665,18 @@ cargo test --features net -p net-sdk
 # Node SDK smoke tests (14 tests — CortEX tasks + memories over napi, incl. watch/AsyncIterator)
 cd bindings/node && npx napi build --platform --no-default-features -F cortex && npx vitest run
 
+# Python SDK smoke tests (12 tests — CortEX tasks + memories via PyO3, incl. sync watch iterators)
+cd bindings/python && uv venv .venv && source .venv/bin/activate && \
+    uv pip install -e '.[test]' maturin && \
+    maturin develop --no-default-features --features cortex && \
+    python -m pytest tests/test_cortex.py
+
 # Backend adapters (requires running services)
 cargo test --test integration_redis --features redis
 cargo test --test integration_jetstream --features jetstream
 ```
 
-**1,123 tests total across the Rust stack** — lib + migration + three_node + integration_net + integration_redex + integration_cortex_{adapter,tasks,memories} + SDK. Plus 14 Node SDK smoke tests via vitest (CRUD, queries, watch/AsyncIterator, multi-model).
+**1,123 tests total across the Rust stack** — lib + migration + three_node + integration_net + integration_redex + integration_cortex_{adapter,tasks,memories} + SDK. Plus 14 Node SDK smoke tests (vitest) and 12 Python SDK smoke tests (pytest), both covering CRUD, filtered queries, reactive watchers, and multi-model coexistence.
 
 ### Test Architecture
 

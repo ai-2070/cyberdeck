@@ -239,3 +239,129 @@ class Net:
 
     def __enter__(self) -> "Net": ...
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool: ...
+
+# =========================================================================
+# CortEX adapter (requires the `cortex` feature at build time)
+# =========================================================================
+
+from typing import Iterator, List, Optional
+
+class Redex:
+    """Local RedEX manager. One handle per node; shared by all adapters."""
+    def __init__(self) -> None: ...
+
+class Task:
+    """A materialized task record."""
+    id: int
+    title: str
+    status: str  # "pending" | "completed"
+    created_ns: int
+    updated_ns: int
+
+class TasksAdapter:
+    @staticmethod
+    def open(redex: Redex, origin_hash: int) -> "TasksAdapter": ...
+    def create(self, id: int, title: str, now_ns: int) -> int: ...
+    def rename(self, id: int, new_title: str, now_ns: int) -> int: ...
+    def complete(self, id: int, now_ns: int) -> int: ...
+    def delete(self, id: int) -> int: ...
+    def wait_for_seq(self, seq: int) -> None: ...
+    def close(self) -> None: ...
+    def is_running(self) -> bool: ...
+    def count(self) -> int: ...
+    def list_tasks(
+        self,
+        *,
+        status: Optional[str] = None,
+        title_contains: Optional[str] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Task]: ...
+    def watch_tasks(
+        self,
+        *,
+        status: Optional[str] = None,
+        title_contains: Optional[str] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> "TaskWatchIter": ...
+
+class TaskWatchIter(Iterator[List[Task]]):
+    def __iter__(self) -> "TaskWatchIter": ...
+    def __next__(self) -> List[Task]: ...
+    def close(self) -> None: ...
+
+class Memory:
+    """A materialized memory record."""
+    id: int
+    content: str
+    tags: List[str]
+    source: str
+    created_ns: int
+    updated_ns: int
+    pinned: bool
+
+class MemoriesAdapter:
+    @staticmethod
+    def open(redex: Redex, origin_hash: int) -> "MemoriesAdapter": ...
+    def store(
+        self,
+        id: int,
+        content: str,
+        tags: List[str],
+        source: str,
+        now_ns: int,
+    ) -> int: ...
+    def retag(self, id: int, tags: List[str], now_ns: int) -> int: ...
+    def pin(self, id: int, now_ns: int) -> int: ...
+    def unpin(self, id: int, now_ns: int) -> int: ...
+    def delete(self, id: int) -> int: ...
+    def wait_for_seq(self, seq: int) -> None: ...
+    def close(self) -> None: ...
+    def is_running(self) -> bool: ...
+    def count(self) -> int: ...
+    def list_memories(
+        self,
+        *,
+        source: Optional[str] = None,
+        content_contains: Optional[str] = None,
+        tag: Optional[str] = None,
+        any_tag: Optional[List[str]] = None,
+        all_tags: Optional[List[str]] = None,
+        pinned: Optional[bool] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Memory]: ...
+    def watch_memories(
+        self,
+        *,
+        source: Optional[str] = None,
+        content_contains: Optional[str] = None,
+        tag: Optional[str] = None,
+        any_tag: Optional[List[str]] = None,
+        all_tags: Optional[List[str]] = None,
+        pinned: Optional[bool] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> "MemoryWatchIter": ...
+
+class MemoryWatchIter(Iterator[List[Memory]]):
+    def __iter__(self) -> "MemoryWatchIter": ...
+    def __next__(self) -> List[Memory]: ...
+    def close(self) -> None: ...
