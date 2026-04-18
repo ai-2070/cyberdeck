@@ -2,9 +2,27 @@
 
 ## Status
 
-**Partial.** The seed of pingwave-driven route installation is already in `mesh.rs` dispatch: when node X receives a pingwave originated by Y, forwarded via direct peer Z, X calls `RoutingTable::add_route_with_metric(Y, next_hop=Z, metric=pw.hop_count + 2)`. The metric policy in `add_route_with_metric` preserves the lower-metric entry, so direct routes (metric 1) always beat pingwave-installed routes. Routes age out via `sweep_stale` on the heartbeat-loop tick.
+**Shipped.** All plan steps are implemented and under test:
 
-This plan fills the remaining gaps — **topology graph population**, **cheap loop avoidance**, and **metric polish** — without inventing a full DV stack. The pingwave wire format doesn't change. Most of this is policy and plumbing on top of machinery that's already in place.
+- `ProximityGraph::edges` populated on every pingwave receipt (`insert_or_update_edge`) and aged out in lockstep with `RoutingTable::sweep_stale` via `sweep_stale_edges` (atomic `DashMap::retain` — no collect-then-remove race).
+- Four loop-avoidance rules at the pingwave-dispatch boundary in `mesh.rs`:
+  1. Origin self-check — drop if `origin == self_id`.
+  2. `MAX_HOPS = 16` — drop if `hop_count >= MAX_HOPS`.
+  3. Split horizon on re-broadcast — skip peers whose address equals the next-hop for the origin.
+  4. **Unregistered-source rejection** — drop pingwaves from peers that haven't completed a handshake; only `addr_to_node.get(&source).is_some()` may inject routing state. Added post-review to close a route/topology poisoning vector.
+- Latency EWMA (`α = 1/8`) on `ProximityEdge.latency_us` for equal-hop tie-breaking (populated; live tiebreaking at lookup is deferred until the routing table grows to hold multiple routes per destination).
+- `RoutingTable::lookup_alternate(dest, exclude_next_hop)` returns the installed entry if it isn't excluded; scaffolding for a future multi-route-per-destination table.
+- `ReroutePolicy::on_failure` resolution order: `lookup_alternate` → `find_graph_alternate_for` → any direct peer.
+
+Unit + integration tests in place; before/after regression (`test_regression_dv_path_to_returns_multi_hop`) confirms `path_to` now returns real multi-hop paths where it used to always return `None`. See `TRANSPORT.md` § Routing for the caller-facing summary.
+
+---
+
+*Original design notes preserved below for context.*
+
+The seed of pingwave-driven route installation was already in `mesh.rs` dispatch: when node X receives a pingwave originated by Y, forwarded via direct peer Z, X calls `RoutingTable::add_route_with_metric(Y, next_hop=Z, metric=pw.hop_count + 2)`. The metric policy in `add_route_with_metric` preserves the lower-metric entry, so direct routes (metric 1) always beat pingwave-installed routes. Routes age out via `sweep_stale` on the heartbeat-loop tick.
+
+This plan filled the remaining gaps — **topology graph population**, **cheap loop avoidance**, and **metric polish** — without inventing a full DV stack. The pingwave wire format didn't change. Most of this was policy and plumbing on top of machinery that was already in place.
 
 ## What already works
 
