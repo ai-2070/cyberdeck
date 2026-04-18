@@ -287,8 +287,14 @@ impl MeshNode {
         let router = Arc::new(router);
         let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
 
-        // Create proximity graph for topology awareness
-        let graph_node_id: [u8; 32] = *identity.entity_id().as_bytes();
+        // Create proximity graph for topology awareness.
+        //
+        // Peers are seeded into the graph via `node_id_to_graph_id(peer_node_id)`
+        // (see `connect`/`accept`). The local node must use the *same*
+        // encoding or path lookups between local and peers would miss —
+        // `entity_id().as_bytes()` would put this node under a different
+        // key than what peers see for it.
+        let graph_node_id = node_id_to_graph_id(node_id);
         let proximity_graph = Arc::new(ProximityGraph::new(
             graph_node_id,
             ProximityConfig::default(),
@@ -574,8 +580,15 @@ impl MeshNode {
             return;
         }
 
-        // Check for pingwave (raw 72-byte packet, not a Net header)
-        if data.len() == EnhancedPingwave::SIZE {
+        // Check for pingwave. Pingwaves are a fixed 72-byte wire format
+        // that does NOT carry the Net header magic. We reject anything
+        // that starts with `MAGIC` so a legitimate Net packet that happens
+        // to be 72 bytes is never mis-handled (defense in depth — the
+        // current Net packet layout has an 80-byte minimum, but relying
+        // on that is fragile). The leading-MAGIC check does not
+        // authenticate pingwaves against a spoofing attacker; that is a
+        // separate protocol concern.
+        if data.len() == EnhancedPingwave::SIZE && u16::from_le_bytes([data[0], data[1]]) != MAGIC {
             if let Some(pw) = EnhancedPingwave::from_bytes(&data) {
                 // Process and optionally re-broadcast
                 if let Some(fwd_pw) = ctx.proximity_graph.on_pingwave(pw, source) {

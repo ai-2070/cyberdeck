@@ -3690,3 +3690,116 @@ async fn test_mesh_handshake_relay_bidirectional() {
     b.shutdown().await.unwrap();
     c.shutdown().await.unwrap();
 }
+
+// ============================================================================
+// Regressions
+// ============================================================================
+
+/// Regression: `MeshNode` used to seed its local proximity-graph identity as
+/// `entity_id().as_bytes()` while peers were seeded via the zero-padded
+/// `node_id` encoding (`node_id_to_graph_id`). That mismatch meant the
+/// graph stored the same logical node under two different keys — any
+/// `path_to(...)` or `all_nodes()` query that joined self with peers would
+/// see inconsistent identities.
+///
+/// The fix is to use `node_id_to_graph_id(node_id)` in both places. This
+/// test exercises the fix via the observable `create_pingwave()` output:
+/// the pingwave's `origin_id` is the local graph identity, and must equal
+/// `node_id.to_le_bytes()` zero-padded to 32 bytes.
+#[tokio::test]
+async fn test_regression_proximity_graph_local_id_matches_peer_encoding() {
+    use net::adapter::net::behavior::loadbalance::HealthStatus;
+
+    let ports = find_ports(1).await;
+    let psk = [0x42u8; 32];
+    let id = EntityKeypair::generate();
+    let expected_nid = id.node_id();
+    let addr: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+
+    let node = MeshNode::new(id, MeshNodeConfig::new(addr, psk))
+        .await
+        .unwrap();
+
+    let pw = node
+        .proximity_graph()
+        .create_pingwave(HealthStatus::Healthy);
+
+    let mut expected = [0u8; 32];
+    expected[0..8].copy_from_slice(&expected_nid.to_le_bytes());
+    assert_eq!(
+        pw.origin_id, expected,
+        "proximity graph's local id must use the zero-padded node_id \
+         encoding so it matches what peers see when they seed this node \
+         into their own graph"
+    );
+
+    node.shutdown().await.unwrap();
+}
+
+/// Regression: the receive loop used to dispatch any 72-byte UDP packet as
+/// a pingwave based on length alone. A packet whose leading bytes were the
+/// Net-header magic (`0x4E45`) would still be mis-handled as a pingwave,
+/// bypassing normal decryption and session-id validation.
+///
+/// The fix is a structural check: only dispatch as a pingwave when the
+/// leading two bytes are NOT the Net magic. A length-72 blob starting with
+/// the magic must NOT increment `pingwaves_received`. (This test does not
+/// address the broader issue of pingwave authentication, which is a
+/// separate protocol concern; it verifies that the length-only heuristic
+/// no longer swallows legitimate Net-header-shaped traffic.)
+#[tokio::test]
+async fn test_regression_pingwave_not_dispatched_on_net_magic_packet() {
+    let ports = find_ports(1).await;
+    let psk = [0x42u8; 32];
+    let id = EntityKeypair::generate();
+    let addr: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+
+    let node = MeshNode::new(id, MeshNodeConfig::new(addr, psk))
+        .await
+        .unwrap();
+    node.start();
+
+    let before = node.proximity_graph().stats().pingwaves_received;
+
+    // Craft a 72-byte packet whose first two bytes are the Net magic
+    // (0x4E45 little-endian = [0x45, 0x4E] = "EN"). Post-fix this must be
+    // rejected at the pingwave guard and NOT reach the proximity graph.
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut pkt = [0u8; 72];
+    pkt[0] = 0x45;
+    pkt[1] = 0x4E;
+    sender.send_to(&pkt, addr).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let after = node.proximity_graph().stats().pingwaves_received;
+    assert_eq!(
+        before, after,
+        "a 72-byte packet starting with the Net magic must not be \
+         dispatched as a pingwave"
+    );
+
+    // Sanity check: a 72-byte packet WITHOUT the Net magic is still
+    // accepted as a pingwave. If this fails, the guard is too aggressive.
+    let mut pw_pkt = [0u8; 72];
+    // Fill origin_id[0..8] with a recognisable node id; the remaining
+    // origin_id bytes (8..32) are zero — not the Net magic — so the
+    // pingwave guard lets it through.
+    pw_pkt[0..8].copy_from_slice(&0xDEADBEEFu64.to_le_bytes());
+    // Set TTL > 0 so the graph considers it live.
+    pw_pkt[40] = 4;
+    sender.send_to(&pw_pkt, addr).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let after_valid = node.proximity_graph().stats().pingwaves_received;
+    assert!(
+        after_valid > after,
+        "legitimate pingwaves (no Net magic) must still be accepted; \
+         before={}, after={}",
+        after,
+        after_valid
+    );
+
+    node.shutdown().await.unwrap();
+}

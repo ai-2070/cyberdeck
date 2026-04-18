@@ -125,15 +125,23 @@ impl ReroutePolicy {
             None => return, // no alternates
         };
 
-        // Reroute each affected destination through the alternate
+        // Reroute each affected destination through the alternate.
+        //
+        // `saved_routes` preserves the *original* next_hop so that recovery
+        // can restore the pre-failure route. Use `entry().or_insert(...)`:
+        // if the same destination already has a saved route from a prior
+        // failure, keep that original — overwriting would substitute a
+        // relay's addr for the true next_hop and corrupt recovery. The
+        // `alternate` field can be updated separately without losing the
+        // original.
         for dest_id in &affected {
-            self.saved_routes.insert(
-                *dest_id,
-                SavedRoute {
+            self.saved_routes
+                .entry(*dest_id)
+                .and_modify(|existing| existing.alternate = alt_addr)
+                .or_insert(SavedRoute {
                     next_hop: failed_addr,
                     alternate: alt_addr,
-                },
-            );
+                });
             self.routing_table.add_route(*dest_id, alt_addr);
         }
 
@@ -332,6 +340,56 @@ mod tests {
         // Route unchanged (still points to B — no better option)
         assert_eq!(rt.lookup(0x4444).unwrap(), addr_b);
         assert_eq!(policy.active_reroutes(), 0);
+    }
+
+    /// Regression: `on_failure` used to `insert` into `saved_routes`,
+    /// which meant a second failure (e.g., the alternate itself going
+    /// down) would overwrite the original `next_hop` with the alternate's
+    /// address. On recovery, the route would then be "restored" to the
+    /// wrong peer — the alternate's old address, not the true original.
+    ///
+    /// Fix: use `entry().or_insert(...)` so the original next_hop is
+    /// preserved across repeated failures. Only `alternate` is updated.
+    #[test]
+    fn test_regression_repeated_failures_preserve_original_next_hop() {
+        let rt = make_routing_table();
+        let peers = Arc::new(DashMap::new());
+
+        let addr_b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let addr_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let addr_d: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+
+        peers.insert(0x2222u64, addr_b);
+        peers.insert(0x3333u64, addr_c);
+        peers.insert(0x4444u64, addr_d);
+
+        // Route to 0x5555 originally goes through B.
+        rt.add_route(0x5555, addr_b);
+
+        let policy = ReroutePolicy::new(rt.clone(), peers.clone());
+
+        // B fails — route is rerouted to an alternate (C or D).
+        policy.on_failure(0x2222);
+        let first_alt = rt.lookup(0x5555).unwrap();
+        assert_ne!(first_alt, addr_b);
+
+        // The alternate also fails. Resolve its node_id to call on_failure.
+        let first_alt_node_id = *peers
+            .iter()
+            .find(|e| *e.value() == first_alt)
+            .unwrap()
+            .key();
+        policy.on_failure(first_alt_node_id);
+
+        // B recovers. The original route must be restored to B, not to
+        // the alternate that transiently held `next_hop` before the fix.
+        policy.on_recovery(0x2222);
+        let restored = rt.lookup(0x5555).unwrap();
+        assert_eq!(
+            restored, addr_b,
+            "recovery must restore the true original next_hop (B), not a \
+             previously chosen alternate"
+        );
     }
 
     #[test]
