@@ -18,9 +18,9 @@ use super::retention::compute_eviction_count;
 use super::segment::HeapSegment;
 
 #[cfg(feature = "redex-disk")]
-use std::path::Path;
-#[cfg(feature = "redex-disk")]
 use super::disk::DiskSegment;
+#[cfg(feature = "redex-disk")]
+use std::path::Path;
 
 /// A live tail subscription waiting for new events.
 struct TailWatcher {
@@ -94,11 +94,7 @@ impl RedexFile {
         base_dir: &Path,
     ) -> Result<Self, RedexError> {
         let recovered = DiskSegment::open(base_dir, &name)?;
-        let next_seq = recovered
-            .index
-            .last()
-            .map(|e| e.seq + 1)
-            .unwrap_or(0);
+        let next_seq = recovered.index.last().map(|e| e.seq + 1).unwrap_or(0);
 
         let segment = HeapSegment::from_existing(recovered.payload_bytes);
         let state = FileState {
@@ -155,8 +151,7 @@ impl RedexFile {
 
         let mut state = self.inner.state.lock();
         let offset = state.segment.append(payload)?;
-        let entry =
-            RedexEntry::new_heap(seq, truncate_u32(offset), payload.len() as u32, 0, cks);
+        let entry = RedexEntry::new_heap(seq, truncate_u32(offset), payload.len() as u32, 0, cks);
         state.index.push(entry);
 
         #[cfg(feature = "redex-disk")]
@@ -175,10 +170,7 @@ impl RedexFile {
 
     /// Append a fixed-length 8-byte inline payload. Skips the segment
     /// indirection. Returns the assigned sequence.
-    pub fn append_inline(
-        &self,
-        payload: &[u8; INLINE_PAYLOAD_SIZE],
-    ) -> Result<u64, RedexError> {
+    pub fn append_inline(&self, payload: &[u8; INLINE_PAYLOAD_SIZE]) -> Result<u64, RedexError> {
         self.check_not_closed()?;
         let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
         let cks = payload_checksum(payload);
@@ -220,13 +212,8 @@ impl RedexFile {
             let seq = first_seq + i as u64;
             let cks = payload_checksum(payload);
             let offset = state.segment.append(payload)?;
-            let entry = RedexEntry::new_heap(
-                seq,
-                truncate_u32(offset),
-                payload.len() as u32,
-                0,
-                cks,
-            );
+            let entry =
+                RedexEntry::new_heap(seq, truncate_u32(offset), payload.len() as u32, 0, cks);
             state.index.push(entry);
             events.push(RedexEvent {
                 entry,
@@ -291,7 +278,10 @@ impl RedexFile {
         }
 
         // Register for live events.
-        state.watchers.push(TailWatcher { from_seq, sender: tx });
+        state.watchers.push(TailWatcher {
+            from_seq,
+            sender: tx,
+        });
         drop(state);
 
         UnboundedReceiverStream::new(rx)

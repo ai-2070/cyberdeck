@@ -230,7 +230,9 @@ impl RedexFold<TaskState> for TaskFold {
         let id = meta.seq_or_ts;
         match meta.dispatch {
             DISPATCH_TASK_CREATED | DISPATCH_TASK_RENAMED => {
-                state.tasks.insert(id, String::from_utf8_lossy(tail).into_owned());
+                state
+                    .tasks
+                    .insert(id, String::from_utf8_lossy(tail).into_owned());
             }
             DISPATCH_TASK_DELETED => {
                 state.tasks.remove(&id);
@@ -254,16 +256,27 @@ async fn test_mixed_dispatch_routing() {
     )
     .unwrap();
 
-    adapter.ingest(mk_env(DISPATCH_TASK_CREATED, 1, b"first")).unwrap();
-    adapter.ingest(mk_env(DISPATCH_TASK_CREATED, 2, b"second")).unwrap();
-    adapter.ingest(mk_env(DISPATCH_TASK_RENAMED, 1, b"first-renamed")).unwrap();
-    let seq = adapter.ingest(mk_env(DISPATCH_TASK_DELETED, 2, b"")).unwrap();
+    adapter
+        .ingest(mk_env(DISPATCH_TASK_CREATED, 1, b"first"))
+        .unwrap();
+    adapter
+        .ingest(mk_env(DISPATCH_TASK_CREATED, 2, b"second"))
+        .unwrap();
+    adapter
+        .ingest(mk_env(DISPATCH_TASK_RENAMED, 1, b"first-renamed"))
+        .unwrap();
+    let seq = adapter
+        .ingest(mk_env(DISPATCH_TASK_DELETED, 2, b""))
+        .unwrap();
     adapter.wait_for_seq(seq).await;
 
     let state = adapter.state();
     let guard = state.read();
     assert_eq!(guard.tasks.len(), 1);
-    assert_eq!(guard.tasks.get(&1).map(|s| s.as_str()), Some("first-renamed"));
+    assert_eq!(
+        guard.tasks.get(&1).map(|s| s.as_str()),
+        Some("first-renamed")
+    );
     assert!(!guard.tasks.contains_key(&2));
 }
 

@@ -53,7 +53,10 @@ pub(super) struct DiskSegment {
 impl DiskSegment {
     /// Open (or create) the idx + dat files for `name` under `base_dir`
     /// and recover the index from disk.
-    pub(super) fn open(base_dir: &Path, name: &ChannelName) -> Result<RecoveredSegment, RedexError> {
+    pub(super) fn open(
+        base_dir: &Path,
+        name: &ChannelName,
+    ) -> Result<RecoveredSegment, RedexError> {
         let dir = channel_dir(base_dir, name);
         std::fs::create_dir_all(&dir).map_err(RedexError::io)?;
         let idx_path = dir.join("idx");
@@ -310,4 +313,3 @@ mod tests {
         assert_eq!(dir, PathBuf::from("/tmp/base/sensors/lidar/front"));
     }
 }
-

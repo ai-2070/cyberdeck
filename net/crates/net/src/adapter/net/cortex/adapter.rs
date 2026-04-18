@@ -248,7 +248,9 @@ where
 
     match result {
         Ok(()) => {
-            inner.folded_through_seq.store(seq as i64, Ordering::Release);
+            inner
+                .folded_through_seq
+                .store(seq as i64, Ordering::Release);
             inner.notify.notify_waiters();
             false
         }
@@ -260,7 +262,9 @@ where
                 FoldErrorPolicy::LogAndContinue => {
                     // Skip this event; advance watermark so
                     // wait_for_seq doesn't hang on the skipped seq.
-                    inner.folded_through_seq.store(seq as i64, Ordering::Release);
+                    inner
+                        .folded_through_seq
+                        .store(seq as i64, Ordering::Release);
                     inner.notify.notify_waiters();
                     false
                 }
@@ -388,7 +392,8 @@ mod tests {
     #[tokio::test]
     async fn test_log_and_continue_skips_errors() {
         let redex = Redex::new();
-        let cfg = CortexAdapterConfig::new().with_fold_error_policy(FoldErrorPolicy::LogAndContinue);
+        let cfg =
+            CortexAdapterConfig::new().with_fold_error_policy(FoldErrorPolicy::LogAndContinue);
         let adapter = CortexAdapter::<u64>::open(
             &redex,
             &cn("cortex/lc"),

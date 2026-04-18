@@ -37,6 +37,8 @@ pub mod compute;
 mod config;
 pub mod contested;
 pub mod continuity;
+#[cfg(feature = "cortex-adapter")]
+pub mod cortex;
 mod crypto;
 mod failure;
 pub mod identity;
@@ -46,8 +48,6 @@ mod protocol;
 mod proxy;
 #[cfg(feature = "redex")]
 pub mod redex;
-#[cfg(feature = "cortex-adapter")]
-pub mod cortex;
 mod reliability;
 mod reroute;
 mod route;
@@ -86,6 +86,11 @@ pub use continuity::{
     DiscontinuityReason, ForkRecord, HorizonDivergence, ObservationWindow, ProofError,
     PropagationModel, SuperpositionPhase, SuperpositionState, SUBPROTOCOL_CONTINUITY,
 };
+#[cfg(feature = "cortex-adapter")]
+pub use cortex::{
+    CortexAdapter, CortexAdapterConfig, CortexAdapterError, EventEnvelope, EventMeta,
+    FoldErrorPolicy, IntoRedexPayload, StartPosition, EVENT_META_SIZE,
+};
 pub use crypto::{CryptoError, SessionKeys, StaticKeypair};
 pub use failure::{
     CircuitBreaker, CircuitState, FailureDetector, FailureDetectorConfig, FailureStats,
@@ -106,11 +111,6 @@ pub use proxy::{
 #[cfg(feature = "redex")]
 pub use redex::{
     Redex, RedexEntry, RedexError, RedexEvent, RedexFile, RedexFileConfig, RedexFlags, RedexFold,
-};
-#[cfg(feature = "cortex-adapter")]
-pub use cortex::{
-    CortexAdapter, CortexAdapterConfig, CortexAdapterError, EventEnvelope, EventMeta,
-    FoldErrorPolicy, IntoRedexPayload, StartPosition, EVENT_META_SIZE,
 };
 pub use reliability::{FireAndForget, ReliabilityMode, ReliableStream};
 pub use reroute::ReroutePolicy;

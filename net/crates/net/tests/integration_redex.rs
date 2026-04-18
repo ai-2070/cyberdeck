@@ -55,7 +55,9 @@ async fn test_redex_10k_roundtrip() {
 async fn test_redex_inline_only_roundtrip() {
     // Exercise the zero-segment-allocation inline path end-to-end.
     let r = Redex::new();
-    let f = r.open_file(&cn("inline/only"), RedexFileConfig::default()).unwrap();
+    let f = r
+        .open_file(&cn("inline/only"), RedexFileConfig::default())
+        .unwrap();
 
     for i in 0..1000u64 {
         f.append_inline(&i.to_le_bytes()).unwrap();
@@ -75,7 +77,9 @@ async fn test_redex_tail_backfill_plus_live_is_gapless() {
     // Two writers: one that fills before tail opens, one that writes
     // while tail is live. Every event must arrive exactly once.
     let r = Redex::new();
-    let f = r.open_file(&cn("gapless"), RedexFileConfig::default()).unwrap();
+    let f = r
+        .open_file(&cn("gapless"), RedexFileConfig::default())
+        .unwrap();
 
     for i in 0..500u64 {
         f.append(format!("pre-{}", i).as_bytes()).unwrap();
@@ -108,8 +112,7 @@ async fn test_redex_tail_backfill_plus_live_is_gapless() {
 #[tokio::test]
 async fn test_redex_retention_with_continued_tail() {
     // Retention evicts while a tail is live on the surviving tail.
-    let cfg = RedexFileConfig::default()
-        .with_retention_max_events(100);
+    let cfg = RedexFileConfig::default().with_retention_max_events(100);
     let r = Redex::new();
     let f = r.open_file(&cn("retention/ev"), cfg).unwrap();
 
@@ -135,7 +138,9 @@ async fn test_redex_retention_with_continued_tail() {
 #[tokio::test]
 async fn test_redex_close_signals_tail() {
     let r = Redex::new();
-    let f = r.open_file(&cn("closing"), RedexFileConfig::default()).unwrap();
+    let f = r
+        .open_file(&cn("closing"), RedexFileConfig::default())
+        .unwrap();
     f.append(b"hello").unwrap();
 
     let mut stream = Box::pin(f.tail(0));
@@ -180,7 +185,9 @@ async fn test_redex_fold_smoke() {
     }
 
     let r = Redex::new();
-    let f = r.open_file(&cn("fold/smoke"), RedexFileConfig::default()).unwrap();
+    let f = r
+        .open_file(&cn("fold/smoke"), RedexFileConfig::default())
+        .unwrap();
     for payload in ["a", "bb", "ccc", "dddd"] {
         f.append(payload.as_bytes()).unwrap();
     }

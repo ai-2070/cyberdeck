@@ -54,13 +54,7 @@ pub struct EventMeta {
 
 impl EventMeta {
     /// Build an `EventMeta` with zeroed pad bytes.
-    pub fn new(
-        dispatch: u8,
-        flags: u8,
-        origin_hash: u32,
-        seq_or_ts: u64,
-        checksum: u32,
-    ) -> Self {
+    pub fn new(dispatch: u8, flags: u8, origin_hash: u32, seq_or_ts: u64, checksum: u32) -> Self {
         Self {
             dispatch,
             flags,
