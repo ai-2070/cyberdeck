@@ -40,6 +40,7 @@ The whole receive path and the fairness layer assume streams already exist and a
 - Stream IDs with protocol meaning. Ranges like "0..1024 reserved for system streams" are **out**; stream IDs are caller-chosen opaque `u64` values. Subprotocol dispatch already has its own field.
 - Streaming video / large-file transfer optimizations. The existing `StreamState` + fair scheduler are enough for the event-bus workload this crate targets.
 - Multi-peer streams ("this stream exists across all of my peers"). Streams are scoped to a single session (one peer).
+- **Multicast / fan-out.** Stream multiplexing is about independent *logical flows over one session*, not "same content to many peers." Fan-out is an application/daemon/channel concern that sits one layer up; it is explicitly NOT a transport-layer feature and should not drive this plan's design.
 
 ## Design
 
@@ -100,19 +101,19 @@ Today's convenience methods keep working unchanged. They internally open (or loo
 
 **Idle eviction.** `StreamState` gets a `last_activity: Instant` field (already trivially derivable from `tx_seq` / `rx_seq` updates but make it explicit). A periodic sweep on the heartbeat tick removes streams with `last_activity.elapsed() > stream_idle_timeout` (config, default 5× session timeout). Evicting a stream means calling `close_stream` internally.
 
-**Hard cap.** `NetSession` grows a `max_streams: usize` config (default 4096). Exceeding the cap forces eviction of the least-recently-active stream before creating a new one. Loud tracing warning so deployments notice.
+**Hard cap.** `NetSession` grows a `max_streams: usize` config (default 4096). Exceeding the cap forces eviction of the least-recently-active stream before creating a new one. Cap-eviction goes through the **same internal path** as a user-initiated `close_stream` (so `CloseBehavior::DrainThenClose` still drains what it can), with a distinctive `tracing::warn!` tagged as `reason=cap_exceeded` so deployments can distinguish it from normal idle eviction.
 
-### Per-stream flow control
+### Per-stream flow control — v1: queue-full is the back-pressure signal
 
-Credit-based window, symmetric to the reliability layer's NACK window but simpler (no retransmission):
+**No credit/window protocol, no wire changes, no in-flight accounting in v1.** The router's `FairScheduler` already bounds per-stream queue depth. Surfacing that existing limit as a caller-visible signal is enough.
 
-- Each `StreamState` has `window_bytes: u32` (total) and `bytes_in_flight: u32` (current).
-- `Stream::send` returns `StreamError::WouldBlock` if the send would exceed `window_bytes`. Caller waits / retries / drops per its own policy — no built-in blocking for now (keeps the API simple; backpressure is expressed, not absorbed).
-- A `StreamWindow { stream_id, new_window_bytes }` control message on the reliability channel grants credit. Actually, this can piggyback on existing NACK / ACK logic for the reliable mode; for fire-and-forget there is nothing to grant back and the window is a pure TX-side budget.
+- `Stream::send` enqueues on the stream's scheduler queue.
+- If the queue is full, `send` returns `StreamError::WouldBlock` immediately. No blocking, no buffering above the scheduler. Caller decides: retry, drop, or surface to its own back-pressure layer.
+- Other streams are unaffected — the fair scheduler keeps serving them. One stream being `WouldBlock` is one stream's problem, not a session-wide stall.
 
-**Alternative, simpler scheme** (if credit windows feel over-engineered for the workload): a pure per-stream TX budget (bytes queued at the scheduler). No in-flight accounting, no credit messages; `send` returns `WouldBlock` when the stream's router queue is full. This is arguably enough — the scheduler already bounds per-stream queue depth; surfacing that limit as a `StreamError` is 90% of the value of a full windowing scheme.
+This is 90% of what a full credit-windowing scheme would give us, for ~5% of the complexity. A proper `StreamWindow { stream_id, new_bytes }` control message with `bytes_in_flight` accounting can be swapped in later as a purely internal change — the `Stream::send` → `WouldBlock` API does not move. Flagged as an open question, not v1 scope.
 
-Recommendation: **ship the simpler scheme first**, add credit windows only if measured need arises. The plan is designed so swapping one for the other is a stream-internal change — the caller API doesn't move.
+`StreamConfig.window_bytes` stays in the struct as a forward-looking knob; v1 treats it as a per-stream override of `max_queue_depth` (bytes-budgeted depth instead of packet-count depth), defaulting to the router's configured value.
 
 ### Fairness weight
 
@@ -146,10 +147,13 @@ Counters already exist in the router's `StreamStats` struct and in `StreamState:
 Add a "Streams" section to `docs/TRANSPORT.md` stating:
 
 - A stream is a logical channel within an encrypted session to a single peer.
-- Ordering is guaranteed in FIFO order **within** a stream.
-- **No ordering across streams.** A later-sent packet on stream A may arrive before an earlier-sent packet on stream B.
+- **Ordering within a stream, split by reliability mode:**
+  - `Reliability::Reliable` — FIFO delivery. The reliability machinery already maintains per-stream sequence + a small in-order window; gaps trigger NACK-driven retransmission.
+  - `Reliability::FireAndForget` — best-effort. Sequence numbers are monotonic on the wire so receivers can detect reorder/loss if they care, but the transport does not reorder or recover.
+- **No ordering across streams.** A later-sent packet on stream A may arrive before an earlier-sent packet on stream B. Fair scheduling prevents starvation; timing is not synchronized.
 - Reliability is chosen per stream at `open_stream`. A session can run fire-and-forget and reliable streams simultaneously.
 - Stream IDs are opaque `u64`s. No range has reserved meaning at the transport layer. Callers derive IDs however they want (hash of a logical channel name is typical; `stream_id_from_key` is the helper).
+- **Multiplexing is not multicast.** A stream is "one logical flow to one peer." Sending the same content to multiple peers is an application / daemon / channel-layer concern and is explicitly not done by the transport.
 - Closing a stream immediately stops delivery of buffered inbound events and drops outbound packets that haven't hit the wire. Durable send = "await completion before closing."
 
 ## Implementation
@@ -170,11 +174,11 @@ Each step is independently reviewable.
 - Heartbeat-loop piggyback: sweep streams with `last_activity.elapsed() > idle_timeout`, up to the `max_streams` cap.
 - `MeshNodeConfig` grows `stream_idle_timeout: Duration` and `max_streams: usize` with sane defaults.
 
-### Step 3: Per-stream TX budget + `StreamError::WouldBlock` (~60 lines)
+### Step 3: Queue-full → `StreamError::WouldBlock` (~40 lines)
 
-- Scheduler already has `max_queue_depth` per stream. Expose the queue's "full" state to callers via a `StreamError::WouldBlock` returned from `Stream::send`.
-- No wire changes — purely local back-pressure signaling.
-- Document that callers can choose to block, drop, or buffer on WouldBlock.
+- The scheduler already has `max_queue_depth` per stream. Surface the queue's "full" state to callers via a `StreamError::WouldBlock` returned from `Stream::send`.
+- `StreamConfig.window_bytes` becomes a per-stream override of the depth cap (bytes-budgeted rather than packet-count-budgeted), defaulting to the router's existing value.
+- No wire changes. No in-flight accounting. No control messages. Caller decides whether to retry, drop, or surface further.
 
 ### Step 4: Public per-stream statistics (~50 lines)
 
@@ -218,12 +222,13 @@ Integration (`tests/three_node_integration.rs`):
 
 ## Scope
 
-~380 lines across `stream.rs` (new), `session.rs`, `router.rs`, `mesh.rs`, and `config.rs`. ~200 lines of tests. ~30 lines of new docs. Each step is independently reviewable; none depends on another shipping first.
+~360 lines across `stream.rs` (new), `session.rs`, `router.rs`, `mesh.rs`, and `config.rs`. ~200 lines of tests. ~30 lines of new docs. Each step is independently reviewable; none depends on another shipping first.
 
-## Open questions
+## Open questions / deferred
 
-- **Backpressure: `WouldBlock` vs. async `send_blocking`.** The plan proposes `WouldBlock` and letting the caller manage the retry loop. Should `Stream::send` have an async flavor that awaits credit? Probably yes — but as a thin wrapper, not a different API.
-- **Cross-stream priority at the AEAD / cipher level.** Today the session's one Noise cipher serializes all streams at the crypto layer. For very high throughput, a per-stream cipher (derived via HKDF from the session keys) would allow parallel encryption. Out of scope for this plan; flag as future work.
-- **Stream close notification on the wire.** Currently closing a stream is purely local — the peer doesn't learn. For `ReliableStream`, a `FIN` flag on the last packet would be ergonomic (it's already in `PacketFlags::FIN` per `protocol.rs`). Worth wiring; small add.
+- **Credit windowing.** v1 ships queue-full → `WouldBlock`. If we ever measure a workload where that's insufficient (one stream's queue capacity shadowing real scheduler pressure on another), a proper per-stream credit window with an explicit `StreamWindow { stream_id, new_bytes }` control message and `bytes_in_flight` accounting can slot in as a **purely internal** change. The `Stream::send → WouldBlock` API doesn't move.
+- **Backpressure: `WouldBlock` vs. async `send_blocking`.** v1 is `WouldBlock` and caller-managed retry. An async `send` wrapper that awaits queue space is a thin convenience on top; worth adding in a follow-up.
+- **Cross-stream priority at the AEAD / cipher level.** Today the session's one Noise cipher serializes all streams at the crypto layer. For very high throughput, a per-stream cipher (derived via HKDF from the session keys) would allow parallel encryption. Out of scope for this plan.
+- **Stream close notification on the wire.** Currently closing a stream is purely local — the peer doesn't learn. For `Reliable` streams, a `FIN` flag on the last packet would be ergonomic (`PacketFlags::FIN` already exists per `protocol.rs`). Worth wiring; small add, could slot in as Step 2.5 if it surfaces during review.
 
-The first two are deferred; the third (wire `FIN` on close) could reasonably slot in as Step 2.5 if it pops up during implementation review.
+All four are deferred, not canceled. The v1 API is designed so each can be added without moving the caller-visible surface.
