@@ -164,3 +164,8 @@ P2 net/crates/net/bindings/node/src/lib.rs:95-100 - node_id() can return negativ
 The Rust node ID is a u64, but the binding exposes it as i64 via as. Any ID with the high bit set will appear negative in Node.js, which can break identity comparisons and routing logic in consumers.
 P2 net/crates/net/src/adapter/net/reroute.rs:111-146 - One alternate is reused for every failed route
 on_failure() computes a single alt_addr and applies it to all affected destinations, even though the topology may require different next hops per destination. In heterogeneous graphs, some of those destinations may not actually be reachable through the chosen alternate, causing traffic to be blackholed until recovery or manual intervention.
+
+P1 net/crates/net/src/adapter/net/subprotocol/migration_handler.rs:85-91, 292-304, 478-492 - Migration acknowledgements are sent to the immediate sender instead of the orchestrator
+RestoreComplete and the later CleanupComplete/ActivateAck chain use from_node as the destination, but from_node is just the previous hop on the wire. In any topology where the migration messages are relayed, these acknowledgements go to the relay instead of the node that owns the migration record, so the state machine can stall waiting for responses that never reach the orchestrator.
+P1 net/crates/net/src/adapter/net/subprotocol/migration_handler.rs:307-320 - Activation is not retry-safe if the final ack is lost
+The target calls activate() and immediately complete() before sending ActivateAck. If the ack packet is dropped or the send fails, the target has already discarded its migration state, so a retry cannot be handled idempotently and the orchestrator can remain stuck waiting for completion.
