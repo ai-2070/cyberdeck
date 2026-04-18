@@ -19,16 +19,32 @@ Neither is necessary. Noise provides confidentiality and authenticity of the han
 
 ### Handshake packets ARE routed packets
 
-An initiator that wants to establish a session with `C` (which it has no direct UDP path to) emits a normal Net packet:
+Handshake is identified by the existing `HANDSHAKE` flag in the Net header, **not** by a subprotocol ID. Relays don't need to know a packet is a handshake — they only see "some Net packet destined for `dest_id = C`" and forward it.
+
+### Stack layering (on the wire, multi-hop)
 
 ```
-[RoutingHeader: dest=C, src=A, ttl, hop_count][NetHeader: HANDSHAKE flag, session_id=0][noise_bytes]
+[RoutingHeader: src=A, dest=C, ttl, hop_count, ...]
+[NetHeader:     HANDSHAKE=1, session_id=0, ...]
+[payload:       Noise msgN bytes]
 ```
 
-- The inner Net packet is exactly what today's direct-connect handshake produces via `PacketBuilder::build_handshake` — header with `HANDSHAKE` flag and `session_id = 0`, payload is the raw Noise message.
-- The outer `RoutingHeader` is what today's `send_routed` prepends for data packets.
-- Every intermediate hop forwards by routing header only. The inner packet is never inspected or modified.
-- At the destination, the routing header is stripped and the Net packet is dispatched like any other handshake packet — fed to the responder half of the Noise state machine, which writes `msg2`, and the response goes back through the routing plane the same way.
+**At a relay**:
+- Reads `RoutingHeader`.
+- Decrements TTL / updates `hop_count`.
+- Forwards as-is to next hop based on `RoutingTable::lookup(dest_id)`.
+- Does not touch the `NetHeader` or the payload.
+
+**At the responder**:
+- Strips `RoutingHeader`.
+- Sees `HANDSHAKE=1` in the `NetHeader`.
+- Hands the payload to the Noise responder state, keyed by `(src_id, dest_id)` taken from the routing header that just arrived.
+
+**At the initiator (for the return msg2)**:
+- Receives a routed packet with `dest=self`, `HANDSHAKE=1`, `session_id=0`.
+- Strips routing header, processes msg2, derives session keys.
+
+No "inner envelope". No per-hop crypto beyond what's already in play at the link layer (see below).
 
 ### What lives where
 
@@ -46,15 +62,25 @@ An initiator that wants to establish a session with `C` (which it has no direct 
 
 The routing header is unauthenticated metadata. A malicious relay could rewrite `src_id` before forwarding; the responder would still decrypt msg1 correctly (Noise doesn't depend on that field) but would register the derived session under whatever `src_id` the relay wrote. Cheap peer-ID spoofing.
 
-Fix (same mechanism we already ship for the single-relay envelope): both sides bind the routing header's `(src_id, dest_id)` into the Noise prologue via a domain-tagged construction:
+Fix: both sides bind the routing header's `(src_id, dest_id)` into the Noise prologue via a domain-tagged construction:
 
 ```
 prologue = "net-handshake-v1\0\0\0\0" || src_id_LE(8) || dest_id_LE(8)
 ```
 
-Initiator's view: `src = self, dest = C`. Responder's view after parsing the routing header it received: `src = routing_header.src_id, dest = self`. If a relay rewrote either, the prologues differ, `read_message` fails the MAC check on msg1, and the handshake is rejected end-to-end.
+- **Initiator** uses `(src = self.node_id, dest = peer_node_id)`.
+- **Responder** uses `(src = routing_header.src_id, dest = self.node_id)` — taken from the routing header that just arrived.
+- Endpoints use this prologue for all Noise messages in the handshake.
 
-Dest tampering is also inherently caught by Noise NKpsk0 — msg1 is encrypted to the responder's static pubkey, so a relay redirecting to a different node produces a decryption failure at the wrong-responder. The prologue is belt-and-suspenders for dest and load-bearing for src.
+Consequences:
+- If a relay rewrites `src_id`: responder's prologue differs from initiator's → MAC check fails on msg1 → no session keys derived → handshake rejected.
+- If a relay rewrites `dest_id`: two overlapping defenses. (a) Noise NKpsk0 encrypts msg1 to the targeted responder's static pubkey, so a redirected msg1 fails to decrypt at the wrong responder. (b) If somehow the same pubkey is reachable under a different `dest_id`, the prologue still mismatches. Belt-and-suspenders.
+
+That's all we need. No hop lists, no extra state, no per-handshake tracking of the path.
+
+### End-to-end vs link-layer confidentiality
+
+We rely on Noise NKpsk0 for end-to-end confidentiality and authenticity of handshake messages — a passive observer between hops without the PSK cannot read them; a compromised relay with the PSK could (but also could forge msg1 for any origin it wants to impersonate, so having the PSK already breaks the trust boundary). If operators want hop-by-hop encryption as a separate defense, that lives at the link/transport layer (e.g., wrapping the routed packet in a per-hop Net session) and is explicitly **not** part of the handshake protocol.
 
 ## What gets deleted
 
@@ -87,14 +113,27 @@ Replace the current `SUBPROTOCOL_HANDSHAKE` machinery with:
 
 - Build msg1 using `NoiseHandshake::initiator_with_prologue` where `prologue = handshake_prologue(src=self.node_id, dest=dest_node_id)`.
 - Wrap the resulting handshake packet in a routing header with `dest=dest_node_id, src=self.node_id, ttl=DEFAULT_HANDSHAKE_TTL`.
-- Send to `relay_addr` (the first hop). `send_to` on the raw socket — no session encryption needed for handshake.
+- Send to `relay_addr` (the first hop) via the raw socket — no session encryption needed for handshake.
 - Wait for a routed handshake packet to arrive with `dest=self` and `session_id=0`, process msg2, derive keys, register peer.
 
-There's no longer any notion of a handshake-specific initiator map. The `pending_initiator` state becomes per-call local (stored in the `connect_via` future's stack frame).
+The **wait** is integrated with the existing receive loop. Two equivalent implementations:
+- A small `pending_initiator: DashMap<u64 peer_node_id, oneshot::Sender<…>>` on `MeshNode`, populated at the start of `connect_via` and consumed by `dispatch_packet` when a matching routed-handshake msg2 arrives. This is what today's `handshake_relay::HandshakeHandler` already does — reuse the same shape.
+- Or a per-call oneshot + a future-registered wake hook. Either works; the DashMap is simpler and matches the rest of the codebase's style.
+
+There's no global `HandshakeHandler` state beyond that one map; no module-level subprotocol machinery.
 
 ### 3. Responder-accept path
 
-The existing `handshake_responder` loop already pulls handshake packets off the socket. Extend it to also recognize routed-arrival handshakes: if the packet is routed *and* `dest == self`, strip the routing header and process the inner handshake packet. The responder then sends msg2 back by reversing the routing (dest := incoming src, src := self) via the routing table.
+The existing `handshake_responder` loop already pulls handshake packets off the socket. Extend it to:
+
+- Recognize **routed-arrival** handshakes: if the packet is routed and `dest == self`, strip the routing header and feed the inner handshake packet into Noise responder state.
+- Always compute the prologue from `(src_id, dest_id)`:
+  - For **direct** handshakes: `(src = peer_node_id from accept API, dest = self.node_id)`.
+  - For **routed** handshakes: `(src = routing_header.src_id, dest = self.node_id)`.
+- For msg2 on the routed path:
+  - Wrap the reply in a routing header with `src = self.node_id`, `dest = routing_header.src_id` (from the msg1 envelope).
+  - Send via the routing table's next-hop lookup — no special relay behavior.
+- Register the new session keyed by the resolved `peer_node_id`. For routed handshakes, `peer_node_id = routing_header.src_id`; for direct, the existing resolution stands.
 
 ### 4. Prologue helper in `crypto.rs`
 
@@ -124,11 +163,13 @@ pub fn handshake_prologue(src_node_id: u64, dest_node_id: u64) -> [u8; 16 + 16] 
 
 The previous `connect_via_chain` / `connect_via_topology` idea disappears — source routing isn't needed.
 
-## Dependencies
+## Dependencies — and what this plan is NOT
 
-**Blocker for spontaneous multi-hop:** the routing table has to know routes to non-direct peers. That's [MULTI_HOP_ROUTING_PLAN.md](MULTI_HOP_ROUTING_PLAN.md) and is required before `connect_routed` becomes useful in topologies larger than one relay.
+This plan assumes the routing plane can deliver packets to `dest_node_id` across multiple hops. **Today it cannot**: `RoutingTable` only knows about direct peers. Multi-hop routing discovery — learning and maintaining routes to non-direct nodes via `ProximityGraph` + pingwaves — is a **separate** plan and will be implemented outside the handshake logic. See [MULTI_HOP_ROUTING_PLAN.md](MULTI_HOP_ROUTING_PLAN.md).
 
-This plan stands alone for the single-relay case: `connect_via(addr_of_B, pubkey_of_C, nid_of_C)` works end-to-end after implementation.
+The split is deliberate: if a future reader is tempted to re-solve routing inside the handshake protocol, the answer is no. Routing is a routing problem.
+
+This plan stands alone for the single-relay case: `connect_via(addr_of_B, pubkey_of_C, nid_of_C)` works end-to-end after implementation, because the first-hop addr is supplied by the caller. `connect_routed` becomes useful in topologies larger than one relay only after the routing-discovery plan lands.
 
 ## Tests
 
