@@ -23,6 +23,9 @@ mod envelope;
 mod error;
 mod meta;
 
+#[cfg(feature = "cortex-tasks")]
+pub mod tasks;
+
 pub use adapter::CortexAdapter;
 pub use config::{CortexAdapterConfig, FoldErrorPolicy, StartPosition};
 pub use envelope::{EventEnvelope, IntoRedexPayload};

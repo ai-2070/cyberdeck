@@ -40,6 +40,7 @@ ffi = []
 redex = ["net", "dep:tokio-stream", "dep:bincode"]
 redex-disk = ["redex"]
 cortex-adapter = ["redex"]
+cortex-tasks = ["cortex-adapter"]
 
 [dependencies]
 # Async runtime
@@ -146,6 +147,11 @@ required-features = ["redex"]
 name = "integration_cortex_adapter"
 path = "tests/integration_cortex_adapter.rs"
 required-features = ["cortex-adapter"]
+
+[[test]]
+name = "integration_cortex_tasks"
+path = "tests/integration_cortex_tasks.rs"
+required-features = ["cortex-tasks"]
 
 [profile.release]
 lto = true

@@ -1,0 +1,173 @@
+//! `TasksAdapter` — a typed wrapper around `CortexAdapter<TasksState>`
+//! with domain-level ingest helpers.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use bytes::Bytes;
+use parking_lot::RwLock;
+
+use super::super::super::channel::ChannelName;
+use super::super::super::redex::{Redex, RedexFileConfig};
+use super::super::adapter::CortexAdapter;
+use super::super::config::CortexAdapterConfig;
+use super::super::envelope::EventEnvelope;
+use super::super::error::CortexAdapterError;
+use super::super::meta::EventMeta;
+use super::dispatch::{
+    DISPATCH_TASK_COMPLETED, DISPATCH_TASK_CREATED, DISPATCH_TASK_DELETED, DISPATCH_TASK_RENAMED,
+    TASKS_CHANNEL,
+};
+use super::fold::TasksFold;
+use super::state::TasksState;
+use super::types::{
+    TaskCompletedPayload, TaskCreatedPayload, TaskDeletedPayload, TaskId, TaskRenamedPayload,
+};
+
+/// Typed wrapper around `CortexAdapter<TasksState>` that exposes
+/// domain-level operations (`create`, `rename`, `complete`, `delete`)
+/// and hides the `EventMeta` + bincode plumbing.
+pub struct TasksAdapter {
+    inner: CortexAdapter<TasksState>,
+    /// Producer identity stamped on every `EventMeta`.
+    origin_hash: u32,
+    /// Monotonic per-origin counter for `EventMeta::seq_or_ts`.
+    /// Starts at 0 and increments on every ingest through this
+    /// handle. This gives deterministic fold order for the stream of
+    /// events produced by this TasksAdapter instance.
+    app_seq: AtomicU64,
+}
+
+impl TasksAdapter {
+    /// Open the tasks adapter against a `Redex` manager.
+    ///
+    /// Uses [`TASKS_CHANNEL`] (`"cortex/tasks"`). Replays the full
+    /// history into state on open; subsequent events are appended to
+    /// the same channel.
+    pub fn open(redex: &Redex, origin_hash: u32) -> Result<Self, CortexAdapterError> {
+        Self::open_with_config(redex, origin_hash, RedexFileConfig::default())
+    }
+
+    /// Like [`Self::open`] but with a caller-supplied `RedexFileConfig`
+    /// (useful for `persistent: true` or custom retention).
+    pub fn open_with_config(
+        redex: &Redex,
+        origin_hash: u32,
+        redex_config: RedexFileConfig,
+    ) -> Result<Self, CortexAdapterError> {
+        let name = ChannelName::new(TASKS_CHANNEL).map_err(|e| {
+            CortexAdapterError::Redex(super::super::super::redex::RedexError::Channel(
+                e.to_string(),
+            ))
+        })?;
+        let inner = CortexAdapter::open(
+            redex,
+            &name,
+            redex_config,
+            CortexAdapterConfig::default(),
+            TasksFold,
+            TasksState::new(),
+        )?;
+        Ok(Self {
+            inner,
+            origin_hash,
+            app_seq: AtomicU64::new(0),
+        })
+    }
+
+    /// Create a new task. Returns the RedEX seq of the append.
+    pub fn create(
+        &self,
+        id: TaskId,
+        title: impl Into<String>,
+        now_ns: u64,
+    ) -> Result<u64, CortexAdapterError> {
+        let payload = TaskCreatedPayload {
+            id,
+            title: title.into(),
+            now_ns,
+        };
+        self.ingest_typed(DISPATCH_TASK_CREATED, &payload)
+    }
+
+    /// Rename an existing task. No-op at fold time if `id` is unknown.
+    pub fn rename(
+        &self,
+        id: TaskId,
+        new_title: impl Into<String>,
+        now_ns: u64,
+    ) -> Result<u64, CortexAdapterError> {
+        let payload = TaskRenamedPayload {
+            id,
+            new_title: new_title.into(),
+            now_ns,
+        };
+        self.ingest_typed(DISPATCH_TASK_RENAMED, &payload)
+    }
+
+    /// Mark a task completed. No-op at fold time if `id` is unknown.
+    pub fn complete(&self, id: TaskId, now_ns: u64) -> Result<u64, CortexAdapterError> {
+        let payload = TaskCompletedPayload { id, now_ns };
+        self.ingest_typed(DISPATCH_TASK_COMPLETED, &payload)
+    }
+
+    /// Delete a task. No-op at fold time if `id` is unknown.
+    pub fn delete(&self, id: TaskId) -> Result<u64, CortexAdapterError> {
+        let payload = TaskDeletedPayload { id };
+        self.ingest_typed(DISPATCH_TASK_DELETED, &payload)
+    }
+
+    /// Read-only access to the materialized state.
+    pub fn state(&self) -> Arc<RwLock<TasksState>> {
+        self.inner.state()
+    }
+
+    /// Block until every event up through `seq` has been folded.
+    pub async fn wait_for_seq(&self, seq: u64) {
+        self.inner.wait_for_seq(seq).await;
+    }
+
+    /// Close the adapter. See [`CortexAdapter::close`].
+    pub fn close(&self) -> Result<(), CortexAdapterError> {
+        self.inner.close()
+    }
+
+    /// True if the fold task is currently running.
+    pub fn is_running(&self) -> bool {
+        self.inner.is_running()
+    }
+
+    /// Access the wrapped [`CortexAdapter`] for cases that need the
+    /// lower-level surface.
+    pub fn as_cortex(&self) -> &CortexAdapter<TasksState> {
+        &self.inner
+    }
+
+    /// Build the `EventEnvelope` + ingest. Keeps bincode serialization
+    /// and `EventMeta` assembly in one place.
+    fn ingest_typed<T: serde::Serialize>(
+        &self,
+        dispatch: u8,
+        payload: &T,
+    ) -> Result<u64, CortexAdapterError> {
+        let tail = bincode::serialize(payload).map_err(|e| {
+            CortexAdapterError::Redex(super::super::super::redex::RedexError::Encode(
+                e.to_string(),
+            ))
+        })?;
+        let app_seq = self.app_seq.fetch_add(1, Ordering::AcqRel);
+        let meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, 0);
+        let env = EventEnvelope::new(meta, Bytes::from(tail));
+        self.inner.ingest(env)
+    }
+}
+
+impl std::fmt::Debug for TasksAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TasksAdapter")
+            .field("origin_hash", &self.origin_hash)
+            .field("app_seq", &self.app_seq.load(Ordering::Acquire))
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
