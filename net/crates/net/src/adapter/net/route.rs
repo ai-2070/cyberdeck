@@ -427,10 +427,10 @@ impl RoutingTable {
 
     /// Like [`Self::lookup`], but returns `None` if the installed
     /// route's `next_hop` equals `exclude_next_hop`. Used by
-    /// [`ReroutePolicy`] so a single failed-peer check against the
-    /// routing table answers "do I have a usable alternate?" — if
-    /// `Some(addr)`, use it directly; if `None`, fall back to a
-    /// graph-based alternate lookup.
+    /// [`crate::adapter::net::ReroutePolicy`] so a single failed-peer
+    /// check against the routing table answers "do I have a usable
+    /// alternate?" — if `Some(addr)`, use it directly; if `None`,
+    /// fall back to a graph-based alternate lookup.
     ///
     /// Today the routing table stores one entry per destination, so
     /// the "alternate" is either the current entry (if not excluded)
