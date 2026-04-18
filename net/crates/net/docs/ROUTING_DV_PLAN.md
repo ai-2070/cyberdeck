@@ -2,9 +2,9 @@
 
 ## Status
 
-**Partial.** The seed of pingwave-driven route installation is already in `mesh.rs` dispatch: when node X receives a pingwave originated by Y, forwarded via direct peer Z, X calls `RoutingTable::add_route_with_metric(Y, next_hop=Z, metric=pw.hop_count + 2)`. The metric policy in `add_route_with_metric` preserves the lower-metric entry, so direct routes (metric 1) always beat pingwave-installed routes. Routes age out via `sweep_stale` on the heartbeat-loop tick. What's missing is the **topology graph side**, **loop / stability policy**, and **invalidation semantics** that turn this from "flooded hop-count advertisements" into a disciplined distance-vector installation.
+**Partial.** The seed of pingwave-driven route installation is already in `mesh.rs` dispatch: when node X receives a pingwave originated by Y, forwarded via direct peer Z, X calls `RoutingTable::add_route_with_metric(Y, next_hop=Z, metric=pw.hop_count + 2)`. The metric policy in `add_route_with_metric` preserves the lower-metric entry, so direct routes (metric 1) always beat pingwave-installed routes. Routes age out via `sweep_stale` on the heartbeat-loop tick.
 
-This plan closes those gaps without rebuilding the pingwave wire format — everything ships as additional bookkeeping and policy over the existing 72-byte `EnhancedPingwave`.
+This plan fills the remaining gaps — **topology graph population**, **cheap loop avoidance**, and **metric polish** — without inventing a full DV stack. The pingwave wire format doesn't change. Most of this is policy and plumbing on top of machinery that's already in place.
 
 ## What already works
 
@@ -19,21 +19,20 @@ This plan closes those gaps without rebuilding the pingwave wire format — ever
 
 1. **`ProximityGraph::edges` is never populated.** The struct holds an `edges: DashMap<NodeId, Vec<NodeId>>` that `path_to()` BFS-walks, but nothing ever inserts into it. `path_to()` therefore returns `None` for every multi-hop destination today, and `ReroutePolicy::find_graph_alternate_for` falls through to the "any direct peer" fallback. The routing-table installer works; the graph-based lookup does not.
 
-2. **No split horizon / loop prevention beyond TTL.** Pingwave re-broadcast fans out to every peer except the sender. In a partitioned-then-healed mesh, a pingwave can loop back through a convergent path and re-install a longer route than the one the node already has. The metric policy absorbs most of this (it won't replace a better route), but it doesn't stop a node from advertising a route *back toward the origin* — classic count-to-infinity kindling.
+2. **Missing cheap loop-avoidance rules.** Pingwave re-broadcast fans out to every peer except the sender. That's TTL-bounded but not split-horizon-bounded, and there's no defensive cap on runaway `hop_count` or on pingwaves that claim `origin_id == self_id` (which a misbehaving peer — or a stale buffered packet from ourselves — could inject).
 
-3. **No route-validity signal.** A pingwave that stops arriving is the only "route is gone" signal. If the intermediate hop (Z) is alive but the path Z→Y has silently broken (partition past Z), X keeps using the stale `(Y, via=Z)` route until `sweep_stale` fires `~3 × session_timeout` later. Peer-failure reroute doesn't help because Z itself is healthy.
+3. **Metric is hop count only.** Pingwaves already carry `origin_timestamp_us`; we never use it to break ties between equal-hop paths, so a 1-hop 200 ms satellite link is indistinguishable from a 1-hop 5 ms fiber link.
 
-4. **Metric is hop count only.** Pingwaves already carry `origin_timestamp_us`; we never use it to estimate path latency, so "fewer hops" always wins even if that path is slower.
+4. **No explicit "table is authoritative, graph is input" boundary.** `ReroutePolicy::on_failure` goes straight to `path_to()` without first checking whether the routing table already has a viable alternate. Route lookups should always hit the table first; the graph is a topology derivation used for (a) populating the table via pingwave receipt and (b) synthesizing one-off alternates when the table has nothing.
 
-5. **No integration story.** `ReroutePolicy` still calls `path_to()` reactively on failure. The DV-installed routes in `RoutingTable` and the graph-based lookup in `ProximityGraph` don't share a source of truth. Either the table is authoritative (and the graph is a side-channel), or the graph is authoritative (and the table is a cache) — the code implies the former but the reroute code acts as if it's the latter.
+**Explicitly not a gap — route invalidation.** The existing `sweep_stale` age-out is enough for v1: if the `Z → Y` path breaks but Z itself stays up, Z stops receiving fresh pingwaves from Y, stops re-broadcasting them, and X's `(Y, via=Z)` route ages out on its own on the heartbeat sweep. No extra invalidation messaging or per-source `last_refreshed` tagging is needed.
 
 ## Goals
 
 - **Populate `ProximityGraph::edges`** from pingwave hops so `path_to()` returns real multi-hop paths.
-- **Split-horizon** the re-broadcast: never forward a pingwave on the same link it arrived on *and* never advertise a route back to a node that would use us as next-hop for the same destination.
-- **Detect stale indirect routes** with an explicit "origin still fresh?" check tied to the origin's own pingwave arrivals (not just next-hop peer liveness).
-- **Latency-aware metric** (optional): combine hop count with measured one-way latency from `origin_timestamp_us` so a 2-hop 5 ms path beats a 1-hop 200 ms satellite link.
-- **Make `RoutingTable` authoritative.** Graph is the topology derivation; table is what the fast-path routes off.
+- **Cheap loop avoidance:** split-horizon on re-broadcast (don't re-advertise a destination on the same link we'd use to reach it), a `MAX_HOPS` cap, and a pingwave origin self-check (drop and never install routes for `origin_id == self_id`).
+- **Latency tie-break on the metric:** hop count stays the primary metric; a smoothed one-way delay estimate (`now_us − origin_timestamp_us`, EWMA'd per origin) breaks ties between equal-hop paths.
+- **`RoutingTable` is authoritative; `ProximityGraph` is an input and a fallback.** `send_routed` already only consults the table. Reroute should too — falling back to `path_to()` only when the table has no alternate.
 
 ## Non-goals
 
@@ -46,69 +45,83 @@ This plan closes those gaps without rebuilding the pingwave wire format — ever
 
 ### 1. Populate edges on pingwave receipt
 
-When X receives a pingwave for origin Y via direct peer Z, X knows one concrete topology fact: **Z has a route to Y** (otherwise Z wouldn't be forwarding the pingwave). Insert the directed edge `Z → Y` into `ProximityGraph::edges` on every pingwave receipt.
+When X receives a pingwave for origin Y via direct peer Z, X knows one concrete topology fact: **Z has a route to Y** (otherwise Z wouldn't be forwarding the pingwave). Insert the directed edge `Z → Y` into `ProximityGraph::edges` on every pingwave receipt. X itself always has the edge `X → Z` (Z is a direct peer), inserted at session setup. Combined, X's local graph has enough to BFS a 2-hop path `X → Z → Y`; deeper chains accumulate as pingwaves traverse.
 
-X itself always has the edge `X → Z` (Z is a direct peer). Combined, X's local graph now has enough to BFS a 2-hop path `X → Z → Y`. For deeper chains, each intermediate's own pingwave contributes its outbound edge to the nodes that see it.
+Edges are timestamped on insert and aged out at the same cadence as `RoutingTable::sweep_stale` (which already runs on every heartbeat-loop tick).
 
-Edges are timestamped and aged out via a periodic sweep (same cadence as `sweep_stale` on the routing table).
+### 2. Three cheap loop-avoidance rules
 
-### 2. Split horizon on re-broadcast
+No full DV protocol — just three rules at the pingwave receive / re-broadcast boundary:
 
-The current re-broadcast skips the sender. Tighten it with a per-origin "poison reverse" rule: if X installed `(Y, via=Z)`, X does **not** re-broadcast pingwaves for Y to Z. This prevents Z from learning "X can reach Y in N+1 hops" and installing a backward loop.
+**2a. Origin self-check.** If `pw.origin_id == self_id`, drop the pingwave. Do not install routes. This handles a malicious or buggy peer that echoes our own origin back at us, and also a stale buffered pingwave we emitted earlier that a partitioned-then-healed peer just replayed.
 
-Implementation: during pingwave re-broadcast, consult `RoutingTable.lookup(origin)` — if the next-hop for `origin` equals a given peer's address, skip that peer.
+**2b. `MAX_HOPS` cap.** If `pw.hop_count >= MAX_HOPS` (propose 16), drop the pingwave on receipt. The existing TTL field already provides a forwarding-time cap; this is the receive-time counterpart so an inflated-hop-count advertisement can't install a usable route. Metric-policy prevents replacement of a shorter route, but `MAX_HOPS` also avoids populating the routing table and edges map with arbitrarily distant entries.
 
-### 3. Origin-freshness invalidation
+**2c. Split horizon on re-broadcast.** Before emitting a pingwave forward to peer P, consult `RoutingTable::lookup(origin_nid)` — if the next-hop for `origin_nid` equals P's address, skip P. This is lightweight poison-reverse: we never advertise a route for Y to the peer we'd use to reach Y. Prevents P from learning "X can reach Y in N+1 hops" and installing a backward loop.
 
-Today's route `(Y, via=Z, metric=N)` survives as long as either (a) Z's direct session is alive, or (b) a pingwave for Y arrives within `max_route_age`. The second is sufficient; the first is misleading because Z being alive tells us nothing about the Z→Y path.
+These three rules are enough for the convergent topologies Net targets. Count-to-infinity is bounded by `MAX_HOPS + age-out`, not by a dedicated protocol.
 
-Simplify: **drop the peer-liveness leg**. A pingwave-installed route is alive iff it was refreshed by a pingwave for its origin within `max_route_age`. The failure detector still triggers `ReroutePolicy::on_failure` when a peer dies, because the routing-table entries whose `next_hop` points at that peer get rerouted — that path covers "Z died" independently of "the route through Z went stale."
+### 3. Metric: hops primary, latency tie-break
 
-Concrete: in `RoutingTable`, tag entries with a `RouteSource::{Direct, Pingwave}` enum. Direct routes age via session liveness (refreshed on every heartbeat pingwave we emit); pingwave routes age via origin pingwave arrivals. `sweep_stale` already checks `updated_at`; update-point is the only thing that changes per source.
+Keep `metric = hop_count + 2` as the primary ordering (existing code; the `+2` keeps direct routes at metric 1 strictly better than any pingwave-installed route). Add a **secondary latency tie-break** for equal-hop paths:
 
-### 4. Latency-aware metric (optional, v1.1)
+- On each pingwave receipt for origin Y via peer Z, compute `sample_us = now_us.saturating_sub(pw.origin_timestamp_us)`.
+- Maintain an EWMA per `(origin_nid, next_hop_addr)` pair: `latency_ewma_us = α·sample + (1−α)·latency_ewma_us`, with `α = 1/8`.
+- When comparing two equal-hop candidates, prefer the lower EWMA.
 
-`origin_timestamp_us` in the pingwave lets a receiver estimate path latency: `now_us − origin_timestamp_us`. This measurement is noisy (asymmetric clocks, queueing), so we smooth it with EWMA over successive pingwaves for the same origin and use `metric = hop_count × 100 + latency_bucket`, where `latency_bucket` is the EWMA latency in 1 ms increments, capped. Hop count dominates; latency breaks ties.
+`ProximityGraph` already owns per-node state; extend `ProximityNode` with `latency_ewma_us: AtomicU32` keyed per origin. When `RoutingTable::lookup` returns multiple equal-metric entries (future-proofing — today it returns one), the tie-breaker applies.
 
-Optional in v1 — if the clock-sync assumption is too shaky, keep hop-only and revisit.
+Clock skew caveat: `origin_timestamp_us − now_us` is asymmetric-clock-sensitive. For v1 we accept that — the tie-breaker is advisory, not safety-critical. If the estimate is unreliable, equal-hop paths get picked arbitrarily; that's the current behavior anyway.
 
-### 5. Routing table is authoritative; graph is a topology cache
+### 4. `RoutingTable` authoritative; `ProximityGraph` is input + fallback
 
-`ReroutePolicy::find_graph_alternate_for(dest)` currently queries the graph. After this plan, the graph's `path_to()` works correctly, so this call returns a real path. But a reroute-time BFS over the graph is slower than a direct `RoutingTable::lookup_excluding(dest, failed_addr)` check — which is what we should do first, falling back to the graph only if no installed alternate exists.
+The data path already only consults `RoutingTable` via `send_routed`. Reroute should match.
 
-Add `RoutingTable::lookup_alternate(dest, exclude_next_hop) -> Option<SocketAddr>` that returns the best route whose `next_hop != exclude_next_hop`. `ReroutePolicy::on_failure` consults this first; if None, fall back to the graph-based `path_to()`.
+Add `RoutingTable::lookup_alternate(dest, exclude_next_hop) -> Option<SocketAddr>` — returns the best (lowest-metric) entry for `dest` whose `next_hop != exclude_next_hop`. `ReroutePolicy::on_failure` calls this first when a peer dies; only if the table has no alternate does it fall back to `ProximityGraph::path_to()` to synthesize one and install it via `add_route_with_metric`.
+
+Concretely:
+
+```rust
+// In ReroutePolicy::on_failure, per affected destination:
+let alt_addr = self
+    .routing_table
+    .lookup_alternate(dest_id, failed_addr)
+    .or_else(|| self.find_graph_alternate_for(failed_node_id, dest_id));
+```
+
+This collapses "two independent truths" into one: the table answers the question, and the graph is a derivation path that feeds the table.
 
 ## Implementation steps
 
-1. **`ProximityGraph::edges` insert + sweep.** On `on_pingwave`, insert `(source_peer_node_id → origin_node_id)` with a timestamp. Periodic sweep drops edges older than `max_route_age`. `path_to()` already reads `edges` — no algorithmic change.
-2. **Split horizon in re-broadcast.** In `mesh.rs:743-757`, before emitting `fwd_bytes` to a peer, check `routing_table.lookup(origin_nid)`: if the next-hop matches the peer's address, skip it.
-3. **`RouteSource` tag on `RouteEntry`.** Introduce the enum, thread through `add_route` (→ `Direct`) and `add_route_with_metric` (→ `Pingwave`). Direct heartbeats refresh only `Direct` entries; pingwave receipts refresh only `Pingwave` entries for the origin they carry. `sweep_stale` unchanged.
-4. **Latency EWMA (deferred to v1.1).** Add `latency_ewma_us: AtomicU32` per origin in `ProximityGraph::nodes`; update on pingwave receipt. Plumb through to metric calculation in `mesh.rs:737`. Hop-only for v1 is fine.
-5. **`RoutingTable::lookup_alternate(dest, exclude)`.** New accessor; prefers lowest-metric entry not equal to the excluded next-hop.
-6. **`ReroutePolicy::on_failure` rework.** Try `lookup_alternate(dest, failed_addr)` first; fall back to `find_graph_alternate_for` only if the table has no alternate.
-7. **Docs.** Extend `TRANSPORT.md` with a "Routing" subsection summarizing the DV story + the "RoutingTable authoritative" principle.
-8. **Tests.**
+1. **`ProximityGraph::edges` insert + sweep.** On `on_pingwave`, insert `(source_peer_node_id → origin_node_id)` with a timestamp. Add a sweep that drops edges older than `max_route_age`; call from the existing heartbeat-loop tick alongside `sweep_stale`.
+2. **Origin self-check + `MAX_HOPS` cap.** In `mesh.rs` pingwave dispatch (around line 723): reject if `origin_nid == ctx.local_node_id` or if `pw.hop_count >= MAX_HOPS`. No route install, no re-broadcast.
+3. **Split horizon in re-broadcast.** In the re-broadcast spawn (`mesh.rs:749-756`), before sending `fwd_bytes` to a peer, check `router.routing_table().lookup(origin_nid)`: if the next-hop address matches that peer's address, skip it.
+4. **Latency EWMA on pingwave receipt.** Extend `ProximityNode` with a `latency_ewma_us: AtomicU32` per origin keyed by next-hop. Update on receipt with `α = 1/8` EWMA over `now_us.saturating_sub(pw.origin_timestamp_us)`.
+5. **`RoutingTable::lookup_alternate(dest, exclude) -> Option<SocketAddr>`.** New accessor. Picks the best non-excluded entry; when metrics tie, consult the graph's EWMA for the tiebreak.
+6. **`ReroutePolicy::on_failure` rework.** Per affected destination: `lookup_alternate(dest, failed_addr)` first; fall back to `find_graph_alternate_for` only if `None`.
+7. **Docs.** New "Routing" subsection in `TRANSPORT.md` — one paragraph on the pingwave→table flow, one on the three loop-avoidance rules, one on the table-authoritative principle.
+8. **Tests** (below).
 
 ## Tests
 
-- **Unit (`route.rs`)** — `lookup_alternate` picks the lowest-metric alternate excluding a given next_hop; returns None if only the excluded route exists; regression: doesn't return a stale entry.
-- **Unit (`proximity.rs`)** — edge insert on pingwave; edge sweep on age-out; `path_to` returns a real 3-hop path after enough pingwave traversal.
+- **Unit (`route.rs`)** — `lookup_alternate` picks the lowest-metric alternate excluding a given next_hop; returns None if only the excluded route exists; returns None for a stale (age-out-eligible) sole entry.
+- **Unit (`proximity.rs`)** — edge insert on pingwave; edge sweep on age-out; `path_to` returns a real 3-hop path after enough pingwave traversal; origin self-check drops the pingwave and installs no route; `MAX_HOPS`-exceeding pingwave drops and installs no route; latency EWMA updates on successive receipts.
 - **Integration** — 4-node chain A-B-C-D with pingwaves propagating. After convergence:
   - A's routing table has `(D, via=B, metric≥3)`, `(C, via=B, metric=2)`.
   - A's `path_to(D)` returns `[A, B, C, D]`.
-  - Split horizon: A does NOT re-broadcast D's pingwave back to B.
+  - Split horizon: A does **not** re-broadcast D's pingwave back to B.
   - Killing B: A's routes for C and D reroute through an alternate if one exists; if not, both entries expire via `sweep_stale`.
-  - Origin staleness: if D stops emitting pingwaves but B is still alive, A's route to D expires; A's route to B does not.
-- **Regression** — the old `ReroutePolicy::find_graph_alternate_for` "any direct peer" fallback path is still exercised for topology gaps (e.g., a node that's a direct peer but hasn't been heard from via pingwave).
+  - Origin staleness: if D stops emitting pingwaves but B is still alive, A's route to D expires naturally via `sweep_stale`; A's route to B does not.
+- **Regression** — origin self-echo: a pingwave with `origin_id == self_id` is dropped and does not replace the node's own routes.
 
 ## Risks and open questions
 
-- **Count-to-infinity.** Split horizon alone doesn't fully prevent it — poison reverse would, but requires advertising a metric-∞ entry for the *opposite* direction, which needs wire-format space we don't want to spend. For v1, TTL + split horizon + metric age-out are the circuit breakers. If a partition stabilizes, routes eventually converge; if it oscillates fast, some queries hit stale routes until `sweep_stale`. Documented expected behavior.
-- **Unbounded fan-out.** Pingwave flooding is O(peers²) per cycle in a fully-connected mesh. Current heartbeat is 5 s; scaling this down would be expensive. For larger meshes we'd want selective re-broadcast (already allowed by the `on_pingwave` returning `Option<EnhancedPingwave>` — the graph can decide to drop). Out of scope here; flagged.
-- **Clock skew for latency metric.** `origin_timestamp_us` assumes rough clock sync. In a heterogeneous mesh with no NTP it's unreliable. Keep hop-only for v1; address in v1.1 with an NTP-fallback or one-way delay estimation.
-- **Trust model.** Malicious peers can inflate/deflate hop counts or forge origin ids to hijack routes. Pingwave auth is a separate protocol. For v1, assume mutually-trusted participants (the PSK gates mesh entry). Flag as known pre-condition.
-- **Interaction with subnets.** Pingwave propagation across subnet boundaries respects `ChannelConfig::visibility` — wait, pingwaves aren't channel traffic. Confirm the subnet gateway doesn't block them; if it does, intentional or accidental is a design question.
+- **Count-to-infinity.** TTL + `MAX_HOPS` + split horizon + metric age-out bound it. If a partition stabilizes, routes converge; if it oscillates fast, queries may hit stale routes until `sweep_stale`. Documented expected behavior — not a bug.
+- **Unbounded fan-out.** Pingwave flooding is O(peers²) per heartbeat cycle in a fully-connected mesh. At current 5 s heartbeat this is fine; larger meshes will want selective re-broadcast (the `on_pingwave` hook already returns `Option<EnhancedPingwave>` and can drop). Out of scope here; flagged.
+- **Clock skew for latency tie-break.** `origin_timestamp_us − now_us` is asymmetric-clock-sensitive. The tie-breaker is advisory — unreliable estimates just degrade to "pick an arbitrary equal-hop path," which is the current behavior.
+- **Trust model.** Malicious peers can inflate/deflate hop counts or forge origin ids to hijack routes. The origin self-check and `MAX_HOPS` cap defend against obvious abuse; a signed-pingwave protocol is separate work. For v1, assume mutually-trusted participants (PSK gates mesh entry).
+- **Interaction with subnets.** Pingwaves are raw UDP (not channel traffic), so subnet-gateway visibility rules don't directly apply. Confirm during implementation that the gateway doesn't filter raw pingwaves; if it does, decide whether subnet-local topology is intentional.
 
 ## Summary
 
-This plan doesn't invent a DV protocol — it finishes the one that's already half-present. `add_route_with_metric` + pingwave-driven install were the hard bits; the finish work is populating the graph's edges, adding split horizon, tagging route source for proper invalidation, and letting the routing table be the authoritative path source rather than delegating to on-demand graph BFS. ~250 LoC of changes + ~150 LoC of tests. v1.1 folds in latency-aware metric once we're confident in the hop-only shape.
+Not a new protocol — the finish work on the one that's already half-shipped. Populate `ProximityGraph::edges`, add three cheap loop-avoidance rules (origin self-check, `MAX_HOPS` cap, split horizon on re-broadcast), latency EWMA as a tie-break on the metric, and `RoutingTable::lookup_alternate` so reroute hits the table first. The routing table remains the authoritative source for `send_routed`; the graph is an input and a fallback path synthesizer. ~200 LoC of changes + ~150 LoC of tests. No wire-format change.
