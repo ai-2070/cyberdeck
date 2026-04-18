@@ -1979,8 +1979,12 @@ impl MeshNode {
             ))
         })?;
         let reliable = config.reliability.is_reliable();
-        peer.session
-            .open_stream_with(stream_id, reliable, config.fairness_weight);
+        peer.session.open_stream_full(
+            stream_id,
+            reliable,
+            config.fairness_weight,
+            config.window_bytes,
+        );
         // Propagate the weight to the router's fair scheduler so
         // forwarded traffic on this stream (e.g., multi-hop relays
         // where we're an intermediate) respects the weight too. v1
@@ -2023,9 +2027,12 @@ impl MeshNode {
     /// Send a batch of events on an explicit stream.
     ///
     /// Uses the stream's reliability mode from its original `open_stream`
-    /// config. `Backpressure` is reserved for a future credit-windowed
-    /// flow-control implementation — v1 returns `Transport` for any
-    /// underlying send failure and success otherwise.
+    /// config. Returns `Backpressure` when the stream's in-flight count
+    /// (`tx_inflight`) would exceed its configured `tx_window`; the event
+    /// was not enqueued — the caller decides what to do (drop, retry,
+    /// or buffer at the app layer). `tx_window == 0` disables the check
+    /// and preserves pre-backpressure behavior. `Transport` is returned
+    /// for underlying socket send failures.
     pub async fn send_on_stream(
         &self,
         stream: &Stream,
@@ -2052,23 +2059,33 @@ impl MeshNode {
         let mut current_batch: Vec<Bytes> = Vec::with_capacity(64);
         let mut current_size = 0usize;
 
+        // Each socket send consumes one tx_window slot: acquire before
+        // building the packet, release after the socket send (success
+        // or failure). Failure to acquire immediately surfaces
+        // `StreamError::Backpressure` — no packets in this call have
+        // been sent yet, so the caller can cleanly retry or drop.
+        let flags = if reliable {
+            PacketFlags::RELIABLE
+        } else {
+            PacketFlags::NONE
+        };
+
         for event in events {
             let frame_size = EventFrame::LEN_SIZE + event.len();
             if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE && !current_batch.is_empty() {
                 let seq = {
                     let state = session.get_or_create_stream(stream_id);
+                    if !state.try_acquire_tx_slot() {
+                        return Err(StreamError::Backpressure);
+                    }
                     state.next_tx_seq()
                 };
-                let flags = if reliable {
-                    PacketFlags::RELIABLE
-                } else {
-                    PacketFlags::NONE
-                };
                 let packet = builder.build(stream_id, seq, &current_batch, flags);
-                self.socket
-                    .send_to(&packet, peer_addr)
-                    .await
-                    .map_err(|e| StreamError::Transport(format!("send failed: {}", e)))?;
+                let send_res = self.socket.send_to(&packet, peer_addr).await;
+                if let Some(state) = session.try_stream(stream_id) {
+                    state.release_tx_slot();
+                }
+                send_res.map_err(|e| StreamError::Transport(format!("send failed: {}", e)))?;
                 current_batch.clear();
                 current_size = 0;
             }
@@ -2079,23 +2096,68 @@ impl MeshNode {
         if !current_batch.is_empty() {
             let seq = {
                 let state = session.get_or_create_stream(stream_id);
+                if !state.try_acquire_tx_slot() {
+                    return Err(StreamError::Backpressure);
+                }
                 state.next_tx_seq()
             };
-            let flags = if reliable {
-                PacketFlags::RELIABLE
-            } else {
-                PacketFlags::NONE
-            };
             let packet = builder.build(stream_id, seq, &current_batch, flags);
-            self.socket
-                .send_to(&packet, peer_addr)
-                .await
-                .map_err(|e| StreamError::Transport(format!("send failed: {}", e)))?;
+            let send_res = self.socket.send_to(&packet, peer_addr).await;
+            if let Some(state) = session.try_stream(stream_id) {
+                state.release_tx_slot();
+            }
+            send_res.map_err(|e| StreamError::Transport(format!("send failed: {}", e)))?;
         }
 
         drop(builder);
         session.touch();
         Ok(())
+    }
+
+    /// Send `events` on `stream`, retrying on `Backpressure` with
+    /// exponential backoff (5 ms → 200 ms, doubling) up to `max_retries`
+    /// times. Transport failures are returned immediately — they're a
+    /// real error, not a pressure signal, and retrying would just mask
+    /// them. Returns the final `Backpressure` error if the stream stays
+    /// saturated across every attempt.
+    pub async fn send_with_retry(
+        &self,
+        stream: &Stream,
+        events: &[Bytes],
+        max_retries: usize,
+    ) -> Result<(), StreamError> {
+        let mut delay = Duration::from_millis(5);
+        let cap = Duration::from_millis(200);
+        let mut last_backpressure: Option<StreamError> = None;
+        for _ in 0..max_retries.saturating_add(1) {
+            match self.send_on_stream(stream, events).await {
+                Ok(()) => return Ok(()),
+                Err(StreamError::Backpressure) => {
+                    last_backpressure = Some(StreamError::Backpressure);
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(cap);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_backpressure.unwrap_or(StreamError::Backpressure))
+    }
+
+    /// Convenience wrapper around [`send_with_retry`](Self::send_with_retry)
+    /// with a generous retry count. Blocks the calling task until the
+    /// send succeeds or a transport error occurs. Use when you'd rather
+    /// wait than drop; prefer `send_with_retry` if you need a concrete
+    /// upper bound on retry attempts.
+    pub async fn send_blocking(
+        &self,
+        stream: &Stream,
+        events: &[Bytes],
+    ) -> Result<(), StreamError> {
+        // 4096 retries × 200 ms cap = ~13 minutes in the worst case,
+        // effectively "block until the network lets up or something is
+        // actually wrong." Callers that need a tighter bound should use
+        // `send_with_retry` directly.
+        self.send_with_retry(stream, events, 4096).await
     }
 
     /// Snapshot of per-stream stats for a single stream.
@@ -2110,6 +2172,9 @@ impl MeshNode {
             inbound_pending: state.inbound_len() as u64,
             last_activity_ns: state.last_activity_ns(),
             active: state.is_active(),
+            backpressure_events: state.backpressure_events(),
+            tx_inflight: state.tx_inflight(),
+            tx_window: state.tx_window(),
         })
     }
 
@@ -2135,6 +2200,9 @@ impl MeshNode {
                         inbound_pending: state.inbound_len() as u64,
                         last_activity_ns: state.last_activity_ns(),
                         active: state.is_active(),
+                        backpressure_events: state.backpressure_events(),
+                        tx_inflight: state.tx_inflight(),
+                        tx_window: state.tx_window(),
                     },
                 ))
             })

@@ -4504,3 +4504,174 @@ async fn test_channel_publisher_unsubscribe_idempotent() {
     node_b.shutdown().await.unwrap();
     node_c.shutdown().await.unwrap();
 }
+
+// ============================================================================
+// Stream backpressure (v1 local in-flight window)
+// ============================================================================
+
+use net::adapter::net::{StreamConfig, StreamError};
+
+/// Concurrent callers on the same stream with a window-1 cap: at least
+/// one caller per concurrent burst hits `StreamError::Backpressure` and
+/// `backpressure_events` increments. Multi-threaded runtime is required
+/// to force real concurrency between the acquire-send-release sequence
+/// across the window boundary (localhost UDP sends are too fast on a
+/// single-threaded runtime for the race to materialize).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_send_on_stream_backpressure_when_concurrent() {
+    let ports = find_ports(2).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(4)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(30))
+    };
+
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let pub_b = *b.public_key();
+
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    a.start();
+    b.start();
+
+    // Window-1 stream: at most one in-flight packet. With a single
+    // serial sender this is effectively unbounded (acquire/release
+    // round-trip per send) — so we need CONCURRENT senders to observe
+    // the cap.
+    let stream = a
+        .open_stream(nid_b, 7777, StreamConfig::new().with_window_bytes(1))
+        .unwrap();
+
+    // Spin up a batch of concurrent tasks sending on the same stream.
+    // Each event is a small payload.
+    let n_tasks: usize = 16;
+    let event = Bytes::from_static(b"{\"t\":\"bp\"}");
+    let mut handles = Vec::new();
+    for _ in 0..n_tasks {
+        let mesh = Arc::clone(&a);
+        let stream = stream.clone();
+        let payload = event.clone();
+        handles.push(tokio::spawn(async move {
+            mesh.send_on_stream(&stream, &[payload]).await
+        }));
+    }
+
+    let mut ok = 0usize;
+    let mut backpressure = 0usize;
+    let mut transport = 0usize;
+    for h in handles {
+        match h.await.unwrap() {
+            Ok(()) => ok += 1,
+            Err(StreamError::Backpressure) => backpressure += 1,
+            Err(StreamError::Transport(_)) => transport += 1,
+            Err(StreamError::NotConnected) => panic!("unexpected NotConnected"),
+        }
+    }
+    // At least one caller must have hit the cap. We don't assert an
+    // exact count — the scheduler's interleaving depends on the
+    // runtime — but with a window of 1 and 16 concurrent senders,
+    // backpressure is virtually guaranteed.
+    assert!(
+        backpressure > 0,
+        "expected at least one Backpressure in {} concurrent sends; got ok={}, bp={}, transport={}",
+        n_tasks,
+        ok,
+        backpressure,
+        transport
+    );
+    assert!(ok > 0, "expected at least one successful send");
+
+    // Stats mirror the backpressure counter we just observed.
+    let stats = a.stream_stats(nid_b, 7777).expect("stream stats");
+    assert!(
+        stats.backpressure_events >= backpressure as u64,
+        "stats.backpressure_events ({}) must be >= observed ({})",
+        stats.backpressure_events,
+        backpressure
+    );
+    assert_eq!(stats.tx_window, 1);
+
+    Arc::try_unwrap(a).ok().unwrap().shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// `send_with_retry` backs off on Backpressure and eventually succeeds
+/// once the window clears. Transport errors are returned immediately,
+/// not retried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_send_with_retry_eventually_succeeds_through_backpressure() {
+    let ports = find_ports(2).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(4)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(30))
+    };
+
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let pub_b = *b.public_key();
+
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    a.start();
+    b.start();
+
+    let stream = a
+        .open_stream(nid_b, 8888, StreamConfig::new().with_window_bytes(4))
+        .unwrap();
+
+    // Run 32 concurrent retry-sends. All must eventually succeed;
+    // none should surface as Backpressure at the caller because
+    // send_with_retry absorbs the transient pressure.
+    let n: usize = 32;
+    let mut handles = Vec::new();
+    for i in 0..n {
+        let mesh = Arc::clone(&a);
+        let stream = stream.clone();
+        let payload = Bytes::from(format!(r#"{{"i":{}}}"#, i));
+        handles.push(tokio::spawn(async move {
+            mesh.send_with_retry(&stream, &[payload], 64).await
+        }));
+    }
+    for h in handles {
+        h.await
+            .unwrap()
+            .expect("send_with_retry must eventually succeed");
+    }
+
+    // After the storm, the window should be fully released.
+    let stats = a.stream_stats(nid_b, 8888).expect("stream stats");
+    assert_eq!(stats.tx_inflight, 0);
+
+    Arc::try_unwrap(a).ok().unwrap().shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}

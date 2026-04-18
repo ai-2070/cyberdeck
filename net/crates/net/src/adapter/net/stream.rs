@@ -163,6 +163,17 @@ pub struct StreamStats {
     pub last_activity_ns: u64,
     /// Whether the stream is active (not closed).
     pub active: bool,
+    /// Cumulative count of `send_on_stream` calls that returned
+    /// `StreamError::Backpressure` because the stream's `tx_window` was
+    /// full. Monotonically increasing; reset only by close + reopen.
+    pub backpressure_events: u64,
+    /// Current in-flight packet count on the stream's send path
+    /// (packets acquired from `tx_window` that haven't yet had their
+    /// socket send complete).
+    pub tx_inflight: u32,
+    /// Configured `tx_window` for this stream; `0` means unbounded (no
+    /// backpressure check).
+    pub tx_window: u32,
 }
 
 /// A typed handle to a logical stream within a peer session.

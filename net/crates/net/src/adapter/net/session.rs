@@ -6,7 +6,7 @@
 use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -103,6 +103,15 @@ impl NetSession {
             .or_insert_with(|| StreamState::new(self.default_reliable))
     }
 
+    /// Look up stream state without creating it. Returns `None` if the
+    /// stream was never opened or has been closed.
+    pub fn try_stream(
+        &self,
+        stream_id: u64,
+    ) -> Option<dashmap::mapref::one::Ref<'_, u64, StreamState>> {
+        self.streams.get(&stream_id)
+    }
+
     /// Open a stream with an explicit reliability mode and fair-scheduler
     /// weight.
     ///
@@ -111,12 +120,26 @@ impl NetSession {
     /// wins. Callers that want to change a stream's config must close +
     /// re-open it.
     pub fn open_stream_with(&self, stream_id: u64, reliable: bool, fairness_weight: u8) {
+        self.open_stream_full(stream_id, reliable, fairness_weight, 0);
+    }
+
+    /// Extended open that also sets the per-stream TX window for
+    /// backpressure. `tx_window == 0` keeps the pre-backpressure
+    /// behavior (unbounded local queue).
+    pub fn open_stream_full(
+        &self,
+        stream_id: u64,
+        reliable: bool,
+        fairness_weight: u8,
+        tx_window: u32,
+    ) {
         use dashmap::mapref::entry::Entry;
         match self.streams.entry(stream_id) {
             Entry::Occupied(existing) => {
                 let existing = existing.get();
                 if existing.reliable_mode() != reliable
                     || existing.fairness_weight() != fairness_weight.max(1)
+                    || existing.tx_window() != tx_window
                 {
                     tracing::warn!(
                         stream_id = format!("{:#x}", stream_id),
@@ -124,12 +147,14 @@ impl NetSession {
                         new_reliable = reliable,
                         existing_weight = existing.fairness_weight(),
                         new_weight = fairness_weight,
+                        existing_tx_window = existing.tx_window(),
+                        new_tx_window = tx_window,
                         "open_stream: ignoring conflicting config; first open wins"
                     );
                 }
             }
             Entry::Vacant(v) => {
-                v.insert(StreamState::new_with_weight(reliable, fairness_weight));
+                v.insert(StreamState::new_full(reliable, fairness_weight, tx_window));
             }
         }
     }
@@ -296,6 +321,19 @@ pub struct StreamState {
     reliable_mode: bool,
     /// Fair-scheduler quantum multiplier (1 = equal share).
     fairness_weight: u8,
+    /// Maximum concurrent in-flight packets for this stream's send
+    /// path before `send_on_stream` returns `StreamError::Backpressure`.
+    /// v1 semantics: counts **packets**, not bytes. Named for forward
+    /// compatibility with a future byte-accounted credit-window swap.
+    /// `0` means "no limit" — the pre-backpressure behavior.
+    tx_window: u32,
+    /// Current in-flight packets. Incremented before a socket send,
+    /// decremented after (success or failure). Compared against
+    /// `tx_window` to decide whether to admit the next send.
+    tx_inflight: AtomicU32,
+    /// Number of `send_on_stream` calls that have returned
+    /// `StreamError::Backpressure` since this stream was opened.
+    backpressure_events: AtomicU64,
 }
 
 impl StreamState {
@@ -306,6 +344,11 @@ impl StreamState {
 
     /// Create a new stream state with a fair-scheduler weight.
     pub fn new_with_weight(reliable: bool, fairness_weight: u8) -> Self {
+        Self::new_full(reliable, fairness_weight, 0)
+    }
+
+    /// Create a new stream state with full config (weight + tx window).
+    pub fn new_full(reliable: bool, fairness_weight: u8, tx_window: u32) -> Self {
         Self {
             tx_seq: AtomicU64::new(0),
             rx_seq: AtomicU64::new(0),
@@ -315,6 +358,9 @@ impl StreamState {
             last_activity: AtomicU64::new(current_timestamp()),
             reliable_mode: reliable,
             fairness_weight: fairness_weight.max(1),
+            tx_window,
+            tx_inflight: AtomicU32::new(0),
+            backpressure_events: AtomicU64::new(0),
         }
     }
 
@@ -342,6 +388,64 @@ impl StreamState {
     #[inline]
     pub fn fairness_weight(&self) -> u8 {
         self.fairness_weight
+    }
+
+    /// Configured max in-flight packets before Backpressure. `0` = no limit.
+    #[inline]
+    pub fn tx_window(&self) -> u32 {
+        self.tx_window
+    }
+
+    /// Current in-flight packet count.
+    #[inline]
+    pub fn tx_inflight(&self) -> u32 {
+        self.tx_inflight.load(Ordering::Acquire)
+    }
+
+    /// Cumulative number of Backpressure rejections since the stream opened.
+    #[inline]
+    pub fn backpressure_events(&self) -> u64 {
+        self.backpressure_events.load(Ordering::Relaxed)
+    }
+
+    /// Try to acquire a TX slot. Returns `true` on success (and increments
+    /// the in-flight counter); returns `false` when the window is full —
+    /// caller is expected to return `StreamError::Backpressure`.
+    ///
+    /// A `tx_window` of 0 is "unbounded" and always admits.
+    pub fn try_acquire_tx_slot(&self) -> bool {
+        if self.tx_window == 0 {
+            self.tx_inflight.fetch_add(1, Ordering::AcqRel);
+            return true;
+        }
+        // CAS loop: admit iff current < window.
+        loop {
+            let cur = self.tx_inflight.load(Ordering::Acquire);
+            if cur >= self.tx_window {
+                self.backpressure_events.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            if self
+                .tx_inflight
+                .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    /// Release a TX slot after the socket send completes. Safe against
+    /// under-flow via saturating decrement.
+    pub fn release_tx_slot(&self) {
+        // Saturating: if something ever decrements without a paired
+        // acquire (shouldn't happen, but defensive), we don't wrap.
+        let prev = self
+            .tx_inflight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(1))
+            });
+        debug_assert!(prev.is_ok());
     }
 
     /// Get and increment the TX sequence number. Refreshes `last_activity`.
@@ -721,5 +825,54 @@ mod tests {
             !manager.check_session(),
             "session should have timed out after 60ms with no touch"
         );
+    }
+
+    #[test]
+    fn test_stream_state_tx_window_trips_backpressure() {
+        let state = StreamState::new_full(false, 1, 2);
+        assert!(state.try_acquire_tx_slot(), "first acquire under window");
+        assert!(state.try_acquire_tx_slot(), "second acquire at window edge");
+        assert!(
+            !state.try_acquire_tx_slot(),
+            "third acquire must be refused — window full"
+        );
+        assert_eq!(state.backpressure_events(), 1);
+        assert_eq!(state.tx_inflight(), 2);
+    }
+
+    #[test]
+    fn test_stream_state_tx_window_releases_on_send_completion() {
+        let state = StreamState::new_full(false, 1, 1);
+        assert!(state.try_acquire_tx_slot());
+        assert!(!state.try_acquire_tx_slot());
+
+        state.release_tx_slot();
+        assert_eq!(state.tx_inflight(), 0);
+        assert!(
+            state.try_acquire_tx_slot(),
+            "acquire succeeds after the prior slot is released"
+        );
+    }
+
+    #[test]
+    fn test_stream_state_tx_window_zero_is_unbounded() {
+        let state = StreamState::new_full(false, 1, 0);
+        // Burst a large number of acquires; none should refuse when
+        // the window is 0 (pre-backpressure behavior).
+        for _ in 0..10_000 {
+            assert!(state.try_acquire_tx_slot());
+        }
+        assert_eq!(state.backpressure_events(), 0);
+    }
+
+    #[test]
+    fn test_stream_state_release_saturates_at_zero() {
+        // Defensive: a stray release without a paired acquire must not
+        // underflow. A subsequent acquire stays within the window.
+        let state = StreamState::new_full(false, 1, 1);
+        state.release_tx_slot();
+        state.release_tx_slot();
+        assert_eq!(state.tx_inflight(), 0);
+        assert!(state.try_acquire_tx_slot());
     }
 }
