@@ -33,6 +33,7 @@ Net is what the internet would look like if it were built today, the network sci
 - [Security](#security)
 - [The Blackwall](#the-blackwall)
 - [Implementation](#implementation)
+- [Status](#status)
 - [SDKs](#sdks)
 - [Benchmarks](#benchmarks)
 
@@ -351,6 +352,10 @@ The wall isn't one mechanism. It's the emergent effect of every constraint worki
 
 Any single mechanism can be overwhelmed. All of them together form the wall. An event that bypasses backpressure hits the bounded queue. An event that fills the queue gets evicted. An event that propagates too far hits the TTL. An event that duplicates gets deduplicated. A node that floods gets rate-limited by every neighbor independently. There is no single point to breach because the wall is the mesh itself.
 
+## Implementation
+
+For implementation details — capabilities, proximity graphs, subnets, channels, daemons, safety envelopes, module map, and code examples — see the [crate README](net/crates/net/README.md).
+
 ## Status
 
 Net is a working protocol, not a paper design. 894 tests verify the implementation across every layer of the stack.
@@ -373,10 +378,6 @@ Net is a working protocol, not a paper design. 894 tests verify the implementati
 - **Full 6-phase migration lifecycle.** The first round-trip (TakeSnapshot → SnapshotReady) is proven over wire. The remaining phases (restore, replay, cutover, cleanup) need the orchestrator to chain messages automatically through the subprotocol response path.
 - **Handshake relay.** Currently, nodes must have direct UDP connectivity to exchange Noise handshakes. Relaying handshakes through intermediate nodes is not yet implemented.
 - **Multi-hop reroute testing.** ProximityGraph-guided rerouting is implemented — `path_to()` is queried for multi-hop alternates before falling back to direct peers. End-to-end tests require 4+ nodes to exercise the multi-hop path; current tests validate the mechanism with direct peers.
-
-## Implementation
-
-For implementation details — capabilities, proximity graphs, subnets, channels, daemons, safety envelopes, module map, and code examples — see the [crate README](net/crates/net/README.md).
 
 ## SDKs
 
