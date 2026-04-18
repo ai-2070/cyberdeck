@@ -379,7 +379,7 @@ Net is a working protocol, not a paper design. 928 tests verify the implementati
 **What needs protocol work:**
 
 - **Secure keypair transfer for migration.** The `DaemonFactoryRegistry` assumes the target has been provisioned with the daemon's `EntityKeypair` out-of-band (`KeyMode::PreProvisioned` is actionable today). `KeyMode::{Derived, Transfer}` and the Key Orchestrator / Key Agent control-plane that would run over CortEX are designed in [`KEY_MIGRATION_PLAN.md`](net/crates/net/docs/KEY_MIGRATION_PLAN.md) but not yet implemented — CortEX itself is forward-looking.
-- **Per-stream credit-window back-pressure.** `StreamError::WouldBlock` is reserved as an API variant, but the v1 send path only returns `Transport` on underlying send failures and `Ok(())` otherwise — there is no queue-full signal back to the caller, and no round-trip credit accounting between peers. Explicit per-peer credit windows are the next increment.
+- **Per-stream credit-window back-pressure.** `StreamError::Backpressure` is reserved as an API variant, but the v1 send path only returns `Transport` on underlying send failures and `Ok(())` otherwise — there is no queue-full signal back to the caller, and no round-trip credit accounting between peers. Explicit per-peer credit windows are the next increment.
 
 ## SDKs
 

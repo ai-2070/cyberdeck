@@ -173,7 +173,7 @@ impl NetSocket {
                 self.recv_buf.truncate(len);
                 Ok(Some((self.recv_buf.split().freeze(), addr)))
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::Backpressure => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -352,7 +352,7 @@ impl BatchedPacketReceiver {
                                 return;
                             }
                             // Timeout or interrupt — just retry
-                            if e.kind() == io::ErrorKind::WouldBlock
+                            if e.kind() == io::ErrorKind::Backpressure
                                 || e.kind() == io::ErrorKind::Interrupted
                             {
                                 continue;

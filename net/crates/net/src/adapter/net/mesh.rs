@@ -2023,7 +2023,7 @@ impl MeshNode {
     /// Send a batch of events on an explicit stream.
     ///
     /// Uses the stream's reliability mode from its original `open_stream`
-    /// config. `WouldBlock` is reserved for a future credit-windowed
+    /// config. `Backpressure` is reserved for a future credit-windowed
     /// flow-control implementation — v1 returns `Transport` for any
     /// underlying send failure and success otherwise.
     pub async fn send_on_stream(

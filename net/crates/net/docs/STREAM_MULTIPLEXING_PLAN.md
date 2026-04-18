@@ -4,7 +4,7 @@
 
 **Shipped.** The design below was implemented in full: `Stream` / `StreamConfig` on `MeshNode`, idempotent `open_stream` / `close_stream`, last-activity-driven idle eviction + `max_streams` LRU cap on the heartbeat loop, per-stream fairness weight threaded through `FairScheduler`, and public `stream_stats` / `all_stream_stats` accessors. The plan is retained as a frozen spec of the contract; see `TRANSPORT.md` for the caller-facing reference.
 
-The only design-time gap still outstanding is **explicit credit-window flow control** — `StreamError::WouldBlock` is reserved as an API variant for a future credit-windowed implementation; v1's send path currently returns `Transport` for underlying send failures and `Ok(())` otherwise. That's a v2 increment.
+The only design-time gap still outstanding is **explicit credit-window flow control** — `StreamError::Backpressure` is reserved as an API variant for a future credit-windowed implementation; v1's send path currently returns `Transport` for underlying send failures and `Ok(())` otherwise. That's a v2 increment.
 
 ---
 
@@ -116,10 +116,10 @@ Today's convenience methods keep working unchanged. They internally open (or loo
 **No credit/window protocol, no wire changes, no in-flight accounting in v1.** The router's `FairScheduler` already bounds per-stream queue depth. Surfacing that existing limit as a caller-visible signal is enough.
 
 - `Stream::send` enqueues on the stream's scheduler queue.
-- If the queue is full, `send` returns `StreamError::WouldBlock` immediately. No blocking, no buffering above the scheduler. Caller decides: retry, drop, or surface to its own back-pressure layer.
-- Other streams are unaffected — the fair scheduler keeps serving them. One stream being `WouldBlock` is one stream's problem, not a session-wide stall.
+- If the queue is full, `send` returns `StreamError::Backpressure` immediately. No blocking, no buffering above the scheduler. Caller decides: retry, drop, or surface to its own back-pressure layer.
+- Other streams are unaffected — the fair scheduler keeps serving them. One stream being `Backpressure` is one stream's problem, not a session-wide stall.
 
-This is 90% of what a full credit-windowing scheme would give us, for ~5% of the complexity. A proper `StreamWindow { stream_id, new_bytes }` control message with `bytes_in_flight` accounting can be swapped in later as a purely internal change — the `Stream::send` → `WouldBlock` API does not move. Flagged as an open question, not v1 scope.
+This is 90% of what a full credit-windowing scheme would give us, for ~5% of the complexity. A proper `StreamWindow { stream_id, new_bytes }` control message with `bytes_in_flight` accounting can be swapped in later as a purely internal change — the `Stream::send` → `Backpressure` API does not move. Flagged as an open question, not v1 scope.
 
 `StreamConfig.window_bytes` stays in the struct as a forward-looking knob; v1 treats it as a per-stream override of `max_queue_depth` (bytes-budgeted depth instead of packet-count depth), defaulting to the router's configured value.
 
@@ -182,9 +182,9 @@ Each step is independently reviewable.
 - Heartbeat-loop piggyback: sweep streams with `last_activity.elapsed() > idle_timeout`, up to the `max_streams` cap.
 - `MeshNodeConfig` grows `stream_idle_timeout: Duration` and `max_streams: usize` with sane defaults.
 
-### Step 3: Queue-full → `StreamError::WouldBlock` (~40 lines)
+### Step 3: Queue-full → `StreamError::Backpressure` (~40 lines)
 
-- The scheduler already has `max_queue_depth` per stream. Surface the queue's "full" state to callers via a `StreamError::WouldBlock` returned from `Stream::send`.
+- The scheduler already has `max_queue_depth` per stream. Surface the queue's "full" state to callers via a `StreamError::Backpressure` returned from `Stream::send`.
 - `StreamConfig.window_bytes` becomes a per-stream override of the depth cap (bytes-budgeted rather than packet-count-budgeted), defaulting to the router's existing value.
 - No wire changes. No in-flight accounting. No control messages. Caller decides whether to retry, drop, or surface further.
 
@@ -212,7 +212,7 @@ Unit:
 - `close_stream` removes the entry; subsequent `open_stream` creates fresh state.
 - Idle eviction evicts exactly the streams past the timeout, leaves fresh ones.
 - `max_streams` cap forces LRU eviction.
-- `Stream::send` with full router queue returns `WouldBlock`.
+- `Stream::send` with full router queue returns `Backpressure`.
 - `StreamStats` round-trip — send/receive some packets, read stats, values match.
 
 Integration (`tests/three_node_integration.rs`):
@@ -234,8 +234,8 @@ Integration (`tests/three_node_integration.rs`):
 
 ## Open questions / deferred
 
-- **Credit windowing.** v1 ships queue-full → `WouldBlock`. If we ever measure a workload where that's insufficient (one stream's queue capacity shadowing real scheduler pressure on another), a proper per-stream credit window with an explicit `StreamWindow { stream_id, new_bytes }` control message and `bytes_in_flight` accounting can slot in as a **purely internal** change. The `Stream::send → WouldBlock` API doesn't move.
-- **Backpressure: `WouldBlock` vs. async `send_blocking`.** v1 is `WouldBlock` and caller-managed retry. An async `send` wrapper that awaits queue space is a thin convenience on top; worth adding in a follow-up.
+- **Credit windowing.** v1 ships queue-full → `Backpressure`. If we ever measure a workload where that's insufficient (one stream's queue capacity shadowing real scheduler pressure on another), a proper per-stream credit window with an explicit `StreamWindow { stream_id, new_bytes }` control message and `bytes_in_flight` accounting can slot in as a **purely internal** change. The `Stream::send → Backpressure` API doesn't move.
+- **Backpressure: `Backpressure` vs. async `send_blocking`.** v1 is `Backpressure` and caller-managed retry. An async `send` wrapper that awaits queue space is a thin convenience on top; worth adding in a follow-up.
 - **Cross-stream priority at the AEAD / cipher level.** Today the session's one Noise cipher serializes all streams at the crypto layer. For very high throughput, a per-stream cipher (derived via HKDF from the session keys) would allow parallel encryption. Out of scope for this plan.
 - **Stream close notification on the wire.** Currently closing a stream is purely local — the peer doesn't learn. For `Reliable` streams, a `FIN` flag on the last packet would be ergonomic (`PacketFlags::FIN` already exists per `protocol.rs`). Worth wiring; small add, could slot in as Step 2.5 if it surfaces during review.
 
