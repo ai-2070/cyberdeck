@@ -2,7 +2,15 @@
 
 ## Status
 
-Design only. `StreamError::Backpressure` is defined as a variant today but never returned; `send_on_stream` either succeeds or surfaces socket-level failures as `StreamError::Transport`. The daemon layer has no first-class way to ask "is this stream under pressure?" without parsing transport errors.
+**v1 shipped.** `StreamError::Backpressure` is now a real signal: `send_on_stream` returns it when a per-stream in-flight counter would exceed the stream's `tx_window`, admission is a CAS loop, the slot is released via an RAII guard that survives async cancellation, `backpressure_events` counts rejections in `StreamStats`, and the Rust/TS/Python SDKs wrap `send_with_retry` / `send_blocking` with exponential backoff + a `BackpressureError` class/exception. v1 catches **concurrent callers** racing on the same stream; a serial sender outrunning a slow receiver across the network still surfaces as `Transport(io::Error)`.
+
+**v2 is the network-speed extension** — round-trip credit windows via `SUBPROTOCOL_STREAM_WINDOW = 0x0B00`. Same `StreamError::Backpressure` variant, same SDK helpers, same daemon patterns. Only the internal condition that triggers Backpressure moves from "local counter full" to "no credit from peer." Design: [`STREAM_BACKPRESSURE_PLAN_V2.md`](STREAM_BACKPRESSURE_PLAN_V2.md).
+
+---
+
+*Original v1 design preserved below.*
+
+`StreamError::Backpressure` is defined as a variant today but never returned; `send_on_stream` either succeeds or surfaces socket-level failures as `StreamError::Transport`. The daemon layer has no first-class way to ask "is this stream under pressure?" without parsing transport errors.
 
 This plan ships a real Backpressure signal in v1 without wire changes or per-peer credit accounting, and gives daemons a small set of reusable patterns (drop / retry / app-buffer) in the SDKs. v2 is a forward-compatible swap to round-trip credit windows where daemon code does not change — only the internal condition that triggers Backpressure does.
 
