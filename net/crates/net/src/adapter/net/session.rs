@@ -38,6 +38,12 @@ pub struct NetSession {
     default_reliable: bool,
     /// Session is active
     active: AtomicBool,
+    /// Monotonic generator for per-`StreamState` epochs. Each opened
+    /// stream captures a unique epoch at construction time so that
+    /// stale `Stream` handles or `TxSlotGuard`s from a previous
+    /// open/close cycle can't silently operate on a new stream that
+    /// reuses the same `stream_id`.
+    stream_epoch_counter: AtomicU64,
 }
 
 impl NetSession {
@@ -66,7 +72,19 @@ impl NetSession {
             thread_local_pool,
             default_reliable,
             active: AtomicBool::new(true),
+            stream_epoch_counter: AtomicU64::new(1),
         }
+    }
+
+    /// Allocate a unique epoch for a freshly-opened stream.
+    ///
+    /// Monotonic per session — a stream closed and reopened gets a
+    /// **new** epoch, which is how stale `Stream` handles and
+    /// `TxSlotGuard`s are prevented from operating on a different
+    /// lifetime of the same `stream_id`.
+    #[inline]
+    fn next_stream_epoch(&self) -> u64 {
+        self.stream_epoch_counter.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Get the session ID
@@ -127,12 +145,51 @@ impl NetSession {
     ///   * [`TxAdmit::StreamClosed`] if the stream isn't registered
     ///     (never opened, closed, or idle-evicted).
     pub fn try_acquire_tx_slot_guard(self: &Arc<Self>, stream_id: u64) -> TxAdmit {
-        // Look up the stream to decide admission. Release the
-        // DashMap ref before returning so the guard's Drop doesn't
-        // deadlock trying to re-acquire it.
-        let admitted = match self.streams.get(&stream_id) {
+        self.try_acquire_tx_slot_guard_inner(stream_id, None)
+    }
+
+    /// Like [`Self::try_acquire_tx_slot_guard`], but additionally
+    /// rejects the admission if the live `StreamState`'s epoch
+    /// differs from `expected_epoch`.
+    ///
+    /// Use from the typed-handle `send_on_stream` path so a handle
+    /// held across a close+reopen cycle doesn't admit against the new
+    /// stream's state.
+    pub fn try_acquire_tx_slot_guard_matching_epoch(
+        self: &Arc<Self>,
+        stream_id: u64,
+        expected_epoch: u64,
+    ) -> TxAdmit {
+        self.try_acquire_tx_slot_guard_inner(stream_id, Some(expected_epoch))
+    }
+
+    fn try_acquire_tx_slot_guard_inner(
+        self: &Arc<Self>,
+        stream_id: u64,
+        expected_epoch: Option<u64>,
+    ) -> TxAdmit {
+        // Look up the stream to decide admission. Capture the state's
+        // epoch so the guard's Drop can tell whether the stream has
+        // been closed + reopened in the interim — a naive release
+        // would decrement `tx_inflight` on the fresh state, which
+        // never saw this acquire.
+        //
+        // Release the DashMap ref before returning so the guard's
+        // Drop doesn't deadlock trying to re-acquire it.
+        let (admitted, epoch) = match self.streams.get(&stream_id) {
             None => return TxAdmit::StreamClosed,
-            Some(state) => state.try_acquire_tx_slot(),
+            Some(state) => {
+                if let Some(expected) = expected_epoch {
+                    if state.epoch() != expected {
+                        // The handle is stale: the stream was closed
+                        // and reopened since the handle was issued.
+                        // Surface this as StreamClosed so the caller
+                        // maps it to `StreamError::NotConnected`.
+                        return TxAdmit::StreamClosed;
+                    }
+                }
+                (state.try_acquire_tx_slot(), state.epoch())
+            }
         };
         if !admitted {
             return TxAdmit::WindowFull;
@@ -140,6 +197,7 @@ impl NetSession {
         TxAdmit::Acquired(TxSlotGuard {
             session: Arc::clone(self),
             stream_id,
+            epoch,
             active: true,
         })
     }
@@ -167,6 +225,12 @@ pub enum TxAdmit {
 pub struct TxSlotGuard {
     session: Arc<NetSession>,
     stream_id: u64,
+    /// Epoch of the `StreamState` that admitted this guard. If the
+    /// stream was closed and reopened before this guard drops, the
+    /// new `StreamState` carries a different epoch and the release is
+    /// suppressed — the "slot" this guard held belongs to a state
+    /// that no longer exists.
+    epoch: u64,
     active: bool,
 }
 
@@ -174,6 +238,7 @@ impl std::fmt::Debug for TxSlotGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TxSlotGuard")
             .field("stream_id", &format_args!("{:#x}", self.stream_id))
+            .field("epoch", &self.epoch)
             .field("active", &self.active)
             .finish()
     }
@@ -201,7 +266,13 @@ impl Drop for TxSlotGuard {
             return;
         }
         if let Some(state) = self.session.try_stream(self.stream_id) {
-            state.release_tx_slot();
+            // Only release if the live state is the same state that
+            // admitted us. After a close+reopen the new state has a
+            // different epoch — releasing would spuriously decrement
+            // `tx_inflight` on a slot we never acquired.
+            if state.epoch() == self.epoch {
+                state.release_tx_slot();
+            }
         }
     }
 }
@@ -214,20 +285,26 @@ impl NetSession {
     /// caller's config is **ignored with a warning log** — the first open
     /// wins. Callers that want to change a stream's config must close +
     /// re-open it.
-    pub fn open_stream_with(&self, stream_id: u64, reliable: bool, fairness_weight: u8) {
-        self.open_stream_full(stream_id, reliable, fairness_weight, 0);
+    pub fn open_stream_with(&self, stream_id: u64, reliable: bool, fairness_weight: u8) -> u64 {
+        self.open_stream_full(stream_id, reliable, fairness_weight, 0)
     }
 
     /// Extended open that also sets the per-stream TX window for
     /// backpressure. `tx_window == 0` keeps the pre-backpressure
     /// behavior (unbounded local queue).
+    ///
+    /// Returns the epoch of the live `StreamState` for `stream_id` —
+    /// either the fresh one created for a new stream, or the existing
+    /// one if the stream is already open (first-open-wins). Callers
+    /// embed this in their `Stream` handle so later sends can reject
+    /// stale handles after close+reopen.
     pub fn open_stream_full(
         &self,
         stream_id: u64,
         reliable: bool,
         fairness_weight: u8,
         tx_window: u32,
-    ) {
+    ) -> u64 {
         use dashmap::mapref::entry::Entry;
         match self.streams.entry(stream_id) {
             Entry::Occupied(existing) => {
@@ -247,9 +324,17 @@ impl NetSession {
                         "open_stream: ignoring conflicting config; first open wins"
                     );
                 }
+                existing.epoch()
             }
             Entry::Vacant(v) => {
-                v.insert(StreamState::new_full(reliable, fairness_weight, tx_window));
+                let epoch = self.next_stream_epoch();
+                v.insert(StreamState::new_full_with_epoch(
+                    reliable,
+                    fairness_weight,
+                    tx_window,
+                    epoch,
+                ));
+                epoch
             }
         }
     }
@@ -429,6 +514,16 @@ pub struct StreamState {
     /// Number of `send_on_stream` calls that have returned
     /// `StreamError::Backpressure` since this stream was opened.
     backpressure_events: AtomicU64,
+    /// Monotonic epoch issued by the owning `NetSession` at open time.
+    /// Close + reopen of the same `stream_id` produces a fresh
+    /// `StreamState` with a new epoch; stale `Stream` handles and
+    /// `TxSlotGuard`s must fail an equality check against this value
+    /// before acting on the state.
+    ///
+    /// `0` is the "no epoch recorded" sentinel for legacy paths
+    /// (`get_or_create_stream`, `send_to_peer` / `send_routed`) that
+    /// don't go through the typed handle API.
+    epoch: u64,
 }
 
 impl StreamState {
@@ -443,7 +538,25 @@ impl StreamState {
     }
 
     /// Create a new stream state with full config (weight + tx window).
+    /// Epoch defaults to `0` (the "no epoch" sentinel used by legacy
+    /// auto-create paths); sessions that go through `open_stream_full`
+    /// allocate a fresh epoch via [`Self::new_full_with_epoch`].
     pub fn new_full(reliable: bool, fairness_weight: u8, tx_window: u32) -> Self {
+        Self::new_full_with_epoch(reliable, fairness_weight, tx_window, 0)
+    }
+
+    /// Create a new stream state with a caller-supplied epoch.
+    ///
+    /// Sessions call this via `open_stream_full` with a monotonic
+    /// epoch; stale `Stream` handles / `TxSlotGuard`s from a prior
+    /// close/reopen cycle will fail the epoch check against the new
+    /// state.
+    pub fn new_full_with_epoch(
+        reliable: bool,
+        fairness_weight: u8,
+        tx_window: u32,
+        epoch: u64,
+    ) -> Self {
         Self {
             tx_seq: AtomicU64::new(0),
             rx_seq: AtomicU64::new(0),
@@ -456,6 +569,7 @@ impl StreamState {
             tx_window,
             tx_inflight: AtomicU32::new(0),
             backpressure_events: AtomicU64::new(0),
+            epoch,
         }
     }
 
@@ -483,6 +597,13 @@ impl StreamState {
     #[inline]
     pub fn fairness_weight(&self) -> u8 {
         self.fairness_weight
+    }
+
+    /// Monotonic per-session epoch captured at construction time.
+    /// `0` means "no epoch recorded" (legacy auto-create path).
+    #[inline]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Configured max in-flight packets before Backpressure. `0` = no limit.

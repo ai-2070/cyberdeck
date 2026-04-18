@@ -1979,7 +1979,10 @@ impl MeshNode {
             ))
         })?;
         let reliable = config.reliability.is_reliable();
-        peer.session.open_stream_full(
+        // Capture the freshly-allocated (or existing, on idempotent
+        // re-open) epoch so the returned `Stream` handle can later
+        // reject stale sends after a close+reopen.
+        let epoch = peer.session.open_stream_full(
             stream_id,
             reliable,
             config.fairness_weight,
@@ -2008,6 +2011,7 @@ impl MeshNode {
         Ok(Stream {
             peer_node_id,
             stream_id,
+            epoch,
             config,
         })
     }
@@ -2059,14 +2063,20 @@ impl MeshNode {
         let stream_id = stream.stream_id;
         let reliable = stream.config.reliability.is_reliable();
 
-        // Refuse to send on a stream that isn't currently open. This
-        // is the contract for the typed `Stream` handle: closing the
-        // stream (or letting it be idle-evicted / LRU-trimmed) should
-        // NOT be papered over by silently recreating it with defaults
-        // on the next send. Callers that want the legacy auto-create
-        // behavior use `send_to_peer` / `send_routed` instead.
-        if session.try_stream(stream_id).is_none() {
-            return Err(StreamError::NotConnected);
+        // Refuse to send on a stream that isn't currently open, OR
+        // whose live state has a different epoch than the handle. The
+        // second case covers the subtle "close + reopen with the same
+        // id" bug: the handle's epoch was captured at its original
+        // open, but a reopen allocates a fresh `StreamState` with a
+        // new epoch. A naive existence-only check would silently
+        // reroute the send onto the new stream — wrong config, wrong
+        // stats, wrong tx_window accounting.
+        match session.try_stream(stream_id) {
+            None => return Err(StreamError::NotConnected),
+            Some(state) if state.epoch() != stream.epoch => {
+                return Err(StreamError::NotConnected);
+            }
+            Some(_) => {}
         }
 
         let pool = session.thread_local_pool();
@@ -2096,7 +2106,7 @@ impl MeshNode {
         for event in events {
             let frame_size = EventFrame::LEN_SIZE + event.len();
             if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE && !current_batch.is_empty() {
-                let (guard, seq) = match session.try_acquire_tx_slot_guard(stream_id) {
+                let (guard, seq) = match session.try_acquire_tx_slot_guard_matching_epoch(stream_id, stream.epoch) {
                     TxAdmit::Acquired(g) => {
                         let seq = session
                             .try_stream(stream_id)
@@ -2119,7 +2129,7 @@ impl MeshNode {
         }
 
         if !current_batch.is_empty() {
-            let (guard, seq) = match session.try_acquire_tx_slot_guard(stream_id) {
+            let (guard, seq) = match session.try_acquire_tx_slot_guard_matching_epoch(stream_id, stream.epoch) {
                 TxAdmit::Acquired(g) => {
                     let seq = session
                         .try_stream(stream_id)

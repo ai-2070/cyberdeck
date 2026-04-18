@@ -187,6 +187,12 @@ pub struct StreamStats {
 pub struct Stream {
     pub(crate) peer_node_id: u64,
     pub(crate) stream_id: u64,
+    /// Epoch of the `StreamState` this handle was opened against. If
+    /// the stream is closed and reopened (same `stream_id`), the new
+    /// state carries a different epoch and this handle's sends will
+    /// fail with `NotConnected`. Prevents a stale `Stream` from
+    /// silently operating on a different lifetime of the same id.
+    pub(crate) epoch: u64,
     pub(crate) config: StreamConfig,
 }
 
