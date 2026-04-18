@@ -460,6 +460,39 @@ async fn test_watch_with_limit_and_order() {
 }
 
 #[tokio::test]
+async fn test_snapshot_and_restore_round_trip() {
+    let redex = Redex::new();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+
+    memories
+        .store(1, "alpha", vec!["x".into()], "alice", 100)
+        .unwrap();
+    memories.pin(1, 110).unwrap();
+    memories
+        .store(2, "beta", vec!["y".into()], "alice", 200)
+        .unwrap();
+    let seq = memories
+        .retag(2, vec!["y".into(), "z".into()], 210)
+        .unwrap();
+    memories.wait_for_seq(seq).await;
+
+    let (bytes, last_seq) = memories.snapshot().unwrap();
+    assert_eq!(last_seq, Some(3));
+    memories.close().unwrap();
+
+    // Restore on a fresh Redex.
+    let redex2 = Redex::new();
+    let memories2 = MemoriesAdapter::open_from_snapshot(&redex2, ORIGIN, &bytes, last_seq).unwrap();
+    let state = memories2.state();
+    let guard = state.read();
+    assert_eq!(guard.len(), 2);
+    let m1 = guard.get(1).unwrap();
+    assert!(m1.pinned);
+    let m2 = guard.get(2).unwrap();
+    assert_eq!(m2.tags, vec!["y".to_string(), "z".to_string()]);
+}
+
+#[tokio::test]
 async fn test_ingest_after_close_errors() {
     let redex = Redex::new();
     let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();

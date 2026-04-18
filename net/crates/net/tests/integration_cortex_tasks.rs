@@ -405,6 +405,58 @@ async fn test_watch_with_limit_and_order() {
 }
 
 #[tokio::test]
+async fn test_snapshot_and_restore_skips_replay() {
+    // Open, do CRUD, snapshot, close. Reopen from snapshot on the
+    // SAME redex — state matches without the fold replaying events
+    // 0..=last_seq (the adapter tails at FromSeq(last_seq+1)).
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+
+    tasks.create(1, "alpha", 100).unwrap();
+    tasks.create(2, "beta", 200).unwrap();
+    tasks.complete(1, 150).unwrap();
+    let seq = tasks.rename(2, "beta-v2", 250).unwrap();
+    tasks.wait_for_seq(seq).await;
+
+    let (bytes, last_seq) = tasks.snapshot().unwrap();
+    assert_eq!(last_seq, Some(3)); // 4 events → seq 0..=3
+    tasks.close().unwrap();
+
+    // Reopen on the same redex — the file still holds seqs 0..=3,
+    // but the restored adapter's fold starts at seq 4 (last_seq+1),
+    // so those old events are NOT replayed. State comes from bytes.
+    let tasks2 = TasksAdapter::open_from_snapshot(&redex, ORIGIN, &bytes, last_seq).unwrap();
+
+    let state = tasks2.state();
+    let guard = state.read();
+    assert_eq!(guard.len(), 2);
+    let t1 = guard.get(1).unwrap();
+    assert_eq!(t1.status, TaskStatus::Completed);
+    let t2 = guard.get(2).unwrap();
+    assert_eq!(t2.title, "beta-v2");
+    assert_eq!(t2.status, TaskStatus::Pending);
+    drop(guard);
+
+    // New ingest flows through normally. The underlying file's
+    // next_seq is 4 (persisted across close), so this create
+    // appends at seq 4, which the fold task picks up since it
+    // tails FromSeq(4).
+    let seq = tasks2.create(3, "gamma", 300).unwrap();
+    assert_eq!(seq, 4);
+    tasks2.wait_for_seq(seq).await;
+    assert_eq!(tasks2.state().read().len(), 3);
+}
+
+#[tokio::test]
+async fn test_snapshot_empty_state_has_no_last_seq() {
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let (bytes, last_seq) = tasks.snapshot().unwrap();
+    assert_eq!(last_seq, None);
+    assert!(!bytes.is_empty()); // even empty state serializes to >0 bytes.
+}
+
+#[tokio::test]
 async fn test_ingest_after_close_errors() {
     let redex = Redex::new();
     let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();

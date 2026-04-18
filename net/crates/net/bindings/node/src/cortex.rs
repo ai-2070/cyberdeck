@@ -258,11 +258,7 @@ impl TasksAdapter {
     /// active — the underlying `CortexAdapter::open` spawns the
     /// fold task via `tokio::spawn` and needs a live reactor.
     #[napi(factory)]
-    pub async fn open(
-        redex: &Redex,
-        origin_hash: u32,
-        persistent: Option<bool>,
-    ) -> Result<Self> {
+    pub async fn open(redex: &Redex, origin_hash: u32, persistent: Option<bool>) -> Result<Self> {
         let cfg = if persistent.unwrap_or(false) {
             RedexFileConfig::default().with_persistent(true)
         } else {
@@ -572,11 +568,7 @@ impl MemoriesAdapter {
     /// Open the memories adapter against a Redex manager. See
     /// [`TasksAdapter::open`] for `persistent` semantics.
     #[napi(factory)]
-    pub async fn open(
-        redex: &Redex,
-        origin_hash: u32,
-        persistent: Option<bool>,
-    ) -> Result<Self> {
+    pub async fn open(redex: &Redex, origin_hash: u32, persistent: Option<bool>) -> Result<Self> {
         let cfg = if persistent.unwrap_or(false) {
             RedexFileConfig::default().with_persistent(true)
         } else {

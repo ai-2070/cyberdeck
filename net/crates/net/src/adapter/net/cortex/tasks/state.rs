@@ -3,10 +3,16 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use super::types::{Task, TaskId, TaskStatus};
 
 /// Materialized view over the tasks log.
-#[derive(Debug, Default, Clone)]
+///
+/// `Serialize` / `Deserialize` are derived so the state can be
+/// snapshotted via [`super::super::CortexAdapter::snapshot`] and
+/// restored via [`super::super::CortexAdapter::open_from_snapshot`].
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TasksState {
     pub(super) tasks: HashMap<TaskId, Task>,
 }

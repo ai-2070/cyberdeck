@@ -16,8 +16,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::{Mutex as TokioMutex, Notify};
 
 use ::net::adapter::net::cortex::memories::{
-    MemoriesAdapter as InnerMemoriesAdapter, Memory as InnerMemory,
-    OrderBy as InnerMemoriesOrderBy,
+    MemoriesAdapter as InnerMemoriesAdapter, Memory as InnerMemory, OrderBy as InnerMemoriesOrderBy,
 };
 use ::net::adapter::net::cortex::tasks::{
     OrderBy as InnerTasksOrderBy, Task as InnerTask, TaskStatus as InnerTaskStatus,
@@ -190,9 +189,9 @@ impl PyTasksAdapter {
             RedexFileConfig::default()
         };
         let inner = runtime
-            .block_on(async move {
-                InnerTasksAdapter::open_with_config(&redex_inner, origin_hash, cfg)
-            })
+            .block_on(
+                async move { InnerTasksAdapter::open_with_config(&redex_inner, origin_hash, cfg) },
+            )
             .map_err(|e| PyRuntimeError::new_err(format!("TasksAdapter open failed: {}", e)))?;
         Ok(Self {
             inner: Arc::new(inner),

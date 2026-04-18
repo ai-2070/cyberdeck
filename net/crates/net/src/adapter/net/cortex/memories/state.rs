@@ -3,10 +3,16 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use super::types::{Memory, MemoryId};
 
 /// Materialized view over the memories log.
-#[derive(Debug, Default, Clone)]
+///
+/// `Serialize` / `Deserialize` are derived so the state can be
+/// snapshotted via [`super::super::CortexAdapter::snapshot`] and
+/// restored via [`super::super::CortexAdapter::open_from_snapshot`].
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct MemoriesState {
     pub(super) memories: HashMap<MemoryId, Memory>,
 }

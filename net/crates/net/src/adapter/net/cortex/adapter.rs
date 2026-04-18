@@ -9,8 +9,11 @@ use parking_lot::RwLock;
 use tokio::sync::{broadcast, Notify};
 use tokio_stream::wrappers::BroadcastStream;
 
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+
 use super::super::channel::ChannelName;
-use super::super::redex::{Redex, RedexEvent, RedexFile, RedexFileConfig, RedexFold};
+use super::super::redex::{Redex, RedexError, RedexEvent, RedexFile, RedexFileConfig, RedexFold};
 use super::config::{CortexAdapterConfig, FoldErrorPolicy, StartPosition};
 use super::envelope::IntoRedexPayload;
 use super::error::CortexAdapterError;
@@ -240,6 +243,83 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
     }
 }
 
+impl<State> CortexAdapter<State>
+where
+    State: Serialize + Send + Sync + 'static,
+{
+    /// Capture a point-in-time snapshot of the materialized state.
+    ///
+    /// Returns `(state_bytes, last_seq)` where `state_bytes` is the
+    /// bincode-serialized state and `last_seq` is the highest RedEX
+    /// sequence folded into it. Persist both together — they form a
+    /// consistent pair, guaranteed by the adapter holding the state
+    /// write lock while advancing the watermark.
+    ///
+    /// Restore via [`Self::open_from_snapshot`] on a State that also
+    /// implements `DeserializeOwned`.
+    ///
+    /// `last_seq` is `None` if no event has been folded yet since
+    /// open (the snapshot is still meaningful — it represents the
+    /// initial State — but callers typically wait until
+    /// [`Self::wait_for_seq`] has returned before snapshotting).
+    pub fn snapshot(&self) -> Result<(Vec<u8>, Option<u64>), CortexAdapterError> {
+        let state = self.inner.state.read();
+        let bytes = bincode::serialize(&*state).map_err(|e| {
+            CortexAdapterError::Redex(RedexError::Encode(format!("snapshot serialize: {}", e)))
+        })?;
+        let watermark = self.inner.folded_through_seq.load(Ordering::Acquire);
+        let last_seq = if watermark < 0 {
+            None
+        } else {
+            Some(watermark as u64)
+        };
+        Ok((bytes, last_seq))
+    }
+}
+
+impl<State> CortexAdapter<State>
+where
+    State: DeserializeOwned + Send + Sync + 'static,
+{
+    /// Open an adapter from a previously-captured snapshot, skipping
+    /// the `[0, last_seq]` replay.
+    ///
+    /// `state_bytes` is the blob returned from [`Self::snapshot`].
+    /// `last_seq` is its companion sequence. The tail starts at
+    /// `last_seq + 1`; the initial state is deserialized from the
+    /// blob; the fold task is spawned as usual.
+    ///
+    /// If `last_seq` is `None` (no events had been folded at
+    /// snapshot time), the tail starts at seq 0 — equivalent to
+    /// `StartPosition::FromBeginning` with the deserialized initial
+    /// state.
+    pub fn open_from_snapshot<F>(
+        redex: &Redex,
+        name: &ChannelName,
+        redex_config: RedexFileConfig,
+        adapter_config: CortexAdapterConfig,
+        fold: F,
+        state_bytes: &[u8],
+        last_seq: Option<u64>,
+    ) -> Result<Self, CortexAdapterError>
+    where
+        F: RedexFold<State> + Send + 'static,
+    {
+        let initial_state: State = bincode::deserialize(state_bytes).map_err(|e| {
+            CortexAdapterError::Redex(RedexError::Encode(format!("deserialize snapshot: {}", e)))
+        })?;
+        let start = match last_seq {
+            Some(n) => StartPosition::FromSeq(n + 1),
+            None => StartPosition::FromBeginning,
+        };
+        let config = CortexAdapterConfig {
+            start,
+            on_fold_error: adapter_config.on_fold_error,
+        };
+        Self::open(redex, name, redex_config, config, fold, initial_state)
+    }
+}
+
 impl<State> Clone for CortexAdapter<State> {
     fn clone(&self) -> Self {
         Self {
@@ -271,16 +351,28 @@ where
     F: RedexFold<State>,
 {
     let seq = event.entry.seq;
+    // Hold the write lock across both the fold and the watermark
+    // update so that a `snapshot()` holding `state.read()` observes
+    // a consistent `(state, folded_through_seq)` pair — otherwise
+    // the state could reflect seq N while the watermark still reads
+    // N-1, causing restore to double-apply event N.
     let result = {
         let mut state = inner.state.write();
-        fold.apply(event, &mut state)
+        let r = fold.apply(event, &mut state);
+        let advance = matches!(
+            (&r, policy),
+            (Ok(()), _) | (Err(_), FoldErrorPolicy::LogAndContinue)
+        );
+        if advance {
+            inner
+                .folded_through_seq
+                .store(seq as i64, Ordering::Release);
+        }
+        r
     };
 
     match result {
         Ok(()) => {
-            inner
-                .folded_through_seq
-                .store(seq as i64, Ordering::Release);
             inner.notify.notify_waiters();
             let _ = inner.changes_tx.send(seq);
             false
@@ -291,11 +383,8 @@ where
             match policy {
                 FoldErrorPolicy::Stop => true,
                 FoldErrorPolicy::LogAndContinue => {
-                    // Skip this event; advance watermark so
-                    // wait_for_seq doesn't hang on the skipped seq.
-                    inner
-                        .folded_through_seq
-                        .store(seq as i64, Ordering::Release);
+                    // Watermark was already advanced inside the lock
+                    // above; just notify waiters.
                     inner.notify.notify_waiters();
                     let _ = inner.changes_tx.send(seq);
                     false

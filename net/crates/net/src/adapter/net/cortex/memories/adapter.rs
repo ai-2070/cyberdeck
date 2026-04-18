@@ -153,11 +153,61 @@ impl MemoriesAdapter {
         &self.inner
     }
 
-    /// Start building a reactive watcher. See
-    /// [`MemoriesWatcher::stream`] for emission semantics (initial +
-    /// deduplicated on filter-result change).
+    /// Start building a reactive watcher.
     pub fn watch(&self) -> MemoriesWatcher {
         MemoriesWatcher::new(self.inner.state(), self.inner.changes().boxed())
+    }
+
+    /// Capture a snapshot suitable for restore. Returns
+    /// `(state_bytes, last_seq)` — persist both together.
+    pub fn snapshot(&self) -> Result<(Vec<u8>, Option<u64>), CortexAdapterError> {
+        self.inner.snapshot()
+    }
+
+    /// Open the memories adapter from a snapshot.
+    pub fn open_from_snapshot(
+        redex: &Redex,
+        origin_hash: u32,
+        state_bytes: &[u8],
+        last_seq: Option<u64>,
+    ) -> Result<Self, CortexAdapterError> {
+        Self::open_from_snapshot_with_config(
+            redex,
+            origin_hash,
+            RedexFileConfig::default(),
+            state_bytes,
+            last_seq,
+        )
+    }
+
+    /// Like [`Self::open_from_snapshot`] but with a caller-supplied
+    /// `RedexFileConfig`.
+    pub fn open_from_snapshot_with_config(
+        redex: &Redex,
+        origin_hash: u32,
+        redex_config: RedexFileConfig,
+        state_bytes: &[u8],
+        last_seq: Option<u64>,
+    ) -> Result<Self, CortexAdapterError> {
+        let name = ChannelName::new(MEMORIES_CHANNEL).map_err(|e| {
+            CortexAdapterError::Redex(super::super::super::redex::RedexError::Channel(
+                e.to_string(),
+            ))
+        })?;
+        let inner = CortexAdapter::open_from_snapshot(
+            redex,
+            &name,
+            redex_config,
+            CortexAdapterConfig::default(),
+            MemoriesFold,
+            state_bytes,
+            last_seq,
+        )?;
+        Ok(Self {
+            inner,
+            origin_hash,
+            app_seq: AtomicU64::new(0),
+        })
     }
 
     fn ingest_typed<T: serde::Serialize>(
