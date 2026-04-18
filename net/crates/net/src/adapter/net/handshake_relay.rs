@@ -7,12 +7,19 @@
 //! Wire format for the subprotocol payload:
 //!
 //! ```text
-//! [dest_node_id: u64 LE][src_node_id: u64 LE][noise_bytes: variable]
+//! [ttl: u8][dest_node_id: u64 LE][src_node_id: u64 LE][noise_bytes: variable]
 //! ```
 //!
 //! The relay reads `dest_node_id` to pick the next hop. Noise NKpsk0 bytes
 //! are authenticated with the PSK and the responder's static key, so a relay
-//! can see them but can't forge or decrypt them.
+//! can see them but can't forge or decrypt them. `(src_node_id, dest_node_id)`
+//! are additionally bound into the Noise prologue so any rewrite-in-flight
+//! is detected as a `read_message` failure on the responder.
+//!
+//! The `ttl` byte is decremented on each `Forward` and the packet is dropped
+//! at zero, preventing a routing loop between relay nodes from bouncing a
+//! handshake indefinitely. It is NOT part of the prologue — the whole point
+//! is that relays can mutate it.
 //!
 //! Completion of the handshake is asymmetric:
 //! - Responder completes in one step (reads msg1, writes msg2, derives keys).
@@ -29,12 +36,24 @@ use super::crypto::{CryptoError, NoiseHandshake, SessionKeys, StaticKeypair};
 /// Subprotocol identifier for relayed Noise handshake messages.
 pub const SUBPROTOCOL_HANDSHAKE: u16 = 0x0601;
 
-/// Minimum payload length: two u64 node IDs.
-const PAYLOAD_HEADER_LEN: usize = 16;
+/// Wire header length: `ttl(1) + dest(8) + src(8) = 17 bytes`.
+const PAYLOAD_HEADER_LEN: usize = 17;
 
-/// Encoded handshake payload: `[dest: u64][src: u64][noise: ..]`.
-pub fn encode_payload(dest_node_id: u64, src_node_id: u64, noise_bytes: &[u8]) -> Bytes {
+/// Default hop budget when the initiator emits `msg1`. Relays decrement
+/// the ttl on each forward and drop the packet when it reaches zero, so a
+/// routing loop between two or more relay nodes cannot bounce a single
+/// handshake indefinitely. 8 hops is generous — real deployments rarely
+/// exceed 3 hops — while still being small enough to bound the worst case.
+pub const DEFAULT_RELAY_TTL: u8 = 8;
+
+/// Encoded handshake payload: `[ttl: u8][dest: u64][src: u64][noise: ..]`.
+///
+/// The ttl is mutable by relays (decremented on forward) and so is NOT
+/// bound into the Noise prologue — `(src, dest)` are, because those must
+/// survive end-to-end authentication.
+pub fn encode_payload(ttl: u8, dest_node_id: u64, src_node_id: u64, noise_bytes: &[u8]) -> Bytes {
     let mut out = Vec::with_capacity(PAYLOAD_HEADER_LEN + noise_bytes.len());
+    out.push(ttl);
     out.extend_from_slice(&dest_node_id.to_le_bytes());
     out.extend_from_slice(&src_node_id.to_le_bytes());
     out.extend_from_slice(noise_bytes);
@@ -58,6 +77,7 @@ fn relay_prologue(initiator: u64, responder: u64) -> [u8; 16 + 16] {
 
 /// Parsed handshake payload.
 pub struct HandshakePayload {
+    pub ttl: u8,
     pub dest_node_id: u64,
     pub src_node_id: u64,
     pub noise_bytes: Bytes,
@@ -69,10 +89,12 @@ impl HandshakePayload {
             return None;
         }
         let mut cursor = &bytes[..PAYLOAD_HEADER_LEN];
+        let ttl = cursor.get_u8();
         let dest_node_id = cursor.get_u64_le();
         let src_node_id = cursor.get_u64_le();
         let noise_bytes = bytes.slice(PAYLOAD_HEADER_LEN..);
         Some(Self {
+            ttl,
             dest_node_id,
             src_node_id,
             noise_bytes,
@@ -172,7 +194,7 @@ impl HandshakeHandler {
         let msg1 = noise.write_message(&[])?;
         let (tx, rx) = oneshot::channel();
         entry.insert(PendingInitiator { noise, tx });
-        let payload = encode_payload(dest_node_id, self.local_node_id, &msg1);
+        let payload = encode_payload(DEFAULT_RELAY_TTL, dest_node_id, self.local_node_id, &msg1);
         Ok((payload, rx))
     }
 
@@ -190,10 +212,26 @@ impl HandshakeHandler {
         };
 
         if parsed.dest_node_id != self.local_node_id {
-            // Not for us — forward toward dest.
+            // Not for us — forward toward dest, decrementing the ttl so
+            // a routing loop between relays cannot bounce the packet
+            // indefinitely. At zero we drop.
+            if parsed.ttl == 0 {
+                tracing::warn!(
+                    dest = format!("{:#x}", parsed.dest_node_id),
+                    src = format!("{:#x}", parsed.src_node_id),
+                    "handshake relay: ttl expired; dropping"
+                );
+                return Vec::new();
+            }
+            let forwarded = encode_payload(
+                parsed.ttl - 1,
+                parsed.dest_node_id,
+                parsed.src_node_id,
+                &parsed.noise_bytes,
+            );
             return vec![HandshakeAction::Forward {
                 to_node: parsed.dest_node_id,
-                payload: Bytes::copy_from_slice(payload),
+                payload: forwarded,
             }];
         }
 
@@ -252,7 +290,12 @@ impl HandshakeHandler {
             }
         };
 
-        let response_payload = encode_payload(parsed.src_node_id, self.local_node_id, &msg2);
+        let response_payload = encode_payload(
+            DEFAULT_RELAY_TTL,
+            parsed.src_node_id,
+            self.local_node_id,
+            &msg2,
+        );
 
         vec![HandshakeAction::RegisterResponderPeer {
             peer_node_id: parsed.src_node_id,
@@ -270,8 +313,9 @@ mod tests {
     #[test]
     fn payload_roundtrip() {
         let noise = b"opaque noise bytes";
-        let bytes = encode_payload(0xAAAA, 0xBBBB, noise);
+        let bytes = encode_payload(7, 0xAAAA, 0xBBBB, noise);
         let parsed = HandshakePayload::decode(bytes).unwrap();
+        assert_eq!(parsed.ttl, 7);
         assert_eq!(parsed.dest_node_id, 0xAAAA);
         assert_eq!(parsed.src_node_id, 0xBBBB);
         assert_eq!(&parsed.noise_bytes[..], noise);
@@ -338,12 +382,17 @@ mod tests {
         let middle = HandshakeHandler::new(0x5555, kp, psk);
 
         // Payload addressed to some other node, not the middle hop.
-        let payload = encode_payload(0x9999, 0x1111, b"noise");
+        let payload = encode_payload(DEFAULT_RELAY_TTL, 0x9999, 0x1111, b"noise");
         let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
         let actions = middle.handle_message(&payload, from);
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            HandshakeAction::Forward { to_node, .. } => assert_eq!(*to_node, 0x9999),
+            HandshakeAction::Forward { to_node, payload } => {
+                assert_eq!(*to_node, 0x9999);
+                // ttl must be decremented on forward.
+                let re = HandshakePayload::decode(payload.clone()).unwrap();
+                assert_eq!(re.ttl, DEFAULT_RELAY_TTL - 1);
+            }
             _ => panic!("expected Forward"),
         }
     }
@@ -381,7 +430,12 @@ mod tests {
         // nid_attacker. dest and noise_bytes unchanged.
         let parsed = HandshakePayload::decode(genuine_payload.clone()).unwrap();
         assert_eq!(parsed.src_node_id, nid_init);
-        let tampered = encode_payload(parsed.dest_node_id, nid_attacker, &parsed.noise_bytes);
+        let tampered = encode_payload(
+            parsed.ttl,
+            parsed.dest_node_id,
+            nid_attacker,
+            &parsed.noise_bytes,
+        );
 
         let dummy_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let actions = responder.handle_message(&tampered, dummy_addr);
@@ -435,7 +489,12 @@ mod tests {
             .begin_initiator(nid_resp + 1, &responder_kp.public)
             .unwrap();
         let other_parsed = HandshakePayload::decode(other_payload).unwrap();
-        let tampered = encode_payload(nid_resp, nid_init, &other_parsed.noise_bytes);
+        let tampered = encode_payload(
+            other_parsed.ttl,
+            nid_resp,
+            nid_init,
+            &other_parsed.noise_bytes,
+        );
 
         // Sanity: the responder *would* decode the envelope (dest matches
         // us), but the prologue it builds won't match what the initiator
@@ -453,6 +512,53 @@ mod tests {
         // byte material — no test assertion depends on it.
         initiator.cancel_initiator(nid_resp + 1);
         initiator.cancel_initiator(nid_resp);
+    }
+
+    /// Regression: relay forwarding had no hop budget, so a routing loop
+    /// between two or more relay nodes would bounce the same
+    /// `SUBPROTOCOL_HANDSHAKE` packet indefinitely. The fix is a ttl byte
+    /// in the wire header that every relay decrements; when it reaches
+    /// zero the packet is dropped.
+    ///
+    /// This test submits a payload whose ttl is already zero and asserts
+    /// that the middle-hop emits no `Forward` action. A companion
+    /// assertion in `middle_hop_forwards_when_not_addressed_to_us` checks
+    /// that a non-zero ttl IS decremented on forward.
+    #[test]
+    fn test_regression_relay_drops_packet_when_ttl_reaches_zero() {
+        let psk = [0x77u8; 32];
+        let kp = StaticKeypair::generate();
+        let middle = HandshakeHandler::new(0x5555, kp, psk);
+
+        // ttl = 0 ⇒ relay must drop without forwarding.
+        let payload = encode_payload(0, 0x9999, 0x1111, b"noise");
+        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let actions = middle.handle_message(&payload, from);
+        assert!(
+            actions.is_empty(),
+            "ttl=0 packet must be dropped at the relay; got {} actions",
+            actions.len()
+        );
+
+        // Simulate a loop: a relay forwards a ttl=1 packet to another
+        // relay, which decrements to 0; that second relay must drop.
+        let payload = encode_payload(1, 0x9999, 0x1111, b"noise");
+        let actions = middle.handle_message(&payload, from);
+        assert_eq!(actions.len(), 1, "ttl=1 should still forward once");
+        let decremented = match actions.into_iter().next().unwrap() {
+            HandshakeAction::Forward { payload, .. } => {
+                let re = HandshakePayload::decode(payload.clone()).unwrap();
+                assert_eq!(re.ttl, 0, "after decrement ttl should be 0");
+                payload
+            }
+            _ => panic!("expected Forward"),
+        };
+        // Re-inject the decremented payload at another relay: drop.
+        let actions = middle.handle_message(&decremented, from);
+        assert!(
+            actions.is_empty(),
+            "the decremented (now ttl=0) payload must be dropped on the next hop"
+        );
     }
 
     /// Regression: `pending_initiator` is keyed only by `dest_node_id`.

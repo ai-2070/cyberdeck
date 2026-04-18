@@ -122,13 +122,26 @@ impl MigrationSubprotocolHandler {
                         // (safe: on_snapshot_ready is idempotent on the
                         // target side because it just re-derives the
                         // forward message we ignore), then reassemble.
-                        let _ = self.orchestrator.on_snapshot_ready(
+                        //
+                        // Errors are informational: the restore path below
+                        // is the authoritative check for whether the
+                        // snapshot is usable. We log at `debug` rather
+                        // than ignore so non-idempotent failures (e.g.,
+                        // unexpected phase transitions on a stale record)
+                        // are observable during triage.
+                        if let Err(e) = self.orchestrator.on_snapshot_ready(
                             daemon_origin,
                             snapshot_bytes.clone(),
                             seq_through,
                             chunk_index,
                             total_chunks,
-                        );
+                        ) {
+                            tracing::debug!(
+                                ?e,
+                                origin = format!("{:#x}", daemon_origin),
+                                "on_snapshot_ready (local target): ignored"
+                            );
+                        }
 
                         if let Some(out) = self.restore_on_target(
                             daemon_origin,
@@ -427,6 +440,9 @@ impl MigrationSubprotocolHandler {
             }
         };
 
+        // `source_node` is the daemon's pre-migration host — tracked here
+        // only for the target-handler's internal bookkeeping. It is NOT
+        // where `RestoreComplete` gets sent (see below).
         let source_node = self
             .orchestrator
             .source_node(daemon_origin)
@@ -455,12 +471,19 @@ impl MigrationSubprotocolHandler {
         // re-registration, is refused.
         self.target_handler.factories().remove(daemon_origin);
 
+        // Route `RestoreComplete` to the orchestrator, not the source.
+        // Only the orchestrator holds the migration record; sending to
+        // the source would fail with `DaemonNotFound` whenever the source
+        // and orchestrator are different nodes (including the collocated
+        // orchestrator+target case). `from_node` is the node that
+        // forwarded us this `SnapshotReady` — in the common topology
+        // (orchestrator → target) that IS the orchestrator.
         let reply = MigrationMessage::RestoreComplete {
             daemon_origin,
             restored_seq: seq_through,
         };
         Ok(Some(vec![OutboundMigrationMessage {
-            dest_node: source_node,
+            dest_node: from_node,
             payload: wire::encode(&reply)?,
         }]))
     }

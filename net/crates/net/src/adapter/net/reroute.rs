@@ -373,13 +373,25 @@ mod tests {
         let first_alt = rt.lookup(0x5555).unwrap();
         assert_ne!(first_alt, addr_b);
 
-        // The alternate also fails. Resolve its node_id to call on_failure.
+        // The alternate also fails. Temporarily remove B from the
+        // peer_addrs map before triggering its reroute, so the second
+        // on_failure is *forced* to pick something other than B. Without
+        // this, the reroute logic is free to land back on B — making a
+        // passing test meaningless because the routing table would end
+        // up pointing at B even with the buggy code.
         let first_alt_node_id = *peers
             .iter()
             .find(|e| *e.value() == first_alt)
             .unwrap()
             .key();
+        peers.remove(&0x2222u64);
         policy.on_failure(first_alt_node_id);
+        let second_alt = rt.lookup(0x5555).unwrap();
+        assert_ne!(
+            second_alt, addr_b,
+            "second reroute must pick a non-B alternate"
+        );
+        peers.insert(0x2222u64, addr_b);
 
         // B recovers. The original route must be restored to B, not to
         // the alternate that transiently held `next_hop` before the fix.

@@ -88,6 +88,10 @@ struct DispatchCtx {
     local_node_id: u64,
     peers: Arc<DashMap<u64, PeerInfo>>,
     addr_to_node: Arc<DashMap<SocketAddr, u64>>,
+    /// Node-id → addr map shared with the reroute policy. Must be kept in
+    /// sync with `peers` on every registration so the reroute policy can
+    /// resolve failed peers.
+    peer_addrs: Arc<DashMap<u64, SocketAddr>>,
     router: Arc<NetRouter>,
     failure_detector: Arc<FailureDetector>,
     inbound: InboundQueues,
@@ -530,6 +534,7 @@ impl MeshNode {
             local_node_id: self.node_id,
             peers: self.peers.clone(),
             addr_to_node: self.addr_to_node.clone(),
+            peer_addrs: self.peer_addrs.clone(),
             router: self.router.clone(),
             failure_detector: self.failure_detector.clone(),
             inbound: self.inbound.clone(),
@@ -1289,6 +1294,7 @@ impl MeshNode {
 
                 let socket = ctx.socket.clone();
                 let peers = ctx.peers.clone();
+                let peer_addrs = ctx.peer_addrs.clone();
                 let router = ctx.router.clone();
                 let packet_pool_size = ctx.packet_pool_size;
                 let default_reliable = ctx.default_reliable;
@@ -1312,10 +1318,16 @@ impl MeshNode {
                     };
                     match socket.send_to(&packet, relay_addr).await {
                         Ok(_) => {
-                            // Send succeeded — now register the peer and
-                            // route. Initiator should be able to complete
-                            // msg2 on its side and start sending routed
-                            // data immediately.
+                            // Send succeeded — register the peer, route,
+                            // and peer-addrs entry. The initiator will be
+                            // able to complete msg2 on its side and start
+                            // sending routed data immediately.
+                            //
+                            // `peer_addrs` must be kept in sync with
+                            // `peers` so the reroute policy can find this
+                            // peer's wire address; every other
+                            // registration path (connect/accept/
+                            // connect_via) already does this.
                             let session = Arc::new(NetSession::new(
                                 keys,
                                 relay_addr,
@@ -1330,6 +1342,7 @@ impl MeshNode {
                                     session,
                                 },
                             );
+                            peer_addrs.insert(peer_node_id, relay_addr);
                             router.add_route(peer_node_id, relay_addr);
                         }
                         Err(e) => {

@@ -69,8 +69,8 @@ Snapshot -> Transfer -> Restore -> Replay -> Cutover -> Complete
 | **Transfer** | Send snapshot to target node via `SUBPROTOCOL_MIGRATION` (0x0500), chunked if needed |
 | **Restore** | Reassemble chunks, resolve local `DaemonFactoryRegistry` entry, call `DaemonHost::from_snapshot()` and register the daemon on target. Target starts buffering in-flight events. |
 | **Replay** | Target replays buffered events in strict sequence order from source, drains to daemon |
-| **Cutover** | Source stops accepting writes and cleans up; daemon is unregistered from source registry |
-| **Complete** | Orchestrator emits `ActivateTarget` to target; target calls `activate()`, drains remaining events, replies with `ActivateAck`; orchestrator removes the migration record |
+| **Cutover** | Source stops accepting writes; routing switches so new events go to the target. Source does not tear down the daemon yet. |
+| **Complete** | Source unregisters the daemon from its local registry; orchestrator emits `ActivateTarget`; target calls `activate()`, drains remaining events, replies with `ActivateAck`; orchestrator removes the migration record |
 
 Phase transitions are validated -- calling `set_snapshot()` in the wrong phase returns `MigrationError::WrongPhase`. The snapshot's `origin_hash` is verified against the daemon being migrated.
 
