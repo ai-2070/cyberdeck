@@ -3,7 +3,7 @@
 //! This module provides:
 //! - `RoutingHeader`: Fixed-size header for multi-hop routing
 //! - `RoutingTable`: Stream-to-destination mapping
-//! - `StreamStats`: Per-stream statistics for fairness monitoring
+//! - `SchedulerStreamStats`: Per-stream statistics for fairness monitoring
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
@@ -194,7 +194,7 @@ impl RoutingHeader {
 
 /// Per-stream statistics for fairness monitoring
 #[derive(Debug)]
-pub struct StreamStats {
+pub struct SchedulerStreamStats {
     /// Packets received
     pub packets_in: AtomicU64,
     /// Packets forwarded
@@ -209,7 +209,7 @@ pub struct StreamStats {
     last_activity: AtomicU64,
 }
 
-impl StreamStats {
+impl SchedulerStreamStats {
     /// Create new stream stats
     pub fn new() -> Self {
         Self {
@@ -277,7 +277,7 @@ impl StreamStats {
     }
 }
 
-impl Default for StreamStats {
+impl Default for SchedulerStreamStats {
     fn default() -> Self {
         Self::new()
     }
@@ -323,7 +323,7 @@ pub struct RoutingTable {
     /// Node ID -> next hop address
     routes: DashMap<u64, RouteEntry>,
     /// Stream ID -> per-stream stats
-    stream_stats: DashMap<u64, StreamStats>,
+    stream_stats: DashMap<u64, SchedulerStreamStats>,
     /// Local node ID
     local_id: u64,
     /// Maximum age a route may have before `lookup` rejects it.
@@ -457,7 +457,7 @@ impl RoutingTable {
     pub fn get_stream_stats(
         &self,
         stream_id: u64,
-    ) -> dashmap::mapref::one::Ref<'_, u64, StreamStats> {
+    ) -> dashmap::mapref::one::Ref<'_, u64, SchedulerStreamStats> {
         self.stream_stats.entry(stream_id).or_default().downgrade()
     }
 
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn test_stream_stats() {
-        let stats = StreamStats::new();
+        let stats = SchedulerStreamStats::new();
 
         stats.record_in(100);
         stats.record_in(200);

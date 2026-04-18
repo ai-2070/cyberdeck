@@ -91,16 +91,57 @@ pub struct NetSession {
 
 ## Stream Routing & Fair Scheduling
 
-`FairScheduler` provides round-robin fairness across streams. Each stream gets a configurable quantum of packets per round. Priority streams can bypass the fairness queue.
+`FairScheduler` provides round-robin fairness across streams. Each stream gets a configurable quantum of packets per round, multiplied by an opt-in per-stream `fairness_weight` (default 1). Priority streams can bypass the fairness queue.
 
 ```rust
 pub struct RouterConfig {
     pub max_queue_depth: usize,   // Per-stream queue limit
-    pub fair_quantum: usize,      // Packets per stream per round
+    pub fair_quantum: usize,      // Base packets per stream per round
 }
 ```
 
-Stream IDs are derived via xxh3 hashing of message keys, providing deterministic stream assignment.
+Stream IDs are opaque `u64` values. `stream_id_from_key(&str)` is the canonical helper for deterministic derivation from a name; callers are free to use anything.
+
+## Streams (caller contract)
+
+A stream is one logical channel within an encrypted session to a single peer. Multiple streams share the session's cipher and socket; they have independent sequence numbers, reliability state, and fair-scheduler weight.
+
+**Opening and closing.**
+
+```rust
+let stream = mesh.open_stream(peer_node_id, stream_id, StreamConfig::new()
+    .with_reliability(Reliability::Reliable)
+    .with_fairness_weight(1)
+    .with_close_behavior(CloseBehavior::DropAndClose))?;
+
+mesh.send_on_stream(&stream, &events).await?;
+
+mesh.close_stream(peer_node_id, stream_id);
+```
+
+- `open_stream` is **idempotent** for a given `(peer_node_id, stream_id)`. Re-opening returns a handle backed by the same underlying state; a config argument that differs from the first open is logged and ignored (first-open wins).
+- `close_stream` drops the `StreamState` and stops inbound delivery for the stream. `CloseBehavior::DrainThenClose` is honored to the extent the scheduler has already flushed; there is no wire "drain" signal in v1.
+
+**Lifecycle.**
+
+- `StreamState` carries a `last_activity_ns` timestamp refreshed on every send and receive.
+- The `MeshNode` heartbeat loop periodically evicts streams idle longer than `MeshNodeConfig::stream_idle_timeout` (default 5 min) and enforces the `max_streams` cap (default 4096) via LRU eviction, both logged (`reason=idle_timeout` or `reason=cap_exceeded`).
+
+**Ordering contract.**
+
+- `Reliability::Reliable` — FIFO delivery within the stream. Gaps trigger NACK-driven retransmission; the receive side reorders into sequence.
+- `Reliability::FireAndForget` — best-effort. Sequence numbers are monotonic on the wire so callers who care can detect loss / reorder themselves, but the transport performs no recovery.
+- **No ordering across streams.** A later-sent packet on stream A may arrive before an earlier-sent packet on stream B. Fair scheduling prevents starvation; cross-stream timing is unsynchronized.
+
+**Stream IDs are opaque.** No range has reserved meaning at the transport layer. Subprotocol dispatch uses the `subprotocol_id` field in the header; do not conflate.
+
+**Not multicast.** A stream is one flow to one peer. Sending the same payload to multiple peers is an application / daemon / channel-layer concern, not transport.
+
+**Back-pressure.** v1 surfaces queue-full only on the forwarding path (router scheduler). Local outbound `send_on_stream` returns `StreamError::Transport` for socket-level failures; `StreamError::WouldBlock` is reserved for a future credit-windowed flow-control swap that does not move the caller API.
+
+**Fairness weight.** `StreamConfig::fairness_weight` is a quantum multiplier on the `FairScheduler`. It takes effect when a packet for this stream transits this node as a forwarder. Local outbound traffic currently bypasses the scheduler; the weight is still persisted so that a future refactor routing local outbound through the scheduler makes it load-bearing end-to-end without API churn.
+
+**Statistics.** `mesh.stream_stats(peer, stream_id) -> Option<StreamStats>` and `mesh.all_stream_stats(peer) -> Vec<(u64, StreamStats)>` snapshot per-stream counters (tx/rx seq, inbound queue depth, last-activity timestamp, active flag).
 
 ## Multi-Hop Forwarding
 

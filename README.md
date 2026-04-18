@@ -358,14 +358,16 @@ For implementation details — capabilities, proximity graphs, subnets, channels
 
 ## Status
 
-Net is a working protocol, not a paper design. 921 tests verify the implementation across every layer of the stack.
+Net is a working protocol, not a paper design. 928 tests verify the implementation across every layer of the stack.
 
 **What works today:**
 
 - **Encrypted point-to-point transport.** Noise NKpsk0 handshake, ChaCha20-Poly1305 per-packet encryption, counter-based nonces. Tested over real UDP between adapter instances.
 - **Multi-peer mesh runtime.** `MeshNode` composes encrypted sessions, routing, failure detection, and subprotocol dispatch behind a single UDP socket. Three-node tests prove the full triangle: handshake, data flow, bidirectional, stream isolation, sustained throughput.
 - **Relay forwarding without decryption.** A sends to C through B. B forwards the packet using only the routing header — never decrypts the payload. Verified by AEAD tamper detection: a malicious relay that flips a single byte is caught and the packet is rejected.
-- **Handshake relay via subprotocol.** A node with no direct UDP path to its peer can complete a Noise NKpsk0 handshake through an already-connected relay. Handshake messages ride inside `SUBPROTOCOL_HANDSHAKE` over existing encrypted sessions; the relay sees the authenticated Noise bytes but can't forge them or derive the post-handshake session keys. After handshake, A↔C data flows through B via `send_routed`, with B unable to decrypt.
+- **Handshake as a routed Net packet.** A node with no direct UDP path to its peer completes a Noise NKpsk0 handshake through already-connected relays. Handshake packets carry the `HANDSHAKE` flag in the routing header and ride the same forwarding path as data packets — no dedicated subprotocol, no special-case wire format. The prologue binds the routing header's `(src, dest)` so relays cannot rebind a handshake to a different peer. Works end-to-end over multi-hop chains.
+- **Multi-hop routing discovery.** Route install is driven by pingwaves with distance-vector semantics: each node advertises reachable destinations with metrics, neighbors prefer lower-metric routes, and stale entries age out. ProximityGraph-guided rerouting queries `path_to()` for multi-hop alternates before falling back to direct peers.
+- **Stream multiplexing.** Multiple independent streams per peer, each with its own sequence space, per-stream `StreamState`, and fairness weight (quantum multiplier) in the round-robin scheduler. Idempotent `open_stream`/`close_stream`, idle timeout + max-stream cap enforced by the heartbeat loop, public `stream_stats`/`all_stream_stats` accessors. `Reliability::{FireAndForget, Reliable}` selects per-stream delivery mode.
 - **Automatic rerouting.** When a relay node dies, the `ReroutePolicy` watches the failure detector and automatically updates the routing table to route through an alternate peer. When the failed peer recovers, the original route is restored. No manual intervention, no data loss across the reroute boundary.
 - **Failure detection over real sockets.** Heartbeat timeout → suspected → failed → recovered lifecycle, proven through the MeshNode runtime with configurable timing.
 - **Full 6-phase migration lifecycle (Mikoshi).** The entire chain — TakeSnapshot → SnapshotReady → Restore → Replay → Cutover → Cleanup → Activate — runs autonomously over encrypted UDP. The orchestrator chains messages through the subprotocol response path; the target reassembles chunked snapshots, restores the daemon via a local `DaemonFactoryRegistry`, drains buffered events in causal order, and activates as the authoritative copy once the source has cleaned up. End-to-end three-node test (orchestrator A, source B, target C) verifies the daemon ends up registered on C, unregistered from B, and the orchestrator record is cleared.
@@ -376,9 +378,8 @@ Net is a working protocol, not a paper design. 921 tests verify the implementati
 
 **What needs protocol work:**
 
-- **Multi-hop reroute testing.** ProximityGraph-guided rerouting is implemented — `path_to()` is queried for multi-hop alternates before falling back to direct peers. End-to-end tests require 4+ nodes to exercise the multi-hop path; current tests validate the mechanism with direct peers.
-- **Multi-hop handshake relay.** Handshake relay currently requires the relay to have a direct session with both initiator and responder. Chains longer than one relay would need the forwarding path to re-encrypt between successive hops, analogous to how routed data packets are forwarded today.
-- **Secure keypair transfer for migration.** The `DaemonFactoryRegistry` assumes the target has been provisioned with the daemon's `EntityKeypair` out-of-band. Transferring the private key securely from source to target at migration time is a separate security design problem.
+- **Secure keypair transfer for migration.** The `DaemonFactoryRegistry` assumes the target has been provisioned with the daemon's `EntityKeypair` out-of-band (`KeyMode::PreProvisioned` is actionable today). `KeyMode::{Derived, Transfer}` and the Key Orchestrator / Key Agent control-plane that would run over CortEX are designed in [`KEY_MIGRATION_PLAN.md`](net/crates/net/docs/KEY_MIGRATION_PLAN.md) but not yet implemented — CortEX itself is forward-looking.
+- **Per-stream credit-window back-pressure.** Stream multiplexing v1 surfaces `StreamError::WouldBlock` as an API variant, but the send path currently returns only `Transport` errors; explicit credit accounting and pushback to senders is the next increment.
 
 ## SDKs
 

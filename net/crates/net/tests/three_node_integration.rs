@@ -3689,6 +3689,188 @@ async fn test_mesh_handshake_relay_bidirectional() {
 }
 
 // ============================================================================
+// Stream multiplexing
+// ============================================================================
+
+/// Two streams between the same pair of peers, distinct stream IDs,
+/// distinct stream stats, and data flows on both. Verifies that:
+/// 1. `open_stream` returns a handle backed by per-stream state.
+/// 2. `send_on_stream` ships events that land in the right shard inbound.
+/// 3. `all_stream_stats` reports both streams' tx_seq independently.
+#[tokio::test]
+async fn test_stream_multiplex_two_streams_same_peer() {
+    use net::adapter::net::{Reliability, StreamConfig};
+
+    let ports = find_ports(2).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(4)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(30))
+    };
+
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let pub_b = *b.public_key();
+
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    a.start();
+    b.start();
+
+    // Open two streams with distinct reliability modes.
+    let s_fire = a
+        .open_stream(
+            nid_b,
+            111,
+            StreamConfig::new().with_reliability(Reliability::FireAndForget),
+        )
+        .unwrap();
+    let s_rel = a
+        .open_stream(
+            nid_b,
+            222,
+            StreamConfig::new().with_reliability(Reliability::Reliable),
+        )
+        .unwrap();
+
+    let events_fire: Vec<Bytes> = (0..3)
+        .map(|i| Bytes::from(format!(r#"{{"stream":"fire","i":{}}}"#, i)))
+        .collect();
+    let events_rel: Vec<Bytes> = (0..5)
+        .map(|i| Bytes::from(format!(r#"{{"stream":"rel","i":{}}}"#, i)))
+        .collect();
+
+    a.send_on_stream(&s_fire, &events_fire).await.unwrap();
+    a.send_on_stream(&s_rel, &events_rel).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Both streams recorded their sends independently.
+    let all = a.all_stream_stats(nid_b);
+    let fire_stats = all
+        .iter()
+        .find(|(sid, _)| *sid == 111)
+        .map(|(_, s)| *s)
+        .expect("stream 111 stats");
+    let rel_stats = all
+        .iter()
+        .find(|(sid, _)| *sid == 222)
+        .map(|(_, s)| *s)
+        .expect("stream 222 stats");
+    assert_eq!(
+        fire_stats.tx_seq, 1,
+        "fire stream sent 1 packet (3 events fit in one)"
+    );
+    assert_eq!(
+        rel_stats.tx_seq, 1,
+        "rel stream sent 1 packet (5 events fit in one)"
+    );
+    assert!(fire_stats.active);
+    assert!(rel_stats.active);
+
+    // Single-stream accessor matches.
+    let fire_solo = a.stream_stats(nid_b, 111).unwrap();
+    assert_eq!(fire_solo.tx_seq, 1);
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// `open_stream` is idempotent for a given `(peer, stream_id)`: re-opens
+/// return handles backed by the same underlying state. Closing and then
+/// re-opening creates fresh state.
+#[tokio::test]
+async fn test_stream_open_close_idempotency() {
+    use net::adapter::net::{Reliability, StreamConfig};
+
+    let ports = find_ports(2).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+    };
+
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let pub_b = *b.public_key();
+
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    // First open creates state.
+    let first = a
+        .open_stream(
+            nid_b,
+            77,
+            StreamConfig::new().with_reliability(Reliability::Reliable),
+        )
+        .unwrap();
+    assert_eq!(first.stream_id(), 77);
+    a.send_on_stream(&first, &[Bytes::from_static(b"{}")])
+        .await
+        .unwrap();
+    let stats1 = a.stream_stats(nid_b, 77).unwrap();
+    assert_eq!(stats1.tx_seq, 1);
+
+    // Second open: same tx_seq state — open is idempotent.
+    let second = a
+        .open_stream(
+            nid_b,
+            77,
+            StreamConfig::new().with_reliability(Reliability::Reliable),
+        )
+        .unwrap();
+    a.send_on_stream(&second, &[Bytes::from_static(b"{}")])
+        .await
+        .unwrap();
+    let stats2 = a.stream_stats(nid_b, 77).unwrap();
+    assert_eq!(
+        stats2.tx_seq, 2,
+        "second send on re-opened stream continues tx_seq"
+    );
+
+    // Close + re-open creates fresh state.
+    a.close_stream(nid_b, 77);
+    assert!(a.stream_stats(nid_b, 77).is_none());
+    let third = a.open_stream(nid_b, 77, StreamConfig::new()).unwrap();
+    a.send_on_stream(&third, &[Bytes::from_static(b"{}")])
+        .await
+        .unwrap();
+    let stats3 = a.stream_stats(nid_b, 77).unwrap();
+    assert_eq!(stats3.tx_seq, 1, "after close+reopen tx_seq resets");
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+// ============================================================================
 // Multi-hop routing discovery
 // ============================================================================
 

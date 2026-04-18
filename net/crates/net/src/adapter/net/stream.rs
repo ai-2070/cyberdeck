@@ -1,0 +1,199 @@
+//! Application-facing stream API over `NetSession`.
+//!
+//! A `Stream` is a typed handle to one logical channel in an encrypted
+//! session to a single peer. Multiple streams share one session, one
+//! Noise cipher, and one UDP socket — but have **independent**:
+//!
+//! - Sequence numbers (per-stream `tx_seq` / `rx_seq`).
+//! - Reliability mode (`FireAndForget` or `Reliable`), chosen at `open_stream`.
+//! - Fairness weight in the forwarding router's `FairScheduler`.
+//! - Statistics.
+//!
+//! # Contract
+//!
+//! - **Ordering within a stream:** FIFO for `Reliable` streams (per-stream
+//!   sequence + NACK-driven in-order delivery), best-effort monotonic-seq
+//!   for `FireAndForget`.
+//! - **No ordering across streams.** Fair scheduling prevents starvation
+//!   but timing is not synchronized.
+//! - **Stream IDs are opaque `u64`s.** No range has reserved meaning at
+//!   the transport layer. Callers derive IDs however they want —
+//!   `stream_id_from_key(&str)` is the canonical helper for a
+//!   deterministic derivation from a name.
+//! - **Not multicast.** A stream is one logical flow to one peer. Sending
+//!   the same content to multiple peers is an app / daemon / channel
+//!   concern that sits a layer above the transport.
+
+use std::fmt;
+
+/// Reliability mode chosen per stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reliability {
+    /// Send packets and forget. No retransmission, no ordering recovery,
+    /// no ACK/NACK tracking. Monotonic sequence numbers on the wire so
+    /// callers that care can detect gaps / reorder themselves.
+    FireAndForget,
+    /// Retransmit lost packets based on NACKs from the receiver. In-order
+    /// delivery within the stream.
+    Reliable,
+}
+
+impl Reliability {
+    /// Whether this mode needs reliability state tracking.
+    #[inline]
+    pub(crate) fn is_reliable(self) -> bool {
+        matches!(self, Reliability::Reliable)
+    }
+}
+
+/// What to do with pending outbound packets when a stream is closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseBehavior {
+    /// Wait for the stream's pending outbound packets to leave the
+    /// scheduler before tearing down state. "Durable close."
+    DrainThenClose,
+    /// Drop pending outbound packets immediately. "Fast close."
+    DropAndClose,
+}
+
+/// Per-stream configuration supplied at `open_stream` time.
+///
+/// Configuration is immutable for the lifetime of a stream. Re-opening
+/// the same `(peer, stream_id)` with different config is a no-op with a
+/// warning log — the original config wins.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamConfig {
+    /// Reliability mode. Defaults to `FireAndForget`.
+    pub reliability: Reliability,
+    /// Outbound queue depth cap for this stream (packets). `0` means
+    /// "inherit the router's configured `max_queue_depth`". Exceeding
+    /// the cap on `Stream::send` returns `StreamError::WouldBlock`.
+    pub window_bytes: u32,
+    /// Fair-scheduler quantum multiplier. `1` is equal-share; higher
+    /// means this stream gets proportionally more packets per round.
+    pub fairness_weight: u8,
+    /// What to do with pending outbound packets on close.
+    pub close_behavior: CloseBehavior,
+}
+
+impl Default for StreamConfig {
+    fn default() -> Self {
+        Self {
+            reliability: Reliability::FireAndForget,
+            window_bytes: 0,
+            fairness_weight: 1,
+            close_behavior: CloseBehavior::DropAndClose,
+        }
+    }
+}
+
+impl StreamConfig {
+    /// Start from defaults.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the reliability mode.
+    pub fn with_reliability(mut self, reliability: Reliability) -> Self {
+        self.reliability = reliability;
+        self
+    }
+
+    /// Set the per-stream window (queue depth cap).
+    pub fn with_window_bytes(mut self, bytes: u32) -> Self {
+        self.window_bytes = bytes;
+        self
+    }
+
+    /// Set the fair-scheduler weight (1 = equal share; higher = more).
+    pub fn with_fairness_weight(mut self, weight: u8) -> Self {
+        // 0 would starve this stream; clamp up to 1.
+        self.fairness_weight = weight.max(1);
+        self
+    }
+
+    /// Set the close behavior.
+    pub fn with_close_behavior(mut self, behavior: CloseBehavior) -> Self {
+        self.close_behavior = behavior;
+        self
+    }
+}
+
+/// Errors a `Stream::send` call can surface to the caller.
+#[derive(Debug)]
+pub enum StreamError {
+    /// The stream's outbound queue is full. No packets were enqueued.
+    /// Caller decides whether to retry, drop, or surface further.
+    WouldBlock,
+    /// The underlying session is gone (peer disconnected, never
+    /// connected, or the stream was closed).
+    NotConnected,
+    /// Underlying transport failure (socket error, encryption error).
+    /// Wraps the originating adapter-level error's message.
+    Transport(String),
+}
+
+impl fmt::Display for StreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StreamError::WouldBlock => write!(f, "stream would block (queue full)"),
+            StreamError::NotConnected => write!(f, "stream not connected"),
+            StreamError::Transport(msg) => write!(f, "stream transport error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for StreamError {}
+
+/// Per-stream statistics snapshot. Cheap to produce (reads a handful of
+/// atomics) and safe to poll at arbitrary frequency.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamStats {
+    /// Next TX sequence number. Reflects "how many packets this stream
+    /// has enqueued since open" because sequences start at 0.
+    pub tx_seq: u64,
+    /// Highest RX sequence number observed so far.
+    pub rx_seq: u64,
+    /// Events currently buffered on the inbound queue (waiting for the
+    /// caller to poll).
+    pub inbound_pending: u64,
+    /// Nanoseconds since Unix epoch of the last inbound or outbound
+    /// activity. Used internally for idle eviction; surfaced for
+    /// diagnostics.
+    pub last_activity_ns: u64,
+    /// Whether the stream is active (not closed).
+    pub active: bool,
+}
+
+/// A typed handle to a logical stream within a peer session.
+///
+/// Created by [`MeshNode::open_stream`]; dropped at any point without
+/// affecting the underlying `StreamState` — the stream is removed only
+/// when [`MeshNode::close_stream`] is explicitly called, when it's
+/// idle-evicted, or when its parent session tears down.
+#[derive(Debug, Clone)]
+pub struct Stream {
+    pub(crate) peer_node_id: u64,
+    pub(crate) stream_id: u64,
+    pub(crate) config: StreamConfig,
+}
+
+impl Stream {
+    /// The peer this stream terminates at.
+    #[inline]
+    pub fn peer_node_id(&self) -> u64 {
+        self.peer_node_id
+    }
+
+    /// The stream id. Caller-chosen, opaque `u64`.
+    #[inline]
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    /// The config this stream was opened with.
+    #[inline]
+    pub fn config(&self) -> &StreamConfig {
+        &self.config
+    }
+}

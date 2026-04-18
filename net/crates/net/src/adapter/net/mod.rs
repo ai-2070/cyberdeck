@@ -50,6 +50,7 @@ mod route;
 mod router;
 mod session;
 pub mod state;
+mod stream;
 pub mod subnet;
 pub mod subprotocol;
 mod swarm;
@@ -100,7 +101,7 @@ pub use proxy::{
 pub use reliability::{FireAndForget, ReliabilityMode, ReliableStream};
 pub use reroute::ReroutePolicy;
 pub use route::{
-    AggregateStats, RouteEntry, RouteFlags, RoutingHeader, RoutingTable, StreamStats,
+    AggregateStats, RouteEntry, RouteFlags, RoutingHeader, RoutingTable, SchedulerStreamStats,
     ROUTING_HEADER_SIZE,
 };
 pub use router::{FairScheduler, NetRouter, RouteAction, RouterConfig, RouterError, RouterStats};
@@ -110,6 +111,7 @@ pub use state::{
     LogIndex, ObservedHorizon, SnapshotStore, StateSnapshot, CAUSAL_LINK_SIZE, SUBPROTOCOL_CAUSAL,
     SUBPROTOCOL_SNAPSHOT,
 };
+pub use stream::{CloseBehavior, Reliability, Stream, StreamConfig, StreamError, StreamStats};
 pub use subnet::{DropReason, ForwardDecision, SubnetGateway, SubnetId, SubnetPolicy, SubnetRule};
 pub use subprotocol::{
     negotiate, MigrationSubprotocolHandler, NegotiatedSet, OutboundMigrationMessage,

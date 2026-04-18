@@ -53,6 +53,7 @@ use super::reroute::ReroutePolicy;
 use super::route::{RoutingHeader, ROUTING_HEADER_SIZE};
 use super::router::{NetRouter, RouterConfig};
 use super::session::NetSession;
+use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subprotocol::MigrationSubprotocolHandler;
 use super::transport::{NetSocket, PacketReceiver, ParsedPacket, SocketBufferConfig};
 use tokio::sync::oneshot;
@@ -153,6 +154,15 @@ pub struct MeshNodeConfig {
     pub max_queue_depth: usize,
     /// Fair scheduling quantum (packets per stream per round).
     pub fair_quantum: usize,
+    /// Idle timeout before a stream is evicted from its session. A
+    /// stream with no send or receive activity for this long is dropped
+    /// on the heartbeat-loop sweep. Protects against unbounded
+    /// `StreamState` growth under workloads that hash into stream ids.
+    pub stream_idle_timeout: Duration,
+    /// Hard cap on the number of streams per session. When exceeded,
+    /// the least-recently-active stream is evicted via the same path as
+    /// `close_stream` (logged with `reason=cap_exceeded`).
+    pub max_streams: usize,
 }
 
 impl MeshNodeConfig {
@@ -171,6 +181,8 @@ impl MeshNodeConfig {
             socket_buffers: SocketBufferConfig::for_testing(),
             max_queue_depth: 1024,
             fair_quantum: 16,
+            stream_idle_timeout: Duration::from_secs(300),
+            max_streams: 4096,
         }
     }
 
@@ -1124,6 +1136,10 @@ impl MeshNode {
         // pingwave emission; indirect (pingwave-learned) routes age out
         // here if their origin goes silent.
         let max_route_age = self.config.session_timeout.saturating_mul(3);
+        // Stream lifecycle: drop idle streams past `stream_idle_timeout`
+        // and enforce `max_streams` cap via LRU.
+        let stream_idle_timeout = self.config.stream_idle_timeout;
+        let max_streams = self.config.max_streams;
 
         tokio::spawn(async move {
             while !shutdown.load(Ordering::Acquire) {
@@ -1151,6 +1167,18 @@ impl MeshNode {
                         // Drop routes whose `updated_at` is past the age
                         // limit. Small scan of the routing table; cheap.
                         router.routing_table().sweep_stale(max_route_age);
+
+                        // Sweep idle streams per-session and enforce the
+                        // per-session `max_streams` cap. Each session is
+                        // independent; large deployments with many peers
+                        // each with many streams pay O(P + total_streams).
+                        for entry in peers.iter() {
+                            entry.value().session.evict_idle_streams(
+                                stream_idle_timeout,
+                                max_streams,
+                                "idle_timeout",
+                            );
+                        }
                     }
                     _ = shutdown_notify.notified() => {
                         break;
@@ -1396,6 +1424,195 @@ impl MeshNode {
         drop(builder);
         session.touch();
         Ok(())
+    }
+
+    // ── Stream API ─────────────────────────────────────────────────────
+
+    /// Open (or look up) a logical stream to a connected peer.
+    ///
+    /// A stream is one ordered, independently reliability-configured
+    /// channel inside the encrypted session to `peer_node_id`. Multiple
+    /// streams share one session, one cipher, and one UDP socket, but
+    /// have independent sequence numbers and reliability state. See
+    /// [`Stream`] for the full contract.
+    ///
+    /// **Idempotent:** repeated calls for the same `(peer_node_id,
+    /// stream_id)` return handles backed by the same underlying state;
+    /// a config argument that differs from the first call's is ignored
+    /// with a warning log. Close + re-open to change a stream's config.
+    pub fn open_stream(
+        &self,
+        peer_node_id: u64,
+        stream_id: u64,
+        config: StreamConfig,
+    ) -> Result<Stream, AdapterError> {
+        let peer = self.peers.get(&peer_node_id).ok_or_else(|| {
+            AdapterError::Connection(format!(
+                "open_stream: no session for peer {:#x}",
+                peer_node_id
+            ))
+        })?;
+        let reliable = config.reliability.is_reliable();
+        peer.session
+            .open_stream_with(stream_id, reliable, config.fairness_weight);
+        // Propagate the weight to the router's fair scheduler so
+        // forwarded traffic on this stream (e.g., multi-hop relays
+        // where we're an intermediate) respects the weight too. v1
+        // caveat: local outbound sends via `send_on_stream` bypass the
+        // scheduler; the weight only becomes observable on the wire
+        // when a packet with this stream_id transits *this* node as
+        // a forwarder. Documented in STREAM_MULTIPLEXING_PLAN.md.
+        self.router
+            .scheduler()
+            .set_stream_weight(stream_id, config.fairness_weight);
+        // Opportunistic eviction: if this open just pushed us over the
+        // cap, trim via the same path as close_stream (idle==0 means
+        // only the cap-exceeded pass runs).
+        if peer.session.stream_count() > self.config.max_streams {
+            peer.session.evict_idle_streams(
+                Duration::from_nanos(u64::MAX),
+                self.config.max_streams,
+                "cap_exceeded",
+            );
+        }
+        Ok(Stream {
+            peer_node_id,
+            stream_id,
+            config,
+        })
+    }
+
+    /// Close a stream: drop its `StreamState` from the session, ending
+    /// delivery of any buffered inbound events for the stream and
+    /// dropping outbound packets that haven't hit the wire yet.
+    /// Idempotent. `CloseBehavior::DrainThenClose` is honored only to
+    /// the extent the router's scheduler has already flushed; there is
+    /// no wire "drain-then-close" signal in v1.
+    pub fn close_stream(&self, peer_node_id: u64, stream_id: u64) {
+        if let Some(peer) = self.peers.get(&peer_node_id) {
+            peer.session.close_stream(stream_id);
+        }
+    }
+
+    /// Send a batch of events on an explicit stream.
+    ///
+    /// Uses the stream's reliability mode from its original `open_stream`
+    /// config. `WouldBlock` is reserved for a future credit-windowed
+    /// flow-control implementation — v1 returns `Transport` for any
+    /// underlying send failure and success otherwise.
+    pub async fn send_on_stream(
+        &self,
+        stream: &Stream,
+        events: &[Bytes],
+    ) -> Result<(), StreamError> {
+        let peer = self
+            .peers
+            .get(&stream.peer_node_id)
+            .ok_or(StreamError::NotConnected)?;
+        let peer_addr = peer.addr;
+        let session = peer.session.clone();
+        drop(peer);
+
+        if self.partition_filter.contains(&peer_addr) {
+            return Ok(()); // matches send_to_peer's silent drop
+        }
+
+        let stream_id = stream.stream_id;
+        let reliable = stream.config.reliability.is_reliable();
+
+        let pool = session.thread_local_pool();
+        let mut builder = pool.get();
+
+        let mut current_batch: Vec<Bytes> = Vec::with_capacity(64);
+        let mut current_size = 0usize;
+
+        for event in events {
+            let frame_size = EventFrame::LEN_SIZE + event.len();
+            if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE && !current_batch.is_empty() {
+                let seq = {
+                    let state = session.get_or_create_stream(stream_id);
+                    state.next_tx_seq()
+                };
+                let flags = if reliable {
+                    PacketFlags::RELIABLE
+                } else {
+                    PacketFlags::NONE
+                };
+                let packet = builder.build(stream_id, seq, &current_batch, flags);
+                self.socket
+                    .send_to(&packet, peer_addr)
+                    .await
+                    .map_err(|e| StreamError::Transport(format!("send failed: {}", e)))?;
+                current_batch.clear();
+                current_size = 0;
+            }
+            current_batch.push(event.clone());
+            current_size += frame_size;
+        }
+
+        if !current_batch.is_empty() {
+            let seq = {
+                let state = session.get_or_create_stream(stream_id);
+                state.next_tx_seq()
+            };
+            let flags = if reliable {
+                PacketFlags::RELIABLE
+            } else {
+                PacketFlags::NONE
+            };
+            let packet = builder.build(stream_id, seq, &current_batch, flags);
+            self.socket
+                .send_to(&packet, peer_addr)
+                .await
+                .map_err(|e| StreamError::Transport(format!("send failed: {}", e)))?;
+        }
+
+        drop(builder);
+        session.touch();
+        Ok(())
+    }
+
+    /// Snapshot of per-stream stats for a single stream.
+    ///
+    /// Returns `None` if either the peer or the stream doesn't exist.
+    pub fn stream_stats(&self, peer_node_id: u64, stream_id: u64) -> Option<StreamStats> {
+        let peer = self.peers.get(&peer_node_id)?;
+        let state = peer.session.get_stream(stream_id)?;
+        Some(StreamStats {
+            tx_seq: state.current_tx_seq(),
+            rx_seq: state.current_rx_seq(),
+            inbound_pending: state.inbound_len() as u64,
+            last_activity_ns: state.last_activity_ns(),
+            active: state.is_active(),
+        })
+    }
+
+    /// Snapshot of per-stream stats for every stream in the session to
+    /// `peer_node_id`. Empty vec if the peer doesn't exist.
+    pub fn all_stream_stats(&self, peer_node_id: u64) -> Vec<(u64, StreamStats)> {
+        let peer = match self.peers.get(&peer_node_id) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+        let session = peer.session.clone();
+        drop(peer);
+        session
+            .stream_ids()
+            .into_iter()
+            .filter_map(|sid| {
+                let state = session.get_stream(sid)?;
+                Some((
+                    sid,
+                    StreamStats {
+                        tx_seq: state.current_tx_seq(),
+                        rx_seq: state.current_rx_seq(),
+                        inbound_pending: state.inbound_len() as u64,
+                        last_activity_ns: state.last_activity_ns(),
+                        active: state.is_active(),
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// Connect to a peer whose first hop on the wire is `relay_addr`.
