@@ -161,6 +161,32 @@ Nodes advertise migration support through the capability graph. `SubprotocolRegi
 
 During migration, a `SuperpositionState` tracks the entity's observational phase. The entity exists on both nodes briefly during replay, then collapses to the target at cutover. See [CONTINUITY.md](CONTINUITY.md) for details.
 
+### What this enables: immortal daemons
+
+With all six phases wired over the subprotocol, a daemon's *worldline* — its causal chain and entity identity — survives the host node going away. The orchestrator fires `start_migration(origin, source, target)` once; every subsequent step (snapshot, reassembly, restore, buffered-event drain, replay, cutover, source cleanup, target activation) chains autonomously through `SUBPROTOCOL_MIGRATION` messages. No human in the loop, no hand-off script, no per-migration state outside the nodes themselves.
+
+**What the daemon keeps across a move:**
+
+- **`EntityId`** — the ed25519 public key is part of the snapshot. Clients addressing the daemon by origin don't notice the move.
+- **Causal-chain sequence.** The target resumes at `snapshot.through_seq + 1`. Events produced before cutover and events produced after cutover form a single contiguous chain; observers can verify continuity via `CausalLink.parent_hash`.
+- **Observed horizon.** `StateSnapshot.horizon` travels with the daemon, so dependency tracking against other entities doesn't reset.
+- **In-flight events.** Events that arrived on the source while the migration was flying are buffered there, shipped to the target in `BufferedEvents`, and replayed in strict sequence order. Nothing is dropped.
+- **Routing.** Peers reach the daemon by its `origin_hash`, which didn't change. The routing plane (`SUBPROTOCOL_MIGRATION` cleanup on the source + the target's existing session plumbing) is the only thing that needs to update, and it does.
+
+**What "immortal" does not cover:**
+
+- **Host crash before `SnapshotReady`.** If the source dies before it produces a snapshot the orchestrator can forward, there is no state to migrate. `ReplicaGroup` / `StandbyGroup` are the answer for workloads that cannot tolerate this — they keep a warm copy running.
+- **Keypair transport.** The target's `DaemonFactoryRegistry` must already carry the daemon's `EntityKeypair` — today that's an out-of-band provisioning step, intentionally out of scope for this subprotocol. Treating the private key as sensitive, and moving it from source to target securely at migration time, is a separate security problem.
+- **Byzantine orchestrators.** A malicious orchestrator could instruct targets to drop the daemon (`MigrationFailed`) or redirect to an attacker-controlled node. Orchestrator trust is a deployment concern, not a protocol guarantee.
+
+**How this composes with the group types:**
+
+- `ReplicaGroup` scales a *stateless* daemon horizontally; migration is unnecessary because any replica can be re-spawned deterministically from `group_seed + index`.
+- `StandbyGroup` keeps a *stateful* daemon fault-tolerant; on failure of the active, a standby promotes and replays buffered events using the **same** `BufferedEvents` machinery migration uses. Migration is what makes standby promotion safe against an active node that's still alive (a drain-and-hand-off), and standby is what makes it safe against an active that just crashed.
+- `ForkGroup` creates divergent lineages from a common parent; migration moves a single lineage, but the fork parent's `ContinuityProof` is still verifiable across the move because the pre-fork chain head rides inside `StateSnapshot.chain_link`.
+
+The coverage end-to-end is `tests/migration_integration.rs` (single-chunk and multi-chunk lifecycle via a mock message pump, plus `test_regression_*` cases for no-factory / corrupt-snapshot / retry-idempotency / activate-without-restore) and `tests/three_node_integration.rs::test_migration_full_lifecycle_over_wire` (three nodes, real encrypted UDP, full 6-phase chain).
+
 ## Replica Groups
 
 Where migration moves a daemon 1:1, `ReplicaGroup` replicates a daemon 1:N. Each replica is a normal `DaemonHost` registered in the `DaemonRegistry` — the group is a coordination overlay, not a new runtime concept.
