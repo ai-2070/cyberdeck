@@ -2311,8 +2311,12 @@ fn test_migration_full_lifecycle_over_subprotocol_single_chunk() {
         !source.orch.is_migrating(origin),
         "orchestrator record removed"
     );
-    // Factory was consumed on restore.
-    assert!(!target.factories.contains(origin));
+    // Factory registration survives across the lifecycle — the handler no
+    // longer auto-removes it, so a transient delivery failure on
+    // `RestoreComplete` can retry without manual re-registration.
+    // Production callers that want single-shot semantics invoke
+    // `factories.remove` themselves after observing `ActivateAck`.
+    assert!(target.factories.contains(origin));
 }
 
 #[test]
@@ -2587,9 +2591,115 @@ fn test_regression_factory_preserved_for_retry_after_restore_failure() {
         target.reg.contains(origin),
         "daemon must be restored on target"
     );
-    // After a successful restore the factory IS consumed — callers must
-    // re-register to migrate the same origin again.
-    assert!(!target.factories.contains(origin));
+    // Factory registration survives across restore so a later retry
+    // (e.g., the source didn't see `RestoreComplete`) doesn't fail
+    // permanently. Single-shot semantics are the caller's responsibility
+    // via an explicit `factories.remove`.
+    assert!(target.factories.contains(origin));
+}
+
+/// Regression: after a successful restore, the subprotocol handler used
+/// to call `factories.remove(origin)` and then assumed the
+/// `RestoreComplete` message had been delivered. If that message was
+/// lost on the wire (transient network failure, node crash between
+/// restore and send), the source would retry `SnapshotReady`. The target
+/// then had no factory, responded with `MigrationFailed`, and a single
+/// lost packet turned into a permanent migration failure.
+///
+/// The fix:
+///   1. The factory is NOT auto-removed on successful restore. Callers
+///      take responsibility for calling `factories.remove` when they
+///      observe full-lifecycle completion (`ActivateAck`).
+///   2. On retry, if the target already has an in-progress migration
+///      record for this origin, the handler re-emits `RestoreComplete`
+///      idempotently instead of attempting a second restore (which
+///      would hit `AlreadyMigrating`).
+///
+/// This test drives the retry path end-to-end: first `SnapshotReady`
+/// succeeds; simulate a lost `RestoreComplete` by ignoring the first
+/// handler output; re-send the same `SnapshotReady`; assert the second
+/// handler output is also `RestoreComplete` and that no duplicate
+/// restore was attempted.
+#[test]
+fn test_regression_snapshot_ready_retry_after_successful_restore_is_idempotent() {
+    let source = WireNode::new(0x1111);
+    let target = WireNode::new(0x2222);
+
+    let (kp, origin) = register_counter_daemon(&source.reg, 9);
+    for seq in 1..=3 {
+        source.reg.deliver(origin, &make_event(0xFFFF, seq)).unwrap();
+    }
+    let snapshot = source.reg.snapshot(origin).unwrap().unwrap();
+    let snapshot_bytes = snapshot.to_bytes();
+
+    target.factories.register(
+        kp.clone(),
+        DaemonHostConfig::default(),
+        || Box::new(CounterDaemon::new()),
+    );
+
+    let snapshot_ready = MigrationMessage::SnapshotReady {
+        daemon_origin: origin,
+        snapshot_bytes,
+        seq_through: snapshot.through_seq,
+        chunk_index: 0,
+        total_chunks: 1,
+    };
+    let payload = net::adapter::net::compute::orchestrator::wire::encode(&snapshot_ready).unwrap();
+
+    // First attempt: target restores, emits RestoreComplete. Simulate
+    // the message being lost on the wire by *dropping* the outbound.
+    let outbound1 = target
+        .handler
+        .handle_message(&payload, source.node_id)
+        .unwrap();
+    assert!(
+        outbound1.iter().any(|o| matches!(
+            net::adapter::net::compute::orchestrator::wire::decode(&o.payload),
+            Ok(MigrationMessage::RestoreComplete { .. })
+        )),
+        "first attempt must emit RestoreComplete"
+    );
+    assert!(target.reg.contains(origin), "daemon must be on target");
+
+    // Retry: source sends the same SnapshotReady again. Target must
+    // re-emit RestoreComplete without failing or double-restoring.
+    let outbound2 = target
+        .handler
+        .handle_message(&payload, source.node_id)
+        .unwrap();
+    let restore_complete_count = outbound2
+        .iter()
+        .filter(|o| {
+            matches!(
+                net::adapter::net::compute::orchestrator::wire::decode(&o.payload),
+                Ok(MigrationMessage::RestoreComplete { .. })
+            )
+        })
+        .count();
+    assert_eq!(
+        restore_complete_count, 1,
+        "retry must emit exactly one RestoreComplete"
+    );
+    let migration_failed_count = outbound2
+        .iter()
+        .filter(|o| {
+            matches!(
+                net::adapter::net::compute::orchestrator::wire::decode(&o.payload),
+                Ok(MigrationMessage::MigrationFailed { .. })
+            )
+        })
+        .count();
+    assert_eq!(
+        migration_failed_count, 0,
+        "retry must not emit MigrationFailed — the daemon is already \
+         restored here, so this is an idempotent retry"
+    );
+    assert!(target.reg.contains(origin));
+    assert!(
+        target.factories.contains(origin),
+        "factory must still be registered until caller explicitly removes it"
+    );
 }
 
 #[test]

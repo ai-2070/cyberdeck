@@ -147,8 +147,14 @@ pub struct PollOptions {
 pub struct StoredEvent {
     /// Backend-specific event ID
     pub id: String,
-    /// Raw JSON payload as string
+    /// Raw payload as UTF-8. When the payload is not valid UTF-8
+    /// (binary payloads), this is the empty string and the original
+    /// bytes are in `raw_bytes` instead.
     pub raw: String,
+    /// Raw payload bytes. Always populated — consumers that need binary
+    /// fidelity should prefer this over `raw`. For UTF-8 payloads the
+    /// two fields carry the same content in different representations.
+    pub raw_bytes: Buffer,
     /// Insertion timestamp (nanoseconds)
     pub insertion_ts: i64,
     /// Shard ID
@@ -446,9 +452,11 @@ impl Net {
             .into_iter()
             .map(|e| {
                 let raw = e.raw_str().unwrap_or("").to_string();
+                let raw_bytes = Buffer::from(e.raw.to_vec());
                 StoredEvent {
                     id: e.id,
                     raw,
+                    raw_bytes,
                     insertion_ts: e.insertion_ts as i64,
                     shard_id: e.shard_id as u32,
                 }
@@ -980,10 +988,17 @@ mod mesh_bindings {
                 .events
                 .into_iter()
                 .map(|e| {
+                    // Preserve binary payloads in `raw_bytes`. `raw` is
+                    // kept for back-compat with UTF-8 consumers but is
+                    // deliberately empty (not a silent UTF-8-lossy
+                    // substitution) when the payload isn't valid UTF-8 —
+                    // callers that need fidelity must use `raw_bytes`.
                     let raw = e.raw_str().unwrap_or("").to_string();
+                    let raw_bytes = Buffer::from(e.raw.to_vec());
                     StoredEvent {
                         id: e.id,
                         raw,
+                        raw_bytes,
                         insertion_ts: e.insertion_ts as i64,
                         shard_id: e.shard_id as u32,
                     }

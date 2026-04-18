@@ -1220,42 +1220,54 @@ impl MeshNode {
     fn execute_handshake_action(action: HandshakeAction, ctx: &DispatchCtx) {
         match action {
             HandshakeAction::Forward { to_node, payload } => {
-                // Find a peer session we can use to re-encrypt toward the
-                // next hop. If we have a direct session with `to_node`, send
-                // there; otherwise drop (multi-hop handshake relay is not
-                // supported yet — would require more routing logic).
-                let next = ctx
-                    .peers
-                    .get(&to_node)
-                    .map(|e| (e.value().addr, e.value().session.clone()));
-                if let Some((next_addr, next_sess)) = next {
-                    if ctx.partition_filter.contains(&next_addr) {
-                        return;
+                // Pick the next hop toward `to_node`. Prefer the routing
+                // table — that's where multi-hop topology lives — and fall
+                // back to a direct peer entry if no route exists. The
+                // packet is then re-encrypted with the session for the
+                // next hop (NOT the final dest); each hop repeats this,
+                // so a relay chain longer than one intermediate works.
+                let next_addr = ctx
+                    .router
+                    .routing_table()
+                    .lookup(to_node)
+                    .or_else(|| ctx.peers.get(&to_node).map(|e| e.value().addr));
+                let next_session = next_addr.and_then(|addr| {
+                    ctx.addr_to_node
+                        .get(&addr)
+                        .map(|e| *e.value())
+                        .and_then(|nid| ctx.peers.get(&nid).map(|e| e.value().session.clone()))
+                });
+                match (next_addr, next_session) {
+                    (Some(next_addr), Some(next_sess)) => {
+                        if ctx.partition_filter.contains(&next_addr) {
+                            return;
+                        }
+                        let socket = ctx.socket.clone();
+                        tokio::spawn(async move {
+                            let pool = next_sess.thread_local_pool();
+                            let mut builder = pool.get();
+                            let seq = {
+                                let stream = next_sess
+                                    .get_or_create_stream(SUBPROTOCOL_HANDSHAKE as u64);
+                                stream.next_tx_seq()
+                            };
+                            let events = vec![payload];
+                            let packet = builder.build_subprotocol(
+                                SUBPROTOCOL_HANDSHAKE as u64,
+                                seq,
+                                &events,
+                                PacketFlags::NONE,
+                                SUBPROTOCOL_HANDSHAKE,
+                            );
+                            let _ = socket.send_to(&packet, next_addr).await;
+                        });
                     }
-                    let socket = ctx.socket.clone();
-                    tokio::spawn(async move {
-                        let pool = next_sess.thread_local_pool();
-                        let mut builder = pool.get();
-                        let seq = {
-                            let stream =
-                                next_sess.get_or_create_stream(SUBPROTOCOL_HANDSHAKE as u64);
-                            stream.next_tx_seq()
-                        };
-                        let events = vec![payload];
-                        let packet = builder.build_subprotocol(
-                            SUBPROTOCOL_HANDSHAKE as u64,
-                            seq,
-                            &events,
-                            PacketFlags::NONE,
-                            SUBPROTOCOL_HANDSHAKE,
+                    _ => {
+                        tracing::warn!(
+                            dest_node = format!("{:#x}", to_node),
+                            "handshake relay: no route or session for next hop; dropping"
                         );
-                        let _ = socket.send_to(&packet, next_addr).await;
-                    });
-                } else {
-                    tracing::warn!(
-                        dest_node = format!("{:#x}", to_node),
-                        "handshake relay: no session to forward through"
-                    );
+                    }
                 }
             }
             HandshakeAction::RegisterResponderPeer {
@@ -1264,17 +1276,23 @@ impl MeshNode {
                 keys,
                 response_payload,
             } => {
-                // Do NOT register the peer until msg2 has actually been
-                // handed to the socket. A half-open record (peer + route
-                // inserted but msg2 never sent) would blackhole all future
-                // traffic to this peer and make recovery rely on external
-                // timeouts.
+                // Register the peer synchronously *before* spawning the
+                // msg2 send. This ordering handles two failure modes:
                 //
-                // `addr_to_node[relay_addr]` is left untouched — it still
-                // points to the relay's node_id, which is the correct
-                // resolution for direct packets from that wire address.
-                // Packets for this new peer arrive via routed headers and
-                // are dispatched by session_id.
+                //   1. If the spawned send task is cancelled or panics
+                //      after `send_to` returns `Ok(())`, the initiator
+                //      still completes its handshake and starts sending
+                //      routed traffic. If registration were deferred
+                //      until after the await, a post-send task death
+                //      would leave the responder with no peer entry and
+                //      traffic would be silently dropped.
+                //
+                //   2. If `send_to` fails, the spawned task removes the
+                //      peer entries we inserted here, so no ghost peer
+                //      persists. That cleanup path is why we also don't
+                //      register into `addr_to_node` — it's already
+                //      mapped to the relay's node_id, and we don't want
+                //      to churn that on failure.
                 let relay_node_id = ctx.addr_to_node.get(&relay_addr).map(|e| *e.value());
                 let relay_session = relay_node_id
                     .and_then(|nid| ctx.peers.get(&nid).map(|e| e.value().session.clone()));
@@ -1292,12 +1310,27 @@ impl MeshNode {
                     return;
                 }
 
+                // Insert the peer + route + peer_addrs up front.
+                let session = Arc::new(NetSession::new(
+                    keys,
+                    relay_addr,
+                    ctx.packet_pool_size,
+                    ctx.default_reliable,
+                ));
+                ctx.peers.insert(
+                    peer_node_id,
+                    PeerInfo {
+                        node_id: peer_node_id,
+                        addr: relay_addr,
+                        session,
+                    },
+                );
+                ctx.peer_addrs.insert(peer_node_id, relay_addr);
+                ctx.router.add_route(peer_node_id, relay_addr);
+
                 let socket = ctx.socket.clone();
                 let peers = ctx.peers.clone();
                 let peer_addrs = ctx.peer_addrs.clone();
-                let router = ctx.router.clone();
-                let packet_pool_size = ctx.packet_pool_size;
-                let default_reliable = ctx.default_reliable;
                 tokio::spawn(async move {
                     let packet = {
                         let pool = relay_sess.thread_local_pool();
@@ -1316,42 +1349,20 @@ impl MeshNode {
                             SUBPROTOCOL_HANDSHAKE,
                         )
                     };
-                    match socket.send_to(&packet, relay_addr).await {
-                        Ok(_) => {
-                            // Send succeeded — register the peer, route,
-                            // and peer-addrs entry. The initiator will be
-                            // able to complete msg2 on its side and start
-                            // sending routed data immediately.
-                            //
-                            // `peer_addrs` must be kept in sync with
-                            // `peers` so the reroute policy can find this
-                            // peer's wire address; every other
-                            // registration path (connect/accept/
-                            // connect_via) already does this.
-                            let session = Arc::new(NetSession::new(
-                                keys,
-                                relay_addr,
-                                packet_pool_size,
-                                default_reliable,
-                            ));
-                            peers.insert(
-                                peer_node_id,
-                                PeerInfo {
-                                    node_id: peer_node_id,
-                                    addr: relay_addr,
-                                    session,
-                                },
-                            );
-                            peer_addrs.insert(peer_node_id, relay_addr);
-                            router.add_route(peer_node_id, relay_addr);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                peer = format!("{:#x}", peer_node_id),
-                                error = %e,
-                                "handshake relay: msg2 send failed; peer not registered"
-                            );
-                        }
+                    if let Err(e) = socket.send_to(&packet, relay_addr).await {
+                        // Send failed — clean up the eagerly-registered
+                        // peer so we don't leave a ghost entry that would
+                        // blackhole traffic. Routing table entries stay
+                        // (there's no stable remove API); the peers map
+                        // miss is enough for dispatch to drop incoming
+                        // packets for this peer.
+                        tracing::warn!(
+                            peer = format!("{:#x}", peer_node_id),
+                            error = %e,
+                            "handshake relay: msg2 send failed; unregistering peer"
+                        );
+                        peers.remove(&peer_node_id);
+                        peer_addrs.remove(&peer_node_id);
                     }
                 });
             }

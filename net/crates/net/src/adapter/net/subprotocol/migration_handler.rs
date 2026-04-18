@@ -422,24 +422,6 @@ impl MigrationSubprotocolHandler {
             }
         };
 
-        // Build restore inputs without removing the registration. If the
-        // restore fails (e.g., parse error revealed at a later layer, or
-        // any other recoverable failure), the factory stays in place so a
-        // retry can use it without the caller re-registering.
-        let inputs = match self.target_handler.factories().construct(daemon_origin) {
-            Some(i) => i,
-            None => {
-                return Ok(Some(self.fail_migration(
-                    daemon_origin,
-                    from_node,
-                    &format!(
-                        "no daemon factory registered for origin {:#x}",
-                        daemon_origin
-                    ),
-                )?));
-            }
-        };
-
         // `source_node` is the daemon's pre-migration host — tracked here
         // only for the target-handler's internal bookkeeping. It is NOT
         // where `RestoreComplete` gets sent (see below).
@@ -448,28 +430,50 @@ impl MigrationSubprotocolHandler {
             .source_node(daemon_origin)
             .unwrap_or(from_node);
 
-        let daemon = inputs.daemon;
-        if let Err(e) = self.target_handler.restore_snapshot(
-            daemon_origin,
-            &snapshot,
-            source_node,
-            inputs.keypair,
-            move || daemon,
-            inputs.config,
-        ) {
-            // Factory is still registered — next `SnapshotReady` for this
-            // origin (e.g., from an orchestrator retry) can try again.
-            return Ok(Some(self.fail_migration(
-                daemon_origin,
-                from_node,
-                &format!("restore_snapshot failed: {:?}", e),
-            )?));
-        }
+        // If this origin is already under migration here, the source is
+        // retrying because our earlier `RestoreComplete` didn't make it
+        // back. Don't touch the already-restored daemon; just re-emit
+        // `RestoreComplete` so the orchestrator can advance. This also
+        // means we DO NOT consume the factory on the retry — the factory
+        // registration must survive until the migration is truly complete
+        // (`ActivateAck`), not just until the first locally-successful
+        // restore.
+        if !self.target_handler.is_migrating(daemon_origin) {
+            let inputs = match self.target_handler.factories().construct(daemon_origin) {
+                Some(i) => i,
+                None => {
+                    return Ok(Some(self.fail_migration(
+                        daemon_origin,
+                        from_node,
+                        &format!(
+                            "no daemon factory registered for origin {:#x}",
+                            daemon_origin
+                        ),
+                    )?));
+                }
+            };
 
-        // Restore succeeded — the registration is now single-shot. Remove
-        // it so a second migration for the same origin, without explicit
-        // re-registration, is refused.
-        self.target_handler.factories().remove(daemon_origin);
+            let daemon = inputs.daemon;
+            if let Err(e) = self.target_handler.restore_snapshot(
+                daemon_origin,
+                &snapshot,
+                source_node,
+                inputs.keypair,
+                move || daemon,
+                inputs.config,
+            ) {
+                // Factory is still registered — next `SnapshotReady` for
+                // this origin (e.g., from an orchestrator retry) can try
+                // again. We don't auto-remove on success either; callers
+                // are expected to call `factories.remove` after observing
+                // `ActivateAck` if they want single-shot semantics.
+                return Ok(Some(self.fail_migration(
+                    daemon_origin,
+                    from_node,
+                    &format!("restore_snapshot failed: {:?}", e),
+                )?));
+            }
+        }
 
         // Route `RestoreComplete` to the orchestrator, not the source.
         // Only the orchestrator holds the migration record; sending to

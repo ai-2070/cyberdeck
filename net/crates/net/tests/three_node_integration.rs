@@ -3733,6 +3733,120 @@ async fn test_regression_proximity_graph_local_id_matches_peer_encoding() {
     node.shutdown().await.unwrap();
 }
 
+/// Regression: `HandshakeAction::Forward` used to require a direct peer
+/// session for the `to_node` — if the next hop toward the destination
+/// was a different intermediate node, the packet was silently dropped.
+/// That meant `connect_via` could only traverse one relay, contradicting
+/// the documented "chain of already-connected peers" design.
+///
+/// The fix looks up `to_node` in the routing table first; only if that
+/// misses does it fall back to the direct-peer entry. This test sets up
+/// a four-node chain A↔B↔C↔D, gives each relay the route to the far
+/// destination, and confirms that `a.connect_via(relay=B, D)` completes
+/// end-to-end with A gaining a peer entry for D.
+#[tokio::test]
+async fn test_regression_handshake_relay_multi_hop_via_routing_table() {
+    let ports = find_ports(4).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let id_d = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+    let nid_d = id_d.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+    let addr_d: SocketAddr = format!("127.0.0.1:{}", ports[3]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(30))
+    };
+
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let d = MeshNode::new(id_d, mk(addr_d)).await.unwrap();
+    let pub_b = *b.public_key();
+    let pub_c = *c.public_key();
+    let pub_d = *d.public_key();
+
+    // Build the chain: A↔B, B↔C, C↔D. No other direct sessions.
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    let (r1, r2) = tokio::join!(c.accept(nid_b), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        b.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    let (r1, r2) = tokio::join!(d.accept(nid_c), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        c.connect(addr_d, &pub_d, nid_d).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    // Routing table entries for the relays. The `connect`/`accept`
+    // calls above auto-install routes for direct peers only; we have to
+    // seed the cross-relay routes manually.
+    //
+    // msg1 path A→B→C→D:  B needs route D via C (C has D direct).
+    // msg2 path D→C→B→A:  C needs route A via B (B has A direct).
+    b.router().add_route(nid_d, addr_c);
+    c.router().add_route(nid_a, addr_b);
+
+    a.start();
+    b.start();
+    c.start();
+    d.start();
+
+    // Register a handshake handler factory on D? No — handshake relay
+    // doesn't use DaemonFactoryRegistry. D just needs to be running.
+    //
+    // Register D as a reachable peer on A's side (no direct session
+    // yet). After connect_via, A should have one.
+    let _before = a.peer_count();
+
+    // Drive the relayed handshake across two intermediate hops.
+    a.connect_via(addr_b, &pub_d, nid_d)
+        .await
+        .expect("A connect_via D (through B→C) failed");
+
+    // Give the spawned msg2-send tasks on D and C time to resolve.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // A now has sessions for B and for D (but not C — C was purely a
+    // transit hop as far as A is concerned).
+    assert!(
+        a.peer_count() >= 2,
+        "A must have at least B + D after multi-hop connect_via; got {}",
+        a.peer_count()
+    );
+    // D now has sessions for C and for A.
+    assert!(
+        d.peer_count() >= 2,
+        "D must have at least C + A after the relayed handshake completes; got {}",
+        d.peer_count()
+    );
+    let _ = nid_a;
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
+    d.shutdown().await.unwrap();
+}
+
 /// Regression: `execute_handshake_action::RegisterResponderPeer` used to
 /// insert the peer + session + route *before* the msg2 send was spawned,
 /// and the send result was ignored. If the spawned send failed (partition
