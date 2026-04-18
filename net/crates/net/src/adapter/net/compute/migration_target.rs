@@ -625,4 +625,189 @@ mod tests {
         assert!(!handler.is_migrating(origin));
         assert!(!reg.contains(origin)); // daemon unregistered on abort
     }
+
+    #[test]
+    fn test_regression_activate_target_idempotent_after_ack_loss() {
+        // Regression: `complete()` used to remove state eagerly and the
+        // target ack was sent BEFORE the idempotency record existed. A
+        // retried `ActivateTarget` after a lost `ActivateAck` would hit
+        // `DaemonNotFound` on `activate()`, wedging the orchestrator.
+        //
+        // Fix: `complete()` moves state into a `completed` index; a
+        // retried `activate()` looks the completion up and returns the
+        // same `replayed_through`.
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = MigrationTargetHandler::new(reg);
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+        let snapshot = make_snapshot(&kp, 0, 0);
+
+        handler
+            .restore_snapshot(
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snapshot,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
+                kp.clone(),
+                || Box::new(AccumDaemon { total: 0 }),
+                DaemonHostConfig::default(),
+            )
+            .unwrap();
+
+        let first_seq = handler.activate(origin).unwrap();
+        handler.complete(origin).unwrap();
+
+        // Simulate the orchestrator's retry: ActivateTarget arrives again.
+        // Must return the same replayed_through, and complete() must be
+        // a no-op — not a DaemonNotFound error.
+        let retry_seq = handler.activate(origin).unwrap();
+        assert_eq!(
+            retry_seq, first_seq,
+            "retried activate() must return the originally-activated seq"
+        );
+        handler
+            .complete(origin)
+            .expect("repeated complete() must no-op, not error");
+
+        // Recorded orchestrator is still queryable via the completed record.
+        assert_eq!(handler.orchestrator_node(origin), Some(0x2222));
+    }
+
+    #[test]
+    fn test_regression_activate_prefers_active_over_completed() {
+        // Regression: `activate()` used to consult the `completed` index
+        // first and returned stale `replayed_through` from a prior
+        // migration. A new active migration for the same daemon_origin
+        // (e.g., migrated back later) would skip cutover and report a
+        // wrong sequence number.
+        //
+        // Fix: active migrations always take precedence over completed
+        // records for the same origin.
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = MigrationTargetHandler::new(reg.clone());
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+
+        // First migration: through_seq = 10.
+        let snap1 = make_snapshot(&kp, 10, 42);
+        handler
+            .restore_snapshot(
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snap1,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
+                kp.clone(),
+                || Box::new(AccumDaemon { total: 0 }),
+                DaemonHostConfig::default(),
+            )
+            .unwrap();
+        handler.activate(origin).unwrap();
+        handler.complete(origin).unwrap();
+
+        // Simulate the daemon migrating away: unregister from the local
+        // DaemonRegistry so the restore of the second migration can
+        // re-register it (mirrors what `complete()` would do on the
+        // source side in production).
+        reg.unregister(origin).unwrap();
+
+        // Second migration for the SAME origin (e.g., migrated away then
+        // back), with a later through_seq = 100.
+        let snap2 = make_snapshot(&kp, 100, 42);
+        handler
+            .restore_snapshot(
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snap2,
+                    source_node: 0x3333,
+                    orchestrator_node: 0x4444,
+                },
+                kp.clone(),
+                || Box::new(AccumDaemon { total: 0 }),
+                DaemonHostConfig::default(),
+            )
+            .unwrap();
+
+        let seq = handler.activate(origin).unwrap();
+        assert_eq!(
+            seq, 100,
+            "activate() must reflect the NEW active migration, not the old completed one"
+        );
+        assert_eq!(
+            handler.phase(origin),
+            Some(MigrationPhase::Cutover),
+            "new active migration must transition to Cutover"
+        );
+    }
+
+    #[test]
+    fn test_regression_complete_prefers_active_over_completed() {
+        // Regression: `complete()` returned `Ok(())` early when a
+        // completed record already existed, even if an active migration
+        // for the same origin was in-flight. That left the new migration
+        // stuck in its pre-cutover phase and its state unmoved to the
+        // idempotency index.
+        //
+        // Fix: complete() finalizes the active migration if one exists;
+        // only no-ops when NO active migration is present.
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = MigrationTargetHandler::new(reg.clone());
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+
+        let snap1 = make_snapshot(&kp, 10, 42);
+        handler
+            .restore_snapshot(
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snap1,
+                    source_node: 0x1111,
+                    orchestrator_node: 0x2222,
+                },
+                kp.clone(),
+                || Box::new(AccumDaemon { total: 0 }),
+                DaemonHostConfig::default(),
+            )
+            .unwrap();
+        handler.activate(origin).unwrap();
+        handler.complete(origin).unwrap();
+
+        // Simulate migrate-away before the second migration arrives.
+        reg.unregister(origin).unwrap();
+
+        // Second migration for the same origin.
+        let snap2 = make_snapshot(&kp, 100, 42);
+        handler
+            .restore_snapshot(
+                RestoreContext {
+                    daemon_origin: origin,
+                    snapshot: &snap2,
+                    source_node: 0x3333,
+                    orchestrator_node: 0x4444,
+                },
+                kp.clone(),
+                || Box::new(AccumDaemon { total: 0 }),
+                DaemonHostConfig::default(),
+            )
+            .unwrap();
+        assert!(handler.is_migrating(origin));
+
+        handler.activate(origin).unwrap();
+        // complete() must actually finalize the new migration, not
+        // short-circuit because a completed record from the prior one
+        // exists.
+        handler.complete(origin).unwrap();
+        assert!(
+            !handler.is_migrating(origin),
+            "complete() must move the new migration to the completed index"
+        );
+        assert_eq!(
+            handler.orchestrator_node(origin),
+            Some(0x4444),
+            "completed record must reflect the second (new) orchestrator"
+        );
+    }
 }

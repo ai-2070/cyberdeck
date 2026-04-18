@@ -799,4 +799,44 @@ mod tests {
         assert!(table.routes.get(&0x2222).is_none());
         assert!(table.routes.get(&0x3333).is_some());
     }
+
+    #[test]
+    fn test_regression_remove_route_if_next_hop_is() {
+        // Regression: rollback paths (e.g., routed-handshake msg2 send
+        // failure) used to call `remove_route` unconditionally and could
+        // clobber a newer valid route written concurrently for the same
+        // dest. `remove_route_if_next_hop_is` is the safe alternative —
+        // it only removes when the current next_hop still matches the
+        // address the caller wrote.
+        let table = RoutingTable::new(0x1111);
+        let original: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let newer: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+
+        // Install original route.
+        table.add_route(0x4444, original);
+
+        // Concurrent rewrite to a different next hop.
+        table.add_route(0x4444, newer);
+
+        // Rollback keyed on the original next_hop must NOT remove the
+        // newer entry.
+        let removed = table.remove_route_if_next_hop_is(0x4444, original);
+        assert!(
+            !removed,
+            "rollback must not evict an entry whose next_hop changed under us"
+        );
+        assert_eq!(
+            table.lookup(0x4444),
+            Some(newer),
+            "newer route must survive a stale rollback attempt"
+        );
+
+        // Rollback keyed on the current next_hop DOES remove it.
+        let removed = table.remove_route_if_next_hop_is(0x4444, newer);
+        assert!(removed);
+        assert!(table.lookup(0x4444).is_none());
+
+        // Rolling back a non-existent route is a no-op, returns false.
+        assert!(!table.remove_route_if_next_hop_is(0x4444, newer));
+    }
 }

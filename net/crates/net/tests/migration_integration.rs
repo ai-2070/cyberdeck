@@ -1208,6 +1208,72 @@ fn test_regression_full_handler_routing_chain() {
     }
 }
 
+/// Regression: CutoverNotify handler used to call `source_handler.cleanup()`
+/// BEFORE reading `source_handler.orchestrator_node()`. Once cleaned up,
+/// the lookup returned `None` and the reply silently fell back to
+/// `from_node`. In any topology where the wire hop differs from the
+/// orchestrator, this would route `CleanupComplete` to the wrong node.
+///
+/// Fix: the orchestrator is captured BEFORE `cleanup()`. This regression
+/// test drives a scenario where `from_node` differs from the recorded
+/// orchestrator so that a naive re-introduction of the bug would produce
+/// the wrong `CleanupComplete.dest_node`.
+#[test]
+fn test_regression_cleanup_complete_prefers_recorded_orchestrator() {
+    use net::adapter::net::compute::orchestrator::wire;
+    use net::adapter::net::subprotocol::MigrationSubprotocolHandler;
+
+    let reg = Arc::new(DaemonRegistry::new());
+    let (_, origin) = register_counter_daemon(&reg, 7);
+
+    // Orchestrator lives on 0xAAAA. Source handler lives on this test node.
+    // CutoverNotify will arrive with `from_node = 0xBBBB` (a hypothetical
+    // relay), distinct from the orchestrator.
+    let local_node: u64 = 0x1234;
+    let target_node: u64 = 0xCAFE;
+    let orchestrator_node: u64 = 0xAAAA;
+    let relay_node: u64 = 0xBBBB;
+
+    let orch = Arc::new(MigrationOrchestrator::new(reg.clone(), local_node));
+    let source = Arc::new(MigrationSourceHandler::new(reg.clone()));
+    let target = Arc::new(MigrationTargetHandler::new(reg.clone()));
+    let handler = MigrationSubprotocolHandler::new(orch, source.clone(), target, local_node);
+
+    // Source-side state records the orchestrator (captured at
+    // TakeSnapshot time in production; supplied directly here).
+    source
+        .start_snapshot(origin, target_node, orchestrator_node)
+        .unwrap();
+
+    // CutoverNotify arrives from a hypothetical relay — NOT the
+    // orchestrator. If the handler reads `orchestrator_node()` after
+    // calling `cleanup()`, it'll get None and fall back to this
+    // relay_node, breaking the reply.
+    let cutover = MigrationMessage::CutoverNotify {
+        daemon_origin: origin,
+        target_node,
+    };
+    let outbound = handler
+        .handle_message(&wire::encode(&cutover).unwrap(), relay_node)
+        .unwrap();
+
+    let cleanup = outbound
+        .iter()
+        .find(|o| {
+            matches!(
+                wire::decode(&o.payload),
+                Ok(MigrationMessage::CleanupComplete { .. })
+            )
+        })
+        .expect("expected CleanupComplete outbound");
+    assert_eq!(
+        cleanup.dest_node, orchestrator_node,
+        "CleanupComplete must go to the recorded orchestrator ({:#x}), not to the \
+         wire hop {:#x}",
+        orchestrator_node, relay_node
+    );
+}
+
 /// Regression: SnapshotReassembler was keyed only by daemon_origin, so chunks
 /// from different seq_through snapshots (e.g., a retry after abort) could be
 /// mixed, producing a corrupt reassembled snapshot. Now keyed by
