@@ -796,9 +796,119 @@ fn build_config(options: Option<EventBusOptions>) -> Result<EventBusConfig> {
 #[cfg(feature = "net")]
 mod mesh_bindings {
     use super::*;
-    use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig};
+    use net::adapter::net::{
+        EntityKeypair, MeshNode, MeshNodeConfig, Reliability, Stream as CoreStream, StreamConfig,
+        StreamError,
+    };
     use net::adapter::Adapter;
     use std::time::Duration;
+
+    // ─── Stream API type bridges ─────────────────────────────────────
+
+    /// Reliability mode for a stream. Wire value is a plain tag string:
+    /// `"fire_and_forget"` (default) or `"reliable"`. Anything else
+    /// errors at stream-open time.
+    #[napi(object)]
+    pub struct StreamOptions {
+        /// Caller-chosen `u64` stream id. Stream IDs are opaque; no
+        /// range has transport-level meaning.
+        pub stream_id: i64,
+        /// `"fire_and_forget"` | `"reliable"`. Default: `"fire_and_forget"`.
+        pub reliability: Option<String>,
+        /// Per-stream in-flight window cap. `0` = unbounded (preserves
+        /// pre-backpressure behavior). Default: `0`.
+        pub window_bytes: Option<u32>,
+        /// Fair-scheduler weight (1 = equal share). Default: 1.
+        pub fairness_weight: Option<u8>,
+    }
+
+    /// Handle to an open stream. Opaque to JS callers; pass back to
+    /// `sendOnStream` / `sendWithRetry` / `sendBlocking` / `closeStream`.
+    #[napi]
+    pub struct NetStream {
+        peer_node_id: u64,
+        stream_id: u64,
+        core: CoreStream,
+    }
+
+    #[napi]
+    impl NetStream {
+        /// The peer this stream terminates at.
+        #[napi(getter)]
+        pub fn peer_node_id(&self) -> Result<i64> {
+            i64::try_from(self.peer_node_id).map_err(|_| {
+                Error::from_reason(format!(
+                    "peer_node_id {} exceeds i64::MAX; JS has no lossless u64",
+                    self.peer_node_id
+                ))
+            })
+        }
+        /// The caller-chosen stream id.
+        #[napi(getter)]
+        pub fn stream_id(&self) -> Result<i64> {
+            i64::try_from(self.stream_id).map_err(|_| {
+                Error::from_reason(format!(
+                    "stream_id {} exceeds i64::MAX; JS has no lossless u64",
+                    self.stream_id
+                ))
+            })
+        }
+    }
+
+    /// Snapshot of per-stream stats.
+    #[napi(object)]
+    pub struct NetStreamStats {
+        pub tx_seq: i64,
+        pub rx_seq: i64,
+        pub inbound_pending: i64,
+        pub last_activity_ns: i64,
+        pub active: bool,
+        pub backpressure_events: i64,
+        pub tx_inflight: u32,
+        pub tx_window: u32,
+    }
+
+    /// Prefix convention for JS SDK error-class routing. The TS wrapper
+    /// matches on the message prefix to re-throw a `BackpressureError`
+    /// or `NotConnectedError` subclass. The rest of the message is
+    /// human-readable detail. Keep these strings stable — they are part
+    /// of the SDK contract.
+    pub(crate) const ERR_BACKPRESSURE_PREFIX: &str = "stream would block";
+    pub(crate) const ERR_NOT_CONNECTED_PREFIX: &str = "stream not connected";
+
+    pub(crate) fn stream_error_to_napi(e: StreamError) -> Error {
+        // Map each variant to a stable, prefix-sniffable message. The
+        // TS `sendOnStream` wrapper (`sdk-ts`) inspects this prefix to
+        // re-throw `BackpressureError` or `NotConnectedError`.
+        match e {
+            StreamError::Backpressure => {
+                Error::from_reason(format!("{}: stream queue full", ERR_BACKPRESSURE_PREFIX))
+            }
+            StreamError::NotConnected => {
+                Error::from_reason(format!("{}: peer session gone", ERR_NOT_CONNECTED_PREFIX))
+            }
+            StreamError::Transport(msg) => {
+                Error::from_reason(format!("stream transport error: {}", msg))
+            }
+        }
+    }
+
+    pub(crate) fn stream_config_from_opts(opts: &StreamOptions) -> Result<StreamConfig> {
+        let reliability = match opts.reliability.as_deref() {
+            None | Some("fire_and_forget") => Reliability::FireAndForget,
+            Some("reliable") => Reliability::Reliable,
+            Some(other) => {
+                return Err(Error::from_reason(format!(
+                    "unknown reliability mode {:?}; expected \"fire_and_forget\" or \"reliable\"",
+                    other
+                )));
+            }
+        };
+        Ok(StreamConfig::new()
+            .with_reliability(reliability)
+            .with_window_bytes(opts.window_bytes.unwrap_or(0))
+            .with_fairness_weight(opts.fairness_weight.unwrap_or(1)))
+    }
 
     /// Configuration for creating a MeshNode.
     #[napi(object)]
@@ -1062,6 +1172,150 @@ mod mesh_bindings {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             Ok(node.proximity_graph().node_count() as u32)
+        }
+
+        // ─── Stream API ────────────────────────────────────────────
+
+        /// Open (or look up) a stream to a connected peer. Repeated
+        /// calls for the same `(peer, streamId)` return handles to the
+        /// same underlying state (first-open wins; differing configs
+        /// are logged and ignored).
+        #[napi]
+        pub fn open_stream(&self, peer_node_id: i64, opts: StreamOptions) -> Result<NetStream> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let peer_u64 = u64::try_from(peer_node_id).map_err(|_| {
+                Error::from_reason(format!(
+                    "peer_node_id must be non-negative; got {}",
+                    peer_node_id
+                ))
+            })?;
+            let stream_u64 = u64::try_from(opts.stream_id).map_err(|_| {
+                Error::from_reason(format!(
+                    "stream_id must be non-negative; got {}",
+                    opts.stream_id
+                ))
+            })?;
+            let config = stream_config_from_opts(&opts)?;
+            let core = node
+                .open_stream(peer_u64, stream_u64, config)
+                .map_err(|e| Error::from_reason(format!("open_stream failed: {}", e)))?;
+            Ok(NetStream {
+                peer_node_id: peer_u64,
+                stream_id: stream_u64,
+                core,
+            })
+        }
+
+        /// Close a stream. Idempotent.
+        #[napi]
+        pub fn close_stream(&self, peer_node_id: i64, stream_id: i64) -> Result<()> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let peer_u64 = u64::try_from(peer_node_id).map_err(|_| {
+                Error::from_reason(format!(
+                    "peer_node_id must be non-negative; got {}",
+                    peer_node_id
+                ))
+            })?;
+            let stream_u64 = u64::try_from(stream_id).map_err(|_| {
+                Error::from_reason(format!("stream_id must be non-negative; got {}", stream_id))
+            })?;
+            node.close_stream(peer_u64, stream_u64);
+            Ok(())
+        }
+
+        /// Send a batch of events on an explicit stream.
+        ///
+        /// **Error contract for SDK wrappers:** message prefixes are
+        /// stable. `"stream would block"` = `BackpressureError`;
+        /// `"stream not connected"` = `NotConnectedError`; anything
+        /// else is a real transport failure. See `sdk-ts` for the
+        /// class-based re-throw layer.
+        #[napi]
+        pub async fn send_on_stream(&self, stream: &NetStream, events: Vec<Buffer>) -> Result<()> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let payloads: Vec<bytes::Bytes> = events
+                .into_iter()
+                .map(|b| bytes::Bytes::copy_from_slice(b.as_ref()))
+                .collect();
+            node.send_on_stream(&stream.core, &payloads)
+                .await
+                .map_err(stream_error_to_napi)
+        }
+
+        /// Send events, retrying on `Backpressure` with 5 ms → 200 ms
+        /// exponential backoff up to `maxRetries` times. Transport
+        /// errors are returned immediately (not retried).
+        #[napi]
+        pub async fn send_with_retry(
+            &self,
+            stream: &NetStream,
+            events: Vec<Buffer>,
+            max_retries: u32,
+        ) -> Result<()> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let payloads: Vec<bytes::Bytes> = events
+                .into_iter()
+                .map(|b| bytes::Bytes::copy_from_slice(b.as_ref()))
+                .collect();
+            node.send_with_retry(&stream.core, &payloads, max_retries as usize)
+                .await
+                .map_err(stream_error_to_napi)
+        }
+
+        /// Block the calling JS task until the send succeeds or a
+        /// transport error occurs. Unbounded retry on `Backpressure`.
+        #[napi]
+        pub async fn send_blocking(
+            &self,
+            stream: &NetStream,
+            events: Vec<Buffer>,
+        ) -> Result<()> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let payloads: Vec<bytes::Bytes> = events
+                .into_iter()
+                .map(|b| bytes::Bytes::copy_from_slice(b.as_ref()))
+                .collect();
+            node.send_blocking(&stream.core, &payloads)
+                .await
+                .map_err(stream_error_to_napi)
+        }
+
+        /// Snapshot of per-stream stats. Returns `null` if the peer or
+        /// stream isn't registered.
+        #[napi]
+        pub fn stream_stats(
+            &self,
+            peer_node_id: i64,
+            stream_id: i64,
+        ) -> Result<Option<NetStreamStats>> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let peer_u64 = u64::try_from(peer_node_id).map_err(|_| {
+                Error::from_reason(format!(
+                    "peer_node_id must be non-negative; got {}",
+                    peer_node_id
+                ))
+            })?;
+            let stream_u64 = u64::try_from(stream_id).map_err(|_| {
+                Error::from_reason(format!("stream_id must be non-negative; got {}", stream_id))
+            })?;
+            Ok(node.stream_stats(peer_u64, stream_u64).map(|s| {
+                NetStreamStats {
+                    tx_seq: s.tx_seq as i64,
+                    rx_seq: s.rx_seq as i64,
+                    inbound_pending: s.inbound_pending as i64,
+                    last_activity_ns: s.last_activity_ns as i64,
+                    active: s.active,
+                    backpressure_events: s.backpressure_events as i64,
+                    tx_inflight: s.tx_inflight,
+                    tx_window: s.tx_window,
+                }
+            }))
         }
 
         /// Shutdown the mesh node.
