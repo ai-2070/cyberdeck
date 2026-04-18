@@ -137,7 +137,7 @@ mesh.close_stream(peer_node_id, stream_id);
 
 **Not multicast.** A stream is one flow to one peer. Sending the same payload to multiple peers is an application / daemon / channel-layer concern, not transport.
 
-**Back-pressure.** `send_on_stream` returns `StreamError::Backpressure` when a per-stream in-flight counter would exceed the stream's configured `tx_window` (taken from `StreamConfig::window_bytes` at open time; `0` means unbounded and preserves the pre-backpressure behavior). Semantics are local-only: the window catches **concurrent callers** racing on the same stream. A single serial sender flooding the socket still sees `StreamError::Transport(io::Error)` when the kernel send buffer fills — v2 will extend the signal to network-speed via a per-peer credit window, without changing the caller API.
+**Back-pressure.** `send_on_stream` returns `StreamError::Backpressure` when a per-stream in-flight counter would exceed the stream's configured `tx_window` (taken from `StreamConfig::window_bytes` at open time; `0` means unbounded and preserves the pre-backpressure behavior). Semantics are local-only: the window catches **concurrent callers** racing on the same stream. A single serial sender flooding the socket still sees `StreamError::Transport(String)` (the stringified socket error) when the kernel send buffer fills — v2 will extend the signal to network-speed via a per-peer credit window, without changing the caller API.
 
 *Backpressure is a signal, not a policy.* The transport never retries, sleeps, or buffers on its own. Daemons pick one of three patterns per stream:
 
@@ -158,7 +158,7 @@ mesh.send_with_retry(&stream, &[event], 8).await?;
 // task. Transport stays out of the policy; the app decides its own cap.
 ```
 
-`send_with_retry(events, max_retries)` and `send_blocking(events)` apply a 5 ms → 200 ms exponential backoff to `Backpressure` only; `Transport` errors are returned immediately. `StreamStats.backpressure_events` counts cumulative rejections for observability.
+`send_with_retry(stream, events, max_retries)` and `send_blocking(stream, events)` apply a 5 ms → 200 ms exponential backoff to `Backpressure` only; `Transport` errors are returned immediately. `StreamStats.backpressure_events` counts cumulative rejections for observability.
 
 **Fairness weight.** `StreamConfig::fairness_weight` is a quantum multiplier on the `FairScheduler`. It takes effect when a packet for this stream transits this node as a forwarder. Local outbound traffic currently bypasses the scheduler; the weight is still persisted so that a future refactor routing local outbound through the scheduler makes it load-bearing end-to-end without API churn.
 

@@ -130,7 +130,7 @@ class MeshNode:
 
     def peer_count(self) -> int:
         """Number of connected peers."""
-        return self._native.peer_count
+        return self._native.peer_count()
 
     # ── Stream API ───────────────────────────────────────────────────
 
@@ -187,7 +187,14 @@ class MeshNode:
 
     def send_blocking(self, stream: MeshStream, events: List[bytes]) -> None:
         """Block the calling thread until the send succeeds or a
-        transport error occurs. Unbounded retry on :class:`BackpressureError`.
+        transport error occurs.
+
+        Retries :class:`BackpressureError` with 5 ms → 200 ms
+        exponential backoff up to 4096 times (~13 min worst case) —
+        effectively "block until the network lets up" for practical
+        workloads, but with a hard upper bound so runaway pressure
+        can't hang the caller forever. Use :meth:`send_with_retry`
+        for a tighter bound.
         """
         self._native.send_blocking(stream._native, events)
 

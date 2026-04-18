@@ -57,7 +57,7 @@ use super::protocol::{self, EventFrame, PacketFlags, MAGIC};
 use super::reroute::ReroutePolicy;
 use super::route::{RoutingHeader, ROUTING_HEADER_SIZE};
 use super::router::{NetRouter, RouterConfig};
-use super::session::NetSession;
+use super::session::{NetSession, TxAdmit};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subprotocol::MigrationSubprotocolHandler;
 use super::transport::{NetSocket, PacketReceiver, ParsedPacket, SocketBufferConfig};
@@ -2033,6 +2033,12 @@ impl MeshNode {
     /// or buffer at the app layer). `tx_window == 0` disables the check
     /// and preserves pre-backpressure behavior. `Transport` is returned
     /// for underlying socket send failures.
+    ///
+    /// Returns `NotConnected` when the stream was never opened or has
+    /// been closed since (`close_stream`, idle eviction, cap-exceeded
+    /// LRU). A previously-closed `Stream` handle is inert by design —
+    /// reusing it does NOT silently re-create the stream with default
+    /// config; the caller must explicitly re-open.
     pub async fn send_on_stream(
         &self,
         stream: &Stream,
@@ -2053,6 +2059,16 @@ impl MeshNode {
         let stream_id = stream.stream_id;
         let reliable = stream.config.reliability.is_reliable();
 
+        // Refuse to send on a stream that isn't currently open. This
+        // is the contract for the typed `Stream` handle: closing the
+        // stream (or letting it be idle-evicted / LRU-trimmed) should
+        // NOT be papered over by silently recreating it with defaults
+        // on the next send. Callers that want the legacy auto-create
+        // behavior use `send_to_peer` / `send_routed` instead.
+        if session.try_stream(stream_id).is_none() {
+            return Err(StreamError::NotConnected);
+        }
+
         let pool = session.thread_local_pool();
         let mut builder = pool.get();
 
@@ -2063,28 +2079,37 @@ impl MeshNode {
         // building the packet, release after the socket send (success
         // or failure). Failure to acquire immediately surfaces
         // `StreamError::Backpressure` — no packets in this call have
-        // been sent yet, so the caller can cleanly retry or drop.
+        // been sent yet, so the caller can cleanly retry or drop. If
+        // the stream disappears mid-call (e.g., another task races a
+        // `close_stream`), we surface `NotConnected`.
         let flags = if reliable {
             PacketFlags::RELIABLE
         } else {
             PacketFlags::NONE
         };
 
+        // Admit + send + release on one-packet scope. The `_guard`
+        // binding is the RAII release: if the `.await` is cancelled
+        // (`tokio::select!` races a shutdown signal, caller drops the
+        // future) the guard's Drop still fires and decrements
+        // `tx_inflight`. Without this the slot would leak.
         for event in events {
             let frame_size = EventFrame::LEN_SIZE + event.len();
             if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE && !current_batch.is_empty() {
-                let seq = {
-                    let state = session.get_or_create_stream(stream_id);
-                    if !state.try_acquire_tx_slot() {
-                        return Err(StreamError::Backpressure);
+                let (guard, seq) = match session.try_acquire_tx_slot_guard(stream_id) {
+                    TxAdmit::Acquired(g) => {
+                        let seq = session
+                            .try_stream(stream_id)
+                            .ok_or(StreamError::NotConnected)?
+                            .next_tx_seq();
+                        (g, seq)
                     }
-                    state.next_tx_seq()
+                    TxAdmit::WindowFull => return Err(StreamError::Backpressure),
+                    TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
                 };
                 let packet = builder.build(stream_id, seq, &current_batch, flags);
                 let send_res = self.socket.send_to(&packet, peer_addr).await;
-                if let Some(state) = session.try_stream(stream_id) {
-                    state.release_tx_slot();
-                }
+                drop(guard); // explicit — RAII also fires on cancellation
                 send_res.map_err(|e| StreamError::Transport(format!("send failed: {}", e)))?;
                 current_batch.clear();
                 current_size = 0;
@@ -2094,18 +2119,20 @@ impl MeshNode {
         }
 
         if !current_batch.is_empty() {
-            let seq = {
-                let state = session.get_or_create_stream(stream_id);
-                if !state.try_acquire_tx_slot() {
-                    return Err(StreamError::Backpressure);
+            let (guard, seq) = match session.try_acquire_tx_slot_guard(stream_id) {
+                TxAdmit::Acquired(g) => {
+                    let seq = session
+                        .try_stream(stream_id)
+                        .ok_or(StreamError::NotConnected)?
+                        .next_tx_seq();
+                    (g, seq)
                 }
-                state.next_tx_seq()
+                TxAdmit::WindowFull => return Err(StreamError::Backpressure),
+                TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
             };
             let packet = builder.build(stream_id, seq, &current_batch, flags);
             let send_res = self.socket.send_to(&packet, peer_addr).await;
-            if let Some(state) = session.try_stream(stream_id) {
-                state.release_tx_slot();
-            }
+            drop(guard);
             send_res.map_err(|e| StreamError::Transport(format!("send failed: {}", e)))?;
         }
 

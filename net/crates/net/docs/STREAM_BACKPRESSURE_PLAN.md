@@ -66,18 +66,51 @@ tx_window: u32,
 tx_inflight: AtomicU32,
 ```
 
-`MeshNode::send_on_stream` gains a check before each socket send:
+`MeshNode::send_on_stream` gains a check before each socket send.
+Two correctness properties the check must preserve:
 
-```rust
-if state.tx_inflight.load(Acquire) >= state.tx_window {
-    state.backpressure_events.fetch_add(1, Relaxed);
-    return Err(StreamError::Backpressure);
-}
-state.tx_inflight.fetch_add(1, AcqRel);
-let result = socket.send_to(&packet, peer_addr).await;
-state.tx_inflight.fetch_sub(1, AcqRel);
-result.map_err(...)?;
-```
+1. **Atomic check + increment.** A naive `load(Acquire); if cur < window { fetch_add(1) }` race-oversubscribes the window: two threads both read `cur == window-1`, both increment, and the counter ends up at `window+1`. Use a CAS loop so the admission decision and the increment happen together:
+
+    ```rust
+    loop {
+        let cur = state.tx_inflight.load(Acquire);
+        if cur >= state.tx_window {
+            state.backpressure_events.fetch_add(1, Relaxed);
+            return Err(StreamError::Backpressure);
+        }
+        if state
+            .tx_inflight
+            .compare_exchange_weak(cur, cur + 1, AcqRel, Acquire)
+            .is_ok()
+        {
+            break;
+        }
+        // CAS lost the race — retry with the fresh value.
+    }
+    ```
+
+2. **Release on every exit path, including async cancellation.** A plain "increment, await, decrement" shape leaks the slot when the caller drops the future mid-`await` (e.g., `tokio::select!` races the send against a shutdown signal). The cure is a RAII guard that decrements on `Drop`:
+
+    ```rust
+    struct TxSlotGuard {
+        session: Arc<NetSession>,
+        stream_id: u64,
+    }
+    impl Drop for TxSlotGuard {
+        fn drop(&mut self) {
+            if let Some(state) = self.session.try_stream(self.stream_id) {
+                state.release_tx_slot();
+            }
+        }
+    }
+    // ...
+    let guard = acquire_slot(&session, stream_id)?; // CAS-admit inside
+    let result = socket.send_to(&packet, peer_addr).await;
+    drop(guard); // explicit for clarity; also fires on cancellation/panic
+    result.map_err(...)?;
+    ```
+
+   The guard looks up the stream fresh at drop time rather than holding a `DashMap` ref across the `await` — holding a shard lock across await would risk a deadlock with the receive loop.
 
 The counter is incremented **per packet**, not per `send()` call; large batches that straddle `MAX_PAYLOAD_SIZE` split into multiple packets and consume multiple window slots.
 

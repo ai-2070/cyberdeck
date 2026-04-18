@@ -3871,6 +3871,85 @@ async fn test_stream_open_close_idempotency() {
     b.shutdown().await.unwrap();
 }
 
+/// Regression: `send_on_stream` used to call `session.get_or_create_stream`,
+/// which would silently revive a closed stream with *default* config
+/// (losing the caller's original `Reliability` / `tx_window` /
+/// `fairness_weight`) on the next send. A stale `Stream` handle
+/// reaching back into a closed session thus produced a stream the
+/// caller never explicitly opened.
+///
+/// Fix: `send_on_stream` now checks `session.try_stream(stream_id)`
+/// and returns `StreamError::NotConnected` if the stream isn't
+/// currently open. Callers that want auto-create behavior use
+/// `send_to_peer` / `send_routed` instead of the typed handle API.
+#[tokio::test]
+async fn test_regression_send_on_stream_rejects_closed_stream() {
+    use net::adapter::net::{Reliability, StreamConfig, StreamError};
+
+    let ports = find_ports(2).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+    };
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let pub_b = *b.public_key();
+
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    // Open a reliable stream, send once to prime state.
+    let stream = a
+        .open_stream(
+            nid_b,
+            123,
+            StreamConfig::new().with_reliability(Reliability::Reliable),
+        )
+        .unwrap();
+    a.send_on_stream(&stream, &[Bytes::from_static(b"{}")])
+        .await
+        .unwrap();
+
+    // Close the stream. The `stream` handle is now stale — the
+    // session no longer tracks stream_id 123.
+    a.close_stream(nid_b, 123);
+    assert!(a.stream_stats(nid_b, 123).is_none());
+
+    // Send on the stale handle. Must return NotConnected — NOT
+    // silently recreate with default (FireAndForget, tx_window=0)
+    // config and succeed.
+    let result = a
+        .send_on_stream(&stream, &[Bytes::from_static(b"{}")])
+        .await;
+    assert!(
+        matches!(result, Err(StreamError::NotConnected)),
+        "expected NotConnected for send on closed stream; got {:?}",
+        result
+    );
+    // And the session still has no entry for 123 — no silent
+    // recreation happened.
+    assert!(
+        a.stream_stats(nid_b, 123).is_none(),
+        "send on closed stream must NOT revive the stream"
+    );
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
 // ============================================================================
 // Multi-hop routing discovery
 // ============================================================================

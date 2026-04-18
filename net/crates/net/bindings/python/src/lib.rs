@@ -1134,12 +1134,24 @@ mod mesh_bindings {
         ///         events sent — the caller decides what to do).
         ///     NotConnectedError: stream's peer session is gone.
         ///     RuntimeError: underlying transport failure.
-        fn send_on_stream(&self, stream: &NetStream, events: Vec<Vec<u8>>) -> PyResult<()> {
+        fn send_on_stream(
+            &self,
+            py: Python<'_>,
+            stream: &NetStream,
+            events: Vec<Vec<u8>>,
+        ) -> PyResult<()> {
             let node = self.get_node()?;
             let payloads: Vec<bytes::Bytes> = events.into_iter().map(bytes::Bytes::from).collect();
-            self.runtime
-                .block_on(node.send_on_stream(&stream.core, &payloads))
-                .map_err(stream_error_to_py)
+            // Release the GIL while the runtime is actually awaiting the
+            // socket send. Without this, every other Python thread is
+            // blocked for the duration — matters even for a single round
+            // trip under contention, matters a lot for `send_with_retry`
+            // / `send_blocking`.
+            py.detach(|| {
+                self.runtime
+                    .block_on(node.send_on_stream(&stream.core, &payloads))
+            })
+            .map_err(stream_error_to_py)
         }
 
         /// Send events, retrying on `BackpressureError` with 5 ms → 200 ms
@@ -1148,25 +1160,48 @@ mod mesh_bindings {
         #[pyo3(signature = (stream, events, max_retries=8))]
         fn send_with_retry(
             &self,
+            py: Python<'_>,
             stream: &NetStream,
             events: Vec<Vec<u8>>,
             max_retries: u32,
         ) -> PyResult<()> {
             let node = self.get_node()?;
             let payloads: Vec<bytes::Bytes> = events.into_iter().map(bytes::Bytes::from).collect();
-            self.runtime
-                .block_on(node.send_with_retry(&stream.core, &payloads, max_retries as usize))
-                .map_err(stream_error_to_py)
+            py.detach(|| {
+                self.runtime.block_on(node.send_with_retry(
+                    &stream.core,
+                    &payloads,
+                    max_retries as usize,
+                ))
+            })
+            .map_err(stream_error_to_py)
         }
 
         /// Block the calling task until the send succeeds or a
-        /// transport error occurs. Unbounded retry on `BackpressureError`.
-        fn send_blocking(&self, stream: &NetStream, events: Vec<Vec<u8>>) -> PyResult<()> {
+        /// transport error occurs. Retries `BackpressureError` with
+        /// 5 ms → 200 ms exponential backoff up to 4096 times (~13 min
+        /// worst case) — effectively "block until the network lets up"
+        /// for practical workloads, but with a hard upper bound so
+        /// runaway pressure can't hang the caller forever. Use
+        /// `send_with_retry` for a tighter bound.
+        ///
+        /// Releases the GIL for the duration of the block — retries
+        /// can take arbitrarily long under sustained backpressure, so
+        /// other Python threads must be free to run (GC, signals,
+        /// other worker threads).
+        fn send_blocking(
+            &self,
+            py: Python<'_>,
+            stream: &NetStream,
+            events: Vec<Vec<u8>>,
+        ) -> PyResult<()> {
             let node = self.get_node()?;
             let payloads: Vec<bytes::Bytes> = events.into_iter().map(bytes::Bytes::from).collect();
-            self.runtime
-                .block_on(node.send_blocking(&stream.core, &payloads))
-                .map_err(stream_error_to_py)
+            py.detach(|| {
+                self.runtime
+                    .block_on(node.send_blocking(&stream.core, &payloads))
+            })
+            .map_err(stream_error_to_py)
         }
 
         /// Snapshot of per-stream stats. Returns None if the peer or

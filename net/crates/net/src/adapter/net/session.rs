@@ -112,6 +112,101 @@ impl NetSession {
         self.streams.get(&stream_id)
     }
 
+    /// Try to acquire a TX slot on `stream_id` with RAII release
+    /// semantics.
+    ///
+    /// Returns:
+    ///   * [`TxAdmit::Acquired`] with a [`TxSlotGuard`] that decrements
+    ///     `tx_inflight` when dropped — including on async cancellation,
+    ///     panic, and early return. This is the cure for the slot-leak
+    ///     that a plain "increment / await / decrement" shape would
+    ///     hit when a caller drops the sending future mid-`.await`
+    ///     (e.g., under a `tokio::select!` cancel).
+    ///   * [`TxAdmit::WindowFull`] if `tx_inflight` is already at
+    ///     `tx_window`. `backpressure_events` has already been bumped.
+    ///   * [`TxAdmit::StreamClosed`] if the stream isn't registered
+    ///     (never opened, closed, or idle-evicted).
+    pub fn try_acquire_tx_slot_guard(self: &Arc<Self>, stream_id: u64) -> TxAdmit {
+        // Look up the stream to decide admission. Release the
+        // DashMap ref before returning so the guard's Drop doesn't
+        // deadlock trying to re-acquire it.
+        let admitted = match self.streams.get(&stream_id) {
+            None => return TxAdmit::StreamClosed,
+            Some(state) => state.try_acquire_tx_slot(),
+        };
+        if !admitted {
+            return TxAdmit::WindowFull;
+        }
+        TxAdmit::Acquired(TxSlotGuard {
+            session: Arc::clone(self),
+            stream_id,
+            active: true,
+        })
+    }
+}
+
+/// Outcome of [`NetSession::try_acquire_tx_slot_guard`].
+#[derive(Debug)]
+pub enum TxAdmit {
+    /// Admission succeeded; the guard holds the slot until dropped.
+    Acquired(TxSlotGuard),
+    /// `tx_inflight` is already at `tx_window`. `backpressure_events`
+    /// was incremented as a side effect of the decision.
+    WindowFull,
+    /// The stream isn't currently open on this session.
+    StreamClosed,
+}
+
+/// RAII guard that releases a TX slot when dropped.
+///
+/// On `Drop` (normal scope end, early return via `?`, panic, or async
+/// cancellation), the guard re-looks up the stream and calls
+/// [`StreamState::release_tx_slot`] if it's still registered. If the
+/// stream has been closed in the interim, the release is a no-op —
+/// `close_stream` already tore the state down.
+pub struct TxSlotGuard {
+    session: Arc<NetSession>,
+    stream_id: u64,
+    active: bool,
+}
+
+impl std::fmt::Debug for TxSlotGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TxSlotGuard")
+            .field("stream_id", &format_args!("{:#x}", self.stream_id))
+            .field("active", &self.active)
+            .finish()
+    }
+}
+
+impl TxSlotGuard {
+    /// Which stream this guard is holding a slot on.
+    #[inline]
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    /// Consume the guard without releasing the slot. Used by tests
+    /// that want to simulate a leaked slot; production code should
+    /// never call this.
+    #[doc(hidden)]
+    pub fn forget(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for TxSlotGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Some(state) = self.session.try_stream(self.stream_id) {
+            state.release_tx_slot();
+        }
+    }
+}
+
+impl NetSession {
     /// Open a stream with an explicit reliability mode and fair-scheduler
     /// weight.
     ///
@@ -874,5 +969,110 @@ mod tests {
         state.release_tx_slot();
         assert_eq!(state.tx_inflight(), 0);
         assert!(state.try_acquire_tx_slot());
+    }
+
+    fn session_with_stream(stream_id: u64, tx_window: u32) -> Arc<NetSession> {
+        let session = Arc::new(NetSession::new(
+            test_keys(),
+            "127.0.0.1:9999".parse().unwrap(),
+            4,
+            false,
+        ));
+        session.open_stream_full(stream_id, false, 1, tx_window);
+        session
+    }
+
+    #[test]
+    fn test_regression_tx_slot_guard_releases_on_drop() {
+        // Regression: without the RAII guard, `send_on_stream`'s
+        // acquire-await-release shape leaks `tx_inflight` if the send
+        // future is dropped mid-`await` (tokio::select! racing a
+        // shutdown, caller abort, panic, etc.). Without a cure, the
+        // stream's window would permanently shrink by one for every
+        // cancellation.
+        //
+        // Fix: `try_acquire_tx_slot_guard` returns a `TxSlotGuard`
+        // that decrements `tx_inflight` in its Drop impl — so any
+        // exit path, including drop-through, releases the slot.
+        let stream_id = 0x7u64;
+        let session = session_with_stream(stream_id, 1);
+
+        // Acquire. Guard is alive → inflight is 1 → a second acquire
+        // must see WindowFull.
+        let guard = match session.try_acquire_tx_slot_guard(stream_id) {
+            TxAdmit::Acquired(g) => g,
+            other => panic!("expected Acquired, got {:?}", other),
+        };
+        assert_eq!(
+            session.try_stream(stream_id).unwrap().tx_inflight(),
+            1,
+            "guard's acquire is observable"
+        );
+        assert!(matches!(
+            session.try_acquire_tx_slot_guard(stream_id),
+            TxAdmit::WindowFull
+        ));
+
+        // Drop the guard. `tx_inflight` must return to 0 — this is
+        // exactly what we need when a send future is cancelled mid-
+        // await.
+        drop(guard);
+        assert_eq!(
+            session.try_stream(stream_id).unwrap().tx_inflight(),
+            0,
+            "dropping the guard releases the slot"
+        );
+        assert!(matches!(
+            session.try_acquire_tx_slot_guard(stream_id),
+            TxAdmit::Acquired(_)
+        ));
+    }
+
+    #[test]
+    fn test_tx_slot_guard_stream_closed_variant() {
+        // Guard lookup races a close_stream: after the stream is
+        // closed the lookup returns StreamClosed, not a guard.
+        let session = session_with_stream(0x9, 1);
+        session.close_stream(0x9);
+        assert!(matches!(
+            session.try_acquire_tx_slot_guard(0x9),
+            TxAdmit::StreamClosed
+        ));
+    }
+
+    #[test]
+    fn test_tx_slot_guard_close_between_acquire_and_drop_no_panic() {
+        // Scenario: a caller acquires a guard, then another task
+        // closes the stream, then the caller drops the guard. The
+        // guard's Drop impl does a fresh `try_stream` lookup, finds
+        // nothing, and silently no-ops. Must not panic / underflow /
+        // resurrect state.
+        let stream_id = 0xAu64;
+        let session = session_with_stream(stream_id, 2);
+        let guard = match session.try_acquire_tx_slot_guard(stream_id) {
+            TxAdmit::Acquired(g) => g,
+            other => panic!("expected Acquired, got {:?}", other),
+        };
+        session.close_stream(stream_id);
+        assert!(session.try_stream(stream_id).is_none());
+        drop(guard); // no-op (state is gone); must not panic
+        assert!(session.try_stream(stream_id).is_none());
+    }
+
+    #[test]
+    fn test_tx_slot_guard_forget_leaves_inflight_elevated() {
+        // `forget()` is a test-only escape hatch that simulates a
+        // leaked slot so we can validate error-recovery code paths.
+        let session = session_with_stream(0xF, 2);
+        let g = match session.try_acquire_tx_slot_guard(0xF) {
+            TxAdmit::Acquired(g) => g,
+            other => panic!("expected Acquired, got {:?}", other),
+        };
+        g.forget();
+        assert_eq!(
+            session.try_stream(0xF).unwrap().tx_inflight(),
+            1,
+            "forget() skips the Drop release"
+        );
     }
 }

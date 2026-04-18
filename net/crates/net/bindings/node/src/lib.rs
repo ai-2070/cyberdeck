@@ -1267,7 +1267,12 @@ mod mesh_bindings {
         }
 
         /// Block the calling JS task until the send succeeds or a
-        /// transport error occurs. Unbounded retry on `Backpressure`.
+        /// transport error occurs. Retries `Backpressure` with 5 ms →
+        /// 200 ms exponential backoff up to 4096 times (~13 min worst
+        /// case) — effectively "block until the network lets up" for
+        /// practical workloads, but with a hard upper bound so runaway
+        /// pressure can't hang a caller forever. Use `sendWithRetry`
+        /// directly if you need a tighter bound.
         #[napi]
         pub async fn send_blocking(&self, stream: &NetStream, events: Vec<Buffer>) -> Result<()> {
             let guard = self.load_node()?;

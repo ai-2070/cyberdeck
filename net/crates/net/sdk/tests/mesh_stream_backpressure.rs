@@ -14,21 +14,26 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use net_sdk::error::SdkError;
-use net_sdk::mesh::MeshBuilder;
+use net_sdk::mesh::{Mesh, MeshBuilder};
 use net_sdk::{Reliability, StreamConfig};
-use tokio::net::UdpSocket;
 
-async fn find_two_ports() -> (u16, u16) {
-    let s1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let s2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let p = (
-        s1.local_addr().unwrap().port(),
-        s2.local_addr().unwrap().port(),
-    );
-    drop(s1);
-    drop(s2);
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    p
+/// Build two `Mesh` nodes bound on OS-assigned ephemeral ports. Reads
+/// the kernel-picked port back via `MeshNode::local_addr()` after the
+/// bind has already succeeded — avoids the classic "bind+drop to probe,
+/// then re-bind" race that can make tests flaky under parallel runs.
+async fn two_bound_meshes(psk: &[u8; 32]) -> (Mesh, Mesh, std::net::SocketAddr) {
+    let a = MeshBuilder::new("127.0.0.1:0", psk)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let b = MeshBuilder::new("127.0.0.1:0", psk)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let addr_b = b.inner().local_addr();
+    (a, b, addr_b)
 }
 
 /// Open a stream with window=1, spawn concurrent sends, assert that at
@@ -36,21 +41,8 @@ async fn find_two_ports() -> (u16, u16) {
 /// crosses the SDK boundary cleanly).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_sdk_surfaces_backpressure_variant() {
-    let (port_a, port_b) = find_two_ports().await;
-    let addr_a = format!("127.0.0.1:{}", port_a);
-    let addr_b = format!("127.0.0.1:{}", port_b);
     let psk = [0x42u8; 32];
-
-    let a = MeshBuilder::new(&addr_a, &psk)
-        .unwrap()
-        .build()
-        .await
-        .unwrap();
-    let b = MeshBuilder::new(&addr_b, &psk)
-        .unwrap()
-        .build()
-        .await
-        .unwrap();
+    let (a, b, addr_b) = two_bound_meshes(&psk).await;
 
     // Handshake (A connects to B as initiator, B accepts).
     let pub_b = *b.inner().public_key();
@@ -59,9 +51,7 @@ async fn test_sdk_surfaces_backpressure_variant() {
 
     let (r1, r2) = tokio::join!(b.inner().accept(nid_a), async {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        a.inner()
-            .connect(addr_b.parse().unwrap(), &pub_b, nid_b)
-            .await
+        a.inner().connect(addr_b, &pub_b, nid_b).await
     });
     r1.expect("accept");
     r2.expect("connect");
@@ -120,21 +110,8 @@ async fn test_sdk_surfaces_backpressure_variant() {
 /// on a 4-slot window under 32 concurrent senders.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_sdk_send_with_retry_succeeds_through_backpressure() {
-    let (port_a, port_b) = find_two_ports().await;
-    let addr_a = format!("127.0.0.1:{}", port_a);
-    let addr_b = format!("127.0.0.1:{}", port_b);
     let psk = [0x42u8; 32];
-
-    let a = MeshBuilder::new(&addr_a, &psk)
-        .unwrap()
-        .build()
-        .await
-        .unwrap();
-    let b = MeshBuilder::new(&addr_b, &psk)
-        .unwrap()
-        .build()
-        .await
-        .unwrap();
+    let (a, b, addr_b) = two_bound_meshes(&psk).await;
 
     let pub_b = *b.inner().public_key();
     let nid_b = b.inner().node_id();
@@ -142,9 +119,7 @@ async fn test_sdk_send_with_retry_succeeds_through_backpressure() {
 
     let (r1, r2) = tokio::join!(b.inner().accept(nid_a), async {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        a.inner()
-            .connect(addr_b.parse().unwrap(), &pub_b, nid_b)
-            .await
+        a.inner().connect(addr_b, &pub_b, nid_b).await
     });
     r1.unwrap();
     r2.unwrap();

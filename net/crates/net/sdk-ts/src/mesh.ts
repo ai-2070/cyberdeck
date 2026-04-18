@@ -126,6 +126,38 @@ function toStreamError(e: unknown): never {
   throw e;
 }
 
+/**
+ * Convert a `bigint` to a `number` with an explicit safe-integer range
+ * check. The napi layer accepts `i64`, but JS `number` is IEEE-754
+ * double precision — any value outside `Number.MAX_SAFE_INTEGER` loses
+ * precision silently. We'd rather fail loudly than corrupt a node or
+ * stream id on the way into the binding.
+ */
+function toSafeNumber(label: string, value: bigint): number {
+  if (value < 0n) {
+    throw new RangeError(`${label} must be non-negative; got ${value}`);
+  }
+  if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new RangeError(
+      `${label} ${value} exceeds Number.MAX_SAFE_INTEGER — JS has no lossless u64`,
+    );
+  }
+  return Number(value);
+}
+
+/**
+ * Convert a `number` coming back from the napi layer to a `bigint`
+ * after a safe-integer range check. Mirror of {@link toSafeNumber}.
+ */
+function fromSafeNumber(label: string, value: number): bigint {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(
+      `${label} ${value} is outside the JS safe integer range (${Number.MAX_SAFE_INTEGER})`,
+    );
+  }
+  return BigInt(value);
+}
+
 /** Options for {@link MeshNode.create}. */
 export interface MeshNodeConfig {
   /** Local bind address (e.g. `"127.0.0.1:9000"`). */
@@ -182,17 +214,17 @@ export class MeshNode {
 
   /** This node's id. */
   nodeId(): bigint {
-    return BigInt(this.native.nodeId());
+    return fromSafeNumber('nodeId', this.native.nodeId());
   }
 
   /** Connect to a peer as initiator. */
   async connect(peerAddr: string, peerPublicKey: string, peerNodeId: bigint): Promise<void> {
-    await this.native.connect(peerAddr, peerPublicKey, Number(peerNodeId));
+    await this.native.connect(peerAddr, peerPublicKey, toSafeNumber('peerNodeId', peerNodeId));
   }
 
   /** Accept an incoming connection as responder. Returns the peer's wire address. */
   async accept(peerNodeId: bigint): Promise<string> {
-    return await this.native.accept(Number(peerNodeId));
+    return await this.native.accept(toSafeNumber('peerNodeId', peerNodeId));
   }
 
   /** Start the receive loop / heartbeats / router. */
@@ -213,8 +245,8 @@ export class MeshNode {
    * open wins and later differing configs are logged and ignored.
    */
   openStream(peerNodeId: bigint, config: StreamConfig): MeshStream {
-    const native = this.native.openStream(Number(peerNodeId), {
-      streamId: Number(config.streamId),
+    const native = this.native.openStream(toSafeNumber('peerNodeId', peerNodeId), {
+      streamId: toSafeNumber('streamId', config.streamId),
       reliability: config.reliability,
       windowBytes: config.windowBytes,
       fairnessWeight: config.fairnessWeight,
@@ -228,7 +260,10 @@ export class MeshNode {
 
   /** Close a stream. Idempotent. */
   closeStream(peerNodeId: bigint, streamId: bigint): void {
-    this.native.closeStream(Number(peerNodeId), Number(streamId));
+    this.native.closeStream(
+      toSafeNumber('peerNodeId', peerNodeId),
+      toSafeNumber('streamId', streamId),
+    );
   }
 
   /**
@@ -268,7 +303,12 @@ export class MeshNode {
 
   /**
    * Block the calling task until the send succeeds or a transport
-   * error occurs. Unbounded retry on {@link BackpressureError}.
+   * error occurs. Retries {@link BackpressureError} with 5 ms → 200 ms
+   * exponential backoff up to 4096 times (~13 min worst case) —
+   * effectively "block until the network lets up" under practical
+   * workloads, but with a hard upper bound so runaway pressure can't
+   * hang the caller forever. Use {@link sendWithRetry} for a tighter
+   * bound.
    */
   async sendBlocking(stream: MeshStream, events: Buffer[]): Promise<void> {
     try {
@@ -281,15 +321,18 @@ export class MeshNode {
 
   /** Snapshot per-stream stats. `null` if the peer or stream isn't open. */
   streamStats(peerNodeId: bigint, streamId: bigint): StreamStats | null {
-    const raw = this.native.streamStats(Number(peerNodeId), Number(streamId));
+    const raw = this.native.streamStats(
+      toSafeNumber('peerNodeId', peerNodeId),
+      toSafeNumber('streamId', streamId),
+    );
     if (!raw) return null;
     return {
-      txSeq: BigInt(raw.txSeq),
-      rxSeq: BigInt(raw.rxSeq),
-      inboundPending: BigInt(raw.inboundPending),
-      lastActivityNs: BigInt(raw.lastActivityNs),
+      txSeq: fromSafeNumber('stats.txSeq', raw.txSeq),
+      rxSeq: fromSafeNumber('stats.rxSeq', raw.rxSeq),
+      inboundPending: fromSafeNumber('stats.inboundPending', raw.inboundPending),
+      lastActivityNs: fromSafeNumber('stats.lastActivityNs', raw.lastActivityNs),
       active: raw.active,
-      backpressureEvents: BigInt(raw.backpressureEvents),
+      backpressureEvents: fromSafeNumber('stats.backpressureEvents', raw.backpressureEvents),
       txInflight: raw.txInflight,
       txWindow: raw.txWindow,
     };
