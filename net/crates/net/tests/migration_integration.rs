@@ -2276,7 +2276,7 @@ fn test_migration_full_lifecycle_over_subprotocol_single_chunk() {
     // daemon instance when the snapshot arrives.
     target
         .factories
-        .register(origin, kp.clone(), DaemonHostConfig::default(), || {
+        .register(kp.clone(), DaemonHostConfig::default(), || {
             Box::new(CounterDaemon::new())
         });
 
@@ -2363,7 +2363,7 @@ fn test_migration_full_lifecycle_over_subprotocol_multi_chunk() {
 
     target
         .factories
-        .register(origin, kp.clone(), DaemonHostConfig::default(), move || {
+        .register(kp.clone(), DaemonHostConfig::default(), move || {
             Box::new(BigBlobDaemon { state: Vec::new() })
         });
 
@@ -2464,7 +2464,7 @@ fn test_migration_fails_on_corrupted_snapshot() {
     let origin = kp.origin_hash();
     target
         .factories
-        .register(origin, kp, DaemonHostConfig::default(), || {
+        .register(kp, DaemonHostConfig::default(), || {
             Box::new(CounterDaemon::new())
         });
 
@@ -2499,6 +2499,91 @@ fn test_migration_fails_on_corrupted_snapshot() {
     // Factory should still be registered — the bad snapshot took nothing
     // from the registry because restore never started.
     assert!(target.factories.contains(origin));
+}
+
+/// Regression: the subprotocol handler used to `take` the factory entry
+/// *before* attempting `restore_snapshot`. Any restore failure (parse
+/// error, recoverable snapshot corruption, etc.) therefore discarded the
+/// only registered restore inputs, and retrying the migration required
+/// manual re-registration on the target.
+///
+/// The fix is `construct` + `remove`: the factory is cloned for the
+/// restore attempt, and only removed after the attempt succeeds. This
+/// test sends a corrupted snapshot first (failure), then a well-formed
+/// snapshot (success), and confirms the second attempt reuses the
+/// registered factory without re-registration.
+#[test]
+fn test_regression_factory_preserved_for_retry_after_restore_failure() {
+    let source = WireNode::new(0x1111);
+    let target = WireNode::new(0x2222);
+
+    // Build a real daemon + real snapshot on the source.
+    let (kp, origin) = register_counter_daemon(&source.reg, 7);
+    for seq in 1..=3 {
+        source.reg.deliver(origin, &make_event(0xFFFF, seq)).unwrap();
+    }
+    let snapshot = source.reg.snapshot(origin).unwrap().unwrap();
+    let valid_bytes = snapshot.to_bytes();
+
+    // Register the factory once on the target.
+    target.factories.register(
+        kp.clone(),
+        DaemonHostConfig::default(),
+        || Box::new(CounterDaemon::new()),
+    );
+
+    // First attempt: corrupt bytes. Restore must fail, factory preserved.
+    let corrupt = MigrationMessage::SnapshotReady {
+        daemon_origin: origin,
+        snapshot_bytes: vec![0xFFu8; 32],
+        seq_through: 0,
+        chunk_index: 0,
+        total_chunks: 1,
+    };
+    let payload = net::adapter::net::compute::orchestrator::wire::encode(&corrupt).unwrap();
+    let outbound = target
+        .handler
+        .handle_message(&payload, source.node_id)
+        .unwrap();
+    assert!(
+        outbound.iter().any(|o| matches!(
+            net::adapter::net::compute::orchestrator::wire::decode(&o.payload),
+            Ok(MigrationMessage::MigrationFailed { .. })
+        )),
+        "first attempt must emit MigrationFailed"
+    );
+    assert!(
+        target.factories.contains(origin),
+        "factory must remain registered after a failed restore so a \
+         retry can use it without manual re-registration"
+    );
+    assert!(!target.reg.contains(origin));
+
+    // Second attempt: well-formed snapshot. Restore must succeed using
+    // the still-registered factory.
+    let good = MigrationMessage::SnapshotReady {
+        daemon_origin: origin,
+        snapshot_bytes: valid_bytes,
+        seq_through: snapshot.through_seq,
+        chunk_index: 0,
+        total_chunks: 1,
+    };
+    let payload = net::adapter::net::compute::orchestrator::wire::encode(&good).unwrap();
+    let outbound = target
+        .handler
+        .handle_message(&payload, source.node_id)
+        .unwrap();
+    assert!(
+        outbound.iter().any(|o| matches!(
+            net::adapter::net::compute::orchestrator::wire::decode(&o.payload),
+            Ok(MigrationMessage::RestoreComplete { .. })
+        )),
+        "second attempt must emit RestoreComplete"
+    );
+    assert!(target.reg.contains(origin), "daemon must be restored on target");
+    // After a successful restore the factory IS consumed — callers must
+    // re-register to migrate the same origin again.
+    assert!(!target.factories.contains(origin));
 }
 
 #[test]

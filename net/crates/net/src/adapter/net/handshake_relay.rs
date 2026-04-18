@@ -41,6 +41,21 @@ pub fn encode_payload(dest_node_id: u64, src_node_id: u64, noise_bytes: &[u8]) -
     Bytes::from(out)
 }
 
+/// Noise prologue for a relayed handshake between `initiator` (src) and
+/// `responder` (dest). Bound into both sides' Noise state so a relay that
+/// rewrites either node ID produces a prologue mismatch, which in turn
+/// fails `read_message` at the responder (no session keys derived, no
+/// peer registered). The prologue is domain-separated by a short label to
+/// avoid accidental collision with other prologue-using contexts.
+fn relay_prologue(initiator: u64, responder: u64) -> [u8; 16 + 16] {
+    // 16-byte domain tag + 16-byte payload (two u64 LE) = 32 bytes.
+    let mut buf = [0u8; 32];
+    buf[0..16].copy_from_slice(b"net-relay-v1\0\0\0\0");
+    buf[16..24].copy_from_slice(&initiator.to_le_bytes());
+    buf[24..32].copy_from_slice(&responder.to_le_bytes());
+    buf
+}
+
 /// Parsed handshake payload.
 pub struct HandshakePayload {
     pub dest_node_id: u64,
@@ -121,21 +136,46 @@ impl HandshakeHandler {
     }
 
     /// Start an initiator handshake: build msg1 and register a waiter keyed
-    /// by `dest_node_id`. The caller is expected to send the returned payload
-    /// as `SUBPROTOCOL_HANDSHAKE` to a relay, then `await` on the receiver to
-    /// get the session keys once msg2 comes back through the relay chain.
+    /// by `dest_node_id`. The caller sends the returned payload as
+    /// `SUBPROTOCOL_HANDSHAKE` to a relay, then `await`s on the receiver
+    /// to get the session keys once msg2 comes back through the relay.
+    ///
+    /// Rejects a second concurrent call for the same `dest_node_id`: the
+    /// `pending_initiator` map is keyed only by destination, so a silent
+    /// overwrite would orphan the first caller's oneshot and leak its
+    /// Noise state. Callers that want to retry must wait for the current
+    /// attempt to complete (successfully, by timeout, or via
+    /// [`Self::cancel_initiator`]) before trying again.
     pub fn begin_initiator(
         &self,
         dest_node_id: u64,
         dest_pubkey: &[u8; 32],
     ) -> Result<(Bytes, oneshot::Receiver<Result<SessionKeys, CryptoError>>), CryptoError> {
-        let mut noise = NoiseHandshake::initiator(&self.psk, dest_pubkey)?;
+        // Check-and-insert under a single DashMap entry lock to avoid a
+        // race between two concurrent callers.
+        let entry = match self.pending_initiator.entry(dest_node_id) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return Err(CryptoError::Handshake(format!(
+                    "handshake already in flight for peer {:#x}",
+                    dest_node_id
+                )));
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => entry,
+        };
+
+        // Prologue binds (initiator=local, responder=dest) into the Noise
+        // transcript. A relay that rewrites either field in the wire
+        // envelope will cause the responder to build a different prologue
+        // and fail `read_message` on msg1.
+        let prologue = relay_prologue(self.local_node_id, dest_node_id);
+        let mut noise = NoiseHandshake::initiator_with_prologue(
+            &self.psk,
+            dest_pubkey,
+            &prologue,
+        )?;
         let msg1 = noise.write_message(&[])?;
         let (tx, rx) = oneshot::channel();
-        // Replace any stale pending entry; the old waiter (if any) is dropped,
-        // which will surface to its awaiter as a channel-closed error.
-        self.pending_initiator
-            .insert(dest_node_id, PendingInitiator { noise, tx });
+        entry.insert(PendingInitiator { noise, tx });
         let payload = encode_payload(dest_node_id, self.local_node_id, &msg1);
         Ok((payload, rx))
     }
@@ -176,7 +216,18 @@ impl HandshakeHandler {
         }
 
         // Fresh responder message (msg1 from a new initiator).
-        let mut noise = match NoiseHandshake::responder(&self.psk, &self.static_keypair) {
+        //
+        // Build the prologue from the plaintext envelope's claimed
+        // (src, dest) node IDs. If a relay rewrote either field, the
+        // prologue here will differ from what the genuine initiator used,
+        // and `read_message` below will fail — the tampered handshake is
+        // rejected and no peer is registered.
+        let prologue = relay_prologue(parsed.src_node_id, parsed.dest_node_id);
+        let mut noise = match NoiseHandshake::responder_with_prologue(
+            &self.psk,
+            &self.static_keypair,
+            &prologue,
+        ) {
             Ok(n) => n,
             Err(e) => {
                 tracing::warn!(error = %e, "handshake relay: failed to create responder");
@@ -299,5 +350,157 @@ mod tests {
             HandshakeAction::Forward { to_node, .. } => assert_eq!(*to_node, 0x9999),
             _ => panic!("expected Forward"),
         }
+    }
+
+    /// Regression: the relay envelope's `src_node_id` field used to flow
+    /// directly into peer registration on the responder without any
+    /// cryptographic check. A malicious relay could rewrite it and the
+    /// responder would bind its session keys to an attacker-chosen peer
+    /// ID, misrouting traffic or enabling impersonation.
+    ///
+    /// The fix binds `(src_node_id, dest_node_id)` into the Noise prologue
+    /// on both sides. Rewriting either field on the wire makes the
+    /// responder's prologue differ from what the genuine initiator used,
+    /// causing `read_message` on msg1 to fail. No `RegisterResponderPeer`
+    /// action is emitted and no peer is registered.
+    #[tokio::test]
+    async fn test_regression_relay_tampering_of_src_node_id_is_rejected() {
+        let psk = [0x42u8; 32];
+        let responder_kp = StaticKeypair::generate();
+        let initiator_kp = StaticKeypair::generate();
+        let nid_init: u64 = 0x1111;
+        let nid_resp: u64 = 0x2222;
+        let nid_attacker: u64 = 0x9999;
+
+        let initiator = HandshakeHandler::new(nid_init, initiator_kp, psk);
+        let responder = HandshakeHandler::new(nid_resp, responder_kp.clone(), psk);
+
+        // Genuine initiator builds msg1 addressed to nid_resp with its
+        // own nid_init as the source.
+        let (genuine_payload, _rx) = initiator
+            .begin_initiator(nid_resp, &responder_kp.public)
+            .unwrap();
+
+        // Malicious relay rewrites src_node_id from nid_init to
+        // nid_attacker. dest and noise_bytes unchanged.
+        let parsed = HandshakePayload::decode(genuine_payload.clone()).unwrap();
+        assert_eq!(parsed.src_node_id, nid_init);
+        let tampered = encode_payload(parsed.dest_node_id, nid_attacker, &parsed.noise_bytes);
+
+        let dummy_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let actions = responder.handle_message(&tampered, dummy_addr);
+
+        assert!(
+            actions.is_empty(),
+            "tampered src_node_id must cause msg1 to fail Noise auth — \
+             no RegisterResponderPeer should be emitted, got {} actions",
+            actions.len()
+        );
+    }
+
+    /// Same attack on the `dest_node_id` field: a relay that rewrites the
+    /// envelope's destination (say, to confuse which daemon this handshake
+    /// is for) is caught the same way — different prologue, failed MAC.
+    #[tokio::test]
+    async fn test_regression_relay_tampering_of_dest_node_id_is_rejected() {
+        let psk = [0x42u8; 32];
+        let responder_kp = StaticKeypair::generate();
+        let initiator_kp = StaticKeypair::generate();
+        let nid_init: u64 = 0x1111;
+        let nid_resp: u64 = 0x2222;
+
+        let initiator = HandshakeHandler::new(nid_init, initiator_kp, psk);
+        let responder = HandshakeHandler::new(nid_resp, responder_kp.clone(), psk);
+
+        let (genuine_payload, _rx) = initiator
+            .begin_initiator(nid_resp, &responder_kp.public)
+            .unwrap();
+        // Confirm the genuine envelope was constructed as expected.
+        let genuine = HandshakePayload::decode(genuine_payload).unwrap();
+        assert_eq!(genuine.dest_node_id, nid_resp);
+
+        // Relay rewrites dest to a different u64 but still addressed at us
+        // (so the responder processes it). `local_node_id` of the
+        // responder is nid_resp; we'll claim it's nid_resp but set the
+        // prologue's dest side to something different by tampering.
+        // Because `dest_node_id != self.local_node_id` would trigger the
+        // forward branch instead, we re-target to nid_resp but also use
+        // a prologue-shifted payload: the easiest way is to fabricate an
+        // msg1 that claims dest=nid_resp but was sealed against a
+        // different dest in the initiator's prologue.
+        //
+        // We emulate this by constructing a prologue-mismatched state on
+        // the initiator side: start a second initiator handshake against
+        // the responder but declare dest=nid_resp+1. The bytes addressed
+        // to nid_resp+1 will not open against a responder with
+        // `local_node_id = nid_resp` — but we force delivery by rewriting
+        // dest=nid_resp in the wire envelope after construction.
+        let (other_payload, _rx2) = initiator
+            .begin_initiator(nid_resp + 1, &responder_kp.public)
+            .unwrap();
+        let other_parsed = HandshakePayload::decode(other_payload).unwrap();
+        let tampered = encode_payload(nid_resp, nid_init, &other_parsed.noise_bytes);
+
+        // Sanity: the responder *would* decode the envelope (dest matches
+        // us), but the prologue it builds won't match what the initiator
+        // actually used, so Noise rejects msg1.
+        let dummy_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let actions = responder.handle_message(&tampered, dummy_addr);
+
+        assert!(
+            actions.is_empty(),
+            "tampered dest_node_id must be rejected via Noise prologue \
+             mismatch; got {} actions",
+            actions.len()
+        );
+        // Clean up the second pending initiator we created just to get
+        // byte material — no test assertion depends on it.
+        initiator.cancel_initiator(nid_resp + 1);
+        initiator.cancel_initiator(nid_resp);
+    }
+
+    /// Regression: `pending_initiator` is keyed only by `dest_node_id`.
+    /// A second concurrent `begin_initiator` call for the same dest used
+    /// to silently overwrite the first, so the first caller's oneshot was
+    /// dropped and its Noise state leaked. On the caller side that
+    /// showed up as an opaque channel-closed error, not a real handshake
+    /// failure — making parallel retries unreliable.
+    ///
+    /// The fix rejects the second call with `CryptoError::Handshake` so
+    /// the caller can choose to wait, cancel, or back off.
+    #[test]
+    fn test_regression_concurrent_begin_initiator_is_rejected() {
+        let psk = [0x42u8; 32];
+        let local_kp = StaticKeypair::generate();
+        let responder_kp = StaticKeypair::generate();
+
+        let handler = HandshakeHandler::new(0x1111, local_kp, psk);
+
+        // First call succeeds.
+        let first = handler.begin_initiator(0x2222, &responder_kp.public);
+        assert!(first.is_ok(), "first concurrent call should succeed");
+        let (_payload, _rx) = first.unwrap();
+
+        // Second concurrent call to the same dest must be refused.
+        let second = handler.begin_initiator(0x2222, &responder_kp.public);
+        match second {
+            Err(CryptoError::Handshake(msg)) => {
+                assert!(
+                    msg.contains("already in flight"),
+                    "expected 'already in flight' in error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected Err(Handshake), got {:?}", other.err()),
+        }
+
+        // A different dest is independent and still works.
+        let other = handler.begin_initiator(0x3333, &responder_kp.public);
+        assert!(other.is_ok(), "different dest must be independent");
+
+        // After cancelling the first, a retry to 0x2222 works.
+        handler.cancel_initiator(0x2222);
+        let retry = handler.begin_initiator(0x2222, &responder_kp.public);
+        assert!(retry.is_ok(), "retry after cancel should succeed");
     }
 }

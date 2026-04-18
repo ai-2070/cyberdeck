@@ -409,9 +409,12 @@ impl MigrationSubprotocolHandler {
             }
         };
 
-        // Look up factory + keypair + config.
-        let entry = match self.target_handler.factories().take(daemon_origin) {
-            Some(e) => e,
+        // Build restore inputs without removing the registration. If the
+        // restore fails (e.g., parse error revealed at a later layer, or
+        // any other recoverable failure), the factory stays in place so a
+        // retry can use it without the caller re-registering.
+        let inputs = match self.target_handler.factories().construct(daemon_origin) {
+            Some(i) => i,
             None => {
                 return Ok(Some(self.fail_migration(
                     daemon_origin,
@@ -429,20 +432,28 @@ impl MigrationSubprotocolHandler {
             .source_node(daemon_origin)
             .unwrap_or(from_node);
 
+        let daemon = inputs.daemon;
         if let Err(e) = self.target_handler.restore_snapshot(
             daemon_origin,
             &snapshot,
             source_node,
-            entry.keypair,
-            entry.factory,
-            entry.config,
+            inputs.keypair,
+            move || daemon,
+            inputs.config,
         ) {
+            // Factory is still registered — next `SnapshotReady` for this
+            // origin (e.g., from an orchestrator retry) can try again.
             return Ok(Some(self.fail_migration(
                 daemon_origin,
                 from_node,
                 &format!("restore_snapshot failed: {:?}", e),
             )?));
         }
+
+        // Restore succeeded — the registration is now single-shot. Remove
+        // it so a second migration for the same origin, without explicit
+        // re-registration, is refused.
+        self.target_handler.factories().remove(daemon_origin);
 
         let reply = MigrationMessage::RestoreComplete {
             daemon_origin,

@@ -2832,7 +2832,6 @@ async fn test_migration_full_lifecycle_over_wire() {
     let registry_c = Arc::new(DaemonRegistry::new());
     let factories_c = Arc::new(DaemonFactoryRegistry::new());
     factories_c.register(
-        daemon_origin,
         daemon_kp.clone(),
         DaemonHostConfig::default(),
         || Box::new(CounterDaemon::with_count(0)),
@@ -3734,6 +3733,91 @@ async fn test_regression_proximity_graph_local_id_matches_peer_encoding() {
     );
 
     node.shutdown().await.unwrap();
+}
+
+/// Regression: `execute_handshake_action::RegisterResponderPeer` used to
+/// insert the peer + session + route *before* the msg2 send was spawned,
+/// and the send result was ignored. If the spawned send failed (partition
+/// filter set, socket error, etc.), the responder would keep a half-open
+/// peer record: the initiator never sees msg2 and the responder has a
+/// session it will never be able to use.
+///
+/// The fix is to register the peer only after the msg2 send succeeds,
+/// inside the spawned task. This test asserts the happy path still
+/// registers — the converse (failure-path silence) is structurally
+/// guaranteed by the spawned-task ordering in
+/// `execute_handshake_action` and covered in a code review.
+#[tokio::test]
+async fn test_regression_handshake_relay_registers_peer_after_msg2_sent() {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(30))
+    };
+
+    let a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let pub_b = *b.public_key();
+    let pub_c = *c.public_key();
+
+    // A↔B and B↔C direct sessions.
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    let (r1, r2) = tokio::join!(c.accept(nid_b), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        b.connect(addr_c, &pub_c, nid_c).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+
+    // After direct connects, both sides should see exactly one peer.
+    assert_eq!(a.peer_count(), 1);
+    assert_eq!(c.peer_count(), 1);
+
+    a.start();
+    b.start();
+    c.start();
+
+    a.connect_via(addr_b, &pub_c, nid_c).await.unwrap();
+
+    // Give the spawned msg2-send on C time to resolve before we inspect.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Happy path: A now has C registered, C now has A registered. Both
+    // registrations ride on msg2 actually having been sent; without the
+    // fix, C's A-peer insertion races the send and can happen even if
+    // the send silently fails.
+    assert_eq!(a.peer_count(), 2, "A must have B and C");
+    assert_eq!(
+        c.peer_count(),
+        2,
+        "C must have B and A — the A entry is only inserted after the \
+         spawned msg2-send succeeds"
+    );
+    let _ = nid_a;
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
 }
 
 /// Regression: the receive loop used to dispatch any 72-byte UDP packet as

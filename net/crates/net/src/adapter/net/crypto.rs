@@ -134,10 +134,27 @@ pub struct NoiseHandshake {
 }
 
 impl NoiseHandshake {
-    /// Create initiator handshake state.
+    /// Create initiator handshake state with an empty prologue.
     ///
     /// The initiator knows the responder's static public key.
     pub fn initiator(psk: &[u8; 32], responder_static: &[u8; 32]) -> Result<Self, CryptoError> {
+        Self::initiator_with_prologue(psk, responder_static, &[])
+    }
+
+    /// Create initiator handshake state with a caller-supplied prologue.
+    ///
+    /// The prologue is mixed into the Noise handshake hash but never sent
+    /// on the wire. Both peers must use byte-identical prologues or `msg1`
+    /// will fail to authenticate. Used by the relayed-handshake path to
+    /// bind the `(dest_node_id, src_node_id)` in the plaintext envelope
+    /// into the Noise transcript — a relay that rewrites either field
+    /// produces a prologue mismatch on the responder, and the attack is
+    /// detected as a Noise `read_message` failure.
+    pub fn initiator_with_prologue(
+        psk: &[u8; 32],
+        responder_static: &[u8; 32],
+        prologue: &[u8],
+    ) -> Result<Self, CryptoError> {
         let params: NoiseParams = NOISE_PATTERN
             .parse()
             .map_err(|e| CryptoError::Handshake(format!("invalid noise params: {}", e)))?;
@@ -145,6 +162,8 @@ impl NoiseHandshake {
         let state = Builder::new(params)
             .psk(0, psk)
             .map_err(|e| CryptoError::Handshake(format!("failed to set psk: {}", e)))?
+            .prologue(prologue)
+            .map_err(|e| CryptoError::Handshake(format!("failed to set prologue: {}", e)))?
             .remote_public_key(responder_static)
             .map_err(|e| CryptoError::Handshake(format!("failed to set remote key: {}", e)))?
             .build_initiator()
@@ -156,10 +175,21 @@ impl NoiseHandshake {
         })
     }
 
-    /// Create responder handshake state.
+    /// Create responder handshake state with an empty prologue.
     ///
     /// The responder uses its static keypair for authentication.
     pub fn responder(psk: &[u8; 32], static_keypair: &StaticKeypair) -> Result<Self, CryptoError> {
+        Self::responder_with_prologue(psk, static_keypair, &[])
+    }
+
+    /// Create responder handshake state with a caller-supplied prologue.
+    ///
+    /// See [`Self::initiator_with_prologue`] for the authentication story.
+    pub fn responder_with_prologue(
+        psk: &[u8; 32],
+        static_keypair: &StaticKeypair,
+        prologue: &[u8],
+    ) -> Result<Self, CryptoError> {
         let params: NoiseParams = NOISE_PATTERN
             .parse()
             .map_err(|e| CryptoError::Handshake(format!("invalid noise params: {}", e)))?;
@@ -167,6 +197,8 @@ impl NoiseHandshake {
         let state = Builder::new(params)
             .psk(0, psk)
             .map_err(|e| CryptoError::Handshake(format!("failed to set psk: {}", e)))?
+            .prologue(prologue)
+            .map_err(|e| CryptoError::Handshake(format!("failed to set prologue: {}", e)))?
             .local_private_key(&static_keypair.private)
             .map_err(|e| CryptoError::Handshake(format!("failed to set local key: {}", e)))?
             .build_responder()

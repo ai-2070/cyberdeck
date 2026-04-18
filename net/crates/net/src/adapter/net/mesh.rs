@@ -1259,37 +1259,41 @@ impl MeshNode {
                 keys,
                 response_payload,
             } => {
-                // Register the new peer. `addr_to_node[relay_addr]` is not
-                // touched — it still points to the relay's node_id, which is
-                // the correct resolution for direct packets from that wire
-                // address. Packets for this new peer arrive via routed
-                // headers and are dispatched by session_id.
-                let session = Arc::new(NetSession::new(
-                    keys,
-                    relay_addr,
-                    ctx.packet_pool_size,
-                    ctx.default_reliable,
-                ));
-                ctx.peers.insert(
-                    peer_node_id,
-                    PeerInfo {
-                        node_id: peer_node_id,
-                        addr: relay_addr,
-                        session,
-                    },
-                );
-                ctx.router.add_route(peer_node_id, relay_addr);
-
-                // Send msg2 back along the same relay path.
+                // Do NOT register the peer until msg2 has actually been
+                // handed to the socket. A half-open record (peer + route
+                // inserted but msg2 never sent) would blackhole all future
+                // traffic to this peer and make recovery rely on external
+                // timeouts.
+                //
+                // `addr_to_node[relay_addr]` is left untouched — it still
+                // points to the relay's node_id, which is the correct
+                // resolution for direct packets from that wire address.
+                // Packets for this new peer arrive via routed headers and
+                // are dispatched by session_id.
                 let relay_node_id = ctx.addr_to_node.get(&relay_addr).map(|e| *e.value());
                 let relay_session = relay_node_id
                     .and_then(|nid| ctx.peers.get(&nid).map(|e| e.value().session.clone()));
-                if let Some(relay_sess) = relay_session {
-                    if ctx.partition_filter.contains(&relay_addr) {
+                let relay_sess = match relay_session {
+                    Some(s) => s,
+                    None => {
+                        tracing::warn!(
+                            peer = format!("{:#x}", peer_node_id),
+                            "handshake relay: no session back to relay; dropping"
+                        );
                         return;
                     }
-                    let socket = ctx.socket.clone();
-                    tokio::spawn(async move {
+                };
+                if ctx.partition_filter.contains(&relay_addr) {
+                    return;
+                }
+
+                let socket = ctx.socket.clone();
+                let peers = ctx.peers.clone();
+                let router = ctx.router.clone();
+                let packet_pool_size = ctx.packet_pool_size;
+                let default_reliable = ctx.default_reliable;
+                tokio::spawn(async move {
+                    let packet = {
                         let pool = relay_sess.thread_local_pool();
                         let mut builder = pool.get();
                         let seq = {
@@ -1298,16 +1302,45 @@ impl MeshNode {
                             stream.next_tx_seq()
                         };
                         let events = vec![response_payload];
-                        let packet = builder.build_subprotocol(
+                        builder.build_subprotocol(
                             SUBPROTOCOL_HANDSHAKE as u64,
                             seq,
                             &events,
                             PacketFlags::NONE,
                             SUBPROTOCOL_HANDSHAKE,
-                        );
-                        let _ = socket.send_to(&packet, relay_addr).await;
-                    });
-                }
+                        )
+                    };
+                    match socket.send_to(&packet, relay_addr).await {
+                        Ok(_) => {
+                            // Send succeeded — now register the peer and
+                            // route. Initiator should be able to complete
+                            // msg2 on its side and start sending routed
+                            // data immediately.
+                            let session = Arc::new(NetSession::new(
+                                keys,
+                                relay_addr,
+                                packet_pool_size,
+                                default_reliable,
+                            ));
+                            peers.insert(
+                                peer_node_id,
+                                PeerInfo {
+                                    node_id: peer_node_id,
+                                    addr: relay_addr,
+                                    session,
+                                },
+                            );
+                            router.add_route(peer_node_id, relay_addr);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                peer = format!("{:#x}", peer_node_id),
+                                error = %e,
+                                "handshake relay: msg2 send failed; peer not registered"
+                            );
+                        }
+                    }
+                });
             }
         }
     }

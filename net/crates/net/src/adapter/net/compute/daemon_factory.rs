@@ -35,6 +35,18 @@ pub struct FactoryEntry {
     pub config: DaemonHostConfig,
 }
 
+/// Freshly built inputs for a single restore attempt. Produced by
+/// [`DaemonFactoryRegistry::construct`] so the caller can retry the
+/// restore on transient failures without losing the registration.
+pub struct ConstructedInputs {
+    /// A fresh daemon instance — unrestored state.
+    pub daemon: Box<dyn MeshDaemon>,
+    /// The daemon's signing keypair.
+    pub keypair: EntityKeypair,
+    /// Host configuration.
+    pub config: DaemonHostConfig,
+}
+
 /// Thread-safe registry of daemon factories keyed by `origin_hash`.
 #[derive(Default)]
 pub struct DaemonFactoryRegistry {
@@ -49,22 +61,19 @@ impl DaemonFactoryRegistry {
 
     /// Register a factory for a daemon type.
     ///
-    /// The `origin_hash` must equal `keypair.origin_hash()`; this is checked
-    /// at registration time to catch mismatches early.
+    /// The registration key is derived from `keypair.origin_hash()`; the
+    /// caller does not supply it separately. Taking `origin_hash` as an
+    /// argument used to invite a class of bugs where the caller passed a
+    /// stale or unrelated value — now impossible by construction.
     pub fn register<F>(
         &self,
-        origin_hash: u32,
         keypair: EntityKeypair,
         config: DaemonHostConfig,
         factory: F,
     ) where
         F: Fn() -> Box<dyn MeshDaemon> + Send + Sync + 'static,
     {
-        debug_assert_eq!(
-            origin_hash,
-            keypair.origin_hash(),
-            "origin_hash must match keypair"
-        );
+        let origin_hash = keypair.origin_hash();
         self.entries.insert(
             origin_hash,
             FactoryEntry {
@@ -75,13 +84,34 @@ impl DaemonFactoryRegistry {
         );
     }
 
+    /// Build fresh restore inputs (daemon instance + keypair + config) for
+    /// `origin_hash` without removing the registration. The subprotocol
+    /// handler uses this when it is about to attempt a restore but wants
+    /// to retain the factory in case the attempt fails (e.g., transient
+    /// snapshot parse error). Call [`Self::remove`] after a successful
+    /// restore to mark the migration single-shot.
+    pub fn construct(&self, origin_hash: u32) -> Option<ConstructedInputs> {
+        let entry = self.entries.get(&origin_hash)?;
+        Some(ConstructedInputs {
+            daemon: (entry.factory)(),
+            keypair: entry.keypair.clone(),
+            config: entry.config.clone(),
+        })
+    }
+
+    /// Remove the factory entry for `origin_hash` (e.g., after a
+    /// successful restore). Idempotent: removing a non-existent entry is
+    /// a no-op.
+    pub fn remove(&self, origin_hash: u32) {
+        self.entries.remove(&origin_hash);
+    }
+
     /// Consume the factory entry for `origin_hash`, if any. Returns `None`
     /// when no factory has been registered.
     ///
-    /// Consumption (rather than cloning) surfaces double-restore bugs: if a
-    /// migration arrives a second time without the caller re-registering,
-    /// this returns `None` and the subprotocol handler fails the migration
-    /// cleanly instead of silently restoring twice.
+    /// Prefer [`Self::construct`] + [`Self::remove`] in callers that want
+    /// to retry restore on failure — `take` discards the entry even if the
+    /// caller hasn't actually used it yet.
     pub fn take(&self, origin_hash: u32) -> Option<FactoryEntry> {
         self.entries.remove(&origin_hash).map(|(_, entry)| entry)
     }
@@ -133,7 +163,7 @@ mod tests {
         let kp = EntityKeypair::generate();
         let origin = kp.origin_hash();
 
-        reg.register(origin, kp, DaemonHostConfig::default(), || Box::new(Stub));
+        reg.register(kp, DaemonHostConfig::default(), || Box::new(Stub));
         assert!(reg.contains(origin));
 
         let entry = reg.take(origin).expect("factory should be present");
@@ -146,5 +176,64 @@ mod tests {
     fn take_missing_returns_none() {
         let reg = DaemonFactoryRegistry::new();
         assert!(reg.take(0xDEADBEEF).is_none());
+    }
+
+    /// Regression: `register` used to take a separate `origin_hash`
+    /// parameter and only `debug_assert_eq!` it against the keypair.
+    /// Release builds silently accepted a mismatched keypair, which would
+    /// later fail at `restore_snapshot` with a cryptic identity error —
+    /// or, worse, register the daemon under the wrong identity.
+    ///
+    /// The fix is to derive `origin_hash` from the keypair: no caller can
+    /// supply a stale or unrelated value. This test verifies the stored
+    /// entry is always keyed by the keypair's own `origin_hash`.
+    #[test]
+    fn test_regression_register_always_uses_keypair_origin() {
+        let reg = DaemonFactoryRegistry::new();
+        let kp = EntityKeypair::generate();
+        let expected = kp.origin_hash();
+
+        reg.register(kp, DaemonHostConfig::default(), || Box::new(Stub));
+
+        assert!(
+            reg.contains(expected),
+            "factory must be keyed by the keypair's origin_hash"
+        );
+        // No other origin_hash accepts the lookup — the previous API
+        // allowed that when the caller passed a mismatched value.
+        assert!(!reg.contains(expected.wrapping_add(1)));
+    }
+
+    /// Regression: factory inputs were consumed (via `take`) before
+    /// `restore_snapshot` ran. A transient failure — e.g., a corrupted
+    /// chunk that parsed to garbage — would discard the registration, so
+    /// a retry could not find the factory. The caller would need to
+    /// manually re-register before another migration could succeed.
+    ///
+    /// The fix is to expose `construct` for non-destructive access, and
+    /// make `remove` a separate step that callers invoke only after a
+    /// successful restore.
+    #[test]
+    fn test_regression_construct_preserves_entry_for_retry() {
+        let reg = DaemonFactoryRegistry::new();
+        let kp = EntityKeypair::generate();
+        let origin = kp.origin_hash();
+
+        reg.register(kp, DaemonHostConfig::default(), || Box::new(Stub));
+
+        let first = reg
+            .construct(origin)
+            .expect("first attempt should find factory");
+        drop(first); // simulate restore failure
+
+        // Retry must still find the factory.
+        let second = reg
+            .construct(origin)
+            .expect("second attempt must still find factory after a failed first attempt");
+        drop(second);
+
+        // Explicit removal is single-step.
+        reg.remove(origin);
+        assert!(reg.construct(origin).is_none());
     }
 }
