@@ -263,26 +263,27 @@ impl MigrationTargetHandler {
     /// Phase 4: Activate — daemon goes live on this node.
     ///
     /// Drains any remaining pending events and marks the daemon as
-    /// the authoritative copy. **Idempotent:** if the migration has
-    /// already been completed (e.g. a retried `ActivateTarget` after a
-    /// lost `ActivateAck`), returns the stored `replayed_through` so the
-    /// subprotocol handler can re-emit the same ack instead of failing.
+    /// the authoritative copy. **Idempotent** for a retried
+    /// `ActivateTarget` after a lost `ActivateAck`: if no active
+    /// migration exists but a completed record does, returns the stored
+    /// `replayed_through` so the subprotocol handler can re-emit the
+    /// same ack.
+    ///
+    /// An active migration in `self.migrations` always takes precedence
+    /// over a completed record for the same origin: a new migration for
+    /// the same daemon (e.g., migrated back to us later) must not be
+    /// skipped just because we still remember the previous completion.
     pub fn activate(&self, daemon_origin: u32) -> Result<u64, MigrationError> {
+        if let Some(entry) = self.migrations.get(&daemon_origin) {
+            let mut state = entry.lock();
+            state.phase = MigrationPhase::Cutover;
+            self.drain_pending(&mut state)?;
+            return Ok(state.replayed_through);
+        }
         if let Some(done) = self.completed.get(&daemon_origin) {
             return Ok(done.replayed_through);
         }
-        let entry = self
-            .migrations
-            .get(&daemon_origin)
-            .ok_or(MigrationError::DaemonNotFound(daemon_origin))?;
-
-        let mut state = entry.lock();
-        state.phase = MigrationPhase::Cutover;
-
-        // Drain remaining events
-        self.drain_pending(&mut state)?;
-
-        Ok(state.replayed_through)
+        Err(MigrationError::DaemonNotFound(daemon_origin))
     }
 
     /// Mark migration as complete and move tracking state into the
@@ -294,13 +295,19 @@ impl MigrationTargetHandler {
     /// target won't need to re-restore from an orchestrator retry once
     /// the migration has successfully completed.
     pub fn complete(&self, daemon_origin: u32) -> Result<(), MigrationError> {
-        if self.completed.contains_key(&daemon_origin) {
-            return Ok(());
-        }
-        let (_, entry) = self
-            .migrations
-            .remove(&daemon_origin)
-            .ok_or(MigrationError::DaemonNotFound(daemon_origin))?;
+        // Precedence: if there is an active migration, finalize it. Only
+        // if there is no active migration AND a completed record exists
+        // do we treat this as an idempotent no-op (the retry case for a
+        // lost ActivateAck).
+        let (_, entry) = match self.migrations.remove(&daemon_origin) {
+            Some(pair) => pair,
+            None => {
+                if self.completed.contains_key(&daemon_origin) {
+                    return Ok(());
+                }
+                return Err(MigrationError::DaemonNotFound(daemon_origin));
+            }
+        };
         let state = entry.into_inner();
         self.completed.insert(
             daemon_origin,

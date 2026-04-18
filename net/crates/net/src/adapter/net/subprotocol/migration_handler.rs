@@ -287,20 +287,22 @@ impl MigrationSubprotocolHandler {
                     Err(e) => return Err(e),
                 }
 
+                // Capture the orchestrator BEFORE `cleanup()` clears the
+                // source-side migration record — once it's gone,
+                // `orchestrator_node()` returns None and we'd silently
+                // fall back to `from_node`, defeating the whole point of
+                // recording the orchestrator at `start_snapshot` time.
+                let dest = self
+                    .source_handler
+                    .orchestrator_node(daemon_origin)
+                    .unwrap_or(from_node);
+
                 // Cleanup source — also tolerant of missing source_handler
                 // state, and unregisters the local daemon even if no
                 // `source_handler.start_snapshot` was called.
                 let _ = self.source_handler.cleanup(daemon_origin);
 
                 let cleanup_msg = MigrationMessage::CleanupComplete { daemon_origin };
-                // Route CleanupComplete to the orchestrator the source
-                // recorded on start_snapshot — `from_node` is only the
-                // wire hop that delivered CutoverNotify, which may not
-                // be the orchestrator under subprotocol relaying.
-                let dest = self
-                    .source_handler
-                    .orchestrator_node(daemon_origin)
-                    .unwrap_or(from_node);
                 outbound.push(OutboundMigrationMessage {
                     dest_node: dest,
                     payload: wire::encode(&cleanup_msg)?,

@@ -399,6 +399,17 @@ impl RoutingTable {
         self.routes.remove(&dest_id).map(|(_, v)| v)
     }
 
+    /// Remove the route for `dest_id` only if its current `next_hop`
+    /// still equals `expected_next_hop`. Used by rollback paths that
+    /// registered a specific route and need to undo it without clobbering
+    /// a newer concurrently-written entry. Returns `true` if the entry
+    /// was removed.
+    pub fn remove_route_if_next_hop_is(&self, dest_id: u64, expected_next_hop: SocketAddr) -> bool {
+        self.routes
+            .remove_if(&dest_id, |_, entry| entry.next_hop == expected_next_hop)
+            .is_some()
+    }
+
     /// Look up next hop for destination.
     ///
     /// Returns `None` for stale routes — an entry whose `updated_at` is

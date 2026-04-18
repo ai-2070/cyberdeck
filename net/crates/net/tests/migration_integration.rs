@@ -1176,8 +1176,10 @@ fn test_regression_full_handler_routing_chain() {
     assert_eq!(cutover_out.dest_node, source_node);
 
     // ── Step 2: Source receives CutoverNotify ──
-    // First, source must have started its migration tracking
-    source.start_snapshot(origin, target_node, 0x1111).unwrap();
+    // First, source must have started its migration tracking. Pass the
+    // *actual* orchestrator node_id (0xCCCC) so the CleanupComplete reply
+    // is routed back to it via `source_handler.orchestrator_node()`.
+    source.start_snapshot(origin, target_node, 0xCCCC).unwrap();
 
     let cutover_outbound = handler
         .handle_message(&cutover_out.payload, 0xCCCC) // from orchestrator

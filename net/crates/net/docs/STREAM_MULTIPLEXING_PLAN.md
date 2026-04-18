@@ -2,9 +2,9 @@
 
 ## Status
 
-**Shipped.** The design below was implemented in full: `Stream` / `StreamConfig` on `MeshNode`, idempotent `open_stream` / `close_stream`, last-activity-driven idle eviction + `max_streams` LRU cap on the heartbeat loop, per-stream fairness weight threaded through `FairScheduler`, `StreamError::WouldBlock` surfaced on queue-full back-pressure, and public `stream_stats` / `all_stream_stats` accessors. The plan is retained as a frozen spec of the contract; see `TRANSPORT.md` for the caller-facing reference.
+**Shipped.** The design below was implemented in full: `Stream` / `StreamConfig` on `MeshNode`, idempotent `open_stream` / `close_stream`, last-activity-driven idle eviction + `max_streams` LRU cap on the heartbeat loop, per-stream fairness weight threaded through `FairScheduler`, and public `stream_stats` / `all_stream_stats` accessors. The plan is retained as a frozen spec of the contract; see `TRANSPORT.md` for the caller-facing reference.
 
-The only design-time gap still outstanding is **explicit credit-window flow control** — `WouldBlock` is already returned on local queue-full, but there is no round-trip credit accounting between peers yet. That's a v2 increment.
+The only design-time gap still outstanding is **explicit credit-window flow control** — `StreamError::WouldBlock` is reserved as an API variant for a future credit-windowed implementation; v1's send path currently returns `Transport` for underlying send failures and `Ok(())` otherwise. That's a v2 increment.
 
 ---
 

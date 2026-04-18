@@ -1048,10 +1048,16 @@ impl MeshNode {
         // for `peer_node_id` through an addr we never confirmed was
         // reachable; removing peers without removing the route would also
         // inject a stale entry into rerouting decisions.
+        //
+        // Route rollback is conditional on the current entry still
+        // pointing at `source` — if a concurrent handshake for the same
+        // `peer_node_id` already installed a newer (valid) route, we must
+        // not overwrite it.
         let socket = ctx.socket.clone();
         let peers = ctx.peers.clone();
         let peer_addrs = ctx.peer_addrs.clone();
         let router = ctx.router.clone();
+        let registered_next_hop = source;
         let payload = routed.freeze();
         tokio::spawn(async move {
             if let Err(e) = socket.send_to(&payload, next_hop).await {
@@ -1060,9 +1066,14 @@ impl MeshNode {
                     error = %e,
                     "routed handshake: msg2 send failed; unregistering peer"
                 );
-                peers.remove(&peer_node_id);
-                peer_addrs.remove(&peer_node_id);
-                router.routing_table().remove_route(peer_node_id);
+                // Only remove entries that still match what we wrote;
+                // a concurrent retry for the same peer may have already
+                // replaced them with a fresh, valid registration.
+                peers.remove_if(&peer_node_id, |_, pi| pi.addr == registered_next_hop);
+                peer_addrs.remove_if(&peer_node_id, |_, addr| *addr == registered_next_hop);
+                router
+                    .routing_table()
+                    .remove_route_if_next_hop_is(peer_node_id, registered_next_hop);
             }
         });
     }
