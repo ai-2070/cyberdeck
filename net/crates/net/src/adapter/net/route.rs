@@ -436,8 +436,10 @@ impl RoutingTable {
     /// Defaults to `Duration::MAX` (effectively disabled). `MeshNode`
     /// sets this to `3 × session_timeout` at construction.
     pub fn set_max_route_age(&self, age: std::time::Duration) {
-        self.max_route_age_nanos
-            .store(age.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+        self.max_route_age_nanos.store(
+            age.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
     }
 
     fn max_route_age(&self) -> std::time::Duration {

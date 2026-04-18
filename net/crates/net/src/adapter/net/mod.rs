@@ -39,7 +39,6 @@ pub mod contested;
 pub mod continuity;
 mod crypto;
 mod failure;
-mod handshake_relay;
 pub mod identity;
 mod mesh;
 mod pool;
@@ -86,7 +85,6 @@ pub use failure::{
     CircuitBreaker, CircuitState, FailureDetector, FailureDetectorConfig, FailureStats,
     LossSimulator, NodeStatus, RecoveryAction, RecoveryManager, RecoveryStats,
 };
-pub use handshake_relay::SUBPROTOCOL_HANDSHAKE;
 pub use identity::{
     EntityError, EntityId, EntityKeypair, OriginStamp, PermissionToken, TokenCache, TokenError,
     TokenScope,

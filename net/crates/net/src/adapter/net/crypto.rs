@@ -23,6 +23,24 @@ use super::protocol::{NONCE_SIZE, TAG_SIZE};
 /// - psk0: Pre-shared key mixed at start
 const NOISE_PATTERN: &str = "Noise_NKpsk0_25519_ChaChaPoly_BLAKE2s";
 
+/// Domain-separated Noise prologue binding `(src_node_id, dest_node_id)`
+/// into the handshake transcript.
+///
+/// Both direct and relayed handshakes use this construction. A relay
+/// that rewrites either node id in the outer addressing (routing header
+/// for routed handshakes, or the caller's own `peer_node_id` argument
+/// for direct) produces a prologue mismatch on the responder, which
+/// fails the Noise MAC check on msg1 — the handshake is rejected
+/// end-to-end before any session keys are bound to an attacker-chosen
+/// identity.
+pub fn handshake_prologue(src_node_id: u64, dest_node_id: u64) -> [u8; 32] {
+    let mut buf = [0u8; 32];
+    buf[0..16].copy_from_slice(b"net-handshake-v1");
+    buf[16..24].copy_from_slice(&src_node_id.to_le_bytes());
+    buf[24..32].copy_from_slice(&dest_node_id.to_le_bytes());
+    buf
+}
+
 /// Error type for cryptographic operations
 #[derive(Debug, Clone)]
 pub enum CryptoError {

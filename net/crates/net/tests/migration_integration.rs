@@ -2162,7 +2162,7 @@ fn test_regression_buffered_events_rejects_unbounded_count() {
     bad.put_u8(7); // MSG_BUFFERED_EVENTS
     bad.put_u32_le(0xAAAA_BBBB); // daemon_origin
     bad.put_u32_le(u32::MAX); // count — unbounded!
-    // No event bytes follow.
+                              // No event bytes follow.
 
     let result = wire::decode(&bad);
     assert!(
@@ -2184,7 +2184,7 @@ fn test_regression_buffered_events_rejects_unbounded_count() {
     bad2.put_u8(7);
     bad2.put_u32_le(0);
     bad2.put_u32_le(2_000_000); // > 1M hard cap
-    // Pad with enough filler bytes to defeat the remaining-bytes check.
+                                // Pad with enough filler bytes to defeat the remaining-bytes check.
     bad2.resize(bad2.len() + 2_000_000 * 36, 0);
     let result = wire::decode(&bad2);
     assert!(
@@ -2687,16 +2687,19 @@ fn test_regression_snapshot_ready_retry_after_successful_restore_is_idempotent()
 
     let (kp, origin) = register_counter_daemon(&source.reg, 9);
     for seq in 1..=3 {
-        source.reg.deliver(origin, &make_event(0xFFFF, seq)).unwrap();
+        source
+            .reg
+            .deliver(origin, &make_event(0xFFFF, seq))
+            .unwrap();
     }
     let snapshot = source.reg.snapshot(origin).unwrap().unwrap();
     let snapshot_bytes = snapshot.to_bytes();
 
-    target.factories.register(
-        kp.clone(),
-        DaemonHostConfig::default(),
-        || Box::new(CounterDaemon::new()),
-    );
+    target
+        .factories
+        .register(kp.clone(), DaemonHostConfig::default(), || {
+            Box::new(CounterDaemon::new())
+        });
 
     let snapshot_ready = MigrationMessage::SnapshotReady {
         daemon_origin: origin,

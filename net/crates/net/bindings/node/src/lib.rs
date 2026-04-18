@@ -871,10 +871,7 @@ mod mesh_bindings {
             }
             if let Some(n) = options.num_shards {
                 let n = u16::try_from(n).map_err(|_| {
-                    Error::from_reason(format!(
-                        "num_shards must be in [0, 65535]; got {}",
-                        n
-                    ))
+                    Error::from_reason(format!("num_shards must be in [0, 65535]; got {}", n))
                 })?;
                 config = config.with_num_shards(n);
             }

@@ -40,7 +40,7 @@ use dashmap::DashMap;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use super::crypto::{NoiseHandshake, SessionKeys, StaticKeypair};
+use super::crypto::{handshake_prologue, CryptoError, NoiseHandshake, SessionKeys, StaticKeypair};
 use super::failure::{FailureDetector, FailureDetectorConfig};
 use super::identity::EntityKeypair;
 use super::pool::PacketBuilder;
@@ -48,7 +48,6 @@ use super::pool::PacketBuilder;
 use super::behavior::loadbalance::HealthStatus;
 use super::behavior::proximity::{EnhancedPingwave, ProximityConfig, ProximityGraph};
 use super::compute::SUBPROTOCOL_MIGRATION;
-use super::handshake_relay::{HandshakeAction, HandshakeHandler, SUBPROTOCOL_HANDSHAKE};
 use super::protocol::{self, EventFrame, PacketFlags, MAGIC};
 use super::reroute::ReroutePolicy;
 use super::route::{RoutingHeader, ROUTING_HEADER_SIZE};
@@ -56,6 +55,7 @@ use super::router::{NetRouter, RouterConfig};
 use super::session::NetSession;
 use super::subprotocol::MigrationSubprotocolHandler;
 use super::transport::{NetSocket, PacketReceiver, ParsedPacket, SocketBufferConfig};
+use tokio::sync::oneshot;
 
 use crate::adapter::{Adapter, ShardPollResult};
 use crate::error::AdapterError;
@@ -106,8 +106,14 @@ struct DispatchCtx {
     num_shards: u16,
     /// Optional subprotocol handler for migration messages.
     migration_handler: Option<Arc<MigrationSubprotocolHandler>>,
-    /// Optional subprotocol handler for relayed Noise handshakes.
-    handshake_handler: Option<Arc<HandshakeHandler>>,
+    /// In-flight initiator handshakes; dispatch completes them when a
+    /// matching routed msg2 arrives.
+    pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
+    /// Our Noise static keypair — needed to construct responder state
+    /// when a routed msg1 arrives for us.
+    static_keypair: StaticKeypair,
+    /// PSK shared across the mesh.
+    psk: [u8; 32],
     /// Socket for sending outbound subprotocol responses.
     socket: Arc<NetSocket>,
     /// Proximity graph for topology awareness.
@@ -205,6 +211,34 @@ struct PeerInfo {
     session: Arc<NetSession>,
 }
 
+/// In-flight initiator handshake. The dispatch loop consumes this when a
+/// routed msg2 arrives for `peer_node_id`: it pulls the Noise state out,
+/// runs `read_message`, derives the session keys, and signals the
+/// awaiting `connect_via` caller via the oneshot.
+///
+/// Keyed in `pending_handshakes` by `peer_node_id as u32 as u64` because
+/// the routing header's `src_id` field is only 32 bits — msg2's routing
+/// header carries the truncated value, so the dispatch loop can only
+/// look up by that. The full `u64` is stored here for peer registration.
+struct PendingHandshake {
+    noise: NoiseHandshake,
+    tx: oneshot::Sender<Result<SessionKeys, CryptoError>>,
+}
+
+/// 32-bit "routing identity" projection of a `u64` node_id, used as the
+/// key across the routing plane (routing header's `src_id` is `u32`).
+/// Encoded back into a `u64` as the low 32 bits, high bits zero, so the
+/// same projection is visible on both sides of a routed packet.
+#[inline]
+fn routing_id(node_id: u64) -> u64 {
+    (node_id as u32) as u64
+}
+
+/// Default TTL for the routing header we stamp on routed handshake
+/// packets. Far above any realistic relay chain; the routing layer
+/// drops at zero.
+const DEFAULT_HANDSHAKE_TTL: u8 = 16;
+
 /// Multi-peer mesh node.
 ///
 /// Composes `NetSession` (per-peer encryption), `NetRouter` (forwarding),
@@ -239,8 +273,10 @@ pub struct MeshNode {
     inbound: InboundQueues,
     /// Optional migration subprotocol handler
     migration_handler: Option<Arc<MigrationSubprotocolHandler>>,
-    /// Handles relayed Noise handshakes arriving as SUBPROTOCOL_HANDSHAKE.
-    handshake_handler: Option<Arc<HandshakeHandler>>,
+    /// In-flight routed-handshake initiators, keyed by the responder's
+    /// node_id. Populated by `connect_via`; consumed by the dispatch
+    /// loop when the matching msg2 arrives.
+    pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
     /// Proximity graph — topology awareness from pingwave propagation
     proximity_graph: Arc<ProximityGraph>,
     /// Automatic reroute policy
@@ -339,11 +375,7 @@ impl MeshNode {
         .on_failure(move |node_id| rp_failure.on_failure(node_id))
         .on_recovery(move |node_id| rp_recovery.on_recovery(node_id));
 
-        let handshake_handler = Some(Arc::new(HandshakeHandler::new(
-            node_id,
-            static_keypair.clone(),
-            config.psk,
-        )));
+        let pending_handshakes: Arc<DashMap<u64, PendingHandshake>> = Arc::new(DashMap::new());
 
         Ok(Self {
             identity,
@@ -357,7 +389,7 @@ impl MeshNode {
             failure_detector: Arc::new(failure_detector),
             inbound: Arc::new(DashMap::new()),
             migration_handler: None,
-            handshake_handler,
+            pending_handshakes,
             proximity_graph,
             reroute_policy,
             peer_addrs,
@@ -438,7 +470,9 @@ impl MeshNode {
         peer_pubkey: &[u8; 32],
         peer_node_id: u64,
     ) -> Result<u64, AdapterError> {
-        let keys = self.handshake_initiator(peer_addr, peer_pubkey).await?;
+        let keys = self
+            .handshake_initiator(peer_addr, peer_pubkey, peer_node_id)
+            .await?;
 
         let session = Arc::new(NetSession::new(
             keys,
@@ -479,7 +513,7 @@ impl MeshNode {
     /// Waits for an incoming handshake packet and completes the handshake.
     /// Returns the peer's address and assigns the given node_id.
     pub async fn accept(&self, peer_node_id: u64) -> Result<(SocketAddr, u64), AdapterError> {
-        let (keys, peer_addr) = self.handshake_responder().await?;
+        let (keys, peer_addr) = self.handshake_responder(peer_node_id).await?;
 
         let session = Arc::new(NetSession::new(
             keys,
@@ -557,7 +591,9 @@ impl MeshNode {
             inbound: self.inbound.clone(),
             num_shards: self.config.num_shards,
             migration_handler: self.migration_handler.clone(),
-            handshake_handler: self.handshake_handler.clone(),
+            pending_handshakes: self.pending_handshakes.clone(),
+            static_keypair: self.static_keypair.clone(),
+            psk: self.config.psk,
             socket: self.socket.clone(),
             proximity_graph: self.proximity_graph.clone(),
             partition_filter: self.partition_filter.clone(),
@@ -676,7 +712,15 @@ impl MeshNode {
                         Some(p) => p,
                         None => return,
                     };
-                    if parsed.header.flags.is_handshake() || parsed.header.flags.is_heartbeat() {
+                    // Heartbeats are link-local and don't make sense over
+                    // the routing layer — drop.
+                    if parsed.header.flags.is_heartbeat() {
+                        return;
+                    }
+                    // Routed handshake arrival. Strip routing header and
+                    // hand to the responder/msg2 dispatcher.
+                    if parsed.header.flags.is_handshake() {
+                        Self::handle_routed_handshake(&parsed, &routing_header, source, ctx);
                         return;
                     }
                     // Find the session that matches this packet's session_id
@@ -690,8 +734,32 @@ impl MeshNode {
                         session.touch();
                     }
                 } else {
-                    // Not for us — forward without decrypting (header-only routing)
-                    let _ = router.route_packet(data, source);
+                    // Not for us — forward without decrypting (header-only
+                    // routing). We send via the main socket so the
+                    // receiving node sees `source` = our bound addr,
+                    // which it can use as a reply path. `router.start()`'s
+                    // internal scheduler has a separate ephemeral socket
+                    // and would make `source` unusable for replies.
+                    if routing_header.is_expired() {
+                        return;
+                    }
+                    let next_hop = match router.routing_table().lookup(routing_header.dest_id) {
+                        Some(addr) => addr,
+                        None => return,
+                    };
+                    if ctx.partition_filter.contains(&next_hop) {
+                        return;
+                    }
+                    let mut fwd_header = routing_header;
+                    fwd_header.forward();
+                    let mut new_data = bytes::BytesMut::with_capacity(data.len());
+                    new_data.extend_from_slice(&fwd_header.to_bytes());
+                    new_data.extend_from_slice(&data[ROUTING_HEADER_SIZE..]);
+                    let forwarded = new_data.freeze();
+                    let socket = ctx.socket.clone();
+                    tokio::spawn(async move {
+                        let _ = socket.send_to(&forwarded, next_hop).await;
+                    });
                 }
             }
             return;
@@ -741,6 +809,181 @@ impl MeshNode {
 
         Self::process_local_packet(&parsed, &session, ctx);
         session.touch();
+    }
+
+    /// Handle a routed handshake packet that arrived at this node.
+    ///
+    /// Two cases, discriminated by whether we have a pending initiator
+    /// state for `routing_header.src_id`:
+    ///
+    /// 1. **msg2 for an in-flight initiator.** We started a `connect_via`
+    ///    earlier and registered a `PendingHandshake` keyed by the
+    ///    responder's node_id. The arriving packet completes that
+    ///    initiator state — we run `read_message`, derive keys, and
+    ///    signal the caller via the oneshot.
+    ///
+    /// 2. **msg1 from a new initiator.** We build a responder state with
+    ///    the prologue derived from `(routing_header.src_id, self.node_id)`,
+    ///    read msg1, write msg2, and send msg2 back via the routing
+    ///    table (reversing src/dest in the routing header). On success
+    ///    we register the new peer with the routing-path addr (the
+    ///    immediate upstream `source`) so that subsequent routed data
+    ///    finds a session.
+    fn handle_routed_handshake(
+        parsed: &ParsedPacket,
+        routing_header: &RoutingHeader,
+        source: SocketAddr,
+        ctx: &DispatchCtx,
+    ) {
+        // Routing id of the remote party: what we see in the routing
+        // header's 32-bit src_id, zero-extended into u64 so it can sit
+        // alongside full node_ids in maps without ambiguity.
+        let peer_routing_id = routing_header.src_id as u64;
+
+        // Case 1: msg2 for an in-flight initiator. Look up pending state
+        // by routing id (that's how it was keyed on insert).
+        if let Some((_, pending)) = ctx.pending_handshakes.remove(&peer_routing_id) {
+            let PendingHandshake { mut noise, tx } = pending;
+            let result = (|| -> Result<SessionKeys, CryptoError> {
+                noise.read_message(&parsed.payload)?;
+                noise.into_session_keys()
+            })();
+            let _ = tx.send(result);
+            return;
+        }
+
+        // Case 2: msg1 from a new initiator.
+        //
+        // Prologue binds (peer_routing_id, self_routing_id) — same u32
+        // projection the initiator used. Full u64 identities don't
+        // fit in the routing header (src_id is u32), so we bind what
+        // both sides CAN see, and carry the full src node_id inside
+        // the Noise payload where it's AEAD-authenticated.
+        let self_routing_id = routing_id(ctx.local_node_id);
+        let prologue = handshake_prologue(peer_routing_id, self_routing_id);
+        let mut noise =
+            match NoiseHandshake::responder_with_prologue(&ctx.psk, &ctx.static_keypair, &prologue)
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(error = %e, "routed handshake: responder build failed");
+                    return;
+                }
+            };
+        let msg1_payload = match noise.read_message(&parsed.payload) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "routed handshake: read_message failed (msg1 tampered or wrong PSK)");
+                return;
+            }
+        };
+
+        // Extract the initiator's full u64 node_id from the decrypted
+        // payload. Verify its routing id matches the one we got on the
+        // wire — a mismatch means the payload was crafted for a
+        // different address than what arrived.
+        if msg1_payload.len() < 8 {
+            tracing::warn!(
+                "routed handshake: msg1 payload too short ({}); need 8 bytes of src node_id",
+                msg1_payload.len()
+            );
+            return;
+        }
+        let peer_node_id = u64::from_le_bytes(msg1_payload[..8].try_into().unwrap());
+        if routing_id(peer_node_id) != peer_routing_id {
+            tracing::warn!(
+                payload = format!("{:#x}", peer_node_id),
+                routing = format!("{:#x}", peer_routing_id),
+                "routed handshake: src_node_id in payload does not match routing header"
+            );
+            return;
+        }
+
+        let msg2 = match noise.write_message(&[]) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "routed handshake: write_message failed");
+                return;
+            }
+        };
+        let keys = match noise.into_session_keys() {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::warn!(error = %e, "routed handshake: key extraction failed");
+                return;
+            }
+        };
+
+        // Build the msg2 packet: Net header (handshake flag) + Noise
+        // bytes, wrapped in a routing header with dest = FULL peer
+        // node_id (from payload). The initiator's local_node_id check
+        // on arrival matches the full u64, so we must put the full
+        // value here.
+        let mut builder = PacketBuilder::new(&[0u8; 32], 0);
+        let inner = builder.build_handshake(&msg2);
+        let reply_routing = RoutingHeader::new(
+            peer_node_id,
+            ctx.local_node_id as u32,
+            DEFAULT_HANDSHAKE_TTL,
+        );
+        let mut routed = bytes::BytesMut::with_capacity(ROUTING_HEADER_SIZE + inner.len());
+        routed.extend_from_slice(&reply_routing.to_bytes());
+        routed.extend_from_slice(&inner);
+
+        // Pick the next hop for the reply. Prefer the routing table
+        // (same path the routed handshake arrived on, symmetrically).
+        // Fall back to `source` (the immediate upstream that sent us
+        // msg1) — that's a direct peer by construction and guaranteed
+        // to have a route back.
+        let next_hop = ctx
+            .router
+            .routing_table()
+            .lookup(peer_node_id)
+            .unwrap_or(source);
+
+        // Register the new peer. The wire `addr` we record is `source`
+        // — the immediate upstream peer that forwarded msg1. That is
+        // NOT necessarily the final responder's addr (for multi-hop it
+        // isn't), but it's the correct place for future routed data
+        // to flow through. Direct data uses this addr; routed data
+        // uses the routing table.
+        //
+        // Registration happens BEFORE the send so that even if the
+        // spawned send task is cancelled or panics post-send, the
+        // initiator that just derived matching keys finds us.
+        let session = Arc::new(NetSession::new(
+            keys,
+            source,
+            ctx.packet_pool_size,
+            ctx.default_reliable,
+        ));
+        ctx.peers.insert(
+            peer_node_id,
+            PeerInfo {
+                node_id: peer_node_id,
+                addr: source,
+                session,
+            },
+        );
+        ctx.peer_addrs.insert(peer_node_id, source);
+        ctx.router.add_route(peer_node_id, source);
+
+        // Spawn the send. If it fails, roll back the registration.
+        let socket = ctx.socket.clone();
+        let peers = ctx.peers.clone();
+        let peer_addrs = ctx.peer_addrs.clone();
+        let payload = routed.freeze();
+        tokio::spawn(async move {
+            if let Err(e) = socket.send_to(&payload, next_hop).await {
+                tracing::warn!(
+                    peer = format!("{:#x}", peer_node_id),
+                    error = %e,
+                    "routed handshake: msg2 send failed; unregistering peer"
+                );
+                peers.remove(&peer_node_id);
+                peer_addrs.remove(&peer_node_id);
+            }
+        });
     }
 
     /// Process a locally-destined packet: decrypt and queue events.
@@ -836,28 +1079,6 @@ impl MeshNode {
                 return; // handler processed it
             }
             // No handler set — fall through to standard event path
-        }
-
-        // Relayed Noise handshake
-        if parsed.header.subprotocol_id == SUBPROTOCOL_HANDSHAKE {
-            if let Some(ref handler) = ctx.handshake_handler {
-                let events =
-                    EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
-                let payload = match events.into_iter().next() {
-                    Some(data) => data,
-                    None => return,
-                };
-
-                // Address of the peer that delivered this subprotocol message to
-                // us (the previous hop). Used as the wire addr for any new peer
-                // we learn about through this handshake.
-                let from_addr = session.peer_addr();
-                let actions = handler.handle_message(&payload, from_addr);
-                for action in actions {
-                    Self::execute_handshake_action(action, ctx);
-                }
-                return;
-            }
         }
 
         // Standard event path: parse event frames and queue
@@ -1177,71 +1398,105 @@ impl MeshNode {
         Ok(())
     }
 
-    /// Connect to a peer through an already-connected relay.
+    /// Connect to a peer whose first hop on the wire is `relay_addr`.
     ///
-    /// The Noise NKpsk0 handshake is carried inside `SUBPROTOCOL_HANDSHAKE`
-    /// packets over the existing relay session. On success, a new peer entry
-    /// for `dest_node_id` is registered with `relay_addr` as the wire
-    /// address (packets go to the relay first), and a routing table entry
-    /// is added so `send_routed(dest_node_id, ...)` works end-to-end.
+    /// The handshake is an ordinary Net packet with the `HANDSHAKE` flag
+    /// plus a routing header addressed to `dest_node_id`. The routing
+    /// layer forwards it hop-by-hop (like any other packet); the
+    /// responder's msg2 comes back the same way. There's no separate
+    /// subprotocol, no per-hop re-encryption — Noise NKpsk0 provides
+    /// end-to-end confidentiality and authenticity, and the prologue
+    /// binds `(src_node_id, dest_node_id)` so a relay that rewrites
+    /// either identity in the routing header fails the responder's MAC
+    /// check on msg1.
     ///
-    /// `start()` must have been called before `connect_via` — the receive
-    /// loop has to be running to deliver msg2 back to us.
+    /// `start()` must have been called before `connect_via` — the
+    /// receive loop has to be running to deliver msg2 back to us.
     pub async fn connect_via(
         &self,
         relay_addr: SocketAddr,
         dest_pubkey: &[u8; 32],
         dest_node_id: u64,
     ) -> Result<u64, AdapterError> {
-        let handler = self
-            .handshake_handler
-            .clone()
-            .ok_or_else(|| AdapterError::Fatal("handshake handler not initialized".into()))?;
+        // Build msg1. Prologue uses *routing-identity* (32-bit) versions
+        // of (self, dest) — that's what a malicious relay could see and
+        // rewrite in the routing header, so binding those bits into the
+        // Noise transcript catches tampering. The FULL u64 self.node_id
+        // is carried inside the msg1 payload (Noise-AEAD-authenticated),
+        // so the responder learns it after decryption and can address
+        // msg2 back to the correct u64 identity.
+        let pending_key = routing_id(dest_node_id);
+        let prologue = handshake_prologue(routing_id(self.node_id), pending_key);
+        let mut noise =
+            NoiseHandshake::initiator_with_prologue(&self.config.psk, dest_pubkey, &prologue)
+                .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
+        let msg1 = noise
+            .write_message(&self.node_id.to_le_bytes())
+            .map_err(|e| AdapterError::Connection(format!("write_message failed: {}", e)))?;
 
-        // Build msg1 and register waiter keyed by dest_node_id.
-        let (payload, keys_rx) = handler
-            .begin_initiator(dest_node_id, dest_pubkey)
-            .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
-
-        if let Err(e) = self
-            .send_subprotocol(relay_addr, SUBPROTOCOL_HANDSHAKE, &payload)
-            .await
-        {
-            handler.cancel_initiator(dest_node_id);
-            return Err(e);
-        }
-
-        let keys = match tokio::time::timeout(self.config.handshake_timeout, keys_rx).await {
-            Ok(Ok(Ok(k))) => k,
-            Ok(Ok(Err(e))) => {
-                handler.cancel_initiator(dest_node_id);
-                return Err(AdapterError::Fatal(format!(
-                    "handshake relay failed: {}",
-                    e
+        // Register pending-initiator state so the dispatch loop can
+        // complete the handshake when msg2 arrives. Keyed by the
+        // 32-bit routing identity because msg2's routing header carries
+        // the truncated src_id — that's the only key the dispatch loop
+        // has when it tries to find the matching initiator.
+        let (tx, rx) = oneshot::channel();
+        match self.pending_handshakes.entry(pending_key) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return Err(AdapterError::Connection(format!(
+                    "connect_via: handshake already in flight for peer {:#x}",
+                    dest_node_id
                 )));
             }
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(PendingHandshake { noise, tx });
+            }
+        }
+
+        // Wrap msg1 in a Net handshake packet + routing header and
+        // send to the first hop. No session encryption — the handshake
+        // payload is the raw Noise bytes, authenticated/confidential
+        // by Noise itself.
+        let inner = {
+            let mut builder = PacketBuilder::new(&[0u8; 32], 0);
+            builder.build_handshake(&msg1)
+        };
+        let routing = RoutingHeader::new(dest_node_id, self.node_id as u32, DEFAULT_HANDSHAKE_TTL);
+        let mut routed = bytes::BytesMut::with_capacity(ROUTING_HEADER_SIZE + inner.len());
+        routed.extend_from_slice(&routing.to_bytes());
+        routed.extend_from_slice(&inner);
+        if let Err(e) = self.socket.send_to(&routed, relay_addr).await {
+            self.pending_handshakes.remove(&pending_key);
+            return Err(AdapterError::Connection(format!("send failed: {}", e)));
+        }
+
+        // Wait for the dispatch loop to complete msg2.
+        let keys = match tokio::time::timeout(self.config.handshake_timeout, rx).await {
+            Ok(Ok(Ok(k))) => k,
+            Ok(Ok(Err(e))) => {
+                self.pending_handshakes.remove(&pending_key);
+                return Err(AdapterError::Fatal(format!("handshake failed: {}", e)));
+            }
             Ok(Err(_)) => {
-                handler.cancel_initiator(dest_node_id);
-                return Err(AdapterError::Connection(
-                    "handshake relay channel dropped".into(),
-                ));
+                self.pending_handshakes.remove(&pending_key);
+                return Err(AdapterError::Connection("handshake channel dropped".into()));
             }
             Err(_) => {
-                handler.cancel_initiator(dest_node_id);
-                return Err(AdapterError::Connection("handshake relay timeout".into()));
+                self.pending_handshakes.remove(&pending_key);
+                return Err(AdapterError::Connection("handshake timeout".into()));
             }
         };
 
+        // Register the new peer with `relay_addr` as the wire address.
+        // Packets to `dest_node_id` go to the relay first; the routing
+        // table does the rest. `addr_to_node` is deliberately NOT
+        // updated — `relay_addr` still maps to the relay's own node_id
+        // for direct-packet dispatch.
         let session = Arc::new(NetSession::new(
             keys,
             relay_addr,
             self.config.packet_pool_size,
             self.config.default_reliable,
         ));
-
-        // Route for dest goes via the relay. Don't overwrite addr_to_node —
-        // that already points `relay_addr` → relay's node_id, which is
-        // correct for direct packets from the relay itself.
         self.router.add_route(dest_node_id, relay_addr);
         self.peers.insert(
             dest_node_id,
@@ -1256,161 +1511,26 @@ impl MeshNode {
         Ok(dest_node_id)
     }
 
-    /// Execute a single handshake-relay action produced by `HandshakeHandler`.
-    ///
-    /// Called from the receive loop's subprotocol dispatch path. Not `async`
-    /// because the dispatch path is synchronous — I/O is spawned onto the
-    /// runtime instead.
-    fn execute_handshake_action(action: HandshakeAction, ctx: &DispatchCtx) {
-        match action {
-            HandshakeAction::Forward { to_node, payload } => {
-                // Pick the next hop toward `to_node`. Prefer the routing
-                // table — that's where multi-hop topology lives — and fall
-                // back to a direct peer entry if no route exists. The
-                // packet is then re-encrypted with the session for the
-                // next hop (NOT the final dest); each hop repeats this,
-                // so a relay chain longer than one intermediate works.
-                let next_addr = ctx
-                    .router
-                    .routing_table()
-                    .lookup(to_node)
-                    .or_else(|| ctx.peers.get(&to_node).map(|e| e.value().addr));
-                let next_session = next_addr.and_then(|addr| {
-                    ctx.addr_to_node
-                        .get(&addr)
-                        .map(|e| *e.value())
-                        .and_then(|nid| ctx.peers.get(&nid).map(|e| e.value().session.clone()))
-                });
-                match (next_addr, next_session) {
-                    (Some(next_addr), Some(next_sess)) => {
-                        if ctx.partition_filter.contains(&next_addr) {
-                            return;
-                        }
-                        let socket = ctx.socket.clone();
-                        tokio::spawn(async move {
-                            let pool = next_sess.thread_local_pool();
-                            let mut builder = pool.get();
-                            let seq = {
-                                let stream = next_sess
-                                    .get_or_create_stream(SUBPROTOCOL_HANDSHAKE as u64);
-                                stream.next_tx_seq()
-                            };
-                            let events = vec![payload];
-                            let packet = builder.build_subprotocol(
-                                SUBPROTOCOL_HANDSHAKE as u64,
-                                seq,
-                                &events,
-                                PacketFlags::NONE,
-                                SUBPROTOCOL_HANDSHAKE,
-                            );
-                            let _ = socket.send_to(&packet, next_addr).await;
-                        });
-                    }
-                    _ => {
-                        tracing::warn!(
-                            dest_node = format!("{:#x}", to_node),
-                            "handshake relay: no route or session for next hop; dropping"
-                        );
-                    }
-                }
-            }
-            HandshakeAction::RegisterResponderPeer {
-                peer_node_id,
-                relay_addr,
-                keys,
-                response_payload,
-            } => {
-                // Register the peer synchronously *before* spawning the
-                // msg2 send. This ordering handles two failure modes:
-                //
-                //   1. If the spawned send task is cancelled or panics
-                //      after `send_to` returns `Ok(())`, the initiator
-                //      still completes its handshake and starts sending
-                //      routed traffic. If registration were deferred
-                //      until after the await, a post-send task death
-                //      would leave the responder with no peer entry and
-                //      traffic would be silently dropped.
-                //
-                //   2. If `send_to` fails, the spawned task removes the
-                //      peer entries we inserted here, so no ghost peer
-                //      persists. That cleanup path is why we also don't
-                //      register into `addr_to_node` — it's already
-                //      mapped to the relay's node_id, and we don't want
-                //      to churn that on failure.
-                let relay_node_id = ctx.addr_to_node.get(&relay_addr).map(|e| *e.value());
-                let relay_session = relay_node_id
-                    .and_then(|nid| ctx.peers.get(&nid).map(|e| e.value().session.clone()));
-                let relay_sess = match relay_session {
-                    Some(s) => s,
-                    None => {
-                        tracing::warn!(
-                            peer = format!("{:#x}", peer_node_id),
-                            "handshake relay: no session back to relay; dropping"
-                        );
-                        return;
-                    }
-                };
-                if ctx.partition_filter.contains(&relay_addr) {
-                    return;
-                }
-
-                // Insert the peer + route + peer_addrs up front.
-                let session = Arc::new(NetSession::new(
-                    keys,
-                    relay_addr,
-                    ctx.packet_pool_size,
-                    ctx.default_reliable,
-                ));
-                ctx.peers.insert(
-                    peer_node_id,
-                    PeerInfo {
-                        node_id: peer_node_id,
-                        addr: relay_addr,
-                        session,
-                    },
-                );
-                ctx.peer_addrs.insert(peer_node_id, relay_addr);
-                ctx.router.add_route(peer_node_id, relay_addr);
-
-                let socket = ctx.socket.clone();
-                let peers = ctx.peers.clone();
-                let peer_addrs = ctx.peer_addrs.clone();
-                tokio::spawn(async move {
-                    let packet = {
-                        let pool = relay_sess.thread_local_pool();
-                        let mut builder = pool.get();
-                        let seq = {
-                            let stream =
-                                relay_sess.get_or_create_stream(SUBPROTOCOL_HANDSHAKE as u64);
-                            stream.next_tx_seq()
-                        };
-                        let events = vec![response_payload];
-                        builder.build_subprotocol(
-                            SUBPROTOCOL_HANDSHAKE as u64,
-                            seq,
-                            &events,
-                            PacketFlags::NONE,
-                            SUBPROTOCOL_HANDSHAKE,
-                        )
-                    };
-                    if let Err(e) = socket.send_to(&packet, relay_addr).await {
-                        // Send failed — clean up the eagerly-registered
-                        // peer so we don't leave a ghost entry that would
-                        // blackhole traffic. Routing table entries stay
-                        // (there's no stable remove API); the peers map
-                        // miss is enough for dispatch to drop incoming
-                        // packets for this peer.
-                        tracing::warn!(
-                            peer = format!("{:#x}", peer_node_id),
-                            error = %e,
-                            "handshake relay: msg2 send failed; unregistering peer"
-                        );
-                        peers.remove(&peer_node_id);
-                        peer_addrs.remove(&peer_node_id);
-                    }
-                });
-            }
-        }
+    /// Connect to a peer by node id, using the routing table to pick the
+    /// first hop. Fails with `Connection("no route to ...")` if the
+    /// routing table doesn't have a route to the destination yet — in
+    /// which case the caller can retry once pingwaves have propagated.
+    pub async fn connect_routed(
+        &self,
+        dest_pubkey: &[u8; 32],
+        dest_node_id: u64,
+    ) -> Result<u64, AdapterError> {
+        let first_hop = self
+            .router
+            .routing_table()
+            .lookup(dest_node_id)
+            .ok_or_else(|| {
+                AdapterError::Connection(format!(
+                    "connect_routed: no route to peer {:#x}",
+                    dest_node_id
+                ))
+            })?;
+        self.connect_via(first_hop, dest_pubkey, dest_node_id).await
     }
 
     // ── Handshake helpers ───────────────────────────────────────────────
@@ -1419,11 +1539,15 @@ impl MeshNode {
         &self,
         peer_addr: SocketAddr,
         peer_pubkey: &[u8; 32],
+        peer_node_id: u64,
     ) -> Result<SessionKeys, AdapterError> {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self.try_handshake_initiator(peer_addr, peer_pubkey).await {
+            match self
+                .try_handshake_initiator(peer_addr, peer_pubkey, peer_node_id)
+                .await
+            {
                 Ok(keys) => return Ok(keys),
                 Err(e) if attempt < self.config.handshake_retries => {
                     tracing::warn!(attempt, error = %e, "mesh handshake failed, retrying");
@@ -1438,12 +1562,20 @@ impl MeshNode {
         &self,
         peer_addr: SocketAddr,
         peer_pubkey: &[u8; 32],
+        peer_node_id: u64,
     ) -> Result<SessionKeys, AdapterError> {
         let timeout = self.config.handshake_timeout;
         let socket_arc = self.socket.socket_arc();
 
-        let mut handshake = NoiseHandshake::initiator(&self.config.psk, peer_pubkey)
-            .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
+        // Prologue uses the 32-bit `routing_id` projection of the node
+        // ids — the same projection routed handshakes use, so the two
+        // paths share one prologue convention. Direct handshakes don't
+        // traverse the routing plane, but the unified convention
+        // simplifies reasoning and future code reuse.
+        let prologue = handshake_prologue(routing_id(self.node_id), routing_id(peer_node_id));
+        let mut handshake =
+            NoiseHandshake::initiator_with_prologue(&self.config.psk, peer_pubkey, &prologue)
+                .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
 
         let msg1 = handshake
             .write_message(&[])
@@ -1494,11 +1626,14 @@ impl MeshNode {
             .map_err(|e| AdapterError::Fatal(format!("key extraction failed: {}", e)))
     }
 
-    async fn handshake_responder(&self) -> Result<(SessionKeys, SocketAddr), AdapterError> {
+    async fn handshake_responder(
+        &self,
+        peer_node_id: u64,
+    ) -> Result<(SessionKeys, SocketAddr), AdapterError> {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self.try_handshake_responder().await {
+            match self.try_handshake_responder(peer_node_id).await {
                 Ok(result) => return Ok(result),
                 Err(e) if attempt < self.config.handshake_retries => {
                     tracing::warn!(attempt, error = %e, "mesh accept failed, retrying");
@@ -1509,7 +1644,10 @@ impl MeshNode {
         }
     }
 
-    async fn try_handshake_responder(&self) -> Result<(SessionKeys, SocketAddr), AdapterError> {
+    async fn try_handshake_responder(
+        &self,
+        peer_node_id: u64,
+    ) -> Result<(SessionKeys, SocketAddr), AdapterError> {
         let timeout = self.config.handshake_timeout;
         let socket_arc = self.socket.socket_arc();
 
@@ -1537,8 +1675,15 @@ impl MeshNode {
         .await
         .map_err(|_| AdapterError::Connection("handshake timeout".into()))??;
 
-        let mut handshake = NoiseHandshake::responder(&self.config.psk, &self.static_keypair)
-            .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
+        // Direct responder: mirror the initiator's `routing_id`-based
+        // prologue so direct and routed share one convention.
+        let prologue = handshake_prologue(routing_id(peer_node_id), routing_id(self.node_id));
+        let mut handshake = NoiseHandshake::responder_with_prologue(
+            &self.config.psk,
+            &self.static_keypair,
+            &prologue,
+        )
+        .map_err(|e| AdapterError::Fatal(format!("handshake init failed: {}", e)))?;
 
         handshake
             .read_message(&parsed.payload)
