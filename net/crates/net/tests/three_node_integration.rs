@@ -4150,6 +4150,100 @@ async fn test_regression_dv_path_to_returns_multi_hop() {
     c.shutdown().await.unwrap();
 }
 
+/// Regression: the pingwave dispatch path used to accept pingwaves from
+/// any UDP source — including addresses that had never completed a
+/// handshake — and install both a `RoutingTable` entry and a
+/// `ProximityGraph` node for the forged origin. That let anyone on the
+/// wire poison the victim's routing/topology state by fabricating a
+/// pingwave claiming to be a next-hop for an arbitrary origin.
+///
+/// Fix: the dispatch now looks up `source` in `addr_to_node` and drops
+/// the pingwave if the source isn't a registered direct peer.
+///
+/// Before the fix, this test would have seen the forged origin appear
+/// in both the routing table and the proximity graph. After the fix,
+/// neither surface changes — the pingwave is silently dropped at the
+/// dispatch boundary.
+#[tokio::test]
+async fn test_regression_pingwave_from_unregistered_source_is_dropped() {
+    use net::adapter::net::behavior::EnhancedPingwave;
+    use tokio::net::UdpSocket;
+
+    let ports = find_ports(2).await;
+    let psk = [0x42u8; 32];
+    let id_a = EntityKeypair::generate();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let attacker_addr: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+
+    let a = MeshNode::new(
+        id_a,
+        MeshNodeConfig::new(addr_a, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(30)),
+    )
+    .await
+    .unwrap();
+    a.start();
+
+    // Bind a raw UDP socket that has NOT completed any handshake with A.
+    let attacker = UdpSocket::bind(attacker_addr).await.unwrap();
+
+    // Forge a pingwave claiming origin 0xDEADBEEF — a node the attacker
+    // wants A to install a route for. `hop_count = 1` is a lie; an
+    // honest intermediate would only be 1 hop away, but A has no way
+    // to verify the claim without authenticating the source.
+    let mut forged_origin_graph_id = [0u8; 32];
+    let forged_origin_nid: u64 = 0xDEAD_BEEF_CAFE_F00D;
+    forged_origin_graph_id[0..8].copy_from_slice(&forged_origin_nid.to_le_bytes());
+    let mut pw = EnhancedPingwave::new(forged_origin_graph_id, 1, 3);
+    pw.hop_count = 1;
+    let pw_bytes = pw.to_bytes();
+
+    // Send from the unregistered socket directly to A. A will dispatch
+    // it through the pingwave path.
+    attacker.send_to(&pw_bytes, addr_a).await.unwrap();
+
+    // Give A's receive loop a generous moment to process. The dispatch
+    // is synchronous after parse; 200 ms is plenty.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Assertion 1: no route for the forged origin was installed.
+    let lookup = a.router().routing_table().lookup(forged_origin_nid);
+    assert!(
+        lookup.is_none(),
+        "routing table must NOT install a route for a forged origin \
+         advertised from an unregistered source; got next_hop={:?}",
+        lookup
+    );
+
+    // Assertion 2: no proximity graph node materialized for the forged
+    // origin. Before the fix, `on_pingwave_from` would have added it.
+    assert!(
+        a.proximity_graph()
+            .get_node(&forged_origin_graph_id)
+            .is_none(),
+        "proximity graph must NOT contain a node for a forged origin \
+         advertised from an unregistered source"
+    );
+
+    // Assertion 3: no graph edge materialized. Even though the
+    // attacker's addr could resolve to some synthetic node, we expect
+    // the graph to stay empty of edges rooted at the attacker.
+    // (Checked indirectly: `path_to(forged_origin)` must be None.)
+    assert!(
+        a.proximity_graph()
+            .path_to(&forged_origin_graph_id)
+            .is_none(),
+        "path_to(forged_origin) must be None — no edge should have \
+         been installed by the dropped pingwave"
+    );
+
+    drop(attacker);
+    a.shutdown().await.unwrap();
+}
+
 // ============================================================================
 // Regressions
 // ============================================================================
