@@ -1,0 +1,40 @@
+net/crates/net/src/adapter/net/compute/migration_target.rs
+  f3669361474f4cb8 628-812
+net/crates/net/tests/migration_integration.rs
+  f3669361474f4cb8 1211-1276
+net/crates/net/src/adapter/net/route.rs
+  f3669361474f4cb8 802-841
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "4d4bfee251aefbd2595f4e652afb6ae3ed99d112",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 70,
+      "overriden_lines": 0
+    },
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 304,
+      "total_deletions": 4531,
+      "accepted_lines": 291,
+      "overriden_lines": 0
+    }
+  }
+}
