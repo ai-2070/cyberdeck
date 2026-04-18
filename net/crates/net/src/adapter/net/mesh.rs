@@ -2106,7 +2106,9 @@ impl MeshNode {
         for event in events {
             let frame_size = EventFrame::LEN_SIZE + event.len();
             if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE && !current_batch.is_empty() {
-                let (guard, seq) = match session.try_acquire_tx_slot_guard_matching_epoch(stream_id, stream.epoch) {
+                let (guard, seq) = match session
+                    .try_acquire_tx_slot_guard_matching_epoch(stream_id, stream.epoch)
+                {
                     TxAdmit::Acquired(g) => {
                         let seq = session
                             .try_stream(stream_id)
@@ -2129,17 +2131,18 @@ impl MeshNode {
         }
 
         if !current_batch.is_empty() {
-            let (guard, seq) = match session.try_acquire_tx_slot_guard_matching_epoch(stream_id, stream.epoch) {
-                TxAdmit::Acquired(g) => {
-                    let seq = session
-                        .try_stream(stream_id)
-                        .ok_or(StreamError::NotConnected)?
-                        .next_tx_seq();
-                    (g, seq)
-                }
-                TxAdmit::WindowFull => return Err(StreamError::Backpressure),
-                TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
-            };
+            let (guard, seq) =
+                match session.try_acquire_tx_slot_guard_matching_epoch(stream_id, stream.epoch) {
+                    TxAdmit::Acquired(g) => {
+                        let seq = session
+                            .try_stream(stream_id)
+                            .ok_or(StreamError::NotConnected)?
+                            .next_tx_seq();
+                        (g, seq)
+                    }
+                    TxAdmit::WindowFull => return Err(StreamError::Backpressure),
+                    TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
+                };
             let packet = builder.build(stream_id, seq, &current_batch, flags);
             let send_res = self.socket.send_to(&packet, peer_addr).await;
             drop(guard);
