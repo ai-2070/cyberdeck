@@ -1,172 +1,139 @@
-# Handshake Relay
+# Handshake Relay (via Subprotocol)
 
 ## Problem
 
-`MeshNode::connect()` requires direct UDP connectivity to the peer for the Noise NKpsk0 handshake. If A wants to establish a session with C, and only B has direct paths to both, A must first establish a direct UDP path to C (which may be impossible due to NAT, firewall, or network topology).
-
-The data path already supports relay — `send_routed` encrypts for C and forwards through B. But the session setup (handshake) can't use this path. A user who builds A↔B↔C topology hits this wall: "I can't connect to C because I can't reach its port directly."
+`MeshNode::connect()` requires direct UDP connectivity for the Noise NKpsk0 handshake. If A wants a session with C and only B has direct paths to both, A can't establish the session.
 
 ## Design
 
-### Relay envelope
-
-Handshake packets between A and C are wrapped in a relay envelope and sent through B. B doesn't decrypt the handshake (it's encrypted to C's key) — it just forwards based on the envelope's destination.
-
-```
-┌──────────────────────────────────────────────┐
-│              Relay Envelope                  │
-│  dest_node_id: u64  (who this is for)        │
-│  src_node_id:  u64  (who sent it)            │
-│  msg_type:     u8   (handshake / data)       │
-│  payload_len:  u16                           │
-│  ┌──────────────────────────────────────┐    │
-│  │  Noise Handshake Packet (opaque)     │    │
-│  │  (encrypted to dest's public key)    │    │
-│  └──────────────────────────────────────┘    │
-└──────────────────────────────────────────────┘
-```
-
-The envelope is NOT encrypted between A and B — it's a cleartext routing wrapper around an already-encrypted handshake message. B reads `dest_node_id`, looks up the peer's address, and forwards the entire envelope.
-
-### Wire format
-
-```
- 0               1               2               3
- 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|     MAGIC_RELAY (0x4E52)      |    msg_type   |   reserved    |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       dest_node_id (8 bytes)                  |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       src_node_id (8 bytes)                   |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|         payload_len           |          reserved             |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                    payload (variable)                         |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-```
-
-Total header: 24 bytes. Magic `0x4E52` ("NR" — Net Relay) distinguishes relay envelopes from Net packets (`0x4E45`) and pingwaves (72 bytes, no magic).
-
-`msg_type`:
-- `0x01` = Handshake forward (Noise message)
-- `0x02` = Handshake response (Noise message)
-- `0x03` = Relay data (future — for relaying post-handshake data through intermediary sessions)
+Handshake messages travel as a normal Net subprotocol (`SUBPROTOCOL_HANDSHAKE = 0x0601`). No separate envelope or magic — the existing Net header, routing, and forwarding handle everything.
 
 ### Flow
 
 ```
 A (initiator)                B (relay)                C (responder)
      │                          │                          │
-     │  connect_via(B, C_pubkey, C_node_id)                │
+     │  A has session with B    │  B has session with C    │
      │                          │                          │
-     │  1. Build Noise msg1     │                          │
-     │  2. Wrap in relay envelope (dest=C)                 │
-     │  3. Send to B            │                          │
-     │ ──────────────────────►  │                          │
-     │                          │  4. Read envelope         │
-     │                          │  5. Lookup C's address    │
-     │                          │  6. Forward envelope to C │
-     │                          │ ──────────────────────►  │
-     │                          │                          │  7. Unwrap envelope
-     │                          │                          │  8. Process Noise msg1
-     │                          │                          │  9. Build Noise msg2
-     │                          │                          │ 10. Wrap in relay envelope (dest=A)
-     │                          │  ◄──────────────────────│ 11. Send to B
-     │                          │ 12. Forward to A         │
-     │  ◄──────────────────────│                          │
-     │ 13. Unwrap envelope      │                          │
-     │ 14. Process Noise msg2   │                          │
-     │ 15. Extract session keys │                          │
+     │  1. Build Noise msg1 for C                          │
+     │  2. Send as SUBPROTOCOL_HANDSHAKE to B              │
+     │     (payload = [dest_node_id:8][noise_msg])         │
+     │ ──────(A↔B encrypted)──►│                          │
+     │                          │  3. Handler sees HANDSHAKE│
+     │                          │  4. Read dest_node_id = C │
+     │                          │  5. Forward payload to C  │
+     │                          │ ──(B↔C encrypted)──────►│
+     │                          │                          │  6. Handler processes
+     │                          │                          │  7. Noise msg1 → msg2
+     │                          │                          │  8. Send response to B
+     │                          │  ◄──(B↔C encrypted)─────│  (HANDSHAKE, dest=A)
+     │                          │  9. Forward to A          │
+     │  ◄──(A↔B encrypted)─────│                          │
+     │ 10. Process Noise msg2   │                          │
+     │ 11. Extract session keys │                          │
      │                          │                          │
-     │  Session A↔C established (keys derived from Noise)  │
-     │  A stores session with peer_addr=C (via B)          │
-     │  Data flows via send_routed (encrypted for C)       │
+     │  Session A↔C established                            │
+     │  Data via send_routed (A↔C keys, forwarded by B)    │
 ```
 
-### Key insight: `peer_addr` tracking
+### Why not a separate relay envelope
 
-After the relayed handshake, A has a session with C but no direct UDP path. A's `peer_addr` for the C session should be B's address (the relay). When A sends data to C, it goes through B's address. B forwards it to C based on the routing table.
+The initial plan used a custom relay envelope (magic `0x4E52`, separate 24-byte header). Kyra correctly identified this as redundant:
 
-But the session's `session_id` is derived from the Noise handshake — it's the same on both A and C. When C receives a packet from B (relayed from A), the session_id lookup in `dispatch_packet` finds the A↔C session. This already works — the relay test proves it.
+- The Net header already carries dest_id, src_id, subprotocol_id
+- The forwarding logic already handles multi-hop routing
+- A second magic/header duplicates information and splits the dispatch path
+- It breaks the "one 64-byte header everywhere" story
 
-### `accept_via` on C's side
+### Payload format
 
-C needs to know it should process relayed handshake envelopes. Two options:
+The handshake subprotocol payload carries:
 
-**Option A:** C's receive loop automatically processes relay envelopes. When a relay envelope arrives with `dest_node_id == C.node_id` and `msg_type == Handshake`, C unwraps it and processes the Noise message. The response is wrapped in a relay envelope addressed to `src_node_id` and sent back through the same source address (B).
+```
+[dest_node_id: u64][src_node_id: u64][noise_bytes: variable]
+```
 
-**Option B:** C explicitly calls `accept_relayed()` which listens for relay envelopes.
+- `dest_node_id`: who the handshake is for (C)
+- `src_node_id`: who initiated (A)
+- `noise_bytes`: opaque Noise NKpsk0 handshake message
 
-Option A is simpler — the receive loop handles it transparently. No special API needed on the responder side.
+B reads `dest_node_id` to know where to forward. B can see the Noise bytes but can't forge them (NKpsk0 authentication) or derive session keys (needs C's private key).
+
+### Security
+
+B sees handshake bytes at the application layer (it decrypts A↔B to read the subprotocol, then re-encrypts B↔C to forward). This is acceptable:
+
+- Noise NKpsk0 bytes are authenticated — B can't forge them
+- The PSK prevents B from impersonating A or C
+- After handshake completes, A↔C data uses `send_routed` with keys B doesn't have
+- This matches the threat model: B is a trusted relay for routing metadata but can't read post-handshake payloads
 
 ## Implementation
 
-### Step 1: Relay envelope (~50 lines)
+### Step 1: Constants and payload format (~20 lines)
 
-New file `src/adapter/net/relay_envelope.rs`:
-- `RelayEnvelope` struct: `dest_node_id`, `src_node_id`, `msg_type`, `payload`
-- `to_bytes()` / `from_bytes()` with `MAGIC_RELAY` (`0x4E52`)
-- `RelayMsgType` enum: `Handshake`, `HandshakeResponse`
+```rust
+pub const SUBPROTOCOL_HANDSHAKE: u16 = 0x0601;
 
-### Step 2: Receive loop — relay envelope dispatch (~30 lines)
+struct HandshakePayload {
+    dest_node_id: u64,
+    src_node_id: u64,
+    noise_bytes: Bytes,
+}
+```
 
-In `MeshNode::dispatch_packet`, add a check before the existing magic-byte discrimination:
-- If first 2 bytes == `0x4E52` → relay envelope
-- If `dest_node_id == self.node_id` → unwrap and process locally
-- If `dest_node_id != self.node_id` → forward to the dest's address via peers map
+### Step 2: HandshakeHandler (~80 lines)
 
-For handshake processing on the responder side:
-- Extract the Noise message from the envelope
-- Run the Noise responder flow (same as `try_handshake_responder`)
-- Wrap the response in a relay envelope addressed to `src_node_id`
-- Send back through the source address (the relay)
+Manages per-peer Noise states for in-flight handshakes:
 
-### Step 3: `connect_via` on MeshNode (~40 lines)
+```rust
+pub struct HandshakeHandler {
+    /// In-flight handshake states: src_node_id → Noise responder state
+    pending: DashMap<u64, NoiseResponderState>,
+    /// This node's Noise static keypair
+    static_keypair: StaticKeypair,
+    /// Pre-shared key
+    psk: [u8; 32],
+}
+```
 
-New method:
+Methods:
+- `handle_initiator_msg(src_node_id, noise_bytes)` → creates responder state, returns response bytes
+- `handle_responder_msg(dest_node_id, noise_bytes)` → feeds into existing initiator state, returns SessionKeys
+
+### Step 3: Wire into MeshNode receive loop (~20 lines)
+
+In `process_local_packet`, after the migration handler check:
+
+```rust
+if parsed.header.subprotocol_id == SUBPROTOCOL_HANDSHAKE {
+    if let Some(ref handler) = ctx.handshake_handler {
+        // extract payload, process, send response
+    }
+}
+```
+
+### Step 4: `connect_via` on MeshNode (~30 lines)
+
 ```rust
 pub async fn connect_via(
     &self,
-    relay_addr: SocketAddr,    // B's address
-    dest_pubkey: &[u8; 32],    // C's Noise public key
-    dest_node_id: u64,         // C's node ID
+    relay_addr: SocketAddr,
+    dest_pubkey: &[u8; 32],
+    dest_node_id: u64,
 ) -> Result<u64, AdapterError>
 ```
 
-- Build Noise initiator msg1
-- Wrap in relay envelope (dest=`dest_node_id`, src=`self.node_id`)
-- Send to `relay_addr`
-- Wait for relay envelope response from the relay
-- Unwrap, process Noise msg2
-- Extract session keys
-- Store session with `peer_addr = relay_addr` (data goes through relay)
+- Creates Noise initiator state
+- Sends msg1 as `SUBPROTOCOL_HANDSHAKE` via `send_subprotocol` to the relay
+- Waits for response (relay forwards it back)
+- Completes handshake, creates NetSession
 
-### Step 4: Tests (~80 lines)
+### Step 5: Tests
 
-- `test_mesh_node_handshake_relay`: A connects to C through B. A has no direct path to C. The handshake completes via relay envelope through B. After handshake, A sends data to C via `send_routed` through B. C receives it.
-- `test_mesh_node_handshake_relay_bidirectional`: After relayed handshake, C can also send data back to A through B.
-
-## What changes, what doesn't
-
-| Component | Changes? | Why |
-|-----------|----------|-----|
-| `NetSession` | No | Session keys come from Noise, same as before |
-| `PacketBuilder` | No | Data packets are built the same way |
-| Noise handshake logic | **Reused** | Same `NoiseHandshake::initiator/responder`, just wrapped in relay envelope |
-| `dispatch_packet` | **Yes** | New check for relay magic `0x4E52` |
-| `MeshNode` | **Yes** | New `connect_via` method, relay envelope handling in receive loop |
-
-## Security
-
-- B cannot read the handshake messages (encrypted to C's Noise key)
-- B cannot forge handshake responses (would need C's private key)
-- B can drop or delay handshake messages (same as any relay — handled by retry)
-- B learns that A is trying to connect to C (topology leak, same as routing headers)
-- The relay envelope is cleartext — B sees `src_node_id` and `dest_node_id`
-
-This matches the threat model from the README: "Untrusted relay. Nodes forward packets without decrypting payloads."
+- `test_mesh_handshake_via_relay`: A↔B↔C, handshake via subprotocol, data flows after
+- `test_mesh_handshake_relay_bidirectional`: C sends data back to A after relayed handshake
 
 ## Scope
 
-~120 lines of new code: relay envelope (50), dispatch changes (30), connect_via (40). Two new tests. The relay envelope format is simple and extensible (future `msg_type` values for other relayed operations).
+~150 lines new code, 2 tests. Reuses existing `send_subprotocol`, `build_subprotocol`, and the subprotocol dispatch path already proven by migration tests.
