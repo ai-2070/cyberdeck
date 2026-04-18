@@ -11,7 +11,7 @@
 //! use net_sdk::mesh::{Mesh, MeshBuilder};
 //!
 //! # async fn example() -> net_sdk::error::Result<()> {
-//! let mut node = Mesh::builder("127.0.0.1:9000", b"my-32-byte-preshared-key-here!!")
+//! let mut node = Mesh::builder("127.0.0.1:9000", b"my-32-byte-preshared-key-here!!!")?
 //!     .heartbeat_ms(200)
 //!     .session_timeout_ms(5000)
 //!     .build()
