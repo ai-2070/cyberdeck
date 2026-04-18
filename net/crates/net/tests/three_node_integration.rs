@@ -4509,59 +4509,83 @@ async fn test_regression_handshake_relay_registers_peer_after_msg2_sent() {
 /// no longer swallows legitimate Net-header-shaped traffic.)
 #[tokio::test]
 async fn test_regression_pingwave_not_dispatched_on_net_magic_packet() {
-    let ports = find_ports(1).await;
+    let ports = find_ports(2).await;
     let psk = [0x42u8; 32];
-    let id = EntityKeypair::generate();
-    let addr: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
 
-    let node = MeshNode::new(id, MeshNodeConfig::new(addr, psk))
-        .await
-        .unwrap();
-    node.start();
+    // Handshaked peer B so we have a registered source for the
+    // "legitimate pingwave" sanity check below. Pingwaves from
+    // unregistered sources are dropped at the dispatch boundary
+    // (see `test_regression_pingwave_from_unregistered_source_is_dropped`),
+    // so the sanity leg needs a real peer.
+    let mk_config = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(10))
+    };
+    let node_a = MeshNode::new(id_a, mk_config(addr_a)).await.unwrap();
+    let node_b = MeshNode::new(id_b, mk_config(addr_b)).await.unwrap();
+    let pub_b = *node_b.public_key();
 
-    let before = node.proximity_graph().stats().pingwaves_received;
+    let (r1, r2) = tokio::join!(node_b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    node_a.start();
+    node_b.start();
 
-    // Craft a 72-byte packet whose first two bytes are the Net magic
-    // (0x4E45 little-endian = [0x45, 0x4E] = "EN"). Post-fix this must be
-    // rejected at the pingwave guard and NOT reach the proximity graph.
-    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let before = node_a.proximity_graph().stats().pingwaves_received;
+
+    // Leg 1: a 72-byte packet whose first two bytes are the Net magic
+    // (0x4E45 little-endian = [0x45, 0x4E] = "EN"), sent from an
+    // UNHANDSHAKED socket. Post-fix this must be rejected at the
+    // pingwave parse guard and NOT reach the proximity graph. The
+    // unregistered-source guard would also drop it, but the parse
+    // guard fires first and is what this test is about.
+    let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let mut pkt = [0u8; 72];
     pkt[0] = 0x45;
     pkt[1] = 0x4E;
-    sender.send_to(&pkt, addr).await.unwrap();
+    attacker.send_to(&pkt, addr_a).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let after = node.proximity_graph().stats().pingwaves_received;
+    let after = node_a.proximity_graph().stats().pingwaves_received;
     assert_eq!(
         before, after,
         "a 72-byte packet starting with the Net magic must not be \
          dispatched as a pingwave"
     );
 
-    // Sanity check: a 72-byte packet WITHOUT the Net magic is still
-    // accepted as a pingwave. If this fails, the guard is too aggressive.
-    let mut pw_pkt = [0u8; 72];
-    // Fill origin_id[0..8] with a recognisable node id; the remaining
-    // origin_id bytes (8..32) are zero — not the Net magic — so the
-    // pingwave guard lets it through.
-    pw_pkt[0..8].copy_from_slice(&0xDEADBEEFu64.to_le_bytes());
-    // Set TTL > 0 so the graph considers it live.
-    pw_pkt[40] = 4;
-    sender.send_to(&pw_pkt, addr).await.unwrap();
+    // Leg 2: legitimate pingwaves from B (a handshaked peer) must
+    // still be accepted. B's heartbeat loop emits a pingwave every
+    // `heartbeat_interval_ms` (500 ms by config); wait long enough
+    // for at least one to cross the wire. A's dispatch must parse it
+    // as a pingwave (the guard lets non-magic packets through) AND
+    // accept it (B is a registered peer). If this counter doesn't
+    // move, either the parse guard is too aggressive or the
+    // unregistered-source guard is rejecting traffic from a real
+    // peer.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let after_valid = node.proximity_graph().stats().pingwaves_received;
+    let after_valid = node_a.proximity_graph().stats().pingwaves_received;
     assert!(
         after_valid > after,
-        "legitimate pingwaves (no Net magic) must still be accepted; \
-         before={}, after={}",
+        "legitimate pingwaves from a handshaked peer must be accepted; \
+         before_valid_leg={}, after_valid_leg={}",
         after,
         after_valid
     );
 
-    node.shutdown().await.unwrap();
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
 }
 
 // ============================================================================
