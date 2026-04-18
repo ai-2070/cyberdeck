@@ -329,7 +329,7 @@ async fn test_data_flow_a_to_b() {
         .expect("B poll failed");
 
     assert!(
-        result.events.len() > 0,
+        !result.events.is_empty(),
         "B should receive events from A, got {}",
         result.events.len()
     );
@@ -375,8 +375,14 @@ async fn test_data_flow_a_to_b_and_c() {
         .await
         .expect("C poll failed");
 
-    assert!(b_result.events.len() > 0, "B should receive events from A");
-    assert!(c_result.events.len() > 0, "C should receive events from A");
+    assert!(
+        !b_result.events.is_empty(),
+        "B should receive events from A"
+    );
+    assert!(
+        !c_result.events.is_empty(),
+        "C should receive events from A"
+    );
 
     triangle.shutdown().await;
 }
@@ -431,12 +437,12 @@ async fn test_bidirectional_simultaneous() {
         .expect("A poll shard 0 failed");
 
     assert!(
-        b_received.events.len() > 0,
+        !b_received.events.is_empty(),
         "B should receive A's events, got {}",
         b_received.events.len()
     );
     assert!(
-        a_received.events.len() > 0,
+        !a_received.events.is_empty(),
         "A should receive B's events, got {}",
         a_received.events.len()
     );
@@ -509,8 +515,8 @@ async fn test_independent_streams_no_interference() {
         );
     }
 
-    assert!(b_events.events.len() > 0, "B should receive S1 events");
-    assert!(c_events.events.len() > 0, "C should receive S2 events");
+    assert!(!b_events.events.is_empty(), "B should receive S1 events");
+    assert!(!c_events.events.is_empty(), "C should receive S2 events");
 
     triangle.shutdown().await;
 }
@@ -579,17 +585,17 @@ async fn test_full_ring_traffic() {
         .expect("A poll failed");
 
     assert!(
-        b_got.events.len() > 0,
+        !b_got.events.is_empty(),
         "B should receive from A, got {}",
         b_got.events.len()
     );
     assert!(
-        c_got.events.len() > 0,
+        !c_got.events.is_empty(),
         "C should receive from B, got {}",
         c_got.events.len()
     );
     assert!(
-        a_got.events.len() > 0,
+        !a_got.events.is_empty(),
         "A should receive from C, got {}",
         a_got.events.len()
     );
@@ -764,7 +770,7 @@ async fn test_data_flow_survives_node_death() {
         .expect("C poll failed");
 
     assert!(
-        c_got.events.len() > 0,
+        !c_got.events.is_empty(),
         "C should receive events from A after B dies, got {}",
         c_got.events.len()
     );
@@ -1966,7 +1972,7 @@ async fn test_mesh_node_two_node_data_exchange() {
     let result = node_b.poll_shard(0, None, 100).await.unwrap();
 
     assert!(
-        result.events.len() > 0,
+        !result.events.is_empty(),
         "B should receive events from A via MeshNode, got {}",
         result.events.len()
     );
@@ -2057,12 +2063,12 @@ async fn test_mesh_node_triangle() {
     let c_events = node_c.poll_shard(0, None, 100).await.unwrap();
 
     assert!(
-        b_events.events.len() > 0,
+        !b_events.events.is_empty(),
         "B should receive from A, got {}",
         b_events.events.len()
     );
     assert!(
-        c_events.events.len() > 0,
+        !c_events.events.is_empty(),
         "C should receive from A, got {}",
         c_events.events.len()
     );
@@ -2159,7 +2165,7 @@ async fn test_mesh_node_relay_through_middle() {
     // C should receive the events
     let c_result = node_c.poll_shard(0, None, 100).await.unwrap();
     assert!(
-        c_result.events.len() > 0,
+        !c_result.events.is_empty(),
         "C should receive relayed events from A through B, got {}",
         c_result.events.len()
     );
@@ -2470,7 +2476,7 @@ async fn test_mesh_node_reroute_on_failure() {
 
     let c_before = c.poll_shard(0, None, 100).await.unwrap();
     assert!(
-        c_before.events.len() > 0,
+        !c_before.events.is_empty(),
         "C should receive events via B before failure, got {}",
         c_before.events.len()
     );
@@ -2490,7 +2496,7 @@ async fn test_mesh_node_reroute_on_failure() {
 
     let c_after = c.poll_shard(0, None, 100).await.unwrap();
     assert!(
-        c_after.events.len() > 0,
+        !c_after.events.is_empty(),
         "C should receive events after reroute, got {}",
         c_after.events.len()
     );
@@ -3278,7 +3284,7 @@ async fn test_mesh_node_auto_reroute() {
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     let c_before = node_c.poll_shard(0, None, 100).await.unwrap();
-    assert!(c_before.events.len() > 0, "C should receive via B");
+    assert!(!c_before.events.is_empty(), "C should receive via B");
 
     // Phase 2: kill B
     node_b.shutdown().await.unwrap();

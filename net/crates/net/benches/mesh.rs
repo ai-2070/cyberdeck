@@ -197,9 +197,8 @@ fn bench_packet_discrimination(c: &mut Criterion) {
 
     group.bench_function("classify_routed", |b| {
         b.iter(|| {
-            let is_routed = routed.len() >= ROUTING_HEADER_SIZE + 64
-                && u16::from_le_bytes([routed[0], routed[1]]) != 0x4E45;
-            is_routed // true → routed
+            routed.len() >= ROUTING_HEADER_SIZE + 64
+                && u16::from_le_bytes([routed[0], routed[1]]) != 0x4E45 // true → routed
         });
     });
 
