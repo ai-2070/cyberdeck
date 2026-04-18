@@ -47,6 +47,11 @@ use super::pool::PacketBuilder;
 
 use super::behavior::loadbalance::HealthStatus;
 use super::behavior::proximity::{EnhancedPingwave, ProximityConfig, ProximityGraph};
+use super::channel::membership::{self, MembershipMsg, SUBPROTOCOL_CHANNEL_MEMBERSHIP};
+use super::channel::{
+    AckReason, ChannelConfigRegistry, ChannelId, ChannelName, ChannelPublisher, OnFailure,
+    PublishConfig, PublishReport, SubscriberRoster,
+};
 use super::compute::SUBPROTOCOL_MIGRATION;
 use super::protocol::{self, EventFrame, PacketFlags, MAGIC};
 use super::reroute::ReroutePolicy;
@@ -125,6 +130,22 @@ struct DispatchCtx {
     /// handshake responder completes here).
     packet_pool_size: usize,
     default_reliable: bool,
+    /// Subscriber roster for channel fan-out.
+    roster: Arc<SubscriberRoster>,
+    /// Channel config registry used to authorize incoming Subscribe.
+    /// `None` disables channel-level ACL checks (any caller accepted).
+    channel_configs: Option<Arc<ChannelConfigRegistry>>,
+    /// In-flight Subscribe/Unsubscribe requests awaiting an Ack, keyed by nonce.
+    pending_membership_acks: Arc<DashMap<u64, oneshot::Sender<MembershipAck>>>,
+    /// Max distinct channels a single peer may subscribe to.
+    max_channels_per_peer: usize,
+}
+
+/// Result passed through the pending-ack oneshot.
+#[derive(Debug, Clone)]
+pub(crate) struct MembershipAck {
+    pub accepted: bool,
+    pub reason: Option<AckReason>,
 }
 
 /// Configuration for a MeshNode.
@@ -163,6 +184,14 @@ pub struct MeshNodeConfig {
     /// the least-recently-active stream is evicted via the same path as
     /// `close_stream` (logged with `reason=cap_exceeded`).
     pub max_streams: usize,
+    /// Max channels a single peer may subscribe to via
+    /// `SUBPROTOCOL_CHANNEL_MEMBERSHIP`. Extra Subscribe requests are
+    /// rejected with `AckReason::TooManyChannels`. Protects the roster
+    /// from a peer that spams subscriptions.
+    pub max_channels_per_peer: usize,
+    /// Timeout for `subscribe_channel` / `unsubscribe_channel` to wait
+    /// for an `Ack` before returning `AdapterError::Timeout`.
+    pub membership_ack_timeout: Duration,
 }
 
 impl MeshNodeConfig {
@@ -183,6 +212,8 @@ impl MeshNodeConfig {
             fair_quantum: 16,
             stream_idle_timeout: Duration::from_secs(300),
             max_streams: 4096,
+            max_channels_per_peer: 1024,
+            membership_ack_timeout: Duration::from_secs(5),
         }
     }
 
@@ -297,6 +328,14 @@ pub struct MeshNode {
     peer_addrs: Arc<DashMap<u64, SocketAddr>>,
     /// Partition filter for simulating network splits
     partition_filter: PartitionFilter,
+    /// Per-channel subscriber roster (daemon-layer fan-out).
+    roster: Arc<SubscriberRoster>,
+    /// Channel config registry consulted by incoming `Subscribe` packets
+    /// for ACL decisions. When `None`, ACL is bypassed and all subscribes
+    /// are accepted — used by tests and by nodes that don't run channels.
+    channel_configs: Option<Arc<ChannelConfigRegistry>>,
+    /// In-flight Subscribe/Unsubscribe requests keyed by nonce.
+    pending_membership_acks: Arc<DashMap<u64, oneshot::Sender<MembershipAck>>>,
     /// Background tasks
     tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
     /// Shutdown flag
@@ -375,16 +414,32 @@ impl MeshNode {
                 .with_proximity_graph(proximity_graph.clone()),
         );
 
-        // Wire failure detector with reroute callbacks
+        // Subscriber roster for channel fan-out; also wired into the
+        // failure-detector `on_failure` callback so that a peer going
+        // Failed is removed from every channel it was subscribed to.
+        let roster: Arc<SubscriberRoster> = Arc::new(SubscriberRoster::new());
+
+        // Wire failure detector with reroute callbacks + roster eviction.
         let rp_failure = reroute_policy.clone();
         let rp_recovery = reroute_policy.clone();
+        let roster_failure = roster.clone();
         let failure_detector = FailureDetector::with_config(FailureDetectorConfig {
             timeout: config.session_timeout,
             miss_threshold: 3,
             suspicion_threshold: 2,
             cleanup_interval: Duration::from_secs(60),
         })
-        .on_failure(move |node_id| rp_failure.on_failure(node_id))
+        .on_failure(move |node_id| {
+            rp_failure.on_failure(node_id);
+            let removed = roster_failure.remove_peer(node_id);
+            if !removed.is_empty() {
+                tracing::debug!(
+                    node_id = format!("{:#x}", node_id),
+                    channels = removed.len(),
+                    "roster: evicted failed peer from channels"
+                );
+            }
+        })
         .on_recovery(move |node_id| rp_recovery.on_recovery(node_id));
 
         let pending_handshakes: Arc<DashMap<u64, PendingHandshake>> = Arc::new(DashMap::new());
@@ -406,6 +461,9 @@ impl MeshNode {
             reroute_policy,
             peer_addrs,
             partition_filter: Arc::new(dashmap::DashSet::new()),
+            roster,
+            channel_configs: None,
+            pending_membership_acks: Arc::new(DashMap::new()),
             tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
@@ -611,6 +669,10 @@ impl MeshNode {
             partition_filter: self.partition_filter.clone(),
             packet_pool_size: self.config.packet_pool_size,
             default_reliable: self.config.default_reliable,
+            roster: self.roster.clone(),
+            channel_configs: self.channel_configs.clone(),
+            pending_membership_acks: self.pending_membership_acks.clone(),
+            max_channels_per_peer: self.config.max_channels_per_peer,
         };
 
         tokio::spawn(async move {
@@ -1093,6 +1155,26 @@ impl MeshNode {
             // No handler set — fall through to standard event path
         }
 
+        // Channel membership: Subscribe / Unsubscribe / Ack.
+        if parsed.header.subprotocol_id == SUBPROTOCOL_CHANNEL_MEMBERSHIP {
+            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let payload = match events.into_iter().next() {
+                Some(data) => data,
+                None => return,
+            };
+
+            // Resolve the sender's node_id from the session they arrived on.
+            let from_node = ctx
+                .peers
+                .iter()
+                .find(|e| e.value().session.session_id() == session.session_id())
+                .map(|e| e.value().node_id)
+                .unwrap_or(0);
+
+            Self::handle_membership_message(&payload, from_node, ctx);
+            return;
+        }
+
         // Standard event path: parse event frames and queue
         let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
 
@@ -1371,6 +1453,432 @@ impl MeshNode {
                 .await
                 .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
         }
+
+        drop(builder);
+        session.touch();
+        Ok(())
+    }
+
+    // ── Channel membership API ─────────────────────────────────────────
+
+    /// Access the per-channel subscriber roster. Used by `ChannelPublisher`
+    /// to enumerate subscribers; exposed for diagnostics.
+    pub fn roster(&self) -> &Arc<SubscriberRoster> {
+        &self.roster
+    }
+
+    /// Install a `ChannelConfigRegistry` whose `can_subscribe` /
+    /// `can_publish` rules are consulted for incoming Subscribe messages.
+    ///
+    /// When unset (the default), all subscribes are accepted. This is fine
+    /// for testing and for deployments that rely on network-layer isolation
+    /// rather than per-channel ACL. Full capability/token-based authorization
+    /// requires threading the sender's `CapabilitySet` through dispatch and
+    /// is a follow-up.
+    pub fn set_channel_configs(&mut self, configs: Arc<ChannelConfigRegistry>) {
+        self.channel_configs = Some(configs);
+    }
+
+    /// Ask `publisher_node_id` to add this node to `channel`'s subscriber set.
+    ///
+    /// Blocks until the publisher's `Ack` arrives or
+    /// `membership_ack_timeout` elapses. Returns `Ok(())` iff the publisher
+    /// accepted the subscribe; `AckReason` failures surface as
+    /// `AdapterError::Connection`.
+    pub async fn subscribe_channel(
+        &self,
+        publisher_node_id: u64,
+        channel: ChannelName,
+    ) -> Result<(), AdapterError> {
+        self.send_membership_request(publisher_node_id, channel, true)
+            .await
+    }
+
+    /// Ask `publisher_node_id` to remove this node from `channel`'s
+    /// subscriber set. Mirror of `subscribe_channel`.
+    pub async fn unsubscribe_channel(
+        &self,
+        publisher_node_id: u64,
+        channel: ChannelName,
+    ) -> Result<(), AdapterError> {
+        self.send_membership_request(publisher_node_id, channel, false)
+            .await
+    }
+
+    async fn send_membership_request(
+        &self,
+        publisher_node_id: u64,
+        channel: ChannelName,
+        subscribe: bool,
+    ) -> Result<(), AdapterError> {
+        let peer_addr = {
+            let peer = self.peers.get(&publisher_node_id).ok_or_else(|| {
+                AdapterError::Connection(format!(
+                    "no session to publisher {:#x}",
+                    publisher_node_id
+                ))
+            })?;
+            peer.addr
+        };
+
+        let nonce = {
+            use std::sync::atomic::AtomicU64;
+            static COUNTER: AtomicU64 = AtomicU64::new(1);
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        };
+        let msg = if subscribe {
+            MembershipMsg::Subscribe {
+                channel: channel.clone(),
+                nonce,
+            }
+        } else {
+            MembershipMsg::Unsubscribe {
+                channel: channel.clone(),
+                nonce,
+            }
+        };
+        let bytes = membership::encode(&msg);
+
+        let (tx, rx) = oneshot::channel::<MembershipAck>();
+        self.pending_membership_acks.insert(nonce, tx);
+
+        // Scoped send; if it fails, drop the pending entry so memory
+        // doesn't accumulate.
+        if let Err(e) = self
+            .send_subprotocol(peer_addr, SUBPROTOCOL_CHANNEL_MEMBERSHIP, &bytes)
+            .await
+        {
+            self.pending_membership_acks.remove(&nonce);
+            return Err(e);
+        }
+
+        let ack = match tokio::time::timeout(self.config.membership_ack_timeout, rx).await {
+            Ok(Ok(ack)) => ack,
+            Ok(Err(_)) => {
+                self.pending_membership_acks.remove(&nonce);
+                return Err(AdapterError::Connection(
+                    "membership ack channel closed".into(),
+                ));
+            }
+            Err(_) => {
+                self.pending_membership_acks.remove(&nonce);
+                return Err(AdapterError::Connection(format!(
+                    "membership ack timeout ({:?}) for channel {}",
+                    self.config.membership_ack_timeout, channel
+                )));
+            }
+        };
+
+        if !ack.accepted {
+            return Err(AdapterError::Connection(format!(
+                "membership request rejected: {:?}",
+                ack.reason
+            )));
+        }
+        Ok(())
+    }
+
+    /// Dispatch an inbound Subscribe / Unsubscribe / Ack on the
+    /// membership subprotocol.
+    fn handle_membership_message(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
+        let msg = match membership::decode(payload) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "membership decode failed");
+                return;
+            }
+        };
+
+        match msg {
+            MembershipMsg::Subscribe { channel, nonce } => {
+                let (accepted, reason) = Self::authorize_subscribe(&channel, from_node, ctx);
+                if accepted {
+                    let id = ChannelId::new(channel);
+                    ctx.roster.add(id, from_node);
+                }
+                Self::send_membership_ack(from_node, nonce, accepted, reason, ctx);
+            }
+            MembershipMsg::Unsubscribe { channel, nonce } => {
+                let id = ChannelId::new(channel);
+                ctx.roster.remove(&id, from_node);
+                // Unsubscribe is always accepted — idempotent even if the
+                // peer wasn't actually subscribed.
+                Self::send_membership_ack(from_node, nonce, true, None, ctx);
+            }
+            MembershipMsg::Ack {
+                nonce,
+                accepted,
+                reason,
+            } => {
+                if let Some((_, tx)) = ctx.pending_membership_acks.remove(&nonce) {
+                    let _ = tx.send(MembershipAck { accepted, reason });
+                } else {
+                    tracing::debug!(
+                        nonce,
+                        "membership ack with no pending request (duplicate or timed out)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Decide whether a Subscribe from `from_node` on `channel` is allowed.
+    ///
+    /// Rules, in order:
+    /// 1. Per-peer channel cap — rejects with `TooManyChannels`.
+    /// 2. If a `channel_configs` registry is set and the channel isn't in
+    ///    it, reject with `UnknownChannel`.
+    /// 3. Otherwise accept. Full capability/token checks are deferred
+    ///    until the dispatch context carries the sender's `CapabilitySet`.
+    fn authorize_subscribe(
+        channel: &ChannelName,
+        from_node: u64,
+        ctx: &DispatchCtx,
+    ) -> (bool, Option<AckReason>) {
+        if ctx.roster.channels_for_peer_count(from_node) >= ctx.max_channels_per_peer {
+            return (false, Some(AckReason::TooManyChannels));
+        }
+        if let Some(ref configs) = ctx.channel_configs {
+            if configs.get_by_name(channel.as_str()).is_none() {
+                return (false, Some(AckReason::UnknownChannel));
+            }
+        }
+        (true, None)
+    }
+
+    /// Send an `Ack` on the membership subprotocol back to `to_node`.
+    /// Non-fatal if `to_node` is not in the peer map or the send fails;
+    /// the requester will simply hit its ack timeout.
+    fn send_membership_ack(
+        to_node: u64,
+        nonce: u64,
+        accepted: bool,
+        reason: Option<AckReason>,
+        ctx: &DispatchCtx,
+    ) {
+        let Some(peer_entry) = ctx.peers.get(&to_node) else {
+            return;
+        };
+        let dest_addr = peer_entry.value().addr;
+        if ctx.partition_filter.contains(&dest_addr) {
+            return;
+        }
+        let dest_sess = peer_entry.value().session.clone();
+        let socket = ctx.socket.clone();
+        let ack = MembershipMsg::Ack {
+            nonce,
+            accepted,
+            reason,
+        };
+        let bytes = Bytes::from(membership::encode(&ack));
+        drop(peer_entry);
+
+        tokio::spawn(async move {
+            let pool = dest_sess.thread_local_pool();
+            let mut builder = pool.get();
+            let stream_id = SUBPROTOCOL_CHANNEL_MEMBERSHIP as u64;
+            let seq = {
+                let stream = dest_sess.get_or_create_stream(stream_id);
+                stream.next_tx_seq()
+            };
+            let events = vec![bytes];
+            let packet = builder.build_subprotocol(
+                stream_id,
+                seq,
+                &events,
+                PacketFlags::NONE,
+                SUBPROTOCOL_CHANNEL_MEMBERSHIP,
+            );
+            let _ = socket.send_to(&packet, dest_addr).await;
+        });
+    }
+
+    // ── Channel fan-out (ChannelPublisher) ─────────────────────────────
+
+    /// Build a [`ChannelPublisher`] recipe. Does NOT talk to the wire —
+    /// combine with [`publish`](Self::publish) or
+    /// [`publish_many`](Self::publish_many) to actually fan out.
+    pub fn channel_publisher(
+        &self,
+        channel: ChannelName,
+        config: PublishConfig,
+    ) -> ChannelPublisher {
+        ChannelPublisher::new(channel, config)
+    }
+
+    /// Fan `payload` out to every subscriber of the publisher's channel.
+    ///
+    /// One per-peer unicast per subscriber — no multicast primitive, no
+    /// group crypto. Per-peer concurrency is bounded by
+    /// `PublishConfig::max_inflight`. The failure policy controls whether
+    /// per-peer errors short-circuit the fan-out (see [`OnFailure`]).
+    pub async fn publish(
+        &self,
+        publisher: &ChannelPublisher,
+        payload: Bytes,
+    ) -> Result<PublishReport, AdapterError> {
+        self.publish_many(publisher, &[payload]).await
+    }
+
+    /// Fan multiple payloads out to every subscriber of the publisher's
+    /// channel. Semantics are the same as [`publish`](Self::publish); the
+    /// whole `events` slice is delivered as one batch per subscriber.
+    pub async fn publish_many(
+        &self,
+        publisher: &ChannelPublisher,
+        events: &[Bytes],
+    ) -> Result<PublishReport, AdapterError> {
+        // Snapshot subscribers at call time; late subscribers won't see
+        // this publish, early-unsubscribes may still receive it — both
+        // are documented non-goals.
+        let subscribers = self.roster.members(publisher.channel());
+        let mut report = PublishReport {
+            attempted: subscribers.len(),
+            delivered: 0,
+            errors: Vec::new(),
+        };
+        if subscribers.is_empty() {
+            return Ok(report);
+        }
+
+        let reliable = publisher.config().reliability.is_reliable();
+        let stream_id = Self::publish_stream_id(publisher.channel());
+        let max_inflight = publisher.config().max_inflight;
+        let on_failure = publisher.config().on_failure;
+
+        use tokio::sync::Semaphore;
+        let sem = Arc::new(Semaphore::new(max_inflight.max(1)));
+
+        match on_failure {
+            OnFailure::FailFast => {
+                // Sequential; stop on first error. Concurrency isn't
+                // meaningful here because we'd be discarding in-flight
+                // results anyway.
+                for peer_id in &subscribers {
+                    match self
+                        .publish_to_peer(*peer_id, stream_id, reliable, events)
+                        .await
+                    {
+                        Ok(()) => report.delivered += 1,
+                        Err(e) => {
+                            report.errors.push((*peer_id, e));
+                            return Ok(report);
+                        }
+                    }
+                }
+                Ok(report)
+            }
+            OnFailure::BestEffort | OnFailure::Collect => {
+                let mut handles = Vec::with_capacity(subscribers.len());
+                for peer_id in subscribers {
+                    let permit = Arc::clone(&sem);
+                    let events_owned: Vec<Bytes> = events.to_vec();
+                    let fut = async move {
+                        let _permit = permit.acquire_owned().await.ok();
+                        (
+                            peer_id,
+                            self.publish_to_peer(peer_id, stream_id, reliable, &events_owned)
+                                .await,
+                        )
+                    };
+                    handles.push(fut);
+                }
+                let results = futures::future::join_all(handles).await;
+                for (peer_id, res) in results {
+                    match res {
+                        Ok(()) => report.delivered += 1,
+                        Err(e) => report.errors.push((peer_id, e)),
+                    }
+                }
+                // BestEffort returns Ok as long as at least one subscriber
+                // got the payload — empty roster was handled above, so
+                // here there was at least one attempt.
+                if matches!(on_failure, OnFailure::BestEffort)
+                    && report.delivered == 0
+                    && !report.errors.is_empty()
+                {
+                    let first = report
+                        .errors
+                        .first()
+                        .map(|(id, e)| {
+                            format!(
+                                "all {} peers failed (first: {:#x}: {})",
+                                report.attempted, id, e
+                            )
+                        })
+                        .unwrap_or_else(|| "all peers failed".into());
+                    return Err(AdapterError::Connection(first));
+                }
+                Ok(report)
+            }
+        }
+    }
+
+    /// Encode the channel hash into a `u64` stream id so that per-channel
+    /// ordering holds within a session. Hash collisions between channels
+    /// are possible but harmless here — streams are opaque u64 to the
+    /// transport and have no ACL meaning.
+    fn publish_stream_id(channel: &ChannelId) -> u64 {
+        // Place channel hash in the low 16 bits; the upper bits stay zero
+        // so that channel-keyed publisher streams don't alias the common
+        // subprotocol range (0x0400..0x0A00).
+        0x0001_0000_0000_0000 | (channel.hash() as u64)
+    }
+
+    /// Send one per-peer leg of a publish. Reuses the same packet-build
+    /// path as `send_on_stream`, with an explicit stream opened per
+    /// `(peer, channel)` pair.
+    async fn publish_to_peer(
+        &self,
+        peer_node_id: u64,
+        stream_id: u64,
+        reliable: bool,
+        events: &[Bytes],
+    ) -> Result<(), AdapterError> {
+        let (dest_addr, session) = match self.peers.get(&peer_node_id) {
+            Some(p) => (p.value().addr, p.value().session.clone()),
+            None => {
+                return Err(AdapterError::Connection(format!(
+                    "publish: no session for subscriber {:#x}",
+                    peer_node_id
+                )));
+            }
+        };
+
+        if self.partition_filter.contains(&dest_addr) {
+            return Err(AdapterError::Connection(format!(
+                "publish: peer {:#x} is partitioned",
+                peer_node_id
+            )));
+        }
+
+        // Ensure a stream is open with the right reliability mode.
+        session.open_stream_with(stream_id, reliable, 1);
+
+        let seq = {
+            let stream = session.get_or_create_stream(stream_id);
+            stream.next_tx_seq()
+        };
+        let pool = session.thread_local_pool();
+        let mut builder = pool.get();
+        let packet = builder.build_subprotocol(
+            stream_id,
+            seq,
+            events,
+            PacketFlags::NONE,
+            0, /* subprotocol_id 0 = event-plane */
+        );
+
+        let next_hop = self
+            .router
+            .routing_table()
+            .lookup(peer_node_id)
+            .unwrap_or(dest_addr);
+
+        self.socket
+            .send_to(&packet, next_hop)
+            .await
+            .map_err(|e| AdapterError::Connection(format!("publish send failed: {}", e)))?;
 
         drop(builder);
         session.touch();

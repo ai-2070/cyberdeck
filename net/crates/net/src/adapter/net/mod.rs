@@ -61,8 +61,9 @@ mod linux;
 
 pub use batch::AdaptiveBatcher;
 pub use channel::{
-    AuthGuard, AuthVerdict, ChannelConfig, ChannelConfigRegistry, ChannelError, ChannelId,
-    ChannelName, ChannelRegistry, Visibility,
+    AckReason, AuthGuard, AuthVerdict, ChannelConfig, ChannelConfigRegistry, ChannelError,
+    ChannelId, ChannelName, ChannelPublisher, ChannelRegistry, MembershipMsg, OnFailure,
+    PublishConfig, PublishReport, SubscriberRoster, Visibility, SUBPROTOCOL_CHANNEL_MEMBERSHIP,
 };
 pub use compute::{
     DaemonError, DaemonFactoryRegistry, DaemonHost, DaemonHostConfig, DaemonRegistry, DaemonStats,

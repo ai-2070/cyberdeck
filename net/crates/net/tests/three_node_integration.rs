@@ -4282,3 +4282,216 @@ async fn test_regression_pingwave_not_dispatched_on_net_magic_packet() {
 
     node.shutdown().await.unwrap();
 }
+
+// ============================================================================
+// Channel fan-out (ChannelPublisher) — three-node tests
+// ============================================================================
+
+use net::adapter::net::{ChannelName, OnFailure, PublishConfig, Reliability};
+
+/// Helper: build three nodes connected in a star (A as publisher, B and C
+/// as subscribers). Returns the three nodes plus their node_ids.
+async fn setup_publisher_with_two_subscribers() -> (MeshNode, MeshNode, MeshNode, u64, u64, u64) {
+    let ports = find_ports(3).await;
+    let psk = [0x42u8; 32];
+
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let id_c = EntityKeypair::generate();
+
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let nid_c = id_c.node_id();
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let addr_c: SocketAddr = format!("127.0.0.1:{}", ports[2]).parse().unwrap();
+
+    let mk_config = |addr: SocketAddr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(2)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(10))
+    };
+
+    let node_a = MeshNode::new(id_a, mk_config(addr_a)).await.unwrap();
+    let node_b = MeshNode::new(id_b, mk_config(addr_b)).await.unwrap();
+    let node_c = MeshNode::new(id_c, mk_config(addr_c)).await.unwrap();
+
+    let pub_b = *node_b.public_key();
+    let pub_c = *node_c.public_key();
+
+    // B subscribes to A → B accepts A, A connects B
+    let (accept_result, connect_result) = tokio::join!(node_b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_b, &pub_b, nid_b).await
+    });
+    accept_result.expect("B accept A failed");
+    connect_result.expect("A connect B failed");
+
+    // Same for C
+    let (accept_result, connect_result) = tokio::join!(node_c.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node_a.connect(addr_c, &pub_c, nid_c).await
+    });
+    accept_result.expect("C accept A failed");
+    connect_result.expect("A connect C failed");
+
+    node_a.start();
+    node_b.start();
+    node_c.start();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    (node_a, node_b, node_c, nid_a, nid_b, nid_c)
+}
+
+/// `ChannelPublisher::publish` reaches every subscriber; the roster
+/// evicts peers that go `Failed` so the next publish skips them.
+#[tokio::test]
+async fn test_channel_publisher_fanout_reaches_all_subscribers() {
+    let (node_a, node_b, node_c, nid_a, _nid_b, _nid_c) =
+        setup_publisher_with_two_subscribers().await;
+
+    // B and C both subscribe to sensors/lidar on publisher A.
+    let channel = ChannelName::new("sensors/lidar").unwrap();
+    node_b
+        .subscribe_channel(nid_a, channel.clone())
+        .await
+        .expect("B subscribe failed");
+    node_c
+        .subscribe_channel(nid_a, channel.clone())
+        .await
+        .expect("C subscribe failed");
+
+    // Roster now has 2 subscribers.
+    let ch_id = net::adapter::net::ChannelId::new(channel.clone());
+    let members = node_a.roster().members(&ch_id);
+    assert_eq!(members.len(), 2, "A's roster should have 2 subscribers");
+
+    // Publish and verify the report.
+    let publisher = node_a.channel_publisher(
+        channel.clone(),
+        PublishConfig::new()
+            .with_reliability(Reliability::FireAndForget)
+            .with_on_failure(OnFailure::Collect),
+    );
+    let payload = bytes::Bytes::from_static(b"lidar-scan-0");
+    let report = node_a.publish(&publisher, payload).await.unwrap();
+
+    assert_eq!(
+        report.attempted, 2,
+        "should have attempted both subscribers"
+    );
+    assert_eq!(report.delivered, 2, "both per-peer sends should succeed");
+    assert!(report.errors.is_empty(), "no errors expected");
+
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+    node_c.shutdown().await.unwrap();
+}
+
+/// `Unsubscribe` removes the peer from the roster; the next publish
+/// does not target it.
+#[tokio::test]
+async fn test_channel_publisher_unsubscribe_evicts_from_roster() {
+    let (node_a, node_b, node_c, nid_a, nid_b, nid_c) =
+        setup_publisher_with_two_subscribers().await;
+
+    let channel = ChannelName::new("alerts").unwrap();
+    node_b
+        .subscribe_channel(nid_a, channel.clone())
+        .await
+        .unwrap();
+    node_c
+        .subscribe_channel(nid_a, channel.clone())
+        .await
+        .unwrap();
+
+    let ch_id = net::adapter::net::ChannelId::new(channel.clone());
+    assert_eq!(node_a.roster().members(&ch_id).len(), 2);
+
+    // B unsubscribes; A's roster should drop B.
+    node_b
+        .unsubscribe_channel(nid_a, channel.clone())
+        .await
+        .unwrap();
+
+    // Ack is processed asynchronously on A; poll briefly.
+    let mut members = Vec::new();
+    for _ in 0..20 {
+        members = node_a.roster().members(&ch_id);
+        if members.len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        members.len(),
+        1,
+        "after B unsubscribes, only C should remain"
+    );
+    assert_eq!(members[0], nid_c, "surviving subscriber should be C");
+
+    // Publish goes only to C.
+    let publisher = node_a.channel_publisher(
+        channel.clone(),
+        PublishConfig::new().with_on_failure(OnFailure::Collect),
+    );
+    let report = node_a
+        .publish(&publisher, bytes::Bytes::from_static(b"only-c"))
+        .await
+        .unwrap();
+    assert_eq!(report.attempted, 1);
+    assert_eq!(report.delivered, 1);
+
+    let _ = nid_a;
+    let _ = nid_b;
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+    node_c.shutdown().await.unwrap();
+}
+
+/// Empty roster → Ok with `attempted == 0`; not an error.
+#[tokio::test]
+async fn test_channel_publisher_empty_roster_is_ok() {
+    let (node_a, node_b, node_c, _nid_a, _nid_b, _nid_c) =
+        setup_publisher_with_two_subscribers().await;
+
+    let channel = ChannelName::new("nobody/listens").unwrap();
+    let publisher = node_a.channel_publisher(
+        channel,
+        PublishConfig::new().with_on_failure(OnFailure::Collect),
+    );
+    let report = node_a
+        .publish(&publisher, bytes::Bytes::from_static(b"x"))
+        .await
+        .unwrap();
+    assert_eq!(report.attempted, 0);
+    assert_eq!(report.delivered, 0);
+    assert!(report.errors.is_empty());
+    assert!(report.is_empty());
+
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+    node_c.shutdown().await.unwrap();
+}
+
+/// `MembershipAck` flows: an Unsubscribe for an unregistered subscriber
+/// is still accepted (idempotent), so the call returns Ok.
+#[tokio::test]
+async fn test_channel_publisher_unsubscribe_idempotent() {
+    let (node_a, node_b, node_c, nid_a, _nid_b, _nid_c) =
+        setup_publisher_with_two_subscribers().await;
+
+    let channel = ChannelName::new("ghosts").unwrap();
+    // B never subscribed; unsubscribe should still succeed.
+    node_b
+        .unsubscribe_channel(nid_a, channel.clone())
+        .await
+        .expect("unsubscribe must be idempotent");
+
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+    node_c.shutdown().await.unwrap();
+}

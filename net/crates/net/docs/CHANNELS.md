@@ -94,6 +94,50 @@ pub enum AuthVerdict {
 
 `authorize()` inserts into both the bloom filter and verified cache at subscription time. `revoke()` removes from the verified cache only -- bloom filters don't support deletion, but verified cache misses cause `NeedsFullCheck` which then fails full verification.
 
+## Fan-out publishers
+
+Channels carry policy and names; they do not carry membership. To publish the same payload to every subscriber of a channel, wrap a [`ChannelPublisher`](../../src/adapter/net/channel/publisher.rs) around the channel name and call `MeshNode::publish` — one per-peer unicast per subscriber, no multicast primitive, no group cryptography.
+
+### Subscriber roster
+
+`SubscriberRoster` in `channel/roster.rs` tracks, for every `ChannelId`, the set of peer `node_id`s that have subscribed. The roster is populated by the `SUBPROTOCOL_CHANNEL_MEMBERSHIP` subprotocol (`0x0A00`, carrying `Subscribe` / `Unsubscribe` / `Ack` messages) and reaped automatically when the failure detector marks a peer `Failed`.
+
+- `MeshNode::subscribe_channel(publisher_node_id, channel)` and `unsubscribe_channel(...)` send one `Subscribe` / `Unsubscribe` and block until the `Ack` (or the configured `membership_ack_timeout`).
+- Incoming `Subscribe` packets are authorized by `max_channels_per_peer` cap, then by the `ChannelConfigRegistry` (if one is set via `MeshNode::set_channel_configs`): unknown channel names are rejected with `AckReason::UnknownChannel`. Full capability / token checks are a follow-up.
+- `MeshNode::roster()` exposes the live roster for diagnostics.
+
+### `ChannelPublisher` API
+
+```rust
+let publisher = mesh.channel_publisher(
+    ChannelName::new("sensors/lidar").unwrap(),
+    PublishConfig::new()
+        .with_reliability(Reliability::FireAndForget)
+        .with_on_failure(OnFailure::Collect)
+        .with_max_inflight(32),
+);
+let report = mesh.publish(&publisher, payload).await?;
+```
+
+`PublishConfig.on_failure` controls what per-peer errors mean:
+
+| Policy | Behavior |
+|--------|----------|
+| `BestEffort` (default) | Log per-peer errors, return `Ok` if any subscriber received the payload. Returns `Err` only if every attempted peer failed. |
+| `FailFast` | Stop at the first per-peer error and return the partial `PublishReport`. |
+| `Collect` | Never short-circuit; always return a full `PublishReport` with every per-peer outcome. |
+
+Per-peer concurrency is bounded by `PublishConfig.max_inflight` (default 32) via a `Semaphore`. The default is fine for rosters up to a few hundred subscribers; larger fan-outs need tuning or a different primitive — this helper is explicitly **not** the right tool for millions-of-subscribers pub/sub.
+
+### Non-goals (non-negotiable)
+
+- **No multicast packet primitive.** One `publish` call = N independent unicasts, one per subscriber. There is no packet that "delivers to many peers in one socket op," no tree dissemination, no gossip.
+- **No group cryptography in transport.** Each unicast uses the existing per-peer Noise session. There is no group key, no shared session, no fan-out-specific AEAD.
+- **No new header bits.** Routing header and AEAD AAD are unchanged. Membership rides on `SUBPROTOCOL_CHANNEL_MEMBERSHIP`; the fan-out payload rides on normal per-peer streams.
+- **No implicit "everyone" broadcast.** Fan-out targets only explicit subscribers; "all connected peers" is not a supported publish mode.
+- **No history / catch-up.** A node that subscribes at time T never receives earlier publishes. Durable streams are a separate concern (EventBus / causal subprotocol).
+- **No atomic fan-out.** Partial delivery is by design; the `PublishReport` is the caller's ground truth.
+
 ## Source Files
 
 | File | Purpose |
@@ -101,3 +145,6 @@ pub enum AuthVerdict {
 | `channel/name.rs` | `ChannelName`, `ChannelId`, `ChannelRegistry`, validation |
 | `channel/config.rs` | `ChannelConfig`, `Visibility`, `ChannelConfigRegistry` |
 | `channel/guard.rs` | `AuthGuard`, bloom filter, `AuthVerdict` |
+| `channel/roster.rs` | `SubscriberRoster` — per-channel subscriber index |
+| `channel/membership.rs` | `MembershipMsg` + `SUBPROTOCOL_CHANNEL_MEMBERSHIP` codec |
+| `channel/publisher.rs` | `ChannelPublisher`, `PublishConfig`, `OnFailure`, `PublishReport` |
