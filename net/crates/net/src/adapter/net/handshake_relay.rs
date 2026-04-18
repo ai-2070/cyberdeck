@@ -168,11 +168,7 @@ impl HandshakeHandler {
         // envelope will cause the responder to build a different prologue
         // and fail `read_message` on msg1.
         let prologue = relay_prologue(self.local_node_id, dest_node_id);
-        let mut noise = NoiseHandshake::initiator_with_prologue(
-            &self.psk,
-            dest_pubkey,
-            &prologue,
-        )?;
+        let mut noise = NoiseHandshake::initiator_with_prologue(&self.psk, dest_pubkey, &prologue)?;
         let msg1 = noise.write_message(&[])?;
         let (tx, rx) = oneshot::channel();
         entry.insert(PendingInitiator { noise, tx });

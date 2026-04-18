@@ -2831,11 +2831,9 @@ async fn test_migration_full_lifecycle_over_wire() {
     // auto-restore the daemon when SnapshotReady arrives over the wire.
     let registry_c = Arc::new(DaemonRegistry::new());
     let factories_c = Arc::new(DaemonFactoryRegistry::new());
-    factories_c.register(
-        daemon_kp.clone(),
-        DaemonHostConfig::default(),
-        || Box::new(CounterDaemon::with_count(0)),
-    );
+    factories_c.register(daemon_kp.clone(), DaemonHostConfig::default(), || {
+        Box::new(CounterDaemon::with_count(0))
+    });
     let handler_c = Arc::new(MigrationSubprotocolHandler::new(
         Arc::new(MigrationOrchestrator::new(registry_c.clone(), nid_c)),
         Arc::new(MigrationSourceHandler::new(registry_c.clone())),

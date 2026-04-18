@@ -2520,17 +2520,20 @@ fn test_regression_factory_preserved_for_retry_after_restore_failure() {
     // Build a real daemon + real snapshot on the source.
     let (kp, origin) = register_counter_daemon(&source.reg, 7);
     for seq in 1..=3 {
-        source.reg.deliver(origin, &make_event(0xFFFF, seq)).unwrap();
+        source
+            .reg
+            .deliver(origin, &make_event(0xFFFF, seq))
+            .unwrap();
     }
     let snapshot = source.reg.snapshot(origin).unwrap().unwrap();
     let valid_bytes = snapshot.to_bytes();
 
     // Register the factory once on the target.
-    target.factories.register(
-        kp.clone(),
-        DaemonHostConfig::default(),
-        || Box::new(CounterDaemon::new()),
-    );
+    target
+        .factories
+        .register(kp.clone(), DaemonHostConfig::default(), || {
+            Box::new(CounterDaemon::new())
+        });
 
     // First attempt: corrupt bytes. Restore must fail, factory preserved.
     let corrupt = MigrationMessage::SnapshotReady {
@@ -2580,7 +2583,10 @@ fn test_regression_factory_preserved_for_retry_after_restore_failure() {
         )),
         "second attempt must emit RestoreComplete"
     );
-    assert!(target.reg.contains(origin), "daemon must be restored on target");
+    assert!(
+        target.reg.contains(origin),
+        "daemon must be restored on target"
+    );
     // After a successful restore the factory IS consumed — callers must
     // re-register to migrate the same origin again.
     assert!(!target.factories.contains(origin));

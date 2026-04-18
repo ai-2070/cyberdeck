@@ -65,12 +65,8 @@ impl DaemonFactoryRegistry {
     /// caller does not supply it separately. Taking `origin_hash` as an
     /// argument used to invite a class of bugs where the caller passed a
     /// stale or unrelated value — now impossible by construction.
-    pub fn register<F>(
-        &self,
-        keypair: EntityKeypair,
-        config: DaemonHostConfig,
-        factory: F,
-    ) where
+    pub fn register<F>(&self, keypair: EntityKeypair, config: DaemonHostConfig, factory: F)
+    where
         F: Fn() -> Box<dyn MeshDaemon> + Send + Sync + 'static,
     {
         let origin_hash = keypair.origin_hash();
