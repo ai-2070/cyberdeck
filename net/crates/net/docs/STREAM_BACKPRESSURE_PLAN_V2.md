@@ -149,7 +149,7 @@ the receiver emits a `StreamWindow { credit_bytes: window_bytes }`
 and bumps `granted`.
 
 Concretely: after each `poll_shard` / scheduler dequeue, check
-whether `granted - consumed < window_bytes / 2`. If so, emit a
+whether `granted - consumed <= (window_bytes / 2).max(1)`. If so, emit a
 grant. Amortizes control traffic — for a 64 KB window, roughly one
 grant per 32 KB consumed, not per-packet.
 
