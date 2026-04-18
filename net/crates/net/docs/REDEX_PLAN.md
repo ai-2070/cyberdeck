@@ -266,7 +266,7 @@ pub trait RedexFold<State> {
 }
 ```
 
-RedEX defines the trait; RedEX itself does not install a fold. CortEX (in a separate `CORTEX_ADAPTER_PLAN.md`) owns:
+RedEX defines the trait; RedEX itself does not install a fold. CortEX (see [`CORTEX_ADAPTER_PLAN.md`](CORTEX_ADAPTER_PLAN.md)) owns:
 
 - Opening a `RedexFile` tail.
 - Supplying an `impl RedexFold<CortexState>`.
@@ -328,7 +328,7 @@ Scope intentionally held out of v1, tracked in separate plan docs:
 - **v2 local scope** — [`REDEX_V2_PLAN.md`](REDEX_V2_PLAN.md). Hot→warm tiering (mmap), time-based retention, cold-tier archive interface, typed file wrappers, `append_and_fold`, local indices, NetDB watch APIs, single-threaded `OrderedAppender` helper. All still single-node; no replication.
 - **Deterministic scheduler** — [`REDEX_SCHEDULER_PLAN.md`](REDEX_SCHEDULER_PLAN.md). Parked until there's a DST harness or a replica protocol that would consume determinism.
 - **Replication (distributed RedEX)** — not planned yet. Needs real single-node usage, a clear DST story, and concrete requirements from pilots before we design it. Will be its own plan when the time comes, riding `ChannelPublisher` / `SubscriberRoster` / the causal-chain machinery.
-- **CortEX adapter** — `EventMeta` projection, fold installation, NetDB query surface. Lives in `CORTEX_ADAPTER_PLAN.md` (to be written); RedEX v1's responsibility is just to expose a `RedexFold` trait and a `tail` shape the adapter can drive.
+- **CortEX adapter** — `EventMeta` projection, fold installation, NetDB query surface. See [`CORTEX_ADAPTER_PLAN.md`](CORTEX_ADAPTER_PLAN.md); RedEX v1's responsibility is just to expose a `RedexFold` trait and a `tail` shape the adapter can drive.
 
 ## Summary
 
