@@ -1,0 +1,53 @@
+net/crates/net/src/adapter/net/cortex/tasks/mod.rs
+  f3669361474f4cb8 38,48
+net/crates/net/tests/integration_cortex_tasks.rs
+  f3669361474f4cb8 10,177-246
+net/crates/net/src/adapter/net/cortex/tasks/query.rs
+  f3669361474f4cb8 1-473
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "ca96b944f4ef6d8a755be43851ac265619b6bbf2",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 70,
+      "overriden_lines": 0
+    },
+    "a9d311afc8324224": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8e12ea48-52c3-40e2-9655-6d0ab0878bb6",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": null,
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 506,
+      "overriden_lines": 0
+    },
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1078,
+      "total_deletions": 1,
+      "accepted_lines": 1542,
+      "overriden_lines": 0
+    }
+  }
+}
