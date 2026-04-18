@@ -80,6 +80,7 @@ For the design philosophy, architecture rationale, and benchmarks, see the [proj
 | **Subprotocols** | Formal protocol registry, version negotiation, capability-aware routing via tags, opaque forwarding guarantee, migration message dispatch | [SUBPROTOCOLS.md](docs/SUBPROTOCOLS.md) |
 | **Observational Continuity** | Causal cones, propagation modeling, continuity proofs, honest discontinuity with deterministic forking, superposition during migration | [CONTINUITY.md](docs/CONTINUITY.md) |
 | **Contested Environments** | Correlated failure detection, subnet-aware partition classification, partition healing with log reconciliation | [CONTESTED.md](docs/CONTESTED.md) |
+| **RedEX (local log)** | 20-byte append-only event records, inline + heap payload hybrid, `ChannelName`-bound files, atomic backfill-then-live tail, count + size retention, optional disk durability via `redex-disk` (torn-write truncation on reopen) | [REDEX_PLAN.md](docs/REDEX_PLAN.md) |
 
 ## Architecture
 
@@ -177,7 +178,7 @@ Benchmarks accurate as of April 15, 2026.
 
 Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns.
 
-985 tests. ~840 KB deployed binary.
+1,042 tests. ~840 KB deployed binary.
 
 ## Capabilities
 
@@ -402,10 +403,23 @@ src/adapter/net/
 │   ├── propagation.rs     #   PropagationModel, subnet-distance latency
 │   └── superposition.rs   #   SuperpositionState, migration phase tracking
 │
-└── contested/             # Layer 8 (Partial) — Contested Environments
-    ├── correlation.rs     #   CorrelatedFailureDetector, subnet correlation
-    ├── partition.rs       #   PartitionDetector, PartitionPhase, healing
-    └── reconcile.rs       #   Log reconciliation, longest-chain-wins, ForkRecord
+├── contested/             # Layer 8 (Partial) — Contested Environments
+│   ├── correlation.rs     #   CorrelatedFailureDetector, subnet correlation
+│   ├── partition.rs       #   PartitionDetector, PartitionPhase, healing
+│   └── reconcile.rs       #   Log reconciliation, longest-chain-wins, ForkRecord
+│
+└── redex/                 # RedEX v1 — local append-only event log (feature `redex`)
+    ├── mod.rs             #   Re-exports: Redex, RedexFile, RedexEvent, RedexError, ...
+    ├── entry.rs           #   20-byte RedexEntry codec, RedexFlags, payload_checksum
+    ├── config.rs          #   RedexFileConfig (persistent, retention, sync_interval)
+    ├── event.rs           #   RedexEvent { entry, payload }
+    ├── error.rs           #   RedexError (thiserror-derived)
+    ├── segment.rs         #   HeapSegment (append-only Vec<u8>, evict_prefix_to)
+    ├── retention.rs       #   compute_eviction_count (count + size policy)
+    ├── fold.rs            #   RedexFold<State> trait (CortEX / NetDB integration hook)
+    ├── file.rs            #   RedexFile (append / tail / read_range / close)
+    ├── manager.rs         #   Redex manager (open_file / get_file / with_persistent_dir)
+    └── disk.rs            #   DiskSegment (feature `redex-disk`): idx + dat append-only files, torn-write recovery
 ```
 
 ## Adapters
@@ -569,6 +583,8 @@ net_shutdown(node);
 | Net transport | `net` | `chacha20poly1305`, `snow`, `blake2`, `dashmap`, `socket2`, `ed25519-dalek` |
 | Regex filters | `regex` | `regex` crate |
 | C FFI | `ffi` | -- |
+| RedEX (local append-only log) | `redex` | `net`, `tokio-stream`, `bincode` |
+| RedEX disk durability | `redex-disk` | `redex` |
 
 Default feature is `redis`.
 
@@ -588,17 +604,20 @@ cargo build --release --all-features
 ## Tests
 
 ```bash
-# Unit tests (849 tests)
-cargo test --lib --features net
+# Unit tests (892 tests with net+redex+redex-disk)
+cargo test --lib --features "net redex redex-disk"
 
 # Migration & group integration tests (53 tests)
 cargo test --test migration_integration --features net
 
-# Three-node mesh integration tests (64 tests)
+# Three-node mesh integration tests (65 tests)
 cargo test --test three_node_integration --features net
 
 # Two-node transport integration (13 tests)
 cargo test --test integration_net --features net
+
+# RedEX integration tests (14 tests: 8 heap + 6 persistent)
+cargo test --test integration_redex --features "redex redex-disk"
 
 # Rust SDK smoke tests (2 async + 3 doctests)
 cargo test --features net -p net-sdk
@@ -608,7 +627,7 @@ cargo test --test integration_redis --features redis
 cargo test --test integration_jetstream --features jetstream
 ```
 
-**984 tests total across the stack** — lib + migration + three_node + integration_net + SDK.
+**1,042 tests total across the stack** — lib + migration + three_node + integration_net + integration_redex + SDK.
 
 ### Test Architecture
 

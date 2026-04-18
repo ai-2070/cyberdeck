@@ -358,7 +358,7 @@ For implementation details — capabilities, proximity graphs, subnets, channels
 
 ## Status
 
-Net is a working protocol, not a paper design. 985 tests verify the implementation across every layer of the stack.
+Net is a working protocol, not a paper design. 1,042 tests verify the implementation across every layer of the stack.
 
 **What works today:**
 
@@ -378,6 +378,8 @@ Net is a working protocol, not a paper design. 985 tests verify the implementati
 - **Correlated failure detection.** Independent vs mass failure classification based on configurable thresholds. Recovery budget throttled during mass failure.
 - **EventBus full stack.** Events flow through the entire pipeline: EventBus → sharded ring buffers → drain workers → batch workers → NetAdapter → encrypted UDP → poll.
 - **SDK parity for the Mesh + Stream + Backpressure API.** Rust, TypeScript, and Python SDKs wrap the core `MeshNode` with typed `Stream`/`StreamConfig`, `BackpressureError` / `NotConnectedError` classes for `instanceof` / `isinstance` matching, and `send_with_retry` / `send_blocking` helpers with the same backoff semantics as the Rust core. Python `send_blocking` releases the GIL for the duration of the retry loop. u64 stream stats fields (`lastActivityNs`, sequence numbers, etc.) cross the napi boundary as `BigInt` to avoid precision loss on the JS side.
+- **RedEX v1 — local append-only event log.** A `Redex` manager binds `RedexFile` handles to `ChannelName`s (hierarchical, ACL-enforced via the existing `AuthGuard`). Every event occupies exactly 20 bytes of index space; payloads live inline (fixed 8 bytes, zero segment allocation for tick-counter / sensor workloads) or in an append-only heap segment. API: `append`, `append_batch`, `append_inline`, `append_bincode`, `tail(from_seq)` (async stream, atomic backfill-then-live with gapless handoff), `read_range`. Monotonic `AtomicU64::fetch_add` sequence allocator. Count-based + size-based retention as a background sweep. `RedexFold<State>` trait is the integration hook for CortEX / NetDB folds — RedEX defines it; adapters install against it. Feature-gated behind `redex`; v1 is strictly local (no replication, no subprotocol, no multi-node convergence).
+- **Disk-backed durability for RedEX (feature `redex-disk`).** Opt-in via `RedexFileConfig::persistent` + `Redex::with_persistent_dir(...)`. Each file writes two append-only files at `<base>/<channel_path>/{idx,dat}` — 20-byte records in `idx`, raw payloads in `dat`. On reopen, the full `dat` replays into the heap segment and `idx` restores the index. Torn-write tail from a crash (partial 20-byte record) is truncated on recovery. `close()` fsyncs; unsynced writes live in OS page cache — exactly matches the documented "recover minus unsynced tail" semantics.
 
 **What needs protocol work:**
 
