@@ -44,6 +44,8 @@ mod mesh;
 mod pool;
 mod protocol;
 mod proxy;
+#[cfg(feature = "redex")]
+pub mod redex;
 mod reliability;
 mod reroute;
 mod route;
@@ -98,6 +100,10 @@ pub use protocol::{
 };
 pub use proxy::{
     ForwardResult, HopStats, MultiHopPacketBuilder, NetProxy, ProxyConfig, ProxyError, ProxyStats,
+};
+#[cfg(feature = "redex")]
+pub use redex::{
+    Redex, RedexEntry, RedexError, RedexEvent, RedexFile, RedexFileConfig, RedexFlags, RedexFold,
 };
 pub use reliability::{FireAndForget, ReliabilityMode, ReliableStream};
 pub use reroute::ReroutePolicy;

@@ -1,0 +1,565 @@
+//! `RedexFile` — the append / tail / read_range primitive.
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+
+use bytes::Bytes;
+use futures::Stream;
+use parking_lot::Mutex;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
+
+use super::super::channel::ChannelName;
+use super::config::RedexFileConfig;
+use super::entry::{payload_checksum, RedexEntry, INLINE_PAYLOAD_SIZE};
+use super::error::RedexError;
+use super::event::RedexEvent;
+use super::retention::compute_eviction_count;
+use super::segment::HeapSegment;
+
+/// A live tail subscription waiting for new events.
+struct TailWatcher {
+    /// Minimum seq to deliver (inclusive).
+    from_seq: u64,
+    /// Channel back to the subscriber.
+    sender: mpsc::UnboundedSender<Result<RedexEvent, RedexError>>,
+}
+
+/// Mutable state: index, segment, and live watchers. All held behind a
+/// single lock so the backfill→register handoff is atomic.
+struct FileState {
+    index: Vec<RedexEntry>,
+    segment: HeapSegment,
+    watchers: Vec<TailWatcher>,
+}
+
+/// Shared inner state. Handles are cheap `Arc` clones of this.
+struct RedexFileInner {
+    name: ChannelName,
+    config: RedexFileConfig,
+    next_seq: AtomicU64,
+    state: Mutex<FileState>,
+    closed: AtomicBool,
+}
+
+/// A handle to a RedEX file. Cheap to clone.
+///
+/// Created via [`super::Redex::open_file`].
+#[derive(Clone)]
+pub struct RedexFile {
+    inner: Arc<RedexFileInner>,
+}
+
+impl RedexFile {
+    /// Create a fresh, empty file. Called by `Redex::open_file`.
+    pub(super) fn new(name: ChannelName, config: RedexFileConfig) -> Self {
+        let capacity = config.max_memory_bytes.min(64 * 1024 * 1024);
+        Self {
+            inner: Arc::new(RedexFileInner {
+                name,
+                config,
+                next_seq: AtomicU64::new(0),
+                state: Mutex::new(FileState {
+                    index: Vec::new(),
+                    segment: HeapSegment::with_capacity(capacity),
+                    watchers: Vec::new(),
+                }),
+                closed: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    /// The channel name this file is bound to.
+    #[inline]
+    pub fn name(&self) -> &ChannelName {
+        &self.inner.name
+    }
+
+    /// The config this file was opened with.
+    #[inline]
+    pub fn config(&self) -> &RedexFileConfig {
+        &self.inner.config
+    }
+
+    /// Number of currently retained entries.
+    pub fn len(&self) -> usize {
+        self.inner.state.lock().index.len()
+    }
+
+    /// True if no entries are retained.
+    pub fn is_empty(&self) -> bool {
+        self.inner.state.lock().index.is_empty()
+    }
+
+    /// Next sequence to be assigned (== total append count since open,
+    /// including any evicted head).
+    pub fn next_seq(&self) -> u64 {
+        self.inner.next_seq.load(Ordering::Acquire)
+    }
+
+    /// Append one event. Returns the assigned sequence.
+    pub fn append(&self, payload: &[u8]) -> Result<u64, RedexError> {
+        self.check_not_closed()?;
+        let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
+        let cks = payload_checksum(payload);
+
+        let mut state = self.inner.state.lock();
+        let offset = state.segment.append(payload)?;
+        let entry =
+            RedexEntry::new_heap(seq, truncate_u32(offset), payload.len() as u32, 0, cks);
+        state.index.push(entry);
+
+        let event = RedexEvent {
+            entry,
+            payload: Bytes::copy_from_slice(payload),
+        };
+        notify_watchers(&mut state.watchers, &event);
+
+        Ok(seq)
+    }
+
+    /// Append a fixed-length 8-byte inline payload. Skips the segment
+    /// indirection. Returns the assigned sequence.
+    pub fn append_inline(
+        &self,
+        payload: &[u8; INLINE_PAYLOAD_SIZE],
+    ) -> Result<u64, RedexError> {
+        self.check_not_closed()?;
+        let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
+        let cks = payload_checksum(payload);
+        let entry = RedexEntry::new_inline(seq, payload, cks);
+
+        let mut state = self.inner.state.lock();
+        state.index.push(entry);
+
+        let event = RedexEvent {
+            entry,
+            payload: Bytes::copy_from_slice(payload),
+        };
+        notify_watchers(&mut state.watchers, &event);
+
+        Ok(seq)
+    }
+
+    /// Append many payloads. Returns the sequence of the FIRST event
+    /// in the batch. All entries land contiguously in the index.
+    pub fn append_batch(&self, payloads: &[Bytes]) -> Result<u64, RedexError> {
+        self.check_not_closed()?;
+        if payloads.is_empty() {
+            return Ok(self.inner.next_seq.load(Ordering::Acquire));
+        }
+
+        let first_seq = self
+            .inner
+            .next_seq
+            .fetch_add(payloads.len() as u64, Ordering::AcqRel);
+
+        let mut state = self.inner.state.lock();
+        let mut events: Vec<RedexEvent> = Vec::with_capacity(payloads.len());
+        for (i, payload) in payloads.iter().enumerate() {
+            let seq = first_seq + i as u64;
+            let cks = payload_checksum(payload);
+            let offset = state.segment.append(payload)?;
+            let entry = RedexEntry::new_heap(
+                seq,
+                truncate_u32(offset),
+                payload.len() as u32,
+                0,
+                cks,
+            );
+            state.index.push(entry);
+            events.push(RedexEvent {
+                entry,
+                payload: payload.clone(),
+            });
+        }
+        for event in &events {
+            notify_watchers(&mut state.watchers, event);
+        }
+        Ok(first_seq)
+    }
+
+    /// Convenience: serialize `value` with bincode and append.
+    pub fn append_bincode<T: serde::Serialize>(&self, value: &T) -> Result<u64, RedexError> {
+        let bytes = bincode::serialize(value).map_err(|e| RedexError::Encode(e.to_string()))?;
+        self.append(&bytes)
+    }
+
+    /// Subscribe to all events with `seq >= from_seq`, including those
+    /// already in the index at call time.
+    ///
+    /// Backfill and live registration happen atomically under the
+    /// state lock: no event can interleave between backfill delivery
+    /// and live subscription.
+    pub fn tail(
+        &self,
+        from_seq: u64,
+    ) -> impl Stream<Item = Result<RedexEvent, RedexError>> + Send + 'static {
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        // If closed, emit a single error and return.
+        if self.inner.closed.load(Ordering::Acquire) {
+            let _ = tx.send(Err(RedexError::Closed));
+            return UnboundedReceiverStream::new(rx);
+        }
+
+        let mut state = self.inner.state.lock();
+
+        // Backfill.
+        for entry in state.index.iter() {
+            if entry.seq < from_seq {
+                continue;
+            }
+            let event = match materialize(entry, &state.segment) {
+                Some(e) => e,
+                None => continue, // payload evicted between index retain and read
+            };
+            if tx.send(Ok(event)).is_err() {
+                // Receiver dropped before stream was even used.
+                return UnboundedReceiverStream::new(rx);
+            }
+        }
+
+        // Register for live events.
+        state.watchers.push(TailWatcher { from_seq, sender: tx });
+        drop(state);
+
+        UnboundedReceiverStream::new(rx)
+    }
+
+    /// One-shot read of the half-open range `[start, end)` from the
+    /// in-memory index. Returns only entries currently retained;
+    /// silently skips any seqs that have been evicted.
+    pub fn read_range(&self, start: u64, end: u64) -> Vec<RedexEvent> {
+        if end <= start {
+            return Vec::new();
+        }
+        let state = self.inner.state.lock();
+        let mut out = Vec::new();
+        for entry in state.index.iter() {
+            if entry.seq < start {
+                continue;
+            }
+            if entry.seq >= end {
+                break;
+            }
+            if let Some(ev) = materialize(entry, &state.segment) {
+                out.push(ev);
+            }
+        }
+        out
+    }
+
+    /// Run the retention policy synchronously. Exposed so a background
+    /// task (heartbeat loop) can drive it; no hot-path cost.
+    pub fn sweep_retention(&self) {
+        let cfg = self.inner.config;
+        if cfg.retention_max_events.is_none() && cfg.retention_max_bytes.is_none() {
+            return;
+        }
+        let mut state = self.inner.state.lock();
+        let drop = compute_eviction_count(&state.index, &cfg);
+        if drop == 0 {
+            return;
+        }
+
+        // Determine the new segment base: first offset of the entry
+        // that survives. Inline entries don't consume segment bytes,
+        // so skip past them when finding the boundary.
+        let mut new_base: Option<u64> = None;
+        for e in state.index.iter().skip(drop) {
+            if !e.is_inline() {
+                new_base = Some(e.payload_offset as u64);
+                break;
+            }
+        }
+
+        // Drop the head of the index.
+        state.index.drain(..drop);
+
+        // Evict the payload prefix up to new_base (or everything if
+        // surviving entries are all inline).
+        if let Some(base) = new_base {
+            state.segment.evict_prefix_to(base);
+        } else {
+            // All surviving entries are inline; reclaim the whole
+            // payload segment.
+            let cur = state.segment.base_offset() + state.segment.live_bytes() as u64;
+            state.segment.evict_prefix_to(cur);
+        }
+    }
+
+    /// Close the file. Outstanding tail streams receive `RedexError::Closed`.
+    pub fn close(&self) -> Result<(), RedexError> {
+        if self.inner.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let mut state = self.inner.state.lock();
+        for w in state.watchers.drain(..) {
+            let _ = w.sender.send(Err(RedexError::Closed));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn check_not_closed(&self) -> Result<(), RedexError> {
+        if self.inner.closed.load(Ordering::Acquire) {
+            Err(RedexError::Closed)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl std::fmt::Debug for RedexFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedexFile")
+            .field("name", &self.inner.name)
+            .field("len", &self.len())
+            .field("next_seq", &self.next_seq())
+            .finish()
+    }
+}
+
+// -- helpers ---------------------------------------------------------------
+
+fn materialize(entry: &RedexEntry, segment: &HeapSegment) -> Option<RedexEvent> {
+    let payload = if entry.is_inline() {
+        Bytes::copy_from_slice(&entry.inline_payload()?)
+    } else {
+        segment.read(entry.payload_offset as u64, entry.payload_len)?
+    };
+    Some(RedexEvent {
+        entry: *entry,
+        payload,
+    })
+}
+
+fn notify_watchers(watchers: &mut Vec<TailWatcher>, event: &RedexEvent) {
+    // Walk watchers; drop those whose receiver is gone.
+    watchers.retain(|w| {
+        if event.entry.seq < w.from_seq {
+            return true; // keep, but don't deliver
+        }
+        w.sender.send(Ok(event.clone())).is_ok()
+    });
+}
+
+#[inline]
+fn truncate_u32(offset: u64) -> u32 {
+    debug_assert!(offset <= u32::MAX as u64, "segment offset overflowed u32");
+    offset as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::channel::ChannelName;
+    use super::*;
+    use futures::StreamExt;
+
+    fn make_file(name: &str) -> RedexFile {
+        RedexFile::new(ChannelName::new(name).unwrap(), RedexFileConfig::default())
+    }
+
+    #[test]
+    fn test_append_assigns_monotonic_seq() {
+        let f = make_file("t1");
+        assert_eq!(f.append(b"a").unwrap(), 0);
+        assert_eq!(f.append(b"b").unwrap(), 1);
+        assert_eq!(f.append(b"c").unwrap(), 2);
+        assert_eq!(f.next_seq(), 3);
+    }
+
+    #[test]
+    fn test_read_range_returns_events_in_order() {
+        let f = make_file("t2");
+        for i in 0..10u64 {
+            f.append(format!("e{}", i).as_bytes()).unwrap();
+        }
+        let events = f.read_range(2, 5);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].entry.seq, 2);
+        assert_eq!(events[0].payload.as_ref(), b"e2");
+        assert_eq!(events[2].entry.seq, 4);
+    }
+
+    #[test]
+    fn test_read_range_empty_when_end_le_start() {
+        let f = make_file("t2e");
+        f.append(b"x").unwrap();
+        assert!(f.read_range(5, 5).is_empty());
+        assert!(f.read_range(10, 3).is_empty());
+    }
+
+    #[test]
+    fn test_append_batch_sequential() {
+        let f = make_file("t3");
+        let start = f
+            .append_batch(&[Bytes::from_static(b"one"), Bytes::from_static(b"two")])
+            .unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(f.next_seq(), 2);
+        let events = f.read_range(0, 2);
+        assert_eq!(events[0].payload.as_ref(), b"one");
+        assert_eq!(events[1].payload.as_ref(), b"two");
+    }
+
+    #[test]
+    fn test_append_inline_roundtrip() {
+        let f = make_file("t4");
+        let bytes = *b"abcdefgh";
+        let seq = f.append_inline(&bytes).unwrap();
+        assert_eq!(seq, 0);
+        let events = f.read_range(0, 1);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].entry.is_inline());
+        assert_eq!(events[0].payload.as_ref(), &bytes);
+    }
+
+    #[test]
+    fn test_append_bincode_roundtrip() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Foo {
+            a: u32,
+            b: String,
+        }
+        let f = make_file("t5");
+        let v = Foo {
+            a: 42,
+            b: "hi".into(),
+        };
+        let seq = f.append_bincode(&v).unwrap();
+        assert_eq!(seq, 0);
+        let events = f.read_range(0, 1);
+        let decoded: Foo = bincode::deserialize(&events[0].payload).unwrap();
+        assert_eq!(decoded, v);
+    }
+
+    #[tokio::test]
+    async fn test_tail_backfills_then_lives() {
+        let f = make_file("t6");
+        for i in 0..5u64 {
+            f.append(format!("e{}", i).as_bytes()).unwrap();
+        }
+
+        let mut stream = Box::pin(f.tail(0));
+
+        // First 5 events are backfill.
+        for i in 0..5u64 {
+            let ev = stream.next().await.unwrap().unwrap();
+            assert_eq!(ev.entry.seq, i);
+            assert_eq!(ev.payload.as_ref(), format!("e{}", i).as_bytes());
+        }
+
+        // New appends should be delivered live.
+        f.append(b"live").unwrap();
+        let ev = stream.next().await.unwrap().unwrap();
+        assert_eq!(ev.entry.seq, 5);
+        assert_eq!(ev.payload.as_ref(), b"live");
+    }
+
+    #[tokio::test]
+    async fn test_tail_boundary_no_dupes_no_drops() {
+        // Regression: backfill → register handoff must be gapless.
+        // We append N events, open a tail, and in parallel the test
+        // drives more appends. Every event must arrive exactly once.
+        let f = make_file("t7");
+        for i in 0..100u64 {
+            f.append(format!("e{}", i).as_bytes()).unwrap();
+        }
+
+        let mut stream = Box::pin(f.tail(0));
+
+        // Append 50 more after tail registration.
+        let f2 = f.clone();
+        let handle = tokio::spawn(async move {
+            for i in 100..150u64 {
+                f2.append(format!("e{}", i).as_bytes()).unwrap();
+            }
+        });
+
+        let mut seen = Vec::new();
+        for _ in 0..150 {
+            let ev = stream.next().await.unwrap().unwrap();
+            seen.push(ev.entry.seq);
+        }
+        handle.await.unwrap();
+
+        assert_eq!(seen.len(), 150);
+        for (i, &seq) in seen.iter().enumerate() {
+            assert_eq!(seq, i as u64, "event {} arrived out of order or missing", i);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tail_from_mid_sequence() {
+        let f = make_file("t8");
+        for i in 0..10u64 {
+            f.append(format!("e{}", i).as_bytes()).unwrap();
+        }
+        let mut stream = Box::pin(f.tail(7));
+        for i in 7..10u64 {
+            let ev = stream.next().await.unwrap().unwrap();
+            assert_eq!(ev.entry.seq, i);
+        }
+    }
+
+    #[test]
+    fn test_retention_count() {
+        let f = RedexFile::new(
+            ChannelName::new("t9").unwrap(),
+            RedexFileConfig::default().with_retention_max_events(3),
+        );
+        for i in 0..10u64 {
+            f.append(format!("e{}", i).as_bytes()).unwrap();
+        }
+        f.sweep_retention();
+        assert_eq!(f.len(), 3);
+        // Surviving events are the newest 3.
+        let events = f.read_range(0, 100);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].entry.seq, 7);
+        assert_eq!(events[2].entry.seq, 9);
+    }
+
+    #[test]
+    fn test_retention_respects_payload_slicing() {
+        let f = RedexFile::new(
+            ChannelName::new("t10").unwrap(),
+            RedexFileConfig::default().with_retention_max_events(2),
+        );
+        f.append(b"first").unwrap();
+        f.append(b"second").unwrap();
+        f.append(b"third").unwrap();
+        f.sweep_retention();
+        let events = f.read_range(0, 100);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].payload.as_ref(), b"second");
+        assert_eq!(events[1].payload.as_ref(), b"third");
+    }
+
+    #[test]
+    fn test_close_rejects_further_append() {
+        let f = make_file("t11");
+        f.append(b"a").unwrap();
+        f.close().unwrap();
+        assert!(matches!(f.append(b"b"), Err(RedexError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn test_close_signals_outstanding_tails() {
+        let f = make_file("t12");
+        f.append(b"a").unwrap();
+        let mut stream = Box::pin(f.tail(0));
+
+        // First event is backfill.
+        let ev = stream.next().await.unwrap().unwrap();
+        assert_eq!(ev.entry.seq, 0);
+
+        f.close().unwrap();
+
+        // Next yield is the Closed error.
+        let err = stream.next().await.unwrap().unwrap_err();
+        assert!(matches!(err, RedexError::Closed));
+    }
+}
