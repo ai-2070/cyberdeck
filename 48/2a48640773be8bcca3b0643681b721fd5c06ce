@@ -1,0 +1,73 @@
+net/crates/net/bindings/python/src/cortex.rs
+  f3669361474f4cb8 27-46,220,253,269,276,283,290,297,314,595,627,642,656,662,668,674,680,694,1013,1078,1086,1092
+net/crates/net/bindings/node/package.json
+  f3669361474f4cb8 7-16,45-46
+net/crates/net/bindings/python/python/net/__init__.py
+  f3669361474f4cb8 48-53,60-61
+net/crates/net/bindings/node/errors.js
+  f3669361474f4cb8 1-60
+net/crates/net/bindings/python/python/net/_net.pyi
+  f3669361474f4cb8 434-443
+net/crates/net/bindings/python/src/lib.rs
+  f3669361474f4cb8 1312-1313
+README.md
+  f3669361474f4cb8 361
+net/crates/net/bindings/node/errors.d.ts
+  f3669361474f4cb8 1-30
+net/crates/net/README.md
+  f3669361474f4cb8 673,676,680,687
+net/crates/net/bindings/python/tests/test_cortex.py
+  f3669361474f4cb8 13,84,352,356-371
+net/crates/net/bindings/python/tests/test_netdb.py
+  f3669361474f4cb8 5,168-171,173-190
+net/crates/net/bindings/node/src/cortex.rs
+  f3669361474f4cb8 35-54,312,337,350,363,372,381,390,405,665,689,702,722,732,741,750,759,773,961,971,989,995,999-1000,1002-1004,1015,1019-1020,1022-1024,1056,1064,1071,1083,1088
+net/crates/net/bindings/node/test/errors.test.ts
+  f3669361474f4cb8 1-95
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "482a48640773be8bcca3b0643681b721fd5c06ce",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 44,
+      "overriden_lines": 0
+    },
+    "a9d311afc8324224": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8e12ea48-52c3-40e2-9655-6d0ab0878bb6",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": null,
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 506,
+      "overriden_lines": 0
+    },
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2974,
+      "total_deletions": 945,
+      "accepted_lines": 1270,
+      "overriden_lines": 0
+    }
+  }
+}
