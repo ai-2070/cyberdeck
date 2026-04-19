@@ -180,8 +180,8 @@ pub struct StreamStats {
     /// credit. Monotonically increasing; reset only by close + reopen.
     pub backpressure_events: u64,
     /// Bytes of send credit still available. `0` means the next send
+    /// For bounded streams (`tx_window > 0`), `0` means the next send
     /// of any size will be rejected as Backpressure; near `tx_window`
-    /// means plenty of headroom. Receiver-driven `StreamWindow` grants
     /// replenish this counter.
     pub tx_credit_remaining: u32,
     /// Configured initial credit window in bytes. Informational —
