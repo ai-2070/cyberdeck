@@ -355,12 +355,24 @@ impl RedexFile {
         Ok(first_seq)
     }
 
-    /// Like [`Self::append`] but holds the state lock across seq
-    /// allocation. Guarantees that the index records entries in
-    /// strict seq order, even under concurrent writers that use the
-    /// ordered path. The non-ordered `append` path allocates seq via
-    /// a lock-free `fetch_add` before taking the lock — fast but can
-    /// produce out-of-seq-order index insertions under contention.
+    /// Strictly-ordered variant of [`Self::append`].
+    ///
+    /// Both [`Self::append`] and this method now take the state lock
+    /// before allocating a sequence number (the failure-atomicity
+    /// fix required moving `fetch_add` inside the lock so rollback
+    /// on disk-write failure is safe). That means `append` already
+    /// produces in-seq-order index insertions under contention, and
+    /// the two paths are functionally equivalent for single writes.
+    ///
+    /// The real distinction is at the wrapper level: this method
+    /// pairs with [`Self::append_batch_ordered`], which holds ONE
+    /// lock across an entire batch, whereas [`Self::append_batch`]
+    /// also holds one lock per batch today. In v1 the non-ordered
+    /// and ordered paths are nearly identical. The distinction is
+    /// kept so that a future optimization of [`Self::append`] (e.g.
+    /// moving the seq allocation back outside the lock with a
+    /// different rollback scheme) doesn't affect callers who need
+    /// guaranteed-ordered appends.
     ///
     /// Used by [`super::OrderedAppender`] for replay determinism.
     /// Same failure-atomicity contract as [`Self::append`].

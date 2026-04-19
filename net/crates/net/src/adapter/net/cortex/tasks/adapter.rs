@@ -14,7 +14,7 @@ use super::super::adapter::CortexAdapter;
 use super::super::config::CortexAdapterConfig;
 use super::super::envelope::EventEnvelope;
 use super::super::error::CortexAdapterError;
-use super::super::meta::{compute_checksum, EventMeta};
+use super::super::meta::{compute_checksum, EventMeta, EVENT_META_SIZE};
 use super::dispatch::{
     DISPATCH_TASK_COMPLETED, DISPATCH_TASK_CREATED, DISPATCH_TASK_DELETED, DISPATCH_TASK_RENAMED,
     TASKS_CHANNEL,
@@ -228,13 +228,35 @@ impl TasksAdapter {
             &payload.inner,
             last_seq,
         )?;
+
+        // Restore the app_seq counter so post-restore events continue
+        // per-origin monotonic sequencing. If the file has events for
+        // this origin with seq > last_seq (periodic-snapshot-while-
+        // ingesting pattern), the fold task will replay them, but
+        // THEIR seq_or_ts values have already been assigned — we
+        // must bump the counter past the highest one of our origin
+        // to avoid duplicates on the next ingest.
+        let mut app_seq = payload.app_seq;
+        let replay_start = last_seq.map(|s| s + 1).unwrap_or(0);
+        let file = redex.open_file(&name, redex_config)?;
+        let replay_end = file.next_seq();
+        if replay_start < replay_end {
+            for ev in file.read_range(replay_start, replay_end) {
+                if ev.payload.len() < EVENT_META_SIZE {
+                    continue;
+                }
+                if let Some(meta) = EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE]) {
+                    if meta.origin_hash == origin_hash && meta.seq_or_ts >= app_seq {
+                        app_seq = meta.seq_or_ts + 1;
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             inner,
             origin_hash,
-            // Restore the app_seq counter so post-restore events
-            // continue per-origin monotonic sequencing rather than
-            // restarting from 0 and duplicating seq_or_ts values.
-            app_seq: AtomicU64::new(payload.app_seq),
+            app_seq: AtomicU64::new(app_seq),
         })
     }
 

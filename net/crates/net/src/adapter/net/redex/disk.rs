@@ -87,22 +87,44 @@ impl DiskSegment {
 
         // Torn-dat tail: our write ordering is dat-before-idx, so a
         // crash between the two writes leaves dat shorter than the
-        // last idx entry thinks it should be. Walk the index backward
-        // and drop any trailing heap entry whose `(offset + len)` runs
-        // past the actual dat size. Inline entries don't touch dat so
-        // they never trigger recovery.
+        // last idx entry thinks it should be. Separately, external
+        // truncation (disk corruption, filesystem bug, admin action)
+        // can shrink dat past ANY heap entry, not just the tail.
+        //
+        // Walk the index backward, skipping inline entries (their
+        // payload rides inside the 20-byte idx record and doesn't
+        // reference dat). Track the earliest heap entry whose
+        // `(offset + len)` runs past the actual dat size — because
+        // dat is append-only, heap offsets are monotonic, so if an
+        // entry at position `i` is torn then every heap entry at
+        // positions `>= i` is either torn or a later append that
+        // never got its dat write. Drop everything from that point
+        // onward.
         let dat_len = payload_bytes.len() as u64;
-        let mut idx_trimmed = false;
-        while let Some(last) = index.last() {
-            if last.is_inline() {
+        let mut truncate_at: Option<usize> = None;
+        for (i, e) in index.iter().enumerate().rev() {
+            if e.is_inline() {
+                // Inline entries are always valid regardless of dat
+                // state. Keep walking back to check earlier heap
+                // entries.
+                continue;
+            }
+            let end = (e.payload_offset as u64).saturating_add(e.payload_len as u64);
+            if end > dat_len {
+                // Torn. Everything from here to the end of the index
+                // must go. Record this position and keep walking —
+                // an even earlier heap entry might also be torn
+                // (external truncation scenarios).
+                truncate_at = Some(i);
+            } else {
+                // First heap entry that fits. By dat's append-only
+                // monotonicity, every earlier heap entry also fits.
                 break;
             }
-            let end = (last.payload_offset as u64).saturating_add(last.payload_len as u64);
-            if end <= dat_len {
-                break;
-            }
-            index.pop();
-            idx_trimmed = true;
+        }
+        let idx_trimmed = truncate_at.is_some();
+        if let Some(cut) = truncate_at {
+            index.truncate(cut);
         }
         if idx_trimmed {
             let file = OpenOptions::new()

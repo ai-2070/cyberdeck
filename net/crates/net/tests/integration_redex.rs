@@ -796,6 +796,68 @@ mod persistent {
 
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    #[tokio::test]
+    async fn test_regression_torn_dat_skips_inline_tail_entries() {
+        // Regression: torn-dat recovery used to `break` the moment it
+        // saw an inline entry at the tail of the index. That meant
+        // a torn heap entry EARLIER in the index (e.g. external dat
+        // truncation after several later inline writes) survived
+        // recovery and silently referenced bytes past dat.
+        //
+        // Fix: skip inline entries while walking backward, continue
+        // checking earlier heap entries, and stop only when a heap
+        // entry that fits dat is found.
+        //
+        // Setup: write Heap1 + Inline2 cleanly, then externally
+        // truncate dat to a size BELOW Heap1's offset+len. Reopen
+        // must detect the torn Heap1 and drop both it and Inline2.
+        let base = tmpdir("torn_dat_inline");
+        let name = cn("durable/torn_inline");
+        let cfg = RedexFileConfig::default().with_persistent(true);
+
+        {
+            let r = Redex::new().with_persistent_dir(&base);
+            let f = r.open_file(&name, cfg).unwrap();
+            f.append(b"heap-payload-16b").unwrap(); // 16-byte heap
+            f.append_inline(b"inline08").unwrap(); // 8-byte inline
+            r.close_file(&name).unwrap();
+        }
+
+        // Externally truncate dat to 8 bytes (half of Heap1). The idx
+        // file is untouched, so Heap1 (still in idx) now references
+        // bytes 0..16 but dat only has bytes 0..8 — that's torn. The
+        // trailing Inline2 in idx would mask this from the pre-fix
+        // walk.
+        let dat_path = base.join("durable/torn_inline/dat");
+        let idx_path = base.join("durable/torn_inline/idx");
+        let dat = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&dat_path)
+            .unwrap();
+        dat.set_len(8).unwrap();
+        drop(dat);
+
+        // Reopen.
+        let r2 = Redex::new().with_persistent_dir(&base);
+        let f2 = r2.open_file(&name, cfg).unwrap();
+        // Both Heap1 (torn) and Inline2 (after the torn entry) must
+        // have been dropped. The recovered file is empty.
+        assert_eq!(
+            f2.len(),
+            0,
+            "torn heap entry AND trailing inline must both be dropped"
+        );
+
+        // idx file must also be truncated on disk.
+        assert_eq!(
+            std::fs::metadata(&idx_path).unwrap().len(),
+            0,
+            "idx must reflect the drop on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
 
 #[tokio::test]

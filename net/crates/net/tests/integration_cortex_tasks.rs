@@ -506,6 +506,71 @@ async fn test_regression_fold_rejects_checksum_mismatch() {
 }
 
 #[tokio::test]
+async fn test_regression_open_from_snapshot_bumps_app_seq_past_replayed_events() {
+    // Regression: `open_from_snapshot` restored `app_seq` from the
+    // snapshot payload without accounting for events ingested AFTER
+    // the snapshot was taken but before the adapter closed. Those
+    // events have already-assigned `seq_or_ts` values that will be
+    // replayed by the fold task on restore — if `app_seq` is just
+    // set to `payload.app_seq`, the next ingest re-emits a
+    // `seq_or_ts` that a replayed event already used.
+    //
+    // The fix scans the replay range `(last_seq, next_seq)` for
+    // events from our origin and bumps `app_seq` past the highest
+    // matching `seq_or_ts` before installing it.
+    //
+    // Setup: ingest 2 events, snapshot, ingest 2 more events to
+    // the SAME file (simulating periodic-snapshot while work
+    // continues), then restore from the snapshot on the same
+    // Redex. The restored adapter must see `seq_or_ts = 4` (not 2)
+    // on its first new ingest.
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+
+    // Events 0, 1 — pre-snapshot.
+    tasks.create(1, "a", 100).unwrap();
+    let seq1 = tasks.create(2, "b", 200).unwrap();
+    tasks.wait_for_seq(seq1).await;
+    let (state_bytes, last_seq) = tasks.snapshot().unwrap();
+    assert_eq!(last_seq, Some(1), "snapshot must capture seqs 0..=1");
+
+    // Events 2, 3 — post-snapshot (still folding on the live adapter).
+    tasks.create(3, "c", 300).unwrap();
+    let seq3 = tasks.create(4, "d", 400).unwrap();
+    tasks.wait_for_seq(seq3).await;
+    tasks.close().unwrap();
+
+    // Restore on the SAME Redex so the file already contains seqs
+    // 2, 3 in the replay range.
+    let restored =
+        TasksAdapter::open_from_snapshot(&redex, ORIGIN, &state_bytes, last_seq).unwrap();
+
+    // The restored adapter should fold in the replay range (seqs
+    // 2, 3) and then accept a new ingest. The new ingest's
+    // `seq_or_ts` must be 4 (continuing past the replayed events)
+    // NOT 2 (which would collide with the replayed event at seq 2).
+    let new_seq = restored.create(5, "e", 500).unwrap();
+    restored.wait_for_seq(new_seq).await;
+
+    // Read the event we just ingested from the file and decode its
+    // EventMeta to inspect `seq_or_ts`.
+    let file = redex
+        .open_file(
+            &ChannelName::new(TASKS_CHANNEL).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+    let events = file.read_range(new_seq, new_seq + 1);
+    assert_eq!(events.len(), 1);
+    let meta = EventMeta::from_bytes(&events[0].payload[..EVENT_META_SIZE]).unwrap();
+    assert_eq!(
+        meta.seq_or_ts, 4,
+        "post-restore ingest must continue past replayed events' seq_or_ts (got {}, expected 4)",
+        meta.seq_or_ts
+    );
+}
+
+#[tokio::test]
 async fn test_regression_snapshot_restore_preserves_app_seq_monotonicity() {
     // Regression: `TasksAdapter::open_from_snapshot[_with_config]`
     // used to recreate the adapter with `app_seq: AtomicU64::new(0)`,
