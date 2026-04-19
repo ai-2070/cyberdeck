@@ -254,11 +254,11 @@ impl<'a> MemoriesQuery<'a> {
 fn sort_memories(memories: &mut [Memory], order: OrderBy) {
     match order {
         OrderBy::IdAsc => memories.sort_by_key(|m| m.id),
-        OrderBy::IdDesc => memories.sort_by(|a, b| b.id.cmp(&a.id)),
+        OrderBy::IdDesc => memories.sort_by_key(|m| std::cmp::Reverse(m.id)),
         OrderBy::CreatedAsc => memories.sort_by_key(|m| m.created_ns),
-        OrderBy::CreatedDesc => memories.sort_by(|a, b| b.created_ns.cmp(&a.created_ns)),
+        OrderBy::CreatedDesc => memories.sort_by_key(|m| std::cmp::Reverse(m.created_ns)),
         OrderBy::UpdatedAsc => memories.sort_by_key(|m| m.updated_ns),
-        OrderBy::UpdatedDesc => memories.sort_by(|a, b| b.updated_ns.cmp(&a.updated_ns)),
+        OrderBy::UpdatedDesc => memories.sort_by_key(|m| std::cmp::Reverse(m.updated_ns)),
     }
 }
 

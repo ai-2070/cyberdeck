@@ -220,11 +220,11 @@ impl<'a> TasksQuery<'a> {
 pub(super) fn sort_tasks(tasks: &mut [Task], order: OrderBy) {
     match order {
         OrderBy::IdAsc => tasks.sort_by_key(|t| t.id),
-        OrderBy::IdDesc => tasks.sort_by(|a, b| b.id.cmp(&a.id)),
+        OrderBy::IdDesc => tasks.sort_by_key(|t| std::cmp::Reverse(t.id)),
         OrderBy::CreatedAsc => tasks.sort_by_key(|t| t.created_ns),
-        OrderBy::CreatedDesc => tasks.sort_by(|a, b| b.created_ns.cmp(&a.created_ns)),
+        OrderBy::CreatedDesc => tasks.sort_by_key(|t| std::cmp::Reverse(t.created_ns)),
         OrderBy::UpdatedAsc => tasks.sort_by_key(|t| t.updated_ns),
-        OrderBy::UpdatedDesc => tasks.sort_by(|a, b| b.updated_ns.cmp(&a.updated_ns)),
+        OrderBy::UpdatedDesc => tasks.sort_by_key(|t| std::cmp::Reverse(t.updated_ns)),
     }
 }
 
