@@ -41,7 +41,6 @@ logs/
 Thumbs.db
 desktop.ini
 
-package-lock.json
 node_modules/
 *.node
 *.pyc
