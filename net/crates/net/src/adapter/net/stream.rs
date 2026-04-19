@@ -56,20 +56,18 @@ pub enum CloseBehavior {
     DropAndClose,
 }
 
-/// Per-stream configuration supplied at `open_stream` time.
-///
-/// Configuration is immutable for the lifetime of a stream. Re-opening
-/// the same `(peer, stream_id)` with different config is a no-op with a
-/// warning log — the original config wins.
 /// Default initial credit window for newly-opened streams, in bytes.
 ///
-/// 64 KB matches a typical BDP under LAN conditions and amortizes one
-/// `StreamWindow` grant per ~32 KB consumed at the default 50%
-/// threshold. Callers who want the v1-style "unbounded" escape hatch
-/// can explicitly set `with_window_bytes(0)`.
+/// 64 KB is a reasonable starting point for LAN / typical mesh
+/// deployments. Callers who want the v1-style "unbounded" escape
+/// hatch can explicitly set `with_window_bytes(0)`.
 pub const DEFAULT_STREAM_WINDOW_BYTES: u32 = 65_536;
 
 /// Per-stream configuration supplied at `open_stream` time.
+///
+/// Configuration is immutable for the lifetime of a stream. Re-opening
+/// the same `(peer, stream_id)` with different config is a no-op with
+/// a warning log — the original config wins.
 #[derive(Debug, Clone, Copy)]
 pub struct StreamConfig {
     /// Reliability mode. Defaults to `FireAndForget`.
@@ -179,10 +177,11 @@ pub struct StreamStats {
     /// `StreamError::Backpressure` because the stream ran out of
     /// credit. Monotonically increasing; reset only by close + reopen.
     pub backpressure_events: u64,
-    /// Bytes of send credit still available. `0` means the next send
-    /// For bounded streams (`tx_window > 0`), `0` means the next send
-    /// of any size will be rejected as Backpressure; near `tx_window`
-    /// replenish this counter.
+    /// Bytes of send credit still available. For bounded streams
+    /// (`tx_window > 0`), `0` means the next send of any size will
+    /// be rejected as Backpressure; near `tx_window` means plenty of
+    /// headroom. Receiver-driven `StreamWindow` grants replenish
+    /// this counter.
     pub tx_credit_remaining: u32,
     /// Configured initial credit window in bytes. Informational —
     /// `0` disables backpressure entirely on this stream.

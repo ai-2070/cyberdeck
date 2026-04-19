@@ -57,7 +57,7 @@ use super::protocol::{self, EventFrame, PacketFlags, MAGIC};
 use super::reroute::ReroutePolicy;
 use super::route::{RoutingHeader, ROUTING_HEADER_SIZE};
 use super::router::{NetRouter, RouterConfig};
-use super::session::{NetSession, TxAdmit};
+use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subprotocol::stream_window::{StreamWindow, SUBPROTOCOL_STREAM_WINDOW};
 use super::subprotocol::MigrationSubprotocolHandler;
@@ -1259,7 +1259,7 @@ impl MeshNode {
                                 "dropping StreamWindow grant for recently-closed stream"
                             );
                         } else if let Some(state) = session.try_stream(grant.stream_id) {
-                            state.apply_credit_grant(grant.credit_bytes);
+                            state.apply_authoritative_grant(grant.total_consumed);
                         }
                     }
                     Err(e) => {
@@ -1324,7 +1324,7 @@ impl MeshNode {
             }
         };
 
-        if let Some(credit_bytes) = grant_bytes {
+        if let Some(total_consumed) = grant_bytes {
             // Find the peer this session belongs to so we know where
             // to route the grant back. Matches the membership-dispatch
             // pattern that resolves `from_node` the same way.
@@ -1340,7 +1340,7 @@ impl MeshNode {
                     peer_session,
                     peer_addr,
                     stream_id,
-                    credit_bytes,
+                    total_consumed,
                 );
             }
         }
@@ -1356,16 +1356,24 @@ impl MeshNode {
     }
 
     /// Emit a `StreamWindow` credit grant back to `peer_addr` on the
-    /// existing encrypted session. Fire-and-forget — a dropped grant
-    /// just means the sender waits a little longer for the next one
-    /// (grants are cumulative: the receiver's next threshold crossing
-    /// emits a fresh grant covering the same outstanding credit).
+    /// existing encrypted session. Fire-and-forget — grants are
+    /// **authoritative**, so a lost grant is reconciled by the next
+    /// one that successfully arrives (each carries the receiver's
+    /// full `total_consumed` picture).
+    ///
+    /// The grant packet rides on the sentinel [`CONTROL_STREAM_ID`]
+    /// (`u64::MAX`) with a sequence drawn from
+    /// `NetSession::next_control_tx_seq`. This is a dedicated
+    /// session-level counter that cannot collide with user stream
+    /// state — a caller who opens a stream numerically equal to
+    /// `SUBPROTOCOL_STREAM_WINDOW` (0x0B00) won't see their
+    /// sequence space polluted by control traffic.
     fn spawn_stream_window_grant(
         ctx: &DispatchCtx,
         session: Arc<NetSession>,
         peer_addr: SocketAddr,
         stream_id: u64,
-        credit_bytes: u32,
+        total_consumed: u64,
     ) {
         if ctx.partition_filter.contains(&peer_addr) {
             return;
@@ -1374,22 +1382,15 @@ impl MeshNode {
         tokio::spawn(async move {
             let payload = StreamWindow {
                 stream_id,
-                credit_bytes,
+                total_consumed,
             }
             .encode();
             let pool = session.thread_local_pool();
             let mut builder = pool.get();
-            // Grant rides a separate subprotocol stream — using
-            // SUBPROTOCOL_STREAM_WINDOW as the stream id mirrors the
-            // pattern used for channel-membership and migration.
-            let grant_stream_id = SUBPROTOCOL_STREAM_WINDOW as u64;
-            let seq = {
-                let grant_stream = session.get_or_create_stream(grant_stream_id);
-                grant_stream.next_tx_seq()
-            };
+            let seq = session.next_control_tx_seq();
             let events = vec![Bytes::copy_from_slice(&payload)];
             let packet = builder.build_subprotocol(
-                grant_stream_id,
+                CONTROL_STREAM_ID,
                 seq,
                 &events,
                 PacketFlags::NONE,

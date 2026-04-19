@@ -30,7 +30,7 @@ use super::stream::DEFAULT_STREAM_WINDOW_BYTES;
 /// will see a brief stall (the reopened stream won't receive
 /// grants until the quarantine expires) — an acceptable trade-off
 /// for correct credit accounting across lifetimes.
-const GRANT_QUARANTINE_WINDOW: Duration = Duration::from_secs(2);
+pub const GRANT_QUARANTINE_WINDOW: Duration = Duration::from_secs(2);
 
 /// Session state after handshake completion.
 pub struct NetSession {
@@ -66,7 +66,24 @@ pub struct NetSession {
     /// subsequent reopen. Entries are inserted on `close_stream` and
     /// lazily garbage-collected by `is_grant_quarantined` on read.
     recently_closed: DashMap<u64, Instant>,
+    /// Monotonic sequence counter for subprotocol control packets
+    /// (grants, membership acks, etc.) that don't belong to a
+    /// user-opened stream. Using a separate counter keeps control
+    /// traffic out of the `streams` map, so a caller who opens a
+    /// stream with a numerically-equal id (e.g., `0x0B00`, the
+    /// `SUBPROTOCOL_STREAM_WINDOW` constant) can't have their
+    /// sequence space polluted by control packets.
+    control_tx_seq: AtomicU64,
 }
+
+/// Sentinel `stream_id` used in the header of subprotocol control
+/// packets (credit grants, etc.). Chosen at the top of the u64
+/// range so it cannot collide with practical user-chosen ids or
+/// with the output of `stream_id_from_key`. The receiver dispatches
+/// these packets by `subprotocol_id`, not `stream_id`, so the
+/// sentinel is purely there to keep sender-side per-stream state
+/// clean.
+pub const CONTROL_STREAM_ID: u64 = u64::MAX;
 
 impl NetSession {
     /// Create a new session from handshake results
@@ -96,7 +113,16 @@ impl NetSession {
             active: AtomicBool::new(true),
             stream_epoch_counter: AtomicU64::new(1),
             recently_closed: DashMap::new(),
+            control_tx_seq: AtomicU64::new(0),
         }
+    }
+
+    /// Allocate the next sequence number for a subprotocol control
+    /// packet. Uses a session-level counter separate from any
+    /// user stream's sequence space — see `CONTROL_STREAM_ID`.
+    #[inline]
+    pub fn next_control_tx_seq(&self) -> u64 {
+        self.control_tx_seq.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Allocate a unique epoch for a freshly-opened stream.
@@ -424,7 +450,7 @@ impl NetSession {
     /// any `StreamWindow` grant still in flight from a peer who was
     /// communicating with the just-closed lifetime is dropped rather
     /// than spuriously crediting a later reopen — see
-    /// [`GRANT_QUARANTINE_WINDOW`] and [`Self::is_grant_quarantined`].
+    /// `GRANT_QUARANTINE_WINDOW` and [`Self::is_grant_quarantined`].
     pub fn close_stream(&self, stream_id: u64) {
         if let Some((_, state)) = self.streams.remove(&stream_id) {
             state.deactivate();
@@ -434,7 +460,7 @@ impl NetSession {
 
     /// Whether a `StreamWindow` grant for `stream_id` should be
     /// dropped because the stream was closed within
-    /// [`GRANT_QUARANTINE_WINDOW`]. Lazily garbage-collects expired
+    /// `GRANT_QUARANTINE_WINDOW`. Lazily garbage-collects expired
     /// entries on call.
     pub fn is_grant_quarantined(&self, stream_id: u64) -> bool {
         let elapsed = match self.recently_closed.get(&stream_id) {
@@ -611,11 +637,24 @@ pub struct StreamState {
     tx_window: u32,
     /// Bytes of send credit the sender may still use on this stream
     /// before `send_on_stream` returns `StreamError::Backpressure`.
-    /// Decremented on each socket send (atomic CAS), incremented on
-    /// each receiver `StreamWindow` grant (saturating fetch_add). When
-    /// `tx_window == 0`, admission short-circuits and this counter is
-    /// not consulted.
+    /// Decremented on each socket send (atomic CAS). Recomputed
+    /// authoritatively from `tx_bytes_sent - max_consumed_seen` on
+    /// every inbound `StreamWindow` grant. When `tx_window == 0`,
+    /// admission short-circuits and this counter is not consulted.
     tx_credit_remaining: AtomicU32,
+    /// Cumulative bytes this sender has committed to the wire on
+    /// this stream, across all lifetime credit acquisitions. Bumped
+    /// when `try_acquire_tx_credit` admits; rolled back when a
+    /// guard drops without commit (refund). The grant handler
+    /// reconciles `tx_credit_remaining` against this and
+    /// `max_consumed_seen`, so lost grants self-heal on the next
+    /// grant arrival.
+    tx_bytes_sent: AtomicU64,
+    /// Highest `total_consumed` observed from the receiver on this
+    /// stream. Monotonic — out-of-order / duplicate grants are
+    /// ignored. Updated under CAS to protect the monotonicity
+    /// invariant against concurrent grant-dispatch tasks.
+    max_consumed_seen: AtomicU64,
     /// Number of `send_on_stream` calls that returned
     /// `StreamError::Backpressure` since this stream opened.
     backpressure_events: AtomicU64,
@@ -707,29 +746,27 @@ impl RxCreditState {
         self.window_bytes
     }
 
-    /// Record `bytes` consumed off the wire and mint a matching
-    /// grant. Returns the grant size so the caller can emit a
-    /// `StreamWindow` packet back to the sender. Returns `None` when
-    /// receive-side bookkeeping is disabled (`window_bytes == 0`).
+    /// Record `bytes` consumed off the wire and return the receiver's
+    /// new cumulative consumed-byte count, which the caller ships as
+    /// the `total_consumed` field of an authoritative `StreamWindow`
+    /// grant. Returns `None` when receive-side bookkeeping is
+    /// disabled (`window_bytes == 0`).
     ///
-    /// Rationale for 1:1 credit flow: amortizing grants via a
-    /// threshold (the v2 plan's original design) only works when
-    /// sender and receiver agree on `window_bytes`. An auto-created
-    /// receive-side stream inherits a default window that may be
-    /// much larger than a small explicitly-configured sender — the
-    /// sender would stall below the receiver's threshold forever.
-    /// 1:1 matches whatever cadence the sender actually pushes, at
-    /// the cost of one grant packet per inbound packet. On LANs and
-    /// typical mesh deployments that overhead is negligible. A
-    /// future enhancement can batch grants once traffic volume
-    /// justifies it, without changing the wire format.
-    pub fn on_bytes_consumed(&self, bytes: u64) -> Option<u32> {
+    /// Authoritative grants are self-healing: each grant carries the
+    /// receiver's full picture, so a single lost grant is reconciled
+    /// by the next one. That's what keeps the sender's credit from
+    /// permanently draining when data packets OR grants are dropped
+    /// on the wire. One grant per inbound packet is the simplest
+    /// cadence; on lossy links the receiver may emit more frequently,
+    /// and a future enhancement can batch grants without changing
+    /// the wire format.
+    pub fn on_bytes_consumed(&self, bytes: u64) -> Option<u64> {
         if self.window_bytes == 0 {
             return None;
         }
-        self.consumed.fetch_add(bytes, Ordering::AcqRel);
+        let new_consumed = self.consumed.fetch_add(bytes, Ordering::AcqRel) + bytes;
         self.granted.fetch_add(bytes, Ordering::AcqRel);
-        u32::try_from(bytes).ok()
+        Some(new_consumed)
     }
 }
 
@@ -793,8 +830,10 @@ impl StreamState {
             tx_window,
             // Implicit initial window: the sender starts with full
             // credit so the first send doesn't eat a handshake round
-            // trip. Matches v2 plan §6.
+            // trip.
             tx_credit_remaining: AtomicU32::new(tx_window),
+            tx_bytes_sent: AtomicU64::new(0),
+            max_consumed_seen: AtomicU64::new(0),
             backpressure_events: AtomicU64::new(0),
             credit_grants_received: AtomicU64::new(0),
             credit_grants_sent: AtomicU64::new(0),
@@ -877,9 +916,12 @@ impl StreamState {
 
     /// Try to acquire `bytes` of send credit via a CAS loop.
     ///
-    /// Returns `true` on success (credit decremented); `false` when
-    /// remaining credit is below `bytes` — caller returns
-    /// `StreamError::Backpressure` and the rejection counter bumps.
+    /// Returns `true` on success — `tx_credit_remaining` is
+    /// decremented and `tx_bytes_sent` is bumped so the
+    /// authoritative-grant reconciliation sees a consistent view.
+    /// Returns `false` when remaining credit is below `bytes`;
+    /// caller returns `StreamError::Backpressure` and the rejection
+    /// counter bumps.
     ///
     /// `tx_window == 0` disables the check; all requests admit and
     /// the counter is not touched.
@@ -898,6 +940,12 @@ impl StreamState {
                 .compare_exchange_weak(cur, cur - bytes, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                // Bump the committed-bytes counter only after the
+                // CAS wins, so a concurrent grant reconciling against
+                // `tx_bytes_sent` doesn't see inflated in-flight
+                // bytes.
+                self.tx_bytes_sent
+                    .fetch_add(bytes as u64, Ordering::Relaxed);
                 return true;
             }
             // CAS lost — retry with the fresh value.
@@ -906,11 +954,13 @@ impl StreamState {
 
     /// Refund `bytes` of send credit. Called by `TxSlotGuard::drop`
     /// when a previously acquired slot never made it to the wire
-    /// (socket send cancelled, early return, etc.). Saturating `u32`
-    /// addition — a pathological caller cannot wrap the counter. No
-    /// clamp at `tx_window`: grants may have pushed the counter past
-    /// the initial window, and refunding those bytes back to a
-    /// `tx_window` ceiling would strand legitimately-granted credit.
+    /// (socket send cancelled, early return, etc.). Rolls back both
+    /// `tx_credit_remaining` and the `tx_bytes_sent` bump recorded at
+    /// admission — the bytes never left the sender, so neither
+    /// counter should reflect them. No clamp at `tx_window`: grants
+    /// may have pushed the counter past the initial window, and
+    /// refunding those bytes back to a `tx_window` ceiling would
+    /// strand legitimately-granted credit.
     pub fn refund_tx_credit(&self, bytes: u32) {
         if self.tx_window == 0 {
             return;
@@ -920,30 +970,82 @@ impl StreamState {
                 Some(v.saturating_add(bytes))
             })
             .ok();
-    }
-
-    /// Apply a receiver grant of `bytes`. Saturating add — pathological
-    /// billions-of-grants sequences cannot wrap the counter. Bumps the
-    /// `credit_grants_received` counter.
-    pub fn apply_credit_grant(&self, bytes: u32) {
-        self.credit_grants_received.fetch_add(1, Ordering::Relaxed);
-        if self.tx_window == 0 || bytes == 0 {
-            return;
-        }
-        self.tx_credit_remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                Some(v.saturating_add(bytes))
+        self.tx_bytes_sent
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(bytes as u64))
             })
             .ok();
     }
 
-    /// Record that the receiver side has accepted `bytes` off the wire
-    /// on this stream. If the outstanding credit
-    /// (`granted - consumed`) dips to or below `window_bytes / 2`,
-    /// returns `Some(grant_bytes)` — the caller is responsible for
-    /// emitting a `StreamWindow` packet with that credit and bumping
-    /// `credit_grants_sent`. Returns `None` otherwise.
-    pub fn on_bytes_consumed(&self, bytes: u64) -> Option<u32> {
+    /// Apply a receiver grant reporting the receiver's **absolute**
+    /// cumulative consumed-byte count on this stream. Authoritatively
+    /// recomputes `tx_credit_remaining` as
+    /// `tx_window - (tx_bytes_sent - total_consumed)`. Monotonic —
+    /// grants arriving with `total_consumed` below the already-observed
+    /// maximum are treated as stale duplicates and only bump the
+    /// `credit_grants_received` counter. Self-healing: a single lost
+    /// grant is reconciled by the next one because each grant carries
+    /// the receiver's full accounting.
+    pub fn apply_authoritative_grant(&self, total_consumed: u64) {
+        self.credit_grants_received.fetch_add(1, Ordering::Relaxed);
+        if self.tx_window == 0 {
+            return;
+        }
+        // Monotonic update under CAS — protects the invariant
+        // against concurrent grant-dispatch tasks.
+        let mut prev = self.max_consumed_seen.load(Ordering::Acquire);
+        loop {
+            if total_consumed <= prev {
+                return; // stale / duplicate grant — ignore
+            }
+            match self.max_consumed_seen.compare_exchange_weak(
+                prev,
+                total_consumed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => prev = current,
+            }
+        }
+        // Reconcile `tx_credit_remaining`. With the new monotonic
+        // `max_consumed_seen`, recompute the fresh outstanding and
+        // set credit to `window - outstanding`. Clamp at 0 and
+        // `tx_window` — `outstanding >= window` (possible under a
+        // transient race where the grant reflects fewer committed
+        // bytes than the sender has racked up) means "everything so
+        // far is outstanding," so credit is 0 until the next grant.
+        let sent = self.tx_bytes_sent.load(Ordering::Relaxed);
+        let outstanding = sent.saturating_sub(total_consumed);
+        let new_remaining = if outstanding >= self.tx_window as u64 {
+            0
+        } else {
+            self.tx_window - outstanding as u32
+        };
+        self.tx_credit_remaining
+            .store(new_remaining, Ordering::Release);
+    }
+
+    /// Cumulative bytes committed to the wire on this stream.
+    /// Admission bumps it; uncommitted-guard drops roll it back.
+    #[inline]
+    pub fn tx_bytes_sent(&self) -> u64 {
+        self.tx_bytes_sent.load(Ordering::Relaxed)
+    }
+
+    /// Highest `total_consumed` this sender has observed from the
+    /// receiver on this stream. Monotonic.
+    #[inline]
+    pub fn max_consumed_seen(&self) -> u64 {
+        self.max_consumed_seen.load(Ordering::Acquire)
+    }
+
+    /// Record that the receiver side has accepted `bytes` off the
+    /// wire on this stream. Returns `Some(total_consumed)` — the
+    /// receiver's new cumulative consumed count — so the caller can
+    /// emit an authoritative `StreamWindow` grant. Returns `None`
+    /// when receive-side bookkeeping is disabled (`window_bytes == 0`).
+    pub fn on_bytes_consumed(&self, bytes: u64) -> Option<u64> {
         self.rx_credit.on_bytes_consumed(bytes)
     }
 
@@ -1375,42 +1477,98 @@ mod tests {
     #[test]
     fn test_stream_state_refund_saturates_at_u32_max() {
         // Refund uses saturating u32 addition with no clamp at
-        // `tx_window`: grants may have legitimately pushed credit
-        // above the initial window, and refunding a cancelled send
-        // must not strand those bytes. A pathological caller still
-        // can't wrap the counter.
+        // `tx_window`: a refunded uncommitted guard must return
+        // bytes to `tx_credit_remaining` without stranding any
+        // credit, and a pathological caller must not wrap the
+        // counter.
         let state = StreamState::new_full(false, 1, 100);
-        state.apply_credit_grant(u32::MAX - 50);
+        // Manually push tx_credit_remaining near the top so we can
+        // exercise the saturating edge. (apply_authoritative_grant
+        // can't do this because it clamps at `tx_window`.)
+        state
+            .tx_credit_remaining
+            .store(u32::MAX - 50, Ordering::Release);
         state.refund_tx_credit(1000);
         assert_eq!(state.tx_credit_remaining(), u32::MAX);
     }
 
     #[test]
-    fn test_stream_state_grant_adds_credit_saturating() {
+    fn test_authoritative_grant_recomputes_from_absolute_consumed() {
+        // Commit 60 bytes, then apply an authoritative grant
+        // reporting `total_consumed = 60`. Outstanding = 0, so the
+        // sender's remaining credit returns to the full 100-byte
+        // window — even though the grant didn't "add" anything.
         let state = StreamState::new_full(false, 1, 100);
-        assert!(state.try_acquire_tx_credit(100));
-        assert_eq!(state.tx_credit_remaining(), 0);
+        assert!(state.try_acquire_tx_credit(60));
+        assert_eq!(state.tx_credit_remaining(), 40);
+        assert_eq!(state.tx_bytes_sent(), 60);
 
-        state.apply_credit_grant(50);
-        assert_eq!(state.tx_credit_remaining(), 50);
+        state.apply_authoritative_grant(60);
+        assert_eq!(state.tx_credit_remaining(), 100);
+        assert_eq!(state.max_consumed_seen(), 60);
         assert_eq!(state.credit_grants_received(), 1);
-
-        // Pathological billions-of-grants must not wrap.
-        state.apply_credit_grant(u32::MAX);
-        state.apply_credit_grant(u32::MAX);
-        assert_eq!(state.tx_credit_remaining(), u32::MAX);
     }
 
     #[test]
-    fn test_rx_credit_emits_one_grant_per_packet_consumed() {
-        // 1:1 grant flow — every `on_bytes_consumed` mints a grant of
-        // the same size. Robust against sender/receiver window
-        // mismatches: a small-window sender still gets credit
-        // replenished at whatever rate it actually pushes.
+    fn test_authoritative_grant_self_heals_lost_grants() {
+        // Simulate a lost grant: sender commits 30 bytes, grant A
+        // (total_consumed = 30) is "lost" — never applied. Sender
+        // commits another 40 bytes (total = 70 on sender's side).
+        // Grant B arrives with total_consumed = 70; sender
+        // reconciles directly to remaining = 100 - (70 - 70) = 100,
+        // fully recovering the credit that Grant A would have
+        // refunded. This is the self-healing property.
+        let state = StreamState::new_full(false, 1, 100);
+        assert!(state.try_acquire_tx_credit(30));
+        assert!(state.try_acquire_tx_credit(40));
+        assert_eq!(state.tx_credit_remaining(), 30);
+        assert_eq!(state.tx_bytes_sent(), 70);
+
+        state.apply_authoritative_grant(70); // Grant B — Grant A was dropped
+        assert_eq!(state.tx_credit_remaining(), 100);
+    }
+
+    #[test]
+    fn test_authoritative_grant_monotonic_ignores_stale() {
+        // Out-of-order grants: apply 60, then a stale grant of 40.
+        // The stale one must be ignored — `max_consumed_seen` stays
+        // at 60 and `tx_credit_remaining` is unchanged.
+        let state = StreamState::new_full(false, 1, 100);
+        assert!(state.try_acquire_tx_credit(80));
+        state.apply_authoritative_grant(60);
+        let remaining = state.tx_credit_remaining();
+
+        state.apply_authoritative_grant(40); // stale
+        assert_eq!(state.max_consumed_seen(), 60);
+        assert_eq!(state.tx_credit_remaining(), remaining);
+    }
+
+    #[test]
+    fn test_authoritative_grant_clamps_when_outstanding_exceeds_window() {
+        // Pathological: tx_bytes_sent has raced ahead of the grant's
+        // `total_consumed` by more than one window. Outstanding would
+        // overflow `tx_window`; credit clamps at 0 rather than
+        // wrapping.
+        let state = StreamState::new_full(false, 1, 100);
+        state.tx_bytes_sent.store(1_000, Ordering::Relaxed);
+        // total_consumed=500 is strictly > initial max_consumed_seen=0,
+        // so the monotonic guard lets it through. Outstanding =
+        // 1000 - 500 = 500, which is >= tx_window (100), so credit
+        // clamps at 0.
+        state.apply_authoritative_grant(500);
+        assert_eq!(state.tx_credit_remaining(), 0);
+        assert_eq!(state.max_consumed_seen(), 500);
+    }
+
+    #[test]
+    fn test_rx_credit_emits_authoritative_total_consumed() {
+        // Every `on_bytes_consumed` returns the receiver's running
+        // cumulative consumed count, which the caller ships as the
+        // `total_consumed` field of an authoritative grant.
         let state = StreamState::new_full(false, 1, 100);
         assert_eq!(state.on_bytes_consumed(60), Some(60));
-        assert_eq!(state.on_bytes_consumed(14), Some(14));
-        assert_eq!(state.on_bytes_consumed(1), Some(1));
+        assert_eq!(state.on_bytes_consumed(14), Some(74));
+        assert_eq!(state.on_bytes_consumed(1), Some(75));
     }
 
     #[test]
@@ -1664,26 +1822,33 @@ mod tests {
             "after commit, 100 bytes consumed against a 200-byte window"
         );
 
-        // Grant of 100 bytes refunds the committed credit.
+        // Authoritative grant reporting total_consumed=100: the
+        // receiver has accepted the 100 bytes we committed, so
+        // outstanding = 0 and credit returns to the full window.
         session
             .try_stream(stream_id)
             .unwrap()
-            .apply_credit_grant(100);
+            .apply_authoritative_grant(100);
         assert_eq!(
             session.try_stream(stream_id).unwrap().tx_credit_remaining(),
             200,
             "grant restores committed credit exactly once"
         );
 
-        // CRITICAL: a second grant for the SAME committed bytes would
-        // inflate past the original window. The saturating add in
-        // `apply_credit_grant` permits extra credit up to u32::MAX —
-        // the protection against double-counting lives in the
-        // commit-vs-refund split on the send side, not on grant
-        // receipt. Document that here.
-        //
-        // (If the plan ever needs a hard window ceiling, add a
-        // `min(v + bytes, tx_window)` cap on grant receipt too.)
+        // CRITICAL: replaying the same grant (stale duplicate) is
+        // ignored by the monotonic `max_consumed_seen` check. No
+        // spurious inflation past the original window — the
+        // authoritative-grant design makes double-counting
+        // impossible even if the grant arrives multiple times.
+        session
+            .try_stream(stream_id)
+            .unwrap()
+            .apply_authoritative_grant(100);
+        assert_eq!(
+            session.try_stream(stream_id).unwrap().tx_credit_remaining(),
+            200,
+            "replaying a stale grant must not inflate credit",
+        );
     }
 
     #[test]
@@ -1710,7 +1875,7 @@ mod tests {
         );
 
         // The reopened stream's credit is untouched — we don't call
-        // apply_credit_grant under quarantine.
+        // apply_authoritative_grant under quarantine.
         assert_eq!(session.try_stream(sid).unwrap().tx_credit_remaining(), 100);
     }
 
