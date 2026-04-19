@@ -1,4 +1,4 @@
-//! RedEX v1 — local append-only streaming log.
+//! RedEX — local append-only streaming log.
 //!
 //! A `RedexFile` is a named monotonic log whose on-disk/index entries are
 //! 20 bytes each. Payloads live inline (≤8 bytes) or in a heap/disk
