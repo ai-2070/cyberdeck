@@ -424,31 +424,36 @@ src/adapter/net/
 │   ├── manager.rs         #   Redex manager (open_file / get_file / with_persistent_dir)
 │   └── disk.rs            #   DiskSegment (feature `redex-disk`): idx + dat append-only files, torn-write recovery
 │
-└── cortex/                # CortEX adapter — NetDB fold driver (feature `cortex`)
-    ├── mod.rs             #   Re-exports: CortexAdapter, EventMeta, EventEnvelope, ...
-    ├── meta.rs            #   20-byte EventMeta prefix codec + dispatch/flag constants
-    ├── envelope.rs        #   EventEnvelope + IntoRedexPayload trait
-    ├── config.rs          #   CortexAdapterConfig, StartPosition, FoldErrorPolicy
-    ├── error.rs           #   CortexAdapterError
-    ├── adapter.rs         #   CortexAdapter<State>: fold task, wait_for_seq, changes() broadcast
-    │
-    ├── tasks/             # First CortEX model — mutate-by-id CRUD (feature `cortex`)
-    │   ├── types.rs       #     Task, TaskStatus, TaskId + serde payload structs
-    │   ├── dispatch.rs    #     DISPATCH_TASK_* (0x01..0x04), TASKS_CHANNEL
-    │   ├── state.rs       #     TasksState + basic accessors
-    │   ├── fold.rs        #     TasksFold (decodes EventMeta, routes by dispatch)
-    │   ├── query.rs       #     TasksQuery fluent builder + TasksFilterSpec + OrderBy
-    │   ├── watch.rs       #     TasksWatcher reactive stream (initial + dedup)
-    │   └── adapter.rs     #     TasksAdapter wrapper (typed ingest + watch)
-    │
-    └── memories/          # Second CortEX model — content + tags + pin (feature `cortex`)
-        ├── types.rs       #     Memory, MemoryId + serde payload structs
-        ├── dispatch.rs    #     DISPATCH_MEMORY_* (0x10..0x14), MEMORIES_CHANNEL
-        ├── state.rs       #     MemoriesState + pinned/unpinned splits
-        ├── fold.rs        #     MemoriesFold
-        ├── query.rs       #     MemoriesQuery with single/any/all tag predicates
-        ├── watch.rs       #     MemoriesWatcher
-        └── adapter.rs     #     MemoriesAdapter wrapper
+├── cortex/                # CortEX adapter — NetDB fold driver (feature `cortex`)
+│   ├── mod.rs             #   Re-exports: CortexAdapter, EventMeta, EventEnvelope, ...
+│   ├── meta.rs            #   20-byte EventMeta prefix codec + dispatch/flag constants
+│   ├── envelope.rs        #   EventEnvelope + IntoRedexPayload trait
+│   ├── config.rs          #   CortexAdapterConfig, StartPosition, FoldErrorPolicy
+│   ├── error.rs           #   CortexAdapterError
+│   ├── adapter.rs         #   CortexAdapter<State>: fold task, wait_for_seq, changes() broadcast
+│   │
+│   ├── tasks/             # First CortEX model — mutate-by-id CRUD (feature `cortex`)
+│   │   ├── types.rs       #     Task, TaskStatus, TaskId + serde payload structs
+│   │   ├── dispatch.rs    #     DISPATCH_TASK_* (0x01..0x04), TASKS_CHANNEL
+│   │   ├── state.rs       #     TasksState + basic accessors
+│   │   ├── fold.rs        #     TasksFold (decodes EventMeta, routes by dispatch)
+│   │   ├── query.rs       #     TasksQuery fluent builder + TasksFilterSpec + OrderBy
+│   │   ├── watch.rs       #     TasksWatcher reactive stream (initial + dedup)
+│   │   └── adapter.rs     #     TasksAdapter wrapper (typed ingest + watch)
+│   │
+│   └── memories/          # Second CortEX model — content + tags + pin (feature `cortex`)
+│       ├── types.rs       #     Memory, MemoryId + serde payload structs
+│       ├── dispatch.rs    #     DISPATCH_MEMORY_* (0x10..0x14), MEMORIES_CHANNEL
+│       ├── state.rs       #     MemoriesState + pinned/unpinned splits
+│       ├── fold.rs        #     MemoriesFold
+│       ├── query.rs       #     MemoriesQuery with single/any/all tag predicates
+│       ├── watch.rs       #     MemoriesWatcher
+│       └── adapter.rs     #     MemoriesAdapter wrapper
+│
+└── netdb/                 # NetDB — unified query façade over CortEX state (feature `netdb`)
+    ├── mod.rs             #   Re-exports: NetDb, NetDbBuilder, NetDbSnapshot, NetDbError + re-exports of TasksFilter / MemoriesFilter
+    ├── db.rs              #   NetDb (bundles TasksAdapter + MemoriesAdapter) + NetDbBuilder + whole-db snapshot/restore
+    └── error.rs           #   NetDbError (wraps CortexAdapterError + missing-model errors)
 ```
 
 ## Adapters
@@ -653,7 +658,7 @@ cargo test --test integration_redex --features "redex redex-disk"
 # CortEX adapter core (8 tests)
 cargo test --test integration_cortex_adapter --features cortex
 
-# CortEX tasks model (16 tests: CRUD + query + watch + replay + snapshot)
+# CortEX tasks model (17 tests: CRUD + query + watch + replay + snapshot)
 cargo test --test integration_cortex_tasks --features cortex
 
 # CortEX memories model (14 tests: CRUD + tag queries + watch + coexistence + snapshot)
@@ -679,7 +684,7 @@ cargo test --test integration_redis --features redis
 cargo test --test integration_jetstream --features jetstream
 ```
 
-**1,126 tests total across the Rust stack** — lib + migration + three_node + integration_net + integration_redex + integration_cortex_{adapter,tasks,memories} + SDK. Plus 20 Node SDK smoke tests (vitest) and 18 Python SDK smoke tests (pytest), both covering CRUD, filtered queries, reactive watchers, multi-model coexistence, disk-durability round-trips, and snapshot/restore via `open_from_snapshot` — all via the `cortex` feature (which pulls in `redex-disk`).
+**1,146 tests total across the Rust stack** — lib (944) + migration (53) + three_node (65) + integration_net (13) + integration_redex (22) + integration_cortex_{adapter,tasks,memories} (8+17+14) + integration_netdb (9) + SDK doctest (1). Plus 20 Node SDK smoke tests (vitest) and 18 Python SDK smoke tests (pytest), both covering CRUD, filtered queries, reactive watchers, multi-model coexistence, disk-durability round-trips, whole-db `NetDb` snapshot/restore, and per-adapter `open_from_snapshot` — all via the `cortex` / `netdb` features (which pull in `redex-disk`).
 
 ### Test Architecture
 
