@@ -433,7 +433,7 @@ src/adapter/net/
 │   ├── partition.rs       #   PartitionDetector, PartitionPhase, healing
 │   └── reconcile.rs       #   Log reconciliation, longest-chain-wins, ForkRecord
 │
-├── redex/                 # RedEX v1 — local append-only event log (feature `redex`)
+├── redex/                 # RedEX — local append-only event log (feature `redex`)
 │   ├── mod.rs             #   Re-exports: Redex, RedexFile, RedexEvent, RedexError, ...
 │   ├── entry.rs           #   20-byte RedexEntry codec, RedexFlags, payload_checksum
 │   ├── config.rs          #   RedexFileConfig (persistent, retention, sync_interval)
