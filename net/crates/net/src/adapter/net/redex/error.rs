@@ -14,6 +14,18 @@ pub enum RedexError {
         max: usize,
     },
 
+    /// Segment offset exceeded `u32::MAX`. Happens on a long-running
+    /// persistent file whose lifetime heap bytes (append + eviction
+    /// + re-append) have crossed the 4 GB `payload_offset` field
+    /// width. Recoverable only by closing + re-opening the file
+    /// (which resets `base_offset` via disk recovery) or by
+    /// sweep-time offset renormalization in v2.
+    #[error("segment offset overflow: offset {offset} exceeds u32::MAX")]
+    SegmentOffsetOverflow {
+        /// The overflowing absolute offset.
+        offset: u64,
+    },
+
     /// Requested sequence is outside the file's retained range.
     #[error("sequence {seq} is outside the retained range [{lo}, {hi})")]
     SeqOutOfRange {

@@ -664,20 +664,18 @@ fn notify_watchers(watchers: &mut Vec<TailWatcher>, event: &RedexEvent) {
 }
 
 /// Convert a segment offset to the `u32` field that lives in
-/// `RedexEntry::payload_offset`. Returns `Err(PayloadTooLarge)` if the
-/// absolute segment offset has passed `u32::MAX` — this can only
-/// happen on a persistent file whose lifetime heap bytes (append +
-/// eviction + re-append) have crossed the 4 GB threshold. The segment
-/// itself caps at 3 GB live, so this fires on `base_offset` growth,
-/// not live-data growth. The right long-term fix is a sweep-time
-/// offset renormalization (v2); until then we surface the overflow
-/// instead of silently truncating.
+/// `RedexEntry::payload_offset`. Returns
+/// `Err(SegmentOffsetOverflow { offset })` if the absolute segment
+/// offset has passed `u32::MAX` — this can only happen on a
+/// persistent file whose lifetime heap bytes (append + eviction +
+/// re-append) have crossed the 4 GB threshold. The segment itself
+/// caps at 3 GB live, so this fires on `base_offset` growth, not
+/// live-data growth. The right long-term fix is a sweep-time offset
+/// renormalization (v2); until then we surface the overflow instead
+/// of silently truncating.
 #[inline]
 fn offset_to_u32(offset: u64) -> Result<u32, RedexError> {
-    u32::try_from(offset).map_err(|_| RedexError::PayloadTooLarge {
-        size: 0,
-        max: u32::MAX as usize,
-    })
+    u32::try_from(offset).map_err(|_| RedexError::SegmentOffsetOverflow { offset })
 }
 
 /// Unix nanoseconds from `SystemTime::now`. Used as the per-entry
@@ -912,14 +910,19 @@ mod tests {
         // (`offset as u32`), which corrupted `RedexEntry::payload_offset`
         // on long-running persistent files whose base_offset crossed
         // `u32::MAX`. The fix converts the truncation into a
-        // `PayloadTooLarge` error at the exact boundary.
+        // `SegmentOffsetOverflow` error at the exact boundary and
+        // surfaces the overflowing offset value.
         assert!(offset_to_u32(0).is_ok());
         assert!(offset_to_u32(u32::MAX as u64).is_ok());
-        assert!(
-            offset_to_u32(u32::MAX as u64 + 1).is_err(),
-            "offsets above u32::MAX must surface an error, not silently truncate"
-        );
-        assert!(offset_to_u32(u64::MAX).is_err());
+        let err = offset_to_u32(u32::MAX as u64 + 1).unwrap_err();
+        assert!(matches!(
+            err,
+            RedexError::SegmentOffsetOverflow { offset } if offset == u32::MAX as u64 + 1
+        ));
+        assert!(matches!(
+            offset_to_u32(u64::MAX).unwrap_err(),
+            RedexError::SegmentOffsetOverflow { offset: u64::MAX }
+        ));
     }
 
     #[test]
@@ -927,16 +930,16 @@ mod tests {
         // Regression: single appends must surface the offset overflow
         // rather than write a truncated `payload_offset`. We force
         // `base_offset` past `u32::MAX` via the test-only hook and
-        // verify the next append returns `PayloadTooLarge`.
+        // verify the next append returns `SegmentOffsetOverflow`.
         let f = make_file("t_off_overflow");
         {
             let mut state = f.inner.state.lock();
             state.segment.force_base_offset(u32::MAX as u64 + 1);
         }
         // Any further append computes a start offset > u32::MAX and
-        // must surface `PayloadTooLarge` from `offset_to_u32`.
+        // must surface `SegmentOffsetOverflow` from `offset_to_u32`.
         let err = f.append(b"x").unwrap_err();
-        assert!(matches!(err, RedexError::PayloadTooLarge { .. }));
+        assert!(matches!(err, RedexError::SegmentOffsetOverflow { .. }));
     }
 
     #[test]
@@ -968,7 +971,7 @@ mod tests {
                 Bytes::from_static(b"bbbbbbbb"),
             ])
             .unwrap_err();
-        assert!(matches!(err, RedexError::PayloadTooLarge { .. }));
+        assert!(matches!(err, RedexError::SegmentOffsetOverflow { .. }));
         // Critical assertion: next_seq did NOT advance. A naive
         // pre-fix implementation would have `next_seq == 3` here.
         assert_eq!(
@@ -997,7 +1000,7 @@ mod tests {
                 Bytes::from_static(b"bbbbbbbb"),
             ])
             .unwrap_err();
-        assert!(matches!(err, RedexError::PayloadTooLarge { .. }));
+        assert!(matches!(err, RedexError::SegmentOffsetOverflow { .. }));
         assert_eq!(f.next_seq(), 1);
     }
 }
