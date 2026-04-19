@@ -239,3 +239,205 @@ class Net:
 
     def __enter__(self) -> "Net": ...
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool: ...
+
+# =========================================================================
+# CortEX adapter (requires the `cortex` feature at build time)
+# =========================================================================
+
+from typing import Iterator, List, Optional
+
+class Redex:
+    """Local RedEX manager. One handle per node; shared by all adapters.
+
+    persistent_dir: when provided, adapters opened with persistent=True
+    write their channel's idx/dat files under this directory and
+    replay them on reopen.
+    """
+    def __init__(self, persistent_dir: Optional[str] = None) -> None: ...
+
+class Task:
+    """A materialized task record."""
+    id: int
+    title: str
+    status: str  # "pending" | "completed"
+    created_ns: int
+    updated_ns: int
+
+class TasksAdapter:
+    @staticmethod
+    def open(
+        redex: Redex, origin_hash: int, persistent: bool = False
+    ) -> "TasksAdapter": ...
+    @staticmethod
+    def open_from_snapshot(
+        redex: Redex,
+        origin_hash: int,
+        state_bytes: bytes,
+        last_seq: Optional[int] = None,
+        persistent: bool = False,
+    ) -> "TasksAdapter": ...
+    def snapshot(self) -> tuple[bytes, Optional[int]]: ...
+    def create(self, id: int, title: str, now_ns: int) -> int: ...
+    def rename(self, id: int, new_title: str, now_ns: int) -> int: ...
+    def complete(self, id: int, now_ns: int) -> int: ...
+    def delete(self, id: int) -> int: ...
+    def wait_for_seq(self, seq: int) -> None: ...
+    def close(self) -> None: ...
+    def is_running(self) -> bool: ...
+    def count(self) -> int: ...
+    def list_tasks(
+        self,
+        *,
+        status: Optional[str] = None,
+        title_contains: Optional[str] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Task]: ...
+    def watch_tasks(
+        self,
+        *,
+        status: Optional[str] = None,
+        title_contains: Optional[str] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> "TaskWatchIter": ...
+
+class TaskWatchIter(Iterator[List[Task]]):
+    def __iter__(self) -> "TaskWatchIter": ...
+    def __next__(self) -> List[Task]: ...
+    def close(self) -> None: ...
+
+class Memory:
+    """A materialized memory record."""
+    id: int
+    content: str
+    tags: List[str]
+    source: str
+    created_ns: int
+    updated_ns: int
+    pinned: bool
+
+class MemoriesAdapter:
+    @staticmethod
+    def open(
+        redex: Redex, origin_hash: int, persistent: bool = False
+    ) -> "MemoriesAdapter": ...
+    @staticmethod
+    def open_from_snapshot(
+        redex: Redex,
+        origin_hash: int,
+        state_bytes: bytes,
+        last_seq: Optional[int] = None,
+        persistent: bool = False,
+    ) -> "MemoriesAdapter": ...
+    def snapshot(self) -> tuple[bytes, Optional[int]]: ...
+    def store(
+        self,
+        id: int,
+        content: str,
+        tags: List[str],
+        source: str,
+        now_ns: int,
+    ) -> int: ...
+    def retag(self, id: int, tags: List[str], now_ns: int) -> int: ...
+    def pin(self, id: int, now_ns: int) -> int: ...
+    def unpin(self, id: int, now_ns: int) -> int: ...
+    def delete(self, id: int) -> int: ...
+    def wait_for_seq(self, seq: int) -> None: ...
+    def close(self) -> None: ...
+    def is_running(self) -> bool: ...
+    def count(self) -> int: ...
+    def list_memories(
+        self,
+        *,
+        source: Optional[str] = None,
+        content_contains: Optional[str] = None,
+        tag: Optional[str] = None,
+        any_tag: Optional[List[str]] = None,
+        all_tags: Optional[List[str]] = None,
+        pinned: Optional[bool] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Memory]: ...
+    def watch_memories(
+        self,
+        *,
+        source: Optional[str] = None,
+        content_contains: Optional[str] = None,
+        tag: Optional[str] = None,
+        any_tag: Optional[List[str]] = None,
+        all_tags: Optional[List[str]] = None,
+        pinned: Optional[bool] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> "MemoryWatchIter": ...
+
+class MemoryWatchIter(Iterator[List[Memory]]):
+    def __iter__(self) -> "MemoryWatchIter": ...
+    def __next__(self) -> List[Memory]: ...
+    def close(self) -> None: ...
+
+class NetDb:
+    """Unified NetDB handle bundling TasksAdapter + MemoriesAdapter.
+
+    Access per-model adapters via the `.tasks` / `.memories`
+    properties. For raw event / stream access, drop down to the
+    underlying adapters.
+    """
+
+    @staticmethod
+    def open(
+        *,
+        origin_hash: int,
+        persistent_dir: Optional[str] = None,
+        persistent: bool = False,
+        with_tasks: bool = False,
+        with_memories: bool = False,
+    ) -> "NetDb": ...
+
+    @staticmethod
+    def open_from_snapshot(
+        bundle: bytes,
+        *,
+        origin_hash: int,
+        persistent_dir: Optional[str] = None,
+        persistent: bool = False,
+        with_tasks: bool = False,
+        with_memories: bool = False,
+    ) -> "NetDb": ...
+
+    @property
+    def tasks(self) -> Optional[TasksAdapter]: ...
+
+    @property
+    def memories(self) -> Optional[MemoriesAdapter]: ...
+
+    def snapshot(self) -> bytes: ...
+
+    def close(self) -> None: ...
+
+class CortexError(Exception):
+    """Raised by CortEX adapter operations (tasks, memories) on
+    adapter-level failures: `adapter closed`, `fold stopped at seq N`,
+    and underlying RedEX storage errors."""
+
+class NetDbError(Exception):
+    """Raised by NetDB handle-level operations: snapshot encode /
+    decode, missing-model accesses. Per-adapter failures inside a
+    NetDB still surface as `CortexError`."""

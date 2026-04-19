@@ -4,3 +4,4 @@ net/crates/net/sdk-ts/dist/
 # macOS cruft
 .DS_Store
 **/.DS_Store
+net/crates/net/bindings/python/python/net/*.so

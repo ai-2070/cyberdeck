@@ -4,6 +4,16 @@
   "description": "High-performance, schema-agnostic event bus for AI runtime workloads",
   "main": "index.js",
   "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./errors": {
+      "types": "./errors.d.ts",
+      "default": "./errors.js"
+    }
+  },
   "napi": {
     "binaryName": "net",
     "triples": {
@@ -32,6 +42,8 @@
   "files": [
     "index.js",
     "index.d.ts",
+    "errors.js",
+    "errors.d.ts",
     "*.node"
   ],
   "devDependencies": {

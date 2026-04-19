@@ -2,6 +2,9 @@
 //!
 //! Provides high-performance event ingestion and consumption for Node.js/TypeScript.
 
+#[cfg(feature = "cortex")]
+mod cortex;
+
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::sync::Arc;

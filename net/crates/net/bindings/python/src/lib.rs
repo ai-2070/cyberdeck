@@ -2,6 +2,9 @@
 //!
 //! Provides high-performance event ingestion and consumption for Python.
 
+#[cfg(feature = "cortex")]
+mod cortex;
+
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -1296,5 +1299,18 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("BackpressureError", m.py().get_type::<BackpressureError>())?;
     #[cfg(feature = "net")]
     m.add("NotConnectedError", m.py().get_type::<NotConnectedError>())?;
+    #[cfg(feature = "cortex")]
+    {
+        m.add_class::<cortex::PyRedex>()?;
+        m.add_class::<cortex::PyTask>()?;
+        m.add_class::<cortex::PyTasksAdapter>()?;
+        m.add_class::<cortex::PyTaskWatchIter>()?;
+        m.add_class::<cortex::PyMemory>()?;
+        m.add_class::<cortex::PyMemoriesAdapter>()?;
+        m.add_class::<cortex::PyMemoryWatchIter>()?;
+        m.add_class::<cortex::PyNetDb>()?;
+        m.add("CortexError", m.py().get_type::<cortex::CortexError>())?;
+        m.add("NetDbError", m.py().get_type::<cortex::NetDbError>())?;
+    }
     Ok(())
 }

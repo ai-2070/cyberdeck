@@ -1,0 +1,128 @@
+//! `TasksState` — the materialized view held behind the
+//! `CortexAdapter<TasksState>`'s `RwLock`.
+
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+use super::filter::TasksFilter;
+use super::types::{Task, TaskId, TaskStatus};
+
+/// Materialized view over the tasks log.
+///
+/// `Serialize` / `Deserialize` are derived so the state can be
+/// snapshotted via [`super::super::CortexAdapter::snapshot`] and
+/// restored via [`super::super::CortexAdapter::open_from_snapshot`].
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct TasksState {
+    pub(super) tasks: HashMap<TaskId, Task>,
+}
+
+impl TasksState {
+    /// Create an empty state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Look up a task by id.
+    pub fn get(&self, id: TaskId) -> Option<&Task> {
+        self.tasks.get(&id)
+    }
+
+    /// Total number of tasks currently retained.
+    pub fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    /// True if no tasks are retained.
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    /// True if a task with `id` exists.
+    pub fn contains(&self, id: TaskId) -> bool {
+        self.tasks.contains_key(&id)
+    }
+
+    /// Iterate over every retained task.
+    pub fn all(&self) -> impl Iterator<Item = &Task> {
+        self.tasks.values()
+    }
+
+    /// Iterate over tasks currently `Pending`.
+    pub fn pending(&self) -> impl Iterator<Item = &Task> {
+        self.tasks
+            .values()
+            .filter(|t| t.status == TaskStatus::Pending)
+    }
+
+    /// Iterate over tasks currently `Completed`.
+    pub fn completed(&self) -> impl Iterator<Item = &Task> {
+        self.tasks
+            .values()
+            .filter(|t| t.status == TaskStatus::Completed)
+    }
+
+    // -- Prisma-ish convenience surface (NetDB layer) -------------------
+
+    /// Look up a task by id. Alias of [`Self::get`], named to match
+    /// the Prisma-style NetDB surface.
+    pub fn find_unique(&self, id: TaskId) -> Option<&Task> {
+        self.get(id)
+    }
+
+    /// Collect all tasks matching `filter` (cloned), respecting
+    /// order + limit.
+    pub fn find_many(&self, filter: &TasksFilter) -> Vec<Task> {
+        filter.apply(self.query()).collect()
+    }
+
+    /// Count tasks matching `filter`. Ignores `limit`.
+    pub fn count_where(&self, filter: &TasksFilter) -> usize {
+        filter.apply(self.query()).count()
+    }
+
+    /// True if any task matches `filter`. Short-circuits on first hit.
+    pub fn exists_where(&self, filter: &TasksFilter) -> bool {
+        filter.apply(self.query()).exists()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(id: TaskId, status: TaskStatus) -> Task {
+        Task {
+            id,
+            title: format!("task-{}", id),
+            status,
+            created_ns: 0,
+            updated_ns: 0,
+        }
+    }
+
+    #[test]
+    fn test_empty_state() {
+        let s = TasksState::new();
+        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
+        assert!(s.get(1).is_none());
+        assert!(!s.contains(1));
+    }
+
+    #[test]
+    fn test_queries_filter_by_status() {
+        let mut s = TasksState::new();
+        s.tasks.insert(1, task(1, TaskStatus::Pending));
+        s.tasks.insert(2, task(2, TaskStatus::Pending));
+        s.tasks.insert(3, task(3, TaskStatus::Completed));
+
+        assert_eq!(s.len(), 3);
+        assert_eq!(s.pending().count(), 2);
+        assert_eq!(s.completed().count(), 1);
+        assert_eq!(s.all().count(), 3);
+        assert!(s.contains(2));
+        assert!(!s.contains(99));
+    }
+}

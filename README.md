@@ -358,7 +358,7 @@ For implementation details — capabilities, proximity graphs, subnets, channels
 
 ## Status
 
-Net is a working protocol, not a paper design. 985 tests verify the implementation across every layer of the stack.
+Net is a working protocol, not a paper design. 1,146 tests across the Rust core, plus 36 Node and 33 Python SDK smoke tests, verify the implementation across every layer of the stack.
 
 **What works today:**
 
@@ -378,11 +378,22 @@ Net is a working protocol, not a paper design. 985 tests verify the implementati
 - **Correlated failure detection.** Independent vs mass failure classification based on configurable thresholds. Recovery budget throttled during mass failure.
 - **EventBus full stack.** Events flow through the entire pipeline: EventBus → sharded ring buffers → drain workers → batch workers → NetAdapter → encrypted UDP → poll.
 - **SDK parity for the Mesh + Stream + Backpressure API.** Rust, TypeScript, and Python SDKs wrap the core `MeshNode` with typed `Stream`/`StreamConfig`, `BackpressureError` / `NotConnectedError` classes for `instanceof` / `isinstance` matching, and `send_with_retry` / `send_blocking` helpers with the same backoff semantics as the Rust core. Python `send_blocking` releases the GIL for the duration of the retry loop. u64 stream stats fields (`lastActivityNs`, sequence numbers, etc.) cross the napi boundary as `BigInt` to avoid precision loss on the JS side.
+- **RedEX — local append-only event log.** A `Redex` manager binds `RedexFile` handles to `ChannelName`s (hierarchical, ACL-enforced via the existing `AuthGuard`). Every event occupies exactly 20 bytes of index space; payloads live inline (fixed 8 bytes, zero segment allocation for tick-counter / sensor workloads) or in an append-only heap segment. API: `append`, `append_batch`, `append_inline`, `append_bincode`, `tail(from_seq)` (async stream, atomic backfill-then-live with gapless handoff), `read_range`. Monotonic `AtomicU64::fetch_add` sequence allocator. Count-based + size-based retention as a background sweep. `RedexFold<State>` trait is the integration hook for CortEX / NetDB folds — RedEX defines it; adapters install against it. Feature-gated behind `redex`; v1 is strictly local (no replication, no subprotocol, no multi-node convergence).
+- **Disk-backed durability for RedEX (feature `redex-disk`).** Opt-in via `RedexFileConfig::persistent` + `Redex::with_persistent_dir(...)`. Each file writes two append-only files at `<base>/<channel_path>/{idx,dat}` — 20-byte records in `idx`, raw payloads in `dat`. On reopen, the full `dat` replays into the heap segment and `idx` restores the index. Torn-write tail from a crash (partial 20-byte record) is truncated on recovery. `close()` fsyncs; unsynced writes live in OS page cache — exactly matches the documented "recover minus unsynced tail" semantics.
+- **CortEX adapter — fold driver + NetDB read surface (feature `cortex`).** The seam between CortEX events and RedEX storage. Projects `EventEnvelope` through a fixed 20-byte `EventMeta` prefix (dispatch / flags / origin_hash / seq_or_ts / checksum), appends to a `RedexFile`, tails the same file and drives a caller-supplied `RedexFold<State>` on a spawned task, exposes the materialized state via `Arc<RwLock<State>>`. `StartPosition::{FromBeginning, LiveOnly, FromSeq(n)}` for replay semantics; `FoldErrorPolicy::{Stop, LogAndContinue}` for error handling; `wait_for_seq(seq)` as a read-after-write barrier (atomic `AtomicI64` watermark + `Notify`, sentinel `-1` distinguishes "nothing folded yet" from "seq 0 folded"). `changes() -> Stream<Item = u64>` via a broadcast channel is the post-fold notification primitive that reactive watchers compose over.
+- **CortEX models — tasks + memories (feature `cortex`).** Two concrete models built on the adapter, proving the pattern across different domain shapes. Tasks is mutate-by-id CRUD (`create` / `rename` / `complete` / `delete` over `Task { id, title, status, created_ns, updated_ns }`). Memories is a content-addressed log with set-valued tag metadata (`store` / `retag` / `pin` / `unpin` / `delete` over `Memory { id, content, tags: Vec<String>, source, pinned, ... }`). Both expose a Prisma-style fluent query builder (`state.query().where_*(...).order_by(...).limit(n).collect()`) and a reactive watcher (`adapter.watch().where_*(...).stream()`) that emits the initial filter result plus deduplicated re-evaluations on every fold tick where the filter output changes. Dispatches partitioned under the CortEX-internal range (`0x01..0x04` for tasks, `0x10..0x14` for memories) with static asserts; both models coexist on one `Redex` manager without cross-channel leakage. Tag predicates come in three flavors (single / any-of / all-of).
+- **Node SDK for CortEX (feature `cortex` on `@ai2070/net`).** Typed napi wrappers for `Redex`, `TasksAdapter`, `MemoriesAdapter`. Full CRUD, synchronous snapshot queries (`listTasks(filter)` / `listMemories(filter)` with filter objects for status / tags / pinned / time windows / ordering / limit), `waitForSeq(seq)` as a `Promise<void>` read-after-write barrier, and reactive `watchTasks(filter)` / `watchMemories(filter)` returning a JS iterator whose `next(): Promise<T[] | null>` wraps trivially into `for await (const tasks of ...)` (a 5-line `toAsyncIterable(iter)` helper is shown in the smoke tests). Cancellation via `iter.close()` uses an `AtomicBool` pre-check paired with tokio `Notify` so `close()` racing ahead of `next()` is still observed. u64 fields (ids, timestamps, sequences) cross the boundary as `BigInt`. `open()` and `watch*()` declared async so the adapter's fold-task `tokio::spawn` lands inside napi-rs's tokio runtime context.
+- **Python SDK for CortEX (feature `cortex` via maturin).** PyO3 wrappers for the same `Redex`, `TasksAdapter`, `MemoriesAdapter` surface. Sync methods block on an owned tokio runtime and release the GIL through `py.detach()` around awaits. Filter arguments are keyword-only (`tasks.list_tasks(status='pending', limit=10)`). Watchers implement Python's native sync iterator protocol (`for tasks in adapter.watch_tasks(status='pending'): ...`) with `StopIteration` on close or stream end — same `AtomicBool` + `Notify.notified().enable()` race-free shutdown as the Node side. u64 ids + timestamps map naturally to Python's arbitrary-precision `int` (no BigInt glue needed). Full type stubs in `net/_net.pyi`.
+- **Disk durability exposed through both SDKs.** The `cortex` feature on each bindings crate pulls in `net/redex-disk`, so `Redex(persistentDir)` (Node) / `Redex(persistent_dir=...)` (Python) plus `TasksAdapter.open(redex, origin, persistent=True)` / `MemoriesAdapter.open(...)` give callers full disk-backed CortEX state across process restarts: close the adapter, reopen against the same `persistentDir` / `persistent_dir`, and the tail replays from `<dir>/<channel_path>/{idx,dat}`. Round-trip tests in both language suites verify complete state recovery (status transitions, retagging, pinning).
+- **Snapshot / resume for long-running folds.** Replaying from seq 0 gets expensive once a file has millions of events. `CortexAdapter::snapshot() -> (state_bytes, last_seq)` serializes the materialized state (via bincode, under the state write lock so the pair is consistent); `CortexAdapter::open_from_snapshot(...)` deserializes + resumes tailing at `FromSeq(last_seq + 1)`. Surfaced on Rust `TasksAdapter` / `MemoriesAdapter`, Node `snapshot() -> { stateBytes: Buffer, lastSeq: bigint | null }` + `openFromSnapshot(...)`, and Python `snapshot() -> (bytes, int | None)` + `open_from_snapshot(...)`. Serde derives on `TasksState` + `MemoriesState` give the feature "for free" to any future CortEX model that derives `Serialize` + `Deserialize`.
+- **RedEX: time-based retention, ordered appender, typed wrappers.** `Retention::Age(Duration)` alongside the existing count/size policies — per-entry wall-clock timestamps captured at append time, age-based eviction on the same sweep path. `OrderedAppender` holds the state lock across seq allocation, guaranteeing in-order index insertion under concurrent writers (single-threaded replay determinism). `TypedRedexFile<T>` is a zero-cost wrapper auto-serdeing `T` on append / deserialize on `tail` / `read_range`; `RedexFile::append_and_fold<T, F, S>` bundles serialize + append + fold into one call.
+- **NetDB — unified query façade across Rust + TS + Python.** A `NetDb` handle bundles `TasksAdapter` + `MemoriesAdapter` under one object with per-model accessors (`db.tasks` / `db.memories`). Rust ships a `NetDbBuilder` (`with_tasks().with_memories().build()`); Node ships `NetDb.open(config)` with `.tasks` / `.memories` getters returning the existing adapter handles; Python ships `NetDb.open(origin_hash=..., with_tasks=True, with_memories=True)` with `@property` accessors. Whole-db `snapshot()` bundles every enabled model's state into one bincode blob; `open_from_snapshot(bundle, ...)` restores cross-model. New Prisma-ish methods on `TasksState` / `MemoriesState` (`find_unique`, `find_many(&filter)`, `count_where`, `exists_where`) complement the existing fluent query builders. NetDB is strictly local and strictly query-oriented — raw events / streams stay at the RedEX / Net layer per [`NETDB_PLAN.md`](net/crates/net/docs/NETDB_PLAN.md).
 
 **What needs protocol work:**
 
 - **Secure keypair transfer for migration.** The `DaemonFactoryRegistry` assumes the target has been provisioned with the daemon's `EntityKeypair` out-of-band (`KeyMode::PreProvisioned` is actionable today). `KeyMode::{Derived, Transfer}` and the Key Orchestrator / Key Agent control-plane that would run over CortEX are designed in [`KEY_MIGRATION_PLAN.md`](net/crates/net/docs/KEY_MIGRATION_PLAN.md) but not yet implemented — CortEX itself is forward-looking.
 - **Round-trip credit-window back-pressure (v2).** v1 back-pressure catches *concurrent callers* racing on the same stream via a local in-flight counter; it does not catch a single serial sender outrunning a slow receiver across the network. v2 extends the same `StreamError::Backpressure` signal to network-speed via per-stream credit windows (one `tx_credit_remaining` counter, `SUBPROTOCOL_STREAM_WINDOW = 0x0B00` receiver→sender grants). Daemon code does not change; only the internal condition that triggers Backpressure shifts from "local counter full" to "no credit from peer." Design: [`STREAM_BACKPRESSURE_PLAN_V2.md`](net/crates/net/docs/STREAM_BACKPRESSURE_PLAN_V2.md).
+
 **What we're deliberately not building:**
 
 - **Persistent multi-route caches.** The `RoutingTable` holds one best route per destination by design — not a ranked alternates list, not a TCP-Cubic-style persistent path cache, not an OSPF-style link-state database. Recomputing a path from fresh pingwaves + the local `ProximityGraph` is microseconds-cheap at our target scales, and the catastrophic-failure case (half a site's links die at once, RF goes hostile, a vehicle loses its primary compute) is exactly where a deep cache of alternates becomes a liability: it surfaces stale confidence into the fast path and delays convergence while the cache ages out entry by entry. Our bias: *"I don't know how to route this right now"* is a safer answer than *"here's a route that was fine 5 seconds ago."* See the **Routing philosophy** section in [`TRANSPORT.md`](net/crates/net/docs/TRANSPORT.md#routing-philosophy).
@@ -519,6 +530,47 @@ Pool contention (thread-local acquire/release):
 Benchmarks accurate as of April 15, 2026.
 
 All SDKs exceed **2M events/sec** with optimal ingestion patterns. Go achieves zero allocations on raw ingestion. Node.js sync methods are 31x faster than async. Bun batch ingestion is ~17% faster than Node.js.
+
+### RedEX (storage primitive)
+
+Microbenchmarks of the local append-only log on its own, separate from CortEX. Answers "is the log ever the bottleneck?" Numbers below are on M1 Max (macOS).
+
+| Operation | Latency | Throughput |
+|-----------|--------:|-----------:|
+| Append inline (≤8 B) | 47 ns | **21.3M ops/sec** |
+| Append heap (32 B) | 54 ns | **18.6M ops/sec** |
+| Append heap (256 B) | 97 ns | **10.3M ops/sec** |
+| Append heap (1 KB) | 240 ns | **4.17M ops/sec** |
+| Batch append (64 × 64 B) | 1.72 us | **37.2M elements/sec** |
+| Append disk (32 B, `redex-disk`) | 3.11 us | **321k ops/sec** |
+| Append disk (1 KB, `redex-disk`) | 6.42 us | **156k ops/sec** |
+| Tail latency (append → subscriber) | 138 ns | -- |
+
+Disk durability costs ~50x the memory-only append path and caps throughput around **hundreds of thousands of events/sec per file** — ample headroom for every workload where the event rate is bounded by the hardware generating it (sensors, instruments, telemetry) rather than by software replaying synthetic load.
+
+### CortEX + NetDB (end-to-end)
+
+The numbers that matter for real workloads — ingest, fold, query, snapshot — measured through the full `TasksAdapter` / `MemoriesAdapter` / `NetDb` stack with RedEX underneath. This is the slice a factory cell, substation, or Deck runs; the microbenchmarks above are how we know no single layer is load-bearing.
+
+| Operation | Latency | Throughput |
+|-----------|--------:|-----------:|
+| `tasks.create` ingest (no barrier) | 271 ns | **3.63M ops/sec** |
+| `memories.store` ingest | 342 ns | **2.88M ops/sec** |
+| Fold round-trip (`create` + `waitForSeq`) | 6.00 us | **165k ops/sec** |
+| `find_unique` (state lookup) | 10.4 ns | **96M ops/sec** |
+| `find_many` @ 1 K tasks (status filter) | 7.79 us | **126M elements/sec** |
+| `find_many` @ 10 K tasks | 142 us | **70.4M elements/sec** |
+| `count_where` @ 10 K tasks | 31.6 us | **337M elements/sec** |
+| `find_many` @ 1 K memories (tag filter) | 53.5 us | **19.1M elements/sec** |
+| Tasks snapshot encode @ 10 K | 67.8 us | -- |
+| Memories snapshot encode @ 10 K | 234 us | -- |
+| `NetDb::open` (both models) | 5.87 us | **170k ops/sec** |
+| Bundle encode @ 1 K (135 KB output) | 62.8 us | -- |
+| Bundle decode @ 1 K | 94.6 us | -- |
+
+Ingest onto a single adapter sustains **~3.6M events/sec** before consumer back-pressure (no `waitForSeq`). The full fold round-trip is **6 us** — so a reactive watcher observes a newly appended event within ~one fold tick of the writer. Query methods at 10 K state size are double-digit microseconds even against a cold read lock, which is why the NetDB surface ships `find_many` / `count_where` / `exists_where` always-on: they're cheap enough to call inside a hot loop without a cache layer.
+
+Benchmarks captured 2026-04-19 via `cargo bench --bench redex --features "redex redex-disk"` and `cargo bench --bench cortex --features "cortex netdb"` at 20 samples × 3 s measurement time.
 
 ### Binary size
 

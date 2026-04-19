@@ -53,4 +53,12 @@ __all__ = [
     "Stats",
 ]
 
+try:
+    from ._net import CortexError, NetDbError
+except ImportError:
+    # `cortex` feature not compiled in; error classes stay undefined.
+    pass
+else:
+    __all__.extend(["CortexError", "NetDbError"])
+
 __version__ = "0.1.0"
