@@ -1,0 +1,31 @@
+net/crates/net/tests/integration_redex.rs
+  f3669361474f4cb8 729-802
+net/crates/net/tests/integration_cortex_adapter.rs
+  f3669361474f4cb8 340-378
+net/crates/net/src/adapter/net/redex/disk.rs
+  f3669361474f4cb8 29-30,53-58,74-75,77-78,88-132,151-152,159-167,179-182,199-202
+net/crates/net/src/adapter/net/cortex/adapter.rs
+  f3669361474f4cb8 4,42-47,70,73,109-114,201-211,216,291,294,396
+net/crates/net/src/adapter/net/redex/file.rs
+  f3669361474f4cb8 161-167,175-198,201-204,207-215,226-227,234-236,240-243,246-248,261-267,289,292-293,296-298,304-306,308,314,319,326-327,334-348,365,372-385,387,391-394,397-403,414,429-432,435-437,450-451,470,473-474,482,484,490,495,502,509-523,1108-1201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "089aea94a2fe1066aaf0de350f6937a4a55dc295",
+  "prompts": {
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 834,
+      "total_deletions": 68,
+      "accepted_lines": 466,
+      "overriden_lines": 0
+    }
+  }
+}
