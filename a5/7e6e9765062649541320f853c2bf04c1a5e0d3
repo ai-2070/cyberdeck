@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/session.rs
+  f3669361474f4cb8 1892-1931
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "a57e6e9765062649541320f853c2bf04c1a5e0d3",
+  "prompts": {
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2019,
+      "total_deletions": 0,
+      "accepted_lines": 73,
+      "overriden_lines": 0
+    }
+  }
+}
