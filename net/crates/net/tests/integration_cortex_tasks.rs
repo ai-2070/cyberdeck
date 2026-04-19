@@ -448,11 +448,11 @@ async fn test_regression_fold_rejects_checksum_mismatch() {
     // stamping), and observe the fold task halt. The TasksAdapter's
     // typed `create`/`rename`/etc. always stamp the correct checksum,
     // so we use the raw path here.
+    use bytes::Bytes;
+    use net::adapter::net::cortex::tasks::{TasksFold, TasksState};
     use net::adapter::net::cortex::{
         CortexAdapter, CortexAdapterConfig, EventEnvelope, FoldErrorPolicy, StartPosition,
     };
-    use net::adapter::net::cortex::tasks::{TasksFold, TasksState};
-    use bytes::Bytes;
 
     let redex = Redex::new();
     let cfg = CortexAdapterConfig {
