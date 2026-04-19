@@ -206,7 +206,7 @@ Benchmarks accurate as of 2026-04-19. Core / Net / Routing / Forwarding / Swarm 
 
 Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns. CortEX ingest on a single `TasksAdapter` sustains **~3.6M events/sec** before any consumer back-pressure (measured without `waitForSeq`); the full fold round-trip — append → RedEX tail → state mutation → `waitForSeq` returns — lands at **6 us**, so reactive watchers see an event roughly one fold tick after the writer. Query methods at 10 K state size run in **double-digit microseconds** on a cold read lock, which is why NetDB ships with an always-on `find_many` + `count_where` + `exists_where` surface: even on cold state they're cheap enough to call inside a hot loop. NetDB **bundle encode/decode is 2-3x faster than the bincode era and produces bundles 60-70% smaller** — the win that matters most for cross-language snapshot transfer.
 
-1,146 Rust tests + 36 Node + 33 Python SDK smoke tests. ~840 KB deployed binary.
+1,146 Rust tests + 36 Node + 33 Python SDK smoke tests. ~1MB deployed binary.
 
 ## Capabilities
 
@@ -749,7 +749,7 @@ Default feature is `redis`.
 # Default (Redis adapter)
 cargo build --release
 
-# Net only (831 KB binary)
+# Net only (1MB binary)
 cargo build --release --no-default-features --features net
 
 # Everything
@@ -842,7 +842,7 @@ Three-node mesh tests in `tests/three_node_integration.rs` exercise the `MeshNod
 | **Handshake relay** | `connect_via(relay_addr, …)` establishes a Noise NKpsk0 session with a peer that has no direct UDP path. Handshake rides as a routed Net packet (`HANDSHAKE` flag) over existing relay sessions; post-handshake data flows A↔C through B via `send_routed`. |
 | **DV routing** | Pingwave-driven route install populates both `RoutingTable` and `ProximityGraph::edges`. 3-hop chain A→B→C→D: A learns the route to D via B; `path_to(D)` returns the full 3-hop path. Regression: `path_to` used to always return `None` because edges were never populated. |
 | **Stream multiplexing** | Multiple independent streams per peer, per-stream reliability + fairness weight, epoch-guarded handles reject sends after close+reopen, idle eviction + LRU cap |
-| **Stream back-pressure (v1)** | Concurrent callers on a window-sized stream: exactly one admission per slot; others get `StreamError::Backpressure`. `send_with_retry` absorbs the pressure and eventually succeeds. |
+| **Stream back-pressure (v1 + v2)** | v1 (concurrent callers racing a window) + v2 (single serial sender outrunning a slow receiver — byte-credit exhaustion). Both surface `StreamError::Backpressure`; `send_with_retry` absorbs transient pressure as receiver `StreamWindow` grants replenish credit. Regression: a serial sender on a small window must hit Backpressure (never `Transport(io::Error)`) and `credit_grants_received` must advance. |
 | **Channel fan-out** | `ChannelPublisher` + `SubscriberRoster` over `SUBPROTOCOL_CHANNEL_MEMBERSHIP` — subscribe, publish fan-out reaches every subscriber, unsubscribe + peer-fail eviction from the roster |
 | **Partition** | Detection via filter, healing with data flow recovery, asymmetric 3-node partition |
 
@@ -870,7 +870,7 @@ cargo bench --bench parallel
 | `0x0800..0x0801` | Partition / reconciliation |
 | `0x0900` | Replica group coordination (reserved) |
 | `0x0A00` | Channel membership (subscribe / unsubscribe / ack) |
-| `0x0B00` | Stream credit window (v2 backpressure, reserved — see [`STREAM_BACKPRESSURE_PLAN_V2.md`](docs/STREAM_BACKPRESSURE_PLAN_V2.md)) |
+| `0x0B00` | Stream credit window (v2 backpressure — receiver→sender grants, 12-byte fixed message; see [`STREAM_BACKPRESSURE_PLAN_V2.md`](docs/STREAM_BACKPRESSURE_PLAN_V2.md)) |
 | `0x1000..0xEFFF` | Vendor / third-party |
 | `0xF000..0xFFFF` | Experimental / ephemeral |
 

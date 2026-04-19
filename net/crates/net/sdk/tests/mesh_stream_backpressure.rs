@@ -59,13 +59,18 @@ async fn test_sdk_surfaces_backpressure_variant() {
     b.inner().start();
 
     let a = Arc::new(a);
+    // v2 wire-bytes accounting: each packet on the wire costs
+    // 64 B Net header + 16 B AEAD tag + 6 B payload (2 B `{}` + 4 B
+    // EventFrame length) = 86 B. A 96-byte window fits exactly one
+    // packet; concurrent callers race for the same window and
+    // surface Backpressure just like v1.
     let stream = a
         .open_stream(
             nid_b,
             0x1337,
             StreamConfig::new()
                 .with_reliability(Reliability::FireAndForget)
-                .with_window_bytes(1),
+                .with_window_bytes(96),
         )
         .expect("open_stream");
 
@@ -98,7 +103,7 @@ async fn test_sdk_surfaces_backpressure_variant() {
     assert!(ok > 0);
 
     let stats = a.stream_stats(nid_b, 0x1337).expect("stats");
-    assert_eq!(stats.tx_window, 1);
+    assert_eq!(stats.tx_window, 96);
     assert!(stats.backpressure_events >= bp as u64);
 
     // Shutdown — consume the Arc.
@@ -127,8 +132,12 @@ async fn test_sdk_send_with_retry_succeeds_through_backpressure() {
     b.inner().start();
 
     let a = Arc::new(a);
+    // v2 wire-bytes window: 512 bytes ≈ 5 × (80 B overhead + small
+    // payload) — enough for a handful of packets concurrently, but
+    // small enough that retries have to wait for receiver-driven
+    // StreamWindow grants to free credit.
     let stream = a
-        .open_stream(nid_b, 0x2468, StreamConfig::new().with_window_bytes(4))
+        .open_stream(nid_b, 0x2468, StreamConfig::new().with_window_bytes(512))
         .unwrap();
 
     let mut handles = Vec::new();
@@ -145,7 +154,13 @@ async fn test_sdk_send_with_retry_succeeds_through_backpressure() {
     }
 
     let stats = a.stream_stats(nid_b, 0x2468).unwrap();
-    assert_eq!(stats.tx_inflight, 0);
+    // What matters is that the retry path actually engaged — i.e.
+    // some concurrent callers hit Backpressure and `send_with_retry`
+    // absorbed it. `tx_credit_remaining` at end-of-run is unstable
+    // (can legitimately land at 0 if the last commit happened between
+    // the last grant and the snapshot), so we assert on the bumped
+    // rejection counter instead.
+    assert!(stats.backpressure_events > 0);
 
     Arc::try_unwrap(a).ok().unwrap().shutdown().await.unwrap();
     b.shutdown().await.unwrap();

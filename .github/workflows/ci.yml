@@ -8,8 +8,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: Test
+  unit-tests:
+    name: Unit tests
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -29,10 +29,171 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             net/crates/net/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-unit-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run unit tests
-        run: cargo test --lib --all-features
+        run: cargo test --lib --features "net redex cortex netdb"
+
+  integration-tests:
+    name: Integration tests (net, 3-node, migration, RedEX, CortEX, NetDB)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: net/crates/net
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock') }}
+
+      # redis and jetstream integration tests are intentionally skipped:
+      # `required-features = ["redis" | "jetstream"]` in Cargo.toml excludes
+      # them from compilation under this feature set. Wire them in separately
+      # once CI service containers are added.
+      - name: Net integration
+        run: cargo test --test integration_net --features net
+      - name: Migration integration
+        run: cargo test --test migration_integration --features net
+      - name: Three-node integration
+        run: cargo test --test three_node_integration --features net
+      - name: RedEX integration
+        run: cargo test --test integration_redex --features redex
+      - name: CortEX adapter integration
+        run: cargo test --test integration_cortex_adapter --features cortex
+      - name: CortEX tasks integration
+        run: cargo test --test integration_cortex_tasks --features cortex
+      - name: CortEX memories integration
+        run: cargo test --test integration_cortex_memories --features cortex
+      - name: NetDB integration
+        run: cargo test --test integration_netdb --features netdb
+
+  rust-sdk-tests:
+    name: Rust SDK tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: net/crates/net/sdk
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-sdk-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run Rust SDK tests (includes mesh_stream_backpressure)
+        run: cargo test --features net
+
+  node-tests:
+    name: Node bindings tests (vitest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: net/crates/net/bindings/node
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-node-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install npm dependencies
+        run: npm install
+
+      # Build napi binding with the features the vitest suite covers:
+      # `net` for the mesh surface + `cortex` for the CortEX / NetDB tests.
+      # `cortex` transitively enables redex + netdb via the binding's
+      # feature graph. Skip the `redis` default — the Node suite doesn't
+      # hit it, and pulling it in would need a service container.
+      - name: Build native module
+        run: npm run build:debug -- --no-default-features --features net,cortex
+
+      - name: Run tests
+        run: npm test
+
+  python-tests:
+    name: Python bindings tests (pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: net/crates/net/bindings/python
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-python-${{ hashFiles('**/Cargo.lock') }}
+
+      # maturin develop requires a virtualenv (refuses to install into
+      # the system Python). Create one and prepend it to PATH so every
+      # subsequent step resolves `maturin`, `pip`, `pytest`, and the
+      # installed `net` extension from the venv.
+      - name: Create virtualenv
+        run: |
+          python -m venv .venv
+          echo "${PWD}/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=${PWD}/.venv" >> "$GITHUB_ENV"
+
+      - name: Install maturin and pytest
+        run: pip install --upgrade pip maturin pytest
+
+      # `net,cortex` mirrors the Node binding's feature set; skip the
+      # default `redis` feature for the same reason.
+      - name: Build and install bindings
+        run: maturin develop --no-default-features --features net,cortex
+
+      - name: Run tests
+        run: pytest -v
 
   clippy:
     name: Clippy
@@ -57,10 +218,10 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             net/crates/net/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run clippy
-        run: cargo clippy --all-features -- -D warnings
+        run: cargo clippy --all-features --all-targets -- -D warnings
 
   fmt:
     name: Format
@@ -100,7 +261,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             net/crates/net/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-doc-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build documentation
         run: cargo doc --no-deps --all-features

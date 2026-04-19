@@ -130,7 +130,10 @@ pub use state::{
     LogIndex, ObservedHorizon, SnapshotStore, StateSnapshot, CAUSAL_LINK_SIZE, SUBPROTOCOL_CAUSAL,
     SUBPROTOCOL_SNAPSHOT,
 };
-pub use stream::{CloseBehavior, Reliability, Stream, StreamConfig, StreamError, StreamStats};
+pub use stream::{
+    CloseBehavior, Reliability, Stream, StreamConfig, StreamError, StreamStats,
+    DEFAULT_STREAM_WINDOW_BYTES,
+};
 pub use subnet::{DropReason, ForwardDecision, SubnetGateway, SubnetId, SubnetPolicy, SubnetRule};
 pub use subprotocol::{
     negotiate, MigrationSubprotocolHandler, NegotiatedSet, OutboundMigrationMessage,

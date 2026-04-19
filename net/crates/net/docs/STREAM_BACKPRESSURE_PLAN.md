@@ -2,9 +2,7 @@
 
 ## Status
 
-**v1 shipped.** `StreamError::Backpressure` is now a real signal: `send_on_stream` returns it when a per-stream in-flight counter would exceed the stream's `tx_window`, admission is a CAS loop, the slot is released via an RAII guard that survives async cancellation, `backpressure_events` counts rejections in `StreamStats`, and the Rust/TS/Python SDKs wrap `send_with_retry` / `send_blocking` with exponential backoff + a `BackpressureError` class/exception. v1 catches **concurrent callers** racing on the same stream; a serial sender outrunning a slow receiver across the network still surfaces as `Transport(io::Error)`.
-
-**v2 is the network-speed extension** — round-trip credit windows via `SUBPROTOCOL_STREAM_WINDOW = 0x0B00`. Same `StreamError::Backpressure` variant, same SDK helpers, same daemon patterns. Only the internal condition that triggers Backpressure moves from "local counter full" to "no credit from peer." Design: [`STREAM_BACKPRESSURE_PLAN_V2.md`](STREAM_BACKPRESSURE_PLAN_V2.md).
+**v1 + v2 shipped.** `StreamError::Backpressure` now fires on both concurrent-caller races (v1) and network-speed overruns (v2: receiver-driven byte credit windows via `SUBPROTOCOL_STREAM_WINDOW = 0x0B00`). Same error variant, same SDK helpers, same daemon patterns. The admission unit is bytes, not packets; `StreamConfig::window_bytes` is now the initial credit window and defaults to 64 KB. Design details: [`STREAM_BACKPRESSURE_PLAN_V2.md`](STREAM_BACKPRESSURE_PLAN_V2.md).
 
 ---
 

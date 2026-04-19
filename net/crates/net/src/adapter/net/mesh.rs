@@ -53,12 +53,32 @@ use super::channel::{
     PublishConfig, PublishReport, SubscriberRoster,
 };
 use super::compute::SUBPROTOCOL_MIGRATION;
-use super::protocol::{self, EventFrame, PacketFlags, MAGIC};
+use super::protocol::{self, EventFrame, PacketFlags, HEADER_SIZE, MAGIC, TAG_SIZE};
+
+/// Wire overhead added to the AEAD-encrypted payload by every Net
+/// packet: the 64-byte header plus the 16-byte Poly1305 tag. Credit
+/// accounting charges this against the sender's `tx_credit_remaining`
+/// alongside the payload so the byte window matches the bandwidth
+/// the sender actually pumps onto the link. The receiver's
+/// `on_bytes_consumed` adds the same overhead, keeping sender and
+/// receiver in lockstep.
+const PACKET_WIRE_OVERHEAD: usize = HEADER_SIZE + TAG_SIZE;
+
+/// Total wire bytes for a single Net packet carrying `payload_bytes`
+/// of AEAD-encrypted content. Saturating at `u32::MAX` so a
+/// pathological `payload_bytes` can't silently wrap the credit math.
+#[inline]
+fn wire_bytes_for_payload(payload_bytes: usize) -> u32 {
+    payload_bytes
+        .saturating_add(PACKET_WIRE_OVERHEAD)
+        .min(u32::MAX as usize) as u32
+}
 use super::reroute::ReroutePolicy;
 use super::route::{RoutingHeader, ROUTING_HEADER_SIZE};
 use super::router::{NetRouter, RouterConfig};
-use super::session::{NetSession, TxAdmit};
+use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
+use super::subprotocol::stream_window::{StreamWindow, SUBPROTOCOL_STREAM_WINDOW};
 use super::subprotocol::MigrationSubprotocolHandler;
 use super::transport::{NetSocket, PacketReceiver, ParsedPacket, SocketBufferConfig};
 use tokio::sync::oneshot;
@@ -1233,6 +1253,42 @@ impl MeshNode {
             // No handler set — fall through to standard event path
         }
 
+        // Stream-window credit grant: apply to the named stream's
+        // `tx_credit_remaining` without touching the inbound event
+        // queue. The grant payload is an event frame carrying a
+        // 12-byte `StreamWindow` message.
+        if parsed.header.subprotocol_id == SUBPROTOCOL_STREAM_WINDOW {
+            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            if let Some(payload) = events.into_iter().next() {
+                match StreamWindow::decode(&payload) {
+                    Ok(grant) => {
+                        // Quarantine guard: a grant that arrives for a
+                        // stream closed within `GRANT_QUARANTINE_WINDOW`
+                        // is dropped, even if the stream has already been
+                        // reopened with the same id. Without this the
+                        // in-flight grant from the *previous* lifetime
+                        // would spuriously credit the new `StreamState`
+                        // and let the sender exceed its intended window.
+                        // Grants for closed / unknown streams are also
+                        // dropped silently — the sender will time out on
+                        // its own.
+                        if session.is_grant_quarantined(grant.stream_id) {
+                            tracing::debug!(
+                                stream_id = format!("{:#x}", grant.stream_id),
+                                "dropping StreamWindow grant for recently-closed stream"
+                            );
+                        } else if let Some(state) = session.try_stream(grant.stream_id) {
+                            state.apply_authoritative_grant(grant.total_consumed);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "malformed StreamWindow grant");
+                    }
+                }
+            }
+            return;
+        }
+
         // Channel membership: Subscribe / Unsubscribe / Ack.
         if parsed.header.subprotocol_id == SUBPROTOCOL_CHANNEL_MEMBERSHIP {
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
@@ -1253,7 +1309,13 @@ impl MeshNode {
             return;
         }
 
-        // Standard event path: parse event frames and queue
+        // Standard event path: parse event frames and queue.
+        //
+        // Credit accounting charges the full on-wire size (Net
+        // header + AEAD tag + payload) so sender and receiver stay
+        // symmetric — the sender debits the same quantity via
+        // `wire_bytes_for_payload` on admission.
+        let payload_bytes = (decrypted.len() + PACKET_WIRE_OVERHEAD) as u64;
         let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
 
         let stream_id = parsed.header.stream_id;
@@ -1263,12 +1325,51 @@ impl MeshNode {
             0
         };
 
-        {
+        // Credit-window bookkeeping: charge only *accepted* inbound
+        // bytes against the stream's RxCreditState. `on_receive`
+        // returns `false` for duplicates (already-acked sequences)
+        // and for sequences past the Reliable receive window —
+        // crediting those would refund send credit for
+        // retransmissions / replays, letting a chatty peer inflate
+        // `tx_credit_remaining` past what it actually pushed through
+        // the protocol. Accounting runs at receive time (not drain
+        // time); this closes the v1 gap where a single serial sender
+        // ran `Transport(io::Error)` into a full kernel buffer. A
+        // separately slow daemon is still backstopped by the
+        // existing shard-queue-depth limits.
+        let grant_bytes = {
             let stream = session.get_or_create_stream(stream_id);
-            stream.with_reliability(|r| {
-                r.on_receive(parsed.header.sequence);
-            });
-            stream.update_rx_seq(parsed.header.sequence);
+            let accepted = stream.with_reliability(|r| r.on_receive(parsed.header.sequence));
+            if accepted {
+                stream.update_rx_seq(parsed.header.sequence);
+                stream.on_bytes_consumed(payload_bytes)
+            } else {
+                None
+            }
+        };
+
+        if let Some(total_consumed) = grant_bytes {
+            // Resolve the sending peer via two O(1) DashMap lookups
+            // (`addr_to_node` → `peers`) instead of a linear scan over
+            // `ctx.peers`. At high peer counts the scan would make
+            // packet receive cost proportional to peer count — the
+            // hot path needs to stay constant-time.
+            let peer_addr = session.peer_addr();
+            if let Some((peer_addr, peer_session)) =
+                ctx.addr_to_node.get(&peer_addr).and_then(|node_id| {
+                    ctx.peers
+                        .get(&*node_id)
+                        .map(|p| (p.value().addr, p.value().session.clone()))
+                })
+            {
+                Self::spawn_stream_window_grant(
+                    ctx,
+                    peer_session,
+                    peer_addr,
+                    stream_id,
+                    total_consumed,
+                );
+            }
         }
 
         let queue = inbound.entry(shard_id).or_default();
@@ -1279,6 +1380,60 @@ impl MeshNode {
             let _ = write!(event_id, "{}:{}", seq, i);
             queue.push(StoredEvent::new(event_id, event_data, seq, shard_id));
         }
+    }
+
+    /// Emit a `StreamWindow` credit grant back to `peer_addr` on the
+    /// existing encrypted session. Fire-and-forget — grants are
+    /// **authoritative**, so a lost grant is reconciled by the next
+    /// one that successfully arrives (each carries the receiver's
+    /// full `total_consumed` picture).
+    ///
+    /// The grant packet rides on the sentinel [`CONTROL_STREAM_ID`]
+    /// (`u64::MAX`) with a sequence drawn from
+    /// `NetSession::next_control_tx_seq`. This is a dedicated
+    /// session-level counter that cannot collide with user stream
+    /// state — a caller who opens a stream numerically equal to
+    /// `SUBPROTOCOL_STREAM_WINDOW` (0x0B00) won't see their
+    /// sequence space polluted by control traffic.
+    fn spawn_stream_window_grant(
+        ctx: &DispatchCtx,
+        session: Arc<NetSession>,
+        peer_addr: SocketAddr,
+        stream_id: u64,
+        total_consumed: u64,
+    ) {
+        if ctx.partition_filter.contains(&peer_addr) {
+            return;
+        }
+        let socket = ctx.socket.clone();
+        tokio::spawn(async move {
+            let payload = StreamWindow {
+                stream_id,
+                total_consumed,
+            }
+            .encode();
+            let pool = session.thread_local_pool();
+            let mut builder = pool.get();
+            let seq = session.next_control_tx_seq();
+            let events = vec![Bytes::copy_from_slice(&payload)];
+            let packet = builder.build_subprotocol(
+                CONTROL_STREAM_ID,
+                seq,
+                &events,
+                PacketFlags::NONE,
+                SUBPROTOCOL_STREAM_WINDOW,
+            );
+            if let Err(e) = socket.send_to(&packet, peer_addr).await {
+                tracing::debug!(error = %e, "StreamWindow grant send failed");
+                return;
+            }
+            // Grant reached the wire — count it on the emitting
+            // stream so the receiver side of stats reflects
+            // cumulative grants sent.
+            if let Some(state) = session.try_stream(stream_id) {
+                state.note_grant_sent();
+            }
+        });
     }
 
     /// Spawn heartbeat sender for all peers.
@@ -1939,12 +2094,33 @@ impl MeshNode {
         }
 
         // Ensure a stream is open with the right reliability mode.
+        // `open_stream_with` seeds the stream with
+        // `DEFAULT_STREAM_WINDOW_BYTES` so publish traffic rides
+        // the same v2 byte-credit window as `send_on_stream`.
         session.open_stream_with(stream_id, reliable, 1);
 
-        let seq = {
-            let stream = session.get_or_create_stream(stream_id);
-            stream.next_tx_seq()
+        // Charge credit on the wire-byte size of the packet we're
+        // about to build. The `TxSlotGuard` refunds on Drop unless
+        // we `commit()` after a successful socket send, so a failed
+        // send doesn't strand credit.
+        let payload_bytes: usize = events.iter().map(|e| EventFrame::LEN_SIZE + e.len()).sum();
+        let needed = wire_bytes_for_payload(payload_bytes);
+        let (guard, seq) = match session.try_acquire_tx_credit_guard(stream_id, needed) {
+            TxAdmit::Acquired { guard, seq } => (guard, seq),
+            TxAdmit::WindowFull => {
+                return Err(AdapterError::Connection(format!(
+                    "publish: stream {:#x} backpressured",
+                    stream_id
+                )));
+            }
+            TxAdmit::StreamClosed => {
+                return Err(AdapterError::Connection(format!(
+                    "publish: stream {:#x} closed",
+                    stream_id
+                )));
+            }
         };
+
         let pool = session.thread_local_pool();
         let mut builder = pool.get();
         let packet = builder.build_subprotocol(
@@ -1965,6 +2141,7 @@ impl MeshNode {
             .send_to(&packet, next_hop)
             .await
             .map_err(|e| AdapterError::Connection(format!("publish send failed: {}", e)))?;
+        guard.commit(); // wire-accepted — bytes now belong to the receiver
 
         drop(builder);
         session.touch();
@@ -2153,44 +2330,49 @@ impl MeshNode {
         let mut current_batch: Vec<Bytes> = Vec::with_capacity(64);
         let mut current_size = 0usize;
 
-        // Each socket send consumes one tx_window slot: acquire before
-        // building the packet, release after the socket send (success
-        // or failure). Failure to acquire immediately surfaces
-        // `StreamError::Backpressure` — no packets in this call have
-        // been sent yet, so the caller can cleanly retry or drop. If
-        // the stream disappears mid-call (e.g., another task races a
-        // `close_stream`), we surface `NotConnected`.
+        // Each socket send acquires byte credit from the stream's
+        // `tx_credit_remaining`. On success we `commit()` the guard —
+        // the bytes now belong to the receiver, which will refund via
+        // `StreamWindow` grants once it drains them. On any failure
+        // (socket error, cancellation, `close_stream` race) the guard
+        // drops without commit and refunds the bytes — the bytes
+        // never hit the wire, so pretending they did would strand
+        // credit. `NotConnected` is surfaced when the stream
+        // disappears mid-call.
         let flags = if reliable {
             PacketFlags::RELIABLE
         } else {
             PacketFlags::NONE
         };
 
-        // Admit + send + release on one-packet scope. The `_guard`
-        // binding is the RAII release: if the `.await` is cancelled
-        // (`tokio::select!` races a shutdown signal, caller drops the
-        // future) the guard's Drop still fires and decrements
-        // `tx_inflight`. Without this the slot would leak.
         for event in events {
             let frame_size = EventFrame::LEN_SIZE + event.len();
             if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE && !current_batch.is_empty() {
-                let (guard, seq) = match session
-                    .try_acquire_tx_slot_guard_matching_epoch(stream_id, stream.epoch)
-                {
-                    TxAdmit::Acquired(g) => {
-                        let seq = session
-                            .try_stream(stream_id)
-                            .ok_or(StreamError::NotConnected)?
-                            .next_tx_seq();
-                        (g, seq)
-                    }
+                // Charge the **wire size** (Net header + AEAD tag +
+                // payload) rather than just the event-frame payload
+                // so the byte window matches the bandwidth the sender
+                // actually pumps onto the link. Both ends add the
+                // same fixed per-packet overhead, so sender and
+                // receiver accounting stay symmetric.
+                //
+                // `TxAdmit::Acquired` returns credit + sequence under
+                // the same DashMap lookup — a close+reopen race can't
+                // slip a stale sequence from the old lifetime onto
+                // the new state.
+                let needed = wire_bytes_for_payload(current_size);
+                let (guard, seq) = match session.try_acquire_tx_credit_matching_epoch(
+                    stream_id,
+                    stream.epoch,
+                    needed,
+                ) {
+                    TxAdmit::Acquired { guard, seq } => (guard, seq),
                     TxAdmit::WindowFull => return Err(StreamError::Backpressure),
                     TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
                 };
                 let packet = builder.build(stream_id, seq, &current_batch, flags);
                 let send_res = self.socket.send_to(&packet, peer_addr).await;
-                drop(guard); // explicit — RAII also fires on cancellation
                 send_res.map_err(|e| StreamError::Transport(format!("send failed: {}", e)))?;
+                guard.commit(); // socket accepted the packet — bytes are the receiver's now
                 current_batch.clear();
                 current_size = 0;
             }
@@ -2199,22 +2381,18 @@ impl MeshNode {
         }
 
         if !current_batch.is_empty() {
+            let needed = wire_bytes_for_payload(current_size);
             let (guard, seq) =
-                match session.try_acquire_tx_slot_guard_matching_epoch(stream_id, stream.epoch) {
-                    TxAdmit::Acquired(g) => {
-                        let seq = session
-                            .try_stream(stream_id)
-                            .ok_or(StreamError::NotConnected)?
-                            .next_tx_seq();
-                        (g, seq)
-                    }
+                match session.try_acquire_tx_credit_matching_epoch(stream_id, stream.epoch, needed)
+                {
+                    TxAdmit::Acquired { guard, seq } => (guard, seq),
                     TxAdmit::WindowFull => return Err(StreamError::Backpressure),
                     TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
                 };
             let packet = builder.build(stream_id, seq, &current_batch, flags);
             let send_res = self.socket.send_to(&packet, peer_addr).await;
-            drop(guard);
             send_res.map_err(|e| StreamError::Transport(format!("send failed: {}", e)))?;
+            guard.commit();
         }
 
         drop(builder);
@@ -2281,8 +2459,10 @@ impl MeshNode {
             last_activity_ns: state.last_activity_ns(),
             active: state.is_active(),
             backpressure_events: state.backpressure_events(),
-            tx_inflight: state.tx_inflight(),
+            tx_credit_remaining: state.tx_credit_remaining(),
             tx_window: state.tx_window(),
+            credit_grants_received: state.credit_grants_received(),
+            credit_grants_sent: state.credit_grants_sent(),
         })
     }
 
@@ -2309,8 +2489,10 @@ impl MeshNode {
                         last_activity_ns: state.last_activity_ns(),
                         active: state.is_active(),
                         backpressure_events: state.backpressure_events(),
-                        tx_inflight: state.tx_inflight(),
+                        tx_credit_remaining: state.tx_credit_remaining(),
                         tx_window: state.tx_window(),
+                        credit_grants_received: state.credit_grants_received(),
+                        credit_grants_sent: state.credit_grants_sent(),
                     },
                 ))
             })

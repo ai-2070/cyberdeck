@@ -245,7 +245,7 @@ When processing can be offloaded to the mesh, edge devices don't need to be smar
 
 A sensor node doesn't need a GPU to run inference. It needs a network interface and a microcontroller. It streams raw data into the mesh and the mesh routes the processing to a node that has the capability. A camera doesn't need to run object detection. A thermostat doesn't need to run a language model. A brake sensor doesn't need to run path planning. They produce data. The mesh finds compute.
 
-The entire transport library — Noise protocol, ChaCha20-Poly1305 encryption, routing, swarm discovery, failure detection, capability system — compiles to ~840 KB stripped. Under a megabyte. It fits on anything with a network interface.
+The entire transport library — Noise protocol, ChaCha20-Poly1305 encryption, routing, swarm discovery, failure detection, capability system — compiles to ~1MB stripped. Under a megabyte. It fits on anything with a network interface.
 
 This inverts the economics of edge deployment. Today, every device that needs intelligence must contain intelligence — or pay for a round trip to a cloud that does. That means expensive hardware at the edge, or latency to a data center, or both. Net eliminates this choice. Devices can be cheap, dumb, and deterministic. They do one thing well — sense, actuate, relay — and the mesh provides the intelligence dynamically.
 
@@ -368,7 +368,7 @@ Net is a working protocol, not a paper design. 1,146 tests across the Rust core,
 - **Handshake as a routed Net packet.** A node with no direct UDP path to its peer completes a Noise NKpsk0 handshake through already-connected relays. Handshake packets carry the `HANDSHAKE` flag in the routing header and ride the same forwarding path as data packets — no dedicated subprotocol, no special-case wire format. The prologue binds the routing header's `(src, dest)` so relays cannot rebind a handshake to a different peer. Works end-to-end over multi-hop chains.
 - **Pingwave-driven distance-vector routing.** Every heartbeat cycle each node emits one 72-byte `EnhancedPingwave` to its direct peers. On receipt, X installs `(origin, via=forwarder, metric=hop_count+2)` into its `RoutingTable` and populates `ProximityGraph::edges` so `path_to()` returns real multi-hop paths. Four loop-avoidance rules: origin self-check (drop pingwaves claiming `origin == self`), `MAX_HOPS = 16` receive-time cap, split horizon on re-broadcast (never advertise a route back on the link used to reach it), and **unregistered-source rejection** (pingwaves from peers that haven't completed a handshake are dropped — prevents route/topology poisoning). Latency EWMA (`α = 1/8`) per `(origin, next_hop)` edge provides an equal-hop tie-breaker. `RoutingTable` is the authoritative source for `send_routed`; `ProximityGraph` feeds it and is the reroute-time fallback.
 - **Stream multiplexing.** Multiple independent streams per peer, each with its own sequence space, per-stream `StreamState`, and fairness weight (quantum multiplier) in the round-robin scheduler. Idempotent `open_stream`/`close_stream`, idle timeout + max-stream cap enforced by the heartbeat loop, public `stream_stats`/`all_stream_stats` accessors. `Reliability::{FireAndForget, Reliable}` selects per-stream delivery mode. A monotonic per-session epoch on each `StreamState` makes stale handles after close+reopen surface `NotConnected` instead of silently operating on a new stream.
-- **Stream back-pressure as a first-class signal.** `send_on_stream` returns `StreamError::Backpressure` when a per-stream in-flight counter would exceed the stream's configured `tx_window`; the admission decision is an atomic CAS and the slot is released via an RAII guard that survives async cancellation. Helpers `send_with_retry(stream, events, max_retries)` and `send_blocking(stream, events)` apply exponential backoff (5 ms → 200 ms) to `Backpressure` only — `Transport` errors are surfaced immediately. `StreamStats.backpressure_events` counts cumulative rejections for observability.
+- **Stream back-pressure as a first-class signal — concurrent callers AND slow receivers.** `send_on_stream` returns `StreamError::Backpressure` when the stream runs out of send credit. Credit is measured in **bytes**, seeded from `StreamConfig::window_bytes` (default 64 KB; `0` disables backpressure), decremented on each socket send via an atomic CAS, and replenished by receiver-driven `StreamWindow` grants over `SUBPROTOCOL_STREAM_WINDOW = 0x0B00`. `TxSlotGuard` refunds credit on Drop unless `commit()` has sealed a successful send — no credit leaks on async cancellation. The signal catches both concurrent callers racing on the same window AND a single serial sender outrunning a slow receiver across the network (the v1 gap where kernel-buffer-full would surface as `Transport(io::Error)`). Helpers `send_with_retry(stream, events, max_retries)` and `send_blocking(stream, events)` apply exponential backoff (5 ms → 200 ms) to `Backpressure` only — `Transport` errors are surfaced immediately. `StreamStats` surfaces `backpressure_events`, `tx_credit_remaining`, `credit_grants_received`, and `credit_grants_sent` for observability.
 - **Channel fan-out (daemon layer).** `ChannelPublisher` + `SubscriberRoster` + `SUBPROTOCOL_CHANNEL_MEMBERSHIP` (`0x0A00`) give daemons a typed pub/sub primitive built on N per-peer unicasts — no multicast packet, no group cryptography, no implicit "everyone" broadcast. `subscribe_channel` / `unsubscribe_channel` ride existing encrypted sessions; failed peers are auto-evicted from the roster by the failure detector. Three `OnFailure` policies (`BestEffort` / `FailFast` / `Collect`) let publishers pick per-peer error handling per call; bounded per-publish concurrency via a semaphore.
 - **Automatic rerouting.** When a relay node dies, the `ReroutePolicy` watches the failure detector and updates the routing table to route through an alternate peer. Resolution order per destination: `RoutingTable::lookup_alternate` (table's own non-excluded entry) → `ProximityGraph::path_to` (graph-based BFS) → any direct peer — so the routing table's own non-failed entries are preferred over a graph re-query. Alternates are picked **per destination** rather than shared across all affected routes, so a heterogeneous topology won't blackhole traffic through a peer that reaches some destinations but not others. When the failed peer recovers, the original route is restored. No manual intervention, no data loss across the reroute boundary.
 - **Failure detection over real sockets.** Heartbeat timeout → suspected → failed → recovered lifecycle, proven through the MeshNode runtime with configurable timing.
@@ -392,7 +392,6 @@ Net is a working protocol, not a paper design. 1,146 tests across the Rust core,
 **What needs protocol work:**
 
 - **Secure keypair transfer for migration.** The `DaemonFactoryRegistry` assumes the target has been provisioned with the daemon's `EntityKeypair` out-of-band (`KeyMode::PreProvisioned` is actionable today). `KeyMode::{Derived, Transfer}` and the Key Orchestrator / Key Agent control-plane that would run over CortEX are designed in [`KEY_MIGRATION_PLAN.md`](net/crates/net/docs/KEY_MIGRATION_PLAN.md) but not yet implemented — CortEX itself is forward-looking.
-- **Round-trip credit-window back-pressure (v2).** v1 back-pressure catches *concurrent callers* racing on the same stream via a local in-flight counter; it does not catch a single serial sender outrunning a slow receiver across the network. v2 extends the same `StreamError::Backpressure` signal to network-speed via per-stream credit windows (one `tx_credit_remaining` counter, `SUBPROTOCOL_STREAM_WINDOW = 0x0B00` receiver→sender grants). Daemon code does not change; only the internal condition that triggers Backpressure shifts from "local counter full" to "no credit from peer." Design: [`STREAM_BACKPRESSURE_PLAN_V2.md`](net/crates/net/docs/STREAM_BACKPRESSURE_PLAN_V2.md).
 
 **What we're deliberately not building:**
 
@@ -577,15 +576,21 @@ Benchmarks captured 2026-04-19 via `cargo bench --bench redex --features "redex 
 
 ### Binary size
 
-Release build with `--features net` only, LTO on, single codegen unit, `panic = "abort"`, `opt-level = 3`:
+`[profile.release]`: `lto = true`, `codegen-units = 1`, `panic = "abort"`, `opt-level = 3`. Three additional profiles ship in the crate's `Cargo.toml`: `release-with-debug` (release + `debug = true` for profiling), `native` (release + thin LTO for faster local links — pair with `RUSTFLAGS="-C target-cpu=native"`), and `bench` (full LTO, single codegen unit).
 
-| Artifact | Size | Purpose |
-|----------|-----:|---------|
-| `net.dll` (cdylib) | **848 KB** | Shipped binary; symbols stripped into `.pdb` on MSVC |
-| `net.pdb` | 1.6 MB | Debug symbols, shipped separately |
-| `libnet.rlib` | 17 MB | Rust static lib with metadata (consumed by Rust) |
-| `net.lib` | 29 MB | C/C++ static lib (pre-LTO, as expected for a `staticlib`) |
+Feature set affects `.rlib` and `.a` (which keep all compiled code for downstream linking) but is **almost invisible on the shipped cdylib** — LTO + dead-code elimination strips unreferenced code across feature boundaries, so the deployed `.dylib`/`.dll`/`.so` stays near-constant across feature combinations.
 
-Figures above accurate as of April 17, 2026.
+| Features | `libnet.dylib` (cdylib) | `libnet.rlib` | `libnet.a` |
+|----------|------------------------:|--------------:|-----------:|
+| `net` | **1.08 MB** | 18.5 MB | 32.7 MB |
+| `net` + `redex` | **1.08 MB** | 18.8 MB | 33.0 MB |
+| `net` + `redex` + `redex-disk` | **1.08 MB** | 18.9 MB | 33.1 MB |
+| `net` + `redex` + `redex-disk` + `cortex` | **1.08 MB** | 20.7 MB | 34.0 MB |
 
-Measured on `x86_64-pc-windows-msvc`. The shipped cdylib fits comfortably under 1 MB despite bundling transport, routing, encryption, identity, load balancing, and the full consumer pipeline.
+- `libnet.dylib` — shipped cdylib (consumed by Node / Python / C bindings).
+- `libnet.rlib` — Rust static lib with metadata (consumed by other Rust crates).
+- `libnet.a` — C/C++ static lib, pre-LTO, expected for `staticlib`.
+
+Measured on `aarch64-apple-darwin`, 2026-04-20.
+
+The shipped cdylib stays at **1.08 MB across all four feature configurations** — opting into RedEX, disk durability, or CortEX adds well under 1% to the deployed binary because dead-code elimination strips whatever the caller doesn't reference. The `.rlib` and `.a` grow with features because they must preserve every compiled symbol for downstream linkers; only the shipped cdylib feels the full benefit of LTO.
