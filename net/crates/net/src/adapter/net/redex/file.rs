@@ -903,4 +903,101 @@ mod tests {
         let err = stream.next().await.unwrap().unwrap_err();
         assert!(matches!(err, RedexError::Closed));
     }
+
+    // ---- Regression tests ----
+
+    #[test]
+    fn test_regression_offset_to_u32_boundary() {
+        // Regression: `offset_to_u32` used to be a silent truncation
+        // (`offset as u32`), which corrupted `RedexEntry::payload_offset`
+        // on long-running persistent files whose base_offset crossed
+        // `u32::MAX`. The fix converts the truncation into a
+        // `PayloadTooLarge` error at the exact boundary.
+        assert!(offset_to_u32(0).is_ok());
+        assert!(offset_to_u32(u32::MAX as u64).is_ok());
+        assert!(
+            offset_to_u32(u32::MAX as u64 + 1).is_err(),
+            "offsets above u32::MAX must surface an error, not silently truncate"
+        );
+        assert!(offset_to_u32(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn test_regression_append_fails_when_base_offset_overflows_u32() {
+        // Regression: single appends must surface the offset overflow
+        // rather than write a truncated `payload_offset`. We force
+        // `base_offset` past `u32::MAX` via the test-only hook and
+        // verify the next append returns `PayloadTooLarge`.
+        let f = make_file("t_off_overflow");
+        {
+            let mut state = f.inner.state.lock();
+            state.segment.force_base_offset(u32::MAX as u64 + 1);
+        }
+        // Any further append computes a start offset > u32::MAX and
+        // must surface `PayloadTooLarge` from `offset_to_u32`.
+        let err = f.append(b"x").unwrap_err();
+        assert!(matches!(err, RedexError::PayloadTooLarge { .. }));
+    }
+
+    #[test]
+    fn test_regression_batch_seq_gap_on_offset_overflow() {
+        // Regression: `append_batch` used to `fetch_add(batch_size)`
+        // before calling `segment.append`. If any append mid-batch
+        // failed, the seq range was allocated but no index entries
+        // were written — producing permanent gaps in seq space.
+        //
+        // The fix pre-validates capacity + final offset under the
+        // state lock, advancing `next_seq` only when every append is
+        // guaranteed to succeed. A failing batch must leave
+        // `next_seq` unchanged.
+        let f = make_file("t_batch_gap");
+        // One real append so `next_seq` starts at 1.
+        f.append(b"a").unwrap();
+        assert_eq!(f.next_seq(), 1);
+
+        // Push base_offset so a 2-payload batch of 8 bytes each
+        // would overflow u32.
+        {
+            let mut state = f.inner.state.lock();
+            state.segment.force_base_offset(u32::MAX as u64 - 4);
+        }
+
+        let err = f
+            .append_batch(&[
+                Bytes::from_static(b"aaaaaaaa"),
+                Bytes::from_static(b"bbbbbbbb"),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, RedexError::PayloadTooLarge { .. }));
+        // Critical assertion: next_seq did NOT advance. A naive
+        // pre-fix implementation would have `next_seq == 3` here.
+        assert_eq!(
+            f.next_seq(),
+            1,
+            "failing batch must not advance next_seq (would leak gap)"
+        );
+    }
+
+    #[test]
+    fn test_regression_ordered_batch_seq_gap_on_offset_overflow() {
+        // Same contract as `test_regression_batch_seq_gap_on_offset_overflow`
+        // but for `append_batch_ordered`.
+        let f = make_file("t_obatch_gap");
+        f.append(b"a").unwrap();
+        assert_eq!(f.next_seq(), 1);
+
+        {
+            let mut state = f.inner.state.lock();
+            state.segment.force_base_offset(u32::MAX as u64 - 4);
+        }
+
+        let err = f
+            .append_batch_ordered(&[
+                Bytes::from_static(b"aaaaaaaa"),
+                Bytes::from_static(b"bbbbbbbb"),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, RedexError::PayloadTooLarge { .. }));
+        assert_eq!(f.next_seq(), 1);
+    }
 }

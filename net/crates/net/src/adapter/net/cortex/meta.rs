@@ -143,6 +143,31 @@ mod tests {
     }
 
     #[test]
+    fn test_regression_pad_is_zeroed_on_write() {
+        // Regression: `to_bytes` used to copy `self._pad` verbatim
+        // into the output buffer. The struct doc says "reserved;
+        // must be zero on write, ignored on read" — but `_pad` is
+        // `pub`, so a caller constructing `EventMeta` via struct
+        // literal syntax could stamp non-zero pad into the wire
+        // format. The fix leaves bytes [2..4] as zero regardless of
+        // struct contents.
+        let m = EventMeta {
+            dispatch: 0x42,
+            flags: 0,
+            _pad: [0xAA, 0xBB], // non-zero — would leak on write
+            origin_hash: 0xDEAD_BEEF,
+            seq_or_ts: 1,
+            checksum: 0,
+        };
+        let bytes = m.to_bytes();
+        assert_eq!(
+            &bytes[2..4],
+            &[0u8, 0u8],
+            "pad bytes must be zero on write regardless of struct contents"
+        );
+    }
+
+    #[test]
     fn test_zero_roundtrip() {
         let m = EventMeta::new(0, 0, 0, 0, 0);
         let decoded = EventMeta::from_bytes(&m.to_bytes()).unwrap();

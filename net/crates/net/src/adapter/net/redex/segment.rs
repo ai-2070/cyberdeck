@@ -102,6 +102,16 @@ impl HeapSegment {
         self.base_offset
     }
 
+    /// Test-only: forcibly set the absolute base offset without
+    /// touching the buffer. Used to simulate a long-lifetime file
+    /// where eviction has pushed `base_offset` near `u32::MAX`,
+    /// triggering the overflow path in `file.rs::offset_to_u32` and
+    /// the pre-validation in `append_batch` / `append_batch_ordered`.
+    #[cfg(test)]
+    pub(super) fn force_base_offset(&mut self, base: u64) {
+        self.base_offset = base;
+    }
+
     /// Evict the prefix of the segment strictly below `new_base` in
     /// the absolute offset space.
     ///

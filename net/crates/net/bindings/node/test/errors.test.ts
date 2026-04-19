@@ -93,3 +93,42 @@ describe('error classification', () => {
     expect(n.name).toBe('NetDbError')
   })
 })
+
+describe('regression: BigInt boundary validation', () => {
+  // Regression: `bigint_u64` in the napi layer used to silently drop
+  // the `signed` + `lossless` flags from `BigInt::get_u64()`. A
+  // negative or >u64::MAX BigInt would then be silently truncated into
+  // a wrong u64 value — corrupting ids, timestamps, and sequences
+  // at the FFI boundary. The fix rejects both cases with an explicit
+  // throw. These tests lock the behavior in place.
+
+  it('rejects a negative BigInt id', async () => {
+    const redex = new Redex()
+    const tasks = await TasksAdapter.open(redex, ORIGIN)
+    expect(() => tasks.create(-1n, 'x', nowNs())).toThrow(/non-negative/)
+  })
+
+  it('rejects a BigInt id that exceeds u64::MAX', async () => {
+    const redex = new Redex()
+    const tasks = await TasksAdapter.open(redex, ORIGIN)
+    // 2^65 > u64::MAX: `get_u64()` reports `lossless = false`.
+    expect(() => tasks.create(2n ** 65n, 'x', nowNs())).toThrow(/u64 range/)
+  })
+
+  it('rejects a negative BigInt timestamp', async () => {
+    const redex = new Redex()
+    const tasks = await TasksAdapter.open(redex, ORIGIN)
+    expect(() => tasks.create(1n, 'x', -100n)).toThrow(/non-negative/)
+  })
+
+  it('rejects an out-of-range BigInt on memories.store', async () => {
+    const redex = new Redex()
+    const memories = await MemoriesAdapter.open(redex, ORIGIN)
+    expect(() => memories.store(-1n, 'x', ['t'], 'src', nowNs())).toThrow(
+      /non-negative/,
+    )
+    expect(() =>
+      memories.store(2n ** 70n, 'x', ['t'], 'src', nowNs()),
+    ).toThrow(/u64 range/)
+  })
+})

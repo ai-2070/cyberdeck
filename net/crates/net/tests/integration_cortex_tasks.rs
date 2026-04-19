@@ -407,6 +407,31 @@ async fn test_watch_with_limit_and_order() {
 }
 
 #[tokio::test]
+async fn test_regression_open_from_snapshot_rejects_u64_max_last_seq() {
+    // Regression: `open_from_snapshot` used to compute `last_seq + 1`
+    // unchecked. A corrupted or malicious snapshot with
+    // `last_seq = u64::MAX` would panic in debug, wraparound to 0 in
+    // release, and silently resume tailing from seq 0 — replaying
+    // the entire log as "new". The fix uses `checked_add` and returns
+    // `CortexAdapterError::Redex(Encode)` on overflow.
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let (state_bytes, _) = tasks.snapshot().unwrap();
+    tasks.close().unwrap();
+
+    // Fresh Redex to avoid channel re-use interference.
+    let redex2 = Redex::new();
+    let result = TasksAdapter::open_from_snapshot(&redex2, ORIGIN, &state_bytes, Some(u64::MAX));
+    assert!(result.is_err(), "u64::MAX last_seq must be rejected");
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("u64::MAX"),
+        "error should mention u64::MAX overflow; got: {}",
+        msg
+    );
+}
+
+#[tokio::test]
 async fn test_regression_checksum_is_computed_not_zero() {
     // Regression: `EventMeta::checksum` used to be hardcoded to 0 in
     // the tasks adapter's `ingest_typed`. The documented contract
