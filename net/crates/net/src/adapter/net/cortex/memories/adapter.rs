@@ -179,6 +179,28 @@ impl MemoriesAdapter {
         MemoriesWatcher::new(self.inner.state(), self.inner.changes().boxed())
     }
 
+    /// One-shot combo: a snapshot of the current filter result PLUS
+    /// a stream that emits every **subsequent** change to that
+    /// filter. The stream skips the initial emission so the caller
+    /// doesn't see the snapshot twice — the snapshot is the initial
+    /// state; the stream carries deltas from there forward.
+    pub fn snapshot_and_watch(
+        &self,
+        watcher: MemoriesWatcher,
+    ) -> (
+        Vec<super::types::Memory>,
+        std::pin::Pin<Box<dyn futures::Stream<Item = Vec<super::types::Memory>> + Send + 'static>>,
+    ) {
+        use futures::StreamExt;
+        let initial = {
+            let state = self.inner.state();
+            let guard = state.read();
+            watcher.spec_for_snapshot().execute(&guard)
+        };
+        let stream = watcher.stream().skip(1).boxed();
+        (initial, stream)
+    }
+
     /// Capture a snapshot suitable for restore. Returns
     /// `(state_bytes, last_seq)` — persist both together.
     pub fn snapshot(&self) -> Result<(Vec<u8>, Option<u64>), CortexAdapterError> {

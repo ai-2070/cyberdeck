@@ -2,6 +2,36 @@
 
 use std::time::Duration;
 
+/// Disk-side fsync policy for persistent `RedexFile`s.
+///
+/// Governs **only** the append path on the disk mirror. `close()` and
+/// explicit `RedexFile::sync()` calls always fsync regardless of
+/// policy — these are the caller's explicit durability barriers.
+///
+/// | Policy | Process crash | Kernel / power crash |
+/// |--------|---------------|---------------------|
+/// | `Never` | Loses the tail since last close / `sync()` | Same |
+/// | `EveryN(N)` | Loses ≤ (N−1) entries from the last sync point | Same |
+/// | `Interval(d)` | Loses ≤ `d` seconds of writes | Same |
+///
+/// Default is [`FsyncPolicy::Never`], matching the pre-`FsyncPolicy`
+/// behavior — OS page cache only, fsync on close. Callers that need
+/// tighter bounds opt into `EveryN` or `Interval`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FsyncPolicy {
+    /// Never fsync on append. `close()` still syncs. Lowest latency;
+    /// fine for telemetry / best-effort logs.
+    #[default]
+    Never,
+    /// Fsync after every N successful appends. Bounds worst-case loss
+    /// at (N − 1) entries from the last sync point. `0` and `1` both
+    /// collapse to "fsync on every append."
+    EveryN(u64),
+    /// Fsync on a timer, independent of append rate. A per-file
+    /// background tokio task drives the sync; `close()` cancels it.
+    Interval(Duration),
+}
+
 /// Per-file configuration supplied at `Redex::open_file` time.
 #[derive(Debug, Clone, Copy)]
 pub struct RedexFileConfig {
@@ -15,6 +45,10 @@ pub struct RedexFileConfig {
     /// With `redex-disk` off, this field is silently ignored — the
     /// file is heap-only regardless.
     pub persistent: bool,
+
+    /// Disk fsync policy for persistent files. Ignored when
+    /// `persistent == false`. Defaults to [`FsyncPolicy::Never`].
+    pub fsync_policy: FsyncPolicy,
 
     /// Initial reservation hint for the heap payload segment. Used
     /// only as the capacity passed to the backing `Vec` on open,
@@ -48,6 +82,7 @@ impl Default for RedexFileConfig {
     fn default() -> Self {
         Self {
             persistent: false,
+            fsync_policy: FsyncPolicy::Never,
             max_memory_bytes: 64 * 1024 * 1024, // 64 MiB soft cap
             retention_max_events: None,
             retention_max_bytes: None,
@@ -65,6 +100,13 @@ impl RedexFileConfig {
     /// Enable persistent (disk-backed) storage.
     pub fn with_persistent(mut self, persistent: bool) -> Self {
         self.persistent = persistent;
+        self
+    }
+
+    /// Set the disk fsync policy. See [`FsyncPolicy`] for the
+    /// durability / latency trade-offs each variant offers.
+    pub fn with_fsync_policy(mut self, policy: FsyncPolicy) -> Self {
+        self.fsync_policy = policy;
         self
     }
 

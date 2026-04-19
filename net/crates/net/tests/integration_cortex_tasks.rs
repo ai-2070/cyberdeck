@@ -788,3 +788,43 @@ async fn test_persistent_tasks_recover_across_processes() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[tokio::test]
+async fn test_snapshot_and_watch_no_gap_no_dup() {
+    // Regression: `snapshot_and_watch` must (a) return a snapshot
+    // that already reflects the current filter result and (b) return
+    // a stream whose FIRST emission is the first *delta* — not the
+    // initial state again. Otherwise a UI consumer painting the
+    // snapshot and then subscribing would double-render the initial
+    // state.
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+
+    // Seed one pending task so the snapshot is non-empty.
+    let seq = tasks.create(1, "p1", 100).unwrap();
+    tasks.wait_for_seq(seq).await;
+
+    let watcher = tasks.watch().where_status(TaskStatus::Pending);
+    let (snapshot, mut stream) = tasks.snapshot_and_watch(watcher);
+    let snapshot_ids: Vec<_> = snapshot.iter().map(|t| t.id).collect();
+    assert_eq!(
+        snapshot_ids,
+        vec![1],
+        "snapshot must contain the pre-existing pending task"
+    );
+
+    // Add a second pending task; the stream's FIRST emission must be
+    // the updated filter result (with both ids), not the initial
+    // [1] that would indicate the stream replayed the snapshot.
+    let seq = tasks.create(2, "p2", 200).unwrap();
+    tasks.wait_for_seq(seq).await;
+
+    let delta = stream.next().await.expect("stream produced no delta");
+    let ids: Vec<_> = delta.iter().map(|t| t.id).collect();
+    assert!(
+        ids.contains(&1) && ids.contains(&2),
+        "first stream emission must reflect the post-change state, got {:?}",
+        ids,
+    );
+    assert_eq!(ids.len(), 2);
+}

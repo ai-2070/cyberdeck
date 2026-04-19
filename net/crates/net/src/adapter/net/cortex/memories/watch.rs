@@ -128,6 +128,18 @@ impl MemoriesWatcher {
         self
     }
 
+    /// Expose the filter spec for one-shot callers like
+    /// [`super::MemoriesAdapter::snapshot_and_watch`] that need to
+    /// execute the filter **once** against the current state before
+    /// handing the watcher off to stream subsequent changes.
+    pub(super) fn spec_for_snapshot(&self) -> MemoriesFilterSpec {
+        let mut spec = self.spec.clone();
+        if spec.order_by.is_none() {
+            spec.order_by = Some(OrderBy::IdAsc);
+        }
+        spec
+    }
+
     /// Start emitting. The stream yields:
     ///
     /// - The current filter result immediately (first element).

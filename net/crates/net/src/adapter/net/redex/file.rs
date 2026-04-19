@@ -18,9 +18,13 @@ use super::retention::compute_eviction_count;
 use super::segment::{HeapSegment, MAX_SEGMENT_BYTES};
 
 #[cfg(feature = "redex-disk")]
+use super::config::FsyncPolicy;
+#[cfg(feature = "redex-disk")]
 use super::disk::DiskSegment;
 #[cfg(feature = "redex-disk")]
 use std::path::Path;
+#[cfg(feature = "redex-disk")]
+use tokio::sync::Notify;
 
 /// A live tail subscription waiting for new events.
 struct TailWatcher {
@@ -54,6 +58,13 @@ struct RedexFileInner {
     closed: AtomicBool,
     #[cfg(feature = "redex-disk")]
     disk: Option<Arc<DiskSegment>>,
+    /// Shutdown signal for the `FsyncPolicy::Interval` background
+    /// task. `Some` iff an Interval task was spawned at
+    /// `open_persistent` time. `close()` calls `notify_waiters()`;
+    /// the task observes it, exits, and releases its DiskSegment
+    /// reference.
+    #[cfg(feature = "redex-disk")]
+    interval_shutdown: Option<Arc<Notify>>,
 }
 
 /// A handle to a RedEX file. Cheap to clone.
@@ -82,6 +93,8 @@ impl RedexFile {
                 closed: AtomicBool::new(false),
                 #[cfg(feature = "redex-disk")]
                 disk: None,
+                #[cfg(feature = "redex-disk")]
+                interval_shutdown: None,
             }),
         }
     }
@@ -101,7 +114,15 @@ impl RedexFile {
         config: RedexFileConfig,
         base_dir: &Path,
     ) -> Result<Self, RedexError> {
-        let recovered = DiskSegment::open(base_dir, &name)?;
+        // Derive the DiskSegment's append-side fsync cadence from
+        // the caller's policy. EveryN is honored on the append path;
+        // Never and Interval both pass 0 (Interval runs via the
+        // per-file background task spawned below).
+        let fsync_every_n = match config.fsync_policy {
+            FsyncPolicy::Never | FsyncPolicy::Interval(_) => 0,
+            FsyncPolicy::EveryN(n) => n.max(1),
+        };
+        let recovered = DiskSegment::open(base_dir, &name, fsync_every_n)?;
         let next_seq = recovered.index.last().map(|e| e.seq + 1).unwrap_or(0);
 
         let segment = HeapSegment::from_existing(recovered.payload_bytes);
@@ -117,6 +138,40 @@ impl RedexFile {
             watchers: Vec::new(),
         };
 
+        let disk = Arc::new(recovered.disk);
+
+        // Spawn the Interval background task (if requested). It holds
+        // an Arc<DiskSegment> and a clone of the shutdown Notify; on
+        // close() the notify fires and the task exits. Dropping the
+        // last RedexFile clone WITHOUT calling close() leaks the
+        // task until the runtime shuts down — consistent with the
+        // rest of the codebase's lifecycle expectations (callers are
+        // expected to `close()` persistent files).
+        let interval_shutdown = match config.fsync_policy {
+            FsyncPolicy::Interval(d) if d > std::time::Duration::ZERO => {
+                let shutdown = Arc::new(Notify::new());
+                let task_shutdown = shutdown.clone();
+                let task_disk = disk.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = task_shutdown.notified() => return,
+                            _ = tokio::time::sleep(d) => {
+                                if let Err(e) = task_disk.sync() {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "Interval fsync failed; continuing"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                });
+                Some(shutdown)
+            }
+            _ => None,
+        };
+
         Ok(Self {
             inner: Arc::new(RedexFileInner {
                 name,
@@ -124,7 +179,8 @@ impl RedexFile {
                 next_seq: AtomicU64::new(next_seq),
                 state: Mutex::new(state),
                 closed: AtomicBool::new(false),
-                disk: Some(Arc::new(recovered.disk)),
+                disk: Some(disk),
+                interval_shutdown,
             }),
         })
     }
@@ -548,10 +604,10 @@ impl RedexFile {
     /// assigned seq.
     ///
     /// This is the common "log-an-event and update a materialized
-    /// view in one step" pattern, without spinning up a full
-    /// [`super::super::cortex`] adapter. Callers maintain `state`
-    /// themselves; the fold closure sees the just-appended value
-    /// and mutates state in place.
+    /// view in one step" pattern, without spinning up a full CortEX
+    /// adapter. Callers maintain `state` themselves; the fold
+    /// closure sees the just-appended value and mutates state in
+    /// place.
     ///
     /// Note: the fold runs AFTER the RedEX append. If the append
     /// succeeds and the fold panics, the log advances but state is
@@ -701,7 +757,11 @@ impl RedexFile {
     }
 
     /// Close the file. Outstanding tail streams receive `RedexError::Closed`.
-    /// For persistent files, fsyncs the disk segment before returning.
+    /// For persistent files, fsyncs the disk segment before returning
+    /// and signals any `FsyncPolicy::Interval` background task to
+    /// exit. `close()` always fsyncs regardless of the per-file
+    /// `FsyncPolicy` — this is the caller's explicit durability
+    /// barrier.
     pub fn close(&self) -> Result<(), RedexError> {
         if self.inner.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
@@ -713,8 +773,15 @@ impl RedexFile {
         drop(state);
 
         #[cfg(feature = "redex-disk")]
-        if let Some(disk) = self.disk() {
-            disk.sync()?;
+        {
+            // Signal the Interval task to exit before fsyncing so
+            // `close()` isn't racing the task's own sync.
+            if let Some(shutdown) = self.inner.interval_shutdown.as_ref() {
+                shutdown.notify_waiters();
+            }
+            if let Some(disk) = self.disk() {
+                disk.sync()?;
+            }
         }
 
         Ok(())
@@ -727,6 +794,14 @@ impl RedexFile {
             disk.sync()?;
         }
         Ok(())
+    }
+
+    /// Test-only: cumulative successful `sync()` count on the disk
+    /// segment. `None` for heap-only files. Used by `FsyncPolicy`
+    /// tests to assert cadence without racing real I/O.
+    #[cfg(all(test, feature = "redex-disk"))]
+    pub fn sync_count(&self) -> Option<u64> {
+        self.disk().map(|d| d.sync_count())
     }
 
     #[cfg(feature = "redex-disk")]
@@ -1212,5 +1287,148 @@ mod tests {
             "batch disk failure must roll back the full seq range"
         );
         assert_eq!(f.len(), 1, "index must not grow on batch disk failure");
+    }
+
+    // ---- FsyncPolicy tests (Stage 1 of v2 closeout) ----
+
+    #[cfg(feature = "redex-disk")]
+    fn make_persistent_with_policy(
+        name: &str,
+        base: &std::path::Path,
+        policy: super::FsyncPolicy,
+    ) -> RedexFile {
+        let r = super::super::manager::Redex::new().with_persistent_dir(base);
+        r.open_file(
+            &ChannelName::new(name).unwrap(),
+            RedexFileConfig::default()
+                .with_persistent(true)
+                .with_fsync_policy(policy),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn test_fsync_policy_never_skips_append_syncs() {
+        // Never: no append-path fsync at all. Counter stays at 0 until
+        // an explicit `sync()` or `close()` triggers one.
+        let dir = tmp_persistent_dir("fsync_never");
+        let f = make_persistent_with_policy("fsync/never", &dir, super::FsyncPolicy::Never);
+        for i in 0..20u64 {
+            f.append(format!("n-{}", i).as_bytes()).unwrap();
+        }
+        assert_eq!(
+            f.sync_count(),
+            Some(0),
+            "Never must not fsync on the append path"
+        );
+        f.sync().unwrap();
+        assert_eq!(f.sync_count(), Some(1), "explicit sync() still works");
+    }
+
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn test_fsync_policy_every_n_syncs_on_cadence() {
+        // EveryN(5): exactly one sync per 5 appends. 23 appends → 4
+        // append-driven syncs (at append-count 5, 10, 15, 20); the
+        // trailing 3 don't trigger. close() adds one more.
+        let dir = tmp_persistent_dir("fsync_every_n");
+        let f = make_persistent_with_policy("fsync/everyn", &dir, super::FsyncPolicy::EveryN(5));
+        for i in 0..23u64 {
+            f.append(format!("e-{}", i).as_bytes()).unwrap();
+        }
+        assert_eq!(
+            f.sync_count(),
+            Some(4),
+            "EveryN(5) over 23 appends = 4 append-driven syncs"
+        );
+        f.close().unwrap();
+        assert_eq!(f.sync_count(), Some(5), "close() adds one more sync");
+    }
+
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn test_fsync_policy_every_n_clamps_zero_to_one() {
+        // EveryN(0) would never fire with a naïve implementation; the
+        // clamp at `open_persistent` maps 0 (and 1) to "fsync every
+        // append."
+        let dir = tmp_persistent_dir("fsync_every_n_zero");
+        let f =
+            make_persistent_with_policy("fsync/everyn_zero", &dir, super::FsyncPolicy::EveryN(0));
+        for i in 0..3u64 {
+            f.append(format!("e-{}", i).as_bytes()).unwrap();
+        }
+        assert_eq!(
+            f.sync_count(),
+            Some(3),
+            "EveryN(0) must fsync on every append (clamped to 1)"
+        );
+    }
+
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_fsync_policy_interval_fires_on_timer() {
+        // Interval drives fsync from a tokio background task. We use
+        // paused-time so the test is deterministic — advance time
+        // through three intervals, expect three syncs (give or take
+        // one scheduler hop).
+        let dir = tmp_persistent_dir("fsync_interval");
+        let f = make_persistent_with_policy(
+            "fsync/interval",
+            &dir,
+            super::FsyncPolicy::Interval(std::time::Duration::from_millis(50)),
+        );
+        // No appends yet, but the timer ticks anyway.
+        for _ in 0..3 {
+            tokio::time::advance(std::time::Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+        }
+        // The background task may be slightly ahead or behind the
+        // advance cursor; require at least 2 to avoid flakes on a
+        // busy runner.
+        let observed = f.sync_count().unwrap_or(0);
+        assert!(
+            observed >= 2,
+            "Interval(50ms) after 150ms of advance expected ≥ 2 syncs, got {}",
+            observed,
+        );
+        f.close().unwrap();
+    }
+
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn test_regression_close_still_syncs_under_never_policy() {
+        // Regression guard: `Never` means "no fsync on append," NOT
+        // "no durability at all." `close()` is the caller's explicit
+        // durability barrier and must always sync regardless of
+        // policy; otherwise a clean shutdown of a Never-configured
+        // file would silently lose its tail.
+        let dir = tmp_persistent_dir("fsync_close_syncs");
+        let base = dir.clone();
+
+        {
+            let f =
+                make_persistent_with_policy("fsync/close_syncs", &base, super::FsyncPolicy::Never);
+            for i in 0..10u64 {
+                f.append(format!("x-{}", i).as_bytes()).unwrap();
+            }
+            assert_eq!(f.sync_count(), Some(0), "Never skips append syncs");
+            f.close().unwrap();
+            assert_eq!(
+                f.sync_count(),
+                Some(1),
+                "close() under Never still syncs once"
+            );
+        }
+
+        // Reopen and verify every entry survived the close.
+        let r = super::super::manager::Redex::new().with_persistent_dir(&base);
+        let f2 = r
+            .open_file(
+                &ChannelName::new("fsync/close_syncs").unwrap(),
+                RedexFileConfig::default().with_persistent(true),
+            )
+            .unwrap();
+        assert_eq!(f2.len(), 10, "all 10 entries must persist across close");
     }
 }

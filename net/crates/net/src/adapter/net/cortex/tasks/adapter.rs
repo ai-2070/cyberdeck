@@ -174,6 +174,38 @@ impl TasksAdapter {
         TasksWatcher::new(self.inner.state(), self.inner.changes().boxed())
     }
 
+    /// One-shot combo: a snapshot of the current filter result PLUS
+    /// a stream that emits every **subsequent** change to that
+    /// filter. The stream skips the initial emission so the caller
+    /// doesn't see the snapshot twice — the snapshot is the initial
+    /// state; the stream carries deltas from there forward.
+    ///
+    /// Useful for UI-style consumers: "paint what's there now, then
+    /// react to changes" without a manual dedup against the first
+    /// emission.
+    pub fn snapshot_and_watch(
+        &self,
+        watcher: TasksWatcher,
+    ) -> (
+        Vec<super::types::Task>,
+        std::pin::Pin<Box<dyn futures::Stream<Item = Vec<super::types::Task>> + Send + 'static>>,
+    ) {
+        use futures::StreamExt;
+        // Compute the snapshot from the adapter's current state,
+        // reusing the watcher's configured filter. Holding the read
+        // lock only for the execute call keeps it brief.
+        let initial = {
+            let state = self.inner.state();
+            let guard = state.read();
+            watcher.spec_for_snapshot().execute(&guard)
+        };
+        // The watcher's stream emits the initial first, then deltas.
+        // Skip the first element so the caller sees only deltas;
+        // the snapshot they already have covers the initial state.
+        let stream = watcher.stream().skip(1).boxed();
+        (initial, stream)
+    }
+
     /// Capture a snapshot suitable for restore. Returns
     /// `(state_bytes, last_seq)` — persist both together.
     pub fn snapshot(&self) -> Result<(Vec<u8>, Option<u64>), CortexAdapterError> {
