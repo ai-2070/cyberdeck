@@ -26,6 +26,15 @@ use super::types::{
 };
 use super::watch::TasksWatcher;
 
+/// Return shape of [`TasksAdapter::snapshot_and_watch`]: the
+/// initial filter result plus a boxed stream that emits every
+/// subsequent change (dedup'd, with the initial skipped so the
+/// caller doesn't double-render).
+pub type TasksSnapshotAndWatch = (
+    Vec<super::types::Task>,
+    std::pin::Pin<Box<dyn futures::Stream<Item = Vec<super::types::Task>> + Send + 'static>>,
+);
+
 use futures::StreamExt;
 
 /// Wire format for [`TasksAdapter::snapshot`]: wraps the `TasksState`
@@ -183,13 +192,7 @@ impl TasksAdapter {
     /// Useful for UI-style consumers: "paint what's there now, then
     /// react to changes" without a manual dedup against the first
     /// emission.
-    pub fn snapshot_and_watch(
-        &self,
-        watcher: TasksWatcher,
-    ) -> (
-        Vec<super::types::Task>,
-        std::pin::Pin<Box<dyn futures::Stream<Item = Vec<super::types::Task>> + Send + 'static>>,
-    ) {
+    pub fn snapshot_and_watch(&self, watcher: TasksWatcher) -> TasksSnapshotAndWatch {
         use futures::StreamExt;
         // Compute the snapshot from the adapter's current state,
         // reusing the watcher's configured filter. Holding the read

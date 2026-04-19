@@ -27,6 +27,15 @@ use super::types::{
 };
 use super::watch::MemoriesWatcher;
 
+/// Return shape of [`MemoriesAdapter::snapshot_and_watch`]: the
+/// initial filter result plus a boxed stream that emits every
+/// subsequent change (dedup'd, with the initial skipped so the
+/// caller doesn't double-render).
+pub type MemoriesSnapshotAndWatch = (
+    Vec<super::types::Memory>,
+    std::pin::Pin<Box<dyn futures::Stream<Item = Vec<super::types::Memory>> + Send + 'static>>,
+);
+
 use futures::StreamExt;
 
 /// Wire format for [`MemoriesAdapter::snapshot`]: wraps the
@@ -184,13 +193,7 @@ impl MemoriesAdapter {
     /// filter. The stream skips the initial emission so the caller
     /// doesn't see the snapshot twice — the snapshot is the initial
     /// state; the stream carries deltas from there forward.
-    pub fn snapshot_and_watch(
-        &self,
-        watcher: MemoriesWatcher,
-    ) -> (
-        Vec<super::types::Memory>,
-        std::pin::Pin<Box<dyn futures::Stream<Item = Vec<super::types::Memory>> + Send + 'static>>,
-    ) {
+    pub fn snapshot_and_watch(&self, watcher: MemoriesWatcher) -> MemoriesSnapshotAndWatch {
         use futures::StreamExt;
         let initial = {
             let state = self.inner.state();
