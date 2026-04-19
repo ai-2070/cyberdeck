@@ -128,6 +128,11 @@ name = "cortex"
 harness = false
 required-features = ["cortex", "netdb"]
 
+[[bench]]
+name = "redex"
+harness = false
+required-features = ["redex"]
+
 [[test]]
 name = "integration_redis"
 path = "tests/integration_redis.rs"

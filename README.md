@@ -531,6 +531,47 @@ Benchmarks accurate as of April 15, 2026.
 
 All SDKs exceed **2M events/sec** with optimal ingestion patterns. Go achieves zero allocations on raw ingestion. Node.js sync methods are 31x faster than async. Bun batch ingestion is ~17% faster than Node.js.
 
+### RedEX (storage primitive)
+
+Microbenchmarks of the local append-only log on its own, separate from CortEX. Answers "is the log ever the bottleneck?" Numbers below are on M1 Max (macOS).
+
+| Operation | Latency | Throughput |
+|-----------|--------:|-----------:|
+| Append inline (≤8 B) | 47 ns | **21.3M ops/sec** |
+| Append heap (32 B) | 54 ns | **18.6M ops/sec** |
+| Append heap (256 B) | 97 ns | **10.3M ops/sec** |
+| Append heap (1 KB) | 240 ns | **4.17M ops/sec** |
+| Batch append (64 × 64 B) | 1.72 us | **37.2M elements/sec** |
+| Append disk (32 B, `redex-disk`) | 3.11 us | **321k ops/sec** |
+| Append disk (1 KB, `redex-disk`) | 6.42 us | **156k ops/sec** |
+| Tail latency (append → subscriber) | 138 ns | -- |
+
+Disk durability costs ~50x the memory-only append path and caps throughput around **hundreds of thousands of events/sec per file** — ample headroom for every workload where the event rate is bounded by the hardware generating it (sensors, instruments, telemetry) rather than by software replaying synthetic load.
+
+### CortEX + NetDB (end-to-end)
+
+The numbers that matter for real workloads — ingest, fold, query, snapshot — measured through the full `TasksAdapter` / `MemoriesAdapter` / `NetDb` stack with RedEX underneath. This is the slice a factory cell, substation, or Deck runs; the microbenchmarks above are how we know no single layer is load-bearing.
+
+| Operation | Latency | Throughput |
+|-----------|--------:|-----------:|
+| `tasks.create` ingest (no barrier) | 271 ns | **3.63M ops/sec** |
+| `memories.store` ingest | 342 ns | **2.88M ops/sec** |
+| Fold round-trip (`create` + `waitForSeq`) | 6.00 us | **165k ops/sec** |
+| `find_unique` (state lookup) | 10.4 ns | **96M ops/sec** |
+| `find_many` @ 1 K tasks (status filter) | 7.79 us | **126M elements/sec** |
+| `find_many` @ 10 K tasks | 142 us | **70.4M elements/sec** |
+| `count_where` @ 10 K tasks | 31.6 us | **337M elements/sec** |
+| `find_many` @ 1 K memories (tag filter) | 53.5 us | **19.1M elements/sec** |
+| Tasks snapshot encode @ 10 K | 67.8 us | -- |
+| Memories snapshot encode @ 10 K | 234 us | -- |
+| `NetDb::open` (both models) | 5.87 us | **170k ops/sec** |
+| Bundle encode @ 1 K (135 KB output) | 62.8 us | -- |
+| Bundle decode @ 1 K | 94.6 us | -- |
+
+Ingest onto a single adapter sustains **~3.6M events/sec** before consumer back-pressure (no `waitForSeq`). The full fold round-trip is **6 us** — so a reactive watcher observes a newly appended event within ~one fold tick of the writer. Query methods at 10 K state size are double-digit microseconds even against a cold read lock, which is why the NetDB surface ships `find_many` / `count_where` / `exists_where` always-on: they're cheap enough to call inside a hot loop without a cache layer.
+
+Benchmarks captured 2026-04-19 via `cargo bench --bench redex --features "redex redex-disk"` and `cargo bench --bench cortex --features "cortex netdb"` at 20 samples × 3 s measurement time.
+
 ### Binary size
 
 Release build with `--features net` only, LTO on, single codegen unit, `panic = "abort"`, `opt-level = 3`:

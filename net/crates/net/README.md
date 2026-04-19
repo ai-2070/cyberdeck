@@ -176,12 +176,34 @@ Benchmarked on Apple M1 Max, macOS.
 | **SDK** | Python batch ingest | 0.36 us | 2.78M/sec |
 | **SDK** | Node.js push batch | 0.35 us | 2.89M/sec |
 | **SDK** | Bun batch ingest | 0.30 us | 3.37M/sec |
+| **RedEX** | Append inline (≤8 B) | 47 ns | 21.3M ops/sec |
+| **RedEX** | Append heap (32 B) | 54 ns | 18.6M ops/sec |
+| **RedEX** | Append heap (256 B) | 97 ns | 10.3M ops/sec |
+| **RedEX** | Append heap (1 KB) | 240 ns | 4.17M ops/sec |
+| **RedEX** | Batch append (64 × 64 B) | 1.72 us | 37.2M elements/sec |
+| **RedEX** | Append disk (32 B, `redex-disk`) | 3.11 us | 321k ops/sec |
+| **RedEX** | Append disk (1 KB, `redex-disk`) | 6.42 us | 156k ops/sec |
+| **RedEX** | Tail latency (append → subscriber) | 138 ns | -- |
+| **CortEX** | `tasks.create` ingest | 271 ns | 3.63M ops/sec |
+| **CortEX** | `memories.store` ingest | 342 ns | 2.88M ops/sec |
+| **CortEX** | Fold round-trip (`create` + `waitForSeq`) | 6.00 us | 165k ops/sec |
+| **CortEX** | `find_unique` (state lookup) | 10.4 ns | 96M ops/sec |
+| **CortEX** | `find_many` @ 1 K tasks (status filter) | 7.79 us | 126M elements/sec |
+| **CortEX** | `find_many` @ 10 K tasks | 142 us | 70.4M elements/sec |
+| **CortEX** | `count_where` @ 10 K tasks | 31.6 us | 337M elements/sec |
+| **CortEX** | `find_many` @ 1 K memories (tag filter) | 53.5 us | 19.1M elements/sec |
+| **CortEX** | Tasks snapshot encode @ 10 K | 67.8 us | -- |
+| **CortEX** | Memories snapshot encode @ 10 K | 234 us | -- |
+| **NetDB** | `NetDb::open` (both models) | 5.87 us | 170k ops/sec |
+| **NetDB** | Bundle encode @ 1 K (135 KB output) | 62.8 us | -- |
+| **NetDB** | Bundle decode @ 1 K | 94.6 us | -- |
+| **NetDB** | Bundle decode @ 10 K | 946 us | -- |
 
-Benchmarks accurate as of April 15, 2026.
+Benchmarks accurate as of 2026-04-19. Core / Net / Routing / Forwarding / Swarm / Failure / Capability rows measured April 15, 2026; RedEX + CortEX + NetDB rows captured via `cargo bench --bench redex --features "redex redex-disk"` and `cargo bench --bench cortex --features "cortex netdb"` at 20 samples × 3 s measurement. The RedEX table splits the storage primitive (inline vs heap, memory vs disk, tail latency) from the end-to-end CortEX path (ingest → fold → query → snapshot) — CortEX numbers include RedEX underneath, since that's the layering real workloads see.
 
-Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns.
+Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns. CortEX ingest on a single `TasksAdapter` sustains **~3.6M events/sec** before any consumer back-pressure (measured without `waitForSeq`); the full fold round-trip — append → RedEX tail → state mutation → `waitForSeq` returns — lands at **6 us**, so reactive watchers see an event roughly one fold tick after the writer. Query methods at 10 K state size run in **double-digit microseconds** on a cold read lock, which is why NetDB ships with an always-on `find_many` + `count_where` + `exists_where` surface: even on cold state they're cheap enough to call inside a hot loop.
 
-1,208 tests. ~840 KB deployed binary.
+1,146 Rust tests + 36 Node + 33 Python SDK smoke tests. ~840 KB deployed binary.
 
 ## Capabilities
 
