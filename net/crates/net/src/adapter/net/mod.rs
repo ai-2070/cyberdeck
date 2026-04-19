@@ -39,6 +39,8 @@ pub mod contested;
 pub mod continuity;
 #[cfg(feature = "cortex-adapter")]
 pub mod cortex;
+#[cfg(feature = "netdb")]
+pub mod netdb;
 mod crypto;
 mod failure;
 pub mod identity;
@@ -91,6 +93,8 @@ pub use cortex::{
     CortexAdapter, CortexAdapterConfig, CortexAdapterError, EventEnvelope, EventMeta,
     FoldErrorPolicy, IntoRedexPayload, StartPosition, EVENT_META_SIZE,
 };
+#[cfg(feature = "netdb")]
+pub use netdb::{MemoriesFilter, NetDb, NetDbBuilder, NetDbError, NetDbSnapshot, TasksFilter};
 pub use crypto::{CryptoError, SessionKeys, StaticKeypair};
 pub use failure::{
     CircuitBreaker, CircuitState, FailureDetector, FailureDetectorConfig, FailureStats,

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::filter::TasksFilter;
 use super::types::{Task, TaskId, TaskStatus};
 
 /// Materialized view over the tasks log.
@@ -60,6 +61,30 @@ impl TasksState {
         self.tasks
             .values()
             .filter(|t| t.status == TaskStatus::Completed)
+    }
+
+    // -- Prisma-ish convenience surface (NetDB layer) -------------------
+
+    /// Look up a task by id. Alias of [`Self::get`], named to match
+    /// the Prisma-style NetDB surface.
+    pub fn find_unique(&self, id: TaskId) -> Option<&Task> {
+        self.get(id)
+    }
+
+    /// Collect all tasks matching `filter` (cloned), respecting
+    /// order + limit.
+    pub fn find_many(&self, filter: &TasksFilter) -> Vec<Task> {
+        filter.apply(self.query()).collect()
+    }
+
+    /// Count tasks matching `filter`. Ignores `limit`.
+    pub fn count_where(&self, filter: &TasksFilter) -> usize {
+        filter.apply(self.query()).count()
+    }
+
+    /// True if any task matches `filter`. Short-circuits on first hit.
+    pub fn exists_where(&self, filter: &TasksFilter) -> bool {
+        filter.apply(self.query()).exists()
     }
 }
 

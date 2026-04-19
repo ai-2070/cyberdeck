@@ -132,6 +132,11 @@ impl MemoriesAdapter {
         self.inner.state()
     }
 
+    /// Total memory count in the current state.
+    pub fn count(&self) -> usize {
+        self.inner.state().read().len()
+    }
+
     /// Block until every event up through `seq` has been folded.
     pub async fn wait_for_seq(&self, seq: u64) {
         self.inner.wait_for_seq(seq).await;

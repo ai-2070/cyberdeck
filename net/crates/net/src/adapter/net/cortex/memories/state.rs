@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::filter::MemoriesFilter;
 use super::types::{Memory, MemoryId};
 
 /// Materialized view over the memories log.
@@ -56,6 +57,28 @@ impl MemoriesState {
     /// Iterate over memories that are NOT pinned.
     pub fn unpinned(&self) -> impl Iterator<Item = &Memory> {
         self.memories.values().filter(|m| !m.pinned)
+    }
+
+    // -- Prisma-ish convenience surface (NetDB layer) -------------------
+
+    /// Look up a memory by id. Alias of [`Self::get`].
+    pub fn find_unique(&self, id: MemoryId) -> Option<&Memory> {
+        self.get(id)
+    }
+
+    /// Collect all memories matching `filter`, respecting order + limit.
+    pub fn find_many(&self, filter: &MemoriesFilter) -> Vec<Memory> {
+        filter.apply(self.query()).collect()
+    }
+
+    /// Count memories matching `filter`. Ignores `limit`.
+    pub fn count_where(&self, filter: &MemoriesFilter) -> usize {
+        filter.apply(self.query()).count()
+    }
+
+    /// True if any memory matches `filter`. Short-circuits.
+    pub fn exists_where(&self, filter: &MemoriesFilter) -> bool {
+        filter.apply(self.query()).exists()
     }
 }
 

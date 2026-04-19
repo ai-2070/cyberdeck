@@ -34,6 +34,7 @@
 
 mod adapter;
 mod dispatch;
+mod filter;
 mod fold;
 mod query;
 mod state;
@@ -45,6 +46,7 @@ pub use dispatch::{
     DISPATCH_TASK_COMPLETED, DISPATCH_TASK_CREATED, DISPATCH_TASK_DELETED, DISPATCH_TASK_RENAMED,
     TASKS_CHANNEL,
 };
+pub use filter::TasksFilter;
 pub use fold::TasksFold;
 pub use query::{OrderBy, TasksQuery};
 pub use state::TasksState;

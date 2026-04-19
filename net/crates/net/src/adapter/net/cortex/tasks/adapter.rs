@@ -125,6 +125,12 @@ impl TasksAdapter {
         self.inner.state()
     }
 
+    /// Total task count in the current state. Cheap; acquires the
+    /// state read lock briefly. Matches the Node/Python SDK surface.
+    pub fn count(&self) -> usize {
+        self.inner.state().read().len()
+    }
+
     /// Block until every event up through `seq` has been folded.
     pub async fn wait_for_seq(&self, seq: u64) {
         self.inner.wait_for_seq(seq).await;

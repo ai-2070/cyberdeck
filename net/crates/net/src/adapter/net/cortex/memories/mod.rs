@@ -21,6 +21,7 @@
 
 mod adapter;
 mod dispatch;
+mod filter;
 mod fold;
 mod query;
 mod state;
@@ -32,6 +33,7 @@ pub use dispatch::{
     DISPATCH_MEMORY_DELETED, DISPATCH_MEMORY_PINNED, DISPATCH_MEMORY_RETAGGED,
     DISPATCH_MEMORY_STORED, DISPATCH_MEMORY_UNPINNED, MEMORIES_CHANNEL,
 };
+pub use filter::MemoriesFilter;
 pub use fold::MemoriesFold;
 pub use query::{MemoriesQuery, OrderBy};
 pub use state::MemoriesState;

@@ -42,6 +42,7 @@ redex-disk = ["redex"]
 cortex-adapter = ["redex"]
 cortex-tasks = ["cortex-adapter"]
 cortex-memories = ["cortex-adapter"]
+netdb = ["cortex-tasks", "cortex-memories"]
 
 [dependencies]
 # Async runtime
@@ -158,6 +159,11 @@ required-features = ["cortex-tasks"]
 name = "integration_cortex_memories"
 path = "tests/integration_cortex_memories.rs"
 required-features = ["cortex-memories"]
+
+[[test]]
+name = "integration_netdb"
+path = "tests/integration_netdb.rs"
+required-features = ["netdb"]
 
 [profile.release]
 lto = true
