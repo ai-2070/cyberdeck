@@ -575,8 +575,8 @@ impl RedexFile {
         Ok(seq)
     }
 
-    /// Convenience: serialize `value` with bincode and append.
-    pub fn append_bincode<T: serde::Serialize>(&self, value: &T) -> Result<u64, RedexError> {
+    /// Convenience: serialize `value` with postcard and append.
+    pub fn append_postcard<T: serde::Serialize>(&self, value: &T) -> Result<u64, RedexError> {
         let bytes = postcard::to_allocvec(value).map_err(|e| RedexError::Encode(e.to_string()))?;
         self.append(&bytes)
     }
@@ -872,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_bincode_roundtrip() {
+    fn test_append_postcard_roundtrip() {
         #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
         struct Foo {
             a: u32,
@@ -883,7 +883,7 @@ mod tests {
             a: 42,
             b: "hi".into(),
         };
-        let seq = f.append_bincode(&v).unwrap();
+        let seq = f.append_postcard(&v).unwrap();
         assert_eq!(seq, 0);
         let events = f.read_range(0, 1);
         let decoded: Foo = postcard::from_bytes(&events[0].payload).unwrap();

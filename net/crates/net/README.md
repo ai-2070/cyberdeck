@@ -187,24 +187,24 @@ Benchmarked on Apple M1 Max, macOS.
 | **RedEX** | Append disk (32 B, `redex-disk`) | 3.11 us | 321k ops/sec |
 | **RedEX** | Append disk (1 KB, `redex-disk`) | 6.42 us | 156k ops/sec |
 | **RedEX** | Tail latency (append → subscriber) | 138 ns | -- |
-| **CortEX** | `tasks.create` ingest | 271 ns | 3.63M ops/sec |
-| **CortEX** | `memories.store` ingest | 342 ns | 2.88M ops/sec |
-| **CortEX** | Fold round-trip (`create` + `waitForSeq`) | 6.00 us | 165k ops/sec |
-| **CortEX** | `find_unique` (state lookup) | 10.4 ns | 96M ops/sec |
-| **CortEX** | `find_many` @ 1 K tasks (status filter) | 7.79 us | 126M elements/sec |
-| **CortEX** | `find_many` @ 10 K tasks | 142 us | 70.4M elements/sec |
-| **CortEX** | `count_where` @ 10 K tasks | 31.6 us | 337M elements/sec |
-| **CortEX** | `find_many` @ 1 K memories (tag filter) | 53.5 us | 19.1M elements/sec |
-| **CortEX** | Tasks snapshot encode @ 10 K | 67.8 us | -- |
-| **CortEX** | Memories snapshot encode @ 10 K | 234 us | -- |
-| **NetDB** | `NetDb::open` (both models) | 5.87 us | 170k ops/sec |
-| **NetDB** | Bundle encode @ 1 K (135 KB output) | 62.8 us | -- |
-| **NetDB** | Bundle decode @ 1 K | 94.6 us | -- |
-| **NetDB** | Bundle decode @ 10 K | 946 us | -- |
+| **CortEX** | `tasks.create` ingest | 275 ns | 3.64M ops/sec |
+| **CortEX** | `memories.store` ingest | 466 ns | 2.14M ops/sec |
+| **CortEX** | Fold round-trip (`create` + `waitForSeq`) | 6.23 us | 161k ops/sec |
+| **CortEX** | `find_unique` (state lookup) | 9.2 ns | 109M ops/sec |
+| **CortEX** | `find_many` @ 1 K tasks (status filter) | 7.92 us | 126M elements/sec |
+| **CortEX** | `find_many` @ 10 K tasks | 137 us | 73.2M elements/sec |
+| **CortEX** | `count_where` @ 10 K tasks | 30.7 us | 326M elements/sec |
+| **CortEX** | `find_many` @ 1 K memories (tag filter) | 51.0 us | 19.6M elements/sec |
+| **CortEX** | Tasks snapshot encode @ 10 K | 350 us | -- |
+| **CortEX** | Memories snapshot encode @ 10 K | 775 us | -- |
+| **NetDB** | `NetDb::open` (both models) | 6.30 us | 159k ops/sec |
+| **NetDB** | Bundle encode @ 1 K (48 KB output) | 22.8 us | -- |
+| **NetDB** | Bundle decode @ 1 K | 27.0 us | -- |
+| **NetDB** | Bundle decode @ 10 K | 289 us | -- |
 
-Benchmarks accurate as of 2026-04-19. Core / Net / Routing / Forwarding / Swarm / Failure / Capability rows measured April 15, 2026; RedEX + CortEX + NetDB rows captured via `cargo bench --bench redex --features "redex redex-disk"` and `cargo bench --bench cortex --features "cortex netdb"` at 20 samples × 3 s measurement. The RedEX table splits the storage primitive (inline vs heap, memory vs disk, tail latency) from the end-to-end CortEX path (ingest → fold → query → snapshot) — CortEX numbers include RedEX underneath, since that's the layering real workloads see.
+Benchmarks accurate as of 2026-04-19. Core / Net / Routing / Forwarding / Swarm / Failure / Capability rows measured April 15, 2026; RedEX + CortEX + NetDB rows captured via `cargo bench --bench redex --features "redex redex-disk"` and `cargo bench --bench cortex --features "cortex netdb"` at 20 samples × 3 s measurement. CortEX / NetDB numbers are on **postcard** serialization (varint-encoded, no-std friendly) — the CortEX adapter serialized state with `bincode` 1.x until the migration in v0.5; callers persisting pre-migration snapshot bytes must re-snapshot on upgrade. The RedEX table splits the storage primitive (inline vs heap, memory vs disk, tail latency) from the end-to-end CortEX path (ingest → fold → query → snapshot) — CortEX numbers include RedEX underneath, since that's the layering real workloads see.
 
-Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns. CortEX ingest on a single `TasksAdapter` sustains **~3.6M events/sec** before any consumer back-pressure (measured without `waitForSeq`); the full fold round-trip — append → RedEX tail → state mutation → `waitForSeq` returns — lands at **6 us**, so reactive watchers see an event roughly one fold tick after the writer. Query methods at 10 K state size run in **double-digit microseconds** on a cold read lock, which is why NetDB ships with an always-on `find_many` + `count_where` + `exists_where` surface: even on cold state they're cheap enough to call inside a hot loop.
+Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns. CortEX ingest on a single `TasksAdapter` sustains **~3.6M events/sec** before any consumer back-pressure (measured without `waitForSeq`); the full fold round-trip — append → RedEX tail → state mutation → `waitForSeq` returns — lands at **6 us**, so reactive watchers see an event roughly one fold tick after the writer. Query methods at 10 K state size run in **double-digit microseconds** on a cold read lock, which is why NetDB ships with an always-on `find_many` + `count_where` + `exists_where` surface: even on cold state they're cheap enough to call inside a hot loop. NetDB **bundle encode/decode is 2-3x faster than the bincode era and produces bundles 60-70% smaller** — the win that matters most for cross-language snapshot transfer.
 
 1,146 Rust tests + 36 Node + 33 Python SDK smoke tests. ~840 KB deployed binary.
 
@@ -364,7 +364,7 @@ The 20-byte record is fixed:
 Two payload paths:
 
 - **Inline** (`append_inline`): exactly 8 bytes of payload live in the index record itself (reusing the `offset`+`len` fields, discriminated by the `INLINE` flag in the high nibble of `flags+checksum`). Zero segment allocation — the fast path for tick counters, sensor readings, small enums.
-- **Heap** (`append`, `append_batch`, `append_bincode`): payload appended to an in-memory `HeapSegment` (grow-only `Vec<u8>`, 3 GB hard cap). The index record carries the `(offset, len)` into the segment.
+- **Heap** (`append`, `append_batch`, `append_postcard`): payload appended to an in-memory `HeapSegment` (grow-only `Vec<u8>`, 3 GB hard cap). The index record carries the `(offset, len)` into the segment.
 
 A monotonic `AtomicU64::fetch_add` assigns the sequence lock-free in the non-ordered path. `OrderedAppender` / `append_ordered` hold the state lock across seq allocation for writers that need strict replay determinism under contention. `append_batch` and `append_batch_ordered` allocate a contiguous seq range atomically; pre-validation under the state lock guarantees a failing batch does NOT advance `next_seq`, so no seq-space gaps appear on `PayloadTooLarge` / `SegmentOffsetOverflow`.
 
@@ -404,7 +404,7 @@ pub struct EventMeta {
 
 `StartPosition` selects replay semantics: `FromBeginning` (full history), `LiveOnly` (skip pre-open), `FromSeq(n)` (resume after a snapshot). `FoldErrorPolicy` governs what happens when the fold returns `Err`: `Stop` halts the task and records the stopping seq; `LogAndContinue` increments an error counter and keeps going. A single `changes()` broadcast is shared across all reactive subscribers; a subscriber falling more than 64 events behind drops intermediate ticks but always sees the latest state on catch-up.
 
-Snapshots compact long-running folds: `snapshot()` serializes the materialized state (under the state write lock so `(bytes, last_seq)` is consistent) via bincode; `open_from_snapshot(bytes, last_seq)` deserializes and resumes tailing at `FromSeq(last_seq + 1)`. `last_seq = u64::MAX` returns `RedexError::Encode` rather than wrapping around silently.
+Snapshots compact long-running folds: `snapshot()` serializes the materialized state (under the state write lock so `(bytes, last_seq)` is consistent) via postcard; `open_from_snapshot(bytes, last_seq)` deserializes and resumes tailing at `FromSeq(last_seq + 1)`. `last_seq = u64::MAX` returns `RedexError::Encode` rather than wrapping around silently.
 
 Two concrete models ship in v1:
 
@@ -440,7 +440,7 @@ let pending = db.tasks().state().read().find_many(&TasksFilter {
 
 Whole-db snapshot is a single call. `db.snapshot()` walks every enabled model under its own state lock (consistent per-model; there is no cross-model consistency guarantee because each model backs a separate RedEX file), returning a `NetDbSnapshot { tasks, memories }` bundle. `NetDbSnapshot::encode()` produces a single bincode blob for persistence; `NetDbSnapshot::decode(bytes)` round-trips it, and `NetDbBuilder::build_from_snapshot(&bundle)` restores every enabled model in one call. Models enabled via `with_*()` whose bundle entry is `None` are opened from scratch — the same fallback path used by a fresh `build`.
 
-NetDB ships the same surface on Rust, Node (`@ai2070/net` napi bindings), and Python (`net._net` PyO3 bindings). The Node and Python handles carry the same CRUD + query methods; `NetDb.open(config)` on both sides is failure-atomic and supports the same whole-db snapshot bundle cross-language (bincode is stable across the FFI boundary).
+NetDB ships the same surface on Rust, Node (`@ai2070/net` napi bindings), and Python (`net._net` PyO3 bindings). The Node and Python handles carry the same CRUD + query methods; `NetDb.open(config)` on both sides is failure-atomic and supports the same whole-db snapshot bundle cross-language (postcard is stable across the FFI boundary).
 
 ## Module Map
 
@@ -736,7 +736,7 @@ net_shutdown(node);
 | Net transport | `net` | `chacha20poly1305`, `snow`, `blake2`, `dashmap`, `socket2`, `ed25519-dalek` |
 | Regex filters | `regex` | `regex` crate |
 | C FFI | `ffi` | -- |
-| RedEX (local append-only log) | `redex` | `net`, `tokio-stream`, `bincode` |
+| RedEX (local append-only log) | `redex` | `net`, `tokio-stream`, `postcard` |
 | RedEX disk durability | `redex-disk` | `redex` |
 | CortEX (adapter core + tasks + memories) | `cortex` | `redex` |
 | NetDB (unified query façade) | `netdb` | `cortex` |
