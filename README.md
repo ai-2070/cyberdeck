@@ -591,6 +591,6 @@ Feature set affects `.rlib` and `.a` (which keep all compiled code for downstrea
 - `libnet.rlib` — Rust static lib with metadata (consumed by other Rust crates).
 - `libnet.a` — C/C++ static lib, pre-LTO, expected for `staticlib`.
 
-Measured on `aarch64-apple-darwin`, 2026-04-20, on the `backpressure-v2` branch (postcard serialization, v2 credit windows wired). Feature-set naming is post-consolidation: `cortex-adapter` + `cortex-tasks` + `cortex-memories` collapsed into one `cortex` feature; `netdb` pulls in `cortex` which pulls in `redex` which pulls in `net`.
+Measured on `aarch64-apple-darwin`, 2026-04-20.
 
 The shipped cdylib stays at **1.08 MB across all four feature configurations** — opting into RedEX, disk durability, or CortEX adds well under 1% to the deployed binary because dead-code elimination strips whatever the caller doesn't reference. The `.rlib` and `.a` grow with features because they must preserve every compiled symbol for downstream linkers; only the shipped cdylib feels the full benefit of LTO.
