@@ -1288,21 +1288,28 @@ impl MeshNode {
             0
         };
 
-        // Credit-window bookkeeping: charge the received payload bytes
-        // against the stream's RxCreditState. If the outstanding
-        // credit dipped past the half-window threshold, mint a grant
-        // and emit it asynchronously. Accounting happens at receive
-        // time (not drain time); this closes the v1 gap where a
-        // single serial sender ran `Transport(io::Error)` into a full
-        // kernel buffer. A separately slow daemon is still backstopped
-        // by the existing shard-queue-depth limits.
+        // Credit-window bookkeeping: charge only *accepted* inbound
+        // bytes against the stream's RxCreditState. `on_receive`
+        // returns `false` for duplicates (already-acked sequences)
+        // and for sequences past the Reliable receive window —
+        // crediting those would refund send credit for
+        // retransmissions / replays, letting a chatty peer inflate
+        // `tx_credit_remaining` past what it actually pushed through
+        // the protocol. Accounting runs at receive time (not drain
+        // time); this closes the v1 gap where a single serial sender
+        // ran `Transport(io::Error)` into a full kernel buffer. A
+        // separately slow daemon is still backstopped by the
+        // existing shard-queue-depth limits.
         let grant_bytes = {
             let stream = session.get_or_create_stream(stream_id);
-            stream.with_reliability(|r| {
-                r.on_receive(parsed.header.sequence);
-            });
-            stream.update_rx_seq(parsed.header.sequence);
-            stream.on_bytes_consumed(payload_bytes)
+            let accepted =
+                stream.with_reliability(|r| r.on_receive(parsed.header.sequence));
+            if accepted {
+                stream.update_rx_seq(parsed.header.sequence);
+                stream.on_bytes_consumed(payload_bytes)
+            } else {
+                None
+            }
         };
 
         if let Some(credit_bytes) = grant_bytes {

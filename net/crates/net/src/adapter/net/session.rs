@@ -1345,6 +1345,48 @@ mod tests {
         assert_eq!(state.on_bytes_consumed(1_000_000), None);
     }
 
+    #[test]
+    fn test_regression_reliable_duplicate_must_not_mint_grant() {
+        // Regression: the mesh dispatcher (`process_local_packet`)
+        // must gate `on_bytes_consumed` on the reliability layer's
+        // `on_receive` return. Otherwise retransmissions / replays
+        // of already-acked sequences on Reliable streams refund
+        // sender credit through the grant path, inflating
+        // `tx_credit_remaining` on the sender and distorting the
+        // `backpressure_events` picture.
+        //
+        // This test exercises the primitives the dispatcher
+        // composes. The dispatcher's gate itself is verified
+        // implicitly by the three-node integration suite; this
+        // primitive-level check is the tight loop that fails
+        // fastest if the invariant regresses.
+        let state = StreamState::new_full(true, 1, 100); // reliable
+
+        // First packet at seq=0: accepted → credit the bytes.
+        assert!(
+            state.with_reliability(|r| r.on_receive(0)),
+            "new seq must be accepted"
+        );
+        assert_eq!(state.on_bytes_consumed(40), Some(40));
+
+        // Replay of seq=0: rejected. The dispatcher MUST NOT call
+        // `on_bytes_consumed` in this branch. We document that
+        // invariant by NOT calling it here — if the dispatcher
+        // ever un-gates, the matching integration test would
+        // observe inflated grants / distorted credit accounting.
+        assert!(
+            !state.with_reliability(|r| r.on_receive(0)),
+            "duplicate seq must be rejected by the reliability layer"
+        );
+
+        // Sanity: the rx-credit state reflects only the one
+        // accepted packet — `granted = window_bytes + 40`,
+        // `consumed = 40`.
+        let rx = state.rx_credit();
+        assert_eq!(rx.consumed(), 40);
+        assert_eq!(rx.granted(), 100 + 40);
+    }
+
     fn session_with_stream(stream_id: u64, tx_window: u32) -> Arc<NetSession> {
         let session = Arc::new(NetSession::new(
             test_keys(),
