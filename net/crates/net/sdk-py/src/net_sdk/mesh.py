@@ -56,11 +56,15 @@ class StreamStats:
     last_activity_ns: int
     active: bool
     backpressure_events: int
-    """Cumulative `BackpressureError` rejections since the stream opened."""
-    tx_inflight: int
-    """Packets currently in-flight on the TX path."""
+    """Cumulative ``BackpressureError`` rejections since the stream opened."""
+    tx_credit_remaining: int
+    """Bytes of send credit still available. ``0`` = next send rejected."""
     tx_window: int
-    """Configured window cap. ``0`` = unbounded."""
+    """Configured initial credit window in bytes. ``0`` = unbounded."""
+    credit_grants_received: int
+    """Cumulative ``StreamWindow`` grants received from the peer."""
+    credit_grants_sent: int
+    """Cumulative ``StreamWindow`` grants emitted to the peer."""
 
 
 class MeshStream:
@@ -211,8 +215,10 @@ class MeshNode:
             last_activity_ns=raw.last_activity_ns,
             active=raw.active,
             backpressure_events=raw.backpressure_events,
-            tx_inflight=raw.tx_inflight,
+            tx_credit_remaining=raw.tx_credit_remaining,
             tx_window=raw.tx_window,
+            credit_grants_received=raw.credit_grants_received,
+            credit_grants_sent=raw.credit_grants_sent,
         )
 
     def shutdown(self) -> None:

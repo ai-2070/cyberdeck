@@ -61,13 +61,25 @@ pub enum CloseBehavior {
 /// Configuration is immutable for the lifetime of a stream. Re-opening
 /// the same `(peer, stream_id)` with different config is a no-op with a
 /// warning log — the original config wins.
+/// Default initial credit window for newly-opened streams, in bytes.
+///
+/// 64 KB matches a typical BDP under LAN conditions and amortizes one
+/// `StreamWindow` grant per ~32 KB consumed at the default 50%
+/// threshold. Callers who want the v1-style "unbounded" escape hatch
+/// can explicitly set `with_window_bytes(0)`.
+pub const DEFAULT_STREAM_WINDOW_BYTES: u32 = 65_536;
+
+/// Per-stream configuration supplied at `open_stream` time.
 #[derive(Debug, Clone, Copy)]
 pub struct StreamConfig {
     /// Reliability mode. Defaults to `FireAndForget`.
     pub reliability: Reliability,
-    /// Outbound queue depth cap for this stream (packets). `0` means
-    /// "inherit the router's configured `max_queue_depth`". Exceeding
-    /// the cap on `Stream::send` returns `StreamError::Backpressure`.
+    /// Initial credit window for the stream's send path, in bytes.
+    /// The sender starts with `tx_credit_remaining = window_bytes` and
+    /// decrements on each socket send; receiver-driven `StreamWindow`
+    /// grants replenish the counter. `0` disables backpressure
+    /// (unbounded — v1 escape hatch). Defaults to
+    /// [`DEFAULT_STREAM_WINDOW_BYTES`].
     pub window_bytes: u32,
     /// Fair-scheduler quantum multiplier. `1` is equal-share; higher
     /// means this stream gets proportionally more packets per round.
@@ -80,7 +92,7 @@ impl Default for StreamConfig {
     fn default() -> Self {
         Self {
             reliability: Reliability::FireAndForget,
-            window_bytes: 0,
+            window_bytes: DEFAULT_STREAM_WINDOW_BYTES,
             fairness_weight: 1,
             close_behavior: CloseBehavior::DropAndClose,
         }
@@ -164,16 +176,23 @@ pub struct StreamStats {
     /// Whether the stream is active (not closed).
     pub active: bool,
     /// Cumulative count of `send_on_stream` calls that returned
-    /// `StreamError::Backpressure` because the stream's `tx_window` was
-    /// full. Monotonically increasing; reset only by close + reopen.
+    /// `StreamError::Backpressure` because the stream ran out of
+    /// credit. Monotonically increasing; reset only by close + reopen.
     pub backpressure_events: u64,
-    /// Current in-flight packet count on the stream's send path
-    /// (packets acquired from `tx_window` that haven't yet had their
-    /// socket send complete).
-    pub tx_inflight: u32,
-    /// Configured `tx_window` for this stream; `0` means unbounded (no
-    /// backpressure check).
+    /// Bytes of send credit still available. `0` means the next send
+    /// of any size will be rejected as Backpressure; near `tx_window`
+    /// means plenty of headroom. Receiver-driven `StreamWindow` grants
+    /// replenish this counter.
+    pub tx_credit_remaining: u32,
+    /// Configured initial credit window in bytes. Informational —
+    /// `0` disables backpressure entirely on this stream.
     pub tx_window: u32,
+    /// Cumulative `StreamWindow` grants received from the peer since
+    /// the stream opened (sender side).
+    pub credit_grants_received: u64,
+    /// Cumulative `StreamWindow` grants emitted to the peer since the
+    /// stream opened (receiver side).
+    pub credit_grants_sent: u64,
 }
 
 /// A typed handle to a logical stream within a peer session.

@@ -2,9 +2,14 @@
 
 ## Status
 
-Design only. v1 (local in-flight counter) shipped in `STREAM_BACKPRESSURE_PLAN.md`: `StreamError::Backpressure` fires when concurrent callers race on the same stream. v2 closes the gap that v1 explicitly doesn't: a **single serial sender outrunning a slow receiver across the network**. Same `StreamError::Backpressure` variant, same SDK helpers, same daemon patterns — only the internal condition that triggers it moves from "local counter full" to "no credit from peer."
+**Shipped.** `StreamError::Backpressure` now fires on both concurrent-caller races (v1) and network-speed overruns (v2). The sender-side counter moved from packets to bytes; `SUBPROTOCOL_STREAM_WINDOW = 0x0B00` carries 12-byte receiver-grant messages; `TxSlotGuard` refunds on Drop unless `commit()` has sealed the send; receive-side `RxCreditState` mints a grant per inbound packet (1:1). Default `StreamConfig::window_bytes` is now `DEFAULT_STREAM_WINDOW_BYTES = 65_536`; `0` stays as the unbounded escape hatch.
 
 No caller-facing API changes. No new `StreamError` variants. No changes to the Rust/TS/Python SDK surface.
+
+Two implementation deviations from the original design, both intentional:
+
+1. **1:1 grants, not 50%-threshold amortization.** The original design assumed sender and receiver agree on `window_bytes`. An auto-created receive-side stream (the common case — the opener only runs on one side) inherits a large default window; a small-window sender would never consume enough bytes to cross the receiver's 50% threshold, and the stream would stall permanently. 1:1 (emit a grant of exactly the consumed size per packet) is robust against window mismatches at the cost of one control packet per data packet. On LANs and typical mesh deployments that overhead is negligible. A future enhancement can batch grants once traffic volume justifies it — the wire format accommodates either policy.
+2. **Consumed tracking hooks at packet-arrival time**, not drain time. This closes the v1 `Transport(io::Error)`-on-kernel-buffer-full gap (the primary v2 goal) but does not backstop a daemon that drains its inbound shard queue slowly — that continues to rely on the existing queue-depth limits. A future follow-up can move the `consumed` increment into `poll_shard` by extending `StoredEvent` with `(peer_node_id, stream_id)` without changing the wire format.
 
 ## What v1 already gives us (recap)
 

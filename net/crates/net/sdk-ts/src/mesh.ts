@@ -72,10 +72,21 @@ export interface StreamStats {
   active: boolean;
   /** Cumulative Backpressure rejections since stream opened. */
   backpressureEvents: bigint;
-  /** Current packets in-flight on the TX path. */
-  txInflight: number;
-  /** Configured window cap. `0` = unbounded. */
+  /**
+   * Bytes of send credit still available. `0` means the next send
+   * will be rejected as Backpressure. Receiver-driven `StreamWindow`
+   * grants replenish this counter.
+   */
+  txCreditRemaining: number;
+  /**
+   * Configured initial credit window in bytes. `0` disables
+   * backpressure entirely on this stream (escape hatch).
+   */
   txWindow: number;
+  /** Cumulative StreamWindow grants received from the peer. */
+  creditGrantsReceived: bigint;
+  /** Cumulative StreamWindow grants emitted to the peer. */
+  creditGrantsSent: bigint;
 }
 
 /**
@@ -326,11 +337,10 @@ export class MeshNode {
       toSafeNumber('streamId', streamId),
     );
     if (!raw) return null;
-    // The napi binding marshals the u64 fields as `BigInt` so values
-    // that exceed `Number.MAX_SAFE_INTEGER` — especially
-    // `lastActivityNs`, which is Unix-epoch nanoseconds and is always
-    // well above 2^53 — survive the boundary without a precision
-    // trap. The two u32 fields stay as regular numbers.
+    // The napi binding marshals u64 fields as `BigInt` so values that
+    // exceed `Number.MAX_SAFE_INTEGER` — especially `lastActivityNs`,
+    // Unix-epoch nanoseconds always above 2^53 — survive the boundary
+    // without a precision trap. The u32 fields stay as regular numbers.
     return {
       txSeq: raw.txSeq,
       rxSeq: raw.rxSeq,
@@ -338,8 +348,10 @@ export class MeshNode {
       lastActivityNs: raw.lastActivityNs,
       active: raw.active,
       backpressureEvents: raw.backpressureEvents,
-      txInflight: raw.txInflight,
+      txCreditRemaining: raw.txCreditRemaining,
       txWindow: raw.txWindow,
+      creditGrantsReceived: raw.creditGrantsReceived,
+      creditGrantsSent: raw.creditGrantsSent,
     };
   }
 

@@ -4845,12 +4845,12 @@ async fn test_send_on_stream_backpressure_when_concurrent() {
     a.start();
     b.start();
 
-    // Window-1 stream: at most one in-flight packet. With a single
-    // serial sender this is effectively unbounded (acquire/release
-    // round-trip per send) — so we need CONCURRENT senders to observe
-    // the cap.
+    // 20-byte window (v2 bytes semantics). Each packet's payload =
+    // EventFrame::LEN_SIZE (4) + event.len() (10) = 14 bytes. One
+    // packet fits; the second races for only 6 bytes of credit and
+    // sees Backpressure before the receiver's grant arrives.
     let stream = a
-        .open_stream(nid_b, 7777, StreamConfig::new().with_window_bytes(1))
+        .open_stream(nid_b, 7777, StreamConfig::new().with_window_bytes(20))
         .unwrap();
 
     // Spin up a batch of concurrent tasks sending on the same stream.
@@ -4900,7 +4900,7 @@ async fn test_send_on_stream_backpressure_when_concurrent() {
         stats.backpressure_events,
         backpressure
     );
-    assert_eq!(stats.tx_window, 1);
+    assert_eq!(stats.tx_window, 20);
 
     Arc::try_unwrap(a).ok().unwrap().shutdown().await.unwrap();
     b.shutdown().await.unwrap();
@@ -4941,8 +4941,11 @@ async fn test_send_with_retry_eventually_succeeds_through_backpressure() {
     a.start();
     b.start();
 
+    // v2: 64-byte window — small enough that retries hit
+    // Backpressure, large enough that receiver-side grants flowing
+    // back replenish credit for subsequent attempts.
     let stream = a
-        .open_stream(nid_b, 8888, StreamConfig::new().with_window_bytes(4))
+        .open_stream(nid_b, 8888, StreamConfig::new().with_window_bytes(64))
         .unwrap();
 
     // Run 32 concurrent retry-sends. All must eventually succeed;
@@ -4964,9 +4967,111 @@ async fn test_send_with_retry_eventually_succeeds_through_backpressure() {
             .expect("send_with_retry must eventually succeed");
     }
 
-    // After the storm, the window should be fully released.
+    // After the storm, credit must still be available — no leaks.
     let stats = a.stream_stats(nid_b, 8888).expect("stream stats");
-    assert_eq!(stats.tx_inflight, 0);
+    assert!(stats.tx_credit_remaining > 0);
+
+    Arc::try_unwrap(a).ok().unwrap().shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// v2 flagship regression: a **single serial sender** with a small
+/// window outruns the receiver's grant cadence and surfaces
+/// `StreamError::Backpressure` — the exact case v1 (local in-flight
+/// counter) could not catch.
+///
+/// In v1 this test would have surfaced as `Transport(io::Error)` once
+/// the kernel send buffer saturated; v2's byte-credit window exhausts
+/// deterministically and returns the clean Backpressure variant. The
+/// `credit_grants_received` counter confirms the loop is active (if
+/// it stayed at zero the sender would just be stalled, not
+/// backpressure-aware).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v2_serial_sender_sees_backpressure_on_slow_receiver() {
+    let ports = find_ports(2).await;
+    let psk = [0x13u8; 32];
+    let id_a = EntityKeypair::generate();
+    let id_b = EntityKeypair::generate();
+    let nid_a = id_a.node_id();
+    let nid_b = id_b.node_id();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+
+    let mk = |addr| {
+        MeshNodeConfig::new(addr, psk)
+            .with_num_shards(4)
+            .with_handshake(3, Duration::from_secs(3))
+            .with_heartbeat_interval(Duration::from_millis(500))
+            .with_session_timeout(Duration::from_secs(30))
+    };
+
+    let a = Arc::new(MeshNode::new(id_a, mk(addr_a)).await.unwrap());
+    let b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let pub_b = *b.public_key();
+
+    let (r1, r2) = tokio::join!(b.accept(nid_a), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.connect(addr_b, &pub_b, nid_b).await
+    });
+    r1.unwrap();
+    r2.unwrap();
+    a.start();
+    b.start();
+
+    // 32-byte window — two 14-byte packets drain it. The third serial
+    // send has to wait for a grant from B. Without a grant it
+    // Backpressures; the critical thing v2 does that v1 couldn't.
+    let stream = a
+        .open_stream(nid_b, 9999, StreamConfig::new().with_window_bytes(32))
+        .unwrap();
+
+    let event = Bytes::from_static(b"{\"k\":\"v\"}"); // 10 bytes, frame = 14
+    let mut ok = 0usize;
+    let mut backpressure = 0usize;
+
+    // Rip through 64 serial sends with NO intervening await beyond
+    // what send_on_stream itself does. The first 2 succeed, the rest
+    // race the grant RTT and trip Backpressure. v1 would eventually
+    // surface Transport(io::Error) when the kernel buffer filled; v2
+    // delivers clean Backpressure on the in-protocol signal.
+    for _ in 0..64 {
+        match a.send_on_stream(&stream, &[event.clone()]).await {
+            Ok(()) => ok += 1,
+            Err(StreamError::Backpressure) => backpressure += 1,
+            Err(StreamError::Transport(_)) => panic!(
+                "v2 must not surface kernel-buffer-full as Transport; \
+                 credit exhaustion should always present as Backpressure"
+            ),
+            Err(StreamError::NotConnected) => panic!("unexpected NotConnected"),
+        }
+    }
+
+    assert!(
+        backpressure > 0,
+        "serial sender must hit Backpressure once credit drains faster \
+         than grants arrive; got ok={}, bp={}",
+        ok,
+        backpressure,
+    );
+    assert!(ok > 0, "at least the initial handful must succeed");
+
+    // Let any in-flight grants settle so the stats snapshot reflects
+    // both sides of the loop.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let stats = a.stream_stats(nid_b, 9999).expect("stats");
+    assert_eq!(stats.tx_window, 32);
+    assert!(
+        stats.backpressure_events >= backpressure as u64,
+        "stats.backpressure_events ({}) should be >= observed ({})",
+        stats.backpressure_events,
+        backpressure,
+    );
+    assert!(
+        stats.credit_grants_received > 0,
+        "at least one StreamWindow grant must have flowed back from B — \
+         otherwise the v2 loop is not actually active"
+    );
 
     Arc::try_unwrap(a).ok().unwrap().shutdown().await.unwrap();
     b.shutdown().await.unwrap();

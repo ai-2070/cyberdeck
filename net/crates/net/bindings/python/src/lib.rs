@@ -855,9 +855,13 @@ mod mesh_bindings {
         #[pyo3(get)]
         pub backpressure_events: u64,
         #[pyo3(get)]
-        pub tx_inflight: u32,
+        pub tx_credit_remaining: u32,
         #[pyo3(get)]
         pub tx_window: u32,
+        #[pyo3(get)]
+        pub credit_grants_received: u64,
+        #[pyo3(get)]
+        pub credit_grants_sent: u64,
     }
 
     pub(crate) fn parse_reliability(s: Option<&str>) -> PyResult<Reliability> {
@@ -1224,8 +1228,10 @@ mod mesh_bindings {
                     last_activity_ns: s.last_activity_ns,
                     active: s.active,
                     backpressure_events: s.backpressure_events,
-                    tx_inflight: s.tx_inflight,
+                    tx_credit_remaining: s.tx_credit_remaining,
                     tx_window: s.tx_window,
+                    credit_grants_received: s.credit_grants_received,
+                    credit_grants_sent: s.credit_grants_sent,
                 }))
         }
 

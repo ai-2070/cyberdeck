@@ -864,8 +864,7 @@ mod mesh_bindings {
     /// safe-integer range (notably `last_activity_ns`, which is
     /// Unix-epoch nanoseconds and always well above `2^53`) don't
     /// lose precision or trip the TS SDK's safe-integer guard. The
-    /// two u32 fields (`tx_inflight`, `tx_window`) are safe as
-    /// regular numbers.
+    /// u32 fields are safe as regular numbers.
     #[napi(object)]
     pub struct NetStreamStats {
         pub tx_seq: BigInt,
@@ -874,8 +873,10 @@ mod mesh_bindings {
         pub last_activity_ns: BigInt,
         pub active: bool,
         pub backpressure_events: BigInt,
-        pub tx_inflight: u32,
+        pub tx_credit_remaining: u32,
         pub tx_window: u32,
+        pub credit_grants_received: BigInt,
+        pub credit_grants_sent: BigInt,
     }
 
     /// Prefix convention for JS SDK error-class routing. The TS wrapper
@@ -1324,8 +1325,10 @@ mod mesh_bindings {
                     last_activity_ns: BigInt::from(s.last_activity_ns),
                     active: s.active,
                     backpressure_events: BigInt::from(s.backpressure_events),
-                    tx_inflight: s.tx_inflight,
+                    tx_credit_remaining: s.tx_credit_remaining,
                     tx_window: s.tx_window,
+                    credit_grants_received: BigInt::from(s.credit_grants_received),
+                    credit_grants_sent: BigInt::from(s.credit_grants_sent),
                 }))
         }
 

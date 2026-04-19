@@ -59,13 +59,17 @@ async fn test_sdk_surfaces_backpressure_variant() {
     b.inner().start();
 
     let a = Arc::new(a);
+    // v2: window_bytes counts bytes, not packets. Each send is
+    // `{}` (2 bytes) + EventFrame::LEN_SIZE (4) = 6 bytes on the
+    // wire. An 8-byte window fits exactly one; concurrent callers
+    // race for the same window and surface Backpressure just like v1.
     let stream = a
         .open_stream(
             nid_b,
             0x1337,
             StreamConfig::new()
                 .with_reliability(Reliability::FireAndForget)
-                .with_window_bytes(1),
+                .with_window_bytes(8),
         )
         .expect("open_stream");
 
@@ -98,7 +102,7 @@ async fn test_sdk_surfaces_backpressure_variant() {
     assert!(ok > 0);
 
     let stats = a.stream_stats(nid_b, 0x1337).expect("stats");
-    assert_eq!(stats.tx_window, 1);
+    assert_eq!(stats.tx_window, 8);
     assert!(stats.backpressure_events >= bp as u64);
 
     // Shutdown — consume the Arc.
@@ -127,8 +131,11 @@ async fn test_sdk_send_with_retry_succeeds_through_backpressure() {
     b.inner().start();
 
     let a = Arc::new(a);
+    // v2: 64-byte window — enough for a handful of small payloads
+    // concurrently, but small enough that retries have to wait for
+    // receiver-driven StreamWindow grants to free credit.
     let stream = a
-        .open_stream(nid_b, 0x2468, StreamConfig::new().with_window_bytes(4))
+        .open_stream(nid_b, 0x2468, StreamConfig::new().with_window_bytes(64))
         .unwrap();
 
     let mut handles = Vec::new();
@@ -145,7 +152,10 @@ async fn test_sdk_send_with_retry_succeeds_through_backpressure() {
     }
 
     let stats = a.stream_stats(nid_b, 0x2468).unwrap();
-    assert_eq!(stats.tx_inflight, 0);
+    // Credit isn't necessarily at the original 64 after the run — it
+    // depends on how many grants arrived. What matters is that no
+    // sends are stuck (no permanently leaked credit).
+    assert!(stats.tx_credit_remaining > 0);
 
     Arc::try_unwrap(a).ok().unwrap().shutdown().await.unwrap();
     b.shutdown().await.unwrap();

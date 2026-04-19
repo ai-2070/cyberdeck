@@ -7,6 +7,7 @@
 use dashmap::DashMap;
 
 use super::descriptor::{SubprotocolDescriptor, SubprotocolVersion};
+use super::stream_window::SUBPROTOCOL_STREAM_WINDOW;
 use crate::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use crate::adapter::net::compute::SUBPROTOCOL_MIGRATION;
 use crate::adapter::net::state::causal::{SUBPROTOCOL_CAUSAL, SUBPROTOCOL_SNAPSHOT};
@@ -50,6 +51,11 @@ impl SubprotocolRegistry {
         reg.register(SubprotocolDescriptor::new(
             super::SUBPROTOCOL_NEGOTIATION,
             "negotiation",
+            SubprotocolVersion::new(1, 0),
+        ));
+        reg.register(SubprotocolDescriptor::new(
+            SUBPROTOCOL_STREAM_WINDOW,
+            "stream-window",
             SubprotocolVersion::new(1, 0),
         ));
         reg
