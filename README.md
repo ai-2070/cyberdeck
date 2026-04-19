@@ -580,12 +580,17 @@ Benchmarks captured 2026-04-19 via `cargo bench --bench redex --features "redex 
 
 Feature set affects `.rlib` and `.a` (which keep all compiled code for downstream linking) but is **almost invisible on the shipped cdylib** — LTO + dead-code elimination strips unreferenced code across feature boundaries, so the deployed `.dylib`/`.dll`/`.so` stays near-constant across feature combinations.
 
-| Artifact | `--features net` | `--features "net redex cortex netdb"` | Purpose |
-|----------|-----------------:|--------------------------------------:|---------|
-| `libnet.dylib` (cdylib) | **1.08 MB** | **1.08 MB** | Shipped binary |
-| `libnet.rlib` | 18 MB | 21 MB | Rust static lib with metadata (consumed by Rust) |
-| `libnet.a` | 33 MB | 34 MB | C/C++ static lib (pre-LTO, expected for `staticlib`) |
+| Features | `libnet.dylib` (cdylib) | `libnet.rlib` | `libnet.a` |
+|----------|------------------------:|--------------:|-----------:|
+| `net` | **1.08 MB** | 18.5 MB | 32.7 MB |
+| `net` + `redex` | **1.08 MB** | 18.8 MB | 33.0 MB |
+| `net` + `redex` + `redex-disk` | **1.08 MB** | 18.9 MB | 33.1 MB |
+| `net` + `redex` + `redex-disk` + `cortex` | **1.08 MB** | 20.7 MB | 34.0 MB |
 
-Measured on `aarch64-apple-darwin`, 2026-04-19, on the `backpressure-v2` branch (postcard serialization, v2 credit windows wired). Feature-set naming is the post-consolidation form: `cortex-adapter` + `cortex-tasks` + `cortex-memories` collapsed into one `cortex` feature; `netdb` pulls in `cortex` which pulls in `redex` which pulls in `net`, so `--features netdb` is equivalent to the full stack.
+- `libnet.dylib` — shipped cdylib (consumed by Node / Python / C bindings).
+- `libnet.rlib` — Rust static lib with metadata (consumed by other Rust crates).
+- `libnet.a` — C/C++ static lib, pre-LTO, expected for `staticlib`.
 
-The shipped cdylib stays comfortably under 1.2 MB despite bundling transport, routing, encryption, identity, load balancing, and the full consumer pipeline — and the size doesn't grow when callers opt into RedEX, CortEX, or NetDB because those subsystems only get linked in to the extent the caller actually references them.
+Measured on `aarch64-apple-darwin`, 2026-04-20, on the `backpressure-v2` branch (postcard serialization, v2 credit windows wired). Feature-set naming is post-consolidation: `cortex-adapter` + `cortex-tasks` + `cortex-memories` collapsed into one `cortex` feature; `netdb` pulls in `cortex` which pulls in `redex` which pulls in `net`.
+
+The shipped cdylib stays at **1.08 MB across all four feature configurations** — opting into RedEX, disk durability, or CortEX adds well under 1% to the deployed binary because dead-code elimination strips whatever the caller doesn't reference. The `.rlib` and `.a` grow with features because they must preserve every compiled symbol for downstream linkers; only the shipped cdylib feels the full benefit of LTO.
