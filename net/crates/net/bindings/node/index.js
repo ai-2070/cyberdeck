@@ -579,6 +579,7 @@ module.exports = nativeBinding
 module.exports.MemoriesAdapter = nativeBinding.MemoriesAdapter
 module.exports.MemoryWatchIter = nativeBinding.MemoryWatchIter
 module.exports.Net = nativeBinding.Net
+module.exports.NetDb = nativeBinding.NetDb
 module.exports.Redex = nativeBinding.Redex
 module.exports.TasksAdapter = nativeBinding.TasksAdapter
 module.exports.TaskWatchIter = nativeBinding.TaskWatchIter

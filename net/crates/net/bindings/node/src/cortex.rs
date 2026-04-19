@@ -264,6 +264,14 @@ pub struct TasksAdapter {
     inner: Arc<InnerTasksAdapter>,
 }
 
+impl Clone for TasksAdapter {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
 #[napi]
 impl TasksAdapter {
     /// Open the tasks adapter against a Redex manager.
@@ -619,6 +627,14 @@ pub struct MemoriesAdapter {
     inner: Arc<InnerMemoriesAdapter>,
 }
 
+impl Clone for MemoriesAdapter {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
 #[napi]
 impl MemoriesAdapter {
     /// Open the memories adapter against a Redex manager. See
@@ -853,5 +869,232 @@ impl MemoriesAdapter {
                 is_shutdown: AtomicBool::new(false),
             }),
         }
+    }
+}
+
+// =========================================================================
+// NetDB — unified query façade over tasks + memories
+// =========================================================================
+
+use ::net::adapter::net::netdb::{
+    NetDb as InnerNetDb, NetDbSnapshot as InnerNetDbSnapshot,
+};
+
+/// Options for [`NetDb::open`] / [`NetDb::open_from_snapshot`].
+#[napi(object)]
+pub struct NetDbOpenConfig {
+    /// Optional persistent base directory. When set, adapters opened
+    /// with `persistent: true` write to `<dir>/<channel_path>/{idx,dat}`.
+    pub persistent_dir: Option<String>,
+    /// Producer origin hash stamped on every `EventMeta`.
+    pub origin_hash: u32,
+    /// Open enabled adapters with `persistent: true`. Requires
+    /// `persistentDir`.
+    pub persistent: Option<bool>,
+    /// Include the tasks model.
+    pub with_tasks: Option<bool>,
+    /// Include the memories model.
+    pub with_memories: Option<bool>,
+}
+
+/// Serialized NetDB snapshot bundle returned by [`NetDb::snapshot`]
+/// and consumed by [`NetDb::open_from_snapshot`].
+#[napi(object)]
+pub struct NetDbBundle {
+    /// Bincode-encoded [`InnerNetDbSnapshot`] — opaque to callers.
+    pub state_bytes: Buffer,
+}
+
+/// Unified NetDB handle. Bundles `TasksAdapter` + `MemoriesAdapter`
+/// under one object; access them via `.tasks` / `.memories` getters.
+///
+/// NetDB is the recommended entry point for callers that want a
+/// database-like surface. For raw event / stream access, drop down
+/// to the individual adapters.
+#[napi]
+pub struct NetDb {
+    tasks: Option<TasksAdapter>,
+    memories: Option<MemoriesAdapter>,
+}
+
+impl NetDb {
+    fn build_redex(config: &NetDbOpenConfig) -> InnerRedex {
+        match &config.persistent_dir {
+            Some(dir) => InnerRedex::new().with_persistent_dir(dir),
+            None => InnerRedex::new(),
+        }
+    }
+
+    fn cfg(config: &NetDbOpenConfig) -> RedexFileConfig {
+        if config.persistent.unwrap_or(false) {
+            RedexFileConfig::default().with_persistent(true)
+        } else {
+            RedexFileConfig::default()
+        }
+    }
+}
+
+#[napi]
+impl NetDb {
+    /// Open a NetDB with the requested models. Each enabled model
+    /// spawns its own CortEX fold task.
+    #[napi(factory)]
+    pub async fn open(config: NetDbOpenConfig) -> Result<Self> {
+        let redex = Self::build_redex(&config);
+        let cfg = Self::cfg(&config);
+        let tasks = if config.with_tasks.unwrap_or(false) {
+            Some(TasksAdapter {
+                inner: Arc::new(
+                    InnerTasksAdapter::open_with_config(&redex, config.origin_hash, cfg)
+                        .map_err(|e| Error::from_reason(format!("NetDb open tasks: {}", e)))?,
+                ),
+            })
+        } else {
+            None
+        };
+        let memories = if config.with_memories.unwrap_or(false) {
+            Some(MemoriesAdapter {
+                inner: Arc::new(
+                    InnerMemoriesAdapter::open_with_config(&redex, config.origin_hash, cfg)
+                        .map_err(|e| {
+                            Error::from_reason(format!("NetDb open memories: {}", e))
+                        })?,
+                ),
+            })
+        } else {
+            None
+        };
+        Ok(Self { tasks, memories })
+    }
+
+    /// Open a NetDB and restore each enabled model's state from the
+    /// bundle. Models whose bundle entry is `None` are opened from
+    /// scratch (equivalent to [`Self::open`] for that model).
+    #[napi(factory)]
+    pub async fn open_from_snapshot(
+        config: NetDbOpenConfig,
+        bundle: NetDbBundle,
+    ) -> Result<Self> {
+        let snapshot = InnerNetDbSnapshot::decode(bundle.state_bytes.as_ref())
+            .map_err(|e| Error::from_reason(format!("decode snapshot bundle: {}", e)))?;
+        let redex = Self::build_redex(&config);
+        let cfg = Self::cfg(&config);
+
+        let tasks = if config.with_tasks.unwrap_or(false) {
+            let adapter = match snapshot.tasks {
+                Some((bytes, last_seq)) => {
+                    InnerTasksAdapter::open_from_snapshot_with_config(
+                        &redex,
+                        config.origin_hash,
+                        cfg,
+                        &bytes,
+                        last_seq,
+                    )
+                    .map_err(|e| {
+                        Error::from_reason(format!("NetDb restore tasks: {}", e))
+                    })?
+                }
+                None => InnerTasksAdapter::open_with_config(
+                    &redex,
+                    config.origin_hash,
+                    cfg,
+                )
+                .map_err(|e| Error::from_reason(format!("NetDb open tasks: {}", e)))?,
+            };
+            Some(TasksAdapter {
+                inner: Arc::new(adapter),
+            })
+        } else {
+            None
+        };
+
+        let memories = if config.with_memories.unwrap_or(false) {
+            let adapter = match snapshot.memories {
+                Some((bytes, last_seq)) => {
+                    InnerMemoriesAdapter::open_from_snapshot_with_config(
+                        &redex,
+                        config.origin_hash,
+                        cfg,
+                        &bytes,
+                        last_seq,
+                    )
+                    .map_err(|e| {
+                        Error::from_reason(format!("NetDb restore memories: {}", e))
+                    })?
+                }
+                None => InnerMemoriesAdapter::open_with_config(
+                    &redex,
+                    config.origin_hash,
+                    cfg,
+                )
+                .map_err(|e| {
+                    Error::from_reason(format!("NetDb open memories: {}", e))
+                })?,
+            };
+            Some(MemoriesAdapter {
+                inner: Arc::new(adapter),
+            })
+        } else {
+            None
+        };
+
+        Ok(Self { tasks, memories })
+    }
+
+    /// The tasks adapter (or `null` if tasks weren't enabled).
+    #[napi(getter)]
+    pub fn tasks(&self) -> Option<TasksAdapter> {
+        self.tasks.clone()
+    }
+
+    /// The memories adapter (or `null` if memories weren't enabled).
+    #[napi(getter)]
+    pub fn memories(&self) -> Option<MemoriesAdapter> {
+        self.memories.clone()
+    }
+
+    /// Snapshot every enabled model into one bundle. Persist the
+    /// `stateBytes` blob; restore via [`Self::open_from_snapshot`].
+    #[napi]
+    pub fn snapshot(&self) -> Result<NetDbBundle> {
+        let tasks = match &self.tasks {
+            Some(t) => Some(
+                t.inner
+                    .snapshot()
+                    .map_err(|e| Error::from_reason(format!("snapshot tasks: {}", e)))?,
+            ),
+            None => None,
+        };
+        let memories = match &self.memories {
+            Some(m) => Some(
+                m.inner
+                    .snapshot()
+                    .map_err(|e| Error::from_reason(format!("snapshot memories: {}", e)))?,
+            ),
+            None => None,
+        };
+        let snap = InnerNetDbSnapshot { tasks, memories };
+        let bytes = snap
+            .encode()
+            .map_err(|e| Error::from_reason(format!("encode snapshot: {}", e)))?;
+        Ok(NetDbBundle {
+            state_bytes: Buffer::from(bytes),
+        })
+    }
+
+    /// Close every enabled adapter. Idempotent.
+    #[napi]
+    pub fn close(&self) -> Result<()> {
+        if let Some(t) = &self.tasks {
+            t.inner
+                .close()
+                .map_err(|e| Error::from_reason(format!("close tasks: {}", e)))?;
+        }
+        if let Some(m) = &self.memories {
+            m.inner
+                .close()
+                .map_err(|e| Error::from_reason(format!("close memories: {}", e)))?;
+        }
+        Ok(())
     }
 }

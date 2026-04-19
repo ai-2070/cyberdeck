@@ -169,6 +169,39 @@ export declare class Net {
 }
 
 /**
+ * Unified NetDB handle. Bundles `TasksAdapter` + `MemoriesAdapter`
+ * under one object; access them via `.tasks` / `.memories` getters.
+ *
+ * NetDB is the recommended entry point for callers that want a
+ * database-like surface. For raw event / stream access, drop down
+ * to the individual adapters.
+ */
+export declare class NetDb {
+  /**
+   * Open a NetDB with the requested models. Each enabled model
+   * spawns its own CortEX fold task.
+   */
+  static open(config: NetDbOpenConfig): Promise<NetDb>
+  /**
+   * Open a NetDB and restore each enabled model's state from the
+   * bundle. Models whose bundle entry is `None` are opened from
+   * scratch (equivalent to [`Self::open`] for that model).
+   */
+  static openFromSnapshot(config: NetDbOpenConfig, bundle: NetDbBundle): Promise<NetDb>
+  /** The tasks adapter (or `null` if tasks weren't enabled). */
+  get tasks(): TasksAdapter | null
+  /** The memories adapter (or `null` if memories weren't enabled). */
+  get memories(): MemoriesAdapter | null
+  /**
+   * Snapshot every enabled model into one bundle. Persist the
+   * `stateBytes` blob; restore via [`Self::open_from_snapshot`].
+   */
+  snapshot(): NetDbBundle
+  /** Close every enabled adapter. Idempotent. */
+  close(): void
+}
+
+/**
  * Local RedEX manager. Holds the set of open files on this node.
  *
  * Cheap to share — methods take `&self`.
@@ -378,6 +411,35 @@ export interface MemoryFilter {
   updatedBeforeNs?: bigint
   orderBy?: MemoriesOrderBy
   limit?: number
+}
+
+/**
+ * Serialized NetDB snapshot bundle returned by [`NetDb::snapshot`]
+ * and consumed by [`NetDb::open_from_snapshot`].
+ */
+export interface NetDbBundle {
+  /** Bincode-encoded [`InnerNetDbSnapshot`] — opaque to callers. */
+  stateBytes: Buffer
+}
+
+/** Options for [`NetDb::open`] / [`NetDb::open_from_snapshot`]. */
+export interface NetDbOpenConfig {
+  /**
+   * Optional persistent base directory. When set, adapters opened
+   * with `persistent: true` write to `<dir>/<channel_path>/{idx,dat}`.
+   */
+  persistentDir?: string
+  /** Producer origin hash stamped on every `EventMeta`. */
+  originHash: number
+  /**
+   * Open enabled adapters with `persistent: true`. Requires
+   * `persistentDir`.
+   */
+  persistent?: boolean
+  /** Include the tasks model. */
+  withTasks?: boolean
+  /** Include the memories model. */
+  withMemories?: boolean
 }
 
 /** Net keypair for encrypted UDP transport. */

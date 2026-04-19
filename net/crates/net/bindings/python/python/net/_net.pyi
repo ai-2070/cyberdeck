@@ -392,3 +392,42 @@ class MemoryWatchIter(Iterator[List[Memory]]):
     def __iter__(self) -> "MemoryWatchIter": ...
     def __next__(self) -> List[Memory]: ...
     def close(self) -> None: ...
+
+class NetDb:
+    """Unified NetDB handle bundling TasksAdapter + MemoriesAdapter.
+
+    Access per-model adapters via the `.tasks` / `.memories`
+    properties. For raw event / stream access, drop down to the
+    underlying adapters.
+    """
+
+    @staticmethod
+    def open(
+        *,
+        origin_hash: int,
+        persistent_dir: Optional[str] = None,
+        persistent: bool = False,
+        with_tasks: bool = False,
+        with_memories: bool = False,
+    ) -> "NetDb": ...
+
+    @staticmethod
+    def open_from_snapshot(
+        bundle: bytes,
+        *,
+        origin_hash: int,
+        persistent_dir: Optional[str] = None,
+        persistent: bool = False,
+        with_tasks: bool = False,
+        with_memories: bool = False,
+    ) -> "NetDb": ...
+
+    @property
+    def tasks(self) -> Optional[TasksAdapter]: ...
+
+    @property
+    def memories(self) -> Optional[MemoriesAdapter]: ...
+
+    def snapshot(self) -> bytes: ...
+
+    def close(self) -> None: ...

@@ -1308,6 +1308,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<cortex::PyMemory>()?;
         m.add_class::<cortex::PyMemoriesAdapter>()?;
         m.add_class::<cortex::PyMemoryWatchIter>()?;
+        m.add_class::<cortex::PyNetDb>()?;
     }
     Ok(())
 }

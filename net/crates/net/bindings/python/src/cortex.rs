@@ -173,6 +173,7 @@ impl PyTask {
 
 /// Typed tasks adapter handle.
 #[pyclass(name = "TasksAdapter")]
+#[derive(Clone)]
 pub struct PyTasksAdapter {
     inner: Arc<InnerTasksAdapter>,
     runtime: Arc<Runtime>,
@@ -551,6 +552,7 @@ impl PyMemory {
 
 /// Typed memories adapter handle.
 #[pyclass(name = "MemoriesAdapter")]
+#[derive(Clone)]
 pub struct PyMemoriesAdapter {
     inner: Arc<InnerMemoriesAdapter>,
     runtime: Arc<Runtime>,
@@ -899,5 +901,193 @@ impl PyMemoryWatchIter {
     fn close(&self) {
         self.inner.is_shutdown.store(true, Ordering::Release);
         self.inner.shutdown.notify_waiters();
+    }
+}
+
+// =========================================================================
+// NetDB — unified query façade over tasks + memories
+// =========================================================================
+
+use ::net::adapter::net::netdb::NetDbSnapshot as InnerNetDbSnapshot;
+
+/// Unified NetDB handle bundling `TasksAdapter` + `MemoriesAdapter`.
+///
+/// Construct via [`PyNetDb::open`] / [`PyNetDb::open_from_snapshot`].
+/// Access per-model adapters via the `tasks` / `memories` properties.
+///
+/// For raw event / stream access, drop down to the underlying
+/// adapters (or RedEX directly).
+#[pyclass(name = "NetDb")]
+pub struct PyNetDb {
+    tasks: Option<PyTasksAdapter>,
+    memories: Option<PyMemoriesAdapter>,
+}
+
+#[pymethods]
+impl PyNetDb {
+    /// Open a NetDB with the requested models. Each enabled model
+    /// spawns its own CortEX fold task on its own tokio runtime.
+    #[staticmethod]
+    #[pyo3(signature = (
+        *,
+        origin_hash,
+        persistent_dir = None,
+        persistent = false,
+        with_tasks = false,
+        with_memories = false,
+    ))]
+    fn open(
+        origin_hash: u32,
+        persistent_dir: Option<String>,
+        persistent: bool,
+        with_tasks: bool,
+        with_memories: bool,
+    ) -> PyResult<Self> {
+        let redex = match &persistent_dir {
+            Some(dir) => PyRedex {
+                inner: Arc::new(InnerRedex::new().with_persistent_dir(dir)),
+                persistent_dir: Some(dir.clone()),
+            },
+            None => PyRedex {
+                inner: Arc::new(InnerRedex::new()),
+                persistent_dir: None,
+            },
+        };
+
+        let tasks = if with_tasks {
+            Some(PyTasksAdapter::open(&redex, origin_hash, persistent)?)
+        } else {
+            None
+        };
+        let memories = if with_memories {
+            Some(PyMemoriesAdapter::open(&redex, origin_hash, persistent)?)
+        } else {
+            None
+        };
+
+        Ok(Self { tasks, memories })
+    }
+
+    /// Open a NetDB and restore each enabled model's state from the
+    /// bundle. Models whose bundle entry is `None` are opened from
+    /// scratch (equivalent to `open` for that model).
+    #[staticmethod]
+    #[pyo3(signature = (
+        bundle,
+        *,
+        origin_hash,
+        persistent_dir = None,
+        persistent = false,
+        with_tasks = false,
+        with_memories = false,
+    ))]
+    fn open_from_snapshot(
+        bundle: &[u8],
+        origin_hash: u32,
+        persistent_dir: Option<String>,
+        persistent: bool,
+        with_tasks: bool,
+        with_memories: bool,
+    ) -> PyResult<Self> {
+        let snapshot = InnerNetDbSnapshot::decode(bundle)
+            .map_err(|e| PyRuntimeError::new_err(format!("decode bundle: {}", e)))?;
+
+        let redex = match &persistent_dir {
+            Some(dir) => PyRedex {
+                inner: Arc::new(InnerRedex::new().with_persistent_dir(dir)),
+                persistent_dir: Some(dir.clone()),
+            },
+            None => PyRedex {
+                inner: Arc::new(InnerRedex::new()),
+                persistent_dir: None,
+            },
+        };
+
+        let tasks = if with_tasks {
+            match snapshot.tasks {
+                Some((bytes, last_seq)) => Some(PyTasksAdapter::open_from_snapshot(
+                    &redex,
+                    origin_hash,
+                    &bytes,
+                    last_seq,
+                    persistent,
+                )?),
+                None => Some(PyTasksAdapter::open(&redex, origin_hash, persistent)?),
+            }
+        } else {
+            None
+        };
+
+        let memories = if with_memories {
+            match snapshot.memories {
+                Some((bytes, last_seq)) => Some(PyMemoriesAdapter::open_from_snapshot(
+                    &redex,
+                    origin_hash,
+                    &bytes,
+                    last_seq,
+                    persistent,
+                )?),
+                None => Some(PyMemoriesAdapter::open(&redex, origin_hash, persistent)?),
+            }
+        } else {
+            None
+        };
+
+        Ok(Self { tasks, memories })
+    }
+
+    /// The tasks adapter, or `None` if tasks weren't enabled.
+    #[getter]
+    fn tasks(&self) -> Option<PyTasksAdapter> {
+        self.tasks.clone()
+    }
+
+    /// The memories adapter, or `None` if memories weren't enabled.
+    #[getter]
+    fn memories(&self) -> Option<PyMemoriesAdapter> {
+        self.memories.clone()
+    }
+
+    /// Snapshot every enabled model into one opaque bincode blob.
+    /// Persist the returned bytes; restore via `open_from_snapshot`.
+    fn snapshot(&self) -> PyResult<Vec<u8>> {
+        let tasks = match &self.tasks {
+            Some(t) => Some(
+                t.inner
+                    .snapshot()
+                    .map_err(|e| PyRuntimeError::new_err(format!("snapshot tasks: {}", e)))?,
+            ),
+            None => None,
+        };
+        let memories = match &self.memories {
+            Some(m) => Some(
+                m.inner
+                    .snapshot()
+                    .map_err(|e| PyRuntimeError::new_err(format!("snapshot memories: {}", e)))?,
+            ),
+            None => None,
+        };
+        let snap = InnerNetDbSnapshot { tasks, memories };
+        snap.encode()
+            .map_err(|e| PyRuntimeError::new_err(format!("encode bundle: {}", e)))
+    }
+
+    /// Close every enabled adapter. Idempotent.
+    fn close(&self) -> PyResult<()> {
+        if let Some(t) = &self.tasks {
+            t.close()?;
+        }
+        if let Some(m) = &self.memories {
+            m.close()?;
+        }
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "NetDb(tasks={}, memories={})",
+            self.tasks.is_some(),
+            self.memories.is_some()
+        )
     }
 }
