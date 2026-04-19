@@ -1,7 +1,7 @@
 //! `CortexAdapter<State>` — one RedEX file, one fold, one materialized
 //! state.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
@@ -39,7 +39,12 @@ struct AdapterInner<State> {
     /// Highest RedEX seq applied to state, as a signed i64 so we can
     /// sentinel "nothing folded yet" with `start_seq - 1` (can be
     /// negative when `start_seq == 0`).
-    folded_through_seq: AtomicI64,
+    /// Highest RedEX seq folded into state, or `u64::MAX` as the
+    /// "nothing folded yet" sentinel. `u64::MAX` is safe as a
+    /// sentinel because the `open_from_snapshot` overflow guard
+    /// rejects `last_seq == u64::MAX`, so no real event can ever
+    /// occupy that slot.
+    folded_through_seq: AtomicU64,
     fold_errors: AtomicU64,
     running: AtomicBool,
     closed: AtomicBool,
@@ -62,10 +67,10 @@ impl<State> CortexAdapter<State> {
     /// `None` if no event has been folded yet since open.
     pub fn folded_through_seq(&self) -> Option<u64> {
         let v = self.inner.folded_through_seq.load(Ordering::Acquire);
-        if v < 0 {
+        if v == u64::MAX {
             None
         } else {
-            Some(v as u64)
+            Some(v)
         }
     }
 
@@ -96,13 +101,17 @@ impl<State> CortexAdapter<State> {
     /// // state reflects the ingest.
     /// ```
     pub async fn wait_for_seq(&self, seq: u64) {
-        let target = seq as i64;
         loop {
             let notified = self.inner.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            if self.inner.folded_through_seq.load(Ordering::Acquire) >= target {
+            let watermark = self.inner.folded_through_seq.load(Ordering::Acquire);
+            // `u64::MAX` is the "nothing folded yet" sentinel — any
+            // other value is a real applied seq, so `watermark >= seq`
+            // after the sentinel check returns exactly when seq has
+            // been applied.
+            if watermark != u64::MAX && watermark >= seq {
                 return;
             }
             if !self.inner.running.load(Ordering::Acquire) {
@@ -189,15 +198,22 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
         };
 
         let state = Arc::new(RwLock::new(initial_state));
-        // Initial watermark is start_seq - 1 (can be -1 for FromBeginning)
-        // so that `folded_through_seq >= start_seq` holds iff the seq
-        // has actually been applied.
-        let initial_watermark = (start_seq as i64).wrapping_sub(1);
+        // Initial watermark encodes "applied through start_seq-1", so
+        // `wait_for_seq(start_seq-1)` returns immediately after open
+        // (those seqs are conceptually behind us) while
+        // `wait_for_seq(start_seq)` blocks until the first event
+        // actually folds. `start_seq == 0` encodes the "nothing
+        // folded yet" state with the `u64::MAX` sentinel.
+        let initial_watermark: u64 = if start_seq == 0 {
+            u64::MAX
+        } else {
+            start_seq - 1
+        };
         let (changes_tx, _) = broadcast::channel(CHANGES_BROADCAST_CAP);
         let inner = Arc::new(AdapterInner {
             file: file.clone(),
             state: state.clone(),
-            folded_through_seq: AtomicI64::new(initial_watermark),
+            folded_through_seq: AtomicU64::new(initial_watermark),
             fold_errors: AtomicU64::new(0),
             running: AtomicBool::new(true),
             closed: AtomicBool::new(false),
@@ -272,10 +288,10 @@ where
             CortexAdapterError::Redex(RedexError::Encode(format!("snapshot serialize: {}", e)))
         })?;
         let watermark = self.inner.folded_through_seq.load(Ordering::Acquire);
-        let last_seq = if watermark < 0 {
+        let last_seq = if watermark == u64::MAX {
             None
         } else {
-            Some(watermark as u64)
+            Some(watermark)
         };
         Ok((bytes, last_seq))
     }
@@ -377,7 +393,7 @@ where
         if advance {
             inner
                 .folded_through_seq
-                .store(seq as i64, Ordering::Release);
+                .store(seq, Ordering::Release);
         }
         r
     };

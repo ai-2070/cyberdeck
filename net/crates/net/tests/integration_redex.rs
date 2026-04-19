@@ -726,6 +726,80 @@ mod persistent {
 
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    #[tokio::test]
+    async fn test_regression_torn_dat_tail_truncates_on_reopen() {
+        // Regression: previously, `DiskSegment::open` only truncated
+        // a partial trailing `idx` record. A crash mid-`dat` write
+        // (before the corresponding `idx` record was flushed) left
+        // trailing garbage bytes in `dat` that recovery preserved —
+        // the next heap append would start after the garbage,
+        // creating a permanent hole in the recovered segment. The
+        // fix walks the index backward dropping entries whose
+        // `(offset + len)` overruns the actual dat length, then
+        // truncates trailing unreferenced dat bytes.
+        //
+        // We simulate the torn-dat scenario by: open, append one
+        // full heap event, close, then append GARBAGE bytes directly
+        // to the dat file (no corresponding idx record). Reopen must
+        // truncate the garbage and produce a clean state.
+        let base = tmpdir("torn_dat");
+        let name = cn("durable/torn");
+        let cfg = RedexFileConfig::default().with_persistent(true);
+
+        {
+            let r = Redex::new().with_persistent_dir(&base);
+            let f = r.open_file(&name, cfg).unwrap();
+            f.append(b"clean-event-payload").unwrap();
+            r.close_file(&name).unwrap();
+        }
+
+        // Simulate a torn dat write: append partial payload bytes to
+        // dat without updating idx. Reopen must discard them.
+        let dat_path = base.join("durable/torn/dat");
+        let mut dat = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&dat_path)
+            .unwrap();
+        use std::io::Write;
+        dat.write_all(b"\xFF\xFF\xFF partial garbage \xFF\xFF")
+            .unwrap();
+        dat.sync_all().unwrap();
+        drop(dat);
+
+        let dat_len_before = std::fs::metadata(&dat_path).unwrap().len();
+        assert!(
+            dat_len_before > b"clean-event-payload".len() as u64,
+            "setup: dat must contain garbage before reopen"
+        );
+
+        // Reopen.
+        let r2 = Redex::new().with_persistent_dir(&base);
+        let f2 = r2.open_file(&name, cfg).unwrap();
+        assert_eq!(
+            f2.len(),
+            1,
+            "reopen must keep only the one clean entry"
+        );
+        let ev = &f2.read_range(0, 1)[0];
+        assert_eq!(ev.payload.as_ref(), b"clean-event-payload");
+
+        // Trailing dat garbage must have been truncated on reopen.
+        let dat_len_after = std::fs::metadata(&dat_path).unwrap().len();
+        assert_eq!(
+            dat_len_after,
+            b"clean-event-payload".len() as u64,
+            "reopen must truncate trailing unreferenced dat bytes"
+        );
+
+        // A fresh append must land at the correct offset (no hole).
+        f2.append(b"after-recovery").unwrap();
+        let events = f2.read_range(0, 2);
+        assert_eq!(events[0].payload.as_ref(), b"clean-event-payload");
+        assert_eq!(events[1].payload.as_ref(), b"after-recovery");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
 
 #[tokio::test]

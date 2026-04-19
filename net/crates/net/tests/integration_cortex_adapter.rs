@@ -337,6 +337,46 @@ async fn test_burst_ordering_preserved() {
 }
 
 #[tokio::test]
+async fn test_regression_folded_through_seq_sentinel_handles_u64_range() {
+    // Regression: `folded_through_seq` used to be stored as `i64`
+    // with `-1` as the "nothing folded yet" sentinel, and
+    // `wait_for_seq` cast `u64 -> i64` to compare. Any seq above
+    // `i64::MAX` would wrap negative, making the comparison
+    // incorrect for extremely long-lived logs. The fix switches to
+    // `AtomicU64` with `u64::MAX` as the sentinel (safe because
+    // `open_from_snapshot` rejects `last_seq == u64::MAX`).
+    //
+    // We can't easily generate a seq > i64::MAX in a unit test, but
+    // we CAN verify the sentinel transitions observably: a fresh
+    // adapter reports `folded_through_seq == None`; after an
+    // ingest + `wait_for_seq`, it reports `Some(seq)`.
+    let redex = Redex::new();
+    let adapter = CortexAdapter::<RecorderState>::open(
+        &redex,
+        &cn("cortex/sentinel"),
+        RedexFileConfig::default(),
+        CortexAdapterConfig::default(),
+        RecorderFold,
+        RecorderState::default(),
+    )
+    .unwrap();
+
+    assert!(
+        adapter.folded_through_seq().is_none(),
+        "fresh adapter must report the 'nothing folded yet' sentinel as None"
+    );
+
+    let seq = adapter.ingest(mk_env(1, 0, b"")).unwrap();
+    adapter.wait_for_seq(seq).await;
+
+    assert_eq!(
+        adapter.folded_through_seq(),
+        Some(seq),
+        "after ingest + wait_for_seq, folded_through_seq must be the applied seq"
+    );
+}
+
+#[tokio::test]
 async fn test_state_handle_is_shared_arc() {
     // Verify that the Arc returned by state() is the same one the
     // fold task writes to.

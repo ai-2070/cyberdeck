@@ -158,22 +158,60 @@ impl RedexFile {
     }
 
     /// Append one event. Returns the assigned sequence.
+    ///
+    /// Failure modes: `PayloadTooLarge` if the segment is full or the
+    /// offset would overflow u32; `Io(_)` if the disk mirror fails
+    /// under `redex-disk`. Failure atomicity: memory is committed
+    /// only after the disk write succeeds (for persistent files);
+    /// `next_seq` is rolled back on disk failure so no seq number is
+    /// burnt and no in-memory entry diverges from disk.
     pub fn append(&self, payload: &[u8]) -> Result<u64, RedexError> {
         self.check_not_closed()?;
-        let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
         let cks = payload_checksum(payload);
         let ts = now_ns();
 
         let mut state = self.inner.state.lock();
-        let offset = state.segment.append(payload)?;
-        let entry = RedexEntry::new_heap(seq, offset_to_u32(offset)?, payload.len() as u32, 0, cks);
-        state.index.push(entry);
-        state.timestamps.push(ts);
 
+        // Pre-validate capacity + offset width under the state lock —
+        // no side effects yet.
+        let current_live = state.segment.live_bytes();
+        if current_live.saturating_add(payload.len()) > MAX_SEGMENT_BYTES {
+            return Err(RedexError::PayloadTooLarge {
+                size: payload.len(),
+                max: MAX_SEGMENT_BYTES.saturating_sub(current_live),
+            });
+        }
+        let offset = state
+            .segment
+            .base_offset()
+            .saturating_add(current_live as u64);
+        let offset_u32 = offset_to_u32(offset)?;
+
+        // Allocate seq only after validation, under the state lock.
+        // Concurrent writers also take the lock, so if we roll back
+        // on disk failure no other writer has observed our value.
+        let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
+        let entry = RedexEntry::new_heap(seq, offset_u32, payload.len() as u32, 0, cks);
+
+        // Disk FIRST. If it fails, roll back the seq allocation and
+        // leave memory untouched so callers don't observe a record
+        // that was never durably persisted.
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.disk() {
-            disk.append_entry(&entry, payload)?;
+            if let Err(e) = disk.append_entry(&entry, payload) {
+                self.inner.next_seq.fetch_sub(1, Ordering::AcqRel);
+                return Err(e);
+            }
         }
+
+        // Commit to memory. `segment.append` is infallible here —
+        // we pre-validated its capacity above.
+        state
+            .segment
+            .append(payload)
+            .expect("pre-validated capacity; segment append cannot fail");
+        state.index.push(entry);
+        state.timestamps.push(ts);
 
         let event = RedexEvent {
             entry,
@@ -185,22 +223,28 @@ impl RedexFile {
     }
 
     /// Append a fixed-length 8-byte inline payload. Skips the segment
-    /// indirection. Returns the assigned sequence.
+    /// indirection. Returns the assigned sequence. Same failure-
+    /// atomicity contract as [`Self::append`].
     pub fn append_inline(&self, payload: &[u8; INLINE_PAYLOAD_SIZE]) -> Result<u64, RedexError> {
         self.check_not_closed()?;
-        let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
         let cks = payload_checksum(payload);
-        let entry = RedexEntry::new_inline(seq, payload, cks);
         let ts = now_ns();
 
         let mut state = self.inner.state.lock();
-        state.index.push(entry);
-        state.timestamps.push(ts);
+
+        let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
+        let entry = RedexEntry::new_inline(seq, payload, cks);
 
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.disk() {
-            disk.append_entry(&entry, payload)?;
+            if let Err(e) = disk.append_entry(&entry, payload) {
+                self.inner.next_seq.fetch_sub(1, Ordering::AcqRel);
+                return Err(e);
+            }
         }
+
+        state.index.push(entry);
+        state.timestamps.push(ts);
 
         let event = RedexEvent {
             entry,
@@ -214,11 +258,13 @@ impl RedexFile {
     /// Append many payloads. Returns the sequence of the FIRST event
     /// in the batch. All entries land contiguously in the index.
     ///
-    /// Failure atomicity: seq numbers are allocated **after** the
-    /// batch is validated to fit (both segment capacity and `u32`
-    /// offset width). A batch that can't fit returns `PayloadTooLarge`
-    /// without advancing `next_seq`, so no gaps appear in the seq
-    /// space.
+    /// Failure atomicity:
+    /// - seq numbers are allocated **after** the batch is validated
+    ///   to fit (both segment capacity and u32 offset width);
+    /// - for persistent files, the batch is written to disk **before**
+    ///   any in-memory commit — on disk failure the seq allocation
+    ///   rolls back and neither memory nor subscribers observe the
+    ///   batch.
     pub fn append_batch(&self, payloads: &[Bytes]) -> Result<u64, RedexError> {
         self.check_not_closed()?;
         if payloads.is_empty() {
@@ -240,49 +286,66 @@ impl RedexFile {
                 max: MAX_SEGMENT_BYTES.saturating_sub(current_live),
             });
         }
-        let final_offset = state
+        let base = state
             .segment
             .base_offset()
-            .saturating_add(current_live as u64)
-            .saturating_add(total_bytes as u64);
+            .saturating_add(current_live as u64);
+        let final_offset = base.saturating_add(total_bytes as u64);
         offset_to_u32(final_offset)?;
 
-        // All appends will succeed — allocate the contiguous seq range.
+        // Allocate the contiguous seq range under the lock so that
+        // a rollback on disk failure is safe — no other writer can
+        // advance past our allocation while we hold the state lock.
         let first_seq = self
             .inner
             .next_seq
             .fetch_add(payloads.len() as u64, Ordering::AcqRel);
 
+        // Pre-compute entries + running offsets without touching
+        // the segment yet. This lets us write the batch to disk
+        // before committing any in-memory state.
         let mut events: Vec<RedexEvent> = Vec::with_capacity(payloads.len());
+        let mut running = base;
         for (i, payload) in payloads.iter().enumerate() {
             let seq = first_seq + i as u64;
             let cks = payload_checksum(payload);
-            let offset = state
-                .segment
-                .append(payload)
-                .expect("pre-validated capacity; segment append cannot fail under the state lock");
             let entry = RedexEntry::new_heap(
                 seq,
-                offset_to_u32(offset).expect("pre-validated final offset fits u32"),
+                offset_to_u32(running).expect("pre-validated final offset fits u32"),
                 payload.len() as u32,
                 0,
                 cks,
             );
-            state.index.push(entry);
-            state.timestamps.push(ts);
+            running = running.saturating_add(payload.len() as u64);
             events.push(RedexEvent {
                 entry,
                 payload: payload.clone(),
             });
         }
 
+        // Disk FIRST. Roll back the seq range on failure so no seq
+        // is burnt and memory stays clean.
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.disk() {
             let pairs: Vec<(RedexEntry, &[u8])> = events
                 .iter()
                 .map(|e| (e.entry, e.payload.as_ref()))
                 .collect();
-            disk.append_entries(&pairs)?;
+            if let Err(e) = disk.append_entries(&pairs) {
+                self.inner
+                    .next_seq
+                    .fetch_sub(payloads.len() as u64, Ordering::AcqRel);
+                return Err(e);
+            }
+        }
+
+        // Commit to memory. Pre-validated capacity → infallible.
+        for event in &events {
+            state.segment.append(&event.payload).expect(
+                "pre-validated capacity; segment append cannot fail under the state lock",
+            );
+            state.index.push(event.entry);
+            state.timestamps.push(ts);
         }
 
         for event in &events {
@@ -299,22 +362,44 @@ impl RedexFile {
     /// produce out-of-seq-order index insertions under contention.
     ///
     /// Used by [`super::OrderedAppender`] for replay determinism.
+    /// Same failure-atomicity contract as [`Self::append`].
     pub fn append_ordered(&self, payload: &[u8]) -> Result<u64, RedexError> {
         self.check_not_closed()?;
         let cks = payload_checksum(payload);
         let ts = now_ns();
 
         let mut state = self.inner.state.lock();
+
+        let current_live = state.segment.live_bytes();
+        if current_live.saturating_add(payload.len()) > MAX_SEGMENT_BYTES {
+            return Err(RedexError::PayloadTooLarge {
+                size: payload.len(),
+                max: MAX_SEGMENT_BYTES.saturating_sub(current_live),
+            });
+        }
+        let offset = state
+            .segment
+            .base_offset()
+            .saturating_add(current_live as u64);
+        let offset_u32 = offset_to_u32(offset)?;
+
         let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
-        let offset = state.segment.append(payload)?;
-        let entry = RedexEntry::new_heap(seq, offset_to_u32(offset)?, payload.len() as u32, 0, cks);
-        state.index.push(entry);
-        state.timestamps.push(ts);
+        let entry = RedexEntry::new_heap(seq, offset_u32, payload.len() as u32, 0, cks);
 
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.disk() {
-            disk.append_entry(&entry, payload)?;
+            if let Err(e) = disk.append_entry(&entry, payload) {
+                self.inner.next_seq.fetch_sub(1, Ordering::AcqRel);
+                return Err(e);
+            }
         }
+
+        state
+            .segment
+            .append(payload)
+            .expect("pre-validated capacity; segment append cannot fail");
+        state.index.push(entry);
+        state.timestamps.push(ts);
 
         let event = RedexEvent {
             entry,
@@ -326,7 +411,7 @@ impl RedexFile {
     }
 
     /// Ordered variant of [`Self::append_inline`]. See
-    /// [`Self::append_ordered`].
+    /// [`Self::append_ordered`]. Same failure-atomicity contract.
     pub fn append_inline_ordered(
         &self,
         payload: &[u8; INLINE_PAYLOAD_SIZE],
@@ -338,13 +423,17 @@ impl RedexFile {
         let mut state = self.inner.state.lock();
         let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
         let entry = RedexEntry::new_inline(seq, payload, cks);
-        state.index.push(entry);
-        state.timestamps.push(ts);
 
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.disk() {
-            disk.append_entry(&entry, payload)?;
+            if let Err(e) = disk.append_entry(&entry, payload) {
+                self.inner.next_seq.fetch_sub(1, Ordering::AcqRel);
+                return Err(e);
+            }
         }
+
+        state.index.push(entry);
+        state.timestamps.push(ts);
 
         let event = RedexEvent {
             entry,
@@ -358,7 +447,8 @@ impl RedexFile {
     /// Ordered variant of [`Self::append_batch`]. The whole batch is
     /// appended under one state-lock acquisition, so it's both
     /// atomic (all-or-nothing within the batch) and strictly
-    /// seq-ordered relative to any other ordered writers.
+    /// seq-ordered relative to any other ordered writers. Same
+    /// failure-atomicity contract as [`Self::append_batch`].
     pub fn append_batch_ordered(&self, payloads: &[Bytes]) -> Result<u64, RedexError> {
         self.check_not_closed()?;
         if payloads.is_empty() {
@@ -377,11 +467,11 @@ impl RedexFile {
                 max: MAX_SEGMENT_BYTES.saturating_sub(current_live),
             });
         }
-        let final_offset = state
+        let base = state
             .segment
             .base_offset()
-            .saturating_add(current_live as u64)
-            .saturating_add(total_bytes as u64);
+            .saturating_add(current_live as u64);
+        let final_offset = base.saturating_add(total_bytes as u64);
         offset_to_u32(final_offset)?;
 
         let first_seq = self
@@ -389,36 +479,48 @@ impl RedexFile {
             .next_seq
             .fetch_add(payloads.len() as u64, Ordering::AcqRel);
 
+        // Pre-compute entries without touching the segment yet.
         let mut events: Vec<RedexEvent> = Vec::with_capacity(payloads.len());
+        let mut running = base;
         for (i, payload) in payloads.iter().enumerate() {
             let seq = first_seq + i as u64;
             let cks = payload_checksum(payload);
-            let offset = state
-                .segment
-                .append(payload)
-                .expect("pre-validated capacity; segment append cannot fail under the state lock");
             let entry = RedexEntry::new_heap(
                 seq,
-                offset_to_u32(offset).expect("pre-validated final offset fits u32"),
+                offset_to_u32(running).expect("pre-validated final offset fits u32"),
                 payload.len() as u32,
                 0,
                 cks,
             );
-            state.index.push(entry);
-            state.timestamps.push(ts);
+            running = running.saturating_add(payload.len() as u64);
             events.push(RedexEvent {
                 entry,
                 payload: payload.clone(),
             });
         }
 
+        // Disk FIRST. Roll back seq range on failure.
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.disk() {
             let pairs: Vec<(RedexEntry, &[u8])> = events
                 .iter()
                 .map(|e| (e.entry, e.payload.as_ref()))
                 .collect();
-            disk.append_entries(&pairs)?;
+            if let Err(e) = disk.append_entries(&pairs) {
+                self.inner
+                    .next_seq
+                    .fetch_sub(payloads.len() as u64, Ordering::AcqRel);
+                return Err(e);
+            }
+        }
+
+        // Commit to memory.
+        for event in &events {
+            state.segment.append(&event.payload).expect(
+                "pre-validated capacity; segment append cannot fail under the state lock",
+            );
+            state.index.push(event.entry);
+            state.timestamps.push(ts);
         }
 
         for event in &events {
@@ -1002,5 +1104,99 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, RedexError::SegmentOffsetOverflow { .. }));
         assert_eq!(f.next_seq(), 1);
+    }
+
+    // ---- Durability-first append regressions (persistent files) ----
+
+    #[cfg(feature = "redex-disk")]
+    fn tmp_persistent_dir(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "redex_persist_{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[cfg(feature = "redex-disk")]
+    fn make_persistent(name: &str, dir: &std::path::Path) -> RedexFile {
+        use super::super::manager::Redex;
+        let r = Redex::new().with_persistent_dir(dir);
+        r.open_file(
+            &ChannelName::new(name).unwrap(),
+            RedexFileConfig::default().with_persistent(true),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn test_regression_append_rolls_back_on_disk_failure() {
+        // Regression: `append` used to commit in-memory state (segment
+        // buf, index, timestamps) and advance `next_seq` BEFORE
+        // attempting the disk mirror write. A disk failure left the
+        // caller with an `Err` but memory diverged from disk — a
+        // retry would duplicate the event and a reopen would miss it.
+        // The fix writes to disk FIRST and rolls back the seq + leaves
+        // memory untouched on disk failure.
+        let dir = tmp_persistent_dir("append_rollback");
+        let f = make_persistent("t_rollback/append", &dir);
+        // One real append to prime the file.
+        f.append(b"a").unwrap();
+        assert_eq!(f.next_seq(), 1);
+        assert_eq!(f.len(), 1);
+
+        // Arm a one-shot failure on the next disk write.
+        f.inner.disk.as_ref().unwrap().arm_next_append_failure();
+
+        let err = f.append(b"b").unwrap_err();
+        assert!(matches!(err, RedexError::Io(_)));
+
+        // Invariants that MUST hold after a failed append:
+        // - next_seq was rolled back (no seq burnt)
+        // - in-memory index unchanged (no ghost entry)
+        // - segment bytes unchanged (no orphaned payload)
+        assert_eq!(
+            f.next_seq(),
+            1,
+            "disk failure must roll back next_seq (no burnt seq)"
+        );
+        assert_eq!(f.len(), 1, "index must not grow on disk failure");
+    }
+
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn test_regression_append_batch_rolls_back_on_disk_failure() {
+        // Same contract as above, for `append_batch`. A mid-batch
+        // disk failure must roll back the whole seq range and leave
+        // memory + index untouched.
+        let dir = tmp_persistent_dir("batch_rollback");
+        let f = make_persistent("t_rollback/batch", &dir);
+        f.append(b"a").unwrap();
+        assert_eq!(f.next_seq(), 1);
+
+        f.inner.disk.as_ref().unwrap().arm_next_append_failure();
+
+        let err = f
+            .append_batch(&[
+                Bytes::from_static(b"x"),
+                Bytes::from_static(b"y"),
+                Bytes::from_static(b"z"),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, RedexError::Io(_)));
+
+        assert_eq!(
+            f.next_seq(),
+            1,
+            "batch disk failure must roll back the full seq range"
+        );
+        assert_eq!(f.len(), 1, "index must not grow on batch disk failure");
     }
 }

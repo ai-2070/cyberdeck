@@ -26,6 +26,8 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 
@@ -48,6 +50,12 @@ pub(super) struct DiskSegment {
     dir: PathBuf,
     idx_file: Mutex<File>,
     dat_file: Mutex<File>,
+    /// Test-only injection: when set, the next `append_entry` /
+    /// `append_entries` call returns `RedexError::Io` before touching
+    /// either file. Exercises the caller's rollback paths without
+    /// needing a real I/O failure (disk full, permission denied).
+    #[cfg(test)]
+    fail_next_append: AtomicBool,
 }
 
 impl DiskSegment {
@@ -63,11 +71,11 @@ impl DiskSegment {
         let dat_path = dir.join("dat");
 
         // Recover existing index.
-        let (index, idx_len_truncated) = read_index(&idx_path)?;
-        let payload_bytes = read_payload(&dat_path)?;
+        let (mut index, idx_len_truncated) = read_index(&idx_path)?;
+        let mut payload_bytes = read_payload(&dat_path)?;
 
-        // Open for append. Truncate idx to a whole multiple of 20 bytes
-        // if the last write was torn (crash mid-append).
+        // Torn-idx tail: the last 20-byte write was partial (crash
+        // mid-append). Truncate idx to a whole multiple of 20 bytes.
         if idx_len_truncated {
             let file = OpenOptions::new()
                 .write(true)
@@ -75,6 +83,51 @@ impl DiskSegment {
                 .map_err(RedexError::io)?;
             file.set_len((index.len() * REDEX_ENTRY_SIZE) as u64)
                 .map_err(RedexError::io)?;
+        }
+
+        // Torn-dat tail: our write ordering is dat-before-idx, so a
+        // crash between the two writes leaves dat shorter than the
+        // last idx entry thinks it should be. Walk the index backward
+        // and drop any trailing heap entry whose `(offset + len)` runs
+        // past the actual dat size. Inline entries don't touch dat so
+        // they never trigger recovery.
+        let dat_len = payload_bytes.len() as u64;
+        let mut idx_trimmed = false;
+        while let Some(last) = index.last() {
+            if last.is_inline() {
+                break;
+            }
+            let end = (last.payload_offset as u64).saturating_add(last.payload_len as u64);
+            if end <= dat_len {
+                break;
+            }
+            index.pop();
+            idx_trimmed = true;
+        }
+        if idx_trimmed {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&idx_path)
+                .map_err(RedexError::io)?;
+            file.set_len((index.len() * REDEX_ENTRY_SIZE) as u64)
+                .map_err(RedexError::io)?;
+        }
+        // Trim any trailing dat bytes that no idx entry references.
+        // Finds the highest `(offset + len)` among retained heap
+        // entries and truncates dat to that.
+        let retained_dat_end = index
+            .iter()
+            .filter(|e| !e.is_inline())
+            .map(|e| (e.payload_offset as u64).saturating_add(e.payload_len as u64))
+            .max()
+            .unwrap_or(0);
+        if retained_dat_end < dat_len {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&dat_path)
+                .map_err(RedexError::io)?;
+            file.set_len(retained_dat_end).map_err(RedexError::io)?;
+            payload_bytes.truncate(retained_dat_end as usize);
         }
 
         let idx_file = OpenOptions::new()
@@ -95,10 +148,21 @@ impl DiskSegment {
                 dir,
                 idx_file: Mutex::new(idx_file),
                 dat_file: Mutex::new(dat_file),
+                #[cfg(test)]
+                fail_next_append: AtomicBool::new(false),
             },
             index,
             payload_bytes,
         })
+    }
+
+    /// Test-only: arm a one-shot failure on the next
+    /// `append_entry` / `append_entries` call. Returns `Io` before
+    /// touching either file. Used to exercise the caller's rollback
+    /// paths without needing a real I/O failure.
+    #[cfg(test)]
+    pub(super) fn arm_next_append_failure(&self) {
+        self.fail_next_append.store(true, Ordering::Release);
     }
 
     /// Append an entry and (for heap entries) its payload to disk.
@@ -112,6 +176,10 @@ impl DiskSegment {
         entry: &RedexEntry,
         payload: &[u8],
     ) -> Result<(), RedexError> {
+        #[cfg(test)]
+        if self.fail_next_append.swap(false, Ordering::AcqRel) {
+            return Err(RedexError::Io("test-injected append failure".into()));
+        }
         if !entry.is_inline() {
             let mut dat = self.dat_file.lock();
             dat.write_all(payload).map_err(RedexError::io)?;
@@ -128,6 +196,10 @@ impl DiskSegment {
         &self,
         entries_and_payloads: &[(RedexEntry, &[u8])],
     ) -> Result<(), RedexError> {
+        #[cfg(test)]
+        if self.fail_next_append.swap(false, Ordering::AcqRel) {
+            return Err(RedexError::Io("test-injected append failure".into()));
+        }
         let mut dat = self.dat_file.lock();
         for (entry, payload) in entries_and_payloads {
             if !entry.is_inline() {
