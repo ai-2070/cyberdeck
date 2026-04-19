@@ -152,10 +152,13 @@ async fn test_sdk_send_with_retry_succeeds_through_backpressure() {
     }
 
     let stats = a.stream_stats(nid_b, 0x2468).unwrap();
-    // Credit isn't necessarily at the original 64 after the run — it
-    // depends on how many grants arrived. What matters is that no
-    // sends are stuck (no permanently leaked credit).
-    assert!(stats.tx_credit_remaining > 0);
+    // What matters is that the retry path actually engaged — i.e.
+    // some concurrent callers hit Backpressure and `send_with_retry`
+    // absorbed it. `tx_credit_remaining` at end-of-run is unstable
+    // (can legitimately land at 0 if the last commit happened between
+    // the last grant and the snapshot), so we assert on the bumped
+    // rejection counter instead.
+    assert!(stats.backpressure_events > 0);
 
     Arc::try_unwrap(a).ok().unwrap().shutdown().await.unwrap();
     b.shutdown().await.unwrap();

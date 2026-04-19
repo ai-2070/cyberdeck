@@ -129,34 +129,70 @@ Why one counter, not two:
   surfaced as a grant; retransmit is the sender's concern
   surfaced as an ACK. No field is touched by both.
 
-### 4. Receive-side: threshold-emit cadence
+### 4. Receive-side: 1:1 grants at packet-arrival time
+
+> **Shipped behavior.** Both the cadence (1:1, not 50% threshold) and
+> the hook point (packet arrival, not drain) differ from the design
+> originally considered here. See Status §1–§2 for the rationale. The
+> original threshold-and-drain design is kept at the end of this
+> section for historical context.
 
 The receiver tracks how much credit it has *extended* vs how much
-it has *consumed*:
+has arrived off the wire:
 
 ```rust
-pub(crate) struct RxCreditState {
+pub struct RxCreditState {
     /// Total credit granted to this sender since stream open,
     /// including the implicit initial window.
     granted: AtomicU64,
-    /// Total bytes consumed off the inbound queue (drained by the
-    /// daemon via `poll_shard`, forwarded by the scheduler, etc.).
+    /// Total inbound bytes accepted on this stream. Invariant:
+    /// `consumed <= granted` under well-behaved peers.
     consumed: AtomicU64,
-    /// Per-grant chunk size.
+    /// Per-stream enable flag. `0` disables receive-side bookkeeping
+    /// and `on_bytes_consumed` becomes a no-op.
     window_bytes: u32,
 }
 ```
 
-Invariant: `consumed <= granted`. Outstanding (what the sender
-has "used") is `granted - consumed`. When `consumed` catches up
-enough that the sender is within `window_bytes / 2` of exhaustion,
-the receiver emits a `StreamWindow { credit_bytes: window_bytes }`
-and bumps `granted`.
+`on_bytes_consumed(bytes)` runs on the **packet-arrival path** in
+`MeshNode::process_local_packet` (before the payload is queued into
+the inbound shard queue). Each call bumps `consumed` by `bytes`,
+bumps `granted` by the same amount, and returns `Some(bytes)` so the
+caller emits a `StreamWindow { stream_id, credit_bytes: bytes }`
+packet. **One grant per inbound packet (1:1).**
 
-Concretely: after each `poll_shard` / scheduler dequeue, check
-whether `granted - consumed <= (window_bytes / 2).max(1)`. If so, emit a
-grant. Amortizes control traffic — for a 64 KB window, roughly one
-grant per 32 KB consumed, not per-packet.
+Rationale for 1:1 instead of threshold: a receiver auto-creating a
+stream on first packet doesn't know the sender's `window_bytes`
+(the sender is the only side that called `open_stream`). A small
+sender window paired with a default receiver window (64 KB) would
+let `consumed` rise forever without crossing the receiver's
+threshold — the stream would stall after the implicit initial
+window drained. 1:1 makes that failure mode impossible at the cost
+of one control packet per data packet. On LANs and typical mesh
+deployments the overhead is negligible. If traffic volume ever
+justifies amortizing, the wire format accommodates grants of
+arbitrary `credit_bytes` without breaking older senders.
+
+**Historical — original threshold design.** The earlier draft had
+the receiver accumulate `consumed` at drain time (`poll_shard` /
+scheduler dequeue) and only emit a grant when
+`granted - consumed <= (window_bytes / 2).max(1)`. Two problems led
+to the shipped design:
+- Drain-time accounting requires `StoredEvent` to carry
+  `(peer_node_id, stream_id)` so `poll_shard` can look up the
+  owning `RxCreditState`. `StoredEvent` is shared across every
+  adapter (Redis, JetStream, RedEX, Net) — adding those fields
+  there is out of scope for a transport-layer change.
+- Threshold emission assumed sender and receiver agree on
+  `window_bytes`. Auto-created receive-side streams don't see the
+  sender's configured window, so a mismatch stalls the loop
+  permanently.
+
+A future follow-up can move `on_bytes_consumed` into `poll_shard`
+without a wire-format change once `StoredEvent` is either extended
+or a parallel per-stream inbound queue is added. That would reopen
+the door to drain-time threshold grants for workloads where the
+1:1 control-traffic overhead matters.
 
 ### 5. Send-side: decrement on send, increment on grant
 
@@ -277,7 +313,7 @@ Observability wins: a daemon author seeing `tx_credit_remaining = 0` and `backpr
 1. **Collapse `tx_window` / `tx_inflight` → `tx_credit_remaining`.** Single `AtomicU32` on `StreamState`. Sends do a CAS-loop subtract; grants do a saturating add. `tx_window` as a configured cap goes away — the receiver drives capacity. Back-compat: expose `tx_credit_remaining` through the existing `StreamStats.tx_window` field so callers who read stats don't break; the meaning shifts from "configured cap" to "current remaining credit."
 2. **`StreamWindow` codec.** New `subprotocol/stream_window.rs` with `SUBPROTOCOL_STREAM_WINDOW = 0x0B00` and 12-byte encode/decode. Register in `SubprotocolRegistry::with_defaults`.
 3. **Send-side credit update.** Dispatch handler for `SUBPROTOCOL_STREAM_WINDOW` calls `tx_credit_remaining.fetch_add(grant.credit_bytes, AcqRel)` with saturating semantics.
-4. **Receive-side credit state.** `RxCreditState` per stream; `poll_shard` and the scheduler's forward path increment `consumed`; after each increment, if `granted - consumed < window_bytes / 2`, emit a `StreamWindow` grant and bump `granted`.
+4. **Receive-side credit state.** `RxCreditState` per stream. `on_bytes_consumed(bytes)` runs on the packet-arrival path in `process_local_packet`, bumping both `consumed` and `granted` by `bytes` and returning `Some(bytes)` so the dispatcher emits a `StreamWindow` grant. One grant per inbound packet (1:1). See §4 for the rationale.
 5. **`TxSlotGuard` adjustment.** Guard now refunds the acquired byte count on Drop **only when the send didn't happen** (early cancellation, etc.). Successful-send path consumes the drop without refund — add a `commit()` method on the guard that flags "the bytes are the receiver's now" and suppresses the Drop refund.
 6. **Stats.** Add `credit_grants_received`, `credit_grants_sent`. Plumb through Rust/TS/Python stat accessors. `tx_credit_remaining` is the existing `tx_window` slot, repurposed.
 7. **Docs.** Update `STREAM_BACKPRESSURE_PLAN.md` Status → "v1 shipped; v2 tracked in `STREAM_BACKPRESSURE_PLAN_V2.md`." Update `TRANSPORT.md` back-pressure section to say "catches both concurrent callers AND slow receivers via per-stream credit windows." Update SDK READMEs' Backpressure sections to drop the "v1 only catches concurrent callers" qualifier.
@@ -285,7 +321,7 @@ Observability wins: a daemon author seeing `tx_credit_remaining = 0` and `backpr
 
 ## Tests
 
-- **Unit (`session.rs`)** — CAS-loop decrement on send; saturating add on grant; `TxSlotGuard::commit()` suppresses refund on success; cancelled guard refunds; threshold-emit fires at 50% consumed on the receive side.
+- **Unit (`session.rs`)** — CAS-loop decrement on send; saturating add on grant; `TxSlotGuard::commit()` suppresses refund on success; cancelled guard refunds; `on_bytes_consumed` mints a 1:1 grant on every non-zero input and is a no-op when `window_bytes == 0`.
 - **Unit (`subprotocol/stream_window.rs`)** — 12-byte round-trip; truncated-input rejected; garbage-tag rejected.
 - **Unit (double-counting regression)** — a grant for N bytes and a "send completed" of N bytes must NOT both increase `tx_credit_remaining` for the same N. Drive a controlled sequence and assert invariants on the counter.
 - **Integration (the v1 gap)** — single serial sender with a slow receiver. v1 never saw `Backpressure`; v2 does. Assert `backpressure_events > 0` and `tx_credit_remaining = 0` at peak.
@@ -297,7 +333,7 @@ Observability wins: a daemon author seeing `tx_credit_remaining = 0` and `backpr
 
 - **Default `window_bytes` shift breaks v1 callers.** A caller who wrote `StreamConfig::new().with_window_bytes(256)` in v1 meaning "256 packets" gets "256 bytes" in v2 and sees immediate `Backpressure`. Migration: change the default in a bump-minor version; document in changelog + SDK READMEs. Callers that want the v1-style "unbounded" behavior set `with_window_bytes(0)`.
 - **Receiver-side credit is per-stream, not per-peer.** A chatty stream can exhaust its own window without affecting other streams to the same peer — intentional. A misbehaving receiver that never drains one stream accumulates `granted - consumed` debt forever on that stream; the `RxCreditState` counters grow without bound (they're u64, so realistically fine, but the receiver will stop granting once the sender stalls — the counters don't force bytes to exist). No-op in practice; flagged for completeness.
-- **Threshold-emit cadence is fixed at 50%.** A guess. Bursty drains may want 25% (more aggressive refill); steady workloads 75% (fewer grants). Start with 50%; add a `StreamConfig::credit_refill_threshold` knob only if workloads need it.
+- **1:1 grant cadence adds one control packet per data packet.** Fine on LANs and typical mesh deployments. If a workload ever shows grant volume as a bottleneck, two paths are open without a wire-format change: (a) batch grants by summing `bytes` across a short window in the dispatch handler before emitting, or (b) move the `on_bytes_consumed` hook into `poll_shard` (requires plumbing `stream_id` through `StoredEvent`) and reintroduce a threshold policy there.
 - **Credit grant loss.** `StreamWindow` rides the existing encrypted session. A grant lost on the wire means the sender waits longer than necessary for the *next* grant, which will include the same credit (grants are cumulative in the receiver's state — the sender sees one larger grant later rather than two smaller ones). No special retransmission needed; the worst case is latency, not deadlock. Document.
 - **Interaction with `send_to_peer` / `send_routed` legacy paths.** These don't use `Stream` handles and don't go through the credit window. Leave them unchanged; credit windows are an opt-in feature of the typed `Stream` API. Document.
 - **Stats field width.** `tx_credit_remaining: u32` caps at ~4 GB per-stream inflight credit. More than enough for any realistic workload.

@@ -576,15 +576,16 @@ Benchmarks captured 2026-04-19 via `cargo bench --bench redex --features "redex 
 
 ### Binary size
 
-Release build with `--features net` only, LTO on, single codegen unit, `panic = "abort"`, `opt-level = 3`:
+`[profile.release]`: `lto = true`, `codegen-units = 1`, `panic = "abort"`, `opt-level = 3`. Three additional profiles ship in the crate's `Cargo.toml`: `release-with-debug` (release + `debug = true` for profiling), `native` (release + thin LTO for faster local links — pair with `RUSTFLAGS="-C target-cpu=native"`), and `bench` (full LTO, single codegen unit).
 
-| Artifact | Size | Purpose |
-|----------|-----:|---------|
-| `net.dll` (cdylib) | **848 KB** | Shipped binary; symbols stripped into `.pdb` on MSVC |
-| `net.pdb` | 1.6 MB | Debug symbols, shipped separately |
-| `libnet.rlib` | 17 MB | Rust static lib with metadata (consumed by Rust) |
-| `net.lib` | 29 MB | C/C++ static lib (pre-LTO, as expected for a `staticlib`) |
+Feature set affects `.rlib` and `.a` (which keep all compiled code for downstream linking) but is **almost invisible on the shipped cdylib** — LTO + dead-code elimination strips unreferenced code across feature boundaries, so the deployed `.dylib`/`.dll`/`.so` stays near-constant across feature combinations.
 
-Figures above accurate as of April 17, 2026.
+| Artifact | `--features net` | `--features "net redex cortex netdb"` | Purpose |
+|----------|-----------------:|--------------------------------------:|---------|
+| `libnet.dylib` (cdylib) | **1.08 MB** | **1.08 MB** | Shipped binary |
+| `libnet.rlib` | 18 MB | 21 MB | Rust static lib with metadata (consumed by Rust) |
+| `libnet.a` | 33 MB | 34 MB | C/C++ static lib (pre-LTO, expected for `staticlib`) |
 
-Measured on `x86_64-pc-windows-msvc`. The shipped cdylib fits comfortably under 1 MB despite bundling transport, routing, encryption, identity, load balancing, and the full consumer pipeline.
+Measured on `aarch64-apple-darwin`, 2026-04-19, on the `backpressure-v2` branch (postcard serialization, v2 credit windows wired). Feature-set naming is the post-consolidation form: `cortex-adapter` + `cortex-tasks` + `cortex-memories` collapsed into one `cortex` feature; `netdb` pulls in `cortex` which pulls in `redex` which pulls in `net`, so `--features netdb` is equivalent to the full stack.
+
+The shipped cdylib stays comfortably under 1.2 MB despite bundling transport, routing, encryption, identity, load balancing, and the full consumer pipeline — and the size doesn't grow when callers opt into RedEX, CortEX, or NetDB because those subsystems only get linked in to the extent the caller actually references them.
