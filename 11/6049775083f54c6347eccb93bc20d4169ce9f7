@@ -1,0 +1,45 @@
+net/crates/net/tests/integration_cortex_memories.rs
+  f3669361474f4cb8 11-13,464-538
+net/crates/net/src/adapter/net/redex/disk.rs
+  f3669361474f4cb8 22,146-154,157
+net/crates/net/src/adapter/net/redex/manager.rs
+  f3669361474f4cb8 87-100
+net/crates/net/src/adapter/net/cortex/memories/watch.rs
+  f3669361474f4cb8 26-27,137-146,153,155-163,167-184,190
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  f3669361474f4cb8 16,229-230
+net/crates/net/src/adapter/net/cortex/tasks/watch.rs
+  f3669361474f4cb8 26-27,112-121,128,130-138,142-159,165
+net/crates/net/src/adapter/net/cortex/mod.rs
+  f3669361474f4cb8 35-38
+net/crates/net/src/adapter/net/redex/file.rs
+  f3669361474f4cb8 169,235,275,345,419-427,429,605-613,615-619
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  f3669361474f4cb8 16,228-229
+net/crates/net/tests/integration_cortex_tasks.rs
+  f3669361474f4cb8 11-13,409-475
+net/crates/net/src/adapter/net/cortex/adapter.rs
+  f3669361474f4cb8 123-127
+net/crates/net/src/adapter/net/cortex/meta.rs
+  f3669361474f4cb8 68-71,76,106-115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "116049775083f54c6347eccb93bc20d4169ce9f7",
+  "prompts": {
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3307,
+      "total_deletions": 134,
+      "accepted_lines": 313,
+      "overriden_lines": 0
+    }
+  }
+}
