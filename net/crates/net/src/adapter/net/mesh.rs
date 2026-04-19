@@ -1349,16 +1349,21 @@ impl MeshNode {
         };
 
         if let Some(total_consumed) = grant_bytes {
-            // Find the peer this session belongs to so we know where
-            // to route the grant back. Matches the membership-dispatch
-            // pattern that resolves `from_node` the same way.
-            if let Some(peer) = ctx
-                .peers
-                .iter()
-                .find(|e| e.value().session.session_id() == session.session_id())
-                .map(|e| (e.value().addr, e.value().session.clone()))
+            // Resolve the sending peer via two O(1) DashMap lookups
+            // (`addr_to_node` → `peers`) instead of a linear scan over
+            // `ctx.peers`. At high peer counts the scan would make
+            // packet receive cost proportional to peer count — the
+            // hot path needs to stay constant-time.
+            let peer_addr = session.peer_addr();
+            if let Some((peer_addr, peer_session)) = ctx
+                .addr_to_node
+                .get(&peer_addr)
+                .and_then(|node_id| {
+                    ctx.peers
+                        .get(&*node_id)
+                        .map(|p| (p.value().addr, p.value().session.clone()))
+                })
             {
-                let (peer_addr, peer_session) = peer;
                 Self::spawn_stream_window_grant(
                     ctx,
                     peer_session,
