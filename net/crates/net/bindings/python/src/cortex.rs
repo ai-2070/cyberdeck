@@ -250,10 +250,7 @@ impl PyTasksAdapter {
                 )
             })
             .map_err(|e| {
-                CortexError::new_err(format!(
-                    "TasksAdapter open_from_snapshot failed: {}",
-                    e
-                ))
+                CortexError::new_err(format!("TasksAdapter open_from_snapshot failed: {}", e))
             })?;
         Ok(Self {
             inner: Arc::new(inner),
@@ -624,10 +621,7 @@ impl PyMemoriesAdapter {
                 )
             })
             .map_err(|e| {
-                CortexError::new_err(format!(
-                    "MemoriesAdapter open_from_snapshot failed: {}",
-                    e
-                ))
+                CortexError::new_err(format!("MemoriesAdapter open_from_snapshot failed: {}", e))
             })?;
         Ok(Self {
             inner: Arc::new(inner),

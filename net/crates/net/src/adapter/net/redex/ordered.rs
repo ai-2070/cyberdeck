@@ -53,10 +53,7 @@ impl OrderedAppender {
 
     /// Append a fixed 8-byte inline payload. Same ordering contract
     /// as [`Self::append`].
-    pub fn append_inline(
-        &self,
-        payload: &[u8; INLINE_PAYLOAD_SIZE],
-    ) -> Result<u64, RedexError> {
+    pub fn append_inline(&self, payload: &[u8; INLINE_PAYLOAD_SIZE]) -> Result<u64, RedexError> {
         self.file.append_inline_ordered(payload)
     }
 

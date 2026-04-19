@@ -129,12 +129,12 @@ impl<State> CortexAdapter<State> {
     /// queries: on each emission, the caller re-reads
     /// [`Self::state`] to compute its current view.
     ///
-    /// Lag semantics: if a subscriber falls more than
-    /// [`CHANGES_BROADCAST_CAP`] events behind, the underlying
-    /// broadcast channel drops intermediate events. This
-    /// implementation filters lag errors out silently — by the time
-    /// the subscriber catches up, `state()` reflects the latest
-    /// applied events regardless of how many signals were missed.
+    /// Lag semantics: if a subscriber falls more than 64 events
+    /// behind (the internal broadcast channel capacity), the channel
+    /// drops intermediate events. This implementation filters lag
+    /// errors out silently — by the time the subscriber catches up,
+    /// `state()` reflects the latest applied events regardless of
+    /// how many signals were missed.
     ///
     /// The stream ends when all adapter handles have been dropped
     /// and the fold task has exited.

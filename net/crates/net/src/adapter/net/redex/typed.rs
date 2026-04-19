@@ -46,9 +46,8 @@ impl<T> TypedRedexFile<T> {
 impl<T: Serialize> TypedRedexFile<T> {
     /// Serialize with bincode and append. Returns the assigned seq.
     pub fn append(&self, value: &T) -> Result<u64, RedexError> {
-        let bytes = bincode::serialize(value).map_err(|e| {
-            RedexError::Encode(format!("typed append serialize: {}", e))
-        })?;
+        let bytes = bincode::serialize(value)
+            .map_err(|e| RedexError::Encode(format!("typed append serialize: {}", e)))?;
         self.inner.append(&bytes)
     }
 
@@ -57,9 +56,8 @@ impl<T: Serialize> TypedRedexFile<T> {
     pub fn append_batch(&self, values: &[T]) -> Result<u64, RedexError> {
         let mut buffers: Vec<Bytes> = Vec::with_capacity(values.len());
         for v in values {
-            let bytes = bincode::serialize(v).map_err(|e| {
-                RedexError::Encode(format!("typed append_batch serialize: {}", e))
-            })?;
+            let bytes = bincode::serialize(v)
+                .map_err(|e| RedexError::Encode(format!("typed append_batch serialize: {}", e)))?;
             buffers.push(Bytes::from(bytes));
         }
         self.inner.append_batch(&buffers)
@@ -87,11 +85,7 @@ impl<T: DeserializeOwned + Send + 'static> TypedRedexFile<T> {
     /// Read the half-open range `[start, end)`, returning `(seq, value)`
     /// pairs. Deserialization errors are returned per-entry —
     /// callers decide whether to skip or abort.
-    pub fn read_range(
-        &self,
-        start: u64,
-        end: u64,
-    ) -> Vec<Result<(u64, T), RedexError>> {
+    pub fn read_range(&self, start: u64, end: u64) -> Vec<Result<(u64, T), RedexError>> {
         self.inner
             .read_range(start, end)
             .into_iter()

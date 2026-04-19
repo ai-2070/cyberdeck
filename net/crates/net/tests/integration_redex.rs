@@ -141,7 +141,9 @@ async fn test_ordered_appender_sequential_seqs() {
     // Single-threaded use of OrderedAppender: seqs are strictly
     // 0, 1, 2, ... in the order we call append.
     let r = Redex::new();
-    let f = r.open_file(&cn("ordered/seq"), RedexFileConfig::default()).unwrap();
+    let f = r
+        .open_file(&cn("ordered/seq"), RedexFileConfig::default())
+        .unwrap();
     let appender = OrderedAppender::new(f.clone());
 
     let mut seqs = Vec::new();
@@ -240,7 +242,9 @@ async fn test_typed_redex_file_roundtrip() {
     }
 
     let r = Redex::new();
-    let f = r.open_file(&cn("typed/metrics"), RedexFileConfig::default()).unwrap();
+    let f = r
+        .open_file(&cn("typed/metrics"), RedexFileConfig::default())
+        .unwrap();
     let typed: TypedRedexFile<Metric> = TypedRedexFile::new(f.clone());
 
     for i in 0..50u64 {
@@ -273,7 +277,9 @@ async fn test_typed_redex_file_tail_decode() {
     }
 
     let r = Redex::new();
-    let f = r.open_file(&cn("typed/tail"), RedexFileConfig::default()).unwrap();
+    let f = r
+        .open_file(&cn("typed/tail"), RedexFileConfig::default())
+        .unwrap();
     let typed: TypedRedexFile<Event> = TypedRedexFile::new(f.clone());
 
     let mut stream = Box::pin(typed.tail(0));
@@ -284,7 +290,11 @@ async fn test_typed_redex_file_tail_decode() {
             for i in 0..20u64 {
                 typed2
                     .append(&Event {
-                        kind: if i % 2 == 0 { "even".into() } else { "odd".into() },
+                        kind: if i % 2 == 0 {
+                            "even".into()
+                        } else {
+                            "odd".into()
+                        },
                         payload: vec![i as u8; 4],
                     })
                     .unwrap();
@@ -373,10 +383,7 @@ async fn test_redex_age_based_retention() {
     let events = f.read_range(10, 15);
     assert_eq!(events.len(), 5);
     for (i, ev) in events.iter().enumerate() {
-        assert_eq!(
-            ev.payload.as_ref(),
-            format!("fresh-{}", 10 + i).as_bytes()
-        );
+        assert_eq!(ev.payload.as_ref(), format!("fresh-{}", 10 + i).as_bytes());
     }
 }
 

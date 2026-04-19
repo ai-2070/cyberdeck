@@ -981,10 +981,7 @@ impl NetDb {
     /// bundle. Models whose bundle entry is `None` are opened from
     /// scratch (equivalent to [`Self::open`] for that model).
     #[napi(factory)]
-    pub async fn open_from_snapshot(
-        config: NetDbOpenConfig,
-        bundle: NetDbBundle,
-    ) -> Result<Self> {
+    pub async fn open_from_snapshot(config: NetDbOpenConfig, bundle: NetDbBundle) -> Result<Self> {
         let snapshot = InnerNetDbSnapshot::decode(bundle.state_bytes.as_ref())
             .map_err(|e| netdb_err("decode snapshot bundle", e))?;
         let redex = Self::build_redex(&config);
@@ -1066,9 +1063,7 @@ impl NetDb {
             None => None,
         };
         let snap = InnerNetDbSnapshot { tasks, memories };
-        let bytes = snap
-            .encode()
-            .map_err(|e| netdb_err("encode snapshot", e))?;
+        let bytes = snap.encode().map_err(|e| netdb_err("encode snapshot", e))?;
         Ok(NetDbBundle {
             state_bytes: Buffer::from(bytes),
         })
@@ -1078,9 +1073,7 @@ impl NetDb {
     #[napi]
     pub fn close(&self) -> Result<()> {
         if let Some(t) = &self.tasks {
-            t.inner
-                .close()
-                .map_err(|e| cortex_err("close tasks", e))?;
+            t.inner.close().map_err(|e| cortex_err("close tasks", e))?;
         }
         if let Some(m) = &self.memories {
             m.inner

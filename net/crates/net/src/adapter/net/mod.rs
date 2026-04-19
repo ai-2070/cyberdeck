@@ -39,12 +39,12 @@ pub mod contested;
 pub mod continuity;
 #[cfg(feature = "cortex")]
 pub mod cortex;
-#[cfg(feature = "netdb")]
-pub mod netdb;
 mod crypto;
 mod failure;
 pub mod identity;
 mod mesh;
+#[cfg(feature = "netdb")]
+pub mod netdb;
 mod pool;
 mod protocol;
 mod proxy;
@@ -93,8 +93,6 @@ pub use cortex::{
     CortexAdapter, CortexAdapterConfig, CortexAdapterError, EventEnvelope, EventMeta,
     FoldErrorPolicy, IntoRedexPayload, StartPosition, EVENT_META_SIZE,
 };
-#[cfg(feature = "netdb")]
-pub use netdb::{MemoriesFilter, NetDb, NetDbBuilder, NetDbError, NetDbSnapshot, TasksFilter};
 pub use crypto::{CryptoError, SessionKeys, StaticKeypair};
 pub use failure::{
     CircuitBreaker, CircuitState, FailureDetector, FailureDetectorConfig, FailureStats,
@@ -105,6 +103,8 @@ pub use identity::{
     TokenScope,
 };
 pub use mesh::{MeshNode, MeshNodeConfig, PartitionFilter};
+#[cfg(feature = "netdb")]
+pub use netdb::{MemoriesFilter, NetDb, NetDbBuilder, NetDbError, NetDbSnapshot, TasksFilter};
 pub use pool::{PacketBuilder, PacketPool, SharedLocalPool, SharedPacketPool, ThreadLocalPool};
 pub use protocol::{
     EventFrame, NackPayload, NetHeader, PacketFlags, HEADER_SIZE, NONCE_SIZE, TAG_SIZE,

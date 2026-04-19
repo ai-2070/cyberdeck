@@ -238,7 +238,10 @@ fn bench_snapshot(c: &mut Criterion) {
         // NetDb whole-bundle encode — mirrors NetDb::snapshot.
         group.bench_with_input(
             BenchmarkId::new(
-                format!("netdb_bundle_encode_bytes_{}", tasks_bytes_len + mem_bytes.len()),
+                format!(
+                    "netdb_bundle_encode_bytes_{}",
+                    tasks_bytes_len + mem_bytes.len()
+                ),
                 n,
             ),
             &n,

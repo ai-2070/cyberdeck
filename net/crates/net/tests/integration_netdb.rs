@@ -123,13 +123,25 @@ async fn test_netdb_find_many_on_memories_state() {
         .unwrap();
 
     db.memories()
-        .store(1, "meeting notes", vec!["work".into(), "notes".into()], "alice", 100)
+        .store(
+            1,
+            "meeting notes",
+            vec!["work".into(), "notes".into()],
+            "alice",
+            100,
+        )
         .unwrap();
     db.memories()
         .store(2, "grocery list", vec!["personal".into()], "alice", 200)
         .unwrap();
     db.memories()
-        .store(3, "api design", vec!["work".into(), "design".into()], "bob", 300)
+        .store(
+            3,
+            "api design",
+            vec!["work".into(), "design".into()],
+            "bob",
+            300,
+        )
         .unwrap();
     let seq = db.memories().pin(1, 310).unwrap();
     db.memories().wait_for_seq(seq).await;
@@ -278,4 +290,3 @@ async fn test_netdb_tasks_without_with_tasks_panics() {
     // Should panic — tasks weren't enabled.
     let _ = db.tasks();
 }
-

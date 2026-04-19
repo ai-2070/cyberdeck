@@ -62,17 +62,16 @@ fn bench_append_heap(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
         let payload = vec![0xCDu8; size];
 
-        group.bench_with_input(
-            BenchmarkId::new("heap_file", size),
-            &size,
-            |b, &s| {
-                let r = Redex::new();
-                let f = r
-                    .open_file(&cn(&format!("bench/heap/mem/{}", s)), RedexFileConfig::default())
-                    .unwrap();
-                b.iter(|| f.append(&payload).unwrap());
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("heap_file", size), &size, |b, &s| {
+            let r = Redex::new();
+            let f = r
+                .open_file(
+                    &cn(&format!("bench/heap/mem/{}", s)),
+                    RedexFileConfig::default(),
+                )
+                .unwrap();
+            b.iter(|| f.append(&payload).unwrap());
+        });
     }
 
     group.finish();
@@ -119,19 +118,15 @@ fn bench_append_disk(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
         let payload = vec![0xABu8; size];
 
-        group.bench_with_input(
-            BenchmarkId::new("disk_file", size),
-            &size,
-            |b, &s| {
-                let r = Redex::new().with_persistent_dir(&tmp);
-                let cfg = RedexFileConfig::default().with_persistent(true);
-                // Each bench gets its own channel so appends don't
-                // recover stale state between runs.
-                let name = cn(&format!("bench/disk/{}/{}", s, rand_suffix()));
-                let f = r.open_file(&name, cfg).unwrap();
-                b.iter(|| f.append(&payload).unwrap());
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("disk_file", size), &size, |b, &s| {
+            let r = Redex::new().with_persistent_dir(&tmp);
+            let cfg = RedexFileConfig::default().with_persistent(true);
+            // Each bench gets its own channel so appends don't
+            // recover stale state between runs.
+            let name = cn(&format!("bench/disk/{}/{}", s, rand_suffix()));
+            let f = r.open_file(&name, cfg).unwrap();
+            b.iter(|| f.append(&payload).unwrap());
+        });
     }
 
     group.finish();
