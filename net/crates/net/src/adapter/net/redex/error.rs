@@ -14,12 +14,12 @@ pub enum RedexError {
         max: usize,
     },
 
-    /// Segment offset exceeded `u32::MAX`. Happens on a long-running
-    /// persistent file whose lifetime heap bytes (append, eviction,
-    /// re-append cycles) have crossed the 4 GB `payload_offset` field
-    /// width. Recoverable only by closing and re-opening the file
-    /// (disk recovery resets `base_offset`) or by sweep-time offset
-    /// renormalization in v2.
+    /// Segment offset exceeded `u32::MAX`.
+    ///
+    /// Fires on long-running persistent files whose lifetime heap
+    /// bytes have crossed the 4 GB `payload_offset` field width.
+    /// Recoverable by reopening the file; disk recovery resets the
+    /// base offset. Sweep-time offset renormalization lands in v2.
     #[error("segment offset overflow: offset {offset} exceeds u32::MAX")]
     SegmentOffsetOverflow {
         /// The overflowing absolute offset.
