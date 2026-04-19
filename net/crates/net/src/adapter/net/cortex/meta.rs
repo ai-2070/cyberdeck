@@ -65,12 +65,15 @@ impl EventMeta {
         }
     }
 
-    /// Encode to the 20-byte little-endian wire format.
+    /// Encode to the 20-byte little-endian wire format. The reserved
+    /// `_pad` bytes are always written as zero regardless of what the
+    /// caller stuffed into them — the wire contract says "zero on
+    /// write, ignored on read."
     pub fn to_bytes(&self) -> [u8; EVENT_META_SIZE] {
         let mut out = [0u8; EVENT_META_SIZE];
         out[0] = self.dispatch;
         out[1] = self.flags;
-        out[2..4].copy_from_slice(&self._pad);
+        // out[2..4] stays [0, 0] (reserved pad).
         out[4..8].copy_from_slice(&self.origin_hash.to_le_bytes());
         out[8..16].copy_from_slice(&self.seq_or_ts.to_le_bytes());
         out[16..20].copy_from_slice(&self.checksum.to_le_bytes());
@@ -98,6 +101,16 @@ impl EventMeta {
     pub fn has_flag(&self, bits: u8) -> bool {
         self.flags & bits != 0
     }
+}
+
+/// Compute the xxh3 checksum of a payload tail, truncated to the low
+/// 32 bits. This is the value callers stamp into
+/// [`EventMeta::checksum`]. Disk-recovery / external inspection tools
+/// can reproduce the value by hashing the bytes after the 20-byte
+/// prefix — it is not currently verified on fold.
+#[inline]
+pub fn compute_checksum(tail: &[u8]) -> u32 {
+    xxhash_rust::xxh3::xxh3_64(tail) as u32
 }
 
 #[cfg(test)]

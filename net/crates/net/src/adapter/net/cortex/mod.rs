@@ -32,4 +32,7 @@ pub use adapter::CortexAdapter;
 pub use config::{CortexAdapterConfig, FoldErrorPolicy, StartPosition};
 pub use envelope::{EventEnvelope, IntoRedexPayload};
 pub use error::CortexAdapterError;
-pub use meta::{EventMeta, DISPATCH_RAW, EVENT_META_SIZE, FLAG_CAUSAL, FLAG_CONTINUITY_PROOF};
+pub use meta::{
+    compute_checksum, EventMeta, DISPATCH_RAW, EVENT_META_SIZE, FLAG_CAUSAL,
+    FLAG_CONTINUITY_PROOF,
+};

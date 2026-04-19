@@ -19,7 +19,7 @@
 //!
 //! - Every append writes to the OS page cache (no per-append fsync).
 //! - `close()` fsyncs both files.
-//! - An optional periodic sync task (`RedexFileConfig::sync_interval`)
+//! - Explicit `sync()` calls (and `close()`) fsync both files
 //!   calls `sync_all` on both files; `None` (default) = sync on close
 //!   only.
 
@@ -143,10 +143,18 @@ impl DiskSegment {
         Ok(())
     }
 
-    /// Flush both files to durable storage.
+    /// Flush both files to durable storage. Order matters for crash
+    /// consistency: the payload (`dat`) must be durable before the
+    /// index entry (`idx`) that references it. A crash between the
+    /// two syncs with the old order could leave an index entry
+    /// pointing at bytes that were never flushed — on recovery the
+    /// index would reference torn payload data. With dat-first the
+    /// worst case is an index that's one or more entries shorter
+    /// than the dat, which the torn-tail truncation logic on reopen
+    /// already handles correctly.
     pub(super) fn sync(&self) -> Result<(), RedexError> {
-        self.idx_file.lock().sync_all().map_err(RedexError::io)?;
         self.dat_file.lock().sync_all().map_err(RedexError::io)?;
+        self.idx_file.lock().sync_all().map_err(RedexError::io)?;
         Ok(())
     }
 }

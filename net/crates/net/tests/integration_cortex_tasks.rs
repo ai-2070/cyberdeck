@@ -8,7 +8,9 @@
 #![cfg(feature = "cortex")]
 
 use futures::StreamExt;
-use net::adapter::net::cortex::tasks::{OrderBy, TaskStatus, TasksAdapter};
+use net::adapter::net::channel::ChannelName;
+use net::adapter::net::cortex::tasks::{OrderBy, TaskStatus, TasksAdapter, TASKS_CHANNEL};
+use net::adapter::net::cortex::{compute_checksum, EventMeta, EVENT_META_SIZE};
 use net::adapter::net::redex::Redex;
 #[cfg(feature = "redex-disk")]
 use net::adapter::net::redex::RedexFileConfig;
@@ -402,6 +404,73 @@ async fn test_watch_with_limit_and_order() {
     assert_eq!(last.len(), 2);
     assert_eq!(last[0].id, 5);
     assert_eq!(last[1].id, 4);
+}
+
+#[tokio::test]
+async fn test_regression_checksum_is_computed_not_zero() {
+    // Regression: `EventMeta::checksum` used to be hardcoded to 0 in
+    // the tasks adapter's `ingest_typed`. The documented contract
+    // (see `EventMeta` struct doc in meta.rs) is xxh3 truncation of
+    // the payload tail. Verify the on-disk event's meta.checksum
+    // matches `compute_checksum(tail)`.
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+
+    let seq = tasks.create(42, "distinctive title", 12345).unwrap();
+    tasks.wait_for_seq(seq).await;
+
+    // Read the raw RedEX event for this append.
+    let file = redex
+        .open_file(
+            &ChannelName::new(TASKS_CHANNEL).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+    let events = file.read_range(0, 1);
+    assert_eq!(events.len(), 1, "tasks channel should have one event");
+    let payload = &events[0].payload;
+    let meta = EventMeta::from_bytes(&payload[..EVENT_META_SIZE]).expect("decode meta");
+    let tail = &payload[EVENT_META_SIZE..];
+
+    assert_ne!(meta.checksum, 0, "checksum must not be hardcoded to 0");
+    assert_eq!(
+        meta.checksum,
+        compute_checksum(tail),
+        "meta.checksum must match xxh3 truncation of the payload tail"
+    );
+}
+
+#[tokio::test]
+async fn test_regression_watch_without_order_by_is_stable() {
+    // Regression for the HashMap-iteration-order false-positive in
+    // the watcher's Vec-equality dedup. Before the fix, a watcher
+    // opened without `order_by` could emit Vecs whose element order
+    // depended on HashMap rehash timing, so a mutation that didn't
+    // change the filter output could still trigger a spurious
+    // re-emission (element reorder breaks Vec equality). The fix
+    // defaults the watcher's `order_by` to `IdAsc` when unset, so
+    // the emitted Vec is deterministic and dedup is correct.
+    //
+    // Seed enough pending tasks that hash iteration order is
+    // demonstrably non-ascending, then assert the watch output is
+    // IdAsc.
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    const N: u64 = 64;
+    let mut last = 0;
+    for id in 1..=N {
+        last = tasks.create(id, format!("t-{}", id), id * 100).unwrap();
+    }
+    tasks.wait_for_seq(last).await;
+
+    // Open watch *without* order_by. The fix makes this default to
+    // IdAsc under the hood.
+    let mut stream = Box::pin(tasks.watch().where_status(TaskStatus::Pending).stream());
+    let initial = stream.next().await.unwrap();
+    assert_eq!(initial.len(), N as usize);
+    let ids: Vec<u64> = initial.iter().map(|t| t.id).collect();
+    let sorted: Vec<u64> = (1..=N).collect();
+    assert_eq!(ids, sorted, "watcher without order_by must emit IdAsc");
 }
 
 #[tokio::test]

@@ -13,7 +13,7 @@ use super::super::adapter::CortexAdapter;
 use super::super::config::CortexAdapterConfig;
 use super::super::envelope::EventEnvelope;
 use super::super::error::CortexAdapterError;
-use super::super::meta::EventMeta;
+use super::super::meta::{compute_checksum, EventMeta};
 use super::dispatch::{
     DISPATCH_TASK_COMPLETED, DISPATCH_TASK_CREATED, DISPATCH_TASK_DELETED, DISPATCH_TASK_RENAMED,
     TASKS_CHANNEL,
@@ -225,7 +225,8 @@ impl TasksAdapter {
             ))
         })?;
         let app_seq = self.app_seq.fetch_add(1, Ordering::AcqRel);
-        let meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, 0);
+        let checksum = compute_checksum(&tail);
+        let meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, checksum);
         let env = EventEnvelope::new(meta, Bytes::from(tail));
         self.inner.ingest(env)
     }

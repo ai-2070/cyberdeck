@@ -120,7 +120,11 @@ impl<State> CortexAdapter<State> {
         if self.inner.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        self.inner.shutdown.notify_waiters();
+        // `notify_one()` stores a permit if the fold task hasn't yet
+        // reached its `shutdown.notified()` poll, so a close that
+        // races the spawn → first-select window is still observed.
+        // `notify_waiters()` would drop the signal in that window.
+        self.inner.shutdown.notify_one();
         Ok(())
     }
 

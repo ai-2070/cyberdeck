@@ -84,7 +84,20 @@ impl Redex {
             return Ok(existing.clone());
         }
 
-        let file = self.build_file(name, config)?;
+        // Build may fail (e.g. disk path creation under `persistent`).
+        // On failure we still re-check the map — a concurrent opener
+        // may have succeeded in between. Returning their file is
+        // correct since `open_file` semantically "returns the live
+        // file for this name."
+        let file = match self.build_file(name, config) {
+            Ok(file) => file,
+            Err(err) => {
+                if let Some(existing) = self.files.get(name) {
+                    return Ok(existing.clone());
+                }
+                return Err(err);
+            }
+        };
         let entry = self.files.entry(name.clone()).or_insert(file);
         Ok(entry.clone())
     }

@@ -166,7 +166,7 @@ impl RedexFile {
 
         let mut state = self.inner.state.lock();
         let offset = state.segment.append(payload)?;
-        let entry = RedexEntry::new_heap(seq, truncate_u32(offset), payload.len() as u32, 0, cks);
+        let entry = RedexEntry::new_heap(seq, offset_to_u32(offset)?, payload.len() as u32, 0, cks);
         state.index.push(entry);
         state.timestamps.push(ts);
 
@@ -232,7 +232,7 @@ impl RedexFile {
             let cks = payload_checksum(payload);
             let offset = state.segment.append(payload)?;
             let entry =
-                RedexEntry::new_heap(seq, truncate_u32(offset), payload.len() as u32, 0, cks);
+                RedexEntry::new_heap(seq, offset_to_u32(offset)?, payload.len() as u32, 0, cks);
             state.index.push(entry);
             state.timestamps.push(ts);
             events.push(RedexEvent {
@@ -272,7 +272,7 @@ impl RedexFile {
         let mut state = self.inner.state.lock();
         let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
         let offset = state.segment.append(payload)?;
-        let entry = RedexEntry::new_heap(seq, truncate_u32(offset), payload.len() as u32, 0, cks);
+        let entry = RedexEntry::new_heap(seq, offset_to_u32(offset)?, payload.len() as u32, 0, cks);
         state.index.push(entry);
         state.timestamps.push(ts);
 
@@ -342,7 +342,7 @@ impl RedexFile {
             let cks = payload_checksum(payload);
             let offset = state.segment.append(payload)?;
             let entry =
-                RedexEntry::new_heap(seq, truncate_u32(offset), payload.len() as u32, 0, cks);
+                RedexEntry::new_heap(seq, offset_to_u32(offset)?, payload.len() as u32, 0, cks);
             state.index.push(entry);
             state.timestamps.push(ts);
             events.push(RedexEvent {
@@ -416,13 +416,20 @@ impl RedexFile {
     ) -> impl Stream<Item = Result<RedexEvent, RedexError>> + Send + 'static {
         let (tx, rx) = mpsc::unbounded_channel();
 
-        // If closed, emit a single error and return.
+        let mut state = self.inner.state.lock();
+
+        // Check `closed` inside the state lock: close() drains the
+        // watcher list under this same lock, so any watcher we register
+        // after clearing this check is guaranteed to either (a) be
+        // seen by a future close() drain, or (b) predate the close.
+        // Checking outside the lock is a TOCTOU — close() could flip
+        // the flag + drain before we register here, leaving the
+        // subscriber hanging with no `Closed` signal.
         if self.inner.closed.load(Ordering::Acquire) {
+            drop(state);
             let _ = tx.send(Err(RedexError::Closed));
             return UnboundedReceiverStream::new(rx);
         }
-
-        let mut state = self.inner.state.lock();
 
         // Backfill.
         for entry in state.index.iter() {
@@ -595,10 +602,21 @@ fn notify_watchers(watchers: &mut Vec<TailWatcher>, event: &RedexEvent) {
     });
 }
 
+/// Convert a segment offset to the `u32` field that lives in
+/// `RedexEntry::payload_offset`. Returns `Err(PayloadTooLarge)` if the
+/// absolute segment offset has passed `u32::MAX` — this can only
+/// happen on a persistent file whose lifetime heap bytes (append +
+/// eviction + re-append) have crossed the 4 GB threshold. The segment
+/// itself caps at 3 GB live, so this fires on `base_offset` growth,
+/// not live-data growth. The right long-term fix is a sweep-time
+/// offset renormalization (v2); until then we surface the overflow
+/// instead of silently truncating.
 #[inline]
-fn truncate_u32(offset: u64) -> u32 {
-    debug_assert!(offset <= u32::MAX as u64, "segment offset overflowed u32");
-    offset as u32
+fn offset_to_u32(offset: u64) -> Result<u32, RedexError> {
+    u32::try_from(offset).map_err(|_| RedexError::PayloadTooLarge {
+        size: 0,
+        max: u32::MAX as usize,
+    })
 }
 
 /// Unix nanoseconds from `SystemTime::now`. Used as the per-entry

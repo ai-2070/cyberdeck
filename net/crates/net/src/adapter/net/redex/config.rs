@@ -38,11 +38,6 @@ pub struct RedexFileConfig {
     /// as their fake timestamp — age retention starts fresh from
     /// the reopen moment. v2 mmap tier will persist timestamps.
     pub retention_max_age_ns: Option<u64>,
-
-    /// If set, a background task fsyncs the disk segment at this
-    /// interval. `None` (default) = sync on close only. Honored only
-    /// when `persistent` is true.
-    pub sync_interval: Option<Duration>,
 }
 
 impl Default for RedexFileConfig {
@@ -53,7 +48,6 @@ impl Default for RedexFileConfig {
             retention_max_events: None,
             retention_max_bytes: None,
             retention_max_age_ns: None,
-            sync_interval: None,
         }
     }
 }
@@ -92,12 +86,6 @@ impl RedexFileConfig {
     /// against `SystemTime::now()` at append time.
     pub fn with_retention_max_age(mut self, max_age: Duration) -> Self {
         self.retention_max_age_ns = Some(max_age.as_nanos() as u64);
-        self
-    }
-
-    /// Set the periodic fsync interval for persistent files.
-    pub fn with_sync_interval(mut self, interval: Duration) -> Self {
-        self.sync_interval = Some(interval);
         self
     }
 }

@@ -23,8 +23,8 @@ use std::sync::Arc;
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
 use parking_lot::RwLock;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio::sync::watch;
+use tokio_stream::wrappers::WatchStream;
 
 use super::query::{OrderBy, TasksFilterSpec};
 use super::state::TasksState;
@@ -109,41 +109,59 @@ impl TasksWatcher {
     /// - A new result vector on each subsequent fold tick where the
     ///   filter's result differs from the previously emitted one.
     ///
+    /// Backing channel is single-slot: if the consumer falls behind
+    /// a fast fold task, intermediate filter results are dropped and
+    /// the consumer sees the latest state on the next poll. Same
+    /// "drop intermediate, final state is correct" semantic as
+    /// [`crate::adapter::net::cortex::CortexAdapter::changes`].
+    ///
+    /// If `order_by` was not set, the watcher defaults to `IdAsc`
+    /// so Vec-equality dedup is deterministic — otherwise HashMap
+    /// iteration order could produce spurious re-emissions.
+    ///
     /// The stream ends when the adapter's change stream ends (e.g.
     /// when all adapter handles drop and the fold task exits).
     pub fn stream(self) -> impl Stream<Item = Vec<Task>> + Send + 'static {
         let TasksWatcher {
             state,
             mut changes,
-            spec,
+            mut spec,
         } = self;
-        let (tx, rx) = mpsc::unbounded_channel();
+        if spec.order_by.is_none() {
+            spec.order_by = Some(OrderBy::IdAsc);
+        }
+
+        let initial = {
+            let guard = state.read();
+            spec.execute(&guard)
+        };
+        let (tx, rx) = watch::channel(initial.clone());
 
         tokio::spawn(async move {
-            // Initial emission.
-            let initial = {
-                let guard = state.read();
-                spec.execute(&guard)
-            };
-            if tx.send(initial.clone()).is_err() {
-                return;
-            }
             let mut last = initial;
-
-            while let Some(_seq) = changes.next().await {
-                let current = {
-                    let guard = state.read();
-                    spec.execute(&guard)
-                };
-                if current != last {
-                    if tx.send(current.clone()).is_err() {
-                        return;
+            loop {
+                tokio::select! {
+                    // Consumer dropped the stream: stop folding
+                    // immediately, don't wait for the next change
+                    // tick (which may never arrive on an idle log).
+                    _ = tx.closed() => return,
+                    maybe_seq = changes.next() => {
+                        let Some(_seq) = maybe_seq else { return };
+                        let current = {
+                            let guard = state.read();
+                            spec.execute(&guard)
+                        };
+                        if current != last {
+                            if tx.send(current.clone()).is_err() {
+                                return;
+                            }
+                            last = current;
+                        }
                     }
-                    last = current;
                 }
             }
         });
 
-        UnboundedReceiverStream::new(rx)
+        WatchStream::new(rx)
     }
 }
