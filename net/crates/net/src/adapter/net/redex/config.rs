@@ -29,6 +29,16 @@ pub struct RedexFileConfig {
     /// Keep only the newest M bytes of payload. `None` = unbounded.
     pub retention_max_bytes: Option<u64>,
 
+    /// Drop entries older than this many nanoseconds at the next
+    /// [`super::RedexFile::sweep_retention`] tick. Age is measured
+    /// against `SystemTime::now()` at append time.
+    ///
+    /// v2 limitation: per-entry timestamps are in-memory only. On
+    /// reopen of a persistent file, all recovered entries get "now"
+    /// as their fake timestamp — age retention starts fresh from
+    /// the reopen moment. v2 mmap tier will persist timestamps.
+    pub retention_max_age_ns: Option<u64>,
+
     /// If set, a background task fsyncs the disk segment at this
     /// interval. `None` (default) = sync on close only. Honored only
     /// when `persistent` is true.
@@ -42,6 +52,7 @@ impl Default for RedexFileConfig {
             max_memory_bytes: 64 * 1024 * 1024, // 64 MiB soft cap
             retention_max_events: None,
             retention_max_bytes: None,
+            retention_max_age_ns: None,
             sync_interval: None,
         }
     }
@@ -74,6 +85,13 @@ impl RedexFileConfig {
     /// Keep at most `bytes` bytes of payload.
     pub fn with_retention_max_bytes(mut self, bytes: u64) -> Self {
         self.retention_max_bytes = Some(bytes);
+        self
+    }
+
+    /// Drop entries older than `max_age`. Measured in nanoseconds
+    /// against `SystemTime::now()` at append time.
+    pub fn with_retention_max_age(mut self, max_age: Duration) -> Self {
+        self.retention_max_age_ns = Some(max_age.as_nanos() as u64);
         self
     }
 

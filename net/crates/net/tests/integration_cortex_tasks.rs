@@ -427,15 +427,16 @@ async fn test_snapshot_and_restore_skips_replay() {
     // so those old events are NOT replayed. State comes from bytes.
     let tasks2 = TasksAdapter::open_from_snapshot(&redex, ORIGIN, &bytes, last_seq).unwrap();
 
-    let state = tasks2.state();
-    let guard = state.read();
-    assert_eq!(guard.len(), 2);
-    let t1 = guard.get(1).unwrap();
-    assert_eq!(t1.status, TaskStatus::Completed);
-    let t2 = guard.get(2).unwrap();
-    assert_eq!(t2.title, "beta-v2");
-    assert_eq!(t2.status, TaskStatus::Pending);
-    drop(guard);
+    {
+        let state = tasks2.state();
+        let guard = state.read();
+        assert_eq!(guard.len(), 2);
+        let t1 = guard.get(1).unwrap();
+        assert_eq!(t1.status, TaskStatus::Completed);
+        let t2 = guard.get(2).unwrap();
+        assert_eq!(t2.title, "beta-v2");
+        assert_eq!(t2.status, TaskStatus::Pending);
+    } // guard dropped here before the await below
 
     // New ingest flows through normally. The underlying file's
     // next_seq is 4 (persisted across close), so this create

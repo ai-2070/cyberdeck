@@ -110,7 +110,8 @@ pub use proxy::{
 };
 #[cfg(feature = "redex")]
 pub use redex::{
-    Redex, RedexEntry, RedexError, RedexEvent, RedexFile, RedexFileConfig, RedexFlags, RedexFold,
+    OrderedAppender, Redex, RedexEntry, RedexError, RedexEvent, RedexFile, RedexFileConfig,
+    RedexFlags, RedexFold, TypedRedexFile,
 };
 pub use reliability::{FireAndForget, ReliabilityMode, ReliableStream};
 pub use reroute::ReroutePolicy;

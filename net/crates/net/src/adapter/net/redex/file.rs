@@ -30,10 +30,17 @@ struct TailWatcher {
     sender: mpsc::UnboundedSender<Result<RedexEvent, RedexError>>,
 }
 
-/// Mutable state: index, segment, and live watchers. All held behind a
-/// single lock so the backfill→register handoff is atomic.
+/// Mutable state: index, parallel timestamps, segment, and live
+/// watchers. All held behind a single lock so the backfill→register
+/// handoff is atomic.
 struct FileState {
     index: Vec<RedexEntry>,
+    /// Per-entry unix-nanos timestamps captured at append time.
+    /// Same length as `index`. Used by age-based retention.
+    /// In-memory only — not persisted to disk in v1; on reopen of
+    /// a persistent file, recovered entries get "now" as their
+    /// fake timestamp.
+    timestamps: Vec<u64>,
     segment: HeapSegment,
     watchers: Vec<TailWatcher>,
 }
@@ -68,6 +75,7 @@ impl RedexFile {
                 next_seq: AtomicU64::new(0),
                 state: Mutex::new(FileState {
                     index: Vec::new(),
+                    timestamps: Vec::new(),
                     segment: HeapSegment::with_capacity(capacity),
                     watchers: Vec::new(),
                 }),
@@ -97,8 +105,14 @@ impl RedexFile {
         let next_seq = recovered.index.last().map(|e| e.seq + 1).unwrap_or(0);
 
         let segment = HeapSegment::from_existing(recovered.payload_bytes);
+        // Recovered entries get "now" as their fake timestamp. v1
+        // age-retention limitation: persistent files lose age info
+        // across reopen. v2 mmap tier will persist timestamps.
+        let now = now_ns();
+        let timestamps = vec![now; recovered.index.len()];
         let state = FileState {
             index: recovered.index,
+            timestamps,
             segment,
             watchers: Vec::new(),
         };
@@ -148,11 +162,13 @@ impl RedexFile {
         self.check_not_closed()?;
         let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
         let cks = payload_checksum(payload);
+        let ts = now_ns();
 
         let mut state = self.inner.state.lock();
         let offset = state.segment.append(payload)?;
         let entry = RedexEntry::new_heap(seq, truncate_u32(offset), payload.len() as u32, 0, cks);
         state.index.push(entry);
+        state.timestamps.push(ts);
 
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.disk() {
@@ -175,9 +191,11 @@ impl RedexFile {
         let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
         let cks = payload_checksum(payload);
         let entry = RedexEntry::new_inline(seq, payload, cks);
+        let ts = now_ns();
 
         let mut state = self.inner.state.lock();
         state.index.push(entry);
+        state.timestamps.push(ts);
 
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.disk() {
@@ -206,6 +224,7 @@ impl RedexFile {
             .next_seq
             .fetch_add(payloads.len() as u64, Ordering::AcqRel);
 
+        let ts = now_ns();
         let mut state = self.inner.state.lock();
         let mut events: Vec<RedexEvent> = Vec::with_capacity(payloads.len());
         for (i, payload) in payloads.iter().enumerate() {
@@ -215,6 +234,7 @@ impl RedexFile {
             let entry =
                 RedexEntry::new_heap(seq, truncate_u32(offset), payload.len() as u32, 0, cks);
             state.index.push(entry);
+            state.timestamps.push(ts);
             events.push(RedexEvent {
                 entry,
                 payload: payload.clone(),
@@ -234,6 +254,148 @@ impl RedexFile {
             notify_watchers(&mut state.watchers, event);
         }
         Ok(first_seq)
+    }
+
+    /// Like [`Self::append`] but holds the state lock across seq
+    /// allocation. Guarantees that the index records entries in
+    /// strict seq order, even under concurrent writers that use the
+    /// ordered path. The non-ordered `append` path allocates seq via
+    /// a lock-free `fetch_add` before taking the lock — fast but can
+    /// produce out-of-seq-order index insertions under contention.
+    ///
+    /// Used by [`super::OrderedAppender`] for replay determinism.
+    pub fn append_ordered(&self, payload: &[u8]) -> Result<u64, RedexError> {
+        self.check_not_closed()?;
+        let cks = payload_checksum(payload);
+        let ts = now_ns();
+
+        let mut state = self.inner.state.lock();
+        let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
+        let offset = state.segment.append(payload)?;
+        let entry = RedexEntry::new_heap(seq, truncate_u32(offset), payload.len() as u32, 0, cks);
+        state.index.push(entry);
+        state.timestamps.push(ts);
+
+        #[cfg(feature = "redex-disk")]
+        if let Some(disk) = self.disk() {
+            disk.append_entry(&entry, payload)?;
+        }
+
+        let event = RedexEvent {
+            entry,
+            payload: Bytes::copy_from_slice(payload),
+        };
+        notify_watchers(&mut state.watchers, &event);
+
+        Ok(seq)
+    }
+
+    /// Ordered variant of [`Self::append_inline`]. See
+    /// [`Self::append_ordered`].
+    pub fn append_inline_ordered(
+        &self,
+        payload: &[u8; INLINE_PAYLOAD_SIZE],
+    ) -> Result<u64, RedexError> {
+        self.check_not_closed()?;
+        let cks = payload_checksum(payload);
+        let ts = now_ns();
+
+        let mut state = self.inner.state.lock();
+        let seq = self.inner.next_seq.fetch_add(1, Ordering::AcqRel);
+        let entry = RedexEntry::new_inline(seq, payload, cks);
+        state.index.push(entry);
+        state.timestamps.push(ts);
+
+        #[cfg(feature = "redex-disk")]
+        if let Some(disk) = self.disk() {
+            disk.append_entry(&entry, payload)?;
+        }
+
+        let event = RedexEvent {
+            entry,
+            payload: Bytes::copy_from_slice(payload),
+        };
+        notify_watchers(&mut state.watchers, &event);
+
+        Ok(seq)
+    }
+
+    /// Ordered variant of [`Self::append_batch`]. The whole batch is
+    /// appended under one state-lock acquisition, so it's both
+    /// atomic (all-or-nothing within the batch) and strictly
+    /// seq-ordered relative to any other ordered writers.
+    pub fn append_batch_ordered(&self, payloads: &[Bytes]) -> Result<u64, RedexError> {
+        self.check_not_closed()?;
+        if payloads.is_empty() {
+            return Ok(self.inner.next_seq.load(Ordering::Acquire));
+        }
+        let ts = now_ns();
+        let mut state = self.inner.state.lock();
+        let first_seq = self
+            .inner
+            .next_seq
+            .fetch_add(payloads.len() as u64, Ordering::AcqRel);
+
+        let mut events: Vec<RedexEvent> = Vec::with_capacity(payloads.len());
+        for (i, payload) in payloads.iter().enumerate() {
+            let seq = first_seq + i as u64;
+            let cks = payload_checksum(payload);
+            let offset = state.segment.append(payload)?;
+            let entry =
+                RedexEntry::new_heap(seq, truncate_u32(offset), payload.len() as u32, 0, cks);
+            state.index.push(entry);
+            state.timestamps.push(ts);
+            events.push(RedexEvent {
+                entry,
+                payload: payload.clone(),
+            });
+        }
+
+        #[cfg(feature = "redex-disk")]
+        if let Some(disk) = self.disk() {
+            let pairs: Vec<(RedexEntry, &[u8])> = events
+                .iter()
+                .map(|e| (e.entry, e.payload.as_ref()))
+                .collect();
+            disk.append_entries(&pairs)?;
+        }
+
+        for event in &events {
+            notify_watchers(&mut state.watchers, event);
+        }
+        Ok(first_seq)
+    }
+
+    /// Append `value` (bincode-serialized) AND run `fold_fn` against
+    /// caller-supplied `state` in the same call. Returns the
+    /// assigned seq.
+    ///
+    /// This is the common "log-an-event and update a materialized
+    /// view in one step" pattern, without spinning up a full
+    /// [`super::super::cortex`] adapter. Callers maintain `state`
+    /// themselves; the fold closure sees the just-appended value
+    /// and mutates state in place.
+    ///
+    /// Note: the fold runs AFTER the RedEX append. If the append
+    /// succeeds and the fold panics, the log advances but state is
+    /// out of sync — callers who need crash-consistency should use
+    /// the CortEX adapter's durable `snapshot` + `open_from_snapshot`
+    /// instead.
+    pub fn append_and_fold<T, F, S>(
+        &self,
+        value: &T,
+        state: &mut S,
+        fold_fn: F,
+    ) -> Result<u64, RedexError>
+    where
+        T: serde::Serialize,
+        F: FnOnce(&T, &mut S),
+    {
+        let bytes = bincode::serialize(value)
+            .map_err(|e| RedexError::Encode(format!("append_and_fold serialize: {}", e)))?;
+        let seq = self.append(&bytes)?;
+        fold_fn(value, state);
+        Ok(seq)
     }
 
     /// Convenience: serialize `value` with bincode and append.
@@ -314,11 +476,15 @@ impl RedexFile {
     /// task (heartbeat loop) can drive it; no hot-path cost.
     pub fn sweep_retention(&self) {
         let cfg = self.inner.config;
-        if cfg.retention_max_events.is_none() && cfg.retention_max_bytes.is_none() {
+        if cfg.retention_max_events.is_none()
+            && cfg.retention_max_bytes.is_none()
+            && cfg.retention_max_age_ns.is_none()
+        {
             return;
         }
+        let now = now_ns();
         let mut state = self.inner.state.lock();
-        let drop = compute_eviction_count(&state.index, &cfg);
+        let drop = compute_eviction_count(&state.index, &state.timestamps, now, &cfg);
         if drop == 0 {
             return;
         }
@@ -334,8 +500,9 @@ impl RedexFile {
             }
         }
 
-        // Drop the head of the index.
+        // Drop the head of the index AND the parallel timestamps.
         state.index.drain(..drop);
+        state.timestamps.drain(..drop);
 
         // Evict the payload prefix up to new_base (or everything if
         // surviving entries are all inline).
@@ -432,6 +599,18 @@ fn notify_watchers(watchers: &mut Vec<TailWatcher>, event: &RedexEvent) {
 fn truncate_u32(offset: u64) -> u32 {
     debug_assert!(offset <= u32::MAX as u64, "segment offset overflowed u32");
     offset as u32
+}
+
+/// Unix nanoseconds from `SystemTime::now`. Used as the per-entry
+/// timestamp for age-based retention. Non-monotonic (wall clock)
+/// is acceptable here — retention only needs rough ordering, not
+/// strict monotonicity.
+#[inline]
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

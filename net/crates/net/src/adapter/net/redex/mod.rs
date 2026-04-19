@@ -17,8 +17,10 @@ mod event;
 mod file;
 mod fold;
 mod manager;
+mod ordered;
 mod retention;
 mod segment;
+mod typed;
 
 pub use config::RedexFileConfig;
 pub use entry::{RedexEntry, RedexFlags, REDEX_ENTRY_SIZE};
@@ -27,3 +29,5 @@ pub use event::RedexEvent;
 pub use file::RedexFile;
 pub use fold::RedexFold;
 pub use manager::Redex;
+pub use ordered::OrderedAppender;
+pub use typed::TypedRedexFile;
