@@ -1,0 +1,25 @@
+net/crates/net/bindings/node/src/cortex.rs
+  f3669361474f4cb8 59-63,65-77,345,377,386,395,404,412-414,434,446,449,452,455,464,481,491,494,497,500,510,516,698,737,747,756,765,774,781-783,802,826,829,832,835,844,856,878,881,884,887,897,903
+net/crates/net/src/adapter/net/cortex/adapter.rs
+  f3669361474f4cb8 312-319
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "cb5c45097145ca21fd7ed853bbcdae8a88a21606",
+  "prompts": {
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 69,
+      "overriden_lines": 0
+    }
+  }
+}
