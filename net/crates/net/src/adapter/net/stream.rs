@@ -56,11 +56,14 @@ pub enum CloseBehavior {
     DropAndClose,
 }
 
-/// Default initial credit window for newly-opened streams, in bytes.
-///
-/// 64 KB is a reasonable starting point for LAN / typical mesh
-/// deployments. Callers who want the v1-style "unbounded" escape
-/// hatch can explicitly set `with_window_bytes(0)`.
+/// Default initial credit window for newly-opened streams, in
+/// **on-wire bytes** (Net header + AEAD tag + payload). 64 KB is
+/// a reasonable starting point for LAN / typical mesh deployments;
+/// each packet costs ~80 B of fixed overhead plus its payload, so
+/// the window comfortably fits hundreds of small packets or a few
+/// MTU-sized ones in flight. Callers who want the v1-style
+/// "unbounded" escape hatch can explicitly set
+/// `with_window_bytes(0)`.
 pub const DEFAULT_STREAM_WINDOW_BYTES: u32 = 65_536;
 
 /// Per-stream configuration supplied at `open_stream` time.

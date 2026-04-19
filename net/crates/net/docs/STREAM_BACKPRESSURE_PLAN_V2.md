@@ -47,7 +47,7 @@ That's the v2 gap.
 ## Goals
 
 - **Same API surface.** `StreamError::Backpressure`, `send_with_retry`, `send_blocking`, `BackpressureError` classes in TS/Python — all unchanged. The v1→v2 swap is invisible to daemons.
-- **Bytes, not packets.** `tx_inflight` and `tx_window` both move to byte accounting.
+- **Wire bytes, not packets.** `tx_inflight` and `tx_window` both move to on-wire byte accounting (Net header + AEAD tag + payload, 80 B overhead per packet). This keeps the byte window aligned with the bandwidth the sender actually pumps onto the link; payload-only accounting would let the sender push materially more on-wire bytes than the window allows.
 - **Receiver-driven credit.** New subprotocol `SUBPROTOCOL_STREAM_WINDOW` (`0x0B00`) carries per-stream credit grants. Sender's window grows on grant, shrinks on send.
 - **One counter, one source of truth.** The sender tracks a single `tx_credit_remaining` (bytes). Sends decrement it; receiver grants increment it. **ACKs do not touch flow control** — they're for reliable retransmission only. This avoids the double-counting trap where an ACK-based refund *plus* a grant-based top-up would inflate capacity beyond what the receiver actually has space for.
 - **Implicit initial window.** Sender starts with a configured initial credit (propose 64 KB default). No handshake round-trip before the first send.
