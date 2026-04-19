@@ -6,9 +6,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 
 use super::super::super::channel::ChannelName;
-use super::super::super::redex::{Redex, RedexFileConfig};
+use super::super::super::redex::{Redex, RedexError, RedexFileConfig};
 use super::super::adapter::CortexAdapter;
 use super::super::config::CortexAdapterConfig;
 use super::super::envelope::EventEnvelope;
@@ -27,6 +28,21 @@ use super::types::{
 use super::watch::MemoriesWatcher;
 
 use futures::StreamExt;
+
+/// Wire format for [`MemoriesAdapter::snapshot`]: wraps the
+/// `MemoriesState` bincode blob produced by the underlying
+/// [`CortexAdapter`] alongside the typed adapter's own `app_seq`
+/// counter so restore preserves per-origin monotonicity of
+/// `EventMeta::seq_or_ts`.
+#[derive(Serialize, Deserialize)]
+struct MemoriesSnapshotPayload {
+    /// Next-to-assign `app_seq` value at snapshot time — the adapter
+    /// restores its counter to this so post-restore `EventMeta`
+    /// records continue with monotonic per-origin sequencing.
+    app_seq: u64,
+    /// The `CortexAdapter::snapshot` blob (bincode of `MemoriesState`).
+    inner: Vec<u8>,
+}
 
 /// Typed wrapper around `CortexAdapter<MemoriesState>` that exposes
 /// domain-level operations (`store`, `retag`, `pin`, `unpin`,
@@ -166,7 +182,18 @@ impl MemoriesAdapter {
     /// Capture a snapshot suitable for restore. Returns
     /// `(state_bytes, last_seq)` — persist both together.
     pub fn snapshot(&self) -> Result<(Vec<u8>, Option<u64>), CortexAdapterError> {
-        self.inner.snapshot()
+        let (inner, last_seq) = self.inner.snapshot()?;
+        let payload = MemoriesSnapshotPayload {
+            app_seq: self.app_seq.load(Ordering::Acquire),
+            inner,
+        };
+        let bytes = bincode::serialize(&payload).map_err(|e| {
+            CortexAdapterError::Redex(RedexError::Encode(format!(
+                "memories snapshot wrap: {}",
+                e
+            )))
+        })?;
+        Ok((bytes, last_seq))
     }
 
     /// Open the memories adapter from a snapshot.
@@ -194,10 +221,15 @@ impl MemoriesAdapter {
         state_bytes: &[u8],
         last_seq: Option<u64>,
     ) -> Result<Self, CortexAdapterError> {
+        let payload: MemoriesSnapshotPayload =
+            bincode::deserialize(state_bytes).map_err(|e| {
+                CortexAdapterError::Redex(RedexError::Encode(format!(
+                    "memories snapshot unwrap: {}",
+                    e
+                )))
+            })?;
         let name = ChannelName::new(MEMORIES_CHANNEL).map_err(|e| {
-            CortexAdapterError::Redex(super::super::super::redex::RedexError::Channel(
-                e.to_string(),
-            ))
+            CortexAdapterError::Redex(RedexError::Channel(e.to_string()))
         })?;
         let inner = CortexAdapter::open_from_snapshot(
             redex,
@@ -205,13 +237,16 @@ impl MemoriesAdapter {
             redex_config,
             CortexAdapterConfig::default(),
             MemoriesFold,
-            state_bytes,
+            &payload.inner,
             last_seq,
         )?;
         Ok(Self {
             inner,
             origin_hash,
-            app_seq: AtomicU64::new(0),
+            // Restore the app_seq counter so post-restore events
+            // continue per-origin monotonic sequencing rather than
+            // restarting from 0 and duplicating seq_or_ts values.
+            app_seq: AtomicU64::new(payload.app_seq),
         })
     }
 

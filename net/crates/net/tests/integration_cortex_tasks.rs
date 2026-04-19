@@ -432,6 +432,55 @@ async fn test_regression_open_from_snapshot_rejects_u64_max_last_seq() {
 }
 
 #[tokio::test]
+async fn test_regression_snapshot_restore_preserves_app_seq_monotonicity() {
+    // Regression: `TasksAdapter::open_from_snapshot[_with_config]`
+    // used to recreate the adapter with `app_seq: AtomicU64::new(0)`,
+    // so post-restore events re-emitted `EventMeta::seq_or_ts` values
+    // that pre-snapshot events already used. The fix wraps `app_seq`
+    // into the snapshot payload and restores it so per-origin
+    // monotonicity is preserved.
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+
+    // Ingest 3 events — their EventMeta::seq_or_ts values run 0, 1, 2.
+    tasks.create(1, "a", 100).unwrap();
+    tasks.create(2, "b", 200).unwrap();
+    let seq = tasks.create(3, "c", 300).unwrap();
+    tasks.wait_for_seq(seq).await;
+
+    let (state_bytes, last_seq) = tasks.snapshot().unwrap();
+    tasks.close().unwrap();
+
+    // Restore on a FRESH Redex — same origin.
+    let redex2 = Redex::new();
+    let tasks2 =
+        TasksAdapter::open_from_snapshot(&redex2, ORIGIN, &state_bytes, last_seq).unwrap();
+
+    // Next ingest on the restored adapter.
+    let new_seq = tasks2.create(4, "d", 400).unwrap();
+    tasks2.wait_for_seq(new_seq).await;
+
+    // Read the raw RedEX event (seq 0 is the first ingest on the fresh
+    // redex2 file — which is this post-restore create). Decode its
+    // EventMeta.seq_or_ts: it MUST be 3 (continuing from pre-snapshot
+    // counter), NOT 0 (which would be a duplicate of the very first
+    // pre-snapshot event's seq_or_ts).
+    let file = redex2
+        .open_file(
+            &ChannelName::new(TASKS_CHANNEL).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+    let events = file.read_range(0, 1);
+    assert_eq!(events.len(), 1, "first post-restore event must be present");
+    let meta = EventMeta::from_bytes(&events[0].payload[..EVENT_META_SIZE]).unwrap();
+    assert_eq!(
+        meta.seq_or_ts, 3,
+        "post-restore app_seq must continue from pre-snapshot value, not reset to 0"
+    );
+}
+
+#[tokio::test]
 async fn test_regression_checksum_is_computed_not_zero() {
     // Regression: `EventMeta::checksum` used to be hardcoded to 0 in
     // the tasks adapter's `ingest_typed`. The documented contract

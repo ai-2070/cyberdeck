@@ -462,6 +462,55 @@ async fn test_watch_with_limit_and_order() {
 }
 
 #[tokio::test]
+async fn test_regression_snapshot_restore_preserves_app_seq_monotonicity() {
+    // Regression: `MemoriesAdapter::open_from_snapshot[_with_config]`
+    // used to recreate the adapter with `app_seq: AtomicU64::new(0)`,
+    // so post-restore events re-emitted `EventMeta::seq_or_ts` values
+    // that pre-snapshot events already used. The fix wraps `app_seq`
+    // into the snapshot payload and restores it so per-origin
+    // monotonicity is preserved.
+    let redex = Redex::new();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+
+    memories
+        .store(1, "alpha", vec!["x".into()], "alice", 100)
+        .unwrap();
+    memories
+        .store(2, "beta", vec!["y".into()], "alice", 200)
+        .unwrap();
+    let seq = memories
+        .store(3, "gamma", vec!["z".into()], "alice", 300)
+        .unwrap();
+    memories.wait_for_seq(seq).await;
+
+    let (state_bytes, last_seq) = memories.snapshot().unwrap();
+    memories.close().unwrap();
+
+    let redex2 = Redex::new();
+    let memories2 =
+        MemoriesAdapter::open_from_snapshot(&redex2, ORIGIN, &state_bytes, last_seq).unwrap();
+
+    let new_seq = memories2
+        .store(4, "delta", vec!["w".into()], "alice", 400)
+        .unwrap();
+    memories2.wait_for_seq(new_seq).await;
+
+    let file = redex2
+        .open_file(
+            &ChannelName::new(MEMORIES_CHANNEL).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+    let events = file.read_range(0, 1);
+    assert_eq!(events.len(), 1, "first post-restore event must be present");
+    let meta = EventMeta::from_bytes(&events[0].payload[..EVENT_META_SIZE]).unwrap();
+    assert_eq!(
+        meta.seq_or_ts, 3,
+        "post-restore app_seq must continue from pre-snapshot value, not reset to 0"
+    );
+}
+
+#[tokio::test]
 async fn test_regression_checksum_is_computed_not_zero() {
     // Regression: `EventMeta::checksum` used to be hardcoded to 0 in
     // the memories adapter's `ingest_typed`. The documented contract
