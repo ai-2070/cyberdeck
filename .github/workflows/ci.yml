@@ -190,7 +190,7 @@ jobs:
       # `net,cortex` mirrors the Node binding's feature set; skip the
       # default `redis` feature for the same reason.
       - name: Build and install bindings
-        run: maturin develop --features net,cortex
+        run: maturin develop --no-default-features --features net,cortex
 
       - name: Run tests
         run: pytest -v
