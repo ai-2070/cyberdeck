@@ -1,0 +1,39 @@
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  f3669361474f4cb8 190,221,274
+net/crates/net/src/adapter/net/netdb/db.rs
+  f3669361474f4cb8 26,31
+net/crates/net/src/adapter/net/cortex/adapter.rs
+  f3669361474f4cb8 287,328
+net/crates/net/src/adapter/net/redex/typed.rs
+  f3669361474f4cb8 49,59,78,94
+net/crates/net/Cargo.toml
+  f3669361474f4cb8 40,101
+net/crates/net/src/adapter/net/cortex/tasks/fold.rs
+  f3669361474f4cb8 47,61,72,80
+net/crates/net/src/adapter/net/redex/file.rs
+  f3669361474f4cb8 571,580,889
+net/crates/net/src/adapter/net/cortex/memories/fold.rs
+  f3669361474f4cb8 48,64,72,80,88
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  f3669361474f4cb8 185,217,270
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "d63a585b0dcf3d11d5aa6a50163b3b8d860f2bfa",
+  "prompts": {
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 65694,
+      "total_deletions": 28,
+      "accepted_lines": 28,
+      "overriden_lines": 0
+    }
+  }
+}
