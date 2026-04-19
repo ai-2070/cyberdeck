@@ -685,6 +685,9 @@ impl CapabilitySet {
 // Capability Announcement
 // ============================================================================
 
+/// Maximum accepted `node_tag` length in bytes.
+pub const MAX_NODE_TAG_BYTES: usize = 64;
+
 /// Capability announcement message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityAnnouncement {
@@ -701,6 +704,12 @@ pub struct CapabilityAnnouncement {
     /// Optional Ed25519 signature (64 bytes, hex encoded for serde)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Signature64>,
+    /// Tag for off-mesh reconciliation.
+    ///
+    /// The mesh does not parse or validate this string.
+    /// Capped at `MAX_NODE_TAG_BYTES` bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_tag: Option<String>,
 }
 
 /// 64-byte signature wrapper with serde support
@@ -764,6 +773,7 @@ impl CapabilityAnnouncement {
             ttl_secs: 300, // 5 minute default TTL
             capabilities,
             signature: None,
+            node_tag: None,
         }
     }
 
@@ -776,6 +786,29 @@ impl CapabilityAnnouncement {
     /// Set signature
     pub fn with_signature(mut self, sig: [u8; 64]) -> Self {
         self.signature = Some(Signature64(sig));
+        self
+    }
+
+    /// Attach an opaque settlement-layer tag.
+    ///
+    /// Truncated at the last UTF-8 char boundary <= `MAX_NODE_TAG_BYTES`.
+    /// In debug builds, oversize input trips a `debug_assert!`.
+    pub fn with_node_tag(mut self, tag: impl Into<String>) -> Self {
+        let mut tag = tag.into();
+        debug_assert!(
+            tag.len() <= MAX_NODE_TAG_BYTES,
+            "node_tag is {} bytes, exceeds MAX_NODE_TAG_BYTES ({})",
+            tag.len(),
+            MAX_NODE_TAG_BYTES,
+        );
+        if tag.len() > MAX_NODE_TAG_BYTES {
+            let mut end = MAX_NODE_TAG_BYTES;
+            while end > 0 && !tag.is_char_boundary(end) {
+                end -= 1;
+            }
+            tag.truncate(end);
+        }
+        self.node_tag = Some(tag);
         self
     }
 
@@ -1625,5 +1658,45 @@ mod tests {
 
         // Should be expired now
         assert!(ann.is_expired());
+    }
+
+    #[test]
+    fn test_node_tag_round_trip() {
+        let caps = sample_capability_set();
+        let ann = CapabilityAnnouncement::new(42, 1, caps).with_node_tag("seller-acct-8f2c1d90");
+
+        let bytes = ann.to_bytes();
+        let parsed = CapabilityAnnouncement::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.node_tag.as_deref(), Some("seller-acct-8f2c1d90"));
+    }
+
+    #[test]
+    fn test_node_tag_absent_by_default() {
+        let caps = sample_capability_set();
+        let ann = CapabilityAnnouncement::new(42, 1, caps);
+        assert!(ann.node_tag.is_none());
+
+        // Announcement without node_tag must not emit the field on the wire —
+        // keeps bytes compact and means a receiver parsing an old payload that
+        // never had the field gets `None` back via #[serde(default)].
+        let bytes = ann.to_bytes();
+        let json = std::str::from_utf8(&bytes).unwrap();
+        assert!(!json.contains("node_tag"));
+
+        let parsed = CapabilityAnnouncement::from_bytes(&bytes).unwrap();
+        assert!(parsed.node_tag.is_none());
+    }
+
+    #[test]
+    fn test_node_tag_truncates_oversize_in_release() {
+        // In release, oversize input truncates at the last char boundary.
+        // debug_assert! trips in debug — skip the assertion there.
+        if cfg!(debug_assertions) {
+            return;
+        }
+        let caps = sample_capability_set();
+        let oversize: String = "a".repeat(MAX_NODE_TAG_BYTES + 10);
+        let ann = CapabilityAnnouncement::new(1, 1, caps).with_node_tag(oversize);
+        assert_eq!(ann.node_tag.as_deref().unwrap().len(), MAX_NODE_TAG_BYTES);
     }
 }

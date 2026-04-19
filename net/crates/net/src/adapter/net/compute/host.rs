@@ -4,7 +4,7 @@
 //! daemon outputs in CausalLinks. The daemon only sees events and
 //! produces payloads — all chain management is the host's job.
 
-use super::daemon::{DaemonError, DaemonHostConfig, DaemonStats, MeshDaemon};
+use super::daemon::{DaemonError, DaemonHostConfig, DaemonStats, MeshDaemon, ResourceUsage};
 use crate::adapter::net::behavior::capability::CapabilityFilter;
 use crate::adapter::net::identity::EntityKeypair;
 use crate::adapter::net::state::causal::{CausalChainBuilder, CausalEvent};
@@ -28,6 +28,10 @@ pub struct DaemonHost {
     config: DaemonHostConfig,
     /// Runtime statistics.
     stats: DaemonStats,
+    /// Host construction time, for uptime.
+    created_at: quanta::Instant,
+    /// Cumulative wall-clock nanoseconds spent in `MeshDaemon::process`.
+    cumulative_process_ns: u64,
 }
 
 impl DaemonHost {
@@ -45,6 +49,8 @@ impl DaemonHost {
             horizon: ObservedHorizon::new(),
             config,
             stats: DaemonStats::default(),
+            created_at: quanta::Instant::now(),
+            cumulative_process_ns: 0,
         }
     }
 
@@ -76,6 +82,8 @@ impl DaemonHost {
             horizon: ObservedHorizon::new(),
             config,
             stats: DaemonStats::default(),
+            created_at: quanta::Instant::now(),
+            cumulative_process_ns: 0,
         }
     }
 
@@ -112,6 +120,8 @@ impl DaemonHost {
             horizon: snapshot.horizon.clone(),
             config,
             stats: DaemonStats::default(),
+            created_at: quanta::Instant::now(),
+            cumulative_process_ns: 0,
         })
     }
 
@@ -127,7 +137,12 @@ impl DaemonHost {
             .observe(event.link.origin_hash, event.link.sequence);
 
         // Process the event
-        let outputs = match self.daemon.process(event) {
+        let started = quanta::Instant::now();
+        let result = self.daemon.process(event);
+        let elapsed_ns = started.elapsed().as_nanos() as u64;
+        self.cumulative_process_ns = self.cumulative_process_ns.saturating_add(elapsed_ns);
+
+        let outputs = match result {
             Ok(outputs) => outputs,
             Err(e) => {
                 self.stats.errors += 1;
@@ -199,6 +214,17 @@ impl DaemonHost {
     #[inline]
     pub fn stats(&self) -> &DaemonStats {
         &self.stats
+    }
+
+    /// Snapshot of daemon consumption.
+    pub fn resource_usage(&self) -> ResourceUsage {
+        ResourceUsage {
+            events_processed: self.stats.events_processed,
+            events_emitted: self.stats.events_emitted,
+            errors: self.stats.errors,
+            uptime_secs: self.created_at.elapsed().as_secs(),
+            cumulative_process_ns: self.cumulative_process_ns,
+        }
     }
 
     /// Get the daemon host configuration.
@@ -408,6 +434,59 @@ mod tests {
 
         // Output should carry horizon info about the observed event
         assert_ne!(outputs[0].link.horizon_encoded, 0);
+    }
+
+    #[test]
+    fn test_resource_usage_accumulates_process_time() {
+        // A daemon that sleeps a known amount in process(), so we can sanity-check
+        // the cumulative_process_ns accumulator.
+        struct SleepyDaemon {
+            sleep_ns: u64,
+        }
+        impl MeshDaemon for SleepyDaemon {
+            fn name(&self) -> &str {
+                "sleepy"
+            }
+            fn requirements(&self) -> CapabilityFilter {
+                CapabilityFilter::default()
+            }
+            fn process(&mut self, _event: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
+                std::thread::sleep(std::time::Duration::from_nanos(self.sleep_ns));
+                Ok(vec![])
+            }
+        }
+
+        let kp = EntityKeypair::generate();
+        let sleep_ns = 2_000_000; // 2 ms per call, well above timer jitter
+        let mut host = DaemonHost::new(
+            Box::new(SleepyDaemon { sleep_ns }),
+            kp,
+            DaemonHostConfig::default(),
+        );
+
+        let u0 = host.resource_usage();
+        assert_eq!(u0.cumulative_process_ns, 0);
+        assert_eq!(u0.events_processed, 0);
+
+        for i in 1..=3 {
+            let event = make_event(0xABCD, i, b"tick");
+            host.deliver(&event).unwrap();
+        }
+
+        let u1 = host.resource_usage();
+        assert_eq!(u1.events_processed, 3);
+        // Three sleeps of `sleep_ns` each — wall clock must meet at least that.
+        assert!(
+            u1.cumulative_process_ns >= 3 * sleep_ns,
+            "cumulative_process_ns {} should be >= {}",
+            u1.cumulative_process_ns,
+            3 * sleep_ns,
+        );
+
+        // Monotonic: next read must not go backwards.
+        let u2 = host.resource_usage();
+        assert!(u2.cumulative_process_ns >= u1.cumulative_process_ns);
+        assert!(u2.uptime_secs >= u1.uptime_secs);
     }
 
     // ---- Regression tests for Cubic AI findings ----

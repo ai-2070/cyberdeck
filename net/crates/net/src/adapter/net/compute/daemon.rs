@@ -113,3 +113,22 @@ pub struct DaemonStats {
     /// Number of snapshots taken.
     pub snapshots_taken: u64,
 }
+
+/// Per-daemon consumption snapshot for metered-compute accounting.
+///
+/// `DaemonStats` tracks what happened; `ResourceUsage` is framed for the
+/// settlement layer — wall-clock time plus the event counters the dashboard
+/// bills against. OS-level CPU/RSS are out of scope today.
+#[derive(Debug, Clone, Default)]
+pub struct ResourceUsage {
+    /// Total events processed (same counter as `DaemonStats::events_processed`).
+    pub events_processed: u64,
+    /// Total output events emitted (same counter as `DaemonStats::events_emitted`).
+    pub events_emitted: u64,
+    /// Total processing errors (same counter as `DaemonStats::errors`).
+    pub errors: u64,
+    /// Seconds since the host was constructed.
+    pub uptime_secs: u64,
+    /// Cumulative wall-clock nanoseconds spent inside `MeshDaemon::process`.
+    pub cumulative_process_ns: u64,
+}
