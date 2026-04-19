@@ -1889,6 +1889,47 @@ mod tests {
     }
 
     #[test]
+    fn test_regression_control_seq_isolated_from_user_stream() {
+        // Regression: `spawn_stream_window_grant` used to draw the
+        // grant packet's sequence from
+        // `get_or_create_stream(SUBPROTOCOL_STREAM_WINDOW as u64)`,
+        // so a user stream opened with the numerically-equal id
+        // (0x0B00) would share sequence state with control traffic.
+        //
+        // Fix: grants ride on the `CONTROL_STREAM_ID` sentinel
+        // (`u64::MAX`) with a dedicated session-level
+        // `next_control_tx_seq` counter. This test verifies that
+        // opening a user stream at the old-collision id leaves its
+        // tx_seq untouched while control-seq advances independently.
+        let session = Arc::new(NetSession::new(
+            test_keys(),
+            "127.0.0.1:9999".parse().unwrap(),
+            4,
+            false,
+        ));
+        let user_sid = 0x0B00u64; // the old collision target
+        session.open_stream_full(user_sid, false, 1, 100);
+        let user_tx_seq_before = session.try_stream(user_sid).unwrap().current_tx_seq();
+
+        // Burn some control-seq as though grants had gone out.
+        let ctrl_a = session.next_control_tx_seq();
+        let ctrl_b = session.next_control_tx_seq();
+        let ctrl_c = session.next_control_tx_seq();
+        assert_eq!((ctrl_a, ctrl_b, ctrl_c), (0, 1, 2));
+
+        // User stream's tx_seq must NOT have moved.
+        assert_eq!(
+            session.try_stream(user_sid).unwrap().current_tx_seq(),
+            user_tx_seq_before,
+        );
+
+        // Conversely, a user send on the same stream must not
+        // advance the control-seq counter.
+        session.try_stream(user_sid).unwrap().next_tx_seq();
+        assert_eq!(session.next_control_tx_seq(), 3);
+    }
+
+    #[test]
     fn test_regression_admit_and_seq_atomic_across_reopen_race() {
         // Regression (P2): `send_on_stream` used to acquire credit
         // and then re-look up the stream to fetch `next_tx_seq`.
