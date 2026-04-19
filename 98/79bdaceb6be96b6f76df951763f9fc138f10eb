@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  f3669361474f4cb8 30-38,196
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  f3669361474f4cb8 29-37,195
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "9879bdaceb6be96b6f76df951763f9fc138f10eb",
+  "prompts": {
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 20,
+      "total_deletions": 14,
+      "accepted_lines": 20,
+      "overriden_lines": 0
+    }
+  }
+}
