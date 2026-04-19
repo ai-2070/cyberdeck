@@ -1,0 +1,33 @@
+net/crates/net/tests/integration_netdb.rs
+  f3669361474f4cb8 293-343
+net/crates/net/src/adapter/net/redex/segment.rs
+  f3669361474f4cb8 105-114
+net/crates/net/src/adapter/net/cortex/meta.rs
+  f3669361474f4cb8 146-169
+net/crates/net/tests/integration_cortex_tasks.rs
+  f3669361474f4cb8 410-423,425-433
+net/crates/net/bindings/node/test/errors.test.ts
+  f3669361474f4cb8 96-134
+net/crates/net/src/adapter/net/redex/file.rs
+  f3669361474f4cb8 906-1002
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "3c66303221c4ebcaa5a0dac8bde5bbd09469f9bf",
+  "prompts": {
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1790,
+      "total_deletions": 6,
+      "accepted_lines": 246,
+      "overriden_lines": 1
+    }
+  }
+}
