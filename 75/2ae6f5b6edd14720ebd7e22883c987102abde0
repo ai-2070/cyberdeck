@@ -1,0 +1,33 @@
+net/crates/net/src/adapter/net/netdb/db.rs
+  f3669361474f4cb8 173-187,229-231
+net/crates/net/src/adapter/net/channel/name.rs
+  f3669361474f4cb8 39-40
+net/crates/net/src/adapter/net/redex/manager.rs
+  f3669361474f4cb8 5,8-11,87-93,250-252
+net/crates/net/tests/integration_redex.rs
+  f3669361474f4cb8 460-461,491
+net/crates/net/tests/integration_netdb.rs
+  f3669361474f4cb8 295,299-302,304-313,340-341
+net/crates/net/src/adapter/net/channel/guard.rs
+  f3669361474f4cb8 18-26,70-77,164,170,182,186-187,189-191,193
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "752ae6f5b6edd14720ebd7e22883c987102abde0",
+  "prompts": {
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 720,
+      "total_deletions": 709,
+      "accepted_lines": 81,
+      "overriden_lines": 0
+    }
+  }
+}
