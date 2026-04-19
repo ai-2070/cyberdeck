@@ -6,7 +6,7 @@
 //! `RedexFile::sweep_retention`.
 
 use super::config::RedexFileConfig;
-use super::entry::{RedexEntry, INLINE_PAYLOAD_SIZE};
+use super::entry::{RedexEntry, REDEX_ENTRY_SIZE};
 
 /// Compute how many head entries to drop so that the retained tail
 /// satisfies every active retention policy (`retention_max_events`,
@@ -44,10 +44,17 @@ pub(crate) fn compute_eviction_count(
     // Size-based: walk from the tail back, accumulating bytes; anything
     // beyond the cap is dropped. `idx` here is the forward index — the
     // entry at `entries[idx]`. When it doesn't fit, we drop [0..idx+1).
+    //
+    // The per-entry size counted against `retention_max_bytes` is the
+    // total on-disk / in-memory footprint: 20 bytes of index record
+    // plus the heap payload (or 0 for inline, since the payload rides
+    // inside the index record). Counting only the payload would make
+    // small-payload workloads blow past the cap through index overhead
+    // alone.
     if let Some(max_bytes) = cfg.retention_max_bytes {
         let mut retained_bytes: u64 = 0;
         for (idx, e) in entries.iter().enumerate().rev() {
-            let size = entry_payload_size(e);
+            let size = entry_total_size(e);
             if retained_bytes + size > max_bytes {
                 drop = drop.max(idx + 1);
                 break;
@@ -76,12 +83,17 @@ pub(crate) fn compute_eviction_count(
     drop
 }
 
+/// Total on-disk / in-memory size attributable to one entry: the
+/// 20-byte index record plus the heap payload, if any. Inline entries
+/// carry their payload inside the 20 bytes and contribute nothing
+/// extra.
 #[inline]
-fn entry_payload_size(e: &RedexEntry) -> u64 {
+fn entry_total_size(e: &RedexEntry) -> u64 {
+    let idx = REDEX_ENTRY_SIZE as u64;
     if e.is_inline() {
-        INLINE_PAYLOAD_SIZE as u64
+        idx
     } else {
-        e.payload_len as u64
+        idx + e.payload_len as u64
     }
 }
 
@@ -122,20 +134,59 @@ mod tests {
 
     #[test]
     fn test_size_retention() {
+        // Each heap entry costs 20 (index record) + 16 (payload) = 36
+        // bytes against the retention_max_bytes budget. 36 × 13 = 468
+        // fits in 480; 36 × 14 = 504 does not → keep 13, drop 87.
         let entries = heap_entries(100, 16);
         let ts = dummy_timestamps(100);
         let cfg = RedexFileConfig::default().with_retention_max_bytes(480);
-        assert_eq!(compute_eviction_count(&entries, &ts, 0, &cfg), 70);
+        assert_eq!(compute_eviction_count(&entries, &ts, 0, &cfg), 87);
     }
 
     #[test]
     fn test_both_count_and_size_takes_larger_drop() {
+        // count policy keeps 40 (drops 60), size policy keeps 13
+        // (drops 87) with the same 480-byte budget as
+        // test_size_retention. The AND-together rule takes the
+        // larger drop count.
         let entries = heap_entries(100, 16);
         let ts = dummy_timestamps(100);
         let cfg = RedexFileConfig::default()
             .with_retention_max_events(40)
             .with_retention_max_bytes(480);
-        assert_eq!(compute_eviction_count(&entries, &ts, 0, &cfg), 70);
+        assert_eq!(compute_eviction_count(&entries, &ts, 0, &cfg), 87);
+    }
+
+    #[test]
+    fn test_regression_size_retention_counts_index_overhead() {
+        // Regression: size retention used to count only the payload
+        // bytes, so a workload with tiny payloads and a tight budget
+        // could retain far more entries than the configured cap in
+        // actual memory/disk usage. Inline entries (payload inside
+        // the 20-byte index record) in particular were charged 8
+        // bytes each when they actually cost 20.
+        //
+        // Fix: charge 20 bytes of index record for every entry
+        // (inline or heap), plus the heap payload. Inline-only
+        // workloads now see the cap respected byte-for-byte.
+        use super::super::entry::{payload_checksum, RedexEntry};
+
+        // 10 inline entries. Pre-fix: accounting was 80 bytes; a
+        // 100-byte cap retained all 10. Post-fix: accounting is
+        // 200 bytes; a 100-byte cap retains at most 5 (100 / 20).
+        let entries: Vec<RedexEntry> = (0..10u64)
+            .map(|i| {
+                let payload = i.to_le_bytes();
+                RedexEntry::new_inline(i, &payload, payload_checksum(&payload))
+            })
+            .collect();
+        let ts = dummy_timestamps(10);
+        let cfg = RedexFileConfig::default().with_retention_max_bytes(100);
+        assert_eq!(
+            compute_eviction_count(&entries, &ts, 0, &cfg),
+            5,
+            "size retention must charge the 20-byte index record per inline entry"
+        );
     }
 
     #[test]

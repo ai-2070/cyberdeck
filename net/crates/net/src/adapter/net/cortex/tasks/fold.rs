@@ -2,7 +2,7 @@
 //! mutates [`super::state::TasksState`].
 
 use super::super::super::redex::{RedexError, RedexEvent, RedexFold};
-use super::super::meta::{EventMeta, EVENT_META_SIZE};
+use super::super::meta::{compute_checksum, EventMeta, EVENT_META_SIZE};
 use super::dispatch::{
     DISPATCH_TASK_COMPLETED, DISPATCH_TASK_CREATED, DISPATCH_TASK_DELETED, DISPATCH_TASK_RENAMED,
 };
@@ -27,6 +27,19 @@ impl RedexFold<TasksState> for TasksFold {
         let meta = EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
             .ok_or_else(|| RedexError::Encode("bad EventMeta prefix".into()))?;
         let tail = &ev.payload[EVENT_META_SIZE..];
+
+        // Verify the checksum stamped at ingest against the tail we
+        // received from RedEX. Catches disk corruption, tampered
+        // on-disk files, and truncated tails. Under
+        // `FoldErrorPolicy::Stop` this halts the fold task; under
+        // `LogAndContinue` the event is counted and skipped.
+        let expected = compute_checksum(tail);
+        if meta.checksum != expected {
+            return Err(RedexError::Encode(format!(
+                "tasks fold: EventMeta checksum mismatch at seq {} (got {:#010x}, tail hashes to {:#010x})",
+                ev.entry.seq, meta.checksum, expected
+            )));
+        }
 
         match meta.dispatch {
             DISPATCH_TASK_CREATED => {

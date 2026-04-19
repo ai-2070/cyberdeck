@@ -432,6 +432,80 @@ async fn test_regression_open_from_snapshot_rejects_u64_max_last_seq() {
 }
 
 #[tokio::test]
+async fn test_regression_fold_rejects_checksum_mismatch() {
+    // Regression: neither `TasksFold` nor `MemoriesFold` used to
+    // verify `EventMeta::checksum` against the payload tail. A
+    // corrupted RedEX record (disk corruption, tampered on-disk
+    // file, truncated tail) would fold into state anyway, silently
+    // poisoning the materialized view. The fix recomputes
+    // `compute_checksum(tail)` in both folds and returns
+    // `RedexError::Encode` on mismatch.
+    //
+    // We can't easily corrupt bytes mid-RedEX without reaching into
+    // private state. The direct surface: construct an
+    // `EventEnvelope` with a WRONG `EventMeta.checksum`, ingest via
+    // the raw `CortexAdapter` path (which bypasses `compute_checksum`
+    // stamping), and observe the fold task halt. The TasksAdapter's
+    // typed `create`/`rename`/etc. always stamp the correct checksum,
+    // so we use the raw path here.
+    use net::adapter::net::cortex::{
+        CortexAdapter, CortexAdapterConfig, EventEnvelope, FoldErrorPolicy, StartPosition,
+    };
+    use net::adapter::net::cortex::tasks::{TasksFold, TasksState};
+    use bytes::Bytes;
+
+    let redex = Redex::new();
+    let cfg = CortexAdapterConfig {
+        start: StartPosition::FromBeginning,
+        on_fold_error: FoldErrorPolicy::Stop,
+    };
+    let adapter = CortexAdapter::<TasksState>::open(
+        &redex,
+        &ChannelName::new(TASKS_CHANNEL).unwrap(),
+        Default::default(),
+        cfg,
+        TasksFold,
+        TasksState::new(),
+    )
+    .unwrap();
+
+    // Stamp an EventMeta with a deliberately-wrong checksum. The
+    // checksum check runs BEFORE dispatch-routing + tail decode, so
+    // the tail bytes don't need to be well-formed — the fold must
+    // halt on the checksum comparison before ever looking at them.
+    let tail = b"any bytes would have matched some xxh3 except this one".to_vec();
+    let wrong_checksum = compute_checksum(&tail).wrapping_add(1);
+    let wrong_meta = EventMeta::new(
+        0x01, // DISPATCH_TASK_CREATED
+        0,
+        ORIGIN,
+        0,
+        wrong_checksum,
+    );
+    let seq = adapter
+        .ingest(EventEnvelope::new(wrong_meta, Bytes::from(tail)))
+        .unwrap();
+
+    // Drive the fold task forward; wait_for_seq returns when the
+    // adapter has processed the event OR when the fold task has
+    // stopped — under Stop policy, checksum mismatch is terminal.
+    adapter.wait_for_seq(seq).await;
+
+    assert!(
+        !adapter.is_running(),
+        "fold task must have stopped after checksum mismatch under FoldErrorPolicy::Stop"
+    );
+
+    // State must NOT contain the poisoned task.
+    let state = adapter.state();
+    let guard = state.read();
+    assert!(
+        guard.get(1).is_none(),
+        "checksum-mismatched event must NOT have folded into state"
+    );
+}
+
+#[tokio::test]
 async fn test_regression_snapshot_restore_preserves_app_seq_monotonicity() {
     // Regression: `TasksAdapter::open_from_snapshot[_with_config]`
     // used to recreate the adapter with `app_seq: AtomicU64::new(0)`,
