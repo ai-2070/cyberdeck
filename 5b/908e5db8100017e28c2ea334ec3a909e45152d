@@ -1,0 +1,29 @@
+net/crates/net/Cargo.toml
+  f3669361474f4cb8 131-135
+net/crates/net/benches/redex.rs
+  f3669361474f4cb8 1-212
+net/crates/net/README.md
+  f3669361474f4cb8 179-206
+README.md
+  f3669361474f4cb8 534-574
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "5b908e5db8100017e28c2ea334ec3a909e45152d",
+  "prompts": {
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 283,
+      "total_deletions": 3,
+      "accepted_lines": 283,
+      "overriden_lines": 0
+    }
+  }
+}
