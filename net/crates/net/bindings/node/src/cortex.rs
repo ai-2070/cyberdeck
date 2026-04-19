@@ -32,6 +32,27 @@ use ::net::adapter::net::cortex::tasks::{
 use ::net::adapter::net::redex::{Redex as InnerRedex, RedexFileConfig};
 
 // =========================================================================
+// Error-class prefix contract
+// =========================================================================
+//
+// Stable prefixes the `@ai2070/net/errors` wrapper inspects to re-throw
+// typed `CortexError` / `NetDbError` instances. Keep these strings
+// byte-stable — they are part of the SDK's public contract.
+
+pub(crate) const ERR_CORTEX_PREFIX: &str = "cortex:";
+pub(crate) const ERR_NETDB_PREFIX: &str = "netdb:";
+
+#[inline]
+pub(crate) fn cortex_err(context: &str, detail: impl std::fmt::Display) -> Error {
+    Error::from_reason(format!("{} {}: {}", ERR_CORTEX_PREFIX, context, detail))
+}
+
+#[inline]
+pub(crate) fn netdb_err(context: &str, detail: impl std::fmt::Display) -> Error {
+    Error::from_reason(format!("{} {}: {}", ERR_NETDB_PREFIX, context, detail))
+}
+
+// =========================================================================
 // Shared helpers
 // =========================================================================
 
@@ -288,7 +309,7 @@ impl TasksAdapter {
     pub async fn open(redex: &Redex, origin_hash: u32, persistent: Option<bool>) -> Result<Self> {
         let cfg = redex_config_from_persistent(persistent);
         let inner = InnerTasksAdapter::open_with_config(&redex.inner, origin_hash, cfg)
-            .map_err(|e| Error::from_reason(format!("TasksAdapter open failed: {}", e)))?;
+            .map_err(|e| cortex_err("TasksAdapter open failed", e))?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -313,9 +334,7 @@ impl TasksAdapter {
             state_bytes.as_ref(),
             last,
         )
-        .map_err(|e| {
-            Error::from_reason(format!("TasksAdapter open_from_snapshot failed: {}", e))
-        })?;
+        .map_err(|e| cortex_err("TasksAdapter open_from_snapshot failed", e))?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -328,7 +347,7 @@ impl TasksAdapter {
         let (bytes, last_seq) = self
             .inner
             .snapshot()
-            .map_err(|e| Error::from_reason(format!("snapshot failed: {}", e)))?;
+            .map_err(|e| cortex_err("snapshot failed", e))?;
         Ok(CortexSnapshot {
             state_bytes: Buffer::from(bytes),
             last_seq: last_seq.map(BigInt::from),
@@ -341,7 +360,7 @@ impl TasksAdapter {
         self.inner
             .create(bigint_u64(id), title, bigint_u64(now_ns))
             .map(BigInt::from)
-            .map_err(|e| Error::from_reason(format!("create failed: {}", e)))
+            .map_err(|e| cortex_err("create failed", e))
     }
 
     /// Rename an existing task. No-op at fold time if `id` is unknown.
@@ -350,7 +369,7 @@ impl TasksAdapter {
         self.inner
             .rename(bigint_u64(id), new_title, bigint_u64(now_ns))
             .map(BigInt::from)
-            .map_err(|e| Error::from_reason(format!("rename failed: {}", e)))
+            .map_err(|e| cortex_err("rename failed", e))
     }
 
     /// Mark a task completed. No-op at fold time if `id` is unknown.
@@ -359,7 +378,7 @@ impl TasksAdapter {
         self.inner
             .complete(bigint_u64(id), bigint_u64(now_ns))
             .map(BigInt::from)
-            .map_err(|e| Error::from_reason(format!("complete failed: {}", e)))
+            .map_err(|e| cortex_err("complete failed", e))
     }
 
     /// Delete a task.
@@ -368,7 +387,7 @@ impl TasksAdapter {
         self.inner
             .delete(bigint_u64(id))
             .map(BigInt::from)
-            .map_err(|e| Error::from_reason(format!("delete failed: {}", e)))
+            .map_err(|e| cortex_err("delete failed", e))
     }
 
     /// Block until every event up through `seq` has been folded into
@@ -383,7 +402,7 @@ impl TasksAdapter {
     pub fn close(&self) -> Result<()> {
         self.inner
             .close()
-            .map_err(|e| Error::from_reason(format!("close failed: {}", e)))
+            .map_err(|e| cortex_err("close failed", e))
     }
 
     /// True if the fold task is currently running.
@@ -643,7 +662,7 @@ impl MemoriesAdapter {
     pub async fn open(redex: &Redex, origin_hash: u32, persistent: Option<bool>) -> Result<Self> {
         let cfg = redex_config_from_persistent(persistent);
         let inner = InnerMemoriesAdapter::open_with_config(&redex.inner, origin_hash, cfg)
-            .map_err(|e| Error::from_reason(format!("MemoriesAdapter open failed: {}", e)))?;
+            .map_err(|e| cortex_err("MemoriesAdapter open failed", e))?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -667,12 +686,7 @@ impl MemoriesAdapter {
             state_bytes.as_ref(),
             last,
         )
-        .map_err(|e| {
-            Error::from_reason(format!(
-                "MemoriesAdapter open_from_snapshot failed: {}",
-                e
-            ))
-        })?;
+        .map_err(|e| cortex_err("MemoriesAdapter open_from_snapshot failed", e))?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -685,7 +699,7 @@ impl MemoriesAdapter {
         let (bytes, last_seq) = self
             .inner
             .snapshot()
-            .map_err(|e| Error::from_reason(format!("snapshot failed: {}", e)))?;
+            .map_err(|e| cortex_err("snapshot failed", e))?;
         Ok(CortexSnapshot {
             state_bytes: Buffer::from(bytes),
             last_seq: last_seq.map(BigInt::from),
@@ -705,7 +719,7 @@ impl MemoriesAdapter {
         self.inner
             .store(bigint_u64(id), content, tags, source, bigint_u64(now_ns))
             .map(BigInt::from)
-            .map_err(|e| Error::from_reason(format!("store failed: {}", e)))
+            .map_err(|e| cortex_err("store failed", e))
     }
 
     /// Replace the tag set on an existing memory. No-op at fold time
@@ -715,7 +729,7 @@ impl MemoriesAdapter {
         self.inner
             .retag(bigint_u64(id), tags, bigint_u64(now_ns))
             .map(BigInt::from)
-            .map_err(|e| Error::from_reason(format!("retag failed: {}", e)))
+            .map_err(|e| cortex_err("retag failed", e))
     }
 
     /// Pin a memory.
@@ -724,7 +738,7 @@ impl MemoriesAdapter {
         self.inner
             .pin(bigint_u64(id), bigint_u64(now_ns))
             .map(BigInt::from)
-            .map_err(|e| Error::from_reason(format!("pin failed: {}", e)))
+            .map_err(|e| cortex_err("pin failed", e))
     }
 
     /// Unpin a memory.
@@ -733,7 +747,7 @@ impl MemoriesAdapter {
         self.inner
             .unpin(bigint_u64(id), bigint_u64(now_ns))
             .map(BigInt::from)
-            .map_err(|e| Error::from_reason(format!("unpin failed: {}", e)))
+            .map_err(|e| cortex_err("unpin failed", e))
     }
 
     /// Delete a memory.
@@ -742,7 +756,7 @@ impl MemoriesAdapter {
         self.inner
             .delete(bigint_u64(id))
             .map(BigInt::from)
-            .map_err(|e| Error::from_reason(format!("delete failed: {}", e)))
+            .map_err(|e| cortex_err("delete failed", e))
     }
 
     /// Block until every event up through `seq` has been folded.
@@ -756,7 +770,7 @@ impl MemoriesAdapter {
     pub fn close(&self) -> Result<()> {
         self.inner
             .close()
-            .map_err(|e| Error::from_reason(format!("close failed: {}", e)))
+            .map_err(|e| cortex_err("close failed", e))
     }
 
     /// True if the fold task is currently running.
@@ -944,7 +958,7 @@ impl NetDb {
             Some(TasksAdapter {
                 inner: Arc::new(
                     InnerTasksAdapter::open_with_config(&redex, config.origin_hash, cfg)
-                        .map_err(|e| Error::from_reason(format!("NetDb open tasks: {}", e)))?,
+                        .map_err(|e| cortex_err("NetDb open tasks", e))?,
                 ),
             })
         } else {
@@ -954,9 +968,7 @@ impl NetDb {
             Some(MemoriesAdapter {
                 inner: Arc::new(
                     InnerMemoriesAdapter::open_with_config(&redex, config.origin_hash, cfg)
-                        .map_err(|e| {
-                            Error::from_reason(format!("NetDb open memories: {}", e))
-                        })?,
+                        .map_err(|e| cortex_err("NetDb open memories", e))?,
                 ),
             })
         } else {
@@ -974,30 +986,22 @@ impl NetDb {
         bundle: NetDbBundle,
     ) -> Result<Self> {
         let snapshot = InnerNetDbSnapshot::decode(bundle.state_bytes.as_ref())
-            .map_err(|e| Error::from_reason(format!("decode snapshot bundle: {}", e)))?;
+            .map_err(|e| netdb_err("decode snapshot bundle", e))?;
         let redex = Self::build_redex(&config);
         let cfg = Self::cfg(&config);
 
         let tasks = if config.with_tasks.unwrap_or(false) {
             let adapter = match snapshot.tasks {
-                Some((bytes, last_seq)) => {
-                    InnerTasksAdapter::open_from_snapshot_with_config(
-                        &redex,
-                        config.origin_hash,
-                        cfg,
-                        &bytes,
-                        last_seq,
-                    )
-                    .map_err(|e| {
-                        Error::from_reason(format!("NetDb restore tasks: {}", e))
-                    })?
-                }
-                None => InnerTasksAdapter::open_with_config(
+                Some((bytes, last_seq)) => InnerTasksAdapter::open_from_snapshot_with_config(
                     &redex,
                     config.origin_hash,
                     cfg,
+                    &bytes,
+                    last_seq,
                 )
-                .map_err(|e| Error::from_reason(format!("NetDb open tasks: {}", e)))?,
+                .map_err(|e| cortex_err("NetDb restore tasks", e))?,
+                None => InnerTasksAdapter::open_with_config(&redex, config.origin_hash, cfg)
+                    .map_err(|e| cortex_err("NetDb open tasks", e))?,
             };
             Some(TasksAdapter {
                 inner: Arc::new(adapter),
@@ -1008,26 +1012,16 @@ impl NetDb {
 
         let memories = if config.with_memories.unwrap_or(false) {
             let adapter = match snapshot.memories {
-                Some((bytes, last_seq)) => {
-                    InnerMemoriesAdapter::open_from_snapshot_with_config(
-                        &redex,
-                        config.origin_hash,
-                        cfg,
-                        &bytes,
-                        last_seq,
-                    )
-                    .map_err(|e| {
-                        Error::from_reason(format!("NetDb restore memories: {}", e))
-                    })?
-                }
-                None => InnerMemoriesAdapter::open_with_config(
+                Some((bytes, last_seq)) => InnerMemoriesAdapter::open_from_snapshot_with_config(
                     &redex,
                     config.origin_hash,
                     cfg,
+                    &bytes,
+                    last_seq,
                 )
-                .map_err(|e| {
-                    Error::from_reason(format!("NetDb open memories: {}", e))
-                })?,
+                .map_err(|e| cortex_err("NetDb restore memories", e))?,
+                None => InnerMemoriesAdapter::open_with_config(&redex, config.origin_hash, cfg)
+                    .map_err(|e| cortex_err("NetDb open memories", e))?,
             };
             Some(MemoriesAdapter {
                 inner: Arc::new(adapter),
@@ -1059,7 +1053,7 @@ impl NetDb {
             Some(t) => Some(
                 t.inner
                     .snapshot()
-                    .map_err(|e| Error::from_reason(format!("snapshot tasks: {}", e)))?,
+                    .map_err(|e| cortex_err("snapshot tasks", e))?,
             ),
             None => None,
         };
@@ -1067,14 +1061,14 @@ impl NetDb {
             Some(m) => Some(
                 m.inner
                     .snapshot()
-                    .map_err(|e| Error::from_reason(format!("snapshot memories: {}", e)))?,
+                    .map_err(|e| cortex_err("snapshot memories", e))?,
             ),
             None => None,
         };
         let snap = InnerNetDbSnapshot { tasks, memories };
         let bytes = snap
             .encode()
-            .map_err(|e| Error::from_reason(format!("encode snapshot: {}", e)))?;
+            .map_err(|e| netdb_err("encode snapshot", e))?;
         Ok(NetDbBundle {
             state_bytes: Buffer::from(bytes),
         })
@@ -1086,12 +1080,12 @@ impl NetDb {
         if let Some(t) = &self.tasks {
             t.inner
                 .close()
-                .map_err(|e| Error::from_reason(format!("close tasks: {}", e)))?;
+                .map_err(|e| cortex_err("close tasks", e))?;
         }
         if let Some(m) = &self.memories {
             m.inner
                 .close()
-                .map_err(|e| Error::from_reason(format!("close memories: {}", e)))?;
+                .map_err(|e| cortex_err("close memories", e))?;
         }
         Ok(())
     }

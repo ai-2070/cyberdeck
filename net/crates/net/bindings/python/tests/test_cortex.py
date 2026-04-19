@@ -10,6 +10,7 @@ import time
 import pytest
 
 from net._net import (
+    CortexError,
     MemoriesAdapter,
     Redex,
     TasksAdapter,
@@ -80,7 +81,7 @@ def test_tasks_ingest_after_close_errors() -> None:
     tasks = TasksAdapter.open(redex, ORIGIN)
     tasks.create(1, "before", 100)
     tasks.close()
-    with pytest.raises(RuntimeError):
+    with pytest.raises(CortexError, match="closed"):
         tasks.create(2, "after", 200)
 
 
@@ -348,8 +349,26 @@ def test_empty_state_snapshot_has_none_last_seq() -> None:
 
 def test_persistent_without_dir_errors() -> None:
     redex = Redex()  # heap-only, no persistent_dir
-    with pytest.raises(RuntimeError, match="persistent"):
+    with pytest.raises(CortexError, match="persistent"):
         TasksAdapter.open(redex, ORIGIN, persistent=True)
+
+
+def test_closed_adapter_raises_cortex_error() -> None:
+    redex = Redex()
+    tasks = TasksAdapter.open(redex, ORIGIN)
+    tasks.close()
+    with pytest.raises(CortexError, match="closed"):
+        tasks.create(1, "x", 100)
+    # Still an Exception subclass, so broad catches keep working.
+    assert issubclass(CortexError, Exception)
+
+
+def test_cortex_error_memories_closed() -> None:
+    redex = Redex()
+    memories = MemoriesAdapter.open(redex, ORIGIN)
+    memories.close()
+    with pytest.raises(CortexError, match="closed"):
+        memories.store(1, "x", ["tag"], "src", 100)
 
 
 def test_multi_model_coexistence() -> None:

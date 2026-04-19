@@ -358,7 +358,7 @@ For implementation details — capabilities, proximity graphs, subnets, channels
 
 ## Status
 
-Net is a working protocol, not a paper design. 1,146 tests across the Rust core, plus 20 Node and 18 Python SDK smoke tests, verify the implementation across every layer of the stack.
+Net is a working protocol, not a paper design. 1,146 tests across the Rust core, plus 36 Node and 33 Python SDK smoke tests, verify the implementation across every layer of the stack.
 
 **What works today:**
 

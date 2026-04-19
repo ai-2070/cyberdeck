@@ -24,6 +24,26 @@ use ::net::adapter::net::cortex::tasks::{
 };
 use ::net::adapter::net::redex::{Redex as InnerRedex, RedexFileConfig};
 
+pyo3::create_exception!(
+    _net,
+    CortexError,
+    pyo3::exceptions::PyException,
+    "Raised when a CortEX adapter operation fails. Covers `adapter \
+     closed`, `fold stopped at seq N`, and underlying RedEX storage \
+     errors. Catch with `except CortexError:`."
+);
+
+pyo3::create_exception!(
+    _net,
+    NetDbError,
+    pyo3::exceptions::PyException,
+    "Raised when a NetDB operation fails. Covers snapshot encode / \
+     decode errors and missing-model accesses (tasks / memories not \
+     enabled on this handle). Per-adapter operations raise \
+     `CortexError`; this class is reserved for errors that span the \
+     NetDB handle itself."
+);
+
 // =========================================================================
 // Shared helpers
 // =========================================================================
@@ -197,7 +217,7 @@ impl PyTasksAdapter {
             .block_on(
                 async move { InnerTasksAdapter::open_with_config(&redex_inner, origin_hash, cfg) },
             )
-            .map_err(|e| PyRuntimeError::new_err(format!("TasksAdapter open failed: {}", e)))?;
+            .map_err(|e| CortexError::new_err(format!("TasksAdapter open failed: {}", e)))?;
         Ok(Self {
             inner: Arc::new(inner),
             runtime,
@@ -230,7 +250,7 @@ impl PyTasksAdapter {
                 )
             })
             .map_err(|e| {
-                PyRuntimeError::new_err(format!(
+                CortexError::new_err(format!(
                     "TasksAdapter open_from_snapshot failed: {}",
                     e
                 ))
@@ -246,35 +266,35 @@ impl PyTasksAdapter {
     fn snapshot(&self) -> PyResult<(Vec<u8>, Option<u64>)> {
         self.inner
             .snapshot()
-            .map_err(|e| PyRuntimeError::new_err(format!("snapshot failed: {}", e)))
+            .map_err(|e| CortexError::new_err(format!("snapshot failed: {}", e)))
     }
 
     /// Create a new task. Returns the RedEX sequence.
     fn create(&self, id: u64, title: String, now_ns: u64) -> PyResult<u64> {
         self.inner
             .create(id, title, now_ns)
-            .map_err(|e| PyRuntimeError::new_err(format!("create failed: {}", e)))
+            .map_err(|e| CortexError::new_err(format!("create failed: {}", e)))
     }
 
     /// Rename an existing task. No-op at fold time if `id` is unknown.
     fn rename(&self, id: u64, new_title: String, now_ns: u64) -> PyResult<u64> {
         self.inner
             .rename(id, new_title, now_ns)
-            .map_err(|e| PyRuntimeError::new_err(format!("rename failed: {}", e)))
+            .map_err(|e| CortexError::new_err(format!("rename failed: {}", e)))
     }
 
     /// Mark a task completed.
     fn complete(&self, id: u64, now_ns: u64) -> PyResult<u64> {
         self.inner
             .complete(id, now_ns)
-            .map_err(|e| PyRuntimeError::new_err(format!("complete failed: {}", e)))
+            .map_err(|e| CortexError::new_err(format!("complete failed: {}", e)))
     }
 
     /// Delete a task.
     fn delete(&self, id: u64) -> PyResult<u64> {
         self.inner
             .delete(id)
-            .map_err(|e| PyRuntimeError::new_err(format!("delete failed: {}", e)))
+            .map_err(|e| CortexError::new_err(format!("delete failed: {}", e)))
     }
 
     /// Block until every event up through `seq` has been folded.
@@ -291,7 +311,7 @@ impl PyTasksAdapter {
     fn close(&self) -> PyResult<()> {
         self.inner
             .close()
-            .map_err(|e| PyRuntimeError::new_err(format!("close failed: {}", e)))
+            .map_err(|e| CortexError::new_err(format!("close failed: {}", e)))
     }
 
     /// True if the fold task is currently running.
@@ -572,7 +592,7 @@ impl PyMemoriesAdapter {
             .block_on(async move {
                 InnerMemoriesAdapter::open_with_config(&redex_inner, origin_hash, cfg)
             })
-            .map_err(|e| PyRuntimeError::new_err(format!("MemoriesAdapter open failed: {}", e)))?;
+            .map_err(|e| CortexError::new_err(format!("MemoriesAdapter open failed: {}", e)))?;
         Ok(Self {
             inner: Arc::new(inner),
             runtime,
@@ -604,7 +624,7 @@ impl PyMemoriesAdapter {
                 )
             })
             .map_err(|e| {
-                PyRuntimeError::new_err(format!(
+                CortexError::new_err(format!(
                     "MemoriesAdapter open_from_snapshot failed: {}",
                     e
                 ))
@@ -619,7 +639,7 @@ impl PyMemoriesAdapter {
     fn snapshot(&self) -> PyResult<(Vec<u8>, Option<u64>)> {
         self.inner
             .snapshot()
-            .map_err(|e| PyRuntimeError::new_err(format!("snapshot failed: {}", e)))
+            .map_err(|e| CortexError::new_err(format!("snapshot failed: {}", e)))
     }
 
     #[pyo3(signature = (id, content, tags, source, now_ns))]
@@ -633,31 +653,31 @@ impl PyMemoriesAdapter {
     ) -> PyResult<u64> {
         self.inner
             .store(id, content, tags, source, now_ns)
-            .map_err(|e| PyRuntimeError::new_err(format!("store failed: {}", e)))
+            .map_err(|e| CortexError::new_err(format!("store failed: {}", e)))
     }
 
     fn retag(&self, id: u64, tags: Vec<String>, now_ns: u64) -> PyResult<u64> {
         self.inner
             .retag(id, tags, now_ns)
-            .map_err(|e| PyRuntimeError::new_err(format!("retag failed: {}", e)))
+            .map_err(|e| CortexError::new_err(format!("retag failed: {}", e)))
     }
 
     fn pin(&self, id: u64, now_ns: u64) -> PyResult<u64> {
         self.inner
             .pin(id, now_ns)
-            .map_err(|e| PyRuntimeError::new_err(format!("pin failed: {}", e)))
+            .map_err(|e| CortexError::new_err(format!("pin failed: {}", e)))
     }
 
     fn unpin(&self, id: u64, now_ns: u64) -> PyResult<u64> {
         self.inner
             .unpin(id, now_ns)
-            .map_err(|e| PyRuntimeError::new_err(format!("unpin failed: {}", e)))
+            .map_err(|e| CortexError::new_err(format!("unpin failed: {}", e)))
     }
 
     fn delete(&self, id: u64) -> PyResult<u64> {
         self.inner
             .delete(id)
-            .map_err(|e| PyRuntimeError::new_err(format!("delete failed: {}", e)))
+            .map_err(|e| CortexError::new_err(format!("delete failed: {}", e)))
     }
 
     fn wait_for_seq(&self, py: Python<'_>, seq: u64) {
@@ -671,7 +691,7 @@ impl PyMemoriesAdapter {
     fn close(&self) -> PyResult<()> {
         self.inner
             .close()
-            .map_err(|e| PyRuntimeError::new_err(format!("close failed: {}", e)))
+            .map_err(|e| CortexError::new_err(format!("close failed: {}", e)))
     }
 
     fn is_running(&self) -> bool {
@@ -990,7 +1010,7 @@ impl PyNetDb {
         with_memories: bool,
     ) -> PyResult<Self> {
         let snapshot = InnerNetDbSnapshot::decode(bundle)
-            .map_err(|e| PyRuntimeError::new_err(format!("decode bundle: {}", e)))?;
+            .map_err(|e| NetDbError::new_err(format!("decode bundle: {}", e)))?;
 
         let redex = match &persistent_dir {
             Some(dir) => PyRedex {
@@ -1055,7 +1075,7 @@ impl PyNetDb {
             Some(t) => Some(
                 t.inner
                     .snapshot()
-                    .map_err(|e| PyRuntimeError::new_err(format!("snapshot tasks: {}", e)))?,
+                    .map_err(|e| CortexError::new_err(format!("snapshot tasks: {}", e)))?,
             ),
             None => None,
         };
@@ -1063,13 +1083,13 @@ impl PyNetDb {
             Some(m) => Some(
                 m.inner
                     .snapshot()
-                    .map_err(|e| PyRuntimeError::new_err(format!("snapshot memories: {}", e)))?,
+                    .map_err(|e| CortexError::new_err(format!("snapshot memories: {}", e)))?,
             ),
             None => None,
         };
         let snap = InnerNetDbSnapshot { tasks, memories };
         snap.encode()
-            .map_err(|e| PyRuntimeError::new_err(format!("encode bundle: {}", e)))
+            .map_err(|e| NetDbError::new_err(format!("encode bundle: {}", e)))
     }
 
     /// Close every enabled adapter. Idempotent.

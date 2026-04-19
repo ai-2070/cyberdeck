@@ -670,21 +670,21 @@ cargo test --test integration_netdb --features netdb
 # Rust SDK smoke tests (2 async + 3 doctests)
 cargo test --features net -p net-sdk
 
-# Node SDK smoke tests (20 tests — CortEX tasks + memories over napi, incl. watch/AsyncIterator, disk durability, snapshot/restore round-trip)
+# Node SDK smoke tests (36 tests — CortEX tasks + memories over napi, incl. watch/AsyncIterator, disk durability, snapshot/restore round-trip, NetDb handle, and classified CortexError/NetDbError from @ai2070/net/errors)
 cd bindings/node && npx napi build --platform --no-default-features -F cortex && npx vitest run
 
-# Python SDK smoke tests (18 tests — CortEX tasks + memories via PyO3, incl. sync watch iterators, disk durability, snapshot/restore round-trip)
+# Python SDK smoke tests (33 tests — CortEX tasks + memories via PyO3, incl. sync watch iterators, disk durability, snapshot/restore round-trip, NetDb handle, and typed CortexError / NetDbError from net._net)
 cd bindings/python && uv venv .venv && source .venv/bin/activate && \
     uv pip install -e '.[test]' maturin && \
     maturin develop --no-default-features --features cortex && \
-    python -m pytest tests/test_cortex.py
+    python -m pytest tests/test_cortex.py tests/test_netdb.py
 
 # Backend adapters (requires running services)
 cargo test --test integration_redis --features redis
 cargo test --test integration_jetstream --features jetstream
 ```
 
-**1,146 tests total across the Rust stack** — lib (944) + migration (53) + three_node (65) + integration_net (13) + integration_redex (22) + integration_cortex_{adapter,tasks,memories} (8+17+14) + integration_netdb (9) + SDK doctest (1). Plus 20 Node SDK smoke tests (vitest) and 18 Python SDK smoke tests (pytest), both covering CRUD, filtered queries, reactive watchers, multi-model coexistence, disk-durability round-trips, whole-db `NetDb` snapshot/restore, and per-adapter `open_from_snapshot` — all via the `cortex` / `netdb` features (which pull in `redex-disk`).
+**1,146 tests total across the Rust stack** — lib (944) + migration (53) + three_node (65) + integration_net (13) + integration_redex (22) + integration_cortex_{adapter,tasks,memories} (8+17+14) + integration_netdb (9) + SDK doctest (1). Plus 36 Node SDK smoke tests (vitest) and 33 Python SDK smoke tests (pytest), both covering CRUD, filtered queries, reactive watchers, multi-model coexistence, disk-durability round-trips, whole-db `NetDb` snapshot/restore, per-adapter `open_from_snapshot`, and classified `CortexError` / `NetDbError` via the `@ai2070/net/errors` subpath (Node) / `net._net` module (Python) — all via the `cortex` / `netdb` features (which pull in `redex-disk`).
 
 ### Test Architecture
 

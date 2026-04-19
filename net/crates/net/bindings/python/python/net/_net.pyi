@@ -431,3 +431,13 @@ class NetDb:
     def snapshot(self) -> bytes: ...
 
     def close(self) -> None: ...
+
+class CortexError(Exception):
+    """Raised by CortEX adapter operations (tasks, memories) on
+    adapter-level failures: `adapter closed`, `fold stopped at seq N`,
+    and underlying RedEX storage errors."""
+
+class NetDbError(Exception):
+    """Raised by NetDB handle-level operations: snapshot encode /
+    decode, missing-model accesses. Per-adapter failures inside a
+    NetDB still surface as `CortexError`."""

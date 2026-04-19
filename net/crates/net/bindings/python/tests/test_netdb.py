@@ -2,7 +2,7 @@
 
 import pytest
 
-from net._net import NetDb
+from net._net import CortexError, NetDb, NetDbError
 
 ORIGIN = 0xABCDEF01
 
@@ -165,5 +165,26 @@ def test_close_is_idempotent() -> None:
 
 
 def test_persistent_without_dir_errors() -> None:
-    with pytest.raises(RuntimeError, match="persistent"):
+    # Underlying adapter open failure surfaces as CortexError, not
+    # NetDbError — NetDbError is reserved for handle-level errors
+    # (snapshot encode/decode, model-not-included).
+    with pytest.raises(CortexError, match="persistent"):
         NetDb.open(origin_hash=ORIGIN, with_tasks=True, persistent=True)
+
+
+def test_netdb_snapshot_decode_raises_netdb_error() -> None:
+    # Garbage bytes → bincode decode error → NetDbError.
+    with pytest.raises(NetDbError, match="decode bundle"):
+        NetDb.open_from_snapshot(
+            b"\xff\xff\xff garbage not bincode \xff\xff",
+            origin_hash=ORIGIN,
+            with_tasks=True,
+        )
+
+
+def test_error_classes_are_exception_subclasses() -> None:
+    assert issubclass(CortexError, Exception)
+    assert issubclass(NetDbError, Exception)
+    # They're independent — NetDbError is not a CortexError subclass.
+    assert not issubclass(NetDbError, CortexError)
+    assert not issubclass(CortexError, NetDbError)
