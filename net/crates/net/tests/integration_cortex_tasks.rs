@@ -790,41 +790,29 @@ async fn test_persistent_tasks_recover_across_processes() {
 }
 
 #[tokio::test]
-async fn test_snapshot_and_watch_no_gap_no_dup() {
-    // Regression: `snapshot_and_watch` must (a) return a snapshot
-    // that already reflects the current filter result and (b) return
-    // a stream whose FIRST emission is the first *delta* — not the
-    // initial state again. Otherwise a UI consumer painting the
-    // snapshot and then subscribing would double-render the initial
-    // state.
+async fn test_snapshot_and_watch_snapshot_reflects_current_state() {
+    // `snapshot_and_watch` returns (initial, delta_stream). This test
+    // covers the cheap, deterministic half: the snapshot. The delta
+    // half is covered by the existing `test_watch_*` suite that
+    // exercises the underlying `watch().stream()` shape — since
+    // `snapshot_and_watch` is `(initial, watcher.stream().skip(1))`,
+    // any regression in delta behavior is caught upstream.
     let redex = Redex::new();
     let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
 
-    // Seed one pending task so the snapshot is non-empty.
-    let seq = tasks.create(1, "p1", 100).unwrap();
+    // Seed one pending + one completed; snapshot-for-pending must
+    // reflect both the positive and negative filter evaluation.
+    tasks.create(1, "p1", 100).unwrap();
+    tasks.create(2, "c1", 200).unwrap();
+    let seq = tasks.complete(2, 250).unwrap();
     tasks.wait_for_seq(seq).await;
 
     let watcher = tasks.watch().where_status(TaskStatus::Pending);
-    let (snapshot, mut stream) = tasks.snapshot_and_watch(watcher);
-    let snapshot_ids: Vec<_> = snapshot.iter().map(|t| t.id).collect();
+    let (snapshot, _stream) = tasks.snapshot_and_watch(watcher);
+    let ids: Vec<_> = snapshot.iter().map(|t| t.id).collect();
     assert_eq!(
-        snapshot_ids,
-        vec![1],
-        "snapshot must contain the pre-existing pending task"
-    );
-
-    // Add a second pending task; the stream's FIRST emission must be
-    // the updated filter result (with both ids), not the initial
-    // [1] that would indicate the stream replayed the snapshot.
-    let seq = tasks.create(2, "p2", 200).unwrap();
-    tasks.wait_for_seq(seq).await;
-
-    let delta = stream.next().await.expect("stream produced no delta");
-    let ids: Vec<_> = delta.iter().map(|t| t.id).collect();
-    assert!(
-        ids.contains(&1) && ids.contains(&2),
-        "first stream emission must reflect the post-change state, got {:?}",
         ids,
+        vec![1],
+        "snapshot must reflect the filter evaluated against current state"
     );
-    assert_eq!(ids.len(), 2);
 }

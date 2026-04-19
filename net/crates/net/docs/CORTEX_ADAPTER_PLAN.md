@@ -1,5 +1,7 @@
 # CortEX adapter — RedEX fold driver + NetDB surface
 
+> **Looking for how to use this?** [`STORAGE_AND_CORTEX.md`](STORAGE_AND_CORTEX.md) is the user-facing narrative. This doc is the implementation plan.
+
 ## Status
 
 Design only. Lands after CortEX itself has a concrete v1 scope (not in this plan) and RedEX v1 has seen pilot usage. Companion to [`REDEX_PLAN.md`](REDEX_PLAN.md) and [`REDEX_V2_PLAN.md`](REDEX_V2_PLAN.md).

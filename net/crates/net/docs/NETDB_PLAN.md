@@ -1,5 +1,7 @@
 # NetDB — query façade over CortEX state
 
+> **Looking for how to use this?** [`STORAGE_AND_CORTEX.md`](STORAGE_AND_CORTEX.md) is the user-facing narrative. This doc is the implementation plan.
+
 ## Status
 
 Design only. Most of the *substance* is already shipped — what NetDB adds is a **named layer** and a **unified multi-model handle** (`db.tasks`, `db.memories`, …) across Rust / TS / Python. No storage format changes, no new wire protocol.

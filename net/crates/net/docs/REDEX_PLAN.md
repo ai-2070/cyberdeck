@@ -1,5 +1,7 @@
 # RedEX v1 — local append-only streaming log
 
+> **Looking for how to use this?** [`STORAGE_AND_CORTEX.md`](STORAGE_AND_CORTEX.md) is the user-facing narrative (API surface, durability trade-offs, restart behavior). This doc is the implementation plan.
+
 ## Status
 
 Design only. RedEX does not exist yet.
