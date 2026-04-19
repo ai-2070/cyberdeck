@@ -181,7 +181,13 @@ where
     V: Hash + Eq + Clone + Send + Sync + 'static,
 {
     fn drop(&mut self) {
-        self.shutdown.notify_waiters();
+        // `notify_one` stores a permit if no waiter is currently
+        // registered, so a Drop that fires while the tail task is
+        // between `tokio::select!` polls still lands — the task
+        // consumes the permit on its next `notified()` and exits.
+        // `notify_waiters` would be dropped in that window and leak
+        // the task.
+        self.shutdown.notify_one();
     }
 }
 

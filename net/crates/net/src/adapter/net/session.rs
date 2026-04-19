@@ -1613,8 +1613,8 @@ mod tests {
         // exercises the ordering between the acquire's two-step
         // (CAS remaining, then bump sent) and the grant's credit
         // update.
-        use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
         use std::thread;
 
         const WINDOW: u32 = 64;

@@ -776,8 +776,16 @@ impl RedexFile {
         {
             // Signal the Interval task to exit before fsyncing so
             // `close()` isn't racing the task's own sync.
+            //
+            // `notify_one` stores a permit if the task hasn't yet
+            // parked on `notified()` — e.g. a `close()` that races a
+            // just-spawned task before it reaches the select, or one
+            // that fires while the task is between sleep and the
+            // next poll. `notify_waiters` would be lost in that
+            // window and the fsync loop would keep running after
+            // close.
             if let Some(shutdown) = self.inner.interval_shutdown.as_ref() {
-                shutdown.notify_waiters();
+                shutdown.notify_one();
             }
             if let Some(disk) = self.disk() {
                 disk.sync()?;
