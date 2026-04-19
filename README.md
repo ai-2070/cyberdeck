@@ -245,7 +245,7 @@ When processing can be offloaded to the mesh, edge devices don't need to be smar
 
 A sensor node doesn't need a GPU to run inference. It needs a network interface and a microcontroller. It streams raw data into the mesh and the mesh routes the processing to a node that has the capability. A camera doesn't need to run object detection. A thermostat doesn't need to run a language model. A brake sensor doesn't need to run path planning. They produce data. The mesh finds compute.
 
-The entire transport library — Noise protocol, ChaCha20-Poly1305 encryption, routing, swarm discovery, failure detection, capability system — compiles to ~840 KB stripped. Under a megabyte. It fits on anything with a network interface.
+The entire transport library — Noise protocol, ChaCha20-Poly1305 encryption, routing, swarm discovery, failure detection, capability system — compiles to ~1MB stripped. Under a megabyte. It fits on anything with a network interface.
 
 This inverts the economics of edge deployment. Today, every device that needs intelligence must contain intelligence — or pay for a round trip to a cloud that does. That means expensive hardware at the edge, or latency to a data center, or both. Net eliminates this choice. Devices can be cheap, dumb, and deterministic. They do one thing well — sense, actuate, relay — and the mesh provides the intelligence dynamically.
 
