@@ -1,0 +1,69 @@
+net/crates/net/tests/integration_cortex_tasks.rs
+  f3669361474f4cb8 8
+net/crates/net/bindings/node/Cargo.toml
+  f3669361474f4cb8 16
+net/crates/net/bindings/python/Cargo.toml
+  f3669361474f4cb8 17
+net/crates/net/docs/NETDB_PLAN.md
+  f3669361474f4cb8 89,263,297
+net/crates/net/bindings/node/src/cortex.rs
+  f3669361474f4cb8 4,879
+net/crates/net/tests/integration_cortex_adapter.rs
+  f3669361474f4cb8 14
+net/crates/net/docs/CORTEX_ADAPTER_PLAN.md
+  f3669361474f4cb8 346
+net/crates/net/tests/integration_cortex_memories.rs
+  f3669361474f4cb8 8,509
+net/crates/net/Cargo.toml
+  f3669361474f4cb8 42-43,149,154,159
+README.md
+  f3669361474f4cb8 361,383-384,389-390
+net/crates/net/README.md
+  f3669361474f4cb8 86,184,427,435,444,617-618,638-639,650,654,656-657,659-663
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "a66dba52d59dc102d1f59d0efa289f7f371a2454",
+  "prompts": {
+    "16f62563c20d300d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44af3dab-948b-45f8-92bd-c346ce78676a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 44,
+      "overriden_lines": 0
+    },
+    "a9d311afc8324224": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8e12ea48-52c3-40e2-9655-6d0ab0878bb6",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": null,
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 506,
+      "overriden_lines": 0
+    },
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2691,
+      "total_deletions": 232,
+      "accepted_lines": 924,
+      "overriden_lines": 31
+    }
+  }
+}
