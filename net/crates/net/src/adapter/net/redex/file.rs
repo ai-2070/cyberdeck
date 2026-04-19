@@ -543,7 +543,7 @@ impl RedexFile {
         Ok(first_seq)
     }
 
-    /// Append `value` (bincode-serialized) AND run `fold_fn` against
+    /// Append `value` (postcard-serialized) AND run `fold_fn` against
     /// caller-supplied `state` in the same call. Returns the
     /// assigned seq.
     ///

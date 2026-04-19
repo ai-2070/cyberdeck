@@ -270,7 +270,7 @@ where
     /// Capture a point-in-time snapshot of the materialized state.
     ///
     /// Returns `(state_bytes, last_seq)` where `state_bytes` is the
-    /// bincode-serialized state and `last_seq` is the highest RedEX
+    /// postcard-serialized state and `last_seq` is the highest RedEX
     /// sequence folded into it. Persist both together — they form a
     /// consistent pair, guaranteed by the adapter holding the state
     /// write lock while advancing the watermark.

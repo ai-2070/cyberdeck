@@ -30,7 +30,7 @@ use super::watch::MemoriesWatcher;
 use futures::StreamExt;
 
 /// Wire format for [`MemoriesAdapter::snapshot`]: wraps the
-/// `MemoriesState` bincode blob produced by the underlying
+/// `MemoriesState` postcard blob produced by the underlying
 /// [`CortexAdapter`] alongside the typed adapter's own `app_seq`
 /// counter so restore preserves per-origin monotonicity of
 /// `EventMeta::seq_or_ts`.
@@ -40,13 +40,13 @@ struct MemoriesSnapshotPayload {
     /// restores its counter to this so post-restore `EventMeta`
     /// records continue with monotonic per-origin sequencing.
     app_seq: u64,
-    /// The `CortexAdapter::snapshot` blob (bincode of `MemoriesState`).
+    /// The `CortexAdapter::snapshot` blob (postcard of `MemoriesState`).
     inner: Vec<u8>,
 }
 
 /// Typed wrapper around `CortexAdapter<MemoriesState>` that exposes
 /// domain-level operations (`store`, `retag`, `pin`, `unpin`,
-/// `delete`) and hides the `EventMeta` + bincode plumbing.
+/// `delete`) and hides the `EventMeta` + postcard plumbing.
 pub struct MemoriesAdapter {
     inner: CortexAdapter<MemoriesState>,
     /// Producer identity stamped on every `EventMeta`.
