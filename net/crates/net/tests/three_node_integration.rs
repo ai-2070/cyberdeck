@@ -4845,12 +4845,14 @@ async fn test_send_on_stream_backpressure_when_concurrent() {
     a.start();
     b.start();
 
-    // 20-byte window (v2 bytes semantics). Each packet's payload =
-    // EventFrame::LEN_SIZE (4) + event.len() (10) = 14 bytes. One
-    // packet fits; the second races for only 6 bytes of credit and
-    // sees Backpressure before the receiver's grant arrives.
+    // 128-byte window (v2 wire-bytes semantics). Each packet on the
+    // wire = 64 B Net header + 16 B AEAD tag + payload = 80 B of
+    // fixed overhead + 14 B payload (4 B frame length + 10 B event)
+    // = 94 B per packet. One packet fits (94 of 128); the second
+    // races for only 34 B of credit and sees Backpressure before
+    // the receiver's grant arrives.
     let stream = a
-        .open_stream(nid_b, 7777, StreamConfig::new().with_window_bytes(20))
+        .open_stream(nid_b, 7777, StreamConfig::new().with_window_bytes(128))
         .unwrap();
 
     // Spin up a batch of concurrent tasks sending on the same stream.
@@ -4900,7 +4902,7 @@ async fn test_send_on_stream_backpressure_when_concurrent() {
         stats.backpressure_events,
         backpressure
     );
-    assert_eq!(stats.tx_window, 20);
+    assert_eq!(stats.tx_window, 128);
 
     Arc::try_unwrap(a).ok().unwrap().shutdown().await.unwrap();
     b.shutdown().await.unwrap();
@@ -4941,11 +4943,13 @@ async fn test_send_with_retry_eventually_succeeds_through_backpressure() {
     a.start();
     b.start();
 
-    // v2: 64-byte window — small enough that retries hit
-    // Backpressure, large enough that receiver-side grants flowing
-    // back replenish credit for subsequent attempts.
+    // v2 wire-bytes window: each packet is 80 B overhead + small
+    // payload ≈ 95 B. A 512-byte window fits ~5 packets in flight,
+    // small enough that retries hit Backpressure, large enough that
+    // receiver-side grants flowing back replenish credit for
+    // subsequent attempts.
     let stream = a
-        .open_stream(nid_b, 8888, StreamConfig::new().with_window_bytes(64))
+        .open_stream(nid_b, 8888, StreamConfig::new().with_window_bytes(512))
         .unwrap();
 
     // Run 32 concurrent retry-sends. All must eventually succeed;
@@ -5018,11 +5022,13 @@ async fn test_v2_serial_sender_sees_backpressure_on_slow_receiver() {
     a.start();
     b.start();
 
-    // 32-byte window — two 14-byte packets drain it. The third serial
-    // send has to wait for a grant from B. Without a grant it
+    // 256-byte wire-bytes window. Each packet on the wire is 80 B
+    // overhead + 14 B payload = 94 B, so two packets drain to 68 B
+    // remaining — the third serial send needs 94 B more credit than
+    // it has and has to wait for a grant from B. Without a grant it
     // Backpressures; the critical thing v2 does that v1 couldn't.
     let stream = a
-        .open_stream(nid_b, 9999, StreamConfig::new().with_window_bytes(32))
+        .open_stream(nid_b, 9999, StreamConfig::new().with_window_bytes(256))
         .unwrap();
 
     let event = Bytes::from_static(b"{\"k\":\"v\"}"); // 10 bytes, frame = 14
@@ -5063,7 +5069,7 @@ async fn test_v2_serial_sender_sees_backpressure_on_slow_receiver() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let stats = a.stream_stats(nid_b, 9999).expect("stats");
-    assert_eq!(stats.tx_window, 32);
+    assert_eq!(stats.tx_window, 256);
     assert!(
         stats.backpressure_events >= backpressure as u64,
         "stats.backpressure_events ({}) should be >= observed ({})",

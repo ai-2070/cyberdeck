@@ -144,22 +144,27 @@ class MeshNode:
         stream_id: int,
         *,
         reliability: Reliability = "fire_and_forget",
-        window_bytes: int = 0,
+        window_bytes: Optional[int] = None,
         fairness_weight: int = 1,
     ) -> MeshStream:
         """Open (or look up) a logical stream to a connected peer.
+
+        ``window_bytes`` defaults to the core's
+        ``DEFAULT_STREAM_WINDOW_BYTES`` (64 KB) when ``None`` so v2
+        backpressure is ON out of the box. Pass ``0`` to restore the
+        v1 unbounded-queue behavior on this stream.
 
         Repeated calls for the same ``(peer_node_id, stream_id)`` are
         idempotent — the first open wins and later differing configs
         are logged and ignored.
         """
-        native = self._native.open_stream(
-            peer_node_id,
-            stream_id,
-            reliability=reliability,
-            window_bytes=window_bytes,
-            fairness_weight=fairness_weight,
-        )
+        kwargs = {
+            "reliability": reliability,
+            "fairness_weight": fairness_weight,
+        }
+        if window_bytes is not None:
+            kwargs["window_bytes"] = window_bytes
+        native = self._native.open_stream(peer_node_id, stream_id, **kwargs)
         return MeshStream(peer_node_id, stream_id, native)
 
     def close_stream(self, peer_node_id: int, stream_id: int) -> None:

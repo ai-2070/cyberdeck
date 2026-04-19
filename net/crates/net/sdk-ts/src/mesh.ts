@@ -51,9 +51,10 @@ export interface StreamConfig {
   /** Reliability mode. Default: `'fire_and_forget'`. */
   reliability?: Reliability;
   /**
-   * Per-stream in-flight window cap (max concurrent packets before
-   * {@link BackpressureError} is thrown). `0` = unbounded (pre-
-   * backpressure behavior). Default: `0`.
+   * Initial send-credit window in bytes. Leave unset to inherit the
+   * core's `DEFAULT_STREAM_WINDOW_BYTES` (64 KB) — v2 backpressure
+   * is ON out of the box. Pass `0` to restore the v1 unbounded-queue
+   * behavior on this stream.
    */
   windowBytes?: number;
   /**

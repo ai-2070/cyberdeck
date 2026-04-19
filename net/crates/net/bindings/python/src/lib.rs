@@ -793,6 +793,7 @@ pyo3::create_exception!(
 #[cfg(feature = "net")]
 mod mesh_bindings {
     use super::*;
+    use net::adapter::net::DEFAULT_STREAM_WINDOW_BYTES;
     use net::adapter::net::{
         EntityKeypair, MeshNode, MeshNodeConfig, Reliability, Stream as CoreStream, StreamConfig,
         StreamError,
@@ -1093,13 +1094,16 @@ mod mesh_bindings {
         ///     peer_node_id: node_id of a peer this node is connected to.
         ///     stream_id: caller-chosen opaque u64.
         ///     reliability: "fire_and_forget" (default) or "reliable".
-        ///     window_bytes: per-stream in-flight window cap. 0 = unbounded.
+        ///     window_bytes: initial send-credit window in bytes.
+        ///         Defaults to DEFAULT_STREAM_WINDOW_BYTES (64 KB)
+        ///         when unset — v2 backpressure is ON out of the
+        ///         box. Pass 0 to restore the v1 unbounded behavior.
         ///     fairness_weight: fair-scheduler quantum multiplier.
         #[pyo3(signature = (
             peer_node_id,
             stream_id,
             reliability=None,
-            window_bytes=0,
+            window_bytes=DEFAULT_STREAM_WINDOW_BYTES,
             fairness_weight=1
         ))]
         fn open_stream(

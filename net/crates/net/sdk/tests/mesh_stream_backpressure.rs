@@ -59,17 +59,18 @@ async fn test_sdk_surfaces_backpressure_variant() {
     b.inner().start();
 
     let a = Arc::new(a);
-    // v2: window_bytes counts bytes, not packets. Each send is
-    // `{}` (2 bytes) + EventFrame::LEN_SIZE (4) = 6 bytes on the
-    // wire. An 8-byte window fits exactly one; concurrent callers
-    // race for the same window and surface Backpressure just like v1.
+    // v2 wire-bytes accounting: each packet on the wire costs
+    // 64 B Net header + 16 B AEAD tag + 6 B payload (2 B `{}` + 4 B
+    // EventFrame length) = 86 B. A 96-byte window fits exactly one
+    // packet; concurrent callers race for the same window and
+    // surface Backpressure just like v1.
     let stream = a
         .open_stream(
             nid_b,
             0x1337,
             StreamConfig::new()
                 .with_reliability(Reliability::FireAndForget)
-                .with_window_bytes(8),
+                .with_window_bytes(96),
         )
         .expect("open_stream");
 
@@ -102,7 +103,7 @@ async fn test_sdk_surfaces_backpressure_variant() {
     assert!(ok > 0);
 
     let stats = a.stream_stats(nid_b, 0x1337).expect("stats");
-    assert_eq!(stats.tx_window, 8);
+    assert_eq!(stats.tx_window, 96);
     assert!(stats.backpressure_events >= bp as u64);
 
     // Shutdown — consume the Arc.
@@ -131,11 +132,12 @@ async fn test_sdk_send_with_retry_succeeds_through_backpressure() {
     b.inner().start();
 
     let a = Arc::new(a);
-    // v2: 64-byte window — enough for a handful of small payloads
-    // concurrently, but small enough that retries have to wait for
-    // receiver-driven StreamWindow grants to free credit.
+    // v2 wire-bytes window: 512 bytes ≈ 5 × (80 B overhead + small
+    // payload) — enough for a handful of packets concurrently, but
+    // small enough that retries have to wait for receiver-driven
+    // StreamWindow grants to free credit.
     let stream = a
-        .open_stream(nid_b, 0x2468, StreamConfig::new().with_window_bytes(64))
+        .open_stream(nid_b, 0x2468, StreamConfig::new().with_window_bytes(512))
         .unwrap();
 
     let mut handles = Vec::new();

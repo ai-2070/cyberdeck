@@ -801,7 +801,7 @@ mod mesh_bindings {
     use super::*;
     use net::adapter::net::{
         EntityKeypair, MeshNode, MeshNodeConfig, Reliability, Stream as CoreStream, StreamConfig,
-        StreamError,
+        StreamError, DEFAULT_STREAM_WINDOW_BYTES,
     };
     use net::adapter::Adapter;
     use std::time::Duration;
@@ -818,8 +818,10 @@ mod mesh_bindings {
         pub stream_id: i64,
         /// `"fire_and_forget"` | `"reliable"`. Default: `"fire_and_forget"`.
         pub reliability: Option<String>,
-        /// Per-stream in-flight window cap. `0` = unbounded (preserves
-        /// pre-backpressure behavior). Default: `0`.
+        /// Initial send-credit window in bytes. Defaults to
+        /// `DEFAULT_STREAM_WINDOW_BYTES` (64 KB) when unset — v2
+        /// backpressure is ON out of the box. Pass `0` to restore the
+        /// v1 unbounded-queue behavior for a specific stream.
         pub window_bytes: Option<u32>,
         /// Fair-scheduler weight (1 = equal share). Default: 1.
         pub fairness_weight: Option<u8>,
@@ -917,7 +919,7 @@ mod mesh_bindings {
         };
         Ok(StreamConfig::new()
             .with_reliability(reliability)
-            .with_window_bytes(opts.window_bytes.unwrap_or(0))
+            .with_window_bytes(opts.window_bytes.unwrap_or(DEFAULT_STREAM_WINDOW_BYTES))
             .with_fairness_weight(opts.fairness_weight.unwrap_or(1)))
     }
 

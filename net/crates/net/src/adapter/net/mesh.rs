@@ -53,7 +53,26 @@ use super::channel::{
     PublishConfig, PublishReport, SubscriberRoster,
 };
 use super::compute::SUBPROTOCOL_MIGRATION;
-use super::protocol::{self, EventFrame, PacketFlags, MAGIC};
+use super::protocol::{self, EventFrame, PacketFlags, HEADER_SIZE, MAGIC, TAG_SIZE};
+
+/// Wire overhead added to the AEAD-encrypted payload by every Net
+/// packet: the 64-byte header plus the 16-byte Poly1305 tag. Credit
+/// accounting charges this against the sender's `tx_credit_remaining`
+/// alongside the payload so the byte window matches the bandwidth
+/// the sender actually pumps onto the link. The receiver's
+/// `on_bytes_consumed` adds the same overhead, keeping sender and
+/// receiver in lockstep.
+const PACKET_WIRE_OVERHEAD: usize = HEADER_SIZE + TAG_SIZE;
+
+/// Total wire bytes for a single Net packet carrying `payload_bytes`
+/// of AEAD-encrypted content. Saturating at `u32::MAX` so a
+/// pathological `payload_bytes` can't silently wrap the credit math.
+#[inline]
+fn wire_bytes_for_payload(payload_bytes: usize) -> u32 {
+    payload_bytes
+        .saturating_add(PACKET_WIRE_OVERHEAD)
+        .min(u32::MAX as usize) as u32
+}
 use super::reroute::ReroutePolicy;
 use super::route::{RoutingHeader, ROUTING_HEADER_SIZE};
 use super::router::{NetRouter, RouterConfig};
@@ -1290,8 +1309,13 @@ impl MeshNode {
             return;
         }
 
-        // Standard event path: parse event frames and queue
-        let payload_bytes = decrypted.len() as u64;
+        // Standard event path: parse event frames and queue.
+        //
+        // Credit accounting charges the full on-wire size (Net
+        // header + AEAD tag + payload) so sender and receiver stay
+        // symmetric — the sender debits the same quantity via
+        // `wire_bytes_for_payload` on admission.
+        let payload_bytes = (decrypted.len() + PACKET_WIRE_OVERHEAD) as u64;
         let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
 
         let stream_id = parsed.header.stream_id;
@@ -2299,14 +2323,18 @@ impl MeshNode {
         for event in events {
             let frame_size = EventFrame::LEN_SIZE + event.len();
             if current_size + frame_size > protocol::MAX_PAYLOAD_SIZE && !current_batch.is_empty() {
-                // Charge against the sender's byte credit using the
-                // wire-payload size for this batch. Matches the units
-                // the receiver accounts against in `on_bytes_consumed`.
+                // Charge the **wire size** (Net header + AEAD tag +
+                // payload) rather than just the event-frame payload
+                // so the byte window matches the bandwidth the sender
+                // actually pumps onto the link. Both ends add the
+                // same fixed per-packet overhead, so sender and
+                // receiver accounting stay symmetric.
+                //
                 // `TxAdmit::Acquired` returns credit + sequence under
                 // the same DashMap lookup — a close+reopen race can't
                 // slip a stale sequence from the old lifetime onto
                 // the new state.
-                let needed = current_size as u32;
+                let needed = wire_bytes_for_payload(current_size);
                 let (guard, seq) = match session.try_acquire_tx_credit_matching_epoch(
                     stream_id,
                     stream.epoch,
@@ -2328,7 +2356,7 @@ impl MeshNode {
         }
 
         if !current_batch.is_empty() {
-            let needed = current_size as u32;
+            let needed = wire_bytes_for_payload(current_size);
             let (guard, seq) =
                 match session.try_acquire_tx_credit_matching_epoch(stream_id, stream.epoch, needed)
                 {
