@@ -1,4 +1,4 @@
-//! Typed wrapper over `RedexFile` — auto-serde via bincode.
+//! Typed wrapper over `RedexFile` — auto-serde via postcard.
 //!
 //! `TypedRedexFile<T>` is a thin layer over [`RedexFile`] that hides
 //! the `&[u8] ↔ T` boundary. Callers pass / receive `T` directly;
@@ -21,7 +21,7 @@ use super::error::RedexError;
 use super::file::RedexFile;
 
 /// Typed wrapper over a `RedexFile`. `T` is the domain event type;
-/// it must be `Serialize + DeserializeOwned` for bincode.
+/// it must be `Serialize + DeserializeOwned` for postcard.
 pub struct TypedRedexFile<T> {
     inner: RedexFile,
     _marker: PhantomData<fn() -> T>,
@@ -44,9 +44,9 @@ impl<T> TypedRedexFile<T> {
 }
 
 impl<T: Serialize> TypedRedexFile<T> {
-    /// Serialize with bincode and append. Returns the assigned seq.
+    /// Serialize with postcard and append. Returns the assigned seq.
     pub fn append(&self, value: &T) -> Result<u64, RedexError> {
-        let bytes = bincode::serialize(value)
+        let bytes = postcard::to_allocvec(value)
             .map_err(|e| RedexError::Encode(format!("typed append serialize: {}", e)))?;
         self.inner.append(&bytes)
     }
@@ -56,7 +56,7 @@ impl<T: Serialize> TypedRedexFile<T> {
     pub fn append_batch(&self, values: &[T]) -> Result<u64, RedexError> {
         let mut buffers: Vec<Bytes> = Vec::with_capacity(values.len());
         for v in values {
-            let bytes = bincode::serialize(v)
+            let bytes = postcard::to_allocvec(v)
                 .map_err(|e| RedexError::Encode(format!("typed append_batch serialize: {}", e)))?;
             buffers.push(Bytes::from(bytes));
         }
@@ -75,7 +75,7 @@ impl<T: DeserializeOwned + Send + 'static> TypedRedexFile<T> {
         self.inner.tail(from_seq).map(|result| {
             let ev = result?;
             let seq = ev.entry.seq;
-            let value: T = bincode::deserialize(&ev.payload).map_err(|e| {
+            let value: T = postcard::from_bytes(&ev.payload).map_err(|e| {
                 RedexError::Encode(format!("typed tail deserialize at seq {}: {}", seq, e))
             })?;
             Ok((seq, value))
@@ -91,7 +91,7 @@ impl<T: DeserializeOwned + Send + 'static> TypedRedexFile<T> {
             .into_iter()
             .map(|ev| {
                 let seq = ev.entry.seq;
-                let value: T = bincode::deserialize(&ev.payload).map_err(|e| {
+                let value: T = postcard::from_bytes(&ev.payload).map_err(|e| {
                     RedexError::Encode(format!(
                         "typed read_range deserialize at seq {}: {}",
                         seq, e

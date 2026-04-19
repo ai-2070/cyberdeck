@@ -270,7 +270,7 @@ where
     /// Capture a point-in-time snapshot of the materialized state.
     ///
     /// Returns `(state_bytes, last_seq)` where `state_bytes` is the
-    /// bincode-serialized state and `last_seq` is the highest RedEX
+    /// postcard-serialized state and `last_seq` is the highest RedEX
     /// sequence folded into it. Persist both together — they form a
     /// consistent pair, guaranteed by the adapter holding the state
     /// write lock while advancing the watermark.
@@ -284,7 +284,7 @@ where
     /// [`Self::wait_for_seq`] has returned before snapshotting).
     pub fn snapshot(&self) -> Result<(Vec<u8>, Option<u64>), CortexAdapterError> {
         let state = self.inner.state.read();
-        let bytes = bincode::serialize(&*state).map_err(|e| {
+        let bytes = postcard::to_allocvec(&*state).map_err(|e| {
             CortexAdapterError::Redex(RedexError::Encode(format!("snapshot serialize: {}", e)))
         })?;
         let watermark = self.inner.folded_through_seq.load(Ordering::Acquire);
@@ -325,7 +325,7 @@ where
     where
         F: RedexFold<State> + Send + 'static,
     {
-        let initial_state: State = bincode::deserialize(state_bytes).map_err(|e| {
+        let initial_state: State = postcard::from_bytes(state_bytes).map_err(|e| {
             CortexAdapterError::Redex(RedexError::Encode(format!("deserialize snapshot: {}", e)))
         })?;
         let start = match last_seq {

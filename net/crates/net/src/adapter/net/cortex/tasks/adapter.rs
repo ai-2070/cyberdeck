@@ -29,7 +29,7 @@ use super::watch::TasksWatcher;
 use futures::StreamExt;
 
 /// Wire format for [`TasksAdapter::snapshot`]: wraps the `TasksState`
-/// bincode blob produced by the underlying [`CortexAdapter`] alongside
+/// postcard blob produced by the underlying [`CortexAdapter`] alongside
 /// the typed adapter's own `app_seq` counter so restore preserves
 /// per-origin monotonicity of `EventMeta::seq_or_ts`.
 #[derive(Serialize, Deserialize)]
@@ -38,13 +38,13 @@ struct TasksSnapshotPayload {
     /// restores its counter to this so post-restore `EventMeta`
     /// records continue with monotonic per-origin sequencing.
     app_seq: u64,
-    /// The `CortexAdapter::snapshot` blob (bincode of `TasksState`).
+    /// The `CortexAdapter::snapshot` blob (postcard of `TasksState`).
     inner: Vec<u8>,
 }
 
 /// Typed wrapper around `CortexAdapter<TasksState>` that exposes
 /// domain-level operations (`create`, `rename`, `complete`, `delete`)
-/// and hides the `EventMeta` + bincode plumbing.
+/// and hides the `EventMeta` + postcard plumbing.
 pub struct TasksAdapter {
     inner: CortexAdapter<TasksState>,
     /// Producer identity stamped on every `EventMeta`.
@@ -182,7 +182,7 @@ impl TasksAdapter {
             app_seq: self.app_seq.load(Ordering::Acquire),
             inner,
         };
-        let bytes = bincode::serialize(&payload).map_err(|e| {
+        let bytes = postcard::to_allocvec(&payload).map_err(|e| {
             CortexAdapterError::Redex(RedexError::Encode(format!("tasks snapshot wrap: {}", e)))
         })?;
         Ok((bytes, last_seq))
@@ -214,7 +214,7 @@ impl TasksAdapter {
         state_bytes: &[u8],
         last_seq: Option<u64>,
     ) -> Result<Self, CortexAdapterError> {
-        let payload: TasksSnapshotPayload = bincode::deserialize(state_bytes).map_err(|e| {
+        let payload: TasksSnapshotPayload = postcard::from_bytes(state_bytes).map_err(|e| {
             CortexAdapterError::Redex(RedexError::Encode(format!("tasks snapshot unwrap: {}", e)))
         })?;
         let name = ChannelName::new(TASKS_CHANNEL)
@@ -260,14 +260,14 @@ impl TasksAdapter {
         })
     }
 
-    /// Build the `EventEnvelope` + ingest. Keeps bincode serialization
+    /// Build the `EventEnvelope` + ingest. Keeps postcard serialization
     /// and `EventMeta` assembly in one place.
     fn ingest_typed<T: serde::Serialize>(
         &self,
         dispatch: u8,
         payload: &T,
     ) -> Result<u64, CortexAdapterError> {
-        let tail = bincode::serialize(payload).map_err(|e| {
+        let tail = postcard::to_allocvec(payload).map_err(|e| {
             CortexAdapterError::Redex(super::super::super::redex::RedexError::Encode(
                 e.to_string(),
             ))

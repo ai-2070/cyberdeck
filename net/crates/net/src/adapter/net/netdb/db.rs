@@ -7,7 +7,7 @@ use super::super::cortex::tasks::TasksAdapter;
 use super::super::redex::{Redex, RedexFileConfig};
 use super::error::NetDbError;
 
-/// Portable, bincode-serialisable bundle of per-model snapshots.
+/// Portable, postcard-serialisable bundle of per-model snapshots.
 /// Returned by [`NetDb::snapshot`]; consumed by
 /// [`NetDbBuilder::build_from_snapshot`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,15 +20,15 @@ pub struct NetDbSnapshot {
 }
 
 impl NetDbSnapshot {
-    /// Serialize the whole bundle into a single bincode blob for
+    /// Serialize the whole bundle into a single postcard blob for
     /// persistence.
     pub fn encode(&self) -> Result<Vec<u8>, NetDbError> {
-        bincode::serialize(self).map_err(|e| NetDbError::Snapshot(e.to_string()))
+        postcard::to_allocvec(self).map_err(|e| NetDbError::Snapshot(e.to_string()))
     }
 
     /// Deserialize from a blob produced by [`Self::encode`].
     pub fn decode(bytes: &[u8]) -> Result<Self, NetDbError> {
-        bincode::deserialize(bytes).map_err(|e| NetDbError::Snapshot(e.to_string()))
+        postcard::from_bytes(bytes).map_err(|e| NetDbError::Snapshot(e.to_string()))
     }
 }
 

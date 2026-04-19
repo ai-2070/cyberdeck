@@ -41,7 +41,7 @@ pub enum RedexError {
     #[error("channel error: {0}")]
     Channel(String),
 
-    /// An encoding helper (e.g. `append_bincode`) failed to serialize.
+    /// An encoding helper (e.g. `append_postcard`) failed to serialize.
     #[error("encode failed: {0}")]
     Encode(String),
 
