@@ -4,11 +4,35 @@
 //! Authorized `(origin_hash, channel_hash)` pairs are inserted at subscription
 //! time (slow path). The per-packet fast path probes the bloom filter with
 //! no crypto, no heap allocation, and no pointer chasing.
+//!
+//! # Two-tier authorization
+//!
+//! The guard keeps two parallel ACLs:
+//!
+//! - **Fast path** (`check_fast`, `authorize`, `is_authorized`): keyed
+//!   on the 16-bit `channel_hash` that rides the Net header. Used by
+//!   the packet data plane. Collisions are tolerable here because
+//!   AEAD still enforces payload integrity end-to-end — a bloom false
+//!   positive at most costs a full check further up the stack.
+//! - **Exact path** (`allow_channel`, `revoke_channel`,
+//!   `is_authorized_full`): keyed on the full 64-bit channel identity
+//!   ([`super::ChannelName::full_id`]). Used by control-plane and
+//!   storage decisions (e.g. `Redex::open_file`) where a 16-bit
+//!   collision would let one channel's ACL authorize access to a
+//!   different channel's file. At mesh scale the 16-bit hash hits
+//!   collisions routinely; the 64-bit identity makes them
+//!   cryptographically negligible for any realistic per-deployment
+//!   channel set.
+//!
+//! `allow_channel` populates both tiers so a caller granted storage
+//! access can also continue sending packets on that channel.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use dashmap::DashMap;
 use xxhash_rust::xxh3::xxh3_64;
+
+use super::ChannelName;
 
 /// Result of a fast-path authorization check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +66,11 @@ pub struct AuthGuard {
     bloom_mask: u64,
     /// Verified-positive cache: (origin_hash, channel_hash) -> authorized.
     verified: DashMap<(u32, u16), bool>,
+    /// Exact-identity ACL: (origin_hash, full 64-bit channel id) ->
+    /// authorized. Separate from `verified` because the 16-bit wire
+    /// hash alone cannot safely authorize storage / control-plane
+    /// decisions at mesh scale (birthday collisions in ~256 names).
+    exact: DashMap<(u32, u64), ()>,
 }
 
 /// Bloom filter size: 2^15 bits = 4KB. Fits in L1 cache.
@@ -56,6 +85,7 @@ impl AuthGuard {
             bloom,
             bloom_mask: (1u64 << BLOOM_BITS) - 1,
             verified: DashMap::new(),
+            exact: DashMap::new(),
         }
     }
 
@@ -114,13 +144,59 @@ impl AuthGuard {
     }
 
     /// Check if a pair is authorized (verified cache only, no bloom).
+    ///
+    /// This is the fast-path check used by the packet data plane.
+    /// For control-plane / storage decisions, use
+    /// [`Self::is_authorized_full`] — the 16-bit `channel_hash` alone
+    /// is collision-prone at mesh scale and must not be trusted as
+    /// an ACL for non-data-plane decisions.
     pub fn is_authorized(&self, origin_hash: u32, channel_hash: u16) -> bool {
         self.verified.contains_key(&(origin_hash, channel_hash))
+    }
+
+    /// Grant `origin_hash` full (control-plane) access to `name`.
+    ///
+    /// Populates both ACL tiers:
+    /// - the exact per-`full_id` map that control-plane / storage
+    ///   callers must consult via [`Self::is_authorized_full`];
+    /// - the fast-path bloom + verified cache, so the same origin
+    ///   can continue sending packets on that channel via
+    ///   [`Self::check_fast`] / [`Self::is_authorized`].
+    pub fn allow_channel(&self, origin_hash: u32, name: &ChannelName) {
+        self.exact.insert((origin_hash, name.full_id()), ());
+        self.authorize(origin_hash, name.hash());
+    }
+
+    /// Revoke `origin_hash`'s full access to `name`.
+    ///
+    /// Removes from both the exact ACL and the fast-path verified
+    /// cache. Bloom bits are not cleared (bloom filters don't support
+    /// deletion), so the fast path may transition to
+    /// [`AuthVerdict::NeedsFullCheck`] for this pair — the exact-map
+    /// miss then fails the full check.
+    pub fn revoke_channel(&self, origin_hash: u32, name: &ChannelName) {
+        self.exact.remove(&(origin_hash, name.full_id()));
+        self.revoke(origin_hash, name.hash());
+    }
+
+    /// Exact authorization check keyed on the full 64-bit channel
+    /// identity. Used by control-plane / storage decisions
+    /// (e.g. `Redex::open_file`). Unlike [`Self::is_authorized`],
+    /// this cannot be bypassed by a 16-bit hash collision between
+    /// two different channel names.
+    pub fn is_authorized_full(&self, origin_hash: u32, name: &ChannelName) -> bool {
+        self.exact.contains_key(&(origin_hash, name.full_id()))
     }
 
     /// Number of authorized pairs in the verified cache.
     pub fn authorized_count(&self) -> usize {
         self.verified.len()
+    }
+
+    /// Number of (origin, channel) pairs with exact (control-plane)
+    /// authorization.
+    pub fn exact_authorized_count(&self) -> usize {
+        self.exact.len()
     }
 
     /// Rebuild the bloom filter from the verified cache.
@@ -166,6 +242,7 @@ impl std::fmt::Debug for AuthGuard {
         f.debug_struct("AuthGuard")
             .field("bloom_size_bytes", &self.bloom.len())
             .field("authorized_pairs", &self.verified.len())
+            .field("exact_authorized_pairs", &self.exact.len())
             .finish()
     }
 }

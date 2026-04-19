@@ -2,7 +2,10 @@
 //!
 //! Holds an optional reference to an [`AuthGuard`](super::super::AuthGuard)
 //! plus a local origin-hash. When auth is wired up, `open_file` rejects
-//! opens whose `(origin, channel_hash)` pair is not authorized.
+//! opens unless `(origin, full_channel_id)` has been explicitly
+//! authorized via [`AuthGuard::allow_channel`]. The 16-bit wire
+//! `channel_hash` alone is not sufficient here — at mesh scale it
+//! collides often enough to allow ACL bypass between unrelated names.
 
 use std::sync::Arc;
 
@@ -39,7 +42,10 @@ impl Redex {
     }
 
     /// Create a manager that rejects `open_file` unless the
-    /// `(origin_hash, channel_hash)` pair is authorized by `guard`.
+    /// `(origin_hash, channel)` pair has been authorized by `guard`
+    /// via [`AuthGuard::allow_channel`]. Uses the exact 64-bit
+    /// channel identity, not the 16-bit wire hash — see the module
+    /// docs for rationale.
     pub fn with_auth(guard: Arc<AuthGuard>, origin_hash: u32) -> Self {
         Self {
             files: DashMap::new(),
@@ -75,7 +81,13 @@ impl Redex {
         config: RedexFileConfig,
     ) -> Result<RedexFile, RedexError> {
         if let Some(auth) = &self.auth {
-            if !auth.is_authorized(self.origin_hash, name.hash()) {
+            // Use the EXACT 64-bit channel identity for the ACL
+            // decision — `is_authorized` (16-bit) is reserved for
+            // the fast-path packet check where AEAD integrity
+            // backstops any bloom-filter false positives. Storage
+            // access has no such backstop, so the exact check is
+            // required to prevent hash-collision ACL bypass.
+            if !auth.is_authorized_full(self.origin_hash, name) {
                 return Err(RedexError::Unauthorized);
             }
         }
@@ -217,9 +229,31 @@ mod tests {
     fn test_auth_allows_authorized_origin() {
         let guard = Arc::new(AuthGuard::new());
         let name = cn("allowed");
-        guard.authorize(0x1234_5678, name.hash());
+        // `allow_channel` populates the exact (control-plane) ACL
+        // used by `open_file`, plus the fast-path bloom so packet
+        // checks on the same channel also pass.
+        guard.allow_channel(0x1234_5678, &name);
         let r = Redex::with_auth(guard, 0x1234_5678);
         assert!(r.open_file(&name, RedexFileConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn test_auth_fast_path_alone_does_not_authorize_open_file() {
+        // Regression: `open_file` used to accept any origin that
+        // had the 16-bit `channel_hash` in its fast-path bloom. A
+        // different channel name whose 16-bit hash collided with an
+        // authorized one would then grant unauthorized storage
+        // access. The fix requires the exact 64-bit `full_id`, so
+        // a fast-path-only authorization is insufficient.
+        let guard = Arc::new(AuthGuard::new());
+        let name = cn("sensitive");
+        // Authorize the fast path ONLY (no allow_channel).
+        guard.authorize(0x1234_5678, name.hash());
+        let r = Redex::with_auth(guard, 0x1234_5678);
+        assert!(matches!(
+            r.open_file(&name, RedexFileConfig::default()),
+            Err(RedexError::Unauthorized)
+        ));
     }
 
     #[test]

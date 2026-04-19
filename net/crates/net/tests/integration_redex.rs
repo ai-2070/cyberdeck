@@ -445,9 +445,70 @@ fn test_redex_auth_enforcement() {
         Err(RedexError::Unauthorized)
     ));
 
-    // Authorize and retry.
-    guard.authorize(0xDEAD_BEEF, name.hash());
+    // Authorize via the exact-identity path (required for storage
+    // decisions) and retry.
+    guard.allow_channel(0xDEAD_BEEF, &name);
     assert!(r.open_file(&name, RedexFileConfig::default()).is_ok());
+}
+
+#[test]
+fn test_regression_auth_does_not_grant_access_via_u16_collision() {
+    // Regression: `open_file` used to authorize on the 16-bit
+    // `channel_hash` alone, which collides on birthday terms at mesh
+    // scale (~256 names). An origin authorized for channel A could
+    // then open channel B whenever A.hash() == B.hash(). The fix
+    // switches the storage ACL to the exact 64-bit `full_id`.
+    //
+    // Find a collision pair at runtime: with 65,536 buckets and a
+    // few hundred candidates, a match is near-certain. We search
+    // bounded so a pathological test env can't hang.
+    use net::adapter::net::channel::channel_hash;
+    let allowed = cn("auth/collision/allowed");
+    let target_hash = allowed.hash();
+    let mut colliding: Option<ChannelName> = None;
+    for i in 0..1_000_000u64 {
+        let candidate = format!("auth/collision/other/c{}", i);
+        if channel_hash(&candidate) == target_hash && candidate != allowed.as_str() {
+            colliding = Some(cn(&candidate));
+            break;
+        }
+    }
+    let colliding = colliding.expect("no u16 hash collision in 1M candidates");
+    assert_ne!(
+        allowed.as_str(),
+        colliding.as_str(),
+        "collision pair must be distinct names"
+    );
+    assert_eq!(
+        allowed.hash(),
+        colliding.hash(),
+        "collision pair must share the 16-bit hash"
+    );
+    assert_ne!(
+        allowed.full_id(),
+        colliding.full_id(),
+        "collision pair must have distinct 64-bit full_ids"
+    );
+
+    let guard = Arc::new(AuthGuard::new());
+    // Authorize ONLY the `allowed` channel. The colliding name
+    // shares the 16-bit hash but not the 64-bit identity.
+    guard.allow_channel(0xDEAD_BEEF, &allowed);
+
+    let r = Redex::with_auth(guard.clone(), 0xDEAD_BEEF);
+
+    // Allowed name opens cleanly.
+    assert!(r.open_file(&allowed, RedexFileConfig::default()).is_ok());
+
+    // Colliding name must be rejected — this is the security
+    // property that the pre-fix implementation violated.
+    assert!(
+        matches!(
+            r.open_file(&colliding, RedexFileConfig::default()),
+            Err(RedexError::Unauthorized)
+        ),
+        "u16 hash collision must NOT authorize access to a different channel"
+    );
 }
 
 #[tokio::test]
