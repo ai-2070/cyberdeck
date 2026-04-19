@@ -391,9 +391,7 @@ where
             (Ok(()), _) | (Err(_), FoldErrorPolicy::LogAndContinue)
         );
         if advance {
-            inner
-                .folded_through_seq
-                .store(seq, Ordering::Release);
+            inner.folded_through_seq.store(seq, Ordering::Release);
         }
         r
     };

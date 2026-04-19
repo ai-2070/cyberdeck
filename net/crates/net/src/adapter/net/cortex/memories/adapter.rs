@@ -188,10 +188,7 @@ impl MemoriesAdapter {
             inner,
         };
         let bytes = bincode::serialize(&payload).map_err(|e| {
-            CortexAdapterError::Redex(RedexError::Encode(format!(
-                "memories snapshot wrap: {}",
-                e
-            )))
+            CortexAdapterError::Redex(RedexError::Encode(format!("memories snapshot wrap: {}", e)))
         })?;
         Ok((bytes, last_seq))
     }
@@ -221,16 +218,14 @@ impl MemoriesAdapter {
         state_bytes: &[u8],
         last_seq: Option<u64>,
     ) -> Result<Self, CortexAdapterError> {
-        let payload: MemoriesSnapshotPayload =
-            bincode::deserialize(state_bytes).map_err(|e| {
-                CortexAdapterError::Redex(RedexError::Encode(format!(
-                    "memories snapshot unwrap: {}",
-                    e
-                )))
-            })?;
-        let name = ChannelName::new(MEMORIES_CHANNEL).map_err(|e| {
-            CortexAdapterError::Redex(RedexError::Channel(e.to_string()))
+        let payload: MemoriesSnapshotPayload = bincode::deserialize(state_bytes).map_err(|e| {
+            CortexAdapterError::Redex(RedexError::Encode(format!(
+                "memories snapshot unwrap: {}",
+                e
+            )))
         })?;
+        let name = ChannelName::new(MEMORIES_CHANNEL)
+            .map_err(|e| CortexAdapterError::Redex(RedexError::Channel(e.to_string())))?;
         let inner = CortexAdapter::open_from_snapshot(
             redex,
             &name,

@@ -453,8 +453,7 @@ async fn test_regression_snapshot_restore_preserves_app_seq_monotonicity() {
 
     // Restore on a FRESH Redex — same origin.
     let redex2 = Redex::new();
-    let tasks2 =
-        TasksAdapter::open_from_snapshot(&redex2, ORIGIN, &state_bytes, last_seq).unwrap();
+    let tasks2 = TasksAdapter::open_from_snapshot(&redex2, ORIGIN, &state_bytes, last_seq).unwrap();
 
     // Next ingest on the restored adapter.
     let new_seq = tasks2.create(4, "d", 400).unwrap();

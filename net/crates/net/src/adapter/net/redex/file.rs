@@ -341,9 +341,10 @@ impl RedexFile {
 
         // Commit to memory. Pre-validated capacity → infallible.
         for event in &events {
-            state.segment.append(&event.payload).expect(
-                "pre-validated capacity; segment append cannot fail under the state lock",
-            );
+            state
+                .segment
+                .append(&event.payload)
+                .expect("pre-validated capacity; segment append cannot fail under the state lock");
             state.index.push(event.entry);
             state.timestamps.push(ts);
         }
@@ -516,9 +517,10 @@ impl RedexFile {
 
         // Commit to memory.
         for event in &events {
-            state.segment.append(&event.payload).expect(
-                "pre-validated capacity; segment append cannot fail under the state lock",
-            );
+            state
+                .segment
+                .append(&event.payload)
+                .expect("pre-validated capacity; segment append cannot fail under the state lock");
             state.index.push(event.entry);
             state.timestamps.push(ts);
         }

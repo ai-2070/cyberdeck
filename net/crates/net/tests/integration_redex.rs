@@ -776,11 +776,7 @@ mod persistent {
         // Reopen.
         let r2 = Redex::new().with_persistent_dir(&base);
         let f2 = r2.open_file(&name, cfg).unwrap();
-        assert_eq!(
-            f2.len(),
-            1,
-            "reopen must keep only the one clean entry"
-        );
+        assert_eq!(f2.len(), 1, "reopen must keep only the one clean entry");
         let ev = &f2.read_range(0, 1)[0];
         assert_eq!(ev.payload.as_ref(), b"clean-event-payload");
 
