@@ -36,23 +36,11 @@ impl ChannelName {
     /// This is the hint stamped on every outgoing packet — fast to
     /// compare but only 65,536 buckets, so it has routine collisions
     /// at mesh scale. Control-plane and storage authorization must
-    /// use [`Self::full_id`] instead so two unrelated channels don't
-    /// share an ACL decision.
+    /// key on the canonical name string (see `AuthGuard::exact`)
+    /// so two unrelated channels don't share an ACL decision.
     #[inline]
     pub fn hash(&self) -> u16 {
         channel_hash(&self.0)
-    }
-
-    /// Full 64-bit channel identity — xxh3_64 of the name string.
-    ///
-    /// Used by `AuthGuard`'s exact (control-plane) path for decisions
-    /// that must not collide. At mesh scale the 16-bit wire hash
-    /// hits collisions routinely; the 64-bit identity makes
-    /// collisions cryptographically negligible for any realistic
-    /// per-deployment channel set.
-    #[inline]
-    pub fn full_id(&self) -> u64 {
-        xxh3_64(self.0.as_bytes())
     }
 
     /// Get the number of path segments.

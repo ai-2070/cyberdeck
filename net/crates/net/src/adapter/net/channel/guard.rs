@@ -15,14 +15,15 @@
 //!   AEAD still enforces payload integrity end-to-end — a bloom false
 //!   positive at most costs a full check further up the stack.
 //! - **Exact path** (`allow_channel`, `revoke_channel`,
-//!   `is_authorized_full`): keyed on the full 64-bit channel identity
-//!   ([`super::ChannelName::full_id`]). Used by control-plane and
-//!   storage decisions (e.g. `Redex::open_file`) where a 16-bit
-//!   collision would let one channel's ACL authorize access to a
-//!   different channel's file. At mesh scale the 16-bit hash hits
-//!   collisions routinely; the 64-bit identity makes them
-//!   cryptographically negligible for any realistic per-deployment
-//!   channel set.
+//!   `is_authorized_full`): keyed on the **canonical `ChannelName`**
+//!   itself, not any hash. Used by control-plane and storage
+//!   decisions (e.g. `Redex::open_file`) where a hash collision
+//!   would let one channel's ACL authorize access to a different
+//!   channel's file. `xxh3_64` is non-cryptographic (~2^32 ops to
+//!   birthday-collide, feasible offline), so a hash-keyed ACL would
+//!   be crackable by an attacker who can influence the name passed
+//!   to `open_file`. Keying on the canonical string eliminates the
+//!   hash layer entirely — two distinct names can never alias.
 //!
 //! `allow_channel` populates both tiers so a caller granted storage
 //! access can also continue sending packets on that channel.
@@ -66,11 +67,14 @@ pub struct AuthGuard {
     bloom_mask: u64,
     /// Verified-positive cache: (origin_hash, channel_hash) -> authorized.
     verified: DashMap<(u32, u16), bool>,
-    /// Exact-identity ACL: (origin_hash, full 64-bit channel id) ->
-    /// authorized. Separate from `verified` because the 16-bit wire
-    /// hash alone cannot safely authorize storage / control-plane
-    /// decisions at mesh scale (birthday collisions in ~256 names).
-    exact: DashMap<(u32, u64), ()>,
+    /// Exact-identity ACL: `(origin_hash, canonical ChannelName) ->
+    /// authorized`. Keys on the name string (not a hash) so that no
+    /// two distinct channels can alias through a hash collision —
+    /// this is the control-plane / storage authorization path.
+    /// `ChannelName` already implements `Hash + Eq` against its
+    /// underlying validated `String`, so DashMap keys on the exact
+    /// name comparison.
+    exact: DashMap<(u32, ChannelName), ()>,
 }
 
 /// Bloom filter size: 2^15 bits = 4KB. Fits in L1 cache.
@@ -157,13 +161,13 @@ impl AuthGuard {
     /// Grant `origin_hash` full (control-plane) access to `name`.
     ///
     /// Populates both ACL tiers:
-    /// - the exact per-`full_id` map that control-plane / storage
+    /// - the exact canonical-name ACL that control-plane / storage
     ///   callers must consult via [`Self::is_authorized_full`];
     /// - the fast-path bloom + verified cache, so the same origin
     ///   can continue sending packets on that channel via
     ///   [`Self::check_fast`] / [`Self::is_authorized`].
     pub fn allow_channel(&self, origin_hash: u32, name: &ChannelName) {
-        self.exact.insert((origin_hash, name.full_id()), ());
+        self.exact.insert((origin_hash, name.clone()), ());
         self.authorize(origin_hash, name.hash());
     }
 
@@ -175,17 +179,18 @@ impl AuthGuard {
     /// [`AuthVerdict::NeedsFullCheck`] for this pair — the exact-map
     /// miss then fails the full check.
     pub fn revoke_channel(&self, origin_hash: u32, name: &ChannelName) {
-        self.exact.remove(&(origin_hash, name.full_id()));
+        self.exact.remove(&(origin_hash, name.clone()));
         self.revoke(origin_hash, name.hash());
     }
 
-    /// Exact authorization check keyed on the full 64-bit channel
-    /// identity. Used by control-plane / storage decisions
+    /// Exact authorization check keyed on the canonical `ChannelName`
+    /// string. Used by control-plane / storage decisions
     /// (e.g. `Redex::open_file`). Unlike [`Self::is_authorized`],
-    /// this cannot be bypassed by a 16-bit hash collision between
-    /// two different channel names.
+    /// this cannot be bypassed by a hash collision between two
+    /// different channel names — two distinct canonical names can
+    /// never alias.
     pub fn is_authorized_full(&self, origin_hash: u32, name: &ChannelName) -> bool {
-        self.exact.contains_key(&(origin_hash, name.full_id()))
+        self.exact.contains_key(&(origin_hash, name.clone()))
     }
 
     /// Number of authorized pairs in the verified cache.

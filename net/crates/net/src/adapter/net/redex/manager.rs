@@ -2,10 +2,13 @@
 //!
 //! Holds an optional reference to an [`AuthGuard`](super::super::AuthGuard)
 //! plus a local origin-hash. When auth is wired up, `open_file` rejects
-//! opens unless `(origin, full_channel_id)` has been explicitly
+//! opens unless `(origin, canonical channel name)` has been explicitly
 //! authorized via [`AuthGuard::allow_channel`]. The 16-bit wire
 //! `channel_hash` alone is not sufficient here — at mesh scale it
-//! collides often enough to allow ACL bypass between unrelated names.
+//! collides often enough to allow ACL bypass between unrelated names,
+//! and even a 64-bit non-cryptographic hash would be crackable by
+//! birthday search offline. Keying on the canonical name is the only
+//! collision-free answer.
 
 use std::sync::Arc;
 
@@ -81,12 +84,13 @@ impl Redex {
         config: RedexFileConfig,
     ) -> Result<RedexFile, RedexError> {
         if let Some(auth) = &self.auth {
-            // Use the EXACT 64-bit channel identity for the ACL
-            // decision — `is_authorized` (16-bit) is reserved for
-            // the fast-path packet check where AEAD integrity
-            // backstops any bloom-filter false positives. Storage
-            // access has no such backstop, so the exact check is
-            // required to prevent hash-collision ACL bypass.
+            // Use the canonical-name ACL for the storage decision —
+            // `is_authorized` (16-bit hash) is reserved for the
+            // fast-path packet check where AEAD integrity backstops
+            // any bloom-filter false positives. Storage access has
+            // no such backstop, and even a 64-bit non-cryptographic
+            // hash would be birthday-crackable offline, so the ACL
+            // keys on the full canonical name.
             if !auth.is_authorized_full(self.origin_hash, name) {
                 return Err(RedexError::Unauthorized);
             }
@@ -243,8 +247,9 @@ mod tests {
         // had the 16-bit `channel_hash` in its fast-path bloom. A
         // different channel name whose 16-bit hash collided with an
         // authorized one would then grant unauthorized storage
-        // access. The fix requires the exact 64-bit `full_id`, so
-        // a fast-path-only authorization is insufficient.
+        // access. The fix requires the canonical channel name in
+        // the exact ACL, so a fast-path-only authorization is
+        // insufficient.
         let guard = Arc::new(AuthGuard::new());
         let name = cn("sensitive");
         // Authorize the fast path ONLY (no allow_channel).

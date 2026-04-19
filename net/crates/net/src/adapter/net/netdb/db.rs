@@ -170,9 +170,21 @@ impl NetDbBuilder {
     /// Build the NetDb. Opens each enabled model against the
     /// underlying `Redex`.
     ///
-    /// Failure-atomic: if the second adapter open fails, the first
-    /// adapter is closed before the error propagates so no orphan
-    /// fold task outlives the failed build.
+    /// # Failure atomicity
+    ///
+    /// If the second adapter open fails, the first adapter is closed
+    /// before the error propagates so no orphan fold task outlives
+    /// the failed build. The `Redex` is dropped with the builder on
+    /// the error path — callers who want to retry without losing
+    /// shared state should construct a new `Redex` (retry on the
+    /// same manager is not available since the builder consumes it
+    /// by value).
+    ///
+    /// The atomicity guarantee itself is code-level: the
+    /// close-on-error block below is the authoritative source of
+    /// truth. Integration tests exercise the observable error path
+    /// but cannot directly observe the closed first-adapter after
+    /// the Redex has been dropped.
     pub fn build(self) -> Result<NetDb, NetDbError> {
         let cfg = self.redex_config();
 
@@ -214,7 +226,9 @@ impl NetDbBuilder {
     /// [`Self::build`] for that model).
     ///
     /// Same failure-atomicity guarantee as [`Self::build`] — a
-    /// second-adapter failure closes the first.
+    /// second-adapter failure closes the first before the error
+    /// propagates. See `build`'s docs for the caveat that the
+    /// failing Redex is dropped with the builder.
     pub fn build_from_snapshot(self, snapshot: &NetDbSnapshot) -> Result<NetDb, NetDbError> {
         let cfg = self.redex_config();
 

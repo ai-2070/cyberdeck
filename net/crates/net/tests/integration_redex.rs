@@ -457,7 +457,8 @@ fn test_regression_auth_does_not_grant_access_via_u16_collision() {
     // `channel_hash` alone, which collides on birthday terms at mesh
     // scale (~256 names). An origin authorized for channel A could
     // then open channel B whenever A.hash() == B.hash(). The fix
-    // switches the storage ACL to the exact 64-bit `full_id`.
+    // keys the storage ACL on the canonical `ChannelName` string —
+    // two distinct names can never alias.
     //
     // Find a collision pair at runtime: with 65,536 buckets and a
     // few hundred candidates, a match is near-certain. We search
@@ -484,15 +485,10 @@ fn test_regression_auth_does_not_grant_access_via_u16_collision() {
         colliding.hash(),
         "collision pair must share the 16-bit hash"
     );
-    assert_ne!(
-        allowed.full_id(),
-        colliding.full_id(),
-        "collision pair must have distinct 64-bit full_ids"
-    );
 
     let guard = Arc::new(AuthGuard::new());
     // Authorize ONLY the `allowed` channel. The colliding name
-    // shares the 16-bit hash but not the 64-bit identity.
+    // shares the 16-bit hash but is a distinct canonical name.
     guard.allow_channel(0xDEAD_BEEF, &allowed);
 
     let r = Redex::with_auth(guard.clone(), 0xDEAD_BEEF);
