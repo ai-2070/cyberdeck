@@ -16,11 +16,15 @@ pub struct RedexFileConfig {
     /// file is heap-only regardless.
     pub persistent: bool,
 
-    /// Soft cap on heap payload bytes. When retention is configured,
-    /// eviction sweeps evict the oldest entries on the next maintenance
-    /// tick once this is exceeded.
+    /// Initial reservation hint for the heap payload segment. Used
+    /// only as the capacity passed to the backing `Vec` on open,
+    /// capped at 64 MiB internally — the segment grows past this
+    /// value on append up to a 3 GB hard limit. **Retention is NOT
+    /// driven by this field** in v1; use `retention_max_events`,
+    /// `retention_max_bytes`, or `retention_max_age_ns` for that.
     ///
-    /// v2's warm-tier rollover is not implemented in v1.
+    /// v2's warm-tier rollover will consume this value as the
+    /// rollover trigger (see REDEX_V2_PLAN §3).
     pub max_memory_bytes: usize,
 
     /// Keep only the newest K events. `None` = unbounded.
@@ -64,7 +68,9 @@ impl RedexFileConfig {
         self
     }
 
-    /// Set the soft memory cap that triggers retention sweeps.
+    /// Set the initial reservation size for the heap segment (capped
+    /// at 64 MiB internally). Does NOT enforce a retention cap — use
+    /// [`Self::with_retention_max_bytes`] for that.
     pub fn with_max_memory_bytes(mut self, bytes: usize) -> Self {
         self.max_memory_bytes = bytes;
         self

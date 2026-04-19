@@ -17,7 +17,7 @@
 //!
 //! All events ride a single RedEX file at `cortex/memories` (see
 //! [`MEMORIES_CHANNEL`]). Dispatches use the CortEX-internal range
-//! `0x10..0x14`.
+//! `0x10..=0x14` (stored / retagged / pinned / unpinned / deleted).
 
 mod adapter;
 mod dispatch;

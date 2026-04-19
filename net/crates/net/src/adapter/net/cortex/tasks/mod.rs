@@ -11,7 +11,7 @@
 //!
 //! All events ride a single RedEX file at `cortex/tasks` (see
 //! [`TASKS_CHANNEL`]). Dispatches use the CortEX-internal range
-//! `0x01..0x04`.
+//! `0x01..=0x04` (created / renamed / completed / deleted).
 //!
 //! # Example
 //!

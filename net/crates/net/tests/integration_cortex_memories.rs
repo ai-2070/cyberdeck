@@ -521,7 +521,13 @@ async fn test_regression_watch_without_order_by_is_stable() {
     let mut last = 0;
     for id in 1..=N {
         last = memories
-            .store(id, format!("m-{}", id), vec!["bench".into()], "alice", id * 100)
+            .store(
+                id,
+                format!("m-{}", id),
+                vec!["bench".into()],
+                "alice",
+                id * 100,
+            )
             .unwrap();
     }
     memories.wait_for_seq(last).await;

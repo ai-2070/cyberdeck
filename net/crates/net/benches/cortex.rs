@@ -235,7 +235,14 @@ fn bench_snapshot(c: &mut Criterion) {
         let (mem_bytes, mem_last_seq) = memories.snapshot().unwrap();
         let (task_bytes, task_last_seq) = tasks.snapshot().unwrap();
 
-        // NetDb whole-bundle encode — mirrors NetDb::snapshot.
+        // NetDb whole-bundle encode — mirrors NetDb::snapshot. Build
+        // the bundle ONCE outside the iter; encode() takes &self so
+        // per-iteration cloning of the inner Vec<u8>s would skew the
+        // measurement toward memcpy instead of bincode serialization.
+        let bundle_snapshot = NetDbSnapshot {
+            tasks: Some((task_bytes.clone(), task_last_seq)),
+            memories: Some((mem_bytes.clone(), mem_last_seq)),
+        };
         group.bench_with_input(
             BenchmarkId::new(
                 format!(
@@ -246,13 +253,7 @@ fn bench_snapshot(c: &mut Criterion) {
             ),
             &n,
             |b, _| {
-                b.iter(|| {
-                    let snap = NetDbSnapshot {
-                        tasks: Some((task_bytes.clone(), task_last_seq)),
-                        memories: Some((mem_bytes.clone(), mem_last_seq)),
-                    };
-                    snap.encode().unwrap()
-                });
+                b.iter(|| bundle_snapshot.encode().unwrap());
             },
         );
 

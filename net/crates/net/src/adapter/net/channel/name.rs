@@ -70,6 +70,20 @@ impl ChannelName {
                 return Err(ChannelError::InvalidChar(ch));
             }
         }
+        // Reject segments that are path-traversal tokens. Channel
+        // names are also used as on-disk directory path segments in
+        // the `redex-disk` feature; `..` would escape the persistent
+        // base directory, `.` would alias the current directory and
+        // shadow siblings. Rejecting these at name-construction time
+        // keeps every downstream path-use safe by construction.
+        for seg in name.split('/') {
+            if seg == "." || seg == ".." {
+                return Err(ChannelError::InvalidFormat(format!(
+                    "segment {:?} is reserved",
+                    seg
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -310,6 +324,35 @@ mod tests {
             ChannelName::new("has@symbol"),
             Err(ChannelError::InvalidChar('@'))
         );
+    }
+
+    #[test]
+    fn test_regression_rejects_path_traversal_segments() {
+        // Regression: channel names are used as on-disk directory
+        // segments in the redex-disk feature. Names like
+        // `a/../../etc/target` previously passed validation (only
+        // `.` and `/` chars) and would escape the base dir. Reject
+        // any `..` or `.` segment at name-construction time.
+        assert!(matches!(
+            ChannelName::new("a/../etc"),
+            Err(ChannelError::InvalidFormat(_))
+        ));
+        assert!(matches!(
+            ChannelName::new(".."),
+            Err(ChannelError::InvalidFormat(_))
+        ));
+        assert!(matches!(
+            ChannelName::new("."),
+            Err(ChannelError::InvalidFormat(_))
+        ));
+        assert!(matches!(
+            ChannelName::new("sensors/./front"),
+            Err(ChannelError::InvalidFormat(_))
+        ));
+        // Names with `.` inside a segment (not as a whole segment)
+        // are still valid — e.g. "control.v2".
+        assert!(ChannelName::new("control.v2").is_ok());
+        assert!(ChannelName::new("a.b/c.d").is_ok());
     }
 
     #[test]

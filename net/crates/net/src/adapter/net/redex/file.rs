@@ -15,7 +15,7 @@ use super::entry::{payload_checksum, RedexEntry, INLINE_PAYLOAD_SIZE};
 use super::error::RedexError;
 use super::event::RedexEvent;
 use super::retention::compute_eviction_count;
-use super::segment::HeapSegment;
+use super::segment::{HeapSegment, MAX_SEGMENT_BYTES};
 
 #[cfg(feature = "redex-disk")]
 use super::disk::DiskSegment;
@@ -213,26 +213,61 @@ impl RedexFile {
 
     /// Append many payloads. Returns the sequence of the FIRST event
     /// in the batch. All entries land contiguously in the index.
+    ///
+    /// Failure atomicity: seq numbers are allocated **after** the
+    /// batch is validated to fit (both segment capacity and `u32`
+    /// offset width). A batch that can't fit returns `PayloadTooLarge`
+    /// without advancing `next_seq`, so no gaps appear in the seq
+    /// space.
     pub fn append_batch(&self, payloads: &[Bytes]) -> Result<u64, RedexError> {
         self.check_not_closed()?;
         if payloads.is_empty() {
             return Ok(self.inner.next_seq.load(Ordering::Acquire));
         }
 
+        let ts = now_ns();
+        let mut state = self.inner.state.lock();
+
+        // Pre-validate: every payload must fit in the remaining
+        // segment capacity, and the final offset must fit in a u32.
+        // Under the state lock, nothing else can write to the
+        // segment, so the check-then-act is atomic.
+        let total_bytes: usize = payloads.iter().map(|p| p.len()).sum();
+        let current_live = state.segment.live_bytes();
+        if current_live.saturating_add(total_bytes) > MAX_SEGMENT_BYTES {
+            return Err(RedexError::PayloadTooLarge {
+                size: total_bytes,
+                max: MAX_SEGMENT_BYTES.saturating_sub(current_live),
+            });
+        }
+        let final_offset = state
+            .segment
+            .base_offset()
+            .saturating_add(current_live as u64)
+            .saturating_add(total_bytes as u64);
+        offset_to_u32(final_offset)?;
+
+        // All appends will succeed — allocate the contiguous seq range.
         let first_seq = self
             .inner
             .next_seq
             .fetch_add(payloads.len() as u64, Ordering::AcqRel);
 
-        let ts = now_ns();
-        let mut state = self.inner.state.lock();
         let mut events: Vec<RedexEvent> = Vec::with_capacity(payloads.len());
         for (i, payload) in payloads.iter().enumerate() {
             let seq = first_seq + i as u64;
             let cks = payload_checksum(payload);
-            let offset = state.segment.append(payload)?;
-            let entry =
-                RedexEntry::new_heap(seq, offset_to_u32(offset)?, payload.len() as u32, 0, cks);
+            let offset = state
+                .segment
+                .append(payload)
+                .expect("pre-validated capacity; segment append cannot fail under the state lock");
+            let entry = RedexEntry::new_heap(
+                seq,
+                offset_to_u32(offset).expect("pre-validated final offset fits u32"),
+                payload.len() as u32,
+                0,
+                cks,
+            );
             state.index.push(entry);
             state.timestamps.push(ts);
             events.push(RedexEvent {
@@ -331,6 +366,24 @@ impl RedexFile {
         }
         let ts = now_ns();
         let mut state = self.inner.state.lock();
+
+        // Pre-validate capacity + offset width before allocating
+        // seq numbers — see [`Self::append_batch`] for rationale.
+        let total_bytes: usize = payloads.iter().map(|p| p.len()).sum();
+        let current_live = state.segment.live_bytes();
+        if current_live.saturating_add(total_bytes) > MAX_SEGMENT_BYTES {
+            return Err(RedexError::PayloadTooLarge {
+                size: total_bytes,
+                max: MAX_SEGMENT_BYTES.saturating_sub(current_live),
+            });
+        }
+        let final_offset = state
+            .segment
+            .base_offset()
+            .saturating_add(current_live as u64)
+            .saturating_add(total_bytes as u64);
+        offset_to_u32(final_offset)?;
+
         let first_seq = self
             .inner
             .next_seq
@@ -340,9 +393,17 @@ impl RedexFile {
         for (i, payload) in payloads.iter().enumerate() {
             let seq = first_seq + i as u64;
             let cks = payload_checksum(payload);
-            let offset = state.segment.append(payload)?;
-            let entry =
-                RedexEntry::new_heap(seq, offset_to_u32(offset)?, payload.len() as u32, 0, cks);
+            let offset = state
+                .segment
+                .append(payload)
+                .expect("pre-validated capacity; segment append cannot fail under the state lock");
+            let entry = RedexEntry::new_heap(
+                seq,
+                offset_to_u32(offset).expect("pre-validated final offset fits u32"),
+                payload.len() as u32,
+                0,
+                cks,
+            );
             state.index.push(entry);
             state.timestamps.push(ts);
             events.push(RedexEvent {

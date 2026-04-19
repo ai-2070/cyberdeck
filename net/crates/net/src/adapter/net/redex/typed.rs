@@ -8,7 +8,7 @@
 //! snapshot) are inherited from the underlying `RedexFile` — this is
 //! purely an ergonomic layer.
 //!
-//! See [`REDEX_V2_PLAN.md`](../../../../../docs/REDEX_V2_PLAN.md) §4a.
+//! See `docs/REDEX_V2_PLAN.md` §4a.
 
 use std::marker::PhantomData;
 

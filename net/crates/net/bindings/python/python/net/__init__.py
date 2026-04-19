@@ -45,20 +45,20 @@ from ._net import (
     Stats,
 )
 
-try:
-    from ._net import CortexError, NetDbError
-except ImportError:
-    CortexError = None  # type: ignore[assignment]
-    NetDbError = None  # type: ignore[assignment]
-
 __all__ = [
     "Net",
     "IngestResult",
     "StoredEvent",
     "PollResponse",
     "Stats",
-    "CortexError",
-    "NetDbError",
 ]
+
+try:
+    from ._net import CortexError, NetDbError
+except ImportError:
+    # `cortex` feature not compiled in; error classes stay undefined.
+    pass
+else:
+    __all__.extend(["CortexError", "NetDbError"])
 
 __version__ = "0.1.0"

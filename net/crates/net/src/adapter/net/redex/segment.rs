@@ -17,7 +17,7 @@ use super::error::RedexError;
 /// Maximum heap segment size before `append` fails with
 /// `PayloadTooLarge`. 32-bit offsets imply 4 GB hard max; we stay 1 GB
 /// below to leave room for concurrent appends during a retention sweep.
-const MAX_SEGMENT_BYTES: usize = 3 * 1024 * 1024 * 1024; // 3 GB
+pub(super) const MAX_SEGMENT_BYTES: usize = 3 * 1024 * 1024 * 1024; // 3 GB
 
 /// In-memory payload segment backed by `Vec<u8>`.
 ///

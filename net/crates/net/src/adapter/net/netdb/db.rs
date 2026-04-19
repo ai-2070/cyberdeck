@@ -169,6 +169,10 @@ impl NetDbBuilder {
 
     /// Build the NetDb. Opens each enabled model against the
     /// underlying `Redex`.
+    ///
+    /// Failure-atomic: if the second adapter open fails, the first
+    /// adapter is closed before the error propagates so no orphan
+    /// fold task outlives the failed build.
     pub fn build(self) -> Result<NetDb, NetDbError> {
         let cfg = self.redex_config();
 
@@ -183,11 +187,15 @@ impl NetDbBuilder {
         };
 
         let memories = if self.want_memories {
-            Some(MemoriesAdapter::open_with_config(
-                &self.redex,
-                self.origin_hash,
-                cfg,
-            )?)
+            match MemoriesAdapter::open_with_config(&self.redex, self.origin_hash, cfg) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    if let Some(t) = &tasks {
+                        let _ = t.close();
+                    }
+                    return Err(e.into());
+                }
+            }
         } else {
             None
         };
@@ -204,6 +212,9 @@ impl NetDbBuilder {
     /// `with_*()` whose snapshot entry is `None` in the bundle is
     /// opened from scratch via the normal open path (equivalent to
     /// [`Self::build`] for that model).
+    ///
+    /// Same failure-atomicity guarantee as [`Self::build`] — a
+    /// second-adapter failure closes the first.
     pub fn build_from_snapshot(self, snapshot: &NetDbSnapshot) -> Result<NetDb, NetDbError> {
         let cfg = self.redex_config();
 
@@ -223,7 +234,7 @@ impl NetDbBuilder {
             (false, _) => None,
         };
 
-        let memories = match (self.want_memories, &snapshot.memories) {
+        let memories_result = match (self.want_memories, &snapshot.memories) {
             (true, Some((bytes, last_seq))) => {
                 Some(MemoriesAdapter::open_from_snapshot_with_config(
                     &self.redex,
@@ -231,14 +242,24 @@ impl NetDbBuilder {
                     cfg,
                     bytes,
                     *last_seq,
-                )?)
+                ))
             }
             (true, None) => Some(MemoriesAdapter::open_with_config(
                 &self.redex,
                 self.origin_hash,
                 cfg,
-            )?),
+            )),
             (false, _) => None,
+        };
+        let memories = match memories_result {
+            Some(Ok(m)) => Some(m),
+            Some(Err(e)) => {
+                if let Some(t) = &tasks {
+                    let _ = t.close();
+                }
+                return Err(e.into());
+            }
+            None => None,
         };
 
         Ok(NetDb {
