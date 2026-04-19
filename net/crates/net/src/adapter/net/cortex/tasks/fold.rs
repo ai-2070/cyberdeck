@@ -44,7 +44,7 @@ impl RedexFold<TasksState> for TasksFold {
         match meta.dispatch {
             DISPATCH_TASK_CREATED => {
                 let p: TaskCreatedPayload =
-                    bincode::deserialize(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
                 state.tasks.insert(
                     p.id,
                     Task {
@@ -58,7 +58,7 @@ impl RedexFold<TasksState> for TasksFold {
             }
             DISPATCH_TASK_RENAMED => {
                 let p: TaskRenamedPayload =
-                    bincode::deserialize(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
                 if let Some(t) = state.tasks.get_mut(&p.id) {
                     t.title = p.new_title;
                     t.updated_ns = p.now_ns;
@@ -69,7 +69,7 @@ impl RedexFold<TasksState> for TasksFold {
             }
             DISPATCH_TASK_COMPLETED => {
                 let p: TaskCompletedPayload =
-                    bincode::deserialize(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
                 if let Some(t) = state.tasks.get_mut(&p.id) {
                     t.status = TaskStatus::Completed;
                     t.updated_ns = p.now_ns;
@@ -77,7 +77,7 @@ impl RedexFold<TasksState> for TasksFold {
             }
             DISPATCH_TASK_DELETED => {
                 let p: TaskDeletedPayload =
-                    bincode::deserialize(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
                 state.tasks.remove(&p.id);
             }
             other => {

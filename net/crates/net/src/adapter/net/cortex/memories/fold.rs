@@ -45,7 +45,7 @@ impl RedexFold<MemoriesState> for MemoriesFold {
         match meta.dispatch {
             DISPATCH_MEMORY_STORED => {
                 let p: MemoryStoredPayload =
-                    bincode::deserialize(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
                 state.memories.insert(
                     p.id,
                     Memory {
@@ -61,7 +61,7 @@ impl RedexFold<MemoriesState> for MemoriesFold {
             }
             DISPATCH_MEMORY_RETAGGED => {
                 let p: MemoryRetaggedPayload =
-                    bincode::deserialize(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
                 if let Some(m) = state.memories.get_mut(&p.id) {
                     m.tags = p.tags;
                     m.updated_ns = p.now_ns;
@@ -69,7 +69,7 @@ impl RedexFold<MemoriesState> for MemoriesFold {
             }
             DISPATCH_MEMORY_PINNED => {
                 let p: MemoryPinTogglePayload =
-                    bincode::deserialize(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
                 if let Some(m) = state.memories.get_mut(&p.id) {
                     m.pinned = true;
                     m.updated_ns = p.now_ns;
@@ -77,7 +77,7 @@ impl RedexFold<MemoriesState> for MemoriesFold {
             }
             DISPATCH_MEMORY_UNPINNED => {
                 let p: MemoryPinTogglePayload =
-                    bincode::deserialize(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
                 if let Some(m) = state.memories.get_mut(&p.id) {
                     m.pinned = false;
                     m.updated_ns = p.now_ns;
@@ -85,7 +85,7 @@ impl RedexFold<MemoriesState> for MemoriesFold {
             }
             DISPATCH_MEMORY_DELETED => {
                 let p: MemoryDeletedPayload =
-                    bincode::deserialize(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
                 state.memories.remove(&p.id);
             }
             other => {

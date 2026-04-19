@@ -568,7 +568,7 @@ impl RedexFile {
         T: serde::Serialize,
         F: FnOnce(&T, &mut S),
     {
-        let bytes = bincode::serialize(value)
+        let bytes = postcard::to_allocvec(value)
             .map_err(|e| RedexError::Encode(format!("append_and_fold serialize: {}", e)))?;
         let seq = self.append(&bytes)?;
         fold_fn(value, state);
@@ -577,7 +577,7 @@ impl RedexFile {
 
     /// Convenience: serialize `value` with bincode and append.
     pub fn append_bincode<T: serde::Serialize>(&self, value: &T) -> Result<u64, RedexError> {
-        let bytes = bincode::serialize(value).map_err(|e| RedexError::Encode(e.to_string()))?;
+        let bytes = postcard::to_allocvec(value).map_err(|e| RedexError::Encode(e.to_string()))?;
         self.append(&bytes)
     }
 
@@ -886,7 +886,7 @@ mod tests {
         let seq = f.append_bincode(&v).unwrap();
         assert_eq!(seq, 0);
         let events = f.read_range(0, 1);
-        let decoded: Foo = bincode::deserialize(&events[0].payload).unwrap();
+        let decoded: Foo = postcard::from_bytes(&events[0].payload).unwrap();
         assert_eq!(decoded, v);
     }
 
