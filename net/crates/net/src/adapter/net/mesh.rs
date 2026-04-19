@@ -1355,10 +1355,8 @@ impl MeshNode {
             // packet receive cost proportional to peer count — the
             // hot path needs to stay constant-time.
             let peer_addr = session.peer_addr();
-            if let Some((peer_addr, peer_session)) = ctx
-                .addr_to_node
-                .get(&peer_addr)
-                .and_then(|node_id| {
+            if let Some((peer_addr, peer_session)) =
+                ctx.addr_to_node.get(&peer_addr).and_then(|node_id| {
                     ctx.peers
                         .get(&*node_id)
                         .map(|p| (p.value().addr, p.value().session.clone()))
@@ -2096,12 +2094,33 @@ impl MeshNode {
         }
 
         // Ensure a stream is open with the right reliability mode.
+        // `open_stream_with` seeds the stream with
+        // `DEFAULT_STREAM_WINDOW_BYTES` so publish traffic rides
+        // the same v2 byte-credit window as `send_on_stream`.
         session.open_stream_with(stream_id, reliable, 1);
 
-        let seq = {
-            let stream = session.get_or_create_stream(stream_id);
-            stream.next_tx_seq()
+        // Charge credit on the wire-byte size of the packet we're
+        // about to build. The `TxSlotGuard` refunds on Drop unless
+        // we `commit()` after a successful socket send, so a failed
+        // send doesn't strand credit.
+        let payload_bytes: usize = events.iter().map(|e| EventFrame::LEN_SIZE + e.len()).sum();
+        let needed = wire_bytes_for_payload(payload_bytes);
+        let (guard, seq) = match session.try_acquire_tx_credit_guard(stream_id, needed) {
+            TxAdmit::Acquired { guard, seq } => (guard, seq),
+            TxAdmit::WindowFull => {
+                return Err(AdapterError::Connection(format!(
+                    "publish: stream {:#x} backpressured",
+                    stream_id
+                )));
+            }
+            TxAdmit::StreamClosed => {
+                return Err(AdapterError::Connection(format!(
+                    "publish: stream {:#x} closed",
+                    stream_id
+                )));
+            }
         };
+
         let pool = session.thread_local_pool();
         let mut builder = pool.get();
         let packet = builder.build_subprotocol(
@@ -2122,6 +2141,7 @@ impl MeshNode {
             .send_to(&packet, next_hop)
             .await
             .map_err(|e| AdapterError::Connection(format!("publish send failed: {}", e)))?;
+        guard.commit(); // wire-accepted — bytes now belong to the receiver
 
         drop(builder);
         session.touch();

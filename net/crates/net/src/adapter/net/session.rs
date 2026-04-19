@@ -388,7 +388,17 @@ impl NetSession {
     /// wins. Callers that want to change a stream's config must close +
     /// re-open it.
     pub fn open_stream_with(&self, stream_id: u64, reliable: bool, fairness_weight: u8) -> u64 {
-        self.open_stream_full(stream_id, reliable, fairness_weight, 0)
+        // Inherit `DEFAULT_STREAM_WINDOW_BYTES` so callers that go
+        // through this convenience wrapper (notably `publish_to_peer`)
+        // pick up v2 backpressure by default. Callers that want the
+        // v1-style unbounded-queue behavior use `open_stream_full`
+        // with `tx_window = 0` explicitly.
+        self.open_stream_full(
+            stream_id,
+            reliable,
+            fairness_weight,
+            DEFAULT_STREAM_WINDOW_BYTES,
+        )
     }
 
     /// Extended open that also sets the per-stream TX window for
@@ -1947,11 +1957,8 @@ mod tests {
         let epoch_before = session.try_stream(sid).unwrap().epoch();
         let tx_seq_before = session.try_stream(sid).unwrap().current_tx_seq();
 
-        let (guard, seq) = match session.try_acquire_tx_credit_matching_epoch(
-            sid,
-            epoch_before,
-            40,
-        ) {
+        let (guard, seq) = match session.try_acquire_tx_credit_matching_epoch(sid, epoch_before, 40)
+        {
             TxAdmit::Acquired { guard, seq } => (guard, seq),
             other => panic!("expected Acquired, got {:?}", other),
         };
