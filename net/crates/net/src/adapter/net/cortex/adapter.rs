@@ -309,7 +309,14 @@ where
             CortexAdapterError::Redex(RedexError::Encode(format!("deserialize snapshot: {}", e)))
         })?;
         let start = match last_seq {
-            Some(n) => StartPosition::FromSeq(n + 1),
+            Some(n) => {
+                let next = n.checked_add(1).ok_or_else(|| {
+                    CortexAdapterError::Redex(RedexError::Encode(
+                        "snapshot last_seq at u64::MAX; cannot resume".to_string(),
+                    ))
+                })?;
+                StartPosition::FromSeq(next)
+            }
             None => StartPosition::FromBeginning,
         };
         let config = CortexAdapterConfig {

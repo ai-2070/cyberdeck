@@ -56,9 +56,25 @@ pub(crate) fn netdb_err(context: &str, detail: impl std::fmt::Display) -> Error 
 // Shared helpers
 // =========================================================================
 
+/// Convert a JS `BigInt` to `u64`, rejecting negatives and values that
+/// exceed `u64::MAX`. The napi `get_u64()` tuple is `(signed, value,
+/// lossless)`; silently accepting either flag corrupts ids / timestamps
+/// / sequences since none of them are meaningful as negative or
+/// truncated.
 #[inline]
-fn bigint_u64(b: BigInt) -> u64 {
-    b.get_u64().1
+fn bigint_u64(b: BigInt) -> Result<u64> {
+    let (signed, value, lossless) = b.get_u64();
+    if signed {
+        return Err(Error::from_reason(
+            "expected non-negative BigInt".to_string(),
+        ));
+    }
+    if !lossless {
+        return Err(Error::from_reason(
+            "BigInt value exceeds u64 range".to_string(),
+        ));
+    }
+    Ok(value)
 }
 
 /// A captured CortEX adapter state snapshot, suitable for
@@ -326,7 +342,7 @@ impl TasksAdapter {
         persistent: Option<bool>,
     ) -> Result<Self> {
         let cfg = redex_config_from_persistent(persistent);
-        let last = last_seq.map(bigint_u64);
+        let last = last_seq.map(bigint_u64).transpose()?;
         let inner = InnerTasksAdapter::open_from_snapshot_with_config(
             &redex.inner,
             origin_hash,
@@ -358,7 +374,7 @@ impl TasksAdapter {
     #[napi]
     pub fn create(&self, id: BigInt, title: String, now_ns: BigInt) -> Result<BigInt> {
         self.inner
-            .create(bigint_u64(id), title, bigint_u64(now_ns))
+            .create(bigint_u64(id)?, title, bigint_u64(now_ns)?)
             .map(BigInt::from)
             .map_err(|e| cortex_err("create failed", e))
     }
@@ -367,7 +383,7 @@ impl TasksAdapter {
     #[napi]
     pub fn rename(&self, id: BigInt, new_title: String, now_ns: BigInt) -> Result<BigInt> {
         self.inner
-            .rename(bigint_u64(id), new_title, bigint_u64(now_ns))
+            .rename(bigint_u64(id)?, new_title, bigint_u64(now_ns)?)
             .map(BigInt::from)
             .map_err(|e| cortex_err("rename failed", e))
     }
@@ -376,7 +392,7 @@ impl TasksAdapter {
     #[napi]
     pub fn complete(&self, id: BigInt, now_ns: BigInt) -> Result<BigInt> {
         self.inner
-            .complete(bigint_u64(id), bigint_u64(now_ns))
+            .complete(bigint_u64(id)?, bigint_u64(now_ns)?)
             .map(BigInt::from)
             .map_err(|e| cortex_err("complete failed", e))
     }
@@ -385,7 +401,7 @@ impl TasksAdapter {
     #[napi]
     pub fn delete(&self, id: BigInt) -> Result<BigInt> {
         self.inner
-            .delete(bigint_u64(id))
+            .delete(bigint_u64(id)?)
             .map(BigInt::from)
             .map_err(|e| cortex_err("delete failed", e))
     }
@@ -393,8 +409,9 @@ impl TasksAdapter {
     /// Block until every event up through `seq` has been folded into
     /// state. Use as a read-after-write barrier.
     #[napi]
-    pub async fn wait_for_seq(&self, seq: BigInt) {
-        self.inner.wait_for_seq(bigint_u64(seq)).await;
+    pub async fn wait_for_seq(&self, seq: BigInt) -> Result<()> {
+        self.inner.wait_for_seq(bigint_u64(seq)?).await;
+        Ok(())
     }
 
     /// Close the adapter. Idempotent.
@@ -414,7 +431,7 @@ impl TasksAdapter {
     /// Snapshot query over current state. Clones out matching tasks
     /// as a Vec. Pass `null` / `undefined` for no filter (returns all).
     #[napi]
-    pub fn list_tasks(&self, filter: Option<TaskFilter>) -> Vec<Task> {
+    pub fn list_tasks(&self, filter: Option<TaskFilter>) -> Result<Vec<Task>> {
         let state_handle = self.inner.state();
         let state = state_handle.read();
         let mut q = state.query();
@@ -426,16 +443,16 @@ impl TasksAdapter {
                 q = q.title_contains(s);
             }
             if let Some(ns) = f.created_after_ns {
-                q = q.created_after(bigint_u64(ns));
+                q = q.created_after(bigint_u64(ns)?);
             }
             if let Some(ns) = f.created_before_ns {
-                q = q.created_before(bigint_u64(ns));
+                q = q.created_before(bigint_u64(ns)?);
             }
             if let Some(ns) = f.updated_after_ns {
-                q = q.updated_after(bigint_u64(ns));
+                q = q.updated_after(bigint_u64(ns)?);
             }
             if let Some(ns) = f.updated_before_ns {
-                q = q.updated_before(bigint_u64(ns));
+                q = q.updated_before(bigint_u64(ns)?);
             }
             if let Some(o) = f.order_by {
                 q = q.order_by(o.into());
@@ -444,7 +461,7 @@ impl TasksAdapter {
                 q = q.limit(l as usize);
             }
         }
-        q.collect().into_iter().map(Task::from).collect()
+        Ok(q.collect().into_iter().map(Task::from).collect())
     }
 
     /// Total task count in current state (ignores any filter).
@@ -461,7 +478,7 @@ impl TasksAdapter {
     /// Declared `async` so the underlying watcher's `tokio::spawn`
     /// fold-forwarding task runs inside napi's tokio runtime.
     #[napi]
-    pub async fn watch_tasks(&self, filter: Option<TaskFilter>) -> TaskWatchIter {
+    pub async fn watch_tasks(&self, filter: Option<TaskFilter>) -> Result<TaskWatchIter> {
         let mut w = self.inner.watch();
         if let Some(f) = filter {
             if let Some(s) = f.status {
@@ -471,16 +488,16 @@ impl TasksAdapter {
                 w = w.title_contains(s);
             }
             if let Some(ns) = f.created_after_ns {
-                w = w.created_after(bigint_u64(ns));
+                w = w.created_after(bigint_u64(ns)?);
             }
             if let Some(ns) = f.created_before_ns {
-                w = w.created_before(bigint_u64(ns));
+                w = w.created_before(bigint_u64(ns)?);
             }
             if let Some(ns) = f.updated_after_ns {
-                w = w.updated_after(bigint_u64(ns));
+                w = w.updated_after(bigint_u64(ns)?);
             }
             if let Some(ns) = f.updated_before_ns {
-                w = w.updated_before(bigint_u64(ns));
+                w = w.updated_before(bigint_u64(ns)?);
             }
             if let Some(o) = f.order_by {
                 w = w.order_by(o.into());
@@ -490,13 +507,13 @@ impl TasksAdapter {
             }
         }
         let stream: BoxStream<'static, Vec<InnerTask>> = w.stream().boxed();
-        TaskWatchIter {
+        Ok(TaskWatchIter {
             inner: Arc::new(TaskWatchIterInner {
                 stream: TokioMutex::new(Some(stream)),
                 shutdown: Notify::new(),
                 is_shutdown: AtomicBool::new(false),
             }),
-        }
+        })
     }
 }
 
@@ -678,7 +695,7 @@ impl MemoriesAdapter {
         persistent: Option<bool>,
     ) -> Result<Self> {
         let cfg = redex_config_from_persistent(persistent);
-        let last = last_seq.map(bigint_u64);
+        let last = last_seq.map(bigint_u64).transpose()?;
         let inner = InnerMemoriesAdapter::open_from_snapshot_with_config(
             &redex.inner,
             origin_hash,
@@ -717,7 +734,7 @@ impl MemoriesAdapter {
         now_ns: BigInt,
     ) -> Result<BigInt> {
         self.inner
-            .store(bigint_u64(id), content, tags, source, bigint_u64(now_ns))
+            .store(bigint_u64(id)?, content, tags, source, bigint_u64(now_ns)?)
             .map(BigInt::from)
             .map_err(|e| cortex_err("store failed", e))
     }
@@ -727,7 +744,7 @@ impl MemoriesAdapter {
     #[napi]
     pub fn retag(&self, id: BigInt, tags: Vec<String>, now_ns: BigInt) -> Result<BigInt> {
         self.inner
-            .retag(bigint_u64(id), tags, bigint_u64(now_ns))
+            .retag(bigint_u64(id)?, tags, bigint_u64(now_ns)?)
             .map(BigInt::from)
             .map_err(|e| cortex_err("retag failed", e))
     }
@@ -736,7 +753,7 @@ impl MemoriesAdapter {
     #[napi]
     pub fn pin(&self, id: BigInt, now_ns: BigInt) -> Result<BigInt> {
         self.inner
-            .pin(bigint_u64(id), bigint_u64(now_ns))
+            .pin(bigint_u64(id)?, bigint_u64(now_ns)?)
             .map(BigInt::from)
             .map_err(|e| cortex_err("pin failed", e))
     }
@@ -745,7 +762,7 @@ impl MemoriesAdapter {
     #[napi]
     pub fn unpin(&self, id: BigInt, now_ns: BigInt) -> Result<BigInt> {
         self.inner
-            .unpin(bigint_u64(id), bigint_u64(now_ns))
+            .unpin(bigint_u64(id)?, bigint_u64(now_ns)?)
             .map(BigInt::from)
             .map_err(|e| cortex_err("unpin failed", e))
     }
@@ -754,15 +771,16 @@ impl MemoriesAdapter {
     #[napi]
     pub fn delete(&self, id: BigInt) -> Result<BigInt> {
         self.inner
-            .delete(bigint_u64(id))
+            .delete(bigint_u64(id)?)
             .map(BigInt::from)
             .map_err(|e| cortex_err("delete failed", e))
     }
 
     /// Block until every event up through `seq` has been folded.
     #[napi]
-    pub async fn wait_for_seq(&self, seq: BigInt) {
-        self.inner.wait_for_seq(bigint_u64(seq)).await;
+    pub async fn wait_for_seq(&self, seq: BigInt) -> Result<()> {
+        self.inner.wait_for_seq(bigint_u64(seq)?).await;
+        Ok(())
     }
 
     /// Close the adapter. Idempotent.
@@ -781,7 +799,7 @@ impl MemoriesAdapter {
 
     /// Snapshot query. See [`MemoryFilter`] for available predicates.
     #[napi]
-    pub fn list_memories(&self, filter: Option<MemoryFilter>) -> Vec<Memory> {
+    pub fn list_memories(&self, filter: Option<MemoryFilter>) -> Result<Vec<Memory>> {
         let state_handle = self.inner.state();
         let state = state_handle.read();
         let mut q = state.query();
@@ -805,16 +823,16 @@ impl MemoriesAdapter {
                 q = q.where_pinned(pinned);
             }
             if let Some(ns) = f.created_after_ns {
-                q = q.created_after(bigint_u64(ns));
+                q = q.created_after(bigint_u64(ns)?);
             }
             if let Some(ns) = f.created_before_ns {
-                q = q.created_before(bigint_u64(ns));
+                q = q.created_before(bigint_u64(ns)?);
             }
             if let Some(ns) = f.updated_after_ns {
-                q = q.updated_after(bigint_u64(ns));
+                q = q.updated_after(bigint_u64(ns)?);
             }
             if let Some(ns) = f.updated_before_ns {
-                q = q.updated_before(bigint_u64(ns));
+                q = q.updated_before(bigint_u64(ns)?);
             }
             if let Some(o) = f.order_by {
                 q = q.order_by(o.into());
@@ -823,7 +841,7 @@ impl MemoriesAdapter {
                 q = q.limit(l as usize);
             }
         }
-        q.collect().into_iter().map(Memory::from).collect()
+        Ok(q.collect().into_iter().map(Memory::from).collect())
     }
 
     /// Total memory count in current state (ignores any filter).
@@ -835,7 +853,7 @@ impl MemoriesAdapter {
     /// Open a reactive watcher over the filter. See
     /// [`TasksAdapter::watch_tasks`] for emission semantics.
     #[napi]
-    pub async fn watch_memories(&self, filter: Option<MemoryFilter>) -> MemoryWatchIter {
+    pub async fn watch_memories(&self, filter: Option<MemoryFilter>) -> Result<MemoryWatchIter> {
         let mut w = self.inner.watch();
         if let Some(f) = filter {
             if let Some(s) = f.source {
@@ -857,16 +875,16 @@ impl MemoriesAdapter {
                 w = w.where_pinned(pinned);
             }
             if let Some(ns) = f.created_after_ns {
-                w = w.created_after(bigint_u64(ns));
+                w = w.created_after(bigint_u64(ns)?);
             }
             if let Some(ns) = f.created_before_ns {
-                w = w.created_before(bigint_u64(ns));
+                w = w.created_before(bigint_u64(ns)?);
             }
             if let Some(ns) = f.updated_after_ns {
-                w = w.updated_after(bigint_u64(ns));
+                w = w.updated_after(bigint_u64(ns)?);
             }
             if let Some(ns) = f.updated_before_ns {
-                w = w.updated_before(bigint_u64(ns));
+                w = w.updated_before(bigint_u64(ns)?);
             }
             if let Some(o) = f.order_by {
                 w = w.order_by(o.into());
@@ -876,13 +894,13 @@ impl MemoriesAdapter {
             }
         }
         let stream: BoxStream<'static, Vec<InnerMemory>> = w.stream().boxed();
-        MemoryWatchIter {
+        Ok(MemoryWatchIter {
             inner: Arc::new(MemoryWatchIterInner {
                 stream: TokioMutex::new(Some(stream)),
                 shutdown: Notify::new(),
                 is_shutdown: AtomicBool::new(false),
             }),
-        }
+        })
     }
 }
 
