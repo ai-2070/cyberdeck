@@ -37,7 +37,7 @@ pub mod compute;
 mod config;
 pub mod contested;
 pub mod continuity;
-#[cfg(feature = "cortex-adapter")]
+#[cfg(feature = "cortex")]
 pub mod cortex;
 #[cfg(feature = "netdb")]
 pub mod netdb;
@@ -88,7 +88,7 @@ pub use continuity::{
     DiscontinuityReason, ForkRecord, HorizonDivergence, ObservationWindow, ProofError,
     PropagationModel, SuperpositionPhase, SuperpositionState, SUBPROTOCOL_CONTINUITY,
 };
-#[cfg(feature = "cortex-adapter")]
+#[cfg(feature = "cortex")]
 pub use cortex::{
     CortexAdapter, CortexAdapterConfig, CortexAdapterError, EventEnvelope, EventMeta,
     FoldErrorPolicy, IntoRedexPayload, StartPosition, EVENT_META_SIZE,

@@ -1,7 +1,7 @@
 //! Node.js bindings for the CortEX adapter slice — tasks + memories.
 //!
 //! Feature-gated behind `cortex` in this crate (which turns on the
-//! core's `cortex-tasks` + `cortex-memories`). Exposes:
+//! core's `cortex` feature). Exposes:
 //!
 //! - [`Redex`] — local RedEX manager handle
 //! - [`TasksAdapter`] / [`MemoriesAdapter`] — typed adapters with CRUD
@@ -876,9 +876,7 @@ impl MemoriesAdapter {
 // NetDB — unified query façade over tasks + memories
 // =========================================================================
 
-use ::net::adapter::net::netdb::{
-    NetDb as InnerNetDb, NetDbSnapshot as InnerNetDbSnapshot,
-};
+use ::net::adapter::net::netdb::NetDbSnapshot as InnerNetDbSnapshot;
 
 /// Options for [`NetDb::open`] / [`NetDb::open_from_snapshot`].
 #[napi(object)]

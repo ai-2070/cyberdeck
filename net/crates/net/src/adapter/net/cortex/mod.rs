@@ -23,9 +23,9 @@ mod envelope;
 mod error;
 mod meta;
 
-#[cfg(feature = "cortex-memories")]
+#[cfg(feature = "cortex")]
 pub mod memories;
-#[cfg(feature = "cortex-tasks")]
+#[cfg(feature = "cortex")]
 pub mod tasks;
 
 pub use adapter::CortexAdapter;

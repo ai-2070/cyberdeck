@@ -343,7 +343,7 @@ The adapter is 100% of what sits between CortEX and RedEX. CortEX owns `TaskStat
 8. **`CortexAdapter::close`** — shuts down the fold task, closes the RedexFile.
 9. **`FoldErrorPolicy::LogAndContinue`** — branch in the fold task; counter wired to `fold_errors()`.
 10. **`StartPosition::LiveOnly`** and **`FromSeq(u64)`** — passed through to `RedexFile::tail(from_seq)`.
-11. **Feature gate** — `cortex-adapter = ["redex"]` on the `net` crate. Gate the module in `lib.rs`.
+11. **Feature gate** — `cortex = ["redex"]` on the `net` crate. Gate the module in `lib.rs`.
 12. **Docs** — `CORTEX_ADAPTER.md` caller-facing, link from `TRANSPORT.md` Stack table once CortEX itself has any shipped surface.
 
 ## 10. Tests

@@ -39,10 +39,8 @@ regex = ["dep:regex"]
 ffi = []
 redex = ["net", "dep:tokio-stream", "dep:bincode"]
 redex-disk = ["redex"]
-cortex-adapter = ["redex"]
-cortex-tasks = ["cortex-adapter"]
-cortex-memories = ["cortex-adapter"]
-netdb = ["cortex-tasks", "cortex-memories"]
+cortex = ["redex"]
+netdb = ["cortex"]
 
 [dependencies]
 # Async runtime
@@ -148,17 +146,17 @@ required-features = ["redex"]
 [[test]]
 name = "integration_cortex_adapter"
 path = "tests/integration_cortex_adapter.rs"
-required-features = ["cortex-adapter"]
+required-features = ["cortex"]
 
 [[test]]
 name = "integration_cortex_tasks"
 path = "tests/integration_cortex_tasks.rs"
-required-features = ["cortex-tasks"]
+required-features = ["cortex"]
 
 [[test]]
 name = "integration_cortex_memories"
 path = "tests/integration_cortex_memories.rs"
-required-features = ["cortex-memories"]
+required-features = ["cortex"]
 
 [[test]]
 name = "integration_netdb"

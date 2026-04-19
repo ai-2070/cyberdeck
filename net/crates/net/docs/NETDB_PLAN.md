@@ -86,7 +86,7 @@ All of this works today, one adapter per model.
 
 1. **Unified `NetDb` handle** — one object that bundles the adapters you want, exposes them as fields/properties. Users don't juggle separate `TasksAdapter` + `MemoriesAdapter` handles; they get a `db` with `db.tasks` and `db.memories` on it.
 2. **Prisma-ish method aliases** at the model level — `findMany`, `findUnique`, `count`, `exists` — wrapping the existing Rust query builder and SDK filter methods. Pure sugar; existing methods stay available.
-3. **Named `feature = "netdb"`** that pulls in `cortex-tasks` + `cortex-memories` + eventually future models. Callers enable one flag to get "the database."
+3. **Named `feature = "netdb"`** that pulls in `cortex` (adapter + all shipped models) + eventually future model features. Callers enable one flag to get "the database."
 4. **Whole-db snapshot** — single call that snapshots every model and returns a bundle; restore via a matching single call.
 
 ### What v2 NetDB adds (not in this plan's core scope)
@@ -260,7 +260,7 @@ db2 = NetDb.open_from_snapshot(snap, persistent_dir='...')
 
 ## Implementation steps
 
-1. **`src/adapter/net/netdb/mod.rs`** behind feature `netdb = ["cortex-tasks", "cortex-memories"]`.
+1. **`src/adapter/net/netdb/mod.rs`** behind feature `netdb = ["cortex"]`.
 2. **`NetDb` struct + `NetDbBuilder`** — thin aggregation of existing adapters; `with_tasks()` / `with_memories()` call the corresponding `open` / `open_with_config`.
 3. **`NetDbSnapshot`** — `{ tasks: Option<(Vec<u8>, Option<u64>)>, memories: Option<(...)> }` with a `.encode() -> Vec<u8>` helper (bincode serialize the bundle).
 4. **`NetDbError`** — just a `From<CortexAdapterError>` wrapper for now.
@@ -294,7 +294,7 @@ db2 = NetDb.open_from_snapshot(snap, persistent_dir='...')
 
 - **Method naming drift.** Today's TS surface is `listTasks(filter)` / `listMemories(filter)`. Prisma-ish rename to `findMany` on a `db.tasks` proxy is a different surface. Decision: **keep both.** The adapter-level methods stay as a lower-level API; the `db.tasks.findMany` proxy is the higher-level façade. Deprecate neither.
 - **Proxy implementation in TS.** napi doesn't directly give us nested `db.tasks.findMany`. Either a JS-side `NetDb` wrapper class that composes the adapters, or a Rust-side aggregator. The JS-side wrapper is simpler and lighter — no new napi surface, just a small class in `index.js` or a companion file.
-- **Feature gating.** `netdb = ["cortex-tasks", "cortex-memories"]` locks in "tasks + memories = NetDB." As more models land, do we add `cortex-facts` under the same umbrella, or have `netdb-tasks` / `netdb-memories` sub-features? Decision for v1: **include all shipped models**; sub-features only if binary-size pressure appears.
+- **Feature gating.** `netdb = ["cortex"]` and `cortex` bundles adapter core + tasks + memories. As more models land they go inside `cortex` (or, if binary-size pressure appears, split into sub-features like `cortex-facts`). Decision for v1: **one flag per layer — `cortex` bundles every shipped model**; sub-flags only if pressure warrants.
 - **Snapshot compatibility across schema changes.** If `Task` gains a field in a future version, old snapshots decode into a `Task` missing that field → bincode error. Need a serde-compatible migration path OR document "snapshots are tied to their app version." Flag as a future concern; bincode doesn't do schema evolution gracefully, so we may eventually switch to serde_json for snapshot blobs (trading size for forward-compat).
 - **Watch semantics under NetDB.** Our existing `watch(filter).stream()` yields the full filter result on every change (deduplicated). Prisma-ish expectations might be "emit delta events" (added / removed / updated). We've explicitly chosen full-result-set emissions — callers diff if they care. Document this clearly.
 

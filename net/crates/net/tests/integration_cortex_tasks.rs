@@ -5,7 +5,7 @@
 //! multi-producer origin_hash separation, replay after close, and
 //! durability with `redex-disk`.
 
-#![cfg(feature = "cortex-tasks")]
+#![cfg(feature = "cortex")]
 
 use futures::StreamExt;
 use net::adapter::net::cortex::tasks::{OrderBy, TaskStatus, TasksAdapter};

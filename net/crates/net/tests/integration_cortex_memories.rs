@@ -5,7 +5,7 @@
 //! no-ops, replay after close, and coexistence with the tasks model
 //! on the same Redex manager.
 
-#![cfg(feature = "cortex-memories")]
+#![cfg(feature = "cortex")]
 
 use futures::StreamExt;
 use net::adapter::net::cortex::memories::{MemoriesAdapter, OrderBy};
@@ -506,7 +506,7 @@ async fn test_ingest_after_close_errors() {
         .is_err());
 }
 
-#[cfg(feature = "cortex-tasks")]
+#[cfg(feature = "cortex")]
 #[tokio::test]
 async fn test_memories_and_tasks_coexist_on_same_redex() {
     // Two CortEX models sharing one Redex manager, each with its own

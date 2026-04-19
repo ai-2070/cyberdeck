@@ -11,7 +11,7 @@
 //! - Ingest after close rejected; state remains readable.
 //! - Ordering preserved across large bursts.
 
-#![cfg(feature = "cortex-adapter")]
+#![cfg(feature = "cortex")]
 
 use std::collections::HashMap;
 use std::sync::Arc;
