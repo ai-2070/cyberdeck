@@ -10,12 +10,27 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::time::Instant;
+
 use crate::event::StoredEvent;
 
 use super::crypto::{PacketCipher, SessionKeys};
 use super::pool::{SharedLocalPool, SharedPacketPool};
 use super::reliability::{create_reliability_mode, ReliabilityMode};
 use super::stream::DEFAULT_STREAM_WINDOW_BYTES;
+
+/// TIME_WAIT-style quarantine window after `close_stream`. A
+/// `StreamWindow` grant that arrives for a stream closed within
+/// this window is dropped — protects a reopened stream from
+/// being credited by in-flight grants minted against the previous
+/// lifetime.
+///
+/// Sized to comfortably exceed grant RTT on LAN / typical mesh
+/// deployments. Callers that rapidly reopen the same `stream_id`
+/// will see a brief stall (the reopened stream won't receive
+/// grants until the quarantine expires) — an acceptable trade-off
+/// for correct credit accounting across lifetimes.
+const GRANT_QUARANTINE_WINDOW: Duration = Duration::from_secs(2);
 
 /// Session state after handshake completion.
 pub struct NetSession {
@@ -45,6 +60,12 @@ pub struct NetSession {
     /// open/close cycle can't silently operate on a new stream that
     /// reuses the same `stream_id`.
     stream_epoch_counter: AtomicU64,
+    /// Stream IDs closed within the last `GRANT_QUARANTINE_WINDOW`.
+    /// Used to drop in-flight `StreamWindow` grants minted against a
+    /// previous lifetime of a `stream_id` so they can't credit a
+    /// subsequent reopen. Entries are inserted on `close_stream` and
+    /// lazily garbage-collected by `is_grant_quarantined` on read.
+    recently_closed: DashMap<u64, Instant>,
 }
 
 impl NetSession {
@@ -74,6 +95,7 @@ impl NetSession {
             default_reliable,
             active: AtomicBool::new(true),
             stream_epoch_counter: AtomicU64::new(1),
+            recently_closed: DashMap::new(),
         }
     }
 
@@ -174,15 +196,21 @@ impl NetSession {
         expected_epoch: Option<u64>,
         bytes: u32,
     ) -> TxAdmit {
-        // Look up the stream to decide admission. Capture the state's
-        // epoch so the guard's Drop can tell whether the stream has
-        // been closed + reopened in the interim — a naive refund
+        // Look up the stream and do admission + sequence allocation
+        // under ONE DashMap lookup. Splitting these into two lookups
+        // would allow a close+reopen race in between — credit would
+        // debit the old state while the sequence came from the new
+        // state, cross-contaminating accounting across lifetimes and
+        // defeating the epoch guard.
+        //
+        // Capture the state's epoch so the guard's Drop knows whether
+        // the stream has been reopened in the interim (naive refund
         // would credit back bytes on the fresh state, which never
-        // saw this acquire.
+        // saw this acquire).
         //
         // Release the DashMap ref before returning so the guard's
         // Drop doesn't deadlock trying to re-acquire it.
-        let (admitted, epoch) = match self.streams.get(&stream_id) {
+        let (admitted, epoch, seq) = match self.streams.get(&stream_id) {
             None => return TxAdmit::StreamClosed,
             Some(state) => {
                 if let Some(expected) = expected_epoch {
@@ -194,19 +222,31 @@ impl NetSession {
                         return TxAdmit::StreamClosed;
                     }
                 }
-                (state.try_acquire_tx_credit(bytes), state.epoch())
+                let admitted = state.try_acquire_tx_credit(bytes);
+                // Only consume a sequence if admission succeeded —
+                // otherwise we'd waste sequence numbers on rejected
+                // sends.
+                let seq = if admitted {
+                    Some(state.next_tx_seq())
+                } else {
+                    None
+                };
+                (admitted, state.epoch(), seq)
             }
         };
         if !admitted {
             return TxAdmit::WindowFull;
         }
-        TxAdmit::Acquired(TxSlotGuard {
-            session: Arc::clone(self),
-            stream_id,
-            epoch,
-            bytes,
-            active: true,
-        })
+        TxAdmit::Acquired {
+            guard: TxSlotGuard {
+                session: Arc::clone(self),
+                stream_id,
+                epoch,
+                bytes,
+                active: true,
+            },
+            seq: seq.expect("seq is Some when admitted is true"),
+        }
     }
 }
 
@@ -214,8 +254,16 @@ impl NetSession {
 #[derive(Debug)]
 pub enum TxAdmit {
     /// Admission succeeded; the guard holds the credit until dropped
-    /// or committed.
-    Acquired(TxSlotGuard),
+    /// or committed. `seq` was allocated under the same DashMap
+    /// lookup as the credit acquire — credit and sequence are
+    /// guaranteed to belong to the same `StreamState` lifetime.
+    Acquired {
+        /// RAII credit holder.
+        guard: TxSlotGuard,
+        /// Sequence number for this send, allocated atomically with
+        /// the admission decision.
+        seq: u64,
+    },
     /// `tx_credit_remaining` was below the requested bytes. The
     /// `backpressure_events` counter was incremented as a side effect.
     WindowFull,
@@ -371,10 +419,35 @@ impl NetSession {
     ///
     /// Idempotent — closing a non-existent stream is a no-op. After
     /// close, a subsequent `open_stream_with` creates a fresh stream.
+    ///
+    /// Also records `stream_id` in the grant-quarantine set so that
+    /// any `StreamWindow` grant still in flight from a peer who was
+    /// communicating with the just-closed lifetime is dropped rather
+    /// than spuriously crediting a later reopen — see
+    /// [`GRANT_QUARANTINE_WINDOW`] and [`Self::is_grant_quarantined`].
     pub fn close_stream(&self, stream_id: u64) {
         if let Some((_, state)) = self.streams.remove(&stream_id) {
             state.deactivate();
+            self.recently_closed.insert(stream_id, Instant::now());
         }
+    }
+
+    /// Whether a `StreamWindow` grant for `stream_id` should be
+    /// dropped because the stream was closed within
+    /// [`GRANT_QUARANTINE_WINDOW`]. Lazily garbage-collects expired
+    /// entries on call.
+    pub fn is_grant_quarantined(&self, stream_id: u64) -> bool {
+        let elapsed = match self.recently_closed.get(&stream_id) {
+            Some(entry) => entry.value().elapsed(),
+            None => return false,
+        };
+        if elapsed < GRANT_QUARANTINE_WINDOW {
+            return true;
+        }
+        // Entry is past the window — clean it up so the map doesn't
+        // grow with stale ids.
+        self.recently_closed.remove(&stream_id);
+        false
     }
 
     /// Remove streams whose `last_activity` is older than `max_idle`,
@@ -401,6 +474,7 @@ impl NetSession {
         for sid in idle {
             if let Some((_, state)) = self.streams.remove(&sid) {
                 state.deactivate();
+                self.recently_closed.insert(sid, Instant::now());
                 evicted += 1;
                 tracing::debug!(
                     stream_id = format!("{:#x}", sid),
@@ -421,6 +495,7 @@ impl NetSession {
                 Some(sid) => {
                     if let Some((_, state)) = self.streams.remove(&sid) {
                         state.deactivate();
+                        self.recently_closed.insert(sid, Instant::now());
                         evicted += 1;
                         tracing::warn!(
                             stream_id = format!("{:#x}", sid),
@@ -1414,7 +1489,7 @@ mod tests {
         let session = session_with_stream(stream_id, 100);
 
         let guard = match session.try_acquire_tx_credit_guard(stream_id, 100) {
-            TxAdmit::Acquired(g) => g,
+            TxAdmit::Acquired { guard, .. } => guard,
             other => panic!("expected Acquired, got {:?}", other),
         };
         assert_eq!(
@@ -1436,7 +1511,7 @@ mod tests {
         );
         assert!(matches!(
             session.try_acquire_tx_credit_guard(stream_id, 50),
-            TxAdmit::Acquired(_)
+            TxAdmit::Acquired { .. }
         ));
     }
 
@@ -1449,7 +1524,7 @@ mod tests {
         let session = session_with_stream(stream_id, 100);
 
         let guard = match session.try_acquire_tx_credit_guard(stream_id, 40) {
-            TxAdmit::Acquired(g) => g,
+            TxAdmit::Acquired { guard, .. } => guard,
             other => panic!("expected Acquired, got {:?}", other),
         };
         guard.commit();
@@ -1478,7 +1553,7 @@ mod tests {
         let stream_id = 0xAu64;
         let session = session_with_stream(stream_id, 100);
         let guard = match session.try_acquire_tx_credit_guard(stream_id, 40) {
-            TxAdmit::Acquired(g) => g,
+            TxAdmit::Acquired { guard, .. } => guard,
             other => panic!("expected Acquired, got {:?}", other),
         };
         session.close_stream(stream_id);
@@ -1494,7 +1569,7 @@ mod tests {
         // "don't refund because the bytes are lost, not sent."
         let session = session_with_stream(0xF, 100);
         let g = match session.try_acquire_tx_credit_guard(0xF, 40) {
-            TxAdmit::Acquired(g) => g,
+            TxAdmit::Acquired { guard, .. } => guard,
             other => panic!("expected Acquired, got {:?}", other),
         };
         g.forget();
@@ -1514,7 +1589,7 @@ mod tests {
         let session = session_with_stream(sid, 100);
 
         let g = match session.try_acquire_tx_credit_guard(sid, 60) {
-            TxAdmit::Acquired(g) => g,
+            TxAdmit::Acquired { guard, .. } => guard,
             other => panic!("expected Acquired, got {:?}", other),
         };
         let first_epoch = g.epoch_for_test();
@@ -1563,7 +1638,7 @@ mod tests {
         let cur_epoch = session.try_stream(sid).unwrap().epoch();
         assert!(matches!(
             session.try_acquire_tx_credit_matching_epoch(sid, cur_epoch, 10),
-            TxAdmit::Acquired(_)
+            TxAdmit::Acquired { .. }
         ));
     }
 
@@ -1579,7 +1654,7 @@ mod tests {
 
         // Send: acquire 100 bytes, commit.
         let g = match session.try_acquire_tx_credit_guard(stream_id, 100) {
-            TxAdmit::Acquired(g) => g,
+            TxAdmit::Acquired { guard, .. } => guard,
             other => panic!("expected Acquired, got {:?}", other),
         };
         g.commit();
@@ -1609,6 +1684,83 @@ mod tests {
         //
         // (If the plan ever needs a hard window ceiling, add a
         // `min(v + bytes, tx_window)` cap on grant receipt too.)
+    }
+
+    #[test]
+    fn test_regression_stale_grant_quarantined_after_close_reopen() {
+        // Regression (P1): a `StreamWindow` grant keyed only by
+        // stream_id could credit a reopened stream with credit
+        // minted against the previous lifetime's `StreamState`.
+        // Fix: `close_stream` stamps the stream_id into
+        // `recently_closed`; `is_grant_quarantined` tells the
+        // dispatcher to drop grants that arrive within
+        // `GRANT_QUARANTINE_WINDOW`.
+        let sid = 0x2077u64;
+        let session = session_with_stream(sid, 100);
+
+        // Mid-flight: close the stream, reopen with the same id.
+        session.close_stream(sid);
+        session.open_stream_full(sid, false, 1, 100);
+
+        // An arriving grant for `sid` must be quarantined because
+        // the original lifetime was closed inside the window.
+        assert!(
+            session.is_grant_quarantined(sid),
+            "grants for recently-closed stream must be dropped"
+        );
+
+        // The reopened stream's credit is untouched — we don't call
+        // apply_credit_grant under quarantine.
+        assert_eq!(session.try_stream(sid).unwrap().tx_credit_remaining(), 100);
+    }
+
+    #[test]
+    fn test_grant_quarantine_does_not_fire_without_close() {
+        // Baseline: streams that were never closed aren't in the
+        // quarantine set. Grants flow normally.
+        let sid = 0x2099u64;
+        let session = session_with_stream(sid, 100);
+        assert!(!session.is_grant_quarantined(sid));
+    }
+
+    #[test]
+    fn test_regression_admit_and_seq_atomic_across_reopen_race() {
+        // Regression (P2): `send_on_stream` used to acquire credit
+        // and then re-look up the stream to fetch `next_tx_seq`.
+        // A concurrent close+reopen between the two lookups would
+        // debit credit on the old state while the sequence came
+        // from the new state — crossing lifetimes and defeating
+        // the epoch guard's safety.
+        //
+        // Fix: `try_acquire_tx_credit_*` now returns both the guard
+        // and the sequence under one DashMap lookup. This test
+        // verifies that the admitted sequence belongs to the same
+        // `StreamState` as the one that was debited.
+        let sid = 0x3141u64;
+        let session = session_with_stream(sid, 100);
+        let epoch_before = session.try_stream(sid).unwrap().epoch();
+        let tx_seq_before = session.try_stream(sid).unwrap().current_tx_seq();
+
+        let (guard, seq) = match session.try_acquire_tx_credit_matching_epoch(
+            sid,
+            epoch_before,
+            40,
+        ) {
+            TxAdmit::Acquired { guard, seq } => (guard, seq),
+            other => panic!("expected Acquired, got {:?}", other),
+        };
+        guard.commit();
+
+        // The sequence must come from the state that was debited —
+        // i.e., the next `current_tx_seq` is one greater than the
+        // value observed before, not zero (as it would be if the
+        // seq had come from a fresh state after an intervening
+        // reopen).
+        let after = session.try_stream(sid).unwrap();
+        assert_eq!(seq, tx_seq_before);
+        assert_eq!(after.current_tx_seq(), tx_seq_before + 1);
+        assert_eq!(after.epoch(), epoch_before);
+        assert_eq!(after.tx_credit_remaining(), 60);
     }
 
     impl TxSlotGuard {

@@ -1243,11 +1243,24 @@ impl MeshNode {
             if let Some(payload) = events.into_iter().next() {
                 match StreamWindow::decode(&payload) {
                     Ok(grant) => {
-                        if let Some(state) = session.try_stream(grant.stream_id) {
+                        // Quarantine guard: a grant that arrives for a
+                        // stream closed within `GRANT_QUARANTINE_WINDOW`
+                        // is dropped, even if the stream has already been
+                        // reopened with the same id. Without this the
+                        // in-flight grant from the *previous* lifetime
+                        // would spuriously credit the new `StreamState`
+                        // and let the sender exceed its intended window.
+                        // Grants for closed / unknown streams are also
+                        // dropped silently — the sender will time out on
+                        // its own.
+                        if session.is_grant_quarantined(grant.stream_id) {
+                            tracing::debug!(
+                                stream_id = format!("{:#x}", grant.stream_id),
+                                "dropping StreamWindow grant for recently-closed stream"
+                            );
+                        } else if let Some(state) = session.try_stream(grant.stream_id) {
                             state.apply_credit_grant(grant.credit_bytes);
                         }
-                        // Grants for closed / unknown streams are dropped
-                        // silently — the sender will time out on its own.
                     }
                     Err(e) => {
                         tracing::debug!(error = %e, "malformed StreamWindow grant");
@@ -2288,19 +2301,17 @@ impl MeshNode {
                 // Charge against the sender's byte credit using the
                 // wire-payload size for this batch. Matches the units
                 // the receiver accounts against in `on_bytes_consumed`.
+                // `TxAdmit::Acquired` returns credit + sequence under
+                // the same DashMap lookup — a close+reopen race can't
+                // slip a stale sequence from the old lifetime onto
+                // the new state.
                 let needed = current_size as u32;
                 let (guard, seq) = match session.try_acquire_tx_credit_matching_epoch(
                     stream_id,
                     stream.epoch,
                     needed,
                 ) {
-                    TxAdmit::Acquired(g) => {
-                        let seq = session
-                            .try_stream(stream_id)
-                            .ok_or(StreamError::NotConnected)?
-                            .next_tx_seq();
-                        (g, seq)
-                    }
+                    TxAdmit::Acquired { guard, seq } => (guard, seq),
                     TxAdmit::WindowFull => return Err(StreamError::Backpressure),
                     TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
                 };
@@ -2320,13 +2331,7 @@ impl MeshNode {
             let (guard, seq) =
                 match session.try_acquire_tx_credit_matching_epoch(stream_id, stream.epoch, needed)
                 {
-                    TxAdmit::Acquired(g) => {
-                        let seq = session
-                            .try_stream(stream_id)
-                            .ok_or(StreamError::NotConnected)?
-                            .next_tx_seq();
-                        (g, seq)
-                    }
+                    TxAdmit::Acquired { guard, seq } => (guard, seq),
                     TxAdmit::WindowFull => return Err(StreamError::Backpressure),
                     TxAdmit::StreamClosed => return Err(StreamError::NotConnected),
                 };
