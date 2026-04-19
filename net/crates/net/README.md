@@ -17,6 +17,9 @@ For the design philosophy, architecture rationale, and benchmarks, see the [proj
 - [Channels](#channels)
 - [Daemons](#daemons)
 - [Safety & Autonomy](#safety--autonomy)
+- [RedEX](#redex)
+- [CortEX](#cortex)
+- [NetDB](#netdb)
 - [Module Map](#module-map)
 - [Adapters](#adapters)
 - [SDKs](#sdks)
@@ -344,6 +347,100 @@ Rule: if event.size > 64KB then drop
 Rules are local decisions, not network policy. No external authority can override a node's safety envelope. A node that refuses work is routed around — the proximity graph reflects this within a heartbeat interval. The mesh adapts to the node's boundaries rather than forcing the node to adapt to the mesh.
 
 This is device autonomy in practice. A $5 sensor node sets tight limits — low rate, small buffer, no daemons. A $1500 GPU node sets generous limits — high rate, large buffer, many daemons. Both are equal participants on the mesh. The protocol treats them identically. Their capabilities and autonomy rules determine what they actually do.
+
+## RedEX
+
+RedEX is the local append-only log primitive. A `Redex` manager owns a `ChannelName → RedexFile` map; every file is an independent monotonic sequence of 20-byte index records plus a payload segment. v1 is strictly local — no replication, no subprotocol, no multi-node convergence. Higher layers (CortEX, NetDB) build on top; nothing in RedEX knows about them.
+
+The 20-byte record is fixed:
+
+```
+┌──────────────┬────────────────┬────────────────┬────────────────────┐
+│ seq (u64 LE) │ offset (u32 LE)│  len (u32 LE)  │ flags+checksum u32 │
+│   8 bytes    │   4 bytes      │    4 bytes     │     4 bytes        │
+└──────────────┴────────────────┴────────────────┴────────────────────┘
+```
+
+Two payload paths:
+
+- **Inline** (`append_inline`): exactly 8 bytes of payload live in the index record itself (reusing the `offset`+`len` fields, discriminated by the `INLINE` flag in the high nibble of `flags+checksum`). Zero segment allocation — the fast path for tick counters, sensor readings, small enums.
+- **Heap** (`append`, `append_batch`, `append_bincode`): payload appended to an in-memory `HeapSegment` (grow-only `Vec<u8>`, 3 GB hard cap). The index record carries the `(offset, len)` into the segment.
+
+A monotonic `AtomicU64::fetch_add` assigns the sequence lock-free in the non-ordered path. `OrderedAppender` / `append_ordered` hold the state lock across seq allocation for writers that need strict replay determinism under contention. `append_batch` and `append_batch_ordered` allocate a contiguous seq range atomically; pre-validation under the state lock guarantees a failing batch does NOT advance `next_seq`, so no seq-space gaps appear on `PayloadTooLarge` / `SegmentOffsetOverflow`.
+
+`tail(from_seq)` returns a `Stream<Item = Result<RedexEvent, RedexError>>` with an atomic backfill-then-live handoff: under the state lock, it drains every retained entry with `seq >= from_seq` and then registers a live watcher — nothing can interleave between the last backfill event and the first live event. Closed files emit a single `RedexError::Closed` and end.
+
+Retention runs as an on-demand `sweep_retention()` call (no background task in v1). Three policies AND together; the sweep takes the largest eviction count satisfying all active constraints:
+
+- **Count** (`retention_max_events`) — keep newest K entries
+- **Size** (`retention_max_bytes`) — keep newest M bytes of payload
+- **Age** (`retention_max_age_ns`) — drop entries older than D nanoseconds (wall-clock at append time; persistent files lose age info across reopen in v1)
+
+`RedexFold<State>` is the integration hook that higher layers consume. RedEX defines the trait and drives it on a tail stream spawned by the caller; CortEX installs its `TasksFold` / `MemoriesFold` against it.
+
+Durability is opt-in behind the `redex-disk` feature and `RedexFileConfig::persistent`. Each persistent file writes two append-only files at `<base>/<channel_path>/{idx,dat}`. On reopen, the full `dat` is replayed into a fresh `HeapSegment` and `idx` restores the index; a torn trailing record from a crash (partial 20-byte write) is truncated on recovery. `close()` and explicit `sync()` fsync `dat` before `idx` — the crash-consistency ordering is "payload before index," so the worst case after a power cut is an index shorter than the payload, which the torn-tail logic already handles.
+
+ACL enforcement happens at `open_file` via the optional `AuthGuard`. The check keys on the canonical `ChannelName` (not the 16-bit wire hash), so two distinct channels can never alias into the same ACL decision — see the Channels section for the two-tier authorization design.
+
+## CortEX
+
+CortEX is the seam between Net events and local state. A `CortexAdapter<State>` wraps a `RedexFile` with:
+
+1. A fixed 20-byte `EventMeta` prefix on every payload (dispatch tag, flags, origin hash, per-origin seq-or-timestamp, xxh3 checksum of the tail).
+2. A spawned fold task that tails the file from a chosen start position, decodes the meta, and drives a caller-supplied `RedexFold<State>` against an `Arc<RwLock<State>>`.
+3. A read-after-write barrier (`wait_for_seq`) so callers can block until a freshly-appended event has been folded into state.
+4. A `changes() -> Stream<Item = u64>` broadcast notification so reactive queries can re-evaluate after every fold tick.
+
+```rust
+pub struct EventMeta {
+    pub dispatch: u8,       // 0x00..0x7F CortEX-internal; 0x80..0xFF app/vendor
+    pub flags: u8,          // FLAG_CAUSAL, FLAG_CONTINUITY_PROOF, ...
+    pub _pad: [u8; 2],      // reserved, zero on write, ignored on read
+    pub origin_hash: u32,   // producer identity
+    pub seq_or_ts: u64,     // per-origin counter OR unix nanos; file picks one
+    pub checksum: u32,      // xxh3_64(tail) truncated
+}
+```
+
+`StartPosition` selects replay semantics: `FromBeginning` (full history), `LiveOnly` (skip pre-open), `FromSeq(n)` (resume after a snapshot). `FoldErrorPolicy` governs what happens when the fold returns `Err`: `Stop` halts the task and records the stopping seq; `LogAndContinue` increments an error counter and keeps going. A single `changes()` broadcast is shared across all reactive subscribers; a subscriber falling more than 64 events behind drops intermediate ticks but always sees the latest state on catch-up.
+
+Snapshots compact long-running folds: `snapshot()` serializes the materialized state (under the state write lock so `(bytes, last_seq)` is consistent) via bincode; `open_from_snapshot(bytes, last_seq)` deserializes and resumes tailing at `FromSeq(last_seq + 1)`. `last_seq = u64::MAX` returns `RedexError::Encode` rather than wrapping around silently.
+
+Two concrete models ship in v1:
+
+- **Tasks** — mutate-by-id CRUD. Dispatches `0x01..=0x04` (created / renamed / completed / deleted). `Task { id, title, status, created_ns, updated_ns }`. `TasksState` holds a `HashMap<TaskId, Task>` and exposes a Prisma-style query builder (`state.query().where_status(...).order_by(...).limit(N).collect()`) plus Prisma-ish shortcuts (`find_unique`, `find_many`, `count_where`, `exists_where`).
+- **Memories** — content-addressed log with set-valued tags. Dispatches `0x10..=0x14` (stored / retagged / pinned / unpinned / deleted). `Memory { id, content, tags: Vec<String>, source, pinned, ... }`. Same query surface with tag predicates in three flavors (`where_tag`, `where_any_tag`, `where_all_tags`) plus a pin filter.
+
+Both models expose a reactive `watch(filter)` that returns a `Stream<Item = Vec<T>>`: the current filter result on open, then a freshly-evaluated vector on every fold tick where the filter output changes (deduplicated by Vec equality; defaults to `OrderBy::IdAsc` when the caller doesn't specify one, so dedup is deterministic). The stream's backing channel is single-slot (`tokio::sync::watch`), so a slow consumer sees the latest state on the next poll — intermediate results are dropped. The spawned watcher task bails out immediately when the consumer drops the stream via `tokio::select!` on `tx.closed()`.
+
+Tasks and memories coexist on the same `Redex` manager without cross-channel leakage: each model owns a distinct `ChannelName` (`cortex/tasks`, `cortex/memories`) and partitions its dispatches under the CortEX-internal range `0x00..=0x7F` (with static asserts). Application / vendor dispatches get `0x80..=0xFF`.
+
+Typed errors cross the FFI boundary as classes on both Node and Python bindings: `CortexError` for adapter-level failures (`adapter closed`, `fold stopped at seq N`, underlying RedEX errors) and `NetDbError` for handle-level failures (snapshot encode / decode, missing-model accesses). The Node side uses stable `cortex:` / `netdb:` message prefixes classified into typed `Error` subclasses by `@ai2070/net/errors::classifyError`; the Python side exposes `net._net.CortexError` / `net._net.NetDbError` directly via `pyo3::create_exception!`.
+
+## NetDB
+
+NetDB is the unified query façade over one or more CortEX models. A `NetDb` handle bundles enabled adapters behind per-model accessors (`db.tasks()` / `db.memories()`); each Prisma-ish method (`find_unique`, `find_many(&filter)`, `count_where`, `exists_where`) is available both on the per-model state guard and transparently through the handle. NetDB is strictly local and strictly query-oriented — raw events and streams stay at the RedEX / CortEX layer.
+
+```rust
+let db = NetDb::builder(Redex::new())
+    .origin(origin_hash)
+    .with_tasks()
+    .with_memories()
+    .build()?;
+
+db.tasks().create(1, "write plan", now_ns())?;
+let pending = db.tasks().state().read().find_many(&TasksFilter {
+    status: Some(TaskStatus::Pending),
+    limit: Some(10),
+    ..Default::default()
+});
+```
+
+`NetDbBuilder::build` is failure-atomic: if the second adapter open fails after the first succeeded, the first is closed before the error propagates so no orphan fold task outlives the failed build.
+
+Whole-db snapshot is a single call. `db.snapshot()` walks every enabled model under its own state lock (consistent per-model; there is no cross-model consistency guarantee because each model backs a separate RedEX file), returning a `NetDbSnapshot { tasks, memories }` bundle. `NetDbSnapshot::encode()` produces a single bincode blob for persistence; `NetDbSnapshot::decode(bytes)` round-trips it, and `NetDbBuilder::build_from_snapshot(&bundle)` restores every enabled model in one call. Models enabled via `with_*()` whose bundle entry is `None` are opened from scratch — the same fallback path used by a fresh `build`.
+
+NetDB ships the same surface on Rust, Node (`@ai2070/net` napi bindings), and Python (`net._net` PyO3 bindings). The Node and Python handles carry the same CRUD + query methods; `NetDb.open(config)` on both sides is failure-atomic and supports the same whole-db snapshot bundle cross-language (bincode is stable across the FFI boundary).
 
 ## Module Map
 
