@@ -137,7 +137,7 @@ mesh.close_stream(peer_node_id, stream_id);
 
 **Not multicast.** A stream is one flow to one peer. Sending the same payload to multiple peers is an application / daemon / channel-layer concern, not transport.
 
-**Back-pressure.** `send_on_stream` returns `StreamError::Backpressure` when the stream's remaining send credit is below the payload size it wants to push. Credit is measured in **bytes**, seeded at open time from `StreamConfig::window_bytes` (default 64 KB; `0` disables backpressure entirely), decremented on each socket send, and replenished by receiver-driven `StreamWindow` grants (subprotocol `0x0B00`). The signal catches both concurrent callers racing on the same window AND a serial sender outrunning a slow receiver across the network — the latter no longer surfaces as `Transport(io::Error)` when the kernel buffer fills.
+**Back-pressure.** `send_on_stream` returns `StreamError::Backpressure` when the stream's remaining send credit is below the payload size it wants to push. Credit is measured in **bytes**, seeded at open time from `StreamConfig::window_bytes` (default 64 KB; `0` disables backpressure entirely), decremented on each socket send, and replenished by receiver-driven `StreamWindow` grants (subprotocol `0x0B00`). The signal catches both concurrent callers racing on the same window AND a serial sender outrunning a slow receiver across the network — the latter no longer surfaces as `StreamError::Transport(String)` when the kernel buffer fills.
 
 *Backpressure is a signal, not a policy.* The transport never retries, sleeps, or buffers on its own. Daemons pick one of three patterns per stream:
 
