@@ -1302,8 +1302,7 @@ impl MeshNode {
         // existing shard-queue-depth limits.
         let grant_bytes = {
             let stream = session.get_or_create_stream(stream_id);
-            let accepted =
-                stream.with_reliability(|r| r.on_receive(parsed.header.sequence));
+            let accepted = stream.with_reliability(|r| r.on_receive(parsed.header.sequence));
             if accepted {
                 stream.update_rx_seq(parsed.header.sequence);
                 stream.on_bytes_consumed(payload_bytes)

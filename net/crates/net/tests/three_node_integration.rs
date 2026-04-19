@@ -5035,7 +5035,10 @@ async fn test_v2_serial_sender_sees_backpressure_on_slow_receiver() {
     // surface Transport(io::Error) when the kernel buffer filled; v2
     // delivers clean Backpressure on the in-protocol signal.
     for _ in 0..64 {
-        match a.send_on_stream(&stream, std::slice::from_ref(&event)).await {
+        match a
+            .send_on_stream(&stream, std::slice::from_ref(&event))
+            .await
+        {
             Ok(()) => ok += 1,
             Err(StreamError::Backpressure) => backpressure += 1,
             Err(StreamError::Transport(_)) => panic!(
