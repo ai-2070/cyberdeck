@@ -1,0 +1,33 @@
+net/crates/net/tests/integration_cortex_tasks.rs
+  f3669361474f4cb8 509-572
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  f3669361474f4cb8 17,238-261,265
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  f3669361474f4cb8 17,231-255,259
+net/crates/net/src/adapter/net/redex/file.rs
+  f3669361474f4cb8 358-375
+net/crates/net/src/adapter/net/redex/disk.rs
+  f3669361474f4cb8 90-102,104-110,112-121,124-127
+net/crates/net/tests/integration_redex.rs
+  f3669361474f4cb8 799-860
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "443b4071080eb9157a9937bf4bfcb7ff24f6c197",
+  "prompts": {
+    "f3669361474f4cb8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57edf9c1-0df7-4f0e-80d2-6605a3438736",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 820,
+      "total_deletions": 3929,
+      "accepted_lines": 232,
+      "overriden_lines": 0
+    }
+  }
+}
