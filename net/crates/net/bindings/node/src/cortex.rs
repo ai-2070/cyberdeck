@@ -22,6 +22,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use tokio::sync::{Mutex as TokioMutex, Notify};
 
+use ::net::adapter::net::channel::ChannelName;
 use ::net::adapter::net::cortex::memories::{
     MemoriesAdapter as InnerMemoriesAdapter, Memory as InnerMemory, OrderBy as InnerMemoriesOrderBy,
 };
@@ -29,7 +30,11 @@ use ::net::adapter::net::cortex::tasks::{
     OrderBy as InnerTasksOrderBy, Task as InnerTask, TaskStatus as InnerTaskStatus,
     TasksAdapter as InnerTasksAdapter,
 };
-use ::net::adapter::net::redex::{Redex as InnerRedex, RedexFileConfig};
+use ::net::adapter::net::redex::{
+    FsyncPolicy as InnerFsyncPolicy, Redex as InnerRedex, RedexError as InnerRedexError,
+    RedexEvent as InnerRedexEvent, RedexFile as InnerRedexFile, RedexFileConfig,
+};
+use bytes::Bytes;
 
 // =========================================================================
 // Error-class prefix contract
@@ -41,6 +46,7 @@ use ::net::adapter::net::redex::{Redex as InnerRedex, RedexFileConfig};
 
 pub(crate) const ERR_CORTEX_PREFIX: &str = "cortex:";
 pub(crate) const ERR_NETDB_PREFIX: &str = "netdb:";
+pub(crate) const ERR_REDEX_PREFIX: &str = "redex:";
 
 #[inline]
 pub(crate) fn cortex_err(context: &str, detail: impl std::fmt::Display) -> Error {
@@ -50,6 +56,11 @@ pub(crate) fn cortex_err(context: &str, detail: impl std::fmt::Display) -> Error
 #[inline]
 pub(crate) fn netdb_err(context: &str, detail: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("{} {}: {}", ERR_NETDB_PREFIX, context, detail))
+}
+
+#[inline]
+pub(crate) fn redex_err(context: &str, detail: impl std::fmt::Display) -> Error {
+    Error::from_reason(format!("{} {}: {}", ERR_REDEX_PREFIX, context, detail))
 }
 
 // =========================================================================
@@ -125,6 +136,305 @@ impl Redex {
         Self {
             inner: Arc::new(inner),
         }
+    }
+
+    /// Open (or get) a raw RedEX file bound to `channelName`. Returns
+    /// a handle for append / tail / read operations without going
+    /// through the CortEX adapter layer.
+    ///
+    /// Re-opening an existing name returns the live handle; the
+    /// `config` argument is honored only on first open.
+    ///
+    /// With `config.persistent = true`, this manager must have been
+    /// constructed with a `persistentDir`. Otherwise the call fails
+    /// with a `redex:` error.
+    #[napi]
+    pub fn open_file(
+        &self,
+        channel_name: String,
+        config: Option<RedexFileConfigJs>,
+    ) -> Result<RedexFile> {
+        let name =
+            ChannelName::new(&channel_name).map_err(|e| redex_err("invalid channel name", e))?;
+        let cfg = resolve_redex_file_config(config)?;
+        let file = self
+            .inner
+            .open_file(&name, cfg)
+            .map_err(|e| redex_err("open_file", e))?;
+        Ok(RedexFile {
+            inner: Arc::new(file),
+        })
+    }
+}
+
+// =========================================================================
+// Raw RedEX file — domain-agnostic event log
+// =========================================================================
+
+/// Configuration for [`Redex::open_file`]. Mirrors the core
+/// `RedexFileConfig` but flattens `FsyncPolicy` into two mutually
+/// exclusive optional fields. Leave both unset for the default
+/// `Never` policy.
+#[napi(object)]
+pub struct RedexFileConfigJs {
+    /// Disk-backed storage. Requires `Redex` to have been constructed
+    /// with `persistentDir`. Default: `false` (heap only).
+    pub persistent: Option<bool>,
+    /// Fsync after every N appends (`1` fsyncs on every append).
+    /// Mutually exclusive with `fsync_interval_ms`. Ignored unless
+    /// `persistent: true`. `0` is rejected.
+    pub fsync_every_n: Option<BigInt>,
+    /// Fsync on a timer (milliseconds). Mutually exclusive with
+    /// `fsync_every_n`. Ignored unless `persistent: true`. `0` is
+    /// rejected.
+    pub fsync_interval_ms: Option<u32>,
+    /// Retain at most N events.
+    pub retention_max_events: Option<BigInt>,
+    /// Retain at most N bytes of payload.
+    pub retention_max_bytes: Option<BigInt>,
+    /// Drop entries older than this many milliseconds at the next
+    /// retention sweep.
+    pub retention_max_age_ms: Option<BigInt>,
+}
+
+fn resolve_redex_file_config(cfg: Option<RedexFileConfigJs>) -> Result<RedexFileConfig> {
+    let Some(c) = cfg else {
+        return Ok(RedexFileConfig::default());
+    };
+    let mut out = RedexFileConfig::default();
+    if let Some(p) = c.persistent {
+        out.persistent = p;
+    }
+    match (c.fsync_every_n, c.fsync_interval_ms) {
+        (Some(_), Some(_)) => {
+            return Err(redex_err(
+                "config",
+                "fsync_every_n and fsync_interval_ms are mutually exclusive",
+            ));
+        }
+        (Some(n), None) => {
+            let n = bigint_u64(n)?;
+            if n == 0 {
+                return Err(redex_err("config", "fsync_every_n must be > 0"));
+            }
+            out.fsync_policy = InnerFsyncPolicy::EveryN(n);
+        }
+        (None, Some(ms)) => {
+            if ms == 0 {
+                return Err(redex_err("config", "fsync_interval_ms must be > 0"));
+            }
+            out.fsync_policy =
+                InnerFsyncPolicy::Interval(std::time::Duration::from_millis(ms as u64));
+        }
+        (None, None) => {}
+    }
+    if let Some(n) = c.retention_max_events {
+        out.retention_max_events = Some(bigint_u64(n)?);
+    }
+    if let Some(b) = c.retention_max_bytes {
+        out.retention_max_bytes = Some(bigint_u64(b)?);
+    }
+    if let Some(ms) = c.retention_max_age_ms {
+        let ms = bigint_u64(ms)?;
+        out.retention_max_age_ns = Some(ms.saturating_mul(1_000_000));
+    }
+    Ok(out)
+}
+
+/// A materialized RedEX event: `seq` + `payload`.
+#[napi(object)]
+pub struct RedexEventJs {
+    pub seq: BigInt,
+    pub payload: Buffer,
+    /// Low-28-bit xxh3 truncation of the payload, stamped at append
+    /// time. Use to detect storage corruption.
+    pub checksum: u32,
+    /// True if the 8-byte payload was stored inline in the entry
+    /// record rather than in the payload segment.
+    pub is_inline: bool,
+}
+
+impl From<InnerRedexEvent> for RedexEventJs {
+    fn from(ev: InnerRedexEvent) -> Self {
+        RedexEventJs {
+            seq: BigInt::from(ev.entry.seq),
+            payload: Buffer::from(ev.payload.as_ref()),
+            checksum: ev.entry.checksum(),
+            is_inline: ev.entry.is_inline(),
+        }
+    }
+}
+
+/// Raw RedEX file handle. Append / tail / read without the CortEX
+/// adapter layer. Cheap to clone (internal `Arc`).
+#[napi]
+pub struct RedexFile {
+    inner: Arc<InnerRedexFile>,
+}
+
+#[napi]
+impl RedexFile {
+    /// Append one payload. Returns the assigned sequence number.
+    #[napi]
+    pub fn append(&self, payload: Buffer) -> Result<BigInt> {
+        let seq = self
+            .inner
+            .append(payload.as_ref())
+            .map_err(|e| redex_err("append", e))?;
+        Ok(BigInt::from(seq))
+    }
+
+    /// Append a batch of payloads atomically. Returns the sequence
+    /// number of the FIRST appended event; callers deduce subsequent
+    /// seqs as `first + 0, first + 1, ...`.
+    #[napi]
+    pub fn append_batch(&self, payloads: Vec<Buffer>) -> Result<BigInt> {
+        let bytes: Vec<Bytes> = payloads
+            .into_iter()
+            .map(|b| Bytes::copy_from_slice(b.as_ref()))
+            .collect();
+        let seq = self
+            .inner
+            .append_batch(&bytes)
+            .map_err(|e| redex_err("append_batch", e))?;
+        Ok(BigInt::from(seq))
+    }
+
+    /// Read the half-open range `[start, end)` from the in-memory
+    /// index. Returns only entries still retained — any seq in the
+    /// range that has been evicted is silently skipped.
+    #[napi]
+    pub fn read_range(&self, start: BigInt, end: BigInt) -> Result<Vec<RedexEventJs>> {
+        let s = bigint_u64(start)?;
+        let e = bigint_u64(end)?;
+        Ok(self
+            .inner
+            .read_range(s, e)
+            .into_iter()
+            .map(RedexEventJs::from)
+            .collect())
+    }
+
+    /// Number of retained events (post-retention eviction).
+    #[napi]
+    pub fn len(&self) -> u32 {
+        self.inner.len() as u32
+    }
+
+    /// Open a live tail over this file. The iterator yields every
+    /// event with `seq >= fromSeq` (default `0`), atomically
+    /// backfilling the existing retained range and then streaming
+    /// subsequent appends. Terminate early with `.close()` or by
+    /// breaking out of `for await` — breaking triggers `return()`,
+    /// which the SDK wrapper routes to `close()`.
+    ///
+    /// Declared `async` so the underlying `UnboundedReceiverStream`
+    /// lives inside the napi tokio runtime.
+    #[napi]
+    pub async fn tail(&self, from_seq: Option<BigInt>) -> Result<RedexTailIter> {
+        let from = match from_seq {
+            Some(s) => bigint_u64(s)?,
+            None => 0,
+        };
+        let stream = self.inner.tail(from);
+        use futures::StreamExt;
+        let boxed: BoxStream<'static, std::result::Result<InnerRedexEvent, InnerRedexError>> =
+            stream.boxed();
+        Ok(RedexTailIter {
+            inner: Arc::new(RedexTailIterInner {
+                stream: TokioMutex::new(Some(boxed)),
+                shutdown: Notify::new(),
+                is_shutdown: AtomicBool::new(false),
+            }),
+        })
+    }
+
+    /// Explicit fsync. Always fsyncs regardless of configured
+    /// `fsyncPolicy`. No-op on heap-only files.
+    #[napi]
+    pub fn sync(&self) -> Result<()> {
+        self.inner.sync().map_err(|e| redex_err("sync", e))
+    }
+
+    /// Close the file. Outstanding tail iterators resolve with a
+    /// `redex:` error on their next `.next()` call.
+    #[napi]
+    pub fn close(&self) -> Result<()> {
+        self.inner.close().map_err(|e| redex_err("close", e))
+    }
+}
+
+struct RedexTailIterInner {
+    stream: TokioMutex<
+        Option<BoxStream<'static, std::result::Result<InnerRedexEvent, InnerRedexError>>>,
+    >,
+    shutdown: Notify,
+    is_shutdown: AtomicBool,
+}
+
+/// Async iterator over a live `RedexFile::tail`.
+#[napi]
+pub struct RedexTailIter {
+    inner: Arc<RedexTailIterInner>,
+}
+
+#[napi]
+impl RedexTailIter {
+    /// Wait for the next event. Returns `null` when the iterator has
+    /// been closed or the underlying file was closed. Throws a
+    /// `redex:` error if the backing stream yielded an error item.
+    #[napi]
+    pub async fn next(&self) -> Result<Option<RedexEventJs>> {
+        if self.inner.is_shutdown.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let mut guard = self.inner.stream.lock().await;
+        let stream = match guard.as_mut() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let shutdown_fut = self.inner.shutdown.notified();
+        tokio::pin!(shutdown_fut);
+        shutdown_fut.as_mut().enable();
+
+        if self.inner.is_shutdown.load(Ordering::Acquire) {
+            *guard = None;
+            return Ok(None);
+        }
+
+        tokio::select! {
+            biased;
+            _ = shutdown_fut => {
+                *guard = None;
+                Ok(None)
+            }
+            msg = stream.next() => match msg {
+                Some(Ok(event)) => Ok(Some(RedexEventJs::from(event))),
+                Some(Err(e)) => {
+                    // The tail stream surfaces RedexError::Closed when
+                    // the owning file is closed; map that to a normal
+                    // stream-end so for-await loops terminate cleanly.
+                    *guard = None;
+                    if matches!(e, InnerRedexError::Closed) {
+                        Ok(None)
+                    } else {
+                        Err(redex_err("tail", e))
+                    }
+                }
+                None => {
+                    *guard = None;
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Terminate the iterator. Idempotent.
+    #[napi]
+    pub fn close(&self) {
+        self.inner.is_shutdown.store(true, Ordering::Release);
+        self.inner.shutdown.notify_waiters();
     }
 }
 

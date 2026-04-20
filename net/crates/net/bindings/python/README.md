@@ -151,6 +151,43 @@ tasks = TasksAdapter.open(redex, origin_hash=0xABCDEF01, persistent=True)
 `pin` / `unpin` / `delete` / `list_memories` / `watch_memories` /
 `snapshot_and_watch_memories`.
 
+### Raw RedEX file (no CortEX fold)
+
+For domain-agnostic persistent logs — your own event schema, no
+fold, no typed adapter — open a `RedexFile` directly from a `Redex`.
+The tail is a sync Python iterator; call `close()` or let
+`StopIteration` fire when the file closes.
+
+```python
+from net import Redex, RedexError
+
+redex = Redex(persistent_dir='/var/lib/net/events')
+file = redex.open_file(
+    'analytics/clicks',
+    persistent=True,
+    fsync_interval_ms=100,           # or fsync_every_n=1000
+    retention_max_events=1_000_000,
+)
+
+# Append (or batch-append).
+seq = file.append(b'{"url": "/home"}')
+first = file.append_batch([b'{"a": 1}', b'{"a": 2}'])
+
+# Tail — backfills the retained range, then streams live appends.
+try:
+    for event in file.tail(from_seq=0):
+        print(event.seq, bytes(event.payload))
+        if should_stop:
+            break           # idempotent; ends the iterator via close()
+except RedexError as e:
+    ...
+
+file.close()
+```
+
+Errors from the RedEX surface raise `RedexError` (invalid channel
+name, bad config, append / tail / sync / close failures).
+
 ### Why `snapshot_and_watch_*`?
 
 Calling `list_tasks()` then `watch_tasks()` takes two independent

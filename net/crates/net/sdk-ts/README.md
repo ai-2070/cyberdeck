@@ -226,15 +226,54 @@ const redex = new Redex({ persistentDir: '/var/lib/net/redex' });
 const tasks = await TasksAdapter.open(redex, 0xABCDEF01, { persistent: true });
 ```
 
+### Raw RedEX file (no CortEX fold)
+
+For domain-agnostic persistent logs — your own event schema, no fold,
+no typed adapter — open a `RedexFile` directly from a `Redex`. The
+tail iterator is the same `AsyncIterable` shape as the CortEX
+watches, so `for await` + `break` cleans up native resources.
+
+```typescript
+import { Redex, RedexError } from '@ai2070/net-sdk';
+
+const redex = new Redex({ persistentDir: '/var/lib/net/events' });
+const file = redex.openFile('analytics/clicks', {
+  persistent: true,
+  fsyncIntervalMs: 100,           // or fsyncEveryN: 1000n
+  retentionMaxEvents: 1_000_000n,
+});
+
+// Append (or batch-append).
+const seq = file.append(Buffer.from(JSON.stringify({ url: '/home' })));
+file.appendBatch(payloadBuffers);
+
+// Tail — backfills the retained range, then streams live appends.
+const stream = await file.tail(0n);
+try {
+  for await (const event of stream) {
+    const parsed = JSON.parse(event.payload.toString());
+    console.log(event.seq, parsed);
+    if (shouldStop) break;   // automatically closes the native iterator
+  }
+} catch (e) {
+  if (e instanceof RedexError) { /* ... */ }
+  throw e;
+}
+
+file.close();
+```
+
 ### Error classes
 
 CortEX-boundary errors are typed and catchable via `instanceof`:
 
 - `CortexError` — adapter errors (fold halted, RedEX I/O, decode failures).
 - `NetDbError` — snapshot/restore bundle errors, missing-model lookups.
+- `RedexError` — raw file errors (invalid channel name, bad config,
+  append / tail / sync / close failures).
 
-Both are re-exported from `@ai2070/net-sdk`; you don't need a separate
-import path.
+All three are re-exported from `@ai2070/net-sdk`; you don't need a
+separate import path.
 
 ## API
 
@@ -275,6 +314,11 @@ import path.
 | `adapter.snapshotAndWatch(filter?)` | `{ snapshot, updates }` — atomic paint+react |
 | `adapter.snapshot()` / `openFromSnapshot` | Model-level persistence |
 | `db.snapshot()` / `NetDb.openFromSnapshot` | Bundled multi-model persistence |
+| `redex.openFile(name, config?)` | Raw RedEX file — append-only log |
+| `file.append(buffer)` / `appendBatch(buffers)` | Append one / many payloads |
+| `file.readRange(start, end)` | Range read over retained entries |
+| `file.tail(fromSeq?)` | `AsyncIterable<RedexEvent>` |
+| `file.sync()` / `file.close()` | Explicit fsync / close |
 
 ## License
 

@@ -15,6 +15,7 @@ use pyo3::prelude::*;
 use tokio::runtime::Runtime;
 use tokio::sync::{Mutex as TokioMutex, Notify};
 
+use ::net::adapter::net::channel::ChannelName;
 use ::net::adapter::net::cortex::memories::{
     MemoriesAdapter as InnerMemoriesAdapter, Memory as InnerMemory, OrderBy as InnerMemoriesOrderBy,
 };
@@ -22,7 +23,11 @@ use ::net::adapter::net::cortex::tasks::{
     OrderBy as InnerTasksOrderBy, Task as InnerTask, TaskStatus as InnerTaskStatus,
     TasksAdapter as InnerTasksAdapter,
 };
-use ::net::adapter::net::redex::{Redex as InnerRedex, RedexFileConfig};
+use ::net::adapter::net::redex::{
+    FsyncPolicy as InnerFsyncPolicy, Redex as InnerRedex, RedexError as InnerRedexError,
+    RedexEvent as InnerRedexEvent, RedexFile as InnerRedexFile, RedexFileConfig,
+};
+use bytes::Bytes;
 
 pyo3::create_exception!(
     _net,
@@ -42,6 +47,16 @@ pyo3::create_exception!(
      enabled on this handle). Per-adapter operations raise \
      `CortexError`; this class is reserved for errors that span the \
      NetDB handle itself."
+);
+
+pyo3::create_exception!(
+    _net,
+    RedexError,
+    pyo3::exceptions::PyException,
+    "Raised when a raw RedEX file operation fails: append / tail / \
+     read / sync / close, invalid channel names, mutually-exclusive \
+     config options, or `persistent=True` without a `persistent_dir` \
+     on the owning `Redex`."
 );
 
 // =========================================================================
@@ -147,6 +162,290 @@ impl PyRedex {
             None => "Redex(local)".into(),
         }
     }
+
+    /// Open (or get) a raw RedEX file for domain-agnostic persistent
+    /// logging. Returns the same handle across repeat calls with the
+    /// same `name`; config is honored only on first open.
+    ///
+    /// Use this when you want an append-only event log without the
+    /// CortEX fold / typed-adapter layer. With `persistent=True`, this
+    /// `Redex` must have been constructed with a `persistent_dir`.
+    ///
+    /// `fsync_every_n` and `fsync_interval_ms` are mutually exclusive;
+    /// leave both unset for the default "never fsync on append"
+    /// policy (`close()` and explicit `sync()` still fsync).
+    #[pyo3(signature = (
+        name,
+        *,
+        persistent = false,
+        fsync_every_n = None,
+        fsync_interval_ms = None,
+        retention_max_events = None,
+        retention_max_bytes = None,
+        retention_max_age_ms = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn open_file(
+        &self,
+        name: &str,
+        persistent: bool,
+        fsync_every_n: Option<u64>,
+        fsync_interval_ms: Option<u64>,
+        retention_max_events: Option<u64>,
+        retention_max_bytes: Option<u64>,
+        retention_max_age_ms: Option<u64>,
+    ) -> PyResult<PyRedexFile> {
+        let channel = ChannelName::new(name).map_err(|e| RedexError::new_err(format!("{}", e)))?;
+        let mut cfg = RedexFileConfig::default();
+        cfg.persistent = persistent;
+        match (fsync_every_n, fsync_interval_ms) {
+            (Some(_), Some(_)) => {
+                return Err(RedexError::new_err(
+                    "fsync_every_n and fsync_interval_ms are mutually exclusive",
+                ));
+            }
+            (Some(0), _) => {
+                return Err(RedexError::new_err("fsync_every_n must be > 0"));
+            }
+            (Some(n), None) => {
+                cfg.fsync_policy = InnerFsyncPolicy::EveryN(n);
+            }
+            (None, Some(0)) => {
+                return Err(RedexError::new_err("fsync_interval_ms must be > 0"));
+            }
+            (None, Some(ms)) => {
+                cfg.fsync_policy = InnerFsyncPolicy::Interval(std::time::Duration::from_millis(ms));
+            }
+            (None, None) => {}
+        }
+        cfg.retention_max_events = retention_max_events;
+        cfg.retention_max_bytes = retention_max_bytes;
+        if let Some(ms) = retention_max_age_ms {
+            cfg.retention_max_age_ns = Some(ms.saturating_mul(1_000_000));
+        }
+        let file = self
+            .inner
+            .open_file(&channel, cfg)
+            .map_err(|e| RedexError::new_err(format!("open_file: {}", e)))?;
+        let runtime = make_runtime()?;
+        Ok(PyRedexFile {
+            inner: Arc::new(file),
+            runtime,
+        })
+    }
+}
+
+// =========================================================================
+// Raw RedEX file — domain-agnostic event log
+// =========================================================================
+
+/// A materialized RedEX event: `seq` + `payload` + checksum / inline
+/// flag. Clone is O(payload size).
+#[pyclass(name = "RedexEvent")]
+#[derive(Clone)]
+pub struct PyRedexEvent {
+    #[pyo3(get)]
+    pub seq: u64,
+    #[pyo3(get)]
+    pub payload: Vec<u8>,
+    /// Low-28-bit xxh3 truncation of the payload at append time.
+    #[pyo3(get)]
+    pub checksum: u32,
+    /// True if the payload was stored inline in the 20-byte entry.
+    #[pyo3(get)]
+    pub is_inline: bool,
+}
+
+impl From<InnerRedexEvent> for PyRedexEvent {
+    fn from(ev: InnerRedexEvent) -> Self {
+        PyRedexEvent {
+            seq: ev.entry.seq,
+            payload: ev.payload.to_vec(),
+            checksum: ev.entry.checksum(),
+            is_inline: ev.entry.is_inline(),
+        }
+    }
+}
+
+#[pymethods]
+impl PyRedexEvent {
+    fn __repr__(&self) -> String {
+        format!(
+            "RedexEvent(seq={}, payload=<{} bytes>, checksum={:#010x}, is_inline={})",
+            self.seq,
+            self.payload.len(),
+            self.checksum,
+            self.is_inline
+        )
+    }
+}
+
+/// Raw RedEX file handle. Cheap to share — methods take `&self`.
+#[pyclass(name = "RedexFile")]
+pub struct PyRedexFile {
+    inner: Arc<InnerRedexFile>,
+    runtime: Arc<Runtime>,
+}
+
+#[pymethods]
+impl PyRedexFile {
+    /// Append one payload. Returns the assigned sequence number.
+    fn append(&self, payload: &[u8]) -> PyResult<u64> {
+        self.inner
+            .append(payload)
+            .map_err(|e| RedexError::new_err(format!("append: {}", e)))
+    }
+
+    /// Append a batch atomically. Returns the seq of the FIRST event;
+    /// subsequent events are `first + 0, first + 1, ...`.
+    fn append_batch(&self, payloads: Vec<Vec<u8>>) -> PyResult<u64> {
+        let bytes: Vec<Bytes> = payloads.into_iter().map(Bytes::from).collect();
+        self.inner
+            .append_batch(&bytes)
+            .map_err(|e| RedexError::new_err(format!("append_batch: {}", e)))
+    }
+
+    /// Read the half-open range `[start, end)` from the in-memory
+    /// index. Only retained entries are returned; evicted seqs are
+    /// silently skipped.
+    fn read_range(&self, start: u64, end: u64) -> Vec<PyRedexEvent> {
+        self.inner
+            .read_range(start, end)
+            .into_iter()
+            .map(PyRedexEvent::from)
+            .collect()
+    }
+
+    /// Number of retained events (post-retention eviction).
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Open a live tail. Returns a sync Python iterator that yields
+    /// events with `seq >= from_seq` (default `0`) — backfills the
+    /// retained range atomically, then streams live appends. Stop
+    /// early with `iter.close()` or let the iterator run to
+    /// `StopIteration` when the file closes.
+    #[pyo3(signature = (from_seq = 0))]
+    fn tail(&self, from_seq: u64) -> PyRedexTailIter {
+        use futures::StreamExt;
+        let adapter = self.inner.clone();
+        let runtime = self.runtime.clone();
+        let stream = runtime.block_on(async move { adapter.tail(from_seq).boxed() });
+        PyRedexTailIter {
+            inner: Arc::new(RedexTailIterInner {
+                stream: TokioMutex::new(Some(stream)),
+                shutdown: Notify::new(),
+                is_shutdown: AtomicBool::new(false),
+            }),
+            runtime: self.runtime.clone(),
+        }
+    }
+
+    /// Explicit fsync. Always fsyncs regardless of configured policy;
+    /// no-op on heap-only files.
+    fn sync(&self) -> PyResult<()> {
+        self.inner
+            .sync()
+            .map_err(|e| RedexError::new_err(format!("sync: {}", e)))
+    }
+
+    /// Close the file. Outstanding tail iterators terminate on their
+    /// next `__next__` call with `StopIteration`.
+    fn close(&self) -> PyResult<()> {
+        self.inner
+            .close()
+            .map_err(|e| RedexError::new_err(format!("close: {}", e)))
+    }
+}
+
+struct RedexTailIterInner {
+    stream: TokioMutex<
+        Option<BoxStream<'static, std::result::Result<InnerRedexEvent, InnerRedexError>>>,
+    >,
+    shutdown: Notify,
+    is_shutdown: AtomicBool,
+}
+
+/// Sync Python iterator over a live `RedexFile.tail()`.
+#[pyclass(name = "RedexTailIter")]
+pub struct PyRedexTailIter {
+    inner: Arc<RedexTailIterInner>,
+    runtime: Arc<Runtime>,
+}
+
+#[pymethods]
+impl PyRedexTailIter {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<PyRedexEvent> {
+        let inner = self.inner.clone();
+        let runtime = self.runtime.clone();
+        let outcome = py.detach(move || {
+            runtime.block_on(async move {
+                if inner.is_shutdown.load(Ordering::Acquire) {
+                    return TailNext::End;
+                }
+                let mut guard = inner.stream.lock().await;
+                let stream = match guard.as_mut() {
+                    Some(s) => s,
+                    None => return TailNext::End,
+                };
+
+                let shutdown_fut = inner.shutdown.notified();
+                tokio::pin!(shutdown_fut);
+                shutdown_fut.as_mut().enable();
+
+                if inner.is_shutdown.load(Ordering::Acquire) {
+                    *guard = None;
+                    return TailNext::End;
+                }
+
+                tokio::select! {
+                    biased;
+                    _ = shutdown_fut => {
+                        *guard = None;
+                        TailNext::End
+                    }
+                    msg = stream.next() => match msg {
+                        Some(Ok(ev)) => TailNext::Event(ev),
+                        Some(Err(InnerRedexError::Closed)) => {
+                            *guard = None;
+                            TailNext::End
+                        }
+                        Some(Err(e)) => {
+                            *guard = None;
+                            TailNext::Error(format!("{}", e))
+                        }
+                        None => {
+                            *guard = None;
+                            TailNext::End
+                        }
+                    }
+                }
+            })
+        });
+        match outcome {
+            TailNext::Event(ev) => Ok(PyRedexEvent::from(ev)),
+            TailNext::Error(msg) => Err(RedexError::new_err(format!("tail: {}", msg))),
+            TailNext::End => Err(PyStopIteration::new_err(())),
+        }
+    }
+
+    /// Terminate the iterator. Idempotent; subsequent `__next__`
+    /// raises `StopIteration`.
+    fn close(&self) {
+        self.inner.is_shutdown.store(true, Ordering::Release);
+        self.inner.shutdown.notify_waiters();
+    }
+}
+
+enum TailNext {
+    Event(InnerRedexEvent),
+    Error(String),
+    End,
 }
 
 // =========================================================================
@@ -469,8 +768,7 @@ impl PyTasksAdapter {
         )?;
         let adapter = self.inner.clone();
         let runtime = self.runtime.clone();
-        let (snapshot, stream) =
-            runtime.block_on(async move { adapter.snapshot_and_watch(w) });
+        let (snapshot, stream) = runtime.block_on(async move { adapter.snapshot_and_watch(w) });
         Ok((
             snapshot.into_iter().map(PyTask::from).collect(),
             new_task_watch_iter(stream, self.runtime.clone()),
@@ -961,8 +1259,7 @@ impl PyMemoriesAdapter {
         )?;
         let adapter = self.inner.clone();
         let runtime = self.runtime.clone();
-        let (snapshot, stream) =
-            runtime.block_on(async move { adapter.snapshot_and_watch(w) });
+        let (snapshot, stream) = runtime.block_on(async move { adapter.snapshot_and_watch(w) });
         Ok((
             snapshot.into_iter().map(PyMemory::from).collect(),
             new_memory_watch_iter(stream, self.runtime.clone()),

@@ -1312,6 +1312,9 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "cortex")]
     {
         m.add_class::<cortex::PyRedex>()?;
+        m.add_class::<cortex::PyRedexFile>()?;
+        m.add_class::<cortex::PyRedexTailIter>()?;
+        m.add_class::<cortex::PyRedexEvent>()?;
         m.add_class::<cortex::PyTask>()?;
         m.add_class::<cortex::PyTasksAdapter>()?;
         m.add_class::<cortex::PyTaskWatchIter>()?;
@@ -1321,6 +1324,7 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<cortex::PyNetDb>()?;
         m.add("CortexError", m.py().get_type::<cortex::CortexError>())?;
         m.add("NetDbError", m.py().get_type::<cortex::NetDbError>())?;
+        m.add("RedexError", m.py().get_type::<cortex::RedexError>())?;
     }
     Ok(())
 }

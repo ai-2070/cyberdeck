@@ -340,6 +340,76 @@ export declare class Redex {
    * and replay from those files on reopen. Heap-only when omitted.
    */
   constructor(persistentDir?: string | undefined | null)
+  /**
+   * Open (or get) a raw RedEX file bound to `channelName`. Returns
+   * a handle for append / tail / read operations without going
+   * through the CortEX adapter layer.
+   *
+   * Re-opening an existing name returns the live handle; the
+   * `config` argument is honored only on first open.
+   *
+   * With `config.persistent = true`, this manager must have been
+   * constructed with a `persistentDir`. Otherwise the call fails
+   * with a `redex:` error.
+   */
+  openFile(channelName: string, config?: RedexFileConfigJs | undefined | null): RedexFile
+}
+
+/**
+ * Raw RedEX file handle. Append / tail / read without the CortEX
+ * adapter layer. Cheap to clone (internal `Arc`).
+ */
+export declare class RedexFile {
+  /** Append one payload. Returns the assigned sequence number. */
+  append(payload: Buffer): bigint
+  /**
+   * Append a batch of payloads atomically. Returns the sequence
+   * number of the FIRST appended event; callers deduce subsequent
+   * seqs as `first + 0, first + 1, ...`.
+   */
+  appendBatch(payloads: Array<Buffer>): bigint
+  /**
+   * Read the half-open range `[start, end)` from the in-memory
+   * index. Returns only entries still retained — any seq in the
+   * range that has been evicted is silently skipped.
+   */
+  readRange(start: bigint, end: bigint): Array<RedexEventJs>
+  /** Number of retained events (post-retention eviction). */
+  len(): number
+  /**
+   * Open a live tail over this file. The iterator yields every
+   * event with `seq >= fromSeq` (default `0`), atomically
+   * backfilling the existing retained range and then streaming
+   * subsequent appends. Terminate early with `.close()` or by
+   * breaking out of `for await` — breaking triggers `return()`,
+   * which the SDK wrapper routes to `close()`.
+   *
+   * Declared `async` so the underlying `UnboundedReceiverStream`
+   * lives inside the napi tokio runtime.
+   */
+  tail(fromSeq?: bigint | undefined | null): Promise<RedexTailIter>
+  /**
+   * Explicit fsync. Always fsyncs regardless of configured
+   * `fsyncPolicy`. No-op on heap-only files.
+   */
+  sync(): void
+  /**
+   * Close the file. Outstanding tail iterators resolve with a
+   * `redex:` error on their next `.next()` call.
+   */
+  close(): void
+}
+
+/** Async iterator over a live `RedexFile::tail`. */
+export declare class RedexTailIter {
+  /**
+   * Wait for the next event. Returns `null` when the iterator has
+   * been closed or the underlying file was closed. Throws a
+   * `redex:` error if the backing stream yielded an error item.
+   */
+  next(): Promise<RedexEventJs | null>
+  /** Terminate the iterator. Idempotent. */
+  close(): void
 }
 
 /** Typed tasks adapter handle. */
@@ -704,6 +774,57 @@ export interface PollResponse {
   nextId?: string
   /** Whether there are more events available */
   hasMore: boolean
+}
+
+/** A materialized RedEX event: `seq` + `payload`. */
+export interface RedexEventJs {
+  seq: bigint
+  payload: Buffer
+  /**
+   * Low-28-bit xxh3 truncation of the payload, stamped at append
+   * time. Use to detect storage corruption.
+   */
+  checksum: number
+  /**
+   * True if the 8-byte payload was stored inline in the entry
+   * record rather than in the payload segment.
+   */
+  isInline: boolean
+}
+
+/**
+ * Configuration for [`Redex::open_file`]. Mirrors the core
+ * `RedexFileConfig` but flattens `FsyncPolicy` into two mutually
+ * exclusive optional fields. Leave both unset for the default
+ * `Never` policy.
+ */
+export interface RedexFileConfigJs {
+  /**
+   * Disk-backed storage. Requires `Redex` to have been constructed
+   * with `persistentDir`. Default: `false` (heap only).
+   */
+  persistent?: boolean
+  /**
+   * Fsync after every N appends (`1` fsyncs on every append).
+   * Mutually exclusive with `fsync_interval_ms`. Ignored unless
+   * `persistent: true`. `0` is rejected.
+   */
+  fsyncEveryN?: bigint
+  /**
+   * Fsync on a timer (milliseconds). Mutually exclusive with
+   * `fsync_every_n`. Ignored unless `persistent: true`. `0` is
+   * rejected.
+   */
+  fsyncIntervalMs?: number
+  /** Retain at most N events. */
+  retentionMaxEvents?: bigint
+  /** Retain at most N bytes of payload. */
+  retentionMaxBytes?: bigint
+  /**
+   * Drop entries older than this many milliseconds at the next
+   * retention sweep.
+   */
+  retentionMaxAgeMs?: bigint
 }
 
 /** Redis adapter configuration. */

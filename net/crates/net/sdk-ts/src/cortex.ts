@@ -40,6 +40,8 @@ import {
   MemoriesSnapshotAndWatch as NapiMemoriesSnapshotAndWatch,
   TaskWatchIter as NapiTaskWatchIter,
   MemoryWatchIter as NapiMemoryWatchIter,
+  RedexFile as NapiRedexFile,
+  RedexTailIter as NapiRedexTailIter,
   TaskStatus,
   TasksOrderBy,
   MemoriesOrderBy,
@@ -53,6 +55,8 @@ import type {
   NetDbOpenConfig,
   NetDbBundle,
   CortexSnapshot,
+  RedexEventJs,
+  RedexFileConfigJs,
 } from '@ai2070/net';
 
 // Re-export the NAPI value types so callers get them from one place.
@@ -80,6 +84,29 @@ export type {
 export { CortexError, NetDbError } from '@ai2070/net/errors';
 import { classifyError } from '@ai2070/net/errors';
 
+/**
+ * Raised on `redex:` prefixed failures: append / tail / read / sync /
+ * close, invalid channel names, mutually-exclusive config options.
+ * Extends `Error`; catch with `instanceof RedexError`.
+ */
+export class RedexError extends Error {
+  constructor(detail?: string) {
+    super(detail ?? 'redex error');
+    this.name = 'RedexError';
+    Object.setPrototypeOf(this, RedexError.prototype);
+  }
+}
+
+/** Classify a napi-thrown error. Mirrors `@ai2070/net/errors` for the
+ *  `redex:` prefix which that package does not yet recognize. */
+function classifyWithRedex(e: unknown): unknown {
+  const classified = classifyError(e);
+  if (classified !== e) return classified; // cortex: / netdb: already handled
+  const msg = (e as Error | undefined)?.message ?? '';
+  if (msg.startsWith('redex:')) return new RedexError(msg);
+  return e;
+}
+
 // ---------------------------------------------------------------------------
 // Redex manager
 // ---------------------------------------------------------------------------
@@ -104,6 +131,173 @@ export class Redex {
 
   constructor(opts?: RedexOptions) {
     this.napi = new NapiRedex(opts?.persistentDir);
+  }
+
+  /**
+   * Open (or get) a raw RedEX file for domain-agnostic persistent
+   * logging. Returns the same handle across repeat calls with the
+   * same `name`; `config` is honored only on first open.
+   *
+   * Use this when you want an append-only event log without the
+   * CortEX fold / typed-adapter layer. Appends, tailing, and range
+   * reads work directly over the file.
+   *
+   * With `config.persistent = true`, this manager must have been
+   * constructed with a `persistentDir`.
+   */
+  openFile(name: string, config?: RedexFileConfig): RedexFile {
+    try {
+      const napiCfg = toNapiFileConfig(config);
+      return new RedexFile(this.napi.openFile(name, napiCfg ?? null));
+    } catch (e) {
+      throw classifyWithRedex(e);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Raw RedEX file — domain-agnostic event log
+// ---------------------------------------------------------------------------
+
+/** Configuration for {@link Redex.openFile}. Mirrors the core
+ *  `RedexFileConfig` field-for-field; the two fsync options are
+ *  mutually exclusive (leave both unset for the default
+ *  `FsyncPolicy::Never`). */
+export interface RedexFileConfig {
+  /** Disk-backed storage. Requires `Redex` to have been constructed
+   *  with `persistentDir`. Default: `false` (heap only). */
+  persistent?: boolean;
+  /** Fsync after every N appends (`1` fsyncs on every append).
+   *  Mutually exclusive with `fsyncIntervalMs`. Ignored unless
+   *  `persistent: true`. */
+  fsyncEveryN?: bigint;
+  /** Fsync on a timer (milliseconds). Mutually exclusive with
+   *  `fsyncEveryN`. Ignored unless `persistent: true`. */
+  fsyncIntervalMs?: number;
+  /** Retain at most N events. */
+  retentionMaxEvents?: bigint;
+  /** Retain at most N bytes of payload. */
+  retentionMaxBytes?: bigint;
+  /** Drop entries older than this many milliseconds at the next
+   *  retention sweep. */
+  retentionMaxAgeMs?: bigint;
+}
+
+function toNapiFileConfig(
+  c: RedexFileConfig | undefined,
+): RedexFileConfigJs | undefined {
+  if (!c) return undefined;
+  return {
+    persistent: c.persistent,
+    fsyncEveryN: c.fsyncEveryN,
+    fsyncIntervalMs: c.fsyncIntervalMs,
+    retentionMaxEvents: c.retentionMaxEvents,
+    retentionMaxBytes: c.retentionMaxBytes,
+    retentionMaxAgeMs: c.retentionMaxAgeMs,
+  };
+}
+
+/** A materialized RedEX event. */
+export interface RedexEvent {
+  seq: bigint;
+  payload: Buffer;
+  /** Low-28-bit xxh3 truncation stamped at append time. */
+  checksum: number;
+  /** True if stored inline in the 20-byte entry record. */
+  isInline: boolean;
+}
+
+function toRedexEvent(raw: RedexEventJs): RedexEvent {
+  return {
+    seq: raw.seq as bigint,
+    payload: raw.payload,
+    checksum: raw.checksum,
+    isInline: raw.isInline,
+  };
+}
+
+/** Raw RedEX file handle. Append, tail, range-read without the
+ *  CortEX adapter layer. */
+export class RedexFile {
+  /** @internal */
+  readonly napi: NapiRedexFile;
+
+  constructor(inner: NapiRedexFile) {
+    this.napi = inner;
+  }
+
+  /** Append one payload. Returns the assigned sequence number. */
+  append(payload: Buffer): bigint {
+    try {
+      return this.napi.append(payload);
+    } catch (e) {
+      throw classifyWithRedex(e);
+    }
+  }
+
+  /** Append a batch atomically. Returns the seq of the first event;
+   *  subsequent events are `first + 0, first + 1, ...`. */
+  appendBatch(payloads: Buffer[]): bigint {
+    try {
+      return this.napi.appendBatch(payloads);
+    } catch (e) {
+      throw classifyWithRedex(e);
+    }
+  }
+
+  /** Read the half-open range `[start, end)` from the in-memory
+   *  index. Only retained entries are returned. */
+  readRange(start: bigint, end: bigint): RedexEvent[] {
+    try {
+      return this.napi.readRange(start, end).map(toRedexEvent);
+    } catch (e) {
+      throw classifyWithRedex(e);
+    }
+  }
+
+  /** Number of retained events (post-retention eviction). */
+  len(): number {
+    return this.napi.len();
+  }
+
+  /** Open a live tail. Yields every event with `seq >= fromSeq`
+   *  (default `0n`) — atomically backfills the retained range and
+   *  then streams appends. Breaking out of `for await` releases the
+   *  native iterator via `return()`. */
+  async tail(fromSeq?: bigint): Promise<AsyncIterable<RedexEvent>> {
+    try {
+      const iter: NapiRedexTailIter = await this.napi.tail(fromSeq ?? null);
+      const raw: RawWatchIter<RedexEvent> = {
+        async next() {
+          const v = await iter.next();
+          return v === null ? null : toRedexEvent(v);
+        },
+        close: () => iter.close(),
+      };
+      return wrapWatchIter(raw);
+    } catch (e) {
+      throw classifyWithRedex(e);
+    }
+  }
+
+  /** Explicit fsync. Always fsyncs regardless of policy; no-op on
+   *  heap-only files. */
+  sync(): void {
+    try {
+      this.napi.sync();
+    } catch (e) {
+      throw classifyWithRedex(e);
+    }
+  }
+
+  /** Close the file. Outstanding tail iterators end cleanly on
+   *  their next emission. */
+  close(): void {
+    try {
+      this.napi.close();
+    } catch (e) {
+      throw classifyWithRedex(e);
+    }
   }
 }
 

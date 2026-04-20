@@ -48,6 +48,7 @@ export type {
 // CortEX + NetDb (event-sourced state with reactive watches).
 export {
   Redex,
+  RedexFile,
   NetDb,
   TasksAdapter,
   MemoriesAdapter,
@@ -56,9 +57,12 @@ export {
   MemoriesOrderBy,
   CortexError,
   NetDbError,
+  RedexError,
 } from './cortex';
 export type {
   RedexOptions,
+  RedexFileConfig,
+  RedexEvent,
   SnapshotAndWatch,
   Task,
   Memory,

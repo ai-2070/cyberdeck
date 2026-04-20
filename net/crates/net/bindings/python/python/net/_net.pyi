@@ -254,6 +254,77 @@ class Redex:
     replay them on reopen.
     """
     def __init__(self, persistent_dir: Optional[str] = None) -> None: ...
+    def open_file(
+        self,
+        name: str,
+        *,
+        persistent: bool = False,
+        fsync_every_n: Optional[int] = None,
+        fsync_interval_ms: Optional[int] = None,
+        retention_max_events: Optional[int] = None,
+        retention_max_bytes: Optional[int] = None,
+        retention_max_age_ms: Optional[int] = None,
+    ) -> "RedexFile":
+        """Open (or get) a raw RedEX file for domain-agnostic persistent
+        logging. Bypasses the CortEX fold layer — use when you want an
+        append-only log and will handle your own event model.
+
+        `fsync_every_n` and `fsync_interval_ms` are mutually exclusive.
+        With neither set, close / explicit sync are the only disk
+        barriers (`FsyncPolicy::Never`).
+
+        `persistent=True` requires this Redex to have been constructed
+        with a `persistent_dir`; otherwise raises `RedexError`.
+        """
+        ...
+
+class RedexEvent:
+    """A materialized RedEX event: `seq` + `payload` + checksum /
+    inline flag. Yielded by `RedexFile.read_range` / `RedexTailIter`."""
+    seq: int
+    payload: bytes
+    checksum: int
+    is_inline: bool
+
+class RedexFile:
+    """Raw RedEX file handle.
+
+    Append / tail / read without the CortEX adapter layer. Safe to
+    share; all methods take `&self`. Dropping the last reference does
+    NOT close the file — call `close()` explicitly.
+    """
+    def append(self, payload: bytes) -> int:
+        """Append one payload; returns the assigned sequence number."""
+        ...
+    def append_batch(self, payloads: list[bytes]) -> int:
+        """Append a batch atomically; returns the seq of the FIRST event.
+        Subsequent events are `first + 0, first + 1, ...`.
+        """
+        ...
+    def read_range(self, start: int, end: int) -> list[RedexEvent]:
+        """Read the half-open range `[start, end)` from the in-memory
+        index. Only retained entries are returned — evicted seqs are
+        silently skipped."""
+        ...
+    def __len__(self) -> int: ...
+    def tail(self, from_seq: int = 0) -> "RedexTailIter":
+        """Live tail iterator. Backfills `seq >= from_seq` atomically
+        and then streams subsequent appends. Stop early with
+        `iter.close()`; `StopIteration` fires when the file closes."""
+        ...
+    def sync(self) -> None:
+        """Explicit fsync. Always fsyncs regardless of policy; no-op
+        on heap-only files."""
+        ...
+    def close(self) -> None:
+        """Close the file. Outstanding tail iterators stop on their
+        next `__next__` call."""
+        ...
+
+class RedexTailIter(Iterator[RedexEvent]):
+    def __iter__(self) -> "RedexTailIter": ...
+    def __next__(self) -> RedexEvent: ...
+    def close(self) -> None: ...
 
 class Task:
     """A materialized task record."""
@@ -482,6 +553,11 @@ class NetDbError(Exception):
     """Raised by NetDB handle-level operations: snapshot encode /
     decode, missing-model accesses. Per-adapter failures inside a
     NetDB still surface as `CortexError`."""
+
+class RedexError(Exception):
+    """Raised by raw RedEX file operations: append / tail / read /
+    sync / close, invalid channel names, mutually-exclusive config
+    options, or `persistent=True` without a `persistent_dir`."""
 
 # =========================================================================
 # Mesh transport + per-peer streams (`net` feature)
