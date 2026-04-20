@@ -20,20 +20,27 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 [features]
 default = []
+# External transports (opt-in, network I/O).
 redis = ["net/redis"]
 jetstream = ["net/jetstream"]
+# Core mesh transport (encrypted UDP + subprotocols).
 net = ["net/net"]
 # CortEX adds the typed event-sourced adapters (tasks + memories) plus
 # the NetDb facade. `redex-disk` comes along so `.persistent(true)` is
 # usable from the SDK without a separate feature flip.
 cortex = ["net/netdb", "net/redex-disk"]
 # Security surface — identity (keypairs + tokens), capability
-# declarations, and subnet assignment. All three sit on top of the
-# `net` feature because the underlying types live in `adapter::net`;
-# there's no finer-grained gate to reach for.
-identity = ["net/net"]
-capabilities = ["net/net"]
-subnets = ["net/net"]
+# declarations, and subnet assignment. Each depends on the SDK's own
+# `net` feature so a change to what `net` enables propagates
+# automatically; the underlying core types live in `adapter::net`.
+identity = ["net"]
+capabilities = ["net"]
+subnets = ["net"]
 # Common-case bundle: enable the whole security surface at once.
 security = ["identity", "capabilities", "subnets"]
-full = ["redis", "jetstream", "net", "cortex", "security"]
+# Everything that runs locally (mesh + storage/state + security, no
+# external transports). The default shape for a single-node or
+# LAN-only deployment.
+local = ["net", "cortex", "security"]
+# Everything — local stack plus external transports.
+full = ["local", "redis", "jetstream"]

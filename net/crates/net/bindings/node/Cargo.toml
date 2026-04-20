@@ -14,6 +14,10 @@ redis = ["net/redis"]
 jetstream = ["net/jetstream"]
 net = ["net/net", "dep:hex"]
 cortex = ["net/netdb", "net/redex-disk"]
+# Identity surface — ed25519 keypair + permission tokens. The
+# underlying types live in `adapter::net::identity`, gated by the
+# core's `net` feature, so this feature depends on ours.
+identity = ["net"]
 
 [dependencies]
 net = { path = "../..", default-features = false }

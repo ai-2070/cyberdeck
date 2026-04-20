@@ -576,6 +576,7 @@ if (!nativeBinding) {
 }
 
 module.exports = nativeBinding
+module.exports.Identity = nativeBinding.Identity
 module.exports.MemoriesAdapter = nativeBinding.MemoriesAdapter
 module.exports.MemoriesSnapshotAndWatch = nativeBinding.MemoriesSnapshotAndWatch
 module.exports.MemoryWatchIter = nativeBinding.MemoryWatchIter
@@ -589,7 +590,12 @@ module.exports.RedexTailIter = nativeBinding.RedexTailIter
 module.exports.TasksAdapter = nativeBinding.TasksAdapter
 module.exports.TasksSnapshotAndWatch = nativeBinding.TasksSnapshotAndWatch
 module.exports.TaskWatchIter = nativeBinding.TaskWatchIter
+module.exports.channelHash = nativeBinding.channelHash
+module.exports.delegateToken = nativeBinding.delegateToken
 module.exports.generateNetKeypair = nativeBinding.generateNetKeypair
 module.exports.MemoriesOrderBy = nativeBinding.MemoriesOrderBy
+module.exports.parseToken = nativeBinding.parseToken
 module.exports.TasksOrderBy = nativeBinding.TasksOrderBy
 module.exports.TaskStatus = nativeBinding.TaskStatus
+module.exports.tokenIsExpired = nativeBinding.tokenIsExpired
+module.exports.verifyToken = nativeBinding.verifyToken

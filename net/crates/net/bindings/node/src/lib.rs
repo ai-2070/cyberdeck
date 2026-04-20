@@ -5,6 +5,8 @@
 mod common;
 #[cfg(feature = "cortex")]
 mod cortex;
+#[cfg(feature = "identity")]
+mod identity;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -1093,16 +1095,16 @@ mod mesh_bindings {
                 // Classify rejection reasons for typed SDK errors.
                 let reason = tail.trim();
                 if reason == "Some(Unauthorized)" {
-                    return Error::from_reason(format!("channel: unauthorized"));
+                    return Error::from_reason("channel: unauthorized".to_string());
                 }
                 if reason == "Some(UnknownChannel)" {
-                    return Error::from_reason(format!("channel: unknown channel"));
+                    return Error::from_reason("channel: unknown channel".to_string());
                 }
                 if reason == "Some(RateLimited)" {
-                    return Error::from_reason(format!("channel: rate limited"));
+                    return Error::from_reason("channel: rate limited".to_string());
                 }
                 if reason == "Some(TooManyChannels)" {
-                    return Error::from_reason(format!("channel: too many channels"));
+                    return Error::from_reason("channel: too many channels".to_string());
                 }
                 return Error::from_reason(format!("channel: rejected ({})", reason));
             }

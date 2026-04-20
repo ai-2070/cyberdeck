@@ -84,6 +84,17 @@ export type {
   CortexSnapshot,
 } from './cortex';
 
+// Identity + tokens (security surface).
+export {
+  Identity,
+  Token,
+  IdentityError,
+  TokenError,
+  channelHash,
+  delegateToken,
+} from './identity';
+export type { TokenScope, TokenErrorKind, IssueTokenOptions } from './identity';
+
 // Types.
 export type {
   NetNodeConfig,
