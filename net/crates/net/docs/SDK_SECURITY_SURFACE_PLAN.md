@@ -83,7 +83,7 @@ subnets = ["net/net"]        # same
 security = ["identity", "capabilities", "subnets"]
 ```
 
-Everything requires the mesh feature because the underlying types live in `adapter::net::identity` / `::behavior::capability` / `::subnet`. Bundle all three under `security` for the common case.
+Everything pulls in the existing `net` feature (`net-sdk`'s gate for the core's `net` feature — which enables the mesh transport). The underlying types live in `adapter::net::identity` / `::behavior::capability` / `::subnet`, so there's no finer-grained gate to reach for. Bundle all three SDK features under `security` for the common case.
 
 ### Surface — new `sdk/src/identity.rs`
 
