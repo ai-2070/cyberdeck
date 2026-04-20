@@ -309,6 +309,29 @@ class TasksAdapter:
         order_by: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> "TaskWatchIter": ...
+    def snapshot_and_watch_tasks(
+        self,
+        *,
+        status: Optional[str] = None,
+        title_contains: Optional[str] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> tuple[List[Task], "TaskWatchIter"]:
+        """
+        Atomic "paint + react" primitive. Returns `(snapshot, iter)` in
+        one call; the iterator drops only leading emissions equal to
+        `snapshot`, so a mutation racing construction is forwarded
+        through instead of being silently dropped.
+
+        Prefer this to calling `list_tasks` + `watch_tasks` separately
+        — those race each other and a mutation landing between them
+        would be lost.
+        """
+        ...
 
 class TaskWatchIter(Iterator[List[Task]]):
     def __iter__(self) -> "TaskWatchIter": ...
@@ -387,6 +410,24 @@ class MemoriesAdapter:
         order_by: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> "MemoryWatchIter": ...
+    def snapshot_and_watch_memories(
+        self,
+        *,
+        source: Optional[str] = None,
+        content_contains: Optional[str] = None,
+        tag: Optional[str] = None,
+        any_tag: Optional[List[str]] = None,
+        all_tags: Optional[List[str]] = None,
+        pinned: Optional[bool] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> tuple[List[Memory], "MemoryWatchIter"]:
+        """Atomic snapshot + watch. See `TasksAdapter.snapshot_and_watch_tasks`."""
+        ...
 
 class MemoryWatchIter(Iterator[List[Memory]]):
     def __iter__(self) -> "MemoryWatchIter": ...
@@ -441,3 +482,76 @@ class NetDbError(Exception):
     """Raised by NetDB handle-level operations: snapshot encode /
     decode, missing-model accesses. Per-adapter failures inside a
     NetDB still surface as `CortexError`."""
+
+# =========================================================================
+# Mesh transport + per-peer streams (`net` feature)
+# =========================================================================
+
+class NetKeypair:
+    """Hex-encoded ed25519 keypair for encrypted UDP transport.
+
+    Treat `secret_key` as secret material — persist via your own
+    envelope encryption / secret manager.
+    """
+
+    public_key: str
+    secret_key: str
+
+def generate_net_keypair() -> NetKeypair:
+    """Generate a fresh ed25519 keypair for encrypted UDP transport."""
+    ...
+
+class NetStream:
+    """Opaque handle to an open mesh stream between this node and a peer."""
+
+    @property
+    def peer_node_id(self) -> int: ...
+    @property
+    def stream_id(self) -> int: ...
+
+class NetStreamStats:
+    """Snapshot of per-stream stats.
+
+    `backpressure_events` is the cumulative count of rejections since
+    the stream opened; `tx_credit_remaining` dipping to 0 means the
+    next send will raise `BackpressureError`.
+    """
+
+    tx_seq: int
+    rx_seq: int
+    inbound_pending: int
+    last_activity_ns: int
+    active: bool
+    backpressure_events: int
+    tx_credit_remaining: int
+    tx_window: int
+    credit_grants_received: int
+    credit_grants_sent: int
+
+class NetMesh:
+    """Multi-peer encrypted mesh handle.
+
+    Manages connections to multiple peers over one UDP socket with
+    automatic failure detection and rerouting. Open per-peer streams
+    via `open_stream(...)`; send with `send_on_stream`, react to
+    `BackpressureError` / `NotConnectedError` at the app layer.
+
+    Canonical three send policies:
+
+    * Drop on pressure — catch `BackpressureError`, record the drop.
+    * Retry with backoff — `send_with_retry(stream, payloads, retries=8)`.
+    * Block until clear — `send_blocking(stream, payloads)`.
+    """
+
+    # Constructor + lifecycle — the mesh surface has many methods; the
+    # shapes below cover the common path. Full reference in the README.
+
+    def __repr__(self) -> str: ...
+
+class BackpressureError(Exception):
+    """Raised when a stream's in-flight window is full. The event was
+    NOT sent — the caller decides drop / retry / buffer."""
+
+class NotConnectedError(Exception):
+    """Raised when a stream's peer session is gone (disconnected,
+    never connected, or the stream was closed)."""

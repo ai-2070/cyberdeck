@@ -401,44 +401,134 @@ impl PyTasksAdapter {
         order_by: Option<&str>,
         limit: Option<u32>,
     ) -> PyResult<PyTaskWatchIter> {
-        let mut w = self.inner.watch();
-        if let Some(s) = status {
-            w = w.where_status(parse_task_status(s)?);
-        }
-        if let Some(s) = title_contains {
-            w = w.title_contains(s);
-        }
-        if let Some(ns) = created_after_ns {
-            w = w.created_after(ns);
-        }
-        if let Some(ns) = created_before_ns {
-            w = w.created_before(ns);
-        }
-        if let Some(ns) = updated_after_ns {
-            w = w.updated_after(ns);
-        }
-        if let Some(ns) = updated_before_ns {
-            w = w.updated_before(ns);
-        }
-        if let Some(o) = order_by {
-            w = w.order_by(parse_tasks_order_by(o)?);
-        }
-        if let Some(l) = limit {
-            w = w.limit(l as usize);
-        }
+        let w = build_task_watcher(
+            &self.inner,
+            status,
+            title_contains,
+            created_after_ns,
+            created_before_ns,
+            updated_after_ns,
+            updated_before_ns,
+            order_by,
+            limit,
+        )?;
         // `stream()` requires an active tokio runtime (it spawns a
         // forwarding task); run via block_on to install the context.
         let runtime = self.runtime.clone();
         let stream: BoxStream<'static, Vec<InnerTask>> =
             runtime.block_on(async move { w.stream().boxed() });
-        Ok(PyTaskWatchIter {
-            inner: Arc::new(TaskWatchIterInner {
-                stream: TokioMutex::new(Some(stream)),
-                shutdown: Notify::new(),
-                is_shutdown: AtomicBool::new(false),
-            }),
-            runtime: self.runtime.clone(),
-        })
+        Ok(new_task_watch_iter(stream, self.runtime.clone()))
+    }
+
+    /// Atomic "paint what's here now, then react to changes" primitive.
+    /// Returns `(snapshot, iter)` in one call; the iterator drops only
+    /// leading emissions equal to `snapshot`, so a mutation racing
+    /// construction is forwarded through instead of being silently
+    /// dropped. Prefer this to `list_tasks` + `watch_tasks` called
+    /// separately — those race each other.
+    ///
+    /// Python usage:
+    ///
+    ///     snap, it = adapter.snapshot_and_watch_tasks(status='pending')
+    ///     render(snap)
+    ///     for batch in it:
+    ///         render(batch)
+    #[pyo3(signature = (
+        *,
+        status=None,
+        title_contains=None,
+        created_after_ns=None,
+        created_before_ns=None,
+        updated_after_ns=None,
+        updated_before_ns=None,
+        order_by=None,
+        limit=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn snapshot_and_watch_tasks(
+        &self,
+        status: Option<&str>,
+        title_contains: Option<String>,
+        created_after_ns: Option<u64>,
+        created_before_ns: Option<u64>,
+        updated_after_ns: Option<u64>,
+        updated_before_ns: Option<u64>,
+        order_by: Option<&str>,
+        limit: Option<u32>,
+    ) -> PyResult<(Vec<PyTask>, PyTaskWatchIter)> {
+        let w = build_task_watcher(
+            &self.inner,
+            status,
+            title_contains,
+            created_after_ns,
+            created_before_ns,
+            updated_after_ns,
+            updated_before_ns,
+            order_by,
+            limit,
+        )?;
+        let adapter = self.inner.clone();
+        let runtime = self.runtime.clone();
+        let (snapshot, stream) =
+            runtime.block_on(async move { adapter.snapshot_and_watch(w) });
+        Ok((
+            snapshot.into_iter().map(PyTask::from).collect(),
+            new_task_watch_iter(stream, self.runtime.clone()),
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_task_watcher(
+    adapter: &InnerTasksAdapter,
+    status: Option<&str>,
+    title_contains: Option<String>,
+    created_after_ns: Option<u64>,
+    created_before_ns: Option<u64>,
+    updated_after_ns: Option<u64>,
+    updated_before_ns: Option<u64>,
+    order_by: Option<&str>,
+    limit: Option<u32>,
+) -> PyResult<::net::adapter::net::cortex::tasks::TasksWatcher> {
+    let mut w = adapter.watch();
+    if let Some(s) = status {
+        w = w.where_status(parse_task_status(s)?);
+    }
+    if let Some(s) = title_contains {
+        w = w.title_contains(s);
+    }
+    if let Some(ns) = created_after_ns {
+        w = w.created_after(ns);
+    }
+    if let Some(ns) = created_before_ns {
+        w = w.created_before(ns);
+    }
+    if let Some(ns) = updated_after_ns {
+        w = w.updated_after(ns);
+    }
+    if let Some(ns) = updated_before_ns {
+        w = w.updated_before(ns);
+    }
+    if let Some(o) = order_by {
+        w = w.order_by(parse_tasks_order_by(o)?);
+    }
+    if let Some(l) = limit {
+        w = w.limit(l as usize);
+    }
+    Ok(w)
+}
+
+fn new_task_watch_iter(
+    stream: BoxStream<'static, Vec<InnerTask>>,
+    runtime: Arc<Runtime>,
+) -> PyTaskWatchIter {
+    PyTaskWatchIter {
+        inner: Arc::new(TaskWatchIterInner {
+            stream: TokioMutex::new(Some(stream)),
+            shutdown: Notify::new(),
+            is_shutdown: AtomicBool::new(false),
+        }),
+        runtime,
     }
 }
 
@@ -800,54 +890,153 @@ impl PyMemoriesAdapter {
         order_by: Option<&str>,
         limit: Option<u32>,
     ) -> PyResult<PyMemoryWatchIter> {
-        let mut w = self.inner.watch();
-        if let Some(s) = source {
-            w = w.where_source(s);
-        }
-        if let Some(s) = content_contains {
-            w = w.content_contains(s);
-        }
-        if let Some(t) = tag {
-            w = w.where_tag(t);
-        }
-        if let Some(tags) = any_tag {
-            w = w.where_any_tag(tags);
-        }
-        if let Some(tags) = all_tags {
-            w = w.where_all_tags(tags);
-        }
-        if let Some(p) = pinned {
-            w = w.where_pinned(p);
-        }
-        if let Some(ns) = created_after_ns {
-            w = w.created_after(ns);
-        }
-        if let Some(ns) = created_before_ns {
-            w = w.created_before(ns);
-        }
-        if let Some(ns) = updated_after_ns {
-            w = w.updated_after(ns);
-        }
-        if let Some(ns) = updated_before_ns {
-            w = w.updated_before(ns);
-        }
-        if let Some(o) = order_by {
-            w = w.order_by(parse_memories_order_by(o)?);
-        }
-        if let Some(l) = limit {
-            w = w.limit(l as usize);
-        }
+        let w = build_memory_watcher(
+            &self.inner,
+            source,
+            content_contains,
+            tag,
+            any_tag,
+            all_tags,
+            pinned,
+            created_after_ns,
+            created_before_ns,
+            updated_after_ns,
+            updated_before_ns,
+            order_by,
+            limit,
+        )?;
         let runtime = self.runtime.clone();
         let stream: BoxStream<'static, Vec<InnerMemory>> =
             runtime.block_on(async move { w.stream().boxed() });
-        Ok(PyMemoryWatchIter {
-            inner: Arc::new(MemoryWatchIterInner {
-                stream: TokioMutex::new(Some(stream)),
-                shutdown: Notify::new(),
-                is_shutdown: AtomicBool::new(false),
-            }),
-            runtime: self.runtime.clone(),
-        })
+        Ok(new_memory_watch_iter(stream, self.runtime.clone()))
+    }
+
+    /// Atomic snapshot + watch. Mirrors
+    /// `TasksAdapter.snapshot_and_watch_tasks`.
+    #[pyo3(signature = (
+        *,
+        source=None,
+        content_contains=None,
+        tag=None,
+        any_tag=None,
+        all_tags=None,
+        pinned=None,
+        created_after_ns=None,
+        created_before_ns=None,
+        updated_after_ns=None,
+        updated_before_ns=None,
+        order_by=None,
+        limit=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn snapshot_and_watch_memories(
+        &self,
+        source: Option<String>,
+        content_contains: Option<String>,
+        tag: Option<String>,
+        any_tag: Option<Vec<String>>,
+        all_tags: Option<Vec<String>>,
+        pinned: Option<bool>,
+        created_after_ns: Option<u64>,
+        created_before_ns: Option<u64>,
+        updated_after_ns: Option<u64>,
+        updated_before_ns: Option<u64>,
+        order_by: Option<&str>,
+        limit: Option<u32>,
+    ) -> PyResult<(Vec<PyMemory>, PyMemoryWatchIter)> {
+        let w = build_memory_watcher(
+            &self.inner,
+            source,
+            content_contains,
+            tag,
+            any_tag,
+            all_tags,
+            pinned,
+            created_after_ns,
+            created_before_ns,
+            updated_after_ns,
+            updated_before_ns,
+            order_by,
+            limit,
+        )?;
+        let adapter = self.inner.clone();
+        let runtime = self.runtime.clone();
+        let (snapshot, stream) =
+            runtime.block_on(async move { adapter.snapshot_and_watch(w) });
+        Ok((
+            snapshot.into_iter().map(PyMemory::from).collect(),
+            new_memory_watch_iter(stream, self.runtime.clone()),
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_memory_watcher(
+    adapter: &InnerMemoriesAdapter,
+    source: Option<String>,
+    content_contains: Option<String>,
+    tag: Option<String>,
+    any_tag: Option<Vec<String>>,
+    all_tags: Option<Vec<String>>,
+    pinned: Option<bool>,
+    created_after_ns: Option<u64>,
+    created_before_ns: Option<u64>,
+    updated_after_ns: Option<u64>,
+    updated_before_ns: Option<u64>,
+    order_by: Option<&str>,
+    limit: Option<u32>,
+) -> PyResult<::net::adapter::net::cortex::memories::MemoriesWatcher> {
+    let mut w = adapter.watch();
+    if let Some(s) = source {
+        w = w.where_source(s);
+    }
+    if let Some(s) = content_contains {
+        w = w.content_contains(s);
+    }
+    if let Some(t) = tag {
+        w = w.where_tag(t);
+    }
+    if let Some(tags) = any_tag {
+        w = w.where_any_tag(tags);
+    }
+    if let Some(tags) = all_tags {
+        w = w.where_all_tags(tags);
+    }
+    if let Some(p) = pinned {
+        w = w.where_pinned(p);
+    }
+    if let Some(ns) = created_after_ns {
+        w = w.created_after(ns);
+    }
+    if let Some(ns) = created_before_ns {
+        w = w.created_before(ns);
+    }
+    if let Some(ns) = updated_after_ns {
+        w = w.updated_after(ns);
+    }
+    if let Some(ns) = updated_before_ns {
+        w = w.updated_before(ns);
+    }
+    if let Some(o) = order_by {
+        w = w.order_by(parse_memories_order_by(o)?);
+    }
+    if let Some(l) = limit {
+        w = w.limit(l as usize);
+    }
+    Ok(w)
+}
+
+fn new_memory_watch_iter(
+    stream: BoxStream<'static, Vec<InnerMemory>>,
+    runtime: Arc<Runtime>,
+) -> PyMemoryWatchIter {
+    PyMemoryWatchIter {
+        inner: Arc::new(MemoryWatchIterInner {
+            stream: TokioMutex::new(Some(stream)),
+            shutdown: Notify::new(),
+            is_shutdown: AtomicBool::new(false),
+        }),
+        runtime,
     }
 }
 
