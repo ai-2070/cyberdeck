@@ -1,0 +1,958 @@
+// Package net — CortEX (tasks + memories) and RedEX file bindings.
+//
+// These surfaces are compiled into the Rust cdylib when the core is
+// built with `--features "netdb redex-disk"` (see the README).
+//
+// The Go API is idiomatic:
+//
+//   - Opaque handles are Go structs wrapping a C pointer, with
+//     finalizers installed so a dropped handle releases the native
+//     allocation even if the caller forgets `Close` / `Free`.
+//
+//   - Watch / tail iterators return `<-chan` plus a `context.Context`.
+//     The goroutine pumps the cursor until the context is cancelled,
+//     the channel is drained by the consumer, or the stream ends.
+//
+//   - `SnapshotAndWatch` returns both the initial result AND a
+//     subscription channel atomically, preserving the v2 race fix
+//     (see docs/STORAGE_AND_CORTEX.md).
+//
+// See `example/cortex/main.go` for an end-to-end walkthrough.
+
+package net
+
+/*
+#include "net.h"
+#include <stdlib.h>
+#include <string.h>
+*/
+import "C"
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"runtime"
+	"sync"
+	"time"
+	"unsafe"
+)
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+var (
+	ErrCortexClosed = errors.New("cortex adapter closed")
+	ErrCortexFold   = errors.New("cortex fold / ingestion failed")
+	ErrNetDb        = errors.New("netdb error")
+	ErrRedex        = errors.New("redex error")
+	ErrStreamEnded  = errors.New("stream ended")
+	ErrStreamTimeout = errors.New("stream timed out")
+)
+
+func cortexErrorFromCode(code C.int) error {
+	switch code {
+	case 0:
+		return nil
+	case -1:
+		return ErrNullPointer
+	case -2:
+		return ErrInvalidUTF8
+	case -3:
+		return ErrInvalidJSON
+	case -100:
+		return ErrCortexClosed
+	case -101:
+		return ErrCortexFold
+	case -102:
+		return ErrNetDb
+	case -103:
+		return ErrRedex
+	case 1:
+		return ErrStreamTimeout
+	case 2:
+		return ErrStreamEnded
+	default:
+		return fmt.Errorf("cortex unknown error (code %d)", code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Redex manager
+// ---------------------------------------------------------------------------
+
+// Redex is a local RedEX manager. One handle per process; shared by
+// all adapters on the same storage tree.
+type Redex struct {
+	mu     sync.Mutex
+	handle *C.net_redex_t
+}
+
+// NewRedex creates a Redex manager. Pass an empty `persistentDir` for
+// heap-only. With a directory, adapters opened with `persistent=true`
+// write to `<dir>/<channel>/{idx,dat}` and replay on reopen.
+func NewRedex(persistentDir string) *Redex {
+	var cDir *C.char
+	if persistentDir != "" {
+		cDir = C.CString(persistentDir)
+		defer C.free(unsafe.Pointer(cDir))
+	}
+	handle := C.net_redex_new(cDir)
+	r := &Redex{handle: handle}
+	runtime.SetFinalizer(r, (*Redex).Free)
+	return r
+}
+
+// Free releases the Redex and every open file handle bound to it.
+// Idempotent.
+func (r *Redex) Free() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.handle != nil {
+		C.net_redex_free(r.handle)
+		r.handle = nil
+		runtime.SetFinalizer(r, nil)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// RedexFile (raw log)
+// ---------------------------------------------------------------------------
+
+// RedexFileConfig maps to the Rust `RedexFileConfig`. `FsyncEveryN`
+// and `FsyncIntervalMs` are mutually exclusive.
+type RedexFileConfig struct {
+	Persistent         bool   `json:"persistent,omitempty"`
+	FsyncEveryN        uint64 `json:"fsync_every_n,omitempty"`
+	FsyncIntervalMs    uint64 `json:"fsync_interval_ms,omitempty"`
+	RetentionMaxEvents uint64 `json:"retention_max_events,omitempty"`
+	RetentionMaxBytes  uint64 `json:"retention_max_bytes,omitempty"`
+	RetentionMaxAgeMs  uint64 `json:"retention_max_age_ms,omitempty"`
+}
+
+// RedexEvent is one materialized event yielded by a tail / range read.
+type RedexEvent struct {
+	Seq      uint64 `json:"seq"`
+	Payload  []byte `json:"-"`
+	Checksum uint32 `json:"checksum"`
+	IsInline bool   `json:"is_inline"`
+}
+
+// Intermediate for JSON (hex payload).
+type redexEventWire struct {
+	Seq        uint64 `json:"seq"`
+	PayloadHex string `json:"payload_hex"`
+	Checksum   uint32 `json:"checksum"`
+	IsInline   bool   `json:"is_inline"`
+}
+
+func (e *redexEventWire) toEvent() (RedexEvent, error) {
+	payload, err := hex.DecodeString(e.PayloadHex)
+	if err != nil {
+		return RedexEvent{}, fmt.Errorf("invalid payload hex: %w", err)
+	}
+	return RedexEvent{
+		Seq:      e.Seq,
+		Payload:  payload,
+		Checksum: e.Checksum,
+		IsInline: e.IsInline,
+	}, nil
+}
+
+// RedexFile is a raw append-only log bound to a channel name.
+type RedexFile struct {
+	mu     sync.Mutex
+	handle *C.net_redex_file_t
+}
+
+// OpenFile opens (or gets) a RedEX file on `redex`. `config` may be
+// nil for defaults.
+func (r *Redex) OpenFile(name string, config *RedexFileConfig) (*RedexFile, error) {
+	r.mu.Lock()
+	if r.handle == nil {
+		r.mu.Unlock()
+		return nil, ErrShuttingDown
+	}
+	rh := r.handle
+	r.mu.Unlock()
+
+	cName := C.CString(name)
+	defer C.free(unsafe.Pointer(cName))
+
+	var cCfg *C.char
+	if config != nil {
+		data, err := json.Marshal(config)
+		if err != nil {
+			return nil, fmt.Errorf("marshal config: %w", err)
+		}
+		cCfg = C.CString(string(data))
+		defer C.free(unsafe.Pointer(cCfg))
+	}
+
+	var out *C.net_redex_file_t
+	code := C.net_redex_open_file(rh, cName, cCfg, &out)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	f := &RedexFile{handle: out}
+	runtime.SetFinalizer(f, (*RedexFile).free)
+	return f, nil
+}
+
+func (f *RedexFile) free() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.handle != nil {
+		C.net_redex_file_free(f.handle)
+		f.handle = nil
+		runtime.SetFinalizer(f, nil)
+	}
+}
+
+// Close flushes and closes the file. Subsequent operations error with
+// ErrRedex. Idempotent.
+func (f *RedexFile) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.handle == nil {
+		return nil
+	}
+	code := C.net_redex_file_close(f.handle)
+	C.net_redex_file_free(f.handle)
+	f.handle = nil
+	runtime.SetFinalizer(f, nil)
+	return cortexErrorFromCode(code)
+}
+
+// Append appends one payload; returns the assigned sequence number.
+func (f *RedexFile) Append(payload []byte) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.handle == nil {
+		return 0, ErrShuttingDown
+	}
+	var seq C.uint64_t
+	var ptr *C.uint8_t
+	var ln C.size_t
+	if len(payload) > 0 {
+		ptr = (*C.uint8_t)(unsafe.Pointer(&payload[0]))
+		ln = C.size_t(len(payload))
+	}
+	code := C.net_redex_file_append(f.handle, ptr, ln, &seq)
+	if err := cortexErrorFromCode(code); err != nil {
+		return 0, err
+	}
+	return uint64(seq), nil
+}
+
+// Len returns the number of retained events.
+func (f *RedexFile) Len() uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.handle == nil {
+		return 0
+	}
+	return uint64(C.net_redex_file_len(f.handle))
+}
+
+// ReadRange reads events in [start, end).
+func (f *RedexFile) ReadRange(start, end uint64) ([]RedexEvent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	var out *C.char
+	var outLen C.size_t
+	code := C.net_redex_file_read_range(f.handle, C.uint64_t(start), C.uint64_t(end), &out, &outLen)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	defer C.net_free_string(out)
+	js := C.GoStringN(out, C.int(outLen))
+	var wire []redexEventWire
+	if err := json.Unmarshal([]byte(js), &wire); err != nil {
+		return nil, fmt.Errorf("decode read_range: %w", err)
+	}
+	events := make([]RedexEvent, 0, len(wire))
+	for i := range wire {
+		ev, err := wire[i].toEvent()
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, ev)
+	}
+	return events, nil
+}
+
+// Sync fsyncs the disk segment. No-op on heap-only files.
+func (f *RedexFile) Sync() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.handle == nil {
+		return ErrShuttingDown
+	}
+	return cortexErrorFromCode(C.net_redex_file_sync(f.handle))
+}
+
+// Tail returns a channel of RedexEvents starting from `fromSeq`.
+// Backfills the retained range atomically, then streams live appends.
+// Cancel `ctx` to stop; the channel is closed when the cursor ends.
+func (f *RedexFile) Tail(ctx context.Context, fromSeq uint64) (<-chan RedexEvent, <-chan error, error) {
+	f.mu.Lock()
+	if f.handle == nil {
+		f.mu.Unlock()
+		return nil, nil, ErrShuttingDown
+	}
+	fh := f.handle
+	f.mu.Unlock()
+
+	var cursor *C.net_redex_tail_t
+	code := C.net_redex_file_tail(fh, C.uint64_t(fromSeq), &cursor)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, nil, err
+	}
+
+	events := make(chan RedexEvent, 16)
+	errs := make(chan error, 1)
+	go func() {
+		defer func() {
+			C.net_redex_tail_free(cursor)
+			close(events)
+			close(errs)
+		}()
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			var out *C.char
+			var outLen C.size_t
+			// 50ms poll so ctx.Done() is observed even when the
+			// underlying stream is idle.
+			code := C.net_redex_tail_next(cursor, 50, &out, &outLen)
+			switch code {
+			case 0:
+				js := C.GoStringN(out, C.int(outLen))
+				C.net_free_string(out)
+				var wire redexEventWire
+				if err := json.Unmarshal([]byte(js), &wire); err != nil {
+					errs <- fmt.Errorf("decode tail event: %w", err)
+					return
+				}
+				ev, err := wire.toEvent()
+				if err != nil {
+					errs <- err
+					return
+				}
+				select {
+				case events <- ev:
+				case <-ctx.Done():
+					return
+				}
+			case C.NET_STREAM_TIMEOUT:
+				// Keep polling.
+			case C.NET_STREAM_ENDED:
+				return
+			default:
+				errs <- cortexErrorFromCode(code)
+				return
+			}
+		}
+	}()
+	return events, errs, nil
+}
+
+// ---------------------------------------------------------------------------
+// Tasks adapter
+// ---------------------------------------------------------------------------
+
+// Task is a materialized task record.
+type Task struct {
+	ID        uint64 `json:"id"`
+	Title     string `json:"title"`
+	Status    string `json:"status"` // "pending" | "completed"
+	CreatedNs uint64 `json:"created_ns"`
+	UpdatedNs uint64 `json:"updated_ns"`
+}
+
+// TasksFilter mirrors the Rust `TasksFilter` via JSON. Unset fields
+// are ignored.
+type TasksFilter struct {
+	Status          string `json:"status,omitempty"` // "pending" | "completed"
+	TitleContains   string `json:"title_contains,omitempty"`
+	CreatedAfterNs  uint64 `json:"created_after_ns,omitempty"`
+	CreatedBeforeNs uint64 `json:"created_before_ns,omitempty"`
+	UpdatedAfterNs  uint64 `json:"updated_after_ns,omitempty"`
+	UpdatedBeforeNs uint64 `json:"updated_before_ns,omitempty"`
+	OrderBy         string `json:"order_by,omitempty"` // "id_asc" | "updated_desc" | ...
+	Limit           uint32 `json:"limit,omitempty"`
+}
+
+// TasksAdapter is the typed tasks handle.
+type TasksAdapter struct {
+	mu     sync.Mutex
+	handle *C.net_tasks_adapter_t
+}
+
+// OpenTasks opens the tasks adapter against a Redex. `persistent`
+// routes writes through the Redex's persistent directory.
+func OpenTasks(redex *Redex, originHash uint32, persistent bool) (*TasksAdapter, error) {
+	redex.mu.Lock()
+	if redex.handle == nil {
+		redex.mu.Unlock()
+		return nil, ErrShuttingDown
+	}
+	rh := redex.handle
+	redex.mu.Unlock()
+
+	var out *C.net_tasks_adapter_t
+	var p C.int
+	if persistent {
+		p = 1
+	}
+	code := C.net_tasks_adapter_open(rh, C.uint32_t(originHash), p, &out)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	t := &TasksAdapter{handle: out}
+	runtime.SetFinalizer(t, (*TasksAdapter).free)
+	return t, nil
+}
+
+func (t *TasksAdapter) free() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.handle != nil {
+		C.net_tasks_adapter_free(t.handle)
+		t.handle = nil
+		runtime.SetFinalizer(t, nil)
+	}
+}
+
+// Close stops the fold task. Subsequent CRUD errors with
+// ErrCortexClosed. Idempotent.
+func (t *TasksAdapter) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.handle == nil {
+		return nil
+	}
+	code := C.net_tasks_adapter_close(t.handle)
+	C.net_tasks_adapter_free(t.handle)
+	t.handle = nil
+	runtime.SetFinalizer(t, nil)
+	return cortexErrorFromCode(code)
+}
+
+func (t *TasksAdapter) Create(id uint64, title string, nowNs uint64) (uint64, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.handle == nil {
+		return 0, ErrShuttingDown
+	}
+	cTitle := C.CString(title)
+	defer C.free(unsafe.Pointer(cTitle))
+	var seq C.uint64_t
+	code := C.net_tasks_create(t.handle, C.uint64_t(id), cTitle, C.uint64_t(nowNs), &seq)
+	return uint64(seq), cortexErrorFromCode(code)
+}
+
+func (t *TasksAdapter) Rename(id uint64, newTitle string, nowNs uint64) (uint64, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.handle == nil {
+		return 0, ErrShuttingDown
+	}
+	cNew := C.CString(newTitle)
+	defer C.free(unsafe.Pointer(cNew))
+	var seq C.uint64_t
+	code := C.net_tasks_rename(t.handle, C.uint64_t(id), cNew, C.uint64_t(nowNs), &seq)
+	return uint64(seq), cortexErrorFromCode(code)
+}
+
+func (t *TasksAdapter) Complete(id uint64, nowNs uint64) (uint64, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.handle == nil {
+		return 0, ErrShuttingDown
+	}
+	var seq C.uint64_t
+	code := C.net_tasks_complete(t.handle, C.uint64_t(id), C.uint64_t(nowNs), &seq)
+	return uint64(seq), cortexErrorFromCode(code)
+}
+
+func (t *TasksAdapter) Delete(id uint64) (uint64, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.handle == nil {
+		return 0, ErrShuttingDown
+	}
+	var seq C.uint64_t
+	code := C.net_tasks_delete(t.handle, C.uint64_t(id), &seq)
+	return uint64(seq), cortexErrorFromCode(code)
+}
+
+// WaitForSeq blocks until the fold has applied every event up through
+// `seq`. Pass `timeout = 0` to wait indefinitely.
+func (t *TasksAdapter) WaitForSeq(seq uint64, timeout time.Duration) error {
+	t.mu.Lock()
+	if t.handle == nil {
+		t.mu.Unlock()
+		return ErrShuttingDown
+	}
+	h := t.handle
+	t.mu.Unlock()
+	code := C.net_tasks_wait_for_seq(h, C.uint64_t(seq), C.uint32_t(timeout.Milliseconds()))
+	return cortexErrorFromCode(code)
+}
+
+// List returns a snapshot query over the materialized state. Pass
+// `nil` filter for "all tasks."
+func (t *TasksAdapter) List(filter *TasksFilter) ([]Task, error) {
+	t.mu.Lock()
+	if t.handle == nil {
+		t.mu.Unlock()
+		return nil, ErrShuttingDown
+	}
+	h := t.handle
+	t.mu.Unlock()
+
+	cFilter, err := marshalFilter(filter)
+	if err != nil {
+		return nil, err
+	}
+	if cFilter != nil {
+		defer C.free(unsafe.Pointer(cFilter))
+	}
+	var out *C.char
+	var outLen C.size_t
+	code := C.net_tasks_list(h, cFilter, &out, &outLen)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	defer C.net_free_string(out)
+	js := C.GoStringN(out, C.int(outLen))
+	var tasks []Task
+	if err := json.Unmarshal([]byte(js), &tasks); err != nil {
+		return nil, fmt.Errorf("decode list: %w", err)
+	}
+	return tasks, nil
+}
+
+// SnapshotAndWatch returns the current filter result AND a channel of
+// subsequent filter results, atomically. `ctx.Done()` terminates the
+// watch; the channel is closed either on ctx cancel or stream end.
+// The `errs` channel carries at most one error (stream / decode
+// failure) before being closed alongside the data channel.
+//
+// This is the v2 race-fix primitive — prefer it to calling `List` +
+// building your own watch, which would race and lose updates.
+func (t *TasksAdapter) SnapshotAndWatch(
+	ctx context.Context,
+	filter *TasksFilter,
+) ([]Task, <-chan []Task, <-chan error, error) {
+	t.mu.Lock()
+	if t.handle == nil {
+		t.mu.Unlock()
+		return nil, nil, nil, ErrShuttingDown
+	}
+	h := t.handle
+	t.mu.Unlock()
+
+	cFilter, err := marshalFilter(filter)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if cFilter != nil {
+		defer C.free(unsafe.Pointer(cFilter))
+	}
+	var snap *C.char
+	var snapLen C.size_t
+	var cursor *C.net_tasks_watch_t
+	code := C.net_tasks_snapshot_and_watch(h, cFilter, &snap, &snapLen, &cursor)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, nil, nil, err
+	}
+	defer C.net_free_string(snap)
+	snapJS := C.GoStringN(snap, C.int(snapLen))
+	var snapshot []Task
+	if err := json.Unmarshal([]byte(snapJS), &snapshot); err != nil {
+		C.net_tasks_watch_free(cursor)
+		return nil, nil, nil, fmt.Errorf("decode snapshot: %w", err)
+	}
+	updates, errs := pumpTasksWatch(ctx, cursor)
+	return snapshot, updates, errs, nil
+}
+
+func pumpTasksWatch(ctx context.Context, cursor *C.net_tasks_watch_t) (<-chan []Task, <-chan error) {
+	data := make(chan []Task, 4)
+	errs := make(chan error, 1)
+	go func() {
+		defer func() {
+			C.net_tasks_watch_free(cursor)
+			close(data)
+			close(errs)
+		}()
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			var out *C.char
+			var outLen C.size_t
+			code := C.net_tasks_watch_next(cursor, 50, &out, &outLen)
+			switch code {
+			case 0:
+				js := C.GoStringN(out, C.int(outLen))
+				C.net_free_string(out)
+				var batch []Task
+				if err := json.Unmarshal([]byte(js), &batch); err != nil {
+					errs <- fmt.Errorf("decode watch batch: %w", err)
+					return
+				}
+				select {
+				case data <- batch:
+				case <-ctx.Done():
+					return
+				}
+			case C.NET_STREAM_TIMEOUT:
+			case C.NET_STREAM_ENDED:
+				return
+			default:
+				errs <- cortexErrorFromCode(code)
+				return
+			}
+		}
+	}()
+	return data, errs
+}
+
+// ---------------------------------------------------------------------------
+// Memories adapter
+// ---------------------------------------------------------------------------
+
+// Memory is a materialized memory record.
+type Memory struct {
+	ID        uint64   `json:"id"`
+	Content   string   `json:"content"`
+	Tags      []string `json:"tags"`
+	Source    string   `json:"source"`
+	CreatedNs uint64   `json:"created_ns"`
+	UpdatedNs uint64   `json:"updated_ns"`
+	Pinned    bool     `json:"pinned"`
+}
+
+// MemoriesFilter mirrors the Rust `MemoriesFilter` via JSON.
+type MemoriesFilter struct {
+	Source          string   `json:"source,omitempty"`
+	ContentContains string   `json:"content_contains,omitempty"`
+	Tag             string   `json:"tag,omitempty"`
+	AnyTag          []string `json:"any_tag,omitempty"`
+	AllTags         []string `json:"all_tags,omitempty"`
+	Pinned          *bool    `json:"pinned,omitempty"`
+	CreatedAfterNs  uint64   `json:"created_after_ns,omitempty"`
+	CreatedBeforeNs uint64   `json:"created_before_ns,omitempty"`
+	UpdatedAfterNs  uint64   `json:"updated_after_ns,omitempty"`
+	UpdatedBeforeNs uint64   `json:"updated_before_ns,omitempty"`
+	OrderBy         string   `json:"order_by,omitempty"`
+	Limit           uint32   `json:"limit,omitempty"`
+}
+
+// MemoriesAdapter is the typed memories handle.
+type MemoriesAdapter struct {
+	mu     sync.Mutex
+	handle *C.net_memories_adapter_t
+}
+
+func OpenMemories(redex *Redex, originHash uint32, persistent bool) (*MemoriesAdapter, error) {
+	redex.mu.Lock()
+	if redex.handle == nil {
+		redex.mu.Unlock()
+		return nil, ErrShuttingDown
+	}
+	rh := redex.handle
+	redex.mu.Unlock()
+
+	var out *C.net_memories_adapter_t
+	var p C.int
+	if persistent {
+		p = 1
+	}
+	code := C.net_memories_adapter_open(rh, C.uint32_t(originHash), p, &out)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	m := &MemoriesAdapter{handle: out}
+	runtime.SetFinalizer(m, (*MemoriesAdapter).free)
+	return m, nil
+}
+
+func (m *MemoriesAdapter) free() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.handle != nil {
+		C.net_memories_adapter_free(m.handle)
+		m.handle = nil
+		runtime.SetFinalizer(m, nil)
+	}
+}
+
+func (m *MemoriesAdapter) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.handle == nil {
+		return nil
+	}
+	code := C.net_memories_adapter_close(m.handle)
+	C.net_memories_adapter_free(m.handle)
+	m.handle = nil
+	runtime.SetFinalizer(m, nil)
+	return cortexErrorFromCode(code)
+}
+
+type memoryStoreInput struct {
+	ID      uint64   `json:"id"`
+	Content string   `json:"content"`
+	Tags    []string `json:"tags"`
+	Source  string   `json:"source"`
+	NowNs   uint64   `json:"now_ns"`
+}
+
+type memoryRetagInput struct {
+	ID    uint64   `json:"id"`
+	Tags  []string `json:"tags"`
+	NowNs uint64   `json:"now_ns"`
+}
+
+func (m *MemoriesAdapter) Store(id uint64, content string, tags []string, source string, nowNs uint64) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.handle == nil {
+		return 0, ErrShuttingDown
+	}
+	if tags == nil {
+		tags = []string{}
+	}
+	data, err := json.Marshal(memoryStoreInput{
+		ID: id, Content: content, Tags: tags, Source: source, NowNs: nowNs,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("marshal store: %w", err)
+	}
+	c := C.CString(string(data))
+	defer C.free(unsafe.Pointer(c))
+	var seq C.uint64_t
+	code := C.net_memories_store(m.handle, c, &seq)
+	return uint64(seq), cortexErrorFromCode(code)
+}
+
+func (m *MemoriesAdapter) Retag(id uint64, tags []string, nowNs uint64) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.handle == nil {
+		return 0, ErrShuttingDown
+	}
+	if tags == nil {
+		tags = []string{}
+	}
+	data, err := json.Marshal(memoryRetagInput{ID: id, Tags: tags, NowNs: nowNs})
+	if err != nil {
+		return 0, fmt.Errorf("marshal retag: %w", err)
+	}
+	c := C.CString(string(data))
+	defer C.free(unsafe.Pointer(c))
+	var seq C.uint64_t
+	code := C.net_memories_retag(m.handle, c, &seq)
+	return uint64(seq), cortexErrorFromCode(code)
+}
+
+func (m *MemoriesAdapter) Pin(id uint64, nowNs uint64) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.handle == nil {
+		return 0, ErrShuttingDown
+	}
+	var seq C.uint64_t
+	code := C.net_memories_pin(m.handle, C.uint64_t(id), C.uint64_t(nowNs), &seq)
+	return uint64(seq), cortexErrorFromCode(code)
+}
+
+func (m *MemoriesAdapter) Unpin(id uint64, nowNs uint64) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.handle == nil {
+		return 0, ErrShuttingDown
+	}
+	var seq C.uint64_t
+	code := C.net_memories_unpin(m.handle, C.uint64_t(id), C.uint64_t(nowNs), &seq)
+	return uint64(seq), cortexErrorFromCode(code)
+}
+
+func (m *MemoriesAdapter) Delete(id uint64) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.handle == nil {
+		return 0, ErrShuttingDown
+	}
+	var seq C.uint64_t
+	code := C.net_memories_delete(m.handle, C.uint64_t(id), &seq)
+	return uint64(seq), cortexErrorFromCode(code)
+}
+
+func (m *MemoriesAdapter) WaitForSeq(seq uint64, timeout time.Duration) error {
+	m.mu.Lock()
+	if m.handle == nil {
+		m.mu.Unlock()
+		return ErrShuttingDown
+	}
+	h := m.handle
+	m.mu.Unlock()
+	code := C.net_memories_wait_for_seq(h, C.uint64_t(seq), C.uint32_t(timeout.Milliseconds()))
+	return cortexErrorFromCode(code)
+}
+
+func (m *MemoriesAdapter) List(filter *MemoriesFilter) ([]Memory, error) {
+	m.mu.Lock()
+	if m.handle == nil {
+		m.mu.Unlock()
+		return nil, ErrShuttingDown
+	}
+	h := m.handle
+	m.mu.Unlock()
+
+	cFilter, err := marshalFilter(filter)
+	if err != nil {
+		return nil, err
+	}
+	if cFilter != nil {
+		defer C.free(unsafe.Pointer(cFilter))
+	}
+	var out *C.char
+	var outLen C.size_t
+	code := C.net_memories_list(h, cFilter, &out, &outLen)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	defer C.net_free_string(out)
+	js := C.GoStringN(out, C.int(outLen))
+	var memories []Memory
+	if err := json.Unmarshal([]byte(js), &memories); err != nil {
+		return nil, fmt.Errorf("decode list: %w", err)
+	}
+	return memories, nil
+}
+
+// SnapshotAndWatch mirrors TasksAdapter.SnapshotAndWatch for memories.
+func (m *MemoriesAdapter) SnapshotAndWatch(
+	ctx context.Context,
+	filter *MemoriesFilter,
+) ([]Memory, <-chan []Memory, <-chan error, error) {
+	m.mu.Lock()
+	if m.handle == nil {
+		m.mu.Unlock()
+		return nil, nil, nil, ErrShuttingDown
+	}
+	h := m.handle
+	m.mu.Unlock()
+
+	cFilter, err := marshalFilter(filter)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if cFilter != nil {
+		defer C.free(unsafe.Pointer(cFilter))
+	}
+	var snap *C.char
+	var snapLen C.size_t
+	var cursor *C.net_memories_watch_t
+	code := C.net_memories_snapshot_and_watch(h, cFilter, &snap, &snapLen, &cursor)
+	if err := cortexErrorFromCode(code); err != nil {
+		return nil, nil, nil, err
+	}
+	defer C.net_free_string(snap)
+	snapJS := C.GoStringN(snap, C.int(snapLen))
+	var snapshot []Memory
+	if err := json.Unmarshal([]byte(snapJS), &snapshot); err != nil {
+		C.net_memories_watch_free(cursor)
+		return nil, nil, nil, fmt.Errorf("decode snapshot: %w", err)
+	}
+	updates, errs := pumpMemoriesWatch(ctx, cursor)
+	return snapshot, updates, errs, nil
+}
+
+func pumpMemoriesWatch(ctx context.Context, cursor *C.net_memories_watch_t) (<-chan []Memory, <-chan error) {
+	data := make(chan []Memory, 4)
+	errs := make(chan error, 1)
+	go func() {
+		defer func() {
+			C.net_memories_watch_free(cursor)
+			close(data)
+			close(errs)
+		}()
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			var out *C.char
+			var outLen C.size_t
+			code := C.net_memories_watch_next(cursor, 50, &out, &outLen)
+			switch code {
+			case 0:
+				js := C.GoStringN(out, C.int(outLen))
+				C.net_free_string(out)
+				var batch []Memory
+				if err := json.Unmarshal([]byte(js), &batch); err != nil {
+					errs <- fmt.Errorf("decode watch batch: %w", err)
+					return
+				}
+				select {
+				case data <- batch:
+				case <-ctx.Done():
+					return
+				}
+			case C.NET_STREAM_TIMEOUT:
+			case C.NET_STREAM_ENDED:
+				return
+			default:
+				errs <- cortexErrorFromCode(code)
+				return
+			}
+		}
+	}()
+	return data, errs
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// marshalFilter serializes any filter struct (TasksFilter /
+// MemoriesFilter) to a C-owned string. Returns `nil, nil` when filter
+// is nil.
+func marshalFilter(filter any) (*C.char, error) {
+	if filter == nil {
+		return nil, nil
+	}
+	// Detect a typed-nil filter pointer (e.g., `(*TasksFilter)(nil)`).
+	switch v := filter.(type) {
+	case *TasksFilter:
+		if v == nil {
+			return nil, nil
+		}
+	case *MemoriesFilter:
+		if v == nil {
+			return nil, nil
+		}
+	}
+	data, err := json.Marshal(filter)
+	if err != nil {
+		return nil, fmt.Errorf("marshal filter: %w", err)
+	}
+	if string(data) == "{}" {
+		// Empty filter — don't bother marshalling.
+		return nil, nil
+	}
+	return C.CString(string(data)), nil
+}

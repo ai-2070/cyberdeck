@@ -15,6 +15,10 @@ First, build the Net shared library:
 # From the repository root
 cargo build --release
 
+# To include CortEX + RedEX support (required for the cortex.go surface below),
+# build with the extended feature set:
+cargo build --release --features "netdb redex-disk"
+
 # The library will be at:
 # - Linux: target/release/libnet.so
 # - macOS: target/release/libnet.dylib
@@ -192,6 +196,125 @@ initiator.IngestRaw(`{"event": "data"}`)
 - `NumShards() int` - Get shard count
 - `Flush() error` - Flush pending batches
 - `Shutdown() error` - Shutdown and free resources
+
+## CortEX & NetDb (event-sourced state)
+
+Typed, event-sourced state on top of RedEX — tasks and memories with
+filterable queries and Go-channel-based watches. The `SnapshotAndWatch`
+primitive preserves the v2 race fix: you get both the initial filter
+result and a live delta channel atomically.
+
+Build the cdylib with `--features "netdb redex-disk"` to expose the
+cortex surface (see the "Building" section above).
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "time"
+
+    "github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net"
+)
+
+func main() {
+    redex := net.NewRedex("") // heap-only; pass a path for persistence
+    defer redex.Free()
+
+    tasks, err := net.OpenTasks(redex, 0xABCDEF01, false)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer tasks.Close()
+
+    // CRUD.
+    seq, err := tasks.Create(1, "write docs", 100)
+    if err != nil {
+        log.Fatal(err)
+    }
+    if err := tasks.WaitForSeq(seq, 2*time.Second); err != nil {
+        log.Fatal(err)
+    }
+
+    // Snapshot + watch, atomically.
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+
+    snapshot, updates, errs, err := tasks.SnapshotAndWatch(ctx, &net.TasksFilter{
+        Status: "pending",
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("initial: %d pending\n", len(snapshot))
+
+    go func() {
+        _, _ = tasks.Complete(1, 200)
+    }()
+
+    select {
+    case batch := <-updates:
+        fmt.Printf("update: %d pending\n", len(batch))
+    case err := <-errs:
+        log.Fatal(err)
+    case <-time.After(time.Second):
+        log.Fatal("timeout")
+    }
+}
+```
+
+### Raw RedEX file
+
+For domain-agnostic persistent logs (no CortEX fold), use the `Redex`
+manager directly:
+
+```go
+redex := net.NewRedex("/var/lib/net/events")
+defer redex.Free()
+
+file, err := redex.OpenFile("analytics/clicks", &net.RedexFileConfig{
+    Persistent:      true,
+    FsyncIntervalMs: 100,
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer file.Close()
+
+seq, _ := file.Append([]byte(`{"url": "/home"}`))
+fmt.Println("wrote seq", seq)
+
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+events, errs, _ := file.Tail(ctx, 0)
+for {
+    select {
+    case ev, ok := <-events:
+        if !ok {
+            return
+        }
+        fmt.Println(ev.Seq, string(ev.Payload))
+    case err := <-errs:
+        log.Fatal(err)
+    }
+}
+```
+
+### CortEX API reference
+
+- `NewRedex(persistentDir string) *Redex`
+- `(*Redex).OpenFile(name string, config *RedexFileConfig) (*RedexFile, error)`
+- `OpenTasks(redex *Redex, originHash uint32, persistent bool) (*TasksAdapter, error)`
+- `OpenMemories(redex *Redex, originHash uint32, persistent bool) (*MemoriesAdapter, error)`
+- `(*TasksAdapter).Create / Rename / Complete / Delete / WaitForSeq / List / SnapshotAndWatch`
+- `(*MemoriesAdapter).Store / Retag / Pin / Unpin / Delete / WaitForSeq / List / SnapshotAndWatch`
+- `(*RedexFile).Append / ReadRange / Tail / Len / Sync / Close`
+
+Errors surfaced as typed sentinels:
+`ErrCortexClosed`, `ErrCortexFold`, `ErrNetDb`, `ErrRedex`,
+`ErrStreamTimeout`, `ErrStreamEnded`.
 
 ## Running the Example
 

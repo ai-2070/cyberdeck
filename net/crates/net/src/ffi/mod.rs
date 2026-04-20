@@ -63,6 +63,12 @@ use crate::config::EventBusConfig;
 use crate::consumer::ConsumeRequest;
 use crate::event::{Event, RawEvent};
 
+/// C FFI for CortEX / NetDb / RedexFile. Requires `netdb` (for the
+/// unified facade) and `redex-disk` (for persistent storage paths on
+/// `Redex` / `RedexFile`). Go / cgo consumers target this surface.
+#[cfg(all(feature = "netdb", feature = "redex-disk"))]
+pub mod cortex;
+
 #[cfg(feature = "net")]
 use crate::adapter::net::{NetAdapterConfig, ReliabilityConfig, StaticKeypair};
 #[cfg(any(feature = "redis", feature = "jetstream", feature = "net"))]
