@@ -12,6 +12,7 @@
 //! - Safety envelope enforcement
 
 pub mod api;
+pub mod broadcast;
 pub mod capability;
 pub mod context;
 pub mod diff;
@@ -20,6 +21,8 @@ pub mod metadata;
 pub mod proximity;
 pub mod rules;
 pub mod safety;
+
+pub use broadcast::SUBPROTOCOL_CAPABILITY_ANN;
 
 pub use capability::{
     AcceleratorInfo, AcceleratorType, CapabilityAnnouncement, CapabilityFilter, CapabilityIndex,

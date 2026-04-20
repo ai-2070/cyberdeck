@@ -29,7 +29,9 @@
 //! ```
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use arc_swap::ArcSwapOption;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +47,10 @@ use super::failure::{FailureDetector, FailureDetectorConfig};
 use super::identity::EntityKeypair;
 use super::pool::PacketBuilder;
 
+use super::behavior::broadcast::SUBPROTOCOL_CAPABILITY_ANN;
+use super::behavior::capability::{
+    CapabilityAnnouncement, CapabilityFilter, CapabilityIndex, CapabilityRequirement, CapabilitySet,
+};
 use super::behavior::loadbalance::HealthStatus;
 use super::behavior::proximity::{EnhancedPingwave, ProximityConfig, ProximityGraph};
 use super::channel::membership::{self, MembershipMsg, SUBPROTOCOL_CHANNEL_MEMBERSHIP};
@@ -159,6 +165,12 @@ struct DispatchCtx {
     pending_membership_acks: Arc<DashMap<u64, oneshot::Sender<MembershipAck>>>,
     /// Max distinct channels a single peer may subscribe to.
     max_channels_per_peer: usize,
+    /// Capability index shared with `MeshNode`. Inbound
+    /// `SUBPROTOCOL_CAPABILITY_ANN` packets are indexed here.
+    capability_index: Arc<CapabilityIndex>,
+    /// Whether inbound `CapabilityAnnouncement` packets without a
+    /// signature are dropped. Validity is not enforced yet.
+    require_signed_capabilities: bool,
 }
 
 /// Result passed through the pending-ack oneshot.
@@ -212,6 +224,15 @@ pub struct MeshNodeConfig {
     /// Timeout for `subscribe_channel` / `unsubscribe_channel` to wait
     /// for an `Ack` before returning `AdapterError::Timeout`.
     pub membership_ack_timeout: Duration,
+    /// Drop inbound `CapabilityAnnouncement` packets whose signature
+    /// is missing. Signature *validity* is not yet enforced (that
+    /// requires the node_id → entity_id binding that lands with
+    /// channel auth); presence is a per-mesh policy knob today.
+    pub require_signed_capabilities: bool,
+    /// How often the capability index sweeps expired entries. Low
+    /// values waste CPU; high values keep stale peers queryable past
+    /// their TTL.
+    pub capability_gc_interval: Duration,
 }
 
 impl MeshNodeConfig {
@@ -234,6 +255,8 @@ impl MeshNodeConfig {
             max_streams: 4096,
             max_channels_per_peer: 1024,
             membership_ack_timeout: Duration::from_secs(5),
+            require_signed_capabilities: false,
+            capability_gc_interval: Duration::from_secs(60),
         }
     }
 
@@ -259,6 +282,20 @@ impl MeshNodeConfig {
     pub fn with_handshake(mut self, retries: usize, timeout: Duration) -> Self {
         self.handshake_retries = retries;
         self.handshake_timeout = timeout;
+        self
+    }
+
+    /// Require inbound `CapabilityAnnouncement` packets to carry a
+    /// signature. Unsigned announcements are dropped silently (a
+    /// trace is emitted).
+    pub fn with_require_signed_capabilities(mut self, require: bool) -> Self {
+        self.require_signed_capabilities = require;
+        self
+    }
+
+    /// Set the capability-index GC sweep interval.
+    pub fn with_capability_gc_interval(mut self, interval: Duration) -> Self {
+        self.capability_gc_interval = interval;
         self
     }
 }
@@ -366,6 +403,21 @@ pub struct MeshNode {
     channel_configs: Option<Arc<ChannelConfigRegistry>>,
     /// In-flight Subscribe/Unsubscribe requests keyed by nonce.
     pending_membership_acks: Arc<DashMap<u64, oneshot::Sender<MembershipAck>>>,
+    /// Capability index populated by inbound
+    /// `SUBPROTOCOL_CAPABILITY_ANN` packets and the local
+    /// `announce_capabilities` path. Self-index so single-node
+    /// queries return us too.
+    capability_index: Arc<CapabilityIndex>,
+    /// Most recent `CapabilityAnnouncement` this node published.
+    /// Pushed to new peers right after `accept` / `connect`
+    /// completes, so late joiners pick up our caps without waiting
+    /// for a re-announce. `None` until the first `announce_*` call.
+    local_announcement: Arc<ArcSwapOption<CapabilityAnnouncement>>,
+    /// Monotonic version counter used when stamping our own
+    /// announcements. `CapabilityIndex::index` skips older versions,
+    /// so this must move forward across restarts if the caller wants
+    /// their announcements accepted.
+    capability_version: Arc<AtomicU64>,
     /// Background tasks
     tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
     /// Shutdown flag
@@ -494,6 +546,9 @@ impl MeshNode {
             roster,
             channel_configs: None,
             pending_membership_acks: Arc::new(DashMap::new()),
+            capability_index: Arc::new(CapabilityIndex::new()),
+            local_announcement: Arc::new(ArcSwapOption::empty()),
+            capability_version: Arc::new(AtomicU64::new(0)),
             tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
@@ -607,6 +662,13 @@ impl MeshNode {
         // Register with failure detector
         self.failure_detector.heartbeat(peer_node_id, peer_addr);
 
+        // Push our most recent capability announcement to the new peer,
+        // so late joiners pick up our caps without waiting for a
+        // re-announce. Races the session's first inbound packet but
+        // that's harmless: the receiver's `index()` is version-skip
+        // safe and DashMap inserts are idempotent.
+        self.push_local_announcement(peer_addr).await;
+
         Ok(peer_node_id)
     }
 
@@ -644,6 +706,9 @@ impl MeshNode {
 
         self.failure_detector.heartbeat(peer_node_id, peer_addr);
 
+        // See the matching comment in `connect`.
+        self.push_local_announcement(peer_addr).await;
+
         Ok((peer_addr, peer_node_id))
     }
 
@@ -659,6 +724,7 @@ impl MeshNode {
         let recv_handle = self.spawn_receive_loop();
         let heartbeat_handle = self.spawn_heartbeat_loop();
         let router_handle = self.router.start();
+        let capability_gc_handle = self.spawn_capability_gc_loop();
 
         // Store handles — can't block here, but we need them for shutdown
         let tasks = self.tasks.clone();
@@ -667,7 +733,33 @@ impl MeshNode {
             tasks.push(recv_handle);
             tasks.push(heartbeat_handle);
             tasks.push(router_handle);
+            tasks.push(capability_gc_handle);
         });
+    }
+
+    /// Spawn a periodic sweep that evicts expired entries from the
+    /// capability index. Interval from `config.capability_gc_interval`
+    /// (default 60 s). Exits on `shutdown_notify`.
+    fn spawn_capability_gc_loop(&self) -> JoinHandle<()> {
+        let index = self.capability_index.clone();
+        let interval = self.config.capability_gc_interval;
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            // First tick fires immediately; skip it so we don't GC
+            // empty state before any announcements have landed.
+            tick.tick().await;
+            while !shutdown.load(Ordering::Acquire) {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        let _removed = index.gc();
+                    }
+                    _ = shutdown_notify.notified() => break,
+                }
+            }
+        })
     }
 
     /// Spawn the main receive loop.
@@ -705,6 +797,8 @@ impl MeshNode {
             channel_configs: self.channel_configs.clone(),
             pending_membership_acks: self.pending_membership_acks.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
+            capability_index: self.capability_index.clone(),
+            require_signed_capabilities: self.config.require_signed_capabilities,
         };
 
         tokio::spawn(async move {
@@ -1309,6 +1403,25 @@ impl MeshNode {
             return;
         }
 
+        // Capability announcement: signed, versioned capability metadata.
+        // Feeds the local `CapabilityIndex`; never responded to.
+        if parsed.header.subprotocol_id == SUBPROTOCOL_CAPABILITY_ANN {
+            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let Some(payload) = events.into_iter().next() else {
+                return;
+            };
+
+            let from_node = ctx
+                .peers
+                .iter()
+                .find(|e| e.value().session.session_id() == session.session_id())
+                .map(|e| e.value().node_id)
+                .unwrap_or(0);
+
+            Self::handle_capability_announcement(&payload, from_node, ctx);
+            return;
+        }
+
         // Standard event path: parse event frames and queue.
         //
         // Credit accounting charges the full on-wire size (Net
@@ -1881,6 +1994,47 @@ impl MeshNode {
         }
     }
 
+    /// Dispatch an inbound `CapabilityAnnouncement` into the local
+    /// capability index. Drops announcements that:
+    /// - fail to decode (malformed bytes),
+    /// - carry a `node_id` that doesn't match the session's peer
+    ///   (a peer can only announce for itself),
+    /// - are missing a signature when
+    ///   `require_signed_capabilities` is on.
+    ///
+    /// Signature *validity* is not checked here; that requires a
+    /// node_id → entity_id binding that lands with Stage E
+    /// (channel auth). Presence is a per-mesh policy knob today.
+    fn handle_capability_announcement(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
+        let Some(ann) = CapabilityAnnouncement::from_bytes(payload) else {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                len = payload.len(),
+                "capability: decode failed"
+            );
+            return;
+        };
+
+        if ann.node_id != from_node {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                ann_node = format!("{:#x}", ann.node_id),
+                "capability: node_id mismatch (peer can only announce for itself)"
+            );
+            return;
+        }
+
+        if ctx.require_signed_capabilities && ann.signature.is_none() {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                "capability: unsigned announcement rejected"
+            );
+            return;
+        }
+
+        ctx.capability_index.index(ann);
+    }
+
     /// Decide whether a Subscribe from `from_node` on `channel` is allowed.
     ///
     /// Rules, in order:
@@ -2213,6 +2367,104 @@ impl MeshNode {
         drop(builder);
         session.touch();
         Ok(())
+    }
+
+    // ── Capability announcements ──────────────────────────────────────
+    //
+    // `SUBPROTOCOL_CAPABILITY_ANN` payloads; the on-wire form is
+    // `CapabilityAnnouncement::to_bytes`. Direct-peer push only in
+    // v1; multi-hop gossip is a follow-up.
+
+    /// Announce this node's capabilities to every directly-connected
+    /// peer. Also self-indexes so single-node `find_peers_by_filter`
+    /// queries return us too.
+    ///
+    /// TTL defaults to 5 minutes. Unsigned (signatures tie in with
+    /// Stage E channel auth). For explicit control over TTL or
+    /// signing, see [`Self::announce_capabilities_with`].
+    pub async fn announce_capabilities(&self, caps: CapabilitySet) -> Result<(), AdapterError> {
+        self.announce_capabilities_with(caps, Duration::from_secs(300), false)
+            .await
+    }
+
+    /// Extended announce with explicit TTL and signing opt-in.
+    ///
+    /// `sign` currently a no-op — the field on
+    /// [`CapabilityAnnouncement`] exists but signing requires access
+    /// to the node's [`EntityKeypair`] and a binding between
+    /// `node_id` and `EntityId`, which lands with Stage E. The flag
+    /// is threaded through so the API shape is stable now.
+    pub async fn announce_capabilities_with(
+        &self,
+        caps: CapabilitySet,
+        ttl: Duration,
+        _sign: bool,
+    ) -> Result<(), AdapterError> {
+        let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
+        let ann = CapabilityAnnouncement::new(self.node_id, version, caps)
+            .with_ttl(ttl.as_secs().min(u32::MAX as u64) as u32);
+
+        // Self-index so local queries see our own caps.
+        self.capability_index.index(ann.clone());
+
+        // Publish as the latest local announcement so future
+        // session-opens push this version to new peers.
+        self.local_announcement.store(Some(Arc::new(ann.clone())));
+
+        // Fan out to currently-connected peers. Best-effort — a
+        // per-peer send failure is logged and skipped rather than
+        // short-circuiting the broadcast.
+        let bytes = ann.to_bytes();
+        let peer_addrs: Vec<SocketAddr> = self.peers.iter().map(|e| e.value().addr).collect();
+        for addr in peer_addrs {
+            if let Err(e) = self
+                .send_subprotocol(addr, SUBPROTOCOL_CAPABILITY_ANN, &bytes)
+                .await
+            {
+                tracing::trace!(peer = %addr, error = %e, "capability: announce send failed");
+            }
+        }
+        Ok(())
+    }
+
+    /// Query the capability index. Returns node ids (including our
+    /// own `node_id`) whose latest announcement matches `filter`.
+    pub fn find_peers_by_filter(&self, filter: &CapabilityFilter) -> Vec<u64> {
+        self.capability_index.query(filter)
+    }
+
+    /// Rank peers for a scored requirement. Returns the best-
+    /// scoring node's id, or `None` if no peer matches.
+    pub fn rank_peers(&self, req: &CapabilityRequirement) -> Option<u64> {
+        self.capability_index.find_best(req)
+    }
+
+    /// Shared reference to the capability index. Use this for
+    /// queries the two helpers above don't cover (listing all known
+    /// peers, reading stats, etc.).
+    pub fn capability_index(&self) -> &Arc<CapabilityIndex> {
+        &self.capability_index
+    }
+
+    /// Push the currently-stored local announcement (if any) to
+    /// `peer_addr`. Called from the end of `connect` / `accept` so
+    /// late joiners don't have to wait for a re-announce. No-op
+    /// when we haven't yet announced anything.
+    async fn push_local_announcement(&self, peer_addr: SocketAddr) {
+        let Some(ann) = self.local_announcement.load_full() else {
+            return;
+        };
+        let bytes = ann.to_bytes();
+        if let Err(e) = self
+            .send_subprotocol(peer_addr, SUBPROTOCOL_CAPABILITY_ANN, &bytes)
+            .await
+        {
+            tracing::trace!(
+                peer = %peer_addr,
+                error = %e,
+                "capability: session-open push failed"
+            );
+        }
     }
 
     // ── Stream API ─────────────────────────────────────────────────────
