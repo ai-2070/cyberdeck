@@ -1,0 +1,31 @@
+net/crates/net/bindings/python/tests/test_snapshot_and_watch.py
+  5bf3f089eecaef7a 1-201
+net/crates/net/bindings/python/python/net/__init__.py
+  5bf3f089eecaef7a 56-57,59-70,72,75-116
+net/crates/net/bindings/python/README.md
+  5bf3f089eecaef7a 106-162
+net/crates/net/bindings/python/python/net/_net.pyi
+  5bf3f089eecaef7a 312-334,413-430,485-557
+net/crates/net/bindings/python/src/cortex.rs
+  5bf3f089eecaef7a 404-414,420-531,893-907,911-1039
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "c2bea89ae06fb2bd5edcbb8a3999115446a61a2d",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 1992,
+      "total_deletions": 81,
+      "accepted_lines": 696,
+      "overriden_lines": 0
+    }
+  }
+}
