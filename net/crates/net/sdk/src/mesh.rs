@@ -50,6 +50,62 @@ use net::event::StoredEvent;
 
 use crate::error::{Result, SdkError};
 
+/// Options passed to [`Mesh::subscribe_channel_with`].
+///
+/// Today the only knob is a presented
+/// [`PermissionToken`](crate::identity::PermissionToken) — the
+/// shape is a struct rather than a bare `Option<Token>` so future
+/// additions (request-side timeout override, subscribe priority,
+/// etc.) don't break callers.
+///
+/// # Round-trip shape
+///
+/// ```no_run
+/// # use std::time::Duration;
+/// # use net_sdk::{ChannelName, Identity, SubscribeOptions, TokenScope};
+/// # use net_sdk::mesh::MeshBuilder;
+/// # async fn example(
+/// #     publisher: &net_sdk::Mesh,
+/// #     publisher_identity: &Identity,
+/// #     subscriber_entity_id: net::adapter::net::identity::EntityId,
+/// # ) -> net_sdk::error::Result<()> {
+/// // Publisher issues a SUBSCRIBE-scope token for the subscriber.
+/// // The publisher's own `Mesh` is bound to an `Identity`, so the
+/// // token lands in its local cache when `issue_token` is called.
+/// let channel = ChannelName::new("events/trades").unwrap();
+/// let token = publisher_identity.issue_token(
+///     subscriber_entity_id,
+///     TokenScope::SUBSCRIBE,
+///     &channel,
+///     Duration::from_secs(600),
+///     0, // no further delegation
+/// );
+///
+/// // Subscriber (another `Mesh`) calls `subscribe_channel_with`,
+/// // attaching the same token bytes they received from the
+/// // publisher out of band. The publisher verifies the signature,
+/// // checks `subject == subscriber_entity_id`, installs it in its
+/// // cache, then runs `can_subscribe`.
+/// let subscriber: &net_sdk::Mesh = unimplemented!();
+/// subscriber
+///     .subscribe_channel_with(
+///         publisher.node_id(),
+///         &channel,
+///         SubscribeOptions { token: Some(token) },
+///     )
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Default, Debug, Clone)]
+pub struct SubscribeOptions {
+    /// Token to attach to the subscribe request. The publisher
+    /// verifies + installs it before running
+    /// `ChannelConfig::can_subscribe`, so a matching token
+    /// satisfies `require_token` channels end-to-end.
+    pub token: Option<net::adapter::net::PermissionToken>,
+}
+
 /// Builder for configuring a [`Mesh`] node.
 pub struct MeshBuilder {
     bind_addr: SocketAddr,
@@ -361,11 +417,42 @@ impl Mesh {
         publisher_node_id: u64,
         channel: &ChannelName,
     ) -> Result<()> {
-        match self
-            .node
-            .subscribe_channel(publisher_node_id, channel.clone())
-            .await
-        {
+        self.subscribe_channel_with(
+            publisher_node_id,
+            channel,
+            SubscribeOptions::default(),
+        )
+        .await
+    }
+
+    /// Subscribe with options — optionally presenting a
+    /// [`PermissionToken`](crate::identity::PermissionToken).
+    ///
+    /// Use this when the publisher registered the channel with
+    /// `require_token = true` and/or a `subscribe_caps` filter that
+    /// your node's capabilities alone don't satisfy. The publisher
+    /// verifies the token on arrival (signature + subject matches
+    /// the subscribing peer's `EntityId`) and installs it into its
+    /// local `TokenCache` before the ACL check runs.
+    pub async fn subscribe_channel_with(
+        &self,
+        publisher_node_id: u64,
+        channel: &ChannelName,
+        opts: SubscribeOptions,
+    ) -> Result<()> {
+        let result = match opts.token {
+            Some(token) => {
+                self.node
+                    .subscribe_channel_with_token(publisher_node_id, channel.clone(), token)
+                    .await
+            }
+            None => {
+                self.node
+                    .subscribe_channel(publisher_node_id, channel.clone())
+                    .await
+            }
+        };
+        match result {
             Ok(()) => Ok(()),
             Err(e) => Err(adapter_to_channel_error(e)),
         }

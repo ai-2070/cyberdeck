@@ -94,7 +94,7 @@ pub use ::net::adapter::net::{
 };
 
 #[cfg(feature = "net")]
-pub use crate::mesh::{Mesh, MeshBuilder};
+pub use crate::mesh::{Mesh, MeshBuilder, SubscribeOptions};
 
 // Convenience re-exports for the common security types, so users can
 // `use net_sdk::{Identity, TokenScope};` without reaching for a

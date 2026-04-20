@@ -1972,13 +1972,29 @@ impl MeshNode {
     /// Blocks until the publisher's `Ack` arrives or
     /// `membership_ack_timeout` elapses. Returns `Ok(())` iff the publisher
     /// accepted the subscribe; `AckReason` failures surface as
-    /// `AdapterError::Connection`.
+    /// `AdapterError::Connection`. No token is presented — use
+    /// [`Self::subscribe_channel_with_token`] for channels with
+    /// `require_token` set.
     pub async fn subscribe_channel(
         &self,
         publisher_node_id: u64,
         channel: ChannelName,
     ) -> Result<(), AdapterError> {
-        self.send_membership_request(publisher_node_id, channel, true)
+        self.send_membership_request(publisher_node_id, channel, true, None)
+            .await
+    }
+
+    /// Subscribe with a pre-issued [`PermissionToken`] attached.
+    /// The publisher verifies the token and, on success, installs
+    /// it in its local `TokenCache` before the
+    /// `ChannelConfig::can_subscribe` check.
+    pub async fn subscribe_channel_with_token(
+        &self,
+        publisher_node_id: u64,
+        channel: ChannelName,
+        token: PermissionToken,
+    ) -> Result<(), AdapterError> {
+        self.send_membership_request(publisher_node_id, channel, true, Some(token.to_bytes()))
             .await
     }
 
@@ -1989,7 +2005,7 @@ impl MeshNode {
         publisher_node_id: u64,
         channel: ChannelName,
     ) -> Result<(), AdapterError> {
-        self.send_membership_request(publisher_node_id, channel, false)
+        self.send_membership_request(publisher_node_id, channel, false, None)
             .await
     }
 
@@ -1998,6 +2014,7 @@ impl MeshNode {
         publisher_node_id: u64,
         channel: ChannelName,
         subscribe: bool,
+        token: Option<Vec<u8>>,
     ) -> Result<(), AdapterError> {
         let peer_addr = {
             let peer = self.peers.get(&publisher_node_id).ok_or_else(|| {
@@ -2018,11 +2035,7 @@ impl MeshNode {
             MembershipMsg::Subscribe {
                 channel: channel.clone(),
                 nonce,
-                // Token wiring lands in E-3 (SDK surface); for now
-                // subscribers never attach a token from this path.
-                // Publishers that set `require_token = true` on the
-                // channel will reject these subscribes.
-                token: None,
+                token,
             }
         } else {
             MembershipMsg::Unsubscribe {
