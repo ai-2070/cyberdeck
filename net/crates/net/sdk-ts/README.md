@@ -161,6 +161,53 @@ retries or buffers on its own behalf — the helper methods are
 opt-in policies, not defaults. See `docs/TRANSPORT.md` for the full
 contract.
 
+## Channels (distributed pub/sub)
+
+Named pub/sub across the encrypted mesh. The publisher registers a
+channel config; subscribers ask to join via `subscribeChannel` (the
+subscribe goes through a dedicated subprotocol with an Ack round-trip);
+`publish` fans one payload out to every current subscriber.
+
+```typescript
+import { MeshNode, ChannelAuthError } from '@ai2070/net-sdk';
+
+// Publisher side.
+const b = await MeshNode.create({ bindAddr: '127.0.0.1:9001', psk });
+b.registerChannel({
+  name: 'sensors/temp',
+  visibility: 'global',           // or 'subnet-local' / 'parent-visible' / 'exported'
+  reliable: true,
+  priority: 2,
+  maxRatePps: 1000,
+});
+
+// Subscriber side (after handshake).
+await a.subscribeChannel(bNodeId, 'sensors/temp');
+
+// Fan out.
+const report = await b.publish(
+  'sensors/temp',
+  Buffer.from(JSON.stringify({ celsius: 22.5 })),
+  { reliability: 'reliable', onFailure: 'best_effort', maxInflight: 32 },
+);
+console.log(`${report.delivered}/${report.attempted} subscribers received`);
+
+// Rejections surface with typed errors:
+try {
+  await a.subscribeChannel(bNodeId, 'restricted');
+} catch (e) {
+  if (e instanceof ChannelAuthError) { /* ACL rejected */ }
+}
+```
+
+**Channel names always cross the boundary as strings.** The u16 hash
+is a transport-layer index only; ACL lookups key on the canonical
+name to avoid bypass via hash collision (see `docs/CHANNELS.md`).
+
+Subscribers today receive payloads through the existing event-bus
+`poll()` surface — a dedicated per-channel `AsyncIterable` receive
+method is a follow-up.
+
 ## CortEX & NetDb (event-sourced state)
 
 Typed, event-sourced state on top of RedEX — tasks and memories with

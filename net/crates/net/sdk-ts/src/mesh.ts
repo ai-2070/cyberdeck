@@ -356,8 +356,170 @@ export class MeshNode {
     };
   }
 
+  // =========================================================
+  // Channels (distributed pub/sub)
+  // =========================================================
+
+  /**
+   * Register a channel on this node. Subscribers who ask to join are
+   * validated against `config` before being added to the roster.
+   *
+   * Mirrors the core `ChannelConfig` field-for-field. v1 omits
+   * `publishCaps` / `subscribeCaps` — those land with the security
+   * plan's identity surface.
+   */
+  registerChannel(config: ChannelConfig): void {
+    try {
+      this.native.registerChannel({
+        name: config.name,
+        visibility: config.visibility,
+        reliable: config.reliable,
+        requireToken: config.requireToken,
+        priority: config.priority,
+        maxRatePps: config.maxRatePps,
+      });
+    } catch (e) {
+      toChannelError(e);
+    }
+  }
+
+  /**
+   * Ask `publisherNodeId` to add this node to `channel`'s subscriber
+   * set. Blocks until the publisher's `Ack` arrives or the
+   * membership-ack timeout elapses.
+   *
+   * Throws a {@link ChannelAuthError} or {@link ChannelError} on
+   * rejection; network-level failures propagate as plain `Error`.
+   */
+  async subscribeChannel(publisherNodeId: bigint, channel: string): Promise<void> {
+    try {
+      await this.native.subscribeChannel(publisherNodeId, channel);
+    } catch (e) {
+      toChannelError(e);
+    }
+  }
+
+  /** Mirror of {@link subscribeChannel}. Idempotent on the publisher side. */
+  async unsubscribeChannel(publisherNodeId: bigint, channel: string): Promise<void> {
+    try {
+      await this.native.unsubscribeChannel(publisherNodeId, channel);
+    } catch (e) {
+      toChannelError(e);
+    }
+  }
+
+  /**
+   * Publish one payload to every subscriber of `channel`. Returns a
+   * {@link PublishReport} describing per-peer outcomes.
+   */
+  async publish(
+    channel: string,
+    payload: Buffer,
+    config?: PublishConfig,
+  ): Promise<PublishReport> {
+    try {
+      const raw = await this.native.publish(channel, payload, {
+        reliability: config?.reliability,
+        onFailure: config?.onFailure,
+        maxInflight: config?.maxInflight,
+      });
+      return {
+        attempted: raw.attempted,
+        delivered: raw.delivered,
+        errors: raw.errors.map((e: { nodeId: bigint; message: string }) => ({
+          nodeId: e.nodeId,
+          message: e.message,
+        })),
+      };
+    } catch (e) {
+      toChannelError(e);
+    }
+  }
+
   /** Shutdown the mesh node. */
   async shutdown(): Promise<void> {
     await this.native.shutdown();
   }
+}
+
+// =====================================================
+// Channel types and errors
+// =====================================================
+
+export type Visibility =
+  | 'subnet-local'
+  | 'parent-visible'
+  | 'exported'
+  | 'global';
+
+export type OnFailure = 'best_effort' | 'fail_fast' | 'collect';
+
+/** Channel configuration — mirror of the core `ChannelConfig`. */
+export interface ChannelConfig {
+  /** Canonical channel name. Crosses the boundary as a string. */
+  name: string;
+  /** Default: `'global'`. */
+  visibility?: Visibility;
+  /** Default reliability for streams on this channel. */
+  reliable?: boolean;
+  /** v1 ships `false`; token enforcement requires the security plan. */
+  requireToken?: boolean;
+  /** Priority (0 = lowest). */
+  priority?: number;
+  /** Rate cap in packets per second. */
+  maxRatePps?: number;
+}
+
+/** Publish-fanout config — mirror of the core `PublishConfig`. */
+export interface PublishConfig {
+  /** Default: `'fire_and_forget'`. */
+  reliability?: Reliability;
+  /** Default: `'best_effort'`. */
+  onFailure?: OnFailure;
+  /** Max concurrent per-peer sends. Default 32. */
+  maxInflight?: number;
+}
+
+/** Per-peer report returned by {@link MeshNode.publish}. */
+export interface PublishReport {
+  attempted: number;
+  delivered: number;
+  errors: Array<{ nodeId: bigint; message: string }>;
+}
+
+/**
+ * Raised when a channel operation fails for a reason other than
+ * auth. The napi binding emits `"channel: ..."` prefixed errors that
+ * the SDK classifies into {@link ChannelAuthError} (unauthorized) or
+ * this class (everything else).
+ */
+export class ChannelError extends Error {
+  constructor(detail?: string) {
+    super(detail ?? 'channel error');
+    this.name = 'ChannelError';
+    Object.setPrototypeOf(this, ChannelError.prototype);
+  }
+}
+
+/**
+ * Raised when a Subscribe / Unsubscribe request is rejected because
+ * the subscriber isn't authorized on the publisher's channel config.
+ */
+export class ChannelAuthError extends ChannelError {
+  constructor(detail?: string) {
+    super(detail ?? 'channel: unauthorized');
+    this.name = 'ChannelAuthError';
+    Object.setPrototypeOf(this, ChannelAuthError.prototype);
+  }
+}
+
+function toChannelError(e: unknown): never {
+  const msg = (e as Error | undefined)?.message ?? '';
+  if (msg.startsWith('channel: unauthorized')) {
+    throw new ChannelAuthError(msg);
+  }
+  if (msg.startsWith('channel:')) {
+    throw new ChannelError(msg);
+  }
+  throw e;
 }

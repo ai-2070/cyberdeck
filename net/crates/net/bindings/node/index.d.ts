@@ -311,6 +311,55 @@ export declare class NetMesh {
    * stream isn't registered.
    */
   streamStats(peerNodeId: number, streamId: number): NetStreamStats | null
+  /**
+   * Register a channel on this (publisher) node. Subscribers
+   * who ask to join are validated against this config before
+   * being added to the roster.
+   *
+   * `config` is a JSON object mirroring the core `ChannelConfig`:
+   *
+   * ```json
+   * {
+   *   "name": "sensors/temp",
+   *   "visibility": "global",   // "subnet-local" | "parent-visible" | "exported" | "global"
+   *   "reliable": true,
+   *   "requireToken": false,
+   *   "priority": 0,
+   *   "maxRatePps": 1000
+   * }
+   * ```
+   *
+   * (The v1 binding does not expose `publishCaps` /
+   * `subscribeCaps` — those require a capability surface that
+   * lands with the security plan.)
+   */
+  registerChannel(config: ChannelConfigJs): void
+  /**
+   * Ask `publisher_node_id` to add this node to `channel`'s
+   * subscriber set. Blocks until the publisher's `Ack` arrives
+   * or the membership-ack timeout elapses.
+   */
+  subscribeChannel(publisherNodeId: bigint, channel: string): Promise<void>
+  /**
+   * Mirror of [`Self::subscribe_channel`]. Idempotent on the
+   * publisher side.
+   */
+  unsubscribeChannel(publisherNodeId: bigint, channel: string): Promise<void>
+  /**
+   * Publish one payload to every subscriber of `channel`.
+   * Returns a `PublishReport` describing per-peer outcomes.
+   *
+   * `config` maps to the core `PublishConfig`:
+   *
+   * ```json
+   * {
+   *   "reliability": "reliable",          // or "fire_and_forget"
+   *   "onFailure":   "best_effort",       // or "fail_fast" | "collect"
+   *   "maxInflight": 32
+   * }
+   * ```
+   */
+  publish(channel: string, payload: Buffer, config?: PublishConfigJs | undefined | null): Promise<PublishReportJs>
   /** Shutdown the mesh node. */
   shutdown(): Promise<void>
 }
@@ -529,6 +578,36 @@ export declare class TaskWatchIter {
    * `null`. Idempotent.
    */
   close(): void
+}
+
+/**
+ * JS-facing channel config, mirroring the core `ChannelConfig`
+ * field-for-field. v1 does not expose `publishCaps` /
+ * `subscribeCaps` — those arrive with the security plan.
+ */
+export interface ChannelConfigJs {
+  /**
+   * Canonical channel name. Crosses the boundary as a string
+   * (not the u16 hash) to avoid ACL bypass via collision.
+   */
+  name: string
+  /**
+   * `"subnet-local" | "parent-visible" | "exported" | "global"`.
+   * Default `"global"`.
+   */
+  visibility?: string
+  /** Default reliability for streams on this channel. */
+  reliable?: boolean
+  /**
+   * Whether subscribers must present a valid PermissionToken.
+   * v1 ships `false`; token verification requires the security
+   * plan's identity surface.
+   */
+  requireToken?: boolean
+  /** Priority (0 = lowest). */
+  priority?: number
+  /** Rate cap in packets per second. */
+  maxRatePps?: number
 }
 
 /**
@@ -774,6 +853,34 @@ export interface PollResponse {
   nextId?: string
   /** Whether there are more events available */
   hasMore: boolean
+}
+
+/** Publish-fanout config, mirror of the core `PublishConfig`. */
+export interface PublishConfigJs {
+  /** `"reliable" | "fire_and_forget"`. Default `"fire_and_forget"`. */
+  reliability?: string
+  /**
+   * `"best_effort" | "fail_fast" | "collect"`. Default
+   * `"best_effort"`.
+   */
+  onFailure?: string
+  /** Max concurrent per-peer sends. Default 32. */
+  maxInflight?: number
+}
+
+export interface PublishFailureJs {
+  nodeId: bigint
+  message: string
+}
+
+/** Per-peer report returned by `publish`. */
+export interface PublishReportJs {
+  /** Total subscribers the publisher attempted to reach. */
+  attempted: number
+  /** Subscribers that received the payload. */
+  delivered: number
+  /** Per-peer errors. Each entry is `{ nodeId, message }`. */
+  errors: Array<PublishFailureJs>
 }
 
 /** A materialized RedEX event: `seq` + `payload`. */

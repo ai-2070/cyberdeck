@@ -41,8 +41,9 @@ use bytes::Bytes;
 use serde::Serialize;
 
 use net::adapter::net::{
-    EntityKeypair, MeshNode, MeshNodeConfig, MigrationSubprotocolHandler, Stream, StreamConfig,
-    StreamStats,
+    AckReason, ChannelConfig, ChannelConfigRegistry, ChannelName, ChannelPublisher, EntityKeypair,
+    MeshNode, MeshNodeConfig, MigrationSubprotocolHandler, PublishConfig, PublishReport, Stream,
+    StreamConfig, StreamStats,
 };
 use net::adapter::Adapter;
 use net::event::StoredEvent;
@@ -100,8 +101,16 @@ impl MeshBuilder {
             .with_num_shards(self.num_shards)
             .with_handshake(3, Duration::from_secs(5));
 
-        let node = MeshNode::new(identity, config).await?;
-        Ok(Mesh { node })
+        let mut node = MeshNode::new(identity, config).await?;
+        // Install a shared ChannelConfigRegistry so `register_channel`
+        // can add entries without needing `&mut Mesh` — the registry
+        // itself uses interior mutability (DashMap).
+        let channel_configs = Arc::new(ChannelConfigRegistry::new());
+        node.set_channel_configs(channel_configs.clone());
+        Ok(Mesh {
+            node,
+            channel_configs,
+        })
     }
 }
 
@@ -112,6 +121,10 @@ impl MeshBuilder {
 /// automatic failure detection, and rerouting.
 pub struct Mesh {
     node: MeshNode,
+    /// Channel config registry shared with the underlying `MeshNode`
+    /// so `register_channel` / subscriber ACL checks operate on the
+    /// same live data.
+    channel_configs: Arc<ChannelConfigRegistry>,
 }
 
 impl Mesh {
@@ -242,6 +255,90 @@ impl Mesh {
     pub async fn recv_shard(&self, shard_id: u16, limit: usize) -> Result<Vec<StoredEvent>> {
         let result = self.node.poll_shard(shard_id, None, limit).await?;
         Ok(result.events)
+    }
+
+    // ---- Channels (distributed pub/sub) ----
+
+    /// Register a channel on this publisher. Subscribers who ask to
+    /// join are validated against `config` before being added to the
+    /// subscriber roster.
+    ///
+    /// `config.channel_id` must be built from the same canonical name
+    /// subscribers pass to `subscribe_channel`. The registry keys on
+    /// the canonical name (not the u16 hash) to avoid ACL bypass via
+    /// hash collision.
+    ///
+    /// Idempotent: re-registering the same channel replaces the prior
+    /// config.
+    pub fn register_channel(&self, config: ChannelConfig) {
+        self.channel_configs.insert(config);
+    }
+
+    /// Ask `publisher_node_id` to add this node to `channel`'s
+    /// subscriber set. Blocks until the publisher's `Ack` arrives or
+    /// the mesh's membership-ack timeout elapses.
+    ///
+    /// Returns `Ok(())` on acceptance; rejection (unauthorized /
+    /// unknown channel / rate-limited / too-many-channels) surfaces
+    /// as `SdkError::ChannelRejected(reason)`. Network-level failures
+    /// surface as `SdkError::Adapter(...)`.
+    pub async fn subscribe_channel(
+        &self,
+        publisher_node_id: u64,
+        channel: &ChannelName,
+    ) -> Result<()> {
+        match self
+            .node
+            .subscribe_channel(publisher_node_id, channel.clone())
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => Err(adapter_to_channel_error(e)),
+        }
+    }
+
+    /// Mirror of [`Self::subscribe_channel`]. Idempotent on the
+    /// publisher side — unsubscribing a non-subscriber still returns
+    /// `Ok(())`.
+    pub async fn unsubscribe_channel(
+        &self,
+        publisher_node_id: u64,
+        channel: &ChannelName,
+    ) -> Result<()> {
+        match self
+            .node
+            .unsubscribe_channel(publisher_node_id, channel.clone())
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => Err(adapter_to_channel_error(e)),
+        }
+    }
+
+    /// Publish one payload to every subscriber of `channel`.
+    /// `config.on_failure` controls whether per-peer errors
+    /// short-circuit the fan-out. Returns a [`PublishReport`]
+    /// describing per-peer outcomes.
+    pub async fn publish(
+        &self,
+        channel: &ChannelName,
+        payload: Bytes,
+        config: PublishConfig,
+    ) -> Result<PublishReport> {
+        let publisher = ChannelPublisher::new(channel.clone(), config);
+        Ok(self.node.publish(&publisher, payload).await?)
+    }
+
+    /// Fan multiple payloads to every subscriber of `channel` as one
+    /// batch per subscriber. Semantics match [`Self::publish`].
+    pub async fn publish_many(
+        &self,
+        channel: &ChannelName,
+        payloads: &[Bytes],
+        config: PublishConfig,
+    ) -> Result<PublishReport> {
+        let publisher = ChannelPublisher::new(channel.clone(), config);
+        Ok(self.node.publish_many(&publisher, payloads).await?)
     }
 
     // ---- Routing ----
@@ -381,5 +478,34 @@ impl Mesh {
     /// Get a reference to the underlying `MeshNode`.
     pub fn inner(&self) -> &MeshNode {
         &self.node
+    }
+}
+
+/// Map an `AdapterError` from a subscribe / unsubscribe / publish
+/// call into the channel-aware `SdkError` variant. Rejection acks
+/// come through as `AdapterError::Connection("membership request
+/// rejected: Some(<reason>)")`; parse that into
+/// [`SdkError::ChannelRejected`].
+fn adapter_to_channel_error(err: net::error::AdapterError) -> SdkError {
+    use net::error::AdapterError;
+    if let AdapterError::Connection(ref msg) = err {
+        let prefix = "membership request rejected: ";
+        if let Some(tail) = msg.strip_prefix(prefix) {
+            let reason = parse_ack_reason(tail);
+            return SdkError::ChannelRejected(reason);
+        }
+    }
+    SdkError::from(err)
+}
+
+fn parse_ack_reason(s: &str) -> Option<AckReason> {
+    // `{:?}` of `Option<AckReason>` produces `Some(Unauthorized)` etc.
+    let inside = s.trim().strip_prefix("Some(")?.strip_suffix(')')?;
+    match inside {
+        "Unauthorized" => Some(AckReason::Unauthorized),
+        "UnknownChannel" => Some(AckReason::UnknownChannel),
+        "RateLimited" => Some(AckReason::RateLimited),
+        "TooManyChannels" => Some(AckReason::TooManyChannels),
+        _ => None,
     }
 }

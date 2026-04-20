@@ -73,6 +73,15 @@ pub use ::net::adapter::net::{
     CloseBehavior, Reliability, Stream as MeshStream, StreamConfig, StreamStats,
 };
 
+// Channel (distributed pub/sub) types. Ship alongside `net` because
+// they live on the mesh transport — subscribing / publishing require
+// a live `Mesh`.
+#[cfg(feature = "net")]
+pub use ::net::adapter::net::{
+    AckReason, ChannelConfig, ChannelId, ChannelName, OnFailure, PublishConfig, PublishReport,
+    Visibility,
+};
+
 #[cfg(feature = "net")]
 pub use crate::mesh::{Mesh, MeshBuilder};
 

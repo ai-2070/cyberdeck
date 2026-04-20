@@ -158,6 +158,61 @@ counts cumulative rejections for observability. See
 [`docs/STREAM_BACKPRESSURE_PLAN.md`](../docs/STREAM_BACKPRESSURE_PLAN.md)
 for the design.
 
+## Channels (distributed pub/sub)
+
+Named pub/sub over the encrypted mesh. Publishers register channels
+with access policy; subscribers ask to join via a membership
+subprotocol with an Ack round-trip. `publish` / `publish_many` fan
+payloads out to every current subscriber.
+
+```rust
+use bytes::Bytes;
+use net_sdk::mesh::{Mesh, MeshBuilder};
+use net_sdk::{ChannelConfig, ChannelId, ChannelName, PublishConfig, Reliability, Visibility};
+
+# async fn example() -> net_sdk::error::Result<()> {
+let publisher = MeshBuilder::new("127.0.0.1:9001", b"32-byte-psk-here-....")?
+    .build().await?;
+let subscriber = MeshBuilder::new("127.0.0.1:9000", b"32-byte-psk-here-....")?
+    .build().await?;
+// (handshake omitted — see Mesh Streams example)
+
+// Publisher registers a channel.
+let channel = ChannelName::new("sensors/temp").unwrap();
+publisher.register_channel(
+    ChannelConfig::new(ChannelId::new(channel.clone()))
+        .with_visibility(Visibility::Global)
+        .with_reliable(true)
+        .with_priority(2),
+);
+
+// Subscriber joins. Network-rejected acks surface as
+// `SdkError::ChannelRejected(reason)`.
+subscriber.subscribe_channel(publisher.inner().node_id(), &channel).await?;
+
+// Fan out.
+let report = publisher.publish(
+    &channel,
+    Bytes::from_static(b"22.5"),
+    PublishConfig {
+        reliability: Reliability::Reliable,
+        ..Default::default()
+    },
+).await?;
+println!("{}/{} delivered", report.delivered, report.attempted);
+# Ok(())
+# }
+```
+
+`register_channel` stores into a shared `ChannelConfigRegistry`
+installed on the underlying `MeshNode` at build time — so multiple
+`register_channel` calls are just inserts and require only `&Mesh`,
+not `&mut`.
+
+Subscribers today receive payloads via the existing `recv` /
+`recv_shard` surface. A dedicated `on_channel(&ChannelName)` stream
+is a follow-up.
+
 ## CortEX & NetDb (event-sourced state)
 
 For typed, event-sourced state — tasks and memories with filterable
@@ -245,6 +300,17 @@ design.
 | `flush()` | Flush pending batches |
 | `shutdown()` | Graceful shutdown |
 | `bus()` | Access underlying `EventBus` |
+
+### Channel surface (feature `net`)
+
+| Method | Description |
+|---|---|
+| `mesh.register_channel(config)` | Install / replace a channel's access config |
+| `mesh.subscribe_channel(peer_id, &name)` | Ask `peer_id` to add us as a subscriber |
+| `mesh.unsubscribe_channel(peer_id, &name)` | Leave a channel (idempotent) |
+| `mesh.publish(&name, bytes, cfg)` | Fan one payload to all subscribers |
+| `mesh.publish_many(&name, &[bytes], cfg)` | Fan a batch to all subscribers |
+| `SdkError::ChannelRejected(reason)` | Typed subscribe/unsubscribe rejection |
 
 ### CortEX surface (feature `cortex`)
 

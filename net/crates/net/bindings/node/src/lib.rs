@@ -938,6 +938,195 @@ mod mesh_bindings {
         pub num_shards: Option<u32>,
     }
 
+    /// JS-facing channel config, mirroring the core `ChannelConfig`
+    /// field-for-field. v1 does not expose `publishCaps` /
+    /// `subscribeCaps` — those arrive with the security plan.
+    #[napi(object)]
+    pub struct ChannelConfigJs {
+        /// Canonical channel name. Crosses the boundary as a string
+        /// (not the u16 hash) to avoid ACL bypass via collision.
+        pub name: String,
+        /// `"subnet-local" | "parent-visible" | "exported" | "global"`.
+        /// Default `"global"`.
+        pub visibility: Option<String>,
+        /// Default reliability for streams on this channel.
+        pub reliable: Option<bool>,
+        /// Whether subscribers must present a valid PermissionToken.
+        /// v1 ships `false`; token verification requires the security
+        /// plan's identity surface.
+        pub require_token: Option<bool>,
+        /// Priority (0 = lowest).
+        pub priority: Option<u8>,
+        /// Rate cap in packets per second.
+        pub max_rate_pps: Option<u32>,
+    }
+
+    impl ChannelConfigJs {
+        fn into_core(self) -> Result<net::adapter::net::ChannelConfig> {
+            let name = net::adapter::net::ChannelName::new(&self.name)
+                .map_err(|e| Error::from_reason(format!("channel: invalid name: {}", e)))?;
+            let mut cfg =
+                net::adapter::net::ChannelConfig::new(net::adapter::net::ChannelId::new(name));
+            if let Some(v) = self.visibility {
+                cfg = cfg.with_visibility(parse_visibility(&v)?);
+            }
+            if let Some(r) = self.reliable {
+                cfg = cfg.with_reliable(r);
+            }
+            if let Some(req) = self.require_token {
+                cfg = cfg.with_require_token(req);
+            }
+            if let Some(p) = self.priority {
+                cfg = cfg.with_priority(p);
+            }
+            if let Some(pps) = self.max_rate_pps {
+                cfg = cfg.with_rate_limit(pps);
+            }
+            Ok(cfg)
+        }
+    }
+
+    fn parse_visibility(s: &str) -> Result<net::adapter::net::Visibility> {
+        use net::adapter::net::Visibility;
+        match s {
+            "subnet-local" => Ok(Visibility::SubnetLocal),
+            "parent-visible" => Ok(Visibility::ParentVisible),
+            "exported" => Ok(Visibility::Exported),
+            "global" => Ok(Visibility::Global),
+            _ => Err(Error::from_reason(format!(
+                "channel: invalid visibility {:?} (expected subnet-local | parent-visible | exported | global)",
+                s
+            ))),
+        }
+    }
+
+    /// Publish-fanout config, mirror of the core `PublishConfig`.
+    #[napi(object, object_from_js = true)]
+    #[derive(Default)]
+    pub struct PublishConfigJs {
+        /// `"reliable" | "fire_and_forget"`. Default `"fire_and_forget"`.
+        pub reliability: Option<String>,
+        /// `"best_effort" | "fail_fast" | "collect"`. Default
+        /// `"best_effort"`.
+        pub on_failure: Option<String>,
+        /// Max concurrent per-peer sends. Default 32.
+        pub max_inflight: Option<u32>,
+    }
+
+    impl PublishConfigJs {
+        fn into_core(self) -> Result<net::adapter::net::PublishConfig> {
+            use net::adapter::net::{OnFailure, PublishConfig, Reliability};
+            let mut cfg = PublishConfig {
+                reliability: Reliability::FireAndForget,
+                on_failure: OnFailure::BestEffort,
+                max_inflight: 32,
+            };
+            if let Some(r) = self.reliability {
+                cfg.reliability = match r.as_str() {
+                    "reliable" => Reliability::Reliable,
+                    "fire_and_forget" => Reliability::FireAndForget,
+                    other => {
+                        return Err(Error::from_reason(format!(
+                            "channel: invalid reliability {:?}",
+                            other
+                        )));
+                    }
+                };
+            }
+            if let Some(f) = self.on_failure {
+                cfg.on_failure = match f.as_str() {
+                    "best_effort" => OnFailure::BestEffort,
+                    "fail_fast" => OnFailure::FailFast,
+                    "collect" => OnFailure::Collect,
+                    other => {
+                        return Err(Error::from_reason(format!(
+                            "channel: invalid on_failure {:?}",
+                            other
+                        )));
+                    }
+                };
+            }
+            if let Some(n) = self.max_inflight {
+                cfg.max_inflight = n as usize;
+            }
+            Ok(cfg)
+        }
+    }
+
+    /// Per-peer report returned by `publish`.
+    #[napi(object)]
+    pub struct PublishReportJs {
+        /// Total subscribers the publisher attempted to reach.
+        pub attempted: u32,
+        /// Subscribers that received the payload.
+        pub delivered: u32,
+        /// Per-peer errors. Each entry is `{ nodeId, message }`.
+        pub errors: Vec<PublishFailureJs>,
+    }
+
+    #[napi(object)]
+    pub struct PublishFailureJs {
+        pub node_id: BigInt,
+        pub message: String,
+    }
+
+    impl PublishReportJs {
+        fn from_core(report: net::adapter::net::PublishReport) -> Self {
+            PublishReportJs {
+                attempted: report.attempted as u32,
+                delivered: report.delivered as u32,
+                errors: report
+                    .errors
+                    .into_iter()
+                    .map(|(id, e)| PublishFailureJs {
+                        node_id: BigInt::from(id),
+                        message: format!("{}", e),
+                    })
+                    .collect(),
+            }
+        }
+    }
+
+    fn bigint_u64_lossless(b: BigInt) -> Result<u64> {
+        let (signed, value, lossless) = b.get_u64();
+        if signed {
+            return Err(Error::from_reason("expected non-negative BigInt".to_string()));
+        }
+        if !lossless {
+            return Err(Error::from_reason("BigInt exceeds u64 range".to_string()));
+        }
+        Ok(value)
+    }
+
+    /// Translate an `AdapterError` from a channel operation into a
+    /// napi `Error`, tagging `"channel:"` prefixed messages so the
+    /// SDK-ts layer can classify them into `ChannelError` /
+    /// `ChannelAuthError`.
+    fn map_channel_adapter_error(err: net::error::AdapterError) -> Error {
+        use net::error::AdapterError;
+        if let AdapterError::Connection(ref msg) = err {
+            let prefix = "membership request rejected: ";
+            if let Some(tail) = msg.strip_prefix(prefix) {
+                // Classify rejection reasons for typed SDK errors.
+                let reason = tail.trim();
+                if reason == "Some(Unauthorized)" {
+                    return Error::from_reason(format!("channel: unauthorized"));
+                }
+                if reason == "Some(UnknownChannel)" {
+                    return Error::from_reason(format!("channel: unknown channel"));
+                }
+                if reason == "Some(RateLimited)" {
+                    return Error::from_reason(format!("channel: rate limited"));
+                }
+                if reason == "Some(TooManyChannels)" {
+                    return Error::from_reason(format!("channel: too many channels"));
+                }
+                return Error::from_reason(format!("channel: rejected ({})", reason));
+            }
+        }
+        Error::from_reason(format!("channel: {}", err))
+    }
+
     /// A multi-peer mesh node for Node.js.
     ///
     /// Manages encrypted connections to multiple peers over a single
@@ -965,6 +1154,10 @@ mod mesh_bindings {
     #[napi]
     pub struct NetMesh {
         node: Arc<ArcSwapOption<MeshNode>>,
+        /// Channel config registry shared with the underlying MeshNode.
+        /// `register_channel` inserts here; the node's membership ACL
+        /// path reads from this same registry.
+        channel_configs: Arc<net::adapter::net::ChannelConfigRegistry>,
     }
 
     #[napi]
@@ -1001,12 +1194,19 @@ mod mesh_bindings {
 
             let identity = EntityKeypair::generate();
 
-            let node = MeshNode::new(identity, config)
+            let mut node = MeshNode::new(identity, config)
                 .await
                 .map_err(|e| Error::from_reason(format!("MeshNode creation failed: {}", e)))?;
 
+            // Install a shared ChannelConfigRegistry so `register_channel`
+            // can insert without needing `&mut NetMesh`.
+            let channel_configs =
+                Arc::new(net::adapter::net::ChannelConfigRegistry::new());
+            node.set_channel_configs(channel_configs.clone());
+
             Ok(NetMesh {
                 node: Arc::new(ArcSwapOption::from_pointee(node)),
+                channel_configs,
             })
         }
 
@@ -1332,6 +1532,107 @@ mod mesh_bindings {
                     credit_grants_received: BigInt::from(s.credit_grants_received),
                     credit_grants_sent: BigInt::from(s.credit_grants_sent),
                 }))
+        }
+
+        // =====================================================
+        // Channels (distributed pub/sub)
+        // =====================================================
+
+        /// Register a channel on this (publisher) node. Subscribers
+        /// who ask to join are validated against this config before
+        /// being added to the roster.
+        ///
+        /// `config` is a JSON object mirroring the core `ChannelConfig`:
+        ///
+        /// ```json
+        /// {
+        ///   "name": "sensors/temp",
+        ///   "visibility": "global",   // "subnet-local" | "parent-visible" | "exported" | "global"
+        ///   "reliable": true,
+        ///   "requireToken": false,
+        ///   "priority": 0,
+        ///   "maxRatePps": 1000
+        /// }
+        /// ```
+        ///
+        /// (The v1 binding does not expose `publishCaps` /
+        /// `subscribeCaps` — those require a capability surface that
+        /// lands with the security plan.)
+        #[napi]
+        pub fn register_channel(&self, config: ChannelConfigJs) -> Result<()> {
+            let cfg = config.into_core()?;
+            self.channel_configs.insert(cfg);
+            Ok(())
+        }
+
+        /// Ask `publisher_node_id` to add this node to `channel`'s
+        /// subscriber set. Blocks until the publisher's `Ack` arrives
+        /// or the membership-ack timeout elapses.
+        #[napi]
+        pub async fn subscribe_channel(
+            &self,
+            publisher_node_id: BigInt,
+            channel: String,
+        ) -> Result<()> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let pub_id = bigint_u64_lossless(publisher_node_id)?;
+            let name = net::adapter::net::ChannelName::new(&channel)
+                .map_err(|e| Error::from_reason(format!("channel: invalid name: {}", e)))?;
+            node.subscribe_channel(pub_id, name)
+                .await
+                .map_err(map_channel_adapter_error)
+        }
+
+        /// Mirror of [`Self::subscribe_channel`]. Idempotent on the
+        /// publisher side.
+        #[napi]
+        pub async fn unsubscribe_channel(
+            &self,
+            publisher_node_id: BigInt,
+            channel: String,
+        ) -> Result<()> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let pub_id = bigint_u64_lossless(publisher_node_id)?;
+            let name = net::adapter::net::ChannelName::new(&channel)
+                .map_err(|e| Error::from_reason(format!("channel: invalid name: {}", e)))?;
+            node.unsubscribe_channel(pub_id, name)
+                .await
+                .map_err(map_channel_adapter_error)
+        }
+
+        /// Publish one payload to every subscriber of `channel`.
+        /// Returns a `PublishReport` describing per-peer outcomes.
+        ///
+        /// `config` maps to the core `PublishConfig`:
+        ///
+        /// ```json
+        /// {
+        ///   "reliability": "reliable",          // or "fire_and_forget"
+        ///   "onFailure":   "best_effort",       // or "fail_fast" | "collect"
+        ///   "maxInflight": 32
+        /// }
+        /// ```
+        #[napi]
+        pub async fn publish(
+            &self,
+            channel: String,
+            payload: Buffer,
+            config: Option<PublishConfigJs>,
+        ) -> Result<PublishReportJs> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let name = net::adapter::net::ChannelName::new(&channel)
+                .map_err(|e| Error::from_reason(format!("channel: invalid name: {}", e)))?;
+            let pub_cfg = config.unwrap_or_default().into_core()?;
+            let publisher = net::adapter::net::ChannelPublisher::new(name, pub_cfg);
+            let payload_bytes = bytes::Bytes::copy_from_slice(payload.as_ref());
+            let report = node
+                .publish(&publisher, payload_bytes)
+                .await
+                .map_err(map_channel_adapter_error)?;
+            Ok(PublishReportJs::from_core(report))
         }
 
         /// Shutdown the mesh node.
