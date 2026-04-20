@@ -35,6 +35,8 @@
 //! ```
 
 pub mod config;
+#[cfg(feature = "cortex")]
+pub mod cortex;
 pub mod error;
 #[cfg(feature = "net")]
 pub mod mesh;

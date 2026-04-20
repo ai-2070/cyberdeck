@@ -161,6 +161,81 @@ retries or buffers on its own behalf — the helper methods are
 opt-in policies, not defaults. See `docs/TRANSPORT.md` for the full
 contract.
 
+## CortEX & NetDb (event-sourced state)
+
+Typed, event-sourced state on top of RedEX — tasks and memories with
+filterable queries and reactive `AsyncIterable` watches. Includes the
+`snapshotAndWatch` primitive whose race fix landed on v2, so you can
+safely "paint what's there now, then react to changes" without losing
+updates that race during construction.
+
+```typescript
+import { NetDb, TaskStatus, CortexError } from '@ai2070/net-sdk';
+
+const db = await NetDb.open({
+  originHash: 0xABCDEF01,
+  withTasks: true,
+  withMemories: true,
+  // persistentDir + persistent: true for disk-backed files
+});
+
+// CRUD through the domain API — no EventMeta plumbing.
+try {
+  const seq = db.tasks!.create(1n, 'write docs', 100n);
+  await db.tasks!.waitForSeq(seq);  // wait for the fold to apply
+} catch (e) {
+  if (e instanceof CortexError) { /* handle adapter error */ }
+  else { throw e; }
+}
+
+// Snapshot + watch: one atomic call, no race.
+const { snapshot, updates } = await db.tasks!.snapshotAndWatch({
+  status: TaskStatus.Pending,
+});
+render(snapshot);
+for await (const next of updates) {
+  render(next);
+  if (shouldStop) break;   // automatically closes the native iterator
+}
+
+db.close();
+```
+
+### Plain watches
+
+`watch()` returns the same `AsyncIterable<T[]>` shape without a
+snapshot. Prefer `snapshotAndWatch` when the caller needs the initial
+result — calling `listTasks()` + `watch()` separately races, and a
+mutation landing between them can be silently lost.
+
+```typescript
+for await (const batch of await db.tasks!.watch({ titleContains: 'ship' })) {
+  // each batch is the current filter result after a deduplicated fold tick
+}
+```
+
+### Standalone adapters
+
+If you only need one model, skip the `NetDb` facade and open the
+adapter directly against a `Redex`:
+
+```typescript
+import { Redex, TasksAdapter } from '@ai2070/net-sdk';
+
+const redex = new Redex({ persistentDir: '/var/lib/net/redex' });
+const tasks = await TasksAdapter.open(redex, 0xABCDEF01, { persistent: true });
+```
+
+### Error classes
+
+CortEX-boundary errors are typed and catchable via `instanceof`:
+
+- `CortexError` — adapter errors (fold halted, RedEX I/O, decode failures).
+- `NetDbError` — snapshot/restore bundle errors, missing-model lookups.
+
+Both are re-exported from `@ai2070/net-sdk`; you don't need a separate
+import path.
+
 ## API
 
 | Method | Description |
@@ -183,6 +258,23 @@ contract.
 | `flush()` | Flush pending batches |
 | `shutdown()` | Graceful shutdown |
 | `napi` | Access underlying NAPI binding |
+
+### CortEX surface
+
+| Entry point | Description |
+|---|---|
+| `new Redex({ persistentDir? })` | Local event-log manager |
+| `NetDb.open({ originHash, withTasks?, withMemories?, ... })` | Unified handle |
+| `NetDb.openFromSnapshot(config, bundle)` | Restore from `db.snapshot()` bundle |
+| `db.tasks` / `db.memories` | Typed adapter handles |
+| `TasksAdapter.open(redex, origin, opts?)` | Standalone tasks adapter |
+| `MemoriesAdapter.open(redex, origin, opts?)` | Standalone memories adapter |
+| `adapter.create/rename/complete/delete/...` | Domain CRUD |
+| `adapter.listTasks(filter?)` / `listMemories` | Sync snapshot query |
+| `adapter.watch(filter?)` | `AsyncIterable<T[]>` over deduplicated fold results |
+| `adapter.snapshotAndWatch(filter?)` | `{ snapshot, updates }` — atomic paint+react |
+| `adapter.snapshot()` / `openFromSnapshot` | Model-level persistence |
+| `db.snapshot()` / `NetDb.openFromSnapshot` | Bundled multi-model persistence |
 
 ## License
 

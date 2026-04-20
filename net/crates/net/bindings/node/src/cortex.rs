@@ -134,6 +134,7 @@ impl Redex {
 
 /// Task lifecycle status.
 #[napi(string_enum)]
+#[derive(Clone)]
 pub enum TaskStatus {
     Pending,
     Completed,
@@ -183,6 +184,7 @@ impl From<TasksOrderBy> for InnerTasksOrderBy {
 
 /// A materialized task record.
 #[napi(object)]
+#[derive(Clone)]
 pub struct Task {
     pub id: BigInt,
     pub title: String,
@@ -248,41 +250,7 @@ impl TaskWatchIter {
     /// iterator has been closed or the underlying stream has ended.
     #[napi]
     pub async fn next(&self) -> Option<Vec<Task>> {
-        if self.inner.is_shutdown.load(Ordering::Acquire) {
-            return None;
-        }
-        let mut guard = self.inner.stream.lock().await;
-        let stream = match guard.as_mut() {
-            Some(s) => s,
-            None => return None,
-        };
-
-        // Pre-register the shutdown waker before re-checking the flag
-        // so a close that fires between the check and the await is
-        // still observed.
-        let shutdown_fut = self.inner.shutdown.notified();
-        tokio::pin!(shutdown_fut);
-        shutdown_fut.as_mut().enable();
-
-        if self.inner.is_shutdown.load(Ordering::Acquire) {
-            *guard = None;
-            return None;
-        }
-
-        tokio::select! {
-            biased;
-            _ = shutdown_fut => {
-                *guard = None;
-                None
-            }
-            msg = stream.next() => match msg {
-                Some(items) => Some(items.into_iter().map(Task::from).collect()),
-                None => {
-                    *guard = None;
-                    None
-                }
-            }
-        }
+        task_watch_next(&self.inner).await
     }
 
     /// Terminate the iterator early. Any pending `next()` call
@@ -290,8 +258,7 @@ impl TaskWatchIter {
     /// `null`. Idempotent.
     #[napi]
     pub fn close(&self) {
-        self.inner.is_shutdown.store(true, Ordering::Release);
-        self.inner.shutdown.notify_waiters();
+        task_watch_close(&self.inner);
     }
 }
 
@@ -479,33 +446,7 @@ impl TasksAdapter {
     /// fold-forwarding task runs inside napi's tokio runtime.
     #[napi]
     pub async fn watch_tasks(&self, filter: Option<TaskFilter>) -> Result<TaskWatchIter> {
-        let mut w = self.inner.watch();
-        if let Some(f) = filter {
-            if let Some(s) = f.status {
-                w = w.where_status(s.into());
-            }
-            if let Some(s) = f.title_contains {
-                w = w.title_contains(s);
-            }
-            if let Some(ns) = f.created_after_ns {
-                w = w.created_after(bigint_u64(ns)?);
-            }
-            if let Some(ns) = f.created_before_ns {
-                w = w.created_before(bigint_u64(ns)?);
-            }
-            if let Some(ns) = f.updated_after_ns {
-                w = w.updated_after(bigint_u64(ns)?);
-            }
-            if let Some(ns) = f.updated_before_ns {
-                w = w.updated_before(bigint_u64(ns)?);
-            }
-            if let Some(o) = f.order_by {
-                w = w.order_by(o.into());
-            }
-            if let Some(l) = f.limit {
-                w = w.limit(l as usize);
-            }
-        }
+        let w = task_watcher_with_filter(&self.inner, filter)?;
         let stream: BoxStream<'static, Vec<InnerTask>> = w.stream().boxed();
         Ok(TaskWatchIter {
             inner: Arc::new(TaskWatchIterInner {
@@ -515,6 +456,143 @@ impl TasksAdapter {
             }),
         })
     }
+
+    /// Atomic "paint what's here now, then react to changes" primitive.
+    /// Computes the current filter result AND hands back an iterator
+    /// over subsequent deltas in one call so the caller can't race a
+    /// mutation that lands between a separate `listTasks` and
+    /// `watchTasks`. The iterator drops only leading emissions equal
+    /// to the returned snapshot; if a change lands during construction,
+    /// the watcher's first emission is forwarded through instead of
+    /// being silently dropped.
+    ///
+    /// Declared `async` for the same tokio-runtime reason as
+    /// [`Self::watch_tasks`].
+    #[napi]
+    pub async fn snapshot_and_watch_tasks(
+        &self,
+        filter: Option<TaskFilter>,
+    ) -> Result<TasksSnapshotAndWatch> {
+        let w = task_watcher_with_filter(&self.inner, filter)?;
+        let (snapshot, stream) = self.inner.snapshot_and_watch(w);
+        let stream: BoxStream<'static, Vec<InnerTask>> = stream;
+        Ok(TasksSnapshotAndWatch {
+            snapshot: snapshot.into_iter().map(Task::from).collect(),
+            inner: Arc::new(TaskWatchIterInner {
+                stream: TokioMutex::new(Some(stream)),
+                shutdown: Notify::new(),
+                is_shutdown: AtomicBool::new(false),
+            }),
+        })
+    }
+}
+
+fn task_watcher_with_filter(
+    adapter: &InnerTasksAdapter,
+    filter: Option<TaskFilter>,
+) -> Result<::net::adapter::net::cortex::tasks::TasksWatcher> {
+    let mut w = adapter.watch();
+    if let Some(f) = filter {
+        if let Some(s) = f.status {
+            w = w.where_status(s.into());
+        }
+        if let Some(s) = f.title_contains {
+            w = w.title_contains(s);
+        }
+        if let Some(ns) = f.created_after_ns {
+            w = w.created_after(bigint_u64(ns)?);
+        }
+        if let Some(ns) = f.created_before_ns {
+            w = w.created_before(bigint_u64(ns)?);
+        }
+        if let Some(ns) = f.updated_after_ns {
+            w = w.updated_after(bigint_u64(ns)?);
+        }
+        if let Some(ns) = f.updated_before_ns {
+            w = w.updated_before(bigint_u64(ns)?);
+        }
+        if let Some(o) = f.order_by {
+            w = w.order_by(o.into());
+        }
+        if let Some(l) = f.limit {
+            w = w.limit(l as usize);
+        }
+    }
+    Ok(w)
+}
+
+/// Result of [`TasksAdapter::snapshot_and_watch_tasks`]. The snapshot
+/// reflects the filter result at the moment of the call; `next()` /
+/// `close()` drive the delta iterator for subsequent changes.
+#[napi]
+pub struct TasksSnapshotAndWatch {
+    snapshot: Vec<Task>,
+    inner: Arc<TaskWatchIterInner>,
+}
+
+#[napi]
+impl TasksSnapshotAndWatch {
+    /// The initial filter result, captured atomically with the
+    /// watcher. Clone-on-read; safe to call from JS without
+    /// invalidating the iterator.
+    #[napi(getter)]
+    pub fn snapshot(&self) -> Vec<Task> {
+        self.snapshot.clone()
+    }
+
+    /// Wait for the next delta. Returns `null` when the iterator has
+    /// been closed or the underlying stream has ended. Mirrors
+    /// [`TaskWatchIter::next`].
+    #[napi]
+    pub async fn next(&self) -> Option<Vec<Task>> {
+        task_watch_next(&self.inner).await
+    }
+
+    /// Terminate the iterator early. Idempotent.
+    #[napi]
+    pub fn close(&self) {
+        task_watch_close(&self.inner);
+    }
+}
+
+async fn task_watch_next(inner: &Arc<TaskWatchIterInner>) -> Option<Vec<Task>> {
+    if inner.is_shutdown.load(Ordering::Acquire) {
+        return None;
+    }
+    let mut guard = inner.stream.lock().await;
+    let stream = match guard.as_mut() {
+        Some(s) => s,
+        None => return None,
+    };
+
+    let shutdown_fut = inner.shutdown.notified();
+    tokio::pin!(shutdown_fut);
+    shutdown_fut.as_mut().enable();
+
+    if inner.is_shutdown.load(Ordering::Acquire) {
+        *guard = None;
+        return None;
+    }
+
+    tokio::select! {
+        biased;
+        _ = shutdown_fut => {
+            *guard = None;
+            None
+        }
+        msg = stream.next() => match msg {
+            Some(items) => Some(items.into_iter().map(Task::from).collect()),
+            None => {
+                *guard = None;
+                None
+            }
+        }
+    }
+}
+
+fn task_watch_close(inner: &Arc<TaskWatchIterInner>) {
+    inner.is_shutdown.store(true, Ordering::Release);
+    inner.shutdown.notify_waiters();
 }
 
 // =========================================================================
@@ -547,6 +625,7 @@ impl From<MemoriesOrderBy> for InnerMemoriesOrderBy {
 
 /// A materialized memory record.
 #[napi(object)]
+#[derive(Clone)]
 pub struct Memory {
     pub id: BigInt,
     pub content: String,
@@ -615,46 +694,54 @@ impl MemoryWatchIter {
     /// iterator has been closed or the underlying stream has ended.
     #[napi]
     pub async fn next(&self) -> Option<Vec<Memory>> {
-        if self.inner.is_shutdown.load(Ordering::Acquire) {
-            return None;
-        }
-        let mut guard = self.inner.stream.lock().await;
-        let stream = match guard.as_mut() {
-            Some(s) => s,
-            None => return None,
-        };
-
-        let shutdown_fut = self.inner.shutdown.notified();
-        tokio::pin!(shutdown_fut);
-        shutdown_fut.as_mut().enable();
-
-        if self.inner.is_shutdown.load(Ordering::Acquire) {
-            *guard = None;
-            return None;
-        }
-
-        tokio::select! {
-            biased;
-            _ = shutdown_fut => {
-                *guard = None;
-                None
-            }
-            msg = stream.next() => match msg {
-                Some(items) => Some(items.into_iter().map(Memory::from).collect()),
-                None => {
-                    *guard = None;
-                    None
-                }
-            }
-        }
+        memory_watch_next(&self.inner).await
     }
 
     /// Terminate the iterator early. Idempotent.
     #[napi]
     pub fn close(&self) {
-        self.inner.is_shutdown.store(true, Ordering::Release);
-        self.inner.shutdown.notify_waiters();
+        memory_watch_close(&self.inner);
     }
+}
+
+async fn memory_watch_next(inner: &Arc<MemoryWatchIterInner>) -> Option<Vec<Memory>> {
+    if inner.is_shutdown.load(Ordering::Acquire) {
+        return None;
+    }
+    let mut guard = inner.stream.lock().await;
+    let stream = match guard.as_mut() {
+        Some(s) => s,
+        None => return None,
+    };
+
+    let shutdown_fut = inner.shutdown.notified();
+    tokio::pin!(shutdown_fut);
+    shutdown_fut.as_mut().enable();
+
+    if inner.is_shutdown.load(Ordering::Acquire) {
+        *guard = None;
+        return None;
+    }
+
+    tokio::select! {
+        biased;
+        _ = shutdown_fut => {
+            *guard = None;
+            None
+        }
+        msg = stream.next() => match msg {
+            Some(items) => Some(items.into_iter().map(Memory::from).collect()),
+            None => {
+                *guard = None;
+                None
+            }
+        }
+    }
+}
+
+fn memory_watch_close(inner: &Arc<MemoryWatchIterInner>) {
+    inner.is_shutdown.store(true, Ordering::Release);
+    inner.shutdown.notify_waiters();
 }
 
 /// Typed memories adapter handle.
@@ -854,45 +941,7 @@ impl MemoriesAdapter {
     /// [`TasksAdapter::watch_tasks`] for emission semantics.
     #[napi]
     pub async fn watch_memories(&self, filter: Option<MemoryFilter>) -> Result<MemoryWatchIter> {
-        let mut w = self.inner.watch();
-        if let Some(f) = filter {
-            if let Some(s) = f.source {
-                w = w.where_source(s);
-            }
-            if let Some(s) = f.content_contains {
-                w = w.content_contains(s);
-            }
-            if let Some(tag) = f.tag {
-                w = w.where_tag(tag);
-            }
-            if let Some(tags) = f.any_tag {
-                w = w.where_any_tag(tags);
-            }
-            if let Some(tags) = f.all_tags {
-                w = w.where_all_tags(tags);
-            }
-            if let Some(pinned) = f.pinned {
-                w = w.where_pinned(pinned);
-            }
-            if let Some(ns) = f.created_after_ns {
-                w = w.created_after(bigint_u64(ns)?);
-            }
-            if let Some(ns) = f.created_before_ns {
-                w = w.created_before(bigint_u64(ns)?);
-            }
-            if let Some(ns) = f.updated_after_ns {
-                w = w.updated_after(bigint_u64(ns)?);
-            }
-            if let Some(ns) = f.updated_before_ns {
-                w = w.updated_before(bigint_u64(ns)?);
-            }
-            if let Some(o) = f.order_by {
-                w = w.order_by(o.into());
-            }
-            if let Some(l) = f.limit {
-                w = w.limit(l as usize);
-            }
-        }
+        let w = memory_watcher_with_filter(&self.inner, filter)?;
         let stream: BoxStream<'static, Vec<InnerMemory>> = w.stream().boxed();
         Ok(MemoryWatchIter {
             inner: Arc::new(MemoryWatchIterInner {
@@ -901,6 +950,100 @@ impl MemoriesAdapter {
                 is_shutdown: AtomicBool::new(false),
             }),
         })
+    }
+
+    /// Atomic "paint + react" primitive. Mirrors
+    /// [`TasksAdapter::snapshot_and_watch_tasks`] for memories.
+    #[napi]
+    pub async fn snapshot_and_watch_memories(
+        &self,
+        filter: Option<MemoryFilter>,
+    ) -> Result<MemoriesSnapshotAndWatch> {
+        let w = memory_watcher_with_filter(&self.inner, filter)?;
+        let (snapshot, stream) = self.inner.snapshot_and_watch(w);
+        let stream: BoxStream<'static, Vec<InnerMemory>> = stream;
+        Ok(MemoriesSnapshotAndWatch {
+            snapshot: snapshot.into_iter().map(Memory::from).collect(),
+            inner: Arc::new(MemoryWatchIterInner {
+                stream: TokioMutex::new(Some(stream)),
+                shutdown: Notify::new(),
+                is_shutdown: AtomicBool::new(false),
+            }),
+        })
+    }
+}
+
+fn memory_watcher_with_filter(
+    adapter: &InnerMemoriesAdapter,
+    filter: Option<MemoryFilter>,
+) -> Result<::net::adapter::net::cortex::memories::MemoriesWatcher> {
+    let mut w = adapter.watch();
+    if let Some(f) = filter {
+        if let Some(s) = f.source {
+            w = w.where_source(s);
+        }
+        if let Some(s) = f.content_contains {
+            w = w.content_contains(s);
+        }
+        if let Some(tag) = f.tag {
+            w = w.where_tag(tag);
+        }
+        if let Some(tags) = f.any_tag {
+            w = w.where_any_tag(tags);
+        }
+        if let Some(tags) = f.all_tags {
+            w = w.where_all_tags(tags);
+        }
+        if let Some(pinned) = f.pinned {
+            w = w.where_pinned(pinned);
+        }
+        if let Some(ns) = f.created_after_ns {
+            w = w.created_after(bigint_u64(ns)?);
+        }
+        if let Some(ns) = f.created_before_ns {
+            w = w.created_before(bigint_u64(ns)?);
+        }
+        if let Some(ns) = f.updated_after_ns {
+            w = w.updated_after(bigint_u64(ns)?);
+        }
+        if let Some(ns) = f.updated_before_ns {
+            w = w.updated_before(bigint_u64(ns)?);
+        }
+        if let Some(o) = f.order_by {
+            w = w.order_by(o.into());
+        }
+        if let Some(l) = f.limit {
+            w = w.limit(l as usize);
+        }
+    }
+    Ok(w)
+}
+
+/// Result of [`MemoriesAdapter::snapshot_and_watch_memories`].
+#[napi]
+pub struct MemoriesSnapshotAndWatch {
+    snapshot: Vec<Memory>,
+    inner: Arc<MemoryWatchIterInner>,
+}
+
+#[napi]
+impl MemoriesSnapshotAndWatch {
+    /// Initial filter result captured atomically with the watcher.
+    #[napi(getter)]
+    pub fn snapshot(&self) -> Vec<Memory> {
+        self.snapshot.clone()
+    }
+
+    /// Wait for the next delta. `null` when closed / ended.
+    #[napi]
+    pub async fn next(&self) -> Option<Vec<Memory>> {
+        memory_watch_next(&self.inner).await
+    }
+
+    /// Terminate the iterator early. Idempotent.
+    #[napi]
+    pub fn close(&self) {
+        memory_watch_close(&self.inner);
     }
 }
 

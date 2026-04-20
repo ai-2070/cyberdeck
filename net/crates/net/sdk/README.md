@@ -11,7 +11,7 @@ The core `net` crate is the engine. This SDK is what Rust developers import.
 net-sdk = { path = "sdk" }
 ```
 
-Features: `redis`, `jetstream`, `net` (mesh transport), `full` (all).
+Features: `redis`, `jetstream`, `net` (mesh transport), `cortex` (event-sourced tasks/memories + NetDb), `full` (all).
 
 ## Quick Start
 
@@ -158,6 +158,74 @@ counts cumulative rejections for observability. See
 [`docs/STREAM_BACKPRESSURE_PLAN.md`](../docs/STREAM_BACKPRESSURE_PLAN.md)
 for the design.
 
+## CortEX & NetDb (event-sourced state)
+
+For typed, event-sourced state — tasks and memories with filterable
+queries and reactive watches — enable the `cortex` feature and import
+from `net_sdk::cortex`:
+
+```rust
+use net_sdk::cortex::{NetDb, Redex, TaskStatus};
+use futures::StreamExt;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let redex = Redex::new();                       // or `.with_persistent_dir("/var/lib/net")`
+    let db = NetDb::builder(redex)
+        .origin(0xABCD_EF01)                        // producer identity on every event
+        .with_tasks()
+        .with_memories()
+        .build()?;
+
+    // Ingest through the domain API; no EventMeta plumbing.
+    let seq = db.tasks().create(1, "write docs", 0)?;
+    db.tasks().wait_for_seq(seq).await;             // wait for the fold to apply
+
+    // Query the materialized state.
+    assert_eq!(db.tasks().count(), 1);
+
+    // Snapshot + watch: "paint what's there now, then react to changes."
+    // The stream drops only leading emissions that equal the snapshot,
+    // so a mutation racing during construction is still delivered.
+    let watcher = db.tasks().watch().where_status(TaskStatus::Pending);
+    let (snapshot, mut deltas) = db.tasks().snapshot_and_watch(watcher);
+    println!("initial: {} pending", snapshot.len());
+    while let Some(batch) = deltas.next().await {
+        println!("delta: {} pending", batch.len());
+    }
+    Ok(())
+}
+```
+
+### Persistence
+
+With `redex-disk` (pulled in by `cortex`), point `Redex` at a directory
+and flip `persistent(true)` on the builder:
+
+```rust
+let redex = Redex::new().with_persistent_dir("/var/lib/net/redex");
+let db = NetDb::builder(redex)
+    .origin(origin_hash)
+    .persistent(true)
+    .with_tasks()
+    .build()?;
+```
+
+Use `RedexFileConfig` + `FsyncPolicy` (both re-exported from
+`net_sdk::cortex`) to tune per-file fsync semantics.
+
+### Raw RedEX file
+
+For domain-agnostic persistent logs (no CortEX, no fold, no typed
+state), use the `Redex` manager directly via `Redex::open_file`. This
+unlocks `RedexFile::append` / `tail` for custom event pipelines.
+
+See [`docs/STORAGE_AND_CORTEX.md`](../docs/STORAGE_AND_CORTEX.md) for
+the full narrative and
+[`docs/REDEX_PLAN.md`](../docs/REDEX_PLAN.md) /
+[`docs/CORTEX_ADAPTER_PLAN.md`](../docs/CORTEX_ADAPTER_PLAN.md) for the
+design.
+
 ## API
 
 | Method | Description |
@@ -177,6 +245,20 @@ for the design.
 | `flush()` | Flush pending batches |
 | `shutdown()` | Graceful shutdown |
 | `bus()` | Access underlying `EventBus` |
+
+### CortEX surface (feature `cortex`)
+
+| Entry point | Description |
+|---|---|
+| `cortex::Redex::new()` | In-memory event-log manager |
+| `cortex::Redex::with_persistent_dir(path)` | Disk-backed manager |
+| `cortex::NetDb::builder(redex)` | Fluent `NetDb` construction |
+| `cortex::TasksAdapter::open(redex, origin)` | Open tasks model standalone |
+| `cortex::MemoriesAdapter::open(redex, origin)` | Open memories model standalone |
+| `db.tasks() / db.memories()` | Typed adapter handles on `NetDb` |
+| `adapter.snapshot_and_watch(watcher)` | Atomic initial-result + delta stream |
+| `db.snapshot()` | `NetDbSnapshot` bundle for persistence |
+| `NetDb::builder(...).build_from_snapshot(&bundle)` | Restore from bundle |
 
 ## License
 

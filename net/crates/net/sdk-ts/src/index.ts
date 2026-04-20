@@ -45,6 +45,30 @@ export type {
   Reliability,
 } from './mesh';
 
+// CortEX + NetDb (event-sourced state with reactive watches).
+export {
+  Redex,
+  NetDb,
+  TasksAdapter,
+  MemoriesAdapter,
+  TaskStatus,
+  TasksOrderBy,
+  MemoriesOrderBy,
+  CortexError,
+  NetDbError,
+} from './cortex';
+export type {
+  RedexOptions,
+  SnapshotAndWatch,
+  Task,
+  Memory,
+  TaskFilter,
+  MemoryFilter,
+  NetDbOpenConfig,
+  NetDbBundle,
+  CortexSnapshot,
+} from './cortex';
+
 // Types.
 export type {
   NetNodeConfig,

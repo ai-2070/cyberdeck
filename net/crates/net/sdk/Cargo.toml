@@ -23,4 +23,8 @@ default = []
 redis = ["net/redis"]
 jetstream = ["net/jetstream"]
 net = ["net/net"]
-full = ["redis", "jetstream", "net"]
+# CortEX adds the typed event-sourced adapters (tasks + memories) plus
+# the NetDb facade. `redex-disk` comes along so `.persistent(true)` is
+# usable from the SDK without a separate feature flip.
+cortex = ["net/netdb", "net/redex-disk"]
+full = ["redis", "jetstream", "net", "cortex"]
