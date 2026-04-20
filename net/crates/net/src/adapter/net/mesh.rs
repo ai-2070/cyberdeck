@@ -56,8 +56,8 @@ use super::behavior::loadbalance::HealthStatus;
 use super::behavior::proximity::{EnhancedPingwave, ProximityConfig, ProximityGraph};
 use super::channel::membership::{self, MembershipMsg, SUBPROTOCOL_CHANNEL_MEMBERSHIP};
 use super::channel::{
-    AckReason, ChannelConfigRegistry, ChannelId, ChannelName, ChannelPublisher, OnFailure,
-    PublishConfig, PublishReport, SubscriberRoster,
+    AckReason, AuthGuard, AuthVerdict, ChannelConfigRegistry, ChannelId, ChannelName,
+    ChannelPublisher, OnFailure, PublishConfig, PublishReport, SubscriberRoster,
 };
 use super::compute::SUBPROTOCOL_MIGRATION;
 use super::protocol::{self, EventFrame, PacketFlags, HEADER_SIZE, MAGIC, TAG_SIZE};
@@ -196,6 +196,19 @@ struct DispatchCtx {
     /// `require_token` path — unset is equivalent to "no token is
     /// ever valid."
     token_cache: Option<Arc<TokenCache>>,
+    /// Per-packet authorization fast path. `authorize_subscribe`
+    /// writes on success (via `allow_channel`) so the publish
+    /// fan-out can use the bloom filter + verified cache to admit
+    /// or drop subscribers in constant time.
+    auth_guard: Arc<AuthGuard>,
+    /// Per-peer auth-failure state (for the subscribe rate limit).
+    auth_failures: Arc<DashMap<u64, AuthFailureState>>,
+    /// Failures-per-window threshold from the parent config.
+    max_auth_failures_per_window: u16,
+    /// Rolling window length for auth-failure counting.
+    auth_failure_window: Duration,
+    /// How long a peer stays throttled after tripping the threshold.
+    auth_throttle_duration: Duration,
 }
 
 /// Result passed through the pending-ack oneshot.
@@ -276,6 +289,28 @@ pub struct MeshNodeConfig {
     /// network broadcast is skipped. Rate-limits apps that
     /// re-announce in tight loops.
     pub min_announce_interval: Duration,
+    /// Period between `TokenCache` expiry sweeps. A subscriber
+    /// whose token expires mid-subscription is evicted from the
+    /// [`SubscriberRoster`] and revoked from the [`AuthGuard`]
+    /// within one sweep interval. Set to [`Duration::MAX`] (or any
+    /// value longer than the mesh's lifetime) to disable the
+    /// sweep — publishes will still re-check the guard, so this
+    /// mainly affects how quickly stale tokens drop off the
+    /// roster.
+    pub token_sweep_interval: Duration,
+    /// Authorization-failure threshold per peer per window. A peer
+    /// that exceeds this count across a rolling
+    /// [`Self::auth_failure_window`] gets throttled — subsequent
+    /// subscribes short-circuit with `AckReason::RateLimited` for
+    /// [`Self::auth_throttle_duration`] without running the
+    /// cap-filter + ed25519 path. Set to `u16::MAX` to disable.
+    pub max_auth_failures_per_window: u16,
+    /// Rolling window over which failed subscribes are counted for
+    /// the throttle check above. Default: 60 s.
+    pub auth_failure_window: Duration,
+    /// How long a peer stays throttled after tripping the
+    /// failure threshold. Default: 30 s.
+    pub auth_throttle_duration: Duration,
 }
 
 impl MeshNodeConfig {
@@ -303,6 +338,10 @@ impl MeshNodeConfig {
             subnet: SubnetId::GLOBAL,
             subnet_policy: None,
             min_announce_interval: Duration::from_secs(10),
+            token_sweep_interval: Duration::from_secs(30),
+            max_auth_failures_per_window: 16,
+            auth_failure_window: Duration::from_secs(60),
+            auth_throttle_duration: Duration::from_secs(30),
         }
     }
 
@@ -349,6 +388,27 @@ impl MeshNodeConfig {
     /// announcement broadcasts. See [`Self::min_announce_interval`].
     pub fn with_min_announce_interval(mut self, interval: Duration) -> Self {
         self.min_announce_interval = interval;
+        self
+    }
+
+    /// Set the token-expiry sweep interval. See
+    /// [`Self::token_sweep_interval`].
+    pub fn with_token_sweep_interval(mut self, interval: Duration) -> Self {
+        self.token_sweep_interval = interval;
+        self
+    }
+
+    /// Tune the per-peer authorization-failure rate limit. See
+    /// [`Self::max_auth_failures_per_window`].
+    pub fn with_auth_failure_limit(
+        mut self,
+        max_per_window: u16,
+        window: Duration,
+        throttle: Duration,
+    ) -> Self {
+        self.max_auth_failures_per_window = max_per_window;
+        self.auth_failure_window = window;
+        self.auth_throttle_duration = throttle;
         self
     }
 
@@ -400,6 +460,96 @@ struct PendingHandshake {
 #[inline]
 fn routing_id(node_id: u64) -> u64 {
     (node_id as u32) as u64
+}
+
+/// 32-bit origin-hash projection used as the `AuthGuard` key.
+/// Matches the routing-plane truncation so `origin_hash` stays
+/// consistent with the `src_id` that forwarded packets already
+/// carry — one subscriber shows up under the same key on every
+/// publish regardless of how the packet is encoded.
+#[inline]
+fn subscriber_origin_hash(node_id: u64) -> u32 {
+    node_id as u32
+}
+
+/// Rolling-window auth-failure tracker, one entry per peer.
+/// Lives behind a per-key `Mutex` so updates from concurrent
+/// subscribes don't race each other on the same peer's counter.
+#[derive(Debug, Default)]
+struct AuthFailureState {
+    /// Failures accumulated inside the current window.
+    failures: u16,
+    /// Start of the window. Resets to `Instant::now()` once
+    /// `auth_failure_window` has elapsed since the current window
+    /// opened.
+    window_start: Option<std::time::Instant>,
+    /// If set, the peer is throttled until this instant and every
+    /// subscribe short-circuits with `RateLimited`.
+    throttled_until: Option<std::time::Instant>,
+}
+
+/// Evict subscribers whose tokens have expired. Walks the roster by
+/// peer and, for every `require_token` channel they hold, runs the
+/// full token-cache check. Expired entries are revoked in the
+/// [`AuthGuard`] and removed from the [`SubscriberRoster`].
+///
+/// Skip conditions (short-circuits to no-op):
+///
+/// - No `token_cache`: `require_token` channels reject every
+///   subscribe anyway, so the roster contains no token-gated
+///   entries.
+/// - No `channel_configs`: nothing to check `require_token`
+///   against, so every roster entry is treated as open and left
+///   alone.
+///
+/// Pulled into a free fn (not a method) so the sweep loop can
+/// call it without capturing `&self` through the async closure.
+fn sweep_expired_subscribers(
+    roster: &SubscriberRoster,
+    guard: &AuthGuard,
+    token_cache: Option<&Arc<TokenCache>>,
+    peer_entity_ids: &DashMap<u64, EntityId>,
+    channel_configs: Option<&Arc<ChannelConfigRegistry>>,
+) {
+    let (Some(cache), Some(configs)) = (token_cache, channel_configs) else {
+        return;
+    };
+    // Snapshot (node_id, entity_id) pairs so we don't hold the
+    // DashMap read guard across the token checks below.
+    let peers: Vec<(u64, EntityId)> = peer_entity_ids
+        .iter()
+        .map(|e| (*e.key(), e.value().clone()))
+        .collect();
+    for (node_id, entity_id) in peers {
+        for channel_id in roster.channels_for(node_id) {
+            let name = channel_id.name();
+            let Some(cfg) = configs.get_by_name(name.as_str()) else {
+                continue;
+            };
+            if !cfg.require_token {
+                continue;
+            }
+            // `check` validates signature + time bounds. Any error
+            // (expired, not_yet_valid, invalid_signature, not_authorized)
+            // means this subscriber is no longer authorized.
+            let authorized = cache
+                .check(
+                    &entity_id,
+                    super::identity::TokenScope::SUBSCRIBE,
+                    name.hash(),
+                )
+                .is_ok();
+            if !authorized {
+                guard.revoke_channel(subscriber_origin_hash(node_id), name);
+                roster.remove(&channel_id, node_id);
+                tracing::debug!(
+                    node_id = format!("{:#x}", node_id),
+                    channel = name.as_str(),
+                    "auth: evicted subscriber with expired/invalid token",
+                );
+            }
+        }
+    }
 }
 
 /// Default TTL for the routing header we stamp on routed handshake
@@ -524,6 +674,21 @@ pub struct MeshNode {
     /// always reject. SDK builders wire this up from the caller's
     /// `Identity`.
     token_cache: Option<Arc<TokenCache>>,
+    /// Per-packet authorization fast path. Populated when a
+    /// subscribe clears `authorize_subscribe`; consulted on every
+    /// publish fan-out via `check_fast`. The bloom filter + verified
+    /// cache keep authorization at O(1) without per-packet
+    /// signature verification. See
+    /// [`docs/CHANNEL_AUTH_GUARD_PLAN.md`](../../../../docs/CHANNEL_AUTH_GUARD_PLAN.md).
+    auth_guard: Arc<AuthGuard>,
+    /// Per-peer auth-failure tracker. Counts failed
+    /// `authorize_subscribe` attempts per `auth_failure_window` and
+    /// throttles bursts — peers that exceed
+    /// `max_auth_failures_per_window` short-circuit with
+    /// `RateLimited` for `auth_throttle_duration` without running
+    /// the cap-filter + ed25519 verify path. Successful subscribes
+    /// clear the counter for that peer.
+    auth_failures: Arc<DashMap<u64, AuthFailureState>>,
     /// Background tasks
     tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
     /// Shutdown flag
@@ -685,6 +850,8 @@ impl MeshNode {
             peer_subnets,
             peer_entity_ids,
             token_cache: None,
+            auth_guard: Arc::new(AuthGuard::new()),
+            auth_failures: Arc::new(DashMap::new()),
             tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
@@ -695,6 +862,15 @@ impl MeshNode {
     /// Get this node's ID.
     pub fn node_id(&self) -> u64 {
         self.node_id
+    }
+
+    /// The per-packet authorization fast path. Writes land here on
+    /// successful subscribe (via `AuthGuard::allow_channel`) and
+    /// reads happen on every publish fan-out. Exposed primarily for
+    /// tests + operator observability; production code should reach
+    /// for `register_channel` / `subscribe_channel` instead.
+    pub fn auth_guard(&self) -> &Arc<AuthGuard> {
+        &self.auth_guard
     }
 
     /// Get this node's ed25519 entity id (derived from the
@@ -868,6 +1044,7 @@ impl MeshNode {
         let heartbeat_handle = self.spawn_heartbeat_loop();
         let router_handle = self.router.start();
         let capability_gc_handle = self.spawn_capability_gc_loop();
+        let token_sweep_handle = self.spawn_token_sweep_loop();
 
         // Store handles — can't block here, but we need them for shutdown
         let tasks = self.tasks.clone();
@@ -877,6 +1054,7 @@ impl MeshNode {
             tasks.push(heartbeat_handle);
             tasks.push(router_handle);
             tasks.push(capability_gc_handle);
+            tasks.push(token_sweep_handle);
         });
     }
 
@@ -909,6 +1087,54 @@ impl MeshNode {
                     _ = tick.tick() => {
                         let _removed = index.gc();
                         seen.retain(|_, instant| instant.elapsed() < dedup_retention);
+                    }
+                    _ = shutdown_notify.notified() => break,
+                }
+            }
+        })
+    }
+
+    /// Spawn a periodic sweep that evicts subscribers whose tokens
+    /// have expired. Walks the roster by peer (via
+    /// `peer_entity_ids`) and, for every `require_token` channel the
+    /// peer is subscribed to, runs the full token-cache check. An
+    /// expired or invalid entry causes:
+    ///
+    /// 1. Revocation in the [`AuthGuard`] (so the next publish
+    ///    fan-out sees the denial instantly, before the next
+    ///    sweep tick).
+    /// 2. Removal from the [`SubscriberRoster`] (so `members()`
+    ///    returns the pruned list).
+    ///
+    /// Interval from `config.token_sweep_interval` (default 30 s).
+    /// Skipped when the `channel_configs` registry is `None` — a
+    /// node without a registry has no `require_token` channels to
+    /// begin with. Similarly, skipped when `token_cache` is `None`.
+    fn spawn_token_sweep_loop(&self) -> JoinHandle<()> {
+        let roster = self.roster.clone();
+        let guard = self.auth_guard.clone();
+        let cache = self.token_cache.clone();
+        let peer_entity_ids = self.peer_entity_ids.clone();
+        let channel_configs = self.channel_configs.clone();
+        let interval = self.config.token_sweep_interval;
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            // First tick fires immediately; skip it so we don't
+            // sweep empty state before any subscribes have landed.
+            tick.tick().await;
+            while !shutdown.load(Ordering::Acquire) {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        sweep_expired_subscribers(
+                            &roster,
+                            &guard,
+                            cache.as_ref(),
+                            &peer_entity_ids,
+                            channel_configs.as_ref(),
+                        );
                     }
                     _ = shutdown_notify.notified() => break,
                 }
@@ -959,6 +1185,11 @@ impl MeshNode {
             peer_subnets: self.peer_subnets.clone(),
             peer_entity_ids: self.peer_entity_ids.clone(),
             token_cache: self.token_cache.clone(),
+            auth_guard: self.auth_guard.clone(),
+            auth_failures: self.auth_failures.clone(),
+            max_auth_failures_per_window: self.config.max_auth_failures_per_window,
+            auth_failure_window: self.config.auth_failure_window,
+            auth_throttle_duration: self.config.auth_throttle_duration,
         };
 
         tokio::spawn(async move {
@@ -2161,12 +2392,36 @@ impl MeshNode {
                 let (accepted, reason) =
                     Self::authorize_subscribe(&channel, from_node, token.as_deref(), ctx);
                 if accepted {
+                    // Populate the AuthGuard fast path so publish
+                    // fan-out can admit this subscriber in <10 ns
+                    // without re-walking the ACL. Mirrors the
+                    // `roster.add` below — both are keyed on the
+                    // channel name so they stay consistent.
+                    ctx.auth_guard
+                        .allow_channel(subscriber_origin_hash(from_node), &channel);
                     let id = ChannelId::new(channel);
                     ctx.roster.add(id, from_node);
+                    Self::clear_auth_failures(from_node, ctx);
+                } else if !matches!(
+                    reason,
+                    Some(AckReason::TooManyChannels) | Some(AckReason::RateLimited)
+                ) {
+                    // Count auth-rule rejections toward the
+                    // failure budget. Resource limits
+                    // (TooManyChannels) and throttle short-
+                    // circuits (RateLimited) don't — the former
+                    // is orthogonal, the latter is the *result*
+                    // of past failures and would double-count.
+                    Self::record_auth_failure(from_node, ctx);
                 }
                 Self::send_membership_ack(from_node, nonce, accepted, reason, ctx);
             }
             MembershipMsg::Unsubscribe { channel, nonce } => {
+                // Revoke from the fast path first so any in-flight
+                // publish stops admitting this subscriber even
+                // before the roster update is visible.
+                ctx.auth_guard
+                    .revoke_channel(subscriber_origin_hash(from_node), &channel);
                 let id = ChannelId::new(channel);
                 ctx.roster.remove(&id, from_node);
                 // Unsubscribe is always accepted — idempotent even if the
@@ -2418,6 +2673,14 @@ impl MeshNode {
         token_bytes: Option<&[u8]>,
         ctx: &DispatchCtx,
     ) -> (bool, Option<AckReason>) {
+        // Rate-limit check runs first — a throttled peer short-
+        // circuits without consuming any ed25519 work. The
+        // failure counter increments only on actual auth-rule
+        // rejections below (not on `TooManyChannels`, which is a
+        // resource-limit failure, not an auth failure).
+        if Self::is_auth_throttled(from_node, ctx) {
+            return (false, Some(AckReason::RateLimited));
+        }
         if ctx.roster.channels_for_peer_count(from_node) >= ctx.max_channels_per_peer {
             return (false, Some(AckReason::TooManyChannels));
         }
@@ -2500,6 +2763,64 @@ impl MeshNode {
             return (false, Some(AckReason::Unauthorized));
         }
         (true, None)
+    }
+
+    /// Check whether `from_node` is currently auth-throttled.
+    /// Reads + clears the `throttled_until` instant atomically so
+    /// an expired throttle state doesn't leak into future windows.
+    fn is_auth_throttled(from_node: u64, ctx: &DispatchCtx) -> bool {
+        if ctx.max_auth_failures_per_window == u16::MAX {
+            return false; // threshold disabled
+        }
+        let Some(mut entry) = ctx.auth_failures.get_mut(&from_node) else {
+            return false;
+        };
+        match entry.throttled_until {
+            Some(until) if std::time::Instant::now() < until => true,
+            Some(_) => {
+                // Throttle elapsed — reset so the peer gets a
+                // clean slate next time around.
+                entry.throttled_until = None;
+                entry.failures = 0;
+                entry.window_start = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Record an authorization-rule rejection against `from_node`.
+    /// Increments the rolling-window counter; once it crosses
+    /// `max_auth_failures_per_window`, marks the peer as throttled
+    /// for `auth_throttle_duration`.
+    fn record_auth_failure(from_node: u64, ctx: &DispatchCtx) {
+        if ctx.max_auth_failures_per_window == u16::MAX {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let mut entry = ctx.auth_failures.entry(from_node).or_default();
+        // Window reset: if the current window has elapsed, start
+        // fresh. Keeps failure counts from leaking across honest
+        // retry storms separated by long idle periods.
+        let reset_window = match entry.window_start {
+            Some(start) => now.duration_since(start) >= ctx.auth_failure_window,
+            None => true,
+        };
+        if reset_window {
+            entry.window_start = Some(now);
+            entry.failures = 0;
+        }
+        entry.failures = entry.failures.saturating_add(1);
+        if entry.failures >= ctx.max_auth_failures_per_window {
+            entry.throttled_until = Some(now + ctx.auth_throttle_duration);
+        }
+    }
+
+    /// Wipe `from_node`'s failure counter. Called after a successful
+    /// subscribe so honest peers that occasionally fail (stale
+    /// token, renewal race) don't accumulate toward the throttle.
+    fn clear_auth_failures(from_node: u64, ctx: &DispatchCtx) {
+        ctx.auth_failures.remove(&from_node);
     }
 
     /// `true` if a packet with `visibility` originating in `source`
@@ -2663,6 +2984,43 @@ impl MeshNode {
                 .map(|e| *e.value())
                 .unwrap_or(SubnetId::GLOBAL);
             Self::subnet_visible(self.local_subnet, peer_subnet, visibility)
+        });
+
+        // AuthGuard fast path. Populated by `authorize_subscribe`;
+        // revoked on unsubscribe and by the expiry sweep. Consulted
+        // on every publish so revocations take effect on the next
+        // fan-out without waiting for a roster refresh.
+        //
+        // Three-way verdict:
+        //
+        // - `Allowed`: bloom hit + verified-cache entry says yes.
+        // - `Denied`: bloom miss — no auth entry exists for this
+        //   (origin, channel). Skip the subscriber.
+        // - `Unknown`: bloom hit but verified cache missed. Fall
+        //   back to the exact-channel ACL. On hit, promote back
+        //   into the verified cache so subsequent publishes take
+        //   the fast path.
+        //
+        // Open channels (no auth configured) are admitted on every
+        // subscribe via `allow_channel`, so the fast path trivially
+        // passes for them — no conditional branch needed.
+        let channel_name = publisher.channel().name().clone();
+        let channel_hash = channel_name.hash();
+        let auth_guard = self.auth_guard.clone();
+        subscribers.retain(|peer_id| {
+            let origin = subscriber_origin_hash(*peer_id);
+            match auth_guard.check_fast(origin, channel_hash) {
+                AuthVerdict::Allowed => true,
+                AuthVerdict::Denied => false,
+                AuthVerdict::NeedsFullCheck => {
+                    if auth_guard.is_authorized_full(origin, &channel_name) {
+                        auth_guard.allow_channel(origin, &channel_name);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }
         });
 
         let mut report = PublishReport {

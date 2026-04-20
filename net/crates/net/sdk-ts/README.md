@@ -335,9 +335,17 @@ await subscriber.subscribeChannel(
 
 Denied subscribes surface as `ChannelAuthError` (a subclass of
 `ChannelError`); malformed token bytes raise `TokenError` before
-any network I/O. Cross-SDK behaviour is fixed by the Rust
-integration suite — see
+any network I/O. Successful subscribes populate an `AuthGuard`
+bloom filter on the publisher so every subsequent publish admits
+the subscriber in constant time (~20 ns per check,
+single-threaded). Expired tokens evict within the publisher's
+`token_sweep_interval` (default 30 s); repeated subscribe
+failures from the same peer throttle via `RateLimited` acks so
+bad-token storms never tie up ed25519 verification. Cross-SDK
+behaviour is fixed by the Rust integration suite — see
 [`SDK_SECURITY_SURFACE_PLAN.md`](../docs/SDK_SECURITY_SURFACE_PLAN.md)
+and
+[`CHANNEL_AUTH_GUARD_PLAN.md`](../docs/CHANNEL_AUTH_GUARD_PLAN.md)
 for the full contract.
 
 ## Channels (distributed pub/sub)

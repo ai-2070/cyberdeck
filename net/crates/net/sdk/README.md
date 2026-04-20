@@ -429,17 +429,33 @@ subscriber
 
 - Full enforcement at subscribe + publish; empty-caps / missing-
   entity defaults fail closed when `require_token` is set.
+- Every publish fan-out consults the `AuthGuard` fast path (4 KB
+  bloom filter + verified-subscribe cache) so revocations apply on
+  the next publish without a roster refresh. Single-threaded
+  microbenchmark: ~20 ns per `check_fast` call.
+- Periodic token-expiry sweep (default 30 s,
+  `MeshNodeConfig::with_token_sweep_interval`) evicts subscribers
+  whose tokens age out of their TTL — they stop receiving events
+  within one sweep tick instead of staying on the roster forever.
+- Per-peer auth-failure rate limiter (`with_auth_failure_limit`,
+  default 16 failures per 60 s window → 30 s throttle) short-
+  circuits bad-token subscribe storms with `AckReason::RateLimited`
+  before ed25519 verification runs. Successful subscribes clear
+  the counter.
 - `CapabilityAnnouncement` now carries the sender's `entity_id` and
   is signed — verified end-to-end (closes the "signature advisory"
   caveat from the capability section above).
 - `node_id → entity_id` is pinned on first sight (TOFU); rebind
   attempts in later announcements are silently rejected.
-- Any denial surfaces as `AckReason::Unauthorized`; we don't split
-  sub-reasons yet (cap-failed vs token-failed vs subnet-failed).
-  Flag as a follow-up if debugging needs finer granularity.
+- Any auth-rule denial surfaces as `AckReason::Unauthorized`;
+  throttled bursts surface as `AckReason::RateLimited`. Sub-reasons
+  within the auth rejection (cap-failed vs token-failed vs
+  subnet-failed) are not split yet.
 
 Wire-format details and the token presentation flow live in
-[`docs/CHANNEL_AUTH_PLAN.md`](../docs/CHANNEL_AUTH_PLAN.md).
+[`docs/CHANNEL_AUTH_PLAN.md`](../docs/CHANNEL_AUTH_PLAN.md); the
+fast-path / sweep / rate-limit design lives in
+[`docs/CHANNEL_AUTH_GUARD_PLAN.md`](../docs/CHANNEL_AUTH_GUARD_PLAN.md).
 
 ## Channels (distributed pub/sub)
 

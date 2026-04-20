@@ -1,4 +1,13 @@
-# Channel authentication hardening — wiring AuthGuard into the mesh hot path
+# Channel authentication hardening — wiring AuthGuard into the mesh hot path — SHIPPED
+
+**Status.** AG-1 through AG-6 complete. AuthGuard is now wired into
+`MeshNode` on both sides — populated on subscribe success, revoked on
+unsubscribe, and consulted on every publish fan-out with a bloom/
+verified-cache/exact-fallback three-way dispatch. Token-expiry sweep
+evicts subscribers whose tokens age out. Per-peer auth-failure
+counter throttles bad-token subscribe storms. Bench measures
+single-threaded `check_fast` at ~20 ns (DashMap probe cost, within
+the 50 ns plan target).
 
 ## Context
 

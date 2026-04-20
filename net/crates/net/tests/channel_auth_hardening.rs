@@ -1,0 +1,581 @@
+//! Integration tests for the channel-auth hardening work in
+//! `docs/CHANNEL_AUTH_GUARD_PLAN.md` (stages AG-1 through AG-6).
+//!
+//! These tests live in a separate file from `tests/channel_auth.rs`
+//! (Stage E) so the Stage E suite remains a stable regression net
+//! for the subscribe-gate contract while the hardening work evolves.
+//!
+//! Harness conventions match `tests/channel_auth.rs`: a `Node`
+//! struct carries the mesh handle alongside its keypair + channel
+//! registry (so tests can issue tokens and register channels), and
+//! handshakes split `handshake_no_start` + `start_all` so the
+//! receive loops come up after every pair has handshaked.
+//!
+//! Run: `cargo test --features net --test channel_auth_hardening`
+
+#![cfg(feature = "net")]
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use net::adapter::net::behavior::capability::CapabilitySet;
+use net::adapter::net::{
+    ChannelConfig, ChannelConfigRegistry, ChannelId, ChannelName, ChannelPublisher, EntityKeypair,
+    MeshNode, MeshNodeConfig, OnFailure, PermissionToken, PublishConfig, Reliability,
+    SocketBufferConfig, TokenCache, TokenScope,
+};
+use tokio::net::UdpSocket;
+
+const TEST_BUFFER_SIZE: usize = 256 * 1024;
+const PSK: [u8; 32] = [0x42u8; 32];
+
+async fn find_ports(n: usize) -> Vec<u16> {
+    let mut ports = Vec::with_capacity(n);
+    let mut sockets = Vec::with_capacity(n);
+    for _ in 0..n {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        ports.push(sock.local_addr().unwrap().port());
+        sockets.push(sock);
+    }
+    drop(sockets);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    ports
+}
+
+fn test_config(port: u16) -> MeshNodeConfig {
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let mut cfg = MeshNodeConfig::new(addr, PSK)
+        .with_heartbeat_interval(Duration::from_millis(200))
+        .with_session_timeout(Duration::from_secs(5))
+        .with_handshake(3, Duration::from_secs(2))
+        .with_capability_gc_interval(Duration::from_millis(250));
+    cfg.socket_buffers = SocketBufferConfig {
+        send_buffer_size: TEST_BUFFER_SIZE,
+        recv_buffer_size: TEST_BUFFER_SIZE,
+    };
+    cfg
+}
+
+/// Wraps a `MeshNode` with its keypair (for issuing tokens), the
+/// channel registry (for registering channels post-construction),
+/// and the local `TokenCache` (so tests can pre-install publisher-
+/// side tokens without needing a public accessor on `MeshNode`).
+struct Node {
+    mesh: Arc<MeshNode>,
+    keypair: EntityKeypair,
+    registry: Arc<ChannelConfigRegistry>,
+    token_cache: Arc<TokenCache>,
+}
+
+async fn build_node(port: u16) -> Node {
+    build_node_with_cfg(port, test_config(port)).await
+}
+
+async fn build_node_with_cfg(port: u16, cfg: MeshNodeConfig) -> Node {
+    let keypair = EntityKeypair::generate();
+    let _ = port; // keypair + cfg are the load-bearing inputs
+    let mut node = MeshNode::new(keypair.clone(), cfg)
+        .await
+        .expect("MeshNode::new");
+    let registry = Arc::new(ChannelConfigRegistry::new());
+    let token_cache = Arc::new(TokenCache::new());
+    node.set_channel_configs(registry.clone());
+    node.set_token_cache(token_cache.clone());
+    Node {
+        mesh: Arc::new(node),
+        keypair,
+        registry,
+        token_cache,
+    }
+}
+
+/// Handshake A↔B and start both receive loops.
+async fn handshake(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+    let b_pub = *b.public_key();
+    let b_addr = b.local_addr();
+    let b_clone = b.clone();
+    let accept = tokio::spawn(async move { b_clone.accept(a_id).await });
+    a.connect(b_addr, &b_pub, b_id)
+        .await
+        .expect("connect failed");
+    accept
+        .await
+        .expect("accept task panicked")
+        .expect("accept failed");
+    a.start();
+    b.start();
+}
+
+async fn wait_until<F>(mut cond: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    cond()
+}
+
+/// `AuthGuard` keys on the low 32 bits of the subscriber's node id —
+/// matches the `subscriber_origin_hash` helper in `mesh.rs`.
+fn origin_hash(node_id: u64) -> u32 {
+    node_id as u32
+}
+
+// ============================================================================
+// AG-1 — AuthGuard is populated on successful subscribe
+// ============================================================================
+
+#[tokio::test]
+async fn auth_guard_populated_on_open_channel_subscribe() {
+    // Open channel (no auth required). `authorize_subscribe` takes
+    // the accept path and calls `auth_guard.allow_channel`; we
+    // observe it via `is_authorized_full`.
+    let ports = find_ports(2).await;
+    let a = build_node(ports[0]).await;
+    let b = build_node(ports[1]).await;
+    handshake(&a.mesh, &b.mesh).await;
+
+    let channel = ChannelName::new("auth/guarded").unwrap();
+    a.registry
+        .insert(ChannelConfig::new(ChannelId::new(channel.clone())));
+
+    let b_origin = origin_hash(b.mesh.node_id());
+    assert!(
+        !a.mesh.auth_guard().is_authorized_full(b_origin, &channel),
+        "guard should be empty before subscribe",
+    );
+
+    b.mesh
+        .subscribe_channel(a.mesh.node_id(), channel.clone())
+        .await
+        .expect("subscribe");
+
+    assert!(
+        wait_until(|| a.mesh.auth_guard().is_authorized_full(b_origin, &channel)).await,
+        "AuthGuard didn't admit B after a successful subscribe",
+    );
+}
+
+#[tokio::test]
+async fn auth_guard_revoked_on_unsubscribe() {
+    let ports = find_ports(2).await;
+    let a = build_node(ports[0]).await;
+    let b = build_node(ports[1]).await;
+    handshake(&a.mesh, &b.mesh).await;
+
+    let channel = ChannelName::new("auth/unsub").unwrap();
+    a.registry
+        .insert(ChannelConfig::new(ChannelId::new(channel.clone())));
+    b.mesh
+        .subscribe_channel(a.mesh.node_id(), channel.clone())
+        .await
+        .expect("subscribe");
+
+    let b_origin = origin_hash(b.mesh.node_id());
+    assert!(
+        wait_until(|| a.mesh.auth_guard().is_authorized_full(b_origin, &channel)).await,
+        "subscribe didn't populate the guard",
+    );
+
+    b.mesh
+        .unsubscribe_channel(a.mesh.node_id(), channel.clone())
+        .await
+        .expect("unsubscribe");
+
+    assert!(
+        wait_until(|| !a.mesh.auth_guard().is_authorized_full(b_origin, &channel)).await,
+        "unsubscribe didn't revoke the guard entry",
+    );
+}
+
+#[tokio::test]
+async fn auth_guard_populated_for_token_gated_subscribe() {
+    // require_token=true: subscribe goes through the
+    // token-install + exact-cap path before reaching the
+    // `allow_channel` call. Same observable outcome — the guard
+    // entry exists — but the code path is different.
+    //
+    // Token-gated subscribes need A's `peer_entity_ids` populated
+    // before B arrives, so both sides exchange capability
+    // announcements first. This mirrors the `setup_pair` helper in
+    // `tests/channel_auth.rs`.
+    let ports = find_ports(2).await;
+    let a = build_node(ports[0]).await;
+    let b = build_node(ports[1]).await;
+    handshake(&a.mesh, &b.mesh).await;
+
+    a.mesh
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("A announce");
+    b.mesh
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("B announce");
+    assert!(
+        wait_until(|| a.mesh.capability_index().get(b.mesh.node_id()).is_some()).await,
+        "A never indexed B's capability announcement",
+    );
+
+    let channel = ChannelName::new("auth/token").unwrap();
+    a.registry
+        .insert(ChannelConfig::new(ChannelId::new(channel.clone())).with_require_token(true));
+
+    let token = PermissionToken::issue(
+        &a.keypair,
+        b.keypair.entity_id().clone(),
+        TokenScope::SUBSCRIBE,
+        channel.hash(),
+        300,
+        0,
+    );
+
+    b.mesh
+        .subscribe_channel_with_token(a.mesh.node_id(), channel.clone(), token)
+        .await
+        .expect("subscribe with token");
+
+    let b_origin = origin_hash(b.mesh.node_id());
+    assert!(
+        wait_until(|| a.mesh.auth_guard().is_authorized_full(b_origin, &channel)).await,
+        "token-gated subscribe didn't populate the guard",
+    );
+}
+
+// ============================================================================
+// AG-2 — publish fan-out consults AuthGuard.check_fast
+// ============================================================================
+
+fn publisher_for(channel: ChannelName) -> ChannelPublisher {
+    ChannelPublisher::new(
+        channel,
+        PublishConfig {
+            reliability: Reliability::FireAndForget,
+            on_failure: OnFailure::BestEffort,
+            max_inflight: 16,
+        },
+    )
+}
+
+#[tokio::test]
+async fn publish_skips_revoked_subscriber() {
+    // B subscribes to an open channel; AuthGuard gets populated.
+    // A revokes B's guard entry directly. The next publish must
+    // NOT attempt delivery to B — the fan-out filter drops
+    // subscribers the guard denies.
+    let ports = find_ports(2).await;
+    let a = build_node(ports[0]).await;
+    let b = build_node(ports[1]).await;
+    handshake(&a.mesh, &b.mesh).await;
+
+    let channel = ChannelName::new("auth/revoke").unwrap();
+    a.registry
+        .insert(ChannelConfig::new(ChannelId::new(channel.clone())));
+
+    b.mesh
+        .subscribe_channel(a.mesh.node_id(), channel.clone())
+        .await
+        .expect("subscribe");
+
+    let b_origin = origin_hash(b.mesh.node_id());
+    assert!(
+        wait_until(|| a.mesh.auth_guard().is_authorized_full(b_origin, &channel)).await,
+        "subscribe didn't populate the guard",
+    );
+
+    // Baseline: publish lands on one subscriber.
+    let report = a
+        .mesh
+        .publish(&publisher_for(channel.clone()), Bytes::from_static(b"hi"))
+        .await
+        .expect("publish pre-revoke");
+    assert_eq!(
+        report.attempted, 1,
+        "pre-revoke publish didn't see B as a subscriber",
+    );
+
+    // Revoke B's guard entry directly. `roster` still lists B —
+    // the fast path is the authority for the publish side.
+    a.mesh.auth_guard().revoke_channel(b_origin, &channel);
+
+    let report = a
+        .mesh
+        .publish(&publisher_for(channel.clone()), Bytes::from_static(b"hi"))
+        .await
+        .expect("publish post-revoke");
+    assert_eq!(
+        report.attempted, 0,
+        "revoked subscriber was not filtered out by the fast path",
+    );
+}
+
+#[tokio::test]
+async fn publish_admits_normal_subscriber() {
+    // Regression for the fast path's happy case — an open channel
+    // with a subscribed peer should publish normally. Keeps us
+    // honest: AG-2 must not block valid deliveries by mistake.
+    let ports = find_ports(2).await;
+    let a = build_node(ports[0]).await;
+    let b = build_node(ports[1]).await;
+    handshake(&a.mesh, &b.mesh).await;
+
+    let channel = ChannelName::new("auth/happy").unwrap();
+    a.registry
+        .insert(ChannelConfig::new(ChannelId::new(channel.clone())));
+
+    b.mesh
+        .subscribe_channel(a.mesh.node_id(), channel.clone())
+        .await
+        .expect("subscribe");
+
+    // Three publishes in a row — after the first, the verified
+    // cache must be warm. All three should find B in the
+    // authorized set and deliver.
+    for _ in 0..3 {
+        let report = a
+            .mesh
+            .publish(&publisher_for(channel.clone()), Bytes::from_static(b"ok"))
+            .await
+            .expect("publish");
+        assert_eq!(
+            report.attempted, 1,
+            "fast path unexpectedly filtered out the subscriber",
+        );
+    }
+}
+
+// ============================================================================
+// AG-3 — token-expiry sweep evicts subscribers whose tokens have aged out
+// ============================================================================
+
+async fn build_node_fast_sweep(port: u16) -> Node {
+    // Tight sweep interval so tests don't wait 30 seconds for
+    // eviction.
+    let cfg = test_config(port).with_token_sweep_interval(Duration::from_millis(200));
+    build_node_with_cfg(port, cfg).await
+}
+
+#[tokio::test]
+async fn expired_token_evicts_subscriber_within_one_sweep() {
+    // B subscribes with a 1-second token. After the TTL passes
+    // AND the sweep runs, B's roster entry + AuthGuard entry are
+    // gone.
+    let ports = find_ports(2).await;
+    let a = build_node_fast_sweep(ports[0]).await;
+    let b = build_node(ports[1]).await;
+    handshake(&a.mesh, &b.mesh).await;
+
+    a.mesh
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("A announce");
+    b.mesh
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("B announce");
+    assert!(
+        wait_until(|| a.mesh.capability_index().get(b.mesh.node_id()).is_some()).await,
+        "A never indexed B's caps",
+    );
+
+    let channel = ChannelName::new("auth/expiring").unwrap();
+    a.registry
+        .insert(ChannelConfig::new(ChannelId::new(channel.clone())).with_require_token(true));
+
+    // Publisher needs its own PUBLISH token on a `require_token`
+    // channel — `can_publish` gates the fan-out before the
+    // subscriber check runs. Install it once; long-lived so it
+    // doesn't expire alongside B's subscribe token.
+    let pub_token = PermissionToken::issue(
+        &a.keypair,
+        a.keypair.entity_id().clone(),
+        TokenScope::PUBLISH,
+        channel.hash(),
+        3600,
+        0,
+    );
+    a.token_cache
+        .insert(pub_token)
+        .expect("install publish token");
+
+    // Short-lived subscribe token — 1 second.
+    let token = PermissionToken::issue(
+        &a.keypair,
+        b.keypair.entity_id().clone(),
+        TokenScope::SUBSCRIBE,
+        channel.hash(),
+        1,
+        0,
+    );
+
+    b.mesh
+        .subscribe_channel_with_token(a.mesh.node_id(), channel.clone(), token)
+        .await
+        .expect("subscribe with short token");
+
+    let b_origin = origin_hash(b.mesh.node_id());
+    assert!(
+        wait_until(|| a.mesh.auth_guard().is_authorized_full(b_origin, &channel)).await,
+        "subscribe didn't populate the guard",
+    );
+
+    // Wait past the token's TTL + one sweep tick.
+    tokio::time::sleep(Duration::from_millis(1_400)).await;
+
+    // Sweep should have pulled B off the roster and revoked the
+    // guard entry. Give the async loop one more tick to land.
+    assert!(
+        wait_until(|| !a.mesh.auth_guard().is_authorized_full(b_origin, &channel)).await,
+        "expired-token sweep didn't revoke the guard",
+    );
+
+    // Publish should now find zero subscribers.
+    let report = a
+        .mesh
+        .publish(
+            &publisher_for(channel.clone()),
+            Bytes::from_static(b"after-expiry"),
+        )
+        .await
+        .expect("publish after expiry");
+    assert_eq!(
+        report.attempted, 0,
+        "publish still reached an expired-token subscriber",
+    );
+}
+
+// ============================================================================
+// AG-4 — auth-failure rate limit throttles repeat offenders
+// ============================================================================
+
+async fn build_node_tight_rate_limit(port: u16) -> Node {
+    // 3 failures per window, 5s throttle, tight window so tests
+    // don't wait minutes for a reset.
+    let cfg = test_config(port).with_auth_failure_limit(
+        3,
+        Duration::from_secs(10),
+        Duration::from_secs(5),
+    );
+    build_node_with_cfg(port, cfg).await
+}
+
+#[tokio::test]
+async fn auth_failure_rate_limit_kicks_in() {
+    // A has a channel requiring `gpu` caps. B announces empty caps,
+    // so every subscribe fails with Unauthorized. After 3 failures
+    // (the tight-limit threshold), the 4th must short-circuit as
+    // RateLimited — evidence the throttle engaged before any
+    // further ed25519 work.
+    use net::adapter::net::behavior::capability::CapabilityFilter;
+
+    let ports = find_ports(2).await;
+    let a = build_node_tight_rate_limit(ports[0]).await;
+    let b = build_node(ports[1]).await;
+    handshake(&a.mesh, &b.mesh).await;
+
+    a.mesh
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("A announce");
+    b.mesh
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("B announce");
+    assert!(
+        wait_until(|| a.mesh.capability_index().get(b.mesh.node_id()).is_some()).await,
+        "A never indexed B's caps",
+    );
+
+    let channel = ChannelName::new("auth/ratelimit").unwrap();
+    a.registry.insert(
+        ChannelConfig::new(ChannelId::new(channel.clone()))
+            .with_subscribe_caps(CapabilityFilter::new().require_tag("gpu")),
+    );
+
+    // Three failed subscribes — all reject with Unauthorized.
+    for attempt in 1..=3 {
+        let err = b
+            .mesh
+            .subscribe_channel(a.mesh.node_id(), channel.clone())
+            .await
+            .expect_err("subscribe should fail — B has no gpu tag");
+        let message = format!("{}", err);
+        assert!(
+            message.contains("Unauthorized") || message.contains("Some(Unauthorized)"),
+            "attempt {}: expected Unauthorized, got {}",
+            attempt,
+            message
+        );
+    }
+
+    // Fourth subscribe should short-circuit with RateLimited.
+    let err = b
+        .mesh
+        .subscribe_channel(a.mesh.node_id(), channel.clone())
+        .await
+        .expect_err("4th subscribe should throttle");
+    let message = format!("{}", err);
+    assert!(
+        message.contains("RateLimited"),
+        "expected RateLimited on 4th attempt, got {}",
+        message
+    );
+}
+
+#[tokio::test]
+async fn successful_subscribe_clears_failure_counter() {
+    // B has empty caps; A's channel requires no caps (open). The
+    // test simulates a scenario where B briefly hits unrelated
+    // auth failures (UnknownChannel), then successfully subscribes
+    // to an open channel — the success path must clear the counter
+    // so subsequent probes don't count against the old total.
+    let ports = find_ports(2).await;
+    let a = build_node_tight_rate_limit(ports[0]).await;
+    let b = build_node(ports[1]).await;
+    handshake(&a.mesh, &b.mesh).await;
+
+    // Two subscribes to unknown channels — fail counter = 2.
+    for i in 0..2 {
+        let unknown = ChannelName::new(&format!("auth/unknown-{}", i)).unwrap();
+        let err = b
+            .mesh
+            .subscribe_channel(a.mesh.node_id(), unknown)
+            .await
+            .expect_err("unknown channel should fail");
+        let message = format!("{}", err);
+        assert!(message.contains("UnknownChannel"), "got {}", message);
+    }
+
+    // Successful subscribe to an open channel — clears counter.
+    let open = ChannelName::new("auth/open").unwrap();
+    a.registry
+        .insert(ChannelConfig::new(ChannelId::new(open.clone())));
+    b.mesh
+        .subscribe_channel(a.mesh.node_id(), open)
+        .await
+        .expect("open subscribe");
+
+    // Two more unknown-channel failures — counter starts from 0
+    // again, so we don't trip the threshold at 3.
+    for i in 0..2 {
+        let unknown = ChannelName::new(&format!("auth/miss-{}", i)).unwrap();
+        let err = b
+            .mesh
+            .subscribe_channel(a.mesh.node_id(), unknown)
+            .await
+            .expect_err("unknown channel should fail");
+        assert!(
+            !format!("{}", err).contains("RateLimited"),
+            "counter was not cleared by the successful subscribe"
+        );
+    }
+}
