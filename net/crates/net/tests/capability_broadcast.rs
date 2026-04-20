@@ -53,7 +53,15 @@ fn test_config(port: u16) -> MeshNodeConfig {
 
 /// Build an unstarted MeshNode and return it alongside its node_id.
 async fn build_node(port: u16) -> Arc<MeshNode> {
-    let cfg = test_config(port);
+    build_node_with(port, |cfg| cfg).await
+}
+
+/// Build a MeshNode with a caller-supplied tweak to the test config.
+async fn build_node_with<F>(port: u16, tweak: F) -> Arc<MeshNode>
+where
+    F: FnOnce(MeshNodeConfig) -> MeshNodeConfig,
+{
+    let cfg = tweak(test_config(port));
     let keypair = EntityKeypair::generate();
     Arc::new(MeshNode::new(keypair, cfg).await.expect("MeshNode::new"))
 }
@@ -175,6 +183,46 @@ async fn late_joiner_receives_session_open_push() {
     assert!(
         arrived,
         "session-open push did not deliver the pre-announcement"
+    );
+}
+
+#[tokio::test]
+async fn require_signed_capabilities_drops_unsigned_announcements() {
+    // Today `announce_capabilities` never stamps a signature
+    // (signing binds to Stage E). A receiver with
+    // `require_signed_capabilities = true` must therefore drop
+    // everything from a peer using the stage-C path, leaving the
+    // index empty for that peer.
+    //
+    // Receiver B has the flag on; sender A doesn't. A self-indexes
+    // its own announcement (local path bypasses receive), so a
+    // self-query on A still matches — only B's view should be blank.
+    let ports = find_ports(2).await;
+    let a = build_node(ports[0]).await;
+    let b = build_node_with(ports[1], |cfg| {
+        cfg.with_require_signed_capabilities(true)
+    })
+    .await;
+    handshake(&a, &b).await;
+
+    a.announce_capabilities(CapabilitySet::new().add_tag("classified"))
+        .await
+        .expect("announce failed");
+
+    // A sees itself (local self-index isn't subject to the flag).
+    let filter = CapabilityFilter::new().require_tag("classified");
+    assert!(
+        a.find_peers_by_filter(&filter).contains(&a.node_id()),
+        "sender lost its own self-index"
+    );
+
+    // Give the receive path a few ms to process (or drop).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // B must not have indexed A's unsigned announcement.
+    assert!(
+        !b.find_peers_by_filter(&filter).contains(&a.node_id()),
+        "receiver accepted an unsigned announcement despite require_signed_capabilities=true"
     );
 }
 

@@ -157,6 +157,18 @@ export interface MeshNodeConfig {
   sessionTimeoutMs?: number;
   /** Inbound shard count. Default: 4. */
   numShards?: number;
+  /**
+   * Capability-index GC sweep interval in milliseconds. Default:
+   * 60_000. Shorter values make TTL-driven eviction more responsive
+   * at the cost of extra CPU; primarily useful in tests.
+   */
+  capabilityGcIntervalMs?: number;
+  /**
+   * Drop inbound `CapabilityAnnouncement` packets without a
+   * signature. Default: false. Signature *validity* is not yet
+   * enforced end-to-end — this is presence-only policy today.
+   */
+  requireSignedCapabilities?: boolean;
 }
 
 /**
@@ -190,6 +202,8 @@ export class MeshNode {
       heartbeatIntervalMs: config.heartbeatIntervalMs,
       sessionTimeoutMs: config.sessionTimeoutMs,
       numShards: config.numShards,
+      capabilityGcIntervalMs: config.capabilityGcIntervalMs,
+      requireSignedCapabilities: config.requireSignedCapabilities,
     });
     return new MeshNode(native);
   }

@@ -932,6 +932,14 @@ mod mesh_bindings {
         pub session_timeout_ms: Option<u32>,
         /// Number of inbound shards (default: 4)
         pub num_shards: Option<u32>,
+        /// Capability-index GC sweep interval in milliseconds.
+        /// Default: 60_000. Shorter values make TTL-driven eviction
+        /// more responsive at the cost of extra CPU.
+        pub capability_gc_interval_ms: Option<u32>,
+        /// Drop inbound `CapabilityAnnouncement` packets without a
+        /// signature. Default: false. Signature *validity* is not
+        /// yet enforced; this is presence-only policy today.
+        pub require_signed_capabilities: Option<bool>,
     }
 
     /// JS-facing channel config, mirroring the core `ChannelConfig`
@@ -1177,6 +1185,12 @@ mod mesh_bindings {
                     Error::from_reason(format!("num_shards must be in [0, 65535]; got {}", n))
                 })?;
                 config = config.with_num_shards(n);
+            }
+            if let Some(ms) = options.capability_gc_interval_ms {
+                config = config.with_capability_gc_interval(Duration::from_millis(ms as u64));
+            }
+            if let Some(b) = options.require_signed_capabilities {
+                config = config.with_require_signed_capabilities(b);
             }
 
             let identity = EntityKeypair::generate();

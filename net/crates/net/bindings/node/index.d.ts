@@ -905,6 +905,18 @@ export interface MeshOptions {
   sessionTimeoutMs?: number
   /** Number of inbound shards (default: 4) */
   numShards?: number
+  /**
+   * Capability-index GC sweep interval in milliseconds.
+   * Default: 60_000. Shorter values make TTL-driven eviction
+   * more responsive at the cost of extra CPU.
+   */
+  capabilityGcIntervalMs?: number
+  /**
+   * Drop inbound `CapabilityAnnouncement` packets without a
+   * signature. Default: false. Signature *validity* is not
+   * yet enforced; this is presence-only policy today.
+   */
+  requireSignedCapabilities?: boolean
 }
 
 export interface ModelJs {

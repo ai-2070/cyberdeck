@@ -345,6 +345,16 @@ Add `IdentityError`, `TokenError` to `sdk-ts/src/errors.ts`. Prefix dispatch: `"
 
 ## Stage C — Capabilities across Rust + TS
 
+> **Expanded in [`CAPABILITY_BROADCAST_PLAN.md`](CAPABILITY_BROADCAST_PLAN.md).**
+> Stage C as sketched below (two methods on `Mesh`) sits on top of
+> core work the survey discovered was missing: no capability-
+> announcement subprotocol, no broadcast primitive on `MeshNode`, no
+> owned `CapabilityIndex`. That plan covers the subprotocol id, the
+> inbound dispatch + handler, session-open push, GC lifecycle, and
+> the full SDK / NAPI / TS layering — which together deliver the
+> exit criteria below at ~1.5× the original estimate. The sketch in
+> this section remains for orientation.
+
 ### NAPI — `bindings/node/src/capabilities.rs` (new)
 
 ```rust

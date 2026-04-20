@@ -207,16 +207,65 @@ let _mesh = MeshBuilder::new("127.0.0.1:9001", &[0x42u8; 32])?
   + verification + install + lookup.
 - `MeshBuilder::identity(...)` pins the keypair used by the mesh's
   Noise handshake so `node_id()` is stable.
-- Re-exports of `CapabilitySet` / `CapabilityFilter` /
-  `CapabilityAnnouncement` / `CapabilityIndex` (local-only
-  construction + match-ability today — network-side
-  `announce_capabilities` / `find_peers` land next).
+- **Capability announcements — cross-node (direct-peer).** Behind
+  the `capabilities` feature. See the subsection below.
 - Re-exports of `SubnetId` / `SubnetPolicy` / `SubnetRule` (builder
   hook + gateway wiring land next).
 
 **Treat `Identity::to_bytes()` as secret material** — it's the
 32-byte ed25519 seed. The SDK never touches a hardcoded path; where
 you put the bytes (disk, vault, enclave, k8s secret) is your call.
+
+### Capability announcements
+
+`Mesh::announce_capabilities(caps)` pushes a `CapabilityAnnouncement`
+to every directly-connected peer and self-indexes locally.
+`Mesh::find_peers(filter)` queries the local index — results include
+this node's own id when self matches.
+
+```rust
+use net_sdk::capabilities::{CapabilityFilter, CapabilitySet, GpuInfo, GpuVendor, HardwareCapabilities};
+use net_sdk::mesh::MeshBuilder;
+
+# async fn example() -> net_sdk::error::Result<()> {
+let mesh = MeshBuilder::new("127.0.0.1:0", &[0x42u8; 32])?
+    .build()
+    .await?;
+
+let hw = HardwareCapabilities::new()
+    .with_cpu(16, 32)
+    .with_memory(65_536)
+    .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24_576));
+mesh.announce_capabilities(
+    CapabilitySet::new().with_hardware(hw).add_tag("gpu"),
+)
+.await?;
+
+// Self-match: returns our own node_id.
+let hits = mesh.find_peers(
+    &CapabilityFilter::new().require_gpu().with_min_vram(16_384),
+);
+assert!(hits.contains(&mesh.node_id()));
+mesh.shutdown().await?;
+# Ok(())
+# }
+```
+
+**Scope today:**
+
+- Direct-peer push only (on `announce_*` + session-open re-push for
+  late joiners). Peers more than one hop away will not see the
+  announcement. Multi-hop gossip is a follow-up.
+- TTL + GC eviction: per-announcement `ttl_secs` drives
+  `CapabilityIndex::gc()` on a configurable tick
+  (`capability_gc_interval`, default 60 s).
+- Signatures are advisory. The `require_signed_capabilities` config
+  knob rejects unsigned announcements at the receiver, but
+  *signature validity* is not enforced end-to-end yet — it requires
+  a `node_id → entity_id` binding that lands with channel auth.
+
+Wire-level details and the subprotocol layout live in
+[`docs/CAPABILITY_BROADCAST_PLAN.md`](../docs/CAPABILITY_BROADCAST_PLAN.md).
 
 ## Channels (distributed pub/sub)
 

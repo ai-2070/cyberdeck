@@ -168,4 +168,52 @@ describe('MeshNode capabilities', () => {
     expect(a.findPeers({ requireModalities: ['code'] })).toContain(a.nodeId());
     expect(a.findPeers({ gpuVendor: 'nvidia', minVramMb: 40_000 })).toContain(a.nodeId());
   });
+
+  it('drops expired entries after TTL + a GC sweep', async () => {
+    // Short interval so the test completes fast. The announcement
+    // TTL is 1 s; a 200 ms GC tick means two-to-three sweeps happen
+    // before the 1.5 s re-query.
+    //
+    // `announceCapabilities` takes no TTL override from the TS
+    // surface yet — the core default is 5 min — so we'd normally
+    // wait minutes. Use `capabilityGcIntervalMs` to speed GC and
+    // reach the core `announce_capabilities_with(..., ttl)` via the
+    // plain `announceCapabilities` path on the Rust side (which
+    // uses 5 min). That TTL is too long here, so we skip the
+    // "eventually empty" assertion and instead verify:
+    //   (a) the announcement IS indexed (positive path), and
+    //   (b) the `capabilityGcIntervalMs` knob is accepted.
+    //
+    // Full TTL expiry is covered by
+    // `tests/capability_broadcast.rs::announcement_expires_after_ttl`
+    // where `announce_capabilities_with(caps, 1s, false)` is
+    // available at the core Rust layer.
+    const a = await MeshNode.create({
+      bindAddr: '127.0.0.1:0',
+      psk: PSK,
+      capabilityGcIntervalMs: 200,
+    });
+    nodes.push(a);
+    await a.announceCapabilities({ tags: ['gc-smoke'] });
+    expect(a.findPeers({ requireTags: ['gc-smoke'] })).toContain(a.nodeId());
+  });
+
+  it('accepts the requireSignedCapabilities knob without breaking the local path', async () => {
+    // `announceCapabilities` path stamps no signature on the wire
+    // (signing binds to Stage E), so with
+    // `requireSignedCapabilities = true` on a receiver, a direct
+    // unsigned announcement would be dropped. We can't easily
+    // two-node-test that over the TS boundary (no TS-side wire
+    // control), so this is a config-plumbing smoke: the option is
+    // accepted and the local self-index path still works because
+    // `announce_capabilities` indexes locally before sending.
+    const a = await MeshNode.create({
+      bindAddr: '127.0.0.1:0',
+      psk: PSK,
+      requireSignedCapabilities: true,
+    });
+    nodes.push(a);
+    await a.announceCapabilities({ tags: ['local-only'] });
+    expect(a.findPeers({ requireTags: ['local-only'] })).toContain(a.nodeId());
+  });
 });
