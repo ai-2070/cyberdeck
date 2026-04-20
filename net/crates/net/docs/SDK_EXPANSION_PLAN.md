@@ -502,27 +502,51 @@ Re-export the core types via `sdk/src/channels.rs` (new, gated on `channels` fea
 
 ### TS SDK — extend `sdk-ts/src/mesh.ts`
 
+The TS shape mirrors the core `ChannelConfig` (`net/crates/net/src/adapter/net/channel/config.rs`) field-for-field so the SDK wrapper stays a thin pass-through. `PublishConfig` likewise mirrors the core struct.
+
 ```typescript
+export type Visibility = 'subnet-local' | 'parent-visible' | 'exported' | 'global';
+export type Reliability = 'reliable' | 'fire-and-forget';
+export type OnFailure = 'best-effort' | 'fail-fast' | 'collect';
+
+/** Mirror of core `ChannelConfig`. */
+export interface ChannelConfig {
+  /** Canonical channel name (crosses the boundary as a string, not the u16 hash). */
+  name: string;
+  visibility: Visibility;
+  /** `CapabilityFilter` deferred to the security-surface plan; leave
+   *  `undefined` to allow any node. */
+  publishCaps?: CapabilityFilter;
+  subscribeCaps?: CapabilityFilter;
+  /** V1 ships `false`; flipping to `true` requires the identity/token
+   *  surface in SDK_SECURITY_SURFACE_PLAN.md. */
+  requireToken?: boolean;
+  /** 0 = lowest. Default 0. */
+  priority?: number;
+  /** Default reliability mode for this channel's streams. */
+  reliable?: boolean;
+  /** Optional rate cap in packets per second. */
+  ratePps?: number;
+}
+
+/** Mirror of core `PublishConfig`. */
+export interface PublishConfig {
+  reliability?: Reliability;        // default 'fire-and-forget'
+  onFailure?: OnFailure;            // default 'best-effort'
+  maxInflight?: number;             // default 32
+}
+
 export class MeshNode {
   // ... existing members ...
 
-  async registerChannel(config: {
-    name: string;
-    visibility: 'local' | 'global';
-    reliable: boolean;
-  }): Promise<void>;
-
+  async registerChannel(config: ChannelConfig): Promise<void>;
   async subscribeChannel(name: string, opts?: { timeoutMs?: number }): Promise<void>;
   async unsubscribeChannel(name: string): Promise<void>;
 
   async publish(
     name: string,
     payload: Buffer,
-    config?: {
-      reliability?: 'reliable' | 'best_effort';
-      onFailure?: 'best_effort' | 'fail_fast';
-      maxInflight?: number;
-    },
+    config?: PublishConfig,
   ): Promise<PublishReport>;
 
   onChannel(name: string): AsyncIterable<{ fromNodeId: bigint; payload: Buffer }>;
@@ -535,7 +559,7 @@ export interface PublishReport {
 }
 ```
 
-New TS error class `ChannelAuthError` (maps `AckReason::Unauthorized`). Prefix: `"channel:unauthorized:"`.
+`ChannelConfig.publishCaps` / `subscribeCaps` / `requireToken` exist on the TS surface from day one but are no-ops in v1 — the capability and token surfaces land with the security plan. Shipping the full shape now avoids a breaking change when auth turns on. New TS error class `ChannelAuthError` (maps `AckReason::Unauthorized`). Prefix: `"channel:unauthorized:"`.
 
 ### NAPI — `bindings/node/src/mesh.rs` additions
 
