@@ -1,0 +1,45 @@
+net/crates/net/bindings/go/net/regression_test.go
+  5bf3f089eecaef7a 1-204
+net/crates/net/bindings/node/src/lib.rs
+  5bf3f089eecaef7a 1504
+net/crates/net/docs/SDK_MESH_PARITY_PLAN.md
+  5bf3f089eecaef7a 28-35
+net/crates/net/sdk-ts/README.md
+  5bf3f089eecaef7a 161,174-175,186-189,210
+net/crates/net/bindings/python/src/lib.rs
+  5bf3f089eecaef7a 1510,1512-1514
+net/crates/net/sdk/README.md
+  5bf3f089eecaef7a 174,176
+net/crates/net/src/ffi/mesh.rs
+  5bf3f089eecaef7a 334-339,341-343,486-488,515-517
+net/crates/net/bindings/go/net/mesh_test.go
+  5bf3f089eecaef7a 5,8,15-21,24,27-31,33-35,66-70,182,190,195
+net/crates/net/bindings/python/tests/test_channels.py
+  5bf3f089eecaef7a 106-114
+net/crates/net/bindings/python/README.md
+  5bf3f089eecaef7a 147-148
+net/crates/net/bindings/go/net/mesh_channels_test.go
+  5bf3f089eecaef7a 101-124,134,136
+net/crates/net/bindings/go/README.md
+  5bf3f089eecaef7a 212
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "ccd049b40c74cc7bae661bf04e083099d360470e",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 4899,
+      "total_deletions": 1929,
+      "accepted_lines": 320,
+      "overriden_lines": 11
+    }
+  }
+}
