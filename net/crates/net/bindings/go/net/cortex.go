@@ -453,13 +453,27 @@ func (t *TasksAdapter) free() {
 
 // Close stops the fold task. Subsequent CRUD errors with
 // ErrCortexClosed. Idempotent.
+//
+// Two-phase so an indefinite WaitForSeq (which holds an RLock) can't
+// hang shutdown: signal the native close under RLock (fast — just an
+// atomic swap + notify, wakes pending wait_for_seq waiters), then
+// take the writer Lock to free. By the time the writer Lock is
+// contested, in-flight waiters have observed `running=false` and
+// released their RLocks.
 func (t *TasksAdapter) Close() error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.mu.RLock()
 	if t.handle == nil {
+		t.mu.RUnlock()
 		return nil
 	}
 	code := C.net_tasks_adapter_close(t.handle)
+	t.mu.RUnlock()
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.handle == nil {
+		return cortexErrorFromCode(code)
+	}
 	C.net_tasks_adapter_free(t.handle)
 	t.handle = nil
 	runtime.SetFinalizer(t, nil)
@@ -713,13 +727,23 @@ func (m *MemoriesAdapter) free() {
 	}
 }
 
+// Close stops the fold task. Subsequent ops error with
+// ErrCortexClosed. Idempotent. Two-phase — see the doc on
+// `(*TasksAdapter).Close` for why.
 func (m *MemoriesAdapter) Close() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
 	if m.handle == nil {
+		m.mu.RUnlock()
 		return nil
 	}
 	code := C.net_memories_adapter_close(m.handle)
+	m.mu.RUnlock()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.handle == nil {
+		return cortexErrorFromCode(code)
+	}
 	C.net_memories_adapter_free(m.handle)
 	m.handle = nil
 	runtime.SetFinalizer(m, nil)

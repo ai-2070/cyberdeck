@@ -178,6 +178,57 @@ func TestRegressionInvalidMemoriesOrderByRejected(t *testing.T) {
 // "never-wait" sentinel.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// P1 regression: Close() must not hang when an indefinite WaitForSeq
+// is in flight.
+//
+// Before the fix, Close took the writer Lock which blocked on the
+// WaitForSeq goroutine's RLock; WaitForSeq held that RLock through a
+// native await that only returned when `seq` was reached (or timeout
+// elapsed). With `timeout = 0` the wait is indefinite, so Close hung
+// forever. Fix: signal native close under RLock first (fast atomic +
+// notify wakes pending waiters), then take writer Lock.
+// ---------------------------------------------------------------------------
+
+func TestRegressionCloseDoesNotHangOnIndefiniteWaitForSeq(t *testing.T) {
+	r := NewRedex("")
+	defer r.Free()
+	tasks, err := OpenTasks(r, testOrigin, false)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	waitDone := make(chan error, 1)
+	go func() {
+		// Seq that will never be reached — nothing will be ingested
+		// after this. `timeout = 0` → wait indefinitely, exactly the
+		// case that previously deadlocked Close.
+		waitDone <- tasks.WaitForSeq(99999, 0)
+	}()
+
+	// Let the goroutine park inside the C wait.
+	time.Sleep(20 * time.Millisecond)
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- tasks.Close() }()
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("close returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Close hung with indefinite WaitForSeq in flight (pre-fix behavior)")
+	}
+
+	// WaitForSeq must also return, not leak the goroutine.
+	select {
+	case <-waitDone:
+	case <-time.After(1 * time.Second):
+		t.Fatalf("WaitForSeq goroutine leaked — native close didn't wake it")
+	}
+}
+
 func TestRegressionDurationToMillisU32Clamp(t *testing.T) {
 	cases := []struct {
 		name string
