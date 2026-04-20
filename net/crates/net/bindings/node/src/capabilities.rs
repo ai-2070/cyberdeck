@@ -244,7 +244,10 @@ fn accelerator_from_js(a: AcceleratorJs) -> AcceleratorInfo {
         accel_type: parse_accelerator_type(&a.kind),
         model: a.model,
         memory_mb: a.memory_mb.unwrap_or(0),
-        tops_x10: a.tops_x10.map(|v| v.min(u16::MAX as u32) as u16).unwrap_or(0),
+        tops_x10: a
+            .tops_x10
+            .map(|v| v.min(u16::MAX as u32) as u16)
+            .unwrap_or(0),
     }
 }
 
@@ -279,10 +282,8 @@ fn hardware_from_js(h: HardwareJs) -> HardwareCapabilities {
 }
 
 fn software_from_js(s: SoftwareJs) -> SoftwareCapabilities {
-    let mut sw = SoftwareCapabilities::new().with_os(
-        s.os.unwrap_or_default(),
-        s.os_version.unwrap_or_default(),
-    );
+    let mut sw = SoftwareCapabilities::new()
+        .with_os(s.os.unwrap_or_default(), s.os_version.unwrap_or_default());
     for (k, v) in pair_vec(s.runtimes) {
         sw = sw.add_runtime(k, v);
     }

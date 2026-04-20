@@ -60,26 +60,24 @@ fn get_opt_str_list(d: &Bound<'_, PyDict>, key: &str) -> PyResult<Vec<String>> {
     }
 }
 
-fn get_opt_dict<'py>(
-    d: &Bound<'py, PyDict>,
-    key: &str,
-) -> PyResult<Option<Bound<'py, PyDict>>> {
+fn get_opt_dict<'py>(d: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<Bound<'py, PyDict>>> {
     match dict_get(d, key)? {
-        Some(v) if !v.is_none() => Ok(Some(v.cast_into::<PyDict>().map_err(|_| {
-            PyTypeError::new_err(format!("field {:?} must be a dict", key))
-        })?)),
+        Some(v) if !v.is_none() => {
+            Ok(Some(v.cast_into::<PyDict>().map_err(|_| {
+                PyTypeError::new_err(format!("field {:?} must be a dict", key))
+            })?))
+        }
         _ => Ok(None),
     }
 }
 
-fn get_opt_list<'py>(
-    d: &Bound<'py, PyDict>,
-    key: &str,
-) -> PyResult<Option<Bound<'py, PyList>>> {
+fn get_opt_list<'py>(d: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<Bound<'py, PyList>>> {
     match dict_get(d, key)? {
-        Some(v) if !v.is_none() => Ok(Some(v.cast_into::<PyList>().map_err(|_| {
-            PyTypeError::new_err(format!("field {:?} must be a list", key))
-        })?)),
+        Some(v) if !v.is_none() => {
+            Ok(Some(v.cast_into::<PyList>().map_err(|_| {
+                PyTypeError::new_err(format!("field {:?} must be a list", key))
+            })?))
+        }
         _ => Ok(None),
     }
 }

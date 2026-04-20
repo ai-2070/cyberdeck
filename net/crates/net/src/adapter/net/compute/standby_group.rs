@@ -479,9 +479,24 @@ mod tests {
         // Use a local_node_id NOT in the index so placement spreads
         // across indexed nodes instead of always picking local.
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
-        index.index(CapabilityAnnouncement::new(0x1111, eid.clone(), 1, CapabilitySet::new()));
-        index.index(CapabilityAnnouncement::new(0x2222, eid.clone(), 1, CapabilitySet::new()));
-        index.index(CapabilityAnnouncement::new(0x3333, eid, 1, CapabilitySet::new()));
+        index.index(CapabilityAnnouncement::new(
+            0x1111,
+            eid.clone(),
+            1,
+            CapabilitySet::new(),
+        ));
+        index.index(CapabilityAnnouncement::new(
+            0x2222,
+            eid.clone(),
+            1,
+            CapabilitySet::new(),
+        ));
+        index.index(CapabilityAnnouncement::new(
+            0x3333,
+            eid,
+            1,
+            CapabilitySet::new(),
+        ));
         Scheduler::new(index, 0xFFFF, CapabilitySet::new())
     }
 

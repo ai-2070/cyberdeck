@@ -63,7 +63,9 @@ struct Node {
 async fn build_node(port: u16) -> Node {
     let keypair = EntityKeypair::generate();
     let cfg = test_config(port);
-    let mut node = MeshNode::new(keypair.clone(), cfg).await.expect("MeshNode::new");
+    let mut node = MeshNode::new(keypair.clone(), cfg)
+        .await
+        .expect("MeshNode::new");
     let registry = Arc::new(ChannelConfigRegistry::new());
     node.set_channel_configs(registry.clone());
     node.set_token_cache(Arc::new(TokenCache::new()));
@@ -108,15 +110,26 @@ where
 /// Handshake + start + both nodes announce capabilities so the
 /// publisher's peer_entity_ids has the subscriber's EntityId before
 /// any subscribe attempt.
-async fn setup_pair(a_port: u16, b_port: u16, a_caps: CapabilitySet, b_caps: CapabilitySet) -> (Node, Node) {
+async fn setup_pair(
+    a_port: u16,
+    b_port: u16,
+    a_caps: CapabilitySet,
+    b_caps: CapabilitySet,
+) -> (Node, Node) {
     let a = build_node(a_port).await;
     let b = build_node(b_port).await;
     handshake_no_start(&a.mesh, &b.mesh).await;
     a.mesh.start();
     b.mesh.start();
 
-    a.mesh.announce_capabilities(a_caps).await.expect("A announce");
-    b.mesh.announce_capabilities(b_caps).await.expect("B announce");
+    a.mesh
+        .announce_capabilities(a_caps)
+        .await
+        .expect("A announce");
+    b.mesh
+        .announce_capabilities(b_caps)
+        .await
+        .expect("B announce");
 
     // Wait until A sees B's entity via the capability index — same
     // dispatch populates peer_entity_ids.
@@ -141,9 +154,8 @@ async fn subscribe_denied_by_cap_filter() {
 
     let name = ChannelName::new("lab/gpu").unwrap();
     let filter = CapabilityFilter::new().require_tag("gpu");
-    a.registry.insert(
-        ChannelConfig::new(ChannelId::new(name.clone())).with_subscribe_caps(filter),
-    );
+    a.registry
+        .insert(ChannelConfig::new(ChannelId::new(name.clone())).with_subscribe_caps(filter));
 
     let result = b.mesh.subscribe_channel(a.mesh.node_id(), name).await;
     assert!(
@@ -294,9 +306,8 @@ async fn publish_denied_by_own_cap_filter() {
 
     let name = ChannelName::new("lab/admin-only").unwrap();
     let filter = CapabilityFilter::new().require_tag("admin");
-    a.registry.insert(
-        ChannelConfig::new(ChannelId::new(name.clone())).with_publish_caps(filter),
-    );
+    a.registry
+        .insert(ChannelConfig::new(ChannelId::new(name.clone())).with_publish_caps(filter));
 
     // Suppress unused-variable warning; test just needs `b` alive.
     let _ = b;
@@ -309,10 +320,7 @@ async fn publish_denied_by_own_cap_filter() {
             max_inflight: 16,
         },
     );
-    let result = a
-        .mesh
-        .publish(&publisher, Bytes::from_static(b"x"))
-        .await;
+    let result = a.mesh.publish(&publisher, Bytes::from_static(b"x")).await;
     assert!(
         result.is_err(),
         "publisher without required caps must not publish"

@@ -143,10 +143,7 @@ async fn announcement_expires_after_ttl() {
     let filter = CapabilityFilter::new().require_tag("ephemeral");
     let a_id = a.node_id();
     assert!(
-        wait_until(&b, |n| n
-            .find_peers_by_filter(&filter)
-            .contains(&a_id))
-        .await,
+        wait_until(&b, |n| n.find_peers_by_filter(&filter).contains(&a_id)).await,
         "B never indexed A's announcement in the first place"
     );
 
@@ -176,10 +173,7 @@ async fn late_joiner_receives_session_open_push() {
 
     let filter = CapabilityFilter::new().require_tag("preannounced");
     let a_id = a.node_id();
-    let arrived = wait_until(&b, |n| {
-        n.find_peers_by_filter(&filter).contains(&a_id)
-    })
-    .await;
+    let arrived = wait_until(&b, |n| n.find_peers_by_filter(&filter).contains(&a_id)).await;
     assert!(
         arrived,
         "session-open push did not deliver the pre-announcement"
@@ -197,10 +191,7 @@ async fn require_signed_capabilities_drops_unsigned_announcements() {
     // should be blank.
     let ports = find_ports(2).await;
     let a = build_node(ports[0]).await;
-    let b = build_node_with(ports[1], |cfg| {
-        cfg.with_require_signed_capabilities(true)
-    })
-    .await;
+    let b = build_node_with(ports[1], |cfg| cfg.with_require_signed_capabilities(true)).await;
     handshake(&a, &b).await;
 
     a.announce_capabilities_with(

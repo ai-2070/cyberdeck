@@ -75,12 +75,33 @@ func meshErrorFromCode(code C.int) error {
 
 // MeshConfig configures a new mesh node.
 type MeshConfig struct {
-	BindAddr          string `json:"bind_addr"`
+	BindAddr         string `json:"bind_addr"`
 	// Hex-encoded 32-byte pre-shared key.
-	PskHex            string `json:"psk_hex"`
-	HeartbeatMs       uint64 `json:"heartbeat_ms,omitempty"`
-	SessionTimeoutMs  uint64 `json:"session_timeout_ms,omitempty"`
-	NumShards         uint16 `json:"num_shards,omitempty"`
+	PskHex           string `json:"psk_hex"`
+	HeartbeatMs      uint64 `json:"heartbeat_ms,omitempty"`
+	SessionTimeoutMs uint64 `json:"session_timeout_ms,omitempty"`
+	NumShards        uint16 `json:"num_shards,omitempty"`
+
+	// CapabilityGCIntervalMs controls how often the local capability
+	// index evicts stale announcements. Leave zero for the core
+	// default.
+	CapabilityGCIntervalMs uint64 `json:"capability_gc_interval_ms,omitempty"`
+	// RequireSignedCapabilities rejects unsigned announcements when
+	// true. Leave nil/false for the core default (accept unsigned in v1).
+	RequireSignedCapabilities bool `json:"require_signed_capabilities,omitempty"`
+
+	// Subnet constrains the node to a hierarchical subnet (1–4 bytes
+	// each 0–255). Empty / nil means `SubnetId::GLOBAL`.
+	Subnet []uint32 `json:"subnet,omitempty"`
+	// SubnetPolicy derives a subnet from capability tags at runtime
+	// (alternative / complement to `Subnet`). See
+	// `docs/SDK_SECURITY_SURFACE_PLAN.md`.
+	SubnetPolicy *SubnetPolicy `json:"subnet_policy,omitempty"`
+
+	// IdentitySeedHex reproduces a mesh keypair from a 32-byte seed
+	// (64 hex chars). Matches `IdentityFromSeed(sameSeed)` so tokens
+	// issued to that identity's `EntityID` work for this mesh.
+	IdentitySeedHex string `json:"identity_seed_hex,omitempty"`
 }
 
 // StreamConfig configures an opened mesh stream.
@@ -115,6 +136,15 @@ type ChannelConfig struct {
 	RequireToken bool   `json:"require_token,omitempty"`
 	Priority     uint8  `json:"priority,omitempty"`
 	MaxRatePps   uint32 `json:"max_rate_pps,omitempty"`
+
+	// PublishCaps restricts who may publish on this channel. Set
+	// when the publisher wants to limit publishing to its own
+	// `CapabilitySet` satisfying the filter.
+	PublishCaps *CapabilityFilter `json:"publish_caps,omitempty"`
+	// SubscribeCaps restricts who may subscribe. Subscribers whose
+	// announced caps miss this filter are rejected with
+	// `ErrChannelAuth`.
+	SubscribeCaps *CapabilityFilter `json:"subscribe_caps,omitempty"`
 }
 
 // PublishConfig mirrors the core `PublishConfig`.
@@ -223,6 +253,23 @@ func (m *MeshNode) NodeID() uint64 {
 		return 0
 	}
 	return uint64(C.net_mesh_node_id(m.handle))
+}
+
+// EntityID returns this node's 32-byte ed25519 entity id. Matches
+// `IdentityFromSeed(seed).EntityID()` when the mesh was constructed
+// with `MeshConfig{IdentitySeedHex: hex.EncodeToString(seed), ...}`.
+func (m *MeshNode) EntityID() ([]byte, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	out := make([]byte, 32)
+	code := C.net_mesh_entity_id(m.handle, (*C.uint8_t)(unsafe.Pointer(&out[0])))
+	if err := meshErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // Connect (initiator). Blocks until the handshake completes.
@@ -539,6 +586,47 @@ func (m *MeshNode) SubscribeChannel(publisherNodeID uint64, channel string) erro
 		return ErrShuttingDown
 	}
 	return meshErrorFromCode(C.net_mesh_subscribe_channel(m.handle, C.uint64_t(publisherNodeID), cCh))
+}
+
+// SubscribeChannelWithToken subscribes to `channel` on
+// `publisherNodeID` while presenting a serialized `PermissionToken`
+// (typically 159 bytes — whatever `Identity.IssueToken` returned).
+// Required when the publisher set `RequireToken=true` or when the
+// subscriber's announced caps don't satisfy the publisher's
+// `SubscribeCaps` filter.
+//
+// Malformed / truncated token bytes return `ErrTokenInvalidFormat`
+// before any network I/O. Signature-tampered tokens surface as
+// `ErrChannelAuth` (the publisher rejects the request).
+func (m *MeshNode) SubscribeChannelWithToken(
+	publisherNodeID uint64,
+	channel string,
+	token []byte,
+) error {
+	if len(token) == 0 {
+		return ErrTokenInvalidFormat
+	}
+	cCh := C.CString(channel)
+	defer C.free(unsafe.Pointer(cCh))
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return ErrShuttingDown
+	}
+	code := C.net_mesh_subscribe_channel_with_token(
+		m.handle,
+		C.uint64_t(publisherNodeID),
+		cCh,
+		(*C.uint8_t)(unsafe.Pointer(&token[0])),
+		C.size_t(len(token)),
+	)
+	// Map token errors first so callers can distinguish them from
+	// the channel/auth code range.
+	switch code {
+	case -121, -122, -123, -124, -125, -126, -127:
+		return identityErrorFromCode(code)
+	}
+	return meshErrorFromCode(code)
 }
 
 // UnsubscribeChannel is the idempotent counterpart of SubscribeChannel.

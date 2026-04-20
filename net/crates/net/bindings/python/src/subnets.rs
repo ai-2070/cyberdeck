@@ -66,9 +66,9 @@ fn subnet_rule_from_py(rule_dict: &Bound<'_, PyDict>) -> PyResult<SubnetRule> {
     let mut rule = SubnetRule::new(tag_prefix, level);
     if let Some(values_obj) = rule_dict.get_item("values")? {
         if !values_obj.is_none() {
-            let values_dict = values_obj.cast_into::<PyDict>().map_err(|_| {
-                PyTypeError::new_err("subnet: rule 'values' must be a dict")
-            })?;
+            let values_dict = values_obj
+                .cast_into::<PyDict>()
+                .map_err(|_| PyTypeError::new_err("subnet: rule 'values' must be a dict"))?;
             for (key, val) in values_dict.iter() {
                 let tag_value: String = key.extract()?;
                 let raw: u32 = val.extract()?;

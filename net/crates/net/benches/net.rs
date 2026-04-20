@@ -2062,7 +2062,9 @@ fn bench_capability_announcement(c: &mut Criterion) {
     let caps = sample_capability_set(42);
 
     group.bench_function("create", |b| {
-        b.iter(|| CapabilityAnnouncement::new(0x1234, EntityId::from_bytes([0u8; 32]), 1, caps.clone()));
+        b.iter(|| {
+            CapabilityAnnouncement::new(0x1234, EntityId::from_bytes([0u8; 32]), 1, caps.clone())
+        });
     });
 
     let ann = CapabilityAnnouncement::new(0x1234, EntityId::from_bytes([0u8; 32]), 1, caps.clone());
@@ -2148,7 +2150,12 @@ fn bench_capability_index_insert(c: &mut Criterion) {
                     let index = CapabilityIndex::new();
                     for i in 0..count {
                         let caps = sample_capability_set(i as u64);
-                        let ann = CapabilityAnnouncement::new(i as u64, EntityId::from_bytes([0u8; 32]), 1, caps);
+                        let ann = CapabilityAnnouncement::new(
+                            i as u64,
+                            EntityId::from_bytes([0u8; 32]),
+                            1,
+                            caps,
+                        );
                         index.index(ann);
                     }
                     index
@@ -2271,7 +2278,8 @@ fn bench_capability_index_scaling(c: &mut Criterion) {
         let index = CapabilityIndex::new();
         for i in 0..*node_count {
             let caps = sample_capability_set(i as u64);
-            let ann = CapabilityAnnouncement::new(i as u64, EntityId::from_bytes([0u8; 32]), 1, caps);
+            let ann =
+                CapabilityAnnouncement::new(i as u64, EntityId::from_bytes([0u8; 32]), 1, caps);
             index.index(ann);
         }
 
@@ -2329,7 +2337,12 @@ fn bench_capability_index_concurrent(c: &mut Criterion) {
                                 for i in 0..ops_per_thread {
                                     let node_id = (thread_id as u64 * 100000) + i as u64;
                                     let caps = sample_capability_set(node_id);
-                                    let ann = CapabilityAnnouncement::new(node_id, EntityId::from_bytes([0u8; 32]), 1, caps);
+                                    let ann = CapabilityAnnouncement::new(
+                                        node_id,
+                                        EntityId::from_bytes([0u8; 32]),
+                                        1,
+                                        caps,
+                                    );
                                     idx.index(ann);
                                 }
                             })
@@ -2395,7 +2408,12 @@ fn bench_capability_index_concurrent(c: &mut Criterion) {
                                         // 10% writes
                                         let node_id = (thread_id as u64 * 100000) + i as u64;
                                         let caps = sample_capability_set(node_id);
-                                        let ann = CapabilityAnnouncement::new(node_id, EntityId::from_bytes([0u8; 32]), 1, caps);
+                                        let ann = CapabilityAnnouncement::new(
+                                            node_id,
+                                            EntityId::from_bytes([0u8; 32]),
+                                            1,
+                                            caps,
+                                        );
                                         idx.index(ann);
                                     } else {
                                         // 90% reads
@@ -2438,7 +2456,8 @@ fn bench_capability_index_updates(c: &mut Criterion) {
         let mut version = 2u64;
         b.iter(|| {
             let caps = sample_capability_set(500);
-            let ann = CapabilityAnnouncement::new(500, EntityId::from_bytes([0u8; 32]), version, caps);
+            let ann =
+                CapabilityAnnouncement::new(500, EntityId::from_bytes([0u8; 32]), version, caps);
             index.index(ann);
             version += 1;
         });

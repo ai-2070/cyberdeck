@@ -1018,8 +1018,8 @@ mod mesh_bindings {
                 cfg = cfg.with_publish_caps(crate::capabilities::capability_filter_from_js(filter));
             }
             if let Some(filter) = self.subscribe_caps {
-                cfg = cfg
-                    .with_subscribe_caps(crate::capabilities::capability_filter_from_js(filter));
+                cfg =
+                    cfg.with_subscribe_caps(crate::capabilities::capability_filter_from_js(filter));
             }
             Ok(cfg)
         }
@@ -1232,8 +1232,7 @@ mod mesh_bindings {
                 config = config.with_subnet(id);
             }
             if let Some(policy_js) = options.subnet_policy {
-                let policy =
-                    std::sync::Arc::new(crate::subnets::subnet_policy_from_js(policy_js)?);
+                let policy = std::sync::Arc::new(crate::subnets::subnet_policy_from_js(policy_js)?);
                 config = config.with_subnet_policy(policy);
             }
 

@@ -1089,8 +1089,7 @@ mod mesh_bindings {
                 config = config.with_subnet(id);
             }
             if let Some(policy_dict) = subnet_policy {
-                let policy =
-                    Arc::new(super::subnets::subnet_policy_from_py(policy_dict)?);
+                let policy = Arc::new(super::subnets::subnet_policy_from_py(policy_dict)?);
                 config = config.with_subnet_policy(policy);
             }
 
@@ -1128,9 +1127,7 @@ mod mesh_bindings {
             // Callers wanting to share a cache across meshes can
             // build one externally; today each `NetMesh` gets its
             // own.
-            node.set_token_cache(Arc::new(
-                net::adapter::net::identity::TokenCache::new(),
-            ));
+            node.set_token_cache(Arc::new(net::adapter::net::identity::TokenCache::new()));
 
             Ok(Self {
                 node: Some(node),
@@ -1532,9 +1529,8 @@ mod mesh_bindings {
             })?;
             match token {
                 Some(bytes) => {
-                    let parsed =
-                        net::adapter::net::identity::PermissionToken::from_bytes(bytes)
-                            .map_err(super::identity::token_err)?;
+                    let parsed = net::adapter::net::identity::PermissionToken::from_bytes(bytes)
+                        .map_err(super::identity::token_err)?;
                     self.runtime
                         .block_on(node.subscribe_channel_with_token(
                             publisher_node_id,
@@ -1732,7 +1728,10 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(identity::delegate_token, m)?)?;
         m.add_function(wrap_pyfunction!(identity::channel_hash, m)?)?;
         m.add_function(wrap_pyfunction!(capabilities::normalize_gpu_vendor, m)?)?;
-        m.add("IdentityError", m.py().get_type::<identity::IdentityError>())?;
+        m.add(
+            "IdentityError",
+            m.py().get_type::<identity::IdentityError>(),
+        )?;
         m.add("TokenError", m.py().get_type::<identity::TokenError>())?;
     }
     #[cfg(feature = "cortex")]

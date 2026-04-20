@@ -130,9 +130,9 @@ impl MeshBuilder {
             heartbeat_interval: Duration::from_secs(5),
             session_timeout: Duration::from_secs(30),
             num_shards: 4,
-                    identity: None,
-                    subnet: None,
-                    subnet_policy: None,
+            identity: None,
+            subnet: None,
+            subnet_policy: None,
         })
     }
 
@@ -417,12 +417,8 @@ impl Mesh {
         publisher_node_id: u64,
         channel: &ChannelName,
     ) -> Result<()> {
-        self.subscribe_channel_with(
-            publisher_node_id,
-            channel,
-            SubscribeOptions::default(),
-        )
-        .await
+        self.subscribe_channel_with(publisher_node_id, channel, SubscribeOptions::default())
+            .await
     }
 
     /// Subscribe with options — optionally presenting a
@@ -651,26 +647,22 @@ impl Mesh {
         ttl: std::time::Duration,
         sign: bool,
     ) -> Result<()> {
-        self.node.announce_capabilities_with(caps, ttl, sign).await?;
+        self.node
+            .announce_capabilities_with(caps, ttl, sign)
+            .await?;
         Ok(())
     }
 
     /// Query the capability index. Returns node ids whose latest
     /// announcement matches `filter`; includes our own `node_id` if
     /// our own announcement matches.
-    pub fn find_peers(
-        &self,
-        filter: &crate::capabilities::CapabilityFilter,
-    ) -> Vec<u64> {
+    pub fn find_peers(&self, filter: &crate::capabilities::CapabilityFilter) -> Vec<u64> {
         self.node.find_peers_by_filter(filter)
     }
 
     /// Rank peers for a scored placement requirement. Returns the
     /// single best-scoring node's id, or `None` if no peer matches.
-    pub fn rank_peers(
-        &self,
-        req: &crate::capabilities::CapabilityRequirement,
-    ) -> Option<u64> {
+    pub fn rank_peers(&self, req: &crate::capabilities::CapabilityRequirement) -> Option<u64> {
         self.node.rank_peers(req)
     }
 

@@ -340,10 +340,14 @@ async fn without_policy_subnet_local_delivers_everywhere() {
     // No policy, default subnet (GLOBAL) on both nodes.
     let a_cfg = test_config_no_policy(ports[0]);
     let b_cfg = test_config_no_policy(ports[1]);
-    let mut a_owned = MeshNode::new(EntityKeypair::generate(), a_cfg).await.unwrap();
+    let mut a_owned = MeshNode::new(EntityKeypair::generate(), a_cfg)
+        .await
+        .unwrap();
     a_owned.set_channel_configs(a_registry.clone());
     let a = Arc::new(a_owned);
-    let mut b_owned = MeshNode::new(EntityKeypair::generate(), b_cfg).await.unwrap();
+    let mut b_owned = MeshNode::new(EntityKeypair::generate(), b_cfg)
+        .await
+        .unwrap();
     b_owned.set_channel_configs(b_registry);
     let b = Arc::new(b_owned);
 

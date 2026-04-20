@@ -337,10 +337,30 @@ mod tests {
     fn make_scheduler() -> Scheduler {
         let index = Arc::new(CapabilityIndex::new());
         let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
-        index.index(CapabilityAnnouncement::new(0x1111, eid.clone(), 1, CapabilitySet::new()));
-        index.index(CapabilityAnnouncement::new(0x2222, eid.clone(), 1, CapabilitySet::new()));
-        index.index(CapabilityAnnouncement::new(0x3333, eid.clone(), 1, CapabilitySet::new()));
-        index.index(CapabilityAnnouncement::new(0x4444, eid, 1, CapabilitySet::new()));
+        index.index(CapabilityAnnouncement::new(
+            0x1111,
+            eid.clone(),
+            1,
+            CapabilitySet::new(),
+        ));
+        index.index(CapabilityAnnouncement::new(
+            0x2222,
+            eid.clone(),
+            1,
+            CapabilitySet::new(),
+        ));
+        index.index(CapabilityAnnouncement::new(
+            0x3333,
+            eid.clone(),
+            1,
+            CapabilitySet::new(),
+        ));
+        index.index(CapabilityAnnouncement::new(
+            0x4444,
+            eid,
+            1,
+            CapabilitySet::new(),
+        ));
         Scheduler::new(index, 0x1111, CapabilitySet::new())
     }
 

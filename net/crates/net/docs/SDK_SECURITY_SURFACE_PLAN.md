@@ -61,7 +61,7 @@ Shippable order:
 4. **Stage D — Subnet configuration across Rust/TS** (2–3 days). Smallest network surface; `SubnetPolicy` + `SubnetId` on `MeshBuilder`.
 5. **Stage E — Wire channel auth through the SDK surface** (3–5 days). With identity + capabilities + subnets all addressable, channel auth becomes a config option. Closes the cut from [`SDK_EXPANSION_PLAN.md`](SDK_EXPANSION_PLAN.md) Stages 6–7.
 6. **Stage F — Python surface (identity + capabilities + subnets + auth)** (1 week). Repeat A–E against the PyO3 layer. See [`SDK_PYTHON_PARITY_PLAN.md`](SDK_PYTHON_PARITY_PLAN.md) for substages and landed behaviours.
-7. **Stage G — Go surface (identity + capabilities + subnets + auth)** (1–2 weeks). New C ABI additions; biggest lift because nothing exists today.
+7. **Stage G — Go surface (identity + capabilities + subnets + auth)** (1–2 weeks). New C ABI additions; biggest lift because nothing exists today. See [`SDK_GO_PARITY_PLAN.md`](SDK_GO_PARITY_PLAN.md) for substages and landed behaviours.
 
 **Why this order, not "ship one area end-to-end":** Stage A unblocks Stage B unblocks Stage E. Capabilities (C) and subnets (D) are orthogonal and could reorder. Python (F) and Go (G) come last because they're repeats, not new design — and the Rust/TS design needs to settle before it's duplicated three more times.
 
@@ -584,28 +584,62 @@ fixture.
 No async/await needed — identity operations are synchronous,
 announcement is fire-and-forget.
 
-### Go (Stage G)
+### Go (Stage G) — SHIPPED
 
-New C ABI surface. `Identity` as opaque handle; tokens cross as `(*C.char, C.size_t)`. Scope as bitfield `uint8`. Errors extend `errorFromCode`:
+New C ABI additions in `src/ffi/mesh.rs`. `Identity` is an opaque
+handle (`net_identity_t`) behind a `*mut IdentityHandle`; tokens
+cross the boundary as `uint8_t* + size_t` pairs, freed via
+`net_free_bytes`. Scope crosses as a JSON array of string names to
+stay aligned with PyO3 / NAPI fixtures.
+
+Full substage breakdown + delivered behaviours:
+[`SDK_GO_PARITY_PLAN.md`](SDK_GO_PARITY_PLAN.md).
+
+Error codes added in the `-120..-128` block — one sentinel per
+`TokenError` kind so Go callers can
+`errors.Is(err, net.ErrTokenExpired)` without parsing messages:
 
 ```go
-const (
-    ErrTokenExpired      = C.NET_ERR_TOKEN_EXPIRED
-    ErrTokenInvalidSig   = C.NET_ERR_TOKEN_INVALID_SIG
-    ErrTokenWrongChannel = C.NET_ERR_TOKEN_WRONG_CHANNEL
-    ErrCapabilityDenied  = C.NET_ERR_CAPABILITY_DENIED
-    ErrSubnetIsolated    = C.NET_ERR_SUBNET_ISOLATED
+var (
+    ErrIdentity                  = errors.New("identity: malformed input")
+    ErrTokenInvalidFormat        = errors.New("token: invalid_format")
+    ErrTokenInvalidSignature     = errors.New("token: invalid_signature")
+    ErrTokenExpired              = errors.New("token: expired")
+    ErrTokenNotYetValid          = errors.New("token: not_yet_valid")
+    ErrTokenDelegationExhausted  = errors.New("token: delegation_exhausted")
+    ErrTokenDelegationNotAllowed = errors.New("token: delegation_not_allowed")
+    ErrTokenNotAuthorized        = errors.New("token: not_authorized")
+    ErrCapability                = errors.New("capability: dispatch failed")
 )
 ```
 
-Files:
-- `net/crates/net/bindings/go/src/identity.rs` (new) — C ABI
-- `net/crates/net/bindings/go/include/net.h` — additions
-- `net/crates/net/bindings/go/net/identity.go` (new)
-- `net/crates/net/bindings/go/net/capabilities.go` (new)
-- `net/crates/net/bindings/go/net/subnets.go` (new)
+Files shipped:
+- `net/crates/net/src/ffi/mesh.rs` — ~30 new `extern "C"` exports
+  (identity lifecycle, token helpers, capabilities, subnet config,
+  channel-auth extensions, `net_free_bytes`, `net_mesh_entity_id`)
+- `net/crates/net/bindings/go/net/net.h` — all new C declarations
+- `net/crates/net/bindings/go/net/identity.go` (new) — `Identity`
+  wrapper + token helpers
+- `net/crates/net/bindings/go/net/capabilities.go` (new) —
+  `CapabilitySet` / `CapabilityFilter` Go structs + mesh methods
+- `net/crates/net/bindings/go/net/subnets.go` (new) — `SubnetPolicy`
+  / `SubnetRule` types
+- `net/crates/net/bindings/go/net/mesh.go` — extended `MeshConfig`
+  (capability GC + signed flags, `Subnet`, `SubnetPolicy`,
+  `IdentitySeedHex`), extended `ChannelConfig` (`PublishCaps`,
+  `SubscribeCaps`), new `(*MeshNode).EntityID` /
+  `SubscribeChannelWithToken`
+- `net/crates/net/bindings/go/net/{identity,capabilities,subnets,channel_auth}_test.go`
+- `net/crates/net/bindings/go/README.md` — Security Surface section
 
-Go channel-based watch patterns don't apply here — identity is all synchronous compute.
+Multi-mesh handshake coverage (subscribe-denied-by-caps, cap-denied
+publish across peers) continues to live in the Rust integration
+suite — the Go bindings track the single-mesh smoke discipline of
+`mesh_channels_test.go` pending a dedicated handshake fixture with
+port pinning.
+
+Go channel-based watch patterns don't apply here — identity is all
+synchronous compute.
 
 ---
 

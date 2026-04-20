@@ -85,10 +85,10 @@ use super::router::{NetRouter, RouterConfig};
 use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
 use super::subnet::{SubnetId, SubnetPolicy};
-use super::Visibility;
 use super::subprotocol::stream_window::{StreamWindow, SUBPROTOCOL_STREAM_WINDOW};
 use super::subprotocol::MigrationSubprotocolHandler;
 use super::transport::{NetSocket, PacketReceiver, ParsedPacket, SocketBufferConfig};
+use super::Visibility;
 use tokio::sync::oneshot;
 
 use crate::adapter::{Adapter, ShardPollResult};
@@ -2293,7 +2293,10 @@ impl MeshNode {
         // Peer entity — load-bearing for `require_token`. Without
         // it we can't validate the subject. Missing entity +
         // require_token = reject.
-        let Some(peer_entity) = ctx.peer_entity_ids.get(&from_node).map(|e| e.value().clone())
+        let Some(peer_entity) = ctx
+            .peer_entity_ids
+            .get(&from_node)
+            .map(|e| e.value().clone())
         else {
             if cfg.require_token {
                 return (false, Some(AckReason::Unauthorized));
@@ -2434,10 +2437,10 @@ impl MeshNode {
         // silently publishing to a channel whose own ACL it doesn't
         // match. Channels absent from the registry are treated as
         // open (permissive default).
-        let cfg_snapshot = self
-            .channel_configs
-            .as_ref()
-            .and_then(|cr| cr.get_by_name(publisher.channel().name().as_str()).map(|c| c.clone()));
+        let cfg_snapshot = self.channel_configs.as_ref().and_then(|cr| {
+            cr.get_by_name(publisher.channel().name().as_str())
+                .map(|c| c.clone())
+        });
         if let Some(cfg) = cfg_snapshot.as_ref() {
             if cfg.publish_caps.is_some() || cfg.require_token {
                 let self_caps = self
