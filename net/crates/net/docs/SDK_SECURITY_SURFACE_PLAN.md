@@ -59,11 +59,13 @@ Shippable order:
 2. **Stage B — Token issuance & verification in NAPI + TS SDK** (3–4 days). Pure-compute surface; no network. Highest-leverage TS addition because it unblocks channel auth.
 3. **Stage C — Capabilities (declare, announce, query) across Rust/TS** (3–4 days). Grafts onto `Mesh`/`MeshNode`. Network-adjacent but bounded.
 4. **Stage D — Subnet configuration across Rust/TS** (2–3 days). Smallest network surface; `SubnetPolicy` + `SubnetId` on `MeshBuilder`.
-5. **Stage E — Wire channel auth through the SDK surface** (3–5 days). With identity + capabilities + subnets all addressable, channel auth becomes a config option. Closes the cut from [`SDK_EXPANSION_PLAN.md`](SDK_EXPANSION_PLAN.md) Stages 6–7. Hardening (AuthGuard fast path, expiry sweep, auth-failure rate limit, bench) landed as a follow-up: [`CHANNEL_AUTH_GUARD_PLAN.md`](CHANNEL_AUTH_GUARD_PLAN.md) — SHIPPED.
+5. **Stage E — Wire channel auth through the SDK surface** (3–5 days). With identity + capabilities + subnets all addressable, channel auth becomes a config option. Closes the cut from [`SDK_EXPANSION_PLAN.md`](SDK_EXPANSION_PLAN.md) Stages 6–7.
 6. **Stage F — Python surface (identity + capabilities + subnets + auth)** (1 week). Repeat A–E against the PyO3 layer. See [`SDK_PYTHON_PARITY_PLAN.md`](SDK_PYTHON_PARITY_PLAN.md) for substages and landed behaviours.
 7. **Stage G — Go surface (identity + capabilities + subnets + auth)** (1–2 weeks). New C ABI additions; biggest lift because nothing exists today. See [`SDK_GO_PARITY_PLAN.md`](SDK_GO_PARITY_PLAN.md) for substages and landed behaviours.
+8. **Stage H — Channel AuthGuard hardening** (~4.5 days). Wires the existing `AuthGuard` bloom filter into the publish hot path, adds token-expiry sweep + mid-subscription eviction, per-peer auth-failure rate limiting, and a criterion bench validating the <50 ns `check_fast` target. See [`CHANNEL_AUTH_GUARD_PLAN.md`](CHANNEL_AUTH_GUARD_PLAN.md) for substages and landed behaviours.
+9. **Stage M — Multi-hop capability propagation** (~5 days). Removes the "announcements are one-hop only" caveat from Stage C: hop-count-bounded forwarding with `(origin, version)` dedup, route install from multi-hop receipt, origin-side rate limiting. See [`MULTIHOP_CAPABILITY_PLAN.md`](MULTIHOP_CAPABILITY_PLAN.md).
 
-**Why this order, not "ship one area end-to-end":** Stage A unblocks Stage B unblocks Stage E. Capabilities (C) and subnets (D) are orthogonal and could reorder. Python (F) and Go (G) come last because they're repeats, not new design — and the Rust/TS design needs to settle before it's duplicated three more times.
+**Why this order, not "ship one area end-to-end":** Stage A unblocks Stage B unblocks Stage E. Capabilities (C) and subnets (D) are orthogonal and could reorder. Python (F) and Go (G) come last because they're repeats, not new design — and the Rust/TS design needs to settle before it's duplicated three more times. Stages H and M are hardening / feature-completion passes that depend on the Stage A–E + F–G surfaces being stable enough to build on.
 
 ---
 
@@ -643,6 +645,154 @@ synchronous compute.
 
 ---
 
+## Stage H — Channel AuthGuard hardening — SHIPPED
+
+Stage E shipped the subscribe-gate and publish-gate auth checks
+(capability filters, `require_token`, TOFU entity-id binding). The
+main README's `AuthGuard` description implied three guarantees that
+Stage E left open:
+
+1. **Per-packet authorization.** Stage E's fan-out trusted the
+   roster; a revoked subscriber kept receiving events until they
+   re-handshaked.
+2. **Mid-subscription token expiry.** An expired token left the
+   subscriber on the roster forever.
+3. **Auth-failure rate limiting.** Bad-token subscribe storms
+   burned ed25519 verify cycles unbounded.
+
+Stage H closes all three. The `AuthGuard` bloom filter +
+verified-subscribe cache was already built (and wired into the RedEX
+storage plane); this stage wires it into `MeshNode` directly.
+
+Full substage breakdown + design decisions:
+[`CHANNEL_AUTH_GUARD_PLAN.md`](CHANNEL_AUTH_GUARD_PLAN.md).
+
+**What shipped:**
+
+- `Arc<AuthGuard>` on `MeshNode` + `DispatchCtx`. Populated on
+  `authorize_subscribe` success via
+  `guard.allow_channel(origin_hash, &name)`; revoked on unsubscribe.
+  Exposed as `MeshNode::auth_guard()` for tests + operator
+  observability.
+- `publish_many` fan-out calls `check_fast` per subscriber with a
+  three-way verdict (`Allowed` / `Denied` / `NeedsFullCheck`).
+  `NeedsFullCheck` falls back to the exact-channel ACL and promotes
+  on hit — so steady-state publishes take the ~20 ns path even when
+  the bloom returns ambiguous. Revocations take effect on the next
+  publish without a roster refresh.
+- Token-expiry sweep loop (`spawn_token_sweep_loop`, interval
+  configurable via `MeshNodeConfig::with_token_sweep_interval`,
+  default 30 s). Walks roster-by-peer; for every `require_token`
+  channel, re-runs the full `TokenCache::check`. Expired entries
+  are revoked from `AuthGuard` AND removed from
+  `SubscriberRoster`.
+- Per-peer auth-failure counter
+  (`MeshNodeConfig::with_auth_failure_limit`, default 16 failures
+  per 60 s window, 30 s throttle). Peers that exceed the threshold
+  short-circuit at the top of `authorize_subscribe` with
+  `AckReason::RateLimited` before ed25519 verification runs.
+  Successful subscribes clear the counter, so honest retry storms
+  don't accumulate toward throttling.
+- Criterion bench (`benches/auth_guard.rs`) with 5 targets: hot-hit,
+  cold-miss, 8-thread contended, `allow_channel` insert, million-op
+  ceiling. Measures **~20 ns / call** single-threaded on a
+  populated guard — DashMap-probe cost dominates the 4-byte atomic
+  load cost, consistent with the struct's own design notes. Well
+  inside the plan's 50 ns p99 target.
+
+Files shipped:
+
+- `net/crates/net/src/adapter/net/mesh.rs` — `auth_guard` field +
+  `DispatchCtx` wiring, `subscriber_origin_hash` helper, fast-path
+  retain in `publish_many`, `spawn_token_sweep_loop` +
+  `sweep_expired_subscribers`, `AuthFailureState` +
+  `is_auth_throttled` / `record_auth_failure` / `clear_auth_failures`.
+- `net/crates/net/src/adapter/net/mesh.rs` config — new knobs:
+  `token_sweep_interval`, `max_auth_failures_per_window`,
+  `auth_failure_window`, `auth_throttle_duration`. Builder methods:
+  `with_token_sweep_interval`, `with_auth_failure_limit`.
+- `net/crates/net/benches/auth_guard.rs` (new) + Cargo.toml bench
+  registration.
+- `net/crates/net/tests/channel_auth_hardening.rs` (new) — 8
+  integration tests covering subscribe → guard population,
+  unsubscribe → revoke, token-gated subscribe, revoke → publish
+  skips, normal publishes admit, expired-token sweep, rate-limit
+  trips, successful subscribe clears counter.
+- `net/crates/net/README.md` — updated `AuthGuard` paragraph + Channel
+  authentication bullet in Security Surface section.
+- `net/crates/net/sdk/README.md`,
+  `net/crates/net/sdk-ts/README.md`,
+  `net/crates/net/bindings/python/README.md`,
+  `net/crates/net/bindings/go/README.md` — Channel authentication
+  subsections mention fast path, sweep, rate limit.
+
+**Explicit non-goals** (deferred, carried from the plan's
+follow-ups):
+
+- Revocation lists. The short-TTL + re-issue pattern is the v1
+  story.
+- Per-channel opt-out of the fast path. Deployments that need
+  per-packet ed25519 can re-examine this; for now the fast path is
+  unconditional.
+- Partial-chain delegation validation. Leaf signature is what's
+  verified on subscribe; intermediate signers remain implicit.
+- Metrics export. Auth-verdict counts + bloom hit-rate would be
+  useful for operators; separate plan.
+
+---
+
+## Stage M — Multi-hop capability propagation — SHIPPED
+
+Stage C's "announcements are one-hop only" caveat left nodes more
+than one hop away invisible to `find_peers`. Stage M closes that by
+reusing the pingwave forwarding pattern: hop-count-bounded
+re-broadcast with `(origin_node_id, version)` dedup.
+
+Full substage breakdown + design:
+[`MULTIHOP_CAPABILITY_PLAN.md`](MULTIHOP_CAPABILITY_PLAN.md).
+
+**What shipped:**
+
+- `CapabilityAnnouncement::hop_count: u8` added **outside** the
+  signed envelope (`signed_payload()` helper zeros both `signature`
+  and `hop_count` on sign/verify). Forwarders can bump the counter
+  without needing the origin's secret key — signature stays valid
+  end-to-end.
+- `MAX_CAPABILITY_HOPS = 16` matching the pingwave hop cap.
+  Announcements at or beyond the cap are dropped rather than
+  re-broadcast.
+- `MeshNode::seen_announcements: DashMap<(u64, u64), Instant>` dedup
+  cache keyed on `(origin, version)`. Swept on the capability GC
+  tick with `2 × DEFAULT_TTL_SECS` retention.
+- `handle_capability_announcement` forwards after indexing when
+  `hop_count < MAX - 1` — split-horizon via `RoutingTable`, skip
+  sender, per-peer encrypted subprotocol send through the spawned
+  async task (mirrors pingwave forwarding).
+- Origin-side rate limit:
+  `MeshNodeConfig::with_min_announce_interval` (default 10 s).
+  Within-window `announce_capabilities` calls update the self-
+  index and `local_announcement` but skip the network broadcast,
+  so a misconfigured publisher can't flood the mesh.
+- Route install from multi-hop receipt: every announcement received
+  with `hop_count > 0` is a free topology observation; installs a
+  route to `ann.node_id` via the sender with metric `hop + 2`
+  (pingwave convention).
+
+Integration tests in `tests/capability_multihop.rs`: 3-node chain
+propagation, diamond dedup at converge point, late-joiner-via-
+multihop-rebroadcast, route install from multi-hop receipt, origin
+rate-limit coalescing. Plus 6 unit tests in `capability.rs` for the
+wire format + signature invariance across hop bumps.
+
+**Explicit non-goals** (deferred):
+
+- `AnnouncementScope` field (subnet-local / parent-visible /
+  global). v1 is permissive-global.
+- Delta / diff encoding for bandwidth reduction.
+- Gossipsub-style lazy/eager-push mesh peer selection.
+
+---
+
 ## Critical files (Rust + TS, the on-ramp)
 
 ### Stage A (Rust)
@@ -713,22 +863,30 @@ synchronous compute.
 
 ## Sizing
 
-| Stage | SDKs touched | Est. effort |
-|---|---|---|
-| A. Rust SDK re-exports + `Identity` | Rust | 2–3 days |
-| B. Token surface NAPI + TS | NAPI + TS | 3–4 days |
-| C. Capabilities Rust + TS | NAPI + SDK + TS | 3–4 days |
-| D. Subnets Rust + TS | SDK + TS | 2–3 days |
-| E. Channel auth wiring | SDK + TS | 3–5 days |
-| F. Python surface | PyO3 + Python | ~1 week |
-| G. Go surface | C ABI + Go | 1–2 weeks |
+| Stage | SDKs touched | Est. effort | Status |
+|---|---|---|---|
+| A. Rust SDK re-exports + `Identity` | Rust | 2–3 days | SHIPPED |
+| B. Token surface NAPI + TS | NAPI + TS | 3–4 days | SHIPPED |
+| C. Capabilities Rust + TS | NAPI + SDK + TS | 3–4 days | SHIPPED |
+| D. Subnets Rust + TS | SDK + TS | 2–3 days | SHIPPED |
+| E. Channel auth wiring | SDK + TS | 3–5 days | SHIPPED |
+| F. Python surface | PyO3 + Python | ~1 week | SHIPPED |
+| G. Go surface | C ABI + Go | 1–2 weeks | SHIPPED |
+| H. Channel AuthGuard hardening | Rust core | ~4.5 days | SHIPPED |
+| M. Multi-hop capability propagation | Rust core | ~5 days | SHIPPED |
 
-Total: ~5–7 weeks. Each stage is an independent PR.
+Total: ~7–8 weeks across A–M. Each stage is an independent PR.
 
 ## Dependencies
 
 - Stage E depends on [`SDK_EXPANSION_PLAN.md`](SDK_EXPANSION_PLAN.md) Stage 6 (channels on Mesh) having landed — auth without a channel surface is useless.
 - Stages F/G depend on Stages A–E having stabilized.
+- Stage H depends on Stage E — hardens the contract E established.
+  Does not require F/G since the wiring is Rust-core only (bindings
+  pick it up transparently because they sit on top of `MeshNode`).
+- Stage M depends on Stage C's `CapabilityAnnouncement` struct and
+  on [`ROUTING_DV_PLAN.md`](ROUTING_DV_PLAN.md) being shipped (pingwave
+  multi-hop pattern is the scaffolding being copied).
 - No dependency on the CortEX/RedEX SDK work beyond Stage 1 (feature-flag layout).
 
 ## Out of scope (for this plan)
