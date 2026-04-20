@@ -2,6 +2,8 @@
 //!
 //! Provides high-performance event ingestion and consumption for Node.js/TypeScript.
 
+#[cfg(feature = "capabilities")]
+mod capabilities;
 mod common;
 #[cfg(feature = "cortex")]
 mod cortex;
@@ -1576,6 +1578,45 @@ mod mesh_bindings {
                 .await
                 .map_err(map_channel_adapter_error)?;
             Ok(PublishReportJs::from_core(report))
+        }
+
+        /// Announce this node's capabilities to every directly-
+        /// connected peer. Also self-indexes, so `findPeers` on the
+        /// same node matches on the announcement.
+        ///
+        /// Multi-hop propagation is deferred — peers more than one
+        /// hop away will not see the announcement.
+        #[cfg(feature = "capabilities")]
+        #[napi]
+        pub async fn announce_capabilities(
+            &self,
+            caps: crate::capabilities::CapabilitySetJs,
+        ) -> Result<()> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let core = crate::capabilities::capability_set_from_js(caps);
+            node.announce_capabilities(core)
+                .await
+                .map_err(|e| Error::from_reason(format!("capability: {}", e)))
+        }
+
+        /// Query the local capability index. Returns node ids
+        /// (including our own if we self-match) whose latest
+        /// announcement matches `filter`.
+        #[cfg(feature = "capabilities")]
+        #[napi]
+        pub fn find_peers(
+            &self,
+            filter: crate::capabilities::CapabilityFilterJs,
+        ) -> Result<Vec<BigInt>> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let core = crate::capabilities::capability_filter_from_js(filter);
+            Ok(node
+                .find_peers_by_filter(&core)
+                .into_iter()
+                .map(BigInt::from)
+                .collect())
         }
 
         /// Shutdown the mesh node.

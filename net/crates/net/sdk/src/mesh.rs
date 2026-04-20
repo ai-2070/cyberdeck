@@ -501,6 +501,61 @@ impl Mesh {
         self.node.all_stream_stats(peer_node_id)
     }
 
+    // ---- Capability announcements ----
+
+    /// Announce this node's capabilities to every directly-connected
+    /// peer. Self-indexes too, so `find_peers` called from this same
+    /// node matches on the announcement. Multi-hop propagation is
+    /// deferred — peers more than one hop away will not see the
+    /// announcement.
+    ///
+    /// Default TTL is 5 minutes; use
+    /// [`Self::announce_capabilities_with`] to override.
+    #[cfg(feature = "capabilities")]
+    pub async fn announce_capabilities(
+        &self,
+        caps: crate::capabilities::CapabilitySet,
+    ) -> Result<()> {
+        self.node.announce_capabilities(caps).await?;
+        Ok(())
+    }
+
+    /// Extended announce with explicit TTL and signing opt-in.
+    /// `sign = true` is accepted but currently a no-op; signatures
+    /// tie in with Stage E (channel auth), once `node_id` →
+    /// `EntityId` binding is wired.
+    #[cfg(feature = "capabilities")]
+    pub async fn announce_capabilities_with(
+        &self,
+        caps: crate::capabilities::CapabilitySet,
+        ttl: std::time::Duration,
+        sign: bool,
+    ) -> Result<()> {
+        self.node.announce_capabilities_with(caps, ttl, sign).await?;
+        Ok(())
+    }
+
+    /// Query the capability index. Returns node ids whose latest
+    /// announcement matches `filter`; includes our own `node_id` if
+    /// our own announcement matches.
+    #[cfg(feature = "capabilities")]
+    pub fn find_peers(
+        &self,
+        filter: &crate::capabilities::CapabilityFilter,
+    ) -> Vec<u64> {
+        self.node.find_peers_by_filter(filter)
+    }
+
+    /// Rank peers for a scored placement requirement. Returns the
+    /// single best-scoring node's id, or `None` if no peer matches.
+    #[cfg(feature = "capabilities")]
+    pub fn rank_peers(
+        &self,
+        req: &crate::capabilities::CapabilityRequirement,
+    ) -> Option<u64> {
+        self.node.rank_peers(req)
+    }
+
     // ---- Lifecycle ----
 
     /// Set a migration handler (for Mikoshi daemon migration).

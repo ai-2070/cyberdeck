@@ -18,6 +18,11 @@ cortex = ["net/netdb", "net/redex-disk"]
 # underlying types live in `adapter::net::identity`, gated by the
 # core's `net` feature, so this feature depends on ours.
 identity = ["net"]
+# Capability surface — announce_capabilities + find_peers on
+# NetMesh, plus the POJO types used to describe hardware/software/
+# models/tools/tags. Sits on top of `net` because the broadcast
+# subprotocol + index live in `adapter::net::behavior`.
+capabilities = ["net"]
 
 [dependencies]
 net = { path = "../..", default-features = false }

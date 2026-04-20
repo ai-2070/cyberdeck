@@ -594,6 +594,7 @@ module.exports.channelHash = nativeBinding.channelHash
 module.exports.delegateToken = nativeBinding.delegateToken
 module.exports.generateNetKeypair = nativeBinding.generateNetKeypair
 module.exports.MemoriesOrderBy = nativeBinding.MemoriesOrderBy
+module.exports.normalizeGpuVendor = nativeBinding.normalizeGpuVendor
 module.exports.parseToken = nativeBinding.parseToken
 module.exports.TasksOrderBy = nativeBinding.TasksOrderBy
 module.exports.TaskStatus = nativeBinding.TaskStatus

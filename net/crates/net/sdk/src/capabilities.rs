@@ -25,13 +25,39 @@
 //! assert!(filter.matches(&caps));
 //! ```
 //!
-//! # Scope in this stage
+//! # Cross-node (direct-peer, one-hop)
 //!
-//! This module is re-exports only — network-side primitives
-//! (`Mesh::announce_capabilities`, `Mesh::find_peers`) land in a
-//! later stage. Today users can build and pattern-match
-//! `CapabilitySet`s locally (e.g. for a scheduler) but can't emit
-//! them over the mesh.
+//! With `--features "net capabilities"`, `Mesh` has
+//! [`announce_capabilities`](crate::mesh::Mesh::announce_capabilities)
+//! and [`find_peers`](crate::mesh::Mesh::find_peers). Announce-side
+//! self-indexes, so a single-node test is round-trippable:
+//!
+//! ```
+//! # #[cfg(all(feature = "net", feature = "capabilities"))]
+//! # async fn doc() -> net_sdk::error::Result<()> {
+//! use net_sdk::capabilities::{CapabilityFilter, CapabilitySet};
+//! use net_sdk::mesh::MeshBuilder;
+//!
+//! let node = MeshBuilder::new("127.0.0.1:0", &[0x42u8; 32])?
+//!     .build()
+//!     .await?;
+//!
+//! // Announce; also self-indexes.
+//! node.announce_capabilities(CapabilitySet::new().add_tag("gpu"))
+//!     .await?;
+//!
+//! // Self-match hits.
+//! let hits = node.find_peers(&CapabilityFilter::new().require_tag("gpu"));
+//! assert!(hits.contains(&node.node_id()));
+//!
+//! node.shutdown().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Multi-hop propagation is deferred — peers more than one hop away
+//! will not see the announcement. TTL + GC eviction match the core
+//! defaults (`capability_gc_interval` on [`net::adapter::net::MeshNodeConfig`]).
 
 pub use net::adapter::net::behavior::capability::{
     AcceleratorInfo, AcceleratorType, CapabilityAnnouncement, CapabilityFilter, CapabilityIndex,

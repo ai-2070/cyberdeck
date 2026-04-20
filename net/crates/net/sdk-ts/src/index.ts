@@ -95,6 +95,23 @@ export {
 } from './identity';
 export type { TokenScope, TokenErrorKind, IssueTokenOptions } from './identity';
 
+// Capabilities (announce + find-peers).
+export type {
+  CapabilitySet,
+  CapabilityFilter,
+  CapabilityLimits,
+  Hardware,
+  Software,
+  SoftwarePair,
+  GpuInfo,
+  GpuVendor,
+  Accelerator,
+  AcceleratorKind,
+  ModelCapability,
+  ToolCapability,
+  Modality,
+} from './capabilities';
+
 // Types.
 export type {
   NetNodeConfig,

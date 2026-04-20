@@ -38,6 +38,13 @@
 
 import { NetMesh as NapiNetMesh } from '@ai2070/net';
 
+import {
+  capabilityFilterToNapi,
+  capabilitySetToNapi,
+  type CapabilityFilter,
+  type CapabilitySet,
+} from './capabilities';
+
 /** Reliability mode chosen at stream-open time. */
 export type Reliability = 'fire_and_forget' | 'reliable';
 
@@ -396,6 +403,25 @@ export class MeshNode {
     } catch (e) {
       toChannelError(e);
     }
+  }
+
+  /**
+   * Announce this node's capabilities to every directly-connected
+   * peer. Self-indexes too, so `findPeers` on this same node matches
+   * on the announcement. Multi-hop propagation is deferred — peers
+   * more than one hop away will not see the announcement.
+   */
+  async announceCapabilities(caps: CapabilitySet): Promise<void> {
+    await this.native.announceCapabilities(capabilitySetToNapi(caps));
+  }
+
+  /**
+   * Query the local capability index. Returns node ids (including
+   * our own `nodeId()` if self matches) whose latest announcement
+   * matches `filter`.
+   */
+  findPeers(filter: CapabilityFilter): bigint[] {
+    return this.native.findPeers(capabilityFilterToNapi(filter));
   }
 
   /** Shutdown the mesh node. */

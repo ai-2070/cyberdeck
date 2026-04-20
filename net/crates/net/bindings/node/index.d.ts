@@ -424,6 +424,21 @@ export declare class NetMesh {
    * ```
    */
   publish(channel: string, payload: Buffer, config?: PublishConfigJs | undefined | null): Promise<PublishReportJs>
+  /**
+   * Announce this node's capabilities to every directly-
+   * connected peer. Also self-indexes, so `findPeers` on the
+   * same node matches on the announcement.
+   *
+   * Multi-hop propagation is deferred — peers more than one
+   * hop away will not see the announcement.
+   */
+  announceCapabilities(caps: CapabilitySetJs): Promise<void>
+  /**
+   * Query the local capability index. Returns node ids
+   * (including our own if we self-match) whose latest
+   * announcement matches `filter`.
+   */
+  findPeers(filter: CapabilityFilterJs): Array<bigint>
   /** Shutdown the mesh node. */
   shutdown(): Promise<void>
 }
@@ -648,6 +663,46 @@ export declare class TaskWatchIter {
   close(): void
 }
 
+export interface AcceleratorJs {
+  /** `tpu` | `npu` | `fpga` | `asic` | `dsp` | `unknown`. */
+  kind: string
+  model: string
+  memoryMb?: number
+  /** TOPS × 10 (matches the core's integer storage). */
+  topsX10?: number
+}
+
+export interface CapabilityFilterJs {
+  requireTags?: Array<string>
+  requireModels?: Array<string>
+  requireTools?: Array<string>
+  minMemoryMb?: number
+  requireGpu?: boolean
+  /** Lowercase vendor name; see `GpuInfoJs::vendor`. */
+  gpuVendor?: string
+  minVramMb?: number
+  minContextLength?: number
+  requireModalities?: Array<string>
+}
+
+export interface CapabilityLimitsJs {
+  maxConcurrentRequests?: number
+  maxTokensPerRequest?: number
+  rateLimitRpm?: number
+  maxBatchSize?: number
+  maxInputBytes?: number
+  maxOutputBytes?: number
+}
+
+export interface CapabilitySetJs {
+  hardware?: HardwareJs
+  software?: SoftwareJs
+  models?: Array<ModelJs>
+  tools?: Array<ToolJs>
+  tags?: Array<string>
+  limits?: CapabilityLimitsJs
+}
+
 /**
  * JS-facing channel config, mirroring the core `ChannelConfig`
  * field-for-field. v1 does not expose `publishCaps` /
@@ -730,6 +785,30 @@ export interface EventBusOptions {
  * with the initiator.
  */
 export declare function generateNetKeypair(): NetKeypair
+
+export interface GpuInfoJs {
+  /**
+   * Lowercase vendor name: `nvidia` | `amd` | `intel` | `apple` |
+   * `qualcomm` | `unknown`.
+   */
+  vendor?: string
+  model: string
+  vramMb: number
+  computeUnits?: number
+  tensorCores?: number
+  fp16TflopsX10?: number
+}
+
+export interface HardwareJs {
+  cpuCores?: number
+  cpuThreads?: number
+  memoryMb?: number
+  gpu?: GpuInfoJs
+  additionalGpus?: Array<GpuInfoJs>
+  storageMb?: bigint
+  networkMbps?: number
+  accelerators?: Array<AcceleratorJs>
+}
 
 /**
  * Pre-computed hash for events that will be reused.
@@ -828,6 +907,25 @@ export interface MeshOptions {
   numShards?: number
 }
 
+export interface ModelJs {
+  modelId: string
+  family?: string
+  /**
+   * Parameter count, billions × 10 (70 B ⇒ 700). Matches the
+   * core's integer encoding — no float precision loss.
+   */
+  parametersBX10?: number
+  contextLength?: number
+  quantization?: string
+  /**
+   * Lowercase modality names: `text`, `image`, `audio`, `video`,
+   * `code`, `embedding`, `tool-use`.
+   */
+  modalities?: Array<string>
+  tokensPerSec?: number
+  loaded?: boolean
+}
+
 /**
  * Serialized NetDB snapshot bundle returned by [`NetDb::snapshot`]
  * and consumed by [`NetDb::open_from_snapshot`].
@@ -914,6 +1012,14 @@ export interface NetStreamStats {
   creditGrantsReceived: bigint
   creditGrantsSent: bigint
 }
+
+/**
+ * Normalize a user-supplied GPU vendor string to the canonical
+ * lowercase form used on-wire (`nvidia` | `amd` | `intel` | `apple` |
+ * `qualcomm` | `unknown`). Unknown / misspelled inputs collapse to
+ * `"unknown"`.
+ */
+export declare function normalizeGpuVendor(vendor: string): string
 
 /**
  * Parse a serialized `PermissionToken`. Throws `token:
@@ -1041,6 +1147,16 @@ export interface RedisOptions {
   maxStreamLen?: number
 }
 
+export interface SoftwareJs {
+  os?: string
+  osVersion?: string
+  /** `[ [runtime_name, version] ]` pairs. */
+  runtimes?: Array<Array<string>>
+  frameworks?: Array<Array<string>>
+  cudaVersion?: string
+  drivers?: Array<Array<string>>
+}
+
 /** Ingestion statistics. */
 export interface Stats {
   /** Total events ingested */
@@ -1159,6 +1275,17 @@ export interface TokenInfo {
  * wall-clock; cross-check against trusted time if that matters.
  */
 export declare function tokenIsExpired(bytes: Buffer): boolean
+
+export interface ToolJs {
+  toolId: string
+  name?: string
+  version?: string
+  inputSchema?: string
+  outputSchema?: string
+  requires?: Array<string>
+  estimatedTimeMs?: number
+  stateless?: boolean
+}
 
 /**
  * Verify a serialized token's signature. Returns `true` on valid.
