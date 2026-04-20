@@ -27,4 +27,13 @@ net = ["net/net"]
 # the NetDb facade. `redex-disk` comes along so `.persistent(true)` is
 # usable from the SDK without a separate feature flip.
 cortex = ["net/netdb", "net/redex-disk"]
-full = ["redis", "jetstream", "net", "cortex"]
+# Security surface — identity (keypairs + tokens), capability
+# declarations, and subnet assignment. All three sit on top of the
+# `net` feature because the underlying types live in `adapter::net`;
+# there's no finer-grained gate to reach for.
+identity = ["net/net"]
+capabilities = ["net/net"]
+subnets = ["net/net"]
+# Common-case bundle: enable the whole security surface at once.
+security = ["identity", "capabilities", "subnets"]
+full = ["redis", "jetstream", "net", "cortex", "security"]

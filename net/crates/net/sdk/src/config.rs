@@ -35,6 +35,11 @@ impl From<Backpressure> for BackpressureMode {
 pub struct NetBuilder {
     pub(crate) inner: EventBusConfigBuilder,
     pub(crate) adapter: Option<AdapterConfig>,
+    /// Caller-owned identity. Stored here so `Net::from_builder` can
+    /// plumb it into whichever adapter consumes keypairs; the
+    /// event-bus itself is adapter-agnostic and doesn't use it.
+    #[cfg(feature = "identity")]
+    pub(crate) identity: Option<crate::identity::Identity>,
 }
 
 impl NetBuilder {
@@ -42,7 +47,22 @@ impl NetBuilder {
         Self {
             inner: EventBusConfig::builder(),
             adapter: None,
+            #[cfg(feature = "identity")]
+            identity: None,
         }
+    }
+
+    /// Pin this node to a caller-owned [`Identity`](crate::Identity).
+    ///
+    /// Stored on the builder and handed to whichever adapter consumes
+    /// keypairs (today: the mesh adapter when `net` is enabled). For
+    /// an event-bus-only node without a mesh adapter, the identity is
+    /// retained but unused — it becomes load-bearing once you wire in
+    /// a `NetAdapterConfig`.
+    #[cfg(feature = "identity")]
+    pub fn identity(mut self, identity: crate::identity::Identity) -> Self {
+        self.identity = Some(identity);
+        self
     }
 
     /// Set the number of shards.

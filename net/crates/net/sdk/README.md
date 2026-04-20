@@ -158,6 +158,66 @@ counts cumulative rejections for observability. See
 [`docs/STREAM_BACKPRESSURE_PLAN.md`](../docs/STREAM_BACKPRESSURE_PLAN.md)
 for the design.
 
+## Security (identity, tokens, capabilities, subnets)
+
+Behind the `security` feature (bundles `identity` + `capabilities` +
+`subnets`, all additive on top of `net`):
+
+```rust
+use std::time::Duration;
+use net_sdk::{Identity, TokenScope};
+use net_sdk::mesh::{Mesh, MeshBuilder};
+use net_sdk::ChannelName;
+
+# async fn example() -> net_sdk::error::Result<()> {
+// Load once from caller-owned storage (vault / k8s secret / enclave).
+let seed: [u8; 32] = [/* 32 bytes */ 0x42u8; 32];
+let id = Identity::from_seed(seed);
+
+// Stable node id across restarts — derived from the ed25519 seed.
+println!("node_id = {:#x}", id.node_id());
+
+// Issue a scoped subscribe grant to a peer and hand it over.
+let subscriber_entity = Identity::generate(); // pretend we received this
+let channel = ChannelName::new("sensors/temp").unwrap();
+let token = id.issue_token(
+    subscriber_entity.entity_id().clone(),
+    TokenScope::SUBSCRIBE,
+    &channel,
+    Duration::from_secs(300),
+    0, // delegation depth — 0 forbids re-delegation
+);
+// Token is a signed, transport-ready blob.
+assert_eq!(token.to_bytes().len(), net_sdk::PermissionToken::WIRE_SIZE);
+
+// Pin this identity on the mesh builder — without this call the
+// builder generates an ephemeral keypair and the node_id changes on
+// every restart.
+let _mesh = MeshBuilder::new("127.0.0.1:9001", &[0x42u8; 32])?
+    .identity(id)
+    .build()
+    .await?;
+# Ok(())
+# }
+```
+
+**What's wired in this release:**
+
+- `Identity` generation / seed round-trip / signing / token issuance
+  + verification + install + lookup.
+- `MeshBuilder::identity(...)` pins the keypair used by the mesh's
+  Noise handshake so `node_id()` is stable.
+- Re-exports of `CapabilitySet` / `CapabilityFilter` /
+  `CapabilityAnnouncement` / `CapabilityIndex` (local-only
+  construction + match-ability today — network-side
+  `announce_capabilities` / `find_peers` land next).
+- Re-exports of `SubnetId` / `SubnetPolicy` / `SubnetRule` (builder
+  hook + gateway wiring land next).
+
+**Treat `Identity::to_bytes()` as secret material** — it's the
+32-byte ed25519 seed. The SDK never touches a hardcoded path; where
+you put the bytes (disk, vault, enclave, k8s secret) is your call.
+
 ## Channels (distributed pub/sub)
 
 Named pub/sub over the encrypted mesh. Publishers register channels

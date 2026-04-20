@@ -354,6 +354,16 @@ impl TokenCache {
         Err(TokenError::NotAuthorized)
     }
 
+    /// Fetch a cached token for `(subject, channel_hash)`. Exact match
+    /// only — the wildcard (`channel_hash = 0`) entry is a separate
+    /// key. Unlike [`Self::check`], this returns the token itself so
+    /// callers can delegate, forward, or inspect it.
+    pub fn get(&self, subject: &EntityId, channel_hash: u16) -> Option<PermissionToken> {
+        self.tokens
+            .get(&(*subject.as_bytes(), channel_hash))
+            .map(|entry| entry.value().clone())
+    }
+
     /// Remove expired tokens.
     pub fn evict_expired(&self) {
         let now = current_timestamp();

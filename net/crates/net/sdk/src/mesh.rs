@@ -1,9 +1,9 @@
 //! Multi-peer mesh handle for the SDK.
 //!
 //! `Mesh` wraps [`MeshNode`] with ergonomic methods for connecting to
-//! peers, sending events, and polling received events. Unlike [`Net`],
-//! which is backed by an [`EventBus`] + adapter, `Mesh` manages its own
-//! encrypted peer sessions and routing.
+//! peers, sending events, and polling received events. Unlike
+//! [`crate::Net`], which is backed by an `EventBus` + adapter, `Mesh`
+//! manages its own encrypted peer sessions and routing.
 //!
 //! # Example
 //!
@@ -57,6 +57,8 @@ pub struct MeshBuilder {
     heartbeat_interval: Duration,
     session_timeout: Duration,
     num_shards: u16,
+    #[cfg(feature = "identity")]
+    identity: Option<crate::identity::Identity>,
 }
 
 impl MeshBuilder {
@@ -71,7 +73,26 @@ impl MeshBuilder {
             heartbeat_interval: Duration::from_secs(5),
             session_timeout: Duration::from_secs(30),
             num_shards: 4,
+            #[cfg(feature = "identity")]
+            identity: None,
         })
+    }
+
+    /// Pin this node to a caller-owned [`Identity`](crate::Identity).
+    ///
+    /// Without this call, `build()` generates an ephemeral keypair —
+    /// fine for one-off sessions, but every restart produces a new
+    /// entity id (and therefore a new node id). Provide an identity
+    /// loaded from disk / vault / enclave to keep stable addressing.
+    ///
+    /// The identity's [`TokenCache`](crate::identity::TokenCache) is
+    /// also bound to this mesh; tokens installed via
+    /// [`Identity::install_token`](crate::identity::Identity::install_token)
+    /// become available to the channel auth path at subscribe time.
+    #[cfg(feature = "identity")]
+    pub fn identity(mut self, identity: crate::identity::Identity) -> Self {
+        self.identity = Some(identity);
+        self
     }
 
     /// Set heartbeat interval in milliseconds.
@@ -94,14 +115,24 @@ impl MeshBuilder {
 
     /// Build the mesh node.
     pub async fn build(self) -> Result<Mesh> {
-        let identity = EntityKeypair::generate();
+        // Use the caller's identity if one was set, otherwise mint an
+        // ephemeral one. `MeshNode::new` takes the keypair by value,
+        // so clone it out of the Arc when we have a shared identity.
+        #[cfg(feature = "identity")]
+        let (keypair, sdk_identity) = match self.identity {
+            Some(id) => (id.keypair().as_ref().clone(), Some(id)),
+            None => (EntityKeypair::generate(), None),
+        };
+        #[cfg(not(feature = "identity"))]
+        let keypair = EntityKeypair::generate();
+
         let config = MeshNodeConfig::new(self.bind_addr, self.psk)
             .with_heartbeat_interval(self.heartbeat_interval)
             .with_session_timeout(self.session_timeout)
             .with_num_shards(self.num_shards)
             .with_handshake(3, Duration::from_secs(5));
 
-        let mut node = MeshNode::new(identity, config).await?;
+        let mut node = MeshNode::new(keypair, config).await?;
         // Install a shared ChannelConfigRegistry so `register_channel`
         // can add entries without needing `&mut Mesh` — the registry
         // itself uses interior mutability (DashMap).
@@ -110,6 +141,8 @@ impl MeshBuilder {
         Ok(Mesh {
             node,
             channel_configs,
+            #[cfg(feature = "identity")]
+            identity: sdk_identity,
         })
     }
 }
@@ -125,6 +158,12 @@ pub struct Mesh {
     /// so `register_channel` / subscriber ACL checks operate on the
     /// same live data.
     channel_configs: Arc<ChannelConfigRegistry>,
+    /// Held onto so the caller's `TokenCache` (and future capability
+    /// announcement state) stays alive for the mesh's lifetime —
+    /// `MeshNode` was already handed a clone of the keypair, so this
+    /// is purely for the auxiliary state that rides alongside.
+    #[cfg(feature = "identity")]
+    identity: Option<crate::identity::Identity>,
 }
 
 impl Mesh {
@@ -478,6 +517,14 @@ impl Mesh {
     /// Get a reference to the underlying `MeshNode`.
     pub fn inner(&self) -> &MeshNode {
         &self.node
+    }
+
+    /// Caller-owned identity bound to this mesh, if any. Returns
+    /// `None` for meshes built without `.identity(...)` (ephemeral
+    /// keypair).
+    #[cfg(feature = "identity")]
+    pub fn identity(&self) -> Option<&crate::identity::Identity> {
+        self.identity.as_ref()
     }
 }
 
