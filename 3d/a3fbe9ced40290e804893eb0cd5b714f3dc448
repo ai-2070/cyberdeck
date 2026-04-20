@@ -1,0 +1,23 @@
+net/crates/net/docs/SDK_EXPANSION_PLAN.md
+  5bf3f089eecaef7a 505-506,508-538,542,549,562
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "3da3fbe9ced40290e804893eb0cd5b714f3dc448",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 37,
+      "total_deletions": 13,
+      "accepted_lines": 37,
+      "overriden_lines": 0
+    }
+  }
+}
