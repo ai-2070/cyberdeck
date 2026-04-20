@@ -1,0 +1,33 @@
+net/crates/net/bindings/go/net/cortex.go
+  5bf3f089eecaef7a 1-958
+net/crates/net/src/ffi/mod.rs
+  5bf3f089eecaef7a 66-71
+net/crates/net/bindings/go/net/net.h
+  5bf3f089eecaef7a 32-39,42-47,180-288
+net/crates/net/src/ffi/cortex.rs
+  5bf3f089eecaef7a 1-1458
+net/crates/net/bindings/go/net/cortex_test.go
+  5bf3f089eecaef7a 1-385
+net/crates/net/bindings/go/README.md
+  5bf3f089eecaef7a 18-21,200-318
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "9ab5a6dc63aeea094e8646f2edec98711ceddaa2",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 7952,
+      "total_deletions": 186,
+      "accepted_lines": 3053,
+      "overriden_lines": 0
+    }
+  }
+}
