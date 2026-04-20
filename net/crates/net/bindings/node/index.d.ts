@@ -917,6 +917,18 @@ export interface MeshOptions {
    * yet enforced; this is presence-only policy today.
    */
   requireSignedCapabilities?: boolean
+  /**
+   * Pin this node to a specific subnet. Defaults to
+   * `SubnetId::GLOBAL` (no restriction). Visibility checks on
+   * publish + subscribe compare against this value.
+   */
+  subnet?: SubnetIdJs
+  /**
+   * Policy applied to inbound `CapabilityAnnouncement`s to
+   * derive each peer's subnet. `None` disables per-peer
+   * subnet tracking.
+   */
+  subnetPolicy?: SubnetPolicyJs
 }
 
 export interface ModelJs {
@@ -1222,6 +1234,35 @@ export interface StreamOptions {
   windowBytes?: number
   /** Fair-scheduler weight (1 = equal share). Default: 1. */
   fairnessWeight?: number
+}
+
+export interface SubnetIdJs {
+  /**
+   * 1–4 levels, each in `[0, 255]`. Example: `[3, 7, 2]` = level
+   * 0 bucket 3 / level 1 bucket 7 / level 2 bucket 2 / level 3 unset.
+   */
+  levels: Array<number>
+}
+
+export interface SubnetPolicyJs {
+  rules: Array<SubnetRuleJs>
+}
+
+export interface SubnetRuleJs {
+  /**
+   * Tag prefix to match — e.g. `"region:"`. Matches at any
+   * position in the capability-tag list; the first matching tag
+   * per rule wins.
+   */
+  tagPrefix: string
+  /** Hierarchy level (0–3) this rule fills. */
+  level: number
+  /**
+   * `tag value → subnet byte` map. E.g. `{ "eu": 1, "us": 2 }`.
+   * Keys are the suffix after `tag_prefix`; values are the u8
+   * bucket index at `level`.
+   */
+  values: Record<string, number>
 }
 
 /** A materialized task record. */

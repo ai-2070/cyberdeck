@@ -23,6 +23,11 @@ identity = ["net"]
 # models/tools/tags. Sits on top of `net` because the broadcast
 # subprotocol + index live in `adapter::net::behavior`.
 capabilities = ["net"]
+# Subnet surface — `subnet` / `subnetPolicy` on `MeshOptions`, plus
+# the POJO types used to describe `SubnetId` / `SubnetRule` /
+# `SubnetPolicy`. Sits on top of `net` because enforcement lives in
+# the mesh publish + subscribe paths.
+subnets = ["net"]
 
 [dependencies]
 net = { path = "../..", default-features = false }

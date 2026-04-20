@@ -44,6 +44,7 @@ import {
   type CapabilityFilter,
   type CapabilitySet,
 } from './capabilities';
+import type { SubnetId, SubnetPolicy } from './subnets';
 
 /** Reliability mode chosen at stream-open time. */
 export type Reliability = 'fire_and_forget' | 'reliable';
@@ -169,6 +170,18 @@ export interface MeshNodeConfig {
    * enforced end-to-end — this is presence-only policy today.
    */
   requireSignedCapabilities?: boolean;
+  /**
+   * Pin this node to a specific subnet. Omitted = no restriction
+   * (`SubnetId::GLOBAL`). Visibility checks on the publish +
+   * subscribe paths compare against this value.
+   */
+  subnet?: SubnetId;
+  /**
+   * Policy that derives each peer's subnet from their capability
+   * announcements. Mesh-wide policy consistency is assumed —
+   * mismatched policies lead to asymmetric views of peer subnets.
+   */
+  subnetPolicy?: SubnetPolicy;
 }
 
 /**
@@ -204,6 +217,8 @@ export class MeshNode {
       numShards: config.numShards,
       capabilityGcIntervalMs: config.capabilityGcIntervalMs,
       requireSignedCapabilities: config.requireSignedCapabilities,
+      subnet: config.subnet,
+      subnetPolicy: config.subnetPolicy,
     });
     return new MeshNode(native);
   }

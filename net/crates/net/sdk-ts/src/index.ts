@@ -112,6 +112,10 @@ export type {
   Modality,
 } from './capabilities';
 
+// Subnets (visibility enforcement).
+export { subnetId, GLOBAL_SUBNET } from './subnets';
+export type { SubnetId, SubnetRule, SubnetPolicy } from './subnets';
+
 // Types.
 export type {
   NetNodeConfig,

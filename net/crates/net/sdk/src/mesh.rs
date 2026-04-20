@@ -59,6 +59,10 @@ pub struct MeshBuilder {
     num_shards: u16,
     #[cfg(feature = "identity")]
     identity: Option<crate::identity::Identity>,
+    #[cfg(feature = "subnets")]
+    subnet: Option<net::adapter::net::SubnetId>,
+    #[cfg(feature = "subnets")]
+    subnet_policy: Option<Arc<net::adapter::net::SubnetPolicy>>,
 }
 
 impl MeshBuilder {
@@ -75,6 +79,10 @@ impl MeshBuilder {
             num_shards: 4,
             #[cfg(feature = "identity")]
             identity: None,
+            #[cfg(feature = "subnets")]
+            subnet: None,
+            #[cfg(feature = "subnets")]
+            subnet_policy: None,
         })
     }
 
@@ -113,6 +121,33 @@ impl MeshBuilder {
         self
     }
 
+    /// Pin this node to a specific subnet. Defaults to
+    /// [`SubnetId::GLOBAL`](crate::subnets::SubnetId) — no
+    /// restriction. Visibility checks on the publish + subscribe
+    /// paths compare against this value.
+    #[cfg(feature = "subnets")]
+    pub fn subnet(mut self, id: net::adapter::net::SubnetId) -> Self {
+        self.subnet = Some(id);
+        self
+    }
+
+    /// Install a subnet policy that derives each peer's subnet from
+    /// their capability announcement. Mesh-wide policy consistency
+    /// is assumed — mismatched policies across nodes lead to
+    /// asymmetric views of peer subnets.
+    ///
+    /// Accepts either an owned `SubnetPolicy` or an `Arc<SubnetPolicy>`
+    /// via blanket `Into` support — useful when several builders
+    /// share one policy at node construction time.
+    #[cfg(feature = "subnets")]
+    pub fn subnet_policy(
+        mut self,
+        policy: impl Into<Arc<net::adapter::net::SubnetPolicy>>,
+    ) -> Self {
+        self.subnet_policy = Some(policy.into());
+        self
+    }
+
     /// Build the mesh node.
     pub async fn build(self) -> Result<Mesh> {
         // Use the caller's identity if one was set, otherwise mint an
@@ -126,11 +161,21 @@ impl MeshBuilder {
         #[cfg(not(feature = "identity"))]
         let keypair = EntityKeypair::generate();
 
-        let config = MeshNodeConfig::new(self.bind_addr, self.psk)
+        #[allow(unused_mut)]
+        let mut config = MeshNodeConfig::new(self.bind_addr, self.psk)
             .with_heartbeat_interval(self.heartbeat_interval)
             .with_session_timeout(self.session_timeout)
             .with_num_shards(self.num_shards)
             .with_handshake(3, Duration::from_secs(5));
+        #[cfg(feature = "subnets")]
+        {
+            if let Some(id) = self.subnet {
+                config = config.with_subnet(id);
+            }
+            if let Some(policy) = self.subnet_policy {
+                config = config.with_subnet_policy(policy);
+            }
+        }
 
         let mut node = MeshNode::new(keypair, config).await?;
         // Install a shared ChannelConfigRegistry so `register_channel`

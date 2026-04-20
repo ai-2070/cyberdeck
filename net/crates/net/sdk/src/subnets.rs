@@ -7,7 +7,7 @@
 //! `SubnetGateway` decides at forwarding time whether a packet
 //! addressed to one subnet should be forwarded to another.
 //!
-//! # Example
+//! # Policy construction
 //!
 //! ```
 //! use net_sdk::subnets::{SubnetId, SubnetPolicy, SubnetRule};
@@ -22,11 +22,42 @@
 //! assert!(SubnetId::GLOBAL.is_global());
 //! ```
 //!
-//! # Scope in this stage
+//! # Binding a subnet to a mesh (`--features "net capabilities subnets"`)
 //!
-//! Re-exports only. The builder hook (`MeshBuilder::subnet(...)`) and
-//! gateway wiring land in a later stage; today users can construct a
-//! `SubnetPolicy` but the mesh does not yet consume it.
+//! ```
+//! # #[cfg(all(feature = "net", feature = "capabilities", feature = "subnets"))]
+//! # async fn doc() -> net_sdk::error::Result<()> {
+//! use std::sync::Arc;
+//! use net_sdk::capabilities::CapabilitySet;
+//! use net_sdk::mesh::MeshBuilder;
+//! use net_sdk::subnets::{SubnetId, SubnetPolicy, SubnetRule};
+//!
+//! let policy = Arc::new(SubnetPolicy::new().add_rule(
+//!     SubnetRule::new("region:", 0).map("eu", 1).map("us", 2),
+//! ));
+//!
+//! let node = MeshBuilder::new("127.0.0.1:0", &[0x42u8; 32])?
+//!     .subnet(SubnetId::new(&[1, 0, 0]))
+//!     .subnet_policy(policy)
+//!     .build()
+//!     .await?;
+//!
+//! // The derived subnet of a peer comes from applying the policy to
+//! // their announced `CapabilitySet`; our own subnet here is
+//! // `[1, 0, 0]`. Self-announced caps must round-trip through the
+//! // policy to the same value for consistent fan-out.
+//! node.announce_capabilities(CapabilitySet::new().add_tag("region:eu"))
+//!     .await?;
+//!
+//! node.shutdown().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Today visibility enforcement covers `Visibility::SubnetLocal` and
+//! `Visibility::ParentVisible`. `Visibility::Exported` and multi-hop
+//! gateway routing are follow-ups; see
+//! [`docs/SUBNET_ENFORCEMENT_PLAN.md`](../../docs/SUBNET_ENFORCEMENT_PLAN.md).
 
 pub use net::adapter::net::subnet::{
     DropReason, ForwardDecision, SubnetGateway, SubnetId, SubnetPolicy, SubnetRule,

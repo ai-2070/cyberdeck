@@ -84,6 +84,8 @@ use super::route::{RoutingHeader, ROUTING_HEADER_SIZE};
 use super::router::{NetRouter, RouterConfig};
 use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
+use super::subnet::{SubnetId, SubnetPolicy};
+use super::Visibility;
 use super::subprotocol::stream_window::{StreamWindow, SUBPROTOCOL_STREAM_WINDOW};
 use super::subprotocol::MigrationSubprotocolHandler;
 use super::transport::{NetSocket, PacketReceiver, ParsedPacket, SocketBufferConfig};
@@ -171,6 +173,14 @@ struct DispatchCtx {
     /// Whether inbound `CapabilityAnnouncement` packets without a
     /// signature are dropped. Validity is not enforced yet.
     require_signed_capabilities: bool,
+    /// This node's subnet (copy of `config.subnet`).
+    local_subnet: SubnetId,
+    /// Policy applied to each inbound `CapabilityAnnouncement` to
+    /// derive the sender's subnet. `None` disables tracking.
+    local_subnet_policy: Option<Arc<SubnetPolicy>>,
+    /// Per-peer subnet map, written by the capability-announcement
+    /// dispatch and read by the subscribe gate + publish fan-out.
+    peer_subnets: Arc<DashMap<u64, SubnetId>>,
 }
 
 /// Result passed through the pending-ack oneshot.
@@ -233,6 +243,16 @@ pub struct MeshNodeConfig {
     /// values waste CPU; high values keep stale peers queryable past
     /// their TTL.
     pub capability_gc_interval: Duration,
+    /// This node's subnet. Defaults to [`SubnetId::GLOBAL`] — "no
+    /// restriction." Visibility checks compare against this value on
+    /// both the publish and subscribe paths.
+    pub subnet: SubnetId,
+    /// Policy applied to inbound [`CapabilityAnnouncement`]s to
+    /// derive each peer's subnet. `None` disables per-peer subnet
+    /// tracking; every peer is treated as `GLOBAL`, which in
+    /// practice means `Visibility::SubnetLocal` channels ship only
+    /// when both sides are `GLOBAL`.
+    pub subnet_policy: Option<Arc<SubnetPolicy>>,
 }
 
 impl MeshNodeConfig {
@@ -257,6 +277,8 @@ impl MeshNodeConfig {
             membership_ack_timeout: Duration::from_secs(5),
             require_signed_capabilities: false,
             capability_gc_interval: Duration::from_secs(60),
+            subnet: SubnetId::GLOBAL,
+            subnet_policy: None,
         }
     }
 
@@ -296,6 +318,21 @@ impl MeshNodeConfig {
     /// Set the capability-index GC sweep interval.
     pub fn with_capability_gc_interval(mut self, interval: Duration) -> Self {
         self.capability_gc_interval = interval;
+        self
+    }
+
+    /// Pin this node to a specific subnet.
+    pub fn with_subnet(mut self, subnet: SubnetId) -> Self {
+        self.subnet = subnet;
+        self
+    }
+
+    /// Derive each peer's subnet locally by applying this policy to
+    /// their inbound [`CapabilityAnnouncement`]s. Mesh-wide policy
+    /// consistency is assumed; mismatched policies lead to
+    /// asymmetric views of peer subnets.
+    pub fn with_subnet_policy(mut self, policy: Arc<SubnetPolicy>) -> Self {
+        self.subnet_policy = Some(policy);
         self
     }
 }
@@ -418,6 +455,18 @@ pub struct MeshNode {
     /// so this must move forward across restarts if the caller wants
     /// their announcements accepted.
     capability_version: Arc<AtomicU64>,
+    /// This node's subnet. Copy of `config.subnet`, hoisted to the
+    /// top level because the publish + subscribe hot paths read it
+    /// without going through the config struct.
+    local_subnet: SubnetId,
+    /// Subnet policy applied to inbound `CapabilityAnnouncement`s.
+    /// `None` disables per-peer subnet tracking.
+    local_subnet_policy: Option<Arc<SubnetPolicy>>,
+    /// Per-peer subnet map. Keys are `node_id`; values are the
+    /// subnet derived from each peer's most recent announcement via
+    /// `local_subnet_policy`. Unknown peers default to
+    /// [`SubnetId::GLOBAL`] at read time.
+    peer_subnets: Arc<DashMap<u64, SubnetId>>,
     /// Background tasks
     tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
     /// Shutdown flag
@@ -501,10 +550,19 @@ impl MeshNode {
         // Failed is removed from every channel it was subscribed to.
         let roster: Arc<SubscriberRoster> = Arc::new(SubscriberRoster::new());
 
+        // Peer-subnet map (Stage D). Populated when inbound
+        // `SUBPROTOCOL_CAPABILITY_ANN` packets arrive and the local
+        // `SubnetPolicy` derives a subnet for the sender. Created
+        // here so the failure callback can evict stale entries on
+        // session loss — otherwise reconnects would silently reuse
+        // the old subnet until the next announcement arrived.
+        let peer_subnets: Arc<DashMap<u64, SubnetId>> = Arc::new(DashMap::new());
+
         // Wire failure detector with reroute callbacks + roster eviction.
         let rp_failure = reroute_policy.clone();
         let rp_recovery = reroute_policy.clone();
         let roster_failure = roster.clone();
+        let peer_subnets_failure = peer_subnets.clone();
         let failure_detector = FailureDetector::with_config(FailureDetectorConfig {
             timeout: config.session_timeout,
             miss_threshold: 3,
@@ -521,10 +579,17 @@ impl MeshNode {
                     "roster: evicted failed peer from channels"
                 );
             }
+            peer_subnets_failure.remove(&node_id);
         })
         .on_recovery(move |node_id| rp_recovery.on_recovery(node_id));
 
         let pending_handshakes: Arc<DashMap<u64, PendingHandshake>> = Arc::new(DashMap::new());
+
+        // Hoist the subnet knobs before `config` is moved into the
+        // struct literal; the publish + subscribe paths read these
+        // without going back through `config`.
+        let local_subnet = config.subnet;
+        let local_subnet_policy = config.subnet_policy.clone();
 
         Ok(Self {
             identity,
@@ -549,6 +614,9 @@ impl MeshNode {
             capability_index: Arc::new(CapabilityIndex::new()),
             local_announcement: Arc::new(ArcSwapOption::empty()),
             capability_version: Arc::new(AtomicU64::new(0)),
+            local_subnet,
+            local_subnet_policy,
+            peer_subnets,
             tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
@@ -799,6 +867,9 @@ impl MeshNode {
             max_channels_per_peer: self.config.max_channels_per_peer,
             capability_index: self.capability_index.clone(),
             require_signed_capabilities: self.config.require_signed_capabilities,
+            local_subnet: self.local_subnet,
+            local_subnet_policy: self.local_subnet_policy.clone(),
+            peer_subnets: self.peer_subnets.clone(),
         };
 
         tokio::spawn(async move {
@@ -2032,6 +2103,14 @@ impl MeshNode {
             return;
         }
 
+        // Derive the peer's subnet *before* moving `ann` into the
+        // index — the policy needs `ann.capabilities` and `index()`
+        // consumes the announcement by value.
+        if let Some(policy) = ctx.local_subnet_policy.as_ref() {
+            let subnet = policy.assign(&ann.capabilities);
+            ctx.peer_subnets.insert(from_node, subnet);
+        }
+
         ctx.capability_index.index(ann);
     }
 
@@ -2041,7 +2120,9 @@ impl MeshNode {
     /// 1. Per-peer channel cap — rejects with `TooManyChannels`.
     /// 2. If a `channel_configs` registry is set and the channel isn't in
     ///    it, reject with `UnknownChannel`.
-    /// 3. Otherwise accept. Full capability/token checks are deferred
+    /// 3. Channel [`Visibility`] must permit the subscriber's subnet
+    ///    — reject cross-subnet subscribes with `Unauthorized`.
+    /// 4. Otherwise accept. Full capability/token checks are deferred
     ///    until the dispatch context carries the sender's `CapabilitySet`.
     fn authorize_subscribe(
         channel: &ChannelName,
@@ -2052,11 +2133,53 @@ impl MeshNode {
             return (false, Some(AckReason::TooManyChannels));
         }
         if let Some(ref configs) = ctx.channel_configs {
-            if configs.get_by_name(channel.as_str()).is_none() {
+            let Some(cfg) = configs.get_by_name(channel.as_str()) else {
                 return (false, Some(AckReason::UnknownChannel));
+            };
+            // Capture visibility + drop the registry guard before
+            // any further work (the `get_by_name` returns a
+            // `DashMap::Ref` that holds a read lock; keeping it
+            // around across the subnet check is fine but cheaper to
+            // release).
+            let visibility = cfg.visibility;
+            drop(cfg);
+
+            let peer_subnet = ctx
+                .peer_subnets
+                .get(&from_node)
+                .map(|e| *e.value())
+                .unwrap_or(SubnetId::GLOBAL);
+            if !Self::subnet_visible(ctx.local_subnet, peer_subnet, visibility) {
+                return (false, Some(AckReason::Unauthorized));
             }
         }
         (true, None)
+    }
+
+    /// `true` if a packet with `visibility` originating in `source`
+    /// should be delivered to a peer in `dest`.
+    ///
+    /// Mirrors the `SubnetGateway::should_forward` visibility matrix
+    /// but doesn't need the gateway's state (`peer_subnets`,
+    /// `export_table`). Regular participants use this for
+    /// publish-fan-out filtering + subscribe-gate checks;
+    /// border-gateway nodes with richer routing state should use the
+    /// full `SubnetGateway` instead.
+    ///
+    /// `Exported` is conservative — returns `false` unless a
+    /// per-channel export table is consulted elsewhere. Wiring that
+    /// is a documented follow-up.
+    fn subnet_visible(source: SubnetId, dest: SubnetId, visibility: Visibility) -> bool {
+        match visibility {
+            Visibility::Global => true,
+            Visibility::SubnetLocal => source.is_same_subnet(dest),
+            Visibility::ParentVisible => {
+                source.is_same_subnet(dest)
+                    || source.is_ancestor_of(dest)
+                    || dest.is_ancestor_of(source)
+            }
+            Visibility::Exported => false,
+        }
     }
 
     /// Send an `Ack` on the membership subprotocol back to `to_node`.
@@ -2144,7 +2267,31 @@ impl MeshNode {
         // Snapshot subscribers at call time; late subscribers won't see
         // this publish, early-unsubscribes may still receive it — both
         // are documented non-goals.
-        let subscribers = self.roster.members(publisher.channel());
+        let mut subscribers = self.roster.members(publisher.channel());
+
+        // Subnet visibility filter. Look up the channel's visibility
+        // (default `Global` for unregistered names so a publisher
+        // without a registry still delivers) and drop any subscriber
+        // whose subnet isn't visible under that rule. Filtered
+        // subscribers don't show up in `attempted` or `errors` —
+        // they're policy decisions, not failures.
+        let visibility = self
+            .channel_configs
+            .as_ref()
+            .and_then(|cr| {
+                cr.get_by_name(publisher.channel().name().as_str())
+                    .map(|c| c.visibility)
+            })
+            .unwrap_or(Visibility::Global);
+        subscribers.retain(|peer_id| {
+            let peer_subnet = self
+                .peer_subnets
+                .get(peer_id)
+                .map(|e| *e.value())
+                .unwrap_or(SubnetId::GLOBAL);
+            Self::subnet_visible(self.local_subnet, peer_subnet, visibility)
+        });
+
         let mut report = PublishReport {
             attempted: subscribers.len(),
             delivered: 0,

@@ -9,6 +9,12 @@ mod common;
 mod cortex;
 #[cfg(feature = "identity")]
 mod identity;
+// Subnet POJOs — gated on `net` rather than `subnets` because the
+// feature-gated #[napi(object)] fields that reference SubnetIdJs /
+// SubnetPolicyJs need the types present whenever `net` brings in
+// MeshOptions. The subnets feature remains a user-facing marker.
+#[cfg(feature = "net")]
+mod subnets;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -940,6 +946,14 @@ mod mesh_bindings {
         /// signature. Default: false. Signature *validity* is not
         /// yet enforced; this is presence-only policy today.
         pub require_signed_capabilities: Option<bool>,
+        /// Pin this node to a specific subnet. Defaults to
+        /// `SubnetId::GLOBAL` (no restriction). Visibility checks on
+        /// publish + subscribe compare against this value.
+        pub subnet: Option<crate::subnets::SubnetIdJs>,
+        /// Policy applied to inbound `CapabilityAnnouncement`s to
+        /// derive each peer's subnet. `None` disables per-peer
+        /// subnet tracking.
+        pub subnet_policy: Option<crate::subnets::SubnetPolicyJs>,
     }
 
     /// JS-facing channel config, mirroring the core `ChannelConfig`
@@ -1191,6 +1205,15 @@ mod mesh_bindings {
             }
             if let Some(b) = options.require_signed_capabilities {
                 config = config.with_require_signed_capabilities(b);
+            }
+            if let Some(id_js) = options.subnet {
+                let id = crate::subnets::subnet_id_from_js(id_js)?;
+                config = config.with_subnet(id);
+            }
+            if let Some(policy_js) = options.subnet_policy {
+                let policy =
+                    std::sync::Arc::new(crate::subnets::subnet_policy_from_js(policy_js)?);
+                config = config.with_subnet_policy(policy);
             }
 
             let identity = EntityKeypair::generate();
