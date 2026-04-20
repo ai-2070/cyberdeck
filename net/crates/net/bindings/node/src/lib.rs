@@ -954,11 +954,19 @@ mod mesh_bindings {
         /// derive each peer's subnet. `None` disables per-peer
         /// subnet tracking.
         pub subnet_policy: Option<crate::subnets::SubnetPolicyJs>,
+        /// 32-byte ed25519 seed. When set, the mesh derives its
+        /// keypair (and therefore its `entity_id` + stable
+        /// `node_id`) from these bytes instead of generating
+        /// ephemeral ones. Treat as secret material.
+        pub identity_seed: Option<Buffer>,
     }
 
     /// JS-facing channel config, mirroring the core `ChannelConfig`
     /// field-for-field. v1 does not expose `publishCaps` /
-    /// `subscribeCaps` — those arrive with the security plan.
+    /// Channel registration config. `publishCaps` / `subscribeCaps`
+    /// are capability filters enforced at subscribe time + before
+    /// the publish fan-out; `requireToken` gates on a valid
+    /// `PermissionToken`. See `docs/CHANNEL_AUTH_PLAN.md`.
     #[napi(object)]
     pub struct ChannelConfigJs {
         /// Canonical channel name. Crosses the boundary as a string
@@ -969,14 +977,20 @@ mod mesh_bindings {
         pub visibility: Option<String>,
         /// Default reliability for streams on this channel.
         pub reliable: Option<bool>,
-        /// Whether subscribers must present a valid PermissionToken.
-        /// v1 ships `false`; token verification requires the security
-        /// plan's identity surface.
+        /// When true, subscribers must present a valid
+        /// `PermissionToken` whose subject matches their entity id.
         pub require_token: Option<bool>,
         /// Priority (0 = lowest).
         pub priority: Option<u8>,
         /// Rate cap in packets per second.
         pub max_rate_pps: Option<u32>,
+        /// Capability filter the publisher itself must satisfy
+        /// before fan-out. Rejected with a `channel:` error on
+        /// mismatch.
+        pub publish_caps: Option<crate::capabilities::CapabilityFilterJs>,
+        /// Capability filter each subscriber must satisfy. Rejected
+        /// as `Unauthorized` on mismatch.
+        pub subscribe_caps: Option<crate::capabilities::CapabilityFilterJs>,
     }
 
     impl ChannelConfigJs {
@@ -999,6 +1013,13 @@ mod mesh_bindings {
             }
             if let Some(pps) = self.max_rate_pps {
                 cfg = cfg.with_rate_limit(pps);
+            }
+            if let Some(filter) = self.publish_caps {
+                cfg = cfg.with_publish_caps(crate::capabilities::capability_filter_from_js(filter));
+            }
+            if let Some(filter) = self.subscribe_caps {
+                cfg = cfg
+                    .with_subscribe_caps(crate::capabilities::capability_filter_from_js(filter));
             }
             Ok(cfg)
         }
@@ -1216,7 +1237,21 @@ mod mesh_bindings {
                 config = config.with_subnet_policy(policy);
             }
 
-            let identity = EntityKeypair::generate();
+            let identity = match options.identity_seed {
+                Some(seed) => {
+                    let bytes: &[u8] = seed.as_ref();
+                    if bytes.len() != 32 {
+                        return Err(Error::from_reason(format!(
+                            "identity_seed must be 32 bytes, got {}",
+                            bytes.len()
+                        )));
+                    }
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(bytes);
+                    EntityKeypair::from_bytes(arr)
+                }
+                None => EntityKeypair::generate(),
+            };
 
             let mut node = MeshNode::new(identity, config)
                 .await
@@ -1226,6 +1261,12 @@ mod mesh_bindings {
             // can insert without needing `&mut NetMesh`.
             let channel_configs = Arc::new(net::adapter::net::ChannelConfigRegistry::new());
             node.set_channel_configs(channel_configs.clone());
+            // Always install a TokenCache — channel auth needs
+            // somewhere to stash tokens presented on subscribe.
+            // Callers that want to pre-seed can use `installToken`
+            // on a caller-side `Identity` constructed from the same
+            // `identity_seed`.
+            node.set_token_cache(Arc::new(net::adapter::net::identity::TokenCache::new()));
 
             Ok(NetMesh {
                 node: Arc::new(ArcSwapOption::from_pointee(node)),
@@ -1249,6 +1290,16 @@ mod mesh_bindings {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             Ok(BigInt::from(node.node_id()))
+        }
+
+        /// Get this node's ed25519 entity id (32 bytes — the same
+        /// value as `new Identity(seed).entityId` when the mesh was
+        /// constructed with `identitySeed = seed`).
+        #[napi]
+        pub fn entity_id(&self) -> Result<Buffer> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            Ok(Buffer::from(node.entity_id().as_bytes().to_vec()))
         }
 
         /// Connect to a peer (initiator side).

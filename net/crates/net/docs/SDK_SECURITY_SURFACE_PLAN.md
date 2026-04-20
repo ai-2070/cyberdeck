@@ -468,6 +468,22 @@ Visibility on channel config (Stage E) will accept `'subnet-local' | 'parent-vis
 
 ## Stage E — Wire channel auth through the SDK
 
+> **Expanded in [`CHANNEL_AUTH_PLAN.md`](CHANNEL_AUTH_PLAN.md).**
+> Same iceberg shape as Stages C and D: the primitives
+> (`ChannelConfig::can_publish` / `can_subscribe`) existed but
+> `authorize_subscribe` never called them, `TokenCache` wasn't
+> plumbed to `MeshNode`, `MembershipMsg::Subscribe` had no token
+> slot, and `CapabilityAnnouncement` carried no `entity_id` that a
+> publisher could bind a token's subject to. That plan covers the
+> wire-format additions (`entity_id` + signature verification on
+> announcements, token field on Subscribe), `TokenCache` +
+> `peer_entity_ids` tracking, both gates (`can_subscribe` at the
+> subscribe handler + `can_publish` as a self-check before
+> fan-out), and the SDK/NAPI/TS surface (`SubscribeOptions {
+> token? }`). Signing defaults to on; Stage C's "signature is
+> advisory" caveat closes as a side effect. ~4-5 days, same as
+> C/D.
+
 With identity + capabilities + subnets addressable, channel auth becomes an `SdkError`-surfaced option on channel config.
 
 ### Rust SDK — extend `Mesh::register_channel` / `publish` / `subscribe_channel`

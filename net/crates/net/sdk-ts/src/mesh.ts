@@ -198,6 +198,14 @@ export interface MeshNodeConfig {
    * mismatched policies lead to asymmetric views of peer subnets.
    */
   subnetPolicy?: SubnetPolicy;
+  /**
+   * 32-byte ed25519 seed. When set, the mesh's keypair is
+   * derived from this seed — so its `entityId` and `nodeId`
+   * are reproducible across restarts, and a caller-side
+   * `Identity.fromSeed(seed)` can issue tokens that validate
+   * against this mesh. Treat as secret material.
+   */
+  identitySeed?: Buffer;
 }
 
 /**
@@ -235,8 +243,14 @@ export class MeshNode {
       requireSignedCapabilities: config.requireSignedCapabilities,
       subnet: config.subnet,
       subnetPolicy: config.subnetPolicy,
+      identitySeed: config.identitySeed,
     });
     return new MeshNode(native);
+  }
+
+  /** 32-byte ed25519 entity id for this mesh. */
+  entityId(): Buffer {
+    return this.native.entityId();
   }
 
   /** Hex-encoded Noise static public key. */
@@ -391,6 +405,12 @@ export class MeshNode {
         requireToken: config.requireToken,
         priority: config.priority,
         maxRatePps: config.maxRatePps,
+        publishCaps: config.publishCaps
+          ? capabilityFilterToNapi(config.publishCaps)
+          : undefined,
+        subscribeCaps: config.subscribeCaps
+          ? capabilityFilterToNapi(config.subscribeCaps)
+          : undefined,
       });
     } catch (e) {
       toChannelError(e);
@@ -511,12 +531,26 @@ export interface ChannelConfig {
   visibility?: Visibility;
   /** Default reliability for streams on this channel. */
   reliable?: boolean;
-  /** v1 ships `false`; token enforcement requires the security plan. */
+  /**
+   * When true, subscribers must present a valid
+   * `PermissionToken` whose subject matches their entity id.
+   */
   requireToken?: boolean;
   /** Priority (0 = lowest). */
   priority?: number;
   /** Rate cap in packets per second. */
   maxRatePps?: number;
+  /**
+   * Capability filter the publisher itself must satisfy before
+   * fan-out. `publish` rejects with a `channel:` error on
+   * mismatch.
+   */
+  publishCaps?: CapabilityFilter;
+  /**
+   * Capability filter each subscriber must satisfy.
+   * `subscribeChannel` throws a `ChannelAuthError` on mismatch.
+   */
+  subscribeCaps?: CapabilityFilter;
 }
 
 /** Publish-fanout config — mirror of the core `PublishConfig`. */

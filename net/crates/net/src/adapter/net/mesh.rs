@@ -659,6 +659,13 @@ impl MeshNode {
         self.node_id
     }
 
+    /// Get this node's ed25519 entity id (derived from the
+    /// keypair handed to `MeshNode::new`). 32 bytes. Used by
+    /// `CapabilityAnnouncement` + channel-auth path.
+    pub fn entity_id(&self) -> &EntityId {
+        self.identity.entity_id()
+    }
+
     /// Get the local bind address.
     pub fn local_addr(&self) -> SocketAddr {
         self.socket.local_addr()

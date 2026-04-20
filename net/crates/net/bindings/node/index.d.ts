@@ -313,6 +313,12 @@ export declare class NetMesh {
    * routinely exceed `Number.MAX_SAFE_INTEGER`.
    */
   nodeId(): bigint
+  /**
+   * Get this node's ed25519 entity id (32 bytes — the same
+   * value as `new Identity(seed).entityId` when the mesh was
+   * constructed with `identitySeed = seed`).
+   */
+  entityId(): Buffer
   /** Connect to a peer (initiator side). */
   connect(peerAddr: string, peerPublicKey: string, peerNodeId: bigint): Promise<void>
   /** Accept an incoming connection (responder side). */
@@ -711,7 +717,10 @@ export interface CapabilitySetJs {
 /**
  * JS-facing channel config, mirroring the core `ChannelConfig`
  * field-for-field. v1 does not expose `publishCaps` /
- * `subscribeCaps` — those arrive with the security plan.
+ * Channel registration config. `publishCaps` / `subscribeCaps`
+ * are capability filters enforced at subscribe time + before
+ * the publish fan-out; `requireToken` gates on a valid
+ * `PermissionToken`. See `docs/CHANNEL_AUTH_PLAN.md`.
  */
 export interface ChannelConfigJs {
   /**
@@ -727,15 +736,25 @@ export interface ChannelConfigJs {
   /** Default reliability for streams on this channel. */
   reliable?: boolean
   /**
-   * Whether subscribers must present a valid PermissionToken.
-   * v1 ships `false`; token verification requires the security
-   * plan's identity surface.
+   * When true, subscribers must present a valid
+   * `PermissionToken` whose subject matches their entity id.
    */
   requireToken?: boolean
   /** Priority (0 = lowest). */
   priority?: number
   /** Rate cap in packets per second. */
   maxRatePps?: number
+  /**
+   * Capability filter the publisher itself must satisfy
+   * before fan-out. Rejected with a `channel:` error on
+   * mismatch.
+   */
+  publishCaps?: CapabilityFilterJs
+  /**
+   * Capability filter each subscriber must satisfy. Rejected
+   * as `Unauthorized` on mismatch.
+   */
+  subscribeCaps?: CapabilityFilterJs
 }
 
 /**
@@ -934,6 +953,13 @@ export interface MeshOptions {
    * subnet tracking.
    */
   subnetPolicy?: SubnetPolicyJs
+  /**
+   * 32-byte ed25519 seed. When set, the mesh derives its
+   * keypair (and therefore its `entity_id` + stable
+   * `node_id`) from these bytes instead of generating
+   * ephemeral ones. Treat as secret material.
+   */
+  identitySeed?: Buffer
 }
 
 export interface ModelJs {

@@ -344,6 +344,93 @@ node.shutdown().await?;
 Wire-level details and the enforcement matrix live in
 [`docs/SUBNET_ENFORCEMENT_PLAN.md`](../docs/SUBNET_ENFORCEMENT_PLAN.md).
 
+### Channel authentication
+
+`ChannelConfig` carries three auth knobs that are now enforced
+end-to-end at both the subscribe gate and the publish path:
+
+- `publish_caps: CapabilityFilter` — publisher must satisfy before
+  fan-out. Failing publishes return an `AdapterError`; no peers are
+  attempted.
+- `subscribe_caps: CapabilityFilter` — subscribers must satisfy
+  before being added to the roster. Failures surface as
+  `SdkError::ChannelRejected(Some(Unauthorized))`.
+- `require_token: bool` — subscribers must present a valid
+  `PermissionToken` whose subject matches their entity id. The
+  token rides on the subscribe message; the publisher verifies the
+  ed25519 signature on arrival, installs it in its local
+  `TokenCache`, then runs `can_subscribe`.
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use net_sdk::capabilities::{CapabilityFilter, CapabilitySet};
+use net_sdk::mesh::MeshBuilder;
+use net_sdk::{
+    ChannelConfig, ChannelId, ChannelName, Identity, PublishConfig, Reliability,
+    SubscribeOptions, TokenScope,
+};
+# async fn example() -> net_sdk::error::Result<()> {
+// Both sides bind caller-owned identities so tokens + entity_ids
+// are load-bearing.
+let publisher_identity = Identity::generate();
+let subscriber_identity = Identity::generate();
+
+let publisher = MeshBuilder::new("127.0.0.1:9001", &[0x42u8; 32])?
+    .identity(publisher_identity.clone())
+    .build()
+    .await?;
+
+// Register a channel that requires `gpu` AND a token.
+let name = ChannelName::new("events/inference").unwrap();
+let filter = CapabilityFilter::new().require_tag("gpu");
+publisher.register_channel(
+    ChannelConfig::new(ChannelId::new(name.clone()))
+        .with_subscribe_caps(filter)
+        .with_require_token(true),
+);
+
+// Issue a SUBSCRIBE-scope token for the subscriber. This also
+// pre-caches it in the publisher's identity (unused for this
+// flow since the subscriber will present the same token on the
+// wire, but useful for the "pre-seed" pattern).
+let token = publisher_identity.issue_token(
+    subscriber_identity.entity_id().clone(),
+    TokenScope::SUBSCRIBE,
+    &name,
+    Duration::from_secs(300),
+    0,
+);
+
+// Subscriber attaches the token.
+let subscriber: &net_sdk::Mesh = unimplemented!();
+subscriber
+    .subscribe_channel_with(
+        publisher.node_id(),
+        &name,
+        SubscribeOptions { token: Some(token) },
+    )
+    .await?;
+# Ok(())
+# }
+```
+
+**Scope today**:
+
+- Full enforcement at subscribe + publish; empty-caps / missing-
+  entity defaults fail closed when `require_token` is set.
+- `CapabilityAnnouncement` now carries the sender's `entity_id` and
+  is signed — verified end-to-end (closes the "signature advisory"
+  caveat from the capability section above).
+- `node_id → entity_id` is pinned on first sight (TOFU); rebind
+  attempts in later announcements are silently rejected.
+- Any denial surfaces as `AckReason::Unauthorized`; we don't split
+  sub-reasons yet (cap-failed vs token-failed vs subnet-failed).
+  Flag as a follow-up if debugging needs finer granularity.
+
+Wire-format details and the token presentation flow live in
+[`docs/CHANNEL_AUTH_PLAN.md`](../docs/CHANNEL_AUTH_PLAN.md).
+
 ## Channels (distributed pub/sub)
 
 Named pub/sub over the encrypted mesh. Publishers register channels

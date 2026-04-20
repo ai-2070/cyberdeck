@@ -626,11 +626,17 @@ class NetMesh:
         heartbeat_interval_ms: Optional[int] = None,
         session_timeout_ms: Optional[int] = None,
         num_shards: Optional[int] = None,
+        identity_seed: Optional[bytes] = None,
     ) -> None: ...
 
     @property
     def public_key(self) -> str:
         """Hex-encoded 32-byte Noise static public key."""
+        ...
+    @property
+    def entity_id(self) -> bytes:
+        """32-byte ed25519 entity id. Matches ``Identity.from_seed(seed).entity_id``
+        when the mesh was constructed with ``identity_seed=seed``."""
         ...
     @property
     def node_id(self) -> int:
@@ -768,3 +774,118 @@ class ChannelAuthError(ChannelError):
     """Subclass of `ChannelError`. Raised when a Subscribe /
     Unsubscribe request is rejected because the publisher's ACL
     denied the subscriber."""
+
+class IdentityError(Exception):
+    """Raised for malformed inputs at the identity layer (wrong
+    seed length, invalid entity id, unknown scope, etc.). Token-
+    validity failures raise `TokenError` instead."""
+
+class TokenError(Exception):
+    """Raised when a `PermissionToken` fails validation. The
+    exception message has the form ``token: <kind>`` where
+    ``<kind>`` is one of ``invalid_signature`` |
+    ``not_yet_valid`` | ``expired`` | ``delegation_exhausted`` |
+    ``delegation_not_allowed`` | ``not_authorized`` |
+    ``invalid_format``. Programmatic callers parse it via
+    ``str(e).removeprefix("token: ")``."""
+
+class Identity:
+    """ed25519 keypair + local token cache. Cheap to use from
+    multiple threads — both inner members are `Arc`-backed on
+    the Rust side.
+
+    Persist via :meth:`to_bytes` (the 32-byte ed25519 seed) and
+    reload with :meth:`from_seed` / :meth:`from_bytes` on
+    subsequent runs. Treat the seed as secret material.
+    """
+
+    @staticmethod
+    def generate() -> "Identity":
+        """Generate a fresh ed25519 identity."""
+        ...
+    @staticmethod
+    def from_seed(seed: bytes) -> "Identity":
+        """Load from a caller-owned 32-byte ed25519 seed."""
+        ...
+    @staticmethod
+    def from_bytes(data: bytes) -> "Identity":
+        """Alias for :meth:`from_seed`."""
+        ...
+    def to_bytes(self) -> bytes:
+        """Serialize as the 32-byte seed. Treat as secret."""
+        ...
+    @property
+    def entity_id(self) -> bytes:
+        """Ed25519 public key (32 bytes)."""
+        ...
+    @property
+    def origin_hash(self) -> int:
+        """Derived 32-bit origin hash used in packet headers."""
+        ...
+    @property
+    def node_id(self) -> int:
+        """Derived 64-bit node id used for routing / addressing."""
+        ...
+    @property
+    def token_cache_len(self) -> int:
+        """Number of cached tokens (testing aid)."""
+        ...
+    def sign(self, message: bytes) -> bytes:
+        """Sign arbitrary bytes. Returns 64-byte ed25519 signature."""
+        ...
+    def issue_token(
+        self,
+        subject: bytes,
+        scope: List[str],
+        channel: str,
+        ttl_seconds: int,
+        delegation_depth: int = 0,
+    ) -> bytes:
+        """Issue a scoped token to ``subject`` (32-byte entity id).
+        Scope is a subset of ``['publish', 'subscribe', 'admin',
+        'delegate']``. Returns the 159-byte serialized
+        ``PermissionToken``."""
+        ...
+    def install_token(self, token: bytes) -> None:
+        """Install a received token. Signature is verified on
+        insert; raises :class:`TokenError` on bad signature or
+        malformed bytes."""
+        ...
+    def lookup_token(
+        self, subject: bytes, channel: str
+    ) -> Optional[bytes]:
+        """Look up a cached token by ``(subject, channel)``.
+        Returns ``None`` if no exact-channel token is cached."""
+        ...
+
+def parse_token(token: bytes) -> dict:
+    """Parse a serialized token into a dict. Raises
+    :class:`TokenError` on bad length / structure. Does NOT
+    verify the signature — use :func:`verify_token` for that."""
+    ...
+
+def verify_token(token: bytes) -> bool:
+    """Verify the ed25519 signature. ``True`` = valid. Does NOT
+    check time-bound validity — see :func:`token_is_expired`."""
+    ...
+
+def token_is_expired(token: bytes) -> bool:
+    """``True`` if the token's ``not_after`` has passed (host
+    wall-clock)."""
+    ...
+
+def delegate_token(
+    signer: Identity,
+    parent: bytes,
+    new_subject: bytes,
+    restricted_scope: List[str],
+) -> bytes:
+    """Delegate a token to a new subject. The ``parent`` token
+    must include ``'delegate'`` scope and have
+    ``delegation_depth > 0``; the ``signer`` must be the subject
+    of the parent token."""
+    ...
+
+def channel_hash(channel: str) -> int:
+    """Hash a channel name to the 16-bit wire-format value."""
+    ...

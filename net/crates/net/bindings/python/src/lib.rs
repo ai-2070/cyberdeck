@@ -4,6 +4,11 @@
 
 #[cfg(feature = "cortex")]
 mod cortex;
+// Identity / capabilities / subnets ride the `net` feature as a
+// single security unit — they share `adapter::net`'s subprotocol
+// dispatch and are operationally inseparable.
+#[cfg(feature = "net")]
+mod identity;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -1022,13 +1027,21 @@ mod mesh_bindings {
         ///     session_timeout_ms: Session timeout (default: 30000)
         ///     num_shards: Number of inbound shards (default: 4)
         #[new]
-        #[pyo3(signature = (bind_addr, psk, heartbeat_interval_ms=None, session_timeout_ms=None, num_shards=None))]
+        #[pyo3(signature = (
+            bind_addr,
+            psk,
+            heartbeat_interval_ms=None,
+            session_timeout_ms=None,
+            num_shards=None,
+            identity_seed=None,
+        ))]
         fn new(
             bind_addr: &str,
             psk: &str,
             heartbeat_interval_ms: Option<u64>,
             session_timeout_ms: Option<u64>,
             num_shards: Option<u16>,
+            identity_seed: Option<&[u8]>,
         ) -> PyResult<Self> {
             let addr: std::net::SocketAddr = bind_addr
                 .parse()
@@ -1057,7 +1070,24 @@ mod mesh_bindings {
                 Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("runtime: {}", e)))?,
             );
 
-            let identity = EntityKeypair::generate();
+            // Derive the mesh's keypair from the caller-supplied
+            // seed when present — lets a caller-side `Identity.
+            // from_seed(same_seed)` issue tokens whose `subject`
+            // matches this mesh's entity id. Otherwise generate.
+            let identity = match identity_seed {
+                Some(seed) => {
+                    if seed.len() != 32 {
+                        return Err(PyValueError::new_err(format!(
+                            "identity_seed must be 32 bytes, got {}",
+                            seed.len()
+                        )));
+                    }
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(seed);
+                    EntityKeypair::from_bytes(arr)
+                }
+                None => EntityKeypair::generate(),
+            };
             let mut node = runtime
                 .block_on(MeshNode::new(identity, config))
                 .map_err(|e| PyRuntimeError::new_err(format!("MeshNode: {}", e)))?;
@@ -1065,6 +1095,14 @@ mod mesh_bindings {
             // Install shared channel-config registry.
             let channel_configs = Arc::new(ChannelConfigRegistry::new());
             node.set_channel_configs(channel_configs.clone());
+            // Install a fresh TokenCache — channel auth needs
+            // somewhere to stash tokens presented on subscribe.
+            // Callers wanting to share a cache across meshes can
+            // build one externally; today each `NetMesh` gets its
+            // own.
+            node.set_token_cache(Arc::new(
+                net::adapter::net::identity::TokenCache::new(),
+            ));
 
             Ok(Self {
                 node: Some(node),
@@ -1078,6 +1116,15 @@ mod mesh_bindings {
         fn public_key(&self) -> PyResult<String> {
             let node = self.get_node()?;
             Ok(hex::encode(node.public_key()))
+        }
+
+        /// Get this node's 32-byte ed25519 entity id. Matches
+        /// `Identity.from_seed(seed).entity_id` when the mesh was
+        /// constructed with `identity_seed=seed`.
+        #[getter]
+        fn entity_id(&self) -> PyResult<Vec<u8>> {
+            let node = self.get_node()?;
+            Ok(node.entity_id().as_bytes().to_vec())
         }
 
         /// Get this node's ID.
@@ -1580,6 +1627,17 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ChannelError", m.py().get_type::<ChannelError>())?;
     #[cfg(feature = "net")]
     m.add("ChannelAuthError", m.py().get_type::<ChannelAuthError>())?;
+    #[cfg(feature = "net")]
+    {
+        m.add_class::<identity::Identity>()?;
+        m.add_function(wrap_pyfunction!(identity::parse_token, m)?)?;
+        m.add_function(wrap_pyfunction!(identity::verify_token, m)?)?;
+        m.add_function(wrap_pyfunction!(identity::token_is_expired, m)?)?;
+        m.add_function(wrap_pyfunction!(identity::delegate_token, m)?)?;
+        m.add_function(wrap_pyfunction!(identity::channel_hash, m)?)?;
+        m.add("IdentityError", m.py().get_type::<identity::IdentityError>())?;
+        m.add("TokenError", m.py().get_type::<identity::TokenError>())?;
+    }
     #[cfg(feature = "cortex")]
     {
         m.add_class::<cortex::PyRedex>()?;
