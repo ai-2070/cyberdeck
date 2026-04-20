@@ -1,0 +1,23 @@
+net/crates/net/sdk-ts/README.md
+  5bf3f089eecaef7a 164-337
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "88019f8b1cf3defdfd88b1692120e79d405887ff",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 177,
+      "total_deletions": 564,
+      "accepted_lines": 174,
+      "overriden_lines": 0
+    }
+  }
+}
