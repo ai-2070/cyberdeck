@@ -1,5 +1,7 @@
 # RedEX v1 — local append-only streaming log
 
+> **Looking for how to use this?** [`STORAGE_AND_CORTEX.md`](STORAGE_AND_CORTEX.md) is the user-facing narrative (API surface, durability trade-offs, restart behavior). This doc is the implementation plan.
+
 ## Status
 
 Design only. RedEX does not exist yet.
@@ -319,9 +321,44 @@ v1's contract is: `tail` is expressive enough that a fold can run against it. Th
 - **Tail backfill vs live race.** The register-watcher + backfill-from-seq sequence must hand off without gaps or dupes. Covered by the tail-boundary test.
 - **CortEX coupling.** `RedexFold` is a trait only; CortEX owns the implementation. If CortEX grows a requirement that needs a shape change (e.g., back-pressure on the fold), we revisit — but unlikely.
 - **Name collision.** RedEX and CortEX both use the `EX` suffix. Keep the aesthetic; callsite docs disambiguate (RedEX = storage primitive, CortEX = query plane).
-- **Durability semantics.** Fire-and-forget loses the tail on crash by default. `persistent: true` opts into background fsync; `sync_on_append` is v2. Document prominently.
+- **Durability semantics.** Shipped with `FsyncPolicy` (see section below); the old `sync_on_append` placeholder is superseded. Default is `Never` — no append-path fsync, `close()` is the durability barrier. Callers opt into `EveryN(N)` or `Interval(d)` when they need tighter bounds.
 
-## Future work
+## Durability & crash semantics (shipped)
+
+Disk-backed files (`RedexFileConfig::persistent = true` + a `Redex` manager configured with `with_persistent_dir`) are governed by a per-file [`FsyncPolicy`](../src/adapter/net/redex/config.rs):
+
+```rust
+pub enum FsyncPolicy {
+    Never,                 // default — no fsync on append
+    EveryN(u64),           // fsync every N appends
+    Interval(Duration),    // fsync on a timer
+}
+```
+
+Set via `RedexFileConfig::default().with_fsync_policy(...)` at `Redex::open_file` time.
+
+| Policy | Worst-case loss — process crash | Worst-case loss — kernel / power crash |
+|--------|---------------------------------|---------------------------------------|
+| `Never` (default) | Tail since last close / explicit `sync()` | Same |
+| `EveryN(N)` | Up to `N − 1` entries from the last sync point | Same |
+| `Interval(d)` | Up to `d` seconds of writes | Same |
+
+### Invariants
+
+- `close()` **always** fsyncs, regardless of policy. `Never` means "no fsync on the append path," not "no durability at all." A clean shutdown of a `Never`-configured file loses nothing.
+- Explicit `RedexFile::sync()` always fsyncs, regardless of policy. It's the caller's on-demand durability barrier.
+- Torn-write recovery is fsync-independent. The dat-before-idx write ordering plus reopen-time truncation handles arbitrary partial writes — no policy can leave the file unrecoverable, only shorter than you'd like.
+- `EveryN(0)` and `EveryN(1)` both collapse to "fsync on every append." `EveryN(N)` for `N > 1` bounds loss at `N − 1` entries.
+- `Interval(d)` spawns one tokio background task per file. `close()` cancels it cleanly; dropping a `RedexFile` without `close()` leaves the task alive until runtime shutdown (consistent with the rest of the file lifecycle).
+
+### Choosing a policy
+
+- `Never` — telemetry, best-effort logs, caches where losing the tail is acceptable. Lowest latency.
+- `EveryN(100)` — most application state. Bounds loss at 99 entries; negligible overhead.
+- `Interval(1s)` — anything that must survive kernel panic / power loss. Bounds loss at one second of writes regardless of append rate.
+- `EveryN(1)` — journalled / audit-grade streams where every entry must be durable before the next write logically happens.
+
+
 
 Scope intentionally held out of v1, tracked in separate plan docs:
 

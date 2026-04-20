@@ -988,23 +988,31 @@ impl StreamState {
     }
 
     /// Apply a receiver grant reporting the receiver's **absolute**
-    /// cumulative consumed-byte count on this stream. Authoritatively
-    /// recomputes `tx_credit_remaining` as
-    /// `tx_window - (tx_bytes_sent - total_consumed)`. Monotonic —
+    /// cumulative consumed-byte count on this stream. Monotonic —
     /// grants arriving with `total_consumed` below the already-observed
     /// maximum are treated as stale duplicates and only bump the
     /// `credit_grants_received` counter. Self-healing: a single lost
     /// grant is reconciled by the next one because each grant carries
     /// the receiver's full accounting.
+    ///
+    /// Reconciliation adds the **delta** of newly-acknowledged bytes
+    /// (`total_consumed - prev_max_consumed`) to `tx_credit_remaining`
+    /// via `fetch_update`. The additive form composes atomically with
+    /// the CAS in `try_acquire_tx_credit` and the `fetch_update` in
+    /// `refund_tx_credit`: every operation preserves the invariant
+    /// `remaining + (sent - max_consumed) == window` regardless of
+    /// interleaving. An earlier `.store()`-based implementation
+    /// recomputed from a racy snapshot of `tx_bytes_sent`, which could
+    /// silently overwrite a concurrent acquire's CAS result.
     pub fn apply_authoritative_grant(&self, total_consumed: u64) {
         self.credit_grants_received.fetch_add(1, Ordering::Relaxed);
         if self.tx_window == 0 {
             return;
         }
-        // Monotonic update under CAS — protects the invariant
-        // against concurrent grant-dispatch tasks.
+        // Monotonic CAS update — the value advanced by the successful
+        // CAS is the amount of newly-acknowledged bytes.
         let mut prev = self.max_consumed_seen.load(Ordering::Acquire);
-        loop {
+        let delta = loop {
             if total_consumed <= prev {
                 return; // stale / duplicate grant — ignore
             }
@@ -1014,26 +1022,30 @@ impl StreamState {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => break total_consumed - prev,
                 Err(current) => prev = current,
             }
-        }
-        // Reconcile `tx_credit_remaining`. With the new monotonic
-        // `max_consumed_seen`, recompute the fresh outstanding and
-        // set credit to `window - outstanding`. Clamp at 0 and
-        // `tx_window` — `outstanding >= window` (possible under a
-        // transient race where the grant reflects fewer committed
-        // bytes than the sender has racked up) means "everything so
-        // far is outstanding," so credit is 0 until the next grant.
-        let sent = self.tx_bytes_sent.load(Ordering::Relaxed);
-        let outstanding = sent.saturating_sub(total_consumed);
-        let new_remaining = if outstanding >= self.tx_window as u64 {
-            0
-        } else {
-            self.tx_window - outstanding as u32
         };
+        // Under honest receiver accounting
+        // (`total_consumed <= tx_bytes_sent`) the delta is bounded by
+        // the outstanding window, so `saturating_add` is a no-op
+        // against overflow and the final value naturally stays at or
+        // below `tx_window`.
+        //
+        // A malformed or buggy grant can report `total_consumed`
+        // above what the sender has actually committed, which would
+        // otherwise mint credit past the window and let the sender
+        // exceed its configured ceiling. The `min(self.tx_window)`
+        // clamp caps credit at the configured window regardless of
+        // the reported delta — a safety bound, not a correctness
+        // requirement under honest operation.
+        let grant_add = delta.min(u32::MAX as u64) as u32;
+        let window = self.tx_window;
         self.tx_credit_remaining
-            .store(new_remaining, Ordering::Release);
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_add(grant_add).min(window))
+            })
+            .ok();
     }
 
     /// Cumulative bytes committed to the wire on this stream.
@@ -1493,8 +1505,7 @@ mod tests {
         // counter.
         let state = StreamState::new_full(false, 1, 100);
         // Manually push tx_credit_remaining near the top so we can
-        // exercise the saturating edge. (apply_authoritative_grant
-        // can't do this because it clamps at `tx_window`.)
+        // exercise the saturating edge.
         state
             .tx_credit_remaining
             .store(u32::MAX - 50, Ordering::Release);
@@ -1554,20 +1565,161 @@ mod tests {
     }
 
     #[test]
-    fn test_authoritative_grant_clamps_when_outstanding_exceeds_window() {
-        // Pathological: tx_bytes_sent has raced ahead of the grant's
-        // `total_consumed` by more than one window. Outstanding would
-        // overflow `tx_window`; credit clamps at 0 rather than
-        // wrapping.
+    fn test_authoritative_grant_clamps_to_window_on_malformed_total_consumed() {
+        // Regression: a malformed or buggy grant whose
+        // `total_consumed` claims more bytes than the sender has
+        // actually committed would otherwise mint credit above
+        // `tx_window` — the sender could then exceed its configured
+        // ceiling on subsequent admits. The fetch_update clamps at
+        // `tx_window` so credit is capped at the window regardless of
+        // the reported delta. `max_consumed_seen` still advances
+        // (monotonic property holds) so subsequent stale grants
+        // continue to be filtered.
         let state = StreamState::new_full(false, 1, 100);
-        state.tx_bytes_sent.store(1_000, Ordering::Relaxed);
-        // total_consumed=500 is strictly > initial max_consumed_seen=0,
-        // so the monotonic guard lets it through. Outstanding =
-        // 1000 - 500 = 500, which is >= tx_window (100), so credit
-        // clamps at 0.
+        assert!(state.try_acquire_tx_credit(40));
+        assert_eq!(state.tx_credit_remaining(), 60);
+        assert_eq!(state.tx_bytes_sent(), 40);
+
+        // Malformed grant: reports 500 consumed against only 40 sent.
         state.apply_authoritative_grant(500);
-        assert_eq!(state.tx_credit_remaining(), 0);
+
+        assert_eq!(
+            state.tx_credit_remaining(),
+            100,
+            "malformed grant must not push credit above tx_window",
+        );
         assert_eq!(state.max_consumed_seen(), 500);
+        // A subsequent honest grant below the malformed high-water
+        // mark is still ignored as stale — the malformed advancement
+        // is sticky.
+        state.apply_authoritative_grant(50);
+        assert_eq!(state.max_consumed_seen(), 500);
+        assert_eq!(state.tx_credit_remaining(), 100);
+    }
+
+    #[test]
+    fn test_authoritative_grant_does_not_clobber_concurrent_acquire() {
+        // Regression: the earlier `.store()`-based reconciliation
+        // computed `remaining = window - (sent - consumed)` from a
+        // racy snapshot of `tx_bytes_sent` and then *overwrote*
+        // `tx_credit_remaining`. A concurrent `try_acquire_tx_credit`
+        // that had already CAS'd its debit but not yet bumped
+        // `tx_bytes_sent` would have its debit silently undone — the
+        // sender could then exceed its window.
+        //
+        // Hand-drive the interleaving by performing the first half of
+        // an acquire (the CAS on `tx_credit_remaining`) before
+        // applying the grant, and the second half (the bump of
+        // `tx_bytes_sent`) after. If the invariant
+        // `remaining + (sent - max_consumed) == window` still holds
+        // at the end, the grant respected the in-flight acquire.
+        let state = StreamState::new_full(false, 1, 100);
+        // Commit 60 bytes up front so `tx_bytes_sent` is non-zero.
+        assert!(state.try_acquire_tx_credit(60));
+        assert_eq!(state.tx_credit_remaining(), 40);
+        assert_eq!(state.tx_bytes_sent(), 60);
+
+        // Step 1 of a would-be `try_acquire_tx_credit(30)`: CAS the
+        // credit debit. Defer the `tx_bytes_sent` bump to simulate a
+        // thread that has stalled between the two atomic ops.
+        state
+            .tx_credit_remaining
+            .compare_exchange(40, 10, Ordering::AcqRel, Ordering::Acquire)
+            .expect("no contention in test harness");
+
+        // Grant arrives while the acquire is mid-flight: sees
+        // `tx_bytes_sent = 60` (pre-bump), advances `max_consumed` to 60.
+        state.apply_authoritative_grant(60);
+
+        // Step 2: finish the acquire by bumping `tx_bytes_sent`.
+        state.tx_bytes_sent.fetch_add(30, Ordering::Relaxed);
+
+        let remaining = state.tx_credit_remaining() as u64;
+        let sent = state.tx_bytes_sent();
+        let consumed = state.max_consumed_seen();
+        assert_eq!(
+            remaining + (sent - consumed),
+            100,
+            "invariant violated: remaining={} sent={} consumed={} (grant clobbered the in-flight acquire)",
+            remaining,
+            sent,
+            consumed,
+        );
+    }
+
+    #[test]
+    fn test_authoritative_grant_invariant_under_thread_contention() {
+        // Stress: many interleaved acquires and grants must preserve
+        // the end-state invariant `remaining + (sent - consumed) == window`.
+        // Each acquire takes 1 byte and each grant advances consumed
+        // by 1; running both loops to completion on separate threads
+        // exercises the ordering between the acquire's two-step
+        // (CAS remaining, then bump sent) and the grant's credit
+        // update.
+        //
+        // The granter mirrors honest receiver accounting by waiting
+        // until the sender has actually committed `target` bytes
+        // before reporting `total_consumed = target`. Without this
+        // ordering the test would synthesize malformed grants that
+        // report consumption ahead of sent bytes — the window clamp
+        // would then strand the over-grant and fail the equality
+        // check even though both operations are behaving correctly.
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::thread;
+
+        const WINDOW: u32 = 64;
+        const ITERATIONS: u64 = 2_000;
+
+        for _trial in 0..8 {
+            let state = Arc::new(StreamState::new_full(false, 1, WINDOW));
+            let go = Arc::new(AtomicBool::new(false));
+
+            let state_a = state.clone();
+            let go_a = go.clone();
+            let acquirer = thread::spawn(move || {
+                while !go_a.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                for _ in 0..ITERATIONS {
+                    while !state_a.try_acquire_tx_credit(1) {
+                        std::hint::spin_loop();
+                    }
+                }
+            });
+
+            let state_g = state.clone();
+            let go_g = go.clone();
+            let granter = thread::spawn(move || {
+                while !go_g.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                for target in 1..=ITERATIONS {
+                    while state_g.tx_bytes_sent() < target {
+                        std::hint::spin_loop();
+                    }
+                    state_g.apply_authoritative_grant(target);
+                }
+            });
+
+            go.store(true, Ordering::Release);
+            acquirer.join().unwrap();
+            granter.join().unwrap();
+
+            let remaining = state.tx_credit_remaining() as u64;
+            let sent = state.tx_bytes_sent();
+            let consumed = state.max_consumed_seen();
+            assert_eq!(sent, ITERATIONS);
+            assert_eq!(consumed, ITERATIONS);
+            assert_eq!(
+                remaining + (sent - consumed),
+                WINDOW as u64,
+                "invariant violated after contention: remaining={} sent={} consumed={}",
+                remaining,
+                sent,
+                consumed,
+            );
+        }
     }
 
     #[test]

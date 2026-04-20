@@ -26,6 +26,15 @@ use super::types::{
 };
 use super::watch::TasksWatcher;
 
+/// Return shape of [`TasksAdapter::snapshot_and_watch`]: the
+/// initial filter result plus a boxed stream that emits every
+/// subsequent change (dedup'd, with the initial skipped so the
+/// caller doesn't double-render).
+pub type TasksSnapshotAndWatch = (
+    Vec<super::types::Task>,
+    std::pin::Pin<Box<dyn futures::Stream<Item = Vec<super::types::Task>> + Send + 'static>>,
+);
+
 use futures::StreamExt;
 
 /// Wire format for [`TasksAdapter::snapshot`]: wraps the `TasksState`
@@ -172,6 +181,44 @@ impl TasksAdapter {
     /// deduplicated on filter-result change).
     pub fn watch(&self) -> TasksWatcher {
         TasksWatcher::new(self.inner.state(), self.inner.changes().boxed())
+    }
+
+    /// One-shot combo: a snapshot of the current filter result PLUS
+    /// a stream that emits every **subsequent** change to that
+    /// filter. The stream skips the initial emission so the caller
+    /// doesn't see the snapshot twice — the snapshot is the initial
+    /// state; the stream carries deltas from there forward.
+    ///
+    /// Useful for UI-style consumers: "paint what's there now, then
+    /// react to changes" without a manual dedup against the first
+    /// emission.
+    pub fn snapshot_and_watch(&self, watcher: TasksWatcher) -> TasksSnapshotAndWatch {
+        use futures::StreamExt;
+        // Compute the snapshot from the adapter's current state,
+        // reusing the watcher's configured filter. Holding the read
+        // lock only for the execute call keeps it brief.
+        let initial = {
+            let state = self.inner.state();
+            let guard = state.read();
+            watcher.spec_for_snapshot().execute(&guard)
+        };
+        // The watcher's stream recomputes its own initial from the
+        // current state when `stream()` runs. If the state changes
+        // between our snapshot read above and the watcher's read
+        // inside `stream()`, a plain `skip(1)` would drop the
+        // watcher's (newer) initial and the caller would miss that
+        // change entirely.
+        //
+        // Use `skip_while` against our snapshot so we only discard
+        // the leading emissions that still equal the state the
+        // caller already has — as soon as the stream diverges, we
+        // forward everything through.
+        let initial_for_stream = initial.clone();
+        let stream = watcher
+            .stream()
+            .skip_while(move |current| futures::future::ready(current == &initial_for_stream))
+            .boxed();
+        (initial, stream)
     }
 
     /// Capture a snapshot suitable for restore. Returns

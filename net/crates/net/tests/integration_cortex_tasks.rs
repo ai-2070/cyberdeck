@@ -788,3 +788,132 @@ async fn test_persistent_tasks_recover_across_processes() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[tokio::test]
+async fn test_snapshot_and_watch_snapshot_reflects_current_state() {
+    // `snapshot_and_watch` returns (initial, delta_stream). This test
+    // covers the cheap, deterministic half: the snapshot. The delta
+    // half is covered by the existing `test_watch_*` suite that
+    // exercises the underlying `watch().stream()` shape — since
+    // `snapshot_and_watch` is `(initial, watcher.stream().skip(1))`,
+    // any regression in delta behavior is caught upstream.
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+
+    // Seed one pending + one completed; snapshot-for-pending must
+    // reflect both the positive and negative filter evaluation.
+    tasks.create(1, "p1", 100).unwrap();
+    tasks.create(2, "c1", 200).unwrap();
+    let seq = tasks.complete(2, 250).unwrap();
+    tasks.wait_for_seq(seq).await;
+
+    let watcher = tasks.watch().where_status(TaskStatus::Pending);
+    let (snapshot, _stream) = tasks.snapshot_and_watch(watcher);
+    let ids: Vec<_> = snapshot.iter().map(|t| t.id).collect();
+    assert_eq!(
+        ids,
+        vec![1],
+        "snapshot must reflect the filter evaluated against current state"
+    );
+}
+
+#[tokio::test]
+async fn test_regression_snapshot_and_watch_delivers_post_call_updates() {
+    // Regression for the `skip(1)` drop-update bug: the watcher's
+    // `stream()` computes its own initial emission from a second,
+    // independent state read. If that read races with the snapshot
+    // read above it in `snapshot_and_watch`, the two values diverge
+    // — and a plain `skip(1)` would silently discard the divergent
+    // emission, leaving the caller with a stale snapshot and no
+    // pending deltas. The fix uses `skip_while(== snapshot)` so any
+    // emission that differs from the returned snapshot is forwarded.
+    //
+    // This test covers the user-visible contract: any state change
+    // after the call must eventually land on the stream, including
+    // the case where the change races stream construction.
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+    let seq = tasks.create(1, "seed", 100).unwrap();
+    tasks.wait_for_seq(seq).await;
+
+    let watcher = tasks.watch();
+    let (initial, mut stream) = tasks.snapshot_and_watch(watcher);
+    let initial_ids: Vec<_> = initial.iter().map(|t| t.id).collect();
+    assert_eq!(initial_ids, vec![1]);
+
+    // Post-call mutation. Under both skip(1) and skip_while this
+    // specific case works (the change arrives via the normal delta
+    // path), but having it as a baseline guards against any future
+    // over-eager filtering that also drops legitimate deltas.
+    let seq = tasks.create(2, "post", 200).unwrap();
+    tasks.wait_for_seq(seq).await;
+
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+        .await
+        .expect("stream must emit after mutation")
+        .expect("stream must not end");
+    let ids: Vec<_> = observed.iter().map(|t| t.id).collect();
+    assert_eq!(ids, vec![1, 2]);
+    assert_ne!(observed, initial);
+}
+
+#[tokio::test]
+async fn test_regression_snapshot_and_watch_forwards_divergent_stream_initial() {
+    // Regression: the watcher's `stream()` reads state independently
+    // of `snapshot_and_watch`'s own read. If between those two reads
+    // the state has mutated — because the mutation was already queued
+    // when the call began — the stream's internal initial will
+    // differ from the snapshot returned to the caller. With the old
+    // `skip(1)`, that divergent initial was dropped silently and the
+    // caller's stream hung on an unchanging state. With
+    // `skip_while(== snapshot)` the divergent initial is forwarded.
+    //
+    // Drive the divergence by mutating state concurrently across
+    // many trials. The assertion is the functional contract: when
+    // the snapshot reflects N tasks and the mutation adds one more,
+    // the stream MUST deliver the N+1 state within a short window.
+    for trial in 0..20 {
+        let redex = Redex::new();
+        let tasks = std::sync::Arc::new(TasksAdapter::open(&redex, ORIGIN).unwrap());
+        let seq = tasks.create(1, "seed", 100).unwrap();
+        tasks.wait_for_seq(seq).await;
+
+        let tasks_m = tasks.clone();
+        let mutator = tokio::spawn(async move {
+            let seq = tasks_m.create(2, "race", 200).unwrap();
+            tasks_m.wait_for_seq(seq).await;
+        });
+
+        let watcher = tasks.watch();
+        let (initial, mut stream) = tasks.snapshot_and_watch(watcher);
+        mutator.await.unwrap();
+
+        // Skip trials where the mutation fully landed before the
+        // snapshot read — there's no further change to deliver.
+        if initial.len() == 2 {
+            continue;
+        }
+        assert_eq!(
+            initial.len(),
+            1,
+            "trial {}: snapshot should be [seed]",
+            trial
+        );
+
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "trial {}: stream must deliver post-snapshot state within timeout",
+                    trial
+                )
+            })
+            .expect("stream must not end");
+        assert_eq!(
+            observed.len(),
+            2,
+            "trial {}: stream must deliver state with both tasks",
+            trial
+        );
+    }
+}

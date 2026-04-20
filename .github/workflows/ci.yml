@@ -133,7 +133,7 @@ jobs:
           key: ${{ runner.os }}-cargo-node-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install npm dependencies
-        run: npm install
+        run: npm ci
 
       # Build napi binding with the features the vitest suite covers:
       # `net` for the mesh surface + `cortex` for the CortEX / NetDB tests.

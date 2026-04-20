@@ -17,17 +17,21 @@
 //!
 //! Durability policy:
 //!
-//! - Every append writes to the OS page cache (no per-append fsync).
-//! - `close()` fsyncs both files.
-//! - Explicit `sync()` calls (and `close()`) fsync both files
-//!   calls `sync_all` on both files; `None` (default) = sync on close
-//!   only.
+//! - Append-path fsync is governed by [`super::FsyncPolicy`], threaded
+//!   in as `fsync_every_n` at open time. `0` disables append-side
+//!   syncing; a positive value triggers a fsync every `n`th append.
+//! - `close()` always fsyncs both files, regardless of policy.
+//! - Explicit `super::RedexFile::sync()` always fsyncs both files.
+//! - Order matters inside [`DiskSegment::sync`]: dat fsyncs before
+//!   idx so a crash can only leave the index shorter than dat,
+//!   which the reopen-time truncation handles.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
@@ -50,20 +54,40 @@ pub(super) struct DiskSegment {
     dir: PathBuf,
     idx_file: Mutex<File>,
     dat_file: Mutex<File>,
+    /// Append-path fsync interval: after `fsync_every_n` successful
+    /// appends, the segment invokes `sync()` itself. `0` disables
+    /// append-side syncing (Never or Interval policies — the latter
+    /// is driven externally by a per-file background task).
+    fsync_every_n: u64,
+    /// Appends since the last append-driven sync (successful or not).
+    /// Only meaningful when `fsync_every_n > 0`.
+    appends_since_sync: AtomicU64,
     /// Test-only injection: when set, the next `append_entry` /
     /// `append_entries` call returns `RedexError::Io` before touching
     /// either file. Exercises the caller's rollback paths without
     /// needing a real I/O failure (disk full, permission denied).
     #[cfg(test)]
     fail_next_append: AtomicBool,
+    /// Test-only counter: cumulative successful `sync()` calls —
+    /// close-time, append-driven (EveryN), or external
+    /// (Interval / explicit). Lets policy tests assert the observed
+    /// fsync cadence without racing real I/O.
+    #[cfg(test)]
+    sync_count: AtomicU64,
 }
 
 impl DiskSegment {
     /// Open (or create) the idx + dat files for `name` under `base_dir`
     /// and recover the index from disk.
+    ///
+    /// `fsync_every_n` is derived from [`super::FsyncPolicy`] at the
+    /// `RedexFile` layer: `EveryN(n)` forwards `n`; `Never` and
+    /// `Interval` (handled by the per-file background task) both
+    /// forward `0`, disabling append-side syncs on this segment.
     pub(super) fn open(
         base_dir: &Path,
         name: &ChannelName,
+        fsync_every_n: u64,
     ) -> Result<RecoveredSegment, RedexError> {
         let dir = channel_dir(base_dir, name);
         std::fs::create_dir_all(&dir).map_err(RedexError::io)?;
@@ -170,12 +194,47 @@ impl DiskSegment {
                 dir,
                 idx_file: Mutex::new(idx_file),
                 dat_file: Mutex::new(dat_file),
+                fsync_every_n,
+                appends_since_sync: AtomicU64::new(0),
                 #[cfg(test)]
                 fail_next_append: AtomicBool::new(false),
+                #[cfg(test)]
+                sync_count: AtomicU64::new(0),
             },
             index,
             payload_bytes,
         })
+    }
+
+    /// Test-only: cumulative successful `sync()` count.
+    #[cfg(test)]
+    pub(super) fn sync_count(&self) -> u64 {
+        self.sync_count.load(Ordering::Acquire)
+    }
+
+    /// Bump the per-append counter and, if `fsync_every_n` is set,
+    /// call `sync()` when the counter reaches it. Counter resets after
+    /// each sync so the cadence stays periodic rather than
+    /// exponentially triggered. An fsync error at this boundary is
+    /// logged but **not** propagated — the caller's append already
+    /// succeeded in the page cache, and a blocked-fsync error here
+    /// would surface as a spurious append failure. Explicit
+    /// `sync()` / `close()` still surface errors.
+    fn maybe_sync_after_append(&self, applied: u64) {
+        if self.fsync_every_n == 0 || applied == 0 {
+            return;
+        }
+        let prev = self.appends_since_sync.fetch_add(applied, Ordering::AcqRel);
+        let now = prev.saturating_add(applied);
+        if now < self.fsync_every_n {
+            return;
+        }
+        // Reset unconditionally before syncing so a concurrent appender
+        // sees a clean counter even if sync is slow.
+        self.appends_since_sync.store(0, Ordering::Release);
+        if let Err(e) = self.sync() {
+            tracing::warn!(error = %e, "EveryN fsync failed; tail may be unsynced");
+        }
     }
 
     /// Test-only: arm a one-shot failure on the next
@@ -191,8 +250,11 @@ impl DiskSegment {
     /// Inline entries skip the dat write — their payload rides in the
     /// 20-byte idx record.
     ///
-    /// Writes go through the OS page cache with no per-append fsync.
-    /// Durability is realized on `sync()` or `close()`.
+    /// Writes go through the OS page cache. Append-time fsync is
+    /// governed by [`super::FsyncPolicy`] via `fsync_every_n`:
+    /// `Never` / `Interval` skip it here entirely; `EveryN(n)`
+    /// triggers a sync every `n`th successful append. Explicit
+    /// `sync()` / `close()` still fsync regardless of policy.
     pub(super) fn append_entry(
         &self,
         entry: &RedexEntry,
@@ -208,12 +270,17 @@ impl DiskSegment {
         }
         let mut idx = self.idx_file.lock();
         idx.write_all(&entry.to_bytes()).map_err(RedexError::io)?;
+        drop(idx);
+        self.maybe_sync_after_append(1);
         Ok(())
     }
 
     /// Append several entries and their payloads atomically (per-file:
     /// each file's buffered write is contiguous). Inline entries only
     /// touch the idx file.
+    ///
+    /// Same fsync semantics as [`Self::append_entry`] — a batch of N
+    /// counts as N applied appends against the `EveryN` cadence.
     pub(super) fn append_entries(
         &self,
         entries_and_payloads: &[(RedexEntry, &[u8])],
@@ -234,6 +301,8 @@ impl DiskSegment {
         for (entry, _) in entries_and_payloads {
             idx.write_all(&entry.to_bytes()).map_err(RedexError::io)?;
         }
+        drop(idx);
+        self.maybe_sync_after_append(entries_and_payloads.len() as u64);
         Ok(())
     }
 
@@ -249,6 +318,8 @@ impl DiskSegment {
     pub(super) fn sync(&self) -> Result<(), RedexError> {
         self.dat_file.lock().sync_all().map_err(RedexError::io)?;
         self.idx_file.lock().sync_all().map_err(RedexError::io)?;
+        #[cfg(test)]
+        self.sync_count.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 }
@@ -326,7 +397,7 @@ mod tests {
         let name = ChannelName::new("t/disk1").unwrap();
 
         {
-            let recovered = DiskSegment::open(&base, &name).unwrap();
+            let recovered = DiskSegment::open(&base, &name, 0).unwrap();
             assert!(recovered.index.is_empty());
             assert!(recovered.payload_bytes.is_empty());
 
@@ -343,7 +414,7 @@ mod tests {
         }
 
         // Reopen; recover both entries and their payload.
-        let recovered = DiskSegment::open(&base, &name).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
         assert_eq!(recovered.index.len(), 2);
         assert_eq!(recovered.index[0].seq, 0);
         assert_eq!(recovered.index[1].seq, 1);
@@ -358,14 +429,14 @@ mod tests {
         let base = tmpdir();
         let name = ChannelName::new("t/inline").unwrap();
 
-        let recovered = DiskSegment::open(&base, &name).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
         let payload = *b"abcdefgh";
         let entry = RedexEntry::new_inline(0, &payload, payload_checksum(&payload));
         recovered.disk.append_entry(&entry, &payload).unwrap();
         recovered.disk.sync().unwrap();
         drop(recovered);
 
-        let recovered = DiskSegment::open(&base, &name).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
         assert_eq!(recovered.index.len(), 1);
         assert!(recovered.index[0].is_inline());
         // Dat file should be empty — inline payload lives in idx.
@@ -381,7 +452,7 @@ mod tests {
 
         // Write one good entry.
         {
-            let recovered = DiskSegment::open(&base, &name).unwrap();
+            let recovered = DiskSegment::open(&base, &name, 0).unwrap();
             let p = b"ok";
             let e = RedexEntry::new_heap(0, 0, p.len() as u32, 0, payload_checksum(p));
             recovered.disk.append_entry(&e, p).unwrap();
@@ -396,7 +467,7 @@ mod tests {
         drop(f);
 
         // Reopen: partial tail must be truncated; one entry recovered.
-        let recovered = DiskSegment::open(&base, &name).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
         assert_eq!(recovered.index.len(), 1);
         assert_eq!(recovered.index[0].seq, 0);
 

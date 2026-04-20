@@ -103,6 +103,20 @@ impl TasksWatcher {
         self
     }
 
+    /// Expose the filter spec for one-shot callers like
+    /// [`super::TasksAdapter::snapshot_and_watch`] that need to
+    /// execute the filter **once** against the current state before
+    /// handing the watcher off to stream subsequent changes.
+    pub(super) fn spec_for_snapshot(&self) -> TasksFilterSpec {
+        let mut spec = self.spec.clone();
+        if spec.order_by.is_none() {
+            // Mirror the default that `stream()` applies so the
+            // snapshot's ordering matches the stream's emissions.
+            spec.order_by = Some(OrderBy::IdAsc);
+        }
+        spec
+    }
+
     /// Start emitting. The stream yields:
     ///
     /// - The current filter result immediately (first element).

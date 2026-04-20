@@ -1354,14 +1354,32 @@ impl MeshNode {
             // `ctx.peers`. At high peer counts the scan would make
             // packet receive cost proportional to peer count — the
             // hot path needs to stay constant-time.
+            //
+            // The addr-based lookup is validated against the arriving
+            // `session.session_id()` because multiple peers can share
+            // a source address in relay scenarios: `addr_to_node` is
+            // keyed by last-seen source and may resolve to a different
+            // peer than the one this packet authenticated as. On
+            // mismatch (or miss) fall back to a session_id scan so the
+            // grant is guaranteed to go back on the session the
+            // accepted bytes arrived on.
             let peer_addr = session.peer_addr();
-            if let Some((peer_addr, peer_session)) =
-                ctx.addr_to_node.get(&peer_addr).and_then(|node_id| {
-                    ctx.peers
-                        .get(&*node_id)
-                        .map(|p| (p.value().addr, p.value().session.clone()))
+            let peer = ctx
+                .addr_to_node
+                .get(&peer_addr)
+                .and_then(|node_id| {
+                    ctx.peers.get(&*node_id).and_then(|p| {
+                        (p.value().session.session_id() == session.session_id())
+                            .then(|| (p.value().addr, p.value().session.clone()))
+                    })
                 })
-            {
+                .or_else(|| {
+                    ctx.peers
+                        .iter()
+                        .find(|e| e.value().session.session_id() == session.session_id())
+                        .map(|e| (e.value().addr, e.value().session.clone()))
+                });
+            if let Some((peer_addr, peer_session)) = peer {
                 Self::spawn_stream_window_grant(
                     ctx,
                     peer_session,

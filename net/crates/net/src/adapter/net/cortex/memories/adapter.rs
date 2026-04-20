@@ -27,6 +27,15 @@ use super::types::{
 };
 use super::watch::MemoriesWatcher;
 
+/// Return shape of [`MemoriesAdapter::snapshot_and_watch`]: the
+/// initial filter result plus a boxed stream that emits every
+/// subsequent change (dedup'd, with the initial skipped so the
+/// caller doesn't double-render).
+pub type MemoriesSnapshotAndWatch = (
+    Vec<super::types::Memory>,
+    std::pin::Pin<Box<dyn futures::Stream<Item = Vec<super::types::Memory>> + Send + 'static>>,
+);
+
 use futures::StreamExt;
 
 /// Wire format for [`MemoriesAdapter::snapshot`]: wraps the
@@ -177,6 +186,33 @@ impl MemoriesAdapter {
     /// Start building a reactive watcher.
     pub fn watch(&self) -> MemoriesWatcher {
         MemoriesWatcher::new(self.inner.state(), self.inner.changes().boxed())
+    }
+
+    /// One-shot combo: a snapshot of the current filter result PLUS
+    /// a stream that emits every **subsequent** change to that
+    /// filter. The stream skips the initial emission so the caller
+    /// doesn't see the snapshot twice — the snapshot is the initial
+    /// state; the stream carries deltas from there forward.
+    pub fn snapshot_and_watch(&self, watcher: MemoriesWatcher) -> MemoriesSnapshotAndWatch {
+        use futures::StreamExt;
+        let initial = {
+            let state = self.inner.state();
+            let guard = state.read();
+            watcher.spec_for_snapshot().execute(&guard)
+        };
+        // The watcher recomputes its own initial from live state in
+        // `stream()`. A plain `skip(1)` would silently drop that
+        // value, so if the state mutated between our snapshot and
+        // the watcher's read the caller would never learn about it.
+        // Instead, drop only while the stream still matches the
+        // snapshot we already returned — any diverging emission is
+        // forwarded.
+        let initial_for_stream = initial.clone();
+        let stream = watcher
+            .stream()
+            .skip_while(move |current| futures::future::ready(current == &initial_for_stream))
+            .boxed();
+        (initial, stream)
     }
 
     /// Capture a snapshot suitable for restore. Returns
