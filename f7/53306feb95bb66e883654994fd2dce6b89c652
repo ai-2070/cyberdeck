@@ -1,0 +1,45 @@
+net/crates/net/tests/subnet_enforcement.rs
+  5bf3f089eecaef7a 1-418
+net/crates/net/sdk/src/mesh.rs
+  5bf3f089eecaef7a 62-65,82-85,124-150,164-165,170-178
+net/crates/net/bindings/node/index.d.ts
+  5bf3f089eecaef7a 920-931,1239-1265
+net/crates/net/sdk-ts/src/index.ts
+  5bf3f089eecaef7a 115-118
+net/crates/net/bindings/node/src/lib.rs
+  5bf3f089eecaef7a 12-17,949-956,1209-1217
+net/crates/net/bindings/node/Cargo.toml
+  5bf3f089eecaef7a 26-30
+net/crates/net/sdk/src/subnets.rs
+  5bf3f089eecaef7a 10,25,27-60
+net/crates/net/src/adapter/net/mesh.rs
+  5bf3f089eecaef7a 87-88,176-183,246-255,280-281,323-337,458-469,553-560,565,582,588-593,617-619,870-872,2106-2113,2123-2125,2136,2138-2153,2159-2184,2270-2294
+net/crates/net/sdk-ts/src/mesh.ts
+  5bf3f089eecaef7a 47,173-184,220-221
+net/crates/net/bindings/node/src/subnets.rs
+  5bf3f089eecaef7a 1-120
+net/crates/net/sdk-ts/src/subnets.ts
+  5bf3f089eecaef7a 1-106
+net/crates/net/sdk-ts/test/subnets.test.ts
+  5bf3f089eecaef7a 1-260
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "f753306feb95bb66e883654994fd2dce6b89c652",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 8937,
+      "total_deletions": 126,
+      "accepted_lines": 1272,
+      "overriden_lines": 0
+    }
+  }
+}
