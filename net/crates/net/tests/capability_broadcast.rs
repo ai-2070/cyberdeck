@@ -188,15 +188,13 @@ async fn late_joiner_receives_session_open_push() {
 
 #[tokio::test]
 async fn require_signed_capabilities_drops_unsigned_announcements() {
-    // Today `announce_capabilities` never stamps a signature
-    // (signing binds to Stage E). A receiver with
-    // `require_signed_capabilities = true` must therefore drop
-    // everything from a peer using the stage-C path, leaving the
-    // index empty for that peer.
-    //
-    // Receiver B has the flag on; sender A doesn't. A self-indexes
-    // its own announcement (local path bypasses receive), so a
-    // self-query on A still matches — only B's view should be blank.
+    // Post-E-1, `announce_capabilities` signs by default. Test the
+    // policy knob by explicitly calling `announce_capabilities_with`
+    // with `sign = false` — receiver B's flag must drop those.
+    // Receiver B has the flag on; sender A announces unsigned.
+    // A self-indexes its own announcement (local path bypasses
+    // receive), so a self-query on A still matches — only B's view
+    // should be blank.
     let ports = find_ports(2).await;
     let a = build_node(ports[0]).await;
     let b = build_node_with(ports[1], |cfg| {
@@ -205,9 +203,13 @@ async fn require_signed_capabilities_drops_unsigned_announcements() {
     .await;
     handshake(&a, &b).await;
 
-    a.announce_capabilities(CapabilitySet::new().add_tag("classified"))
-        .await
-        .expect("announce failed");
+    a.announce_capabilities_with(
+        CapabilitySet::new().add_tag("classified"),
+        Duration::from_secs(60),
+        false, // unsigned
+    )
+    .await
+    .expect("announce failed");
 
     // A sees itself (local self-index isn't subject to the flag).
     let filter = CapabilityFilter::new().require_tag("classified");
@@ -234,13 +236,18 @@ async fn stale_versions_are_ignored_by_index() {
     // lives together and this regression catches anyone who alters
     // index semantics.
     use net::adapter::net::behavior::CapabilityIndex;
+    use net::adapter::net::EntityId;
 
     let index = CapabilityIndex::new();
     let caps_v1 = CapabilitySet::new().add_tag("v1");
     let caps_v2 = CapabilitySet::new().add_tag("v2");
 
-    let v1 = CapabilityAnnouncement::new(/* node_id */ 0xAA, /* version */ 1, caps_v1);
-    let v2 = CapabilityAnnouncement::new(0xAA, 2, caps_v2);
+    // Direct index test — no mesh, no signature verification.
+    // A zero-byte EntityId is a valid data-structure input even
+    // though it's not a valid ed25519 public key.
+    let eid = EntityId::from_bytes([0u8; 32]);
+    let v1 = CapabilityAnnouncement::new(/* node_id */ 0xAA, eid.clone(), 1, caps_v1);
+    let v2 = CapabilityAnnouncement::new(0xAA, eid, 2, caps_v2);
 
     index.index(v2);
     index.index(v1); // older — must be a no-op

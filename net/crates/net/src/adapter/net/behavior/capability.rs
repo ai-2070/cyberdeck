@@ -690,6 +690,11 @@ impl CapabilitySet {
 pub struct CapabilityAnnouncement {
     /// Announcing node ID
     pub node_id: u64,
+    /// Announcing entity — the 32-byte ed25519 public key. Pairs
+    /// with `signature` so receivers can verify end-to-end, and
+    /// lets the mesh's channel-auth path resolve
+    /// `node_id → EntityId` for token lookups.
+    pub entity_id: super::super::identity::EntityId,
     /// Monotonic version (for diffing)
     pub version: u64,
     /// Timestamp of announcement (nanoseconds since epoch)
@@ -698,7 +703,8 @@ pub struct CapabilityAnnouncement {
     pub ttl_secs: u32,
     /// Capability set
     pub capabilities: CapabilitySet,
-    /// Optional Ed25519 signature (64 bytes, hex encoded for serde)
+    /// Optional Ed25519 signature (64 bytes, hex encoded for serde).
+    /// Covers every other field (serialize with `signature: None`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Signature64>,
 }
@@ -749,8 +755,15 @@ impl<'de> Deserialize<'de> for Signature64 {
 }
 
 impl CapabilityAnnouncement {
-    /// Create new announcement
-    pub fn new(node_id: u64, version: u64, capabilities: CapabilitySet) -> Self {
+    /// Create a new unsigned announcement. Receivers that run with
+    /// `require_signed_capabilities = true` will drop it until
+    /// [`Self::sign`] is called.
+    pub fn new(
+        node_id: u64,
+        entity_id: super::super::identity::EntityId,
+        version: u64,
+        capabilities: CapabilitySet,
+    ) -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
         let timestamp_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -759,6 +772,7 @@ impl CapabilityAnnouncement {
 
         Self {
             node_id,
+            entity_id,
             version,
             timestamp_ns,
             ttl_secs: 300, // 5 minute default TTL
@@ -777,6 +791,32 @@ impl CapabilityAnnouncement {
     pub fn with_signature(mut self, sig: [u8; 64]) -> Self {
         self.signature = Some(Signature64(sig));
         self
+    }
+
+    /// Sign this announcement in place with `keypair`. Clears any
+    /// existing signature, serializes the (unsigned) payload, signs
+    /// with ed25519, and stores the signature back. The caller must
+    /// ensure `keypair.entity_id() == self.entity_id` — otherwise
+    /// receivers will reject with `InvalidSignature`.
+    pub fn sign(&mut self, keypair: &super::super::identity::EntityKeypair) {
+        self.signature = None;
+        let payload = self.to_bytes();
+        let sig = keypair.sign(&payload);
+        self.signature = Some(Signature64(sig.to_bytes()));
+    }
+
+    /// Verify the signature against the announcement's own
+    /// `entity_id`. Returns `Err` if no signature is present, if
+    /// the signature can't be decoded, or if verification fails.
+    pub fn verify(&self) -> Result<(), super::super::identity::EntityError> {
+        let Some(Signature64(raw)) = self.signature else {
+            return Err(super::super::identity::EntityError::InvalidSignature);
+        };
+        let mut unsigned = self.clone();
+        unsigned.signature = None;
+        let payload = unsigned.to_bytes();
+        let sig = ed25519_dalek::Signature::from_bytes(&raw);
+        self.entity_id.verify(&payload, &sig)
     }
 
     /// Serialize to bytes
@@ -1425,6 +1465,14 @@ pub struct CapabilityIndexStats {
 mod tests {
     use super::*;
 
+    /// Fixed-bytes `EntityId` for unit-test fixtures. Valid as a
+    /// *value* (it's just 32 bytes) but not a valid ed25519 public
+    /// key — callers that also exercise signature verification
+    /// should construct a real `EntityKeypair` instead.
+    fn test_entity() -> super::super::super::identity::EntityId {
+        super::super::super::identity::EntityId::from_bytes([0u8; 32])
+    }
+
     fn sample_capability_set() -> CapabilitySet {
         let gpu = GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24576)
             .with_compute_units(128)
@@ -1538,7 +1586,7 @@ mod tests {
                 caps.tags.push("divisible_by_3".into());
             }
 
-            let ann = CapabilityAnnouncement::new(i, 1, caps);
+            let ann = CapabilityAnnouncement::new(i, test_entity(), 1, caps);
             index.index(ann);
         }
 
@@ -1582,7 +1630,7 @@ mod tests {
 
         // Index version 1
         let caps_v1 = CapabilitySet::new().add_tag("v1");
-        let ann_v1 = CapabilityAnnouncement::new(1, 1, caps_v1);
+        let ann_v1 = CapabilityAnnouncement::new(1, test_entity(), 1, caps_v1);
         index.index(ann_v1);
 
         // Query should find v1 tag
@@ -1591,7 +1639,7 @@ mod tests {
 
         // Index version 2 (should replace v1)
         let caps_v2 = CapabilitySet::new().add_tag("v2");
-        let ann_v2 = CapabilityAnnouncement::new(1, 2, caps_v2);
+        let ann_v2 = CapabilityAnnouncement::new(1, test_entity(), 2, caps_v2);
         index.index(ann_v2);
 
         // v1 tag should be gone, v2 should be present
@@ -1603,7 +1651,7 @@ mod tests {
 
         // Older version should be ignored
         let caps_old = CapabilitySet::new().add_tag("old");
-        let ann_old = CapabilityAnnouncement::new(1, 1, caps_old);
+        let ann_old = CapabilityAnnouncement::new(1, test_entity(), 1, caps_old);
         index.index(ann_old);
 
         // v2 should still be present
@@ -1614,7 +1662,7 @@ mod tests {
     #[test]
     fn test_capability_announcement_expiry() {
         let caps = sample_capability_set();
-        let mut ann = CapabilityAnnouncement::new(1, 1, caps);
+        let mut ann = CapabilityAnnouncement::new(1, test_entity(), 1, caps);
 
         // Fresh announcement should not be expired
         assert!(!ann.is_expired());

@@ -44,7 +44,7 @@ use tokio::task::JoinHandle;
 
 use super::crypto::{handshake_prologue, CryptoError, NoiseHandshake, SessionKeys, StaticKeypair};
 use super::failure::{FailureDetector, FailureDetectorConfig};
-use super::identity::EntityKeypair;
+use super::identity::{EntityId, EntityKeypair};
 use super::pool::PacketBuilder;
 
 use super::behavior::broadcast::SUBPROTOCOL_CAPABILITY_ANN;
@@ -181,6 +181,10 @@ struct DispatchCtx {
     /// Per-peer subnet map, written by the capability-announcement
     /// dispatch and read by the subscribe gate + publish fan-out.
     peer_subnets: Arc<DashMap<u64, SubnetId>>,
+    /// Per-peer entity-id map, written by the capability-
+    /// announcement dispatch after signature verification. Load-
+    /// bearing for channel auth.
+    peer_entity_ids: Arc<DashMap<u64, EntityId>>,
 }
 
 /// Result passed through the pending-ack oneshot.
@@ -467,6 +471,12 @@ pub struct MeshNode {
     /// `local_subnet_policy`. Unknown peers default to
     /// [`SubnetId::GLOBAL`] at read time.
     peer_subnets: Arc<DashMap<u64, SubnetId>>,
+    /// Per-peer entity-id map. Keys are `node_id`; values are the
+    /// 32-byte ed25519 public key carried on the peer's most recent
+    /// `CapabilityAnnouncement`. Load-bearing for channel auth —
+    /// without it, `require_token` channels can't match a token's
+    /// `subject` to the subscribing peer.
+    peer_entity_ids: Arc<DashMap<u64, EntityId>>,
     /// Background tasks
     tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
     /// Shutdown flag
@@ -557,12 +567,18 @@ impl MeshNode {
         // session loss — otherwise reconnects would silently reuse
         // the old subnet until the next announcement arrived.
         let peer_subnets: Arc<DashMap<u64, SubnetId>> = Arc::new(DashMap::new());
+        // Peer entity-id map (Stage E). Populated from each inbound
+        // `CapabilityAnnouncement`. Evicted alongside `peer_subnets`
+        // on session failure so a reconnect doesn't silently reuse
+        // the old identity.
+        let peer_entity_ids: Arc<DashMap<u64, EntityId>> = Arc::new(DashMap::new());
 
         // Wire failure detector with reroute callbacks + roster eviction.
         let rp_failure = reroute_policy.clone();
         let rp_recovery = reroute_policy.clone();
         let roster_failure = roster.clone();
         let peer_subnets_failure = peer_subnets.clone();
+        let peer_entity_ids_failure = peer_entity_ids.clone();
         let failure_detector = FailureDetector::with_config(FailureDetectorConfig {
             timeout: config.session_timeout,
             miss_threshold: 3,
@@ -580,6 +596,7 @@ impl MeshNode {
                 );
             }
             peer_subnets_failure.remove(&node_id);
+            peer_entity_ids_failure.remove(&node_id);
         })
         .on_recovery(move |node_id| rp_recovery.on_recovery(node_id));
 
@@ -617,6 +634,7 @@ impl MeshNode {
             local_subnet,
             local_subnet_policy,
             peer_subnets,
+            peer_entity_ids,
             tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
@@ -870,6 +888,7 @@ impl MeshNode {
             local_subnet: self.local_subnet,
             local_subnet_policy: self.local_subnet_policy.clone(),
             peer_subnets: self.peer_subnets.clone(),
+            peer_entity_ids: self.peer_entity_ids.clone(),
         };
 
         tokio::spawn(async move {
@@ -1973,6 +1992,11 @@ impl MeshNode {
             MembershipMsg::Subscribe {
                 channel: channel.clone(),
                 nonce,
+                // Token wiring lands in E-3 (SDK surface); for now
+                // subscribers never attach a token from this path.
+                // Publishers that set `require_token = true` on the
+                // channel will reject these subscribes.
+                token: None,
             }
         } else {
             MembershipMsg::Unsubscribe {
@@ -2033,7 +2057,16 @@ impl MeshNode {
         };
 
         match msg {
-            MembershipMsg::Subscribe { channel, nonce } => {
+            MembershipMsg::Subscribe {
+                channel,
+                nonce,
+                token,
+            } => {
+                // `token` is parsed off the wire but not yet consumed
+                // by `authorize_subscribe` — E-2 wires it into the
+                // cap-filter + token-check path. Silencing unused
+                // var until then keeps the payload shape stable.
+                let _ = token;
                 let (accepted, reason) = Self::authorize_subscribe(&channel, from_node, ctx);
                 if accepted {
                     let id = ChannelId::new(channel);
@@ -2071,11 +2104,14 @@ impl MeshNode {
     /// - carry a `node_id` that doesn't match the session's peer
     ///   (a peer can only announce for itself),
     /// - are missing a signature when
-    ///   `require_signed_capabilities` is on.
+    ///   `require_signed_capabilities` is on,
+    /// - carry a signature that fails verification against the
+    ///   announcement's own `entity_id` (Stage E upgrade).
     ///
-    /// Signature *validity* is not checked here; that requires a
-    /// node_id → entity_id binding that lands with Stage E
-    /// (channel auth). Presence is a per-mesh policy knob today.
+    /// `node_id` and `entity_id` are independent values on the
+    /// wire; we pin `node_id → entity_id` on first sight so a
+    /// later announcement claiming a different `entity_id` for the
+    /// same `node_id` won't silently rebind identity.
     fn handle_capability_announcement(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
         let Some(ann) = CapabilityAnnouncement::from_bytes(payload) else {
             tracing::trace!(
@@ -2101,6 +2137,34 @@ impl MeshNode {
                 "capability: unsigned announcement rejected"
             );
             return;
+        }
+
+        // Verify the signature (when present) against the
+        // announcement's self-claimed entity_id. Unsigned
+        // announcements skip this branch; receivers that care about
+        // authenticity set `require_signed_capabilities = true`.
+        if ann.signature.is_some() && ann.verify().is_err() {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                "capability: signature verification failed"
+            );
+            return;
+        }
+
+        // First-seen identity pin. A peer that tries to rebind its
+        // `entity_id` in a later announcement is silently rejected —
+        // protects against a replay / misrouted packet claiming a
+        // peer id that's already bound.
+        if let Some(existing) = ctx.peer_entity_ids.get(&from_node) {
+            if *existing.value() != ann.entity_id {
+                tracing::trace!(
+                    from_node = format!("{:#x}", from_node),
+                    "capability: entity_id rebind rejected (TOFU)"
+                );
+                return;
+            }
+        } else {
+            ctx.peer_entity_ids.insert(from_node, ann.entity_id.clone());
         }
 
         // Derive the peer's subnet *before* moving `ann` into the
@@ -2530,26 +2594,38 @@ impl MeshNode {
     /// Stage E channel auth). For explicit control over TTL or
     /// signing, see [`Self::announce_capabilities_with`].
     pub async fn announce_capabilities(&self, caps: CapabilitySet) -> Result<(), AdapterError> {
-        self.announce_capabilities_with(caps, Duration::from_secs(300), false)
+        // Default to signed — the node always has a keypair (either
+        // caller-supplied or ephemeral at construction time), so
+        // signing is free and closes the trust-on-first-use gap.
+        self.announce_capabilities_with(caps, Duration::from_secs(300), true)
             .await
     }
 
     /// Extended announce with explicit TTL and signing opt-in.
     ///
-    /// `sign` currently a no-op — the field on
-    /// [`CapabilityAnnouncement`] exists but signing requires access
-    /// to the node's [`EntityKeypair`] and a binding between
-    /// `node_id` and `EntityId`, which lands with Stage E. The flag
-    /// is threaded through so the API shape is stable now.
+    /// `sign = true` signs the announcement with the node's
+    /// [`EntityKeypair`] so receivers can validate end-to-end.
+    /// `sign = false` broadcasts unsigned — useful in trusted
+    /// environments where the wire signature adds no value.
+    /// Receivers with `require_signed_capabilities = true` drop
+    /// unsigned announcements regardless.
     pub async fn announce_capabilities_with(
         &self,
         caps: CapabilitySet,
         ttl: Duration,
-        _sign: bool,
+        sign: bool,
     ) -> Result<(), AdapterError> {
         let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
-        let ann = CapabilityAnnouncement::new(self.node_id, version, caps)
-            .with_ttl(ttl.as_secs().min(u32::MAX as u64) as u32);
+        let mut ann = CapabilityAnnouncement::new(
+            self.node_id,
+            self.identity.entity_id().clone(),
+            version,
+            caps,
+        )
+        .with_ttl(ttl.as_secs().min(u32::MAX as u64) as u32);
+        if sign {
+            ann.sign(&self.identity);
+        }
 
         // Self-index so local queries see our own caps.
         self.capability_index.index(ann.clone());

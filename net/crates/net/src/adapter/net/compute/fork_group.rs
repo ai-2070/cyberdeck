@@ -396,11 +396,12 @@ mod tests {
 
     fn make_scheduler() -> Scheduler {
         let index = Arc::new(CapabilityIndex::new());
-        index.index(CapabilityAnnouncement::new(0x1111, 1, CapabilitySet::new()));
-        index.index(CapabilityAnnouncement::new(0x2222, 1, CapabilitySet::new()));
-        index.index(CapabilityAnnouncement::new(0x3333, 1, CapabilitySet::new()));
-        index.index(CapabilityAnnouncement::new(0x4444, 1, CapabilitySet::new()));
-        index.index(CapabilityAnnouncement::new(0x5555, 1, CapabilitySet::new()));
+        let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
+        index.index(CapabilityAnnouncement::new(0x1111, eid.clone(), 1, CapabilitySet::new()));
+        index.index(CapabilityAnnouncement::new(0x2222, eid.clone(), 1, CapabilitySet::new()));
+        index.index(CapabilityAnnouncement::new(0x3333, eid.clone(), 1, CapabilitySet::new()));
+        index.index(CapabilityAnnouncement::new(0x4444, eid.clone(), 1, CapabilitySet::new()));
+        index.index(CapabilityAnnouncement::new(0x5555, eid, 1, CapabilitySet::new()));
         Scheduler::new(index, 0x1111, CapabilitySet::new())
     }
 
@@ -648,7 +649,12 @@ mod tests {
         // excluded node when all candidates were in the exclusion set,
         // defeating the spread constraint.
         let index = Arc::new(CapabilityIndex::new());
-        index.index(CapabilityAnnouncement::new(0x1111, 1, CapabilitySet::new()));
+        index.index(CapabilityAnnouncement::new(
+            0x1111,
+            crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]),
+            1,
+            CapabilitySet::new(),
+        ));
         let sched = Scheduler::new(index, 0x1111, CapabilitySet::new());
 
         let mut exclude = HashSet::new();
