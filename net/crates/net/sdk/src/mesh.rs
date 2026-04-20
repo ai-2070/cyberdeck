@@ -167,6 +167,14 @@ impl MeshBuilder {
         // itself uses interior mutability (DashMap).
         let channel_configs = Arc::new(ChannelConfigRegistry::new());
         node.set_channel_configs(channel_configs.clone());
+        // Hand the caller's TokenCache to the mesh so channel auth
+        // (`require_token` / `can_subscribe` / `can_publish`) has a
+        // cache to consult + install incoming tokens into. Without
+        // an identity, no cache is installed and `require_token`
+        // channels will reject.
+        if let Some(id) = sdk_identity.as_ref() {
+            node.set_token_cache(id.token_cache().clone());
+        }
         Ok(Mesh {
             node,
             channel_configs,

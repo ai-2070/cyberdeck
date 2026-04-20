@@ -44,7 +44,7 @@ use tokio::task::JoinHandle;
 
 use super::crypto::{handshake_prologue, CryptoError, NoiseHandshake, SessionKeys, StaticKeypair};
 use super::failure::{FailureDetector, FailureDetectorConfig};
-use super::identity::{EntityId, EntityKeypair};
+use super::identity::{EntityId, EntityKeypair, PermissionToken, TokenCache};
 use super::pool::PacketBuilder;
 
 use super::behavior::broadcast::SUBPROTOCOL_CAPABILITY_ANN;
@@ -185,6 +185,11 @@ struct DispatchCtx {
     /// announcement dispatch after signature verification. Load-
     /// bearing for channel auth.
     peer_entity_ids: Arc<DashMap<u64, EntityId>>,
+    /// Shared token cache, populated by subscriber-presented tokens
+    /// plus caller-side pre-installs. `None` disables the
+    /// `require_token` path — unset is equivalent to "no token is
+    /// ever valid."
+    token_cache: Option<Arc<TokenCache>>,
 }
 
 /// Result passed through the pending-ack oneshot.
@@ -477,6 +482,12 @@ pub struct MeshNode {
     /// without it, `require_token` channels can't match a token's
     /// `subject` to the subscribing peer.
     peer_entity_ids: Arc<DashMap<u64, EntityId>>,
+    /// Shared token cache used by the channel-auth path. When
+    /// `None`, `can_publish` / `can_subscribe` fall back to a
+    /// fresh empty cache — which means `require_token` channels
+    /// always reject. SDK builders wire this up from the caller's
+    /// `Identity`.
+    token_cache: Option<Arc<TokenCache>>,
     /// Background tasks
     tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
     /// Shutdown flag
@@ -635,6 +646,7 @@ impl MeshNode {
             local_subnet_policy,
             peer_subnets,
             peer_entity_ids,
+            token_cache: None,
             tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
@@ -889,6 +901,7 @@ impl MeshNode {
             local_subnet_policy: self.local_subnet_policy.clone(),
             peer_subnets: self.peer_subnets.clone(),
             peer_entity_ids: self.peer_entity_ids.clone(),
+            token_cache: self.token_cache.clone(),
         };
 
         tokio::spawn(async move {
@@ -1930,15 +1943,28 @@ impl MeshNode {
     }
 
     /// Install a `ChannelConfigRegistry` whose `can_subscribe` /
-    /// `can_publish` rules are consulted for incoming Subscribe messages.
+    /// `can_publish` rules are consulted for incoming Subscribe
+    /// messages.
     ///
-    /// When unset (the default), all subscribes are accepted. This is fine
-    /// for testing and for deployments that rely on network-layer isolation
-    /// rather than per-channel ACL. Full capability/token-based authorization
-    /// requires threading the sender's `CapabilitySet` through dispatch and
-    /// is a follow-up.
+    /// When unset (the default), all subscribes are accepted. Full
+    /// capability/token-based authorization additionally requires a
+    /// `TokenCache` — see [`Self::set_token_cache`].
     pub fn set_channel_configs(&mut self, configs: Arc<ChannelConfigRegistry>) {
         self.channel_configs = Some(configs);
+    }
+
+    /// Install a shared `TokenCache` used by the channel-auth path.
+    /// When set, `authorize_subscribe` and `publish_many` consult
+    /// it via `ChannelConfig::can_subscribe` / `can_publish`.
+    /// Subscribers that present a token on the wire have their
+    /// token installed into this cache (after signature
+    /// verification) before the ACL check runs.
+    ///
+    /// When unset, `require_token` channels always reject —
+    /// without a cache there's no way to validate presented tokens
+    /// or find pre-cached ones.
+    pub fn set_token_cache(&mut self, cache: Arc<TokenCache>) {
+        self.token_cache = Some(cache);
     }
 
     /// Ask `publisher_node_id` to add this node to `channel`'s subscriber set.
@@ -2062,12 +2088,8 @@ impl MeshNode {
                 nonce,
                 token,
             } => {
-                // `token` is parsed off the wire but not yet consumed
-                // by `authorize_subscribe` — E-2 wires it into the
-                // cap-filter + token-check path. Silencing unused
-                // var until then keeps the payload shape stable.
-                let _ = token;
-                let (accepted, reason) = Self::authorize_subscribe(&channel, from_node, ctx);
+                let (accepted, reason) =
+                    Self::authorize_subscribe(&channel, from_node, token.as_deref(), ctx);
                 if accepted {
                     let id = ChannelId::new(channel);
                     ctx.roster.add(id, from_node);
@@ -2186,36 +2208,94 @@ impl MeshNode {
     ///    it, reject with `UnknownChannel`.
     /// 3. Channel [`Visibility`] must permit the subscriber's subnet
     ///    — reject cross-subnet subscribes with `Unauthorized`.
-    /// 4. Otherwise accept. Full capability/token checks are deferred
-    ///    until the dispatch context carries the sender's `CapabilitySet`.
+    /// 4. Channel auth — `publish_caps` / `subscribe_caps` /
+    ///    `require_token` on `ChannelConfig` are honored via
+    ///    `ChannelConfig::can_subscribe`. A presented token is
+    ///    installed into the local `TokenCache` (after signature
+    ///    verification) before the check runs.
     fn authorize_subscribe(
         channel: &ChannelName,
         from_node: u64,
+        token_bytes: Option<&[u8]>,
         ctx: &DispatchCtx,
     ) -> (bool, Option<AckReason>) {
         if ctx.roster.channels_for_peer_count(from_node) >= ctx.max_channels_per_peer {
             return (false, Some(AckReason::TooManyChannels));
         }
-        if let Some(ref configs) = ctx.channel_configs {
-            let Some(cfg) = configs.get_by_name(channel.as_str()) else {
-                return (false, Some(AckReason::UnknownChannel));
-            };
-            // Capture visibility + drop the registry guard before
-            // any further work (the `get_by_name` returns a
-            // `DashMap::Ref` that holds a read lock; keeping it
-            // around across the subnet check is fine but cheaper to
-            // release).
-            let visibility = cfg.visibility;
-            drop(cfg);
+        let Some(ref configs) = ctx.channel_configs else {
+            // No registry → no ACL (test / permissive deployments).
+            return (true, None);
+        };
+        let Some(cfg_ref) = configs.get_by_name(channel.as_str()) else {
+            return (false, Some(AckReason::UnknownChannel));
+        };
+        // Clone the cfg so we can drop the DashMap guard before
+        // any further work — the cfg fields are all cheap to clone
+        // and doing so releases the registry's read lock early.
+        let cfg = cfg_ref.clone();
+        drop(cfg_ref);
 
-            let peer_subnet = ctx
-                .peer_subnets
-                .get(&from_node)
-                .map(|e| *e.value())
-                .unwrap_or(SubnetId::GLOBAL);
-            if !Self::subnet_visible(ctx.local_subnet, peer_subnet, visibility) {
+        let peer_subnet = ctx
+            .peer_subnets
+            .get(&from_node)
+            .map(|e| *e.value())
+            .unwrap_or(SubnetId::GLOBAL);
+        if !Self::subnet_visible(ctx.local_subnet, peer_subnet, cfg.visibility) {
+            return (false, Some(AckReason::Unauthorized));
+        }
+
+        // Install any presented token first so the subsequent
+        // `can_subscribe` cache lookup succeeds. `TokenCache::insert`
+        // verifies the signature; a tampered / malformed token is
+        // silently skipped here and will cause the require_token
+        // path below to reject.
+        if let (Some(bytes), Some(cache)) = (token_bytes, ctx.token_cache.as_ref()) {
+            if let Ok(tok) = PermissionToken::from_bytes(bytes) {
+                let _ = cache.insert(tok);
+            }
+        }
+
+        // Whether any cap / token gate is in play. A fully open
+        // channel (no filters, no require_token) short-circuits
+        // without needing a peer entity_id at all.
+        let has_auth_gates =
+            cfg.publish_caps.is_some() || cfg.subscribe_caps.is_some() || cfg.require_token;
+        if !has_auth_gates {
+            return (true, None);
+        }
+
+        // Peer caps default to empty — subscribe-before-announce
+        // races return `None` from the index; we treat that as an
+        // empty capability set, which makes `subscribe_caps` filters
+        // fail closed.
+        let peer_caps = ctx.capability_index.get(from_node).unwrap_or_default();
+
+        // Peer entity — load-bearing for `require_token`. Without
+        // it we can't validate the subject. Missing entity +
+        // require_token = reject.
+        let Some(peer_entity) = ctx.peer_entity_ids.get(&from_node).map(|e| e.value().clone())
+        else {
+            if cfg.require_token {
                 return (false, Some(AckReason::Unauthorized));
             }
+            // Cap-filter-only mode without a known entity — build a
+            // dummy id so `can_subscribe` can still run the cap
+            // match. Token check is skipped via `require_token=false`.
+            let dummy = EntityId::from_bytes([0u8; 32]);
+            let empty_cache = Arc::new(TokenCache::new());
+            return if cfg.can_subscribe(&peer_caps, &dummy, &empty_cache) {
+                (true, None)
+            } else {
+                (false, Some(AckReason::Unauthorized))
+            };
+        };
+
+        let cache = ctx
+            .token_cache
+            .clone()
+            .unwrap_or_else(|| Arc::new(TokenCache::new()));
+        if !cfg.can_subscribe(&peer_caps, &peer_entity, &cache) {
+            return (false, Some(AckReason::Unauthorized));
         }
         (true, None)
     }
@@ -2328,6 +2408,37 @@ impl MeshNode {
         publisher: &ChannelPublisher,
         events: &[Bytes],
     ) -> Result<PublishReport, AdapterError> {
+        // Publisher-side auth: if the channel is registered with
+        // `publish_caps` / `require_token`, the local node must
+        // satisfy them *before* fan-out begins. Keeps a node from
+        // silently publishing to a channel whose own ACL it doesn't
+        // match. Channels absent from the registry are treated as
+        // open (permissive default).
+        let cfg_snapshot = self
+            .channel_configs
+            .as_ref()
+            .and_then(|cr| cr.get_by_name(publisher.channel().name().as_str()).map(|c| c.clone()));
+        if let Some(cfg) = cfg_snapshot.as_ref() {
+            if cfg.publish_caps.is_some() || cfg.require_token {
+                let self_caps = self
+                    .local_announcement
+                    .load()
+                    .as_deref()
+                    .map(|ann| ann.capabilities.clone())
+                    .unwrap_or_default();
+                let self_entity = self.identity.entity_id().clone();
+                let cache = self
+                    .token_cache
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(TokenCache::new()));
+                if !cfg.can_publish(&self_caps, &self_entity, &cache) {
+                    return Err(AdapterError::Connection(
+                        "channel: publish denied by channel ACL".into(),
+                    ));
+                }
+            }
+        }
+
         // Snapshot subscribers at call time; late subscribers won't see
         // this publish, early-unsubscribes may still receive it — both
         // are documented non-goals.
@@ -2339,13 +2450,9 @@ impl MeshNode {
         // whose subnet isn't visible under that rule. Filtered
         // subscribers don't show up in `attempted` or `errors` —
         // they're policy decisions, not failures.
-        let visibility = self
-            .channel_configs
+        let visibility = cfg_snapshot
             .as_ref()
-            .and_then(|cr| {
-                cr.get_by_name(publisher.channel().name().as_str())
-                    .map(|c| c.visibility)
-            })
+            .map(|c| c.visibility)
             .unwrap_or(Visibility::Global);
         subscribers.retain(|peer_id| {
             let peer_subnet = self
