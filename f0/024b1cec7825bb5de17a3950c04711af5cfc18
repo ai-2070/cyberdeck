@@ -1,0 +1,39 @@
+net/crates/net/bindings/python/src/cortex.rs
+  5bf3f089eecaef7a 66-70,72-83,85-87
+net/crates/net/sdk-ts/test/redex.test.ts
+  5bf3f089eecaef7a 16,34,61
+net/crates/net/bindings/node/test/redex.test.ts
+  5bf3f089eecaef7a 11,15,33,49
+net/crates/net/bindings/python/README.md
+  5bf3f089eecaef7a 243
+net/crates/net/bindings/python/python/net/_net.pyi
+  5bf3f089eecaef7a 622-711,713-714
+net/crates/net/sdk-ts/test/cortex.test.ts
+  5bf3f089eecaef7a 52-58,106-113,117-122
+net/crates/net/bindings/node/src/cortex.rs
+  5bf3f089eecaef7a 181-188,205,221,224,227,297-298,307-309,311-312,327
+net/crates/net/sdk-ts/src/cortex.ts
+  5bf3f089eecaef7a 258-263,274-277,279-284,464-468,473-477,482-486,491-495,636-640,644-648,652-656,660-664
+net/crates/net/sdk-ts/README.md
+  5bf3f089eecaef7a 308-310,361-362
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "f0024b1cec7825bb5de17a3950c04711af5cfc18",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 1555,
+      "total_deletions": 962,
+      "accepted_lines": 224,
+      "overriden_lines": 1
+    }
+  }
+}
