@@ -197,6 +197,20 @@ initiator.IngestRaw(`{"event": "data"}`)
 - `Flush() error` - Flush pending batches
 - `Shutdown() error` - Shutdown and free resources
 
+## Channels (distributed pub/sub)
+
+**Deferred — not yet in the Go binding.**
+
+The Rust / TypeScript / Python SDKs expose a `register_channel` /
+`subscribe_channel` / `publish` surface backed by the mesh
+subprotocol. The Go binding lands that surface in a follow-up
+because the broader `NetMesh` transport (connect, accept, per-peer
+streams) isn't yet exposed through the C ABI — today the Go SDK
+covers the event bus + CortEX surfaces but not the mesh node.
+
+When the Go Mesh lands, `RegisterChannel`, `SubscribeChannel`, and
+`Publish` will follow the same shape as the TS / Python APIs.
+
 ## CortEX & NetDb (event-sourced state)
 
 Typed, event-sourced state on top of RedEX — tasks and memories with

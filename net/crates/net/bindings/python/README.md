@@ -103,6 +103,51 @@ initiator.ingest_raw('{"event": "data"}')
 - `"drop_oldest"` - Evict oldest events to make room
 - `"fail_producer"` - Raise an error
 
+## Channels (distributed pub/sub)
+
+Named pub/sub over the encrypted mesh. Publishers register channels
+with access policy; subscribers ask to join via a membership
+subprotocol; `publish` fans payloads out to every current subscriber.
+
+```python
+from net import NetMesh, ChannelAuthError, ChannelError
+
+pub = NetMesh('127.0.0.1:9001', '42' * 32)
+try:
+    pub.register_channel(
+        'sensors/temp',
+        visibility='global',      # or 'subnet-local' | 'parent-visible' | 'exported'
+        reliable=True,
+        priority=2,
+        max_rate_pps=1000,
+    )
+
+    # Subscriber side (after handshake with pub):
+    # sub.subscribe_channel(pub.node_id, 'sensors/temp')
+
+    # Fan a payload out to all subscribers.
+    report = pub.publish(
+        'sensors/temp',
+        b'{"celsius": 22.5}',
+        reliability='reliable',
+        on_failure='best_effort',
+        max_inflight=32,
+    )
+    print(f"{report['delivered']}/{report['attempted']} subscribers received")
+finally:
+    pub.shutdown()
+
+# Typed errors for ACL outcomes:
+# try: sub.subscribe_channel(peer_id, 'restricted')
+# except ChannelAuthError: ...   # publisher denied
+# except ChannelError: ...       # unknown channel / other rejection
+```
+
+Channel names always cross the binding as strings (not the u16 hash)
+to avoid ACL bypass via collision. Subscribers today receive payloads
+through the existing `NetMesh.poll()` surface — a per-channel stream
+primitive is a follow-up.
+
 ## CortEX & NetDb (event-sourced state)
 
 Typed, event-sourced state on top of RedEX — tasks and memories with

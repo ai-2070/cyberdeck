@@ -624,6 +624,42 @@ class NetMesh:
 
     def __repr__(self) -> str: ...
 
+    def register_channel(
+        self,
+        name: str,
+        *,
+        visibility: Optional[str] = None,
+        reliable: Optional[bool] = None,
+        require_token: Optional[bool] = None,
+        priority: Optional[int] = None,
+        max_rate_pps: Optional[int] = None,
+    ) -> None:
+        """Register a channel on this node. Subscribers are validated
+        against this config before being added to the roster.
+        Raises `ChannelError` for invalid names / visibility."""
+        ...
+    def subscribe_channel(self, publisher_node_id: int, channel: str) -> None:
+        """Subscribe to `channel` on `publisher_node_id`. Raises
+        `ChannelAuthError` for unauthorized rejections, `ChannelError`
+        for other rejection / transport failures."""
+        ...
+    def unsubscribe_channel(self, publisher_node_id: int, channel: str) -> None:
+        """Idempotent counterpart of `subscribe_channel`."""
+        ...
+    def publish(
+        self,
+        channel: str,
+        payload: bytes,
+        *,
+        reliability: Optional[str] = None,
+        on_failure: Optional[str] = None,
+        max_inflight: Optional[int] = None,
+    ) -> dict:
+        """Fan one payload to every subscriber. Returns a
+        `PublishReport` dict: `{attempted, delivered, errors}` where
+        `errors` is a list of `{node_id, message}`."""
+        ...
+
 class BackpressureError(Exception):
     """Raised when a stream's in-flight window is full. The event was
     NOT sent — the caller decides drop / retry / buffer."""
@@ -631,3 +667,14 @@ class BackpressureError(Exception):
 class NotConnectedError(Exception):
     """Raised when a stream's peer session is gone (disconnected,
     never connected, or the stream was closed)."""
+
+class ChannelError(Exception):
+    """Raised when a channel operation fails for a non-auth reason:
+    invalid name / visibility, unknown channel, rate limit,
+    transport failure. Auth rejections raise `ChannelAuthError`
+    (subclass of this class)."""
+
+class ChannelAuthError(ChannelError):
+    """Subclass of `ChannelError`. Raised when a Subscribe /
+    Unsubscribe request is rejected because the publisher's ACL
+    denied the subscriber."""

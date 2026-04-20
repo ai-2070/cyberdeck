@@ -100,6 +100,8 @@ else:
 try:
     from ._net import (
         BackpressureError,
+        ChannelAuthError,
+        ChannelError,
         NetKeypair,
         NetMesh,
         NetStream,
@@ -114,6 +116,8 @@ else:
     __all__.extend(
         [
             "BackpressureError",
+            "ChannelAuthError",
+            "ChannelError",
             "NetKeypair",
             "NetMesh",
             "NetStream",

@@ -791,12 +791,36 @@ pyo3::create_exception!(
 );
 
 #[cfg(feature = "net")]
+pyo3::create_exception!(
+    _net,
+    ChannelError,
+    pyo3::exceptions::PyException,
+    "Raised when a channel operation fails for a reason other than \
+     auth: invalid name / visibility, unknown channel, rate limit, \
+     transport failure. Authorization-specific rejections raise the \
+     subclass `ChannelAuthError`."
+);
+
+#[cfg(feature = "net")]
+pyo3::create_exception!(
+    _net,
+    ChannelAuthError,
+    ChannelError,
+    "Raised when a Subscribe / Unsubscribe is rejected because the \
+     publisher's ACL denied the subscriber. Subclass of \
+     `ChannelError`."
+);
+
+#[cfg(feature = "net")]
 mod mesh_bindings {
     use super::*;
     use net::adapter::net::DEFAULT_STREAM_WINDOW_BYTES;
     use net::adapter::net::{
-        EntityKeypair, MeshNode, MeshNodeConfig, Reliability, Stream as CoreStream, StreamConfig,
-        StreamError,
+        ChannelConfig as InnerChannelConfig, ChannelConfigRegistry, ChannelId,
+        ChannelName as InnerChannelName, ChannelPublisher, EntityKeypair, MeshNode, MeshNodeConfig,
+        OnFailure as InnerOnFailure, PublishConfig as InnerPublishConfig,
+        PublishReport as InnerPublishReport, Reliability, Stream as CoreStream, StreamConfig,
+        StreamError, Visibility as InnerVisibility,
     };
     use net::adapter::Adapter;
     use std::time::Duration;
@@ -811,6 +835,88 @@ mod mesh_bindings {
                 PyRuntimeError::new_err(format!("stream transport error: {}", msg))
             }
         }
+    }
+
+    fn parse_visibility(s: &str) -> PyResult<InnerVisibility> {
+        match s {
+            "subnet-local" => Ok(InnerVisibility::SubnetLocal),
+            "parent-visible" => Ok(InnerVisibility::ParentVisible),
+            "exported" => Ok(InnerVisibility::Exported),
+            "global" => Ok(InnerVisibility::Global),
+            other => Err(super::ChannelError::new_err(format!(
+                "channel: invalid visibility {:?} (expected subnet-local | parent-visible | exported | global)",
+                other
+            ))),
+        }
+    }
+
+    fn parse_reliability_cfg(s: &str) -> PyResult<Reliability> {
+        match s {
+            "reliable" => Ok(Reliability::Reliable),
+            "fire_and_forget" => Ok(Reliability::FireAndForget),
+            other => Err(super::ChannelError::new_err(format!(
+                "channel: invalid reliability {:?}",
+                other
+            ))),
+        }
+    }
+
+    fn parse_on_failure(s: &str) -> PyResult<InnerOnFailure> {
+        match s {
+            "best_effort" => Ok(InnerOnFailure::BestEffort),
+            "fail_fast" => Ok(InnerOnFailure::FailFast),
+            "collect" => Ok(InnerOnFailure::Collect),
+            other => Err(super::ChannelError::new_err(format!(
+                "channel: invalid on_failure {:?}",
+                other
+            ))),
+        }
+    }
+
+    fn publish_report_to_pydict<'py>(
+        py: Python<'py>,
+        report: InnerPublishReport,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("attempted", report.attempted)?;
+        dict.set_item("delivered", report.delivered)?;
+        let errors = pyo3::types::PyList::empty(py);
+        for (node_id, err) in report.errors {
+            let entry = pyo3::types::PyDict::new(py);
+            entry.set_item("node_id", node_id)?;
+            entry.set_item("message", format!("{}", err))?;
+            errors.append(entry)?;
+        }
+        dict.set_item("errors", errors)?;
+        Ok(dict)
+    }
+
+    /// Translate an `AdapterError` from a channel op into the right
+    /// typed Python error: `ChannelAuthError` for the `Unauthorized`
+    /// AckReason, `ChannelError` for every other rejection / network
+    /// failure.
+    pub(crate) fn adapter_to_channel_pyerr(err: net::error::AdapterError) -> PyErr {
+        use net::error::AdapterError;
+        if let AdapterError::Connection(ref msg) = err {
+            let prefix = "membership request rejected: ";
+            if let Some(tail) = msg.strip_prefix(prefix) {
+                let reason = tail.trim();
+                if reason == "Some(Unauthorized)" {
+                    return super::ChannelAuthError::new_err("channel: unauthorized");
+                }
+                if reason == "Some(UnknownChannel)" {
+                    return super::ChannelError::new_err("channel: unknown channel");
+                }
+                if reason == "Some(RateLimited)" {
+                    return super::ChannelError::new_err("channel: rate limited");
+                }
+                if reason == "Some(TooManyChannels)" {
+                    return super::ChannelError::new_err("channel: too many channels");
+                }
+                return super::ChannelError::new_err(format!("channel: rejected ({})", reason));
+            }
+        }
+        super::ChannelError::new_err(format!("channel: {}", err))
     }
 
     /// Handle to an open stream. Opaque to Python callers.
@@ -899,6 +1005,10 @@ mod mesh_bindings {
     pub struct NetMesh {
         node: Option<MeshNode>,
         runtime: Arc<Runtime>,
+        /// Shared channel config registry installed on the MeshNode
+        /// at construction; `register_channel` inserts into this same
+        /// Arc so the core's membership-ACL path sees every add.
+        channel_configs: Arc<ChannelConfigRegistry>,
     }
 
     #[pymethods]
@@ -948,13 +1058,18 @@ mod mesh_bindings {
             );
 
             let identity = EntityKeypair::generate();
-            let node = runtime
+            let mut node = runtime
                 .block_on(MeshNode::new(identity, config))
                 .map_err(|e| PyRuntimeError::new_err(format!("MeshNode: {}", e)))?;
+
+            // Install shared channel-config registry.
+            let channel_configs = Arc::new(ChannelConfigRegistry::new());
+            node.set_channel_configs(channel_configs.clone());
 
             Ok(Self {
                 node: Some(node),
                 runtime,
+                channel_configs,
             })
         }
 
@@ -1239,6 +1354,159 @@ mod mesh_bindings {
                 }))
         }
 
+        // =====================================================
+        // Channels (distributed pub/sub)
+        // =====================================================
+
+        /// Register a channel on this node. Subscribers must pass the
+        /// publisher-side ACL (built from this config) before being
+        /// added to the roster.
+        ///
+        /// Args:
+        ///     name: Canonical channel name (not the u16 hash).
+        ///     visibility: One of 'subnet-local', 'parent-visible',
+        ///         'exported', 'global'. Default 'global'.
+        ///     reliable: Default reliability for streams on this
+        ///         channel.
+        ///     require_token: v1 only supports `False` — token
+        ///         enforcement arrives with the security plan's
+        ///         identity surface.
+        ///     priority: 0 = lowest.
+        ///     max_rate_pps: Rate cap in packets per second.
+        ///
+        /// Raises:
+        ///     ChannelError: invalid name / visibility.
+        #[pyo3(signature = (
+            name,
+            *,
+            visibility = None,
+            reliable = None,
+            require_token = None,
+            priority = None,
+            max_rate_pps = None,
+        ))]
+        fn register_channel(
+            &self,
+            name: &str,
+            visibility: Option<&str>,
+            reliable: Option<bool>,
+            require_token: Option<bool>,
+            priority: Option<u8>,
+            max_rate_pps: Option<u32>,
+        ) -> PyResult<()> {
+            let channel = InnerChannelName::new(name).map_err(|e| {
+                super::ChannelError::new_err(format!("channel: invalid name: {}", e))
+            })?;
+            let mut cfg = InnerChannelConfig::new(ChannelId::new(channel));
+            if let Some(v) = visibility {
+                cfg = cfg.with_visibility(parse_visibility(v)?);
+            }
+            if let Some(r) = reliable {
+                cfg = cfg.with_reliable(r);
+            }
+            if let Some(t) = require_token {
+                cfg = cfg.with_require_token(t);
+            }
+            if let Some(p) = priority {
+                cfg = cfg.with_priority(p);
+            }
+            if let Some(pps) = max_rate_pps {
+                cfg = cfg.with_rate_limit(pps);
+            }
+            self.channel_configs.insert(cfg);
+            Ok(())
+        }
+
+        /// Ask `publisher_node_id` to add this node to `channel`'s
+        /// subscriber set. Blocks until the publisher's `Ack`
+        /// arrives or the membership-ack timeout elapses.
+        ///
+        /// Raises:
+        ///     ChannelAuthError: publisher rejected as unauthorized.
+        ///     ChannelError: other rejection / transport failure.
+        fn subscribe_channel(&self, publisher_node_id: u64, channel: &str) -> PyResult<()> {
+            let node = self.get_node()?;
+            let name = InnerChannelName::new(channel).map_err(|e| {
+                super::ChannelError::new_err(format!("channel: invalid name: {}", e))
+            })?;
+            self.runtime
+                .block_on(node.subscribe_channel(publisher_node_id, name))
+                .map_err(adapter_to_channel_pyerr)
+        }
+
+        /// Mirror of `subscribe_channel`. Idempotent on the publisher
+        /// side — unsubscribing a non-member returns `None`.
+        fn unsubscribe_channel(&self, publisher_node_id: u64, channel: &str) -> PyResult<()> {
+            let node = self.get_node()?;
+            let name = InnerChannelName::new(channel).map_err(|e| {
+                super::ChannelError::new_err(format!("channel: invalid name: {}", e))
+            })?;
+            self.runtime
+                .block_on(node.unsubscribe_channel(publisher_node_id, name))
+                .map_err(adapter_to_channel_pyerr)
+        }
+
+        /// Publish one payload to every subscriber of `channel`.
+        /// Returns a `PublishReport` dict:
+        ///
+        ///     {
+        ///       "attempted":  <int>,
+        ///       "delivered":  <int>,
+        ///       "errors":     [{"node_id": <int>, "message": <str>}, ...]
+        ///     }
+        ///
+        /// Args:
+        ///     channel: Channel name.
+        ///     payload: Bytes to publish.
+        ///     reliability: 'reliable' | 'fire_and_forget'. Default
+        ///         'fire_and_forget'.
+        ///     on_failure: 'best_effort' | 'fail_fast' | 'collect'.
+        ///         Default 'best_effort'.
+        ///     max_inflight: Concurrent per-peer sends. Default 32.
+        #[pyo3(signature = (
+            channel,
+            payload,
+            *,
+            reliability = None,
+            on_failure = None,
+            max_inflight = None,
+        ))]
+        fn publish<'py>(
+            &self,
+            py: Python<'py>,
+            channel: &str,
+            payload: &[u8],
+            reliability: Option<&str>,
+            on_failure: Option<&str>,
+            max_inflight: Option<u32>,
+        ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+            let node = self.get_node()?;
+            let name = InnerChannelName::new(channel).map_err(|e| {
+                super::ChannelError::new_err(format!("channel: invalid name: {}", e))
+            })?;
+            let mut pub_cfg = InnerPublishConfig {
+                reliability: Reliability::FireAndForget,
+                on_failure: InnerOnFailure::BestEffort,
+                max_inflight: 32,
+            };
+            if let Some(r) = reliability {
+                pub_cfg.reliability = parse_reliability_cfg(r)?;
+            }
+            if let Some(f) = on_failure {
+                pub_cfg.on_failure = parse_on_failure(f)?;
+            }
+            if let Some(n) = max_inflight {
+                pub_cfg.max_inflight = n as usize;
+            }
+            let publisher = ChannelPublisher::new(name, pub_cfg);
+            let payload_bytes = bytes::Bytes::copy_from_slice(payload);
+            let report: InnerPublishReport = self
+                .runtime
+                .block_on(node.publish(&publisher, payload_bytes))
+                .map_err(adapter_to_channel_pyerr)?;
+            publish_report_to_pydict(py, report)
+        }
+
         /// Shutdown the mesh node.
         fn shutdown(&mut self) -> PyResult<()> {
             let node = self
@@ -1309,6 +1577,10 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("BackpressureError", m.py().get_type::<BackpressureError>())?;
     #[cfg(feature = "net")]
     m.add("NotConnectedError", m.py().get_type::<NotConnectedError>())?;
+    #[cfg(feature = "net")]
+    m.add("ChannelError", m.py().get_type::<ChannelError>())?;
+    #[cfg(feature = "net")]
+    m.add("ChannelAuthError", m.py().get_type::<ChannelAuthError>())?;
     #[cfg(feature = "cortex")]
     {
         m.add_class::<cortex::PyRedex>()?;
