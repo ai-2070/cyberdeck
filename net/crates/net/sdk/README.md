@@ -267,6 +267,79 @@ mesh.shutdown().await?;
 Wire-level details and the subprotocol layout live in
 [`docs/CAPABILITY_BROADCAST_PLAN.md`](../docs/CAPABILITY_BROADCAST_PLAN.md).
 
+### Subnets (visibility partitioning)
+
+`MeshBuilder::subnet(id)` pins a node to one of 2³² possible 4-level
+subnet ids; `subnet_policy(policy)` derives each *peer's* subnet by
+applying a shared tag-matching policy to their inbound
+`CapabilityAnnouncement`. Channel visibility then gates publish
+fan-out and subscribe authorization against that geometry.
+
+```rust
+use std::sync::Arc;
+use net_sdk::capabilities::CapabilitySet;
+use net_sdk::mesh::MeshBuilder;
+use net_sdk::subnets::{SubnetId, SubnetPolicy, SubnetRule};
+
+# async fn example() -> net_sdk::error::Result<()> {
+// Mesh-wide policy: `region:<x>` maps to the level 0 byte,
+// `fleet:<x>` maps to level 1. Every node in the mesh must
+// construct the same policy — mismatched policies yield
+// asymmetric views of peer subnets.
+let policy = Arc::new(
+    SubnetPolicy::new()
+        .add_rule(SubnetRule::new("region:", 0).map("us", 3).map("eu", 4))
+        .add_rule(SubnetRule::new("fleet:", 1).map("blue", 7).map("green", 8)),
+);
+
+let node = MeshBuilder::new("127.0.0.1:0", &[0x42u8; 32])?
+    .subnet(SubnetId::new(&[3, 7]))           // us/blue
+    .subnet_policy(policy)
+    .build()
+    .await?;
+
+// Announce with tags matching the policy so peers derive the same
+// subnet (`[3, 7]`) when they apply their own policy to our caps.
+node.announce_capabilities(
+    CapabilitySet::new()
+        .add_tag("region:us")
+        .add_tag("fleet:blue"),
+)
+.await?;
+
+// Register a SubnetLocal channel — only peers with the exact same
+// SubnetId will be accepted as subscribers and included in publish
+// fan-out. Any cross-subnet subscribe rejects with `Unauthorized`.
+// (Channel registration uses the channel config types from the
+// `Channels` section below.)
+node.shutdown().await?;
+# Ok(())
+# }
+```
+
+**Visibility semantics** (from `Visibility` enum):
+
+| Variant | Delivery |
+|---|---|
+| `Global` | every peer |
+| `SubnetLocal` | peers with an identical `SubnetId` |
+| `ParentVisible` | same subnet OR either side is an ancestor of the other |
+| `Exported` | per-channel export table — **deferred**, drops in v1 |
+
+**Scope today**:
+
+- Enforcement is end-to-end through the publish + subscribe gates.
+  Filtered subscribers do not appear in `PublishReport.attempted`.
+- Peer subnets are derived locally from each peer's capability
+  announcement via `SubnetPolicy::assign`. No dedicated subnet
+  subprotocol; announcements piggyback on the capability broadcast
+  from Stage C.
+- Multi-hop subnet-aware routing (forwarding filters at the packet
+  header) is a follow-up.
+
+Wire-level details and the enforcement matrix live in
+[`docs/SUBNET_ENFORCEMENT_PLAN.md`](../docs/SUBNET_ENFORCEMENT_PLAN.md).
+
 ## Channels (distributed pub/sub)
 
 Named pub/sub over the encrypted mesh. Publishers register channels
