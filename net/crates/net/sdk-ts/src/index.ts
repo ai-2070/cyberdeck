@@ -36,14 +36,53 @@ export { EventStream, TypedEventStream } from './stream';
 export { TypedChannel } from './channel';
 
 // Mesh + streams.
-export { MeshNode, BackpressureError, NotConnectedError } from './mesh';
+export {
+  MeshNode,
+  BackpressureError,
+  NotConnectedError,
+  ChannelError,
+  ChannelAuthError,
+} from './mesh';
 export type {
   MeshNodeConfig,
   MeshStream,
   StreamConfig,
   StreamStats,
   Reliability,
+  Visibility,
+  OnFailure,
+  ChannelConfig,
+  PublishConfig,
+  PublishReport,
 } from './mesh';
+
+// CortEX + NetDb (event-sourced state with reactive watches).
+export {
+  Redex,
+  RedexFile,
+  NetDb,
+  TasksAdapter,
+  MemoriesAdapter,
+  TaskStatus,
+  TasksOrderBy,
+  MemoriesOrderBy,
+  CortexError,
+  NetDbError,
+  RedexError,
+} from './cortex';
+export type {
+  RedexOptions,
+  RedexFileConfig,
+  RedexEvent,
+  SnapshotAndWatch,
+  Task,
+  Memory,
+  TaskFilter,
+  MemoryFilter,
+  NetDbOpenConfig,
+  NetDbBundle,
+  CortexSnapshot,
+} from './cortex';
 
 // Types.
 export type {

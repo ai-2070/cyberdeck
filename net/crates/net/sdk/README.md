@@ -11,7 +11,7 @@ The core `net` crate is the engine. This SDK is what Rust developers import.
 net-sdk = { path = "sdk" }
 ```
 
-Features: `redis`, `jetstream`, `net` (mesh transport), `full` (all).
+Features: `redis`, `jetstream`, `net` (mesh transport), `cortex` (event-sourced tasks/memories + NetDb), `full` (all).
 
 ## Quick Start
 
@@ -158,6 +158,129 @@ counts cumulative rejections for observability. See
 [`docs/STREAM_BACKPRESSURE_PLAN.md`](../docs/STREAM_BACKPRESSURE_PLAN.md)
 for the design.
 
+## Channels (distributed pub/sub)
+
+Named pub/sub over the encrypted mesh. Publishers register channels
+with access policy; subscribers ask to join via a membership
+subprotocol with an Ack round-trip. `publish` / `publish_many` fan
+payloads out to every current subscriber.
+
+```rust
+use bytes::Bytes;
+use net_sdk::mesh::{Mesh, MeshBuilder};
+use net_sdk::{ChannelConfig, ChannelId, ChannelName, PublishConfig, Reliability, Visibility};
+
+# async fn example() -> net_sdk::error::Result<()> {
+let publisher = MeshBuilder::new("127.0.0.1:9001", &[0x42u8; 32])?
+    .build().await?;
+let subscriber = MeshBuilder::new("127.0.0.1:9000", &[0x42u8; 32])?
+    .build().await?;
+// (handshake omitted — see Mesh Streams example)
+
+// Publisher registers a channel.
+let channel = ChannelName::new("sensors/temp").unwrap();
+publisher.register_channel(
+    ChannelConfig::new(ChannelId::new(channel.clone()))
+        .with_visibility(Visibility::Global)
+        .with_reliable(true)
+        .with_priority(2),
+);
+
+// Subscriber joins. Network-rejected acks surface as
+// `SdkError::ChannelRejected(reason)`.
+subscriber.subscribe_channel(publisher.inner().node_id(), &channel).await?;
+
+// Fan out.
+let report = publisher.publish(
+    &channel,
+    Bytes::from_static(b"22.5"),
+    PublishConfig {
+        reliability: Reliability::Reliable,
+        ..Default::default()
+    },
+).await?;
+println!("{}/{} delivered", report.delivered, report.attempted);
+# Ok(())
+# }
+```
+
+`register_channel` stores into a shared `ChannelConfigRegistry`
+installed on the underlying `MeshNode` at build time — so multiple
+`register_channel` calls are just inserts and require only `&Mesh`,
+not `&mut`.
+
+Subscribers today receive payloads via the existing `recv` /
+`recv_shard` surface. A dedicated `on_channel(&ChannelName)` stream
+is a follow-up.
+
+## CortEX & NetDb (event-sourced state)
+
+For typed, event-sourced state — tasks and memories with filterable
+queries and reactive watches — enable the `cortex` feature and import
+from `net_sdk::cortex`:
+
+```rust
+use net_sdk::cortex::{NetDb, Redex, TaskStatus};
+use futures::StreamExt;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let redex = Redex::new();                       // or `.with_persistent_dir("/var/lib/net")`
+    let db = NetDb::builder(redex)
+        .origin(0xABCD_EF01)                        // producer identity on every event
+        .with_tasks()
+        .with_memories()
+        .build()?;
+
+    // Ingest through the domain API; no EventMeta plumbing.
+    let seq = db.tasks().create(1, "write docs", 0)?;
+    db.tasks().wait_for_seq(seq).await;             // wait for the fold to apply
+
+    // Query the materialized state.
+    assert_eq!(db.tasks().count(), 1);
+
+    // Snapshot + watch: "paint what's there now, then react to changes."
+    // The stream drops only leading emissions that equal the snapshot,
+    // so a mutation racing during construction is still delivered.
+    let watcher = db.tasks().watch().where_status(TaskStatus::Pending);
+    let (snapshot, mut deltas) = db.tasks().snapshot_and_watch(watcher);
+    println!("initial: {} pending", snapshot.len());
+    while let Some(batch) = deltas.next().await {
+        println!("delta: {} pending", batch.len());
+    }
+    Ok(())
+}
+```
+
+### Persistence
+
+With `redex-disk` (pulled in by `cortex`), point `Redex` at a directory
+and flip `persistent(true)` on the builder:
+
+```rust
+let redex = Redex::new().with_persistent_dir("/var/lib/net/redex");
+let db = NetDb::builder(redex)
+    .origin(origin_hash)
+    .persistent(true)
+    .with_tasks()
+    .build()?;
+```
+
+Use `RedexFileConfig` + `FsyncPolicy` (both re-exported from
+`net_sdk::cortex`) to tune per-file fsync semantics.
+
+### Raw RedEX file
+
+For domain-agnostic persistent logs (no CortEX, no fold, no typed
+state), use the `Redex` manager directly via `Redex::open_file`. This
+unlocks `RedexFile::append` / `tail` for custom event pipelines.
+
+See [`docs/STORAGE_AND_CORTEX.md`](../docs/STORAGE_AND_CORTEX.md) for
+the full narrative and
+[`docs/REDEX_PLAN.md`](../docs/REDEX_PLAN.md) /
+[`docs/CORTEX_ADAPTER_PLAN.md`](../docs/CORTEX_ADAPTER_PLAN.md) for the
+design.
+
 ## API
 
 | Method | Description |
@@ -177,6 +300,31 @@ for the design.
 | `flush()` | Flush pending batches |
 | `shutdown()` | Graceful shutdown |
 | `bus()` | Access underlying `EventBus` |
+
+### Channel surface (feature `net`)
+
+| Method | Description |
+|---|---|
+| `mesh.register_channel(config)` | Install / replace a channel's access config |
+| `mesh.subscribe_channel(peer_id, &name)` | Ask `peer_id` to add us as a subscriber |
+| `mesh.unsubscribe_channel(peer_id, &name)` | Leave a channel (idempotent) |
+| `mesh.publish(&name, bytes, cfg)` | Fan one payload to all subscribers |
+| `mesh.publish_many(&name, &[bytes], cfg)` | Fan a batch to all subscribers |
+| `SdkError::ChannelRejected(reason)` | Typed subscribe/unsubscribe rejection |
+
+### CortEX surface (feature `cortex`)
+
+| Entry point | Description |
+|---|---|
+| `cortex::Redex::new()` | In-memory event-log manager |
+| `cortex::Redex::with_persistent_dir(path)` | Disk-backed manager |
+| `cortex::NetDb::builder(redex)` | Fluent `NetDb` construction |
+| `cortex::TasksAdapter::open(redex, origin)` | Open tasks model standalone |
+| `cortex::MemoriesAdapter::open(redex, origin)` | Open memories model standalone |
+| `db.tasks() / db.memories()` | Typed adapter handles on `NetDb` |
+| `adapter.snapshot_and_watch(watcher)` | Atomic initial-result + delta stream |
+| `db.snapshot()` | `NetDbSnapshot` bundle for persistence |
+| `NetDb::builder(...).build_from_snapshot(&bundle)` | Restore from bundle |
 
 ## License
 

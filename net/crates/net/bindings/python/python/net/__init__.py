@@ -53,12 +53,78 @@ __all__ = [
     "Stats",
 ]
 
+# CortEX + NetDB surface. Present iff the native module was built with
+# the `cortex` feature (maturin's default picks it up).
 try:
-    from ._net import CortexError, NetDbError
+    from ._net import (
+        CortexError,
+        NetDb,
+        NetDbError,
+        MemoriesAdapter,
+        Memory,
+        MemoryWatchIter,
+        Redex,
+        RedexError,
+        RedexEvent,
+        RedexFile,
+        RedexTailIter,
+        Task,
+        TasksAdapter,
+        TaskWatchIter,
+    )
 except ImportError:
-    # `cortex` feature not compiled in; error classes stay undefined.
+    # `cortex` feature not compiled in; symbols stay undefined.
     pass
 else:
-    __all__.extend(["CortexError", "NetDbError"])
+    __all__.extend(
+        [
+            "CortexError",
+            "MemoriesAdapter",
+            "Memory",
+            "MemoryWatchIter",
+            "NetDb",
+            "NetDbError",
+            "Redex",
+            "RedexError",
+            "RedexEvent",
+            "RedexFile",
+            "RedexTailIter",
+            "Task",
+            "TasksAdapter",
+            "TaskWatchIter",
+        ]
+    )
+
+# Encrypted mesh transport + per-peer streams. Present iff the native
+# module was built with the `net` feature.
+try:
+    from ._net import (
+        BackpressureError,
+        ChannelAuthError,
+        ChannelError,
+        NetKeypair,
+        NetMesh,
+        NetStream,
+        NetStreamStats,
+        NotConnectedError,
+        generate_net_keypair,
+    )
+except ImportError:
+    # `net` feature not compiled in; symbols stay undefined.
+    pass
+else:
+    __all__.extend(
+        [
+            "BackpressureError",
+            "ChannelAuthError",
+            "ChannelError",
+            "NetKeypair",
+            "NetMesh",
+            "NetStream",
+            "NetStreamStats",
+            "NotConnectedError",
+            "generate_net_keypair",
+        ]
+    )
 
 __version__ = "0.1.0"

@@ -36,6 +36,12 @@ pub enum SdkError {
     /// connected, or the stream was closed).
     #[error("stream not connected")]
     NotConnected,
+
+    /// A publisher's `Ack` rejected a Subscribe / Unsubscribe
+    /// request. `None` means the rejection arrived without a
+    /// structured reason.
+    #[error("channel membership rejected: {0:?}")]
+    ChannelRejected(Option<net::adapter::net::AckReason>),
 }
 
 #[cfg(feature = "net")]

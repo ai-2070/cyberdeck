@@ -254,6 +254,77 @@ class Redex:
     replay them on reopen.
     """
     def __init__(self, persistent_dir: Optional[str] = None) -> None: ...
+    def open_file(
+        self,
+        name: str,
+        *,
+        persistent: bool = False,
+        fsync_every_n: Optional[int] = None,
+        fsync_interval_ms: Optional[int] = None,
+        retention_max_events: Optional[int] = None,
+        retention_max_bytes: Optional[int] = None,
+        retention_max_age_ms: Optional[int] = None,
+    ) -> "RedexFile":
+        """Open (or get) a raw RedEX file for domain-agnostic persistent
+        logging. Bypasses the CortEX fold layer — use when you want an
+        append-only log and will handle your own event model.
+
+        `fsync_every_n` and `fsync_interval_ms` are mutually exclusive.
+        With neither set, close / explicit sync are the only disk
+        barriers (`FsyncPolicy::Never`).
+
+        `persistent=True` requires this Redex to have been constructed
+        with a `persistent_dir`; otherwise raises `RedexError`.
+        """
+        ...
+
+class RedexEvent:
+    """A materialized RedEX event: `seq` + `payload` + checksum /
+    inline flag. Yielded by `RedexFile.read_range` / `RedexTailIter`."""
+    seq: int
+    payload: bytes
+    checksum: int
+    is_inline: bool
+
+class RedexFile:
+    """Raw RedEX file handle.
+
+    Append / tail / read without the CortEX adapter layer. Safe to
+    share; all methods take `&self`. Dropping the last reference does
+    NOT close the file — call `close()` explicitly.
+    """
+    def append(self, payload: bytes) -> int:
+        """Append one payload; returns the assigned sequence number."""
+        ...
+    def append_batch(self, payloads: list[bytes]) -> int:
+        """Append a batch atomically; returns the seq of the FIRST event.
+        Subsequent events are `first + 0, first + 1, ...`.
+        """
+        ...
+    def read_range(self, start: int, end: int) -> list[RedexEvent]:
+        """Read the half-open range `[start, end)` from the in-memory
+        index. Only retained entries are returned — evicted seqs are
+        silently skipped."""
+        ...
+    def __len__(self) -> int: ...
+    def tail(self, from_seq: int = 0) -> "RedexTailIter":
+        """Live tail iterator. Backfills `seq >= from_seq` atomically
+        and then streams subsequent appends. Stop early with
+        `iter.close()`; `StopIteration` fires when the file closes."""
+        ...
+    def sync(self) -> None:
+        """Explicit fsync. Always fsyncs regardless of policy; no-op
+        on heap-only files."""
+        ...
+    def close(self) -> None:
+        """Close the file. Outstanding tail iterators stop on their
+        next `__next__` call."""
+        ...
+
+class RedexTailIter(Iterator[RedexEvent]):
+    def __iter__(self) -> "RedexTailIter": ...
+    def __next__(self) -> RedexEvent: ...
+    def close(self) -> None: ...
 
 class Task:
     """A materialized task record."""
@@ -309,6 +380,29 @@ class TasksAdapter:
         order_by: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> "TaskWatchIter": ...
+    def snapshot_and_watch_tasks(
+        self,
+        *,
+        status: Optional[str] = None,
+        title_contains: Optional[str] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> tuple[List[Task], "TaskWatchIter"]:
+        """
+        Atomic "paint + react" primitive. Returns `(snapshot, iter)` in
+        one call; the iterator drops only leading emissions equal to
+        `snapshot`, so a mutation racing construction is forwarded
+        through instead of being silently dropped.
+
+        Prefer this to calling `list_tasks` + `watch_tasks` separately
+        — those race each other and a mutation landing between them
+        would be lost.
+        """
+        ...
 
 class TaskWatchIter(Iterator[List[Task]]):
     def __iter__(self) -> "TaskWatchIter": ...
@@ -387,6 +481,24 @@ class MemoriesAdapter:
         order_by: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> "MemoryWatchIter": ...
+    def snapshot_and_watch_memories(
+        self,
+        *,
+        source: Optional[str] = None,
+        content_contains: Optional[str] = None,
+        tag: Optional[str] = None,
+        any_tag: Optional[List[str]] = None,
+        all_tags: Optional[List[str]] = None,
+        pinned: Optional[bool] = None,
+        created_after_ns: Optional[int] = None,
+        created_before_ns: Optional[int] = None,
+        updated_after_ns: Optional[int] = None,
+        updated_before_ns: Optional[int] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> tuple[List[Memory], "MemoryWatchIter"]:
+        """Atomic snapshot + watch. See `TasksAdapter.snapshot_and_watch_tasks`."""
+        ...
 
 class MemoryWatchIter(Iterator[List[Memory]]):
     def __iter__(self) -> "MemoryWatchIter": ...
@@ -441,3 +553,218 @@ class NetDbError(Exception):
     """Raised by NetDB handle-level operations: snapshot encode /
     decode, missing-model accesses. Per-adapter failures inside a
     NetDB still surface as `CortexError`."""
+
+class RedexError(Exception):
+    """Raised by raw RedEX file operations: append / tail / read /
+    sync / close, invalid channel names, mutually-exclusive config
+    options, or `persistent=True` without a `persistent_dir`."""
+
+# =========================================================================
+# Mesh transport + per-peer streams (`net` feature)
+# =========================================================================
+
+class NetKeypair:
+    """Hex-encoded ed25519 keypair for encrypted UDP transport.
+
+    Treat `secret_key` as secret material — persist via your own
+    envelope encryption / secret manager.
+    """
+
+    public_key: str
+    secret_key: str
+
+def generate_net_keypair() -> NetKeypair:
+    """Generate a fresh ed25519 keypair for encrypted UDP transport."""
+    ...
+
+class NetStream:
+    """Opaque handle to an open mesh stream between this node and a peer."""
+
+    @property
+    def peer_node_id(self) -> int: ...
+    @property
+    def stream_id(self) -> int: ...
+
+class NetStreamStats:
+    """Snapshot of per-stream stats.
+
+    `backpressure_events` is the cumulative count of rejections since
+    the stream opened; `tx_credit_remaining` dipping to 0 means the
+    next send will raise `BackpressureError`.
+    """
+
+    tx_seq: int
+    rx_seq: int
+    inbound_pending: int
+    last_activity_ns: int
+    active: bool
+    backpressure_events: int
+    tx_credit_remaining: int
+    tx_window: int
+    credit_grants_received: int
+    credit_grants_sent: int
+
+class NetMesh:
+    """Multi-peer encrypted mesh handle.
+
+    Manages connections to multiple peers over one UDP socket with
+    automatic failure detection and rerouting. Open per-peer streams
+    via `open_stream(...)`; send with `send_on_stream`, react to
+    `BackpressureError` / `NotConnectedError` at the app layer.
+
+    Canonical three send policies:
+
+    * Drop on pressure — catch `BackpressureError`, record the drop.
+    * Retry with backoff — `send_with_retry(stream, payloads, retries=8)`.
+    * Block until clear — `send_blocking(stream, payloads)`.
+    """
+
+    def __init__(
+        self,
+        bind_addr: str,
+        psk: str,
+        heartbeat_interval_ms: Optional[int] = None,
+        session_timeout_ms: Optional[int] = None,
+        num_shards: Optional[int] = None,
+    ) -> None: ...
+
+    @property
+    def public_key(self) -> str:
+        """Hex-encoded 32-byte Noise static public key."""
+        ...
+    @property
+    def node_id(self) -> int:
+        """u64 node identifier derived from the keypair."""
+        ...
+
+    def connect(
+        self,
+        peer_addr: str,
+        peer_public_key: str,
+        peer_node_id: int,
+    ) -> None:
+        """Connect to a peer (initiator). Blocks until handshake
+        completes or the timeout elapses."""
+        ...
+    def accept(self, peer_node_id: int) -> str:
+        """Accept an incoming connection (responder). Returns the
+        peer's wire address."""
+        ...
+    def start(self) -> None:
+        """Start the receive loop, heartbeats, and router."""
+        ...
+
+    def push_to(self, peer_addr: str, json: str) -> bool:
+        """Send a raw JSON payload to a direct peer address."""
+        ...
+    def poll(self, limit: int) -> List[StoredEvent]:
+        """Drain up to `limit` events from shard 0."""
+        ...
+
+    def add_route(self, dest_node_id: int, next_hop_addr: str) -> None:
+        """Add a routing table entry."""
+        ...
+    def peer_count(self) -> int: ...
+    def discovered_nodes(self) -> int: ...
+
+    def open_stream(
+        self,
+        peer_node_id: int,
+        stream_id: int,
+        reliability: Optional[str] = None,
+        window_bytes: int = 65536,
+        fairness_weight: int = 1,
+    ) -> "NetStream":
+        """Open (or look up) a stream to a connected peer. Repeated
+        calls for the same `(peer_node_id, stream_id)` are idempotent;
+        first-open wins."""
+        ...
+    def close_stream(self, peer_node_id: int, stream_id: int) -> None:
+        """Close a stream. Idempotent."""
+        ...
+    def send_on_stream(self, stream: "NetStream", events: List[bytes]) -> None:
+        """Send a batch of events on a stream. Raises
+        `BackpressureError` if the window is full, `NotConnectedError`
+        if the peer session is gone."""
+        ...
+    def send_with_retry(
+        self,
+        stream: "NetStream",
+        events: List[bytes],
+        max_retries: int = 8,
+    ) -> None:
+        """Retry `BackpressureError` with 5–200 ms exponential backoff
+        up to `max_retries` times. Transport errors propagate."""
+        ...
+    def send_blocking(self, stream: "NetStream", events: List[bytes]) -> None:
+        """Retry until the send succeeds or the ~13-minute upper bound
+        is hit. Releases the GIL while waiting."""
+        ...
+    def stream_stats(
+        self, peer_node_id: int, stream_id: int
+    ) -> Optional["NetStreamStats"]:
+        """Per-stream stats snapshot; `None` if the stream isn't open."""
+        ...
+
+    def shutdown(self) -> None:
+        """Graceful shutdown. Idempotent."""
+        ...
+
+    def __enter__(self) -> "NetMesh": ...
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> bool: ...
+    def __repr__(self) -> str: ...
+
+    def register_channel(
+        self,
+        name: str,
+        *,
+        visibility: Optional[str] = None,
+        reliable: Optional[bool] = None,
+        require_token: Optional[bool] = None,
+        priority: Optional[int] = None,
+        max_rate_pps: Optional[int] = None,
+    ) -> None:
+        """Register a channel on this node. Subscribers are validated
+        against this config before being added to the roster.
+        Raises `ChannelError` for invalid names / visibility."""
+        ...
+    def subscribe_channel(self, publisher_node_id: int, channel: str) -> None:
+        """Subscribe to `channel` on `publisher_node_id`. Raises
+        `ChannelAuthError` for unauthorized rejections, `ChannelError`
+        for other rejection / transport failures."""
+        ...
+    def unsubscribe_channel(self, publisher_node_id: int, channel: str) -> None:
+        """Idempotent counterpart of `subscribe_channel`."""
+        ...
+    def publish(
+        self,
+        channel: str,
+        payload: bytes,
+        *,
+        reliability: Optional[str] = None,
+        on_failure: Optional[str] = None,
+        max_inflight: Optional[int] = None,
+    ) -> dict:
+        """Fan one payload to every subscriber. Returns a
+        `PublishReport` dict: `{attempted, delivered, errors}` where
+        `errors` is a list of `{node_id, message}`."""
+        ...
+
+class BackpressureError(Exception):
+    """Raised when a stream's in-flight window is full. The event was
+    NOT sent — the caller decides drop / retry / buffer."""
+
+class NotConnectedError(Exception):
+    """Raised when a stream's peer session is gone (disconnected,
+    never connected, or the stream was closed)."""
+
+class ChannelError(Exception):
+    """Raised when a channel operation fails for a non-auth reason:
+    invalid name / visibility, unknown channel, rate limit,
+    transport failure. Auth rejections raise `ChannelAuthError`
+    (subclass of this class)."""
+
+class ChannelAuthError(ChannelError):
+    """Subclass of `ChannelError`. Raised when a Subscribe /
+    Unsubscribe request is rejected because the publisher's ACL
+    denied the subscriber."""

@@ -63,6 +63,26 @@ use crate::config::EventBusConfig;
 use crate::consumer::ConsumeRequest;
 use crate::event::{Event, RawEvent};
 
+/// C FFI for CortEX / NetDb / RedexFile. Requires `netdb` (for the
+/// unified facade) and `redex-disk` (for persistent storage paths on
+/// `Redex` / `RedexFile`). Go / cgo consumers target this surface.
+///
+/// `missing_docs` is suppressed on this module: these are extern "C"
+/// shims over already-documented Rust adapters, and the per-function
+/// contract is documented in the binding-side READMEs (Go / TS / Py).
+/// Re-documenting each shim would duplicate with drift risk.
+#[cfg(all(feature = "netdb", feature = "redex-disk"))]
+#[allow(missing_docs)]
+pub mod cortex;
+
+/// C FFI for the encrypted-UDP mesh transport + channels. Requires
+/// the `net` feature (which brings in the crypto + transport). Go /
+/// cgo consumers target this surface alongside `ffi::cortex`. See
+/// the `ffi::cortex` note for why `missing_docs` is suppressed here.
+#[cfg(feature = "net")]
+#[allow(missing_docs)]
+pub mod mesh;
+
 #[cfg(feature = "net")]
 use crate::adapter::net::{NetAdapterConfig, ReliabilityConfig, StaticKeypair};
 #[cfg(any(feature = "redis", feature = "jetstream", feature = "net"))]

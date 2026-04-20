@@ -42,6 +42,21 @@ export declare class MemoriesAdapter {
    * [`TasksAdapter::watch_tasks`] for emission semantics.
    */
   watchMemories(filter?: MemoryFilter | undefined | null): Promise<MemoryWatchIter>
+  /**
+   * Atomic "paint + react" primitive. Mirrors
+   * [`TasksAdapter::snapshot_and_watch_tasks`] for memories.
+   */
+  snapshotAndWatchMemories(filter?: MemoryFilter | undefined | null): Promise<MemoriesSnapshotAndWatch>
+}
+
+/** Result of [`MemoriesAdapter::snapshot_and_watch_memories`]. */
+export declare class MemoriesSnapshotAndWatch {
+  /** Initial filter result captured atomically with the watcher. */
+  get snapshot(): Array<Memory>
+  /** Wait for the next delta. `null` when closed / ended. */
+  next(): Promise<Array<Memory> | null>
+  /** Terminate the iterator early. Idempotent. */
+  close(): void
 }
 
 /** Async iterator over a live memory filter. */
@@ -202,6 +217,169 @@ export declare class NetDb {
 }
 
 /**
+ * A multi-peer mesh node for Node.js.
+ *
+ * Manages encrypted connections to multiple peers over a single
+ * UDP socket with automatic failure detection and rerouting.
+ *
+ * ```typescript
+ * import { NetMesh } from '@ai2070/net';
+ *
+ * const node = await NetMesh.create({
+ *   bindAddr: '127.0.0.1:9000',
+ *   psk: '0'.repeat(64), // 32-byte hex
+ * });
+ *
+ * console.log('public key:', node.publicKey());
+ *
+ * await node.connect('127.0.0.1:9001', peerPubkey, 0x2222);
+ * node.start();
+ *
+ * node.pushTo('127.0.0.1:9001', Buffer.from('{"token":"hi"}'));
+ *
+ * const events = await node.poll(100);
+ *
+ * await node.shutdown();
+ * ```
+ */
+export declare class NetMesh {
+  /** Create a new mesh node. */
+  static create(options: MeshOptions): Promise<NetMesh>
+  /** Get this node's Noise public key (hex-encoded). */
+  publicKey(): string
+  /**
+   * Get this node's ID. Returned as `BigInt` so full u64
+   * precision is preserved — keypair-derived node_ids
+   * routinely exceed `Number.MAX_SAFE_INTEGER`.
+   */
+  nodeId(): bigint
+  /** Connect to a peer (initiator side). */
+  connect(peerAddr: string, peerPublicKey: string, peerNodeId: bigint): Promise<void>
+  /** Accept an incoming connection (responder side). */
+  accept(peerNodeId: bigint): Promise<string>
+  /**
+   * Start the receive loop, heartbeats, and router.
+   *
+   * Declared `async` so napi-rs invokes it with an active
+   * tokio runtime — `MeshNode::start()` spawns background
+   * tasks via `tokio::spawn` and panics outside a reactor.
+   */
+  start(): Promise<void>
+  /** Send raw bytes to a direct peer. */
+  pushTo(peerAddr: string, data: Buffer): Promise<boolean>
+  /** Poll for received events. */
+  poll(limit: number): Promise<Array<StoredEvent>>
+  /** Add a route to a destination node. */
+  addRoute(destNodeId: bigint, nextHopAddr: string): void
+  /** Number of connected peers. */
+  peerCount(): number
+  /** Number of nodes discovered via pingwave. */
+  discoveredNodes(): number
+  /**
+   * Open (or look up) a stream to a connected peer. Repeated
+   * calls for the same `(peer, streamId)` return handles to the
+   * same underlying state (first-open wins; differing configs
+   * are logged and ignored).
+   */
+  openStream(peerNodeId: bigint, opts: StreamOptions): NetStream
+  /** Close a stream. Idempotent. */
+  closeStream(peerNodeId: bigint, streamId: bigint): void
+  /**
+   * Send a batch of events on an explicit stream.
+   *
+   * **Error contract for SDK wrappers:** message prefixes are
+   * stable. `"stream would block"` = `BackpressureError`;
+   * `"stream not connected"` = `NotConnectedError`; anything
+   * else is a real transport failure. See `sdk-ts` for the
+   * class-based re-throw layer.
+   */
+  sendOnStream(stream: NetStream, events: Array<Buffer>): Promise<void>
+  /**
+   * Send events, retrying on `Backpressure` with 5 ms → 200 ms
+   * exponential backoff up to `maxRetries` times. Transport
+   * errors are returned immediately (not retried).
+   */
+  sendWithRetry(stream: NetStream, events: Array<Buffer>, maxRetries: number): Promise<void>
+  /**
+   * Block the calling JS task until the send succeeds or a
+   * transport error occurs. Retries `Backpressure` with 5 ms →
+   * 200 ms exponential backoff up to 4096 times (~13 min worst
+   * case) — effectively "block until the network lets up" for
+   * practical workloads, but with a hard upper bound so runaway
+   * pressure can't hang a caller forever. Use `sendWithRetry`
+   * directly if you need a tighter bound.
+   */
+  sendBlocking(stream: NetStream, events: Array<Buffer>): Promise<void>
+  /**
+   * Snapshot of per-stream stats. Returns `null` if the peer or
+   * stream isn't registered.
+   */
+  streamStats(peerNodeId: bigint, streamId: bigint): NetStreamStats | null
+  /**
+   * Register a channel on this (publisher) node. Subscribers
+   * who ask to join are validated against this config before
+   * being added to the roster.
+   *
+   * `config` is a JSON object mirroring the core `ChannelConfig`:
+   *
+   * ```json
+   * {
+   *   "name": "sensors/temp",
+   *   "visibility": "global",   // "subnet-local" | "parent-visible" | "exported" | "global"
+   *   "reliable": true,
+   *   "requireToken": false,
+   *   "priority": 0,
+   *   "maxRatePps": 1000
+   * }
+   * ```
+   *
+   * (The v1 binding does not expose `publishCaps` /
+   * `subscribeCaps` — those require a capability surface that
+   * lands with the security plan.)
+   */
+  registerChannel(config: ChannelConfigJs): void
+  /**
+   * Ask `publisher_node_id` to add this node to `channel`'s
+   * subscriber set. Blocks until the publisher's `Ack` arrives
+   * or the membership-ack timeout elapses.
+   */
+  subscribeChannel(publisherNodeId: bigint, channel: string): Promise<void>
+  /**
+   * Mirror of [`Self::subscribe_channel`]. Idempotent on the
+   * publisher side.
+   */
+  unsubscribeChannel(publisherNodeId: bigint, channel: string): Promise<void>
+  /**
+   * Publish one payload to every subscriber of `channel`.
+   * Returns a `PublishReport` describing per-peer outcomes.
+   *
+   * `config` maps to the core `PublishConfig`:
+   *
+   * ```json
+   * {
+   *   "reliability": "reliable",          // or "fire_and_forget"
+   *   "onFailure":   "best_effort",       // or "fail_fast" | "collect"
+   *   "maxInflight": 32
+   * }
+   * ```
+   */
+  publish(channel: string, payload: Buffer, config?: PublishConfigJs | undefined | null): Promise<PublishReportJs>
+  /** Shutdown the mesh node. */
+  shutdown(): Promise<void>
+}
+
+/**
+ * Handle to an open stream. Opaque to JS callers; pass back to
+ * `sendOnStream` / `sendWithRetry` / `sendBlocking` / `closeStream`.
+ */
+export declare class NetStream {
+  /** The peer this stream terminates at. */
+  get peerNodeId(): bigint
+  /** The caller-chosen stream id. */
+  get streamId(): bigint
+}
+
+/**
  * Local RedEX manager. Holds the set of open files on this node.
  *
  * Cheap to share — methods take `&self`.
@@ -215,6 +393,80 @@ export declare class Redex {
    * and replay from those files on reopen. Heap-only when omitted.
    */
   constructor(persistentDir?: string | undefined | null)
+  /**
+   * Open (or get) a raw RedEX file bound to `channelName`. Returns
+   * a handle for append / tail / read operations without going
+   * through the CortEX adapter layer.
+   *
+   * Re-opening an existing name returns the live handle; the
+   * `config` argument is honored only on first open.
+   *
+   * With `config.persistent = true`, this manager must have been
+   * constructed with a `persistentDir`. Otherwise the call fails
+   * with a `redex:` error.
+   */
+  openFile(channelName: string, config?: RedexFileConfigJs | undefined | null): RedexFile
+}
+
+/**
+ * Raw RedEX file handle. Append / tail / read without the CortEX
+ * adapter layer. Cheap to clone (internal `Arc`).
+ */
+export declare class RedexFile {
+  /** Append one payload. Returns the assigned sequence number. */
+  append(payload: Buffer): bigint
+  /**
+   * Append a batch of payloads atomically. Returns the sequence
+   * number of the FIRST appended event; callers deduce subsequent
+   * seqs as `first + 0, first + 1, ...`.
+   */
+  appendBatch(payloads: Array<Buffer>): bigint
+  /**
+   * Read the half-open range `[start, end)` from the in-memory
+   * index. Returns only entries still retained — any seq in the
+   * range that has been evicted is silently skipped.
+   */
+  readRange(start: bigint, end: bigint): Array<RedexEventJs>
+  /**
+   * Number of retained events (post-retention eviction). Returned
+   * as `BigInt` so event counts above `u32::MAX` (~4.3 B) don't
+   * silently truncate.
+   */
+  len(): bigint
+  /**
+   * Open a live tail over this file. The iterator yields every
+   * event with `seq >= fromSeq` (default `0`), atomically
+   * backfilling the existing retained range and then streaming
+   * subsequent appends. Terminate early with `.close()` or by
+   * breaking out of `for await` — breaking triggers `return()`,
+   * which the SDK wrapper routes to `close()`.
+   *
+   * Declared `async` so the underlying `UnboundedReceiverStream`
+   * lives inside the napi tokio runtime.
+   */
+  tail(fromSeq?: bigint | undefined | null): Promise<RedexTailIter>
+  /**
+   * Explicit fsync. Always fsyncs regardless of configured
+   * `fsyncPolicy`. No-op on heap-only files.
+   */
+  sync(): void
+  /**
+   * Close the file. Outstanding tail iterators resolve with a
+   * `redex:` error on their next `.next()` call.
+   */
+  close(): void
+}
+
+/** Async iterator over a live `RedexFile::tail`. */
+export declare class RedexTailIter {
+  /**
+   * Wait for the next event. Returns `null` when the iterator has
+   * been closed or the underlying file was closed. Throws a
+   * `redex:` error if the backing stream yielded an error item.
+   */
+  next(): Promise<RedexEventJs | null>
+  /** Terminate the iterator. Idempotent. */
+  close(): void
 }
 
 /** Typed tasks adapter handle. */
@@ -276,6 +528,42 @@ export declare class TasksAdapter {
    * fold-forwarding task runs inside napi's tokio runtime.
    */
   watchTasks(filter?: TaskFilter | undefined | null): Promise<TaskWatchIter>
+  /**
+   * Atomic "paint what's here now, then react to changes" primitive.
+   * Computes the current filter result AND hands back an iterator
+   * over subsequent deltas in one call so the caller can't race a
+   * mutation that lands between a separate `listTasks` and
+   * `watchTasks`. The iterator drops only leading emissions equal
+   * to the returned snapshot; if a change lands during construction,
+   * the watcher's first emission is forwarded through instead of
+   * being silently dropped.
+   *
+   * Declared `async` for the same tokio-runtime reason as
+   * [`Self::watch_tasks`].
+   */
+  snapshotAndWatchTasks(filter?: TaskFilter | undefined | null): Promise<TasksSnapshotAndWatch>
+}
+
+/**
+ * Result of [`TasksAdapter::snapshot_and_watch_tasks`]. The snapshot
+ * reflects the filter result at the moment of the call; `next()` /
+ * `close()` drive the delta iterator for subsequent changes.
+ */
+export declare class TasksSnapshotAndWatch {
+  /**
+   * The initial filter result, captured atomically with the
+   * watcher. Clone-on-read; safe to call from JS without
+   * invalidating the iterator.
+   */
+  get snapshot(): Array<Task>
+  /**
+   * Wait for the next delta. Returns `null` when the iterator has
+   * been closed or the underlying stream has ended. Mirrors
+   * [`TaskWatchIter::next`].
+   */
+  next(): Promise<Array<Task> | null>
+  /** Terminate the iterator early. Idempotent. */
+  close(): void
 }
 
 /**
@@ -298,6 +586,36 @@ export declare class TaskWatchIter {
    * `null`. Idempotent.
    */
   close(): void
+}
+
+/**
+ * JS-facing channel config, mirroring the core `ChannelConfig`
+ * field-for-field. v1 does not expose `publishCaps` /
+ * `subscribeCaps` — those arrive with the security plan.
+ */
+export interface ChannelConfigJs {
+  /**
+   * Canonical channel name. Crosses the boundary as a string
+   * (not the u16 hash) to avoid ACL bypass via collision.
+   */
+  name: string
+  /**
+   * `"subnet-local" | "parent-visible" | "exported" | "global"`.
+   * Default `"global"`.
+   */
+  visibility?: string
+  /** Default reliability for streams on this channel. */
+  reliable?: boolean
+  /**
+   * Whether subscribers must present a valid PermissionToken.
+   * v1 ships `false`; token verification requires the security
+   * plan's identity surface.
+   */
+  requireToken?: boolean
+  /** Priority (0 = lowest). */
+  priority?: number
+  /** Rate cap in packets per second. */
+  maxRatePps?: number
 }
 
 /**
@@ -329,6 +647,15 @@ export interface EventBusOptions {
   /** Net adapter configuration for encrypted UDP transport */
   net?: NetOptions
 }
+
+/**
+ * Generate a new Net keypair for encrypted UDP transport.
+ *
+ * Returns a keypair with hex-encoded public and secret keys.
+ * Use this to generate keys for a responder, then share the public key
+ * with the initiator.
+ */
+export declare function generateNetKeypair(): NetKeypair
 
 /**
  * Pre-computed hash for events that will be reused.
@@ -413,6 +740,20 @@ export interface MemoryFilter {
   limit?: number
 }
 
+/** Configuration for creating a MeshNode. */
+export interface MeshOptions {
+  /** Local bind address (e.g., "127.0.0.1:9000") */
+  bindAddr: string
+  /** Hex-encoded 32-byte pre-shared key */
+  psk: string
+  /** Heartbeat interval in milliseconds (default: 5000) */
+  heartbeatIntervalMs?: number
+  /** Session timeout in milliseconds (default: 30000) */
+  sessionTimeoutMs?: number
+  /** Number of inbound shards (default: 4) */
+  numShards?: number
+}
+
 /**
  * Serialized NetDB snapshot bundle returned by [`NetDb::snapshot`]
  * and consumed by [`NetDb::open_from_snapshot`].
@@ -478,6 +819,28 @@ export interface NetOptions {
   packetPoolSize?: number
 }
 
+/**
+ * Snapshot of per-stream stats.
+ *
+ * u64 fields are exposed as `BigInt` so values outside the JS
+ * safe-integer range (notably `last_activity_ns`, which is
+ * Unix-epoch nanoseconds and always well above `2^53`) don't
+ * lose precision or trip the TS SDK's safe-integer guard. The
+ * u32 fields are safe as regular numbers.
+ */
+export interface NetStreamStats {
+  txSeq: bigint
+  rxSeq: bigint
+  inboundPending: bigint
+  lastActivityNs: bigint
+  active: boolean
+  backpressureEvents: bigint
+  txCreditRemaining: number
+  txWindow: number
+  creditGrantsReceived: bigint
+  creditGrantsSent: bigint
+}
+
 /** Options for polling events. */
 export interface PollOptions {
   /** Maximum number of events to return */
@@ -498,6 +861,85 @@ export interface PollResponse {
   nextId?: string
   /** Whether there are more events available */
   hasMore: boolean
+}
+
+/** Publish-fanout config, mirror of the core `PublishConfig`. */
+export interface PublishConfigJs {
+  /** `"reliable" | "fire_and_forget"`. Default `"fire_and_forget"`. */
+  reliability?: string
+  /**
+   * `"best_effort" | "fail_fast" | "collect"`. Default
+   * `"best_effort"`.
+   */
+  onFailure?: string
+  /** Max concurrent per-peer sends. Default 32. */
+  maxInflight?: number
+}
+
+export interface PublishFailureJs {
+  nodeId: bigint
+  message: string
+}
+
+/** Per-peer report returned by `publish`. */
+export interface PublishReportJs {
+  /** Total subscribers the publisher attempted to reach. */
+  attempted: number
+  /** Subscribers that received the payload. */
+  delivered: number
+  /** Per-peer errors. Each entry is `{ nodeId, message }`. */
+  errors: Array<PublishFailureJs>
+}
+
+/** A materialized RedEX event: `seq` + `payload`. */
+export interface RedexEventJs {
+  seq: bigint
+  payload: Buffer
+  /**
+   * Low-28-bit xxh3 truncation of the payload, stamped at append
+   * time. Use to detect storage corruption.
+   */
+  checksum: number
+  /**
+   * True if the 8-byte payload was stored inline in the entry
+   * record rather than in the payload segment.
+   */
+  isInline: boolean
+}
+
+/**
+ * Configuration for [`Redex::open_file`]. Mirrors the core
+ * `RedexFileConfig` but flattens `FsyncPolicy` into two mutually
+ * exclusive optional fields. Leave both unset for the default
+ * `Never` policy.
+ */
+export interface RedexFileConfigJs {
+  /**
+   * Disk-backed storage. Requires `Redex` to have been constructed
+   * with `persistentDir`. Default: `false` (heap only).
+   */
+  persistent?: boolean
+  /**
+   * Fsync after every N appends (`1` fsyncs on every append).
+   * Mutually exclusive with `fsync_interval_ms`. Ignored unless
+   * `persistent: true`. `0` is rejected.
+   */
+  fsyncEveryN?: bigint
+  /**
+   * Fsync on a timer (milliseconds). Mutually exclusive with
+   * `fsync_every_n`. Ignored unless `persistent: true`. `0` is
+   * rejected.
+   */
+  fsyncIntervalMs?: number
+  /** Retain at most N events. */
+  retentionMaxEvents?: bigint
+  /** Retain at most N bytes of payload. */
+  retentionMaxBytes?: bigint
+  /**
+   * Drop entries older than this many milliseconds at the next
+   * retention sweep.
+   */
+  retentionMaxAgeMs?: bigint
 }
 
 /** Redis adapter configuration. */
@@ -546,6 +988,31 @@ export interface StoredEvent {
   insertionTs: number
   /** Shard ID */
   shardId: number
+}
+
+/**
+ * Reliability mode for a stream. Wire value is a plain tag string:
+ * `"fire_and_forget"` (default) or `"reliable"`. Anything else
+ * errors at stream-open time.
+ */
+export interface StreamOptions {
+  /**
+   * Caller-chosen `u64` stream id. Stream IDs are opaque; no
+   * range has transport-level meaning. Crosses the boundary
+   * as `BigInt` so full u64 precision is preserved.
+   */
+  streamId: bigint
+  /** `"fire_and_forget"` | `"reliable"`. Default: `"fire_and_forget"`. */
+  reliability?: string
+  /**
+   * Initial send-credit window in bytes. Defaults to
+   * `DEFAULT_STREAM_WINDOW_BYTES` (64 KB) when unset — v2
+   * backpressure is ON out of the box. Pass `0` to restore the
+   * v1 unbounded-queue behavior for a specific stream.
+   */
+  windowBytes?: number
+  /** Fair-scheduler weight (1 = equal share). Default: 1. */
+  fairnessWeight?: number
 }
 
 /** A materialized task record. */
