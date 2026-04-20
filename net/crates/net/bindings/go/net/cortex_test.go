@@ -2,6 +2,7 @@ package net
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -228,18 +229,18 @@ func TestRegressionTasksSnapshotAndWatchForwardsDivergentInitial(t *testing.T) {
 			t.Fatalf("trial %d: wait: %v", trial, err)
 		}
 
-		mutated := make(chan uint64, 1)
+		mutated := make(chan error, 1)
 		go func() {
 			s, err := tasks.Create(2, "race", 200)
 			if err != nil {
-				mutated <- 0
+				mutated <- fmt.Errorf("create: %w", err)
 				return
 			}
 			if err := tasks.WaitForSeq(s, 2*time.Second); err != nil {
-				mutated <- 0
+				mutated <- fmt.Errorf("wait_for_seq: %w", err)
 				return
 			}
-			mutated <- s
+			mutated <- nil
 		}()
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -248,7 +249,12 @@ func TestRegressionTasksSnapshotAndWatchForwardsDivergentInitial(t *testing.T) {
 			cancel()
 			t.Fatalf("trial %d: snapshot_and_watch: %v", trial, err)
 		}
-		<-mutated
+		if mErr := <-mutated; mErr != nil {
+			// Fail fast with the real cause rather than waiting for a
+			// misleading delta-timeout below.
+			cancel()
+			t.Fatalf("trial %d: mutator failed: %v", trial, mErr)
+		}
 
 		if len(snapshot) == 2 {
 			cancel()
@@ -332,18 +338,18 @@ func TestRegressionMemoriesSnapshotAndWatchForwardsDivergentInitial(t *testing.T
 			t.Fatalf("trial %d: wait: %v", trial, err)
 		}
 
-		mutated := make(chan uint64, 1)
+		mutated := make(chan error, 1)
 		go func() {
 			s, err := mem.Store(2, "race", []string{"t"}, "alice", 200)
 			if err != nil {
-				mutated <- 0
+				mutated <- fmt.Errorf("store: %w", err)
 				return
 			}
 			if err := mem.WaitForSeq(s, 2*time.Second); err != nil {
-				mutated <- 0
+				mutated <- fmt.Errorf("wait_for_seq: %w", err)
 				return
 			}
-			mutated <- s
+			mutated <- nil
 		}()
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -352,7 +358,10 @@ func TestRegressionMemoriesSnapshotAndWatchForwardsDivergentInitial(t *testing.T
 			cancel()
 			t.Fatalf("trial %d: snapshot_and_watch: %v", trial, err)
 		}
-		<-mutated
+		if mErr := <-mutated; mErr != nil {
+			cancel()
+			t.Fatalf("trial %d: mutator failed: %v", trial, mErr)
+		}
 
 		if len(snapshot) == 2 {
 			cancel()

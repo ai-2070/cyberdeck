@@ -743,15 +743,19 @@ fn build_tasks_list_filter(filter_json: *const c_char) -> Result<TasksFilter, c_
     out.created_before_ns = f.created_before_ns;
     out.updated_after_ns = f.updated_after_ns;
     out.updated_before_ns = f.updated_before_ns;
-    out.order_by = f.order_by.as_deref().and_then(|o| match o {
-        "id_asc" => Some(TasksOrderBy::IdAsc),
-        "id_desc" => Some(TasksOrderBy::IdDesc),
-        "created_asc" => Some(TasksOrderBy::CreatedAsc),
-        "created_desc" => Some(TasksOrderBy::CreatedDesc),
-        "updated_asc" => Some(TasksOrderBy::UpdatedAsc),
-        "updated_desc" => Some(TasksOrderBy::UpdatedDesc),
-        _ => None,
-    });
+    out.order_by = match f.order_by.as_deref() {
+        None => None,
+        Some("id_asc") => Some(TasksOrderBy::IdAsc),
+        Some("id_desc") => Some(TasksOrderBy::IdDesc),
+        Some("created_asc") => Some(TasksOrderBy::CreatedAsc),
+        Some("created_desc") => Some(TasksOrderBy::CreatedDesc),
+        Some("updated_asc") => Some(TasksOrderBy::UpdatedAsc),
+        Some("updated_desc") => Some(TasksOrderBy::UpdatedDesc),
+        // Reject unknown order_by instead of silently falling back —
+        // a misspelling ("createdasc") would otherwise return a
+        // successful but misordered result.
+        Some(_) => return Err(NetError::InvalidJson.into()),
+    };
     out.limit = f.limit.map(|l| l as usize);
     Ok(out)
 }
@@ -1286,7 +1290,15 @@ fn build_memories_list_filter(filter_json: *const c_char) -> Result<MemoriesFilt
     out.created_before_ns = f.created_before_ns;
     out.updated_after_ns = f.updated_after_ns;
     out.updated_before_ns = f.updated_before_ns;
-    out.order_by = f.order_by.as_deref().and_then(parse_memories_order_by);
+    // Reject unknown order_by instead of silently falling back —
+    // keep parity with build_memories_watcher above.
+    out.order_by = match f.order_by.as_deref() {
+        None => None,
+        Some(o) => match parse_memories_order_by(o) {
+            Some(ob) => Some(ob),
+            None => return Err(NetError::InvalidJson.into()),
+        },
+    };
     out.limit = f.limit.map(|l| l as usize);
     Ok(out)
 }

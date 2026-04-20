@@ -151,7 +151,7 @@ type RecvdEvent struct {
 
 // MeshNode is a multi-peer encrypted mesh handle.
 type MeshNode struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	handle *C.net_meshnode_t
 }
 
@@ -200,8 +200,8 @@ func (m *MeshNode) Shutdown() error {
 
 // PublicKey returns this node's Noise static public key, hex-encoded.
 func (m *MeshNode) PublicKey() (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if m.handle == nil {
 		return "", ErrShuttingDown
 	}
@@ -217,8 +217,8 @@ func (m *MeshNode) PublicKey() (string, error) {
 
 // NodeID returns this node's u64 id.
 func (m *MeshNode) NodeID() uint64 {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if m.handle == nil {
 		return 0
 	}
@@ -227,31 +227,29 @@ func (m *MeshNode) NodeID() uint64 {
 
 // Connect (initiator). Blocks until the handshake completes.
 func (m *MeshNode) Connect(peerAddr, peerPubkeyHex string, peerNodeID uint64) error {
-	m.mu.Lock()
-	h := m.handle
-	m.mu.Unlock()
-	if h == nil {
-		return ErrShuttingDown
-	}
 	cAddr := C.CString(peerAddr)
 	defer C.free(unsafe.Pointer(cAddr))
 	cPk := C.CString(peerPubkeyHex)
 	defer C.free(unsafe.Pointer(cPk))
-	code := C.net_mesh_connect(h, cAddr, cPk, C.uint64_t(peerNodeID))
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return ErrShuttingDown
+	}
+	code := C.net_mesh_connect(m.handle, cAddr, cPk, C.uint64_t(peerNodeID))
 	return meshErrorFromCode(code)
 }
 
 // Accept an incoming connection (responder). Returns the peer's wire address.
 func (m *MeshNode) Accept(peerNodeID uint64) (string, error) {
-	m.mu.Lock()
-	h := m.handle
-	m.mu.Unlock()
-	if h == nil {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
 		return "", ErrShuttingDown
 	}
 	var out *C.char
 	var outLen C.size_t
-	code := C.net_mesh_accept(h, C.uint64_t(peerNodeID), &out, &outLen)
+	code := C.net_mesh_accept(m.handle, C.uint64_t(peerNodeID), &out, &outLen)
 	if err := meshErrorFromCode(code); err != nil {
 		return "", err
 	}
@@ -261,13 +259,12 @@ func (m *MeshNode) Accept(peerNodeID uint64) (string, error) {
 
 // Start the receive loop, heartbeats, and router.
 func (m *MeshNode) Start() error {
-	m.mu.Lock()
-	h := m.handle
-	m.mu.Unlock()
-	if h == nil {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
 		return ErrShuttingDown
 	}
-	return meshErrorFromCode(C.net_mesh_start(h))
+	return meshErrorFromCode(C.net_mesh_start(m.handle))
 }
 
 // ---------------------------------------------------------------------------
@@ -276,7 +273,7 @@ func (m *MeshNode) Start() error {
 
 // MeshStream is an opaque handle to an open per-peer stream.
 type MeshStream struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	handle *C.net_mesh_stream_t
 	// Parent node — kept alongside the stream so Send calls can
 	// reach the owning runtime. The stream's own lifetime is bounded
@@ -288,12 +285,6 @@ type MeshStream struct {
 // Repeated calls for the same (peer, streamID) are idempotent;
 // first-open wins and later differing configs are logged and ignored.
 func (m *MeshNode) OpenStream(peerNodeID, streamID uint64, cfg StreamConfig) (*MeshStream, error) {
-	m.mu.Lock()
-	h := m.handle
-	m.mu.Unlock()
-	if h == nil {
-		return nil, ErrShuttingDown
-	}
 	data, err := json.Marshal(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("marshal stream cfg: %w", err)
@@ -303,8 +294,13 @@ func (m *MeshNode) OpenStream(peerNodeID, streamID uint64, cfg StreamConfig) (*M
 		cCfg = C.CString(string(data))
 		defer C.free(unsafe.Pointer(cCfg))
 	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return nil, ErrShuttingDown
+	}
 	var handle *C.net_mesh_stream_t
-	code := C.net_mesh_open_stream(h, C.uint64_t(peerNodeID), C.uint64_t(streamID), cCfg, &handle)
+	code := C.net_mesh_open_stream(m.handle, C.uint64_t(peerNodeID), C.uint64_t(streamID), cCfg, &handle)
 	if err := meshErrorFromCode(code); err != nil {
 		return nil, err
 	}
@@ -378,80 +374,77 @@ func payloadPtrs(payloads [][]byte) (
 // when the window is full (nothing sent — caller decides to drop /
 // retry / buffer), ErrNotConnected when the peer is gone, or a
 // transport error.
+//
+// Holds the stream AND node read-locks through the C call so a
+// concurrent Close/Shutdown can't race the native handles into a
+// use-after-free. Concurrent sends run in parallel; Close waits.
 func (s *MeshStream) Send(payloads [][]byte) error {
-	s.mu.Lock()
-	sh := s.handle
-	n := s.node
-	s.mu.Unlock()
-	if sh == nil || n == nil {
-		return ErrShuttingDown
-	}
-	n.mu.Lock()
-	nh := n.handle
-	n.mu.Unlock()
-	if nh == nil {
-		return ErrShuttingDown
-	}
 	ptrs, lens, count, release := payloadPtrs(payloads)
 	defer release()
-	code := C.net_mesh_send(sh, ptrs, lens, count, nh)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := s.node
+	if s.handle == nil || n == nil {
+		return ErrShuttingDown
+	}
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.handle == nil {
+		return ErrShuttingDown
+	}
+	code := C.net_mesh_send(s.handle, ptrs, lens, count, n.handle)
 	return meshErrorFromCode(code)
 }
 
 // SendWithRetry absorbs ErrBackpressure with exponential backoff up
 // to `maxRetries`. Other errors propagate immediately.
 func (s *MeshStream) SendWithRetry(payloads [][]byte, maxRetries uint32) error {
-	s.mu.Lock()
-	sh := s.handle
-	n := s.node
-	s.mu.Unlock()
-	if sh == nil || n == nil {
-		return ErrShuttingDown
-	}
-	n.mu.Lock()
-	nh := n.handle
-	n.mu.Unlock()
-	if nh == nil {
-		return ErrShuttingDown
-	}
 	ptrs, lens, count, release := payloadPtrs(payloads)
 	defer release()
-	code := C.net_mesh_send_with_retry(sh, ptrs, lens, count, C.uint32_t(maxRetries), nh)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := s.node
+	if s.handle == nil || n == nil {
+		return ErrShuttingDown
+	}
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.handle == nil {
+		return ErrShuttingDown
+	}
+	code := C.net_mesh_send_with_retry(s.handle, ptrs, lens, count, C.uint32_t(maxRetries), n.handle)
 	return meshErrorFromCode(code)
 }
 
 // SendBlocking retries ErrBackpressure up to ~13 min worst case.
 func (s *MeshStream) SendBlocking(payloads [][]byte) error {
-	s.mu.Lock()
-	sh := s.handle
-	n := s.node
-	s.mu.Unlock()
-	if sh == nil || n == nil {
-		return ErrShuttingDown
-	}
-	n.mu.Lock()
-	nh := n.handle
-	n.mu.Unlock()
-	if nh == nil {
-		return ErrShuttingDown
-	}
 	ptrs, lens, count, release := payloadPtrs(payloads)
 	defer release()
-	code := C.net_mesh_send_blocking(sh, ptrs, lens, count, nh)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := s.node
+	if s.handle == nil || n == nil {
+		return ErrShuttingDown
+	}
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.handle == nil {
+		return ErrShuttingDown
+	}
+	code := C.net_mesh_send_blocking(s.handle, ptrs, lens, count, n.handle)
 	return meshErrorFromCode(code)
 }
 
 // StreamStats returns a snapshot. `nil` if the stream isn't open.
 func (m *MeshNode) StreamStats(peerNodeID, streamID uint64) (*StreamStats, error) {
-	m.mu.Lock()
-	h := m.handle
-	m.mu.Unlock()
-	if h == nil {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
 		return nil, ErrShuttingDown
 	}
 	var out *C.char
 	var outLen C.size_t
-	code := C.net_mesh_stream_stats(h, C.uint64_t(peerNodeID), C.uint64_t(streamID), &out, &outLen)
+	code := C.net_mesh_stream_stats(m.handle, C.uint64_t(peerNodeID), C.uint64_t(streamID), &out, &outLen)
 	if err := meshErrorFromCode(code); err != nil {
 		return nil, err
 	}
@@ -480,15 +473,14 @@ type recvEventWire struct {
 
 // RecvShard drains up to `limit` events from a specific inbound shard.
 func (m *MeshNode) RecvShard(shardID uint16, limit uint32) ([]RecvdEvent, error) {
-	m.mu.Lock()
-	h := m.handle
-	m.mu.Unlock()
-	if h == nil {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
 		return nil, ErrShuttingDown
 	}
 	var out *C.char
 	var outLen C.size_t
-	code := C.net_mesh_recv_shard(h, C.uint16_t(shardID), C.uint32_t(limit), &out, &outLen)
+	code := C.net_mesh_recv_shard(m.handle, C.uint16_t(shardID), C.uint32_t(limit), &out, &outLen)
 	if err := meshErrorFromCode(code); err != nil {
 		return nil, err
 	}
@@ -521,57 +513,48 @@ func (m *MeshNode) RecvShard(shardID uint16, limit uint32) ([]RecvdEvent, error)
 // RegisterChannel installs a channel config on this node. Subscribers
 // must pass the publisher-side ACL before being added to the roster.
 func (m *MeshNode) RegisterChannel(cfg ChannelConfig) error {
-	m.mu.Lock()
-	h := m.handle
-	m.mu.Unlock()
-	if h == nil {
-		return ErrShuttingDown
-	}
 	data, err := json.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("marshal channel cfg: %w", err)
 	}
 	cCfg := C.CString(string(data))
 	defer C.free(unsafe.Pointer(cCfg))
-	return meshErrorFromCode(C.net_mesh_register_channel(h, cCfg))
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return ErrShuttingDown
+	}
+	return meshErrorFromCode(C.net_mesh_register_channel(m.handle, cCfg))
 }
 
 // SubscribeChannel joins `channel` on `publisherNodeID`. Blocks until
 // the Ack arrives. `ErrChannelAuth` when the publisher rejected as
 // unauthorized, `ErrChannel` for other rejections.
 func (m *MeshNode) SubscribeChannel(publisherNodeID uint64, channel string) error {
-	m.mu.Lock()
-	h := m.handle
-	m.mu.Unlock()
-	if h == nil {
-		return ErrShuttingDown
-	}
 	cCh := C.CString(channel)
 	defer C.free(unsafe.Pointer(cCh))
-	return meshErrorFromCode(C.net_mesh_subscribe_channel(h, C.uint64_t(publisherNodeID), cCh))
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return ErrShuttingDown
+	}
+	return meshErrorFromCode(C.net_mesh_subscribe_channel(m.handle, C.uint64_t(publisherNodeID), cCh))
 }
 
 // UnsubscribeChannel is the idempotent counterpart of SubscribeChannel.
 func (m *MeshNode) UnsubscribeChannel(publisherNodeID uint64, channel string) error {
-	m.mu.Lock()
-	h := m.handle
-	m.mu.Unlock()
-	if h == nil {
-		return ErrShuttingDown
-	}
 	cCh := C.CString(channel)
 	defer C.free(unsafe.Pointer(cCh))
-	return meshErrorFromCode(C.net_mesh_unsubscribe_channel(h, C.uint64_t(publisherNodeID), cCh))
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return ErrShuttingDown
+	}
+	return meshErrorFromCode(C.net_mesh_unsubscribe_channel(m.handle, C.uint64_t(publisherNodeID), cCh))
 }
 
 // Publish fans one payload to every subscriber of `channel`.
 func (m *MeshNode) Publish(channel string, payload []byte, cfg PublishConfig) (*PublishReport, error) {
-	m.mu.Lock()
-	h := m.handle
-	m.mu.Unlock()
-	if h == nil {
-		return nil, ErrShuttingDown
-	}
 	cCh := C.CString(channel)
 	defer C.free(unsafe.Pointer(cCh))
 	data, err := json.Marshal(cfg)
@@ -591,7 +574,12 @@ func (m *MeshNode) Publish(channel string, payload []byte, cfg PublishConfig) (*
 	}
 	var out *C.char
 	var outLen C.size_t
-	code := C.net_mesh_publish(h, cCh, ptr, ln, cCfg, &out, &outLen)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	code := C.net_mesh_publish(m.handle, cCh, ptr, ln, cCfg, &out, &outLen)
 	runtime.KeepAlive(payload)
 	if err := meshErrorFromCode(code); err != nil {
 		return nil, err

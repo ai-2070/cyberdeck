@@ -412,7 +412,10 @@ fmt.Println("wrote seq", seq)
 
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
-events, errs, _ := file.Tail(ctx, 0)
+events, errs, err := file.Tail(ctx, 0)
+if err != nil {
+    log.Fatal(err)  // otherwise the loop below blocks on nil channels
+}
 for {
     select {
     case ev, ok := <-events:

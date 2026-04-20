@@ -53,6 +53,23 @@ var (
 	ErrStreamTimeout = errors.New("stream timed out")
 )
 
+// durationToMillisU32 clamps a Go Duration down to the millisecond
+// range the C ABI expects (`uint32`). Negative durations are treated
+// as zero (=wait indefinitely on the FFI side); durations that would
+// overflow u32 are clamped at `math.MaxUint32` (~49.7 days) rather
+// than silently wrapping — which would flip a 2-hour timeout into a
+// ~50ms poll.
+func durationToMillisU32(d time.Duration) C.uint32_t {
+	if d <= 0 {
+		return 0
+	}
+	ms := d.Milliseconds()
+	if ms > int64(^uint32(0)) {
+		return C.uint32_t(^uint32(0))
+	}
+	return C.uint32_t(ms)
+}
+
 func cortexErrorFromCode(code C.int) error {
 	switch code {
 	case 0:
@@ -87,7 +104,7 @@ func cortexErrorFromCode(code C.int) error {
 // Redex is a local RedEX manager. One handle per process; shared by
 // all adapters on the same storage tree.
 type Redex struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	handle *C.net_redex_t
 }
 
@@ -164,21 +181,13 @@ func (e *redexEventWire) toEvent() (RedexEvent, error) {
 
 // RedexFile is a raw append-only log bound to a channel name.
 type RedexFile struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	handle *C.net_redex_file_t
 }
 
 // OpenFile opens (or gets) a RedEX file on `redex`. `config` may be
 // nil for defaults.
 func (r *Redex) OpenFile(name string, config *RedexFileConfig) (*RedexFile, error) {
-	r.mu.Lock()
-	if r.handle == nil {
-		r.mu.Unlock()
-		return nil, ErrShuttingDown
-	}
-	rh := r.handle
-	r.mu.Unlock()
-
 	cName := C.CString(name)
 	defer C.free(unsafe.Pointer(cName))
 
@@ -192,8 +201,15 @@ func (r *Redex) OpenFile(name string, config *RedexFileConfig) (*RedexFile, erro
 		defer C.free(unsafe.Pointer(cCfg))
 	}
 
+	// Hold the Redex read-lock through the C call so a concurrent
+	// Free() can't race the native pointer into a use-after-free.
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.handle == nil {
+		return nil, ErrShuttingDown
+	}
 	var out *C.net_redex_file_t
-	code := C.net_redex_open_file(rh, cName, cCfg, &out)
+	code := C.net_redex_open_file(r.handle, cName, cCfg, &out)
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
 	}
@@ -229,8 +245,8 @@ func (f *RedexFile) Close() error {
 
 // Append appends one payload; returns the assigned sequence number.
 func (f *RedexFile) Append(payload []byte) (uint64, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	if f.handle == nil {
 		return 0, ErrShuttingDown
 	}
@@ -250,8 +266,8 @@ func (f *RedexFile) Append(payload []byte) (uint64, error) {
 
 // Len returns the number of retained events.
 func (f *RedexFile) Len() uint64 {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	if f.handle == nil {
 		return 0
 	}
@@ -260,8 +276,8 @@ func (f *RedexFile) Len() uint64 {
 
 // ReadRange reads events in [start, end).
 func (f *RedexFile) ReadRange(start, end uint64) ([]RedexEvent, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	if f.handle == nil {
 		return nil, ErrShuttingDown
 	}
@@ -290,8 +306,8 @@ func (f *RedexFile) ReadRange(start, end uint64) ([]RedexEvent, error) {
 
 // Sync fsyncs the disk segment. No-op on heap-only files.
 func (f *RedexFile) Sync() error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	if f.handle == nil {
 		return ErrShuttingDown
 	}
@@ -301,17 +317,21 @@ func (f *RedexFile) Sync() error {
 // Tail returns a channel of RedexEvents starting from `fromSeq`.
 // Backfills the retained range atomically, then streams live appends.
 // Cancel `ctx` to stop; the channel is closed when the cursor ends.
+//
+// Hold the read-lock for the duration of the cursor-creation C call
+// only. Once the cursor is built, it's self-contained Rust memory
+// that survives independent of the file handle — closing the file
+// just drives the cursor's tail stream to `RedexError::Closed`, which
+// the goroutine maps to a clean channel close.
 func (f *RedexFile) Tail(ctx context.Context, fromSeq uint64) (<-chan RedexEvent, <-chan error, error) {
-	f.mu.Lock()
+	f.mu.RLock()
 	if f.handle == nil {
-		f.mu.Unlock()
+		f.mu.RUnlock()
 		return nil, nil, ErrShuttingDown
 	}
-	fh := f.handle
-	f.mu.Unlock()
-
 	var cursor *C.net_redex_tail_t
-	code := C.net_redex_file_tail(fh, C.uint64_t(fromSeq), &cursor)
+	code := C.net_redex_file_tail(f.handle, C.uint64_t(fromSeq), &cursor)
+	f.mu.RUnlock()
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, nil, err
 	}
@@ -393,27 +413,26 @@ type TasksFilter struct {
 
 // TasksAdapter is the typed tasks handle.
 type TasksAdapter struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	handle *C.net_tasks_adapter_t
 }
 
 // OpenTasks opens the tasks adapter against a Redex. `persistent`
 // routes writes through the Redex's persistent directory.
 func OpenTasks(redex *Redex, originHash uint32, persistent bool) (*TasksAdapter, error) {
-	redex.mu.Lock()
-	if redex.handle == nil {
-		redex.mu.Unlock()
-		return nil, ErrShuttingDown
-	}
-	rh := redex.handle
-	redex.mu.Unlock()
-
-	var out *C.net_tasks_adapter_t
 	var p C.int
 	if persistent {
 		p = 1
 	}
-	code := C.net_tasks_adapter_open(rh, C.uint32_t(originHash), p, &out)
+	// Hold the redex read-lock for the duration of the C call so a
+	// concurrent Free() can't race it.
+	redex.mu.RLock()
+	defer redex.mu.RUnlock()
+	if redex.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	var out *C.net_tasks_adapter_t
+	code := C.net_tasks_adapter_open(redex.handle, C.uint32_t(originHash), p, &out)
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
 	}
@@ -448,34 +467,34 @@ func (t *TasksAdapter) Close() error {
 }
 
 func (t *TasksAdapter) Create(id uint64, title string, nowNs uint64) (uint64, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	cTitle := C.CString(title)
+	defer C.free(unsafe.Pointer(cTitle))
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	if t.handle == nil {
 		return 0, ErrShuttingDown
 	}
-	cTitle := C.CString(title)
-	defer C.free(unsafe.Pointer(cTitle))
 	var seq C.uint64_t
 	code := C.net_tasks_create(t.handle, C.uint64_t(id), cTitle, C.uint64_t(nowNs), &seq)
 	return uint64(seq), cortexErrorFromCode(code)
 }
 
 func (t *TasksAdapter) Rename(id uint64, newTitle string, nowNs uint64) (uint64, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	cNew := C.CString(newTitle)
+	defer C.free(unsafe.Pointer(cNew))
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	if t.handle == nil {
 		return 0, ErrShuttingDown
 	}
-	cNew := C.CString(newTitle)
-	defer C.free(unsafe.Pointer(cNew))
 	var seq C.uint64_t
 	code := C.net_tasks_rename(t.handle, C.uint64_t(id), cNew, C.uint64_t(nowNs), &seq)
 	return uint64(seq), cortexErrorFromCode(code)
 }
 
 func (t *TasksAdapter) Complete(id uint64, nowNs uint64) (uint64, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	if t.handle == nil {
 		return 0, ErrShuttingDown
 	}
@@ -485,8 +504,8 @@ func (t *TasksAdapter) Complete(id uint64, nowNs uint64) (uint64, error) {
 }
 
 func (t *TasksAdapter) Delete(id uint64) (uint64, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	if t.handle == nil {
 		return 0, ErrShuttingDown
 	}
@@ -498,28 +517,19 @@ func (t *TasksAdapter) Delete(id uint64) (uint64, error) {
 // WaitForSeq blocks until the fold has applied every event up through
 // `seq`. Pass `timeout = 0` to wait indefinitely.
 func (t *TasksAdapter) WaitForSeq(seq uint64, timeout time.Duration) error {
-	t.mu.Lock()
+	timeoutMs := durationToMillisU32(timeout)
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	if t.handle == nil {
-		t.mu.Unlock()
 		return ErrShuttingDown
 	}
-	h := t.handle
-	t.mu.Unlock()
-	code := C.net_tasks_wait_for_seq(h, C.uint64_t(seq), C.uint32_t(timeout.Milliseconds()))
+	code := C.net_tasks_wait_for_seq(t.handle, C.uint64_t(seq), timeoutMs)
 	return cortexErrorFromCode(code)
 }
 
 // List returns a snapshot query over the materialized state. Pass
 // `nil` filter for "all tasks."
 func (t *TasksAdapter) List(filter *TasksFilter) ([]Task, error) {
-	t.mu.Lock()
-	if t.handle == nil {
-		t.mu.Unlock()
-		return nil, ErrShuttingDown
-	}
-	h := t.handle
-	t.mu.Unlock()
-
 	cFilter, err := marshalFilter(filter)
 	if err != nil {
 		return nil, err
@@ -527,9 +537,14 @@ func (t *TasksAdapter) List(filter *TasksFilter) ([]Task, error) {
 	if cFilter != nil {
 		defer C.free(unsafe.Pointer(cFilter))
 	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.handle == nil {
+		return nil, ErrShuttingDown
+	}
 	var out *C.char
 	var outLen C.size_t
-	code := C.net_tasks_list(h, cFilter, &out, &outLen)
+	code := C.net_tasks_list(t.handle, cFilter, &out, &outLen)
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
 	}
@@ -554,14 +569,6 @@ func (t *TasksAdapter) SnapshotAndWatch(
 	ctx context.Context,
 	filter *TasksFilter,
 ) ([]Task, <-chan []Task, <-chan error, error) {
-	t.mu.Lock()
-	if t.handle == nil {
-		t.mu.Unlock()
-		return nil, nil, nil, ErrShuttingDown
-	}
-	h := t.handle
-	t.mu.Unlock()
-
 	cFilter, err := marshalFilter(filter)
 	if err != nil {
 		return nil, nil, nil, err
@@ -572,7 +579,17 @@ func (t *TasksAdapter) SnapshotAndWatch(
 	var snap *C.char
 	var snapLen C.size_t
 	var cursor *C.net_tasks_watch_t
-	code := C.net_tasks_snapshot_and_watch(h, cFilter, &snap, &snapLen, &cursor)
+	// Hold the read-lock only for the duration of the
+	// snapshot-and-cursor-creation C call. The cursor itself lives
+	// in independent Rust memory; the goroutine below uses the
+	// cursor pointer, not the adapter handle.
+	t.mu.RLock()
+	if t.handle == nil {
+		t.mu.RUnlock()
+		return nil, nil, nil, ErrShuttingDown
+	}
+	code := C.net_tasks_snapshot_and_watch(t.handle, cFilter, &snap, &snapLen, &cursor)
+	t.mu.RUnlock()
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, nil, nil, err
 	}
@@ -662,25 +679,22 @@ type MemoriesFilter struct {
 
 // MemoriesAdapter is the typed memories handle.
 type MemoriesAdapter struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	handle *C.net_memories_adapter_t
 }
 
 func OpenMemories(redex *Redex, originHash uint32, persistent bool) (*MemoriesAdapter, error) {
-	redex.mu.Lock()
-	if redex.handle == nil {
-		redex.mu.Unlock()
-		return nil, ErrShuttingDown
-	}
-	rh := redex.handle
-	redex.mu.Unlock()
-
-	var out *C.net_memories_adapter_t
 	var p C.int
 	if persistent {
 		p = 1
 	}
-	code := C.net_memories_adapter_open(rh, C.uint32_t(originHash), p, &out)
+	redex.mu.RLock()
+	defer redex.mu.RUnlock()
+	if redex.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	var out *C.net_memories_adapter_t
+	code := C.net_memories_adapter_open(redex.handle, C.uint32_t(originHash), p, &out)
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
 	}
@@ -727,11 +741,6 @@ type memoryRetagInput struct {
 }
 
 func (m *MemoriesAdapter) Store(id uint64, content string, tags []string, source string, nowNs uint64) (uint64, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.handle == nil {
-		return 0, ErrShuttingDown
-	}
 	if tags == nil {
 		tags = []string{}
 	}
@@ -743,17 +752,17 @@ func (m *MemoriesAdapter) Store(id uint64, content string, tags []string, source
 	}
 	c := C.CString(string(data))
 	defer C.free(unsafe.Pointer(c))
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return 0, ErrShuttingDown
+	}
 	var seq C.uint64_t
 	code := C.net_memories_store(m.handle, c, &seq)
 	return uint64(seq), cortexErrorFromCode(code)
 }
 
 func (m *MemoriesAdapter) Retag(id uint64, tags []string, nowNs uint64) (uint64, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.handle == nil {
-		return 0, ErrShuttingDown
-	}
 	if tags == nil {
 		tags = []string{}
 	}
@@ -763,14 +772,19 @@ func (m *MemoriesAdapter) Retag(id uint64, tags []string, nowNs uint64) (uint64,
 	}
 	c := C.CString(string(data))
 	defer C.free(unsafe.Pointer(c))
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return 0, ErrShuttingDown
+	}
 	var seq C.uint64_t
 	code := C.net_memories_retag(m.handle, c, &seq)
 	return uint64(seq), cortexErrorFromCode(code)
 }
 
 func (m *MemoriesAdapter) Pin(id uint64, nowNs uint64) (uint64, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if m.handle == nil {
 		return 0, ErrShuttingDown
 	}
@@ -780,8 +794,8 @@ func (m *MemoriesAdapter) Pin(id uint64, nowNs uint64) (uint64, error) {
 }
 
 func (m *MemoriesAdapter) Unpin(id uint64, nowNs uint64) (uint64, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if m.handle == nil {
 		return 0, ErrShuttingDown
 	}
@@ -791,8 +805,8 @@ func (m *MemoriesAdapter) Unpin(id uint64, nowNs uint64) (uint64, error) {
 }
 
 func (m *MemoriesAdapter) Delete(id uint64) (uint64, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if m.handle == nil {
 		return 0, ErrShuttingDown
 	}
@@ -802,26 +816,17 @@ func (m *MemoriesAdapter) Delete(id uint64) (uint64, error) {
 }
 
 func (m *MemoriesAdapter) WaitForSeq(seq uint64, timeout time.Duration) error {
-	m.mu.Lock()
+	timeoutMs := durationToMillisU32(timeout)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if m.handle == nil {
-		m.mu.Unlock()
 		return ErrShuttingDown
 	}
-	h := m.handle
-	m.mu.Unlock()
-	code := C.net_memories_wait_for_seq(h, C.uint64_t(seq), C.uint32_t(timeout.Milliseconds()))
+	code := C.net_memories_wait_for_seq(m.handle, C.uint64_t(seq), timeoutMs)
 	return cortexErrorFromCode(code)
 }
 
 func (m *MemoriesAdapter) List(filter *MemoriesFilter) ([]Memory, error) {
-	m.mu.Lock()
-	if m.handle == nil {
-		m.mu.Unlock()
-		return nil, ErrShuttingDown
-	}
-	h := m.handle
-	m.mu.Unlock()
-
 	cFilter, err := marshalFilter(filter)
 	if err != nil {
 		return nil, err
@@ -829,9 +834,14 @@ func (m *MemoriesAdapter) List(filter *MemoriesFilter) ([]Memory, error) {
 	if cFilter != nil {
 		defer C.free(unsafe.Pointer(cFilter))
 	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return nil, ErrShuttingDown
+	}
 	var out *C.char
 	var outLen C.size_t
-	code := C.net_memories_list(h, cFilter, &out, &outLen)
+	code := C.net_memories_list(m.handle, cFilter, &out, &outLen)
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, err
 	}
@@ -849,14 +859,6 @@ func (m *MemoriesAdapter) SnapshotAndWatch(
 	ctx context.Context,
 	filter *MemoriesFilter,
 ) ([]Memory, <-chan []Memory, <-chan error, error) {
-	m.mu.Lock()
-	if m.handle == nil {
-		m.mu.Unlock()
-		return nil, nil, nil, ErrShuttingDown
-	}
-	h := m.handle
-	m.mu.Unlock()
-
 	cFilter, err := marshalFilter(filter)
 	if err != nil {
 		return nil, nil, nil, err
@@ -867,7 +869,13 @@ func (m *MemoriesAdapter) SnapshotAndWatch(
 	var snap *C.char
 	var snapLen C.size_t
 	var cursor *C.net_memories_watch_t
-	code := C.net_memories_snapshot_and_watch(h, cFilter, &snap, &snapLen, &cursor)
+	m.mu.RLock()
+	if m.handle == nil {
+		m.mu.RUnlock()
+		return nil, nil, nil, ErrShuttingDown
+	}
+	code := C.net_memories_snapshot_and_watch(m.handle, cFilter, &snap, &snapLen, &cursor)
+	m.mu.RUnlock()
 	if err := cortexErrorFromCode(code); err != nil {
 		return nil, nil, nil, err
 	}
