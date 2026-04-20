@@ -1,0 +1,45 @@
+net/crates/net/src/ffi/mod.rs
+  5bf3f089eecaef7a 72-77
+net/crates/net/bindings/go/README.md
+  5bf3f089eecaef7a 200,202-205,207-293,295-322
+net/crates/net/bindings/go/net/mesh_test.go
+  5bf3f089eecaef7a 1-297
+net/crates/net/sdk-ts/test/channels.test.ts
+  5bf3f089eecaef7a 4-8,12-17,21-28,30-62,115-164
+net/crates/net/bindings/go/net/net.h
+  5bf3f089eecaef7a 39-48,298-426
+net/crates/net/bindings/go/net/mesh.go
+  5bf3f089eecaef7a 1-606
+net/crates/net/bindings/go/net/mesh_channels_test.go
+  5bf3f089eecaef7a 1-169
+net/crates/net/bindings/node/src/cortex.rs
+  5bf3f089eecaef7a 70
+net/crates/net/src/ffi/mesh.rs
+  5bf3f089eecaef7a 1-884
+net/crates/net/bindings/node/src/lib.rs
+  5bf3f089eecaef7a 5,818-820,845-846,850-851,1082,1203-1205,1207,1210,1219,1235,1244,1247,1256-1259,1261,1327,1333,1361,1364-1365,1379,1382-1383,1454-1455,1459-1460
+net/crates/net/bindings/node/src/common.rs
+  5bf3f089eecaef7a 1-24
+net/crates/net/sdk-ts/src/mesh.ts
+  5bf3f089eecaef7a 197,202,207,211-212,228-229,243,301
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "82996495bb4baff8ab366429cc15547c947c82b7",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 9972,
+      "total_deletions": 10990,
+      "accepted_lines": 2400,
+      "overriden_lines": 0
+    }
+  }
+}
