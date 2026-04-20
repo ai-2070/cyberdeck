@@ -1,0 +1,25 @@
+net/crates/net/bindings/go/net/regression_test.go
+  5bf3f089eecaef7a 181-231
+net/crates/net/bindings/go/net/cortex.go
+  5bf3f089eecaef7a 456-462,464,466,470-476,730-732,734,736,740-746
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "6e26241f9d1d9e5b99310430589813470e1caa20",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 2569,
+      "total_deletions": 4,
+      "accepted_lines": 104,
+      "overriden_lines": 0
+    }
+  }
+}
