@@ -98,18 +98,30 @@ func TestMeshChannelSubscribeAndPublish(t *testing.T) {
 		t.Fatalf("subscribe: %v", err)
 	}
 
-	// Let the publisher's roster register A.
-	time.Sleep(50 * time.Millisecond)
-
-	report, err := b.Publish("sensors/temp", []byte("22.5"), PublishConfig{
-		Reliability: "reliable",
-		OnFailure:   "best_effort",
-	})
-	if err != nil {
-		t.Fatalf("publish: %v", err)
-	}
-	if report.Attempted != 1 {
-		t.Fatalf("attempted: got %d, want 1", report.Attempted)
+	// `SubscribeChannel` blocks on the membership Ack, and the
+	// publisher adds the subscriber to its roster *before* sending
+	// that Ack (see `handle_membership_message` in adapter/net/mesh.rs),
+	// so the first Publish should see Attempted=1. Poll with a bounded
+	// deadline anyway so the test degrades to a clear timeout rather
+	// than a cryptic assertion miss if that ordering ever changes.
+	var report *PublishReport
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		r, err := b.Publish("sensors/temp", []byte("22.5"), PublishConfig{
+			Reliability: "reliable",
+			OnFailure:   "best_effort",
+		})
+		if err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+		if r.Attempted == 1 {
+			report = r
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("publisher roster never observed subscriber (attempted=%d)", r.Attempted)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if report.Delivered != 1 {
 		t.Fatalf("delivered: got %d, want 1", report.Delivered)
@@ -119,9 +131,9 @@ func TestMeshChannelSubscribeAndPublish(t *testing.T) {
 	}
 
 	// Subscriber observes the payload on the event bus.
-	deadline := time.Now().Add(2 * time.Second)
+	recvDeadline := time.Now().Add(2 * time.Second)
 	var received []RecvdEvent
-	for time.Now().Before(deadline) && len(received) == 0 {
+	for time.Now().Before(recvDeadline) && len(received) == 0 {
 		for shard := uint16(0); shard < 4; shard++ {
 			events, err := a.RecvShard(shard, 16)
 			if err != nil {

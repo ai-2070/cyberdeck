@@ -25,11 +25,14 @@ some pieces are still partial.
    on Go today cannot connect to peers, open streams, or publish to
    channels.
 
-Both gaps are **additive-only** (no behavior changes for existing
-callers unless they were already broken on the NAPI side). Each
-stage is independently shippable; this plan holds them together
-because they are the last remaining items to reach SDK parity on
-the mesh transport.
+The Go gap is purely additive. The NAPI gap is **additive for TS SDK
+consumers** (the wrapper already used `bigint`) but a **breaking type
+change for direct `@ai2070/net` consumers** who passed plain `number`
+to the affected id parameters — those calls will now throw `"expected
+BigInt"` and must wrap values in `BigInt(x)`. Migration note in
+Stage A below. Each stage is independently shippable; this plan holds
+them together because they are the last remaining items to reach SDK
+parity on the mesh transport.
 
 ## Scope
 

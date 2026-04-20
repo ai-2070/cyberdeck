@@ -103,3 +103,12 @@ def test_publish_rejects_invalid_reliability() -> None:
             m.publish("chan/x", b"p", reliability="whatever")
     finally:
         m.shutdown()
+
+
+def test_shutdown_is_idempotent() -> None:
+    # The stub documents shutdown() as idempotent; the impl previously
+    # raised "already shut down" on the second call, breaking that
+    # contract (and any finally-blocks that double-called it).
+    m = NetMesh(_port(7), PSK)
+    m.shutdown()
+    m.shutdown()  # second call must not raise

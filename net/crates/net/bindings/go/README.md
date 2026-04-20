@@ -209,6 +209,7 @@ package main
 
 import (
     "log"
+    "strings"
 
     "github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net"
 )

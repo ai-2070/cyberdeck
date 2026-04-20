@@ -171,9 +171,9 @@ use net_sdk::mesh::{Mesh, MeshBuilder};
 use net_sdk::{ChannelConfig, ChannelId, ChannelName, PublishConfig, Reliability, Visibility};
 
 # async fn example() -> net_sdk::error::Result<()> {
-let publisher = MeshBuilder::new("127.0.0.1:9001", b"32-byte-psk-here-....")?
+let publisher = MeshBuilder::new("127.0.0.1:9001", &[0x42u8; 32])?
     .build().await?;
-let subscriber = MeshBuilder::new("127.0.0.1:9000", b"32-byte-psk-here-....")?
+let subscriber = MeshBuilder::new("127.0.0.1:9000", &[0x42u8; 32])?
     .build().await?;
 // (handshake omitted — see Mesh Streams example)
 

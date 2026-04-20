@@ -158,7 +158,7 @@ const stats = node.streamStats(peerNodeId, 0x42n);
 `BackpressureError` and `NotConnectedError` both extend `Error`, so
 `instanceof` and `try/catch` work as expected. The transport never
 retries or buffers on its own behalf — the helper methods are
-opt-in policies, not defaults. See `docs/TRANSPORT.md` for the full
+opt-in policies, not defaults. See `../docs/TRANSPORT.md` for the full
 contract.
 
 ## Channels (distributed pub/sub)
@@ -171,6 +171,8 @@ subscribe goes through a dedicated subprotocol with an Ack round-trip);
 ```typescript
 import { MeshNode, ChannelAuthError } from '@ai2070/net-sdk';
 
+const psk = '0'.repeat(64);
+
 // Publisher side.
 const b = await MeshNode.create({ bindAddr: '127.0.0.1:9001', psk });
 b.registerChannel({
@@ -181,7 +183,10 @@ b.registerChannel({
   maxRatePps: 1000,
 });
 
-// Subscriber side (after handshake).
+// Subscriber side (after handshake with b).
+const a = await MeshNode.create({ bindAddr: '127.0.0.1:9002', psk });
+const bNodeId = b.nodeId();
+await a.connect('127.0.0.1:9001', b.publicKey(), bNodeId);
 await a.subscribeChannel(bNodeId, 'sensors/temp');
 
 // Fan out.
@@ -202,7 +207,7 @@ try {
 
 **Channel names always cross the boundary as strings.** The u16 hash
 is a transport-layer index only; ACL lookups key on the canonical
-name to avoid bypass via hash collision (see `docs/CHANNELS.md`).
+name to avoid bypass via hash collision (see `../docs/CHANNELS.md`).
 
 Subscribers today receive payloads through the existing event-bus
 `poll()` surface — a dedicated per-channel `AsyncIterable` receive

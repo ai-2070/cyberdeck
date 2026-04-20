@@ -1507,12 +1507,11 @@ mod mesh_bindings {
             publish_report_to_pydict(py, report)
         }
 
-        /// Shutdown the mesh node.
+        /// Shutdown the mesh node. Idempotent — a second call is a no-op.
         fn shutdown(&mut self) -> PyResult<()> {
-            let node = self
-                .node
-                .take()
-                .ok_or_else(|| PyRuntimeError::new_err("already shut down"))?;
+            let Some(node) = self.node.take() else {
+                return Ok(());
+            };
             self.runtime
                 .block_on(node.shutdown())
                 .map_err(|e| PyRuntimeError::new_err(format!("shutdown: {}", e)))?;

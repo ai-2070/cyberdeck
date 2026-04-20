@@ -1501,6 +1501,7 @@ mod mesh_bindings {
         #[napi]
         pub fn register_channel(&self, config: ChannelConfigJs) -> Result<()> {
             let cfg = config.into_core()?;
+            self.load_node()?;
             self.channel_configs.insert(cfg);
             Ok(())
         }

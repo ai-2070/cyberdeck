@@ -331,18 +331,16 @@ pub extern "C" fn net_mesh_shutdown(handle: *mut MeshNodeHandle) -> c_int {
     }
     let h = unsafe { &*handle };
     let rt = runtime();
-    // Only try to shutdown if we're the sole holder of the Arc
-    // (caller hasn't leaked stream handles etc.). Otherwise return
-    // OK — the remaining references will keep the node alive until
-    // they're dropped.
+    // Only actually shut down if we're the sole holder of the Arc
+    // (no outstanding stream handles etc.). Otherwise return OK —
+    // the remaining references will keep the node alive until they
+    // drop. `shutdown` takes `&self`, so no ownership transfer is
+    // needed; the earlier `try_unwrap` against an extra clone of the
+    // same `Arc` was unreachable.
     if Arc::strong_count(&h.inner) == 1 {
-        let node_arc = h.inner.clone();
-        match Arc::try_unwrap(node_arc) {
-            Ok(node) => match rt.block_on(async move { node.shutdown().await }) {
-                Ok(()) => 0,
-                Err(e) => adapter_err_to_code(&e),
-            },
-            Err(_) => 0,
+        match rt.block_on(async { h.inner.shutdown().await }) {
+            Ok(()) => 0,
+            Err(e) => adapter_err_to_code(&e),
         }
     } else {
         0
@@ -485,6 +483,9 @@ pub extern "C" fn net_mesh_send_with_retry(
     if handle.is_null() || node_handle.is_null() {
         return NetError::NullPointer.into();
     }
+    if count > 0 && (payloads.is_null() || lens.is_null()) {
+        return NetError::NullPointer.into();
+    }
     let sh = unsafe { &*handle };
     let nh = unsafe { &*node_handle };
     let rt = runtime();
@@ -509,6 +510,9 @@ pub extern "C" fn net_mesh_send_blocking(
     node_handle: *mut MeshNodeHandle,
 ) -> c_int {
     if handle.is_null() || node_handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    if count > 0 && (payloads.is_null() || lens.is_null()) {
         return NetError::NullPointer.into();
     }
     let sh = unsafe { &*handle };

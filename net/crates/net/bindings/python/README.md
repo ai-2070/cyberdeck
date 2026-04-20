@@ -144,9 +144,8 @@ finally:
 ```
 
 Channel names always cross the binding as strings (not the u16 hash)
-to avoid ACL bypass via collision. Subscribers today receive payloads
-through the existing `NetMesh.poll()` surface — a per-channel stream
-primitive is a follow-up.
+to avoid ACL bypass via collision. The Python binding does not yet
+expose a dedicated per-channel receive API; that is a follow-up.
 
 ## CortEX & NetDb (event-sourced state)
 

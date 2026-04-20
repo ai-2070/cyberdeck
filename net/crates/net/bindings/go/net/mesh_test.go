@@ -2,46 +2,37 @@ package net
 
 import (
 	"errors"
+	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 const meshPsk = "4242424242424242424242424242424242424242424242424242424242424242"
 
-// pairPorts returns two unique ephemeral-ish ports per test case.
-// The Go binding doesn't yet expose `local_addr()`, so we can't let
-// the OS pick — allocate from a shared counter instead.
-var (
-	portMu   sync.Mutex
-	portBase = uint16(29200)
-)
-
+// allocPortPair reserves two free local UDP ports by having the OS
+// assign them, then immediately closing the sockets so the mesh node
+// can bind them. There's a narrow TOCTOU window between close and
+// rebind, but the OS ephemeral-port allocator rarely reuses a
+// just-closed port right away — this is the standard idiom for Go
+// integration tests, and it's strictly better than a deterministic
+// counter which collided with other local processes.
 func allocPortPair(t *testing.T) (string, string) {
 	t.Helper()
-	portMu.Lock()
-	defer portMu.Unlock()
-	a := portBase
-	b := portBase + 1
-	portBase += 2
-	return portAddr(a), portAddr(b)
+	return reserveLocalUDPPort(t), reserveLocalUDPPort(t)
 }
 
-func portAddr(p uint16) string { return "127.0.0.1:" + itoa(p) }
-
-func itoa(p uint16) string {
-	if p == 0 {
-		return "0"
+func reserveLocalUDPPort(t *testing.T) string {
+	t.Helper()
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve udp port: %v", err)
 	}
-	var buf [5]byte
-	i := len(buf)
-	for p > 0 {
-		i--
-		buf[i] = byte('0' + p%10)
-		p /= 10
-	}
-	return string(buf[i:])
+	addr := conn.LocalAddr().String()
+	conn.Close()
+	return addr
 }
 
 func meshHandshakePair(t *testing.T) (*MeshNode, *MeshNode, func()) {
@@ -72,8 +63,11 @@ func meshHandshakePair(t *testing.T) (*MeshNode, *MeshNode, func()) {
 		acceptDone <- err
 	}()
 
-	// Give Accept a chance to start polling.
-	time.Sleep(50 * time.Millisecond)
+	// No sleep before Connect: both sides' handshake helpers have
+	// internal retry-with-backoff (see `handshake_initiator` /
+	// `handshake_responder` in adapter/net/mesh.rs), so a Connect
+	// that races ahead of Accept is absorbed by the first retry
+	// rather than failing the test deterministically.
 	if err := a.Connect(bAddr, bPub, bID); err != nil {
 		a.Shutdown()
 		b.Shutdown()
@@ -185,7 +179,7 @@ func TestMeshSendBackpressureSurfaces(t *testing.T) {
 	}
 	defer stream.Close()
 
-	sawBackpressure := false
+	var sawBackpressure atomic.Bool
 	var wg sync.WaitGroup
 	for i := 0; i < 16; i++ {
 		wg.Add(1)
@@ -193,12 +187,12 @@ func TestMeshSendBackpressureSurfaces(t *testing.T) {
 			defer wg.Done()
 			err := stream.Send([][]byte{{}})
 			if errors.Is(err, ErrBackpressure) {
-				sawBackpressure = true
+				sawBackpressure.Store(true)
 			}
 		}()
 	}
 	wg.Wait()
-	if !sawBackpressure {
+	if !sawBackpressure.Load() {
 		t.Fatalf("expected at least one ErrBackpressure from 16 concurrent window-1 sends")
 	}
 }
