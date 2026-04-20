@@ -45,6 +45,7 @@ import {
   type CapabilitySet,
 } from './capabilities';
 import type { SubnetId, SubnetPolicy } from './subnets';
+import type { Token } from './identity';
 
 /** Reliability mode chosen at stream-open time. */
 export type Reliability = 'fire_and_forget' | 'reliable';
@@ -144,6 +145,21 @@ function toStreamError(e: unknown): never {
     throw new NotConnectedError(msg);
   }
   throw e;
+}
+
+/**
+ * Options for {@link MeshNode.subscribeChannel}. Struct form so
+ * future knobs (timeout override, priority) don't break callers.
+ */
+export interface SubscribeOptions {
+  /**
+   * Token to present to the publisher. The publisher verifies the
+   * ed25519 signature, checks the subject matches the subscribing
+   * peer's `EntityId`, and installs the token in its local cache
+   * before running `can_subscribe`. A matching token satisfies
+   * `requireToken` channels end-to-end.
+   */
+  token?: Token;
 }
 
 /** Options for {@link MeshNode.create}. */
@@ -386,12 +402,28 @@ export class MeshNode {
    * set. Blocks until the publisher's `Ack` arrives or the
    * membership-ack timeout elapses.
    *
+   * Pass `opts.token` to present a
+   * {@link Token PermissionToken} issued by the publisher — required
+   * when the channel was registered with `requireToken: true` or
+   * when your caps alone don't satisfy `subscribeCaps`. The
+   * publisher verifies the signature, checks `subject ===
+   * thisNode.entityId`, installs it in its local cache, then runs
+   * the ACL check.
+   *
    * Throws a {@link ChannelAuthError} or {@link ChannelError} on
    * rejection; network-level failures propagate as plain `Error`.
    */
-  async subscribeChannel(publisherNodeId: bigint, channel: string): Promise<void> {
+  async subscribeChannel(
+    publisherNodeId: bigint,
+    channel: string,
+    opts?: SubscribeOptions,
+  ): Promise<void> {
     try {
-      await this.native.subscribeChannel(publisherNodeId, channel);
+      await this.native.subscribeChannel(
+        publisherNodeId,
+        channel,
+        opts?.token?.bytes,
+      );
     } catch (e) {
       toChannelError(e);
     }

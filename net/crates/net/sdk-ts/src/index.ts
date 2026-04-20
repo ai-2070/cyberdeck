@@ -54,6 +54,7 @@ export type {
   ChannelConfig,
   PublishConfig,
   PublishReport,
+  SubscribeOptions,
 } from './mesh';
 
 // CortEX + NetDb (event-sourced state with reactive watches).

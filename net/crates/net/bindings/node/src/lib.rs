@@ -1550,20 +1550,37 @@ mod mesh_bindings {
         /// Ask `publisher_node_id` to add this node to `channel`'s
         /// subscriber set. Blocks until the publisher's `Ack` arrives
         /// or the membership-ack timeout elapses.
+        ///
+        /// Optional `token` is the serialized `PermissionToken` bytes
+        /// (159 bytes) — attach it when the publisher set
+        /// `requireToken = true` on the channel, or when the caller's
+        /// caps don't satisfy `subscribeCaps` on their own.
         #[napi]
         pub async fn subscribe_channel(
             &self,
             publisher_node_id: BigInt,
             channel: String,
+            token: Option<Buffer>,
         ) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             let pub_id = bigint_u64_lossless(publisher_node_id)?;
             let name = net::adapter::net::ChannelName::new(&channel)
                 .map_err(|e| Error::from_reason(format!("channel: invalid name: {}", e)))?;
-            node.subscribe_channel(pub_id, name)
-                .await
-                .map_err(map_channel_adapter_error)
+            match token {
+                Some(bytes) => {
+                    let parsed =
+                        net::adapter::net::identity::PermissionToken::from_bytes(bytes.as_ref())
+                            .map_err(crate::identity::token_err_for)?;
+                    node.subscribe_channel_with_token(pub_id, name, parsed)
+                        .await
+                        .map_err(map_channel_adapter_error)
+                }
+                None => node
+                    .subscribe_channel(pub_id, name)
+                    .await
+                    .map_err(map_channel_adapter_error),
+            }
         }
 
         /// Mirror of [`Self::subscribe_channel`]. Idempotent on the

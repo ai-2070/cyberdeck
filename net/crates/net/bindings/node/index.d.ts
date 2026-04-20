@@ -402,8 +402,13 @@ export declare class NetMesh {
    * Ask `publisher_node_id` to add this node to `channel`'s
    * subscriber set. Blocks until the publisher's `Ack` arrives
    * or the membership-ack timeout elapses.
+   *
+   * Optional `token` is the serialized `PermissionToken` bytes
+   * (159 bytes) — attach it when the publisher set
+   * `requireToken = true` on the channel, or when the caller's
+   * caps don't satisfy `subscribeCaps` on their own.
    */
-  subscribeChannel(publisherNodeId: bigint, channel: string): Promise<void>
+  subscribeChannel(publisherNodeId: bigint, channel: string, token?: Buffer | undefined | null): Promise<void>
   /**
    * Mirror of [`Self::subscribe_channel`]. Idempotent on the
    * publisher side.

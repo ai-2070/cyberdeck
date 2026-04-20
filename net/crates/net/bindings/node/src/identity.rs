@@ -59,6 +59,14 @@ fn map_token_err(e: TokenError) -> Error {
     token_err(token_error_kind(&e))
 }
 
+/// Public helper for crate-internal callers (mesh subscribe path)
+/// that need to classify a `TokenError` with the same `token: <kind>`
+/// prefix the rest of this module uses. Keeps the `kind` strings
+/// single-sourced.
+pub(crate) fn token_err_for(e: TokenError) -> Error {
+    map_token_err(e)
+}
+
 // =========================================================================
 // Scope parsing — string array ↔ TokenScope bitfield
 // =========================================================================
