@@ -1,0 +1,27 @@
+net/crates/net/sdk/src/mesh.rs
+  5bf3f089eecaef7a 53-108,420-455
+net/crates/net/src/adapter/net/mesh.rs
+  5bf3f089eecaef7a 1975-1977,1983-1997,2008,2017,2038
+net/crates/net/sdk/src/lib.rs
+  5bf3f089eecaef7a 97
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "a80566a477953bc140d5e98354e4aa148ff912e4",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 4483,
+      "total_deletions": 14,
+      "accepted_lines": 148,
+      "overriden_lines": 0
+    }
+  }
+}
