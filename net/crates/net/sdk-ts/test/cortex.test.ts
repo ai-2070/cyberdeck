@@ -49,9 +49,13 @@ describe('NetDb', () => {
       withTasks: true,
       withMemories: true,
     });
-    db.tasks!.create(1n, 'alpha', 100n);
-    const seq = db.memories!.store(1n, 'mem', ['x'], 'alice', 100n);
-    await db.memories!.waitForSeq(seq);
+    const taskSeq = db.tasks!.create(1n, 'alpha', 100n);
+    const memSeq = db.memories!.store(1n, 'mem', ['x'], 'alice', 100n);
+    // Wait for BOTH fold tasks before snapshotting — otherwise the
+    // tasks fold may not have applied the create yet and the restored
+    // db would see count=0.
+    await db.tasks!.waitForSeq(taskSeq);
+    await db.memories!.waitForSeq(memSeq);
 
     const bundle = db.snapshot();
     const restored = await NetDb.openFromSnapshot(
@@ -99,24 +103,23 @@ describe('TasksAdapter.watch — for-await lifecycle', () => {
     await tasks.waitForSeq(seedSeq);
 
     const stream = await tasks.watch();
-    const collected: Task[][] = [];
-    const loop = (async () => {
-      for await (const batch of stream) {
-        collected.push(batch);
-        if (collected.length >= 2) break; // break triggers return() → close()
-      }
-    })();
+    const iter = stream[Symbol.asyncIterator]();
 
-    // Wait for initial emission.
-    await new Promise((r) => setTimeout(r, 30));
-    // Add a second task so the watcher emits a divergent batch.
+    // Await the watcher's initial emission directly — no timing guess.
+    const first = await iter.next();
+    expect(first.done).toBe(false);
+    expect(first.value).toHaveLength(1);
+
+    // Mutate and await the divergent emission.
     const seq = tasks.create(2n, 'second', 200n);
     await tasks.waitForSeq(seq);
 
-    await loop;
-    expect(collected).toHaveLength(2);
-    expect(collected[0]).toHaveLength(1);
-    expect(collected[1]).toHaveLength(2);
+    const second = await iter.next();
+    expect(second.done).toBe(false);
+    expect(second.value).toHaveLength(2);
+
+    // `return()` releases the native iterator deterministically.
+    await iter.return!();
   });
 });
 

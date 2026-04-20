@@ -178,6 +178,14 @@ pub struct RedexFileConfigJs {
     pub retention_max_age_ms: Option<BigInt>,
 }
 
+/// Validate a `BigInt` config field while preserving the `redex:`
+/// error-message prefix so the SDK can classify it as `RedexError`.
+/// The shared `common::bigint_u64` emits prefix-less errors; rethrow
+/// with the RedEX prefix tacked on.
+fn redex_bigint_u64(field: &str, b: BigInt) -> Result<u64> {
+    bigint_u64(b).map_err(|e| redex_err(&format!("config.{}", field), e.reason))
+}
+
 fn resolve_redex_file_config(cfg: Option<RedexFileConfigJs>) -> Result<RedexFileConfig> {
     let Some(c) = cfg else {
         return Ok(RedexFileConfig::default());
@@ -194,7 +202,7 @@ fn resolve_redex_file_config(cfg: Option<RedexFileConfigJs>) -> Result<RedexFile
             ));
         }
         (Some(n), None) => {
-            let n = bigint_u64(n)?;
+            let n = redex_bigint_u64("fsync_every_n", n)?;
             if n == 0 {
                 return Err(redex_err("config", "fsync_every_n must be > 0"));
             }
@@ -210,13 +218,13 @@ fn resolve_redex_file_config(cfg: Option<RedexFileConfigJs>) -> Result<RedexFile
         (None, None) => {}
     }
     if let Some(n) = c.retention_max_events {
-        out.retention_max_events = Some(bigint_u64(n)?);
+        out.retention_max_events = Some(redex_bigint_u64("retention_max_events", n)?);
     }
     if let Some(b) = c.retention_max_bytes {
-        out.retention_max_bytes = Some(bigint_u64(b)?);
+        out.retention_max_bytes = Some(redex_bigint_u64("retention_max_bytes", b)?);
     }
     if let Some(ms) = c.retention_max_age_ms {
-        let ms = bigint_u64(ms)?;
+        let ms = redex_bigint_u64("retention_max_age_ms", ms)?;
         out.retention_max_age_ns = Some(ms.saturating_mul(1_000_000));
     }
     Ok(out)
@@ -286,8 +294,8 @@ impl RedexFile {
     /// range that has been evicted is silently skipped.
     #[napi]
     pub fn read_range(&self, start: BigInt, end: BigInt) -> Result<Vec<RedexEventJs>> {
-        let s = bigint_u64(start)?;
-        let e = bigint_u64(end)?;
+        let s = redex_bigint_u64("start", start)?;
+        let e = redex_bigint_u64("end", end)?;
         Ok(self
             .inner
             .read_range(s, e)
@@ -296,10 +304,12 @@ impl RedexFile {
             .collect())
     }
 
-    /// Number of retained events (post-retention eviction).
+    /// Number of retained events (post-retention eviction). Returned
+    /// as `BigInt` so event counts above `u32::MAX` (~4.3 B) don't
+    /// silently truncate.
     #[napi]
-    pub fn len(&self) -> u32 {
-        self.inner.len() as u32
+    pub fn len(&self) -> BigInt {
+        BigInt::from(self.inner.len() as u64)
     }
 
     /// Open a live tail over this file. The iterator yields every
@@ -314,7 +324,7 @@ impl RedexFile {
     #[napi]
     pub async fn tail(&self, from_seq: Option<BigInt>) -> Result<RedexTailIter> {
         let from = match from_seq {
-            Some(s) => bigint_u64(s)?,
+            Some(s) => redex_bigint_u64("from_seq", s)?,
             None => 0,
         };
         let stream = self.inner.tail(from);

@@ -13,7 +13,7 @@ describe('Redex.openFile', () => {
     const file = redex.openFile('sdk/basic');
     const seq = file.append(Buffer.from('hello'));
     expect(seq).toBe(0n);
-    expect(file.len()).toBe(1);
+    expect(file.len()).toBe(1n);
 
     const events = file.readRange(0n, 10n);
     expect(events).toHaveLength(1);
@@ -31,7 +31,7 @@ describe('Redex.openFile', () => {
       Buffer.from('c'),
     ]);
     expect(first).toBe(0n);
-    expect(file.len()).toBe(3);
+    expect(file.len()).toBe(3n);
   });
 
   it('throws RedexError for invalid channel names', () => {
@@ -58,7 +58,7 @@ describe('Redex.openFile', () => {
       retentionMaxBytes: 1024n * 1024n,
       retentionMaxAgeMs: 60_000n,
     });
-    expect(file.len()).toBe(0);
+    expect(file.len()).toBe(0n);
   });
 });
 

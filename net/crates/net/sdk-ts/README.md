@@ -305,9 +305,10 @@ try {
 } catch (e) {
   if (e instanceof RedexError) { /* ... */ }
   throw e;
+} finally {
+  // Ensure the file is closed even if tailing / parsing throws.
+  file.close();
 }
-
-file.close();
 ```
 
 ### Error classes
@@ -357,8 +358,8 @@ separate import path.
 | `MemoriesAdapter.open(redex, origin, opts?)` | Standalone memories adapter |
 | `adapter.create/rename/complete/delete/...` | Domain CRUD |
 | `adapter.listTasks(filter?)` / `listMemories` | Sync snapshot query |
-| `adapter.watch(filter?)` | `AsyncIterable<T[]>` over deduplicated fold results |
-| `adapter.snapshotAndWatch(filter?)` | `{ snapshot, updates }` — atomic paint+react |
+| `adapter.watch(filter?)` | `Promise<AsyncIterable<T[]>>` over deduplicated fold results |
+| `adapter.snapshotAndWatch(filter?)` | `Promise<SnapshotAndWatch<T>>` — atomic paint+react |
 | `adapter.snapshot()` / `openFromSnapshot` | Model-level persistence |
 | `db.snapshot()` / `NetDb.openFromSnapshot` | Bundled multi-model persistence |
 | `redex.openFile(name, config?)` | Raw RedEX file — append-only log |

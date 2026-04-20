@@ -63,10 +63,28 @@ pyo3::create_exception!(
 // Shared helpers
 // =========================================================================
 
+/// One shared tokio runtime for every CortEX / RedEX handle. Opening
+/// N adapters / files used to spawn N runtimes (one per handle),
+/// each with its own worker thread pool — wasteful at memory and CPU.
+/// A single multi-threaded runtime drives every handle; construction
+/// is lazy so Python tests that never touch cortex pay nothing.
 fn make_runtime() -> PyResult<Arc<Runtime>> {
-    Runtime::new()
+    use std::sync::OnceLock;
+    static RT: OnceLock<Arc<Runtime>> = OnceLock::new();
+    // Can't use `get_or_init` with a fallible init, so do the check
+    // manually. Runtime::new() returns an io::Error that's normally
+    // surfaced to the caller on first-touch; if it fails once it'll
+    // keep failing, so caching the error (or panicking) would leave
+    // subsequent callers without a recovery path. Instead, try fresh
+    // each time the slot is empty.
+    if let Some(existing) = RT.get() {
+        return Ok(existing.clone());
+    }
+    let rt = Runtime::new()
         .map(Arc::new)
-        .map_err(|e| PyRuntimeError::new_err(format!("failed to create tokio runtime: {}", e)))
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to create tokio runtime: {}", e)))?;
+    // If another thread raced and populated the slot, reuse theirs.
+    Ok(RT.get_or_init(|| rt).clone())
 }
 
 fn parse_task_status(s: &str) -> PyResult<InnerTaskStatus> {

@@ -240,7 +240,7 @@ state reads. A mutation landing between them would be silently lost
 under the old `skip(1)` implementation. The atomic primitive returns
 the snapshot and an iterator seeded so that any divergent initial
 emission is forwarded through instead of dropped — see
-[`docs/STORAGE_AND_CORTEX.md`](../docs/STORAGE_AND_CORTEX.md).
+[`docs/STORAGE_AND_CORTEX.md`](../../docs/STORAGE_AND_CORTEX.md).
 
 ## Performance Tips
 

@@ -255,9 +255,12 @@ export class RedexFile {
     }
   }
 
-  /** Number of retained events (post-retention eviction). */
-  len(): number {
-    return this.napi.len();
+  /** Number of retained events (post-retention eviction). Returned
+   *  as `bigint` because event counts can exceed `Number.MAX_SAFE_INTEGER`
+   *  (~9 P) in theory — though in practice they'll fit in a `number`,
+   *  the lossless type is the safe surface. */
+  len(): bigint {
+    return this.napi.len() as bigint;
   }
 
   /** Open a live tail. Yields every event with `seq >= fromSeq`
@@ -268,9 +271,17 @@ export class RedexFile {
     try {
       const iter: NapiRedexTailIter = await this.napi.tail(fromSeq ?? null);
       const raw: RawWatchIter<RedexEvent> = {
+        // The napi tail emits `redex:` errors for tail-time failures
+        // (file closed mid-stream, decode failures on reopen, etc.).
+        // Without classifying here, those surface as bare `Error`s
+        // — callers doing `instanceof RedexError` miss them.
         async next() {
-          const v = await iter.next();
-          return v === null ? null : toRedexEvent(v);
+          try {
+            const v = await iter.next();
+            return v === null ? null : toRedexEvent(v);
+          } catch (e) {
+            throw classifyWithRedex(e);
+          }
         },
         close: () => iter.close(),
       };
@@ -450,22 +461,38 @@ export class TasksAdapter {
 
   /** Total count in the materialized state (ignores any filter). */
   count(): number {
-    return this.napi.count();
+    try {
+      return this.napi.count();
+    } catch (e) {
+      throw classifyError(e);
+    }
   }
 
   /** Wait for the fold task to have applied every event up through `seq`. */
   async waitForSeq(seq: bigint): Promise<void> {
-    return this.napi.waitForSeq(seq);
+    try {
+      return await this.napi.waitForSeq(seq);
+    } catch (e) {
+      throw classifyError(e);
+    }
   }
 
   /** Snapshot query over the materialized state. */
   listTasks(filter?: TaskFilter | null): Task[] {
-    return this.napi.listTasks(filter ?? null);
+    try {
+      return this.napi.listTasks(filter ?? null);
+    } catch (e) {
+      throw classifyError(e);
+    }
   }
 
   /** Capture a serialized state snapshot for {@link TasksAdapter.openFromSnapshot}. */
   snapshot(): CortexSnapshot {
-    return this.napi.snapshot();
+    try {
+      return this.napi.snapshot();
+    } catch (e) {
+      throw classifyError(e);
+    }
   }
 
   /**
@@ -606,19 +633,35 @@ export class MemoriesAdapter {
   }
 
   count(): number {
-    return this.napi.count();
+    try {
+      return this.napi.count();
+    } catch (e) {
+      throw classifyError(e);
+    }
   }
 
   async waitForSeq(seq: bigint): Promise<void> {
-    return this.napi.waitForSeq(seq);
+    try {
+      return await this.napi.waitForSeq(seq);
+    } catch (e) {
+      throw classifyError(e);
+    }
   }
 
   listMemories(filter?: MemoryFilter | null): Memory[] {
-    return this.napi.listMemories(filter ?? null);
+    try {
+      return this.napi.listMemories(filter ?? null);
+    } catch (e) {
+      throw classifyError(e);
+    }
   }
 
   snapshot(): CortexSnapshot {
-    return this.napi.snapshot();
+    try {
+      return this.napi.snapshot();
+    } catch (e) {
+      throw classifyError(e);
+    }
   }
 
   async watch(filter?: MemoryFilter | null): Promise<AsyncIterable<Memory[]>> {

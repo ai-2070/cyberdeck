@@ -619,9 +619,99 @@ class NetMesh:
     * Block until clear — `send_blocking(stream, payloads)`.
     """
 
-    # Constructor + lifecycle — the mesh surface has many methods; the
-    # shapes below cover the common path. Full reference in the README.
+    def __init__(
+        self,
+        bind_addr: str,
+        psk: str,
+        heartbeat_interval_ms: Optional[int] = None,
+        session_timeout_ms: Optional[int] = None,
+        num_shards: Optional[int] = None,
+    ) -> None: ...
 
+    @property
+    def public_key(self) -> str:
+        """Hex-encoded 32-byte Noise static public key."""
+        ...
+    @property
+    def node_id(self) -> int:
+        """u64 node identifier derived from the keypair."""
+        ...
+
+    def connect(
+        self,
+        peer_addr: str,
+        peer_public_key: str,
+        peer_node_id: int,
+    ) -> None:
+        """Connect to a peer (initiator). Blocks until handshake
+        completes or the timeout elapses."""
+        ...
+    def accept(self, peer_node_id: int) -> str:
+        """Accept an incoming connection (responder). Returns the
+        peer's wire address."""
+        ...
+    def start(self) -> None:
+        """Start the receive loop, heartbeats, and router."""
+        ...
+
+    def push_to(self, peer_addr: str, json: str) -> bool:
+        """Send a raw JSON payload to a direct peer address."""
+        ...
+    def poll(self, limit: int) -> List[StoredEvent]:
+        """Drain up to `limit` events from shard 0."""
+        ...
+
+    def add_route(self, dest_node_id: int, next_hop_addr: str) -> None:
+        """Add a routing table entry."""
+        ...
+    def peer_count(self) -> int: ...
+    def discovered_nodes(self) -> int: ...
+
+    def open_stream(
+        self,
+        peer_node_id: int,
+        stream_id: int,
+        reliability: Optional[str] = None,
+        window_bytes: int = 65536,
+        fairness_weight: int = 1,
+    ) -> "NetStream":
+        """Open (or look up) a stream to a connected peer. Repeated
+        calls for the same `(peer_node_id, stream_id)` are idempotent;
+        first-open wins."""
+        ...
+    def close_stream(self, peer_node_id: int, stream_id: int) -> None:
+        """Close a stream. Idempotent."""
+        ...
+    def send_on_stream(self, stream: "NetStream", events: List[bytes]) -> None:
+        """Send a batch of events on a stream. Raises
+        `BackpressureError` if the window is full, `NotConnectedError`
+        if the peer session is gone."""
+        ...
+    def send_with_retry(
+        self,
+        stream: "NetStream",
+        events: List[bytes],
+        max_retries: int = 8,
+    ) -> None:
+        """Retry `BackpressureError` with 5–200 ms exponential backoff
+        up to `max_retries` times. Transport errors propagate."""
+        ...
+    def send_blocking(self, stream: "NetStream", events: List[bytes]) -> None:
+        """Retry until the send succeeds or the ~13-minute upper bound
+        is hit. Releases the GIL while waiting."""
+        ...
+    def stream_stats(
+        self, peer_node_id: int, stream_id: int
+    ) -> Optional["NetStreamStats"]:
+        """Per-stream stats snapshot; `None` if the stream isn't open."""
+        ...
+
+    def shutdown(self) -> None:
+        """Graceful shutdown. Idempotent."""
+        ...
+
+    def __enter__(self) -> "NetMesh": ...
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> bool: ...
     def __repr__(self) -> str: ...
 
     def register_channel(

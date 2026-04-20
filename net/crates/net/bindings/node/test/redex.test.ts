@@ -8,11 +8,11 @@ describe('Redex.openFile', () => {
   it('returns a handle, appends, reads back via readRange', () => {
     const redex = new Redex();
     const file = redex.openFile('test/basic');
-    expect(file.len()).toBe(0);
+    expect(file.len()).toBe(0n);
 
     const seq = file.append(Buffer.from('hello'));
     expect(seq).toBe(0n);
-    expect(file.len()).toBe(1);
+    expect(file.len()).toBe(1n);
 
     const events = file.readRange(0n, 10n);
     expect(events).toHaveLength(1);
@@ -30,7 +30,7 @@ describe('Redex.openFile', () => {
       Buffer.from('c'),
     ]);
     expect(first).toBe(0n);
-    expect(file.len()).toBe(3);
+    expect(file.len()).toBe(3n);
 
     const events = file.readRange(0n, 5n);
     expect(events.map((e) => Buffer.from(e.payload).toString())).toEqual([
@@ -46,7 +46,7 @@ describe('Redex.openFile', () => {
     a.append(Buffer.from('from-a'));
 
     const b = redex.openFile('test/shared');
-    expect(b.len()).toBe(1);
+    expect(b.len()).toBe(1n);
     const [event] = b.readRange(0n, 1n);
     expect(Buffer.from(event.payload).toString()).toBe('from-a');
   });
