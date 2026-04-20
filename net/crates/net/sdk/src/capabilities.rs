@@ -27,13 +27,13 @@
 //!
 //! # Cross-node (direct-peer, one-hop)
 //!
-//! With `--features "net capabilities"`, `Mesh` has
+//! With `--features net`, `Mesh` has
 //! [`announce_capabilities`](crate::mesh::Mesh::announce_capabilities)
 //! and [`find_peers`](crate::mesh::Mesh::find_peers). Announce-side
 //! self-indexes, so a single-node test is round-trippable:
 //!
 //! ```
-//! # #[cfg(all(feature = "net", feature = "capabilities"))]
+//! # #[cfg(feature = "net")]
 //! # async fn doc() -> net_sdk::error::Result<()> {
 //! use net_sdk::capabilities::{CapabilityFilter, CapabilitySet};
 //! use net_sdk::mesh::MeshBuilder;

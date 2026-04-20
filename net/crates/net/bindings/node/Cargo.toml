@@ -12,22 +12,14 @@ crate-type = ["cdylib"]
 default = ["redis"]
 redis = ["net/redis"]
 jetstream = ["net/jetstream"]
+# Core mesh transport. Bundles the identity, capabilities, and
+# subnet surfaces — they share `adapter::net`'s subprotocol dispatch
+# and are operationally inseparable (subnet enforcement reuses the
+# capability broadcast; channel auth uses all three together), so
+# separate NAPI flags would only enable combinations that don't
+# actually work end-to-end.
 net = ["net/net", "dep:hex"]
 cortex = ["net/netdb", "net/redex-disk"]
-# Identity surface — ed25519 keypair + permission tokens. The
-# underlying types live in `adapter::net::identity`, gated by the
-# core's `net` feature, so this feature depends on ours.
-identity = ["net"]
-# Capability surface — announce_capabilities + find_peers on
-# NetMesh, plus the POJO types used to describe hardware/software/
-# models/tools/tags. Sits on top of `net` because the broadcast
-# subprotocol + index live in `adapter::net::behavior`.
-capabilities = ["net"]
-# Subnet surface — `subnet` / `subnetPolicy` on `MeshOptions`, plus
-# the POJO types used to describe `SubnetId` / `SubnetRule` /
-# `SubnetPolicy`. Sits on top of `net` because enforcement lives in
-# the mesh publish + subscribe paths.
-subnets = ["net"]
 
 [dependencies]
 net = { path = "../..", default-features = false }

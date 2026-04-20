@@ -38,7 +38,7 @@ pub struct NetBuilder {
     /// Caller-owned identity. Stored here so `Net::from_builder` can
     /// plumb it into whichever adapter consumes keypairs; the
     /// event-bus itself is adapter-agnostic and doesn't use it.
-    #[cfg(feature = "identity")]
+    #[cfg(feature = "net")]
     pub(crate) identity: Option<crate::identity::Identity>,
 }
 
@@ -47,7 +47,7 @@ impl NetBuilder {
         Self {
             inner: EventBusConfig::builder(),
             adapter: None,
-            #[cfg(feature = "identity")]
+            #[cfg(feature = "net")]
             identity: None,
         }
     }
@@ -59,7 +59,7 @@ impl NetBuilder {
     /// an event-bus-only node without a mesh adapter, the identity is
     /// retained but unused — it becomes load-bearing once you wire in
     /// a `NetAdapterConfig`.
-    #[cfg(feature = "identity")]
+    #[cfg(feature = "net")]
     pub fn identity(mut self, identity: crate::identity::Identity) -> Self {
         self.identity = Some(identity);
         self

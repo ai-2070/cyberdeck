@@ -43,14 +43,15 @@ pub mod mesh;
 mod net;
 pub mod stream;
 
-// Security surface — each sub-surface is independently gated so
-// consumers can pick only what they need. The `security` meta-feature
-// enables all three together.
-#[cfg(feature = "capabilities")]
+// Security surface — identity (keypairs + tokens), capabilities
+// (declare + query), and subnets (visibility partitioning). All
+// three ride the `net` feature because they share a subprotocol
+// dispatch and operate as a single unit at runtime.
+#[cfg(feature = "net")]
 pub mod capabilities;
-#[cfg(feature = "identity")]
+#[cfg(feature = "net")]
 pub mod identity;
-#[cfg(feature = "subnets")]
+#[cfg(feature = "net")]
 pub mod subnets;
 
 // Re-export the main handle.
@@ -98,11 +99,11 @@ pub use crate::mesh::{Mesh, MeshBuilder};
 // Convenience re-exports for the common security types, so users can
 // `use net_sdk::{Identity, TokenScope};` without reaching for a
 // sub-module path.
-#[cfg(feature = "capabilities")]
+#[cfg(feature = "net")]
 pub use crate::capabilities::{CapabilityFilter, CapabilitySet};
-#[cfg(feature = "identity")]
+#[cfg(feature = "net")]
 pub use crate::identity::{Identity, PermissionToken, TokenError, TokenScope};
-#[cfg(feature = "subnets")]
+#[cfg(feature = "net")]
 pub use crate::subnets::{SubnetId, SubnetPolicy};
 
 impl NetBuilder {

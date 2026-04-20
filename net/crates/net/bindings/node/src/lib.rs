@@ -2,17 +2,17 @@
 //!
 //! Provides high-performance event ingestion and consumption for Node.js/TypeScript.
 
-#[cfg(feature = "capabilities")]
+// Identity / capabilities / subnets ride the `net` feature as a
+// single security unit — they share `adapter::net`'s subprotocol
+// dispatch and operate together at runtime, so gating each module
+// separately would only enable combinations that aren't meaningful.
+#[cfg(feature = "net")]
 mod capabilities;
 mod common;
 #[cfg(feature = "cortex")]
 mod cortex;
-#[cfg(feature = "identity")]
+#[cfg(feature = "net")]
 mod identity;
-// Subnet POJOs — gated on `net` rather than `subnets` because the
-// feature-gated #[napi(object)] fields that reference SubnetIdJs /
-// SubnetPolicyJs need the types present whenever `net` brings in
-// MeshOptions. The subnets feature remains a user-facing marker.
 #[cfg(feature = "net")]
 mod subnets;
 
@@ -1623,7 +1623,6 @@ mod mesh_bindings {
         ///
         /// Multi-hop propagation is deferred — peers more than one
         /// hop away will not see the announcement.
-        #[cfg(feature = "capabilities")]
         #[napi]
         pub async fn announce_capabilities(
             &self,
@@ -1640,7 +1639,6 @@ mod mesh_bindings {
         /// Query the local capability index. Returns node ids
         /// (including our own if we self-match) whose latest
         /// announcement matches `filter`.
-        #[cfg(feature = "capabilities")]
         #[napi]
         pub fn find_peers(
             &self,

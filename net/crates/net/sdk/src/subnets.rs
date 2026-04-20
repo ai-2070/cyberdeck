@@ -22,10 +22,10 @@
 //! assert!(SubnetId::GLOBAL.is_global());
 //! ```
 //!
-//! # Binding a subnet to a mesh (`--features "net capabilities subnets"`)
+//! # Binding a subnet to a mesh (`--features net`)
 //!
 //! ```
-//! # #[cfg(all(feature = "net", feature = "capabilities", feature = "subnets"))]
+//! # #[cfg(feature = "net")]
 //! # async fn doc() -> net_sdk::error::Result<()> {
 //! use std::sync::Arc;
 //! use net_sdk::capabilities::CapabilitySet;

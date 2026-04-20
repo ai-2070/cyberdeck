@@ -57,11 +57,8 @@ pub struct MeshBuilder {
     heartbeat_interval: Duration,
     session_timeout: Duration,
     num_shards: u16,
-    #[cfg(feature = "identity")]
     identity: Option<crate::identity::Identity>,
-    #[cfg(feature = "subnets")]
     subnet: Option<net::adapter::net::SubnetId>,
-    #[cfg(feature = "subnets")]
     subnet_policy: Option<Arc<net::adapter::net::SubnetPolicy>>,
 }
 
@@ -77,12 +74,9 @@ impl MeshBuilder {
             heartbeat_interval: Duration::from_secs(5),
             session_timeout: Duration::from_secs(30),
             num_shards: 4,
-            #[cfg(feature = "identity")]
-            identity: None,
-            #[cfg(feature = "subnets")]
-            subnet: None,
-            #[cfg(feature = "subnets")]
-            subnet_policy: None,
+                    identity: None,
+                    subnet: None,
+                    subnet_policy: None,
         })
     }
 
@@ -97,7 +91,6 @@ impl MeshBuilder {
     /// also bound to this mesh; tokens installed via
     /// [`Identity::install_token`](crate::identity::Identity::install_token)
     /// become available to the channel auth path at subscribe time.
-    #[cfg(feature = "identity")]
     pub fn identity(mut self, identity: crate::identity::Identity) -> Self {
         self.identity = Some(identity);
         self
@@ -125,7 +118,6 @@ impl MeshBuilder {
     /// [`SubnetId::GLOBAL`](crate::subnets::SubnetId) — no
     /// restriction. Visibility checks on the publish + subscribe
     /// paths compare against this value.
-    #[cfg(feature = "subnets")]
     pub fn subnet(mut self, id: net::adapter::net::SubnetId) -> Self {
         self.subnet = Some(id);
         self
@@ -139,7 +131,6 @@ impl MeshBuilder {
     /// Accepts either an owned `SubnetPolicy` or an `Arc<SubnetPolicy>`
     /// via blanket `Into` support — useful when several builders
     /// share one policy at node construction time.
-    #[cfg(feature = "subnets")]
     pub fn subnet_policy(
         mut self,
         policy: impl Into<Arc<net::adapter::net::SubnetPolicy>>,
@@ -153,28 +144,21 @@ impl MeshBuilder {
         // Use the caller's identity if one was set, otherwise mint an
         // ephemeral one. `MeshNode::new` takes the keypair by value,
         // so clone it out of the Arc when we have a shared identity.
-        #[cfg(feature = "identity")]
         let (keypair, sdk_identity) = match self.identity {
             Some(id) => (id.keypair().as_ref().clone(), Some(id)),
             None => (EntityKeypair::generate(), None),
         };
-        #[cfg(not(feature = "identity"))]
-        let keypair = EntityKeypair::generate();
 
-        #[allow(unused_mut)]
         let mut config = MeshNodeConfig::new(self.bind_addr, self.psk)
             .with_heartbeat_interval(self.heartbeat_interval)
             .with_session_timeout(self.session_timeout)
             .with_num_shards(self.num_shards)
             .with_handshake(3, Duration::from_secs(5));
-        #[cfg(feature = "subnets")]
-        {
-            if let Some(id) = self.subnet {
-                config = config.with_subnet(id);
-            }
-            if let Some(policy) = self.subnet_policy {
-                config = config.with_subnet_policy(policy);
-            }
+        if let Some(id) = self.subnet {
+            config = config.with_subnet(id);
+        }
+        if let Some(policy) = self.subnet_policy {
+            config = config.with_subnet_policy(policy);
         }
 
         let mut node = MeshNode::new(keypair, config).await?;
@@ -186,7 +170,6 @@ impl MeshBuilder {
         Ok(Mesh {
             node,
             channel_configs,
-            #[cfg(feature = "identity")]
             identity: sdk_identity,
         })
     }
@@ -207,7 +190,6 @@ pub struct Mesh {
     /// announcement state) stays alive for the mesh's lifetime —
     /// `MeshNode` was already handed a clone of the keypair, so this
     /// is purely for the auxiliary state that rides alongside.
-    #[cfg(feature = "identity")]
     identity: Option<crate::identity::Identity>,
 }
 
@@ -556,7 +538,6 @@ impl Mesh {
     ///
     /// Default TTL is 5 minutes; use
     /// [`Self::announce_capabilities_with`] to override.
-    #[cfg(feature = "capabilities")]
     pub async fn announce_capabilities(
         &self,
         caps: crate::capabilities::CapabilitySet,
@@ -569,7 +550,6 @@ impl Mesh {
     /// `sign = true` is accepted but currently a no-op; signatures
     /// tie in with Stage E (channel auth), once `node_id` →
     /// `EntityId` binding is wired.
-    #[cfg(feature = "capabilities")]
     pub async fn announce_capabilities_with(
         &self,
         caps: crate::capabilities::CapabilitySet,
@@ -583,7 +563,6 @@ impl Mesh {
     /// Query the capability index. Returns node ids whose latest
     /// announcement matches `filter`; includes our own `node_id` if
     /// our own announcement matches.
-    #[cfg(feature = "capabilities")]
     pub fn find_peers(
         &self,
         filter: &crate::capabilities::CapabilityFilter,
@@ -593,7 +572,6 @@ impl Mesh {
 
     /// Rank peers for a scored placement requirement. Returns the
     /// single best-scoring node's id, or `None` if no peer matches.
-    #[cfg(feature = "capabilities")]
     pub fn rank_peers(
         &self,
         req: &crate::capabilities::CapabilityRequirement,
@@ -622,7 +600,6 @@ impl Mesh {
     /// Caller-owned identity bound to this mesh, if any. Returns
     /// `None` for meshes built without `.identity(...)` (ephemeral
     /// keypair).
-    #[cfg(feature = "identity")]
     pub fn identity(&self) -> Option<&crate::identity::Identity> {
         self.identity.as_ref()
     }

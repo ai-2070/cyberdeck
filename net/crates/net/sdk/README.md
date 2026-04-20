@@ -160,8 +160,12 @@ for the design.
 
 ## Security (identity, tokens, capabilities, subnets)
 
-Behind the `security` feature (bundles `identity` + `capabilities` +
-`subnets`, all additive on top of `net`):
+Identity, capabilities, and subnets ride the `net` feature as a
+single security unit — they share the mesh's subprotocol dispatch
+and operate together at runtime (subnet enforcement reuses the
+capability broadcast; channel auth threads identity + capabilities
++ subnets together), so `--features net` gives you the whole
+surface:
 
 ```rust
 use std::time::Duration;
@@ -207,8 +211,8 @@ let _mesh = MeshBuilder::new("127.0.0.1:9001", &[0x42u8; 32])?
   + verification + install + lookup.
 - `MeshBuilder::identity(...)` pins the keypair used by the mesh's
   Noise handshake so `node_id()` is stable.
-- **Capability announcements — cross-node (direct-peer).** Behind
-  the `capabilities` feature. See the subsection below.
+- **Capability announcements — cross-node (direct-peer).** See the
+  subsection below.
 - Re-exports of `SubnetId` / `SubnetPolicy` / `SubnetRule` (builder
   hook + gateway wiring land next).
 

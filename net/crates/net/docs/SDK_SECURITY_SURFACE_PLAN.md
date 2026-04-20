@@ -414,6 +414,20 @@ findPeers(filter: CapabilityFilter): Array<{ nodeId: bigint; score: number }>;
 
 ## Stage D — Subnets across Rust + TS
 
+> **Expanded in [`SUBNET_ENFORCEMENT_PLAN.md`](SUBNET_ENFORCEMENT_PLAN.md).**
+> Same iceberg shape as Stage C: `SubnetId` / `SubnetPolicy` /
+> `SubnetGateway` types exist in core, but `ChannelConfig.visibility`
+> was never enforced anywhere; `MeshNode` had no subnet fields; and
+> peers had no discoverable subnet membership. That plan covers
+> peer-subnet derivation via the Stage-C capability dispatch, the
+> `subnet_visible` helper + publish fan-out filter + subscribe gate,
+> SDK / NAPI / TS surfaces, and three-node integration tests. The
+> original plan's example A=[3,7,2] / B=[3,7,3] / C=[3,8,1] conflated
+> "SubnetLocal at level N" with the actual enum semantics; the
+> expanded plan uses strict-same-subnet for `SubnetLocal` and keeps
+> the ancestor relation for `ParentVisible`. ~1.5× the original
+> estimate.
+
 ### NAPI — extend `bindings/node/src/mesh.rs`
 
 ```rust
