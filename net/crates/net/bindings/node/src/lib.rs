@@ -1090,7 +1090,9 @@ mod mesh_bindings {
     fn bigint_u64_lossless(b: BigInt) -> Result<u64> {
         let (signed, value, lossless) = b.get_u64();
         if signed {
-            return Err(Error::from_reason("expected non-negative BigInt".to_string()));
+            return Err(Error::from_reason(
+                "expected non-negative BigInt".to_string(),
+            ));
         }
         if !lossless {
             return Err(Error::from_reason("BigInt exceeds u64 range".to_string()));
@@ -1200,8 +1202,7 @@ mod mesh_bindings {
 
             // Install a shared ChannelConfigRegistry so `register_channel`
             // can insert without needing `&mut NetMesh`.
-            let channel_configs =
-                Arc::new(net::adapter::net::ChannelConfigRegistry::new());
+            let channel_configs = Arc::new(net::adapter::net::ChannelConfigRegistry::new());
             node.set_channel_configs(channel_configs.clone());
 
             Ok(NetMesh {

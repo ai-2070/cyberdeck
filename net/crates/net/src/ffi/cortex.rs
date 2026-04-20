@@ -464,9 +464,10 @@ pub extern "C" fn net_tasks_adapter_open(
     // needs a live reactor; run under our runtime.
     let rt = runtime();
     let redex_inner = redex.inner.clone();
-    let result = rt.block_on(async move {
-        InnerTasksAdapter::open_with_config(&redex_inner, origin_hash, cfg)
-    });
+    let result =
+        rt.block_on(
+            async move { InnerTasksAdapter::open_with_config(&redex_inner, origin_hash, cfg) },
+        );
     match result {
         Ok(adapter) => {
             let handle = Box::new(TasksAdapterHandle {
@@ -1032,10 +1033,13 @@ pub extern "C" fn net_memories_store(
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
-    match mem
-        .inner
-        .store(input.id, input.content, input.tags, input.source, input.now_ns)
-    {
+    match mem.inner.store(
+        input.id,
+        input.content,
+        input.tags,
+        input.source,
+        input.now_ns,
+    ) {
         Ok(seq) => {
             unsafe {
                 *out_seq = seq;
@@ -1282,10 +1286,7 @@ fn build_memories_list_filter(filter_json: *const c_char) -> Result<MemoriesFilt
     out.created_before_ns = f.created_before_ns;
     out.updated_after_ns = f.updated_after_ns;
     out.updated_before_ns = f.updated_before_ns;
-    out.order_by = f
-        .order_by
-        .as_deref()
-        .and_then(parse_memories_order_by);
+    out.order_by = f.order_by.as_deref().and_then(parse_memories_order_by);
     out.limit = f.limit.map(|l| l as usize);
     Ok(out)
 }
