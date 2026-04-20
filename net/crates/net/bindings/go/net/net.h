@@ -36,7 +36,16 @@ typedef enum {
     NET_ERR_CORTEX_CLOSED = -100,
     NET_ERR_CORTEX_FOLD = -101,
     NET_ERR_NETDB = -102,
-    NET_ERR_REDEX = -103
+    NET_ERR_REDEX = -103,
+    /* Mesh / channel surface (compiled when the Rust cdylib has the
+     * `net` feature on). */
+    NET_ERR_MESH_INIT = -110,
+    NET_ERR_MESH_HANDSHAKE = -111,
+    NET_ERR_MESH_BACKPRESSURE = -112,
+    NET_ERR_MESH_NOT_CONNECTED = -113,
+    NET_ERR_MESH_TRANSPORT = -114,
+    NET_ERR_CHANNEL = -115,
+    NET_ERR_CHANNEL_AUTH = -116
 } net_error_t;
 
 /* Watch / tail cursor status codes. Returned from net_*_next functions
@@ -285,6 +294,135 @@ int  net_memories_snapshot_and_watch(net_memories_adapter_t* handle,
 int  net_memories_watch_next(net_memories_watch_t* cursor, uint32_t timeout_ms,
                              char** out_json, size_t* out_len);
 void net_memories_watch_free(net_memories_watch_t* cursor);
+
+/* =========================================================================
+ * Mesh transport (`net` feature).
+ *
+ * Encrypted UDP mesh: handshake, per-peer streams, channels (named
+ * pub/sub), shard receive. Mirrors the Rust SDK's `Mesh` type; not
+ * full parity with the core `MeshNode`.
+ *
+ * Strings returned via `char**` are heap-allocated and must be freed
+ * with `net_free_string`.
+ * ========================================================================= */
+
+typedef struct net_meshnode_s    net_meshnode_t;
+typedef struct net_mesh_stream_s net_mesh_stream_t;
+
+/* ---- Lifecycle ---- */
+
+/* Open a mesh node. `config_json`:
+ *   { "bind_addr": "127.0.0.1:9000",
+ *     "psk_hex":   "<64 hex chars>",
+ *     "heartbeat_ms":        5000,      // optional
+ *     "session_timeout_ms":  30000,     // optional
+ *     "num_shards":          4 }        // optional
+ */
+int      net_mesh_new(const char* config_json, net_meshnode_t** out);
+void     net_mesh_free(net_meshnode_t* handle);
+int      net_mesh_shutdown(net_meshnode_t* handle);
+
+/* ---- Identity + handshake ---- */
+
+int      net_mesh_public_key_hex(net_meshnode_t* handle,
+                                 char** out_hex, size_t* out_len);
+uint64_t net_mesh_node_id(net_meshnode_t* handle);
+
+int      net_mesh_connect(net_meshnode_t* handle,
+                          const char* peer_addr,
+                          const char* peer_pubkey_hex,
+                          uint64_t peer_node_id);
+int      net_mesh_accept(net_meshnode_t* handle,
+                         uint64_t peer_node_id,
+                         char** out_addr, size_t* out_len);
+int      net_mesh_start(net_meshnode_t* handle);
+
+/* ---- Per-peer streams ---- */
+
+/* `config_json`:
+ *   { "reliability": "reliable" | "fire_and_forget",
+ *     "window_bytes":    65536,
+ *     "fairness_weight": 1 }
+ * May be NULL for defaults.
+ */
+int      net_mesh_open_stream(net_meshnode_t* handle,
+                              uint64_t peer_node_id,
+                              uint64_t stream_id,
+                              const char* config_json,
+                              net_mesh_stream_t** out_stream);
+void     net_mesh_stream_free(net_mesh_stream_t* handle);
+
+/* Send a batch of payloads on an open stream.
+ *
+ * `payloads` is a pointer to an array of `count` byte-pointers;
+ * `lens` is the parallel array of lengths. Borrowed for the call
+ * duration only — caller owns the memory. Pass `node_handle` so the
+ * FFI can reach the owning runtime without creating a global index.
+ *
+ * Returns `NET_ERR_MESH_BACKPRESSURE` when the window is full,
+ * `NET_ERR_MESH_NOT_CONNECTED` when the peer is gone,
+ * `NET_ERR_MESH_TRANSPORT` for other I/O errors.
+ */
+int      net_mesh_send(net_mesh_stream_t* stream,
+                       const uint8_t* const* payloads,
+                       const size_t* lens,
+                       size_t count,
+                       net_meshnode_t* node_handle);
+int      net_mesh_send_with_retry(net_mesh_stream_t* stream,
+                                  const uint8_t* const* payloads,
+                                  const size_t* lens,
+                                  size_t count,
+                                  uint32_t max_retries,
+                                  net_meshnode_t* node_handle);
+int      net_mesh_send_blocking(net_mesh_stream_t* stream,
+                                const uint8_t* const* payloads,
+                                const size_t* lens,
+                                size_t count,
+                                net_meshnode_t* node_handle);
+
+/* Stream stats — JSON shape mirrors `StreamStats`. Writes `null` to
+ * *out_json when the stream isn't open. */
+int      net_mesh_stream_stats(net_meshnode_t* handle,
+                               uint64_t peer_node_id,
+                               uint64_t stream_id,
+                               char** out_json, size_t* out_len);
+
+/* ---- Shard receive ----
+ *
+ * Drain up to `limit` events from shard `shard_id`. Output is a JSON
+ * array of {id, payload_b64, insertion_ts, shard_id}.
+ */
+int      net_mesh_recv_shard(net_meshnode_t* handle,
+                             uint16_t shard_id, uint32_t limit,
+                             char** out_json, size_t* out_len);
+
+/* ---- Channels ----
+ *
+ * `config_json`:
+ *   { "name": "sensors/temp",
+ *     "visibility": "global" | "subnet-local" | "parent-visible" | "exported",
+ *     "reliable":      false,
+ *     "require_token": false,
+ *     "priority":      0,
+ *     "max_rate_pps":  1000 }
+ */
+int      net_mesh_register_channel(net_meshnode_t* handle, const char* config_json);
+int      net_mesh_subscribe_channel(net_meshnode_t* handle,
+                                    uint64_t publisher_node_id,
+                                    const char* channel);
+int      net_mesh_unsubscribe_channel(net_meshnode_t* handle,
+                                      uint64_t publisher_node_id,
+                                      const char* channel);
+/* Publish one payload to every subscriber. `config_json`:
+ *   { "reliability": "reliable" | "fire_and_forget",
+ *     "on_failure":  "best_effort" | "fail_fast" | "collect",
+ *     "max_inflight": 32 }
+ * May be NULL. Writes a JSON `PublishReport` to `*out_json`. */
+int      net_mesh_publish(net_meshnode_t* handle,
+                          const char* channel,
+                          const uint8_t* payload, size_t len,
+                          const char* config_json,
+                          char** out_json, size_t* out_len);
 
 #ifdef __cplusplus
 }

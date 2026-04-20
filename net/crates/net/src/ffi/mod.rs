@@ -69,6 +69,12 @@ use crate::event::{Event, RawEvent};
 #[cfg(all(feature = "netdb", feature = "redex-disk"))]
 pub mod cortex;
 
+/// C FFI for the encrypted-UDP mesh transport + channels. Requires
+/// the `net` feature (which brings in the crypto + transport). Go /
+/// cgo consumers target this surface alongside `ffi::cortex`.
+#[cfg(feature = "net")]
+pub mod mesh;
+
 #[cfg(feature = "net")]
 use crate::adapter::net::{NetAdapterConfig, ReliabilityConfig, StaticKeypair};
 #[cfg(any(feature = "redis", feature = "jetstream", feature = "net"))]

@@ -138,38 +138,6 @@ function toStreamError(e: unknown): never {
   throw e;
 }
 
-/**
- * Convert a `bigint` to a `number` with an explicit safe-integer range
- * check. The napi layer accepts `i64`, but JS `number` is IEEE-754
- * double precision — any value outside `Number.MAX_SAFE_INTEGER` loses
- * precision silently. We'd rather fail loudly than corrupt a node or
- * stream id on the way into the binding.
- */
-function toSafeNumber(label: string, value: bigint): number {
-  if (value < 0n) {
-    throw new RangeError(`${label} must be non-negative; got ${value}`);
-  }
-  if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
-    throw new RangeError(
-      `${label} ${value} exceeds Number.MAX_SAFE_INTEGER — JS has no lossless u64`,
-    );
-  }
-  return Number(value);
-}
-
-/**
- * Convert a `number` coming back from the napi layer to a `bigint`
- * after a safe-integer range check. Mirror of {@link toSafeNumber}.
- */
-function fromSafeNumber(label: string, value: number): bigint {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new RangeError(
-      `${label} ${value} is outside the JS safe integer range (${Number.MAX_SAFE_INTEGER})`,
-    );
-  }
-  return BigInt(value);
-}
-
 /** Options for {@link MeshNode.create}. */
 export interface MeshNodeConfig {
   /** Local bind address (e.g. `"127.0.0.1:9000"`). */
@@ -226,22 +194,22 @@ export class MeshNode {
 
   /** This node's id. */
   nodeId(): bigint {
-    return fromSafeNumber('nodeId', this.native.nodeId());
+    return this.native.nodeId();
   }
 
   /** Connect to a peer as initiator. */
   async connect(peerAddr: string, peerPublicKey: string, peerNodeId: bigint): Promise<void> {
-    await this.native.connect(peerAddr, peerPublicKey, toSafeNumber('peerNodeId', peerNodeId));
+    await this.native.connect(peerAddr, peerPublicKey, peerNodeId);
   }
 
   /** Accept an incoming connection as responder. Returns the peer's wire address. */
   async accept(peerNodeId: bigint): Promise<string> {
-    return await this.native.accept(toSafeNumber('peerNodeId', peerNodeId));
+    return await this.native.accept(peerNodeId);
   }
 
   /** Start the receive loop / heartbeats / router. */
-  start(): void {
-    this.native.start();
+  async start(): Promise<void> {
+    await this.native.start();
   }
 
   /** Number of connected peers. */
@@ -257,8 +225,8 @@ export class MeshNode {
    * open wins and later differing configs are logged and ignored.
    */
   openStream(peerNodeId: bigint, config: StreamConfig): MeshStream {
-    const native = this.native.openStream(toSafeNumber('peerNodeId', peerNodeId), {
-      streamId: toSafeNumber('streamId', config.streamId),
+    const native = this.native.openStream(peerNodeId, {
+      streamId: config.streamId,
       reliability: config.reliability,
       windowBytes: config.windowBytes,
       fairnessWeight: config.fairnessWeight,
@@ -272,10 +240,7 @@ export class MeshNode {
 
   /** Close a stream. Idempotent. */
   closeStream(peerNodeId: bigint, streamId: bigint): void {
-    this.native.closeStream(
-      toSafeNumber('peerNodeId', peerNodeId),
-      toSafeNumber('streamId', streamId),
-    );
+    this.native.closeStream(peerNodeId, streamId);
   }
 
   /**
@@ -333,10 +298,7 @@ export class MeshNode {
 
   /** Snapshot per-stream stats. `null` if the peer or stream isn't open. */
   streamStats(peerNodeId: bigint, streamId: bigint): StreamStats | null {
-    const raw = this.native.streamStats(
-      toSafeNumber('peerNodeId', peerNodeId),
-      toSafeNumber('streamId', streamId),
-    );
+    const raw = this.native.streamStats(peerNodeId, streamId);
     if (!raw) return null;
     // The napi binding marshals u64 fields as `BigInt` so values that
     // exceed `Number.MAX_SAFE_INTEGER` — especially `lastActivityNs`,

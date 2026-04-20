@@ -2,6 +2,7 @@
 //!
 //! Provides high-performance event ingestion and consumption for Node.js/TypeScript.
 
+mod common;
 #[cfg(feature = "cortex")]
 mod cortex;
 
@@ -814,8 +815,9 @@ mod mesh_bindings {
     #[napi(object)]
     pub struct StreamOptions {
         /// Caller-chosen `u64` stream id. Stream IDs are opaque; no
-        /// range has transport-level meaning.
-        pub stream_id: i64,
+        /// range has transport-level meaning. Crosses the boundary
+        /// as `BigInt` so full u64 precision is preserved.
+        pub stream_id: BigInt,
         /// `"fire_and_forget"` | `"reliable"`. Default: `"fire_and_forget"`.
         pub reliability: Option<String>,
         /// Initial send-credit window in bytes. Defaults to
@@ -840,23 +842,13 @@ mod mesh_bindings {
     impl NetStream {
         /// The peer this stream terminates at.
         #[napi(getter)]
-        pub fn peer_node_id(&self) -> Result<i64> {
-            i64::try_from(self.peer_node_id).map_err(|_| {
-                Error::from_reason(format!(
-                    "peer_node_id {} exceeds i64::MAX; JS has no lossless u64",
-                    self.peer_node_id
-                ))
-            })
+        pub fn peer_node_id(&self) -> BigInt {
+            BigInt::from(self.peer_node_id)
         }
         /// The caller-chosen stream id.
         #[napi(getter)]
-        pub fn stream_id(&self) -> Result<i64> {
-            i64::try_from(self.stream_id).map_err(|_| {
-                Error::from_reason(format!(
-                    "stream_id {} exceeds i64::MAX; JS has no lossless u64",
-                    self.stream_id
-                ))
-            })
+        pub fn stream_id(&self) -> BigInt {
+            BigInt::from(self.stream_id)
         }
     }
 
@@ -1087,18 +1079,7 @@ mod mesh_bindings {
         }
     }
 
-    fn bigint_u64_lossless(b: BigInt) -> Result<u64> {
-        let (signed, value, lossless) = b.get_u64();
-        if signed {
-            return Err(Error::from_reason(
-                "expected non-negative BigInt".to_string(),
-            ));
-        }
-        if !lossless {
-            return Err(Error::from_reason("BigInt exceeds u64 range".to_string()));
-        }
-        Ok(value)
-    }
+    use crate::common::bigint_u64 as bigint_u64_lossless;
 
     /// Translate an `AdapterError` from a channel operation into a
     /// napi `Error`, tagging `"channel:"` prefixed messages so the
@@ -1219,21 +1200,14 @@ mod mesh_bindings {
             Ok(hex::encode(node.public_key()))
         }
 
-        /// Get this node's ID.
-        ///
-        /// Returned as `i64` to fit JavaScript's `number` semantics. Fails
-        /// rather than wraps when the `u64` node_id exceeds `i64::MAX`,
-        /// which would otherwise silently flip sign on the JS side.
+        /// Get this node's ID. Returned as `BigInt` so full u64
+        /// precision is preserved — keypair-derived node_ids
+        /// routinely exceed `Number.MAX_SAFE_INTEGER`.
         #[napi]
-        pub fn node_id(&self) -> Result<i64> {
+        pub fn node_id(&self) -> Result<BigInt> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            i64::try_from(node.node_id()).map_err(|_| {
-                Error::from_reason(format!(
-                    "node_id {} exceeds i64::MAX; JS has no lossless u64",
-                    node.node_id()
-                ))
-            })
+            Ok(BigInt::from(node.node_id()))
         }
 
         /// Connect to a peer (initiator side).
@@ -1242,7 +1216,7 @@ mod mesh_bindings {
             &self,
             peer_addr: String,
             peer_public_key: String,
-            peer_node_id: i64,
+            peer_node_id: BigInt,
         ) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
@@ -1258,12 +1232,7 @@ mod mesh_bindings {
             let mut pubkey = [0u8; 32];
             pubkey.copy_from_slice(&pubkey_bytes);
 
-            let peer_node_id = u64::try_from(peer_node_id).map_err(|_| {
-                Error::from_reason(format!(
-                    "peer_node_id must be non-negative; got {}",
-                    peer_node_id
-                ))
-            })?;
+            let peer_node_id = crate::common::bigint_u64(peer_node_id)?;
             node.connect(addr, &pubkey, peer_node_id)
                 .await
                 .map_err(|e| Error::from_reason(format!("connect failed: {}", e)))?;
@@ -1272,15 +1241,10 @@ mod mesh_bindings {
 
         /// Accept an incoming connection (responder side).
         #[napi]
-        pub async fn accept(&self, peer_node_id: i64) -> Result<String> {
+        pub async fn accept(&self, peer_node_id: BigInt) -> Result<String> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let peer_node_id = u64::try_from(peer_node_id).map_err(|_| {
-                Error::from_reason(format!(
-                    "peer_node_id must be non-negative; got {}",
-                    peer_node_id
-                ))
-            })?;
+            let peer_node_id = crate::common::bigint_u64(peer_node_id)?;
             let (addr, _) = node
                 .accept(peer_node_id)
                 .await
@@ -1289,8 +1253,12 @@ mod mesh_bindings {
         }
 
         /// Start the receive loop, heartbeats, and router.
+        ///
+        /// Declared `async` so napi-rs invokes it with an active
+        /// tokio runtime — `MeshNode::start()` spawns background
+        /// tasks via `tokio::spawn` and panics outside a reactor.
         #[napi]
-        pub fn start(&self) -> Result<()> {
+        pub async fn start(&self) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             node.start();
@@ -1356,18 +1324,13 @@ mod mesh_bindings {
 
         /// Add a route to a destination node.
         #[napi]
-        pub fn add_route(&self, dest_node_id: i64, next_hop_addr: String) -> Result<()> {
+        pub fn add_route(&self, dest_node_id: BigInt, next_hop_addr: String) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             let addr: std::net::SocketAddr = next_hop_addr
                 .parse()
                 .map_err(|e| Error::from_reason(format!("invalid address: {}", e)))?;
-            let dest_node_id = u64::try_from(dest_node_id).map_err(|_| {
-                Error::from_reason(format!(
-                    "dest_node_id must be non-negative; got {}",
-                    dest_node_id
-                ))
-            })?;
+            let dest_node_id = crate::common::bigint_u64(dest_node_id)?;
             node.router().add_route(dest_node_id, addr);
             Ok(())
         }
@@ -1395,21 +1358,11 @@ mod mesh_bindings {
         /// same underlying state (first-open wins; differing configs
         /// are logged and ignored).
         #[napi]
-        pub fn open_stream(&self, peer_node_id: i64, opts: StreamOptions) -> Result<NetStream> {
+        pub fn open_stream(&self, peer_node_id: BigInt, opts: StreamOptions) -> Result<NetStream> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let peer_u64 = u64::try_from(peer_node_id).map_err(|_| {
-                Error::from_reason(format!(
-                    "peer_node_id must be non-negative; got {}",
-                    peer_node_id
-                ))
-            })?;
-            let stream_u64 = u64::try_from(opts.stream_id).map_err(|_| {
-                Error::from_reason(format!(
-                    "stream_id must be non-negative; got {}",
-                    opts.stream_id
-                ))
-            })?;
+            let peer_u64 = crate::common::bigint_u64(peer_node_id)?;
+            let stream_u64 = crate::common::bigint_u64(opts.stream_id.clone())?;
             let config = stream_config_from_opts(&opts)?;
             let core = node
                 .open_stream(peer_u64, stream_u64, config)
@@ -1423,18 +1376,11 @@ mod mesh_bindings {
 
         /// Close a stream. Idempotent.
         #[napi]
-        pub fn close_stream(&self, peer_node_id: i64, stream_id: i64) -> Result<()> {
+        pub fn close_stream(&self, peer_node_id: BigInt, stream_id: BigInt) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let peer_u64 = u64::try_from(peer_node_id).map_err(|_| {
-                Error::from_reason(format!(
-                    "peer_node_id must be non-negative; got {}",
-                    peer_node_id
-                ))
-            })?;
-            let stream_u64 = u64::try_from(stream_id).map_err(|_| {
-                Error::from_reason(format!("stream_id must be non-negative; got {}", stream_id))
-            })?;
+            let peer_u64 = crate::common::bigint_u64(peer_node_id)?;
+            let stream_u64 = crate::common::bigint_u64(stream_id)?;
             node.close_stream(peer_u64, stream_u64);
             Ok(())
         }
@@ -1505,20 +1451,13 @@ mod mesh_bindings {
         #[napi]
         pub fn stream_stats(
             &self,
-            peer_node_id: i64,
-            stream_id: i64,
+            peer_node_id: BigInt,
+            stream_id: BigInt,
         ) -> Result<Option<NetStreamStats>> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let peer_u64 = u64::try_from(peer_node_id).map_err(|_| {
-                Error::from_reason(format!(
-                    "peer_node_id must be non-negative; got {}",
-                    peer_node_id
-                ))
-            })?;
-            let stream_u64 = u64::try_from(stream_id).map_err(|_| {
-                Error::from_reason(format!("stream_id must be non-negative; got {}", stream_id))
-            })?;
+            let peer_u64 = crate::common::bigint_u64(peer_node_id)?;
+            let stream_u64 = crate::common::bigint_u64(stream_id)?;
             Ok(node
                 .stream_stats(peer_u64, stream_u64)
                 .map(|s| NetStreamStats {

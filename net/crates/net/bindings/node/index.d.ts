@@ -248,25 +248,29 @@ export declare class NetMesh {
   /** Get this node's Noise public key (hex-encoded). */
   publicKey(): string
   /**
-   * Get this node's ID.
-   *
-   * Returned as `i64` to fit JavaScript's `number` semantics. Fails
-   * rather than wraps when the `u64` node_id exceeds `i64::MAX`,
-   * which would otherwise silently flip sign on the JS side.
+   * Get this node's ID. Returned as `BigInt` so full u64
+   * precision is preserved — keypair-derived node_ids
+   * routinely exceed `Number.MAX_SAFE_INTEGER`.
    */
-  nodeId(): number
+  nodeId(): bigint
   /** Connect to a peer (initiator side). */
-  connect(peerAddr: string, peerPublicKey: string, peerNodeId: number): Promise<void>
+  connect(peerAddr: string, peerPublicKey: string, peerNodeId: bigint): Promise<void>
   /** Accept an incoming connection (responder side). */
-  accept(peerNodeId: number): Promise<string>
-  /** Start the receive loop, heartbeats, and router. */
-  start(): void
+  accept(peerNodeId: bigint): Promise<string>
+  /**
+   * Start the receive loop, heartbeats, and router.
+   *
+   * Declared `async` so napi-rs invokes it with an active
+   * tokio runtime — `MeshNode::start()` spawns background
+   * tasks via `tokio::spawn` and panics outside a reactor.
+   */
+  start(): Promise<void>
   /** Send raw bytes to a direct peer. */
   pushTo(peerAddr: string, data: Buffer): Promise<boolean>
   /** Poll for received events. */
   poll(limit: number): Promise<Array<StoredEvent>>
   /** Add a route to a destination node. */
-  addRoute(destNodeId: number, nextHopAddr: string): void
+  addRoute(destNodeId: bigint, nextHopAddr: string): void
   /** Number of connected peers. */
   peerCount(): number
   /** Number of nodes discovered via pingwave. */
@@ -277,9 +281,9 @@ export declare class NetMesh {
    * same underlying state (first-open wins; differing configs
    * are logged and ignored).
    */
-  openStream(peerNodeId: number, opts: StreamOptions): NetStream
+  openStream(peerNodeId: bigint, opts: StreamOptions): NetStream
   /** Close a stream. Idempotent. */
-  closeStream(peerNodeId: number, streamId: number): void
+  closeStream(peerNodeId: bigint, streamId: bigint): void
   /**
    * Send a batch of events on an explicit stream.
    *
@@ -310,7 +314,7 @@ export declare class NetMesh {
    * Snapshot of per-stream stats. Returns `null` if the peer or
    * stream isn't registered.
    */
-  streamStats(peerNodeId: number, streamId: number): NetStreamStats | null
+  streamStats(peerNodeId: bigint, streamId: bigint): NetStreamStats | null
   /**
    * Register a channel on this (publisher) node. Subscribers
    * who ask to join are validated against this config before
@@ -370,9 +374,9 @@ export declare class NetMesh {
  */
 export declare class NetStream {
   /** The peer this stream terminates at. */
-  get peerNodeId(): number
+  get peerNodeId(): bigint
   /** The caller-chosen stream id. */
-  get streamId(): number
+  get streamId(): bigint
 }
 
 /**
@@ -990,9 +994,10 @@ export interface StoredEvent {
 export interface StreamOptions {
   /**
    * Caller-chosen `u64` stream id. Stream IDs are opaque; no
-   * range has transport-level meaning.
+   * range has transport-level meaning. Crosses the boundary
+   * as `BigInt` so full u64 precision is preserved.
    */
-  streamId: number
+  streamId: bigint
   /** `"fire_and_forget"` | `"reliable"`. Default: `"fire_and_forget"`. */
   reliability?: string
   /**

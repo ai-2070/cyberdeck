@@ -67,26 +67,7 @@ pub(crate) fn redex_err(context: &str, detail: impl std::fmt::Display) -> Error 
 // Shared helpers
 // =========================================================================
 
-/// Convert a JS `BigInt` to `u64`, rejecting negatives and values that
-/// exceed `u64::MAX`. The napi `get_u64()` tuple is `(signed, value,
-/// lossless)`; silently accepting either flag corrupts ids / timestamps
-/// / sequences since none of them are meaningful as negative or
-/// truncated.
-#[inline]
-fn bigint_u64(b: BigInt) -> Result<u64> {
-    let (signed, value, lossless) = b.get_u64();
-    if signed {
-        return Err(Error::from_reason(
-            "expected non-negative BigInt".to_string(),
-        ));
-    }
-    if !lossless {
-        return Err(Error::from_reason(
-            "BigInt value exceeds u64 range".to_string(),
-        ));
-    }
-    Ok(value)
-}
+use crate::common::bigint_u64;
 
 /// A captured CortEX adapter state snapshot, suitable for
 /// `openFromSnapshot`. Callers persist both fields together.

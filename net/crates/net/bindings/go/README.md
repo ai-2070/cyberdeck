@@ -197,19 +197,129 @@ initiator.IngestRaw(`{"event": "data"}`)
 - `Flush() error` - Flush pending batches
 - `Shutdown() error` - Shutdown and free resources
 
-## Channels (distributed pub/sub)
+## Mesh transport + channels
 
-**Deferred — not yet in the Go binding.**
+Encrypted-UDP mesh handshake, per-peer streams with v2 backpressure,
+and named pub/sub channels. Requires building the Rust cdylib with
+`--features "net"` (already on when you use the combined
+`--features "netdb redex-disk net"` build described above).
 
-The Rust / TypeScript / Python SDKs expose a `register_channel` /
-`subscribe_channel` / `publish` surface backed by the mesh
-subprotocol. The Go binding lands that surface in a follow-up
-because the broader `NetMesh` transport (connect, accept, per-peer
-streams) isn't yet exposed through the C ABI — today the Go SDK
-covers the event bus + CortEX surfaces but not the mesh node.
+```go
+package main
 
-When the Go Mesh lands, `RegisterChannel`, `SubscribeChannel`, and
-`Publish` will follow the same shape as the TS / Python APIs.
+import (
+    "log"
+
+    "github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net"
+)
+
+func main() {
+    psk := "42" + strings.Repeat("42", 31)  // 64 hex chars
+
+    // Publisher.
+    pub, err := net.NewMeshNode(net.MeshConfig{
+        BindAddr: "127.0.0.1:9001",
+        PskHex:   psk,
+    })
+    if err != nil { log.Fatal(err) }
+    defer pub.Shutdown()
+
+    // Subscriber.
+    sub, err := net.NewMeshNode(net.MeshConfig{
+        BindAddr: "127.0.0.1:9000",
+        PskHex:   psk,
+    })
+    if err != nil { log.Fatal(err) }
+    defer sub.Shutdown()
+
+    // Handshake: subscriber connects to publisher.
+    pubKey, _ := pub.PublicKey()
+    go pub.Accept(sub.NodeID())
+    if err := sub.Connect("127.0.0.1:9001", pubKey, pub.NodeID()); err != nil {
+        log.Fatal(err)
+    }
+    pub.Start(); sub.Start()
+
+    // Register + subscribe + publish.
+    pub.RegisterChannel(net.ChannelConfig{
+        Name:       "sensors/temp",
+        Visibility: "global",
+        Reliable:   true,
+    })
+    if err := sub.SubscribeChannel(pub.NodeID(), "sensors/temp"); err != nil {
+        log.Fatal(err)
+    }
+    report, err := pub.Publish("sensors/temp", []byte("22.5"), net.PublishConfig{
+        Reliability: "reliable",
+        OnFailure:   "best_effort",
+    })
+    if err != nil { log.Fatal(err) }
+    log.Printf("%d/%d delivered", report.Delivered, report.Attempted)
+
+    // Subscriber drains the payload via the event bus.
+    for shard := uint16(0); shard < 4; shard++ {
+        events, _ := sub.RecvShard(shard, 16)
+        for _, e := range events {
+            log.Printf("recv: %s", e.Payload)
+        }
+    }
+}
+```
+
+### Per-peer streams with backpressure
+
+```go
+stream, err := node.OpenStream(peerID, 0x1337, net.StreamConfig{
+    Reliability: "reliable",
+    WindowBytes: 64 * 1024,
+})
+if err != nil { log.Fatal(err) }
+defer stream.Close()
+
+// Three send policies:
+// 1. Drop on pressure.
+if err := stream.Send(payloads); errors.Is(err, net.ErrBackpressure) {
+    metrics.Inc("drops")
+}
+// 2. Retry with backoff.
+stream.SendWithRetry(payloads, 8)
+// 3. Block until clear.
+stream.SendBlocking(payloads)
+
+// Live stats.
+stats, _ := node.StreamStats(peerID, 0x1337)
+log.Printf("tx_credit=%d backpressure_events=%d",
+    stats.TxCreditRemaining, stats.BackpressureEvents)
+```
+
+### Typed errors
+
+- `ErrMeshInit` — bad bind address / PSK / crypto init.
+- `ErrMeshHandshake` — `Connect` / `Accept` failed.
+- `ErrBackpressure` — stream's in-flight window is full; nothing sent.
+- `ErrNotConnected` — peer session is gone.
+- `ErrMeshTransport` — other I/O error.
+- `ErrChannel` — channel invalid name / visibility / unknown / rate limit / transport.
+- `ErrChannelAuth` — publisher rejected the subscribe as unauthorized.
+
+All are sentinels; use `errors.Is`.
+
+### Mesh API reference
+
+| Function / method | Description |
+|---|---|
+| `NewMeshNode(cfg MeshConfig)` | Open a mesh node |
+| `(*MeshNode).PublicKey() / NodeID()` | Identity |
+| `(*MeshNode).Connect / Accept / Start / Shutdown` | Handshake + lifecycle |
+| `(*MeshNode).OpenStream(peerID, streamID, cfg)` | Open a per-peer stream |
+| `(*MeshNode).StreamStats(peerID, streamID)` | Per-stream snapshot |
+| `(*MeshNode).RecvShard(shard, limit)` | Drain a shard inbox |
+| `(*MeshNode).RegisterChannel(cfg)` | Install a channel config |
+| `(*MeshNode).SubscribeChannel(pubID, name)` | Join a channel |
+| `(*MeshNode).UnsubscribeChannel(pubID, name)` | Leave a channel |
+| `(*MeshNode).Publish(name, payload, cfg)` | Fan one payload to subscribers |
+| `(*MeshStream).Send / SendWithRetry / SendBlocking` | Three send policies |
+| `(*MeshStream).Close()` | Release stream handle |
 
 ## CortEX & NetDb (event-sourced state)
 
