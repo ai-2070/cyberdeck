@@ -1,0 +1,41 @@
+net/crates/net/bindings/python/python/net/_net.pyi
+  5bf3f089eecaef7a 630-644,746-747,751-757,759-775,794-812,946-952
+net/crates/net/bindings/python/python/net/__init__.py
+  5bf3f089eecaef7a 139,154
+net/crates/net/bindings/python/src/lib.rs
+  5bf3f089eecaef7a 11-12,14-15,1041-1044,1046,1054-1057,1081-1095,1462-1463,1465,1474-1475,1496-1503,1512-1517,1521-1528,1533-1550,1626-1652,1734
+net/crates/net/bindings/python/tests/test_capabilities.py
+  5bf3f089eecaef7a 1-178
+net/crates/net/bindings/python/src/capabilities.rs
+  5bf3f089eecaef7a 1-394
+net/crates/net/bindings/python/tests/test_subnets.py
+  5bf3f089eecaef7a 1-180
+net/crates/net/bindings/python/README.md
+  5bf3f089eecaef7a 244-356
+net/crates/net/docs/SDK_SECURITY_SURFACE_PLAN.md
+  5bf3f089eecaef7a 63,548-585
+net/crates/net/bindings/python/src/subnets.rs
+  5bf3f089eecaef7a 1-105
+net/crates/net/bindings/python/tests/test_channel_auth.py
+  5bf3f089eecaef7a 1-184
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "de1a26f16c18c944ebcb0c8b75c6b05532d290be",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 5926,
+      "total_deletions": 8265,
+      "accepted_lines": 1988,
+      "overriden_lines": 0
+    }
+  }
+}
