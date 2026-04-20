@@ -290,6 +290,18 @@ alerts/temperature      → ChannelId(0x1e09)
 
 Channels decouple applications from node identity. A producer emits to `sensors/temperature`. A consumer subscribes to `sensors/temperature`. Neither knows or cares which node the other is. The mesh connects them through the channel, the proximity graph finds the shortest path, and the auth guard ensures both sides are authorized.
 
+## Security Surface
+
+Identity, capability announcements, subnet visibility, and channel authentication work as a single unit behind the `net` feature. Every binding — Rust, TypeScript, Python, Go — surfaces the same pieces with the same wire contract:
+
+- **Ed25519 identities.** `Identity` bundles a caller-owned 32-byte seed with a local `TokenCache`. `node_id` and `entity_id` are reproducible across restarts when the seed is pinned on `MeshBuilder` (or `identity_seed` / `identitySeed` on the mesh constructors for non-Rust bindings).
+- **Permission tokens.** ed25519-signed grants tying a `(subject, scope, channel, TTL)` tuple together. `TokenScope` is a bitfield of `publish | subscribe | admin | delegate`; delegation is capped per-token and the chain is verified end-to-end. Tokens cross the boundary as 159-byte opaque buffers (no hex round-trip, no JSON tax).
+- **Capability announcements.** One-hop broadcast of each node's `CapabilitySet` (hardware, software, models, tools, tags, limits). `find_peers(filter)` queries the local index in constant time; self-match returns the owning node's id. Announcements are signed and carry the sender's `entity_id`; the `node_id → entity_id` binding is pinned TOFU-style on first sight.
+- **Subnets.** A `SubnetId` is a 4-level u32; `SubnetPolicy` derives each peer's subnet from their capability tags so every node in the mesh agrees on the geometry without a central directory. `Visibility` on a channel gates publish fan-out and subscribe authorization against that geometry.
+- **Channel authentication.** `ChannelConfig` carries `publish_caps`, `subscribe_caps`, and `require_token`. Publishers check their own caps before fan-out; subscribers present a `PermissionToken` whose subject matches their entity id. Any denial surfaces as `Unauthorized` at the subscribe gate or as a `PublishReport` miss on the publish side.
+
+Full staging, wire formats, and rationale: [`docs/SDK_SECURITY_SURFACE_PLAN.md`](docs/SDK_SECURITY_SURFACE_PLAN.md). Per-binding parity details: [`docs/SDK_PYTHON_PARITY_PLAN.md`](docs/SDK_PYTHON_PARITY_PLAN.md), [`docs/SDK_GO_PARITY_PLAN.md`](docs/SDK_GO_PARITY_PLAN.md). Runnable examples in idiomatic form: [Rust](sdk/README.md#security-identity-tokens-capabilities-subnets) · [TypeScript](sdk-ts/README.md#security-identity-tokens-capabilities-subnets) · [Python](bindings/python/README.md#security-surface-stage-ae) · [Go](bindings/go/README.md#security-surface-stage-ae).
+
 ## Daemons
 
 A `MeshDaemon` is a stateful event processor — the compute unit of the mesh.
