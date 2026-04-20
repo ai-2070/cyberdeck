@@ -49,7 +49,8 @@ use super::pool::PacketBuilder;
 
 use super::behavior::broadcast::SUBPROTOCOL_CAPABILITY_ANN;
 use super::behavior::capability::{
-    CapabilityAnnouncement, CapabilityFilter, CapabilityIndex, CapabilityRequirement, CapabilitySet,
+    CapabilityAnnouncement, CapabilityFilter, CapabilityIndex, CapabilityRequirement,
+    CapabilitySet, MAX_CAPABILITY_HOPS,
 };
 use super::behavior::loadbalance::HealthStatus;
 use super::behavior::proximity::{EnhancedPingwave, ProximityConfig, ProximityGraph};
@@ -170,6 +171,11 @@ struct DispatchCtx {
     /// Capability index shared with `MeshNode`. Inbound
     /// `SUBPROTOCOL_CAPABILITY_ANN` packets are indexed here.
     capability_index: Arc<CapabilityIndex>,
+    /// Dedup cache for multi-hop capability announcements, keyed by
+    /// `(origin_node_id, version)`. Written by the dispatch handler
+    /// before indexing + forwarding so a `(origin, version)` tuple
+    /// is processed at most once per node.
+    seen_announcements: Arc<DashMap<(u64, u64), std::time::Instant>>,
     /// Whether inbound `CapabilityAnnouncement` packets without a
     /// signature are dropped. Validity is not enforced yet.
     require_signed_capabilities: bool,
@@ -262,6 +268,14 @@ pub struct MeshNodeConfig {
     /// practice means `Visibility::SubnetLocal` channels ship only
     /// when both sides are `GLOBAL`.
     pub subnet_policy: Option<Arc<SubnetPolicy>>,
+    /// Minimum time between successive
+    /// [`MeshNode::announce_capabilities`] broadcasts from this
+    /// origin. Calls within the window coalesce: the local index
+    /// and `local_announcement` are updated so self-queries + late-
+    /// joiner session-open pushes reflect the latest caps, but the
+    /// network broadcast is skipped. Rate-limits apps that
+    /// re-announce in tight loops.
+    pub min_announce_interval: Duration,
 }
 
 impl MeshNodeConfig {
@@ -288,6 +302,7 @@ impl MeshNodeConfig {
             capability_gc_interval: Duration::from_secs(60),
             subnet: SubnetId::GLOBAL,
             subnet_policy: None,
+            min_announce_interval: Duration::from_secs(10),
         }
     }
 
@@ -327,6 +342,13 @@ impl MeshNodeConfig {
     /// Set the capability-index GC sweep interval.
     pub fn with_capability_gc_interval(mut self, interval: Duration) -> Self {
         self.capability_gc_interval = interval;
+        self
+    }
+
+    /// Set the minimum interval between outbound capability-
+    /// announcement broadcasts. See [`Self::min_announce_interval`].
+    pub fn with_min_announce_interval(mut self, interval: Duration) -> Self {
+        self.min_announce_interval = interval;
         self
     }
 
@@ -454,6 +476,20 @@ pub struct MeshNode {
     /// `announce_capabilities` path. Self-index so single-node
     /// queries return us too.
     capability_index: Arc<CapabilityIndex>,
+    /// Dedup cache for multi-hop capability announcements. Keyed by
+    /// `(origin_node_id, version)` — the same discriminator
+    /// `CapabilityIndex` uses to skip stale announcements. Entries
+    /// are evicted by the capability GC loop once their
+    /// announcement's effective lifetime (2× `ttl_secs`) has
+    /// elapsed. Mirrors the `seen_pingwaves` cache in
+    /// [`ProximityGraph`].
+    seen_announcements: Arc<DashMap<(u64, u64), std::time::Instant>>,
+    /// Timestamp of the most recent outbound capability-announcement
+    /// broadcast from this origin. Compared against
+    /// `config.min_announce_interval` on every `announce_capabilities_with`
+    /// call; within-window calls coalesce to a local self-index
+    /// update without a network broadcast.
+    last_announce_at: Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
     /// Most recent `CapabilityAnnouncement` this node published.
     /// Pushed to new peers right after `accept` / `connect`
     /// completes, so late joiners pick up our caps without waiting
@@ -640,6 +676,8 @@ impl MeshNode {
             channel_configs: None,
             pending_membership_acks: Arc::new(DashMap::new()),
             capability_index: Arc::new(CapabilityIndex::new()),
+            seen_announcements: Arc::new(DashMap::new()),
+            last_announce_at: Arc::new(parking_lot::Mutex::new(None)),
             local_announcement: Arc::new(ArcSwapOption::empty()),
             capability_version: Arc::new(AtomicU64::new(0)),
             local_subnet,
@@ -843,11 +881,21 @@ impl MeshNode {
     }
 
     /// Spawn a periodic sweep that evicts expired entries from the
-    /// capability index. Interval from `config.capability_gc_interval`
-    /// (default 60 s). Exits on `shutdown_notify`.
+    /// capability index plus stale `(origin, version)` tuples from
+    /// the multi-hop dedup cache. Interval from
+    /// `config.capability_gc_interval` (default 60 s). Exits on
+    /// `shutdown_notify`.
     fn spawn_capability_gc_loop(&self) -> JoinHandle<()> {
         let index = self.capability_index.clone();
+        let seen = self.seen_announcements.clone();
         let interval = self.config.capability_gc_interval;
+        // Dedup retention = 2× the announcement's own TTL. Longer
+        // than one announcement lifetime so the re-announced bumped
+        // version isn't confused with the previous one; shorter than
+        // `index.gc` retention so the dedup set never outlives the
+        // index it guards.
+        let dedup_retention =
+            std::time::Duration::from_secs(2 * u64::from(CapabilityAnnouncement::DEFAULT_TTL_SECS));
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
 
@@ -860,6 +908,7 @@ impl MeshNode {
                 tokio::select! {
                     _ = tick.tick() => {
                         let _removed = index.gc();
+                        seen.retain(|_, instant| instant.elapsed() < dedup_retention);
                     }
                     _ = shutdown_notify.notified() => break,
                 }
@@ -903,6 +952,7 @@ impl MeshNode {
             pending_membership_acks: self.pending_membership_acks.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
             capability_index: self.capability_index.clone(),
+            seen_announcements: self.seen_announcements.clone(),
             require_signed_capabilities: self.config.require_signed_capabilities,
             local_subnet: self.local_subnet,
             local_subnet_policy: self.local_subnet_policy.clone(),
@@ -2164,12 +2214,34 @@ impl MeshNode {
             return;
         };
 
-        if ann.node_id != from_node {
+        // Direct peers may only announce their own caps. Forwarded
+        // announcements (hop_count > 0) are relayed through a peer
+        // that isn't the origin, so we skip the check in that path
+        // and rely on signature verification plus the TOFU binding
+        // to keep forgers out.
+        if ann.hop_count == 0 && ann.node_id != from_node {
             tracing::trace!(
                 from_node = format!("{:#x}", from_node),
                 ann_node = format!("{:#x}", ann.node_id),
                 "capability: node_id mismatch (peer can only announce for itself)"
             );
+            return;
+        }
+
+        // Origin self-check — if we're the origin, drop. A mesh
+        // loop could bounce our own announcement back to us; no
+        // reason to re-index or re-broadcast.
+        if ann.node_id == ctx.local_node_id {
+            return;
+        }
+
+        // Dedup on (origin, version). A `(node_id, version)` tuple
+        // is processed at most once — protects against diamond
+        // topologies where the same announcement arrives twice via
+        // different paths. Insert happens AFTER validation so a
+        // malformed announcement doesn't poison the cache.
+        let dedup_key = (ann.node_id, ann.version);
+        if ctx.seen_announcements.contains_key(&dedup_key) {
             return;
         }
 
@@ -2217,7 +2289,114 @@ impl MeshNode {
             ctx.peer_subnets.insert(from_node, subnet);
         }
 
+        // Cache BEFORE indexing (the index consumes `ann` by value,
+        // but the dedup key is already captured above). Insert at
+        // this point so a subsequent duplicate short-circuits at the
+        // `contains_key` check without re-parsing + re-verifying.
+        ctx.seen_announcements
+            .insert(dedup_key, std::time::Instant::now());
+
+        // Topology learning from multi-hop receipt. An announcement
+        // arriving with `hop_count > 0` traveled through `from_node`
+        // to reach us, so install a route to the origin with metric
+        // `hop_count + 2`. The `+2` offset matches the pingwave
+        // convention so direct routes (metric 1) always strictly
+        // beat any announcement-installed route. Routes from
+        // capability announcements compete with pingwave-installed
+        // routes via the routing table's "better metric wins" rule.
+        // Direct announcements (hop_count == 0) skip this — the
+        // session itself is already the authority for that peer.
+        if ann.hop_count > 0 {
+            if let Some(entry) = ctx.peer_addrs.get(&from_node) {
+                let sender_addr = *entry.value();
+                let metric = u16::from(ann.hop_count) + 2;
+                ctx.router
+                    .routing_table()
+                    .add_route_with_metric(ann.node_id, sender_addr, metric);
+            }
+        }
+
+        // Multi-hop forwarding: if we haven't exhausted the hop
+        // budget, increment `hop_count` and re-broadcast to every
+        // directly-connected peer except the sender and the peer we
+        // use to reach the origin (split horizon). Do this BEFORE
+        // handing `ann` to the index (which consumes by value) so
+        // the forwarder has the current view of `hop_count`.
+        if ann.hop_count < MAX_CAPABILITY_HOPS - 1 {
+            let mut forwarded = ann.clone();
+            forwarded.hop_count += 1;
+            // `to_bytes` on a clone with the bumped counter —
+            // signature remains valid because `signed_payload()`
+            // zeros `hop_count` on verify.
+            let fwd_bytes = forwarded.to_bytes();
+            Self::forward_capability_announcement(fwd_bytes, ann.node_id, from_node, ctx);
+        }
+
         ctx.capability_index.index(ann);
+    }
+
+    /// Fan an already-serialized capability announcement out to every
+    /// directly-connected peer, minus the sender and any split-
+    /// horizon-excluded peer. Spawned onto the runtime so the
+    /// synchronous dispatch handler isn't blocked on per-peer
+    /// encryption and network send. Mirrors the pingwave forwarding
+    /// loop at the top of `dispatch_packet` — same split-horizon
+    /// rule, same best-effort send semantics.
+    fn forward_capability_announcement(
+        payload: Vec<u8>,
+        origin_node_id: u64,
+        sender_node_id: u64,
+        ctx: &DispatchCtx,
+    ) {
+        let peers = ctx.peers.clone();
+        let socket = ctx.socket.clone();
+        let partition_filter = ctx.partition_filter.clone();
+        let router = ctx.router.clone();
+
+        tokio::spawn(async move {
+            // Split-horizon: consult the routing table for the
+            // origin's best next hop and skip that peer. Matches the
+            // pingwave rule so capability forwarding + pingwave
+            // forwarding contribute to the same DV loop-avoidance
+            // invariant.
+            let next_hop_addr = router.routing_table().lookup(origin_node_id);
+
+            for entry in peers.iter() {
+                let peer = entry.value();
+                if peer.node_id == sender_node_id {
+                    continue; // never send back to whoever gave it to us
+                }
+                if Some(peer.addr) == next_hop_addr {
+                    continue; // split horizon: that's our path to the origin
+                }
+                if partition_filter.contains(&peer.addr) {
+                    continue;
+                }
+
+                // Build + send a subprotocol packet through this
+                // peer's session. Same path as `send_subprotocol`;
+                // inlined because the dispatch handler has no `self`.
+                let session = &peer.session;
+                let stream_id = SUBPROTOCOL_CAPABILITY_ANN as u64;
+                let pool = session.thread_local_pool();
+                let mut builder = pool.get();
+                let seq = {
+                    let stream = session.get_or_create_stream(stream_id);
+                    stream.next_tx_seq()
+                };
+                let events = vec![Bytes::copy_from_slice(&payload)];
+                let packet = builder.build_subprotocol(
+                    stream_id,
+                    seq,
+                    &events,
+                    PacketFlags::NONE,
+                    SUBPROTOCOL_CAPABILITY_ANN,
+                );
+                let _ = socket.send_to(&packet, peer.addr).await;
+                drop(builder);
+                session.touch();
+            }
+        });
     }
 
     /// Decide whether a Subscribe from `from_node` on `channel` is allowed.
@@ -2757,12 +2936,36 @@ impl MeshNode {
             ann.sign(&self.identity);
         }
 
-        // Self-index so local queries see our own caps.
+        // Self-index so local queries see our own caps. Always runs
+        // regardless of rate limit — the self-index reflects the
+        // latest intended announcement.
         self.capability_index.index(ann.clone());
 
         // Publish as the latest local announcement so future
-        // session-opens push this version to new peers.
+        // session-opens push this version to new peers. Also always
+        // runs so late joiners get the latest caps even when we've
+        // rate-limited away the broadcast.
         self.local_announcement.store(Some(Arc::new(ann.clone())));
+
+        // Origin-side rate limit: within-window calls update the
+        // self-index + `local_announcement` but skip the network
+        // broadcast. Callers that want to force an immediate
+        // re-broadcast should lower `min_announce_interval` on
+        // `MeshNodeConfig`.
+        let now = std::time::Instant::now();
+        let min_interval = self.config.min_announce_interval;
+        let should_broadcast = {
+            let mut last = self.last_announce_at.lock();
+            let elapsed = last.map(|t| now.saturating_duration_since(t));
+            let can_send = elapsed.is_none_or(|e| e >= min_interval);
+            if can_send {
+                *last = Some(now);
+            }
+            can_send
+        };
+        if !should_broadcast {
+            return Ok(());
+        }
 
         // Fan out to currently-connected peers. Best-effort — a
         // per-peer send failure is logged and skipped rather than

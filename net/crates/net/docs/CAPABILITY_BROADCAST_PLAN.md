@@ -50,9 +50,10 @@ Stage C's own dependencies remain unchanged: it requires Stages A
 
 **Out of scope:**
 
-- Gossip across multi-hop (indirect peers learn only via direct-peer
-  forwarding, which is deferred). For the two-node exit criterion
-  direct-peer is sufficient.
+- Gossip across multi-hop — originally deferred, now **shipped**
+  via hop-count-bounded forwarding + `(origin, version)` dedup.
+  See [`MULTIHOP_CAPABILITY_PLAN.md`](MULTIHOP_CAPABILITY_PLAN.md)
+  for the design.
 - Bandwidth optimizations (delta encoding, hash-summary + fetch).
   Full-announcement push is the v1 shape; optimization lands if
   profiling shows it.
@@ -115,10 +116,13 @@ Bandwidth profile: each `announce_capabilities` call is O(N_peers)
 packets; re-announcement frequency is caller-controlled. No periodic
 heartbeat piggyback — keeps the heartbeat path unchanged.
 
-Multi-hop gossip is deferred; the plan deliberately ships
-direct-peer-only for v1. Nodes more than one hop away will not see
-the announcement. This matches how channel membership already
-behaves.
+Multi-hop gossip originally deferred to v1; **now shipped** under
+[`MULTIHOP_CAPABILITY_PLAN.md`](MULTIHOP_CAPABILITY_PLAN.md).
+Announcements fan out up to `MAX_CAPABILITY_HOPS = 16` hops with
+`(origin, version)` dedup, origin-side rate limiting, and route
+install on receipt. Signature verification holds across hops —
+`hop_count` sits outside the signed envelope so forwarders never
+touch the origin's signature.
 
 ### Receiver path
 
@@ -478,7 +482,8 @@ from `channels.test.ts`, plus TTL expiry.
 
 ## Explicit follow-ups (not in this plan)
 
-- Multi-hop capability gossip (forwarding via the routing table).
+- ~~Multi-hop capability gossip~~ — shipped in
+  [`MULTIHOP_CAPABILITY_PLAN.md`](MULTIHOP_CAPABILITY_PLAN.md).
 - Full signature verification (requires node_id → entity_id binding
   from Stage E).
 - Delta encoding / hash-summary + fetch for bandwidth reduction.

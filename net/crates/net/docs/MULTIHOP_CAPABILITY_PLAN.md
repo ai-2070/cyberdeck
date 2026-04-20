@@ -1,4 +1,9 @@
-# Multi-hop capability announcement propagation
+# Multi-hop capability announcement propagation — SHIPPED
+
+**Status.** Stages M-1 through M-7 complete. Multi-hop capability
+propagation ships with hop-count=16, TTL-based dedup, origin rate
+limiting, route install from receipt, and 5 integration tests on
+top of the existing direct-peer suite.
 
 ## Context
 

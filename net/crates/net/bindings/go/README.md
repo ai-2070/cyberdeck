@@ -513,8 +513,11 @@ gpuPeers, _ := mesh.FindPeers(net.CapabilityFilter{
 })
 ```
 
-Capability propagation is one-hop in v1; peers more than one hop
-away will not see the announcement.
+Capability propagation is multi-hop, bounded by
+`MAX_CAPABILITY_HOPS = 16` with `(origin, version)` dedup on every
+forwarder. `CapabilityGCIntervalMs` controls both the index TTL
+sweep and the dedup cache eviction. See
+[`docs/MULTIHOP_CAPABILITY_PLAN.md`](../../docs/MULTIHOP_CAPABILITY_PLAN.md).
 
 ### Subnets
 

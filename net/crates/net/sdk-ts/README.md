@@ -242,9 +242,14 @@ const gpuPeers = mesh.findPeers({
 // gpuPeers includes mesh.nodeId() on self-match.
 ```
 
-Propagation is one-hop in v1; peers more than one hop away will not
-see the announcement. `capabilityGcIntervalMs` + TTL-driven eviction
-are configurable on `MeshNode.create`.
+Propagation is multi-hop, bounded by `MAX_CAPABILITY_HOPS = 16`.
+Forwarders re-broadcast every received announcement to their other
+peers; dedup on `(origin, version)` drops duplicates at convergence
+points, and `hop_count` sits outside the signed envelope so the
+origin's signature verifies at every hop.
+`capabilityGcIntervalMs` + TTL-driven eviction are configurable on
+`MeshNode.create`. See
+[`docs/MULTIHOP_CAPABILITY_PLAN.md`](../docs/MULTIHOP_CAPABILITY_PLAN.md).
 
 ### Subnets (visibility partitioning)
 

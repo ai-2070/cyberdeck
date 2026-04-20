@@ -257,9 +257,19 @@ mesh.shutdown().await?;
 
 **Scope today:**
 
-- Direct-peer push only (on `announce_*` + session-open re-push for
-  late joiners). Peers more than one hop away will not see the
-  announcement. Multi-hop gossip is a follow-up.
+- Multi-hop fan-out bounded by `MAX_CAPABILITY_HOPS = 16`.
+  Forwarders re-broadcast every received announcement to their
+  other peers (minus the sender and any split-horizon peer),
+  bumping `hop_count` outside the signed envelope so the origin's
+  signature keeps verifying end-to-end. Dedup on
+  `(origin, version)` drops duplicates at diamond-topology
+  converge points. See
+  [`docs/MULTIHOP_CAPABILITY_PLAN.md`](../docs/MULTIHOP_CAPABILITY_PLAN.md).
+- Origin-side rate limiting: `min_announce_interval` (default 10s)
+  coalesces rapid `announce_capabilities` calls into a single
+  broadcast, preventing a busy-loop announcer from flooding the
+  mesh. Self-index + late-joiner session-open push still reflect
+  the latest caps inside the window.
 - TTL + GC eviction: per-announcement `ttl_secs` drives
   `CapabilityIndex::gc()` on a configurable tick
   (`capability_gc_interval`, default 60 s).

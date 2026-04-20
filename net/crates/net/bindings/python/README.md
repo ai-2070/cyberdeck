@@ -304,8 +304,11 @@ gpu_peers = mesh.find_peers({
 })
 ```
 
-Capability propagation is one-hop in v1; peers >1 hop away will not
-see the announcement.
+Capability propagation is multi-hop, bounded by
+`MAX_CAPABILITY_HOPS = 16` with `(origin, version)` dedup on every
+forwarder. `capability_gc_interval_ms` controls both the index TTL
+sweep and the dedup cache eviction. See
+[`docs/MULTIHOP_CAPABILITY_PLAN.md`](../../docs/MULTIHOP_CAPABILITY_PLAN.md).
 
 ### Subnets
 

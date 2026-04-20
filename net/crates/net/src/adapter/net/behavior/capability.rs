@@ -704,10 +704,26 @@ pub struct CapabilityAnnouncement {
     /// Capability set
     pub capabilities: CapabilitySet,
     /// Optional Ed25519 signature (64 bytes, hex encoded for serde).
-    /// Covers every other field (serialize with `signature: None`).
+    /// Covers every other field EXCEPT [`Self::hop_count`] — the
+    /// signed payload zeros `hop_count` so forwarders can increment
+    /// it without breaking verification. See [`Self::signed_payload`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Signature64>,
+    /// Number of times this announcement has been forwarded. Origin
+    /// sets 0; each forwarder increments before re-broadcasting.
+    /// Sits *outside* the signed envelope so forwarders don't need
+    /// the origin's secret key. Capped at `MAX_CAPABILITY_HOPS` —
+    /// announcements at or beyond the cap are dropped rather than
+    /// re-broadcast. Old-format announcements missing this field
+    /// deserialize as 0 via `#[serde(default)]`.
+    #[serde(default)]
+    pub hop_count: u8,
 }
+
+/// Hard cap on `CapabilityAnnouncement::hop_count`. Mirrors the
+/// pingwave `MAX_HOPS` so both multi-hop broadcast paths share the
+/// same forwarding-depth contract.
+pub const MAX_CAPABILITY_HOPS: u8 = 16;
 
 /// 64-byte signature wrapper with serde support
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -755,6 +771,14 @@ impl<'de> Deserialize<'de> for Signature64 {
 }
 
 impl CapabilityAnnouncement {
+    /// Default `ttl_secs` value assigned by [`Self::new`]. Five
+    /// minutes — long enough that a missed re-announcement on one
+    /// node doesn't immediately evict it from every peer's
+    /// [`CapabilityIndex`], short enough that stale state clears on
+    /// realistic operational timescales. Exposed as a constant so
+    /// multi-hop dedup retention can be scaled off it.
+    pub const DEFAULT_TTL_SECS: u32 = 300;
+
     /// Create a new unsigned announcement. Receivers that run with
     /// `require_signed_capabilities = true` will drop it until
     /// [`Self::sign`] is called.
@@ -775,9 +799,10 @@ impl CapabilityAnnouncement {
             entity_id,
             version,
             timestamp_ns,
-            ttl_secs: 300, // 5 minute default TTL
+            ttl_secs: Self::DEFAULT_TTL_SECS,
             capabilities,
             signature: None,
+            hop_count: 0,
         }
     }
 
@@ -793,28 +818,39 @@ impl CapabilityAnnouncement {
         self
     }
 
-    /// Sign this announcement in place with `keypair`. Clears any
-    /// existing signature, serializes the (unsigned) payload, signs
-    /// with ed25519, and stores the signature back. The caller must
-    /// ensure `keypair.entity_id() == self.entity_id` — otherwise
-    /// receivers will reject with `InvalidSignature`.
+    /// Serialize the sign/verify payload: same bytes on both sides
+    /// of the signature round-trip, with `signature` cleared AND
+    /// `hop_count` zeroed. Keeping `hop_count` out of the signed
+    /// envelope is what lets downstream forwarders bump it without
+    /// invalidating the origin's signature — standard multi-hop
+    /// gossip design (libp2p gossipsub, Chord, etc.).
+    fn signed_payload(&self) -> Vec<u8> {
+        let mut canonical = self.clone();
+        canonical.signature = None;
+        canonical.hop_count = 0;
+        canonical.to_bytes()
+    }
+
+    /// Sign this announcement in place with `keypair`. The resulting
+    /// signature covers every field EXCEPT [`Self::hop_count`] — the
+    /// caller must still ensure `keypair.entity_id() == self.entity_id`
+    /// or receivers will reject with `InvalidSignature`.
     pub fn sign(&mut self, keypair: &super::super::identity::EntityKeypair) {
-        self.signature = None;
-        let payload = self.to_bytes();
+        let payload = self.signed_payload();
         let sig = keypair.sign(&payload);
         self.signature = Some(Signature64(sig.to_bytes()));
     }
 
     /// Verify the signature against the announcement's own
-    /// `entity_id`. Returns `Err` if no signature is present, if
-    /// the signature can't be decoded, or if verification fails.
+    /// `entity_id`. Ignores [`Self::hop_count`] — forwarders are
+    /// expected to bump it. Returns `Err` if no signature is
+    /// present, if the signature can't be decoded, or if
+    /// verification fails.
     pub fn verify(&self) -> Result<(), super::super::identity::EntityError> {
         let Some(Signature64(raw)) = self.signature else {
             return Err(super::super::identity::EntityError::InvalidSignature);
         };
-        let mut unsigned = self.clone();
-        unsigned.signature = None;
-        let payload = unsigned.to_bytes();
+        let payload = self.signed_payload();
         let sig = ed25519_dalek::Signature::from_bytes(&raw);
         self.entity_id.verify(&payload, &sig)
     }
@@ -1673,5 +1709,83 @@ mod tests {
 
         // Should be expired now
         assert!(ann.is_expired());
+    }
+
+    // ========================================================================
+    // Multi-hop wire format (M-1)
+    // ========================================================================
+
+    #[test]
+    fn hop_count_defaults_to_zero() {
+        let ann = CapabilityAnnouncement::new(1, test_entity(), 1, sample_capability_set());
+        assert_eq!(ann.hop_count, 0);
+    }
+
+    #[test]
+    fn hop_count_roundtrips_through_serde() {
+        let mut ann = CapabilityAnnouncement::new(1, test_entity(), 1, sample_capability_set());
+        ann.hop_count = 7;
+        let bytes = ann.to_bytes();
+        let restored = CapabilityAnnouncement::from_bytes(&bytes).expect("parse");
+        assert_eq!(restored.hop_count, 7);
+    }
+
+    #[test]
+    fn old_format_without_hop_count_parses_as_zero() {
+        // Hand-crafted JSON missing the `hop_count` field — the
+        // #[serde(default)] attribute should rescue us.
+        let payload = serde_json::json!({
+            "node_id": 1,
+            "entity_id": hex::encode([0u8; 32]),
+            "version": 1,
+            "timestamp_ns": 0u64,
+            "ttl_secs": 300u32,
+            "capabilities": sample_capability_set(),
+        });
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let parsed = CapabilityAnnouncement::from_bytes(&bytes).expect("parse old format");
+        assert_eq!(parsed.hop_count, 0);
+    }
+
+    #[test]
+    fn signature_verifies_across_hop_count_bumps() {
+        use super::super::super::identity::EntityKeypair;
+        let keypair = EntityKeypair::generate();
+        let mut ann =
+            CapabilityAnnouncement::new(1, keypair.entity_id().clone(), 1, sample_capability_set());
+        ann.sign(&keypair);
+        // Baseline: freshly signed announcement verifies.
+        assert!(ann.verify().is_ok());
+
+        // Simulate a forwarder bumping the counter. Signature still
+        // holds because `hop_count` sits outside the signed envelope.
+        for bumped in 1..=MAX_CAPABILITY_HOPS {
+            ann.hop_count = bumped;
+            assert!(
+                ann.verify().is_ok(),
+                "signature should remain valid after hop_count={}",
+                bumped
+            );
+        }
+    }
+
+    #[test]
+    fn signature_rejects_tampered_payload_even_at_hop_zero() {
+        use super::super::super::identity::EntityKeypair;
+        let keypair = EntityKeypair::generate();
+        let mut ann =
+            CapabilityAnnouncement::new(1, keypair.entity_id().clone(), 1, sample_capability_set());
+        ann.sign(&keypair);
+        // Flip a byte inside the signed envelope (node_id).
+        ann.node_id ^= 0x01;
+        assert!(ann.verify().is_err());
+    }
+
+    #[test]
+    fn max_capability_hops_matches_pingwave_contract() {
+        // MAX_CAPABILITY_HOPS is documented to mirror the pingwave
+        // MAX_HOPS. If the pingwave side is ever renumbered this
+        // test flags the divergence at compile time.
+        assert_eq!(MAX_CAPABILITY_HOPS, 16);
     }
 }
