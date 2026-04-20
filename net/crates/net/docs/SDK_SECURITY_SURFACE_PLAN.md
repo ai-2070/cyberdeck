@@ -59,7 +59,7 @@ Shippable order:
 2. **Stage B — Token issuance & verification in NAPI + TS SDK** (3–4 days). Pure-compute surface; no network. Highest-leverage TS addition because it unblocks channel auth.
 3. **Stage C — Capabilities (declare, announce, query) across Rust/TS** (3–4 days). Grafts onto `Mesh`/`MeshNode`. Network-adjacent but bounded.
 4. **Stage D — Subnet configuration across Rust/TS** (2–3 days). Smallest network surface; `SubnetPolicy` + `SubnetId` on `MeshBuilder`.
-5. **Stage E — Wire channel auth through the SDK surface** (3–5 days). With identity + capabilities + subnets all addressable, channel auth becomes a config option. Closes the cut from [`SDK_EXPANSION_PLAN.md`](SDK_EXPANSION_PLAN.md) Stages 6–7.
+5. **Stage E — Wire channel auth through the SDK surface** (3–5 days). With identity + capabilities + subnets all addressable, channel auth becomes a config option. Closes the cut from [`SDK_EXPANSION_PLAN.md`](SDK_EXPANSION_PLAN.md) Stages 6–7. Hardening (AuthGuard fast path, expiry sweep, auth-failure rate limit, bench) landed as a follow-up: [`CHANNEL_AUTH_GUARD_PLAN.md`](CHANNEL_AUTH_GUARD_PLAN.md) — SHIPPED.
 6. **Stage F — Python surface (identity + capabilities + subnets + auth)** (1 week). Repeat A–E against the PyO3 layer. See [`SDK_PYTHON_PARITY_PLAN.md`](SDK_PYTHON_PARITY_PLAN.md) for substages and landed behaviours.
 7. **Stage G — Go surface (identity + capabilities + subnets + auth)** (1–2 weeks). New C ABI additions; biggest lift because nothing exists today. See [`SDK_GO_PARITY_PLAN.md`](SDK_GO_PARITY_PLAN.md) for substages and landed behaviours.
 
