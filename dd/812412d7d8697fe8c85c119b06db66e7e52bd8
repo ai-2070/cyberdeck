@@ -1,0 +1,33 @@
+net/crates/net/bindings/python/README.md
+  5bf3f089eecaef7a 106-150
+net/crates/net/bindings/python/tests/test_channels.py
+  5bf3f089eecaef7a 1-105
+net/crates/net/bindings/go/README.md
+  5bf3f089eecaef7a 200-213
+net/crates/net/bindings/python/python/net/_net.pyi
+  5bf3f089eecaef7a 627-662,670-680
+net/crates/net/bindings/python/python/net/__init__.py
+  5bf3f089eecaef7a 103-104,119-120
+net/crates/net/bindings/python/src/lib.rs
+  5bf3f089eecaef7a 794-813,819-823,840-921,1008-1011,1061,1065-1068,1072,1357-1509,1580-1583
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "dd812412d7d8697fe8c85c119b06db66e7e52bd8",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 2092,
+      "total_deletions": 2520,
+      "accepted_lines": 493,
+      "overriden_lines": 0
+    }
+  }
+}
