@@ -585,9 +585,14 @@ _ = mesh.SubscribeChannelWithToken(publisherNodeID, "gpu/jobs", tokenBytes)
 
 Denied subscribes return `ErrChannelAuth` (wrapped as a sub-class
 of `ErrChannel`); malformed tokens return `ErrTokenInvalidFormat`
-before any network I/O. Cross-SDK behaviour is fixed by the Rust
-integration suite; see
-[`tests/channel_auth.rs`](../../tests/channel_auth.rs).
+before any network I/O. Successful subscribes populate an
+`AuthGuard` bloom filter on the publisher so every subsequent
+publish admits the subscriber in constant time. An expiry sweep
+(default 30 s) evicts subscribers whose tokens age out; a per-
+peer auth-failure rate limiter throttles bad-token storms.
+Cross-SDK behaviour is fixed by the Rust integration suite; see
+[`tests/channel_auth.rs`](../../tests/channel_auth.rs) and
+[`tests/channel_auth_hardening.rs`](../../tests/channel_auth_hardening.rs).
 
 ## Running the Example
 
