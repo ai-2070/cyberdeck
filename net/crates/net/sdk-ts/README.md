@@ -161,6 +161,180 @@ retries or buffers on its own behalf — the helper methods are
 opt-in policies, not defaults. See `../docs/TRANSPORT.md` for the full
 contract.
 
+## Security (identity, tokens, capabilities, subnets)
+
+Identity, capabilities, and subnets ride the underlying NAPI bindings
+as a single security unit — the mesh's subprotocol dispatch threads
+identity + capabilities + subnets + channel auth together at runtime,
+and the TS SDK surfaces all of it through one type hierarchy.
+
+```typescript
+import { randomBytes } from 'node:crypto';
+import { Identity, MeshNode } from '@ai2070/net-sdk';
+
+// Load once from caller-owned storage (vault / KMS / env secret).
+// The persisted form IS the 32-byte seed; treat as secret material.
+const seed = randomBytes(32);
+const identity = Identity.fromSeed(seed);
+
+// Stable entity_id / node_id across restarts — derived from the seed.
+const mesh = await MeshNode.create({
+  bindAddr: '127.0.0.1:9001',
+  psk: '42'.repeat(32),
+  identitySeed: seed,          // mesh and identity share the keypair
+});
+
+// mesh.entityId() === identity.entityId (both 32-byte Buffers).
+
+// Issue a scoped subscribe grant for another entity.
+const grantee = Identity.generate();
+const token = identity.issueToken({
+  subject: grantee.entityId,
+  scope: ['subscribe'],
+  channel: 'sensors/temp',
+  ttlSeconds: 300,
+  delegationDepth: 0,          // 0 forbids re-delegation
+});
+
+// `token.bytes` is the transport-ready 159-byte blob.
+// Ship it to the grantee; they hand it back on subscribe.
+```
+
+Errors surface as `IdentityError` (malformed inputs — bad seed
+length, unknown scope, invalid channel name) and `TokenError` whose
+`kind` discriminator is one of `invalid_format` | `invalid_signature`
+| `expired` | `not_yet_valid` | `delegation_exhausted` |
+`delegation_not_allowed` | `not_authorized`. Both extend `Error`,
+so `try/catch` + `instanceof` work as expected.
+
+### Capability announcements
+
+`mesh.announceCapabilities(caps)` broadcasts a `CapabilitySet` to
+every directly-connected peer and self-indexes locally.
+`mesh.findPeers(filter)` queries the local index — results include
+this node's own id when self matches.
+
+```typescript
+import { MeshNode } from '@ai2070/net-sdk';
+
+const mesh = await MeshNode.create({
+  bindAddr: '127.0.0.1:9002',
+  psk: '42'.repeat(32),
+});
+
+await mesh.announceCapabilities({
+  hardware: {
+    cpuCores: 16,
+    memoryMb: 65_536,
+    gpu: { vendor: 'nvidia', model: 'h100', vramMb: 81_920 },
+  },
+  models: [
+    { modelId: 'llama-3.1-70b', family: 'llama', contextLength: 128_000 },
+  ],
+  tags: ['gpu', 'prod'],
+});
+
+const gpuPeers = mesh.findPeers({
+  requireGpu: true,
+  gpuVendor: 'nvidia',
+  minVramMb: 40_000,
+});
+// gpuPeers includes mesh.nodeId() on self-match.
+```
+
+Propagation is one-hop in v1; peers more than one hop away will not
+see the announcement. `capabilityGcIntervalMs` + TTL-driven eviction
+are configurable on `MeshNode.create`.
+
+### Subnets (visibility partitioning)
+
+`subnet` pins a node to a specific 4-level `SubnetId`; `subnetPolicy`
+derives each *peer's* subnet from their inbound capability tags so
+every node in the mesh agrees on the geometry without a central
+directory.
+
+```typescript
+import { MeshNode } from '@ai2070/net-sdk';
+
+const policy = {
+  rules: [
+    { tagPrefix: 'region:', level: 0, values: { us: 3, eu: 4 } },
+    { tagPrefix: 'fleet:',  level: 1, values: { blue: 7, green: 8 } },
+  ],
+};
+
+const mesh = await MeshNode.create({
+  bindAddr: '127.0.0.1:9003',
+  psk: '42'.repeat(32),
+  subnet: { levels: [3, 7] },    // us/blue
+  subnetPolicy: policy,
+});
+
+// Announce tags matching the policy so peers derive the same
+// SubnetId [3, 7] when they apply their own policy to our caps.
+await mesh.announceCapabilities({ tags: ['region:us', 'fleet:blue'] });
+```
+
+Channel `visibility` gates publish fan-out and subscribe
+authorization against the derived geometry. Cross-subnet subscribes
+to a `SubnetLocal` channel reject with `Unauthorized`.
+
+### Channel authentication
+
+`ChannelConfig` carries three auth knobs, enforced end-to-end at
+both the subscribe gate and the publish path:
+
+- `publishCaps: CapabilityFilter` — publisher must satisfy before
+  fan-out. Failing publishes raise an error; no peers are attempted.
+- `subscribeCaps: CapabilityFilter` — subscribers must satisfy
+  before being added to the roster. Failures surface as
+  `ChannelAuthError`.
+- `requireToken: true` — subscribers must present a valid `Token`
+  whose subject matches their `entityId`. The publisher verifies
+  the ed25519 signature, installs the token in its local cache,
+  then runs `can_subscribe`.
+
+```typescript
+import { Identity, MeshNode } from '@ai2070/net-sdk';
+
+const pubIdentity = Identity.generate();
+const subIdentity = Identity.generate();
+
+const publisher = await MeshNode.create({
+  bindAddr: '127.0.0.1:9004',
+  psk: '42'.repeat(32),
+  identitySeed: pubIdentity.toBytes(),
+});
+
+publisher.registerChannel({
+  name: 'events/inference',
+  subscribeCaps: { requireTags: ['gpu'] },
+  requireToken: true,
+});
+
+// Issue a SUBSCRIBE-scope token for the subscriber.
+const token = pubIdentity.issueToken({
+  subject: subIdentity.entityId,
+  scope: ['subscribe'],
+  channel: 'events/inference',
+  ttlSeconds: 300,
+});
+
+// Subscriber side (different MeshNode) — attach the token.
+await subscriber.subscribeChannel(
+  publisher.nodeId(),
+  'events/inference',
+  { token },
+);
+```
+
+Denied subscribes surface as `ChannelAuthError` (a subclass of
+`ChannelError`); malformed token bytes raise `TokenError` before
+any network I/O. Cross-SDK behaviour is fixed by the Rust
+integration suite — see
+[`SDK_SECURITY_SURFACE_PLAN.md`](../docs/SDK_SECURITY_SURFACE_PLAN.md)
+for the full contract.
+
 ## Channels (distributed pub/sub)
 
 Named pub/sub across the encrypted mesh. The publisher registers a
