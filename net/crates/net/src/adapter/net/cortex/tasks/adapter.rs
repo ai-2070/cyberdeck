@@ -202,10 +202,22 @@ impl TasksAdapter {
             let guard = state.read();
             watcher.spec_for_snapshot().execute(&guard)
         };
-        // The watcher's stream emits the initial first, then deltas.
-        // Skip the first element so the caller sees only deltas;
-        // the snapshot they already have covers the initial state.
-        let stream = watcher.stream().skip(1).boxed();
+        // The watcher's stream recomputes its own initial from the
+        // current state when `stream()` runs. If the state changes
+        // between our snapshot read above and the watcher's read
+        // inside `stream()`, a plain `skip(1)` would drop the
+        // watcher's (newer) initial and the caller would miss that
+        // change entirely.
+        //
+        // Use `skip_while` against our snapshot so we only discard
+        // the leading emissions that still equal the state the
+        // caller already has — as soon as the stream diverges, we
+        // forward everything through.
+        let initial_for_stream = initial.clone();
+        let stream = watcher
+            .stream()
+            .skip_while(move |current| futures::future::ready(current == &initial_for_stream))
+            .boxed();
         (initial, stream)
     }
 

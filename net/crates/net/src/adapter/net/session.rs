@@ -1026,14 +1026,24 @@ impl StreamState {
                 Err(current) => prev = current,
             }
         };
-        // Saturating add — under honest receiver accounting
+        // Under honest receiver accounting
         // (`total_consumed <= tx_bytes_sent`) the delta is bounded by
-        // the outstanding window and cannot overflow. A pathological
-        // delta saturates at `u32::MAX` rather than wrapping.
+        // the outstanding window, so `saturating_add` is a no-op
+        // against overflow and the final value naturally stays at or
+        // below `tx_window`.
+        //
+        // A malformed or buggy grant can report `total_consumed`
+        // above what the sender has actually committed, which would
+        // otherwise mint credit past the window and let the sender
+        // exceed its configured ceiling. The `min(self.tx_window)`
+        // clamp caps credit at the configured window regardless of
+        // the reported delta — a safety bound, not a correctness
+        // requirement under honest operation.
         let grant_add = delta.min(u32::MAX as u64) as u32;
+        let window = self.tx_window;
         self.tx_credit_remaining
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                Some(v.saturating_add(grant_add))
+                Some(v.saturating_add(grant_add).min(window))
             })
             .ok();
     }
@@ -1555,6 +1565,39 @@ mod tests {
     }
 
     #[test]
+    fn test_authoritative_grant_clamps_to_window_on_malformed_total_consumed() {
+        // Regression: a malformed or buggy grant whose
+        // `total_consumed` claims more bytes than the sender has
+        // actually committed would otherwise mint credit above
+        // `tx_window` — the sender could then exceed its configured
+        // ceiling on subsequent admits. The fetch_update clamps at
+        // `tx_window` so credit is capped at the window regardless of
+        // the reported delta. `max_consumed_seen` still advances
+        // (monotonic property holds) so subsequent stale grants
+        // continue to be filtered.
+        let state = StreamState::new_full(false, 1, 100);
+        assert!(state.try_acquire_tx_credit(40));
+        assert_eq!(state.tx_credit_remaining(), 60);
+        assert_eq!(state.tx_bytes_sent(), 40);
+
+        // Malformed grant: reports 500 consumed against only 40 sent.
+        state.apply_authoritative_grant(500);
+
+        assert_eq!(
+            state.tx_credit_remaining(),
+            100,
+            "malformed grant must not push credit above tx_window",
+        );
+        assert_eq!(state.max_consumed_seen(), 500);
+        // A subsequent honest grant below the malformed high-water
+        // mark is still ignored as stale — the malformed advancement
+        // is sticky.
+        state.apply_authoritative_grant(50);
+        assert_eq!(state.max_consumed_seen(), 500);
+        assert_eq!(state.tx_credit_remaining(), 100);
+    }
+
+    #[test]
     fn test_authoritative_grant_does_not_clobber_concurrent_acquire() {
         // Regression: the earlier `.store()`-based reconciliation
         // computed `remaining = window - (sent - consumed)` from a
@@ -1613,6 +1656,14 @@ mod tests {
         // exercises the ordering between the acquire's two-step
         // (CAS remaining, then bump sent) and the grant's credit
         // update.
+        //
+        // The granter mirrors honest receiver accounting by waiting
+        // until the sender has actually committed `target` bytes
+        // before reporting `total_consumed = target`. Without this
+        // ordering the test would synthesize malformed grants that
+        // report consumption ahead of sent bytes — the window clamp
+        // would then strand the over-grant and fail the equality
+        // check even though both operations are behaving correctly.
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
         use std::thread;
@@ -1643,8 +1694,11 @@ mod tests {
                 while !go_g.load(Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
-                for i in 1..=ITERATIONS {
-                    state_g.apply_authoritative_grant(i);
+                for target in 1..=ITERATIONS {
+                    while state_g.tx_bytes_sent() < target {
+                        std::hint::spin_loop();
+                    }
+                    state_g.apply_authoritative_grant(target);
                 }
             });
 

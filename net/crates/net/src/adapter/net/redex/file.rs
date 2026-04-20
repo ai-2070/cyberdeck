@@ -60,9 +60,10 @@ struct RedexFileInner {
     disk: Option<Arc<DiskSegment>>,
     /// Shutdown signal for the `FsyncPolicy::Interval` background
     /// task. `Some` iff an Interval task was spawned at
-    /// `open_persistent` time. `close()` calls `notify_waiters()`;
-    /// the task observes it, exits, and releases its DiskSegment
-    /// reference.
+    /// `open_persistent` time. `close()` calls `notify_one()` so a
+    /// permit is stored even if the task hasn't yet registered a
+    /// waiter; the task observes it, exits, and releases its
+    /// DiskSegment reference.
     #[cfg(feature = "redex-disk")]
     interval_shutdown: Option<Arc<Notify>>,
 }

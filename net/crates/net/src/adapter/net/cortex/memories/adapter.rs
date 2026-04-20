@@ -200,7 +200,18 @@ impl MemoriesAdapter {
             let guard = state.read();
             watcher.spec_for_snapshot().execute(&guard)
         };
-        let stream = watcher.stream().skip(1).boxed();
+        // The watcher recomputes its own initial from live state in
+        // `stream()`. A plain `skip(1)` would silently drop that
+        // value, so if the state mutated between our snapshot and
+        // the watcher's read the caller would never learn about it.
+        // Instead, drop only while the stream still matches the
+        // snapshot we already returned — any diverging emission is
+        // forwarded.
+        let initial_for_stream = initial.clone();
+        let stream = watcher
+            .stream()
+            .skip_while(move |current| futures::future::ready(current == &initial_for_stream))
+            .boxed();
         (initial, stream)
     }
 

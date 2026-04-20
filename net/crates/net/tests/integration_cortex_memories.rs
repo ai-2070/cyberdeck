@@ -676,3 +676,43 @@ async fn test_memories_and_tasks_coexist_on_same_redex() {
     assert_eq!(tg.len(), 1);
     assert_eq!(tg.get(1).unwrap().status, TaskStatus::Completed);
 }
+
+#[tokio::test]
+async fn test_regression_snapshot_and_watch_delivers_post_call_updates() {
+    // Regression: `MemoriesAdapter::snapshot_and_watch` used to pair
+    // the caller-returned snapshot with `watcher.stream().skip(1)`.
+    // Because the watcher's stream reads state independently, a race
+    // between the snapshot read and the stream's own read could
+    // produce a divergent initial emission — which `skip(1)` would
+    // then silently drop, leaving the caller holding a stale
+    // snapshot with no delta to reconcile against. The fix replaces
+    // `skip(1)` with `skip_while(== snapshot)` so only matching
+    // leading emissions are suppressed.
+    //
+    // This covers the functional contract: any change after the
+    // call must land on the stream.
+    let redex = Redex::new();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let seq = memories
+        .store(1, "seed", vec!["t".into()], "alice", 100)
+        .unwrap();
+    memories.wait_for_seq(seq).await;
+
+    let watcher = memories.watch();
+    let (initial, mut stream) = memories.snapshot_and_watch(watcher);
+    let initial_ids: Vec<_> = initial.iter().map(|m| m.id).collect();
+    assert_eq!(initial_ids, vec![1]);
+
+    let seq = memories
+        .store(2, "post", vec!["t".into()], "alice", 200)
+        .unwrap();
+    memories.wait_for_seq(seq).await;
+
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+        .await
+        .expect("stream must emit after mutation")
+        .expect("stream must not end");
+    let ids: Vec<_> = observed.iter().map(|m| m.id).collect();
+    assert_eq!(ids, vec![1, 2]);
+    assert_ne!(observed, initial);
+}
