@@ -8,7 +8,7 @@
 #![cfg(feature = "cortex")]
 
 use futures::StreamExt;
-use net_sdk::cortex::{MemoriesAdapter, NetDb, Redex, TasksAdapter, TaskStatus};
+use net_sdk::cortex::{MemoriesAdapter, NetDb, Redex, TaskStatus, TasksAdapter};
 
 const ORIGIN: u32 = 0xABCD_EF01;
 
