@@ -183,10 +183,19 @@ b.registerChannel({
   maxRatePps: 1000,
 });
 
-// Subscriber side (after handshake with b).
+// Subscriber side + full handshake.
 const a = await MeshNode.create({ bindAddr: '127.0.0.1:9002', psk });
+const aNodeId = a.nodeId();
 const bNodeId = b.nodeId();
-await a.connect('127.0.0.1:9001', b.publicKey(), bNodeId);
+// connect/accept must race: the initiator blocks on a handshake reply
+// that only shows up once the responder is in accept(). Then both
+// sides must start() their receive loops before app traffic flows.
+await Promise.all([
+  b.accept(aNodeId),
+  a.connect('127.0.0.1:9001', b.publicKey(), bNodeId),
+]);
+await a.start();
+await b.start();
 await a.subscribeChannel(bNodeId, 'sensors/temp');
 
 // Fan out.
