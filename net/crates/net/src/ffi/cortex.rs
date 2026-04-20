@@ -48,6 +48,10 @@ use super::NetError;
 
 pub(crate) const NET_ERR_CORTEX_CLOSED: c_int = -100;
 pub(crate) const NET_ERR_CORTEX_FOLD: c_int = -101;
+// Exported via the Go header (`net.h` / `ErrNetDb`) for forward
+// compatibility with future NetDb-layer errors; no current FFI site
+// returns it, hence the allow.
+#[allow(dead_code)]
 pub(crate) const NET_ERR_NETDB: c_int = -102;
 pub(crate) const NET_ERR_REDEX: c_int = -103;
 pub(crate) const NET_ERR_TIMEOUT: c_int = 1;
@@ -165,6 +169,10 @@ pub struct RedexFileHandle {
 /// `config_json` may be NULL for defaults. Writes the file handle to
 /// `*out_handle` on success. Caller frees with `net_redex_file_free`.
 #[unsafe(no_mangle)]
+// Field-by-field reassignment after `default()` is clearer here than
+// a struct literal because several fields need conditional logic
+// (fsync policy validation) that inlines awkwardly.
+#[allow(clippy::field_reassign_with_default)]
 pub extern "C" fn net_redex_open_file(
     redex: *mut RedexHandle,
     name: *const c_char,
@@ -720,6 +728,7 @@ fn build_tasks_watcher(
 }
 
 /// Apply JSON filter to a query-side filter (used by `list_tasks`).
+#[allow(clippy::field_reassign_with_default)]
 fn build_tasks_list_filter(filter_json: *const c_char) -> Result<TasksFilter, c_int> {
     if filter_json.is_null() {
         return Ok(TasksFilter::default());
@@ -1268,6 +1277,7 @@ fn build_memories_watcher(
     Ok(w)
 }
 
+#[allow(clippy::field_reassign_with_default)]
 fn build_memories_list_filter(filter_json: *const c_char) -> Result<MemoriesFilter, c_int> {
     if filter_json.is_null() {
         return Ok(MemoriesFilter::default());

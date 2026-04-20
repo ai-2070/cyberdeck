@@ -626,7 +626,7 @@ fn encode_b64(bytes: &[u8]) -> String {
     // Small stdlib-free base64. Net already pulls in `base64` via
     // other deps, but a local encoder keeps this module independent.
     const ALPH: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut s = String::with_capacity(((bytes.len() + 2) / 3) * 4);
+    let mut s = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= bytes.len() {
         let chunk = &bytes[i..i + 3];
