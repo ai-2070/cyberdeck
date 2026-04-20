@@ -1,0 +1,39 @@
+net/crates/net/src/adapter/net/mesh.rs
+  5bf3f089eecaef7a 52-53,174-178,271-278,305,348-354,479-492,679-680,884-887,890,892-897,911,955,2217-2222,2231-2247,2292-2331,2333-2334,2338-2401,2939-2941,2945-2947,2950-2968
+net/crates/net/bindings/go/README.md
+  5bf3f089eecaef7a 516-520
+net/crates/net/bindings/python/README.md
+  5bf3f089eecaef7a 307-311
+net/crates/net/sdk-ts/README.md
+  5bf3f089eecaef7a 245-252
+net/crates/net/sdk/README.md
+  5bf3f089eecaef7a 260-272
+net/crates/net/src/adapter/net/behavior/capability.rs
+  5bf3f089eecaef7a 707-709,712-720,723-727,774-781,802,805,821-837,839,845-848,853,1713-1754,1756-1776,1778-1790
+net/crates/net/tests/capability_multihop.rs
+  5bf3f089eecaef7a 1-173,175-406
+net/crates/net/docs/CAPABILITY_BROADCAST_PLAN.md
+  5bf3f089eecaef7a 53-56,119-125,485-486
+net/crates/net/docs/MULTIHOP_CAPABILITY_PLAN.md
+  5bf3f089eecaef7a 1-6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "f16206d2f3cd501d01ec4e5a0bc449c9ea98e12e",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 815,
+      "total_deletions": 44,
+      "accepted_lines": 788,
+      "overriden_lines": 5
+    }
+  }
+}
