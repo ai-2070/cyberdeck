@@ -1,0 +1,39 @@
+net/crates/net/src/adapter/net/identity/token.rs
+  5bf3f089eecaef7a 357-364
+net/crates/net/sdk/README.md
+  5bf3f089eecaef7a 161-220
+net/crates/net/sdk/src/capabilities.rs
+  5bf3f089eecaef7a 1-41
+net/crates/net/sdk/Cargo.toml
+  5bf3f089eecaef7a 30-39
+net/crates/net/sdk/src/identity.rs
+  5bf3f089eecaef7a 1-203
+net/crates/net/sdk/src/config.rs
+  5bf3f089eecaef7a 38-42,50-51,55-65
+net/crates/net/sdk/src/mesh.rs
+  5bf3f089eecaef7a 4-6,60-61,76-77,81-97,118-128,135,144-145,161-166,521-528
+net/crates/net/sdk/src/subnets.rs
+  5bf3f089eecaef7a 1-38
+net/crates/net/sdk/src/lib.rs
+  5bf3f089eecaef7a 46-55,98-107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "7897cda4ebeef34afaf3e59ccce09ea6f6be0daf",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 2995,
+      "total_deletions": 131,
+      "accepted_lines": 466,
+      "overriden_lines": 2
+    }
+  }
+}
