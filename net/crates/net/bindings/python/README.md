@@ -353,9 +353,14 @@ mesh.subscribe_channel(publisher_node_id, "gpu/jobs", token=token_bytes)
 Denied subscribes raise `ChannelAuthError` (a subclass of
 `ChannelError`); malformed tokens raise `TokenError` whose message
 has the form `"token: <kind>"` (`invalid_signature`, `expired`,
-`delegation_exhausted`, …). Cross-SDK behaviour is fixed by the
-Rust integration suite; see
-[`tests/channel_auth.rs`](../../tests/channel_auth.rs).
+`delegation_exhausted`, …). Successful subscribes populate an
+`AuthGuard` bloom filter on the publisher so every subsequent
+publish admits the subscriber in constant time. An expiry sweep
+(default 30 s) evicts subscribers whose tokens age out; a per-
+peer auth-failure rate limiter throttles bad-token storms. Cross-
+SDK behaviour is fixed by the Rust integration suite; see
+[`tests/channel_auth.rs`](../../tests/channel_auth.rs) and
+[`tests/channel_auth_hardening.rs`](../../tests/channel_auth_hardening.rs).
 
 ## Performance Tips
 
