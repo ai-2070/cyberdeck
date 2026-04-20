@@ -427,8 +427,12 @@ export declare class RedexFile {
    * range that has been evicted is silently skipped.
    */
   readRange(start: bigint, end: bigint): Array<RedexEventJs>
-  /** Number of retained events (post-retention eviction). */
-  len(): number
+  /**
+   * Number of retained events (post-retention eviction). Returned
+   * as `BigInt` so event counts above `u32::MAX` (~4.3 B) don't
+   * silently truncate.
+   */
+  len(): bigint
   /**
    * Open a live tail over this file. The iterator yields every
    * event with `seq >= fromSeq` (default `0`), atomically

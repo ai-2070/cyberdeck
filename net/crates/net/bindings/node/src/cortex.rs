@@ -183,7 +183,7 @@ pub struct RedexFileConfigJs {
 /// The shared `common::bigint_u64` emits prefix-less errors; rethrow
 /// with the RedEX prefix tacked on.
 fn redex_bigint_u64(field: &str, b: BigInt) -> Result<u64> {
-    bigint_u64(b).map_err(|e| redex_err(&format!("config.{}", field), e.reason))
+    bigint_u64(b).map_err(|e| redex_err(&format!("config.{}", field), e.reason.clone()))
 }
 
 fn resolve_redex_file_config(cfg: Option<RedexFileConfigJs>) -> Result<RedexFileConfig> {
