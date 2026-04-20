@@ -678,19 +678,12 @@ async fn test_memories_and_tasks_coexist_on_same_redex() {
 }
 
 #[tokio::test]
-async fn test_regression_snapshot_and_watch_delivers_post_call_updates() {
-    // Regression: `MemoriesAdapter::snapshot_and_watch` used to pair
-    // the caller-returned snapshot with `watcher.stream().skip(1)`.
-    // Because the watcher's stream reads state independently, a race
-    // between the snapshot read and the stream's own read could
-    // produce a divergent initial emission — which `skip(1)` would
-    // then silently drop, leaving the caller holding a stale
-    // snapshot with no delta to reconcile against. The fix replaces
-    // `skip(1)` with `skip_while(== snapshot)` so only matching
-    // leading emissions are suppressed.
-    //
-    // This covers the functional contract: any change after the
-    // call must land on the stream.
+async fn test_snapshot_and_watch_delivers_post_call_updates() {
+    // Baseline functional contract: a mutation that happens strictly
+    // after `snapshot_and_watch` returns must land on the delta
+    // stream. This path does not exercise the skip-vs-skip_while
+    // race — both implementations pass it — but guards against any
+    // future change that accidentally over-filters legitimate deltas.
     let redex = Redex::new();
     let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
     let seq = memories
@@ -715,4 +708,74 @@ async fn test_regression_snapshot_and_watch_delivers_post_call_updates() {
     let ids: Vec<_> = observed.iter().map(|m| m.id).collect();
     assert_eq!(ids, vec![1, 2]);
     assert_ne!(observed, initial);
+}
+
+#[tokio::test]
+async fn test_regression_snapshot_and_watch_forwards_divergent_stream_initial() {
+    // Regression for the `skip(1)` race fix on
+    // `MemoriesAdapter::snapshot_and_watch`: the watcher's `stream()`
+    // reads state independently of our own snapshot read. If state
+    // mutates between those two reads, the watcher's first emission
+    // reflects the newer state. The old `skip(1)` silently dropped
+    // that divergent emission, leaving the caller on a stale snapshot
+    // with no further delta arriving — because the fold's change
+    // event had already been consumed into `last` inside the watch
+    // task's seed value. `skip_while(== snapshot)` forwards only the
+    // emissions that match the snapshot we already handed out.
+    //
+    // Drive the race by spawning a concurrent mutator around each
+    // call. Trials where the mutation fully lands before the snapshot
+    // read are skipped (nothing further to deliver). Remaining trials
+    // must see the stream emit the post-mutation state within a tight
+    // timeout; under the old bug the race trials would hang because
+    // the watcher's internal `last` already equals the post-mutation
+    // state, so no subsequent emission differs from it.
+    for trial in 0..20 {
+        let redex = Redex::new();
+        let memories = std::sync::Arc::new(MemoriesAdapter::open(&redex, ORIGIN).unwrap());
+        let seq = memories
+            .store(1, "seed", vec!["t".into()], "alice", 100)
+            .unwrap();
+        memories.wait_for_seq(seq).await;
+
+        let memories_m = memories.clone();
+        let mutator = tokio::spawn(async move {
+            let seq = memories_m
+                .store(2, "race", vec!["t".into()], "alice", 200)
+                .unwrap();
+            memories_m.wait_for_seq(seq).await;
+        });
+
+        let watcher = memories.watch();
+        let (initial, mut stream) = memories.snapshot_and_watch(watcher);
+        mutator.await.unwrap();
+
+        // Mutation already applied before the snapshot read: no
+        // further delta to deliver.
+        if initial.len() == 2 {
+            continue;
+        }
+        assert_eq!(
+            initial.len(),
+            1,
+            "trial {}: snapshot should be [seed]",
+            trial
+        );
+
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "trial {}: stream must deliver post-snapshot state within timeout",
+                    trial
+                )
+            })
+            .expect("stream must not end");
+        assert_eq!(
+            observed.len(),
+            2,
+            "trial {}: stream must deliver state with both memories",
+            trial
+        );
+    }
 }
