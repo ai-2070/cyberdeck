@@ -627,7 +627,21 @@ class NetMesh:
         session_timeout_ms: Optional[int] = None,
         num_shards: Optional[int] = None,
         identity_seed: Optional[bytes] = None,
-    ) -> None: ...
+        capability_gc_interval_ms: Optional[int] = None,
+        require_signed_capabilities: Optional[bool] = None,
+        subnet: Optional[List[int]] = None,
+        subnet_policy: Optional[dict] = None,
+    ) -> None:
+        """Construct a new mesh node.
+
+        ``subnet`` is 1–4 ints each in ``[0, 255]``. Defaults to
+        ``SubnetId::GLOBAL`` (no restriction). ``subnet_policy`` is
+        a dict of shape ``{"rules": [{"tag_prefix": str, "level":
+        int, "values": {str: int}}]}`` that derives a subnet from
+        the node's capability tags — see
+        ``docs/SDK_SECURITY_SURFACE_PLAN.md``.
+        """
+        ...
 
     @property
     def public_key(self) -> str:
@@ -729,15 +743,36 @@ class NetMesh:
         require_token: Optional[bool] = None,
         priority: Optional[int] = None,
         max_rate_pps: Optional[int] = None,
+        publish_caps: Optional[dict] = None,
+        subscribe_caps: Optional[dict] = None,
     ) -> None:
         """Register a channel on this node. Subscribers are validated
         against this config before being added to the roster.
-        Raises `ChannelError` for invalid names / visibility."""
+
+        ``publish_caps`` / ``subscribe_caps`` are ``CapabilityFilter``
+        dicts (same shape as the ``filter`` argument to
+        :meth:`find_peers`) that restrict who may publish or subscribe
+        based on the other node's announced capabilities.
+
+        Raises ``ChannelError`` for invalid names / visibility."""
         ...
-    def subscribe_channel(self, publisher_node_id: int, channel: str) -> None:
-        """Subscribe to `channel` on `publisher_node_id`. Raises
-        `ChannelAuthError` for unauthorized rejections, `ChannelError`
-        for other rejection / transport failures."""
+    def subscribe_channel(
+        self,
+        publisher_node_id: int,
+        channel: str,
+        token: Optional[bytes] = None,
+    ) -> None:
+        """Subscribe to `channel` on `publisher_node_id`.
+
+        Optional ``token`` is the serialized ``PermissionToken`` bytes
+        (159 bytes) — attach it when the publisher set
+        ``require_token=True`` on the channel, or when the caller's
+        caps don't satisfy ``subscribe_caps`` on their own.
+
+        Raises ``ChannelAuthError`` for unauthorized rejections,
+        ``ChannelError`` for other rejection / transport failures, and
+        ``TokenError`` if ``token`` is malformed or has a bad
+        signature."""
         ...
     def unsubscribe_channel(self, publisher_node_id: int, channel: str) -> None:
         """Idempotent counterpart of `subscribe_channel`."""
@@ -754,6 +789,25 @@ class NetMesh:
         """Fan one payload to every subscriber. Returns a
         `PublishReport` dict: `{attempted, delivered, errors}` where
         `errors` is a list of `{node_id, message}`."""
+        ...
+
+    def announce_capabilities(self, caps: dict) -> None:
+        """Broadcast `caps` to every directly-connected peer and
+        self-index so :meth:`find_peers` matches. Multi-hop
+        propagation is deferred — peers more than one hop away do
+        not see the announcement. See ``SDK_SECURITY_SURFACE_PLAN.md``
+        for the capability dict shape (hardware, software, models,
+        tools, tags, limits)."""
+        ...
+
+    def find_peers(self, filter: dict) -> list[int]:
+        """Query the local capability index. Returns node ids
+        (including own when the filter matches this node's own
+        announcement) whose latest announcement matches `filter`.
+        Filter shape mirrors `CapabilityFilter`: ``require_tags``,
+        ``require_models``, ``require_tools``, ``min_memory_mb``,
+        ``require_gpu``, ``gpu_vendor``, ``min_vram_mb``,
+        ``min_context_length``, ``require_modalities``."""
         ...
 
 class BackpressureError(Exception):
@@ -888,4 +942,11 @@ def delegate_token(
 
 def channel_hash(channel: str) -> int:
     """Hash a channel name to the 16-bit wire-format value."""
+    ...
+
+def normalize_gpu_vendor(vendor: str) -> str:
+    """Normalize a GPU vendor string to canonical lowercase:
+    ``nvidia | amd | intel | apple | qualcomm | unknown``. Unknown
+    inputs collapse to ``"unknown"``. Matches the NAPI helper so TS
+    and Python callers produce identical announcement payloads."""
     ...

@@ -241,6 +241,119 @@ the snapshot and an iterator seeded so that any divergent initial
 emission is forwarded through instead of dropped — see
 [`docs/STORAGE_AND_CORTEX.md`](../../docs/STORAGE_AND_CORTEX.md).
 
+## Security Surface (Stage A–E)
+
+The mesh layer surfaces the same identity / capabilities / subnets /
+channel-auth story that the Rust SDK and the TypeScript / Node SDKs
+ship. Full staging and rationale:
+[`docs/SDK_SECURITY_SURFACE_PLAN.md`](../../docs/SDK_SECURITY_SURFACE_PLAN.md).
+Python-binding parity details:
+[`docs/SDK_PYTHON_PARITY_PLAN.md`](../../docs/SDK_PYTHON_PARITY_PLAN.md).
+
+### Identity + permission tokens
+
+Every node has an ed25519 identity; permission tokens are ed25519-
+signed delegations that authorize a subject to `publish` /
+`subscribe` / `delegate` / `admin` on a channel, optionally with
+further delegation depth.
+
+```python
+from net import Identity, parse_token, verify_token, delegate_token
+
+alice = Identity.generate()
+bob = Identity.generate()
+
+# Alice issues Bob a subscribe+delegate token good for 5 min, with
+# one re-delegation hop remaining.
+token = alice.issue_token(
+    subject=bob.entity_id,
+    scope=["subscribe", "delegate"],
+    channel="sensors/temp",
+    ttl_seconds=300,
+    delegation_depth=1,
+)
+assert verify_token(token) is True
+
+# Bob re-delegates to Carol; depth drops to 0 (leaf).
+carol = Identity.generate()
+child = delegate_token(bob, token, carol.entity_id, ["subscribe"])
+assert parse_token(child)["delegation_depth"] == 0
+```
+
+### Capability announcements + peer discovery
+
+Announce hardware / software / model / tool / tag fingerprints, then
+query the local capability index with a filter.
+
+```python
+mesh.announce_capabilities({
+    "hardware": {
+        "cpu_cores": 16,
+        "memory_mb": 65536,
+        "gpu": {"vendor": "nvidia", "model": "h100", "vram_mb": 81920},
+    },
+    "models": [{"model_id": "llama-3.1-70b", "family": "llama",
+                "context_length": 128_000}],
+    "tags": ["gpu", "prod"],
+})
+
+gpu_peers = mesh.find_peers({
+    "require_gpu": True,
+    "gpu_vendor": "nvidia",
+    "min_vram_mb": 40_000,
+})
+```
+
+Capability propagation is one-hop in v1; peers >1 hop away will not
+see the announcement.
+
+### Subnets
+
+Nodes can bind to a hierarchical `SubnetId` (1–4 levels, each 0–255)
+directly, or derive one from announced tags via a `SubnetPolicy`.
+
+```python
+# Explicit subnet.
+mesh = NetMesh("127.0.0.1:9000", PSK, subnet=[3, 7, 2])
+
+# Or derive from tags.
+mesh = NetMesh(
+    "127.0.0.1:9001", PSK,
+    subnet_policy={
+        "rules": [
+            {"tag_prefix": "region:", "level": 0,
+             "values": {"eu": 1, "us": 2, "apac": 3}},
+            {"tag_prefix": "zone:", "level": 1,
+             "values": {"a": 1, "b": 2, "c": 3}},
+        ]
+    },
+)
+```
+
+### Channel authentication
+
+Publishers set `publish_caps` / `subscribe_caps` / `require_token` on
+`register_channel`. Subscribers present a `PermissionToken` via the
+optional `token=bytes` kwarg on `subscribe_channel`.
+
+```python
+mesh.register_channel(
+    "gpu/jobs",
+    subscribe_caps={"require_gpu": True, "min_vram_mb": 16_000},
+    require_token=True,
+)
+
+# Subscriber side, with a token issued by the publisher:
+mesh.subscribe_channel(publisher_node_id, "gpu/jobs", token=token_bytes)
+```
+
+Denied subscribes raise `ChannelAuthError` (a subclass of
+`ChannelError`); malformed tokens raise `TokenError` whose message
+has the form `"token: <kind>"` (`invalid_signature`, `expired`,
+`delegation_exhausted`, …). Cross-SDK behaviour is fixed by the
+Rust integration suite; see
+[`tests/channel_auth.rs`](../../tests/channel_auth.rs).
+
 ## Performance Tips
 
 1. **Use `ingest_raw()` for maximum throughput** - Pass pre-serialized JSON strings

@@ -60,7 +60,7 @@ Shippable order:
 3. **Stage C — Capabilities (declare, announce, query) across Rust/TS** (3–4 days). Grafts onto `Mesh`/`MeshNode`. Network-adjacent but bounded.
 4. **Stage D — Subnet configuration across Rust/TS** (2–3 days). Smallest network surface; `SubnetPolicy` + `SubnetId` on `MeshBuilder`.
 5. **Stage E — Wire channel auth through the SDK surface** (3–5 days). With identity + capabilities + subnets all addressable, channel auth becomes a config option. Closes the cut from [`SDK_EXPANSION_PLAN.md`](SDK_EXPANSION_PLAN.md) Stages 6–7.
-6. **Stage F — Python surface (identity + capabilities + subnets + auth)** (1 week). Repeat A–E against the PyO3 layer.
+6. **Stage F — Python surface (identity + capabilities + subnets + auth)** (1 week). Repeat A–E against the PyO3 layer. See [`SDK_PYTHON_PARITY_PLAN.md`](SDK_PYTHON_PARITY_PLAN.md) for substages and landed behaviours.
 7. **Stage G — Go surface (identity + capabilities + subnets + auth)** (1–2 weeks). New C ABI additions; biggest lift because nothing exists today.
 
 **Why this order, not "ship one area end-to-end":** Stage A unblocks Stage B unblocks Stage E. Capabilities (C) and subnets (D) are orthogonal and could reorder. Python (F) and Go (G) come last because they're repeats, not new design — and the Rust/TS design needs to settle before it's duplicated three more times.
@@ -545,17 +545,44 @@ Errors: `ChannelAuthError` (from [`SDK_EXPANSION_PLAN.md`](SDK_EXPANSION_PLAN.md
 
 ## Stages F & G — Python and Go
 
-### Python (Stage F)
+### Python (Stage F) — SHIPPED
 
-PyO3 surface mirrors Stage A–E. `PermissionToken` cross boundary as `bytes` (opaque). `Identity` is a `#[pyclass]`. Errors: `IdentityError`, `TokenError(kind)` subclasses of existing `CortexError`-sibling error base.
+PyO3 surface mirrors Stage A–E. `PermissionToken` crosses the
+boundary as `bytes` (opaque 159-byte). `Identity` is a `#[pyclass]`.
+Errors: `IdentityError`, `TokenError` subclasses of Python's builtin
+`Exception`. The `TokenError` message has the form `"token: <kind>"`
+— programmatic callers parse with
+`str(e).removeprefix("token: ")`.
 
-Files:
-- `net/crates/net/bindings/python/src/identity.rs` (new)
-- `net/crates/net/bindings/python/src/capabilities.rs` (new)
-- `net/crates/net/bindings/python/src/subnets.rs` (new)
-- `net/crates/net/bindings/python/python/__init__.py` — add exports
+Full substage breakdown + delivered behaviours:
+[`SDK_PYTHON_PARITY_PLAN.md`](SDK_PYTHON_PARITY_PLAN.md).
 
-No async/await needed — identity operations are synchronous, announcement is fire-and-forget.
+Files shipped:
+- `net/crates/net/bindings/python/src/identity.rs`
+- `net/crates/net/bindings/python/src/capabilities.rs`
+- `net/crates/net/bindings/python/src/subnets.rs`
+- `net/crates/net/bindings/python/src/lib.rs` — extended
+  `NetMesh.__new__` (identity_seed, capability_gc_interval_ms,
+  require_signed_capabilities, subnet, subnet_policy),
+  `register_channel` (publish_caps / subscribe_caps),
+  `subscribe_channel` (token), plus `announce_capabilities` /
+  `find_peers` / `entity_id`
+- `net/crates/net/bindings/python/python/net/{__init__.py,_net.pyi}` — exports + stubs
+- `net/crates/net/bindings/python/tests/test_{identity,capabilities,subnets,channel_auth}.py`
+- `net/crates/net/bindings/python/README.md` — Security Surface section
+
+Tokens' signature verification happens server-side on
+`subscribe_channel_with_token`; the Python client-side path parses
+structurally (raising `TokenError(invalid_format)` for malformed
+bytes) but defers bit-level tamper checks to the publisher.
+Multi-mesh handshake coverage (subscribe-denied-by-caps, cap-denied
+publish across peers) continues to live in the Rust integration
+suite and the TS SDK — the Python bindings track the single-mesh
+smoke discipline of `test_channels.py` pending a dedicated handshake
+fixture.
+
+No async/await needed — identity operations are synchronous,
+announcement is fire-and-forget.
 
 ### Go (Stage G)
 
