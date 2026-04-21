@@ -443,6 +443,72 @@ async fn unsigned_announcement_does_not_tofu_pin_entity() {
 /// non-GLOBAL subnet under any plausible policy, and asserts the
 /// subnet binding stays unwritten.
 #[tokio::test]
+/// Regression for a cubic-flagged P1: the subnet-assignment write
+/// was gated on `signature_verified` but not on
+/// `ann.hop_count == 0`, so a **signed** forwarded announcement
+/// still wrote `peer_subnets[from_node]` — where `from_node` is
+/// the relay, not the origin. A crafted relay could therefore
+/// overwrite its own legitimate subnet binding with whatever
+/// subnet the forwarded caps would derive to, or poison a
+/// legitimate peer's subnet binding by being the last hop on its
+/// path. Matching the TOFU-pin pattern: both writes are now gated
+/// on `hop_count == 0`.
+#[tokio::test]
+async fn forwarded_announcement_does_not_write_relay_peer_subnet() {
+    use net::adapter::net::behavior::SUBPROTOCOL_CAPABILITY_ANN;
+    use net::adapter::net::{SubnetPolicy, SubnetRule};
+
+    let ports = find_ports(2).await;
+    let attacker = build_node(ports[0]).await;
+
+    let rule = SubnetRule::new("region:", 0).map("privileged", 1);
+    let policy = SubnetPolicy::new().add_rule(rule);
+    let receiver = build_node_with(ports[1], |cfg| cfg.with_subnet_policy(Arc::new(policy))).await;
+    handshake(&attacker, &receiver).await;
+
+    // Harvested victim bytes: a real, signature-valid announcement
+    // with caps that would classify the origin into the non-GLOBAL
+    // subnet. The attacker replays it via its own session with
+    // hop_count=1 (forwarded).
+    let victim_kp = EntityKeypair::generate();
+    let caps = CapabilitySet::new().add_tag("region:privileged");
+    let mut ann =
+        CapabilityAnnouncement::new(victim_kp.node_id(), victim_kp.entity_id().clone(), 1, caps);
+    ann.sign(&victim_kp);
+    assert!(ann.verify().is_ok(), "victim's signature is valid");
+    ann.hop_count = 1;
+
+    attacker
+        .send_subprotocol(
+            receiver.local_addr(),
+            SUBPROTOCOL_CAPABILITY_ANN,
+            &ann.to_bytes(),
+        )
+        .await
+        .expect("send forwarded announcement");
+
+    // The index may admit the victim by node_id (signature is real),
+    // but the attacker's own session must NOT have been shifted into
+    // the forwarded subnet — that binding belongs to the origin,
+    // not the relay.
+    let filter = CapabilityFilter::new().require_tag("region:privileged");
+    let victim_node_id = victim_kp.node_id();
+    let arrived = wait_until(&receiver, |n| {
+        n.find_peers_by_filter(&filter).contains(&victim_node_id)
+    })
+    .await;
+    assert!(arrived, "receiver should still index the victim by node_id");
+
+    // Give the dispatch path a beat in case the subnet write lags.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(
+        receiver.peer_subnet(attacker.node_id()).is_none(),
+        "forwarded announcement wrote the relay's subnet — a crafted last \
+         hop can reshape any legitimate peer's SubnetLocal visibility",
+    );
+}
+
 async fn unsigned_announcement_does_not_write_peer_subnet() {
     use net::adapter::net::{SubnetPolicy, SubnetRule};
 

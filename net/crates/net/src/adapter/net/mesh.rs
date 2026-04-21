@@ -2671,17 +2671,27 @@ impl MeshNode {
         // index — the policy needs `ann.capabilities` and `index()`
         // consumes the announcement by value.
         //
-        // Gated on `signature_verified`: the subnet assignment is
-        // fed by `ann.capabilities`, which is attacker-controlled
-        // on an unsigned announcement. `peer_subnets` is consulted
-        // by `subnet_visible` on the publish fan-out and subscribe
-        // paths, so a spoofed subnet would let a peer see / receive
-        // traffic on `SubnetLocal` channels it shouldn't. A
-        // deployment that explicitly sets
-        // `require_signed_capabilities = false` for discovery keeps
-        // the capability index populated for `find_peers_by_filter`
-        // queries but does not let those queries back into auth.
-        if signature_verified {
+        // Gated on `signature_verified && ann.hop_count == 0` for
+        // the same reasons the TOFU pin above has that exact pair
+        // of conditions:
+        //
+        // 1. Unsigned `ann.capabilities` is attacker-controlled, so
+        //    a deployment running with
+        //    `require_signed_capabilities = false` for discovery
+        //    must not let unsigned input feed `peer_subnets` —
+        //    that map is read by `subnet_visible` on the
+        //    publish / subscribe paths, and a spoofed subnet would
+        //    admit a peer to `SubnetLocal` channels it shouldn't
+        //    see.
+        // 2. On a forwarded announcement (`hop_count > 0`) the
+        //    `from_node` in our hands is the relay peer, not the
+        //    origin. Writing the origin's derived subnet under the
+        //    relay's `node_id` would overwrite the relay's legitimate
+        //    subnet binding — a crafted forwarded announcement could
+        //    shift any legitimate peer into a different subnet just
+        //    by being the last hop on its path. The real binding
+        //    comes from the origin's own direct announcement.
+        if signature_verified && ann.hop_count == 0 {
             if let Some(policy) = ctx.local_subnet_policy.as_ref() {
                 let subnet = policy.assign(&ann.capabilities);
                 ctx.peer_subnets.insert(from_node, subnet);
