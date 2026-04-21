@@ -477,16 +477,25 @@ fn subscriber_origin_hash(node_id: u64) -> u64 {
     node_id
 }
 
-/// Replace a zero `Duration` with a 1 ms floor.
+/// Replace a zero `Duration` with a 1 s floor.
 /// `tokio::time::interval` panics on a zero period; this is the
 /// guard every `spawn_*_loop` call site applies before handing the
 /// caller-configured interval to tokio. A legitimate "disable this
 /// timer" sentinel is `Duration::MAX`, documented on the relevant
 /// config fields — `Duration::ZERO` is just pathological input.
+///
+/// The floor is deliberately coarse (1 s, not 1 ms): a mis-configured
+/// zero-interval used to spin the maintenance loop at 1 kHz, calling
+/// `index.gc()` + `seen.retain()` a thousand times a second and
+/// burning a whole core. 1 Hz keeps the loop obviously alive for
+/// observability without an appreciable CPU cost, and is still
+/// finer than the default intervals (capability GC ≈ announcement
+/// TTL, token sweep 30 s), so it never masks a legitimate
+/// fine-grained config — those values are already well above 1 s.
 #[inline]
 fn nonzero_interval(d: Duration) -> Duration {
     if d.is_zero() {
-        Duration::from_millis(1)
+        Duration::from_secs(1)
     } else {
         d
     }
@@ -1133,7 +1142,7 @@ impl MeshNode {
             // `Duration::ZERO` in `MeshNodeConfig`. A zero interval
             // isn't a sentinel for "disabled" (that's
             // `Duration::MAX`), it's just pathological input; clamp
-            // to 1 ms so the GC still runs, every tick.
+            // to 1 s (see `nonzero_interval` for the rationale).
             let mut tick = tokio::time::interval(nonzero_interval(interval));
             // First tick fires immediately; skip it so we don't GC
             // empty state before any announcements have landed.
