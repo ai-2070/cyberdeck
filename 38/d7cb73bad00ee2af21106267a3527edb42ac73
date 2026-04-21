@@ -1,0 +1,23 @@
+net/crates/net/docs/DAEMON_CHANNEL_REBIND_PLAN.md
+  5bf3f089eecaef7a 1-279
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "38d7cb73bad00ee2af21106267a3527edb42ac73",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 281,
+      "overriden_lines": 0
+    }
+  }
+}
