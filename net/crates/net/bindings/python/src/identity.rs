@@ -142,6 +142,17 @@ impl Identity {
             cache: Arc::new(TokenCache::new()),
         }
     }
+
+    /// Convert this Python `Identity` into the SDK `Identity` type
+    /// consumed by `net-sdk::compute`. Used by the compute feature's
+    /// `DaemonRuntime::spawn` / migration methods — the SDK reads
+    /// the 32-byte ed25519 seed through its own handle, so we hand
+    /// it a fresh `net_sdk::Identity` built from the seed bytes we
+    /// already hold.
+    #[cfg(feature = "compute")]
+    pub(crate) fn to_sdk_identity(&self) -> net_sdk::Identity {
+        net_sdk::Identity::from_seed(*self.keypair.secret_bytes())
+    }
 }
 
 #[pymethods]

@@ -13,6 +13,8 @@ mod capabilities;
 mod identity;
 #[cfg(feature = "net")]
 mod subnets;
+#[cfg(feature = "compute")]
+mod compute;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -1012,7 +1014,13 @@ mod mesh_bindings {
     /// ```
     #[pyclass]
     pub struct NetMesh {
-        node: Option<MeshNode>,
+        /// Live `MeshNode` held via `Arc` so the compute feature's
+        /// `DaemonRuntime` (and any future Arc-sharing consumer)
+        /// can hold a second reference without copying the live
+        /// socket or handshake table. Shutdown drops this Arc —
+        /// any remaining clones held by a `DaemonRuntime` observe
+        /// a shut-down node the next time they call into it.
+        node: Option<Arc<MeshNode>>,
         runtime: Arc<Runtime>,
         /// Shared channel config registry installed on the MeshNode
         /// at construction; `register_channel` inserts into this same
@@ -1130,7 +1138,7 @@ mod mesh_bindings {
             node.set_token_cache(Arc::new(net::adapter::net::identity::TokenCache::new()));
 
             Ok(Self {
-                node: Some(node),
+                node: Some(Arc::new(node)),
                 runtime,
                 channel_configs,
             })
@@ -1688,8 +1696,35 @@ mod mesh_bindings {
     impl NetMesh {
         fn get_node(&self) -> PyResult<&MeshNode> {
             self.node
-                .as_ref()
+                .as_deref()
                 .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))
+        }
+
+        /// Clone the `Arc<MeshNode>` backing this `NetMesh`. Used
+        /// by the compute feature's `DaemonRuntime` to share the
+        /// live mesh node without opening a second socket.
+        #[cfg(feature = "compute")]
+        pub(crate) fn node_arc_clone(&self) -> PyResult<Arc<MeshNode>> {
+            self.node
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))
+        }
+
+        /// Shared `ChannelConfigRegistry`. `DaemonRuntime` reuses
+        /// the registry for channel-bind replay on daemon spawn.
+        #[cfg(feature = "compute")]
+        pub(crate) fn channel_configs_arc(&self) -> Arc<ChannelConfigRegistry> {
+            self.channel_configs.clone()
+        }
+
+        /// Shared tokio runtime. `DaemonRuntime` uses this for
+        /// async method bridging (`start`, `shutdown`, `spawn`,
+        /// `deliver`, migration calls) so we don't spin up a
+        /// second runtime per mesh.
+        #[cfg(feature = "compute")]
+        pub(crate) fn runtime_arc(&self) -> Arc<Runtime> {
+            self.runtime.clone()
         }
     }
 }
@@ -1750,6 +1785,10 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add("CortexError", m.py().get_type::<cortex::CortexError>())?;
         m.add("NetDbError", m.py().get_type::<cortex::NetDbError>())?;
         m.add("RedexError", m.py().get_type::<cortex::RedexError>())?;
+    }
+    #[cfg(feature = "compute")]
+    {
+        m.add_class::<compute::PyDaemonRuntime>()?;
     }
     Ok(())
 }

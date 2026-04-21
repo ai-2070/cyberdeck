@@ -158,4 +158,13 @@ else:
         ]
     )
 
+# Compute runtime surface. Present iff the native module was built
+# with the `compute` feature. Stage 5 of SDK_COMPUTE_SURFACE_PLAN.md.
+try:
+    from ._net import DaemonRuntime
+except ImportError:
+    pass
+else:
+    __all__.extend(["DaemonRuntime"])
+
 __version__ = "0.1.0"

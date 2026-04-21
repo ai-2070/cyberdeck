@@ -1274,9 +1274,11 @@ name = "net-python"
 version = "0.5.0"
 dependencies = [
  "bytes",
+ "dashmap",
  "futures",
  "hex",
  "net",
+ "net-sdk",
  "pyo3",
  "pyo3-build-config",
  "serde_json",
