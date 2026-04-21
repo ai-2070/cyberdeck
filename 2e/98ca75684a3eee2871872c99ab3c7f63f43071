@@ -1,0 +1,25 @@
+net/crates/net/sdk/src/compute.rs
+  5bf3f089eecaef7a 196-200,233,446-457,481-487,521-535
+net/crates/net/sdk/tests/compute_runtime.rs
+  5bf3f089eecaef7a 492-525,527-541
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "2e98ca75684a3eee2871872c99ab3c7f63f43071",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 103,
+      "total_deletions": 2506,
+      "accepted_lines": 86,
+      "overriden_lines": 0
+    }
+  }
+}
