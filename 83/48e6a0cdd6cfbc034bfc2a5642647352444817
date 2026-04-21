@@ -1,0 +1,36 @@
+net/crates/net/bindings/node/src/capabilities.rs
+  5bf3f089eecaef7a 210-219,228,231,257,264-267,444-496
+net/crates/net/src/ffi/mesh.rs
+  5bf3f089eecaef7a 1776-1785,1794,1797,1810,1817-1821,2061-2104
+net/crates/net/bindings/python/src/capabilities.rs
+  5bf3f089eecaef7a 152-162,172,175,190,200,202-203,405-429
+net/crates/net/bindings/python/Cargo.toml
+  5bf3f089eecaef7a 10-14
+net/crates/net/bindings/node/Cargo.toml
+  5bf3f089eecaef7a 9-13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "8348e6a0cdd6cfbc034bfc2a5642647352444817",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 955,
+      "total_deletions": 342,
+      "accepted_lines": 683,
+      "overriden_lines": 0
+    }
+  },
+  "humans": {
+    "h_fb620e726e1595": {
+      "author": "LZL0"
+    }
+  }
+}
