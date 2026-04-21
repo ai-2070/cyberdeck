@@ -1113,10 +1113,14 @@ impl MeshNode {
     /// packets with `subprotocol_id == 0x0500` are dispatched to
     /// this handler instead of being queued as events. Idempotent
     /// w.r.t. replacing the handler — a second call swaps in the
-    /// new one atomically. Pass the handler you want; no way to
-    /// clear once set (and no reason to — the mesh can run without
-    /// one, so constructing without installing is the "clear"
-    /// state).
+    /// new one atomically.
+    ///
+    /// Use [`Self::clear_migration_handler`] to uninstall (returns
+    /// the mesh to the no-handler state where inbound migration
+    /// packets hit the `ComputeNotSupported` fallback). Needed by
+    /// `DaemonRuntime::shutdown` and by `start`'s lost-race
+    /// cleanup path — the mesh must not hold a live handler
+    /// pointing at a runtime that is no longer serving daemons.
     pub fn set_migration_handler(&self, handler: Arc<MigrationSubprotocolHandler>) {
         self.migration_handler.store(Some(handler));
     }

@@ -316,7 +316,34 @@ impl MigrationSubprotocolHandler {
                 // daemon's keypair into the snapshot before chunking
                 // so the target can reconstruct identity without an
                 // out-of-band pre-registration.
-                snapshot = self.maybe_seal_envelope(snapshot, daemon_origin, target_node)?;
+                //
+                // Seal failure needs a wire reply, not just `?`. The
+                // orchestrator (remote) is blocked waiting for this
+                // node's `SnapshotReady`; bailing with a dispatcher
+                // error would leave it waiting forever and leave our
+                // own `source_handler.start_snapshot` state dangling
+                // for `daemon_origin`. Convert to a `MigrationFailed`
+                // reply — the orchestrator consumes it, the SDK
+                // surfaces the reason, retry semantics kick in if
+                // applicable.
+                snapshot = match self.maybe_seal_envelope(snapshot, daemon_origin, target_node) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = self.source_handler.abort(daemon_origin);
+                        let reason =
+                            crate::adapter::net::compute::MigrationFailureReason::StateFailed(
+                                format!("identity envelope seal failed: {e}"),
+                            );
+                        outbound.push(OutboundMigrationMessage {
+                            dest_node: from_node,
+                            payload: wire::encode(&MigrationMessage::MigrationFailed {
+                                daemon_origin,
+                                reason,
+                            })?,
+                        });
+                        return Ok(outbound);
+                    }
+                };
 
                 // Chunk the snapshot for transport
                 let chunks = crate::adapter::net::compute::orchestrator::chunk_snapshot(
