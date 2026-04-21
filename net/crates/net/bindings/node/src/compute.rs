@@ -33,9 +33,9 @@ use net::adapter::net::compute::{DaemonError as CoreDaemonError, DaemonHostConfi
 use net::adapter::net::state::causal::CausalEvent;
 use net_sdk::compute::{
     DaemonError as SdkDaemonError, DaemonHandle as SdkDaemonHandle,
-    DaemonRuntime as SdkDaemonRuntime, MigrationError as SdkMigrationError,
-    MigrationFailureReason, MigrationHandle as SdkMigrationHandle, MigrationOpts,
-    MigrationPhase as CoreMigrationPhase, StateSnapshot,
+    DaemonRuntime as SdkDaemonRuntime, MigrationError as SdkMigrationError, MigrationFailureReason,
+    MigrationHandle as SdkMigrationHandle, MigrationOpts, MigrationPhase as CoreMigrationPhase,
+    StateSnapshot,
 };
 use net_sdk::mesh::Mesh as SdkMesh;
 
@@ -133,13 +133,8 @@ fn format_migration_error(err: &SdkMigrationError) -> String {
 /// and can cross threads as a whole. Used by both the initial
 /// spawn path and by the migration-target reconstruction closure
 /// mirrored into the SDK factory map.
-type FactoryTsfn = napi::threadsafe_function::ThreadsafeFunction<
-    (),
-    DaemonBridgeTsfns,
-    (),
-    napi::Status,
-    false,
->;
+type FactoryTsfn =
+    napi::threadsafe_function::ThreadsafeFunction<(), DaemonBridgeTsfns, (), napi::Status, false>;
 
 /// `process` TSFN — invoked by [`EventDispatchBridge::process`]
 /// on every inbound causal event. Takes a [`CausalEventJs`] by
@@ -927,11 +922,7 @@ impl MigrationHandle {
         // Clone because SDK's `wait(self)` consumes the handle; we
         // want the JS-side handle to stay usable for e.g. `phase()`
         // polling after wait returns.
-        self.inner
-            .clone()
-            .wait()
-            .await
-            .map_err(daemon_err_from_sdk)
+        self.inner.clone().wait().await.map_err(daemon_err_from_sdk)
     }
 
     /// Like [`wait`] with a caller-controlled timeout. On timeout
@@ -1084,10 +1075,7 @@ impl DaemonHandle {
     /// stopped (or never successfully registered).
     #[napi]
     pub fn stats(&self) -> Result<DaemonStatsJs> {
-        let stats = self
-            .inner
-            .stats()
-            .map_err(|e| daemon_err(e.to_string()))?;
+        let stats = self.inner.stats().map_err(|e| daemon_err(e.to_string()))?;
         Ok(DaemonStatsJs {
             events_processed: BigInt::from(stats.events_processed),
             events_emitted: BigInt::from(stats.events_emitted),

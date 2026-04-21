@@ -1154,6 +1154,150 @@ describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', ()
     }
   });
 
+  it('mid-flight failure: target has no factory for origin → wait() rejects kind factory-not-found', async () => {
+    // Stage 4 exit-criterion test: a mid-flight failure surfaces
+    // through `wait()` as a typed MigrationError whose `.kind`
+    // discriminates the structured cause. Here the target has no
+    // `expectMigration` entry for the origin_hash, so the inbound
+    // SnapshotReady hits a dispatcher with no factory → wire-level
+    // MigrationFailed(FactoryNotFound).
+    const [aAddr, bAddr] = [`127.0.0.1:${portSeed++}`, `127.0.0.1:${portSeed++}`];
+    const a = await MeshNode.create({ bindAddr: aAddr, psk: PSK });
+    cleanups.push(() => a.shutdown());
+    const b = await MeshNode.create({ bindAddr: bAddr, psk: PSK });
+    cleanups.push(() => b.shutdown());
+    await Promise.all([
+      b.accept(a.nodeId()),
+      (async () => {
+        await new Promise((r) => setTimeout(r, 50));
+        await a.connect(bAddr, b.publicKey(), b.nodeId());
+      })(),
+    ]);
+    await a.start();
+    await b.start();
+
+    const rtA = DaemonRuntime.create(a);
+    cleanups.push(() => rtA.shutdown());
+    rtA.registerFactory('counter', counterFactory());
+    await rtA.start();
+
+    const rtB = DaemonRuntime.create(b);
+    cleanups.push(() => rtB.shutdown());
+    rtB.registerFactory('counter', counterFactory());
+    await rtB.start();
+    // Deliberately do NOT call rtB.expectMigration — so the
+    // target's factory_registry has no entry for this origin_hash.
+
+    const id = Identity.generate();
+    const handle = await rtA.spawn('counter', id);
+    const mig = await rtA.startMigrationWith(
+      handle.originHash,
+      a.nodeId(),
+      b.nodeId(),
+      // Disable retry so the first failure surfaces without the
+      // default 30s NotReady backoff delaying the test.
+      { retryNotReadyMs: 0n },
+    );
+
+    try {
+      await mig.waitWithTimeout(5000n);
+      throw new Error('expected wait() to reject');
+    } catch (e) {
+      expect(e).toBeInstanceOf(MigrationError);
+      const err = e as MigrationError;
+      expect(err.kind).toBe('factory-not-found');
+    }
+  }, 15_000);
+
+  it('mid-flight failure: target restore throws → wait() rejects kind state-failed', async () => {
+    // Build the source daemon with the normal counter factory so
+    // snapshot() emits a valid 4-byte state payload. The target
+    // registers a factory whose `restore` throws — the dispatcher
+    // calls `DaemonHost::from_snapshot` → bridge.restore(state) →
+    // JS callback throws → CoreDaemonError::RestoreFailed → wire-
+    // level MigrationFailed(StateFailed(msg)).
+    const [aAddr, bAddr] = [`127.0.0.1:${portSeed++}`, `127.0.0.1:${portSeed++}`];
+    const a = await MeshNode.create({ bindAddr: aAddr, psk: PSK });
+    cleanups.push(() => a.shutdown());
+    const b = await MeshNode.create({ bindAddr: bAddr, psk: PSK });
+    cleanups.push(() => b.shutdown());
+    await Promise.all([
+      b.accept(a.nodeId()),
+      (async () => {
+        await new Promise((r) => setTimeout(r, 50));
+        await a.connect(bAddr, b.publicKey(), b.nodeId());
+      })(),
+    ]);
+    await a.start();
+    await b.start();
+
+    const rtA = DaemonRuntime.create(a);
+    cleanups.push(() => rtA.shutdown());
+    rtA.registerFactory('counter', counterFactory());
+    await rtA.start();
+
+    const rtB = DaemonRuntime.create(b);
+    cleanups.push(() => rtB.shutdown());
+    // Target-side factory whose restore throws — mirror the same
+    // kind string so `expectMigration('counter', ...)` matches
+    // the source's spawn kind.
+    rtB.registerFactory('counter', () => {
+      let count = 0;
+      return {
+        name: 'counter',
+        process: () => {
+          count += 1;
+          const buf = Buffer.alloc(4);
+          buf.writeUInt32LE(count, 0);
+          return [buf];
+        },
+        snapshot: (): Buffer | null => {
+          const buf = Buffer.alloc(4);
+          buf.writeUInt32LE(count, 0);
+          return buf;
+        },
+        restore: (_state: Buffer) => {
+          throw new Error('deliberate restore failure');
+        },
+      };
+    });
+    await rtB.start();
+
+    const id = Identity.generate();
+    const handle = await rtA.spawn('counter', id);
+    // Drive the counter so the snapshot carries real state; also
+    // ensures the source is past any zero-state degenerate edge.
+    for (let i = 1; i <= 2; i++) {
+      await rtA.deliver(handle.originHash, {
+        originHash: id.originHash,
+        sequence: BigInt(i),
+        payload: Buffer.alloc(0),
+      });
+    }
+
+    rtB.expectMigration('counter', handle.originHash);
+
+    const mig = await rtA.startMigration(
+      handle.originHash,
+      a.nodeId(),
+      b.nodeId(),
+    );
+    try {
+      await mig.waitWithTimeout(5000n);
+      throw new Error('expected wait() to reject');
+    } catch (e) {
+      expect(e).toBeInstanceOf(MigrationError);
+      const err = e as MigrationError;
+      expect(err.kind).toBe('state-failed');
+      // Detail should carry the restore error's message somewhere
+      // in the chain. We don't pin the exact wording (it passes
+      // through RestoreFailed + StateFailed formatters) but the
+      // field should be a non-empty string.
+      expect(typeof err.detail).toBe('string');
+      expect(err.detail!.length).toBeGreaterThan(0);
+    }
+  }, 15_000);
+
   it('end-to-end migration: counter survives A → B with envelope transport', async () => {
     // Stage 4 exit criterion. Mirrors the Rust SDK's
     // `local_source_migration_reaches_complete_and_transfers_state`
