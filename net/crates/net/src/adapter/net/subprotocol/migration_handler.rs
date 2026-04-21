@@ -1345,6 +1345,132 @@ mod tests {
         let _ = IdentityEnvelope::new; // silence unused import
     }
 
+    /// Regression (Cubic-AI P1): seal failure inside the
+    /// `TakeSnapshot` dispatcher path was propagated as a
+    /// dispatcher error via `?`, leaving the source's
+    /// `start_snapshot` record in place AND starving the remote
+    /// orchestrator — it's waiting for a `SnapshotReady` that
+    /// will never arrive.
+    ///
+    /// The fix converts seal failures into a `MigrationFailed`
+    /// wire reply back to the orchestrator, aborts the local
+    /// source-handler record, and returns the single-message
+    /// outbound so the caller dispatches it normally.
+    ///
+    /// Test: construct a public-only daemon keypair (seal will
+    /// fail at attestation), wire an identity context that
+    /// surfaces the target's static, drive the handler with a
+    /// `TakeSnapshot` message. Assert:
+    /// 1. `handle_message` returns `Ok(outbound)` — no bubble-up.
+    /// 2. The outbound contains exactly one `MigrationFailed`
+    ///    addressed to the originator (`from_node`).
+    /// 3. The `source_handler` no longer tracks this daemon
+    ///    (abort ran).
+    #[test]
+    fn take_snapshot_seal_failure_emits_migration_failed_reply() {
+        use crate::adapter::net::state::snapshot::StateSnapshot;
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Secret};
+
+        // Target static for the context's peer lookup. The value
+        // isn't exercised by the seal (it fails at attestation
+        // first due to public-only keypair), but the context needs
+        // a non-None for the lookup or it'd short-circuit before
+        // hitting the seal at all.
+        let mut x25519_seed = [0u8; 32];
+        getrandom::fill(&mut x25519_seed).unwrap();
+        let target_priv = X25519Secret::from(x25519_seed);
+        let target_pub = *X25519Pub::from(&target_priv).as_bytes();
+        let target_node_id: u64 = 0x2222;
+        let orchestrator_node_id: u64 = 0x3333;
+
+        // Daemon registered with a public-only keypair — seal's
+        // attestation step needs the signing half, so this guarantees
+        // `maybe_seal_envelope` returns Err once the seal runs.
+        let real_kp = EntityKeypair::generate();
+        let origin = real_kp.origin_hash();
+        let public_only_kp = EntityKeypair::public_only(real_kp.entity_id().clone());
+
+        let reg = Arc::new(DaemonRegistry::new());
+        let host = DaemonHost::new(
+            Box::new(TestDaemon { value: 7 }),
+            public_only_kp,
+            DaemonHostConfig::default(),
+        );
+        reg.register(host).unwrap();
+
+        let unseal: EnvelopeUnsealFn =
+            Arc::new(move |snap: &StateSnapshot| snap.open_identity_envelope(&target_priv));
+        let peer_static_lookup: Arc<dyn Fn(u64) -> Option<[u8; 32]> + Send + Sync> =
+            Arc::new(move |nid| {
+                if nid == target_node_id {
+                    Some(target_pub)
+                } else {
+                    None
+                }
+            });
+        let ctx = MigrationIdentityContext {
+            unseal_snapshot: unseal,
+            peer_static_lookup,
+        };
+
+        let orch = Arc::new(MigrationOrchestrator::new(reg.clone(), 0x1111));
+        let source = Arc::new(MigrationSourceHandler::new(reg.clone()));
+        let target = Arc::new(MigrationTargetHandler::new(reg));
+        let handler = MigrationSubprotocolHandler::with_hooks(
+            orch,
+            source.clone(),
+            target,
+            0x1111,
+            MigrationHandlerHooks {
+                identity: Some(ctx),
+                ..Default::default()
+            },
+        );
+
+        // Drive a `TakeSnapshot` from the fictional orchestrator.
+        let msg = MigrationMessage::TakeSnapshot {
+            daemon_origin: origin,
+            target_node: target_node_id,
+        };
+        let encoded = wire::encode(&msg).unwrap();
+        let outbound = handler
+            .handle_message(&encoded, orchestrator_node_id)
+            .expect("seal failure must not bubble up as dispatcher error");
+
+        // Exactly one message back, addressed to the orchestrator
+        // that sent TakeSnapshot.
+        assert_eq!(
+            outbound.len(),
+            1,
+            "expected single MigrationFailed reply, got {} messages",
+            outbound.len(),
+        );
+        assert_eq!(outbound[0].dest_node, orchestrator_node_id);
+
+        let reply = wire::decode(&outbound[0].payload).unwrap();
+        match reply {
+            MigrationMessage::MigrationFailed {
+                daemon_origin,
+                reason,
+            } => {
+                assert_eq!(daemon_origin, origin);
+                let reason_msg = format!("{reason}");
+                assert!(
+                    reason_msg.contains("identity envelope seal failed"),
+                    "expected seal-failure reason, got: {reason_msg}",
+                );
+            }
+            other => panic!("expected MigrationFailed, got {other:?}"),
+        }
+
+        // Source-handler record was aborted — the pre-fix code
+        // left this in place indefinitely.
+        assert!(
+            source.phase(origin).is_none(),
+            "source_handler must have cleared its record for {origin:#x} after a failed TakeSnapshot",
+        );
+    }
+
     #[test]
     fn test_handle_migration_failed() {
         let (handler, _reg, origin) = setup();
