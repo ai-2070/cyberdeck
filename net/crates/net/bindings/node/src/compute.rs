@@ -74,16 +74,39 @@ type FactoryTsfn = napi::threadsafe_function::ThreadsafeFunction<
     false,
 >;
 
-/// Per-method TSFN — used for the `process` / `snapshot` /
-/// `restore` callbacks that sub-step 3 will invoke from tokio
-/// tasks to dispatch events into the JS-side daemon.
+/// `process` TSFN — invoked by [`EventDispatchBridge::process`]
+/// on every inbound causal event. Takes a [`CausalEventJs`] by
+/// value, returns `Buffer[]` which NAPI marshals into
+/// `Vec<Buffer>` here.
 ///
-/// Sub-step 2b stores these but doesn't call them; the Args and
-/// Return types are therefore placeholders. Sub-step 3 will
-/// refine the types (e.g. `process` takes a `CausalEventJs`
-/// arg and returns a `Vec<Buffer>`) once the concrete call
-/// shapes are nailed down.
-type MethodTsfn = FactoryTsfn;
+/// `CalleeHandled = false`: we deal with JS-thrown errors by
+/// routing them through the `Result<Return>` callback in
+/// `call_with_return_value` (wrapped as `DaemonError::ProcessFailed`
+/// on the way back into the SDK). No need for napi-rs's
+/// callee-side error-propagation plumbing on top of that.
+type ProcessTsfn = napi::threadsafe_function::ThreadsafeFunction<
+    CausalEventJs,
+    Vec<Buffer>,
+    CausalEventJs,
+    napi::Status,
+    false,
+>;
+
+/// `snapshot` TSFN — invoked by the SDK when `take_snapshot` is
+/// requested. Takes no args; returns `Buffer | null`.
+///
+/// Sub-step 3 stores this but doesn't yet call it — snapshot
+/// wiring lands in sub-step 4. Kept at the generic shape for
+/// now; sub-step 4 will swap to
+/// `ThreadsafeFunction<(), Option<Buffer>, (), Status, false>`.
+type SnapshotTsfn = FactoryTsfn;
+
+/// `restore` TSFN — invoked by the SDK on
+/// `DaemonHost::from_snapshot`. Takes one `Buffer`; return value
+/// ignored.
+///
+/// Same sub-step-4 note as [`SnapshotTsfn`].
+type RestoreTsfn = FactoryTsfn;
 
 /// Per-runtime compute surface. One instance per `NetMesh`; clone
 /// handles are `Arc`-shared internally.
@@ -243,7 +266,7 @@ impl DaemonRuntime {
         env: &'env Env,
         kind: String,
         identity: &crate::identity::Identity,
-        process: Function<'_, (), napi::threadsafe_function::UnknownReturnValue>,
+        process: Function<'_, CausalEventJs, Vec<Buffer>>,
         snapshot: Option<Function<'_, (), napi::threadsafe_function::UnknownReturnValue>>,
         restore: Option<Function<'_, (), napi::threadsafe_function::UnknownReturnValue>>,
         config: Option<DaemonHostConfigJs>,
@@ -262,12 +285,12 @@ impl DaemonRuntime {
         // values are `!Send`, so we can't carry them into the
         // async future. Each TSFN is `Send + Sync + Clone`; the
         // future below holds only TSFNs.
-        let process_tsfn: MethodTsfn = process.build_threadsafe_function().build()?;
-        let snapshot_tsfn = match snapshot {
+        let process_tsfn: ProcessTsfn = process.build_threadsafe_function().build()?;
+        let snapshot_tsfn: Option<SnapshotTsfn> = match snapshot {
             Some(f) => Some(f.build_threadsafe_function().build()?),
             None => None,
         };
-        let restore_tsfn = match restore {
+        let restore_tsfn: Option<RestoreTsfn> = match restore {
             Some(f) => Some(f.build_threadsafe_function().build()?),
             None => None,
         };
@@ -316,6 +339,85 @@ impl DaemonRuntime {
             .stop(origin_hash)
             .await
             .map_err(|e| daemon_err(e.to_string()))
+    }
+
+    /// Deliver a single causal event to the daemon identified by
+    /// `origin_hash`. Invokes the daemon's JS `process(event)`
+    /// callback via the `ThreadsafeFunction` stored at `spawn`
+    /// time, waits for the `Buffer[]` return, and surfaces each
+    /// output back to JS as a `Buffer`.
+    ///
+    /// Direct ingress — Stage 1 convenience. Mesh-dispatched
+    /// delivery (inbound via the causal subprotocol) lands in a
+    /// later stage, at which point this method becomes test
+    /// sugar rather than the primary entry point.
+    #[napi]
+    pub async fn deliver(
+        &self,
+        origin_hash: u32,
+        event: CausalEventJs,
+    ) -> Result<Vec<Buffer>> {
+        use bytes::Bytes as BytesType;
+        use net::adapter::net::state::causal::CausalLink;
+
+        let (_sign, sequence, _lossless) = event.sequence.get_u64();
+        let core_event = CausalEvent {
+            link: CausalLink {
+                origin_hash: event.origin_hash,
+                horizon_encoded: 0,
+                sequence,
+                parent_hash: 0,
+            },
+            payload: BytesType::copy_from_slice(&event.payload),
+            received_at: 0,
+        };
+
+        // SDK's `deliver` routes through `DaemonRegistry::deliver`
+        // → `DaemonHost::deliver` → `MeshDaemon::process` on the
+        // bridge, which is where the TSFN round-trip to JS
+        // happens. The outputs come back as `Vec<Bytes>` wrapped
+        // in causal events; we discard the chain wrapping and
+        // return just the payload buffers.
+        let outputs = self
+            .inner
+            .deliver(origin_hash, &core_event)
+            .map_err(|e| daemon_err(e.to_string()))?;
+
+        Ok(outputs
+            .into_iter()
+            .map(|ev| Buffer::from(ev.payload.as_ref()))
+            .collect())
+    }
+}
+
+// =========================================================================
+// CausalEvent POJO — marshalled across NAPI into the JS daemon's `process`.
+// =========================================================================
+
+/// The causal event handed to a daemon's `process(event)` method.
+///
+/// Field shape matches
+/// [`net::adapter::net::state::causal::CausalEvent`] with the
+/// 64-bit `sequence` exposed as `BigInt` so JS doesn't silently
+/// truncate.
+#[napi(object)]
+pub struct CausalEventJs {
+    /// 32-bit hash of the emitting entity.
+    pub origin_hash: u32,
+    /// Sequence number in the emitter's causal chain.
+    pub sequence: BigInt,
+    /// Opaque payload bytes — identical to `event.payload` on the
+    /// Rust side.
+    pub payload: Buffer,
+}
+
+impl From<&CausalEvent> for CausalEventJs {
+    fn from(event: &CausalEvent) -> Self {
+        Self {
+            origin_hash: event.link.origin_hash,
+            sequence: BigInt::from(event.link.sequence),
+            payload: Buffer::from(event.payload.as_ref()),
+        }
     }
 }
 
@@ -410,12 +512,11 @@ impl DaemonHandle {
 /// call the TSFNs and marshal arguments / return values.
 struct EventDispatchBridge {
     name: String,
+    process: ProcessTsfn,
     #[allow(dead_code)]
-    process: MethodTsfn,
+    snapshot: Option<SnapshotTsfn>,
     #[allow(dead_code)]
-    snapshot: Option<MethodTsfn>,
-    #[allow(dead_code)]
-    restore: Option<MethodTsfn>,
+    restore: Option<RestoreTsfn>,
 }
 
 impl MeshDaemon for EventDispatchBridge {
@@ -427,14 +528,75 @@ impl MeshDaemon for EventDispatchBridge {
         CapabilityFilter::default()
     }
 
+    /// Synchronously dispatch the event to the JS `process`
+    /// callback and wait for the returned `Buffer[]`.
+    ///
+    /// The TSFN call itself is asynchronous w.r.t. the Node
+    /// event loop — napi-rs queues the JS callback and fires it
+    /// when Node gets around to it. We use
+    /// `call_with_return_value` so napi-rs invokes our Rust
+    /// callback with the parsed `Result<Vec<Buffer>>` once JS
+    /// returns; that callback sends through an `std::sync::mpsc`
+    /// channel which this tokio task blocks on.
+    ///
+    /// Deadlock avoidance: `process` runs on a tokio worker, not
+    /// the Node main thread. Blocking on the channel is safe
+    /// because the Node event loop — where the JS `process`
+    /// function actually executes — is a separate thread. The
+    /// caller that reached us (`DaemonRuntime::deliver`) returns
+    /// a `Promise` to JS, so the JS caller's `await` yields the
+    /// event loop long enough for the TSFN callback to fire.
     fn process(
         &mut self,
-        _event: &CausalEvent,
+        event: &CausalEvent,
     ) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
-        // Sub-step 3 replaces this body with a synchronous call
-        // into `self.process` (the TSFN) waiting on a channel for
-        // the JS return. For now the daemon is live but silent.
-        Ok(Vec::new())
+        let event_js = CausalEventJs::from(event);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<Buffer>>>(1);
+
+        let status = self.process.call_with_return_value(
+            event_js,
+            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+            move |ret: Result<Vec<Buffer>>, _env| {
+                // `send` only fails if the receiver was dropped —
+                // that means the Rust caller gave up before we
+                // got a chance to reply. Nothing productive to
+                // do here; swallow to avoid napi-rs escalating
+                // to a fatal process exit.
+                let _ = tx.send(ret);
+                Ok(())
+            },
+        );
+        if status != napi::Status::Ok {
+            return Err(CoreDaemonError::ProcessFailed(format!(
+                "threadsafe_function enqueue failed: {status:?}"
+            )));
+        }
+
+        let result = rx.recv().map_err(|e| {
+            CoreDaemonError::ProcessFailed(format!(
+                "JS `process` callback did not respond: {e}"
+            ))
+        })?;
+
+        match result {
+            Ok(buffers) => {
+                // Convert `Vec<Buffer>` → `Vec<Bytes>` without
+                // extra copies. `Buffer` derefs to `&[u8]`, and
+                // `Bytes::copy_from_slice` allocates an
+                // Arc-tracked payload. The daemon's contract
+                // says outputs may be held indefinitely by the
+                // causal chain, so we must not alias the
+                // `Buffer`'s V8-managed memory — the copy is
+                // load-bearing.
+                Ok(buffers
+                    .into_iter()
+                    .map(|b| Bytes::copy_from_slice(b.as_ref()))
+                    .collect())
+            }
+            Err(e) => Err(CoreDaemonError::ProcessFailed(format!(
+                "JS `process` threw: {e}"
+            ))),
+        }
     }
 }
 

@@ -304,3 +304,198 @@ describe('DaemonRuntime (Stage 3 sub-step 2a: spawn + stop)', () => {
     expect(rt.daemonCount()).toBe(0);
   });
 });
+
+// Sub-step 3: event dispatch. `deliver()` invokes the JS `process`
+// callback through the TSFN round-trip and returns the outputs.
+describe('DaemonRuntime (Stage 3 sub-step 3: event dispatch)', () => {
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    while (cleanups.length > 0) {
+      const fn = cleanups.pop();
+      if (fn) {
+        try {
+          await fn();
+        } catch {
+          // Best-effort teardown.
+        }
+      }
+    }
+  });
+
+  it('EchoDaemon returns the input payload on deliver', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+
+    rt.registerFactory('echo', () => ({
+      name: 'echo',
+      process: (event) => [event.payload],
+    }));
+    await rt.start();
+
+    const id = Identity.generate();
+    const handle = await rt.spawn('echo', id);
+
+    const payload = Buffer.from('hello world', 'utf8');
+    const outputs = await rt.deliver(handle.originHash, {
+      originHash: id.originHash,
+      sequence: 1n,
+      payload,
+    });
+
+    expect(outputs.length).toBe(1);
+    expect(outputs[0].equals(payload)).toBe(true);
+  });
+
+  it('process closure sees per-instance state across multiple deliveries', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+
+    rt.registerFactory('counter', () => {
+      let count = 0;
+      return {
+        name: 'counter',
+        process: () => {
+          count += 1;
+          const buf = Buffer.alloc(4);
+          buf.writeUInt32LE(count, 0);
+          return [buf];
+        },
+      };
+    });
+    await rt.start();
+
+    const id = Identity.generate();
+    const handle = await rt.spawn('counter', id);
+
+    for (let i = 1; i <= 5; i++) {
+      const out = await rt.deliver(handle.originHash, {
+        originHash: id.originHash,
+        sequence: BigInt(i),
+        payload: Buffer.alloc(0),
+      });
+      expect(out.length).toBe(1);
+      expect(out[0].readUInt32LE(0)).toBe(i);
+    }
+  });
+
+  it('two concurrent daemons keep independent state', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+
+    rt.registerFactory('counter', () => {
+      let count = 0;
+      return {
+        name: 'counter',
+        process: () => {
+          count += 1;
+          const buf = Buffer.alloc(4);
+          buf.writeUInt32LE(count, 0);
+          return [buf];
+        },
+      };
+    });
+    await rt.start();
+
+    const idA = Identity.generate();
+    const idB = Identity.generate();
+    const hA = await rt.spawn('counter', idA);
+    const hB = await rt.spawn('counter', idB);
+
+    const evt = (id: Identity, seq: bigint) => ({
+      originHash: id.originHash,
+      sequence: seq,
+      payload: Buffer.alloc(0),
+    });
+
+    // Drive A three times, B once, then A twice.
+    for (let i = 1; i <= 3; i++) await rt.deliver(hA.originHash, evt(idA, BigInt(i)));
+    const bOnce = await rt.deliver(hB.originHash, evt(idB, 1n));
+    expect(bOnce[0].readUInt32LE(0)).toBe(1);
+    for (let i = 4; i <= 5; i++) {
+      const out = await rt.deliver(hA.originHash, evt(idA, BigInt(i)));
+      expect(out[0].readUInt32LE(0)).toBe(i);
+    }
+    const bAgain = await rt.deliver(hB.originHash, evt(idB, 2n));
+    expect(bAgain[0].readUInt32LE(0)).toBe(2);
+  });
+
+  it('process returning multiple buffers: caller sees all of them', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+
+    rt.registerFactory('fanout', () => ({
+      name: 'fanout',
+      process: () => [
+        Buffer.from('a'),
+        Buffer.from('bb'),
+        Buffer.from('ccc'),
+      ],
+    }));
+    await rt.start();
+
+    const id = Identity.generate();
+    const handle = await rt.spawn('fanout', id);
+    const out = await rt.deliver(handle.originHash, {
+      originHash: id.originHash,
+      sequence: 1n,
+      payload: Buffer.alloc(0),
+    });
+    expect(out.length).toBe(3);
+    expect(out[0].toString()).toBe('a');
+    expect(out[1].toString()).toBe('bb');
+    expect(out[2].toString()).toBe('ccc');
+  });
+
+  it('deliver to an unknown origin throws DaemonError', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+    rt.registerFactory('echo', () => ({
+      name: 'echo',
+      process: (e) => [e.payload],
+    }));
+    await rt.start();
+
+    await expect(
+      rt.deliver(0xdeadbeef, {
+        originHash: 0xdeadbeef,
+        sequence: 1n,
+        payload: Buffer.from('x'),
+      }),
+    ).rejects.toThrow(DaemonError);
+  });
+
+  it('JS process throwing surfaces as DaemonError', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+
+    rt.registerFactory('buggy', () => ({
+      name: 'buggy',
+      process: () => {
+        throw new Error('boom');
+      },
+    }));
+    await rt.start();
+    const id = Identity.generate();
+    const handle = await rt.spawn('buggy', id);
+    await expect(
+      rt.deliver(handle.originHash, {
+        originHash: id.originHash,
+        sequence: 1n,
+        payload: Buffer.alloc(0),
+      }),
+    ).rejects.toThrow(DaemonError);
+  });
+});

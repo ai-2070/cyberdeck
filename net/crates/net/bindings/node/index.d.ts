@@ -103,7 +103,7 @@ export declare class DaemonRuntime {
    * idiomatic napi-rs pattern for "sync setup, async
    * continuation."
    */
-  spawn(kind: string, identity: Identity, process: () => unknown, snapshot?: (() => unknown) | undefined | null, restore?: (() => unknown) | undefined | null, config?: DaemonHostConfigJs | undefined | null): Promise<DaemonHandle>
+  spawn(kind: string, identity: Identity, process: (arg: CausalEventJs) => Array<Buffer>, snapshot?: (() => unknown) | undefined | null, restore?: (() => unknown) | undefined | null, config?: DaemonHostConfigJs | undefined | null): Promise<DaemonHandle>
   /**
    * Stop a daemon, removing it from the runtime's registry.
    *
@@ -113,6 +113,19 @@ export declare class DaemonRuntime {
    * SDK's error is surfaced verbatim with the `daemon:` prefix.
    */
   stop(originHash: number): Promise<void>
+  /**
+   * Deliver a single causal event to the daemon identified by
+   * `origin_hash`. Invokes the daemon's JS `process(event)`
+   * callback via the `ThreadsafeFunction` stored at `spawn`
+   * time, waits for the `Buffer[]` return, and surfaces each
+   * output back to JS as a `Buffer`.
+   *
+   * Direct ingress — Stage 1 convenience. Mesh-dispatched
+   * delivery (inbound via the causal subprotocol) lands in a
+   * later stage, at which point this method becomes test
+   * sugar rather than the primary entry point.
+   */
+  deliver(originHash: number, event: CausalEventJs): Promise<Array<Buffer>>
 }
 
 /**
@@ -827,6 +840,26 @@ export interface CapabilitySetJs {
   tools?: Array<ToolJs>
   tags?: Array<string>
   limits?: CapabilityLimitsJs
+}
+
+/**
+ * The causal event handed to a daemon's `process(event)` method.
+ *
+ * Field shape matches
+ * [`net::adapter::net::state::causal::CausalEvent`] with the
+ * 64-bit `sequence` exposed as `BigInt` so JS doesn't silently
+ * truncate.
+ */
+export interface CausalEventJs {
+  /** 32-bit hash of the emitting entity. */
+  originHash: number
+  /** Sequence number in the emitter's causal chain. */
+  sequence: bigint
+  /**
+   * Opaque payload bytes — identical to `event.payload` on the
+   * Rust side.
+   */
+  payload: Buffer
 }
 
 /**

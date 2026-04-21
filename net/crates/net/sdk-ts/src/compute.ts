@@ -311,7 +311,15 @@ export class DaemonRuntime {
     // stateless daemons omit them. `bind(instance)` preserves
     // `this` inside user code when NAPI invokes the function
     // off the main thread via the TSFN.
-    const process = instance.process.bind(instance) as () => unknown;
+    //
+    // Shape conversion for `process`: the SDK `MeshDaemon.process`
+    // returns `Buffer[]`; NAPI's generated type is
+    // `(arg: CausalEventJs) => Buffer[]`. Signatures match in
+    // practice — the Rust side marshals a full `CausalEventJs`,
+    // and the SDK's `MeshDaemon` contract requires `Buffer[]`.
+    const process = instance.process.bind(instance) as (
+      event: CausalEvent,
+    ) => Buffer[];
     const snapshot = instance.snapshot
       ? (instance.snapshot.bind(instance) as () => unknown)
       : undefined;
@@ -350,6 +358,37 @@ export class DaemonRuntime {
       await this.inner.stop(originHash);
     } catch (e) {
       toDaemonError(e);
+    }
+  }
+
+  /**
+   * Deliver a single causal event to a live daemon and return
+   * the daemon's output buffers. Routes through the core
+   * `DaemonRegistry::deliver` → `MeshDaemon::process` path,
+   * which invokes the JS `process(event)` callback registered
+   * at spawn time and waits for its return.
+   *
+   * Direct ingress — Stage 1 convenience. Mesh-dispatched
+   * delivery (via the causal subprotocol on an inbound packet)
+   * lands in a later stage; this method stays as test sugar + a
+   * manual-trigger surface.
+   *
+   * Throws {@link DaemonError} if `originHash` doesn't match a
+   * live daemon, if the daemon's `process` throws, or if the
+   * runtime is shutting down.
+   */
+  async deliver(
+    originHash: number,
+    event: CausalEvent,
+  ): Promise<Buffer[]> {
+    try {
+      return await this.inner.deliver(originHash, {
+        originHash: event.originHash,
+        sequence: event.sequence,
+        payload: event.payload,
+      });
+    } catch (e) {
+      return toDaemonError(e);
     }
   }
 }
