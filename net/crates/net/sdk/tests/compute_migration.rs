@@ -236,9 +236,21 @@ async fn migration_to_unconnected_peer_fails_target_unavailable() {
     match err {
         DaemonError::Migration(e) => {
             let msg = format!("{}", e);
+            // Either the envelope-seal prerequisite check fails
+            // first (peer X25519 static unknown for the
+            // unconnected node), or the subsequent send fails
+            // (no peer_addr). Both are correct rejections of a
+            // migration to a peer we have no session with. The
+            // previous `Ok(None)` fallback in `maybe_seal_local_snapshot`
+            // would silently proceed with unsealed bytes and surface
+            // only the send-side failure; the current stricter
+            // semantic may surface the seal-prerequisite error
+            // instead.
             assert!(
-                msg.contains("unavailable") || msg.contains("send"),
-                "expected TargetUnavailable-flavored error, got: {msg}",
+                msg.contains("unavailable")
+                    || msg.contains("send")
+                    || msg.contains("peer X25519 static"),
+                "expected target-unreachable-flavored error, got: {msg}",
             );
         }
         other => panic!("expected DaemonError::Migration, got {other:?}"),
@@ -1154,6 +1166,162 @@ async fn wait_without_timeout_survives_120_virtual_seconds() {
 }
 
 use net_sdk::compute::MigrationPhase;
+
+/// Regression (Cubic-AI P1): `transport_identity: true` is a
+/// strict opt-in. When the local mesh cannot supply the target's
+/// X25519 static (e.g. this node was the NKpsk0 responder, so
+/// `snow` never surfaced the initiator's static), the previous
+/// `maybe_seal_local_snapshot` returned `Ok(None)` and
+/// `start_migration_with` proceeded with an **unsealed**
+/// snapshot — silently downgrading the migration below what the
+/// caller opted into.
+///
+/// The fix treats "peer X25519 unknown" and "daemon keypair
+/// absent" as terminal errors under `transport_identity: true`.
+/// Callers who want to proceed unsealed in NKpsk0-responder
+/// topologies must now set `transport_identity: false`
+/// explicitly.
+///
+/// Fixture: the default `build_pair` makes node A the initiator
+/// and node B the responder. On B, `peer_static_x25519(A)`
+/// returns `None` (the documented NKpsk0 limitation exercised in
+/// `capability_broadcast::peer_static_x25519_returns_peer_noise_pubkey_after_handshake`).
+/// Spawning on B and attempting to migrate B→A with
+/// `transport_identity: true` must fail with the seal-prerequisite
+/// error, not complete silently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transport_identity_strict_rejects_when_peer_static_unknown() {
+    let pair = build_pair().await;
+    // Responder is `target_rt` (B) in the fixture; flip roles
+    // so the responder is the migration source.
+    let source_rt = &pair.target_rt;
+    let target_rt = &pair.source_rt;
+
+    source_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    target_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    source_rt.start().await.unwrap();
+    target_rt.start().await.unwrap();
+    source_rt.mesh().inner().start();
+    target_rt.mesh().inner().start();
+    sleep(Duration::from_millis(100)).await;
+
+    let target_node_id = target_rt.mesh().inner().node_id();
+    let source_node_id = source_rt.mesh().inner().node_id();
+
+    // Sanity: responder side (source) indeed cannot see the
+    // initiator side's (target) X25519 static. If this fails,
+    // the fixture doesn't reflect the NKpsk0 limitation and
+    // the test below isn't exercising the right scenario.
+    assert!(
+        source_rt
+            .mesh()
+            .inner()
+            .peer_static_x25519(target_node_id)
+            .is_none(),
+        "fixture: responder should see None for initiator's X25519 static",
+    );
+
+    let identity = Identity::generate();
+    let origin_hash = identity.keypair().origin_hash();
+    let _handle = source_rt
+        .spawn("counter", identity.clone(), DaemonHostConfig::default())
+        .await
+        .expect("spawn on responder");
+    target_rt
+        .expect_migration("counter", origin_hash, DaemonHostConfig::default())
+        .expect("expect_migration on initiator");
+
+    // Strict opt-in. Pre-fix: `Ok(None)` silent downgrade →
+    // migration proceeds unsealed → either completes incorrectly
+    // or fails later for a misleading reason. Post-fix: fails
+    // here with the seal-prerequisite error.
+    let err = source_rt
+        .start_migration_with(
+            origin_hash,
+            source_node_id,
+            target_node_id,
+            MigrationOpts {
+                transport_identity: true,
+                retry_not_ready: None,
+            },
+        )
+        .await
+        .expect_err(
+            "transport_identity: true must reject when peer X25519 static is unknown — \
+             silently proceeding unsealed breaks the caller's opt-in guarantee",
+        );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("peer X25519 static"),
+        "expected seal-prerequisite error mentioning peer X25519 static, got: {msg}",
+    );
+    // Post-completion: no daemon landed on target; source still
+    // has its own daemon; orchestrator record was rolled back.
+    assert_eq!(target_rt.daemon_count(), 0);
+    assert_eq!(source_rt.daemon_count(), 1);
+}
+
+/// Complement to the strict rejection above: opting out via
+/// `transport_identity: false` must still proceed successfully
+/// in the NKpsk0-responder topology, using the
+/// `register_migration_target_identity` fallback keypair on the
+/// target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transport_identity_false_proceeds_unsealed_under_nkpsk0_responder_source() {
+    let pair = build_pair().await;
+    let source_rt = &pair.target_rt;
+    let target_rt = &pair.source_rt;
+
+    source_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    target_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    source_rt.start().await.unwrap();
+    target_rt.start().await.unwrap();
+    source_rt.mesh().inner().start();
+    target_rt.mesh().inner().start();
+    sleep(Duration::from_millis(100)).await;
+
+    let identity = Identity::generate();
+    let origin_hash = identity.keypair().origin_hash();
+    let _handle = source_rt
+        .spawn("counter", identity.clone(), DaemonHostConfig::default())
+        .await
+        .expect("spawn");
+    // Opt-out requires the target to pre-register the identity
+    // so the factory has a keypair to restore under.
+    target_rt
+        .register_migration_target_identity(
+            "counter",
+            identity,
+            DaemonHostConfig::default(),
+        )
+        .expect("target identity");
+
+    let mig = source_rt
+        .start_migration_with(
+            origin_hash,
+            source_rt.mesh().inner().node_id(),
+            target_rt.mesh().inner().node_id(),
+            MigrationOpts {
+                transport_identity: false,
+                retry_not_ready: None,
+            },
+        )
+        .await
+        .expect("start_migration with opt-out");
+    mig.wait_with_timeout(Duration::from_secs(5))
+        .await
+        .expect("migration reaches Complete under opt-out");
+    assert_eq!(source_rt.daemon_count(), 0);
+    assert_eq!(target_rt.daemon_count(), 1);
+}
 
 /// Regression (Cubic-AI P2 on `recent_failures` cache hygiene): the
 /// dispatcher's failure callback populates `recent_failures[origin]`

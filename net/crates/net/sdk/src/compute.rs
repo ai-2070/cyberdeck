@@ -1056,11 +1056,12 @@ impl DaemonRuntime {
                 ..
             } = first_msg
             {
-                // `?` on the seal's `Result` propagates hard failures
-                // (prerequisites met but crypto bug) and leaves the
-                // caller's orchestrator record to abort cleanly. A
-                // quiet `Ok(None)` means "prerequisites missing;
-                // proceed unsealed" — the documented fallback.
+                // `transport_identity: true` is a strict opt-in:
+                // prerequisites-missing (e.g. NKpsk0-responder)
+                // surfaces as `Err` and aborts the migration, not a
+                // silent downgrade to unsealed. `Ok(None)` is
+                // reserved for "snapshot already carries an
+                // envelope" (not a downgrade, just no-op here).
                 match self.maybe_seal_local_snapshot(
                     origin_hash,
                     target_node,
@@ -1122,25 +1123,36 @@ impl DaemonRuntime {
         })
     }
 
-    /// Decode `snapshot_bytes`, attempt to seal an identity envelope
-    /// using the local daemon's keypair + target's X25519 static
-    /// pubkey, and re-encode.
+    /// Decode `snapshot_bytes`, seal an identity envelope using
+    /// the local daemon's keypair + target's X25519 static pubkey,
+    /// and re-encode.
+    ///
+    /// Called only when the caller opted into envelope transport
+    /// via `MigrationOpts { transport_identity: true }`. The
+    /// caller committed to the stronger guarantee at that opt-in
+    /// point; this helper must never silently downgrade.
     ///
     /// Resolution:
-    /// - `Ok(None)`: the snapshot already has an envelope, or a
-    ///   transport prerequisite (peer static not known, daemon
-    ///   keypair absent) is missing. The caller proceeds with the
-    ///   original unsealed bytes — this matches the documented
-    ///   NKpsk0-responder / public-identity fallback.
+    /// - `Ok(None)`: the snapshot already carries an envelope
+    ///   (e.g. pre-sealed upstream). Caller proceeds with the
+    ///   existing bytes — this is not a downgrade, the envelope
+    ///   is already there.
     /// - `Ok(Some(new_bytes))`: sealed successfully; caller should
     ///   replace the snapshot payload.
-    /// - `Err(_)`: prerequisites were met but the seal operation
-    ///   itself failed. The caller **must** abort — silently
-    ///   proceeding with the unsealed snapshot would break the
-    ///   identity-transport guarantee the caller opted into via
-    ///   `MigrationOpts { transport_identity: true }`, and the
-    ///   target would restore under whatever fallback keypair the
-    ///   factory registry carries (possibly a stale or absent one).
+    /// - `Err(_)`: any missing prerequisite (peer X25519 static
+    ///   unknown, daemon keypair absent) or seal-crypto failure.
+    ///   The caller **must** abort — silently falling back to
+    ///   unsealed transport would break the caller's opt-in
+    ///   guarantee, and the target would restore under whatever
+    ///   pre-provisioned keypair the factory registry carries
+    ///   (possibly stale, possibly absent).
+    ///
+    /// The NKpsk0-responder case (target was the handshake
+    /// responder, its peer static is not surfaced by `snow`) is a
+    /// concrete prerequisite-missing scenario that now fails
+    /// here. Callers in that topology should use `transport_identity:
+    /// false` explicitly, which signals "I know identity transport
+    /// isn't reachable; proceed unsealed."
     fn maybe_seal_local_snapshot(
         &self,
         daemon_origin: u32,
@@ -1153,13 +1165,23 @@ impl DaemonRuntime {
             ))
         })?;
         if snapshot.identity_envelope.is_some() {
+            // Upstream already sealed — not a downgrade, the
+            // envelope is present.
             return Ok(None);
         }
         let Some(target_pub) = self.inner.mesh.inner().peer_static_x25519(target_node) else {
-            return Ok(None);
+            return Err(DaemonError::Migration(MigrationError::StateFailed(format!(
+                "identity transport requested but peer X25519 static for \
+                 {target_node:#x} is unknown (e.g. NKpsk0-responder \
+                 side) — cannot seal envelope; use \
+                 `transport_identity: false` to proceed unsealed"
+            ))));
         };
         let Some(kp) = self.inner.registry.daemon_keypair(daemon_origin) else {
-            return Ok(None);
+            return Err(DaemonError::Migration(MigrationError::StateFailed(format!(
+                "identity transport requested but daemon {daemon_origin:#x} has \
+                 no local keypair to seal with"
+            ))));
         };
         snapshot
             .with_identity_envelope(&kp, target_pub)
