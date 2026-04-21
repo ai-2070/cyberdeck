@@ -315,6 +315,73 @@ async fn forged_node_id_rejected_even_with_valid_signature() {
     );
 }
 
+/// Regression for a cubic-flagged P2: an attacker that forwards a
+/// victim's signed announcement through their own session used to
+/// get TOFU-bound to the victim's `entity_id`. The announcement's
+/// signature was valid (the victim really signed it), but the
+/// `from_node` on the receiver side was the attacker, not the
+/// origin — so the binding said "attacker's session belongs to
+/// victim," later satisfying `authorize_subscribe`'s entity lookup
+/// for the wrong peer. The fix restricts TOFU pinning to
+/// announcements that arrived **directly** from the origin
+/// (`hop_count == 0`); forwarded announcements still update the
+/// capability index + routing but no longer touch
+/// `peer_entity_ids`.
+#[tokio::test]
+async fn forwarded_announcement_does_not_tofu_pin_forwarder_to_victim_entity() {
+    use net::adapter::net::behavior::SUBPROTOCOL_CAPABILITY_ANN;
+
+    let ports = find_ports(2).await;
+    let attacker = build_node(ports[0]).await;
+    let receiver = build_node(ports[1]).await;
+    handshake(&attacker, &receiver).await;
+
+    // The victim never joins the network — the attacker harvested
+    // the victim's signed announcement bytes (say, from an earlier
+    // multi-hop path) and now replays them via their own session.
+    let victim_kp = EntityKeypair::generate();
+    let victim_entity = victim_kp.entity_id().clone();
+    let victim_node_id = victim_kp.node_id();
+
+    let caps = CapabilitySet::new().add_tag("forwarded-tofu-probe");
+    let mut ann = CapabilityAnnouncement::new(victim_node_id, victim_entity.clone(), 1, caps);
+    ann.sign(&victim_kp);
+    assert!(ann.verify().is_ok(), "victim's signature is valid");
+
+    // Bump hop_count so the receiver treats this as a forwarded
+    // announcement (skips the `ann.node_id == from_node` check and
+    // falls into the relay path). Signature verification still
+    // passes because `signed_payload` zeros hop_count.
+    ann.hop_count = 1;
+
+    let payload = ann.to_bytes();
+    attacker
+        .send_subprotocol(receiver.local_addr(), SUBPROTOCOL_CAPABILITY_ANN, &payload)
+        .await
+        .expect("send forwarded announcement");
+
+    // The announcement may still land in the capability index for
+    // the victim's node_id — that's fine, the signature is real.
+    let filter = CapabilityFilter::new().require_tag("forwarded-tofu-probe");
+    let arrived =
+        wait_until(&receiver, |n| n.find_peers_by_filter(&filter).contains(&victim_node_id)).await;
+    assert!(
+        arrived,
+        "receiver should still index the victim by node_id — signature is valid",
+    );
+
+    // But the attacker's session must NOT be TOFU-bound to the
+    // victim's entity_id. That's the core property: a forwarder
+    // cannot impersonate the origin for direct-session auth.
+    let attacker_node_id = attacker.node_id();
+    assert!(
+        receiver.peer_entity_id(attacker_node_id)
+            != Some(victim_entity.clone()),
+        "attacker's session got TOFU-pinned to the victim's entity_id via a forwarded announcement — \
+         forwarder can now impersonate origin for channel auth",
+    );
+}
+
 /// Regression for a cubic-flagged P1/P2: TOFU used to pin the
 /// `(from_node → entity_id)` mapping from the first seen
 /// announcement regardless of whether the announcement was

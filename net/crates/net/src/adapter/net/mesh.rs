@@ -2602,14 +2602,29 @@ impl MeshNode {
 
         // First-seen identity pin — TOFU. A peer that tries to
         // rebind its `entity_id` in a later announcement is
-        // silently rejected. Pin ONLY for signature-verified
-        // announcements; an unsigned announcement's entity_id is
-        // attacker-controlled and would poison the binding.
-        // Unauthenticated deployments skip the pin entirely —
-        // channel-auth paths that need the binding will fail
-        // cleanly at "missing entity" rather than trusting forged
-        // input.
-        if signature_verified {
+        // silently rejected. Two preconditions must hold before we
+        // pin anything:
+        //
+        // 1. The announcement is **signature-verified**. An
+        //    unsigned announcement's `entity_id` is attacker-
+        //    controlled and would poison the binding; unauthenticated
+        //    deployments skip the pin entirely, and channel-auth
+        //    paths fall through to "missing entity" instead of
+        //    trusting forged input.
+        // 2. The announcement arrived **directly** from the origin
+        //    (`hop_count == 0`). On that path `ann.node_id` was
+        //    already checked to equal `from_node` above, so pinning
+        //    `from_node → ann.entity_id` binds the session to the
+        //    key that actually signed for it. A forwarded
+        //    announcement (`hop_count > 0`) travels through an
+        //    arbitrary middle peer; pinning `from_node → victim_id`
+        //    in that path would let the forwarder pose as the
+        //    origin for subsequent channel auth (`authorize_subscribe`
+        //    keys on `peer_entity_ids.get(from_node)`). Forwarded
+        //    caps still update the capability index + routing, but
+        //    the entity binding is deferred to the eventual direct
+        //    announcement.
+        if signature_verified && ann.hop_count == 0 {
             if let Some(existing) = ctx.peer_entity_ids.get(&from_node) {
                 if *existing.value() != ann.entity_id {
                     tracing::trace!(
