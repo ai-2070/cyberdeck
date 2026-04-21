@@ -630,6 +630,80 @@ impl DaemonRuntime {
         })
     }
 
+    /// Spawn a daemon with a caller-supplied `MeshDaemon` instance,
+    /// bypassing the SDK-side kind-factory lookup.
+    ///
+    /// Used by language-binding layers (currently: the NAPI `compute`
+    /// module) that build daemon instances via cross-FFI dispatch —
+    /// the factory closure for such a daemon can't be a plain
+    /// `Fn() -> Box<dyn MeshDaemon>` because constructing the
+    /// daemon requires an awaitable call into the host language.
+    /// The binding does the await itself, hands in the resulting
+    /// `Box<dyn MeshDaemon>`, and this method does the rest of
+    /// what [`Self::spawn`] does: register the `(origin_hash →
+    /// kind-factory)` mirror in the core registry so future
+    /// migrations can reconstruct the daemon, insert the host,
+    /// and run the same shutdown-race fence.
+    ///
+    /// `kind_factory` is the closure the core registry stores for
+    /// migration-target reconstruction; it must be re-callable
+    /// (migration targets call it when they restore the daemon
+    /// on another node). Bindings typically build this by cloning
+    /// the same TSFN used for the initial spawn.
+    pub async fn spawn_with_daemon<F>(
+        &self,
+        identity: Identity,
+        config: DaemonHostConfig,
+        daemon: Box<dyn MeshDaemon>,
+        kind_factory: F,
+    ) -> Result<DaemonHandle, DaemonError>
+    where
+        F: Fn() -> Box<dyn MeshDaemon> + Send + Sync + 'static,
+    {
+        self.require_ready()?;
+        // Same test-only stall as `spawn` — tests race shutdown
+        // against this path too.
+        let stall_ms = self.inner.spawn_stall_ms.load(Ordering::Acquire);
+        if stall_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(stall_ms as u64)).await;
+        }
+        let keypair = identity.keypair().as_ref().clone();
+        let origin_hash = keypair.origin_hash();
+        let entity_id = keypair.entity_id().clone();
+
+        // Mirror the caller-supplied kind_factory into the core
+        // registry. Same atomic-register semantics as `spawn` —
+        // if another daemon already claims this origin_hash, bail
+        // without touching state.
+        self.inner
+            .factory_registry
+            .register(keypair.clone(), config.clone(), kind_factory)
+            .map_err(DaemonError::Core)?;
+
+        let host = DaemonHost::new(daemon, keypair, config);
+        if let Err(e) = self.inner.registry.register(host) {
+            self.inner.factory_registry.remove(origin_hash);
+            return Err(DaemonError::Core(e));
+        }
+
+        // Post-insert shutdown fence, matching `spawn`. Without
+        // this, a concurrent `shutdown()` that raced past our
+        // `require_ready` check and already swept the registries
+        // would leave a zombie daemon live in the torn-down
+        // runtime.
+        if self.state() == State::ShuttingDown {
+            let _ = self.inner.registry.unregister(origin_hash);
+            self.inner.factory_registry.remove(origin_hash);
+            return Err(DaemonError::ShuttingDown);
+        }
+
+        Ok(DaemonHandle {
+            origin_hash,
+            entity_id,
+            inner: self.inner.clone(),
+        })
+    }
+
     /// Spawn a daemon of `kind` and restore its state from `snapshot`.
     /// The snapshot's `entity_id` must match the caller's
     /// [`Identity`]; mismatch returns

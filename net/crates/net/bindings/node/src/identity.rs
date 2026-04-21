@@ -273,6 +273,20 @@ impl Identity {
             cache: Arc::new(TokenCache::new()),
         }
     }
+
+    /// Build a matching SDK-level `Identity` by cloning out the
+    /// seed and re-constructing. Used by sibling NAPI modules
+    /// (currently: `compute`'s `DaemonRuntime::spawn`) that feed
+    /// the identity into the SDK's compute surface.
+    ///
+    /// The token cache does NOT carry over — the SDK creates a
+    /// fresh `TokenCache` inside its own `Identity`. For
+    /// `DaemonRuntime` use this is fine; daemons don't consult
+    /// the cache at spawn time.
+    #[cfg(feature = "compute")]
+    pub(crate) fn to_sdk_identity(&self) -> net_sdk::Identity {
+        net_sdk::Identity::from_seed(*self.keypair.secret_bytes())
+    }
 }
 
 // =========================================================================

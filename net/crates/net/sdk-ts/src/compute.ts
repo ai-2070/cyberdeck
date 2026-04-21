@@ -30,8 +30,10 @@
 
 import {
   DaemonRuntime as NapiDaemonRuntime,
+  DaemonHandle as NapiDaemonHandle,
 } from '@ai2070/net';
 
+import { Identity } from './identity.js';
 import { MeshNode } from './mesh.js';
 
 // ----------------------------------------------------------------------------
@@ -105,6 +107,59 @@ export interface MeshDaemon {
 
 /** A zero-arg function returning a {@link MeshDaemon} or a Promise of one. */
 export type DaemonFactory = () => MeshDaemon | Promise<MeshDaemon>;
+
+/**
+ * Host configuration for a daemon. Omit a field to take the
+ * runtime default.
+ */
+export interface DaemonHostConfig {
+  /**
+   * Auto-snapshot cadence in events processed. `0` (the default) =
+   * manual snapshots only.
+   */
+  readonly autoSnapshotInterval?: bigint;
+  /** Maximum events to buffer before forcing a snapshot. */
+  readonly maxLogEntries?: number;
+}
+
+// ----------------------------------------------------------------------------
+// DaemonHandle — thin wrapper over the NAPI handle.
+// ----------------------------------------------------------------------------
+
+/**
+ * Handle to a running daemon. Returned by
+ * {@link DaemonRuntime.spawn}; pass its `originHash` back to
+ * {@link DaemonRuntime.stop} to tear the daemon down.
+ *
+ * Cloning the JS object shares the same underlying daemon.
+ * Dropping the handle does **not** stop the daemon — callers must
+ * call `stop` explicitly.
+ */
+export class DaemonHandle {
+  private readonly inner: NapiDaemonHandle;
+
+  /** @internal */
+  constructor(inner: NapiDaemonHandle) {
+    this.inner = inner;
+  }
+
+  /**
+   * 32-bit hash of the daemon's identity — the key used by the
+   * registry, factory registry, and migration dispatcher.
+   */
+  get originHash(): number {
+    return this.inner.originHash;
+  }
+
+  /**
+   * Full 32-byte `EntityId` (ed25519 public key) of the daemon's
+   * identity. Returned as a `Buffer` to match the convention used
+   * by `Identity.entityId`.
+   */
+  get entityId(): Buffer {
+    return this.inner.entityId;
+  }
+}
 
 // ----------------------------------------------------------------------------
 // DaemonRuntime — thin wrapper over the NAPI class.
@@ -194,6 +249,55 @@ export class DaemonRuntime {
   registerFactory(kind: string, factory: DaemonFactory): void {
     try {
       this.inner.registerFactory(kind, factory as unknown as () => unknown);
+    } catch (e) {
+      toDaemonError(e);
+    }
+  }
+
+  /**
+   * Spawn a daemon of `kind` under the given {@link Identity}.
+   *
+   * **Sub-step 2a** (current): the daemon is a no-op bridge —
+   * lifecycle works (handle, `daemonCount`, `stop`) but events
+   * are not yet dispatched to the factory-returned JS object.
+   * Sub-step 2b will invoke the factory TSFN and replace the
+   * no-op bridge with a real one.
+   *
+   * `kind` must have been registered via
+   * {@link DaemonRuntime.registerFactory} first — spawning an
+   * unregistered kind throws {@link DaemonError}.
+   */
+  async spawn(
+    kind: string,
+    identity: Identity,
+    config?: DaemonHostConfig,
+  ): Promise<DaemonHandle> {
+    try {
+      const handle = await this.inner.spawn(
+        kind,
+        identity.toNapi(),
+        config
+          ? {
+              autoSnapshotInterval: config.autoSnapshotInterval,
+              maxLogEntries: config.maxLogEntries,
+            }
+          : undefined,
+      );
+      return new DaemonHandle(handle);
+    } catch (e) {
+      return toDaemonError(e);
+    }
+  }
+
+  /**
+   * Stop a daemon, removing it from the runtime's registry.
+   * Idempotent during `ShuttingDown`; rejects with
+   * {@link DaemonError} during `Registering` or when the origin
+   * is unknown.
+   */
+  async stop(originHash: number): Promise<void> {
+    try {
+      await this.inner.stop(originHash);
     } catch (e) {
       toDaemonError(e);
     }

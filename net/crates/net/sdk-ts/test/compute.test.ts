@@ -8,7 +8,13 @@
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { DaemonError, DaemonRuntime, MeshNode } from '../src';
+import {
+  DaemonError,
+  DaemonHandle,
+  DaemonRuntime,
+  Identity,
+  MeshNode,
+} from '../src';
 
 const PSK = '42'.repeat(32);
 
@@ -109,5 +115,118 @@ describe('DaemonRuntime (Stage 3 sub-step 1: skeleton + lifecycle)', () => {
     await rt.shutdown();
     // Second shutdown: no throw.
     await expect(rt.shutdown()).resolves.toBeUndefined();
+  });
+});
+
+// Sub-step 2a: spawn / stop lifecycle. Daemon is a no-op bridge
+// on the Rust side; factory TSFN is not yet invoked. Sub-step 2b
+// replaces the bridge with one that dispatches events to the
+// JS-returned object.
+describe('DaemonRuntime (Stage 3 sub-step 2a: spawn + stop)', () => {
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    while (cleanups.length > 0) {
+      const fn = cleanups.pop();
+      if (fn) {
+        try {
+          await fn();
+        } catch {
+          // Best-effort teardown.
+        }
+      }
+    }
+  });
+
+  async function startedRuntime(): Promise<{
+    mesh: MeshNode;
+    rt: DaemonRuntime;
+  }> {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+    rt.registerFactory('echo', () => ({ name: 'echo', process: () => [] }));
+    await rt.start();
+    return { mesh, rt };
+  }
+
+  it('spawn returns a handle with originHash + entityId', async () => {
+    const { rt } = await startedRuntime();
+    const id = Identity.generate();
+    const handle = await rt.spawn('echo', id);
+
+    expect(handle).toBeInstanceOf(DaemonHandle);
+    expect(typeof handle.originHash).toBe('number');
+    expect(handle.entityId).toBeInstanceOf(Buffer);
+    expect(handle.entityId.length).toBe(32);
+    // originHash matches identity's origin hash (first 4 bytes of
+    // the BLAKE2s-derived hash). We don't recompute here — just
+    // assert it's non-zero, because `Identity.generate()` produces
+    // random bytes that essentially never hash to zero.
+    expect(handle.originHash).not.toBe(0);
+
+    expect(rt.daemonCount()).toBe(1);
+  });
+
+  it('spawn -> stop reduces daemonCount', async () => {
+    const { rt } = await startedRuntime();
+    const handle = await rt.spawn('echo', Identity.generate());
+    expect(rt.daemonCount()).toBe(1);
+
+    await rt.stop(handle.originHash);
+    expect(rt.daemonCount()).toBe(0);
+  });
+
+  it('spawn with an unregistered kind throws DaemonError', async () => {
+    const { rt } = await startedRuntime();
+    await expect(rt.spawn('missing', Identity.generate())).rejects.toThrow(
+      DaemonError,
+    );
+    await expect(rt.spawn('missing', Identity.generate())).rejects.toThrow(
+      /no factory registered/,
+    );
+  });
+
+  it('spawn with the same identity twice rejects the second call', async () => {
+    const { rt } = await startedRuntime();
+    const id = Identity.generate();
+    await rt.spawn('echo', id);
+    // Second spawn: same origin_hash -> atomic factory_registry
+    // rejects. The underlying SDK surfaces this as the
+    // `already registered` message with the `daemon:` prefix.
+    await expect(rt.spawn('echo', id)).rejects.toThrow(DaemonError);
+    expect(rt.daemonCount()).toBe(1);
+  });
+
+  it('spawn many, stop each, daemonCount reaches zero', async () => {
+    const { rt } = await startedRuntime();
+    const handles: DaemonHandle[] = [];
+    for (let i = 0; i < 10; i++) {
+      handles.push(await rt.spawn('echo', Identity.generate()));
+    }
+    expect(rt.daemonCount()).toBe(10);
+
+    for (const h of handles) {
+      await rt.stop(h.originHash);
+    }
+    expect(rt.daemonCount()).toBe(0);
+  });
+
+  it('spawn after shutdown rejects with DaemonError', async () => {
+    const { rt } = await startedRuntime();
+    await rt.shutdown();
+    await expect(rt.spawn('echo', Identity.generate())).rejects.toThrow(
+      DaemonError,
+    );
+  });
+
+  it('config with auto-snapshot + max-log-entries is accepted', async () => {
+    const { rt } = await startedRuntime();
+    const handle = await rt.spawn('echo', Identity.generate(), {
+      autoSnapshotInterval: 128n,
+      maxLogEntries: 2048,
+    });
+    expect(handle.originHash).not.toBe(0);
   });
 });

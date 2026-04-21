@@ -576,6 +576,7 @@ if (!nativeBinding) {
 }
 
 module.exports = nativeBinding
+module.exports.DaemonHandle = nativeBinding.DaemonHandle
 module.exports.DaemonRuntime = nativeBinding.DaemonRuntime
 module.exports.Identity = nativeBinding.Identity
 module.exports.MemoriesAdapter = nativeBinding.MemoriesAdapter

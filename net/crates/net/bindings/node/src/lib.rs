@@ -1765,18 +1765,13 @@ mod mesh_bindings {
         #[cfg(feature = "compute")]
         pub(crate) fn node_arc_clone(&self) -> Result<Arc<MeshNode>> {
             let guard = self.load_node()?;
-            Ok(guard
-                .as_ref()
-                .expect("load_node ensures Some")
-                .clone())
+            Ok(guard.as_ref().expect("load_node ensures Some").clone())
         }
 
         /// Share the `ChannelConfigRegistry` for sibling-module
         /// access. Same rationale as [`Self::node_arc_clone`].
         #[cfg(feature = "compute")]
-        pub(crate) fn channel_configs_arc(
-            &self,
-        ) -> Arc<net::adapter::net::ChannelConfigRegistry> {
+        pub(crate) fn channel_configs_arc(&self) -> Arc<net::adapter::net::ChannelConfigRegistry> {
             self.channel_configs.clone()
         }
     }
