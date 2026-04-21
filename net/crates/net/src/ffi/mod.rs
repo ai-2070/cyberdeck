@@ -607,7 +607,10 @@ pub extern "C" fn net_ingest_batch(handle: *mut NetHandle, events_json: *const c
     let events: Vec<Event> = array.into_iter().map(Event::new).collect();
     let count = handle.bus.ingest_batch(events);
 
-    c_int::try_from(count).unwrap_or(c_int::MAX)
+    // Returning `c_int::MAX` on overflow would be ambiguous with a real
+    // `INT_MAX` ingest. Signal overflow explicitly — matches the
+    // `net_ingest_raw_batch` contract.
+    c_int::try_from(count).unwrap_or_else(|_| NetError::IntOverflow.into())
 }
 
 /// Poll events from the bus.

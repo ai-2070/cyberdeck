@@ -392,7 +392,11 @@ impl ReplayWindow {
     /// is outside the retained window.
     fn commit(&mut self, received: u64) -> bool {
         if received >= self.rx_counter {
-            let shift = received - self.rx_counter + 1;
+            // saturating_add guards `received == u64::MAX` (with
+            // rx_counter == 0 the `+ 1` would panic in debug and wrap
+            // in release). shift_bitmap_up already clamps at
+            // BITMAP_WORDS * 64, so a saturated value is still safe.
+            let shift = (received - self.rx_counter).saturating_add(1);
             self.shift_bitmap_up(shift);
             self.rx_counter = received.saturating_add(1);
             self.bitmap[0] |= 1u64;

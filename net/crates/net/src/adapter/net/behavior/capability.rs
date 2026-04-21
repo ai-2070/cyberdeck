@@ -1259,12 +1259,19 @@ impl CapabilityIndex {
 
     /// Remove node from index
     pub fn remove(&self, node_id: u64) {
-        // Lock ordering: versions before nodes (matches `index`). Drop the
-        // version entry first so a concurrent `index` call for this node
-        // cannot be blocked on versions while we hold nodes.
-        self.versions.remove(&node_id);
+        use dashmap::mapref::entry::Entry;
+        // Hold the versions shard lock across the whole cleanup so a
+        // concurrent `index(ann)` for this node_id serializes against us.
+        // Without this, the sequence (versions.remove → index inserts
+        // fresh version+node → nodes.remove clobbers the new entry) is
+        // observable as a lost update. Lock ordering: versions before
+        // nodes, matching `index`.
+        let version_entry = self.versions.entry(node_id);
         if let Some((_, node)) = self.nodes.remove(&node_id) {
             self.remove_from_indexes(node_id, &node.capabilities);
+        }
+        if let Entry::Occupied(e) = version_entry {
+            e.remove();
         }
     }
 
