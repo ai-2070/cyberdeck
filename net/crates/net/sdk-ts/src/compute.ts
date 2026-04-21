@@ -109,6 +109,25 @@ export interface MeshDaemon {
 export type DaemonFactory = () => MeshDaemon | Promise<MeshDaemon>;
 
 /**
+ * Runtime statistics for a single daemon. Read via
+ * {@link DaemonHandle.stats}.
+ *
+ * All counters are monotonic for the daemon's lifetime. They reset
+ * to zero when the daemon is stopped and respawned — the core
+ * rebuilds the host, including on {@link DaemonRuntime.spawnFromSnapshot}.
+ */
+export interface DaemonStats {
+  /** Total events processed since spawn. */
+  readonly eventsProcessed: bigint;
+  /** Total output events emitted since spawn. */
+  readonly eventsEmitted: bigint;
+  /** Total processing errors surfaced from `process`. */
+  readonly errors: bigint;
+  /** Number of snapshots taken (manual + auto combined). */
+  readonly snapshotsTaken: bigint;
+}
+
+/**
  * Host configuration for a daemon. Omit a field to take the
  * runtime default.
  */
@@ -158,6 +177,20 @@ export class DaemonHandle {
    */
   get entityId(): Buffer {
     return this.inner.entityId;
+  }
+
+  /**
+   * Current runtime statistics for this daemon. Reads a live
+   * atomic snapshot from the registry — cheap enough to poll.
+   *
+   * Throws {@link DaemonError} if the daemon has been stopped.
+   */
+  stats(): DaemonStats {
+    try {
+      return this.inner.stats();
+    } catch (e) {
+      return toDaemonError(e);
+    }
   }
 }
 

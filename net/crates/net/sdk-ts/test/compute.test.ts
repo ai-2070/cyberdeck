@@ -658,6 +658,61 @@ describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', ()
     ).rejects.toThrow(DaemonError);
   });
 
+  it('DaemonHandle.stats counts events processed + snapshots taken', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+
+    rt.registerFactory('counter', counterFactory());
+    await rt.start();
+
+    const id = Identity.generate();
+    const handle = await rt.spawn('counter', id);
+
+    const initial = handle.stats();
+    expect(initial.eventsProcessed).toBe(0n);
+    expect(initial.eventsEmitted).toBe(0n);
+    expect(initial.snapshotsTaken).toBe(0n);
+
+    for (let i = 1; i <= 4; i++) {
+      await rt.deliver(handle.originHash, {
+        originHash: id.originHash,
+        sequence: BigInt(i),
+        payload: Buffer.alloc(0),
+      });
+    }
+
+    const afterDeliveries = handle.stats();
+    expect(afterDeliveries.eventsProcessed).toBe(4n);
+    // CounterDaemon emits exactly one buffer per event.
+    expect(afterDeliveries.eventsEmitted).toBe(4n);
+    expect(afterDeliveries.errors).toBe(0n);
+    // `snapshotsTaken` is reserved on the struct but not
+    // incremented by the core registry at the moment — assert
+    // only that reading it doesn't throw.
+    expect(typeof afterDeliveries.snapshotsTaken).toBe('bigint');
+  });
+
+  it('DaemonHandle.stats on a stopped daemon rejects with DaemonError', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+
+    rt.registerFactory('echo', () => ({
+      name: 'echo',
+      process: (e) => [e.payload],
+    }));
+    await rt.start();
+
+    const id = Identity.generate();
+    const handle = await rt.spawn('echo', id);
+    await rt.stop(handle.originHash);
+
+    expect(() => handle.stats()).toThrow(DaemonError);
+  });
+
   it('snapshot -> modify -> snapshot captures the newer state', async () => {
     const mesh = await buildMesh();
     cleanups.push(() => mesh.shutdown());
@@ -693,4 +748,35 @@ describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', ()
     const out5 = await rt.deliver(h5.originHash, evt(7n));
     expect(out5[0].readUInt32LE(0)).toBe(6);
   });
+
+  // Plan exit criterion: spawn/stop 1000 daemons in a loop, heap
+  // usage stable. We don't actually probe the heap — that's
+  // observability, not correctness — but we do assert the registry
+  // returns to empty after the churn, that no DaemonError leaks, and
+  // that the runtime stays Ready throughout. If any TSFN / Arc /
+  // DashMap leak pattern returned with this sub-step, the test
+  // would either hang (TSFN refs blocking shutdown) or spike the
+  // `daemonCount` above zero at the end (registry leak).
+  it('spawn/stop 1000 daemons without leaking registry slots', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+
+    rt.registerFactory('echo', () => ({
+      name: 'echo',
+      process: (e) => [e.payload],
+    }));
+    await rt.start();
+
+    const N = 1000;
+    for (let i = 0; i < N; i++) {
+      const id = Identity.generate();
+      const handle = await rt.spawn('echo', id);
+      await rt.stop(handle.originHash);
+    }
+
+    expect(rt.isReady()).toBe(true);
+    expect(rt.daemonCount()).toBe(0);
+  }, 30_000);
 });

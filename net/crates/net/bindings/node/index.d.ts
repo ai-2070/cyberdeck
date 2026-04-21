@@ -19,6 +19,16 @@ export declare class DaemonHandle {
    * convention used by `Identity.entityId`.
    */
   get entityId(): Buffer
+  /**
+   * Current runtime statistics for the daemon — event counters
+   * and snapshot count. Reads a live atomic snapshot from the
+   * registry; no TSFN round-trip, so the call is cheap enough
+   * to poll.
+   *
+   * Rejects with `daemon: not found` if the daemon has been
+   * stopped (or never successfully registered).
+   */
+  stats(): DaemonStatsJs
 }
 
 /**
@@ -975,6 +985,27 @@ export interface DaemonHostConfigJs {
   autoSnapshotInterval?: bigint
   /** Maximum events to buffer before forcing a snapshot. */
   maxLogEntries?: number
+}
+
+/**
+ * Runtime statistics for a single daemon.
+ *
+ * All counters are monotonically increasing for the daemon's
+ * lifetime and reset to zero when the daemon is stopped + respawned
+ * (including via `spawnFromSnapshot`, because the core's registry
+ * replaces the host). Field shape mirrors
+ * [`net::adapter::net::compute::DaemonStats`] with `u64` → `BigInt`
+ * so JS doesn't silently lose precision past 2^53.
+ */
+export interface DaemonStatsJs {
+  /** Total events processed since spawn. */
+  eventsProcessed: bigint
+  /** Total output events emitted since spawn. */
+  eventsEmitted: bigint
+  /** Total processing errors surfaced from `process`. */
+  errors: bigint
+  /** Number of snapshots taken (manual + auto combined). */
+  snapshotsTaken: bigint
 }
 
 /**

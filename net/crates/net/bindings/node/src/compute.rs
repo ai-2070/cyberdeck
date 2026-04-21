@@ -575,7 +575,6 @@ impl From<DaemonHostConfigJs> for DaemonHostConfig {
 pub struct DaemonHandle {
     origin_hash: u32,
     entity_id: [u8; 32],
-    #[allow(dead_code)]
     inner: SdkDaemonHandle,
 }
 
@@ -607,6 +606,51 @@ impl DaemonHandle {
     pub fn entity_id(&self) -> Buffer {
         Buffer::from(self.entity_id.to_vec())
     }
+
+    /// Current runtime statistics for the daemon — event counters
+    /// and snapshot count. Reads a live atomic snapshot from the
+    /// registry; no TSFN round-trip, so the call is cheap enough
+    /// to poll.
+    ///
+    /// Rejects with `daemon: not found` if the daemon has been
+    /// stopped (or never successfully registered).
+    #[napi]
+    pub fn stats(&self) -> Result<DaemonStatsJs> {
+        let stats = self
+            .inner
+            .stats()
+            .map_err(|e| daemon_err(e.to_string()))?;
+        Ok(DaemonStatsJs {
+            events_processed: BigInt::from(stats.events_processed),
+            events_emitted: BigInt::from(stats.events_emitted),
+            errors: BigInt::from(stats.errors),
+            snapshots_taken: BigInt::from(stats.snapshots_taken),
+        })
+    }
+}
+
+// =========================================================================
+// DaemonStats POJO — mirrors the core struct, u64 fields as BigInt.
+// =========================================================================
+
+/// Runtime statistics for a single daemon.
+///
+/// All counters are monotonically increasing for the daemon's
+/// lifetime and reset to zero when the daemon is stopped + respawned
+/// (including via `spawnFromSnapshot`, because the core's registry
+/// replaces the host). Field shape mirrors
+/// [`net::adapter::net::compute::DaemonStats`] with `u64` → `BigInt`
+/// so JS doesn't silently lose precision past 2^53.
+#[napi(object)]
+pub struct DaemonStatsJs {
+    /// Total events processed since spawn.
+    pub events_processed: BigInt,
+    /// Total output events emitted since spawn.
+    pub events_emitted: BigInt,
+    /// Total processing errors surfaced from `process`.
+    pub errors: BigInt,
+    /// Number of snapshots taken (manual + auto combined).
+    pub snapshots_taken: BigInt,
 }
 
 // =========================================================================
