@@ -806,6 +806,7 @@ impl DaemonRuntime {
             source_node,
             target_node,
             runtime: self.clone(),
+            opts,
         })
     }
 
@@ -1030,11 +1031,16 @@ async fn teardown_subscriptions(inner: Arc<Inner>, bindings: Vec<SubscriptionBin
 
 /// Options for [`DaemonRuntime::start_migration_with`].
 ///
-/// Stage 6 of
-/// [`DAEMON_IDENTITY_MIGRATION_PLAN.md`](../../../docs/DAEMON_IDENTITY_MIGRATION_PLAN.md) —
-/// lets the caller opt out of identity transport for workloads that
-/// don't need post-migration signing capability (pure compute
-/// daemons). Default: identity IS transported.
+/// - Stage 6 of
+///   [`DAEMON_IDENTITY_MIGRATION_PLAN.md`](../../../docs/DAEMON_IDENTITY_MIGRATION_PLAN.md):
+///   the `transport_identity` flag. Default `true`.
+/// - Stages 3 + 4 of
+///   [`DAEMON_RUNTIME_READINESS_PLAN.md`](../../../docs/DAEMON_RUNTIME_READINESS_PLAN.md):
+///   the `retry_not_ready` budget. When the migration target
+///   responds `NotReady` (runtime still in `Registering`), the
+///   source backs off + re-initiates up to this total elapsed
+///   time. `None` disables retry; the first `NotReady` surfaces
+///   immediately.
 #[derive(Debug, Clone)]
 pub struct MigrationOpts {
     /// If `true` (default), the source node seals its daemon's
@@ -1050,14 +1056,38 @@ pub struct MigrationOpts {
     /// payloads, and do NOT need to mint capability announcements
     /// or issue permission tokens from the target.
     pub transport_identity: bool,
+
+    /// Retry budget for [`MigrationFailureReason::NotReady`].
+    ///
+    /// `Some(d)` (default 30 s): on `NotReady`, the source backs
+    /// off (500 ms → 1 s → 2 s → 4 s → 8 s, capped at 16 s) and
+    /// re-initiates the migration. The total retry clock is
+    /// capped at `d`; after that, the caller sees
+    /// [`MigrationFailureReason::NotReadyTimeout`].
+    ///
+    /// `None`: no retry. The first `NotReady` surfaces as a
+    /// terminal failure to the caller.
+    pub retry_not_ready: Option<std::time::Duration>,
 }
 
 impl Default for MigrationOpts {
     fn default() -> Self {
         Self {
             transport_identity: true,
+            retry_not_ready: Some(std::time::Duration::from_secs(30)),
         }
     }
+}
+
+/// Exponential backoff for the i-th `NotReady` retry attempt.
+/// First retry waits 500 ms, subsequent retries double up to a
+/// 16 s cap — total budget is controlled separately by
+/// [`MigrationOpts::retry_not_ready`]. Matching the schedule in
+/// `DAEMON_RUNTIME_READINESS_PLAN.md` § *Source-side retry*.
+fn not_ready_backoff(attempt: u8) -> std::time::Duration {
+    use std::time::Duration;
+    let ms = 500u64 << (attempt.saturating_sub(1).min(5));
+    Duration::from_millis(ms.min(16_000))
 }
 
 /// Handle to an in-flight migration. Drop the handle and the
@@ -1077,6 +1107,10 @@ pub struct MigrationHandle {
     /// Runtime the orchestrator lives on. Used by [`Self::phase`]
     /// and [`Self::wait`] to poll migration state.
     runtime: DaemonRuntime,
+    /// Options the migration was initiated with. Drives retry
+    /// policy on `NotReady` + the identity-transport flag for
+    /// re-initiated attempts.
+    opts: MigrationOpts,
 }
 
 impl MigrationHandle {
@@ -1114,27 +1148,69 @@ impl MigrationHandle {
         self,
         timeout: std::time::Duration,
     ) -> Result<(), DaemonError> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let start = tokio::time::Instant::now();
+        let overall_deadline = start + timeout;
+        let retry_deadline = self.opts.retry_not_ready.map(|b| start + b);
+        let mut attempts: u8 = 1; // first attempt initiated by start_migration_with
+        loop {
+            match self.wait_one_attempt(overall_deadline).await {
+                Ok(()) => return Ok(()),
+                Err(DaemonError::MigrationFailed(reason)) if reason.is_retriable() => {
+                    // Retry decision.
+                    let Some(deadline) = retry_deadline else {
+                        // Opts explicitly disable retry — surface
+                        // the NotReady verbatim.
+                        return Err(DaemonError::MigrationFailed(reason));
+                    };
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline || now >= overall_deadline {
+                        // Budget exhausted. `NotReadyTimeout` carries
+                        // the attempt count for operator diagnosis.
+                        return Err(DaemonError::MigrationFailed(
+                            MigrationFailureReason::NotReadyTimeout { attempts },
+                        ));
+                    }
+                    // Back off and re-initiate.
+                    let backoff = not_ready_backoff(attempts);
+                    tokio::time::sleep(backoff).await;
+                    attempts = attempts.saturating_add(1);
+                    // Re-initiate the migration by calling the
+                    // orchestrator fresh. The previous record has
+                    // been cleaned up by the dispatcher's
+                    // MigrationFailed handler, so this starts a new
+                    // attempt from phase 0.
+                    if let Err(e) = self.reinitiate_attempt().await {
+                        return Err(e);
+                    }
+                    // Loop; poll this new attempt's outcome.
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Poll a single migration attempt's outcome. Returns:
+    /// - `Ok(())` on Complete.
+    /// - `Err(MigrationFailed(reason))` when the dispatcher
+    ///   observed a structured failure.
+    /// - `Err(Migration(_))` on overall-timeout or unknown abort.
+    async fn wait_one_attempt(
+        &self,
+        overall_deadline: tokio::time::Instant,
+    ) -> Result<(), DaemonError> {
         let mut last_phase: Option<MigrationPhase> = None;
         loop {
             match self.runtime.inner.orchestrator.status(self.origin_hash) {
                 Some(phase) => {
                     last_phase = Some(phase);
                     if phase == MigrationPhase::Complete {
-                        // Complete phase is reached and the orchestrator
-                        // will clean up its record momentarily. Give it
-                        // one more tick to settle, then return Ok.
+                        // Give the dispatcher a beat to finish
+                        // cleanup, then surface success.
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         return Ok(());
                     }
                 }
                 None => {
-                    // Record gone. If we ever observed Complete, this
-                    // is the normal cleanup path — success. Otherwise
-                    // check whether the dispatcher's failure observer
-                    // captured a structured reason (NotReady, etc.);
-                    // if so, surface it. Fall back to a generic
-                    // aborted error when there's no observer entry.
                     if last_phase == Some(MigrationPhase::Complete) {
                         return Ok(());
                     }
@@ -1146,7 +1222,7 @@ impl MigrationHandle {
                     )));
                 }
             }
-            if tokio::time::Instant::now() >= deadline {
+            if tokio::time::Instant::now() >= overall_deadline {
                 let _ = self
                     .runtime
                     .inner
@@ -1158,6 +1234,53 @@ impl MigrationHandle {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    }
+
+    /// Re-initiate a migration attempt for the same daemon after a
+    /// retriable failure. Calls the orchestrator fresh + sends the
+    /// first wire message; mirrors the tail of
+    /// [`DaemonRuntime::start_migration_with`] but without building
+    /// a new handle (we keep the existing one).
+    async fn reinitiate_attempt(&self) -> Result<(), DaemonError> {
+        let mut first_msg = self
+            .runtime
+            .inner
+            .orchestrator
+            .start_migration(self.origin_hash, self.source_node, self.target_node)
+            .map_err(DaemonError::Migration)?;
+
+        if self.opts.transport_identity {
+            if let MigrationMessage::SnapshotReady {
+                ref mut snapshot_bytes,
+                ..
+            } = first_msg
+            {
+                if let Some(sealed) = self.runtime.maybe_seal_local_snapshot(
+                    self.origin_hash,
+                    self.target_node,
+                    snapshot_bytes,
+                ) {
+                    *snapshot_bytes = sealed;
+                }
+            }
+        }
+
+        let (dest_node, payload) = match &first_msg {
+            MigrationMessage::TakeSnapshot { .. } => (self.source_node, &first_msg),
+            MigrationMessage::SnapshotReady { .. } => (self.target_node, &first_msg),
+            other => {
+                let _ = self
+                    .runtime
+                    .inner
+                    .orchestrator
+                    .abort_migration(self.origin_hash, "unexpected retry message".into());
+                return Err(DaemonError::Migration(MigrationError::StateFailed(
+                    format!("unexpected retry initial message: {other:?}"),
+                )));
+            }
+        };
+
+        self.runtime.send_migration_message(dest_node, payload).await
     }
 
     /// Pop the most recent `MigrationFailureReason` the dispatcher
