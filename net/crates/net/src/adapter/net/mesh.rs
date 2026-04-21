@@ -29,7 +29,9 @@
 //! ```
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use arc_swap::ArcSwapOption;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,15 +44,20 @@ use tokio::task::JoinHandle;
 
 use super::crypto::{handshake_prologue, CryptoError, NoiseHandshake, SessionKeys, StaticKeypair};
 use super::failure::{FailureDetector, FailureDetectorConfig};
-use super::identity::EntityKeypair;
+use super::identity::{EntityId, EntityKeypair, PermissionToken, TokenCache, TokenScope};
 use super::pool::PacketBuilder;
 
+use super::behavior::broadcast::SUBPROTOCOL_CAPABILITY_ANN;
+use super::behavior::capability::{
+    CapabilityAnnouncement, CapabilityFilter, CapabilityIndex, CapabilityRequirement,
+    CapabilitySet, MAX_CAPABILITY_HOPS,
+};
 use super::behavior::loadbalance::HealthStatus;
 use super::behavior::proximity::{EnhancedPingwave, ProximityConfig, ProximityGraph};
 use super::channel::membership::{self, MembershipMsg, SUBPROTOCOL_CHANNEL_MEMBERSHIP};
 use super::channel::{
-    AckReason, ChannelConfigRegistry, ChannelId, ChannelName, ChannelPublisher, OnFailure,
-    PublishConfig, PublishReport, SubscriberRoster,
+    AckReason, AuthGuard, AuthVerdict, ChannelConfigRegistry, ChannelId, ChannelName,
+    ChannelPublisher, OnFailure, PublishConfig, PublishReport, SubscriberRoster,
 };
 use super::compute::SUBPROTOCOL_MIGRATION;
 use super::protocol::{self, EventFrame, PacketFlags, HEADER_SIZE, MAGIC, TAG_SIZE};
@@ -78,9 +85,11 @@ use super::route::{RoutingHeader, ROUTING_HEADER_SIZE};
 use super::router::{NetRouter, RouterConfig};
 use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
+use super::subnet::{SubnetId, SubnetPolicy};
 use super::subprotocol::stream_window::{StreamWindow, SUBPROTOCOL_STREAM_WINDOW};
 use super::subprotocol::MigrationSubprotocolHandler;
 use super::transport::{NetSocket, PacketReceiver, ParsedPacket, SocketBufferConfig};
+use super::Visibility;
 use tokio::sync::oneshot;
 
 use crate::adapter::{Adapter, ShardPollResult};
@@ -159,6 +168,47 @@ struct DispatchCtx {
     pending_membership_acks: Arc<DashMap<u64, oneshot::Sender<MembershipAck>>>,
     /// Max distinct channels a single peer may subscribe to.
     max_channels_per_peer: usize,
+    /// Capability index shared with `MeshNode`. Inbound
+    /// `SUBPROTOCOL_CAPABILITY_ANN` packets are indexed here.
+    capability_index: Arc<CapabilityIndex>,
+    /// Dedup cache for multi-hop capability announcements, keyed by
+    /// `(origin_node_id, version)`. Written by the dispatch handler
+    /// before indexing + forwarding so a `(origin, version)` tuple
+    /// is processed at most once per node.
+    seen_announcements: Arc<DashMap<(u64, u64), std::time::Instant>>,
+    /// Whether inbound `CapabilityAnnouncement` packets without a
+    /// signature are dropped. Validity is not enforced yet.
+    require_signed_capabilities: bool,
+    /// This node's subnet (copy of `config.subnet`).
+    local_subnet: SubnetId,
+    /// Policy applied to each inbound `CapabilityAnnouncement` to
+    /// derive the sender's subnet. `None` disables tracking.
+    local_subnet_policy: Option<Arc<SubnetPolicy>>,
+    /// Per-peer subnet map, written by the capability-announcement
+    /// dispatch and read by the subscribe gate + publish fan-out.
+    peer_subnets: Arc<DashMap<u64, SubnetId>>,
+    /// Per-peer entity-id map, written by the capability-
+    /// announcement dispatch after signature verification. Load-
+    /// bearing for channel auth.
+    peer_entity_ids: Arc<DashMap<u64, EntityId>>,
+    /// Shared token cache, populated by subscriber-presented tokens
+    /// plus caller-side pre-installs. `None` disables the
+    /// `require_token` path — unset is equivalent to "no token is
+    /// ever valid."
+    token_cache: Option<Arc<TokenCache>>,
+    /// Per-packet authorization fast path. `authorize_subscribe`
+    /// writes on success (via `allow_channel`) so the publish
+    /// fan-out can use the bloom filter + verified cache to admit
+    /// or drop subscribers in constant time.
+    auth_guard: Arc<AuthGuard>,
+    /// Per-peer auth-failure state (for the subscribe rate limit).
+    auth_failures: Arc<DashMap<u64, AuthFailureState>>,
+    /// Failures-per-window threshold from the parent config.
+    max_auth_failures_per_window: u16,
+    /// Rolling window length for auth-failure counting.
+    auth_failure_window: Duration,
+    /// How long a peer stays throttled after tripping the threshold.
+    auth_throttle_duration: Duration,
 }
 
 /// Result passed through the pending-ack oneshot.
@@ -212,6 +262,64 @@ pub struct MeshNodeConfig {
     /// Timeout for `subscribe_channel` / `unsubscribe_channel` to wait
     /// for an `Ack` before returning `AdapterError::Timeout`.
     pub membership_ack_timeout: Duration,
+    /// Drop inbound `CapabilityAnnouncement` packets whose signature
+    /// is missing. Defaults to `true` because the cap data feeds
+    /// channel-auth (`can_publish` / `can_subscribe` cap filters)
+    /// and subnet visibility — an unsigned announcement is
+    /// attacker-controlled input, and accepting it silently meant a
+    /// peer could claim any caps or subnet just by announcing. The
+    /// dispatch path still applies a second belt-and-braces guard
+    /// on individual auth-load-bearing state updates
+    /// (`peer_entity_ids`, `peer_subnets`), so explicitly setting
+    /// this to `false` for discovery-only deployments is
+    /// defensible; flipping this on simply makes the rejection
+    /// happen up-front instead of silently no-oping the state
+    /// writes downstream.
+    pub require_signed_capabilities: bool,
+    /// How often the capability index sweeps expired entries. Low
+    /// values waste CPU; high values keep stale peers queryable past
+    /// their TTL.
+    pub capability_gc_interval: Duration,
+    /// This node's subnet. Defaults to [`SubnetId::GLOBAL`] — "no
+    /// restriction." Visibility checks compare against this value on
+    /// both the publish and subscribe paths.
+    pub subnet: SubnetId,
+    /// Policy applied to inbound [`CapabilityAnnouncement`]s to
+    /// derive each peer's subnet. `None` disables per-peer subnet
+    /// tracking; every peer is treated as `GLOBAL`, which in
+    /// practice means `Visibility::SubnetLocal` channels ship only
+    /// when both sides are `GLOBAL`.
+    pub subnet_policy: Option<Arc<SubnetPolicy>>,
+    /// Minimum time between successive
+    /// [`MeshNode::announce_capabilities`] broadcasts from this
+    /// origin. Calls within the window coalesce: the local index
+    /// and `local_announcement` are updated so self-queries + late-
+    /// joiner session-open pushes reflect the latest caps, but the
+    /// network broadcast is skipped. Rate-limits apps that
+    /// re-announce in tight loops.
+    pub min_announce_interval: Duration,
+    /// Period between `TokenCache` expiry sweeps. A subscriber
+    /// whose token expires mid-subscription is evicted from the
+    /// [`SubscriberRoster`] and revoked from the [`AuthGuard`]
+    /// within one sweep interval. Set to [`Duration::MAX`] (or any
+    /// value longer than the mesh's lifetime) to disable the
+    /// sweep — publishes will still re-check the guard, so this
+    /// mainly affects how quickly stale tokens drop off the
+    /// roster.
+    pub token_sweep_interval: Duration,
+    /// Authorization-failure threshold per peer per window. A peer
+    /// that exceeds this count across a rolling
+    /// [`Self::auth_failure_window`] gets throttled — subsequent
+    /// subscribes short-circuit with `AckReason::RateLimited` for
+    /// [`Self::auth_throttle_duration`] without running the
+    /// cap-filter + ed25519 path. Set to `u16::MAX` to disable.
+    pub max_auth_failures_per_window: u16,
+    /// Rolling window over which failed subscribes are counted for
+    /// the throttle check above. Default: 60 s.
+    pub auth_failure_window: Duration,
+    /// How long a peer stays throttled after tripping the
+    /// failure threshold. Default: 30 s.
+    pub auth_throttle_duration: Duration,
 }
 
 impl MeshNodeConfig {
@@ -234,6 +342,15 @@ impl MeshNodeConfig {
             max_streams: 4096,
             max_channels_per_peer: 1024,
             membership_ack_timeout: Duration::from_secs(5),
+            require_signed_capabilities: true,
+            capability_gc_interval: Duration::from_secs(60),
+            subnet: SubnetId::GLOBAL,
+            subnet_policy: None,
+            min_announce_interval: Duration::from_secs(10),
+            token_sweep_interval: Duration::from_secs(30),
+            max_auth_failures_per_window: 16,
+            auth_failure_window: Duration::from_secs(60),
+            auth_throttle_duration: Duration::from_secs(30),
         }
     }
 
@@ -259,6 +376,63 @@ impl MeshNodeConfig {
     pub fn with_handshake(mut self, retries: usize, timeout: Duration) -> Self {
         self.handshake_retries = retries;
         self.handshake_timeout = timeout;
+        self
+    }
+
+    /// Require inbound `CapabilityAnnouncement` packets to carry a
+    /// signature. Unsigned announcements are dropped silently (a
+    /// trace is emitted).
+    pub fn with_require_signed_capabilities(mut self, require: bool) -> Self {
+        self.require_signed_capabilities = require;
+        self
+    }
+
+    /// Set the capability-index GC sweep interval.
+    pub fn with_capability_gc_interval(mut self, interval: Duration) -> Self {
+        self.capability_gc_interval = interval;
+        self
+    }
+
+    /// Set the minimum interval between outbound capability-
+    /// announcement broadcasts. See [`Self::min_announce_interval`].
+    pub fn with_min_announce_interval(mut self, interval: Duration) -> Self {
+        self.min_announce_interval = interval;
+        self
+    }
+
+    /// Set the token-expiry sweep interval. See
+    /// [`Self::token_sweep_interval`].
+    pub fn with_token_sweep_interval(mut self, interval: Duration) -> Self {
+        self.token_sweep_interval = interval;
+        self
+    }
+
+    /// Tune the per-peer authorization-failure rate limit. See
+    /// [`Self::max_auth_failures_per_window`].
+    pub fn with_auth_failure_limit(
+        mut self,
+        max_per_window: u16,
+        window: Duration,
+        throttle: Duration,
+    ) -> Self {
+        self.max_auth_failures_per_window = max_per_window;
+        self.auth_failure_window = window;
+        self.auth_throttle_duration = throttle;
+        self
+    }
+
+    /// Pin this node to a specific subnet.
+    pub fn with_subnet(mut self, subnet: SubnetId) -> Self {
+        self.subnet = subnet;
+        self
+    }
+
+    /// Derive each peer's subnet locally by applying this policy to
+    /// their inbound [`CapabilityAnnouncement`]s. Mesh-wide policy
+    /// consistency is assumed; mismatched policies lead to
+    /// asymmetric views of peer subnets.
+    pub fn with_subnet_policy(mut self, policy: Arc<SubnetPolicy>) -> Self {
+        self.subnet_policy = Some(policy);
         self
     }
 }
@@ -295,6 +469,125 @@ struct PendingHandshake {
 #[inline]
 fn routing_id(node_id: u64) -> u64 {
     (node_id as u32) as u64
+}
+
+/// 64-bit origin-hash projection used as the `AuthGuard` key.
+///
+/// A prior version truncated to `u32` so the key matched the
+/// routing-plane's 32-bit `src_id`, but truncating to 32 bits
+/// birthday-collides at ~65 k peers — inside the practical reach of
+/// a medium mesh — and lets one subscriber's grant admit a different
+/// subscriber's packets. The fan-out fast path keys on the full
+/// 64-bit `node_id` (the value it already has in hand), which pushes
+/// the collision floor out of reach. The `src_id` field on wire
+/// packets is not consulted for authorization.
+#[inline]
+fn subscriber_origin_hash(node_id: u64) -> u64 {
+    node_id
+}
+
+/// Replace a zero `Duration` with a 1 s floor.
+/// `tokio::time::interval` panics on a zero period; this is the
+/// guard every `spawn_*_loop` call site applies before handing the
+/// caller-configured interval to tokio. A legitimate "disable this
+/// timer" sentinel is `Duration::MAX`, documented on the relevant
+/// config fields — `Duration::ZERO` is just pathological input.
+///
+/// The floor is deliberately coarse (1 s, not 1 ms): a mis-configured
+/// zero-interval used to spin the maintenance loop at 1 kHz, calling
+/// `index.gc()` + `seen.retain()` a thousand times a second and
+/// burning a whole core. 1 Hz keeps the loop obviously alive for
+/// observability without an appreciable CPU cost, and is still
+/// finer than the default intervals (capability GC ≈ announcement
+/// TTL, token sweep 30 s), so it never masks a legitimate
+/// fine-grained config — those values are already well above 1 s.
+#[inline]
+fn nonzero_interval(d: Duration) -> Duration {
+    if d.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        d
+    }
+}
+
+/// Rolling-window auth-failure tracker, one entry per peer.
+/// Lives behind a per-key `Mutex` so updates from concurrent
+/// subscribes don't race each other on the same peer's counter.
+#[derive(Debug, Default)]
+struct AuthFailureState {
+    /// Failures accumulated inside the current window.
+    failures: u16,
+    /// Start of the window. Resets to `Instant::now()` once
+    /// `auth_failure_window` has elapsed since the current window
+    /// opened.
+    window_start: Option<std::time::Instant>,
+    /// If set, the peer is throttled until this instant and every
+    /// subscribe short-circuits with `RateLimited`.
+    throttled_until: Option<std::time::Instant>,
+}
+
+/// Evict subscribers whose tokens have expired. Walks the roster by
+/// peer and, for every `require_token` channel they hold, runs the
+/// full token-cache check. Expired entries are revoked in the
+/// [`AuthGuard`] and removed from the [`SubscriberRoster`].
+///
+/// Skip conditions (short-circuits to no-op):
+///
+/// - No `token_cache`: `require_token` channels reject every
+///   subscribe anyway, so the roster contains no token-gated
+///   entries.
+/// - No `channel_configs`: nothing to check `require_token`
+///   against, so every roster entry is treated as open and left
+///   alone.
+///
+/// Pulled into a free fn (not a method) so the sweep loop can
+/// call it without capturing `&self` through the async closure.
+fn sweep_expired_subscribers(
+    roster: &SubscriberRoster,
+    guard: &AuthGuard,
+    token_cache: Option<&Arc<TokenCache>>,
+    peer_entity_ids: &DashMap<u64, EntityId>,
+    channel_configs: Option<&Arc<ChannelConfigRegistry>>,
+) {
+    let (Some(cache), Some(configs)) = (token_cache, channel_configs) else {
+        return;
+    };
+    // Snapshot (node_id, entity_id) pairs so we don't hold the
+    // DashMap read guard across the token checks below.
+    let peers: Vec<(u64, EntityId)> = peer_entity_ids
+        .iter()
+        .map(|e| (*e.key(), e.value().clone()))
+        .collect();
+    for (node_id, entity_id) in peers {
+        for channel_id in roster.channels_for(node_id) {
+            let name = channel_id.name();
+            let Some(cfg) = configs.get_by_name(name.as_str()) else {
+                continue;
+            };
+            if !cfg.require_token {
+                continue;
+            }
+            // `check` validates signature + time bounds. Any error
+            // (expired, not_yet_valid, invalid_signature, not_authorized)
+            // means this subscriber is no longer authorized.
+            let authorized = cache
+                .check(
+                    &entity_id,
+                    super::identity::TokenScope::SUBSCRIBE,
+                    name.hash(),
+                )
+                .is_ok();
+            if !authorized {
+                guard.revoke_channel(subscriber_origin_hash(node_id), name);
+                roster.remove(&channel_id, node_id);
+                tracing::debug!(
+                    node_id = format!("{:#x}", node_id),
+                    channel = name.as_str(),
+                    "auth: evicted subscriber with expired/invalid token",
+                );
+            }
+        }
+    }
 }
 
 /// Default TTL for the routing header we stamp on routed handshake
@@ -366,6 +659,74 @@ pub struct MeshNode {
     channel_configs: Option<Arc<ChannelConfigRegistry>>,
     /// In-flight Subscribe/Unsubscribe requests keyed by nonce.
     pending_membership_acks: Arc<DashMap<u64, oneshot::Sender<MembershipAck>>>,
+    /// Capability index populated by inbound
+    /// `SUBPROTOCOL_CAPABILITY_ANN` packets and the local
+    /// `announce_capabilities` path. Self-index so single-node
+    /// queries return us too.
+    capability_index: Arc<CapabilityIndex>,
+    /// Dedup cache for multi-hop capability announcements. Keyed by
+    /// `(origin_node_id, version)` — the same discriminator
+    /// `CapabilityIndex` uses to skip stale announcements. Entries
+    /// are evicted by the capability GC loop once their
+    /// announcement's effective lifetime (2× `ttl_secs`) has
+    /// elapsed. Mirrors the `seen_pingwaves` cache in
+    /// [`ProximityGraph`].
+    seen_announcements: Arc<DashMap<(u64, u64), std::time::Instant>>,
+    /// Timestamp of the most recent outbound capability-announcement
+    /// broadcast from this origin. Compared against
+    /// `config.min_announce_interval` on every `announce_capabilities_with`
+    /// call; within-window calls coalesce to a local self-index
+    /// update without a network broadcast.
+    last_announce_at: Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
+    /// Most recent `CapabilityAnnouncement` this node published.
+    /// Pushed to new peers right after `accept` / `connect`
+    /// completes, so late joiners pick up our caps without waiting
+    /// for a re-announce. `None` until the first `announce_*` call.
+    local_announcement: Arc<ArcSwapOption<CapabilityAnnouncement>>,
+    /// Monotonic version counter used when stamping our own
+    /// announcements. `CapabilityIndex::index` skips older versions,
+    /// so this must move forward across restarts if the caller wants
+    /// their announcements accepted.
+    capability_version: Arc<AtomicU64>,
+    /// This node's subnet. Copy of `config.subnet`, hoisted to the
+    /// top level because the publish + subscribe hot paths read it
+    /// without going through the config struct.
+    local_subnet: SubnetId,
+    /// Subnet policy applied to inbound `CapabilityAnnouncement`s.
+    /// `None` disables per-peer subnet tracking.
+    local_subnet_policy: Option<Arc<SubnetPolicy>>,
+    /// Per-peer subnet map. Keys are `node_id`; values are the
+    /// subnet derived from each peer's most recent announcement via
+    /// `local_subnet_policy`. Unknown peers default to
+    /// [`SubnetId::GLOBAL`] at read time.
+    peer_subnets: Arc<DashMap<u64, SubnetId>>,
+    /// Per-peer entity-id map. Keys are `node_id`; values are the
+    /// 32-byte ed25519 public key carried on the peer's most recent
+    /// `CapabilityAnnouncement`. Load-bearing for channel auth —
+    /// without it, `require_token` channels can't match a token's
+    /// `subject` to the subscribing peer.
+    peer_entity_ids: Arc<DashMap<u64, EntityId>>,
+    /// Shared token cache used by the channel-auth path. When
+    /// `None`, `can_publish` / `can_subscribe` fall back to a
+    /// fresh empty cache — which means `require_token` channels
+    /// always reject. SDK builders wire this up from the caller's
+    /// `Identity`.
+    token_cache: Option<Arc<TokenCache>>,
+    /// Per-packet authorization fast path. Populated when a
+    /// subscribe clears `authorize_subscribe`; consulted on every
+    /// publish fan-out via `check_fast`. The bloom filter + verified
+    /// cache keep authorization at O(1) without per-packet
+    /// signature verification. See
+    /// [`docs/CHANNEL_AUTH_GUARD_PLAN.md`](../../../../docs/CHANNEL_AUTH_GUARD_PLAN.md).
+    auth_guard: Arc<AuthGuard>,
+    /// Per-peer auth-failure tracker. Counts failed
+    /// `authorize_subscribe` attempts per `auth_failure_window` and
+    /// throttles bursts — peers that exceed
+    /// `max_auth_failures_per_window` short-circuit with
+    /// `RateLimited` for `auth_throttle_duration` without running
+    /// the cap-filter + ed25519 verify path. Successful subscribes
+    /// clear the counter for that peer.
+    auth_failures: Arc<DashMap<u64, AuthFailureState>>,
     /// Background tasks
     tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
     /// Shutdown flag
@@ -380,6 +741,16 @@ impl MeshNode {
     /// Get the Noise static public key (for peers to connect to this node).
     pub fn public_key(&self) -> &[u8; 32] {
         &self.static_keypair.public
+    }
+
+    /// Whether [`Self::shutdown`] has been invoked on this node.
+    ///
+    /// Exposed for tests and for FFI callers that want to verify a
+    /// shutdown actually landed (rather than being a silent no-op
+    /// because extra `Arc` references were outstanding, as an earlier
+    /// `net_mesh_shutdown` variant did).
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
     }
 
     /// Create a new mesh node.
@@ -449,10 +820,25 @@ impl MeshNode {
         // Failed is removed from every channel it was subscribed to.
         let roster: Arc<SubscriberRoster> = Arc::new(SubscriberRoster::new());
 
+        // Peer-subnet map (Stage D). Populated when inbound
+        // `SUBPROTOCOL_CAPABILITY_ANN` packets arrive and the local
+        // `SubnetPolicy` derives a subnet for the sender. Created
+        // here so the failure callback can evict stale entries on
+        // session loss — otherwise reconnects would silently reuse
+        // the old subnet until the next announcement arrived.
+        let peer_subnets: Arc<DashMap<u64, SubnetId>> = Arc::new(DashMap::new());
+        // Peer entity-id map (Stage E). Populated from each inbound
+        // `CapabilityAnnouncement`. Evicted alongside `peer_subnets`
+        // on session failure so a reconnect doesn't silently reuse
+        // the old identity.
+        let peer_entity_ids: Arc<DashMap<u64, EntityId>> = Arc::new(DashMap::new());
+
         // Wire failure detector with reroute callbacks + roster eviction.
         let rp_failure = reroute_policy.clone();
         let rp_recovery = reroute_policy.clone();
         let roster_failure = roster.clone();
+        let peer_subnets_failure = peer_subnets.clone();
+        let peer_entity_ids_failure = peer_entity_ids.clone();
         let failure_detector = FailureDetector::with_config(FailureDetectorConfig {
             timeout: config.session_timeout,
             miss_threshold: 3,
@@ -469,10 +855,18 @@ impl MeshNode {
                     "roster: evicted failed peer from channels"
                 );
             }
+            peer_subnets_failure.remove(&node_id);
+            peer_entity_ids_failure.remove(&node_id);
         })
         .on_recovery(move |node_id| rp_recovery.on_recovery(node_id));
 
         let pending_handshakes: Arc<DashMap<u64, PendingHandshake>> = Arc::new(DashMap::new());
+
+        // Hoist the subnet knobs before `config` is moved into the
+        // struct literal; the publish + subscribe paths read these
+        // without going back through `config`.
+        let local_subnet = config.subnet;
+        let local_subnet_policy = config.subnet_policy.clone();
 
         Ok(Self {
             identity,
@@ -494,6 +888,18 @@ impl MeshNode {
             roster,
             channel_configs: None,
             pending_membership_acks: Arc::new(DashMap::new()),
+            capability_index: Arc::new(CapabilityIndex::new()),
+            seen_announcements: Arc::new(DashMap::new()),
+            last_announce_at: Arc::new(parking_lot::Mutex::new(None)),
+            local_announcement: Arc::new(ArcSwapOption::empty()),
+            capability_version: Arc::new(AtomicU64::new(0)),
+            local_subnet,
+            local_subnet_policy,
+            peer_subnets,
+            peer_entity_ids,
+            token_cache: None,
+            auth_guard: Arc::new(AuthGuard::new()),
+            auth_failures: Arc::new(DashMap::new()),
             tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
@@ -504,6 +910,53 @@ impl MeshNode {
     /// Get this node's ID.
     pub fn node_id(&self) -> u64 {
         self.node_id
+    }
+
+    /// The per-packet authorization fast path. Writes land here on
+    /// successful subscribe (via `AuthGuard::allow_channel`) and
+    /// reads happen on every publish fan-out. Exposed primarily for
+    /// tests + operator observability; production code should reach
+    /// for `register_channel` / `subscribe_channel` instead.
+    pub fn auth_guard(&self) -> &Arc<AuthGuard> {
+        &self.auth_guard
+    }
+
+    /// The shared `TokenCache` installed on this node, if any. Only
+    /// populated when a caller registered one via
+    /// [`Self::set_token_cache`]. Exposed for tests that need to
+    /// assert the cache is *not* populated as a side effect of a
+    /// rejected subscribe.
+    pub fn token_cache(&self) -> Option<&Arc<TokenCache>> {
+        self.token_cache.as_ref()
+    }
+
+    /// Get this node's ed25519 entity id (derived from the
+    /// keypair handed to `MeshNode::new`). 32 bytes. Used by
+    /// `CapabilityAnnouncement` + channel-auth path.
+    pub fn entity_id(&self) -> &EntityId {
+        self.identity.entity_id()
+    }
+
+    /// Look up a peer's pinned `entity_id`, if the TOFU binding
+    /// has been established. Returns `None` before we've received
+    /// a signature-verified `CapabilityAnnouncement` from the peer.
+    /// Exposed primarily for tests + operator observability; the
+    /// channel-auth subscribe gate consults this map internally.
+    pub fn peer_entity_id(&self, node_id: u64) -> Option<EntityId> {
+        self.peer_entity_ids
+            .get(&node_id)
+            .map(|e| e.value().clone())
+    }
+
+    /// Look up a peer's assigned subnet, if one has been recorded.
+    /// Only populated from signature-verified
+    /// `CapabilityAnnouncement`s — unsigned announcements do not
+    /// write here even when a node is running with
+    /// `require_signed_capabilities = false`. Exposed for tests +
+    /// operator observability; `subnet_visible` consults this map
+    /// on the publish / subscribe fan-out path.
+    pub fn peer_subnet(&self, node_id: u64) -> Option<SubnetId> {
+        self.peer_subnets.get(&node_id).map(|e| *e.value())
     }
 
     /// Get the local bind address.
@@ -607,6 +1060,13 @@ impl MeshNode {
         // Register with failure detector
         self.failure_detector.heartbeat(peer_node_id, peer_addr);
 
+        // Push our most recent capability announcement to the new peer,
+        // so late joiners pick up our caps without waiting for a
+        // re-announce. Races the session's first inbound packet but
+        // that's harmless: the receiver's `index()` is version-skip
+        // safe and DashMap inserts are idempotent.
+        self.push_local_announcement(peer_addr).await;
+
         Ok(peer_node_id)
     }
 
@@ -644,6 +1104,9 @@ impl MeshNode {
 
         self.failure_detector.heartbeat(peer_node_id, peer_addr);
 
+        // See the matching comment in `connect`.
+        self.push_local_announcement(peer_addr).await;
+
         Ok((peer_addr, peer_node_id))
     }
 
@@ -659,6 +1122,8 @@ impl MeshNode {
         let recv_handle = self.spawn_receive_loop();
         let heartbeat_handle = self.spawn_heartbeat_loop();
         let router_handle = self.router.start();
+        let capability_gc_handle = self.spawn_capability_gc_loop();
+        let token_sweep_handle = self.spawn_token_sweep_loop();
 
         // Store handles — can't block here, but we need them for shutdown
         let tasks = self.tasks.clone();
@@ -667,7 +1132,101 @@ impl MeshNode {
             tasks.push(recv_handle);
             tasks.push(heartbeat_handle);
             tasks.push(router_handle);
+            tasks.push(capability_gc_handle);
+            tasks.push(token_sweep_handle);
         });
+    }
+
+    /// Spawn a periodic sweep that evicts expired entries from the
+    /// capability index plus stale `(origin, version)` tuples from
+    /// the multi-hop dedup cache. Interval from
+    /// `config.capability_gc_interval` (default 60 s). Exits on
+    /// `shutdown_notify`.
+    fn spawn_capability_gc_loop(&self) -> JoinHandle<()> {
+        let index = self.capability_index.clone();
+        let seen = self.seen_announcements.clone();
+        let interval = self.config.capability_gc_interval;
+        // Dedup retention = 2× the announcement's own TTL. Longer
+        // than one announcement lifetime so the re-announced bumped
+        // version isn't confused with the previous one; shorter than
+        // `index.gc` retention so the dedup set never outlives the
+        // index it guards.
+        let dedup_retention =
+            std::time::Duration::from_secs(2 * u64::from(CapabilityAnnouncement::DEFAULT_TTL_SECS));
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+
+        tokio::spawn(async move {
+            // `tokio::time::interval` panics on a zero period — guard
+            // against a caller who set `capability_gc_interval` to
+            // `Duration::ZERO` in `MeshNodeConfig`. A zero interval
+            // isn't a sentinel for "disabled" (that's
+            // `Duration::MAX`), it's just pathological input; clamp
+            // to 1 s (see `nonzero_interval` for the rationale).
+            let mut tick = tokio::time::interval(nonzero_interval(interval));
+            // First tick fires immediately; skip it so we don't GC
+            // empty state before any announcements have landed.
+            tick.tick().await;
+            while !shutdown.load(Ordering::Acquire) {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        let _removed = index.gc();
+                        seen.retain(|_, instant| instant.elapsed() < dedup_retention);
+                    }
+                    _ = shutdown_notify.notified() => break,
+                }
+            }
+        })
+    }
+
+    /// Spawn a periodic sweep that evicts subscribers whose tokens
+    /// have expired. Walks the roster by peer (via
+    /// `peer_entity_ids`) and, for every `require_token` channel the
+    /// peer is subscribed to, runs the full token-cache check. An
+    /// expired or invalid entry causes:
+    ///
+    /// 1. Revocation in the [`AuthGuard`] (so the next publish
+    ///    fan-out sees the denial instantly, before the next
+    ///    sweep tick).
+    /// 2. Removal from the [`SubscriberRoster`] (so `members()`
+    ///    returns the pruned list).
+    ///
+    /// Interval from `config.token_sweep_interval` (default 30 s).
+    /// Skipped when the `channel_configs` registry is `None` — a
+    /// node without a registry has no `require_token` channels to
+    /// begin with. Similarly, skipped when `token_cache` is `None`.
+    fn spawn_token_sweep_loop(&self) -> JoinHandle<()> {
+        let roster = self.roster.clone();
+        let guard = self.auth_guard.clone();
+        let cache = self.token_cache.clone();
+        let peer_entity_ids = self.peer_entity_ids.clone();
+        let channel_configs = self.channel_configs.clone();
+        let interval = self.config.token_sweep_interval;
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+
+        tokio::spawn(async move {
+            // Same zero-guard as `spawn_capability_gc_loop` —
+            // tokio panics if the period is zero.
+            let mut tick = tokio::time::interval(nonzero_interval(interval));
+            // First tick fires immediately; skip it so we don't
+            // sweep empty state before any subscribes have landed.
+            tick.tick().await;
+            while !shutdown.load(Ordering::Acquire) {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        sweep_expired_subscribers(
+                            &roster,
+                            &guard,
+                            cache.as_ref(),
+                            &peer_entity_ids,
+                            channel_configs.as_ref(),
+                        );
+                    }
+                    _ = shutdown_notify.notified() => break,
+                }
+            }
+        })
     }
 
     /// Spawn the main receive loop.
@@ -705,6 +1264,19 @@ impl MeshNode {
             channel_configs: self.channel_configs.clone(),
             pending_membership_acks: self.pending_membership_acks.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
+            capability_index: self.capability_index.clone(),
+            seen_announcements: self.seen_announcements.clone(),
+            require_signed_capabilities: self.config.require_signed_capabilities,
+            local_subnet: self.local_subnet,
+            local_subnet_policy: self.local_subnet_policy.clone(),
+            peer_subnets: self.peer_subnets.clone(),
+            peer_entity_ids: self.peer_entity_ids.clone(),
+            token_cache: self.token_cache.clone(),
+            auth_guard: self.auth_guard.clone(),
+            auth_failures: self.auth_failures.clone(),
+            max_auth_failures_per_window: self.config.max_auth_failures_per_window,
+            auth_failure_window: self.config.auth_failure_window,
+            auth_throttle_duration: self.config.auth_throttle_duration,
         };
 
         tokio::spawn(async move {
@@ -1309,6 +1881,25 @@ impl MeshNode {
             return;
         }
 
+        // Capability announcement: signed, versioned capability metadata.
+        // Feeds the local `CapabilityIndex`; never responded to.
+        if parsed.header.subprotocol_id == SUBPROTOCOL_CAPABILITY_ANN {
+            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let Some(payload) = events.into_iter().next() else {
+                return;
+            };
+
+            let from_node = ctx
+                .peers
+                .iter()
+                .find(|e| e.value().session.session_id() == session.session_id())
+                .map(|e| e.value().node_id)
+                .unwrap_or(0);
+
+            Self::handle_capability_announcement(&payload, from_node, ctx);
+            return;
+        }
+
         // Standard event path: parse event frames and queue.
         //
         // Credit accounting charges the full on-wire size (Net
@@ -1727,15 +2318,28 @@ impl MeshNode {
     }
 
     /// Install a `ChannelConfigRegistry` whose `can_subscribe` /
-    /// `can_publish` rules are consulted for incoming Subscribe messages.
+    /// `can_publish` rules are consulted for incoming Subscribe
+    /// messages.
     ///
-    /// When unset (the default), all subscribes are accepted. This is fine
-    /// for testing and for deployments that rely on network-layer isolation
-    /// rather than per-channel ACL. Full capability/token-based authorization
-    /// requires threading the sender's `CapabilitySet` through dispatch and
-    /// is a follow-up.
+    /// When unset (the default), all subscribes are accepted. Full
+    /// capability/token-based authorization additionally requires a
+    /// `TokenCache` — see [`Self::set_token_cache`].
     pub fn set_channel_configs(&mut self, configs: Arc<ChannelConfigRegistry>) {
         self.channel_configs = Some(configs);
+    }
+
+    /// Install a shared `TokenCache` used by the channel-auth path.
+    /// When set, `authorize_subscribe` and `publish_many` consult
+    /// it via `ChannelConfig::can_subscribe` / `can_publish`.
+    /// Subscribers that present a token on the wire have their
+    /// token installed into this cache (after signature
+    /// verification) before the ACL check runs.
+    ///
+    /// When unset, `require_token` channels always reject —
+    /// without a cache there's no way to validate presented tokens
+    /// or find pre-cached ones.
+    pub fn set_token_cache(&mut self, cache: Arc<TokenCache>) {
+        self.token_cache = Some(cache);
     }
 
     /// Ask `publisher_node_id` to add this node to `channel`'s subscriber set.
@@ -1743,13 +2347,29 @@ impl MeshNode {
     /// Blocks until the publisher's `Ack` arrives or
     /// `membership_ack_timeout` elapses. Returns `Ok(())` iff the publisher
     /// accepted the subscribe; `AckReason` failures surface as
-    /// `AdapterError::Connection`.
+    /// `AdapterError::Connection`. No token is presented — use
+    /// [`Self::subscribe_channel_with_token`] for channels with
+    /// `require_token` set.
     pub async fn subscribe_channel(
         &self,
         publisher_node_id: u64,
         channel: ChannelName,
     ) -> Result<(), AdapterError> {
-        self.send_membership_request(publisher_node_id, channel, true)
+        self.send_membership_request(publisher_node_id, channel, true, None)
+            .await
+    }
+
+    /// Subscribe with a pre-issued [`PermissionToken`] attached.
+    /// The publisher verifies the token and, on success, installs
+    /// it in its local `TokenCache` before the
+    /// `ChannelConfig::can_subscribe` check.
+    pub async fn subscribe_channel_with_token(
+        &self,
+        publisher_node_id: u64,
+        channel: ChannelName,
+        token: PermissionToken,
+    ) -> Result<(), AdapterError> {
+        self.send_membership_request(publisher_node_id, channel, true, Some(token.to_bytes()))
             .await
     }
 
@@ -1760,7 +2380,7 @@ impl MeshNode {
         publisher_node_id: u64,
         channel: ChannelName,
     ) -> Result<(), AdapterError> {
-        self.send_membership_request(publisher_node_id, channel, false)
+        self.send_membership_request(publisher_node_id, channel, false, None)
             .await
     }
 
@@ -1769,6 +2389,7 @@ impl MeshNode {
         publisher_node_id: u64,
         channel: ChannelName,
         subscribe: bool,
+        token: Option<Vec<u8>>,
     ) -> Result<(), AdapterError> {
         let peer_addr = {
             let peer = self.peers.get(&publisher_node_id).ok_or_else(|| {
@@ -1789,6 +2410,7 @@ impl MeshNode {
             MembershipMsg::Subscribe {
                 channel: channel.clone(),
                 nonce,
+                token,
             }
         } else {
             MembershipMsg::Unsubscribe {
@@ -1849,15 +2471,44 @@ impl MeshNode {
         };
 
         match msg {
-            MembershipMsg::Subscribe { channel, nonce } => {
-                let (accepted, reason) = Self::authorize_subscribe(&channel, from_node, ctx);
+            MembershipMsg::Subscribe {
+                channel,
+                nonce,
+                token,
+            } => {
+                let (accepted, reason) =
+                    Self::authorize_subscribe(&channel, from_node, token.as_deref(), ctx);
                 if accepted {
+                    // Populate the AuthGuard fast path so publish
+                    // fan-out can admit this subscriber in <10 ns
+                    // without re-walking the ACL. Mirrors the
+                    // `roster.add` below — both are keyed on the
+                    // channel name so they stay consistent.
+                    ctx.auth_guard
+                        .allow_channel(subscriber_origin_hash(from_node), &channel);
                     let id = ChannelId::new(channel);
                     ctx.roster.add(id, from_node);
+                    Self::clear_auth_failures(from_node, ctx);
+                } else if !matches!(
+                    reason,
+                    Some(AckReason::TooManyChannels) | Some(AckReason::RateLimited)
+                ) {
+                    // Count auth-rule rejections toward the
+                    // failure budget. Resource limits
+                    // (TooManyChannels) and throttle short-
+                    // circuits (RateLimited) don't — the former
+                    // is orthogonal, the latter is the *result*
+                    // of past failures and would double-count.
+                    Self::record_auth_failure(from_node, ctx);
                 }
                 Self::send_membership_ack(from_node, nonce, accepted, reason, ctx);
             }
             MembershipMsg::Unsubscribe { channel, nonce } => {
+                // Revoke from the fast path first so any in-flight
+                // publish stops admitting this subscriber even
+                // before the roster update is visible.
+                ctx.auth_guard
+                    .revoke_channel(subscriber_origin_hash(from_node), &channel);
                 let id = ChannelId::new(channel);
                 ctx.roster.remove(&id, from_node);
                 // Unsubscribe is always accepted — idempotent even if the
@@ -1881,28 +2532,495 @@ impl MeshNode {
         }
     }
 
+    /// Dispatch an inbound `CapabilityAnnouncement` into the local
+    /// capability index. Drops announcements that:
+    /// - fail to decode (malformed bytes),
+    /// - carry a `node_id` that doesn't match the session's peer
+    ///   (a peer can only announce for itself),
+    /// - are missing a signature when
+    ///   `require_signed_capabilities` is on,
+    /// - carry a signature that fails verification against the
+    ///   announcement's own `entity_id` (Stage E upgrade).
+    ///
+    /// `node_id` and `entity_id` are independent values on the
+    /// wire; we pin `node_id → entity_id` on first sight so a
+    /// later announcement claiming a different `entity_id` for the
+    /// same `node_id` won't silently rebind identity.
+    fn handle_capability_announcement(payload: &[u8], from_node: u64, ctx: &DispatchCtx) {
+        let Some(ann) = CapabilityAnnouncement::from_bytes(payload) else {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                len = payload.len(),
+                "capability: decode failed"
+            );
+            return;
+        };
+
+        // Direct peers may only announce their own caps. Forwarded
+        // announcements (hop_count > 0) are relayed through a peer
+        // that isn't the origin, so we skip the check in that path
+        // and rely on signature verification plus the TOFU binding
+        // to keep forgers out.
+        if ann.hop_count == 0 && ann.node_id != from_node {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                ann_node = format!("{:#x}", ann.node_id),
+                "capability: node_id mismatch (peer can only announce for itself)"
+            );
+            return;
+        }
+
+        // Origin self-check — if we're the origin, drop. A mesh
+        // loop could bounce our own announcement back to us; no
+        // reason to re-index or re-broadcast.
+        if ann.node_id == ctx.local_node_id {
+            return;
+        }
+
+        // Dedup on (origin, version). A `(node_id, version)` tuple
+        // is processed at most once — protects against diamond
+        // topologies where the same announcement arrives twice via
+        // different paths. Insert happens AFTER validation so a
+        // malformed announcement doesn't poison the cache.
+        let dedup_key = (ann.node_id, ann.version);
+        if ctx.seen_announcements.contains_key(&dedup_key) {
+            return;
+        }
+
+        if ctx.require_signed_capabilities && ann.signature.is_none() {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                "capability: unsigned announcement rejected"
+            );
+            return;
+        }
+
+        // Verify the signature (when present) against the
+        // announcement's self-claimed entity_id. Unsigned
+        // announcements skip this branch; receivers that care about
+        // authenticity set `require_signed_capabilities = true`.
+        let signature_verified = if ann.signature.is_some() {
+            if ann.verify().is_err() {
+                tracing::trace!(
+                    from_node = format!("{:#x}", from_node),
+                    "capability: signature verification failed"
+                );
+                return;
+            }
+            true
+        } else {
+            false
+        };
+
+        // Bind `node_id` to `entity_id` cryptographically. The
+        // signature covers `entity_id` but NOT `node_id` — without
+        // this check a signed announcement could claim any
+        // `node_id`, poisoning the capability index and route
+        // learning for an unrelated peer. `EntityId::node_id()` is
+        // a blake2s derivation over the public key, so a forger who
+        // doesn't control the key can't produce matching bytes.
+        if ann.entity_id.node_id() != ann.node_id {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                claimed_node = format!("{:#x}", ann.node_id),
+                derived_node = format!("{:#x}", ann.entity_id.node_id()),
+                "capability: node_id does not match entity_id derivation"
+            );
+            return;
+        }
+
+        // First-seen identity pin — TOFU. A peer that tries to
+        // rebind its `entity_id` in a later announcement is
+        // silently rejected. Two preconditions must hold before we
+        // pin anything:
+        //
+        // 1. The announcement is **signature-verified**. An
+        //    unsigned announcement's `entity_id` is attacker-
+        //    controlled and would poison the binding; unauthenticated
+        //    deployments skip the pin entirely, and channel-auth
+        //    paths fall through to "missing entity" instead of
+        //    trusting forged input.
+        // 2. The announcement arrived **directly** from the origin
+        //    (`hop_count == 0`). On that path `ann.node_id` was
+        //    already checked to equal `from_node` above, so pinning
+        //    `from_node → ann.entity_id` binds the session to the
+        //    key that actually signed for it. A forwarded
+        //    announcement (`hop_count > 0`) travels through an
+        //    arbitrary middle peer; pinning `from_node → victim_id`
+        //    in that path would let the forwarder pose as the
+        //    origin for subsequent channel auth (`authorize_subscribe`
+        //    keys on `peer_entity_ids.get(from_node)`). Forwarded
+        //    caps still update the capability index + routing, but
+        //    the entity binding is deferred to the eventual direct
+        //    announcement.
+        if signature_verified && ann.hop_count == 0 {
+            if let Some(existing) = ctx.peer_entity_ids.get(&from_node) {
+                if *existing.value() != ann.entity_id {
+                    tracing::trace!(
+                        from_node = format!("{:#x}", from_node),
+                        "capability: entity_id rebind rejected (TOFU)"
+                    );
+                    return;
+                }
+            } else {
+                ctx.peer_entity_ids.insert(from_node, ann.entity_id.clone());
+            }
+        }
+
+        // Derive the peer's subnet *before* moving `ann` into the
+        // index — the policy needs `ann.capabilities` and `index()`
+        // consumes the announcement by value.
+        //
+        // Gated on `signature_verified && ann.hop_count == 0` for
+        // the same reasons the TOFU pin above has that exact pair
+        // of conditions:
+        //
+        // 1. Unsigned `ann.capabilities` is attacker-controlled, so
+        //    a deployment running with
+        //    `require_signed_capabilities = false` for discovery
+        //    must not let unsigned input feed `peer_subnets` —
+        //    that map is read by `subnet_visible` on the
+        //    publish / subscribe paths, and a spoofed subnet would
+        //    admit a peer to `SubnetLocal` channels it shouldn't
+        //    see.
+        // 2. On a forwarded announcement (`hop_count > 0`) the
+        //    `from_node` in our hands is the relay peer, not the
+        //    origin. Writing the origin's derived subnet under the
+        //    relay's `node_id` would overwrite the relay's legitimate
+        //    subnet binding — a crafted forwarded announcement could
+        //    shift any legitimate peer into a different subnet just
+        //    by being the last hop on its path. The real binding
+        //    comes from the origin's own direct announcement.
+        if signature_verified && ann.hop_count == 0 {
+            if let Some(policy) = ctx.local_subnet_policy.as_ref() {
+                let subnet = policy.assign(&ann.capabilities);
+                ctx.peer_subnets.insert(from_node, subnet);
+            }
+        }
+
+        // Cache BEFORE indexing (the index consumes `ann` by value,
+        // but the dedup key is already captured above). Insert at
+        // this point so a subsequent duplicate short-circuits at the
+        // `contains_key` check without re-parsing + re-verifying.
+        ctx.seen_announcements
+            .insert(dedup_key, std::time::Instant::now());
+
+        // Topology learning from multi-hop receipt. An announcement
+        // arriving with `hop_count > 0` traveled through `from_node`
+        // to reach us, so install a route to the origin with metric
+        // `hop_count + 2`. The `+2` offset matches the pingwave
+        // convention so direct routes (metric 1) always strictly
+        // beat any announcement-installed route. Routes from
+        // capability announcements compete with pingwave-installed
+        // routes via the routing table's "better metric wins" rule.
+        // Direct announcements (hop_count == 0) skip this — the
+        // session itself is already the authority for that peer.
+        if ann.hop_count > 0 {
+            if let Some(entry) = ctx.peer_addrs.get(&from_node) {
+                let sender_addr = *entry.value();
+                let metric = u16::from(ann.hop_count) + 2;
+                ctx.router
+                    .routing_table()
+                    .add_route_with_metric(ann.node_id, sender_addr, metric);
+            }
+        }
+
+        // Multi-hop forwarding: if we haven't exhausted the hop
+        // budget, increment `hop_count` and re-broadcast to every
+        // directly-connected peer except the sender and the peer we
+        // use to reach the origin (split horizon). Do this BEFORE
+        // handing `ann` to the index (which consumes by value) so
+        // the forwarder has the current view of `hop_count`.
+        if ann.hop_count < MAX_CAPABILITY_HOPS - 1 {
+            let mut forwarded = ann.clone();
+            forwarded.hop_count += 1;
+            // `to_bytes` on a clone with the bumped counter —
+            // signature remains valid because `signed_payload()`
+            // zeros `hop_count` on verify.
+            let fwd_bytes = forwarded.to_bytes();
+            Self::forward_capability_announcement(fwd_bytes, ann.node_id, from_node, ctx);
+        }
+
+        ctx.capability_index.index(ann);
+    }
+
+    /// Fan an already-serialized capability announcement out to every
+    /// directly-connected peer, minus the sender and any split-
+    /// horizon-excluded peer. Spawned onto the runtime so the
+    /// synchronous dispatch handler isn't blocked on per-peer
+    /// encryption and network send. Mirrors the pingwave forwarding
+    /// loop at the top of `dispatch_packet` — same split-horizon
+    /// rule, same best-effort send semantics.
+    fn forward_capability_announcement(
+        payload: Vec<u8>,
+        origin_node_id: u64,
+        sender_node_id: u64,
+        ctx: &DispatchCtx,
+    ) {
+        let peers = ctx.peers.clone();
+        let socket = ctx.socket.clone();
+        let partition_filter = ctx.partition_filter.clone();
+        let router = ctx.router.clone();
+
+        tokio::spawn(async move {
+            // Split-horizon: consult the routing table for the
+            // origin's best next hop and skip that peer. Matches the
+            // pingwave rule so capability forwarding + pingwave
+            // forwarding contribute to the same DV loop-avoidance
+            // invariant.
+            let next_hop_addr = router.routing_table().lookup(origin_node_id);
+
+            for entry in peers.iter() {
+                let peer = entry.value();
+                if peer.node_id == sender_node_id {
+                    continue; // never send back to whoever gave it to us
+                }
+                if Some(peer.addr) == next_hop_addr {
+                    continue; // split horizon: that's our path to the origin
+                }
+                if partition_filter.contains(&peer.addr) {
+                    continue;
+                }
+
+                // Build + send a subprotocol packet through this
+                // peer's session. Same path as `send_subprotocol`;
+                // inlined because the dispatch handler has no `self`.
+                let session = &peer.session;
+                let stream_id = SUBPROTOCOL_CAPABILITY_ANN as u64;
+                let pool = session.thread_local_pool();
+                let mut builder = pool.get();
+                let seq = {
+                    let stream = session.get_or_create_stream(stream_id);
+                    stream.next_tx_seq()
+                };
+                let events = vec![Bytes::copy_from_slice(&payload)];
+                let packet = builder.build_subprotocol(
+                    stream_id,
+                    seq,
+                    &events,
+                    PacketFlags::NONE,
+                    SUBPROTOCOL_CAPABILITY_ANN,
+                );
+                let _ = socket.send_to(&packet, peer.addr).await;
+                drop(builder);
+                session.touch();
+            }
+        });
+    }
+
     /// Decide whether a Subscribe from `from_node` on `channel` is allowed.
     ///
     /// Rules, in order:
     /// 1. Per-peer channel cap — rejects with `TooManyChannels`.
     /// 2. If a `channel_configs` registry is set and the channel isn't in
     ///    it, reject with `UnknownChannel`.
-    /// 3. Otherwise accept. Full capability/token checks are deferred
-    ///    until the dispatch context carries the sender's `CapabilitySet`.
+    /// 3. Channel [`Visibility`] must permit the subscriber's subnet
+    ///    — reject cross-subnet subscribes with `Unauthorized`.
+    /// 4. Channel auth — `publish_caps` / `subscribe_caps` /
+    ///    `require_token` on `ChannelConfig` are honored via
+    ///    `ChannelConfig::can_subscribe`. A presented token is
+    ///    installed into the local `TokenCache` (after signature
+    ///    verification) before the check runs.
     fn authorize_subscribe(
         channel: &ChannelName,
         from_node: u64,
+        token_bytes: Option<&[u8]>,
         ctx: &DispatchCtx,
     ) -> (bool, Option<AckReason>) {
+        // Rate-limit check runs first — a throttled peer short-
+        // circuits without consuming any ed25519 work. The
+        // failure counter increments only on actual auth-rule
+        // rejections below (not on `TooManyChannels`, which is a
+        // resource-limit failure, not an auth failure).
+        if Self::is_auth_throttled(from_node, ctx) {
+            return (false, Some(AckReason::RateLimited));
+        }
         if ctx.roster.channels_for_peer_count(from_node) >= ctx.max_channels_per_peer {
             return (false, Some(AckReason::TooManyChannels));
         }
-        if let Some(ref configs) = ctx.channel_configs {
-            if configs.get_by_name(channel.as_str()).is_none() {
-                return (false, Some(AckReason::UnknownChannel));
+        let Some(ref configs) = ctx.channel_configs else {
+            // No registry → no ACL (test / permissive deployments).
+            return (true, None);
+        };
+        let Some(cfg_ref) = configs.get_by_name(channel.as_str()) else {
+            return (false, Some(AckReason::UnknownChannel));
+        };
+        // Clone the cfg so we can drop the DashMap guard before
+        // any further work — the cfg fields are all cheap to clone
+        // and doing so releases the registry's read lock early.
+        let cfg = cfg_ref.clone();
+        drop(cfg_ref);
+
+        let peer_subnet = ctx
+            .peer_subnets
+            .get(&from_node)
+            .map(|e| *e.value())
+            .unwrap_or(SubnetId::GLOBAL);
+        if !Self::subnet_visible(ctx.local_subnet, peer_subnet, cfg.visibility) {
+            return (false, Some(AckReason::Unauthorized));
+        }
+
+        // Parse + verify the presented token into a LOCAL scratch
+        // value. We do NOT insert into the shared cache until the
+        // full auth check passes — otherwise an attacker can spam
+        // self-signed subscribes (which fail at cap/visibility
+        // checks) yet leave their tokens permanently in the shared
+        // cache, exhausting memory keyed under attacker-controlled
+        // `(subject, channel_hash)` slots.
+        let presented_token = token_bytes
+            .and_then(|bytes| PermissionToken::from_bytes(bytes).ok())
+            .filter(|tok| tok.verify().is_ok());
+
+        // Whether any cap / token gate is in play. A fully open
+        // channel (no filters, no require_token) short-circuits
+        // without needing a peer entity_id at all.
+        let has_auth_gates =
+            cfg.publish_caps.is_some() || cfg.subscribe_caps.is_some() || cfg.require_token;
+        if !has_auth_gates {
+            return (true, None);
+        }
+
+        // Peer caps default to empty — subscribe-before-announce
+        // races return `None` from the index; we treat that as an
+        // empty capability set, which makes `subscribe_caps` filters
+        // fail closed.
+        let peer_caps = ctx.capability_index.get(from_node).unwrap_or_default();
+
+        // Peer entity — load-bearing for `require_token`. Without
+        // it we can't validate the subject. Missing entity +
+        // require_token = reject.
+        let Some(peer_entity) = ctx
+            .peer_entity_ids
+            .get(&from_node)
+            .map(|e| e.value().clone())
+        else {
+            if cfg.require_token {
+                return (false, Some(AckReason::Unauthorized));
             }
+            // Cap-filter-only mode without a known entity — build a
+            // dummy id so `can_subscribe` can still run the cap
+            // match. Token check is skipped via `require_token=false`.
+            let dummy = EntityId::from_bytes([0u8; 32]);
+            let empty_cache = Arc::new(TokenCache::new());
+            return if cfg.can_subscribe(&peer_caps, &dummy, &empty_cache) {
+                (true, None)
+            } else {
+                (false, Some(AckReason::Unauthorized))
+            };
+        };
+
+        // Run the ACL check against a scratch cache containing only
+        // the presented token first. A positive verdict means the
+        // fresh token alone is sufficient. If that fails, fall back
+        // to the shared cache so a peer relying on a previously-
+        // stored delegation can still re-subscribe without having
+        // to re-present. The shared cache is read-only for this
+        // decision.
+        let scratch_cache = Arc::new(TokenCache::new());
+        if let Some(ref tok) = presented_token {
+            scratch_cache.insert_unchecked(tok.clone());
+        }
+        let passed_with_scratch = cfg.can_subscribe(&peer_caps, &peer_entity, &scratch_cache);
+        let passed = passed_with_scratch
+            || ctx
+                .token_cache
+                .as_ref()
+                .is_some_and(|shared| cfg.can_subscribe(&peer_caps, &peer_entity, shared));
+        if !passed {
+            return (false, Some(AckReason::Unauthorized));
+        }
+
+        // Auth passed — now and only now promote the presented token
+        // to the shared cache so future subscribes on the same
+        // (subject, channel_hash) can skip re-presenting.
+        if let (Some(tok), Some(shared)) = (presented_token, ctx.token_cache.as_ref()) {
+            let _ = shared.insert(tok);
         }
         (true, None)
+    }
+
+    /// Check whether `from_node` is currently auth-throttled.
+    /// Reads + clears the `throttled_until` instant atomically so
+    /// an expired throttle state doesn't leak into future windows.
+    fn is_auth_throttled(from_node: u64, ctx: &DispatchCtx) -> bool {
+        if ctx.max_auth_failures_per_window == u16::MAX {
+            return false; // threshold disabled
+        }
+        let Some(mut entry) = ctx.auth_failures.get_mut(&from_node) else {
+            return false;
+        };
+        match entry.throttled_until {
+            Some(until) if std::time::Instant::now() < until => true,
+            Some(_) => {
+                // Throttle elapsed — reset so the peer gets a
+                // clean slate next time around.
+                entry.throttled_until = None;
+                entry.failures = 0;
+                entry.window_start = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Record an authorization-rule rejection against `from_node`.
+    /// Increments the rolling-window counter; once it crosses
+    /// `max_auth_failures_per_window`, marks the peer as throttled
+    /// for `auth_throttle_duration`.
+    fn record_auth_failure(from_node: u64, ctx: &DispatchCtx) {
+        if ctx.max_auth_failures_per_window == u16::MAX {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let mut entry = ctx.auth_failures.entry(from_node).or_default();
+        // Window reset: if the current window has elapsed, start
+        // fresh. Keeps failure counts from leaking across honest
+        // retry storms separated by long idle periods.
+        let reset_window = match entry.window_start {
+            Some(start) => now.duration_since(start) >= ctx.auth_failure_window,
+            None => true,
+        };
+        if reset_window {
+            entry.window_start = Some(now);
+            entry.failures = 0;
+        }
+        entry.failures = entry.failures.saturating_add(1);
+        if entry.failures >= ctx.max_auth_failures_per_window {
+            entry.throttled_until = Some(now + ctx.auth_throttle_duration);
+        }
+    }
+
+    /// Wipe `from_node`'s failure counter. Called after a successful
+    /// subscribe so honest peers that occasionally fail (stale
+    /// token, renewal race) don't accumulate toward the throttle.
+    fn clear_auth_failures(from_node: u64, ctx: &DispatchCtx) {
+        ctx.auth_failures.remove(&from_node);
+    }
+
+    /// `true` if a packet with `visibility` originating in `source`
+    /// should be delivered to a peer in `dest`.
+    ///
+    /// Mirrors the `SubnetGateway::should_forward` visibility matrix
+    /// but doesn't need the gateway's state (`peer_subnets`,
+    /// `export_table`). Regular participants use this for
+    /// publish-fan-out filtering + subscribe-gate checks;
+    /// border-gateway nodes with richer routing state should use the
+    /// full `SubnetGateway` instead.
+    ///
+    /// `Exported` is conservative — returns `false` unless a
+    /// per-channel export table is consulted elsewhere. Wiring that
+    /// is a documented follow-up.
+    fn subnet_visible(source: SubnetId, dest: SubnetId, visibility: Visibility) -> bool {
+        match visibility {
+            Visibility::Global => true,
+            Visibility::SubnetLocal => source.is_same_subnet(dest),
+            Visibility::ParentVisible => {
+                source.is_same_subnet(dest)
+                    || source.is_ancestor_of(dest)
+                    || dest.is_ancestor_of(source)
+            }
+            Visibility::Exported => false,
+        }
     }
 
     /// Send an `Ack` on the membership subprotocol back to `to_node`.
@@ -1987,10 +3105,151 @@ impl MeshNode {
         publisher: &ChannelPublisher,
         events: &[Bytes],
     ) -> Result<PublishReport, AdapterError> {
+        // Publisher-side auth: if the channel is registered with
+        // `publish_caps` / `require_token`, the local node must
+        // satisfy them *before* fan-out begins. Keeps a node from
+        // silently publishing to a channel whose own ACL it doesn't
+        // match. Channels absent from the registry are treated as
+        // open (permissive default).
+        let cfg_snapshot = self.channel_configs.as_ref().and_then(|cr| {
+            cr.get_by_name(publisher.channel().name().as_str())
+                .map(|c| c.clone())
+        });
+        if let Some(cfg) = cfg_snapshot.as_ref() {
+            if cfg.publish_caps.is_some() || cfg.require_token {
+                let self_caps = self
+                    .local_announcement
+                    .load()
+                    .as_deref()
+                    .map(|ann| ann.capabilities.clone())
+                    .unwrap_or_default();
+                let self_entity = self.identity.entity_id().clone();
+                let cache = self
+                    .token_cache
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(TokenCache::new()));
+                if !cfg.can_publish(&self_caps, &self_entity, &cache) {
+                    return Err(AdapterError::Connection(
+                        "channel: publish denied by channel ACL".into(),
+                    ));
+                }
+            }
+        }
+
         // Snapshot subscribers at call time; late subscribers won't see
         // this publish, early-unsubscribes may still receive it — both
         // are documented non-goals.
-        let subscribers = self.roster.members(publisher.channel());
+        let mut subscribers = self.roster.members(publisher.channel());
+
+        // Subnet visibility filter. Look up the channel's visibility
+        // (default `Global` for unregistered names so a publisher
+        // without a registry still delivers) and drop any subscriber
+        // whose subnet isn't visible under that rule. Filtered
+        // subscribers don't show up in `attempted` or `errors` —
+        // they're policy decisions, not failures.
+        let visibility = cfg_snapshot
+            .as_ref()
+            .map(|c| c.visibility)
+            .unwrap_or(Visibility::Global);
+        subscribers.retain(|peer_id| {
+            let peer_subnet = self
+                .peer_subnets
+                .get(peer_id)
+                .map(|e| *e.value())
+                .unwrap_or(SubnetId::GLOBAL);
+            Self::subnet_visible(self.local_subnet, peer_subnet, visibility)
+        });
+
+        // AuthGuard fast path. Populated by `authorize_subscribe`;
+        // revoked on unsubscribe and by the expiry sweep. Consulted
+        // on every publish so revocations take effect on the next
+        // fan-out without waiting for a roster refresh.
+        //
+        // Three-way verdict:
+        //
+        // - `Allowed`: bloom hit + verified-cache entry says yes.
+        //   The verified cache is keyed on the 16-bit `channel_hash`
+        //   that rides the wire header, which collides routinely at
+        //   mesh scale — one subscriber's grant on channel A can
+        //   falsely admit them on channel B when the hashes alias.
+        //   Cross-check the canonical name against `exact` before
+        //   trusting the verdict; a mismatch means the allow came
+        //   from a different channel that happened to collide.
+        // - `Denied`: bloom miss — no auth entry exists for this
+        //   (origin, channel). Skip the subscriber.
+        // - `Unknown`: bloom hit but verified cache missed. Fall
+        //   back to the exact-channel ACL. On hit, promote back
+        //   into the verified cache so subsequent publishes take
+        //   the fast path.
+        //
+        // Open channels (no auth configured) are admitted on every
+        // subscribe via `allow_channel`, so the fast path trivially
+        // passes for them — no conditional branch needed.
+        //
+        // Additionally, when the channel is `require_token`, we do a
+        // **lazy expiry check** on each admitted subscriber. The
+        // periodic token sweep (`spawn_token_sweep_loop`) is the
+        // primary eviction path, but a caller may deliberately
+        // configure `token_sweep_interval = Duration::MAX` to opt out
+        // — and without a second line of defence an expired token
+        // would keep authorizing packets forever. Probing the token
+        // cache per admitted subscriber costs one DashMap lookup +
+        // a timestamp compare per publish, which is only paid on
+        // token-gated channels (`require_token = false` skips the
+        // branch entirely). An expired subscriber is revoked inline
+        // so the next publish takes the `Denied` path.
+        let channel_name = publisher.channel().name().clone();
+        let channel_hash = channel_name.hash();
+        let auth_guard = self.auth_guard.clone();
+        let require_token = cfg_snapshot
+            .as_ref()
+            .map(|c| c.require_token)
+            .unwrap_or(false);
+        subscribers.retain(|peer_id| {
+            let origin = subscriber_origin_hash(*peer_id);
+            let admitted = match auth_guard.check_fast(origin, channel_hash) {
+                AuthVerdict::Allowed => auth_guard.is_authorized_full(origin, &channel_name),
+                AuthVerdict::Denied => false,
+                AuthVerdict::NeedsFullCheck => {
+                    if auth_guard.is_authorized_full(origin, &channel_name) {
+                        auth_guard.allow_channel(origin, &channel_name);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if !admitted {
+                return false;
+            }
+            if !require_token {
+                return true;
+            }
+            // Token-gated branch: ensure the subscriber still has a
+            // valid token. If the cache answer is "no valid token
+            // authorizes SUBSCRIBE on this channel," revoke inline.
+            let (Some(cache), Some(entity)) = (
+                self.token_cache.as_ref(),
+                self.peer_entity_ids.get(peer_id).map(|e| e.value().clone()),
+            ) else {
+                // Missing entity binding or no cache installed —
+                // treat as unauthorized. The subscribe path would
+                // have rejected this peer in the first place;
+                // reaching here means a config drift that we must
+                // not paper over by admitting the publish.
+                auth_guard.revoke_channel(origin, &channel_name);
+                return false;
+            };
+            if cache
+                .check(&entity, TokenScope::SUBSCRIBE, channel_hash)
+                .is_err()
+            {
+                auth_guard.revoke_channel(origin, &channel_name);
+                return false;
+            }
+            true
+        });
+
         let mut report = PublishReport {
             attempted: subscribers.len(),
             delivered: 0,
@@ -2213,6 +3472,140 @@ impl MeshNode {
         drop(builder);
         session.touch();
         Ok(())
+    }
+
+    // ── Capability announcements ──────────────────────────────────────
+    //
+    // `SUBPROTOCOL_CAPABILITY_ANN` payloads; the on-wire form is
+    // `CapabilityAnnouncement::to_bytes`. Direct-peer push only in
+    // v1; multi-hop gossip is a follow-up.
+
+    /// Announce this node's capabilities to every directly-connected
+    /// peer. Also self-indexes so single-node `find_peers_by_filter`
+    /// queries return us too.
+    ///
+    /// TTL defaults to 5 minutes. Unsigned (signatures tie in with
+    /// Stage E channel auth). For explicit control over TTL or
+    /// signing, see [`Self::announce_capabilities_with`].
+    pub async fn announce_capabilities(&self, caps: CapabilitySet) -> Result<(), AdapterError> {
+        // Default to signed — the node always has a keypair (either
+        // caller-supplied or ephemeral at construction time), so
+        // signing is free and closes the trust-on-first-use gap.
+        self.announce_capabilities_with(caps, Duration::from_secs(300), true)
+            .await
+    }
+
+    /// Extended announce with explicit TTL and signing opt-in.
+    ///
+    /// `sign = true` signs the announcement with the node's
+    /// [`EntityKeypair`] so receivers can validate end-to-end.
+    /// `sign = false` broadcasts unsigned — useful in trusted
+    /// environments where the wire signature adds no value.
+    /// Receivers with `require_signed_capabilities = true` drop
+    /// unsigned announcements regardless.
+    pub async fn announce_capabilities_with(
+        &self,
+        caps: CapabilitySet,
+        ttl: Duration,
+        sign: bool,
+    ) -> Result<(), AdapterError> {
+        let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut ann = CapabilityAnnouncement::new(
+            self.node_id,
+            self.identity.entity_id().clone(),
+            version,
+            caps,
+        )
+        .with_ttl(ttl.as_secs().min(u32::MAX as u64) as u32);
+        if sign {
+            ann.sign(&self.identity);
+        }
+
+        // Self-index so local queries see our own caps. Always runs
+        // regardless of rate limit — the self-index reflects the
+        // latest intended announcement.
+        self.capability_index.index(ann.clone());
+
+        // Publish as the latest local announcement so future
+        // session-opens push this version to new peers. Also always
+        // runs so late joiners get the latest caps even when we've
+        // rate-limited away the broadcast.
+        self.local_announcement.store(Some(Arc::new(ann.clone())));
+
+        // Origin-side rate limit: within-window calls update the
+        // self-index + `local_announcement` but skip the network
+        // broadcast. Callers that want to force an immediate
+        // re-broadcast should lower `min_announce_interval` on
+        // `MeshNodeConfig`.
+        let now = std::time::Instant::now();
+        let min_interval = self.config.min_announce_interval;
+        let should_broadcast = {
+            let mut last = self.last_announce_at.lock();
+            let elapsed = last.map(|t| now.saturating_duration_since(t));
+            let can_send = elapsed.is_none_or(|e| e >= min_interval);
+            if can_send {
+                *last = Some(now);
+            }
+            can_send
+        };
+        if !should_broadcast {
+            return Ok(());
+        }
+
+        // Fan out to currently-connected peers. Best-effort — a
+        // per-peer send failure is logged and skipped rather than
+        // short-circuiting the broadcast.
+        let bytes = ann.to_bytes();
+        let peer_addrs: Vec<SocketAddr> = self.peers.iter().map(|e| e.value().addr).collect();
+        for addr in peer_addrs {
+            if let Err(e) = self
+                .send_subprotocol(addr, SUBPROTOCOL_CAPABILITY_ANN, &bytes)
+                .await
+            {
+                tracing::trace!(peer = %addr, error = %e, "capability: announce send failed");
+            }
+        }
+        Ok(())
+    }
+
+    /// Query the capability index. Returns node ids (including our
+    /// own `node_id`) whose latest announcement matches `filter`.
+    pub fn find_peers_by_filter(&self, filter: &CapabilityFilter) -> Vec<u64> {
+        self.capability_index.query(filter)
+    }
+
+    /// Rank peers for a scored requirement. Returns the best-
+    /// scoring node's id, or `None` if no peer matches.
+    pub fn rank_peers(&self, req: &CapabilityRequirement) -> Option<u64> {
+        self.capability_index.find_best(req)
+    }
+
+    /// Shared reference to the capability index. Use this for
+    /// queries the two helpers above don't cover (listing all known
+    /// peers, reading stats, etc.).
+    pub fn capability_index(&self) -> &Arc<CapabilityIndex> {
+        &self.capability_index
+    }
+
+    /// Push the currently-stored local announcement (if any) to
+    /// `peer_addr`. Called from the end of `connect` / `accept` so
+    /// late joiners don't have to wait for a re-announce. No-op
+    /// when we haven't yet announced anything.
+    async fn push_local_announcement(&self, peer_addr: SocketAddr) {
+        let Some(ann) = self.local_announcement.load_full() else {
+            return;
+        };
+        let bytes = ann.to_bytes();
+        if let Err(e) = self
+            .send_subprotocol(peer_addr, SUBPROTOCOL_CAPABILITY_ANN, &bytes)
+            .await
+        {
+            tracing::trace!(
+                peer = %peer_addr,
+                error = %e,
+                "capability: session-open push failed"
+            );
+        }
     }
 
     // ── Stream API ─────────────────────────────────────────────────────

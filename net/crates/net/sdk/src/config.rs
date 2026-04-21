@@ -35,6 +35,11 @@ impl From<Backpressure> for BackpressureMode {
 pub struct NetBuilder {
     pub(crate) inner: EventBusConfigBuilder,
     pub(crate) adapter: Option<AdapterConfig>,
+    /// Caller-owned identity. Stored here so `Net::from_builder` can
+    /// plumb it into whichever adapter consumes keypairs; the
+    /// event-bus itself is adapter-agnostic and doesn't use it.
+    #[cfg(feature = "net")]
+    pub(crate) identity: Option<crate::identity::Identity>,
 }
 
 impl NetBuilder {
@@ -42,7 +47,22 @@ impl NetBuilder {
         Self {
             inner: EventBusConfig::builder(),
             adapter: None,
+            #[cfg(feature = "net")]
+            identity: None,
         }
+    }
+
+    /// Pin this node to a caller-owned [`Identity`](crate::Identity).
+    ///
+    /// Stored on the builder and handed to whichever adapter consumes
+    /// keypairs (today: the mesh adapter when `net` is enabled). For
+    /// an event-bus-only node without a mesh adapter, the identity is
+    /// retained but unused — it becomes load-bearing once you wire in
+    /// a `NetAdapterConfig`.
+    #[cfg(feature = "net")]
+    pub fn identity(mut self, identity: crate::identity::Identity) -> Self {
+        self.identity = Some(identity);
+        self
     }
 
     /// Set the number of shards.
@@ -122,11 +142,96 @@ impl NetBuilder {
 
     /// Build the configuration, consuming the builder.
     pub(crate) fn build_config(mut self) -> crate::error::Result<EventBusConfig> {
-        if let Some(adapter) = self.adapter {
+        if let Some(mut adapter) = self.adapter {
+            // Plumb the caller-supplied identity into the adapter if
+            // it consumes keypairs. Today only the `net` adapter
+            // does; other adapters drop the identity silently (the
+            // `identity()` docstring flags this). Without this
+            // injection the builder's `identity(...)` would be a
+            // no-op — the mesh would generate a fresh keypair every
+            // run and `node_id` / `entity_id` would drift across
+            // restarts.
+            #[cfg(feature = "net")]
+            if let (Some(id), AdapterConfig::Net(ref mut net_cfg)) =
+                (self.identity.as_ref(), &mut adapter)
+            {
+                net_cfg.entity_keypair = Some((**id.keypair()).clone());
+            }
             self.inner = self.inner.adapter(adapter);
         }
         self.inner
             .build()
             .map_err(|e| crate::error::SdkError::Config(e.to_string()))
+    }
+}
+
+#[cfg(all(test, feature = "net"))]
+mod tests {
+    use super::*;
+    use net::adapter::net::NetAdapterConfig;
+    use std::net::SocketAddr;
+
+    fn sample_net_adapter() -> NetAdapterConfig {
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        NetAdapterConfig::initiator(bind, peer, [0x00; 32], [0x00; 32])
+    }
+
+    /// Regression for a cubic-flagged P1: `NetBuilder::identity(...)`
+    /// stored the identity on the builder but `build_config` never
+    /// plumbed it into the adapter. Callers pinning a seed expected
+    /// a stable `node_id` / `entity_id` across restarts and silently
+    /// got a fresh keypair every build.
+    ///
+    /// Test constructs a builder with a seeded identity + a `Net`
+    /// adapter via `.mesh(...)`, calls `build_config`, and asserts
+    /// the resulting `NetAdapterConfig.entity_keypair` contains the
+    /// caller's key — not `None` (pre-fix behaviour) and not a
+    /// freshly generated one.
+    #[test]
+    fn net_builder_identity_plumbs_into_adapter() {
+        let seed = [0x42u8; 32];
+        let identity = crate::identity::Identity::from_seed(seed);
+        let expected_entity_id = identity.entity_id().clone();
+
+        let config = NetBuilder::new()
+            .mesh(sample_net_adapter())
+            .identity(identity)
+            .build_config()
+            .expect("build_config");
+
+        let AdapterConfig::Net(net_cfg) = config.adapter else {
+            panic!("adapter lost its Net variant during build_config");
+        };
+        let kp = net_cfg
+            .entity_keypair
+            .as_ref()
+            .expect("entity_keypair should have been plumbed from NetBuilder::identity");
+        assert_eq!(
+            kp.entity_id(),
+            &expected_entity_id,
+            "plumbed entity_id must match the pinned identity's",
+        );
+    }
+
+    /// Regression for the other half of the same contract: a
+    /// builder with no identity must leave `entity_keypair` unset
+    /// so the mesh's internal default (generate a fresh keypair)
+    /// is honoured. The fix mustn't accidentally inject an empty /
+    /// default keypair when the caller didn't pin one.
+    #[test]
+    fn net_builder_without_identity_leaves_adapter_keypair_unset() {
+        let config = NetBuilder::new()
+            .mesh(sample_net_adapter())
+            .build_config()
+            .expect("build_config");
+
+        let AdapterConfig::Net(net_cfg) = config.adapter else {
+            panic!("adapter lost its Net variant");
+        };
+        assert!(
+            net_cfg.entity_keypair.is_none(),
+            "entity_keypair must stay unset when the builder has no identity",
+        );
     }
 }

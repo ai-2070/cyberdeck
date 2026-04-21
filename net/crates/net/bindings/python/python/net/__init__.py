@@ -127,4 +127,35 @@ else:
         ]
     )
 
+# Identity + tokens surface. Present iff the native module was built
+# with the `net` feature.
+try:
+    from ._net import (
+        Identity,
+        IdentityError,
+        TokenError,
+        channel_hash,
+        delegate_token,
+        normalize_gpu_vendor,
+        parse_token,
+        token_is_expired,
+        verify_token,
+    )
+except ImportError:
+    pass
+else:
+    __all__.extend(
+        [
+            "Identity",
+            "IdentityError",
+            "TokenError",
+            "channel_hash",
+            "delegate_token",
+            "normalize_gpu_vendor",
+            "parse_token",
+            "token_is_expired",
+            "verify_token",
+        ]
+    )
+
 __version__ = "0.1.0"

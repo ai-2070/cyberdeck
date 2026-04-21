@@ -626,11 +626,31 @@ class NetMesh:
         heartbeat_interval_ms: Optional[int] = None,
         session_timeout_ms: Optional[int] = None,
         num_shards: Optional[int] = None,
-    ) -> None: ...
+        identity_seed: Optional[bytes] = None,
+        capability_gc_interval_ms: Optional[int] = None,
+        require_signed_capabilities: Optional[bool] = None,
+        subnet: Optional[List[int]] = None,
+        subnet_policy: Optional[dict] = None,
+    ) -> None:
+        """Construct a new mesh node.
+
+        ``subnet`` is 1–4 ints each in ``[0, 255]``. Defaults to
+        ``SubnetId::GLOBAL`` (no restriction). ``subnet_policy`` is
+        a dict of shape ``{"rules": [{"tag_prefix": str, "level":
+        int, "values": {str: int}}]}`` that derives a subnet from
+        the node's capability tags — see
+        ``docs/SDK_SECURITY_SURFACE_PLAN.md``.
+        """
+        ...
 
     @property
     def public_key(self) -> str:
         """Hex-encoded 32-byte Noise static public key."""
+        ...
+    @property
+    def entity_id(self) -> bytes:
+        """32-byte ed25519 entity id. Matches ``Identity.from_seed(seed).entity_id``
+        when the mesh was constructed with ``identity_seed=seed``."""
         ...
     @property
     def node_id(self) -> int:
@@ -723,15 +743,36 @@ class NetMesh:
         require_token: Optional[bool] = None,
         priority: Optional[int] = None,
         max_rate_pps: Optional[int] = None,
+        publish_caps: Optional[dict] = None,
+        subscribe_caps: Optional[dict] = None,
     ) -> None:
         """Register a channel on this node. Subscribers are validated
         against this config before being added to the roster.
-        Raises `ChannelError` for invalid names / visibility."""
+
+        ``publish_caps`` / ``subscribe_caps`` are ``CapabilityFilter``
+        dicts (same shape as the ``filter`` argument to
+        :meth:`find_peers`) that restrict who may publish or subscribe
+        based on the other node's announced capabilities.
+
+        Raises ``ChannelError`` for invalid names / visibility."""
         ...
-    def subscribe_channel(self, publisher_node_id: int, channel: str) -> None:
-        """Subscribe to `channel` on `publisher_node_id`. Raises
-        `ChannelAuthError` for unauthorized rejections, `ChannelError`
-        for other rejection / transport failures."""
+    def subscribe_channel(
+        self,
+        publisher_node_id: int,
+        channel: str,
+        token: Optional[bytes] = None,
+    ) -> None:
+        """Subscribe to `channel` on `publisher_node_id`.
+
+        Optional ``token`` is the serialized ``PermissionToken`` bytes
+        (159 bytes) — attach it when the publisher set
+        ``require_token=True`` on the channel, or when the caller's
+        caps don't satisfy ``subscribe_caps`` on their own.
+
+        Raises ``ChannelAuthError`` for unauthorized rejections,
+        ``ChannelError`` for other rejection / transport failures, and
+        ``TokenError`` if ``token`` is malformed or has a bad
+        signature."""
         ...
     def unsubscribe_channel(self, publisher_node_id: int, channel: str) -> None:
         """Idempotent counterpart of `subscribe_channel`."""
@@ -748,6 +789,25 @@ class NetMesh:
         """Fan one payload to every subscriber. Returns a
         `PublishReport` dict: `{attempted, delivered, errors}` where
         `errors` is a list of `{node_id, message}`."""
+        ...
+
+    def announce_capabilities(self, caps: dict) -> None:
+        """Broadcast `caps` to every directly-connected peer and
+        self-index so :meth:`find_peers` matches. Multi-hop
+        propagation is deferred — peers more than one hop away do
+        not see the announcement. See ``SDK_SECURITY_SURFACE_PLAN.md``
+        for the capability dict shape (hardware, software, models,
+        tools, tags, limits)."""
+        ...
+
+    def find_peers(self, filter: dict) -> list[int]:
+        """Query the local capability index. Returns node ids
+        (including own when the filter matches this node's own
+        announcement) whose latest announcement matches `filter`.
+        Filter shape mirrors `CapabilityFilter`: ``require_tags``,
+        ``require_models``, ``require_tools``, ``min_memory_mb``,
+        ``require_gpu``, ``gpu_vendor``, ``min_vram_mb``,
+        ``min_context_length``, ``require_modalities``."""
         ...
 
 class BackpressureError(Exception):
@@ -768,3 +828,125 @@ class ChannelAuthError(ChannelError):
     """Subclass of `ChannelError`. Raised when a Subscribe /
     Unsubscribe request is rejected because the publisher's ACL
     denied the subscriber."""
+
+class IdentityError(Exception):
+    """Raised for malformed inputs at the identity layer (wrong
+    seed length, invalid entity id, unknown scope, etc.). Token-
+    validity failures raise `TokenError` instead."""
+
+class TokenError(Exception):
+    """Raised when a `PermissionToken` fails validation. The
+    exception message has the form ``token: <kind>`` where
+    ``<kind>`` is one of ``invalid_signature`` |
+    ``not_yet_valid`` | ``expired`` | ``delegation_exhausted`` |
+    ``delegation_not_allowed`` | ``not_authorized`` |
+    ``invalid_format``. Programmatic callers parse it via
+    ``str(e).removeprefix("token: ")``."""
+
+class Identity:
+    """ed25519 keypair + local token cache. Cheap to use from
+    multiple threads — both inner members are `Arc`-backed on
+    the Rust side.
+
+    Persist via :meth:`to_bytes` (the 32-byte ed25519 seed) and
+    reload with :meth:`from_seed` / :meth:`from_bytes` on
+    subsequent runs. Treat the seed as secret material.
+    """
+
+    @staticmethod
+    def generate() -> "Identity":
+        """Generate a fresh ed25519 identity."""
+        ...
+    @staticmethod
+    def from_seed(seed: bytes) -> "Identity":
+        """Load from a caller-owned 32-byte ed25519 seed."""
+        ...
+    @staticmethod
+    def from_bytes(data: bytes) -> "Identity":
+        """Alias for :meth:`from_seed`."""
+        ...
+    def to_bytes(self) -> bytes:
+        """Serialize as the 32-byte seed. Treat as secret."""
+        ...
+    @property
+    def entity_id(self) -> bytes:
+        """Ed25519 public key (32 bytes)."""
+        ...
+    @property
+    def origin_hash(self) -> int:
+        """Derived 32-bit origin hash used in packet headers."""
+        ...
+    @property
+    def node_id(self) -> int:
+        """Derived 64-bit node id used for routing / addressing."""
+        ...
+    @property
+    def token_cache_len(self) -> int:
+        """Number of cached tokens (testing aid)."""
+        ...
+    def sign(self, message: bytes) -> bytes:
+        """Sign arbitrary bytes. Returns 64-byte ed25519 signature."""
+        ...
+    def issue_token(
+        self,
+        subject: bytes,
+        scope: List[str],
+        channel: str,
+        ttl_seconds: int,
+        delegation_depth: int = 0,
+    ) -> bytes:
+        """Issue a scoped token to ``subject`` (32-byte entity id).
+        Scope is a subset of ``['publish', 'subscribe', 'admin',
+        'delegate']``. Returns the 159-byte serialized
+        ``PermissionToken``."""
+        ...
+    def install_token(self, token: bytes) -> None:
+        """Install a received token. Signature is verified on
+        insert; raises :class:`TokenError` on bad signature or
+        malformed bytes."""
+        ...
+    def lookup_token(
+        self, subject: bytes, channel: str
+    ) -> Optional[bytes]:
+        """Look up a cached token by ``(subject, channel)``.
+        Returns ``None`` if no exact-channel token is cached."""
+        ...
+
+def parse_token(token: bytes) -> dict:
+    """Parse a serialized token into a dict. Raises
+    :class:`TokenError` on bad length / structure. Does NOT
+    verify the signature — use :func:`verify_token` for that."""
+    ...
+
+def verify_token(token: bytes) -> bool:
+    """Verify the ed25519 signature. ``True`` = valid. Does NOT
+    check time-bound validity — see :func:`token_is_expired`."""
+    ...
+
+def token_is_expired(token: bytes) -> bool:
+    """``True`` if the token's ``not_after`` has passed (host
+    wall-clock)."""
+    ...
+
+def delegate_token(
+    signer: Identity,
+    parent: bytes,
+    new_subject: bytes,
+    restricted_scope: List[str],
+) -> bytes:
+    """Delegate a token to a new subject. The ``parent`` token
+    must include ``'delegate'`` scope and have
+    ``delegation_depth > 0``; the ``signer`` must be the subject
+    of the parent token."""
+    ...
+
+def channel_hash(channel: str) -> int:
+    """Hash a channel name to the 16-bit wire-format value."""
+    ...
+
+def normalize_gpu_vendor(vendor: str) -> str:
+    """Normalize a GPU vendor string to canonical lowercase:
+    ``nvidia | amd | intel | apple | qualcomm | unknown``. Unknown
+    inputs collapse to ``"unknown"``. Matches the NAPI helper so TS
+    and Python callers produce identical announcement payloads."""
+    ...

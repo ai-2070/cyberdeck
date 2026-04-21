@@ -45,7 +45,23 @@ typedef enum {
     NET_ERR_MESH_NOT_CONNECTED = -113,
     NET_ERR_MESH_TRANSPORT = -114,
     NET_ERR_CHANNEL = -115,
-    NET_ERR_CHANNEL_AUTH = -116
+    NET_ERR_CHANNEL_AUTH = -116,
+    /* Identity + permission-token surface (compiled when the Rust
+     * cdylib has the `net` feature on). Codes below -119 — one per
+     * `TokenError` kind so Go callers can `errors.Is` without
+     * parsing strings. Mirrors the PyO3 / NAPI prefix conventions
+     * (`"identity: ..."` / `"token: <kind>"`). */
+    NET_ERR_IDENTITY = -120,
+    NET_ERR_TOKEN_INVALID_FORMAT = -121,
+    NET_ERR_TOKEN_INVALID_SIGNATURE = -122,
+    NET_ERR_TOKEN_EXPIRED = -123,
+    NET_ERR_TOKEN_NOT_YET_VALID = -124,
+    NET_ERR_TOKEN_DELEGATION_EXHAUSTED = -125,
+    NET_ERR_TOKEN_DELEGATION_NOT_ALLOWED = -126,
+    NET_ERR_TOKEN_NOT_AUTHORIZED = -127,
+    /* Capability announce / find_peers errors. Wraps core
+     * `AdapterError` when announcement dispatch fails. */
+    NET_ERR_CAPABILITY = -128
 } net_error_t;
 
 /* Watch / tail cursor status codes. Returned from net_*_next functions
@@ -404,12 +420,28 @@ int      net_mesh_recv_shard(net_meshnode_t* handle,
  *     "reliable":      false,
  *     "require_token": false,
  *     "priority":      0,
- *     "max_rate_pps":  1000 }
+ *     "max_rate_pps":  1000,
+ *     "publish_caps":   { ... CapabilityFilter ... },   // Stage G-4
+ *     "subscribe_caps": { ... CapabilityFilter ... } }  // Stage G-4
  */
 int      net_mesh_register_channel(net_meshnode_t* handle, const char* config_json);
 int      net_mesh_subscribe_channel(net_meshnode_t* handle,
                                     uint64_t publisher_node_id,
                                     const char* channel);
+
+/* Subscribe with a serialized `PermissionToken` (159 bytes) attached.
+ * Required when the publisher set `require_token=true`, or when the
+ * subscriber's announced caps don't satisfy `subscribe_caps`. Parses
+ * the token client-side — malformed bytes return
+ * `NET_ERR_TOKEN_INVALID_FORMAT` with no network I/O. Signature
+ * tampering is caught server-side and surfaces as
+ * `NET_ERR_CHANNEL_AUTH`. */
+int      net_mesh_subscribe_channel_with_token(net_meshnode_t* handle,
+                                               uint64_t publisher_node_id,
+                                               const char* channel,
+                                               const uint8_t* token,
+                                               size_t token_len);
+
 int      net_mesh_unsubscribe_channel(net_meshnode_t* handle,
                                       uint64_t publisher_node_id,
                                       const char* channel);
@@ -423,6 +455,137 @@ int      net_mesh_publish(net_meshnode_t* handle,
                           const uint8_t* payload, size_t len,
                           const char* config_json,
                           char** out_json, size_t* out_len);
+
+/* =========================================================================
+ * Identity + permission tokens (Stage G — security surface).
+ *
+ * `net_identity_t` is an opaque handle bundling an ed25519 keypair
+ * with a local token cache. Free with `net_identity_free`. Binary
+ * buffers returned as `uint8_t**` + `size_t*` are heap-allocated by
+ * Rust and must be released with `net_free_bytes(ptr, len)` — do NOT
+ * use `net_free_string` on them (CString-only).
+ * ========================================================================= */
+
+typedef struct net_identity_s net_identity_t;
+
+/* Free a byte buffer returned by any `net_*` function that returns
+ * raw token / entity-id bytes through `uint8_t**`. Uses `len` to
+ * reconstruct the Vec — pass the exact length returned via the
+ * matching `size_t*` out-param. No-op on NULL / len=0. */
+void     net_free_bytes(uint8_t* ptr, size_t len);
+
+/* Lifecycle + seed round-trip */
+int      net_identity_generate(net_identity_t** out_handle);
+int      net_identity_from_seed(const uint8_t* seed, size_t seed_len,
+                                net_identity_t** out_handle);
+void     net_identity_free(net_identity_t* handle);
+
+/* Writes the 32-byte ed25519 seed into `out[32]`. Caller owns the
+ * buffer — treat the bytes as secret material. */
+int      net_identity_to_seed(net_identity_t* handle, uint8_t* out);
+
+/* Writes the 32-byte entity id into `out[32]`. */
+int      net_identity_entity_id(net_identity_t* handle, uint8_t* out);
+
+uint64_t net_identity_node_id(net_identity_t* handle);
+uint32_t net_identity_origin_hash(net_identity_t* handle);
+
+/* Signs `msg[len]`; writes a 64-byte ed25519 signature into `out_sig[64]`. */
+int      net_identity_sign(net_identity_t* handle,
+                           const uint8_t* msg, size_t len,
+                           uint8_t* out_sig);
+
+/* Issue a token to `subject` (32 bytes). `scope_json` is a JSON
+ * array of strings: `["publish"]`, `["subscribe","delegate"]`, etc.
+ * `channel` is the canonical name (not the u16 hash). Writes a
+ * newly-allocated blob — free via `net_free_bytes`. */
+int      net_identity_issue_token(net_identity_t* signer,
+                                  const uint8_t* subject, size_t subject_len,
+                                  const char* scope_json,
+                                  const char* channel,
+                                  uint32_t ttl_seconds,
+                                  uint8_t delegation_depth,
+                                  uint8_t** out_token,
+                                  size_t* out_token_len);
+
+/* Install a token received from another issuer. Signature check
+ * runs on insert — malformed / tampered tokens return the relevant
+ * `NET_ERR_TOKEN_*` code. */
+int      net_identity_install_token(net_identity_t* handle,
+                                    const uint8_t* token, size_t len);
+
+/* Look up a cached token by `(subject, channel)`. On hit, writes a
+ * newly-allocated blob (free via `net_free_bytes`). On miss, writes
+ * NULL/0 and returns `NET_SUCCESS`. */
+int      net_identity_lookup_token(net_identity_t* handle,
+                                   const uint8_t* subject, size_t subject_len,
+                                   const char* channel,
+                                   uint8_t** out_token,
+                                   size_t* out_token_len);
+
+uint32_t net_identity_token_cache_len(net_identity_t* handle);
+
+/* Parse a serialized `PermissionToken` into a JSON dict with keys
+ * `issuer_hex`, `subject_hex`, `scope`, `channel_hash`, `not_before`,
+ * `not_after`, `delegation_depth`, `nonce`, `signature_hex`. Returns
+ * `NET_ERR_TOKEN_INVALID_FORMAT` on bad length / layout. */
+int      net_parse_token(const uint8_t* token, size_t len,
+                         char** out_json, size_t* out_len);
+
+/* Verify the token's ed25519 signature. Writes 1 (valid) or 0
+ * (tampered/wrong-subject) to `*out_ok`. Does NOT check time-bound
+ * validity — see `net_token_is_expired`. */
+int      net_verify_token(const uint8_t* token, size_t len, int* out_ok);
+
+/* Writes 1 to `*out_expired` if `not_after` has passed. */
+int      net_token_is_expired(const uint8_t* token, size_t len, int* out_expired);
+
+/* Delegate a token to a new subject. Parent must have the
+ * `delegate` scope and `delegation_depth > 0`; `signer` must be the
+ * subject of the parent. */
+int      net_delegate_token(net_identity_t* signer,
+                            const uint8_t* parent, size_t parent_len,
+                            const uint8_t* new_subject, size_t new_subject_len,
+                            const char* restricted_scope_json,
+                            uint8_t** out_token, size_t* out_token_len);
+
+/* Writes the mesh's 32-byte ed25519 entity id into `out[32]`. */
+int      net_mesh_entity_id(net_meshnode_t* handle, uint8_t* out);
+
+/* Hash a channel name to its 16-bit wire representation. */
+int      net_channel_hash(const char* channel, uint16_t* out_hash);
+
+/* =========================================================================
+ * Capabilities (announce / find_peers).
+ *
+ * `caps_json` is the same POJO shape as PyO3 / NAPI:
+ *   { "hardware": {...}, "software": {...},
+ *     "models": [{...}], "tools": [{...}],
+ *     "tags": ["gpu", "prod"], "limits": {...} }
+ *
+ * `filter_json`:
+ *   { "require_tags": [...], "require_models": [...],
+ *     "require_tools": [...], "min_memory_mb": N,
+ *     "require_gpu": bool, "gpu_vendor": "nvidia",
+ *     "min_vram_mb": N, "min_context_length": N,
+ *     "require_modalities": [...] }
+ * ========================================================================= */
+int      net_mesh_announce_capabilities(net_meshnode_t* handle,
+                                        const char* caps_json);
+
+/* Writes a JSON array `[node_id, ...]` of matching peers (including
+ * own node id when self-match). Free `*out_json` via `net_free_string`. */
+int      net_mesh_find_peers(net_meshnode_t* handle,
+                             const char* filter_json,
+                             char** out_json, size_t* out_len);
+
+/* Normalize a GPU vendor string to canonical lowercase
+ * (`"nvidia"` | `"amd"` | `"intel"` | `"apple"` | `"qualcomm"` |
+ * `"unknown"`). Writes the result via `*out` / `*out_len`; free via
+ * `net_free_string`. Matches the NAPI / PyO3 helper so every SDK
+ * produces the same wire-normalized value. */
+int      net_normalize_gpu_vendor(const char* raw,
+                                  char** out, size_t* out_len);
 
 #ifdef __cplusplus
 }

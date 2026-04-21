@@ -4,6 +4,15 @@
 
 #[cfg(feature = "cortex")]
 mod cortex;
+// Identity / capabilities / subnets ride the `net` feature as a
+// single security unit — they share `adapter::net`'s subprotocol
+// dispatch and are operationally inseparable.
+#[cfg(feature = "net")]
+mod capabilities;
+#[cfg(feature = "net")]
+mod identity;
+#[cfg(feature = "net")]
+mod subnets;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -1022,13 +1031,30 @@ mod mesh_bindings {
         ///     session_timeout_ms: Session timeout (default: 30000)
         ///     num_shards: Number of inbound shards (default: 4)
         #[new]
-        #[pyo3(signature = (bind_addr, psk, heartbeat_interval_ms=None, session_timeout_ms=None, num_shards=None))]
+        #[pyo3(signature = (
+            bind_addr,
+            psk,
+            heartbeat_interval_ms=None,
+            session_timeout_ms=None,
+            num_shards=None,
+            identity_seed=None,
+            capability_gc_interval_ms=None,
+            require_signed_capabilities=None,
+            subnet=None,
+            subnet_policy=None,
+        ))]
+        #[allow(clippy::too_many_arguments)]
         fn new(
             bind_addr: &str,
             psk: &str,
             heartbeat_interval_ms: Option<u64>,
             session_timeout_ms: Option<u64>,
             num_shards: Option<u16>,
+            identity_seed: Option<&[u8]>,
+            capability_gc_interval_ms: Option<u64>,
+            require_signed_capabilities: Option<bool>,
+            subnet: Option<Vec<u32>>,
+            subnet_policy: Option<&Bound<'_, PyDict>>,
         ) -> PyResult<Self> {
             let addr: std::net::SocketAddr = bind_addr
                 .parse()
@@ -1052,12 +1078,43 @@ mod mesh_bindings {
             if let Some(n) = num_shards {
                 config = config.with_num_shards(n);
             }
+            if let Some(ms) = capability_gc_interval_ms {
+                config = config.with_capability_gc_interval(Duration::from_millis(ms));
+            }
+            if let Some(b) = require_signed_capabilities {
+                config = config.with_require_signed_capabilities(b);
+            }
+            if let Some(levels) = subnet {
+                let id = super::subnets::subnet_id_from_py(levels)?;
+                config = config.with_subnet(id);
+            }
+            if let Some(policy_dict) = subnet_policy {
+                let policy = Arc::new(super::subnets::subnet_policy_from_py(policy_dict)?);
+                config = config.with_subnet_policy(policy);
+            }
 
             let runtime = Arc::new(
                 Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("runtime: {}", e)))?,
             );
 
-            let identity = EntityKeypair::generate();
+            // Derive the mesh's keypair from the caller-supplied
+            // seed when present — lets a caller-side `Identity.
+            // from_seed(same_seed)` issue tokens whose `subject`
+            // matches this mesh's entity id. Otherwise generate.
+            let identity = match identity_seed {
+                Some(seed) => {
+                    if seed.len() != 32 {
+                        return Err(PyValueError::new_err(format!(
+                            "identity_seed must be 32 bytes, got {}",
+                            seed.len()
+                        )));
+                    }
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(seed);
+                    EntityKeypair::from_bytes(arr)
+                }
+                None => EntityKeypair::generate(),
+            };
             let mut node = runtime
                 .block_on(MeshNode::new(identity, config))
                 .map_err(|e| PyRuntimeError::new_err(format!("MeshNode: {}", e)))?;
@@ -1065,6 +1122,12 @@ mod mesh_bindings {
             // Install shared channel-config registry.
             let channel_configs = Arc::new(ChannelConfigRegistry::new());
             node.set_channel_configs(channel_configs.clone());
+            // Install a fresh TokenCache — channel auth needs
+            // somewhere to stash tokens presented on subscribe.
+            // Callers wanting to share a cache across meshes can
+            // build one externally; today each `NetMesh` gets its
+            // own.
+            node.set_token_cache(Arc::new(net::adapter::net::identity::TokenCache::new()));
 
             Ok(Self {
                 node: Some(node),
@@ -1078,6 +1141,15 @@ mod mesh_bindings {
         fn public_key(&self) -> PyResult<String> {
             let node = self.get_node()?;
             Ok(hex::encode(node.public_key()))
+        }
+
+        /// Get this node's 32-byte ed25519 entity id. Matches
+        /// `Identity.from_seed(seed).entity_id` when the mesh was
+        /// constructed with `identity_seed=seed`.
+        #[getter]
+        fn entity_id(&self) -> PyResult<Vec<u8>> {
+            let node = self.get_node()?;
+            Ok(node.entity_id().as_bytes().to_vec())
         }
 
         /// Get this node's ID.
@@ -1384,7 +1456,10 @@ mod mesh_bindings {
             require_token = None,
             priority = None,
             max_rate_pps = None,
+            publish_caps = None,
+            subscribe_caps = None,
         ))]
+        #[allow(clippy::too_many_arguments)]
         fn register_channel(
             &self,
             name: &str,
@@ -1393,6 +1468,8 @@ mod mesh_bindings {
             require_token: Option<bool>,
             priority: Option<u8>,
             max_rate_pps: Option<u32>,
+            publish_caps: Option<&Bound<'_, PyDict>>,
+            subscribe_caps: Option<&Bound<'_, PyDict>>,
         ) -> PyResult<()> {
             let channel = InnerChannelName::new(name).map_err(|e| {
                 super::ChannelError::new_err(format!("channel: invalid name: {}", e))
@@ -1413,6 +1490,14 @@ mod mesh_bindings {
             if let Some(pps) = max_rate_pps {
                 cfg = cfg.with_rate_limit(pps);
             }
+            if let Some(filter_dict) = publish_caps {
+                let filter = super::capabilities::capability_filter_from_py(filter_dict)?;
+                cfg = cfg.with_publish_caps(filter);
+            }
+            if let Some(filter_dict) = subscribe_caps {
+                let filter = super::capabilities::capability_filter_from_py(filter_dict)?;
+                cfg = cfg.with_subscribe_caps(filter);
+            }
             self.channel_configs.insert(cfg);
             Ok(())
         }
@@ -1421,17 +1506,44 @@ mod mesh_bindings {
         /// subscriber set. Blocks until the publisher's `Ack`
         /// arrives or the membership-ack timeout elapses.
         ///
+        /// Optional `token` is the serialized `PermissionToken`
+        /// bytes (159 bytes) — attach it when the publisher sets
+        /// `require_token=True` on the channel, or when the
+        /// caller's caps don't satisfy `subscribe_caps` on their
+        /// own.
+        ///
         /// Raises:
         ///     ChannelAuthError: publisher rejected as unauthorized.
         ///     ChannelError: other rejection / transport failure.
-        fn subscribe_channel(&self, publisher_node_id: u64, channel: &str) -> PyResult<()> {
+        ///     TokenError: supplied `token` is malformed / bad signature.
+        #[pyo3(signature = (publisher_node_id, channel, token = None))]
+        fn subscribe_channel(
+            &self,
+            publisher_node_id: u64,
+            channel: &str,
+            token: Option<&[u8]>,
+        ) -> PyResult<()> {
             let node = self.get_node()?;
             let name = InnerChannelName::new(channel).map_err(|e| {
                 super::ChannelError::new_err(format!("channel: invalid name: {}", e))
             })?;
-            self.runtime
-                .block_on(node.subscribe_channel(publisher_node_id, name))
-                .map_err(adapter_to_channel_pyerr)
+            match token {
+                Some(bytes) => {
+                    let parsed = net::adapter::net::identity::PermissionToken::from_bytes(bytes)
+                        .map_err(super::identity::token_err)?;
+                    self.runtime
+                        .block_on(node.subscribe_channel_with_token(
+                            publisher_node_id,
+                            name,
+                            parsed,
+                        ))
+                        .map_err(adapter_to_channel_pyerr)
+                }
+                None => self
+                    .runtime
+                    .block_on(node.subscribe_channel(publisher_node_id, name))
+                    .map_err(adapter_to_channel_pyerr),
+            }
         }
 
         /// Mirror of `subscribe_channel`. Idempotent on the publisher
@@ -1507,6 +1619,33 @@ mod mesh_bindings {
             publish_report_to_pydict(py, report)
         }
 
+        // =====================================================
+        // Capability announcements
+        // =====================================================
+
+        /// Announce this node's capabilities to every directly-
+        /// connected peer. Also self-indexes, so `find_peers` on this
+        /// same node matches on the announcement.
+        ///
+        /// Multi-hop propagation is deferred — peers more than one
+        /// hop away will not see the announcement.
+        fn announce_capabilities(&self, caps: &Bound<'_, PyDict>) -> PyResult<()> {
+            let node = self.get_node()?;
+            let core = super::capabilities::capability_set_from_py(caps)?;
+            self.runtime
+                .block_on(node.announce_capabilities(core))
+                .map_err(|e| PyRuntimeError::new_err(format!("capability: {}", e)))
+        }
+
+        /// Query the local capability index. Returns node ids
+        /// (including our own when we self-match) whose latest
+        /// announcement matches `filter`.
+        fn find_peers(&self, filter: &Bound<'_, PyDict>) -> PyResult<Vec<u64>> {
+            let node = self.get_node()?;
+            let core = super::capabilities::capability_filter_from_py(filter)?;
+            Ok(node.find_peers_by_filter(&core))
+        }
+
         /// Shutdown the mesh node. Idempotent — a second call is a no-op.
         fn shutdown(&mut self) -> PyResult<()> {
             let Some(node) = self.node.take() else {
@@ -1580,6 +1719,21 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ChannelError", m.py().get_type::<ChannelError>())?;
     #[cfg(feature = "net")]
     m.add("ChannelAuthError", m.py().get_type::<ChannelAuthError>())?;
+    #[cfg(feature = "net")]
+    {
+        m.add_class::<identity::Identity>()?;
+        m.add_function(wrap_pyfunction!(identity::parse_token, m)?)?;
+        m.add_function(wrap_pyfunction!(identity::verify_token, m)?)?;
+        m.add_function(wrap_pyfunction!(identity::token_is_expired, m)?)?;
+        m.add_function(wrap_pyfunction!(identity::delegate_token, m)?)?;
+        m.add_function(wrap_pyfunction!(identity::channel_hash, m)?)?;
+        m.add_function(wrap_pyfunction!(capabilities::normalize_gpu_vendor, m)?)?;
+        m.add(
+            "IdentityError",
+            m.py().get_type::<identity::IdentityError>(),
+        )?;
+        m.add("TokenError", m.py().get_type::<identity::TokenError>())?;
+    }
     #[cfg(feature = "cortex")]
     {
         m.add_class::<cortex::PyRedex>()?;

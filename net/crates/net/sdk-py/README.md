@@ -171,6 +171,72 @@ retries or buffers on its own behalf — the helper methods are
 opt-in policies, not defaults. See `docs/TRANSPORT.md` for the full
 contract.
 
+## Security (identity, tokens, capabilities, subnets)
+
+The full security surface — ed25519 `Identity`, `PermissionToken`
+issue / install / delegate, `CapabilityAnnouncement` broadcast +
+`find_peers`, `SubnetId` / `SubnetPolicy`, channel auth with
+`publish_caps` / `subscribe_caps` / `require_token` — is shipped
+on the underlying **`net`** PyO3 package, not this wrapper. Import
+directly:
+
+```python
+from net import (
+    Identity, TokenError, IdentityError,
+    parse_token, verify_token, delegate_token, channel_hash,
+)
+from net import NetMesh  # adds announce_capabilities / find_peers /
+                        # entity_id / subscribe_channel(..., token=)
+```
+
+Quick example — issue a token and round-trip it through the mesh:
+
+```python
+import os
+from net import Identity, NetMesh
+
+seed = os.urandom(32)                     # persist via your own secret manager
+identity = Identity.from_seed(seed)
+
+# Mesh reuses the same keypair — `entity_id` is stable across restarts.
+mesh = NetMesh(
+    "127.0.0.1:9000",
+    psk="42" * 32,
+    identity_seed=seed,
+)
+assert mesh.entity_id == identity.entity_id
+
+# Issue a SUBSCRIBE-scope token for a grantee.
+grantee = Identity.generate()
+token = identity.issue_token(
+    subject=grantee.entity_id,
+    scope=["subscribe"],
+    channel="sensors/temp",
+    ttl_seconds=300,
+)
+
+# Publisher gates the channel on tokens; subscribers attach them.
+mesh.register_channel("sensors/temp", require_token=True)
+# subscriber_mesh.subscribe_channel(mesh.node_id, "sensors/temp", token=token)
+```
+
+`TokenError` messages have the form `"token: <kind>"` where `<kind>`
+is one of `invalid_format | invalid_signature | expired |
+not_yet_valid | delegation_exhausted | delegation_not_allowed |
+not_authorized`. Parse with `str(e).removeprefix("token: ")` for
+programmatic dispatch.
+
+Full surface + runnable examples:
+[`bindings/python/README.md`](../bindings/python/README.md#security-surface-stage-ae).
+Cross-SDK contract + rationale:
+[`docs/SDK_SECURITY_SURFACE_PLAN.md`](../docs/SDK_SECURITY_SURFACE_PLAN.md).
+
+> **Note.** The `net_sdk` wrapper (generators / typed channels /
+> Pydantic) doesn't yet re-export the security types — use `net`
+> directly for the identity / capability / subnet / channel-auth
+> paths. Follow-up work to proxy them through `net_sdk` is tracked
+> in [`SDK_PYTHON_PARITY_PLAN.md`](../docs/SDK_PYTHON_PARITY_PLAN.md).
+
 ## API
 
 | Method | Description |

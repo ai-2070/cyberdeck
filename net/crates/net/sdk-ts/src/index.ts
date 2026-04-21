@@ -54,6 +54,7 @@ export type {
   ChannelConfig,
   PublishConfig,
   PublishReport,
+  SubscribeOptions,
 } from './mesh';
 
 // CortEX + NetDb (event-sourced state with reactive watches).
@@ -83,6 +84,38 @@ export type {
   NetDbBundle,
   CortexSnapshot,
 } from './cortex';
+
+// Identity + tokens (security surface).
+export {
+  Identity,
+  Token,
+  IdentityError,
+  TokenError,
+  channelHash,
+  delegateToken,
+} from './identity';
+export type { TokenScope, TokenErrorKind, IssueTokenOptions } from './identity';
+
+// Capabilities (announce + find-peers).
+export type {
+  CapabilitySet,
+  CapabilityFilter,
+  CapabilityLimits,
+  Hardware,
+  Software,
+  SoftwarePair,
+  GpuInfo,
+  GpuVendor,
+  Accelerator,
+  AcceleratorKind,
+  ModelCapability,
+  ToolCapability,
+  Modality,
+} from './capabilities';
+
+// Subnets (visibility enforcement).
+export { subnetId, GLOBAL_SUBNET } from './subnets';
+export type { SubnetId, SubnetRule, SubnetPolicy } from './subnets';
 
 // Types.
 export type {

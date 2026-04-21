@@ -219,8 +219,9 @@ mod tests {
 
     fn make_index_with_nodes(nodes: Vec<(u64, CapabilitySet)>) -> Arc<CapabilityIndex> {
         let index = CapabilityIndex::new();
+        let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
         for (node_id, caps) in nodes {
-            let ad = CapabilityAnnouncement::new(node_id, 1, caps);
+            let ad = CapabilityAnnouncement::new(node_id, eid.clone(), 1, caps);
             index.index(ad);
         }
         Arc::new(index)

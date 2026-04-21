@@ -38,6 +38,15 @@
 
 import { NetMesh as NapiNetMesh } from '@ai2070/net';
 
+import {
+  capabilityFilterToNapi,
+  capabilitySetToNapi,
+  type CapabilityFilter,
+  type CapabilitySet,
+} from './capabilities';
+import type { SubnetId, SubnetPolicy } from './subnets';
+import type { Token } from './identity';
+
 /** Reliability mode chosen at stream-open time. */
 export type Reliability = 'fire_and_forget' | 'reliable';
 
@@ -138,6 +147,21 @@ function toStreamError(e: unknown): never {
   throw e;
 }
 
+/**
+ * Options for {@link MeshNode.subscribeChannel}. Struct form so
+ * future knobs (timeout override, priority) don't break callers.
+ */
+export interface SubscribeOptions {
+  /**
+   * Token to present to the publisher. The publisher verifies the
+   * ed25519 signature, checks the subject matches the subscribing
+   * peer's `EntityId`, and installs the token in its local cache
+   * before running `can_subscribe`. A matching token satisfies
+   * `requireToken` channels end-to-end.
+   */
+  token?: Token;
+}
+
 /** Options for {@link MeshNode.create}. */
 export interface MeshNodeConfig {
   /** Local bind address (e.g. `"127.0.0.1:9000"`). */
@@ -150,6 +174,38 @@ export interface MeshNodeConfig {
   sessionTimeoutMs?: number;
   /** Inbound shard count. Default: 4. */
   numShards?: number;
+  /**
+   * Capability-index GC sweep interval in milliseconds. Default:
+   * 60_000. Shorter values make TTL-driven eviction more responsive
+   * at the cost of extra CPU; primarily useful in tests.
+   */
+  capabilityGcIntervalMs?: number;
+  /**
+   * Drop inbound `CapabilityAnnouncement` packets without a
+   * signature. Default: false. Signature *validity* is not yet
+   * enforced end-to-end — this is presence-only policy today.
+   */
+  requireSignedCapabilities?: boolean;
+  /**
+   * Pin this node to a specific subnet. Omitted = no restriction
+   * (`SubnetId::GLOBAL`). Visibility checks on the publish +
+   * subscribe paths compare against this value.
+   */
+  subnet?: SubnetId;
+  /**
+   * Policy that derives each peer's subnet from their capability
+   * announcements. Mesh-wide policy consistency is assumed —
+   * mismatched policies lead to asymmetric views of peer subnets.
+   */
+  subnetPolicy?: SubnetPolicy;
+  /**
+   * 32-byte ed25519 seed. When set, the mesh's keypair is
+   * derived from this seed — so its `entityId` and `nodeId`
+   * are reproducible across restarts, and a caller-side
+   * `Identity.fromSeed(seed)` can issue tokens that validate
+   * against this mesh. Treat as secret material.
+   */
+  identitySeed?: Buffer;
 }
 
 /**
@@ -183,8 +239,18 @@ export class MeshNode {
       heartbeatIntervalMs: config.heartbeatIntervalMs,
       sessionTimeoutMs: config.sessionTimeoutMs,
       numShards: config.numShards,
+      capabilityGcIntervalMs: config.capabilityGcIntervalMs,
+      requireSignedCapabilities: config.requireSignedCapabilities,
+      subnet: config.subnet,
+      subnetPolicy: config.subnetPolicy,
+      identitySeed: config.identitySeed,
     });
     return new MeshNode(native);
+  }
+
+  /** 32-byte ed25519 entity id for this mesh. */
+  entityId(): Buffer {
+    return this.native.entityId();
   }
 
   /** Hex-encoded Noise static public key. */
@@ -339,6 +405,12 @@ export class MeshNode {
         requireToken: config.requireToken,
         priority: config.priority,
         maxRatePps: config.maxRatePps,
+        publishCaps: config.publishCaps
+          ? capabilityFilterToNapi(config.publishCaps)
+          : undefined,
+        subscribeCaps: config.subscribeCaps
+          ? capabilityFilterToNapi(config.subscribeCaps)
+          : undefined,
       });
     } catch (e) {
       toChannelError(e);
@@ -350,12 +422,28 @@ export class MeshNode {
    * set. Blocks until the publisher's `Ack` arrives or the
    * membership-ack timeout elapses.
    *
+   * Pass `opts.token` to present a
+   * {@link Token PermissionToken} issued by the publisher — required
+   * when the channel was registered with `requireToken: true` or
+   * when your caps alone don't satisfy `subscribeCaps`. The
+   * publisher verifies the signature, checks `subject ===
+   * thisNode.entityId`, installs it in its local cache, then runs
+   * the ACL check.
+   *
    * Throws a {@link ChannelAuthError} or {@link ChannelError} on
    * rejection; network-level failures propagate as plain `Error`.
    */
-  async subscribeChannel(publisherNodeId: bigint, channel: string): Promise<void> {
+  async subscribeChannel(
+    publisherNodeId: bigint,
+    channel: string,
+    opts?: SubscribeOptions,
+  ): Promise<void> {
     try {
-      await this.native.subscribeChannel(publisherNodeId, channel);
+      await this.native.subscribeChannel(
+        publisherNodeId,
+        channel,
+        opts?.token?.bytes,
+      );
     } catch (e) {
       toChannelError(e);
     }
@@ -398,6 +486,25 @@ export class MeshNode {
     }
   }
 
+  /**
+   * Announce this node's capabilities to every directly-connected
+   * peer. Self-indexes too, so `findPeers` on this same node matches
+   * on the announcement. Multi-hop propagation is deferred — peers
+   * more than one hop away will not see the announcement.
+   */
+  async announceCapabilities(caps: CapabilitySet): Promise<void> {
+    await this.native.announceCapabilities(capabilitySetToNapi(caps));
+  }
+
+  /**
+   * Query the local capability index. Returns node ids (including
+   * our own `nodeId()` if self matches) whose latest announcement
+   * matches `filter`.
+   */
+  findPeers(filter: CapabilityFilter): bigint[] {
+    return this.native.findPeers(capabilityFilterToNapi(filter));
+  }
+
   /** Shutdown the mesh node. */
   async shutdown(): Promise<void> {
     await this.native.shutdown();
@@ -424,12 +531,26 @@ export interface ChannelConfig {
   visibility?: Visibility;
   /** Default reliability for streams on this channel. */
   reliable?: boolean;
-  /** v1 ships `false`; token enforcement requires the security plan. */
+  /**
+   * When true, subscribers must present a valid
+   * `PermissionToken` whose subject matches their entity id.
+   */
   requireToken?: boolean;
   /** Priority (0 = lowest). */
   priority?: number;
   /** Rate cap in packets per second. */
   maxRatePps?: number;
+  /**
+   * Capability filter the publisher itself must satisfy before
+   * fan-out. `publish` rejects with a `channel:` error on
+   * mismatch.
+   */
+  publishCaps?: CapabilityFilter;
+  /**
+   * Capability filter each subscriber must satisfy.
+   * `subscribeChannel` throws a `ChannelAuthError` on mismatch.
+   */
+  subscribeCaps?: CapabilityFilter;
 }
 
 /** Publish-fanout config — mirror of the core `PublishConfig`. */

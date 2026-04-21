@@ -158,6 +158,305 @@ counts cumulative rejections for observability. See
 [`docs/STREAM_BACKPRESSURE_PLAN.md`](../docs/STREAM_BACKPRESSURE_PLAN.md)
 for the design.
 
+## Security (identity, tokens, capabilities, subnets)
+
+Identity, capabilities, and subnets ride the `net` feature as a
+single security unit — they share the mesh's subprotocol dispatch
+and operate together at runtime (subnet enforcement reuses the
+capability broadcast; channel auth threads identity + capabilities
++ subnets together), so `--features net` gives you the whole
+surface:
+
+```rust
+use std::time::Duration;
+use net_sdk::{Identity, TokenScope};
+use net_sdk::mesh::{Mesh, MeshBuilder};
+use net_sdk::ChannelName;
+
+# async fn example() -> net_sdk::error::Result<()> {
+// Load once from caller-owned storage (vault / k8s secret / enclave).
+let seed: [u8; 32] = [/* 32 bytes */ 0x42u8; 32];
+let id = Identity::from_seed(seed);
+
+// Stable node id across restarts — derived from the ed25519 seed.
+println!("node_id = {:#x}", id.node_id());
+
+// Issue a scoped subscribe grant to a peer and hand it over.
+let subscriber_entity = Identity::generate(); // pretend we received this
+let channel = ChannelName::new("sensors/temp").unwrap();
+let token = id.issue_token(
+    subscriber_entity.entity_id().clone(),
+    TokenScope::SUBSCRIBE,
+    &channel,
+    Duration::from_secs(300),
+    0, // delegation depth — 0 forbids re-delegation
+);
+// Token is a signed, transport-ready blob.
+assert_eq!(token.to_bytes().len(), net_sdk::PermissionToken::WIRE_SIZE);
+
+// Pin this identity on the mesh builder — without this call the
+// builder generates an ephemeral keypair and the node_id changes on
+// every restart.
+let _mesh = MeshBuilder::new("127.0.0.1:9001", &[0x42u8; 32])?
+    .identity(id)
+    .build()
+    .await?;
+# Ok(())
+# }
+```
+
+**What's wired in this release:**
+
+- `Identity` generation / seed round-trip / signing / token issuance
+  + verification + install + lookup.
+- `MeshBuilder::identity(...)` pins the keypair used by the mesh's
+  Noise handshake so `node_id()` is stable.
+- **Capability announcements — cross-node (direct-peer).** See the
+  subsection below.
+- Re-exports of `SubnetId` / `SubnetPolicy` / `SubnetRule` (builder
+  hook + gateway wiring land next).
+
+**Treat `Identity::to_bytes()` as secret material** — it's the
+32-byte ed25519 seed. The SDK never touches a hardcoded path; where
+you put the bytes (disk, vault, enclave, k8s secret) is your call.
+
+### Capability announcements
+
+`Mesh::announce_capabilities(caps)` pushes a `CapabilityAnnouncement`
+to every directly-connected peer and self-indexes locally.
+`Mesh::find_peers(filter)` queries the local index — results include
+this node's own id when self matches.
+
+```rust
+use net_sdk::capabilities::{CapabilityFilter, CapabilitySet, GpuInfo, GpuVendor, HardwareCapabilities};
+use net_sdk::mesh::MeshBuilder;
+
+# async fn example() -> net_sdk::error::Result<()> {
+let mesh = MeshBuilder::new("127.0.0.1:0", &[0x42u8; 32])?
+    .build()
+    .await?;
+
+let hw = HardwareCapabilities::new()
+    .with_cpu(16, 32)
+    .with_memory(65_536)
+    .with_gpu(GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24_576));
+mesh.announce_capabilities(
+    CapabilitySet::new().with_hardware(hw).add_tag("gpu"),
+)
+.await?;
+
+// Self-match: returns our own node_id.
+let hits = mesh.find_peers(
+    &CapabilityFilter::new().require_gpu().with_min_vram(16_384),
+);
+assert!(hits.contains(&mesh.node_id()));
+mesh.shutdown().await?;
+# Ok(())
+# }
+```
+
+**Scope today:**
+
+- Multi-hop fan-out bounded by `MAX_CAPABILITY_HOPS = 16`.
+  Forwarders re-broadcast every received announcement to their
+  other peers (minus the sender and any split-horizon peer),
+  bumping `hop_count` outside the signed envelope so the origin's
+  signature keeps verifying end-to-end. Dedup on
+  `(origin, version)` drops duplicates at diamond-topology
+  converge points. See
+  [`docs/MULTIHOP_CAPABILITY_PLAN.md`](../docs/MULTIHOP_CAPABILITY_PLAN.md).
+- Origin-side rate limiting: `min_announce_interval` (default 10s)
+  coalesces rapid `announce_capabilities` calls into a single
+  broadcast, preventing a busy-loop announcer from flooding the
+  mesh. Self-index + late-joiner session-open push still reflect
+  the latest caps inside the window.
+- TTL + GC eviction: per-announcement `ttl_secs` drives
+  `CapabilityIndex::gc()` on a configurable tick
+  (`capability_gc_interval`, default 60 s).
+- Signatures are advisory. The `require_signed_capabilities` config
+  knob rejects unsigned announcements at the receiver, but
+  *signature validity* is not enforced end-to-end yet — it requires
+  a `node_id → entity_id` binding that lands with channel auth.
+
+Wire-level details and the subprotocol layout live in
+[`docs/CAPABILITY_BROADCAST_PLAN.md`](../docs/CAPABILITY_BROADCAST_PLAN.md).
+
+### Subnets (visibility partitioning)
+
+`MeshBuilder::subnet(id)` pins a node to one of 2³² possible 4-level
+subnet ids; `subnet_policy(policy)` derives each *peer's* subnet by
+applying a shared tag-matching policy to their inbound
+`CapabilityAnnouncement`. Channel visibility then gates publish
+fan-out and subscribe authorization against that geometry.
+
+```rust
+use std::sync::Arc;
+use net_sdk::capabilities::CapabilitySet;
+use net_sdk::mesh::MeshBuilder;
+use net_sdk::subnets::{SubnetId, SubnetPolicy, SubnetRule};
+
+# async fn example() -> net_sdk::error::Result<()> {
+// Mesh-wide policy: `region:<x>` maps to the level 0 byte,
+// `fleet:<x>` maps to level 1. Every node in the mesh must
+// construct the same policy — mismatched policies yield
+// asymmetric views of peer subnets.
+let policy = Arc::new(
+    SubnetPolicy::new()
+        .add_rule(SubnetRule::new("region:", 0).map("us", 3).map("eu", 4))
+        .add_rule(SubnetRule::new("fleet:", 1).map("blue", 7).map("green", 8)),
+);
+
+let node = MeshBuilder::new("127.0.0.1:0", &[0x42u8; 32])?
+    .subnet(SubnetId::new(&[3, 7]))           // us/blue
+    .subnet_policy(policy)
+    .build()
+    .await?;
+
+// Announce with tags matching the policy so peers derive the same
+// subnet (`[3, 7]`) when they apply their own policy to our caps.
+node.announce_capabilities(
+    CapabilitySet::new()
+        .add_tag("region:us")
+        .add_tag("fleet:blue"),
+)
+.await?;
+
+// Register a SubnetLocal channel — only peers with the exact same
+// SubnetId will be accepted as subscribers and included in publish
+// fan-out. Any cross-subnet subscribe rejects with `Unauthorized`.
+// (Channel registration uses the channel config types from the
+// `Channels` section below.)
+node.shutdown().await?;
+# Ok(())
+# }
+```
+
+**Visibility semantics** (from `Visibility` enum):
+
+| Variant | Delivery |
+|---|---|
+| `Global` | every peer |
+| `SubnetLocal` | peers with an identical `SubnetId` |
+| `ParentVisible` | same subnet OR either side is an ancestor of the other |
+| `Exported` | per-channel export table — **deferred**, drops in v1 |
+
+**Scope today**:
+
+- Enforcement is end-to-end through the publish + subscribe gates.
+  Filtered subscribers do not appear in `PublishReport.attempted`.
+- Peer subnets are derived locally from each peer's capability
+  announcement via `SubnetPolicy::assign`. No dedicated subnet
+  subprotocol; announcements piggyback on the capability broadcast
+  from Stage C.
+- Multi-hop subnet-aware routing (forwarding filters at the packet
+  header) is a follow-up.
+
+Wire-level details and the enforcement matrix live in
+[`docs/SUBNET_ENFORCEMENT_PLAN.md`](../docs/SUBNET_ENFORCEMENT_PLAN.md).
+
+### Channel authentication
+
+`ChannelConfig` carries three auth knobs that are now enforced
+end-to-end at both the subscribe gate and the publish path:
+
+- `publish_caps: CapabilityFilter` — publisher must satisfy before
+  fan-out. Failing publishes return an `AdapterError`; no peers are
+  attempted.
+- `subscribe_caps: CapabilityFilter` — subscribers must satisfy
+  before being added to the roster. Failures surface as
+  `SdkError::ChannelRejected(Some(Unauthorized))`.
+- `require_token: bool` — subscribers must present a valid
+  `PermissionToken` whose subject matches their entity id. The
+  token rides on the subscribe message; the publisher verifies the
+  ed25519 signature on arrival, installs it in its local
+  `TokenCache`, then runs `can_subscribe`.
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use net_sdk::capabilities::{CapabilityFilter, CapabilitySet};
+use net_sdk::mesh::MeshBuilder;
+use net_sdk::{
+    ChannelConfig, ChannelId, ChannelName, Identity, PublishConfig, Reliability,
+    SubscribeOptions, TokenScope,
+};
+# async fn example() -> net_sdk::error::Result<()> {
+// Both sides bind caller-owned identities so tokens + entity_ids
+// are load-bearing.
+let publisher_identity = Identity::generate();
+let subscriber_identity = Identity::generate();
+
+let publisher = MeshBuilder::new("127.0.0.1:9001", &[0x42u8; 32])?
+    .identity(publisher_identity.clone())
+    .build()
+    .await?;
+
+// Register a channel that requires `gpu` AND a token.
+let name = ChannelName::new("events/inference").unwrap();
+let filter = CapabilityFilter::new().require_tag("gpu");
+publisher.register_channel(
+    ChannelConfig::new(ChannelId::new(name.clone()))
+        .with_subscribe_caps(filter)
+        .with_require_token(true),
+);
+
+// Issue a SUBSCRIBE-scope token for the subscriber. This also
+// pre-caches it in the publisher's identity (unused for this
+// flow since the subscriber will present the same token on the
+// wire, but useful for the "pre-seed" pattern).
+let token = publisher_identity.issue_token(
+    subscriber_identity.entity_id().clone(),
+    TokenScope::SUBSCRIBE,
+    &name,
+    Duration::from_secs(300),
+    0,
+);
+
+// Subscriber attaches the token.
+let subscriber: &net_sdk::Mesh = unimplemented!();
+subscriber
+    .subscribe_channel_with(
+        publisher.node_id(),
+        &name,
+        SubscribeOptions { token: Some(token) },
+    )
+    .await?;
+# Ok(())
+# }
+```
+
+**Scope today**:
+
+- Full enforcement at subscribe + publish; empty-caps / missing-
+  entity defaults fail closed when `require_token` is set.
+- Every publish fan-out consults the `AuthGuard` fast path (4 KB
+  bloom filter + verified-subscribe cache) so revocations apply on
+  the next publish without a roster refresh. Single-threaded
+  microbenchmark: ~20 ns per `check_fast` call.
+- Periodic token-expiry sweep (default 30 s,
+  `MeshNodeConfig::with_token_sweep_interval`) evicts subscribers
+  whose tokens age out of their TTL — they stop receiving events
+  within one sweep tick instead of staying on the roster forever.
+- Per-peer auth-failure rate limiter (`with_auth_failure_limit`,
+  default 16 failures per 60 s window → 30 s throttle) short-
+  circuits bad-token subscribe storms with `AckReason::RateLimited`
+  before ed25519 verification runs. Successful subscribes clear
+  the counter.
+- `CapabilityAnnouncement` now carries the sender's `entity_id` and
+  is signed — verified end-to-end (closes the "signature advisory"
+  caveat from the capability section above).
+- `node_id → entity_id` is pinned on first sight (TOFU); rebind
+  attempts in later announcements are silently rejected.
+- Any auth-rule denial surfaces as `AckReason::Unauthorized`;
+  throttled bursts surface as `AckReason::RateLimited`. Sub-reasons
+  within the auth rejection (cap-failed vs token-failed vs
+  subnet-failed) are not split yet.
+
+Wire-format details and the token presentation flow live in
+[`docs/CHANNEL_AUTH_PLAN.md`](../docs/CHANNEL_AUTH_PLAN.md); the
+fast-path / sweep / rate-limit design lives in
+[`docs/CHANNEL_AUTH_GUARD_PLAN.md`](../docs/CHANNEL_AUTH_GUARD_PLAN.md).
+
 ## Channels (distributed pub/sub)
 
 Named pub/sub over the encrypted mesh. Publishers register channels

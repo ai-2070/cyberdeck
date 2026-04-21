@@ -22,7 +22,14 @@ use net::adapter::net::compute::{
     StandbyGroup, StandbyGroupConfig, MAX_SNAPSHOT_CHUNK_SIZE,
 };
 use net::adapter::net::continuity::discontinuity::fork_sentinel;
-use net::adapter::net::identity::EntityKeypair;
+use net::adapter::net::identity::{EntityId, EntityKeypair};
+
+/// Zero-byte EntityId for test fixtures — valid as a data-structure
+/// input to `CapabilityAnnouncement::new`, but not a valid ed25519
+/// public key. None of these tests exercise signature verification.
+fn test_entity_id() -> EntityId {
+    EntityId::from_bytes([0u8; 32])
+}
 use net::adapter::net::state::causal::{CausalEvent, CausalLink};
 use net::adapter::net::state::snapshot::StateSnapshot;
 use net::adapter::net::subprotocol::SubprotocolRegistry;
@@ -301,7 +308,12 @@ fn test_start_migration_auto() {
     // Create an index with a migration-capable target
     let index = Arc::new(CapabilityIndex::new());
     let target_caps = CapabilitySet::new().add_tag("subprotocol:0x0500");
-    index.index(CapabilityAnnouncement::new(0x2222, 1, target_caps));
+    index.index(CapabilityAnnouncement::new(
+        0x2222,
+        test_entity_id(),
+        1,
+        target_caps,
+    ));
 
     let local_caps = CapabilitySet::new();
     let scheduler = Scheduler::new(index, 0x1111, local_caps);
@@ -757,11 +769,21 @@ fn test_enriched_capabilities_discoverable_by_scheduler() {
 
     // Index node A's capabilities
     let index = Arc::new(CapabilityIndex::new());
-    index.index(CapabilityAnnouncement::new(0xAAAA, 1, node_a_caps));
+    index.index(CapabilityAnnouncement::new(
+        0xAAAA,
+        test_entity_id(),
+        1,
+        node_a_caps,
+    ));
 
     // Node B: no migration support
     let node_b_caps = CapabilitySet::new();
-    index.index(CapabilityAnnouncement::new(0xBBBB, 1, node_b_caps));
+    index.index(CapabilityAnnouncement::new(
+        0xBBBB,
+        test_entity_id(),
+        1,
+        node_b_caps,
+    ));
 
     // Scheduler on node C should find A but not B
     let scheduler = Scheduler::new(index, 0xCCCC, CapabilitySet::new());
@@ -1372,9 +1394,24 @@ fn test_regression_chunk_count_boundary() {
 
 fn make_scheduler_for_groups() -> Scheduler {
     let index = Arc::new(CapabilityIndex::new());
-    index.index(CapabilityAnnouncement::new(0x1111, 1, CapabilitySet::new()));
-    index.index(CapabilityAnnouncement::new(0x2222, 1, CapabilitySet::new()));
-    index.index(CapabilityAnnouncement::new(0x3333, 1, CapabilitySet::new()));
+    index.index(CapabilityAnnouncement::new(
+        0x1111,
+        test_entity_id(),
+        1,
+        CapabilitySet::new(),
+    ));
+    index.index(CapabilityAnnouncement::new(
+        0x2222,
+        test_entity_id(),
+        1,
+        CapabilitySet::new(),
+    ));
+    index.index(CapabilityAnnouncement::new(
+        0x3333,
+        test_entity_id(),
+        1,
+        CapabilitySet::new(),
+    ));
     Scheduler::new(index, 0x1111, CapabilitySet::new())
 }
 

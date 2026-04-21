@@ -6,12 +6,22 @@ license = "Apache-2.0"
 description = "Node.js bindings for Net event bus"
 
 [lib]
-crate-type = ["cdylib"]
+# `rlib` is needed alongside `cdylib` so in-crate `#[cfg(test)] mod
+# tests` blocks can run (cargo requires rlib to link the unit-test
+# harness). Publishing still ships the `.node` cdylib; the rlib is
+# a build artifact only.
+crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["redis"]
 redis = ["net/redis"]
 jetstream = ["net/jetstream"]
+# Core mesh transport. Bundles the identity, capabilities, and
+# subnet surfaces — they share `adapter::net`'s subprotocol dispatch
+# and are operationally inseparable (subnet enforcement reuses the
+# capability broadcast; channel auth uses all three together), so
+# separate NAPI flags would only enable combinations that don't
+# actually work end-to-end.
 net = ["net/net", "dep:hex"]
 cortex = ["net/netdb", "net/redex-disk"]
 

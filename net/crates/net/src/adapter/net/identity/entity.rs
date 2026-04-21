@@ -85,6 +85,48 @@ impl std::fmt::Display for EntityId {
     }
 }
 
+// Hex-encoded JSON round-trip (to match the `Signature64` pattern
+// on `CapabilityAnnouncement`); raw bytes for non-human-readable
+// formats. Keeps the announcement wire format self-describing.
+impl serde::Serialize for EntityId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&hex::encode(self.0))
+        } else {
+            serializer.serialize_bytes(&self.0)
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for EntityId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            let hex_str = String::deserialize(deserializer)?;
+            let bytes = hex::decode(&hex_str).map_err(serde::de::Error::custom)?;
+            if bytes.len() != 32 {
+                return Err(serde::de::Error::custom("entity_id must be 32 bytes"));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            Ok(EntityId(arr))
+        } else {
+            let bytes = <Vec<u8>>::deserialize(deserializer)?;
+            if bytes.len() != 32 {
+                return Err(serde::de::Error::custom("entity_id must be 32 bytes"));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            Ok(EntityId(arr))
+        }
+    }
+}
+
 /// Entity keypair — ed25519 signing key + public identity.
 ///
 /// This is the root of trust for a node. The signing key must be kept secret.

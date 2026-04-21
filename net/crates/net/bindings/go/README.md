@@ -444,6 +444,156 @@ Errors surfaced as typed sentinels:
 `ErrCortexClosed`, `ErrCortexFold`, `ErrNetDb`, `ErrRedex`,
 `ErrStreamTimeout`, `ErrStreamEnded`.
 
+## Security Surface (Stage A–E)
+
+The Go bindings ship the same identity / capabilities / subnets /
+channel-auth story as the Rust SDK and the TS / Python SDKs. Full
+staging and rationale:
+[`docs/SDK_SECURITY_SURFACE_PLAN.md`](../../docs/SDK_SECURITY_SURFACE_PLAN.md).
+Go-binding parity details:
+[`docs/SDK_GO_PARITY_PLAN.md`](../../docs/SDK_GO_PARITY_PLAN.md).
+
+### Identity + permission tokens
+
+Every node has an ed25519 identity. `PermissionToken`s are ed25519-
+signed delegations authorizing a subject to `publish` / `subscribe`
+/ `delegate` / `admin` on a channel, optionally with further
+delegation depth.
+
+```go
+alice, _ := net.GenerateIdentity()
+defer alice.Close()
+bob, _ := net.GenerateIdentity()
+defer bob.Close()
+
+bobID, _ := bob.EntityID()
+token, _ := alice.IssueToken(net.IssueTokenRequest{
+    Subject:         bobID,
+    Scope:           []string{"subscribe", "delegate"},
+    Channel:         "sensors/temp",
+    TTLSeconds:      300,
+    DelegationDepth: 1,
+})
+
+ok, _ := net.VerifyToken(token)    // true — ed25519 signature ok
+expired, _ := net.TokenIsExpired(token) // false — within TTL
+
+// Re-delegate one hop down the chain:
+carolID := /* 32 bytes */
+child, _ := net.DelegateToken(bob, token, carolID, []string{"subscribe"})
+```
+
+Token errors surface as one-sentinel-per-kind: `ErrTokenInvalidFormat`,
+`ErrTokenInvalidSignature`, `ErrTokenExpired`, `ErrTokenNotYetValid`,
+`ErrTokenDelegationExhausted`, `ErrTokenDelegationNotAllowed`,
+`ErrTokenNotAuthorized`. Use `errors.Is` to match.
+
+### Capability announcements + peer discovery
+
+Announce hardware / software / model / tool / tag fingerprints, then
+query the local capability index with a filter.
+
+```go
+mesh.AnnounceCapabilities(net.CapabilitySet{
+    Hardware: &net.HardwareCaps{
+        CPUCores: 16,
+        MemoryMB: 65536,
+        GPU: &net.GPUInfo{Vendor: "nvidia", Model: "h100", VRAMMB: 81920},
+    },
+    Models: []net.ModelCaps{{
+        ModelID: "llama-3.1-70b", Family: "llama", ContextLength: 128_000,
+    }},
+    Tags: []string{"gpu", "prod"},
+})
+
+gpuPeers, _ := mesh.FindPeers(net.CapabilityFilter{
+    RequireGPU: true,
+    GPUVendor:  "nvidia",
+    MinVRAMMB:  40_000,
+})
+```
+
+Capability propagation is multi-hop, bounded by
+`MAX_CAPABILITY_HOPS = 16` with `(origin, version)` dedup on every
+forwarder. `CapabilityGCIntervalMs` controls both the index TTL
+sweep and the dedup cache eviction. See
+[`docs/MULTIHOP_CAPABILITY_PLAN.md`](../../docs/MULTIHOP_CAPABILITY_PLAN.md).
+
+### Subnets
+
+Nodes can bind to a hierarchical `SubnetID` (1–4 levels, each
+0–255) directly, or derive one from announced tags via a
+`SubnetPolicy`:
+
+```go
+// Explicit subnet on the node.
+mesh, _ := net.NewMeshNode(net.MeshConfig{
+    BindAddr: "127.0.0.1:9000",
+    PskHex:   psk,
+    Subnet:   []uint32{3, 7, 2},
+})
+
+// Or derive from tags.
+mesh, _ = net.NewMeshNode(net.MeshConfig{
+    BindAddr: "127.0.0.1:9001",
+    PskHex:   psk,
+    SubnetPolicy: &net.SubnetPolicy{
+        Rules: []net.SubnetRule{{
+            TagPrefix: "region:",
+            Level:     0,
+            Values:    map[string]uint32{"eu": 1, "us": 2, "apac": 3},
+        }},
+    },
+})
+```
+
+### Reproducible mesh identity
+
+Pass `IdentitySeedHex` so the mesh's `EntityID()` matches an
+`Identity` rehydrated from the same 32-byte seed:
+
+```go
+seed := bytes.Repeat([]byte{0x42}, 32)
+mesh, _ := net.NewMeshNode(net.MeshConfig{
+    BindAddr:        "127.0.0.1:9002",
+    PskHex:          psk,
+    IdentitySeedHex: hex.EncodeToString(seed),
+})
+issuer, _ := net.IdentityFromSeed(seed)
+defer issuer.Close()
+meshEID, _ := mesh.EntityID()
+issuerEID, _ := issuer.EntityID()
+// bytes.Equal(meshEID, issuerEID) — true.
+```
+
+### Channel authentication
+
+Publishers set `PublishCaps` / `SubscribeCaps` / `RequireToken` on
+`RegisterChannel`. Subscribers present a `PermissionToken` via
+`SubscribeChannelWithToken`.
+
+```go
+mesh.RegisterChannel(net.ChannelConfig{
+    Name:          "gpu/jobs",
+    SubscribeCaps: &net.CapabilityFilter{RequireGPU: true, MinVRAMMB: 16_000},
+    RequireToken:  true,
+})
+
+// Subscriber, with a token issued by the publisher:
+_ = mesh.SubscribeChannelWithToken(publisherNodeID, "gpu/jobs", tokenBytes)
+```
+
+Denied subscribes return `ErrChannelAuth` (wrapped as a sub-class
+of `ErrChannel`); malformed tokens return `ErrTokenInvalidFormat`
+before any network I/O. Successful subscribes populate an
+`AuthGuard` bloom filter on the publisher so every subsequent
+publish admits the subscriber in constant time. An expiry sweep
+(default 30 s) evicts subscribers whose tokens age out; a per-
+peer auth-failure rate limiter throttles bad-token storms.
+Cross-SDK behaviour is fixed by the Rust integration suite; see
+[`tests/channel_auth.rs`](../../tests/channel_auth.rs) and
+[`tests/channel_auth_hardening.rs`](../../tests/channel_auth_hardening.rs).
+
 ## Running the Example
 
 ```bash

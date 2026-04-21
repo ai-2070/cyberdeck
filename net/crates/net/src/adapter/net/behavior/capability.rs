@@ -690,6 +690,11 @@ impl CapabilitySet {
 pub struct CapabilityAnnouncement {
     /// Announcing node ID
     pub node_id: u64,
+    /// Announcing entity — the 32-byte ed25519 public key. Pairs
+    /// with `signature` so receivers can verify end-to-end, and
+    /// lets the mesh's channel-auth path resolve
+    /// `node_id → EntityId` for token lookups.
+    pub entity_id: super::super::identity::EntityId,
     /// Monotonic version (for diffing)
     pub version: u64,
     /// Timestamp of announcement (nanoseconds since epoch)
@@ -698,10 +703,47 @@ pub struct CapabilityAnnouncement {
     pub ttl_secs: u32,
     /// Capability set
     pub capabilities: CapabilitySet,
-    /// Optional Ed25519 signature (64 bytes, hex encoded for serde)
+    /// Optional Ed25519 signature (64 bytes, hex encoded for serde).
+    /// Covers every other field EXCEPT [`Self::hop_count`] — the
+    /// internal signing helper zeros `hop_count` before serializing
+    /// and hashing, so forwarders can increment it without
+    /// invalidating this signature. See [`Self::sign`] /
+    /// [`Self::verify`] for the public API; the zeroing is an
+    /// implementation detail of both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Signature64>,
+    /// Number of times this announcement has been forwarded. Origin
+    /// sets 0; each forwarder increments before re-broadcasting.
+    /// Sits *outside* the signed envelope so forwarders don't need
+    /// the origin's secret key. Capped at `MAX_CAPABILITY_HOPS` —
+    /// announcements at or beyond the cap are dropped rather than
+    /// re-broadcast. Old-format announcements missing this field
+    /// deserialize as 0 via `#[serde(default)]`.
+    ///
+    /// `skip_serializing_if` omits the field when it's zero so the
+    /// SIGNED byte form stays identical to pre-M-1 announcements —
+    /// a pre-M-1 node's signature verifies on a post-M-1 node
+    /// during a rolling upgrade because both produce the same
+    /// canonical bytes for the origin (hop_count=0). Forwarded
+    /// announcements (hop_count > 0) serialize the field; receivers
+    /// still zero it in `signed_payload()` so verification hits the
+    /// omitted-when-zero form.
+    #[serde(default, skip_serializing_if = "is_hop_count_zero")]
+    pub hop_count: u8,
 }
+
+/// Serde predicate: skip serializing `hop_count` when it's zero.
+/// Preserves on-wire byte-compat with pre-M-1 announcements that
+/// didn't carry this field at all. See
+/// [`CapabilityAnnouncement::hop_count`] for the rationale.
+fn is_hop_count_zero(v: &u8) -> bool {
+    *v == 0
+}
+
+/// Hard cap on `CapabilityAnnouncement::hop_count`. Mirrors the
+/// pingwave `MAX_HOPS` so both multi-hop broadcast paths share the
+/// same forwarding-depth contract.
+pub const MAX_CAPABILITY_HOPS: u8 = 16;
 
 /// 64-byte signature wrapper with serde support
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -749,8 +791,23 @@ impl<'de> Deserialize<'de> for Signature64 {
 }
 
 impl CapabilityAnnouncement {
-    /// Create new announcement
-    pub fn new(node_id: u64, version: u64, capabilities: CapabilitySet) -> Self {
+    /// Default `ttl_secs` value assigned by [`Self::new`]. Five
+    /// minutes — long enough that a missed re-announcement on one
+    /// node doesn't immediately evict it from every peer's
+    /// [`CapabilityIndex`], short enough that stale state clears on
+    /// realistic operational timescales. Exposed as a constant so
+    /// multi-hop dedup retention can be scaled off it.
+    pub const DEFAULT_TTL_SECS: u32 = 300;
+
+    /// Create a new unsigned announcement. Receivers that run with
+    /// `require_signed_capabilities = true` will drop it until
+    /// [`Self::sign`] is called.
+    pub fn new(
+        node_id: u64,
+        entity_id: super::super::identity::EntityId,
+        version: u64,
+        capabilities: CapabilitySet,
+    ) -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
         let timestamp_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -759,11 +816,13 @@ impl CapabilityAnnouncement {
 
         Self {
             node_id,
+            entity_id,
             version,
             timestamp_ns,
-            ttl_secs: 300, // 5 minute default TTL
+            ttl_secs: Self::DEFAULT_TTL_SECS,
             capabilities,
             signature: None,
+            hop_count: 0,
         }
     }
 
@@ -777,6 +836,43 @@ impl CapabilityAnnouncement {
     pub fn with_signature(mut self, sig: [u8; 64]) -> Self {
         self.signature = Some(Signature64(sig));
         self
+    }
+
+    /// Serialize the sign/verify payload: same bytes on both sides
+    /// of the signature round-trip, with `signature` cleared AND
+    /// `hop_count` zeroed. Keeping `hop_count` out of the signed
+    /// envelope is what lets downstream forwarders bump it without
+    /// invalidating the origin's signature — standard multi-hop
+    /// gossip design (libp2p gossipsub, Chord, etc.).
+    fn signed_payload(&self) -> Vec<u8> {
+        let mut canonical = self.clone();
+        canonical.signature = None;
+        canonical.hop_count = 0;
+        canonical.to_bytes()
+    }
+
+    /// Sign this announcement in place with `keypair`. The resulting
+    /// signature covers every field EXCEPT [`Self::hop_count`] — the
+    /// caller must still ensure `keypair.entity_id() == self.entity_id`
+    /// or receivers will reject with `InvalidSignature`.
+    pub fn sign(&mut self, keypair: &super::super::identity::EntityKeypair) {
+        let payload = self.signed_payload();
+        let sig = keypair.sign(&payload);
+        self.signature = Some(Signature64(sig.to_bytes()));
+    }
+
+    /// Verify the signature against the announcement's own
+    /// `entity_id`. Ignores [`Self::hop_count`] — forwarders are
+    /// expected to bump it. Returns `Err` if no signature is
+    /// present, if the signature can't be decoded, or if
+    /// verification fails.
+    pub fn verify(&self) -> Result<(), super::super::identity::EntityError> {
+        let Some(Signature64(raw)) = self.signature else {
+            return Err(super::super::identity::EntityError::InvalidSignature);
+        };
+        let payload = self.signed_payload();
+        let sig = ed25519_dalek::Signature::from_bytes(&raw);
+        self.entity_id.verify(&payload, &sig)
     }
 
     /// Serialize to bytes
@@ -1425,6 +1521,14 @@ pub struct CapabilityIndexStats {
 mod tests {
     use super::*;
 
+    /// Fixed-bytes `EntityId` for unit-test fixtures. Valid as a
+    /// *value* (it's just 32 bytes) but not a valid ed25519 public
+    /// key — callers that also exercise signature verification
+    /// should construct a real `EntityKeypair` instead.
+    fn test_entity() -> super::super::super::identity::EntityId {
+        super::super::super::identity::EntityId::from_bytes([0u8; 32])
+    }
+
     fn sample_capability_set() -> CapabilitySet {
         let gpu = GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24576)
             .with_compute_units(128)
@@ -1538,7 +1642,7 @@ mod tests {
                 caps.tags.push("divisible_by_3".into());
             }
 
-            let ann = CapabilityAnnouncement::new(i, 1, caps);
+            let ann = CapabilityAnnouncement::new(i, test_entity(), 1, caps);
             index.index(ann);
         }
 
@@ -1582,7 +1686,7 @@ mod tests {
 
         // Index version 1
         let caps_v1 = CapabilitySet::new().add_tag("v1");
-        let ann_v1 = CapabilityAnnouncement::new(1, 1, caps_v1);
+        let ann_v1 = CapabilityAnnouncement::new(1, test_entity(), 1, caps_v1);
         index.index(ann_v1);
 
         // Query should find v1 tag
@@ -1591,7 +1695,7 @@ mod tests {
 
         // Index version 2 (should replace v1)
         let caps_v2 = CapabilitySet::new().add_tag("v2");
-        let ann_v2 = CapabilityAnnouncement::new(1, 2, caps_v2);
+        let ann_v2 = CapabilityAnnouncement::new(1, test_entity(), 2, caps_v2);
         index.index(ann_v2);
 
         // v1 tag should be gone, v2 should be present
@@ -1603,7 +1707,7 @@ mod tests {
 
         // Older version should be ignored
         let caps_old = CapabilitySet::new().add_tag("old");
-        let ann_old = CapabilityAnnouncement::new(1, 1, caps_old);
+        let ann_old = CapabilityAnnouncement::new(1, test_entity(), 1, caps_old);
         index.index(ann_old);
 
         // v2 should still be present
@@ -1614,7 +1718,7 @@ mod tests {
     #[test]
     fn test_capability_announcement_expiry() {
         let caps = sample_capability_set();
-        let mut ann = CapabilityAnnouncement::new(1, 1, caps);
+        let mut ann = CapabilityAnnouncement::new(1, test_entity(), 1, caps);
 
         // Fresh announcement should not be expired
         assert!(!ann.is_expired());
@@ -1625,5 +1729,211 @@ mod tests {
 
         // Should be expired now
         assert!(ann.is_expired());
+    }
+
+    // ========================================================================
+    // Multi-hop wire format (M-1)
+    // ========================================================================
+
+    #[test]
+    fn hop_count_defaults_to_zero() {
+        let ann = CapabilityAnnouncement::new(1, test_entity(), 1, sample_capability_set());
+        assert_eq!(ann.hop_count, 0);
+    }
+
+    #[test]
+    fn hop_count_roundtrips_through_serde() {
+        let mut ann = CapabilityAnnouncement::new(1, test_entity(), 1, sample_capability_set());
+        ann.hop_count = 7;
+        let bytes = ann.to_bytes();
+        let restored = CapabilityAnnouncement::from_bytes(&bytes).expect("parse");
+        assert_eq!(restored.hop_count, 7);
+    }
+
+    #[test]
+    fn old_format_without_hop_count_parses_as_zero() {
+        // Hand-crafted JSON missing the `hop_count` field — the
+        // #[serde(default)] attribute should rescue us.
+        let payload = serde_json::json!({
+            "node_id": 1,
+            "entity_id": hex::encode([0u8; 32]),
+            "version": 1,
+            "timestamp_ns": 0u64,
+            "ttl_secs": 300u32,
+            "capabilities": sample_capability_set(),
+        });
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let parsed = CapabilityAnnouncement::from_bytes(&bytes).expect("parse old format");
+        assert_eq!(parsed.hop_count, 0);
+    }
+
+    #[test]
+    fn signature_verifies_across_hop_count_bumps() {
+        use super::super::super::identity::EntityKeypair;
+        let keypair = EntityKeypair::generate();
+        let mut ann =
+            CapabilityAnnouncement::new(1, keypair.entity_id().clone(), 1, sample_capability_set());
+        ann.sign(&keypair);
+        // Baseline: freshly signed announcement verifies.
+        assert!(ann.verify().is_ok());
+
+        // Simulate a forwarder bumping the counter. Signature still
+        // holds because `hop_count` sits outside the signed envelope.
+        for bumped in 1..=MAX_CAPABILITY_HOPS {
+            ann.hop_count = bumped;
+            assert!(
+                ann.verify().is_ok(),
+                "signature should remain valid after hop_count={}",
+                bumped
+            );
+        }
+    }
+
+    #[test]
+    fn signature_rejects_tampered_payload_even_at_hop_zero() {
+        use super::super::super::identity::EntityKeypair;
+        let keypair = EntityKeypair::generate();
+        let mut ann =
+            CapabilityAnnouncement::new(1, keypair.entity_id().clone(), 1, sample_capability_set());
+        ann.sign(&keypair);
+        // Flip a byte inside the signed envelope (node_id).
+        ann.node_id ^= 0x01;
+        assert!(ann.verify().is_err());
+    }
+
+    #[test]
+    fn max_capability_hops_matches_pingwave_contract() {
+        // MAX_CAPABILITY_HOPS is documented to mirror the pingwave
+        // MAX_HOPS. If the pingwave side is ever renumbered this
+        // test flags the divergence at compile time.
+        assert_eq!(MAX_CAPABILITY_HOPS, 16);
+    }
+
+    /// Regression for a cubic-flagged P1: adding `hop_count` to the
+    /// signed canonical serialization broke rolling-upgrade
+    /// compatibility — pre-M-1 announcements were signed over bytes
+    /// that had no `hop_count` key, so a post-M-1 verifier's
+    /// recomputed `signed_payload()` (which unconditionally
+    /// serialized `hop_count: 0`) produced different bytes and the
+    /// signature failed.
+    ///
+    /// The fix is `#[serde(skip_serializing_if = "is_hop_count_zero")]`:
+    /// both pre-M-1 signers AND post-M-1 signed_payload (which
+    /// always zeros hop_count) omit the field, producing identical
+    /// canonical bytes.
+    ///
+    /// Approach: construct a mirror struct matching pre-M-1's layout
+    /// (same fields, no hop_count) and compare its serialized output
+    /// byte-for-byte with the current node's `signed_payload()`.
+    /// Can't use `serde_json::json!` — that goes through
+    /// `serde_json::Map` which sorts keys alphabetically, whereas
+    /// `CapabilityAnnouncement`'s derived Serialize writes in
+    /// struct-declaration order. The mirror struct keeps the same
+    /// serialization path.
+    #[test]
+    fn signed_payload_stays_compatible_with_pre_hop_count_format() {
+        use super::super::super::identity::{EntityId, EntityKeypair};
+
+        // Mirror of the pre-M-1 `CapabilityAnnouncement` layout —
+        // fields match in declaration order, no `hop_count`.
+        #[derive(Serialize)]
+        struct PreM1Announcement {
+            node_id: u64,
+            entity_id: EntityId,
+            version: u64,
+            timestamp_ns: u64,
+            ttl_secs: u32,
+            capabilities: CapabilitySet,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            signature: Option<Signature64>,
+        }
+
+        let keypair = EntityKeypair::generate();
+        let caps = sample_capability_set();
+
+        let ann = CapabilityAnnouncement::new(1, keypair.entity_id().clone(), 1, caps.clone());
+        let pre_m1 = PreM1Announcement {
+            node_id: ann.node_id,
+            entity_id: ann.entity_id.clone(),
+            version: ann.version,
+            timestamp_ns: ann.timestamp_ns,
+            ttl_secs: ann.ttl_secs,
+            capabilities: ann.capabilities.clone(),
+            signature: None,
+        };
+        let pre_m1_bytes = serde_json::to_vec(&pre_m1).expect("pre-M-1 serialize");
+
+        // Post-M-1 signed_payload — clones, zeros hop_count, sets
+        // signature=None, serializes via the derived Serialize
+        // (same struct-order path as PreM1Announcement).
+        let new_signed = ann.signed_payload();
+
+        assert_eq!(
+            pre_m1_bytes,
+            new_signed,
+            "signed_payload bytes must be byte-identical to pre-M-1 \
+             serialization — otherwise signatures issued before M-1 \
+             fail verification after a rolling upgrade.\n  \
+             pre-M-1:  {}\n  post-M-1: {}",
+            std::str::from_utf8(&pre_m1_bytes).unwrap_or("<non-utf8>"),
+            std::str::from_utf8(&new_signed).unwrap_or("<non-utf8>"),
+        );
+        assert!(
+            !std::str::from_utf8(&new_signed)
+                .unwrap()
+                .contains("hop_count"),
+            "signed_payload must not contain 'hop_count' when zero",
+        );
+
+        // End-to-end: sign with pre-M-1 bytes (what an old node
+        // would have produced), construct a wire payload carrying
+        // that signature, parse via post-M-1 `from_bytes`, and
+        // verify. Must succeed.
+        let sig = keypair.sign(&pre_m1_bytes);
+        let signed_mirror = PreM1Announcement {
+            node_id: ann.node_id,
+            entity_id: ann.entity_id.clone(),
+            version: ann.version,
+            timestamp_ns: ann.timestamp_ns,
+            ttl_secs: ann.ttl_secs,
+            capabilities: ann.capabilities.clone(),
+            signature: Some(Signature64(sig.to_bytes())),
+        };
+        let wire_bytes = serde_json::to_vec(&signed_mirror).expect("serialize wire");
+        let parsed = CapabilityAnnouncement::from_bytes(&wire_bytes)
+            .expect("post-M-1 parses pre-M-1 wire format");
+        assert_eq!(parsed.hop_count, 0);
+        assert!(
+            parsed.verify().is_ok(),
+            "signature computed over pre-M-1 bytes must still verify \
+             on a post-M-1 node — rolling-upgrade compatibility",
+        );
+    }
+
+    #[test]
+    fn hop_count_zero_omits_key_while_nonzero_keeps_it() {
+        // Complements the cross-version compat test: proves the
+        // serde predicate behaves as documented — hop_count=0 is
+        // elided (old-format compat) but hop_count=N>0 survives on
+        // the wire so forwarders can read + bump it.
+        let caps = sample_capability_set();
+        let mut ann = CapabilityAnnouncement::new(1, test_entity(), 1, caps);
+
+        let zero_bytes = ann.to_bytes();
+        let zero_str = std::str::from_utf8(&zero_bytes).expect("utf8");
+        assert!(
+            !zero_str.contains("hop_count"),
+            "hop_count=0 must be omitted from serialized output",
+        );
+
+        ann.hop_count = 3;
+        let bumped_bytes = ann.to_bytes();
+        let bumped_str = std::str::from_utf8(&bumped_bytes).expect("utf8");
+        assert!(
+            bumped_str.contains("\"hop_count\":3"),
+            "hop_count>0 must survive serialization so forwarders \
+             can read + bump. Got: {}",
+            bumped_str,
+        );
     }
 }

@@ -45,6 +45,11 @@ pub enum MembershipMsg {
         channel: ChannelName,
         /// Request correlation nonce — echoed back in `Ack`.
         nonce: u64,
+        /// Serialized [`super::super::identity::PermissionToken`]
+        /// presented alongside the subscribe request. `None` / empty
+        /// when the sender has no token to offer — the publisher's
+        /// `authorize_subscribe` decides whether a token is required.
+        token: Option<Vec<u8>>,
     },
     /// Ask the publisher to remove this node from `channel`'s subscriber set.
     Unsubscribe {
@@ -92,12 +97,23 @@ const MAX_CHANNEL_NAME_LEN: usize = 255;
 pub fn encode(msg: &MembershipMsg) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     match msg {
-        MembershipMsg::Subscribe { channel, nonce } => {
+        MembershipMsg::Subscribe {
+            channel,
+            nonce,
+            token,
+        } => {
             buf.put_u8(MSG_SUBSCRIBE);
             buf.put_u64_le(*nonce);
             let name = channel.as_str().as_bytes();
             buf.put_u8(name.len() as u8);
             buf.extend_from_slice(name);
+            // Token payload: u16_le length + bytes. Zero length when
+            // unset — decoder treats absent trailing bytes as no
+            // token, for forward-compat with a potential pre-E-1
+            // sender (none exist in practice but the cost is ~nil).
+            let token_bytes: &[u8] = token.as_deref().unwrap_or(&[]);
+            buf.put_u16_le(token_bytes.len() as u16);
+            buf.extend_from_slice(token_bytes);
         }
         MembershipMsg::Unsubscribe { channel, nonce } => {
             buf.put_u8(MSG_UNSUBSCRIBE);
@@ -159,7 +175,42 @@ pub fn decode(data: &[u8]) -> Result<MembershipMsg, MembershipCodecError> {
                 .map_err(|_| MembershipCodecError::Truncated("non-utf8 channel name"))?;
             let channel = ChannelName::new(name_str)?;
             if tag == MSG_SUBSCRIBE {
-                Ok(MembershipMsg::Subscribe { channel, nonce })
+                // Advance past the name we just read.
+                cur.set_position(end as u64);
+                // Token: u16_le length + bytes. Zero length ⇒ absent.
+                // Legacy pre-E-1 payloads that stop exactly after the
+                // name (zero trailing bytes) are treated as "no token"
+                // for forward-compat. Exactly one trailing byte is
+                // neither — it means a malformed sender wrote half
+                // the length prefix, and the older
+                // `cur.remaining() < 2` check silently accepted it as
+                // "no token," hiding the bug from callers. Reject so
+                // truncation surfaces as an error.
+                let token = match cur.remaining() {
+                    0 => None,
+                    1 => {
+                        return Err(MembershipCodecError::Truncated(
+                            "subscribe token length prefix",
+                        ));
+                    }
+                    _ => {
+                        let token_len = cur.get_u16_le() as usize;
+                        if token_len == 0 {
+                            None
+                        } else if cur.remaining() < token_len {
+                            return Err(MembershipCodecError::Overflow(token_len, cur.remaining()));
+                        } else {
+                            let tstart = cur.position() as usize;
+                            let tend = tstart + token_len;
+                            Some(data[tstart..tend].to_vec())
+                        }
+                    }
+                };
+                Ok(MembershipMsg::Subscribe {
+                    channel,
+                    nonce,
+                    token,
+                })
             } else {
                 Ok(MembershipMsg::Unsubscribe { channel, nonce })
             }
@@ -206,14 +257,75 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_subscribe() {
+    fn test_roundtrip_subscribe_no_token() {
         let msg = MembershipMsg::Subscribe {
             channel: ch("sensors/lidar"),
             nonce: 0xDEAD_BEEF_CAFE_F00D,
+            token: None,
         };
         let bytes = encode(&msg);
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn test_roundtrip_subscribe_with_token() {
+        // Arbitrary token bytes — codec doesn't validate internal
+        // structure. Validation is the job of `PermissionToken`.
+        let token_bytes = vec![0xABu8; 64];
+        let msg = MembershipMsg::Subscribe {
+            channel: ch("sensors/lidar"),
+            nonce: 0xCAFE,
+            token: Some(token_bytes),
+        };
+        let bytes = encode(&msg);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn test_legacy_subscribe_no_trailing_token_len_decodes_as_none() {
+        // Forge a pre-E-1 payload (no u16 token_len trailer).
+        use bytes::BufMut;
+        let mut buf = Vec::new();
+        buf.put_u8(MSG_SUBSCRIBE);
+        buf.put_u64_le(42);
+        let name = b"lab/x";
+        buf.put_u8(name.len() as u8);
+        buf.extend_from_slice(name);
+        // NO token_len field — stops right after the name.
+        let decoded = decode(&buf).unwrap();
+        assert_eq!(
+            decoded,
+            MembershipMsg::Subscribe {
+                channel: ch("lab/x"),
+                nonce: 42,
+                token: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_regression_subscribe_one_byte_token_len_rejected() {
+        // Regression for a cubic-flagged P2: a Subscribe payload with
+        // exactly one trailing byte after the name used to be silently
+        // accepted as "no token" because the decoder guarded on
+        // `remaining() < 2`. A half-written `u16_le` length prefix is
+        // a truncation, not a legacy payload — it must error.
+        use bytes::BufMut;
+        let mut buf = Vec::new();
+        buf.put_u8(MSG_SUBSCRIBE);
+        buf.put_u64_le(42);
+        let name = b"lab/x";
+        buf.put_u8(name.len() as u8);
+        buf.extend_from_slice(name);
+        // Exactly ONE trailing byte — half of a u16_le length prefix.
+        buf.push(0x05);
+        let err = decode(&buf).unwrap_err();
+        assert!(
+            matches!(err, MembershipCodecError::Truncated(_)),
+            "expected Truncated, got {err:?}",
+        );
     }
 
     #[test]

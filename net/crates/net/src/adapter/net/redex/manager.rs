@@ -91,7 +91,14 @@ impl Redex {
             // no such backstop, and even a 64-bit non-cryptographic
             // hash would be birthday-crackable offline, so the ACL
             // keys on the full canonical name.
-            if !auth.is_authorized_full(self.origin_hash, name) {
+            // Widen the 32-bit local origin_hash to match
+            // `AuthGuard`'s 64-bit key. The guard keeps the local
+            // entity and remote subscribers in disjoint key ranges
+            // simply by the natural spread of node_ids — the local
+            // entity lives in the lower 2^32 and remote subscribers'
+            // full node_ids occupy the full range, so there is no
+            // cross-contamination.
+            if !auth.is_authorized_full(self.origin_hash as u64, name) {
                 return Err(RedexError::Unauthorized);
             }
         }

@@ -1,9 +1,9 @@
 //! Multi-peer mesh handle for the SDK.
 //!
 //! `Mesh` wraps [`MeshNode`] with ergonomic methods for connecting to
-//! peers, sending events, and polling received events. Unlike [`Net`],
-//! which is backed by an [`EventBus`] + adapter, `Mesh` manages its own
-//! encrypted peer sessions and routing.
+//! peers, sending events, and polling received events. Unlike
+//! [`crate::Net`], which is backed by an `EventBus` + adapter, `Mesh`
+//! manages its own encrypted peer sessions and routing.
 //!
 //! # Example
 //!
@@ -50,6 +50,62 @@ use net::event::StoredEvent;
 
 use crate::error::{Result, SdkError};
 
+/// Options passed to [`Mesh::subscribe_channel_with`].
+///
+/// Today the only knob is a presented
+/// [`PermissionToken`](crate::identity::PermissionToken) — the
+/// shape is a struct rather than a bare `Option<Token>` so future
+/// additions (request-side timeout override, subscribe priority,
+/// etc.) don't break callers.
+///
+/// # Round-trip shape
+///
+/// ```no_run
+/// # use std::time::Duration;
+/// # use net_sdk::{ChannelName, Identity, SubscribeOptions, TokenScope};
+/// # use net_sdk::mesh::MeshBuilder;
+/// # async fn example(
+/// #     publisher: &net_sdk::Mesh,
+/// #     publisher_identity: &Identity,
+/// #     subscriber_entity_id: net::adapter::net::identity::EntityId,
+/// # ) -> net_sdk::error::Result<()> {
+/// // Publisher issues a SUBSCRIBE-scope token for the subscriber.
+/// // The publisher's own `Mesh` is bound to an `Identity`, so the
+/// // token lands in its local cache when `issue_token` is called.
+/// let channel = ChannelName::new("events/trades").unwrap();
+/// let token = publisher_identity.issue_token(
+///     subscriber_entity_id,
+///     TokenScope::SUBSCRIBE,
+///     &channel,
+///     Duration::from_secs(600),
+///     0, // no further delegation
+/// );
+///
+/// // Subscriber (another `Mesh`) calls `subscribe_channel_with`,
+/// // attaching the same token bytes they received from the
+/// // publisher out of band. The publisher verifies the signature,
+/// // checks `subject == subscriber_entity_id`, installs it in its
+/// // cache, then runs `can_subscribe`.
+/// let subscriber: &net_sdk::Mesh = unimplemented!();
+/// subscriber
+///     .subscribe_channel_with(
+///         publisher.node_id(),
+///         &channel,
+///         SubscribeOptions { token: Some(token) },
+///     )
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Default, Debug, Clone)]
+pub struct SubscribeOptions {
+    /// Token to attach to the subscribe request. The publisher
+    /// verifies + installs it before running
+    /// `ChannelConfig::can_subscribe`, so a matching token
+    /// satisfies `require_token` channels end-to-end.
+    pub token: Option<net::adapter::net::PermissionToken>,
+}
+
 /// Builder for configuring a [`Mesh`] node.
 pub struct MeshBuilder {
     bind_addr: SocketAddr,
@@ -57,6 +113,9 @@ pub struct MeshBuilder {
     heartbeat_interval: Duration,
     session_timeout: Duration,
     num_shards: u16,
+    identity: Option<crate::identity::Identity>,
+    subnet: Option<net::adapter::net::SubnetId>,
+    subnet_policy: Option<Arc<net::adapter::net::SubnetPolicy>>,
 }
 
 impl MeshBuilder {
@@ -71,7 +130,26 @@ impl MeshBuilder {
             heartbeat_interval: Duration::from_secs(5),
             session_timeout: Duration::from_secs(30),
             num_shards: 4,
+            identity: None,
+            subnet: None,
+            subnet_policy: None,
         })
+    }
+
+    /// Pin this node to a caller-owned [`Identity`](crate::Identity).
+    ///
+    /// Without this call, `build()` generates an ephemeral keypair —
+    /// fine for one-off sessions, but every restart produces a new
+    /// entity id (and therefore a new node id). Provide an identity
+    /// loaded from disk / vault / enclave to keep stable addressing.
+    ///
+    /// The identity's [`TokenCache`](crate::identity::TokenCache) is
+    /// also bound to this mesh; tokens installed via
+    /// [`Identity::install_token`](crate::identity::Identity::install_token)
+    /// become available to the channel auth path at subscribe time.
+    pub fn identity(mut self, identity: crate::identity::Identity) -> Self {
+        self.identity = Some(identity);
+        self
     }
 
     /// Set heartbeat interval in milliseconds.
@@ -92,24 +170,71 @@ impl MeshBuilder {
         self
     }
 
+    /// Pin this node to a specific subnet. Defaults to
+    /// [`SubnetId::GLOBAL`](crate::subnets::SubnetId) — no
+    /// restriction. Visibility checks on the publish + subscribe
+    /// paths compare against this value.
+    pub fn subnet(mut self, id: net::adapter::net::SubnetId) -> Self {
+        self.subnet = Some(id);
+        self
+    }
+
+    /// Install a subnet policy that derives each peer's subnet from
+    /// their capability announcement. Mesh-wide policy consistency
+    /// is assumed — mismatched policies across nodes lead to
+    /// asymmetric views of peer subnets.
+    ///
+    /// Accepts either an owned `SubnetPolicy` or an `Arc<SubnetPolicy>`
+    /// via blanket `Into` support — useful when several builders
+    /// share one policy at node construction time.
+    pub fn subnet_policy(
+        mut self,
+        policy: impl Into<Arc<net::adapter::net::SubnetPolicy>>,
+    ) -> Self {
+        self.subnet_policy = Some(policy.into());
+        self
+    }
+
     /// Build the mesh node.
     pub async fn build(self) -> Result<Mesh> {
-        let identity = EntityKeypair::generate();
-        let config = MeshNodeConfig::new(self.bind_addr, self.psk)
+        // Use the caller's identity if one was set, otherwise mint an
+        // ephemeral one. `MeshNode::new` takes the keypair by value,
+        // so clone it out of the Arc when we have a shared identity.
+        let (keypair, sdk_identity) = match self.identity {
+            Some(id) => (id.keypair().as_ref().clone(), Some(id)),
+            None => (EntityKeypair::generate(), None),
+        };
+
+        let mut config = MeshNodeConfig::new(self.bind_addr, self.psk)
             .with_heartbeat_interval(self.heartbeat_interval)
             .with_session_timeout(self.session_timeout)
             .with_num_shards(self.num_shards)
             .with_handshake(3, Duration::from_secs(5));
+        if let Some(id) = self.subnet {
+            config = config.with_subnet(id);
+        }
+        if let Some(policy) = self.subnet_policy {
+            config = config.with_subnet_policy(policy);
+        }
 
-        let mut node = MeshNode::new(identity, config).await?;
+        let mut node = MeshNode::new(keypair, config).await?;
         // Install a shared ChannelConfigRegistry so `register_channel`
         // can add entries without needing `&mut Mesh` — the registry
         // itself uses interior mutability (DashMap).
         let channel_configs = Arc::new(ChannelConfigRegistry::new());
         node.set_channel_configs(channel_configs.clone());
+        // Hand the caller's TokenCache to the mesh so channel auth
+        // (`require_token` / `can_subscribe` / `can_publish`) has a
+        // cache to consult + install incoming tokens into. Without
+        // an identity, no cache is installed and `require_token`
+        // channels will reject.
+        if let Some(id) = sdk_identity.as_ref() {
+            node.set_token_cache(id.token_cache().clone());
+        }
         Ok(Mesh {
             node,
             channel_configs,
+            identity: sdk_identity,
         })
     }
 }
@@ -125,6 +250,11 @@ pub struct Mesh {
     /// so `register_channel` / subscriber ACL checks operate on the
     /// same live data.
     channel_configs: Arc<ChannelConfigRegistry>,
+    /// Held onto so the caller's `TokenCache` (and future capability
+    /// announcement state) stays alive for the mesh's lifetime —
+    /// `MeshNode` was already handed a clone of the keypair, so this
+    /// is purely for the auxiliary state that rides alongside.
+    identity: Option<crate::identity::Identity>,
 }
 
 impl Mesh {
@@ -287,11 +417,38 @@ impl Mesh {
         publisher_node_id: u64,
         channel: &ChannelName,
     ) -> Result<()> {
-        match self
-            .node
-            .subscribe_channel(publisher_node_id, channel.clone())
+        self.subscribe_channel_with(publisher_node_id, channel, SubscribeOptions::default())
             .await
-        {
+    }
+
+    /// Subscribe with options — optionally presenting a
+    /// [`PermissionToken`](crate::identity::PermissionToken).
+    ///
+    /// Use this when the publisher registered the channel with
+    /// `require_token = true` and/or a `subscribe_caps` filter that
+    /// your node's capabilities alone don't satisfy. The publisher
+    /// verifies the token on arrival (signature + subject matches
+    /// the subscribing peer's `EntityId`) and installs it into its
+    /// local `TokenCache` before the ACL check runs.
+    pub async fn subscribe_channel_with(
+        &self,
+        publisher_node_id: u64,
+        channel: &ChannelName,
+        opts: SubscribeOptions,
+    ) -> Result<()> {
+        let result = match opts.token {
+            Some(token) => {
+                self.node
+                    .subscribe_channel_with_token(publisher_node_id, channel.clone(), token)
+                    .await
+            }
+            None => {
+                self.node
+                    .subscribe_channel(publisher_node_id, channel.clone())
+                    .await
+            }
+        };
+        match result {
             Ok(()) => Ok(()),
             Err(e) => Err(adapter_to_channel_error(e)),
         }
@@ -462,6 +619,53 @@ impl Mesh {
         self.node.all_stream_stats(peer_node_id)
     }
 
+    // ---- Capability announcements ----
+
+    /// Announce this node's capabilities to every directly-connected
+    /// peer. Self-indexes too, so `find_peers` called from this same
+    /// node matches on the announcement. Multi-hop propagation is
+    /// deferred — peers more than one hop away will not see the
+    /// announcement.
+    ///
+    /// Default TTL is 5 minutes; use
+    /// [`Self::announce_capabilities_with`] to override.
+    pub async fn announce_capabilities(
+        &self,
+        caps: crate::capabilities::CapabilitySet,
+    ) -> Result<()> {
+        self.node.announce_capabilities(caps).await?;
+        Ok(())
+    }
+
+    /// Extended announce with explicit TTL and signing opt-in.
+    /// `sign = true` is accepted but currently a no-op; signatures
+    /// tie in with Stage E (channel auth), once `node_id` →
+    /// `EntityId` binding is wired.
+    pub async fn announce_capabilities_with(
+        &self,
+        caps: crate::capabilities::CapabilitySet,
+        ttl: std::time::Duration,
+        sign: bool,
+    ) -> Result<()> {
+        self.node
+            .announce_capabilities_with(caps, ttl, sign)
+            .await?;
+        Ok(())
+    }
+
+    /// Query the capability index. Returns node ids whose latest
+    /// announcement matches `filter`; includes our own `node_id` if
+    /// our own announcement matches.
+    pub fn find_peers(&self, filter: &crate::capabilities::CapabilityFilter) -> Vec<u64> {
+        self.node.find_peers_by_filter(filter)
+    }
+
+    /// Rank peers for a scored placement requirement. Returns the
+    /// single best-scoring node's id, or `None` if no peer matches.
+    pub fn rank_peers(&self, req: &crate::capabilities::CapabilityRequirement) -> Option<u64> {
+        self.node.rank_peers(req)
+    }
+
     // ---- Lifecycle ----
 
     /// Set a migration handler (for Mikoshi daemon migration).
@@ -478,6 +682,13 @@ impl Mesh {
     /// Get a reference to the underlying `MeshNode`.
     pub fn inner(&self) -> &MeshNode {
         &self.node
+    }
+
+    /// Caller-owned identity bound to this mesh, if any. Returns
+    /// `None` for meshes built without `.identity(...)` (ephemeral
+    /// keypair).
+    pub fn identity(&self) -> Option<&crate::identity::Identity> {
+        self.identity.as_ref()
     }
 }
 

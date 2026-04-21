@@ -2,9 +2,19 @@
 //!
 //! Provides high-performance event ingestion and consumption for Node.js/TypeScript.
 
+// Identity / capabilities / subnets ride the `net` feature as a
+// single security unit — they share `adapter::net`'s subprotocol
+// dispatch and operate together at runtime, so gating each module
+// separately would only enable combinations that aren't meaningful.
+#[cfg(feature = "net")]
+mod capabilities;
 mod common;
 #[cfg(feature = "cortex")]
 mod cortex;
+#[cfg(feature = "net")]
+mod identity;
+#[cfg(feature = "net")]
+mod subnets;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -928,11 +938,35 @@ mod mesh_bindings {
         pub session_timeout_ms: Option<u32>,
         /// Number of inbound shards (default: 4)
         pub num_shards: Option<u32>,
+        /// Capability-index GC sweep interval in milliseconds.
+        /// Default: 60_000. Shorter values make TTL-driven eviction
+        /// more responsive at the cost of extra CPU.
+        pub capability_gc_interval_ms: Option<u32>,
+        /// Drop inbound `CapabilityAnnouncement` packets without a
+        /// signature. Default: false. Signature *validity* is not
+        /// yet enforced; this is presence-only policy today.
+        pub require_signed_capabilities: Option<bool>,
+        /// Pin this node to a specific subnet. Defaults to
+        /// `SubnetId::GLOBAL` (no restriction). Visibility checks on
+        /// publish + subscribe compare against this value.
+        pub subnet: Option<crate::subnets::SubnetIdJs>,
+        /// Policy applied to inbound `CapabilityAnnouncement`s to
+        /// derive each peer's subnet. `None` disables per-peer
+        /// subnet tracking.
+        pub subnet_policy: Option<crate::subnets::SubnetPolicyJs>,
+        /// 32-byte ed25519 seed. When set, the mesh derives its
+        /// keypair (and therefore its `entity_id` + stable
+        /// `node_id`) from these bytes instead of generating
+        /// ephemeral ones. Treat as secret material.
+        pub identity_seed: Option<Buffer>,
     }
 
     /// JS-facing channel config, mirroring the core `ChannelConfig`
     /// field-for-field. v1 does not expose `publishCaps` /
-    /// `subscribeCaps` — those arrive with the security plan.
+    /// Channel registration config. `publishCaps` / `subscribeCaps`
+    /// are capability filters enforced at subscribe time + before
+    /// the publish fan-out; `requireToken` gates on a valid
+    /// `PermissionToken`. See `docs/CHANNEL_AUTH_PLAN.md`.
     #[napi(object)]
     pub struct ChannelConfigJs {
         /// Canonical channel name. Crosses the boundary as a string
@@ -943,14 +977,20 @@ mod mesh_bindings {
         pub visibility: Option<String>,
         /// Default reliability for streams on this channel.
         pub reliable: Option<bool>,
-        /// Whether subscribers must present a valid PermissionToken.
-        /// v1 ships `false`; token verification requires the security
-        /// plan's identity surface.
+        /// When true, subscribers must present a valid
+        /// `PermissionToken` whose subject matches their entity id.
         pub require_token: Option<bool>,
         /// Priority (0 = lowest).
         pub priority: Option<u8>,
         /// Rate cap in packets per second.
         pub max_rate_pps: Option<u32>,
+        /// Capability filter the publisher itself must satisfy
+        /// before fan-out. Rejected with a `channel:` error on
+        /// mismatch.
+        pub publish_caps: Option<crate::capabilities::CapabilityFilterJs>,
+        /// Capability filter each subscriber must satisfy. Rejected
+        /// as `Unauthorized` on mismatch.
+        pub subscribe_caps: Option<crate::capabilities::CapabilityFilterJs>,
     }
 
     impl ChannelConfigJs {
@@ -973,6 +1013,13 @@ mod mesh_bindings {
             }
             if let Some(pps) = self.max_rate_pps {
                 cfg = cfg.with_rate_limit(pps);
+            }
+            if let Some(filter) = self.publish_caps {
+                cfg = cfg.with_publish_caps(crate::capabilities::capability_filter_from_js(filter));
+            }
+            if let Some(filter) = self.subscribe_caps {
+                cfg =
+                    cfg.with_subscribe_caps(crate::capabilities::capability_filter_from_js(filter));
             }
             Ok(cfg)
         }
@@ -1093,16 +1140,16 @@ mod mesh_bindings {
                 // Classify rejection reasons for typed SDK errors.
                 let reason = tail.trim();
                 if reason == "Some(Unauthorized)" {
-                    return Error::from_reason(format!("channel: unauthorized"));
+                    return Error::from_reason("channel: unauthorized".to_string());
                 }
                 if reason == "Some(UnknownChannel)" {
-                    return Error::from_reason(format!("channel: unknown channel"));
+                    return Error::from_reason("channel: unknown channel".to_string());
                 }
                 if reason == "Some(RateLimited)" {
-                    return Error::from_reason(format!("channel: rate limited"));
+                    return Error::from_reason("channel: rate limited".to_string());
                 }
                 if reason == "Some(TooManyChannels)" {
-                    return Error::from_reason(format!("channel: too many channels"));
+                    return Error::from_reason("channel: too many channels".to_string());
                 }
                 return Error::from_reason(format!("channel: rejected ({})", reason));
             }
@@ -1174,8 +1221,36 @@ mod mesh_bindings {
                 })?;
                 config = config.with_num_shards(n);
             }
+            if let Some(ms) = options.capability_gc_interval_ms {
+                config = config.with_capability_gc_interval(Duration::from_millis(ms as u64));
+            }
+            if let Some(b) = options.require_signed_capabilities {
+                config = config.with_require_signed_capabilities(b);
+            }
+            if let Some(id_js) = options.subnet {
+                let id = crate::subnets::subnet_id_from_js(id_js)?;
+                config = config.with_subnet(id);
+            }
+            if let Some(policy_js) = options.subnet_policy {
+                let policy = std::sync::Arc::new(crate::subnets::subnet_policy_from_js(policy_js)?);
+                config = config.with_subnet_policy(policy);
+            }
 
-            let identity = EntityKeypair::generate();
+            let identity = match options.identity_seed {
+                Some(seed) => {
+                    let bytes: &[u8] = seed.as_ref();
+                    if bytes.len() != 32 {
+                        return Err(Error::from_reason(format!(
+                            "identity_seed must be 32 bytes, got {}",
+                            bytes.len()
+                        )));
+                    }
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(bytes);
+                    EntityKeypair::from_bytes(arr)
+                }
+                None => EntityKeypair::generate(),
+            };
 
             let mut node = MeshNode::new(identity, config)
                 .await
@@ -1185,6 +1260,12 @@ mod mesh_bindings {
             // can insert without needing `&mut NetMesh`.
             let channel_configs = Arc::new(net::adapter::net::ChannelConfigRegistry::new());
             node.set_channel_configs(channel_configs.clone());
+            // Always install a TokenCache — channel auth needs
+            // somewhere to stash tokens presented on subscribe.
+            // Callers that want to pre-seed can use `installToken`
+            // on a caller-side `Identity` constructed from the same
+            // `identity_seed`.
+            node.set_token_cache(Arc::new(net::adapter::net::identity::TokenCache::new()));
 
             Ok(NetMesh {
                 node: Arc::new(ArcSwapOption::from_pointee(node)),
@@ -1208,6 +1289,16 @@ mod mesh_bindings {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             Ok(BigInt::from(node.node_id()))
+        }
+
+        /// Get this node's ed25519 entity id (32 bytes — the same
+        /// value as `new Identity(seed).entityId` when the mesh was
+        /// constructed with `identitySeed = seed`).
+        #[napi]
+        pub fn entity_id(&self) -> Result<Buffer> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            Ok(Buffer::from(node.entity_id().as_bytes().to_vec()))
         }
 
         /// Connect to a peer (initiator side).
@@ -1509,20 +1600,37 @@ mod mesh_bindings {
         /// Ask `publisher_node_id` to add this node to `channel`'s
         /// subscriber set. Blocks until the publisher's `Ack` arrives
         /// or the membership-ack timeout elapses.
+        ///
+        /// Optional `token` is the serialized `PermissionToken` bytes
+        /// (159 bytes) — attach it when the publisher set
+        /// `requireToken = true` on the channel, or when the caller's
+        /// caps don't satisfy `subscribeCaps` on their own.
         #[napi]
         pub async fn subscribe_channel(
             &self,
             publisher_node_id: BigInt,
             channel: String,
+            token: Option<Buffer>,
         ) -> Result<()> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             let pub_id = bigint_u64_lossless(publisher_node_id)?;
             let name = net::adapter::net::ChannelName::new(&channel)
                 .map_err(|e| Error::from_reason(format!("channel: invalid name: {}", e)))?;
-            node.subscribe_channel(pub_id, name)
-                .await
-                .map_err(map_channel_adapter_error)
+            match token {
+                Some(bytes) => {
+                    let parsed =
+                        net::adapter::net::identity::PermissionToken::from_bytes(bytes.as_ref())
+                            .map_err(crate::identity::token_err_for)?;
+                    node.subscribe_channel_with_token(pub_id, name, parsed)
+                        .await
+                        .map_err(map_channel_adapter_error)
+                }
+                None => node
+                    .subscribe_channel(pub_id, name)
+                    .await
+                    .map_err(map_channel_adapter_error),
+            }
         }
 
         /// Mirror of [`Self::subscribe_channel`]. Idempotent on the
@@ -1574,6 +1682,43 @@ mod mesh_bindings {
                 .await
                 .map_err(map_channel_adapter_error)?;
             Ok(PublishReportJs::from_core(report))
+        }
+
+        /// Announce this node's capabilities to every directly-
+        /// connected peer. Also self-indexes, so `findPeers` on the
+        /// same node matches on the announcement.
+        ///
+        /// Multi-hop propagation is deferred — peers more than one
+        /// hop away will not see the announcement.
+        #[napi]
+        pub async fn announce_capabilities(
+            &self,
+            caps: crate::capabilities::CapabilitySetJs,
+        ) -> Result<()> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let core = crate::capabilities::capability_set_from_js(caps);
+            node.announce_capabilities(core)
+                .await
+                .map_err(|e| Error::from_reason(format!("capability: {}", e)))
+        }
+
+        /// Query the local capability index. Returns node ids
+        /// (including our own if we self-match) whose latest
+        /// announcement matches `filter`.
+        #[napi]
+        pub fn find_peers(
+            &self,
+            filter: crate::capabilities::CapabilityFilterJs,
+        ) -> Result<Vec<BigInt>> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let core = crate::capabilities::capability_filter_from_js(filter);
+            Ok(node
+                .find_peers_by_filter(&core)
+                .into_iter()
+                .map(BigInt::from)
+                .collect())
         }
 
         /// Shutdown the mesh node.
