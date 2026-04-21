@@ -1171,11 +1171,11 @@ mod mesh_bindings {
         #[pyo3(signature = (peer_addr, peer_public_key, peer_node_id))]
         fn connect(
             &self,
+            py: Python<'_>,
             peer_addr: &str,
             peer_public_key: &str,
             peer_node_id: u64,
         ) -> PyResult<()> {
-            let node = self.get_node()?;
             let addr: std::net::SocketAddr = peer_addr
                 .parse()
                 .map_err(|e| PyValueError::new_err(format!("invalid address: {}", e)))?;
@@ -1188,25 +1188,54 @@ mod mesh_bindings {
             let mut pubkey = [0u8; 32];
             pubkey.copy_from_slice(&pubkey_bytes);
 
-            self.runtime
-                .block_on(node.connect(addr, &pubkey, peer_node_id))
-                .map_err(|e| PyRuntimeError::new_err(format!("connect: {}", e)))?;
-            Ok(())
+            // Grab an Arc to the node before detaching so we don't
+            // need `&self` while the GIL is released. Releasing the
+            // GIL is load-bearing for the two-mesh handshake case:
+            // the peer's `accept` blocks on its own thread while
+            // holding the GIL, and our blocking connect on this
+            // thread would otherwise deadlock that thread's GIL
+            // acquire at the end of handshake.
+            let node = self
+                .node
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime
+                    .block_on(node.connect(addr, &pubkey, peer_node_id))
+                    .map_err(|e| PyRuntimeError::new_err(format!("connect: {}", e)))?;
+                Ok(())
+            })
         }
 
         /// Accept an incoming connection (responder side).
-        fn accept(&self, peer_node_id: u64) -> PyResult<String> {
-            let node = self.get_node()?;
-            let (addr, _) = self
-                .runtime
-                .block_on(node.accept(peer_node_id))
-                .map_err(|e| PyRuntimeError::new_err(format!("accept: {}", e)))?;
-            Ok(addr.to_string())
+        fn accept(&self, py: Python<'_>, peer_node_id: u64) -> PyResult<String> {
+            // Release the GIL while blocking on the accept future —
+            // without this, a caller running `accept` in a thread
+            // would pin the GIL and starve a concurrent `connect` on
+            // the main thread (same reason as `connect` above).
+            let node = self
+                .node
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let (addr, _) = runtime
+                    .block_on(node.accept(peer_node_id))
+                    .map_err(|e| PyRuntimeError::new_err(format!("accept: {}", e)))?;
+                Ok(addr.to_string())
+            })
         }
 
         /// Start the receive loop and heartbeats.
         fn start(&self) -> PyResult<()> {
             let node = self.get_node()?;
+            // `MeshNode::start` uses `tokio::spawn` internally, so
+            // it must run inside a tokio runtime context. Enter
+            // our owned runtime for the duration of the call.
+            let _guard = self.runtime.enter();
             node.start();
             Ok(())
         }
@@ -1791,6 +1820,10 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<compute::PyDaemonRuntime>()?;
         m.add_class::<compute::PyDaemonHandle>()?;
         m.add_class::<compute::PyCausalEvent>()?;
+        m.add_class::<compute::PyMigrationHandle>()?;
+        m.add_class::<compute::PyMigrationPhasesIter>()?;
+        m.add("DaemonError", m.py().get_type::<compute::DaemonError>())?;
+        m.add("MigrationError", m.py().get_type::<compute::MigrationError>())?;
     }
     Ok(())
 }

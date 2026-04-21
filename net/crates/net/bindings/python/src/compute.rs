@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 
@@ -34,7 +34,10 @@ use net::adapter::net::behavior::capability::CapabilityFilter;
 use net::adapter::net::compute::{DaemonError as CoreDaemonError, DaemonHostConfig, MeshDaemon};
 use net::adapter::net::state::causal::{CausalEvent, CausalLink};
 use net_sdk::compute::{
-    DaemonHandle as SdkDaemonHandle, DaemonRuntime as SdkDaemonRuntime, StateSnapshot,
+    DaemonError as SdkDaemonError, DaemonHandle as SdkDaemonHandle,
+    DaemonRuntime as SdkDaemonRuntime, MigrationError as SdkMigrationError, MigrationFailureReason,
+    MigrationHandle as SdkMigrationHandle, MigrationOpts, MigrationPhase as CoreMigrationPhase,
+    StateSnapshot,
 };
 use net_sdk::mesh::Mesh as SdkMesh;
 use tokio::runtime::Runtime;
@@ -45,11 +48,121 @@ use tokio::runtime::Runtime;
 
 const ERR_DAEMON_PREFIX: &str = "daemon:";
 
-/// Build a `PyRuntimeError` with the `daemon:` prefix. Matches the
+// ---------------------------------------------------------------
+// Exception classes
+// ---------------------------------------------------------------
+//
+// `DaemonError` — base for anything the compute runtime throws.
+// `MigrationError` — subclass of DaemonError; message carries a
+//   structured `migration: <kind>[: detail]` payload so Python
+//   callers can dispatch on the kind string without regex-parsing
+//   free-form messages.
+//
+// Mirrors the TS `DaemonError` / `MigrationError extends DaemonError`
+// shape; the kind vocabulary is the same set used by the NAPI
+// layer's `format_migration_failure_reason` / `format_migration_error`.
+
+pyo3::create_exception!(
+    _net,
+    DaemonError,
+    PyException,
+    "Base class for compute-runtime errors. Message is prefixed \
+     with `daemon: `. Non-migration failures surface with a \
+     free-form detail (`daemon: <detail>`); migration failures \
+     use the `MigrationError` subclass with a `migration: <kind>` \
+     body — see `MigrationError` for the kind vocabulary."
+);
+
+pyo3::create_exception!(
+    _net,
+    MigrationError,
+    DaemonError,
+    "Migration-layer failure. Message has the form \
+     `daemon: migration: <kind>[: <detail>]`, where `<kind>` is \
+     one of `not-ready` | `factory-not-found` | \
+     `compute-not-supported` | `state-failed` | \
+     `already-migrating` | `identity-transport-failed` | \
+     `not-ready-timeout` | `daemon-not-found` | \
+     `target-unavailable` | `wrong-phase` | `snapshot-too-large`. \
+     Use the `net.migration_error_kind` helper to extract the \
+     kind from a caught exception programmatically."
+);
+
+/// Build a `DaemonError` with the `daemon:` prefix. Matches the
 /// identity / cortex / token conventions so Python-side
 /// classifiers can route on the prefix cheaply.
 pub(crate) fn daemon_err(msg: impl Into<String>) -> PyErr {
-    PyRuntimeError::new_err(format!("{} {}", ERR_DAEMON_PREFIX, msg.into()))
+    PyErr::new::<DaemonError, _>(format!("{} {}", ERR_DAEMON_PREFIX, msg.into()))
+}
+
+/// Build a `MigrationError` with the `daemon: migration:` prefix.
+fn migration_err(body: impl Into<String>) -> PyErr {
+    PyErr::new::<MigrationError, _>(format!(
+        "{} migration: {}",
+        ERR_DAEMON_PREFIX,
+        body.into()
+    ))
+}
+
+/// Map an SDK `DaemonError` to the right Python-level exception
+/// class. Migration failures get the structured
+/// `migration: <kind>[: detail]` body on a `MigrationError`;
+/// everything else falls through to `DaemonError` with the SDK's
+/// Display-formatted message.
+fn daemon_err_from_sdk(e: SdkDaemonError) -> PyErr {
+    match e {
+        SdkDaemonError::MigrationFailed(reason) => {
+            migration_err(format_migration_failure_reason(&reason))
+        }
+        SdkDaemonError::Migration(mig_err) => migration_err(format_migration_error(&mig_err)),
+        other => daemon_err(other.to_string()),
+    }
+}
+
+fn format_migration_failure_reason(reason: &MigrationFailureReason) -> String {
+    match reason {
+        MigrationFailureReason::NotReady => "not-ready".to_string(),
+        MigrationFailureReason::FactoryNotFound => "factory-not-found".to_string(),
+        MigrationFailureReason::ComputeNotSupported => "compute-not-supported".to_string(),
+        MigrationFailureReason::StateFailed(msg) => format!("state-failed: {msg}"),
+        MigrationFailureReason::AlreadyMigrating => "already-migrating".to_string(),
+        MigrationFailureReason::IdentityTransportFailed(msg) => {
+            format!("identity-transport-failed: {msg}")
+        }
+        MigrationFailureReason::NotReadyTimeout { attempts } => {
+            format!("not-ready-timeout: {attempts}")
+        }
+    }
+}
+
+fn format_migration_error(err: &SdkMigrationError) -> String {
+    match err {
+        SdkMigrationError::DaemonNotFound(origin) => format!("daemon-not-found: {origin:#x}"),
+        SdkMigrationError::TargetUnavailable(node) => format!("target-unavailable: {node:#x}"),
+        SdkMigrationError::StateFailed(msg) => format!("state-failed: {msg}"),
+        SdkMigrationError::AlreadyMigrating(origin) => format!("already-migrating: {origin:#x}"),
+        SdkMigrationError::WrongPhase { expected, got } => {
+            format!("wrong-phase: {expected:?}: {got:?}")
+        }
+        SdkMigrationError::SnapshotTooLarge { size, max } => {
+            format!("snapshot-too-large: {size}: {max}")
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+// Migration phase helper
+// ---------------------------------------------------------------
+
+fn migration_phase_str(phase: CoreMigrationPhase) -> &'static str {
+    match phase {
+        CoreMigrationPhase::Snapshot => "snapshot",
+        CoreMigrationPhase::Transfer => "transfer",
+        CoreMigrationPhase::Restore => "restore",
+        CoreMigrationPhase::Replay => "replay",
+        CoreMigrationPhase::Cutover => "cutover",
+        CoreMigrationPhase::Complete => "complete",
+    }
 }
 
 // =========================================================================
@@ -503,12 +616,296 @@ impl PyDaemonRuntime {
         Ok(out)
     }
 
+    /// Initiate a migration for the daemon identified by
+    /// `origin_hash`, moving it from `source_node` to
+    /// `target_node`. Returns a `MigrationHandle` whose `wait()`
+    /// resolves when the migration reaches a terminal state
+    /// (`complete` on success, `MigrationError` otherwise).
+    ///
+    /// Both node IDs are `u64` — Python's unbounded int handles
+    /// the full range without precision concerns.
+    fn start_migration(
+        &self,
+        py: Python<'_>,
+        origin_hash: u32,
+        source_node: u64,
+        target_node: u64,
+    ) -> PyResult<PyMigrationHandle> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        let handle = py.detach(move || {
+            runtime
+                .block_on(async move {
+                    inner
+                        .start_migration(origin_hash, source_node, target_node)
+                        .await
+                })
+                .map_err(daemon_err_from_sdk)
+        })?;
+        Ok(PyMigrationHandle::from_sdk(handle, self.runtime.clone()))
+    }
+
+    /// `start_migration` with caller-supplied options. Keys:
+    /// `transport_identity` (bool), `retry_not_ready_ms` (int).
+    #[pyo3(signature = (origin_hash, source_node, target_node, opts))]
+    fn start_migration_with(
+        &self,
+        py: Python<'_>,
+        origin_hash: u32,
+        source_node: u64,
+        target_node: u64,
+        opts: &Bound<'_, PyDict>,
+    ) -> PyResult<PyMigrationHandle> {
+        let mut sdk_opts = MigrationOpts::default();
+        if let Some(v) = opts.get_item("transport_identity")? {
+            sdk_opts.transport_identity = v.extract()?;
+        }
+        if let Some(v) = opts.get_item("retry_not_ready_ms")? {
+            let ms: u64 = v.extract()?;
+            sdk_opts.retry_not_ready = if ms == 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_millis(ms))
+            };
+        }
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        let handle = py.detach(move || {
+            runtime
+                .block_on(async move {
+                    inner
+                        .start_migration_with(origin_hash, source_node, target_node, sdk_opts)
+                        .await
+                })
+                .map_err(daemon_err_from_sdk)
+        })?;
+        Ok(PyMigrationHandle::from_sdk(handle, self.runtime.clone()))
+    }
+
+    /// Declare on the target node that a migration will land here
+    /// for `origin_hash` of `kind`. Registers a placeholder
+    /// factory — the migration snapshot's identity envelope
+    /// supplies the real keypair at restore time.
+    #[pyo3(signature = (kind, origin_hash, config=None))]
+    fn expect_migration(
+        &self,
+        kind: String,
+        origin_hash: u32,
+        config: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        let cfg = daemon_host_config_from_dict(config)?;
+        self.inner
+            .expect_migration(&kind, origin_hash, cfg)
+            .map_err(daemon_err_from_sdk)
+    }
+
+    /// Pre-register a target-side identity for a migration that
+    /// will NOT carry an identity envelope (source used
+    /// `transport_identity=False`). For the common envelope path,
+    /// prefer `expect_migration`.
+    #[pyo3(signature = (kind, identity, config=None))]
+    fn register_migration_target_identity(
+        &self,
+        kind: String,
+        identity: &crate::identity::Identity,
+        config: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        let sdk_identity = identity.to_sdk_identity();
+        let cfg = daemon_host_config_from_dict(config)?;
+        self.inner
+            .register_migration_target_identity(&kind, sdk_identity, cfg)
+            .map_err(daemon_err_from_sdk)
+    }
+
+    /// Query the orchestrator's current migration phase for
+    /// `origin_hash`, returned as a string
+    /// (`snapshot` | `transfer` | `restore` | `replay` |
+    /// `cutover` | `complete`) or `None` if no migration is in
+    /// flight for that origin.
+    fn migration_phase(&self, origin_hash: u32) -> Option<&'static str> {
+        self.inner.migration_phase(origin_hash).map(migration_phase_str)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "DaemonRuntime(ready={}, daemons={})",
             self.inner.is_ready(),
             self.inner.daemon_count()
         )
+    }
+}
+
+// =========================================================================
+// PyMigrationHandle — observe and abort an in-flight migration
+// =========================================================================
+
+/// Handle to an in-flight migration. Returned by
+/// `DaemonRuntime.start_migration` /
+/// `DaemonRuntime.start_migration_with`.
+///
+/// Dropping the handle does NOT cancel the migration — the
+/// orchestrator keeps driving it to completion in the background.
+/// Keep the handle to observe phase transitions or request abort.
+#[pyclass(name = "MigrationHandle", module = "net._net")]
+pub struct PyMigrationHandle {
+    origin_hash: u32,
+    source_node: u64,
+    target_node: u64,
+    inner: SdkMigrationHandle,
+    runtime: Arc<Runtime>,
+}
+
+impl PyMigrationHandle {
+    fn from_sdk(handle: SdkMigrationHandle, runtime: Arc<Runtime>) -> Self {
+        Self {
+            origin_hash: handle.origin_hash,
+            source_node: handle.source_node,
+            target_node: handle.target_node,
+            inner: handle,
+            runtime,
+        }
+    }
+}
+
+#[pymethods]
+impl PyMigrationHandle {
+    /// 32-bit origin hash of the daemon being migrated.
+    #[getter]
+    fn origin_hash(&self) -> u32 {
+        self.origin_hash
+    }
+
+    /// Source node ID (currently hosting the daemon).
+    #[getter]
+    fn source_node(&self) -> u64 {
+        self.source_node
+    }
+
+    /// Target node ID (post-cutover).
+    #[getter]
+    fn target_node(&self) -> u64 {
+        self.target_node
+    }
+
+    /// Current migration phase, or `None` once the migration has
+    /// left the orchestrator's records (terminal success or
+    /// abort). Callers distinguish success from abort by
+    /// remembering the last non-None phase they observed.
+    fn phase(&self) -> Option<&'static str> {
+        self.inner.phase().map(migration_phase_str)
+    }
+
+    /// Block until the migration reaches a terminal state.
+    /// Returns on `complete`; raises `MigrationError` on abort
+    /// or structured failure. No wall-clock timeout — use
+    /// `wait_with_timeout` for a bound.
+    fn wait(&self, py: Python<'_>) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let runtime = self.runtime.clone();
+        py.detach(move || {
+            runtime
+                .block_on(async move { inner.wait().await })
+                .map_err(daemon_err_from_sdk)
+        })
+    }
+
+    /// Like `wait` with a caller-controlled timeout in
+    /// milliseconds. On timeout, the orchestrator record is
+    /// aborted and the call raises `MigrationError`.
+    fn wait_with_timeout(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let runtime = self.runtime.clone();
+        py.detach(move || {
+            runtime
+                .block_on(async move {
+                    inner
+                        .wait_with_timeout(std::time::Duration::from_millis(timeout_ms))
+                        .await
+                })
+                .map_err(daemon_err_from_sdk)
+        })
+    }
+
+    /// Request cancellation of the migration. Best-effort: past
+    /// `cutover`, the routing flip cannot be undone cleanly, and
+    /// this call resolves without aborting.
+    fn cancel(&self, py: Python<'_>) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let runtime = self.runtime.clone();
+        py.detach(move || {
+            runtime
+                .block_on(async move { inner.cancel().await })
+                .map_err(daemon_err_from_sdk)
+        })
+    }
+
+    /// Return a sync iterator that yields each distinct migration
+    /// phase as the orchestrator transitions through them, and
+    /// terminates (via `StopIteration`) once the migration
+    /// reaches a terminal state. 50 ms polling cadence — the
+    /// same cadence used by the SDK's `wait()`.
+    ///
+    /// **Call-site ordering:** iterate as soon as the handle is
+    /// returned. If you call `wait()` first and then iterate,
+    /// the orchestrator record may already be cleared and the
+    /// iterator yields nothing.
+    fn phases(&self) -> PyMigrationPhasesIter {
+        PyMigrationPhasesIter {
+            inner: self.inner.clone(),
+            last: None,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "MigrationHandle(origin_hash={:#x}, source={:#x}, target={:#x})",
+            self.origin_hash, self.source_node, self.target_node,
+        )
+    }
+}
+
+// =========================================================================
+// PyMigrationPhasesIter — sync iterator over migration phases
+// =========================================================================
+
+/// Sync iterator returned by `MigrationHandle.phases()`. Each
+/// `__next__` polls the orchestrator and yields the current
+/// phase when it differs from the previously yielded one.
+/// Raises `StopIteration` when the orchestrator clears its
+/// record (terminal success or abort).
+#[pyclass(name = "MigrationPhasesIter", module = "net._net")]
+pub struct PyMigrationPhasesIter {
+    inner: SdkMigrationHandle,
+    last: Option<&'static str>,
+}
+
+#[pymethods]
+impl PyMigrationPhasesIter {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<&'static str> {
+        // Poll loop — block on 50 ms sleeps with the GIL
+        // released, so other Python threads can run while we
+        // wait. Exit when the orchestrator clears its record
+        // (phase goes to None) or when a new distinct phase
+        // shows up.
+        loop {
+            let current = self.inner.phase().map(migration_phase_str);
+            match current {
+                None => return Err(pyo3::exceptions::PyStopIteration::new_err(())),
+                Some(phase) => {
+                    if Some(phase) != self.last {
+                        self.last = Some(phase);
+                        return Ok(phase);
+                    }
+                    py.detach(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    });
+                }
+            }
+        }
     }
 }
 

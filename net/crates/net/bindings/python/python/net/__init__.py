@@ -161,10 +161,55 @@ else:
 # Compute runtime surface. Present iff the native module was built
 # with the `compute` feature. Stage 5 of SDK_COMPUTE_SURFACE_PLAN.md.
 try:
-    from ._net import DaemonRuntime, DaemonHandle, CausalEvent
+    from ._net import (
+        CausalEvent,
+        DaemonError,
+        DaemonHandle,
+        DaemonRuntime,
+        MigrationError,
+        MigrationHandle,
+    )
 except ImportError:
     pass
 else:
-    __all__.extend(["DaemonRuntime", "DaemonHandle", "CausalEvent"])
+    __all__.extend(
+        [
+            "CausalEvent",
+            "DaemonError",
+            "DaemonHandle",
+            "DaemonRuntime",
+            "MigrationError",
+            "MigrationHandle",
+            "migration_error_kind",
+        ]
+    )
+
+    def migration_error_kind(exc: "MigrationError") -> str | None:
+        """Extract the migration-failure kind from a caught
+        ``MigrationError``.
+
+        The Rust side encodes migration failures as messages of the form
+        ``"daemon: migration: <kind>[: <detail>]"``. This helper parses
+        the kind out so callers can dispatch programmatically::
+
+            try:
+                migration.wait()
+            except MigrationError as e:
+                kind = migration_error_kind(e)
+                if kind == "not-ready":
+                    # ...retriable...
+                elif kind == "factory-not-found":
+                    # ...terminal, target mis-configured...
+
+        Returns ``None`` if the message doesn't start with the expected
+        prefix (shouldn't happen for exceptions raised by this module).
+        """
+        msg = str(exc)
+        prefix = "daemon: migration:"
+        if not msg.startswith(prefix):
+            return None
+        body = msg[len(prefix) :].strip()
+        colon = body.find(":")
+        return body if colon == -1 else body[:colon].strip()
 
 __version__ = "0.1.0"
