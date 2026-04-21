@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/subprotocol/migration_handler.rs
+  5bf3f089eecaef7a 926-936,945-966,1461-1558
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "8438fd6e4bff94d452c9e738f923e2b1109d5b1d",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 1610,
+      "total_deletions": 33,
+      "accepted_lines": 131,
+      "overriden_lines": 0
+    }
+  }
+}
