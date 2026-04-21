@@ -286,6 +286,149 @@ async fn ledger_rides_snapshot_through_migration() {
     };
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_replay_rebinds_subscriptions_on_target_after_migration() {
+    // Stage 3: after a migration Completes, the target's ledger is
+    // rehydrated AND the target's DaemonRuntime has auto-invoked
+    // `mesh.subscribe_channel(...)` for every binding so the
+    // publisher's roster now includes the target node. We observe
+    // this via the publisher's `roster.has_subscriber(channel,
+    // target_node_id)` after letting the rebind task run.
+    let trio = build_trio().await;
+    let Trio {
+        source_rt,
+        target_rt,
+        publisher,
+    } = &trio;
+    source_rt
+        .register_factory("echo-counter", echo_factory())
+        .unwrap();
+    target_rt
+        .register_factory("echo-counter", echo_factory())
+        .unwrap();
+    source_rt.start().await.unwrap();
+    target_rt.start().await.unwrap();
+    source_rt.mesh().inner().start();
+    target_rt.mesh().inner().start();
+    publisher.inner().start();
+    sleep(Duration::from_millis(100)).await;
+
+    let channel = ChannelName::new("lab/streams").unwrap();
+    publisher.register_channel(
+        ChannelConfig::new(ChannelId::new(channel.clone())).with_visibility(Visibility::Global),
+    );
+
+    let identity = Identity::generate();
+    let handle = source_rt
+        .spawn(
+            "echo-counter",
+            identity.clone(),
+            DaemonHostConfig::default(),
+        )
+        .await
+        .expect("spawn");
+
+    source_rt
+        .subscribe_channel(
+            handle.origin_hash,
+            publisher.inner().node_id(),
+            channel.clone(),
+            None,
+        )
+        .await
+        .expect("source-side subscribe");
+
+    // Publisher initially sees ONLY the source node in the roster.
+    let channel_id = ChannelId::new(channel.clone());
+    let pre_migration = publisher
+        .inner()
+        .roster()
+        .members(&channel_id)
+        .contains(&source_rt.mesh().inner().node_id());
+    assert!(pre_migration, "publisher must see source as subscriber pre-migration");
+
+    target_rt
+        .register_migration_target_identity(
+            "echo-counter",
+            identity,
+            DaemonHostConfig::default(),
+        )
+        .expect("pre-register target");
+
+    let mig = source_rt
+        .start_migration(
+            handle.origin_hash,
+            source_rt.mesh().inner().node_id(),
+            target_rt.mesh().inner().node_id(),
+        )
+        .await
+        .expect("start_migration");
+    mig.wait_with_timeout(Duration::from_secs(5))
+        .await
+        .expect("migration Complete");
+
+    // Give the auto-replay tokio task a beat to finish its
+    // subscribe round-trip to the publisher.
+    let target_node = target_rt.mesh().inner().node_id();
+    let source_node = source_rt.mesh().inner().node_id();
+    let arrived = wait_until(
+        Duration::from_secs(2),
+        Duration::from_millis(50),
+        || {
+            publisher
+                .inner()
+                .roster()
+                .members(&channel_id)
+                .contains(&target_node)
+        },
+    )
+    .await;
+    assert!(
+        arrived,
+        "publisher must see target as subscriber after auto-replay — \
+         channel re-bind didn't complete on migration",
+    );
+
+    // Stage 4: after Cutover, the source's pre-cleanup callback
+    // sent Unsubscribe to the publisher. The publisher's roster
+    // should drop the source node within a short window — without
+    // the teardown it would linger until session timeout (~30 s).
+    let source_gone = wait_until(
+        Duration::from_secs(2),
+        Duration::from_millis(50),
+        || {
+            !publisher
+                .inner()
+                .roster()
+                .members(&channel_id)
+                .contains(&source_node)
+        },
+    )
+    .await;
+    assert!(
+        source_gone,
+        "publisher's roster must drop the source promptly after \
+         Cutover — source-side Unsubscribe teardown didn't fire",
+    );
+}
+
+async fn wait_until<F: FnMut() -> bool>(
+    total: Duration,
+    step: Duration,
+    mut cond: F,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + total;
+    loop {
+        if cond() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        sleep(step).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_ledger_produces_no_bindings_bytes_overhead() {
     let mesh = MeshBuilder::new("127.0.0.1:0", &PSK)

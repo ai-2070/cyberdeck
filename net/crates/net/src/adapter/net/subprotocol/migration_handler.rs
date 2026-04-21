@@ -66,6 +66,30 @@ pub struct OutboundMigrationMessage {
 ///
 /// Routes each message type to the orchestrator, source handler, or target
 /// handler as appropriate, and produces outbound response messages.
+/// Callback fired after the target-side dispatcher successfully
+/// restores a daemon from a migration snapshot. Invoked with the
+/// daemon's `origin_hash`. Used by the SDK to drive channel
+/// re-bind replay (`DAEMON_CHANNEL_REBIND_PLAN.md` Stage 3): the
+/// callback walks the restored daemon's subscription ledger and
+/// spawns asynchronous `subscribe_channel` calls so publishers
+/// start fanning out to the target before the source tears down.
+///
+/// The callback runs synchronously on the dispatcher thread; it
+/// should kick off any async work via `tokio::spawn` rather than
+/// blocking the dispatch loop.
+pub type PostRestoreCallback = Arc<dyn Fn(u32) + Send + Sync>;
+
+/// Callback fired on the source side at `CutoverNotify` handling,
+/// immediately before `source_handler.cleanup` unregisters the
+/// daemon. Stage 4 of `DAEMON_CHANNEL_REBIND_PLAN.md`: the SDK's
+/// hook snapshots the daemon's subscription ledger here and spawns
+/// async `unsubscribe_channel` calls to each publisher so rosters
+/// drop the source immediately rather than aging out over the
+/// session-timeout window.
+///
+/// Sync on the dispatcher thread; async work must `tokio::spawn`.
+pub type PreCleanupCallback = Arc<dyn Fn(u32) + Send + Sync>;
+
 pub struct MigrationSubprotocolHandler {
     orchestrator: Arc<MigrationOrchestrator>,
     source_handler: Arc<MigrationSourceHandler>,
@@ -81,6 +105,16 @@ pub struct MigrationSubprotocolHandler {
     /// Identity-transport context. `None` = envelopes ignored
     /// (pre-identity-envelope fallback).
     identity_context: Option<MigrationIdentityContext>,
+    /// Post-restore callback, fired on the target side after
+    /// `restore_snapshot` succeeds. Used by the SDK to drive
+    /// subscription replay. `None` = no hook (used by tests and
+    /// pre-Stage-3 callers).
+    post_restore_callback: Option<PostRestoreCallback>,
+    /// Pre-cleanup callback, fired on the source side at
+    /// `CutoverNotify` handling just before the daemon is
+    /// unregistered. Drives source-side Unsubscribe teardown
+    /// (Stage 4 of the channel re-bind plan). `None` = no hook.
+    pre_cleanup_callback: Option<PreCleanupCallback>,
 }
 
 impl MigrationSubprotocolHandler {
@@ -113,6 +147,53 @@ impl MigrationSubprotocolHandler {
         local_node_id: u64,
         identity_context: Option<MigrationIdentityContext>,
     ) -> Self {
+        Self::new_with_hooks(
+            orchestrator,
+            source_handler,
+            target_handler,
+            local_node_id,
+            identity_context,
+            None,
+        )
+    }
+
+    /// Create a new handler with both an identity-transport context
+    /// and a post-restore callback. Convenience alias for
+    /// [`Self::new_with_all_hooks`] with the pre-cleanup callback
+    /// unset — callers that need both hooks should use the fuller
+    /// constructor.
+    pub fn new_with_hooks(
+        orchestrator: Arc<MigrationOrchestrator>,
+        source_handler: Arc<MigrationSourceHandler>,
+        target_handler: Arc<MigrationTargetHandler>,
+        local_node_id: u64,
+        identity_context: Option<MigrationIdentityContext>,
+        post_restore_callback: Option<PostRestoreCallback>,
+    ) -> Self {
+        Self::new_with_all_hooks(
+            orchestrator,
+            source_handler,
+            target_handler,
+            local_node_id,
+            identity_context,
+            post_restore_callback,
+            None,
+        )
+    }
+
+    /// Create a handler with every hook populated: identity context,
+    /// post-restore callback (target-side subscription replay), and
+    /// pre-cleanup callback (source-side unsubscribe teardown).
+    /// Used by the SDK's `DaemonRuntime::start`.
+    pub fn new_with_all_hooks(
+        orchestrator: Arc<MigrationOrchestrator>,
+        source_handler: Arc<MigrationSourceHandler>,
+        target_handler: Arc<MigrationTargetHandler>,
+        local_node_id: u64,
+        identity_context: Option<MigrationIdentityContext>,
+        post_restore_callback: Option<PostRestoreCallback>,
+        pre_cleanup_callback: Option<PreCleanupCallback>,
+    ) -> Self {
         Self {
             orchestrator,
             source_handler,
@@ -120,6 +201,8 @@ impl MigrationSubprotocolHandler {
             local_node_id,
             reassemblers: DashMap::new(),
             identity_context,
+            post_restore_callback,
+            pre_cleanup_callback,
         }
     }
 
@@ -367,6 +450,19 @@ impl MigrationSubprotocolHandler {
                     .orchestrator_node(daemon_origin)
                     .unwrap_or(from_node);
 
+                // Fire the pre-cleanup callback BEFORE unregistering
+                // the daemon — the host still holds the subscription
+                // ledger, which the SDK's hook snapshots here so it
+                // can send `Unsubscribe` messages to every publisher
+                // after cleanup. This is Stage 4 of the channel
+                // re-bind plan: without it, the publishers' rosters
+                // keep pointing at the source until their session
+                // timeout (~30 s), causing duplicate deliveries to
+                // a now-gone daemon and unnecessary bandwidth.
+                if let Some(cb) = &self.pre_cleanup_callback {
+                    cb(daemon_origin);
+                }
+
                 // Cleanup source — also tolerant of missing source_handler
                 // state, and unregisters the local daemon even if no
                 // `source_handler.start_snapshot` was called.
@@ -605,6 +701,17 @@ impl MigrationSubprotocolHandler {
                     from_node,
                     &format!("restore_snapshot failed: {:?}", e),
                 )?));
+            }
+
+            // Fire the post-restore callback. The SDK-supplied hook
+            // drives channel re-bind replay (Stage 3 of the channel
+            // re-bind plan): walks the restored daemon's ledger and
+            // spawns async `subscribe_channel` calls so publishers
+            // start fanning out to the target before the source
+            // tears down. Sync callback; the hook itself should
+            // `tokio::spawn` the actual work.
+            if let Some(cb) = &self.post_restore_callback {
+                cb(daemon_origin);
             }
         }
 

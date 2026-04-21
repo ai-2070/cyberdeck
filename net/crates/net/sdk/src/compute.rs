@@ -67,7 +67,8 @@ use ::net::adapter::net::compute::{
 };
 use ::net::adapter::net::identity::EntityId;
 use ::net::adapter::net::subprotocol::{
-    MigrationIdentityContext, MigrationSubprotocolHandler,
+    MigrationIdentityContext, MigrationSubprotocolHandler, PostRestoreCallback,
+    PreCleanupCallback,
 };
 
 use crate::identity::Identity;
@@ -253,13 +254,17 @@ impl DaemonRuntime {
                     if swap.is_ok() {
                         // Install the migration subprotocol handler —
                         // this is the runtime's one-time side effect
-                        // on the underlying `Mesh`. Constructed with
-                        // an `IdentityContext` derived from the
-                        // mesh's own Noise static key + the
-                        // `peer_static_x25519` accessor so the
-                        // dispatcher can auto-seal envelopes on the
-                        // source path and auto-open them on the
-                        // target path.
+                        // on the underlying `Mesh`. Constructed with:
+                        //
+                        // - `IdentityContext`: auto-seal envelopes on
+                        //   source, auto-open on target (Stage 5b of
+                        //   the identity-migration plan).
+                        // - `PostRestoreCallback`: fires subscription
+                        //   replay on the target after a successful
+                        //   restore (Stage 3 of the channel-re-bind
+                        //   plan). Walks the restored daemon's
+                        //   ledger and spawns async
+                        //   `subscribe_channel` calls.
                         let local_node_id = self.inner.mesh.inner().node_id();
                         let mesh_for_lookup = self.inner.mesh.clone();
                         let ctx = MigrationIdentityContext {
@@ -268,13 +273,47 @@ impl DaemonRuntime {
                                 mesh_for_lookup.inner().peer_static_x25519(node_id)
                             }),
                         };
-                        let handler = Arc::new(MigrationSubprotocolHandler::new_with_identity(
-                            self.inner.orchestrator.clone(),
-                            self.inner.source_handler.clone(),
-                            self.inner.target_handler.clone(),
-                            local_node_id,
-                            Some(ctx),
-                        ));
+                        let inner_for_rebind = self.inner.clone();
+                        let post_restore: PostRestoreCallback =
+                            Arc::new(move |origin_hash: u32| {
+                                let inner = inner_for_rebind.clone();
+                                tokio::spawn(async move {
+                                    replay_subscriptions(inner, origin_hash).await;
+                                });
+                            });
+                        let inner_for_teardown = self.inner.clone();
+                        let pre_cleanup: PreCleanupCallback =
+                            Arc::new(move |origin_hash: u32| {
+                                // Snapshot the ledger BEFORE cleanup
+                                // drops the host — after that, the
+                                // ledger is gone. Spawn async
+                                // unsubscribes so the dispatcher
+                                // thread returns immediately.
+                                let bindings = inner_for_teardown
+                                    .registry
+                                    .with_host(origin_hash, |host| {
+                                        host.bindings_snapshot().subscriptions
+                                    })
+                                    .unwrap_or_default();
+                                if bindings.is_empty() {
+                                    return;
+                                }
+                                let inner = inner_for_teardown.clone();
+                                tokio::spawn(async move {
+                                    teardown_subscriptions(inner, bindings).await;
+                                });
+                            });
+                        let handler = Arc::new(
+                            MigrationSubprotocolHandler::new_with_all_hooks(
+                                self.inner.orchestrator.clone(),
+                                self.inner.source_handler.clone(),
+                                self.inner.target_handler.clone(),
+                                local_node_id,
+                                Some(ctx),
+                                Some(post_restore),
+                                Some(pre_cleanup),
+                            ),
+                        );
                         self.inner.mesh.inner().set_migration_handler(handler);
                         return Ok(());
                     }
@@ -873,6 +912,87 @@ impl std::fmt::Debug for DaemonHandle {
             .field("origin_hash", &format_args!("{:#x}", self.origin_hash))
             .field("entity_id", &self.entity_id)
             .finish()
+    }
+}
+
+/// Stage 3 of `DAEMON_CHANNEL_REBIND_PLAN.md` — after a migration
+/// target restores a daemon, walk its subscription ledger and
+/// re-send each `subscribe_channel` to the matching publisher so
+/// messages flow to the target without waiting for the source's
+/// entry to age out of the publisher's roster. Errors are
+/// per-subscription; one publisher being offline doesn't fail the
+/// rest.
+///
+/// Runs in a tokio task spawned by the post-restore callback
+/// installed on `MigrationSubprotocolHandler`.
+async fn replay_subscriptions(inner: Arc<Inner>, origin_hash: u32) {
+    let bindings = match inner
+        .registry
+        .with_host(origin_hash, |host| host.bindings_snapshot().subscriptions)
+    {
+        Ok(list) => list,
+        Err(_) => return,
+    };
+    for sub in bindings {
+        let token = sub
+            .token_bytes
+            .as_deref()
+            .and_then(|bytes| PermissionToken::from_bytes(bytes).ok());
+        let result = match token {
+            Some(tok) => {
+                inner
+                    .mesh
+                    .inner()
+                    .subscribe_channel_with_token(sub.publisher, sub.channel.clone(), tok)
+                    .await
+            }
+            None => {
+                inner
+                    .mesh
+                    .inner()
+                    .subscribe_channel(sub.publisher, sub.channel.clone())
+                    .await
+            }
+        };
+        if let Err(e) = result {
+            // Non-fatal: one subscription failing (publisher
+            // offline, token expired, etc.) must not take down the
+            // rest of the ledger's replay. The SDK doesn't depend
+            // on `tracing`; drop the failure to stderr via
+            // `eprintln!` so operators running `RUST_LOG=warn`
+            // still see it. Future work can add a `ReplayPartial`
+            // event on the migration phase stream (plan §
+            // *Error surface*) to surface failures programmatically.
+            eprintln!(
+                "channel re-bind replay failed: daemon={:#x} channel={} publisher={:#x} error={}",
+                origin_hash, sub.channel, sub.publisher, e,
+            );
+        }
+    }
+}
+
+/// Stage 4 of `DAEMON_CHANNEL_REBIND_PLAN.md` — fires at `Cutover`
+/// on the source node (just before daemon cleanup). Walks the
+/// daemon's ledger and sends `unsubscribe_channel` to each
+/// publisher so rosters drop the source without waiting for
+/// session-timeout (~30 s). Fire-and-forget: we don't block the
+/// cutover dispatch on acks.
+async fn teardown_subscriptions(inner: Arc<Inner>, bindings: Vec<SubscriptionBinding>) {
+    for sub in bindings {
+        if let Err(e) = inner
+            .mesh
+            .inner()
+            .unsubscribe_channel(sub.publisher, sub.channel.clone())
+            .await
+        {
+            // Non-fatal; the publisher's session timeout will
+            // eventually clean up our stale roster entry even
+            // without an explicit Unsubscribe.
+            eprintln!(
+                "channel re-bind teardown failed: channel={} publisher={:#x} error={}",
+                sub.channel, sub.publisher, e,
+            );
+        }
     }
 }
 
