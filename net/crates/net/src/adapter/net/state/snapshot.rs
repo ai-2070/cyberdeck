@@ -22,7 +22,9 @@ use bytes::{Buf, Bytes};
 
 use super::causal::CausalLink;
 use super::horizon::ObservedHorizon;
-use crate::adapter::net::identity::{EntityId, IdentityEnvelope, IDENTITY_ENVELOPE_SIZE};
+use crate::adapter::net::identity::{
+    EntityId, EntityKeypair, IdentityEnvelope, IDENTITY_ENVELOPE_SIZE,
+};
 
 /// 4-byte magic prefix for v1 snapshots. v0's first 4 bytes are the
 /// first 32 bytes of an `EntityId` (arbitrary); this ASCII marker is
@@ -93,6 +95,62 @@ impl StateSnapshot {
             created_at: current_timestamp(),
             bindings_bytes: Vec::new(),
             identity_envelope: None,
+        }
+    }
+
+    /// Attach an identity envelope sealed to `target_static_pub`,
+    /// returning `self` by value so the call chains cleanly off
+    /// [`Self::new`] / the source's snapshot-build path.
+    ///
+    /// Fails with
+    /// [`EnvelopeError::SourceReadOnly`](crate::adapter::net::identity::EnvelopeError::SourceReadOnly)
+    /// when `source_kp` is public-only — a public-only caller can't
+    /// produce the attestation signature the target needs to verify.
+    /// The attestation transcript binds to `self.chain_link`, so the
+    /// resulting envelope is non-replayable at a different migration
+    /// point.
+    pub fn with_identity_envelope(
+        mut self,
+        source_kp: &EntityKeypair,
+        target_static_pub: [u8; 32],
+    ) -> Result<Self, crate::adapter::net::identity::EnvelopeError> {
+        let env = IdentityEnvelope::new(source_kp, target_static_pub, &self.chain_link)?;
+        self.identity_envelope = Some(env);
+        Ok(self)
+    }
+
+    /// Open the attached identity envelope (if any) using the
+    /// target's X25519 static private key. Returns the daemon's
+    /// fully-keyed [`EntityKeypair`], which the target-side
+    /// restore path uses instead of the caller-supplied fallback.
+    ///
+    /// Returns `Ok(None)` when the snapshot has no envelope —
+    /// callers interpret this as "public-identity migration, target
+    /// gets a read-only keypair." Returns `Err` if the envelope is
+    /// present but fails to verify / unseal; callers must treat
+    /// that as a terminal error, not a fallback trigger, or an
+    /// attacker could downgrade identity transport by tampering.
+    pub fn open_identity_envelope(
+        &self,
+        target_x25519_priv: &x25519_dalek::StaticSecret,
+    ) -> Result<Option<EntityKeypair>, crate::adapter::net::identity::EnvelopeError> {
+        match &self.identity_envelope {
+            None => Ok(None),
+            Some(env) => {
+                let kp = env.open(target_x25519_priv, &self.chain_link)?;
+                // Belt-and-braces: the decrypted keypair's
+                // `origin_hash` must match the snapshot's
+                // `entity_id`. `IdentityEnvelope::open` already
+                // checks that the decrypted pub matches the
+                // envelope's `signer_pub`, but the snapshot's
+                // `entity_id` is a second, separately-signed
+                // commitment that the decrypted identity must
+                // also match.
+                if kp.entity_id() != &self.entity_id {
+                    return Err(crate::adapter::net::identity::EnvelopeError::OriginHashMismatch);
+                }
+                Ok(Some(kp))
+            }
         }
     }
 
@@ -608,6 +666,121 @@ mod tests {
         // version — decoder must refuse rather than mis-parse.
         bytes[4] = 0xFE;
         assert!(StateSnapshot::from_bytes(&bytes).is_none());
+    }
+
+    // ---- Identity-envelope end-to-end (Stage 5) ----
+
+    fn fresh_x25519() -> (x25519_dalek::StaticSecret, [u8; 32]) {
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).unwrap();
+        let sk = x25519_dalek::StaticSecret::from(seed);
+        let pk = x25519_dalek::PublicKey::from(&sk);
+        (sk, *pk.as_bytes())
+    }
+
+    #[test]
+    fn envelope_roundtrip_seals_and_opens_through_wire() {
+        // Full migration-primitive slice: source builds a snapshot,
+        // seals its daemon keypair to the target's X25519 pubkey,
+        // serializes, ships bytes, target deserializes, opens the
+        // envelope with its X25519 private key, recovers the same
+        // daemon keypair (including the ability to sign).
+        let daemon_kp = EntityKeypair::generate();
+        let entity_id = daemon_kp.entity_id().clone();
+        let mut builder = CausalChainBuilder::new(daemon_kp.origin_hash());
+        builder.append(Bytes::from_static(b"event"), 0).unwrap();
+
+        let (target_priv, target_pub) = fresh_x25519();
+
+        let snapshot = StateSnapshot::new(
+            entity_id.clone(),
+            *builder.head(),
+            Bytes::from_static(b"daemon state"),
+            ObservedHorizon::new(),
+        )
+        .with_identity_envelope(&daemon_kp, target_pub)
+        .expect("seal");
+
+        // Round-trip through bytes (simulating the wire).
+        let bytes = snapshot.to_bytes();
+        let received = StateSnapshot::from_bytes(&bytes).expect("decode");
+        assert!(received.identity_envelope.is_some());
+
+        // Target opens with its X25519 private key.
+        let recovered = received
+            .open_identity_envelope(&target_priv)
+            .expect("open")
+            .expect("envelope present");
+
+        // Full round-trip: the recovered keypair has the same
+        // identity AND a working signing half.
+        assert_eq!(recovered.entity_id(), &entity_id);
+        assert_eq!(recovered.origin_hash(), daemon_kp.origin_hash());
+        assert!(!recovered.is_read_only());
+        let sig = recovered.sign(b"post-migration");
+        assert!(entity_id.verify(b"post-migration", &sig).is_ok());
+    }
+
+    #[test]
+    fn envelope_open_on_snapshot_without_envelope_returns_none() {
+        let kp = EntityKeypair::generate();
+        let snapshot = StateSnapshot::new(
+            kp.entity_id().clone(),
+            CausalLink::genesis(kp.origin_hash(), 0),
+            Bytes::from_static(b"s"),
+            ObservedHorizon::new(),
+        );
+
+        let (target_priv, _) = fresh_x25519();
+        let opened = snapshot
+            .open_identity_envelope(&target_priv)
+            .expect("no envelope is not an error");
+        assert!(opened.is_none(), "public-identity migration: target gets None");
+    }
+
+    #[test]
+    fn envelope_open_rejects_wrong_entity_id() {
+        // Belt-and-braces: the snapshot commits to a specific
+        // entity_id independently of the envelope's attestation. If
+        // the envelope's attested `signer_pub` doesn't match the
+        // snapshot's `entity_id`, `open_identity_envelope` must
+        // reject — otherwise an attacker who compromises the
+        // envelope-sealing path could still be caught by the
+        // snapshot-level identity commitment.
+        let real_daemon = EntityKeypair::generate();
+        let impostor = EntityKeypair::generate();
+        let (target_priv, target_pub) = fresh_x25519();
+
+        let mut builder = CausalChainBuilder::new(real_daemon.origin_hash());
+        builder.append(Bytes::from_static(b"e"), 0).unwrap();
+
+        // Snapshot commits to `real_daemon`'s entity_id…
+        let mut snapshot = StateSnapshot::new(
+            real_daemon.entity_id().clone(),
+            *builder.head(),
+            Bytes::from_static(b"s"),
+            ObservedHorizon::new(),
+        );
+
+        // …but an envelope is built from the impostor's keypair.
+        // Can't happen through `with_identity_envelope` (which uses
+        // the snapshot's own daemon keypair), so we construct
+        // manually to simulate a tampered wire payload.
+        let env = IdentityEnvelope::new(&impostor, target_pub, &snapshot.chain_link)
+            .expect("impostor can still seal their own keypair");
+        snapshot.identity_envelope = Some(env);
+
+        // Fix up chain_link's origin_hash so the snapshot's own
+        // consistency check (origin_hash == entity_id.origin_hash)
+        // still passes — the point of this test is the
+        // envelope-vs-entity_id mismatch, not the chain check.
+        assert_eq!(snapshot.chain_link.origin_hash, snapshot.entity_id.origin_hash());
+
+        let err = snapshot
+            .open_identity_envelope(&target_priv)
+            .expect_err("impostor envelope must be rejected");
+        use crate::adapter::net::identity::EnvelopeError;
+        assert_eq!(err, EnvelopeError::OriginHashMismatch);
     }
 
     #[test]

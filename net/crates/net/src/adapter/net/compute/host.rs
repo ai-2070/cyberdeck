@@ -177,6 +177,19 @@ impl DaemonHost {
         self.keypair.origin_hash()
     }
 
+    /// Read-only access to the daemon's keypair.
+    ///
+    /// Migration uses this to seal the daemon's ed25519 seed into
+    /// an [`IdentityEnvelope`] before shipping the snapshot. The
+    /// keypair may be public-only (see
+    /// [`EntityKeypair::is_read_only`]) — sealing a public-only
+    /// keypair is a logic error handled by
+    /// [`IdentityEnvelope::new`], not here.
+    #[inline]
+    pub fn keypair(&self) -> &EntityKeypair {
+        &self.keypair
+    }
+
     /// Get the daemon's capability requirements.
     #[inline]
     pub fn requirements(&self) -> CapabilityFilter {

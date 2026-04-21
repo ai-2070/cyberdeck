@@ -10,6 +10,6 @@ mod origin;
 mod token;
 
 pub use entity::{EntityError, EntityId, EntityKeypair};
-pub use envelope::{IdentityEnvelope, IDENTITY_ENVELOPE_SIZE};
+pub use envelope::{EnvelopeError, IdentityEnvelope, IDENTITY_ENVELOPE_SIZE};
 pub use origin::OriginStamp;
 pub use token::{PermissionToken, TokenCache, TokenError, TokenScope};
