@@ -705,8 +705,11 @@ pub struct CapabilityAnnouncement {
     pub capabilities: CapabilitySet,
     /// Optional Ed25519 signature (64 bytes, hex encoded for serde).
     /// Covers every other field EXCEPT [`Self::hop_count`] — the
-    /// signed payload zeros `hop_count` so forwarders can increment
-    /// it without breaking verification. See [`Self::signed_payload`].
+    /// internal signing helper zeros `hop_count` before serializing
+    /// and hashing, so forwarders can increment it without
+    /// invalidating this signature. See [`Self::sign`] /
+    /// [`Self::verify`] for the public API; the zeroing is an
+    /// implementation detail of both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Signature64>,
     /// Number of times this announcement has been forwarded. Origin
