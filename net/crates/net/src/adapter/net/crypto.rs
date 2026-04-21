@@ -436,7 +436,7 @@ impl ReplayWindow {
                 } else {
                     0
                 };
-                let lo = if i >= word_shift + 1 {
+                let lo = if i > word_shift {
                     self.bitmap[i - word_shift - 1] >> (64 - bit_shift)
                 } else {
                     0
