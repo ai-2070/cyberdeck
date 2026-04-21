@@ -1,0 +1,40 @@
+net/crates/net/src/adapter/net/behavior/capability.rs
+  5bf3f089eecaef7a 719-728,732-739,1808-1937
+net/crates/net/bindings/go/net/identity.go
+  5bf3f089eecaef7a 243-249,450-460
+net/crates/net/docs/MULTIHOP_CAPABILITY_PLAN.md
+  5bf3f089eecaef7a 5-16,256-281
+net/crates/net/bindings/go/net/identity_test.go
+  5bf3f089eecaef7a 13,484-534
+net/crates/net/sdk-ts/test/channel_auth.test.ts
+  5bf3f089eecaef7a 143-152,184-190
+net/crates/net/sdk-ts/README.md
+  5bf3f089eecaef7a 187-189,316-326,341
+net/crates/net/README.md
+  5bf3f089eecaef7a 297
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "422fb60ab53de62d8e44fddf38e4125648651ee5",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 2532,
+      "total_deletions": 907,
+      "accepted_lines": 290,
+      "overriden_lines": 1
+    }
+  },
+  "humans": {
+    "h_fb620e726e1595": {
+      "author": "LZL0"
+    }
+  }
+}
