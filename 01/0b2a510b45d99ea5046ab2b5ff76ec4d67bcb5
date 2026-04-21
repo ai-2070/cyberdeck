@@ -1,0 +1,31 @@
+net/crates/net/sdk/src/compute.rs
+  5bf3f089eecaef7a 270-292,302-307,315-388,521-531,927-948,995-1011,1017-1022,1024,1026-1039,1503,1508-1516
+net/crates/net/src/adapter/net/compute/daemon_factory.rs
+  5bf3f089eecaef7a 87-88
+net/crates/net/sdk/tests/compute_runtime.rs
+  5bf3f089eecaef7a 293-470
+net/crates/net/src/adapter/net/subprotocol/migration_handler.rs
+  5bf3f089eecaef7a 46,58,137-138,319,832-849,855,857,863,866,876,878-882,1139-1303
+net/crates/net/src/adapter/net/mesh.rs
+  5bf3f089eecaef7a 1004-1005,1124-1132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "010b2a510b45d99ea5046ab2b5ff76ec4d67bcb5",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 5577,
+      "total_deletions": 10591,
+      "accepted_lines": 573,
+      "overriden_lines": 0
+    }
+  }
+}
