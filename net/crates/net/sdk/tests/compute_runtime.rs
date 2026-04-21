@@ -313,6 +313,16 @@ async fn spawn_same_identity_twice_is_rejected() {
     // Two daemons can't share the same origin_hash. The runtime
     // surfaces the core's `ProcessFailed` with a "already registered"
     // message as a `DaemonError::Core(_)`.
+    //
+    // Regression (Cubic AI P1): the duplicate spawn used to fail at
+    // the `DaemonRegistry::register` step *after* the factory_registry
+    // had already been silently clobbered by the second insert, so
+    // the rollback then removed the slot the *first* daemon was
+    // relying on. The first daemon would stay live in the registry
+    // but lose its factory entry — future migrations of that daemon
+    // would then fail to construct on the source. `DaemonFactoryRegistry::register`
+    // is now atomic-on-collision: we fail fast at the factory
+    // registration step, before the incumbent's slot is touched.
     let rt = runtime().await;
     rt.register_factory("echo", || Box::new(EchoDaemon))
         .expect("register");
@@ -324,12 +334,142 @@ async fn spawn_same_identity_twice_is_rejected() {
         .await
         .expect("first spawn");
     let err = rt
-        .spawn("echo", identity, DaemonHostConfig::default())
+        .spawn("echo", identity.clone(), DaemonHostConfig::default())
         .await
         .expect_err("second spawn with same identity must fail");
-    assert!(matches!(err, DaemonError::Core(_)), "got {err:?}");
-    // And the runtime still reports exactly one daemon.
+    // Core(ProcessFailed("... already registered")) is what the
+    // atomic factory_registry now returns. Anything else means the
+    // collision was caught at a later stage — i.e., the factory slot
+    // was clobbered first, which is exactly the regressed behavior.
+    match err {
+        DaemonError::Core(CoreDaemonError::ProcessFailed(ref m)) => {
+            assert!(
+                m.contains("already registered"),
+                "expected 'already registered' in message, got {m:?}",
+            );
+        }
+        other => panic!(
+            "expected Core(ProcessFailed(already registered)) from atomic factory_registry; \
+             got {other:?} — collision caught too late may mean the incumbent's slot was clobbered",
+        ),
+    }
+    // Runtime still reports exactly one daemon — the incumbent is
+    // untouched.
     assert_eq!(rt.daemon_count(), 1);
+
+    // Prove the incumbent's factory is still usable: stop it and
+    // re-spawn from snapshot via the same kind. Under the pre-fix
+    // behavior, the rollback had stripped the factory_registry entry,
+    // so on-mesh migration of this daemon would have failed with
+    // FactoryNotFound at restore time. spawn_from_snapshot uses the
+    // SDK-level kind map (not factory_registry), so this succeeds
+    // regardless — the real migration-side regression is covered by
+    // compute_migration::duplicate_spawn_preserves_migratability.
+    let snapshot = rt
+        .snapshot(identity.keypair().origin_hash())
+        .await
+        .expect("snapshot");
+    assert!(
+        snapshot.is_none(),
+        "EchoDaemon is stateless, so snapshot returns Ok(None)",
+    );
+}
+
+/// Regression: duplicate `spawn_from_snapshot` must not corrupt the
+/// incumbent's factory entry. Same root cause as
+/// [`spawn_same_identity_twice_is_rejected`] but exercised through
+/// the snapshot-rehydration path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_spawn_from_snapshot_does_not_corrupt_first_daemon() {
+    let rt = runtime().await;
+    rt.register_factory("counter", || Box::new(CounterDaemon { count: 0 }))
+        .expect("register");
+    rt.start().await.expect("start");
+
+    let identity = Identity::generate();
+    let handle = rt
+        .spawn("counter", identity.clone(), DaemonHostConfig::default())
+        .await
+        .expect("first spawn");
+    // Drive a few events so the snapshot is non-trivial.
+    for i in 1..=2u64 {
+        rt.deliver(
+            handle.origin_hash,
+            &event(handle.origin_hash, i, b"tick"),
+        )
+        .expect("deliver");
+    }
+    let snapshot = handle
+        .snapshot()
+        .await
+        .expect("snapshot")
+        .expect("counter is stateful");
+
+    // Duplicate spawn_from_snapshot with the same identity + the
+    // living daemon's snapshot. Fails at the atomic factory_registry
+    // step, before touching the incumbent's slot.
+    let err = rt
+        .spawn_from_snapshot(
+            "counter",
+            identity.clone(),
+            snapshot,
+            DaemonHostConfig::default(),
+        )
+        .await
+        .expect_err("duplicate spawn_from_snapshot must fail");
+    match err {
+        DaemonError::Core(CoreDaemonError::ProcessFailed(ref m)) => {
+            assert!(
+                m.contains("already registered"),
+                "expected 'already registered' in message, got {m:?}",
+            );
+        }
+        other => panic!("expected Core(ProcessFailed), got {other:?}"),
+    }
+    assert_eq!(rt.daemon_count(), 1);
+
+    // Incumbent still processes events — its state wasn't disturbed.
+    let outputs = rt
+        .deliver(
+            handle.origin_hash,
+            &event(handle.origin_hash, 3, b"post-dupe"),
+        )
+        .expect("deliver after failed duplicate");
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&outputs[0].payload);
+    assert_eq!(
+        u64::from_le_bytes(bytes),
+        3,
+        "incumbent counter must continue at 3, not reset",
+    );
+}
+
+/// Regression: `expect_migration` (placeholder register) must fail
+/// cleanly on collision, not replace the incumbent's keypair-bearing
+/// entry with a placeholder. Before the fix, a target that
+/// accidentally double-called `expect_migration` for the same
+/// `origin_hash` would silently overwrite, and a subsequent migration
+/// restore would fail at `resolve_restore_keypair` when the envelope
+/// path was opted out of.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expect_migration_collision_is_rejected() {
+    let rt = runtime().await;
+    rt.register_factory("echo", || Box::new(EchoDaemon))
+        .expect("register");
+    rt.start().await.expect("start");
+
+    let origin_hash = 0xDEAD_BEEFu32;
+    rt.expect_migration("echo", origin_hash, DaemonHostConfig::default())
+        .expect("first expect_migration");
+    let err = rt
+        .expect_migration("echo", origin_hash, DaemonHostConfig::default())
+        .expect_err("duplicate expect_migration must fail");
+    match err {
+        DaemonError::Core(CoreDaemonError::ProcessFailed(ref m)) => {
+            assert!(m.contains("already registered"), "got {m:?}");
+        }
+        other => panic!("expected Core(ProcessFailed), got {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

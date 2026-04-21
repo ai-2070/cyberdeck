@@ -885,6 +885,119 @@ async fn migration_opts_retry_disabled_surfaces_not_ready_immediately() {
     }
 }
 
+/// Regression (Cubic AI P1): a duplicate `spawn` with the same
+/// identity used to corrupt the factory registry for the incumbent.
+/// The sequence was:
+///
+/// 1. First `spawn` — factory_registry[origin] = incumbent's factory.
+/// 2. Second `spawn` with same identity — factory_registry.insert()
+///    silently clobbered the slot. Then `DaemonRegistry::register`
+///    correctly rejected the duplicate host. The error-path rollback
+///    then called `factory_registry.remove(origin)` — removing the
+///    *now-clobbered* slot.
+/// 3. The incumbent daemon stayed live, but its factory entry was
+///    gone. Subsequent migration attempts of the incumbent would
+///    fail at the source-side snapshot path because the dispatcher
+///    couldn't rebuild the daemon's restore inputs.
+///
+/// This test exercises the real migration path end-to-end after a
+/// failed duplicate `spawn`: the atomic register fix (factory
+/// insert fails fast on collision, never clobbers) keeps the
+/// incumbent's slot intact, so migration still completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_spawn_preserves_migratability() {
+    let pair = build_pair().await;
+    let Pair {
+        source_rt,
+        target_rt,
+    } = &pair;
+
+    source_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    target_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    source_rt.start().await.unwrap();
+    target_rt.start().await.unwrap();
+    source_rt.mesh().inner().start();
+    target_rt.mesh().inner().start();
+    sleep(Duration::from_millis(100)).await;
+
+    let identity = Identity::generate();
+    let origin_hash = identity.keypair().origin_hash();
+
+    // First spawn — the incumbent we're going to migrate later.
+    let handle = source_rt
+        .spawn("counter", identity.clone(), DaemonHostConfig::default())
+        .await
+        .expect("first spawn on source");
+    for i in 1..=2u64 {
+        source_rt
+            .deliver(handle.origin_hash, &make_event(origin_hash, i, b"pre"))
+            .expect("deliver");
+    }
+
+    // Duplicate spawn: same identity. Must fail at the atomic
+    // factory_registry step, without touching the incumbent's slot.
+    let err = source_rt
+        .spawn("counter", identity.clone(), DaemonHostConfig::default())
+        .await
+        .expect_err("duplicate spawn must fail");
+    match err {
+        DaemonError::Core(CoreDaemonError::ProcessFailed(ref m)) => {
+            assert!(m.contains("already registered"), "got {m:?}");
+        }
+        other => panic!("expected Core(ProcessFailed), got {other:?}"),
+    }
+    assert_eq!(
+        source_rt.daemon_count(),
+        1,
+        "incumbent must still be in the registry after a rejected duplicate",
+    );
+
+    // Target pre-registers so envelope transport works. Pre-fix,
+    // this step would succeed here too — the regression manifests
+    // on the SOURCE side at snapshot-construction time.
+    target_rt
+        .register_migration_target_identity(
+            "counter",
+            identity.clone(),
+            DaemonHostConfig::default(),
+        )
+        .expect("target identity");
+
+    // Now migrate the incumbent. Pre-fix, the source's snapshot path
+    // would fail here because the rollback had stripped the factory
+    // entry. Post-fix, this completes normally.
+    let mig = source_rt
+        .start_migration(
+            handle.origin_hash,
+            source_rt.mesh().inner().node_id(),
+            target_rt.mesh().inner().node_id(),
+        )
+        .await
+        .expect("start_migration after failed duplicate spawn");
+    mig.wait_with_timeout(Duration::from_secs(5))
+        .await
+        .expect("migration reaches Complete — incumbent's factory entry survived");
+
+    // State survived: counter was at 2 on source, next event on
+    // target yields 3.
+    let outputs = target_rt
+        .deliver(origin_hash, &make_event(origin_hash, 3, b"post"))
+        .expect("deliver on target");
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&outputs[0].payload);
+    assert_eq!(
+        u64::from_le_bytes(bytes),
+        3,
+        "incumbent's state must survive a rejected duplicate-spawn attempt",
+    );
+    assert_eq!(source_rt.daemon_count(), 0);
+    assert_eq!(target_rt.daemon_count(), 1);
+}
+
 // ---- Helpers -----------------------------------------------------------
 
 fn make_event(origin_hash: u32, seq: u64, payload: &'static [u8]) -> CausalEvent {

@@ -2741,9 +2741,11 @@ async fn test_migration_snapshot_over_wire() {
     // original assertion observable.
     let registry_a = Arc::new(DaemonRegistry::new());
     let factories_a = Arc::new(DaemonFactoryRegistry::new());
-    factories_a.register(daemon_kp.clone(), DaemonHostConfig::default(), || {
-        Box::new(CounterDaemon::with_count(0))
-    });
+    factories_a
+        .register(daemon_kp.clone(), DaemonHostConfig::default(), || {
+            Box::new(CounterDaemon::with_count(0))
+        })
+        .unwrap();
     let orch_a = Arc::new(MigrationOrchestrator::new(registry_a.clone(), nid_a));
     let source_a = Arc::new(MigrationSourceHandler::new(registry_a.clone()));
     let target_a = Arc::new(MigrationTargetHandler::new_with_factories(
@@ -2859,9 +2861,11 @@ async fn test_migration_full_lifecycle_over_wire() {
     // auto-restore the daemon when SnapshotReady arrives over the wire.
     let registry_c = Arc::new(DaemonRegistry::new());
     let factories_c = Arc::new(DaemonFactoryRegistry::new());
-    factories_c.register(daemon_kp.clone(), DaemonHostConfig::default(), || {
-        Box::new(CounterDaemon::with_count(0))
-    });
+    factories_c
+        .register(daemon_kp.clone(), DaemonHostConfig::default(), || {
+            Box::new(CounterDaemon::with_count(0))
+        })
+        .unwrap();
     let handler_c = Arc::new(MigrationSubprotocolHandler::new(
         Arc::new(MigrationOrchestrator::new(registry_c.clone(), nid_c)),
         Arc::new(MigrationSourceHandler::new(registry_c.clone())),

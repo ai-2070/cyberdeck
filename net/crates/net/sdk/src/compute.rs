@@ -446,19 +446,26 @@ impl DaemonRuntime {
 
         // Mirror the factory into the core registry BEFORE registering
         // the host, so a migration-target handler that catches up on
-        // this origin mid-spawn always sees a consistent view.
+        // this origin mid-spawn always sees a consistent view. Atomic
+        // on collision: if another daemon already claims this
+        // `origin_hash`, bail without mutating either registry —
+        // otherwise the rollback below would strip the factory entry
+        // for the *existing* daemon and silently break its future
+        // migratability.
         let factory_for_core = factory.clone();
         self.inner
             .factory_registry
             .register(keypair.clone(), config.clone(), move || {
                 (factory_for_core)()
-            });
+            })
+            .map_err(DaemonError::Core)?;
 
         let host = DaemonHost::new(daemon, keypair, config);
         // `DaemonRegistry::register` errors on origin_hash collisions
         // — two daemons can't share the same identity. Roll back the
-        // factory_registry insert so a retry with a fresh identity
-        // doesn't pick up a stale factory.
+        // factory_registry insert we just made (we own that slot
+        // because `register` above succeeded atomically) so a retry
+        // with a fresh identity doesn't pick up a stale factory.
         if let Err(e) = self.inner.registry.register(host) {
             self.inner.factory_registry.remove(origin_hash);
             return Err(DaemonError::Core(e));
@@ -497,16 +504,25 @@ impl DaemonRuntime {
         }
 
         let daemon = (factory)();
+        // Atomic register: collision here means some other daemon
+        // (live or a previous spawn_from_snapshot in-flight) already
+        // owns this `origin_hash`. Bail without touching the other
+        // daemon's state — the later rollback would otherwise remove
+        // the victim's factory entry and silently break its future
+        // migratability.
         let factory_for_core = factory.clone();
         self.inner
             .factory_registry
             .register(keypair.clone(), config.clone(), move || {
                 (factory_for_core)()
-            });
+            })
+            .map_err(DaemonError::Core)?;
 
         let host = match DaemonHost::from_snapshot(daemon, keypair, &snapshot, config) {
             Ok(h) => h,
             Err(e) => {
+                // We own the factory slot (register above succeeded
+                // atomically). Safe to remove on rollback.
                 self.inner.factory_registry.remove(origin_hash);
                 return Err(DaemonError::Core(e));
             }
@@ -720,8 +736,8 @@ impl DaemonRuntime {
         let factory_clone = factory.clone();
         self.inner
             .factory_registry
-            .register(keypair, config, move || (factory_clone)());
-        Ok(())
+            .register(keypair, config, move || (factory_clone)())
+            .map_err(DaemonError::Core)
     }
 
     /// Declare on the target that this node expects a migration
@@ -756,8 +772,8 @@ impl DaemonRuntime {
         let factory_clone = factory.clone();
         self.inner
             .factory_registry
-            .register_placeholder(origin_hash, config, move || (factory_clone)());
-        Ok(())
+            .register_placeholder(origin_hash, config, move || (factory_clone)())
+            .map_err(DaemonError::Core)
     }
 
     /// Start migrating a daemon from `source_node` to `target_node`.
