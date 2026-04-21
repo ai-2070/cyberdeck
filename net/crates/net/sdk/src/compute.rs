@@ -198,6 +198,10 @@ struct Inner {
     /// in milliseconds; `0` = no stall (production default). See
     /// [`DaemonRuntime::set_spawn_stall_ms`].
     spawn_stall_ms: std::sync::atomic::AtomicU32,
+    /// Test-only stall injected into `start` between installing
+    /// the migration handler and the Registering→Ready CAS.
+    /// Measured in milliseconds; `0` = no stall.
+    start_stall_ms: std::sync::atomic::AtomicU32,
 }
 
 impl DaemonRuntime {
@@ -231,6 +235,7 @@ impl DaemonRuntime {
                 recent_failures: Mutex::new(HashMap::new()),
                 simulate_not_ready: AtomicBool::new(false),
                 spawn_stall_ms: std::sync::atomic::AtomicU32::new(0),
+                start_stall_ms: std::sync::atomic::AtomicU32::new(0),
             }),
         }
     }
@@ -296,6 +301,16 @@ impl DaemonRuntime {
                     let handler = Arc::new(self.build_migration_handler());
                     self.inner.mesh.inner().set_migration_handler(handler);
 
+                    // Test-only stall between install and CAS so
+                    // integration tests can race `shutdown` in. In
+                    // production the atomic load is 0 and this is
+                    // a no-op.
+                    let stall_ms = self.inner.start_stall_ms.load(Ordering::Acquire);
+                    if stall_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(stall_ms as u64))
+                            .await;
+                    }
+
                     let swap = self.inner.state.compare_exchange(
                         State::Registering as u8,
                         State::Ready as u8,
@@ -305,11 +320,27 @@ impl DaemonRuntime {
                     if swap.is_ok() {
                         return Ok(());
                     }
-                    // Lost the CAS — another caller flipped the state
-                    // and also installed a handler. Our own install
-                    // may have overwritten theirs with an equivalent
-                    // one; either way the mesh now holds a live
-                    // handler. Loop to re-classify and return Ok on
+                    // Lost the CAS. State is now either `Ready`
+                    // (another `start` caller beat us) or
+                    // `ShuttingDown` (a concurrent `shutdown`
+                    // raced past our install). Handle the second
+                    // case explicitly — otherwise a torn-down
+                    // runtime would leave a live handler on the
+                    // mesh, accepting migration traffic and firing
+                    // callbacks against stale registry state.
+                    //
+                    // Under the `Ready` case we leave the handler
+                    // installed: the winning `start` caller also
+                    // installed an equivalent handler (same
+                    // registry, orchestrator, hooks), so whichever
+                    // `ArcSwap` store lands last is indistinguishable
+                    // from the winner's.
+                    if self.state() == State::ShuttingDown {
+                        self.inner.mesh.inner().clear_migration_handler();
+                        return Err(DaemonError::ShuttingDown);
+                    }
+                    // CAS lost to another `start` that won the
+                    // race — loop to re-classify and return Ok on
                     // the `Ready` arm.
                 }
                 State::Ready => return Ok(()),
@@ -426,6 +457,15 @@ impl DaemonRuntime {
         if let Ok(mut map) = self.inner.recent_failures.lock() {
             map.clear();
         }
+        // Uninstall the migration subprotocol handler. The
+        // handler carries `Arc` clones into our `Inner` — leaving
+        // it installed keeps the runtime's internals alive via
+        // the mesh even after we've drained every registry, and
+        // would accept inbound migration traffic that now
+        // unconditionally fails (empty registry). The happy-path
+        // teardown should leave the mesh in the same shape it
+        // had before `start()`.
+        self.inner.mesh.inner().clear_migration_handler();
         Ok(())
     }
 
@@ -452,6 +492,17 @@ impl DaemonRuntime {
     pub fn set_spawn_stall_ms(&self, millis: u32) {
         self.inner
             .spawn_stall_ms
+            .store(millis, Ordering::Release);
+    }
+
+    /// **Test-only.** Inject a sleep inside `start` between the
+    /// handler install and the Registering→Ready CAS. Used to
+    /// deterministically race `shutdown` against a mid-flight
+    /// `start` so tests can verify the handler-cleanup path.
+    #[doc(hidden)]
+    pub fn set_start_stall_ms(&self, millis: u32) {
+        self.inner
+            .start_stall_ms
             .store(millis, Ordering::Release);
     }
 

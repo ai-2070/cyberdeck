@@ -1121,6 +1121,22 @@ impl MeshNode {
         self.migration_handler.store(Some(handler));
     }
 
+    /// Uninstall the migration subprotocol handler. After this
+    /// call, inbound migration subprotocol packets hit the
+    /// no-handler fallback and synthesise `ComputeNotSupported`
+    /// for migration-initiating messages (other message types are
+    /// dropped).
+    ///
+    /// Used by the SDK's `DaemonRuntime::start` to clean up after
+    /// losing the install-vs-CAS race against a concurrent
+    /// `shutdown`: if `start` installed a handler but its CAS to
+    /// `Ready` lost to `shutdown`'s state flip, the mesh would
+    /// otherwise be left with a live handler owned by a runtime
+    /// that's already been torn down.
+    pub fn clear_migration_handler(&self) {
+        self.migration_handler.store(None);
+    }
+
     /// Returns `true` iff a migration subprotocol handler is
     /// currently installed on this mesh. Used primarily by tests
     /// that need to observe the ordering of handler installation

@@ -468,6 +468,78 @@ async fn start_installs_handler_before_publishing_ready() {
     }
 }
 
+/// Regression (Cubic-AI P1): `start()` that loses the install-vs-CAS
+/// race to a concurrent `shutdown()` used to leave the migration
+/// handler installed on the mesh. The runtime would then be in
+/// `ShuttingDown` state with every registry empty, but the mesh's
+/// `ArcSwap` slot still held the handler — inbound migration traffic
+/// would fire callbacks against stale / drained state.
+///
+/// The fix: after the CAS fails, re-read state; if `ShuttingDown`,
+/// call `mesh.clear_migration_handler()` before returning
+/// `Err(ShuttingDown)`. This test injects a stall into `start()`
+/// between install and CAS, fires `shutdown()` in the stall window,
+/// then asserts the mesh has no handler installed after `start`
+/// returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn start_losing_race_to_shutdown_clears_handler() {
+    let rt = runtime().await;
+    rt.set_start_stall_ms(100);
+
+    let rt_for_start = rt.clone();
+    let start_task =
+        tokio::spawn(async move { rt_for_start.start().await });
+
+    // Give `start_task` a beat to install the handler and land in
+    // the injected stall, then race in the shutdown.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(
+        rt.mesh().inner().has_migration_handler(),
+        "fixture: start should have installed the handler by now",
+    );
+    rt.shutdown().await.expect("shutdown Ok");
+
+    let start_result = start_task.await.expect("start task panicked");
+
+    // Pre-fix, `start` would exit the loop through `Err(ShuttingDown)`
+    // but leave the handler installed on the mesh.
+    match start_result {
+        Err(DaemonError::ShuttingDown) => {}
+        other => panic!(
+            "start racing with shutdown must return Err(ShuttingDown); got {other:?}",
+        ),
+    }
+    assert!(
+        !rt.mesh().inner().has_migration_handler(),
+        "start() that lost the race to shutdown must clear its own \
+         handler install — leaving it on the mesh would keep the \
+         runtime's internals wired into inbound migration traffic \
+         after the runtime has already been torn down",
+    );
+}
+
+/// Regression for the happy-path teardown: `shutdown()` uninstalls
+/// the migration handler so the mesh matches the pre-`start()`
+/// shape. Without this, the handler retains `Arc` clones into the
+/// runtime's `Inner`, keeping drained registries alive via the
+/// mesh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_clears_migration_handler() {
+    let rt = runtime().await;
+    rt.start().await.expect("start");
+    assert!(
+        rt.mesh().inner().has_migration_handler(),
+        "fixture: handler should be installed after start",
+    );
+    rt.shutdown().await.expect("shutdown");
+    assert!(
+        !rt.mesh().inner().has_migration_handler(),
+        "shutdown must uninstall the handler — leaving it installed \
+         keeps the torn-down runtime wired into inbound migration \
+         traffic",
+    );
+}
+
 /// Regression (Cubic-AI P1): `spawn` and `shutdown` had no
 /// coordination. `spawn` checked `require_ready()` once, then did
 /// unguarded registry inserts. If `shutdown` flipped state to
