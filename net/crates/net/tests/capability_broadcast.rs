@@ -252,3 +252,107 @@ async fn stale_versions_are_ignored_by_index() {
         "older version overwrote the newer one"
     );
 }
+
+/// Regression for a cubic-flagged P1: the announcement handler
+/// verified the signature against `entity_id` but never checked
+/// that `node_id` matched a derivation from `entity_id`. A signer
+/// could therefore produce a valid signature claiming any
+/// `node_id`, poisoning the capability index and route learning
+/// for an unrelated peer.
+///
+/// The fix asserts `ann.entity_id.node_id() == ann.node_id`
+/// after signature verification. This test constructs a forged
+/// announcement — A's real entity_id, A's real signature, but a
+/// made-up `node_id` — and ships it via the subprotocol channel.
+/// The receiver must NOT index the forged node_id.
+#[tokio::test]
+async fn forged_node_id_rejected_even_with_valid_signature() {
+    use net::adapter::net::behavior::SUBPROTOCOL_CAPABILITY_ANN;
+
+    let ports = find_ports(2).await;
+    let a = build_node(ports[0]).await;
+    let b = build_node(ports[1]).await;
+    handshake(&a, &b).await;
+
+    // Craft a forged announcement with a fresh keypair. The
+    // signature is valid (signer == entity_id), but we deliberately
+    // stamp a `node_id` that does NOT match
+    // `entity_id.node_id()` — that's the spoof the fix catches.
+    let attacker_kp = EntityKeypair::generate();
+    let forged_node_id: u64 = 0x1234_5678_9ABC_DEF0;
+    assert_ne!(
+        forged_node_id,
+        attacker_kp.node_id(),
+        "fixture: forged_node_id must differ from the signer's real node_id",
+    );
+
+    let caps = CapabilitySet::new().add_tag("forged-node-id-probe");
+    let mut ann = CapabilityAnnouncement::new(
+        forged_node_id,
+        attacker_kp.entity_id().clone(),
+        1,
+        caps,
+    );
+    ann.sign(&attacker_kp);
+    assert!(
+        ann.verify().is_ok(),
+        "forged announcement still carries a valid signature",
+    );
+
+    // Ship the raw payload via A's subprotocol channel.
+    let payload = ann.to_bytes();
+    a.send_subprotocol(b.local_addr(), SUBPROTOCOL_CAPABILITY_ANN, &payload)
+        .await
+        .expect("send forged announcement");
+
+    // B should NOT admit the forged node_id into its index.
+    let filter = CapabilityFilter::new().require_tag("forged-node-id-probe");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !b.find_peers_by_filter(&filter).contains(&forged_node_id),
+        "receiver indexed a forged node_id despite derivation mismatch — \
+         node_id must be bound to entity_id cryptographically",
+    );
+}
+
+/// Regression for a cubic-flagged P1/P2: TOFU used to pin the
+/// `(from_node → entity_id)` mapping from the first seen
+/// announcement regardless of whether the announcement was
+/// authenticated. An unauthenticated peer could therefore poison
+/// the binding with a victim's `entity_id`, later satisfying
+/// token-based channel checks for that spoofed identity. The fix
+/// restricts TOFU pinning to signature-verified announcements;
+/// unauthenticated deployments that run without signatures get no
+/// pin at all (channel auth fails cleanly at "missing entity").
+#[tokio::test]
+async fn unsigned_announcement_does_not_tofu_pin_entity() {
+    let ports = find_ports(2).await;
+    let a = build_node(ports[0]).await;
+    let b = build_node(ports[1]).await;
+    handshake(&a, &b).await;
+
+    // A announces UNSIGNED caps. B accepts (no
+    // require_signed_capabilities) but must NOT trust
+    // `ann.entity_id` enough to pin it.
+    a.announce_capabilities_with(
+        CapabilitySet::new().add_tag("unsigned-tofu-probe"),
+        Duration::from_secs(60),
+        false, // unsigned
+    )
+    .await
+    .expect("announce");
+
+    // Index still admits the announcement (permissive default).
+    let filter = CapabilityFilter::new().require_tag("unsigned-tofu-probe");
+    let a_id = a.node_id();
+    let arrived = wait_until(&b, |n| n.find_peers_by_filter(&filter).contains(&a_id)).await;
+    assert!(arrived, "unsigned announcement should still index");
+
+    // But the TOFU map must stay empty for this peer — no pin
+    // from an unauthenticated announcement.
+    assert!(
+        b.peer_entity_id(a_id).is_none(),
+        "TOFU pin established from an unsigned announcement — \
+         unauthenticated entity_id is attacker-controlled input",
+    );
+}

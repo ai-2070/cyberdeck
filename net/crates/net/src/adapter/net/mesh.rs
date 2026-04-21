@@ -895,6 +895,17 @@ impl MeshNode {
         self.identity.entity_id()
     }
 
+    /// Look up a peer's pinned `entity_id`, if the TOFU binding
+    /// has been established. Returns `None` before we've received
+    /// a signature-verified `CapabilityAnnouncement` from the peer.
+    /// Exposed primarily for tests + operator observability; the
+    /// channel-auth subscribe gate consults this map internally.
+    pub fn peer_entity_id(&self, node_id: u64) -> Option<EntityId> {
+        self.peer_entity_ids
+            .get(&node_id)
+            .map(|e| e.value().clone())
+    }
+
     /// Get the local bind address.
     pub fn local_addr(&self) -> SocketAddr {
         self.socket.local_addr()
@@ -2535,28 +2546,57 @@ impl MeshNode {
         // announcement's self-claimed entity_id. Unsigned
         // announcements skip this branch; receivers that care about
         // authenticity set `require_signed_capabilities = true`.
-        if ann.signature.is_some() && ann.verify().is_err() {
+        let signature_verified = if ann.signature.is_some() {
+            if ann.verify().is_err() {
+                tracing::trace!(
+                    from_node = format!("{:#x}", from_node),
+                    "capability: signature verification failed"
+                );
+                return;
+            }
+            true
+        } else {
+            false
+        };
+
+        // Bind `node_id` to `entity_id` cryptographically. The
+        // signature covers `entity_id` but NOT `node_id` — without
+        // this check a signed announcement could claim any
+        // `node_id`, poisoning the capability index and route
+        // learning for an unrelated peer. `EntityId::node_id()` is
+        // a blake2s derivation over the public key, so a forger who
+        // doesn't control the key can't produce matching bytes.
+        if ann.entity_id.node_id() != ann.node_id {
             tracing::trace!(
                 from_node = format!("{:#x}", from_node),
-                "capability: signature verification failed"
+                claimed_node = format!("{:#x}", ann.node_id),
+                derived_node = format!("{:#x}", ann.entity_id.node_id()),
+                "capability: node_id does not match entity_id derivation"
             );
             return;
         }
 
-        // First-seen identity pin. A peer that tries to rebind its
-        // `entity_id` in a later announcement is silently rejected —
-        // protects against a replay / misrouted packet claiming a
-        // peer id that's already bound.
-        if let Some(existing) = ctx.peer_entity_ids.get(&from_node) {
-            if *existing.value() != ann.entity_id {
-                tracing::trace!(
-                    from_node = format!("{:#x}", from_node),
-                    "capability: entity_id rebind rejected (TOFU)"
-                );
-                return;
+        // First-seen identity pin — TOFU. A peer that tries to
+        // rebind its `entity_id` in a later announcement is
+        // silently rejected. Pin ONLY for signature-verified
+        // announcements; an unsigned announcement's entity_id is
+        // attacker-controlled and would poison the binding.
+        // Unauthenticated deployments skip the pin entirely —
+        // channel-auth paths that need the binding will fail
+        // cleanly at "missing entity" rather than trusting forged
+        // input.
+        if signature_verified {
+            if let Some(existing) = ctx.peer_entity_ids.get(&from_node) {
+                if *existing.value() != ann.entity_id {
+                    tracing::trace!(
+                        from_node = format!("{:#x}", from_node),
+                        "capability: entity_id rebind rejected (TOFU)"
+                    );
+                    return;
+                }
+            } else {
+                ctx.peer_entity_ids.insert(from_node, ann.entity_id.clone());
             }
-        } else {
-            ctx.peer_entity_ids.insert(from_node, ann.entity_id.clone());
         }
 
         // Derive the peer's subnet *before* moving `ann` into the

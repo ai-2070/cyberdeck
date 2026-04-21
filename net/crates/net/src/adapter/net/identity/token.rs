@@ -127,6 +127,13 @@ impl PermissionToken {
     pub const WIRE_SIZE: usize = Self::SIGNED_PAYLOAD_SIZE + 64; // 159 bytes
 
     /// Issue a new token.
+    ///
+    /// `duration_secs` is clamped: a value that would overflow
+    /// `now + duration_secs` saturates `not_after` at `u64::MAX`,
+    /// producing a functionally-never-expiring token rather than
+    /// wrapping the timestamp or panicking. Callers who want to
+    /// reject pathological TTLs should range-check at the SDK
+    /// layer.
     pub fn issue(
         issuer_keypair: &EntityKeypair,
         subject: EntityId,
@@ -146,7 +153,7 @@ impl PermissionToken {
             scope,
             channel_hash,
             not_before: now,
-            not_after: now + duration_secs,
+            not_after: now.saturating_add(duration_secs),
             delegation_depth,
             nonce,
             signature: [0u8; 64],
@@ -205,6 +212,17 @@ impl PermissionToken {
     ///
     /// Returns `None` if delegation is not allowed (depth exhausted or
     /// DELEGATE not in scope).
+    ///
+    /// The child's `not_after` is copied from the parent verbatim,
+    /// NOT derived from `parent.not_after - now`. The subtract-then-
+    /// re-read-clock approach lost multiple seconds of validity
+    /// when the parent was near expiry — the child's `issue()` call
+    /// re-reads `current_timestamp()` and computes
+    /// `now + (parent.not_after - previous_now)`, which rounds down
+    /// by the wall-clock delta between the two reads. Copying
+    /// `not_after` avoids the double-read and guarantees the
+    /// child's lifetime is `parent.not_after - child.not_before`
+    /// exactly.
     pub fn delegate(
         &self,
         signer: &EntityKeypair,
@@ -229,14 +247,32 @@ impl PermissionToken {
         // New scope is intersection of current scope and requested scope
         let new_scope = self.scope.intersect(restricted_scope);
 
-        Ok(Self::issue(
-            signer,
-            new_subject,
-            new_scope,
-            self.channel_hash,
-            self.not_after.saturating_sub(current_timestamp()),
-            self.delegation_depth - 1,
-        ))
+        // Issue a child whose `not_after` matches the parent's.
+        // `issue()` stamps `not_before = now`, so the child's
+        // effective lifetime is `parent.not_after - now` — the
+        // same quantity as before, but computed against a single
+        // clock read instead of two. Avoids the near-zero-lifetime
+        // bug when the parent is near expiry.
+        let now = current_timestamp();
+        let mut nonce_bytes = [0u8; 8];
+        getrandom::fill(&mut nonce_bytes).expect("getrandom failed");
+        let nonce = u64::from_le_bytes(nonce_bytes);
+
+        let mut child = Self {
+            issuer: signer.entity_id().clone(),
+            subject: new_subject,
+            scope: new_scope,
+            channel_hash: self.channel_hash,
+            not_before: now,
+            not_after: self.not_after,
+            delegation_depth: self.delegation_depth - 1,
+            nonce,
+            signature: [0u8; 64],
+        };
+        let payload = child.signed_payload();
+        let sig = signer.sign(&payload);
+        child.signature = sig.to_bytes();
+        Ok(child)
     }
 
     /// Serialize the fields that are covered by the signature.
@@ -261,8 +297,16 @@ impl PermissionToken {
     }
 
     /// Deserialize from wire format.
+    ///
+    /// Rejects buffers whose length is anything other than exactly
+    /// [`Self::WIRE_SIZE`]. Previously this method only guarded the
+    /// lower bound, silently accepting concatenated or trailing-
+    /// garbage payloads — which weakened the wire-format contract
+    /// and let malformed blobs parse as valid tokens. Callers
+    /// framing tokens inside a larger message must slice to exactly
+    /// `WIRE_SIZE` before calling this.
     pub fn from_bytes(data: &[u8]) -> Result<Self, TokenError> {
-        if data.len() < Self::WIRE_SIZE {
+        if data.len() != Self::WIRE_SIZE {
             return Err(TokenError::InvalidFormat);
         }
 
@@ -306,11 +350,20 @@ impl std::fmt::Debug for PermissionToken {
 
 /// Fast permission lookup cache.
 ///
-/// Keyed by `(subject EntityId, channel_hash)` for O(1) per-channel
-/// authorization checks. Entries are not evicted automatically —
-/// callers should check `is_valid()` on retrieved tokens.
+/// Keyed by `(subject EntityId, channel_hash)`. Each slot holds a
+/// **list** of tokens — previous versions kept a single token per
+/// slot, which silently dropped tokens when the same subject needed
+/// multiple distinct scopes on the same channel (e.g. one PUBLISH
+/// token and one SUBSCRIBE token). On insert the incoming token
+/// replaces any existing entry with an **identical scope bitfield**
+/// so a refresh doesn't stack duplicates, but tokens with different
+/// scopes coexist.
+///
+/// Entries are not evicted automatically — callers should check
+/// `is_valid()` on retrieved tokens, or call [`Self::evict_expired`]
+/// on a cadence.
 pub struct TokenCache {
-    tokens: DashMap<([u8; 32], u16), PermissionToken>,
+    tokens: DashMap<([u8; 32], u16), Vec<PermissionToken>>,
 }
 
 impl TokenCache {
@@ -325,10 +378,15 @@ impl TokenCache {
     ///
     /// Returns an error if the token's signature is invalid. This prevents
     /// self-signed or tampered tokens from being cached.
+    ///
+    /// Tokens with distinct scope bitfields for the same
+    /// `(subject, channel_hash)` are stored side-by-side.
+    /// A new token with the same scope as an existing entry
+    /// **replaces** the existing one — latest-issued wins so
+    /// refreshing via re-issue doesn't leak growth.
     pub fn insert(&self, token: PermissionToken) -> Result<(), TokenError> {
         token.verify()?;
-        let key = (*token.subject.as_bytes(), token.channel_hash);
-        self.tokens.insert(key, token);
+        self.insert_unchecked(token);
         Ok(())
     }
 
@@ -337,14 +395,24 @@ impl TokenCache {
     /// Only use this when the token is known to be valid (e.g., just issued locally).
     pub fn insert_unchecked(&self, token: PermissionToken) {
         let key = (*token.subject.as_bytes(), token.channel_hash);
-        self.tokens.insert(key, token);
+        let mut entry = self.tokens.entry(key).or_default();
+        // Replace any existing token with exactly the same scope;
+        // otherwise push so distinct-scope tokens coexist.
+        if let Some(slot) = entry.iter_mut().find(|t| t.scope == token.scope) {
+            *slot = token;
+        } else {
+            entry.push(token);
+        }
     }
 
     /// Check if an entity is authorized for an action on a channel.
     ///
-    /// Returns `Ok(())` if a valid token exists, or an error explaining why not.
-    /// Checks channel-specific token first, then wildcard (channel_hash = 0).
-    /// An expired/invalid channel-specific token does NOT block the wildcard fallback.
+    /// Returns `Ok(())` if any cached token for this subject grants
+    /// `action`, else an error. Walks the exact-channel slot first,
+    /// then the wildcard (`channel_hash = 0`) slot. Within a slot,
+    /// any valid token that authorizes the requested action wins —
+    /// an expired or otherwise-invalid token in the same slot is
+    /// ignored, not blocking.
     pub fn check(
         &self,
         subject: &EntityId,
@@ -352,34 +420,54 @@ impl TokenCache {
         channel_hash: u16,
     ) -> Result<(), TokenError> {
         // Try exact channel match first
-        if let Some(token) = self.tokens.get(&(*subject.as_bytes(), channel_hash)) {
-            if token.is_valid().is_ok() && token.authorizes(action, channel_hash) {
+        if let Some(slot) = self.tokens.get(&(*subject.as_bytes(), channel_hash)) {
+            if slot
+                .value()
+                .iter()
+                .any(|t| t.is_valid().is_ok() && t.authorizes(action, channel_hash))
+            {
                 return Ok(());
             }
         }
         // Try wildcard (channel_hash = 0)
-        if let Some(token) = self.tokens.get(&(*subject.as_bytes(), 0)) {
-            if token.is_valid().is_ok() && token.authorizes(action, channel_hash) {
+        if let Some(slot) = self.tokens.get(&(*subject.as_bytes(), 0)) {
+            if slot
+                .value()
+                .iter()
+                .any(|t| t.is_valid().is_ok() && t.authorizes(action, channel_hash))
+            {
                 return Ok(());
             }
         }
         Err(TokenError::NotAuthorized)
     }
 
-    /// Fetch a cached token for `(subject, channel_hash)`. Exact match
-    /// only — the wildcard (`channel_hash = 0`) entry is a separate
-    /// key. Unlike [`Self::check`], this returns the token itself so
-    /// callers can delegate, forward, or inspect it.
+    /// Fetch any cached token for `(subject, channel_hash)`. Exact
+    /// match only — the wildcard (`channel_hash = 0`) entry is a
+    /// separate key. Returns the first valid token in the slot; if
+    /// none are valid, returns any entry (so callers can still
+    /// inspect for debugging). Callers that need a specific scope
+    /// should use [`Self::check`] instead.
     pub fn get(&self, subject: &EntityId, channel_hash: u16) -> Option<PermissionToken> {
-        self.tokens
-            .get(&(*subject.as_bytes(), channel_hash))
-            .map(|entry| entry.value().clone())
+        let slot = self.tokens.get(&(*subject.as_bytes(), channel_hash))?;
+        let tokens = slot.value();
+        // Prefer a currently-valid token; otherwise fall back to
+        // the first entry so callers like `net_identity_lookup_token`
+        // can still inspect it.
+        tokens
+            .iter()
+            .find(|t| t.is_valid().is_ok())
+            .or_else(|| tokens.first())
+            .cloned()
     }
 
     /// Remove expired tokens.
     pub fn evict_expired(&self) {
         let now = current_timestamp();
-        self.tokens.retain(|_, token| token.not_after > now);
+        self.tokens.retain(|_, slot| {
+            slot.retain(|t| t.not_after > now);
+            !slot.is_empty()
+        });
     }
 
     /// Number of cached tokens.
@@ -874,5 +962,185 @@ mod tests {
             "insert must reject tampered token"
         );
         assert_eq!(cache.len(), 0, "tampered token must not be cached");
+    }
+
+    // ========================================================================
+    // Cubic-flagged P1/P2 regressions
+    // ========================================================================
+
+    /// Regression for a cubic-flagged P1: TokenCache used to key on
+    /// `(subject, channel_hash)` and store a single token per slot,
+    /// so inserting a SUBSCRIBE token after a PUBLISH token
+    /// silently overwrote the earlier one. Both must coexist.
+    #[test]
+    fn cache_coexists_tokens_of_different_scopes_for_same_channel() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let channel = 0xABCD;
+
+        let publish_tok = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            channel,
+            3600,
+            0,
+        );
+        let subscribe_tok = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::SUBSCRIBE,
+            channel,
+            3600,
+            0,
+        );
+
+        let cache = TokenCache::new();
+        cache.insert(publish_tok).expect("insert publish");
+        cache.insert(subscribe_tok).expect("insert subscribe");
+
+        // Both authorizations must pass — the second insert used to
+        // clobber the first because the cache was keyed without
+        // considering scope.
+        assert!(
+            cache.check(subject.entity_id(), TokenScope::PUBLISH, channel).is_ok(),
+            "publish auth lost after subscribe insert",
+        );
+        assert!(
+            cache.check(subject.entity_id(), TokenScope::SUBSCRIBE, channel).is_ok(),
+            "subscribe auth lost",
+        );
+    }
+
+    /// Regression for the other half of the cache semantic: issuing
+    /// a SECOND token with the same scope as an existing one
+    /// should **replace** it, not stack. Otherwise repeated refreshes
+    /// leak linear memory.
+    #[test]
+    fn cache_same_scope_reinsert_replaces_not_stacks() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let channel = 0xABCD;
+
+        let cache = TokenCache::new();
+        for _ in 0..10 {
+            let tok = PermissionToken::issue(
+                &issuer,
+                subject.entity_id().clone(),
+                TokenScope::SUBSCRIBE,
+                channel,
+                3600,
+                0,
+            );
+            cache.insert(tok).expect("insert");
+        }
+        // All ten had scope=SUBSCRIBE. The cache should hold one
+        // entry total (the most recent), not ten.
+        assert_eq!(
+            cache.len(),
+            1,
+            "repeated inserts with the same scope must replace, not stack",
+        );
+    }
+
+    /// Regression for a cubic-flagged P2: `from_bytes` used to
+    /// accept any buffer ≥ WIRE_SIZE, silently ignoring trailing
+    /// bytes. Concatenated / corrupted payloads must fail cleanly.
+    #[test]
+    fn from_bytes_rejects_trailing_garbage() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let tok = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0,
+            3600,
+            0,
+        );
+        let mut bytes = tok.to_bytes();
+        assert_eq!(bytes.len(), PermissionToken::WIRE_SIZE);
+        // Fresh bytes parse fine.
+        assert!(PermissionToken::from_bytes(&bytes).is_ok());
+
+        // Append trailing garbage — parser must now refuse.
+        bytes.push(0xFF);
+        assert!(
+            matches!(
+                PermissionToken::from_bytes(&bytes),
+                Err(TokenError::InvalidFormat)
+            ),
+            "trailing byte must reject as InvalidFormat",
+        );
+
+        // Truncate by one — also refused (already was, but lock in).
+        let truncated = &tok.to_bytes()[..PermissionToken::WIRE_SIZE - 1];
+        assert!(matches!(
+            PermissionToken::from_bytes(truncated),
+            Err(TokenError::InvalidFormat)
+        ));
+    }
+
+    /// Regression for a cubic-flagged P1: `issue()` used unchecked
+    /// `now + duration_secs`, which panics in debug builds on
+    /// large TTL. Saturating add yields a never-expiring token
+    /// instead of crashing.
+    #[test]
+    fn issue_with_huge_ttl_saturates_rather_than_panics() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let tok = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0,
+            u64::MAX,
+            0,
+        );
+        assert_eq!(
+            tok.not_after,
+            u64::MAX,
+            "TTL=u64::MAX must saturate, not wrap or panic",
+        );
+        assert!(!tok.is_expired());
+        // Signature is still valid.
+        assert!(tok.verify().is_ok());
+    }
+
+    /// Regression for a cubic-flagged P2: `delegate()` computed the
+    /// child's TTL as `parent.not_after - current_timestamp()` and
+    /// then passed that duration back through `issue()`, which
+    /// re-reads `current_timestamp()`. When the parent was close
+    /// to expiry the double-read shaved meaningful lifetime off
+    /// the child — in the worst case, a child token born already
+    /// expired. The fix copies `parent.not_after` directly.
+    #[test]
+    fn delegate_preserves_parent_not_after() {
+        let a = EntityKeypair::generate();
+        let b = EntityKeypair::generate();
+        let c = EntityKeypair::generate();
+
+        let parent = PermissionToken::issue(
+            &a,
+            b.entity_id().clone(),
+            TokenScope::PUBLISH.union(TokenScope::DELEGATE),
+            0,
+            3600,
+            2,
+        );
+
+        let child = parent
+            .delegate(&b, c.entity_id().clone(), TokenScope::PUBLISH)
+            .expect("delegate");
+
+        assert_eq!(
+            child.not_after, parent.not_after,
+            "child's not_after must equal parent's, not some smaller value \
+             derived from a second clock read",
+        );
+        // child.not_before was stamped by the child's own clock
+        // read, so it's ≥ parent.not_before — which is correct.
+        assert!(child.not_before >= parent.not_before);
+        assert!(child.verify().is_ok());
     }
 }
