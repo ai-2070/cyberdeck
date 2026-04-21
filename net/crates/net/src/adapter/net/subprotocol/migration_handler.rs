@@ -14,7 +14,44 @@ use crate::adapter::net::compute::{
     MigrationError, MigrationMessage, MigrationOrchestrator, MigrationSourceHandler,
     MigrationTargetHandler, SnapshotReassembler,
 };
+use crate::adapter::net::identity::EntityKeypair;
 use crate::adapter::net::state::snapshot::StateSnapshot;
+
+/// Identity-transport context for automatic envelope seal/open in
+/// the migration dispatcher.
+///
+/// When populated, the handler:
+/// - **Source path**: after taking a snapshot, if the target's
+///   X25519 static pub is known (via `peer_static_lookup`) AND the
+///   local daemon's keypair is available, seal the envelope into
+///   the snapshot before chunking.
+/// - **Target path**: on `SnapshotReady` with an attached envelope,
+///   unseal using `local_x25519_priv`, derive the daemon's keypair,
+///   and pass that into `restore_snapshot` instead of whatever the
+///   factory registry has pre-registered.
+///
+/// A `None` context means the dispatcher ignores envelopes — the
+/// pre-identity-envelope fallback path where both nodes pre-register
+/// matching keypairs.
+#[derive(Clone)]
+pub struct MigrationIdentityContext {
+    /// Local Noise static X25519 private key. Used to unseal
+    /// envelopes sealed to our public half.
+    pub local_x25519_priv: [u8; 32],
+    /// Callback: given a peer node_id, return its X25519 static
+    /// public key if we have an active session with it. Used by the
+    /// source path to pick the seal recipient.
+    pub peer_static_lookup: Arc<dyn Fn(u64) -> Option<[u8; 32]> + Send + Sync>,
+}
+
+impl std::fmt::Debug for MigrationIdentityContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MigrationIdentityContext")
+            .field("local_x25519_priv", &"[REDACTED]")
+            .field("peer_static_lookup", &"<fn>")
+            .finish()
+    }
+}
 
 /// Outbound message with destination node.
 #[derive(Debug)]
@@ -41,15 +78,40 @@ pub struct MigrationSubprotocolHandler {
     /// Wrapped in `Mutex` because `SnapshotReassembler::feed` requires
     /// `&mut self`.
     reassemblers: DashMap<u32, Mutex<SnapshotReassembler>>,
+    /// Identity-transport context. `None` = envelopes ignored
+    /// (pre-identity-envelope fallback).
+    identity_context: Option<MigrationIdentityContext>,
 }
 
 impl MigrationSubprotocolHandler {
-    /// Create a new handler.
+    /// Create a new handler with no identity-transport context.
+    /// Envelopes on inbound snapshots are ignored; outbound
+    /// snapshots don't get an envelope attached. Matches the
+    /// pre-Stage-5b behaviour.
     pub fn new(
         orchestrator: Arc<MigrationOrchestrator>,
         source_handler: Arc<MigrationSourceHandler>,
         target_handler: Arc<MigrationTargetHandler>,
         local_node_id: u64,
+    ) -> Self {
+        Self::new_with_identity(
+            orchestrator,
+            source_handler,
+            target_handler,
+            local_node_id,
+            None,
+        )
+    }
+
+    /// Create a new handler with an optional identity-transport
+    /// context. When provided, the dispatcher auto-seals envelopes
+    /// on the source path and auto-opens them on the target path.
+    pub fn new_with_identity(
+        orchestrator: Arc<MigrationOrchestrator>,
+        source_handler: Arc<MigrationSourceHandler>,
+        target_handler: Arc<MigrationTargetHandler>,
+        local_node_id: u64,
+        identity_context: Option<MigrationIdentityContext>,
     ) -> Self {
         Self {
             orchestrator,
@@ -57,6 +119,7 @@ impl MigrationSubprotocolHandler {
             target_handler,
             local_node_id,
             reassemblers: DashMap::new(),
+            identity_context,
         }
     }
 
@@ -91,9 +154,16 @@ impl MigrationSubprotocolHandler {
                 // CleanupComplete) must reach it. The source-side handler
                 // stores this so subsequent replies don't drift if a
                 // future forwarding layer rewrites `from_node`.
-                let snapshot =
+                let mut snapshot =
                     self.source_handler
                         .start_snapshot(daemon_origin, target_node, from_node)?;
+
+                // Identity envelope: if we have a transport context
+                // and can find the target's X25519 pubkey, seal the
+                // daemon's keypair into the snapshot before chunking
+                // so the target can reconstruct identity without an
+                // out-of-band pre-registration.
+                snapshot = self.maybe_seal_envelope(snapshot, daemon_origin, target_node);
 
                 // Chunk the snapshot for transport
                 let chunks = crate::adapter::net::compute::orchestrator::chunk_snapshot(
@@ -490,6 +560,27 @@ impl MigrationSubprotocolHandler {
                 }
             };
 
+            // Identity envelope: if the snapshot carries one and we
+            // have the X25519 private key to unseal it, the envelope
+            // supplies the real daemon keypair. Otherwise fall back
+            // to whatever keypair the factory was registered with —
+            // which, for public-identity migrations or pre-Stage-5b
+            // callers, is either a placeholder or a manually-shared
+            // keypair. A present-but-invalid envelope is a hard
+            // failure, not a fallback — otherwise an attacker who
+            // tampers with the envelope could downgrade identity
+            // transport silently.
+            let keypair = match self.resolve_restore_keypair(&snapshot, &inputs.keypair) {
+                Ok(kp) => kp,
+                Err(e) => {
+                    return Ok(Some(self.fail_migration(
+                        daemon_origin,
+                        from_node,
+                        &format!("identity envelope open failed: {e}"),
+                    )?));
+                }
+            };
+
             let daemon = inputs.daemon;
             if let Err(e) = self.target_handler.restore_snapshot(
                 RestoreContext {
@@ -499,7 +590,7 @@ impl MigrationSubprotocolHandler {
                     // orchestrator: whoever forwarded SnapshotReady to us
                     orchestrator_node: from_node,
                 },
-                inputs.keypair,
+                keypair,
                 move || daemon,
                 inputs.config,
             ) {
@@ -534,6 +625,110 @@ impl MigrationSubprotocolHandler {
             dest_node: dest,
             payload: wire::encode(&reply)?,
         }]))
+    }
+
+    /// Source-side helper: if we have an identity-transport context
+    /// and the target's X25519 pubkey is available, seal the
+    /// daemon's keypair into the snapshot. On any missing piece
+    /// (context, target key, daemon keypair), pass the snapshot
+    /// through unchanged — the dispatcher treats a no-envelope path
+    /// as "public-identity migration" and expects the target to
+    /// have a pre-registered keypair.
+    fn maybe_seal_envelope(
+        &self,
+        snapshot: StateSnapshot,
+        daemon_origin: u32,
+        target_node: u64,
+    ) -> StateSnapshot {
+        let Some(ctx) = &self.identity_context else {
+            return snapshot;
+        };
+        // Skip if the snapshot already carries an envelope (e.g. the
+        // SDK pre-sealed at `start_migration` time for a local-source
+        // case).
+        if snapshot.identity_envelope.is_some() {
+            return snapshot;
+        }
+        let Some(target_pub) = (ctx.peer_static_lookup)(target_node) else {
+            return snapshot;
+        };
+        // Find the daemon's keypair in the local registry. The
+        // orchestrator + source_handler + target_handler share one
+        // registry, so whichever owns this daemon, we see it.
+        let kp = match self
+            .source_handler_registry_keypair(daemon_origin)
+            .or_else(|| self.target_handler_registry_keypair(daemon_origin))
+        {
+            Some(kp) => kp,
+            None => return snapshot,
+        };
+        // Clone ahead of the consuming `with_identity_envelope` call
+        // so we can return the original on seal failure. `StateSnapshot`
+        // is `Clone`; the state payload is a `Bytes` (refcount bump),
+        // and the remaining fields are small.
+        let backup = snapshot.clone();
+        match snapshot.with_identity_envelope(&kp, target_pub) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    daemon_origin = format!("{:#x}", daemon_origin),
+                    error = %e,
+                    "identity envelope seal failed — proceeding without envelope",
+                );
+                backup
+            }
+        }
+    }
+
+    /// Read-only keypair fetch from the shared daemon registry
+    /// reachable via `source_handler`. `source_handler` and
+    /// `target_handler` hold `Arc` clones of the same registry in
+    /// typical wiring, so checking via source is sufficient; the
+    /// `target_handler_registry_keypair` fallback exists for
+    /// asymmetric setups where they diverge.
+    fn source_handler_registry_keypair(&self, daemon_origin: u32) -> Option<EntityKeypair> {
+        let _ = daemon_origin;
+        // `MigrationSourceHandler` doesn't expose the registry
+        // publicly, so reach through the orchestrator which shares
+        // the same `Arc<DaemonRegistry>`.
+        self.orchestrator
+            .daemon_registry()
+            .daemon_keypair(daemon_origin)
+    }
+
+    fn target_handler_registry_keypair(&self, daemon_origin: u32) -> Option<EntityKeypair> {
+        // Parallel path — the target-side registry may in some
+        // configurations be distinct. Today it's the same `Arc`, so
+        // this returns the same value as the source path; kept as a
+        // seam.
+        self.orchestrator
+            .daemon_registry()
+            .daemon_keypair(daemon_origin)
+    }
+
+    /// Target-side helper: pick the keypair to hand to
+    /// `restore_snapshot`. When the snapshot has an envelope AND we
+    /// have a private key to unseal it with, the envelope wins;
+    /// otherwise we fall back to the factory-registered keypair.
+    fn resolve_restore_keypair(
+        &self,
+        snapshot: &StateSnapshot,
+        fallback: &EntityKeypair,
+    ) -> Result<EntityKeypair, String> {
+        let Some(ctx) = &self.identity_context else {
+            return Ok(fallback.clone());
+        };
+        if snapshot.identity_envelope.is_none() {
+            return Ok(fallback.clone());
+        }
+        // Reconstruct the X25519 private key from our stored bytes.
+        // `StaticSecret::from` consumes the 32-byte array.
+        let priv_secret = x25519_dalek::StaticSecret::from(ctx.local_x25519_priv);
+        match snapshot.open_identity_envelope(&priv_secret) {
+            Ok(Some(kp)) => Ok(kp),
+            Ok(None) => Ok(fallback.clone()),
+            Err(e) => Err(format!("{e}")),
+        }
     }
 
     /// Build a `MigrationFailed` outbound message and clean up local state.

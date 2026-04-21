@@ -812,6 +812,14 @@ impl MigrationOrchestrator {
         }
     }
 
+    /// Shared handle to the daemon registry this orchestrator was
+    /// built against. Exposed so the migration subprotocol
+    /// dispatcher can reach the registry without an extra `Arc`
+    /// plumbed alongside.
+    pub fn daemon_registry(&self) -> &Arc<DaemonRegistry> {
+        &self.daemon_registry
+    }
+
     /// Initiate a migration (phase 0: Snapshot).
     ///
     /// If the source is the local node, takes the snapshot immediately and

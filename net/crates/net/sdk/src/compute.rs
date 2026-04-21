@@ -62,7 +62,9 @@ use ::net::adapter::net::compute::{
     MigrationMessage, MigrationOrchestrator, MigrationSourceHandler, MigrationTargetHandler,
 };
 use ::net::adapter::net::identity::EntityId;
-use ::net::adapter::net::subprotocol::MigrationSubprotocolHandler;
+use ::net::adapter::net::subprotocol::{
+    MigrationIdentityContext, MigrationSubprotocolHandler,
+};
 
 use crate::identity::Identity;
 use crate::mesh::Mesh;
@@ -247,17 +249,27 @@ impl DaemonRuntime {
                     if swap.is_ok() {
                         // Install the migration subprotocol handler —
                         // this is the runtime's one-time side effect
-                        // on the underlying `Mesh`. Constructed from
-                        // the orchestrator / source / target the
-                        // runtime already owns so wire events land in
-                        // the same state a local `start_migration`
-                        // call sees.
+                        // on the underlying `Mesh`. Constructed with
+                        // an `IdentityContext` derived from the
+                        // mesh's own Noise static key + the
+                        // `peer_static_x25519` accessor so the
+                        // dispatcher can auto-seal envelopes on the
+                        // source path and auto-open them on the
+                        // target path.
                         let local_node_id = self.inner.mesh.inner().node_id();
-                        let handler = Arc::new(MigrationSubprotocolHandler::new(
+                        let mesh_for_lookup = self.inner.mesh.clone();
+                        let ctx = MigrationIdentityContext {
+                            local_x25519_priv: self.inner.mesh.inner().static_x25519_priv(),
+                            peer_static_lookup: Arc::new(move |node_id: u64| {
+                                mesh_for_lookup.inner().peer_static_x25519(node_id)
+                            }),
+                        };
+                        let handler = Arc::new(MigrationSubprotocolHandler::new_with_identity(
                             self.inner.orchestrator.clone(),
                             self.inner.source_handler.clone(),
                             self.inner.target_handler.clone(),
                             local_node_id,
+                            Some(ctx),
                         ));
                         self.inner.mesh.inner().set_migration_handler(handler);
                         return Ok(());
@@ -526,12 +538,47 @@ impl DaemonRuntime {
         source_node: u64,
         target_node: u64,
     ) -> Result<MigrationHandle, DaemonError> {
+        self.start_migration_with(origin_hash, source_node, target_node, MigrationOpts::default())
+            .await
+    }
+
+    /// `start_migration` with caller-supplied options. Stage 6 of
+    /// [`DAEMON_IDENTITY_MIGRATION_PLAN.md`](../../../docs/DAEMON_IDENTITY_MIGRATION_PLAN.md):
+    /// lets the caller opt out of identity transport when the daemon
+    /// doesn't need to sign anything on the target.
+    pub async fn start_migration_with(
+        &self,
+        origin_hash: u32,
+        source_node: u64,
+        target_node: u64,
+        opts: MigrationOpts,
+    ) -> Result<MigrationHandle, DaemonError> {
         self.require_ready()?;
-        let first_msg = self
+        let mut first_msg = self
             .inner
             .orchestrator
             .start_migration(origin_hash, source_node, target_node)
             .map_err(DaemonError::Migration)?;
+
+        // Local-source path: `start_migration` builds `SnapshotReady`
+        // synchronously from the local registry. If the caller asked
+        // for identity transport, seal the envelope HERE — the
+        // dispatcher's source-side seal only fires on the TakeSnapshot
+        // path (remote source). Decoding + re-encoding isolates the
+        // payload cleanly.
+        if opts.transport_identity {
+            if let MigrationMessage::SnapshotReady {
+                ref mut snapshot_bytes,
+                ..
+            } = first_msg
+            {
+                if let Some(sealed) =
+                    self.maybe_seal_local_snapshot(origin_hash, target_node, snapshot_bytes)
+                {
+                    *snapshot_bytes = sealed;
+                }
+            }
+        }
 
         // Send the first message to the appropriate node. `start_migration`
         // returns `TakeSnapshot` when source is remote, `SnapshotReady`
@@ -568,6 +615,30 @@ impl DaemonRuntime {
             target_node,
             runtime: self.clone(),
         })
+    }
+
+    /// Decode `snapshot_bytes`, attempt to seal an identity envelope
+    /// using the local daemon's keypair + target's X25519 static
+    /// pubkey, and re-encode. Returns `Some(new_bytes)` on success,
+    /// `None` if any prerequisite is missing — the caller treats
+    /// `None` as "proceed without envelope," matching the remote-
+    /// source dispatcher's public-identity fallback.
+    fn maybe_seal_local_snapshot(
+        &self,
+        daemon_origin: u32,
+        target_node: u64,
+        snapshot_bytes: &[u8],
+    ) -> Option<Vec<u8>> {
+        let snapshot = StateSnapshot::from_bytes(snapshot_bytes)?;
+        if snapshot.identity_envelope.is_some() {
+            return None;
+        }
+        let target_pub = self.inner.mesh.inner().peer_static_x25519(target_node)?;
+        let kp = self.inner.registry.daemon_keypair(daemon_origin)?;
+        match snapshot.with_identity_envelope(&kp, target_pub) {
+            Ok(sealed) => Some(sealed.to_bytes()),
+            Err(_) => None,
+        }
     }
 
     async fn send_migration_message(
@@ -681,6 +752,38 @@ impl std::fmt::Debug for DaemonHandle {
             .field("origin_hash", &format_args!("{:#x}", self.origin_hash))
             .field("entity_id", &self.entity_id)
             .finish()
+    }
+}
+
+/// Options for [`DaemonRuntime::start_migration_with`].
+///
+/// Stage 6 of
+/// [`DAEMON_IDENTITY_MIGRATION_PLAN.md`](../../../docs/DAEMON_IDENTITY_MIGRATION_PLAN.md) —
+/// lets the caller opt out of identity transport for workloads that
+/// don't need post-migration signing capability (pure compute
+/// daemons). Default: identity IS transported.
+#[derive(Debug, Clone)]
+pub struct MigrationOpts {
+    /// If `true` (default), the source node seals its daemon's
+    /// ed25519 seed into the outbound snapshot using the target's
+    /// X25519 static pubkey. The target unseals on arrival and the
+    /// migrated daemon keeps its full signing capability.
+    ///
+    /// If `false`, the envelope is omitted and the target
+    /// reconstructs the daemon with a `public_only` keypair —
+    /// identity queries (`entity_id`, `origin_hash`) work, but
+    /// `sign` calls fail with `EntityError::ReadOnly`. Appropriate
+    /// for pure compute daemons that only consume events and emit
+    /// payloads, and do NOT need to mint capability announcements
+    /// or issue permission tokens from the target.
+    pub transport_identity: bool,
+}
+
+impl Default for MigrationOpts {
+    fn default() -> Self {
+        Self {
+            transport_identity: true,
+        }
     }
 }
 

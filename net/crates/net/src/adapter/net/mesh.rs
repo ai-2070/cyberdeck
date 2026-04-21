@@ -971,6 +971,20 @@ impl MeshNode {
         self.peers.get(&node_id).map(|e| e.value().addr)
     }
 
+    /// The local Noise static X25519 **private** key — the secret
+    /// half that unseals identity envelopes addressed to this node.
+    /// Clone of the 32-byte seed; caller owns the copy.
+    ///
+    /// Used by the daemon migration target path to open
+    /// [`IdentityEnvelope`](crate::adapter::net::identity::IdentityEnvelope)s
+    /// that source nodes seal against this node's public static.
+    /// Exposed at this layer because the migration dispatcher runs
+    /// inside `MeshNode` and needs a concrete private key to pass
+    /// to the envelope-open primitives.
+    pub fn static_x25519_priv(&self) -> [u8; 32] {
+        self.static_keypair.private
+    }
+
     /// The peer's Noise static X25519 public key, captured during
     /// the handshake that established the session. Load-bearing for
     /// daemon migration: the source uses this key as the seal

@@ -17,7 +17,9 @@ pub mod stream_window;
 pub const SUBPROTOCOL_NEGOTIATION: u16 = 0x0600;
 
 pub use descriptor::{SubprotocolDescriptor, SubprotocolVersion, MANIFEST_ENTRY_SIZE};
-pub use migration_handler::{MigrationSubprotocolHandler, OutboundMigrationMessage};
+pub use migration_handler::{
+    MigrationIdentityContext, MigrationSubprotocolHandler, OutboundMigrationMessage,
+};
 pub use negotiation::{negotiate, ManifestEntry, NegotiatedSet, SubprotocolManifest};
 pub use registry::SubprotocolRegistry;
 pub use stream_window::{StreamWindow, SUBPROTOCOL_STREAM_WINDOW};

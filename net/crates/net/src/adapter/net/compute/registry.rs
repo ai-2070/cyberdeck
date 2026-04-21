@@ -107,6 +107,23 @@ impl DaemonRegistry {
     pub fn contains(&self, origin_hash: u32) -> bool {
         self.daemons.contains_key(&origin_hash)
     }
+
+    /// Clone the signing keypair of a locally-registered daemon.
+    ///
+    /// Used by the migration-source path to seal the daemon's
+    /// identity into an [`IdentityEnvelope`] before shipping its
+    /// snapshot. Returns `None` when the daemon isn't registered
+    /// (already unregistered / never spawned here). The clone is
+    /// deliberate — the caller gets its own keypair instance that
+    /// outlives the host's internal lock guard.
+    pub fn daemon_keypair(
+        &self,
+        origin_hash: u32,
+    ) -> Option<crate::adapter::net::identity::EntityKeypair> {
+        let entry = self.daemons.get(&origin_hash)?;
+        let host = entry.lock();
+        Some(host.keypair().clone())
+    }
 }
 
 impl Default for DaemonRegistry {
