@@ -290,6 +290,184 @@ async fn spawn_from_snapshot_rejects_identity_mismatch() {
     );
 }
 
+/// Regression (Cubic-AI P1): `spawn_from_snapshot` used to compare
+/// only `origin_hash` (a 32-bit BLAKE2s projection of the entity
+/// pubkey), not the full 32-byte `entity_id`. On a birthday-bounded
+/// collision (~2^16 daemons in a pool, ~2^32 across a runtime's
+/// lifetime), two legitimately-different identities can share the
+/// same `origin_hash`. Pre-fix, the SDK would accept the mismatched
+/// identity at its check layer, create a factory entry, and only
+/// fail much later when `DaemonHost::from_snapshot` did its own
+/// full-bytes check — surfacing as `DaemonError::Core(RestoreFailed)`
+/// rather than the semantically correct `SnapshotIdentityMismatch`.
+/// Callers relying on the typed error (the docstring advertises it)
+/// would never see it.
+///
+/// This test brute-force searches for a real origin_hash collision
+/// between two ed25519 keypairs, then feeds the snapshot of one
+/// through `spawn_from_snapshot` with the other's identity.
+///
+/// Runtime: ~1–3 seconds on modern hardware (birthday-bound ~2^16
+/// keygens against a 32-bit hash). Bounded at 300 000 attempts to
+/// prevent pathological CI hangs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_from_snapshot_checks_full_entity_id_not_just_origin_hash() {
+    use std::collections::HashMap;
+
+    // Deterministic-seed brute force: Identity::from_seed takes any
+    // 32-byte value, so iterate a counter → seed for reproducibility.
+    let mut seen: HashMap<u32, Identity> = HashMap::new();
+    let mut collision: Option<(Identity, Identity)> = None;
+    for i in 0u64..300_000 {
+        let mut seed = [0u8; 32];
+        seed[..8].copy_from_slice(&i.to_le_bytes());
+        let id = Identity::from_seed(seed);
+        let h = id.keypair().origin_hash();
+        if let Some(prior) = seen.remove(&h) {
+            if prior.entity_id() != id.entity_id() {
+                collision = Some((prior, id));
+                break;
+            }
+        }
+        seen.insert(h, id);
+    }
+    let (ident_a, ident_b) = collision
+        .expect("no origin_hash collision found within the attempt budget — try raising the bound");
+    assert_eq!(
+        ident_a.keypair().origin_hash(),
+        ident_b.keypair().origin_hash(),
+        "fixture: pair must collide on origin_hash",
+    );
+    assert_ne!(
+        ident_a.entity_id(),
+        ident_b.entity_id(),
+        "fixture: pair must have different entity_ids",
+    );
+
+    let rt = runtime().await;
+    rt.register_factory("counter", || Box::new(CounterDaemon { count: 0 }))
+        .expect("register");
+    rt.start().await.expect("start");
+
+    // Spawn with A, take a real snapshot, stop.
+    let handle = rt
+        .spawn("counter", ident_a.clone(), DaemonHostConfig::default())
+        .await
+        .expect("spawn A");
+    let snapshot = handle
+        .snapshot()
+        .await
+        .expect("snapshot")
+        .expect("counter is stateful");
+    rt.stop(handle.origin_hash).await.expect("stop");
+
+    // Attempt restore with B, whose origin_hash collides with A's
+    // but whose full entity_id differs. Must be rejected at the
+    // SDK check layer with the typed `SnapshotIdentityMismatch`
+    // variant — NOT `DaemonError::Core(RestoreFailed)`, which
+    // would indicate the check slipped past the SDK and was only
+    // caught by the deeper `DaemonHost::from_snapshot` backstop.
+    let err = rt
+        .spawn_from_snapshot("counter", ident_b, snapshot, DaemonHostConfig::default())
+        .await
+        .expect_err("collision but distinct entity_id must reject");
+    match err {
+        DaemonError::SnapshotIdentityMismatch { .. } => {}
+        DaemonError::Core(inner) => panic!(
+            "origin_hash collision slipped past the SDK check and was only caught by the \
+             core backstop ({inner:?}); the SDK must do its own full-entity_id check",
+        ),
+        other => panic!("expected SnapshotIdentityMismatch, got {other:?}"),
+    }
+}
+
+/// Regression (Cubic-AI P1): `start()` used to flip the runtime
+/// state to `Ready` **before** calling `set_migration_handler`.
+/// Any thread observing `is_ready() == true` in that window would
+/// try to migrate against a handler-less mesh — the dispatcher's
+/// fallback synthesises `ComputeNotSupported`, aborting the
+/// migration nondeterministically during startup.
+///
+/// The fix installs the handler first, then CAS-flips state. This
+/// test races a background observer against `start()`: the watcher
+/// spin-reads `is_ready()` and records whether `has_migration_handler()`
+/// was false at the moment `is_ready()` first became true. Under
+/// the pre-fix ordering, the watcher occasionally catches the gap.
+/// Under the fix, the handler is always live by the time state
+/// publishes `Ready`.
+///
+/// The test repeats the observation many times to make a single
+/// flaky run unlikely to mask a regression. `std::thread` (not
+/// `tokio::spawn`) is used because the observer needs to tight-
+/// loop across the runtime's state transitions; tokio cooperative
+/// scheduling could starve it long past the race window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn start_installs_handler_before_publishing_ready() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering as AOrd};
+    use std::sync::Arc as StdArc;
+
+    // 64 trials total. A single observable race is enough to fail
+    // the test — the assertion trips on the first gap witnessed.
+    for trial in 0..64u32 {
+        let rt = runtime().await;
+        let mesh = rt.mesh().clone();
+
+        // Shared signals between observer thread and the main
+        // task. `gap_witnessed` records the bug; `started` asks
+        // the observer to stop after start() completes so we can
+        // join it.
+        let gap_witnessed = StdArc::new(AtomicBool::new(false));
+        let observer_done = StdArc::new(AtomicBool::new(false));
+        let first_ready_tick = StdArc::new(AtomicU32::new(0));
+
+        let rt_w = rt.clone();
+        let mesh_w = mesh.clone();
+        let gap_w = gap_witnessed.clone();
+        let done_w = observer_done.clone();
+        let first_w = first_ready_tick.clone();
+
+        let observer = std::thread::spawn(move || {
+            let mut ticks = 0u32;
+            // Spin until is_ready() flips. At the moment of the
+            // flip, check whether the handler is installed. Under
+            // the pre-fix ordering, the flip can precede the
+            // install → `has_migration_handler == false`.
+            loop {
+                if rt_w.is_ready() {
+                    if !mesh_w.inner().has_migration_handler() {
+                        gap_w.store(true, AOrd::Release);
+                    }
+                    first_w.store(ticks, AOrd::Release);
+                    break;
+                }
+                ticks = ticks.saturating_add(1);
+                // Yield rarely; tight loop keeps us in the window.
+                if ticks & 0xFFFF == 0 {
+                    std::thread::yield_now();
+                }
+                if done_w.load(AOrd::Acquire) {
+                    return;
+                }
+            }
+        });
+
+        // Small jitter so the observer has a chance to hit the
+        // spin loop before start() executes.
+        std::thread::sleep(std::time::Duration::from_micros(50));
+        rt.start().await.expect("start");
+        observer_done.store(true, AOrd::Release);
+        observer.join().expect("observer panicked");
+
+        assert!(
+            !gap_witnessed.load(AOrd::Acquire),
+            "trial {trial}: observed Ready-without-handler gap — start() flipped state \
+             to Ready before set_migration_handler completed",
+        );
+
+        let _ = first_ready_tick.load(AOrd::Acquire); // keep for debugging
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_unknown_kind_errors() {
     let rt = runtime().await;

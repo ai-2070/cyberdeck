@@ -43,7 +43,7 @@ use crate::adapter::net::state::snapshot::StateSnapshot;
 /// node's identity in the mesh, not just the envelope-open path.
 ///
 /// The private key is now captured inside the `unseal_snapshot`
-/// closure (built by [`MeshNode::migration_identity_context`]) and
+/// closure (built by [`MeshNode::migration_identity_context`](crate::adapter::net::MeshNode::migration_identity_context)) and
 /// never surfaced as a struct field. Callers can still hand the
 /// context to the dispatcher, but they cannot extract the key from
 /// it. This matches how `peer_static_lookup` already worked.
@@ -55,7 +55,7 @@ pub struct MigrationIdentityContext {
     /// no envelope, `Ok(Some(kp))` on a successful open, and an
     /// error string on seal-open / attestation failure.
     ///
-    /// Built by [`MeshNode::migration_identity_context`]; the
+    /// Built by [`MeshNode::migration_identity_context`](crate::adapter::net::MeshNode::migration_identity_context); the
     /// closure owns a `zeroize`-on-drop `StaticSecret` so the key
     /// material is wiped when the context is dropped.
     pub unseal_snapshot: EnvelopeUnsealFn,
@@ -134,8 +134,8 @@ pub type FailureCallback =
     Arc<dyn Fn(u32, crate::adapter::net::compute::MigrationFailureReason) + Send + Sync>;
 
 /// Callback that opens an identity envelope carried on a
-/// [`StateSnapshot`](crate::adapter::net::state::snapshot::StateSnapshot),
-/// using a local private key captured inside the closure. See
+/// [`crate::adapter::net::state::snapshot::StateSnapshot`], using a
+/// local private key captured inside the closure. See
 /// [`MigrationIdentityContext`] for key-hygiene rationale.
 pub type EnvelopeUnsealFn = Arc<
     dyn Fn(
@@ -316,7 +316,7 @@ impl MigrationSubprotocolHandler {
                 // daemon's keypair into the snapshot before chunking
                 // so the target can reconstruct identity without an
                 // out-of-band pre-registration.
-                snapshot = self.maybe_seal_envelope(snapshot, daemon_origin, target_node);
+                snapshot = self.maybe_seal_envelope(snapshot, daemon_origin, target_node)?;
 
                 // Chunk the snapshot for transport
                 let chunks = crate::adapter::net::compute::orchestrator::chunk_snapshot(
@@ -829,28 +829,41 @@ impl MigrationSubprotocolHandler {
 
     /// Source-side helper: if we have an identity-transport context
     /// and the target's X25519 pubkey is available, seal the
-    /// daemon's keypair into the snapshot. On any missing piece
-    /// (context, target key, daemon keypair), pass the snapshot
-    /// through unchanged — the dispatcher treats a no-envelope path
-    /// as "public-identity migration" and expects the target to
-    /// have a pre-registered keypair.
+    /// daemon's keypair into the snapshot.
+    ///
+    /// Resolution:
+    /// - **Prerequisite missing** (no context, target key not known,
+    ///   or daemon keypair absent from the local registry): return
+    ///   the snapshot unchanged. This is the legitimate public-
+    ///   identity / NKpsk0-responder fallback — the target is
+    ///   expected to have a pre-registered keypair.
+    /// - **Prerequisites met, seal crypto succeeds**: return the
+    ///   sealed snapshot.
+    /// - **Prerequisites met, seal crypto fails**: fail the
+    ///   migration. Silently downgrading to unsealed transport would
+    ///   break the identity-transport guarantee the caller installed
+    ///   `identity_context` to obtain — the target would restore
+    ///   using whatever fallback keypair the factory registry carries
+    ///   (possibly nothing, possibly a stale mismatch), and any later
+    ///   signature the daemon produces on the target would be bound
+    ///   to the wrong identity. The only honest response is to abort.
     fn maybe_seal_envelope(
         &self,
         snapshot: StateSnapshot,
         daemon_origin: u32,
         target_node: u64,
-    ) -> StateSnapshot {
+    ) -> Result<StateSnapshot, MigrationError> {
         let Some(ctx) = &self.identity_context else {
-            return snapshot;
+            return Ok(snapshot);
         };
         // Skip if the snapshot already carries an envelope (e.g. the
         // SDK pre-sealed at `start_migration` time for a local-source
         // case).
         if snapshot.identity_envelope.is_some() {
-            return snapshot;
+            return Ok(snapshot);
         }
         let Some(target_pub) = (ctx.peer_static_lookup)(target_node) else {
-            return snapshot;
+            return Ok(snapshot);
         };
         // Find the daemon's keypair in the local registry. The
         // orchestrator + source_handler + target_handler share one
@@ -860,24 +873,13 @@ impl MigrationSubprotocolHandler {
             .or_else(|| self.target_handler_registry_keypair(daemon_origin))
         {
             Some(kp) => kp,
-            None => return snapshot,
+            None => return Ok(snapshot),
         };
-        // Clone ahead of the consuming `with_identity_envelope` call
-        // so we can return the original on seal failure. `StateSnapshot`
-        // is `Clone`; the state payload is a `Bytes` (refcount bump),
-        // and the remaining fields are small.
-        let backup = snapshot.clone();
-        match snapshot.with_identity_envelope(&kp, target_pub) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    daemon_origin = format!("{:#x}", daemon_origin),
-                    error = %e,
-                    "identity envelope seal failed — proceeding without envelope",
-                );
-                backup
-            }
-        }
+        snapshot.with_identity_envelope(&kp, target_pub).map_err(|e| {
+            MigrationError::StateFailed(format!(
+                "identity envelope seal failed for daemon {daemon_origin:#x}: {e}"
+            ))
+        })
     }
 
     /// Read-only keypair fetch from the shared daemon registry
@@ -1132,6 +1134,171 @@ mod tests {
             }
             _ => panic!("expected SnapshotReady"),
         }
+    }
+
+    /// Regression (Cubic-AI P2): `maybe_seal_envelope` used to
+    /// swallow seal-crypto errors (e.g. a public-only source
+    /// keypair) and return the **unsealed** snapshot to the caller,
+    /// downgrading identity transport silently. Any target that
+    /// relied on the envelope to supply the daemon keypair
+    /// (`expect_migration` placeholder + no out-of-band keypair)
+    /// would then fail to restore, or — worse — restore under a
+    /// stale fallback keypair and produce mis-signed outputs.
+    ///
+    /// The fix makes the helper return `Result` and propagate seal
+    /// failures as `MigrationError::StateFailed`. Callers abort
+    /// rather than ship an unsealed snapshot they didn't ask for.
+    ///
+    /// This test stages the exact failure mode: register a daemon
+    /// with a public-only `EntityKeypair`, install an identity
+    /// context that successfully resolves the target's static, then
+    /// ask `maybe_seal_envelope` to seal. The underlying crypto
+    /// rejects (public-only can't sign the attestation) and the
+    /// helper must surface it.
+    #[test]
+    fn maybe_seal_envelope_propagates_seal_failures() {
+        use crate::adapter::net::identity::IdentityEnvelope;
+        use crate::adapter::net::state::snapshot::StateSnapshot;
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Secret};
+
+        // Target's X25519 static — arbitrary fresh key.
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).unwrap();
+        let target_priv = X25519Secret::from(seed);
+        let target_pub = *X25519Pub::from(&target_priv).as_bytes();
+        let target_node_id: u64 = 0x2222;
+
+        // Daemon keypair: generate a real one for the entity_id,
+        // then strip the signing half via `public_only`. The
+        // registry will hand this out; the seal will try to sign
+        // the attestation transcript and fail.
+        let real_kp = EntityKeypair::generate();
+        let origin_hash = real_kp.origin_hash();
+        let public_only_kp = EntityKeypair::public_only(real_kp.entity_id().clone());
+        assert!(
+            public_only_kp.is_read_only(),
+            "fixture: must be public-only",
+        );
+
+        // Register a DaemonHost using the public-only keypair so
+        // `source_handler_registry_keypair` → `daemon_keypair`
+        // returns it. The daemon body is irrelevant.
+        let reg = Arc::new(DaemonRegistry::new());
+        let host = DaemonHost::new(
+            Box::new(TestDaemon { value: 0 }),
+            public_only_kp,
+            DaemonHostConfig::default(),
+        );
+        reg.register(host).unwrap();
+
+        // Build a matching snapshot the normal way — same origin,
+        // same entity_id.
+        let snapshot = StateSnapshot {
+            version: crate::adapter::net::state::snapshot::SNAPSHOT_VERSION,
+            entity_id: real_kp.entity_id().clone(),
+            chain_link: crate::adapter::net::state::causal::CausalLink {
+                origin_hash,
+                horizon_encoded: 0,
+                sequence: 0,
+                parent_hash: 0,
+            },
+            through_seq: 0,
+            state: Bytes::from_static(&[0u8; 8]),
+            horizon: Default::default(),
+            created_at: 0,
+            bindings_bytes: Vec::new(),
+            identity_envelope: None,
+        };
+
+        // Wire the identity context so `peer_static_lookup` returns
+        // the target pub — i.e., every prerequisite is satisfied.
+        // The unseal closure isn't exercised on the source path.
+        let unseal_snapshot: EnvelopeUnsealFn = Arc::new(move |snap: &StateSnapshot| {
+            snap.open_identity_envelope(&target_priv)
+        });
+        let peer_static_lookup: Arc<dyn Fn(u64) -> Option<[u8; 32]> + Send + Sync> =
+            Arc::new(move |nid| {
+                if nid == target_node_id {
+                    Some(target_pub)
+                } else {
+                    None
+                }
+            });
+        let ctx = MigrationIdentityContext {
+            unseal_snapshot,
+            peer_static_lookup,
+        };
+
+        let orch = Arc::new(MigrationOrchestrator::new(reg.clone(), 0x1111));
+        let source = Arc::new(MigrationSourceHandler::new(reg.clone()));
+        let target = Arc::new(MigrationTargetHandler::new(reg));
+        let handler = MigrationSubprotocolHandler::with_hooks(
+            orch,
+            source,
+            target,
+            0x1111,
+            MigrationHandlerHooks {
+                identity: Some(ctx),
+                ..Default::default()
+            },
+        );
+
+        // With all prerequisites satisfied but crypto guaranteed to
+        // fail (public-only keypair can't attest), the helper must
+        // surface an error — not return the unsealed snapshot.
+        let err = handler
+            .maybe_seal_envelope(snapshot, origin_hash, target_node_id)
+            .expect_err(
+                "public-only daemon keypair must fail to seal; silently returning the \
+                 unsealed snapshot breaks the identity-transport guarantee",
+            );
+        match err {
+            MigrationError::StateFailed(ref msg) => {
+                assert!(
+                    msg.contains("envelope seal failed"),
+                    "expected 'envelope seal failed' in message, got: {msg}",
+                );
+                assert!(
+                    msg.contains(&format!("{origin_hash:#x}")),
+                    "expected origin_hash in message, got: {msg}",
+                );
+            }
+            other => panic!("expected StateFailed, got {other:?}"),
+        }
+
+        // Belt-and-braces: the unsealed-fallback path (no context)
+        // still works — proves this test isn't accidentally
+        // asserting `maybe_seal_envelope` always errors.
+        let handler_no_ctx = MigrationSubprotocolHandler::new(
+            Arc::new(MigrationOrchestrator::new(
+                Arc::new(DaemonRegistry::new()),
+                0x1111,
+            )),
+            Arc::new(MigrationSourceHandler::new(Arc::new(DaemonRegistry::new()))),
+            Arc::new(MigrationTargetHandler::new(Arc::new(DaemonRegistry::new()))),
+            0x1111,
+        );
+        let snapshot2 = StateSnapshot {
+            version: crate::adapter::net::state::snapshot::SNAPSHOT_VERSION,
+            entity_id: real_kp.entity_id().clone(),
+            chain_link: crate::adapter::net::state::causal::CausalLink {
+                origin_hash,
+                horizon_encoded: 0,
+                sequence: 0,
+                parent_hash: 0,
+            },
+            through_seq: 0,
+            state: Bytes::from_static(&[0u8; 8]),
+            horizon: Default::default(),
+            created_at: 0,
+            bindings_bytes: Vec::new(),
+            identity_envelope: None,
+        };
+        let passthrough = handler_no_ctx
+            .maybe_seal_envelope(snapshot2, origin_hash, target_node_id)
+            .expect("no ctx = ok unchanged");
+        assert!(passthrough.identity_envelope.is_none());
+        let _ = IdentityEnvelope::new; // silence unused import
     }
 
     #[test]

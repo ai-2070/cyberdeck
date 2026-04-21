@@ -1001,7 +1001,8 @@ impl MeshNode {
         self.peers.get(&node_id).map(|e| e.value().addr)
     }
 
-    /// Build a [`MigrationIdentityContext`] bound to this node.
+    /// Build a [`MigrationIdentityContext`](crate::adapter::net::subprotocol::MigrationIdentityContext)
+    /// bound to this node.
     ///
     /// The context's closures capture this node's long-term Noise
     /// static private key (for the envelope-open path) and an
@@ -1118,6 +1119,15 @@ impl MeshNode {
     /// state).
     pub fn set_migration_handler(&self, handler: Arc<MigrationSubprotocolHandler>) {
         self.migration_handler.store(Some(handler));
+    }
+
+    /// Returns `true` iff a migration subprotocol handler is
+    /// currently installed on this mesh. Used primarily by tests
+    /// that need to observe the ordering of handler installation
+    /// against other runtime state transitions — the `ArcSwap` load
+    /// itself is a public API surface regardless.
+    pub fn has_migration_handler(&self) -> bool {
+        self.migration_handler.load().is_some()
     }
 
     /// Block packets from/to a peer address (simulates network partition).

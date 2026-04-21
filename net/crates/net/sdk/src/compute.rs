@@ -267,6 +267,29 @@ impl DaemonRuntime {
         loop {
             match self.state() {
                 State::Registering => {
+                    // Install the migration subprotocol handler
+                    // **before** publishing `Ready`. Other threads
+                    // that observe `Ready` must be able to rely on
+                    // the handler being live: the previous ordering
+                    // (CAS → install) left a window where a
+                    // concurrent caller read `Ready`, began a
+                    // migration, and sent `SnapshotReady` onto a
+                    // mesh whose handler slot was still empty —
+                    // the dispatcher's no-handler fallback would
+                    // synthesise `ComputeNotSupported`, aborting
+                    // the migration nondeterministically during
+                    // startup.
+                    //
+                    // Double-install is safe: `set_migration_handler`
+                    // is an `ArcSwap` store, so if two concurrent
+                    // `start()`s both reach this point the later
+                    // store just wins and the CAS picks one caller
+                    // to return first. Both built handlers are
+                    // functionally equivalent (same registry,
+                    // orchestrator, hooks).
+                    let handler = Arc::new(self.build_migration_handler());
+                    self.inner.mesh.inner().set_migration_handler(handler);
+
                     let swap = self.inner.state.compare_exchange(
                         State::Registering as u8,
                         State::Ready as u8,
@@ -274,100 +297,93 @@ impl DaemonRuntime {
                         Ordering::Acquire,
                     );
                     if swap.is_ok() {
-                        // Install the migration subprotocol handler —
-                        // this is the runtime's one-time side effect
-                        // on the underlying `Mesh`. Constructed with:
-                        //
-                        // - `IdentityContext`: auto-seal envelopes on
-                        //   source, auto-open on target (Stage 5b of
-                        //   the identity-migration plan).
-                        // - `PostRestoreCallback`: fires subscription
-                        //   replay on the target after a successful
-                        //   restore (Stage 3 of the channel-re-bind
-                        //   plan). Walks the restored daemon's
-                        //   ledger and spawns async
-                        //   `subscribe_channel` calls.
-                        let local_node_id = self.inner.mesh.inner().node_id();
-                        // Ask the core crate to build the context. The
-                        // Noise static private key is captured inside
-                        // closures the core owns and never crosses
-                        // this boundary as raw bytes — see
-                        // `MeshNode::migration_identity_context`.
-                        let ctx = self.inner.mesh.inner().migration_identity_context();
-                        let inner_for_rebind = self.inner.clone();
-                        let post_restore: PostRestoreCallback =
-                            Arc::new(move |origin_hash: u32| {
-                                let inner = inner_for_rebind.clone();
-                                tokio::spawn(async move {
-                                    replay_subscriptions(inner, origin_hash).await;
-                                });
-                            });
-                        let inner_for_teardown = self.inner.clone();
-                        let pre_cleanup: PreCleanupCallback = Arc::new(move |origin_hash: u32| {
-                            // Snapshot the ledger BEFORE cleanup
-                            // drops the host — after that, the
-                            // ledger is gone. Spawn async
-                            // unsubscribes so the dispatcher
-                            // thread returns immediately.
-                            let bindings = inner_for_teardown
-                                .registry
-                                .with_host(origin_hash, |host| {
-                                    host.bindings_snapshot().subscriptions
-                                })
-                                .unwrap_or_default();
-                            if bindings.is_empty() {
-                                return;
-                            }
-                            let inner = inner_for_teardown.clone();
-                            tokio::spawn(async move {
-                                teardown_subscriptions(inner, bindings).await;
-                            });
-                        });
-                        let inner_for_readiness = self.inner.clone();
-                        let readiness: ReadinessCallback = Arc::new(move || {
-                            // Test-only: `simulate_not_ready` flips
-                            // the predicate to false regardless of
-                            // the underlying lifecycle state. Honour
-                            // it first so integration tests can
-                            // drive the NotReady retry path.
-                            if inner_for_readiness
-                                .simulate_not_ready
-                                .load(Ordering::Acquire)
-                            {
-                                return false;
-                            }
-                            inner_for_readiness.state.load(Ordering::Acquire) == State::Ready as u8
-                        });
-                        let inner_for_failure = self.inner.clone();
-                        let failure: FailureCallback =
-                            Arc::new(move |origin_hash: u32, reason: MigrationFailureReason| {
-                                if let Ok(mut map) = inner_for_failure.recent_failures.lock() {
-                                    map.insert(origin_hash, reason);
-                                }
-                            });
-                        let handler = Arc::new(MigrationSubprotocolHandler::with_hooks(
-                            self.inner.orchestrator.clone(),
-                            self.inner.source_handler.clone(),
-                            self.inner.target_handler.clone(),
-                            local_node_id,
-                            MigrationHandlerHooks {
-                                identity: Some(ctx),
-                                post_restore: Some(post_restore),
-                                pre_cleanup: Some(pre_cleanup),
-                                readiness: Some(readiness),
-                                failure: Some(failure),
-                            },
-                        ));
-                        self.inner.mesh.inner().set_migration_handler(handler);
                         return Ok(());
                     }
-                    // Lost the CAS — another caller flipped the state.
-                    // Loop and re-classify.
+                    // Lost the CAS — another caller flipped the state
+                    // and also installed a handler. Our own install
+                    // may have overwritten theirs with an equivalent
+                    // one; either way the mesh now holds a live
+                    // handler. Loop to re-classify and return Ok on
+                    // the `Ready` arm.
                 }
                 State::Ready => return Ok(()),
                 State::ShuttingDown => return Err(DaemonError::ShuttingDown),
             }
         }
+    }
+
+    /// Construct the migration subprotocol handler with every
+    /// hook wired — identity context, channel-rebind replay,
+    /// unsubscribe teardown, readiness predicate, failure
+    /// observer. Extracted so [`Self::start`] can install it
+    /// before the atomic state flip (race fix) without burying
+    /// the construction inline.
+    fn build_migration_handler(&self) -> MigrationSubprotocolHandler {
+        let local_node_id = self.inner.mesh.inner().node_id();
+        // Ask the core crate to build the context. The Noise static
+        // private key is captured inside closures the core owns and
+        // never crosses this boundary as raw bytes — see
+        // `MeshNode::migration_identity_context`.
+        let ctx = self.inner.mesh.inner().migration_identity_context();
+        let inner_for_rebind = self.inner.clone();
+        let post_restore: PostRestoreCallback = Arc::new(move |origin_hash: u32| {
+            let inner = inner_for_rebind.clone();
+            tokio::spawn(async move {
+                replay_subscriptions(inner, origin_hash).await;
+            });
+        });
+        let inner_for_teardown = self.inner.clone();
+        let pre_cleanup: PreCleanupCallback = Arc::new(move |origin_hash: u32| {
+            // Snapshot the ledger BEFORE cleanup drops the host —
+            // after that, the ledger is gone. Spawn async
+            // unsubscribes so the dispatcher thread returns
+            // immediately.
+            let bindings = inner_for_teardown
+                .registry
+                .with_host(origin_hash, |host| host.bindings_snapshot().subscriptions)
+                .unwrap_or_default();
+            if bindings.is_empty() {
+                return;
+            }
+            let inner = inner_for_teardown.clone();
+            tokio::spawn(async move {
+                teardown_subscriptions(inner, bindings).await;
+            });
+        });
+        let inner_for_readiness = self.inner.clone();
+        let readiness: ReadinessCallback = Arc::new(move || {
+            // Test-only: `simulate_not_ready` flips the predicate
+            // to false regardless of the underlying lifecycle
+            // state. Honour it first so integration tests can
+            // drive the NotReady retry path.
+            if inner_for_readiness
+                .simulate_not_ready
+                .load(Ordering::Acquire)
+            {
+                return false;
+            }
+            inner_for_readiness.state.load(Ordering::Acquire) == State::Ready as u8
+        });
+        let inner_for_failure = self.inner.clone();
+        let failure: FailureCallback =
+            Arc::new(move |origin_hash: u32, reason: MigrationFailureReason| {
+                if let Ok(mut map) = inner_for_failure.recent_failures.lock() {
+                    map.insert(origin_hash, reason);
+                }
+            });
+        MigrationSubprotocolHandler::with_hooks(
+            self.inner.orchestrator.clone(),
+            self.inner.source_handler.clone(),
+            self.inner.target_handler.clone(),
+            local_node_id,
+            MigrationHandlerHooks {
+                identity: Some(ctx),
+                post_restore: Some(post_restore),
+                pre_cleanup: Some(pre_cleanup),
+                readiness: Some(readiness),
+                failure: Some(failure),
+            },
+        )
     }
 
     /// Tear down the runtime. Unregisters every local daemon host,
@@ -502,7 +518,17 @@ impl DaemonRuntime {
         let origin_hash = keypair.origin_hash();
         let entity_id = keypair.entity_id().clone();
 
-        if snapshot.entity_id.origin_hash() != origin_hash {
+        // Compare the **full** 32-byte `entity_id`, not just the
+        // 32-bit `origin_hash` projection. `origin_hash` is a
+        // birthday-bounded 32-bit hash of the ed25519 public key;
+        // two legitimately-different identities can collide on
+        // `origin_hash` with probability ~2^-16 after ~65k daemons.
+        // A collision would let the *wrong* identity restore the
+        // snapshot, producing a daemon signed under one pubkey
+        // but claiming to be another — downstream signatures then
+        // verify against the wrong key and the daemon silently
+        // produces outputs no peer accepts.
+        if snapshot.entity_id != entity_id {
             return Err(DaemonError::SnapshotIdentityMismatch {
                 snapshot: snapshot.entity_id.origin_hash(),
                 identity: origin_hash,
@@ -898,10 +924,28 @@ impl DaemonRuntime {
                 ..
             } = first_msg
             {
-                if let Some(sealed) =
-                    self.maybe_seal_local_snapshot(origin_hash, target_node, snapshot_bytes)
-                {
-                    *snapshot_bytes = sealed;
+                // `?` on the seal's `Result` propagates hard failures
+                // (prerequisites met but crypto bug) and leaves the
+                // caller's orchestrator record to abort cleanly. A
+                // quiet `Ok(None)` means "prerequisites missing;
+                // proceed unsealed" — the documented fallback.
+                match self.maybe_seal_local_snapshot(
+                    origin_hash,
+                    target_node,
+                    snapshot_bytes,
+                ) {
+                    Ok(Some(sealed)) => *snapshot_bytes = sealed,
+                    Ok(None) => {}
+                    Err(e) => {
+                        // The orchestrator record was created by the
+                        // preceding `start_migration` call — roll it
+                        // back so a retry starts from phase 0.
+                        let _ = self.inner.orchestrator.abort_migration(
+                            origin_hash,
+                            format!("envelope seal failed: {e}"),
+                        );
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -948,26 +992,51 @@ impl DaemonRuntime {
 
     /// Decode `snapshot_bytes`, attempt to seal an identity envelope
     /// using the local daemon's keypair + target's X25519 static
-    /// pubkey, and re-encode. Returns `Some(new_bytes)` on success,
-    /// `None` if any prerequisite is missing — the caller treats
-    /// `None` as "proceed without envelope," matching the remote-
-    /// source dispatcher's public-identity fallback.
+    /// pubkey, and re-encode.
+    ///
+    /// Resolution:
+    /// - `Ok(None)`: the snapshot already has an envelope, or a
+    ///   transport prerequisite (peer static not known, daemon
+    ///   keypair absent) is missing. The caller proceeds with the
+    ///   original unsealed bytes — this matches the documented
+    ///   NKpsk0-responder / public-identity fallback.
+    /// - `Ok(Some(new_bytes))`: sealed successfully; caller should
+    ///   replace the snapshot payload.
+    /// - `Err(_)`: prerequisites were met but the seal operation
+    ///   itself failed. The caller **must** abort — silently
+    ///   proceeding with the unsealed snapshot would break the
+    ///   identity-transport guarantee the caller opted into via
+    ///   `MigrationOpts { transport_identity: true }`, and the
+    ///   target would restore under whatever fallback keypair the
+    ///   factory registry carries (possibly a stale or absent one).
     fn maybe_seal_local_snapshot(
         &self,
         daemon_origin: u32,
         target_node: u64,
         snapshot_bytes: &[u8],
-    ) -> Option<Vec<u8>> {
-        let snapshot = StateSnapshot::from_bytes(snapshot_bytes)?;
+    ) -> Result<Option<Vec<u8>>, DaemonError> {
+        let snapshot = StateSnapshot::from_bytes(snapshot_bytes).ok_or_else(|| {
+            DaemonError::Migration(MigrationError::StateFailed(
+                "failed to decode local snapshot for envelope sealing".into(),
+            ))
+        })?;
         if snapshot.identity_envelope.is_some() {
-            return None;
+            return Ok(None);
         }
-        let target_pub = self.inner.mesh.inner().peer_static_x25519(target_node)?;
-        let kp = self.inner.registry.daemon_keypair(daemon_origin)?;
-        match snapshot.with_identity_envelope(&kp, target_pub) {
-            Ok(sealed) => Some(sealed.to_bytes()),
-            Err(_) => None,
-        }
+        let Some(target_pub) = self.inner.mesh.inner().peer_static_x25519(target_node) else {
+            return Ok(None);
+        };
+        let Some(kp) = self.inner.registry.daemon_keypair(daemon_origin) else {
+            return Ok(None);
+        };
+        snapshot
+            .with_identity_envelope(&kp, target_pub)
+            .map(|sealed| Some(sealed.to_bytes()))
+            .map_err(|e| {
+                DaemonError::Migration(MigrationError::StateFailed(format!(
+                    "identity envelope seal failed for daemon {daemon_origin:#x}: {e}"
+                )))
+            })
     }
 
     async fn send_migration_message(
@@ -1431,12 +1500,20 @@ impl MigrationHandle {
                 ..
             } = first_msg
             {
-                if let Some(sealed) = self.runtime.maybe_seal_local_snapshot(
+                match self.runtime.maybe_seal_local_snapshot(
                     self.origin_hash,
                     self.target_node,
                     snapshot_bytes,
                 ) {
-                    *snapshot_bytes = sealed;
+                    Ok(Some(sealed)) => *snapshot_bytes = sealed,
+                    Ok(None) => {}
+                    Err(e) => {
+                        let _ = self.runtime.inner.orchestrator.abort_migration(
+                            self.origin_hash,
+                            format!("retry envelope seal failed: {e}"),
+                        );
+                        return Err(e);
+                    }
                 }
             }
         }

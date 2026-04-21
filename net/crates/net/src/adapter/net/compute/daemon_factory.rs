@@ -84,9 +84,8 @@ impl DaemonFactoryRegistry {
     /// [`Self::register_placeholder`] — there's no reason to make up
     /// a fake keypair for the target.
     ///
-    /// Returns
-    /// [`DaemonError::ProcessFailed`](super::daemon::DaemonError::ProcessFailed)
-    /// when the `origin_hash` already has an entry (live or
+    /// Returns [`DaemonError::ProcessFailed`] when the `origin_hash`
+    /// already has an entry (live or
     /// placeholder). Callers that intend to replace an entry must
     /// [`Self::remove`] first. Insertion is atomic on collision —
     /// an existing entry is never clobbered, so a failed register
