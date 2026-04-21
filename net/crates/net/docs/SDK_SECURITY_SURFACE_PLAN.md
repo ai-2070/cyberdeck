@@ -31,17 +31,29 @@ This plan closes that gap. It is **additive** on top of [`SDK_EXPANSION_PLAN.md`
 
 | Feature | Rust SDK | TS SDK | Python SDK | Go SDK |
 |---|---|---|---|---|
-| `EntityKeypair` generate / sign | ✗ | ✗ | ✗ | ✗ |
-| `PermissionToken` issue / verify | ✗ | ✗ | ✗ | ✗ |
-| `TokenCache` | ✗ | ✗ | ✗ | ✗ |
-| `CapabilitySet` construction | ✗ | ✗ | ✗ | ✗ |
-| `CapabilityAnnouncement` emit | ✗ | ✗ | ✗ | ✗ |
-| `CapabilityIndex` query | ✗ | ✗ | ✗ | ✗ |
-| `SubnetId` / `SubnetPolicy` | ✗ | ✗ | ✗ | ✗ |
+| `EntityKeypair` generate / sign | ✓ | ✓ | ✓ | ✓ |
+| `PermissionToken` issue / verify | ✓ | ✓ | ✓ | ✓ |
+| `PermissionToken` delegate | ✓ | ✓ | ✓ | ✓ |
+| `TokenCache` | ✓ | ✓ | ✓ | ✓ |
+| `CapabilitySet` construction | ✓ | ✓ | ✓ (dict) | ✓ (struct) |
+| `CapabilityAnnouncement` emit | ✓ | ✓ | ✓ | ✓ |
+| `CapabilityIndex` query (`find_peers`) | ✓ | ✓ | ✓ | ✓ |
+| `SubnetId` / `SubnetPolicy` | ✓ | ✓ | ✓ | ✓ |
 | `SubnetGateway` forwarding | ✗ (core only) | ✗ | ✗ | ✗ |
-| Channel auth (token-gated) | blocked on above | blocked | blocked | blocked |
+| Channel auth — `publish_caps` / `subscribe_caps` | ✓ | ✓ | ✓ | ✓ |
+| Channel auth — token-gated subscribe | ✓ | ✓ | ✓ | ✓ |
+| `AuthGuard` fast path on publish fan-out | ✓ | ✓ (via NAPI) | ✓ (via PyO3) | ✓ (via C FFI) |
+| Mid-subscription token-expiry sweep | ✓ | ✓ (via NAPI) | ✓ (via PyO3) | ✓ (via C FFI) |
+| Per-peer auth-failure rate limit | ✓ | ✓ (via NAPI) | ✓ (via PyO3) | ✓ (via C FFI) |
+| Multi-hop capability propagation | ✓ | ✓ (via NAPI) | ✓ (via PyO3) | ✓ (via C FFI) |
 
-Everything is core-only today. SDK users have literally no way to build a `PermissionToken`.
+Every row above is covered end-to-end through the Rust core —
+bindings inherit behaviour by sitting on top of `MeshNode`, so the
+hardening work from Stages H and M ships to every binding without a
+per-binding PR. `SubnetGateway` forwarding is the only remaining
+core-only feature: cross-subnet visibility on a dedicated gateway
+node is designed but not exposed through any SDK yet (tracked as a
+follow-up outside this plan).
 
 ## Design principles
 
