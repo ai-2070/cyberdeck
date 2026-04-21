@@ -1003,11 +1003,15 @@ mod tests {
         // clobber the first because the cache was keyed without
         // considering scope.
         assert!(
-            cache.check(subject.entity_id(), TokenScope::PUBLISH, channel).is_ok(),
+            cache
+                .check(subject.entity_id(), TokenScope::PUBLISH, channel)
+                .is_ok(),
             "publish auth lost after subscribe insert",
         );
         assert!(
-            cache.check(subject.entity_id(), TokenScope::SUBSCRIBE, channel).is_ok(),
+            cache
+                .check(subject.entity_id(), TokenScope::SUBSCRIBE, channel)
+                .is_ok(),
             "subscribe auth lost",
         );
     }

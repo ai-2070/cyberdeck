@@ -447,9 +447,8 @@ mod tests {
             }
         }
         let name_a = name_a.expect("seeded name");
-        let name_b = name_b.expect(
-            "two distinct ChannelNames with the same 16-bit hash — widen the search range",
-        );
+        let name_b = name_b
+            .expect("two distinct ChannelNames with the same 16-bit hash — widen the search range");
         assert_eq!(name_a.hash(), name_b.hash());
         assert_ne!(name_a.as_str(), name_b.as_str());
 
@@ -458,7 +457,10 @@ mod tests {
 
         // Fast-path collision: check_fast says Allowed for B because
         // it only sees the 16-bit hash.
-        assert_eq!(guard.check_fast(origin, name_b.hash()), AuthVerdict::Allowed);
+        assert_eq!(
+            guard.check_fast(origin, name_b.hash()),
+            AuthVerdict::Allowed
+        );
 
         // Exact check distinguishes them — this is what callers must
         // consult before trusting the fast-path verdict for any

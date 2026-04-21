@@ -287,12 +287,8 @@ async fn forged_node_id_rejected_even_with_valid_signature() {
     );
 
     let caps = CapabilitySet::new().add_tag("forged-node-id-probe");
-    let mut ann = CapabilityAnnouncement::new(
-        forged_node_id,
-        attacker_kp.entity_id().clone(),
-        1,
-        caps,
-    );
+    let mut ann =
+        CapabilityAnnouncement::new(forged_node_id, attacker_kp.entity_id().clone(), 1, caps);
     ann.sign(&attacker_kp);
     assert!(
         ann.verify().is_ok(),
@@ -363,8 +359,10 @@ async fn forwarded_announcement_does_not_tofu_pin_forwarder_to_victim_entity() {
     // The announcement may still land in the capability index for
     // the victim's node_id — that's fine, the signature is real.
     let filter = CapabilityFilter::new().require_tag("forwarded-tofu-probe");
-    let arrived =
-        wait_until(&receiver, |n| n.find_peers_by_filter(&filter).contains(&victim_node_id)).await;
+    let arrived = wait_until(&receiver, |n| {
+        n.find_peers_by_filter(&filter).contains(&victim_node_id)
+    })
+    .await;
     assert!(
         arrived,
         "receiver should still index the victim by node_id — signature is valid",

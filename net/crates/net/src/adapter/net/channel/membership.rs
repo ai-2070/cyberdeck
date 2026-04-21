@@ -198,10 +198,7 @@ pub fn decode(data: &[u8]) -> Result<MembershipMsg, MembershipCodecError> {
                         if token_len == 0 {
                             None
                         } else if cur.remaining() < token_len {
-                            return Err(MembershipCodecError::Overflow(
-                                token_len,
-                                cur.remaining(),
-                            ));
+                            return Err(MembershipCodecError::Overflow(token_len, cur.remaining()));
                         } else {
                             let tstart = cur.position() as usize;
                             let tend = tstart + token_len;
