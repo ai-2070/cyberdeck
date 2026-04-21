@@ -108,6 +108,27 @@ impl DaemonRegistry {
         self.daemons.contains_key(&origin_hash)
     }
 
+    /// Invoke `f` with a reference to the host identified by
+    /// `origin_hash`, holding the per-daemon lock for the duration.
+    /// Returns the closure's result, or `DaemonError::NotFound` if
+    /// no daemon matches.
+    ///
+    /// Keeps the lock scoped so callers don't accidentally leak
+    /// `MutexGuard` out; used by the SDK's subscribe / unsubscribe
+    /// path to update the subscription ledger after a successful
+    /// mesh call.
+    pub fn with_host<F, R>(&self, origin_hash: u32, f: F) -> Result<R, DaemonError>
+    where
+        F: FnOnce(&DaemonHost) -> R,
+    {
+        let entry = self
+            .daemons
+            .get(&origin_hash)
+            .ok_or(DaemonError::NotFound(origin_hash))?;
+        let host = entry.lock();
+        Ok(f(&host))
+    }
+
     /// Clone the signing keypair of a locally-registered daemon.
     ///
     /// Used by the migration-source path to seal the daemon's

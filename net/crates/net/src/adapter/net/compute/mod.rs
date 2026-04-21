@@ -5,6 +5,7 @@
 //! `Scheduler` for capability-based placement, and `MigrationState`
 //! for snapshot-based daemon migration.
 
+pub mod bindings;
 mod daemon;
 pub mod daemon_factory;
 pub mod fork_group;
@@ -19,6 +20,7 @@ pub mod replica_group;
 mod scheduler;
 pub mod standby_group;
 
+pub use bindings::{DaemonBindings, SubscriptionBinding};
 pub use daemon::{DaemonError, DaemonHostConfig, DaemonStats, MeshDaemon};
 pub use daemon_factory::{DaemonFactoryRegistry, FactoryEntry};
 pub use fork_group::{ForkGroup, ForkGroupConfig, ForkInfo};

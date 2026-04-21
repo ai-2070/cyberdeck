@@ -51,11 +51,15 @@ use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 pub use ::net::adapter::net::compute::{
-    DaemonError as CoreDaemonError, DaemonHostConfig, DaemonStats, MeshDaemon, MigrationError,
-    MigrationPhase, PlacementDecision, SchedulerError, SUBPROTOCOL_MIGRATION,
+    DaemonBindings, DaemonError as CoreDaemonError, DaemonHostConfig, DaemonStats, MeshDaemon,
+    MigrationError, MigrationPhase, PlacementDecision, SchedulerError, SubscriptionBinding,
+    SUBPROTOCOL_MIGRATION,
 };
 pub use ::net::adapter::net::state::causal::{CausalEvent, CausalLink};
 pub use ::net::adapter::net::state::snapshot::StateSnapshot;
+
+use ::net::adapter::net::channel::ChannelName;
+use ::net::adapter::net::identity::PermissionToken;
 
 use ::net::adapter::net::compute::{
     orchestrator::wire as migration_wire, DaemonFactoryRegistry, DaemonHost, DaemonRegistry,
@@ -474,6 +478,123 @@ impl DaemonRuntime {
     /// Number of daemons currently registered.
     pub fn daemon_count(&self) -> usize {
         self.inner.registry.count()
+    }
+
+    /// Snapshot the daemon's subscription ledger — a cloned view of
+    /// every `(publisher, channel)` pair the daemon has subscribed
+    /// to via [`Self::subscribe_channel`]. Used by the migration
+    /// target path to drive replay and by tests / operators to
+    /// observe what a daemon is subscribed to.
+    pub fn subscriptions(
+        &self,
+        origin_hash: u32,
+    ) -> Result<Vec<SubscriptionBinding>, DaemonError> {
+        self.inner
+            .registry
+            .with_host(origin_hash, |host| host.bindings_snapshot().subscriptions)
+            .map_err(DaemonError::Core)
+    }
+
+    /// Subscribe a specific daemon to a channel on a remote
+    /// publisher. Routes through the mesh's membership subprotocol
+    /// and **records the subscription in the daemon's ledger** so
+    /// a migration target can replay it after cutover. Users should
+    /// use this method (rather than reaching through
+    /// `rt.mesh().inner().subscribe_channel_*`) for daemon-owned
+    /// subscriptions; otherwise the subscription travels with the
+    /// node, not the daemon, and silently drops on migration.
+    ///
+    /// Flow:
+    /// 1. Hit the publisher's membership endpoint via
+    ///    `Mesh::subscribe_channel_with_token` (or the
+    ///    no-token variant).
+    /// 2. On success, record
+    ///    `(publisher, channel) → SubscriptionBinding` in the
+    ///    host's ledger.
+    /// 3. On wire failure, no ledger mutation.
+    ///
+    /// `token` is the caller-owned [`PermissionToken`] for
+    /// token-gated channels; `None` for open channels.
+    pub async fn subscribe_channel(
+        &self,
+        origin_hash: u32,
+        publisher: u64,
+        channel: ChannelName,
+        token: Option<PermissionToken>,
+    ) -> Result<(), DaemonError> {
+        self.require_ready()?;
+        if !self.inner.registry.contains(origin_hash) {
+            return Err(DaemonError::Core(CoreDaemonError::NotFound(origin_hash)));
+        }
+        // Capture serialized token bytes for the ledger BEFORE
+        // handing ownership to the mesh. The mesh call consumes the
+        // token by value on the token-path.
+        let token_bytes = token.as_ref().map(|t| t.to_bytes().to_vec());
+        let result = match token {
+            Some(tok) => {
+                self.inner
+                    .mesh
+                    .inner()
+                    .subscribe_channel_with_token(publisher, channel.clone(), tok)
+                    .await
+            }
+            None => {
+                self.inner
+                    .mesh
+                    .inner()
+                    .subscribe_channel(publisher, channel.clone())
+                    .await
+            }
+        };
+        result.map_err(|e| {
+            DaemonError::Core(CoreDaemonError::ProcessFailed(format!(
+                "subscribe_channel failed: {e}"
+            )))
+        })?;
+
+        // Mesh accepted the subscribe — record in the ledger.
+        // `with_host` reaches into the registry's per-daemon mutex;
+        // since this is SDK-level code we do the minimum work
+        // under the lock (a single DashMap insert).
+        if let Err(e) = self
+            .inner
+            .registry
+            .with_host(origin_hash, |host| {
+                host.record_subscription(publisher, channel, token_bytes);
+            })
+        {
+            return Err(DaemonError::Core(e));
+        }
+        Ok(())
+    }
+
+    /// Unsubscribe a specific daemon from a channel. Symmetric to
+    /// [`Self::subscribe_channel`]: mesh wire call first, then
+    /// ledger update.
+    pub async fn unsubscribe_channel(
+        &self,
+        origin_hash: u32,
+        publisher: u64,
+        channel: ChannelName,
+    ) -> Result<(), DaemonError> {
+        self.require_ready()?;
+        if !self.inner.registry.contains(origin_hash) {
+            return Err(DaemonError::Core(CoreDaemonError::NotFound(origin_hash)));
+        }
+        self.inner
+            .mesh
+            .inner()
+            .unsubscribe_channel(publisher, channel.clone())
+            .await
+            .map_err(|e| {
+                DaemonError::Core(CoreDaemonError::ProcessFailed(format!(
+                    "unsubscribe_channel failed: {e}"
+                )))
+            })?;
+        let _ = self.inner.registry.with_host(origin_hash, |host| {
+            host.forget_subscription(publisher, &channel);
+        });
+        Ok(())
     }
 
     /// Pre-register a factory on the target node keyed by the
