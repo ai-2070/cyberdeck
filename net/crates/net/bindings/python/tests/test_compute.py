@@ -289,6 +289,150 @@ def test_deliver_to_unknown_origin_raises() -> None:
         mesh.shutdown()
 
 
+# -------------------------------------------------------------------------
+# Stage 5 sub-step 3: snapshot + restore round-trip
+# -------------------------------------------------------------------------
+
+
+def test_counter_snapshot_then_spawn_from_snapshot_restores_state() -> None:
+    mesh = _mesh()
+    rt = DaemonRuntime(mesh)
+    try:
+        rt.register_factory("counter", CounterDaemon)
+        rt.start()
+        ident = Identity.generate()
+        handle = rt.spawn("counter", ident)
+
+        # Drive the counter to 3.
+        for i in range(1, 4):
+            rt.deliver(handle.origin_hash, CausalEvent(ident.origin_hash, i, b""))
+
+        snap = rt.snapshot(handle.origin_hash)
+        assert snap is not None
+        assert isinstance(snap, bytes)
+        assert len(snap) > 0
+
+        # Tear the original daemon down — the restored instance
+        # must pick up purely from the snapshot, not from live
+        # state.
+        rt.stop(handle.origin_hash)
+        assert rt.daemon_count() == 0
+
+        restored = rt.spawn_from_snapshot("counter", ident, snap)
+        assert rt.daemon_count() == 1
+        assert restored.origin_hash == handle.origin_hash
+
+        # One more delivery — counter steps from 3 to 4, proving
+        # the snapshot's state survived the round-trip.
+        out = rt.deliver(restored.origin_hash, CausalEvent(ident.origin_hash, 4, b""))
+        assert int.from_bytes(out[0], "little") == 4
+    finally:
+        rt.shutdown()
+        mesh.shutdown()
+
+
+def test_snapshot_of_stateless_daemon_returns_none() -> None:
+    mesh = _mesh()
+    rt = DaemonRuntime(mesh)
+    try:
+        rt.register_factory("echo", EchoDaemon)
+        rt.start()
+        ident = Identity.generate()
+        handle = rt.spawn("echo", ident)
+        assert rt.snapshot(handle.origin_hash) is None
+    finally:
+        rt.shutdown()
+        mesh.shutdown()
+
+
+def test_snapshot_of_unknown_origin_raises() -> None:
+    mesh = _mesh()
+    rt = DaemonRuntime(mesh)
+    try:
+        rt.register_factory("counter", CounterDaemon)
+        rt.start()
+        with pytest.raises(RuntimeError) as exc_info:
+            rt.snapshot(0xDEADBEEF)
+        assert str(exc_info.value).startswith("daemon:")
+    finally:
+        rt.shutdown()
+        mesh.shutdown()
+
+
+def test_spawn_from_snapshot_with_corrupted_bytes_raises() -> None:
+    mesh = _mesh()
+    rt = DaemonRuntime(mesh)
+    try:
+        rt.register_factory("counter", CounterDaemon)
+        rt.start()
+        ident = Identity.generate()
+        with pytest.raises(RuntimeError) as exc_info:
+            rt.spawn_from_snapshot("counter", ident, b"not a real snapshot")
+        assert "snapshot decode failed" in str(exc_info.value)
+    finally:
+        rt.shutdown()
+        mesh.shutdown()
+
+
+def test_spawn_from_snapshot_with_wrong_identity_raises() -> None:
+    mesh = _mesh()
+    rt = DaemonRuntime(mesh)
+    try:
+        rt.register_factory("counter", CounterDaemon)
+        rt.start()
+        original = Identity.generate()
+        handle = rt.spawn("counter", original)
+        rt.deliver(handle.origin_hash, CausalEvent(original.origin_hash, 1, b""))
+        snap = rt.snapshot(handle.origin_hash)
+        assert snap is not None
+        rt.stop(handle.origin_hash)
+
+        # Different identity — snapshot's entity_id doesn't match.
+        other = Identity.generate()
+        with pytest.raises(RuntimeError) as exc_info:
+            rt.spawn_from_snapshot("counter", other, snap)
+        assert str(exc_info.value).startswith("daemon:")
+    finally:
+        rt.shutdown()
+        mesh.shutdown()
+
+
+def test_snapshot_modify_snapshot_captures_newer_state() -> None:
+    # Restoring an earlier vs later snapshot yields different
+    # counter values. Proves snapshot captures the state at the
+    # moment it was taken.
+    mesh = _mesh()
+    rt = DaemonRuntime(mesh)
+    try:
+        rt.register_factory("counter", CounterDaemon)
+        rt.start()
+        ident = Identity.generate()
+        handle = rt.spawn("counter", ident)
+
+        for i in range(1, 3):
+            rt.deliver(handle.origin_hash, CausalEvent(ident.origin_hash, i, b""))
+        snap_at_2 = rt.snapshot(handle.origin_hash)
+        for i in range(3, 6):
+            rt.deliver(handle.origin_hash, CausalEvent(ident.origin_hash, i, b""))
+        snap_at_5 = rt.snapshot(handle.origin_hash)
+
+        rt.stop(handle.origin_hash)
+
+        # Restore earlier snapshot; next event steps to 3.
+        h2 = rt.spawn_from_snapshot("counter", ident, snap_at_2)
+        out = rt.deliver(h2.origin_hash, CausalEvent(ident.origin_hash, 6, b""))
+        assert int.from_bytes(out[0], "little") == 3
+        rt.stop(h2.origin_hash)
+
+        # Restore later snapshot; next event steps to 6.
+        h5 = rt.spawn_from_snapshot("counter", ident, snap_at_5)
+        out = rt.deliver(h5.origin_hash, CausalEvent(ident.origin_hash, 7, b""))
+        assert int.from_bytes(out[0], "little") == 6
+    finally:
+        rt.shutdown()
+        mesh.shutdown()
+
+
 def test_two_daemons_keep_independent_counter_state() -> None:
     mesh = _mesh()
     rt = DaemonRuntime(mesh)

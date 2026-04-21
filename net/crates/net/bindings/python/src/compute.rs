@@ -33,7 +33,9 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use net::adapter::net::behavior::capability::CapabilityFilter;
 use net::adapter::net::compute::{DaemonError as CoreDaemonError, DaemonHostConfig, MeshDaemon};
 use net::adapter::net::state::causal::{CausalEvent, CausalLink};
-use net_sdk::compute::{DaemonHandle as SdkDaemonHandle, DaemonRuntime as SdkDaemonRuntime};
+use net_sdk::compute::{
+    DaemonHandle as SdkDaemonHandle, DaemonRuntime as SdkDaemonRuntime, StateSnapshot,
+};
 use net_sdk::mesh::Mesh as SdkMesh;
 use tokio::runtime::Runtime;
 
@@ -366,6 +368,91 @@ impl PyDaemonRuntime {
                 .block_on(async move { inner.stop(origin_hash).await })
                 .map_err(|e| daemon_err(e.to_string()))
         })
+    }
+
+    /// Take a snapshot of a running daemon by `origin_hash`.
+    ///
+    /// Returns the daemon's serialized state as `bytes`, or
+    /// `None` when the daemon is stateless (no `snapshot`
+    /// method, or its `snapshot` returned `None`). The wire
+    /// format is the core's `StateSnapshot::to_bytes` encoding —
+    /// opaque to Python callers, but round-trippable via
+    /// `spawn_from_snapshot`.
+    fn snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        origin_hash: u32,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        let snap = py.detach(move || {
+            runtime
+                .block_on(async move { inner.snapshot(origin_hash).await })
+                .map_err(|e| daemon_err(e.to_string()))
+        })?;
+        Ok(snap.map(|s| PyBytes::new(py, &s.to_bytes())))
+    }
+
+    /// Spawn a daemon of `kind` from a previously-taken snapshot.
+    /// Parallel to `spawn`, but the daemon's initial state is
+    /// seeded from `snapshot_bytes` by calling its `restore`
+    /// method before any events land.
+    ///
+    /// `snapshot_bytes` must be the exact `bytes` returned by a
+    /// prior call to `snapshot`; mismatched or corrupted bytes
+    /// surface as `daemon: snapshot decode failed`.
+    ///
+    /// Identity check: the snapshot's `entity_id` must match the
+    /// caller's `identity` — mismatch raises `daemon: snapshot
+    /// identity mismatch`.
+    #[pyo3(signature = (kind, identity, snapshot_bytes, config=None))]
+    fn spawn_from_snapshot(
+        &self,
+        py: Python<'_>,
+        kind: String,
+        identity: &crate::identity::Identity,
+        snapshot_bytes: &[u8],
+        config: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PyDaemonHandle> {
+        if !self.factories.contains_key(&kind) {
+            return Err(daemon_err(format!(
+                "no factory registered for kind '{kind}'"
+            )));
+        }
+        // Decode the snapshot synchronously — cheap, and a clean
+        // `daemon: snapshot decode failed` is friendlier than the
+        // downstream SDK error.
+        let snapshot_decoded = StateSnapshot::from_bytes(snapshot_bytes)
+            .ok_or_else(|| daemon_err("snapshot decode failed"))?;
+
+        let cfg = daemon_host_config_from_dict(config)?;
+        let sdk_identity = identity.to_sdk_identity();
+        let bridge = build_bridge_inline(py, &self.factories, &kind)?;
+
+        let factories_for_closure = self.factories.clone();
+        let kind_for_closure = kind.clone();
+        let kind_factory = move || -> Box<dyn MeshDaemon> {
+            build_bridge_from_factory(&factories_for_closure, &kind_for_closure)
+        };
+
+        let runtime = self.runtime.clone();
+        let inner = self.inner.clone();
+        let handle = py.detach(move || {
+            runtime
+                .block_on(async move {
+                    inner
+                        .spawn_from_snapshot_with_daemon(
+                            sdk_identity,
+                            snapshot_decoded,
+                            cfg,
+                            bridge,
+                            kind_factory,
+                        )
+                        .await
+                })
+                .map_err(|e| daemon_err(e.to_string()))
+        })?;
+        Ok(PyDaemonHandle::from_sdk(handle))
     }
 
     /// Deliver one causal event to the daemon identified by
