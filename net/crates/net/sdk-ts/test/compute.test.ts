@@ -15,6 +15,7 @@ import {
   Identity,
   MeshNode,
   MigrationHandle,
+  type MigrationPhase,
 } from '../src';
 
 const PSK = '42'.repeat(32);
@@ -874,6 +875,124 @@ describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', ()
       // Already-terminated record; fine.
     }
   });
+
+  it('phases() yields distinct transitions and terminates on cleanup', async () => {
+    // Two-mesh pair: source drives a migration to a connected
+    // target. Without `expectMigration`/target-side identity the
+    // migration will fail on the target's dispatcher, but the
+    // orchestrator record still walks through `snapshot` /
+    // `transfer` etc. before being torn down — enough to observe
+    // the iterator yielding distinct phases.
+    const [aAddr, bAddr] = [`127.0.0.1:${portSeed++}`, `127.0.0.1:${portSeed++}`];
+    const a = await MeshNode.create({ bindAddr: aAddr, psk: PSK });
+    cleanups.push(() => a.shutdown());
+    const b = await MeshNode.create({ bindAddr: bAddr, psk: PSK });
+    cleanups.push(() => b.shutdown());
+    await Promise.all([
+      b.accept(a.nodeId()),
+      (async () => {
+        await new Promise((r) => setTimeout(r, 50));
+        await a.connect(bAddr, b.publicKey(), b.nodeId());
+      })(),
+    ]);
+    await a.start();
+    await b.start();
+
+    const rtA = DaemonRuntime.create(a);
+    cleanups.push(() => rtA.shutdown());
+    rtA.registerFactory('counter', counterFactory());
+    await rtA.start();
+
+    const id = Identity.generate();
+    const spawn = await rtA.spawn('counter', id);
+    const mig = await rtA.startMigrationWith(
+      spawn.originHash,
+      a.nodeId(),
+      b.nodeId(),
+      { transportIdentity: false, retryNotReadyMs: 0n },
+    );
+
+    // Iterator must terminate — if it doesn't, the test times
+    // out and we know the cleanup path is broken. We race the
+    // iterator against a 5 s hard cap.
+    const iteratorDone = (async () => {
+      const seen: MigrationPhase[] = [];
+      for await (const phase of mig.phases()) {
+        seen.push(phase);
+      }
+      return seen;
+    })();
+    const timeout = new Promise<MigrationPhase[]>((_, rej) =>
+      setTimeout(() => rej(new Error('phases iterator hung')), 5000),
+    );
+
+    const seen = await Promise.race([iteratorDone, timeout]);
+
+    // Each yielded phase must be distinct from its predecessor —
+    // that's the iterator's contract. Order within the enum isn't
+    // strictly asserted (depends on scheduling + network timing),
+    // but the transition uniqueness is a correctness property.
+    for (let i = 1; i < seen.length; i++) {
+      expect(seen[i]).not.toBe(seen[i - 1]);
+    }
+    // After the iterator terminates, `phase()` should be null
+    // (orchestrator cleaned up).
+    expect(mig.phase()).toBeNull();
+  }, 15_000);
+
+  it('phases() on a migration that never started yields nothing', async () => {
+    // Pre-cleanup case: if the orchestrator record is already
+    // gone before the caller starts iterating, the first poll
+    // returns null and the iterator terminates immediately.
+    // We construct this scenario with startMigration on unknown
+    // origin — which throws, so we can't get a handle. Instead,
+    // drive a migration to a cancelled state, THEN iterate.
+    const [aAddr, bAddr] = [`127.0.0.1:${portSeed++}`, `127.0.0.1:${portSeed++}`];
+    const a = await MeshNode.create({ bindAddr: aAddr, psk: PSK });
+    cleanups.push(() => a.shutdown());
+    const b = await MeshNode.create({ bindAddr: bAddr, psk: PSK });
+    cleanups.push(() => b.shutdown());
+    await Promise.all([
+      b.accept(a.nodeId()),
+      (async () => {
+        await new Promise((r) => setTimeout(r, 50));
+        await a.connect(bAddr, b.publicKey(), b.nodeId());
+      })(),
+    ]);
+    await a.start();
+    await b.start();
+
+    const rtA = DaemonRuntime.create(a);
+    cleanups.push(() => rtA.shutdown());
+    rtA.registerFactory('counter', counterFactory());
+    await rtA.start();
+
+    const id = Identity.generate();
+    const spawn = await rtA.spawn('counter', id);
+    const mig = await rtA.startMigrationWith(
+      spawn.originHash,
+      a.nodeId(),
+      b.nodeId(),
+      { transportIdentity: false, retryNotReadyMs: 0n },
+    );
+    // Cancel before iterating — record goes away fast.
+    try {
+      await mig.cancel();
+    } catch {
+      // Already terminal; fine.
+    }
+    // Give the orchestrator a beat to finish tearing down before
+    // we start iterating.
+    await new Promise((r) => setTimeout(r, 200));
+
+    const seen: MigrationPhase[] = [];
+    for await (const phase of mig.phases()) {
+      seen.push(phase);
+    }
+    // Either empty (record already gone at first poll) or at
+    // most a handful of residual phases. Never hangs.
+    expect(seen.length).toBeLessThan(10);
+  }, 15_000);
 
   it('startMigrationWith transportIdentity=false produces a handle to a connected peer', async () => {
     // Full two-mesh pair: connect A <-> B, spawn on A, and

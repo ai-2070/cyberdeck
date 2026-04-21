@@ -277,6 +277,52 @@ export class MigrationHandle {
   }
 
   /**
+   * Async iterator that yields each distinct migration phase as
+   * the orchestrator transitions through them, and terminates
+   * cleanly once the migration reaches a terminal state (either
+   * `complete` on success, or abort / failure — the orchestrator
+   * record is gone either way).
+   *
+   * **Usage pattern:**
+   * ```ts
+   * const mig = await rt.startMigration(origin, a, b);
+   * const phases: MigrationPhase[] = [];
+   * for await (const phase of mig.phases()) {
+   *   phases.push(phase);
+   * }
+   * // Inspect `phases.at(-1)` — `'complete'` vs anything else
+   * // distinguishes success from abort / failure.
+   * ```
+   *
+   * **Call site ordering:** iterate as soon as the handle is
+   * returned. If you await `wait()` first and then call
+   * `phases()`, the orchestrator record may already be cleared
+   * and the iterator yields nothing.
+   *
+   * **Sampling cadence:** polls every 50 ms — matching the Rust
+   * SDK's `wait()` cadence. Phase transitions faster than that
+   * may be missed; acceptable for Stage 1 since real migrations
+   * spend hundreds of ms per phase on network round-trips. A
+   * broadcast-channel push replacement is documented as future
+   * work in `DAEMON_IDENTITY_MIGRATION_PLAN.md`.
+   */
+  async *phases(): AsyncGenerator<MigrationPhase, void, void> {
+    let last: MigrationPhase | null = null;
+    while (true) {
+      const current = this.phase();
+      if (current === null) {
+        // Orchestrator cleaned up — terminal state reached.
+        return;
+      }
+      if (current !== last) {
+        yield current;
+        last = current;
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+
+  /**
    * Block until the migration reaches a terminal state. Resolves
    * on `complete`; rejects with {@link DaemonError} on abort or
    * structured failure (target unavailable, restore failed, etc.).
