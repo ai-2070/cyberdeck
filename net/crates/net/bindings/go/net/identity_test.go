@@ -258,15 +258,18 @@ func TestTokenIsExpired_ReportsExpiredEvenWhenSignatureTampered(t *testing.T) {
 	defer subject.Close()
 
 	subID, _ := subject.EntityID()
-	// 1-second TTL so the test doesn't wait long.
+	// 1-second TTL. Sleep 2.5s below — must cover a full seconds-
+	// truncation boundary since `not_after` is seconds, so 1.3s
+	// could leave `current == not_after` on certain issue-time
+	// phases (flake).
 	raw := issueTestToken(t, issuer, subID, []string{"publish"}, "topic", 1, 0)
 	token := make([]byte, len(raw))
 	copy(token, raw)
 	// Tamper the signature byte.
 	token[len(token)-1] ^= 0xFF
 
-	// Wait past TTL.
-	time.Sleep(1300 * time.Millisecond)
+	// Wait past TTL with margin.
+	time.Sleep(2500 * time.Millisecond)
 
 	expired, err := TokenIsExpired(token)
 	if err != nil {

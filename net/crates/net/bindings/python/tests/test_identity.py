@@ -151,7 +151,10 @@ def test_token_is_expired_reports_expired_even_when_signature_tampered() -> None
 
     issuer = Identity.generate()
     subject = Identity.generate()
-    # 1-second TTL so the test doesn't wait long.
+    # 1-second TTL. Sleep 2.5s below — `not_after` is stored in
+    # whole seconds, so 1.3s can leave `current == not_after` on
+    # certain issue-time phases (flake). 2.5s reliably crosses a
+    # full boundary.
     token = bytearray(
         issuer.issue_token(
             subject.entity_id, ["publish"], "topic", ttl_seconds=1
@@ -160,8 +163,8 @@ def test_token_is_expired_reports_expired_even_when_signature_tampered() -> None
     # Tamper the signature.
     token[-1] ^= 0xFF
 
-    # Wait past the TTL.
-    time.sleep(1.3)
+    # Wait past the TTL with margin.
+    time.sleep(2.5)
 
     # Pure time check — tampered-but-expired must report True.
     assert token_is_expired(bytes(token)) is True, (
