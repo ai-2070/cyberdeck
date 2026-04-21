@@ -226,17 +226,47 @@ impl DaemonRuntime {
 
         // Atomic insert-or-error via DashMap's entry API. Matches
         // the SDK's `register_factory` contract — "second
-        // registration fails."
+        // registration fails." Do the DashMap insert first so we
+        // fail fast on duplicates before touching the SDK registry.
         use dashmap::mapref::entry::Entry;
         match self.factories.entry(kind.clone()) {
-            Entry::Occupied(_) => Err(daemon_err(format!(
-                "factory for kind '{kind}' is already registered"
-            ))),
+            Entry::Occupied(_) => {
+                return Err(daemon_err(format!(
+                    "factory for kind '{kind}' is already registered"
+                )));
+            }
             Entry::Vacant(slot) => {
                 slot.insert(tsfn);
-                Ok(())
             }
         }
+
+        // Mirror into the SDK factory map so `expect_migration`
+        // and `register_migration_target_identity` can resolve
+        // `kind → factory_closure` via the core registry.
+        //
+        // The factory closure returns a `NoopBridge` — a
+        // placeholder `MeshDaemon` whose `process` returns empty
+        // outputs. That's correct for migration-target reconstruction
+        // today (same fallback used by `spawn_with_daemon`'s
+        // `kind_factory`), but means a migrated-in daemon on a TS
+        // target won't actually invoke the user's JS factory. Full
+        // JS-factory reconstruction on migration targets is a later
+        // sub-step — at that point this closure gets swapped for
+        // one that does a synchronous TSFN round-trip to build a
+        // real `EventDispatchBridge`. For now, landing the
+        // lifecycle / registry consistency is enough to unblock
+        // `expect_migration`.
+        let kind_for_bridge = kind.clone();
+        if let Err(e) = self.inner.register_factory(&kind, move || {
+            Box::new(NoopBridge::new(kind_for_bridge.clone())) as Box<dyn MeshDaemon>
+        }) {
+            // SDK registration failed — roll back the NAPI-side
+            // insert so `register_factory` stays atomic across
+            // both registries.
+            self.factories.remove(&kind);
+            return Err(daemon_err(e.to_string()));
+        }
+        Ok(())
     }
 
     /// Spawn a daemon of `kind` under the given identity with
@@ -555,6 +585,71 @@ impl DaemonRuntime {
             .await
             .map_err(|e| daemon_err(e.to_string()))?;
         Ok(MigrationHandle::from_sdk(handle))
+    }
+
+    /// Declare on the target node that a migration will land here
+    /// for `origin_hash` of the given `kind`. Registers a
+    /// **placeholder** factory — the migration snapshot's identity
+    /// envelope supplies the real keypair at restore time.
+    ///
+    /// Must be called BEFORE the source starts the migration;
+    /// otherwise the dispatcher has no factory entry and rejects
+    /// the migration with `FactoryNotFound`.
+    ///
+    /// Fails with `daemon: factory not found for kind '<kind>'` if
+    /// `kind` hasn't been registered via
+    /// [`Self::register_factory`]. The source must migrate with
+    /// `transport_identity: true` (default); without the envelope
+    /// the dispatcher emits `IdentityTransportFailed`.
+    #[napi]
+    pub fn expect_migration(
+        &self,
+        kind: String,
+        origin_hash: u32,
+        config: Option<DaemonHostConfigJs>,
+    ) -> Result<()> {
+        let sdk_config = config.map(DaemonHostConfig::from).unwrap_or_default();
+        self.inner
+            .expect_migration(&kind, origin_hash, sdk_config)
+            .map_err(|e| daemon_err(e.to_string()))
+    }
+
+    /// Pre-register a target-side identity for a migration that
+    /// will NOT carry an identity envelope (e.g., the source used
+    /// `transportIdentity: false`). The target must already hold
+    /// the matching [`Identity`]; the dispatcher restores the
+    /// daemon with that identity instead of overriding it from an
+    /// envelope.
+    ///
+    /// For the common envelope-transport case, prefer
+    /// [`Self::expect_migration`] — the caller doesn't need to
+    /// know the daemon's private key ahead of time.
+    #[napi]
+    pub fn register_migration_target_identity(
+        &self,
+        kind: String,
+        identity: &crate::identity::Identity,
+        config: Option<DaemonHostConfigJs>,
+    ) -> Result<()> {
+        let sdk_identity = identity.to_sdk_identity();
+        let sdk_config = config.map(DaemonHostConfig::from).unwrap_or_default();
+        self.inner
+            .register_migration_target_identity(&kind, sdk_identity, sdk_config)
+            .map_err(|e| daemon_err(e.to_string()))
+    }
+
+    /// Query the orchestrator's current migration phase for
+    /// `origin_hash`, returned as a string
+    /// (`'snapshot' | 'transfer' | 'restore' | 'replay' | 'cutover' | 'complete'`)
+    /// or `null` if no migration is in flight for that origin.
+    ///
+    /// Works on any node — source, target, or an observer that
+    /// heard the migration on the mesh.
+    #[napi]
+    pub fn migration_phase(&self, origin_hash: u32) -> Option<String> {
+        self.inner
+            .migration_phase(origin_hash)
+            .map(migration_phase_str)
     }
 }
 

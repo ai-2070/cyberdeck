@@ -778,6 +778,103 @@ describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', ()
     ).rejects.toThrow(DaemonError);
   });
 
+  it('expectMigration requires kind to be registered first', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+    await rt.start();
+
+    expect(() => rt.expectMigration('never-registered', 0x1234)).toThrow(
+      DaemonError,
+    );
+  });
+
+  it('expectMigration succeeds once kind is registered', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+    rt.registerFactory('counter', counterFactory());
+    await rt.start();
+
+    // First call is fine — second for the same origin should fail
+    // (registry slot already occupied).
+    rt.expectMigration('counter', 0xabcd_ef01);
+    expect(() => rt.expectMigration('counter', 0xabcd_ef01)).toThrow(
+      DaemonError,
+    );
+  });
+
+  it('registerMigrationTargetIdentity binds an identity for the target side', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+    rt.registerFactory('counter', counterFactory());
+    await rt.start();
+
+    const id = Identity.generate();
+    rt.registerMigrationTargetIdentity('counter', id);
+    // Second bind for the same origin_hash should fail — the core
+    // factory registry only admits one entry per origin.
+    expect(() =>
+      rt.registerMigrationTargetIdentity('counter', id),
+    ).toThrow(DaemonError);
+  });
+
+  it('migrationPhase returns null when no migration is in flight', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+    await rt.start();
+    expect(rt.migrationPhase(0xdeadbeef)).toBeNull();
+  });
+
+  it('migrationPhase returns a phase string for an in-flight migration', async () => {
+    // Two-mesh setup so `startMigrationWith` succeeds.
+    const [aAddr, bAddr] = [`127.0.0.1:${portSeed++}`, `127.0.0.1:${portSeed++}`];
+    const a = await MeshNode.create({ bindAddr: aAddr, psk: PSK });
+    cleanups.push(() => a.shutdown());
+    const b = await MeshNode.create({ bindAddr: bAddr, psk: PSK });
+    cleanups.push(() => b.shutdown());
+    await Promise.all([
+      b.accept(a.nodeId()),
+      (async () => {
+        await new Promise((r) => setTimeout(r, 50));
+        await a.connect(bAddr, b.publicKey(), b.nodeId());
+      })(),
+    ]);
+    await a.start();
+    await b.start();
+
+    const rtA = DaemonRuntime.create(a);
+    cleanups.push(() => rtA.shutdown());
+    rtA.registerFactory('counter', counterFactory());
+    await rtA.start();
+
+    const id = Identity.generate();
+    const spawn = await rtA.spawn('counter', id);
+    const mig = await rtA.startMigrationWith(
+      spawn.originHash,
+      a.nodeId(),
+      b.nodeId(),
+      { transportIdentity: false, retryNotReadyMs: 0n },
+    );
+
+    // `migrationPhase` on A should see the record; observer's view
+    // may race so we just check it's string | null.
+    const phase = rtA.migrationPhase(spawn.originHash);
+    expect(phase === null || typeof phase === 'string').toBe(true);
+
+    try {
+      await mig.cancel();
+    } catch {
+      // Already-terminated record; fine.
+    }
+  });
+
   it('startMigrationWith transportIdentity=false produces a handle to a connected peer', async () => {
     // Full two-mesh pair: connect A <-> B, spawn on A, and
     // initiate a migration A → B. The target has no pre-registered

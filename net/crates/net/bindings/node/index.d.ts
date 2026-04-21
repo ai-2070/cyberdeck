@@ -198,6 +198,46 @@ export declare class DaemonRuntime {
    * NotReady-retry budget.
    */
   startMigrationWith(originHash: number, sourceNode: bigint, targetNode: bigint, opts: MigrationOptsJs): Promise<MigrationHandle>
+  /**
+   * Declare on the target node that a migration will land here
+   * for `origin_hash` of the given `kind`. Registers a
+   * **placeholder** factory — the migration snapshot's identity
+   * envelope supplies the real keypair at restore time.
+   *
+   * Must be called BEFORE the source starts the migration;
+   * otherwise the dispatcher has no factory entry and rejects
+   * the migration with `FactoryNotFound`.
+   *
+   * Fails with `daemon: factory not found for kind '<kind>'` if
+   * `kind` hasn't been registered via
+   * [`Self::register_factory`]. The source must migrate with
+   * `transport_identity: true` (default); without the envelope
+   * the dispatcher emits `IdentityTransportFailed`.
+   */
+  expectMigration(kind: string, originHash: number, config?: DaemonHostConfigJs | undefined | null): void
+  /**
+   * Pre-register a target-side identity for a migration that
+   * will NOT carry an identity envelope (e.g., the source used
+   * `transportIdentity: false`). The target must already hold
+   * the matching [`Identity`]; the dispatcher restores the
+   * daemon with that identity instead of overriding it from an
+   * envelope.
+   *
+   * For the common envelope-transport case, prefer
+   * [`Self::expect_migration`] — the caller doesn't need to
+   * know the daemon's private key ahead of time.
+   */
+  registerMigrationTargetIdentity(kind: string, identity: Identity, config?: DaemonHostConfigJs | undefined | null): void
+  /**
+   * Query the orchestrator's current migration phase for
+   * `origin_hash`, returned as a string
+   * (`'snapshot' | 'transfer' | 'restore' | 'replay' | 'cutover' | 'complete'`)
+   * or `null` if no migration is in flight for that origin.
+   *
+   * Works on any node — source, target, or an observer that
+   * heard the migration on the mesh.
+   */
+  migrationPhase(originHash: number): string | null
 }
 
 /**

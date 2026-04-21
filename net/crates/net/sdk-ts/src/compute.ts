@@ -691,4 +691,85 @@ export class DaemonRuntime {
       return toDaemonError(e);
     }
   }
+
+  /**
+   * Declare that a migration will land on this node for the given
+   * `originHash` of `kind`. Registers a placeholder factory; the
+   * migration snapshot's identity envelope supplies the real
+   * keypair at restore time.
+   *
+   * Must be called BEFORE the source initiates the migration —
+   * the target dispatcher checks for a factory entry when the
+   * inbound `SnapshotReady` lands, and rejects with
+   * `FactoryNotFound` if nothing is registered.
+   *
+   * The source must migrate with `transportIdentity: true`
+   * (default). Without the envelope the dispatcher emits
+   * `IdentityTransportFailed` because the placeholder has no
+   * keypair. Use {@link registerMigrationTargetIdentity} for the
+   * explicit public-identity-migration case.
+   */
+  expectMigration(
+    kind: string,
+    originHash: number,
+    config?: DaemonHostConfig,
+  ): void {
+    try {
+      this.inner.expectMigration(
+        kind,
+        originHash,
+        config
+          ? {
+              autoSnapshotInterval: config.autoSnapshotInterval,
+              maxLogEntries: config.maxLogEntries,
+            }
+          : undefined,
+      );
+    } catch (e) {
+      toDaemonError(e);
+    }
+  }
+
+  /**
+   * Pre-register a target-side identity for a migration that
+   * will NOT carry an identity envelope (source used
+   * `transportIdentity: false`). The target holds the matching
+   * {@link Identity}; the dispatcher restores the daemon with
+   * that identity instead of overriding it from an envelope.
+   *
+   * For the common envelope-transport case, prefer
+   * {@link expectMigration} — the caller doesn't need to know
+   * the daemon's private key ahead of time.
+   */
+  registerMigrationTargetIdentity(
+    kind: string,
+    identity: Identity,
+    config?: DaemonHostConfig,
+  ): void {
+    try {
+      this.inner.registerMigrationTargetIdentity(
+        kind,
+        identity.toNapi(),
+        config
+          ? {
+              autoSnapshotInterval: config.autoSnapshotInterval,
+              maxLogEntries: config.maxLogEntries,
+            }
+          : undefined,
+      );
+    } catch (e) {
+      toDaemonError(e);
+    }
+  }
+
+  /**
+   * Query the orchestrator's current migration phase for
+   * `originHash`, or `null` if no migration is in flight for
+   * that origin. Works on any node — source, target, or an
+   * observer that heard the migration on the mesh.
+   */
+  migrationPhase(originHash: number): MigrationPhase | null {
+    const p = this.inner.migrationPhase(originHash);
+    return (p as MigrationPhase | null) ?? null;
+  }
 }
