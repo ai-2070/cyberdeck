@@ -175,28 +175,43 @@ impl PermissionToken {
     }
 
     /// Check if the token is currently valid (signature + time bounds).
+    ///
+    /// Both bounds are **inclusive-expiry**: the token is live while
+    /// `not_before <= now < not_after`. At `now == not_after` the
+    /// token is already expired. The cache sweep
+    /// (`TokenCache::evict_expired`) has always used this convention
+    /// (`retain(|t| t.not_after > now)` drops boundary entries);
+    /// the earlier `is_valid` / `is_expired` wording accidentally
+    /// treated `not_after` as the last valid second, giving every
+    /// token a one-second bonus over what the sweep believed.
+    /// Aligning everything on strict "< not_after" removes the
+    /// off-by-one and makes the token lifetime exactly
+    /// `duration_secs` seconds as `issue()` promises.
     pub fn is_valid(&self) -> Result<(), TokenError> {
         self.verify()?;
         let now = current_timestamp();
         if now < self.not_before {
             return Err(TokenError::NotYetValid);
         }
-        if now > self.not_after {
+        if now >= self.not_after {
             return Err(TokenError::Expired);
         }
         Ok(())
     }
 
-    /// Pure time-bound check: `true` iff the host wall-clock is
-    /// past `not_after`. Deliberately **does not** touch the
+    /// Pure time-bound check: `true` iff the host wall-clock has
+    /// reached `not_after`. Deliberately **does not** touch the
     /// signature — callers wanting end-to-end validity use
     /// [`Self::is_valid`], and signature integrity alone is
     /// [`Self::verify`]. This separation matters because a
     /// tampered-but-expired token is still expired, and every
     /// binding's `token_is_expired` helper documents itself as a
     /// pure time check.
+    ///
+    /// Boundary: `now == not_after` ⇒ expired (matches
+    /// [`Self::is_valid`] and the cache's eviction convention).
     pub fn is_expired(&self) -> bool {
-        current_timestamp() > self.not_after
+        current_timestamp() >= self.not_after
     }
 
     /// Check if this token authorizes a specific action on a channel.
@@ -593,9 +608,73 @@ mod tests {
             0,
         );
 
-        assert!(token.verify().is_ok()); // signature is valid
-                                         // Token may or may not be expired depending on timing,
-                                         // but with duration 0 and not_after = now, it's borderline
+        assert!(token.verify().is_ok(), "signature is valid");
+        // `issue(duration=0)` sets `not_after = now`, and the
+        // inclusive-expiry convention (`now >= not_after`) says
+        // "expired exactly at the boundary" — so a zero-duration
+        // token is always expired on the very next read, without
+        // any timing ambiguity. This used to be "borderline"
+        // because the old `>` check let the boundary second count
+        // as valid.
+        assert!(
+            token.is_expired(),
+            "duration=0 token must report expired under inclusive-expiry",
+        );
+        assert!(
+            matches!(token.is_valid(), Err(TokenError::Expired)),
+            "is_valid must agree with is_expired at the boundary",
+        );
+    }
+
+    /// Regression for a cubic-flagged P3: `is_valid` / `is_expired`
+    /// used strict `>` against `not_after`, so the boundary second
+    /// (`now == not_after`) still counted as valid. The cache's
+    /// `evict_expired` has always used the inclusive convention
+    /// (drops at the boundary), so tokens survived one second longer
+    /// in the "hot" caller-facing checks than in the sweep — a
+    /// quiet mismatch that also gave every `issue(duration=N)` an
+    /// effective lifetime of `N+1` seconds. This test pins the
+    /// inclusive boundary: at `not_after` exactly, expired.
+    #[test]
+    fn is_valid_and_is_expired_agree_at_not_after_boundary() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+
+        let mut token = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0,
+            3600,
+            0,
+        );
+        // Force the boundary deterministically — set not_after to
+        // the current wall-clock second and re-sign so `is_valid`
+        // still passes its signature check.
+        token.not_after = current_timestamp();
+        let payload = token.signed_payload();
+        token.signature = issuer.sign(&payload).to_bytes();
+
+        assert!(
+            token.is_expired(),
+            "is_expired must return true at now == not_after (inclusive)",
+        );
+        assert!(
+            matches!(token.is_valid(), Err(TokenError::Expired)),
+            "is_valid must agree: Expired at now == not_after",
+        );
+
+        // And the cache eviction path must also drop it — same
+        // boundary convention.
+        let cache = TokenCache::new();
+        cache.insert_unchecked(token);
+        cache.evict_expired();
+        assert_eq!(
+            cache.len(),
+            0,
+            "evict_expired must drop a boundary token — all three code paths \
+             (is_valid, is_expired, evict_expired) must agree on the boundary",
+        );
     }
 
     /// Regression for a cubic-flagged bug that hit every FFI binding:
