@@ -125,10 +125,11 @@ where
     cond()
 }
 
-/// `AuthGuard` keys on the low 32 bits of the subscriber's node id —
-/// matches the `subscriber_origin_hash` helper in `mesh.rs`.
-fn origin_hash(node_id: u64) -> u32 {
-    node_id as u32
+/// `AuthGuard` keys on the full 64-bit subscriber `node_id` —
+/// matches the `subscriber_origin_hash` helper in `mesh.rs`. The
+/// prior 32-bit truncation birthday-collided at ~65 k peers.
+fn origin_hash(node_id: u64) -> u64 {
+    node_id
 }
 
 // ============================================================================

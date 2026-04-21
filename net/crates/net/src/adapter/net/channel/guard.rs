@@ -66,7 +66,14 @@ pub struct AuthGuard {
     /// Number of bits in the bloom filter (power of 2).
     bloom_mask: u64,
     /// Verified-positive cache: (origin_hash, channel_hash) -> authorized.
-    verified: DashMap<(u32, u16), bool>,
+    ///
+    /// `origin_hash` is a 64-bit subscriber projection — typically the
+    /// full `node_id` — rather than a 32-bit truncation. A 32-bit key
+    /// births-collides at ~65 k peers (√2^32), inside the practical
+    /// reach of a medium-sized mesh; 64 bits pushes the collision
+    /// floor to ~4 billion peers, which is no longer a plausible
+    /// operating point.
+    verified: DashMap<(u64, u16), bool>,
     /// Exact-identity ACL: `(origin_hash, canonical ChannelName) ->
     /// authorized`. Keys on the name string (not a hash) so that no
     /// two distinct channels can alias through a hash collision —
@@ -74,7 +81,7 @@ pub struct AuthGuard {
     /// `ChannelName` already implements `Hash + Eq` against its
     /// underlying validated `String`, so DashMap keys on the exact
     /// name comparison.
-    exact: DashMap<(u32, ChannelName), ()>,
+    exact: DashMap<(u64, ChannelName), ()>,
 }
 
 /// Bloom filter size: 2^15 bits = 4KB. Fits in L1 cache.
@@ -97,7 +104,7 @@ impl AuthGuard {
     ///
     /// Called on every packet by forwarding nodes. Must complete in <10ns.
     #[inline]
-    pub fn check_fast(&self, origin_hash: u32, channel_hash: u16) -> AuthVerdict {
+    pub fn check_fast(&self, origin_hash: u64, channel_hash: u16) -> AuthVerdict {
         let key = bloom_key(origin_hash, channel_hash);
 
         // Probe bloom filter with two hash functions
@@ -123,7 +130,7 @@ impl AuthGuard {
     ///
     /// Called at subscription time (slow path). Inserts into both the
     /// bloom filter and the verified cache.
-    pub fn authorize(&self, origin_hash: u32, channel_hash: u16) {
+    pub fn authorize(&self, origin_hash: u64, channel_hash: u16) {
         let key = bloom_key(origin_hash, channel_hash);
 
         // Insert into bloom filter
@@ -143,7 +150,7 @@ impl AuthGuard {
     /// Removes from verified cache. The bloom filter is not cleared
     /// (bloom filters don't support deletion), but the verified cache
     /// miss will cause `NeedsFullCheck` which will then fail.
-    pub fn revoke(&self, origin_hash: u32, channel_hash: u16) {
+    pub fn revoke(&self, origin_hash: u64, channel_hash: u16) {
         self.verified.remove(&(origin_hash, channel_hash));
     }
 
@@ -154,7 +161,7 @@ impl AuthGuard {
     /// [`Self::is_authorized_full`] — the 16-bit `channel_hash` alone
     /// is collision-prone at mesh scale and must not be trusted as
     /// an ACL for non-data-plane decisions.
-    pub fn is_authorized(&self, origin_hash: u32, channel_hash: u16) -> bool {
+    pub fn is_authorized(&self, origin_hash: u64, channel_hash: u16) -> bool {
         self.verified.contains_key(&(origin_hash, channel_hash))
     }
 
@@ -166,7 +173,7 @@ impl AuthGuard {
     /// - the fast-path bloom + verified cache, so the same origin
     ///   can continue sending packets on that channel via
     ///   [`Self::check_fast`] / [`Self::is_authorized`].
-    pub fn allow_channel(&self, origin_hash: u32, name: &ChannelName) {
+    pub fn allow_channel(&self, origin_hash: u64, name: &ChannelName) {
         self.exact.insert((origin_hash, name.clone()), ());
         self.authorize(origin_hash, name.hash());
     }
@@ -178,7 +185,7 @@ impl AuthGuard {
     /// deletion), so the fast path may transition to
     /// [`AuthVerdict::NeedsFullCheck`] for this pair — the exact-map
     /// miss then fails the full check.
-    pub fn revoke_channel(&self, origin_hash: u32, name: &ChannelName) {
+    pub fn revoke_channel(&self, origin_hash: u64, name: &ChannelName) {
         self.exact.remove(&(origin_hash, name.clone()));
         self.revoke(origin_hash, name.hash());
     }
@@ -189,7 +196,7 @@ impl AuthGuard {
     /// this cannot be bypassed by a hash collision between two
     /// different channel names — two distinct canonical names can
     /// never alias.
-    pub fn is_authorized_full(&self, origin_hash: u32, name: &ChannelName) -> bool {
+    pub fn is_authorized_full(&self, origin_hash: u64, name: &ChannelName) -> bool {
         self.exact.contains_key(&(origin_hash, name.clone()))
     }
 
@@ -254,10 +261,10 @@ impl std::fmt::Debug for AuthGuard {
 
 /// Compute bloom filter key from (origin_hash, channel_hash).
 #[inline]
-fn bloom_key(origin_hash: u32, channel_hash: u16) -> u64 {
-    let mut buf = [0u8; 6];
-    buf[0..4].copy_from_slice(&origin_hash.to_le_bytes());
-    buf[4..6].copy_from_slice(&channel_hash.to_le_bytes());
+fn bloom_key(origin_hash: u64, channel_hash: u16) -> u64 {
+    let mut buf = [0u8; 10];
+    buf[0..8].copy_from_slice(&origin_hash.to_le_bytes());
+    buf[8..10].copy_from_slice(&channel_hash.to_le_bytes());
     xxh3_64(&buf)
 }
 
@@ -324,13 +331,13 @@ mod tests {
     fn test_multiple_authorizations() {
         let guard = AuthGuard::new();
 
-        for i in 0..100u32 {
+        for i in 0..100u64 {
             guard.authorize(i, (i * 7) as u16);
         }
 
         assert_eq!(guard.authorized_count(), 100);
 
-        for i in 0..100u32 {
+        for i in 0..100u64 {
             assert_eq!(
                 guard.check_fast(i, (i * 7) as u16),
                 AuthVerdict::Allowed,
@@ -359,12 +366,12 @@ mod tests {
         // False positive rate should be well under 1% for a 4KB filter.
         let guard = AuthGuard::new();
 
-        for i in 0..1000u32 {
+        for i in 0..1000u64 {
             guard.authorize(i, i as u16);
         }
 
         let mut false_positives = 0;
-        for i in 10000..20000u32 {
+        for i in 10000..20000u64 {
             let verdict = guard.check_fast(i, i as u16);
             if verdict != AuthVerdict::Denied {
                 false_positives += 1;
@@ -378,6 +385,89 @@ mod tests {
     // ---- Regression tests for Cubic AI findings ----
 
     #[test]
+    fn test_regression_u64_origin_hash_defeats_32bit_collision() {
+        // Regression: before this fix the guard keyed on `u32`, so two
+        // distinct `node_id`s sharing the low 32 bits were
+        // indistinguishable — the first subscriber's grant admitted the
+        // second's packets. Birthday collision is plausible at ~65 k
+        // peers. Widening to `u64` pushes the floor out of reach.
+        let guard = AuthGuard::new();
+
+        let name = ChannelName::new("regression-u64-origin").unwrap();
+        let legit: u64 = 0x0000_ABCD_1234_5678;
+        let forged: u64 = 0xFFFF_FFFF_1234_5678; // same low 32, different high
+        assert_eq!(legit as u32, forged as u32);
+        assert_ne!(legit, forged);
+
+        guard.allow_channel(legit, &name);
+
+        // Legit subscriber is admitted.
+        assert_eq!(
+            guard.check_fast(legit, name.hash()),
+            AuthVerdict::Allowed,
+            "legit subscriber must be admitted"
+        );
+        assert!(guard.is_authorized_full(legit, &name));
+
+        // Forged subscriber (sharing only the low 32 bits) is rejected.
+        assert_ne!(
+            guard.check_fast(forged, name.hash()),
+            AuthVerdict::Allowed,
+            "forged subscriber must not ride the legit grant"
+        );
+        assert!(!guard.is_authorized_full(forged, &name));
+    }
+
+    #[test]
+    fn test_regression_channel_hash_collision_distinguishable_by_exact_name() {
+        // Regression: `check_fast` alone is keyed on the 16-bit
+        // channel_hash, which collides often enough at mesh scale to
+        // let one channel's subscription authorize another. The exact
+        // ACL on the canonical `ChannelName` is the intended backstop —
+        // this test asserts two colliding names never alias there.
+        let guard = AuthGuard::new();
+
+        // Construct two distinct names whose `ChannelName::hash()`
+        // happens to collide. We brute-force because the hash is
+        // xxh3_64 truncated to 16 bits — collisions are cheap to find.
+        let base = "regression/coll-";
+        let mut name_a: Option<ChannelName> = None;
+        let mut name_b: Option<ChannelName> = None;
+        'outer: for i in 0..200_000u32 {
+            let cand = ChannelName::new(&format!("{base}{i}")).unwrap();
+            if name_a.is_none() {
+                name_a = Some(cand);
+                continue;
+            }
+            if cand.hash() == name_a.as_ref().unwrap().hash()
+                && cand.as_str() != name_a.as_ref().unwrap().as_str()
+            {
+                name_b = Some(cand);
+                break 'outer;
+            }
+        }
+        let name_a = name_a.expect("seeded name");
+        let name_b = name_b.expect(
+            "two distinct ChannelNames with the same 16-bit hash — widen the search range",
+        );
+        assert_eq!(name_a.hash(), name_b.hash());
+        assert_ne!(name_a.as_str(), name_b.as_str());
+
+        let origin: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        guard.allow_channel(origin, &name_a);
+
+        // Fast-path collision: check_fast says Allowed for B because
+        // it only sees the 16-bit hash.
+        assert_eq!(guard.check_fast(origin, name_b.hash()), AuthVerdict::Allowed);
+
+        // Exact check distinguishes them — this is what callers must
+        // consult before trusting the fast-path verdict for any
+        // authorization decision that survives past the AEAD backstop.
+        assert!(guard.is_authorized_full(origin, &name_a));
+        assert!(!guard.is_authorized_full(origin, &name_b));
+    }
+
+    #[test]
     fn test_regression_concurrent_authorize_and_check() {
         // Regression: bloom filter used unsafe raw pointer mutation through
         // &self, causing UB under concurrent access. Now uses AtomicU8.
@@ -388,10 +478,10 @@ mod tests {
 
         // Spawn writers
         let mut handles = Vec::new();
-        for t in 0..4u32 {
+        for t in 0..4u64 {
             let g = Arc::clone(&guard);
             handles.push(thread::spawn(move || {
-                for i in 0..250u32 {
+                for i in 0..250u64 {
                     g.authorize(t * 1000 + i, (t * 1000 + i) as u16);
                 }
             }));
@@ -401,7 +491,7 @@ mod tests {
         for _ in 0..4 {
             let g = Arc::clone(&guard);
             handles.push(thread::spawn(move || {
-                for i in 0..1000u32 {
+                for i in 0..1000u64 {
                     let _ = g.check_fast(i, i as u16);
                 }
             }));
@@ -413,8 +503,8 @@ mod tests {
 
         // All authorized pairs should be findable
         assert_eq!(guard.authorized_count(), 1000);
-        for t in 0..4u32 {
-            for i in 0..250u32 {
+        for t in 0..4u64 {
+            for i in 0..250u64 {
                 assert!(
                     guard.is_authorized(t * 1000 + i, (t * 1000 + i) as u16),
                     "pair ({}, {}) should be authorized after concurrent insertion",

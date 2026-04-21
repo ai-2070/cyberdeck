@@ -462,14 +462,19 @@ fn routing_id(node_id: u64) -> u64 {
     (node_id as u32) as u64
 }
 
-/// 32-bit origin-hash projection used as the `AuthGuard` key.
-/// Matches the routing-plane truncation so `origin_hash` stays
-/// consistent with the `src_id` that forwarded packets already
-/// carry — one subscriber shows up under the same key on every
-/// publish regardless of how the packet is encoded.
+/// 64-bit origin-hash projection used as the `AuthGuard` key.
+///
+/// A prior version truncated to `u32` so the key matched the
+/// routing-plane's 32-bit `src_id`, but truncating to 32 bits
+/// birthday-collides at ~65 k peers — inside the practical reach of
+/// a medium mesh — and lets one subscriber's grant admit a different
+/// subscriber's packets. The fan-out fast path keys on the full
+/// 64-bit `node_id` (the value it already has in hand), which pushes
+/// the collision floor out of reach. The `src_id` field on wire
+/// packets is not consulted for authorization.
 #[inline]
-fn subscriber_origin_hash(node_id: u64) -> u32 {
-    node_id as u32
+fn subscriber_origin_hash(node_id: u64) -> u64 {
+    node_id
 }
 
 /// Replace a zero `Duration` with a 1 ms floor.
@@ -720,6 +725,16 @@ impl MeshNode {
         &self.static_keypair.public
     }
 
+    /// Whether [`Self::shutdown`] has been invoked on this node.
+    ///
+    /// Exposed for tests and for FFI callers that want to verify a
+    /// shutdown actually landed (rather than being a silent no-op
+    /// because extra `Arc` references were outstanding, as an earlier
+    /// `net_mesh_shutdown` variant did).
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+
     /// Create a new mesh node.
     ///
     /// Binds a UDP socket but does not connect to any peers yet.
@@ -886,6 +901,15 @@ impl MeshNode {
     /// for `register_channel` / `subscribe_channel` instead.
     pub fn auth_guard(&self) -> &Arc<AuthGuard> {
         &self.auth_guard
+    }
+
+    /// The shared `TokenCache` installed on this node, if any. Only
+    /// populated when a caller registered one via
+    /// [`Self::set_token_cache`]. Exposed for tests that need to
+    /// assert the cache is *not* populated as a side effect of a
+    /// rejected subscribe.
+    pub fn token_cache(&self) -> Option<&Arc<TokenCache>> {
+        self.token_cache.as_ref()
     }
 
     /// Get this node's ed25519 entity id (derived from the
@@ -2769,16 +2793,16 @@ impl MeshNode {
             return (false, Some(AckReason::Unauthorized));
         }
 
-        // Install any presented token first so the subsequent
-        // `can_subscribe` cache lookup succeeds. `TokenCache::insert`
-        // verifies the signature; a tampered / malformed token is
-        // silently skipped here and will cause the require_token
-        // path below to reject.
-        if let (Some(bytes), Some(cache)) = (token_bytes, ctx.token_cache.as_ref()) {
-            if let Ok(tok) = PermissionToken::from_bytes(bytes) {
-                let _ = cache.insert(tok);
-            }
-        }
+        // Parse + verify the presented token into a LOCAL scratch
+        // value. We do NOT insert into the shared cache until the
+        // full auth check passes — otherwise an attacker can spam
+        // self-signed subscribes (which fail at cap/visibility
+        // checks) yet leave their tokens permanently in the shared
+        // cache, exhausting memory keyed under attacker-controlled
+        // `(subject, channel_hash)` slots.
+        let presented_token = token_bytes
+            .and_then(|bytes| PermissionToken::from_bytes(bytes).ok())
+            .filter(|tok| tok.verify().is_ok());
 
         // Whether any cap / token gate is in play. A fully open
         // channel (no filters, no require_token) short-circuits
@@ -2818,12 +2842,32 @@ impl MeshNode {
             };
         };
 
-        let cache = ctx
-            .token_cache
-            .clone()
-            .unwrap_or_else(|| Arc::new(TokenCache::new()));
-        if !cfg.can_subscribe(&peer_caps, &peer_entity, &cache) {
+        // Run the ACL check against a scratch cache containing only
+        // the presented token first. A positive verdict means the
+        // fresh token alone is sufficient. If that fails, fall back
+        // to the shared cache so a peer relying on a previously-
+        // stored delegation can still re-subscribe without having
+        // to re-present. The shared cache is read-only for this
+        // decision.
+        let scratch_cache = Arc::new(TokenCache::new());
+        if let Some(ref tok) = presented_token {
+            scratch_cache.insert_unchecked(tok.clone());
+        }
+        let passed_with_scratch = cfg.can_subscribe(&peer_caps, &peer_entity, &scratch_cache);
+        let passed = passed_with_scratch
+            || ctx
+                .token_cache
+                .as_ref()
+                .is_some_and(|shared| cfg.can_subscribe(&peer_caps, &peer_entity, shared));
+        if !passed {
             return (false, Some(AckReason::Unauthorized));
+        }
+
+        // Auth passed — now and only now promote the presented token
+        // to the shared cache so future subscribes on the same
+        // (subject, channel_hash) can skip re-presenting.
+        if let (Some(tok), Some(shared)) = (presented_token, ctx.token_cache.as_ref()) {
+            let _ = shared.insert(tok);
         }
         (true, None)
     }
@@ -3057,6 +3101,13 @@ impl MeshNode {
         // Three-way verdict:
         //
         // - `Allowed`: bloom hit + verified-cache entry says yes.
+        //   The verified cache is keyed on the 16-bit `channel_hash`
+        //   that rides the wire header, which collides routinely at
+        //   mesh scale — one subscriber's grant on channel A can
+        //   falsely admit them on channel B when the hashes alias.
+        //   Cross-check the canonical name against `exact` before
+        //   trusting the verdict; a mismatch means the allow came
+        //   from a different channel that happened to collide.
         // - `Denied`: bloom miss — no auth entry exists for this
         //   (origin, channel). Skip the subscriber.
         // - `Unknown`: bloom hit but verified cache missed. Fall
@@ -3073,7 +3124,7 @@ impl MeshNode {
         subscribers.retain(|peer_id| {
             let origin = subscriber_origin_hash(*peer_id);
             match auth_guard.check_fast(origin, channel_hash) {
-                AuthVerdict::Allowed => true,
+                AuthVerdict::Allowed => auth_guard.is_authorized_full(origin, &channel_name),
                 AuthVerdict::Denied => false,
                 AuthVerdict::NeedsFullCheck => {
                     if auth_guard.is_authorized_full(origin, &channel_name) {

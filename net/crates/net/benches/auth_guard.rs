@@ -24,7 +24,7 @@ fn populated_guard(n_entries: u32) -> AuthGuard {
     let guard = AuthGuard::new();
     for i in 0..n_entries {
         let name = ChannelName::new(&format!("bench/chan-{}", i)).unwrap();
-        guard.allow_channel(0xdead_0000 + i, &name);
+        guard.allow_channel(0xdead_0000_u64 + i as u64, &name);
     }
     guard
 }
@@ -40,12 +40,12 @@ fn bench_check_fast_hot_hit(c: &mut Criterion) {
     group.bench_function("single_thread", |b| {
         // Cycle through 256 different authorized (origin, channel)
         // pairs so the bench doesn't stay on one cache line.
-        let mut i = 0u32;
+        let mut i = 0u64;
         let channels: Vec<ChannelName> = (0..256)
             .map(|j| ChannelName::new(&format!("bench/chan-{}", j)).unwrap())
             .collect();
         b.iter(|| {
-            let origin = 0xdead_0000 + (i & 0xff);
+            let origin = 0xdead_0000_u64 + (i & 0xff);
             let channel_hash = channels[(i as usize) & 0xff].hash();
             let v = guard.check_fast(black_box(origin), black_box(channel_hash));
             i = i.wrapping_add(1);
@@ -67,10 +67,10 @@ fn bench_check_fast_cold_miss(c: &mut Criterion) {
     let mut group = c.benchmark_group("auth_guard_check_fast_miss");
     group.throughput(Throughput::Elements(1));
     group.bench_function("single_thread", |b| {
-        let mut i = 0u32;
+        let mut i = 0u64;
         b.iter(|| {
             // Origin range that never appeared in `populated_guard`.
-            let origin = 0xcafe_0000 + i;
+            let origin = 0xcafe_0000_u64 + i;
             let channel_hash = (i & 0xffff) as u16;
             let v = guard.check_fast(black_box(origin), black_box(channel_hash));
             i = i.wrapping_add(1);
@@ -100,9 +100,9 @@ fn bench_check_fast_concurrent(c: &mut Criterion) {
         let g = guard.clone();
         let s = stop.clone();
         handles.push(thread::spawn(move || {
-            let mut i = t as u32;
+            let mut i = t as u64;
             while s.load(Ordering::Relaxed) == 0 {
-                let origin = 0xdead_0000 + (i & 0xff);
+                let origin = 0xdead_0000_u64 + (i & 0xff);
                 let channel_hash = (i % 10_000) as u16;
                 black_box(g.check_fast(origin, channel_hash));
                 i = i.wrapping_add(7);
@@ -117,9 +117,9 @@ fn bench_check_fast_concurrent(c: &mut Criterion) {
     let mut group = c.benchmark_group("auth_guard_check_fast_contended");
     group.throughput(Throughput::Elements(1));
     group.bench_function("eight_threads", |b| {
-        let mut i = 0u32;
+        let mut i = 0u64;
         b.iter(|| {
-            let origin = 0xdead_0000 + (i & 0xff);
+            let origin = 0xdead_0000_u64 + (i & 0xff);
             let channel_hash = (i % 10_000) as u16;
             let v = guard.check_fast(black_box(origin), black_box(channel_hash));
             i = i.wrapping_add(1);
@@ -143,9 +143,9 @@ fn bench_allow_channel(c: &mut Criterion) {
     group.bench_function("insert", |b| {
         let guard = AuthGuard::new();
         let name = ChannelName::new("bench/chan-allow").unwrap();
-        let mut i = 0u32;
+        let mut i = 0u64;
         b.iter(|| {
-            guard.allow_channel(black_box(0xbeef_0000 + i), &name);
+            guard.allow_channel(black_box(0xbeef_0000_u64 + i), &name);
             i = i.wrapping_add(1);
         });
     });
@@ -170,8 +170,8 @@ fn bench_hot_hit_ceiling(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
-                for i in 0..1_000_000u32 {
-                    black_box(guard.check_fast(0xdead_0000 + (i & 0xff), channel_hash));
+                for i in 0..1_000_000u64 {
+                    black_box(guard.check_fast(0xdead_0000_u64 + (i & 0xff), channel_hash));
                 }
             }
             start.elapsed()

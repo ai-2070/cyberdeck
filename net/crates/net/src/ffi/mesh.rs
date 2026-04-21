@@ -478,6 +478,15 @@ pub extern "C" fn net_mesh_start(handle: *mut MeshNodeHandle) -> c_int {
 
 /// Shut down the node. Must be called before `net_mesh_free` to
 /// release network resources. Idempotent.
+///
+/// Runs unconditionally — `MeshNode::shutdown` takes `&self` and
+/// the underlying primitives (shutdown flag, notify, deactivate)
+/// are safe to call while other handles still hold the `Arc`. A
+/// prior version silently returned 0 whenever `Arc::strong_count`
+/// exceeded 1, which meant a caller that held a stream handle
+/// would see "shutdown successful" without any tasks actually
+/// stopping — the node kept running until every stream was
+/// dropped. Callers now always get the real shutdown outcome.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_mesh_shutdown(handle: *mut MeshNodeHandle) -> c_int {
     if handle.is_null() {
@@ -485,19 +494,9 @@ pub extern "C" fn net_mesh_shutdown(handle: *mut MeshNodeHandle) -> c_int {
     }
     let h = unsafe { &*handle };
     let rt = runtime();
-    // Only actually shut down if we're the sole holder of the Arc
-    // (no outstanding stream handles etc.). Otherwise return OK —
-    // the remaining references will keep the node alive until they
-    // drop. `shutdown` takes `&self`, so no ownership transfer is
-    // needed; the earlier `try_unwrap` against an extra clone of the
-    // same `Arc` was unreachable.
-    if Arc::strong_count(&h.inner) == 1 {
-        match rt.block_on(async { h.inner.shutdown().await }) {
-            Ok(()) => 0,
-            Err(e) => adapter_err_to_code(&e),
-        }
-    } else {
-        0
+    match rt.block_on(async { h.inner.shutdown().await }) {
+        Ok(()) => 0,
+        Err(e) => adapter_err_to_code(&e),
     }
 }
 
@@ -2089,6 +2088,46 @@ mod tests {
         assert_eq!(saturating_u16_cap(u16::MAX as u32), u16::MAX);
         assert_eq!(saturating_u16_cap(u16::MAX as u32 + 1), u16::MAX);
         assert_eq!(saturating_u16_cap(u32::MAX), u16::MAX);
+    }
+
+    /// Regression for a cubic-flagged P1: `net_mesh_shutdown`
+    /// previously returned success (0) without actually shutting
+    /// the node down whenever `Arc::strong_count(&inner) > 1`
+    /// (e.g. the FFI caller was holding a stream handle). The real
+    /// shutdown was silently skipped, so background tasks kept
+    /// draining UDP and consuming CPU. This test holds an extra
+    /// `Arc` clone, calls `net_mesh_shutdown`, and asserts the
+    /// shutdown flag flipped.
+    #[test]
+    fn net_mesh_shutdown_runs_even_with_outstanding_arc_refs() {
+        let cfg = serde_json::json!({
+            "bind_addr": "127.0.0.1:0",
+            "psk_hex": "0".repeat(64),
+        });
+        let cfg_c = CString::new(cfg.to_string()).unwrap();
+        let mut out: *mut MeshNodeHandle = std::ptr::null_mut();
+        let rc = net_mesh_new(cfg_c.as_ptr(), &mut out);
+        assert_eq!(rc, 0, "net_mesh_new failed: {rc}");
+        assert!(!out.is_null());
+
+        // Clone the inner Arc so strong_count > 1 — this is what a
+        // live stream handle would look like from the guard's POV.
+        let inner_clone = {
+            let h = unsafe { &*out };
+            h.inner.clone()
+        };
+        assert!(Arc::strong_count(&inner_clone) >= 2);
+        assert!(!inner_clone.is_shutdown());
+
+        let rc = net_mesh_shutdown(out);
+        assert_eq!(rc, 0, "net_mesh_shutdown returned {rc}");
+        assert!(
+            inner_clone.is_shutdown(),
+            "shutdown flag must be set even when extra Arc refs are outstanding"
+        );
+
+        drop(inner_clone);
+        let _ = unsafe { Box::from_raw(out) };
     }
 
     #[test]

@@ -178,20 +178,35 @@ pub fn decode(data: &[u8]) -> Result<MembershipMsg, MembershipCodecError> {
                 // Advance past the name we just read.
                 cur.set_position(end as u64);
                 // Token: u16_le length + bytes. Zero length ⇒ absent.
-                // Trailing-byte absence (legacy pre-E-1 payload) is
-                // also treated as "no token" for forward-compat.
-                let token = if cur.remaining() < 2 {
-                    None
-                } else {
-                    let token_len = cur.get_u16_le() as usize;
-                    if token_len == 0 {
-                        None
-                    } else if cur.remaining() < token_len {
-                        return Err(MembershipCodecError::Overflow(token_len, cur.remaining()));
-                    } else {
-                        let tstart = cur.position() as usize;
-                        let tend = tstart + token_len;
-                        Some(data[tstart..tend].to_vec())
+                // Legacy pre-E-1 payloads that stop exactly after the
+                // name (zero trailing bytes) are treated as "no token"
+                // for forward-compat. Exactly one trailing byte is
+                // neither — it means a malformed sender wrote half
+                // the length prefix, and the older
+                // `cur.remaining() < 2` check silently accepted it as
+                // "no token," hiding the bug from callers. Reject so
+                // truncation surfaces as an error.
+                let token = match cur.remaining() {
+                    0 => None,
+                    1 => {
+                        return Err(MembershipCodecError::Truncated(
+                            "subscribe token length prefix",
+                        ));
+                    }
+                    _ => {
+                        let token_len = cur.get_u16_le() as usize;
+                        if token_len == 0 {
+                            None
+                        } else if cur.remaining() < token_len {
+                            return Err(MembershipCodecError::Overflow(
+                                token_len,
+                                cur.remaining(),
+                            ));
+                        } else {
+                            let tstart = cur.position() as usize;
+                            let tend = tstart + token_len;
+                            Some(data[tstart..tend].to_vec())
+                        }
                     }
                 };
                 Ok(MembershipMsg::Subscribe {
@@ -290,6 +305,29 @@ mod tests {
                 nonce: 42,
                 token: None,
             }
+        );
+    }
+
+    #[test]
+    fn test_regression_subscribe_one_byte_token_len_rejected() {
+        // Regression for a cubic-flagged P2: a Subscribe payload with
+        // exactly one trailing byte after the name used to be silently
+        // accepted as "no token" because the decoder guarded on
+        // `remaining() < 2`. A half-written `u16_le` length prefix is
+        // a truncation, not a legacy payload — it must error.
+        use bytes::BufMut;
+        let mut buf = Vec::new();
+        buf.put_u8(MSG_SUBSCRIBE);
+        buf.put_u64_le(42);
+        let name = b"lab/x";
+        buf.put_u8(name.len() as u8);
+        buf.extend_from_slice(name);
+        // Exactly ONE trailing byte — half of a u16_le length prefix.
+        buf.push(0x05);
+        let err = decode(&buf).unwrap_err();
+        assert!(
+            matches!(err, MembershipCodecError::Truncated(_)),
+            "expected Truncated, got {err:?}",
         );
     }
 

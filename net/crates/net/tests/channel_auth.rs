@@ -294,6 +294,65 @@ async fn subscribe_rejected_with_wrong_subject_token() {
 }
 
 #[tokio::test]
+async fn rejected_subscribe_does_not_leak_token_into_shared_cache() {
+    // Regression for a cubic-flagged P2 DoS vector: the publisher
+    // used to insert every parseable, signature-valid token into the
+    // shared `TokenCache` **before** running the ACL check. An
+    // attacker could spam self-signed tokens that fail authorization
+    // yet still land in the cache, filling memory under
+    // attacker-controlled `(subject, channel_hash)` keys.
+    //
+    // The fix defers the insert until authorization passes.
+    let ports = find_ports(2).await;
+    let (a, b) = setup_pair(
+        ports[0],
+        ports[1],
+        CapabilitySet::new(),
+        CapabilitySet::new(),
+    )
+    .await;
+
+    let name = ChannelName::new("lab/leak").unwrap();
+    a.registry
+        .insert(ChannelConfig::new(ChannelId::new(name.clone())).with_require_token(true));
+
+    // Pre-test: publisher's shared cache is empty.
+    let shared_cache = a
+        .mesh
+        .token_cache()
+        .cloned()
+        .expect("publisher should have a shared token cache");
+    assert_eq!(shared_cache.len(), 0, "precondition: empty cache");
+
+    // B signs a token intended for a THIRD bystander entity, not
+    // itself. The token is signature-valid but unauthorized for B.
+    let bystander = EntityKeypair::generate();
+    let token = PermissionToken::issue(
+        &a.keypair,
+        bystander.entity_id().clone(),
+        TokenScope::SUBSCRIBE,
+        name.hash(),
+        300,
+        0,
+    );
+
+    let result = b
+        .mesh
+        .subscribe_channel_with_token(a.mesh.node_id(), name, token)
+        .await;
+    assert!(result.is_err(), "unauthorized subscribe must be rejected");
+
+    // Post-test: publisher's shared cache must STILL be empty. If
+    // the pre-fix order ever returns, this will flip to non-zero
+    // and flag the regression.
+    assert_eq!(
+        shared_cache.len(),
+        0,
+        "rejected subscribe must not populate the shared token cache"
+    );
+}
+
+#[tokio::test]
 async fn publish_denied_by_own_cap_filter() {
     let ports = find_ports(2).await;
     let (a, b) = setup_pair(
