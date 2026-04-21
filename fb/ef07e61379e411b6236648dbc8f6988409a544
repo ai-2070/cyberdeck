@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/mesh.rs
+  5bf3f089eecaef7a 1124-1139
+net/crates/net/sdk/src/compute.rs
+  5bf3f089eecaef7a 201-204,238,304-313,323-343,460-468,498-508
+net/crates/net/sdk/tests/compute_runtime.rs
+  5bf3f089eecaef7a 471-542
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "fbef07e61379e411b6236648dbc8f6988409a544",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 1880,
+      "total_deletions": 38,
+      "accepted_lines": 145,
+      "overriden_lines": 0
+    }
+  }
+}
