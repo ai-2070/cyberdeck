@@ -1242,6 +1242,11 @@ mod tests {
             tx_key: [0x42u8; 32],
             rx_key: [0x24u8; 32],
             session_id: 0x1234567890ABCDEF,
+            // Zero-filled sentinel — this helper bypasses the Noise
+            // handshake, so there is no real X25519 peer key to
+            // surface. `MeshNode::peer_static_x25519` treats zeros
+            // as "not available" and returns `None`.
+            remote_static_pub: [0u8; 32],
         }
     }
 

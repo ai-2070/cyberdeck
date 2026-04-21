@@ -7,10 +7,11 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Buf;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 
-use super::migration::{MigrationError, MigrationPhase, MigrationState};
+use super::migration::{MigrationError, MigrationFailureReason, MigrationPhase, MigrationState};
 use super::registry::DaemonRegistry;
 use crate::adapter::net::continuity::superposition::SuperpositionState;
 use crate::adapter::net::state::causal::{CausalEvent, CausalLink};
@@ -82,8 +83,10 @@ pub enum MigrationMessage {
     MigrationFailed {
         /// Origin hash of daemon whose migration failed.
         daemon_origin: u32,
-        /// Human-readable reason for failure.
-        reason: String,
+        /// Structured reason code — source dispatches on this to
+        /// decide whether the migration is retriable. See
+        /// [`MigrationFailureReason`].
+        reason: MigrationFailureReason,
     },
 
     /// Buffered events from source for replay on target.
@@ -214,16 +217,34 @@ pub mod wire {
                 daemon_origin,
                 reason,
             } => {
-                let reason_len = u16::try_from(reason.len()).map_err(|_| {
-                    MigrationError::StateFailed(format!(
-                        "reason length {} exceeds u16::MAX",
-                        reason.len()
-                    ))
-                })?;
                 buf.put_u8(MSG_FAILED);
                 buf.put_u32_le(*daemon_origin);
-                buf.put_u16_le(reason_len);
-                buf.extend_from_slice(reason.as_bytes());
+                // Wire layout:
+                //   code:  u16 le
+                //   then variant-specific payload (0 bytes for
+                //   zero-payload variants; `u16 le + bytes` for
+                //   string-bearing variants; `u8` for NotReadyTimeout).
+                buf.put_u16_le(reason.code());
+                match reason {
+                    MigrationFailureReason::NotReady
+                    | MigrationFailureReason::FactoryNotFound
+                    | MigrationFailureReason::ComputeNotSupported
+                    | MigrationFailureReason::AlreadyMigrating => {}
+                    MigrationFailureReason::StateFailed(msg)
+                    | MigrationFailureReason::IdentityTransportFailed(msg) => {
+                        let len = u16::try_from(msg.len()).map_err(|_| {
+                            MigrationError::StateFailed(format!(
+                                "failure reason message length {} exceeds u16::MAX",
+                                msg.len()
+                            ))
+                        })?;
+                        buf.put_u16_le(len);
+                        buf.extend_from_slice(msg.as_bytes());
+                    }
+                    MigrationFailureReason::NotReadyTimeout { attempts } => {
+                        buf.put_u8(*attempts);
+                    }
+                }
             }
             MigrationMessage::BufferedEvents {
                 daemon_origin,
@@ -376,20 +397,14 @@ pub mod wire {
                 })
             }
             MSG_FAILED => {
-                if cur.remaining() < 6 {
+                if cur.remaining() < 4 + 2 {
                     return Err(MigrationError::StateFailed(
-                        "truncated MigrationFailed".into(),
+                        "truncated MigrationFailed header".into(),
                     ));
                 }
                 let daemon_origin = cur.get_u32_le();
-                let reason_len = cur.get_u16_le() as usize;
-                if cur.remaining() < reason_len {
-                    return Err(MigrationError::StateFailed("truncated reason".into()));
-                }
-                let mut reason_bytes = vec![0u8; reason_len];
-                cur.copy_to_slice(&mut reason_bytes);
-                let reason =
-                    String::from_utf8(reason_bytes).unwrap_or_else(|_| "invalid utf8".into());
+                let code = cur.get_u16_le();
+                let reason = decode_failure_reason(&mut cur, code)?;
                 Ok(MigrationMessage::MigrationFailed {
                     daemon_origin,
                     reason,
@@ -486,6 +501,59 @@ pub mod wire {
             ))),
         }
     }
+}
+
+/// Decode a `MigrationFailureReason` from the `MSG_FAILED` variant
+/// payload. The 16-bit tag already consumed by the caller selects
+/// the variant; unknown tags are rejected so forward-compat is
+/// explicit rather than silent-ignore.
+fn decode_failure_reason(
+    cur: &mut std::io::Cursor<&[u8]>,
+    code: u16,
+) -> Result<MigrationFailureReason, MigrationError> {
+    match code {
+        0 => Ok(MigrationFailureReason::NotReady),
+        1 => Ok(MigrationFailureReason::FactoryNotFound),
+        2 => Ok(MigrationFailureReason::ComputeNotSupported),
+        3 => {
+            let msg = read_u16_string(cur, "StateFailed message")?;
+            Ok(MigrationFailureReason::StateFailed(msg))
+        }
+        4 => Ok(MigrationFailureReason::AlreadyMigrating),
+        5 => {
+            let msg = read_u16_string(cur, "IdentityTransportFailed message")?;
+            Ok(MigrationFailureReason::IdentityTransportFailed(msg))
+        }
+        6 => {
+            if cur.remaining() < 1 {
+                return Err(MigrationError::StateFailed(
+                    "truncated NotReadyTimeout attempts field".into(),
+                ));
+            }
+            Ok(MigrationFailureReason::NotReadyTimeout {
+                attempts: cur.get_u8(),
+            })
+        }
+        other => Err(MigrationError::StateFailed(format!(
+            "unknown MigrationFailureReason code {other}",
+        ))),
+    }
+}
+
+fn read_u16_string(cur: &mut std::io::Cursor<&[u8]>, ctx: &str) -> Result<String, MigrationError> {
+    if cur.remaining() < 2 {
+        return Err(MigrationError::StateFailed(format!(
+            "truncated {ctx} length prefix",
+        )));
+    }
+    let len = cur.get_u16_le() as usize;
+    if cur.remaining() < len {
+        return Err(MigrationError::StateFailed(format!("truncated {ctx} body")));
+    }
+    let mut bytes = vec![0u8; len];
+    cur.copy_to_slice(&mut bytes);
+    String::from_utf8(bytes)
+        .map_err(|e| MigrationError::StateFailed(format!("{ctx} is not valid UTF-8: {e}")))
 }
 
 // ── Snapshot chunking ────────────────────────────────────────────────────────
@@ -812,6 +880,14 @@ impl MigrationOrchestrator {
         }
     }
 
+    /// Shared handle to the daemon registry this orchestrator was
+    /// built against. Exposed so the migration subprotocol
+    /// dispatcher can reach the registry without an extra `Arc`
+    /// plumbed alongside.
+    pub fn daemon_registry(&self) -> &Arc<DaemonRegistry> {
+        &self.daemon_registry
+    }
+
     /// Initiate a migration (phase 0: Snapshot).
     ///
     /// If the source is the local node, takes the snapshot immediately and
@@ -1124,10 +1200,22 @@ impl MigrationOrchestrator {
     /// Abort a migration at any phase.
     ///
     /// Returns the abort message to broadcast to involved nodes.
+    /// `reason` is wrapped in [`MigrationFailureReason::StateFailed`]
+    /// since a generic abort doesn't fit any of the more specific
+    /// variants.
     pub fn abort_migration(
         &self,
         daemon_origin: u32,
         reason: String,
+    ) -> Result<MigrationMessage, MigrationError> {
+        self.abort_migration_with_reason(daemon_origin, MigrationFailureReason::StateFailed(reason))
+    }
+
+    /// Abort a migration with a caller-supplied structured reason.
+    pub fn abort_migration_with_reason(
+        &self,
+        daemon_origin: u32,
+        reason: MigrationFailureReason,
     ) -> Result<MigrationMessage, MigrationError> {
         self.migrations
             .remove(&daemon_origin)
@@ -1210,7 +1298,7 @@ mod tests {
         DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, MeshDaemon,
     };
     use crate::adapter::net::identity::EntityKeypair;
-    use bytes::Bytes;
+    use bytes::{BufMut, Bytes};
 
     struct CounterDaemon {
         count: u64,
@@ -1316,7 +1404,13 @@ mod tests {
         let msg = orch.abort_migration(origin, "test abort".into()).unwrap();
         match msg {
             MigrationMessage::MigrationFailed { reason, .. } => {
-                assert_eq!(reason, "test abort");
+                // `abort_migration` wraps its string in `StateFailed`.
+                match reason {
+                    MigrationFailureReason::StateFailed(msg) => {
+                        assert_eq!(msg, "test abort")
+                    }
+                    other => panic!("expected StateFailed, got {other:?}"),
+                }
             }
             _ => panic!("expected MigrationFailed"),
         }
@@ -1770,21 +1864,35 @@ mod tests {
 
     #[test]
     fn test_wire_roundtrip_failed() {
-        let msg = MigrationMessage::MigrationFailed {
-            daemon_origin: 0xCCCC,
-            reason: "something broke".into(),
-        };
-        let encoded = wire::encode(&msg).unwrap();
-        let decoded = wire::decode(&encoded).unwrap();
-        match decoded {
-            MigrationMessage::MigrationFailed {
-                daemon_origin,
-                reason,
-            } => {
-                assert_eq!(daemon_origin, 0xCCCC);
-                assert_eq!(reason, "something broke");
+        // Round-trip every variant of MigrationFailureReason to
+        // pin the wire-layout contract. A future bump that drops
+        // or adds a variant without updating the match will trip
+        // the exhaustive match below.
+        for reason in [
+            MigrationFailureReason::NotReady,
+            MigrationFailureReason::FactoryNotFound,
+            MigrationFailureReason::ComputeNotSupported,
+            MigrationFailureReason::StateFailed("something broke".into()),
+            MigrationFailureReason::AlreadyMigrating,
+            MigrationFailureReason::IdentityTransportFailed("seal failed".into()),
+            MigrationFailureReason::NotReadyTimeout { attempts: 5 },
+        ] {
+            let msg = MigrationMessage::MigrationFailed {
+                daemon_origin: 0xCCCC,
+                reason: reason.clone(),
+            };
+            let encoded = wire::encode(&msg).unwrap();
+            let decoded = wire::decode(&encoded).unwrap();
+            match decoded {
+                MigrationMessage::MigrationFailed {
+                    daemon_origin,
+                    reason: r,
+                } => {
+                    assert_eq!(daemon_origin, 0xCCCC);
+                    assert_eq!(r, reason);
+                }
+                _ => panic!("expected MigrationFailed"),
             }
-            _ => panic!("expected MigrationFailed"),
         }
     }
 
@@ -1839,7 +1947,7 @@ mod tests {
         let oversized = "x".repeat(u16::MAX as usize + 1);
         let msg = MigrationMessage::MigrationFailed {
             daemon_origin: 0xDEAD,
-            reason: oversized,
+            reason: MigrationFailureReason::StateFailed(oversized),
         };
         let result = wire::encode(&msg);
         assert!(
@@ -1847,6 +1955,23 @@ mod tests {
             "encode of oversized reason must error, got {:?}",
             result
         );
+    }
+
+    #[test]
+    fn test_wire_rejects_unknown_failure_code() {
+        // Manually-crafted `MSG_FAILED` with code 0xFFFF (unknown
+        // variant). Decoder must refuse rather than mis-parse.
+        let mut buf = Vec::new();
+        buf.put_u8(wire::MSG_FAILED);
+        buf.put_u32_le(0xBEEF);
+        buf.put_u16_le(0xFFFF); // unknown code
+        let err = wire::decode(&buf).expect_err("unknown code must reject");
+        match err {
+            MigrationError::StateFailed(msg) => {
+                assert!(msg.contains("unknown MigrationFailureReason code"));
+            }
+            other => panic!("expected StateFailed, got {other:?}"),
+        }
     }
 
     #[test]

@@ -4,8 +4,14 @@
 //! daemon outputs in CausalLinks. The daemon only sees events and
 //! produces payloads — all chain management is the host's job.
 
+use std::sync::Arc;
+
+use dashmap::DashMap;
+
+use super::bindings::{DaemonBindings, SubscriptionBinding};
 use super::daemon::{DaemonError, DaemonHostConfig, DaemonStats, MeshDaemon};
 use crate::adapter::net::behavior::capability::CapabilityFilter;
+use crate::adapter::net::channel::ChannelName;
 use crate::adapter::net::identity::EntityKeypair;
 use crate::adapter::net::state::causal::{CausalChainBuilder, CausalEvent};
 use crate::adapter::net::state::horizon::ObservedHorizon;
@@ -28,6 +34,19 @@ pub struct DaemonHost {
     config: DaemonHostConfig,
     /// Runtime statistics.
     stats: DaemonStats,
+    /// Per-daemon subscription ledger. Populated by
+    /// [`Self::record_subscription`] / [`Self::forget_subscription`]
+    /// when the daemon asks to subscribe or unsubscribe from a
+    /// channel; read by [`Self::take_snapshot`] to serialize into
+    /// `StateSnapshot::bindings_bytes` so the migration target can
+    /// replay the subscriptions. See
+    /// [`DAEMON_CHANNEL_REBIND_PLAN.md`](../../../../docs/DAEMON_CHANNEL_REBIND_PLAN.md).
+    ///
+    /// `Arc<DashMap>` because the host itself lives under a
+    /// registry-level `Mutex` (for single-threaded `process()`
+    /// ordering) but the ledger is updated from the SDK's
+    /// subscribe / unsubscribe path which runs outside that lock.
+    subscriptions: Arc<DashMap<(u64, ChannelName), SubscriptionBinding>>,
 }
 
 impl DaemonHost {
@@ -45,6 +64,7 @@ impl DaemonHost {
             horizon: ObservedHorizon::new(),
             config,
             stats: DaemonStats::default(),
+            subscriptions: Arc::new(DashMap::new()),
         }
     }
 
@@ -76,13 +96,19 @@ impl DaemonHost {
             horizon: ObservedHorizon::new(),
             config,
             stats: DaemonStats::default(),
+            subscriptions: Arc::new(DashMap::new()),
         }
     }
 
     /// Restore from an L4 `StateSnapshot`.
     ///
     /// Rebuilds the causal chain from the snapshot's head link and calls
-    /// `daemon.restore()` with the serialized state.
+    /// `daemon.restore()` with the serialized state. Any subscriptions
+    /// encoded in `snapshot.bindings_bytes` are parsed into the host's
+    /// ledger so the migration-target replay path can re-subscribe the
+    /// daemon on the target node before cutover fires. A malformed
+    /// `bindings_bytes` payload aborts the restore — attacker-controlled
+    /// data must not slip past into the daemon's operational state.
     pub fn from_snapshot(
         mut daemon: Box<dyn MeshDaemon>,
         keypair: EntityKeypair,
@@ -105,6 +131,24 @@ impl DaemonHost {
         // head payload so the next event's parent_hash is computed correctly.
         let chain = CausalChainBuilder::from_head(snapshot.chain_link, snapshot.state.clone());
 
+        // Rehydrate the subscription ledger. Empty bytes → empty
+        // ledger; malformed bytes → reject. The migration-target
+        // handler consults this after construction to drive the
+        // re-bind replay.
+        let subscriptions = Arc::new(DashMap::new());
+        if !snapshot.bindings_bytes.is_empty() {
+            let bindings =
+                DaemonBindings::from_bytes(&snapshot.bindings_bytes).ok_or_else(|| {
+                    DaemonError::RestoreFailed(
+                        "snapshot bindings_bytes failed to decode — tampered or corrupt snapshot"
+                            .into(),
+                    )
+                })?;
+            for sub in bindings.subscriptions {
+                subscriptions.insert((sub.publisher, sub.channel.clone()), sub);
+            }
+        }
+
         Ok(Self {
             daemon,
             keypair,
@@ -112,6 +156,7 @@ impl DaemonHost {
             horizon: snapshot.horizon.clone(),
             config,
             stats: DaemonStats::default(),
+            subscriptions,
         })
     }
 
@@ -155,14 +200,73 @@ impl DaemonHost {
     /// Take a snapshot of the daemon's current state.
     ///
     /// Returns `None` if the daemon is stateless (`snapshot()` returns `None`).
+    /// The returned snapshot carries a frozen view of the subscription
+    /// ledger in its `bindings_bytes` field so the migration target
+    /// can replay subscriptions during Restore. An empty ledger serializes
+    /// to an empty byte slice — no wire overhead for daemons that never
+    /// subscribed.
     pub fn take_snapshot(&self) -> Option<StateSnapshot> {
         let state = self.daemon.snapshot()?;
-        Some(StateSnapshot::new(
+        let mut snapshot = StateSnapshot::new(
             self.keypair.entity_id().clone(),
             *self.chain.head(),
             state,
             self.horizon.clone(),
-        ))
+        );
+        let bindings = self.bindings_snapshot();
+        if !bindings.is_empty() {
+            snapshot.bindings_bytes = bindings.to_bytes();
+        }
+        Some(snapshot)
+    }
+
+    /// Record a subscription in the daemon's ledger.
+    ///
+    /// Called by the SDK's `DaemonRuntime::subscribe_channel` path
+    /// after the membership-subscribe Ack returns successfully. The
+    /// ledger is the authoritative view of what the daemon has
+    /// subscribed to; migration reads from here, not from the
+    /// mesh's per-node subscriber roster.
+    ///
+    /// Re-recording the same `(publisher, channel)` pair replaces
+    /// the token (tokens refresh), but keeps the subscription
+    /// single-entry — no duplicates in the ledger.
+    pub fn record_subscription(
+        &self,
+        publisher: u64,
+        channel: ChannelName,
+        token_bytes: Option<Vec<u8>>,
+    ) {
+        let binding = SubscriptionBinding {
+            publisher,
+            channel: channel.clone(),
+            token_bytes,
+        };
+        self.subscriptions.insert((publisher, channel), binding);
+    }
+
+    /// Drop a subscription from the ledger. Idempotent.
+    pub fn forget_subscription(&self, publisher: u64, channel: &ChannelName) {
+        self.subscriptions.remove(&(publisher, channel.clone()));
+    }
+
+    /// Number of subscriptions in the ledger.
+    pub fn subscription_count(&self) -> usize {
+        self.subscriptions.len()
+    }
+
+    /// Snapshot of the subscription ledger — a cloned view for
+    /// migration / diagnostic readers. Order is insertion-ish but
+    /// DashMap doesn't guarantee stable iteration, so the target
+    /// replay path treats the list as a set.
+    pub fn bindings_snapshot(&self) -> DaemonBindings {
+        DaemonBindings {
+            subscriptions: self
+                .subscriptions
+                .iter()
+                .map(|e| e.value().clone())
+                .collect(),
+        }
     }
 
     /// Get the daemon's entity ID.
@@ -175,6 +279,20 @@ impl DaemonHost {
     #[inline]
     pub fn origin_hash(&self) -> u32 {
         self.keypair.origin_hash()
+    }
+
+    /// Read-only access to the daemon's keypair.
+    ///
+    /// Migration uses this to seal the daemon's ed25519 seed into
+    /// an [`IdentityEnvelope`](crate::adapter::net::identity::IdentityEnvelope)
+    /// before shipping the snapshot. The keypair may be public-only
+    /// (see [`EntityKeypair::is_read_only`]) — sealing a public-only
+    /// keypair is a logic error handled by
+    /// [`IdentityEnvelope::new`](crate::adapter::net::identity::IdentityEnvelope::new),
+    /// not here.
+    #[inline]
+    pub fn keypair(&self) -> &EntityKeypair {
+        &self.keypair
     }
 
     /// Get the daemon's capability requirements.

@@ -834,7 +834,9 @@ fn test_wire_roundtrip_all_message_types() {
         },
         MigrationMessage::MigrationFailed {
             daemon_origin: 0x9999,
-            reason: "test failure".into(),
+            reason: net::adapter::net::compute::MigrationFailureReason::StateFailed(
+                "test failure".into(),
+            ),
         },
         MigrationMessage::BufferedEvents {
             daemon_origin: 0xAAAA,
@@ -2457,7 +2459,8 @@ fn test_migration_full_lifecycle_over_subprotocol_single_chunk() {
         .factories
         .register(kp.clone(), DaemonHostConfig::default(), || {
             Box::new(CounterDaemon::new())
-        });
+        })
+        .unwrap();
 
     let nodes: std::collections::HashMap<u64, Arc<MigrationSubprotocolHandler>> = [
         (source.node_id, source.handler.clone()),
@@ -2548,7 +2551,8 @@ fn test_migration_full_lifecycle_over_subprotocol_multi_chunk() {
         .factories
         .register(kp.clone(), DaemonHostConfig::default(), move || {
             Box::new(BigBlobDaemon { state: Vec::new() })
-        });
+        })
+        .unwrap();
 
     let nodes: std::collections::HashMap<u64, Arc<MigrationSubprotocolHandler>> = [
         (source.node_id, source.handler.clone()),
@@ -2649,7 +2653,8 @@ fn test_migration_fails_on_corrupted_snapshot() {
         .factories
         .register(kp, DaemonHostConfig::default(), || {
             Box::new(CounterDaemon::new())
-        });
+        })
+        .unwrap();
 
     let junk = MigrationMessage::SnapshotReady {
         daemon_origin: origin,
@@ -2673,10 +2678,20 @@ fn test_migration_fails_on_corrupted_snapshot() {
             }
         })
         .expect("expected MigrationFailed");
+    // `fail_migration` wraps parse / reassembly messages in
+    // `MigrationFailureReason::StateFailed(msg)`. Match the variant
+    // first, then peek at the inner string for the recognizable
+    // fragment. The reason-code surface moved from free-form
+    // `String` to a typed enum during the runtime-readiness work;
+    // this assertion tracks the same fragments inside the new
+    // wrapping.
+    let failed_msg = match &failed {
+        net::adapter::net::compute::MigrationFailureReason::StateFailed(m) => m.clone(),
+        other => panic!("expected StateFailed-wrapped reason, got {other:?}"),
+    };
     assert!(
-        failed.contains("parse snapshot") || failed.contains("reassembly"),
-        "unexpected failure reason: {}",
-        failed
+        failed_msg.contains("parse snapshot") || failed_msg.contains("reassembly"),
+        "unexpected failure reason: {failed_msg}",
     );
     assert!(!target.reg.contains(origin));
     // Factory should still be registered — the bad snapshot took nothing
@@ -2716,7 +2731,8 @@ fn test_regression_factory_preserved_for_retry_after_restore_failure() {
         .factories
         .register(kp.clone(), DaemonHostConfig::default(), || {
             Box::new(CounterDaemon::new())
-        });
+        })
+        .unwrap();
 
     // First attempt: corrupt bytes. Restore must fail, factory preserved.
     let corrupt = MigrationMessage::SnapshotReady {
@@ -2818,7 +2834,8 @@ fn test_regression_snapshot_ready_retry_after_successful_restore_is_idempotent()
         .factories
         .register(kp.clone(), DaemonHostConfig::default(), || {
             Box::new(CounterDaemon::new())
-        });
+        })
+        .unwrap();
 
     let snapshot_ready = MigrationMessage::SnapshotReady {
         daemon_origin: origin,

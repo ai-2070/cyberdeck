@@ -140,7 +140,13 @@ struct DispatchCtx {
     inbound: InboundQueues,
     num_shards: u16,
     /// Optional subprotocol handler for migration messages.
-    migration_handler: Option<Arc<MigrationSubprotocolHandler>>,
+    ///
+    /// `ArcSwapOption` so [`Self::set_migration_handler`] can install
+    /// at runtime via `&self` — the SDK's `DaemonRuntime::start`
+    /// hands in a handler after the mesh has been constructed but
+    /// before user migration traffic lands, which is otherwise
+    /// awkward because a started `Mesh` is shared by `Arc`.
+    migration_handler: Arc<ArcSwapOption<MigrationSubprotocolHandler>>,
     /// In-flight initiator handshakes; dispatch completes them when a
     /// matching routed msg2 arrives.
     pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
@@ -446,6 +452,13 @@ struct PeerInfo {
     addr: SocketAddr,
     /// Encrypted session
     session: Arc<NetSession>,
+    /// The peer's Noise static public key (X25519, 32 bytes). Captured
+    /// during the handshake and surfaced via
+    /// [`MeshNode::peer_static_x25519`] so the identity-envelope path
+    /// can seal daemon keypairs to a peer that the session already
+    /// trusts. Zero-filled when the session was built without a real
+    /// handshake (test paths).
+    remote_static_pub: [u8; 32],
 }
 
 /// In-flight initiator handshake. The dispatch loop consumes this when a
@@ -501,6 +514,36 @@ fn subscriber_origin_hash(node_id: u64) -> u64 {
 /// finer than the default intervals (capability GC ≈ announcement
 /// TTL, token sweep 30 s), so it never masks a legitimate
 /// fine-grained config — those values are already well above 1 s.
+/// Parse an inbound migration payload just far enough to decide
+/// whether it's a migration-initiating message that needs a
+/// `ComputeNotSupported` response. Returns the encoded reply for
+/// `TakeSnapshot` / `SnapshotReady`; `None` for decode failures or
+/// mid-migration message types (which arrive only inside an
+/// already-live migration and so can't reach a node with no
+/// handler at all).
+///
+/// Used by the mesh dispatch loop when `ctx.migration_handler` is
+/// `None` — a bare `Mesh` with no `DaemonRuntime` attached still
+/// responds to migration attempts instead of silently dropping
+/// them, so the source surfaces `MigrationFailureReason::ComputeNotSupported`
+/// promptly rather than timing out.
+fn synthesize_compute_not_supported_reply(payload: &[u8]) -> Option<Bytes> {
+    use crate::adapter::net::compute::orchestrator::wire as mig_wire;
+    use crate::adapter::net::compute::{MigrationFailureReason, MigrationMessage};
+
+    let msg = mig_wire::decode(payload).ok()?;
+    let origin = match msg {
+        MigrationMessage::TakeSnapshot { daemon_origin, .. }
+        | MigrationMessage::SnapshotReady { daemon_origin, .. } => daemon_origin,
+        _ => return None,
+    };
+    let reply = MigrationMessage::MigrationFailed {
+        daemon_origin: origin,
+        reason: MigrationFailureReason::ComputeNotSupported,
+    };
+    mig_wire::encode(&reply).ok().map(Bytes::from)
+}
+
 #[inline]
 fn nonzero_interval(d: Duration) -> Duration {
     if d.is_zero() {
@@ -637,8 +680,10 @@ pub struct MeshNode {
     failure_detector: Arc<FailureDetector>,
     /// Inbound event queues (shared with receive loop)
     inbound: InboundQueues,
-    /// Optional migration subprotocol handler
-    migration_handler: Option<Arc<MigrationSubprotocolHandler>>,
+    /// Optional migration subprotocol handler — same `ArcSwapOption`
+    /// surface as on `MeshNode`, propagated into the dispatch
+    /// context so the packet-receive loop stays lock-free.
+    migration_handler: Arc<ArcSwapOption<MigrationSubprotocolHandler>>,
     /// In-flight routed-handshake initiators, keyed by the responder's
     /// node_id. Populated by `connect_via`; consumed by the dispatch
     /// loop when the matching msg2 arrives.
@@ -879,7 +924,7 @@ impl MeshNode {
             router,
             failure_detector: Arc::new(failure_detector),
             inbound: Arc::new(DashMap::new()),
-            migration_handler: None,
+            migration_handler: Arc::new(ArcSwapOption::empty()),
             pending_handshakes,
             proximity_graph,
             reroute_policy,
@@ -948,6 +993,94 @@ impl MeshNode {
             .map(|e| e.value().clone())
     }
 
+    /// The peer's socket address, if we have an active session
+    /// with them. Used by the migration subprotocol to route
+    /// orchestrator-originated messages (e.g. `TakeSnapshot`) to
+    /// the source node by its `node_id`.
+    pub fn peer_addr(&self, node_id: u64) -> Option<SocketAddr> {
+        self.peers.get(&node_id).map(|e| e.value().addr)
+    }
+
+    /// Build a [`MigrationIdentityContext`](crate::adapter::net::subprotocol::MigrationIdentityContext)
+    /// bound to this node.
+    ///
+    /// The context's closures capture this node's long-term Noise
+    /// static private key (for the envelope-open path) and an
+    /// `Arc`-clone of the peer map (for the peer-static lookup used
+    /// by the source-side seal path). The private key is wrapped in
+    /// a `StaticSecret` inside the `unseal_snapshot` closure, which
+    /// is `zeroize`-on-drop — the key is never surfaced as a
+    /// readable field on the returned value.
+    ///
+    /// Used by the SDK's compute runtime to wire identity-envelope
+    /// support into the migration dispatcher without handing the
+    /// key across the crate boundary. The previous shape exposed
+    /// `static_x25519_priv() -> [u8; 32]` as a `pub` method, which
+    /// leaked long-term secret material to any SDK caller — any
+    /// code with an `Arc<Mesh>` could copy the node's identity key
+    /// out and impersonate it indefinitely.
+    pub fn migration_identity_context(
+        &self,
+    ) -> crate::adapter::net::subprotocol::MigrationIdentityContext {
+        use crate::adapter::net::state::snapshot::StateSnapshot;
+        use crate::adapter::net::subprotocol::MigrationIdentityContext;
+
+        // Construct once; `StaticSecret` zeroizes on drop, so the
+        // key is wiped when the last owner of the Arc'd closure is
+        // dropped. Rebuilding the StaticSecret on every call would
+        // copy the raw bytes through a short-lived stack variable —
+        // bounded exposure is fine but once-at-construction is
+        // strictly less.
+        let priv_secret = x25519_dalek::StaticSecret::from(self.static_keypair.private);
+        let unseal_snapshot = Arc::new(
+            move |snapshot: &StateSnapshot|
+                  -> Result<Option<_>, crate::adapter::net::identity::EnvelopeError> {
+                snapshot.open_identity_envelope(&priv_secret)
+            },
+        );
+
+        let peers = self.peers.clone();
+        let peer_static_lookup = Arc::new(move |node_id: u64| {
+            peers.get(&node_id).and_then(|e| {
+                let pk = e.value().remote_static_pub;
+                if pk == [0u8; 32] {
+                    None
+                } else {
+                    Some(pk)
+                }
+            })
+        });
+
+        MigrationIdentityContext {
+            unseal_snapshot,
+            peer_static_lookup,
+        }
+    }
+
+    /// The peer's Noise static X25519 public key, captured during
+    /// the handshake that established the session. Load-bearing for
+    /// daemon migration: the source uses this key as the seal
+    /// recipient on the `IdentityEnvelope`, so the only party that
+    /// can unseal the daemon's ed25519 seed is the peer whose
+    /// static private key completed the Noise handshake.
+    ///
+    /// Returns `None` if we have no session with `node_id`, or if
+    /// the underlying handshake produced a zero-filled static
+    /// pubkey (a sentinel for test-only code paths that construct
+    /// `SessionKeys` without running a real handshake).
+    pub fn peer_static_x25519(&self, node_id: u64) -> Option<[u8; 32]> {
+        let entry = self.peers.get(&node_id)?;
+        let pk = entry.value().remote_static_pub;
+        // Zero-filled → "not available." Real handshakes populate
+        // this from `snow`'s post-handshake `get_remote_static`,
+        // which returns 32 bytes of non-identity-zero X25519 pubkey.
+        if pk == [0u8; 32] {
+            None
+        } else {
+            Some(pk)
+        }
+    }
+
     /// Look up a peer's assigned subnet, if one has been recorded.
     /// Only populated from signature-verified
     /// `CapabilityAnnouncement`s — unsigned announcements do not
@@ -976,11 +1109,45 @@ impl MeshNode {
 
     /// Set the migration subprotocol handler.
     ///
-    /// Must be called before `start()`. When set, inbound packets with
-    /// `subprotocol_id == 0x0500` are dispatched to this handler instead
-    /// of being queued as events.
-    pub fn set_migration_handler(&mut self, handler: Arc<MigrationSubprotocolHandler>) {
-        self.migration_handler = Some(handler);
+    /// Can be called before or after `start()`. When set, inbound
+    /// packets with `subprotocol_id == 0x0500` are dispatched to
+    /// this handler instead of being queued as events. Idempotent
+    /// w.r.t. replacing the handler — a second call swaps in the
+    /// new one atomically.
+    ///
+    /// Use [`Self::clear_migration_handler`] to uninstall (returns
+    /// the mesh to the no-handler state where inbound migration
+    /// packets hit the `ComputeNotSupported` fallback). Needed by
+    /// `DaemonRuntime::shutdown` and by `start`'s lost-race
+    /// cleanup path — the mesh must not hold a live handler
+    /// pointing at a runtime that is no longer serving daemons.
+    pub fn set_migration_handler(&self, handler: Arc<MigrationSubprotocolHandler>) {
+        self.migration_handler.store(Some(handler));
+    }
+
+    /// Uninstall the migration subprotocol handler. After this
+    /// call, inbound migration subprotocol packets hit the
+    /// no-handler fallback and synthesise `ComputeNotSupported`
+    /// for migration-initiating messages (other message types are
+    /// dropped).
+    ///
+    /// Used by the SDK's `DaemonRuntime::start` to clean up after
+    /// losing the install-vs-CAS race against a concurrent
+    /// `shutdown`: if `start` installed a handler but its CAS to
+    /// `Ready` lost to `shutdown`'s state flip, the mesh would
+    /// otherwise be left with a live handler owned by a runtime
+    /// that's already been torn down.
+    pub fn clear_migration_handler(&self) {
+        self.migration_handler.store(None);
+    }
+
+    /// Returns `true` iff a migration subprotocol handler is
+    /// currently installed on this mesh. Used primarily by tests
+    /// that need to observe the ordering of handler installation
+    /// against other runtime state transitions — the `ArcSwap` load
+    /// itself is a public API surface regardless.
+    pub fn has_migration_handler(&self) -> bool {
+        self.migration_handler.load().is_some()
     }
 
     /// Block packets from/to a peer address (simulates network partition).
@@ -1027,6 +1194,7 @@ impl MeshNode {
             .handshake_initiator(peer_addr, peer_pubkey, peer_node_id)
             .await?;
 
+        let remote_static_pub = keys.remote_static_pub;
         let session = Arc::new(NetSession::new(
             keys,
             peer_addr,
@@ -1043,6 +1211,7 @@ impl MeshNode {
                 node_id: peer_node_id,
                 addr: peer_addr,
                 session,
+                remote_static_pub,
             },
         );
         self.addr_to_node.insert(peer_addr, peer_node_id);
@@ -1077,6 +1246,7 @@ impl MeshNode {
     pub async fn accept(&self, peer_node_id: u64) -> Result<(SocketAddr, u64), AdapterError> {
         let (keys, peer_addr) = self.handshake_responder(peer_node_id).await?;
 
+        let remote_static_pub = keys.remote_static_pub;
         let session = Arc::new(NetSession::new(
             keys,
             peer_addr,
@@ -1092,6 +1262,7 @@ impl MeshNode {
                 node_id: peer_node_id,
                 addr: peer_addr,
                 session,
+                remote_static_pub,
             },
         );
         self.addr_to_node.insert(peer_addr, peer_node_id);
@@ -1677,6 +1848,7 @@ impl MeshNode {
         // Registration happens BEFORE the send so that even if the
         // spawned send task is cancelled or panics post-send, the
         // initiator that just derived matching keys finds us.
+        let remote_static_pub = keys.remote_static_pub;
         let session = Arc::new(NetSession::new(
             keys,
             source,
@@ -1689,6 +1861,7 @@ impl MeshNode {
                 node_id: peer_node_id,
                 addr: source,
                 session,
+                remote_static_pub,
             },
         );
         ctx.peer_addrs.insert(peer_node_id, source);
@@ -1766,7 +1939,19 @@ impl MeshNode {
 
         // Check subprotocol — migration messages are sent as single event frames
         if parsed.header.subprotocol_id == SUBPROTOCOL_MIGRATION {
-            if let Some(ref handler) = ctx.migration_handler {
+            // Resolve sender up-front: both the handler-present and
+            // no-handler-default branches need it to route replies
+            // back over the inbound session.
+            let from_node = ctx
+                .peers
+                .iter()
+                .find(|e| e.value().session.session_id() == session.session_id())
+                .map(|e| e.value().node_id)
+                .unwrap_or(0);
+
+            // `ArcSwapOption::load` — lock-free on the hot path.
+            let handler_guard = ctx.migration_handler.load();
+            if let Some(handler) = handler_guard.as_ref() {
                 // Extract the payload from the event frame wrapper
                 let events =
                     EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
@@ -1775,18 +1960,46 @@ impl MeshNode {
                     None => return,
                 };
 
-                // Find the sender's node_id
-                let from_node = ctx
-                    .peers
-                    .iter()
-                    .find(|e| e.value().session.session_id() == session.session_id())
-                    .map(|e| e.value().node_id)
-                    .unwrap_or(0);
-
                 match handler.handle_message(&payload, from_node) {
                     Ok(outbound) => {
-                        // Send outbound responses asynchronously
-                        for msg in outbound {
+                        // BFS queue: self-destined messages loop back
+                        // through the dispatcher in-place; any output
+                        // the loopback produces joins the same queue
+                        // so remote-bound follow-ups reach the socket.
+                        //
+                        // The 2-node case where orchestrator and
+                        // source/target share a node uses this path —
+                        // `peers.get(&local_node_id)` is None, so the
+                        // loopback short-circuit is the only way a
+                        // self-destined wire message gets dispatched.
+                        //
+                        // Regression (Cubic-AI P1): the earlier
+                        // implementation `tokio::spawn`ed each
+                        // loopback with a fire-and-forget closure,
+                        // discarding `handle_message`'s return value.
+                        // Any outbound produced by the loopback —
+                        // including remote-bound messages that should
+                        // have ridden the wire — disappeared, wedging
+                        // state transitions whenever a self-bounce
+                        // chained into a further reply. The in-place
+                        // queue preserves all downstream messages.
+                        //
+                        // Handler work is synchronous and cheap; doing
+                        // it on the receive-loop task is fine.
+                        let mut pending: std::collections::VecDeque<_> = outbound.into();
+                        while let Some(msg) = pending.pop_front() {
+                            if msg.dest_node == ctx.local_node_id {
+                                match handler.handle_message(&msg.payload, ctx.local_node_id) {
+                                    Ok(more) => pending.extend(more),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "migration handler loopback error",
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
                             let dest_session = ctx
                                 .peers
                                 .get(&msg.dest_node)
@@ -1826,7 +2039,47 @@ impl MeshNode {
                 }
                 return; // handler processed it
             }
-            // No handler set — fall through to standard event path
+            // No handler set — synthesize a `ComputeNotSupported`
+            // reply so the source doesn't silently time out. Parses
+            // the inbound far enough to extract `daemon_origin` for
+            // the reply envelope, then drops. Only responds to the
+            // two migration-initiating messages (`TakeSnapshot`,
+            // `SnapshotReady`) — other inbound types arrive only
+            // mid-migration, and a migration can't be mid-state
+            // against a node that has no compute runtime.
+            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            if let Some(payload) = events.into_iter().next() {
+                if let Some(reply) = synthesize_compute_not_supported_reply(&payload) {
+                    let dest_session = ctx
+                        .peers
+                        .get(&from_node)
+                        .map(|e| (e.value().addr, e.value().session.clone()));
+                    if let Some((dest_addr, dest_sess)) = dest_session {
+                        if !ctx.partition_filter.contains(&dest_addr) {
+                            let socket = ctx.socket.clone();
+                            tokio::spawn(async move {
+                                let pool = dest_sess.thread_local_pool();
+                                let mut builder = pool.get();
+                                let seq = {
+                                    let stream = dest_sess
+                                        .get_or_create_stream(SUBPROTOCOL_MIGRATION as u64);
+                                    stream.next_tx_seq()
+                                };
+                                let events = vec![reply];
+                                let packet = builder.build_subprotocol(
+                                    SUBPROTOCOL_MIGRATION as u64,
+                                    seq,
+                                    &events,
+                                    PacketFlags::NONE,
+                                    SUBPROTOCOL_MIGRATION,
+                                );
+                                let _ = socket.send_to(&packet, dest_addr).await;
+                            });
+                        }
+                    }
+                }
+            }
+            return;
         }
 
         // Stream-window credit grant: apply to the named stream's
@@ -4007,6 +4260,7 @@ impl MeshNode {
         // table does the rest. `addr_to_node` is deliberately NOT
         // updated — `relay_addr` still maps to the relay's own node_id
         // for direct-packet dispatch.
+        let remote_static_pub = keys.remote_static_pub;
         let session = Arc::new(NetSession::new(
             keys,
             relay_addr,
@@ -4020,6 +4274,7 @@ impl MeshNode {
                 node_id: dest_node_id,
                 addr: relay_addr,
                 session,
+                remote_static_pub,
             },
         );
         self.peer_addrs.insert(dest_node_id, relay_addr);

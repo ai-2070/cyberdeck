@@ -34,6 +34,7 @@ net = [
     "dep:libc",
     "dep:blake2",
     "dep:ed25519-dalek",
+    "dep:x25519-dalek",
 ]
 regex = ["dep:regex"]
 ffi = []
@@ -87,7 +88,14 @@ socket2 = { version = "0.6", features = ["all"], optional = true }
 hex = { version = "0.4", optional = true }
 libc = { version = "0.2", optional = true }
 blake2 = { version = "0.10", optional = true }
-ed25519-dalek = { version = "2", features = ["rand_core"], optional = true }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"], optional = true }
+# X25519 DH for the `IdentityEnvelope` sealed-box construction used
+# by daemon migration. We derive an ephemeral pubkey, DH against the
+# target's static X25519 pubkey, and key an XChaCha20-Poly1305 AEAD
+# to seal the 32-byte ed25519 seed under the target's key — the
+# construction mirrors libsodium's `crypto_box_seal` but uses the
+# XChaCha AEAD already in-tree rather than pulling in XSalsa20.
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"], optional = true }
 regex = { version = "1", optional = true }
 
 # Redis adapter (optional)

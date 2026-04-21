@@ -16,7 +16,7 @@ pin-project-lite = "0.2"
 thiserror = "2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 
 [features]
 default = []
@@ -35,9 +35,14 @@ net = ["net/net"]
 # the NetDb facade. `redex-disk` comes along so `.persistent(true)` is
 # usable from the SDK without a separate feature flip.
 cortex = ["net/netdb", "net/redex-disk"]
-# Everything that runs locally (mesh + storage/state + security, no
-# external transports). The default shape for a single-node or
-# LAN-only deployment.
-local = ["net", "cortex"]
+# Compute surface — `MeshDaemon` trait + `DaemonRuntime` for local
+# spawn / snapshot / stop. Requires `net` because daemons have a
+# mesh identity (ed25519 keypair + origin_hash) that rides on the
+# same `Identity` the channel-auth path uses.
+compute = ["net"]
+# Everything that runs locally (mesh + storage/state + security +
+# compute, no external transports). The default shape for a
+# single-node or LAN-only deployment.
+local = ["net", "cortex", "compute"]
 # Everything — local stack plus external transports.
 full = ["local", "redis", "jetstream"]
