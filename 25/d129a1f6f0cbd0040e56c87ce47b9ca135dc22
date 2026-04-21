@@ -1,0 +1,40 @@
+net/crates/net/bindings/python/tests/test_subnets.py
+  5bf3f089eecaef7a 154-175
+net/crates/net/bindings/go/net/capabilities_test.go
+  5bf3f089eecaef7a 150-153
+net/crates/net/bindings/node/src/subnets.rs
+  5bf3f089eecaef7a 105-115
+net/crates/net/bindings/go/net/subnets_test.go
+  5bf3f089eecaef7a 153-173,187-190
+net/crates/net/src/ffi/mesh.rs
+  5bf3f089eecaef7a 198-205
+net/crates/net/sdk-ts/test/subnets.test.ts
+  5bf3f089eecaef7a 28-33,189-201,203-205,223-227
+net/crates/net/bindings/python/src/subnets.rs
+  5bf3f089eecaef7a 76-87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "25d129a1f6f0cbd0040e56c87ce47b9ca135dc22",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 872,
+      "total_deletions": 7,
+      "accepted_lines": 609,
+      "overriden_lines": 0
+    }
+  },
+  "humans": {
+    "h_fb620e726e1595": {
+      "author": "LZL0"
+    }
+  }
+}
