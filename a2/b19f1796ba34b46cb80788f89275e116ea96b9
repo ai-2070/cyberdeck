@@ -1,0 +1,23 @@
+net/crates/net/docs/SDK_SECURITY_SURFACE_PLAN.md
+  5bf3f089eecaef7a 34-41,43-56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "a2b19f1796ba34b46cb80788f89275e116ea96b9",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 21,
+      "total_deletions": 917,
+      "accepted_lines": 519,
+      "overriden_lines": 0
+    }
+  }
+}
