@@ -175,6 +175,14 @@ export class DaemonHandle {
  */
 export class DaemonRuntime {
   private readonly inner: NapiDaemonRuntime;
+  /**
+   * TS-side factory table, keyed by `kind`. `registerFactory`
+   * inserts here; `spawn` looks up and invokes. Duplicates the
+   * kind set that lives on the NAPI side — the NAPI copy drives
+   * migration-targeting and the `already registered` check at
+   * registration time; this map is what actually gets *called*.
+   */
+  private readonly factories: Map<string, DaemonFactory> = new Map();
 
   private constructor(inner: NapiDaemonRuntime) {
     this.inner = inner;
@@ -248,7 +256,14 @@ export class DaemonRuntime {
    */
   registerFactory(kind: string, factory: DaemonFactory): void {
     try {
+      // Register on NAPI so the kind is tracked for migration
+      // targeting and so the `already registered` check there
+      // fires on duplicate calls before we mutate our own map.
+      // The NAPI side stores a TSFN of the factory but doesn't
+      // invoke it — the actual invocation happens on the TS side
+      // at `spawn` time (see `spawn` below).
       this.inner.registerFactory(kind, factory as unknown as () => unknown);
+      this.factories.set(kind, factory);
     } catch (e) {
       toDaemonError(e);
     }
@@ -257,14 +272,20 @@ export class DaemonRuntime {
   /**
    * Spawn a daemon of `kind` under the given {@link Identity}.
    *
-   * **Sub-step 2a** (current): the daemon is a no-op bridge —
-   * lifecycle works (handle, `daemonCount`, `stop`) but events
-   * are not yet dispatched to the factory-returned JS object.
-   * Sub-step 2b will invoke the factory TSFN and replace the
-   * no-op bridge with a real one.
+   * Invokes the user-supplied factory (registered via
+   * {@link DaemonRuntime.registerFactory}), extracts the
+   * returned daemon's `process` / `snapshot` / `restore`
+   * methods, and hands each to NAPI as a separate JS function.
+   * NAPI builds a `ThreadsafeFunction` per method so the
+   * eventual event-dispatch path (sub-step 3) can call them
+   * from any tokio task.
    *
-   * `kind` must have been registered via
-   * {@link DaemonRuntime.registerFactory} first — spawning an
+   * **Sub-step 2b** (current): method TSFNs are stored on the
+   * Rust side but **not yet invoked**. `process` / `snapshot` /
+   * `restore` behave as no-ops. Sub-step 3 wires the full
+   * round-trip so events land in the JS daemon.
+   *
+   * `kind` must have been registered first — spawning an
    * unregistered kind throws {@link DaemonError}.
    */
   async spawn(
@@ -272,10 +293,39 @@ export class DaemonRuntime {
     identity: Identity,
     config?: DaemonHostConfig,
   ): Promise<DaemonHandle> {
+    const factory = this.factories.get(kind);
+    if (!factory) {
+      throw new DaemonError(
+        `no factory registered for kind '${kind}'`,
+      );
+    }
+
+    // Invoke the factory in JS. Accepts both sync and async
+    // factories per the `DaemonFactory` type. The returned
+    // instance owns its own state (closures, class fields); the
+    // method bindings below capture `this` so per-instance state
+    // survives across calls.
+    const instance = await factory();
+
+    // Method extraction. `snapshot` / `restore` are optional —
+    // stateless daemons omit them. `bind(instance)` preserves
+    // `this` inside user code when NAPI invokes the function
+    // off the main thread via the TSFN.
+    const process = instance.process.bind(instance) as () => unknown;
+    const snapshot = instance.snapshot
+      ? (instance.snapshot.bind(instance) as () => unknown)
+      : undefined;
+    const restore = instance.restore
+      ? (instance.restore.bind(instance) as () => unknown)
+      : undefined;
+
     try {
       const handle = await this.inner.spawn(
         kind,
         identity.toNapi(),
+        process,
+        snapshot,
+        restore,
         config
           ? {
               autoSnapshotInterval: config.autoSnapshotInterval,

@@ -72,21 +72,38 @@ export declare class DaemonRuntime {
    */
   registerFactory(kind: string, factory: () => unknown): void
   /**
-   * Spawn a daemon of `kind` under the given identity.
+   * Spawn a daemon of `kind` under the given identity with
+   * pre-bound `process` / `snapshot` / `restore` callbacks.
    *
-   * **Sub-step 2a:** the underlying daemon is a [`NoopBridge`]
-   * — it implements `MeshDaemon` with no-op methods. The
-   * factory TSFN stored by `register_factory` is **not yet
-   * invoked**; sub-step 2b will invoke it, extract the JS
-   * `process` / `snapshot` / `restore` methods, and replace
-   * `NoopBridge` with a real bridge. Lifecycle semantics
-   * (registration, handle, `stop` / `daemonCount`) work today.
+   * The TS wrapper invokes the user-supplied factory in JS
+   * land, extracts the returned daemon object's methods, and
+   * passes them here as three separate `Function`s. NAPI wraps
+   * each in a `ThreadsafeFunction` so the eventual event
+   * dispatch (sub-step 3) can call them from any tokio task
+   * without being pinned to the Node main thread.
    *
-   * Returns a [`DaemonHandle`] that carries the daemon's
-   * `origin_hash`. A `DaemonHostConfigJs` of `null` /
-   * `undefined` falls back to defaults.
+   * **Sub-step 2b** (this file): the `EventDispatchBridge`
+   * stores the three TSFNs but its `MeshDaemon::process`
+   * implementation returns an empty output. Sub-step 3 wires
+   * that method to call `process_tsfn` synchronously and
+   * marshal the result.
+   *
+   * `snapshot` / `restore` are optional — stateless daemons
+   * omit them. If `snapshot` is present, the stored TSFN will
+   * be called by the host on `take_snapshot`; if absent, the
+   * host reports the daemon as stateless.
+   *
+   * # Method is sync but returns a `PromiseRaw`
+   *
+   * napi-rs `Function` values are `!Send`, so an `async fn`
+   * taking them would produce a non-`Send` future that tokio's
+   * worker pool can't schedule. The two-stage shape here
+   * (sync consumes the `Function`s to build `TSFN`s → then
+   * hands all-`Send` state to `env.spawn_future`) is the
+   * idiomatic napi-rs pattern for "sync setup, async
+   * continuation."
    */
-  spawn(kind: string, identity: Identity, config?: DaemonHostConfigJs | undefined | null): Promise<DaemonHandle>
+  spawn(kind: string, identity: Identity, process: () => unknown, snapshot?: (() => unknown) | undefined | null, restore?: (() => unknown) | undefined | null, config?: DaemonHostConfigJs | undefined | null): Promise<DaemonHandle>
   /**
    * Stop a daemon, removing it from the runtime's registry.
    *

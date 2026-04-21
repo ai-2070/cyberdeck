@@ -229,4 +229,78 @@ describe('DaemonRuntime (Stage 3 sub-step 2a: spawn + stop)', () => {
     });
     expect(handle.originHash).not.toBe(0);
   });
+
+  it('factory is invoked exactly once per spawn; each invocation gets its own closure state', async () => {
+    // Factory that closes over a per-invocation counter — proves
+    // each spawn gets a fresh instance, not a shared one.
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+
+    let invocations = 0;
+    rt.registerFactory('counter', () => {
+      invocations++;
+      let localState = 0;
+      return {
+        name: 'counter',
+        // `process` closes over `localState`; if sub-step 3 ever
+        // starts dispatching events, each instance will see its
+        // own state. Sub-step 2b: just assert the factory ran.
+        process: () => {
+          localState++;
+          return [];
+        },
+      };
+    });
+    await rt.start();
+
+    expect(invocations).toBe(0);
+    await rt.spawn('counter', Identity.generate());
+    expect(invocations).toBe(1);
+    await rt.spawn('counter', Identity.generate());
+    expect(invocations).toBe(2);
+    await rt.spawn('counter', Identity.generate());
+    expect(invocations).toBe(3);
+    expect(rt.daemonCount()).toBe(3);
+  });
+
+  it('async factory is awaited before spawn resolves', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+
+    let factoryResolved = false;
+    rt.registerFactory('async-echo', async () => {
+      await new Promise((r) => setTimeout(r, 10));
+      factoryResolved = true;
+      return { name: 'async-echo', process: () => [] };
+    });
+    await rt.start();
+
+    expect(factoryResolved).toBe(false);
+    const handle = await rt.spawn('async-echo', Identity.generate());
+    expect(factoryResolved).toBe(true);
+    expect(handle.originHash).not.toBe(0);
+  });
+
+  it('snapshot / restore methods are optional', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+
+    // Stateless factory — only `process`. snapshot/restore omitted.
+    rt.registerFactory('stateless', () => ({
+      name: 'stateless',
+      process: () => [],
+    }));
+    await rt.start();
+
+    const handle = await rt.spawn('stateless', Identity.generate());
+    expect(handle.originHash).not.toBe(0);
+    await rt.stop(handle.originHash);
+    expect(rt.daemonCount()).toBe(0);
+  });
 });

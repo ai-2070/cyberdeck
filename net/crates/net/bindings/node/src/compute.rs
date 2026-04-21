@@ -74,6 +74,17 @@ type FactoryTsfn = napi::threadsafe_function::ThreadsafeFunction<
     false,
 >;
 
+/// Per-method TSFN — used for the `process` / `snapshot` /
+/// `restore` callbacks that sub-step 3 will invoke from tokio
+/// tasks to dispatch events into the JS-side daemon.
+///
+/// Sub-step 2b stores these but doesn't call them; the Args and
+/// Return types are therefore placeholders. Sub-step 3 will
+/// refine the types (e.g. `process` takes a `CausalEventJs`
+/// arg and returns a `Vec<Buffer>`) once the concrete call
+/// shapes are nailed down.
+type MethodTsfn = FactoryTsfn;
+
 /// Per-runtime compute surface. One instance per `NetMesh`; clone
 /// handles are `Arc`-shared internally.
 #[napi]
@@ -196,60 +207,101 @@ impl DaemonRuntime {
         }
     }
 
-    /// Spawn a daemon of `kind` under the given identity.
+    /// Spawn a daemon of `kind` under the given identity with
+    /// pre-bound `process` / `snapshot` / `restore` callbacks.
     ///
-    /// **Sub-step 2a:** the underlying daemon is a [`NoopBridge`]
-    /// — it implements `MeshDaemon` with no-op methods. The
-    /// factory TSFN stored by `register_factory` is **not yet
-    /// invoked**; sub-step 2b will invoke it, extract the JS
-    /// `process` / `snapshot` / `restore` methods, and replace
-    /// `NoopBridge` with a real bridge. Lifecycle semantics
-    /// (registration, handle, `stop` / `daemonCount`) work today.
+    /// The TS wrapper invokes the user-supplied factory in JS
+    /// land, extracts the returned daemon object's methods, and
+    /// passes them here as three separate `Function`s. NAPI wraps
+    /// each in a `ThreadsafeFunction` so the eventual event
+    /// dispatch (sub-step 3) can call them from any tokio task
+    /// without being pinned to the Node main thread.
     ///
-    /// Returns a [`DaemonHandle`] that carries the daemon's
-    /// `origin_hash`. A `DaemonHostConfigJs` of `null` /
-    /// `undefined` falls back to defaults.
+    /// **Sub-step 2b** (this file): the `EventDispatchBridge`
+    /// stores the three TSFNs but its `MeshDaemon::process`
+    /// implementation returns an empty output. Sub-step 3 wires
+    /// that method to call `process_tsfn` synchronously and
+    /// marshal the result.
+    ///
+    /// `snapshot` / `restore` are optional — stateless daemons
+    /// omit them. If `snapshot` is present, the stored TSFN will
+    /// be called by the host on `take_snapshot`; if absent, the
+    /// host reports the daemon as stateless.
+    ///
+    /// # Method is sync but returns a `PromiseRaw`
+    ///
+    /// napi-rs `Function` values are `!Send`, so an `async fn`
+    /// taking them would produce a non-`Send` future that tokio's
+    /// worker pool can't schedule. The two-stage shape here
+    /// (sync consumes the `Function`s to build `TSFN`s → then
+    /// hands all-`Send` state to `env.spawn_future`) is the
+    /// idiomatic napi-rs pattern for "sync setup, async
+    /// continuation."
     #[napi]
-    pub async fn spawn(
-        &self,
+    pub fn spawn<'env>(
+        &'env self,
+        env: &'env Env,
         kind: String,
         identity: &crate::identity::Identity,
+        process: Function<'_, (), napi::threadsafe_function::UnknownReturnValue>,
+        snapshot: Option<Function<'_, (), napi::threadsafe_function::UnknownReturnValue>>,
+        restore: Option<Function<'_, (), napi::threadsafe_function::UnknownReturnValue>>,
         config: Option<DaemonHostConfigJs>,
-    ) -> Result<DaemonHandle> {
-        // Guard: kind must have been registered. The SDK's
-        // `spawn_with_daemon` doesn't need the kind string, but
-        // the TS contract does — pretending `spawn` works for an
-        // unregistered kind would hide the error until the
-        // JS-factory wiring fails in sub-step 2b.
+    ) -> Result<napi::bindgen_prelude::PromiseRaw<'env, DaemonHandle>> {
+        // Guard: kind must have been registered. Registration is
+        // the TS API's contract for "the target knows about this
+        // daemon type"; skipping it would hide mis-configured TS
+        // callers until a downstream operation fails cryptically.
         if !self.factories.contains_key(&kind) {
             return Err(daemon_err(format!(
                 "no factory registered for kind '{kind}'"
             )));
         }
 
-        let sdk_identity = identity.to_sdk_identity();
-        let sdk_config = config.map(DaemonHostConfig::from).unwrap_or_default();
-
-        // Sub-step 2a: NoopBridge. Sub-step 2b will build a real
-        // bridge from the factory TSFN's return value.
-        let daemon: Box<dyn MeshDaemon> = Box::new(NoopBridge::new(kind.clone()));
-        let kind_factory_label = kind.clone();
-        // The kind-factory closure registered on the core is what
-        // a migration target calls to reconstruct the daemon. In
-        // sub-step 2a we just hand out fresh NoopBridges — the
-        // core registry needs *some* factory. Sub-step 2b replaces
-        // this with a TSFN-backed factory.
-        let kind_factory = move || -> Box<dyn MeshDaemon> {
-            Box::new(NoopBridge::new(kind_factory_label.clone()))
+        // Build TSFNs synchronously — the napi-rs `Function`
+        // values are `!Send`, so we can't carry them into the
+        // async future. Each TSFN is `Send + Sync + Clone`; the
+        // future below holds only TSFNs.
+        let process_tsfn: MethodTsfn = process.build_threadsafe_function().build()?;
+        let snapshot_tsfn = match snapshot {
+            Some(f) => Some(f.build_threadsafe_function().build()?),
+            None => None,
+        };
+        let restore_tsfn = match restore {
+            Some(f) => Some(f.build_threadsafe_function().build()?),
+            None => None,
         };
 
-        let handle = self
-            .inner
-            .spawn_with_daemon(sdk_identity, sdk_config, daemon, kind_factory)
-            .await
-            .map_err(|e| daemon_err(e.to_string()))?;
+        let sdk_identity = identity.to_sdk_identity();
+        let sdk_config = config.map(DaemonHostConfig::from).unwrap_or_default();
+        let runtime = self.inner.clone();
+        let kind_label = kind.clone();
 
-        Ok(DaemonHandle::from_sdk(handle))
+        let bridge = Box::new(EventDispatchBridge {
+            name: kind,
+            process: process_tsfn,
+            snapshot: snapshot_tsfn,
+            restore: restore_tsfn,
+        });
+
+        // Kind-factory closure for migration-target reconstruction.
+        // The TS node can't yet serve migrations targeting it
+        // because the factory TSFN's return value (a JS daemon
+        // object with method closures) can't be reconstructed from
+        // Rust without re-running the TS factory. Sub-step 4+ will
+        // address this; for now hand out NoopBridges so the core
+        // registry has *some* factory — migrations into this node
+        // will fail downstream until the full path lands.
+        let kind_factory =
+            move || -> Box<dyn MeshDaemon> { Box::new(NoopBridge::new(kind_label.clone())) };
+
+        env.spawn_future(async move {
+            runtime
+                .spawn_with_daemon(sdk_identity, sdk_config, bridge, kind_factory)
+                .await
+                .map(DaemonHandle::from_sdk)
+                .map_err(|e| daemon_err(e.to_string()))
+        })
     }
 
     /// Stop a daemon, removing it from the runtime's registry.
@@ -345,14 +397,60 @@ impl DaemonHandle {
 }
 
 // =========================================================================
-// NoopBridge — placeholder `MeshDaemon` impl for sub-step 2a.
+// EventDispatchBridge — real daemon bridge holding method TSFNs.
 // =========================================================================
 
-/// Daemon bridge used by sub-step 2a's `spawn`: implements
-/// `MeshDaemon` with no-op methods so the spawn / stop / lifecycle
-/// machinery compiles and runs end-to-end. Sub-step 2b replaces
-/// this with a bridge that holds `ThreadsafeFunction`s for the
-/// JS-side `process` / `snapshot` / `restore` callbacks.
+/// Daemon bridge built at `spawn` time from three TSFNs extracted
+/// by the TS wrapper from the user's factory return value.
+///
+/// **Sub-step 2b** (this file): the TSFNs are stored but not yet
+/// invoked — `process` returns an empty output, `snapshot` /
+/// `restore` are ignored. The storage + lifecycle paths work
+/// end-to-end; sub-step 3 will wire the method implementations to
+/// call the TSFNs and marshal arguments / return values.
+struct EventDispatchBridge {
+    name: String,
+    #[allow(dead_code)]
+    process: MethodTsfn,
+    #[allow(dead_code)]
+    snapshot: Option<MethodTsfn>,
+    #[allow(dead_code)]
+    restore: Option<MethodTsfn>,
+}
+
+impl MeshDaemon for EventDispatchBridge {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn requirements(&self) -> CapabilityFilter {
+        CapabilityFilter::default()
+    }
+
+    fn process(
+        &mut self,
+        _event: &CausalEvent,
+    ) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
+        // Sub-step 3 replaces this body with a synchronous call
+        // into `self.process` (the TSFN) waiting on a channel for
+        // the JS return. For now the daemon is live but silent.
+        Ok(Vec::new())
+    }
+}
+
+// =========================================================================
+// NoopBridge — fallback `MeshDaemon` for migration-target reconstruction.
+// =========================================================================
+
+/// Placeholder bridge used as the core factory-registry's
+/// "kind-factory" for NAPI-spawned daemons. The core registry
+/// requires a `Fn() -> Box<dyn MeshDaemon>` factory so a migration
+/// target can reconstruct the daemon from `origin_hash` alone;
+/// faithfully implementing that for NAPI requires re-running the
+/// TS factory on the Rust side (sub-step 4+ work). Until then
+/// `NoopBridge` stands in — migrations into a TS node's daemon
+/// will fail downstream at the first event delivery, but the
+/// lifecycle / registry machinery stays consistent.
 struct NoopBridge {
     name: String,
 }
