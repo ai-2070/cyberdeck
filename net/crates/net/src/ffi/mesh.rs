@@ -1508,7 +1508,10 @@ pub extern "C" fn net_token_is_expired(
         Err(e) => return token_err_to_code(&e),
     };
     unsafe {
-        *out_expired = if parsed.is_expired() { 1 } else { 0 };
+        *out_expired = match parsed.is_valid() {
+            Err(CoreTokenError::Expired) => 1,
+            _ => 0,
+        };
     }
     0
 }
