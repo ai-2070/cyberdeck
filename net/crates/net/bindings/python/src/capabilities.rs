@@ -186,9 +186,7 @@ fn accelerator_from_dict(d: &Bound<'_, PyDict>) -> PyResult<AcceleratorInfo> {
         accel_type: parse_accelerator_type(&kind),
         model: get_opt_str(d, "model")?.unwrap_or_default(),
         memory_mb: get_opt_u32(d, "memory_mb")?.unwrap_or(0),
-        tops_x10: get_opt_u32(d, "tops_x10")?
-            .map(saturating_u16)
-            .unwrap_or(0),
+        tops_x10: get_opt_u32(d, "tops_x10")?.map(saturating_u16).unwrap_or(0),
     })
 }
 

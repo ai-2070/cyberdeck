@@ -1851,12 +1851,7 @@ mod tests {
         let keypair = EntityKeypair::generate();
         let caps = sample_capability_set();
 
-        let ann = CapabilityAnnouncement::new(
-            1,
-            keypair.entity_id().clone(),
-            1,
-            caps.clone(),
-        );
+        let ann = CapabilityAnnouncement::new(1, keypair.entity_id().clone(), 1, caps.clone());
         let pre_m1 = PreM1Announcement {
             node_id: ann.node_id,
             entity_id: ann.entity_id.clone(),
@@ -1874,7 +1869,8 @@ mod tests {
         let new_signed = ann.signed_payload();
 
         assert_eq!(
-            pre_m1_bytes, new_signed,
+            pre_m1_bytes,
+            new_signed,
             "signed_payload bytes must be byte-identical to pre-M-1 \
              serialization — otherwise signatures issued before M-1 \
              fail verification after a rolling upgrade.\n  \
@@ -1883,7 +1879,9 @@ mod tests {
             std::str::from_utf8(&new_signed).unwrap_or("<non-utf8>"),
         );
         assert!(
-            !std::str::from_utf8(&new_signed).unwrap().contains("hop_count"),
+            !std::str::from_utf8(&new_signed)
+                .unwrap()
+                .contains("hop_count"),
             "signed_payload must not contain 'hop_count' when zero",
         );
 
