@@ -1251,6 +1251,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-compute-ffi"
+version = "0.5.0"
+dependencies = [
+ "bytes",
+ "dashmap",
+ "net",
+ "net-sdk",
+ "parking_lot",
+ "tokio",
+]
+
+[[package]]
 name = "net-node"
 version = "0.5.0"
 dependencies = [

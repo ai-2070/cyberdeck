@@ -4,6 +4,7 @@ members = [
     "sdk",
     "bindings/node",
     "bindings/python",
+    "bindings/go/compute-ffi",
 ]
 
 [package]

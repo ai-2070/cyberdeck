@@ -1,0 +1,34 @@
+[package]
+name = "net-compute-ffi"
+version = "0.5.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "C ABI compute (MeshDaemon + migration) surface for the Go binding of Net"
+
+[lib]
+# `cdylib` for the shared object Go links against; `staticlib` for
+# platforms that prefer `.a` archives. `rlib` alongside lets any
+# in-crate `#[cfg(test)] mod tests` compile — cargo requires an rlib
+# to link the unit-test harness. The shipped artifact is the cdylib.
+name = "net_compute"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+# Core mesh types — needed because we expose C-ABI handles that wrap
+# `NetHandle`-style MeshNode refs handed in by the existing
+# `bindings/go/net` (via the `net_mesh` FFI), and because daemons
+# reach into `adapter::net::compute::MeshDaemon` / `CausalEvent`
+# types at the bridge layer.
+net = { path = "../../..", features = ["net"] }
+# SDK compute surface — `DaemonRuntime`, `DaemonHandle`,
+# `MigrationHandle`, `StateSnapshot`. The Go FFI delegates to this
+# layer so all three language bindings stay behavior-aligned.
+net-sdk = { path = "../../../sdk", features = ["net", "compute"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
+bytes = "1"
+dashmap = "6"
+# Shared lock primitives used by the callback-dispatch table.
+parking_lot = "0.12"
+
+[profile.release]
+lto = true

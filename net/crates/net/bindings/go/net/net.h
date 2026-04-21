@@ -587,6 +587,78 @@ int      net_mesh_find_peers(net_meshnode_t* handle,
 int      net_normalize_gpu_vendor(const char* raw,
                                   char** out, size_t* out_len);
 
+/* =========================================================================
+ * Compute — MeshDaemon + migration. Stage 6 of
+ * SDK_COMPUTE_SURFACE_PLAN.md. Symbols live in `libnet_compute`
+ * (sibling shared library built from `bindings/go/compute-ffi`).
+ * Link with `-lnet -lnet_compute`.
+ * ========================================================================= */
+
+/* Opaque handles. Go wrappers own the pointer lifetime via
+ * runtime.SetFinalizer — consistent with `net_meshnode_t`. */
+typedef struct net_compute_runtime_s      net_compute_runtime_t;
+typedef struct net_compute_mesh_arc_s     net_compute_mesh_arc_t;
+typedef struct net_compute_cc_arc_s       net_compute_cc_arc_t;
+
+/* Compute error codes (negative). */
+#define NET_COMPUTE_OK                   0
+#define NET_COMPUTE_ERR_NULL            -1
+#define NET_COMPUTE_ERR_CALL_FAILED     -2
+#define NET_COMPUTE_ERR_DUPLICATE_KIND  -3
+
+/* --- Arc<MeshNode> / Arc<ChannelConfigRegistry> accessors ---
+ *
+ * Produced by `net_mesh_*_arc_clone` (in libnet); compute-ffi's
+ * `net_compute_runtime_new` CONSUMES them. Pair each clone with
+ * either a `net_compute_runtime_new` consume-call or a matching
+ * `_free`.
+ */
+net_compute_mesh_arc_t* net_mesh_arc_clone(net_meshnode_t* handle);
+void                    net_mesh_arc_free(net_compute_mesh_arc_t* p);
+
+net_compute_cc_arc_t*   net_mesh_channel_configs_arc_clone(net_meshnode_t* handle);
+void                    net_mesh_channel_configs_arc_free(net_compute_cc_arc_t* p);
+
+/* --- Runtime lifecycle --- */
+
+/* Build a DaemonRuntime sharing the given mesh's node + channel
+ * configs. Both Arc pointers are consumed on success (do not free
+ * afterwards). Returns NULL if any input is NULL. */
+net_compute_runtime_t*  net_compute_runtime_new(
+    net_compute_mesh_arc_t* node_arc,
+    net_compute_cc_arc_t* channel_configs_arc);
+
+/* Free a runtime handle. The underlying MeshNode is untouched. */
+void                    net_compute_runtime_free(net_compute_runtime_t* handle);
+
+/* Transition to Ready. On failure, writes a heap-allocated char*
+ * detail to `*err_out` (free via `net_compute_free_cstring`). */
+int                     net_compute_runtime_start(
+    net_compute_runtime_t* handle,
+    char** err_out);
+
+/* Tear down the runtime. `*err_out` carries detail on failure. */
+int                     net_compute_runtime_shutdown(
+    net_compute_runtime_t* handle,
+    char** err_out);
+
+/* 1 = ready, 0 = not-ready, NET_COMPUTE_ERR_NULL on NULL handle. */
+int                     net_compute_runtime_is_ready(net_compute_runtime_t* handle);
+
+/* Number of daemons registered. Returns -1 on NULL handle. */
+int64_t                 net_compute_runtime_daemon_count(net_compute_runtime_t* handle);
+
+/* Register a placeholder kind. Returns NET_COMPUTE_ERR_DUPLICATE_KIND
+ * on second registration of the same kind, NET_COMPUTE_OK on first.
+ * Sub-step 2 will wire the Go callback table here. */
+int                     net_compute_register_factory(
+    net_compute_runtime_t* handle,
+    const char* kind_ptr,
+    size_t kind_len);
+
+/* Free a CString returned by compute-ffi (e.g., an err_out detail). */
+void                    net_compute_free_cstring(char* s);
+
 #ifdef __cplusplus
 }
 #endif
