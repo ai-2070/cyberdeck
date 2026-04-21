@@ -1,0 +1,35 @@
+net/crates/net/src/adapter/net/subprotocol/mod.rs
+  5bf3f089eecaef7a 21-22
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  5bf3f089eecaef7a 10,14-16,88-91,224-249,402,404,408-409,508-564,1209-1211,1216-1227,1416-1422,1876-1903,1959,1969-1983
+net/crates/net/sdk/src/compute.rs
+  5bf3f089eecaef7a 49,55-56,70-71,111-116,182-189,220,321-335,337,345-346,1134-1137,1141-1143,1163-1172
+net/crates/net/sdk/tests/compute_migration.rs
+  5bf3f089eecaef7a 24-25,423-498
+net/crates/net/src/adapter/net/compute/mod.rs
+  5bf3f089eecaef7a 29-31
+net/crates/net/src/adapter/net/compute/migration.rs
+  5bf3f089eecaef7a 29-119
+net/crates/net/src/adapter/net/subprotocol/migration_handler.rs
+  5bf3f089eecaef7a 93-115,141-155,225-226,235-287,298-299,628,630-642,645-648,752-765,769,772,960-964,970-989,993-994,1000,1117-1119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "0176181c83659d7684634893b611b888cf1798a0",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 3054,
+      "total_deletions": 100,
+      "accepted_lines": 605,
+      "overriden_lines": 0
+    }
+  }
+}
