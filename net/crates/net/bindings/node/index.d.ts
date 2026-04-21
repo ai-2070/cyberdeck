@@ -80,7 +80,7 @@ export declare class DaemonRuntime {
    * Second registration of the same `kind` returns
    * `daemon: factory for kind '<kind>' is already registered`.
    */
-  registerFactory(kind: string, factory: () => unknown): void
+  registerFactory(kind: string, factory: () => DaemonBridgeTsfns): void
   /**
    * Spawn a daemon of `kind` under the given identity with
    * pre-bound `process` / `snapshot` / `restore` callbacks.

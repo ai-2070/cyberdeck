@@ -55,10 +55,184 @@ export class DaemonError extends Error {
   }
 }
 
+/**
+ * Stable discriminator for migration-layer failures. Use
+ * `err.kind` in catch blocks rather than parsing messages.
+ *
+ * - `not-ready` — target runtime exists but hasn't called
+ *   `start()`. Retriable; source auto-retries by default.
+ * - `factory-not-found` — target has no factory for the daemon's
+ *   origin_hash. Terminal — target mis-configured.
+ * - `compute-not-supported` — target node is a bare `Mesh` with
+ *   no `DaemonRuntime`. Terminal.
+ * - `state-failed` — snapshot encode/decode or restore failed.
+ *   Terminal. `detail` carries the underlying message.
+ * - `already-migrating` — a migration is already in flight for
+ *   the same origin_hash. Terminal on the duplicate attempt.
+ * - `identity-transport-failed` — envelope signature/unseal
+ *   failure. Terminal. `detail` carries the underlying message.
+ * - `not-ready-timeout` — source exhausted its NotReady-retry
+ *   budget. Terminal. `attempts` is the retry count.
+ * - `daemon-not-found` — orchestrator couldn't locate the daemon
+ *   on the source node. Carries `originHash`.
+ * - `target-unavailable` — target node ID isn't in the source's
+ *   peer table. Carries `nodeId`.
+ * - `wrong-phase` — internal phase-machine violation (shouldn't
+ *   surface in practice; carries expected + actual phase).
+ * - `snapshot-too-large` — snapshot exceeds the transfer limit;
+ *   carries `size` and `max`.
+ */
+export type MigrationErrorKind =
+  | 'not-ready'
+  | 'factory-not-found'
+  | 'compute-not-supported'
+  | 'state-failed'
+  | 'already-migrating'
+  | 'identity-transport-failed'
+  | 'not-ready-timeout'
+  | 'daemon-not-found'
+  | 'target-unavailable'
+  | 'wrong-phase'
+  | 'snapshot-too-large'
+  | 'unknown';
+
+/**
+ * Typed migration failure. Subclass of {@link DaemonError} so
+ * `catch (e: DaemonError)` still matches; callers who want to
+ * discriminate use `e instanceof MigrationError` + `e.kind`.
+ *
+ * **Retriability:** only `kind === 'not-ready'` is retriable
+ * (the source SDK auto-retries on this by default). Everything
+ * else is terminal — a caller's own retry loop won't help.
+ */
+export class MigrationError extends DaemonError {
+  readonly kind: MigrationErrorKind;
+  /** Number of NotReady retries on `not-ready-timeout`. */
+  readonly attempts?: number;
+  /** Daemon origin on `daemon-not-found` / `already-migrating`. */
+  readonly originHash?: number;
+  /** Node ID on `target-unavailable`. */
+  readonly nodeId?: bigint;
+  /** Size / max on `snapshot-too-large`. */
+  readonly size?: number;
+  readonly max?: number;
+  /** Underlying string detail on `state-failed` / `identity-transport-failed`. */
+  readonly detail?: string;
+
+  constructor(
+    kind: MigrationErrorKind,
+    message: string,
+    extras: {
+      attempts?: number;
+      originHash?: number;
+      nodeId?: bigint;
+      size?: number;
+      max?: number;
+      detail?: string;
+    } = {},
+  ) {
+    super(message);
+    this.name = 'MigrationError';
+    this.kind = kind;
+    this.attempts = extras.attempts;
+    this.originHash = extras.originHash;
+    this.nodeId = extras.nodeId;
+    this.size = extras.size;
+    this.max = extras.max;
+    this.detail = extras.detail;
+    Object.setPrototypeOf(this, MigrationError.prototype);
+  }
+}
+
+/**
+ * Parse a `migration: <kind>[: <detail>]` body (already stripped
+ * of the `daemon:` prefix) into a typed {@link MigrationError}.
+ * Unknown kinds fall back to `kind: 'unknown'` with the raw body
+ * as the message — defensive default so the error surface stays
+ * typed even if the Rust side adds new variants.
+ */
+function parseMigrationError(body: string, fullMessage: string): MigrationError {
+  // Body shape (after stripping `migration: `):
+  //   <kind>
+  //   <kind>: <detail>
+  // For some kinds detail is parsed; for others it's free text.
+  const afterPrefix = body.slice('migration:'.length).trim();
+  const firstColon = afterPrefix.indexOf(':');
+  const kind =
+    firstColon === -1 ? afterPrefix : afterPrefix.slice(0, firstColon).trim();
+  const rest =
+    firstColon === -1 ? '' : afterPrefix.slice(firstColon + 1).trim();
+
+  switch (kind) {
+    case 'not-ready':
+    case 'factory-not-found':
+    case 'compute-not-supported':
+    case 'already-migrating': {
+      // `already-migrating` may also carry an originHash on the
+      // orchestrator path; parse it when present.
+      if (kind === 'already-migrating' && rest) {
+        return new MigrationError(kind, fullMessage, {
+          originHash: parseMaybeHex(rest),
+        });
+      }
+      return new MigrationError(kind, fullMessage);
+    }
+    case 'state-failed':
+    case 'identity-transport-failed':
+      return new MigrationError(kind, fullMessage, { detail: rest });
+    case 'not-ready-timeout':
+      return new MigrationError(kind, fullMessage, {
+        attempts: Number.parseInt(rest, 10),
+      });
+    case 'daemon-not-found':
+      return new MigrationError(kind, fullMessage, {
+        originHash: parseMaybeHex(rest),
+      });
+    case 'target-unavailable':
+      return new MigrationError(kind, fullMessage, {
+        nodeId: parseMaybeHexBigInt(rest),
+      });
+    case 'wrong-phase':
+      return new MigrationError(kind, fullMessage, { detail: rest });
+    case 'snapshot-too-large': {
+      const [sizeStr, maxStr] = rest.split(':').map((s) => s.trim());
+      return new MigrationError(kind, fullMessage, {
+        size: Number.parseInt(sizeStr ?? '', 10),
+        max: Number.parseInt(maxStr ?? '', 10),
+      });
+    }
+    default:
+      return new MigrationError('unknown', fullMessage);
+  }
+}
+
+function parseMaybeHex(s: string): number | undefined {
+  const trimmed = s.trim();
+  if (!trimmed) return undefined;
+  const n = trimmed.startsWith('0x')
+    ? Number.parseInt(trimmed.slice(2), 16)
+    : Number.parseInt(trimmed, 10);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function parseMaybeHexBigInt(s: string): bigint | undefined {
+  const trimmed = s.trim();
+  if (!trimmed) return undefined;
+  try {
+    return trimmed.startsWith('0x') ? BigInt(trimmed) : BigInt(trimmed);
+  } catch {
+    return undefined;
+  }
+}
+
 function toDaemonError(e: unknown): never {
   const msg = (e as Error | undefined)?.message ?? String(e);
   if (msg.startsWith('daemon:')) {
-    throw new DaemonError(msg.slice('daemon:'.length).trim());
+    const body = msg.slice('daemon:'.length).trim();
+    if (body.startsWith('migration:')) {
+      throw parseMigrationError(body, msg.slice('daemon:'.length).trim());
+    }
+    throw new DaemonError(body);
   }
   throw e;
 }

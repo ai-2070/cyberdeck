@@ -123,6 +123,7 @@ export {
   DaemonHandle,
   DaemonError,
   MigrationHandle,
+  MigrationError,
 } from './compute';
 export type {
   CausalEvent,
@@ -132,6 +133,7 @@ export type {
   DaemonStats,
   MigrationPhase,
   MigrationOptions,
+  MigrationErrorKind,
 } from './compute';
 
 // Types.

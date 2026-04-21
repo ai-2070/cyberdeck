@@ -32,9 +32,10 @@ use net::adapter::net::behavior::capability::CapabilityFilter;
 use net::adapter::net::compute::{DaemonError as CoreDaemonError, DaemonHostConfig, MeshDaemon};
 use net::adapter::net::state::causal::CausalEvent;
 use net_sdk::compute::{
-    DaemonHandle as SdkDaemonHandle, DaemonRuntime as SdkDaemonRuntime,
-    MigrationHandle as SdkMigrationHandle, MigrationOpts, MigrationPhase as CoreMigrationPhase,
-    StateSnapshot,
+    DaemonError as SdkDaemonError, DaemonHandle as SdkDaemonHandle,
+    DaemonRuntime as SdkDaemonRuntime, MigrationError as SdkMigrationError,
+    MigrationFailureReason, MigrationHandle as SdkMigrationHandle, MigrationOpts,
+    MigrationPhase as CoreMigrationPhase, StateSnapshot,
 };
 use net_sdk::mesh::Mesh as SdkMesh;
 
@@ -50,6 +51,70 @@ fn daemon_err(msg: impl Into<String>) -> Error {
     Error::from_reason(format!("{} {}", ERR_DAEMON_PREFIX, msg.into()))
 }
 
+/// Map an SDK `DaemonError` to a NAPI error with a stable
+/// machine-readable kind prefix for migration failures. TS side
+/// dispatches on the kind rather than parsing free-form messages.
+///
+/// Non-migration variants fall through to the default `daemon:`
+/// prefix via `e.to_string()`, preserving pre-existing behavior.
+///
+/// **Wire format** (after the `daemon: ` prefix):
+/// - Migration failures: `migration: <kind>[: <detail>]`
+/// - Orchestrator errors: `migration: <kind>[: <detail>]`
+/// - Everything else: verbatim `e.to_string()`
+///
+/// See [`MigrationErrorKind`] on the TS side for the full kind
+/// vocabulary. Keep the kind strings stable — they're part of
+/// the SDK's public API once callers `catch (e) { if (e.kind === ... )}`.
+fn daemon_err_from_sdk(e: SdkDaemonError) -> Error {
+    match e {
+        SdkDaemonError::MigrationFailed(reason) => {
+            daemon_err(format_migration_failure_reason(&reason))
+        }
+        SdkDaemonError::Migration(mig_err) => daemon_err(format_migration_error(&mig_err)),
+        other => daemon_err(other.to_string()),
+    }
+}
+
+fn format_migration_failure_reason(reason: &MigrationFailureReason) -> String {
+    match reason {
+        MigrationFailureReason::NotReady => "migration: not-ready".to_string(),
+        MigrationFailureReason::FactoryNotFound => "migration: factory-not-found".to_string(),
+        MigrationFailureReason::ComputeNotSupported => {
+            "migration: compute-not-supported".to_string()
+        }
+        MigrationFailureReason::StateFailed(msg) => format!("migration: state-failed: {msg}"),
+        MigrationFailureReason::AlreadyMigrating => "migration: already-migrating".to_string(),
+        MigrationFailureReason::IdentityTransportFailed(msg) => {
+            format!("migration: identity-transport-failed: {msg}")
+        }
+        MigrationFailureReason::NotReadyTimeout { attempts } => {
+            format!("migration: not-ready-timeout: {attempts}")
+        }
+    }
+}
+
+fn format_migration_error(err: &SdkMigrationError) -> String {
+    match err {
+        SdkMigrationError::DaemonNotFound(origin) => {
+            format!("migration: daemon-not-found: {origin:#x}")
+        }
+        SdkMigrationError::TargetUnavailable(node) => {
+            format!("migration: target-unavailable: {node:#x}")
+        }
+        SdkMigrationError::StateFailed(msg) => format!("migration: state-failed: {msg}"),
+        SdkMigrationError::AlreadyMigrating(origin) => {
+            format!("migration: already-migrating: {origin:#x}")
+        }
+        SdkMigrationError::WrongPhase { expected, got } => {
+            format!("migration: wrong-phase: {expected:?}: {got:?}")
+        }
+        SdkMigrationError::SnapshotTooLarge { size, max } => {
+            format!("migration: snapshot-too-large: {size}: {max}")
+        }
+    }
+}
+
 // =========================================================================
 // NAPI class — DaemonRuntime
 // =========================================================================
@@ -59,20 +124,18 @@ fn daemon_err(msg: impl Into<String>) -> Error {
 /// is `Send + Sync + Clone` — it can be called from any tokio task
 /// without being pinned to the Node main thread.
 ///
-/// Return type is `UnknownReturnValue` — napi-rs's `'static`
-/// placeholder for "we don't inspect the return value here." The
-/// TSFN alias would otherwise inherit the call-site `Unknown<'_>`
-/// lifetime from the `Function` param, which isn't `'static`-
-/// storable. Sub-step 3 will read the concrete object shape off
-/// the returned JS value inside the `call` callback, so holding
-/// the typed return here adds nothing.
-///
-/// `CalleeHandled` left at the builder's default (`false`) —
-/// we'll wire callee-side error handling when sub-step 3 brings
-/// up the `process` dispatch path.
+/// Return type is [`DaemonBridgeTsfns`] — on each invocation the
+/// JS factory returns a `MeshDaemon`-shaped object; napi-rs's
+/// `FromNapiValue` impl for `DaemonBridgeTsfns` runs inline on
+/// the Node main thread (where TSFN callbacks execute) and
+/// extracts the `process` / `snapshot` / `restore` functions into
+/// fresh per-instance TSFNs. The resulting triple is Send + Sync
+/// and can cross threads as a whole. Used by both the initial
+/// spawn path and by the migration-target reconstruction closure
+/// mirrored into the SDK factory map.
 type FactoryTsfn = napi::threadsafe_function::ThreadsafeFunction<
     (),
-    napi::threadsafe_function::UnknownReturnValue,
+    DaemonBridgeTsfns,
     (),
     napi::Status,
     false,
@@ -117,6 +180,91 @@ type RestoreTsfn = napi::threadsafe_function::ThreadsafeFunction<
     false,
 >;
 
+/// Extracted TSFNs for the three daemon methods. Produced by the
+/// factory TSFN on every invocation — napi-rs calls our
+/// [`FromNapiValue`] impl on the Node main thread, which pulls
+/// the `process` / `snapshot` / `restore` function properties off
+/// the factory's return object and builds a fresh TSFN per
+/// method.
+///
+/// The TSFNs themselves are `Send + Sync + Clone` so the whole
+/// triple can be packaged into a Rust closure that crosses
+/// threads (e.g., the SDK kind-factory that the migration
+/// dispatcher invokes from a tokio worker).
+///
+/// If the user's factory returned a Promise instead of a plain
+/// object, the `FromNapiValue` impl fails because the Promise
+/// has no `process` property — that's intentional. Migration-
+/// target reconstruction requires a synchronous factory; async
+/// factories work only for the initial `spawn` path (where the
+/// TS layer awaits in JS before calling NAPI).
+pub struct DaemonBridgeTsfns {
+    process: ProcessTsfn,
+    snapshot: Option<SnapshotTsfn>,
+    restore: Option<RestoreTsfn>,
+}
+
+impl napi::bindgen_prelude::TypeName for DaemonBridgeTsfns {
+    fn type_name() -> &'static str {
+        "DaemonBridgeTsfns"
+    }
+
+    fn value_type() -> napi::ValueType {
+        napi::ValueType::Object
+    }
+}
+
+impl napi::bindgen_prelude::ValidateNapiValue for DaemonBridgeTsfns {}
+
+impl napi::bindgen_prelude::FromNapiValue for DaemonBridgeTsfns {
+    unsafe fn from_napi_value(
+        env: napi::sys::napi_env,
+        napi_val: napi::sys::napi_value,
+    ) -> Result<Self> {
+        use napi::bindgen_prelude::{JsObjectValue as _, Object};
+
+        // Hydrate the JS return as an Object<'_>. Lifetime is
+        // bound to this function scope — we consume it fully
+        // inside here by extracting functions and building TSFNs.
+        let obj = unsafe { Object::from_napi_value(env, napi_val) }?;
+
+        // Required: `process`. `get_named_property::<Function<...>>`
+        // validates the property is callable before returning;
+        // a missing `process` surfaces as an InvalidArg error
+        // that the TSFN's `Result<DaemonBridgeTsfns>` callback
+        // will receive as `Err(_)`.
+        let process_fn: Function<'_, CausalEventJs, Vec<Buffer>> =
+            obj.get_named_property("process")?;
+        let process: ProcessTsfn = process_fn.build_threadsafe_function().build()?;
+
+        // Optional: `snapshot`, `restore`. Missing or `undefined`
+        // properties decode to `None` via napi-rs's `Option<T>`
+        // impl. A property that's present but not a function
+        // still errors out — that's the right call (users who
+        // provide the field must provide a function).
+        let snapshot_fn: Option<Function<'_, (), Option<Buffer>>> =
+            obj.get_named_property("snapshot")?;
+        let snapshot: Option<SnapshotTsfn> = match snapshot_fn {
+            Some(f) => Some(f.build_threadsafe_function().build()?),
+            None => None,
+        };
+
+        let restore_fn: Option<
+            Function<'_, Buffer, napi::threadsafe_function::UnknownReturnValue>,
+        > = obj.get_named_property("restore")?;
+        let restore: Option<RestoreTsfn> = match restore_fn {
+            Some(f) => Some(f.build_threadsafe_function().build()?),
+            None => None,
+        };
+
+        Ok(DaemonBridgeTsfns {
+            process,
+            snapshot,
+            restore,
+        })
+    }
+}
+
 /// Per-runtime compute surface. One instance per `NetMesh`; clone
 /// handles are `Arc`-shared internally.
 #[napi]
@@ -125,12 +273,14 @@ pub struct DaemonRuntime {
     /// registry, migration orchestrator, and lifecycle state. The
     /// NAPI layer is a thin envelope — behavior lives in the SDK.
     inner: Arc<SdkDaemonRuntime>,
-    /// JS-side factory table. Keyed by the `kind` string; value is
-    /// the `ThreadsafeFunction` returned by NAPI when the caller
-    /// passed a JS function. Sub-step 2 consumes these at `spawn`
-    /// time to build each daemon's `process` / `snapshot` /
-    /// `restore` TSFNs. Sub-step 1 just stores and drops.
-    factories: Arc<DashMap<String, FactoryTsfn>>,
+    /// Concurrent set of registered kinds. Used only by the
+    /// NAPI-level `spawn` / `spawnFromSnapshot` guards that reject
+    /// spawns against unregistered kinds with a friendlier error
+    /// than the SDK's downstream `FactoryNotFound`. The authoritative
+    /// factory storage lives on the SDK side (via the TSFN-backed
+    /// closure registered in `register_factory`); the TSFN itself
+    /// is owned by that SDK closure, not by this set.
+    factories: Arc<DashMap<String, ()>>,
 }
 
 #[napi]
@@ -216,17 +366,17 @@ impl DaemonRuntime {
     pub fn register_factory(
         &self,
         kind: String,
-        factory: Function<'_, (), napi::threadsafe_function::UnknownReturnValue>,
+        factory: Function<'_, (), DaemonBridgeTsfns>,
     ) -> Result<()> {
-        // Build a threadsafe handle so the factory can be called
-        // from any tokio task (sub-step 2 will do this at spawn
-        // time). The TSFN is `Send + Sync + Clone` — once built we
-        // can invoke it off the Node main thread.
+        // Build a threadsafe handle so the factory can be invoked
+        // from any tokio task. The TSFN carries its own JS ref to
+        // the user's factory function; cloning the TSFN is cheap
+        // and thread-safe.
         let tsfn: FactoryTsfn = factory.build_threadsafe_function().build()?;
 
         // Atomic insert-or-error via DashMap's entry API. Matches
         // the SDK's `register_factory` contract — "second
-        // registration fails." Do the DashMap insert first so we
+        // registration fails." Do the NAPI-set insert first so we
         // fail fast on duplicates before touching the SDK registry.
         use dashmap::mapref::entry::Entry;
         match self.factories.entry(kind.clone()) {
@@ -236,29 +386,38 @@ impl DaemonRuntime {
                 )));
             }
             Entry::Vacant(slot) => {
-                slot.insert(tsfn);
+                slot.insert(());
             }
         }
 
-        // Mirror into the SDK factory map so `expect_migration`
-        // and `register_migration_target_identity` can resolve
-        // `kind → factory_closure` via the core registry.
+        // Mirror into the SDK factory map. The closure calls back
+        // into JS synchronously via the TSFN + mpsc pattern: fires
+        // the factory on the Node main thread, waits for the
+        // `DaemonBridgeTsfns` to come back, wraps them in an
+        // `EventDispatchBridge`. Falls back to `NoopBridge` if the
+        // JS call throws or the channel drops — callers see a
+        // daemon that produces no outputs rather than a crash.
         //
-        // The factory closure returns a `NoopBridge` — a
-        // placeholder `MeshDaemon` whose `process` returns empty
-        // outputs. That's correct for migration-target reconstruction
-        // today (same fallback used by `spawn_with_daemon`'s
-        // `kind_factory`), but means a migrated-in daemon on a TS
-        // target won't actually invoke the user's JS factory. Full
-        // JS-factory reconstruction on migration targets is a later
-        // sub-step — at that point this closure gets swapped for
-        // one that does a synchronous TSFN round-trip to build a
-        // real `EventDispatchBridge`. For now, landing the
-        // lifecycle / registry consistency is enough to unblock
-        // `expect_migration`.
+        // The SDK closure owns the TSFN; NAPI only tracks the
+        // kind string for fast spawn-time lookup.
+        //
+        // **Caveat (sub-step 5 landing note):** requires a
+        // *synchronous* JS factory. An async factory returns a
+        // Promise, which has no `process` property, so
+        // `DaemonBridgeTsfns::from_napi_value` rejects with an
+        // InvalidArg error. Local `spawn()` is unaffected — the
+        // TS wrapper awaits async factories before calling NAPI,
+        // so by the time NAPI sees the three methods they're
+        // concrete functions.
+        //
+        // We need to call `tsfn` potentially multiple times (once
+        // per migrated-in daemon), but `FactoryTsfn` is not
+        // `Clone`. Wrap in an `Arc` so the SDK closure can share
+        // the same TSFN across invocations.
+        let factory_tsfn = Arc::new(tsfn);
         let kind_for_bridge = kind.clone();
         if let Err(e) = self.inner.register_factory(&kind, move || {
-            Box::new(NoopBridge::new(kind_for_bridge.clone())) as Box<dyn MeshDaemon>
+            build_bridge_from_tsfn(factory_tsfn.clone(), kind_for_bridge.clone())
         }) {
             // SDK registration failed — roll back the NAPI-side
             // insert so `register_factory` stays atomic across
@@ -561,7 +720,7 @@ impl DaemonRuntime {
             .inner
             .start_migration(origin_hash, source, target)
             .await
-            .map_err(|e| daemon_err(e.to_string()))?;
+            .map_err(daemon_err_from_sdk)?;
         Ok(MigrationHandle::from_sdk(handle))
     }
 
@@ -583,7 +742,7 @@ impl DaemonRuntime {
             .inner
             .start_migration_with(origin_hash, source, target, opts.into())
             .await
-            .map_err(|e| daemon_err(e.to_string()))?;
+            .map_err(daemon_err_from_sdk)?;
         Ok(MigrationHandle::from_sdk(handle))
     }
 
@@ -772,7 +931,7 @@ impl MigrationHandle {
             .clone()
             .wait()
             .await
-            .map_err(|e| daemon_err(e.to_string()))
+            .map_err(daemon_err_from_sdk)
     }
 
     /// Like [`wait`] with a caller-controlled timeout. On timeout
@@ -785,7 +944,7 @@ impl MigrationHandle {
             .clone()
             .wait_with_timeout(std::time::Duration::from_millis(ms))
             .await
-            .map_err(|e| daemon_err(e.to_string()))
+            .map_err(daemon_err_from_sdk)
     }
 
     /// Request cancellation of the migration. Best-effort: a
@@ -794,10 +953,7 @@ impl MigrationHandle {
     /// without aborting.
     #[napi]
     pub async fn cancel(&self) -> Result<()> {
-        self.inner
-            .cancel()
-            .await
-            .map_err(|e| daemon_err(e.to_string()))
+        self.inner.cancel().await.map_err(daemon_err_from_sdk)
     }
 }
 
@@ -1179,5 +1335,68 @@ impl MeshDaemon for NoopBridge {
         _event: &CausalEvent,
     ) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
         Ok(Vec::new())
+    }
+}
+
+// =========================================================================
+// Bridge construction from a factory TSFN — sub-step 5
+// =========================================================================
+
+/// Invoke the JS factory TSFN synchronously and build an
+/// `EventDispatchBridge` from the returned method triple. Used
+/// both by `spawn`'s migration-target reconstruction path (via
+/// the SDK kind_factory closure) and directly when the dispatcher
+/// needs to rebuild a daemon after a cross-node migration.
+///
+/// Blocks the current thread (expected to be a tokio worker, not
+/// the Node main thread) until the TSFN callback sends the
+/// extracted TSFNs back over the mpsc channel.
+///
+/// Falls back to [`NoopBridge`] if:
+/// - The TSFN enqueue fails (runtime shutting down)
+/// - The JS factory throws
+/// - The user's factory returned a Promise (async), which lacks
+///   the expected `process` property
+/// - The mpsc receiver drops
+///
+/// The fallback is intentional — a migrated-in daemon shouldn't
+/// crash the target runtime just because the JS side
+/// mis-registered. An `eprintln!` trail points operators at the
+/// failure.
+fn build_bridge_from_tsfn(factory: Arc<FactoryTsfn>, kind: String) -> Box<dyn MeshDaemon> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<DaemonBridgeTsfns>>(1);
+    let status = factory.call_with_return_value(
+        (),
+        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+        move |ret: Result<DaemonBridgeTsfns>, _env| {
+            let _ = tx.send(ret);
+            Ok(())
+        },
+    );
+    if status != napi::Status::Ok {
+        eprintln!(
+            "build_bridge_from_tsfn: TSFN enqueue failed for kind '{kind}': {status:?}; falling back to NoopBridge"
+        );
+        return Box::new(NoopBridge::new(kind));
+    }
+    match rx.recv() {
+        Ok(Ok(tsfns)) => Box::new(EventDispatchBridge {
+            name: kind,
+            process: tsfns.process,
+            snapshot: tsfns.snapshot,
+            restore: tsfns.restore,
+        }),
+        Ok(Err(e)) => {
+            eprintln!(
+                "build_bridge_from_tsfn: JS factory for kind '{kind}' failed: {e}; falling back to NoopBridge"
+            );
+            Box::new(NoopBridge::new(kind))
+        }
+        Err(e) => {
+            eprintln!(
+                "build_bridge_from_tsfn: channel recv failed for kind '{kind}': {e}; falling back to NoopBridge"
+            );
+            Box::new(NoopBridge::new(kind))
+        }
     }
 }

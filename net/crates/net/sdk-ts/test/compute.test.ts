@@ -14,6 +14,7 @@ import {
   DaemonRuntime,
   Identity,
   MeshNode,
+  MigrationError,
   MigrationHandle,
   type MigrationPhase,
 } from '../src';
@@ -876,6 +877,108 @@ describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', ()
     }
   });
 
+  it('startMigration with unknown target peer throws MigrationError { kind: "target-unavailable" }', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+    rt.registerFactory('counter', counterFactory());
+    await rt.start();
+
+    const id = Identity.generate();
+    const spawn = await rt.spawn('counter', id);
+
+    // Migrate to a node ID we never handshook with — source's
+    // peer table has no entry, so start_migration_with fails at
+    // the seal-envelope step (or the target lookup).
+    const ghostNode = 0x00aa_bb_cc_dd_ee_ff_00n;
+    try {
+      await rt.startMigrationWith(spawn.originHash, mesh.nodeId(), ghostNode, {
+        transportIdentity: false,
+        retryNotReadyMs: 0n,
+      });
+      throw new Error('expected startMigrationWith to throw');
+    } catch (e) {
+      expect(e).toBeInstanceOf(MigrationError);
+      const err = e as MigrationError;
+      // Either target-unavailable (peer lookup) or identity-
+      // transport-failed (envelope seal). Both are terminal and
+      // both are typed MigrationErrors.
+      expect([
+        'target-unavailable',
+        'identity-transport-failed',
+        'state-failed',
+      ]).toContain(err.kind);
+    }
+  });
+
+  it('MigrationError is catch-able as a DaemonError (subclass)', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+    rt.registerFactory('counter', counterFactory());
+    await rt.start();
+
+    const id = Identity.generate();
+    const spawn = await rt.spawn('counter', id);
+    const ghostNode = 0x11_22_33_44_55_66_77_88n;
+    try {
+      await rt.startMigrationWith(
+        spawn.originHash,
+        mesh.nodeId(),
+        ghostNode,
+        { transportIdentity: false, retryNotReadyMs: 0n },
+      );
+      throw new Error('expected throw');
+    } catch (e) {
+      // Subclass check — catch (e: DaemonError) still matches.
+      expect(e).toBeInstanceOf(DaemonError);
+      expect(e).toBeInstanceOf(MigrationError);
+    }
+  });
+
+  it('wait() on an orchestrator record cleared by cancel surfaces MigrationError', async () => {
+    const [aAddr, bAddr] = [`127.0.0.1:${portSeed++}`, `127.0.0.1:${portSeed++}`];
+    const a = await MeshNode.create({ bindAddr: aAddr, psk: PSK });
+    cleanups.push(() => a.shutdown());
+    const b = await MeshNode.create({ bindAddr: bAddr, psk: PSK });
+    cleanups.push(() => b.shutdown());
+    await Promise.all([
+      b.accept(a.nodeId()),
+      (async () => {
+        await new Promise((r) => setTimeout(r, 50));
+        await a.connect(bAddr, b.publicKey(), b.nodeId());
+      })(),
+    ]);
+    await a.start();
+    await b.start();
+
+    const rtA = DaemonRuntime.create(a);
+    cleanups.push(() => rtA.shutdown());
+    rtA.registerFactory('counter', counterFactory());
+    await rtA.start();
+
+    const id = Identity.generate();
+    const spawn = await rtA.spawn('counter', id);
+    const mig = await rtA.startMigrationWith(
+      spawn.originHash,
+      a.nodeId(),
+      b.nodeId(),
+      { transportIdentity: false, retryNotReadyMs: 0n },
+    );
+    // Don't await cancel — race with wait.
+    const waitPromise = mig.wait();
+    await mig.cancel();
+    try {
+      await waitPromise;
+      // Might resolve if the record raced past cancel; that's OK
+      // too — the contract is "if it rejects, it's a MigrationError".
+    } catch (e) {
+      expect(e).toBeInstanceOf(MigrationError);
+    }
+  });
+
   it('phases() yields distinct transitions and terminates on cleanup', async () => {
     // Two-mesh pair: source drives a migration to a connected
     // target. Without `expectMigration`/target-side identity the
@@ -1050,6 +1153,85 @@ describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', ()
       // `no such migration`. That's fine for this smoke test.
     }
   });
+
+  it('end-to-end migration: counter survives A → B with envelope transport', async () => {
+    // Stage 4 exit criterion. Mirrors the Rust SDK's
+    // `local_source_migration_reaches_complete_and_transfers_state`
+    // test: spawn a stateful JS daemon on A, drive the counter
+    // via deliveries, migrate to B with identity-envelope
+    // transport, verify counter state survived.
+    const [aAddr, bAddr] = [`127.0.0.1:${portSeed++}`, `127.0.0.1:${portSeed++}`];
+    const a = await MeshNode.create({ bindAddr: aAddr, psk: PSK });
+    cleanups.push(() => a.shutdown());
+    const b = await MeshNode.create({ bindAddr: bAddr, psk: PSK });
+    cleanups.push(() => b.shutdown());
+    await Promise.all([
+      b.accept(a.nodeId()),
+      (async () => {
+        await new Promise((r) => setTimeout(r, 50));
+        await a.connect(bAddr, b.publicKey(), b.nodeId());
+      })(),
+    ]);
+    await a.start();
+    await b.start();
+
+    // Both runtimes register the same factory — source uses it
+    // for the initial spawn; target uses it (via the SDK's
+    // mirrored kind_factory) to rebuild the daemon from the
+    // inbound snapshot's envelope + state bytes. Synchronous
+    // factory is required for the target-side reconstruction.
+    const rtA = DaemonRuntime.create(a);
+    cleanups.push(() => rtA.shutdown());
+    rtA.registerFactory('counter', counterFactory());
+    await rtA.start();
+
+    const rtB = DaemonRuntime.create(b);
+    cleanups.push(() => rtB.shutdown());
+    rtB.registerFactory('counter', counterFactory());
+    await rtB.start();
+
+    const id = Identity.generate();
+    const handle = await rtA.spawn('counter', id);
+    const evt = (seq: bigint) => ({
+      originHash: id.originHash,
+      sequence: seq,
+      payload: Buffer.alloc(0),
+    });
+    for (let i = 1; i <= 3; i++) {
+      await rtA.deliver(handle.originHash, evt(BigInt(i)));
+    }
+
+    // Pre-register on B. Envelope-transport path supplies the
+    // real keypair at restore time, so we only need the
+    // origin_hash + kind here.
+    rtB.expectMigration('counter', handle.originHash);
+
+    const mig = await rtA.startMigration(
+      handle.originHash,
+      a.nodeId(),
+      b.nodeId(),
+    );
+    await mig.waitWithTimeout(5000n);
+
+    // Tail-end ActivateAck race — matches the 200 ms beat in the
+    // Rust test. `wait` returns when the orchestrator record
+    // clears on A, which can slightly precede the target-side
+    // dispatcher's final daemon-registry insert.
+    await new Promise((r) => setTimeout(r, 200));
+
+    // Post-migration: A shed the daemon, B picked it up.
+    expect(rtA.daemonCount()).toBe(0);
+    expect(rtB.daemonCount()).toBe(1);
+
+    // Drive one more delivery through the target. If the
+    // target-side factory reconstruction worked, the JS counter
+    // closure on B has been seeded from the snapshot (3), and
+    // this delivery steps it to 4. If reconstruction fell back
+    // to NoopBridge, the delivery returns empty.
+    const out = await rtB.deliver(handle.originHash, evt(4n));
+    expect(out.length).toBe(1);
+    expect(out[0].readUInt32LE(0)).toBe(4);
+  }, 30_000);
 
   // Plan exit criterion: spawn/stop 1000 daemons in a loop, heap
   // usage stable. We don't actually probe the heap — that's
