@@ -1,0 +1,53 @@
+net/crates/net/src/adapter/net/crypto.rs
+  3f7be55252abce8d 395-399
+net/crates/net/src/ffi/mod.rs
+  3f7be55252abce8d 610-613
+net/crates/net/src/adapter/net/behavior/capability.rs
+  3f7be55252abce8d 1262-1269,1273-1274
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "a10fc1d9ab47fcb5d8745aeaa84fe45cb453935f",
+  "prompts": {
+    "3f7be55252abce8d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79535006-5411-4b1f-9b3f-f33fc7aa16e1",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 4319,
+      "total_deletions": 7,
+      "accepted_lines": 20,
+      "overriden_lines": 0
+    },
+    "9da793ecc812ac08": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe6943d3-7e93-4024-a31d-c9fddb6eb40e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 5,
+      "overriden_lines": 0
+    },
+    "af5d677bc1867855": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dce3e2d2-9f61-4a27-b2c2-0118dd5aae82",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 5,
+      "overriden_lines": 0
+    }
+  }
+}
