@@ -26,7 +26,9 @@ pub use daemon_factory::{DaemonFactoryRegistry, FactoryEntry};
 pub use fork_group::{ForkGroup, ForkGroupConfig, ForkInfo};
 pub use group_coord::{GroupCoordinator, GroupError, GroupHealth, MemberInfo};
 pub use host::DaemonHost;
-pub use migration::{MigrationError, MigrationPhase, MigrationState, SUBPROTOCOL_MIGRATION};
+pub use migration::{
+    MigrationError, MigrationFailureReason, MigrationPhase, MigrationState, SUBPROTOCOL_MIGRATION,
+};
 pub use migration_source::MigrationSourceHandler;
 pub use migration_target::MigrationTargetHandler;
 pub use orchestrator::{

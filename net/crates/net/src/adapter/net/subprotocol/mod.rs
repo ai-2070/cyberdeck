@@ -18,8 +18,8 @@ pub const SUBPROTOCOL_NEGOTIATION: u16 = 0x0600;
 
 pub use descriptor::{SubprotocolDescriptor, SubprotocolVersion, MANIFEST_ENTRY_SIZE};
 pub use migration_handler::{
-    MigrationIdentityContext, MigrationSubprotocolHandler, OutboundMigrationMessage,
-    PostRestoreCallback, PreCleanupCallback,
+    FailureCallback, MigrationIdentityContext, MigrationSubprotocolHandler,
+    OutboundMigrationMessage, PostRestoreCallback, PreCleanupCallback, ReadinessCallback,
 };
 pub use negotiation::{negotiate, ManifestEntry, NegotiatedSet, SubprotocolManifest};
 pub use registry::SubprotocolRegistry;

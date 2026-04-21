@@ -26,6 +26,97 @@ pub enum MigrationPhase {
     Complete,
 }
 
+/// Structured reason the migration target rejected (or the
+/// orchestrator aborted) a migration. Replaces the free-form
+/// `reason: String` on `MigrationMessage::MigrationFailed` so the
+/// source can dispatch programmatically on the cause — specifically,
+/// distinguish "retry this, the target is still booting" (`NotReady`)
+/// from "give up, the target doesn't know this daemon kind"
+/// (`FactoryNotFound`).
+///
+/// See [`DAEMON_RUNTIME_READINESS_PLAN.md`](../../../../docs/DAEMON_RUNTIME_READINESS_PLAN.md)
+/// for the retry-classification table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationFailureReason {
+    /// Target runtime exists but hasn't called `start()` yet — the
+    /// dispatcher received the migration before the runtime was
+    /// ready to accept one. **Retriable**: source should back off
+    /// + resend.
+    NotReady,
+    /// Target has no factory registered for the daemon's
+    /// `origin_hash` (supplied in the outer `MigrationFailed`
+    /// envelope). **Terminal** — retrying won't help; the target
+    /// is mis-configured (wrong node), the kind is wrong, or the
+    /// daemon never registered.
+    FactoryNotFound,
+    /// Target doesn't run a compute runtime at all (a bare `Mesh`
+    /// with no `DaemonRuntime` attached). **Terminal** — source
+    /// should pick a different target.
+    ComputeNotSupported,
+    /// Generic snapshot / restore / state-machine failure. Carries
+    /// a human-readable detail. **Terminal.**
+    StateFailed(String),
+    /// A migration is already in flight for the same origin.
+    /// **Terminal** on the duplicate attempt — caller should not
+    /// retry, and the currently-active migration should be allowed
+    /// to run to completion.
+    AlreadyMigrating,
+    /// Identity envelope failure: signature didn't verify, seal
+    /// open failed, etc. **Terminal** — tampering or misconfigured
+    /// target X25519 key; retry won't fix it.
+    IdentityTransportFailed(String),
+    /// Source gave up after exhausting its `NotReady` retry budget.
+    /// **Terminal** on both sides; carries the retry attempt count
+    /// for operator diagnosis.
+    NotReadyTimeout { attempts: u8 },
+}
+
+impl MigrationFailureReason {
+    /// `true` iff the source should retry after a short backoff
+    /// when it sees this reason. Today only `NotReady` qualifies —
+    /// the others are terminal.
+    pub fn is_retriable(&self) -> bool {
+        matches!(self, MigrationFailureReason::NotReady)
+    }
+
+    /// 16-bit wire code. Separating the code from the payload lets
+    /// the dispatcher's decoder match on the tag cheaply and the
+    /// payload length on-line with the variant.
+    pub fn code(&self) -> u16 {
+        match self {
+            MigrationFailureReason::NotReady => 0,
+            MigrationFailureReason::FactoryNotFound => 1,
+            MigrationFailureReason::ComputeNotSupported => 2,
+            MigrationFailureReason::StateFailed(_) => 3,
+            MigrationFailureReason::AlreadyMigrating => 4,
+            MigrationFailureReason::IdentityTransportFailed(_) => 5,
+            MigrationFailureReason::NotReadyTimeout { .. } => 6,
+        }
+    }
+}
+
+impl std::fmt::Display for MigrationFailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotReady => write!(f, "target runtime not ready yet"),
+            Self::FactoryNotFound => {
+                write!(f, "no factory registered on target for this daemon")
+            }
+            Self::ComputeNotSupported => {
+                write!(f, "target does not run a compute runtime")
+            }
+            Self::StateFailed(msg) => write!(f, "state failed: {msg}"),
+            Self::AlreadyMigrating => write!(f, "daemon is already migrating"),
+            Self::IdentityTransportFailed(msg) => {
+                write!(f, "identity envelope transport failed: {msg}")
+            }
+            Self::NotReadyTimeout { attempts } => {
+                write!(f, "source gave up after {attempts} NotReady retries")
+            }
+        }
+    }
+}
+
 /// State of an in-progress migration.
 pub struct MigrationState {
     /// Origin hash of the daemon being migrated.

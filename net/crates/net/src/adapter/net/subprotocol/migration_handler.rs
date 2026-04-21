@@ -90,6 +90,29 @@ pub type PostRestoreCallback = Arc<dyn Fn(u32) + Send + Sync>;
 /// Sync on the dispatcher thread; async work must `tokio::spawn`.
 pub type PreCleanupCallback = Arc<dyn Fn(u32) + Send + Sync>;
 
+/// Readiness predicate — returns `true` when the local runtime is
+/// prepared to accept inbound migrations (target path). When
+/// populated and the predicate returns `false`, the dispatcher
+/// responds to `SnapshotReady` with
+/// [`MigrationFailureReason::NotReady`](crate::adapter::net::compute::MigrationFailureReason::NotReady)
+/// so the source can retry with backoff rather than surfacing a
+/// terminal error while the target is still booting.
+///
+/// The callback is consulted synchronously on the dispatcher
+/// thread — it must return quickly.
+pub type ReadinessCallback = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Callback fired on the source side whenever the dispatcher
+/// observes an inbound `MigrationFailed` message. The SDK uses this
+/// to surface the structured reason code to the
+/// [`MigrationHandle::wait`](crate) caller so they can distinguish
+/// retriable from terminal failures.
+///
+/// Sync on the dispatcher thread.
+pub type FailureCallback = Arc<
+    dyn Fn(u32, crate::adapter::net::compute::MigrationFailureReason) + Send + Sync,
+>;
+
 pub struct MigrationSubprotocolHandler {
     orchestrator: Arc<MigrationOrchestrator>,
     source_handler: Arc<MigrationSourceHandler>,
@@ -115,6 +138,21 @@ pub struct MigrationSubprotocolHandler {
     /// unregistered. Drives source-side Unsubscribe teardown
     /// (Stage 4 of the channel re-bind plan). `None` = no hook.
     pre_cleanup_callback: Option<PreCleanupCallback>,
+    /// Target-side readiness predicate. When `Some` and returns
+    /// `false`, the dispatcher responds to inbound migration
+    /// attempts with `NotReady` instead of attempting restore.
+    /// Drives the runtime-readiness retry path
+    /// (`DAEMON_RUNTIME_READINESS_PLAN.md` Stage 3). `None` = always
+    /// treat target as ready (pre-Stage-3 behaviour).
+    readiness_callback: Option<ReadinessCallback>,
+    /// Source-side failure observer — fired when the dispatcher
+    /// receives an inbound `MigrationFailed` message. Lets the SDK
+    /// hand the structured reason to the caller via
+    /// [`MigrationHandle::wait`] rather than swallowing it at the
+    /// dispatcher layer. `None` = no hook; failures are still
+    /// processed (orchestrator aborted) but the SDK can't
+    /// distinguish retriable (NotReady) from terminal.
+    failure_callback: Option<FailureCallback>,
 }
 
 impl MigrationSubprotocolHandler {
@@ -184,7 +222,8 @@ impl MigrationSubprotocolHandler {
     /// Create a handler with every hook populated: identity context,
     /// post-restore callback (target-side subscription replay), and
     /// pre-cleanup callback (source-side unsubscribe teardown).
-    /// Used by the SDK's `DaemonRuntime::start`.
+    /// Equivalent to [`Self::new_with_full_hooks`] with no
+    /// readiness predicate.
     pub fn new_with_all_hooks(
         orchestrator: Arc<MigrationOrchestrator>,
         source_handler: Arc<MigrationSourceHandler>,
@@ -193,6 +232,59 @@ impl MigrationSubprotocolHandler {
         identity_context: Option<MigrationIdentityContext>,
         post_restore_callback: Option<PostRestoreCallback>,
         pre_cleanup_callback: Option<PreCleanupCallback>,
+    ) -> Self {
+        Self::new_with_full_hooks(
+            orchestrator,
+            source_handler,
+            target_handler,
+            local_node_id,
+            identity_context,
+            post_restore_callback,
+            pre_cleanup_callback,
+            None,
+        )
+    }
+
+    /// Create a handler with every hook + the readiness predicate.
+    /// Convenience — falls through to [`Self::new_fully_hooked`]
+    /// with the failure observer unset.
+    pub fn new_with_full_hooks(
+        orchestrator: Arc<MigrationOrchestrator>,
+        source_handler: Arc<MigrationSourceHandler>,
+        target_handler: Arc<MigrationTargetHandler>,
+        local_node_id: u64,
+        identity_context: Option<MigrationIdentityContext>,
+        post_restore_callback: Option<PostRestoreCallback>,
+        pre_cleanup_callback: Option<PreCleanupCallback>,
+        readiness_callback: Option<ReadinessCallback>,
+    ) -> Self {
+        Self::new_fully_hooked(
+            orchestrator,
+            source_handler,
+            target_handler,
+            local_node_id,
+            identity_context,
+            post_restore_callback,
+            pre_cleanup_callback,
+            readiness_callback,
+            None,
+        )
+    }
+
+    /// Fully-hooked constructor. The SDK's `DaemonRuntime::start`
+    /// uses this form to supply every callback at once; the
+    /// progressive-disclosure variants above are convenience
+    /// entry points for tests and pre-Stage-X callers.
+    pub fn new_fully_hooked(
+        orchestrator: Arc<MigrationOrchestrator>,
+        source_handler: Arc<MigrationSourceHandler>,
+        target_handler: Arc<MigrationTargetHandler>,
+        local_node_id: u64,
+        identity_context: Option<MigrationIdentityContext>,
+        post_restore_callback: Option<PostRestoreCallback>,
+        pre_cleanup_callback: Option<PreCleanupCallback>,
+        readiness_callback: Option<ReadinessCallback>,
+        failure_callback: Option<FailureCallback>,
     ) -> Self {
         Self {
             orchestrator,
@@ -203,6 +295,8 @@ impl MigrationSubprotocolHandler {
             identity_context,
             post_restore_callback,
             pre_cleanup_callback,
+            readiness_callback,
+            failure_callback,
         }
     }
 
@@ -531,14 +625,27 @@ impl MigrationSubprotocolHandler {
 
             MigrationMessage::MigrationFailed {
                 daemon_origin,
-                reason: _,
+                reason,
             } => {
-                // Abort on all local handlers
+                // Fire the SDK's observer BEFORE abort, so the
+                // observer sees the structured reason while the
+                // migration record is still alive — the SDK uses
+                // this to surface NotReady vs terminal to the
+                // caller of `MigrationHandle::wait`.
+                if let Some(cb) = &self.failure_callback {
+                    cb(daemon_origin, reason.clone());
+                }
+                // Abort on all local handlers. This is correct for
+                // terminal reasons; for `NotReady` the SDK may
+                // elect to retry, which will re-`start_migration`
+                // from scratch (re-snapshotting on local source,
+                // re-sending TakeSnapshot on remote source).
                 let _ = self.source_handler.abort(daemon_origin);
                 let _ = self.target_handler.abort(daemon_origin);
-                let _ = self
-                    .orchestrator
-                    .abort_migration(daemon_origin, "remote abort".into());
+                let _ = self.orchestrator.abort_migration_with_reason(
+                    daemon_origin,
+                    reason,
+                );
             }
 
             MigrationMessage::BufferedEvents {
@@ -642,16 +749,27 @@ impl MigrationSubprotocolHandler {
         // (`ActivateAck`), not just until the first locally-successful
         // restore.
         if !self.target_handler.is_migrating(daemon_origin) {
+            // Readiness check first: if the runtime is still in
+            // `Registering`, respond `NotReady` so the source can
+            // retry with backoff rather than burning the attempt
+            // on a target that's still booting.
+            if let Some(readiness) = &self.readiness_callback {
+                if !readiness() {
+                    return Ok(Some(self.fail_migration_with_reason(
+                        daemon_origin,
+                        from_node,
+                        crate::adapter::net::compute::MigrationFailureReason::NotReady,
+                    )?));
+                }
+            }
+
             let inputs = match self.target_handler.factories().construct(daemon_origin) {
                 Some(i) => i,
                 None => {
-                    return Ok(Some(self.fail_migration(
+                    return Ok(Some(self.fail_migration_with_reason(
                         daemon_origin,
                         from_node,
-                        &format!(
-                            "no daemon factory registered for origin {:#x}",
-                            daemon_origin
-                        ),
+                        crate::adapter::net::compute::MigrationFailureReason::FactoryNotFound,
                     )?));
                 }
             };
@@ -839,24 +957,47 @@ impl MigrationSubprotocolHandler {
     }
 
     /// Build a `MigrationFailed` outbound message and clean up local state.
-    /// Used when the target can't accept a migration (no factory, parse
-    /// failure, etc).
+    /// Convenience wrapper that wraps `reason` in
+    /// [`MigrationFailureReason::StateFailed`] for generic failures;
+    /// callers that need a specific reason code (e.g. `NotReady`,
+    /// `FactoryNotFound`) should use
+    /// [`Self::fail_migration_with_reason`].
     fn fail_migration(
         &self,
         daemon_origin: u32,
         from_node: u64,
         reason: &str,
     ) -> Result<Vec<OutboundMigrationMessage>, MigrationError> {
+        self.fail_migration_with_reason(
+            daemon_origin,
+            from_node,
+            crate::adapter::net::compute::MigrationFailureReason::StateFailed(
+                reason.to_string(),
+            ),
+        )
+    }
+
+    /// Build a `MigrationFailed` outbound message with a structured
+    /// reason. Clean-up is the same as [`Self::fail_migration`]: the
+    /// reassembler entry + target-handler state are dropped so a
+    /// retry from the source can start fresh (unless the reason is
+    /// `FactoryNotFound` — a retry won't find what isn't there).
+    fn fail_migration_with_reason(
+        &self,
+        daemon_origin: u32,
+        from_node: u64,
+        reason: crate::adapter::net::compute::MigrationFailureReason,
+    ) -> Result<Vec<OutboundMigrationMessage>, MigrationError> {
         tracing::warn!(
             daemon_origin = format!("{:#x}", daemon_origin),
-            reason = reason,
-            "migration failed on target"
+            reason = %reason,
+            "migration failed on target",
         );
         self.reassemblers.remove(&daemon_origin);
         let _ = self.target_handler.abort(daemon_origin);
         let msg = MigrationMessage::MigrationFailed {
             daemon_origin,
-            reason: reason.to_string(),
+            reason,
         };
         Ok(vec![OutboundMigrationMessage {
             dest_node: from_node,
@@ -973,7 +1114,9 @@ mod tests {
 
         let msg = MigrationMessage::MigrationFailed {
             daemon_origin: origin,
-            reason: "test failure".into(),
+            reason: crate::adapter::net::compute::MigrationFailureReason::StateFailed(
+                "test failure".into(),
+            ),
         };
         let encoded = wire::encode(&msg).unwrap();
 

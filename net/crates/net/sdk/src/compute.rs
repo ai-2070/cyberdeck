@@ -46,14 +46,14 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use thiserror::Error;
 
 pub use ::net::adapter::net::compute::{
     DaemonBindings, DaemonError as CoreDaemonError, DaemonHostConfig, DaemonStats, MeshDaemon,
-    MigrationError, MigrationPhase, PlacementDecision, SchedulerError, SubscriptionBinding,
-    SUBPROTOCOL_MIGRATION,
+    MigrationError, MigrationFailureReason, MigrationPhase, PlacementDecision, SchedulerError,
+    SubscriptionBinding, SUBPROTOCOL_MIGRATION,
 };
 pub use ::net::adapter::net::state::causal::{CausalEvent, CausalLink};
 pub use ::net::adapter::net::state::snapshot::StateSnapshot;
@@ -67,8 +67,8 @@ use ::net::adapter::net::compute::{
 };
 use ::net::adapter::net::identity::EntityId;
 use ::net::adapter::net::subprotocol::{
-    MigrationIdentityContext, MigrationSubprotocolHandler, PostRestoreCallback,
-    PreCleanupCallback,
+    FailureCallback, MigrationIdentityContext, MigrationSubprotocolHandler, PostRestoreCallback,
+    PreCleanupCallback, ReadinessCallback,
 };
 
 use crate::identity::Identity;
@@ -108,6 +108,12 @@ pub enum DaemonError {
     /// Pass-through for migration-layer errors.
     #[error("migration failed: {0}")]
     Migration(#[from] MigrationError),
+    /// Structured failure reason surfaced by the migration
+    /// dispatcher on the source side. Use
+    /// [`MigrationFailureReason::is_retriable`] to decide whether
+    /// the caller should back off and retry rather than propagating.
+    #[error("migration failed: {0}")]
+    MigrationFailed(MigrationFailureReason),
 }
 
 // Runtime state machine. Encoded as `u8` so it rides in an
@@ -173,6 +179,14 @@ struct Inner {
     /// Migration target handler — drives the target side when THIS
     /// node is the target of a migration.
     target_handler: Arc<MigrationTargetHandler>,
+    /// Most recent `MigrationFailureReason` observed on the source
+    /// side for each migration, keyed by `daemon_origin`. Populated
+    /// by the dispatcher's failure callback; consumed by
+    /// `MigrationHandle::wait` to surface the reason to the caller.
+    /// Mutex because the SDK's dependency set doesn't include
+    /// `dashmap` directly, and this map sees low write frequency
+    /// (one entry per failed migration).
+    recent_failures: Mutex<HashMap<u32, MigrationFailureReason>>,
 }
 
 impl DaemonRuntime {
@@ -203,6 +217,7 @@ impl DaemonRuntime {
                 orchestrator,
                 source_handler,
                 target_handler,
+                recent_failures: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -303,8 +318,23 @@ impl DaemonRuntime {
                                     teardown_subscriptions(inner, bindings).await;
                                 });
                             });
+                        let inner_for_readiness = self.inner.clone();
+                        let readiness: ReadinessCallback = Arc::new(move || {
+                            inner_for_readiness
+                                .state
+                                .load(Ordering::Acquire)
+                                == State::Ready as u8
+                        });
+                        let inner_for_failure = self.inner.clone();
+                        let failure: FailureCallback = Arc::new(
+                            move |origin_hash: u32, reason: MigrationFailureReason| {
+                                if let Ok(mut map) = inner_for_failure.recent_failures.lock() {
+                                    map.insert(origin_hash, reason);
+                                }
+                            },
+                        );
                         let handler = Arc::new(
-                            MigrationSubprotocolHandler::new_with_all_hooks(
+                            MigrationSubprotocolHandler::new_fully_hooked(
                                 self.inner.orchestrator.clone(),
                                 self.inner.source_handler.clone(),
                                 self.inner.target_handler.clone(),
@@ -312,6 +342,8 @@ impl DaemonRuntime {
                                 Some(ctx),
                                 Some(post_restore),
                                 Some(pre_cleanup),
+                                Some(readiness),
+                                Some(failure),
                             ),
                         );
                         self.inner.mesh.inner().set_migration_handler(handler);
@@ -1099,9 +1131,15 @@ impl MigrationHandle {
                 None => {
                     // Record gone. If we ever observed Complete, this
                     // is the normal cleanup path — success. Otherwise
-                    // someone aborted.
+                    // check whether the dispatcher's failure observer
+                    // captured a structured reason (NotReady, etc.);
+                    // if so, surface it. Fall back to a generic
+                    // aborted error when there's no observer entry.
                     if last_phase == Some(MigrationPhase::Complete) {
                         return Ok(());
+                    }
+                    if let Some(reason) = self.take_recent_failure() {
+                        return Err(DaemonError::MigrationFailed(reason));
                     }
                     return Err(DaemonError::Migration(MigrationError::StateFailed(
                         "migration aborted before reaching Complete".into(),
@@ -1120,6 +1158,18 @@ impl MigrationHandle {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    }
+
+    /// Pop the most recent `MigrationFailureReason` the dispatcher
+    /// observed for this migration (if any). Consumed: subsequent
+    /// calls see `None` until the next failure arrives.
+    fn take_recent_failure(&self) -> Option<MigrationFailureReason> {
+        self.runtime
+            .inner
+            .recent_failures
+            .lock()
+            .ok()?
+            .remove(&self.origin_hash)
     }
 
     /// Request abort. The orchestrator emits a `MigrationFailed`
