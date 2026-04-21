@@ -560,10 +560,18 @@ impl DaemonRuntime {
 
         let host = DaemonHost::new(daemon, keypair, config);
         // `DaemonRegistry::register` errors on origin_hash collisions
-        // — two daemons can't share the same identity. Roll back the
-        // factory_registry insert we just made (we own that slot
-        // because `register` above succeeded atomically) so a retry
-        // with a fresh identity doesn't pick up a stale factory.
+        // — two daemons can't share the same identity.
+        //
+        // Rolling back our `factory_registry` insert is safe
+        // because `factory_registry::register` is atomic on
+        // collision: since our call above *succeeded*, the slot
+        // was empty and we exclusively own it. No other code path
+        // replaces an occupied slot (`register` /
+        // `register_placeholder` both error on collision;
+        // `remove` / `take` only remove their caller's own
+        // entries), so the entry we're about to remove is still
+        // ours. The rollback cannot affect a pre-existing
+        // placeholder or another daemon's factory entry.
         if let Err(e) = self.inner.registry.register(host) {
             self.inner.factory_registry.remove(origin_hash);
             return Err(DaemonError::Core(e));
