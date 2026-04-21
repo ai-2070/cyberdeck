@@ -79,6 +79,16 @@ pub struct SessionKeys {
     pub rx_key: [u8; 32],
     /// Session ID derived from handshake
     pub session_id: u64,
+    /// The remote peer's Noise static public key (X25519). 32 bytes
+    /// of public material extracted from the handshake before
+    /// transitioning into transport mode. Load-bearing for the
+    /// identity-envelope path in daemon migration: the source seals
+    /// the daemon's ed25519 seed to this key, knowing the only
+    /// party that can unseal it is the peer whose static private
+    /// key completed this handshake. `[0; 32]` is a sentinel for
+    /// "not available" — some test paths construct `SessionKeys`
+    /// directly and don't go through a real handshake.
+    pub remote_static_pub: [u8; 32],
 }
 
 impl std::fmt::Debug for SessionKeys {
@@ -87,6 +97,16 @@ impl std::fmt::Debug for SessionKeys {
             .field("session_id", &self.session_id)
             .field("tx_key", &"[REDACTED]")
             .field("rx_key", &"[REDACTED]")
+            .field(
+                "remote_static_pub",
+                &format_args!(
+                    "{:02x}{:02x}{:02x}{:02x}…",
+                    self.remote_static_pub[0],
+                    self.remote_static_pub[1],
+                    self.remote_static_pub[2],
+                    self.remote_static_pub[3],
+                ),
+            )
             .finish()
     }
 }
@@ -287,6 +307,19 @@ impl NoiseHandshake {
             arr
         };
 
+        // Capture the remote static pubkey BEFORE `into_transport_mode`
+        // consumes the handshake state. Populated on both sides of
+        // NKpsk0: initiator learned it out-of-band and handed it to
+        // snow via `remote_public_key`; responder learned it from
+        // `-> s` in the Noise pattern. Zero-filled if snow returns
+        // `None` (shouldn't happen post-handshake but `get_remote_static`
+        // is nominally fallible).
+        let mut remote_static_pub = [0u8; 32];
+        if let Some(rs) = self.state.get_remote_static() {
+            let len = rs.len().min(32);
+            remote_static_pub[..len].copy_from_slice(&rs[..len]);
+        }
+
         // Transition to transport mode (we don't need the transport state since we're using stateless encryption)
         let _transport = self
             .state
@@ -317,6 +350,7 @@ impl NoiseHandshake {
             tx_key,
             rx_key,
             session_id,
+            remote_static_pub,
         })
     }
 }

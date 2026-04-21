@@ -446,6 +446,13 @@ struct PeerInfo {
     addr: SocketAddr,
     /// Encrypted session
     session: Arc<NetSession>,
+    /// The peer's Noise static public key (X25519, 32 bytes). Captured
+    /// during the handshake and surfaced via
+    /// [`MeshNode::peer_static_x25519`] so the identity-envelope path
+    /// can seal daemon keypairs to a peer that the session already
+    /// trusts. Zero-filled when the session was built without a real
+    /// handshake (test paths).
+    remote_static_pub: [u8; 32],
 }
 
 /// In-flight initiator handshake. The dispatch loop consumes this when a
@@ -948,6 +955,30 @@ impl MeshNode {
             .map(|e| e.value().clone())
     }
 
+    /// The peer's Noise static X25519 public key, captured during
+    /// the handshake that established the session. Load-bearing for
+    /// daemon migration: the source uses this key as the seal
+    /// recipient on the `IdentityEnvelope`, so the only party that
+    /// can unseal the daemon's ed25519 seed is the peer whose
+    /// static private key completed the Noise handshake.
+    ///
+    /// Returns `None` if we have no session with `node_id`, or if
+    /// the underlying handshake produced a zero-filled static
+    /// pubkey (a sentinel for test-only code paths that construct
+    /// `SessionKeys` without running a real handshake).
+    pub fn peer_static_x25519(&self, node_id: u64) -> Option<[u8; 32]> {
+        let entry = self.peers.get(&node_id)?;
+        let pk = entry.value().remote_static_pub;
+        // Zero-filled → "not available." Real handshakes populate
+        // this from `snow`'s post-handshake `get_remote_static`,
+        // which returns 32 bytes of non-identity-zero X25519 pubkey.
+        if pk == [0u8; 32] {
+            None
+        } else {
+            Some(pk)
+        }
+    }
+
     /// Look up a peer's assigned subnet, if one has been recorded.
     /// Only populated from signature-verified
     /// `CapabilityAnnouncement`s — unsigned announcements do not
@@ -1027,6 +1058,7 @@ impl MeshNode {
             .handshake_initiator(peer_addr, peer_pubkey, peer_node_id)
             .await?;
 
+        let remote_static_pub = keys.remote_static_pub;
         let session = Arc::new(NetSession::new(
             keys,
             peer_addr,
@@ -1043,6 +1075,7 @@ impl MeshNode {
                 node_id: peer_node_id,
                 addr: peer_addr,
                 session,
+                remote_static_pub,
             },
         );
         self.addr_to_node.insert(peer_addr, peer_node_id);
@@ -1077,6 +1110,7 @@ impl MeshNode {
     pub async fn accept(&self, peer_node_id: u64) -> Result<(SocketAddr, u64), AdapterError> {
         let (keys, peer_addr) = self.handshake_responder(peer_node_id).await?;
 
+        let remote_static_pub = keys.remote_static_pub;
         let session = Arc::new(NetSession::new(
             keys,
             peer_addr,
@@ -1092,6 +1126,7 @@ impl MeshNode {
                 node_id: peer_node_id,
                 addr: peer_addr,
                 session,
+                remote_static_pub,
             },
         );
         self.addr_to_node.insert(peer_addr, peer_node_id);
@@ -1677,6 +1712,7 @@ impl MeshNode {
         // Registration happens BEFORE the send so that even if the
         // spawned send task is cancelled or panics post-send, the
         // initiator that just derived matching keys finds us.
+        let remote_static_pub = keys.remote_static_pub;
         let session = Arc::new(NetSession::new(
             keys,
             source,
@@ -1689,6 +1725,7 @@ impl MeshNode {
                 node_id: peer_node_id,
                 addr: source,
                 session,
+                remote_static_pub,
             },
         );
         ctx.peer_addrs.insert(peer_node_id, source);
@@ -4007,6 +4044,7 @@ impl MeshNode {
         // table does the rest. `addr_to_node` is deliberately NOT
         // updated — `relay_addr` still maps to the relay's own node_id
         // for direct-packet dispatch.
+        let remote_static_pub = keys.remote_static_pub;
         let session = Arc::new(NetSession::new(
             keys,
             relay_addr,
@@ -4020,6 +4058,7 @@ impl MeshNode {
                 node_id: dest_node_id,
                 addr: relay_addr,
                 session,
+                remote_static_pub,
             },
         );
         self.peer_addrs.insert(dest_node_id, relay_addr);

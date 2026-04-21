@@ -129,10 +129,33 @@ impl<'de> serde::Deserialize<'de> for EntityId {
 
 /// Entity keypair — ed25519 signing key + public identity.
 ///
-/// This is the root of trust for a node. The signing key must be kept secret.
-/// The `EntityId` (public key) is freely shareable.
+/// This is the root of trust for a node. The signing key must be
+/// kept secret. The `EntityId` (public key) is freely shareable.
+///
+/// # Full vs. public-only
+///
+/// Most keypairs carry both halves: a `SigningKey` (32-byte secret
+/// seed) plus the derived `EntityId`. The migration-target path
+/// may instead receive a **public-only** keypair — same `entity_id`
+/// and `origin_hash`, but with the signing half absent. Public-only
+/// keypairs satisfy every `entity_id` / `origin_hash` / `node_id`
+/// query the mesh does routinely, but refuse to sign. This exists
+/// because a daemon that migrated under "transport_identity = false"
+/// (see `DAEMON_IDENTITY_MIGRATION_PLAN.md`) reaches the target with
+/// its public identity intact but no private material — the plan's
+/// deliberate trade-off for workloads that don't need post-migration
+/// signing capability.
+///
+/// Callers that may receive a public-only keypair should use
+/// [`Self::try_sign`] / [`Self::is_read_only`]; [`Self::sign`]
+/// panics on a public-only keypair because most call sites own a
+/// freshly generated keypair and a silent "signed with zeros"
+/// fallback would be worse than a panic.
 pub struct EntityKeypair {
-    signing_key: SigningKey,
+    /// `None` marks a public-only keypair that was transferred without
+    /// its private half (or whose private half has been explicitly
+    /// [zeroized](Self::zeroize)). `Some(_)` is the normal path.
+    signing_key: Option<SigningKey>,
     entity_id: EntityId,
     /// Cached origin_hash (computed once)
     origin_hash: u32,
@@ -160,7 +183,7 @@ impl EntityKeypair {
         let origin_hash = entity_id.origin_hash();
         let node_id = entity_id.node_id();
         Self {
-            signing_key,
+            signing_key: Some(signing_key),
             entity_id,
             origin_hash,
             node_id,
@@ -171,6 +194,26 @@ impl EntityKeypair {
     pub fn from_bytes(secret: [u8; 32]) -> Self {
         let signing_key = SigningKey::from_bytes(&secret);
         Self::from_signing_key(signing_key)
+    }
+
+    /// Create a public-only keypair — an `EntityId` without its
+    /// signing half. Sign attempts return [`EntityError::ReadOnly`]
+    /// (via [`Self::try_sign`]) or panic (via [`Self::sign`]).
+    ///
+    /// Used by the migration-target path when a caller opts out of
+    /// private-key transport; the daemon keeps its public identity
+    /// (so `origin_hash` stays stable and the causal chain continues)
+    /// but cannot sign new capability announcements or mint new
+    /// permission tokens from the target.
+    pub fn public_only(entity_id: EntityId) -> Self {
+        let origin_hash = entity_id.origin_hash();
+        let node_id = entity_id.node_id();
+        Self {
+            signing_key: None,
+            entity_id,
+            origin_hash,
+            node_id,
+        }
     }
 
     /// Get the entity identity (public key).
@@ -191,33 +234,114 @@ impl EntityKeypair {
         self.node_id
     }
 
-    /// Sign a message.
+    /// `true` iff this keypair has no signing half. Public-only
+    /// keypairs survive every `entity_id` / `origin_hash` query but
+    /// return [`EntityError::ReadOnly`] from [`Self::try_sign`] and
+    /// [`Self::try_secret_bytes`].
     #[inline]
-    pub fn sign(&self, message: &[u8]) -> Signature {
-        self.signing_key.sign(message)
+    pub fn is_read_only(&self) -> bool {
+        self.signing_key.is_none()
     }
 
-    /// Get the raw secret key bytes.
+    /// Sign a message. Panics on a public-only keypair; callers
+    /// that might hold one must use [`Self::try_sign`] instead.
+    ///
+    /// # Panics
+    ///
+    /// If this keypair is public-only (see [`Self::is_read_only`]).
+    #[inline]
+    pub fn sign(&self, message: &[u8]) -> Signature {
+        match &self.signing_key {
+            Some(sk) => sk.sign(message),
+            None => panic!(
+                "EntityKeypair::sign called on public-only keypair — use try_sign \
+                 or check is_read_only() before signing",
+            ),
+        }
+    }
+
+    /// Fallible sign. Returns [`EntityError::ReadOnly`] when this
+    /// keypair is public-only; otherwise delegates to the ed25519
+    /// signing path.
+    #[inline]
+    pub fn try_sign(&self, message: &[u8]) -> Result<Signature, EntityError> {
+        self.signing_key
+            .as_ref()
+            .map(|sk| sk.sign(message))
+            .ok_or(EntityError::ReadOnly)
+    }
+
+    /// Get the raw secret key bytes. Panics on a public-only
+    /// keypair; callers that might hold one must use
+    /// [`Self::try_secret_bytes`].
     ///
     /// Handle with care — this is the root secret.
+    ///
+    /// # Panics
+    ///
+    /// If this keypair is public-only (see [`Self::is_read_only`]).
     pub fn secret_bytes(&self) -> &[u8; 32] {
-        self.signing_key.as_bytes()
+        match &self.signing_key {
+            Some(sk) => sk.as_bytes(),
+            None => panic!(
+                "EntityKeypair::secret_bytes called on public-only keypair — use \
+                 try_secret_bytes or check is_read_only()",
+            ),
+        }
+    }
+
+    /// Fallible `secret_bytes`. Returns [`EntityError::ReadOnly`]
+    /// for public-only keypairs.
+    pub fn try_secret_bytes(&self) -> Result<&[u8; 32], EntityError> {
+        self.signing_key
+            .as_ref()
+            .map(|sk| sk.as_bytes())
+            .ok_or(EntityError::ReadOnly)
+    }
+
+    /// Zeroize the signing half in place, converting this keypair
+    /// into public-only. The `entity_id` / `origin_hash` / `node_id`
+    /// remain available; further `sign` / `secret_bytes` calls go
+    /// down the `try_*` / read-only path.
+    ///
+    /// Called by the migration-source handler after
+    /// `ActivateAck` arrives from the target — the source no longer
+    /// needs to sign on behalf of this daemon, and holding the key
+    /// longer than necessary widens the dual-custody window beyond
+    /// the plan's invariant. Idempotent; second call is a no-op.
+    pub fn zeroize(&mut self) {
+        // `ed25519_dalek::SigningKey` carries `ZeroizeOnDrop`, so
+        // dropping the value we take out of `self.signing_key` runs
+        // the zeroize. The compiler-inserted drop is sufficient; no
+        // explicit `Zeroize::zeroize` needed (and indeed upstream
+        // does not derive the bare `Zeroize` trait on `SigningKey`
+        // in 2.x). Double-zeroize is safe because `Option::take`
+        // leaves `None` behind.
+        let _ = self.signing_key.take();
     }
 }
 
 impl Clone for EntityKeypair {
     fn clone(&self) -> Self {
-        Self::from_signing_key(self.signing_key.clone())
+        match &self.signing_key {
+            Some(sk) => Self::from_signing_key(sk.clone()),
+            None => Self::public_only(self.entity_id.clone()),
+        }
     }
 }
 
 impl std::fmt::Debug for EntityKeypair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let secret_marker = if self.signing_key.is_some() {
+            "[REDACTED]"
+        } else {
+            "[PUBLIC-ONLY]"
+        };
         f.debug_struct("EntityKeypair")
             .field("entity_id", &self.entity_id)
             .field("origin_hash", &format!("{:08x}", self.origin_hash))
             .field("node_id", &format!("{:016x}", self.node_id))
-            .field("secret", &"[REDACTED]")
+            .field("secret", &secret_marker)
             .finish()
     }
 }
@@ -229,6 +353,11 @@ pub enum EntityError {
     InvalidPublicKey,
     /// Signature verification failed.
     InvalidSignature,
+    /// Operation requires the signing half of the keypair, but this
+    /// keypair is public-only — either constructed via
+    /// [`EntityKeypair::public_only`] or zeroized via
+    /// [`EntityKeypair::zeroize`].
+    ReadOnly,
 }
 
 impl std::fmt::Display for EntityError {
@@ -236,6 +365,7 @@ impl std::fmt::Display for EntityError {
         match self {
             Self::InvalidPublicKey => write!(f, "invalid public key"),
             Self::InvalidSignature => write!(f, "invalid signature"),
+            Self::ReadOnly => write!(f, "keypair is public-only; signing is not available"),
         }
     }
 }
@@ -345,5 +475,90 @@ mod tests {
         // Should be hex prefix + "..."
         assert!(display.ends_with("..."));
         assert!(display.len() > 4);
+    }
+
+    // ---- Public-only + zeroize (Stage 2 of DAEMON_IDENTITY_MIGRATION_PLAN) ----
+
+    #[test]
+    fn public_only_preserves_identity_queries() {
+        let full = EntityKeypair::generate();
+        let public = EntityKeypair::public_only(full.entity_id().clone());
+        assert_eq!(public.entity_id(), full.entity_id());
+        assert_eq!(public.origin_hash(), full.origin_hash());
+        assert_eq!(public.node_id(), full.node_id());
+        assert!(public.is_read_only());
+        assert!(!full.is_read_only());
+    }
+
+    #[test]
+    fn public_only_try_sign_returns_read_only() {
+        let public = EntityKeypair::public_only(EntityKeypair::generate().entity_id().clone());
+        let err = public.try_sign(b"payload").expect_err("must refuse");
+        assert_eq!(err, EntityError::ReadOnly);
+    }
+
+    #[test]
+    fn public_only_try_secret_bytes_returns_read_only() {
+        let public = EntityKeypair::public_only(EntityKeypair::generate().entity_id().clone());
+        let err = public.try_secret_bytes().expect_err("must refuse");
+        assert_eq!(err, EntityError::ReadOnly);
+    }
+
+    #[test]
+    #[should_panic(expected = "public-only keypair")]
+    fn public_only_sign_panics() {
+        let public = EntityKeypair::public_only(EntityKeypair::generate().entity_id().clone());
+        let _ = public.sign(b"payload");
+    }
+
+    #[test]
+    #[should_panic(expected = "public-only keypair")]
+    fn public_only_secret_bytes_panics() {
+        let public = EntityKeypair::public_only(EntityKeypair::generate().entity_id().clone());
+        let _ = public.secret_bytes();
+    }
+
+    #[test]
+    fn zeroize_converts_full_to_public_only() {
+        let mut kp = EntityKeypair::generate();
+        let entity_before = kp.entity_id().clone();
+        assert!(!kp.is_read_only());
+        // Sanity: signing works pre-zeroize.
+        let sig = kp.try_sign(b"pre").expect("full keypair signs");
+        assert!(entity_before.verify(b"pre", &sig).is_ok());
+
+        kp.zeroize();
+        assert!(kp.is_read_only());
+        assert_eq!(kp.entity_id(), &entity_before);
+        assert_eq!(
+            kp.try_sign(b"post").expect_err("post-zeroize signing must fail"),
+            EntityError::ReadOnly,
+        );
+    }
+
+    #[test]
+    fn zeroize_is_idempotent() {
+        let mut kp = EntityKeypair::generate();
+        kp.zeroize();
+        kp.zeroize();
+        assert!(kp.is_read_only());
+    }
+
+    #[test]
+    fn try_sign_on_full_keypair_matches_sign() {
+        let kp = EntityKeypair::generate();
+        let try_sig = kp.try_sign(b"m").expect("try_sign");
+        let plain_sig = kp.sign(b"m");
+        // Ed25519 is deterministic — identical inputs produce
+        // identical signatures.
+        assert_eq!(try_sig.to_bytes(), plain_sig.to_bytes());
+    }
+
+    #[test]
+    fn clone_of_public_only_is_public_only() {
+        let public = EntityKeypair::public_only(EntityKeypair::generate().entity_id().clone());
+        let cloned = public.clone();
+        assert!(cloned.is_read_only());
+        assert_eq!(cloned.entity_id(), public.entity_id());
     }
 }

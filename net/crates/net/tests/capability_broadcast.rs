@@ -105,6 +105,49 @@ where
     cond(node)
 }
 
+/// After an NKpsk0 handshake, only the initiator learns the peer's
+/// Noise static pubkey — the pattern has no `-> s` leg, so the
+/// responder never sees the initiator's static. `peer_static_x25519`
+/// reflects exactly what snow exposes: `Some(pub)` on the initiator
+/// side, `None` on the responder side. The identity-envelope path
+/// uses this to seal to the target when the source was the
+/// initiator; the Stage 5 wiring handles the responder-side case
+/// by refusing to transport identity when the static is unknown
+/// (migration falls back to `public_only` identity).
+#[tokio::test]
+async fn peer_static_x25519_returns_peer_noise_pubkey_after_handshake() {
+    let ports = find_ports(2).await;
+    let a = build_node(ports[0]).await;
+    let b = build_node(ports[1]).await;
+    handshake(&a, &b).await;
+
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+
+    // Initiator side: A learns B's static from the out-of-band
+    // pubkey it handed to `connect()`, surfaced post-handshake by
+    // snow's `get_remote_static`.
+    assert_eq!(
+        a.peer_static_x25519(b_id),
+        Some(*b.public_key()),
+        "initiator (A) should recover B's Noise static pubkey",
+    );
+
+    // Responder side: NKpsk0 has no `-> s`, so snow has no remote
+    // static to return. Documented limitation of the current
+    // pattern; Stage 5 of the identity-migration plan plans around
+    // this by requiring the migration source to have initiated the
+    // session to the target (or by falling back to public-only
+    // identity transport).
+    assert!(
+        b.peer_static_x25519(a_id).is_none(),
+        "responder (B) should see None under NKpsk0 — pattern discloses only -> e",
+    );
+
+    // No session with an unknown node_id — return None, not zeros.
+    assert!(a.peer_static_x25519(0xDEAD_BEEF_CAFE_F00D).is_none());
+}
+
 #[tokio::test]
 async fn two_node_announce_is_visible() {
     let ports = find_ports(2).await;
