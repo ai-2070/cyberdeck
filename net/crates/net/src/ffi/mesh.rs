@@ -1490,7 +1490,9 @@ pub extern "C" fn net_verify_token(token: *const u8, len: usize, out_ok: *mut c_
 }
 
 /// Writes `1` to `*out_expired` if the token's `not_after` has
-/// passed; `0` otherwise.
+/// passed; `0` otherwise. Pure time check — a tampered-but-expired
+/// token still reports `1`. Use `net_verify_token` for signature
+/// integrity.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_token_is_expired(
     token: *const u8,
@@ -1506,10 +1508,7 @@ pub extern "C" fn net_token_is_expired(
         Err(e) => return token_err_to_code(&e),
     };
     unsafe {
-        *out_expired = match parsed.is_valid() {
-            Err(CoreTokenError::Expired) => 1,
-            _ => 0,
-        };
+        *out_expired = if parsed.is_expired() { 1 } else { 0 };
     }
     0
 }

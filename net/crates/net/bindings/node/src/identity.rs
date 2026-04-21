@@ -326,10 +326,12 @@ pub fn verify_token(bytes: Buffer) -> Result<bool> {
 
 /// `true` if the token's `not_after` has passed. Uses the host
 /// wall-clock; cross-check against trusted time if that matters.
+/// Pure time check — a tampered-but-expired token still reports
+/// true. Use `verifyToken` for signature integrity.
 #[napi]
 pub fn token_is_expired(bytes: Buffer) -> Result<bool> {
     let token = PermissionToken::from_bytes(bytes.as_ref()).map_err(map_token_err)?;
-    Ok(matches!(token.is_valid(), Err(TokenError::Expired)))
+    Ok(token.is_expired())
 }
 
 /// Delegate a token to a new subject. The `parent_bytes` token must

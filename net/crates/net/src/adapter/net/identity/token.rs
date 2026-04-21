@@ -180,6 +180,18 @@ impl PermissionToken {
         Ok(())
     }
 
+    /// Pure time-bound check: `true` iff the host wall-clock is
+    /// past `not_after`. Deliberately **does not** touch the
+    /// signature — callers wanting end-to-end validity use
+    /// [`Self::is_valid`], and signature integrity alone is
+    /// [`Self::verify`]. This separation matters because a
+    /// tampered-but-expired token is still expired, and every
+    /// binding's `token_is_expired` helper documents itself as a
+    /// pure time check.
+    pub fn is_expired(&self) -> bool {
+        current_timestamp() > self.not_after
+    }
+
     /// Check if this token authorizes a specific action on a channel.
     pub fn authorizes(&self, action: TokenScope, channel: u16) -> bool {
         if !self.scope.contains(action) {
@@ -496,6 +508,65 @@ mod tests {
         assert!(token.verify().is_ok()); // signature is valid
                                          // Token may or may not be expired depending on timing,
                                          // but with duration 0 and not_after = now, it's borderline
+    }
+
+    /// Regression for a cubic-flagged bug that hit every FFI binding:
+    /// `token_is_expired` used to call `is_valid()` and match on
+    /// `Err(Expired)`, which short-circuited on signature failure.
+    /// A tampered + expired token therefore returned `false` ("not
+    /// expired") even though the wall-clock was past `not_after`.
+    /// `is_expired()` must be a pure time check, independent of the
+    /// signature.
+    #[test]
+    fn is_expired_ignores_signature_tampering() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+
+        // Fresh token — not expired.
+        let mut token = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0,
+            3600,
+            0,
+        );
+        assert!(!token.is_expired(), "fresh token is not expired");
+
+        // Construct the bug scenario: backdate `not_after` into the
+        // past AND flip a byte in the signature. In practice a
+        // tampered packet would arrive over the wire; here we
+        // mutate in place so the test doesn't depend on sleeps.
+        // Both mutations land outside what `verify()` recomputes —
+        // not_after is part of the signed payload, so verify() is
+        // already going to fail; the point is that `is_expired()`
+        // doesn't care.
+        token.not_after = 0;
+        token.signature[0] ^= 0xFF;
+
+        // Signature fails (expected).
+        assert!(
+            token.verify().is_err(),
+            "mutated payload / signature must fail verify",
+        );
+
+        // Pre-fix pattern: `matches!(is_valid(), Err(Expired))`.
+        // `is_valid()` short-circuits on the signature failure and
+        // returns `Err(InvalidSignature)`, so the match returns
+        // false — this is exactly the bug Cubic flagged.
+        assert!(
+            !matches!(token.is_valid(), Err(TokenError::Expired)),
+            "captures the pre-fix pattern: is_valid() short-circuits \
+             on signature, never reaches the time check",
+        );
+
+        // Post-fix: `is_expired()` compares time directly and
+        // reports `true` regardless of signature state.
+        assert!(
+            token.is_expired(),
+            "is_expired() must be a pure time check, independent \
+             of signature validity",
+        );
     }
 
     #[test]

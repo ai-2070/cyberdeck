@@ -139,6 +139,37 @@ def test_token_is_expired_false_for_fresh_token() -> None:
     assert token_is_expired(token) is False
 
 
+def test_token_is_expired_reports_expired_even_when_signature_tampered() -> None:
+    # Regression for a cubic-flagged bug: the previous impl walked
+    # `is_valid()` (signature + time) and matched on Err(Expired),
+    # which short-circuited on the signature check. A tampered +
+    # expired token therefore returned False ("not expired") even
+    # though wall-clock was past `not_after`. The docstring says
+    # `token_is_expired` is a pure time check — this regression
+    # locks that contract in.
+    import time
+
+    issuer = Identity.generate()
+    subject = Identity.generate()
+    # 1-second TTL so the test doesn't wait long.
+    token = bytearray(
+        issuer.issue_token(
+            subject.entity_id, ["publish"], "topic", ttl_seconds=1
+        )
+    )
+    # Tamper the signature.
+    token[-1] ^= 0xFF
+
+    # Wait past the TTL.
+    time.sleep(1.3)
+
+    # Pure time check — tampered-but-expired must report True.
+    assert token_is_expired(bytes(token)) is True, (
+        "token_is_expired must be a pure time check; short-circuiting "
+        "on signature validity is the cubic-flagged bug"
+    )
+
+
 def test_issue_token_rejects_unknown_scope() -> None:
     issuer = Identity.generate()
     subject = Identity.generate()

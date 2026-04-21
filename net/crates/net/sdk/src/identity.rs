@@ -196,8 +196,12 @@ impl Identity {
     }
 }
 
-impl Default for Identity {
-    fn default() -> Self {
-        Self::generate()
-    }
-}
+// NOTE: `Identity` deliberately does NOT implement `Default`.
+// Returning a fresh random keypair from `default()` would be a
+// footgun — any `unwrap_or_default()` or `#[derive(Default)]` on a
+// struct containing `Identity` would silently spin up a throwaway
+// identity, bypassing the explicit `generate()` / `from_seed()`
+// constructors where the docs warn about secret-material handling.
+// Callers who want a random identity must call
+// [`Identity::generate`] directly; callers restoring from a seed
+// call [`Identity::from_seed`].

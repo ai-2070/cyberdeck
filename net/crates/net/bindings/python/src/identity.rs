@@ -296,10 +296,12 @@ pub fn verify_token(token: &[u8]) -> PyResult<bool> {
 }
 
 /// `True` if the token's `not_after` has passed (host wall-clock).
+/// Pure time check — a tampered-but-expired token still reports
+/// true. Use :func:`verify_token` for signature integrity.
 #[pyfunction]
 pub fn token_is_expired(token: &[u8]) -> PyResult<bool> {
     let parsed = PermissionToken::from_bytes(token).map_err(token_err)?;
-    Ok(matches!(parsed.is_valid(), Err(CoreTokenError::Expired)))
+    Ok(parsed.is_expired())
 }
 
 /// Delegate a token to a new subject. The `parent` token must

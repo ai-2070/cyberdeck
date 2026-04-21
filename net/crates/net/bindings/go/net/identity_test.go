@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -242,6 +243,41 @@ func TestTokenIsExpired_FalseForFresh(t *testing.T) {
 	}
 	if expired {
 		t.Fatal("fresh token reported as expired")
+	}
+}
+
+// Regression for a cubic-flagged bug: the previous impl walked
+// `PermissionToken::is_valid()` and matched on Err(Expired), which
+// short-circuits on signature check. A tampered + expired token
+// therefore reported NOT expired. TokenIsExpired is documented as
+// a pure time check; this test locks that in.
+func TestTokenIsExpired_ReportsExpiredEvenWhenSignatureTampered(t *testing.T) {
+	issuer, _ := GenerateIdentity()
+	defer issuer.Close()
+	subject, _ := GenerateIdentity()
+	defer subject.Close()
+
+	subID, _ := subject.EntityID()
+	// 1-second TTL so the test doesn't wait long.
+	raw := issueTestToken(t, issuer, subID, []string{"publish"}, "topic", 1, 0)
+	token := make([]byte, len(raw))
+	copy(token, raw)
+	// Tamper the signature byte.
+	token[len(token)-1] ^= 0xFF
+
+	// Wait past TTL.
+	time.Sleep(1300 * time.Millisecond)
+
+	expired, err := TokenIsExpired(token)
+	if err != nil {
+		t.Fatalf("is expired: %v", err)
+	}
+	if !expired {
+		t.Fatal(
+			"TokenIsExpired must be a pure time check; " +
+				"short-circuiting on signature validity is the " +
+				"cubic-flagged bug",
+		)
 	}
 }
 
