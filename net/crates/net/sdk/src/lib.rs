@@ -35,6 +35,8 @@
 //! ```
 
 pub mod config;
+#[cfg(feature = "compute")]
+pub mod compute;
 #[cfg(feature = "cortex")]
 pub mod cortex;
 pub mod error;
@@ -95,6 +97,14 @@ pub use ::net::adapter::net::{
 
 #[cfg(feature = "net")]
 pub use crate::mesh::{Mesh, MeshBuilder, SubscribeOptions};
+
+// Compute surface — `MeshDaemon` trait + runtime. Gated by the
+// `compute` feature (which depends on `net`).
+#[cfg(feature = "compute")]
+pub use crate::compute::{
+    CausalEvent, CausalLink, DaemonError as ComputeDaemonError, DaemonHandle, DaemonHostConfig,
+    DaemonRuntime, DaemonStats, MeshDaemon, StateSnapshot,
+};
 
 // Convenience re-exports for the common security types, so users can
 // `use net_sdk::{Identity, TokenScope};` without reaching for a
