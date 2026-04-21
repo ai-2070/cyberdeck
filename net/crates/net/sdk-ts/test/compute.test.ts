@@ -14,6 +14,7 @@ import {
   DaemonRuntime,
   Identity,
   MeshNode,
+  MigrationHandle,
 } from '../src';
 
 const PSK = '42'.repeat(32);
@@ -747,6 +748,91 @@ describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', ()
     const h5 = await rt.spawnFromSnapshot('counter', id, snapAt5!);
     const out5 = await rt.deliver(h5.originHash, evt(7n));
     expect(out5[0].readUInt32LE(0)).toBe(6);
+  });
+
+  it('startMigration on an unknown origin rejects with DaemonError', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+    rt.registerFactory('counter', counterFactory());
+    await rt.start();
+
+    const selfId = mesh.nodeId();
+    await expect(
+      rt.startMigration(0xdeadbeef, selfId, selfId),
+    ).rejects.toThrow(DaemonError);
+  });
+
+  it('startMigration before runtime is Ready rejects with DaemonError', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+    rt.registerFactory('counter', counterFactory());
+    // Intentionally skip rt.start() — runtime stays in Registering.
+
+    const id = Identity.generate();
+    await expect(
+      rt.startMigration(id.originHash, mesh.nodeId(), mesh.nodeId()),
+    ).rejects.toThrow(DaemonError);
+  });
+
+  it('startMigrationWith transportIdentity=false produces a handle to a connected peer', async () => {
+    // Full two-mesh pair: connect A <-> B, spawn on A, and
+    // initiate a migration A → B. The target has no pre-registered
+    // factory for this origin_hash, so the migration will fail on
+    // the target's dispatcher, but start_migration on the source
+    // only needs the target peer to be reachable and the envelope
+    // skippable — both covered by `transportIdentity: false`.
+    const [aAddr, bAddr] = [`127.0.0.1:${portSeed++}`, `127.0.0.1:${portSeed++}`];
+    const a = await MeshNode.create({ bindAddr: aAddr, psk: PSK });
+    cleanups.push(() => a.shutdown());
+    const b = await MeshNode.create({ bindAddr: bAddr, psk: PSK });
+    cleanups.push(() => b.shutdown());
+    // Handshake A <-> B so they appear in each other's peer tables.
+    await Promise.all([
+      b.accept(a.nodeId()),
+      (async () => {
+        await new Promise((r) => setTimeout(r, 50));
+        await a.connect(bAddr, b.publicKey(), b.nodeId());
+      })(),
+    ]);
+    await a.start();
+    await b.start();
+
+    const rtA = DaemonRuntime.create(a);
+    cleanups.push(() => rtA.shutdown());
+    rtA.registerFactory('counter', counterFactory());
+    await rtA.start();
+
+    const id = Identity.generate();
+    const spawn = await rtA.spawn('counter', id);
+
+    const mig = await rtA.startMigrationWith(
+      spawn.originHash,
+      a.nodeId(),
+      b.nodeId(),
+      { transportIdentity: false, retryNotReadyMs: 0n },
+    );
+    expect(mig).toBeInstanceOf(MigrationHandle);
+    expect(mig.originHash).toBe(spawn.originHash);
+    expect(mig.sourceNode).toBe(a.nodeId());
+    expect(mig.targetNode).toBe(b.nodeId());
+    // Phase is a string right after start (before orchestrator
+    // cleanup) or null if the migration already resolved terminally.
+    const p = mig.phase();
+    expect(p === null || typeof p === 'string').toBe(true);
+
+    // Clean up — the migration will fail on B (no factory for this
+    // origin_hash on the target), so wait() would reject. We just
+    // cancel and move on.
+    try {
+      await mig.cancel();
+    } catch {
+      // Already-terminated record — cancel may surface
+      // `no such migration`. That's fine for this smoke test.
+    }
   });
 
   // Plan exit criterion: spawn/stop 1000 daemons in a loop, heap

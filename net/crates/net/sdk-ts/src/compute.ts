@@ -31,6 +31,7 @@
 import {
   DaemonRuntime as NapiDaemonRuntime,
   DaemonHandle as NapiDaemonHandle,
+  MigrationHandle as NapiMigrationHandle,
 } from '@ai2070/net';
 
 import { Identity } from './identity.js';
@@ -60,6 +61,40 @@ function toDaemonError(e: unknown): never {
     throw new DaemonError(msg.slice('daemon:'.length).trim());
   }
   throw e;
+}
+
+/**
+ * Phase a migration is currently in. Order is monotonic:
+ * `snapshot` → `transfer` → `restore` → `replay` → `cutover` →
+ * `complete`. Once complete (or aborted), the orchestrator drops
+ * its record and {@link MigrationHandle.phase} returns `null`.
+ */
+export type MigrationPhase =
+  | 'snapshot'
+  | 'transfer'
+  | 'restore'
+  | 'replay'
+  | 'cutover'
+  | 'complete';
+
+/**
+ * Options for {@link DaemonRuntime.startMigrationWith}. Omit any
+ * field to take the runtime default.
+ */
+export interface MigrationOptions {
+  /**
+   * Seal the daemon's ed25519 seed into the outbound snapshot so
+   * the target keeps full signing capability. Default `true`;
+   * set `false` for pure compute daemons that only consume events
+   * and don't need to sign anything on the target.
+   */
+  readonly transportIdentity?: boolean;
+  /**
+   * Retry budget for `NotReady` targets, in milliseconds. Default
+   * 30_000 (30 s). Pass `0` to disable retry — the first
+   * `NotReady` surfaces as a terminal failure.
+   */
+  readonly retryNotReadyMs?: bigint;
 }
 
 // ----------------------------------------------------------------------------
@@ -190,6 +225,97 @@ export class DaemonHandle {
       return this.inner.stats();
     } catch (e) {
       return toDaemonError(e);
+    }
+  }
+}
+
+// ----------------------------------------------------------------------------
+// MigrationHandle — observe and abort an in-flight migration.
+// ----------------------------------------------------------------------------
+
+/**
+ * Handle to an in-flight migration. Returned by
+ * {@link DaemonRuntime.startMigration} /
+ * {@link DaemonRuntime.startMigrationWith}.
+ *
+ * Dropping the handle does NOT cancel the migration — the
+ * orchestrator keeps driving it to completion in the background.
+ * Keep the handle to observe phase transitions or request abort.
+ */
+export class MigrationHandle {
+  private readonly inner: NapiMigrationHandle;
+
+  /** @internal */
+  constructor(inner: NapiMigrationHandle) {
+    this.inner = inner;
+  }
+
+  /** 32-bit origin hash of the daemon being migrated. */
+  get originHash(): number {
+    return this.inner.originHash;
+  }
+
+  /** Node ID of the source (currently hosting) node. */
+  get sourceNode(): bigint {
+    return this.inner.sourceNode;
+  }
+
+  /** Node ID of the target (post-cutover) node. */
+  get targetNode(): bigint {
+    return this.inner.targetNode;
+  }
+
+  /**
+   * Current migration phase, or `null` once the migration has
+   * left the orchestrator's records (terminal success or abort).
+   * Callers distinguish success from abort by remembering the
+   * last non-null phase they observed.
+   */
+  phase(): MigrationPhase | null {
+    const p = this.inner.phase();
+    return (p as MigrationPhase | null) ?? null;
+  }
+
+  /**
+   * Block until the migration reaches a terminal state. Resolves
+   * on `complete`; rejects with {@link DaemonError} on abort or
+   * structured failure (target unavailable, restore failed, etc.).
+   *
+   * No wall-clock timeout — a migration stalled against an
+   * unresponsive peer blocks indefinitely. Use
+   * {@link MigrationHandle.waitWithTimeout} for a bound.
+   */
+  async wait(): Promise<void> {
+    try {
+      await this.inner.wait();
+    } catch (e) {
+      toDaemonError(e);
+    }
+  }
+
+  /**
+   * Like {@link wait} with a caller-controlled timeout (in
+   * milliseconds). On timeout the orchestrator record is aborted
+   * and the promise rejects with {@link DaemonError}.
+   */
+  async waitWithTimeout(timeoutMs: bigint): Promise<void> {
+    try {
+      await this.inner.waitWithTimeout(timeoutMs);
+    } catch (e) {
+      toDaemonError(e);
+    }
+  }
+
+  /**
+   * Request cancellation of the migration. Best-effort: past
+   * `cutover` the routing flip cannot be undone cleanly, and
+   * this call resolves without aborting.
+   */
+  async cancel(): Promise<void> {
+    try {
+      await this.inner.cancel();
+    } catch (e) {
+      toDaemonError(e);
     }
   }
 }
@@ -502,6 +628,65 @@ export class DaemonRuntime {
         sequence: event.sequence,
         payload: event.payload,
       });
+    } catch (e) {
+      return toDaemonError(e);
+    }
+  }
+
+  /**
+   * Initiate a migration for the daemon identified by
+   * `originHash`, moving it from `sourceNode` to `targetNode`.
+   *
+   * Returns a {@link MigrationHandle} whose `wait()` resolves
+   * when the migration reaches a terminal state. On local-source
+   * migrations (`sourceNode === mesh.nodeId`) the snapshot is
+   * taken synchronously inside this call; on remote-source
+   * migrations the orchestrator drives the state machine via
+   * inbound wire messages.
+   *
+   * Both node IDs are `u64` — pass as `bigint` to avoid silent
+   * precision loss past 2^53.
+   */
+  async startMigration(
+    originHash: number,
+    sourceNode: bigint,
+    targetNode: bigint,
+  ): Promise<MigrationHandle> {
+    try {
+      const handle = await this.inner.startMigration(
+        originHash,
+        sourceNode,
+        targetNode,
+      );
+      return new MigrationHandle(handle);
+    } catch (e) {
+      return toDaemonError(e);
+    }
+  }
+
+  /**
+   * {@link startMigration} with caller-supplied options. Use this
+   * to opt out of identity transport (when the daemon doesn't
+   * need to sign on the target) or to tune the NotReady-retry
+   * budget.
+   */
+  async startMigrationWith(
+    originHash: number,
+    sourceNode: bigint,
+    targetNode: bigint,
+    opts: MigrationOptions,
+  ): Promise<MigrationHandle> {
+    try {
+      const handle = await this.inner.startMigrationWith(
+        originHash,
+        sourceNode,
+        targetNode,
+        {
+          transportIdentity: opts.transportIdentity,
+          retryNotReadyMs: opts.retryNotReadyMs,
+        },
+      );
+      return new MigrationHandle(handle);
     } catch (e) {
       return toDaemonError(e);
     }

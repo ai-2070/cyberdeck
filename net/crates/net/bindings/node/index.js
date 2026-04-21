@@ -582,6 +582,7 @@ module.exports.Identity = nativeBinding.Identity
 module.exports.MemoriesAdapter = nativeBinding.MemoriesAdapter
 module.exports.MemoriesSnapshotAndWatch = nativeBinding.MemoriesSnapshotAndWatch
 module.exports.MemoryWatchIter = nativeBinding.MemoryWatchIter
+module.exports.MigrationHandle = nativeBinding.MigrationHandle
 module.exports.Net = nativeBinding.Net
 module.exports.NetDb = nativeBinding.NetDb
 module.exports.NetMesh = nativeBinding.NetMesh

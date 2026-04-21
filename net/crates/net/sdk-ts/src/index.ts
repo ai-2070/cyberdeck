@@ -117,13 +117,21 @@ export type {
 export { subnetId, GLOBAL_SUBNET } from './subnets';
 export type { SubnetId, SubnetRule, SubnetPolicy } from './subnets';
 
-// Compute (daemons + migration — Stage 3).
-export { DaemonRuntime, DaemonHandle, DaemonError } from './compute';
+// Compute (daemons + migration — Stage 3 + 4).
+export {
+  DaemonRuntime,
+  DaemonHandle,
+  DaemonError,
+  MigrationHandle,
+} from './compute';
 export type {
   CausalEvent,
   MeshDaemon,
   DaemonFactory,
   DaemonHostConfig,
+  DaemonStats,
+  MigrationPhase,
+  MigrationOptions,
 } from './compute';
 
 // Types.

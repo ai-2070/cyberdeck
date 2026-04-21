@@ -32,7 +32,9 @@ use net::adapter::net::behavior::capability::CapabilityFilter;
 use net::adapter::net::compute::{DaemonError as CoreDaemonError, DaemonHostConfig, MeshDaemon};
 use net::adapter::net::state::causal::CausalEvent;
 use net_sdk::compute::{
-    DaemonHandle as SdkDaemonHandle, DaemonRuntime as SdkDaemonRuntime, StateSnapshot,
+    DaemonHandle as SdkDaemonHandle, DaemonRuntime as SdkDaemonRuntime,
+    MigrationHandle as SdkMigrationHandle, MigrationOpts, MigrationPhase as CoreMigrationPhase,
+    StateSnapshot,
 };
 use net_sdk::mesh::Mesh as SdkMesh;
 
@@ -499,6 +501,221 @@ impl DaemonRuntime {
             .map(|ev| Buffer::from(ev.payload.as_ref()))
             .collect())
     }
+
+    /// Initiate a migration for the daemon identified by
+    /// `originHash`, moving it from `sourceNode` to `targetNode`.
+    ///
+    /// Returns a [`MigrationHandle`] whose `wait()` resolves when
+    /// the migration reaches a terminal state — `Complete` on
+    /// success, or throws a `DaemonError` on abort / failure.
+    ///
+    /// `sourceNode` / `targetNode` are `u64` node IDs (the hash of
+    /// each node's static pubkey); pass them as `BigInt` to avoid
+    /// silent precision loss past 2^53.
+    ///
+    /// **Local-source migration** — the common case where
+    /// `sourceNode` is the current node — snapshots synchronously
+    /// and ships `SnapshotReady` to the target. Remote-source
+    /// migrations drive the state machine entirely via inbound
+    /// wire messages.
+    #[napi]
+    pub async fn start_migration(
+        &self,
+        origin_hash: u32,
+        source_node: BigInt,
+        target_node: BigInt,
+    ) -> Result<MigrationHandle> {
+        let (_, source, _) = source_node.get_u64();
+        let (_, target, _) = target_node.get_u64();
+        let handle = self
+            .inner
+            .start_migration(origin_hash, source, target)
+            .await
+            .map_err(|e| daemon_err(e.to_string()))?;
+        Ok(MigrationHandle::from_sdk(handle))
+    }
+
+    /// `startMigration` with caller-supplied options. Use this to
+    /// opt out of identity transport (when the daemon doesn't need
+    /// to sign on the target) or to disable / shorten the
+    /// NotReady-retry budget.
+    #[napi]
+    pub async fn start_migration_with(
+        &self,
+        origin_hash: u32,
+        source_node: BigInt,
+        target_node: BigInt,
+        opts: MigrationOptsJs,
+    ) -> Result<MigrationHandle> {
+        let (_, source, _) = source_node.get_u64();
+        let (_, target, _) = target_node.get_u64();
+        let handle = self
+            .inner
+            .start_migration_with(origin_hash, source, target, opts.into())
+            .await
+            .map_err(|e| daemon_err(e.to_string()))?;
+        Ok(MigrationHandle::from_sdk(handle))
+    }
+}
+
+// =========================================================================
+// MigrationOpts POJO — mirrors the SDK struct
+// =========================================================================
+
+/// Options for `startMigrationWith`. All fields optional — omit to
+/// take the runtime default.
+///
+/// See [`MigrationOpts`] on the Rust side for the full semantics of
+/// each field.
+#[napi(object)]
+pub struct MigrationOptsJs {
+    /// Seal the daemon's ed25519 seed into the outbound snapshot
+    /// so the target keeps full signing capability. Default
+    /// `true`; set `false` for pure compute daemons that only
+    /// consume events.
+    pub transport_identity: Option<bool>,
+    /// Retry budget for `NotReady` targets, in milliseconds.
+    /// Default 30_000 (30 s). Pass `0` to disable retry — the
+    /// first `NotReady` surfaces as a terminal failure.
+    pub retry_not_ready_ms: Option<BigInt>,
+}
+
+impl From<MigrationOptsJs> for MigrationOpts {
+    fn from(js: MigrationOptsJs) -> Self {
+        let mut opts = MigrationOpts::default();
+        if let Some(t) = js.transport_identity {
+            opts.transport_identity = t;
+        }
+        if let Some(ms_bi) = js.retry_not_ready_ms {
+            let (_, ms, _) = ms_bi.get_u64();
+            opts.retry_not_ready = if ms == 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_millis(ms))
+            };
+        }
+        opts
+    }
+}
+
+// =========================================================================
+// MigrationHandle — NAPI class wrapping the SDK handle
+// =========================================================================
+
+/// Handle to an in-flight migration. Created by
+/// [`DaemonRuntime::start_migration`] /
+/// [`DaemonRuntime::start_migration_with`]; cloneable (shares
+/// state) and cheap to pass across async boundaries.
+///
+/// Dropping the handle does NOT cancel the migration — the
+/// orchestrator keeps driving it to completion in the background.
+/// Callers who want to observe or abort must hold onto the handle.
+#[napi]
+pub struct MigrationHandle {
+    origin_hash: u32,
+    source_node: u64,
+    target_node: u64,
+    inner: SdkMigrationHandle,
+}
+
+impl MigrationHandle {
+    fn from_sdk(handle: SdkMigrationHandle) -> Self {
+        Self {
+            origin_hash: handle.origin_hash,
+            source_node: handle.source_node,
+            target_node: handle.target_node,
+            inner: handle,
+        }
+    }
+}
+
+#[napi]
+impl MigrationHandle {
+    /// 32-bit origin hash of the daemon being migrated.
+    #[napi(getter)]
+    pub fn origin_hash(&self) -> u32 {
+        self.origin_hash
+    }
+
+    /// Node ID of the source (currently hosting) node. BigInt to
+    /// match the u64 hash without precision loss.
+    #[napi(getter)]
+    pub fn source_node(&self) -> BigInt {
+        BigInt::from(self.source_node)
+    }
+
+    /// Node ID of the target (post-cutover) node.
+    #[napi(getter)]
+    pub fn target_node(&self) -> BigInt {
+        BigInt::from(self.target_node)
+    }
+
+    /// Current migration phase as a string:
+    /// `'snapshot' | 'transfer' | 'restore' | 'replay' | 'cutover' | 'complete'`,
+    /// or `null` once the migration has left the orchestrator's
+    /// records (terminal success or abort). Callers distinguish
+    /// success from abort by remembering the last non-null phase.
+    #[napi]
+    pub fn phase(&self) -> Option<String> {
+        self.inner.phase().map(migration_phase_str)
+    }
+
+    /// Block until the migration reaches a terminal state. Resolves
+    /// void on normal completion (saw `Complete`, then the
+    /// orchestrator cleaned up); rejects with `DaemonError`
+    /// carrying the failure reason otherwise.
+    ///
+    /// No wall-clock timeout — a migration stalled against an
+    /// unresponsive peer will block indefinitely. Callers that
+    /// need a bound should use [`MigrationHandle::wait_with_timeout`].
+    #[napi]
+    pub async fn wait(&self) -> Result<()> {
+        // Clone because SDK's `wait(self)` consumes the handle; we
+        // want the JS-side handle to stay usable for e.g. `phase()`
+        // polling after wait returns.
+        self.inner
+            .clone()
+            .wait()
+            .await
+            .map_err(|e| daemon_err(e.to_string()))
+    }
+
+    /// Like [`wait`] with a caller-controlled timeout. On timeout
+    /// the orchestrator record is aborted and the promise rejects
+    /// with a `DaemonError` describing the stall.
+    #[napi]
+    pub async fn wait_with_timeout(&self, timeout_ms: BigInt) -> Result<()> {
+        let (_, ms, _) = timeout_ms.get_u64();
+        self.inner
+            .clone()
+            .wait_with_timeout(std::time::Duration::from_millis(ms))
+            .await
+            .map_err(|e| daemon_err(e.to_string()))
+    }
+
+    /// Request cancellation of the migration. Best-effort: a
+    /// migration that has already passed `Cutover` cannot be
+    /// cleanly undone (routing has flipped), and this call resolves
+    /// without aborting.
+    #[napi]
+    pub async fn cancel(&self) -> Result<()> {
+        self.inner
+            .cancel()
+            .await
+            .map_err(|e| daemon_err(e.to_string()))
+    }
+}
+
+fn migration_phase_str(phase: CoreMigrationPhase) -> String {
+    match phase {
+        CoreMigrationPhase::Snapshot => "snapshot",
+        CoreMigrationPhase::Transfer => "transfer",
+        CoreMigrationPhase::Restore => "restore",
+        CoreMigrationPhase::Replay => "replay",
+        CoreMigrationPhase::Cutover => "cutover",
+        CoreMigrationPhase::Complete => "complete",
+    }
+    .to_string()
 }
 
 // =========================================================================

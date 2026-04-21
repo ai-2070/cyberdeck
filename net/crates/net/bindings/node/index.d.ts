@@ -172,6 +172,32 @@ export declare class DaemonRuntime {
    * sugar rather than the primary entry point.
    */
   deliver(originHash: number, event: CausalEventJs): Promise<Array<Buffer>>
+  /**
+   * Initiate a migration for the daemon identified by
+   * `originHash`, moving it from `sourceNode` to `targetNode`.
+   *
+   * Returns a [`MigrationHandle`] whose `wait()` resolves when
+   * the migration reaches a terminal state — `Complete` on
+   * success, or throws a `DaemonError` on abort / failure.
+   *
+   * `sourceNode` / `targetNode` are `u64` node IDs (the hash of
+   * each node's static pubkey); pass them as `BigInt` to avoid
+   * silent precision loss past 2^53.
+   *
+   * **Local-source migration** — the common case where
+   * `sourceNode` is the current node — snapshots synchronously
+   * and ships `SnapshotReady` to the target. Remote-source
+   * migrations drive the state machine entirely via inbound
+   * wire messages.
+   */
+  startMigration(originHash: number, sourceNode: bigint, targetNode: bigint): Promise<MigrationHandle>
+  /**
+   * `startMigration` with caller-supplied options. Use this to
+   * opt out of identity transport (when the daemon doesn't need
+   * to sign on the target) or to disable / shorten the
+   * NotReady-retry budget.
+   */
+  startMigrationWith(originHash: number, sourceNode: bigint, targetNode: bigint, opts: MigrationOptsJs): Promise<MigrationHandle>
 }
 
 /**
@@ -302,6 +328,60 @@ export declare class MemoryWatchIter {
   next(): Promise<Array<Memory> | null>
   /** Terminate the iterator early. Idempotent. */
   close(): void
+}
+
+/**
+ * Handle to an in-flight migration. Created by
+ * [`DaemonRuntime::start_migration`] /
+ * [`DaemonRuntime::start_migration_with`]; cloneable (shares
+ * state) and cheap to pass across async boundaries.
+ *
+ * Dropping the handle does NOT cancel the migration — the
+ * orchestrator keeps driving it to completion in the background.
+ * Callers who want to observe or abort must hold onto the handle.
+ */
+export declare class MigrationHandle {
+  /** 32-bit origin hash of the daemon being migrated. */
+  get originHash(): number
+  /**
+   * Node ID of the source (currently hosting) node. BigInt to
+   * match the u64 hash without precision loss.
+   */
+  get sourceNode(): bigint
+  /** Node ID of the target (post-cutover) node. */
+  get targetNode(): bigint
+  /**
+   * Current migration phase as a string:
+   * `'snapshot' | 'transfer' | 'restore' | 'replay' | 'cutover' | 'complete'`,
+   * or `null` once the migration has left the orchestrator's
+   * records (terminal success or abort). Callers distinguish
+   * success from abort by remembering the last non-null phase.
+   */
+  phase(): string | null
+  /**
+   * Block until the migration reaches a terminal state. Resolves
+   * void on normal completion (saw `Complete`, then the
+   * orchestrator cleaned up); rejects with `DaemonError`
+   * carrying the failure reason otherwise.
+   *
+   * No wall-clock timeout — a migration stalled against an
+   * unresponsive peer will block indefinitely. Callers that
+   * need a bound should use [`MigrationHandle::wait_with_timeout`].
+   */
+  wait(): Promise<void>
+  /**
+   * Like [`wait`] with a caller-controlled timeout. On timeout
+   * the orchestrator record is aborted and the promise rejects
+   * with a `DaemonError` describing the stall.
+   */
+  waitWithTimeout(timeoutMs: bigint): Promise<void>
+  /**
+   * Request cancellation of the migration. Best-effort: a
+   * migration that has already passed `Cutover` cannot be
+   * cleanly undone (routing has flipped), and this call resolves
+   * without aborting.
+   */
+  cancel(): Promise<void>
 }
 
 /**
@@ -1190,6 +1270,29 @@ export interface MeshOptions {
    * ephemeral ones. Treat as secret material.
    */
   identitySeed?: Buffer
+}
+
+/**
+ * Options for `startMigrationWith`. All fields optional — omit to
+ * take the runtime default.
+ *
+ * See [`MigrationOpts`] on the Rust side for the full semantics of
+ * each field.
+ */
+export interface MigrationOptsJs {
+  /**
+   * Seal the daemon's ed25519 seed into the outbound snapshot
+   * so the target keeps full signing capability. Default
+   * `true`; set `false` for pure compute daemons that only
+   * consume events.
+   */
+  transportIdentity?: boolean
+  /**
+   * Retry budget for `NotReady` targets, in milliseconds.
+   * Default 30_000 (30 s). Pass `0` to disable retry — the
+   * first `NotReady` surfaces as a terminal failure.
+   */
+  retryNotReadyMs?: bigint
 }
 
 export interface ModelJs {
