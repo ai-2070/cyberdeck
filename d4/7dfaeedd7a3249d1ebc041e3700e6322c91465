@@ -1,0 +1,37 @@
+net/crates/net/src/adapter/net/identity/token.rs
+  5bf3f089eecaef7a 183-194,513-571
+net/crates/net/src/ffi/mesh.rs
+  5bf3f089eecaef7a 1493-1495,1511
+net/crates/net/sdk/src/identity.rs
+  5bf3f089eecaef7a 199-207
+net/crates/net/bindings/go/net/identity_test.go
+  5bf3f089eecaef7a 14,249-283
+net/crates/net/bindings/python/tests/test_identity.py
+  5bf3f089eecaef7a 142-172
+net/crates/net/sdk/src/config.rs
+  5bf3f089eecaef7a 145-159,167-237
+net/crates/net/bindings/node/src/identity.rs
+  5bf3f089eecaef7a 329-330,334
+net/crates/net/bindings/python/src/identity.rs
+  5bf3f089eecaef7a 299-300,304
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "d47dfaeedd7a3249d1ebc041e3700e6322c91465",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 834,
+      "total_deletions": 75,
+      "accepted_lines": 741,
+      "overriden_lines": 0
+    }
+  }
+}
