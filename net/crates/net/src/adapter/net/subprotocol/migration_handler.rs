@@ -923,10 +923,17 @@ impl MigrationSubprotocolHandler {
     ///    absence means the source skipped identity transport
     ///    without the target being prepared for that.
     ///
-    /// Present-but-invalid envelopes are terminal — propagating the
-    /// envelope error rather than falling back prevents an attacker
-    /// from downgrading identity transport by tampering with the
-    /// envelope bytes.
+    /// Once an envelope is **present** on the snapshot, envelope
+    /// transport is mandatory — the fallback keypair is NEVER used
+    /// on that path. Present-but-invalid envelopes are terminal
+    /// (propagating the envelope error rather than falling back
+    /// prevents an attacker from downgrading identity transport by
+    /// tampering with the envelope bytes), and a misbehaving
+    /// `unseal_snapshot` that returns `Ok(None)` despite an
+    /// envelope being present is treated as a terminal error for
+    /// the same reason: silently falling through to the
+    /// pre-provisioned keypair would defeat the identity-transport
+    /// guarantee callers installed the context to obtain.
     fn resolve_restore_keypair(
         &self,
         snapshot: &StateSnapshot,
@@ -935,17 +942,28 @@ impl MigrationSubprotocolHandler {
         if let (Some(ctx), Some(_)) = (&self.identity_context, &snapshot.identity_envelope) {
             // The private key stays inside the closure owned by
             // `ctx.unseal_snapshot` — the dispatcher never sees it.
-            match (ctx.unseal_snapshot)(snapshot) {
-                Ok(Some(kp)) => return Ok(kp),
-                Ok(None) => {
-                    // Unreachable under normal conditions — `Some`
-                    // envelope on the snapshot paired with
-                    // `unseal_snapshot` returning `Ok(None)` would
-                    // mean envelope was present but yielded no
-                    // keypair. Fall through to fallback.
-                }
-                Err(e) => return Err(format!("{e}")),
-            }
+            //
+            // Both `Ok(None)` and `Err` terminate resolution. The
+            // envelope has been attached to the snapshot, so we've
+            // already committed to envelope transport; falling back
+            // to the pre-provisioned keypair here would silently
+            // downgrade a migration the caller asked to carry
+            // identity. A conforming `unseal_snapshot` returns
+            // `Ok(Some(_))` or `Err(_)` when handed a snapshot with
+            // a present envelope — `Ok(None)` indicates a broken
+            // unsealer and must not mask the breakage.
+            return match (ctx.unseal_snapshot)(snapshot) {
+                Ok(Some(kp)) => Ok(kp),
+                Ok(None) => Err(
+                    "identity envelope present on snapshot but \
+                     `unseal_snapshot` returned Ok(None) — refusing to \
+                     fall back to the pre-provisioned keypair; a \
+                     present envelope mandates envelope-sourced \
+                     identity transport"
+                        .to_string(),
+                ),
+                Err(e) => Err(format!("{e}")),
+            };
         }
         fallback.cloned().ok_or_else(|| {
             "placeholder factory registered but snapshot has no \
@@ -1439,5 +1457,103 @@ mod tests {
             .resolve_restore_keypair(&snapshot_no_envelope, Some(&wrong_fallback))
             .expect("resolve with fallback only");
         assert_eq!(resolved_fallback.entity_id(), wrong_fallback.entity_id());
+    }
+
+    /// Regression (Cubic-AI P2): once an identity envelope is
+    /// present on the snapshot, resolution must commit to
+    /// envelope transport. A misbehaving `unseal_snapshot` that
+    /// returns `Ok(None)` — e.g., a partially-implemented or
+    /// buggy custom closure — previously made the dispatcher
+    /// fall through to the pre-provisioned fallback keypair,
+    /// silently downgrading a migration the caller had opted
+    /// into envelope transport for.
+    ///
+    /// The fix treats `Ok(None)` from a present-envelope snapshot
+    /// as a terminal error, matching the policy for an explicit
+    /// `Err(...)` from unseal.
+    ///
+    /// Test: construct a snapshot that carries an envelope, wire
+    /// an identity context whose `unseal_snapshot` ignores the
+    /// snapshot entirely and returns `Ok(None)`. Provide a
+    /// (wrong) fallback keypair. The resolver must refuse,
+    /// returning `Err(...)` — not the fallback.
+    #[test]
+    fn envelope_present_but_unseal_returns_none_fails_rather_than_fallback() {
+        use crate::adapter::net::identity::IdentityEnvelope;
+        use crate::adapter::net::state::snapshot::StateSnapshot;
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Secret};
+
+        // Fresh X25519 keypair — seal recipient.
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).unwrap();
+        let target_priv = X25519Secret::from(seed);
+        let target_pub = *X25519Pub::from(&target_priv).as_bytes();
+
+        // Real daemon keypair: builds a valid envelope so the
+        // snapshot is well-formed from the wire's perspective.
+        let real_kp = EntityKeypair::generate();
+        let chain_link = crate::adapter::net::state::causal::CausalLink {
+            origin_hash: real_kp.origin_hash(),
+            horizon_encoded: 0,
+            sequence: 0,
+            parent_hash: 0,
+        };
+        let envelope =
+            IdentityEnvelope::new(&real_kp, target_pub, &chain_link).expect("seal envelope");
+
+        let snapshot = StateSnapshot {
+            version: crate::adapter::net::state::snapshot::SNAPSHOT_VERSION,
+            entity_id: real_kp.entity_id().clone(),
+            chain_link,
+            through_seq: 0,
+            state: Bytes::new(),
+            horizon: Default::default(),
+            created_at: 0,
+            bindings_bytes: Vec::new(),
+            identity_envelope: Some(envelope),
+        };
+
+        // Misbehaving unsealer: always returns `Ok(None)`, even
+        // when handed a snapshot with a real envelope. Simulates
+        // a partial implementation or a bug that would have
+        // triggered the silent-downgrade previously.
+        let unseal_snapshot: EnvelopeUnsealFn = Arc::new(|_snap: &StateSnapshot| Ok(None));
+        let peer_static_lookup: Arc<dyn Fn(u64) -> Option<[u8; 32]> + Send + Sync> =
+            Arc::new(|_| None);
+        let ctx = MigrationIdentityContext {
+            unseal_snapshot,
+            peer_static_lookup,
+        };
+
+        let reg = Arc::new(DaemonRegistry::new());
+        let orch = Arc::new(MigrationOrchestrator::new(reg.clone(), 0x1111));
+        let source = Arc::new(MigrationSourceHandler::new(reg.clone()));
+        let target = Arc::new(MigrationTargetHandler::new(reg));
+        let handler = MigrationSubprotocolHandler::with_hooks(
+            orch,
+            source,
+            target,
+            0x1111,
+            MigrationHandlerHooks {
+                identity: Some(ctx),
+                ..Default::default()
+            },
+        );
+
+        // Fallback would have "succeeded" (wrong keypair, but
+        // syntactically present) pre-fix. Post-fix the resolver
+        // rejects because the envelope-present invariant commits
+        // us to envelope transport.
+        let wrong_fallback = EntityKeypair::generate();
+        let err = handler
+            .resolve_restore_keypair(&snapshot, Some(&wrong_fallback))
+            .expect_err(
+                "envelope present + unseal Ok(None) must fail; silently \
+                 returning the fallback downgrades identity transport",
+            );
+        assert!(
+            err.contains("refusing to fall back"),
+            "expected 'refusing to fall back' in error message, got: {err}",
+        );
     }
 }
