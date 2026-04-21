@@ -493,6 +493,7 @@ impl DaemonRuntime {
             return Err(DaemonError::Core(e));
         }
 
+        // TEMP revert: no post-insert fence.
         Ok(DaemonHandle {
             origin_hash,
             entity_id,
@@ -563,6 +564,14 @@ impl DaemonRuntime {
         if let Err(e) = self.inner.registry.register(host) {
             self.inner.factory_registry.remove(origin_hash);
             return Err(DaemonError::Core(e));
+        }
+
+        // Post-insert fence against a concurrent `shutdown` — see
+        // the matching comment in `spawn`.
+        if self.state() == State::ShuttingDown {
+            let _ = self.inner.registry.unregister(origin_hash);
+            self.inner.factory_registry.remove(origin_hash);
+            return Err(DaemonError::ShuttingDown);
         }
 
         Ok(DaemonHandle {
@@ -809,11 +818,20 @@ impl DaemonRuntime {
         }
         let factory = self.factory_for_kind(kind)?;
         let keypair = identity.keypair().as_ref().clone();
+        let origin_hash = keypair.origin_hash();
         let factory_clone = factory.clone();
         self.inner
             .factory_registry
             .register(keypair, config, move || (factory_clone)())
-            .map_err(DaemonError::Core)
+            .map_err(DaemonError::Core)?;
+        // Post-insert fence — a concurrent `shutdown` may have
+        // raced past the initial state check. Roll back so no
+        // factory entry outlives the torn-down runtime.
+        if self.state() == State::ShuttingDown {
+            self.inner.factory_registry.remove(origin_hash);
+            return Err(DaemonError::ShuttingDown);
+        }
+        Ok(())
     }
 
     /// Declare on the target that this node expects a migration
@@ -849,7 +867,14 @@ impl DaemonRuntime {
         self.inner
             .factory_registry
             .register_placeholder(origin_hash, config, move || (factory_clone)())
-            .map_err(DaemonError::Core)
+            .map_err(DaemonError::Core)?;
+        // Post-insert fence against a concurrent `shutdown` — see
+        // the matching comment in `register_migration_target_identity`.
+        if self.state() == State::ShuttingDown {
+            self.inner.factory_registry.remove(origin_hash);
+            return Err(DaemonError::ShuttingDown);
+        }
+        Ok(())
     }
 
     /// Start migrating a daemon from `source_node` to `target_node`.

@@ -468,6 +468,77 @@ async fn start_installs_handler_before_publishing_ready() {
     }
 }
 
+/// Regression (Cubic-AI P1): `spawn` and `shutdown` had no
+/// coordination. `spawn` checked `require_ready()` once, then did
+/// unguarded registry inserts. If `shutdown` flipped state to
+/// `ShuttingDown` between the `require_ready` check and the
+/// inserts — and completed its sweep of the registries before
+/// `spawn` inserted — the new entries would survive the torn-down
+/// runtime. `daemon_count()` after `shutdown` returned could be
+/// non-zero.
+///
+/// The fix adds a post-insert fence: after all registration
+/// atomics complete, `spawn` re-reads `state`. If `ShuttingDown`,
+/// it unregisters what it just inserted and returns
+/// `Err(ShuttingDown)`. The caller never gets a handle to a
+/// zombie daemon, and the registries converge to empty.
+///
+/// This test fires many concurrent `spawn` + `shutdown` pairs to
+/// hit the narrow race window. The invariant checked is:
+/// `daemon_count() == 0` after both tasks join — regardless of
+/// whether `spawn` returned `Ok` or `Err(ShuttingDown)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spawn_racing_with_shutdown_does_not_leave_daemon_registered() {
+    for trial in 0..256u32 {
+        let rt = runtime().await;
+        rt.register_factory("echo", || Box::new(EchoDaemon))
+            .unwrap();
+        rt.start().await.unwrap();
+
+        // Both race paths use their own rt clone and run on
+        // separate tasks. Tokio's scheduler interleaves them
+        // across worker threads, exercising the race window.
+        let rt_for_spawn = rt.clone();
+        let rt_for_shutdown = rt.clone();
+        let spawn_task = tokio::spawn(async move {
+            rt_for_spawn
+                .spawn(
+                    "echo",
+                    Identity::generate(),
+                    DaemonHostConfig::default(),
+                )
+                .await
+        });
+        let shutdown_task = tokio::spawn(async move { rt_for_shutdown.shutdown().await });
+
+        let (spawn_result, shutdown_result) = tokio::join!(spawn_task, shutdown_task);
+        let spawn_result = spawn_result.expect("spawn task panicked");
+        shutdown_result
+            .expect("shutdown task panicked")
+            .expect("shutdown Ok");
+
+        assert_eq!(
+            rt.daemon_count(),
+            0,
+            "trial {trial}: daemon survived shutdown — spawn returned \
+             {spawn_result:?}; pre-fix race left an entry in the registry \
+             when shutdown's sweep completed before spawn's inserts",
+        );
+
+        // If `spawn` happened to beat `shutdown`, the caller got a
+        // handle but the underlying daemon was drained. If it lost
+        // the race, it saw `Err(ShuttingDown)`. Anything else is a
+        // regression.
+        match spawn_result {
+            Ok(_) | Err(DaemonError::ShuttingDown) => {}
+            other => panic!(
+                "trial {trial}: spawn racing with shutdown must return Ok \
+                 or Err(ShuttingDown); got {other:?}",
+            ),
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_unknown_kind_errors() {
     let rt = runtime().await;
