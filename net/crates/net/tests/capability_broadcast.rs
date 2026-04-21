@@ -135,8 +135,10 @@ async fn announcement_expires_after_ttl() {
 
     let caps = CapabilitySet::new().add_tag("ephemeral");
     // TTL = 1s; GC tick from `test_config` is 250ms, so two or three
-    // sweeps land before we re-query at 1.5s.
-    a.announce_capabilities_with(caps, Duration::from_secs(1), false)
+    // sweeps land before we re-query at 1.5s. Signed — B's default
+    // now drops unsigned announcements, and this test is exercising
+    // TTL + GC, not the sign-gate.
+    a.announce_capabilities_with(caps, Duration::from_secs(1), true)
         .await
         .expect("announce failed");
 
@@ -389,16 +391,22 @@ async fn forwarded_announcement_does_not_tofu_pin_forwarder_to_victim_entity() {
 /// restricts TOFU pinning to signature-verified announcements;
 /// unauthenticated deployments that run without signatures get no
 /// pin at all (channel auth fails cleanly at "missing entity").
+///
+/// Explicit opt-out: the receiver sets
+/// `require_signed_capabilities = false` so unsigned announcements
+/// still reach the dispatch path (the safer post-fix default
+/// drops them up front). This test covers the "discovery without
+/// signatures" deployment shape and asserts the defence-in-depth
+/// state guards still hold under it.
 #[tokio::test]
 async fn unsigned_announcement_does_not_tofu_pin_entity() {
     let ports = find_ports(2).await;
     let a = build_node(ports[0]).await;
-    let b = build_node(ports[1]).await;
+    let b = build_node_with(ports[1], |cfg| cfg.with_require_signed_capabilities(false)).await;
     handshake(&a, &b).await;
 
-    // A announces UNSIGNED caps. B accepts (no
-    // require_signed_capabilities) but must NOT trust
-    // `ann.entity_id` enough to pin it.
+    // A announces UNSIGNED caps. B accepts (explicit opt-out
+    // below) but must NOT trust `ann.entity_id` enough to pin it.
     a.announce_capabilities_with(
         CapabilitySet::new().add_tag("unsigned-tofu-probe"),
         Duration::from_secs(60),
@@ -407,7 +415,7 @@ async fn unsigned_announcement_does_not_tofu_pin_entity() {
     .await
     .expect("announce");
 
-    // Index still admits the announcement (permissive default).
+    // Index still admits the announcement under the opt-out.
     let filter = CapabilityFilter::new().require_tag("unsigned-tofu-probe");
     let a_id = a.node_id();
     let arrived = wait_until(&b, |n| n.find_peers_by_filter(&filter).contains(&a_id)).await;
@@ -419,5 +427,71 @@ async fn unsigned_announcement_does_not_tofu_pin_entity() {
         b.peer_entity_id(a_id).is_none(),
         "TOFU pin established from an unsigned announcement — \
          unauthenticated entity_id is attacker-controlled input",
+    );
+}
+
+/// Regression for a cubic-flagged P1: even with the default
+/// (`require_signed_capabilities = true`) dropping unsigned
+/// announcements up-front, we want belt-and-braces so an
+/// explicit opt-out for discovery can't accidentally re-open the
+/// auth surface. `peer_subnets` is populated from
+/// `ann.capabilities` via the subnet policy and is later consulted
+/// by `subnet_visible` on the publish / subscribe paths — an
+/// unsigned announcement must not be allowed to pick the peer's
+/// subnet. This test opts out of the signature requirement, sends
+/// an unsigned announcement whose caps would land the peer in a
+/// non-GLOBAL subnet under any plausible policy, and asserts the
+/// subnet binding stays unwritten.
+#[tokio::test]
+async fn unsigned_announcement_does_not_write_peer_subnet() {
+    use net::adapter::net::{SubnetPolicy, SubnetRule};
+
+    let ports = find_ports(2).await;
+    let a = build_node(ports[0]).await;
+
+    // Receiver opts out of require_signed AND installs a subnet
+    // policy whose rule maps `region:privileged` to a non-zero
+    // level. `SubnetPolicy::assign` matches on a tag prefix; a
+    // peer carrying that tag lands in a non-GLOBAL subnet. If the
+    // write path were live, an attacker could drop itself into
+    // that subnet just by announcing the matching tag.
+    let rule = SubnetRule::new("region:", 0).map("privileged", 1);
+    let policy = SubnetPolicy::new().add_rule(rule);
+    let b = build_node_with(ports[1], |cfg| {
+        cfg.with_require_signed_capabilities(false)
+            .with_subnet_policy(Arc::new(policy))
+    })
+    .await;
+    handshake(&a, &b).await;
+
+    a.announce_capabilities_with(
+        CapabilitySet::new().add_tag("region:privileged"),
+        Duration::from_secs(60),
+        false, // unsigned — attacker lying about caps
+    )
+    .await
+    .expect("announce");
+
+    // Capability index is allowed to pick it up (opt-out lets
+    // discovery still work).
+    let filter = CapabilityFilter::new().require_tag("region:privileged");
+    let a_id = a.node_id();
+    let arrived = wait_until(&b, |n| n.find_peers_by_filter(&filter).contains(&a_id)).await;
+    assert!(
+        arrived,
+        "unsigned announcement should still index under opt-out",
+    );
+
+    // Give the dispatch path another beat in case the subnet
+    // write lags the index insert.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // `peer_subnets` must stay empty for this peer — the unsigned
+    // ann doesn't write here, so `subnet_visible` decisions on
+    // `SubnetLocal` channels can't be steered by attacker input.
+    assert!(
+        b.peer_subnet(a_id).is_none(),
+        "unsigned announcement was allowed to pick the peer's subnet — \
+         subnet_visible decisions become attacker-controlled",
     );
 }

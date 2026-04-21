@@ -263,9 +263,18 @@ pub struct MeshNodeConfig {
     /// for an `Ack` before returning `AdapterError::Timeout`.
     pub membership_ack_timeout: Duration,
     /// Drop inbound `CapabilityAnnouncement` packets whose signature
-    /// is missing. Signature *validity* is not yet enforced (that
-    /// requires the node_id → entity_id binding that lands with
-    /// channel auth); presence is a per-mesh policy knob today.
+    /// is missing. Defaults to `true` because the cap data feeds
+    /// channel-auth (`can_publish` / `can_subscribe` cap filters)
+    /// and subnet visibility — an unsigned announcement is
+    /// attacker-controlled input, and accepting it silently meant a
+    /// peer could claim any caps or subnet just by announcing. The
+    /// dispatch path still applies a second belt-and-braces guard
+    /// on individual auth-load-bearing state updates
+    /// (`peer_entity_ids`, `peer_subnets`), so explicitly setting
+    /// this to `false` for discovery-only deployments is
+    /// defensible; flipping this on simply makes the rejection
+    /// happen up-front instead of silently no-oping the state
+    /// writes downstream.
     pub require_signed_capabilities: bool,
     /// How often the capability index sweeps expired entries. Low
     /// values waste CPU; high values keep stale peers queryable past
@@ -333,7 +342,7 @@ impl MeshNodeConfig {
             max_streams: 4096,
             max_channels_per_peer: 1024,
             membership_ack_timeout: Duration::from_secs(5),
-            require_signed_capabilities: false,
+            require_signed_capabilities: true,
             capability_gc_interval: Duration::from_secs(60),
             subnet: SubnetId::GLOBAL,
             subnet_policy: None,
@@ -937,6 +946,17 @@ impl MeshNode {
         self.peer_entity_ids
             .get(&node_id)
             .map(|e| e.value().clone())
+    }
+
+    /// Look up a peer's assigned subnet, if one has been recorded.
+    /// Only populated from signature-verified
+    /// `CapabilityAnnouncement`s — unsigned announcements do not
+    /// write here even when a node is running with
+    /// `require_signed_capabilities = false`. Exposed for tests +
+    /// operator observability; `subnet_visible` consults this map
+    /// on the publish / subscribe fan-out path.
+    pub fn peer_subnet(&self, node_id: u64) -> Option<SubnetId> {
+        self.peer_subnets.get(&node_id).map(|e| *e.value())
     }
 
     /// Get the local bind address.
@@ -2650,9 +2670,22 @@ impl MeshNode {
         // Derive the peer's subnet *before* moving `ann` into the
         // index — the policy needs `ann.capabilities` and `index()`
         // consumes the announcement by value.
-        if let Some(policy) = ctx.local_subnet_policy.as_ref() {
-            let subnet = policy.assign(&ann.capabilities);
-            ctx.peer_subnets.insert(from_node, subnet);
+        //
+        // Gated on `signature_verified`: the subnet assignment is
+        // fed by `ann.capabilities`, which is attacker-controlled
+        // on an unsigned announcement. `peer_subnets` is consulted
+        // by `subnet_visible` on the publish fan-out and subscribe
+        // paths, so a spoofed subnet would let a peer see / receive
+        // traffic on `SubnetLocal` channels it shouldn't. A
+        // deployment that explicitly sets
+        // `require_signed_capabilities = false` for discovery keeps
+        // the capability index populated for `find_peers_by_filter`
+        // queries but does not let those queries back into auth.
+        if signature_verified {
+            if let Some(policy) = ctx.local_subnet_policy.as_ref() {
+                let subnet = policy.assign(&ann.capabilities);
+                ctx.peer_subnets.insert(from_node, subnet);
+            }
         }
 
         // Cache BEFORE indexing (the index consumes `ann` by value,
