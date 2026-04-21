@@ -317,8 +317,7 @@ impl DaemonRuntime {
                     // a no-op.
                     let stall_ms = self.inner.start_stall_ms.load(Ordering::Acquire);
                     if stall_ms > 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(stall_ms as u64))
-                            .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(stall_ms as u64)).await;
                     }
 
                     let swap = self.inner.state.compare_exchange(
@@ -500,9 +499,7 @@ impl DaemonRuntime {
     /// disables.
     #[doc(hidden)]
     pub fn set_spawn_stall_ms(&self, millis: u32) {
-        self.inner
-            .spawn_stall_ms
-            .store(millis, Ordering::Release);
+        self.inner.spawn_stall_ms.store(millis, Ordering::Release);
     }
 
     /// **Test-only.** Inject a sleep inside `start` between the
@@ -511,9 +508,7 @@ impl DaemonRuntime {
     /// `start` so tests can verify the handler-cleanup path.
     #[doc(hidden)]
     pub fn set_start_stall_ms(&self, millis: u32) {
-        self.inner
-            .start_stall_ms
-            .store(millis, Ordering::Release);
+        self.inner.start_stall_ms.store(millis, Ordering::Release);
     }
 
     /// Readiness accessor for tests + operators. `true` iff the
@@ -1072,21 +1067,17 @@ impl DaemonRuntime {
                 // silent downgrade to unsealed. `Ok(None)` is
                 // reserved for "snapshot already carries an
                 // envelope" (not a downgrade, just no-op here).
-                match self.maybe_seal_local_snapshot(
-                    origin_hash,
-                    target_node,
-                    snapshot_bytes,
-                ) {
+                match self.maybe_seal_local_snapshot(origin_hash, target_node, snapshot_bytes) {
                     Ok(Some(sealed)) => *snapshot_bytes = sealed,
                     Ok(None) => {}
                     Err(e) => {
                         // The orchestrator record was created by the
                         // preceding `start_migration` call — roll it
                         // back so a retry starts from phase 0.
-                        let _ = self.inner.orchestrator.abort_migration(
-                            origin_hash,
-                            format!("envelope seal failed: {e}"),
-                        );
+                        let _ = self
+                            .inner
+                            .orchestrator
+                            .abort_migration(origin_hash, format!("envelope seal failed: {e}"));
                         return Err(e);
                     }
                 }
@@ -1180,18 +1171,22 @@ impl DaemonRuntime {
             return Ok(None);
         }
         let Some(target_pub) = self.inner.mesh.inner().peer_static_x25519(target_node) else {
-            return Err(DaemonError::Migration(MigrationError::StateFailed(format!(
-                "identity transport requested but peer X25519 static for \
+            return Err(DaemonError::Migration(MigrationError::StateFailed(
+                format!(
+                    "identity transport requested but peer X25519 static for \
                  {target_node:#x} is unknown (e.g. NKpsk0-responder \
                  side) — cannot seal envelope; use \
                  `transport_identity: false` to proceed unsealed"
-            ))));
+                ),
+            )));
         };
         let Some(kp) = self.inner.registry.daemon_keypair(daemon_origin) else {
-            return Err(DaemonError::Migration(MigrationError::StateFailed(format!(
-                "identity transport requested but daemon {daemon_origin:#x} has \
+            return Err(DaemonError::Migration(MigrationError::StateFailed(
+                format!(
+                    "identity transport requested but daemon {daemon_origin:#x} has \
                  no local keypair to seal with"
-            ))));
+                ),
+            )));
         };
         snapshot
             .with_identity_envelope(&kp, target_pub)

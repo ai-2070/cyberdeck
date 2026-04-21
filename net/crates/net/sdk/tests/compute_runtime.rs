@@ -545,8 +545,7 @@ async fn start_losing_race_to_shutdown_clears_handler() {
     rt.set_start_stall_ms(100);
 
     let rt_for_start = rt.clone();
-    let start_task =
-        tokio::spawn(async move { rt_for_start.start().await });
+    let start_task = tokio::spawn(async move { rt_for_start.start().await });
 
     // Give `start_task` a beat to install the handler and land in
     // the injected stall, then race in the shutdown.
@@ -563,9 +562,7 @@ async fn start_losing_race_to_shutdown_clears_handler() {
     // but leave the handler installed on the mesh.
     match start_result {
         Err(DaemonError::ShuttingDown) => {}
-        other => panic!(
-            "start racing with shutdown must return Err(ShuttingDown); got {other:?}",
-        ),
+        other => panic!("start racing with shutdown must return Err(ShuttingDown); got {other:?}",),
     }
     assert!(
         !rt.mesh().inner().has_migration_handler(),
@@ -634,11 +631,7 @@ async fn spawn_racing_with_shutdown_does_not_leave_daemon_registered() {
     let rt_for_spawn = rt.clone();
     let spawn_task = tokio::spawn(async move {
         rt_for_spawn
-            .spawn(
-                "echo",
-                Identity::generate(),
-                DaemonHostConfig::default(),
-            )
+            .spawn("echo", Identity::generate(), DaemonHostConfig::default())
             .await
     });
 

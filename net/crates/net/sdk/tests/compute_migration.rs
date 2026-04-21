@@ -1297,11 +1297,7 @@ async fn transport_identity_false_proceeds_unsealed_under_nkpsk0_responder_sourc
     // Opt-out requires the target to pre-register the identity
     // so the factory has a keypair to restore under.
     target_rt
-        .register_migration_target_identity(
-            "counter",
-            identity,
-            DaemonHostConfig::default(),
-        )
+        .register_migration_target_identity("counter", identity, DaemonHostConfig::default())
         .expect("target identity");
 
     let mig = source_rt

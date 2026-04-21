@@ -875,11 +875,13 @@ impl MigrationSubprotocolHandler {
             Some(kp) => kp,
             None => return Ok(snapshot),
         };
-        snapshot.with_identity_envelope(&kp, target_pub).map_err(|e| {
-            MigrationError::StateFailed(format!(
-                "identity envelope seal failed for daemon {daemon_origin:#x}: {e}"
-            ))
-        })
+        snapshot
+            .with_identity_envelope(&kp, target_pub)
+            .map_err(|e| {
+                MigrationError::StateFailed(format!(
+                    "identity envelope seal failed for daemon {daemon_origin:#x}: {e}"
+                ))
+            })
     }
 
     /// Read-only keypair fetch from the shared daemon registry
@@ -954,14 +956,12 @@ impl MigrationSubprotocolHandler {
             // unsealer and must not mask the breakage.
             return match (ctx.unseal_snapshot)(snapshot) {
                 Ok(Some(kp)) => Ok(kp),
-                Ok(None) => Err(
-                    "identity envelope present on snapshot but \
+                Ok(None) => Err("identity envelope present on snapshot but \
                      `unseal_snapshot` returned Ok(None) — refusing to \
                      fall back to the pre-provisioned keypair; a \
                      present envelope mandates envelope-sourced \
                      identity transport"
-                        .to_string(),
-                ),
+                    .to_string()),
                 Err(e) => Err(format!("{e}")),
             };
         }
@@ -1231,9 +1231,8 @@ mod tests {
         // Wire the identity context so `peer_static_lookup` returns
         // the target pub — i.e., every prerequisite is satisfied.
         // The unseal closure isn't exercised on the source path.
-        let unseal_snapshot: EnvelopeUnsealFn = Arc::new(move |snap: &StateSnapshot| {
-            snap.open_identity_envelope(&target_priv)
-        });
+        let unseal_snapshot: EnvelopeUnsealFn =
+            Arc::new(move |snap: &StateSnapshot| snap.open_identity_envelope(&target_priv));
         let peer_static_lookup: Arc<dyn Fn(u64) -> Option<[u8; 32]> + Send + Sync> =
             Arc::new(move |nid| {
                 if nid == target_node_id {
