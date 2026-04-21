@@ -1789,6 +1789,8 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "compute")]
     {
         m.add_class::<compute::PyDaemonRuntime>()?;
+        m.add_class::<compute::PyDaemonHandle>()?;
+        m.add_class::<compute::PyCausalEvent>()?;
     }
     Ok(())
 }
