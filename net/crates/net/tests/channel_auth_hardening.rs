@@ -455,6 +455,125 @@ async fn expired_token_evicts_subscriber_within_one_sweep() {
     );
 }
 
+async fn build_node_sweep_disabled(port: u16) -> Node {
+    let cfg = test_config(port).with_token_sweep_interval(Duration::MAX);
+    build_node_with_cfg(port, cfg).await
+}
+
+/// Regression for a cubic-flagged P1: when `token_sweep_interval`
+/// is set to `Duration::MAX` (the documented "disable" sentinel),
+/// expired subscribers used to stay authorized indefinitely —
+/// nothing walks the roster to notice their tokens expired. The
+/// fix adds a lazy per-subscriber token-expiry probe to the
+/// publish fast path, gated on `require_token` so open channels
+/// still take the zero-cost path. This test exercises the
+/// sweep-disabled branch end-to-end.
+#[tokio::test]
+async fn publish_skips_expired_subscriber_when_sweep_is_disabled() {
+    let ports = find_ports(2).await;
+    let a = build_node_sweep_disabled(ports[0]).await;
+    let b = build_node(ports[1]).await;
+    handshake(&a.mesh, &b.mesh).await;
+
+    a.mesh
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("A announce");
+    b.mesh
+        .announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("B announce");
+    assert!(
+        wait_until(|| a.mesh.capability_index().get(b.mesh.node_id()).is_some()).await,
+        "A never indexed B's caps",
+    );
+
+    let channel = ChannelName::new("auth/nosweep").unwrap();
+    a.registry
+        .insert(ChannelConfig::new(ChannelId::new(channel.clone())).with_require_token(true));
+
+    // Long-lived publish token for A.
+    let pub_token = PermissionToken::issue(
+        &a.keypair,
+        a.keypair.entity_id().clone(),
+        TokenScope::PUBLISH,
+        channel.hash(),
+        3600,
+        0,
+    );
+    a.token_cache
+        .insert(pub_token)
+        .expect("install publish token");
+
+    // Short-lived subscribe token — 1 second.
+    let sub_token = PermissionToken::issue(
+        &a.keypair,
+        b.keypair.entity_id().clone(),
+        TokenScope::SUBSCRIBE,
+        channel.hash(),
+        1,
+        0,
+    );
+
+    b.mesh
+        .subscribe_channel_with_token(a.mesh.node_id(), channel.clone(), sub_token)
+        .await
+        .expect("subscribe with short token");
+
+    let b_origin = origin_hash(b.mesh.node_id());
+    assert!(
+        wait_until(|| a.mesh.auth_guard().is_authorized_full(b_origin, &channel)).await,
+        "subscribe didn't populate the guard",
+    );
+
+    // First publish inside the TTL — B is a valid subscriber.
+    let report = a
+        .mesh
+        .publish(
+            &publisher_for(channel.clone()),
+            Bytes::from_static(b"before-expiry"),
+        )
+        .await
+        .expect("publish before expiry");
+    assert_eq!(
+        report.attempted, 1,
+        "fast-path should admit the still-valid subscriber",
+    );
+
+    // Wait past the subscribe token's TTL. With the sweep disabled
+    // the AuthGuard entry + roster entry both persist — pre-fix,
+    // the next publish would still fan out to B.
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    assert!(
+        a.mesh.auth_guard().is_authorized_full(b_origin, &channel),
+        "sweep-disabled harness precondition: guard entry must persist past TTL",
+    );
+
+    // Post-fix: the lazy expiry check on the publish fast path
+    // notices the expired token and revokes inline. `attempted`
+    // counts subscribers admitted after the filter runs, so it
+    // must drop to zero even though the sweep never ran.
+    let report = a
+        .mesh
+        .publish(
+            &publisher_for(channel.clone()),
+            Bytes::from_static(b"after-expiry"),
+        )
+        .await
+        .expect("publish after expiry");
+    assert_eq!(
+        report.attempted, 0,
+        "publish admitted an expired-token subscriber while the sweep was disabled",
+    );
+
+    // Revocation should also have landed on the guard so future
+    // publishes take the cheap `Denied` path.
+    assert!(
+        !a.mesh.auth_guard().is_authorized_full(b_origin, &channel),
+        "lazy expiry should have revoked the guard entry for the expired subscriber",
+    );
+}
+
 // ============================================================================
 // AG-4 — auth-failure rate limit throttles repeat offenders
 // ============================================================================

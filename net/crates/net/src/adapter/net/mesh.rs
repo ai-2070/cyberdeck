@@ -44,7 +44,7 @@ use tokio::task::JoinHandle;
 
 use super::crypto::{handshake_prologue, CryptoError, NoiseHandshake, SessionKeys, StaticKeypair};
 use super::failure::{FailureDetector, FailureDetectorConfig};
-use super::identity::{EntityId, EntityKeypair, PermissionToken, TokenCache};
+use super::identity::{EntityId, EntityKeypair, PermissionToken, TokenCache, TokenScope};
 use super::pool::PacketBuilder;
 
 use super::behavior::broadcast::SUBPROTOCOL_CAPABILITY_ANN;
@@ -3142,12 +3142,29 @@ impl MeshNode {
         // Open channels (no auth configured) are admitted on every
         // subscribe via `allow_channel`, so the fast path trivially
         // passes for them — no conditional branch needed.
+        //
+        // Additionally, when the channel is `require_token`, we do a
+        // **lazy expiry check** on each admitted subscriber. The
+        // periodic token sweep (`spawn_token_sweep_loop`) is the
+        // primary eviction path, but a caller may deliberately
+        // configure `token_sweep_interval = Duration::MAX` to opt out
+        // — and without a second line of defence an expired token
+        // would keep authorizing packets forever. Probing the token
+        // cache per admitted subscriber costs one DashMap lookup +
+        // a timestamp compare per publish, which is only paid on
+        // token-gated channels (`require_token = false` skips the
+        // branch entirely). An expired subscriber is revoked inline
+        // so the next publish takes the `Denied` path.
         let channel_name = publisher.channel().name().clone();
         let channel_hash = channel_name.hash();
         let auth_guard = self.auth_guard.clone();
+        let require_token = cfg_snapshot
+            .as_ref()
+            .map(|c| c.require_token)
+            .unwrap_or(false);
         subscribers.retain(|peer_id| {
             let origin = subscriber_origin_hash(*peer_id);
-            match auth_guard.check_fast(origin, channel_hash) {
+            let admitted = match auth_guard.check_fast(origin, channel_hash) {
                 AuthVerdict::Allowed => auth_guard.is_authorized_full(origin, &channel_name),
                 AuthVerdict::Denied => false,
                 AuthVerdict::NeedsFullCheck => {
@@ -3158,7 +3175,36 @@ impl MeshNode {
                         false
                     }
                 }
+            };
+            if !admitted {
+                return false;
             }
+            if !require_token {
+                return true;
+            }
+            // Token-gated branch: ensure the subscriber still has a
+            // valid token. If the cache answer is "no valid token
+            // authorizes SUBSCRIBE on this channel," revoke inline.
+            let (Some(cache), Some(entity)) = (
+                self.token_cache.as_ref(),
+                self.peer_entity_ids.get(peer_id).map(|e| e.value().clone()),
+            ) else {
+                // Missing entity binding or no cache installed —
+                // treat as unauthorized. The subscribe path would
+                // have rejected this peer in the first place;
+                // reaching here means a config drift that we must
+                // not paper over by admitting the publish.
+                auth_guard.revoke_channel(origin, &channel_name);
+                return false;
+            };
+            if cache
+                .check(&entity, TokenScope::SUBSCRIBE, channel_hash)
+                .is_err()
+            {
+                auth_guard.revoke_channel(origin, &channel_name);
+                return false;
+            }
+            true
         });
 
         let mut report = PublishReport {
