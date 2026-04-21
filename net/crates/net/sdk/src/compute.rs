@@ -67,8 +67,8 @@ use ::net::adapter::net::compute::{
 };
 use ::net::adapter::net::identity::EntityId;
 use ::net::adapter::net::subprotocol::{
-    FailureCallback, MigrationIdentityContext, MigrationSubprotocolHandler, PostRestoreCallback,
-    PreCleanupCallback, ReadinessCallback,
+    FailureCallback, MigrationHandlerHooks, MigrationIdentityContext, MigrationSubprotocolHandler,
+    PostRestoreCallback, PreCleanupCallback, ReadinessCallback,
 };
 
 use crate::identity::Identity;
@@ -346,16 +346,18 @@ impl DaemonRuntime {
                                     map.insert(origin_hash, reason);
                                 }
                             });
-                        let handler = Arc::new(MigrationSubprotocolHandler::new_fully_hooked(
+                        let handler = Arc::new(MigrationSubprotocolHandler::with_hooks(
                             self.inner.orchestrator.clone(),
                             self.inner.source_handler.clone(),
                             self.inner.target_handler.clone(),
                             local_node_id,
-                            Some(ctx),
-                            Some(post_restore),
-                            Some(pre_cleanup),
-                            Some(readiness),
-                            Some(failure),
+                            MigrationHandlerHooks {
+                                identity: Some(ctx),
+                                post_restore: Some(post_restore),
+                                pre_cleanup: Some(pre_cleanup),
+                                readiness: Some(readiness),
+                                failure: Some(failure),
+                            },
                         ));
                         self.inner.mesh.inner().set_migration_handler(handler);
                         return Ok(());

@@ -112,6 +112,37 @@ pub type ReadinessCallback = Arc<dyn Fn() -> bool + Send + Sync>;
 pub type FailureCallback =
     Arc<dyn Fn(u32, crate::adapter::net::compute::MigrationFailureReason) + Send + Sync>;
 
+/// Optional cross-cutting hooks consumed by
+/// [`MigrationSubprotocolHandler::with_hooks`]. Each field is
+/// independently opt-in so a test that cares about one hook doesn't
+/// have to fabricate the others; `Default` = nothing wired.
+///
+/// | Field             | Side     | Purpose                                    |
+/// |-------------------|----------|--------------------------------------------|
+/// | `identity`        | both     | auto-seal / auto-open identity envelopes   |
+/// | `post_restore`    | target   | kick off channel re-bind replay            |
+/// | `pre_cleanup`     | source   | source-side Unsubscribe teardown           |
+/// | `readiness`       | target   | gate inbound migrations on runtime state   |
+/// | `failure`         | source   | surface structured reason to SDK caller    |
+#[derive(Default, Clone)]
+pub struct MigrationHandlerHooks {
+    /// Identity-transport context. `None` = envelopes ignored
+    /// (pre-identity-envelope fallback).
+    pub identity: Option<MigrationIdentityContext>,
+    /// Target-side post-restore callback — drives subscription
+    /// replay.
+    pub post_restore: Option<PostRestoreCallback>,
+    /// Source-side pre-cleanup callback — drives Unsubscribe
+    /// teardown.
+    pub pre_cleanup: Option<PreCleanupCallback>,
+    /// Target-side readiness predicate — returns `false` to reply
+    /// `NotReady` instead of attempting restore.
+    pub readiness: Option<ReadinessCallback>,
+    /// Source-side failure observer — surfaces structured reason
+    /// codes to the SDK.
+    pub failure: Option<FailureCallback>,
+}
+
 /// Dispatcher for migration subprotocol (`0x0500`) messages.
 ///
 /// Wraps the three handler halves — orchestrator, source, target —
@@ -119,9 +150,8 @@ pub type FailureCallback =
 /// identity-envelope seal/open, channel-re-bind replay,
 /// source-side Unsubscribe teardown, runtime-readiness gating, and
 /// source-side failure observation. Constructed by the SDK's
-/// `DaemonRuntime::start` via [`Self::new_fully_hooked`]; tests
-/// use [`Self::new`] / [`Self::new_with_hooks`] with the subset of
-/// hooks they care about.
+/// `DaemonRuntime::start` via [`Self::with_hooks`]; tests use
+/// [`Self::new`] when they don't need any hooks.
 ///
 /// Install onto a `MeshNode` via `MeshNode::set_migration_handler`.
 pub struct MigrationSubprotocolHandler {
@@ -167,137 +197,37 @@ pub struct MigrationSubprotocolHandler {
 }
 
 impl MigrationSubprotocolHandler {
-    /// Create a new handler with no identity-transport context.
-    /// Envelopes on inbound snapshots are ignored; outbound
-    /// snapshots don't get an envelope attached. Matches the
-    /// pre-Stage-5b behaviour.
+    /// Create a new handler with no hooks wired. Envelopes on
+    /// inbound snapshots are ignored; outbound snapshots don't
+    /// carry an envelope; readiness is treated as always-ready;
+    /// no failure observer; no channel-re-bind callbacks. Matches
+    /// the pre-Stage-5b behaviour and is the right shape for tests
+    /// that only need the bare three-handler dispatcher.
     pub fn new(
         orchestrator: Arc<MigrationOrchestrator>,
         source_handler: Arc<MigrationSourceHandler>,
         target_handler: Arc<MigrationTargetHandler>,
         local_node_id: u64,
     ) -> Self {
-        Self::new_with_identity(
+        Self::with_hooks(
             orchestrator,
             source_handler,
             target_handler,
             local_node_id,
-            None,
+            MigrationHandlerHooks::default(),
         )
     }
 
-    /// Create a new handler with an optional identity-transport
-    /// context. When provided, the dispatcher auto-seals envelopes
-    /// on the source path and auto-opens them on the target path.
-    pub fn new_with_identity(
+    /// Create a handler with an explicit [`MigrationHandlerHooks`]
+    /// bundle. Each hook field is independently optional; the SDK
+    /// supplies all five at once from `DaemonRuntime::start`, tests
+    /// populate only the subset they need.
+    pub fn with_hooks(
         orchestrator: Arc<MigrationOrchestrator>,
         source_handler: Arc<MigrationSourceHandler>,
         target_handler: Arc<MigrationTargetHandler>,
         local_node_id: u64,
-        identity_context: Option<MigrationIdentityContext>,
-    ) -> Self {
-        Self::new_with_hooks(
-            orchestrator,
-            source_handler,
-            target_handler,
-            local_node_id,
-            identity_context,
-            None,
-        )
-    }
-
-    /// Create a new handler with both an identity-transport context
-    /// and a post-restore callback. Convenience alias for
-    /// [`Self::new_with_all_hooks`] with the pre-cleanup callback
-    /// unset — callers that need both hooks should use the fuller
-    /// constructor.
-    pub fn new_with_hooks(
-        orchestrator: Arc<MigrationOrchestrator>,
-        source_handler: Arc<MigrationSourceHandler>,
-        target_handler: Arc<MigrationTargetHandler>,
-        local_node_id: u64,
-        identity_context: Option<MigrationIdentityContext>,
-        post_restore_callback: Option<PostRestoreCallback>,
-    ) -> Self {
-        Self::new_with_all_hooks(
-            orchestrator,
-            source_handler,
-            target_handler,
-            local_node_id,
-            identity_context,
-            post_restore_callback,
-            None,
-        )
-    }
-
-    /// Create a handler with every hook populated: identity context,
-    /// post-restore callback (target-side subscription replay), and
-    /// pre-cleanup callback (source-side unsubscribe teardown).
-    /// Equivalent to [`Self::new_with_full_hooks`] with no
-    /// readiness predicate.
-    pub fn new_with_all_hooks(
-        orchestrator: Arc<MigrationOrchestrator>,
-        source_handler: Arc<MigrationSourceHandler>,
-        target_handler: Arc<MigrationTargetHandler>,
-        local_node_id: u64,
-        identity_context: Option<MigrationIdentityContext>,
-        post_restore_callback: Option<PostRestoreCallback>,
-        pre_cleanup_callback: Option<PreCleanupCallback>,
-    ) -> Self {
-        Self::new_with_full_hooks(
-            orchestrator,
-            source_handler,
-            target_handler,
-            local_node_id,
-            identity_context,
-            post_restore_callback,
-            pre_cleanup_callback,
-            None,
-        )
-    }
-
-    /// Create a handler with every hook + the readiness predicate.
-    /// Convenience — falls through to [`Self::new_fully_hooked`]
-    /// with the failure observer unset.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_full_hooks(
-        orchestrator: Arc<MigrationOrchestrator>,
-        source_handler: Arc<MigrationSourceHandler>,
-        target_handler: Arc<MigrationTargetHandler>,
-        local_node_id: u64,
-        identity_context: Option<MigrationIdentityContext>,
-        post_restore_callback: Option<PostRestoreCallback>,
-        pre_cleanup_callback: Option<PreCleanupCallback>,
-        readiness_callback: Option<ReadinessCallback>,
-    ) -> Self {
-        Self::new_fully_hooked(
-            orchestrator,
-            source_handler,
-            target_handler,
-            local_node_id,
-            identity_context,
-            post_restore_callback,
-            pre_cleanup_callback,
-            readiness_callback,
-            None,
-        )
-    }
-
-    /// Fully-hooked constructor. The SDK's `DaemonRuntime::start`
-    /// uses this form to supply every callback at once; the
-    /// progressive-disclosure variants above are convenience
-    /// entry points for tests and pre-Stage-X callers.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_fully_hooked(
-        orchestrator: Arc<MigrationOrchestrator>,
-        source_handler: Arc<MigrationSourceHandler>,
-        target_handler: Arc<MigrationTargetHandler>,
-        local_node_id: u64,
-        identity_context: Option<MigrationIdentityContext>,
-        post_restore_callback: Option<PostRestoreCallback>,
-        pre_cleanup_callback: Option<PreCleanupCallback>,
-        readiness_callback: Option<ReadinessCallback>,
-        failure_callback: Option<FailureCallback>,
+        hooks: MigrationHandlerHooks,
     ) -> Self {
         Self {
             orchestrator,
@@ -305,11 +235,11 @@ impl MigrationSubprotocolHandler {
             target_handler,
             local_node_id,
             reassemblers: DashMap::new(),
-            identity_context,
-            post_restore_callback,
-            pre_cleanup_callback,
-            readiness_callback,
-            failure_callback,
+            identity_context: hooks.identity,
+            post_restore_callback: hooks.post_restore,
+            pre_cleanup_callback: hooks.pre_cleanup,
+            readiness_callback: hooks.readiness,
+            failure_callback: hooks.failure,
         }
     }
 
