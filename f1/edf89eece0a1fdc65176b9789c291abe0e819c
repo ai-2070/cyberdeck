@@ -1,0 +1,39 @@
+net/crates/net/sdk-ts/test/compute.test.ts
+  5bf3f089eecaef7a 11-17,120-232
+net/crates/net/bindings/node/src/identity.rs
+  5bf3f089eecaef7a 276-289
+net/crates/net/bindings/node/index.js
+  5bf3f089eecaef7a 579
+net/crates/net/bindings/node/src/lib.rs
+  5bf3f089eecaef7a 1768,1774
+net/crates/net/sdk-ts/src/index.ts
+  5bf3f089eecaef7a 121-127
+net/crates/net/bindings/node/index.d.ts
+  5bf3f089eecaef7a 4-23,74-98,879-891
+net/crates/net/sdk/src/compute.rs
+  5bf3f089eecaef7a 633-706
+net/crates/net/bindings/node/src/compute.rs
+  5bf3f089eecaef7a 8-15,27,31-34,125-128,198-380
+net/crates/net/sdk-ts/src/compute.ts
+  5bf3f089eecaef7a 33,36,111-163,256-304
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "f1edf89eece0a1fdc65176b9789c291abe0e819c",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 5654,
+      "total_deletions": 5321,
+      "accepted_lines": 586,
+      "overriden_lines": 0
+    }
+  }
+}
