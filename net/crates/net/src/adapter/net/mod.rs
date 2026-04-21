@@ -543,7 +543,11 @@ impl NetAdapter {
         }
         let decrypted = match rx_cipher.decrypt(counter, &aad, &parsed.payload) {
             Ok(d) => {
-                rx_cipher.update_rx_counter(counter);
+                // Commit-time replay check: closes the TOCTOU race where
+                // two threads decrypt the same replayed packet concurrently.
+                if !rx_cipher.update_rx_counter(counter) {
+                    return;
+                }
                 d
             }
             Err(_) => return,

@@ -12,7 +12,7 @@ use chacha20poly1305::{
 };
 use snow::{params::NoiseParams, Builder, HandshakeState};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::protocol::{NONCE_SIZE, TAG_SIZE};
 
@@ -340,7 +340,115 @@ pub struct PacketCipher {
     session_prefix: [u8; 4],
     /// TX counter — owned or shared with other ciphers in a pool.
     tx_counter: Arc<AtomicU64>,
-    rx_counter: AtomicU64,
+    /// Sliding-window replay state for received counters. A single counter
+    /// range check cannot prevent replay: an attacker resending a previously
+    /// decrypted packet produces identical AEAD output, so we must track
+    /// which counters have already been committed inside the window.
+    rx_window: Mutex<ReplayWindow>,
+}
+
+/// Sliding-window replay protection.
+///
+/// Bit `i` of `bitmap` is set iff counter `rx_counter - 1 - i` has been
+/// committed (decrypted and accepted). `rx_counter` is `1 + highest_seen`,
+/// starting at 0 meaning "nothing received yet". The bitmap is only
+/// meaningful once `rx_counter > 0`.
+#[derive(Debug)]
+struct ReplayWindow {
+    rx_counter: u64,
+    bitmap: [u64; Self::BITMAP_WORDS],
+}
+
+impl ReplayWindow {
+    const WINDOW_SIZE: u64 = 1024;
+    const MAX_FORWARD: u64 = 65536;
+    const BITMAP_WORDS: usize = 16;
+
+    const fn new() -> Self {
+        Self {
+            rx_counter: 0,
+            bitmap: [0; Self::BITMAP_WORDS],
+        }
+    }
+
+    /// Read-only check: is `received` in range and not yet committed?
+    fn is_valid(&self, received: u64) -> bool {
+        if received >= self.rx_counter {
+            received.saturating_sub(self.rx_counter) <= Self::MAX_FORWARD
+        } else {
+            let age = self.rx_counter - 1 - received;
+            if age >= Self::WINDOW_SIZE {
+                return false;
+            }
+            let word = (age / 64) as usize;
+            let bit = age % 64;
+            self.bitmap[word] & (1u64 << bit) == 0
+        }
+    }
+
+    /// Commit `received` as seen. Returns `true` iff this call was the one
+    /// that marked it — a `false` return means the counter was already
+    /// committed by a concurrent caller (replay detected at commit time) or
+    /// is outside the retained window.
+    fn commit(&mut self, received: u64) -> bool {
+        if received >= self.rx_counter {
+            // saturating_add guards `received == u64::MAX` (with
+            // rx_counter == 0 the `+ 1` would panic in debug and wrap
+            // in release). shift_bitmap_up already clamps at
+            // BITMAP_WORDS * 64, so a saturated value is still safe.
+            let shift = (received - self.rx_counter).saturating_add(1);
+            self.shift_bitmap_up(shift);
+            self.rx_counter = received.saturating_add(1);
+            self.bitmap[0] |= 1u64;
+            true
+        } else {
+            let age = self.rx_counter - 1 - received;
+            if age >= Self::WINDOW_SIZE {
+                return false;
+            }
+            let word = (age / 64) as usize;
+            let bit = age % 64;
+            let mask = 1u64 << bit;
+            let was_set = self.bitmap[word] & mask != 0;
+            self.bitmap[word] |= mask;
+            !was_set
+        }
+    }
+
+    fn shift_bitmap_up(&mut self, shift: u64) {
+        if shift == 0 {
+            return;
+        }
+        if shift >= (Self::BITMAP_WORDS as u64) * 64 {
+            self.bitmap = [0; Self::BITMAP_WORDS];
+            return;
+        }
+        let word_shift = (shift / 64) as usize;
+        let bit_shift = (shift % 64) as u32;
+        if bit_shift == 0 {
+            for i in (0..Self::BITMAP_WORDS).rev() {
+                self.bitmap[i] = if i >= word_shift {
+                    self.bitmap[i - word_shift]
+                } else {
+                    0
+                };
+            }
+        } else {
+            for i in (0..Self::BITMAP_WORDS).rev() {
+                let hi = if i >= word_shift {
+                    self.bitmap[i - word_shift] << bit_shift
+                } else {
+                    0
+                };
+                let lo = if i > word_shift {
+                    self.bitmap[i - word_shift - 1] >> (64 - bit_shift)
+                } else {
+                    0
+                };
+                self.bitmap[i] = hi | lo;
+            }
+        }
+    }
 }
 
 impl PacketCipher {
@@ -350,7 +458,7 @@ impl PacketCipher {
             cipher: ChaCha20Poly1305::new(key.into()),
             session_prefix: (session_id as u32).to_le_bytes(),
             tx_counter: Arc::new(AtomicU64::new(0)),
-            rx_counter: AtomicU64::new(0),
+            rx_window: Mutex::new(ReplayWindow::new()),
         }
     }
 
@@ -368,7 +476,7 @@ impl PacketCipher {
             cipher: ChaCha20Poly1305::new(key.into()),
             session_prefix: (session_id as u32).to_le_bytes(),
             tx_counter,
-            rx_counter: AtomicU64::new(0),
+            rx_window: Mutex::new(ReplayWindow::new()),
         }
     }
 
@@ -486,37 +594,44 @@ impl PacketCipher {
         Ok(plaintext_len)
     }
 
-    /// Update the expected RX counter (for replay protection)
+    /// Commit a received counter as seen. Must be called only after the
+    /// packet has been successfully decrypted and authenticated.
+    ///
+    /// Returns `true` if the counter was genuinely novel; `false` if it was
+    /// already committed by a concurrent caller or has slid out of the
+    /// replay window. On `false`, the caller MUST drop the packet — this
+    /// closes the TOCTOU race between [`Self::is_valid_rx_counter`] and
+    /// this call when two threads decrypt the same replayed packet
+    /// concurrently.
     #[inline]
-    pub fn update_rx_counter(&self, received: u64) {
-        // Only update if received is higher (simple replay protection).
-        // saturating_add avoids wrapping to 0 if received == u64::MAX.
-        let _ = self
-            .rx_counter
-            .fetch_max(received.saturating_add(1), Ordering::Release);
+    pub fn update_rx_counter(&self, received: u64) -> bool {
+        let mut w = self
+            .rx_window
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        w.commit(received)
     }
 
-    /// Check if a received counter is valid (basic replay protection)
+    /// Check if a received counter is in the accept range and has not yet
+    /// been committed. Does not change state; callers still race with
+    /// [`Self::update_rx_counter`], which returns `false` on replay.
     #[inline]
     pub fn is_valid_rx_counter(&self, received: u64) -> bool {
-        // Allow some window for out-of-order packets, but also cap how far
-        // ahead a counter may be. Without the forward limit, a single packet
-        // with a very large counter would advance rx_counter and deny all
-        // subsequent legitimate packets until the sender catches up.
-        const REPLAY_WINDOW: u64 = 1024;
-        const MAX_FORWARD: u64 = 65536;
-        let expected = self.rx_counter.load(Ordering::Acquire);
-        received >= expected.saturating_sub(REPLAY_WINDOW)
-            && received <= expected.saturating_add(MAX_FORWARD)
+        let w = self
+            .rx_window
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        w.is_valid(received)
     }
 }
 
 impl std::fmt::Debug for PacketCipher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let rx_counter = self.rx_window.try_lock().map(|w| w.rx_counter).unwrap_or(0);
         f.debug_struct("PacketCipher")
             .field("algorithm", &"ChaCha20-Poly1305")
             .field("tx_counter", &self.tx_counter.load(Ordering::Relaxed))
-            .field("rx_counter", &self.rx_counter.load(Ordering::Relaxed))
+            .field("rx_counter", &rx_counter)
             .finish()
     }
 }
@@ -851,25 +966,126 @@ mod tests {
     #[test]
     fn test_regression_rx_counter_u64_max_no_wrap() {
         // Regression: update_rx_counter used `received + 1` which wraps to 0
-        // when received == u64::MAX. fetch_max(0) would be a no-op, but in
-        // debug mode the addition panics. Now uses saturating_add.
+        // when received == u64::MAX. Now uses saturating_add in commit().
         let key = [0x42u8; 32];
         let cipher = PacketCipher::new(&key, 0x1234);
 
         // Advance counter to a high value first
-        cipher.update_rx_counter(1000);
+        assert!(cipher.update_rx_counter(1000));
 
         // u64::MAX would be rejected by is_valid_rx_counter (beyond
         // MAX_FORWARD), but if it somehow reached update_rx_counter,
         // it must not wrap the counter to 0.
-        cipher.update_rx_counter(u64::MAX);
+        assert!(cipher.update_rx_counter(u64::MAX));
 
-        // Counter should be u64::MAX (saturated), not 0 (wrapped)
-        let counter = cipher.rx_counter.load(std::sync::atomic::Ordering::Acquire);
+        // Counter should saturate at u64::MAX, not wrap to 0.
+        let counter = cipher.rx_window.lock().unwrap().rx_counter;
         assert_eq!(
             counter,
             u64::MAX,
             "rx_counter must saturate at u64::MAX, not wrap to 0"
+        );
+    }
+
+    #[test]
+    fn test_replay_bitmap_rejects_duplicate_counter() {
+        // Regression: `is_valid_rx_counter` used to only check that a
+        // received counter fell inside a ±window around the max seen
+        // value and did not track which specific counters had already
+        // been processed. An attacker could replay a decrypted packet
+        // with the same counter and pass both the range check and
+        // AEAD decryption, because (key, nonce, ciphertext) is
+        // deterministic. The sliding-window bitmap now catches this.
+        let key = [0x42u8; 32];
+        let cipher = PacketCipher::new(&key, 0x1234);
+
+        // First delivery: novel → accepted and committed.
+        assert!(cipher.is_valid_rx_counter(100));
+        assert!(cipher.update_rx_counter(100));
+
+        // Replay of the same counter: rejected on both sides.
+        assert!(
+            !cipher.is_valid_rx_counter(100),
+            "replayed counter must fail the validity check"
+        );
+        assert!(
+            !cipher.update_rx_counter(100),
+            "replayed counter must fail the commit-time check too, \
+             closing the TOCTOU race between check and commit"
+        );
+
+        // Out-of-order but distinct counter within the window: accepted once.
+        assert!(cipher.is_valid_rx_counter(50));
+        assert!(cipher.update_rx_counter(50));
+        // Same counter replayed: rejected.
+        assert!(!cipher.is_valid_rx_counter(50));
+        assert!(!cipher.update_rx_counter(50));
+
+        // Counters outside the window after the peer advances far ahead
+        // remain rejected.
+        assert!(cipher.update_rx_counter(10_000));
+        assert!(
+            !cipher.is_valid_rx_counter(100),
+            "counter that has slid out of the window is no longer valid"
+        );
+    }
+
+    #[test]
+    fn test_replay_window_tracks_bits_across_slide() {
+        // After the window slides forward by less than its full width,
+        // previously-seen counters that are still inside the window must
+        // remain marked as seen.
+        let key = [0x42u8; 32];
+        let cipher = PacketCipher::new(&key, 0x1234);
+
+        // Commit a sparse set of counters.
+        assert!(cipher.update_rx_counter(10));
+        assert!(cipher.update_rx_counter(20));
+        assert!(cipher.update_rx_counter(30));
+
+        // Slide forward by 500 (well inside the 1024-wide window).
+        assert!(cipher.update_rx_counter(530));
+
+        // The earlier counters must still be rejected as replays.
+        for c in [10u64, 20, 30, 530] {
+            assert!(
+                !cipher.is_valid_rx_counter(c),
+                "counter {c} should remain marked as seen after window slide"
+            );
+            assert!(
+                !cipher.update_rx_counter(c),
+                "commit of already-seen counter {c} must return false"
+            );
+        }
+
+        // A never-seen counter still inside the window is accepted.
+        assert!(cipher.is_valid_rx_counter(25));
+        assert!(cipher.update_rx_counter(25));
+    }
+
+    #[test]
+    fn test_replay_commit_rejects_out_of_window_counter() {
+        // A counter that has already slid out of the 1024-wide retained
+        // window must be rejected by both `is_valid_rx_counter` and
+        // `update_rx_counter`. Otherwise an attacker could resurrect a
+        // very old, previously-decrypted packet once the bitmap no
+        // longer remembers it.
+        let key = [0x42u8; 32];
+        let cipher = PacketCipher::new(&key, 0x1234);
+
+        // Advance rx_counter well past the 1024-wide window.
+        assert!(cipher.update_rx_counter(5_000));
+
+        // Counter 100 is now 4899 behind rx_counter-1 (= 4999), far past
+        // the 1024 window. Both the read-only check and the commit must
+        // reject it.
+        assert!(
+            !cipher.is_valid_rx_counter(100),
+            "out-of-window counter must fail validity"
+        );
+        assert!(
+            !cipher.update_rx_counter(100),
+            "out-of-window counter must also fail at commit time"
         );
     }
 }

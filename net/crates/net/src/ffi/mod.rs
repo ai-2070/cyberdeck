@@ -119,15 +119,24 @@ struct FfiOpGuard<'a> {
 
 impl<'a> FfiOpGuard<'a> {
     /// Try to enter an FFI operation. Returns `None` if the handle is shutting down.
+    ///
+    /// The fetch_add on `active_ops` and the load of `shutting_down` here,
+    /// together with the store on `shutting_down` and the load of
+    /// `active_ops` in `net_shutdown`, form a Dekker-style handshake
+    /// across two separate atomics. Release/Acquire only orders operations
+    /// on the *same* variable, so it is legal under that ordering for both
+    /// sides to see the "pre" value of the other atomic simultaneously —
+    /// the caller would then proceed into an FFI op while the shutdown
+    /// frees the handle, causing a use-after-free. `SeqCst` imposes a
+    /// single total order over these four operations, eliminating that
+    /// possibility.
     fn try_enter(handle: &'a NetHandle) -> Option<Self> {
         handle
             .active_ops
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        // Re-check shutdown after incrementing — if shutdown was signaled
-        // between our check_shutting_down and fetch_add, we must bail out.
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if handle
             .shutting_down
-            .load(std::sync::atomic::Ordering::Acquire)
+            .load(std::sync::atomic::Ordering::SeqCst)
         {
             handle
                 .active_ops
@@ -168,6 +177,8 @@ pub enum NetError {
     BufferTooSmall = -7,
     /// Shutting down.
     ShuttingDown = -8,
+    /// Integer overflow: result does not fit in `c_int`.
+    IntOverflow = -9,
     /// Unknown error.
     Unknown = -99,
 }
@@ -554,7 +565,10 @@ pub extern "C" fn net_ingest_raw_batch(
     }
 
     let count = handle.bus.ingest_raw_batch(events);
-    c_int::try_from(count).unwrap_or(c_int::MAX)
+    // Returning `c_int::MAX` on overflow would be ambiguous with a real
+    // `INT_MAX` ingest. Signal overflow explicitly so callers doing
+    // accounting in high-throughput paths do not silently miscount.
+    c_int::try_from(count).unwrap_or_else(|_| NetError::IntOverflow.into())
 }
 
 /// Ingest multiple events.
@@ -593,7 +607,10 @@ pub extern "C" fn net_ingest_batch(handle: *mut NetHandle, events_json: *const c
     let events: Vec<Event> = array.into_iter().map(Event::new).collect();
     let count = handle.bus.ingest_batch(events);
 
-    c_int::try_from(count).unwrap_or(c_int::MAX)
+    // Returning `c_int::MAX` on overflow would be ambiguous with a real
+    // `INT_MAX` ingest. Signal overflow explicitly — matches the
+    // `net_ingest_raw_batch` contract.
+    c_int::try_from(count).unwrap_or_else(|_| NetError::IntOverflow.into())
 }
 
 /// Poll events from the bus.
@@ -807,17 +824,22 @@ pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
 
     // Signal shutdown *before* taking ownership so that concurrent FFI
     // calls on other threads see the flag and bail out early.
+    //
+    // The store on `shutting_down` and the subsequent load on `active_ops`
+    // both use `SeqCst` to pair with `FfiOpGuard::try_enter` — see the
+    // comment there for why Release/Acquire is not sufficient for this
+    // Dekker-style handshake across two atomics.
     let handle_ref = unsafe { &*handle };
     handle_ref
         .shutting_down
-        .store(true, std::sync::atomic::Ordering::Release);
+        .store(true, std::sync::atomic::Ordering::SeqCst);
 
     // Spin-wait until all in-flight FFI operations have completed.
     // Each operation holds an FfiOpGuard that decrements active_ops on drop,
     // so this loop is bounded by the longest concurrent FFI call.
     while handle_ref
         .active_ops
-        .load(std::sync::atomic::Ordering::Acquire)
+        .load(std::sync::atomic::Ordering::SeqCst)
         > 0
     {
         std::hint::spin_loop();
