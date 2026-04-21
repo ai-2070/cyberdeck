@@ -496,7 +496,7 @@ Same "not microsecond-latency" caveat.
 ### Factory registration semantics
 
 - **Kind strings are global per runtime.** A user cannot register `"echo"` twice with different factories. SDK error: `DaemonError::FactoryAlreadyRegistered`. Consistent across all SDKs.
-- **Restore after process restart.** On restart the runtime has no factory table until the user re-registers. If migration is in-flight against a restart, the target errors `FactoryNotFound`. Document: factories must be registered before the user starts accepting migrations.
+- **Restore after process restart.** On restart the runtime has no factory table until the user re-registers. If migration is in-flight against a restart, the target errors `FactoryNotFound`. [`DAEMON_RUNTIME_READINESS_PLAN.md`](DAEMON_RUNTIME_READINESS_PLAN.md) closes this gap: it adds a `Registering → Ready` lifecycle on `DaemonRuntime` so the mesh can't accept migrations before factories are registered, structured reason codes on `MigrationFailed` so the source can distinguish "target is booting" from "target doesn't host this kind," and bounded source-side retry on the former. Until that plan lands, the user must guarantee all factories are registered before `Mesh::start()` returns.
 - **Cross-SDK restore.** A daemon snapshotted on a Rust node, migrated to a JS node, depends on the JS side having a factory registered for the same `kind`. Recommend convention: use the same `kind` strings across languages for conceptually-equivalent daemons.
 
 ### Scope cuts
