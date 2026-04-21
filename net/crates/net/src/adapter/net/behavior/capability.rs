@@ -716,8 +716,25 @@ pub struct CapabilityAnnouncement {
     /// announcements at or beyond the cap are dropped rather than
     /// re-broadcast. Old-format announcements missing this field
     /// deserialize as 0 via `#[serde(default)]`.
-    #[serde(default)]
+    ///
+    /// `skip_serializing_if` omits the field when it's zero so the
+    /// SIGNED byte form stays identical to pre-M-1 announcements —
+    /// a pre-M-1 node's signature verifies on a post-M-1 node
+    /// during a rolling upgrade because both produce the same
+    /// canonical bytes for the origin (hop_count=0). Forwarded
+    /// announcements (hop_count > 0) serialize the field; receivers
+    /// still zero it in `signed_payload()` so verification hits the
+    /// omitted-when-zero form.
+    #[serde(default, skip_serializing_if = "is_hop_count_zero")]
     pub hop_count: u8,
+}
+
+/// Serde predicate: skip serializing `hop_count` when it's zero.
+/// Preserves on-wire byte-compat with pre-M-1 announcements that
+/// didn't carry this field at all. See
+/// [`CapabilityAnnouncement::hop_count`] for the rationale.
+fn is_hop_count_zero(v: &u8) -> bool {
+    *v == 0
 }
 
 /// Hard cap on `CapabilityAnnouncement::hop_count`. Mirrors the
@@ -1787,5 +1804,135 @@ mod tests {
         // MAX_HOPS. If the pingwave side is ever renumbered this
         // test flags the divergence at compile time.
         assert_eq!(MAX_CAPABILITY_HOPS, 16);
+    }
+
+    /// Regression for a cubic-flagged P1: adding `hop_count` to the
+    /// signed canonical serialization broke rolling-upgrade
+    /// compatibility — pre-M-1 announcements were signed over bytes
+    /// that had no `hop_count` key, so a post-M-1 verifier's
+    /// recomputed `signed_payload()` (which unconditionally
+    /// serialized `hop_count: 0`) produced different bytes and the
+    /// signature failed.
+    ///
+    /// The fix is `#[serde(skip_serializing_if = "is_hop_count_zero")]`:
+    /// both pre-M-1 signers AND post-M-1 signed_payload (which
+    /// always zeros hop_count) omit the field, producing identical
+    /// canonical bytes.
+    ///
+    /// Approach: construct a mirror struct matching pre-M-1's layout
+    /// (same fields, no hop_count) and compare its serialized output
+    /// byte-for-byte with the current node's `signed_payload()`.
+    /// Can't use `serde_json::json!` — that goes through
+    /// `serde_json::Map` which sorts keys alphabetically, whereas
+    /// `CapabilityAnnouncement`'s derived Serialize writes in
+    /// struct-declaration order. The mirror struct keeps the same
+    /// serialization path.
+    #[test]
+    fn signed_payload_stays_compatible_with_pre_hop_count_format() {
+        use super::super::super::identity::{EntityId, EntityKeypair};
+
+        // Mirror of the pre-M-1 `CapabilityAnnouncement` layout —
+        // fields match in declaration order, no `hop_count`.
+        #[derive(Serialize)]
+        struct PreM1Announcement {
+            node_id: u64,
+            entity_id: EntityId,
+            version: u64,
+            timestamp_ns: u64,
+            ttl_secs: u32,
+            capabilities: CapabilitySet,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            signature: Option<Signature64>,
+        }
+
+        let keypair = EntityKeypair::generate();
+        let caps = sample_capability_set();
+
+        let ann = CapabilityAnnouncement::new(
+            1,
+            keypair.entity_id().clone(),
+            1,
+            caps.clone(),
+        );
+        let pre_m1 = PreM1Announcement {
+            node_id: ann.node_id,
+            entity_id: ann.entity_id.clone(),
+            version: ann.version,
+            timestamp_ns: ann.timestamp_ns,
+            ttl_secs: ann.ttl_secs,
+            capabilities: ann.capabilities.clone(),
+            signature: None,
+        };
+        let pre_m1_bytes = serde_json::to_vec(&pre_m1).expect("pre-M-1 serialize");
+
+        // Post-M-1 signed_payload — clones, zeros hop_count, sets
+        // signature=None, serializes via the derived Serialize
+        // (same struct-order path as PreM1Announcement).
+        let new_signed = ann.signed_payload();
+
+        assert_eq!(
+            pre_m1_bytes, new_signed,
+            "signed_payload bytes must be byte-identical to pre-M-1 \
+             serialization — otherwise signatures issued before M-1 \
+             fail verification after a rolling upgrade.\n  \
+             pre-M-1:  {}\n  post-M-1: {}",
+            std::str::from_utf8(&pre_m1_bytes).unwrap_or("<non-utf8>"),
+            std::str::from_utf8(&new_signed).unwrap_or("<non-utf8>"),
+        );
+        assert!(
+            !std::str::from_utf8(&new_signed).unwrap().contains("hop_count"),
+            "signed_payload must not contain 'hop_count' when zero",
+        );
+
+        // End-to-end: sign with pre-M-1 bytes (what an old node
+        // would have produced), construct a wire payload carrying
+        // that signature, parse via post-M-1 `from_bytes`, and
+        // verify. Must succeed.
+        let sig = keypair.sign(&pre_m1_bytes);
+        let signed_mirror = PreM1Announcement {
+            node_id: ann.node_id,
+            entity_id: ann.entity_id.clone(),
+            version: ann.version,
+            timestamp_ns: ann.timestamp_ns,
+            ttl_secs: ann.ttl_secs,
+            capabilities: ann.capabilities.clone(),
+            signature: Some(Signature64(sig.to_bytes())),
+        };
+        let wire_bytes = serde_json::to_vec(&signed_mirror).expect("serialize wire");
+        let parsed = CapabilityAnnouncement::from_bytes(&wire_bytes)
+            .expect("post-M-1 parses pre-M-1 wire format");
+        assert_eq!(parsed.hop_count, 0);
+        assert!(
+            parsed.verify().is_ok(),
+            "signature computed over pre-M-1 bytes must still verify \
+             on a post-M-1 node — rolling-upgrade compatibility",
+        );
+    }
+
+    #[test]
+    fn hop_count_zero_omits_key_while_nonzero_keeps_it() {
+        // Complements the cross-version compat test: proves the
+        // serde predicate behaves as documented — hop_count=0 is
+        // elided (old-format compat) but hop_count=N>0 survives on
+        // the wire so forwarders can read + bump it.
+        let caps = sample_capability_set();
+        let mut ann = CapabilityAnnouncement::new(1, test_entity(), 1, caps);
+
+        let zero_bytes = ann.to_bytes();
+        let zero_str = std::str::from_utf8(&zero_bytes).expect("utf8");
+        assert!(
+            !zero_str.contains("hop_count"),
+            "hop_count=0 must be omitted from serialized output",
+        );
+
+        ann.hop_count = 3;
+        let bumped_bytes = ann.to_bytes();
+        let bumped_str = std::str::from_utf8(&bumped_bytes).expect("utf8");
+        assert!(
+            bumped_str.contains("\"hop_count\":3"),
+            "hop_count>0 must survive serialization so forwarders \
+             can read + bump. Got: {}",
+            bumped_str,
+        );
     }
 }

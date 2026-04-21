@@ -10,6 +10,7 @@ package net
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -477,6 +478,57 @@ func TestDelegation_RejectsUnauthorizedSigner(t *testing.T) {
 	_, err := DelegateToken(stranger, tokenAB, cID, []string{"publish"})
 	if !errors.Is(err, ErrTokenNotAuthorized) {
 		t.Fatalf("want ErrTokenNotAuthorized, got %v", err)
+	}
+}
+
+// Regression for a cubic-flagged P2: `json.Marshal(nil)` produces
+// `"null"`, which the Rust scope parser rejects as "not a list" and
+// maps to the generic `ErrIdentity`. Callers passing `nil` (usually
+// a programming mistake — meant to pass `[]string{}`) got an opaque
+// signal. The Go wrapper now short-circuits with a clear error that
+// wraps `ErrIdentity` and mentions the nil.
+func TestDelegateToken_RejectsNilScope(t *testing.T) {
+	a, _ := GenerateIdentity()
+	defer a.Close()
+	b, _ := GenerateIdentity()
+	defer b.Close()
+	c, _ := GenerateIdentity()
+	defer c.Close()
+
+	bID, _ := b.EntityID()
+	cID, _ := c.EntityID()
+	tokenAB := issueTestToken(t, a, bID, []string{"publish", "delegate"}, "topic", 3600, 2)
+
+	_, err := DelegateToken(b, tokenAB, cID, nil)
+	if !errors.Is(err, ErrIdentity) {
+		t.Fatalf("want err wrapping ErrIdentity, got %v", err)
+	}
+	// Message should mention the specific cause so callers don't
+	// have to dig — confirms we're not just returning bare
+	// `ErrIdentity`.
+	if !strings.Contains(err.Error(), "nil") {
+		t.Fatalf("err should mention nil scope, got %q", err.Error())
+	}
+}
+
+func TestIssueToken_RejectsNilScope(t *testing.T) {
+	issuer, _ := GenerateIdentity()
+	defer issuer.Close()
+	subject, _ := GenerateIdentity()
+	defer subject.Close()
+
+	subID, _ := subject.EntityID()
+	_, err := issuer.IssueToken(IssueTokenRequest{
+		Subject:    subID,
+		Scope:      nil,
+		Channel:    "topic",
+		TTLSeconds: 60,
+	})
+	if !errors.Is(err, ErrIdentity) {
+		t.Fatalf("want err wrapping ErrIdentity, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "nil") {
+		t.Fatalf("err should mention nil scope, got %q", err.Error())
 	}
 }
 

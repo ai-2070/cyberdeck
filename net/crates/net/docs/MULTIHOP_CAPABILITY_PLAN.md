@@ -2,8 +2,18 @@
 
 **Status.** Stages M-1 through M-7 complete. Multi-hop capability
 propagation ships with hop-count=16, TTL-based dedup, origin rate
-limiting, route install from receipt, and 5 integration tests on
-top of the existing direct-peer suite.
+limiting, route install from receipt, **6 unit tests** (M-1 wire
+format + signature invariants in `capability.rs`) and **5
+integration tests** (`tests/capability_multihop.rs`) on top of the
+existing direct-peer suite. The test plan below originally listed 8
+integration tests; three were deferred to follow-ups —
+`hop_count_exhaustion_drops_announcement` needs 17+ nodes or a
+crafted-payload injection API, `tampered_forward_fails_verification`
+is covered by the signature-rejection unit test + the dispatch
+handler's verify gate, and `split_horizon_skips_origin_nearest_hop`
+needs a fuller pingwave-established-routes fixture. Rationale is
+inline in `tests/capability_multihop.rs` at the bottom of the
+file.
 
 ## Context
 
@@ -243,15 +253,32 @@ Plus SDK-layer tests:
   mesh with 1 announcement per node per 5 min → 10k entries at
   steady state, ~400 KB. Sweep in heartbeat (already scheduled)
   evicts expired entries. Not a concern for realistic scales.
-- **Signature forgery at the hop_count boundary.** Putting hop_count
-  *outside* the signed envelope means a malicious forwarder can
-  decrement it (propagate further) or set it to MAX_HOPS-1 (truncate
-  propagation). Both are contained: former by MAX_HOPS absolute cap,
-  latter only hurts the origin's reach by one hop. Explicit signing
-  of hop_count would force re-signing at every hop (requires the
-  forwarder to have the origin's secret key — not available), so
-  the "mutable routing metadata outside signature" compromise is
-  standard.
+- **Hop-count tampering (trust assumption, not a bound).** Putting
+  hop_count *outside* the signed envelope means a malicious
+  forwarder can decrement it — including resetting to 0 at every
+  hop — to extend an announcement's reach arbitrarily beyond the
+  intended `MAX_HOPS` horizon. The `MAX_HOPS` cap is a
+  *per-sender, per-hop* bound, not an end-to-end guarantee: an
+  attacker with control of one forwarder node can sustain
+  propagation across multiple malicious nodes by resetting the
+  counter at each handoff.
+  What IS bounded end-to-end:
+    1. Integrity — the signed payload (everything except hop_count)
+       can't be altered without invalidating the origin's ed25519
+       signature.
+    2. Origin authenticity — the `(node_id → entity_id)` TOFU pin
+       means a forwarder can't forge an announcement claiming to
+       be from an unrelated origin.
+    3. Honest-network reach — in a mesh where no node is malicious,
+       `MAX_HOPS = 16` bounds propagation exactly.
+  The alternative (signing hop_count) would require the forwarder
+  to have the origin's secret key, which defeats the "forwarders
+  don't need secrets" property. This is the standard
+  "mutable routing metadata outside signature" trade-off in
+  gossipsub / libp2p / Chord — document it, don't defend against it
+  cryptographically. Defenses against extended propagation by
+  malicious forwarders belong at the reputation / anomaly-detection
+  layer, tracked as a separate concern.
 - **Routing table thrash.** If capabilities and pingwaves install
   different routes to the same destination, the table oscillates.
   Mitigation: capability-installed routes always have metric

@@ -184,7 +184,9 @@ const mesh = await MeshNode.create({
   identitySeed: seed,          // mesh and identity share the keypair
 });
 
-// mesh.entityId() === identity.entityId (both 32-byte Buffers).
+// mesh.entityId().equals(identity.entityId) // true — compare via
+// Buffer.equals(), since `===` on Buffers checks reference identity
+// not byte equality.
 
 // Issue a scoped subscribe grant for another entity.
 const grantee = Identity.generate();
@@ -311,6 +313,17 @@ const publisher = await MeshNode.create({
   identitySeed: pubIdentity.toBytes(),
 });
 
+// Subscriber-side mesh, pinned to subIdentity so the publisher's
+// `require_token` check matches the token's subject against the
+// subscribing peer's entityId.
+const subscriber = await MeshNode.create({
+  bindAddr: '127.0.0.1:9005',
+  psk: '42'.repeat(32),
+  identitySeed: subIdentity.toBytes(),
+});
+// Handshake the pair + start receive loops before any subscribe —
+// omitted here for brevity; see the `Mesh Streams` section.
+
 publisher.registerChannel({
   name: 'events/inference',
   subscribeCaps: { requireTags: ['gpu'] },
@@ -325,7 +338,7 @@ const token = pubIdentity.issueToken({
   ttlSeconds: 300,
 });
 
-// Subscriber side (different MeshNode) — attach the token.
+// Subscriber attaches the token on subscribe.
 await subscriber.subscribeChannel(
   publisher.nodeId(),
   'events/inference',

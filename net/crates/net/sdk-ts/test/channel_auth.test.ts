@@ -140,6 +140,16 @@ describe('Channel authentication', () => {
     };
     a.registerChannel(chan);
 
+    // Wait until A has indexed B — the publisher's
+    // `authorize_subscribe` looks up the subscriber's entity_id in
+    // `peer_entity_ids` BEFORE comparing it against the token
+    // subject. If the announcement hasn't landed yet, A rejects
+    // with `Unauthorized` for the wrong reason (missing entity,
+    // not bad token) and the test flakes positive → negative
+    // under load. Flagged by cubic as a race.
+    const bId = b.nodeId();
+    await waitUntil(() => a.findPeers({}).includes(bId));
+
     // Publisher issues a SUBSCRIBE-scoped token for B.
     const token = aIdentity.issueToken({
       subject: bIdentity.entityId,
@@ -170,6 +180,13 @@ describe('Channel authentication', () => {
 
     const chan: ChannelConfig = { name: 'lab/wrong-subject', requireToken: true };
     a.registerChannel(chan);
+
+    // Same race as `subscribe_accepted_with_valid_token`: if A
+    // hasn't indexed B's announcement yet, the rejection fires on
+    // the "entity unknown" branch, not the "token subject
+    // mismatch" branch we want to exercise.
+    const bId = b.nodeId();
+    await waitUntil(() => a.findPeers({}).includes(bId));
 
     // Token issued for a third, unrelated entity — B attempts
     // to use it anyway. Publisher's cache will be keyed by the

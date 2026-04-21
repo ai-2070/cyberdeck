@@ -240,6 +240,13 @@ func (id *Identity) IssueToken(req IssueTokenRequest) ([]byte, error) {
 	if len(req.Subject) != 32 {
 		return nil, ErrIdentity
 	}
+	// json.Marshal(nil) produces `"null"`, which the Rust scope
+	// parser rejects as "not a list" and reports as a generic
+	// ErrIdentity. Short-circuit with a clearer error so callers
+	// get a readable signal instead of the catch-all.
+	if req.Scope == nil {
+		return nil, fmt.Errorf("%w: scope must not be nil", ErrIdentity)
+	}
 	scopeJSON, err := json.Marshal(req.Scope)
 	if err != nil {
 		return nil, fmt.Errorf("scope marshal: %w", err)
@@ -439,6 +446,17 @@ func DelegateToken(
 	}
 	if len(newSubject) != 32 {
 		return nil, ErrIdentity
+	}
+	// json.Marshal(nil) produces `"null"`, which the Rust scope
+	// parser rejects as "not a list" and reports as a generic
+	// ErrIdentity. Short-circuit with a clearer error so callers
+	// passing `nil` (usually a programming mistake) get a readable
+	// signal. A caller who genuinely wants "no scope" passes
+	// `[]string{}` — delegate's intersection with an empty set
+	// yields an empty-scope child, which is a valid (if useless)
+	// token.
+	if restrictedScope == nil {
+		return nil, fmt.Errorf("%w: restrictedScope must not be nil", ErrIdentity)
 	}
 	scopeJSON, err := json.Marshal(restrictedScope)
 	if err != nil {
