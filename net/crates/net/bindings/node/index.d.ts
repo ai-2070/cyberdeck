@@ -103,7 +103,7 @@ export declare class DaemonRuntime {
    * idiomatic napi-rs pattern for "sync setup, async
    * continuation."
    */
-  spawn(kind: string, identity: Identity, process: (arg: CausalEventJs) => Array<Buffer>, snapshot?: (() => unknown) | undefined | null, restore?: (() => unknown) | undefined | null, config?: DaemonHostConfigJs | undefined | null): Promise<DaemonHandle>
+  spawn(kind: string, identity: Identity, process: (arg: CausalEventJs) => Array<Buffer>, snapshot?: (() => Buffer | null) | undefined | null, restore?: ((arg: Buffer) => unknown) | undefined | null, config?: DaemonHostConfigJs | undefined | null): Promise<DaemonHandle>
   /**
    * Stop a daemon, removing it from the runtime's registry.
    *
@@ -113,6 +113,42 @@ export declare class DaemonRuntime {
    * SDK's error is surfaced verbatim with the `daemon:` prefix.
    */
   stop(originHash: number): Promise<void>
+  /**
+   * Take a snapshot of a running daemon by `origin_hash`.
+   *
+   * Returns the daemon's serialized state as a `Buffer`, or
+   * `null` when the daemon is stateless (no `snapshot` method,
+   * or its `snapshot` returned null). The wire format is the
+   * core's `StateSnapshot::to_bytes` encoding — opaque to JS
+   * callers, but round-trippable via
+   * [`Self::spawn_from_snapshot`].
+   *
+   * Calls into `MeshDaemon::snapshot` on the bridge, which in
+   * turn fires the JS `snapshot` TSFN stored at spawn time.
+   * Same TSFN-blocking pattern as `deliver`.
+   */
+  snapshot(originHash: number): Promise<Buffer | null>
+  /**
+   * Spawn a daemon from a previously-taken `snapshot_bytes`
+   * payload. The daemon instance is built from the
+   * caller-supplied `process` / `snapshot` / `restore` functions
+   * (same shape as [`Self::spawn`]); its state is seeded from
+   * the snapshot via the `restore` TSFN.
+   *
+   * `snapshot_bytes` must be the exact `Buffer` returned by a
+   * prior call to [`Self::snapshot`]; the core validates the
+   * wire magic/version and rejects mismatched bytes as
+   * `daemon: snapshot decode failed`.
+   *
+   * Identity check: the snapshot's `entity_id` must match the
+   * caller's `identity`; mismatch surfaces as
+   * `daemon: snapshot identity mismatch`.
+   *
+   * Same sync-with-PromiseRaw shape as `spawn` — `Function`
+   * values are `!Send`, so we build TSFNs synchronously before
+   * handing off to the async continuation.
+   */
+  spawnFromSnapshot(kind: string, identity: Identity, snapshotBytes: Buffer, process: (arg: CausalEventJs) => Array<Buffer>, snapshot?: (() => Buffer | null) | undefined | null, restore?: ((arg: Buffer) => unknown) | undefined | null, config?: DaemonHostConfigJs | undefined | null): Promise<DaemonHandle>
   /**
    * Deliver a single causal event to the daemon identified by
    * `origin_hash`. Invokes the daemon's JS `process(event)`

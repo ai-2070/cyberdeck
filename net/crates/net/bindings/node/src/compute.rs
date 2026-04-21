@@ -31,7 +31,9 @@ use std::sync::Arc;
 use net::adapter::net::behavior::capability::CapabilityFilter;
 use net::adapter::net::compute::{DaemonError as CoreDaemonError, DaemonHostConfig, MeshDaemon};
 use net::adapter::net::state::causal::CausalEvent;
-use net_sdk::compute::{DaemonHandle as SdkDaemonHandle, DaemonRuntime as SdkDaemonRuntime};
+use net_sdk::compute::{
+    DaemonHandle as SdkDaemonHandle, DaemonRuntime as SdkDaemonRuntime, StateSnapshot,
+};
 use net_sdk::mesh::Mesh as SdkMesh;
 
 use crate::NetMesh;
@@ -92,21 +94,26 @@ type ProcessTsfn = napi::threadsafe_function::ThreadsafeFunction<
     false,
 >;
 
-/// `snapshot` TSFN — invoked by the SDK when `take_snapshot` is
-/// requested. Takes no args; returns `Buffer | null`.
-///
-/// Sub-step 3 stores this but doesn't yet call it — snapshot
-/// wiring lands in sub-step 4. Kept at the generic shape for
-/// now; sub-step 4 will swap to
-/// `ThreadsafeFunction<(), Option<Buffer>, (), Status, false>`.
-type SnapshotTsfn = FactoryTsfn;
+/// `snapshot` TSFN — invoked by the SDK's `take_snapshot` path.
+/// Takes no args; returns `Buffer | null` which napi-rs marshals
+/// into `Option<Buffer>` via `FromNapiValue`. A stateless daemon
+/// returns `null`, which propagates as `Option<Bytes>::None` to
+/// the core.
+type SnapshotTsfn =
+    napi::threadsafe_function::ThreadsafeFunction<(), Option<Buffer>, (), napi::Status, false>;
 
 /// `restore` TSFN — invoked by the SDK on
-/// `DaemonHost::from_snapshot`. Takes one `Buffer`; return value
-/// ignored.
-///
-/// Same sub-step-4 note as [`SnapshotTsfn`].
-type RestoreTsfn = FactoryTsfn;
+/// `DaemonHost::from_snapshot`. Takes one `Buffer` (the daemon's
+/// serialized state) and returns nothing useful — we only care
+/// whether JS throws. `UnknownReturnValue` is napi-rs's `'static`
+/// placeholder for "discard the return value."
+type RestoreTsfn = napi::threadsafe_function::ThreadsafeFunction<
+    Buffer,
+    napi::threadsafe_function::UnknownReturnValue,
+    Buffer,
+    napi::Status,
+    false,
+>;
 
 /// Per-runtime compute surface. One instance per `NetMesh`; clone
 /// handles are `Arc`-shared internally.
@@ -267,8 +274,8 @@ impl DaemonRuntime {
         kind: String,
         identity: &crate::identity::Identity,
         process: Function<'_, CausalEventJs, Vec<Buffer>>,
-        snapshot: Option<Function<'_, (), napi::threadsafe_function::UnknownReturnValue>>,
-        restore: Option<Function<'_, (), napi::threadsafe_function::UnknownReturnValue>>,
+        snapshot: Option<Function<'_, (), Option<Buffer>>>,
+        restore: Option<Function<'_, Buffer, napi::threadsafe_function::UnknownReturnValue>>,
         config: Option<DaemonHostConfigJs>,
     ) -> Result<napi::bindgen_prelude::PromiseRaw<'env, DaemonHandle>> {
         // Guard: kind must have been registered. Registration is
@@ -341,6 +348,114 @@ impl DaemonRuntime {
             .map_err(|e| daemon_err(e.to_string()))
     }
 
+    /// Take a snapshot of a running daemon by `origin_hash`.
+    ///
+    /// Returns the daemon's serialized state as a `Buffer`, or
+    /// `null` when the daemon is stateless (no `snapshot` method,
+    /// or its `snapshot` returned null). The wire format is the
+    /// core's `StateSnapshot::to_bytes` encoding — opaque to JS
+    /// callers, but round-trippable via
+    /// [`Self::spawn_from_snapshot`].
+    ///
+    /// Calls into `MeshDaemon::snapshot` on the bridge, which in
+    /// turn fires the JS `snapshot` TSFN stored at spawn time.
+    /// Same TSFN-blocking pattern as `deliver`.
+    #[napi]
+    pub async fn snapshot(&self, origin_hash: u32) -> Result<Option<Buffer>> {
+        let snap = self
+            .inner
+            .snapshot(origin_hash)
+            .await
+            .map_err(|e| daemon_err(e.to_string()))?;
+        Ok(snap.map(|s| Buffer::from(s.to_bytes())))
+    }
+
+    /// Spawn a daemon from a previously-taken `snapshot_bytes`
+    /// payload. The daemon instance is built from the
+    /// caller-supplied `process` / `snapshot` / `restore` functions
+    /// (same shape as [`Self::spawn`]); its state is seeded from
+    /// the snapshot via the `restore` TSFN.
+    ///
+    /// `snapshot_bytes` must be the exact `Buffer` returned by a
+    /// prior call to [`Self::snapshot`]; the core validates the
+    /// wire magic/version and rejects mismatched bytes as
+    /// `daemon: snapshot decode failed`.
+    ///
+    /// Identity check: the snapshot's `entity_id` must match the
+    /// caller's `identity`; mismatch surfaces as
+    /// `daemon: snapshot identity mismatch`.
+    ///
+    /// Same sync-with-PromiseRaw shape as `spawn` — `Function`
+    /// values are `!Send`, so we build TSFNs synchronously before
+    /// handing off to the async continuation.
+    #[napi]
+    pub fn spawn_from_snapshot<'env>(
+        &'env self,
+        env: &'env Env,
+        kind: String,
+        identity: &crate::identity::Identity,
+        snapshot_bytes: Buffer,
+        process: Function<'_, CausalEventJs, Vec<Buffer>>,
+        snapshot: Option<Function<'_, (), Option<Buffer>>>,
+        restore: Option<Function<'_, Buffer, napi::threadsafe_function::UnknownReturnValue>>,
+        config: Option<DaemonHostConfigJs>,
+    ) -> Result<napi::bindgen_prelude::PromiseRaw<'env, DaemonHandle>> {
+        if !self.factories.contains_key(&kind) {
+            return Err(daemon_err(format!(
+                "no factory registered for kind '{kind}'"
+            )));
+        }
+
+        // Decode the snapshot synchronously — cheap, and it lets
+        // us surface a clean error before spinning up any TSFNs.
+        // `from_bytes` returns `Option` (no error detail); the
+        // core would reject mis-framed bytes anyway, but failing
+        // fast here saves allocating the TSFNs and the bridge.
+        let snapshot_decoded = StateSnapshot::from_bytes(snapshot_bytes.as_ref())
+            .ok_or_else(|| daemon_err("snapshot decode failed"))?;
+
+        let process_tsfn: ProcessTsfn = process.build_threadsafe_function().build()?;
+        let snapshot_tsfn: Option<SnapshotTsfn> = match snapshot {
+            Some(f) => Some(f.build_threadsafe_function().build()?),
+            None => None,
+        };
+        let restore_tsfn: Option<RestoreTsfn> = match restore {
+            Some(f) => Some(f.build_threadsafe_function().build()?),
+            None => None,
+        };
+
+        let sdk_identity = identity.to_sdk_identity();
+        let sdk_config = config.map(DaemonHostConfig::from).unwrap_or_default();
+        let runtime = self.inner.clone();
+        let kind_label = kind.clone();
+
+        let bridge = Box::new(EventDispatchBridge {
+            name: kind,
+            process: process_tsfn,
+            snapshot: snapshot_tsfn,
+            restore: restore_tsfn,
+        });
+
+        // Same NoopBridge fallback for migration-target reconstruction
+        // as `spawn` — see comment there for why.
+        let kind_factory =
+            move || -> Box<dyn MeshDaemon> { Box::new(NoopBridge::new(kind_label.clone())) };
+
+        env.spawn_future(async move {
+            runtime
+                .spawn_from_snapshot_with_daemon(
+                    sdk_identity,
+                    snapshot_decoded,
+                    sdk_config,
+                    bridge,
+                    kind_factory,
+                )
+                .await
+                .map(DaemonHandle::from_sdk)
+                .map_err(|e| daemon_err(e.to_string()))
+        })
+    }
+
     /// Deliver a single causal event to the daemon identified by
     /// `origin_hash`. Invokes the daemon's JS `process(event)`
     /// callback via the `ThreadsafeFunction` stored at `spawn`
@@ -352,11 +467,7 @@ impl DaemonRuntime {
     /// later stage, at which point this method becomes test
     /// sugar rather than the primary entry point.
     #[napi]
-    pub async fn deliver(
-        &self,
-        origin_hash: u32,
-        event: CausalEventJs,
-    ) -> Result<Vec<Buffer>> {
+    pub async fn deliver(&self, origin_hash: u32, event: CausalEventJs) -> Result<Vec<Buffer>> {
         use bytes::Bytes as BytesType;
         use net::adapter::net::state::causal::CausalLink;
 
@@ -513,9 +624,7 @@ impl DaemonHandle {
 struct EventDispatchBridge {
     name: String,
     process: ProcessTsfn,
-    #[allow(dead_code)]
     snapshot: Option<SnapshotTsfn>,
-    #[allow(dead_code)]
     restore: Option<RestoreTsfn>,
 }
 
@@ -546,10 +655,7 @@ impl MeshDaemon for EventDispatchBridge {
     /// caller that reached us (`DaemonRuntime::deliver`) returns
     /// a `Promise` to JS, so the JS caller's `await` yields the
     /// event loop long enough for the TSFN callback to fire.
-    fn process(
-        &mut self,
-        event: &CausalEvent,
-    ) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
+    fn process(&mut self, event: &CausalEvent) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
         let event_js = CausalEventJs::from(event);
         let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<Buffer>>>(1);
 
@@ -573,9 +679,7 @@ impl MeshDaemon for EventDispatchBridge {
         }
 
         let result = rx.recv().map_err(|e| {
-            CoreDaemonError::ProcessFailed(format!(
-                "JS `process` callback did not respond: {e}"
-            ))
+            CoreDaemonError::ProcessFailed(format!("JS `process` callback did not respond: {e}"))
         })?;
 
         match result {
@@ -595,6 +699,88 @@ impl MeshDaemon for EventDispatchBridge {
             }
             Err(e) => Err(CoreDaemonError::ProcessFailed(format!(
                 "JS `process` threw: {e}"
+            ))),
+        }
+    }
+
+    /// Synchronously ask the JS `snapshot()` callback for the
+    /// daemon's current state. Same channel-and-block pattern as
+    /// [`Self::process`].
+    ///
+    /// `MeshDaemon::snapshot` returns `Option<Bytes>` (no `Result`),
+    /// so there's no way to surface an error from here. If the JS
+    /// `snapshot` throws or the TSFN enqueue fails, we log a
+    /// warning via `eprintln!` and return `None` — the core
+    /// interprets that as "stateless at this moment" rather than
+    /// "snapshot attempted but failed." Callers who need strict
+    /// error propagation should rely on [`Self::restore`] round-
+    /// trips to catch corrupted state.
+    fn snapshot(&self) -> Option<Bytes> {
+        let tsfn = self.snapshot.as_ref()?;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Option<Buffer>>>(1);
+        let status = tsfn.call_with_return_value(
+            (),
+            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+            move |ret: Result<Option<Buffer>>, _env| {
+                let _ = tx.send(ret);
+                Ok(())
+            },
+        );
+        if status != napi::Status::Ok {
+            eprintln!("EventDispatchBridge::snapshot enqueue failed: {status:?}");
+            return None;
+        }
+        match rx.recv() {
+            Ok(Ok(Some(buf))) => Some(Bytes::copy_from_slice(buf.as_ref())),
+            Ok(Ok(None)) => None,
+            Ok(Err(e)) => {
+                eprintln!("EventDispatchBridge::snapshot JS callback threw: {e}");
+                None
+            }
+            Err(e) => {
+                eprintln!("EventDispatchBridge::snapshot channel recv failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Synchronously invoke the JS `restore(state)` callback.
+    /// Errors propagate back as `CoreDaemonError::RestoreFailed` so
+    /// the core's `DaemonHost::from_snapshot` can reject a bad
+    /// snapshot before any events are processed.
+    ///
+    /// If no `restore` TSFN is installed (user's daemon didn't
+    /// provide one), the state is silently ignored — matches the
+    /// default `MeshDaemon::restore` behaviour in core.
+    fn restore(&mut self, state: Bytes) -> std::result::Result<(), CoreDaemonError> {
+        let tsfn = match self.restore.as_ref() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let buf = Buffer::from(state.as_ref());
+        let (tx, rx) = std::sync::mpsc::sync_channel::<
+            Result<napi::threadsafe_function::UnknownReturnValue>,
+        >(1);
+        let status = tsfn.call_with_return_value(
+            buf,
+            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+            move |ret, _env| {
+                let _ = tx.send(ret);
+                Ok(())
+            },
+        );
+        if status != napi::Status::Ok {
+            return Err(CoreDaemonError::RestoreFailed(format!(
+                "threadsafe_function enqueue failed: {status:?}"
+            )));
+        }
+        let result = rx.recv().map_err(|e| {
+            CoreDaemonError::RestoreFailed(format!("JS `restore` callback did not respond: {e}"))
+        })?;
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => Err(CoreDaemonError::RestoreFailed(format!(
+                "JS `restore` threw: {e}"
             ))),
         }
     }

@@ -321,10 +321,10 @@ export class DaemonRuntime {
       event: CausalEvent,
     ) => Buffer[];
     const snapshot = instance.snapshot
-      ? (instance.snapshot.bind(instance) as () => unknown)
+      ? (instance.snapshot.bind(instance) as () => Buffer | null)
       : undefined;
     const restore = instance.restore
-      ? (instance.restore.bind(instance) as () => unknown)
+      ? (instance.restore.bind(instance) as (state: Buffer) => unknown)
       : undefined;
 
     try {
@@ -342,6 +342,88 @@ export class DaemonRuntime {
           : undefined,
       );
       return new DaemonHandle(handle);
+    } catch (e) {
+      return toDaemonError(e);
+    }
+  }
+
+  /**
+   * Spawn a daemon of `kind` from a previously-taken snapshot.
+   * Parallel to {@link DaemonRuntime.spawn} but seeds the
+   * daemon's initial state from `snapshotBytes` by calling its
+   * `restore` method before any events land.
+   *
+   * `snapshotBytes` must be the exact `Buffer` returned by a
+   * prior call to {@link DaemonRuntime.snapshot}; mismatched or
+   * corrupted bytes surface as `daemon: snapshot decode failed`.
+   *
+   * `kind` must be registered and the caller's {@link Identity}
+   * must match the snapshot's `entityId` — a mismatch throws
+   * {@link DaemonError} before any side effects.
+   */
+  async spawnFromSnapshot(
+    kind: string,
+    identity: Identity,
+    snapshotBytes: Buffer,
+    config?: DaemonHostConfig,
+  ): Promise<DaemonHandle> {
+    const factory = this.factories.get(kind);
+    if (!factory) {
+      throw new DaemonError(`no factory registered for kind '${kind}'`);
+    }
+
+    // Same factory-decomposition dance as `spawn`: invoke in JS,
+    // extract methods, hand them to NAPI as separate functions.
+    // The daemon's initial (pre-restore) state is built by the
+    // factory here; the core's `from_snapshot` will then call
+    // `restore` on the bridge with `snapshotBytes`.
+    const instance = await factory();
+    const process = instance.process.bind(instance) as (
+      event: CausalEvent,
+    ) => Buffer[];
+    const snapshot = instance.snapshot
+      ? (instance.snapshot.bind(instance) as () => Buffer | null)
+      : undefined;
+    const restore = instance.restore
+      ? (instance.restore.bind(instance) as (state: Buffer) => unknown)
+      : undefined;
+
+    try {
+      const handle = await this.inner.spawnFromSnapshot(
+        kind,
+        identity.toNapi(),
+        snapshotBytes,
+        process,
+        snapshot,
+        restore,
+        config
+          ? {
+              autoSnapshotInterval: config.autoSnapshotInterval,
+              maxLogEntries: config.maxLogEntries,
+            }
+          : undefined,
+      );
+      return new DaemonHandle(handle);
+    } catch (e) {
+      return toDaemonError(e);
+    }
+  }
+
+  /**
+   * Take a snapshot of a running daemon by `originHash`. Returns
+   * the daemon's serialized state bytes, or `null` if the daemon
+   * is stateless (no `snapshot` method, or it returned `null`).
+   *
+   * The returned `Buffer` is opaque to the caller — the wire
+   * format is the core's `StateSnapshot` encoding, including
+   * version headers and the chain link at the snapshot point.
+   * Feed it unchanged to {@link DaemonRuntime.spawnFromSnapshot}
+   * to restore the daemon on another node or after a restart.
+   */
+  async snapshot(originHash: number): Promise<Buffer | null> {
+    try {
+      const buf = await this.inner.snapshot(originHash);
+      return buf ?? null;
     } catch (e) {
       return toDaemonError(e);
     }

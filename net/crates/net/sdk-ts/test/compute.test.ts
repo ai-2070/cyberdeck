@@ -499,3 +499,198 @@ describe('DaemonRuntime (Stage 3 sub-step 3: event dispatch)', () => {
     ).rejects.toThrow(DaemonError);
   });
 });
+
+describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', () => {
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    while (cleanups.length > 0) {
+      const fn = cleanups.pop();
+      if (fn) {
+        try {
+          await fn();
+        } catch {
+          // Best-effort teardown.
+        }
+      }
+    }
+  });
+
+  // CounterDaemon used across the round-trip tests: increments a
+  // local `count` per event, returns the current count as a LE
+  // u32, and serializes `count` as a 4-byte buffer in its
+  // `snapshot` / `restore` pair. Factory is parameterized so tests
+  // can pre-seed the counter when checking restore semantics.
+  function counterFactory(initial = 0) {
+    return () => {
+      let count = initial;
+      return {
+        name: 'counter',
+        process: () => {
+          count += 1;
+          const buf = Buffer.alloc(4);
+          buf.writeUInt32LE(count, 0);
+          return [buf];
+        },
+        snapshot: (): Buffer | null => {
+          const buf = Buffer.alloc(4);
+          buf.writeUInt32LE(count, 0);
+          return buf;
+        },
+        restore: (state: Buffer) => {
+          count = state.readUInt32LE(0);
+        },
+      };
+    };
+  }
+
+  it('snapshot after N deliveries captures the counter; spawnFromSnapshot restores it', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+
+    rt.registerFactory('counter', counterFactory());
+    await rt.start();
+
+    const id = Identity.generate();
+    const handle = await rt.spawn('counter', id);
+    const evt = (seq: bigint) => ({
+      originHash: id.originHash,
+      sequence: seq,
+      payload: Buffer.alloc(0),
+    });
+
+    // Drive the counter to 3.
+    for (let i = 1; i <= 3; i++) await rt.deliver(handle.originHash, evt(BigInt(i)));
+
+    const snapBytes = await rt.snapshot(handle.originHash);
+    expect(snapBytes).not.toBeNull();
+    expect(snapBytes!.length).toBeGreaterThan(0);
+
+    // Tear the original daemon down — the restored instance must
+    // pick up purely from the snapshot, not from live state.
+    await rt.stop(handle.originHash);
+    expect(rt.daemonCount()).toBe(0);
+
+    const restored = await rt.spawnFromSnapshot('counter', id, snapBytes!);
+    expect(rt.daemonCount()).toBe(1);
+    // Same identity -> same origin_hash after restore.
+    expect(restored.originHash).toBe(handle.originHash);
+
+    // One more delivery — counter should step from 3 to 4, proving
+    // the snapshot's state survived the round trip.
+    const out = await rt.deliver(restored.originHash, evt(4n));
+    expect(out.length).toBe(1);
+    expect(out[0].readUInt32LE(0)).toBe(4);
+  });
+
+  it('snapshot of a stateless daemon returns null', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+
+    rt.registerFactory('echo', () => ({
+      name: 'echo',
+      process: (e) => [e.payload],
+      // No snapshot / restore -> host reports daemon as stateless.
+    }));
+    await rt.start();
+
+    const id = Identity.generate();
+    const handle = await rt.spawn('echo', id);
+
+    const snap = await rt.snapshot(handle.originHash);
+    expect(snap).toBeNull();
+  });
+
+  it('snapshot of an unknown origin rejects with DaemonError', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+    rt.registerFactory('counter', counterFactory());
+    await rt.start();
+
+    await expect(rt.snapshot(0xdeadbeef)).rejects.toThrow(DaemonError);
+  });
+
+  it('spawnFromSnapshot with corrupted bytes rejects with DaemonError', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+    rt.registerFactory('counter', counterFactory());
+    await rt.start();
+
+    const id = Identity.generate();
+    const garbage = Buffer.from('not a real snapshot');
+    await expect(
+      rt.spawnFromSnapshot('counter', id, garbage),
+    ).rejects.toThrow(DaemonError);
+  });
+
+  it('spawnFromSnapshot with mismatched identity rejects with DaemonError', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+
+    rt.registerFactory('counter', counterFactory());
+    await rt.start();
+
+    const original = Identity.generate();
+    const handle = await rt.spawn('counter', original);
+    await rt.deliver(handle.originHash, {
+      originHash: original.originHash,
+      sequence: 1n,
+      payload: Buffer.alloc(0),
+    });
+    const snap = await rt.snapshot(handle.originHash);
+    expect(snap).not.toBeNull();
+    await rt.stop(handle.originHash);
+
+    // Different identity -> snapshot's entity_id doesn't match.
+    const other = Identity.generate();
+    await expect(
+      rt.spawnFromSnapshot('counter', other, snap!),
+    ).rejects.toThrow(DaemonError);
+  });
+
+  it('snapshot -> modify -> snapshot captures the newer state', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+
+    rt.registerFactory('counter', counterFactory());
+    await rt.start();
+
+    const id = Identity.generate();
+    const handle = await rt.spawn('counter', id);
+    const evt = (seq: bigint) => ({
+      originHash: id.originHash,
+      sequence: seq,
+      payload: Buffer.alloc(0),
+    });
+
+    for (let i = 1; i <= 2; i++) await rt.deliver(handle.originHash, evt(BigInt(i)));
+    const snapAt2 = await rt.snapshot(handle.originHash);
+    for (let i = 3; i <= 5; i++) await rt.deliver(handle.originHash, evt(BigInt(i)));
+    const snapAt5 = await rt.snapshot(handle.originHash);
+
+    await rt.stop(handle.originHash);
+
+    // Restore the earlier snapshot; next event should step to 3.
+    const h2 = await rt.spawnFromSnapshot('counter', id, snapAt2!);
+    const out2 = await rt.deliver(h2.originHash, evt(6n));
+    expect(out2[0].readUInt32LE(0)).toBe(3);
+    await rt.stop(h2.originHash);
+
+    // Restore the later snapshot; next event should step to 6.
+    const h5 = await rt.spawnFromSnapshot('counter', id, snapAt5!);
+    const out5 = await rt.deliver(h5.originHash, evt(7n));
+    expect(out5[0].readUInt32LE(0)).toBe(6);
+  });
+});

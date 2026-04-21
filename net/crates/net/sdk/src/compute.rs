@@ -704,6 +704,72 @@ impl DaemonRuntime {
         })
     }
 
+    /// Spawn a daemon from a caller-supplied instance and restore its
+    /// state from `snapshot`, bypassing the SDK-side kind-factory
+    /// lookup. Parallels [`Self::spawn_with_daemon`] for restore.
+    ///
+    /// Used by language-binding layers whose daemons are built via
+    /// cross-FFI dispatch — construction goes through the host
+    /// language, then the binding hands the built `Box<dyn MeshDaemon>`
+    /// (already wired to its TSFN bridge) plus the `kind_factory`
+    /// closure used by the core registry for migration-target
+    /// reconstruction.
+    pub async fn spawn_from_snapshot_with_daemon<F>(
+        &self,
+        identity: Identity,
+        snapshot: StateSnapshot,
+        config: DaemonHostConfig,
+        daemon: Box<dyn MeshDaemon>,
+        kind_factory: F,
+    ) -> Result<DaemonHandle, DaemonError>
+    where
+        F: Fn() -> Box<dyn MeshDaemon> + Send + Sync + 'static,
+    {
+        self.require_ready()?;
+        let keypair = identity.keypair().as_ref().clone();
+        let origin_hash = keypair.origin_hash();
+        let entity_id = keypair.entity_id().clone();
+
+        // Full `entity_id` comparison — see `spawn_from_snapshot` for
+        // the birthday-collision rationale.
+        if snapshot.entity_id != entity_id {
+            return Err(DaemonError::SnapshotIdentityMismatch {
+                snapshot: snapshot.entity_id.origin_hash(),
+                identity: origin_hash,
+            });
+        }
+
+        self.inner
+            .factory_registry
+            .register(keypair.clone(), config.clone(), kind_factory)
+            .map_err(DaemonError::Core)?;
+
+        let host = match DaemonHost::from_snapshot(daemon, keypair, &snapshot, config) {
+            Ok(h) => h,
+            Err(e) => {
+                self.inner.factory_registry.remove(origin_hash);
+                return Err(DaemonError::Core(e));
+            }
+        };
+
+        if let Err(e) = self.inner.registry.register(host) {
+            self.inner.factory_registry.remove(origin_hash);
+            return Err(DaemonError::Core(e));
+        }
+
+        if self.state() == State::ShuttingDown {
+            let _ = self.inner.registry.unregister(origin_hash);
+            self.inner.factory_registry.remove(origin_hash);
+            return Err(DaemonError::ShuttingDown);
+        }
+
+        Ok(DaemonHandle {
+            origin_hash,
+            entity_id,
+            inner: self.inner.clone(),
+        })
+    }
+
     /// Spawn a daemon of `kind` and restore its state from `snapshot`.
     /// The snapshot's `entity_id` must match the caller's
     /// [`Identity`]; mismatch returns
