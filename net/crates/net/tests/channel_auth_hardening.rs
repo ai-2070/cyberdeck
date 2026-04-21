@@ -540,10 +540,15 @@ async fn publish_skips_expired_subscriber_when_sweep_is_disabled() {
         "fast-path should admit the still-valid subscriber",
     );
 
-    // Wait past the subscribe token's TTL. With the sweep disabled
-    // the AuthGuard entry + roster entry both persist — pre-fix,
-    // the next publish would still fan out to B.
-    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    // Wait past the subscribe token's TTL. `PermissionToken` works
+    // in 1-second granularity (unix seconds), and `is_valid`'s
+    // strict `now > not_after` lets the boundary second still
+    // pass — so 2.5 s from issue reliably crosses the expiry even
+    // when the test harness wakes a little late. With the sweep
+    // disabled the AuthGuard entry + roster entry both persist
+    // across this sleep — pre-fix, the next publish would still
+    // fan out to B.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
     assert!(
         a.mesh.auth_guard().is_authorized_full(b_origin, &channel),
         "sweep-disabled harness precondition: guard entry must persist past TTL",
