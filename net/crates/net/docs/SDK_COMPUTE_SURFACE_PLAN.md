@@ -510,7 +510,7 @@ Same "not microsecond-latency" caveat.
 - **Identity ([`SDK_SECURITY_SURFACE_PLAN.md`](SDK_SECURITY_SURFACE_PLAN.md) Stage A).** Required. Daemons have keypairs. No anonymous daemons.
 - **Capabilities ([same plan], Stage C).** Recommended. Without declaring capabilities, a daemon can't advertise `subprotocol:0x0500` and auto-migration won't find targets. The SDK validates: if `requirements()` references a capability tag the node hasn't announced, log a warning at spawn.
 - **CortEX ([`SDK_EXPANSION_PLAN.md`](SDK_EXPANSION_PLAN.md) Stages 2–3).** Independent. A daemon may use a `TasksAdapter` internally; the SDK makes no assumption.
-- **Channels ([same plan] Stages 6–7).** Independent at the protocol level, but a daemon that subscribes to a channel needs its subscription re-bound on migration. Document: on cutover, the application must re-subscribe the daemon on the target node. V2 consideration: automatic channel-rebind on migration.
+- **Channels ([same plan] Stages 6–7).** Independent at the protocol level, but a daemon that subscribes to a channel needs its subscription re-bound on migration. Automatic re-bind is sized + specified in [`DAEMON_CHANNEL_REBIND_PLAN.md`](DAEMON_CHANNEL_REBIND_PLAN.md) — it lives outside this plan because it cuts across migration semantics + the `StateSnapshot` wire format, and is a correctness fix rather than a pure SDK addition. Until that lands, the application must re-subscribe the daemon on the target node after every migration.
 
 ---
 
