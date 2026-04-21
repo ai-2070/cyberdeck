@@ -140,7 +140,13 @@ struct DispatchCtx {
     inbound: InboundQueues,
     num_shards: u16,
     /// Optional subprotocol handler for migration messages.
-    migration_handler: Option<Arc<MigrationSubprotocolHandler>>,
+    ///
+    /// `ArcSwapOption` so [`Self::set_migration_handler`] can install
+    /// at runtime via `&self` — the SDK's `DaemonRuntime::start`
+    /// hands in a handler after the mesh has been constructed but
+    /// before user migration traffic lands, which is otherwise
+    /// awkward because a started `Mesh` is shared by `Arc`.
+    migration_handler: Arc<ArcSwapOption<MigrationSubprotocolHandler>>,
     /// In-flight initiator handshakes; dispatch completes them when a
     /// matching routed msg2 arrives.
     pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
@@ -644,8 +650,10 @@ pub struct MeshNode {
     failure_detector: Arc<FailureDetector>,
     /// Inbound event queues (shared with receive loop)
     inbound: InboundQueues,
-    /// Optional migration subprotocol handler
-    migration_handler: Option<Arc<MigrationSubprotocolHandler>>,
+    /// Optional migration subprotocol handler — same `ArcSwapOption`
+    /// surface as on `MeshNode`, propagated into the dispatch
+    /// context so the packet-receive loop stays lock-free.
+    migration_handler: Arc<ArcSwapOption<MigrationSubprotocolHandler>>,
     /// In-flight routed-handshake initiators, keyed by the responder's
     /// node_id. Populated by `connect_via`; consumed by the dispatch
     /// loop when the matching msg2 arrives.
@@ -886,7 +894,7 @@ impl MeshNode {
             router,
             failure_detector: Arc::new(failure_detector),
             inbound: Arc::new(DashMap::new()),
-            migration_handler: None,
+            migration_handler: Arc::new(ArcSwapOption::empty()),
             pending_handshakes,
             proximity_graph,
             reroute_policy,
@@ -955,6 +963,14 @@ impl MeshNode {
             .map(|e| e.value().clone())
     }
 
+    /// The peer's socket address, if we have an active session
+    /// with them. Used by the migration subprotocol to route
+    /// orchestrator-originated messages (e.g. `TakeSnapshot`) to
+    /// the source node by its `node_id`.
+    pub fn peer_addr(&self, node_id: u64) -> Option<SocketAddr> {
+        self.peers.get(&node_id).map(|e| e.value().addr)
+    }
+
     /// The peer's Noise static X25519 public key, captured during
     /// the handshake that established the session. Load-bearing for
     /// daemon migration: the source uses this key as the seal
@@ -1007,11 +1023,16 @@ impl MeshNode {
 
     /// Set the migration subprotocol handler.
     ///
-    /// Must be called before `start()`. When set, inbound packets with
-    /// `subprotocol_id == 0x0500` are dispatched to this handler instead
-    /// of being queued as events.
-    pub fn set_migration_handler(&mut self, handler: Arc<MigrationSubprotocolHandler>) {
-        self.migration_handler = Some(handler);
+    /// Can be called before or after `start()`. When set, inbound
+    /// packets with `subprotocol_id == 0x0500` are dispatched to
+    /// this handler instead of being queued as events. Idempotent
+    /// w.r.t. replacing the handler — a second call swaps in the
+    /// new one atomically. Pass the handler you want; no way to
+    /// clear once set (and no reason to — the mesh can run without
+    /// one, so constructing without installing is the "clear"
+    /// state).
+    pub fn set_migration_handler(&self, handler: Arc<MigrationSubprotocolHandler>) {
+        self.migration_handler.store(Some(handler));
     }
 
     /// Block packets from/to a peer address (simulates network partition).
@@ -1803,7 +1824,9 @@ impl MeshNode {
 
         // Check subprotocol — migration messages are sent as single event frames
         if parsed.header.subprotocol_id == SUBPROTOCOL_MIGRATION {
-            if let Some(ref handler) = ctx.migration_handler {
+            // `ArcSwapOption::load` — lock-free on the hot path.
+            let handler_guard = ctx.migration_handler.load();
+            if let Some(handler) = handler_guard.as_ref() {
                 // Extract the payload from the event frame wrapper
                 let events =
                     EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
@@ -1822,8 +1845,30 @@ impl MeshNode {
 
                 match handler.handle_message(&payload, from_node) {
                     Ok(outbound) => {
-                        // Send outbound responses asynchronously
+                        // Send outbound responses. Self-destined messages
+                        // loop back into the dispatcher instead of
+                        // round-tripping through the socket — the 2-node
+                        // case where the orchestrator and the source (or
+                        // target) are the same node otherwise drops the
+                        // message because `peers.get(&local_node_id)` is
+                        // None and migration wedges at Cutover / Complete.
                         for msg in outbound {
+                            if msg.dest_node == ctx.local_node_id {
+                                let handler_loopback = handler.clone();
+                                let payload = msg.payload;
+                                let self_node = ctx.local_node_id;
+                                tokio::spawn(async move {
+                                    if let Err(e) =
+                                        handler_loopback.handle_message(&payload, self_node)
+                                    {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "migration handler loopback error",
+                                        );
+                                    }
+                                });
+                                continue;
+                            }
                             let dest_session = ctx
                                 .peers
                                 .get(&msg.dest_node)

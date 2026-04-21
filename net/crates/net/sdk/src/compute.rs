@@ -51,14 +51,18 @@ use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 pub use ::net::adapter::net::compute::{
-    DaemonError as CoreDaemonError, DaemonHostConfig, DaemonStats, MeshDaemon,
-    PlacementDecision, SchedulerError,
+    DaemonError as CoreDaemonError, DaemonHostConfig, DaemonStats, MeshDaemon, MigrationError,
+    MigrationPhase, PlacementDecision, SchedulerError, SUBPROTOCOL_MIGRATION,
 };
 pub use ::net::adapter::net::state::causal::{CausalEvent, CausalLink};
 pub use ::net::adapter::net::state::snapshot::StateSnapshot;
 
-use ::net::adapter::net::compute::{DaemonFactoryRegistry, DaemonHost, DaemonRegistry};
+use ::net::adapter::net::compute::{
+    orchestrator::wire as migration_wire, DaemonFactoryRegistry, DaemonHost, DaemonRegistry,
+    MigrationMessage, MigrationOrchestrator, MigrationSourceHandler, MigrationTargetHandler,
+};
 use ::net::adapter::net::identity::EntityId;
+use ::net::adapter::net::subprotocol::MigrationSubprotocolHandler;
 
 use crate::identity::Identity;
 use crate::mesh::Mesh;
@@ -94,6 +98,9 @@ pub enum DaemonError {
     /// Pass-through for errors surfaced by the core compute layer.
     #[error(transparent)]
     Core(#[from] CoreDaemonError),
+    /// Pass-through for migration-layer errors.
+    #[error("migration failed: {0}")]
+    Migration(#[from] MigrationError),
 }
 
 // Runtime state machine. Encoded as `u8` so it rides in an
@@ -136,21 +143,29 @@ pub struct DaemonRuntime {
 struct Inner {
     mesh: Arc<Mesh>,
     state: AtomicU8,
-    /// SDK-side kind → factory map. Stage 2 readers (migration
-    /// target) reach into the core `factory_registry` below by
-    /// `origin_hash`; `kind` is SDK sugar so the *caller* can spawn
-    /// without knowing the underlying keypair.
+    /// SDK-side kind → factory map. The migration target path reaches
+    /// into the core `factory_registry` below by `origin_hash`;
+    /// `kind` is SDK sugar so the *caller* can spawn without knowing
+    /// the underlying keypair.
     factories: RwLock<HashMap<String, FactoryFn>>,
-    /// Core registry — lives inside `MeshNode` machinery in Stage 2
-    /// once the migration subprotocol is wired; today it sits behind
-    /// the SDK surface only.
+    /// Core registry — shared with the migration target handler so
+    /// daemons restored from an inbound snapshot land in the same
+    /// map a local `spawn` uses.
     registry: Arc<DaemonRegistry>,
     /// Core factory registry, keyed by `origin_hash`. `spawn` mirrors
     /// each SDK-side kind registration into this map with the
-    /// concrete keypair attached, so Stage 2 migrations restore
-    /// through the existing `DaemonFactoryRegistry::construct` path
-    /// without a second lookup layer.
+    /// concrete keypair attached so the migration target restores
+    /// through the existing `DaemonFactoryRegistry::construct` path.
     factory_registry: Arc<DaemonFactoryRegistry>,
+    /// Migration orchestrator, owned by this node. Orchestrates the
+    /// 6-phase state machine when this node initiates a migration.
+    orchestrator: Arc<MigrationOrchestrator>,
+    /// Migration source handler — drives the source side when THIS
+    /// node is the source of a migration.
+    source_handler: Arc<MigrationSourceHandler>,
+    /// Migration target handler — drives the target side when THIS
+    /// node is the target of a migration.
+    target_handler: Arc<MigrationTargetHandler>,
 }
 
 impl DaemonRuntime {
@@ -162,13 +177,25 @@ impl DaemonRuntime {
     /// migration messages (if any) are silently dropped by the core,
     /// same as today.
     pub fn new(mesh: Arc<Mesh>) -> Self {
+        let local_node_id = mesh.inner().node_id();
+        let registry = Arc::new(DaemonRegistry::new());
+        let factory_registry = Arc::new(DaemonFactoryRegistry::new());
+        let orchestrator = Arc::new(MigrationOrchestrator::new(registry.clone(), local_node_id));
+        let source_handler = Arc::new(MigrationSourceHandler::new(registry.clone()));
+        let target_handler = Arc::new(MigrationTargetHandler::new_with_factories(
+            registry.clone(),
+            factory_registry.clone(),
+        ));
         Self {
             inner: Arc::new(Inner {
                 mesh,
                 state: AtomicU8::new(State::Registering as u8),
                 factories: RwLock::new(HashMap::new()),
-                registry: Arc::new(DaemonRegistry::new()),
-                factory_registry: Arc::new(DaemonFactoryRegistry::new()),
+                registry,
+                factory_registry,
+                orchestrator,
+                source_handler,
+                target_handler,
             }),
         }
     }
@@ -199,8 +226,14 @@ impl DaemonRuntime {
 
     /// Promote to `Ready`. Idempotent — a second call on an already-
     /// `Ready` runtime is a no-op; a call on a `ShuttingDown` runtime
-    /// returns [`DaemonError::ShuttingDown`]. Stage 2 will also wire
-    /// the migration subprotocol handler here.
+    /// returns [`DaemonError::ShuttingDown`].
+    ///
+    /// Wires the migration subprotocol (`0x0500`) handler into the
+    /// mesh so inbound `TakeSnapshot` / `SnapshotReady` / etc.
+    /// messages reach the orchestrator / source / target handlers
+    /// owned by this runtime. Installing is idempotent w.r.t.
+    /// multiple `start` calls — the `ArcSwapOption` on the mesh
+    /// swaps the same handler in on each call.
     pub async fn start(&self) -> Result<(), DaemonError> {
         loop {
             match self.state() {
@@ -212,6 +245,21 @@ impl DaemonRuntime {
                         Ordering::Acquire,
                     );
                     if swap.is_ok() {
+                        // Install the migration subprotocol handler —
+                        // this is the runtime's one-time side effect
+                        // on the underlying `Mesh`. Constructed from
+                        // the orchestrator / source / target the
+                        // runtime already owns so wire events land in
+                        // the same state a local `start_migration`
+                        // call sees.
+                        let local_node_id = self.inner.mesh.inner().node_id();
+                        let handler = Arc::new(MigrationSubprotocolHandler::new(
+                            self.inner.orchestrator.clone(),
+                            self.inner.source_handler.clone(),
+                            self.inner.target_handler.clone(),
+                            local_node_id,
+                        ));
+                        self.inner.mesh.inner().set_migration_handler(handler);
                         return Ok(());
                     }
                     // Lost the CAS — another caller flipped the state.
@@ -416,6 +464,138 @@ impl DaemonRuntime {
         self.inner.registry.count()
     }
 
+    /// Pre-register a factory on the target node keyed by the
+    /// daemon's `origin_hash`, using the caller-supplied `Identity`
+    /// as the keypair. Required today on any node that may receive
+    /// an inbound migration for a specific daemon — the target's
+    /// `DaemonFactoryRegistry` needs both the constructor closure
+    /// *and* the matching keypair to reconstruct the daemon.
+    ///
+    /// **Stopgap.** `DAEMON_IDENTITY_MIGRATION_PLAN.md` Stages 5b /
+    /// 6 replace this with an `IdentityEnvelope` that carries the
+    /// keypair across the wire, sealed to the target's X25519
+    /// pubkey. Once those land, the target no longer needs to know
+    /// the daemon's keypair out of band and this method becomes
+    /// unnecessary — keep it as a low-level escape hatch or remove
+    /// it entirely.
+    ///
+    /// `kind` still matters: it's looked up in the SDK-side
+    /// `factories` map so later `spawn_from_snapshot` calls on the
+    /// same node can find the same constructor. The `Identity`
+    /// keypair must match the one the *source* used to spawn the
+    /// daemon, otherwise `origin_hash` mismatches at restore and
+    /// the migration fails.
+    pub fn register_migration_target_identity(
+        &self,
+        kind: &str,
+        identity: Identity,
+        config: DaemonHostConfig,
+    ) -> Result<(), DaemonError> {
+        if self.state() == State::ShuttingDown {
+            return Err(DaemonError::ShuttingDown);
+        }
+        let factory = self.factory_for_kind(kind)?;
+        let keypair = identity.keypair().as_ref().clone();
+        let factory_clone = factory.clone();
+        self.inner.factory_registry.register(
+            keypair,
+            config,
+            move || (factory_clone)(),
+        );
+        Ok(())
+    }
+
+    /// Start migrating a daemon from `source_node` to `target_node`.
+    /// The orchestrator runs on this node regardless of who owns
+    /// the daemon — call this on whichever node wants to drive the
+    /// migration state machine.
+    ///
+    /// Returns a [`MigrationHandle`] whose [`MigrationHandle::wait`]
+    /// resolves when the migration reaches a terminal state
+    /// (`Complete` on success, `MigrationError` on abort / failure).
+    ///
+    /// For the common local-source case (`source_node ==
+    /// mesh.node_id()`), the snapshot is taken synchronously inside
+    /// this call and `SnapshotReady` is shipped to the target. For
+    /// a remote source, the orchestrator sends `TakeSnapshot` to
+    /// the source and drives the rest of the state machine from
+    /// inbound wire messages.
+    pub async fn start_migration(
+        &self,
+        origin_hash: u32,
+        source_node: u64,
+        target_node: u64,
+    ) -> Result<MigrationHandle, DaemonError> {
+        self.require_ready()?;
+        let first_msg = self
+            .inner
+            .orchestrator
+            .start_migration(origin_hash, source_node, target_node)
+            .map_err(DaemonError::Migration)?;
+
+        // Send the first message to the appropriate node. `start_migration`
+        // returns `TakeSnapshot` when source is remote, `SnapshotReady`
+        // when source is local.
+        let (dest_node, payload) = match &first_msg {
+            MigrationMessage::TakeSnapshot { target_node: _, .. } => (source_node, &first_msg),
+            MigrationMessage::SnapshotReady { .. } => (target_node, &first_msg),
+            other => {
+                // `start_migration` on the core orchestrator is
+                // documented to return one of these two variants;
+                // anything else is a protocol bug. Abort + surface.
+                let _ = self
+                    .inner
+                    .orchestrator
+                    .abort_migration(origin_hash, "unexpected initial message".into());
+                return Err(DaemonError::Migration(MigrationError::StateFailed(format!(
+                    "orchestrator returned unexpected initial migration message: {:?}",
+                    other
+                ))));
+            }
+        };
+
+        if let Err(e) = self.send_migration_message(dest_node, payload).await {
+            let _ = self
+                .inner
+                .orchestrator
+                .abort_migration(origin_hash, format!("initial send failed: {e}"));
+            return Err(e);
+        }
+
+        Ok(MigrationHandle {
+            origin_hash,
+            source_node,
+            target_node,
+            runtime: self.clone(),
+        })
+    }
+
+    async fn send_migration_message(
+        &self,
+        dest_node: u64,
+        msg: &MigrationMessage,
+    ) -> Result<(), DaemonError> {
+        let addr = self
+            .inner
+            .mesh
+            .inner()
+            .peer_addr(dest_node)
+            .ok_or_else(|| {
+                DaemonError::Migration(MigrationError::TargetUnavailable(dest_node))
+            })?;
+        let bytes = migration_wire::encode(msg).map_err(DaemonError::Migration)?;
+        self.inner
+            .mesh
+            .inner()
+            .send_subprotocol(addr, SUBPROTOCOL_MIGRATION, &bytes)
+            .await
+            .map_err(|e| {
+                DaemonError::Migration(MigrationError::StateFailed(format!(
+                    "send_subprotocol failed: {e}"
+                )))
+            })
+    }
+
     /// Underlying mesh. Exposed read-only so the caller can still
     /// reach the channel / subscribe / publish surface without
     /// reaching around the runtime.
@@ -500,6 +680,137 @@ impl std::fmt::Debug for DaemonHandle {
         f.debug_struct("DaemonHandle")
             .field("origin_hash", &format_args!("{:#x}", self.origin_hash))
             .field("entity_id", &self.entity_id)
+            .finish()
+    }
+}
+
+/// Handle to an in-flight migration. Drop the handle and the
+/// orchestrator continues driving the migration to completion in the
+/// background; keep it to observe phase transitions or request abort.
+///
+/// Cheap to clone — the backing state is shared with the
+/// [`DaemonRuntime`] that produced it.
+#[derive(Clone)]
+pub struct MigrationHandle {
+    /// Daemon being migrated.
+    pub origin_hash: u32,
+    /// Source node that currently hosts the daemon.
+    pub source_node: u64,
+    /// Target node that will host the daemon after cutover.
+    pub target_node: u64,
+    /// Runtime the orchestrator lives on. Used by [`Self::phase`]
+    /// and [`Self::wait`] to poll migration state.
+    runtime: DaemonRuntime,
+}
+
+impl MigrationHandle {
+    /// Current migration phase, or `None` once the migration has
+    /// left the orchestrator's records (either via `Complete` → auto
+    /// cleanup, or via explicit abort). Callers distinguish the two
+    /// by remembering the last non-None phase.
+    pub fn phase(&self) -> Option<MigrationPhase> {
+        self.runtime.inner.orchestrator.status(self.origin_hash)
+    }
+
+    /// Block until the migration reaches a terminal state.
+    ///
+    /// Returns `Ok(())` on normal completion (saw `Complete`, then
+    /// the orchestrator cleaned up). Returns `Err(MigrationError)`
+    /// if the orchestrator's record disappeared without the caller
+    /// ever having seen `Complete` — either an explicit abort or a
+    /// failure at some upstream stage.
+    ///
+    /// Polls every 50 ms. The implementation is deliberately
+    /// simple — Stage 2 of `DAEMON_IDENTITY_MIGRATION_PLAN.md` and
+    /// the V2 iteration of this plan will swap this for a
+    /// broadcast-channel push, but 50 ms polling is plenty for the
+    /// use cases a migration API sees today.
+    pub async fn wait(self) -> Result<(), DaemonError> {
+        self.wait_with_timeout(std::time::Duration::from_secs(60))
+            .await
+    }
+
+    /// Like [`Self::wait`] with a caller-controlled timeout. A
+    /// timeout aborts the orchestrator-side record and returns
+    /// `Err(MigrationError::StateFailed)`; a graceful `Complete`
+    /// returns `Ok`.
+    pub async fn wait_with_timeout(
+        self,
+        timeout: std::time::Duration,
+    ) -> Result<(), DaemonError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut last_phase: Option<MigrationPhase> = None;
+        loop {
+            match self.runtime.inner.orchestrator.status(self.origin_hash) {
+                Some(phase) => {
+                    last_phase = Some(phase);
+                    if phase == MigrationPhase::Complete {
+                        // Complete phase is reached and the orchestrator
+                        // will clean up its record momentarily. Give it
+                        // one more tick to settle, then return Ok.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        return Ok(());
+                    }
+                }
+                None => {
+                    // Record gone. If we ever observed Complete, this
+                    // is the normal cleanup path — success. Otherwise
+                    // someone aborted.
+                    if last_phase == Some(MigrationPhase::Complete) {
+                        return Ok(());
+                    }
+                    return Err(DaemonError::Migration(MigrationError::StateFailed(
+                        "migration aborted before reaching Complete".into(),
+                    )));
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let _ = self
+                    .runtime
+                    .inner
+                    .orchestrator
+                    .abort_migration(self.origin_hash, "timeout".into());
+                return Err(DaemonError::Migration(MigrationError::StateFailed(
+                    format!("migration timed out in phase {:?}", last_phase),
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Request abort. The orchestrator emits a `MigrationFailed`
+    /// message to involved nodes and clears its record; the target
+    /// rolls back via its own handler. Best-effort — a migration
+    /// past `Cutover` cannot be undone cleanly because routing has
+    /// already flipped.
+    pub async fn cancel(&self) -> Result<(), DaemonError> {
+        let msg = self
+            .runtime
+            .inner
+            .orchestrator
+            .abort_migration(self.origin_hash, "cancel requested".into())
+            .map_err(DaemonError::Migration)?;
+        // Best-effort notify — ignore send errors, the orchestrator
+        // record is already gone on our side.
+        let _ = self
+            .runtime
+            .send_migration_message(self.source_node, &msg)
+            .await;
+        let _ = self
+            .runtime
+            .send_migration_message(self.target_node, &msg)
+            .await;
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for MigrationHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MigrationHandle")
+            .field("origin_hash", &format_args!("{:#x}", self.origin_hash))
+            .field("source_node", &format_args!("{:#x}", self.source_node))
+            .field("target_node", &format_args!("{:#x}", self.target_node))
+            .field("phase", &self.phase())
             .finish()
     }
 }

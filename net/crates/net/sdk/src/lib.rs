@@ -103,7 +103,8 @@ pub use crate::mesh::{Mesh, MeshBuilder, SubscribeOptions};
 #[cfg(feature = "compute")]
 pub use crate::compute::{
     CausalEvent, CausalLink, DaemonError as ComputeDaemonError, DaemonHandle, DaemonHostConfig,
-    DaemonRuntime, DaemonStats, MeshDaemon, StateSnapshot,
+    DaemonRuntime, DaemonStats, MeshDaemon, MigrationError, MigrationHandle, MigrationPhase,
+    StateSnapshot,
 };
 
 // Convenience re-exports for the common security types, so users can
