@@ -472,6 +472,21 @@ fn subscriber_origin_hash(node_id: u64) -> u32 {
     node_id as u32
 }
 
+/// Replace a zero `Duration` with a 1 ms floor.
+/// `tokio::time::interval` panics on a zero period; this is the
+/// guard every `spawn_*_loop` call site applies before handing the
+/// caller-configured interval to tokio. A legitimate "disable this
+/// timer" sentinel is `Duration::MAX`, documented on the relevant
+/// config fields — `Duration::ZERO` is just pathological input.
+#[inline]
+fn nonzero_interval(d: Duration) -> Duration {
+    if d.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        d
+    }
+}
+
 /// Rolling-window auth-failure tracker, one entry per peer.
 /// Lives behind a per-key `Mutex` so updates from concurrent
 /// subscribes don't race each other on the same peer's counter.
@@ -1078,7 +1093,13 @@ impl MeshNode {
         let shutdown_notify = self.shutdown_notify.clone();
 
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
+            // `tokio::time::interval` panics on a zero period — guard
+            // against a caller who set `capability_gc_interval` to
+            // `Duration::ZERO` in `MeshNodeConfig`. A zero interval
+            // isn't a sentinel for "disabled" (that's
+            // `Duration::MAX`), it's just pathological input; clamp
+            // to 1 ms so the GC still runs, every tick.
+            let mut tick = tokio::time::interval(nonzero_interval(interval));
             // First tick fires immediately; skip it so we don't GC
             // empty state before any announcements have landed.
             tick.tick().await;
@@ -1121,7 +1142,9 @@ impl MeshNode {
         let shutdown_notify = self.shutdown_notify.clone();
 
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
+            // Same zero-guard as `spawn_capability_gc_loop` —
+            // tokio panics if the period is zero.
+            let mut tick = tokio::time::interval(nonzero_interval(interval));
             // First tick fires immediately; skip it so we don't
             // sweep empty state before any subscribes have landed.
             tick.tick().await;
