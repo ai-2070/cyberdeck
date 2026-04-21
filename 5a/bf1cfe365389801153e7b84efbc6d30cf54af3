@@ -1,0 +1,35 @@
+net/crates/net/bindings/go/net/compute_test.go
+  5bf3f089eecaef7a 1-195
+net/crates/net/bindings/go/net/net.h
+  5bf3f089eecaef7a 590-661
+net/crates/net/bindings/go/net/compute.go
+  5bf3f089eecaef7a 1-247
+net/crates/net/bindings/go/compute-ffi/src/lib.rs
+  5bf3f089eecaef7a 1-323
+net/crates/net/bindings/go/compute-ffi/Cargo.toml
+  5bf3f089eecaef7a 1-34
+net/crates/net/src/ffi/mesh.rs
+  5bf3f089eecaef7a 363-419
+net/crates/net/Cargo.toml
+  5bf3f089eecaef7a 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "5abf1cfe365389801153e7b84efbc6d30cf54af3",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 4030,
+      "total_deletions": 151,
+      "accepted_lines": 933,
+      "overriden_lines": 0
+    }
+  }
+}
