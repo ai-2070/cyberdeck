@@ -485,12 +485,29 @@ impl TokenCache {
         });
     }
 
-    /// Number of cached tokens.
+    /// Total number of cached tokens across all slots.
+    ///
+    /// A slot is keyed by `(subject, channel_hash)` and can hold
+    /// multiple tokens with distinct scopes (e.g. one `PUBLISH` and
+    /// one `SUBSCRIBE` for the same peer-on-channel). An earlier
+    /// storage change from a single `PermissionToken` per slot to
+    /// a `Vec<PermissionToken>` left this method returning the
+    /// slot count instead of the token count — FFI / binding
+    /// metrics that surfaced "tokens cached" silently undercounted
+    /// whenever a slot carried more than one scope. Sum the slot
+    /// lengths so the number matches the observable cache
+    /// contents.
     pub fn len(&self) -> usize {
-        self.tokens.len()
+        self.tokens.iter().map(|e| e.value().len()).sum()
     }
 
     /// Check if cache is empty.
+    ///
+    /// `evict_expired` already drops empty slots, and
+    /// `insert_unchecked` never creates one, so a zero slot-count
+    /// and a zero token-count coincide in practice — but checking
+    /// the slot count keeps `is_empty()` O(1) instead of walking
+    /// every slot.
     pub fn is_empty(&self) -> bool {
         self.tokens.is_empty()
     }
@@ -1092,6 +1109,71 @@ mod tests {
                 .check(subject.entity_id(), TokenScope::SUBSCRIBE, channel)
                 .is_ok(),
             "subscribe auth lost",
+        );
+    }
+
+    /// Regression for a cubic-flagged P2: after the storage change
+    /// from `PermissionToken` to `Vec<PermissionToken>` per slot,
+    /// `TokenCache::len()` kept returning `self.tokens.len()` —
+    /// the slot count, not the token count. FFI / binding metrics
+    /// silently undercounted whenever a slot held more than one
+    /// scope. This test exercises the multi-scope case: two tokens
+    /// share a slot, so a slot count of 1 coexists with a token
+    /// count of 2 — `len()` must report 2.
+    #[test]
+    fn cache_len_reports_total_tokens_not_slot_count() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let channel = 0xFEED;
+
+        let cache = TokenCache::new();
+        assert_eq!(cache.len(), 0);
+
+        // Two tokens, same (subject, channel) slot, different scopes
+        // — coexist in one Vec per `insert_unchecked`.
+        cache
+            .insert(PermissionToken::issue(
+                &issuer,
+                subject.entity_id().clone(),
+                TokenScope::PUBLISH,
+                channel,
+                3600,
+                0,
+            ))
+            .expect("insert publish");
+        cache
+            .insert(PermissionToken::issue(
+                &issuer,
+                subject.entity_id().clone(),
+                TokenScope::SUBSCRIBE,
+                channel,
+                3600,
+                0,
+            ))
+            .expect("insert subscribe");
+
+        assert_eq!(
+            cache.len(),
+            2,
+            "len() must sum per-slot Vec lengths — two scopes in one slot means two tokens",
+        );
+
+        // A third token with a different channel lives in its own
+        // slot, bumping both slot count and token count to 2 / 3.
+        cache
+            .insert(PermissionToken::issue(
+                &issuer,
+                subject.entity_id().clone(),
+                TokenScope::PUBLISH,
+                0xBEEF,
+                3600,
+                0,
+            ))
+            .expect("insert publish-other");
+        assert_eq!(
+            cache.len(),
+            3,
+            "len() after a second slot must reflect 3 tokens total, not 2 slots",
         );
     }
 
