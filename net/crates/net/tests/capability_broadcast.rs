@@ -430,19 +430,6 @@ async fn unsigned_announcement_does_not_tofu_pin_entity() {
     );
 }
 
-/// Regression for a cubic-flagged P1: even with the default
-/// (`require_signed_capabilities = true`) dropping unsigned
-/// announcements up-front, we want belt-and-braces so an
-/// explicit opt-out for discovery can't accidentally re-open the
-/// auth surface. `peer_subnets` is populated from
-/// `ann.capabilities` via the subnet policy and is later consulted
-/// by `subnet_visible` on the publish / subscribe paths — an
-/// unsigned announcement must not be allowed to pick the peer's
-/// subnet. This test opts out of the signature requirement, sends
-/// an unsigned announcement whose caps would land the peer in a
-/// non-GLOBAL subnet under any plausible policy, and asserts the
-/// subnet binding stays unwritten.
-#[tokio::test]
 /// Regression for a cubic-flagged P1: the subnet-assignment write
 /// was gated on `signature_verified` but not on
 /// `ann.hop_count == 0`, so a **signed** forwarded announcement
@@ -509,6 +496,19 @@ async fn forwarded_announcement_does_not_write_relay_peer_subnet() {
     );
 }
 
+/// Regression for a cubic-flagged P1: even with the default
+/// (`require_signed_capabilities = true`) dropping unsigned
+/// announcements up-front, we want belt-and-braces so an
+/// explicit opt-out for discovery can't accidentally re-open the
+/// auth surface. `peer_subnets` is populated from
+/// `ann.capabilities` via the subnet policy and is later consulted
+/// by `subnet_visible` on the publish / subscribe paths — an
+/// unsigned announcement must not be allowed to pick the peer's
+/// subnet. This test opts out of the signature requirement, sends
+/// an unsigned announcement whose caps would land the peer in a
+/// non-GLOBAL subnet under any plausible policy, and asserts the
+/// subnet binding stays unwritten.
+#[tokio::test]
 async fn unsigned_announcement_does_not_write_peer_subnet() {
     use net::adapter::net::{SubnetPolicy, SubnetRule};
 
