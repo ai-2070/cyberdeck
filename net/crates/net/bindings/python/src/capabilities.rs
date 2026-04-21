@@ -149,6 +149,17 @@ fn parse_accelerator_type(s: &str) -> AcceleratorType {
 // Subsection dict → core
 // =========================================================================
 
+/// Clamp an untrusted Python `int` (already extracted as `u32`)
+/// into a core `u16` field, saturating at `u16::MAX`. Bare
+/// `as u16` silently wraps on overflow — a caller reporting 65536
+/// cores could land 0 on the wire. Applied uniformly so every
+/// capability dict conversion is consistent with the NAPI + Go
+/// paths.
+#[inline]
+fn saturating_u16(v: u32) -> u16 {
+    v.min(u16::MAX as u32) as u16
+}
+
 fn gpu_info_from_dict(d: &Bound<'_, PyDict>) -> PyResult<GpuInfo> {
     let vendor = get_opt_str(d, "vendor")?
         .as_deref()
@@ -158,10 +169,10 @@ fn gpu_info_from_dict(d: &Bound<'_, PyDict>) -> PyResult<GpuInfo> {
     let vram = get_opt_u32(d, "vram_mb")?.unwrap_or(0);
     let mut info = GpuInfo::new(vendor, model, vram);
     if let Some(cu) = get_opt_u32(d, "compute_units")? {
-        info = info.with_compute_units(cu as u16);
+        info = info.with_compute_units(saturating_u16(cu));
     }
     if let Some(tc) = get_opt_u32(d, "tensor_cores")? {
-        info = info.with_tensor_cores(tc as u16);
+        info = info.with_tensor_cores(saturating_u16(tc));
     }
     if let Some(tf) = get_opt_u32(d, "fp16_tflops_x10")? {
         info = info.with_fp16_tflops(tf as f32 / 10.0);
@@ -176,7 +187,7 @@ fn accelerator_from_dict(d: &Bound<'_, PyDict>) -> PyResult<AcceleratorInfo> {
         model: get_opt_str(d, "model")?.unwrap_or_default(),
         memory_mb: get_opt_u32(d, "memory_mb")?.unwrap_or(0),
         tops_x10: get_opt_u32(d, "tops_x10")?
-            .map(|v| v.min(u16::MAX as u32) as u16)
+            .map(saturating_u16)
             .unwrap_or(0),
     })
 }
@@ -186,9 +197,10 @@ fn hardware_from_dict(d: &Bound<'_, PyDict>) -> PyResult<HardwareCapabilities> {
     let cores = get_opt_u32(d, "cpu_cores")?;
     let threads = get_opt_u32(d, "cpu_threads")?;
     if let (Some(c), Some(t)) = (cores, threads) {
-        hw = hw.with_cpu(c as u16, t as u16);
+        hw = hw.with_cpu(saturating_u16(c), saturating_u16(t));
     } else if let Some(c) = cores {
-        hw = hw.with_cpu(c as u16, c as u16);
+        let c16 = saturating_u16(c);
+        hw = hw.with_cpu(c16, c16);
     }
     if let Some(mb) = get_opt_u32(d, "memory_mb")? {
         hw = hw.with_memory(mb);
@@ -389,4 +401,29 @@ pub fn capability_filter_from_py(d: &Bound<'_, PyDict>) -> PyResult<CapabilityFi
 #[pyfunction]
 pub fn normalize_gpu_vendor(vendor: &str) -> String {
     gpu_vendor_to_string(parse_gpu_vendor(vendor))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for a cubic-flagged P2: Python-supplied `int`
+    /// values wider than u16::MAX silently wrapped via `as u16`
+    /// in `gpu_info_from_dict` / `accelerator_from_dict` /
+    /// `hardware_from_dict`, turning 65536 cores into 0. Every
+    /// conversion site now routes through `saturating_u16`.
+    ///
+    /// End-to-end observability through `find_peers` is limited —
+    /// the `CapabilityFilter` surface doesn't filter on
+    /// `cpu_cores` / `cpu_threads` / `compute_units` /
+    /// `tensor_cores`. The helper is the contract; NAPI's tests
+    /// exercise the wiring with full POJO inputs.
+    #[test]
+    fn saturating_u16_clamps_at_u16_max() {
+        assert_eq!(saturating_u16(0), 0);
+        assert_eq!(saturating_u16(42), 42);
+        assert_eq!(saturating_u16(u16::MAX as u32), u16::MAX);
+        assert_eq!(saturating_u16(u16::MAX as u32 + 1), u16::MAX);
+        assert_eq!(saturating_u16(u32::MAX), u16::MAX);
+    }
 }

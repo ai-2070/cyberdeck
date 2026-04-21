@@ -1773,6 +1773,16 @@ fn pair_vec(xs: Vec<Vec<String>>) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Clamp an untrusted JSON `u32` into a core `u16` field,
+/// saturating at `u16::MAX`. Bare `as u16` silently wraps on
+/// overflow — a Go caller reporting 65536 cores could land 0 on
+/// the wire. Applied uniformly so every capability JSON
+/// conversion is consistent with the NAPI + PyO3 paths.
+#[inline]
+fn saturating_u16_cap(v: u32) -> u16 {
+    v.min(u16::MAX as u32) as u16
+}
+
 fn gpu_info_from_json(g: GpuJson) -> GpuInfo {
     let vendor = g
         .vendor
@@ -1781,10 +1791,10 @@ fn gpu_info_from_json(g: GpuJson) -> GpuInfo {
         .unwrap_or(GpuVendor::Unknown);
     let mut info = GpuInfo::new(vendor, g.model, g.vram_mb);
     if let Some(cu) = g.compute_units {
-        info = info.with_compute_units(cu as u16);
+        info = info.with_compute_units(saturating_u16_cap(cu));
     }
     if let Some(tc) = g.tensor_cores {
-        info = info.with_tensor_cores(tc as u16);
+        info = info.with_tensor_cores(saturating_u16_cap(tc));
     }
     if let Some(tf) = g.fp16_tflops_x10 {
         info = info.with_fp16_tflops(tf as f32 / 10.0);
@@ -1797,18 +1807,18 @@ fn accelerator_from_json(a: AcceleratorJson) -> AcceleratorInfo {
         accel_type: parse_accelerator_type_cap(&a.kind),
         model: a.model,
         memory_mb: a.memory_mb.unwrap_or(0),
-        tops_x10: a
-            .tops_x10
-            .map(|v| v.min(u16::MAX as u32) as u16)
-            .unwrap_or(0),
+        tops_x10: a.tops_x10.map(saturating_u16_cap).unwrap_or(0),
     }
 }
 
 fn hardware_from_json(h: HardwareJson) -> HardwareCapabilities {
     let mut hw = HardwareCapabilities::new();
     match (h.cpu_cores, h.cpu_threads) {
-        (Some(c), Some(t)) => hw = hw.with_cpu(c as u16, t as u16),
-        (Some(c), None) => hw = hw.with_cpu(c as u16, c as u16),
+        (Some(c), Some(t)) => hw = hw.with_cpu(saturating_u16_cap(c), saturating_u16_cap(t)),
+        (Some(c), None) => {
+            let c16 = saturating_u16_cap(c);
+            hw = hw.with_cpu(c16, c16);
+        }
         _ => {}
     }
     if let Some(mb) = h.memory_mb {
@@ -2047,4 +2057,48 @@ pub extern "C" fn net_normalize_gpu_vendor(
     };
     let canonical = gpu_vendor_to_string_cap(parse_gpu_vendor_cap(s));
     write_string_out(canonical.to_string(), out_json, out_len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for a cubic-flagged P2: Go-supplied JSON values
+    /// wider than u16::MAX silently wrapped via `as u16` in
+    /// `gpu_info_from_json` / `accelerator_from_json` /
+    /// `hardware_from_json`, turning 65536 cores into 0. Every
+    /// conversion site now routes through `saturating_u16_cap`.
+    ///
+    /// The NAPI binding has parallel end-to-end tests on
+    /// `hardware_from_js`; the Go side verifies saturation in
+    /// its own integration suite by round-tripping an overflow
+    /// announcement through `announce_capabilities` (separate
+    /// file).
+    #[test]
+    fn saturating_u16_cap_clamps_at_u16_max() {
+        assert_eq!(saturating_u16_cap(0), 0);
+        assert_eq!(saturating_u16_cap(42), 42);
+        assert_eq!(saturating_u16_cap(u16::MAX as u32), u16::MAX);
+        assert_eq!(saturating_u16_cap(u16::MAX as u32 + 1), u16::MAX);
+        assert_eq!(saturating_u16_cap(u32::MAX), u16::MAX);
+    }
+
+    #[test]
+    fn hardware_from_json_saturates_overflow_cpu_fields() {
+        // 70_000 > u16::MAX (65_535). Pre-fix: 70_000 as u16 = 4464.
+        // Post-fix: saturates to 65_535.
+        let h = HardwareJson {
+            cpu_cores: Some(70_000),
+            cpu_threads: Some(200_000),
+            memory_mb: None,
+            gpu: None,
+            additional_gpus: Vec::new(),
+            storage_mb: None,
+            network_mbps: None,
+            accelerators: Vec::new(),
+        };
+        let hw = hardware_from_json(h);
+        assert_eq!(hw.cpu_cores, u16::MAX);
+        assert_eq!(hw.cpu_threads, u16::MAX);
+    }
 }

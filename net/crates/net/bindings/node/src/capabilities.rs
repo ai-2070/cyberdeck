@@ -207,6 +207,16 @@ fn pair_vec(xs: Option<Vec<Vec<String>>>) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Clamp an untrusted JS `u32` into a core `u16` field, saturating
+/// at `u16::MAX`. Bare `as u16` silently wraps on overflow — a
+/// misbehaving / malicious caller could report 65536 cores and have
+/// it land as 0 on the wire. Mirrors the accelerator `tops_x10`
+/// site and keeps every capability conversion consistent.
+#[inline]
+fn saturating_u16(v: u32) -> u16 {
+    v.min(u16::MAX as u32) as u16
+}
+
 fn gpu_info_from_js(g: GpuInfoJs) -> GpuInfo {
     let vendor = g
         .vendor
@@ -215,10 +225,10 @@ fn gpu_info_from_js(g: GpuInfoJs) -> GpuInfo {
         .unwrap_or(GpuVendor::Unknown);
     let mut info = GpuInfo::new(vendor, g.model, g.vram_mb);
     if let Some(cu) = g.compute_units {
-        info = info.with_compute_units(cu as u16);
+        info = info.with_compute_units(saturating_u16(cu));
     }
     if let Some(tc) = g.tensor_cores {
-        info = info.with_tensor_cores(tc as u16);
+        info = info.with_tensor_cores(saturating_u16(tc));
     }
     if let Some(tf) = g.fp16_tflops_x10 {
         // Core builder takes f32 TFLOPS; we accept the x10 integer to
@@ -244,21 +254,17 @@ fn accelerator_from_js(a: AcceleratorJs) -> AcceleratorInfo {
         accel_type: parse_accelerator_type(&a.kind),
         model: a.model,
         memory_mb: a.memory_mb.unwrap_or(0),
-        tops_x10: a
-            .tops_x10
-            .map(|v| v.min(u16::MAX as u32) as u16)
-            .unwrap_or(0),
+        tops_x10: a.tops_x10.map(saturating_u16).unwrap_or(0),
     }
 }
 
 fn hardware_from_js(h: HardwareJs) -> HardwareCapabilities {
     let mut hw = HardwareCapabilities::new();
     if let (Some(cores), Some(threads)) = (h.cpu_cores, h.cpu_threads) {
-        hw = hw.with_cpu(cores as u16, threads as u16);
-    } else {
-        if let Some(cores) = h.cpu_cores {
-            hw = hw.with_cpu(cores as u16, cores as u16);
-        }
+        hw = hw.with_cpu(saturating_u16(cores), saturating_u16(threads));
+    } else if let Some(cores) = h.cpu_cores {
+        let c = saturating_u16(cores);
+        hw = hw.with_cpu(c, c);
     }
     if let Some(mb) = h.memory_mb {
         hw = hw.with_memory(mb);
@@ -434,4 +440,57 @@ pub fn capability_filter_from_js(f: CapabilityFilterJs) -> CapabilityFilter {
 #[napi]
 pub fn normalize_gpu_vendor(vendor: String) -> String {
     gpu_vendor_to_string(parse_gpu_vendor(&vendor))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for a cubic-flagged P2: JS-supplied u32 values
+    /// wider than u16::MAX silently wrapped via `as u16`, turning
+    /// 65536 cores into 0 cores on the wire. Every conversion site
+    /// now routes through `saturating_u16`, which clamps to
+    /// `u16::MAX`.
+    #[test]
+    fn saturating_u16_clamps_at_u16_max() {
+        assert_eq!(saturating_u16(0), 0);
+        assert_eq!(saturating_u16(42), 42);
+        assert_eq!(saturating_u16(u16::MAX as u32), u16::MAX);
+        assert_eq!(saturating_u16(u16::MAX as u32 + 1), u16::MAX);
+        assert_eq!(saturating_u16(u32::MAX), u16::MAX);
+    }
+
+    #[test]
+    fn hardware_from_js_saturates_overflow_cpu_fields() {
+        // 70_000 > u16::MAX (65_535). Pre-fix: 70_000 as u16 = 4464.
+        // Post-fix: saturates to 65_535.
+        let h = HardwareJs {
+            cpu_cores: Some(70_000),
+            cpu_threads: Some(200_000),
+            memory_mb: None,
+            gpu: None,
+            additional_gpus: None,
+            storage_mb: None,
+            network_mbps: None,
+            accelerators: None,
+        };
+        let hw = hardware_from_js(h);
+        assert_eq!(hw.cpu_cores, u16::MAX);
+        assert_eq!(hw.cpu_threads, u16::MAX);
+    }
+
+    #[test]
+    fn gpu_info_from_js_saturates_overflow_compute_and_tensor_fields() {
+        let g = GpuInfoJs {
+            vendor: Some("nvidia".into()),
+            model: "test".into(),
+            vram_mb: 0,
+            compute_units: Some(90_000),
+            tensor_cores: Some(u32::MAX),
+            fp16_tflops_x10: None,
+        };
+        let info = gpu_info_from_js(g);
+        assert_eq!(info.compute_units, u16::MAX);
+        assert_eq!(info.tensor_cores, u16::MAX);
+    }
 }

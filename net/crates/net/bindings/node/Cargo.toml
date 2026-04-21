@@ -6,7 +6,11 @@ license = "Apache-2.0"
 description = "Node.js bindings for Net event bus"
 
 [lib]
-crate-type = ["cdylib"]
+# `rlib` is needed alongside `cdylib` so in-crate `#[cfg(test)] mod
+# tests` blocks can run (cargo requires rlib to link the unit-test
+# harness). Publishing still ships the `.node` cdylib; the rlib is
+# a build artifact only.
+crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["redis"]

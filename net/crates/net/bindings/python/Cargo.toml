@@ -7,7 +7,11 @@ description = "Python bindings for Net event bus"
 
 [lib]
 name = "_net"
-crate-type = ["cdylib"]
+# `rlib` is needed alongside `cdylib` so in-crate `#[cfg(test)] mod
+# tests` blocks compile — cargo requires rlib to link the unit-test
+# harness. The published Python wheel still ships the `.so/.dylib`
+# cdylib; the rlib is a build artifact only.
+crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["redis", "net"]
