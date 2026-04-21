@@ -148,6 +148,103 @@ async fn peer_static_x25519_returns_peer_noise_pubkey_after_handshake() {
     assert!(a.peer_static_x25519(0xDEAD_BEEF_CAFE_F00D).is_none());
 }
 
+/// Regression (Cubic-AI P1: leaking Noise static private key).
+///
+/// `MeshNode::static_x25519_priv()` used to return a raw
+/// `[u8; 32]` copy of the node's long-term Noise static private
+/// key. Any SDK caller with an `Arc<Mesh>` could call it and
+/// exfiltrate the key — the key that backs this node's *identity*
+/// in the mesh, not just one migration's envelope-open.
+///
+/// The fix deletes that method and replaces it with
+/// [`MeshNode::migration_identity_context`], which returns a
+/// `MigrationIdentityContext` whose closures capture the key
+/// internally. Callers get the *functionality* they need
+/// (open a sealed envelope) without ever touching the raw bytes.
+///
+/// This test exercises the new surface end-to-end: build an
+/// identity envelope on A sealed against B's public static, then
+/// unseal it via B's context. Functional regression — if the
+/// context's closure is wired incorrectly, the keypair won't
+/// round-trip.
+#[tokio::test]
+async fn migration_identity_context_unseals_envelope_without_exposing_key() {
+    use net::adapter::net::identity::{EntityKeypair, IdentityEnvelope};
+    use net::adapter::net::state::causal::CausalLink;
+    use net::adapter::net::state::snapshot::StateSnapshot;
+
+    let ports = find_ports(2).await;
+    let a = build_node(ports[0]).await;
+    let b = build_node(ports[1]).await;
+    handshake(&a, &b).await;
+
+    // Source-side daemon identity (what an envelope would carry).
+    let daemon_kp = EntityKeypair::generate();
+
+    // Build an envelope on A sealed against B's public static. We
+    // read B's public half the normal way (it's public key
+    // material, not secret).
+    let b_static_pub = *b.public_key();
+    let chain_link = CausalLink {
+        origin_hash: daemon_kp.origin_hash(),
+        horizon_encoded: 0,
+        sequence: 0,
+        parent_hash: 0,
+    };
+    let envelope =
+        IdentityEnvelope::new(&daemon_kp, b_static_pub, &chain_link).expect("seal envelope");
+
+    // Wrap into a minimal StateSnapshot carrying only the envelope
+    // (the rest of the fields are stubbed for the open path).
+    let snapshot = StateSnapshot {
+        version: net::adapter::net::state::snapshot::SNAPSHOT_VERSION,
+        entity_id: daemon_kp.entity_id().clone(),
+        chain_link,
+        through_seq: 0,
+        state: bytes::Bytes::new(),
+        horizon: Default::default(),
+        created_at: 0,
+        bindings_bytes: Vec::new(),
+        identity_envelope: Some(envelope),
+    };
+
+    // Unseal via B's migration-identity context. The private key
+    // never leaves B's closures — this call is the only surface.
+    let ctx = b.migration_identity_context();
+    let opened = (ctx.unseal_snapshot)(&snapshot)
+        .expect("unseal succeeds")
+        .expect("envelope present → Some(keypair)");
+
+    // Round-trip: the opened keypair matches the source.
+    assert_eq!(opened.entity_id(), daemon_kp.entity_id());
+    assert_eq!(opened.origin_hash(), daemon_kp.origin_hash());
+
+    // peer_static_lookup on the context finds B's view of A's
+    // static (initiator side — A initiated the handshake to B).
+    let a_from_b_via_ctx = (a.migration_identity_context().peer_static_lookup)(b.node_id());
+    assert_eq!(
+        a_from_b_via_ctx,
+        Some(b_static_pub),
+        "peer_static_lookup on A's context must find B's static \
+         (A initiated to B; initiator learns responder's static)",
+    );
+
+    // Size canary — pinned here as an integration-level
+    // regression alongside the unit-level one in
+    // `migration_handler::tests`. If the context ever grows
+    // (e.g. re-adding `local_x25519_priv: [u8; 32]`), this
+    // assertion fires.
+    use std::mem::size_of;
+    let fat_ptr = 2 * size_of::<usize>();
+    assert_eq!(
+        size_of::<net::adapter::net::subprotocol::MigrationIdentityContext>(),
+        2 * fat_ptr,
+        "MigrationIdentityContext must stay two Arc<dyn Fn ...> — a \
+         size bump means a new field, most likely the Noise static \
+         private key leaking back as a readable [u8; 32]",
+    );
+}
+
 #[tokio::test]
 async fn two_node_announce_is_visible() {
     let ports = find_ports(2).await;

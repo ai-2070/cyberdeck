@@ -1001,18 +1001,59 @@ impl MeshNode {
         self.peers.get(&node_id).map(|e| e.value().addr)
     }
 
-    /// The local Noise static X25519 **private** key — the secret
-    /// half that unseals identity envelopes addressed to this node.
-    /// Clone of the 32-byte seed; caller owns the copy.
+    /// Build a [`MigrationIdentityContext`] bound to this node.
     ///
-    /// Used by the daemon migration target path to open
-    /// [`IdentityEnvelope`](crate::adapter::net::identity::IdentityEnvelope)s
-    /// that source nodes seal against this node's public static.
-    /// Exposed at this layer because the migration dispatcher runs
-    /// inside `MeshNode` and needs a concrete private key to pass
-    /// to the envelope-open primitives.
-    pub fn static_x25519_priv(&self) -> [u8; 32] {
-        self.static_keypair.private
+    /// The context's closures capture this node's long-term Noise
+    /// static private key (for the envelope-open path) and an
+    /// `Arc`-clone of the peer map (for the peer-static lookup used
+    /// by the source-side seal path). The private key is wrapped in
+    /// a `StaticSecret` inside the `unseal_snapshot` closure, which
+    /// is `zeroize`-on-drop — the key is never surfaced as a
+    /// readable field on the returned value.
+    ///
+    /// Used by the SDK's compute runtime to wire identity-envelope
+    /// support into the migration dispatcher without handing the
+    /// key across the crate boundary. The previous shape exposed
+    /// `static_x25519_priv() -> [u8; 32]` as a `pub` method, which
+    /// leaked long-term secret material to any SDK caller — any
+    /// code with an `Arc<Mesh>` could copy the node's identity key
+    /// out and impersonate it indefinitely.
+    pub fn migration_identity_context(
+        &self,
+    ) -> crate::adapter::net::subprotocol::MigrationIdentityContext {
+        use crate::adapter::net::state::snapshot::StateSnapshot;
+        use crate::adapter::net::subprotocol::MigrationIdentityContext;
+
+        // Construct once; `StaticSecret` zeroizes on drop, so the
+        // key is wiped when the last owner of the Arc'd closure is
+        // dropped. Rebuilding the StaticSecret on every call would
+        // copy the raw bytes through a short-lived stack variable —
+        // bounded exposure is fine but once-at-construction is
+        // strictly less.
+        let priv_secret = x25519_dalek::StaticSecret::from(self.static_keypair.private);
+        let unseal_snapshot = Arc::new(
+            move |snapshot: &StateSnapshot|
+                  -> Result<Option<_>, crate::adapter::net::identity::EnvelopeError> {
+                snapshot.open_identity_envelope(&priv_secret)
+            },
+        );
+
+        let peers = self.peers.clone();
+        let peer_static_lookup = Arc::new(move |node_id: u64| {
+            peers.get(&node_id).and_then(|e| {
+                let pk = e.value().remote_static_pub;
+                if pk == [0u8; 32] {
+                    None
+                } else {
+                    Some(pk)
+                }
+            })
+        });
+
+        MigrationIdentityContext {
+            unseal_snapshot,
+            peer_static_lookup,
+        }
     }
 
     /// The peer's Noise static X25519 public key, captured during
@@ -1891,28 +1932,42 @@ impl MeshNode {
 
                 match handler.handle_message(&payload, from_node) {
                     Ok(outbound) => {
-                        // Send outbound responses. Self-destined messages
-                        // loop back into the dispatcher instead of
-                        // round-tripping through the socket — the 2-node
-                        // case where the orchestrator and the source (or
-                        // target) are the same node otherwise drops the
-                        // message because `peers.get(&local_node_id)` is
-                        // None and migration wedges at Cutover / Complete.
-                        for msg in outbound {
+                        // BFS queue: self-destined messages loop back
+                        // through the dispatcher in-place; any output
+                        // the loopback produces joins the same queue
+                        // so remote-bound follow-ups reach the socket.
+                        //
+                        // The 2-node case where orchestrator and
+                        // source/target share a node uses this path —
+                        // `peers.get(&local_node_id)` is None, so the
+                        // loopback short-circuit is the only way a
+                        // self-destined wire message gets dispatched.
+                        //
+                        // Regression (Cubic-AI P1): the earlier
+                        // implementation `tokio::spawn`ed each
+                        // loopback with a fire-and-forget closure,
+                        // discarding `handle_message`'s return value.
+                        // Any outbound produced by the loopback —
+                        // including remote-bound messages that should
+                        // have ridden the wire — disappeared, wedging
+                        // state transitions whenever a self-bounce
+                        // chained into a further reply. The in-place
+                        // queue preserves all downstream messages.
+                        //
+                        // Handler work is synchronous and cheap; doing
+                        // it on the receive-loop task is fine.
+                        let mut pending: std::collections::VecDeque<_> = outbound.into();
+                        while let Some(msg) = pending.pop_front() {
                             if msg.dest_node == ctx.local_node_id {
-                                let handler_loopback = handler.clone();
-                                let payload = msg.payload;
-                                let self_node = ctx.local_node_id;
-                                tokio::spawn(async move {
-                                    if let Err(e) =
-                                        handler_loopback.handle_message(&payload, self_node)
-                                    {
+                                match handler.handle_message(&msg.payload, ctx.local_node_id) {
+                                    Ok(more) => pending.extend(more),
+                                    Err(e) => {
                                         tracing::warn!(
                                             error = %e,
                                             "migration handler loopback error",
                                         );
                                     }
-                                });
+                                }
                                 continue;
                             }
                             let dest_session = ctx

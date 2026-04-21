@@ -264,106 +264,6 @@ async fn migration_to_unconnected_peer_fails_target_unavailable() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn identity_envelope_overrides_target_placeholder_keypair() {
-    // Proves Stage 5b of the identity-migration plan: the target
-    // pre-registers a factory under a PLACEHOLDER identity that does
-    // NOT match the source's, and the migration still completes
-    // because the envelope on the snapshot carries the real keypair
-    // and overrides the placeholder at restore time.
-    let pair = build_pair().await;
-    let Pair {
-        source_rt,
-        target_rt,
-    } = &pair;
-    source_rt
-        .register_factory("counter", counter_factory())
-        .unwrap();
-    target_rt
-        .register_factory("counter", counter_factory())
-        .unwrap();
-    source_rt.start().await.unwrap();
-    target_rt.start().await.unwrap();
-    source_rt.mesh().inner().start();
-    target_rt.mesh().inner().start();
-    sleep(Duration::from_millis(100)).await;
-
-    let real_identity = Identity::generate();
-    let origin_hash = real_identity.keypair().origin_hash();
-
-    // SPAWN on source with the real identity.
-    let handle = source_rt
-        .spawn(
-            "counter",
-            real_identity.clone(),
-            DaemonHostConfig::default(),
-        )
-        .await
-        .expect("spawn");
-    for i in 1..=2u64 {
-        source_rt
-            .deliver(handle.origin_hash, &make_event(origin_hash, i, b"t"))
-            .expect("deliver");
-    }
-
-    // Target pre-registers with a DIFFERENT identity — this is the
-    // placeholder the envelope must override. Without Stage 5b, the
-    // `register_migration_target_identity` call panics here on
-    // origin_hash mismatch during restore; with Stage 5b, the
-    // envelope replaces this keypair with the real one.
-    //
-    // Side-note: `register_migration_target_identity` keys the
-    // factory on the *identity's* origin_hash, not the daemon's —
-    // so a placeholder with a different origin_hash would miss the
-    // dispatcher's `factories.construct(daemon_origin)` lookup. For
-    // THIS test we therefore can't use a fully-different identity;
-    // we derive a deterministic shadow keypair with the same
-    // origin_hash by re-using the identity's seed. That's
-    // sufficient to exercise the envelope-override path because
-    // the keypairs are byte-distinct (different ed25519 seeds
-    // would yield different origin_hashes).
-    //
-    // TODO: once an origin_hash-keyed placeholder registration API
-    // exists, switch this test to a truly-different identity and
-    // assert via `daemon_keypair(origin_hash)` on the target that
-    // the envelope's keypair replaced the placeholder's. Today
-    // just asserting the migration completes + counter continues
-    // is sufficient: without envelope transport, the placeholder's
-    // *different* ed25519 seed would produce chain-invalid
-    // signatures on any subsequent outbound cap announcement or
-    // token minted from the target.
-    target_rt
-        .register_migration_target_identity(
-            "counter",
-            real_identity.clone(),
-            DaemonHostConfig::default(),
-        )
-        .expect("pre-register target");
-
-    let mig = source_rt
-        .start_migration(
-            handle.origin_hash,
-            source_rt.mesh().inner().node_id(),
-            target_rt.mesh().inner().node_id(),
-        )
-        .await
-        .expect("start_migration");
-
-    mig.wait_with_timeout(Duration::from_secs(5))
-        .await
-        .expect("migration reached Complete");
-
-    assert_eq!(target_rt.daemon_count(), 1);
-
-    // Counter continues from 2.
-    let outputs = target_rt
-        .deliver(origin_hash, &make_event(origin_hash, 3, b"post"))
-        .expect("deliver post");
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&outputs[0].payload);
-    assert_eq!(u64::from_le_bytes(bytes), 3);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn migration_opts_transport_identity_false_skips_envelope() {
     // Smoke test for the opt-out surface: `MigrationOpts {
     // transport_identity: false }` reaches migration Complete on a
@@ -416,35 +316,29 @@ async fn migration_opts_transport_identity_false_skips_envelope() {
     assert_eq!(pair.target_rt.daemon_count(), 1);
 }
 
+/// Target has the `kind` factory registered but has NOT pre-
+/// registered a factory for the daemon's specific `origin_hash`
+/// (no `register_migration_target_identity` / `expect_migration`).
+/// The dispatcher must surface `FactoryNotFound` rather than
+/// timing out, so the caller can distinguish a configuration bug
+/// from a transient failure.
+///
+/// Previously named `migration_to_registering_target_surfaces_not_ready`
+/// — misleading, since the body never exercised the `NotReady`
+/// path. The NotReady readiness predicate is covered separately by
+/// [`auto_retry_succeeds_after_target_becomes_ready`],
+/// [`auto_retry_gives_up_with_not_ready_timeout`], and
+/// [`migration_opts_retry_disabled_surfaces_not_ready_verbatim`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn migration_to_registering_target_surfaces_not_ready() {
-    // Stage 3 + 4 of the runtime-readiness plan: if the target's
-    // DaemonRuntime hasn't been `start()`ed, an inbound SnapshotReady
-    // should come back as `MigrationFailureReason::NotReady`.
-    // Without this, the source sees an opaque "aborted" error and
-    // can't distinguish retriable boot-timing failures from
-    // terminal ones.
+async fn migration_to_target_without_origin_factory_surfaces_factory_not_found() {
     let pair = build_pair().await;
     pair.source_rt
         .register_factory("counter", counter_factory())
         .unwrap();
-    // Target registers the factory BUT deliberately skips `start()`,
-    // leaving the runtime in Registering. The dispatcher is
-    // installed only after `start()`; receiving a migration message
-    // at this stage means no handler is live → source times out
-    // rather than observing NotReady directly.
-    //
-    // To actually test the Stage-3 readiness callback path, the
-    // handler needs to be installed. Call `start()` THEN flip the
-    // state back to Registering via shutdown? No — shutdown is
-    // terminal. Instead: install the handler directly with a
-    // readiness predicate that returns `false`.
-    //
-    // For this SDK-level test we take a simpler path: start the
-    // target, then attempt a migration for an origin with no
-    // factory — dispatcher responds `FactoryNotFound`, the SDK
-    // surfaces the typed reason. This proves the wire + callback
-    // plumbing and is one of the two Stage-3 branches.
+    // Target registers the `kind` factory but never calls
+    // `register_migration_target_identity` / `expect_migration`,
+    // so `factories.construct(origin_hash)` returns None →
+    // dispatcher emits `FactoryNotFound`.
     pair.target_rt
         .register_factory("counter", counter_factory())
         .unwrap();
@@ -462,9 +356,6 @@ async fn migration_to_registering_target_surfaces_not_ready() {
         .await
         .expect("spawn");
 
-    // Target has a kind registered but NO factory-by-origin_hash
-    // entry, so `factories.construct(origin_hash)` returns None →
-    // dispatcher emits `FactoryNotFound`.
     let mig = pair
         .source_rt
         .start_migration(
@@ -824,12 +715,19 @@ async fn migration_to_node_without_compute_runtime_surfaces_compute_not_supporte
     }
 }
 
+/// `MigrationOpts { retry_not_ready: None }` is the one-shot
+/// variant: any failure (retriable or not) surfaces verbatim; the
+/// SDK doesn't reinitiate. This test exercises the terminal branch
+/// with a `FactoryNotFound` failure — the caller should see the
+/// typed reason within a single poll cycle, not after any backoff.
+///
+/// Previously named `migration_opts_retry_disabled_surfaces_not_ready_immediately`
+/// — misleading, since the body tests `FactoryNotFound`, not
+/// `NotReady`. The NotReady-plus-retry-disabled combination is
+/// covered by
+/// [`migration_opts_retry_disabled_surfaces_not_ready_verbatim`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn migration_opts_retry_disabled_surfaces_not_ready_immediately() {
-    // `MigrationOpts { retry_not_ready: None }` means one-shot —
-    // any `NotReady` / `FactoryNotFound` failure surfaces to the
-    // caller verbatim. Exercises the `retry_deadline.is_none()`
-    // branch in `wait_with_timeout`.
+async fn migration_opts_retry_disabled_surfaces_factory_not_found_immediately() {
     let pair = build_pair().await;
     pair.source_rt
         .register_factory("counter", counter_factory())
@@ -882,6 +780,83 @@ async fn migration_opts_retry_disabled_surfaces_not_ready_immediately() {
     match err {
         DaemonError::MigrationFailed(MigrationFailureReason::FactoryNotFound) => {}
         other => panic!("expected FactoryNotFound, got {other:?}"),
+    }
+}
+
+/// Real NotReady-with-retry-disabled coverage: target simulates
+/// NotReady permanently, but the SDK is called with
+/// `retry_not_ready: None`. The caller must see
+/// `MigrationFailureReason::NotReady` surfaced **verbatim** (not
+/// retried, not promoted to `NotReadyTimeout`).
+///
+/// Exercises the `retry_deadline.is_none()` branch in `wait_until`:
+/// `NotReady` is retriable, but with no budget the SDK must return
+/// the raw reason instead of looping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migration_opts_retry_disabled_surfaces_not_ready_verbatim() {
+    let pair = build_pair().await;
+    let Pair {
+        source_rt,
+        target_rt,
+    } = &pair;
+    source_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    target_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    source_rt.start().await.unwrap();
+    target_rt.start().await.unwrap();
+    source_rt.mesh().inner().start();
+    target_rt.mesh().inner().start();
+    sleep(Duration::from_millis(100)).await;
+
+    // Target stays in simulated-not-ready throughout.
+    target_rt.simulate_not_ready(true);
+
+    let identity = Identity::generate();
+    let origin_hash = identity.keypair().origin_hash();
+    let _handle = source_rt
+        .spawn("counter", identity, DaemonHostConfig::default())
+        .await
+        .expect("spawn");
+    target_rt
+        .expect_migration("counter", origin_hash, DaemonHostConfig::default())
+        .expect("expect_migration");
+
+    let mig = source_rt
+        .start_migration_with(
+            origin_hash,
+            source_rt.mesh().inner().node_id(),
+            target_rt.mesh().inner().node_id(),
+            MigrationOpts {
+                retry_not_ready: None,
+                ..MigrationOpts::default()
+            },
+        )
+        .await
+        .expect("start_migration_with");
+
+    let start = tokio::time::Instant::now();
+    let err = mig
+        .wait_with_timeout(Duration::from_secs(5))
+        .await
+        .expect_err("must surface NotReady, not complete");
+    let elapsed = start.elapsed();
+    // Fast fail: no retry budget means we must surface within a
+    // poll cycle of the first inbound MigrationFailed (~100 ms on
+    // localhost). 2 s is defensive.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "retry-disabled NotReady must surface on the first attempt — took {elapsed:?}",
+    );
+    match err {
+        DaemonError::MigrationFailed(MigrationFailureReason::NotReady) => {}
+        DaemonError::MigrationFailed(other) => panic!(
+            "expected MigrationFailed(NotReady) verbatim, got MigrationFailed({other:?}) — \
+             retry-disabled must NOT promote NotReady to NotReadyTimeout",
+        ),
+        other => panic!("expected MigrationFailed(NotReady), got {other:?}"),
     }
 }
 
@@ -996,6 +971,308 @@ async fn duplicate_spawn_preserves_migratability() {
     );
     assert_eq!(source_rt.daemon_count(), 0);
     assert_eq!(target_rt.daemon_count(), 1);
+}
+
+/// Regression (Cubic-AI P1 on mesh.rs self-loopback): the 2-node
+/// local-source topology (A = orchestrator = source, B = target)
+/// runs the tail of the migration entirely through self-loopback
+/// on A:
+///
+/// ```text
+///   A: on_replay_complete  → CutoverNotify    to self   (loopback 1)
+///   A: on_cutover          → CleanupComplete  to self   (loopback 2)
+///   A: on_cleanup_complete → ActivateTarget   to B      (REMOTE)
+///   B: activate            → ActivateAck      to A      (remote)
+///   A: on_activate_ack     → orchestrator record removed
+/// ```
+///
+/// The earlier mesh.rs implementation `tokio::spawn`ed each
+/// loopback with a fire-and-forget closure that **dropped**
+/// `handle_message`'s return value. Loopback 2's output
+/// (`ActivateTarget` to B) was discarded, B never ran `activate`,
+/// and A's orchestrator record never reached its terminal state —
+/// the migration looked complete (phase=Complete stayed pinned)
+/// but never fully wound down.
+///
+/// The fix replaces the fire-and-forget spawn with an in-place
+/// BFS queue that preserves every outbound message, including
+/// remote-bound follow-ups produced by a loopback chain.
+///
+/// This test asserts the record is **fully removed** after the
+/// migration (post-`ActivateAck`), which is the only observable
+/// that distinguishes "phase reached Complete" from "record
+/// genuinely cleaned up." A pre-fix run leaves
+/// `migration_phase(origin) == Some(Complete)`; post-fix it is
+/// `None`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_source_migration_drives_full_chain_through_self_loopback() {
+    let pair = build_pair().await;
+    let Pair {
+        source_rt,
+        target_rt,
+    } = &pair;
+    source_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    target_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    source_rt.start().await.unwrap();
+    target_rt.start().await.unwrap();
+    source_rt.mesh().inner().start();
+    target_rt.mesh().inner().start();
+    sleep(Duration::from_millis(100)).await;
+
+    let identity = Identity::generate();
+    let origin_hash = identity.keypair().origin_hash();
+    let handle = source_rt
+        .spawn("counter", identity.clone(), DaemonHostConfig::default())
+        .await
+        .expect("spawn on source");
+    target_rt
+        .register_migration_target_identity("counter", identity, DaemonHostConfig::default())
+        .expect("target identity");
+
+    let mig = source_rt
+        .start_migration(
+            handle.origin_hash,
+            source_rt.mesh().inner().node_id(),
+            target_rt.mesh().inner().node_id(),
+        )
+        .await
+        .expect("start_migration");
+    mig.wait_with_timeout(Duration::from_secs(5))
+        .await
+        .expect("migration reaches Complete");
+
+    // Give the dispatcher's tail-end ActivateAck a beat to land —
+    // `wait` returns as soon as it observes the orchestrator record
+    // disappear, which can race with the final `on_activate_ack`
+    // removal under current_thread scheduling. 200 ms is plenty.
+    sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(
+        source_rt.migration_phase(origin_hash),
+        None,
+        "orchestrator record must be removed by ActivateAck — a pre-fix \
+         run would leave phase=Complete pinned because ActivateTarget \
+         (produced inside self-loopback) was silently dropped",
+    );
+    assert_eq!(source_rt.daemon_count(), 0);
+    assert_eq!(target_rt.daemon_count(), 1);
+}
+
+/// Regression (Cubic-AI P1 on `MigrationHandle::wait`): the doc
+/// advertised "block until terminal state" but silently enforced
+/// a 60-second ceiling via `wait_with_timeout(60s)` — a migration
+/// that legitimately exceeded 60s (large snapshot on a saturated
+/// link) would be aborted mid-flight.
+///
+/// The fix splits the two: `wait()` takes no deadline;
+/// `wait_with_timeout(d)` takes one. This test pins virtual time,
+/// starts a migration that stalls at phase=Snapshot because the
+/// target's receive loop is never started, and advances 120 s of
+/// virtual time — well past the old 60 s ceiling. Under the
+/// pre-fix code the spawned `wait()` task would have resolved
+/// with `Err(StateFailed("timed out"))` somewhere in the advance
+/// window. Post-fix, it stays pending.
+#[tokio::test(flavor = "current_thread")]
+async fn wait_without_timeout_survives_120_virtual_seconds() {
+    let pair = build_pair().await;
+    let Pair {
+        source_rt,
+        target_rt,
+    } = &pair;
+    source_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    target_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    source_rt.start().await.unwrap();
+    target_rt.start().await.unwrap();
+
+    // Start ONLY A's receive loop. B's socket still buffers
+    // inbound, but nothing is dispatched — so the `SnapshotReady`
+    // A sends below never drives B into the restore path, and the
+    // orchestrator on A sits at phase=Snapshot indefinitely.
+    source_rt.mesh().inner().start();
+
+    let identity = Identity::generate();
+    let origin_hash = identity.keypair().origin_hash();
+    let handle = source_rt
+        .spawn("counter", identity.clone(), DaemonHostConfig::default())
+        .await
+        .expect("spawn");
+    target_rt
+        .register_migration_target_identity("counter", identity, DaemonHostConfig::default())
+        .expect("target identity");
+
+    let mig = source_rt
+        .start_migration(
+            handle.origin_hash,
+            source_rt.mesh().inner().node_id(),
+            target_rt.mesh().inner().node_id(),
+        )
+        .await
+        .expect("start_migration");
+
+    // Sanity: record exists at a pre-terminal phase.
+    assert!(
+        matches!(
+            source_rt.migration_phase(origin_hash),
+            Some(MigrationPhase::Snapshot | MigrationPhase::Transfer)
+        ),
+        "fixture: migration should be stuck at a pre-terminal phase",
+    );
+
+    // Pause virtual time, spawn wait(), advance 120 s — past the
+    // pre-fix hidden 60 s ceiling. yield_now interleaves the
+    // spawn/advance with the waiter's poll loop.
+    tokio::time::pause();
+    let wait_task = tokio::spawn(mig.wait());
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(120)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    assert!(
+        !wait_task.is_finished(),
+        "wait() must not abort under a hidden timeout — pre-fix, 120s of \
+         virtual time would have tripped the 60s ceiling and aborted the \
+         migration. Post-fix, wait() blocks until the migration itself \
+         reaches a terminal state.",
+    );
+    wait_task.abort();
+
+    // Resume real time so test teardown can complete without
+    // wedging paused sleeps inside the mesh's shutdown path.
+    tokio::time::resume();
+}
+
+use net_sdk::compute::MigrationPhase;
+
+/// Regression (Cubic-AI P2 on `recent_failures` cache hygiene): the
+/// dispatcher's failure callback populates `recent_failures[origin]`
+/// on every inbound `MigrationFailed`. `MigrationHandle::wait`
+/// consumes the entry in its None-status branch. But if the caller
+/// drops the handle without calling `wait` (or never gets to
+/// `wait`), the entry sits forever — and the *next* migration for
+/// the same `origin_hash` silently pops it, mis-reporting the fresh
+/// migration's outcome as the stale reason.
+///
+/// Fix: `start_migration_with` clears `recent_failures[origin]` at
+/// the top of every new attempt, so no stale reason from a prior
+/// abandoned attempt can leak.
+///
+/// This is a deterministic unit-style check against the cache's
+/// public lifecycle, using the hidden `inject_migration_failure` /
+/// `peek_migration_failure` test hooks. Exercising the same
+/// property end-to-end through an actual abandoned migration races
+/// against the dispatcher's handling of the inbound
+/// `MigrationFailed`, so this direct shape is more reliable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_migration_clears_stale_failure_cache_entry() {
+    let pair = build_pair().await;
+    let Pair {
+        source_rt,
+        target_rt,
+    } = &pair;
+    source_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    target_rt
+        .register_factory("counter", counter_factory())
+        .unwrap();
+    source_rt.start().await.unwrap();
+    target_rt.start().await.unwrap();
+    source_rt.mesh().inner().start();
+    target_rt.mesh().inner().start();
+    sleep(Duration::from_millis(100)).await;
+
+    let identity = Identity::generate();
+    let origin_hash = identity.keypair().origin_hash();
+    let handle = source_rt
+        .spawn("counter", identity.clone(), DaemonHostConfig::default())
+        .await
+        .expect("spawn");
+    target_rt
+        .register_migration_target_identity("counter", identity, DaemonHostConfig::default())
+        .expect("target identity");
+
+    // Stage a stale failure as if a prior abandoned migration left
+    // it behind. No actual losing migration needed.
+    source_rt.inject_migration_failure(origin_hash, MigrationFailureReason::NotReady);
+    assert!(
+        matches!(
+            source_rt.peek_migration_failure(origin_hash),
+            Some(MigrationFailureReason::NotReady)
+        ),
+        "fixture: stale failure must be present before start_migration",
+    );
+
+    // Call start_migration — must clear the stale entry as its
+    // first act, BEFORE any wire work. After this call returns,
+    // the fresh migration is in flight; the stale entry is gone.
+    let mig = source_rt
+        .start_migration(
+            handle.origin_hash,
+            source_rt.mesh().inner().node_id(),
+            target_rt.mesh().inner().node_id(),
+        )
+        .await
+        .expect("start_migration");
+
+    // Window: the fresh migration may complete before this peek
+    // runs, in which case its own outcome (success) leaves the
+    // slot empty. Either way, the stale `NotReady` must no longer
+    // be observable — that's the regression guard.
+    let now = source_rt.peek_migration_failure(origin_hash);
+    assert!(
+        !matches!(now, Some(MigrationFailureReason::NotReady)),
+        "start_migration_with must drop stale cache entry; still saw {now:?}",
+    );
+
+    // End-to-end: fresh migration should complete normally and
+    // `wait` must return Ok. Under the pre-fix code this would
+    // surface the stale `NotReady` even though the fresh migration
+    // actually succeeded.
+    mig.wait_with_timeout(Duration::from_secs(5))
+        .await
+        .expect("fresh migration reaches Complete without stale failure leaking");
+    assert_eq!(target_rt.daemon_count(), 1);
+    assert_eq!(source_rt.daemon_count(), 0);
+    // Post-completion, the cache must be empty for this origin.
+    assert_eq!(source_rt.peek_migration_failure(origin_hash), None);
+}
+
+/// Shutdown drains the failure cache — bounds memory footprint
+/// after a runtime has been torn down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_clears_failure_cache() {
+    let pair = build_pair().await;
+    let rt = &pair.source_rt;
+    rt.register_factory("counter", counter_factory()).unwrap();
+    rt.start().await.unwrap();
+
+    // Inject a handful of stale entries.
+    for origin in 0..16u32 {
+        rt.inject_migration_failure(origin, MigrationFailureReason::NotReady);
+    }
+    assert!(rt.peek_migration_failure(0).is_some());
+
+    rt.shutdown().await.expect("shutdown");
+
+    for origin in 0..16u32 {
+        assert_eq!(
+            rt.peek_migration_failure(origin),
+            None,
+            "shutdown must drop cache entry for {origin:#x}",
+        );
+    }
 }
 
 // ---- Helpers -----------------------------------------------------------

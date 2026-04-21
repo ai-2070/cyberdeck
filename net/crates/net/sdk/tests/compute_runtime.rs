@@ -393,11 +393,8 @@ async fn duplicate_spawn_from_snapshot_does_not_corrupt_first_daemon() {
         .expect("first spawn");
     // Drive a few events so the snapshot is non-trivial.
     for i in 1..=2u64 {
-        rt.deliver(
-            handle.origin_hash,
-            &event(handle.origin_hash, i, b"tick"),
-        )
-        .expect("deliver");
+        rt.deliver(handle.origin_hash, &event(handle.origin_hash, i, b"tick"))
+            .expect("deliver");
     }
     let snapshot = handle
         .snapshot()

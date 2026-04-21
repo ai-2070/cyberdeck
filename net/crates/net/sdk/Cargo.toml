@@ -16,7 +16,7 @@ pin-project-lite = "0.2"
 thiserror = "2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 
 [features]
 default = []

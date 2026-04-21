@@ -189,7 +189,7 @@ impl IdentityEnvelope {
         target_static_pub: [u8; 32],
         chain_link: &CausalLink,
     ) -> Result<Self, EnvelopeError> {
-        let seed = source_kp
+        let mut seed = source_kp
             .try_secret_bytes()
             .map_err(EnvelopeError::from)?
             .to_owned();
@@ -199,14 +199,12 @@ impl IdentityEnvelope {
         let mut rng_bytes = [0u8; 32];
         getrandom::fill(&mut rng_bytes).expect("getrandom failed");
         let eph_sk = X25519Secret::from(rng_bytes);
-        for byte in rng_bytes.iter_mut() {
-            unsafe { std::ptr::write_volatile(byte, 0) };
-        }
+        volatile_zero(&mut rng_bytes);
         let eph_pk = X25519Pub::from(&eph_sk);
         let target_pk = X25519Pub::from(target_static_pub);
 
         let shared = eph_sk.diffie_hellman(&target_pk);
-        let key = derive_key(shared.as_bytes(), KDF_DOMAIN_KEY);
+        let mut key = derive_key(shared.as_bytes(), KDF_DOMAIN_KEY);
         let nonce = derive_nonce(eph_pk.as_bytes(), &target_static_pub);
 
         let aead = XChaCha20Poly1305::new((&key).into());
@@ -220,6 +218,16 @@ impl IdentityEnvelope {
             )
             .expect("XChaCha20Poly1305 encrypt with fresh key+nonce cannot fail on 32-byte msg");
         debug_assert_eq!(ciphertext.len(), SEED_LEN + TAG_LEN);
+
+        // Wipe the local copy of the seed — the AEAD has already
+        // consumed it, and we hold the ciphertext only from here on.
+        // The source keypair retains its own seed inside
+        // `EntityKeypair`; this wipe is about the short-lived `to_owned`
+        // copy we made for the `Payload.msg`.
+        volatile_zero(&mut seed);
+        // Derived AEAD key: also a function of a secret (the shared
+        // DH output). Scrub so the stack frame doesn't retain it.
+        volatile_zero(&mut key);
 
         let mut sealed_seed = [0u8; 80];
         sealed_seed[..EPH_PK_LEN].copy_from_slice(eph_pk.as_bytes());
@@ -282,30 +290,44 @@ impl IdentityEnvelope {
         let (eph_pk_bytes, ct) = self.sealed_seed.split_at(EPH_PK_LEN);
         let eph_pk = X25519Pub::from(<[u8; 32]>::try_from(eph_pk_bytes).unwrap());
         let shared = target_static_priv.diffie_hellman(&eph_pk);
-        let key = derive_key(shared.as_bytes(), KDF_DOMAIN_KEY);
+        let mut key = derive_key(shared.as_bytes(), KDF_DOMAIN_KEY);
         let nonce = derive_nonce(eph_pk.as_bytes(), &self.target_static_pub);
 
         let aead = XChaCha20Poly1305::new((&key).into());
-        let seed_vec = aead
+        let mut seed_vec = aead
             .decrypt((&nonce).into(), Payload { msg: ct, aad: &[] })
             .map_err(|_| EnvelopeError::SealOpenFailed)?;
         if seed_vec.len() != SEED_LEN {
+            // Even on a length-mismatch error, scrub the buffer
+            // before dropping — it holds (partial) decrypted secret
+            // material regardless of length.
+            volatile_zero(&mut seed_vec);
+            volatile_zero(&mut key);
             return Err(EnvelopeError::SealOpenFailed);
         }
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&seed_vec);
+        // AEAD returned an owned `Vec<u8>` holding the decrypted seed.
+        // Its `Drop` does NOT zeroize — `alloc::Vec` frees the backing
+        // storage without scrubbing, so a later allocation could
+        // observe the seed bytes in reused heap memory. Wipe through
+        // a volatile write before drop runs. Length-only wipe is
+        // enough because XChaCha20Poly1305::decrypt returns a tight
+        // Vec (len == capacity == SEED_LEN on the happy path we
+        // validated above).
+        volatile_zero(&mut seed_vec);
 
         // The derived ed25519 public key MUST match `signer_pub` —
         // otherwise the sender sealed a seed that doesn't correspond
         // to the identity they attested with. Fail closed.
         let kp = EntityKeypair::from_bytes(seed);
+        // Wipe the local copy of the seed; `kp` owns its own. Do
+        // this before the signer_pub check so an early-return on
+        // mismatch doesn't leave secret material on the stack.
+        volatile_zero(&mut seed);
+        volatile_zero(&mut key);
         if kp.entity_id().as_bytes() != &self.signer_pub {
             return Err(EnvelopeError::InvalidAttestation);
-        }
-
-        // Wipe the local copy of the seed; `kp` owns its own.
-        for byte in seed.iter_mut() {
-            unsafe { std::ptr::write_volatile(byte, 0) };
         }
 
         Ok(kp)
@@ -371,6 +393,24 @@ fn derive_key(shared: &[u8; 32], label: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&result);
     out
+}
+
+/// Scrub a byte slice with `write_volatile` so the compiler can't
+/// elide the wipe. Centralized so every secret-bearing buffer in
+/// this module uses the same idiom — missing a site has already
+/// bitten us once (see Cubic-AI P1 on `new` + `open`), and a helper
+/// makes future sites easier to audit.
+///
+/// `Vec<u8>`: the iteration bound is `len()`, not `capacity()`. The
+/// AEAD returns a tight buffer on the happy path, so this is
+/// sufficient; callers that know the Vec has excess capacity should
+/// truncate first or use a different primitive.
+fn volatile_zero(buf: &mut [u8]) {
+    for byte in buf.iter_mut() {
+        // SAFETY: `byte` is a valid mutable reference for the
+        // lifetime of this call, which is all `write_volatile` needs.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
 }
 
 /// Deterministic nonce: BLAKE2s-MAC keyed with a domain label,

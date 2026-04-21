@@ -67,8 +67,8 @@ use ::net::adapter::net::compute::{
 };
 use ::net::adapter::net::identity::EntityId;
 use ::net::adapter::net::subprotocol::{
-    FailureCallback, MigrationHandlerHooks, MigrationIdentityContext, MigrationSubprotocolHandler,
-    PostRestoreCallback, PreCleanupCallback, ReadinessCallback,
+    FailureCallback, MigrationHandlerHooks, MigrationSubprotocolHandler, PostRestoreCallback,
+    PreCleanupCallback, ReadinessCallback,
 };
 
 use crate::identity::Identity;
@@ -288,13 +288,12 @@ impl DaemonRuntime {
                         //   ledger and spawns async
                         //   `subscribe_channel` calls.
                         let local_node_id = self.inner.mesh.inner().node_id();
-                        let mesh_for_lookup = self.inner.mesh.clone();
-                        let ctx = MigrationIdentityContext {
-                            local_x25519_priv: self.inner.mesh.inner().static_x25519_priv(),
-                            peer_static_lookup: Arc::new(move |node_id: u64| {
-                                mesh_for_lookup.inner().peer_static_x25519(node_id)
-                            }),
-                        };
+                        // Ask the core crate to build the context. The
+                        // Noise static private key is captured inside
+                        // closures the core owns and never crosses
+                        // this boundary as raw bytes — see
+                        // `MeshNode::migration_identity_context`.
+                        let ctx = self.inner.mesh.inner().migration_identity_context();
                         let inner_for_rebind = self.inner.clone();
                         let post_restore: PostRestoreCallback =
                             Arc::new(move |origin_hash: u32| {
@@ -397,6 +396,13 @@ impl DaemonRuntime {
         for origin in origins {
             let _ = self.inner.registry.unregister(origin);
             self.inner.factory_registry.remove(origin);
+        }
+        // Drop any leftover migration-failure entries so they
+        // don't count against the process's memory footprint after
+        // shutdown. The runtime is permanently non-functional at
+        // this point, so no one will consume them.
+        if let Ok(mut map) = self.inner.recent_failures.lock() {
+            map.clear();
         }
         Ok(())
     }
@@ -592,6 +598,50 @@ impl DaemonRuntime {
     /// Number of daemons currently registered.
     pub fn daemon_count(&self) -> usize {
         self.inner.registry.count()
+    }
+
+    /// Current orchestrator-side migration phase for `origin_hash`,
+    /// or `None` when no migration record exists (either never
+    /// started here or already reached its terminal state and was
+    /// removed). Useful for tests that assert the migration reached
+    /// true completion (record gone via `ActivateAck`) rather than
+    /// simply advancing to the `Complete` phase.
+    pub fn migration_phase(&self, origin_hash: u32) -> Option<MigrationPhase> {
+        self.inner.orchestrator.status(origin_hash)
+    }
+
+    /// **Test-only.** Peek at the cached failure reason for
+    /// `origin_hash` without consuming it.
+    ///
+    /// Normal `MigrationHandle::wait` code path pops the entry when
+    /// it hits status=None; this accessor exists so regression tests
+    /// can observe the cache's lifecycle directly (e.g. assert the
+    /// cache is cleared by `start_migration_with`).
+    ///
+    /// Exposed publicly because SDK integration tests live in a
+    /// separate crate; not part of the stable surface.
+    #[doc(hidden)]
+    pub fn peek_migration_failure(&self, origin_hash: u32) -> Option<MigrationFailureReason> {
+        self.inner
+            .recent_failures
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&origin_hash).cloned())
+    }
+
+    /// **Test-only.** Inject a failure reason into the cache for
+    /// `origin_hash`. Lets tests stage a "stale entry from a prior
+    /// attempt" scenario deterministically, without having to run
+    /// a whole losing migration to populate it.
+    ///
+    /// Same caveat as [`Self::peek_migration_failure`] — visible
+    /// because SDK integration tests live out-of-crate; not part of
+    /// the stable surface.
+    #[doc(hidden)]
+    pub fn inject_migration_failure(&self, origin_hash: u32, reason: MigrationFailureReason) {
+        if let Ok(mut m) = self.inner.recent_failures.lock() {
+            m.insert(origin_hash, reason);
+        }
     }
 
     /// Snapshot the daemon's subscription ledger — a cloned view of
@@ -818,6 +868,18 @@ impl DaemonRuntime {
         opts: MigrationOpts,
     ) -> Result<MigrationHandle, DaemonError> {
         self.require_ready()?;
+        // Clear any stale failure reason from a prior migration
+        // attempt for this same `origin_hash`. Without this, if the
+        // previous attempt's `MigrationHandle` was dropped before
+        // `wait()` ran (or never `wait()`ed at all), the dispatcher's
+        // failure callback left an entry in `recent_failures` that
+        // would leak into THIS attempt's `wait()` — a successful
+        // new migration would incorrectly surface the old reason
+        // when `wait_one_attempt` hits its None-status branch and
+        // pops `recent_failures`.
+        if let Ok(mut map) = self.inner.recent_failures.lock() {
+            map.remove(&origin_hash);
+        }
         let mut first_msg = self
             .inner
             .orchestrator
@@ -1204,14 +1266,18 @@ impl MigrationHandle {
     /// ever having seen `Complete` — either an explicit abort or a
     /// failure at some upstream stage.
     ///
+    /// This method does **not** enforce any wall-clock timeout. A
+    /// migration that stalls waiting on an unresponsive peer will
+    /// block indefinitely; callers that want a bound should use
+    /// [`Self::wait_with_timeout`] instead.
+    ///
     /// Polls every 50 ms. The implementation is deliberately
     /// simple — Stage 2 of `DAEMON_IDENTITY_MIGRATION_PLAN.md` and
     /// the V2 iteration of this plan will swap this for a
     /// broadcast-channel push, but 50 ms polling is plenty for the
     /// use cases a migration API sees today.
     pub async fn wait(self) -> Result<(), DaemonError> {
-        self.wait_with_timeout(std::time::Duration::from_secs(60))
-            .await
+        self.wait_until(None).await
     }
 
     /// Like [`Self::wait`] with a caller-controlled timeout. A
@@ -1219,8 +1285,22 @@ impl MigrationHandle {
     /// `Err(MigrationError::StateFailed)`; a graceful `Complete`
     /// returns `Ok`.
     pub async fn wait_with_timeout(self, timeout: std::time::Duration) -> Result<(), DaemonError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        self.wait_until(Some(deadline)).await
+    }
+
+    /// Inner wait loop with an optional deadline. `None` = block
+    /// forever until the migration reaches a terminal state;
+    /// `Some(d)` = give up and abort at `d`.
+    ///
+    /// Centralised here so `wait` and `wait_with_timeout` can't
+    /// drift on the retry/backoff semantics, and so the
+    /// "hidden 60 s ceiling" cannot reappear under `wait`.
+    async fn wait_until(
+        self,
+        overall_deadline: Option<tokio::time::Instant>,
+    ) -> Result<(), DaemonError> {
         let start = tokio::time::Instant::now();
-        let overall_deadline = start + timeout;
         let retry_deadline = self.opts.retry_not_ready.map(|b| start + b);
         let mut attempts: u8 = 1; // first attempt initiated by start_migration_with
         loop {
@@ -1228,13 +1308,14 @@ impl MigrationHandle {
                 Ok(()) => return Ok(()),
                 Err(DaemonError::MigrationFailed(reason)) if reason.is_retriable() => {
                     // Retry decision.
-                    let Some(deadline) = retry_deadline else {
+                    let Some(retry_d) = retry_deadline else {
                         // Opts explicitly disable retry — surface
                         // the NotReady verbatim.
                         return Err(DaemonError::MigrationFailed(reason));
                     };
                     let now = tokio::time::Instant::now();
-                    if now >= deadline || now >= overall_deadline {
+                    let overall_exhausted = overall_deadline.map(|d| now >= d).unwrap_or(false);
+                    if now >= retry_d || overall_exhausted {
                         // Budget exhausted. `NotReadyTimeout` carries
                         // the attempt count for operator diagnosis.
                         return Err(DaemonError::MigrationFailed(
@@ -1263,15 +1344,17 @@ impl MigrationHandle {
     /// - `Err(MigrationFailed(reason))` when the dispatcher
     ///   observed a structured failure.
     /// - `Err(Migration(_))` on overall-timeout or unknown abort.
+    ///
+    /// `overall_deadline = None` disables the deadline check — the
+    /// poll loop only returns via a terminal status transition.
     async fn wait_one_attempt(
         &self,
-        overall_deadline: tokio::time::Instant,
+        overall_deadline: Option<tokio::time::Instant>,
     ) -> Result<(), DaemonError> {
-        let mut last_phase: Option<MigrationPhase> = None;
         loop {
-            match self.runtime.inner.orchestrator.status(self.origin_hash) {
+            let current_phase = self.runtime.inner.orchestrator.status(self.origin_hash);
+            match current_phase {
                 Some(phase) => {
-                    last_phase = Some(phase);
                     if phase == MigrationPhase::Complete {
                         // Give the dispatcher a beat to finish
                         // cleanup, then surface success.
@@ -1280,26 +1363,50 @@ impl MigrationHandle {
                     }
                 }
                 None => {
-                    if last_phase == Some(MigrationPhase::Complete) {
-                        return Ok(());
-                    }
+                    // A recorded failure is authoritative — the
+                    // dispatcher populates `recent_failures` before
+                    // the orchestrator removes the record, so
+                    // status=None + recorded-reason unambiguously
+                    // means abort.
                     if let Some(reason) = self.take_recent_failure() {
                         return Err(DaemonError::MigrationFailed(reason));
                     }
-                    return Err(DaemonError::Migration(MigrationError::StateFailed(
-                        "migration aborted before reaching Complete".into(),
-                    )));
+                    // No recorded failure. The orchestrator removes
+                    // records via two paths:
+                    //   1. `on_activate_ack` — success.
+                    //   2. `abort_migration_with_reason` — failure,
+                    //      which rides through the dispatcher's
+                    //      `MigrationFailed` handler *before* the
+                    //      record is dropped, so `recent_failures`
+                    //      is populated first.
+                    // Therefore status=None + no-recorded-failure is
+                    // unambiguously success, regardless of what
+                    // phase we last observed. This matters when the
+                    // dispatcher runs the tail of the migration
+                    // (Cutover → Complete → ActivateAck) entirely
+                    // between two 50 ms polls — we may never observe
+                    // `Complete` explicitly.
+                    //
+                    // Synchronous abort paths that bypass the
+                    // dispatcher (`wait_one_attempt`'s own timeout,
+                    // `start_migration_with`'s send-failure path)
+                    // return `Err` to the caller *before* the wait
+                    // loop can observe the None status, so they
+                    // don't trip this branch.
+                    return Ok(());
                 }
             }
-            if tokio::time::Instant::now() >= overall_deadline {
-                let _ = self
-                    .runtime
-                    .inner
-                    .orchestrator
-                    .abort_migration(self.origin_hash, "timeout".into());
-                return Err(DaemonError::Migration(MigrationError::StateFailed(
-                    format!("migration timed out in phase {:?}", last_phase),
-                )));
+            if let Some(d) = overall_deadline {
+                if tokio::time::Instant::now() >= d {
+                    let _ = self
+                        .runtime
+                        .inner
+                        .orchestrator
+                        .abort_migration(self.origin_hash, "timeout".into());
+                    return Err(DaemonError::Migration(MigrationError::StateFailed(
+                        format!("migration timed out in phase {:?}", current_phase),
+                    )));
+                }
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }

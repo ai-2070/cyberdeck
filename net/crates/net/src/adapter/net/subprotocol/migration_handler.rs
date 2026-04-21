@@ -26,18 +26,39 @@ use crate::adapter::net::state::snapshot::StateSnapshot;
 ///   local daemon's keypair is available, seal the envelope into
 ///   the snapshot before chunking.
 /// - **Target path**: on `SnapshotReady` with an attached envelope,
-///   unseal using `local_x25519_priv`, derive the daemon's keypair,
-///   and pass that into `restore_snapshot` instead of whatever the
+///   call `unseal_snapshot` to recover the daemon's keypair, and
+///   pass that into `restore_snapshot` instead of whatever the
 ///   factory registry has pre-registered.
 ///
 /// A `None` context means the dispatcher ignores envelopes — the
 /// pre-identity-envelope fallback path where both nodes pre-register
 /// matching keypairs.
+///
+/// # Key hygiene
+///
+/// This struct used to carry the local Noise static private key as a
+/// `pub [u8; 32]` field. Any SDK caller with access to a
+/// `MigrationIdentityContext` could copy the node's long-term secret
+/// out, which is unacceptable — the Noise static is what backs the
+/// node's identity in the mesh, not just the envelope-open path.
+///
+/// The private key is now captured inside the `unseal_snapshot`
+/// closure (built by [`MeshNode::migration_identity_context`]) and
+/// never surfaced as a struct field. Callers can still hand the
+/// context to the dispatcher, but they cannot extract the key from
+/// it. This matches how `peer_static_lookup` already worked.
 #[derive(Clone)]
 pub struct MigrationIdentityContext {
-    /// Local Noise static X25519 private key. Used to unseal
-    /// envelopes sealed to our public half.
-    pub local_x25519_priv: [u8; 32],
+    /// Open an identity envelope attached to `snapshot`, if present,
+    /// using the local static X25519 private key captured at
+    /// construction time. Returns `Ok(None)` when the snapshot has
+    /// no envelope, `Ok(Some(kp))` on a successful open, and an
+    /// error string on seal-open / attestation failure.
+    ///
+    /// Built by [`MeshNode::migration_identity_context`]; the
+    /// closure owns a `zeroize`-on-drop `StaticSecret` so the key
+    /// material is wiped when the context is dropped.
+    pub unseal_snapshot: EnvelopeUnsealFn,
     /// Callback: given a peer node_id, return its X25519 static
     /// public key if we have an active session with it. Used by the
     /// source path to pick the seal recipient.
@@ -47,7 +68,7 @@ pub struct MigrationIdentityContext {
 impl std::fmt::Debug for MigrationIdentityContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MigrationIdentityContext")
-            .field("local_x25519_priv", &"[REDACTED]")
+            .field("unseal_snapshot", &"<fn>")
             .field("peer_static_lookup", &"<fn>")
             .finish()
     }
@@ -111,6 +132,18 @@ pub type ReadinessCallback = Arc<dyn Fn() -> bool + Send + Sync>;
 /// Sync on the dispatcher thread.
 pub type FailureCallback =
     Arc<dyn Fn(u32, crate::adapter::net::compute::MigrationFailureReason) + Send + Sync>;
+
+/// Callback that opens an identity envelope carried on a
+/// [`StateSnapshot`](crate::adapter::net::state::snapshot::StateSnapshot),
+/// using a local private key captured inside the closure. See
+/// [`MigrationIdentityContext`] for key-hygiene rationale.
+pub type EnvelopeUnsealFn = Arc<
+    dyn Fn(
+            &crate::adapter::net::state::snapshot::StateSnapshot,
+        ) -> Result<Option<EntityKeypair>, crate::adapter::net::identity::EnvelopeError>
+        + Send
+        + Sync,
+>;
 
 /// Optional cross-cutting hooks consumed by
 /// [`MigrationSubprotocolHandler::with_hooks`]. Each field is
@@ -898,15 +931,16 @@ impl MigrationSubprotocolHandler {
         fallback: Option<&EntityKeypair>,
     ) -> Result<EntityKeypair, String> {
         if let (Some(ctx), Some(_)) = (&self.identity_context, &snapshot.identity_envelope) {
-            let priv_secret = x25519_dalek::StaticSecret::from(ctx.local_x25519_priv);
-            match snapshot.open_identity_envelope(&priv_secret) {
+            // The private key stays inside the closure owned by
+            // `ctx.unseal_snapshot` — the dispatcher never sees it.
+            match (ctx.unseal_snapshot)(snapshot) {
                 Ok(Some(kp)) => return Ok(kp),
                 Ok(None) => {
                     // Unreachable under normal conditions — `Some`
                     // envelope on the snapshot paired with
-                    // `open_identity_envelope` returning `Ok(None)`
-                    // would mean envelope was present but yielded
-                    // no keypair. Fall through to fallback.
+                    // `unseal_snapshot` returning `Ok(None)` would
+                    // mean envelope was present but yielded no
+                    // keypair. Fall through to fallback.
                 }
                 Err(e) => return Err(format!("{e}")),
             }
@@ -1002,6 +1036,38 @@ mod tests {
     use crate::adapter::net::state::causal::CausalEvent;
     use bytes::Bytes;
 
+    /// Regression (Cubic-AI P1: leaking Noise static private key):
+    /// `MigrationIdentityContext` previously exposed
+    /// `pub local_x25519_priv: [u8; 32]`, which meant any SDK caller
+    /// holding a context (or calling the now-removed
+    /// `MeshNode::static_x25519_priv`) could copy the node's
+    /// long-term identity key out.
+    ///
+    /// The fix moves the key into an `unseal_snapshot` closure owned
+    /// by the context, with the raw bytes never reachable as a
+    /// readable field. This test pins the struct's size so a
+    /// blind re-add of a `[u8; 32]` or similar secret-bearing field
+    /// trips the canary.
+    ///
+    /// Two `Arc<dyn Fn ...>` are fat pointers — two `usize`s each —
+    /// so the context is `4 * size_of::<usize>()`. If someone adds a
+    /// 32-byte key field, size jumps to that + 32 and this assertion
+    /// fails. Not a true API-surface guard (PR review is the real
+    /// guard) but an honest canary for the specific regression.
+    #[test]
+    fn migration_identity_context_has_no_plaintext_secret_field_regression() {
+        use std::mem::size_of;
+        let fat_ptr = 2 * size_of::<usize>();
+        assert_eq!(
+            size_of::<MigrationIdentityContext>(),
+            2 * fat_ptr,
+            "MigrationIdentityContext must stay two Arc<dyn Fn ...> and \
+             nothing else — a size change means a new field was added, \
+             most likely re-exposing the Noise static private key the \
+             way `local_x25519_priv: [u8; 32]` used to.",
+        );
+    }
+
     struct TestDaemon {
         value: u64,
     }
@@ -1083,5 +1149,128 @@ mod tests {
         // Should not error — just cleans up
         let outbound = handler.handle_message(&encoded, 0x3333).unwrap();
         assert!(outbound.is_empty());
+    }
+
+    /// Regression for a test that the SDK-level suite could not
+    /// honestly exercise: when the factory registry carries a
+    /// pre-provisioned **fallback keypair** AND the snapshot carries
+    /// a **valid identity envelope**, the envelope's keypair must
+    /// win. The SDK test that used to assert this could only register
+    /// a fallback keyed by the envelope's own `origin_hash`, because
+    /// `origin_hash` is derived from the keypair bytes — there's no
+    /// way for a user-level API to supply a "wrong" keypair at a
+    /// given `origin_hash`.
+    ///
+    /// This unit test reaches directly into `resolve_restore_keypair`
+    /// with two genuinely-distinct keypairs and asserts the envelope
+    /// overrides. If someone later flips the resolution order (e.g.
+    /// preferring the fallback for some misguided "backward-
+    /// compatibility" reason), this test trips.
+    #[test]
+    fn envelope_keypair_overrides_fallback_placeholder() {
+        use crate::adapter::net::identity::IdentityEnvelope;
+        use crate::adapter::net::state::causal::CausalLink;
+        use crate::adapter::net::state::snapshot::StateSnapshot;
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Secret};
+
+        // Target's Noise static X25519 keypair — used to seal and
+        // then unseal the envelope.
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).unwrap();
+        let target_priv = X25519Secret::from(seed);
+        let target_pub = *X25519Pub::from(&target_priv).as_bytes();
+
+        // Real source-side daemon keypair: the one that should end
+        // up being used for restore.
+        let real_kp = EntityKeypair::generate();
+        // Wrong fallback keypair: the one that would be used if
+        // someone flipped the resolution order.
+        let wrong_fallback = EntityKeypair::generate();
+        assert_ne!(
+            real_kp.entity_id(),
+            wrong_fallback.entity_id(),
+            "fixture: real and fallback must differ",
+        );
+
+        let chain_link = CausalLink {
+            origin_hash: real_kp.origin_hash(),
+            horizon_encoded: 0,
+            sequence: 0,
+            parent_hash: 0,
+        };
+        let envelope =
+            IdentityEnvelope::new(&real_kp, target_pub, &chain_link).expect("seal envelope");
+
+        // Snapshot carrying the envelope. The envelope's origin_hash
+        // matches `real_kp`; the test doesn't need the rest of the
+        // snapshot to validate, only the envelope-open path.
+        let snapshot = StateSnapshot {
+            version: crate::adapter::net::state::snapshot::SNAPSHOT_VERSION,
+            entity_id: real_kp.entity_id().clone(),
+            chain_link,
+            through_seq: 0,
+            state: Bytes::new(),
+            horizon: Default::default(),
+            created_at: 0,
+            bindings_bytes: Vec::new(),
+            identity_envelope: Some(envelope),
+        };
+
+        // Build a handler with an identity_context whose unseal
+        // closure holds the target's private key. This mirrors what
+        // `MeshNode::migration_identity_context` produces.
+        let priv_for_closure = target_priv.clone();
+        let unseal_snapshot: EnvelopeUnsealFn =
+            Arc::new(move |snap: &StateSnapshot| snap.open_identity_envelope(&priv_for_closure));
+        let peer_static_lookup: Arc<dyn Fn(u64) -> Option<[u8; 32]> + Send + Sync> =
+            Arc::new(|_| None);
+        let ctx = MigrationIdentityContext {
+            unseal_snapshot,
+            peer_static_lookup,
+        };
+
+        let reg = Arc::new(DaemonRegistry::new());
+        let orch = Arc::new(MigrationOrchestrator::new(reg.clone(), 0x1111));
+        let source = Arc::new(MigrationSourceHandler::new(reg.clone()));
+        let target = Arc::new(MigrationTargetHandler::new(reg));
+        let handler = MigrationSubprotocolHandler::with_hooks(
+            orch,
+            source,
+            target,
+            0x1111,
+            MigrationHandlerHooks {
+                identity: Some(ctx),
+                ..Default::default()
+            },
+        );
+
+        // Both envelope and fallback present — envelope wins.
+        let resolved = handler
+            .resolve_restore_keypair(&snapshot, Some(&wrong_fallback))
+            .expect("resolve");
+        assert_eq!(
+            resolved.entity_id(),
+            real_kp.entity_id(),
+            "envelope's keypair must win over the pre-provisioned fallback — \
+             flipping this order silently downgrades identity transport to \
+             whatever the factory registry was pre-populated with",
+        );
+        assert_ne!(
+            resolved.entity_id(),
+            wrong_fallback.entity_id(),
+            "fallback must NOT leak through when the envelope is valid",
+        );
+
+        // Sanity: with no envelope on the snapshot, fallback is
+        // returned verbatim. Proves the `Some(envelope) → envelope`
+        // branch above wasn't passing by coincidence.
+        let snapshot_no_envelope = StateSnapshot {
+            identity_envelope: None,
+            ..snapshot.clone()
+        };
+        let resolved_fallback = handler
+            .resolve_restore_keypair(&snapshot_no_envelope, Some(&wrong_fallback))
+            .expect("resolve with fallback only");
+        assert_eq!(resolved_fallback.entity_id(), wrong_fallback.entity_id());
     }
 }
