@@ -241,14 +241,40 @@ impl DaemonRuntime {
     }
 
     /// Register a factory for a daemon type. `kind` is a user-chosen
-    /// string shared across every node that may host this daemon —
-    /// Stage 2 migrations will look up the same `kind` on the
-    /// target. Second registrations of the same `kind` return
+    /// string shared across every node that may host this daemon.
+    /// Second registrations of the same `kind` return
     /// [`DaemonError::FactoryAlreadyRegistered`].
     ///
     /// Valid in both `Registering` and `Ready` states; the runtime
     /// permits new kinds to appear at runtime. Only `ShuttingDown`
     /// rejects.
+    ///
+    /// # Migration targeting
+    ///
+    /// `register_factory` alone is **not sufficient** to accept
+    /// inbound migrations — it registers the kind-to-closure mapping
+    /// only on the SDK side. The core migration dispatcher looks up
+    /// factories by `origin_hash` (the daemon's identity), not by
+    /// `kind`, because the migration wire protocol doesn't carry a
+    /// kind string; the target couldn't pick the right factory from
+    /// an inbound snapshot without an explicit binding.
+    ///
+    /// To accept migrations for a specific daemon, the target must
+    /// ALSO call one of:
+    ///
+    /// - [`Self::expect_migration`] `(kind, origin_hash, config)` —
+    ///   placeholder factory keyed by `origin_hash`; the envelope
+    ///   on the snapshot supplies the keypair at restore time.
+    ///   This is the common case.
+    /// - [`Self::register_migration_target_identity`] `(kind,
+    ///   identity, config)` — pre-provisions the keypair as a
+    ///   fallback when the source migrates with
+    ///   `transport_identity: false`.
+    ///
+    /// Or spawn the daemon locally first (via [`Self::spawn`]);
+    /// spawn seeds both the SDK map and the core registry, so a
+    /// daemon that migrated out and migrates back in on the same
+    /// node is covered without extra calls.
     pub fn register_factory<F>(&self, kind: &str, factory: F) -> Result<(), DaemonError>
     where
         F: Fn() -> Box<dyn MeshDaemon> + Send + Sync + 'static,
