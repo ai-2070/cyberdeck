@@ -652,14 +652,23 @@ impl DaemonRuntime {
         let host = match DaemonHost::from_snapshot(daemon, keypair, &snapshot, config) {
             Ok(h) => h,
             Err(e) => {
-                // We own the factory slot (register above succeeded
-                // atomically). Safe to remove on rollback.
+                // Same rollback-safety argument as in `spawn`:
+                // atomic `factory_registry::register` above means
+                // we exclusively own the slot, and nothing else
+                // can replace an occupied slot. Removing here
+                // cleans up strictly our insert — an adjacent
+                // pre-existing placeholder (e.g. from
+                // `expect_migration`) would have made our
+                // register fail atomically upstream, and we'd
+                // never have reached this branch.
                 self.inner.factory_registry.remove(origin_hash);
                 return Err(DaemonError::Core(e));
             }
         };
 
         if let Err(e) = self.inner.registry.register(host) {
+            // Same ownership argument — the atomic register
+            // above means we own this slot exclusively.
             self.inner.factory_registry.remove(origin_hash);
             return Err(DaemonError::Core(e));
         }
