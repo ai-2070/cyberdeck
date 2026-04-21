@@ -377,6 +377,129 @@ func (rt *DaemonRuntime) Stop(originHash uint32) error {
 	return computeErr(code, errOut)
 }
 
+// Snapshot takes a snapshot of a running daemon. Returns the
+// serialized state bytes, or nil for a stateless daemon (one that
+// doesn't implement DaemonSnapshotter, or whose Snapshot returned
+// nil).
+//
+// The returned bytes round-trip through SpawnFromSnapshot; callers
+// treat the slice as opaque.
+func (rt *DaemonRuntime) Snapshot(originHash uint32) ([]byte, error) {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if rt.handle == nil {
+		return nil, ErrRuntimeShutDown
+	}
+	var outputs *C.net_compute_outputs_t
+	var errOut *C.char
+	code := C.net_compute_runtime_snapshot(rt.handle, C.uint32_t(originHash), &outputs, &errOut)
+	if code != C.NET_COMPUTE_OK {
+		return nil, computeErr(code, errOut)
+	}
+	defer C.net_compute_outputs_free(outputs)
+	n := int(C.net_compute_outputs_len(outputs))
+	if n == 0 {
+		return nil, nil
+	}
+	var ptr *C.uint8_t
+	var length C.size_t
+	if C.net_compute_outputs_at(outputs, C.size_t(0), &ptr, &length) != C.NET_COMPUTE_OK {
+		return nil, &DaemonError{Message: "snapshot: failed to read bytes"}
+	}
+	return C.GoBytes(unsafe.Pointer(ptr), C.int(length)), nil
+}
+
+// SpawnFromSnapshot creates a new daemon of `kind` seeded from a
+// previously-taken snapshot. `snapshotBytes` must be the exact
+// buffer returned by a prior Snapshot call; the core validates the
+// wire format and rejects corruption before touching any state.
+//
+// The daemon instance supplied by `daemon` provides the initial
+// fresh state; its Restore method (if any) is invoked with
+// snapshotBytes' inner state payload before Process fires.
+func (rt *DaemonRuntime) SpawnFromSnapshot(
+	kind string,
+	identity *Identity,
+	snapshotBytes []byte,
+	daemon MeshDaemon,
+	cfg *DaemonHostConfig,
+) (*DaemonHandle, error) {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if rt.handle == nil {
+		return nil, ErrRuntimeShutDown
+	}
+	if daemon == nil {
+		return nil, &DaemonError{Message: "daemon is nil"}
+	}
+	if identity == nil {
+		return nil, &DaemonError{Message: "identity is nil"}
+	}
+
+	seed, err := identity.ToSeed()
+	if err != nil {
+		return nil, &DaemonError{Message: "failed to read identity seed: " + err.Error()}
+	}
+	if len(seed) != 32 {
+		return nil, &DaemonError{Message: "identity seed must be 32 bytes"}
+	}
+
+	daemonID := registerDaemon(daemon)
+
+	kindBytes := []byte(kind)
+	var kindPtr *C.char
+	if len(kindBytes) > 0 {
+		kindPtr = (*C.char)(unsafe.Pointer(&kindBytes[0]))
+	}
+	var snapPtr *C.uint8_t
+	if len(snapshotBytes) > 0 {
+		snapPtr = (*C.uint8_t)(unsafe.Pointer(&snapshotBytes[0]))
+	}
+
+	var autoSnap C.uint64_t
+	var maxLog C.uint32_t
+	if cfg != nil {
+		autoSnap = C.uint64_t(cfg.AutoSnapshotInterval)
+		maxLog = C.uint32_t(cfg.MaxLogEntries)
+	}
+
+	var nativeHandle *C.net_compute_daemon_handle_t
+	var errOut *C.char
+	code := C.net_compute_spawn_from_snapshot(
+		rt.handle,
+		kindPtr,
+		C.size_t(len(kindBytes)),
+		(*C.uint8_t)(unsafe.Pointer(&seed[0])),
+		snapPtr,
+		C.size_t(len(snapshotBytes)),
+		C.uint64_t(daemonID),
+		autoSnap,
+		maxLog,
+		&nativeHandle,
+		&errOut,
+	)
+	runtime.KeepAlive(kindBytes)
+	runtime.KeepAlive(seed)
+	runtime.KeepAlive(snapshotBytes)
+
+	if code != C.NET_COMPUTE_OK {
+		unregisterDaemon(daemonID)
+		return nil, computeErr(code, errOut)
+	}
+
+	var entityID [32]byte
+	_ = C.net_compute_daemon_handle_entity_id(nativeHandle, (*C.uint8_t)(unsafe.Pointer(&entityID[0])))
+	originHash := uint32(C.net_compute_daemon_handle_origin_hash(nativeHandle))
+
+	h := &DaemonHandle{
+		handle:     nativeHandle,
+		originHash: originHash,
+		entityID:   entityID,
+	}
+	runtime.SetFinalizer(h, (*DaemonHandle).Close)
+	return h, nil
+}
+
 // Deliver drives one causal event through the daemon at
 // originHash. Returns the daemon's output payloads (each a fresh
 // []byte).

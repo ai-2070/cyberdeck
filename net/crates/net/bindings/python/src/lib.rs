@@ -9,12 +9,12 @@ mod cortex;
 // dispatch and are operationally inseparable.
 #[cfg(feature = "net")]
 mod capabilities;
+#[cfg(feature = "compute")]
+mod compute;
 #[cfg(feature = "net")]
 mod identity;
 #[cfg(feature = "net")]
 mod subnets;
-#[cfg(feature = "compute")]
-mod compute;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -1823,7 +1823,10 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<compute::PyMigrationHandle>()?;
         m.add_class::<compute::PyMigrationPhasesIter>()?;
         m.add("DaemonError", m.py().get_type::<compute::DaemonError>())?;
-        m.add("MigrationError", m.py().get_type::<compute::MigrationError>())?;
+        m.add(
+            "MigrationError",
+            m.py().get_type::<compute::MigrationError>(),
+        )?;
     }
     Ok(())
 }

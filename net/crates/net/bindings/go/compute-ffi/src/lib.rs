@@ -44,7 +44,9 @@ use net::adapter::net::channel::ChannelConfigRegistry;
 use net::adapter::net::compute::{DaemonError as CoreDaemonError, DaemonHostConfig, MeshDaemon};
 use net::adapter::net::state::causal::CausalEvent;
 use net::adapter::net::MeshNode;
-use net_sdk::compute::{DaemonHandle as SdkDaemonHandle, DaemonRuntime as SdkDaemonRuntime};
+use net_sdk::compute::{
+    DaemonHandle as SdkDaemonHandle, DaemonRuntime as SdkDaemonRuntime, StateSnapshot,
+};
 use net_sdk::mesh::Mesh as SdkMesh;
 use net_sdk::Identity as SdkIdentity;
 use tokio::runtime::Runtime;
@@ -478,10 +480,7 @@ impl MeshDaemon for GoBridge {
         CapabilityFilter::default()
     }
 
-    fn process(
-        &mut self,
-        event: &CausalEvent,
-    ) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
+    fn process(&mut self, event: &CausalEvent) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
         let Some(d) = DISPATCHER.get() else {
             return Err(CoreDaemonError::ProcessFailed(
                 "Go dispatcher not registered — call net_compute_set_dispatcher at init"
@@ -513,9 +512,7 @@ impl MeshDaemon for GoBridge {
         let mut len: usize = 0;
         let code = unsafe { (d.snapshot)(self.daemon_id, &mut ptr, &mut len) };
         if code != NET_COMPUTE_OK {
-            eprintln!(
-                "GoBridge::snapshot: dispatcher returned {code}; treating as None"
-            );
+            eprintln!("GoBridge::snapshot: dispatcher returned {code}; treating as None");
             return None;
         }
         if ptr.is_null() || len == 0 {
@@ -529,10 +526,7 @@ impl MeshDaemon for GoBridge {
         Some(out)
     }
 
-    fn restore(
-        &mut self,
-        state: Bytes,
-    ) -> std::result::Result<(), CoreDaemonError> {
+    fn restore(&mut self, state: Bytes) -> std::result::Result<(), CoreDaemonError> {
         let Some(d) = DISPATCHER.get() else {
             return Err(CoreDaemonError::RestoreFailed(
                 "Go dispatcher not registered".to_string(),
@@ -673,9 +667,8 @@ pub extern "C" fn net_compute_spawn(
     // into Go's factory on the target side. Sub-step 4 addresses
     // this for migration-capable Go targets.
     let kind_for_noop = kind.clone();
-    let kind_factory = move || -> Box<dyn MeshDaemon> {
-        Box::new(NoopBridge::new(kind_for_noop.clone()))
-    };
+    let kind_factory =
+        move || -> Box<dyn MeshDaemon> { Box::new(NoopBridge::new(kind_for_noop.clone())) };
 
     let inner = h.inner.clone();
     let rt = runtime();
@@ -730,6 +723,165 @@ pub extern "C" fn net_compute_runtime_stop(
     }
 }
 
+/// Take a snapshot of the daemon identified by `origin_hash`.
+/// Returns the daemon's serialized state bytes in a one-element
+/// `OutputsVec`, or an empty `OutputsVec` if the daemon is
+/// stateless (no `snapshot` method, or snapshot returned nil).
+///
+/// The wire format is the core's `StateSnapshot::to_bytes`
+/// encoding — round-trip via [`net_compute_spawn_from_snapshot`].
+///
+/// Caller reads via `net_compute_outputs_len` / `_at` and frees
+/// via `net_compute_outputs_free`, same as `deliver`.
+#[no_mangle]
+pub extern "C" fn net_compute_runtime_snapshot(
+    handle: *mut DaemonRuntimeHandle,
+    origin_hash: u32,
+    out_outputs: *mut *mut OutputsVec,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    if out_outputs.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    let inner = h.inner.clone();
+    let rt = runtime();
+    let result = rt.block_on(async move { inner.snapshot(origin_hash).await });
+    match result {
+        Ok(opt) => {
+            let vec = match opt {
+                Some(snap) => OutputsVec {
+                    inner: vec![Bytes::from(snap.to_bytes())],
+                },
+                None => OutputsVec { inner: Vec::new() },
+            };
+            unsafe {
+                *out_outputs = Box::into_raw(Box::new(vec));
+            }
+            NET_COMPUTE_OK
+        }
+        Err(e) => {
+            unsafe {
+                *out_outputs = std::ptr::null_mut();
+            }
+            write_err(err_out, &e.to_string());
+            NET_COMPUTE_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Spawn a daemon from a previously-taken snapshot. Parallels
+/// [`net_compute_spawn`] but seeds the daemon's initial state
+/// from `snapshot_bytes` by calling its `restore` method before
+/// any events land.
+///
+/// `snapshot_bytes` MUST be the exact buffer returned by a prior
+/// [`net_compute_runtime_snapshot`] call; corrupted bytes surface
+/// as `snapshot decode failed`.
+///
+/// Identity check: the snapshot's `entity_id` must match the
+/// caller's identity — mismatch surfaces as
+/// `daemon: snapshot identity mismatch`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn net_compute_spawn_from_snapshot(
+    handle: *mut DaemonRuntimeHandle,
+    kind_ptr: *const c_char,
+    kind_len: usize,
+    identity_seed: *const u8,
+    snapshot_ptr: *const u8,
+    snapshot_len: usize,
+    daemon_id: u64,
+    auto_snapshot_interval: u64,
+    max_log_entries: u32,
+    out_handle: *mut *mut DaemonHandleC,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    if kind_ptr.is_null() || identity_seed.is_null() || out_handle.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    if snapshot_len > 0 && snapshot_ptr.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+
+    // Decode the snapshot up front so a corrupted buffer surfaces
+    // with a clean message before we build a bridge / register a
+    // daemon_id.
+    let snap_bytes = if snapshot_len == 0 {
+        &[] as &[u8]
+    } else {
+        unsafe { std::slice::from_raw_parts(snapshot_ptr, snapshot_len) }
+    };
+    let Some(snapshot_decoded) = StateSnapshot::from_bytes(snap_bytes) else {
+        write_err(err_out, "snapshot decode failed");
+        return NET_COMPUTE_ERR_CALL_FAILED;
+    };
+
+    let mut seed = [0u8; 32];
+    unsafe {
+        std::ptr::copy_nonoverlapping(identity_seed, seed.as_mut_ptr(), 32);
+    }
+    let sdk_identity = SdkIdentity::from_seed(seed);
+
+    let mut cfg = DaemonHostConfig::default();
+    cfg.auto_snapshot_interval = auto_snapshot_interval;
+    if max_log_entries > 0 {
+        cfg.max_log_entries = max_log_entries;
+    }
+
+    let bridge = Box::new(GoBridge {
+        name: kind.clone(),
+        daemon_id,
+    });
+    let kind_for_noop = kind.clone();
+    let kind_factory =
+        move || -> Box<dyn MeshDaemon> { Box::new(NoopBridge::new(kind_for_noop.clone())) };
+
+    let inner = h.inner.clone();
+    let rt = runtime();
+    let result = rt.block_on(async move {
+        inner
+            .spawn_from_snapshot_with_daemon(
+                sdk_identity,
+                snapshot_decoded,
+                cfg,
+                bridge,
+                kind_factory,
+            )
+            .await
+    });
+    match result {
+        Ok(sdk_handle) => {
+            let origin_hash = sdk_handle.origin_hash;
+            let entity_id = *sdk_handle.entity_id.as_bytes();
+            let boxed = Box::new(DaemonHandleC {
+                origin_hash,
+                entity_id,
+                inner: sdk_handle,
+            });
+            unsafe {
+                *out_handle = Box::into_raw(boxed);
+            }
+            NET_COMPUTE_OK
+        }
+        Err(e) => {
+            unsafe {
+                *out_handle = std::ptr::null_mut();
+            }
+            write_err(err_out, &e.to_string());
+            NET_COMPUTE_ERR_CALL_FAILED
+        }
+    }
+}
+
 /// Deliver one event to the daemon at `origin_hash`. The Go
 /// dispatcher's `process` callback fires with the same event
 /// fields; the daemon's outputs push into a fresh `OutputsVec`
@@ -761,8 +913,7 @@ pub extern "C" fn net_compute_runtime_deliver(
     let payload = if event_payload_len == 0 {
         Bytes::new()
     } else {
-        let slice =
-            unsafe { std::slice::from_raw_parts(event_payload, event_payload_len) };
+        let slice = unsafe { std::slice::from_raw_parts(event_payload, event_payload_len) };
         Bytes::copy_from_slice(slice)
     };
     let event = CausalEvent {
@@ -782,10 +933,7 @@ pub extern "C" fn net_compute_runtime_deliver(
     match result {
         Ok(outputs) => {
             let vec = OutputsVec {
-                inner: outputs
-                    .into_iter()
-                    .map(|ev| ev.payload.clone())
-                    .collect(),
+                inner: outputs.into_iter().map(|ev| ev.payload.clone()).collect(),
             };
             unsafe {
                 *out_outputs = Box::into_raw(Box::new(vec));

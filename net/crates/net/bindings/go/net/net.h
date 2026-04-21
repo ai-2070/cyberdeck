@@ -772,6 +772,35 @@ int                     net_compute_outputs_at(
     size_t* out_len);
 void                    net_compute_outputs_free(net_compute_outputs_t* vec);
 
+/* --- Snapshot + restore (sub-step 3) --- */
+
+/* Take a snapshot of a running daemon. On success, `*out_outputs`
+ * carries the serialized StateSnapshot bytes as a single-entry
+ * outputs vec, or an empty vec for stateless daemons. */
+int                     net_compute_runtime_snapshot(
+    net_compute_runtime_t* runtime,
+    uint32_t origin_hash,
+    net_compute_outputs_t** out_outputs,
+    char** err_out);
+
+/* Spawn from a previously-taken snapshot. `snapshot_ptr` /
+ * `snapshot_len` must be the exact bytes returned by a prior
+ * `net_compute_runtime_snapshot`. Corrupted bytes fail fast with
+ * `daemon: snapshot decode failed`; identity mismatch surfaces via
+ * the SDK's existing `snapshot identity mismatch` error. */
+int                     net_compute_spawn_from_snapshot(
+    net_compute_runtime_t* runtime,
+    const char* kind_ptr,
+    size_t kind_len,
+    const uint8_t* identity_seed,
+    const uint8_t* snapshot_ptr,
+    size_t snapshot_len,
+    uint64_t daemon_id,
+    uint64_t auto_snapshot_interval,
+    uint32_t max_log_entries,
+    net_compute_daemon_handle_t** out_handle,
+    char** err_out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -542,6 +542,242 @@ func TestDeliver_TwoDaemonsIndependentState(t *testing.T) {
 	}
 }
 
+// -------------------------------------------------------------------------
+// Sub-step 3: snapshot + restore round-trip
+// -------------------------------------------------------------------------
+
+func TestSnapshot_CounterRoundTrip(t *testing.T) {
+	m := newLocalMesh(t)
+	defer m.Shutdown()
+	rt, err := NewDaemonRuntime(m)
+	if err != nil {
+		t.Fatalf("NewDaemonRuntime: %v", err)
+	}
+	defer rt.Close()
+	if err := rt.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	id, _ := GenerateIdentity()
+	defer id.Close()
+	h, err := rt.Spawn("counter", id, &counterDaemon{}, nil)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	// Drive the counter to 3.
+	for i := uint64(1); i <= 3; i++ {
+		if _, err := rt.Deliver(h.OriginHash(), CausalEvent{OriginHash: id.OriginHash(), Sequence: i}); err != nil {
+			t.Fatalf("Deliver(%d): %v", i, err)
+		}
+	}
+
+	snap, err := rt.Snapshot(h.OriginHash())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if len(snap) == 0 {
+		t.Fatalf("Snapshot returned empty bytes for stateful daemon")
+	}
+
+	// Tear the original down — restored instance must pick up
+	// from the snapshot, not any live state.
+	if err := rt.Stop(h.OriginHash()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	h.Close()
+	if rt.DaemonCount() != 0 {
+		t.Fatalf("DaemonCount after stop = %d, want 0", rt.DaemonCount())
+	}
+
+	restored, err := rt.SpawnFromSnapshot("counter", id, snap, &counterDaemon{}, nil)
+	if err != nil {
+		t.Fatalf("SpawnFromSnapshot: %v", err)
+	}
+	defer restored.Close()
+	if restored.OriginHash() != h.OriginHash() {
+		t.Errorf("restored.OriginHash = %#x, want %#x", restored.OriginHash(), h.OriginHash())
+	}
+
+	// One more delivery — counter should step from 3 to 4.
+	out, err := rt.Deliver(restored.OriginHash(), CausalEvent{OriginHash: id.OriginHash(), Sequence: 4})
+	if err != nil {
+		t.Fatalf("Deliver after restore: %v", err)
+	}
+	if got := readU32LE(out[0]); got != 4 {
+		t.Errorf("counter after restore = %d, want 4", got)
+	}
+}
+
+func TestSnapshot_StatelessDaemonReturnsNil(t *testing.T) {
+	m := newLocalMesh(t)
+	defer m.Shutdown()
+	rt, err := NewDaemonRuntime(m)
+	if err != nil {
+		t.Fatalf("NewDaemonRuntime: %v", err)
+	}
+	defer rt.Close()
+	if err := rt.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	id, _ := GenerateIdentity()
+	defer id.Close()
+	h, err := rt.Spawn("echo", id, echoDaemon{}, nil)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer h.Close()
+
+	snap, err := rt.Snapshot(h.OriginHash())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if snap != nil {
+		t.Errorf("Snapshot of stateless daemon = %d bytes, want nil", len(snap))
+	}
+}
+
+func TestSnapshot_UnknownOriginErrors(t *testing.T) {
+	m := newLocalMesh(t)
+	defer m.Shutdown()
+	rt, err := NewDaemonRuntime(m)
+	if err != nil {
+		t.Fatalf("NewDaemonRuntime: %v", err)
+	}
+	defer rt.Close()
+	if err := rt.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	_, err = rt.Snapshot(0xDEADBEEF)
+	if err == nil {
+		t.Fatalf("Snapshot(unknown) returned nil error")
+	}
+}
+
+func TestSpawnFromSnapshot_CorruptedBytesErrors(t *testing.T) {
+	m := newLocalMesh(t)
+	defer m.Shutdown()
+	rt, err := NewDaemonRuntime(m)
+	if err != nil {
+		t.Fatalf("NewDaemonRuntime: %v", err)
+	}
+	defer rt.Close()
+	if err := rt.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	id, _ := GenerateIdentity()
+	defer id.Close()
+	_, err = rt.SpawnFromSnapshot("counter", id, []byte("not a real snapshot"), &counterDaemon{}, nil)
+	if err == nil {
+		t.Fatalf("SpawnFromSnapshot with garbage bytes returned nil error")
+	}
+	if !strings.Contains(err.Error(), "snapshot decode failed") {
+		t.Errorf("err = %q, want 'snapshot decode failed'", err.Error())
+	}
+}
+
+func TestSpawnFromSnapshot_MismatchedIdentityErrors(t *testing.T) {
+	m := newLocalMesh(t)
+	defer m.Shutdown()
+	rt, err := NewDaemonRuntime(m)
+	if err != nil {
+		t.Fatalf("NewDaemonRuntime: %v", err)
+	}
+	defer rt.Close()
+	if err := rt.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	orig, _ := GenerateIdentity()
+	defer orig.Close()
+	h, err := rt.Spawn("counter", orig, &counterDaemon{}, nil)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	_, err = rt.Deliver(h.OriginHash(), CausalEvent{OriginHash: orig.OriginHash(), Sequence: 1})
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	snap, err := rt.Snapshot(h.OriginHash())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	_ = rt.Stop(h.OriginHash())
+	h.Close()
+
+	// Different identity — snapshot's entity_id mismatch.
+	other, _ := GenerateIdentity()
+	defer other.Close()
+	_, err = rt.SpawnFromSnapshot("counter", other, snap, &counterDaemon{}, nil)
+	if err == nil {
+		t.Fatalf("SpawnFromSnapshot with wrong identity returned nil error")
+	}
+}
+
+func TestSnapshot_EarlierVsLaterCapturesDifferentState(t *testing.T) {
+	m := newLocalMesh(t)
+	defer m.Shutdown()
+	rt, err := NewDaemonRuntime(m)
+	if err != nil {
+		t.Fatalf("NewDaemonRuntime: %v", err)
+	}
+	defer rt.Close()
+	if err := rt.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	id, _ := GenerateIdentity()
+	defer id.Close()
+	h, err := rt.Spawn("counter", id, &counterDaemon{}, nil)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	evt := func(seq uint64) CausalEvent {
+		return CausalEvent{OriginHash: id.OriginHash(), Sequence: seq}
+	}
+	for i := uint64(1); i <= 2; i++ {
+		_, _ = rt.Deliver(h.OriginHash(), evt(i))
+	}
+	snapAt2, err := rt.Snapshot(h.OriginHash())
+	if err != nil {
+		t.Fatalf("Snapshot at 2: %v", err)
+	}
+	for i := uint64(3); i <= 5; i++ {
+		_, _ = rt.Deliver(h.OriginHash(), evt(i))
+	}
+	snapAt5, err := rt.Snapshot(h.OriginHash())
+	if err != nil {
+		t.Fatalf("Snapshot at 5: %v", err)
+	}
+	_ = rt.Stop(h.OriginHash())
+	h.Close()
+
+	// Restore earlier snapshot — next event should be 3.
+	h2, err := rt.SpawnFromSnapshot("counter", id, snapAt2, &counterDaemon{}, nil)
+	if err != nil {
+		t.Fatalf("SpawnFromSnapshot at 2: %v", err)
+	}
+	out, _ := rt.Deliver(h2.OriginHash(), evt(6))
+	if got := readU32LE(out[0]); got != 3 {
+		t.Errorf("restore-from-2 counter after one delivery = %d, want 3", got)
+	}
+	_ = rt.Stop(h2.OriginHash())
+	h2.Close()
+
+	// Restore later snapshot — next event should be 6.
+	h5, err := rt.SpawnFromSnapshot("counter", id, snapAt5, &counterDaemon{}, nil)
+	if err != nil {
+		t.Fatalf("SpawnFromSnapshot at 5: %v", err)
+	}
+	defer h5.Close()
+	out, _ = rt.Deliver(h5.OriginHash(), evt(7))
+	if got := readU32LE(out[0]); got != 6 {
+		t.Errorf("restore-from-5 counter after one delivery = %d, want 6", got)
+	}
+}
+
 func bytesEqual(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false

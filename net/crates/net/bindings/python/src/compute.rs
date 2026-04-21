@@ -97,11 +97,7 @@ pub(crate) fn daemon_err(msg: impl Into<String>) -> PyErr {
 
 /// Build a `MigrationError` with the `daemon: migration:` prefix.
 fn migration_err(body: impl Into<String>) -> PyErr {
-    PyErr::new::<MigrationError, _>(format!(
-        "{} migration: {}",
-        ERR_DAEMON_PREFIX,
-        body.into()
-    ))
+    PyErr::new::<MigrationError, _>(format!("{} migration: {}", ERR_DAEMON_PREFIX, body.into()))
 }
 
 /// Map an SDK `DaemonError` to the right Python-level exception
@@ -723,7 +719,9 @@ impl PyDaemonRuntime {
     /// `cutover` | `complete`) or `None` if no migration is in
     /// flight for that origin.
     fn migration_phase(&self, origin_hash: u32) -> Option<&'static str> {
-        self.inner.migration_phase(origin_hash).map(migration_phase_str)
+        self.inner
+            .migration_phase(origin_hash)
+            .map(migration_phase_str)
     }
 
     fn __repr__(&self) -> String {
@@ -936,10 +934,7 @@ impl MeshDaemon for PyDaemonBridge {
     /// Dispatch the event to the Python `process` callable. The
     /// callable must return an iterable of `bytes`; anything else
     /// is surfaced as `CoreDaemonError::ProcessFailed`.
-    fn process(
-        &mut self,
-        event: &CausalEvent,
-    ) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
+    fn process(&mut self, event: &CausalEvent) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
         let py_event = PyCausalEvent::from_core(event);
         Python::attach(|py| -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
             let event_obj = Py::new(py, py_event).map_err(|e| {
@@ -948,9 +943,10 @@ impl MeshDaemon for PyDaemonBridge {
             let args = PyTuple::new(py, [event_obj.into_any()]).map_err(|e| {
                 CoreDaemonError::ProcessFailed(format!("failed to build args: {e}"))
             })?;
-            let result = self.process.call1(py, args).map_err(|e| {
-                CoreDaemonError::ProcessFailed(format!("process raised: {e}"))
-            })?;
+            let result = self
+                .process
+                .call1(py, args)
+                .map_err(|e| CoreDaemonError::ProcessFailed(format!("process raised: {e}")))?;
             let list: Bound<'_, PyAny> = result.into_bound(py);
             parse_output_list(&list)
         })
@@ -989,10 +985,7 @@ impl MeshDaemon for PyDaemonBridge {
 
     /// Invoke the Python `restore(state)` callable. Errors
     /// propagate as `CoreDaemonError::RestoreFailed`.
-    fn restore(
-        &mut self,
-        state: Bytes,
-    ) -> std::result::Result<(), CoreDaemonError> {
+    fn restore(&mut self, state: Bytes) -> std::result::Result<(), CoreDaemonError> {
         let Some(restore) = self.restore.as_ref() else {
             return Ok(());
         };
@@ -1001,9 +994,9 @@ impl MeshDaemon for PyDaemonBridge {
             let args = PyTuple::new(py, [state_bytes.into_any()]).map_err(|e| {
                 CoreDaemonError::RestoreFailed(format!("failed to build args: {e}"))
             })?;
-            restore.call1(py, args).map_err(|e| {
-                CoreDaemonError::RestoreFailed(format!("restore raised: {e}"))
-            })?;
+            restore
+                .call1(py, args)
+                .map_err(|e| CoreDaemonError::RestoreFailed(format!("restore raised: {e}")))?;
             Ok(())
         })
     }
@@ -1017,9 +1010,7 @@ fn parse_output_list(obj: &Bound<'_, PyAny>) -> std::result::Result<Vec<Bytes>, 
         let mut out = Vec::with_capacity(list.len());
         for item in list.iter() {
             let v: Vec<u8> = item.extract().map_err(|e| {
-                CoreDaemonError::ProcessFailed(format!(
-                    "process output element is not bytes: {e}"
-                ))
+                CoreDaemonError::ProcessFailed(format!("process output element is not bytes: {e}"))
             })?;
             out.push(Bytes::from(v));
         }
@@ -1031,9 +1022,7 @@ fn parse_output_list(obj: &Bound<'_, PyAny>) -> std::result::Result<Vec<Bytes>, 
             let mut out = Vec::new();
             for item in iter {
                 let item = item.map_err(|e| {
-                    CoreDaemonError::ProcessFailed(format!(
-                        "iterating process output: {e}"
-                    ))
+                    CoreDaemonError::ProcessFailed(format!("iterating process output: {e}"))
                 })?;
                 let v: Vec<u8> = item.extract().map_err(|e| {
                     CoreDaemonError::ProcessFailed(format!(
