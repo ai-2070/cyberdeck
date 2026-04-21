@@ -1,0 +1,29 @@
+net/crates/net/bindings/go/net/compute.go
+  5bf3f089eecaef7a 380-502
+net/crates/net/bindings/go/net/compute_test.go
+  5bf3f089eecaef7a 545-780
+net/crates/net/bindings/go/net/net.h
+  5bf3f089eecaef7a 775-803
+net/crates/net/bindings/go/compute-ffi/src/lib.rs
+  5bf3f089eecaef7a 47-49,483,515,529,670-671,726-884,916,936
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "0ced2d99407052df229c96da8c32b692d3c4b37f",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 6834,
+      "total_deletions": 47,
+      "accepted_lines": 560,
+      "overriden_lines": 0
+    }
+  }
+}
