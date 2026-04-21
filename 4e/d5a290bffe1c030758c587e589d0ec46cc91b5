@@ -1,0 +1,49 @@
+net/crates/net/src/adapter/net/compute/migration.rs
+  5bf3f089eecaef7a 71-75
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  5bf3f089eecaef7a 10,14,543,555-556,1211,1301
+net/crates/net/tests/three_node_integration.rs
+  5bf3f089eecaef7a 2710,2726,2731-2757,2875-2877
+net/crates/net/tests/migration_integration.rs
+  5bf3f089eecaef7a 837-839,2678-2688,2690-2691
+net/crates/net/sdk/src/compute.rs
+  5bf3f089eecaef7a 4,48,190-195,227,307-324,326,329-335,337-340,343-344,348-359,402-415,449-453,499-503,584,652-654,691,693-699,701-706,719-757,782-788,843-848,903-905,1203,1235,1334-1336
+net/crates/net/src/adapter/net/subprotocol/migration_handler.rs
+  5bf3f089eecaef7a 112-113,115-126,262,290,658-660,799,947-964,968,970-982,984-988,1006
+net/crates/net/src/adapter/net/mesh.rs
+  5bf3f089eecaef7a 517-546,1871-1880,1957-1997
+net/crates/net/src/adapter/net/compute/host.rs
+  5bf3f089eecaef7a 140-141,146,148,250,287-289,291-292
+net/crates/net/src/adapter/net/redex/manager.rs
+  5bf3f089eecaef7a 78-80
+net/crates/net/src/adapter/net/compute/registry.rs
+  5bf3f089eecaef7a 135-138
+net/crates/net/sdk/tests/compute_migration.rs
+  5bf3f089eecaef7a 24,86-89,162,172,295-299,396,497-501,519-522,526,528-539,541-641,643-824
+net/crates/net/sdk/tests/compute_channel_rebind.rs
+  5bf3f089eecaef7a 27,155-158,187-190,241-244,246,248,251-252,344-347,350,369-375,387-393,402
+net/crates/net/src/adapter/net/compute/bindings.rs
+  5bf3f089eecaef7a 17-21,86-87,94-95
+net/crates/net/src/adapter/net/compute/daemon_factory.rs
+  5bf3f089eecaef7a 32-41,52-56,73,79-85,95-119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "4ed5a290bffe1c030758c587e589d0ec46cc91b5",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 23767,
+      "total_deletions": 537,
+      "accepted_lines": 836,
+      "overriden_lines": 0
+    }
+  }
+}
