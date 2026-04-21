@@ -489,53 +489,56 @@ async fn start_installs_handler_before_publishing_ready() {
 /// whether `spawn` returned `Ok` or `Err(ShuttingDown)`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn spawn_racing_with_shutdown_does_not_leave_daemon_registered() {
-    for trial in 0..256u32 {
-        let rt = runtime().await;
-        rt.register_factory("echo", || Box::new(EchoDaemon))
-            .unwrap();
-        rt.start().await.unwrap();
+    // Inject a stall into `spawn` between the `require_ready`
+    // check and the registry inserts. This makes the race
+    // deterministic: shutdown reliably flips state + sweeps
+    // during the stall, and spawn's post-insert fence must
+    // catch it afterwards. Without the stall, the race window
+    // is nanoseconds wide and the test would be flaky.
+    let rt = runtime().await;
+    rt.register_factory("echo", || Box::new(EchoDaemon))
+        .unwrap();
+    rt.start().await.unwrap();
+    rt.set_spawn_stall_ms(100);
 
-        // Both race paths use their own rt clone and run on
-        // separate tasks. Tokio's scheduler interleaves them
-        // across worker threads, exercising the race window.
-        let rt_for_spawn = rt.clone();
-        let rt_for_shutdown = rt.clone();
-        let spawn_task = tokio::spawn(async move {
-            rt_for_spawn
-                .spawn(
-                    "echo",
-                    Identity::generate(),
-                    DaemonHostConfig::default(),
-                )
-                .await
-        });
-        let shutdown_task = tokio::spawn(async move { rt_for_shutdown.shutdown().await });
+    let rt_for_spawn = rt.clone();
+    let spawn_task = tokio::spawn(async move {
+        rt_for_spawn
+            .spawn(
+                "echo",
+                Identity::generate(),
+                DaemonHostConfig::default(),
+            )
+            .await
+    });
 
-        let (spawn_result, shutdown_result) = tokio::join!(spawn_task, shutdown_task);
-        let spawn_result = spawn_result.expect("spawn task panicked");
-        shutdown_result
-            .expect("shutdown task panicked")
-            .expect("shutdown Ok");
+    // Give `spawn_task` a beat to clear `require_ready` and land
+    // in its injected stall. Then run `shutdown` — it flips state
+    // and sweeps while spawn is still parked.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    rt.shutdown().await.expect("shutdown Ok");
 
-        assert_eq!(
-            rt.daemon_count(),
-            0,
-            "trial {trial}: daemon survived shutdown — spawn returned \
-             {spawn_result:?}; pre-fix race left an entry in the registry \
-             when shutdown's sweep completed before spawn's inserts",
-        );
+    // Spawn eventually unblocks after the stall. Its inserts
+    // happen on a runtime that is already `ShuttingDown`, so the
+    // post-insert fence MUST detect this and roll back. Without
+    // the fence, the inserts persist and `daemon_count()` is 1.
+    let spawn_result = spawn_task.await.expect("spawn task panicked");
 
-        // If `spawn` happened to beat `shutdown`, the caller got a
-        // handle but the underlying daemon was drained. If it lost
-        // the race, it saw `Err(ShuttingDown)`. Anything else is a
-        // regression.
-        match spawn_result {
-            Ok(_) | Err(DaemonError::ShuttingDown) => {}
-            other => panic!(
-                "trial {trial}: spawn racing with shutdown must return Ok \
-                 or Err(ShuttingDown); got {other:?}",
-            ),
-        }
+    assert_eq!(
+        rt.daemon_count(),
+        0,
+        "daemon survived shutdown (spawn returned {spawn_result:?}) — \
+         pre-fix race left an entry in the registry when shutdown's \
+         sweep completed before spawn's inserts",
+    );
+    // With the stall, shutdown reliably runs first, so spawn
+    // must see `ShuttingDown` at its post-insert check.
+    match spawn_result {
+        Err(DaemonError::ShuttingDown) => {}
+        other => panic!(
+            "spawn racing with shutdown must return Err(ShuttingDown) \
+             when shutdown completed during the stall; got {other:?}",
+        ),
     }
 }
 

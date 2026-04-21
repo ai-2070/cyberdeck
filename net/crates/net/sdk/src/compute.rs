@@ -193,6 +193,11 @@ struct Inner {
     /// without racing against runtime startup. Defaults to `false`;
     /// production code should not touch it.
     simulate_not_ready: AtomicBool,
+    /// Test-only stall injected into `spawn` between the
+    /// `require_ready` check and the registry inserts. Measured
+    /// in milliseconds; `0` = no stall (production default). See
+    /// [`DaemonRuntime::set_spawn_stall_ms`].
+    spawn_stall_ms: std::sync::atomic::AtomicU32,
 }
 
 impl DaemonRuntime {
@@ -225,6 +230,7 @@ impl DaemonRuntime {
                 target_handler,
                 recent_failures: Mutex::new(HashMap::new()),
                 simulate_not_ready: AtomicBool::new(false),
+                spawn_stall_ms: std::sync::atomic::AtomicU32::new(0),
             }),
         }
     }
@@ -437,6 +443,18 @@ impl DaemonRuntime {
         self.inner.simulate_not_ready.store(flag, Ordering::Release);
     }
 
+    /// **Test-only.** Inject a sleep inside `spawn` between the
+    /// initial `require_ready` check and the registry inserts,
+    /// giving integration tests a deterministic window to race
+    /// `shutdown` against. Duration is stored as millis; `0`
+    /// disables.
+    #[doc(hidden)]
+    pub fn set_spawn_stall_ms(&self, millis: u32) {
+        self.inner
+            .spawn_stall_ms
+            .store(millis, Ordering::Release);
+    }
+
     /// Readiness accessor for tests + operators. `true` iff the
     /// runtime has transitioned to `Ready` and has not yet begun
     /// shutting down.
@@ -460,6 +478,13 @@ impl DaemonRuntime {
         config: DaemonHostConfig,
     ) -> Result<DaemonHandle, DaemonError> {
         self.require_ready()?;
+        // Test-only stall between the readiness check and the
+        // registry inserts. In production `spawn_stall_ms` is
+        // always 0 and this branch is a no-op.
+        let stall_ms = self.inner.spawn_stall_ms.load(Ordering::Acquire);
+        if stall_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(stall_ms as u64)).await;
+        }
         let factory = self.factory_for_kind(kind)?;
         let daemon = (factory)();
         let keypair = identity.keypair().as_ref().clone();
@@ -493,7 +518,21 @@ impl DaemonRuntime {
             return Err(DaemonError::Core(e));
         }
 
-        // TEMP revert: no post-insert fence.
+        // Post-insert fence: `shutdown` may have raced past our
+        // initial `require_ready()` and already swept the
+        // registries. In that case our entries are either already
+        // gone (shutdown saw them in its sweep) or will outlive
+        // shutdown's sweep (we inserted after `list()`). Roll back
+        // unconditionally under the ShuttingDown branch so no
+        // zombie daemon survives the torn-down runtime; the
+        // rollback's `unregister` / `remove` calls are idempotent
+        // no-ops if shutdown already drained our slot.
+        if self.state() == State::ShuttingDown {
+            let _ = self.inner.registry.unregister(origin_hash);
+            self.inner.factory_registry.remove(origin_hash);
+            return Err(DaemonError::ShuttingDown);
+        }
+
         Ok(DaemonHandle {
             origin_hash,
             entity_id,
