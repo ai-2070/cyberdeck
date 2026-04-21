@@ -1,0 +1,29 @@
+net/crates/net/sdk-ts/src/compute.ts
+  5bf3f089eecaef7a 324,327,350-431
+net/crates/net/sdk-ts/test/compute.test.ts
+  5bf3f089eecaef7a 502-696
+net/crates/net/sdk/src/compute.rs
+  5bf3f089eecaef7a 707-772
+net/crates/net/bindings/node/src/compute.rs
+  5bf3f089eecaef7a 34-36,97-102,106-116,277-278,351-458,470,658,682,705-754,756-786
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "be76e470177f1df0a87e5e5536c3e9ae87dd4c0d",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Zed",
+      "messages": [],
+      "total_additions": 8401,
+      "total_deletions": 22,
+      "accepted_lines": 559,
+      "overriden_lines": 2
+    }
+  }
+}
