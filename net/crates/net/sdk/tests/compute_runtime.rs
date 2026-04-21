@@ -468,6 +468,64 @@ async fn start_installs_handler_before_publishing_ready() {
     }
 }
 
+/// Regression for the atomicity guarantee of `register_factory`:
+/// many concurrent callers all registering the **same** `kind`
+/// must see exactly one `Ok` and the rest `FactoryAlreadyRegistered`.
+/// Proves the check-and-insert runs under a single exclusive
+/// guard — no window where two callers both observe "kind absent"
+/// and both insert.
+///
+/// Current implementation uses `HashMap::entry` under a
+/// `RwLockWriteGuard`, which is trivially atomic. This test
+/// guards against a future refactor that splits the check and
+/// the insert across separately-acquired guards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn register_factory_concurrent_same_kind_admits_exactly_one() {
+    use std::sync::atomic::{AtomicU32, Ordering as AOrd};
+
+    let rt = runtime().await;
+    let rt_shared = std::sync::Arc::new(rt);
+
+    const THREADS: u32 = 32;
+    let oks = std::sync::Arc::new(AtomicU32::new(0));
+    let dupes = std::sync::Arc::new(AtomicU32::new(0));
+
+    let mut handles = Vec::with_capacity(THREADS as usize);
+    for _ in 0..THREADS {
+        let rt_c = rt_shared.clone();
+        let oks_c = oks.clone();
+        let dupes_c = dupes.clone();
+        handles.push(tokio::spawn(async move {
+            let r = rt_c.register_factory("contended-kind", || Box::new(EchoDaemon));
+            match r {
+                Ok(()) => {
+                    oks_c.fetch_add(1, AOrd::AcqRel);
+                }
+                Err(DaemonError::FactoryAlreadyRegistered(_)) => {
+                    dupes_c.fetch_add(1, AOrd::AcqRel);
+                }
+                other => panic!("unexpected register_factory result: {other:?}"),
+            }
+        }));
+    }
+    for h in handles {
+        h.await.expect("task panicked");
+    }
+
+    assert_eq!(
+        oks.load(AOrd::Acquire),
+        1,
+        "exactly one concurrent register_factory call must succeed; got {}",
+        oks.load(AOrd::Acquire),
+    );
+    assert_eq!(
+        dupes.load(AOrd::Acquire),
+        THREADS - 1,
+        "the other {} callers must see FactoryAlreadyRegistered",
+        THREADS - 1,
+    );
+}
+
 /// Regression (Cubic-AI P1): `start()` that loses the install-vs-CAS
 /// race to a concurrent `shutdown()` used to leave the migration
 /// handler installed on the mesh. The runtime would then be in

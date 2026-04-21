@@ -256,12 +256,22 @@ impl DaemonRuntime {
         if self.state() == State::ShuttingDown {
             return Err(DaemonError::ShuttingDown);
         }
+        // `contains_key` + `insert` would be atomic under the
+        // single `write` guard, but the `entry` API makes
+        // atomicity self-evident in one expression — no opening
+        // for a future reviewer to wonder whether the check and
+        // the insert can drift across two separately-acquired
+        // guards.
         let mut map = self.inner.factories.write().expect("factory map poisoned");
-        if map.contains_key(kind) {
-            return Err(DaemonError::FactoryAlreadyRegistered(kind.to_string()));
+        match map.entry(kind.to_string()) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                Err(DaemonError::FactoryAlreadyRegistered(kind.to_string()))
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(Arc::new(factory));
+                Ok(())
+            }
         }
-        map.insert(kind.to_string(), Arc::new(factory));
-        Ok(())
     }
 
     /// Promote to `Ready`. Idempotent — a second call on an already-
