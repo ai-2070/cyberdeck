@@ -24,9 +24,7 @@ use tokio::time::sleep;
 use net::adapter::net::compute::DaemonError as CoreDaemonError;
 use net::adapter::net::state::causal::CausalEvent;
 use net_sdk::capabilities::CapabilityFilter;
-use net_sdk::compute::{
-    DaemonHostConfig, DaemonRuntime, MeshDaemon, SubscriptionBinding,
-};
+use net_sdk::compute::{DaemonHostConfig, DaemonRuntime, MeshDaemon, SubscriptionBinding};
 use net_sdk::mesh::{Mesh, MeshBuilder};
 use net_sdk::{ChannelConfig, ChannelId, ChannelName, Identity, Visibility};
 
@@ -154,12 +152,10 @@ async fn subscribe_through_runtime_records_in_ledger() {
         .expect("spawn");
 
     // Ledger is empty pre-subscribe.
-    assert!(
-        source_rt
-            .subscriptions(handle.origin_hash)
-            .expect("ledger query")
-            .is_empty(),
-    );
+    assert!(source_rt
+        .subscriptions(handle.origin_hash)
+        .expect("ledger query")
+        .is_empty(),);
 
     source_rt
         .subscribe_channel(
@@ -188,12 +184,10 @@ async fn subscribe_through_runtime_records_in_ledger() {
         .await
         .expect("unsubscribe");
 
-    assert!(
-        source_rt
-            .subscriptions(handle.origin_hash)
-            .expect("ledger")
-            .is_empty(),
-    );
+    assert!(source_rt
+        .subscriptions(handle.origin_hash)
+        .expect("ledger")
+        .is_empty(),);
 }
 
 // ---- Stage 2: ledger rides in `StateSnapshot::bindings_bytes` --------
@@ -244,16 +238,18 @@ async fn ledger_rides_snapshot_through_migration() {
         .await
         .expect("subscribe");
 
-    // Pre-register factory on the target (still the Stage-5b seam;
-    // envelope transport pins the keypair, migration target needs a
-    // matching kind).
+    // Target pre-registers for the migration by origin_hash only.
+    // The envelope on the outbound snapshot carries the real
+    // keypair; `expect_migration` stores a placeholder and the
+    // dispatcher overrides at restore time.
     target_rt
-        .register_migration_target_identity(
+        .expect_migration(
             "echo-counter",
-            identity,
+            handle.origin_hash,
             DaemonHostConfig::default(),
         )
-        .expect("pre-register target");
+        .expect("expect_migration on target");
+    let _ = identity; // not needed on target under envelope transport
 
     let mig = source_rt
         .start_migration(
@@ -345,14 +341,13 @@ async fn auto_replay_rebinds_subscriptions_on_target_after_migration() {
         .roster()
         .members(&channel_id)
         .contains(&source_rt.mesh().inner().node_id());
-    assert!(pre_migration, "publisher must see source as subscriber pre-migration");
+    assert!(
+        pre_migration,
+        "publisher must see source as subscriber pre-migration"
+    );
 
     target_rt
-        .register_migration_target_identity(
-            "echo-counter",
-            identity,
-            DaemonHostConfig::default(),
-        )
+        .register_migration_target_identity("echo-counter", identity, DaemonHostConfig::default())
         .expect("pre-register target");
 
     let mig = source_rt
@@ -371,17 +366,13 @@ async fn auto_replay_rebinds_subscriptions_on_target_after_migration() {
     // subscribe round-trip to the publisher.
     let target_node = target_rt.mesh().inner().node_id();
     let source_node = source_rt.mesh().inner().node_id();
-    let arrived = wait_until(
-        Duration::from_secs(2),
-        Duration::from_millis(50),
-        || {
-            publisher
-                .inner()
-                .roster()
-                .members(&channel_id)
-                .contains(&target_node)
-        },
-    )
+    let arrived = wait_until(Duration::from_secs(2), Duration::from_millis(50), || {
+        publisher
+            .inner()
+            .roster()
+            .members(&channel_id)
+            .contains(&target_node)
+    })
     .await;
     assert!(
         arrived,
@@ -393,17 +384,13 @@ async fn auto_replay_rebinds_subscriptions_on_target_after_migration() {
     // sent Unsubscribe to the publisher. The publisher's roster
     // should drop the source node within a short window — without
     // the teardown it would linger until session timeout (~30 s).
-    let source_gone = wait_until(
-        Duration::from_secs(2),
-        Duration::from_millis(50),
-        || {
-            !publisher
-                .inner()
-                .roster()
-                .members(&channel_id)
-                .contains(&source_node)
-        },
-    )
+    let source_gone = wait_until(Duration::from_secs(2), Duration::from_millis(50), || {
+        !publisher
+            .inner()
+            .roster()
+            .members(&channel_id)
+            .contains(&source_node)
+    })
     .await;
     assert!(
         source_gone,
@@ -412,11 +399,7 @@ async fn auto_replay_rebinds_subscriptions_on_target_after_migration() {
     );
 }
 
-async fn wait_until<F: FnMut() -> bool>(
-    total: Duration,
-    step: Duration,
-    mut cond: F,
-) -> bool {
+async fn wait_until<F: FnMut() -> bool>(total: Duration, step: Duration, mut cond: F) -> bool {
     let deadline = tokio::time::Instant::now() + total;
     loop {
         if cond() {

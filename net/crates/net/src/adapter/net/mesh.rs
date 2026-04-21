@@ -514,6 +514,36 @@ fn subscriber_origin_hash(node_id: u64) -> u64 {
 /// finer than the default intervals (capability GC ≈ announcement
 /// TTL, token sweep 30 s), so it never masks a legitimate
 /// fine-grained config — those values are already well above 1 s.
+/// Parse an inbound migration payload just far enough to decide
+/// whether it's a migration-initiating message that needs a
+/// `ComputeNotSupported` response. Returns the encoded reply for
+/// `TakeSnapshot` / `SnapshotReady`; `None` for decode failures or
+/// mid-migration message types (which arrive only inside an
+/// already-live migration and so can't reach a node with no
+/// handler at all).
+///
+/// Used by the mesh dispatch loop when `ctx.migration_handler` is
+/// `None` — a bare `Mesh` with no `DaemonRuntime` attached still
+/// responds to migration attempts instead of silently dropping
+/// them, so the source surfaces `MigrationFailureReason::ComputeNotSupported`
+/// promptly rather than timing out.
+fn synthesize_compute_not_supported_reply(payload: &[u8]) -> Option<Bytes> {
+    use crate::adapter::net::compute::orchestrator::wire as mig_wire;
+    use crate::adapter::net::compute::{MigrationFailureReason, MigrationMessage};
+
+    let msg = mig_wire::decode(payload).ok()?;
+    let origin = match msg {
+        MigrationMessage::TakeSnapshot { daemon_origin, .. }
+        | MigrationMessage::SnapshotReady { daemon_origin, .. } => daemon_origin,
+        _ => return None,
+    };
+    let reply = MigrationMessage::MigrationFailed {
+        daemon_origin: origin,
+        reason: MigrationFailureReason::ComputeNotSupported,
+    };
+    mig_wire::encode(&reply).ok().map(Bytes::from)
+}
+
 #[inline]
 fn nonzero_interval(d: Duration) -> Duration {
     if d.is_zero() {
@@ -1838,6 +1868,16 @@ impl MeshNode {
 
         // Check subprotocol — migration messages are sent as single event frames
         if parsed.header.subprotocol_id == SUBPROTOCOL_MIGRATION {
+            // Resolve sender up-front: both the handler-present and
+            // no-handler-default branches need it to route replies
+            // back over the inbound session.
+            let from_node = ctx
+                .peers
+                .iter()
+                .find(|e| e.value().session.session_id() == session.session_id())
+                .map(|e| e.value().node_id)
+                .unwrap_or(0);
+
             // `ArcSwapOption::load` — lock-free on the hot path.
             let handler_guard = ctx.migration_handler.load();
             if let Some(handler) = handler_guard.as_ref() {
@@ -1848,14 +1888,6 @@ impl MeshNode {
                     Some(data) => data,
                     None => return,
                 };
-
-                // Find the sender's node_id
-                let from_node = ctx
-                    .peers
-                    .iter()
-                    .find(|e| e.value().session.session_id() == session.session_id())
-                    .map(|e| e.value().node_id)
-                    .unwrap_or(0);
 
                 match handler.handle_message(&payload, from_node) {
                     Ok(outbound) => {
@@ -1922,7 +1954,47 @@ impl MeshNode {
                 }
                 return; // handler processed it
             }
-            // No handler set — fall through to standard event path
+            // No handler set — synthesize a `ComputeNotSupported`
+            // reply so the source doesn't silently time out. Parses
+            // the inbound far enough to extract `daemon_origin` for
+            // the reply envelope, then drops. Only responds to the
+            // two migration-initiating messages (`TakeSnapshot`,
+            // `SnapshotReady`) — other inbound types arrive only
+            // mid-migration, and a migration can't be mid-state
+            // against a node that has no compute runtime.
+            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            if let Some(payload) = events.into_iter().next() {
+                if let Some(reply) = synthesize_compute_not_supported_reply(&payload) {
+                    let dest_session = ctx
+                        .peers
+                        .get(&from_node)
+                        .map(|e| (e.value().addr, e.value().session.clone()));
+                    if let Some((dest_addr, dest_sess)) = dest_session {
+                        if !ctx.partition_filter.contains(&dest_addr) {
+                            let socket = ctx.socket.clone();
+                            tokio::spawn(async move {
+                                let pool = dest_sess.thread_local_pool();
+                                let mut builder = pool.get();
+                                let seq = {
+                                    let stream = dest_sess
+                                        .get_or_create_stream(SUBPROTOCOL_MIGRATION as u64);
+                                    stream.next_tx_seq()
+                                };
+                                let events = vec![reply];
+                                let packet = builder.build_subprotocol(
+                                    SUBPROTOCOL_MIGRATION as u64,
+                                    seq,
+                                    &events,
+                                    PacketFlags::NONE,
+                                    SUBPROTOCOL_MIGRATION,
+                                );
+                                let _ = socket.send_to(&packet, dest_addr).await;
+                            });
+                        }
+                    }
+                }
+            }
+            return;
         }
 
         // Stream-window credit grant: apply to the named stream's

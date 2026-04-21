@@ -127,7 +127,10 @@ impl std::fmt::Display for EnvelopeError {
                 "identity envelope: decrypted seed's origin_hash does not match expected"
             ),
             Self::InvalidSignerKey => {
-                write!(f, "identity envelope: signer_pub is not a valid ed25519 point")
+                write!(
+                    f,
+                    "identity envelope: signer_pub is not a valid ed25519 point"
+                )
             }
             Self::SourceReadOnly => write!(
                 f,
@@ -256,10 +259,10 @@ impl IdentityEnvelope {
         // unsealing so a tampered envelope can't get anywhere near
         // the decryption path.
         let transcript = attestation_transcript(&self.target_static_pub, chain_link);
-        let verifying_key =
-            VerifyingKey::from_bytes(&self.signer_pub).map_err(|_| EnvelopeError::InvalidSignerKey)?;
-        let sig =
-            Signature::try_from(&self.signature[..]).map_err(|_| EnvelopeError::InvalidAttestation)?;
+        let verifying_key = VerifyingKey::from_bytes(&self.signer_pub)
+            .map_err(|_| EnvelopeError::InvalidSignerKey)?;
+        let sig = Signature::try_from(&self.signature[..])
+            .map_err(|_| EnvelopeError::InvalidAttestation)?;
         verifying_key
             .verify_strict(&transcript, &sig)
             .map_err(|_| EnvelopeError::InvalidAttestation)?;
@@ -284,13 +287,7 @@ impl IdentityEnvelope {
 
         let aead = XChaCha20Poly1305::new((&key).into());
         let seed_vec = aead
-            .decrypt(
-                (&nonce).into(),
-                Payload {
-                    msg: ct,
-                    aad: &[],
-                },
-            )
+            .decrypt((&nonce).into(), Payload { msg: ct, aad: &[] })
             .map_err(|_| EnvelopeError::SealOpenFailed)?;
         if seed_vec.len() != SEED_LEN {
             return Err(EnvelopeError::SealOpenFailed);

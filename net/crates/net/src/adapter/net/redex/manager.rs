@@ -75,9 +75,9 @@ impl Redex {
     /// opens ignore it and return the live file.
     ///
     /// With `persistent: true`, the manager must have been configured
-    /// via [`Self::with_persistent_dir`] (feature `redex-disk`) —
-    /// otherwise `open_file` returns a [`RedexError::Channel`] that
-    /// describes the missing base dir.
+    /// via `with_persistent_dir` (feature `redex-disk`) — otherwise
+    /// `open_file` returns a [`RedexError::Channel`] that describes
+    /// the missing base dir.
     pub fn open_file(
         &self,
         name: &ChannelName,

@@ -109,10 +109,21 @@ pub type ReadinessCallback = Arc<dyn Fn() -> bool + Send + Sync>;
 /// retriable from terminal failures.
 ///
 /// Sync on the dispatcher thread.
-pub type FailureCallback = Arc<
-    dyn Fn(u32, crate::adapter::net::compute::MigrationFailureReason) + Send + Sync,
->;
+pub type FailureCallback =
+    Arc<dyn Fn(u32, crate::adapter::net::compute::MigrationFailureReason) + Send + Sync>;
 
+/// Dispatcher for migration subprotocol (`0x0500`) messages.
+///
+/// Wraps the three handler halves — orchestrator, source, target —
+/// plus the optional cross-cutting hooks that let the SDK drive
+/// identity-envelope seal/open, channel-re-bind replay,
+/// source-side Unsubscribe teardown, runtime-readiness gating, and
+/// source-side failure observation. Constructed by the SDK's
+/// `DaemonRuntime::start` via [`Self::new_fully_hooked`]; tests
+/// use [`Self::new`] / [`Self::new_with_hooks`] with the subset of
+/// hooks they care about.
+///
+/// Install onto a `MeshNode` via `MeshNode::set_migration_handler`.
 pub struct MigrationSubprotocolHandler {
     orchestrator: Arc<MigrationOrchestrator>,
     source_handler: Arc<MigrationSourceHandler>,
@@ -248,6 +259,7 @@ impl MigrationSubprotocolHandler {
     /// Create a handler with every hook + the readiness predicate.
     /// Convenience — falls through to [`Self::new_fully_hooked`]
     /// with the failure observer unset.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_full_hooks(
         orchestrator: Arc<MigrationOrchestrator>,
         source_handler: Arc<MigrationSourceHandler>,
@@ -275,6 +287,7 @@ impl MigrationSubprotocolHandler {
     /// uses this form to supply every callback at once; the
     /// progressive-disclosure variants above are convenience
     /// entry points for tests and pre-Stage-X callers.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_fully_hooked(
         orchestrator: Arc<MigrationOrchestrator>,
         source_handler: Arc<MigrationSourceHandler>,
@@ -642,10 +655,9 @@ impl MigrationSubprotocolHandler {
                 // re-sending TakeSnapshot on remote source).
                 let _ = self.source_handler.abort(daemon_origin);
                 let _ = self.target_handler.abort(daemon_origin);
-                let _ = self.orchestrator.abort_migration_with_reason(
-                    daemon_origin,
-                    reason,
-                );
+                let _ = self
+                    .orchestrator
+                    .abort_migration_with_reason(daemon_origin, reason);
             }
 
             MigrationMessage::BufferedEvents {
@@ -784,7 +796,7 @@ impl MigrationSubprotocolHandler {
             // failure, not a fallback — otherwise an attacker who
             // tampers with the envelope could downgrade identity
             // transport silently.
-            let keypair = match self.resolve_restore_keypair(&snapshot, &inputs.keypair) {
+            let keypair = match self.resolve_restore_keypair(&snapshot, inputs.keypair.as_ref()) {
                 Ok(kp) => kp,
                 Err(e) => {
                     return Ok(Some(self.fail_migration(
@@ -932,28 +944,48 @@ impl MigrationSubprotocolHandler {
     }
 
     /// Target-side helper: pick the keypair to hand to
-    /// `restore_snapshot`. When the snapshot has an envelope AND we
-    /// have a private key to unseal it with, the envelope wins;
-    /// otherwise we fall back to the factory-registered keypair.
+    /// `restore_snapshot`. Resolution order:
+    ///
+    /// 1. If the snapshot carries an identity envelope AND we have
+    ///    the X25519 private key to unseal it → use the envelope's
+    ///    keypair. (Non-envelope cases fall through.)
+    /// 2. Otherwise, if `fallback` was provided — the factory was
+    ///    registered via `DaemonFactoryRegistry::register` with a
+    ///    pre-provisioned keypair — use that.
+    /// 3. If neither is available (placeholder registration +
+    ///    no envelope in the snapshot), fail: a placeholder factory
+    ///    expects the envelope to supply the keypair, and its
+    ///    absence means the source skipped identity transport
+    ///    without the target being prepared for that.
+    ///
+    /// Present-but-invalid envelopes are terminal — propagating the
+    /// envelope error rather than falling back prevents an attacker
+    /// from downgrading identity transport by tampering with the
+    /// envelope bytes.
     fn resolve_restore_keypair(
         &self,
         snapshot: &StateSnapshot,
-        fallback: &EntityKeypair,
+        fallback: Option<&EntityKeypair>,
     ) -> Result<EntityKeypair, String> {
-        let Some(ctx) = &self.identity_context else {
-            return Ok(fallback.clone());
-        };
-        if snapshot.identity_envelope.is_none() {
-            return Ok(fallback.clone());
+        if let (Some(ctx), Some(_)) = (&self.identity_context, &snapshot.identity_envelope) {
+            let priv_secret = x25519_dalek::StaticSecret::from(ctx.local_x25519_priv);
+            match snapshot.open_identity_envelope(&priv_secret) {
+                Ok(Some(kp)) => return Ok(kp),
+                Ok(None) => {
+                    // Unreachable under normal conditions — `Some`
+                    // envelope on the snapshot paired with
+                    // `open_identity_envelope` returning `Ok(None)`
+                    // would mean envelope was present but yielded
+                    // no keypair. Fall through to fallback.
+                }
+                Err(e) => return Err(format!("{e}")),
+            }
         }
-        // Reconstruct the X25519 private key from our stored bytes.
-        // `StaticSecret::from` consumes the 32-byte array.
-        let priv_secret = x25519_dalek::StaticSecret::from(ctx.local_x25519_priv);
-        match snapshot.open_identity_envelope(&priv_secret) {
-            Ok(Some(kp)) => Ok(kp),
-            Ok(None) => Ok(fallback.clone()),
-            Err(e) => Err(format!("{e}")),
-        }
+        fallback.cloned().ok_or_else(|| {
+            "placeholder factory registered but snapshot has no \
+             identity envelope (and no local fallback keypair available)"
+                .to_string()
+        })
     }
 
     /// Build a `MigrationFailed` outbound message and clean up local state.
@@ -971,9 +1003,7 @@ impl MigrationSubprotocolHandler {
         self.fail_migration_with_reason(
             daemon_origin,
             from_node,
-            crate::adapter::net::compute::MigrationFailureReason::StateFailed(
-                reason.to_string(),
-            ),
+            crate::adapter::net::compute::MigrationFailureReason::StateFailed(reason.to_string()),
         )
     }
 

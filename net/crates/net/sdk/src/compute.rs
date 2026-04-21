@@ -1,7 +1,7 @@
 //! Compute surface — `MeshDaemon` + `DaemonRuntime`.
 //!
 //! Users implement [`MeshDaemon`] and hand it to a [`DaemonRuntime`]
-//! tied to a [`Mesh`](crate::Mesh) node. The runtime holds the
+//! tied to a [`Mesh`] node. The runtime holds the
 //! kind-keyed factory table, the per-daemon host registry, and the
 //! lifecycle gate that decides when inbound migrations may land.
 //!
@@ -45,7 +45,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use thiserror::Error;
@@ -187,6 +187,12 @@ struct Inner {
     /// `dashmap` directly, and this map sees low write frequency
     /// (one entry per failed migration).
     recent_failures: Mutex<HashMap<u32, MigrationFailureReason>>,
+    /// Test-only knob: when set to `true`, the readiness callback
+    /// reports "not ready" even when the runtime is in `Ready`.
+    /// Lets integration tests drive the `NotReady` retry path
+    /// without racing against runtime startup. Defaults to `false`;
+    /// production code should not touch it.
+    simulate_not_ready: AtomicBool,
 }
 
 impl DaemonRuntime {
@@ -218,6 +224,7 @@ impl DaemonRuntime {
                 source_handler,
                 target_handler,
                 recent_failures: Mutex::new(HashMap::new()),
+                simulate_not_ready: AtomicBool::new(false),
             }),
         }
     }
@@ -297,55 +304,59 @@ impl DaemonRuntime {
                                 });
                             });
                         let inner_for_teardown = self.inner.clone();
-                        let pre_cleanup: PreCleanupCallback =
-                            Arc::new(move |origin_hash: u32| {
-                                // Snapshot the ledger BEFORE cleanup
-                                // drops the host — after that, the
-                                // ledger is gone. Spawn async
-                                // unsubscribes so the dispatcher
-                                // thread returns immediately.
-                                let bindings = inner_for_teardown
-                                    .registry
-                                    .with_host(origin_hash, |host| {
-                                        host.bindings_snapshot().subscriptions
-                                    })
-                                    .unwrap_or_default();
-                                if bindings.is_empty() {
-                                    return;
-                                }
-                                let inner = inner_for_teardown.clone();
-                                tokio::spawn(async move {
-                                    teardown_subscriptions(inner, bindings).await;
-                                });
+                        let pre_cleanup: PreCleanupCallback = Arc::new(move |origin_hash: u32| {
+                            // Snapshot the ledger BEFORE cleanup
+                            // drops the host — after that, the
+                            // ledger is gone. Spawn async
+                            // unsubscribes so the dispatcher
+                            // thread returns immediately.
+                            let bindings = inner_for_teardown
+                                .registry
+                                .with_host(origin_hash, |host| {
+                                    host.bindings_snapshot().subscriptions
+                                })
+                                .unwrap_or_default();
+                            if bindings.is_empty() {
+                                return;
+                            }
+                            let inner = inner_for_teardown.clone();
+                            tokio::spawn(async move {
+                                teardown_subscriptions(inner, bindings).await;
                             });
+                        });
                         let inner_for_readiness = self.inner.clone();
                         let readiness: ReadinessCallback = Arc::new(move || {
-                            inner_for_readiness
-                                .state
+                            // Test-only: `simulate_not_ready` flips
+                            // the predicate to false regardless of
+                            // the underlying lifecycle state. Honour
+                            // it first so integration tests can
+                            // drive the NotReady retry path.
+                            if inner_for_readiness
+                                .simulate_not_ready
                                 .load(Ordering::Acquire)
-                                == State::Ready as u8
+                            {
+                                return false;
+                            }
+                            inner_for_readiness.state.load(Ordering::Acquire) == State::Ready as u8
                         });
                         let inner_for_failure = self.inner.clone();
-                        let failure: FailureCallback = Arc::new(
-                            move |origin_hash: u32, reason: MigrationFailureReason| {
+                        let failure: FailureCallback =
+                            Arc::new(move |origin_hash: u32, reason: MigrationFailureReason| {
                                 if let Ok(mut map) = inner_for_failure.recent_failures.lock() {
                                     map.insert(origin_hash, reason);
                                 }
-                            },
-                        );
-                        let handler = Arc::new(
-                            MigrationSubprotocolHandler::new_fully_hooked(
-                                self.inner.orchestrator.clone(),
-                                self.inner.source_handler.clone(),
-                                self.inner.target_handler.clone(),
-                                local_node_id,
-                                Some(ctx),
-                                Some(post_restore),
-                                Some(pre_cleanup),
-                                Some(readiness),
-                                Some(failure),
-                            ),
-                        );
+                            });
+                        let handler = Arc::new(MigrationSubprotocolHandler::new_fully_hooked(
+                            self.inner.orchestrator.clone(),
+                            self.inner.source_handler.clone(),
+                            self.inner.target_handler.clone(),
+                            local_node_id,
+                            Some(ctx),
+                            Some(post_restore),
+                            Some(pre_cleanup),
+                            Some(readiness),
+                            Some(failure),
+                        ));
                         self.inner.mesh.inner().set_migration_handler(handler);
                         return Ok(());
                     }
@@ -388,6 +399,20 @@ impl DaemonRuntime {
         Ok(())
     }
 
+    /// **Test-only.** Force the readiness predicate seen by the
+    /// migration dispatcher to return `false` regardless of
+    /// lifecycle state — simulates a target that's still in
+    /// `Registering` even after `start()` has run. Lets
+    /// integration tests exercise the `NotReady` retry path
+    /// without racing against runtime startup.
+    ///
+    /// No effect on `is_ready()` or `spawn` / `stop` — those use
+    /// the underlying `state` directly. Only the dispatcher's
+    /// readiness predicate is affected.
+    pub fn simulate_not_ready(&self, flag: bool) {
+        self.inner.simulate_not_ready.store(flag, Ordering::Release);
+    }
+
     /// Readiness accessor for tests + operators. `true` iff the
     /// runtime has transitioned to `Ready` and has not yet begun
     /// shutting down.
@@ -421,11 +446,11 @@ impl DaemonRuntime {
         // the host, so a migration-target handler that catches up on
         // this origin mid-spawn always sees a consistent view.
         let factory_for_core = factory.clone();
-        self.inner.factory_registry.register(
-            keypair.clone(),
-            config.clone(),
-            move || (factory_for_core)(),
-        );
+        self.inner
+            .factory_registry
+            .register(keypair.clone(), config.clone(), move || {
+                (factory_for_core)()
+            });
 
         let host = DaemonHost::new(daemon, keypair, config);
         // `DaemonRegistry::register` errors on origin_hash collisions
@@ -471,11 +496,11 @@ impl DaemonRuntime {
 
         let daemon = (factory)();
         let factory_for_core = factory.clone();
-        self.inner.factory_registry.register(
-            keypair.clone(),
-            config.clone(),
-            move || (factory_for_core)(),
-        );
+        self.inner
+            .factory_registry
+            .register(keypair.clone(), config.clone(), move || {
+                (factory_for_core)()
+            });
 
         let host = match DaemonHost::from_snapshot(daemon, keypair, &snapshot, config) {
             Ok(h) => h,
@@ -556,10 +581,7 @@ impl DaemonRuntime {
     /// to via [`Self::subscribe_channel`]. Used by the migration
     /// target path to drive replay and by tests / operators to
     /// observe what a daemon is subscribed to.
-    pub fn subscriptions(
-        &self,
-        origin_hash: u32,
-    ) -> Result<Vec<SubscriptionBinding>, DaemonError> {
+    pub fn subscriptions(&self, origin_hash: u32) -> Result<Vec<SubscriptionBinding>, DaemonError> {
         self.inner
             .registry
             .with_host(origin_hash, |host| host.bindings_snapshot().subscriptions)
@@ -627,13 +649,9 @@ impl DaemonRuntime {
         // `with_host` reaches into the registry's per-daemon mutex;
         // since this is SDK-level code we do the minimum work
         // under the lock (a single DashMap insert).
-        if let Err(e) = self
-            .inner
-            .registry
-            .with_host(origin_hash, |host| {
-                host.record_subscription(publisher, channel, token_bytes);
-            })
-        {
+        if let Err(e) = self.inner.registry.with_host(origin_hash, |host| {
+            host.record_subscription(publisher, channel, token_bytes);
+        }) {
             return Err(DaemonError::Core(e));
         }
         Ok(())
@@ -670,25 +688,22 @@ impl DaemonRuntime {
 
     /// Pre-register a factory on the target node keyed by the
     /// daemon's `origin_hash`, using the caller-supplied `Identity`
-    /// as the keypair. Required today on any node that may receive
-    /// an inbound migration for a specific daemon — the target's
-    /// `DaemonFactoryRegistry` needs both the constructor closure
-    /// *and* the matching keypair to reconstruct the daemon.
+    /// as the **fallback** keypair.
     ///
-    /// **Stopgap.** `DAEMON_IDENTITY_MIGRATION_PLAN.md` Stages 5b /
-    /// 6 replace this with an `IdentityEnvelope` that carries the
-    /// keypair across the wire, sealed to the target's X25519
-    /// pubkey. Once those land, the target no longer needs to know
-    /// the daemon's keypair out of band and this method becomes
-    /// unnecessary — keep it as a low-level escape hatch or remove
-    /// it entirely.
+    /// Use this when:
+    /// - The caller genuinely has the daemon's keypair on hand
+    ///   (typical: test harnesses that share the same
+    ///   `Identity` between source and target runtimes).
+    /// - Migration runs with `transport_identity = false`, so the
+    ///   snapshot carries no envelope and the target needs a
+    ///   matching keypair pre-provisioned.
     ///
-    /// `kind` still matters: it's looked up in the SDK-side
-    /// `factories` map so later `spawn_from_snapshot` calls on the
-    /// same node can find the same constructor. The `Identity`
-    /// keypair must match the one the *source* used to spawn the
-    /// daemon, otherwise `origin_hash` mismatches at restore and
-    /// the migration fails.
+    /// For the common envelope-transport case where the target
+    /// doesn't know the daemon's private key ahead of time,
+    /// prefer [`Self::expect_migration`] — it registers a
+    /// placeholder factory keyed only on `origin_hash`, and the
+    /// envelope in the migration snapshot supplies the real
+    /// keypair at restore time.
     pub fn register_migration_target_identity(
         &self,
         kind: &str,
@@ -701,11 +716,45 @@ impl DaemonRuntime {
         let factory = self.factory_for_kind(kind)?;
         let keypair = identity.keypair().as_ref().clone();
         let factory_clone = factory.clone();
-        self.inner.factory_registry.register(
-            keypair,
-            config,
-            move || (factory_clone)(),
-        );
+        self.inner
+            .factory_registry
+            .register(keypair, config, move || (factory_clone)());
+        Ok(())
+    }
+
+    /// Declare on the target that this node expects a migration
+    /// for `origin_hash` of the given `kind`. Registers a
+    /// **placeholder** factory in the core registry — no matching
+    /// keypair required, because the migration snapshot's
+    /// [`IdentityEnvelope`](::net::adapter::net::identity::IdentityEnvelope)
+    /// carries the real keypair and the dispatcher overrides the
+    /// placeholder at restore time.
+    ///
+    /// Fails cleanly if the source migrates without an envelope
+    /// (e.g., `MigrationOpts { transport_identity: false }`) —
+    /// the target's factory has no keypair and the dispatcher
+    /// emits `IdentityTransportFailed`. Use
+    /// [`Self::register_migration_target_identity`] with a shared
+    /// identity for the explicit public-identity-migration case.
+    ///
+    /// Landing this method closes the seam documented in the
+    /// `envelope_overrides_target_placeholder_keypair` test of
+    /// Stage 5b of the identity-migration plan — targets can now
+    /// pre-register for a migration by `origin_hash` alone.
+    pub fn expect_migration(
+        &self,
+        kind: &str,
+        origin_hash: u32,
+        config: DaemonHostConfig,
+    ) -> Result<(), DaemonError> {
+        if self.state() == State::ShuttingDown {
+            return Err(DaemonError::ShuttingDown);
+        }
+        let factory = self.factory_for_kind(kind)?;
+        let factory_clone = factory.clone();
+        self.inner
+            .factory_registry
+            .register_placeholder(origin_hash, config, move || (factory_clone)());
         Ok(())
     }
 
@@ -730,8 +779,13 @@ impl DaemonRuntime {
         source_node: u64,
         target_node: u64,
     ) -> Result<MigrationHandle, DaemonError> {
-        self.start_migration_with(origin_hash, source_node, target_node, MigrationOpts::default())
-            .await
+        self.start_migration_with(
+            origin_hash,
+            source_node,
+            target_node,
+            MigrationOpts::default(),
+        )
+        .await
     }
 
     /// `start_migration` with caller-supplied options. Stage 6 of
@@ -786,10 +840,12 @@ impl DaemonRuntime {
                     .inner
                     .orchestrator
                     .abort_migration(origin_hash, "unexpected initial message".into());
-                return Err(DaemonError::Migration(MigrationError::StateFailed(format!(
-                    "orchestrator returned unexpected initial migration message: {:?}",
-                    other
-                ))));
+                return Err(DaemonError::Migration(MigrationError::StateFailed(
+                    format!(
+                        "orchestrator returned unexpected initial migration message: {:?}",
+                        other
+                    ),
+                )));
             }
         };
 
@@ -844,9 +900,9 @@ impl DaemonRuntime {
             .mesh
             .inner()
             .peer_addr(dest_node)
-            .ok_or_else(|| {
-                DaemonError::Migration(MigrationError::TargetUnavailable(dest_node))
-            })?;
+            .ok_or(DaemonError::Migration(MigrationError::TargetUnavailable(
+                dest_node,
+            )))?;
         let bytes = migration_wire::encode(msg).map_err(DaemonError::Migration)?;
         self.inner
             .mesh
@@ -1144,10 +1200,7 @@ impl MigrationHandle {
     /// timeout aborts the orchestrator-side record and returns
     /// `Err(MigrationError::StateFailed)`; a graceful `Complete`
     /// returns `Ok`.
-    pub async fn wait_with_timeout(
-        self,
-        timeout: std::time::Duration,
-    ) -> Result<(), DaemonError> {
+    pub async fn wait_with_timeout(self, timeout: std::time::Duration) -> Result<(), DaemonError> {
         let start = tokio::time::Instant::now();
         let overall_deadline = start + timeout;
         let retry_deadline = self.opts.retry_not_ready.map(|b| start + b);
@@ -1179,9 +1232,7 @@ impl MigrationHandle {
                     // been cleaned up by the dispatcher's
                     // MigrationFailed handler, so this starts a new
                     // attempt from phase 0.
-                    if let Err(e) = self.reinitiate_attempt().await {
-                        return Err(e);
-                    }
+                    self.reinitiate_attempt().await?;
                     // Loop; poll this new attempt's outcome.
                 }
                 Err(e) => return Err(e),
@@ -1280,7 +1331,9 @@ impl MigrationHandle {
             }
         };
 
-        self.runtime.send_migration_message(dest_node, payload).await
+        self.runtime
+            .send_migration_message(dest_node, payload)
+            .await
     }
 
     /// Pop the most recent `MigrationFailureReason` the dispatcher

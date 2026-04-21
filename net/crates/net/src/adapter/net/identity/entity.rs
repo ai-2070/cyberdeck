@@ -531,7 +531,8 @@ mod tests {
         assert!(kp.is_read_only());
         assert_eq!(kp.entity_id(), &entity_before);
         assert_eq!(
-            kp.try_sign(b"post").expect_err("post-zeroize signing must fail"),
+            kp.try_sign(b"post")
+                .expect_err("post-zeroize signing must fail"),
             EntityError::ReadOnly,
         );
     }

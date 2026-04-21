@@ -2707,7 +2707,7 @@ async fn test_migration_snapshot_over_wire() {
     let daemon_origin = daemon_kp.origin_hash();
     let host = DaemonHost::new(
         Box::new(CounterDaemon::with_count(42)),
-        daemon_kp,
+        daemon_kp.clone(),
         DaemonHostConfig::default(),
     );
     registry_b.register(host).unwrap();
@@ -2723,10 +2723,37 @@ async fn test_migration_snapshot_over_wire() {
     ));
 
     let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let mut node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
     let pub_b = *node_b.public_key();
 
     node_b.set_migration_handler(handler_b);
+
+    // A also needs a handler installed — and a matching factory
+    // for `daemon_origin` — so the incoming `SnapshotReady` lands
+    // successfully rather than getting bounced back with a
+    // MigrationFailed reply that would clear B's migration record
+    // before the test gets a chance to observe it. Post the
+    // runtime-readiness "default handler" work, a bare `MeshNode`
+    // with no migration handler synthesizes `ComputeNotSupported`;
+    // a handler with no factory-for-origin emits `FactoryNotFound`;
+    // either outcome aborts B's source_handler mid-flow. Wiring a
+    // full A-side handler that can actually restore keeps the
+    // original assertion observable.
+    let registry_a = Arc::new(DaemonRegistry::new());
+    let factories_a = Arc::new(DaemonFactoryRegistry::new());
+    factories_a.register(daemon_kp.clone(), DaemonHostConfig::default(), || {
+        Box::new(CounterDaemon::with_count(0))
+    });
+    let orch_a = Arc::new(MigrationOrchestrator::new(registry_a.clone(), nid_a));
+    let source_a = Arc::new(MigrationSourceHandler::new(registry_a.clone()));
+    let target_a = Arc::new(MigrationTargetHandler::new_with_factories(
+        registry_a.clone(),
+        factories_a,
+    ));
+    let handler_a = Arc::new(MigrationSubprotocolHandler::new(
+        orch_a, source_a, target_a, nid_a,
+    ));
+    node_a.set_migration_handler(handler_a);
 
     let (r1, r2) = tokio::join!(node_b.accept(nid_a), async {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2845,9 +2872,9 @@ async fn test_migration_full_lifecycle_over_wire() {
         nid_c,
     ));
 
-    let mut node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
-    let mut node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
-    let mut node_c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
+    let node_a = MeshNode::new(id_a, mk(addr_a)).await.unwrap();
+    let node_b = MeshNode::new(id_b, mk(addr_b)).await.unwrap();
+    let node_c = MeshNode::new(id_c, mk(addr_c)).await.unwrap();
     let pub_b = *node_b.public_key();
     let pub_c = *node_c.public_key();
 

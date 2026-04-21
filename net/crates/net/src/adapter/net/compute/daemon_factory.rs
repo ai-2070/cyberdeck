@@ -29,8 +29,16 @@ use crate::adapter::net::identity::EntityKeypair;
 pub struct FactoryEntry {
     /// Constructor for a fresh, unrestored daemon instance.
     pub factory: Box<dyn Fn() -> Box<dyn MeshDaemon> + Send + Sync>,
-    /// The daemon's signing keypair (must match `snapshot.entity_id`).
-    pub keypair: EntityKeypair,
+    /// The daemon's signing keypair.
+    ///
+    /// - `Some(kp)` — caller pre-provisioned the keypair out-of-band.
+    ///   Used as the default at restore; the dispatcher's envelope
+    ///   path can still override when the snapshot carries one.
+    /// - `None` — placeholder registration. The caller expects the
+    ///   `IdentityEnvelope` to supply the keypair at restore time;
+    ///   if the snapshot arrives without an envelope, restore fails
+    ///   cleanly rather than silently synthesizing a wrong keypair.
+    pub keypair: Option<EntityKeypair>,
     /// Host configuration to apply to the restored daemon.
     pub config: DaemonHostConfig,
 }
@@ -41,8 +49,11 @@ pub struct FactoryEntry {
 pub struct ConstructedInputs {
     /// A fresh daemon instance — unrestored state.
     pub daemon: Box<dyn MeshDaemon>,
-    /// The daemon's signing keypair.
-    pub keypair: EntityKeypair,
+    /// The daemon's signing keypair, when the factory was registered
+    /// with one. `None` for placeholder registrations — the dispatcher
+    /// must recover the real keypair from the snapshot's
+    /// [`IdentityEnvelope`](crate::adapter::net::identity::IdentityEnvelope).
+    pub keypair: Option<EntityKeypair>,
     /// Host configuration.
     pub config: DaemonHostConfig,
 }
@@ -59,12 +70,19 @@ impl DaemonFactoryRegistry {
         Self::default()
     }
 
-    /// Register a factory for a daemon type.
+    /// Register a factory for a daemon type with a known keypair.
     ///
     /// The registration key is derived from `keypair.origin_hash()`; the
     /// caller does not supply it separately. Taking `origin_hash` as an
     /// argument used to invite a class of bugs where the caller passed a
     /// stale or unrelated value — now impossible by construction.
+    ///
+    /// Use this when the caller genuinely has the daemon's keypair
+    /// in hand (local spawn, identity-transport opt-out). For the
+    /// common envelope-transport case, where the keypair will arrive
+    /// with the snapshot, prefer
+    /// [`Self::register_placeholder`] — there's no reason to make up
+    /// a fake keypair for the target.
     pub fn register<F>(&self, keypair: EntityKeypair, config: DaemonHostConfig, factory: F)
     where
         F: Fn() -> Box<dyn MeshDaemon> + Send + Sync + 'static,
@@ -74,7 +92,31 @@ impl DaemonFactoryRegistry {
             origin_hash,
             FactoryEntry {
                 factory: Box::new(factory),
-                keypair,
+                keypair: Some(keypair),
+                config,
+            },
+        );
+    }
+
+    /// Register a placeholder factory keyed by `origin_hash` alone.
+    /// No keypair is supplied — the dispatcher's target path will
+    /// recover it from the migration snapshot's identity envelope.
+    ///
+    /// Use this on the target side of a migration that plans to
+    /// transport identity via the envelope: the target legitimately
+    /// doesn't know the daemon's private key ahead of time, and
+    /// synthesizing a matching-origin keypair is cryptographically
+    /// impossible. Restore without an envelope in the snapshot fails
+    /// cleanly with an identity-transport error.
+    pub fn register_placeholder<F>(&self, origin_hash: u32, config: DaemonHostConfig, factory: F)
+    where
+        F: Fn() -> Box<dyn MeshDaemon> + Send + Sync + 'static,
+    {
+        self.entries.insert(
+            origin_hash,
+            FactoryEntry {
+                factory: Box::new(factory),
+                keypair: None,
                 config,
             },
         );

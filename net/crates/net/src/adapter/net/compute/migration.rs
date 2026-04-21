@@ -68,7 +68,11 @@ pub enum MigrationFailureReason {
     /// Source gave up after exhausting its `NotReady` retry budget.
     /// **Terminal** on both sides; carries the retry attempt count
     /// for operator diagnosis.
-    NotReadyTimeout { attempts: u8 },
+    NotReadyTimeout {
+        /// Number of `NotReady` retries the source attempted before
+        /// giving up. ≥ 1 because the first attempt always counts.
+        attempts: u8,
+    },
 }
 
 impl MigrationFailureReason {

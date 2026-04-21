@@ -7,13 +7,11 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use bytes::{Buf, BufMut};
+use bytes::Buf;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 
-use super::migration::{
-    MigrationError, MigrationFailureReason, MigrationPhase, MigrationState,
-};
+use super::migration::{MigrationError, MigrationFailureReason, MigrationPhase, MigrationState};
 use super::registry::DaemonRegistry;
 use crate::adapter::net::continuity::superposition::SuperpositionState;
 use crate::adapter::net::state::causal::{CausalEvent, CausalLink};
@@ -542,10 +540,7 @@ fn decode_failure_reason(
     }
 }
 
-fn read_u16_string(
-    cur: &mut std::io::Cursor<&[u8]>,
-    ctx: &str,
-) -> Result<String, MigrationError> {
+fn read_u16_string(cur: &mut std::io::Cursor<&[u8]>, ctx: &str) -> Result<String, MigrationError> {
     if cur.remaining() < 2 {
         return Err(MigrationError::StateFailed(format!(
             "truncated {ctx} length prefix",
@@ -557,9 +552,8 @@ fn read_u16_string(
     }
     let mut bytes = vec![0u8; len];
     cur.copy_to_slice(&mut bytes);
-    String::from_utf8(bytes).map_err(|e| {
-        MigrationError::StateFailed(format!("{ctx} is not valid UTF-8: {e}"))
-    })
+    String::from_utf8(bytes)
+        .map_err(|e| MigrationError::StateFailed(format!("{ctx} is not valid UTF-8: {e}")))
 }
 
 // ── Snapshot chunking ────────────────────────────────────────────────────────
@@ -1214,10 +1208,7 @@ impl MigrationOrchestrator {
         daemon_origin: u32,
         reason: String,
     ) -> Result<MigrationMessage, MigrationError> {
-        self.abort_migration_with_reason(
-            daemon_origin,
-            MigrationFailureReason::StateFailed(reason),
-        )
+        self.abort_migration_with_reason(daemon_origin, MigrationFailureReason::StateFailed(reason))
     }
 
     /// Abort a migration with a caller-supplied structured reason.
@@ -1307,7 +1298,7 @@ mod tests {
         DaemonError, DaemonHost, DaemonHostConfig, DaemonRegistry, MeshDaemon,
     };
     use crate::adapter::net::identity::EntityKeypair;
-    use bytes::Bytes;
+    use bytes::{BufMut, Bytes};
 
     struct CounterDaemon {
         count: u64,

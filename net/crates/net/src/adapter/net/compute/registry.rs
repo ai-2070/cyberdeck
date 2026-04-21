@@ -132,8 +132,10 @@ impl DaemonRegistry {
     /// Clone the signing keypair of a locally-registered daemon.
     ///
     /// Used by the migration-source path to seal the daemon's
-    /// identity into an [`IdentityEnvelope`] before shipping its
-    /// snapshot. Returns `None` when the daemon isn't registered
+    /// identity into an
+    /// [`IdentityEnvelope`](crate::adapter::net::identity::IdentityEnvelope)
+    /// before shipping its snapshot. Returns `None` when the daemon
+    /// isn't registered
     /// (already unregistered / never spawned here). The clone is
     /// deliberate — the caller gets its own keypair instance that
     /// outlives the host's internal lock guard.

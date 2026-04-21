@@ -735,7 +735,10 @@ mod tests {
         let opened = snapshot
             .open_identity_envelope(&target_priv)
             .expect("no envelope is not an error");
-        assert!(opened.is_none(), "public-identity migration: target gets None");
+        assert!(
+            opened.is_none(),
+            "public-identity migration: target gets None"
+        );
     }
 
     #[test]
@@ -774,7 +777,10 @@ mod tests {
         // consistency check (origin_hash == entity_id.origin_hash)
         // still passes — the point of this test is the
         // envelope-vs-entity_id mismatch, not the chain check.
-        assert_eq!(snapshot.chain_link.origin_hash, snapshot.entity_id.origin_hash());
+        assert_eq!(
+            snapshot.chain_link.origin_hash,
+            snapshot.entity_id.origin_hash()
+        );
 
         let err = snapshot
             .open_identity_envelope(&target_priv)

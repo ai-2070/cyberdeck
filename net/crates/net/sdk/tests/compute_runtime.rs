@@ -245,10 +245,7 @@ async fn counter_snapshot_round_trip_through_runtime() {
     // Counter survived the round-trip: the next event should report 6,
     // not 1.
     let outputs = rt
-        .deliver(
-            rehydrated.origin_hash,
-            &event(origin_hash, 6, b"resumed"),
-        )
+        .deliver(rehydrated.origin_hash, &event(origin_hash, 6, b"resumed"))
         .expect("deliver after restore");
     assert_eq!(outputs.len(), 1);
     let mut bytes = [0u8; 8];

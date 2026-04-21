@@ -137,17 +137,15 @@ impl DaemonHost {
         // re-bind replay.
         let subscriptions = Arc::new(DashMap::new());
         if !snapshot.bindings_bytes.is_empty() {
-            let bindings = DaemonBindings::from_bytes(&snapshot.bindings_bytes).ok_or_else(
-                || {
+            let bindings =
+                DaemonBindings::from_bytes(&snapshot.bindings_bytes).ok_or_else(|| {
                     DaemonError::RestoreFailed(
                         "snapshot bindings_bytes failed to decode — tampered or corrupt snapshot"
                             .into(),
                     )
-                },
-            )?;
+                })?;
             for sub in bindings.subscriptions {
-                subscriptions
-                    .insert((sub.publisher, sub.channel.clone()), sub);
+                subscriptions.insert((sub.publisher, sub.channel.clone()), sub);
             }
         }
 
@@ -249,8 +247,7 @@ impl DaemonHost {
 
     /// Drop a subscription from the ledger. Idempotent.
     pub fn forget_subscription(&self, publisher: u64, channel: &ChannelName) {
-        self.subscriptions
-            .remove(&(publisher, channel.clone()));
+        self.subscriptions.remove(&(publisher, channel.clone()));
     }
 
     /// Number of subscriptions in the ledger.
@@ -287,11 +284,12 @@ impl DaemonHost {
     /// Read-only access to the daemon's keypair.
     ///
     /// Migration uses this to seal the daemon's ed25519 seed into
-    /// an [`IdentityEnvelope`] before shipping the snapshot. The
-    /// keypair may be public-only (see
-    /// [`EntityKeypair::is_read_only`]) — sealing a public-only
+    /// an [`IdentityEnvelope`](crate::adapter::net::identity::IdentityEnvelope)
+    /// before shipping the snapshot. The keypair may be public-only
+    /// (see [`EntityKeypair::is_read_only`]) — sealing a public-only
     /// keypair is a logic error handled by
-    /// [`IdentityEnvelope::new`], not here.
+    /// [`IdentityEnvelope::new`](crate::adapter::net::identity::IdentityEnvelope::new),
+    /// not here.
     #[inline]
     pub fn keypair(&self) -> &EntityKeypair {
         &self.keypair

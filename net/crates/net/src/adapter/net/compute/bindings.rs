@@ -14,10 +14,11 @@ use crate::adapter::net::channel::ChannelName;
 
 /// One subscription a daemon holds on a specific publisher for a
 /// specific channel. The `publisher` is a `node_id`; the `token`
-/// (if present) is the serialized [`PermissionToken`] bytes the
-/// daemon presented when it subscribed — stored as raw bytes (not a
-/// typed token) so the ledger can round-trip through a SDK version
-/// mismatch without re-verifying signatures source-side.
+/// (if present) is the serialized
+/// [`PermissionToken`](crate::adapter::net::identity::PermissionToken)
+/// bytes the daemon presented when it subscribed — stored as raw
+/// bytes (not a typed token) so the ledger can round-trip through a
+/// SDK version mismatch without re-verifying signatures source-side.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscriptionBinding {
     /// `node_id` of the publisher this subscription targets.
@@ -82,16 +83,16 @@ impl DaemonBindings {
         for sub in &self.subscriptions {
             buf.put_u64_le(sub.publisher);
             let name = sub.channel.as_str().as_bytes();
-            let name_len = u16::try_from(name.len())
-                .expect("channel name validation already caps at u16");
+            let name_len =
+                u16::try_from(name.len()).expect("channel name validation already caps at u16");
             buf.put_u16_le(name_len);
             buf.extend_from_slice(name);
             match &sub.token_bytes {
                 None => buf.put_u8(0),
                 Some(tok) => {
                     buf.put_u8(1);
-                    let tok_len = u16::try_from(tok.len())
-                        .expect("token bytes exceed u16::MAX — caller bug");
+                    let tok_len =
+                        u16::try_from(tok.len()).expect("token bytes exceed u16::MAX — caller bug");
                     buf.put_u16_le(tok_len);
                     buf.extend_from_slice(tok);
                 }

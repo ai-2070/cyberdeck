@@ -34,9 +34,9 @@
 //! # }
 //! ```
 
-pub mod config;
 #[cfg(feature = "compute")]
 pub mod compute;
+pub mod config;
 #[cfg(feature = "cortex")]
 pub mod cortex;
 pub mod error;
