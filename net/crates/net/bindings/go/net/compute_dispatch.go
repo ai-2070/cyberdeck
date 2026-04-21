@@ -1,0 +1,258 @@
+// Compute dispatcher trampolines — Stage 6 sub-step 2.
+//
+// Rust (compute-ffi) calls into Go whenever a bridged daemon's
+// `process` / `snapshot` / `restore` methods need to run. Go can't
+// receive Rust callbacks directly through CGO, so we use the
+// standard callback-table pattern: Go exposes four C-linkage
+// functions via `//export`; Rust stores pointers to them in a
+// `OnceLock<DispatcherFns>` via `net_compute_set_dispatcher`.
+//
+// Every Go daemon is registered in a process-wide `sync.Map`
+// keyed by a monotonically-increasing `uint64` ID. Rust holds the
+// ID (inside `GoBridge`) and hands it back to us on every
+// callback; we look up the `MeshDaemon` and dispatch. When Rust
+// drops the bridge, it invokes our `free` trampoline so we can
+// release the map entry.
+package net
+
+/*
+#include "net.h"
+#include <stdlib.h>
+#include <string.h>
+
+// Prototypes for the bridge trampolines defined in
+// `compute_dispatch_bridge.c`. Those functions have the exact
+// `net_compute_*_fn` signatures (with `const uint8_t*` pointer
+// params) that the dispatcher typedef expects; they thunk into
+// the `//export`ed Go functions below which cgo generates with
+// non-const pointer params.
+extern int bridgeProcess(uint64_t daemon_id, uint32_t origin_hash, uint64_t sequence,
+                         const uint8_t* payload, size_t payload_len,
+                         net_compute_outputs_t* outputs);
+extern int bridgeSnapshot(uint64_t daemon_id, uint8_t** out_ptr, size_t* out_len);
+extern int bridgeRestore(uint64_t daemon_id, const uint8_t* state, size_t state_len);
+extern void bridgeFree(uint64_t daemon_id);
+*/
+import "C"
+
+import (
+	"sync"
+	"sync/atomic"
+	"unsafe"
+)
+
+// MeshDaemon is the interface a Go daemon implements. `Process`
+// is required; `Snapshot` and `Restore` are optional — callers
+// can type-assert to the matching single-method interfaces (below)
+// to detect support.
+type MeshDaemon interface {
+	// Process handles one inbound event. Returns zero or more
+	// output payloads — the runtime wraps each in a fresh causal
+	// link. Must be synchronous: the Rust dispatcher blocks on
+	// this call.
+	Process(event CausalEvent) ([][]byte, error)
+}
+
+// DaemonSnapshotter is the optional snapshot interface. Daemons
+// that don't implement this surface as stateless to the runtime.
+type DaemonSnapshotter interface {
+	// Snapshot returns the daemon's serialized state, or nil for a
+	// stateless instant. An error falls back to "stateless" in the
+	// core registry (with a stderr warning from the Rust bridge).
+	Snapshot() ([]byte, error)
+}
+
+// DaemonRestorer is the optional restore interface. If a daemon
+// registers via `SpawnFromSnapshot` (sub-step 3) but does not
+// implement `DaemonRestorer`, the state bytes are silently ignored
+// at the bridge layer — same semantics as the Node / Python
+// bindings.
+type DaemonRestorer interface {
+	Restore(state []byte) error
+}
+
+// CausalEvent is the event delivered to a daemon's `Process`.
+type CausalEvent struct {
+	// OriginHash is the 32-bit hash of the emitting entity.
+	OriginHash uint32
+	// Sequence is the emitter's causal-chain sequence number.
+	Sequence uint64
+	// Payload is the opaque event body. Treat as borrowed — copy
+	// if you need to retain it past the `Process` call.
+	Payload []byte
+}
+
+// -------------------------------------------------------------------------
+// Daemon registry — process-wide map of live MeshDaemon instances.
+// -------------------------------------------------------------------------
+
+var (
+	daemonsMu sync.RWMutex
+	daemons   = make(map[uint64]MeshDaemon)
+	nextID    atomic.Uint64
+)
+
+// registerDaemon stores `d` in the registry under a fresh uint64
+// ID and returns the ID. Called by `DaemonRuntime.Spawn`.
+func registerDaemon(d MeshDaemon) uint64 {
+	id := nextID.Add(1)
+	daemonsMu.Lock()
+	daemons[id] = d
+	daemonsMu.Unlock()
+	return id
+}
+
+// lookupDaemon returns the MeshDaemon for `id`, or nil if gone.
+func lookupDaemon(id uint64) MeshDaemon {
+	daemonsMu.RLock()
+	d := daemons[id]
+	daemonsMu.RUnlock()
+	return d
+}
+
+// unregisterDaemon drops the registry entry for `id`. Called by
+// Rust's free callback on bridge drop.
+func unregisterDaemon(id uint64) {
+	daemonsMu.Lock()
+	delete(daemons, id)
+	daemonsMu.Unlock()
+}
+
+// -------------------------------------------------------------------------
+// //export trampolines — called from Rust's GoBridge via the
+// dispatcher registration below.
+// -------------------------------------------------------------------------
+
+//export goComputeProcess
+func goComputeProcess(daemonID C.uint64_t, originHash C.uint32_t, sequence C.uint64_t,
+	payloadPtr *C.uint8_t, payloadLen C.size_t, outputs *C.net_compute_outputs_t,
+) C.int {
+	d := lookupDaemon(uint64(daemonID))
+	if d == nil {
+		return -1
+	}
+	// Copy the payload — the Rust side owns the underlying `Bytes`
+	// and may free it after this callback returns. Go slices
+	// backed by Rust memory are unsafe to retain.
+	var payload []byte
+	if payloadLen > 0 {
+		payload = C.GoBytes(unsafe.Pointer(payloadPtr), C.int(payloadLen))
+	}
+	outs, err := d.Process(CausalEvent{
+		OriginHash: uint32(originHash),
+		Sequence:   uint64(sequence),
+		Payload:    payload,
+	})
+	if err != nil {
+		return -1
+	}
+	for _, o := range outs {
+		var ptr *C.uint8_t
+		if len(o) > 0 {
+			ptr = (*C.uint8_t)(unsafe.Pointer(&o[0]))
+		}
+		code := C.net_compute_outputs_push(outputs, ptr, C.size_t(len(o)))
+		// Keep `o` alive until after the push call so the copy-in
+		// is correct even if GC decides to move the slice backing.
+		if code != C.NET_COMPUTE_OK {
+			return -1
+		}
+	}
+	// Prevent Go's escape analysis from collapsing `outs` before
+	// the final push (belt-and-braces; the for-loop pins each o).
+	if len(outs) > 0 {
+		_ = outs[len(outs)-1]
+	}
+	return C.NET_COMPUTE_OK
+}
+
+//export goComputeSnapshot
+func goComputeSnapshot(daemonID C.uint64_t, outPtr **C.uint8_t, outLen *C.size_t) C.int {
+	d := lookupDaemon(uint64(daemonID))
+	if d == nil {
+		*outPtr = nil
+		*outLen = 0
+		return -1
+	}
+	snapper, ok := d.(DaemonSnapshotter)
+	if !ok {
+		// Daemon is stateless — not an error, just empty output.
+		*outPtr = nil
+		*outLen = 0
+		return C.NET_COMPUTE_OK
+	}
+	state, err := snapper.Snapshot()
+	if err != nil {
+		*outPtr = nil
+		*outLen = 0
+		return -1
+	}
+	if len(state) == 0 {
+		*outPtr = nil
+		*outLen = 0
+		return C.NET_COMPUTE_OK
+	}
+	// Copy into a C.malloc buffer so Rust can free via libc::free
+	// (matches `net_compute_snapshot_bytes_free`'s contract).
+	buf := C.malloc(C.size_t(len(state)))
+	if buf == nil {
+		*outPtr = nil
+		*outLen = 0
+		return -1
+	}
+	C.memcpy(buf, unsafe.Pointer(&state[0]), C.size_t(len(state)))
+	*outPtr = (*C.uint8_t)(buf)
+	*outLen = C.size_t(len(state))
+	return C.NET_COMPUTE_OK
+}
+
+//export goComputeRestore
+func goComputeRestore(daemonID C.uint64_t, statePtr *C.uint8_t, stateLen C.size_t) C.int {
+	d := lookupDaemon(uint64(daemonID))
+	if d == nil {
+		return -1
+	}
+	restorer, ok := d.(DaemonRestorer)
+	if !ok {
+		// No restore method — silently succeed. Matches the
+		// Node / Python semantics: absent `restore` = ignore state.
+		return C.NET_COMPUTE_OK
+	}
+	var state []byte
+	if stateLen > 0 {
+		state = C.GoBytes(unsafe.Pointer(statePtr), C.int(stateLen))
+	}
+	if err := restorer.Restore(state); err != nil {
+		return -1
+	}
+	return C.NET_COMPUTE_OK
+}
+
+//export goComputeFree
+func goComputeFree(daemonID C.uint64_t) {
+	unregisterDaemon(uint64(daemonID))
+}
+
+// -------------------------------------------------------------------------
+// init — register the dispatcher with Rust.
+// -------------------------------------------------------------------------
+
+func init() {
+	// OnceLock on the Rust side makes this idempotent: a second
+	// call (e.g., from a test harness re-init) is a no-op.
+	// Pass the C-side `bridge*` wrappers — they have the exact
+	// `net_compute_*_fn` signatures (with `const uint8_t*`
+	// parameters) and thunk into the `//export`ed Go functions
+	// which cgo emits with non-const pointer parameters.
+	code := C.net_compute_set_dispatcher(
+		C.net_compute_process_fn(C.bridgeProcess),
+		C.net_compute_snapshot_fn(C.bridgeSnapshot),
+		C.net_compute_restore_fn(C.bridgeRestore),
+		C.net_compute_free_fn(C.bridgeFree),
+	)
+	if code != C.NET_COMPUTE_OK {
+		// Panic is appropriate here — without the dispatcher,
+		// nothing on the compute surface will work.
+		panic("net: failed to install compute dispatcher")
+	}
+}

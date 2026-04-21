@@ -29,6 +29,10 @@ bytes = "1"
 dashmap = "6"
 # Shared lock primitives used by the callback-dispatch table.
 parking_lot = "0.12"
+# `libc::free` for Go-allocated snapshot buffers that the dispatcher
+# hands us. Go side allocates via `C.malloc`; we release via the
+# matching `free`.
+libc = "0.2"
 
 [profile.release]
 lto = true

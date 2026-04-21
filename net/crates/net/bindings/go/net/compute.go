@@ -224,6 +224,207 @@ func (rt *DaemonRuntime) Close() {
 	runtime.SetFinalizer(rt, nil)
 }
 
+// DaemonHandle is returned by Spawn. Identifies a running daemon
+// by its 32-bit origin_hash. Cloning the Go struct shares the
+// native pointer — the finalizer runs on the last reference.
+type DaemonHandle struct {
+	handle     *C.net_compute_daemon_handle_t
+	originHash uint32
+	entityID   [32]byte
+	mu         sync.RWMutex
+}
+
+// OriginHash returns the daemon's stable 32-bit origin_hash.
+func (h *DaemonHandle) OriginHash() uint32 {
+	return h.originHash
+}
+
+// EntityID returns the daemon's full 32-byte ed25519 public key.
+// The returned slice is a fresh copy — safe to retain.
+func (h *DaemonHandle) EntityID() []byte {
+	out := make([]byte, 32)
+	copy(out, h.entityID[:])
+	return out
+}
+
+// Close releases the native daemon handle. Does NOT stop the
+// daemon — call DaemonRuntime.Stop(h.OriginHash()) first.
+// Idempotent.
+func (h *DaemonHandle) Close() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.handle == nil {
+		return
+	}
+	C.net_compute_daemon_handle_free(h.handle)
+	h.handle = nil
+	runtime.SetFinalizer(h, nil)
+}
+
+// DaemonHostConfig configures per-daemon host behavior. Zero values
+// take the runtime defaults (0 = manual snapshots only, ≥0 log
+// entries with a sensible default cap).
+type DaemonHostConfig struct {
+	// AutoSnapshotInterval is the event count between automatic
+	// snapshots. 0 disables auto-snapshot.
+	AutoSnapshotInterval uint64
+	// MaxLogEntries caps the event log before forcing a snapshot.
+	// 0 takes the default.
+	MaxLogEntries uint32
+}
+
+// Spawn creates a new daemon of `kind` under the given identity.
+// `daemon` is the Go implementation of `MeshDaemon`; the runtime
+// registers it in a process-wide map keyed by a fresh uint64 ID
+// that Rust hands back on every `process` / `snapshot` / `restore`
+// callback.
+//
+// `kind` must be a string registered via RegisterFactory (sub-step
+// 1 only enforces uniqueness; sub-step 2 lets any string be used
+// at spawn time since the bridge is a caller-supplied instance).
+//
+// Passing a nil `cfg` is equivalent to a zero-value DaemonHostConfig.
+func (rt *DaemonRuntime) Spawn(
+	kind string,
+	identity *Identity,
+	daemon MeshDaemon,
+	cfg *DaemonHostConfig,
+) (*DaemonHandle, error) {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if rt.handle == nil {
+		return nil, ErrRuntimeShutDown
+	}
+	if daemon == nil {
+		return nil, &DaemonError{Message: "daemon is nil"}
+	}
+	if identity == nil {
+		return nil, &DaemonError{Message: "identity is nil"}
+	}
+
+	seed, err := identity.ToSeed()
+	if err != nil {
+		return nil, &DaemonError{Message: "failed to read identity seed: " + err.Error()}
+	}
+	if len(seed) != 32 {
+		return nil, &DaemonError{Message: "identity seed must be 32 bytes"}
+	}
+
+	// Register on the Go side BEFORE calling Rust. If spawn fails,
+	// we unregister — otherwise Rust owns the entry via the
+	// free callback on bridge drop.
+	daemonID := registerDaemon(daemon)
+
+	kindBytes := []byte(kind)
+	var kindPtr *C.char
+	if len(kindBytes) > 0 {
+		kindPtr = (*C.char)(unsafe.Pointer(&kindBytes[0]))
+	}
+
+	var autoSnap C.uint64_t
+	var maxLog C.uint32_t
+	if cfg != nil {
+		autoSnap = C.uint64_t(cfg.AutoSnapshotInterval)
+		maxLog = C.uint32_t(cfg.MaxLogEntries)
+	}
+
+	var nativeHandle *C.net_compute_daemon_handle_t
+	var errOut *C.char
+	code := C.net_compute_spawn(
+		rt.handle,
+		kindPtr,
+		C.size_t(len(kindBytes)),
+		(*C.uint8_t)(unsafe.Pointer(&seed[0])),
+		C.uint64_t(daemonID),
+		autoSnap,
+		maxLog,
+		&nativeHandle,
+		&errOut,
+	)
+	runtime.KeepAlive(kindBytes)
+	runtime.KeepAlive(seed)
+
+	if code != C.NET_COMPUTE_OK {
+		// Rust didn't take ownership — roll back the Go-side
+		// registration so the daemon doesn't leak.
+		unregisterDaemon(daemonID)
+		return nil, computeErr(code, errOut)
+	}
+
+	var entityID [32]byte
+	_ = C.net_compute_daemon_handle_entity_id(nativeHandle, (*C.uint8_t)(unsafe.Pointer(&entityID[0])))
+	originHash := uint32(C.net_compute_daemon_handle_origin_hash(nativeHandle))
+
+	h := &DaemonHandle{
+		handle:     nativeHandle,
+		originHash: originHash,
+		entityID:   entityID,
+	}
+	runtime.SetFinalizer(h, (*DaemonHandle).Close)
+	return h, nil
+}
+
+// Stop removes the daemon identified by originHash from the
+// runtime's registry. Idempotent during ShuttingDown.
+func (rt *DaemonRuntime) Stop(originHash uint32) error {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if rt.handle == nil {
+		return ErrRuntimeShutDown
+	}
+	var errOut *C.char
+	code := C.net_compute_runtime_stop(rt.handle, C.uint32_t(originHash), &errOut)
+	return computeErr(code, errOut)
+}
+
+// Deliver drives one causal event through the daemon at
+// originHash. Returns the daemon's output payloads (each a fresh
+// []byte).
+func (rt *DaemonRuntime) Deliver(originHash uint32, event CausalEvent) ([][]byte, error) {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if rt.handle == nil {
+		return nil, ErrRuntimeShutDown
+	}
+
+	var payloadPtr *C.uint8_t
+	if len(event.Payload) > 0 {
+		payloadPtr = (*C.uint8_t)(unsafe.Pointer(&event.Payload[0]))
+	}
+
+	var outputs *C.net_compute_outputs_t
+	var errOut *C.char
+	code := C.net_compute_runtime_deliver(
+		rt.handle,
+		C.uint32_t(originHash),
+		C.uint32_t(event.OriginHash),
+		C.uint64_t(event.Sequence),
+		payloadPtr,
+		C.size_t(len(event.Payload)),
+		&outputs,
+		&errOut,
+	)
+	runtime.KeepAlive(event.Payload)
+	if code != C.NET_COMPUTE_OK {
+		return nil, computeErr(code, errOut)
+	}
+	defer C.net_compute_outputs_free(outputs)
+
+	n := int(C.net_compute_outputs_len(outputs))
+	out := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		var ptr *C.uint8_t
+		var length C.size_t
+		if C.net_compute_outputs_at(outputs, C.size_t(i), &ptr, &length) != C.NET_COMPUTE_OK {
+			return nil, &DaemonError{Message: "deliver: failed to read output"}
+		}
+		// Copy — outputs pointer lifetime is tied to the outputs
+		// vec which we're about to free.
+		out[i] = C.GoBytes(unsafe.Pointer(ptr), C.int(length))
+	}
+	return out, nil
+}
+
 // computeErr turns a compute-ffi return code + optional err_out
 // CString into a Go error. OK returns nil; all other codes return
 // a *DaemonError, with Message populated from err_out when set.

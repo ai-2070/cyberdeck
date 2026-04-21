@@ -659,6 +659,119 @@ int                     net_compute_register_factory(
 /* Free a CString returned by compute-ffi (e.g., an err_out detail). */
 void                    net_compute_free_cstring(char* s);
 
+/* --- Callback dispatcher (sub-step 2) ---
+ *
+ * Go registers four trampolines with C linkage via
+ * `net_compute_set_dispatcher` in its `init()`. Rust invokes them
+ * whenever a bridged daemon's `process` / `snapshot` / `restore`
+ * method needs to run, plus a `free` callback on daemon drop so
+ * Go can release its registry entry.
+ */
+
+typedef struct net_compute_outputs_s      net_compute_outputs_t;
+typedef struct net_compute_daemon_handle_s net_compute_daemon_handle_t;
+
+typedef int (*net_compute_process_fn)(
+    uint64_t daemon_id,
+    uint32_t origin_hash,
+    uint64_t sequence,
+    const uint8_t* payload_ptr,
+    size_t payload_len,
+    net_compute_outputs_t* outputs);
+
+typedef int (*net_compute_snapshot_fn)(
+    uint64_t daemon_id,
+    uint8_t** out_ptr,
+    size_t* out_len);
+
+typedef int (*net_compute_restore_fn)(
+    uint64_t daemon_id,
+    const uint8_t* state_ptr,
+    size_t state_len);
+
+typedef void (*net_compute_free_fn)(uint64_t daemon_id);
+
+/* Install the Go dispatcher. Call once from Go's init; second call
+ * is ignored (first registration wins). All four pointers must be
+ * non-NULL. */
+int                     net_compute_set_dispatcher(
+    net_compute_process_fn process,
+    net_compute_snapshot_fn snapshot,
+    net_compute_restore_fn restore,
+    net_compute_free_fn free);
+
+/* Push one output payload into the outputs vec. Called by Go's
+ * process trampoline. Copies `len` bytes. */
+int                     net_compute_outputs_push(
+    net_compute_outputs_t* vec,
+    const uint8_t* data,
+    size_t len);
+
+/* Free a snapshot buffer the Go side malloc'd and handed to Rust
+ * via `net_compute_snapshot_fn`. (The Rust bridge calls this after
+ * copying the bytes into its own Bytes.) Normal callers should not
+ * invoke this directly. */
+void                    net_compute_snapshot_bytes_free(uint8_t* ptr, size_t len);
+
+/* --- Spawn / stop / deliver --- */
+
+/* Spawn a daemon. `daemon_id` is the Go-side registry key
+ * trampolines will receive on every callback. `identity_seed`
+ * points at 32 bytes of ed25519 seed. Writes the opaque handle to
+ * `*out_handle` on success. `auto_snapshot_interval` and
+ * `max_log_entries` take 0 for defaults. */
+int                     net_compute_spawn(
+    net_compute_runtime_t* runtime,
+    const char* kind_ptr,
+    size_t kind_len,
+    const uint8_t* identity_seed,
+    uint64_t daemon_id,
+    uint64_t auto_snapshot_interval,
+    uint32_t max_log_entries,
+    net_compute_daemon_handle_t** out_handle,
+    char** err_out);
+
+/* Read the origin_hash from a daemon handle. Returns 0 on NULL. */
+uint32_t                net_compute_daemon_handle_origin_hash(
+    const net_compute_daemon_handle_t* handle);
+
+/* Copy the 32-byte entity_id from a daemon handle into `out`. */
+int                     net_compute_daemon_handle_entity_id(
+    const net_compute_daemon_handle_t* handle,
+    uint8_t* out);
+
+/* Free a daemon handle (does NOT stop the daemon — call
+ * `net_compute_runtime_stop(origin_hash)` separately). */
+void                    net_compute_daemon_handle_free(
+    net_compute_daemon_handle_t* handle);
+
+/* Stop a daemon by origin_hash. */
+int                     net_compute_runtime_stop(
+    net_compute_runtime_t* runtime,
+    uint32_t origin_hash,
+    char** err_out);
+
+/* Deliver one event. Writes a heap-allocated outputs vec to
+ * `*out_outputs`; caller reads via `net_compute_outputs_len`/`_at`
+ * and frees via `net_compute_outputs_free`. */
+int                     net_compute_runtime_deliver(
+    net_compute_runtime_t* runtime,
+    uint32_t origin_hash,
+    uint32_t event_origin_hash,
+    uint64_t event_sequence,
+    const uint8_t* event_payload,
+    size_t event_payload_len,
+    net_compute_outputs_t** out_outputs,
+    char** err_out);
+
+size_t                  net_compute_outputs_len(const net_compute_outputs_t* vec);
+int                     net_compute_outputs_at(
+    const net_compute_outputs_t* vec,
+    size_t idx,
+    const uint8_t** out_ptr,
+    size_t* out_len);
+void                    net_compute_outputs_free(net_compute_outputs_t* vec);
+
 #ifdef __cplusplus
 }
 #endif
