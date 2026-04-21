@@ -9,6 +9,8 @@
 #[cfg(feature = "net")]
 mod capabilities;
 mod common;
+#[cfg(feature = "compute")]
+mod compute;
 #[cfg(feature = "cortex")]
 mod cortex;
 #[cfg(feature = "net")]
@@ -1752,6 +1754,30 @@ mod mesh_bindings {
                 return Err(Error::from_reason("MeshNode has been shut down"));
             }
             Ok(guard)
+        }
+
+        /// Clone an `Arc<MeshNode>` out of the `ArcSwapOption`
+        /// slot. Used by sibling modules (currently: `compute`)
+        /// that build their own SDK-level wrappers against the
+        /// same live node — no second UDP socket, no second
+        /// handshake table. Returns an error if the node has
+        /// been shut down.
+        #[cfg(feature = "compute")]
+        pub(crate) fn node_arc_clone(&self) -> Result<Arc<MeshNode>> {
+            let guard = self.load_node()?;
+            Ok(guard
+                .as_ref()
+                .expect("load_node ensures Some")
+                .clone())
+        }
+
+        /// Share the `ChannelConfigRegistry` for sibling-module
+        /// access. Same rationale as [`Self::node_arc_clone`].
+        #[cfg(feature = "compute")]
+        pub(crate) fn channel_configs_arc(
+            &self,
+        ) -> Arc<net::adapter::net::ChannelConfigRegistry> {
+            self.channel_configs.clone()
         }
     }
 }

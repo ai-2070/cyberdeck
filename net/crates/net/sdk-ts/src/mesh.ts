@@ -231,6 +231,19 @@ export class MeshNode {
     this.native = native;
   }
 
+  /**
+   * **Internal.** Expose the underlying NAPI `NetMesh` to sibling
+   * SDK modules (currently: `compute`'s `DaemonRuntime.create`).
+   * Not part of the public SDK surface — callers should not rely
+   * on this; the return type is the NAPI-generated class and may
+   * change.
+   *
+   * @internal
+   */
+  _napiNetMesh(): NapiNetMesh {
+    return this.native;
+  }
+
   /** Create and configure a new mesh node. */
   static async create(config: MeshNodeConfig): Promise<MeshNode> {
     const native = await NapiNetMesh.create({

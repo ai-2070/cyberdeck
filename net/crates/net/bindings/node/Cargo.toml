@@ -24,9 +24,18 @@ jetstream = ["net/jetstream"]
 # actually work end-to-end.
 net = ["net/net", "dep:hex"]
 cortex = ["net/netdb", "net/redex-disk"]
+# Compute surface — `DaemonRuntime`, `MeshDaemon`, migration. Stage 3
+# of SDK_COMPUTE_SURFACE_PLAN. Depends on `net` (mesh transport is
+# what daemons ride) and brings in `net-sdk` at its `compute` feature
+# for the already-shipped Rust surface. `dashmap` is added here
+# because the compute module keeps a `kind -> TSFN` map that needs
+# concurrent access without serializing the whole NAPI runtime.
+compute = ["net", "dep:net-sdk", "dep:dashmap"]
 
 [dependencies]
 net = { path = "../..", default-features = false }
+net-sdk = { path = "../../sdk", default-features = false, features = ["compute"], optional = true }
+dashmap = { version = "6", optional = true }
 napi = { version = "3.7.0", default-features = false, features = ["napi4", "napi6", "async", "tokio_rt"] }
 napi-derive = "3.4.0"
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "sync"] }
