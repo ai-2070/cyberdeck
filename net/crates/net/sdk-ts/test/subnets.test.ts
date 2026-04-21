@@ -25,6 +25,12 @@ const sharedPolicy: SubnetPolicy = {
     { tagPrefix: 'region:', level: 0, values: { us: 3 } },
     { tagPrefix: 'fleet:', level: 1, values: { blue: 7, green: 8 } },
     { tagPrefix: 'unit:', level: 2, values: { alpha: 2, beta: 3, gamma: 1 } },
+    // Level 3 exists only for the ParentVisible descendant test —
+    // nodes that don't carry a `host:` tag derive a 3-level
+    // SubnetId (depth=3), nodes that do derive a 4-level
+    // descendant. Keeps the other tests untouched since none of
+    // them tag `host:*`.
+    { tagPrefix: 'host:', level: 3, values: { h1: 5 } },
   ],
 };
 
@@ -180,10 +186,23 @@ describe('Subnet enforcement', () => {
     await handshakeNoStart(a, sibling, sibAddr);
     await startAll(a, desc, sibling);
 
-    // desc has tags producing level 2 bucket 2 (is_ancestor_of works
-    // because desc's [3,7,2,5] is a child of A's [3,7,2]).
+    // Subnet derivation on A's side:
+    //
+    //   a's tags  = [region:us, fleet:blue, unit:alpha]      → [3,7,2]
+    //   desc's    = [region:us, fleet:blue, unit:alpha, host:h1] → [3,7,2,5]
+    //   sibling's = [region:us, fleet:green, unit:gamma]     → [3,8,1]
+    //
+    // Crucially: desc's derived SubnetId is a STRICT descendant
+    // of A's — it adds one level beyond A's depth. This forces
+    // the `is_ancestor_of` branch of `ParentVisible` to fire
+    // rather than the same-subnet short-circuit. Cubic flagged
+    // the prior version of this test where desc and A announced
+    // identical tags: they both derived `[3,7,2]`, so A saw desc
+    // as same-subnet and the ancestor logic never ran.
     await a.announceCapabilities({ tags: ['region:us', 'fleet:blue', 'unit:alpha'] });
-    await desc.announceCapabilities({ tags: ['region:us', 'fleet:blue', 'unit:alpha'] });
+    await desc.announceCapabilities({
+      tags: ['region:us', 'fleet:blue', 'unit:alpha', 'host:h1'],
+    });
     await sibling.announceCapabilities({ tags: ['region:us', 'fleet:green', 'unit:gamma'] });
 
     const learned = await waitUntil(() => {
@@ -201,6 +220,11 @@ describe('Subnet enforcement', () => {
     a.registerChannel({ name: chanName, visibility: 'parent-visible' });
 
     const aId = a.nodeId();
+    // `parent-visible` admits via the ancestor branch:
+    //   source=A=[3,7,2].is_ancestor_of(dest=desc=[3,7,2,5]) → true.
+    // Under `subnet-local` the same subscribe rejects (verified
+    // locally) — the ancestor branch is what's under test here,
+    // not same-subnet.
     await expect(desc.subscribeChannel(aId, chanName)).resolves.toBeUndefined();
     await expect(sibling.subscribeChannel(aId, chanName)).rejects.toThrow();
 

@@ -195,6 +195,14 @@ fn subnet_policy_from_json(p: SubnetPolicyJson) -> Option<SubnetPolicy> {
         let mut rule = SubnetRule::new(rule_json.tag_prefix, level);
         for (tag_value, raw_val) in rule_json.values {
             let v = u8_from_u32(raw_val)?;
+            // `SubnetRule::map` panics when `v == 0` — zero is
+            // reserved by the core as "unmatched / no restriction"
+            // and must not appear as an explicit mapping. Reject
+            // at the FFI boundary so Go callers surface a clean
+            // `NET_ERR_MESH_INIT` instead of a cdylib abort.
+            if v == 0 {
+                return None;
+            }
             rule = rule.map(tag_value, v);
         }
         policy = policy.add_rule(rule);

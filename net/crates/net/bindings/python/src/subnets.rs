@@ -73,6 +73,18 @@ fn subnet_rule_from_py(rule_dict: &Bound<'_, PyDict>) -> PyResult<SubnetRule> {
                 let tag_value: String = key.extract()?;
                 let raw: u32 = val.extract()?;
                 let v = u8_from_u32(raw, &format!("rule value for {}", tag_value))?;
+                // `SubnetRule::map` panics when `v == 0` — zero is
+                // reserved by the core as "unmatched / no
+                // restriction" and must not appear as an explicit
+                // mapping. Reject it here as an `IdentityError`
+                // rather than letting Python callers crash the
+                // interpreter with a Rust panic.
+                if v == 0 {
+                    return Err(identity_err(format!(
+                        "subnet: rule value for {:?} must be in 1..=255 (0 is reserved)",
+                        tag_value
+                    )));
+                }
                 rule = rule.map(tag_value, v);
             }
         }

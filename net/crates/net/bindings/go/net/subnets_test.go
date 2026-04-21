@@ -150,6 +150,27 @@ func TestMesh_SubnetPolicyValueOutOfRange_Rejected(t *testing.T) {
 	}
 }
 
+// Regression for a cubic-flagged P1: `SubnetRule::map` in the core
+// panics if any value is 0 (0 is reserved for "unmatched / no
+// restriction"). A Go caller passing `{"eu": 0}` used to abort
+// the cdylib with a Rust panic. The FFI layer now returns a clean
+// mesh-init error.
+func TestMesh_SubnetPolicyValueZero_Rejected(t *testing.T) {
+	addr := reserveLocalUDPPort(t)
+	_, err := NewMeshNode(MeshConfig{
+		BindAddr: addr,
+		PskHex:   meshPsk,
+		SubnetPolicy: &SubnetPolicy{
+			Rules: []SubnetRule{
+				{TagPrefix: "region:", Level: 0, Values: map[string]uint32{"eu": 0}},
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for rule value = 0 (reserved)")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // identity_seed_hex — verifies EntityID round-trip across mesh + identity
 // ---------------------------------------------------------------------------
@@ -163,7 +184,10 @@ func TestMesh_IdentitySeed_MatchesIdentityFromSeed(t *testing.T) {
 		t.Fatalf("identity from seed: %v", err)
 	}
 	defer expectedID.Close()
-	wantEID, _ := expectedID.EntityID()
+	wantEID, err := expectedID.EntityID()
+	if err != nil {
+		t.Fatalf("identity entity id: %v", err)
+	}
 
 	addr := reserveLocalUDPPort(t)
 	m, err := NewMeshNode(MeshConfig{

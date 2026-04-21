@@ -151,6 +151,28 @@ def test_subnet_policy_value_out_of_range_rejected() -> None:
         )
 
 
+def test_subnet_policy_value_zero_rejected() -> None:
+    # Regression for a cubic-flagged P1: `SubnetRule::map` in the
+    # core panics if any value is 0 (0 is reserved for "unmatched /
+    # no restriction"). A Python caller passing `{"eu": 0}` used to
+    # crash the interpreter. The PyO3 layer now rejects 0 with a
+    # clean `IdentityError`.
+    with pytest.raises(IdentityError):
+        NetMesh(
+            _port(15),
+            PSK,
+            subnet_policy={
+                "rules": [
+                    {
+                        "tag_prefix": "region:",
+                        "level": 0,
+                        "values": {"eu": 0},
+                    }
+                ]
+            },
+        )
+
+
 # -------------------------------------------------------------------------
 # Combined subnet + policy + signed caps flags
 # -------------------------------------------------------------------------

@@ -102,6 +102,17 @@ fn subnet_rule_from_js(r: SubnetRuleJs) -> Result<SubnetRule> {
     let mut rule = SubnetRule::new(r.tag_prefix, level);
     for (tag_value, level_value) in r.values {
         let v = parse_u8(level_value, &format!("rule value for {}", tag_value))?;
+        // `SubnetRule::map` panics when `v == 0` — zero is
+        // reserved by the core as "unmatched / no restriction" and
+        // must not appear as an explicit mapping. Reject on the
+        // NAPI boundary so JS callers get a clean `Error` instead
+        // of a native-side panic.
+        if v == 0 {
+            return Err(Error::from_reason(format!(
+                "subnet: rule value for {:?} must be in 1..=255 (0 is reserved)",
+                tag_value
+            )));
+        }
         rule = rule.map(tag_value, v);
     }
     Ok(rule)

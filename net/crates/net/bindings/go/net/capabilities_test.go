@@ -147,7 +147,10 @@ func TestModelAndToolFilter_Matches(t *testing.T) {
 		t.Fatalf("modality filter missed own node: err=%v peers=%v", err, peers)
 	}
 
-	missing, _ := m.FindPeers(CapabilityFilter{RequireModels: []string{"missing"}})
+	missing, err := m.FindPeers(CapabilityFilter{RequireModels: []string{"missing"}})
+	if err != nil {
+		t.Fatalf("find_peers missing-model query: %v", err)
+	}
 	if len(missing) != 0 {
 		t.Fatalf("expected no match, got %v", missing)
 	}
