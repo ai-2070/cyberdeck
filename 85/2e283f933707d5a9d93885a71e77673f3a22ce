@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/mesh.rs
+  5bf3f089eecaef7a 194-201,759-766,1029-1030,1616-1617,2460-2469,2475,2477-2496,3563-3679,4629-4635,4639,4642-4657,4661-4665,5530-5565
+net/crates/net/tests/rendezvous_ack.rs
+  5bf3f089eecaef7a 1-284
+net/crates/net/src/adapter/net/traversal/rendezvous.rs
+  5bf3f089eecaef7a 68,71-73,76-85,123-124,164-168,171-178,271-272,315-322,381-382,393-414,479-480
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "852e283f933707d5a9d93885a71e77673f3a22ce",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1072,
+      "total_deletions": 38,
+      "accepted_lines": 585,
+      "overriden_lines": 0
+    }
+  }
+}
