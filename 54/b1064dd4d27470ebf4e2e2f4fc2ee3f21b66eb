@@ -1,0 +1,25 @@
+net/crates/net/bindings/python/src/lib.rs
+  5bf3f089eecaef7a 853-886,1750-1909
+net/crates/net/bindings/python/Cargo.toml
+  5bf3f089eecaef7a 21-28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "54b1064dd4d27470ebf4e2e2f4fc2ee3f21b66eb",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2270,
+      "total_deletions": 2121,
+      "accepted_lines": 205,
+      "overriden_lines": 0
+    }
+  }
+}
