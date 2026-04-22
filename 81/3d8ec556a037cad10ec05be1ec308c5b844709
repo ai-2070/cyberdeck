@@ -1,0 +1,43 @@
+net/crates/net/bindings/python/Cargo.toml
+  5bf3f089eecaef7a 26-28,32
+net/crates/net/bindings/python/python/net/__init__.py
+  5bf3f089eecaef7a 215-261
+net/crates/net/bindings/python/src/compute.rs
+  5bf3f089eecaef7a 319-328
+net/crates/net/bindings/python/src/groups.rs
+  5bf3f089eecaef7a 1-175,177-345,347-486,488-567
+net/crates/net/bindings/python/src/lib.rs
+  5bf3f089eecaef7a 14-15,1679-1692,1694-1706,1861-1867
+net/crates/net/bindings/go/net/groups_test.go
+  5bf3f089eecaef7a 1-396
+net/crates/net/bindings/go/net/net.h
+  5bf3f089eecaef7a 908-1031
+net/crates/net/bindings/go/net/groups.go
+  5bf3f089eecaef7a 1-841
+net/crates/net/bindings/python/tests/test_groups.py
+  5bf3f089eecaef7a 1-305
+net/crates/net/bindings/go/compute-ffi/Cargo.toml
+  5bf3f089eecaef7a 26
+net/crates/net/bindings/go/compute-ffi/src/lib.rs
+  5bf3f089eecaef7a 1552-1575,1577-1617,1619-1665,1667-1762,1764-1807,1809-1815,1817-1823,1825-2001,2003-2009,2011-2017,2019-2025,2027-2035,2037-2062,2064-2070,2072-2127,2129-2165,2167-2173,2175-2181,2183-2189,2191-2197,2199-2209,2211-2312
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "813d8ec556a037cad10ec05be1ec308c5b844709",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 9527,
+      "total_deletions": 9,
+      "accepted_lines": 3071,
+      "overriden_lines": 25
+    }
+  }
+}
