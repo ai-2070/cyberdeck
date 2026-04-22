@@ -81,10 +81,14 @@ use arc_swap::ArcSwapOption;
 ///   attempt a hole-punch. Increments whether the punch
 ///   eventually succeeds or fails.
 /// - **`relay_fallbacks`** — connection ended up on the routed-
-///   handshake path: either because the pair-type matrix skipped
-///   punching, or because the punch attempt failed and fell back.
-///   Every `connect_direct` that doesn't establish a directly-
-///   punched session increments this counter.
+///   handshake path: either because the pair-type matrix picked
+///   `SkipPunch` (Symmetric-×-Symmetric), or because the punch
+///   attempt failed and fell back, or because a `Direct`
+///   attempt failed and fell back to the routing table. A
+///   successful direct connect does NOT increment this counter;
+///   it's reserved for the "we're actually on the routed path
+///   right now" case so operators can use it as a real
+///   NAT-traversal-effectiveness signal.
 /// - **`punches_succeeded`** — the punch completed within the
 ///   deadline and produced a direct session. Always `≤
 ///   punches_attempted`; the difference is the punch-failure
@@ -122,7 +126,9 @@ pub struct TraversalStatsSnapshot {
     /// Number of those attempts that produced a direct session.
     pub punches_succeeded: u64,
     /// Number of `connect_direct` calls that ended on the routed-
-    /// handshake path — matrix-skipped + punch-failed.
+    /// handshake path: matrix-skipped (Symmetric × Symmetric),
+    /// punch-failed, or Direct-handshake-failed-falling-back.
+    /// Successful direct connects do NOT contribute here.
     pub relay_fallbacks: u64,
     /// True when a port mapping is currently installed on the
     /// operator's router. Flips via the port-mapping task's

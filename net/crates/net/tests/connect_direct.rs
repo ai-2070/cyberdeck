@@ -11,9 +11,11 @@
 //! # Properties under test
 //!
 //! - **Open × Open goes direct.** `connect_direct` picks the
-//!   `Direct` action, does not call the coordinator, bumps
-//!   `relay_fallbacks` (no punch was attempted), and establishes
-//!   a session on `peer_reflex`.
+//!   `Direct` action, does not call the coordinator, and
+//!   establishes a session on `peer_reflex`. None of the
+//!   NAT-traversal stats counters bump on the happy path —
+//!   `relay_fallbacks` only fires when we actually end up on
+//!   the routed-handshake path.
 //! - **Punch-worthy pair bumps `punches_attempted`.** A pair that
 //!   the matrix classifies as `SinglePunch` records a punch
 //!   attempt in the stats, even when the result is ultimately
@@ -113,7 +115,14 @@ async fn wait_for<F: Fn() -> bool>(limit: Duration, check: F) -> bool {
     check()
 }
 
-/// Open × Open → direct connect, no punch. Stats: relay_fallbacks++.
+/// Open × Open → direct connect, no punch. Stats: everything
+/// stays at zero — the successful direct connect is neither a
+/// punch attempt nor a relay fallback. Cubic P1 fix pinned this:
+/// an earlier revision unconditionally incremented
+/// `relay_fallbacks` on entry to the `Direct` branch, which
+/// inflated the counter on every successful direct connect and
+/// made `TraversalStats.relay_fallbacks` useless as a
+/// "NAT-traversal failed, we're on the relay" signal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connect_direct_open_pair_takes_direct_path() {
     let (a, r, b, _x) = punch_topology().await;
@@ -154,8 +163,9 @@ async fn connect_direct_open_pair_takes_direct_path() {
         "connect_direct returns the peer's node_id",
     );
 
-    // Stats: Open×Open → Direct, bumps relay_fallbacks (no
-    // punch was attempted). punches_attempted stays at zero.
+    // Stats: Open×Open → Direct path resolved via peer_reflex.
+    // No punch attempted, no relay fallback. All three
+    // traversal counters stay put.
     let after = a.traversal_stats();
     assert_eq!(
         after.punches_attempted, before.punches_attempted,
@@ -166,9 +176,19 @@ async fn connect_direct_open_pair_takes_direct_path() {
         "no punch attempted → no punch success",
     );
     assert_eq!(
-        after.relay_fallbacks,
-        before.relay_fallbacks + 1,
-        "Direct action bumps relay_fallbacks",
+        after.relay_fallbacks, before.relay_fallbacks,
+        "a successful Direct connect is NOT a relay fallback — \
+         the counter's documented meaning is \"ended up on the \
+         routed-handshake path\", which didn't happen here. \
+         (Regression guard for cubic P1 — the counter used to \
+         bump unconditionally on entry to the Direct branch.)",
+    );
+
+    // And the transport is B's reflex, not the coordinator's.
+    assert_eq!(
+        a.peer_addr(b_id),
+        Some(b_bind),
+        "Direct path should resolve on B's reflex, not the coordinator",
     );
 }
 

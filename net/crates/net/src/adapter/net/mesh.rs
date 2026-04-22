@@ -5103,13 +5103,22 @@ impl MeshNode {
                 // the earlier implementation always went via
                 // the routing table, which added an unnecessary
                 // relay hop when a direct path was available.
-                self.traversal_stats.record_relay_fallback();
+                //
+                // Stats note (cubic P1): `record_relay_fallback`
+                // fires only when we actually fall back to the
+                // routed path — not on entry. A successful
+                // direct connect is not a fallback; attributing
+                // it as one breaks `TraversalStats.relay_fallbacks`'s
+                // documented meaning ("ended up on the routed-
+                // handshake path") and makes the counter useless
+                // for assessing NAT-traversal effectiveness.
                 match connect_on_direct_path(peer_reflex).await {
                     Ok(id) => Ok(id),
                     Err(_) => {
                         if self.peers.contains_key(&peer_node_id) {
                             return Ok(peer_node_id);
                         }
+                        self.traversal_stats.record_relay_fallback();
                         self.connect_routed(peer_pubkey, peer_node_id)
                             .await
                             .map_err(|e| TraversalError::Transport(e.to_string()))
