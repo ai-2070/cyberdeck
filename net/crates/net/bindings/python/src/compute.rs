@@ -316,6 +316,16 @@ pub struct PyDaemonRuntime {
     factories: Arc<DashMap<String, Py<PyAny>>>,
 }
 
+impl PyDaemonRuntime {
+    /// Shared access to the inner SDK runtime. Used by the
+    /// `groups` module to pass a `&SdkDaemonRuntime` to the group
+    /// constructors.
+    #[cfg(feature = "groups")]
+    pub(crate) fn sdk_runtime(&self) -> &SdkDaemonRuntime {
+        &self.inner
+    }
+}
+
 #[pymethods]
 impl PyDaemonRuntime {
     /// Build a compute runtime against an existing `NetMesh`.

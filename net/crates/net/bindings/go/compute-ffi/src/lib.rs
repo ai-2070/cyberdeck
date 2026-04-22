@@ -1549,3 +1549,764 @@ fn cstr_to_string(ptr: *const c_char, len: usize) -> Option<String> {
     let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
     std::str::from_utf8(bytes).ok().map(|s| s.to_string())
 }
+
+// =========================================================================
+// Test-only helpers (feature-gated behind the groups-testing path)
+// =========================================================================
+
+/// **Test-only** helper for `groups_test.go`. Injects a synthetic
+/// capability announcement directly into the caller-provided
+/// mesh's capability index so `place_with_spread` has enough
+/// candidates for `ReplicaGroup` / `ForkGroup` / `StandbyGroup`
+/// tests without a real handshake.
+///
+/// Production code should NOT use this — the mesh's normal
+/// `announce_capabilities` is what peers broadcast through at
+/// runtime.
+///
+/// # Safety
+///
+/// `mesh_arc` must be a pointer returned by `net_mesh_arc_clone`
+/// (from `net::ffi::mesh`); it is NOT consumed by this call.
+#[no_mangle]
+pub extern "C" fn net_compute_test_inject_synthetic_peer(
+    mesh_arc: *mut std::sync::Arc<MeshNode>,
+    node_id: u64,
+) {
+    use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
+    use net::adapter::net::identity::EntityId;
+    if mesh_arc.is_null() {
+        return;
+    }
+    let arc = unsafe { &*mesh_arc };
+    let index = arc.capability_index().clone();
+    let eid = EntityId::from_bytes([0u8; 32]);
+    index.index(CapabilityAnnouncement::new(
+        node_id,
+        eid,
+        1,
+        CapabilitySet::new(),
+    ));
+}
+
+// =========================================================================
+// Groups — Stage 4 of SDK_GROUPS_SURFACE_PLAN.md
+// =========================================================================
+
+use net_sdk::groups::{
+    ForkGroup as SdkForkGroup, ForkGroupConfig as SdkForkGroupConfig, ForkRecord as SdkForkRecord,
+    GroupError as SdkGroupError, GroupHealth as SdkGroupHealth, MemberInfo as SdkMemberInfo,
+    MemberRole as SdkMemberRole, ReplicaGroup as SdkReplicaGroup,
+    ReplicaGroupConfig as SdkReplicaGroupConfig, RequestContext as SdkRequestContext,
+    StandbyGroup as SdkStandbyGroup, StandbyGroupConfig as SdkStandbyGroupConfig,
+};
+
+/// Format an SDK `GroupError` into the stable
+/// `group: <kind>[: detail]` body the Go side parses via
+/// `migrationErr`-style helpers.
+fn format_group_error(e: &SdkGroupError) -> String {
+    match e {
+        SdkGroupError::NotReady => "group: not-ready".to_string(),
+        SdkGroupError::FactoryNotFound(kind) => {
+            format!("group: factory-not-found: {kind}")
+        }
+        SdkGroupError::Daemon(d) => format!("group: daemon: {d}"),
+        SdkGroupError::Core(core) => format_core_group_error(core),
+    }
+}
+
+fn format_core_group_error(e: &net::adapter::net::compute::GroupError) -> String {
+    use net::adapter::net::compute::GroupError as C;
+    match e {
+        C::NoHealthyMember => "group: no-healthy-member".to_string(),
+        C::PlacementFailed(msg) => format!("group: placement-failed: {msg}"),
+        C::RegistryFailed(msg) => format!("group: registry-failed: {msg}"),
+        C::InvalidConfig(msg) => format!("group: invalid-config: {msg}"),
+    }
+}
+
+fn group_err_out(err_out: *mut *mut c_char, e: &SdkGroupError) -> c_int {
+    write_err(err_out, &format_group_error(e));
+    NET_COMPUTE_ERR_CALL_FAILED
+}
+
+fn parse_seed(ptr: *const u8) -> Option<[u8; 32]> {
+    if ptr.is_null() {
+        return None;
+    }
+    let mut seed = [0u8; 32];
+    unsafe {
+        std::ptr::copy_nonoverlapping(ptr, seed.as_mut_ptr(), 32);
+    }
+    Some(seed)
+}
+
+fn parse_strategy(
+    ptr: *const c_char,
+    len: usize,
+) -> Option<net::adapter::net::behavior::loadbalance::Strategy> {
+    use net::adapter::net::behavior::loadbalance::Strategy;
+    match cstr_to_string(ptr, len)?.as_str() {
+        "round-robin" => Some(Strategy::RoundRobin),
+        "consistent-hash" => Some(Strategy::ConsistentHash),
+        "least-load" => Some(Strategy::LeastLoad),
+        "least-connections" => Some(Strategy::LeastConnections),
+        "random" => Some(Strategy::Random),
+        _ => None,
+    }
+}
+
+fn health_status(h: SdkGroupHealth) -> (c_int, u32, u32) {
+    // Encode GroupHealth as three ints:
+    //   status: 0 = healthy, 1 = degraded, 2 = dead
+    //   healthy: number of healthy members (0 if status != degraded)
+    //   total: total member count (0 if status != degraded)
+    match h {
+        SdkGroupHealth::Healthy => (0, 0, 0),
+        SdkGroupHealth::Degraded { healthy, total } => (1, healthy as u32, total as u32),
+        SdkGroupHealth::Dead => (2, 0, 0),
+    }
+}
+
+/// Simple JSON encoder for member arrays. Avoids pulling `serde`
+/// into `compute-ffi` just for one function.
+fn members_to_json(members: &[SdkMemberInfo]) -> String {
+    let mut out = String::from("[");
+    for (i, m) in members.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            r#"{{"index":{},"origin_hash":{},"node_id":{},"entity_id":"{}","healthy":{}}}"#,
+            m.index,
+            m.origin_hash,
+            m.node_id,
+            hex_encode(&m.entity_id_bytes),
+            m.healthy,
+        ));
+    }
+    out.push(']');
+    out
+}
+
+fn fork_records_to_json(records: &[SdkForkRecord]) -> String {
+    let mut out = String::from("[");
+    for (i, r) in records.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let snap = match r.from_snapshot_seq {
+            Some(s) => format!("{s}"),
+            None => "null".to_string(),
+        };
+        out.push_str(&format!(
+            r#"{{"original_origin":{},"forked_origin":{},"fork_seq":{},"from_snapshot_seq":{}}}"#,
+            r.original_origin, r.forked_origin, r.fork_seq, snap,
+        ));
+    }
+    out.push(']');
+    out
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+// ---------------------------------------------------------------
+// ReplicaGroup
+// ---------------------------------------------------------------
+
+pub struct ReplicaGroupHandle {
+    inner: std::sync::Arc<SdkReplicaGroup>,
+    kind: String,
+}
+
+/// Spawn a replica group bound to an existing `DaemonRuntime`.
+/// `kind_ptr` + `kind_len` name the factory (must be registered
+/// via `net_compute_register_factory_with_func`).
+///
+/// On success, writes the handle to `*out_handle` and returns
+/// `NET_COMPUTE_OK`. On failure, writes a
+/// `group: <kind>[: detail]` body to `*err_out` and returns
+/// `NET_COMPUTE_ERR_CALL_FAILED`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn net_compute_replica_group_spawn(
+    runtime: *mut DaemonRuntimeHandle,
+    kind_ptr: *const c_char,
+    kind_len: usize,
+    replica_count: u32,
+    group_seed: *const u8,
+    lb_strategy_ptr: *const c_char,
+    lb_strategy_len: usize,
+    auto_snapshot_interval: u64,
+    max_log_entries: u32,
+    out_handle: *mut *mut ReplicaGroupHandle,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    let Some(rt) = (unsafe { runtime.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    if out_handle.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    let Some(seed) = parse_seed(group_seed) else {
+        write_err(
+            err_out,
+            "group: invalid-config: group_seed must be 32 bytes",
+        );
+        return NET_COMPUTE_ERR_CALL_FAILED;
+    };
+    let Some(lb) = parse_strategy(lb_strategy_ptr, lb_strategy_len) else {
+        write_err(err_out, "group: invalid-config: unknown lb strategy");
+        return NET_COMPUTE_ERR_CALL_FAILED;
+    };
+
+    let mut host = DaemonHostConfig::default();
+    host.auto_snapshot_interval = auto_snapshot_interval;
+    if max_log_entries > 0 {
+        host.max_log_entries = max_log_entries;
+    }
+    let cfg = SdkReplicaGroupConfig {
+        replica_count: replica_count as u8,
+        group_seed: seed,
+        lb_strategy: lb,
+        host_config: host,
+    };
+
+    match SdkReplicaGroup::spawn(&rt.inner, &kind, cfg) {
+        Ok(g) => {
+            let h = ReplicaGroupHandle {
+                inner: std::sync::Arc::new(g),
+                kind,
+            };
+            unsafe { *out_handle = Box::into_raw(Box::new(h)) };
+            NET_COMPUTE_OK
+        }
+        Err(e) => group_err_out(err_out, &e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_replica_group_free(h: *mut ReplicaGroupHandle) {
+    if h.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(h);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_replica_group_replica_count(h: *const ReplicaGroupHandle) -> c_int {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    h.inner.replica_count() as c_int
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_replica_group_healthy_count(h: *const ReplicaGroupHandle) -> c_int {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    h.inner.healthy_count() as c_int
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_replica_group_group_id(h: *const ReplicaGroupHandle) -> u32 {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return 0;
+    };
+    h.inner.group_id()
+}
+
+/// Fill `(out_status, out_healthy, out_total)` with the group's
+/// current health. `out_status`: 0 = healthy, 1 = degraded,
+/// 2 = dead. On non-degraded `healthy` and `total` are 0.
+#[no_mangle]
+pub extern "C" fn net_compute_replica_group_health(
+    h: *const ReplicaGroupHandle,
+    out_status: *mut c_int,
+    out_healthy: *mut u32,
+    out_total: *mut u32,
+) -> c_int {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    if out_status.is_null() || out_healthy.is_null() || out_total.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    let (s, hc, t) = health_status(h.inner.health());
+    unsafe {
+        *out_status = s;
+        *out_healthy = hc;
+        *out_total = t;
+    }
+    NET_COMPUTE_OK
+}
+
+/// Route a request to the best healthy replica. `routing_key_ptr`
+/// (may be NULL if len=0) is consistent-hashed for sticky routing.
+#[no_mangle]
+pub extern "C" fn net_compute_replica_group_route_event(
+    h: *const ReplicaGroupHandle,
+    routing_key_ptr: *const c_char,
+    routing_key_len: usize,
+    out_origin: *mut u32,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    if out_origin.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    let mut rc = SdkRequestContext::new();
+    if routing_key_len > 0 {
+        if let Some(k) = cstr_to_string(routing_key_ptr, routing_key_len) {
+            rc = rc.with_routing_key(k);
+        }
+    }
+    match h.inner.route_event(&rc) {
+        Ok(origin) => {
+            unsafe { *out_origin = origin };
+            NET_COMPUTE_OK
+        }
+        Err(e) => group_err_out(err_out, &e),
+    }
+}
+
+/// Resize the group to `n` members. Reuses the kind the group was
+/// spawned with.
+#[no_mangle]
+pub extern "C" fn net_compute_replica_group_scale_to(
+    h: *const ReplicaGroupHandle,
+    n: u32,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    match h.inner.scale_to(n as u8, &h.kind) {
+        Ok(()) => NET_COMPUTE_OK,
+        Err(e) => group_err_out(err_out, &e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_replica_group_on_node_recovery(
+    h: *const ReplicaGroupHandle,
+    node_id: u64,
+) {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return;
+    };
+    h.inner.on_node_recovery(node_id);
+}
+
+/// Return the members roster as a heap-allocated JSON string.
+/// Caller frees via `net_compute_free_cstring`.
+#[no_mangle]
+pub extern "C" fn net_compute_replica_group_members_json(
+    h: *const ReplicaGroupHandle,
+) -> *mut c_char {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return std::ptr::null_mut();
+    };
+    let json = members_to_json(&h.inner.replicas());
+    CString::new(json)
+        .map(|c| c.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+// ---------------------------------------------------------------
+// ForkGroup
+// ---------------------------------------------------------------
+
+pub struct ForkGroupHandle {
+    inner: std::sync::Arc<SdkForkGroup>,
+    kind: String,
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn net_compute_fork_group_spawn(
+    runtime: *mut DaemonRuntimeHandle,
+    kind_ptr: *const c_char,
+    kind_len: usize,
+    parent_origin: u32,
+    fork_seq: u64,
+    fork_count: u32,
+    lb_strategy_ptr: *const c_char,
+    lb_strategy_len: usize,
+    auto_snapshot_interval: u64,
+    max_log_entries: u32,
+    out_handle: *mut *mut ForkGroupHandle,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    let Some(rt) = (unsafe { runtime.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    if out_handle.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    let Some(lb) = parse_strategy(lb_strategy_ptr, lb_strategy_len) else {
+        write_err(err_out, "group: invalid-config: unknown lb strategy");
+        return NET_COMPUTE_ERR_CALL_FAILED;
+    };
+    let mut host = DaemonHostConfig::default();
+    host.auto_snapshot_interval = auto_snapshot_interval;
+    if max_log_entries > 0 {
+        host.max_log_entries = max_log_entries;
+    }
+    let cfg = SdkForkGroupConfig {
+        fork_count: fork_count as u8,
+        lb_strategy: lb,
+        host_config: host,
+    };
+    match SdkForkGroup::fork(&rt.inner, &kind, parent_origin, fork_seq, cfg) {
+        Ok(g) => {
+            let h = ForkGroupHandle {
+                inner: std::sync::Arc::new(g),
+                kind,
+            };
+            unsafe { *out_handle = Box::into_raw(Box::new(h)) };
+            NET_COMPUTE_OK
+        }
+        Err(e) => group_err_out(err_out, &e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_fork_group_free(h: *mut ForkGroupHandle) {
+    if h.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(h);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_fork_group_fork_count(h: *const ForkGroupHandle) -> c_int {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    h.inner.fork_count() as c_int
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_fork_group_healthy_count(h: *const ForkGroupHandle) -> c_int {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    h.inner.healthy_count() as c_int
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_fork_group_parent_origin(h: *const ForkGroupHandle) -> u32 {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return 0;
+    };
+    h.inner.parent_origin()
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_fork_group_fork_seq(h: *const ForkGroupHandle) -> u64 {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return 0;
+    };
+    h.inner.fork_seq()
+}
+
+/// Verify every fork's lineage record. Returns 1 on verified, 0
+/// otherwise. Caller sees NULL handle as 0.
+#[no_mangle]
+pub extern "C" fn net_compute_fork_group_verify_lineage(h: *const ForkGroupHandle) -> c_int {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return 0;
+    };
+    if h.inner.verify_lineage() {
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_fork_group_scale_to(
+    h: *const ForkGroupHandle,
+    n: u32,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    match h.inner.scale_to(n as u8, &h.kind) {
+        Ok(()) => NET_COMPUTE_OK,
+        Err(e) => group_err_out(err_out, &e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_fork_group_on_node_recovery(h: *const ForkGroupHandle, node_id: u64) {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return;
+    };
+    h.inner.on_node_recovery(node_id);
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_fork_group_members_json(h: *const ForkGroupHandle) -> *mut c_char {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return std::ptr::null_mut();
+    };
+    let json = members_to_json(&h.inner.members());
+    CString::new(json)
+        .map(|c| c.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_fork_group_fork_records_json(
+    h: *const ForkGroupHandle,
+) -> *mut c_char {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return std::ptr::null_mut();
+    };
+    let json = fork_records_to_json(&h.inner.fork_records());
+    CString::new(json)
+        .map(|c| c.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+// ---------------------------------------------------------------
+// StandbyGroup
+// ---------------------------------------------------------------
+
+pub struct StandbyGroupHandle {
+    inner: std::sync::Arc<SdkStandbyGroup>,
+    kind: String,
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn net_compute_standby_group_spawn(
+    runtime: *mut DaemonRuntimeHandle,
+    kind_ptr: *const c_char,
+    kind_len: usize,
+    member_count: u32,
+    group_seed: *const u8,
+    auto_snapshot_interval: u64,
+    max_log_entries: u32,
+    out_handle: *mut *mut StandbyGroupHandle,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    let Some(rt) = (unsafe { runtime.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    if out_handle.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    let Some(seed) = parse_seed(group_seed) else {
+        write_err(
+            err_out,
+            "group: invalid-config: group_seed must be 32 bytes",
+        );
+        return NET_COMPUTE_ERR_CALL_FAILED;
+    };
+    let mut host = DaemonHostConfig::default();
+    host.auto_snapshot_interval = auto_snapshot_interval;
+    if max_log_entries > 0 {
+        host.max_log_entries = max_log_entries;
+    }
+    let cfg = SdkStandbyGroupConfig {
+        member_count: member_count as u8,
+        group_seed: seed,
+        host_config: host,
+    };
+    match SdkStandbyGroup::spawn(&rt.inner, &kind, cfg) {
+        Ok(g) => {
+            let h = StandbyGroupHandle {
+                inner: std::sync::Arc::new(g),
+                kind,
+            };
+            unsafe { *out_handle = Box::into_raw(Box::new(h)) };
+            NET_COMPUTE_OK
+        }
+        Err(e) => group_err_out(err_out, &e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_standby_group_free(h: *mut StandbyGroupHandle) {
+    if h.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(h);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_standby_group_member_count(h: *const StandbyGroupHandle) -> c_int {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    h.inner.member_count() as c_int
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_standby_group_standby_count(h: *const StandbyGroupHandle) -> c_int {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    h.inner.standby_count() as c_int
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_standby_group_active_index(h: *const StandbyGroupHandle) -> c_int {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    h.inner.active_index() as c_int
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_standby_group_active_origin(h: *const StandbyGroupHandle) -> u32 {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return 0;
+    };
+    h.inner.active_origin()
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_standby_group_active_healthy(h: *const StandbyGroupHandle) -> c_int {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return 0;
+    };
+    if h.inner.active_healthy() {
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_standby_group_group_id(h: *const StandbyGroupHandle) -> u32 {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return 0;
+    };
+    h.inner.group_id()
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_standby_group_buffered_event_count(
+    h: *const StandbyGroupHandle,
+) -> c_int {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    h.inner.buffered_event_count() as c_int
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_standby_group_sync_standbys(
+    h: *const StandbyGroupHandle,
+    out_through: *mut u64,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    if out_through.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    match h.inner.sync_standbys() {
+        Ok(seq) => {
+            unsafe { *out_through = seq };
+            NET_COMPUTE_OK
+        }
+        Err(e) => group_err_out(err_out, &e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_standby_group_promote(
+    h: *const StandbyGroupHandle,
+    out_origin: *mut u32,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    if out_origin.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    match h.inner.promote(&h.kind) {
+        Ok(origin) => {
+            unsafe { *out_origin = origin };
+            NET_COMPUTE_OK
+        }
+        Err(e) => group_err_out(err_out, &e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_standby_group_on_node_recovery(
+    h: *const StandbyGroupHandle,
+    node_id: u64,
+) {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return;
+    };
+    h.inner.on_node_recovery(node_id);
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_standby_group_members_json(
+    h: *const StandbyGroupHandle,
+) -> *mut c_char {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return std::ptr::null_mut();
+    };
+    let json = members_to_json(&h.inner.members());
+    CString::new(json)
+        .map(|c| c.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Returns `"active"` / `"standby"` (caller frees via
+/// `net_compute_free_cstring`) or NULL for an out-of-range index.
+#[no_mangle]
+pub extern "C" fn net_compute_standby_group_member_role(
+    h: *const StandbyGroupHandle,
+    index: u32,
+) -> *mut c_char {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return std::ptr::null_mut();
+    };
+    match h.inner.member_role(index as u8) {
+        Some(SdkMemberRole::Active) => CString::new("active")
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        Some(SdkMemberRole::Standby) => CString::new("standby")
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        None => std::ptr::null_mut(),
+    }
+}

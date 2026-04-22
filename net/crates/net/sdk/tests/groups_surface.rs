@@ -86,8 +86,8 @@ fn replica_config(n: u8, seed: u8) -> ReplicaGroupConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replica_group_spawn_registers_members_and_reports_health() {
     let rt = runtime_with_peers(3).await;
-    let group = ReplicaGroup::spawn(&rt, "noop", replica_config(3, 0x11))
-        .expect("spawn replica group");
+    let group =
+        ReplicaGroup::spawn(&rt, "noop", replica_config(3, 0x11)).expect("spawn replica group");
 
     assert_eq!(group.replica_count(), 3);
     assert_eq!(group.healthy_count(), 3);
@@ -128,8 +128,7 @@ async fn replica_group_route_event_returns_live_origin() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replica_group_scale_up_and_down_tracks_daemon_count() {
     let rt = runtime_with_peers(5).await;
-    let group =
-        ReplicaGroup::spawn(&rt, "noop", replica_config(2, 0x33)).expect("spawn");
+    let group = ReplicaGroup::spawn(&rt, "noop", replica_config(2, 0x33)).expect("spawn");
     assert_eq!(rt.daemon_count(), 2);
 
     group.scale_to(5, "noop").expect("scale up");

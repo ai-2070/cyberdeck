@@ -87,12 +87,8 @@ impl ReplicaGroup {
             .map_err(|_| GroupError::FactoryNotFound(kind.to_string()))?;
         let scheduler = runtime.scheduler_arc();
         let registry = runtime.registry_arc();
-        let core = CoreReplicaGroup::spawn(
-            config.into(),
-            move || (factory)(),
-            &scheduler,
-            &registry,
-        )?;
+        let core =
+            CoreReplicaGroup::spawn(config.into(), move || (factory)(), &scheduler, &registry)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(core)),
             runtime: runtime.clone(),
@@ -135,12 +131,8 @@ impl ReplicaGroup {
         let scheduler = self.runtime.scheduler_arc();
         let registry = self.runtime.registry_arc();
         let mut guard = self.inner.lock().expect("ReplicaGroup mutex poisoned");
-        let replaced = guard.on_node_failure(
-            failed_node_id,
-            move || (factory)(),
-            &scheduler,
-            &registry,
-        )?;
+        let replaced =
+            guard.on_node_failure(failed_node_id, move || (factory)(), &scheduler, &registry)?;
         Ok(replaced)
     }
 

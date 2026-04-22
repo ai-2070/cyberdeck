@@ -6,9 +6,7 @@
 //! public surface.
 
 pub use ::net::adapter::net::behavior::loadbalance::{RequestContext, Strategy};
-pub use ::net::adapter::net::compute::{
-    fork_group::ForkInfo, GroupHealth, MemberInfo, MemberRole,
-};
+pub use ::net::adapter::net::compute::{fork_group::ForkInfo, GroupHealth, MemberInfo, MemberRole};
 pub use ::net::adapter::net::continuity::discontinuity::ForkRecord;
 
 /// Convenience constructor for a [`RequestContext`] with a

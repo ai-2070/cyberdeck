@@ -105,12 +105,7 @@ impl ForkGroup {
         let scheduler = self.runtime.scheduler_arc();
         let registry = self.runtime.registry_arc();
         let mut guard = self.inner.lock().expect("ForkGroup mutex poisoned");
-        Ok(guard.on_node_failure(
-            failed_node_id,
-            move || (factory)(),
-            &scheduler,
-            &registry,
-        )?)
+        Ok(guard.on_node_failure(failed_node_id, move || (factory)(), &scheduler, &registry)?)
     }
 
     pub fn on_node_recovery(&self, recovered_node_id: u64) {
@@ -120,7 +115,10 @@ impl ForkGroup {
     }
 
     pub fn health(&self) -> GroupHealth {
-        self.inner.lock().expect("ForkGroup mutex poisoned").health()
+        self.inner
+            .lock()
+            .expect("ForkGroup mutex poisoned")
+            .health()
     }
 
     pub fn parent_origin(&self) -> u32 {
@@ -185,7 +183,10 @@ impl std::fmt::Debug for ForkGroup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let guard = self.inner.lock().expect("ForkGroup mutex poisoned");
         f.debug_struct("ForkGroup")
-            .field("parent_origin", &format_args!("{:#x}", guard.parent_origin()))
+            .field(
+                "parent_origin",
+                &format_args!("{:#x}", guard.parent_origin()),
+            )
             .field("fork_seq", &guard.fork_seq())
             .field("fork_count", &guard.fork_count())
             .field("healthy_count", &guard.healthy_count())

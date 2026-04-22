@@ -23,7 +23,7 @@ net = { path = "../../..", features = ["net"] }
 # SDK compute surface — `DaemonRuntime`, `DaemonHandle`,
 # `MigrationHandle`, `StateSnapshot`. The Go FFI delegates to this
 # layer so all three language bindings stay behavior-aligned.
-net-sdk = { path = "../../../sdk", features = ["net", "compute"] }
+net-sdk = { path = "../../../sdk", features = ["net", "compute", "groups"] }
 tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
 bytes = "1"
 dashmap = "6"

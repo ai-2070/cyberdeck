@@ -36,12 +36,12 @@
 
 #[cfg(feature = "compute")]
 pub mod compute;
-#[cfg(feature = "groups")]
-pub mod groups;
 pub mod config;
 #[cfg(feature = "cortex")]
 pub mod cortex;
 pub mod error;
+#[cfg(feature = "groups")]
+pub mod groups;
 #[cfg(feature = "net")]
 pub mod mesh;
 mod net;

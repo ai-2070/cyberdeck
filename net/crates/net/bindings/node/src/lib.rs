@@ -1722,9 +1722,7 @@ mod mesh_bindings {
         #[napi]
         #[cfg(feature = "groups")]
         pub fn test_inject_synthetic_peer(&self, node_id: BigInt) -> Result<()> {
-            use net::adapter::net::behavior::capability::{
-                CapabilityAnnouncement, CapabilitySet,
-            };
+            use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
             use net::adapter::net::identity::EntityId;
             let (_, nid, _) = node_id.get_u64();
             let guard = self.load_node()?;

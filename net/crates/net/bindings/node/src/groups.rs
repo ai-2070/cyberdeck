@@ -25,9 +25,9 @@ use napi_derive::napi;
 use std::sync::Arc;
 
 use net_sdk::groups::{
-    ForkGroup as SdkForkGroup, ForkGroupConfig as SdkForkGroupConfig,
-    ForkRecord as SdkForkRecord, GroupError as SdkGroupError, GroupHealth as SdkGroupHealth,
-    MemberInfo as SdkMemberInfo, MemberRole as SdkMemberRole, ReplicaGroup as SdkReplicaGroup,
+    ForkGroup as SdkForkGroup, ForkGroupConfig as SdkForkGroupConfig, ForkRecord as SdkForkRecord,
+    GroupError as SdkGroupError, GroupHealth as SdkGroupHealth, MemberInfo as SdkMemberInfo,
+    MemberRole as SdkMemberRole, ReplicaGroup as SdkReplicaGroup,
     ReplicaGroupConfig as SdkReplicaGroupConfig, RequestContext as SdkRequestContext,
     StandbyGroup as SdkStandbyGroup, StandbyGroupConfig as SdkStandbyGroupConfig,
 };
@@ -318,8 +318,8 @@ pub(crate) async fn spawn_fork_group(
         lb_strategy: config.lb_strategy.into(),
         host_config: config.host_config.map(Into::into).unwrap_or_default(),
     };
-    let group = SdkForkGroup::fork(&runtime, &kind, parent_origin, fork_seq, cfg)
-        .map_err(group_err)?;
+    let group =
+        SdkForkGroup::fork(&runtime, &kind, parent_origin, fork_seq, cfg).map_err(group_err)?;
     Ok(ForkGroup {
         inner: Arc::new(group),
         kind,
@@ -356,7 +356,6 @@ pub struct ReplicaGroup {
 
 #[napi]
 impl ReplicaGroup {
-
     /// Resolve `ctx` to the best-available replica's `origin_hash`.
     /// Caller hands the returned hash to `runtime.deliver(...)`.
     #[napi]
@@ -440,12 +439,9 @@ pub struct ForkGroup {
 
 #[napi]
 impl ForkGroup {
-
     #[napi]
     pub fn route_event(&self, ctx: RequestContextJs) -> Result<u32> {
-        self.inner
-            .route_event(&ctx.into())
-            .map_err(group_err)
+        self.inner.route_event(&ctx.into()).map_err(group_err)
     }
 
     #[napi]
@@ -528,7 +524,6 @@ pub struct StandbyGroup {
 
 #[napi]
 impl StandbyGroup {
-
     /// `origin_hash` of the current active. Feed to
     /// `runtime.deliver(...)` for every event, then call
     /// `onEventDelivered` with the same event so standbys have
@@ -596,9 +591,7 @@ impl StandbyGroup {
 
     #[napi]
     pub fn synced_through(&self, index: u32) -> Option<BigInt> {
-        self.inner
-            .synced_through(index as u8)
-            .map(BigInt::from)
+        self.inner.synced_through(index as u8).map(BigInt::from)
     }
 
     #[napi(getter)]

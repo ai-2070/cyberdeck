@@ -83,12 +83,8 @@ impl StandbyGroup {
             .map_err(|_| GroupError::FactoryNotFound(kind.to_string()))?;
         let scheduler = runtime.scheduler_arc();
         let registry = runtime.registry_arc();
-        let core = CoreStandbyGroup::spawn(
-            config.into(),
-            move || (factory)(),
-            &scheduler,
-            &registry,
-        )?;
+        let core =
+            CoreStandbyGroup::spawn(config.into(), move || (factory)(), &scheduler, &registry)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(core)),
             runtime: runtime.clone(),
@@ -155,12 +151,7 @@ impl StandbyGroup {
         let scheduler = self.runtime.scheduler_arc();
         let registry = self.runtime.registry_arc();
         let mut guard = self.inner.lock().expect("StandbyGroup mutex poisoned");
-        Ok(guard.on_node_failure(
-            failed_node_id,
-            move || (factory)(),
-            &scheduler,
-            &registry,
-        )?)
+        Ok(guard.on_node_failure(failed_node_id, move || (factory)(), &scheduler, &registry)?)
     }
 
     pub fn on_node_recovery(&self, recovered_node_id: u64) {

@@ -905,6 +905,130 @@ int                     net_compute_migration_handle_cancel(
     net_compute_migration_handle_t* handle,
     char** err_out);
 
+/* Test-only helper — injects a synthetic capability announcement
+ * into the mesh's capability index so group tests can stage
+ * multi-candidate placement without a real handshake. */
+void net_compute_test_inject_synthetic_peer(
+    net_compute_mesh_arc_t* mesh_arc, uint64_t node_id);
+
+/* =========================================================================
+ * Groups — Stage 4 of SDK_GROUPS_SURFACE_PLAN.md.
+ *
+ * `ReplicaGroup` / `ForkGroup` / `StandbyGroup` overlays on top of
+ * `DaemonRuntime`. Errors use the stable prefix
+ * `group: <kind>[: <detail>]`, where `<kind>` is one of:
+ *   `not-ready` | `factory-not-found` | `no-healthy-member` |
+ *   `placement-failed` | `registry-failed` | `invalid-config` |
+ *   `daemon`
+ * ========================================================================= */
+
+typedef struct net_compute_replica_group_s  net_compute_replica_group_t;
+typedef struct net_compute_fork_group_s     net_compute_fork_group_t;
+typedef struct net_compute_standby_group_s  net_compute_standby_group_t;
+
+/* --- ReplicaGroup --- */
+
+int  net_compute_replica_group_spawn(
+    net_compute_runtime_t* runtime,
+    const char* kind_ptr, size_t kind_len,
+    uint32_t replica_count,
+    const uint8_t* group_seed,
+    const char* lb_strategy_ptr, size_t lb_strategy_len,
+    uint64_t auto_snapshot_interval,
+    uint32_t max_log_entries,
+    net_compute_replica_group_t** out_handle,
+    char** err_out);
+
+void net_compute_replica_group_free(net_compute_replica_group_t* h);
+int  net_compute_replica_group_replica_count(const net_compute_replica_group_t* h);
+int  net_compute_replica_group_healthy_count(const net_compute_replica_group_t* h);
+uint32_t net_compute_replica_group_group_id(const net_compute_replica_group_t* h);
+
+/* status: 0=healthy 1=degraded 2=dead */
+int  net_compute_replica_group_health(
+    const net_compute_replica_group_t* h,
+    int* out_status, uint32_t* out_healthy, uint32_t* out_total);
+
+int  net_compute_replica_group_route_event(
+    const net_compute_replica_group_t* h,
+    const char* routing_key_ptr, size_t routing_key_len,
+    uint32_t* out_origin, char** err_out);
+
+int  net_compute_replica_group_scale_to(
+    const net_compute_replica_group_t* h,
+    uint32_t n, char** err_out);
+
+void net_compute_replica_group_on_node_recovery(
+    const net_compute_replica_group_t* h, uint64_t node_id);
+
+/* Returns JSON string; free with `net_compute_free_cstring`. */
+char* net_compute_replica_group_members_json(
+    const net_compute_replica_group_t* h);
+
+/* --- ForkGroup --- */
+
+int  net_compute_fork_group_spawn(
+    net_compute_runtime_t* runtime,
+    const char* kind_ptr, size_t kind_len,
+    uint32_t parent_origin,
+    uint64_t fork_seq,
+    uint32_t fork_count,
+    const char* lb_strategy_ptr, size_t lb_strategy_len,
+    uint64_t auto_snapshot_interval,
+    uint32_t max_log_entries,
+    net_compute_fork_group_t** out_handle,
+    char** err_out);
+
+void net_compute_fork_group_free(net_compute_fork_group_t* h);
+int  net_compute_fork_group_fork_count(const net_compute_fork_group_t* h);
+int  net_compute_fork_group_healthy_count(const net_compute_fork_group_t* h);
+uint32_t net_compute_fork_group_parent_origin(const net_compute_fork_group_t* h);
+uint64_t net_compute_fork_group_fork_seq(const net_compute_fork_group_t* h);
+/* Returns 1 if every fork's lineage verifies, 0 otherwise. */
+int  net_compute_fork_group_verify_lineage(const net_compute_fork_group_t* h);
+int  net_compute_fork_group_scale_to(
+    const net_compute_fork_group_t* h, uint32_t n, char** err_out);
+void net_compute_fork_group_on_node_recovery(
+    const net_compute_fork_group_t* h, uint64_t node_id);
+
+char* net_compute_fork_group_members_json(const net_compute_fork_group_t* h);
+char* net_compute_fork_group_fork_records_json(const net_compute_fork_group_t* h);
+
+/* --- StandbyGroup --- */
+
+int  net_compute_standby_group_spawn(
+    net_compute_runtime_t* runtime,
+    const char* kind_ptr, size_t kind_len,
+    uint32_t member_count,
+    const uint8_t* group_seed,
+    uint64_t auto_snapshot_interval,
+    uint32_t max_log_entries,
+    net_compute_standby_group_t** out_handle,
+    char** err_out);
+
+void net_compute_standby_group_free(net_compute_standby_group_t* h);
+int  net_compute_standby_group_member_count(const net_compute_standby_group_t* h);
+int  net_compute_standby_group_standby_count(const net_compute_standby_group_t* h);
+int  net_compute_standby_group_active_index(const net_compute_standby_group_t* h);
+uint32_t net_compute_standby_group_active_origin(const net_compute_standby_group_t* h);
+int  net_compute_standby_group_active_healthy(const net_compute_standby_group_t* h);
+uint32_t net_compute_standby_group_group_id(const net_compute_standby_group_t* h);
+int  net_compute_standby_group_buffered_event_count(const net_compute_standby_group_t* h);
+
+int  net_compute_standby_group_sync_standbys(
+    const net_compute_standby_group_t* h,
+    uint64_t* out_through, char** err_out);
+int  net_compute_standby_group_promote(
+    const net_compute_standby_group_t* h,
+    uint32_t* out_origin, char** err_out);
+void net_compute_standby_group_on_node_recovery(
+    const net_compute_standby_group_t* h, uint64_t node_id);
+
+char* net_compute_standby_group_members_json(const net_compute_standby_group_t* h);
+/* Returns "active" | "standby" (caller frees) or NULL for OOB. */
+char* net_compute_standby_group_member_role(
+    const net_compute_standby_group_t* h, uint32_t index);
+
 #ifdef __cplusplus
 }
 #endif

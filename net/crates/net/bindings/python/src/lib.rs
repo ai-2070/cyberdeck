@@ -11,6 +11,8 @@ mod cortex;
 mod capabilities;
 #[cfg(feature = "compute")]
 mod compute;
+#[cfg(feature = "groups")]
+mod groups;
 #[cfg(feature = "net")]
 mod identity;
 #[cfg(feature = "net")]
@@ -1674,6 +1676,34 @@ mod mesh_bindings {
                 .map_err(|e| PyRuntimeError::new_err(format!("capability: {}", e)))
         }
 
+        /// **Test-only** helper for the groups test suite.
+        /// Injects a synthetic capability announcement directly
+        /// into the local capability index, simulating a peer
+        /// announcement without going through a real handshake.
+        ///
+        /// Production code should NOT use this — the mesh's
+        /// normal `announce_capabilities` path is what peers
+        /// broadcast through at runtime. This exists so
+        /// `test_groups.py` can stage enough placement candidates
+        /// for `ReplicaGroup` / `ForkGroup` / `StandbyGroup`
+        /// `place_with_spread` calls without spinning up a 3-node
+        /// handshake in every test.
+        #[cfg(feature = "groups")]
+        fn _test_inject_synthetic_peer(&self, node_id: u64) -> PyResult<()> {
+            use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
+            use net::adapter::net::identity::EntityId;
+            let node = self.get_node()?;
+            let index = node.capability_index().clone();
+            let eid = EntityId::from_bytes([0u8; 32]);
+            index.index(CapabilityAnnouncement::new(
+                node_id,
+                eid,
+                1,
+                CapabilitySet::new(),
+            ));
+            Ok(())
+        }
+
         /// Query the local capability index. Returns node ids
         /// (including our own when we self-match) whose latest
         /// announcement matches `filter`.
@@ -1827,6 +1857,13 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
             "MigrationError",
             m.py().get_type::<compute::MigrationError>(),
         )?;
+    }
+    #[cfg(feature = "groups")]
+    {
+        m.add_class::<groups::PyReplicaGroup>()?;
+        m.add_class::<groups::PyForkGroup>()?;
+        m.add_class::<groups::PyStandbyGroup>()?;
+        m.add("GroupError", m.py().get_type::<groups::GroupError>())?;
     }
     Ok(())
 }
