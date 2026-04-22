@@ -730,6 +730,32 @@ pub struct CapabilityAnnouncement {
     /// omitted-when-zero form.
     #[serde(default, skip_serializing_if = "is_hop_count_zero")]
     pub hop_count: u8,
+    /// Observer-visible reflexive `SocketAddr` as seen by this
+    /// node's anchor peers during NAT classification. Populated
+    /// once [`crate::adapter::net::traversal::classify::ClassifyFsm`]
+    /// has ≥ 2 probe results; stays `None` on nodes that haven't
+    /// classified yet, ran with `nat-traversal` disabled, or
+    /// landed in the `Unknown` bucket (different peers disagree
+    /// on our port so no single address is truthful).
+    ///
+    /// **Peer usage.** Receivers cache this alongside the
+    /// `nat:*` tag and use it as the initial rendezvous target
+    /// for hole punching — one fewer reflex round-trip per
+    /// first-contact punch. The field is advisory: the punch
+    /// step still waits for a real keep-alive exchange on the
+    /// advertised address before handing off to the Noise
+    /// handshake, so a lying peer can only fail its own
+    /// incoming punches, not redirect traffic to a third party
+    /// (see `docs/NAT_TRAVERSAL_PLAN.md` §7 for the trust model).
+    ///
+    /// **Wire compat.** `skip_serializing_if` keeps the old
+    /// on-wire shape when the field is `None`, so pre-stage-2
+    /// nodes round-trip through a post-stage-2 deserializer
+    /// without breaking signatures. A post-stage-2 node
+    /// deserializing a pre-stage-2 announcement sees the field
+    /// default to `None` via `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflex_addr: Option<std::net::SocketAddr>,
 }
 
 /// Serde predicate: skip serializing `hop_count` when it's zero.
@@ -823,12 +849,26 @@ impl CapabilityAnnouncement {
             capabilities,
             signature: None,
             hop_count: 0,
+            reflex_addr: None,
         }
     }
 
     /// Set TTL
     pub fn with_ttl(mut self, ttl_secs: u32) -> Self {
         self.ttl_secs = ttl_secs;
+        self
+    }
+
+    /// Attach the classifier's observed reflex address. Typically
+    /// called by the mesh's capability-broadcast path after NAT
+    /// classification has completed at least two probes. Pass
+    /// `None` to clear a previously-set address — e.g. if
+    /// reclassification landed in `Unknown`.
+    ///
+    /// Included in the signed envelope: a post-signing change
+    /// invalidates verification.
+    pub fn with_reflex_addr(mut self, reflex: Option<std::net::SocketAddr>) -> Self {
+        self.reflex_addr = reflex;
         self
     }
 
@@ -1846,6 +1886,37 @@ mod tests {
     /// `CapabilityAnnouncement`'s derived Serialize writes in
     /// struct-declaration order. The mirror struct keeps the same
     /// serialization path.
+    #[test]
+    fn reflex_addr_roundtrips_through_serde_when_set() {
+        // Stage 2 of NAT traversal: `reflex_addr` rides the
+        // signed envelope when the classifier has an observed
+        // address. Round-trip must preserve it intact.
+        let reflex: std::net::SocketAddr = "198.51.100.5:54321".parse().unwrap();
+        let ann = CapabilityAnnouncement::new(1, test_entity(), 1, sample_capability_set())
+            .with_reflex_addr(Some(reflex));
+        let bytes = ann.to_bytes();
+        let restored = CapabilityAnnouncement::from_bytes(&bytes).expect("parse");
+        assert_eq!(restored.reflex_addr, Some(reflex));
+    }
+
+    #[test]
+    fn reflex_addr_none_is_omitted_from_wire_bytes() {
+        // The `skip_serializing_if = "Option::is_none"` on
+        // `reflex_addr` is what preserves on-wire byte-compat
+        // with pre-stage-2 announcements. The canonical bytes
+        // must not mention `reflex_addr` at all when it's None —
+        // otherwise pre-stage-2 nodes' signatures wouldn't
+        // verify on post-stage-2 nodes (same shape of
+        // compatibility guarantee as `hop_count`).
+        let ann = CapabilityAnnouncement::new(1, test_entity(), 1, sample_capability_set());
+        let bytes = ann.to_bytes();
+        let text = std::str::from_utf8(&bytes).expect("valid utf8");
+        assert!(
+            !text.contains("reflex_addr"),
+            "reflex_addr key must be omitted when the field is None; got: {text}",
+        );
+    }
+
     #[test]
     fn signed_payload_stays_compatible_with_pre_hop_count_format() {
         use super::super::super::identity::{EntityId, EntityKeypair};

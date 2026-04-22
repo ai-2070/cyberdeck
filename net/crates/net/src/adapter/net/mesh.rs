@@ -722,6 +722,27 @@ pub struct MeshNode {
     #[cfg(feature = "nat-traversal")]
     pending_reflex_probes:
         Arc<DashMap<u64, oneshot::Sender<std::net::SocketAddr>>>,
+    /// Current NAT classification, encoded via
+    /// [`super::traversal::classify::NatClass::as_u8`]. Starts as
+    /// `Unknown` (`0`) and is updated by the classification sweep
+    /// spawned in [`Self::start`]. Stored atomically so the
+    /// announce-capabilities hot path can read without locking.
+    #[cfg(feature = "nat-traversal")]
+    nat_class: Arc<std::sync::atomic::AtomicU8>,
+    /// Current reflex address (this node's public-facing
+    /// `SocketAddr` as observed by remote peers), or `None` until
+    /// the classification sweep has produced at least one reflex
+    /// observation. Piggybacks on outbound `CapabilityAnnouncement`
+    /// payloads so peers can attempt a direct connect without a
+    /// separate discovery round-trip.
+    #[cfg(feature = "nat-traversal")]
+    reflex_addr: Arc<ArcSwapOption<SocketAddr>>,
+    /// Traversal tunables — probe timeouts, classification
+    /// deadline, punch cadence, and port-mapping renewal interval.
+    /// Defaults match `docs/NAT_TRAVERSAL_PLAN.md`. Exposed via
+    /// `MeshBuilder` setters in stage 5; internal-only today.
+    #[cfg(feature = "nat-traversal")]
+    traversal_config: super::traversal::TraversalConfig,
     /// Capability index populated by inbound
     /// `SUBPROTOCOL_CAPABILITY_ANN` packets and the local
     /// `announce_capabilities` path. Self-index so single-node
@@ -953,6 +974,14 @@ impl MeshNode {
             pending_membership_acks: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
             pending_reflex_probes: Arc::new(DashMap::new()),
+            #[cfg(feature = "nat-traversal")]
+            nat_class: Arc::new(std::sync::atomic::AtomicU8::new(
+                super::traversal::classify::NatClass::Unknown.as_u8(),
+            )),
+            #[cfg(feature = "nat-traversal")]
+            reflex_addr: Arc::new(ArcSwapOption::empty()),
+            #[cfg(feature = "nat-traversal")]
+            traversal_config: super::traversal::TraversalConfig::default(),
             capability_index: Arc::new(CapabilityIndex::new()),
             seen_announcements: Arc::new(DashMap::new()),
             last_announce_at: Arc::new(parking_lot::Mutex::new(None)),
@@ -1326,6 +1355,76 @@ impl MeshNode {
             tasks.push(capability_gc_handle);
             tasks.push(token_sweep_handle);
         });
+    }
+
+    /// Spawn the NAT classification loop. Waits until at least 2
+    /// peers are connected, fires the initial sweep, then re-checks
+    /// periodically so a mid-session NAT rebind (e.g. gateway
+    /// reboot) gets picked up without operator intervention.
+    ///
+    /// Separate from [`Self::start`] because the loop needs an
+    /// `Arc<MeshNode>` to call [`Self::reclassify_nat`] across
+    /// `.await` points. Callers that hold a `MeshNode` behind an
+    /// `Arc` (SDK, FFI, all production paths) can spawn this
+    /// alongside `start` to get continuous classification; callers
+    /// that don't can call [`Self::reclassify_nat`] manually via
+    /// the `&self` surface.
+    ///
+    /// The loop is best-effort — it never returns an error surface
+    /// to the node, and a failed sweep leaves the previous
+    /// classification intact. Exits on `shutdown_notify`.
+    #[cfg(feature = "nat-traversal")]
+    pub fn spawn_nat_classify_loop(self: &Arc<Self>) -> JoinHandle<()> {
+        let node = Arc::clone(self);
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        let reclassify_interval = self.traversal_config.classify_deadline.saturating_mul(12);
+
+        tokio::spawn(async move {
+            // Poll loop: wait for ≥2 peers before the first sweep.
+            // The routed-handshake path seeds `peers` as each
+            // connect/accept lands, so the wait is bounded by how
+            // fast the operator hands us peers — not something we
+            // can tune from here.
+            let mut poll = tokio::time::interval(Duration::from_millis(200));
+            poll.tick().await; // skip the immediate first tick
+            loop {
+                if shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                tokio::select! {
+                    _ = shutdown_notify.notified() => return,
+                    _ = poll.tick() => {
+                        if node.peers.len() >= 2 {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Initial classification sweep — produces the first
+            // `nat:*` tag value that any subsequent announce can
+            // emit. Callers that want the tag on their very first
+            // announce should `await` this future before calling
+            // `announce_capabilities`.
+            node.reclassify_nat().await;
+
+            // Periodic re-check. `classify_deadline × 12` is long
+            // enough to be cheap (probe traffic is cheap but not
+            // free) and short enough that a gateway reboot is
+            // reflected in outbound announcements within ~1 min of
+            // the next re-announce.
+            let mut tick = tokio::time::interval(nonzero_interval(reclassify_interval));
+            tick.tick().await; // skip the immediate tick
+            while !shutdown.load(Ordering::Acquire) {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        node.reclassify_nat().await;
+                    }
+                    _ = shutdown_notify.notified() => break,
+                }
+            }
+        })
     }
 
     /// Spawn a periodic sweep that evicts expired entries from the
@@ -3869,6 +3968,28 @@ impl MeshNode {
         sign: bool,
     ) -> Result<(), AdapterError> {
         let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
+
+        // Piggyback the current NAT classification as a `nat:*`
+        // capability tag so peers can filter-match on NAT type,
+        // and the reflex address on the dedicated announcement
+        // field so peers have a direct-connect candidate without a
+        // separate discovery round-trip. Both are feature-gated on
+        // `nat-traversal` — callers compiled without the feature
+        // emit announcements identical to the pre-traversal format.
+        #[cfg(feature = "nat-traversal")]
+        let caps = {
+            use super::traversal::classify::NatClass;
+            let class = NatClass::from_u8(
+                self.nat_class.load(std::sync::atomic::Ordering::Acquire),
+            );
+            // Strip any prior `nat:*` tags before adding the fresh
+            // one so a reclassification doesn't leave a stale tag
+            // behind when the class transitions.
+            let mut next = caps;
+            next.tags.retain(|t| !t.starts_with("nat:"));
+            next.add_tag(class.tag().to_string())
+        };
+
         let mut ann = CapabilityAnnouncement::new(
             self.node_id,
             self.identity.entity_id().clone(),
@@ -3876,6 +3997,10 @@ impl MeshNode {
             caps,
         )
         .with_ttl(ttl.as_secs().min(u32::MAX as u64) as u32);
+        #[cfg(feature = "nat-traversal")]
+        {
+            ann = ann.with_reflex_addr(self.reflex_addr.load_full().map(|arc| *arc));
+        }
         if sign {
             ann.sign(&self.identity);
         }
@@ -4611,7 +4736,7 @@ impl MeshNode {
         &self,
         peer_node_id: u64,
     ) -> Result<std::net::SocketAddr, super::traversal::TraversalError> {
-        use super::traversal::{reflex, TraversalError, TraversalConfig};
+        use super::traversal::{reflex, TraversalError};
 
         let peer_addr = self
             .peer_addrs
@@ -4637,7 +4762,7 @@ impl MeshNode {
             return Err(TraversalError::Transport(e.to_string()));
         }
 
-        let timeout = TraversalConfig::default().reflex_timeout;
+        let timeout = self.traversal_config.reflex_timeout;
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(addr)) => Ok(addr),
             Ok(Err(_recv_err)) => {
@@ -4651,6 +4776,118 @@ impl MeshNode {
                 Err(TraversalError::ReflexTimeout)
             }
         }
+    }
+
+    /// The current NAT classification for this node. `Unknown`
+    /// until the classification sweep has run; updated atomically
+    /// by the sweep and by [`Self::reclassify_nat`]. Read-only for
+    /// external callers — the sweep is the only writer.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn nat_class(&self) -> super::traversal::classify::NatClass {
+        super::traversal::classify::NatClass::from_u8(
+            self.nat_class.load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    /// This node's public-facing `SocketAddr` as observed by a
+    /// remote peer during the classification sweep. `None` before
+    /// the first sweep has produced an observation. Exposed
+    /// primarily for tests + observability; the announce-
+    /// capabilities path piggybacks this value onto every signed
+    /// `CapabilityAnnouncement`.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn reflex_addr(&self) -> Option<std::net::SocketAddr> {
+        self.reflex_addr.load_full().map(|arc| *arc)
+    }
+
+    /// Fire the classification sweep. Picks up to two currently-
+    /// connected peers, runs [`Self::probe_reflex`] against each in
+    /// parallel, feeds the observations to
+    /// [`super::traversal::classify::ClassifyFsm`], and updates
+    /// `nat_class` + `reflex_addr` with the result.
+    ///
+    /// Runs at most one sweep at a time — a second call while a
+    /// sweep is in flight is a no-op. Exits early if fewer than 2
+    /// peers are currently connected; callers should check
+    /// [`Self::nat_class`] after the returned future completes to
+    /// see whether classification produced a definite verdict or
+    /// stayed at `Unknown`.
+    ///
+    /// Bounded by [`TraversalConfig::classify_deadline`] — even if
+    /// probes hang, the sweep returns within that window with
+    /// whatever observations arrived.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn reclassify_nat(&self) {
+        use super::traversal::classify::ClassifyFsm;
+
+        // Snapshot up to two peers. Two is enough to distinguish
+        // Cone vs. Symmetric (plan §2); sampling more adds probe
+        // traffic for no classification gain.
+        let peers: Vec<u64> = self
+            .peers
+            .iter()
+            .map(|e| *e.key())
+            .take(2)
+            .collect();
+        if peers.len() < 2 {
+            return;
+        }
+
+        // Fire probes in parallel so the sweep finishes in one
+        // reflex_timeout window rather than N*timeout. Each probe
+        // already respects its own timeout via `probe_reflex`.
+        let bind = self.local_addr();
+        let futures = peers
+            .iter()
+            .copied()
+            .map(|peer| async move {
+                let res = self.probe_reflex(peer).await;
+                (peer, res)
+            });
+        let deadline = self.traversal_config.classify_deadline;
+        let results = match tokio::time::timeout(
+            deadline,
+            futures::future::join_all(futures),
+        )
+        .await
+        {
+            Ok(results) => results,
+            Err(_elapsed) => {
+                // Classification-deadline blown. Leave current
+                // classification untouched — a later sweep can
+                // retry; treating deadline-expired as "Unknown"
+                // would flap state on a temporarily slow link.
+                tracing::debug!("nat-traversal: classify_deadline elapsed, keeping prior state");
+                return;
+            }
+        };
+
+        let mut fsm = ClassifyFsm::new();
+        let mut latest_reflex: Option<std::net::SocketAddr> = None;
+        for (peer, res) in results {
+            if let Ok(addr) = res {
+                fsm.observe(peer, addr);
+                latest_reflex = Some(addr);
+            }
+        }
+
+        let class = fsm.classify(bind);
+        self.nat_class
+            .store(class.as_u8(), std::sync::atomic::Ordering::Release);
+        if let Some(addr) = latest_reflex {
+            self.reflex_addr.store(Some(Arc::new(addr)));
+        }
+        tracing::debug!(
+            nat_class = ?class,
+            reflex = ?latest_reflex,
+            "nat-traversal: reclassified",
+        );
     }
 }
 
