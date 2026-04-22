@@ -154,22 +154,50 @@ pub enum PairAction {
 /// the other end's type.
 pub fn pair_action(local: NatClass, remote: NatClass) -> PairAction {
     use NatClass::*;
+    // Explicit 4×4 enumeration — one arm per matrix cell. The
+    // table above must be the ground truth: any change to a cell
+    // here is a wire-visible contract change, and a wildcard arm
+    // (like a previous `(Open, _) => Direct` version) can silently
+    // collapse two cells into one. A cubic review caught this for
+    // `Open × Symmetric` — the wildcard ate the `SinglePunch` cell
+    // and mapped it to `Direct`, letting punch-worthy pairs fall
+    // through to a direct connect that an open-to-symmetric pair
+    // can't actually complete without coordination.
     match (local, remote) {
-        // Open never needs a punch — it's directly reachable.
-        (Open, _) | (_, Open) => PairAction::Direct,
+        // Row: Open — publicly reachable. A symmetric peer still
+        // needs the coordinator to initiate outbound (reverse
+        // connect) because the symmetric side's outbound NAT
+        // allocation is per-destination and unpredictable.
+        (Open, Open) => PairAction::Direct,
+        (Open, Cone) => PairAction::Direct,
+        (Open, Symmetric) => PairAction::SinglePunch,
+        (Open, Unknown) => PairAction::Direct,
 
-        // Symmetric × Symmetric: punch is not reliable either way.
+        // Row: Cone — stable outbound mapping, punch against
+        // anything except a publicly-reachable peer is worthwhile.
+        (Cone, Open) => PairAction::Direct,
+        (Cone, Cone) => PairAction::SinglePunch,
+        (Cone, Symmetric) => PairAction::SinglePunch,
+        (Cone, Unknown) => PairAction::SinglePunch,
+
+        // Row: Symmetric — per-destination outbound mapping.
+        // Punch works against Open (reverse-connect semantics) or
+        // Cone (plan decision 8's one-shot); against another
+        // symmetric or an Unknown (likely symmetric) the punch
+        // can't land reliably, so skip.
+        (Symmetric, Open) => PairAction::SinglePunch,
+        (Symmetric, Cone) => PairAction::SinglePunch,
         (Symmetric, Symmetric) => PairAction::SkipPunch,
+        (Symmetric, Unknown) => PairAction::SkipPunch,
 
-        // Symmetric × Unknown (or vice versa): don't waste the
-        // coordinator round-trip; the symmetric side can't punch.
-        (Symmetric, Unknown) | (Unknown, Symmetric) => PairAction::SkipPunch,
-
-        // Cone × anything else (Cone, Symmetric, Unknown): worth
-        // a single-shot punch. Cone × Open is handled above.
-        (Cone, _) | (_, Cone) => PairAction::SinglePunch,
-
-        // Unknown × Unknown: attempt direct, fall back on failure.
+        // Row: Unknown — pre-classification. Treat as "attempt
+        // direct, fall back on first failure" for Open + Unknown;
+        // as a cone-like punch target for Cone; skip against
+        // Symmetric since the Unknown side can't contribute a
+        // reliable mapping.
+        (Unknown, Open) => PairAction::Direct,
+        (Unknown, Cone) => PairAction::SinglePunch,
+        (Unknown, Symmetric) => PairAction::SkipPunch,
         (Unknown, Unknown) => PairAction::Direct,
     }
 }
@@ -424,27 +452,49 @@ mod tests {
     }
 
     #[test]
-    fn pair_action_open_always_direct() {
-        // Open on either side = directly reachable; no punch
-        // needed. Stable across every remote classification,
-        // including Unknown.
-        for remote in [
-            NatClass::Open,
-            NatClass::Cone,
-            NatClass::Symmetric,
-            NatClass::Unknown,
-        ] {
+    fn pair_action_open_with_non_symmetric_is_direct() {
+        // Open is publicly reachable, so Open × {Open, Cone,
+        // Unknown} all resolve on the direct path. Open ×
+        // Symmetric is the one exception (covered separately) —
+        // the symmetric side can't be reached without
+        // coordination because its outbound NAT mapping is
+        // per-destination.
+        for peer in [NatClass::Open, NatClass::Cone, NatClass::Unknown] {
             assert_eq!(
-                pair_action(NatClass::Open, remote),
+                pair_action(NatClass::Open, peer),
                 PairAction::Direct,
-                "Open × {remote:?} should be Direct",
+                "Open × {peer:?} should be Direct",
             );
             assert_eq!(
-                pair_action(remote, NatClass::Open),
+                pair_action(peer, NatClass::Open),
                 PairAction::Direct,
-                "{remote:?} × Open should be Direct",
+                "{peer:?} × Open should be Direct",
             );
         }
+    }
+
+    /// Regression test for a cubic-flagged bug where `Open ×
+    /// Symmetric` was swallowed by a wildcard `(_ , Open) =>
+    /// Direct` arm and mis-classified as a direct connect.
+    ///
+    /// Direct won't work here: the symmetric side allocates a
+    /// per-destination outbound port, so a straight
+    /// A (open) → B (symmetric) connect hits a port B didn't
+    /// reserve for A. A coordinated single-shot punch — where R
+    /// tells B to initiate outbound to A's reflex — is the right
+    /// mechanism. Both directions must resolve to `SinglePunch`.
+    #[test]
+    fn pair_action_open_with_symmetric_is_single_punch() {
+        assert_eq!(
+            pair_action(NatClass::Open, NatClass::Symmetric),
+            PairAction::SinglePunch,
+            "Open × Symmetric needs coordinator-driven reverse connect",
+        );
+        assert_eq!(
+            pair_action(NatClass::Symmetric, NatClass::Open),
+            PairAction::SinglePunch,
+            "Symmetric × Open needs the same coordinator-driven flow",
+        );
     }
 
     #[test]
@@ -518,5 +568,63 @@ mod tests {
             pair_action(NatClass::Unknown, NatClass::Cone),
             PairAction::SinglePunch,
         );
+    }
+
+    /// Exhaustive regression test: pin every one of the 16 cells
+    /// of the pair-type matrix explicitly against the table in
+    /// the `pair_action` docstring + plan §3.
+    ///
+    /// Written after a cubic review caught `Open × Symmetric`
+    /// being silently collapsed to `Direct` by a wildcard arm.
+    /// The existing single-cell tests above covered common
+    /// pairs but left diagonal coverage to implicit reasoning;
+    /// this test makes every cell load-bearing so a wildcard-
+    /// introduced drift fails CI on the exact cell that
+    /// regressed, rather than hiding in a matching-but-wrong
+    /// arm.
+    ///
+    /// When updating the matrix, update **both** the doc table
+    /// above `pair_action` and this test's expected values —
+    /// they're two copies of the same contract.
+    #[test]
+    fn pair_action_matches_plan_matrix() {
+        use NatClass::*;
+        use PairAction::*;
+
+        // (local, remote) → expected action. Rows + columns
+        // match the doc table's row-major order.
+        let cases: &[(NatClass, NatClass, PairAction)] = &[
+            // Row: Open
+            (Open, Open, Direct),
+            (Open, Cone, Direct),
+            (Open, Symmetric, SinglePunch),
+            (Open, Unknown, Direct),
+            // Row: Cone
+            (Cone, Open, Direct),
+            (Cone, Cone, SinglePunch),
+            (Cone, Symmetric, SinglePunch),
+            (Cone, Unknown, SinglePunch),
+            // Row: Symmetric
+            (Symmetric, Open, SinglePunch),
+            (Symmetric, Cone, SinglePunch),
+            (Symmetric, Symmetric, SkipPunch),
+            (Symmetric, Unknown, SkipPunch),
+            // Row: Unknown
+            (Unknown, Open, Direct),
+            (Unknown, Cone, SinglePunch),
+            (Unknown, Symmetric, SkipPunch),
+            (Unknown, Unknown, Direct),
+        ];
+
+        // Sanity: we've covered all 16 cells.
+        assert_eq!(cases.len(), 16, "matrix has 16 cells (4 × 4)");
+
+        for &(local, remote, expected) in cases {
+            assert_eq!(
+                pair_action(local, remote),
+                expected,
+                "pair_action({local:?}, {remote:?})",
+            );
+        }
     }
 }

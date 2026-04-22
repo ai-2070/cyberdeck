@@ -28,26 +28,16 @@ use std::time::Duration;
 
 use net::adapter::net::traversal::TraversalError;
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
-use tokio::net::UdpSocket;
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
 
-async fn find_ports(n: usize) -> Vec<u16> {
-    let mut ports = Vec::with_capacity(n);
-    let mut sockets = Vec::with_capacity(n);
-    for _ in 0..n {
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        ports.push(sock.local_addr().unwrap().port());
-        sockets.push(sock);
-    }
-    drop(sockets);
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    ports
-}
-
-fn test_config(port: u16) -> MeshNodeConfig {
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+/// Bind address helper. Uses port 0 so the OS picks a free
+/// ephemeral port — no pre-bind reservation, no TOCTOU race.
+/// Callers read the actually-bound address via
+/// `MeshNode::local_addr` after construction.
+fn test_config() -> MeshNodeConfig {
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut cfg = MeshNodeConfig::new(addr, PSK)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))
@@ -59,8 +49,8 @@ fn test_config(port: u16) -> MeshNodeConfig {
     cfg
 }
 
-async fn build_node(port: u16) -> Arc<MeshNode> {
-    let cfg = test_config(port);
+async fn build_node() -> Arc<MeshNode> {
+    let cfg = test_config();
     let keypair = EntityKeypair::generate();
     Arc::new(MeshNode::new(keypair, cfg).await.expect("MeshNode::new"))
 }
@@ -88,9 +78,8 @@ async fn handshake(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
 /// (localhost has no NAT, so the UDP source equals the bind addr).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reflex_probe_returns_observed_source_address() {
-    let ports = find_ports(2).await;
-    let a = build_node(ports[0]).await;
-    let b = build_node(ports[1]).await;
+    let a = build_node().await;
+    let b = build_node().await;
     handshake(&a, &b).await;
 
     let a_bind = a.local_addr();
@@ -112,8 +101,7 @@ async fn reflex_probe_returns_observed_source_address() {
 /// `PeerNotReachable` — no timeout wait, no socket traffic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reflex_probe_unknown_peer_fails_fast() {
-    let ports = find_ports(1).await;
-    let a = build_node(ports[0]).await;
+    let a = build_node().await;
     a.start();
 
     let bogus_node_id: u64 = 0xDEAD_BEEF_FEED_CAFE;
@@ -144,9 +132,8 @@ async fn reflex_probe_unknown_peer_fails_fast() {
 /// works but the initiator role doesn't (or vice versa).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reflex_probe_is_bidirectional() {
-    let ports = find_ports(2).await;
-    let a = build_node(ports[0]).await;
-    let b = build_node(ports[1]).await;
+    let a = build_node().await;
+    let b = build_node().await;
     handshake(&a, &b).await;
 
     let a_bind = a.local_addr();

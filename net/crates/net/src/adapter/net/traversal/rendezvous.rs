@@ -39,7 +39,7 @@
 //!   future migration can share the codec without a wire bump.
 //! - Multi-byte integers are big-endian.
 //!
-//! ## PunchRequest body (12 + 19 = 31 bytes)
+//! ## PunchRequest body (8 + 19 = 27 bytes)
 //!
 //! ```text
 //! ┌──────────────────┬─────────────────────────────┐
@@ -456,6 +456,69 @@ mod tests {
             Some(RendezvousMsg::PunchRequest(out)) => assert_eq!(out, req),
             other => panic!("expected PunchRequest, got {other:?}"),
         }
+    }
+
+    /// Byte-level regression test for the [`PunchRequest`] wire
+    /// layout + the size math in the module doc header.
+    ///
+    /// History: the doc used to claim `PunchRequest body (12 + 19 =
+    /// 31 bytes)`, which was wrong twice over — the body is
+    /// `target_node(8) + self_reflex(19) = 27 bytes`, and the
+    /// total on-wire payload is `kind(1) + 27 = 28 bytes`
+    /// ([`PUNCH_REQUEST_LEN`]). A reviewer flagged the doc
+    /// inconsistency; this test pins the layout so the doc and
+    /// code can't drift silently again.
+    ///
+    /// Assertions:
+    ///
+    /// - Total length is `PUNCH_REQUEST_LEN` (28 bytes).
+    /// - Byte 0 is the kind discriminator (`KIND_PUNCH_REQUEST = 0x01`).
+    /// - Bytes 1..9 are `target_node` as big-endian u64.
+    /// - Bytes 9..28 are the 19-byte `self_reflex` socket-addr
+    ///   block (family byte + 16-byte address + big-endian port).
+    ///   For IPv4 the address block is zero-padded in its upper
+    ///   12 bytes — same shape as `reflex::encode_response`.
+    #[test]
+    fn punch_request_wire_layout_matches_doc() {
+        let req = PunchRequest {
+            target: 0x0102_0304_0506_0708,
+            self_reflex: sa("192.0.2.7:9001"),
+        };
+        let encoded = RendezvousMsg::PunchRequest(req).encode();
+
+        // Size matches PUNCH_REQUEST_LEN and the documented
+        // "body (8 + 19 = 27) + kind (1) = 28" math.
+        assert_eq!(encoded.len(), PUNCH_REQUEST_LEN, "total wire length");
+        assert_eq!(PUNCH_REQUEST_LEN, 28, "kind(1) + body(27)");
+        assert_eq!(
+            PUNCH_REQUEST_LEN - 1,
+            27,
+            "body = 8 (target) + 19 (self_reflex)",
+        );
+
+        // Byte 0: kind discriminator.
+        assert_eq!(encoded[0], 0x01, "kind byte = KIND_PUNCH_REQUEST");
+
+        // Bytes 1..9: target_node big-endian.
+        assert_eq!(
+            &encoded[1..9],
+            &0x0102_0304_0506_0708_u64.to_be_bytes(),
+            "target_node big-endian at offset 1",
+        );
+
+        // Bytes 9..28: self_reflex socket-addr block (family + 16 + port).
+        assert_eq!(encoded[9], FAMILY_V4, "family byte at offset 9");
+        assert_eq!(&encoded[10..14], &[192, 0, 2, 7], "IPv4 in low 4 bytes");
+        assert_eq!(
+            &encoded[14..26],
+            &[0u8; 12],
+            "upper 12 bytes of address field zero-padded for IPv4",
+        );
+        assert_eq!(
+            &encoded[26..28],
+            &9001_u16.to_be_bytes(),
+            "port big-endian at offset 26",
+        );
     }
 
     #[test]

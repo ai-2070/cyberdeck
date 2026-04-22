@@ -45,21 +45,10 @@ use tokio::net::UdpSocket;
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
 
-async fn find_ports(n: usize) -> Vec<u16> {
-    let mut ports = Vec::with_capacity(n);
-    let mut sockets = Vec::with_capacity(n);
-    for _ in 0..n {
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        ports.push(sock.local_addr().unwrap().port());
-        sockets.push(sock);
-    }
-    drop(sockets);
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    ports
-}
-
-fn test_config(port: u16) -> MeshNodeConfig {
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+/// Bind via `127.0.0.1:0` so the OS picks a free port — no
+/// pre-bind reservation, no TOCTOU race with parallel tests.
+fn test_config() -> MeshNodeConfig {
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut cfg = MeshNodeConfig::new(addr, PSK)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))
@@ -71,9 +60,9 @@ fn test_config(port: u16) -> MeshNodeConfig {
     cfg
 }
 
-async fn build_node(port: u16) -> Arc<MeshNode> {
+async fn build_node() -> Arc<MeshNode> {
     Arc::new(
-        MeshNode::new(EntityKeypair::generate(), test_config(port))
+        MeshNode::new(EntityKeypair::generate(), test_config())
             .await
             .expect("MeshNode::new"),
     )
@@ -96,12 +85,11 @@ async fn connect_pair(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
 }
 
 async fn rendezvous_topology(
-    ports: &[u16],
 ) -> (Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>) {
-    let a = build_node(ports[0]).await;
-    let r = build_node(ports[1]).await;
-    let b = build_node(ports[2]).await;
-    let x = build_node(ports[3]).await;
+    let a = build_node().await;
+    let r = build_node().await;
+    let b = build_node().await;
+    let x = build_node().await;
     connect_pair(&a, &r).await;
     connect_pair(&b, &r).await;
     connect_pair(&a, &x).await;
@@ -154,8 +142,7 @@ fn keepalive_codec_round_trips() {
 /// end-to-end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keepalive_triggers_ack_via_observer() {
-    let ports = find_ports(4).await;
-    let (a, r, b, _x) = rendezvous_topology(&ports).await;
+    let (a, r, b, _x) = rendezvous_topology().await;
 
     a.reclassify_nat().await;
     b.reclassify_nat().await;
@@ -223,8 +210,7 @@ async fn keepalive_triggers_ack_via_observer() {
 /// after the bogus packet arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_keepalive_is_ignored_not_fatal() {
-    let ports = find_ports(1).await;
-    let a = build_node(ports[0]).await;
+    let a = build_node().await;
     a.start();
 
     // Bind a local socket and send a 14-byte packet with the

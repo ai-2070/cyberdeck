@@ -31,26 +31,14 @@ use std::time::Duration;
 use net::adapter::net::traversal::classify::NatClass;
 use net::adapter::net::traversal::portmap::{MockPortMapperClient, PortMapping, Protocol};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
-use tokio::net::UdpSocket;
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
 
-async fn find_ports(n: usize) -> Vec<u16> {
-    let mut ports = Vec::with_capacity(n);
-    let mut sockets = Vec::with_capacity(n);
-    for _ in 0..n {
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        ports.push(sock.local_addr().unwrap().port());
-        sockets.push(sock);
-    }
-    drop(sockets);
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    ports
-}
-
-fn base_config(port: u16) -> MeshNodeConfig {
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+/// Bind via `127.0.0.1:0` so the OS picks a free port — no
+/// pre-bind reservation, no TOCTOU race with parallel tests.
+fn base_config() -> MeshNodeConfig {
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut cfg = MeshNodeConfig::new(addr, PSK)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))
@@ -74,8 +62,7 @@ async fn build_node(cfg: MeshNodeConfig) -> Arc<MeshNode> {
 /// spawned. Stats show inactive; reflex untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_port_mapping_when_flag_unset() {
-    let ports = find_ports(1).await;
-    let node = build_node(base_config(ports[0])).await;
+    let node = build_node(base_config()).await;
     node.start();
 
     // No time to spawn anything — the flag is unset.
@@ -97,8 +84,7 @@ async fn no_port_mapping_when_flag_unset() {
 /// returns the mapped address (override is active).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_spawn_install_pins_reflex_override() {
-    let ports = find_ports(1).await;
-    let mut cfg = base_config(ports[0]);
+    let mut cfg = base_config();
     // Short renewal so the mock queue turns over fast in this test.
     cfg.heartbeat_interval = Duration::from_millis(100);
     let node = build_node(cfg).await;
@@ -107,7 +93,7 @@ async fn explicit_spawn_install_pins_reflex_override() {
     let external: SocketAddr = "198.51.100.11:54321".parse().unwrap();
     let mapping = PortMapping {
         external,
-        internal_port: ports[0],
+        internal_port: node.local_addr().port(),
         ttl: Duration::from_secs(3600),
         protocol: Protocol::Upnp,
     };

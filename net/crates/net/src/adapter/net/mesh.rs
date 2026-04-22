@@ -3897,16 +3897,26 @@ impl MeshNode {
         let deadline = ctx.traversal_config.punch_deadline;
         let punch_observers = ctx.punch_observers.clone();
 
-        // Keep-alive sender task: fires at each offset from the
-        // spawn time. The observer task (below) runs in parallel
-        // and races the deadline.
+        // Keep-alive sender task: fires three packets at
+        // absolute offsets from the spawn instant. Each
+        // `offsets[i]` is the intended delay from `start`, not
+        // from the previous iteration — `sleep_until(start + offset)`
+        // keeps the schedule anchored so a slow `send_to` on
+        // packet N doesn't push packet N+1 past its deadline.
+        //
+        // History: an earlier revision did `sleep(offset)` in
+        // the loop, which cumulatively summed to 500 / 1100 /
+        // 1850 ms instead of 500 / 600 / 750 ms at the default
+        // fire_lead — the later packets missed the peer's punch
+        // window entirely. cubic flagged this as P1.
         let keepalive_payload = encode_keepalive(&Keepalive {
             sender_node_id: local_node_id,
             punch_id: 0, // reserved; no generator wiring yet
         });
         tokio::spawn(async move {
+            let start = tokio::time::Instant::now();
             for offset in offsets {
-                tokio::time::sleep(offset).await;
+                tokio::time::sleep_until(start + offset).await;
                 let _ = socket_send
                     .send_to(&keepalive_payload[..], peer_reflex)
                     .await;

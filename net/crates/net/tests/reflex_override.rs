@@ -42,26 +42,13 @@ use std::time::Duration;
 use net::adapter::net::behavior::capability::CapabilitySet;
 use net::adapter::net::traversal::classify::NatClass;
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
-use tokio::net::UdpSocket;
-
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
 
-async fn find_ports(n: usize) -> Vec<u16> {
-    let mut ports = Vec::with_capacity(n);
-    let mut sockets = Vec::with_capacity(n);
-    for _ in 0..n {
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        ports.push(sock.local_addr().unwrap().port());
-        sockets.push(sock);
-    }
-    drop(sockets);
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    ports
-}
-
-fn test_config(port: u16) -> MeshNodeConfig {
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+/// Bind via `127.0.0.1:0` so the OS picks a free port — no
+/// pre-bind reservation, no TOCTOU race with parallel tests.
+fn test_config() -> MeshNodeConfig {
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut cfg = MeshNodeConfig::new(addr, PSK)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))
@@ -73,8 +60,8 @@ fn test_config(port: u16) -> MeshNodeConfig {
     cfg
 }
 
-async fn build_mesh_with_override(port: u16, external: SocketAddr) -> Arc<MeshNode> {
-    let cfg = test_config(port).with_reflex_override(external);
+async fn build_mesh_with_override(external: SocketAddr) -> Arc<MeshNode> {
+    let cfg = test_config().with_reflex_override(external);
     Arc::new(
         MeshNode::new(EntityKeypair::generate(), cfg)
             .await
@@ -82,8 +69,8 @@ async fn build_mesh_with_override(port: u16, external: SocketAddr) -> Arc<MeshNo
     )
 }
 
-async fn build_mesh_plain(port: u16) -> Arc<MeshNode> {
-    let cfg = test_config(port);
+async fn build_mesh_plain() -> Arc<MeshNode> {
+    let cfg = test_config();
     Arc::new(
         MeshNode::new(EntityKeypair::generate(), cfg)
             .await
@@ -113,9 +100,8 @@ async fn connect_pair(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
 /// probes happened — the override is load-bearing at init time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn override_forces_open_at_construction() {
-    let ports = find_ports(1).await;
     let external: SocketAddr = "203.0.113.42:9001".parse().unwrap();
-    let node = build_mesh_with_override(ports[0], external).await;
+    let node = build_mesh_with_override(external).await;
 
     assert_eq!(
         node.nat_class(),
@@ -133,11 +119,10 @@ async fn override_forces_open_at_construction() {
 /// with enough peers to run the sweep, the override is preserved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reclassify_is_noop_when_override_set() {
-    let ports = find_ports(3).await;
     let external: SocketAddr = "203.0.113.42:9001".parse().unwrap();
-    let a = build_mesh_with_override(ports[0], external).await;
-    let b = build_mesh_plain(ports[1]).await;
-    let c = build_mesh_plain(ports[2]).await;
+    let a = build_mesh_with_override(external).await;
+    let b = build_mesh_plain().await;
+    let c = build_mesh_plain().await;
 
     connect_pair(&a, &b).await;
     connect_pair(&a, &c).await;
@@ -163,10 +148,9 @@ async fn reclassify_is_noop_when_override_set() {
 /// A's reflex, not A's bind address.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn override_propagates_through_capability_broadcast() {
-    let ports = find_ports(2).await;
     let external: SocketAddr = "198.51.100.7:54321".parse().unwrap();
-    let a = build_mesh_with_override(ports[0], external).await;
-    let b = build_mesh_plain(ports[1]).await;
+    let a = build_mesh_with_override(external).await;
+    let b = build_mesh_plain().await;
 
     connect_pair(&a, &b).await;
     a.start();
@@ -209,10 +193,9 @@ async fn override_propagates_through_capability_broadcast() {
 /// becomes a no-op.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_set_reflex_override_flips_open() {
-    let ports = find_ports(3).await;
-    let a = build_mesh_plain(ports[0]).await;
-    let b = build_mesh_plain(ports[1]).await;
-    let c = build_mesh_plain(ports[2]).await;
+    let a = build_mesh_plain().await;
+    let b = build_mesh_plain().await;
+    let c = build_mesh_plain().await;
 
     connect_pair(&a, &b).await;
     connect_pair(&a, &c).await;
@@ -248,10 +231,9 @@ async fn runtime_set_reflex_override_flips_open() {
 /// mesh doesn't keep advertising a defunct reflex.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_clear_reflex_override_resumes_classifier() {
-    let ports = find_ports(3).await;
-    let a = build_mesh_plain(ports[0]).await;
-    let b = build_mesh_plain(ports[1]).await;
-    let c = build_mesh_plain(ports[2]).await;
+    let a = build_mesh_plain().await;
+    let b = build_mesh_plain().await;
+    let c = build_mesh_plain().await;
 
     connect_pair(&a, &b).await;
     connect_pair(&a, &c).await;
@@ -283,8 +265,7 @@ async fn runtime_clear_reflex_override_resumes_classifier() {
 /// without first checking state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_clear_is_noop_when_no_override() {
-    let ports = find_ports(1).await;
-    let a = build_mesh_plain(ports[0]).await;
+    let a = build_mesh_plain().await;
 
     // State before: Unknown / None.
     assert_eq!(a.nat_class(), NatClass::Unknown);
@@ -303,10 +284,9 @@ async fn runtime_clear_is_noop_when_no_override() {
 /// default path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_override_uses_classifier_path() {
-    let ports = find_ports(3).await;
-    let a = build_mesh_plain(ports[0]).await;
-    let b = build_mesh_plain(ports[1]).await;
-    let c = build_mesh_plain(ports[2]).await;
+    let a = build_mesh_plain().await;
+    let b = build_mesh_plain().await;
+    let c = build_mesh_plain().await;
 
     connect_pair(&a, &b).await;
     connect_pair(&a, &c).await;

@@ -37,26 +37,15 @@ use std::time::Duration;
 use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use net::adapter::net::traversal::classify::NatClass;
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
-use tokio::net::UdpSocket;
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
 
-async fn find_ports(n: usize) -> Vec<u16> {
-    let mut ports = Vec::with_capacity(n);
-    let mut sockets = Vec::with_capacity(n);
-    for _ in 0..n {
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        ports.push(sock.local_addr().unwrap().port());
-        sockets.push(sock);
-    }
-    drop(sockets);
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    ports
-}
-
-fn test_config(port: u16) -> MeshNodeConfig {
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+/// Bind via `127.0.0.1:0` so the OS picks a free port — no
+/// pre-bind reservation window, no TOCTOU race with parallel
+/// tests.
+fn test_config() -> MeshNodeConfig {
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut cfg = MeshNodeConfig::new(addr, PSK)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))
@@ -68,8 +57,8 @@ fn test_config(port: u16) -> MeshNodeConfig {
     cfg
 }
 
-async fn build_node(port: u16) -> Arc<MeshNode> {
-    let cfg = test_config(port);
+async fn build_node() -> Arc<MeshNode> {
+    let cfg = test_config();
     let keypair = EntityKeypair::generate();
     Arc::new(MeshNode::new(keypair, cfg).await.expect("MeshNode::new"))
 }
@@ -78,10 +67,10 @@ async fn build_node(port: u16) -> Arc<MeshNode> {
 /// both handshakes before starting the receive loops so a running
 /// A doesn't conflict with a second inbound accept. Returns the
 /// three started nodes.
-async fn three_node_star(ports: &[u16]) -> (Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>) {
-    let a = build_node(ports[0]).await;
-    let b = build_node(ports[1]).await;
-    let c = build_node(ports[2]).await;
+async fn three_node_star() -> (Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>) {
+    let a = build_node().await;
+    let b = build_node().await;
+    let c = build_node().await;
 
     // A ↔ B handshake
     {
@@ -127,9 +116,9 @@ async fn three_node_star(ports: &[u16]) -> (Arc<MeshNode>, Arc<MeshNode>, Arc<Me
 /// Two-node variant of the star helper. Same order-of-operations
 /// (handshake then start), kept as its own helper to keep the test
 /// bodies readable.
-async fn two_node_pair(ports: &[u16]) -> (Arc<MeshNode>, Arc<MeshNode>) {
-    let a = build_node(ports[0]).await;
-    let b = build_node(ports[1]).await;
+async fn two_node_pair() -> (Arc<MeshNode>, Arc<MeshNode>) {
+    let a = build_node().await;
+    let b = build_node().await;
     let a_id = a.node_id();
     let b_pub = *b.public_key();
     let b_addr = b.local_addr();
@@ -152,8 +141,7 @@ async fn two_node_pair(ports: &[u16]) -> (Arc<MeshNode>, Arc<MeshNode>) {
 /// should yield `Open` — reflex equals bind, no NAT in the path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reclassify_on_localhost_is_open() {
-    let ports = find_ports(3).await;
-    let (a, _b, _c) = three_node_star(&ports).await;
+    let (a, _b, _c) = three_node_star().await;
 
     // Pre-classification: atomic still at the Unknown default.
     assert_eq!(
@@ -184,8 +172,7 @@ async fn reclassify_on_localhost_is_open() {
 /// it via `find_peers_by_filter` on the `nat:*` tag.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nat_tag_propagates_through_capability_broadcast() {
-    let ports = find_ports(3).await;
-    let (a, b, _c) = three_node_star(&ports).await;
+    let (a, b, _c) = three_node_star().await;
 
     a.reclassify_nat().await;
     assert_eq!(a.nat_class(), NatClass::Open);
@@ -221,8 +208,7 @@ async fn nat_tag_propagates_through_capability_broadcast() {
 /// must not flip the atomic into a bogus state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reclassify_with_single_peer_stays_unknown() {
-    let ports = find_ports(2).await;
-    let (a, _b) = two_node_pair(&ports).await;
+    let (a, _b) = two_node_pair().await;
 
     a.reclassify_nat().await;
     assert_eq!(
@@ -241,8 +227,7 @@ async fn reclassify_with_single_peer_stays_unknown() {
 /// connected. No explicit `reclassify_nat` call required.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn background_classify_loop_seeds_state() {
-    let ports = find_ports(3).await;
-    let (a, _b, _c) = three_node_star(&ports).await;
+    let (a, _b, _c) = three_node_star().await;
 
     // The loop polls every 200 ms for ≥2 peers, so the first sweep
     // fires within that window after the handshakes finish.
