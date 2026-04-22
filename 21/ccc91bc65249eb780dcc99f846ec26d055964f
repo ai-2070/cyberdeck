@@ -1,0 +1,29 @@
+net/crates/net/src/adapter/net/mesh.rs
+  5bf3f089eecaef7a 772-778,1020-1021,4330-4496
+net/crates/net/tests/connect_direct.rs
+  5bf3f089eecaef7a 1-294
+net/crates/net/src/adapter/net/traversal/mod.rs
+  5bf3f089eecaef7a 60-146
+net/crates/net/src/adapter/net/traversal/classify.rs
+  5bf3f089eecaef7a 112-176,422-518
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "21ccc91bc65249eb780dcc99f846ec26d055964f",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 750,
+      "total_deletions": 30,
+      "accepted_lines": 723,
+      "overriden_lines": 0
+    }
+  }
+}
