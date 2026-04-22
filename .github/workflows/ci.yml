@@ -142,8 +142,15 @@ jobs:
       # redex + netdb via the binding's feature graph. Skip the
       # `redis` default — the Node suite doesn't hit it, and pulling
       # it in would need a service container.
+      #
+      # Invoke napi directly (not via `npm run build:debug`) because
+      # that script hard-codes `--features redis,net,cortex,compute`;
+      # appending a second `--features` flag makes cargo see a
+      # positional arg and fail. Calling napi explicitly gives us
+      # clean control over the feature set.
       - name: Build native module
-        run: npm run build:debug -- --no-default-features --features net,cortex,compute
+        working-directory: net/crates/net/bindings/node
+        run: npx napi build --platform --no-default-features --features net,cortex,compute
 
       - name: Run tests
         run: npm test
