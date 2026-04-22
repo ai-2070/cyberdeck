@@ -1933,7 +1933,12 @@ mod mesh_bindings {
         pub fn peer_nat_type(&self, peer_node_id: BigInt) -> Result<String> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let (_, peer_id, _) = peer_node_id.get_u64();
+            // Validate sign + losslessness — raw `get_u64()`
+            // silently reinterprets negatives + truncates oversize
+            // BigInts, which could target the wrong peer on a
+            // malformed caller input. See `crate::common::bigint_u64`
+            // for the check.
+            let peer_id = crate::common::bigint_u64(peer_node_id)?;
             Ok(nat_class_to_string(node.peer_nat_class(peer_id)))
         }
 
@@ -1949,7 +1954,7 @@ mod mesh_bindings {
         pub async fn probe_reflex(&self, peer_node_id: BigInt) -> Result<String> {
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
-            let (_, peer_id, _) = peer_node_id.get_u64();
+            let peer_id = crate::common::bigint_u64(peer_node_id)?;
             node.probe_reflex(peer_id)
                 .await
                 .map(|addr| addr.to_string())
@@ -2020,8 +2025,12 @@ mod mesh_bindings {
             }
             let mut pubkey = [0u8; 32];
             pubkey.copy_from_slice(pubkey_bytes);
-            let (_, peer_id, _) = peer_node_id.get_u64();
-            let (_, coord_id, _) = coordinator.get_u64();
+            // Validate both ids before the async work — raw
+            // `get_u64()` would silently reinterpret negatives
+            // or truncate oversize values, picking the wrong
+            // peer or coordinator for the rendezvous.
+            let peer_id = crate::common::bigint_u64(peer_node_id)?;
+            let coord_id = crate::common::bigint_u64(coordinator)?;
             node.connect_direct(peer_id, &pubkey, coord_id)
                 .await
                 .map_err(traversal_err)?;

@@ -680,6 +680,62 @@ fn nonzero_interval(d: Duration) -> Duration {
     }
 }
 
+/// Race a punch-observer `oneshot::Receiver` against a deadline
+/// and handle cleanup of the shared `punch_observers` map with
+/// the correct semantics for each outcome. Returns `true` when
+/// the observer fired (caller should emit a `PunchAck`), `false`
+/// otherwise.
+///
+/// Three outcomes, each with a distinct cleanup rule:
+///
+/// - **`Ok(Ok(ka))`** — a matching keep-alive arrived and the
+///   receive loop fired our sender. Returns `true`; caller emits
+///   the ack. The receive loop already consumed the map entry
+///   via `remove` when it fired the oneshot, so no cleanup
+///   needed here.
+/// - **`Ok(Err(_))`** — our sender was dropped without firing.
+///   This happens when a newer observer replaced ours in the
+///   map (`DashMap::insert` drops the old value, which wakes
+///   our `rx` with `RecvError`). Returning without removing the
+///   key is load-bearing: removing would evict the replacement
+///   observer that's now legitimately in the map.
+/// - **`Err(_)`** — the deadline expired. Our sender is still
+///   in the map — if it had been replaced we'd be in the
+///   `Ok(Err)` branch above, not here. Remove our stale entry
+///   so a late keep-alive doesn't find it.
+///
+/// History: earlier revisions collapsed `Ok(Err)` and `Err(_)`
+/// into a single `remove`-in-both-cases arm, which evicted
+/// replacement observers. cubic flagged this as a P2. The
+/// three-arm split is tested in `await_punch_observer_outcome`'s
+/// unit tests below.
+#[cfg(feature = "nat-traversal")]
+async fn await_punch_observer_outcome(
+    obs_rx: tokio::sync::oneshot::Receiver<super::traversal::rendezvous::Keepalive>,
+    deadline: Duration,
+    punch_observers: &DashMap<
+        SocketAddr,
+        tokio::sync::oneshot::Sender<super::traversal::rendezvous::Keepalive>,
+    >,
+    peer_reflex: SocketAddr,
+) -> bool {
+    match tokio::time::timeout(deadline, obs_rx).await {
+        // Observer fired with a real keep-alive.
+        Ok(Ok(_ka)) => true,
+        // Sender was dropped — almost certainly replaced by a
+        // newer observer for the same peer_reflex. Leaving the
+        // map alone is correct: the replacement's sender is the
+        // current value and a remove would evict it.
+        Ok(Err(_)) => false,
+        // Deadline fired with our sender still in the map. Evict
+        // so a late keep-alive doesn't find a stale entry.
+        Err(_) => {
+            punch_observers.remove(&peer_reflex);
+            false
+        }
+    }
+}
+
 /// Rolling-window auth-failure tracker, one entry per peer.
 /// Lives behind a per-key `Mutex` so updates from concurrent
 /// subscribes don't race each other on the same peer's counter.
@@ -3924,44 +3980,46 @@ impl MeshNode {
         });
 
         // Observer task: waits for the receive loop to fire the
-        // oneshot. On success emits the PunchAck; on timeout
-        // evicts the observer and drops silently.
+        // oneshot. On success emits the PunchAck; on timeout /
+        // cancellation defers to `await_punch_observer_outcome`
+        // for cleanup so the map-eviction race against a
+        // replacement observer is handled in one place.
         tokio::spawn(async move {
-            match tokio::time::timeout(deadline, obs_rx).await {
-                Ok(Ok(_observed)) => {
-                    // Build + send the ack via the coordinator
-                    // session, same shape as the former
-                    // `send_punch_ack_via` helper.
-                    let ack_body = RendezvousMsg::PunchAck(PunchAck {
-                        from_peer: local_node_id,
-                        to_peer: peer,
-                        punch_id: 0,
-                    })
-                    .encode();
-                    let pool = coord_session.thread_local_pool();
-                    let mut builder = pool.get();
-                    let seq = {
-                        let stream = coord_session
-                            .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
-                        stream.next_tx_seq()
-                    };
-                    let events = vec![ack_body];
-                    let packet = builder.build_subprotocol(
-                        super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
-                        seq,
-                        &events,
-                        PacketFlags::NONE,
-                        super::traversal::SUBPROTOCOL_RENDEZVOUS,
-                    );
-                    let _ = socket_ack.send_to(&packet, coord_addr).await;
-                }
-                Ok(Err(_)) | Err(_) => {
-                    // Cancelled or timed out. Evict the observer
-                    // so a late keep-alive doesn't find a stale
-                    // entry; treat this as "punch failed."
-                    punch_observers.remove(&peer_reflex);
-                }
+            let outcome = await_punch_observer_outcome(
+                obs_rx,
+                deadline,
+                &punch_observers,
+                peer_reflex,
+            )
+            .await;
+            if !outcome {
+                return;
             }
+            // Observer fired — build + send the ack via the
+            // coordinator session, same shape as the former
+            // `send_punch_ack_via` helper.
+            let ack_body = RendezvousMsg::PunchAck(PunchAck {
+                from_peer: local_node_id,
+                to_peer: peer,
+                punch_id: 0,
+            })
+            .encode();
+            let pool = coord_session.thread_local_pool();
+            let mut builder = pool.get();
+            let seq = {
+                let stream = coord_session
+                    .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
+                stream.next_tx_seq()
+            };
+            let events = vec![ack_body];
+            let packet = builder.build_subprotocol(
+                super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                seq,
+                &events,
+                PacketFlags::NONE,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS,
+            );
+            let _ = socket_ack.send_to(&packet, coord_addr).await;
         });
     }
 
@@ -6024,8 +6082,38 @@ impl MeshNode {
         }
 
         let class = fsm.classify(bind);
-        self.nat_class
-            .store(class.as_u8(), std::sync::atomic::Ordering::Release);
+        self.commit_reclassify_observations(class, latest_reflex);
+    }
+
+    /// Commit the result of a classification sweep.
+    ///
+    /// Split out from [`Self::reclassify_nat`] so the
+    /// override-race guard is unit-testable without standing up
+    /// a full probe mesh. The guard fixes a cubic-flagged P1
+    /// bug: the entry-time check in `reclassify_nat` races with
+    /// any `set_reflex_override` call that lands *during* the
+    /// probe sweep — the flag flips false→true while we're
+    /// awaiting probe futures, and a blind commit would silently
+    /// stomp the fresh override with whatever the classifier
+    /// observed. A port-mapping install is a strong signal (we
+    /// have a known-public `external` address) that outranks
+    /// peer-probed reflex; clobbering it would demote the node
+    /// from Open back to whatever NAT class the probes inferred
+    /// and could re-advertise the wrong reflex to peers.
+    #[cfg(feature = "nat-traversal")]
+    fn commit_reclassify_observations(
+        &self,
+        class: super::traversal::classify::NatClass,
+        latest_reflex: Option<std::net::SocketAddr>,
+    ) {
+        use std::sync::atomic::Ordering;
+        if self.reflex_override_active.load(Ordering::Acquire) {
+            tracing::debug!(
+                "nat-traversal: reflex override installed mid-sweep, skipping commit"
+            );
+            return;
+        }
+        self.nat_class.store(class.as_u8(), Ordering::Release);
         if let Some(addr) = latest_reflex {
             self.reflex_addr.store(Some(Arc::new(addr)));
         }
@@ -6135,5 +6223,270 @@ impl Drop for MeshNode {
         self.shutdown.store(true, Ordering::Release);
         self.shutdown_notify.notify_waiters();
         self.router.stop();
+    }
+}
+
+#[cfg(all(test, feature = "nat-traversal"))]
+mod punch_observer_tests {
+    //! Tests for [`await_punch_observer_outcome`].
+    //!
+    //! Regression coverage for a cubic-flagged bug (P2): earlier
+    //! revisions collapsed the `Ok(Err(_))` (sender dropped) and
+    //! `Err(_)` (deadline) arms into a single `remove`-in-both
+    //! branch, which evicted replacement observers. Each test
+    //! below pins one of the three outcomes independently.
+    use super::*;
+    use crate::adapter::net::traversal::rendezvous::Keepalive;
+    use tokio::sync::oneshot;
+
+    fn sample_ka() -> Keepalive {
+        Keepalive {
+            sender_node_id: 0x1234,
+            punch_id: 0,
+        }
+    }
+
+    fn sample_peer() -> SocketAddr {
+        "198.51.100.5:9001".parse().unwrap()
+    }
+
+    /// Keep-alive fires before the deadline — outcome is `true`
+    /// (caller emits ack). The map entry was consumed by the
+    /// receive loop when it fired the oneshot, so the helper
+    /// doesn't need to remove anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fires_true_when_keepalive_arrives() {
+        let observers: DashMap<SocketAddr, oneshot::Sender<Keepalive>> = DashMap::new();
+        let peer = sample_peer();
+        let (tx, rx) = oneshot::channel();
+        observers.insert(peer, tx);
+
+        // Simulate the receive loop firing the oneshot: remove
+        // from the map + send the keepalive.
+        let (_, fired_tx) = observers.remove(&peer).unwrap();
+        fired_tx.send(sample_ka()).expect("send");
+
+        let result =
+            await_punch_observer_outcome(rx, Duration::from_secs(1), &observers, peer).await;
+        assert!(result, "keepalive arrival should return true");
+    }
+
+    /// Deadline expires while our sender is still the live value
+    /// in the map — helper must evict the stale entry so a late
+    /// keep-alive doesn't find it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeout_evicts_own_stale_entry() {
+        let observers: DashMap<SocketAddr, oneshot::Sender<Keepalive>> = DashMap::new();
+        let peer = sample_peer();
+        let (tx, rx) = oneshot::channel();
+        observers.insert(peer, tx);
+
+        // Very short deadline; nobody fires.
+        let result =
+            await_punch_observer_outcome(rx, Duration::from_millis(50), &observers, peer).await;
+        assert!(!result, "timeout should return false");
+        assert!(
+            !observers.contains_key(&peer),
+            "timeout should evict our own stale entry",
+        );
+    }
+
+    /// The cubic-flagged regression: a newer observer replaces
+    /// ours (our sender is dropped). Our task's `Ok(Err(_))` arm
+    /// must **not** remove the peer_reflex key — it would evict
+    /// the replacement observer that's the current live value
+    /// in the map.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sender_dropped_leaves_replacement_observer_intact() {
+        let observers: DashMap<SocketAddr, oneshot::Sender<Keepalive>> = DashMap::new();
+        let peer = sample_peer();
+
+        // Install observer A.
+        let (tx_a, rx_a) = oneshot::channel::<Keepalive>();
+        observers.insert(peer, tx_a);
+
+        // Install observer B via insert — this drops A's sender
+        // (the old value returned from the insert is dropped
+        // immediately). Now the map contains B's sender.
+        let (tx_b, _rx_b) = oneshot::channel::<Keepalive>();
+        observers.insert(peer, tx_b);
+        assert!(observers.contains_key(&peer), "B's sender in map");
+
+        // A's task runs the cleanup helper. A's rx_a sees
+        // RecvError (tx_a dropped), outcome is `Ok(Err(_))`.
+        let result =
+            await_punch_observer_outcome(rx_a, Duration::from_secs(5), &observers, peer).await;
+        assert!(!result, "sender-dropped path returns false");
+        assert!(
+            observers.contains_key(&peer),
+            "B's sender must still be in the map — A's cleanup must not evict",
+        );
+    }
+
+    /// Idempotent-by-peer check: after a timeout-eviction,
+    /// removing again is a no-op. Prevents a hypothetical
+    /// double-eviction regression where the helper called
+    /// `remove` on every cleanup path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeout_then_sender_drop_does_not_double_evict() {
+        let observers: DashMap<SocketAddr, oneshot::Sender<Keepalive>> = DashMap::new();
+        let peer = sample_peer();
+
+        // First task: install A, let it time out, evict.
+        let (tx_a, rx_a) = oneshot::channel::<Keepalive>();
+        observers.insert(peer, tx_a);
+        let r1 =
+            await_punch_observer_outcome(rx_a, Duration::from_millis(20), &observers, peer).await;
+        assert!(!r1);
+        assert!(!observers.contains_key(&peer));
+
+        // Second task: install B, drop B's sender via a fresh
+        // insert from C — simulates the "replacement" scenario
+        // but now for a different observer lineage.
+        let (tx_b, rx_b) = oneshot::channel::<Keepalive>();
+        observers.insert(peer, tx_b);
+        let (tx_c, _rx_c) = oneshot::channel::<Keepalive>();
+        observers.insert(peer, tx_c);
+
+        // B's task cleanup. Must NOT remove peer (C is live).
+        let r2 =
+            await_punch_observer_outcome(rx_b, Duration::from_secs(5), &observers, peer).await;
+        assert!(!r2);
+        assert!(
+            observers.contains_key(&peer),
+            "C's sender must remain after B's sender-dropped cleanup",
+        );
+    }
+}
+
+#[cfg(all(test, feature = "nat-traversal"))]
+mod reclassify_override_race_tests {
+    //! Regression coverage for a cubic-flagged P1 bug:
+    //! [`MeshNode::reclassify_nat`] checked
+    //! `reflex_override_active` only at entry, then ran the
+    //! multi-peer probe sweep, then committed the result. A
+    //! `set_reflex_override` call landing *after* the entry
+    //! check but *before* the commit was silently stomped:
+    //! the commit unconditionally overwrote `nat_class` and
+    //! `reflex_addr` with the probe-derived values, undoing
+    //! the freshly-installed override.
+    //!
+    //! Fix: [`MeshNode::reclassify_nat`] now calls
+    //! [`MeshNode::commit_reclassify_observations`], which
+    //! re-loads the flag before any store and bails out if an
+    //! override landed mid-sweep. Tests below pin that guard
+    //! without needing to stand up a real probe mesh.
+    use super::*;
+    use crate::adapter::net::traversal::classify::NatClass;
+    use std::net::SocketAddr;
+
+    async fn build_node_for_test() -> Arc<MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x17u8; 32]);
+        Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        )
+    }
+
+    /// Pre-fix behavior: with override inactive, the commit
+    /// path overwrites both `nat_class` and `reflex_addr`.
+    /// This pins the positive case so the guard doesn't
+    /// silently turn into a no-op.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_applies_when_override_inactive() {
+        let node = build_node_for_test().await;
+        let probed: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+
+        // Override flag is false by default.
+        node.commit_reclassify_observations(NatClass::Cone, Some(probed));
+
+        assert_eq!(node.nat_class(), NatClass::Cone);
+        assert_eq!(node.reflex_addr(), Some(probed));
+    }
+
+    /// The race guard: flag flipped true mid-sweep →
+    /// commit must be a no-op. Without the fix the `nat_class`
+    /// store and the `reflex_addr` store would land regardless,
+    /// demoting the override-provided Open/external-ip back to
+    /// the classifier's observation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_skips_when_override_installed_mid_sweep() {
+        let node = build_node_for_test().await;
+        let override_addr: SocketAddr = "203.0.113.77:9999".parse().unwrap();
+        let probed: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+
+        // Simulate the race: `reclassify_nat` passed its entry
+        // check with the flag false, ran probes, and is about
+        // to commit. In between, port-mapping install fires
+        // `set_reflex_override` — the flag flips true and the
+        // reflex/class are written.
+        node.set_reflex_override(override_addr);
+        assert_eq!(node.nat_class(), NatClass::Open);
+        assert_eq!(node.reflex_addr(), Some(override_addr));
+
+        // Now the classifier's (stale) commit tries to land.
+        // With the guard in place, it must be skipped.
+        node.commit_reclassify_observations(NatClass::Symmetric, Some(probed));
+
+        assert_eq!(
+            node.nat_class(),
+            NatClass::Open,
+            "mid-sweep commit stomped the override's NAT class — \
+             the node would be demoted from Open back to Symmetric",
+        );
+        assert_eq!(
+            node.reflex_addr(),
+            Some(override_addr),
+            "mid-sweep commit stomped the override reflex — the \
+             node would advertise the classifier's observation \
+             instead of the known-public mapping",
+        );
+    }
+
+    /// Same guard, but the `latest_reflex = None` path — when
+    /// every probe failed, the buggy commit *still* wrote
+    /// `nat_class` (only the `reflex_addr` store was gated by
+    /// `Some`). The fix's guard covers both stores.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_skips_nat_class_store_even_when_reflex_absent() {
+        let node = build_node_for_test().await;
+        let override_addr: SocketAddr = "203.0.113.77:9999".parse().unwrap();
+
+        node.set_reflex_override(override_addr);
+
+        // Classifier gave up (all probes failed); it would
+        // still store `Unknown` without the guard.
+        node.commit_reclassify_observations(NatClass::Unknown, None);
+
+        assert_eq!(
+            node.nat_class(),
+            NatClass::Open,
+            "`nat_class` was overwritten with Unknown even though \
+             `latest_reflex` was None — demonstrates the second \
+             half of the bug that the bare `if let Some` would've \
+             missed",
+        );
+        assert_eq!(node.reflex_addr(), Some(override_addr));
+    }
+
+    /// After `clear_reflex_override` is called, the classifier
+    /// regains write access. Without this, the fix would
+    /// permanently freeze classification once any override had
+    /// ever been installed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_resumes_after_override_cleared() {
+        let node = build_node_for_test().await;
+        let override_addr: SocketAddr = "203.0.113.77:9999".parse().unwrap();
+        let probed: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+
+        node.set_reflex_override(override_addr);
+        node.clear_reflex_override();
+
+        node.commit_reclassify_observations(NatClass::Cone, Some(probed));
+
+        assert_eq!(node.nat_class(), NatClass::Cone);
+        assert_eq!(node.reflex_addr(), Some(probed));
     }
 }

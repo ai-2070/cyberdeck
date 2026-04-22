@@ -335,6 +335,12 @@ pub fn decode_response(data: &[u8]) -> Option<NatPmpResponse> {
 /// port (the map response itself only carries the port).
 pub struct NatPmpMapper {
     gateway: Ipv4Addr,
+    /// Gateway UDP port. Always [`NATPMP_PORT`] in production —
+    /// the field exists so tests can target a mock responder on
+    /// an unprivileged port without losing coverage of the real
+    /// `round_trip` path (the `connect`-based source-address
+    /// filter is the whole point of the spoof-rejection test).
+    target_port: u16,
     cached_external: Mutex<Option<Ipv4Addr>>,
 }
 
@@ -344,6 +350,20 @@ impl NatPmpMapper {
     pub fn new(gateway: Ipv4Addr) -> Self {
         Self {
             gateway,
+            target_port: NATPMP_PORT,
+            cached_external: Mutex::new(None),
+        }
+    }
+
+    /// Test-only constructor that lets the caller pin the
+    /// gateway port. Production code must keep using
+    /// [`NatPmpMapper::new`] so the wire destination stays at
+    /// the RFC 6886 port.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(gateway: Ipv4Addr, target_port: u16) -> Self {
+        Self {
+            gateway,
+            target_port,
             cached_external: Mutex::new(None),
         }
     }
@@ -368,19 +388,37 @@ impl NatPmpMapper {
     /// Send a request to the gateway and wait for a response,
     /// bounded by [`NATPMP_DEADLINE`]. Returns the raw response
     /// bytes.
+    ///
+    /// Uses `UdpSocket::connect` to pin the kernel-side accept
+    /// filter to `(gateway, NATPMP_PORT)`. Any packet from a
+    /// host other than the configured gateway — or from the
+    /// gateway but on a different source port — is silently
+    /// dropped by the kernel before it reaches `recv`. This
+    /// implements RFC 6886 §3.1's mandate that clients
+    /// "silently ignore any response from anywhere other than
+    /// the gateway IP address on port 5351," and prevents an
+    /// on-path attacker from spoofing a fake NAT-PMP success
+    /// reply with an attacker-controlled external address that
+    /// the mesh would then advertise as its reflex.
     async fn round_trip(&self, request: Bytes) -> Result<Vec<u8>, PortMappingError> {
         let sock = UdpSocket::bind("0.0.0.0:0")
             .await
             .map_err(|e| PortMappingError::Transport(e.to_string()))?;
-        let target = SocketAddr::new(IpAddr::V4(self.gateway), NATPMP_PORT);
-        sock.send_to(&request, target)
+        let target = SocketAddr::new(IpAddr::V4(self.gateway), self.target_port);
+        // Kernel-side source-address filter. After `connect`,
+        // `send`/`recv` only talk to `target`; packets from
+        // anywhere else are discarded without reaching our
+        // userland loop.
+        sock.connect(target)
+            .await
+            .map_err(|e| PortMappingError::Transport(e.to_string()))?;
+        sock.send(&request)
             .await
             .map_err(|e| PortMappingError::Transport(e.to_string()))?;
 
         let mut buf = [0u8; 64];
-        let (n, _from) = match tokio::time::timeout(NATPMP_DEADLINE, sock.recv_from(&mut buf)).await
-        {
-            Ok(Ok((n, addr))) => (n, addr),
+        let n = match tokio::time::timeout(NATPMP_DEADLINE, sock.recv(&mut buf)).await {
+            Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err(PortMappingError::Transport(e.to_string())),
             Err(_) => return Err(PortMappingError::Timeout),
         };
@@ -699,18 +737,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nat_pmp_mapper_probe_times_out_against_dead_gateway() {
         // Construct the real `NatPmpMapper` against a gateway
-        // IP that has no NAT-PMP responder. Verifies the full
-        // `PortMapperClient::probe` path (encode → UDP send →
-        // await response → deadline) without needing a mock
-        // that simulates success. Loopback with no listener
-        // guarantees the 1 s timeout fires.
+        // port with a bound-but-silent listener. Verifies the
+        // full `PortMapperClient::probe` path (encode → UDP
+        // send → await response → deadline) without needing a
+        // mock that simulates success.
         //
-        // Can't target `5351` on loopback without root on
-        // unix, but the real `NatPmpMapper::new(127.0.0.1)`
-        // still goes through the full send/timeout cycle —
-        // the send itself is a no-op on a closed port (UDP is
-        // connectionless) and the recv never fires.
-        let mapper = NatPmpMapper::new(Ipv4Addr::LOCALHOST);
+        // Subtlety: after the RFC 6886 §3.1 spoof-rejection
+        // fix, `round_trip` calls `UdpSocket::connect(gateway)`.
+        // On loopback, sending to a *closed* port surfaces an
+        // ICMP destination-unreachable as ECONNREFUSED —
+        // `recv` returns `Err` immediately instead of waiting
+        // for the deadline. That's correct kernel behavior,
+        // just not the "silent gateway" case we want to test.
+        // Binding a real socket (that never replies) keeps the
+        // port "alive" so the deadline path is what fires.
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent_port = silent.local_addr().unwrap().port();
+        let mapper = NatPmpMapper::new_for_test(Ipv4Addr::LOCALHOST, silent_port);
         assert_eq!(mapper.gateway(), Ipv4Addr::LOCALHOST);
 
         let start = tokio::time::Instant::now();
@@ -728,6 +771,7 @@ mod tests {
 
         // No response → cache stays empty.
         assert!(mapper.cached_external().is_none());
+        drop(silent);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -860,5 +904,119 @@ mod tests {
         };
         assert_eq!(mapping, (9001, 54321));
         gw.abort();
+    }
+
+    /// Regression test for a cubic-flagged P1 bug: the NAT-PMP
+    /// client accepted UDP responses from any source host/port,
+    /// letting an on-path attacker inject a fake success with an
+    /// attacker-chosen `external_ip`. The mesh would then
+    /// advertise that IP as its reflex, poisoning rendezvous
+    /// targets.
+    ///
+    /// RFC 6886 §3.1 requires clients to "silently ignore any
+    /// response from anywhere other than the gateway IP address
+    /// on port 5351." We implement that by calling
+    /// `UdpSocket::connect(gateway, target_port)` before
+    /// `recv` — the kernel drops packets from any other
+    /// `(ip, port)` pair before they reach userland.
+    ///
+    /// # Topology
+    ///
+    /// - **Gateway (silent):** binds an ephemeral loopback port.
+    ///   Swallows incoming requests without replying. Its port
+    ///   is what `NatPmpMapper::new_for_test` targets, so the
+    ///   connected socket's filter pins to that `(127.0.0.1, port)`.
+    /// - **Spoofer:** binds a *different* ephemeral loopback
+    ///   port. Watches the gateway's mailbox for the client's
+    ///   source address (which the spoofer can observe because
+    ///   the request went to the gateway, not to it — so we hand
+    ///   it the client's source explicitly via a channel the
+    ///   spoofer listens on), then races to send a forged
+    ///   external-address success from its own source port to
+    ///   the client.
+    ///
+    /// Simpler variant used here: the spoofer just blasts a
+    /// fake success to every ephemeral port in a tight range
+    /// around the mapper's likely source. Loopback is fast
+    /// enough that within the 1-second deadline the spoof
+    /// *would* land if the filter weren't working — the
+    /// pre-fix code accepted the first matching packet
+    /// regardless of source.
+    ///
+    /// # Assertion
+    ///
+    /// `probe()` times out (no packet passed the kernel filter)
+    /// and the cache stays empty. Without the `connect` call
+    /// the spoofed response would reach userland, decode as
+    /// success, and populate `cached_external` with the
+    /// attacker IP.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn round_trip_rejects_response_from_non_gateway_source() {
+        // Silent gateway — binds but never replies.
+        let gateway_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gateway_port = gateway_sock.local_addr().unwrap().port();
+
+        // Spoofer on a different ephemeral port. When the
+        // spoofer sees *anything*, it replies with a fake
+        // success. But we have no way to know the mapper's
+        // source port in advance — so instead we arrange for
+        // the gateway to forward incoming `(source_addr)`
+        // tuples to the spoofer over a channel, and the spoofer
+        // then sends the forged response back to that exact
+        // source port. This makes the spoof as directly
+        // targeted as possible — the only remaining defense is
+        // the `connect`-based filter on the mapper's socket.
+        let (src_tx, mut src_rx) = tokio::sync::mpsc::unbounded_channel::<SocketAddr>();
+        let gateway_handle = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            while let Ok((_n, from)) = gateway_sock.recv_from(&mut buf).await {
+                // Don't reply — just forward the source addr.
+                let _ = src_tx.send(from);
+            }
+        });
+
+        let spoofer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let spoofer_port = spoofer_sock.local_addr().unwrap().port();
+        assert_ne!(spoofer_port, gateway_port, "spoofer must use a different port");
+        let spoofer_handle = tokio::spawn(async move {
+            // Forge a success reply with an attacker-chosen IP.
+            // If this lands, the mapper would cache this as its
+            // external — that's the poisoning vector.
+            let forged = encode_external_success(Ipv4Addr::new(203, 0, 113, 66));
+            while let Some(client_src) = src_rx.recv().await {
+                // Blast the forged packet at the client. If the
+                // `connect` filter is working, this is dropped
+                // by the kernel before reaching `recv`.
+                let _ = spoofer_sock.send_to(&forged, client_src).await;
+            }
+        });
+
+        // The real `NatPmpMapper`, targeting the silent gateway's
+        // port. With the fix in place, its UDP socket is
+        // `connect()`ed to `(127.0.0.1, gateway_port)` so
+        // packets from the spoofer's port are filtered out.
+        let mapper = NatPmpMapper::new_for_test(Ipv4Addr::LOCALHOST, gateway_port);
+
+        let start = tokio::time::Instant::now();
+        let res = mapper.probe().await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(res, Err(PortMappingError::Timeout)),
+            "probe must time out — spoofed response should not leak through kernel filter; \
+             got {res:?} after {elapsed:?}",
+        );
+        assert!(
+            elapsed >= Duration::from_millis(800),
+            "timeout fired too early ({elapsed:?}); spoof may have short-circuited the deadline",
+        );
+        assert!(
+            mapper.cached_external().is_none(),
+            "external-IP cache must stay empty — if a spoofed IP landed here, the mesh would \
+             advertise the attacker's address as its reflex",
+        );
+
+        gateway_handle.abort();
+        spoofer_handle.abort();
     }
 }
