@@ -43,6 +43,23 @@ use net_sdk::compute::DaemonRuntime as SdkDaemonRuntime;
 
 const ERR_DAEMON_PREFIX: &str = "daemon:";
 
+/// Validate a caller-supplied `BigInt` before narrowing to `u64`.
+///
+/// `BigInt::get_u64()` returns `(signed, value, lossless)`; silently
+/// dropping either flag lets negative or `>u64::MAX` BigInts cross
+/// the boundary as garbage `u64`s — corrupting node IDs and config
+/// fields. Reject both with a `daemon: group: invalid-config` prefix
+/// so the TS side classifies them as `GroupError` with
+/// `kind: 'invalid-config'`.
+fn group_bigint_u64(field: &str, b: BigInt) -> Result<u64> {
+    crate::common::bigint_u64(b).map_err(|e| {
+        Error::from_reason(format!(
+            "{} group: invalid-config: {}: {}",
+            ERR_DAEMON_PREFIX, field, e.reason,
+        ))
+    })
+}
+
 fn group_err(e: SdkGroupError) -> Error {
     Error::from_reason(format!(
         "{} group: {}",
@@ -119,17 +136,20 @@ pub struct GroupHostConfigJs {
     pub max_log_entries: Option<u32>,
 }
 
-impl From<GroupHostConfigJs> for DaemonHostConfig {
-    fn from(js: GroupHostConfigJs) -> Self {
+impl GroupHostConfigJs {
+    /// Fallible conversion to the core `DaemonHostConfig`. Replaces
+    /// the prior `From` impl which silently accepted negative /
+    /// overflow BigInts on `auto_snapshot_interval`.
+    pub(crate) fn into_core(self) -> Result<DaemonHostConfig> {
         let mut cfg = DaemonHostConfig::default();
-        if let Some(v) = js.auto_snapshot_interval {
-            let (_, n, _) = v.get_u64();
-            cfg.auto_snapshot_interval = n;
+        if let Some(v) = self.auto_snapshot_interval {
+            cfg.auto_snapshot_interval =
+                group_bigint_u64("hostConfig.autoSnapshotInterval", v)?;
         }
-        if let Some(n) = js.max_log_entries {
+        if let Some(n) = self.max_log_entries {
             cfg.max_log_entries = n;
         }
-        cfg
+        Ok(cfg)
     }
 }
 
@@ -293,7 +313,7 @@ pub(crate) async fn spawn_replica_group(
         replica_count: config.replica_count as u8,
         group_seed: seed,
         lb_strategy: config.lb_strategy.into(),
-        host_config: config.host_config.map(Into::into).unwrap_or_default(),
+        host_config: match config.host_config { Some(h) => h.into_core()?, None => DaemonHostConfig::default() },
     };
     // `SdkReplicaGroup::spawn` is a sync function that invokes the
     // factory inline. Running it on this tokio worker (rather than
@@ -316,7 +336,7 @@ pub(crate) async fn spawn_fork_group(
     let cfg = SdkForkGroupConfig {
         fork_count: config.fork_count as u8,
         lb_strategy: config.lb_strategy.into(),
-        host_config: config.host_config.map(Into::into).unwrap_or_default(),
+        host_config: match config.host_config { Some(h) => h.into_core()?, None => DaemonHostConfig::default() },
     };
     let group =
         SdkForkGroup::fork(&runtime, &kind, parent_origin, fork_seq, cfg).map_err(group_err)?;
@@ -335,7 +355,7 @@ pub(crate) async fn spawn_standby_group(
     let cfg = SdkStandbyGroupConfig {
         member_count: config.member_count as u8,
         group_seed: seed,
-        host_config: config.host_config.map(Into::into).unwrap_or_default(),
+        host_config: match config.host_config { Some(h) => h.into_core()?, None => DaemonHostConfig::default() },
     };
     let group = SdkStandbyGroup::spawn(&runtime, &kind, cfg).map_err(group_err)?;
     Ok(StandbyGroup {
@@ -388,7 +408,7 @@ impl ReplicaGroup {
         failed_node_id: BigInt,
         kind: Option<String>,
     ) -> Result<Vec<u32>> {
-        let (_, node, _) = failed_node_id.get_u64();
+        let node = group_bigint_u64("failedNodeId", failed_node_id)?;
         let k = kind.unwrap_or_else(|| self.kind.clone());
         let inner = self.inner.clone();
         let replaced = inner.on_node_failure(node, &k).map_err(group_err)?;
@@ -396,9 +416,10 @@ impl ReplicaGroup {
     }
 
     #[napi]
-    pub fn on_node_recovery(&self, recovered_node_id: BigInt) {
-        let (_, node, _) = recovered_node_id.get_u64();
+    pub fn on_node_recovery(&self, recovered_node_id: BigInt) -> Result<()> {
+        let node = group_bigint_u64("recoveredNodeId", recovered_node_id)?;
         self.inner.on_node_recovery(node);
+        Ok(())
     }
 
     #[napi(getter)]
@@ -456,7 +477,7 @@ impl ForkGroup {
         failed_node_id: BigInt,
         kind: Option<String>,
     ) -> Result<Vec<u32>> {
-        let (_, node, _) = failed_node_id.get_u64();
+        let node = group_bigint_u64("failedNodeId", failed_node_id)?;
         let k = kind.unwrap_or_else(|| self.kind.clone());
         self.inner
             .clone()
@@ -466,9 +487,10 @@ impl ForkGroup {
     }
 
     #[napi]
-    pub fn on_node_recovery(&self, recovered_node_id: BigInt) {
-        let (_, node, _) = recovered_node_id.get_u64();
+    pub fn on_node_recovery(&self, recovered_node_id: BigInt) -> Result<()> {
+        let node = group_bigint_u64("recoveredNodeId", recovered_node_id)?;
         self.inner.on_node_recovery(node);
+        Ok(())
     }
 
     #[napi(getter)]
@@ -551,7 +573,7 @@ impl StandbyGroup {
         failed_node_id: BigInt,
         kind: Option<String>,
     ) -> Result<Option<u32>> {
-        let (_, node, _) = failed_node_id.get_u64();
+        let node = group_bigint_u64("failedNodeId", failed_node_id)?;
         let k = kind.unwrap_or_else(|| self.kind.clone());
         self.inner
             .clone()
@@ -560,9 +582,10 @@ impl StandbyGroup {
     }
 
     #[napi]
-    pub fn on_node_recovery(&self, recovered_node_id: BigInt) {
-        let (_, node, _) = recovered_node_id.get_u64();
+    pub fn on_node_recovery(&self, recovered_node_id: BigInt) -> Result<()> {
+        let node = group_bigint_u64("recoveredNodeId", recovered_node_id)?;
         self.inner.on_node_recovery(node);
+        Ok(())
     }
 
     #[napi(getter)]

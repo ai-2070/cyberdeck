@@ -51,6 +51,18 @@ fn daemon_err(msg: impl Into<String>) -> Error {
     Error::from_reason(format!("{} {}", ERR_DAEMON_PREFIX, msg.into()))
 }
 
+/// Validate a caller-supplied `BigInt` before narrowing to `u64`.
+///
+/// `BigInt::get_u64()` returns `(signed, value, lossless)`; silently
+/// discarding either flag lets a negative or `>u64::MAX` BigInt
+/// cross the FFI boundary as a garbage `u64` — corrupting daemon
+/// identifiers, sequence numbers, node IDs, or timeouts. Reject
+/// both with a `daemon:`-prefixed error so the TS side classifies
+/// them as `DaemonError`.
+fn daemon_bigint_u64(field: &str, b: BigInt) -> Result<u64> {
+    crate::common::bigint_u64(b).map_err(|e| daemon_err(format!("{}: {}", field, e.reason)))
+}
+
 /// Map an SDK `DaemonError` to a NAPI error with a stable
 /// machine-readable kind prefix for migration failures. TS side
 /// dispatches on the kind rather than parsing free-form messages.
@@ -499,7 +511,7 @@ impl DaemonRuntime {
         };
 
         let sdk_identity = identity.to_sdk_identity();
-        let sdk_config = config.map(DaemonHostConfig::from).unwrap_or_default();
+        let sdk_config = match config { Some(c) => c.into_core()?, None => DaemonHostConfig::default() };
         let runtime = self.inner.clone();
         let kind_label = kind.clone();
 
@@ -621,7 +633,7 @@ impl DaemonRuntime {
         };
 
         let sdk_identity = identity.to_sdk_identity();
-        let sdk_config = config.map(DaemonHostConfig::from).unwrap_or_default();
+        let sdk_config = match config { Some(c) => c.into_core()?, None => DaemonHostConfig::default() };
         let runtime = self.inner.clone();
         let kind_label = kind.clone();
 
@@ -667,7 +679,7 @@ impl DaemonRuntime {
         use bytes::Bytes as BytesType;
         use net::adapter::net::state::causal::CausalLink;
 
-        let (_sign, sequence, _lossless) = event.sequence.get_u64();
+        let sequence = daemon_bigint_u64("event.sequence", event.sequence)?;
         let core_event = CausalEvent {
             link: CausalLink {
                 origin_hash: event.origin_hash,
@@ -727,7 +739,7 @@ impl DaemonRuntime {
         fork_seq: BigInt,
         config: crate::groups::ForkGroupConfigJs,
     ) -> Result<crate::groups::ForkGroup> {
-        let (_, seq, _) = fork_seq.get_u64();
+        let seq = daemon_bigint_u64("forkSeq", fork_seq)?;
         crate::groups::spawn_fork_group(
             self.sdk_runtime().clone(),
             kind,
@@ -773,8 +785,8 @@ impl DaemonRuntime {
         source_node: BigInt,
         target_node: BigInt,
     ) -> Result<MigrationHandle> {
-        let (_, source, _) = source_node.get_u64();
-        let (_, target, _) = target_node.get_u64();
+        let source = daemon_bigint_u64("sourceNode", source_node)?;
+        let target = daemon_bigint_u64("targetNode", target_node)?;
         let handle = self
             .inner
             .start_migration(origin_hash, source, target)
@@ -795,11 +807,12 @@ impl DaemonRuntime {
         target_node: BigInt,
         opts: MigrationOptsJs,
     ) -> Result<MigrationHandle> {
-        let (_, source, _) = source_node.get_u64();
-        let (_, target, _) = target_node.get_u64();
+        let source = daemon_bigint_u64("sourceNode", source_node)?;
+        let target = daemon_bigint_u64("targetNode", target_node)?;
+        let core_opts = opts.into_core()?;
         let handle = self
             .inner
-            .start_migration_with(origin_hash, source, target, opts.into())
+            .start_migration_with(origin_hash, source, target, core_opts)
             .await
             .map_err(daemon_err_from_sdk)?;
         Ok(MigrationHandle::from_sdk(handle))
@@ -826,7 +839,7 @@ impl DaemonRuntime {
         origin_hash: u32,
         config: Option<DaemonHostConfigJs>,
     ) -> Result<()> {
-        let sdk_config = config.map(DaemonHostConfig::from).unwrap_or_default();
+        let sdk_config = match config { Some(c) => c.into_core()?, None => DaemonHostConfig::default() };
         self.inner
             .expect_migration(&kind, origin_hash, sdk_config)
             .map_err(|e| daemon_err(e.to_string()))
@@ -850,7 +863,7 @@ impl DaemonRuntime {
         config: Option<DaemonHostConfigJs>,
     ) -> Result<()> {
         let sdk_identity = identity.to_sdk_identity();
-        let sdk_config = config.map(DaemonHostConfig::from).unwrap_or_default();
+        let sdk_config = match config { Some(c) => c.into_core()?, None => DaemonHostConfig::default() };
         self.inner
             .register_migration_target_identity(&kind, sdk_identity, sdk_config)
             .map_err(|e| daemon_err(e.to_string()))
@@ -893,21 +906,24 @@ pub struct MigrationOptsJs {
     pub retry_not_ready_ms: Option<BigInt>,
 }
 
-impl From<MigrationOptsJs> for MigrationOpts {
-    fn from(js: MigrationOptsJs) -> Self {
+impl MigrationOptsJs {
+    /// Fallible conversion to the core `MigrationOpts`. Replaces
+    /// the prior `From` impl which silently accepted negative /
+    /// overflow BigInts on `retry_not_ready_ms`.
+    pub(crate) fn into_core(self) -> Result<MigrationOpts> {
         let mut opts = MigrationOpts::default();
-        if let Some(t) = js.transport_identity {
+        if let Some(t) = self.transport_identity {
             opts.transport_identity = t;
         }
-        if let Some(ms_bi) = js.retry_not_ready_ms {
-            let (_, ms, _) = ms_bi.get_u64();
+        if let Some(ms_bi) = self.retry_not_ready_ms {
+            let ms = daemon_bigint_u64("opts.retryNotReadyMs", ms_bi)?;
             opts.retry_not_ready = if ms == 0 {
                 None
             } else {
                 Some(std::time::Duration::from_millis(ms))
             };
         }
-        opts
+        Ok(opts)
     }
 }
 
@@ -994,7 +1010,7 @@ impl MigrationHandle {
     /// with a `DaemonError` describing the stall.
     #[napi]
     pub async fn wait_with_timeout(&self, timeout_ms: BigInt) -> Result<()> {
-        let (_, ms, _) = timeout_ms.get_u64();
+        let ms = daemon_bigint_u64("timeoutMs", timeout_ms)?;
         self.inner
             .clone()
             .wait_with_timeout(std::time::Duration::from_millis(ms))
@@ -1071,17 +1087,20 @@ pub struct DaemonHostConfigJs {
     pub max_log_entries: Option<u32>,
 }
 
-impl From<DaemonHostConfigJs> for DaemonHostConfig {
-    fn from(js: DaemonHostConfigJs) -> Self {
+impl DaemonHostConfigJs {
+    /// Fallible conversion to the core `DaemonHostConfig`. Replaces
+    /// the prior `From` impl which silently accepted negative /
+    /// overflow BigInts on `auto_snapshot_interval`.
+    pub(crate) fn into_core(self) -> Result<DaemonHostConfig> {
         let mut cfg = DaemonHostConfig::default();
-        if let Some(interval) = js.auto_snapshot_interval {
-            let (_sign, as_u64, _lossless) = interval.get_u64();
-            cfg.auto_snapshot_interval = as_u64;
+        if let Some(interval) = self.auto_snapshot_interval {
+            cfg.auto_snapshot_interval =
+                daemon_bigint_u64("hostConfig.autoSnapshotInterval", interval)?;
         }
-        if let Some(max) = js.max_log_entries {
+        if let Some(max) = self.max_log_entries {
             cfg.max_log_entries = max;
         }
-        cfg
+        Ok(cfg)
     }
 }
 

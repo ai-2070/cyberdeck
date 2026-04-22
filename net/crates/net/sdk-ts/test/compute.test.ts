@@ -1408,3 +1408,118 @@ describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', ()
     expect(rt.daemonCount()).toBe(0);
   }, 30_000);
 });
+
+// Regression: BigInt boundary validation at the compute FFI surface.
+//
+// The NAPI layer used to call `BigInt::get_u64()` and discard the
+// `signed` / `lossless` flags — so a negative or `>u64::MAX` BigInt
+// would silently cross the boundary as a garbage `u64`. That is a
+// correctness bug for *every* u64 arg: daemon identities, node IDs,
+// sequence numbers, timeouts, auto-snapshot cadence. The fix routes
+// every BigInt through `daemon_bigint_u64` which throws a typed
+// `DaemonError` on either flag. These tests lock the behavior in.
+describe('regression: BigInt boundary validation (compute)', () => {
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    while (cleanups.length > 0) {
+      const fn = cleanups.pop();
+      if (fn) {
+        try {
+          await fn();
+        } catch {
+          // Best-effort teardown.
+        }
+      }
+    }
+  });
+
+  async function startedRuntime(): Promise<DaemonRuntime> {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+    rt.registerFactory('echo', () => ({ name: 'echo', process: () => [] }));
+    await rt.start();
+    return rt;
+  }
+
+  it('spawn rejects a negative autoSnapshotInterval', async () => {
+    const rt = await startedRuntime();
+    await expect(
+      rt.spawn('echo', Identity.generate(), {
+        autoSnapshotInterval: -1n,
+      }),
+    ).rejects.toThrow(/non-negative/);
+  });
+
+  it('spawn rejects an autoSnapshotInterval > u64::MAX', async () => {
+    const rt = await startedRuntime();
+    await expect(
+      rt.spawn('echo', Identity.generate(), {
+        // 2^65 > u64::MAX — `lossless` comes back false.
+        autoSnapshotInterval: 2n ** 65n,
+      }),
+    ).rejects.toThrow(/u64 range/);
+  });
+
+  it('startMigration rejects a negative sourceNode', async () => {
+    const rt = await startedRuntime();
+    // Any origin_hash works — the BigInt validation fires before
+    // the migration orchestrator ever looks for a local daemon.
+    await expect(rt.startMigration(0xdead_beef, -1n, 1n)).rejects.toThrow(
+      /non-negative/,
+    );
+  });
+
+  it('startMigration rejects an overflow targetNode', async () => {
+    const rt = await startedRuntime();
+    await expect(
+      rt.startMigration(0xdead_beef, 1n, 2n ** 65n),
+    ).rejects.toThrow(/u64 range/);
+  });
+
+  it('startMigrationWith rejects a negative retryNotReadyMs', async () => {
+    const rt = await startedRuntime();
+    await expect(
+      rt.startMigrationWith(0xdead_beef, 1n, 2n, {
+        retryNotReadyMs: -100n,
+      }),
+    ).rejects.toThrow(/non-negative/);
+  });
+});
+
+// Regression: `stripInternal: true` in tsconfig.json. The sdk-ts
+// compilation relies on `@internal` JSDoc tags to hide
+// cross-module FFI accessors (`_napiNetMesh`, `_napiRuntime`,
+// internal `napi` fields on cortex handles) from the emitted
+// `dist/*.d.ts` files. Without `stripInternal` the TS compiler
+// ignores the tag and consumers can depend on the unstable NAPI
+// surface. This test reads the built declaration files and
+// asserts the internal names are gone. Skips when `dist/` is
+// absent so running vitest without a prior `tsc` run still works.
+describe('regression: stripInternal leaks', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const distDir = path.resolve(__dirname, '..', 'dist');
+  const hasBuild = fs.existsSync(distDir);
+  const runIf = hasBuild ? it : it.skip;
+
+  runIf('does not expose _napiNetMesh on the public MeshNode type', () => {
+    const dts = fs.readFileSync(path.join(distDir, 'mesh.d.ts'), 'utf8');
+    expect(dts).not.toMatch(/_napiNetMesh/);
+    expect(dts).not.toMatch(/_testInjectSyntheticPeer/);
+  });
+
+  runIf('does not expose _napiRuntime on the public DaemonRuntime type', () => {
+    const dts = fs.readFileSync(path.join(distDir, 'compute.d.ts'), 'utf8');
+    expect(dts).not.toMatch(/_napiRuntime/);
+  });
+
+  runIf('does not expose the internal `napi` accessor on cortex types', () => {
+    const dts = fs.readFileSync(path.join(distDir, 'cortex.d.ts'), 'utf8');
+    // The source has `/** @internal */ readonly napi: NapiRedex` etc.
+    // After stripInternal, no `readonly napi:` line should remain.
+    expect(dts).not.toMatch(/readonly napi:/);
+  });
+});
