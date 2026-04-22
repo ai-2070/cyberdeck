@@ -11,17 +11,34 @@ import itertools
 
 import pytest
 
-from net import (
-    DaemonError,
-    DaemonRuntime,
-    ForkGroup,
-    GroupError,
-    Identity,
-    NetMesh,
-    ReplicaGroup,
-    StandbyGroup,
-    group_error_kind,
-)
+# The groups surface is only present when the native module was
+# built with the `groups` feature (see
+# `bindings/python/Cargo.toml`). A CI matrix that omits it — e.g.
+# the `--features net,cortex,compute` compute-only build — still
+# imports the `net` package successfully but without `ForkGroup`
+# / `ReplicaGroup` / `StandbyGroup` / `GroupError`. Collect-time
+# failure there is a false negative; tolerate it by skipping the
+# whole module when any of the groups symbols are missing.
+try:
+    from net import (  # noqa: I001 — conditional to match feature gate
+        DaemonError,
+        DaemonRuntime,
+        ForkGroup,
+        GroupError,
+        Identity,
+        NetMesh,
+        ReplicaGroup,
+        StandbyGroup,
+        group_error_kind,
+    )
+except ImportError as _groups_import_err:
+    pytestmark = pytest.mark.skip(
+        reason=(
+            "net bindings built without the `groups` feature; rebuild with "
+            "`maturin develop --features net,cortex,compute,groups` to run "
+            f"these tests ({_groups_import_err})"
+        )
+    )
 
 PSK = "42" * 32
 

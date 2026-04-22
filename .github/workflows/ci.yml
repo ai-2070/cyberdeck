@@ -196,12 +196,14 @@ jobs:
       - name: Install maturin and pytest
         run: pip install --upgrade pip maturin pytest
 
-      # `net,cortex,compute` mirrors the Node binding's feature set;
-      # skip the default `redis` feature for the same reason. The
-      # `compute` feature is required for `test_compute.py` to
-      # import `CausalEvent` / `DaemonRuntime` / `MigrationHandle`.
+      # `net,cortex,compute,groups` mirrors the Node binding's
+      # feature set for tests. `groups` is needed so `test_groups.py`
+      # can import `ReplicaGroup` / `ForkGroup` / `StandbyGroup` /
+      # `GroupError`; without it the module would skip via the
+      # `pytestmark` guard in the test file. Default `redis` is
+      # omitted because the suite doesn't exercise the Redis adapter.
       - name: Build and install bindings
-        run: maturin develop --no-default-features --features net,cortex,compute
+        run: maturin develop --no-default-features --features net,cortex,compute,groups
 
       - name: Run tests
         run: pytest -v
