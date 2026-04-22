@@ -1,0 +1,33 @@
+net/crates/net/sdk/README.md
+  5bf3f089eecaef7a 583-669
+net/crates/net/sdk-py/README.md
+  5bf3f089eecaef7a 240-302
+net/crates/net/bindings/python/README.md
+  5bf3f089eecaef7a 365-458
+net/crates/net/bindings/go/README.md
+  5bf3f089eecaef7a 597-695
+net/crates/net/README.md
+  5bf3f089eecaef7a 342-343
+net/crates/net/sdk-ts/README.md
+  5bf3f089eecaef7a 540-625
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "dab14abfe7076ecef5f149bf215c0be9ea58eeee",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 434,
+      "total_deletions": 3,
+      "accepted_lines": 434,
+      "overriden_lines": 0
+    }
+  }
+}
