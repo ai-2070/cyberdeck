@@ -366,6 +366,33 @@ pub struct MeshNodeConfig {
     /// How long a peer stays throttled after tripping the
     /// failure threshold. Default: 30 s.
     pub auth_throttle_duration: Duration,
+    /// Override the mesh's public-facing `SocketAddr` — the
+    /// address peers see this node as reachable at. When `Some`,
+    /// the classifier's background sweep is skipped entirely and
+    /// the node immediately advertises `NatClass::Open` with the
+    /// supplied `SocketAddr` on its capability announcements.
+    ///
+    /// Intended for:
+    ///
+    /// - **Port-forwarded servers.** An operator who has manually
+    ///   configured a port forward knows the external address
+    ///   directly; setting this short-circuits the multi-peer
+    ///   classification that wouldn't discover anything new.
+    /// - **Stage-4 port mapping (UPnP / NAT-PMP / PCP).** A
+    ///   successful mapping installation records the mapped
+    ///   external `ip:port` here, so subsequent peers see the
+    ///   node as `Open` without the classifier needing to probe
+    ///   for a reflex.
+    ///
+    /// Framing (plan §4): this is an optimization surface, not a
+    /// connectivity requirement — a node with no override still
+    /// reaches every peer through routed-handshake. Stored on
+    /// `MeshNodeConfig` so both programmatic callers and future
+    /// port-mapping runtime writers have a single site to update.
+    ///
+    /// Default: `None` (use classifier observations).
+    #[cfg(feature = "nat-traversal")]
+    pub reflex_override: Option<SocketAddr>,
 }
 
 impl MeshNodeConfig {
@@ -397,7 +424,20 @@ impl MeshNodeConfig {
             max_auth_failures_per_window: 16,
             auth_failure_window: Duration::from_secs(60),
             auth_throttle_duration: Duration::from_secs(30),
+            #[cfg(feature = "nat-traversal")]
+            reflex_override: None,
         }
+    }
+
+    /// Set the reflex override — the public `SocketAddr` this
+    /// node advertises to peers. See
+    /// [`MeshNodeConfig::reflex_override`] for semantics.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn with_reflex_override(mut self, external: SocketAddr) -> Self {
+        self.reflex_override = Some(external);
+        self
     }
 
     /// Set heartbeat interval.
@@ -1012,6 +1052,14 @@ impl MeshNode {
         // without going back through `config`.
         let local_subnet = config.subnet;
         let local_subnet_policy = config.subnet_policy.clone();
+        // Pre-apply the reflex override so the node starts in
+        // `Open` + `reflex_addr = Some(override)` state before
+        // the first capability announcement leaves the box. Skips
+        // the classifier sweep — operators with manually-forwarded
+        // ports (or stage-4 port mapping) don't need multi-peer
+        // probing to discover what they already know.
+        #[cfg(feature = "nat-traversal")]
+        let initial_reflex_override = config.reflex_override;
 
         Ok(Self {
             identity,
@@ -1043,10 +1091,17 @@ impl MeshNode {
             punch_observers: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
             nat_class: Arc::new(std::sync::atomic::AtomicU8::new(
-                super::traversal::classify::NatClass::Unknown.as_u8(),
+                if initial_reflex_override.is_some() {
+                    super::traversal::classify::NatClass::Open.as_u8()
+                } else {
+                    super::traversal::classify::NatClass::Unknown.as_u8()
+                },
             )),
             #[cfg(feature = "nat-traversal")]
-            reflex_addr: Arc::new(ArcSwapOption::empty()),
+            reflex_addr: Arc::new(match initial_reflex_override {
+                Some(addr) => ArcSwapOption::from_pointee(addr),
+                None => ArcSwapOption::empty(),
+            }),
             #[cfg(feature = "nat-traversal")]
             traversal_config: super::traversal::TraversalConfig::default(),
             #[cfg(feature = "nat-traversal")]
@@ -5661,6 +5716,16 @@ impl MeshNode {
     #[cfg(feature = "nat-traversal")]
     pub async fn reclassify_nat(&self) {
         use super::traversal::classify::ClassifyFsm;
+
+        // Reflex-override short-circuit: an operator-set (or
+        // port-mapping installed) external address already tells
+        // us everything the classifier would: NAT type is Open,
+        // reflex is the override. Running the multi-peer probe
+        // sweep would only replace the overridden values with
+        // (possibly worse) observations — skip it.
+        if self.config.reflex_override.is_some() {
+            return;
+        }
 
         // Snapshot up to two peers. Two is enough to distinguish
         // Cone vs. Symmetric (plan §2); sampling more adds probe
