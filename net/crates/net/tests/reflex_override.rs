@@ -379,7 +379,7 @@ async fn override_set_clear_is_atomic_with_announce_read() {
                 continue;
             };
             let class = ann
-                .caps
+                .capabilities
                 .tags
                 .iter()
                 .find_map(|t| NatClass::from_tag(t))
