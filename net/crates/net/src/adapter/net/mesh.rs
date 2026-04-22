@@ -5010,22 +5010,17 @@ impl MeshNode {
         use super::traversal::classify::{pair_action, PairAction};
         use super::traversal::TraversalError;
 
-        // Require the peer to have announced a reflex — the
-        // rendezvous coordinator needs it too, and it's our
-        // fast-fail signal that the peer is discoverable at all.
-        let peer_reflex = self
-            .peer_reflex_addr(peer_node_id)
-            .ok_or(TraversalError::PeerNotReachable)?;
-
-        // NOTE: `coordinator` is deliberately NOT resolved here.
-        // A cubic review (P1) flagged that an eager lookup +
-        // `PeerNotReachable` fast-fail broke every `PairAction::Direct`
-        // case whenever the caller's nominal coordinator wasn't
-        // a live peer — Open/Open, Open/Cone, Open/Unknown, and
-        // Unknown/Unknown don't need the coordinator at all and
-        // should succeed via the routing table's first-hop. The
-        // `coordinator_addr` lookup now happens only inside
-        // branches that actually need a mediator.
+        // NOTE: `peer_reflex` and `coordinator` are deliberately
+        // NOT resolved here. Two separate cubic P1 reviews
+        // flagged that eager lookups + `PeerNotReachable` fast-
+        // fails at the top broke branches that didn't actually
+        // need those inputs — `Direct` doesn't need the
+        // coordinator, and `SkipPunch` / `SinglePunch` don't need
+        // the peer's reflex (SinglePunch gets it from the
+        // coordinator's `PunchIntroduce`; SkipPunch rides the
+        // coordinator relay and doesn't probe the peer directly).
+        // Both lookups now happen lazily inside the arms that
+        // actually consume them.
 
         let local_class = self.nat_class();
         let remote_class = self.peer_nat_class(peer_node_id);
@@ -5118,6 +5113,17 @@ impl MeshNode {
                 // documented meaning ("ended up on the routed-
                 // handshake path") and makes the counter useless
                 // for assessing NAT-traversal effectiveness.
+                // `Direct` is the one branch that genuinely
+                // needs the peer's reflex — it's the wire target
+                // for the direct-handshake attempt. Resolve it
+                // lazily here (cubic P1): putting this lookup
+                // at the top of the function used to reject
+                // `SkipPunch` pairs (which don't need a reflex
+                // at all) with `PeerNotReachable`.
+                let peer_reflex = self
+                    .peer_reflex_addr(peer_node_id)
+                    .ok_or(TraversalError::PeerNotReachable)?;
+
                 match connect_on_direct_path(peer_reflex).await {
                     Ok(id) => Ok(id),
                     Err(_) => {

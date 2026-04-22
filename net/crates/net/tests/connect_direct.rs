@@ -549,6 +549,80 @@ async fn punch_topology_forced(
     (a, b_id, *b.public_key(), 0xDEAD_C0DE_CAFE_BABE)
 }
 
+/// Regression test for a cubic-flagged P1 bug: `connect_direct`
+/// used to demand `peer_reflex_addr(peer_node_id)` at the top
+/// of the function — before it had even computed which pair-
+/// action branch applied. That rejected every `SkipPunch` pair
+/// (Symmetric × Symmetric, Symmetric × Unknown) with
+/// `PeerNotReachable` whenever the peer hadn't cached a reflex,
+/// even though those branches route entirely through the
+/// coordinator and don't read the reflex at all. Same story
+/// applies to `SinglePunch`, which gets the peer's reflex from
+/// the coordinator's `PunchIntroduce`, not from our index.
+///
+/// This test builds a Symmetric × Symmetric pair, wipes the
+/// peer's reflex from A's capability index by forcing the class
+/// without announcing a reflex, and verifies `connect_direct`
+/// still resolves via the coordinator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skip_punch_succeeds_even_when_peer_reflex_is_uncached() {
+    use net::adapter::net::traversal::classify::NatClass;
+
+    let (a, r, b, _x) = punch_topology().await;
+
+    // Force Symmetric × Symmetric → SkipPunch. Critically, do
+    // NOT call `reclassify_nat` or `announce_capabilities` on B
+    // — A's capability index will have no reflex entry for B.
+    a.force_nat_class_for_test(NatClass::Symmetric);
+    b.force_nat_class_for_test(NatClass::Symmetric);
+
+    // A needs to learn B's Symmetric class somehow. We announce
+    // only on A's side; B publishes via a manual capability
+    // push... actually the simplest way is to have A's
+    // capability index pre-populated with a non-reflex entry
+    // for B. On localhost the classifier needs reflex probes
+    // to work, so we rely on B's cap announcement carrying the
+    // class tag. But we want B's reflex NOT cached.
+    //
+    // We can't cleanly skip reflex without skipping the whole
+    // announcement, but the Direct/SkipPunch pair-action read
+    // falls back to `Unknown` for a peer A hasn't indexed — and
+    // `pair_action(Symmetric, Unknown)` is also `SkipPunch`.
+    // So we simply DON'T have B announce at all. A sees
+    // (Symmetric, Unknown) → SkipPunch, reflex lookup would
+    // return None, and before the fix that'd fast-fail with
+    // PeerNotReachable.
+    a.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("A announce");
+
+    // Sanity-check: A's reflex index for B is empty.
+    let b_id = b.node_id();
+    assert!(
+        a.peer_reflex_addr(b_id).is_none(),
+        "test precondition: B's reflex must not be cached on A",
+    );
+    // And the pair action resolves to SkipPunch (Symmetric ×
+    // Unknown).
+    assert_eq!(a.peer_nat_class(b_id), NatClass::Unknown);
+    assert_eq!(a.nat_class(), NatClass::Symmetric);
+
+    let b_pub = *b.public_key();
+    let session_id = a
+        .connect_direct(b_id, &b_pub, r.node_id())
+        .await
+        .expect(
+            "SkipPunch should resolve via the coordinator — the \
+             peer's reflex is irrelevant on this branch",
+        );
+    assert_eq!(session_id, b_id);
+    assert_eq!(
+        a.peer_addr(b_id),
+        Some(r.local_addr()),
+        "SkipPunch session must be pathed via R",
+    );
+}
+
 /// Regression test for a cubic-flagged P2 bug on the SkipPunch
 /// branch: `record_relay_fallback()` used to fire *before*
 /// `coordinator_addr()?` resolved. On a missing-coordinator
