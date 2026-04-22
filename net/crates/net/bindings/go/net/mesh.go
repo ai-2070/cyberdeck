@@ -546,6 +546,44 @@ func (m *MeshNode) ConnectDirect(
 	return meshErrorFromCode(code)
 }
 
+// SetReflexOverride installs a runtime reflex override. Forces
+// NatType() to "open" and ReflexAddr() to the supplied "ip:port"
+// string, short-circuiting any further classifier sweeps.
+//
+// Runtime counterpart of the MeshConfig.ReflexOverride startup
+// option — useful when a port-forward goes live mid-session or
+// when a stage-4 port-mapping task has just installed a mapping.
+// Optimization, not correctness: nodes without an override still
+// reach every peer via the routed-handshake path.
+//
+// Returns ErrMeshInit on a malformed external address.
+func (m *MeshNode) SetReflexOverride(external string) error {
+	cExt := C.CString(external)
+	defer C.free(unsafe.Pointer(cExt))
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return ErrShuttingDown
+	}
+	return meshErrorFromCode(C.net_mesh_set_reflex_override(m.handle, cExt))
+}
+
+// ClearReflexOverride drops a previously-installed reflex
+// override. The classifier resumes on its normal cadence;
+// ReflexAddr() clears to "" immediately so a between-sweep read
+// doesn't return a stale override.
+//
+// No-op when no override is active — safe to call unconditionally
+// on shutdown or revoke paths.
+func (m *MeshNode) ClearReflexOverride() error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return ErrShuttingDown
+	}
+	return meshErrorFromCode(C.net_mesh_clear_reflex_override(m.handle))
+}
+
 // ---------------------------------------------------------------------------
 // Streams
 // ---------------------------------------------------------------------------

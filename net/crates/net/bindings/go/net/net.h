@@ -621,6 +621,18 @@ int      net_mesh_connect_direct(net_meshnode_t* handle,
                                  const char* peer_pubkey_hex,
                                  uint64_t coordinator);
 
+/* Install a runtime reflex override. `external` is a
+ * null-terminated "ip:port" string. Forces `nat_type` to "open"
+ * and `reflex_addr` to `external`; short-circuits any further
+ * classifier sweeps. */
+int      net_mesh_set_reflex_override(net_meshnode_t* handle,
+                                      const char* external);
+
+/* Drop a previously-installed reflex override. The classifier
+ * resumes on its normal cadence. No-op when no override is
+ * active. */
+int      net_mesh_clear_reflex_override(net_meshnode_t* handle);
+
 /* Hash a channel name to its 16-bit wire representation. */
 int      net_channel_hash(const char* channel, uint16_t* out_hash);
 

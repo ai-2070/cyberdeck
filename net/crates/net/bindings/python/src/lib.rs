@@ -1928,6 +1928,44 @@ mod mesh_bindings {
             })
         }
 
+        /// Install a runtime reflex override. Forces `nat_type()`
+        /// to `"open"` and `reflex_addr()` to `external`
+        /// immediately, short-circuiting any further classifier
+        /// sweeps. Runtime counterpart of the `reflex_override`
+        /// constructor kwarg — useful when a port-forward goes
+        /// live mid-session or when a stage-4 port-mapping task
+        /// has just installed a mapping.
+        ///
+        /// **Optimization, not correctness.** Nodes without an
+        /// override still reach every peer via the routed-
+        /// handshake path.
+        ///
+        /// `external` is an "ip:port" string. Raises
+        /// `ValueError` if it fails to parse.
+        #[cfg(feature = "nat-traversal")]
+        fn set_reflex_override(&self, external: &str) -> PyResult<()> {
+            let node = self.get_node()?;
+            let addr: std::net::SocketAddr = external
+                .parse()
+                .map_err(|e| PyValueError::new_err(format!("invalid reflex override: {e}")))?;
+            node.set_reflex_override(addr);
+            Ok(())
+        }
+
+        /// Drop a previously-installed reflex override. The
+        /// classifier resumes on its normal cadence;
+        /// `reflex_addr()` clears to `None` immediately so a
+        /// between-sweep read doesn't return a stale override.
+        ///
+        /// No-op when no override is active — safe to call
+        /// unconditionally on shutdown or revoke paths.
+        #[cfg(feature = "nat-traversal")]
+        fn clear_reflex_override(&self) -> PyResult<()> {
+            let node = self.get_node()?;
+            node.clear_reflex_override();
+            Ok(())
+        }
+
         /// Shutdown the mesh node. Idempotent — a second call is a no-op.
         fn shutdown(&mut self) -> PyResult<()> {
             let Some(node) = self.node.take() else {

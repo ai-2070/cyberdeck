@@ -2009,6 +2009,46 @@ mod mesh_bindings {
                 .map_err(traversal_err)?;
             Ok(())
         }
+
+        /// Install a runtime reflex override. Forces `natType()`
+        /// to `"open"` and `reflexAddr()` to `external`
+        /// immediately, short-circuiting any further classifier
+        /// sweeps. Runtime counterpart of the `reflexOverride`
+        /// option passed at `create()` time — useful when a
+        /// port-forward goes live mid-session or when a stage-4
+        /// port-mapping task has just installed a mapping.
+        ///
+        /// **Optimization, not correctness.** Nodes without an
+        /// override still reach every peer via the routed-
+        /// handshake path.
+        ///
+        /// `external` is an `"ip:port"` string — rejects with
+        /// `invalid reflex override` if it fails to parse.
+        #[napi]
+        pub fn set_reflex_override(&self, external: String) -> Result<()> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let addr: std::net::SocketAddr = external
+                .parse()
+                .map_err(|e| Error::from_reason(format!("invalid reflex override: {e}")))?;
+            node.set_reflex_override(addr);
+            Ok(())
+        }
+
+        /// Drop a previously-installed reflex override. The
+        /// classifier resumes on its normal cadence;
+        /// `reflexAddr()` clears to `null` immediately so a
+        /// between-sweep read doesn't return a stale override.
+        ///
+        /// No-op when no override is active — safe to call
+        /// unconditionally on shutdown or revoke paths.
+        #[napi]
+        pub fn clear_reflex_override(&self) -> Result<()> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            node.clear_reflex_override();
+            Ok(())
+        }
     }
 
     // =====================================================================

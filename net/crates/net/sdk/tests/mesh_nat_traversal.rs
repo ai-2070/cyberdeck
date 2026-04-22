@@ -162,6 +162,55 @@ async fn builder_reflex_override_forces_open() {
     );
 }
 
+/// Runtime `set_reflex_override` / `clear_reflex_override` via
+/// the SDK wrapper. Installs, verifies, and clears an override
+/// mid-session without needing the builder path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_reflex_override_via_sdk() {
+    let psk = [0x42u8; 32];
+    let mesh = MeshBuilder::new("127.0.0.1:0", &psk)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    // Pre-override: the plain classifier path hasn't run, so
+    // Unknown / None.
+    assert_eq!(mesh.nat_type(), NatClass::Unknown);
+    assert!(mesh.reflex_addr().is_none());
+
+    let external: std::net::SocketAddr = "203.0.113.99:4242".parse().unwrap();
+    mesh.set_reflex_override(external);
+
+    assert_eq!(
+        mesh.nat_type(),
+        NatClass::Open,
+        "runtime override should flip nat_type to Open",
+    );
+    assert_eq!(
+        mesh.reflex_addr(),
+        Some(external),
+        "reflex_addr should reflect the runtime override",
+    );
+
+    mesh.clear_reflex_override();
+
+    assert_eq!(
+        mesh.nat_type(),
+        NatClass::Unknown,
+        "clear should reset nat_type",
+    );
+    assert!(
+        mesh.reflex_addr().is_none(),
+        "clear should reset reflex_addr to None",
+    );
+
+    // clear is idempotent — second clear is a no-op.
+    mesh.clear_reflex_override();
+    assert_eq!(mesh.nat_type(), NatClass::Unknown);
+    assert!(mesh.reflex_addr().is_none());
+}
+
 /// `connect_direct` end-to-end via the SDK: Open×Open pair
 /// picks the Direct action, increments relay_fallbacks (no
 /// punch was attempted because no punch was warranted), and

@@ -917,6 +917,43 @@ impl Mesh {
     pub fn traversal_stats(&self) -> net::adapter::net::traversal::TraversalStatsSnapshot {
         self.node.traversal_stats()
     }
+
+    /// Install a runtime reflex override. Forces `nat_type() =
+    /// "open"` and `reflex_addr() = Some(external)` immediately,
+    /// short-circuiting any further classifier sweeps.
+    ///
+    /// Intended for operator-driven updates — a port-forward
+    /// that went live mid-session, or a stage-4 port-mapping
+    /// task that just installed a UPnP / NAT-PMP mapping.
+    /// Builder-level [`MeshBuilder::reflex_override`] covers the
+    /// startup-time case; this is the runtime equivalent.
+    ///
+    /// **Optimization, not correctness.** Nodes without an
+    /// override still reach every peer via the routed-handshake
+    /// path. The override pins the publicly-advertised address
+    /// when it's already known.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn set_reflex_override(&self, external: SocketAddr) {
+        self.node.set_reflex_override(external);
+    }
+
+    /// Drop a previously-installed reflex override. The
+    /// classifier resumes on its normal cadence; the next sweep
+    /// repopulates `reflex_addr` and `nat_type` from real probe
+    /// observations. `reflex_addr` clears to `None` immediately
+    /// so a between-sweep read doesn't return a stale override.
+    ///
+    /// No-op when no override is active — safe to call
+    /// unconditionally during shutdown or a port-mapper revoke
+    /// path.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn clear_reflex_override(&self) {
+        self.node.clear_reflex_override();
+    }
 }
 
 /// Map an `AdapterError` from a subscribe / unsubscribe / publish

@@ -834,6 +834,51 @@ pub extern "C" fn net_mesh_connect_direct(
     }
 }
 
+/// Install a runtime reflex override. `external` is a
+/// UTF-8 / null-terminated `"ip:port"` string. Forces `nat_type`
+/// to `"open"` and `reflex_addr` to `external` immediately;
+/// short-circuits any further classifier sweeps.
+///
+/// Returns `0` on success or `NET_ERR_MESH_INIT` on a malformed
+/// address.
+#[cfg(feature = "nat-traversal")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_set_reflex_override(
+    handle: *mut MeshNodeHandle,
+    external: *const c_char,
+) -> c_int {
+    if handle.is_null() || external.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let Some(s) = (unsafe { c_str_to_str(external) }) else {
+        return NetError::InvalidUtf8.into();
+    };
+    let Ok(addr) = s.parse::<std::net::SocketAddr>() else {
+        return NET_ERR_MESH_INIT;
+    };
+    h.inner.set_reflex_override(addr);
+    0
+}
+
+/// Drop a previously-installed reflex override. The classifier
+/// resumes on its normal cadence; `reflex_addr` clears to empty
+/// immediately so a between-sweep read doesn't return a stale
+/// override.
+///
+/// No-op when no override is active. Always returns `0` on a
+/// live handle.
+#[cfg(feature = "nat-traversal")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_clear_reflex_override(handle: *mut MeshNodeHandle) -> c_int {
+    if handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    h.inner.clear_reflex_override();
+    0
+}
+
 // =========================================================================
 // Streams
 // =========================================================================
