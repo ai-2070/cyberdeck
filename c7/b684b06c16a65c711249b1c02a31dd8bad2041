@@ -1,0 +1,25 @@
+net/crates/net/tests/connect_direct.rs
+  5bf3f089eecaef7a 518-612
+net/crates/net/src/adapter/net/mesh.rs
+  5bf3f089eecaef7a 5150-5157,5159
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "c7b684b06c16a65c711249b1c02a31dd8bad2041",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 155,
+      "total_deletions": 52,
+      "accepted_lines": 107,
+      "overriden_lines": 0
+    }
+  }
+}
