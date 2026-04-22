@@ -11,7 +11,7 @@ The core `net` crate is the engine. This SDK is what Rust developers import.
 net-sdk = { path = "sdk" }
 ```
 
-Features: `redis`, `jetstream`, `net` (mesh transport), `cortex` (event-sourced tasks/memories + NetDb), `full` (all).
+Features: `redis`, `jetstream`, `net` (mesh transport), `nat-traversal` (classifier + `connect_direct`), `port-mapping` (NAT-PMP + UPnP), `cortex` (event-sourced tasks/memories + NetDb), `compute` (daemons + migration), `groups` (replica / fork / standby), `local` (convenience bundle), `full` (all).
 
 ## Quick Start
 
@@ -190,6 +190,7 @@ node.send_with_retry(&stream, &[Bytes::from_static(b"{}")], 8).await?;
 node.send_blocking(&stream, &[Bytes::from_static(b"{}")]).await?;
 
 // Live stats — per-stream tx/rx seq, in-flight, window, backpressure count.
+// Returns `None` if the stream was closed or never opened.
 let stats = node.stream_stats(peer_node_id, 0x42);
 ```
 
@@ -796,8 +797,8 @@ let ctx = RequestContext::new().with_routing_key("user:42");
 let origin = replicas.route_event(&ctx)?;
 // rt.deliver(origin, &event)?;   // hand the event to the chosen replica
 
-replicas.scale_to(5, "counter")?;         // grow
-replicas.on_node_failure(failed_id, "counter")?;  // respawn elsewhere
+replicas.scale_to(5)?;                    // grow
+replicas.on_node_failure(failed_id)?;     // respawn elsewhere
 
 // --- ForkGroup -------------------------------------------------------
 let forks = ForkGroup::fork(
@@ -823,7 +824,7 @@ let hot = StandbyGroup::spawn(&rt, "counter", StandbyGroupConfig {
 // rt.deliver(hot.active_origin(), &event)?;
 hot.on_event_delivered(event.clone());     // buffer for replay
 hot.sync_standbys()?;                      // periodic catchup
-// On active-node failure: hot.on_node_failure(failed_id, "counter")?;
+// On active-node failure: hot.on_node_failure(failed_id)?;
 # Ok(())
 # }
 ```

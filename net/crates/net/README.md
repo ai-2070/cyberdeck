@@ -480,7 +480,6 @@ src/adapter/net/
 ├── mesh.rs                # MeshNode — multi-peer mesh runtime (single socket, forwarding, subprotocol dispatch)
 ├── config.rs              # NetAdapterConfig
 ├── crypto.rs              # Noise NKpsk0 handshake, ChaCha20-Poly1305 AEAD
-├── handshake_relay.rs     # Handshake relay (SUBPROTOCOL_HANDSHAKE 0x0601), connect_via
 ├── protocol.rs            # 64-byte wire header, EventFrame, NackPayload
 ├── transport.rs           # UDP socket abstraction, batched I/O
 ├── session.rs             # Session state, stream multiplexing, thread-local pools
@@ -773,7 +772,7 @@ net_shutdown(node);
 | CortEX (adapter core + tasks + memories) | `cortex` | `redex` |
 | NetDB (unified query façade) | `netdb` | `cortex` |
 
-Default feature is `redis`.
+No features are enabled by default — opt into `redis`, `jetstream`, `net`, etc. explicitly.
 
 ## Building
 
