@@ -77,18 +77,21 @@ use arc_swap::ArcSwapOption;
 /// The three punch/fallback counters partition all
 /// `connect_direct` outcomes:
 ///
-/// - **`punches_attempted`** — the pair-type matrix decided to
-///   attempt a hole-punch. Increments whether the punch
-///   eventually succeeds or fails.
+/// - **`punches_attempted`** — the coordinator mediated a
+///   punch: the `PunchRequest` went on the wire and the
+///   `PunchIntroduce` came back. Fast-fails before that point
+///   (coordinator unreachable, socket send failed) do NOT
+///   increment — the counter reflects *actual punch activity*,
+///   not just matrix decisions. Bumped whether the subsequent
+///   ack / direct handshake ultimately succeeds or falls back.
 /// - **`relay_fallbacks`** — connection ended up on the routed-
-///   handshake path: either because the pair-type matrix picked
-///   `SkipPunch` (Symmetric-×-Symmetric), or because the punch
-///   attempt failed and fell back, or because a `Direct`
-///   attempt failed and fell back to the routing table. A
-///   successful direct connect does NOT increment this counter;
-///   it's reserved for the "we're actually on the routed path
-///   right now" case so operators can use it as a real
-///   NAT-traversal-effectiveness signal.
+///   handshake path: `SkipPunch` (Symmetric-×-Symmetric), a
+///   failed-and-fallen-back punch, or a failed-and-fallen-back
+///   `Direct` attempt. Only incremented after the routed
+///   handshake *itself* lands. Successful direct connects don't
+///   contribute, and failed-and-ALSO-failed fallback attempts
+///   don't either — so the counter stays a real "we're on the
+///   relay right now" signal operators can use.
 /// - **`punches_succeeded`** — the punch completed within the
 ///   deadline and produced a direct session. Always `≤
 ///   punches_attempted`; the difference is the punch-failure
@@ -121,14 +124,20 @@ pub struct TraversalStats {
 /// counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TraversalStatsSnapshot {
-    /// Number of punches the pair-type matrix elected to attempt.
+    /// Number of punches whose `PunchRequest` was successfully
+    /// mediated by the coordinator. Fast-fails before the wire
+    /// send (coordinator unreachable, transport error) don't
+    /// contribute — the counter reflects real punch activity.
     pub punches_attempted: u64,
     /// Number of those attempts that produced a direct session.
     pub punches_succeeded: u64,
     /// Number of `connect_direct` calls that ended on the routed-
     /// handshake path: matrix-skipped (Symmetric × Symmetric),
     /// punch-failed, or Direct-handshake-failed-falling-back.
-    /// Successful direct connects do NOT contribute here.
+    /// Only counted after the routed handshake actually
+    /// succeeds — failed-and-also-failed-fallback calls don't
+    /// contribute. Successful direct connects don't contribute
+    /// either.
     pub relay_fallbacks: u64,
     /// True when a port mapping is currently installed on the
     /// operator's router. Flips via the port-mapping task's

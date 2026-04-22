@@ -681,6 +681,86 @@ async fn single_punch_fast_fail_on_missing_coordinator_does_not_bump_stats() {
     );
 }
 
+/// Regression test for a cubic-flagged P2 bug: the stats
+/// counters used to bump *before* the operation they were
+/// counting actually succeeded, so a fully-failed
+/// `connect_direct` could still move `relay_fallbacks` (and,
+/// on SinglePunch, `punches_attempted`). That broke the
+/// documented meanings of both counters — operators reading
+/// them to gauge NAT-traversal effectiveness would get numbers
+/// inflated by calls where no actual session was established
+/// and no punch traffic went out.
+///
+/// The fix: `record_punch_attempt` fires only when
+/// `request_punch` returns Ok (the wire `PunchRequest` was
+/// sent AND the coordinator mediated an `Introduce`).
+/// `record_relay_fallback` fires only when
+/// `connect_via_coordinator` / `connect_routed` actually
+/// succeed. Fully-failed calls leave the counters at zero.
+///
+/// # Scenario
+///
+/// Drive the SkipPunch branch with a live coordinator but
+/// wipe that peer from the routing table so the relayed
+/// handshake fails. Expect:
+/// - `connect_direct` returns Err.
+/// - `relay_fallbacks` stays unchanged (no handshake landed).
+/// - All other counters stay unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connect_direct_does_not_bump_relay_fallbacks_on_failed_fallback() {
+    use net::adapter::net::traversal::classify::NatClass;
+
+    let (a, r, b, _x) = punch_topology().await;
+
+    a.reclassify_nat().await;
+    b.reclassify_nat().await;
+    a.force_nat_class_for_test(NatClass::Symmetric);
+    b.force_nat_class_for_test(NatClass::Symmetric);
+    a.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("A announce");
+    b.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("B announce");
+
+    let a_for_poll = a.clone();
+    let b_id = b.node_id();
+    let b_bind = b.local_addr();
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            a_for_poll.peer_reflex_addr(b_id) == Some(b_bind)
+                && a_for_poll.peer_nat_class(b_id) == NatClass::Symmetric
+        })
+        .await,
+        "A should see B's Symmetric class + reflex",
+    );
+
+    // Use an unreachable-peer pubkey so the relayed Noise
+    // handshake fails. The coordinator r IS reachable and
+    // IS a live peer — so `coordinator_addr()?` resolves and
+    // the SkipPunch branch proceeds to `connect_via_coordinator`.
+    // That call hands msg1 to r, but msg2 never comes back with
+    // a useful handshake because the target b never receives
+    // a valid msg1 (wrong static pubkey).
+    let wrong_pubkey = [0u8; 32];
+
+    let before = a.traversal_stats();
+    let result = a.connect_direct(b_id, &wrong_pubkey, r.node_id()).await;
+    let after = a.traversal_stats();
+
+    assert!(
+        result.is_err(),
+        "connect_direct with wrong pubkey must fail — got {result:?}",
+    );
+    assert_eq!(
+        after, before,
+        "a fully-failed connect_direct must not bump any counters — \
+         the pre-fix bug bumped `relay_fallbacks` before the \
+         handshake ran, so a failed fallback still inflated the \
+         'we're on the relay' signal",
+    );
+}
+
 /// Regression test for a cubic-flagged P1 bug: the
 /// `connect_via_coordinator` helper short-circuited on any
 /// existing peer-map entry, so a second `connect_direct` call

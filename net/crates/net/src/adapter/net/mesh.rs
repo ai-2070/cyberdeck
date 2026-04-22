@@ -5180,10 +5180,24 @@ impl MeshNode {
                         // first-hop it'll succeed quickly; if no
                         // route is cached it returns an honest
                         // error the caller can observe.
-                        self.traversal_stats.record_relay_fallback();
-                        self.connect_routed(peer_pubkey, peer_node_id)
+                        //
+                        // Stats ordering (cubic P2):
+                        // `record_relay_fallback` only fires
+                        // *after* `connect_routed` actually
+                        // succeeds. Bumping it before the
+                        // fallback runs would overcount — if
+                        // the routing-table path also fails,
+                        // the call returns Err and the counter
+                        // would still have moved, breaking
+                        // `relay_fallbacks`'s documented meaning
+                        // ("resolutions that stayed on the
+                        // routed path").
+                        let id = self
+                            .connect_routed(peer_pubkey, peer_node_id)
                             .await
-                            .map_err(|e| TraversalError::Transport(e.to_string()))
+                            .map_err(|e| TraversalError::Transport(e.to_string()))?;
+                        self.traversal_stats.record_relay_fallback();
+                        Ok(id)
                     }
                 }
             }
@@ -5194,16 +5208,18 @@ impl MeshNode {
                 // caller's coordinator isn't reachable — there
                 // is no viable fallback in this branch.
                 //
-                // Stats note: resolve the coordinator *before*
-                // recording the relay fallback, so a missing
-                // coordinator returns `PeerNotReachable` cleanly
-                // without inflating the fallback counter with
-                // calls where no traversal attempt actually
-                // happened. Same ordering invariant as the
-                // SinglePunch branch below (cubic P2).
+                // Stats note (cubic P2): `record_relay_fallback`
+                // runs only *after* `connect_via_coordinator`
+                // actually succeeds. A failed coordinator
+                // handshake returns Err without bumping, so
+                // `relay_fallbacks` continues to mean "ended
+                // up on the routed-handshake path" — not "the
+                // matrix picked the routed path but the
+                // handshake also failed."
                 let coord = coordinator_addr()?;
+                let id = connect_via_coordinator(coord).await?;
                 self.traversal_stats.record_relay_fallback();
-                connect_via_coordinator(coord).await
+                Ok(id)
             }
             PairAction::SinglePunch => {
                 // Punch requires the coordinator for rendezvous
@@ -5211,7 +5227,6 @@ impl MeshNode {
                 // top) so Direct-path callers with no active
                 // coordinator peer can still succeed.
                 let coord = coordinator_addr()?;
-                self.traversal_stats.record_punch_attempt();
                 let self_reflex = self.reflex_addr().unwrap_or_else(|| self.local_addr());
 
                 // Install the PunchAck waiter BEFORE firing the
@@ -5230,66 +5245,87 @@ impl MeshNode {
                     .request_punch(coordinator, peer_node_id, self_reflex)
                     .await;
 
-                match punch_outcome {
+                // Stats ordering (cubic P2): `record_punch_attempt`
+                // fires only when `request_punch` returns Ok —
+                // i.e., the coordinator mediated the introduction,
+                // which proves the send succeeded and the intro
+                // arrived. Bumping before knowing the outcome
+                // would overcount cases where no wire activity
+                // actually happened (coordinator unreachable,
+                // socket send failed). Similarly, the relay-
+                // fallback counters below only fire after the
+                // fallback handshake itself lands.
+                let intro = match punch_outcome {
                     Ok(intro) => {
-                        // Await the counterpart's PunchAck,
-                        // forwarded by the coordinator. On
-                        // success we try a direct handshake to
-                        // the peer's advertised reflex — that's
-                        // the whole point of the punch, and
-                        // without it this code path is a fancy
-                        // way of doing a relayed connect while
-                        // lying in stats that a punch happened.
-                        // On ack-timeout or direct-handshake
-                        // failure we fall back to relay so the
-                        // caller still gets a usable session.
-                        let deadline = self.traversal_config.punch_deadline;
-                        match tokio::time::timeout(deadline, ack_rx).await {
-                            Ok(Ok(_ack)) => {
-                                match connect_on_direct_path(intro.peer_reflex).await {
-                                    Ok(id) => {
-                                        self.traversal_stats.record_punch_success();
-                                        Ok(id)
-                                    }
-                                    Err(_) => {
-                                        // Punch opened but direct
-                                        // handshake failed (NAT
-                                        // rebound between ack and
-                                        // handshake, or the
-                                        // peer's socket buffer
-                                        // filled). Relay fallback.
-                                        self.traversal_stats.record_relay_fallback();
-                                        connect_via_coordinator(coord).await
-                                    }
-                                }
-                            }
-                            Ok(Err(_)) => {
-                                // Our sender was replaced by a
-                                // concurrent call — the map
-                                // entry is now theirs, do NOT
-                                // remove. Fall through to relay
-                                // on our side.
-                                self.traversal_stats.record_relay_fallback();
-                                connect_via_coordinator(coord).await
-                            }
-                            Err(_) => {
-                                self.pending_punch_acks
-                                    .remove_if(&peer_node_id, |_, (g, _)| *g == ack_gen);
-                                self.traversal_stats.record_relay_fallback();
-                                connect_via_coordinator(coord).await
-                            }
-                        }
+                        self.traversal_stats.record_punch_attempt();
+                        intro
                     }
                     Err(_) => {
                         // Coordinator mediation failed — no
                         // point waiting for an ack that will
                         // never come. Evict the waiter only if
                         // it's still ours (a concurrent call may
-                        // have replaced it; cubic P1).
+                        // have replaced it; cubic P1). No
+                        // `record_punch_attempt` — the wire
+                        // punch didn't happen. The relay-
+                        // fallback counter is bumped only after
+                        // `connect_via_coordinator` actually
+                        // succeeds.
                         self.pending_punch_acks
                             .remove_if(&peer_node_id, |_, (g, _)| *g == ack_gen);
+                        let id = connect_via_coordinator(coord).await?;
                         self.traversal_stats.record_relay_fallback();
-                        connect_via_coordinator(coord).await
+                        return Ok(id);
+                    }
+                };
+
+                // Await the counterpart's PunchAck, forwarded by
+                // the coordinator. On success we try a direct
+                // handshake to the peer's advertised reflex —
+                // that's the whole point of the punch, and
+                // without it this code path is a fancy way of
+                // doing a relayed connect while lying in stats
+                // that a punch happened. On ack-timeout or
+                // direct-handshake failure we fall back to relay
+                // so the caller still gets a usable session.
+                let deadline = self.traversal_config.punch_deadline;
+                match tokio::time::timeout(deadline, ack_rx).await {
+                    Ok(Ok(_ack)) => {
+                        match connect_on_direct_path(intro.peer_reflex).await {
+                            Ok(id) => {
+                                self.traversal_stats.record_punch_success();
+                                Ok(id)
+                            }
+                            Err(_) => {
+                                // Punch opened but direct
+                                // handshake failed (NAT rebound
+                                // between ack and handshake, or
+                                // the peer's socket buffer
+                                // filled). Relay fallback — bump
+                                // `relay_fallbacks` only after
+                                // the coordinator handshake
+                                // actually lands.
+                                let id = connect_via_coordinator(coord).await?;
+                                self.traversal_stats.record_relay_fallback();
+                                Ok(id)
+                            }
+                        }
+                    }
+                    Ok(Err(_)) => {
+                        // Our sender was replaced by a concurrent
+                        // call — the map entry is now theirs, do
+                        // NOT remove. Fall through to relay on
+                        // our side.
+                        let id = connect_via_coordinator(coord).await?;
+                        self.traversal_stats.record_relay_fallback();
+                        Ok(id)
+                    }
+                    Err(_) => {
+                        self.pending_punch_acks
+                            .remove_if(&peer_node_id, |_, (g, _)| *g == ack_gen);
+                        let id = connect_via_coordinator(coord).await?;
+                        self.traversal_stats.record_relay_fallback();
+                        Ok(id)
                     }
                 }
             }
