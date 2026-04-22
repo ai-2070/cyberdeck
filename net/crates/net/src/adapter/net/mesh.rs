@@ -180,8 +180,7 @@ struct DispatchCtx {
     /// replaces the pending entry and the previous caller sees
     /// `ReflexTimeout`.
     #[cfg(feature = "nat-traversal")]
-    pending_reflex_probes:
-        Arc<DashMap<u64, tokio::sync::oneshot::Sender<std::net::SocketAddr>>>,
+    pending_reflex_probes: Arc<DashMap<u64, tokio::sync::oneshot::Sender<std::net::SocketAddr>>>,
     /// Waiters for incoming `PunchIntroduce` messages, keyed by
     /// the counterpart endpoint's `node_id` (the `peer` field in
     /// the introduce). Mirrors `pending_reflex_probes` — the
@@ -196,9 +195,8 @@ struct DispatchCtx {
     /// `connect_direct`'s `SinglePunch` path awaits on this map
     /// to confirm the peer completed their side of the punch.
     #[cfg(feature = "nat-traversal")]
-    pending_punch_acks: Arc<
-        DashMap<u64, tokio::sync::oneshot::Sender<super::traversal::rendezvous::PunchAck>>,
-    >,
+    pending_punch_acks:
+        Arc<DashMap<u64, tokio::sync::oneshot::Sender<super::traversal::rendezvous::PunchAck>>>,
     /// Keep-alive observers, keyed by the `SocketAddr` of the
     /// counterpart's `peer_reflex`. Fired by the receive loop
     /// when a matching `Keepalive`-formatted packet arrives;
@@ -752,8 +750,7 @@ pub struct MeshNode {
     /// `MeshNode`. Details on the field's usage in the
     /// `DispatchCtx` docstring.
     #[cfg(feature = "nat-traversal")]
-    pending_reflex_probes:
-        Arc<DashMap<u64, oneshot::Sender<std::net::SocketAddr>>>,
+    pending_reflex_probes: Arc<DashMap<u64, oneshot::Sender<std::net::SocketAddr>>>,
     /// In-flight rendezvous handshakes keyed by the *counterpart*
     /// endpoint's `node_id` — i.e. the `peer` field in the
     /// incoming `PunchIntroduce`. The coordinator-side fanout
@@ -762,17 +759,15 @@ pub struct MeshNode {
     /// observe an introduce install an entry here via the
     /// stage-3c surface before calling the coordinator.
     #[cfg(feature = "nat-traversal")]
-    pending_punch_introduces: Arc<
-        DashMap<u64, oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>>,
-    >,
+    pending_punch_introduces:
+        Arc<DashMap<u64, oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>>>,
     /// In-flight punch acknowledgements keyed by the *sender*
     /// endpoint's `node_id` — i.e. the `from_peer` field on the
     /// arriving `PunchAck`. `connect_direct` awaits this map on
     /// the `SinglePunch` path so `punches_succeeded` only bumps
     /// when the peer actually confirmed the punch.
     #[cfg(feature = "nat-traversal")]
-    pending_punch_acks:
-        Arc<DashMap<u64, oneshot::Sender<super::traversal::rendezvous::PunchAck>>>,
+    pending_punch_acks: Arc<DashMap<u64, oneshot::Sender<super::traversal::rendezvous::PunchAck>>>,
     /// Keep-alive observers for in-progress punches, keyed by
     /// the `SocketAddr` we're watching for inbound traffic (the
     /// counterpart's `peer_reflex`). The receive loop fires the
@@ -2390,12 +2385,8 @@ impl MeshNode {
         #[cfg(feature = "nat-traversal")]
         if parsed.header.subprotocol_id == super::traversal::SUBPROTOCOL_REFLEX {
             use super::traversal::reflex;
-            let events =
-                EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
-            let payload = events
-                .into_iter()
-                .next()
-                .unwrap_or_else(Bytes::new);
+            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let payload = events.into_iter().next().unwrap_or_else(Bytes::new);
             let Some(msg) = reflex::decode(&payload) else {
                 return;
             };
@@ -2434,9 +2425,8 @@ impl MeshNode {
                         let pool = dest_sess.thread_local_pool();
                         let mut builder = pool.get();
                         let seq = {
-                            let stream = dest_sess.get_or_create_stream(
-                                super::traversal::SUBPROTOCOL_REFLEX as u64,
-                            );
+                            let stream = dest_sess
+                                .get_or_create_stream(super::traversal::SUBPROTOCOL_REFLEX as u64);
                             stream.next_tx_seq()
                         };
                         let events = vec![response];
@@ -2475,12 +2465,8 @@ impl MeshNode {
         #[cfg(feature = "nat-traversal")]
         if parsed.header.subprotocol_id == super::traversal::SUBPROTOCOL_RENDEZVOUS {
             use super::traversal::rendezvous;
-            let events =
-                EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
-            let payload = events
-                .into_iter()
-                .next()
-                .unwrap_or_else(Bytes::new);
+            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let payload = events.into_iter().next().unwrap_or_else(Bytes::new);
             let Some(msg) = rendezvous::decode(&payload) else {
                 return;
             };
@@ -2508,9 +2494,7 @@ impl MeshNode {
                     // sees inbound traffic from `peer_reflex`
                     // (or — on localhost — at the punch_deadline
                     // fallback). Plan §3 endpoint semantics.
-                    if let Some((_, tx)) =
-                        ctx.pending_punch_introduces.remove(&intro.peer)
-                    {
+                    if let Some((_, tx)) = ctx.pending_punch_introduces.remove(&intro.peer) {
                         let _ = tx.send(intro);
                     }
                     Self::schedule_punch(from_node, intro, ctx);
@@ -2521,9 +2505,7 @@ impl MeshNode {
                         // oneshot keyed by `from_peer`. A late ack
                         // for an abandoned `connect_direct` is
                         // dropped silently.
-                        if let Some((_, tx)) =
-                            ctx.pending_punch_acks.remove(&ack.from_peer)
-                        {
+                        if let Some((_, tx)) = ctx.pending_punch_acks.remove(&ack.from_peer) {
                             let _ = tx.send(ack);
                         }
                     } else {
@@ -3505,10 +3487,11 @@ impl MeshNode {
 
         // 2. Compute the shared fire time.
         let fire_lead = ctx.traversal_config.punch_fire_lead;
-        let fire_at_ms = match std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-        {
-            Ok(d) => d.saturating_add(fire_lead).as_millis().min(u64::MAX as u128) as u64,
+        let fire_at_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d
+                .saturating_add(fire_lead)
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
             Err(_) => {
                 // System clock pre-1970 — can't compute a
                 // meaningful fire_at. Drop rather than introduce
@@ -3567,8 +3550,8 @@ impl MeshNode {
             let pool = a_session.thread_local_pool();
             let mut builder = pool.get();
             let seq = {
-                let stream = a_session
-                    .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
+                let stream =
+                    a_session.get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
                 stream.next_tx_seq()
             };
             let events = vec![intro_to_a];
@@ -3585,8 +3568,8 @@ impl MeshNode {
             let pool = b_session.thread_local_pool();
             let mut builder = pool.get();
             let seq = {
-                let stream = b_session
-                    .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
+                let stream =
+                    b_session.get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
                 stream.next_tx_seq()
             };
             let events = vec![intro_to_b];
@@ -3711,9 +3694,8 @@ impl MeshNode {
                     let pool = coord_session.thread_local_pool();
                     let mut builder = pool.get();
                     let seq = {
-                        let stream = coord_session.get_or_create_stream(
-                            super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
-                        );
+                        let stream = coord_session
+                            .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
                         stream.next_tx_seq()
                     };
                     let events = vec![ack_body];
@@ -3744,10 +3726,7 @@ impl MeshNode {
     /// the original sender so the recipient can correlate
     /// against its `pending_punch_acks` map.
     #[cfg(feature = "nat-traversal")]
-    fn forward_punch_ack(
-        ack: super::traversal::rendezvous::PunchAck,
-        ctx: &DispatchCtx,
-    ) {
+    fn forward_punch_ack(ack: super::traversal::rendezvous::PunchAck, ctx: &DispatchCtx) {
         use super::traversal::rendezvous::RendezvousMsg;
 
         let Some((dest_addr, dest_session)) = ctx
@@ -4500,9 +4479,8 @@ impl MeshNode {
         #[cfg(feature = "nat-traversal")]
         let caps = {
             use super::traversal::classify::NatClass;
-            let class = NatClass::from_u8(
-                self.nat_class.load(std::sync::atomic::Ordering::Acquire),
-            );
+            let class =
+                NatClass::from_u8(self.nat_class.load(std::sync::atomic::Ordering::Acquire));
             // Strip any prior `nat:*` tags before adding the fresh
             // one so a reclassification doesn't leave a stale tag
             // behind when the class transitions.
@@ -4608,10 +4586,7 @@ impl MeshNode {
     ///
     /// Requires the `nat-traversal` cargo feature.
     #[cfg(feature = "nat-traversal")]
-    pub fn peer_nat_class(
-        &self,
-        peer_node_id: u64,
-    ) -> super::traversal::classify::NatClass {
+    pub fn peer_nat_class(&self, peer_node_id: u64) -> super::traversal::classify::NatClass {
         use super::traversal::classify::NatClass;
         let Some(caps) = self.capability_index.get(peer_node_id) else {
             return NatClass::Unknown;
@@ -4734,8 +4709,7 @@ impl MeshNode {
             }
             PairAction::SinglePunch => {
                 self.traversal_stats.record_punch_attempt();
-                let self_reflex =
-                    self.reflex_addr().unwrap_or_else(|| self.local_addr());
+                let self_reflex = self.reflex_addr().unwrap_or_else(|| self.local_addr());
 
                 // Install the PunchAck waiter BEFORE firing the
                 // request so a fast round-trip can't beat us to
@@ -5554,10 +5528,8 @@ impl MeshNode {
         relay: u64,
         target: u64,
         self_reflex: std::net::SocketAddr,
-    ) -> Result<
-        super::traversal::rendezvous::PunchIntroduce,
-        super::traversal::TraversalError,
-    > {
+    ) -> Result<super::traversal::rendezvous::PunchIntroduce, super::traversal::TraversalError>
+    {
         use super::traversal::rendezvous::{PunchRequest, RendezvousMsg};
         use super::traversal::TraversalError;
 
@@ -5619,10 +5591,8 @@ impl MeshNode {
     pub async fn await_punch_introduce(
         &self,
         counterpart: u64,
-    ) -> Result<
-        super::traversal::rendezvous::PunchIntroduce,
-        super::traversal::TraversalError,
-    > {
+    ) -> Result<super::traversal::rendezvous::PunchIntroduce, super::traversal::TraversalError>
+    {
         use super::traversal::TraversalError;
         let (tx, rx) = oneshot::channel();
         self.pending_punch_introduces.insert(counterpart, tx);
@@ -5655,10 +5625,7 @@ impl MeshNode {
     pub async fn await_punch_ack(
         &self,
         counterpart: u64,
-    ) -> Result<
-        super::traversal::rendezvous::PunchAck,
-        super::traversal::TraversalError,
-    > {
+    ) -> Result<super::traversal::rendezvous::PunchAck, super::traversal::TraversalError> {
         use super::traversal::TraversalError;
         let (tx, rx) = oneshot::channel();
         self.pending_punch_acks.insert(counterpart, tx);
@@ -5698,12 +5665,7 @@ impl MeshNode {
         // Snapshot up to two peers. Two is enough to distinguish
         // Cone vs. Symmetric (plan §2); sampling more adds probe
         // traffic for no classification gain.
-        let peers: Vec<u64> = self
-            .peers
-            .iter()
-            .map(|e| *e.key())
-            .take(2)
-            .collect();
+        let peers: Vec<u64> = self.peers.iter().map(|e| *e.key()).take(2).collect();
         if peers.len() < 2 {
             return;
         }
@@ -5712,19 +5674,12 @@ impl MeshNode {
         // reflex_timeout window rather than N*timeout. Each probe
         // already respects its own timeout via `probe_reflex`.
         let bind = self.local_addr();
-        let futures = peers
-            .iter()
-            .copied()
-            .map(|peer| async move {
-                let res = self.probe_reflex(peer).await;
-                (peer, res)
-            });
+        let futures = peers.iter().copied().map(|peer| async move {
+            let res = self.probe_reflex(peer).await;
+            (peer, res)
+        });
         let deadline = self.traversal_config.classify_deadline;
-        let results = match tokio::time::timeout(
-            deadline,
-            futures::future::join_all(futures),
-        )
-        .await
+        let results = match tokio::time::timeout(deadline, futures::future::join_all(futures)).await
         {
             Ok(results) => results,
             Err(_elapsed) => {

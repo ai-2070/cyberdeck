@@ -625,7 +625,10 @@ mod tests {
             to_peer: 1,
             punch_id: 1,
         };
-        assert_eq!(RendezvousMsg::PunchRequest(req).encode()[0], KIND_PUNCH_REQUEST);
+        assert_eq!(
+            RendezvousMsg::PunchRequest(req).encode()[0],
+            KIND_PUNCH_REQUEST
+        );
         assert_eq!(
             RendezvousMsg::PunchIntroduce(intro).encode()[0],
             KIND_PUNCH_INTRODUCE

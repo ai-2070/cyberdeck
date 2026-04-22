@@ -78,9 +78,7 @@ async fn build_node(port: u16) -> Arc<MeshNode> {
 /// both handshakes before starting the receive loops so a running
 /// A doesn't conflict with a second inbound accept. Returns the
 /// three started nodes.
-async fn three_node_star(
-    ports: &[u16],
-) -> (Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>) {
+async fn three_node_star(ports: &[u16]) -> (Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>) {
     let a = build_node(ports[0]).await;
     let b = build_node(ports[1]).await;
     let c = build_node(ports[2]).await;

@@ -271,7 +271,10 @@ impl ClassifyFsm {
         // port-restricted cone all produce stable outbound ports
         // per source). If ports differ, we're symmetric.
         let first_port = self.probes[0].1.port();
-        let port_stable = self.probes.iter().all(|(_, reflex)| reflex.port() == first_port);
+        let port_stable = self
+            .probes
+            .iter()
+            .all(|(_, reflex)| reflex.port() == first_port);
         if port_stable {
             NatClass::Cone
         } else {

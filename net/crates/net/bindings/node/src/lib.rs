@@ -160,6 +160,68 @@ pub struct PollOptions {
     pub ordering: Option<String>,
 }
 
+/// Cumulative NAT-traversal counters surfaced via
+/// `NetMesh.traversalStats()`. All counters are monotonic u64s
+/// and never reset — subtract snapshots for deltas. Exposed as
+/// BigInt because JavaScript numbers can't round-trip full u64.
+///
+/// Framing reminder (plan §5): NAT traversal is an optimization,
+/// not a connectivity requirement. `relay_fallbacks` isn't a
+/// failure counter — it counts `connect_direct` resolutions that
+/// stayed on the routed-handshake path, which is always
+/// available regardless of NAT shape.
+#[cfg(feature = "nat-traversal")]
+#[napi(object)]
+pub struct TraversalStats {
+    /// Number of hole-punch attempts the pair-type matrix
+    /// elected to initiate. Bumps once per attempt, whether the
+    /// punch eventually succeeds or falls back.
+    pub punches_attempted: BigInt,
+    /// Subset of attempts that produced a direct session.
+    /// Always `<= punchesAttempted`; the difference is the
+    /// punch-failure rate.
+    pub punches_succeeded: BigInt,
+    /// Number of `connect_direct` resolutions that stayed on
+    /// the routed-handshake path — matrix-skipped pairs plus
+    /// punch-failed attempts. Every `connect_direct` that
+    /// doesn't establish a directly-punched session increments
+    /// this counter.
+    pub relay_fallbacks: BigInt,
+}
+
+/// Convert the core `NatClass` enum to the stable string form
+/// used on the binding boundary. Stable vocabulary per plan §5:
+/// `"open" | "cone" | "symmetric" | "unknown"`. Keep this in
+/// sync with the Python / Go bindings — callers do
+/// `mesh.natType() === "open"` branching against these strings.
+#[cfg(feature = "nat-traversal")]
+fn nat_class_to_string(class: net::adapter::net::traversal::classify::NatClass) -> String {
+    use net::adapter::net::traversal::classify::NatClass;
+    match class {
+        NatClass::Open => "open",
+        NatClass::Cone => "cone",
+        NatClass::Symmetric => "symmetric",
+        NatClass::Unknown => "unknown",
+    }
+    .to_string()
+}
+
+/// Format a core `TraversalError` into a NAPI `Error` whose
+/// message follows the `traversal: <kind>[: <detail>]`
+/// convention — mirrors the `migration: <kind>[: <detail>]`
+/// pattern used by the compute module. The kind string is the
+/// stable discriminator callers parse in `catch (e) { ... }`.
+#[cfg(feature = "nat-traversal")]
+fn traversal_err(e: net::adapter::net::traversal::TraversalError) -> Error {
+    use net::adapter::net::traversal::TraversalError;
+    let body = match &e {
+        TraversalError::Transport(msg) => format!("transport: {msg}"),
+        TraversalError::RendezvousRejected(msg) => format!("rendezvous-rejected: {msg}"),
+        _ => e.kind().to_string(),
+    };
+    Error::from_reason(format!("traversal: {body}"))
+}
+
 /// A stored event returned from polling.
 #[napi(object)]
 pub struct StoredEvent {
@@ -1775,6 +1837,156 @@ mod mesh_bindings {
         #[cfg(feature = "compute")]
         pub(crate) fn channel_configs_arc(&self) -> Arc<net::adapter::net::ChannelConfigRegistry> {
             self.channel_configs.clone()
+        }
+    }
+
+    // =====================================================================
+    // NAT traversal surface — separate `#[napi] impl` block so the outer
+    // `#[napi]` on the main `impl NetMesh` doesn't try to register the
+    // `*_c_callback` symbols that don't exist without the `nat-traversal`
+    // feature. napi-derive collects method names at expansion time
+    // regardless of inner `#[cfg]` attributes, so the feature gate has
+    // to live on the *impl block* itself. Same structural rationale as
+    // the `test-helpers` block below.
+    //
+    // Framing (plan §5, load-bearing): every user-visible docstring
+    // positions NAT traversal as **optimization, not correctness**.
+    // Nodes behind NAT can always reach each other via the routed-
+    // handshake path; these APIs let the mesh upgrade to a direct
+    // path when the NATs allow it. A `nat_type` of `symmetric` or a
+    // `traversal: punch-failed` error is not a connectivity failure.
+    // =====================================================================
+
+    #[cfg(feature = "nat-traversal")]
+    #[napi]
+    impl NetMesh {
+        /// NAT classification for this mesh, as a stable string:
+        /// `"open" | "cone" | "symmetric" | "unknown"`. `unknown`
+        /// is the pre-classification state; classification runs
+        /// in the background after `start()` once ≥2 peers are
+        /// connected.
+        #[napi]
+        pub fn nat_type(&self) -> Result<String> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            Ok(nat_class_to_string(node.nat_class()))
+        }
+
+        /// This mesh's public-facing `ip:port` as observed by a
+        /// remote peer, or `null` before classification has
+        /// produced an observation. Rides on outbound capability
+        /// announcements so peers can attempt direct connects
+        /// without a separate discovery round-trip.
+        #[napi]
+        pub fn reflex_addr(&self) -> Result<Option<String>> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            Ok(node.reflex_addr().map(|addr| addr.to_string()))
+        }
+
+        /// NAT classification most recently advertised by
+        /// `peer_node_id` (parsed from the `nat:*` tag on their
+        /// capability announcement). Returns `"unknown"` when
+        /// the peer hasn't announced. The pair-type matrix
+        /// treats Unknown as "attempt direct, fall back on
+        /// failure," never "don't attempt."
+        #[napi]
+        pub fn peer_nat_type(&self, peer_node_id: BigInt) -> Result<String> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let (_, peer_id, _) = peer_node_id.get_u64();
+            Ok(nat_class_to_string(node.peer_nat_class(peer_id)))
+        }
+
+        /// Send one reflex probe to `peer_node_id` and resolve
+        /// with the public `ip:port` the peer observed on the
+        /// probe's UDP envelope. Useful for tests and for
+        /// diagnosing misclassifications.
+        ///
+        /// Rejects with an `Error` whose `message` follows the
+        /// `traversal: <kind>[: <detail>]` convention (kinds:
+        /// `reflex-timeout`, `peer-not-reachable`, `transport`).
+        #[napi]
+        pub async fn probe_reflex(&self, peer_node_id: BigInt) -> Result<String> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let (_, peer_id, _) = peer_node_id.get_u64();
+            node.probe_reflex(peer_id)
+                .await
+                .map(|addr| addr.to_string())
+                .map_err(traversal_err)
+        }
+
+        /// Explicitly re-run the classification sweep. Normally
+        /// the background loop handles this; call this after a
+        /// suspected NAT rebind (e.g. gateway reboot) to
+        /// accelerate re-classification. No-op when fewer than
+        /// 2 peers are connected. Never rejects.
+        #[napi]
+        pub async fn reclassify_nat(&self) -> Result<()> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            node.reclassify_nat().await;
+            Ok(())
+        }
+
+        /// Cumulative NAT-traversal counters for this mesh.
+        /// Object shape: `{ punchesAttempted, punchesSucceeded,
+        /// relayFallbacks }` — all u64 bigints, monotonic, never
+        /// reset. Useful for telemetry on punch success rate and
+        /// relay load.
+        #[napi]
+        pub fn traversal_stats(&self) -> Result<TraversalStats> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let snap = node.traversal_stats();
+            Ok(TraversalStats {
+                punches_attempted: BigInt::from(snap.punches_attempted),
+                punches_succeeded: BigInt::from(snap.punches_succeeded),
+                relay_fallbacks: BigInt::from(snap.relay_fallbacks),
+            })
+        }
+
+        /// Establish a session to `peer_node_id` via the
+        /// rendezvous path. The pair-type matrix decides between
+        /// a direct handshake and a relay-coordinated punch;
+        /// either way the returned session is equivalent in
+        /// correctness to `connect()`.
+        ///
+        /// **Optimization, not correctness.** `connect_direct`
+        /// always resolves (on punch-failed, the session is
+        /// established via the routed-handshake fallback).
+        /// Inspect `traversal_stats()` afterward to distinguish
+        /// a successful punch from a relay fallback.
+        ///
+        /// Rejects with `traversal: peer-not-reachable` when we
+        /// have no cached reflex for `peer_node_id`, or
+        /// `traversal: transport: ...` on a socket-level
+        /// handshake error.
+        #[napi]
+        pub async fn connect_direct(
+            &self,
+            peer_node_id: BigInt,
+            peer_public_key: Buffer,
+            coordinator: BigInt,
+        ) -> Result<()> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let pubkey_bytes: &[u8] = peer_public_key.as_ref();
+            if pubkey_bytes.len() != 32 {
+                return Err(Error::from_reason(format!(
+                    "peer_public_key must be 32 bytes, got {}",
+                    pubkey_bytes.len()
+                )));
+            }
+            let mut pubkey = [0u8; 32];
+            pubkey.copy_from_slice(pubkey_bytes);
+            let (_, peer_id, _) = peer_node_id.get_u64();
+            let (_, coord_id, _) = coordinator.get_u64();
+            node.connect_direct(peer_id, &pubkey, coord_id)
+                .await
+                .map_err(traversal_err)?;
+            Ok(())
         }
     }
 

@@ -104,12 +104,7 @@ async fn connect_pair(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
 /// ≥2 peers for `reclassify_nat` to produce a reflex.
 async fn rendezvous_topology(
     ports: &[u16],
-) -> (
-    Arc<MeshNode>,
-    Arc<MeshNode>,
-    Arc<MeshNode>,
-    Arc<MeshNode>,
-) {
+) -> (Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>) {
     let a = build_node(ports[0]).await;
     let r = build_node(ports[1]).await;
     let b = build_node(ports[2]).await;
@@ -274,10 +269,10 @@ async fn ack_wait_times_out_when_punch_uncoordinated() {
     // reflex for B. Running the two concurrently makes the
     // test bounded by the longer of the two deadlines.
     let a_bind = a.local_addr();
-    let (req_result, ack_result) = tokio::join!(
-        a.request_punch(r.node_id(), b_id, a_bind),
-        async { ack_task.await.expect("ack task panicked") },
-    );
+    let (req_result, ack_result) =
+        tokio::join!(a.request_punch(r.node_id(), b_id, a_bind), async {
+            ack_task.await.expect("ack task panicked")
+        },);
 
     assert!(req_result.is_err(), "request_punch should fail");
     assert!(ack_result.is_err(), "ack waiter should time out");

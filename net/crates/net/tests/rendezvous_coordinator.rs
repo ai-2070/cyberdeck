@@ -108,12 +108,7 @@ async fn connect_pair(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
 /// target; the punch itself still routes A → R → B.
 async fn rendezvous_topology(
     ports: &[u16],
-) -> (
-    Arc<MeshNode>,
-    Arc<MeshNode>,
-    Arc<MeshNode>,
-    Arc<MeshNode>,
-) {
+) -> (Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>) {
     let a = build_node(ports[0]).await;
     let r = build_node(ports[1]).await;
     let b = build_node(ports[2]).await;

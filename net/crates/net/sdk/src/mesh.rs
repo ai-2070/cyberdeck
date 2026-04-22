@@ -879,9 +879,7 @@ impl Mesh {
     ///
     /// Requires the `nat-traversal` cargo feature.
     #[cfg(feature = "nat-traversal")]
-    pub fn traversal_stats(
-        &self,
-    ) -> net::adapter::net::traversal::TraversalStatsSnapshot {
+    pub fn traversal_stats(&self) -> net::adapter::net::traversal::TraversalStatsSnapshot {
         self.node.traversal_stats()
     }
 }
