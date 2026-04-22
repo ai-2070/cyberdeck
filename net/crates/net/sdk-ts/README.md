@@ -112,28 +112,30 @@ await NetNode.create({
 
 ## NAT Traversal (optimization, not correctness)
 
-Two NATed peers already reach each other through the mesh's routed-handshake path. NAT traversal opens a shorter direct path when the NAT shape allows it; it's never required for connectivity. The surface is exposed on the underlying `@ai2070/net` native handle (camelCased methods) and is a no-op when the native library was built without `--features nat-traversal`.
+Two NATed peers already reach each other through the mesh's routed-handshake path. NAT traversal opens a shorter direct path when the NAT shape allows it; it's never required for connectivity. The TS SDK doesn't yet wrap this surface — it's a planned follow-up. For now, construct a `NetMesh` from `@ai2070/net` directly to access the NAPI methods:
 
 ```ts
-// Access via the underlying NAPI handle. Ergonomic TS SDK
-// wrappers are a planned follow-up; the NAPI methods mirror
-// the Rust SDK surface directly.
-const meshNative = (node as any)._native; // NapiNetMesh
+import { NetMesh } from '@ai2070/net';
 
-await meshNative.reclassifyNat();
+const mesh = await NetMesh.create({
+  bindAddr: '0.0.0.0:9000',
+  psk: '00'.repeat(32),
+});
 
-const klass  = meshNative.natType();            // "open" | "cone" | "symmetric" | "unknown"
-const reflex = meshNative.reflexAddr();         // "203.0.113.5:9001" | null
+await mesh.reclassifyNat();
 
-const observed = await meshNative.probeReflex(peerNodeId); // "ip:port"
+const klass  = mesh.natType();            // "open" | "cone" | "symmetric" | "unknown"
+const reflex = mesh.reflexAddr();         // "203.0.113.5:9001" | null
+
+const observed = await mesh.probeReflex(peerNodeId); // "ip:port"
 
 // Attempt a direct connection via the pair-type matrix.
 // `coordinator` mediates the punch when the matrix picks one.
 // Always resolves — stats tell you which path won.
-await meshNative.connectDirect(peerNodeId, peerPubkeyHex, coordinatorNodeId);
+await mesh.connectDirect(peerNodeId, peerPubkeyHex, coordinatorNodeId);
 
 // Cumulative counters — all BigInt, monotonic.
-const s = meshNative.traversalStats();
+const s = mesh.traversalStats();
 s.punchesAttempted;   // coordinator mediated a PunchRequest + Introduce
 s.punchesSucceeded;   // ack arrived AND direct handshake landed
 s.relayFallbacks;     // landed on the routed path after skip/fail
@@ -142,14 +144,29 @@ s.relayFallbacks;     // landed on the routed path after skip/fail
 Operators with a known-public address skip the classifier sweep entirely. The override pins `"open"` + the supplied address on every capability announcement; call `announceCapabilities()` after to propagate (the setter resets the rate-limit floor so the next announce is guaranteed to broadcast).
 
 ```ts
-meshNative.setReflexOverride('203.0.113.5:9001');
-await meshNative.announceCapabilities(/* caps */);
+mesh.setReflexOverride('203.0.113.5:9001');
+await mesh.announceCapabilities(/* caps */);
 // later:
-meshNative.clearReflexOverride();
-await meshNative.announceCapabilities(/* caps */);
+mesh.clearReflexOverride();
+await mesh.announceCapabilities(/* caps */);
 ```
 
-`NetError` instances from traversal calls carry a stable `kind` discriminator (`reflex-timeout` | `peer-not-reachable` | `transport` | `rendezvous-no-relay` | `rendezvous-rejected` | `punch-failed` | `port-map-unavailable` | `unsupported`). A build without the `nat-traversal` feature surfaces every traversal call as `unsupported` — the routed path keeps working regardless.
+Traversal failures surface as `Error` instances whose `message` follows the stable `traversal: <kind>[: <detail>]` convention. The `<kind>` discriminator is one of `reflex-timeout` | `peer-not-reachable` | `transport` | `rendezvous-no-relay` | `rendezvous-rejected` | `punch-failed` | `port-map-unavailable` | `unsupported`. Match on the prefix:
+
+```ts
+try {
+  await mesh.connectDirect(peerNodeId, peerPubkeyHex, coordId);
+} catch (e) {
+  const msg = (e as Error).message;
+  if (msg.startsWith('traversal: unsupported')) {
+    // native library built without --features nat-traversal
+  } else if (msg.startsWith('traversal: peer-not-reachable')) {
+    // ...
+  }
+}
+```
+
+A build without the `nat-traversal` feature raises `traversal: unsupported` for every NAT call — the routed path keeps working regardless. The NAPI type declarations for these methods are only generated when the build-time type-gen runs against a build *with* the feature, so a feature-off cdylib may require an `as any` cast or a local `.d.ts` augmentation.
 
 ## Mesh Streams (multi-peer + back-pressure)
 
