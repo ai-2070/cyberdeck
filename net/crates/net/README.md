@@ -777,11 +777,14 @@ No features are enabled by default — opt into `redis`, `jetstream`, `net`, etc
 ## Building
 
 ```bash
-# Default (Redis adapter)
+# Core only — no adapters (opt in with a feature flag).
 cargo build --release
 
+# Redis adapter
+cargo build --release --features redis
+
 # Net only (2MB binary)
-cargo build --release --no-default-features --features net
+cargo build --release --features net
 
 # Everything
 cargo build --release --all-features
