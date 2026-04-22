@@ -602,7 +602,13 @@ impl StandbyGroup {
     #[napi]
     pub fn on_event_delivered(&self, event: crate::compute::CausalEventJs) -> Result<()> {
         use ::net::adapter::net::state::causal::{CausalEvent, CausalLink};
-        let sequence = crate::compute::daemon_bigint_u64("event.sequence", event.sequence)?;
+        // Route through the group validator (not the compute one)
+        // so an invalid BigInt lands as `daemon: group: invalid-config`
+        // — the TS wrapper's `toGroupError` classifier then turns it
+        // into `GroupError { kind: 'invalid-config' }`. Using
+        // `daemon_bigint_u64` would leak through as plain `DaemonError`
+        // and break the typed-error contract this class promises.
+        let sequence = group_bigint_u64("event.sequence", event.sequence)?;
         let core_event = CausalEvent {
             link: CausalLink {
                 origin_hash: event.origin_hash,

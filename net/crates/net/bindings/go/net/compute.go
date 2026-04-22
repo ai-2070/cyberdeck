@@ -230,7 +230,7 @@ func (rt *DaemonRuntime) RegisterFactoryFunc(kind string, factory DaemonFactory)
 	// discriminator; per-runtime duplicate-kind rejection is the
 	// Rust layer's job (it returns `DUPLICATE_KIND` from the FFI
 	// when a given DaemonRuntime already has `kind` registered).
-	prev, existed := swapFactoryFunc(rt.runtimeID, kind, factory)
+	prev, existed, ourEpoch := swapFactoryFunc(rt.runtimeID, kind, factory)
 
 	kindBytes := []byte(kind)
 	var ptr *C.char
@@ -246,20 +246,22 @@ func (rt *DaemonRuntime) RegisterFactoryFunc(kind string, factory DaemonFactory)
 		// Rust says this runtime already had the kind. Restore
 		// the prior Go-side factory so a subsequent migration
 		// into the original runtime still resolves correctly.
-		restoreFactoryFunc(rt.runtimeID, kind, prev, existed)
+		// Epoch-gated so a concurrent successful registration
+		// doesn't get clobbered by this rollback.
+		restoreFactoryFunc(rt.runtimeID, kind, ourEpoch, prev, existed)
 		return &DuplicateKindError{Kind: kind}
 	case C.NET_COMPUTE_ERR_CALL_FAILED:
 		// The Rust side maps `DaemonError::ShuttingDown` /
 		// `NotReady` to this code. Callers racing a concurrent
 		// `Shutdown` should see the typed shutdown sentinel, not
 		// a generic CALL_FAILED message.
-		restoreFactoryFunc(rt.runtimeID, kind, prev, existed)
+		restoreFactoryFunc(rt.runtimeID, kind, ourEpoch, prev, existed)
 		return ErrRuntimeShutDown
 	case C.NET_COMPUTE_ERR_NULL:
-		restoreFactoryFunc(rt.runtimeID, kind, prev, existed)
+		restoreFactoryFunc(rt.runtimeID, kind, ourEpoch, prev, existed)
 		return &DaemonError{Message: "register_factory_with_func: null argument"}
 	default:
-		restoreFactoryFunc(rt.runtimeID, kind, prev, existed)
+		restoreFactoryFunc(rt.runtimeID, kind, ourEpoch, prev, existed)
 		return &DaemonError{Message: fmt.Sprintf("register_factory_with_func: unexpected code %d", code)}
 	}
 }

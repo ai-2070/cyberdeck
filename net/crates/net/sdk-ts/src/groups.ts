@@ -279,7 +279,11 @@ export class ReplicaGroup {
   }
 
   onNodeRecovery(recoveredNodeId: bigint): void {
-    this.inner.onNodeRecovery(recoveredNodeId);
+    try {
+      this.inner.onNodeRecovery(recoveredNodeId);
+    } catch (e) {
+      toGroupError(e);
+    }
   }
 
   get health(): GroupHealth {
@@ -368,7 +372,11 @@ export class ForkGroup {
   }
 
   onNodeRecovery(recoveredNodeId: bigint): void {
-    this.inner.onNodeRecovery(recoveredNodeId);
+    try {
+      this.inner.onNodeRecovery(recoveredNodeId);
+    } catch (e) {
+      toGroupError(e);
+    }
   }
 
   get health(): GroupHealth {
@@ -507,7 +515,11 @@ export class StandbyGroup {
   }
 
   onNodeRecovery(recoveredNodeId: bigint): void {
-    this.inner.onNodeRecovery(recoveredNodeId);
+    try {
+      this.inner.onNodeRecovery(recoveredNodeId);
+    } catch (e) {
+      toGroupError(e);
+    }
   }
 
   get health(): GroupHealth {

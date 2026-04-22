@@ -221,30 +221,42 @@ func (h *MigrationHandle) Wait() error {
 	return migrationErr(code, errOut)
 }
 
+// clampTimeoutToU64Ms converts a `time.Duration` to the u64
+// milliseconds the Rust FFI expects, clamping non-positive
+// durations to zero. Extracted as a pure helper so the clamp is
+// unit-testable without spinning up a real migration handle — a
+// nil-handle test would short-circuit via the `handle == nil`
+// guard in `WaitWithTimeout` and never exercise this branch.
+//
+// Rationale: `time.Duration.Milliseconds()` returns `int64`.
+// A negative value cast straight to `uint64` wraps to a huge
+// number — `-1 ns` becomes roughly 584 million years — which
+// would turn a past-deadline call into effectively infinite
+// blocking. Clamping to 0 forces the FFI to "check once and
+// return."
+func clampTimeoutToU64Ms(d time.Duration) uint64 {
+	ms := d.Milliseconds()
+	if ms < 0 {
+		return 0
+	}
+	return uint64(ms)
+}
+
 // WaitWithTimeout is like Wait but aborts the migration on
 // timeout and returns a *MigrationError describing the stall.
 //
-// A zero or negative timeout aborts immediately — the Rust FFI
-// takes a `u64`, so a negative `time.Duration` would otherwise
-// wrap to a massive wait (~584 million years for -1 ns), turning
-// a past-deadline call into effectively infinite blocking.
+// A zero or negative timeout aborts immediately — see
+// [`clampTimeoutToU64Ms`] for why.
 func (h *MigrationHandle) WaitWithTimeout(timeout time.Duration) error {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	if h.handle == nil {
 		return ErrRuntimeShutDown
 	}
-	// Clamp non-positive durations to zero so the FFI treats
-	// them as "check once and return" rather than wrapping to
-	// a garbage u64.
-	ms := timeout.Milliseconds()
-	if ms < 0 {
-		ms = 0
-	}
 	var errOut *C.char
 	code := C.net_compute_migration_handle_wait_with_timeout(
 		h.handle,
-		C.uint64_t(ms),
+		C.uint64_t(clampTimeoutToU64Ms(timeout)),
 		&errOut,
 	)
 	return migrationErr(code, errOut)

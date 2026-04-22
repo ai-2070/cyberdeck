@@ -281,31 +281,63 @@ func TestRegressionDurationToMillisU32Clamp(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// P2 regression: negative `time.Duration` must not wrap to a
-// huge `uint64` timeout in `MigrationHandle.WaitWithTimeout`.
+// P2 regression: negative / huge `time.Duration` must clamp to a
+// well-formed `uint64` ms for `MigrationHandle.WaitWithTimeout`.
 //
 // `time.Duration.Milliseconds()` returns `int64`. Before the fix,
-// passing a negative duration (or any `time.Until(pastDeadline)`
-// that resolved past zero) cast to `C.uint64_t` and wrapped into
-// a ~584-million-year wait — turning a past-deadline call into
-// effectively infinite blocking. The fix clamps `ms < 0` to zero
-// so the FFI sees "check once and return."
+// passing a negative duration (or `time.Until(pastDeadline)` that
+// resolved past zero) cast straight to `C.uint64_t` and wrapped
+// into ~584 million years of wait — a past-deadline call turned
+// into effectively infinite blocking. The fix extracts the clamp
+// into `clampTimeoutToU64Ms` and `WaitWithTimeout` routes through
+// it.
 //
-// We test the clamp indirectly: a handle that doesn't exist
-// (nil-handled) returns ErrRuntimeShutDown regardless of timeout,
-// but exercising the code path with a negative duration proves
-// the call itself doesn't hang waiting for a wraparound timeout.
+// Testing the clamp on a live `*MigrationHandle` with a nil handle
+// is a false positive: the nil-check short-circuits to
+// `ErrRuntimeShutDown` before the clamp runs. Exercise the helper
+// directly so every branch is covered — including values that
+// *should* pass through unchanged.
 // ---------------------------------------------------------------------------
 
-func TestRegressionMigrationHandleWaitWithTimeoutNegativeDurationClamps(t *testing.T) {
-	// Construct a closed handle directly — no mesh / migration
-	// needed. The read-lock check fires first and returns
-	// ErrRuntimeShutDown; the interesting property is that the
-	// call returns *promptly* instead of spinning up the C call
-	// with a wrapped timeout.
+func TestRegressionClampTimeoutToU64Ms(t *testing.T) {
+	cases := []struct {
+		name string
+		in   time.Duration
+		want uint64
+	}{
+		{"zero", 0, 0},
+		// Any negative duration — the bug path: -1 ns would
+		// otherwise wrap to 0xFFFF_FFFF_FFFF_FFFF.
+		{"negative_nanosecond", -time.Nanosecond, 0},
+		{"negative_one_second", -time.Second, 0},
+		{"min_int64", time.Duration(math.MinInt64), 0},
+		{"one_ms", time.Millisecond, 1},
+		{"one_second", time.Second, 1000},
+		// Upper end: large but still int64-positive values flow
+		// through as their millisecond count.
+		{"one_hour", time.Hour, 3600 * 1000},
+		// math.MaxInt64 ns expressed in ms — the divide-by-1e6
+		// keeps it int64-representable.
+		{"max_int64_ns", time.Duration(math.MaxInt64), uint64(math.MaxInt64) / 1_000_000},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := clampTimeoutToU64Ms(tc.in)
+			if got != tc.want {
+				t.Fatalf("clampTimeoutToU64Ms(%v) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRegressionMigrationHandleWaitWithTimeoutOnClosedHandle(t *testing.T) {
+	// Independently verify the `handle == nil` short-circuit so a
+	// refactor of `WaitWithTimeout` can't silently drop the shutdown
+	// guard. Negative duration is passed to exercise the lock path
+	// first; the clamp itself is covered by
+	// `TestRegressionClampTimeoutToU64Ms` above.
 	h := &MigrationHandle{handle: nil}
 
-	deadline := time.Now().Add(500 * time.Millisecond)
 	done := make(chan error, 1)
 	go func() {
 		done <- h.WaitWithTimeout(-1 * time.Second)
@@ -314,22 +346,10 @@ func TestRegressionMigrationHandleWaitWithTimeoutNegativeDurationClamps(t *testi
 	select {
 	case err := <-done:
 		if !errors.Is(err, ErrRuntimeShutDown) {
-			t.Errorf("WaitWithTimeout(-1s) on closed handle = %v, want ErrRuntimeShutDown", err)
+			t.Errorf("WaitWithTimeout on nil handle = %v, want ErrRuntimeShutDown", err)
 		}
-	case <-time.After(time.Until(deadline)):
-		t.Fatal("WaitWithTimeout(-1s) did not return within 500ms — negative duration may have wrapped to a huge u64 timeout")
-	}
-
-	// Same with a zero duration — must also return promptly.
-	done = make(chan error, 1)
-	go func() {
-		done <- h.WaitWithTimeout(0)
-	}()
-	select {
-	case <-done:
-		// Any outcome is fine; we only care that the call terminated.
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("WaitWithTimeout(0) did not return within 500ms")
+		t.Fatal("WaitWithTimeout on nil handle did not return within 500ms")
 	}
 }
 

@@ -104,6 +104,29 @@ type factoryKey struct {
 	kind      string
 }
 
+// factoryEntry pairs the registered `fn` with a monotonic epoch
+// assigned by `swapFactoryFunc`. The epoch lets `restoreFactoryFunc`
+// detect a concurrent successful registration for the same key and
+// *not* clobber it with a stale rollback — without it, two
+// interleaved RegisterFactoryFunc calls can corrupt the global map:
+//
+//	T1 swap(k, A)  — entry={A, 1}
+//	T2 swap(k, B)  — entry={B, 2}   (succeeds native-side)
+//	T1 native failed → restore(k, prev={}, existed=false)
+//	                   …would delete entry={B, 2}  ← the bug
+//
+// With the epoch check, T1's restore sees `current.epoch == 2 != 1`
+// and leaves the map alone. Only the thread that last successfully
+// placed an entry can roll it back.
+type factoryEntry struct {
+	fn    DaemonFactory
+	epoch uint64
+}
+
+// factoryEpoch is a process-wide monotonic counter minted on every
+// `swapFactoryFunc`. Values start at 1; 0 is a "no epoch" sentinel.
+var factoryEpoch atomic.Uint64
+
 var (
 	daemonsMu sync.RWMutex
 	daemons   = make(map[uint64]MeshDaemon)
@@ -119,32 +142,40 @@ var (
 	//   - Stale entries from a closed runtime can be purged in one
 	//     sweep via `purgeFactoryFuncsForRuntime(runtimeID)`.
 	factoryFuncsMu sync.RWMutex
-	factoryFuncs   = make(map[factoryKey]DaemonFactory)
+	factoryFuncs   = make(map[factoryKey]factoryEntry)
 )
 
-// swapFactoryFunc stores `fn` under `(runtimeID, kind)` and returns
-// the prior entry (if any) so it can be restored on rollback. Used
-// by `RegisterFactoryFunc`: mutate first so the trampoline has the
-// entry ready before the native register call lets migrations fire,
-// then restore via `restoreFactoryFunc` if the native side rejected.
-func swapFactoryFunc(runtimeID uint64, kind string, fn DaemonFactory) (prev DaemonFactory, existed bool) {
+// swapFactoryFunc stores `fn` under `(runtimeID, kind)` with a
+// fresh epoch. Returns the prior entry (if any), the prior-existed
+// bool, and our newly-minted epoch. Callers pass all three to
+// `restoreFactoryFunc` if the native side later rejects the
+// registration.
+func swapFactoryFunc(runtimeID uint64, kind string, fn DaemonFactory) (prev factoryEntry, existed bool, ourEpoch uint64) {
 	k := factoryKey{runtimeID: runtimeID, kind: kind}
+	ourEpoch = factoryEpoch.Add(1)
 	factoryFuncsMu.Lock()
 	defer factoryFuncsMu.Unlock()
 	prev, existed = factoryFuncs[k]
-	factoryFuncs[k] = fn
+	factoryFuncs[k] = factoryEntry{fn: fn, epoch: ourEpoch}
 	return
 }
 
-// restoreFactoryFunc undoes a `swapFactoryFunc`. If the key had no
-// prior entry, the new entry is deleted; otherwise the prior
-// factory is put back. Called on every non-OK branch of
-// `RegisterFactoryFunc` so a rejected registration doesn't leave a
-// stale factory bound to the (runtimeID, kind) pair.
-func restoreFactoryFunc(runtimeID uint64, kind string, prev DaemonFactory, existed bool) {
+// restoreFactoryFunc undoes a `swapFactoryFunc` iff the current
+// entry is still the one the caller wrote (matched by `ourEpoch`).
+// If a concurrent thread successfully overwrote the entry in the
+// meantime, leave it alone — that thread owns the slot now, and
+// clobbering it with stale state would re-introduce the
+// process-global overwrite bug at a smaller scale.
+func restoreFactoryFunc(runtimeID uint64, kind string, ourEpoch uint64, prev factoryEntry, existed bool) {
 	k := factoryKey{runtimeID: runtimeID, kind: kind}
 	factoryFuncsMu.Lock()
 	defer factoryFuncsMu.Unlock()
+	current, present := factoryFuncs[k]
+	if !present || current.epoch != ourEpoch {
+		// A concurrent writer owns (or purged) this entry. Not
+		// ours to touch.
+		return
+	}
 	if existed {
 		factoryFuncs[k] = prev
 	} else {
@@ -156,7 +187,7 @@ func restoreFactoryFunc(runtimeID uint64, kind string, prev DaemonFactory, exist
 func lookupFactoryFunc(runtimeID uint64, kind string) DaemonFactory {
 	factoryFuncsMu.RLock()
 	defer factoryFuncsMu.RUnlock()
-	return factoryFuncs[factoryKey{runtimeID: runtimeID, kind: kind}]
+	return factoryFuncs[factoryKey{runtimeID: runtimeID, kind: kind}].fn
 }
 
 // purgeFactoryFuncsForRuntime removes every factory registered

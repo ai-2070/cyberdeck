@@ -173,9 +173,6 @@ export declare class DaemonRuntime {
    */
   deliver(originHash: number, event: CausalEventJs): Promise<Array<Buffer>>
   /**
-   * Spawn a `ReplicaGroup` bound to this runtime. `kind` must
-   * have been registered via [`Self::register_factory`]; the
-   * group invokes the factory once per replica at spawn and
    * Initiate a migration for the daemon identified by
    * `originHash`, moving it from `sourceNode` to `targetNode`.
    *
