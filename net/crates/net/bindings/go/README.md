@@ -594,6 +594,105 @@ Cross-SDK behaviour is fixed by the Rust integration suite; see
 [`tests/channel_auth.rs`](../../tests/channel_auth.rs) and
 [`tests/channel_auth_hardening.rs`](../../tests/channel_auth_hardening.rs).
 
+## Compute Groups (Replica / Fork / Standby)
+
+HA / scaling overlays on top of `DaemonRuntime`. Build the cdylib
+with the `groups` feature (implies `compute`) to expose the three
+group constructors plus typed `GroupError` / `GroupErrorKind`.
+
+- **`ReplicaGroup`** — N interchangeable copies. Deterministic
+  identity from `group_seed + index`; load-balances inbound events
+  across healthy members; auto-replaces on node failure.
+- **`ForkGroup`** — N independent daemons forked from a common
+  parent at `forkSeq`. Unique keypairs, shared ancestry via a
+  verifiable `GroupForkRecord`.
+- **`StandbyGroup`** — active-passive replication. One member
+  processes events; standbys hold snapshots and catch up via
+  `SyncStandbys()`. On active failure the most-synced standby
+  promotes and replays buffered events.
+
+```go
+rt, err := net.NewDaemonRuntime(mesh)
+if err != nil { log.Fatal(err) }
+defer rt.Close()
+_ = rt.RegisterFactoryFunc("counter", func() net.MeshDaemon {
+    return &counterDaemon{}
+})
+
+// --- ReplicaGroup -------------------------------------------------
+seed := bytes.Repeat([]byte{0x11}, 32)
+replicas, err := net.NewReplicaGroup(rt, "counter", net.ReplicaGroupConfig{
+    ReplicaCount: 3,
+    GroupSeed:    seed,
+    LBStrategy:   net.StrategyConsistentHash,
+})
+if err != nil { log.Fatal(err) }
+defer replicas.Close()
+
+origin, _ := replicas.RouteEvent("user:42")
+_, _ = rt.Deliver(origin, event)
+_ = replicas.ScaleTo(5)
+
+// --- ForkGroup ----------------------------------------------------
+forks, err := net.NewForkGroup(rt, "counter",
+    /* parentOrigin */ 0xABCDEF01,
+    /* forkSeq     */ 42,
+    net.ForkGroupConfig{ForkCount: 3, LBStrategy: net.StrategyRoundRobin})
+if err != nil { log.Fatal(err) }
+defer forks.Close()
+if !forks.VerifyLineage() {
+    log.Fatal("lineage mismatch")
+}
+for _, rec := range forks.ForkRecords() {
+    fmt.Println(rec.ForkedOrigin, rec.ForkSeq)
+}
+
+// --- StandbyGroup -------------------------------------------------
+hot, err := net.NewStandbyGroup(rt, "counter", net.StandbyGroupConfig{
+    MemberCount: 3,                         // 1 active + 2 standbys
+    GroupSeed:   bytes.Repeat([]byte{0x77}, 32),
+})
+if err != nil { log.Fatal(err) }
+defer hot.Close()
+
+_, _ = rt.Deliver(hot.ActiveOrigin(), event)
+// Event-delivered buffering for replay on promotion is a follow-up
+// in the Go surface; currently expose SyncStandbys for periodic
+// catchup and Promote / OnNodeFailure for failover.
+if _, err := hot.SyncStandbys(); err != nil { log.Fatal(err) }
+// newActive, err := hot.Promote()  // or hot.OnNodeFailure(failedNodeID)
+```
+
+### Typed errors
+
+Group failures return `*GroupError` (embeds `*DaemonError`) whose
+`Kind` field is one of the stable `GroupErrorKind` constants:
+
+```go
+_, err := net.NewReplicaGroup(rt, "never-registered", cfg)
+var ge *net.GroupError
+if errors.As(err, &ge) {
+    switch ge.Kind {
+    case net.GroupErrNotReady:         // runtime.Start() didn't run
+    case net.GroupErrFactoryNotFound:  // kind wasn't registered
+    case net.GroupErrNoHealthyMember:  // RouteEvent on all-down group
+    case net.GroupErrInvalidConfig:    // ge.Detail has specifics
+    case net.GroupErrPlacementFailed:
+    case net.GroupErrRegistryFailed:
+    case net.GroupErrDaemon:
+    }
+}
+```
+
+Because `*GroupError` embeds `*DaemonError`, `errors.As(&de)` still
+reaches the underlying daemon-level error for callers that only
+care about the broader type.
+
+Full staging, wire formats, and rationale:
+[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../../docs/SDK_GROUPS_SURFACE_PLAN.md).
+Core semantics:
+[`../../README.md#daemons`](../../README.md#daemons).
+
 ## Running the Example
 
 ```bash

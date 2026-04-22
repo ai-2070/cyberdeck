@@ -237,6 +237,69 @@ Cross-SDK contract + rationale:
 > paths. Follow-up work to proxy them through `net_sdk` is tracked
 > in [`SDK_PYTHON_PARITY_PLAN.md`](../docs/SDK_PYTHON_PARITY_PLAN.md).
 
+## Groups (replica / fork / standby)
+
+HA / scaling overlays on top of `DaemonRuntime` — `ReplicaGroup`,
+`ForkGroup`, `StandbyGroup` — ship on the native **`net`** PyO3
+package (when built with the `groups` feature). Import directly:
+
+```python
+from net import (
+    DaemonRuntime, ReplicaGroup, ForkGroup, StandbyGroup,
+    GroupError, group_error_kind,
+)
+
+rt = DaemonRuntime(mesh)
+rt.register_factory("counter", lambda: CounterDaemon())
+
+# N interchangeable replicas with deterministic per-index identity.
+replicas = ReplicaGroup.spawn(
+    rt, "counter",
+    replica_count=3,
+    group_seed=bytes([0x11] * 32),
+    lb_strategy="consistent-hash",   # or "round-robin" | "least-load" | ...
+)
+origin = replicas.route_event({"routing_key": "user:42"})
+rt.deliver(origin, event)
+replicas.scale_to(5)
+
+# N independent daemons forked from a common parent; verifiable lineage.
+forks = ForkGroup.fork(
+    rt, "counter",
+    parent_origin=0xABCDEF01,
+    fork_seq=42,
+    fork_count=3,
+    lb_strategy="round-robin",
+)
+assert forks.verify_lineage()
+
+# Active-passive replication with replay on promotion.
+hot = StandbyGroup.spawn(
+    rt, "counter",
+    member_count=3,                  # 1 active + 2 standbys
+    group_seed=bytes([0x77] * 32),
+)
+rt.deliver(hot.active_origin(), event)
+hot.on_event_delivered(event)        # keep standby replay buffer accurate
+hot.sync_standbys()                  # periodic catchup
+
+try:
+    ReplicaGroup.spawn(rt, "never-registered", replica_count=2, group_seed=bytes(32))
+except GroupError as e:
+    kind = group_error_kind(e)
+    # kind ∈ { "not-ready", "factory-not-found", "no-healthy-member",
+    #         "placement-failed", "registry-failed", "invalid-config",
+    #         "daemon", "unknown" }
+```
+
+Full surface + runnable examples:
+[`bindings/python/README.md`](../bindings/python/README.md#compute-groups-replica--fork--standby).
+Cross-SDK contract + rationale:
+[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../docs/SDK_GROUPS_SURFACE_PLAN.md).
+
+> **Note.** `net_sdk` does not yet proxy the groups surface; use the
+> native `net` package directly, the same way as the security types.
+
 ## API
 
 | Method | Description |

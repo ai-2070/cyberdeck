@@ -580,6 +580,93 @@ the full narrative and
 [`docs/CORTEX_ADAPTER_PLAN.md`](../docs/CORTEX_ADAPTER_PLAN.md) for the
 design.
 
+## Groups (replica / fork / standby)
+
+Enable the `groups` feature (implies `compute`) to spawn logical
+clusters of daemons from a single `DaemonRuntime`. Three flavours
+share one coordination layer:
+
+- `ReplicaGroup` — N interchangeable copies. Each replica gets a
+  deterministic identity from `group_seed + index`, so a replacement
+  respawned on another node has a stable `origin_hash`. Load-balances
+  inbound events across healthy members; auto-replaces on node failure.
+- `ForkGroup` — N independent daemons forked from a common parent at
+  `fork_seq`. Unique keypairs, shared ancestry via a verifiable
+  `ForkRecord` (sentinel hash linking each fork to the parent chain).
+- `StandbyGroup` — active-passive replication. One member processes
+  events; standbys hold snapshots and catch up via `sync_standbys()`.
+  On active failure, the most-synced standby promotes and replays the
+  events buffered since the last sync.
+
+```rust
+use net_sdk::compute::{DaemonHostConfig, DaemonRuntime};
+use net_sdk::groups::{
+    ForkGroup, ForkGroupConfig, GroupError, ReplicaGroup, ReplicaGroupConfig,
+    RequestContext, StandbyGroup, StandbyGroupConfig,
+};
+use net_sdk::groups::common::Strategy;
+
+# async fn example(rt: DaemonRuntime) -> Result<(), GroupError> {
+// Register the factory the group will call for each member.
+rt.register_factory("counter", || Box::new(CounterDaemon::new()))?;
+
+// --- ReplicaGroup ----------------------------------------------------
+let replicas = ReplicaGroup::spawn(&rt, "counter", ReplicaGroupConfig {
+    replica_count: 3,
+    group_seed: [0x11; 32],
+    lb_strategy: Strategy::ConsistentHash,
+    host_config: DaemonHostConfig::default(),
+})?;
+
+let ctx = RequestContext::new().with_routing_key("user:42");
+let origin = replicas.route_event(&ctx)?;
+// rt.deliver(origin, &event)?;   // hand the event to the chosen replica
+
+replicas.scale_to(5, "counter")?;         // grow
+replicas.on_node_failure(failed_id, "counter")?;  // respawn elsewhere
+
+// --- ForkGroup -------------------------------------------------------
+let forks = ForkGroup::fork(
+    &rt,
+    "counter",
+    /* parent_origin */ 0xabcd_ef01,
+    /* fork_seq */ 42,
+    ForkGroupConfig {
+        fork_count: 3,
+        lb_strategy: Strategy::RoundRobin,
+        host_config: DaemonHostConfig::default(),
+    },
+)?;
+assert!(forks.verify_lineage());           // sentinel + signature ok
+let records = forks.fork_records();        // one ForkRecord per member
+
+// --- StandbyGroup ----------------------------------------------------
+let hot = StandbyGroup::spawn(&rt, "counter", StandbyGroupConfig {
+    member_count: 3,                       // 1 active + 2 standbys
+    group_seed: [0x77; 32],
+    host_config: DaemonHostConfig::default(),
+})?;
+// rt.deliver(hot.active_origin(), &event)?;
+hot.on_event_delivered(event.clone());     // buffer for replay
+hot.sync_standbys()?;                      // periodic catchup
+// On active-node failure: hot.on_node_failure(failed_id, "counter")?;
+# Ok(())
+# }
+```
+
+Errors surface as `GroupError`: `NotReady` (runtime not started),
+`FactoryNotFound(kind)` (`kind` was never registered), `Core(_)`
+wrapping `InvalidConfig` / `PlacementFailed` / `RegistryFailed`, and
+`Daemon(_)` for runtime-level failures. Match on the variant to
+dispatch — the wire form through the FFI is
+`daemon: group: <kind>[: detail]` and stays consistent across all
+language bindings.
+
+Full staging, wire formats, and rationale:
+[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../docs/SDK_GROUPS_SURFACE_PLAN.md).
+Core semantics (placement spread, health aggregation, failure
+domains) live in [`../README.md#daemons`](../README.md#daemons).
+
 ## API
 
 | Method | Description |

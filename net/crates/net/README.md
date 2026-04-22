@@ -339,6 +339,8 @@ For stateful daemons that need fault tolerance without duplicate compute, `Stand
 
 All three group types share coordination logic via `GroupCoordinator` — health tracking, member management, and placement work identically. Any member of any group is a normal daemon in the `DaemonRegistry`, so MIKOSHI can migrate it without knowing it belongs to a group.
 
+Every binding — Rust, TypeScript, Python, Go — surfaces all three groups with the same coordination semantics and the same stable error vocabulary (`daemon: group: <kind>[: detail]`, where `<kind>` is one of `not-ready | factory-not-found | no-healthy-member | placement-failed | registry-failed | invalid-config | daemon`). Staging, wire formats, and design notes: [`docs/SDK_GROUPS_SURFACE_PLAN.md`](docs/SDK_GROUPS_SURFACE_PLAN.md). Runnable examples in idiomatic form: [Rust](sdk/README.md#groups-replica--fork--standby) · [TypeScript](sdk-ts/README.md#groups-replica--fork--standby) · [Python](bindings/python/README.md#compute-groups-replica--fork--standby) · [Go](bindings/go/README.md#compute-groups-replica--fork--standby).
+
 ## Safety & Autonomy
 
 Every node enforces its own rules. The `SafetyEnforcer` evaluates a `ResourceEnvelope` that defines:

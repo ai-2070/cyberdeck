@@ -362,6 +362,100 @@ SDK behaviour is fixed by the Rust integration suite; see
 [`tests/channel_auth.rs`](../../tests/channel_auth.rs) and
 [`tests/channel_auth_hardening.rs`](../../tests/channel_auth_hardening.rs).
 
+## Compute Groups (Replica / Fork / Standby)
+
+HA / scaling overlays on top of `DaemonRuntime`. Build the native
+module with the `groups` feature (implies `compute`) to expose
+`ReplicaGroup`, `ForkGroup`, `StandbyGroup`, and the `GroupError`
+exception class.
+
+- **`ReplicaGroup`** — N interchangeable copies of a daemon.
+  Deterministic identity from `group_seed + index`, so a replacement
+  respawned on another node has a stable `origin_hash`. Load-balances
+  inbound events across healthy members; auto-replaces on node failure.
+- **`ForkGroup`** — N independent daemons forked from a common parent
+  at `fork_seq`. Unique keypairs, shared ancestry via a verifiable
+  `ForkRecord`.
+- **`StandbyGroup`** — active-passive replication. One member
+  processes events; standbys hold snapshots and catch up via
+  `sync_standbys()`. On active failure the most-synced standby
+  promotes and replays the events buffered since the last sync.
+
+```python
+from net import (
+    DaemonRuntime, ForkGroup, GroupError, ReplicaGroup, StandbyGroup,
+    group_error_kind,
+)
+
+rt = DaemonRuntime(mesh)
+rt.register_factory("counter", lambda: CounterDaemon())
+
+# --- ReplicaGroup ----------------------------------------------------
+replicas = ReplicaGroup.spawn(
+    rt, "counter",
+    replica_count=3,
+    group_seed=bytes([0x11] * 32),
+    lb_strategy="consistent-hash",   # or "round-robin" / "least-load"
+                                     #    / "least-connections" / "random"
+)
+origin = replicas.route_event({"routing_key": "user:42"})
+rt.deliver(origin, event)
+replicas.scale_to(5)                 # grow
+replicas.on_node_failure(failed_node_id)   # respawn elsewhere
+
+# --- ForkGroup -------------------------------------------------------
+forks = ForkGroup.fork(
+    rt, "counter",
+    parent_origin=0xABCDEF01,
+    fork_seq=42,
+    fork_count=3,
+    lb_strategy="round-robin",
+)
+assert forks.verify_lineage()
+for record in forks.fork_records():
+    print(record["forked_origin"], record["fork_seq"])
+
+# --- StandbyGroup ----------------------------------------------------
+hot = StandbyGroup.spawn(
+    rt, "counter",
+    member_count=3,                  # 1 active + 2 standbys
+    group_seed=bytes([0x77] * 32),
+)
+rt.deliver(hot.active_origin(), event)
+hot.on_event_delivered(event)        # keep replay buffer accurate
+hot.sync_standbys()                  # periodic catchup
+# On active-node failure:
+# new_origin = hot.on_node_failure(failed_node_id)  # auto-promotes
+```
+
+### Typed errors
+
+Failures raise `GroupError` (a subclass of `DaemonError`). Use
+`group_error_kind(e)` to parse the discriminator from the Rust side's
+`daemon: group: <kind>[: detail]` message prefix:
+
+```python
+from net import GroupError, group_error_kind
+
+try:
+    ReplicaGroup.spawn(rt, "never-registered",
+                       replica_count=2, group_seed=bytes(32))
+except GroupError as e:
+    kind = group_error_kind(e)
+    if kind == "not-ready":               ...  # runtime.start() didn't run
+    elif kind == "factory-not-found":     ...  # kind wasn't registered
+    elif kind == "no-healthy-member":     ...  # routed on an all-down group
+    elif kind == "invalid-config":        ...  # e.g. replica_count == 0
+    elif kind in ("placement-failed",
+                  "registry-failed",
+                  "daemon"):              ...  # core failure — read e args
+```
+
+Full staging, wire formats, and rationale:
+[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../../docs/SDK_GROUPS_SURFACE_PLAN.md).
+Core semantics live in the main
+[`README.md#daemons`](../../README.md#daemons).
+
 ## Performance Tips
 
 1. **Use `ingest_raw()` for maximum throughput** - Pass pre-serialized JSON strings
