@@ -1,0 +1,29 @@
+net/crates/net/src/adapter/net/traversal/portmap/mod.rs
+  5bf3f089eecaef7a 267-290,553,665-666,669-674,677-757
+net/crates/net/src/adapter/net/traversal/mod.rs
+  5bf3f089eecaef7a 200-212
+net/crates/net/src/adapter/net/traversal/portmap/gateway.rs
+  5bf3f089eecaef7a 85-101,233-294
+net/crates/net/src/adapter/net/traversal/portmap/natpmp.rs
+  5bf3f089eecaef7a 510-518,524-538,1045-1095
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "2754ce7fcd3cbd4bccfe440d4e3b313cf16b0630",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 282,
+      "total_deletions": 11,
+      "accepted_lines": 284,
+      "overriden_lines": 0
+    }
+  }
+}
