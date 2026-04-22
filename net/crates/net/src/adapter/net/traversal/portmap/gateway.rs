@@ -82,7 +82,23 @@ fn parse_proc_net_route_content(content: &str) -> Option<Ipv4Addr> {
         }
         // Gateway column: little-endian hex of IPv4. Parse as
         // u32 and flip to LE bytes to reconstruct the address.
-        let raw = u32::from_str_radix(cols[2], 16).ok()?;
+        //
+        // Multiple default-route rows are legitimate: a multi-
+        // homed host, a point-to-point interface that emits a
+        // `0.0.0.0` gateway (WireGuard, PPP), a transient row
+        // during DHCP lease renewal, or a malformed kernel
+        // entry. Return the first *usable* row — skip rows
+        // whose gateway doesn't parse as hex, and skip
+        // all-zero gateways (there's nobody on the other end
+        // to send NAT-PMP to). Falling out of the whole scan on
+        // the first bad row would strand a perfectly good
+        // default route sitting below it.
+        let Some(raw) = u32::from_str_radix(cols[2], 16).ok() else {
+            continue;
+        };
+        if raw == 0 {
+            continue;
+        }
         let bytes = raw.to_le_bytes();
         return Some(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]));
     }
@@ -212,6 +228,68 @@ eth0\t0000A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0
             "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
         )
         .is_none());
+    }
+
+    /// Regression test for a cubic-flagged P2 bug: the parser
+    /// used to abort on the first row where the gateway column
+    /// didn't parse as hex. A multi-homed host that carries a
+    /// malformed default-route entry above the real one would
+    /// return `None` and skip NAT-PMP entirely even though a
+    /// valid gateway sat one row further down.
+    ///
+    /// The fix changes the behavior from "bail on first bad
+    /// row" to "skip + continue."
+    #[test]
+    fn proc_net_route_skips_unparseable_default_row_and_continues() {
+        let fixture = "\
+Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
+tun0\t00000000\tNOT_HEX!\t0003\t0\t0\t50\t00000000\t0\t0\t0
+eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
+";
+        assert_eq!(
+            parse_proc_net_route_content(fixture),
+            Some(Ipv4Addr::new(192, 168, 1, 1)),
+            "unparseable default-route row must not abort the scan — \
+             the eth0 row below should still resolve",
+        );
+    }
+
+    /// Complement: a zero-gateway default row (point-to-point
+    /// interface, transient DHCP state, WireGuard) should be
+    /// skipped, not accepted as `0.0.0.0`. Accepting `0.0.0.0`
+    /// would make the NAT-PMP client try to talk to the
+    /// unspecified address — always a dead channel.
+    #[test]
+    fn proc_net_route_skips_zero_gateway_row() {
+        let fixture = "\
+Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
+wg0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0
+eth0\t00000000\t010010AC\t0003\t0\t0\t100\t00000000\t0\t0\t0
+";
+        assert_eq!(
+            parse_proc_net_route_content(fixture),
+            Some(Ipv4Addr::new(172, 16, 0, 1)),
+            "zero-gateway default row must not be returned — it's a \
+             point-to-point or transient state, not a routable gateway",
+        );
+    }
+
+    /// Belt-and-braces: the all-zero gateway check doesn't mask
+    /// a valid 0.x.x.x gateway above it (0.0.0.0 is the
+    /// canonical "unspecified" sentinel — no valid gateway
+    /// would share that exact little-endian encoding). Pin the
+    /// terminal case: only a zero row followed by nothing else
+    /// returns None.
+    #[test]
+    fn proc_net_route_returns_none_when_only_zero_default_present() {
+        let fixture = "\
+Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
+wg0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0
+";
+        assert!(
+            parse_proc_net_route_content(fixture).is_none(),
+            "a single all-zero default-route row should resolve to None, not 0.0.0.0",
+        );
     }
 
     // ---- macOS `route get default` parser ----

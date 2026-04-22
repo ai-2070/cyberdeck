@@ -507,12 +507,35 @@ impl PortMapperClient for NatPmpMapper {
         // Lifetime=0 is the RFC 6886 §3.3 "drop mapping" signal.
         // Best-effort — task shutdown calls this, and we don't
         // want a timeout here to stall mesh teardown.
+        //
+        // Fire-and-forget semantics: the old `round_trip` path
+        // waited up to `NATPMP_DEADLINE` (1 s) for a response
+        // that a misbehaving or already-torn-down gateway would
+        // never send, stalling the shutdown / revoke path by a
+        // full second per remove. The gateway's ack on a
+        // lifetime=0 request is informational — the mapping is
+        // already gone (or never existed) once our UDP packet
+        // lands — so we send and return without recv'ing.
         let req = NatPmpRequest::MapUdp {
             internal_port: mapping.internal_port,
             external_port_hint: 0,
             lifetime: 0,
         };
-        let _ = self.round_trip(encode_request(&req)).await;
+        let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await else {
+            return;
+        };
+        let target = SocketAddr::new(IpAddr::V4(self.gateway), self.target_port);
+        // Use `connect` for symmetry with `round_trip` — not
+        // strictly needed for a single send (there's no reply
+        // we care about), but matches the idiomatic UDP-client
+        // pattern for a bound gateway and makes the kernel
+        // treat later `send` as non-blocking-to-a-connected-
+        // peer semantics (faster failure on a torn route).
+        if sock.connect(target).await.is_err() {
+            return;
+        }
+        let bytes = encode_request(&req);
+        let _ = sock.send(&bytes).await;
     }
 }
 
@@ -1018,5 +1041,56 @@ mod tests {
 
         gateway_handle.abort();
         spoofer_handle.abort();
+    }
+
+    /// Regression test for a cubic-flagged P2 bug: the old
+    /// `remove` impl went through `round_trip`, which waited up
+    /// to [`NATPMP_DEADLINE`] (1 s) for a response. On shutdown
+    /// / revoke against a silent-or-gone gateway that stalls
+    /// the mesh teardown by a full second per remove call —
+    /// multiplied by however many mappings we held.
+    ///
+    /// The fix makes `remove` fire-and-forget: send the
+    /// lifetime=0 packet, return immediately. The gateway's
+    /// optional ack is informational — by the time our UDP
+    /// packet lands, the mapping is being torn down regardless,
+    /// and stalling mesh shutdown waiting for an ack the
+    /// gateway may not send is a poor tradeoff.
+    ///
+    /// This test points `remove` at a bound-but-silent
+    /// listener and asserts the call returns in well under
+    /// the old 1 s deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_is_fire_and_forget_and_does_not_block_on_silent_gateway() {
+        // Silent gateway — binds the port (so `connect` can
+        // succeed on loopback) but never reads or replies.
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gateway_port = silent.local_addr().unwrap().port();
+
+        let mapper = NatPmpMapper::new_for_test(Ipv4Addr::LOCALHOST, gateway_port);
+        let mapping = PortMapping {
+            external: "203.0.113.1:9001".parse().unwrap(),
+            internal_port: 9001,
+            ttl: Duration::from_secs(3600),
+            protocol: Protocol::NatPmp,
+        };
+
+        let start = tokio::time::Instant::now();
+        mapper.remove(&mapping).await;
+        let elapsed = start.elapsed();
+
+        // Old behavior: ~1000 ms (the `round_trip` NATPMP_DEADLINE).
+        // Fixed behavior: a single UDP `send`, which on loopback
+        // is sub-millisecond. Cap at 200 ms — 5× a generous
+        // scheduler-jitter margin, ~5× under the old deadline.
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "remove() blocked for {elapsed:?} — fire-and-forget regressed. \
+             On a silent gateway it must not wait for NATPMP_DEADLINE; the \
+             gateway's ack is informational and a dead-gateway scenario \
+             should not stall mesh shutdown per-mapping",
+        );
+
+        drop(silent);
     }
 }

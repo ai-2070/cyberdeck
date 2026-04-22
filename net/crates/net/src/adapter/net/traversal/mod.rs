@@ -197,6 +197,19 @@ impl TraversalStats {
         self.port_mapping_renewals.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Overwrite the stored external `SocketAddr` without
+    /// touching `port_mapping_active` or the renewal counter.
+    /// Called by [`MappingSink::apply_renewal`] when the router
+    /// returns a different external on a renewal tick (router
+    /// reboot / WAN flap / DHCP lease change). Keeping stats
+    /// and reflex in sync matters: observability reads this
+    /// field, and it's what operators cross-reference against
+    /// `reflex_addr` when debugging flapping reachability.
+    #[cfg(feature = "port-mapping")]
+    pub(crate) fn replace_port_mapping_external(&self, external: std::net::SocketAddr) {
+        self.port_mapping_external.store(Some(Arc::new(external)));
+    }
+
     /// Record a revoke — either operator-initiated (clean
     /// shutdown) or after repeated renewal failures. Flips
     /// `port_mapping_active` to `false` and clears the external

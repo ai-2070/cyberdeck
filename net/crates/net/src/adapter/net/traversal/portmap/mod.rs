@@ -264,9 +264,30 @@ impl MappingSink {
         self.reflex_override_active.store(true, Ordering::Release);
     }
 
-    /// Record a successful renewal. Stats-only — no override
-    /// changes, since the external address stayed the same.
-    pub(crate) fn apply_renewal(&self) {
+    /// Record a successful renewal. If `mapping.external`
+    /// matches the currently-advertised reflex, this is a pure
+    /// stats bump (renewal counter only). If it *differs* —
+    /// router reboot, WAN interface flap, DHCP lease change —
+    /// the new external has to be re-published on both the
+    /// reflex-override atomic (so capability announcements
+    /// carry the fresh address) and the stats block (so
+    /// observability sees the current mapping). The override
+    /// flag + NAT class stay set; only the address field
+    /// moves. Without this propagation the renewal loop silently
+    /// advertises a dead address to peers until the next install
+    /// / revoke cycle.
+    pub(crate) fn apply_renewal(&self, mapping: &PortMapping) {
+        let prev = self.reflex_addr.load_full().map(|arc| *arc);
+        if prev != Some(mapping.external) {
+            // Publish order mirrors `apply_install` (reflex
+            // first, stats second) so a concurrent announce
+            // either sees the old address or the new one, never
+            // a torn mix. No need to re-flip the override flag
+            // — it's already set and stays set across the
+            // rebind.
+            self.reflex_addr.store(Some(Arc::new(mapping.external)));
+            self.stats.replace_port_mapping_external(mapping.external);
+        }
         self.stats.record_port_mapping_renewal();
     }
 
@@ -529,8 +550,8 @@ impl PortMapperTask {
                     match self.client.renew(&mapping).await {
                         Ok(next) => {
                             consecutive_failures = 0;
+                            self.sink.apply_renewal(&next);
                             mapping = next;
-                            self.sink.apply_renewal();
                         }
                         Err(_) => {
                             consecutive_failures = consecutive_failures.saturating_add(1);
@@ -641,14 +662,99 @@ mod tests {
     #[test]
     fn mapping_sink_apply_renewal_bumps_counter() {
         let (sink, stats, _) = sample_sink();
-        sink.apply_install(&sample_mapping());
+        let mapping = sample_mapping();
+        sink.apply_install(&mapping);
         assert_eq!(stats.snapshot().port_mapping_renewals, 0);
 
-        sink.apply_renewal();
-        sink.apply_renewal();
-        sink.apply_renewal();
+        // Same external across ticks — the common path. Address
+        // doesn't change, renewal counter bumps, reflex/stats
+        // stay put.
+        sink.apply_renewal(&mapping);
+        sink.apply_renewal(&mapping);
+        sink.apply_renewal(&mapping);
 
         assert_eq!(stats.snapshot().port_mapping_renewals, 3);
+        assert_eq!(stats.snapshot().port_mapping_external, Some(mapping.external));
+    }
+
+    /// Regression for a cubic-flagged P2 bug: on successful
+    /// renewal the task was overwriting the local `mapping`
+    /// variable but `apply_renewal` (counter-only) was leaving
+    /// the `reflex_addr` and `port_mapping_external` stats
+    /// stale. If the router returned a different external on
+    /// renewal (reboot, WAN flap, DHCP churn), the mesh kept
+    /// advertising the dead address to peers until the next
+    /// install / revoke cycle.
+    ///
+    /// With the fix, `apply_renewal` takes `&PortMapping` and
+    /// re-publishes the external if it changed. This test pins
+    /// that path.
+    #[test]
+    fn mapping_sink_apply_renewal_propagates_new_external() {
+        use crate::adapter::net::traversal::classify::NatClass;
+
+        let (sink, stats, override_active) = sample_sink();
+        let initial = sample_mapping();
+        let initial_external = initial.external;
+        sink.apply_install(&initial);
+        assert_eq!(stats.snapshot().port_mapping_external, Some(initial_external));
+
+        // Router returns a new external address on the next
+        // renewal tick. Simulate a WAN-rebind scenario.
+        let new_external: std::net::SocketAddr = "203.0.113.200:55555".parse().unwrap();
+        assert_ne!(new_external, initial_external, "test precondition");
+        let rebind = PortMapping {
+            external: new_external,
+            internal_port: initial.internal_port,
+            ttl: initial.ttl,
+            protocol: initial.protocol,
+        };
+
+        sink.apply_renewal(&rebind);
+
+        let snap = stats.snapshot();
+        assert_eq!(
+            snap.port_mapping_external,
+            Some(new_external),
+            "stats must carry the new mapped external, not the stale one",
+        );
+        assert_eq!(
+            snap.port_mapping_renewals, 1,
+            "renewal counter should still bump",
+        );
+        assert!(
+            override_active.load(Ordering::Acquire),
+            "override flag stays set across a rebind — only the address moves",
+        );
+        // nat_class stays Open — no demotion on address change.
+        let nc = sink.nat_class.load(Ordering::Acquire);
+        assert_eq!(NatClass::from_u8(nc), NatClass::Open);
+    }
+
+    /// Complement of the above: when the router returns the same
+    /// external on renewal (the common case), the reflex atomic
+    /// isn't re-stored. ArcSwap writes are cheap but not free,
+    /// and we want the fast path to stay fast.
+    #[test]
+    fn mapping_sink_apply_renewal_skips_republish_when_external_unchanged() {
+        let (sink, stats, _) = sample_sink();
+        let mapping = sample_mapping();
+        sink.apply_install(&mapping);
+
+        // Take a snapshot of the reflex pointer identity after
+        // install. Without a rebind, apply_renewal must not
+        // replace the Arc — repeated renewals shouldn't churn
+        // ArcSwap's hazard-pointer bookkeeping.
+        let before = sink.reflex_addr.load_full().unwrap();
+        sink.apply_renewal(&mapping);
+        sink.apply_renewal(&mapping);
+        let after = sink.reflex_addr.load_full().unwrap();
+
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "unchanged external must not re-store the reflex Arc; got a new pointer",
+        );
+        assert_eq!(stats.snapshot().port_mapping_renewals, 2);
     }
 
     #[test]
