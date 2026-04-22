@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/mesh.rs
+  5bf3f089eecaef7a 6060-6070,6078-6081,6102-6113,6123-6129,6156-6161
+net/crates/net/tests/reflex_override.rs
+  5bf3f089eecaef7a 415-492
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "9bb8cf03e6fec347a154ebdb2f07dbebb08f1d8b",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 610,
+      "total_deletions": 7344,
+      "accepted_lines": 121,
+      "overriden_lines": 0
+    }
+  }
+}
