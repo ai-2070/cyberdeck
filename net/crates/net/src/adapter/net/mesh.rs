@@ -191,6 +191,14 @@ struct DispatchCtx {
     pending_punch_introduces: Arc<
         DashMap<u64, tokio::sync::oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>>,
     >,
+    /// Waiters for incoming `PunchAck` messages, keyed by the
+    /// sender's `node_id` (the `from_peer` field in the ack).
+    /// `connect_direct`'s `SinglePunch` path awaits on this map
+    /// to confirm the peer completed their side of the punch.
+    #[cfg(feature = "nat-traversal")]
+    pending_punch_acks: Arc<
+        DashMap<u64, tokio::sync::oneshot::Sender<super::traversal::rendezvous::PunchAck>>,
+    >,
     /// NAT-traversal tunables (probe timeouts, punch cadence,
     /// classification deadlines). Shared with `MeshNode` by value
     /// since `TraversalConfig` is `Clone` and small. The dispatch
@@ -748,6 +756,14 @@ pub struct MeshNode {
     pending_punch_introduces: Arc<
         DashMap<u64, oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>>,
     >,
+    /// In-flight punch acknowledgements keyed by the *sender*
+    /// endpoint's `node_id` — i.e. the `from_peer` field on the
+    /// arriving `PunchAck`. `connect_direct` awaits this map on
+    /// the `SinglePunch` path so `punches_succeeded` only bumps
+    /// when the peer actually confirmed the punch.
+    #[cfg(feature = "nat-traversal")]
+    pending_punch_acks:
+        Arc<DashMap<u64, oneshot::Sender<super::traversal::rendezvous::PunchAck>>>,
     /// Current NAT classification, encoded via
     /// [`super::traversal::classify::NatClass::as_u8`]. Starts as
     /// `Unknown` (`0`) and is updated by the classification sweep
@@ -1009,6 +1025,8 @@ impl MeshNode {
             pending_reflex_probes: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
             pending_punch_introduces: Arc::new(DashMap::new()),
+            #[cfg(feature = "nat-traversal")]
+            pending_punch_acks: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
             nat_class: Arc::new(std::sync::atomic::AtomicU8::new(
                 super::traversal::classify::NatClass::Unknown.as_u8(),
@@ -1594,6 +1612,8 @@ impl MeshNode {
             pending_reflex_probes: self.pending_reflex_probes.clone(),
             #[cfg(feature = "nat-traversal")]
             pending_punch_introduces: self.pending_punch_introduces.clone(),
+            #[cfg(feature = "nat-traversal")]
+            pending_punch_acks: self.pending_punch_acks.clone(),
             #[cfg(feature = "nat-traversal")]
             traversal_config: self.traversal_config.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
@@ -2437,22 +2457,43 @@ impl MeshNode {
                     Self::handle_punch_request(from_node, req, ctx);
                 }
                 rendezvous::RendezvousMsg::PunchIntroduce(intro) => {
-                    // Endpoint side of the rendezvous. Stage 3b
-                    // only completes waiters installed by callers;
-                    // the keep-alive train + PunchAck emission
-                    // land in stage 3c. A message with no waiter
-                    // is dropped silently — a late introduce for
-                    // an abandoned connect_direct is noise, not
-                    // an error.
+                    // Endpoint side of the rendezvous. Complete
+                    // any installed observer waiter (for tests /
+                    // explicit awaits), then auto-emit the
+                    // matching `PunchAck` via the coordinator —
+                    // the sender we just received the introduce
+                    // from. Stage 3d wiring: the ack flows
+                    // `endpoint → coordinator → other endpoint`,
+                    // which on localhost is immediate; on a real
+                    // NAT it rides the already-working relay
+                    // session.
                     if let Some((_, tx)) =
                         ctx.pending_punch_introduces.remove(&intro.peer)
                     {
                         let _ = tx.send(intro);
                     }
+                    Self::send_punch_ack_via(from_node, intro, ctx);
                 }
-                rendezvous::RendezvousMsg::PunchAck(_) => {
-                    // Stage 3c lands the PunchAck-correlation
-                    // wiring. Drop silently for now.
+                rendezvous::RendezvousMsg::PunchAck(ack) => {
+                    if ack.to_peer == ctx.local_node_id {
+                        // Final recipient: complete the correlation
+                        // oneshot keyed by `from_peer`. A late ack
+                        // for an abandoned `connect_direct` is
+                        // dropped silently.
+                        if let Some((_, tx)) =
+                            ctx.pending_punch_acks.remove(&ack.from_peer)
+                        {
+                            let _ = tx.send(ack);
+                        }
+                    } else {
+                        // Coordinator role: forward verbatim to
+                        // `to_peer` via our session with that
+                        // peer. The forwarded ack keeps the same
+                        // bytes — `from_peer` still points at the
+                        // original sender, which is what the
+                        // recipient correlates on.
+                        Self::forward_punch_ack(ack, ctx);
+                    }
                 }
             }
             return;
@@ -3519,6 +3560,123 @@ impl MeshNode {
         });
     }
 
+    /// Endpoint-side: send a `PunchAck` back to the other
+    /// endpoint, via the coordinator that just introduced us.
+    ///
+    /// Called from the `PunchIntroduce` dispatch branch. The ack
+    /// is stamped `from_peer = self, to_peer = intro.peer`
+    /// (the counterpart). The coordinator that delivers the ack
+    /// to the counterpart is the same peer we received the
+    /// introduce from — stored as `coordinator_node_id`. This
+    /// works because the rendezvous three-message dance routes
+    /// through the same coordinator for all three steps.
+    ///
+    /// Best-effort: a failure to send (socket error, coordinator
+    /// session gone) logs + returns. The counterpart's own
+    /// ack-await on `connect_direct` will time out; neither side
+    /// crashes.
+    #[cfg(feature = "nat-traversal")]
+    fn send_punch_ack_via(
+        coordinator_node_id: u64,
+        intro: super::traversal::rendezvous::PunchIntroduce,
+        ctx: &DispatchCtx,
+    ) {
+        use super::traversal::rendezvous::{PunchAck, RendezvousMsg};
+
+        let Some((coord_addr, coord_session)) = ctx
+            .peers
+            .get(&coordinator_node_id)
+            .map(|e| (e.value().addr, e.value().session.clone()))
+        else {
+            return;
+        };
+        if ctx.partition_filter.contains(&coord_addr) {
+            return;
+        }
+
+        let ack_body = RendezvousMsg::PunchAck(PunchAck {
+            from_peer: ctx.local_node_id,
+            to_peer: intro.peer,
+            // `punch_id` is reserved for stage-3b-onwards
+            // correlation; no generator wiring yet. 0 is a
+            // placeholder — the field is on the wire but not
+            // consulted.
+            punch_id: 0,
+        })
+        .encode();
+
+        let socket = ctx.socket.clone();
+        tokio::spawn(async move {
+            let pool = coord_session.thread_local_pool();
+            let mut builder = pool.get();
+            let seq = {
+                let stream = coord_session
+                    .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
+                stream.next_tx_seq()
+            };
+            let events = vec![ack_body];
+            let packet = builder.build_subprotocol(
+                super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                seq,
+                &events,
+                PacketFlags::NONE,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS,
+            );
+            let _ = socket.send_to(&packet, coord_addr).await;
+        });
+    }
+
+    /// Coordinator-side: forward a `PunchAck` whose `to_peer`
+    /// isn't us to the session with `to_peer`. Best-effort —
+    /// if we don't have a session with `to_peer`, drop.
+    ///
+    /// Wire bytes are preserved intact: `from_peer` still names
+    /// the original sender so the recipient can correlate
+    /// against its `pending_punch_acks` map.
+    #[cfg(feature = "nat-traversal")]
+    fn forward_punch_ack(
+        ack: super::traversal::rendezvous::PunchAck,
+        ctx: &DispatchCtx,
+    ) {
+        use super::traversal::rendezvous::RendezvousMsg;
+
+        let Some((dest_addr, dest_session)) = ctx
+            .peers
+            .get(&ack.to_peer)
+            .map(|e| (e.value().addr, e.value().session.clone()))
+        else {
+            tracing::trace!(
+                to_peer = format!("{:#x}", ack.to_peer),
+                "rendezvous: no session with PunchAck.to_peer; dropping",
+            );
+            return;
+        };
+        if ctx.partition_filter.contains(&dest_addr) {
+            return;
+        }
+
+        let body = RendezvousMsg::PunchAck(ack).encode();
+        let socket = ctx.socket.clone();
+        tokio::spawn(async move {
+            let pool = dest_session.thread_local_pool();
+            let mut builder = pool.get();
+            let seq = {
+                let stream = dest_session
+                    .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
+                stream.next_tx_seq()
+            };
+            let events = vec![body];
+            let packet = builder.build_subprotocol(
+                super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                seq,
+                &events,
+                PacketFlags::NONE,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS,
+            );
+            let _ = socket.send_to(&packet, dest_addr).await;
+        });
+    }
+
     /// Decide whether a Subscribe from `from_node` on `channel` is allowed.
     ///
     /// Rules, in order:
@@ -4468,24 +4626,43 @@ impl MeshNode {
                 self.traversal_stats.record_punch_attempt();
                 let self_reflex =
                     self.reflex_addr().unwrap_or_else(|| self.local_addr());
+
+                // Install the PunchAck waiter BEFORE firing the
+                // request so a fast round-trip can't beat us to
+                // the correlation map.
+                let (ack_tx, ack_rx) = oneshot::channel();
+                self.pending_punch_acks.insert(peer_node_id, ack_tx);
+
                 let punch_outcome = self
                     .request_punch(coordinator, peer_node_id, self_reflex)
                     .await;
+
                 match punch_outcome {
                     Ok(_intro) => {
-                        // Stage 3c approximation: a successful
-                        // coordinator mediation counts as
-                        // "punch succeeded" for the stats. The
-                        // real keep-alive confirmation lands in
-                        // stage 3d.
-                        self.traversal_stats.record_punch_success();
+                        // Await the counterpart's PunchAck,
+                        // forwarded by the coordinator. On
+                        // success the punch is considered
+                        // confirmed end-to-end; on timeout we
+                        // fall back to relay and the ack waiter
+                        // is evicted.
+                        let deadline = self.traversal_config.punch_deadline;
+                        match tokio::time::timeout(deadline, ack_rx).await {
+                            Ok(Ok(_ack)) => {
+                                self.traversal_stats.record_punch_success();
+                            }
+                            Ok(Err(_)) | Err(_) => {
+                                self.pending_punch_acks.remove(&peer_node_id);
+                                self.traversal_stats.record_relay_fallback();
+                            }
+                        }
                         connect_routed().await
                     }
                     Err(_) => {
-                        // Punch coordination failed (no cached
-                        // reflex on R, timeout, etc). Traffic
-                        // still rides the relay; record the
-                        // fallback and resolve.
+                        // Coordinator mediation failed — no
+                        // point waiting for an ack that will
+                        // never come. Evict the waiter + record
+                        // the fallback and continue.
+                        self.pending_punch_acks.remove(&peer_node_id);
                         self.traversal_stats.record_relay_fallback();
                         connect_routed().await
                     }
@@ -5345,6 +5522,42 @@ impl MeshNode {
             Ok(Err(_)) => Err(TraversalError::PunchFailed),
             Err(_) => {
                 self.pending_punch_introduces.remove(&counterpart);
+                Err(TraversalError::PunchFailed)
+            }
+        }
+    }
+
+    /// Install a waiter for an incoming `PunchAck` whose
+    /// `from_peer` matches `counterpart`. Stage-3d correlation
+    /// surface — the `SinglePunch` path in `connect_direct`
+    /// registers the waiter before firing `request_punch` and
+    /// awaits it afterward. Times out with
+    /// [`TraversalError::PunchFailed`] after
+    /// [`TraversalConfig::punch_deadline`].
+    ///
+    /// Note: the caller installs the waiter before issuing the
+    /// request via [`Self::install_punch_ack_waiter`] to avoid a
+    /// race where the ack arrives before the await call is
+    /// entered.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn await_punch_ack(
+        &self,
+        counterpart: u64,
+    ) -> Result<
+        super::traversal::rendezvous::PunchAck,
+        super::traversal::TraversalError,
+    > {
+        use super::traversal::TraversalError;
+        let (tx, rx) = oneshot::channel();
+        self.pending_punch_acks.insert(counterpart, tx);
+        let deadline = self.traversal_config.punch_deadline;
+        match tokio::time::timeout(deadline, rx).await {
+            Ok(Ok(ack)) => Ok(ack),
+            Ok(Err(_)) => Err(TraversalError::PunchFailed),
+            Err(_) => {
+                self.pending_punch_acks.remove(&counterpart);
                 Err(TraversalError::PunchFailed)
             }
         }

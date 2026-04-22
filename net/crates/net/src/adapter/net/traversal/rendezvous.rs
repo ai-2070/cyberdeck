@@ -65,18 +65,24 @@
 //! epoch milliseconds — the synchronized punch-time both sides
 //! use to schedule their keep-alives.
 //!
-//! ## PunchAck body (8 + 4 = 12 bytes)
+//! ## PunchAck body (8 + 8 + 4 = 20 bytes)
 //!
 //! ```text
-//! ┌────────────┬───────────────┐
-//! │ peer (8)   │ punch_id (4)  │
-//! └────────────┴───────────────┘
+//! ┌─────────────────┬───────────────┬───────────────┐
+//! │ from_peer (8)   │ to_peer (8)   │ punch_id (4)  │
+//! └─────────────────┴───────────────┴───────────────┘
 //! ```
 //!
-//! `punch_id` correlates an `Ack` back to the originating
-//! `PunchRequest`. The plan reserves this as a u32; this module
-//! preserves it on the wire even though stage-3a wiring doesn't
-//! yet generate punch ids — stages 3b/3c do.
+//! `from_peer` + `to_peer` make PunchAck forwarding unambiguous:
+//! the coordinator receives a PunchAck on an endpoint's session,
+//! reads `to_peer` to decide where to forward, and the final
+//! recipient reads `from_peer` to correlate with the punch
+//! attempt it initiated. `punch_id` is a u32 correlation token
+//! echoed from the originating `PunchRequest`. The plan only
+//! names `peer` + `punch_id` but silently requires two different
+//! identities during forwarding — this module makes them both
+//! explicit so the coordinator doesn't have to rewrite bytes
+//! mid-flight.
 //!
 //! # Framing (not correctness)
 //!
@@ -114,8 +120,8 @@ pub const PUNCH_REQUEST_LEN: usize = 1 + 8 + ADDR_LEN;
 pub const PUNCH_INTRODUCE_LEN: usize = 1 + 8 + ADDR_LEN + 8;
 
 /// Total on-wire size of a `PunchAck` payload.
-/// `kind(1) + peer(8) + punch_id(4) = 13`.
-pub const PUNCH_ACK_LEN: usize = 1 + 8 + 4;
+/// `kind(1) + from_peer(8) + to_peer(8) + punch_id(4) = 21`.
+pub const PUNCH_ACK_LEN: usize = 1 + 8 + 8 + 4;
 
 /// A `PunchRequest` payload — A → R ("please mediate a punch to
 /// `target`").
@@ -155,10 +161,21 @@ pub struct PunchIntroduce {
 /// traffic on the punched path tells the other side the punch
 /// succeeded. Sent via the routed-handshake path, not the punched
 /// one — we don't yet know the punched path is symmetric-reliable.
+///
+/// Carries both endpoints' identities so the coordinator can
+/// forward the ack to `to_peer` without rewriting wire bytes,
+/// and the recipient can correlate with the punch attempt it
+/// initiated by reading `from_peer`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PunchAck {
-    /// The other endpoint's `node_id`.
-    pub peer: u64,
+    /// The endpoint that observed the punch and emitted the ack.
+    /// On the ack arriving at the final recipient, this field
+    /// names the peer the recipient's punch attempt targeted.
+    pub from_peer: u64,
+    /// The endpoint the ack is addressed to. The coordinator
+    /// dispatches the ack to this peer when it's not the
+    /// coordinator itself.
+    pub to_peer: u64,
     /// Correlation token echoed from the originating
     /// `PunchRequest`. Stage-3b wiring generates these; stage 3a
     /// preserves them on the wire.
@@ -251,7 +268,8 @@ fn encode_punch_introduce(intro: &PunchIntroduce) -> Bytes {
 fn encode_punch_ack(ack: &PunchAck) -> Bytes {
     let mut buf = BytesMut::with_capacity(PUNCH_ACK_LEN);
     buf.put_u8(KIND_PUNCH_ACK);
-    buf.put_u64(ack.peer);
+    buf.put_u64(ack.from_peer);
+    buf.put_u64(ack.to_peer);
     buf.put_u32(ack.punch_id);
     debug_assert_eq!(buf.len(), PUNCH_ACK_LEN);
     buf.freeze()
@@ -294,9 +312,14 @@ pub fn decode(payload: &[u8]) -> Option<RendezvousMsg> {
             if payload.len() != PUNCH_ACK_LEN {
                 return None;
             }
-            let peer = u64::from_be_bytes(payload[1..9].try_into().ok()?);
-            let punch_id = u32::from_be_bytes(payload[9..13].try_into().ok()?);
-            Some(RendezvousMsg::PunchAck(PunchAck { peer, punch_id }))
+            let from_peer = u64::from_be_bytes(payload[1..9].try_into().ok()?);
+            let to_peer = u64::from_be_bytes(payload[9..17].try_into().ok()?);
+            let punch_id = u32::from_be_bytes(payload[17..21].try_into().ok()?);
+            Some(RendezvousMsg::PunchAck(PunchAck {
+                from_peer,
+                to_peer,
+                punch_id,
+            }))
         }
         _ => None,
     }
@@ -355,13 +378,36 @@ mod tests {
     #[test]
     fn punch_ack_roundtrip() {
         let ack = PunchAck {
-            peer: 7,
+            from_peer: 7,
+            to_peer: 42,
             punch_id: 0xCAFEBABE,
         };
         let encoded = RendezvousMsg::PunchAck(ack).encode();
         assert_eq!(encoded.len(), PUNCH_ACK_LEN);
         match decode(&encoded) {
             Some(RendezvousMsg::PunchAck(out)) => assert_eq!(out, ack),
+            other => panic!("expected PunchAck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn punch_ack_from_and_to_are_distinguishable_on_wire() {
+        // Regression guard: if encode/decode accidentally swap the
+        // two identities, the coordinator would forward the ack
+        // back to the initiator, dropping both sides into a
+        // timeout. Assert by constructing an ack with visibly
+        // different from/to and verifying neither slot swaps.
+        let ack = PunchAck {
+            from_peer: 0x1111_1111_1111_1111,
+            to_peer: 0x2222_2222_2222_2222,
+            punch_id: 0x3333_3333,
+        };
+        let encoded = RendezvousMsg::PunchAck(ack).encode();
+        match decode(&encoded) {
+            Some(RendezvousMsg::PunchAck(out)) => {
+                assert_eq!(out.from_peer, 0x1111_1111_1111_1111);
+                assert_eq!(out.to_peer, 0x2222_2222_2222_2222);
+            }
             other => panic!("expected PunchAck, got {other:?}"),
         }
     }
@@ -430,7 +476,8 @@ mod tests {
             fire_at_ms: 1,
         };
         let ack = PunchAck {
-            peer: 1,
+            from_peer: 1,
+            to_peer: 1,
             punch_id: 1,
         };
         assert_eq!(RendezvousMsg::PunchRequest(req).encode()[0], KIND_PUNCH_REQUEST);
