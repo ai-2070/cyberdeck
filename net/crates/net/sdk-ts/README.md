@@ -537,6 +537,198 @@ CortEX-boundary errors are typed and catchable via `instanceof`:
 All three are re-exported from `@ai2070/net-sdk`; you don't need a
 separate import path.
 
+## Compute (daemons + migration)
+
+Run `MeshDaemon`s directly from TypeScript. `DaemonRuntime` owns
+the factory table, per-daemon hosts, and the
+`Registering → Ready → ShuttingDown` lifecycle gate that decides
+when inbound migrations may land. Daemons are plain JS objects
+(or class instances) whose `process(event)` returns an array of
+output `Buffer`s — the runtime wraps each output in a causal link
+automatically.
+
+Build the `@ai2070/net` NAPI module with `--features compute`
+(auto-enabled in the default `local` bundle) to expose the
+surface; everything below is re-exported from `@ai2070/net-sdk`.
+Full design notes:
+[`docs/SDK_COMPUTE_SURFACE_PLAN.md`](../docs/SDK_COMPUTE_SURFACE_PLAN.md).
+
+```typescript
+import {
+  DaemonRuntime, DaemonError, Identity, MeshNode,
+  type CausalEvent, type MeshDaemon,
+} from '@ai2070/net-sdk';
+
+// 1. Build a mesh + runtime.
+const mesh = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk: '42'.repeat(32) });
+const rt = DaemonRuntime.create(mesh);
+
+// 2. Register factories BEFORE flipping the runtime to Ready.
+rt.registerFactory('echo', (): MeshDaemon => ({
+  name: 'echo',
+  process: (event: CausalEvent) => [event.payload],
+  // optional: snapshot() / restore(state) for migration-capable daemons
+}));
+
+// 3. Ready the runtime — after this point spawns + migrations accept.
+await rt.start();
+
+// 4. Spawn a daemon. `Identity` pins its ed25519 keypair so
+//    `originHash` / `entityId` stay stable across migrations.
+const handle = await rt.spawn('echo', Identity.generate());
+console.log('origin =', handle.originHash.toString(16));
+
+// 5. Inspect / stop when done.
+const stats = handle.stats();       // eventsProcessed / eventsEmitted / ...
+await rt.stop(handle.originHash);
+await rt.shutdown();
+```
+
+`MeshDaemon.process` is synchronous by contract — the NAPI TSFN
+bridge blocks the calling tokio task until it returns, so
+returning a `Promise` will break event dispatch. Stateful daemons
+opt into migration by adding `snapshot(): Buffer | null` and
+`restore(state: Buffer): void`.
+
+### Migration
+
+`startMigration(origin, sourceNode, targetNode)` orchestrates the
+six-phase cutover (`Snapshot → Transfer → Restore → Replay →
+Cutover → Complete`). The source seals the daemon's seed into the
+outbound snapshot using the target's X25519 static pubkey; the
+target's factory for the same `kind` rebuilds the daemon, replays
+any events that arrived during transfer, then activates.
+
+```typescript
+import { MigrationError } from '@ai2070/net-sdk';
+
+try {
+  const mig = await rtA.startMigration(handle.originHash, nodeA, nodeB);
+  console.log('phase =', mig.phase);        // 'snapshot' | 'transfer' | ...
+  await mig.wait();                         // drive to completion
+} catch (e) {
+  if (e instanceof MigrationError) {
+    switch (e.kind) {
+      case 'not-ready':                 break; // target not started yet
+      case 'factory-not-found':         break; // target missing `kind`
+      case 'compute-not-supported':     break; // target has no DaemonRuntime
+      case 'state-failed':              break; // snapshot / restore threw
+      case 'identity-transport-failed': break; // seal / unseal failed
+      // ... see MigrationErrorKind for the full set
+    }
+  }
+}
+```
+
+`startMigrationWith(origin, src, dst, { sealSeed, ... })` exposes
+the advanced knobs. On the target node, call
+`rt.registerMigrationTargetIdentity(identity)` before a migration
+lands — without it, the runtime rejects sealed-seed envelopes with
+`MigrationError.kind === 'identity-transport-failed'`.
+
+### Surface at a glance
+
+| Method | Description |
+|---|---|
+| `DaemonRuntime.create(mesh)` | Construct a runtime against an existing `MeshNode` |
+| `rt.registerFactory(kind, fn)` | Install a factory (must run before `start()`) |
+| `rt.start() / rt.shutdown()` | Flip the lifecycle gate |
+| `rt.spawn(kind, identity, cfg?)` | Spawn a local daemon |
+| `rt.spawnFromSnapshot(kind, identity, bytes, cfg?)` | Rehydrate from a snapshot |
+| `rt.stop(origin)` | Stop a local daemon |
+| `rt.snapshot(origin)` | Capture a `Buffer` for persistence / migration |
+| `rt.deliver(origin, event)` | Feed an event (returns output buffers) |
+| `rt.startMigration(origin, src, dst)` | Orchestrate a live migration |
+| `rt.registerMigrationTargetIdentity(id)` | Pin the unseal keypair on target nodes |
+| `handle.originHash` / `entityId` / `stats()` | Per-daemon identity + observability |
+| `DaemonError` / `MigrationError` | Typed catch classes (`instanceof` + `err.kind`) |
+
+## Groups (replica / fork / standby)
+
+HA / scaling overlays on top of `DaemonRuntime`. Build the NAPI
+crate with `--features groups` (implies `compute`) to expose
+`ReplicaGroup`, `ForkGroup`, and `StandbyGroup`.
+
+- **ReplicaGroup** — N interchangeable copies with deterministic
+  identity per index; load-balances inbound events across healthy
+  members; auto-replaces on node failure.
+- **ForkGroup** — N independent daemons forked from a common parent
+  at `forkSeq`. Unique identities, shared ancestry via a verifiable
+  `ForkRecord`.
+- **StandbyGroup** — active-passive replication. One member processes
+  events; standbys hold snapshots via `sync()`. Most-synced standby
+  promotes on active failure and replays buffered events.
+
+```typescript
+import {
+  DaemonRuntime, ForkGroup, GroupError, ReplicaGroup, StandbyGroup,
+} from '@ai2070/net-sdk';
+
+const rt = await DaemonRuntime.create(mesh);
+rt.registerFactory('counter', () => new CounterDaemon());
+
+// ReplicaGroup — async because the factory round-trips through the
+// Node main thread (TSFN).
+const replicas = await ReplicaGroup.spawn(rt, 'counter', {
+  replicaCount: 3,
+  groupSeed: Buffer.alloc(32, 0x11),
+  lbStrategy: 'consistent-hash',        // or 'round-robin' | 'least-load' | ...
+});
+
+const origin = replicas.routeEvent({ routingKey: 'user:42' });
+await rt.deliver(origin, event);
+
+await replicas.scaleTo(5);               // grow
+await replicas.onNodeFailure(failedNodeId);   // respawn elsewhere
+
+// ForkGroup
+const forks = await ForkGroup.fork(rt, 'counter',
+  /* parentOrigin */ 0xabcdef01,
+  /* forkSeq     */ 42n,
+  { forkCount: 3, lbStrategy: 'round-robin' });
+console.log(forks.verifyLineage(), forks.forkRecords.length);
+
+// StandbyGroup — manual event buffering for replay on promotion.
+const hot = await StandbyGroup.spawn(rt, 'counter', {
+  memberCount: 3,                        // 1 active + 2 standbys
+  groupSeed: Buffer.alloc(32, 0x77),
+});
+await rt.deliver(hot.activeOrigin, event);
+hot.onEventDelivered(event);             // keep standbys' replay buffer accurate
+await hot.sync();                        // periodic catchup
+// await hot.onNodeFailure(failedNodeId); // auto-promotes the most-synced standby
+```
+
+### Typed errors
+
+Failures surface as `GroupError` (a subclass of `DaemonError`) with
+a stable `kind` discriminator parsed from the Rust side's
+`daemon: group: <kind>[: detail]` prefix:
+
+```typescript
+import { GroupError } from '@ai2070/net-sdk';
+
+try {
+  await ReplicaGroup.spawn(rt, 'never-registered', cfg);
+} catch (e) {
+  if (e instanceof GroupError) {
+    switch (e.kind) {
+      case 'not-ready':           break; // runtime.start() hasn't run
+      case 'factory-not-found':   break; // e.requestedKind tells you which
+      case 'no-healthy-member':   break; // routeEvent on an all-down group
+      case 'invalid-config':      break; // e.detail has the specifics
+      case 'placement-failed':    break;
+      case 'registry-failed':     break;
+    }
+  }
+}
+```
+
+Full staging, wire formats, and rationale:
+[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../docs/SDK_GROUPS_SURFACE_PLAN.md).
+Core semantics (placement spread, health aggregation, failure
+domains): [`../README.md#daemons`](../README.md#daemons).
+
 ## API
 
 | Method | Description |

@@ -360,6 +360,63 @@ pub extern "C" fn net_mesh_free(handle: *mut MeshNodeHandle) {
     }
 }
 
+/// Clone the `Arc<MeshNode>` backing this handle and return a
+/// `*mut Arc<MeshNode>`. Used by the compute-FFI crate so the
+/// Go binding's `DaemonRuntime` can share the live mesh node
+/// without opening a second socket.
+///
+/// Caller takes ownership of the returned pointer and MUST free it
+/// with [`net_mesh_arc_free`]. Returns NULL if `handle` is NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_arc_clone(handle: *mut MeshNodeHandle) -> *mut Arc<MeshNode> {
+    if handle.is_null() {
+        return std::ptr::null_mut();
+    }
+    let h = unsafe { &*handle };
+    Box::into_raw(Box::new(h.inner.clone()))
+}
+
+/// Clone the shared `Arc<ChannelConfigRegistry>` backing this
+/// handle. Used by compute-FFI so migration-triggered channel
+/// rebind replays hit the same registry the mesh publishes to.
+///
+/// Caller takes ownership and MUST free with
+/// [`net_mesh_channel_configs_arc_free`].
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_channel_configs_arc_clone(
+    handle: *mut MeshNodeHandle,
+) -> *mut Arc<ChannelConfigRegistry> {
+    if handle.is_null() {
+        return std::ptr::null_mut();
+    }
+    let h = unsafe { &*handle };
+    Box::into_raw(Box::new(h.channel_configs.clone()))
+}
+
+/// Free an `Arc<MeshNode>` handle produced by
+/// [`net_mesh_arc_clone`]. Idempotent on NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_arc_free(p: *mut Arc<MeshNode>) {
+    if p.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(p));
+    }
+}
+
+/// Free an `Arc<ChannelConfigRegistry>` handle produced by
+/// [`net_mesh_channel_configs_arc_clone`]. Idempotent on NULL.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_channel_configs_arc_free(p: *mut Arc<ChannelConfigRegistry>) {
+    if p.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(p));
+    }
+}
+
 /// Write the hex-encoded 32-byte Noise static public key of this
 /// node to `*out`. Caller frees via `net_free_string`.
 #[unsafe(no_mangle)]

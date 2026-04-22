@@ -576,10 +576,14 @@ if (!nativeBinding) {
 }
 
 module.exports = nativeBinding
+module.exports.DaemonHandle = nativeBinding.DaemonHandle
+module.exports.DaemonRuntime = nativeBinding.DaemonRuntime
+module.exports.ForkGroup = nativeBinding.ForkGroup
 module.exports.Identity = nativeBinding.Identity
 module.exports.MemoriesAdapter = nativeBinding.MemoriesAdapter
 module.exports.MemoriesSnapshotAndWatch = nativeBinding.MemoriesSnapshotAndWatch
 module.exports.MemoryWatchIter = nativeBinding.MemoryWatchIter
+module.exports.MigrationHandle = nativeBinding.MigrationHandle
 module.exports.Net = nativeBinding.Net
 module.exports.NetDb = nativeBinding.NetDb
 module.exports.NetMesh = nativeBinding.NetMesh
@@ -587,6 +591,8 @@ module.exports.NetStream = nativeBinding.NetStream
 module.exports.Redex = nativeBinding.Redex
 module.exports.RedexFile = nativeBinding.RedexFile
 module.exports.RedexTailIter = nativeBinding.RedexTailIter
+module.exports.ReplicaGroup = nativeBinding.ReplicaGroup
+module.exports.StandbyGroup = nativeBinding.StandbyGroup
 module.exports.TasksAdapter = nativeBinding.TasksAdapter
 module.exports.TasksSnapshotAndWatch = nativeBinding.TasksSnapshotAndWatch
 module.exports.TaskWatchIter = nativeBinding.TaskWatchIter
@@ -596,6 +602,7 @@ module.exports.generateNetKeypair = nativeBinding.generateNetKeypair
 module.exports.MemoriesOrderBy = nativeBinding.MemoriesOrderBy
 module.exports.normalizeGpuVendor = nativeBinding.normalizeGpuVendor
 module.exports.parseToken = nativeBinding.parseToken
+module.exports.StrategyJs = nativeBinding.StrategyJs
 module.exports.TasksOrderBy = nativeBinding.TasksOrderBy
 module.exports.TaskStatus = nativeBinding.TaskStatus
 module.exports.tokenIsExpired = nativeBinding.tokenIsExpired

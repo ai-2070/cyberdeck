@@ -237,6 +237,144 @@ Cross-SDK contract + rationale:
 > paths. Follow-up work to proxy them through `net_sdk` is tracked
 > in [`SDK_PYTHON_PARITY_PLAN.md`](../docs/SDK_PYTHON_PARITY_PLAN.md).
 
+## Compute (daemons + migration)
+
+The full compute surface — `DaemonRuntime`, `MeshDaemon`
+(duck-typed), `DaemonHandle`, `MigrationHandle`, plus the six-
+phase migration orchestrator — ships on the native **`net`** PyO3
+package (when built with the `compute` feature). Import directly:
+
+```python
+from net import (
+    DaemonRuntime, NetMesh, Identity, CausalEvent,
+    DaemonError, MigrationError, migration_error_kind,
+)
+
+
+class EchoDaemon:
+    name = "echo"
+
+    def process(self, event):
+        return [bytes(event.payload)]
+
+
+mesh = NetMesh("127.0.0.1:9000", "42" * 32)
+rt = DaemonRuntime(mesh)
+rt.register_factory("echo", lambda: EchoDaemon())
+rt.start()
+
+handle = rt.spawn("echo", Identity.generate())
+# rt.deliver(handle.origin_hash, CausalEvent(handle.origin_hash, 1, b"hi"))
+rt.stop(handle.origin_hash)
+rt.shutdown()
+```
+
+Live migration (`rt.start_migration(origin, src, dst)`) returns a
+`MigrationHandle` whose `wait()` drives the cutover to completion;
+failures raise `MigrationError` with a stable `kind` parseable by
+`migration_error_kind(e)`. Full surface + runnable examples:
+[`bindings/python/README.md`](../bindings/python/README.md#compute-daemons--migration).
+Cross-SDK contract + rationale:
+[`docs/SDK_COMPUTE_SURFACE_PLAN.md`](../docs/SDK_COMPUTE_SURFACE_PLAN.md).
+
+> **Note.** Like the security types, the `net_sdk` wrapper doesn't
+> yet re-export `DaemonRuntime` / `MigrationHandle` — use the
+> native `net` package directly. Proxying these through `net_sdk`
+> is tracked in
+> [`SDK_PYTHON_PARITY_PLAN.md`](../docs/SDK_PYTHON_PARITY_PLAN.md).
+
+## Groups (replica / fork / standby)
+
+HA / scaling overlays on top of `DaemonRuntime` — `ReplicaGroup`,
+`ForkGroup`, `StandbyGroup` — ship on the native **`net`** PyO3
+package (when built with the `groups` feature). Import directly:
+
+```python
+from net import (
+    DaemonRuntime, NetMesh, Identity, CausalEvent,
+    ReplicaGroup, ForkGroup, StandbyGroup,
+    GroupError, group_error_kind,
+)
+
+
+class CounterDaemon:
+    """Minimal stateful daemon — increments on every event."""
+
+    name = "counter"
+
+    def __init__(self):
+        self._count = 0
+
+    def process(self, event: CausalEvent) -> list[bytes]:
+        self._count += 1
+        return [self._count.to_bytes(4, "little")]
+
+
+# Build a mesh + runtime, register the factory, flip to Ready.
+mesh = NetMesh("127.0.0.1:9000", "42" * 32)
+rt = DaemonRuntime(mesh)
+rt.register_factory("counter", lambda: CounterDaemon())
+rt.start()
+
+# A sample event — `rt.deliver` expects a `CausalEvent` per the
+# compute surface. The origin/sequence match the replica the
+# group routes to.
+event = CausalEvent(0x1234_5678, sequence=1, payload=b"tick")
+
+# N interchangeable replicas with deterministic per-index identity.
+replicas = ReplicaGroup.spawn(
+    rt, "counter",
+    replica_count=3,
+    group_seed=bytes([0x11] * 32),
+    lb_strategy="consistent-hash",   # or "round-robin" | "least-load" | ...
+)
+origin = replicas.route_event({"routing_key": "user:42"})
+rt.deliver(origin, CausalEvent(origin, sequence=1, payload=b"tick"))
+replicas.scale_to(5)
+
+# N independent daemons forked from a common parent; verifiable lineage.
+forks = ForkGroup.fork(
+    rt, "counter",
+    parent_origin=0xABCDEF01,
+    fork_seq=42,
+    fork_count=3,
+    lb_strategy="round-robin",
+)
+assert forks.verify_lineage()
+
+# Active-passive replication with replay on promotion.
+hot = StandbyGroup.spawn(
+    rt, "counter",
+    member_count=3,                  # 1 active + 2 standbys
+    group_seed=bytes([0x77] * 32),
+)
+active_origin = hot.active_origin()
+active_event = CausalEvent(active_origin, sequence=1, payload=b"tick")
+rt.deliver(active_origin, active_event)
+hot.on_event_delivered(active_event)  # keep standby replay buffer accurate
+hot.sync_standbys()                   # periodic catchup
+
+try:
+    ReplicaGroup.spawn(
+        rt, "never-registered",
+        replica_count=2, group_seed=bytes(32),
+        lb_strategy="round-robin",
+    )
+except GroupError as e:
+    kind = group_error_kind(e)
+    # kind ∈ { "not-ready", "factory-not-found", "no-healthy-member",
+    #         "placement-failed", "registry-failed", "invalid-config",
+    #         "daemon", "unknown" }
+```
+
+Full surface + runnable examples:
+[`bindings/python/README.md`](../bindings/python/README.md#compute-groups-replica--fork--standby).
+Cross-SDK contract + rationale:
+[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../docs/SDK_GROUPS_SURFACE_PLAN.md).
+
+> **Note.** `net_sdk` does not yet proxy the groups surface; use the
+> native `net` package directly, the same way as the security types.
+
 ## API
 
 | Method | Description |

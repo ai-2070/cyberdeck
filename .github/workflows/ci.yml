@@ -136,12 +136,26 @@ jobs:
         run: npm ci
 
       # Build napi binding with the features the vitest suite covers:
-      # `net` for the mesh surface + `cortex` for the CortEX / NetDB tests.
+      # `net` for the mesh surface + `cortex` for the CortEX / NetDB
+      # tests + `compute` for the MeshDaemon / migration tests +
+      # `groups` for the `ReplicaGroup` / `ForkGroup` / `StandbyGroup`
+      # tests (Stages 3 + 4 of `SDK_COMPUTE_SURFACE_PLAN` and
+      # `SDK_GROUPS_SURFACE_PLAN`) + `test-helpers` so
+      # `_testInjectSyntheticPeer` is exported for the group-placement
+      # fixtures.
+      #
       # `cortex` transitively enables redex + netdb via the binding's
-      # feature graph. Skip the `redis` default — the Node suite doesn't
-      # hit it, and pulling it in would need a service container.
+      # feature graph. Skip the `redis` default — the Node suite
+      # doesn't hit it, and pulling it in would need a service
+      # container.
+      #
+      # Invoke napi directly (not `npm run build:test`) so we can pass
+      # `--no-default-features` to suppress `redis`; the package.json
+      # scripts bake `redis` in for consumers who want the full
+      # surface from source.
       - name: Build native module
-        run: npm run build:debug -- --no-default-features --features net,cortex
+        working-directory: net/crates/net/bindings/node
+        run: npx napi build --platform --no-default-features --features net,cortex,compute,groups,test-helpers
 
       - name: Run tests
         run: npm test
@@ -187,10 +201,14 @@ jobs:
       - name: Install maturin and pytest
         run: pip install --upgrade pip maturin pytest
 
-      # `net,cortex` mirrors the Node binding's feature set; skip the
-      # default `redis` feature for the same reason.
+      # `net,cortex,compute,groups` mirrors the Node binding's
+      # feature set for tests. `groups` is needed so `test_groups.py`
+      # can import `ReplicaGroup` / `ForkGroup` / `StandbyGroup` /
+      # `GroupError`; without it the module would skip via the
+      # `pytestmark` guard in the test file. Default `redis` is
+      # omitted because the suite doesn't exercise the Redis adapter.
       - name: Build and install bindings
-        run: maturin develop --no-default-features --features net,cortex
+        run: maturin develop --no-default-features --features net,cortex,compute,groups
 
       - name: Run tests
         run: pytest -v

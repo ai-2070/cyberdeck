@@ -117,6 +117,40 @@ export type {
 export { subnetId, GLOBAL_SUBNET } from './subnets';
 export type { SubnetId, SubnetRule, SubnetPolicy } from './subnets';
 
+// Compute (daemons + migration — Stage 3 + 4).
+export {
+  DaemonRuntime,
+  DaemonHandle,
+  DaemonError,
+  MigrationHandle,
+  MigrationError,
+} from './compute';
+export type {
+  CausalEvent,
+  MeshDaemon,
+  DaemonFactory,
+  DaemonHostConfig,
+  DaemonStats,
+  MigrationPhase,
+  MigrationOptions,
+  MigrationErrorKind,
+} from './compute';
+
+// Groups (HA / scaling overlays — Stage 2 of SDK_GROUPS_SURFACE_PLAN).
+export { ReplicaGroup, ForkGroup, StandbyGroup, GroupError } from './groups';
+export type {
+  GroupErrorKind,
+  GroupStrategy,
+  GroupHealth,
+  GroupMemberInfo,
+  GroupHostConfig,
+  ForkRecord,
+  RequestContext,
+  ReplicaGroupConfig,
+  ForkGroupConfig,
+  StandbyGroupConfig,
+} from './groups';
+
 // Types.
 export type {
   NetNodeConfig,

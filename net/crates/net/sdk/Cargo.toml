@@ -40,9 +40,14 @@ cortex = ["net/netdb", "net/redex-disk"]
 # mesh identity (ed25519 keypair + origin_hash) that rides on the
 # same `Identity` the channel-auth path uses.
 compute = ["net"]
+# HA / scaling overlays — `ReplicaGroup` / `ForkGroup` /
+# `StandbyGroup`. Sits on top of `compute`; a caller with just
+# `compute` gets single-daemon spawn / snapshot / migration, and
+# `groups` adds the N-member coordination primitives on top.
+groups = ["compute"]
 # Everything that runs locally (mesh + storage/state + security +
-# compute, no external transports). The default shape for a
-# single-node or LAN-only deployment.
-local = ["net", "cortex", "compute"]
+# compute + groups, no external transports). The default shape for
+# a single-node or LAN-only deployment.
+local = ["net", "cortex", "compute", "groups"]
 # Everything — local stack plus external transports.
 full = ["local", "redis", "jetstream"]

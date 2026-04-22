@@ -587,6 +587,456 @@ int      net_mesh_find_peers(net_meshnode_t* handle,
 int      net_normalize_gpu_vendor(const char* raw,
                                   char** out, size_t* out_len);
 
+/* =========================================================================
+ * Compute — MeshDaemon + migration. Stage 6 of
+ * SDK_COMPUTE_SURFACE_PLAN.md. Symbols live in `libnet_compute`
+ * (sibling shared library built from `bindings/go/compute-ffi`).
+ * Link with `-lnet -lnet_compute`.
+ * ========================================================================= */
+
+/* Opaque handles. Go wrappers own the pointer lifetime via
+ * runtime.SetFinalizer — consistent with `net_meshnode_t`. */
+typedef struct net_compute_runtime_s      net_compute_runtime_t;
+typedef struct net_compute_mesh_arc_s     net_compute_mesh_arc_t;
+typedef struct net_compute_cc_arc_s       net_compute_cc_arc_t;
+
+/* Compute error codes (negative). */
+#define NET_COMPUTE_OK                   0
+#define NET_COMPUTE_ERR_NULL            -1
+#define NET_COMPUTE_ERR_CALL_FAILED     -2
+#define NET_COMPUTE_ERR_DUPLICATE_KIND  -3
+
+/* --- Arc<MeshNode> / Arc<ChannelConfigRegistry> accessors ---
+ *
+ * Produced by `net_mesh_*_arc_clone` (in libnet); compute-ffi's
+ * `net_compute_runtime_new` CONSUMES them. Pair each clone with
+ * either a `net_compute_runtime_new` consume-call or a matching
+ * `_free`.
+ */
+net_compute_mesh_arc_t* net_mesh_arc_clone(net_meshnode_t* handle);
+void                    net_mesh_arc_free(net_compute_mesh_arc_t* p);
+
+net_compute_cc_arc_t*   net_mesh_channel_configs_arc_clone(net_meshnode_t* handle);
+void                    net_mesh_channel_configs_arc_free(net_compute_cc_arc_t* p);
+
+/* --- Runtime lifecycle --- */
+
+/* Build a DaemonRuntime sharing the given mesh's node + channel
+ * configs. Both Arc pointers are consumed on success (do not free
+ * afterwards). Returns NULL if any input is NULL. */
+net_compute_runtime_t*  net_compute_runtime_new(
+    net_compute_mesh_arc_t* node_arc,
+    net_compute_cc_arc_t* channel_configs_arc);
+
+/* Free a runtime handle. The underlying MeshNode is untouched. */
+void                    net_compute_runtime_free(net_compute_runtime_t* handle);
+
+/* Return the monotonic, process-unique identifier assigned to this
+ * runtime by `net_compute_runtime_new`. Go uses this id to scope
+ * its factory map so two runtimes in the same process can register
+ * the same `kind` without colliding. Returns 0 on NULL input. */
+uint64_t                net_compute_runtime_id(const net_compute_runtime_t* handle);
+
+/* Transition to Ready. On failure, writes a heap-allocated char*
+ * detail to `*err_out` (free via `net_compute_free_cstring`). */
+int                     net_compute_runtime_start(
+    net_compute_runtime_t* handle,
+    char** err_out);
+
+/* Tear down the runtime. `*err_out` carries detail on failure. */
+int                     net_compute_runtime_shutdown(
+    net_compute_runtime_t* handle,
+    char** err_out);
+
+/* 1 = ready, 0 = not-ready, NET_COMPUTE_ERR_NULL on NULL handle. */
+int                     net_compute_runtime_is_ready(net_compute_runtime_t* handle);
+
+/* Number of daemons registered. Returns -1 on NULL handle. */
+int64_t                 net_compute_runtime_daemon_count(net_compute_runtime_t* handle);
+
+/* Register a placeholder kind. Enables `spawn`; migration-target
+ * reconstruction falls back to NoopBridge (migrated-in daemons on
+ * this node run as no-op). Use `net_compute_register_factory_with_func`
+ * when you need migrated-in daemons to run user code. */
+int                     net_compute_register_factory(
+    net_compute_runtime_t* handle,
+    const char* kind_ptr,
+    size_t kind_len);
+
+/* Register a kind with a Go-side factory func (the caller already
+ * stored the func in the Go-side factoryFuncs map; we install an
+ * SDK factory closure that reaches back via the dispatcher's
+ * factory trampoline on every migration-target reconstruction). */
+int                     net_compute_register_factory_with_func(
+    net_compute_runtime_t* handle,
+    const char* kind_ptr,
+    size_t kind_len);
+
+/* Free a CString returned by compute-ffi (e.g., an err_out detail). */
+void                    net_compute_free_cstring(char* s);
+
+/* --- Callback dispatcher (sub-step 2) ---
+ *
+ * Go registers four trampolines with C linkage via
+ * `net_compute_set_dispatcher` in its `init()`. Rust invokes them
+ * whenever a bridged daemon's `process` / `snapshot` / `restore`
+ * method needs to run, plus a `free` callback on daemon drop so
+ * Go can release its registry entry.
+ */
+
+typedef struct net_compute_outputs_s      net_compute_outputs_t;
+typedef struct net_compute_daemon_handle_s net_compute_daemon_handle_t;
+
+typedef int (*net_compute_process_fn)(
+    uint64_t daemon_id,
+    uint32_t origin_hash,
+    uint64_t sequence,
+    const uint8_t* payload_ptr,
+    size_t payload_len,
+    net_compute_outputs_t* outputs);
+
+typedef int (*net_compute_snapshot_fn)(
+    uint64_t daemon_id,
+    uint8_t** out_ptr,
+    size_t* out_len);
+
+typedef int (*net_compute_restore_fn)(
+    uint64_t daemon_id,
+    const uint8_t* state_ptr,
+    size_t state_len);
+
+typedef void (*net_compute_free_fn)(uint64_t daemon_id);
+
+typedef int (*net_compute_factory_fn)(
+    uint64_t runtime_id,
+    const char* kind_ptr,
+    size_t kind_len,
+    uint64_t* out_daemon_id);
+
+/* Install the Go dispatcher. Call once from Go's init; second call
+ * is ignored (first registration wins). All five pointers must be
+ * non-NULL. */
+int                     net_compute_set_dispatcher(
+    net_compute_process_fn process,
+    net_compute_snapshot_fn snapshot,
+    net_compute_restore_fn restore,
+    net_compute_free_fn free,
+    net_compute_factory_fn factory);
+
+/* Push one output payload into the outputs vec. Called by Go's
+ * process trampoline. Copies `len` bytes. */
+int                     net_compute_outputs_push(
+    net_compute_outputs_t* vec,
+    const uint8_t* data,
+    size_t len);
+
+/* Free a snapshot buffer the Go side malloc'd and handed to Rust
+ * via `net_compute_snapshot_fn`. (The Rust bridge calls this after
+ * copying the bytes into its own Bytes.) Normal callers should not
+ * invoke this directly. */
+void                    net_compute_snapshot_bytes_free(uint8_t* ptr, size_t len);
+
+/* --- Spawn / stop / deliver --- */
+
+/* Spawn a daemon. `daemon_id` is the Go-side registry key
+ * trampolines will receive on every callback. `identity_seed`
+ * points at 32 bytes of ed25519 seed. Writes the opaque handle to
+ * `*out_handle` on success. `auto_snapshot_interval` and
+ * `max_log_entries` take 0 for defaults. */
+int                     net_compute_spawn(
+    net_compute_runtime_t* runtime,
+    const char* kind_ptr,
+    size_t kind_len,
+    const uint8_t* identity_seed,
+    uint64_t daemon_id,
+    uint64_t auto_snapshot_interval,
+    uint32_t max_log_entries,
+    net_compute_daemon_handle_t** out_handle,
+    char** err_out);
+
+/* Read the origin_hash from a daemon handle. Returns 0 on NULL. */
+uint32_t                net_compute_daemon_handle_origin_hash(
+    const net_compute_daemon_handle_t* handle);
+
+/* Copy the 32-byte entity_id from a daemon handle into `out`. */
+int                     net_compute_daemon_handle_entity_id(
+    const net_compute_daemon_handle_t* handle,
+    uint8_t* out);
+
+/* Free a daemon handle (does NOT stop the daemon — call
+ * `net_compute_runtime_stop(origin_hash)` separately). */
+void                    net_compute_daemon_handle_free(
+    net_compute_daemon_handle_t* handle);
+
+/* Stop a daemon by origin_hash. */
+int                     net_compute_runtime_stop(
+    net_compute_runtime_t* runtime,
+    uint32_t origin_hash,
+    char** err_out);
+
+/* Deliver one event. Writes a heap-allocated outputs vec to
+ * `*out_outputs`; caller reads via `net_compute_outputs_len`/`_at`
+ * and frees via `net_compute_outputs_free`. */
+int                     net_compute_runtime_deliver(
+    net_compute_runtime_t* runtime,
+    uint32_t origin_hash,
+    uint32_t event_origin_hash,
+    uint64_t event_sequence,
+    const uint8_t* event_payload,
+    size_t event_payload_len,
+    net_compute_outputs_t** out_outputs,
+    char** err_out);
+
+size_t                  net_compute_outputs_len(const net_compute_outputs_t* vec);
+int                     net_compute_outputs_at(
+    const net_compute_outputs_t* vec,
+    size_t idx,
+    const uint8_t** out_ptr,
+    size_t* out_len);
+void                    net_compute_outputs_free(net_compute_outputs_t* vec);
+
+/* --- Snapshot + restore (sub-step 3) --- */
+
+/* Take a snapshot of a running daemon. On success, `*out_outputs`
+ * carries the serialized StateSnapshot bytes as a single-entry
+ * outputs vec, or an empty vec for stateless daemons. */
+int                     net_compute_runtime_snapshot(
+    net_compute_runtime_t* runtime,
+    uint32_t origin_hash,
+    net_compute_outputs_t** out_outputs,
+    char** err_out);
+
+/* Spawn from a previously-taken snapshot. `snapshot_ptr` /
+ * `snapshot_len` must be the exact bytes returned by a prior
+ * `net_compute_runtime_snapshot`. Corrupted bytes fail fast with
+ * `daemon: snapshot decode failed`; identity mismatch surfaces via
+ * the SDK's existing `snapshot identity mismatch` error. */
+int                     net_compute_spawn_from_snapshot(
+    net_compute_runtime_t* runtime,
+    const char* kind_ptr,
+    size_t kind_len,
+    const uint8_t* identity_seed,
+    const uint8_t* snapshot_ptr,
+    size_t snapshot_len,
+    uint64_t daemon_id,
+    uint64_t auto_snapshot_interval,
+    uint32_t max_log_entries,
+    net_compute_daemon_handle_t** out_handle,
+    char** err_out);
+
+/* --- Migration (sub-step 4) ---
+ *
+ * Error messages from the migration surface use the prefix
+ * `migration: <kind>[: <detail>]` (written into the `err_out`
+ * CString) so the Go side can dispatch on the stable kind:
+ * `not-ready` | `factory-not-found` | `compute-not-supported` |
+ * `state-failed` | `already-migrating` | `identity-transport-failed` |
+ * `not-ready-timeout` | `daemon-not-found` | `target-unavailable` |
+ * `wrong-phase` | `snapshot-too-large`.
+ */
+
+typedef struct net_compute_migration_handle_s net_compute_migration_handle_t;
+
+/* Start a migration. `transport_identity`: 0 = skip envelope,
+ * non-zero = seal the daemon's keypair into the snapshot.
+ * `retry_not_ready_ms`: 0 disables retry; otherwise the source
+ * backs off + re-initiates on `NotReady` up to this budget. */
+int                     net_compute_start_migration(
+    net_compute_runtime_t* runtime,
+    uint32_t origin_hash,
+    uint64_t source_node,
+    uint64_t target_node,
+    uint8_t transport_identity,
+    uint64_t retry_not_ready_ms,
+    net_compute_migration_handle_t** out_handle,
+    char** err_out);
+
+/* Declare that a migration will land on this node for
+ * `origin_hash`. Uses the snapshot's envelope to supply the
+ * keypair. */
+int                     net_compute_expect_migration(
+    net_compute_runtime_t* runtime,
+    const char* kind_ptr,
+    size_t kind_len,
+    uint32_t origin_hash,
+    uint64_t auto_snapshot_interval,
+    uint32_t max_log_entries,
+    char** err_out);
+
+/* Register an identity for target-side restore when the source
+ * migrates without an envelope (transport_identity=0). */
+int                     net_compute_register_migration_target_identity(
+    net_compute_runtime_t* runtime,
+    const char* kind_ptr,
+    size_t kind_len,
+    const uint8_t* identity_seed,
+    uint64_t auto_snapshot_interval,
+    uint32_t max_log_entries,
+    char** err_out);
+
+/* Query the orchestrator phase for `origin_hash`. Returns NULL
+ * if no migration is in flight, else a heap-allocated CString
+ * the caller frees with `net_compute_free_cstring`. */
+char*                   net_compute_migration_phase(
+    net_compute_runtime_t* runtime,
+    uint32_t origin_hash);
+
+/* Free a migration handle. Does NOT cancel the migration. */
+void                    net_compute_migration_handle_free(
+    net_compute_migration_handle_t* handle);
+
+uint32_t                net_compute_migration_handle_origin_hash(
+    const net_compute_migration_handle_t* handle);
+uint64_t                net_compute_migration_handle_source_node(
+    const net_compute_migration_handle_t* handle);
+uint64_t                net_compute_migration_handle_target_node(
+    const net_compute_migration_handle_t* handle);
+
+/* Current phase or NULL (same semantics as
+ * `net_compute_migration_phase`). Caller frees non-NULL result. */
+char*                   net_compute_migration_handle_phase(
+    const net_compute_migration_handle_t* handle);
+
+/* Block until terminal state. 0 on `complete`; err_out carries
+ * `migration: <kind>` body on abort/failure. */
+int                     net_compute_migration_handle_wait(
+    net_compute_migration_handle_t* handle,
+    char** err_out);
+
+int                     net_compute_migration_handle_wait_with_timeout(
+    net_compute_migration_handle_t* handle,
+    uint64_t timeout_ms,
+    char** err_out);
+
+int                     net_compute_migration_handle_cancel(
+    net_compute_migration_handle_t* handle,
+    char** err_out);
+
+/* Test-only helper — `net_compute_test_inject_synthetic_peer` —
+ * lives in the test-only Go file `groups_testhelpers_test.go`,
+ * gated at the Rust layer behind the `test-helpers` cargo
+ * feature on compute-ffi. Intentionally NOT declared here
+ * because this header ships with production consumers; the test
+ * binary supplies its own extern declaration. */
+
+/* =========================================================================
+ * Groups — Stage 4 of SDK_GROUPS_SURFACE_PLAN.md.
+ *
+ * `ReplicaGroup` / `ForkGroup` / `StandbyGroup` overlays on top of
+ * `DaemonRuntime`. Errors use the stable prefix
+ * `group: <kind>[: <detail>]`, where `<kind>` is one of:
+ *   `not-ready` | `factory-not-found` | `no-healthy-member` |
+ *   `placement-failed` | `registry-failed` | `invalid-config` |
+ *   `daemon`
+ * ========================================================================= */
+
+typedef struct net_compute_replica_group_s  net_compute_replica_group_t;
+typedef struct net_compute_fork_group_s     net_compute_fork_group_t;
+typedef struct net_compute_standby_group_s  net_compute_standby_group_t;
+
+/* --- ReplicaGroup --- */
+
+int  net_compute_replica_group_spawn(
+    net_compute_runtime_t* runtime,
+    const char* kind_ptr, size_t kind_len,
+    uint32_t replica_count,
+    const uint8_t* group_seed,
+    const char* lb_strategy_ptr, size_t lb_strategy_len,
+    uint64_t auto_snapshot_interval,
+    uint32_t max_log_entries,
+    net_compute_replica_group_t** out_handle,
+    char** err_out);
+
+void net_compute_replica_group_free(net_compute_replica_group_t* h);
+int  net_compute_replica_group_replica_count(const net_compute_replica_group_t* h);
+int  net_compute_replica_group_healthy_count(const net_compute_replica_group_t* h);
+uint32_t net_compute_replica_group_group_id(const net_compute_replica_group_t* h);
+
+/* status: 0=healthy 1=degraded 2=dead */
+int  net_compute_replica_group_health(
+    const net_compute_replica_group_t* h,
+    int* out_status, uint32_t* out_healthy, uint32_t* out_total);
+
+int  net_compute_replica_group_route_event(
+    const net_compute_replica_group_t* h,
+    const char* routing_key_ptr, size_t routing_key_len,
+    uint32_t* out_origin, char** err_out);
+
+int  net_compute_replica_group_scale_to(
+    const net_compute_replica_group_t* h,
+    uint32_t n, char** err_out);
+
+void net_compute_replica_group_on_node_recovery(
+    const net_compute_replica_group_t* h, uint64_t node_id);
+
+/* Returns JSON string; free with `net_compute_free_cstring`. */
+char* net_compute_replica_group_members_json(
+    const net_compute_replica_group_t* h);
+
+/* --- ForkGroup --- */
+
+int  net_compute_fork_group_spawn(
+    net_compute_runtime_t* runtime,
+    const char* kind_ptr, size_t kind_len,
+    uint32_t parent_origin,
+    uint64_t fork_seq,
+    uint32_t fork_count,
+    const char* lb_strategy_ptr, size_t lb_strategy_len,
+    uint64_t auto_snapshot_interval,
+    uint32_t max_log_entries,
+    net_compute_fork_group_t** out_handle,
+    char** err_out);
+
+void net_compute_fork_group_free(net_compute_fork_group_t* h);
+int  net_compute_fork_group_fork_count(const net_compute_fork_group_t* h);
+int  net_compute_fork_group_healthy_count(const net_compute_fork_group_t* h);
+uint32_t net_compute_fork_group_parent_origin(const net_compute_fork_group_t* h);
+uint64_t net_compute_fork_group_fork_seq(const net_compute_fork_group_t* h);
+/* Returns 1 if every fork's lineage verifies, 0 otherwise. */
+int  net_compute_fork_group_verify_lineage(const net_compute_fork_group_t* h);
+int  net_compute_fork_group_scale_to(
+    const net_compute_fork_group_t* h, uint32_t n, char** err_out);
+void net_compute_fork_group_on_node_recovery(
+    const net_compute_fork_group_t* h, uint64_t node_id);
+
+char* net_compute_fork_group_members_json(const net_compute_fork_group_t* h);
+char* net_compute_fork_group_fork_records_json(const net_compute_fork_group_t* h);
+
+/* --- StandbyGroup --- */
+
+int  net_compute_standby_group_spawn(
+    net_compute_runtime_t* runtime,
+    const char* kind_ptr, size_t kind_len,
+    uint32_t member_count,
+    const uint8_t* group_seed,
+    uint64_t auto_snapshot_interval,
+    uint32_t max_log_entries,
+    net_compute_standby_group_t** out_handle,
+    char** err_out);
+
+void net_compute_standby_group_free(net_compute_standby_group_t* h);
+int  net_compute_standby_group_member_count(const net_compute_standby_group_t* h);
+int  net_compute_standby_group_standby_count(const net_compute_standby_group_t* h);
+int  net_compute_standby_group_active_index(const net_compute_standby_group_t* h);
+uint32_t net_compute_standby_group_active_origin(const net_compute_standby_group_t* h);
+int  net_compute_standby_group_active_healthy(const net_compute_standby_group_t* h);
+uint32_t net_compute_standby_group_group_id(const net_compute_standby_group_t* h);
+int  net_compute_standby_group_buffered_event_count(const net_compute_standby_group_t* h);
+
+int  net_compute_standby_group_sync_standbys(
+    const net_compute_standby_group_t* h,
+    uint64_t* out_through, char** err_out);
+int  net_compute_standby_group_promote(
+    const net_compute_standby_group_t* h,
+    uint32_t* out_origin, char** err_out);
+void net_compute_standby_group_on_node_recovery(
+    const net_compute_standby_group_t* h, uint64_t node_id);
+
+char* net_compute_standby_group_members_json(const net_compute_standby_group_t* h);
+/* Returns "active" | "standby" (caller frees) or NULL for OOB. */
+char* net_compute_standby_group_member_role(
+    const net_compute_standby_group_t* h, uint32_t index);
+
 #ifdef __cplusplus
 }
 #endif

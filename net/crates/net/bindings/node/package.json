@@ -54,8 +54,9 @@
   },
   "scripts": {
     "artifacts": "napi artifacts",
-    "build": "napi build --platform --release",
-    "build:debug": "napi build --platform",
+    "build": "napi build --platform --release --features redis,net,cortex,compute,groups",
+    "build:debug": "napi build --platform --features redis,net,cortex,compute,groups",
+    "build:test": "napi build --platform --features redis,net,cortex,compute,groups,test-helpers",
     "prepublishOnly": "napi prepublish -t npm",
     "test": "vitest run",
     "test:integration": "RUN_INTEGRATION_TESTS=1 vitest run",

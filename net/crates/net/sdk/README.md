@@ -580,6 +580,225 @@ the full narrative and
 [`docs/CORTEX_ADAPTER_PLAN.md`](../docs/CORTEX_ADAPTER_PLAN.md) for the
 design.
 
+## Compute (daemons + migration)
+
+Enable the `compute` feature to run `MeshDaemon`s from your SDK
+code. A daemon is a stateful event processor with a deterministic
+causal chain; `DaemonRuntime` owns the factory table, the per-
+daemon hosts, the lifecycle gate (`Registering → Ready →
+ShuttingDown`), and the migration subprotocol plumbing. The full
+staging and design notes live in
+[`docs/SDK_COMPUTE_SURFACE_PLAN.md`](../docs/SDK_COMPUTE_SURFACE_PLAN.md);
+the runtime readiness fence in
+[`docs/DAEMON_RUNTIME_READINESS_PLAN.md`](../docs/DAEMON_RUNTIME_READINESS_PLAN.md).
+
+```rust
+use std::sync::Arc;
+use bytes::Bytes;
+use net_sdk::{Identity, MeshBuilder};
+use net_sdk::capabilities::CapabilityFilter;
+use net_sdk::compute::{
+    CausalEvent, ComputeDaemonError as DaemonError, DaemonHostConfig,
+    DaemonRuntime, MeshDaemon,
+};
+
+struct EchoDaemon;
+impl MeshDaemon for EchoDaemon {
+    fn name(&self) -> &str { "echo" }
+    fn requirements(&self) -> CapabilityFilter { CapabilityFilter::default() }
+    fn process(&mut self, event: &CausalEvent) -> Result<Vec<Bytes>, DaemonError> {
+        Ok(vec![event.payload.clone()])
+    }
+}
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let mesh = MeshBuilder::new("127.0.0.1:0", &[0x42u8; 32])?
+    .build()
+    .await?;
+let rt = DaemonRuntime::new(Arc::new(mesh));
+
+// 1. Register factories BEFORE flipping the runtime to Ready.
+rt.register_factory("echo", || Box::new(EchoDaemon))?;
+
+// 2. Ready the runtime. After this point spawn / migration accept.
+rt.start().await?;
+
+// 3. Spawn a local daemon. `Identity` pins the daemon's ed25519
+//    keypair → `origin_hash` / `entity_id` are stable across migrations.
+let handle = rt
+    .spawn("echo", Identity::generate(), DaemonHostConfig::default())
+    .await?;
+println!("origin = {:#x}", handle.origin_hash);
+
+// 4. Hand events to the daemon. The SDK links each event into the
+//    causal chain and forwards produced payloads to subscribers.
+let event = CausalEvent::new(handle.origin_hash, 1, Bytes::from_static(b"hi"));
+rt.deliver(handle.origin_hash, &event)?;
+
+// 5. Clean shutdown — stops every daemon and tears down the gate.
+rt.shutdown().await?;
+# Ok(())
+# }
+```
+
+The `MeshDaemon` trait is intentionally minimal:
+
+```rust
+pub trait MeshDaemon: Send + Sync {
+    fn name(&self) -> &str;
+    fn requirements(&self) -> CapabilityFilter;
+    fn process(&mut self, event: &CausalEvent) -> Result<Vec<Bytes>, DaemonError>;
+    fn snapshot(&self) -> Option<Bytes> { None }        // opt into migration
+    fn restore(&mut self, state: Bytes) -> Result<(), DaemonError> { Ok(()) }
+}
+```
+
+`requirements()` feeds the `PlacementScheduler` — a GPU daemon
+advertises `require_gpu()` and only lands on nodes whose
+`CapabilityAnnouncement` matches. `snapshot` / `restore` are opt-in:
+leave the defaults for stateless daemons; implement them to enable
+live migration of stateful ones.
+
+### Migration
+
+Once a daemon is up, `start_migration` orchestrates the six-phase
+cutover to another node: `Snapshot → Transfer → Restore → Replay →
+Cutover → Complete`. The source seals the daemon's seed into the
+outbound snapshot (sealed with the target's X25519 pubkey); the
+target rebuilds the daemon via the factory registered under the same
+`kind`, replays any events that arrived during transfer, then
+activates.
+
+```rust
+use net_sdk::compute::{MigrationHandle, MigrationOpts};
+
+// Caller side: start a migration to `target_node`. Returns as soon
+// as the SNAPSHOT phase has begun; `wait()` drives to completion.
+let mig: MigrationHandle = rt
+    .start_migration(handle.origin_hash, /* source */ src_id, /* target */ dst_id)
+    .await?;
+assert_eq!(mig.origin_hash, handle.origin_hash);
+println!("phase = {:?}", mig.phase());   // Some(MigrationPhase::Snapshot)
+mig.wait().await?;                       // blocks to Complete
+```
+
+- `start_migration_with(origin, src, dst, MigrationOpts { seal_seed, .. })`
+  toggles seed-sealing and other advanced knobs.
+- On the *target* side, `DaemonRuntime::register_migration_target_identity(...)`
+  pins the X25519 keypair used to unseal inbound seeds. If unset,
+  the runtime rejects inbound migrations with
+  `MigrationFailureReason::SealedSeedMissing`.
+- Failures from any of the six phases surface as a
+  `MigrationFailureReason` variant on `MigrationHandle::wait()` (or
+  on the receiving `expect_migration` hook), mirroring the wire-
+  level `MigrationFailureMessage`.
+
+### Stop / snapshot / inspect
+
+| Method | Description |
+|---|---|
+| `rt.spawn(kind, identity, cfg)` | Launch a daemon from a registered kind |
+| `rt.spawn_from_snapshot(...)` | Bootstrap from a previously captured `StateSnapshot` |
+| `rt.stop(origin)` | Gracefully stop a local daemon |
+| `rt.snapshot(origin)` | Capture a `StateSnapshot` for persistence / migration |
+| `rt.deliver(origin, &event)` | Feed the daemon an event (returns produced payloads) |
+| `rt.daemon_count()` / `rt.is_ready()` | Runtime introspection |
+| `rt.start_migration(origin, src, dst)` | Orchestrate a live migration |
+| `rt.subscribe_channel(origin, &name, ...)` | Attach a daemon to a mesh channel |
+| `handle.stats()` / `handle.snapshot()` | Per-daemon observability |
+
+Errors surface as `ComputeDaemonError` (`NotReady` before `start`,
+`FactoryNotFound(kind)`, `FactoryAlreadyRegistered(kind)`,
+`ShuttingDown` after `shutdown`, plus `Core(_)` for the underlying
+scheduler / registry failures).
+
+## Groups (replica / fork / standby)
+
+Enable the `groups` feature (implies `compute`) to spawn logical
+clusters of daemons from a single `DaemonRuntime`. Three flavours
+share one coordination layer:
+
+- `ReplicaGroup` — N interchangeable copies. Each replica gets a
+  deterministic identity from `group_seed + index`, so a replacement
+  respawned on another node has a stable `origin_hash`. Load-balances
+  inbound events across healthy members; auto-replaces on node failure.
+- `ForkGroup` — N independent daemons forked from a common parent at
+  `fork_seq`. Unique keypairs, shared ancestry via a verifiable
+  `ForkRecord` (sentinel hash linking each fork to the parent chain).
+- `StandbyGroup` — active-passive replication. One member processes
+  events; standbys hold snapshots and catch up via `sync_standbys()`.
+  On active failure, the most-synced standby promotes and replays the
+  events buffered since the last sync.
+
+```rust
+use net_sdk::compute::{DaemonHostConfig, DaemonRuntime};
+use net_sdk::groups::{
+    ForkGroup, ForkGroupConfig, GroupError, ReplicaGroup, ReplicaGroupConfig,
+    RequestContext, StandbyGroup, StandbyGroupConfig,
+};
+use net_sdk::groups::common::Strategy;
+
+# async fn example(rt: DaemonRuntime) -> Result<(), GroupError> {
+// Register the factory the group will call for each member.
+rt.register_factory("counter", || Box::new(CounterDaemon::new()))?;
+
+// --- ReplicaGroup ----------------------------------------------------
+let replicas = ReplicaGroup::spawn(&rt, "counter", ReplicaGroupConfig {
+    replica_count: 3,
+    group_seed: [0x11; 32],
+    lb_strategy: Strategy::ConsistentHash,
+    host_config: DaemonHostConfig::default(),
+})?;
+
+let ctx = RequestContext::new().with_routing_key("user:42");
+let origin = replicas.route_event(&ctx)?;
+// rt.deliver(origin, &event)?;   // hand the event to the chosen replica
+
+replicas.scale_to(5, "counter")?;         // grow
+replicas.on_node_failure(failed_id, "counter")?;  // respawn elsewhere
+
+// --- ForkGroup -------------------------------------------------------
+let forks = ForkGroup::fork(
+    &rt,
+    "counter",
+    /* parent_origin */ 0xabcd_ef01,
+    /* fork_seq */ 42,
+    ForkGroupConfig {
+        fork_count: 3,
+        lb_strategy: Strategy::RoundRobin,
+        host_config: DaemonHostConfig::default(),
+    },
+)?;
+assert!(forks.verify_lineage());           // sentinel + signature ok
+let records = forks.fork_records();        // one ForkRecord per member
+
+// --- StandbyGroup ----------------------------------------------------
+let hot = StandbyGroup::spawn(&rt, "counter", StandbyGroupConfig {
+    member_count: 3,                       // 1 active + 2 standbys
+    group_seed: [0x77; 32],
+    host_config: DaemonHostConfig::default(),
+})?;
+// rt.deliver(hot.active_origin(), &event)?;
+hot.on_event_delivered(event.clone());     // buffer for replay
+hot.sync_standbys()?;                      // periodic catchup
+// On active-node failure: hot.on_node_failure(failed_id, "counter")?;
+# Ok(())
+# }
+```
+
+Errors surface as `GroupError`: `NotReady` (runtime not started),
+`FactoryNotFound(kind)` (`kind` was never registered), `Core(_)`
+wrapping `InvalidConfig` / `PlacementFailed` / `RegistryFailed`, and
+`Daemon(_)` for runtime-level failures. Match on the variant to
+dispatch — the wire form through the FFI is
+`daemon: group: <kind>[: detail]` and stays consistent across all
+language bindings.
+
+Full staging, wire formats, and rationale:
+[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../docs/SDK_GROUPS_SURFACE_PLAN.md).
+Core semantics (placement spread, health aggregation, failure
+domains) live in [`../README.md#daemons`](../README.md#daemons).
+
 ## API
 
 | Method | Description |

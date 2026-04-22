@@ -9,6 +9,10 @@ mod cortex;
 // dispatch and are operationally inseparable.
 #[cfg(feature = "net")]
 mod capabilities;
+#[cfg(feature = "compute")]
+mod compute;
+#[cfg(feature = "groups")]
+mod groups;
 #[cfg(feature = "net")]
 mod identity;
 #[cfg(feature = "net")]
@@ -1012,7 +1016,13 @@ mod mesh_bindings {
     /// ```
     #[pyclass]
     pub struct NetMesh {
-        node: Option<MeshNode>,
+        /// Live `MeshNode` held via `Arc` so the compute feature's
+        /// `DaemonRuntime` (and any future Arc-sharing consumer)
+        /// can hold a second reference without copying the live
+        /// socket or handshake table. Shutdown drops this Arc —
+        /// any remaining clones held by a `DaemonRuntime` observe
+        /// a shut-down node the next time they call into it.
+        node: Option<Arc<MeshNode>>,
         runtime: Arc<Runtime>,
         /// Shared channel config registry installed on the MeshNode
         /// at construction; `register_channel` inserts into this same
@@ -1130,7 +1140,7 @@ mod mesh_bindings {
             node.set_token_cache(Arc::new(net::adapter::net::identity::TokenCache::new()));
 
             Ok(Self {
-                node: Some(node),
+                node: Some(Arc::new(node)),
                 runtime,
                 channel_configs,
             })
@@ -1163,11 +1173,11 @@ mod mesh_bindings {
         #[pyo3(signature = (peer_addr, peer_public_key, peer_node_id))]
         fn connect(
             &self,
+            py: Python<'_>,
             peer_addr: &str,
             peer_public_key: &str,
             peer_node_id: u64,
         ) -> PyResult<()> {
-            let node = self.get_node()?;
             let addr: std::net::SocketAddr = peer_addr
                 .parse()
                 .map_err(|e| PyValueError::new_err(format!("invalid address: {}", e)))?;
@@ -1180,25 +1190,54 @@ mod mesh_bindings {
             let mut pubkey = [0u8; 32];
             pubkey.copy_from_slice(&pubkey_bytes);
 
-            self.runtime
-                .block_on(node.connect(addr, &pubkey, peer_node_id))
-                .map_err(|e| PyRuntimeError::new_err(format!("connect: {}", e)))?;
-            Ok(())
+            // Grab an Arc to the node before detaching so we don't
+            // need `&self` while the GIL is released. Releasing the
+            // GIL is load-bearing for the two-mesh handshake case:
+            // the peer's `accept` blocks on its own thread while
+            // holding the GIL, and our blocking connect on this
+            // thread would otherwise deadlock that thread's GIL
+            // acquire at the end of handshake.
+            let node = self
+                .node
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime
+                    .block_on(node.connect(addr, &pubkey, peer_node_id))
+                    .map_err(|e| PyRuntimeError::new_err(format!("connect: {}", e)))?;
+                Ok(())
+            })
         }
 
         /// Accept an incoming connection (responder side).
-        fn accept(&self, peer_node_id: u64) -> PyResult<String> {
-            let node = self.get_node()?;
-            let (addr, _) = self
-                .runtime
-                .block_on(node.accept(peer_node_id))
-                .map_err(|e| PyRuntimeError::new_err(format!("accept: {}", e)))?;
-            Ok(addr.to_string())
+        fn accept(&self, py: Python<'_>, peer_node_id: u64) -> PyResult<String> {
+            // Release the GIL while blocking on the accept future —
+            // without this, a caller running `accept` in a thread
+            // would pin the GIL and starve a concurrent `connect` on
+            // the main thread (same reason as `connect` above).
+            let node = self
+                .node
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let (addr, _) = runtime
+                    .block_on(node.accept(peer_node_id))
+                    .map_err(|e| PyRuntimeError::new_err(format!("accept: {}", e)))?;
+                Ok(addr.to_string())
+            })
         }
 
         /// Start the receive loop and heartbeats.
         fn start(&self) -> PyResult<()> {
             let node = self.get_node()?;
+            // `MeshNode::start` uses `tokio::spawn` internally, so
+            // it must run inside a tokio runtime context. Enter
+            // our owned runtime for the duration of the call.
+            let _guard = self.runtime.enter();
             node.start();
             Ok(())
         }
@@ -1637,6 +1676,34 @@ mod mesh_bindings {
                 .map_err(|e| PyRuntimeError::new_err(format!("capability: {}", e)))
         }
 
+        /// **Test-only** helper for the groups test suite.
+        /// Injects a synthetic capability announcement directly
+        /// into the local capability index, simulating a peer
+        /// announcement without going through a real handshake.
+        ///
+        /// Production code should NOT use this — the mesh's
+        /// normal `announce_capabilities` path is what peers
+        /// broadcast through at runtime. This exists so
+        /// `test_groups.py` can stage enough placement candidates
+        /// for `ReplicaGroup` / `ForkGroup` / `StandbyGroup`
+        /// `place_with_spread` calls without spinning up a 3-node
+        /// handshake in every test.
+        #[cfg(feature = "groups")]
+        fn _test_inject_synthetic_peer(&self, node_id: u64) -> PyResult<()> {
+            use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
+            use net::adapter::net::identity::EntityId;
+            let node = self.get_node()?;
+            let index = node.capability_index().clone();
+            let eid = EntityId::from_bytes([0u8; 32]);
+            index.index(CapabilityAnnouncement::new(
+                node_id,
+                eid,
+                1,
+                CapabilitySet::new(),
+            ));
+            Ok(())
+        }
+
         /// Query the local capability index. Returns node ids
         /// (including our own when we self-match) whose latest
         /// announcement matches `filter`.
@@ -1688,8 +1755,35 @@ mod mesh_bindings {
     impl NetMesh {
         fn get_node(&self) -> PyResult<&MeshNode> {
             self.node
-                .as_ref()
+                .as_deref()
                 .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))
+        }
+
+        /// Clone the `Arc<MeshNode>` backing this `NetMesh`. Used
+        /// by the compute feature's `DaemonRuntime` to share the
+        /// live mesh node without opening a second socket.
+        #[cfg(feature = "compute")]
+        pub(crate) fn node_arc_clone(&self) -> PyResult<Arc<MeshNode>> {
+            self.node
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))
+        }
+
+        /// Shared `ChannelConfigRegistry`. `DaemonRuntime` reuses
+        /// the registry for channel-bind replay on daemon spawn.
+        #[cfg(feature = "compute")]
+        pub(crate) fn channel_configs_arc(&self) -> Arc<ChannelConfigRegistry> {
+            self.channel_configs.clone()
+        }
+
+        /// Shared tokio runtime. `DaemonRuntime` uses this for
+        /// async method bridging (`start`, `shutdown`, `spawn`,
+        /// `deliver`, migration calls) so we don't spin up a
+        /// second runtime per mesh.
+        #[cfg(feature = "compute")]
+        pub(crate) fn runtime_arc(&self) -> Arc<Runtime> {
+            self.runtime.clone()
         }
     }
 }
@@ -1750,6 +1844,26 @@ fn _net(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add("CortexError", m.py().get_type::<cortex::CortexError>())?;
         m.add("NetDbError", m.py().get_type::<cortex::NetDbError>())?;
         m.add("RedexError", m.py().get_type::<cortex::RedexError>())?;
+    }
+    #[cfg(feature = "compute")]
+    {
+        m.add_class::<compute::PyDaemonRuntime>()?;
+        m.add_class::<compute::PyDaemonHandle>()?;
+        m.add_class::<compute::PyCausalEvent>()?;
+        m.add_class::<compute::PyMigrationHandle>()?;
+        m.add_class::<compute::PyMigrationPhasesIter>()?;
+        m.add("DaemonError", m.py().get_type::<compute::DaemonError>())?;
+        m.add(
+            "MigrationError",
+            m.py().get_type::<compute::MigrationError>(),
+        )?;
+    }
+    #[cfg(feature = "groups")]
+    {
+        m.add_class::<groups::PyReplicaGroup>()?;
+        m.add_class::<groups::PyForkGroup>()?;
+        m.add_class::<groups::PyStandbyGroup>()?;
+        m.add("GroupError", m.py().get_type::<groups::GroupError>())?;
     }
     Ok(())
 }

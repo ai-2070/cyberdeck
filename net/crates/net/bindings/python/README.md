@@ -362,6 +362,211 @@ SDK behaviour is fixed by the Rust integration suite; see
 [`tests/channel_auth.rs`](../../tests/channel_auth.rs) and
 [`tests/channel_auth_hardening.rs`](../../tests/channel_auth_hardening.rs).
 
+## Compute (daemons + migration)
+
+Run `MeshDaemon`s directly from Python. `DaemonRuntime` owns the
+factory table, the per-daemon hosts, and the
+`Registering → Ready → ShuttingDown` lifecycle gate that decides
+when inbound migrations may land. Daemons are any Python object
+whose `process(event)` returns a list of `bytes`/`bytearray`
+payloads — the runtime wraps each output in a causal link and
+forwards it.
+
+Build the native module with the `compute` feature (maturin picks
+it up on the default build) and import from `net`. Full design
+notes:
+[`docs/SDK_COMPUTE_SURFACE_PLAN.md`](../../docs/SDK_COMPUTE_SURFACE_PLAN.md).
+
+```python
+from net import DaemonRuntime, NetMesh, Identity, CausalEvent
+
+
+class EchoDaemon:
+    """Stateless echo — ships every event's payload straight back."""
+
+    name = "echo"
+
+    def process(self, event: CausalEvent) -> list[bytes]:
+        return [bytes(event.payload)]
+
+    # Optional: snapshot() / restore(state) for migration-capable daemons.
+
+
+mesh = NetMesh("127.0.0.1:9000", "42" * 32)
+rt = DaemonRuntime(mesh)
+
+# 1. Register factories BEFORE flipping the runtime to Ready.
+rt.register_factory("echo", lambda: EchoDaemon())
+
+# 2. Ready the runtime — after this point spawn / migration accept.
+rt.start()
+
+# 3. Spawn a daemon; Identity pins the ed25519 keypair so
+#    origin_hash / entity_id stay stable across migrations.
+identity = Identity.generate()
+handle = rt.spawn("echo", identity)
+print(f"origin = 0x{handle.origin_hash:08x}")
+
+# 4. Manually feed an event for testing; real delivery happens
+#    via the mesh's causal chain.
+event = CausalEvent(handle.origin_hash, sequence=1, payload=b"hello")
+outputs = rt.deliver(handle.origin_hash, event)
+
+# 5. Clean shutdown.
+rt.stop(handle.origin_hash)
+rt.shutdown()
+```
+
+`process` must be synchronous — the core's contract is sync, and
+the PyO3 bridge re-attaches the GIL for the duration of each call.
+Raising inside `process` surfaces as `DaemonError` on the caller.
+
+### Migration
+
+`start_migration(origin_hash, source_node, target_node)`
+orchestrates the six-phase cutover (`Snapshot → Transfer →
+Restore → Replay → Cutover → Complete`). The source seals the
+daemon's ed25519 seed into the outbound snapshot using the
+target's X25519 static pubkey; the target rebuilds the daemon via
+the factory registered under the same `kind`, replays any events
+that arrived during transfer, then activates.
+
+```python
+from net import MigrationError, migration_error_kind
+
+try:
+    mig = rt.start_migration(handle.origin_hash, src_node_id, dst_node_id)
+    # mig.phase  — "snapshot" | "transfer" | "restore" | ...
+    # mig.source_node / mig.target_node
+    mig.wait()                      # blocks to completion
+except MigrationError as e:
+    kind = migration_error_kind(e)
+    if kind == "not-ready":               ...  # target start() didn't run
+    elif kind == "factory-not-found":     ...  # target missing this kind
+    elif kind == "compute-not-supported": ...  # target has no DaemonRuntime
+    elif kind == "state-failed":          ...  # snapshot / restore threw
+    elif kind == "identity-transport-failed": ...  # seal / unseal failed
+    # ...see SDK_COMPUTE_SURFACE_PLAN.md for the full enum
+```
+
+`start_migration_with(origin, src, dst, opts)` exposes
+options such as `seal_seed=False` for test scenarios. On the
+*target* node, call
+`rt.register_migration_target_identity(identity)` before any
+migration lands; without it the runtime rejects sealed-seed
+envelopes with `migration_error_kind == "identity-transport-failed"`.
+
+### Surface at a glance
+
+| Method | Description |
+|---|---|
+| `DaemonRuntime(mesh)` | Construct against an existing `NetMesh` |
+| `rt.register_factory(kind, fn)` | Install a factory (before `start()`) |
+| `rt.start() / rt.shutdown()` | Flip the lifecycle gate |
+| `rt.spawn(kind, identity, config=None)` | Spawn a local daemon |
+| `rt.spawn_from_snapshot(kind, identity, bytes, config=None)` | Rehydrate |
+| `rt.stop(origin)` | Stop a local daemon |
+| `rt.snapshot(origin)` | Capture bytes for persistence / migration |
+| `rt.deliver(origin, event)` | Feed an event (returns `list[bytes]`) |
+| `rt.start_migration(origin, src, dst)` | Orchestrate a live migration |
+| `rt.register_migration_target_identity(id)` | Pin unseal keypair on target |
+| `handle.origin_hash` / `entity_id` / `stats()` | Per-daemon identity + stats |
+| `DaemonError` / `MigrationError` | Typed exceptions; `migration_error_kind(e)` parses `e.kind` |
+
+## Compute Groups (Replica / Fork / Standby)
+
+HA / scaling overlays on top of `DaemonRuntime`. Build the native
+module with the `groups` feature (implies `compute`) to expose
+`ReplicaGroup`, `ForkGroup`, `StandbyGroup`, and the `GroupError`
+exception class.
+
+- **`ReplicaGroup`** — N interchangeable copies of a daemon.
+  Deterministic identity from `group_seed + index`, so a replacement
+  respawned on another node has a stable `origin_hash`. Load-balances
+  inbound events across healthy members; auto-replaces on node failure.
+- **`ForkGroup`** — N independent daemons forked from a common parent
+  at `fork_seq`. Unique keypairs, shared ancestry via a verifiable
+  `ForkRecord`.
+- **`StandbyGroup`** — active-passive replication. One member
+  processes events; standbys hold snapshots and catch up via
+  `sync_standbys()`. On active failure the most-synced standby
+  promotes and replays the events buffered since the last sync.
+
+```python
+from net import (
+    DaemonRuntime, ForkGroup, GroupError, ReplicaGroup, StandbyGroup,
+    group_error_kind,
+)
+
+rt = DaemonRuntime(mesh)
+rt.register_factory("counter", lambda: CounterDaemon())
+
+# --- ReplicaGroup ----------------------------------------------------
+replicas = ReplicaGroup.spawn(
+    rt, "counter",
+    replica_count=3,
+    group_seed=bytes([0x11] * 32),
+    lb_strategy="consistent-hash",   # or "round-robin" / "least-load"
+                                     #    / "least-connections" / "random"
+)
+origin = replicas.route_event({"routing_key": "user:42"})
+rt.deliver(origin, event)
+replicas.scale_to(5)                 # grow
+replicas.on_node_failure(failed_node_id)   # respawn elsewhere
+
+# --- ForkGroup -------------------------------------------------------
+forks = ForkGroup.fork(
+    rt, "counter",
+    parent_origin=0xABCDEF01,
+    fork_seq=42,
+    fork_count=3,
+    lb_strategy="round-robin",
+)
+assert forks.verify_lineage()
+for record in forks.fork_records():
+    print(record["forked_origin"], record["fork_seq"])
+
+# --- StandbyGroup ----------------------------------------------------
+hot = StandbyGroup.spawn(
+    rt, "counter",
+    member_count=3,                  # 1 active + 2 standbys
+    group_seed=bytes([0x77] * 32),
+)
+rt.deliver(hot.active_origin(), event)
+hot.on_event_delivered(event)        # keep replay buffer accurate
+hot.sync_standbys()                  # periodic catchup
+# On active-node failure:
+# new_origin = hot.on_node_failure(failed_node_id)  # auto-promotes
+```
+
+### Typed errors
+
+Failures raise `GroupError` (a subclass of `DaemonError`). Use
+`group_error_kind(e)` to parse the discriminator from the Rust side's
+`daemon: group: <kind>[: detail]` message prefix:
+
+```python
+from net import GroupError, group_error_kind
+
+try:
+    ReplicaGroup.spawn(rt, "never-registered",
+                       replica_count=2, group_seed=bytes(32))
+except GroupError as e:
+    kind = group_error_kind(e)
+    if kind == "not-ready":               ...  # runtime.start() didn't run
+    elif kind == "factory-not-found":     ...  # kind wasn't registered
+    elif kind == "no-healthy-member":     ...  # routed on an all-down group
+    elif kind == "invalid-config":        ...  # e.g. replica_count == 0
+    elif kind in ("placement-failed",
+                  "registry-failed",
+                  "daemon"):              ...  # core failure — read e args
+```
+
+Full staging, wire formats, and rationale:
+[`docs/SDK_GROUPS_SURFACE_PLAN.md`](../../docs/SDK_GROUPS_SURFACE_PLAN.md).
+Core semantics live in the main
+[`README.md#daemons`](../../README.md#daemons).
+
 ## Performance Tips
 
 1. **Use `ingest_raw()` for maximum throughput** - Pass pre-serialized JSON strings

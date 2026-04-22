@@ -1251,17 +1251,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-compute-ffi"
+version = "0.5.0"
+dependencies = [
+ "bytes",
+ "dashmap",
+ "libc",
+ "net",
+ "net-sdk",
+ "parking_lot",
+ "tokio",
+]
+
+[[package]]
 name = "net-node"
 version = "0.5.0"
 dependencies = [
  "arc-swap",
  "bytes",
+ "dashmap",
  "futures",
  "hex",
  "napi",
  "napi-build",
  "napi-derive",
  "net",
+ "net-sdk",
  "serde_json",
  "tokio",
  "xxhash-rust",
@@ -1272,9 +1287,11 @@ name = "net-python"
 version = "0.5.0"
 dependencies = [
  "bytes",
+ "dashmap",
  "futures",
  "hex",
  "net",
+ "net-sdk",
  "pyo3",
  "pyo3-build-config",
  "serde_json",

@@ -38,6 +38,7 @@
 
 import { NetMesh as NapiNetMesh } from '@ai2070/net';
 
+import { setNapiMesh } from './_internal.js';
 import {
   capabilityFilterToNapi,
   capabilitySetToNapi,
@@ -229,6 +230,36 @@ export class MeshNode {
 
   private constructor(native: NapiNetMesh) {
     this.native = native;
+    // Register on the WeakMap so sibling SDK modules can reach
+    // the native pointer without a public escape-hatch method on
+    // the class instance. See `./_internal.ts` for why.
+    setNapiMesh(this, native);
+  }
+
+  /**
+   * **Test-only.** Inject a synthetic peer entry into the local
+   * capability index so vitest suites can stage multi-candidate
+   * placement for `ReplicaGroup` / `ForkGroup` / `StandbyGroup`
+   * tests without a full 3-node handshake.
+   *
+   * Not part of the stable API; do NOT use in production code —
+   * the real mesh surface is `announceCapabilities`. Gated at the
+   * NAPI layer behind the `test-helpers` cargo feature; release
+   * builds of `@ai2070/net` do not export `testInjectSyntheticPeer`
+   * and this method will throw if called against such a build.
+   *
+   * @internal
+   */
+  _testInjectSyntheticPeer(nodeId: bigint): void {
+    const native = this.native as unknown as {
+      testInjectSyntheticPeer?: (nodeId: bigint) => void;
+    };
+    if (typeof native.testInjectSyntheticPeer !== 'function') {
+      throw new Error(
+        'testInjectSyntheticPeer: NAPI build missing `test-helpers` feature',
+      );
+    }
+    native.testInjectSyntheticPeer(nodeId);
   }
 
   /** Create and configure a new mesh node. */

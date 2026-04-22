@@ -232,7 +232,7 @@ impl MeshBuilder {
             node.set_token_cache(id.token_cache().clone());
         }
         Ok(Mesh {
-            node,
+            node: Arc::new(node),
             channel_configs,
             identity: sdk_identity,
         })
@@ -245,7 +245,14 @@ impl MeshBuilder {
 /// socket. Supports direct peer-to-peer sends, routed multi-hop sends,
 /// automatic failure detection, and rerouting.
 pub struct Mesh {
-    node: MeshNode,
+    /// Shared `MeshNode`. `Arc` rather than by-value so NAPI /
+    /// FFI bindings can hand the same live node to multiple
+    /// wrappers (e.g. a `DaemonRuntime` alongside the existing
+    /// `NetMesh` class) without double-owning the underlying
+    /// socket. All public methods go through `.inner()` (Arc
+    /// deref), so holding the `Arc` changes no existing call
+    /// sites.
+    node: Arc<MeshNode>,
     /// Channel config registry shared with the underlying `MeshNode`
     /// so `register_channel` / subscriber ACL checks operate on the
     /// same live data.
@@ -682,6 +689,42 @@ impl Mesh {
     /// Get a reference to the underlying `MeshNode`.
     pub fn inner(&self) -> &MeshNode {
         &self.node
+    }
+
+    /// Clone the `Arc`-shared `MeshNode` handle out of the mesh.
+    ///
+    /// Used by FFI bindings (currently: NAPI) that need to hand
+    /// the same live node to the `net-sdk::compute::DaemonRuntime`
+    /// **and** to their own wrapper class without constructing a
+    /// second UDP socket. All public `MeshNode` operations go
+    /// through `&MeshNode`, so two Arc holders observe exactly
+    /// the same state.
+    pub fn node_arc(&self) -> Arc<MeshNode> {
+        self.node.clone()
+    }
+
+    /// Construct a `Mesh` that shares an existing `MeshNode` with
+    /// another owner. Used by FFI bindings that already hold an
+    /// `Arc<MeshNode>` (e.g. NAPI's `NetMesh`) and need a `Mesh`
+    /// wrapper so the SDK's `DaemonRuntime` can be built against
+    /// the same live node.
+    ///
+    /// Does not re-install `channel_configs` or a `TokenCache` —
+    /// the owner of the original `MeshNode` is responsible for
+    /// that wiring. Supplied `channel_configs` / `identity`
+    /// arguments are held onto here purely so the `Mesh`'s own
+    /// helpers (channel registration lookup, identity getter)
+    /// have data to return.
+    pub fn from_node_arc(
+        node: Arc<MeshNode>,
+        channel_configs: Arc<ChannelConfigRegistry>,
+        identity: Option<crate::identity::Identity>,
+    ) -> Self {
+        Self {
+            node,
+            channel_configs,
+            identity,
+        }
     }
 
     /// Caller-owned identity bound to this mesh, if any. Returns

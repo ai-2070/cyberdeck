@@ -19,10 +19,17 @@ Net is what the internet would look like if it were built today, the network sci
 - [Topology](#topology)
 - [Consistency](#consistency)
 - [State, not connections](#state-not-connections)
+- [Capabilities](#capabilities)
+- [Channels](#channels)
+- [Subnets](#subnets)
+- [Security surface](#security-surface)
+- [Daemons](#daemons)
 - [Mikoshi](#mikoshi)
 - [Invariants](#invariants)
 - [Device autonomy](#device-autonomy)
 - [Processing without storage](#processing-without-storage)
+- [RedEX](#redex)
+- [CortEX + NetDB](#cortex--netdb)
 - [Non-localized event bus](#non-localized-event-bus)
 - [Infinite extensibility via subprotocols](#infinite-extensibility-via-subprotocols)
 - [Cost of devices](#cost-of-devices)
@@ -157,6 +164,46 @@ Traditional networking treats the connection as the primary object. You establis
 
 Net propagates state. Connections are ephemeral transport — the current shortest path between where state is and where it needs to be. When a path breaks, state doesn't wait for recovery. It moves. The routing table updates, the proximity graph adjusts, the state continues on a different path. No reconnection, no session resumption, no handshake retry. Identity lives in the state chain, not in the socket.
 
+## Capabilities
+
+Every distributed system assumes a registry. Kubernetes has etcd. Consul has Consul. Nomad has a scheduler. You tell the registry what hardware exists, and the registry tells the scheduler where things can run. The registry is the control plane. If it goes down, the cluster forgets what it is.
+
+Net has no registry. A node announces what it is — cores, memory, GPU, loaded models, installed tools, operator tags — and every peer indexes that announcement locally. Announcements propagate multi-hop; a node four subnets away learns the same fingerprint as a direct peer, without anyone in the middle being a directory. The nodes *are* the control plane, collectively. Nothing to provision, nothing to fail over, nothing to pay for at rest.
+
+This changes what "placement" means. You don't submit a job to a scheduler that queries a registry that talks to a node. You ask the local index — *any peer with an NVIDIA GPU and 40 GB of VRAM, advertising the `prod` tag* — and you get an answer in microseconds. The answer may be a laptop under someone's desk, a server in a rack, or a Jetson on a factory floor. The mesh doesn't care, and neither does your code. Capability is the addressing; location is incidental.
+
+## Channels
+
+Kafka, NATS, Pulsar, Redis Streams — every serious pub/sub is centralized. You run a broker cluster. Producers connect to the cluster. Consumers connect to the cluster. The broker is the bus, and the cluster is the infrastructure. You provision it, scale it, monitor it, patch it. You pay for it whether traffic is flowing or not.
+
+Channels in Net are not a thing you connect to. They are a *name you match on*. A publisher registers `sensors/temperature` with a policy; subscribers ask to join by name; the mesh routes the semantic. A subscriber on a NAT'd laptop, a publisher in a datacenter, and a relay on a jump host all participate in the same channel without anyone connecting to a broker — because there is no broker. The roster is held by the publisher, fan-out is N per-peer unicasts over the existing encrypted sessions, and nothing about "the channel" exists as a standalone process.
+
+This means channels cost nothing when nobody is listening. No queue builds up at a broker. No retention policy has to be configured at a central service. Publish-without-subscribers is literally a no-op — the roster is empty, the fan-out loop runs zero times. Channels with thousands of subscribers work too; they just fan out more packets. The broker was a bottleneck in the first place because it existed. Removing it removes the bottleneck.
+
+## Subnets
+
+Network segmentation has always been a network problem. VLANs partition Layer 2. VPCs partition Layer 3. Firewalls enforce boundaries. You reconfigure who-can-talk-to-whom by touching routers, ACL lists, and subnet masks — the infrastructure, not the application. Changing the boundary means changing the wire.
+
+Subnets in Net are a property of the *application*, derived from capability tags. A policy says "a `region:us` tag maps to subnet level 0, value 2"; every node applies the same policy to every announcement it sees; the geometry emerges without any node holding authority over it. You change the geometry by editing a policy, not by touching a router. The geometry travels with the workload — a node that moves regions announces its new tags, peers re-derive, and the boundary follows.
+
+Enforcement lives at the channel. A channel declared `SubnetLocal` accepts subscribers only from peers whose derived subnet matches exactly; cross-subnet subscribes reject at the publisher. "Development nodes can't see production data" becomes a one-line capability tag plus a subnet policy — not a firewall rule, not a VPN, not a network redesign. The boundary is part of the software, enforced every time a packet tries to cross it.
+
+## Security surface
+
+Most systems ship authentication, capability discovery, and tenancy isolation as three separate products. mTLS for identity. A service mesh for discovery. VPCs or namespaces for isolation. Each is configured independently; each can drift; each has its own blast radius when it misconfigures. Revocation takes effect whenever the slowest of them catches up.
+
+Net fuses them. The same 32-byte ed25519 seed that gives a node its `node_id` signs the capability announcements that drive placement. The same identity issues the permission tokens that authorize channel subscribes. The same tokens delegate down chains whose signatures verify end-to-end. The same capability announcements feed the subnet policy that decides visibility. There is one key, one policy surface, one revocation primitive — and they compose automatically because they share a substrate.
+
+Which means revocation actually works. A subscriber who loses their token stops receiving events on the publisher's next packet — not on the next cluster reconciliation, not after a cache expiry, not when the service mesh pushes a new ACL. The check is a 20 ns bloom filter hit on every publish, and when the filter says no, the subscriber is dropped. Same primitive, same identity, same policy, across the whole fleet. The cost of making security unified is that it's boring; the payoff is that it's actually enforceable.
+
+## Daemons
+
+AWS Lambda is stateless; state lives in DynamoDB and each invocation fetches it. Temporal is stateful, but the state lives in Temporal's database, and the workflow is bound to that cluster. Dapr is a sidecar; coordination runs through Dapr's runtime. Erlang and Akka actors are stateful and addressable, but they live inside one cluster you own — "move this actor to a different cluster" is not a primitive any of them expose.
+
+A daemon in Net is a stateful event processor whose *identity* is cryptographic and whose *location* is the mesh. You don't address it by "node X, slot 3." You address it by its `origin_hash`, a fingerprint of an ed25519 public key that doesn't change when the daemon moves. Every event it produces is signed into a causal chain that any node can verify — no database, no ledger service, no central log. The chain itself is self-authenticating, and the daemon's history travels with it.
+
+Concretely: you ship code that says "I need a GPU." It runs wherever a GPU exists. If that GPU dies, the runtime moves the daemon to another GPU node, carrying its state and its history. Its tokens still verify. Its subscribers don't notice it moved. No operator runs `kubectl drain`; no SRE updates a service registry. The daemon is the object, and the object moves. What "moves" actually means is *Mikoshi*, below.
+
 ## Mikoshi
 
 In Cyberpunk, Mikoshi is Arasaka's construct for storing engrams — consciousness held in digital space, minds persisting outside their original hardware.
@@ -206,6 +253,28 @@ This means processing can happen anywhere without first solving "where is the da
 Storage becomes a choice, not an assumption. A node can choose to persist events to Redis. A node can choose to replay from JetStream. But the mesh itself doesn't require storage to function. Events exist in the ring buffers of the nodes they're passing through, for as long as they're relevant, and then they're gone. If you need them later, that's what the persistence adapters are for. But the processing path — the hot path — never touches disk, never queries a database, never waits on storage I/O.
 
 This is why the latency numbers are what they are. Processing isn't waiting on storage. Storage isn't blocking processing. They're independent decisions made by independent nodes.
+
+## RedEX
+
+**The stream is the state.** Every database you've used separates the two — a mutable state somewhere (rows, documents, keys) and a log that records changes to it. The log is secondary: a write-ahead record, a binlog, a replication feed. If the log and the state disagree, the state wins.
+
+RedEX inverts that. The append-only event stream is the source of truth; any "state" anywhere else is just a projection of the stream at a particular point. You don't update a row and then log it. You append an event, and rows derive. The log doesn't drift from the state, because the log *is* the state — re-running the fold on the same events yields the same result every time.
+
+Kafka is a distributed log; you need a cluster to run it. SQLite and DuckDB give you random access, not append-only streaming, and their write path isn't designed for continuous telemetry. Write-ahead logs inside databases are internal — a private detail of Postgres or MySQL, not a product you can point at your own events.
+
+RedEX is the append-only log, unbundled and local. A single file is a single monotonic sequence — 20 bytes of index per record, a heap segment for payloads, optional disk persistence via two files per channel. That is the whole thing. A node decides, per channel, whether to persist: keep the last 24 hours of `sensors/temp` locally; forget everything on `metrics/debug` the moment it leaves the ring buffer; write `audit/events` to disk with fsync on close. Every decision is local.
+
+Because storage is per-file and per-node, the durability decision scales with the node, not with the cluster. A Raspberry Pi keeps a tiny log of its own sensor readings. A server keeps a huge log of whatever it cares about. Neither participates in a cluster consensus protocol to persist anything, because there is no cluster — the log is local, the replay is local, the retention is local. When higher layers (CortEX, NetDB, your own fold) need durability, they build on RedEX. When they don't, RedEX isn't on the critical path.
+
+## CortEX + NetDB
+
+**CortEX is RedEX, folded.** If RedEX makes the stream the state, CortEX is what you get when you collapse that stream into a usable shape — a reactive, queryable projection of the log, updated event-by-event. The log stays the source of truth; the folded state is a view of it that's cheap to read and always consistent with the events that produced it.
+
+Materialize, RisingWave, Flink — all distributed systems. You run a cluster, connect clients, write SQL, the cluster materializes views and pushes deltas. Elegant for a datacenter; overkill for a drone, a $50 sensor, or a laptop that wants a reactive view of its own history. The smallest useful deployment of any of them is already bigger than most of the devices Net runs on.
+
+CortEX is a *local* fold from a RedEX tail into an in-memory state, kept consistent event-by-event. The "database" isn't a process you connect to. It's a `Vec<Task>` or a `HashMap<Uuid, Memory>` you hold in your Rust, TypeScript, or Python code, that updates as events fold in. Queries are direct memory access — no network, no parser, no planner, no lock contention beyond a single read-lock. A $50 device can run a full reactive view of its own event history, materialize a few hundred tasks or a few thousand memories, and serve filtered queries at cache speed.
+
+NetDB bundles adapters into a query façade — `db.tasks.find_many(filter)`, `db.memories.find_unique(id)` — with whole-database snapshots for persistence and handoff. The surface is identical across Rust, TypeScript, and Python; snapshot bundles round-trip between languages. Because everything is local, two nodes can have completely different NetDB views — one tracks tasks, one tracks memories, one tracks both, one tracks neither. The database is a *choice*, not a dependency of being on the mesh.
 
 ## Non-localized event bus
 
