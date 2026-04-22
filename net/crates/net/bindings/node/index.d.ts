@@ -176,26 +176,6 @@ export declare class DaemonRuntime {
    * Spawn a `ReplicaGroup` bound to this runtime. `kind` must
    * have been registered via [`Self::register_factory`]; the
    * group invokes the factory once per replica at spawn and
-   * again on scale-up / failure replacement.
-   *
-   * Async so the SDK-level spawn runs on a tokio worker. The
-   * factory round-trip goes through the TSFN dispatcher — if
-   * this method were sync on the Node main thread, the TSFN
-   * callback would queue behind the blocked spawn and deadlock.
-   */
-  spawnReplicaGroup(kind: string, config: ReplicaGroupConfigJs): Promise<ReplicaGroup>
-  /**
-   * Fork `config.forkCount` new daemons from a parent at
-   * `forkSeq`. Same deadlock-avoidance argument as
-   * `spawnReplicaGroup`.
-   */
-  spawnForkGroup(kind: string, parentOrigin: number, forkSeq: bigint, config: ForkGroupConfigJs): Promise<ForkGroup>
-  /**
-   * Spawn a `StandbyGroup`. Same deadlock-avoidance argument
-   * as `spawnReplicaGroup`.
-   */
-  spawnStandbyGroup(kind: string, config: StandbyGroupConfigJs): Promise<StandbyGroup>
-  /**
    * Initiate a migration for the daemon identified by
    * `originHash`, moving it from `sourceNode` to `targetNode`.
    *
@@ -261,6 +241,27 @@ export declare class DaemonRuntime {
    * heard the migration on the mesh.
    */
   migrationPhase(originHash: number): string | null
+  /**
+   * Spawn a `ReplicaGroup` of `config.replicaCount` members
+   * using the factory registered under `kind`.
+   *
+   * Async so the SDK-level spawn runs on a tokio worker. The
+   * factory round-trip goes through the TSFN dispatcher — if
+   * this method were sync on the Node main thread, the TSFN
+   * callback would queue behind the blocked spawn and deadlock.
+   */
+  spawnReplicaGroup(kind: string, config: ReplicaGroupConfigJs): Promise<ReplicaGroup>
+  /**
+   * Fork `config.forkCount` new daemons from a parent at
+   * `forkSeq`. Same deadlock-avoidance argument as
+   * `spawnReplicaGroup`.
+   */
+  spawnForkGroup(kind: string, parentOrigin: number, forkSeq: bigint, config: ForkGroupConfigJs): Promise<ForkGroup>
+  /**
+   * Spawn a `StandbyGroup`. Same deadlock-avoidance argument
+   * as `spawnReplicaGroup`.
+   */
+  spawnStandbyGroup(kind: string, config: StandbyGroupConfigJs): Promise<StandbyGroup>
 }
 
 export declare class ForkGroup {
@@ -777,6 +778,14 @@ export declare class NetMesh {
    */
   announceCapabilities(caps: CapabilitySetJs): Promise<void>
   /**
+   * Query the local capability index. Returns node ids
+   * (including our own if we self-match) whose latest
+   * announcement matches `filter`.
+   */
+  findPeers(filter: CapabilityFilterJs): Array<bigint>
+  /** Shutdown the mesh node. */
+  shutdown(): Promise<void>
+  /**
    * **Test-only** helper for the vitest groups suite.
    * Injects a synthetic capability announcement directly
    * into the local capability index, simulating a peer
@@ -789,14 +798,6 @@ export declare class NetMesh {
    * code uses the normal `announce_capabilities` path.
    */
   testInjectSyntheticPeer(nodeId: bigint): void
-  /**
-   * Query the local capability index. Returns node ids
-   * (including our own if we self-match) whose latest
-   * announcement matches `filter`.
-   */
-  findPeers(filter: CapabilityFilterJs): Array<bigint>
-  /** Shutdown the mesh node. */
-  shutdown(): Promise<void>
 }
 
 /**

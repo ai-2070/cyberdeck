@@ -1707,41 +1707,6 @@ mod mesh_bindings {
                 .map_err(|e| Error::from_reason(format!("capability: {}", e)))
         }
 
-        /// **Test-only** helper for the vitest groups suite.
-        /// Injects a synthetic capability announcement directly
-        /// into the local capability index, simulating a peer
-        /// announcement without going through a real handshake.
-        ///
-        /// Gated behind the `test-helpers` feature so it is
-        /// **not** exported to production JS consumers. Enabling
-        /// `groups` alone does not pull this in; vitest builds with
-        /// `--features groups,test-helpers` explicitly. Production
-        /// code uses the normal `announce_capabilities` path.
-        #[napi]
-        #[cfg(feature = "test-helpers")]
-        pub fn test_inject_synthetic_peer(&self, node_id: BigInt) -> Result<()> {
-            use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
-            use net::adapter::net::identity::EntityId;
-            // Validate sign/lossless — a negative or >u64::MAX
-            // BigInt would otherwise silently wrap into a garbage
-            // node id and corrupt the capability index the test
-            // is trying to stage.
-            let nid = crate::common::bigint_u64(node_id).map_err(|e| {
-                Error::from_reason(format!("test_inject_synthetic_peer: {}", e.reason))
-            })?;
-            let guard = self.load_node()?;
-            let node = guard.as_ref().unwrap();
-            let index = node.capability_index().clone();
-            let eid = EntityId::from_bytes([0u8; 32]);
-            index.index(CapabilityAnnouncement::new(
-                nid,
-                eid,
-                1,
-                CapabilitySet::new(),
-            ));
-            Ok(())
-        }
-
         /// Query the local capability index. Returns node ids
         /// (including our own if we self-match) whose latest
         /// announcement matches `filter`.
@@ -1810,6 +1775,53 @@ mod mesh_bindings {
         #[cfg(feature = "compute")]
         pub(crate) fn channel_configs_arc(&self) -> Arc<net::adapter::net::ChannelConfigRegistry> {
             self.channel_configs.clone()
+        }
+    }
+
+    // =====================================================================
+    // Test-only helpers — separate `#[napi] impl` block so the outer
+    // `#[napi]` on the main `impl NetMesh` doesn't try to register the
+    // `test_inject_synthetic_peer_c_callback` symbol that doesn't exist
+    // without the `test-helpers` feature. napi-derive collects method
+    // names at expansion time regardless of inner `#[cfg]` attributes,
+    // so the feature gate has to live on the *impl block* itself.
+    // =====================================================================
+
+    #[cfg(feature = "test-helpers")]
+    #[napi]
+    impl NetMesh {
+        /// **Test-only** helper for the vitest groups suite.
+        /// Injects a synthetic capability announcement directly
+        /// into the local capability index, simulating a peer
+        /// announcement without going through a real handshake.
+        ///
+        /// Gated behind the `test-helpers` feature so it is
+        /// **not** exported to production JS consumers. Enabling
+        /// `groups` alone does not pull this in; vitest builds with
+        /// `--features groups,test-helpers` explicitly. Production
+        /// code uses the normal `announce_capabilities` path.
+        #[napi]
+        pub fn test_inject_synthetic_peer(&self, node_id: BigInt) -> Result<()> {
+            use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
+            use net::adapter::net::identity::EntityId;
+            // Validate sign/lossless — a negative or >u64::MAX
+            // BigInt would otherwise silently wrap into a garbage
+            // node id and corrupt the capability index the test
+            // is trying to stage.
+            let nid = crate::common::bigint_u64(node_id).map_err(|e| {
+                Error::from_reason(format!("test_inject_synthetic_peer: {}", e.reason))
+            })?;
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let index = node.capability_index().clone();
+            let eid = EntityId::from_bytes([0u8; 32]);
+            index.index(CapabilityAnnouncement::new(
+                nid,
+                eid,
+                1,
+                CapabilitySet::new(),
+            ));
+            Ok(())
         }
     }
 }

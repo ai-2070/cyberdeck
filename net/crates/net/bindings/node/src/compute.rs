@@ -757,57 +757,6 @@ impl DaemonRuntime {
     /// Spawn a `ReplicaGroup` bound to this runtime. `kind` must
     /// have been registered via [`Self::register_factory`]; the
     /// group invokes the factory once per replica at spawn and
-    /// again on scale-up / failure replacement.
-    ///
-    /// Async so the SDK-level spawn runs on a tokio worker. The
-    /// factory round-trip goes through the TSFN dispatcher — if
-    /// this method were sync on the Node main thread, the TSFN
-    /// callback would queue behind the blocked spawn and deadlock.
-    #[cfg(feature = "groups")]
-    #[napi]
-    pub async fn spawn_replica_group(
-        &self,
-        kind: String,
-        config: crate::groups::ReplicaGroupConfigJs,
-    ) -> Result<crate::groups::ReplicaGroup> {
-        crate::groups::spawn_replica_group(self.sdk_runtime().clone(), kind, config).await
-    }
-
-    /// Fork `config.forkCount` new daemons from a parent at
-    /// `forkSeq`. Same deadlock-avoidance argument as
-    /// `spawnReplicaGroup`.
-    #[cfg(feature = "groups")]
-    #[napi]
-    pub async fn spawn_fork_group(
-        &self,
-        kind: String,
-        parent_origin: u32,
-        fork_seq: BigInt,
-        config: crate::groups::ForkGroupConfigJs,
-    ) -> Result<crate::groups::ForkGroup> {
-        let seq = daemon_bigint_u64("forkSeq", fork_seq)?;
-        crate::groups::spawn_fork_group(
-            self.sdk_runtime().clone(),
-            kind,
-            parent_origin,
-            seq,
-            config,
-        )
-        .await
-    }
-
-    /// Spawn a `StandbyGroup`. Same deadlock-avoidance argument
-    /// as `spawnReplicaGroup`.
-    #[cfg(feature = "groups")]
-    #[napi]
-    pub async fn spawn_standby_group(
-        &self,
-        kind: String,
-        config: crate::groups::StandbyGroupConfigJs,
-    ) -> Result<crate::groups::StandbyGroup> {
-        crate::groups::spawn_standby_group(self.sdk_runtime().clone(), kind, config).await
-    }
-
     /// Initiate a migration for the daemon identified by
     /// `originHash`, moving it from `sourceNode` to `targetNode`.
     ///
@@ -933,6 +882,69 @@ impl DaemonRuntime {
         self.inner
             .migration_phase(origin_hash)
             .map(migration_phase_str)
+    }
+}
+
+// =========================================================================
+// Groups surface — separate `#[napi] impl` block so the outer
+// `#[napi]` on the main `impl DaemonRuntime` doesn't try to
+// register `spawn_*_group_c_callback` symbols that don't exist
+// when the `groups` feature is off. napi-derive collects method
+// names at macro-expansion time regardless of inner `#[cfg]`
+// attributes, so the cfg gate has to live on the *impl block*
+// itself to keep the compute-only build green.
+// =========================================================================
+
+#[cfg(feature = "groups")]
+#[napi]
+impl DaemonRuntime {
+    /// Spawn a `ReplicaGroup` of `config.replicaCount` members
+    /// using the factory registered under `kind`.
+    ///
+    /// Async so the SDK-level spawn runs on a tokio worker. The
+    /// factory round-trip goes through the TSFN dispatcher — if
+    /// this method were sync on the Node main thread, the TSFN
+    /// callback would queue behind the blocked spawn and deadlock.
+    #[napi]
+    pub async fn spawn_replica_group(
+        &self,
+        kind: String,
+        config: crate::groups::ReplicaGroupConfigJs,
+    ) -> Result<crate::groups::ReplicaGroup> {
+        crate::groups::spawn_replica_group(self.sdk_runtime().clone(), kind, config).await
+    }
+
+    /// Fork `config.forkCount` new daemons from a parent at
+    /// `forkSeq`. Same deadlock-avoidance argument as
+    /// `spawnReplicaGroup`.
+    #[napi]
+    pub async fn spawn_fork_group(
+        &self,
+        kind: String,
+        parent_origin: u32,
+        fork_seq: BigInt,
+        config: crate::groups::ForkGroupConfigJs,
+    ) -> Result<crate::groups::ForkGroup> {
+        let seq = daemon_bigint_u64("forkSeq", fork_seq)?;
+        crate::groups::spawn_fork_group(
+            self.sdk_runtime().clone(),
+            kind,
+            parent_origin,
+            seq,
+            config,
+        )
+        .await
+    }
+
+    /// Spawn a `StandbyGroup`. Same deadlock-avoidance argument
+    /// as `spawnReplicaGroup`.
+    #[napi]
+    pub async fn spawn_standby_group(
+        &self,
+        kind: String,
+        config: crate::groups::StandbyGroupConfigJs,
+    ) -> Result<crate::groups::StandbyGroup> {
+        crate::groups::spawn_standby_group(self.sdk_runtime().clone(), kind, config).await
     }
 }
 
