@@ -1,0 +1,35 @@
+net/crates/net/bindings/go/net/regression_test.go
+  5bf3f089eecaef7a 11,257-336
+net/crates/net/bindings/node/src/compute.rs
+  5bf3f089eecaef7a 433-436,538-541,558-567,673-676,688-696,888-891,915-918,1168-1169,1469,1472-1494,1496,1499-1511,1515,1528-1532,1550-1551,1556,1559-1565,1577-1579,1582-1583,1594-1596,1599-1600,1603-1604,1607-1697
+net/crates/net/bindings/go/net/groups.go
+  5bf3f089eecaef7a 827-831,835,839
+net/crates/net/sdk-ts/test/compute.test.ts
+  5bf3f089eecaef7a 904-909,974-988
+net/crates/net/bindings/python/tests/test_compute.py
+  5bf3f089eecaef7a 125-129,135-140,509-511,517-523,611-664
+net/crates/net/bindings/go/net/compute.go
+  5bf3f089eecaef7a 79-93,97,106,110
+net/crates/net/bindings/python/src/compute.rs
+  5bf3f089eecaef7a 411-415,670-677,680-681,683,1129-1131,1139-1141,1149-1151,1157-1159,1180-1181,1184-1204,1206,1209-1221,1225,1238-1327
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "0334b3c36f7750bc53ea594c935720593d254357",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 5721,
+      "total_deletions": 87,
+      "accepted_lines": 541,
+      "overriden_lines": 2
+    }
+  }
+}
