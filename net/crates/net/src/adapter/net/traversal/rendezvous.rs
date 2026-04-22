@@ -84,6 +84,37 @@
 //! explicit so the coordinator doesn't have to rewrite bytes
 //! mid-flight.
 //!
+//! # Keep-alive packet
+//!
+//! Keep-alives are the pre-session half of the rendezvous. At
+//! `fire_at`, each endpoint sends three keep-alives to the other
+//! endpoint's `peer_reflex`. These packets exist solely to open
+//! NAT connection-tracking rows (outbound traffic primes inbound
+//! acceptance). They **do not** ride the event-frame wrapper —
+//! no session exists between A and B at fire time, so a Net
+//! packet with MAGIC header wouldn't decrypt. Instead:
+//!
+//! ```text
+//! ┌──────────────────┬──────────────────┬───────────────┐
+//! │ KEEPALIVE_MAGIC  │ sender_node_id   │ punch_id      │
+//! │ (2)              │ (8)              │ (4)           │
+//! └──────────────────┴──────────────────┴───────────────┘
+//! ```
+//!
+//! Total 14 bytes, distinct from both Net packet (MAGIC-prefixed,
+//! ≥ 80 bytes) and pingwave (72 bytes). The receive loop pre-
+//! processes any 14-byte packet starting with `KEEPALIVE_MAGIC`
+//! before session lookup; matching packets fire an observer
+//! oneshot keyed by the source `SocketAddr` and do not continue
+//! down the session-decrypt path.
+//!
+//! The observer firing is what triggers the `PunchAck` —
+//! "the counterpart's keep-alive reached me, so my outbound NAT
+//! row is confirmed." On localhost this is equivalent to the
+//! auto-emit-on-introduce shortcut (there's no NAT to confirm),
+//! but on a real NAT the observer is the actual
+//! connectivity signal.
+//!
 //! # Framing (not correctness)
 //!
 //! Rendezvous is an optimization, not a connectivity requirement.
@@ -122,6 +153,73 @@ pub const PUNCH_INTRODUCE_LEN: usize = 1 + 8 + ADDR_LEN + 8;
 /// Total on-wire size of a `PunchAck` payload.
 /// `kind(1) + from_peer(8) + to_peer(8) + punch_id(4) = 21`.
 pub const PUNCH_ACK_LEN: usize = 1 + 8 + 8 + 4;
+
+/// Two-byte magic prefix identifying a pre-session keep-alive
+/// packet. Chosen to be disjoint from the Net packet `MAGIC`
+/// (`0x4E45` on the wire) so the receive loop can discriminate
+/// without parsing. Value: ASCII `"PH"` (Punch Hello).
+///
+/// Byte-order: the magic is compared against
+/// `u16::from_le_bytes([data[0], data[1]])` at receive time, so
+/// the on-wire bytes are `[b'P', b'H']` = `[0x50, 0x48]` and the
+/// little-endian u16 is `0x4850`.
+pub const KEEPALIVE_MAGIC: u16 = 0x4850;
+
+/// On-wire length of a keep-alive packet: magic(2) +
+/// sender_node_id(8) + punch_id(4) = 14 bytes. Distinct from
+/// pingwave's 72 bytes and from the minimum Net packet length.
+pub const KEEPALIVE_LEN: usize = 2 + 8 + 4;
+
+/// Decoded keep-alive packet. Produced by [`decode_keepalive`]
+/// when the receive loop recognizes a packet by its 14-byte
+/// length and `KEEPALIVE_MAGIC` prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Keepalive {
+    /// The sending endpoint's `node_id`. Load-bearing: the
+    /// observer correlates inbound keep-alives against the peer
+    /// it's expecting to hear from; without the sender id, a
+    /// stray packet on the right source addr would falsely
+    /// signal "punch succeeded."
+    pub sender_node_id: u64,
+    /// Correlation token echoed from the originating
+    /// `PunchRequest`. Same value that rides `PunchAck`, so an
+    /// ack reaching the initiator can be matched against the
+    /// keep-alive that triggered it.
+    pub punch_id: u32,
+}
+
+/// Encode a keep-alive packet. Output length is always
+/// [`KEEPALIVE_LEN`].
+pub fn encode_keepalive(ka: &Keepalive) -> Bytes {
+    let mut buf = BytesMut::with_capacity(KEEPALIVE_LEN);
+    // Magic is written little-endian so the receive-loop
+    // recognition check (also LE) compares the same bytes.
+    buf.put_slice(&KEEPALIVE_MAGIC.to_le_bytes());
+    buf.put_u64(ka.sender_node_id);
+    buf.put_u32(ka.punch_id);
+    debug_assert_eq!(buf.len(), KEEPALIVE_LEN);
+    buf.freeze()
+}
+
+/// Decode a keep-alive packet. Returns `None` if the length
+/// doesn't match or the magic prefix is wrong. A packet that
+/// fails this check isn't a keep-alive and should continue down
+/// the normal receive-loop dispatch path.
+pub fn decode_keepalive(data: &[u8]) -> Option<Keepalive> {
+    if data.len() != KEEPALIVE_LEN {
+        return None;
+    }
+    let magic = u16::from_le_bytes([data[0], data[1]]);
+    if magic != KEEPALIVE_MAGIC {
+        return None;
+    }
+    let sender_node_id = u64::from_be_bytes(data[2..10].try_into().ok()?);
+    let punch_id = u32::from_be_bytes(data[10..14].try_into().ok()?);
+    Some(Keepalive {
+        sender_node_id,
+        punch_id,
+    })
+}
 
 /// A `PunchRequest` payload — A → R ("please mediate a punch to
 /// `target`").
@@ -458,6 +556,53 @@ mod tests {
         // address family at byte 9 — set to invalid
         payload[9] = 7;
         assert!(decode(&payload).is_none());
+    }
+
+    #[test]
+    fn keepalive_roundtrip() {
+        let ka = Keepalive {
+            sender_node_id: 0xA1B2_C3D4_E5F6_0718,
+            punch_id: 0x1234_5678,
+        };
+        let encoded = encode_keepalive(&ka);
+        assert_eq!(encoded.len(), KEEPALIVE_LEN);
+        match decode_keepalive(&encoded) {
+            Some(out) => assert_eq!(out, ka),
+            None => panic!("decode_keepalive returned None on a valid packet"),
+        }
+    }
+
+    #[test]
+    fn keepalive_magic_is_distinct_from_net_magic() {
+        // The receive loop uses `u16::from_le_bytes([d[0], d[1]]) != MAGIC`
+        // to route to the pingwave path; we use the same little-endian
+        // read to recognize keep-alives. The two discriminators MUST be
+        // different or a keep-alive would either be mis-routed to
+        // pingwave or mis-parsed as a Net packet.
+        use crate::adapter::net::protocol::MAGIC;
+        assert_ne!(
+            KEEPALIVE_MAGIC, MAGIC,
+            "KEEPALIVE_MAGIC collides with Net packet MAGIC",
+        );
+    }
+
+    #[test]
+    fn keepalive_wrong_length_rejects() {
+        // A 14-byte packet that doesn't start with KEEPALIVE_MAGIC
+        // is not a keep-alive. Similarly, anything outside
+        // KEEPALIVE_LEN isn't recognized. Guards against a receive
+        // loop that "almost" recognizes a keep-alive.
+        let mut too_short = vec![0u8; KEEPALIVE_LEN - 1];
+        too_short[0..2].copy_from_slice(&KEEPALIVE_MAGIC.to_le_bytes());
+        assert!(decode_keepalive(&too_short).is_none());
+
+        let mut too_long = vec![0u8; KEEPALIVE_LEN + 1];
+        too_long[0..2].copy_from_slice(&KEEPALIVE_MAGIC.to_le_bytes());
+        assert!(decode_keepalive(&too_long).is_none());
+
+        let mut wrong_magic = vec![0u8; KEEPALIVE_LEN];
+        wrong_magic[0..2].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        assert!(decode_keepalive(&wrong_magic).is_none());
     }
 
     #[test]

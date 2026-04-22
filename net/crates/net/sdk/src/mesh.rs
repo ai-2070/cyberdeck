@@ -733,6 +733,157 @@ impl Mesh {
     pub fn identity(&self) -> Option<&crate::identity::Identity> {
         self.identity.as_ref()
     }
+
+    // ── NAT traversal ──────────────────────────────────────────
+    //
+    // Framing (load-bearing — see `docs/NAT_TRAVERSAL_PLAN.md`
+    // stage 5): every user-visible docstring here must position
+    // NAT traversal as **optimization, not correctness**. Nodes
+    // behind NAT can always talk through the mesh's routed-
+    // handshake path. These APIs let the mesh upgrade to a
+    // *direct* path when the underlying NATs allow it, cutting
+    // relay hops out of the data plane. A `nat_type` of
+    // `symmetric` or a `PunchFailed` error is not a
+    // connectivity failure — it just means traffic keeps
+    // riding the relay.
+    //
+    // Anti-phrasings to avoid: "required for NATed peers",
+    // "enables cross-NAT connectivity", "fixes NAT issues."
+    // Each of these implies the mesh otherwise can't reach
+    // NATed peers, which is false.
+
+    /// Current NAT classification for this mesh's public face,
+    /// as observed against other peers during the classification
+    /// sweep. One of `Open`, `Cone`, `Symmetric`, or `Unknown`
+    /// (pre-sweep or insufficient data).
+    ///
+    /// **Optimization, not correctness.** A `Symmetric`
+    /// classification doesn't prevent this mesh from
+    /// communicating with any peer — it just means the direct-
+    /// punch optimization is unlikely to succeed against some
+    /// peers, and traffic will keep riding the routed path.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn nat_type(&self) -> net::adapter::net::traversal::classify::NatClass {
+        self.node.nat_class()
+    }
+
+    /// This mesh's public-facing `SocketAddr` as observed by a
+    /// remote peer, or `None` before the first classification
+    /// sweep has produced an observation.
+    ///
+    /// Piggybacks on outbound `CapabilityAnnouncement`s so peers
+    /// can attempt a direct-connect without a separate
+    /// discovery round-trip. Read by peers implementing the
+    /// `connect_direct` rendezvous path.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn reflex_addr(&self) -> Option<SocketAddr> {
+        self.node.reflex_addr()
+    }
+
+    /// The NAT classification most recently advertised by
+    /// `peer_node_id` (parsed from the `nat:*` tag on their
+    /// capability announcement). Returns `NatClass::Unknown`
+    /// when the peer hasn't announced or was compiled without
+    /// NAT traversal — the pair-type matrix treats Unknown as
+    /// "attempt direct, fall back on failure," not as
+    /// "don't attempt."
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn peer_nat_type(
+        &self,
+        peer_node_id: u64,
+    ) -> net::adapter::net::traversal::classify::NatClass {
+        self.node.peer_nat_class(peer_node_id)
+    }
+
+    /// Send one reflex probe to `peer_node_id` and return the
+    /// public `SocketAddr` the peer observed on the probe's UDP
+    /// envelope. Useful for tests and for operators diagnosing a
+    /// NAT-type classification that seems off.
+    ///
+    /// Times out after `TraversalConfig::reflex_timeout` (3 s
+    /// default) on network delays, and fast-fails with
+    /// `peer-not-reachable` on an unknown peer.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn probe_reflex(&self, peer_node_id: u64) -> Result<SocketAddr> {
+        Ok(self.node.probe_reflex(peer_node_id).await?)
+    }
+
+    /// Explicitly re-run the NAT classification sweep against
+    /// this node's currently-connected peers. Normally the
+    /// background loop (spawned by `start()`) takes care of
+    /// this; call this after a suspected NAT rebind (e.g. a
+    /// gateway reboot) to accelerate the re-classification.
+    ///
+    /// No-op when fewer than 2 peers are connected — the
+    /// two-probe rule needs two distinct targets to produce a
+    /// classification. Never returns an error; a failed sweep
+    /// leaves the previous classification intact.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn reclassify_nat(&self) {
+        self.node.reclassify_nat().await
+    }
+
+    /// Establish a session to `peer_node_id` via the rendezvous
+    /// path, using the pair-type matrix to decide between a
+    /// direct handshake and a relay-coordinated punch. The
+    /// returned session is equivalent in correctness to
+    /// `connect()` — the *only* difference is that a
+    /// `connect_direct` that lands on the punched path cuts
+    /// relay hops out of the data plane.
+    ///
+    /// **Optimization, not correctness.** `connect_direct`
+    /// always resolves: on a punch-failed outcome, the session
+    /// is established via the routed-handshake fallback.
+    /// Inspect `traversal_stats()` afterward to distinguish a
+    /// successful punch from a relay fallback.
+    ///
+    /// `coordinator` names a peer we already have a session
+    /// with — typically a stable relay-capable node. The
+    /// coordinator mediates the introduction; it doesn't carry
+    /// user-plane traffic once the punch succeeds.
+    ///
+    /// Fails with an `SdkError::Traversal` variant whose `kind`
+    /// is `peer-not-reachable` (no cached reflex for `peer`),
+    /// `transport` (socket-level error on the final handshake),
+    /// or (internal, retried on fallback) `punch-failed`.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn connect_direct(
+        &self,
+        peer_node_id: u64,
+        peer_pubkey: &[u8; 32],
+        coordinator: u64,
+    ) -> Result<()> {
+        self.node
+            .connect_direct(peer_node_id, peer_pubkey, coordinator)
+            .await?;
+        Ok(())
+    }
+
+    /// Cumulative counters for this mesh's NAT-traversal
+    /// activity: punch attempts, successful punches, and relay
+    /// fallbacks. Monotonic — counters never reset. Useful for
+    /// diagnostics + telemetry (success rate, relay load
+    /// trends).
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn traversal_stats(
+        &self,
+    ) -> net::adapter::net::traversal::TraversalStatsSnapshot {
+        self.node.traversal_stats()
+    }
 }
 
 /// Map an `AdapterError` from a subscribe / unsubscribe / publish

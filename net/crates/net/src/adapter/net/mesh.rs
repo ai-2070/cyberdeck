@@ -199,6 +199,15 @@ struct DispatchCtx {
     pending_punch_acks: Arc<
         DashMap<u64, tokio::sync::oneshot::Sender<super::traversal::rendezvous::PunchAck>>,
     >,
+    /// Keep-alive observers, keyed by the `SocketAddr` of the
+    /// counterpart's `peer_reflex`. Fired by the receive loop
+    /// when a matching `Keepalive`-formatted packet arrives;
+    /// consumed by the endpoint's punch-scheduling task to
+    /// decide when to emit a `PunchAck`.
+    #[cfg(feature = "nat-traversal")]
+    punch_observers: Arc<
+        DashMap<SocketAddr, tokio::sync::oneshot::Sender<super::traversal::rendezvous::Keepalive>>,
+    >,
     /// NAT-traversal tunables (probe timeouts, punch cadence,
     /// classification deadlines). Shared with `MeshNode` by value
     /// since `TraversalConfig` is `Clone` and small. The dispatch
@@ -764,6 +773,14 @@ pub struct MeshNode {
     #[cfg(feature = "nat-traversal")]
     pending_punch_acks:
         Arc<DashMap<u64, oneshot::Sender<super::traversal::rendezvous::PunchAck>>>,
+    /// Keep-alive observers for in-progress punches, keyed by
+    /// the `SocketAddr` we're watching for inbound traffic (the
+    /// counterpart's `peer_reflex`). The receive loop fires the
+    /// oneshot on the first matching keep-alive and the punch-
+    /// scheduler task reacts by emitting a `PunchAck`.
+    #[cfg(feature = "nat-traversal")]
+    punch_observers:
+        Arc<DashMap<SocketAddr, oneshot::Sender<super::traversal::rendezvous::Keepalive>>>,
     /// Current NAT classification, encoded via
     /// [`super::traversal::classify::NatClass::as_u8`]. Starts as
     /// `Unknown` (`0`) and is updated by the classification sweep
@@ -1027,6 +1044,8 @@ impl MeshNode {
             pending_punch_introduces: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
             pending_punch_acks: Arc::new(DashMap::new()),
+            #[cfg(feature = "nat-traversal")]
+            punch_observers: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
             nat_class: Arc::new(std::sync::atomic::AtomicU8::new(
                 super::traversal::classify::NatClass::Unknown.as_u8(),
@@ -1615,6 +1634,8 @@ impl MeshNode {
             #[cfg(feature = "nat-traversal")]
             pending_punch_acks: self.pending_punch_acks.clone(),
             #[cfg(feature = "nat-traversal")]
+            punch_observers: self.punch_observers.clone(),
+            #[cfg(feature = "nat-traversal")]
             traversal_config: self.traversal_config.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
             capability_index: self.capability_index.clone(),
@@ -1667,6 +1688,28 @@ impl MeshNode {
         // Partition filter: silently drop packets from blocked peers
         if ctx.partition_filter.contains(&source) {
             return;
+        }
+
+        // Pre-session keep-alive recognition. Keep-alives are
+        // 14-byte packets with `KEEPALIVE_MAGIC` at offset 0. The
+        // receive loop fires any observer watching `source` and
+        // returns — these packets never continue down the
+        // session-decrypt path because no session exists between
+        // the peers at punch time. See
+        // `traversal::rendezvous`'s module docstring for the
+        // wire layout rationale.
+        //
+        // Ordered BEFORE the pingwave check because both reach
+        // into `data[0..2]`; keep-alives are shorter (14 vs 72)
+        // so the length guard disambiguates without cost.
+        #[cfg(feature = "nat-traversal")]
+        if data.len() == super::traversal::rendezvous::KEEPALIVE_LEN {
+            if let Some(ka) = super::traversal::rendezvous::decode_keepalive(&data) {
+                if let Some((_, tx)) = ctx.punch_observers.remove(&source) {
+                    let _ = tx.send(ka);
+                }
+                return;
+            }
         }
 
         // Check for pingwave. Pingwaves are a fixed 72-byte wire format
@@ -2459,20 +2502,18 @@ impl MeshNode {
                 rendezvous::RendezvousMsg::PunchIntroduce(intro) => {
                     // Endpoint side of the rendezvous. Complete
                     // any installed observer waiter (for tests /
-                    // explicit awaits), then auto-emit the
-                    // matching `PunchAck` via the coordinator —
-                    // the sender we just received the introduce
-                    // from. Stage 3d wiring: the ack flows
-                    // `endpoint → coordinator → other endpoint`,
-                    // which on localhost is immediate; on a real
-                    // NAT it rides the already-working relay
-                    // session.
+                    // explicit awaits), then schedule the
+                    // keep-alive train + observer. The
+                    // `PunchAck` fires only once the observer
+                    // sees inbound traffic from `peer_reflex`
+                    // (or — on localhost — at the punch_deadline
+                    // fallback). Plan §3 endpoint semantics.
                     if let Some((_, tx)) =
                         ctx.pending_punch_introduces.remove(&intro.peer)
                     {
                         let _ = tx.send(intro);
                     }
-                    Self::send_punch_ack_via(from_node, intro, ctx);
+                    Self::schedule_punch(from_node, intro, ctx);
                 }
                 rendezvous::RendezvousMsg::PunchAck(ack) => {
                     if ack.to_peer == ctx.local_node_id {
@@ -3560,28 +3601,35 @@ impl MeshNode {
         });
     }
 
-    /// Endpoint-side: send a `PunchAck` back to the other
-    /// endpoint, via the coordinator that just introduced us.
+    /// Endpoint-side: schedule the keep-alive train + observer
+    /// after receiving a `PunchIntroduce`. Plan §3 endpoint
+    /// behavior, end-to-end:
     ///
-    /// Called from the `PunchIntroduce` dispatch branch. The ack
-    /// is stamped `from_peer = self, to_peer = intro.peer`
-    /// (the counterpart). The coordinator that delivers the ack
-    /// to the counterpart is the same peer we received the
-    /// introduce from — stored as `coordinator_node_id`. This
-    /// works because the rendezvous three-message dance routes
-    /// through the same coordinator for all three steps.
+    /// 1. At `fire_at`, `fire_at + 100ms`, `fire_at + 250ms`
+    ///    send a keep-alive packet to `intro.peer_reflex`. Raw
+    ///    UDP, no encryption — the peer has no session with us
+    ///    yet. The purpose is to open our side's NAT
+    ///    connection-tracking row, so the peer's keep-alive
+    ///    (fired in the same window on their side) can arrive.
+    /// 2. Install an observer on `punch_observers[peer_reflex]`.
+    ///    The receive loop's pre-session keep-alive recognition
+    ///    fires it on first matching inbound.
+    /// 3. Wait up to `punch_deadline` for the observer. On
+    ///    success, emit a `PunchAck` via the coordinator; on
+    ///    timeout, drop silently — the counterpart's
+    ///    `await_punch_ack` times out too, and `connect_direct`
+    ///    records the fallback.
     ///
-    /// Best-effort: a failure to send (socket error, coordinator
-    /// session gone) logs + returns. The counterpart's own
-    /// ack-await on `connect_direct` will time out; neither side
-    /// crashes.
+    /// Best-effort throughout: a failed send at any step is
+    /// logged-and-skipped. Rendezvous is an optimization (plan
+    /// framing); routed-handshake is always the safety net.
     #[cfg(feature = "nat-traversal")]
-    fn send_punch_ack_via(
+    fn schedule_punch(
         coordinator_node_id: u64,
         intro: super::traversal::rendezvous::PunchIntroduce,
         ctx: &DispatchCtx,
     ) {
-        use super::traversal::rendezvous::{PunchAck, RendezvousMsg};
+        use super::traversal::rendezvous::{encode_keepalive, Keepalive, PunchAck, RendezvousMsg};
 
         let Some((coord_addr, coord_session)) = ctx
             .peers
@@ -3593,36 +3641,98 @@ impl MeshNode {
         if ctx.partition_filter.contains(&coord_addr) {
             return;
         }
+        if ctx.partition_filter.contains(&intro.peer_reflex) {
+            return;
+        }
 
-        let ack_body = RendezvousMsg::PunchAck(PunchAck {
-            from_peer: ctx.local_node_id,
-            to_peer: intro.peer,
-            // `punch_id` is reserved for stage-3b-onwards
-            // correlation; no generator wiring yet. 0 is a
-            // placeholder — the field is on the wire but not
-            // consulted.
-            punch_id: 0,
-        })
-        .encode();
+        // Install the observer. A prior pending entry at the same
+        // addr (unusual — would mean two simultaneous punches to
+        // the same peer_reflex) is replaced; the earlier scheduler
+        // task sees a `SendError` on its oneshot.
+        let (obs_tx, obs_rx) = oneshot::channel();
+        ctx.punch_observers.insert(intro.peer_reflex, obs_tx);
 
-        let socket = ctx.socket.clone();
+        // Compute keep-alive send delays. `fire_at_ms` is a Unix
+        // epoch millisecond value synthesized by R; we subtract
+        // "now" to get the lead. If the computed lead is
+        // negative (clock skew, slow path), treat as "fire
+        // immediately" rather than as an error.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let base_lead_ms = intro.fire_at_ms.saturating_sub(now_ms);
+        let base_lead = std::time::Duration::from_millis(base_lead_ms);
+        let offsets = [
+            base_lead,
+            base_lead.saturating_add(std::time::Duration::from_millis(100)),
+            base_lead.saturating_add(std::time::Duration::from_millis(250)),
+        ];
+
+        let local_node_id = ctx.local_node_id;
+        let peer_reflex = intro.peer_reflex;
+        let peer = intro.peer;
+        let socket_send = ctx.socket.clone();
+        let socket_ack = ctx.socket.clone();
+        let deadline = ctx.traversal_config.punch_deadline;
+        let punch_observers = ctx.punch_observers.clone();
+
+        // Keep-alive sender task: fires at each offset from the
+        // spawn time. The observer task (below) runs in parallel
+        // and races the deadline.
+        let keepalive_payload = encode_keepalive(&Keepalive {
+            sender_node_id: local_node_id,
+            punch_id: 0, // reserved; no generator wiring yet
+        });
         tokio::spawn(async move {
-            let pool = coord_session.thread_local_pool();
-            let mut builder = pool.get();
-            let seq = {
-                let stream = coord_session
-                    .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
-                stream.next_tx_seq()
-            };
-            let events = vec![ack_body];
-            let packet = builder.build_subprotocol(
-                super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
-                seq,
-                &events,
-                PacketFlags::NONE,
-                super::traversal::SUBPROTOCOL_RENDEZVOUS,
-            );
-            let _ = socket.send_to(&packet, coord_addr).await;
+            for offset in offsets {
+                tokio::time::sleep(offset).await;
+                let _ = socket_send
+                    .send_to(&keepalive_payload[..], peer_reflex)
+                    .await;
+            }
+        });
+
+        // Observer task: waits for the receive loop to fire the
+        // oneshot. On success emits the PunchAck; on timeout
+        // evicts the observer and drops silently.
+        tokio::spawn(async move {
+            match tokio::time::timeout(deadline, obs_rx).await {
+                Ok(Ok(_observed)) => {
+                    // Build + send the ack via the coordinator
+                    // session, same shape as the former
+                    // `send_punch_ack_via` helper.
+                    let ack_body = RendezvousMsg::PunchAck(PunchAck {
+                        from_peer: local_node_id,
+                        to_peer: peer,
+                        punch_id: 0,
+                    })
+                    .encode();
+                    let pool = coord_session.thread_local_pool();
+                    let mut builder = pool.get();
+                    let seq = {
+                        let stream = coord_session.get_or_create_stream(
+                            super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                        );
+                        stream.next_tx_seq()
+                    };
+                    let events = vec![ack_body];
+                    let packet = builder.build_subprotocol(
+                        super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                        seq,
+                        &events,
+                        PacketFlags::NONE,
+                        super::traversal::SUBPROTOCOL_RENDEZVOUS,
+                    );
+                    let _ = socket_ack.send_to(&packet, coord_addr).await;
+                }
+                Ok(Err(_)) | Err(_) => {
+                    // Cancelled or timed out. Evict the observer
+                    // so a late keep-alive doesn't find a stale
+                    // entry; treat this as "punch failed."
+                    punch_observers.remove(&peer_reflex);
+                }
+            }
         });
     }
 
