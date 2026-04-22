@@ -105,13 +105,12 @@ initiator.ingest_raw('{"event": "data"}')
 
 ### NAT traversal (optimization, not correctness)
 
-Two NATed peers already reach each other through the mesh's routed-handshake path. NAT traversal opens a shorter direct path when the NAT shape allows it; it's never required for connectivity. Every method below is safe to call regardless of NAT type — a failed punch or a `TraversalError` is not a connectivity failure, traffic keeps riding the relay. The whole surface is a no-op when the native module was built without `--features nat-traversal`: every call raises `TraversalError` with `kind="unsupported"`.
+Two NATed peers already reach each other through the mesh's routed-handshake path. NAT traversal opens a shorter direct path when the NAT shape allows it; it's never required for connectivity. Every method below is safe to call regardless of NAT type — a failed punch or a `traversal: *` `RuntimeError` is not a connectivity failure, traffic keeps riding the relay. The whole surface is a no-op when the native module was built without `--features nat-traversal`: every call raises `RuntimeError("traversal: unsupported")`.
 
 ```python
-from net import TraversalError
+from net import NetMesh
 
-# Access via the PyO3 NetMesh handle on the node.
-mesh = node.mesh  # or however your app exposes it
+mesh = NetMesh(bind_addr="0.0.0.0:9000", psk="00" * 32)
 
 mesh.reclassify_nat()
 
@@ -142,7 +141,20 @@ mesh.clear_reflex_override()
 mesh.announce_capabilities(caps)
 ```
 
-`TraversalError` carries a stable `kind` discriminator: `reflex-timeout` | `peer-not-reachable` | `transport` | `rendezvous-no-relay` | `rendezvous-rejected` | `punch-failed` | `port-map-unavailable` | `unsupported`. Match on `e.kind` for machine-readable branching. `"unsupported"` is the signal that the bindings are linked unconditionally and the native module doesn't have the feature — callers can branch cleanly without probing for symbol presence.
+Traversal failures surface as `RuntimeError` with a stable `traversal: <kind>[: <detail>]` message prefix. The `<kind>` discriminator is one of `reflex-timeout` | `peer-not-reachable` | `transport` | `rendezvous-no-relay` | `rendezvous-rejected` | `punch-failed` | `port-map-unavailable` | `unsupported`. Match on the prefix for machine-readable branching:
+
+```python
+try:
+    mesh.connect_direct(peer_node_id, peer_pubkey_hex, coord_id)
+except RuntimeError as e:
+    msg = str(e)
+    if msg.startswith("traversal: unsupported"):
+        ...   # native module built without --features nat-traversal
+    elif msg.startswith("traversal: peer-not-reachable"):
+        ...
+```
+
+`"unsupported"` is the signal that the bindings are linked unconditionally and the native module doesn't have the feature — callers can branch cleanly without probing for symbol presence.
 
 ## Channels (distributed pub/sub)
 
