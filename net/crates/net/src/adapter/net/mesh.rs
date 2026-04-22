@@ -5002,6 +5002,19 @@ impl MeshNode {
                 .map_err(|e| TraversalError::Transport(e.to_string()))
         };
 
+        // Small helper: open a direct session using the punched
+        // path. Same idempotency as `connect_routed`. Returns
+        // `Err` on handshake failure — caller falls back to
+        // relay to still produce a usable session.
+        let connect_on_punched_path = |peer_reflex: std::net::SocketAddr| async move {
+            if self.peers.contains_key(&peer_node_id) {
+                return Ok(peer_node_id);
+            }
+            self.connect(peer_reflex, peer_pubkey, peer_node_id)
+                .await
+                .map_err(|e| TraversalError::Transport(e.to_string()))
+        };
+
         match action {
             PairAction::Direct | PairAction::SkipPunch => {
                 self.traversal_stats.record_relay_fallback();
@@ -5022,24 +5035,44 @@ impl MeshNode {
                     .await;
 
                 match punch_outcome {
-                    Ok(_intro) => {
+                    Ok(intro) => {
                         // Await the counterpart's PunchAck,
                         // forwarded by the coordinator. On
-                        // success the punch is considered
-                        // confirmed end-to-end; on timeout we
-                        // fall back to relay and the ack waiter
-                        // is evicted.
+                        // success we try a direct handshake to
+                        // the peer's advertised reflex — that's
+                        // the whole point of the punch, and
+                        // without it this code path is a fancy
+                        // way of doing a relayed connect while
+                        // lying in stats that a punch happened.
+                        // On ack-timeout or direct-handshake
+                        // failure we fall back to relay so the
+                        // caller still gets a usable session.
                         let deadline = self.traversal_config.punch_deadline;
                         match tokio::time::timeout(deadline, ack_rx).await {
                             Ok(Ok(_ack)) => {
-                                self.traversal_stats.record_punch_success();
+                                match connect_on_punched_path(intro.peer_reflex).await {
+                                    Ok(id) => {
+                                        self.traversal_stats.record_punch_success();
+                                        Ok(id)
+                                    }
+                                    Err(_) => {
+                                        // Punch opened but direct
+                                        // handshake failed (NAT
+                                        // rebound between ack and
+                                        // handshake, or the
+                                        // peer's socket buffer
+                                        // filled). Relay fallback.
+                                        self.traversal_stats.record_relay_fallback();
+                                        connect_routed().await
+                                    }
+                                }
                             }
                             Ok(Err(_)) | Err(_) => {
                                 self.pending_punch_acks.remove(&peer_node_id);
                                 self.traversal_stats.record_relay_fallback();
+                                connect_routed().await
                             }
                         }
-                        connect_routed().await
                     }
                     Err(_) => {
                         // Coordinator mediation failed — no
@@ -5861,6 +5894,30 @@ impl MeshNode {
             super::traversal::classify::NatClass::Unknown.as_u8(),
             Ordering::Release,
         );
+    }
+
+    /// Testing / debugging hook: force this node's advertised
+    /// `NatClass` without running the probe sweep. On loopback
+    /// every node classifies as `Open`, which means the pair-type
+    /// matrix always picks `Direct` — useful for Open×Open cases
+    /// but leaves the `SinglePunch` path unexercised. Regression
+    /// tests that need to drive `connect_direct` through the
+    /// punch branch set this to `Cone` (or `Symmetric`) before
+    /// calling `announce_capabilities`, then the peer reads it
+    /// back via `peer_nat_class` and the matrix resolves to
+    /// `SinglePunch`.
+    ///
+    /// Not for production use: the classifier is the intended
+    /// writer, and forcing a class short-circuits real NAT
+    /// observation. Exposed as `pub` (not `pub(crate)`) only so
+    /// `tests/connect_direct.rs` can reach it from a separate
+    /// crate.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    #[doc(hidden)]
+    pub fn force_nat_class_for_test(&self, class: super::traversal::classify::NatClass) {
+        self.nat_class.store(class.as_u8(), Ordering::Release);
     }
 
     /// Send a `PunchRequest` to a coordinator peer `relay`, asking

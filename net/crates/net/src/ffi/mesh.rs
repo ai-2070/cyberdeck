@@ -72,6 +72,10 @@ pub(crate) const NET_ERR_TOKEN_NOT_AUTHORIZED: c_int = -127;
 // not a connectivity failure — the routed-handshake path is
 // always available. See `TraversalError` docs for per-variant
 // semantics.
+// Per-variant traversal error codes. Gated on the feature
+// because they're only referenced by `traversal_err_to_code`,
+// which only compiles with the feature on. `NET_ERR_TRAVERSAL_UNSUPPORTED`
+// below is unconditional — the no-feature stubs need it.
 #[cfg(feature = "nat-traversal")]
 pub(crate) const NET_ERR_TRAVERSAL_REFLEX_TIMEOUT: c_int = -130;
 #[cfg(feature = "nat-traversal")]
@@ -86,7 +90,11 @@ pub(crate) const NET_ERR_TRAVERSAL_RENDEZVOUS_REJECTED: c_int = -134;
 pub(crate) const NET_ERR_TRAVERSAL_PUNCH_FAILED: c_int = -135;
 #[cfg(feature = "nat-traversal")]
 pub(crate) const NET_ERR_TRAVERSAL_PORT_MAP_UNAVAILABLE: c_int = -136;
-#[cfg(feature = "nat-traversal")]
+// Unconditional — the `#[cfg(not(feature = "nat-traversal"))]`
+// FFI stubs below return this so the Go / NAPI / PyO3 bindings
+// surface `ErrTraversalUnsupported` when built against a cdylib
+// without the feature, rather than failing at dlopen with a
+// missing-symbol error.
 pub(crate) const NET_ERR_TRAVERSAL_UNSUPPORTED: c_int = -137;
 
 #[cfg(feature = "nat-traversal")]
@@ -889,6 +897,113 @@ pub extern "C" fn net_mesh_clear_reflex_override(handle: *mut MeshNodeHandle) ->
     let h = unsafe { &*handle };
     h.inner.clear_reflex_override();
     0
+}
+
+// =========================================================================
+// NAT-traversal fallback stubs — built when the core is
+// compiled *without* `--features nat-traversal`.
+//
+// Bug L (cubic, P1): the Go / NAPI / PyO3 bindings unconditionally
+// link against these symbols, so a cdylib without the feature
+// used to fail at dlopen / load time with missing-symbol
+// errors. The doc comment on each binding promised
+// `ErrTraversalUnsupported` as the runtime surface for a no-
+// feature build, but there were no stubs to back that promise.
+//
+// These stubs make the promise real: the symbol resolves, the
+// call returns `NET_ERR_TRAVERSAL_UNSUPPORTED`, and the Go
+// error-mapping layer translates that to
+// `ErrTraversalUnsupported`. No heap allocation — the `_out_*`
+// pointers are left untouched (the Go side treats them as
+// invalid on a nonzero return).
+//
+// Every signature mirrors the `#[cfg(feature = "nat-traversal")]`
+// definition above. Ordering matches the feature-on block so
+// diff review can line up the pair at a glance.
+
+#[cfg(not(feature = "nat-traversal"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_nat_type(
+    _handle: *mut MeshNodeHandle,
+    _out_str: *mut *mut c_char,
+    _out_len: *mut usize,
+) -> c_int {
+    NET_ERR_TRAVERSAL_UNSUPPORTED
+}
+
+#[cfg(not(feature = "nat-traversal"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_reflex_addr(
+    _handle: *mut MeshNodeHandle,
+    _out_str: *mut *mut c_char,
+    _out_len: *mut usize,
+) -> c_int {
+    NET_ERR_TRAVERSAL_UNSUPPORTED
+}
+
+#[cfg(not(feature = "nat-traversal"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_peer_nat_type(
+    _handle: *mut MeshNodeHandle,
+    _peer_node_id: u64,
+    _out_str: *mut *mut c_char,
+    _out_len: *mut usize,
+) -> c_int {
+    NET_ERR_TRAVERSAL_UNSUPPORTED
+}
+
+#[cfg(not(feature = "nat-traversal"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_probe_reflex(
+    _handle: *mut MeshNodeHandle,
+    _peer_node_id: u64,
+    _out_str: *mut *mut c_char,
+    _out_len: *mut usize,
+) -> c_int {
+    NET_ERR_TRAVERSAL_UNSUPPORTED
+}
+
+#[cfg(not(feature = "nat-traversal"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_reclassify_nat(_handle: *mut MeshNodeHandle) -> c_int {
+    NET_ERR_TRAVERSAL_UNSUPPORTED
+}
+
+#[cfg(not(feature = "nat-traversal"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_traversal_stats(
+    _handle: *mut MeshNodeHandle,
+    _out_punches_attempted: *mut u64,
+    _out_punches_succeeded: *mut u64,
+    _out_relay_fallbacks: *mut u64,
+) -> c_int {
+    NET_ERR_TRAVERSAL_UNSUPPORTED
+}
+
+#[cfg(not(feature = "nat-traversal"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_connect_direct(
+    _handle: *mut MeshNodeHandle,
+    _peer_node_id: u64,
+    _peer_pubkey_hex: *const c_char,
+    _coordinator: u64,
+) -> c_int {
+    NET_ERR_TRAVERSAL_UNSUPPORTED
+}
+
+#[cfg(not(feature = "nat-traversal"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_set_reflex_override(
+    _handle: *mut MeshNodeHandle,
+    _external: *const c_char,
+) -> c_int {
+    NET_ERR_TRAVERSAL_UNSUPPORTED
+}
+
+#[cfg(not(feature = "nat-traversal"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_clear_reflex_override(_handle: *mut MeshNodeHandle) -> c_int {
+    NET_ERR_TRAVERSAL_UNSUPPORTED
 }
 
 // =========================================================================
@@ -2538,5 +2653,102 @@ mod tests {
         let hw = hardware_from_json(h);
         assert_eq!(hw.cpu_cores, u16::MAX);
         assert_eq!(hw.cpu_threads, u16::MAX);
+    }
+}
+
+#[cfg(all(test, not(feature = "nat-traversal")))]
+mod nat_traversal_stub_tests {
+    //! Regression coverage for cubic-flagged P1 Bug L: the Go /
+    //! NAPI / PyO3 bindings unconditionally link against the
+    //! `net_mesh_nat_type` / `net_mesh_connect_direct` / ...
+    //! symbols. Without these stubs, a cdylib built without
+    //! `--features nat-traversal` failed at dlopen with a missing-
+    //! symbol error, contradicting the binding docs' promise of
+    //! `ErrTraversalUnsupported` at runtime.
+    //!
+    //! Each test here asserts the stub resolves *and* returns
+    //! [`super::NET_ERR_TRAVERSAL_UNSUPPORTED`] (-137) — the exact
+    //! value the Go / NAPI / PyO3 translation layers map to their
+    //! respective `Unsupported` sentinels.
+    //!
+    //! Only compiled in the no-feature build; the feature-on path
+    //! has different semantics (real NAT-traversal work) tested
+    //! elsewhere.
+    use super::*;
+    use std::ptr;
+
+    #[test]
+    fn nat_type_stub_returns_unsupported() {
+        let mut out_str: *mut c_char = ptr::null_mut();
+        let mut out_len: usize = 0;
+        let code = net_mesh_nat_type(ptr::null_mut(), &mut out_str, &mut out_len);
+        assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
+    }
+
+    #[test]
+    fn reflex_addr_stub_returns_unsupported() {
+        let mut out_str: *mut c_char = ptr::null_mut();
+        let mut out_len: usize = 0;
+        let code = net_mesh_reflex_addr(ptr::null_mut(), &mut out_str, &mut out_len);
+        assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
+    }
+
+    #[test]
+    fn peer_nat_type_stub_returns_unsupported() {
+        let mut out_str: *mut c_char = ptr::null_mut();
+        let mut out_len: usize = 0;
+        let code = net_mesh_peer_nat_type(ptr::null_mut(), 0, &mut out_str, &mut out_len);
+        assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
+    }
+
+    #[test]
+    fn probe_reflex_stub_returns_unsupported() {
+        let mut out_str: *mut c_char = ptr::null_mut();
+        let mut out_len: usize = 0;
+        let code = net_mesh_probe_reflex(ptr::null_mut(), 0, &mut out_str, &mut out_len);
+        assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
+    }
+
+    #[test]
+    fn reclassify_nat_stub_returns_unsupported() {
+        let code = net_mesh_reclassify_nat(ptr::null_mut());
+        assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
+    }
+
+    #[test]
+    fn traversal_stats_stub_returns_unsupported() {
+        let mut a: u64 = 0;
+        let mut b: u64 = 0;
+        let mut c: u64 = 0;
+        let code = net_mesh_traversal_stats(ptr::null_mut(), &mut a, &mut b, &mut c);
+        assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
+    }
+
+    #[test]
+    fn connect_direct_stub_returns_unsupported() {
+        let code = net_mesh_connect_direct(ptr::null_mut(), 0, ptr::null(), 0);
+        assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
+    }
+
+    #[test]
+    fn set_reflex_override_stub_returns_unsupported() {
+        let code = net_mesh_set_reflex_override(ptr::null_mut(), ptr::null());
+        assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
+    }
+
+    #[test]
+    fn clear_reflex_override_stub_returns_unsupported() {
+        let code = net_mesh_clear_reflex_override(ptr::null_mut());
+        assert_eq!(code, NET_ERR_TRAVERSAL_UNSUPPORTED);
+    }
+
+    /// Pins the constant itself. If anyone ever renumbers
+    /// `NET_ERR_TRAVERSAL_UNSUPPORTED`, every Go / NAPI / PyO3
+    /// binding's error translation silently breaks — the stubs
+    /// return the new value but the mapping layers are hardcoded
+    /// to -137.
+    #[test]
+    fn unsupported_code_is_stable() {
+        assert_eq!(NET_ERR_TRAVERSAL_UNSUPPORTED, -137);
     }
 }

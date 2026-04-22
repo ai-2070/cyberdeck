@@ -269,3 +269,117 @@ async fn stats_start_at_zero() {
     assert_eq!(stats.punches_succeeded, 0);
     assert_eq!(stats.relay_fallbacks, 0);
 }
+
+/// Regression test for a cubic-flagged P1 bug. Earlier
+/// `connect_direct` on the `SinglePunch` path recorded
+/// `punches_succeeded++` after a successful rendezvous +
+/// PunchAck and then unconditionally called `connect_routed()`
+/// — leaving the session on the relayed path through the
+/// coordinator. The stats claimed a punched session existed but
+/// the data plane didn't actually have one, so the NAT-traversal
+/// optimization the plan promises never took effect.
+///
+/// The fix makes the success branch attempt a direct handshake
+/// against the peer's advertised reflex; `punches_succeeded`
+/// only increments when that handshake lands. A failed direct
+/// handshake (post-`start()` recv-loop contention, peer not
+/// listening, etc.) falls back to the routed path and the stats
+/// flip to `relay_fallbacks`.
+///
+/// # What this test observes
+///
+/// Drive `connect_direct` through the `SinglePunch` branch
+/// (forced by pushing both endpoints' advertised `NatClass` to
+/// `Cone`, since loopback otherwise classifies as `Open` and
+/// collapses everything to `Direct`). In this setup the punch
+/// path *cannot* complete the direct handshake on localhost —
+/// both nodes' recv loops are running and there's no post-start
+/// accept primitive wired for the responder. That means the
+/// fix's "attempt direct; fall back on failure" control flow
+/// is exactly the path we exercise.
+///
+/// Under the old bug: `punches_succeeded == 1` (wrongly — the
+///   punch was never actually used).
+/// Under the fix:     `punches_succeeded == 0`, `relay_fallbacks
+///   == 1` (honest: punch ack landed, direct handshake didn't,
+///   relay fallback was taken).
+///
+/// The counter behavior cleanly distinguishes the two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connect_direct_does_not_record_punch_success_when_direct_handshake_fails() {
+    use net::adapter::net::traversal::classify::NatClass;
+
+    let (a, r, b, _x) = punch_topology().await;
+
+    // Force both sides to advertise `Cone` so the matrix picks
+    // SinglePunch. Reclassify first (so reflex/bind are populated
+    // from probes), then overwrite the class atomic — the
+    // announce below carries the overwritten value because the
+    // nat tag is read from the atomic at announce time.
+    a.reclassify_nat().await;
+    b.reclassify_nat().await;
+    a.force_nat_class_for_test(NatClass::Cone);
+    b.force_nat_class_for_test(NatClass::Cone);
+
+    a.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("A announce");
+    b.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("B announce");
+
+    let a_for_poll = a.clone();
+    let b_id = b.node_id();
+    let b_bind = b.local_addr();
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            a_for_poll.peer_reflex_addr(b_id) == Some(b_bind)
+                && a_for_poll.peer_nat_class(b_id) == NatClass::Cone
+        })
+        .await,
+        "A should see B's Cone class + reflex",
+    );
+
+    let before = a.traversal_stats();
+    let b_pub = *b.public_key();
+    let session_id = a
+        .connect_direct(b_id, &b_pub, r.node_id())
+        .await
+        .expect("connect_direct should still return Ok via the relay fallback");
+    assert_eq!(session_id, b_id);
+
+    let after = a.traversal_stats();
+
+    assert_eq!(
+        after.punches_attempted,
+        before.punches_attempted + 1,
+        "Cone×Cone should attempt a punch",
+    );
+    // Load-bearing. Under the old bug this was
+    // `before.punches_succeeded + 1` because the fix was bypassed
+    // — the counter got bumped even though the data plane
+    // stayed on the relay.
+    assert_eq!(
+        after.punches_succeeded, before.punches_succeeded,
+        "direct handshake on the punched path did not land — \
+         punches_succeeded must NOT increment. Under the pre-fix bug \
+         this counter would wrongly be +1 and the caller would think \
+         it had a direct session when in fact the session runs over \
+         the relay.",
+    );
+    assert_eq!(
+        after.relay_fallbacks,
+        before.relay_fallbacks + 1,
+        "failed direct handshake on the punched path must fall back \
+         to relay and bump relay_fallbacks",
+    );
+
+    // And the session's transport is R's addr (relay path),
+    // matching relay_fallbacks being what actually happened.
+    assert_eq!(
+        a.peer_addr(b_id),
+        Some(r.local_addr()),
+        "session transport should be R's address — the relay path \
+         that the fallback established",
+    );
+}
