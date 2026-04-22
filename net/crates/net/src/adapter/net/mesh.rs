@@ -5147,8 +5147,16 @@ impl MeshNode {
                 // is the only way to relay. Fail fast if the
                 // caller's coordinator isn't reachable — there
                 // is no viable fallback in this branch.
-                self.traversal_stats.record_relay_fallback();
+                //
+                // Stats note: resolve the coordinator *before*
+                // recording the relay fallback, so a missing
+                // coordinator returns `PeerNotReachable` cleanly
+                // without inflating the fallback counter with
+                // calls where no traversal attempt actually
+                // happened. Same ordering invariant as the
+                // SinglePunch branch below (cubic P2).
                 let coord = coordinator_addr()?;
+                self.traversal_stats.record_relay_fallback();
                 connect_via_coordinator(coord).await
             }
             PairAction::SinglePunch => {

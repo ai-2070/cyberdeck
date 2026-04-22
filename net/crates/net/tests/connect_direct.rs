@@ -515,6 +515,101 @@ async fn connect_direct_upgrades_session_to_punched_path_on_success() {
     );
 }
 
+/// Helper: build A + B with a forced pair-action classification
+/// and an unreachable-coordinator id. Returns
+/// `(a, b_id, b_pubkey, bogus_coord_id)`.
+async fn punch_topology_forced(
+    a_class: net::adapter::net::traversal::classify::NatClass,
+    b_class: net::adapter::net::traversal::classify::NatClass,
+) -> (Arc<MeshNode>, u64, [u8; 32], u64) {
+    let (a, _r, b, _x) = punch_topology().await;
+    a.reclassify_nat().await;
+    b.reclassify_nat().await;
+    a.force_nat_class_for_test(a_class);
+    b.force_nat_class_for_test(b_class);
+    a.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("A announce");
+    b.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("B announce");
+
+    let a_for_poll = a.clone();
+    let b_id = b.node_id();
+    let b_bind = b.local_addr();
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            a_for_poll.peer_reflex_addr(b_id) == Some(b_bind)
+                && a_for_poll.peer_nat_class(b_id) == b_class
+        })
+        .await,
+        "A should see B's {b_class:?} class + reflex",
+    );
+
+    (a, b_id, *b.public_key(), 0xDEAD_C0DE_CAFE_BABE)
+}
+
+/// Regression test for a cubic-flagged P2 bug on the SkipPunch
+/// branch: `record_relay_fallback()` used to fire *before*
+/// `coordinator_addr()?` resolved. On a missing-coordinator
+/// fast-fail, no traversal attempt actually happened, but the
+/// counter had already been bumped — inflating the "on relay"
+/// numbers operators use to judge NAT-traversal effectiveness.
+/// The fix resolves the coordinator first; stats only move
+/// when something meaningful happened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skip_punch_fast_fail_on_missing_coordinator_does_not_bump_stats() {
+    use net::adapter::net::traversal::classify::NatClass;
+
+    let (a, b_id, b_pub, bogus) =
+        punch_topology_forced(NatClass::Symmetric, NatClass::Symmetric).await;
+
+    let before = a.traversal_stats();
+    let err = a
+        .connect_direct(b_id, &b_pub, bogus)
+        .await
+        .expect_err("SkipPunch with unreachable coordinator must fail fast");
+    match err {
+        TraversalError::PeerNotReachable => {}
+        other => panic!("expected PeerNotReachable, got {other:?}"),
+    }
+    let after = a.traversal_stats();
+    assert_eq!(
+        after, before,
+        "fast-fail on missing coordinator must not bump any \
+         traversal stats — the pre-fix ordering bug had \
+         `relay_fallbacks` bumped before coordinator resolution",
+    );
+}
+
+/// Complement on the SinglePunch branch: a Cone × Cone pair
+/// with a bogus coordinator must also fail fast with no stats
+/// changes. Cubic's original complaint was specifically about
+/// this branch (they referenced `punches_attempted` before
+/// `coordinator_addr()` resolution); verified fixed here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn single_punch_fast_fail_on_missing_coordinator_does_not_bump_stats() {
+    use net::adapter::net::traversal::classify::NatClass;
+
+    let (a, b_id, b_pub, bogus) = punch_topology_forced(NatClass::Cone, NatClass::Cone).await;
+
+    let before = a.traversal_stats();
+    let err = a
+        .connect_direct(b_id, &b_pub, bogus)
+        .await
+        .expect_err("SinglePunch with unreachable coordinator must fail fast");
+    match err {
+        TraversalError::PeerNotReachable => {}
+        other => panic!("expected PeerNotReachable, got {other:?}"),
+    }
+    let after = a.traversal_stats();
+    assert_eq!(
+        after, before,
+        "fast-fail on missing coordinator must not bump \
+         `punches_attempted` nor `relay_fallbacks`",
+    );
+}
+
 /// Regression test for a cubic-flagged P1 bug: the
 /// `connect_via_coordinator` helper short-circuited on any
 /// existing peer-map entry, so a second `connect_direct` call
