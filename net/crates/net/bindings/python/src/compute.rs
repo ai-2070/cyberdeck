@@ -408,8 +408,11 @@ impl PyDaemonRuntime {
         // closure so the closure's Fn bound is satisfied without
         // borrowing `self`.
         //
-        // On the failure path below (NoopBridge) we log and
-        // fall back — same safety argument as the NAPI layer.
+        // On the failure path below (`ReconstructionErrorBridge`) we
+        // log and return a bridge that raises a typed error on
+        // `restore` / `process`, so a migration through a broken
+        // factory fails visibly rather than silently swallowing
+        // events — same approach as the NAPI layer.
         let factories_for_closure = self.factories.clone();
         let kind_for_closure = kind.clone();
         if let Err(e) = self.inner.register_factory(&kind, move || {
@@ -664,10 +667,21 @@ impl PyDaemonRuntime {
     ) -> PyResult<PyMigrationHandle> {
         let mut sdk_opts = MigrationOpts::default();
         if let Some(v) = opts.get_item("transport_identity")? {
-            sdk_opts.transport_identity = v.extract()?;
+            // Route the conversion error through `daemon_err` so an
+            // invalid value (e.g. a string instead of a bool) raises
+            // a `daemon:`-prefixed error that the SDK side classifies
+            // as `DaemonError`, rather than a raw PyO3 TypeError that
+            // bypasses the typed-error convention.
+            sdk_opts.transport_identity = v
+                .extract()
+                .map_err(|e| daemon_err(format!("transport_identity must be bool: {e}")))?;
         }
         if let Some(v) = opts.get_item("retry_not_ready_ms")? {
-            let ms: u64 = v.extract()?;
+            // Same prefix-preservation rationale as the
+            // `transport_identity` branch above.
+            let ms: u64 = v.extract().map_err(|e| {
+                daemon_err(format!("retry_not_ready_ms must be non-negative int: {e}"))
+            })?;
             sdk_opts.retry_not_ready = if ms == 0 {
                 None
             } else {
@@ -1112,8 +1126,9 @@ fn build_bridge_inline(
 /// entry). Used by the SDK kind-factory closure for
 /// migration-target reconstruction. Acquires the GIL via
 /// `Python::attach`, calls the Python factory, extracts methods,
-/// and returns a bridge — or a no-op fallback on any failure
-/// (migrated-in daemons can't reliably panic the whole runtime).
+/// and returns a bridge — or a `ReconstructionErrorBridge` on any
+/// failure so the next `restore` / `process` raises a typed error
+/// rather than silently swallowing events.
 fn build_bridge_from_factory(
     factories: &DashMap<String, Py<PyAny>>,
     kind: &str,
@@ -1121,10 +1136,9 @@ fn build_bridge_from_factory(
     let factory_obj = match factories.get(kind) {
         Some(entry) => Python::attach(|py| entry.clone_ref(py)),
         None => {
-            eprintln!(
-                "build_bridge_from_factory: no factory for kind '{kind}'; returning NoopBridge"
-            );
-            return Box::new(NoopBridge::new(kind.to_string()));
+            let reason = "no factory registered for this kind".to_string();
+            eprintln!("build_bridge_from_factory: kind '{kind}': {reason}");
+            return Box::new(ReconstructionErrorBridge::new(kind.to_string(), reason));
         }
     };
 
@@ -1132,19 +1146,17 @@ fn build_bridge_from_factory(
         let instance = match factory_obj.call0(py) {
             Ok(i) => i,
             Err(e) => {
-                eprintln!(
-                    "build_bridge_from_factory: factory for kind '{kind}' raised: {e}; falling back to NoopBridge"
-                );
-                return Box::new(NoopBridge::new(kind.to_string()));
+                let reason = format!("Python factory raised: {e}");
+                eprintln!("build_bridge_from_factory: kind '{kind}': {reason}");
+                return Box::new(ReconstructionErrorBridge::new(kind.to_string(), reason));
             }
         };
         let process = match instance.getattr(py, "process") {
             Ok(f) => f,
             Err(e) => {
-                eprintln!(
-                    "build_bridge_from_factory: kind '{kind}' daemon has no `process`: {e}; falling back to NoopBridge"
-                );
-                return Box::new(NoopBridge::new(kind.to_string()));
+                let reason = format!("factory instance has no `process` attribute: {e}");
+                eprintln!("build_bridge_from_factory: kind '{kind}': {reason}");
+                return Box::new(ReconstructionErrorBridge::new(kind.to_string(), reason));
             }
         };
         let snapshot = match instance.getattr(py, "snapshot") {
@@ -1165,21 +1177,52 @@ fn build_bridge_from_factory(
 }
 
 // =========================================================================
-// NoopBridge — migration-target fallback when the Python factory
-// can't be reached or its return value is malformed.
+// ReconstructionErrorBridge — migration-target fallback when the
+// Python factory can't be reached or its return value is malformed.
 // =========================================================================
 
-struct NoopBridge {
+/// Fallback `MeshDaemon` used when `build_bridge_from_factory`
+/// can't produce a real `PyDaemonBridge` (factory missing from the
+/// registry, Python factory raised, instance lacks `process`, etc.).
+///
+/// **Why loud, not silent.** The previous implementation
+/// (`NoopBridge`) returned `Ok(vec![])` from `process`, which made
+/// migrations appear to succeed on the target even though every
+/// event the daemon received was silently dropped. Operators saw
+/// "migration completed" alongside vanishing event throughput and
+/// no diagnostic. This bridge instead:
+///
+/// - Returns `CoreDaemonError::RestoreFailed` from `restore`, so
+///   the migration's restore phase fails visibly with a typed
+///   error carrying the underlying reason.
+/// - Returns `CoreDaemonError::ProcessFailed` from every `process`
+///   call, so stateless migrations (where `restore` isn't
+///   exercised) still surface a failure on the first event.
+///
+/// Mirrors the same fix applied to the NAPI bindings — see
+/// `bindings/node/src/compute.rs` for the Node-side version.
+struct ReconstructionErrorBridge {
     name: String,
+    reason: String,
 }
 
-impl NoopBridge {
-    fn new(name: String) -> Self {
-        Self { name }
+impl ReconstructionErrorBridge {
+    fn new(name: String, reason: impl Into<String>) -> Self {
+        Self {
+            name,
+            reason: reason.into(),
+        }
+    }
+
+    fn err_msg(&self, op: &str) -> String {
+        format!(
+            "reconstruction failed for daemon kind '{}' on {}: {}",
+            self.name, op, self.reason,
+        )
     }
 }
 
-impl MeshDaemon for NoopBridge {
+impl MeshDaemon for ReconstructionErrorBridge {
     fn name(&self) -> &str {
         &self.name
     }
@@ -1192,6 +1235,95 @@ impl MeshDaemon for NoopBridge {
         &mut self,
         _event: &CausalEvent,
     ) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
-        Ok(Vec::new())
+        Err(CoreDaemonError::ProcessFailed(self.err_msg("process")))
+    }
+
+    fn restore(&mut self, _state: Bytes) -> std::result::Result<(), CoreDaemonError> {
+        Err(CoreDaemonError::RestoreFailed(self.err_msg("restore")))
+    }
+}
+
+// =========================================================================
+// Tests
+// =========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: migration-target reconstruction fallback must fail
+    // loudly, never silently. Before this fix the PyO3 layer installed
+    // a `NoopBridge` whose `process` returned `Ok(vec![])`, so a
+    // migration could "succeed" on a target where the Python factory
+    // was missing / raised / lacked `process` — the daemon would then
+    // silently swallow every event with no diagnostic. The replacement
+    // `ReconstructionErrorBridge` returns typed `RestoreFailed` from
+    // `restore` and `ProcessFailed` from `process`, each carrying the
+    // underlying reason, so the migration fails visibly at either the
+    // restore phase or the first event.
+    //
+    // Testing the bridge directly (without a real Python interpreter
+    // spawn / migration run) proves the contract at the bridge layer.
+    // The Python-side integration test in `tests/test_compute.py`
+    // covers the end-to-end path via registered factories.
+
+    #[test]
+    fn reconstruction_error_bridge_process_returns_typed_error() {
+        let mut bridge = ReconstructionErrorBridge::new(
+            "echo".to_string(),
+            "Python factory raised: AttributeError: 'NoneType' object has no attribute 'process'",
+        );
+        let event = CausalEvent {
+            link: ::net::adapter::net::state::causal::CausalLink {
+                origin_hash: 0xdead_beef,
+                horizon_encoded: 0,
+                sequence: 1,
+                parent_hash: 0,
+            },
+            payload: bytes::Bytes::from_static(b"x"),
+            received_at: 0,
+        };
+
+        let result = bridge.process(&event);
+        match result {
+            Err(CoreDaemonError::ProcessFailed(msg)) => {
+                assert!(msg.contains("echo"), "missing kind: {msg}");
+                assert!(
+                    msg.contains("AttributeError"),
+                    "missing underlying reason: {msg}",
+                );
+                assert!(msg.contains("process"), "missing op label: {msg}");
+            }
+            Err(other) => panic!("expected ProcessFailed, got {other:?}"),
+            Ok(outputs) => panic!(
+                "silent-noop regression: ReconstructionErrorBridge must never return Ok; got {} outputs",
+                outputs.len(),
+            ),
+        }
+    }
+
+    #[test]
+    fn reconstruction_error_bridge_restore_returns_typed_error() {
+        let mut bridge = ReconstructionErrorBridge::new(
+            "counter".to_string(),
+            "no factory registered for this kind",
+        );
+        let state = bytes::Bytes::from_static(&[0u8; 16]);
+
+        let result = bridge.restore(state);
+        match result {
+            Err(CoreDaemonError::RestoreFailed(msg)) => {
+                assert!(msg.contains("counter"), "missing kind: {msg}");
+                assert!(
+                    msg.contains("no factory registered"),
+                    "missing underlying reason: {msg}",
+                );
+                assert!(msg.contains("restore"), "missing op label: {msg}");
+            }
+            Err(other) => panic!("expected RestoreFailed, got {other:?}"),
+            Ok(()) => panic!(
+                "silent-noop regression: ReconstructionErrorBridge::restore must never return Ok",
+            ),
+        }
     }
 }

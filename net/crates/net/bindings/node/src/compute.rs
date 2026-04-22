@@ -430,9 +430,10 @@ impl DaemonRuntime {
         // into JS synchronously via the TSFN + mpsc pattern: fires
         // the factory on the Node main thread, waits for the
         // `DaemonBridgeTsfns` to come back, wraps them in an
-        // `EventDispatchBridge`. Falls back to `NoopBridge` if the
-        // JS call throws or the channel drops — callers see a
-        // daemon that produces no outputs rather than a crash.
+        // `EventDispatchBridge`. Falls back to `ReconstructionErrorBridge`
+        // if the JS call throws or the channel drops — the next `restore`
+        // / `process` returns a typed error so the migration fails
+        // visibly rather than silently "succeeding" with a noop daemon.
         //
         // The SDK closure owns the TSFN; NAPI only tracks the
         // kind string for fast spawn-time lookup.
@@ -534,7 +535,10 @@ impl DaemonRuntime {
             .as_ref()
             .map(|c| c.callback_timeout())
             .unwrap_or(Duration::from_millis(DEFAULT_CALLBACK_TIMEOUT_MS as u64));
-        let sdk_config = match config { Some(c) => c.into_core()?, None => DaemonHostConfig::default() };
+        let sdk_config = match config {
+            Some(c) => c.into_core()?,
+            None => DaemonHostConfig::default(),
+        };
         let runtime = self.inner.clone();
         let kind_label = kind.clone();
 
@@ -551,11 +555,16 @@ impl DaemonRuntime {
         // because the factory TSFN's return value (a JS daemon
         // object with method closures) can't be reconstructed from
         // Rust without re-running the TS factory. Sub-step 4+ will
-        // address this; for now hand out NoopBridges so the core
-        // registry has *some* factory — migrations into this node
-        // will fail downstream until the full path lands.
-        let kind_factory =
-            move || -> Box<dyn MeshDaemon> { Box::new(NoopBridge::new(kind_label.clone())) };
+        // address this; for now hand out a `ReconstructionErrorBridge`
+        // so that *if* a migration lands here before the real path is
+        // wired up, the failure is visible (first `restore` / `process`
+        // returns a typed error) rather than a silent-noop "success."
+        let kind_factory = move || -> Box<dyn MeshDaemon> {
+            Box::new(ReconstructionErrorBridge::new(
+                kind_label.clone(),
+                "local-spawn path does not yet re-run the JS factory; register the kind via DaemonRuntime.registerFactory to enable migration-target reconstruction",
+            ))
+        };
 
         env.spawn_future(async move {
             runtime
@@ -661,7 +670,10 @@ impl DaemonRuntime {
             .as_ref()
             .map(|c| c.callback_timeout())
             .unwrap_or(Duration::from_millis(DEFAULT_CALLBACK_TIMEOUT_MS as u64));
-        let sdk_config = match config { Some(c) => c.into_core()?, None => DaemonHostConfig::default() };
+        let sdk_config = match config {
+            Some(c) => c.into_core()?,
+            None => DaemonHostConfig::default(),
+        };
         let runtime = self.inner.clone();
         let kind_label = kind.clone();
 
@@ -673,10 +685,15 @@ impl DaemonRuntime {
             callback_timeout,
         });
 
-        // Same NoopBridge fallback for migration-target reconstruction
-        // as `spawn` — see comment there for why.
-        let kind_factory =
-            move || -> Box<dyn MeshDaemon> { Box::new(NoopBridge::new(kind_label.clone())) };
+        // Same `ReconstructionErrorBridge` fallback for migration-target
+        // reconstruction as `spawn` — see comment there for why loud
+        // over silent.
+        let kind_factory = move || -> Box<dyn MeshDaemon> {
+            Box::new(ReconstructionErrorBridge::new(
+                kind_label.clone(),
+                "spawn-from-snapshot path does not yet re-run the JS factory; register the kind via DaemonRuntime.registerFactory to enable migration-target reconstruction",
+            ))
+        };
 
         env.spawn_future(async move {
             runtime
@@ -868,7 +885,10 @@ impl DaemonRuntime {
         origin_hash: u32,
         config: Option<DaemonHostConfigJs>,
     ) -> Result<()> {
-        let sdk_config = match config { Some(c) => c.into_core()?, None => DaemonHostConfig::default() };
+        let sdk_config = match config {
+            Some(c) => c.into_core()?,
+            None => DaemonHostConfig::default(),
+        };
         self.inner
             .expect_migration(&kind, origin_hash, sdk_config)
             .map_err(|e| daemon_err(e.to_string()))
@@ -892,7 +912,10 @@ impl DaemonRuntime {
         config: Option<DaemonHostConfigJs>,
     ) -> Result<()> {
         let sdk_identity = identity.to_sdk_identity();
-        let sdk_config = match config { Some(c) => c.into_core()?, None => DaemonHostConfig::default() };
+        let sdk_config = match config {
+            Some(c) => c.into_core()?,
+            None => DaemonHostConfig::default(),
+        };
         self.inner
             .register_migration_target_identity(&kind, sdk_identity, sdk_config)
             .map_err(|e| daemon_err(e.to_string()))
@@ -1142,7 +1165,8 @@ impl DaemonHostConfigJs {
     /// time and still hand the config to the core conversion.
     pub(crate) fn callback_timeout(&self) -> Duration {
         Duration::from_millis(
-            self.callback_timeout_ms.unwrap_or(DEFAULT_CALLBACK_TIMEOUT_MS) as u64,
+            self.callback_timeout_ms
+                .unwrap_or(DEFAULT_CALLBACK_TIMEOUT_MS) as u64,
         )
     }
 }
@@ -1442,29 +1466,53 @@ impl MeshDaemon for EventDispatchBridge {
 }
 
 // =========================================================================
-// NoopBridge — fallback `MeshDaemon` for migration-target reconstruction.
+// ReconstructionErrorBridge — loud-failure fallback for factory errors
 // =========================================================================
 
-/// Placeholder bridge used as the core factory-registry's
-/// "kind-factory" for NAPI-spawned daemons. The core registry
-/// requires a `Fn() -> Box<dyn MeshDaemon>` factory so a migration
-/// target can reconstruct the daemon from `origin_hash` alone;
-/// faithfully implementing that for NAPI requires re-running the
-/// TS factory on the Rust side (sub-step 4+ work). Until then
-/// `NoopBridge` stands in — migrations into a TS node's daemon
-/// will fail downstream at the first event delivery, but the
-/// lifecycle / registry machinery stays consistent.
-struct NoopBridge {
+/// Fallback `MeshDaemon` used when a migration-target factory
+/// reconstruction fails (JS factory threw, TSFN timed out, channel
+/// disconnected, local-spawn kind factory not yet implemented).
+///
+/// **Why loud, not silent.** The previous implementation
+/// (`NoopBridge`) returned `Ok(vec![])` from `process`, which made
+/// migrations appear to succeed on the target even though the
+/// daemon's actual work was not running. Operators saw "migration
+/// completed" alongside vanishing event throughput and no error.
+/// This bridge instead:
+///
+/// - Returns `CoreDaemonError::RestoreFailed` from `restore`, so
+///   the migration's restore phase fails visibly with a typed error
+///   carrying the underlying reason.
+/// - Returns `CoreDaemonError::ProcessFailed` from every `process`
+///   call, so even stateless migrations (where `restore` is not
+///   exercised) produce a visible failure on the first event.
+///
+/// The `reason` is plumbed from the specific `build_bridge_from_tsfn`
+/// failure branch (enqueue / throw / timeout / disconnect) or the
+/// local-spawn "not yet wired" placeholder, so diagnostic output is
+/// precise about why reconstruction failed.
+struct ReconstructionErrorBridge {
     name: String,
+    reason: String,
 }
 
-impl NoopBridge {
-    fn new(name: String) -> Self {
-        Self { name }
+impl ReconstructionErrorBridge {
+    fn new(name: String, reason: impl Into<String>) -> Self {
+        Self {
+            name,
+            reason: reason.into(),
+        }
+    }
+
+    fn err_msg(&self, op: &str) -> String {
+        format!(
+            "reconstruction failed for daemon kind '{}' on {}: {}",
+            self.name, op, self.reason,
+        )
     }
 }
 
-impl MeshDaemon for NoopBridge {
+impl MeshDaemon for ReconstructionErrorBridge {
     fn name(&self) -> &str {
         &self.name
     }
@@ -1477,7 +1525,11 @@ impl MeshDaemon for NoopBridge {
         &mut self,
         _event: &CausalEvent,
     ) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
-        Ok(Vec::new())
+        Err(CoreDaemonError::ProcessFailed(self.err_msg("process")))
+    }
+
+    fn restore(&mut self, _state: Bytes) -> std::result::Result<(), CoreDaemonError> {
+        Err(CoreDaemonError::RestoreFailed(self.err_msg("restore")))
     }
 }
 
@@ -1495,17 +1547,22 @@ impl MeshDaemon for NoopBridge {
 /// the Node main thread) until the TSFN callback sends the
 /// extracted TSFNs back over the mpsc channel.
 ///
-/// Falls back to [`NoopBridge`] if:
+/// Falls back to [`ReconstructionErrorBridge`] — **never**
+/// `NoopBridge` — if:
 /// - The TSFN enqueue fails (runtime shutting down)
 /// - The JS factory throws
 /// - The user's factory returned a Promise (async), which lacks
 ///   the expected `process` property
+/// - The TSFN callback does not respond within the bounded wait
 /// - The mpsc receiver drops
 ///
-/// The fallback is intentional — a migrated-in daemon shouldn't
-/// crash the target runtime just because the JS side
-/// mis-registered. An `eprintln!` trail points operators at the
-/// failure.
+/// The bridge's `restore` / `process` return typed
+/// `CoreDaemonError::{RestoreFailed, ProcessFailed}` carrying the
+/// underlying reason, so a migration that reconstructs through a
+/// broken factory fails visibly (either at the restore phase or
+/// on the first event), rather than silently "succeeding" with a
+/// daemon that eats every event it receives. The `eprintln!` trail
+/// preserves the operator-visible breadcrumb.
 fn build_bridge_from_tsfn(factory: Arc<FactoryTsfn>, kind: String) -> Box<dyn MeshDaemon> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<DaemonBridgeTsfns>>(1);
     let status = factory.call_with_return_value(
@@ -1517,15 +1574,13 @@ fn build_bridge_from_tsfn(factory: Arc<FactoryTsfn>, kind: String) -> Box<dyn Me
         },
     );
     if status != napi::Status::Ok {
-        eprintln!(
-            "build_bridge_from_tsfn: TSFN enqueue failed for kind '{kind}': {status:?}; falling back to NoopBridge"
-        );
-        return Box::new(NoopBridge::new(kind));
+        let reason = format!("TSFN enqueue failed: {status:?}");
+        eprintln!("build_bridge_from_tsfn: kind '{kind}': {reason}");
+        return Box::new(ReconstructionErrorBridge::new(kind, reason));
     }
     // Bounded wait — same deadlock rationale as `EventDispatchBridge::process`.
-    // This path runs on a migration target during reconstruction; if the
-    // Node main thread is wedged we want `NoopBridge` (with an `eprintln!`
-    // trail) rather than a silent hang.
+    // If the Node main thread is wedged we want the migration to fail
+    // loudly (via `ReconstructionErrorBridge`) rather than hang forever.
     let factory_timeout = Duration::from_millis(DEFAULT_CALLBACK_TIMEOUT_MS as u64);
     match rx.recv_timeout(factory_timeout) {
         Ok(Ok(tsfns)) => Box::new(EventDispatchBridge {
@@ -1536,23 +1591,110 @@ fn build_bridge_from_tsfn(factory: Arc<FactoryTsfn>, kind: String) -> Box<dyn Me
             callback_timeout: factory_timeout,
         }),
         Ok(Err(e)) => {
-            eprintln!(
-                "build_bridge_from_tsfn: JS factory for kind '{kind}' failed: {e}; falling back to NoopBridge"
-            );
-            Box::new(NoopBridge::new(kind))
+            let reason = format!("JS factory threw: {e}");
+            eprintln!("build_bridge_from_tsfn: kind '{kind}': {reason}");
+            Box::new(ReconstructionErrorBridge::new(kind, reason))
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            eprintln!(
-                "build_bridge_from_tsfn: TSFN factory for kind '{kind}' did not respond within {} ms; falling back to NoopBridge",
+            let reason = format!(
+                "TSFN factory did not respond within {} ms",
                 factory_timeout.as_millis(),
             );
-            Box::new(NoopBridge::new(kind))
+            eprintln!("build_bridge_from_tsfn: kind '{kind}': {reason}");
+            Box::new(ReconstructionErrorBridge::new(kind, reason))
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            eprintln!(
-                "build_bridge_from_tsfn: channel disconnected for kind '{kind}'; falling back to NoopBridge"
-            );
-            Box::new(NoopBridge::new(kind))
+            let reason = "TSFN channel disconnected".to_string();
+            eprintln!("build_bridge_from_tsfn: kind '{kind}': {reason}");
+            Box::new(ReconstructionErrorBridge::new(kind, reason))
+        }
+    }
+}
+
+// =========================================================================
+// Tests
+// =========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: migration-target reconstruction fallback must fail
+    // loudly, never silently. Before this fix the NAPI layer installed
+    // a `NoopBridge` whose `process` returned `Ok(vec![])`, so a
+    // migration could "succeed" on a target where the JS factory
+    // threw / returned a Promise / timed out — the daemon would then
+    // silently swallow every event with no diagnostic. The replacement
+    // `ReconstructionErrorBridge` returns typed `RestoreFailed` from
+    // `restore` and typed `ProcessFailed` from `process`, each
+    // carrying the underlying reason, so the migration fails visibly
+    // at either the restore phase or the first event.
+    //
+    // Testing the bridge directly (without spinning up a real
+    // migration) proves the contract at the bridge layer. The TS-side
+    // integration test in `test/compute.test.ts` (existing
+    // target-unavailable coverage) guards the end-to-end path.
+
+    #[test]
+    fn reconstruction_error_bridge_process_returns_typed_error() {
+        let mut bridge = ReconstructionErrorBridge::new(
+            "echo".to_string(),
+            "JS factory threw: TypeError: process is not a function",
+        );
+        let event = CausalEvent {
+            link: ::net::adapter::net::state::causal::CausalLink {
+                origin_hash: 0xdead_beef,
+                horizon_encoded: 0,
+                sequence: 1,
+                parent_hash: 0,
+            },
+            payload: bytes::Bytes::from_static(b"x"),
+            received_at: 0,
+        };
+
+        let result = bridge.process(&event);
+        match result {
+            Err(CoreDaemonError::ProcessFailed(msg)) => {
+                // Message must identify kind + the underlying reason,
+                // so an operator staring at logs can diagnose without
+                // cross-referencing source lines.
+                assert!(msg.contains("echo"), "missing kind: {msg}");
+                assert!(
+                    msg.contains("TypeError: process is not a function"),
+                    "missing underlying reason: {msg}",
+                );
+                assert!(msg.contains("process"), "missing op label: {msg}");
+            }
+            Err(other) => panic!("expected ProcessFailed, got {other:?}"),
+            Ok(outputs) => panic!(
+                "silent-noop regression: ReconstructionErrorBridge must never return Ok; got {} outputs",
+                outputs.len(),
+            ),
+        }
+    }
+
+    #[test]
+    fn reconstruction_error_bridge_restore_returns_typed_error() {
+        let mut bridge = ReconstructionErrorBridge::new(
+            "counter".to_string(),
+            "TSFN factory did not respond within 60000 ms",
+        );
+        let state = bytes::Bytes::from_static(&[0u8; 16]);
+
+        let result = bridge.restore(state);
+        match result {
+            Err(CoreDaemonError::RestoreFailed(msg)) => {
+                assert!(msg.contains("counter"), "missing kind: {msg}");
+                assert!(
+                    msg.contains("did not respond within 60000 ms"),
+                    "missing underlying reason: {msg}",
+                );
+                assert!(msg.contains("restore"), "missing op label: {msg}");
+            }
+            Err(other) => panic!("expected RestoreFailed, got {other:?}"),
+            Ok(()) => panic!(
+                "silent-noop regression: ReconstructionErrorBridge::restore must never return Ok",
+            ),
         }
     }
 }

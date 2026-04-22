@@ -143,8 +143,7 @@ impl GroupHostConfigJs {
     pub(crate) fn into_core(self) -> Result<DaemonHostConfig> {
         let mut cfg = DaemonHostConfig::default();
         if let Some(v) = self.auto_snapshot_interval {
-            cfg.auto_snapshot_interval =
-                group_bigint_u64("hostConfig.autoSnapshotInterval", v)?;
+            cfg.auto_snapshot_interval = group_bigint_u64("hostConfig.autoSnapshotInterval", v)?;
         }
         if let Some(n) = self.max_log_entries {
             cfg.max_log_entries = n;
@@ -313,7 +312,10 @@ pub(crate) async fn spawn_replica_group(
         replica_count: config.replica_count as u8,
         group_seed: seed,
         lb_strategy: config.lb_strategy.into(),
-        host_config: match config.host_config { Some(h) => h.into_core()?, None => DaemonHostConfig::default() },
+        host_config: match config.host_config {
+            Some(h) => h.into_core()?,
+            None => DaemonHostConfig::default(),
+        },
     };
     // `SdkReplicaGroup::spawn` is a sync function that invokes the
     // factory inline. Running it on this tokio worker (rather than
@@ -336,7 +338,10 @@ pub(crate) async fn spawn_fork_group(
     let cfg = SdkForkGroupConfig {
         fork_count: config.fork_count as u8,
         lb_strategy: config.lb_strategy.into(),
-        host_config: match config.host_config { Some(h) => h.into_core()?, None => DaemonHostConfig::default() },
+        host_config: match config.host_config {
+            Some(h) => h.into_core()?,
+            None => DaemonHostConfig::default(),
+        },
     };
     let group =
         SdkForkGroup::fork(&runtime, &kind, parent_origin, fork_seq, cfg).map_err(group_err)?;
@@ -355,7 +360,10 @@ pub(crate) async fn spawn_standby_group(
     let cfg = SdkStandbyGroupConfig {
         member_count: config.member_count as u8,
         group_seed: seed,
-        host_config: match config.host_config { Some(h) => h.into_core()?, None => DaemonHostConfig::default() },
+        host_config: match config.host_config {
+            Some(h) => h.into_core()?,
+            None => DaemonHostConfig::default(),
+        },
     };
     let group = SdkStandbyGroup::spawn(&runtime, &kind, cfg).map_err(group_err)?;
     Ok(StandbyGroup {

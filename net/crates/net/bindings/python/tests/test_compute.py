@@ -122,13 +122,22 @@ def test_shutdown_is_idempotent() -> None:
 def test_daemon_runtime_does_not_shut_down_underlying_mesh() -> None:
     # Shutting down the runtime tears down daemons + migration handler
     # but leaves the NetMesh alive. Caller owns the mesh lifecycle.
+    #
+    # Liveness check: exercise a real mesh operation (announce +
+    # find_peers self-match) rather than reading `node_id`, since
+    # the node_id is a derived identifier that would still be valid
+    # even if the underlying mesh runtime had been torn down.
     mesh = _mesh()
     rt = DaemonRuntime(mesh)
     try:
         rt.start()
         rt.shutdown()
-        # Mesh should still be usable after runtime shutdown.
-        assert mesh.node_id != 0
+        # Post-shutdown: the mesh still accepts capability
+        # announcements and self-indexes them, proving the
+        # capability subprotocol + local index are still wired up.
+        mesh.announce_capabilities({"tags": ["post-runtime-shutdown-probe"]})
+        peers = mesh.find_peers({"require_tags": ["post-runtime-shutdown-probe"]})
+        assert mesh.node_id in peers
     finally:
         mesh.shutdown()
 
@@ -497,12 +506,21 @@ def _mesh_pair() -> tuple[NetMesh, NetMesh]:
         except Exception as e:
             errors.append(e)
 
-    t = threading.Thread(target=_accept)
+    # `daemon=True` so a wedged accept thread doesn't block
+    # interpreter shutdown when a test fails or CI gets interrupted.
+    t = threading.Thread(target=_accept, daemon=True)
     t.start()
     # Small beat so the accept-side is primed before connect fires.
     time.sleep(0.05)
     a.connect(b_addr, b.public_key, b.node_id)
     t.join(timeout=5)
+    # `join(timeout=...)` silently returns when it times out —
+    # detect via `is_alive()` so a hung handshake fails the test
+    # with a clear message instead of masquerading as success.
+    if t.is_alive():
+        raise RuntimeError(
+            "mesh-pair handshake: accept thread still alive after 5 s timeout"
+        )
     if errors:
         raise errors[0]
     a.start()
@@ -585,6 +603,60 @@ def test_migration_phase_returns_none_for_unknown_origin() -> None:
     try:
         rt.start()
         assert rt.migration_phase(0xDEADBEEF) is None
+    finally:
+        rt.shutdown()
+        mesh.shutdown()
+
+
+# Regression: invalid `start_migration_with` opts must surface as
+# typed `DaemonError`, not a raw PyO3 `TypeError` / `ValueError`.
+# The previous implementation used `v.extract()?` which bypassed
+# the `daemon:`-prefix convention: callers doing
+# `except DaemonError` would silently miss the exception, and the
+# error message wouldn't route through the SDK's typed-error
+# classifier.
+def test_start_migration_with_invalid_transport_identity_raises_daemon_error() -> None:
+    mesh = _mesh()
+    rt = DaemonRuntime(mesh)
+    try:
+        rt.register_factory("counter", CounterDaemon)
+        rt.start()
+        ident = Identity.generate()
+        handle = rt.spawn("counter", ident)
+        with pytest.raises(DaemonError) as exc_info:
+            rt.start_migration_with(
+                handle.origin_hash,
+                mesh.node_id,
+                0x1234_5678_ABCD_0001,
+                # `"not-a-bool"` is the wrong type — must route through
+                # `daemon_err` rather than a raw PyO3 conversion error.
+                {"transport_identity": "not-a-bool"},
+            )
+        assert "transport_identity must be bool" in str(exc_info.value)
+    finally:
+        rt.shutdown()
+        mesh.shutdown()
+
+
+def test_start_migration_with_invalid_retry_not_ready_ms_raises_daemon_error() -> None:
+    mesh = _mesh()
+    rt = DaemonRuntime(mesh)
+    try:
+        rt.register_factory("counter", CounterDaemon)
+        rt.start()
+        ident = Identity.generate()
+        handle = rt.spawn("counter", ident)
+        with pytest.raises(DaemonError) as exc_info:
+            rt.start_migration_with(
+                handle.origin_hash,
+                mesh.node_id,
+                0x1234_5678_ABCD_0002,
+                # Negative int — `u64::extract()` rejects this; the
+                # fix routes the error through `daemon_err` so callers
+                # still see a prefixed `DaemonError`.
+                {"retry_not_ready_ms": -1},
+            )
+        assert "retry_not_ready_ms" in str(exc_info.value)
     finally:
         rt.shutdown()
         mesh.shutdown()

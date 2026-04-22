@@ -824,13 +824,19 @@ func TestInjectSyntheticPeer(mesh *MeshNode, nodeID uint64) {
 	if mesh == nil {
 		return
 	}
+	// Same TOCTOU guard as `NewDaemonRuntime`: hold the read lock
+	// across the Arc-clone so a concurrent `mesh.Shutdown()` can't
+	// free the native handle between the `mesh.handle` load and
+	// `net_mesh_arc_clone(h)`. Once the Arc is cloned it keeps the
+	// underlying object alive for the duration of this call.
 	mesh.mu.RLock()
 	h := mesh.handle
-	mesh.mu.RUnlock()
 	if h == nil {
+		mesh.mu.RUnlock()
 		return
 	}
 	arc := C.net_mesh_arc_clone(h)
+	mesh.mu.RUnlock()
 	if arc == nil {
 		return
 	}

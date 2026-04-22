@@ -901,13 +901,15 @@ describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', ()
     } catch (e) {
       expect(e).toBeInstanceOf(MigrationError);
       const err = e as MigrationError;
-      // Either target-unavailable (peer lookup) or identity-
-      // transport-failed (envelope seal). Both are terminal and
-      // both are typed MigrationErrors.
+      // Unknown target: either target-unavailable (peer lookup
+      // failed) or identity-transport-failed (envelope seal
+      // against missing peer X25519 pubkey). `state-failed`
+      // would indicate a snapshot/restore problem, which is
+      // unrelated to an unreachable target — rejecting it here
+      // keeps the test specific to the unknown-target guarantee.
       expect([
         'target-unavailable',
         'identity-transport-failed',
-        'state-failed',
       ]).toContain(err.kind);
     }
   });
@@ -969,7 +971,21 @@ describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', ()
     );
     // Don't await cancel — race with wait.
     const waitPromise = mig.wait();
-    await mig.cancel();
+    // `cancel` itself can race against the migration already
+    // having terminated (snapshot phase completed past the
+    // cancel point, orchestrator record removed, etc.). Either
+    // outcome is acceptable here; the `await waitPromise` below
+    // is what the test is actually probing. Swallow the
+    // already-terminated MigrationError from `cancel` so the
+    // test stays stable under that ordering.
+    try {
+      await mig.cancel();
+    } catch (e) {
+      // Tolerated only if it's the typed migration error.
+      if (!(e instanceof MigrationError)) {
+        throw e;
+      }
+    }
     try {
       await waitPromise;
       // Might resolve if the record raced past cancel; that's OK

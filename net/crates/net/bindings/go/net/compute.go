@@ -76,10 +76,25 @@ func NewDaemonRuntime(mesh *MeshNode) (*DaemonRuntime, error) {
 	if mesh == nil {
 		return nil, &DaemonError{Message: "mesh is nil"}
 	}
+
+	// Hold the mesh's read lock across the Arc-clone FFI calls.
+	//
+	// TOCTOU guard: releasing the lock after the `mesh.handle` load
+	// but before `net_mesh_arc_clone` would let a concurrent
+	// `mesh.Shutdown()` (which takes the write lock, frees the
+	// native handle, and nils `mesh.handle`) slip in between — the
+	// captured `meshHandle` local would then be a dangling pointer,
+	// and the Arc-clone would dereference freed memory.
+	//
+	// Once we've cloned the Arcs they keep the underlying object
+	// alive by refcount, so there's no need to hold the lock past
+	// the clones. `Shutdown` on another goroutine will simply wait
+	// for our read lock to release, which is a short, bounded window
+	// dominated by two Arc increments.
 	mesh.mu.RLock()
 	meshHandle := mesh.handle
-	mesh.mu.RUnlock()
 	if meshHandle == nil {
+		mesh.mu.RUnlock()
 		return nil, &DaemonError{Message: "mesh has been closed"}
 	}
 
@@ -88,9 +103,11 @@ func NewDaemonRuntime(mesh *MeshNode) (*DaemonRuntime, error) {
 	// them on the error path.
 	nodeArc := C.net_mesh_arc_clone(meshHandle)
 	if nodeArc == nil {
+		mesh.mu.RUnlock()
 		return nil, &DaemonError{Message: "failed to clone mesh Arc"}
 	}
 	ccArc := C.net_mesh_channel_configs_arc_clone(meshHandle)
+	mesh.mu.RUnlock()
 	if ccArc == nil {
 		C.net_mesh_arc_free(nodeArc)
 		return nil, &DaemonError{Message: "failed to clone channel configs Arc"}
