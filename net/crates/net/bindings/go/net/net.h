@@ -801,6 +801,94 @@ int                     net_compute_spawn_from_snapshot(
     net_compute_daemon_handle_t** out_handle,
     char** err_out);
 
+/* --- Migration (sub-step 4) ---
+ *
+ * Error messages from the migration surface use the prefix
+ * `migration: <kind>[: <detail>]` (written into the `err_out`
+ * CString) so the Go side can dispatch on the stable kind:
+ * `not-ready` | `factory-not-found` | `compute-not-supported` |
+ * `state-failed` | `already-migrating` | `identity-transport-failed` |
+ * `not-ready-timeout` | `daemon-not-found` | `target-unavailable` |
+ * `wrong-phase` | `snapshot-too-large`.
+ */
+
+typedef struct net_compute_migration_handle_s net_compute_migration_handle_t;
+
+/* Start a migration. `transport_identity`: 0 = skip envelope,
+ * non-zero = seal the daemon's keypair into the snapshot.
+ * `retry_not_ready_ms`: 0 disables retry; otherwise the source
+ * backs off + re-initiates on `NotReady` up to this budget. */
+int                     net_compute_start_migration(
+    net_compute_runtime_t* runtime,
+    uint32_t origin_hash,
+    uint64_t source_node,
+    uint64_t target_node,
+    uint8_t transport_identity,
+    uint64_t retry_not_ready_ms,
+    net_compute_migration_handle_t** out_handle,
+    char** err_out);
+
+/* Declare that a migration will land on this node for
+ * `origin_hash`. Uses the snapshot's envelope to supply the
+ * keypair. */
+int                     net_compute_expect_migration(
+    net_compute_runtime_t* runtime,
+    const char* kind_ptr,
+    size_t kind_len,
+    uint32_t origin_hash,
+    uint64_t auto_snapshot_interval,
+    uint32_t max_log_entries,
+    char** err_out);
+
+/* Register an identity for target-side restore when the source
+ * migrates without an envelope (transport_identity=0). */
+int                     net_compute_register_migration_target_identity(
+    net_compute_runtime_t* runtime,
+    const char* kind_ptr,
+    size_t kind_len,
+    const uint8_t* identity_seed,
+    uint64_t auto_snapshot_interval,
+    uint32_t max_log_entries,
+    char** err_out);
+
+/* Query the orchestrator phase for `origin_hash`. Returns NULL
+ * if no migration is in flight, else a heap-allocated CString
+ * the caller frees with `net_compute_free_cstring`. */
+char*                   net_compute_migration_phase(
+    net_compute_runtime_t* runtime,
+    uint32_t origin_hash);
+
+/* Free a migration handle. Does NOT cancel the migration. */
+void                    net_compute_migration_handle_free(
+    net_compute_migration_handle_t* handle);
+
+uint32_t                net_compute_migration_handle_origin_hash(
+    const net_compute_migration_handle_t* handle);
+uint64_t                net_compute_migration_handle_source_node(
+    const net_compute_migration_handle_t* handle);
+uint64_t                net_compute_migration_handle_target_node(
+    const net_compute_migration_handle_t* handle);
+
+/* Current phase or NULL (same semantics as
+ * `net_compute_migration_phase`). Caller frees non-NULL result. */
+char*                   net_compute_migration_handle_phase(
+    const net_compute_migration_handle_t* handle);
+
+/* Block until terminal state. 0 on `complete`; err_out carries
+ * `migration: <kind>` body on abort/failure. */
+int                     net_compute_migration_handle_wait(
+    net_compute_migration_handle_t* handle,
+    char** err_out);
+
+int                     net_compute_migration_handle_wait_with_timeout(
+    net_compute_migration_handle_t* handle,
+    uint64_t timeout_ms,
+    char** err_out);
+
+int                     net_compute_migration_handle_cancel(
+    net_compute_migration_handle_t* handle,
+    char** err_out);
+
 #ifdef __cplusplus
 }
 #endif

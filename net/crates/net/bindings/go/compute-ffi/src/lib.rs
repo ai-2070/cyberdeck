@@ -45,7 +45,10 @@ use net::adapter::net::compute::{DaemonError as CoreDaemonError, DaemonHostConfi
 use net::adapter::net::state::causal::CausalEvent;
 use net::adapter::net::MeshNode;
 use net_sdk::compute::{
-    DaemonHandle as SdkDaemonHandle, DaemonRuntime as SdkDaemonRuntime, StateSnapshot,
+    DaemonError as SdkDaemonError, DaemonHandle as SdkDaemonHandle,
+    DaemonRuntime as SdkDaemonRuntime, MigrationError as SdkMigrationError, MigrationFailureReason,
+    MigrationHandle as SdkMigrationHandle, MigrationOpts, MigrationPhase as CoreMigrationPhase,
+    StateSnapshot,
 };
 use net_sdk::mesh::Mesh as SdkMesh;
 use net_sdk::Identity as SdkIdentity;
@@ -64,6 +67,72 @@ pub const NET_COMPUTE_ERR_NULL: c_int = -1;
 pub const NET_COMPUTE_ERR_CALL_FAILED: c_int = -2;
 /// Kind already registered on `net_compute_register_factory`.
 pub const NET_COMPUTE_ERR_DUPLICATE_KIND: c_int = -3;
+
+// =========================================================================
+// Structured error formatter (mirrors NAPI / PyO3)
+// =========================================================================
+
+/// Format an SDK `DaemonError` into a stable machine-readable
+/// string for the Go side to parse. Migration failures get the
+/// `migration: <kind>[: detail]` prefix so `MigrationErrorKind`
+/// on the Go side can dispatch on the kind without regex parsing.
+/// Everything else falls through to the SDK's Display.
+///
+/// Matches the format used by `format_migration_failure_reason` /
+/// `format_migration_error` in the NAPI / Python bindings.
+fn format_sdk_error(e: &SdkDaemonError) -> String {
+    match e {
+        SdkDaemonError::MigrationFailed(reason) => {
+            format!("migration: {}", format_migration_failure_reason(reason))
+        }
+        SdkDaemonError::Migration(mig_err) => {
+            format!("migration: {}", format_migration_error(mig_err))
+        }
+        other => other.to_string(),
+    }
+}
+
+fn format_migration_failure_reason(reason: &MigrationFailureReason) -> String {
+    match reason {
+        MigrationFailureReason::NotReady => "not-ready".to_string(),
+        MigrationFailureReason::FactoryNotFound => "factory-not-found".to_string(),
+        MigrationFailureReason::ComputeNotSupported => "compute-not-supported".to_string(),
+        MigrationFailureReason::StateFailed(msg) => format!("state-failed: {msg}"),
+        MigrationFailureReason::AlreadyMigrating => "already-migrating".to_string(),
+        MigrationFailureReason::IdentityTransportFailed(msg) => {
+            format!("identity-transport-failed: {msg}")
+        }
+        MigrationFailureReason::NotReadyTimeout { attempts } => {
+            format!("not-ready-timeout: {attempts}")
+        }
+    }
+}
+
+fn format_migration_error(err: &SdkMigrationError) -> String {
+    match err {
+        SdkMigrationError::DaemonNotFound(origin) => format!("daemon-not-found: {origin:#x}"),
+        SdkMigrationError::TargetUnavailable(node) => format!("target-unavailable: {node:#x}"),
+        SdkMigrationError::StateFailed(msg) => format!("state-failed: {msg}"),
+        SdkMigrationError::AlreadyMigrating(origin) => format!("already-migrating: {origin:#x}"),
+        SdkMigrationError::WrongPhase { expected, got } => {
+            format!("wrong-phase: {expected:?}: {got:?}")
+        }
+        SdkMigrationError::SnapshotTooLarge { size, max } => {
+            format!("snapshot-too-large: {size}: {max}")
+        }
+    }
+}
+
+fn migration_phase_str(phase: CoreMigrationPhase) -> &'static str {
+    match phase {
+        CoreMigrationPhase::Snapshot => "snapshot",
+        CoreMigrationPhase::Transfer => "transfer",
+        CoreMigrationPhase::Restore => "restore",
+        CoreMigrationPhase::Replay => "replay",
+        CoreMigrationPhase::Cutover => "cutover",
+        CoreMigrationPhase::Complete => "complete",
+    }
+}
 
 // =========================================================================
 // Shared tokio runtime
@@ -257,10 +326,20 @@ pub extern "C" fn net_compute_runtime_daemon_count(handle: *mut DaemonRuntimeHan
     h.inner.daemon_count() as i64
 }
 
-/// Register a placeholder factory entry under `kind`. Sub-step 1
-/// only stores the kind string in the runtime's registered set;
-/// sub-step 2 will wire the Go callback table so the SDK's
-/// factory map can construct daemons on demand.
+/// Register a factory kind on the runtime. Enables `spawn` and
+/// migration-target setup (`expect_migration` /
+/// `register_migration_target_identity`) for that kind.
+///
+/// **Migration-target reconstruction caveat:** the SDK-side
+/// factory closure mirrored here returns a `NoopBridge` fallback
+/// — a placeholder `MeshDaemon` whose `process` emits no output.
+/// A daemon migrated INTO a Go target today lands as a no-op
+/// daemon. Sub-step 5+ will swap this for a Go-callback path that
+/// invokes a registered factory function. For the Node / Python
+/// bindings this gap is closed (via TSFN / `Py<PyAny>`
+/// round-trips); the Go equivalent is deferred because it
+/// requires a separate C-ABI factory trampoline to look up a Go
+/// factory by kind string.
 ///
 /// Returns [`NET_COMPUTE_OK`] on success,
 /// [`NET_COMPUTE_ERR_DUPLICATE_KIND`] if the kind was already
@@ -288,13 +367,31 @@ pub extern "C" fn net_compute_register_factory(
         None => return NET_COMPUTE_ERR_NULL,
     };
     use dashmap::mapref::entry::Entry;
-    match h.factories.entry(kind) {
-        Entry::Occupied(_) => NET_COMPUTE_ERR_DUPLICATE_KIND,
+    match h.factories.entry(kind.clone()) {
+        Entry::Occupied(_) => return NET_COMPUTE_ERR_DUPLICATE_KIND,
         Entry::Vacant(slot) => {
             slot.insert(());
-            NET_COMPUTE_OK
         }
     }
+
+    // Mirror into the SDK factory registry with a NoopBridge
+    // fallback. Without this, `expect_migration` /
+    // `register_migration_target_identity` reject with
+    // `FactoryNotFound` because they call `factory_for_kind(kind)`.
+    let kind_for_bridge = kind.clone();
+    if let Err(e) = h.inner.register_factory(&kind, move || {
+        Box::new(NoopBridge::new(kind_for_bridge.clone())) as Box<dyn MeshDaemon>
+    }) {
+        // SDK rejected the mirror — roll back our kind-set entry
+        // so the two registries stay in sync.
+        h.factories.remove(&kind);
+        // Translate to DUPLICATE_KIND for the only realistic
+        // failure mode (already-registered); any other SDK error
+        // shouldn't happen here under current invariants.
+        let _ = e; // silence unused binding
+        return NET_COMPUTE_ERR_DUPLICATE_KIND;
+    }
+    NET_COMPUTE_OK
 }
 
 // =========================================================================
@@ -879,6 +976,301 @@ pub extern "C" fn net_compute_spawn_from_snapshot(
             write_err(err_out, &e.to_string());
             NET_COMPUTE_ERR_CALL_FAILED
         }
+    }
+}
+
+// =========================================================================
+// Migration — start / expect / register_target_identity / phase
+// =========================================================================
+
+/// Opaque handle returned by `net_compute_start_migration*`. Wraps
+/// the SDK `MigrationHandle` plus cached `origin_hash` /
+/// `source_node` / `target_node` for zero-cost accessors from Go.
+pub struct MigrationHandleC {
+    origin_hash: u32,
+    source_node: u64,
+    target_node: u64,
+    inner: SdkMigrationHandle,
+}
+
+/// Free a migration handle. Dropping the Go-side handle does NOT
+/// cancel the migration — the orchestrator keeps driving it in
+/// the background. Idempotent on NULL.
+#[no_mangle]
+pub extern "C" fn net_compute_migration_handle_free(h: *mut MigrationHandleC) {
+    if h.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(h);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_migration_handle_origin_hash(h: *const MigrationHandleC) -> u32 {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return 0;
+    };
+    h.origin_hash
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_migration_handle_source_node(h: *const MigrationHandleC) -> u64 {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return 0;
+    };
+    h.source_node
+}
+
+#[no_mangle]
+pub extern "C" fn net_compute_migration_handle_target_node(h: *const MigrationHandleC) -> u64 {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return 0;
+    };
+    h.target_node
+}
+
+/// Return the current migration phase as a CString, or NULL if
+/// the migration has left the orchestrator's records (terminal
+/// success or abort). Caller frees via
+/// [`net_compute_free_cstring`].
+#[no_mangle]
+pub extern "C" fn net_compute_migration_handle_phase(h: *const MigrationHandleC) -> *mut c_char {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return std::ptr::null_mut();
+    };
+    match h.inner.phase() {
+        Some(p) => CString::new(migration_phase_str(p))
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Block until the migration reaches a terminal state. Returns
+/// [`NET_COMPUTE_OK`] on `Complete`; on abort/failure writes a
+/// structured `migration: <kind>[: detail]` body to `*err_out`.
+#[no_mangle]
+pub extern "C" fn net_compute_migration_handle_wait(
+    h: *mut MigrationHandleC,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    let handle = h.inner.clone();
+    let rt = runtime();
+    match rt.block_on(async move { handle.wait().await }) {
+        Ok(()) => NET_COMPUTE_OK,
+        Err(e) => {
+            write_err(err_out, &format_sdk_error(&e));
+            NET_COMPUTE_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Like `wait` with a caller-controlled timeout in milliseconds.
+#[no_mangle]
+pub extern "C" fn net_compute_migration_handle_wait_with_timeout(
+    h: *mut MigrationHandleC,
+    timeout_ms: u64,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    let handle = h.inner.clone();
+    let rt = runtime();
+    match rt.block_on(async move {
+        handle
+            .wait_with_timeout(std::time::Duration::from_millis(timeout_ms))
+            .await
+    }) {
+        Ok(()) => NET_COMPUTE_OK,
+        Err(e) => {
+            write_err(err_out, &format_sdk_error(&e));
+            NET_COMPUTE_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Request cancellation. Best-effort; past `cutover` the routing
+/// flip cannot be cleanly undone.
+#[no_mangle]
+pub extern "C" fn net_compute_migration_handle_cancel(
+    h: *mut MigrationHandleC,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { h.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    let handle = &h.inner;
+    let rt = runtime();
+    match rt.block_on(async move { handle.cancel().await }) {
+        Ok(()) => NET_COMPUTE_OK,
+        Err(e) => {
+            write_err(err_out, &format_sdk_error(&e));
+            NET_COMPUTE_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Start a migration with default options. Returns a boxed
+/// `MigrationHandleC*` via `*out_handle` on success. On failure,
+/// `*out_handle` is NULL and `*err_out` carries the structured
+/// `migration: <kind>[: detail]` body.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn net_compute_start_migration(
+    handle: *mut DaemonRuntimeHandle,
+    origin_hash: u32,
+    source_node: u64,
+    target_node: u64,
+    transport_identity: u8, // 0 = false, non-zero = true
+    retry_not_ready_ms: u64, // 0 = disabled
+    out_handle: *mut *mut MigrationHandleC,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    if out_handle.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    let mut opts = MigrationOpts::default();
+    opts.transport_identity = transport_identity != 0;
+    opts.retry_not_ready = if retry_not_ready_ms == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(retry_not_ready_ms))
+    };
+
+    let inner = h.inner.clone();
+    let rt = runtime();
+    let result = rt.block_on(async move {
+        inner
+            .start_migration_with(origin_hash, source_node, target_node, opts)
+            .await
+    });
+    match result {
+        Ok(mig) => {
+            let boxed = Box::new(MigrationHandleC {
+                origin_hash: mig.origin_hash,
+                source_node: mig.source_node,
+                target_node: mig.target_node,
+                inner: mig,
+            });
+            unsafe {
+                *out_handle = Box::into_raw(boxed);
+            }
+            NET_COMPUTE_OK
+        }
+        Err(e) => {
+            unsafe {
+                *out_handle = std::ptr::null_mut();
+            }
+            write_err(err_out, &format_sdk_error(&e));
+            NET_COMPUTE_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Declare on the target side that a migration will land here for
+/// `origin_hash` of `kind`. Registers a placeholder factory —
+/// identity comes from the migration snapshot's envelope.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn net_compute_expect_migration(
+    handle: *mut DaemonRuntimeHandle,
+    kind_ptr: *const c_char,
+    kind_len: usize,
+    origin_hash: u32,
+    auto_snapshot_interval: u64,
+    max_log_entries: u32,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    let mut cfg = DaemonHostConfig::default();
+    cfg.auto_snapshot_interval = auto_snapshot_interval;
+    if max_log_entries > 0 {
+        cfg.max_log_entries = max_log_entries;
+    }
+    match h.inner.expect_migration(&kind, origin_hash, cfg) {
+        Ok(()) => NET_COMPUTE_OK,
+        Err(e) => {
+            write_err(err_out, &format_sdk_error(&e));
+            NET_COMPUTE_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Pre-register a target-side identity for a migration that will
+/// NOT carry an identity envelope (source used
+/// `transport_identity=false`). `identity_seed` = 32 bytes.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn net_compute_register_migration_target_identity(
+    handle: *mut DaemonRuntimeHandle,
+    kind_ptr: *const c_char,
+    kind_len: usize,
+    identity_seed: *const u8,
+    auto_snapshot_interval: u64,
+    max_log_entries: u32,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    if identity_seed.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    let mut seed = [0u8; 32];
+    unsafe {
+        std::ptr::copy_nonoverlapping(identity_seed, seed.as_mut_ptr(), 32);
+    }
+    let sdk_identity = SdkIdentity::from_seed(seed);
+    let mut cfg = DaemonHostConfig::default();
+    cfg.auto_snapshot_interval = auto_snapshot_interval;
+    if max_log_entries > 0 {
+        cfg.max_log_entries = max_log_entries;
+    }
+    match h
+        .inner
+        .register_migration_target_identity(&kind, sdk_identity, cfg)
+    {
+        Ok(()) => NET_COMPUTE_OK,
+        Err(e) => {
+            write_err(err_out, &format_sdk_error(&e));
+            NET_COMPUTE_ERR_CALL_FAILED
+        }
+    }
+}
+
+/// Query the orchestrator's migration phase for `origin_hash`.
+/// Returns NULL if no migration is in flight for that origin
+/// (either never started or already cleaned up). Caller frees via
+/// [`net_compute_free_cstring`] on a non-NULL return.
+#[no_mangle]
+pub extern "C" fn net_compute_migration_phase(
+    handle: *mut DaemonRuntimeHandle,
+    origin_hash: u32,
+) -> *mut c_char {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return std::ptr::null_mut();
+    };
+    match h.inner.migration_phase(origin_hash) {
+        Some(p) => CString::new(migration_phase_str(p))
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        None => std::ptr::null_mut(),
     }
 }
 
