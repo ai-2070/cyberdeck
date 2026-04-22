@@ -594,6 +594,134 @@ Cross-SDK behaviour is fixed by the Rust integration suite; see
 [`tests/channel_auth.rs`](../../tests/channel_auth.rs) and
 [`tests/channel_auth_hardening.rs`](../../tests/channel_auth_hardening.rs).
 
+## Compute (daemons + migration)
+
+Run `MeshDaemon`s directly from Go. `DaemonRuntime` owns the
+factory table, per-daemon hosts, and the
+`Registering → Ready → ShuttingDown` lifecycle gate that decides
+when inbound migrations may land. The Go side implements the
+`MeshDaemon` interface; a CGO callback table dispatches each
+`process` / `snapshot` / `restore` invocation back into the
+runtime registry without releasing ownership of the Go pointer.
+
+Build the cdylib with `--features compute` (already on when you
+use the `netdb redex-disk net compute` bundle) and import from
+`net`. Full design notes:
+[`docs/SDK_COMPUTE_SURFACE_PLAN.md`](../../docs/SDK_COMPUTE_SURFACE_PLAN.md).
+
+```go
+package main
+
+import (
+    "log"
+
+    "github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net"
+)
+
+type echoDaemon struct{}
+
+func (echoDaemon) Process(event net.CausalEvent) ([][]byte, error) {
+    return [][]byte{event.Payload}, nil
+}
+// Optional: implement DaemonSnapshotter / DaemonRestorer for
+// migration-capable daemons.
+
+func main() {
+    mesh, err := net.NewMeshNode(net.MeshConfig{
+        BindAddr: "127.0.0.1:9000",
+        PskHex:   "42" + strings.Repeat("42", 31),
+    })
+    if err != nil { log.Fatal(err) }
+    defer mesh.Shutdown()
+
+    rt, err := net.NewDaemonRuntime(mesh)
+    if err != nil { log.Fatal(err) }
+    defer rt.Close()
+
+    // Register factories BEFORE Start — the runtime rejects spawns
+    // until it transitions to Ready.
+    if err := rt.RegisterFactoryFunc("echo", func() net.MeshDaemon {
+        return echoDaemon{}
+    }); err != nil {
+        log.Fatal(err)
+    }
+    if err := rt.Start(); err != nil { log.Fatal(err) }
+
+    // Spawn — Identity pins the daemon's ed25519 keypair so
+    // OriginHash / EntityID stay stable across migrations.
+    identity, _ := net.GenerateIdentity()
+    defer identity.Close()
+    handle, err := rt.Spawn("echo", identity, echoDaemon{}, nil)
+    if err != nil { log.Fatal(err) }
+    defer handle.Close()
+    log.Printf("origin = %#x", handle.OriginHash())
+
+    // Stop / shutdown.
+    _ = rt.Stop(handle.OriginHash())
+    _ = rt.Shutdown()
+}
+```
+
+`Process` is synchronous — the Rust dispatcher blocks on the CGO
+call. The `Payload` slice is borrowed; copy it if you need to
+retain it past the call.
+
+### Migration
+
+`StartMigration(originHash, sourceNode, targetNode)` orchestrates
+the six-phase cutover (`Snapshot → Transfer → Restore → Replay →
+Cutover → Complete`). The source seals the daemon's ed25519 seed
+into the outbound snapshot using the target's X25519 static
+pubkey; the target rebuilds the daemon via the same `kind`
+factory, replays any events that arrived during transfer, then
+activates.
+
+```go
+mig, err := rt.StartMigration(handle.OriginHash(), sourceNodeID, targetNodeID)
+if err != nil {
+    var me *net.MigrationError
+    if errors.As(err, &me) {
+        switch me.Kind {
+        case net.MigrationErrKindNotReady:               // target not started
+        case net.MigrationErrKindFactoryNotFound:        // target missing kind
+        case net.MigrationErrKindComputeNotSupported:    // no DaemonRuntime on target
+        case net.MigrationErrKindStateFailed:            // snapshot/restore threw
+        case net.MigrationErrKindIdentityTransportFailed:// seal/unseal failed
+        // ...see the full enum in migration.go
+        }
+    }
+    log.Fatal(err)
+}
+
+log.Printf("phase = %s", mig.Phase())     // "snapshot" | "transfer" | ...
+if err := mig.Wait(); err != nil {
+    log.Fatal(err)
+}
+```
+
+`StartMigrationWith(origin, src, dst, MigrationOptions{SealSeed: false, ...})`
+exposes advanced knobs. On the target node, call
+`rt.RegisterMigrationTargetIdentity(identity)` before any migration
+lands — without it, sealed-seed envelopes are rejected with
+`MigrationErrKindIdentityTransportFailed`.
+
+### Surface at a glance
+
+| Function / method | Description |
+|---|---|
+| `NewDaemonRuntime(mesh)` | Construct against an existing `*MeshNode` |
+| `rt.RegisterFactoryFunc(kind, fn)` | Install a Go factory (before `Start()`) |
+| `rt.Start() / rt.Shutdown()` | Flip the lifecycle gate |
+| `rt.Spawn(kind, identity, daemon, cfg)` | Spawn a local daemon |
+| `rt.SpawnFromSnapshot(kind, identity, bytes, daemon, cfg)` | Rehydrate |
+| `rt.Stop(origin)` | Stop a local daemon |
+| `rt.Snapshot(origin)` | Capture `[]byte` for persistence / migration |
+| `rt.Deliver(origin, event)` | Feed an event (returns `[][]byte`) |
+| `rt.StartMigration(origin, src, dst)` | Orchestrate a live migration |
+| `rt.RegisterMigrationTargetIdentity(id)` | Pin unseal keypair on target |
+| `handle.OriginHash() / EntityID() / Close()` | Per-daemon identity + lifetime |
+| `*DaemonError` / `*MigrationError` | Typed errors via `errors.As` + `.Kind` |
+
 ## Compute Groups (Replica / Fork / Standby)
 
 HA / scaling overlays on top of `DaemonRuntime`. Build the cdylib

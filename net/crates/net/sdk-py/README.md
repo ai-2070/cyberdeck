@@ -237,6 +237,52 @@ Cross-SDK contract + rationale:
 > paths. Follow-up work to proxy them through `net_sdk` is tracked
 > in [`SDK_PYTHON_PARITY_PLAN.md`](../docs/SDK_PYTHON_PARITY_PLAN.md).
 
+## Compute (daemons + migration)
+
+The full compute surface — `DaemonRuntime`, `MeshDaemon`
+(duck-typed), `DaemonHandle`, `MigrationHandle`, plus the six-
+phase migration orchestrator — ships on the native **`net`** PyO3
+package (when built with the `compute` feature). Import directly:
+
+```python
+from net import (
+    DaemonRuntime, NetMesh, Identity, CausalEvent,
+    DaemonError, MigrationError, migration_error_kind,
+)
+
+
+class EchoDaemon:
+    name = "echo"
+
+    def process(self, event):
+        return [bytes(event.payload)]
+
+
+mesh = NetMesh("127.0.0.1:9000", "42" * 32)
+rt = DaemonRuntime(mesh)
+rt.register_factory("echo", lambda: EchoDaemon())
+rt.start()
+
+handle = rt.spawn("echo", Identity.generate())
+# rt.deliver(handle.origin_hash, CausalEvent(handle.origin_hash, 1, b"hi"))
+rt.stop(handle.origin_hash)
+rt.shutdown()
+```
+
+Live migration (`rt.start_migration(origin, src, dst)`) returns a
+`MigrationHandle` whose `wait()` drives the cutover to completion;
+failures raise `MigrationError` with a stable `kind` parseable by
+`migration_error_kind(e)`. Full surface + runnable examples:
+[`bindings/python/README.md`](../bindings/python/README.md#compute-daemons--migration).
+Cross-SDK contract + rationale:
+[`docs/SDK_COMPUTE_SURFACE_PLAN.md`](../docs/SDK_COMPUTE_SURFACE_PLAN.md).
+
+> **Note.** Like the security types, the `net_sdk` wrapper doesn't
+> yet re-export `DaemonRuntime` / `MigrationHandle` — use the
+> native `net` package directly. Proxying these through `net_sdk`
+> is tracked in
+> [`SDK_PYTHON_PARITY_PLAN.md`](../docs/SDK_PYTHON_PARITY_PLAN.md).
+
 ## Groups (replica / fork / standby)
 
 HA / scaling overlays on top of `DaemonRuntime` — `ReplicaGroup`,
