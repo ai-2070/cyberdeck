@@ -850,6 +850,40 @@ mod mesh_bindings {
         }
     }
 
+    /// Convert the core `NatClass` enum to the stable string form
+    /// used on the Python boundary. Stable vocabulary per plan §5:
+    /// `"open" | "cone" | "symmetric" | "unknown"`. Kept in sync
+    /// with the NAPI + Go bindings — callers do
+    /// `mesh.nat_type() == "open"` against these strings.
+    #[cfg(feature = "nat-traversal")]
+    pub(crate) fn nat_class_to_string(
+        class: net::adapter::net::traversal::classify::NatClass,
+    ) -> String {
+        use net::adapter::net::traversal::classify::NatClass;
+        match class {
+            NatClass::Open => "open",
+            NatClass::Cone => "cone",
+            NatClass::Symmetric => "symmetric",
+            NatClass::Unknown => "unknown",
+        }
+        .to_string()
+    }
+
+    /// Format a core `TraversalError` into a `PyErr` whose message
+    /// follows the `traversal: <kind>[: <detail>]` convention.
+    /// Mirrors the `migration: <kind>` pattern already used by the
+    /// compute surface; callers branch on the stable `kind` prefix.
+    #[cfg(feature = "nat-traversal")]
+    pub(crate) fn traversal_py_err(e: net::adapter::net::traversal::TraversalError) -> PyErr {
+        use net::adapter::net::traversal::TraversalError;
+        let body = match &e {
+            TraversalError::Transport(msg) => format!("transport: {msg}"),
+            TraversalError::RendezvousRejected(msg) => format!("rendezvous-rejected: {msg}"),
+            _ => e.kind().to_string(),
+        };
+        PyRuntimeError::new_err(format!("traversal: {body}"))
+    }
+
     fn parse_visibility(s: &str) -> PyResult<InnerVisibility> {
         match s {
             "subnet-local" => Ok(InnerVisibility::SubnetLocal),
@@ -1711,6 +1745,166 @@ mod mesh_bindings {
             let node = self.get_node()?;
             let core = super::capabilities::capability_filter_from_py(filter)?;
             Ok(node.find_peers_by_filter(&core))
+        }
+
+        // ── NAT traversal ──────────────────────────────────────
+        //
+        // Framing (plan §5, load-bearing): every user-visible
+        // docstring positions NAT traversal as **optimization,
+        // not correctness**. Nodes behind NAT can always reach
+        // each other through the mesh's routed-handshake path.
+        // A `nat_type` of `"symmetric"` or a
+        // `traversal: punch-failed` error is not a connectivity
+        // failure — traffic just keeps riding the relay.
+
+        /// NAT classification for this mesh, as a stable string:
+        /// `"open" | "cone" | "symmetric" | "unknown"`.
+        /// `"unknown"` is the pre-classification state;
+        /// classification runs in the background after `start()`
+        /// once ≥2 peers are connected. Requires the
+        /// `nat-traversal` build.
+        #[cfg(feature = "nat-traversal")]
+        fn nat_type(&self) -> PyResult<String> {
+            let node = self.get_node()?;
+            Ok(nat_class_to_string(node.nat_class()))
+        }
+
+        /// This mesh's public-facing `ip:port` as observed by a
+        /// remote peer, or `None` before classification has
+        /// produced an observation. Piggybacks on outbound
+        /// capability announcements so peers can attempt direct
+        /// connects without a separate discovery round-trip.
+        /// Requires the `nat-traversal` build.
+        #[cfg(feature = "nat-traversal")]
+        fn reflex_addr(&self) -> PyResult<Option<String>> {
+            let node = self.get_node()?;
+            Ok(node.reflex_addr().map(|a| a.to_string()))
+        }
+
+        /// NAT classification most recently advertised by
+        /// `peer_node_id` (parsed from the `nat:*` tag on their
+        /// capability announcement). Returns `"unknown"` when
+        /// the peer hasn't announced. The pair-type matrix
+        /// treats Unknown as "attempt direct, fall back on
+        /// failure," never "don't attempt." Requires the
+        /// `nat-traversal` build.
+        #[cfg(feature = "nat-traversal")]
+        fn peer_nat_type(&self, peer_node_id: u64) -> PyResult<String> {
+            let node = self.get_node()?;
+            Ok(nat_class_to_string(node.peer_nat_class(peer_node_id)))
+        }
+
+        /// Send one reflex probe to `peer_node_id` and return the
+        /// public `ip:port` the peer observed on the probe's UDP
+        /// envelope. Useful for tests and for diagnosing
+        /// misclassifications.
+        ///
+        /// Raises `RuntimeError` whose message follows the
+        /// `traversal: <kind>[: <detail>]` convention (kinds:
+        /// `reflex-timeout`, `peer-not-reachable`, `transport`)
+        /// — mirrors the pattern used by `migration:` errors.
+        /// Requires the `nat-traversal` build.
+        #[cfg(feature = "nat-traversal")]
+        fn probe_reflex(&self, py: Python<'_>, peer_node_id: u64) -> PyResult<String> {
+            let node = self
+                .node
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime
+                    .block_on(node.probe_reflex(peer_node_id))
+                    .map(|a| a.to_string())
+                    .map_err(traversal_py_err)
+            })
+        }
+
+        /// Explicitly re-run the classification sweep. Normally
+        /// the background loop handles this; call this after a
+        /// suspected NAT rebind (gateway reboot, address change)
+        /// to accelerate re-classification. No-op when fewer
+        /// than 2 peers are connected. Never raises.
+        /// Requires the `nat-traversal` build.
+        #[cfg(feature = "nat-traversal")]
+        fn reclassify_nat(&self, py: Python<'_>) -> PyResult<()> {
+            let node = self
+                .node
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(node.reclassify_nat());
+            });
+            Ok(())
+        }
+
+        /// Cumulative NAT-traversal counters. Returns a dict:
+        /// `{"punches_attempted": int, "punches_succeeded": int,
+        /// "relay_fallbacks": int}`. Monotonic — counters never
+        /// reset. Useful for telemetry on punch success rate
+        /// and relay load. Requires the `nat-traversal` build.
+        #[cfg(feature = "nat-traversal")]
+        fn traversal_stats<'py>(
+            &self,
+            py: Python<'py>,
+        ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+            let node = self.get_node()?;
+            let snap = node.traversal_stats();
+            let d = pyo3::types::PyDict::new(py);
+            d.set_item("punches_attempted", snap.punches_attempted)?;
+            d.set_item("punches_succeeded", snap.punches_succeeded)?;
+            d.set_item("relay_fallbacks", snap.relay_fallbacks)?;
+            Ok(d)
+        }
+
+        /// Establish a session to `peer_node_id` via the
+        /// rendezvous path. The pair-type matrix decides between
+        /// a direct handshake and a relay-coordinated punch;
+        /// either way the returned session is equivalent in
+        /// correctness to `connect()`.
+        ///
+        /// **Optimization, not correctness.** `connect_direct`
+        /// always resolves (on punch-failed, the session is
+        /// established via the routed-handshake fallback).
+        /// Inspect `traversal_stats()` afterward to distinguish
+        /// a successful punch from a relay fallback.
+        ///
+        /// Raises `RuntimeError` with
+        /// `traversal: peer-not-reachable` when we have no
+        /// cached reflex for `peer_node_id`, or
+        /// `traversal: transport: ...` on a socket-level
+        /// handshake error. Requires the `nat-traversal` build.
+        #[cfg(feature = "nat-traversal")]
+        #[pyo3(signature = (peer_node_id, peer_public_key, coordinator))]
+        fn connect_direct(
+            &self,
+            py: Python<'_>,
+            peer_node_id: u64,
+            peer_public_key: &str,
+            coordinator: u64,
+        ) -> PyResult<()> {
+            let pubkey_bytes = hex::decode(peer_public_key)
+                .map_err(|e| PyValueError::new_err(format!("invalid hex: {}", e)))?;
+            if pubkey_bytes.len() != 32 {
+                return Err(PyValueError::new_err("public key must be 32 bytes"));
+            }
+            let mut pubkey = [0u8; 32];
+            pubkey.copy_from_slice(&pubkey_bytes);
+
+            let node = self
+                .node
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| PyRuntimeError::new_err("MeshNode has been shut down"))?;
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime
+                    .block_on(node.connect_direct(peer_node_id, &pubkey, coordinator))
+                    .map_err(traversal_py_err)?;
+                Ok(())
+            })
         }
 
         /// Shutdown the mesh node. Idempotent — a second call is a no-op.
