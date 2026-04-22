@@ -1,0 +1,532 @@
+/**
+ * Groups surface — `ReplicaGroup` / `ForkGroup` / `StandbyGroup`.
+ *
+ * Stage 2 of `SDK_GROUPS_SURFACE_PLAN.md`. Thin wrappers over the
+ * NAPI classes that add:
+ *
+ * - Typed `GroupError` extending `DaemonError` with a `kind`
+ *   discriminator parsed from the Rust side's stable
+ *   `daemon: group: <kind>[: detail]` error prefix.
+ * - `Buffer | Uint8Array` interop for `groupSeed`.
+ * - `MigrationOptions`-style config shapes with camelCase fields.
+ *
+ * @example
+ * ```typescript
+ * import { DaemonRuntime, Identity, ReplicaGroup } from '@ai2070/net-sdk';
+ *
+ * // Register the factory the group will invoke for each member.
+ * rt.registerFactory('counter', () => new CounterDaemon());
+ *
+ * // Spawn a 3-member replica group.
+ * const group = ReplicaGroup.spawn(rt, 'counter', {
+ *   replicaCount: 3,
+ *   groupSeed: Buffer.from('...'),  // 32 bytes
+ *   lbStrategy: 'round-robin',
+ * });
+ *
+ * // Route a request.
+ * const origin = group.routeEvent({ routingKey: 'user:42' });
+ * await rt.deliver(origin, someEvent);
+ * ```
+ *
+ * @packageDocumentation
+ */
+
+import {
+  ReplicaGroup as NapiReplicaGroup,
+  ForkGroup as NapiForkGroup,
+  StandbyGroup as NapiStandbyGroup,
+  type ReplicaGroupConfigJs,
+  type ForkGroupConfigJs,
+  type StandbyGroupConfigJs,
+  type GroupHealthJs,
+  type GroupHostConfigJs,
+  type MemberInfoJs,
+  type ForkRecordJs,
+  type RequestContextJs,
+  StrategyJs,
+} from '@ai2070/net';
+
+import { DaemonError } from './compute';
+import type { DaemonRuntime } from './compute';
+
+// ----------------------------------------------------------------------------
+// GroupError — typed subclass of DaemonError
+// ----------------------------------------------------------------------------
+
+/**
+ * Stable machine-readable discriminator for group-layer failures.
+ * Parsed from the Rust side's `daemon: group: <kind>[: detail]`
+ * prefix; use `err.kind` in catch blocks rather than parsing the
+ * message string by hand.
+ */
+export type GroupErrorKind =
+  | 'not-ready'
+  | 'factory-not-found'
+  | 'no-healthy-member'
+  | 'placement-failed'
+  | 'registry-failed'
+  | 'invalid-config'
+  | 'daemon'
+  | 'unknown';
+
+/**
+ * Typed group failure. Subclass of {@link DaemonError} so
+ * `catch (e: DaemonError)` still matches.
+ */
+export class GroupError extends DaemonError {
+  readonly kind: GroupErrorKind;
+  /** Optional detail string carried by `placement-failed` /
+   *  `registry-failed` / `invalid-config` / `daemon` variants. */
+  readonly detail?: string;
+  /** `factory-not-found` carries the requested kind name. */
+  readonly requestedKind?: string;
+
+  constructor(
+    kind: GroupErrorKind,
+    message: string,
+    extras: { detail?: string; requestedKind?: string } = {},
+  ) {
+    super(message);
+    this.name = 'GroupError';
+    this.kind = kind;
+    this.detail = extras.detail;
+    this.requestedKind = extras.requestedKind;
+    Object.setPrototypeOf(this, GroupError.prototype);
+  }
+}
+
+/**
+ * Lift a caught unknown error into the right typed exception.
+ * The Rust side emits `daemon: group: <kind>[: detail]`; unknown
+ * kinds fall back to `kind: 'unknown'` with the raw body.
+ * Non-group errors pass through as plain `DaemonError` (or the
+ * original throw if the message doesn't start with `daemon:`).
+ */
+function toGroupError(e: unknown): never {
+  const msg = (e as Error | undefined)?.message ?? String(e);
+  if (msg.startsWith('daemon:')) {
+    const body = msg.slice('daemon:'.length).trim();
+    if (body.startsWith('group:')) {
+      throw parseGroupError(body, msg.slice('daemon:'.length).trim());
+    }
+    throw new DaemonError(body);
+  }
+  throw e;
+}
+
+function parseGroupError(body: string, fullMessage: string): GroupError {
+  // Body shape after `daemon: ` stripping:
+  //   group: <kind>
+  //   group: <kind>: <detail>
+  const afterPrefix = body.slice('group:'.length).trim();
+  const firstColon = afterPrefix.indexOf(':');
+  const kind =
+    firstColon === -1 ? afterPrefix : afterPrefix.slice(0, firstColon).trim();
+  const rest =
+    firstColon === -1 ? '' : afterPrefix.slice(firstColon + 1).trim();
+
+  switch (kind) {
+    case 'not-ready':
+    case 'no-healthy-member':
+      return new GroupError(kind, fullMessage);
+    case 'factory-not-found':
+      return new GroupError(kind, fullMessage, { requestedKind: rest });
+    case 'placement-failed':
+    case 'registry-failed':
+    case 'invalid-config':
+    case 'daemon':
+      return new GroupError(kind, fullMessage, { detail: rest });
+    default:
+      return new GroupError('unknown', fullMessage);
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Public types — re-exports of NAPI POJOs with ergonomic names
+// ----------------------------------------------------------------------------
+
+/**
+ * Load-balancing strategy for inbound group events.
+ *
+ * - `round-robin` — rotate across healthy members.
+ * - `consistent-hash` — stable routing on `routingKey`.
+ * - `least-load` — pick the member with the lowest utilization.
+ * - `least-connections` — pick the member with the fewest in-flight calls.
+ * - `random` — uniformly-random healthy pick.
+ */
+export type GroupStrategy = StrategyJs;
+
+/** Per-member metadata. */
+export type GroupMemberInfo = MemberInfoJs;
+
+/** Aggregate health surface. */
+export type GroupHealth = GroupHealthJs;
+
+/** Lineage record for a single fork. */
+export type ForkRecord = ForkRecordJs;
+
+/** Routing context handed to `routeEvent`. */
+export type RequestContext = RequestContextJs;
+
+/** Per-daemon host config applied to every group member. */
+export type GroupHostConfig = GroupHostConfigJs;
+
+/** Config for a replica group. */
+export interface ReplicaGroupConfig extends Omit<ReplicaGroupConfigJs, 'groupSeed'> {
+  /** 32-byte seed. Accepts `Buffer` or `Uint8Array`. */
+  groupSeed: Buffer | Uint8Array;
+}
+
+/** Config for a fork group. */
+export type ForkGroupConfig = ForkGroupConfigJs;
+
+/** Config for a standby group. */
+export interface StandbyGroupConfig
+  extends Omit<StandbyGroupConfigJs, 'groupSeed'> {
+  /** 32-byte seed. Accepts `Buffer` or `Uint8Array`. */
+  groupSeed: Buffer | Uint8Array;
+}
+
+function toBuffer(seed: Buffer | Uint8Array): Buffer {
+  return Buffer.isBuffer(seed) ? seed : Buffer.from(seed);
+}
+
+// ----------------------------------------------------------------------------
+// ReplicaGroup
+// ----------------------------------------------------------------------------
+
+/**
+ * N interchangeable copies of a daemon. Each replica has a
+ * deterministic identity derived from `groupSeed + index`;
+ * the group load-balances inbound events across healthy members
+ * and auto-replaces members on node failure.
+ */
+export class ReplicaGroup {
+  private readonly inner: NapiReplicaGroup;
+
+  /** @internal */
+  constructor(inner: NapiReplicaGroup) {
+    this.inner = inner;
+  }
+
+  /**
+   * Spawn a replica group bound to `runtime`. `kind` must have
+   * been registered via {@link DaemonRuntime.registerFactory};
+   * the group calls the factory once per replica at spawn and
+   * again on scale-up / failure replacement.
+   *
+   * Throws {@link GroupError} on `not-ready`, `factory-not-found`,
+   * `placement-failed`, `invalid-config`, or `registry-failed`.
+   */
+  static spawn(
+    runtime: DaemonRuntime,
+    kind: string,
+    config: ReplicaGroupConfig,
+  ): ReplicaGroup {
+    try {
+      const napi = NapiReplicaGroup.spawn(
+        runtime._napiRuntime(),
+        kind,
+        {
+          replicaCount: config.replicaCount,
+          groupSeed: toBuffer(config.groupSeed),
+          lbStrategy: config.lbStrategy,
+          hostConfig: config.hostConfig,
+        },
+      );
+      return new ReplicaGroup(napi);
+    } catch (e) {
+      return toGroupError(e);
+    }
+  }
+
+  /** Route to the best-available replica; returns the target
+   *  `origin_hash` which the caller feeds to `runtime.deliver`. */
+  routeEvent(ctx: RequestContext = {}): number {
+    try {
+      return this.inner.routeEvent(ctx);
+    } catch (e) {
+      return toGroupError(e);
+    }
+  }
+
+  /** Resize the group to `n` members. `kind` defaults to the
+   *  kind the group was spawned with. */
+  scaleTo(n: number, kind?: string): void {
+    try {
+      this.inner.scaleTo(n, kind);
+    } catch (e) {
+      toGroupError(e);
+    }
+  }
+
+  /** Replace all members on `failedNodeId` onto other nodes.
+   *  Returns the indices of replicas that were respawned. */
+  onNodeFailure(failedNodeId: bigint, kind?: string): number[] {
+    try {
+      return this.inner.onNodeFailure(failedNodeId, kind);
+    } catch (e) {
+      return toGroupError(e);
+    }
+  }
+
+  onNodeRecovery(recoveredNodeId: bigint): void {
+    this.inner.onNodeRecovery(recoveredNodeId);
+  }
+
+  get health(): GroupHealth {
+    return this.inner.health;
+  }
+
+  get groupId(): number {
+    return this.inner.groupId;
+  }
+
+  get replicas(): GroupMemberInfo[] {
+    return this.inner.replicas;
+  }
+
+  get replicaCount(): number {
+    return this.inner.replicaCount;
+  }
+
+  get healthyCount(): number {
+    return this.inner.healthyCount;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// ForkGroup
+// ----------------------------------------------------------------------------
+
+/**
+ * N independent daemons forked from a common parent at
+ * `forkSeq`. Unique identities, shared ancestry via `ForkRecord`.
+ */
+export class ForkGroup {
+  private readonly inner: NapiForkGroup;
+
+  /** @internal */
+  constructor(inner: NapiForkGroup) {
+    this.inner = inner;
+  }
+
+  /** Fork `config.forkCount` new daemons from `parentOrigin` at
+   *  `forkSeq`. Each fork gets a fresh unique keypair + a
+   *  `ForkRecord` linking it to the parent. */
+  static fork(
+    runtime: DaemonRuntime,
+    kind: string,
+    parentOrigin: number,
+    forkSeq: bigint,
+    config: ForkGroupConfig,
+  ): ForkGroup {
+    try {
+      const napi = NapiForkGroup.fork(
+        runtime._napiRuntime(),
+        kind,
+        parentOrigin,
+        forkSeq,
+        config,
+      );
+      return new ForkGroup(napi);
+    } catch (e) {
+      return toGroupError(e);
+    }
+  }
+
+  routeEvent(ctx: RequestContext = {}): number {
+    try {
+      return this.inner.routeEvent(ctx);
+    } catch (e) {
+      return toGroupError(e);
+    }
+  }
+
+  scaleTo(n: number, kind?: string): void {
+    try {
+      this.inner.scaleTo(n, kind);
+    } catch (e) {
+      toGroupError(e);
+    }
+  }
+
+  onNodeFailure(failedNodeId: bigint, kind?: string): number[] {
+    try {
+      return this.inner.onNodeFailure(failedNodeId, kind);
+    } catch (e) {
+      return toGroupError(e);
+    }
+  }
+
+  onNodeRecovery(recoveredNodeId: bigint): void {
+    this.inner.onNodeRecovery(recoveredNodeId);
+  }
+
+  get health(): GroupHealth {
+    return this.inner.health;
+  }
+
+  get parentOrigin(): number {
+    return this.inner.parentOrigin;
+  }
+
+  get forkSeq(): bigint {
+    return this.inner.forkSeq;
+  }
+
+  get forkRecords(): ForkRecord[] {
+    return this.inner.forkRecords;
+  }
+
+  /** `true` iff every fork's `ForkRecord` verifies against its
+   *  parent. Core performs the signature + sentinel checks. */
+  verifyLineage(): boolean {
+    return this.inner.verifyLineage();
+  }
+
+  get members(): GroupMemberInfo[] {
+    return this.inner.members;
+  }
+
+  get forkCount(): number {
+    return this.inner.forkCount;
+  }
+
+  get healthyCount(): number {
+    return this.inner.healthyCount;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// StandbyGroup
+// ----------------------------------------------------------------------------
+
+/**
+ * Active-passive replication. One active processes events; N−1
+ * standbys hold snapshots and catch up via {@link sync}. On
+ * active failure, {@link promote} (or automatic failover via
+ * {@link onNodeFailure}) picks the most-synced standby.
+ *
+ * **Caller-driven buffering:** after every
+ * `runtime.deliver(group.activeOrigin, event)` the caller must
+ * also call `group.onEventDelivered(event)` so the standby
+ * replay buffer is accurate on promotion. See
+ * `SDK_GROUPS_SURFACE_PLAN.md` → "Open questions" for the
+ * manual-vs-hook rationale.
+ */
+export class StandbyGroup {
+  private readonly inner: NapiStandbyGroup;
+
+  /** @internal */
+  constructor(inner: NapiStandbyGroup) {
+    this.inner = inner;
+  }
+
+  static spawn(
+    runtime: DaemonRuntime,
+    kind: string,
+    config: StandbyGroupConfig,
+  ): StandbyGroup {
+    try {
+      const napi = NapiStandbyGroup.spawn(
+        runtime._napiRuntime(),
+        kind,
+        {
+          memberCount: config.memberCount,
+          groupSeed: toBuffer(config.groupSeed),
+          hostConfig: config.hostConfig,
+        },
+      );
+      return new StandbyGroup(napi);
+    } catch (e) {
+      return toGroupError(e);
+    }
+  }
+
+  /** `origin_hash` of the current active. Target for inbound
+   *  events; standbys don't process inputs. */
+  get activeOrigin(): number {
+    return this.inner.activeOrigin;
+  }
+
+  /** Snapshot the active and push to every standby. Returns the
+   *  sequence number the sync caught up through. */
+  sync(): bigint {
+    try {
+      return this.inner.syncStandbys();
+    } catch (e) {
+      return toGroupError(e);
+    }
+  }
+
+  /** Promote the most-synced standby to active. Call manually for
+   *  planned failover; {@link onNodeFailure} calls automatically
+   *  when the active's node fails. */
+  promote(kind?: string): number {
+    try {
+      return this.inner.promote(kind);
+    } catch (e) {
+      return toGroupError(e);
+    }
+  }
+
+  /** Handle node failure. Returns the new active's `origin_hash`
+   *  if the active was on `failedNodeId`; `null` if only standbys
+   *  were affected. */
+  onNodeFailure(failedNodeId: bigint, kind?: string): number | null {
+    try {
+      const r = this.inner.onNodeFailure(failedNodeId, kind);
+      return r ?? null;
+    } catch (e) {
+      return toGroupError(e);
+    }
+  }
+
+  onNodeRecovery(recoveredNodeId: bigint): void {
+    this.inner.onNodeRecovery(recoveredNodeId);
+  }
+
+  get health(): GroupHealth {
+    return this.inner.health;
+  }
+
+  get activeHealthy(): boolean {
+    return this.inner.activeHealthy;
+  }
+
+  get activeIndex(): number {
+    return this.inner.activeIndex;
+  }
+
+  /** `"active"` | `"standby"` | `null` (out-of-range). */
+  memberRole(index: number): 'active' | 'standby' | null {
+    const r = this.inner.memberRole(index);
+    return (r as 'active' | 'standby' | null) ?? null;
+  }
+
+  syncedThrough(index: number): bigint | null {
+    return this.inner.syncedThrough(index) ?? null;
+  }
+
+  get bufferedEventCount(): number {
+    return this.inner.bufferedEventCount;
+  }
+
+  get groupId(): number {
+    return this.inner.groupId;
+  }
+
+  get members(): GroupMemberInfo[] {
+    return this.inner.members;
+  }
+
+  get memberCount(): number {
+    return this.inner.memberCount;
+  }
+
+  get standbyCount(): number {
+    return this.inner.standbyCount;
+  }
+}

@@ -31,10 +31,13 @@ cortex = ["net/netdb", "net/redex-disk"]
 # because the compute module keeps a `kind -> TSFN` map that needs
 # concurrent access without serializing the whole NAPI runtime.
 compute = ["net", "dep:net-sdk", "dep:dashmap"]
+# HA / scaling overlays — `ReplicaGroup` / `ForkGroup` / `StandbyGroup`.
+# Follows `SDK_GROUPS_SURFACE_PLAN.md`. Sits on top of `compute`.
+groups = ["compute"]
 
 [dependencies]
 net = { path = "../..", default-features = false }
-net-sdk = { path = "../../sdk", default-features = false, features = ["compute"], optional = true }
+net-sdk = { path = "../../sdk", default-features = false, features = ["compute", "groups"], optional = true }
 dashmap = { version = "6", optional = true }
 napi = { version = "3.7.0", default-features = false, features = ["napi4", "napi6", "async", "tokio_rt"] }
 napi-derive = "3.4.0"

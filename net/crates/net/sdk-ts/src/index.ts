@@ -136,6 +136,21 @@ export type {
   MigrationErrorKind,
 } from './compute';
 
+// Groups (HA / scaling overlays — Stage 2 of SDK_GROUPS_SURFACE_PLAN).
+export { ReplicaGroup, ForkGroup, StandbyGroup, GroupError } from './groups';
+export type {
+  GroupErrorKind,
+  GroupStrategy,
+  GroupHealth,
+  GroupMemberInfo,
+  GroupHostConfig,
+  ForkRecord,
+  RequestContext,
+  ReplicaGroupConfig,
+  ForkGroupConfig,
+  StandbyGroupConfig,
+} from './groups';
+
 // Types.
 export type {
   NetNodeConfig,

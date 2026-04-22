@@ -244,6 +244,23 @@ export class MeshNode {
     return this.native;
   }
 
+  /**
+   * **Test-only.** Inject a synthetic peer entry into the local
+   * capability index so vitest suites can stage multi-candidate
+   * placement for `ReplicaGroup` / `ForkGroup` / `StandbyGroup`
+   * tests without a full 3-node handshake.
+   *
+   * Not part of the stable API; do NOT use in production code —
+   * the real mesh surface is `announceCapabilities`.
+   *
+   * @internal
+   */
+  _testInjectSyntheticPeer(nodeId: bigint): void {
+    // The NAPI method is feature-gated behind `groups`; callers
+    // must have built with that feature.
+    (this.native as unknown as { testInjectSyntheticPeer(nodeId: bigint): void }).testInjectSyntheticPeer(nodeId);
+  }
+
   /** Create and configure a new mesh node. */
   static async create(config: MeshNodeConfig): Promise<MeshNode> {
     const native = await NapiNetMesh.create({

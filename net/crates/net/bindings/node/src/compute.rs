@@ -278,6 +278,16 @@ pub struct DaemonRuntime {
     factories: Arc<DashMap<String, ()>>,
 }
 
+impl DaemonRuntime {
+    /// Access the underlying SDK runtime. Used by the `groups`
+    /// module to pass a `&SdkDaemonRuntime` into the group
+    /// constructors.
+    #[cfg(feature = "groups")]
+    pub(crate) fn sdk_runtime(&self) -> &SdkDaemonRuntime {
+        &self.inner
+    }
+}
+
 #[napi]
 impl DaemonRuntime {
     /// Build a compute runtime against an existing `NetMesh`.

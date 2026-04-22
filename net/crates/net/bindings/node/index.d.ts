@@ -240,6 +240,22 @@ export declare class DaemonRuntime {
   migrationPhase(originHash: number): string | null
 }
 
+export declare class ForkGroup {
+  static fork(runtime: DaemonRuntime, kind: string, parentOrigin: number, forkSeq: bigint, config: ForkGroupConfigJs): ForkGroup
+  routeEvent(ctx: RequestContextJs): number
+  scaleTo(n: number, kind?: string | undefined | null): void
+  onNodeFailure(failedNodeId: bigint, kind?: string | undefined | null): Array<number>
+  onNodeRecovery(recoveredNodeId: bigint): void
+  get health(): GroupHealthJs
+  get parentOrigin(): number
+  get forkSeq(): bigint
+  get forkRecords(): Array<ForkRecordJs>
+  verifyLineage(): boolean
+  get members(): Array<MemberInfoJs>
+  get forkCount(): number
+  get healthyCount(): number
+}
+
 /**
  * ed25519 keypair + local token cache. See the module docs for the
  * persistence model (seed out via `toBytes`, back in via
@@ -739,6 +755,21 @@ export declare class NetMesh {
    */
   announceCapabilities(caps: CapabilitySetJs): Promise<void>
   /**
+   * **Test-only** helper for the vitest groups suite.
+   * Injects a synthetic capability announcement directly
+   * into the local capability index, simulating a peer
+   * announcement without going through a real handshake.
+   *
+   * Production code should NOT use this — the mesh's
+   * normal `announce_capabilities` path is what peers
+   * broadcast through at runtime. This exists so
+   * `groups.test.ts` can stage enough placement candidates
+   * for `ReplicaGroup` / `ForkGroup` / `StandbyGroup`
+   * `place_with_spread` calls without spinning up a 3-node
+   * handshake in every test.
+   */
+  testInjectSyntheticPeer(nodeId: bigint): void
+  /**
    * Query the local capability index. Returns node ids
    * (including our own if we self-match) whose latest
    * announcement matches `filter`.
@@ -847,6 +878,62 @@ export declare class RedexTailIter {
   next(): Promise<RedexEventJs | null>
   /** Terminate the iterator. Idempotent. */
   close(): void
+}
+
+export declare class ReplicaGroup {
+  /**
+   * Spawn a replica group bound to an existing runtime. `kind`
+   * must have been registered via `runtime.registerFactory`.
+   */
+  static spawn(runtime: DaemonRuntime, kind: string, config: ReplicaGroupConfigJs): ReplicaGroup
+  /**
+   * Resolve `ctx` to the best-available replica's `origin_hash`.
+   * Caller hands the returned hash to `runtime.deliver(...)`.
+   */
+  routeEvent(ctx: RequestContextJs): number
+  /**
+   * Resize the group to `n` replicas. `kind` may be omitted to
+   * re-use the kind the group was spawned with.
+   */
+  scaleTo(n: number, kind?: string | undefined | null): void
+  /**
+   * Handle failure of a node hosting one or more replicas.
+   * Returns the indices of replicas that were successfully
+   * respawned on other nodes.
+   */
+  onNodeFailure(failedNodeId: bigint, kind?: string | undefined | null): Array<number>
+  onNodeRecovery(recoveredNodeId: bigint): void
+  get health(): GroupHealthJs
+  get groupId(): number
+  get replicas(): Array<MemberInfoJs>
+  get replicaCount(): number
+  get healthyCount(): number
+}
+
+export declare class StandbyGroup {
+  static spawn(runtime: DaemonRuntime, kind: string, config: StandbyGroupConfigJs): StandbyGroup
+  /**
+   * `origin_hash` of the current active. Feed to
+   * `runtime.deliver(...)` for every event, then call
+   * `onEventDelivered` with the same event so standbys have
+   * it in their replay buffer on promotion.
+   */
+  get activeOrigin(): number
+  syncStandbys(): bigint
+  promote(kind?: string | undefined | null): number
+  onNodeFailure(failedNodeId: bigint, kind?: string | undefined | null): number | null
+  onNodeRecovery(recoveredNodeId: bigint): void
+  get health(): GroupHealthJs
+  get activeHealthy(): boolean
+  get activeIndex(): number
+  /** `"active"` | `"standby"` | `null` (out-of-range index). */
+  memberRole(index: number): string | null
+  syncedThrough(index: number): bigint | null
+  get bufferedEventCount(): number
+  get groupId(): number
+  get members(): Array<MemberInfoJs>
+  get memberCount(): number
+  get standbyCount(): number
 }
 
 /** Typed tasks adapter handle. */
@@ -1151,6 +1238,19 @@ export interface EventBusOptions {
   net?: NetOptions
 }
 
+export interface ForkGroupConfigJs {
+  forkCount: number
+  lbStrategy: StrategyJs
+  hostConfig?: GroupHostConfigJs
+}
+
+export interface ForkRecordJs {
+  originalOrigin: number
+  forkedOrigin: number
+  forkSeq: bigint
+  fromSnapshotSeq?: bigint
+}
+
 /**
  * Generate a new Net keypair for encrypted UDP transport.
  *
@@ -1171,6 +1271,29 @@ export interface GpuInfoJs {
   computeUnits?: number
   tensorCores?: number
   fp16TflopsX10?: number
+}
+
+/**
+ * Aggregate group health. Matches the core `GroupHealth` enum
+ * as a tagged object so TS callers can discriminate on `status`.
+ */
+export interface GroupHealthJs {
+  /** `"healthy"` | `"degraded"` | `"dead"`. */
+  status: string
+  /** Populated on `"degraded"` — the current healthy count. */
+  healthy?: number
+  /** Populated on `"degraded"` — the total member count. */
+  total?: number
+}
+
+/**
+ * Daemon host config passed through to every group member.
+ * Matches `DaemonHostConfigJs` in `compute.rs` but duplicated here
+ * so this module stays self-contained.
+ */
+export interface GroupHostConfigJs {
+  autoSnapshotInterval?: bigint
+  maxLogEntries?: number
 }
 
 export interface HardwareJs {
@@ -1221,6 +1344,14 @@ export interface JetStreamOptions {
   maxAgeMs?: number
   /** Number of stream replicas (default: 1) */
   replicas?: number
+}
+
+export interface MemberInfoJs {
+  index: number
+  originHash: number
+  nodeId: bigint
+  entityId: Buffer
+  healthy: boolean
 }
 
 /** Ordering for memory queries. */
@@ -1575,6 +1706,30 @@ export interface RedisOptions {
   maxStreamLen?: number
 }
 
+export interface ReplicaGroupConfigJs {
+  /** Desired number of replicas. Must be ≥ 1. */
+  replicaCount: number
+  /**
+   * 32-byte seed for deterministic keypair derivation. Passed
+   * as `Buffer` of length 32; anything else rejects at spawn.
+   */
+  groupSeed: Buffer
+  lbStrategy: StrategyJs
+  hostConfig?: GroupHostConfigJs
+}
+
+/**
+ * Routing context handed to `routeEvent`. A single `routingKey`
+ * covers the common stickiness case; callers who need session /
+ * zone routing build a richer context via builder chaining in a
+ * future expansion.
+ */
+export interface RequestContextJs {
+  routingKey?: string
+  sessionId?: string
+  requestId?: string
+}
+
 export interface SoftwareJs {
   os?: string
   osVersion?: string
@@ -1583,6 +1738,12 @@ export interface SoftwareJs {
   frameworks?: Array<Array<string>>
   cudaVersion?: string
   drivers?: Array<Array<string>>
+}
+
+export interface StandbyGroupConfigJs {
+  memberCount: number
+  groupSeed: Buffer
+  hostConfig?: GroupHostConfigJs
 }
 
 /** Ingestion statistics. */
@@ -1613,6 +1774,31 @@ export interface StoredEvent {
   insertionTs: number
   /** Shard ID */
   shardId: number
+}
+
+/**
+ * Load-balancing strategy for inbound group events. Exposed as a
+ * string enum so TS callers pick via a stable name rather than an
+ * integer discriminator. Only the strategies commonly useful for
+ * group routing are surfaced; the core `loadbalance::Strategy`
+ * enum has more variants (`WeightedRoundRobin`, `PowerOfTwo`,
+ * `Adaptive`, etc.) that make sense for raw mesh streams but not
+ * for group membership.
+ */
+export declare const enum StrategyJs {
+  /** Rotate across healthy members per request. */
+  RoundRobin = 'round-robin',
+  /** Consistent-hash on the request's `routing_key`. */
+  ConsistentHash = 'consistent-hash',
+  /**
+   * Pick the least-loaded healthy member (by resource
+   * utilization metrics tracked in the LB state).
+   */
+  LeastLoad = 'least-load',
+  /** Pick the member with the fewest in-flight connections. */
+  LeastConnections = 'least-connections',
+  /** Select randomly among healthy members. */
+  Random = 'random'
 }
 
 /**

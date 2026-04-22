@@ -554,6 +554,13 @@ export class MigrationHandle {
  */
 export class DaemonRuntime {
   private readonly inner: NapiDaemonRuntime;
+
+  /** @internal Used by the `groups` module to pass this runtime
+   *  into NAPI group factories. NOT part of the stable API. */
+  _napiRuntime(): NapiDaemonRuntime {
+    return this.inner;
+  }
+
   /**
    * TS-side factory table, keyed by `kind`. `registerFactory`
    * inserts here; `spawn` looks up and invokes. Duplicates the

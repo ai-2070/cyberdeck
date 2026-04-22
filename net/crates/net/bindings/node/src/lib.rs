@@ -13,6 +13,8 @@ mod common;
 mod compute;
 #[cfg(feature = "cortex")]
 mod cortex;
+#[cfg(feature = "groups")]
+mod groups;
 #[cfg(feature = "net")]
 mod identity;
 #[cfg(feature = "net")]
@@ -1703,6 +1705,39 @@ mod mesh_bindings {
             node.announce_capabilities(core)
                 .await
                 .map_err(|e| Error::from_reason(format!("capability: {}", e)))
+        }
+
+        /// **Test-only** helper for the vitest groups suite.
+        /// Injects a synthetic capability announcement directly
+        /// into the local capability index, simulating a peer
+        /// announcement without going through a real handshake.
+        ///
+        /// Production code should NOT use this — the mesh's
+        /// normal `announce_capabilities` path is what peers
+        /// broadcast through at runtime. This exists so
+        /// `groups.test.ts` can stage enough placement candidates
+        /// for `ReplicaGroup` / `ForkGroup` / `StandbyGroup`
+        /// `place_with_spread` calls without spinning up a 3-node
+        /// handshake in every test.
+        #[napi]
+        #[cfg(feature = "groups")]
+        pub fn test_inject_synthetic_peer(&self, node_id: BigInt) -> Result<()> {
+            use net::adapter::net::behavior::capability::{
+                CapabilityAnnouncement, CapabilitySet,
+            };
+            use net::adapter::net::identity::EntityId;
+            let (_, nid, _) = node_id.get_u64();
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let index = node.capability_index().clone();
+            let eid = EntityId::from_bytes([0u8; 32]);
+            index.index(CapabilityAnnouncement::new(
+                nid,
+                eid,
+                1,
+                CapabilitySet::new(),
+            ));
+            Ok(())
         }
 
         /// Query the local capability index. Returns node ids
