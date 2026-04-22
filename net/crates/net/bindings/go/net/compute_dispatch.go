@@ -32,7 +32,7 @@ extern int bridgeProcess(uint64_t daemon_id, uint32_t origin_hash, uint64_t sequ
 extern int bridgeSnapshot(uint64_t daemon_id, uint8_t** out_ptr, size_t* out_len);
 extern int bridgeRestore(uint64_t daemon_id, const uint8_t* state, size_t state_len);
 extern void bridgeFree(uint64_t daemon_id);
-extern int bridgeFactory(const char* kind_ptr, size_t kind_len, uint64_t* out_daemon_id);
+extern int bridgeFactory(uint64_t runtime_id, const char* kind_ptr, size_t kind_len, uint64_t* out_daemon_id);
 */
 import "C"
 
@@ -94,73 +94,85 @@ type CausalEvent struct {
 // needs a new daemon instance for an inbound migration.
 type DaemonFactory func() MeshDaemon
 
+// factoryKey scopes a registered factory to a specific runtime so
+// two `DaemonRuntime`s in the same process can register the same
+// `kind` with different factories without colliding on the Go map.
+// The runtime id comes from `net_compute_runtime_id` on the Rust
+// side; 0 is reserved as a sentinel for "no runtime."
+type factoryKey struct {
+	runtimeID uint64
+	kind      string
+}
+
 var (
 	daemonsMu sync.RWMutex
 	daemons   = make(map[uint64]MeshDaemon)
 	nextID    atomic.Uint64
 
-	// Factory funcs keyed by kind string. Populated by
+	// Factory funcs keyed by (runtime_id, kind). Populated by
 	// `DaemonRuntime.RegisterFactoryFunc`; looked up by
-	// `goComputeFactory` on migration-target reconstruction.
-	// Process-wide because the Rust side's SDK factory closure is
-	// likewise process-wide — there's no per-runtime scoping
-	// boundary on the C-ABI.
+	// `goComputeFactory` on migration-target reconstruction. The
+	// runtime-id scoping means:
+	//
+	//   - Two runtimes registering the same kind with different
+	//     factories stay independent.
+	//   - Stale entries from a closed runtime can be purged in one
+	//     sweep via `purgeFactoryFuncsForRuntime(runtimeID)`.
 	factoryFuncsMu sync.RWMutex
-	factoryFuncs   = make(map[string]DaemonFactory)
+	factoryFuncs   = make(map[factoryKey]DaemonFactory)
 )
 
-// setFactoryFunc stores `fn` under `kind`, unconditionally.
-// Multiple `DaemonRuntime`s in the same process can register the
-// same `kind` — the factory map is process-global because the
-// C-side trampoline is keyed on `kind` alone with no runtime
-// discriminator. So duplicate-kind rejection happens at the
-// *Rust* layer (which IS per-runtime) while the Go map just holds
-// the callback the trampoline invokes.
-//
-// Public registration should go through `swapFactoryFunc` instead
-// so the previous value can be restored if the native register
-// call fails after the Go map was already mutated — otherwise a
-// failed registration silently overwrites the previous factory.
-func setFactoryFunc(kind string, fn DaemonFactory) {
+// swapFactoryFunc stores `fn` under `(runtimeID, kind)` and returns
+// the prior entry (if any) so it can be restored on rollback. Used
+// by `RegisterFactoryFunc`: mutate first so the trampoline has the
+// entry ready before the native register call lets migrations fire,
+// then restore via `restoreFactoryFunc` if the native side rejected.
+func swapFactoryFunc(runtimeID uint64, kind string, fn DaemonFactory) (prev DaemonFactory, existed bool) {
+	k := factoryKey{runtimeID: runtimeID, kind: kind}
 	factoryFuncsMu.Lock()
 	defer factoryFuncsMu.Unlock()
-	factoryFuncs[kind] = fn
-}
-
-// swapFactoryFunc stores `fn` under `kind` and returns the prior
-// entry (if any) so it can be restored on rollback. Used by
-// `RegisterFactoryFunc`: mutate first so the trampoline has the
-// entry ready before the native register call lets migrations
-// fire, then restore via `restoreFactoryFunc` if the native side
-// rejected.
-func swapFactoryFunc(kind string, fn DaemonFactory) (prev DaemonFactory, existed bool) {
-	factoryFuncsMu.Lock()
-	defer factoryFuncsMu.Unlock()
-	prev, existed = factoryFuncs[kind]
-	factoryFuncs[kind] = fn
+	prev, existed = factoryFuncs[k]
+	factoryFuncs[k] = fn
 	return
 }
 
-// restoreFactoryFunc undoes a `swapFactoryFunc`. If the kind had
-// no prior entry, the new entry is deleted; otherwise the prior
+// restoreFactoryFunc undoes a `swapFactoryFunc`. If the key had no
+// prior entry, the new entry is deleted; otherwise the prior
 // factory is put back. Called on every non-OK branch of
-// `RegisterFactoryFunc` so a rejected registration doesn't leave
-// a stale factory bound to the kind.
-func restoreFactoryFunc(kind string, prev DaemonFactory, existed bool) {
+// `RegisterFactoryFunc` so a rejected registration doesn't leave a
+// stale factory bound to the (runtimeID, kind) pair.
+func restoreFactoryFunc(runtimeID uint64, kind string, prev DaemonFactory, existed bool) {
+	k := factoryKey{runtimeID: runtimeID, kind: kind}
 	factoryFuncsMu.Lock()
 	defer factoryFuncsMu.Unlock()
 	if existed {
-		factoryFuncs[kind] = prev
+		factoryFuncs[k] = prev
 	} else {
-		delete(factoryFuncs, kind)
+		delete(factoryFuncs, k)
 	}
 }
 
-// lookupFactoryFunc returns the factory for `kind` or nil.
-func lookupFactoryFunc(kind string) DaemonFactory {
+// lookupFactoryFunc returns the factory for `(runtimeID, kind)` or nil.
+func lookupFactoryFunc(runtimeID uint64, kind string) DaemonFactory {
 	factoryFuncsMu.RLock()
 	defer factoryFuncsMu.RUnlock()
-	return factoryFuncs[kind]
+	return factoryFuncs[factoryKey{runtimeID: runtimeID, kind: kind}]
+}
+
+// purgeFactoryFuncsForRuntime removes every factory registered
+// against `runtimeID`. Called from `DaemonRuntime.Close()` so a
+// closed runtime's factory callbacks don't leak into a future
+// runtime that happens to reuse a freed runtime id (can't happen
+// with a monotonic u64, but defensive) and don't pin captured
+// Go closures longer than the runtime itself.
+func purgeFactoryFuncsForRuntime(runtimeID uint64) {
+	factoryFuncsMu.Lock()
+	defer factoryFuncsMu.Unlock()
+	for k := range factoryFuncs {
+		if k.runtimeID == runtimeID {
+			delete(factoryFuncs, k)
+		}
+	}
 }
 
 // registerDaemon stores `d` in the registry under a fresh uint64
@@ -305,7 +317,7 @@ func goComputeFree(daemonID C.uint64_t) {
 }
 
 //export goComputeFactory
-func goComputeFactory(kindPtr *C.char, kindLen C.size_t, outDaemonID *C.uint64_t) C.int {
+func goComputeFactory(runtimeID C.uint64_t, kindPtr *C.char, kindLen C.size_t, outDaemonID *C.uint64_t) C.int {
 	if outDaemonID == nil {
 		return -1
 	}
@@ -315,7 +327,7 @@ func goComputeFactory(kindPtr *C.char, kindLen C.size_t, outDaemonID *C.uint64_t
 		// the first NUL.
 		kind = C.GoStringN(kindPtr, C.int(kindLen))
 	}
-	fn := lookupFactoryFunc(kind)
+	fn := lookupFactoryFunc(uint64(runtimeID), kind)
 	if fn == nil {
 		return -1
 	}

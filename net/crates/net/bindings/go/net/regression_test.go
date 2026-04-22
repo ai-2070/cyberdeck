@@ -387,3 +387,96 @@ func TestRegressionNewDaemonRuntimeVsShutdownNoUseAfterFree(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// P1 regression: the process-global Go factory map must scope by
+// (runtime_id, kind) so two runtimes in the same process that
+// register the same kind don't collide.
+//
+// Before the fix the map was keyed on `kind` alone; the second
+// `RegisterFactoryFunc("counter", ...)` across two runtimes would
+// overwrite the first, and a migration landing on the original
+// runtime's trampoline would reconstruct using the wrong factory.
+// The fix captures `net_compute_runtime_id` per runtime and scopes
+// every map operation to `(runtime_id, kind)`.
+//
+// This test:
+//   1. Creates two independent runtimes on two independent meshes.
+//   2. Registers the same kind on each with a *different* factory
+//      (one produces an "A"-flavoured counter, the other "B").
+//   3. Asserts the Go-side trampoline resolves each runtime's
+//      registration independently by looking them up with their
+//      respective runtime ids.
+//   4. Asserts Close() purges each runtime's entries from the map.
+// ---------------------------------------------------------------------------
+
+type flavouredDaemon struct{ flavour string }
+
+func (flavouredDaemon) Process(event CausalEvent) ([][]byte, error) {
+	return nil, nil
+}
+
+func TestRegressionFactoryMapScopedByRuntimeID(t *testing.T) {
+	meshA := newLocalMesh(t)
+	defer meshA.Shutdown()
+	meshB := newLocalMesh(t)
+	defer meshB.Shutdown()
+
+	rtA, err := NewDaemonRuntime(meshA)
+	if err != nil {
+		t.Fatalf("NewDaemonRuntime A: %v", err)
+	}
+	rtB, err := NewDaemonRuntime(meshB)
+	if err != nil {
+		t.Fatalf("NewDaemonRuntime B: %v", err)
+	}
+
+	if rtA.runtimeID == 0 || rtB.runtimeID == 0 {
+		t.Fatalf("runtime ids must be non-zero; got A=%d B=%d", rtA.runtimeID, rtB.runtimeID)
+	}
+	if rtA.runtimeID == rtB.runtimeID {
+		t.Fatalf("two runtimes must have distinct ids; both are %d", rtA.runtimeID)
+	}
+
+	factoryA := func() MeshDaemon { return flavouredDaemon{flavour: "A"} }
+	factoryB := func() MeshDaemon { return flavouredDaemon{flavour: "B"} }
+
+	if err := rtA.RegisterFactoryFunc("counter", factoryA); err != nil {
+		t.Fatalf("RegisterFactoryFunc A: %v", err)
+	}
+	if err := rtB.RegisterFactoryFunc("counter", factoryB); err != nil {
+		t.Fatalf("RegisterFactoryFunc B: %v", err)
+	}
+
+	// Each trampoline lookup must return its own runtime's factory.
+	// Before the fix, `factoryB` would have overwritten `factoryA`
+	// on a shared `map[string]DaemonFactory`.
+	gotA := lookupFactoryFunc(rtA.runtimeID, "counter")
+	gotB := lookupFactoryFunc(rtB.runtimeID, "counter")
+	if gotA == nil || gotB == nil {
+		t.Fatalf("both lookups should return non-nil; gotA=%v gotB=%v", gotA, gotB)
+	}
+	a := gotA().(flavouredDaemon)
+	b := gotB().(flavouredDaemon)
+	if a.flavour != "A" {
+		t.Errorf("runtime A's factory produced flavour=%q, want 'A'", a.flavour)
+	}
+	if b.flavour != "B" {
+		t.Errorf("runtime B's factory produced flavour=%q, want 'B'", b.flavour)
+	}
+
+	// Close rtA — its entry must vanish from the map. rtB's
+	// registration must survive.
+	rtA.Close()
+	if lookupFactoryFunc(rtA.runtimeID, "counter") != nil {
+		t.Errorf("rtA factory still present after Close — purge leaked")
+	}
+	if lookupFactoryFunc(rtB.runtimeID, "counter") == nil {
+		t.Errorf("rtB factory vanished when rtA closed — wrong runtime purged")
+	}
+
+	rtB.Close()
+	if lookupFactoryFunc(rtB.runtimeID, "counter") != nil {
+		t.Errorf("rtB factory still present after Close — purge leaked")
+	}
+}

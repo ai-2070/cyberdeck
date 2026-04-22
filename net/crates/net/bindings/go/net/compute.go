@@ -63,7 +63,15 @@ var ErrRuntimeShutDown = errors.New("daemon: runtime handle freed")
 // finalizer.
 type DaemonRuntime struct {
 	handle *C.net_compute_runtime_t
-	mu     sync.RWMutex
+	// runtimeID is the monotonic id returned by
+	// `net_compute_runtime_id`. Captured at construction and
+	// used as the first component of every `factoryKey` so two
+	// runtimes in the same process that register the same
+	// `kind` don't collide on the Go factory map. Purged via
+	// `purgeFactoryFuncsForRuntime` in `Close()` so a closed
+	// runtime's callbacks don't leak.
+	runtimeID uint64
+	mu        sync.RWMutex
 }
 
 // NewDaemonRuntime builds a DaemonRuntime bound to the given
@@ -122,7 +130,10 @@ func NewDaemonRuntime(mesh *MeshNode) (*DaemonRuntime, error) {
 		C.net_mesh_channel_configs_arc_free(ccArc)
 		return nil, &DaemonError{Message: "failed to build runtime"}
 	}
-	rt := &DaemonRuntime{handle: handle}
+	rt := &DaemonRuntime{
+		handle:    handle,
+		runtimeID: uint64(C.net_compute_runtime_id(handle)),
+	}
 	runtime.SetFinalizer(rt, (*DaemonRuntime).Close)
 	return rt, nil
 }
@@ -219,7 +230,7 @@ func (rt *DaemonRuntime) RegisterFactoryFunc(kind string, factory DaemonFactory)
 	// discriminator; per-runtime duplicate-kind rejection is the
 	// Rust layer's job (it returns `DUPLICATE_KIND` from the FFI
 	// when a given DaemonRuntime already has `kind` registered).
-	prev, existed := swapFactoryFunc(kind, factory)
+	prev, existed := swapFactoryFunc(rt.runtimeID, kind, factory)
 
 	kindBytes := []byte(kind)
 	var ptr *C.char
@@ -235,20 +246,20 @@ func (rt *DaemonRuntime) RegisterFactoryFunc(kind string, factory DaemonFactory)
 		// Rust says this runtime already had the kind. Restore
 		// the prior Go-side factory so a subsequent migration
 		// into the original runtime still resolves correctly.
-		restoreFactoryFunc(kind, prev, existed)
+		restoreFactoryFunc(rt.runtimeID, kind, prev, existed)
 		return &DuplicateKindError{Kind: kind}
 	case C.NET_COMPUTE_ERR_CALL_FAILED:
 		// The Rust side maps `DaemonError::ShuttingDown` /
 		// `NotReady` to this code. Callers racing a concurrent
 		// `Shutdown` should see the typed shutdown sentinel, not
 		// a generic CALL_FAILED message.
-		restoreFactoryFunc(kind, prev, existed)
+		restoreFactoryFunc(rt.runtimeID, kind, prev, existed)
 		return ErrRuntimeShutDown
 	case C.NET_COMPUTE_ERR_NULL:
-		restoreFactoryFunc(kind, prev, existed)
+		restoreFactoryFunc(rt.runtimeID, kind, prev, existed)
 		return &DaemonError{Message: "register_factory_with_func: null argument"}
 	default:
-		restoreFactoryFunc(kind, prev, existed)
+		restoreFactoryFunc(rt.runtimeID, kind, prev, existed)
 		return &DaemonError{Message: fmt.Sprintf("register_factory_with_func: unexpected code %d", code)}
 	}
 }
@@ -298,6 +309,12 @@ func (rt *DaemonRuntime) RegisterFactory(kind string) error {
 // Close releases the native handle. Idempotent — a second call is
 // a no-op. If Shutdown has not been called, Close attempts it
 // best-effort (discarding the error) before freeing.
+//
+// Also purges every factory the runtime had registered in the
+// process-global factory map. Without this, closed runtimes would
+// leak their Go-closure factories indefinitely — the map retains
+// the closure references and the closures may capture substantial
+// state (JS / Python bridges, configs, etc.).
 func (rt *DaemonRuntime) Close() {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -311,6 +328,13 @@ func (rt *DaemonRuntime) Close() {
 	}
 	C.net_compute_runtime_free(rt.handle)
 	rt.handle = nil
+	// Drop every factory registered against this runtime's id.
+	// Safe to call with `runtimeID == 0` (a never-initialized
+	// struct, e.g. from a test that zero-values the type): the
+	// purge is a no-op in that case.
+	if rt.runtimeID != 0 {
+		purgeFactoryFuncsForRuntime(rt.runtimeID)
+	}
 	runtime.SetFinalizer(rt, nil)
 }
 

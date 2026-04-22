@@ -631,6 +631,12 @@ net_compute_runtime_t*  net_compute_runtime_new(
 /* Free a runtime handle. The underlying MeshNode is untouched. */
 void                    net_compute_runtime_free(net_compute_runtime_t* handle);
 
+/* Return the monotonic, process-unique identifier assigned to this
+ * runtime by `net_compute_runtime_new`. Go uses this id to scope
+ * its factory map so two runtimes in the same process can register
+ * the same `kind` without colliding. Returns 0 on NULL input. */
+uint64_t                net_compute_runtime_id(const net_compute_runtime_t* handle);
+
 /* Transition to Ready. On failure, writes a heap-allocated char*
  * detail to `*err_out` (free via `net_compute_free_cstring`). */
 int                     net_compute_runtime_start(
@@ -702,6 +708,7 @@ typedef int (*net_compute_restore_fn)(
 typedef void (*net_compute_free_fn)(uint64_t daemon_id);
 
 typedef int (*net_compute_factory_fn)(
+    uint64_t runtime_id,
     const char* kind_ptr,
     size_t kind_len,
     uint64_t* out_daemon_id);

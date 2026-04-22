@@ -169,7 +169,22 @@ pub struct DaemonRuntimeHandle {
     /// DashMap on NAPI / PyO3). Sub-step 2 will swap the value
     /// type to a Go-callback trampoline table.
     factories: Arc<DashMap<String, ()>>,
+    /// Monotonic, process-unique identifier used to scope the
+    /// Go-side factory map to *this* runtime. Without it, two
+    /// `DaemonRuntime`s in the same process that register the
+    /// same `kind` would collide on the process-global Go map
+    /// and the second registration would overwrite the first —
+    /// a migrated-in daemon could then reconstruct using the
+    /// wrong implementation. We pass `runtime_id` through the
+    /// factory trampoline so Go looks up `(runtime_id, kind)`
+    /// instead of `kind` alone.
+    runtime_id: u64,
 }
+
+/// Monotonic counter for `DaemonRuntimeHandle::runtime_id`. Starts
+/// at 1 so `0` is reserved as a sentinel for "no runtime" (defensive
+/// against uninitialized trampoline calls).
+static NEXT_RUNTIME_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 // =========================================================================
 // Free helpers — misc out-of-band allocations
@@ -227,10 +242,27 @@ pub extern "C" fn net_compute_runtime_new(
     let sdk_mesh = SdkMesh::from_node_arc(node, cc, None);
     let sdk_rt = SdkDaemonRuntime::new(Arc::new(sdk_mesh));
 
+    let runtime_id = NEXT_RUNTIME_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Box::into_raw(Box::new(DaemonRuntimeHandle {
         inner: Arc::new(sdk_rt),
         factories: Arc::new(DashMap::new()),
+        runtime_id,
     }))
+}
+
+/// Return the monotonic runtime identifier assigned at
+/// `net_compute_runtime_new`. Go uses this to scope its factory
+/// map to this runtime so two runtimes in the same process can
+/// register the same kind with different factories without
+/// collision.
+///
+/// Returns `0` on NULL input.
+#[no_mangle]
+pub extern "C" fn net_compute_runtime_id(handle: *const DaemonRuntimeHandle) -> u64 {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return 0;
+    };
+    h.runtime_id
 }
 
 /// Free a runtime handle. The underlying `MeshNode` stays alive
@@ -331,15 +363,15 @@ pub extern "C" fn net_compute_runtime_daemon_count(handle: *mut DaemonRuntimeHan
 /// `register_migration_target_identity`) for that kind.
 ///
 /// **Migration-target reconstruction caveat:** the SDK-side
-/// factory closure mirrored here returns a `NoopBridge` fallback
-/// — a placeholder `MeshDaemon` whose `process` emits no output.
-/// A daemon migrated INTO a Go target today lands as a no-op
-/// daemon. Sub-step 5+ will swap this for a Go-callback path that
-/// invokes a registered factory function. For the Node / Python
-/// bindings this gap is closed (via TSFN / `Py<PyAny>`
-/// round-trips); the Go equivalent is deferred because it
-/// requires a separate C-ABI factory trampoline to look up a Go
-/// factory by kind string.
+/// factory closure mirrored here returns a
+/// `ReconstructionErrorBridge` fallback — a placeholder
+/// `MeshDaemon` whose `restore` / `process` return a typed error
+/// identifying the root cause (e.g. "register via
+/// RegisterFactoryFunc to enable reconstruction"). A daemon
+/// migrated INTO a Go target today therefore fails visibly on
+/// first event rather than silently accepting and dropping them.
+/// Use [`net_compute_register_factory_with_func`] instead for the
+/// full migration-capable path.
 ///
 /// Returns [`NET_COMPUTE_OK`] on success,
 /// [`NET_COMPUTE_ERR_DUPLICATE_KIND`] if the kind was already
@@ -374,13 +406,19 @@ pub extern "C" fn net_compute_register_factory(
         }
     }
 
-    // Mirror into the SDK factory registry with a NoopBridge
-    // fallback. Without this, `expect_migration` /
+    // Mirror into the SDK factory registry with a loud-failure
+    // fallback bridge. Without this, `expect_migration` /
     // `register_migration_target_identity` reject with
-    // `FactoryNotFound` because they call `factory_for_kind(kind)`.
+    // `FactoryNotFound`. The bridge fails on first `restore` /
+    // `process` with a typed error so a migration that lands on
+    // a kind registered via `RegisterFactory` (without Func) is
+    // visibly rejected rather than silently accepting events.
     let kind_for_bridge = kind.clone();
     if let Err(e) = h.inner.register_factory(&kind, move || {
-        Box::new(NoopBridge::new(kind_for_bridge.clone())) as Box<dyn MeshDaemon>
+        Box::new(ReconstructionErrorBridge::new(
+            kind_for_bridge.clone(),
+            "kind registered via RegisterFactory (without Func); use RegisterFactoryFunc to enable migration-target reconstruction",
+        )) as Box<dyn MeshDaemon>
     }) {
         // SDK rejected the mirror — roll back our kind-set entry
         // so the two registries stay in sync.
@@ -403,10 +441,14 @@ pub extern "C" fn net_compute_register_factory(
 
 /// Register a factory kind with a real Go-side factory function
 /// so migration-target reconstruction builds a fresh user daemon
-/// instead of falling back to `NoopBridge`. The Go caller supplied
-/// the factory via [`RegisterFactoryFunc`](../../../net/net/migration.go);
+/// instead of falling back to `ReconstructionErrorBridge`. The Go
+/// caller supplied the factory via
+/// [`RegisterFactoryFunc`](../../../net/net/migration.go);
 /// we look it up via the dispatcher's `factory` trampoline on
-/// every reconstruction.
+/// every reconstruction. The trampoline receives the runtime id
+/// (from `net_compute_runtime_id`) so the Go side can scope its
+/// factory map per-runtime — two runtimes in the same process
+/// can register the same `kind` without colliding.
 ///
 /// Use this instead of [`net_compute_register_factory`] when you
 /// want migrated-in daemons on this target to actually run user
@@ -436,30 +478,40 @@ pub extern "C" fn net_compute_register_factory_with_func(
     }
 
     // SDK closure reaches back into Go via the factory trampoline
-    // to build a fresh daemon per invocation. Dispatcher MUST be
-    // set before the first migration lands — we panic lazily if
-    // it's missing rather than failing silently.
+    // to build a fresh daemon per invocation. Captures the runtime
+    // id so Go can scope its factory map to this runtime and avoid
+    // the process-global overwrite bug (two runtimes registering
+    // the same kind would otherwise collide).
     let kind_for_closure = kind.clone();
+    let runtime_id = h.runtime_id;
     let closure = move || -> Box<dyn MeshDaemon> {
         let Some(d) = DISPATCHER.get() else {
-            eprintln!(
-                "net-compute-ffi: factory closure fired with no dispatcher; returning NoopBridge"
-            );
-            return Box::new(NoopBridge::new(kind_for_closure.clone()));
+            // Failing loudly beats silent-noop: a reconstructed
+            // daemon that processes zero events is harder to spot
+            // than a typed error. See `ReconstructionErrorBridge`.
+            let reason = "Go dispatcher not registered (net_compute_set_dispatcher never called)";
+            eprintln!("net-compute-ffi: kind '{kind_for_closure}': {reason}");
+            return Box::new(ReconstructionErrorBridge::new(
+                kind_for_closure.clone(),
+                reason,
+            ));
         };
         let mut daemon_id: u64 = 0;
         let code = unsafe {
             (d.factory)(
+                runtime_id,
                 kind_for_closure.as_ptr() as *const c_char,
                 kind_for_closure.len(),
                 &mut daemon_id,
             )
         };
         if code != NET_COMPUTE_OK {
-            eprintln!(
-                "net-compute-ffi: Go factory for '{kind_for_closure}' returned {code}; falling back to NoopBridge"
-            );
-            return Box::new(NoopBridge::new(kind_for_closure.clone()));
+            let reason = format!("Go factory returned error code {code}");
+            eprintln!("net-compute-ffi: kind '{kind_for_closure}': {reason}");
+            return Box::new(ReconstructionErrorBridge::new(
+                kind_for_closure.clone(),
+                reason,
+            ));
         }
         Box::new(GoBridge {
             name: kind_for_closure.clone(),
@@ -520,15 +572,21 @@ pub type FreeFn = unsafe extern "C" fn(daemon_id: u64);
 /// it on every migration-target reconstruction via the factory
 /// closure mirrored into the SDK by
 /// [`net_compute_register_factory_with_func`]; the Go side looks
-/// up the registered factory by `kind`, invokes it to build a
-/// fresh `MeshDaemon`, inserts it into the daemon registry, and
-/// writes the new `daemon_id` into `*out_daemon_id`.
+/// up the registered factory by `(runtime_id, kind)`, invokes it
+/// to build a fresh `MeshDaemon`, inserts it into the daemon
+/// registry, and writes the new `daemon_id` into `*out_daemon_id`.
+/// The `runtime_id` argument scopes the lookup so two runtimes in
+/// the same process that registered the same kind don't collide
+/// (see `net_compute_runtime_id`).
 ///
 /// Returns `NET_COMPUTE_OK` on success; non-zero means the Go
 /// side couldn't build a daemon (no factory registered, factory
-/// panicked, etc.). The Rust bridge falls back to `NoopBridge` on
-/// failure.
+/// panicked, etc.). The Rust bridge installs a
+/// `ReconstructionErrorBridge` on failure — the migration's next
+/// `restore` / `process` returns a typed error carrying the
+/// failure reason.
 pub type FactoryFn = unsafe extern "C" fn(
+    runtime_id: u64,
     kind_ptr: *const c_char,
     kind_len: usize,
     out_daemon_id: *mut u64,
@@ -871,13 +929,19 @@ pub extern "C" fn net_compute_spawn(
         name: kind.clone(),
         daemon_id,
     });
-    // kind_factory for migration-target reconstruction — returns
-    // a NoopBridge fallback because we don't currently call back
-    // into Go's factory on the target side. Sub-step 4 addresses
-    // this for migration-capable Go targets.
-    let kind_for_noop = kind.clone();
-    let kind_factory =
-        move || -> Box<dyn MeshDaemon> { Box::new(NoopBridge::new(kind_for_noop.clone())) };
+    // kind_factory for migration-target reconstruction. Uses a
+    // loud-failure bridge: if a migration lands here before the
+    // caller has also installed `RegisterFactoryFunc` for this
+    // kind, the migration fails visibly on first `restore` /
+    // `process` rather than silently accepting events into a
+    // noop.
+    let kind_for_fallback = kind.clone();
+    let kind_factory = move || -> Box<dyn MeshDaemon> {
+        Box::new(ReconstructionErrorBridge::new(
+            kind_for_fallback.clone(),
+            "spawn-side kind registration does not route to a Go factory; call DaemonRuntime.RegisterFactoryFunc before the migration lands",
+        ))
+    };
 
     let inner = h.inner.clone();
     let rt = runtime();
@@ -1050,9 +1114,15 @@ pub extern "C" fn net_compute_spawn_from_snapshot(
         name: kind.clone(),
         daemon_id,
     });
-    let kind_for_noop = kind.clone();
-    let kind_factory =
-        move || -> Box<dyn MeshDaemon> { Box::new(NoopBridge::new(kind_for_noop.clone())) };
+    // Same loud-failure fallback rationale as the plain-spawn
+    // path above — see the comment there.
+    let kind_for_fallback = kind.clone();
+    let kind_factory = move || -> Box<dyn MeshDaemon> {
+        Box::new(ReconstructionErrorBridge::new(
+            kind_for_fallback.clone(),
+            "spawn-from-snapshot kind registration does not route to a Go factory; call DaemonRuntime.RegisterFactoryFunc before the migration lands",
+        ))
+    };
 
     let inner = h.inner.clone();
     let rt = runtime();
@@ -1503,20 +1573,52 @@ pub extern "C" fn net_compute_outputs_free(vec: *mut OutputsVec) {
 }
 
 // =========================================================================
-// NoopBridge — migration-target fallback
+// ReconstructionErrorBridge — loud-failure fallback for factory errors
 // =========================================================================
 
-struct NoopBridge {
+/// Fallback `MeshDaemon` used when a migration-target factory
+/// reconstruction fails (Go dispatcher missing, Go factory returned
+/// non-OK, register-factory-without-func placeholder, etc.).
+///
+/// **Why loud, not silent.** The previous implementation
+/// (`NoopBridge`) returned `Ok(vec![])` from `process`, which made
+/// migrations appear to succeed on the target even though every
+/// event the daemon received was silently dropped. Operators saw
+/// "migration completed" alongside vanishing event throughput and
+/// no diagnostic. This bridge instead:
+///
+/// - Returns `CoreDaemonError::RestoreFailed` from `restore`, so
+///   the migration's restore phase fails visibly with a typed
+///   error carrying the underlying reason.
+/// - Returns `CoreDaemonError::ProcessFailed` from every `process`
+///   call, so stateless migrations (where `restore` isn't
+///   exercised) still surface a failure on the first event.
+///
+/// Mirrors the same fix applied to the NAPI and PyO3 bindings —
+/// see `bindings/node/src/compute.rs` and
+/// `bindings/python/src/compute.rs` for the peer implementations.
+struct ReconstructionErrorBridge {
     name: String,
+    reason: String,
 }
 
-impl NoopBridge {
-    fn new(name: String) -> Self {
-        Self { name }
+impl ReconstructionErrorBridge {
+    fn new(name: String, reason: impl Into<String>) -> Self {
+        Self {
+            name,
+            reason: reason.into(),
+        }
+    }
+
+    fn err_msg(&self, op: &str) -> String {
+        format!(
+            "reconstruction failed for daemon kind '{}' on {}: {}",
+            self.name, op, self.reason,
+        )
     }
 }
 
-impl MeshDaemon for NoopBridge {
+impl MeshDaemon for ReconstructionErrorBridge {
     fn name(&self) -> &str {
         &self.name
     }
@@ -1529,7 +1631,11 @@ impl MeshDaemon for NoopBridge {
         &mut self,
         _event: &CausalEvent,
     ) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
-        Ok(Vec::new())
+        Err(CoreDaemonError::ProcessFailed(self.err_msg("process")))
+    }
+
+    fn restore(&mut self, _state: Bytes) -> std::result::Result<(), CoreDaemonError> {
+        Err(CoreDaemonError::RestoreFailed(self.err_msg("restore")))
     }
 }
 
@@ -2361,5 +2467,84 @@ pub extern "C" fn net_compute_standby_group_member_role(
             .map(|c| c.into_raw())
             .unwrap_or(std::ptr::null_mut()),
         None => std::ptr::null_mut(),
+    }
+}
+
+// =========================================================================
+// Tests
+// =========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: migration-target reconstruction fallback must
+    // fail loudly, never silently. Before this fix the compute-ffi
+    // layer installed a `NoopBridge` whose `process` returned
+    // `Ok(vec![])`, so a migration could "succeed" on a Go target
+    // where the dispatcher wasn't installed / the Go factory
+    // returned an error — the daemon would then silently swallow
+    // every event with no diagnostic. The replacement
+    // `ReconstructionErrorBridge` returns typed `RestoreFailed`
+    // from `restore` and typed `ProcessFailed` from `process`
+    // carrying the underlying reason, mirroring the same fix in
+    // the NAPI and PyO3 bindings.
+
+    #[test]
+    fn reconstruction_error_bridge_process_returns_typed_error() {
+        let mut bridge = ReconstructionErrorBridge::new(
+            "counter".to_string(),
+            "Go factory returned error code 2",
+        );
+        let event = CausalEvent {
+            link: ::net::adapter::net::state::causal::CausalLink {
+                origin_hash: 0xdead_beef,
+                horizon_encoded: 0,
+                sequence: 1,
+                parent_hash: 0,
+            },
+            payload: bytes::Bytes::from_static(b"x"),
+            received_at: 0,
+        };
+
+        let result = bridge.process(&event);
+        match result {
+            Err(CoreDaemonError::ProcessFailed(msg)) => {
+                assert!(msg.contains("counter"), "missing kind: {msg}");
+                assert!(
+                    msg.contains("Go factory returned error code 2"),
+                    "missing underlying reason: {msg}",
+                );
+                assert!(msg.contains("process"), "missing op label: {msg}");
+            }
+            Err(other) => panic!("expected ProcessFailed, got {other:?}"),
+            Ok(outputs) => panic!(
+                "silent-noop regression: ReconstructionErrorBridge must never return Ok; got {} outputs",
+                outputs.len(),
+            ),
+        }
+    }
+
+    #[test]
+    fn reconstruction_error_bridge_restore_returns_typed_error() {
+        let mut bridge =
+            ReconstructionErrorBridge::new("echo".to_string(), "Go dispatcher not registered");
+        let state = bytes::Bytes::from_static(&[0u8; 16]);
+
+        let result = bridge.restore(state);
+        match result {
+            Err(CoreDaemonError::RestoreFailed(msg)) => {
+                assert!(msg.contains("echo"), "missing kind: {msg}");
+                assert!(
+                    msg.contains("dispatcher not registered"),
+                    "missing underlying reason: {msg}",
+                );
+                assert!(msg.contains("restore"), "missing op label: {msg}");
+            }
+            Err(other) => panic!("expected RestoreFailed, got {other:?}"),
+            Ok(()) => panic!(
+                "silent-noop regression: ReconstructionErrorBridge::restore must never return Ok",
+            ),
+        }
     }
 }
