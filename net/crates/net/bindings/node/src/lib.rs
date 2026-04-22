@@ -1025,6 +1025,20 @@ mod mesh_bindings {
         /// `node_id`) from these bytes instead of generating
         /// ephemeral ones. Treat as secret material.
         pub identity_seed: Option<Buffer>,
+        /// Pin this mesh's publicly-advertised reflex to the
+        /// supplied external `"ip:port"`. Classification is
+        /// skipped; the node starts in `nat:open` and advertises
+        /// this address on capability announcements.
+        ///
+        /// Use for port-forwarded servers (operator knows the
+        /// external address) and stage-4 UPnP / NAT-PMP
+        /// integration. **Optimization, not correctness** —
+        /// nodes without an override still reach every peer via
+        /// the routed-handshake path.
+        ///
+        /// Silently ignored when the Rust cdylib was built
+        /// without `--features nat-traversal`.
+        pub reflex_override: Option<String>,
     }
 
     /// JS-facing channel config, mirroring the core `ChannelConfig`
@@ -1300,6 +1314,13 @@ mod mesh_bindings {
             if let Some(policy_js) = options.subnet_policy {
                 let policy = std::sync::Arc::new(crate::subnets::subnet_policy_from_js(policy_js)?);
                 config = config.with_subnet_policy(policy);
+            }
+            #[cfg(feature = "nat-traversal")]
+            if let Some(external_str) = options.reflex_override.as_deref() {
+                let external: std::net::SocketAddr = external_str
+                    .parse()
+                    .map_err(|e| Error::from_reason(format!("invalid reflex_override: {e}")))?;
+                config = config.with_reflex_override(external);
             }
 
             let identity = match options.identity_seed {

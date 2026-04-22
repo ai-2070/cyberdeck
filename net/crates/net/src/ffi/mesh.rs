@@ -287,6 +287,13 @@ struct MeshNewConfig {
     /// `IdentityFromSeed(sameSeed)`. Leave unset to generate a fresh
     /// keypair.
     identity_seed_hex: Option<String>,
+    /// Pin this mesh's publicly-advertised reflex address (an
+    /// `"ip:port"` string). Classification is skipped; the node
+    /// starts in `nat:open` with this address on its capability
+    /// announcements. Silently ignored when the cdylib is built
+    /// without `--features nat-traversal`.
+    #[serde(default)]
+    reflex_override: Option<String>,
 }
 
 pub struct MeshNodeHandle {
@@ -365,6 +372,18 @@ pub extern "C" fn net_mesh_new(
         };
         node_cfg = node_cfg.with_subnet_policy(Arc::new(policy));
     }
+    #[cfg(feature = "nat-traversal")]
+    if let Some(external_str) = cfg.reflex_override.as_deref() {
+        let Ok(external) = external_str.parse::<std::net::SocketAddr>() else {
+            return NET_ERR_MESH_INIT;
+        };
+        node_cfg = node_cfg.with_reflex_override(external);
+    }
+    // Silently drop the field in builds without nat-traversal so
+    // Go callers compiled against a full-feature cdylib can fall
+    // back to a thin cdylib without a JSON-parse error.
+    #[cfg(not(feature = "nat-traversal"))]
+    let _ = cfg.reflex_override;
 
     let identity = match cfg.identity_seed_hex {
         Some(seed_hex) => {

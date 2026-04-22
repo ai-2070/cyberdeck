@@ -73,10 +73,7 @@ fn test_config(port: u16) -> MeshNodeConfig {
     cfg
 }
 
-async fn build_mesh_with_override(
-    port: u16,
-    external: SocketAddr,
-) -> Arc<MeshNode> {
+async fn build_mesh_with_override(port: u16, external: SocketAddr) -> Arc<MeshNode> {
     let cfg = test_config(port).with_reflex_override(external);
     Arc::new(
         MeshNode::new(EntityKeypair::generate(), cfg)
@@ -197,8 +194,7 @@ async fn override_propagates_through_capability_broadcast() {
 
     // B should also see A's nat:open tag (override implies Open).
     let peers = b.find_peers_by_filter(
-        &net::adapter::net::behavior::capability::CapabilityFilter::new()
-            .require_tag("nat:open"),
+        &net::adapter::net::behavior::capability::CapabilityFilter::new().require_tag("nat:open"),
     );
     assert!(
         peers.contains(&a_id),

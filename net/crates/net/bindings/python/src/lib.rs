@@ -1086,6 +1086,7 @@ mod mesh_bindings {
             require_signed_capabilities=None,
             subnet=None,
             subnet_policy=None,
+            reflex_override=None,
         ))]
         #[allow(clippy::too_many_arguments)]
         fn new(
@@ -1099,6 +1100,13 @@ mod mesh_bindings {
             require_signed_capabilities: Option<bool>,
             subnet: Option<Vec<u32>>,
             subnet_policy: Option<&Bound<'_, PyDict>>,
+            // reflex_override: pin this mesh's public reflex to
+            // the supplied external "ip:port". Classification is
+            // skipped; the node starts in "open" with this
+            // reflex on its capability announcements. Silently
+            // ignored when the cdylib was built without
+            // `--features nat-traversal`.
+            reflex_override: Option<&str>,
         ) -> PyResult<Self> {
             let addr: std::net::SocketAddr = bind_addr
                 .parse()
@@ -1136,6 +1144,19 @@ mod mesh_bindings {
                 let policy = Arc::new(super::subnets::subnet_policy_from_py(policy_dict)?);
                 config = config.with_subnet_policy(policy);
             }
+            #[cfg(feature = "nat-traversal")]
+            if let Some(external_str) = reflex_override {
+                let external: std::net::SocketAddr = external_str.parse().map_err(|e| {
+                    PyValueError::new_err(format!("invalid reflex_override: {e}"))
+                })?;
+                config = config.with_reflex_override(external);
+            }
+            // Silently accept + ignore the kwarg in builds without
+            // `nat-traversal` so Python callers compiled against a
+            // full-feature wheel can fall back to a thin wheel
+            // without an exception on an unknown kwarg.
+            #[cfg(not(feature = "nat-traversal"))]
+            let _ = reflex_override;
 
             let runtime = Arc::new(
                 Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("runtime: {}", e)))?,

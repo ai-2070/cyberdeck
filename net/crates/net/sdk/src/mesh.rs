@@ -116,6 +116,8 @@ pub struct MeshBuilder {
     identity: Option<crate::identity::Identity>,
     subnet: Option<net::adapter::net::SubnetId>,
     subnet_policy: Option<Arc<net::adapter::net::SubnetPolicy>>,
+    #[cfg(feature = "nat-traversal")]
+    reflex_override: Option<SocketAddr>,
 }
 
 impl MeshBuilder {
@@ -133,6 +135,8 @@ impl MeshBuilder {
             identity: None,
             subnet: None,
             subnet_policy: None,
+            #[cfg(feature = "nat-traversal")]
+            reflex_override: None,
         })
     }
 
@@ -195,6 +199,33 @@ impl MeshBuilder {
         self
     }
 
+    /// Pin this mesh's publicly-advertised reflex `SocketAddr` to
+    /// the supplied external address. The classifier's background
+    /// sweep is skipped; the node starts in `NatClass::Open` with
+    /// `reflex_addr = Some(external)` on outbound capability
+    /// announcements.
+    ///
+    /// Intended for:
+    ///
+    /// - **Port-forwarded servers.** An operator who has manually
+    ///   configured a port forward knows the external address and
+    ///   shouldn't wait on peer-probing to discover it.
+    /// - **Stage-4 port mapping (UPnP / NAT-PMP / PCP).** A
+    ///   successful mapping installation will set this on behalf
+    ///   of the caller.
+    ///
+    /// **Optimization, not correctness.** Nodes without an
+    /// override still reach every peer through the routed-
+    /// handshake path — the override just cuts the classifier
+    /// round-trip when the answer is already known.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn reflex_override(mut self, external: SocketAddr) -> Self {
+        self.reflex_override = Some(external);
+        self
+    }
+
     /// Build the mesh node.
     pub async fn build(self) -> Result<Mesh> {
         // Use the caller's identity if one was set, otherwise mint an
@@ -215,6 +246,10 @@ impl MeshBuilder {
         }
         if let Some(policy) = self.subnet_policy {
             config = config.with_subnet_policy(policy);
+        }
+        #[cfg(feature = "nat-traversal")]
+        if let Some(external) = self.reflex_override {
+            config = config.with_reflex_override(external);
         }
 
         let mut node = MeshNode::new(keypair, config).await?;

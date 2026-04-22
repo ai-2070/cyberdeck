@@ -132,6 +132,20 @@ type MeshConfig struct {
 	// (64 hex chars). Matches `IdentityFromSeed(sameSeed)` so tokens
 	// issued to that identity's `EntityID` work for this mesh.
 	IdentitySeedHex string `json:"identity_seed_hex,omitempty"`
+
+	// ReflexOverride pins this mesh's publicly-advertised reflex
+	// to the supplied external "ip:port". Classification is
+	// skipped; the node starts in nat:open and advertises this
+	// address on capability announcements.
+	//
+	// Use for port-forwarded servers (operator knows the external
+	// address) or stage-4 UPnP / NAT-PMP integration. This is
+	// optimization, not correctness — nodes without an override
+	// still reach every peer via the routed-handshake path.
+	//
+	// Silently ignored when the Rust cdylib was built without
+	// `--features nat-traversal`.
+	ReflexOverride string `json:"reflex_override,omitempty"`
 }
 
 // StreamConfig configures an opened mesh stream.

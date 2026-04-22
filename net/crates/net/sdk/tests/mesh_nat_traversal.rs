@@ -135,6 +135,33 @@ async fn reclassify_populates_open_on_localhost() {
     );
 }
 
+/// `MeshBuilder::reflex_override` pins the public reflex at
+/// construction. No probes fire; `nat_type()` reports `Open`
+/// and `reflex_addr()` returns the pinned address from the
+/// moment the mesh is built.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn builder_reflex_override_forces_open() {
+    let psk = [0x42u8; 32];
+    let external: std::net::SocketAddr = "203.0.113.42:9001".parse().unwrap();
+    let mesh = MeshBuilder::new("127.0.0.1:0", &psk)
+        .unwrap()
+        .reflex_override(external)
+        .build()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        mesh.nat_type(),
+        NatClass::Open,
+        "override should force Open at construction",
+    );
+    assert_eq!(
+        mesh.reflex_addr(),
+        Some(external),
+        "reflex_addr should reflect the override",
+    );
+}
+
 /// `connect_direct` end-to-end via the SDK: Open×Open pair
 /// picks the Direct action, increments relay_fallbacks (no
 /// punch was attempted because no punch was warranted), and
