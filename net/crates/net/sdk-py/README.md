@@ -125,6 +125,47 @@ node = NetNode(
 )
 ```
 
+## NAT Traversal (optimization, not correctness)
+
+Two NATed peers already reach each other through the mesh's routed-handshake path. NAT traversal opens a shorter direct path when the NAT shape allows it; it's never required for connectivity. The surface is exposed on the underlying `net` PyO3 module and is a no-op when the native package was built without `--features nat-traversal`.
+
+```python
+# Access via the underlying PyO3 handle. Ergonomic sdk-py
+# wrappers are a planned follow-up; the PyO3 methods mirror
+# the Rust SDK surface directly.
+mesh = node._native_mesh  # PyMeshNode
+
+mesh.reclassify_nat()
+
+klass  = mesh.nat_type()            # "open" | "cone" | "symmetric" | "unknown"
+reflex = mesh.reflex_addr()         # "203.0.113.5:9001" | None
+
+observed = mesh.probe_reflex(peer_node_id)   # "ip:port"
+
+# Attempt a direct connection via the pair-type matrix.
+# `coordinator` mediates the punch when the matrix picks one.
+# Always returns — stats tell you which path won.
+mesh.connect_direct(peer_node_id, peer_pubkey_hex, coordinator_node_id)
+
+# Cumulative counters — all int, monotonic.
+s = mesh.traversal_stats()
+s.punches_attempted   # coordinator mediated a PunchRequest + Introduce
+s.punches_succeeded   # ack arrived AND direct handshake landed
+s.relay_fallbacks     # landed on the routed path after skip/fail
+```
+
+Operators with a known-public address skip the classifier sweep entirely. The override pins `"open"` + the supplied address on every capability announcement; call `announce_capabilities()` after to propagate (the setter resets the rate-limit floor so the next announce is guaranteed to broadcast).
+
+```python
+mesh.set_reflex_override('203.0.113.5:9001')
+mesh.announce_capabilities(caps)
+# later:
+mesh.clear_reflex_override()
+mesh.announce_capabilities(caps)
+```
+
+`TraversalError` carries a stable `kind` discriminator (`reflex-timeout` | `peer-not-reachable` | `transport` | `rendezvous-no-relay` | `rendezvous-rejected` | `punch-failed` | `port-map-unavailable` | `unsupported`). A build without the `nat-traversal` feature surfaces every traversal call as `unsupported` — the routed path keeps working regardless.
+
 ## Mesh Streams (multi-peer + back-pressure)
 
 For direct peer-to-peer messaging — open a stream to a specific peer
