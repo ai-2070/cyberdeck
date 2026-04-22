@@ -85,8 +85,7 @@ async fn connect_pair(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
 /// Importantly: **A and B are not directly connected**. That's
 /// the whole point — `connect_direct(A, B)` has to open a new
 /// session via the rendezvous path.
-async fn punch_topology(
-) -> (Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>) {
+async fn punch_topology() -> (Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>) {
     let a = build_node().await;
     let r = build_node().await;
     let b = build_node().await;

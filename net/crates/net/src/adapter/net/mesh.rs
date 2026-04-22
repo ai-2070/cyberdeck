@@ -3985,13 +3985,8 @@ impl MeshNode {
         // for cleanup so the map-eviction race against a
         // replacement observer is handled in one place.
         tokio::spawn(async move {
-            let outcome = await_punch_observer_outcome(
-                obs_rx,
-                deadline,
-                &punch_observers,
-                peer_reflex,
-            )
-            .await;
+            let outcome =
+                await_punch_observer_outcome(obs_rx, deadline, &punch_observers, peer_reflex).await;
             if !outcome {
                 return;
             }
@@ -6108,9 +6103,7 @@ impl MeshNode {
     ) {
         use std::sync::atomic::Ordering;
         if self.reflex_override_active.load(Ordering::Acquire) {
-            tracing::debug!(
-                "nat-traversal: reflex override installed mid-sweep, skipping commit"
-            );
+            tracing::debug!("nat-traversal: reflex override installed mid-sweep, skipping commit");
             return;
         }
         self.nat_class.store(class.as_u8(), Ordering::Release);
@@ -6349,8 +6342,7 @@ mod punch_observer_tests {
         observers.insert(peer, tx_c);
 
         // B's task cleanup. Must NOT remove peer (C is live).
-        let r2 =
-            await_punch_observer_outcome(rx_b, Duration::from_secs(5), &observers, peer).await;
+        let r2 = await_punch_observer_outcome(rx_b, Duration::from_secs(5), &observers, peer).await;
         assert!(!r2);
         assert!(
             observers.contains_key(&peer),

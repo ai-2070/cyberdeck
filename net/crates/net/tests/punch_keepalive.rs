@@ -84,8 +84,7 @@ async fn connect_pair(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
         .expect("accept failed");
 }
 
-async fn rendezvous_topology(
-) -> (Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>) {
+async fn rendezvous_topology() -> (Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>) {
     let a = build_node().await;
     let r = build_node().await;
     let b = build_node().await;

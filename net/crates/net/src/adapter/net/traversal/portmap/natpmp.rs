@@ -1000,7 +1000,10 @@ mod tests {
 
         let spoofer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let spoofer_port = spoofer_sock.local_addr().unwrap().port();
-        assert_ne!(spoofer_port, gateway_port, "spoofer must use a different port");
+        assert_ne!(
+            spoofer_port, gateway_port,
+            "spoofer must use a different port"
+        );
         let spoofer_handle = tokio::spawn(async move {
             // Forge a success reply with an attacker-chosen IP.
             // If this lands, the mapper would cache this as its

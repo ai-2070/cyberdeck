@@ -93,8 +93,7 @@ async fn connect_pair(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
 ///
 /// Returns `(A, R, B, X)`. X is only used as a classification
 /// target; the punch itself still routes A → R → B.
-async fn rendezvous_topology(
-) -> (Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>) {
+async fn rendezvous_topology() -> (Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>, Arc<MeshNode>) {
     let a = build_node().await;
     let r = build_node().await;
     let b = build_node().await;

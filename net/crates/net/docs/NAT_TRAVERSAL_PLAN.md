@@ -564,10 +564,10 @@ Current state against the staging plan:
 | 3c    | Pair-type matrix, `connect_direct`, `TraversalStats` | **done** |
 | 3d    | Keep-alive train + observer + `PunchAck` round-trip (routed via coordinator) | **done** |
 | 4a    | `reflex_override` — config field + runtime `set_reflex_override` / `clear_reflex_override` across all 4 surfaces | **done** |
-| 4b    | UPnP-IGD / NAT-PMP / PCP client + renewal task | **deferred** |
+| 4b    | UPnP-IGD / NAT-PMP client + renewal task | **done** |
 | 5     | SDK + NAPI + PyO3 + Go binding surface (nat_type / reflex_addr / probe_reflex / connect_direct / traversal_stats / reflex_override) | **done** |
 
-**Stage 4b deferred rationale.** The port-mapper task integrates with the operator's home router — it's inherently hard to test in CI without a UPnP-capable gateway in the test loop. The stage-4a surface (`set_reflex_override` from any binding, runtime + startup) is the exact hook a stage-4b task needs: on successful `AddPortMapping` it calls `set_reflex_override(external)`, on renewal failure it calls `clear_reflex_override()`. Dropping in real `igd-next` / `rust-natpmp` clients is additive and testable against a staged gateway; the integration point is already stable.
+**Stage 4b landing notes.** Implemented per [`PORT_MAPPING_PLAN.md`](PORT_MAPPING_PLAN.md): `PortMapperClient` trait, `NatPmpMapper` (inlined RFC 6886 wire codec with `UdpSocket::connect` source-address filter), `UpnpMapper` (`igd-next`-backed), `SequentialMapper` composer, and a `PortMapperTask` lifecycle state machine driving probe → install → renew → revoke. Install calls `set_reflex_override(external)`; renewal failures clear it via `clear_reflex_override()`. Surface-wide binding parity for the `try_port_mapping` flag across SDK / NAPI / PyO3 / Go. PCP is explicitly out of scope (§PORT_MAPPING_PLAN non-goals — different wire format from NAT-PMP despite the shared port).
 
 Testing coverage summary (as of stage 5 / 4a):
 

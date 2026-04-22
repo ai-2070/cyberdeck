@@ -674,7 +674,10 @@ mod tests {
         sink.apply_renewal(&mapping);
 
         assert_eq!(stats.snapshot().port_mapping_renewals, 3);
-        assert_eq!(stats.snapshot().port_mapping_external, Some(mapping.external));
+        assert_eq!(
+            stats.snapshot().port_mapping_external,
+            Some(mapping.external)
+        );
     }
 
     /// Regression for a cubic-flagged P2 bug: on successful
@@ -697,7 +700,10 @@ mod tests {
         let initial = sample_mapping();
         let initial_external = initial.external;
         sink.apply_install(&initial);
-        assert_eq!(stats.snapshot().port_mapping_external, Some(initial_external));
+        assert_eq!(
+            stats.snapshot().port_mapping_external,
+            Some(initial_external)
+        );
 
         // Router returns a new external address on the next
         // renewal tick. Simulate a WAN-rebind scenario.

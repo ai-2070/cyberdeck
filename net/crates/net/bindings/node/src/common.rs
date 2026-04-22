@@ -121,4 +121,3 @@ mod tests {
         assert!(validate_bigint_u64_parts(false, &[42, 0, 0]).is_err());
     }
 }
-
