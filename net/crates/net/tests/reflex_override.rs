@@ -412,3 +412,81 @@ async fn override_set_clear_is_atomic_with_announce_read() {
          traversal atomics must publish + read atomically as a group",
     );
 }
+
+/// Regression test for a cubic-flagged P2 bug: after
+/// `set_reflex_override`, an immediate `announce_capabilities`
+/// call could get coalesced by the `min_announce_interval`
+/// rate limit if a prior announce had landed within the window —
+/// so peers kept seeing the pre-override reflex until the next
+/// scheduled announce.
+///
+/// The fix resets `last_announce_at` inside the setter so the
+/// *next* announce broadcasts unconditionally. Callers that
+/// want peers to see the new reflex still need to announce
+/// themselves — the setter doesn't auto-broadcast — but that
+/// announce is now guaranteed to land on the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_reflex_override_resets_rate_limit_for_next_announce() {
+    // Build A + B with a tight `min_announce_interval` so we
+    // can reliably land two announces inside the window.
+    let cfg_a = test_config().with_min_announce_interval(Duration::from_secs(5));
+    let a = Arc::new(
+        MeshNode::new(EntityKeypair::generate(), cfg_a)
+            .await
+            .expect("A"),
+    );
+    let b = build_mesh_plain().await;
+    connect_pair(&a, &b).await;
+    a.start();
+    b.start();
+
+    // First announce — pre-override state; sets
+    // `last_announce_at`. Use a distinctive tag so we can tell
+    // the two announces apart on B's index.
+    a.announce_capabilities(CapabilitySet::new().add_tag("pre"))
+        .await
+        .expect("A announce 1");
+    // Wait for B to index it.
+    let a_id = a.node_id();
+    for _ in 0..20 {
+        if b.capability_index().get(a_id).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let external: SocketAddr = "203.0.113.88:55555".parse().unwrap();
+    a.set_reflex_override(external);
+
+    // Second announce — immediately after the setter, well
+    // inside the 5 s rate-limit window. Under the pre-fix bug
+    // this call would still update A's self-index but skip the
+    // network broadcast, so B's index would NOT see the
+    // override. With the fix, the setter reset
+    // `last_announce_at = None`, so this announce broadcasts.
+    a.announce_capabilities(CapabilitySet::new().add_tag("post"))
+        .await
+        .expect("A announce 2");
+
+    // Wait for B to see the new announcement (new tag +
+    // overridden reflex).
+    let mut propagated = false;
+    for _ in 0..40 {
+        if let Some(caps) = b.capability_index().get(a_id) {
+            let has_post = caps.tags.iter().any(|t| t == "post");
+            let reflex = b.capability_index().reflex_addr(a_id);
+            if has_post && reflex == Some(external) {
+                propagated = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        propagated,
+        "override did not propagate to B within the rate-limit window — \
+         the setter's rate-limit reset regressed. Under the pre-fix bug, \
+         the post-override announce was coalesced and peers kept seeing \
+         the pre-override reflex.",
+    );
+}

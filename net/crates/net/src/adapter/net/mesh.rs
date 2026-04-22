@@ -6057,6 +6057,17 @@ impl MeshNode {
     /// short-circuits any further classifier sweeps until
     /// [`Self::clear_reflex_override`] is called.
     ///
+    /// # Publishing to peers
+    ///
+    /// This method updates only *local* state. To propagate the
+    /// change to peers, call [`Self::announce_capabilities`]
+    /// afterward. The setter resets the announce rate-limit
+    /// floor so the next announce is guaranteed to broadcast
+    /// rather than coalesce against the previous send — cubic
+    /// P2 pinned this, after flagging that callers who set an
+    /// override within `min_announce_interval` of a prior
+    /// announce would find peers still seeing the old reflex.
+    ///
     /// **Optimization, not correctness.** A node with no override
     /// still reaches every peer through the routed-handshake
     /// path; the override just pins the publicly-advertised
@@ -6064,10 +6075,10 @@ impl MeshNode {
     /// successful stage-4 port-mapping install, etc).
     ///
     /// Safe to call concurrently with `announce_capabilities` —
-    /// the atomic + ArcSwap writes publish in order (override
-    /// flag first, then reflex address, then NAT class), so a
-    /// concurrent announce either sees the pre-override state or
-    /// the fully-installed override, never a torn mix.
+    /// the triple-write runs under `traversal_publish_mu`
+    /// (alongside the announce's multi-field read), so a
+    /// concurrent announce either sees the pre-override state
+    /// or the fully-installed override, never a torn mix.
     ///
     /// Requires the `nat-traversal` cargo feature.
     #[cfg(feature = "nat-traversal")]
@@ -6088,6 +6099,18 @@ impl MeshNode {
             Ordering::Release,
         );
         self.reflex_override_active.store(true, Ordering::Release);
+
+        // Reset the rate-limit floor so the next
+        // `announce_capabilities` call is guaranteed to
+        // broadcast — cubic P2 flagged that the override
+        // setter's doc implies immediate peer visibility, but
+        // the rate limit could coalesce an announce that lands
+        // inside `min_announce_interval`. Callers that want
+        // peers to see the new reflex "right away" still need
+        // to call announce themselves; this just makes that
+        // call's broadcast step unconditional instead of
+        // coalesced.
+        *self.last_announce_at.lock() = None;
     }
 
     /// Drop a previously-installed runtime reflex override. The
@@ -6096,6 +6119,13 @@ impl MeshNode {
     /// probe observations. `reflex_addr` is cleared to `None`
     /// immediately so a between-sweep read doesn't return a stale
     /// override value as "still current."
+    ///
+    /// # Publishing to peers
+    ///
+    /// Mirrors [`Self::set_reflex_override`]: only local state
+    /// changes here. Call [`Self::announce_capabilities`] after
+    /// this to tell peers. The rate-limit floor is reset so that
+    /// call broadcasts unconditionally.
     ///
     /// No-op when no override is active — safe to call
     /// unconditionally during shutdown / port-mapping revoke
@@ -6123,6 +6153,12 @@ impl MeshNode {
             super::traversal::classify::NatClass::Unknown.as_u8(),
             Ordering::Release,
         );
+        // Same rate-limit reset as `set_reflex_override` — the
+        // next `announce_capabilities` call broadcasts
+        // unconditionally instead of coalescing against the
+        // previous send. See that method's comment for details
+        // (cubic P2).
+        *self.last_announce_at.lock() = None;
     }
 
     /// Testing / debugging hook: force this node's advertised
