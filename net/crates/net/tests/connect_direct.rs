@@ -608,13 +608,10 @@ async fn skip_punch_succeeds_even_when_peer_reflex_is_uncached() {
     assert_eq!(a.nat_class(), NatClass::Symmetric);
 
     let b_pub = *b.public_key();
-    let session_id = a
-        .connect_direct(b_id, &b_pub, r.node_id())
-        .await
-        .expect(
-            "SkipPunch should resolve via the coordinator — the \
+    let session_id = a.connect_direct(b_id, &b_pub, r.node_id()).await.expect(
+        "SkipPunch should resolve via the coordinator — the \
              peer's reflex is irrelevant on this branch",
-        );
+    );
     assert_eq!(session_id, b_id);
     assert_eq!(
         a.peer_addr(b_id),
