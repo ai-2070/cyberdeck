@@ -17,9 +17,9 @@
 //!   hasn't run yet.
 //!
 //! This module owns the pure-logic FSM. Wiring the FSM to the
-//! reflex probe + capability broadcast lives in
-//! [`super::super::mesh`]; the split keeps classification
-//! testable without spinning up a real mesh.
+//! reflex probe + capability broadcast lives in the parent
+//! `mesh` module; the split keeps classification testable
+//! without spinning up a real mesh.
 
 use std::net::SocketAddr;
 
@@ -30,7 +30,7 @@ use std::net::SocketAddr;
 ///
 /// Internal code that wants the richer five-way enum
 /// (`FullCone / RestrictedCone / PortRestricted / Symmetric / None`)
-/// should use [`adapter::net::behavior::metadata::NatType`]
+/// should use [`crate::adapter::net::behavior::metadata::NatType`]
 /// directly. This type is the *publishable* summary that fits
 /// on one tag and drives the connect-time pair-type matrix in
 /// `docs/NAT_TRAVERSAL_PLAN.md` §8.

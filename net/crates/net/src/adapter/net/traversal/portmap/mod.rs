@@ -247,8 +247,8 @@ impl MappingSink {
 
     /// Apply a freshly-installed mapping: flip the stats, stamp
     /// the reflex-override atomics to `Open + external`. Same
-    /// publish order as `MeshNode::set_reflex_override` — reflex
-    /// + class first, flag last — so a concurrent announce
+    /// publish order as `MeshNode::set_reflex_override` (reflex
+    /// and class first, flag last) so a concurrent announce
     /// either sees the pre-install state or the fully-installed
     /// override, never a torn mix.
     pub(crate) fn apply_install(&self, mapping: &PortMapping) {
@@ -570,6 +570,34 @@ impl PortMapperTask {
         // cleans up on TTL expiry.
         self.client.remove(&mapping).await;
         self.sink.apply_revoke();
+    }
+}
+
+/// Blanket impl so `Arc<C>` delegates to the inner client. Lets
+/// unit tests hold both the mock (to queue responses) and hand
+/// the task a `Box<dyn PortMapperClient>` wrapping the same
+/// inner value — without this, the mock would need an explicit
+/// split between control-side + task-side handles.
+#[async_trait]
+impl<C> PortMapperClient for Arc<C>
+where
+    C: PortMapperClient + ?Sized,
+{
+    async fn probe(&self) -> Result<(), PortMappingError> {
+        C::probe(self).await
+    }
+    async fn install(
+        &self,
+        internal_port: u16,
+        ttl: Duration,
+    ) -> Result<PortMapping, PortMappingError> {
+        C::install(self, internal_port, ttl).await
+    }
+    async fn renew(&self, mapping: &PortMapping) -> Result<PortMapping, PortMappingError> {
+        C::renew(self, mapping).await
+    }
+    async fn remove(&self, mapping: &PortMapping) {
+        C::remove(self, mapping).await
     }
 }
 
@@ -975,33 +1003,5 @@ mod tests {
         assert!(!snap.port_mapping_active);
         assert_eq!(snap.port_mapping_external, None);
         assert_eq!(snap.port_mapping_renewals, 0);
-    }
-}
-
-/// Blanket impl so `Arc<C>` delegates to the inner client. Lets
-/// unit tests hold both the mock (to queue responses) and hand
-/// the task a `Box<dyn PortMapperClient>` wrapping the same
-/// inner value — without this, the mock would need an explicit
-/// split between control-side + task-side handles.
-#[async_trait]
-impl<C> PortMapperClient for Arc<C>
-where
-    C: PortMapperClient + ?Sized,
-{
-    async fn probe(&self) -> Result<(), PortMappingError> {
-        C::probe(self).await
-    }
-    async fn install(
-        &self,
-        internal_port: u16,
-        ttl: Duration,
-    ) -> Result<PortMapping, PortMappingError> {
-        C::install(self, internal_port, ttl).await
-    }
-    async fn renew(&self, mapping: &PortMapping) -> Result<PortMapping, PortMappingError> {
-        C::renew(self, mapping).await
-    }
-    async fn remove(&self, mapping: &PortMapping) {
-        C::remove(self, mapping).await
     }
 }

@@ -2679,7 +2679,7 @@ impl MeshNode {
         if parsed.header.subprotocol_id == super::traversal::SUBPROTOCOL_REFLEX {
             use super::traversal::reflex;
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
-            let payload = events.into_iter().next().unwrap_or_else(Bytes::new);
+            let payload = events.into_iter().next().unwrap_or_default();
             let Some(msg) = reflex::decode(&payload) else {
                 return;
             };
@@ -2759,7 +2759,7 @@ impl MeshNode {
         if parsed.header.subprotocol_id == super::traversal::SUBPROTOCOL_RENDEZVOUS {
             use super::traversal::rendezvous;
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
-            let payload = events.into_iter().next().unwrap_or_else(Bytes::new);
+            let payload = events.into_iter().next().unwrap_or_default();
             let Some(msg) = rendezvous::decode(&payload) else {
                 return;
             };
@@ -4926,7 +4926,7 @@ impl MeshNode {
     ///    (plan decision 8).
     /// 2. Resolve the peer's reflex address from the local
     ///    capability index. Fails with
-    ///    [`TraversalError::PeerNotReachable`] if no reflex is
+    ///    [`super::traversal::TraversalError::PeerNotReachable`] if no reflex is
     ///    cached (peer hasn't announced yet).
     /// 3. Apply the matrix:
     ///    - `Direct` / `SkipPunch` → connect straight to
@@ -5721,10 +5721,10 @@ impl MeshNode {
     /// public `SocketAddr` the peer observed on the probe's UDP
     /// envelope.
     ///
-    /// Waits up to [`TraversalConfig::reflex_timeout`] (default
-    /// 3 s) for the response. Fails with [`TraversalError::ReflexTimeout`]
-    /// on timeout, [`TraversalError::PeerNotReachable`] if the peer
-    /// has no active session, or [`TraversalError::Transport`] on
+    /// Waits up to [`super::traversal::TraversalConfig::reflex_timeout`] (default
+    /// 3 s) for the response. Fails with [`super::traversal::TraversalError::ReflexTimeout`]
+    /// on timeout, [`super::traversal::TraversalError::PeerNotReachable`] if the peer
+    /// has no active session, or [`super::traversal::TraversalError::Transport`] on
     /// a socket-level send failure.
     ///
     /// Requires the `nat-traversal` cargo feature.
@@ -5875,12 +5875,12 @@ impl MeshNode {
     /// full `connect_direct` flow lands in stage 3c.
     ///
     /// Fails with:
-    /// - [`TraversalError::PeerNotReachable`] if `relay` has no
+    /// - [`super::traversal::TraversalError::PeerNotReachable`] if `relay` has no
     ///   active session.
-    /// - [`TraversalError::Transport`] on a socket-level send
+    /// - [`super::traversal::TraversalError::Transport`] on a socket-level send
     ///   failure.
-    /// - [`TraversalError::PunchFailed`] if the coordinator
-    ///   doesn't introduce within [`TraversalConfig::punch_deadline`]
+    /// - [`super::traversal::TraversalError::PunchFailed`] if the coordinator
+    ///   doesn't introduce within [`super::traversal::TraversalConfig::punch_deadline`]
     ///   (likely: R has no cached reflex for `target`).
     ///
     /// Requires the `nat-traversal` cargo feature.
@@ -5940,8 +5940,8 @@ impl MeshNode {
     /// Install a waiter for an incoming `PunchIntroduce` from
     /// `counterpart`. The returned future resolves when the
     /// dispatcher decodes a matching introduce, or with
-    /// [`TraversalError::PunchFailed`] after
-    /// [`TraversalConfig::punch_deadline`].
+    /// [`super::traversal::TraversalError::PunchFailed`] after
+    /// [`super::traversal::TraversalConfig::punch_deadline`].
     ///
     /// Stage-3b responder-side primitive: the peer being punched
     /// *into* uses this to observe the introduce without
@@ -5974,12 +5974,12 @@ impl MeshNode {
     /// surface — the `SinglePunch` path in `connect_direct`
     /// registers the waiter before firing `request_punch` and
     /// awaits it afterward. Times out with
-    /// [`TraversalError::PunchFailed`] after
-    /// [`TraversalConfig::punch_deadline`].
+    /// [`super::traversal::TraversalError::PunchFailed`] after
+    /// [`super::traversal::TraversalConfig::punch_deadline`].
     ///
-    /// Note: the caller installs the waiter before issuing the
-    /// request via [`Self::install_punch_ack_waiter`] to avoid a
-    /// race where the ack arrives before the await call is
+    /// Note: the caller inserts the oneshot sender into
+    /// `pending_punch_acks` before issuing the request so the ack
+    /// can't arrive and be dropped before the await call is
     /// entered.
     ///
     /// Requires the `nat-traversal` cargo feature.
@@ -6015,7 +6015,7 @@ impl MeshNode {
     /// see whether classification produced a definite verdict or
     /// stayed at `Unknown`.
     ///
-    /// Bounded by [`TraversalConfig::classify_deadline`] — even if
+    /// Bounded by [`super::traversal::TraversalConfig::classify_deadline`] — even if
     /// probes hang, the sweep returns within that window with
     /// whatever observations arrived.
     ///
