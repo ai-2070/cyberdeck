@@ -379,9 +379,7 @@ async fn connect_direct_skip_punch_still_requires_reachable_coordinator() {
 
     match err {
         TraversalError::PeerNotReachable => {}
-        other => panic!(
-            "expected PeerNotReachable (coordinator not a peer); got {other:?}"
-        ),
+        other => panic!("expected PeerNotReachable (coordinator not a peer); got {other:?}"),
     }
 }
 

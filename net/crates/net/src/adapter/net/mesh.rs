@@ -931,15 +931,8 @@ pub struct MeshNode {
     /// the `SinglePunch` path so `punches_succeeded` only bumps
     /// when the peer actually confirmed the punch.
     #[cfg(feature = "nat-traversal")]
-    pending_punch_acks: Arc<
-        DashMap<
-            u64,
-            (
-                u64,
-                oneshot::Sender<super::traversal::rendezvous::PunchAck>,
-            ),
-        >,
-    >,
+    pending_punch_acks:
+        Arc<DashMap<u64, (u64, oneshot::Sender<super::traversal::rendezvous::PunchAck>)>>,
     /// Monotonic counter for waiter generations used by the
     /// three `pending_*` maps above. Each insert stamps its
     /// entry with a unique `gen`; removal is a `remove_if` check
@@ -2827,8 +2820,7 @@ impl MeshNode {
                     // sees inbound traffic from `peer_reflex`
                     // (or — on localhost — at the punch_deadline
                     // fallback). Plan §3 endpoint semantics.
-                    if let Some((_, (_gen, tx))) =
-                        ctx.pending_punch_introduces.remove(&intro.peer)
+                    if let Some((_, (_gen, tx))) = ctx.pending_punch_introduces.remove(&intro.peer)
                     {
                         let _ = tx.send(intro);
                     }
@@ -2840,8 +2832,7 @@ impl MeshNode {
                         // oneshot keyed by `from_peer`. A late ack
                         // for an abandoned `connect_direct` is
                         // dropped silently.
-                        if let Some((_, (_gen, tx))) =
-                            ctx.pending_punch_acks.remove(&ack.from_peer)
+                        if let Some((_, (_gen, tx))) = ctx.pending_punch_acks.remove(&ack.from_peer)
                         {
                             let _ = tx.send(ack);
                         }
