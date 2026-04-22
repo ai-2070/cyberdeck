@@ -270,6 +270,121 @@ async fn stats_start_at_zero() {
     assert_eq!(stats.relay_fallbacks, 0);
 }
 
+/// Regression test for a cubic-flagged P1 bug: `connect_direct`
+/// used to resolve the caller-supplied `coordinator` into an
+/// address up front and fast-fail with `PeerNotReachable` if
+/// that lookup missed — but the `PairAction::Direct` branch
+/// doesn't need the coordinator at all (Open/Open, Open/Cone,
+/// Open/Unknown, Unknown/Unknown all succeed via the routing
+/// table's first-hop). The eager lookup broke those cases for
+/// any caller whose coordinator slot referenced a non-peer
+/// id. The fix defers coordinator resolution into the branches
+/// that actually need it (SkipPunch, SinglePunch).
+///
+/// This test exercises the Open×Open path with a bogus
+/// coordinator id and asserts `connect_direct` still succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connect_direct_open_pair_succeeds_even_with_unreachable_coordinator() {
+    let (a, _r, b, _x) = punch_topology().await;
+
+    a.reclassify_nat().await;
+    b.reclassify_nat().await;
+    a.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("A announce");
+    b.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("B announce");
+
+    let a_for_poll = a.clone();
+    let b_id = b.node_id();
+    let b_bind = b.local_addr();
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            a_for_poll.peer_reflex_addr(b_id) == Some(b_bind)
+        })
+        .await,
+        "A should see B's reflex",
+    );
+
+    // Deliberately hand `connect_direct` a coordinator id that
+    // is NOT a connected peer. Under the old eager-lookup bug
+    // this yielded PeerNotReachable even though Open×Open
+    // doesn't need the coordinator. The fix routes this through
+    // the routing table's first-hop instead.
+    let bogus_coordinator: u64 = 0xDEAD_C0DE_CAFE_BABE;
+    assert!(
+        a.peer_addr(bogus_coordinator).is_none(),
+        "test precondition: bogus coordinator must not be a peer",
+    );
+
+    let b_pub = *b.public_key();
+    let session_id = a
+        .connect_direct(b_id, &b_pub, bogus_coordinator)
+        .await
+        .expect(
+            "Open×Open must resolve via the routing table — the coordinator is \
+             irrelevant on this path and its reachability must not be checked",
+        );
+    assert_eq!(session_id, b_id);
+}
+
+/// Complement of the above: `PairAction::SkipPunch` /
+/// `SinglePunch` still require a reachable coordinator (either
+/// as a relay or as a rendezvous mediator). Passing a bogus
+/// coordinator here must still fail with `PeerNotReachable` —
+/// those branches have no viable fallback. This test pins the
+/// "coordinator reachability gate is preserved where it
+/// matters" half of the fix so a future refactor doesn't
+/// silently drop the check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connect_direct_skip_punch_still_requires_reachable_coordinator() {
+    use net::adapter::net::traversal::classify::NatClass;
+
+    let (a, _r, b, _x) = punch_topology().await;
+
+    // Force Symmetric×Symmetric → SkipPunch. The coordinator is
+    // the only viable path for this pair; missing coordinator
+    // must still fast-fail.
+    a.reclassify_nat().await;
+    b.reclassify_nat().await;
+    a.force_nat_class_for_test(NatClass::Symmetric);
+    b.force_nat_class_for_test(NatClass::Symmetric);
+
+    a.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("A announce");
+    b.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("B announce");
+
+    let a_for_poll = a.clone();
+    let b_id = b.node_id();
+    let b_bind = b.local_addr();
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            a_for_poll.peer_reflex_addr(b_id) == Some(b_bind)
+                && a_for_poll.peer_nat_class(b_id) == NatClass::Symmetric
+        })
+        .await,
+        "A should see B's Symmetric class + reflex",
+    );
+
+    let bogus_coordinator: u64 = 0xDEAD_C0DE_CAFE_BABE;
+    let b_pub = *b.public_key();
+    let err = a
+        .connect_direct(b_id, &b_pub, bogus_coordinator)
+        .await
+        .expect_err("SkipPunch with unreachable coordinator must fail");
+
+    match err {
+        TraversalError::PeerNotReachable => {}
+        other => panic!(
+            "expected PeerNotReachable (coordinator not a peer); got {other:?}"
+        ),
+    }
+}
+
 /// Regression test for a cubic-flagged P1 bug. Earlier
 /// `connect_direct` on the `SinglePunch` path recorded
 /// `punches_succeeded++` after a successful rendezvous +

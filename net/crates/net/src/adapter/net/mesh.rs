@@ -4929,19 +4929,22 @@ impl MeshNode {
     ///    [`super::traversal::TraversalError::PeerNotReachable`] if no reflex is
     ///    cached (peer hasn't announced yet).
     /// 3. Apply the matrix:
-    ///    - `Direct` / `SkipPunch` → connect straight to
-    ///      `peer_reflex` using the supplied pubkey.
-    ///      `relay_fallbacks` increments (traffic rides the
-    ///      direct path when possible, routed otherwise, but
-    ///      we didn't try to punch).
+    ///    - `Direct` → connect via the routing table's
+    ///      first-hop; `coordinator` is not consulted and its
+    ///      reachability is irrelevant. `relay_fallbacks`
+    ///      increments (we didn't attempt a punch).
+    ///    - `SkipPunch` → connect via `coordinator` as the
+    ///      relay; symmetric pairs have no better option.
+    ///      Fails with `PeerNotReachable` if `coordinator`
+    ///      isn't a live peer.
     ///    - `SinglePunch` → ask `coordinator` to mediate via
     ///      [`Self::request_punch`]. On successful introduction,
     ///      increment `punches_attempted` + `punches_succeeded`
     ///      and connect to `peer_reflex`. On failure, increment
     ///      `punches_attempted` + `relay_fallbacks` and fall
-    ///      back to connecting via `peer_reflex` directly
-    ///      anyway — the plan's framing treats punch-failed as
-    ///      "optimization missed," not a connectivity failure.
+    ///      back to connecting via the coordinator — the plan's
+    ///      framing treats punch-failed as "optimization missed,"
+    ///      not a connectivity failure.
     ///
     /// # Scope note
     ///
@@ -4979,33 +4982,47 @@ impl MeshNode {
             .peer_reflex_addr(peer_node_id)
             .ok_or(TraversalError::PeerNotReachable)?;
 
-        let coordinator_addr = self
-            .peer_addrs
-            .get(&coordinator)
-            .map(|e| *e.value())
-            .ok_or(TraversalError::PeerNotReachable)?;
+        // NOTE: `coordinator` is deliberately NOT resolved here.
+        // A cubic review (P1) flagged that an eager lookup +
+        // `PeerNotReachable` fast-fail broke every `PairAction::Direct`
+        // case whenever the caller's nominal coordinator wasn't
+        // a live peer — Open/Open, Open/Cone, Open/Unknown, and
+        // Unknown/Unknown don't need the coordinator at all and
+        // should succeed via the routing table's first-hop. The
+        // `coordinator_addr` lookup now happens only inside
+        // branches that actually need a mediator.
 
         let local_class = self.nat_class();
         let remote_class = self.peer_nat_class(peer_node_id);
         let action = pair_action(local_class, remote_class);
 
-        // Small helper: open the routed session via the
+        // Resolve `coordinator` into a wire address. Only call
+        // from the SkipPunch / SinglePunch arms — `Direct`
+        // routes via the routing table (below).
+        let coordinator_addr = || {
+            self.peer_addrs
+                .get(&coordinator)
+                .map(|e| *e.value())
+                .ok_or(TraversalError::PeerNotReachable)
+        };
+
+        // Small helper: open a relayed session via the
         // coordinator. Idempotent — a pre-existing session with
         // `peer_node_id` short-circuits with `Ok(peer_node_id)`
         // so back-to-back `connect_direct` calls don't error out.
-        let connect_routed = || async {
+        let connect_via_coordinator = |coord_addr: std::net::SocketAddr| async move {
             if self.peers.contains_key(&peer_node_id) {
                 return Ok(peer_node_id);
             }
-            self.connect_via(coordinator_addr, peer_pubkey, peer_node_id)
+            self.connect_via(coord_addr, peer_pubkey, peer_node_id)
                 .await
                 .map_err(|e| TraversalError::Transport(e.to_string()))
         };
 
         // Small helper: open a direct session using the punched
-        // path. Same idempotency as `connect_routed`. Returns
-        // `Err` on handshake failure — caller falls back to
-        // relay to still produce a usable session.
+        // path. Same idempotency as `connect_via_coordinator`.
+        // Returns `Err` on handshake failure — caller falls back
+        // to relay to still produce a usable session.
         let connect_on_punched_path = |peer_reflex: std::net::SocketAddr| async move {
             if self.peers.contains_key(&peer_node_id) {
                 return Ok(peer_node_id);
@@ -5016,11 +5033,38 @@ impl MeshNode {
         };
 
         match action {
-            PairAction::Direct | PairAction::SkipPunch => {
+            PairAction::Direct => {
+                // `Direct` pairs (Open/Open, Open/Cone,
+                // Open/Unknown, Unknown/Unknown, etc.) don't
+                // need the coordinator — the routing table's
+                // first-hop is enough to reach the peer. Use
+                // the public `connect_routed` helper which
+                // looks up that first-hop itself and error-
+                // wraps cleanly if no route is cached.
                 self.traversal_stats.record_relay_fallback();
-                connect_routed().await
+                if self.peers.contains_key(&peer_node_id) {
+                    return Ok(peer_node_id);
+                }
+                self.connect_routed(peer_pubkey, peer_node_id)
+                    .await
+                    .map_err(|e| TraversalError::Transport(e.to_string()))
+            }
+            PairAction::SkipPunch => {
+                // Symmetric × Symmetric (and Symmetric ×
+                // Unknown). Punch can't land; the coordinator
+                // is the only way to relay. Fail fast if the
+                // caller's coordinator isn't reachable — there
+                // is no viable fallback in this branch.
+                self.traversal_stats.record_relay_fallback();
+                let coord = coordinator_addr()?;
+                connect_via_coordinator(coord).await
             }
             PairAction::SinglePunch => {
+                // Punch requires the coordinator for rendezvous
+                // mediation. Resolve it here (not eagerly at the
+                // top) so Direct-path callers with no active
+                // coordinator peer can still succeed.
+                let coord = coordinator_addr()?;
                 self.traversal_stats.record_punch_attempt();
                 let self_reflex = self.reflex_addr().unwrap_or_else(|| self.local_addr());
 
@@ -5063,14 +5107,14 @@ impl MeshNode {
                                         // peer's socket buffer
                                         // filled). Relay fallback.
                                         self.traversal_stats.record_relay_fallback();
-                                        connect_routed().await
+                                        connect_via_coordinator(coord).await
                                     }
                                 }
                             }
                             Ok(Err(_)) | Err(_) => {
                                 self.pending_punch_acks.remove(&peer_node_id);
                                 self.traversal_stats.record_relay_fallback();
-                                connect_routed().await
+                                connect_via_coordinator(coord).await
                             }
                         }
                     }
@@ -5081,7 +5125,7 @@ impl MeshNode {
                         // the fallback and continue.
                         self.pending_punch_acks.remove(&peer_node_id);
                         self.traversal_stats.record_relay_fallback();
-                        connect_routed().await
+                        connect_via_coordinator(coord).await
                     }
                 }
             }
