@@ -1,0 +1,46 @@
+net/crates/net/bindings/go/net/regression_test.go
+  5bf3f089eecaef7a 284-285,288-293,295-299,302-338,349,352
+net/crates/net/bindings/go/net/migration.go
+  5bf3f089eecaef7a 224-244,248-249,259
+net/crates/net/sdk-ts/src/groups.ts
+  5bf3f089eecaef7a 282-286,375-379,518-522
+net/crates/net/bindings/node/src/groups.rs
+  5bf3f089eecaef7a 605-611
+net/crates/net/bindings/go/net/compute.go
+  5bf3f089eecaef7a 233,249-251,258,261,264
+net/crates/net/bindings/go/net/compute_dispatch.go
+  5bf3f089eecaef7a 107-129,145,148-153,155,159,163-169,173-178,190
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "bd3818cef364bd35ea06075106e95b7862f8c61b",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2810,
+      "total_deletions": 71,
+      "accepted_lines": 154,
+      "overriden_lines": 0
+    },
+    "e3f423cec43443dc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3ced1793-e431-44d2-9ab4-e9ebe3162989",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3140,
+      "total_deletions": 0,
+      "accepted_lines": 0,
+      "overriden_lines": 0
+    }
+  }
+}
