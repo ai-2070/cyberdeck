@@ -182,6 +182,21 @@ struct DispatchCtx {
     #[cfg(feature = "nat-traversal")]
     pending_reflex_probes:
         Arc<DashMap<u64, tokio::sync::oneshot::Sender<std::net::SocketAddr>>>,
+    /// Waiters for incoming `PunchIntroduce` messages, keyed by
+    /// the counterpart endpoint's `node_id` (the `peer` field in
+    /// the introduce). Mirrors `pending_reflex_probes` — the
+    /// dispatcher completes the oneshot when a matching introduce
+    /// lands; a message with no waiter is dropped silently.
+    #[cfg(feature = "nat-traversal")]
+    pending_punch_introduces: Arc<
+        DashMap<u64, tokio::sync::oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>>,
+    >,
+    /// NAT-traversal tunables (probe timeouts, punch cadence,
+    /// classification deadlines). Shared with `MeshNode` by value
+    /// since `TraversalConfig` is `Clone` and small. The dispatch
+    /// path only reads it — no need for an Arc.
+    #[cfg(feature = "nat-traversal")]
+    traversal_config: super::traversal::TraversalConfig,
     /// Max distinct channels a single peer may subscribe to.
     max_channels_per_peer: usize,
     /// Capability index shared with `MeshNode`. Inbound
@@ -722,6 +737,17 @@ pub struct MeshNode {
     #[cfg(feature = "nat-traversal")]
     pending_reflex_probes:
         Arc<DashMap<u64, oneshot::Sender<std::net::SocketAddr>>>,
+    /// In-flight rendezvous handshakes keyed by the *counterpart*
+    /// endpoint's `node_id` — i.e. the `peer` field in the
+    /// incoming `PunchIntroduce`. The coordinator-side fanout
+    /// (stage 3b) drops `PunchIntroduce` messages silently when
+    /// no waiter is installed; endpoint callers that want to
+    /// observe an introduce install an entry here via the
+    /// stage-3c surface before calling the coordinator.
+    #[cfg(feature = "nat-traversal")]
+    pending_punch_introduces: Arc<
+        DashMap<u64, oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>>,
+    >,
     /// Current NAT classification, encoded via
     /// [`super::traversal::classify::NatClass::as_u8`]. Starts as
     /// `Unknown` (`0`) and is updated by the classification sweep
@@ -974,6 +1000,8 @@ impl MeshNode {
             pending_membership_acks: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
             pending_reflex_probes: Arc::new(DashMap::new()),
+            #[cfg(feature = "nat-traversal")]
+            pending_punch_introduces: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
             nat_class: Arc::new(std::sync::atomic::AtomicU8::new(
                 super::traversal::classify::NatClass::Unknown.as_u8(),
@@ -1555,6 +1583,10 @@ impl MeshNode {
             pending_membership_acks: self.pending_membership_acks.clone(),
             #[cfg(feature = "nat-traversal")]
             pending_reflex_probes: self.pending_reflex_probes.clone(),
+            #[cfg(feature = "nat-traversal")]
+            pending_punch_introduces: self.pending_punch_introduces.clone(),
+            #[cfg(feature = "nat-traversal")]
+            traversal_config: self.traversal_config.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
             capability_index: self.capability_index.clone(),
             seen_announcements: self.seen_announcements.clone(),
@@ -2353,6 +2385,65 @@ impl MeshNode {
                     if let Some((_, tx)) = ctx.pending_reflex_probes.remove(&from_node) {
                         let _ = tx.send(observed);
                     }
+                }
+            }
+            return;
+        }
+
+        // Rendezvous coordinator: on `PunchRequest` from peer A,
+        // look up target B's reflex in the capability index and
+        // send `PunchIntroduce` to both sides with the shared
+        // `fire_at` timestamp. Plan §3 — the three-message dance
+        // for synchronized hole-punch.
+        //
+        // `PunchIntroduce` and `PunchAck` inbound wiring lands in
+        // stage 3c (endpoint role); stage 3b only handles the
+        // coordinator branch so the unit under test is the
+        // fan-out itself.
+        #[cfg(feature = "nat-traversal")]
+        if parsed.header.subprotocol_id == super::traversal::SUBPROTOCOL_RENDEZVOUS {
+            use super::traversal::rendezvous;
+            let events =
+                EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let payload = events
+                .into_iter()
+                .next()
+                .unwrap_or_else(Bytes::new);
+            let Some(msg) = rendezvous::decode(&payload) else {
+                return;
+            };
+
+            let from_node = ctx
+                .peers
+                .iter()
+                .find(|e| e.value().session.session_id() == session.session_id())
+                .map(|e| e.value().node_id)
+                .unwrap_or(0);
+            if from_node == 0 {
+                return;
+            }
+
+            match msg {
+                rendezvous::RendezvousMsg::PunchRequest(req) => {
+                    Self::handle_punch_request(from_node, req, ctx);
+                }
+                rendezvous::RendezvousMsg::PunchIntroduce(intro) => {
+                    // Endpoint side of the rendezvous. Stage 3b
+                    // only completes waiters installed by callers;
+                    // the keep-alive train + PunchAck emission
+                    // land in stage 3c. A message with no waiter
+                    // is dropped silently — a late introduce for
+                    // an abandoned connect_direct is noise, not
+                    // an error.
+                    if let Some((_, tx)) =
+                        ctx.pending_punch_introduces.remove(&intro.peer)
+                    {
+                        let _ = tx.send(intro);
+                    }
+                }
+                rendezvous::RendezvousMsg::PunchAck(_) => {
+                    // Stage 3c lands the PunchAck-correlation
+                    // wiring. Drop silently for now.
                 }
             }
             return;
@@ -3266,6 +3357,159 @@ impl MeshNode {
         });
     }
 
+    /// Coordinator-side handler for a `PunchRequest` from peer A
+    /// (who wants to punch to target B).
+    ///
+    /// Behavior (plan §3 coordinator steps 1–3):
+    ///
+    /// 1. Resolve B's reflex address. Preferred source is the
+    ///    `reflex_addr` field on B's latest signed
+    ///    `CapabilityAnnouncement` in the local index. Without a
+    ///    cached reflex, coordination can't proceed — we drop the
+    ///    request silently. A's side times out on
+    ///    `connect_direct` and falls back to routed-handshake.
+    /// 2. Pick `fire_at = now() + TraversalConfig::punch_fire_lead`
+    ///    (default 500 ms) — short enough to be under any plausible
+    ///    NAT keep-alive row timeout, long enough for both
+    ///    endpoints to receive `PunchIntroduce` and arm their
+    ///    timers.
+    /// 3. Fan out `PunchIntroduce` to both A and B with the
+    ///    respective counterpart's reflex and the shared
+    ///    `fire_at`.
+    ///
+    /// Best-effort: A unreachable-from-us or B not-in-our-peer-
+    /// table short-circuits. Neither is surfaced — the caller's
+    /// `connect_direct` timeout is the recovery path.
+    #[cfg(feature = "nat-traversal")]
+    fn handle_punch_request(
+        from_node: u64,
+        req: super::traversal::rendezvous::PunchRequest,
+        ctx: &DispatchCtx,
+    ) {
+        use super::traversal::rendezvous::{PunchIntroduce, RendezvousMsg};
+
+        // 1. Resolve B's reflex address. A's self-reported reflex
+        //    (carried on the request) is the fallback when the
+        //    capability cache doesn't have one yet — matches plan
+        //    decision 7's "prefer-cached, fall-back-to-announced."
+        //    But we do NOT override A's reflex with the cached one
+        //    if A also announces it: the cache may be stale after
+        //    a NAT rebind, and A's self-report is the freshest
+        //    observation from A's own perspective.
+        let Some(b_reflex) = ctx.capability_index.reflex_addr(req.target) else {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                target = format!("{:#x}", req.target),
+                "rendezvous: no cached reflex for target; dropping PunchRequest",
+            );
+            return;
+        };
+
+        // A's reflex comes from the request body. R trusts A's
+        // self-report over the cached value for A-side, per the
+        // note above; a mid-session rebind on A's gateway is
+        // visible to A before it propagates into R's capability
+        // cache via a re-announce.
+        let a_reflex = req.self_reflex;
+
+        // 2. Compute the shared fire time.
+        let fire_lead = ctx.traversal_config.punch_fire_lead;
+        let fire_at_ms = match std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+        {
+            Ok(d) => d.saturating_add(fire_lead).as_millis().min(u64::MAX as u128) as u64,
+            Err(_) => {
+                // System clock pre-1970 — can't compute a
+                // meaningful fire_at. Drop rather than introduce
+                // with a garbage time that endpoints would
+                // interpret as "already past."
+                return;
+            }
+        };
+
+        // 3. Build introduce payloads. Each side learns the
+        //    counterpart's reflex + the shared fire_at.
+        let intro_to_a = RendezvousMsg::PunchIntroduce(PunchIntroduce {
+            peer: req.target,
+            peer_reflex: b_reflex,
+            fire_at_ms,
+        })
+        .encode();
+        let intro_to_b = RendezvousMsg::PunchIntroduce(PunchIntroduce {
+            peer: from_node,
+            peer_reflex: a_reflex,
+            fire_at_ms,
+        })
+        .encode();
+
+        // Look up sessions for both endpoints. If B isn't in our
+        // peer table we can't introduce — stage 5 SDK surface
+        // will map this to `RendezvousNoRelay` on A's side via
+        // the `connect_direct` timeout.
+        let Some((a_addr, a_session)) = ctx
+            .peers
+            .get(&from_node)
+            .map(|e| (e.value().addr, e.value().session.clone()))
+        else {
+            return;
+        };
+        let Some((b_addr, b_session)) = ctx
+            .peers
+            .get(&req.target)
+            .map(|e| (e.value().addr, e.value().session.clone()))
+        else {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                target = format!("{:#x}", req.target),
+                "rendezvous: target peer not directly connected; dropping",
+            );
+            return;
+        };
+
+        if ctx.partition_filter.contains(&a_addr) || ctx.partition_filter.contains(&b_addr) {
+            return;
+        }
+
+        let socket_a = ctx.socket.clone();
+        let socket_b = ctx.socket.clone();
+        tokio::spawn(async move {
+            let pool = a_session.thread_local_pool();
+            let mut builder = pool.get();
+            let seq = {
+                let stream = a_session
+                    .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
+                stream.next_tx_seq()
+            };
+            let events = vec![intro_to_a];
+            let packet = builder.build_subprotocol(
+                super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                seq,
+                &events,
+                PacketFlags::NONE,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS,
+            );
+            let _ = socket_a.send_to(&packet, a_addr).await;
+        });
+        tokio::spawn(async move {
+            let pool = b_session.thread_local_pool();
+            let mut builder = pool.get();
+            let seq = {
+                let stream = b_session
+                    .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
+                stream.next_tx_seq()
+            };
+            let events = vec![intro_to_b];
+            let packet = builder.build_subprotocol(
+                super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                seq,
+                &events,
+                PacketFlags::NONE,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS,
+            );
+            let _ = socket_b.send_to(&packet, b_addr).await;
+        });
+    }
+
     /// Decide whether a Subscribe from `from_node` on `channel` is allowed.
     ///
     /// Rules, in order:
@@ -4058,6 +4302,22 @@ impl MeshNode {
         self.capability_index.query(filter)
     }
 
+    /// Read a peer's most recently advertised public reflex
+    /// `SocketAddr` from the capability index. `None` before the
+    /// peer has sent a stage-2 announcement, or when the peer was
+    /// compiled without `nat-traversal`.
+    ///
+    /// Stage 3 (rendezvous) reads this field to resolve the punch
+    /// target's public address. Exposed for observability and for
+    /// tests that want to verify capability-announcement propagation
+    /// of the reflex field.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn peer_reflex_addr(&self, peer_node_id: u64) -> Option<std::net::SocketAddr> {
+        self.capability_index.reflex_addr(peer_node_id)
+    }
+
     /// Rank peers for a scored requirement. Returns the best-
     /// scoring node's id, or `None` if no peer matches.
     pub fn rank_peers(&self, req: &CapabilityRequirement) -> Option<u64> {
@@ -4802,6 +5062,116 @@ impl MeshNode {
     #[cfg(feature = "nat-traversal")]
     pub fn reflex_addr(&self) -> Option<std::net::SocketAddr> {
         self.reflex_addr.load_full().map(|arc| *arc)
+    }
+
+    /// Send a `PunchRequest` to a coordinator peer `relay`, asking
+    /// it to mediate a hole-punch to `target`. Returns the
+    /// `PunchIntroduce` produced by the coordinator (the one
+    /// arriving on this node's side of the introduction — carrying
+    /// `target`'s reflex and the shared `fire_at`).
+    ///
+    /// This is a stage-3b primitive: it exercises the coordinator
+    /// fan-out end-to-end but does not itself schedule the
+    /// keep-alive train or finalize the punched session. The
+    /// full `connect_direct` flow lands in stage 3c.
+    ///
+    /// Fails with:
+    /// - [`TraversalError::PeerNotReachable`] if `relay` has no
+    ///   active session.
+    /// - [`TraversalError::Transport`] on a socket-level send
+    ///   failure.
+    /// - [`TraversalError::PunchFailed`] if the coordinator
+    ///   doesn't introduce within [`TraversalConfig::punch_deadline`]
+    ///   (likely: R has no cached reflex for `target`).
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn request_punch(
+        &self,
+        relay: u64,
+        target: u64,
+        self_reflex: std::net::SocketAddr,
+    ) -> Result<
+        super::traversal::rendezvous::PunchIntroduce,
+        super::traversal::TraversalError,
+    > {
+        use super::traversal::rendezvous::{PunchRequest, RendezvousMsg};
+        use super::traversal::TraversalError;
+
+        let relay_addr = self
+            .peer_addrs
+            .get(&relay)
+            .map(|e| *e.value())
+            .ok_or(TraversalError::PeerNotReachable)?;
+
+        // Install the waiter BEFORE sending. An improbably fast
+        // coordinator response (R is local, A is local) could
+        // otherwise arrive before the oneshot is registered.
+        // Keyed by `target` because the introduce we'll receive
+        // has `peer = target` in its body.
+        let (tx, rx) = oneshot::channel();
+        self.pending_punch_introduces.insert(target, tx);
+
+        let body = RendezvousMsg::PunchRequest(PunchRequest {
+            target,
+            self_reflex,
+        })
+        .encode();
+        if let Err(e) = self
+            .send_subprotocol(relay_addr, super::traversal::SUBPROTOCOL_RENDEZVOUS, &body)
+            .await
+        {
+            self.pending_punch_introduces.remove(&target);
+            return Err(TraversalError::Transport(e.to_string()));
+        }
+
+        let deadline = self.traversal_config.punch_deadline;
+        match tokio::time::timeout(deadline, rx).await {
+            Ok(Ok(intro)) => Ok(intro),
+            Ok(Err(_recv_err)) => {
+                // oneshot cancelled — another request_punch to the
+                // same target replaced our sender.
+                Err(TraversalError::PunchFailed)
+            }
+            Err(_elapsed) => {
+                self.pending_punch_introduces.remove(&target);
+                Err(TraversalError::PunchFailed)
+            }
+        }
+    }
+
+    /// Install a waiter for an incoming `PunchIntroduce` from
+    /// `counterpart`. The returned future resolves when the
+    /// dispatcher decodes a matching introduce, or with
+    /// [`TraversalError::PunchFailed`] after
+    /// [`TraversalConfig::punch_deadline`].
+    ///
+    /// Stage-3b responder-side primitive: the peer being punched
+    /// *into* uses this to observe the introduce without
+    /// initiating the flow itself. Stage 3c wires the keep-alive
+    /// train onto the returned introduce.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn await_punch_introduce(
+        &self,
+        counterpart: u64,
+    ) -> Result<
+        super::traversal::rendezvous::PunchIntroduce,
+        super::traversal::TraversalError,
+    > {
+        use super::traversal::TraversalError;
+        let (tx, rx) = oneshot::channel();
+        self.pending_punch_introduces.insert(counterpart, tx);
+        let deadline = self.traversal_config.punch_deadline;
+        match tokio::time::timeout(deadline, rx).await {
+            Ok(Ok(intro)) => Ok(intro),
+            Ok(Err(_)) => Err(TraversalError::PunchFailed),
+            Err(_) => {
+                self.pending_punch_introduces.remove(&counterpart);
+                Err(TraversalError::PunchFailed)
+            }
+        }
     }
 
     /// Fire the classification sweep. Picks up to two currently-

@@ -1216,6 +1216,14 @@ pub struct IndexedNode {
     pub indexed_at: Instant,
     /// TTL
     pub ttl: Duration,
+    /// Peer's public-facing `SocketAddr` as advertised on the
+    /// announcement (stage 2 of `NAT_TRAVERSAL_PLAN.md`). `None`
+    /// when the sender was compiled without `nat-traversal` or
+    /// hasn't finished its classification sweep yet. Consumed by
+    /// the rendezvous coordinator (stage 3) — R looks up the
+    /// punch target's `reflex_addr` from the index instead of
+    /// probing it directly.
+    pub reflex_addr: Option<std::net::SocketAddr>,
 }
 
 /// High-performance capability index with inverted indexes
@@ -1291,6 +1299,7 @@ impl CapabilityIndex {
             version: ann.version,
             indexed_at: Instant::now(),
             ttl: Duration::from_secs(ann.ttl_secs as u64),
+            reflex_addr: ann.reflex_addr,
         };
         self.nodes.insert(node_id, indexed);
 
@@ -1496,6 +1505,15 @@ impl CapabilityIndex {
     /// Get node capabilities
     pub fn get(&self, node_id: u64) -> Option<CapabilitySet> {
         self.nodes.get(&node_id).map(|n| n.capabilities.clone())
+    }
+
+    /// Get the peer's last-advertised reflex address from the
+    /// index. Returns `None` when the peer hasn't indexed, or
+    /// indexed a version with no `reflex_addr` attached. Consumed
+    /// by the rendezvous coordinator (stage 3) — R looks up the
+    /// punch target's public `SocketAddr` here.
+    pub fn reflex_addr(&self, node_id: u64) -> Option<std::net::SocketAddr> {
+        self.nodes.get(&node_id).and_then(|n| n.reflex_addr)
     }
 
     /// Get all node IDs
@@ -1897,6 +1915,36 @@ mod tests {
         let bytes = ann.to_bytes();
         let restored = CapabilityAnnouncement::from_bytes(&bytes).expect("parse");
         assert_eq!(restored.reflex_addr, Some(reflex));
+    }
+
+    #[test]
+    fn index_stores_and_returns_reflex_addr() {
+        // Stage 3 (rendezvous): the coordinator looks up the
+        // punch target's reflex address in its capability index.
+        // Regression-guard the storage path — without it, the
+        // coordinator would never find any reflex, effectively
+        // disabling the rendezvous optimization.
+        let reflex: std::net::SocketAddr = "198.51.100.9:40000".parse().unwrap();
+        let ann = CapabilityAnnouncement::new(42, test_entity(), 1, sample_capability_set())
+            .with_reflex_addr(Some(reflex));
+        let index = CapabilityIndex::new();
+        index.index(ann);
+        assert_eq!(index.reflex_addr(42), Some(reflex));
+        // Unknown node returns None — not a panic, not a default.
+        assert_eq!(index.reflex_addr(999), None);
+    }
+
+    #[test]
+    fn index_reflex_addr_none_when_unset_on_announcement() {
+        // A node compiled without nat-traversal (or that hasn't
+        // classified yet) announces with `reflex_addr = None`.
+        // The index round-trip must preserve that, not invent a
+        // bogus default that the coordinator would then try to
+        // punch to.
+        let ann = CapabilityAnnouncement::new(77, test_entity(), 1, sample_capability_set());
+        let index = CapabilityIndex::new();
+        index.index(ann);
+        assert_eq!(index.reflex_addr(77), None);
     }
 
     #[test]
