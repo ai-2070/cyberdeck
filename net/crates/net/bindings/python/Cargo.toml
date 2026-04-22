@@ -26,6 +26,10 @@ net = ["net/net", "dep:hex"]
 # regardless of this feature. Framing (plan §5): traversal is
 # an optimization, not a connectivity requirement.
 nat-traversal = ["net", "net/nat-traversal"]
+# Port mapping — opportunistic UPnP / NAT-PMP / PCP. Exposes
+# `try_port_mapping=None` as a `NetMesh.__init__` kwarg. Builds
+# on `nat-traversal`.
+port-mapping = ["nat-traversal", "net/port-mapping"]
 cortex = ["net/netdb", "net/redex-disk"]
 # Stage 5 of `SDK_COMPUTE_SURFACE_PLAN.md` — Python surface for
 # the `MeshDaemon` / migration runtime. Requires the `net` feature

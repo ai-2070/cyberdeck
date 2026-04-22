@@ -31,6 +31,10 @@ net = ["net/net", "dep:hex"]
 # is an optimization, not a connectivity requirement. See the
 # `NAT_TRAVERSAL_PLAN.md` top-of-doc framing rules.
 nat-traversal = ["net", "net/nat-traversal"]
+# Port mapping — opportunistic UPnP-IGD / NAT-PMP / PCP at
+# startup. Exposes `tryPortMapping?: boolean` on `MeshOptions`.
+# Builds on `nat-traversal`.
+port-mapping = ["nat-traversal", "net/port-mapping"]
 cortex = ["net/netdb", "net/redex-disk"]
 # Compute surface — `DaemonRuntime`, `MeshDaemon`, migration. Stage 3
 # of SDK_COMPUTE_SURFACE_PLAN. Depends on `net` (mesh transport is

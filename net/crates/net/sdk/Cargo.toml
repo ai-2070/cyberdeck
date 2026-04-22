@@ -42,6 +42,13 @@ net = ["net/net"]
 # `punch-failed` error just means traffic keeps riding the
 # relay.
 nat-traversal = ["net", "net/nat-traversal"]
+# Port mapping — opportunistic UPnP-IGD / NAT-PMP / PCP install
+# at startup. Exposes `MeshBuilder::try_port_mapping(bool)` on
+# the SDK surface. Builds on `nat-traversal` (the port-mapping
+# task calls the same `set_reflex_override` / `clear_reflex_override`
+# runtime setters). Off by default — port mapping modifies
+# state on the user's router and some environments forbid it.
+port-mapping = ["nat-traversal", "net/port-mapping"]
 # CortEX adds the typed event-sourced adapters (tasks + memories) plus
 # the NetDb facade. `redex-disk` comes along so `.persistent(true)` is
 # usable from the SDK without a separate feature flip.

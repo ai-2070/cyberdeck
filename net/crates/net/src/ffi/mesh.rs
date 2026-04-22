@@ -294,6 +294,11 @@ struct MeshNewConfig {
     /// without `--features nat-traversal`.
     #[serde(default)]
     reflex_override: Option<String>,
+    /// Opt into opportunistic UPnP / NAT-PMP / PCP port mapping
+    /// at startup. Silently ignored when the cdylib is built
+    /// without `--features port-mapping`.
+    #[serde(default)]
+    try_port_mapping: bool,
 }
 
 pub struct MeshNodeHandle {
@@ -384,6 +389,13 @@ pub extern "C" fn net_mesh_new(
     // back to a thin cdylib without a JSON-parse error.
     #[cfg(not(feature = "nat-traversal"))]
     let _ = cfg.reflex_override;
+    #[cfg(feature = "port-mapping")]
+    if cfg.try_port_mapping {
+        node_cfg = node_cfg.with_try_port_mapping(true);
+    }
+    // Same drop-on-the-floor pattern as reflex_override above.
+    #[cfg(not(feature = "port-mapping"))]
+    let _ = cfg.try_port_mapping;
 
     let identity = match cfg.identity_seed_hex {
         Some(seed_hex) => {

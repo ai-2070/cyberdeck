@@ -848,8 +848,18 @@ mod tests {
 
     #[test]
     fn test_failure_detector_failure() {
+        // Timings: timeout=100ms, sleeps=150ms. `missed_count`
+        // computes `elapsed / timeout`, so after 150ms we
+        // expect 1 miss → Suspected. After 300ms we expect 3
+        // misses → Failed. Wider ratio than the original
+        // (10ms / 15ms) because OS scheduler slippage + deps
+        // that pull in larger runtimes (hyper / igd-next for
+        // the `port-mapping` feature) can add several-ms jitter
+        // on top of a 15ms sleep, which was enough to push
+        // `missed_count` from 1 into 2 (i.e. Failed) after the
+        // first sleep — false positive on the Suspected assert.
         let detector = FailureDetector::with_config(FailureDetectorConfig {
-            timeout: Duration::from_millis(10),
+            timeout: Duration::from_millis(100),
             miss_threshold: 2,
             suspicion_threshold: 1,
             cleanup_interval: Duration::from_secs(60),
@@ -858,15 +868,15 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
         detector.heartbeat(0x1234, addr);
 
-        // Wait for timeout
-        std::thread::sleep(Duration::from_millis(15));
+        // Wait for timeout (~1.5× the timeout → 1 miss).
+        std::thread::sleep(Duration::from_millis(150));
 
         // First check - should be suspected
         detector.check_all();
         assert_eq!(detector.status(0x1234), NodeStatus::Suspected);
 
-        // Wait more
-        std::thread::sleep(Duration::from_millis(15));
+        // Wait more (total ~300ms → 3 misses → Failed).
+        std::thread::sleep(Duration::from_millis(150));
 
         // Second check - should be failed
         let failed = detector.check_all();

@@ -1039,6 +1039,20 @@ mod mesh_bindings {
         /// Silently ignored when the Rust cdylib was built
         /// without `--features nat-traversal`.
         pub reflex_override: Option<String>,
+        /// Opt into opportunistic UPnP-IGD / NAT-PMP / PCP port
+        /// mapping at `start()` time. When `true`, the mesh
+        /// spawns a port-mapping task that probes NAT-PMP + UPnP,
+        /// installs a mapping against the operator's router on
+        /// success, pins the reflex to the mapped external, and
+        /// renews every 30 min.
+        ///
+        /// **Optimization, not correctness.** Safe to set
+        /// `true` on any network — the task degrades cleanly
+        /// when no router responds.
+        ///
+        /// Silently ignored when the Rust cdylib was built
+        /// without `--features port-mapping`.
+        pub try_port_mapping: Option<bool>,
     }
 
     /// JS-facing channel config, mirroring the core `ChannelConfig`
@@ -1321,6 +1335,10 @@ mod mesh_bindings {
                     .parse()
                     .map_err(|e| Error::from_reason(format!("invalid reflex_override: {e}")))?;
                 config = config.with_reflex_override(external);
+            }
+            #[cfg(feature = "port-mapping")]
+            if options.try_port_mapping == Some(true) {
+                config = config.with_try_port_mapping(true);
             }
 
             let identity = match options.identity_seed {

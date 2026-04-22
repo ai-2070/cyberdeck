@@ -49,6 +49,8 @@
 
 pub mod classify;
 pub mod config;
+#[cfg(feature = "port-mapping")]
+pub mod portmap;
 pub mod reflex;
 pub mod rendezvous;
 
@@ -61,14 +63,19 @@ pub use config::TraversalConfig;
 // Traversal stats
 // =========================================================================
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(feature = "port-mapping")]
+use std::sync::Arc;
+
+use arc_swap::ArcSwapOption;
 
 /// Counters tracking traversal decisions + outcomes. Exposed via
 /// [`crate::adapter::net::MeshNode::traversal_stats`]. Every
 /// counter is monotonic; resetting isn't supported because the
 /// values are only meaningful cumulatively.
 ///
-/// The three counters partition all `connect_direct` outcomes:
+/// The three punch/fallback counters partition all
+/// `connect_direct` outcomes:
 ///
 /// - **`punches_attempted`** — the pair-type matrix decided to
 ///   attempt a hole-punch. Increments whether the punch
@@ -83,17 +90,31 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///   punches_attempted`; the difference is the punch-failure
 ///   rate.
 ///
+/// Plus three port-mapping fields (stage 4b): `port_mapping_active`
+/// plus a monotonic renewal counter and the current external
+/// `SocketAddr`. See `docs/PORT_MAPPING_PLAN.md` §8 for the
+/// derivation.
+///
 /// Read via [`TraversalStats::snapshot`] for a consistent
-/// `(attempted, succeeded, fallbacks)` tuple.
+/// point-in-time view.
 #[derive(Debug, Default)]
 pub struct TraversalStats {
     punches_attempted: AtomicU64,
     punches_succeeded: AtomicU64,
     relay_fallbacks: AtomicU64,
+    /// True when a port mapping is currently installed on the
+    /// operator's router and the mesh is advertising the mapped
+    /// external address via `set_reflex_override`.
+    port_mapping_active: AtomicBool,
+    /// The external `SocketAddr` a successful port-mapping
+    /// install produced. `None` while inactive.
+    port_mapping_external: ArcSwapOption<std::net::SocketAddr>,
+    /// Count of successful renewal ticks since install.
+    port_mapping_renewals: AtomicU64,
 }
 
-/// Consistent point-in-time view of the three
-/// [`TraversalStats`] counters.
+/// Consistent point-in-time view of the [`TraversalStats`]
+/// counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TraversalStatsSnapshot {
     /// Number of punches the pair-type matrix elected to attempt.
@@ -103,6 +124,16 @@ pub struct TraversalStatsSnapshot {
     /// Number of `connect_direct` calls that ended on the routed-
     /// handshake path — matrix-skipped + punch-failed.
     pub relay_fallbacks: u64,
+    /// True when a port mapping is currently installed on the
+    /// operator's router. Flips via the port-mapping task's
+    /// install / revoke transitions.
+    pub port_mapping_active: bool,
+    /// Current mapped external `SocketAddr`, or `None` when no
+    /// port mapping is active.
+    pub port_mapping_external: Option<std::net::SocketAddr>,
+    /// Cumulative count of successful renewal ticks since the
+    /// current mapping was installed. Resets on a fresh install.
+    pub port_mapping_renewals: u64,
 }
 
 impl TraversalStats {
@@ -112,16 +143,18 @@ impl TraversalStats {
         Self::default()
     }
 
-    /// Read all three counters. Reads are `Relaxed` — the stats
-    /// are observability, not synchronization primitives, and
-    /// cross-counter skew at observation time is meaningless
-    /// (none of the three counters imply anything about the
-    /// others' current value).
+    /// Read all counters + port-mapping flags. Reads are
+    /// `Relaxed` — the stats are observability, not
+    /// synchronization primitives, and cross-counter skew at
+    /// observation time is meaningless.
     pub fn snapshot(&self) -> TraversalStatsSnapshot {
         TraversalStatsSnapshot {
             punches_attempted: self.punches_attempted.load(Ordering::Relaxed),
             punches_succeeded: self.punches_succeeded.load(Ordering::Relaxed),
             relay_fallbacks: self.relay_fallbacks.load(Ordering::Relaxed),
+            port_mapping_active: self.port_mapping_active.load(Ordering::Relaxed),
+            port_mapping_external: self.port_mapping_external.load_full().map(|arc| *arc),
+            port_mapping_renewals: self.port_mapping_renewals.load(Ordering::Relaxed),
         }
     }
 
@@ -142,6 +175,36 @@ impl TraversalStats {
     /// punch-failed.
     pub(crate) fn record_relay_fallback(&self) {
         self.relay_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a freshly-installed port mapping. Flips
+    /// `port_mapping_active` to `true`, stores the external
+    /// `SocketAddr`, and resets the renewal counter to zero —
+    /// a new install is treated as a distinct session from any
+    /// prior one.
+    #[cfg(feature = "port-mapping")]
+    pub(crate) fn record_port_mapping_install(&self, external: std::net::SocketAddr) {
+        self.port_mapping_external.store(Some(Arc::new(external)));
+        self.port_mapping_renewals.store(0, Ordering::Release);
+        self.port_mapping_active.store(true, Ordering::Release);
+    }
+
+    /// Record a successful renewal of the currently-installed
+    /// mapping. Bumps the renewal counter; leaves
+    /// `port_mapping_active` + `port_mapping_external` unchanged.
+    #[cfg(feature = "port-mapping")]
+    pub(crate) fn record_port_mapping_renewal(&self) {
+        self.port_mapping_renewals.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a revoke — either operator-initiated (clean
+    /// shutdown) or after repeated renewal failures. Flips
+    /// `port_mapping_active` to `false` and clears the external
+    /// address.
+    #[cfg(feature = "port-mapping")]
+    pub(crate) fn record_port_mapping_revoke(&self) {
+        self.port_mapping_active.store(false, Ordering::Release);
+        self.port_mapping_external.store(None);
     }
 }
 

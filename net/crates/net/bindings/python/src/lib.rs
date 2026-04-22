@@ -1087,6 +1087,7 @@ mod mesh_bindings {
             subnet=None,
             subnet_policy=None,
             reflex_override=None,
+            try_port_mapping=None,
         ))]
         #[allow(clippy::too_many_arguments)]
         fn new(
@@ -1107,6 +1108,13 @@ mod mesh_bindings {
             // ignored when the cdylib was built without
             // `--features nat-traversal`.
             reflex_override: Option<&str>,
+            // try_port_mapping: opt into opportunistic UPnP /
+            // NAT-PMP / PCP at startup. When True, the mesh
+            // spawns a port-mapping task that installs + renews
+            // a mapping on the operator's router. Optimization,
+            // not correctness — silently ignored when the cdylib
+            // was built without `--features port-mapping`.
+            try_port_mapping: Option<bool>,
         ) -> PyResult<Self> {
             let addr: std::net::SocketAddr = bind_addr
                 .parse()
@@ -1157,6 +1165,14 @@ mod mesh_bindings {
             // without an exception on an unknown kwarg.
             #[cfg(not(feature = "nat-traversal"))]
             let _ = reflex_override;
+            #[cfg(feature = "port-mapping")]
+            if try_port_mapping == Some(true) {
+                config = config.with_try_port_mapping(true);
+            }
+            // Same drop-on-the-floor pattern as reflex_override
+            // above — thin wheels accept the kwarg and ignore it.
+            #[cfg(not(feature = "port-mapping"))]
+            let _ = try_port_mapping;
 
             let runtime = Arc::new(
                 Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("runtime: {}", e)))?,

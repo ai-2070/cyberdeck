@@ -393,6 +393,39 @@ pub struct MeshNodeConfig {
     /// Default: `None` (use classifier observations).
     #[cfg(feature = "nat-traversal")]
     pub reflex_override: Option<SocketAddr>,
+    /// Attempt to install a UPnP-IGD / NAT-PMP / PCP port
+    /// mapping on the operator's router at [`MeshNode::start`]
+    /// time, lifting this node to `NatClass::Open` with the
+    /// router's external `SocketAddr` when the mapping succeeds.
+    ///
+    /// Off by default because port mapping modifies state on a
+    /// device the operator owns — some deployments explicitly
+    /// disable router control from software, and the mesh should
+    /// never silently change that.
+    ///
+    /// When set, `start()` spawns a `PortMapperTask` that:
+    ///
+    /// 1. Probes NAT-PMP (1 s), falls back to UPnP (2 s).
+    /// 2. On install success: calls [`MeshNode::set_reflex_override`]
+    ///    with the mapped external address.
+    /// 3. Renews on [`super::traversal::TraversalConfig::port_mapping_renewal`]
+    ///    cadence (default 30 min).
+    /// 4. On 3 consecutive renewal failures: calls
+    ///    [`MeshNode::clear_reflex_override`] and exits.
+    /// 5. On mesh shutdown: removes the mapping (best-effort).
+    ///
+    /// **Optimization, not correctness.** Setting this to
+    /// `true` on a network without UPnP / NAT-PMP support is
+    /// safe — the task exits cleanly after one failed probe
+    /// cycle and the classifier takes over as usual.
+    ///
+    /// Requires the `port-mapping` cargo feature. Reading this
+    /// field on a build without the feature is always `false`
+    /// at runtime.
+    ///
+    /// Default: `false`.
+    #[cfg(feature = "port-mapping")]
+    pub try_port_mapping: bool,
 }
 
 impl MeshNodeConfig {
@@ -426,6 +459,8 @@ impl MeshNodeConfig {
             auth_throttle_duration: Duration::from_secs(30),
             #[cfg(feature = "nat-traversal")]
             reflex_override: None,
+            #[cfg(feature = "port-mapping")]
+            try_port_mapping: false,
         }
     }
 
@@ -437,6 +472,18 @@ impl MeshNodeConfig {
     #[cfg(feature = "nat-traversal")]
     pub fn with_reflex_override(mut self, external: SocketAddr) -> Self {
         self.reflex_override = Some(external);
+        self
+    }
+
+    /// Opt into opportunistic UPnP-IGD / NAT-PMP / PCP port
+    /// mapping at `start()` time. See
+    /// [`MeshNodeConfig::try_port_mapping`] for lifecycle
+    /// semantics.
+    ///
+    /// Requires the `port-mapping` cargo feature.
+    #[cfg(feature = "port-mapping")]
+    pub fn with_try_port_mapping(mut self, enabled: bool) -> Self {
+        self.try_port_mapping = enabled;
         self
     }
 
@@ -1487,6 +1534,61 @@ impl MeshNode {
         let router_handle = self.router.start();
         let capability_gc_handle = self.spawn_capability_gc_loop();
         let token_sweep_handle = self.spawn_token_sweep_loop();
+        // Port-mapping task is opt-in — only spawned when the
+        // operator set `try_port_mapping(true)`. Real client is
+        // the `SequentialMapper` (NAT-PMP first, UPnP fallback
+        // — stage 4b-4). Construction is async because LAN-IP
+        // resolution needs a UDP socket bind, so we spawn an
+        // outer task that resolves the sequencer then drives
+        // the port-mapper task inline. If OS gateway discovery
+        // AND LAN-IP resolution both fail, we fall back to the
+        // `NullPortMapper` — the task exits quickly without
+        // side effects, identical to an unavailable-router
+        // environment.
+        #[cfg(feature = "port-mapping")]
+        let port_mapping_handle = if self.config.try_port_mapping {
+            use super::traversal::portmap::{
+                sequential_mapper_from_os, MappingSink, NullPortMapper, PortMapperClient,
+                PortMapperTask,
+            };
+            let traversal_stats = self.traversal_stats.clone();
+            let reflex_addr = self.reflex_addr.clone();
+            let nat_class = self.nat_class.clone();
+            let reflex_override_active = self.reflex_override_active.clone();
+            let shutdown = self.shutdown.clone();
+            let shutdown_notify = self.shutdown_notify.clone();
+            let internal_port = self.config.bind_addr.port();
+            let renewal = self.traversal_config.port_mapping_renewal;
+            Some(tokio::spawn(async move {
+                let client: Box<dyn PortMapperClient> = match sequential_mapper_from_os().await {
+                    Some(seq) => Box::new(seq),
+                    None => {
+                        tracing::debug!(
+                            "port-mapping: OS gateway + LAN IP resolution failed; \
+                                 falling back to NullPortMapper",
+                        );
+                        Box::new(NullPortMapper::new())
+                    }
+                };
+                let sink = MappingSink::new(
+                    traversal_stats,
+                    reflex_addr,
+                    nat_class,
+                    reflex_override_active,
+                );
+                let task = PortMapperTask::new(
+                    client,
+                    sink,
+                    internal_port,
+                    renewal,
+                    shutdown,
+                    shutdown_notify,
+                );
+                task.run().await;
+            }))
+        } else {
+            None
+        };
 
         // Store handles — can't block here, but we need them for shutdown
         let tasks = self.tasks.clone();
@@ -1497,6 +1599,10 @@ impl MeshNode {
             tasks.push(router_handle);
             tasks.push(capability_gc_handle);
             tasks.push(token_sweep_handle);
+            #[cfg(feature = "port-mapping")]
+            if let Some(h) = port_mapping_handle {
+                tasks.push(h);
+            }
         });
     }
 
@@ -1568,6 +1674,63 @@ impl MeshNode {
                 }
             }
         })
+    }
+
+    /// Spawn a port-mapping task driven by `client`. Drives the
+    /// UPnP-IGD / NAT-PMP / PCP lifecycle per
+    /// `docs/PORT_MAPPING_PLAN.md`:
+    ///
+    /// 1. Probe the client; on failure, exit without side
+    ///    effects.
+    /// 2. On probe success, install a mapping for this mesh's
+    ///    bind port. On install success, pin the reflex override
+    ///    to the mapped external address — same publish order
+    ///    as [`Self::set_reflex_override`].
+    /// 3. Renew every
+    ///    [`super::traversal::TraversalConfig::port_mapping_renewal`];
+    ///    3-strike consecutive failures revoke + clear override.
+    /// 4. On shutdown, remove the mapping (best-effort), clear
+    ///    the override, and exit.
+    ///
+    /// Callers that want `MeshNode::start` to auto-spawn a
+    /// [`super::traversal::portmap::NullPortMapper`] (the
+    /// stage-4b-1 default) should set
+    /// [`MeshNodeConfig::try_port_mapping`] to `true`; this
+    /// method is the explicit-client path used by stages 4b-4+
+    /// (real sequencer) and by unit tests that inject mocks.
+    ///
+    /// Requires the `port-mapping` cargo feature.
+    ///
+    /// Takes `&self` (not `&Arc<Self>`) because the task body
+    /// only needs `Arc`-clones of specific fields
+    /// (`traversal_stats`, `reflex_addr`, `nat_class`,
+    /// `reflex_override_active`, `shutdown`, `shutdown_notify`),
+    /// not the whole `MeshNode`. Callable from `start()` without
+    /// forcing the entire `start()` surface to consume an
+    /// `Arc<Self>`.
+    #[cfg(feature = "port-mapping")]
+    pub fn spawn_port_mapping_loop(
+        &self,
+        client: Box<dyn super::traversal::portmap::PortMapperClient>,
+    ) -> JoinHandle<()> {
+        use super::traversal::portmap::{MappingSink, PortMapperTask};
+        let sink = MappingSink::new(
+            self.traversal_stats.clone(),
+            self.reflex_addr.clone(),
+            self.nat_class.clone(),
+            self.reflex_override_active.clone(),
+        );
+        let internal_port = self.config.bind_addr.port();
+        let renewal = self.traversal_config.port_mapping_renewal;
+        let task = PortMapperTask::new(
+            client,
+            sink,
+            internal_port,
+            renewal,
+            self.shutdown.clone(),
+            self.shutdown_notify.clone(),
+        );
+        tokio::spawn(task.run())
     }
 
     /// Spawn a periodic sweep that evicts expired entries from the

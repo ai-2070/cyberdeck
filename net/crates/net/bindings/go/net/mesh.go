@@ -146,6 +146,18 @@ type MeshConfig struct {
 	// Silently ignored when the Rust cdylib was built without
 	// `--features nat-traversal`.
 	ReflexOverride string `json:"reflex_override,omitempty"`
+
+	// TryPortMapping opts into opportunistic UPnP / NAT-PMP / PCP
+	// port mapping at startup. When true, the mesh spawns a
+	// port-mapping task that probes the operator's router,
+	// installs a mapping on success, pins the reflex to the
+	// mapped external, and renews every 30 min.
+	//
+	// Optimization, not correctness — a router that doesn't
+	// speak UPnP / NAT-PMP just falls through to the classifier
+	// path. Silently ignored when the Rust cdylib was built
+	// without `--features port-mapping`.
+	TryPortMapping bool `json:"try_port_mapping,omitempty"`
 }
 
 // StreamConfig configures an opened mesh stream.

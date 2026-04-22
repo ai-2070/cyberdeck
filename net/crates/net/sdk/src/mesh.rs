@@ -118,6 +118,8 @@ pub struct MeshBuilder {
     subnet_policy: Option<Arc<net::adapter::net::SubnetPolicy>>,
     #[cfg(feature = "nat-traversal")]
     reflex_override: Option<SocketAddr>,
+    #[cfg(feature = "port-mapping")]
+    try_port_mapping: bool,
 }
 
 impl MeshBuilder {
@@ -137,6 +139,8 @@ impl MeshBuilder {
             subnet_policy: None,
             #[cfg(feature = "nat-traversal")]
             reflex_override: None,
+            #[cfg(feature = "port-mapping")]
+            try_port_mapping: false,
         })
     }
 
@@ -226,6 +230,35 @@ impl MeshBuilder {
         self
     }
 
+    /// Opt into opportunistic UPnP-IGD / NAT-PMP / PCP port
+    /// mapping at startup. When set, the mesh spawns a
+    /// [`PortMapperTask`](net::adapter::net::traversal::portmap)
+    /// during `start()` that:
+    ///
+    /// 1. Probes NAT-PMP against the OS-discovered default
+    ///    gateway (1 s deadline).
+    /// 2. Falls back to UPnP via SSDP discovery (2 s deadline).
+    /// 3. On install success, pins the reflex override to the
+    ///    mapped external address — the mesh advertises itself
+    ///    as `Open` to peers without a classifier round-trip.
+    /// 4. Renews every 30 min; revokes on shutdown; falls back
+    ///    to the classifier on three consecutive renewal
+    ///    failures.
+    ///
+    /// **Optimization, not correctness.** A node whose router
+    /// doesn't speak UPnP / NAT-PMP still reaches every peer
+    /// through the routed-handshake path. Off by default
+    /// because port mapping modifies state on the operator's
+    /// router.
+    ///
+    /// Requires the `port-mapping` cargo feature. The flag is
+    /// silently ignored when the feature is off.
+    #[cfg(feature = "port-mapping")]
+    pub fn try_port_mapping(mut self, enabled: bool) -> Self {
+        self.try_port_mapping = enabled;
+        self
+    }
+
     /// Build the mesh node.
     pub async fn build(self) -> Result<Mesh> {
         // Use the caller's identity if one was set, otherwise mint an
@@ -250,6 +283,10 @@ impl MeshBuilder {
         #[cfg(feature = "nat-traversal")]
         if let Some(external) = self.reflex_override {
             config = config.with_reflex_override(external);
+        }
+        #[cfg(feature = "port-mapping")]
+        if self.try_port_mapping {
+            config = config.with_try_port_mapping(true);
         }
 
         let mut node = MeshNode::new(keypair, config).await?;
