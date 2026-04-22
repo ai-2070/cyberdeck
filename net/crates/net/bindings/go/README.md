@@ -267,6 +267,57 @@ func main() {
 }
 ```
 
+### NAT traversal (optimization, not correctness)
+
+Two NATed peers already reach each other through the mesh's routed-handshake path. NAT traversal opens a shorter direct path when the NAT shape allows it; it's never required for connectivity. Every method below is safe to call regardless of NAT type — a failed punch or an `ErrTraversal*` is not a connectivity failure, traffic keeps riding the relay. The whole surface is a no-op when the core cdylib was built without `--features nat-traversal`: the Go methods resolve as fallback stubs that return `ErrTraversalUnsupported`.
+
+```go
+// Probe + classify — results land on every outbound capability announcement.
+_ = mesh.ReclassifyNat()
+
+class,  _ := mesh.NatType()                 // "open" | "cone" | "symmetric" | "unknown"
+reflex, _ := mesh.ReflexAddr()              // "203.0.113.5:9001" (or "")
+
+// Ask one peer directly what reflex they see for us.
+observed, _ := mesh.ProbeReflex(peerNodeID)
+
+// Attempt a direct connection via the pair-type matrix.
+// `coordinator` mediates the punch when the matrix picks one.
+// Always resolves — inspect stats to learn which path won.
+_ = mesh.ConnectDirect(peerNodeID, peerPubkeyHex, coordinatorNodeID)
+
+// Cumulative counters partition real activity.
+stats, _ := mesh.TraversalStats()
+stats.PunchesAttempted  // coordinator mediated a PunchRequest + Introduce
+stats.PunchesSucceeded  // ack arrived AND direct handshake landed
+stats.RelayFallbacks    // landed on the routed path after skip/fail
+```
+
+Operators with a known-public address — port-forwarded servers, successful UPnP / NAT-PMP installs — skip the classifier sweep entirely. The override pins `"open"` + the supplied address on every capability announcement; call `AnnounceCapabilities` after to propagate (the setter resets the rate-limit floor so the next announce is guaranteed to broadcast).
+
+```go
+_ = mesh.SetReflexOverride("203.0.113.5:9001")
+_ = mesh.AnnounceCapabilities(caps)
+// later:
+_ = mesh.ClearReflexOverride()
+_ = mesh.AnnounceCapabilities(caps)
+```
+
+Typed errors:
+
+```go
+ErrTraversalReflexTimeout
+ErrTraversalPeerNotReachable
+ErrTraversalTransport
+ErrTraversalRendezvousNoRelay
+ErrTraversalRendezvousRejected
+ErrTraversalPunchFailed
+ErrTraversalPortMapUnavailable
+ErrTraversalUnsupported   // surfaced by every method on a cdylib built without `nat-traversal`
+```
+
+All are sentinels; use `errors.Is`. `ErrTraversalUnsupported` is the signal that the bindings are linked unconditionally and the native library doesn't have the feature — callers can branch cleanly without probing for symbol presence.
+
 ### Per-peer streams with backpressure
 
 ```go
