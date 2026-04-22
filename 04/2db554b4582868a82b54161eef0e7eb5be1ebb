@@ -1,0 +1,35 @@
+net/crates/net/bindings/python/src/lib.rs
+  5bf3f089eecaef7a 1931-1968
+net/crates/net/bindings/go/net/net.h
+  5bf3f089eecaef7a 624-635
+net/crates/net/bindings/node/src/lib.rs
+  5bf3f089eecaef7a 2012-2051
+net/crates/net/src/ffi/mesh.rs
+  5bf3f089eecaef7a 837-881
+net/crates/net/bindings/go/net/mesh.go
+  5bf3f089eecaef7a 549-586
+net/crates/net/sdk/tests/mesh_nat_traversal.rs
+  5bf3f089eecaef7a 165-213
+net/crates/net/sdk/src/mesh.rs
+  5bf3f089eecaef7a 920-956
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "042db554b4582868a82b54161eef0e7eb5be1ebb",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 14055,
+      "total_deletions": 1602,
+      "accepted_lines": 262,
+      "overriden_lines": 0
+    }
+  }
+}
