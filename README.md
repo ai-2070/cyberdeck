@@ -157,6 +157,58 @@ Traditional networking treats the connection as the primary object. You establis
 
 Net propagates state. Connections are ephemeral transport — the current shortest path between where state is and where it needs to be. When a path breaks, state doesn't wait for recovery. It moves. The routing table updates, the proximity graph adjusts, the state continues on a different path. No reconnection, no session resumption, no handshake retry. Identity lives in the state chain, not in the socket.
 
+## Capabilities
+
+Before a daemon can run somewhere useful, the mesh has to know what each node actually is — how many cores, how much memory, which GPU, which models loaded, which tools installed, which tags the operator wants matched. Every node broadcasts a signed `CapabilityAnnouncement` carrying that fingerprint. Peers index it locally; announcements propagate multi-hop (up to 16 hops, `(origin, version)` deduped at every relay), so a node four hops away learns the same fingerprint without a central directory.
+
+A caller queries the local index with a `CapabilityFilter` — *any peer with an NVIDIA GPU, at least 40 GB VRAM, advertising the `prod` tag* — and gets back a list of node ids in microseconds. Placement (which node should host a new daemon), channel authorization (should this subscriber be allowed in), and subnet derivation (where does this peer live in the visibility geometry) all key off the same fingerprint. A node that hasn't announced matching capabilities is invisible to placement; a node that stops meeting them gets rerouted around.
+
+Announcements are ed25519-signed with the node's identity keypair. `node_id → entity_id` is pinned TOFU on first sight; rebinds are silently rejected. TTL-driven GC and origin-side rate limiting (default 10 s) keep the index stable under churn without losing freshness for late joiners. Forwarders bump `hop_count` outside the signed envelope so the origin's signature verifies end-to-end at every hop.
+
+Details: [`net/crates/net/README.md#capabilities`](net/crates/net/README.md#capabilities), [`net/crates/net/docs/MULTIHOP_CAPABILITY_PLAN.md`](net/crates/net/docs/MULTIHOP_CAPABILITY_PLAN.md).
+
+## Channels
+
+Named pub/sub over the encrypted mesh. A publisher registers a channel with an access policy: a hierarchical name (`sensors/temperature`, `events/inference`), a visibility class, capability requirements for subscribers, optionally a `require_token` flag. Subscribers send a subscribe message; the publisher validates the request and either adds them to the roster or rejects with a typed ack (`Unauthorized`, `RateLimited`, `UnknownChannel`). Once on the roster, every `publish` fans out N per-peer unicasts — no multicast packet, no group cryptography, no implicit "everyone" broadcast.
+
+Channels decouple applications from node identity. A producer emits to `sensors/temperature`. A consumer subscribes to `sensors/temperature`. Neither knows or cares which node the other is. The mesh connects them through the channel, the proximity graph finds the shortest path, and the auth guard ensures both sides are authorized.
+
+Every publish consults an `AuthGuard` fast path — a 4 KB bloom filter backed by a verified-subscribe cache — before forwarding a packet. Microbenchmark: ~20 ns per check. Revocations apply on the very next publish without a roster refresh. A periodic token-expiry sweep evicts subscribers whose tokens age out; a per-peer auth-failure rate limiter throttles bad-token storms before ed25519 verification runs.
+
+Channel names always cross the SDK boundary as strings. The u16 hash used in the transport header is an index into the local config registry, not an authority — ACL lookups key on the canonical name to prevent bypass via hash collision.
+
+Details: [`net/crates/net/README.md#channels`](net/crates/net/README.md#channels), [`net/crates/net/docs/CHANNELS.md`](net/crates/net/docs/CHANNELS.md), [`net/crates/net/docs/CHANNEL_AUTH_GUARD_PLAN.md`](net/crates/net/docs/CHANNEL_AUTH_GUARD_PLAN.md).
+
+## Subnets
+
+Subnets partition visibility. A `SubnetId` is a 4-level hierarchical address (each level 0–255); 2³² possible subnets in total. A node pins its own subnet on startup, or lets a shared `SubnetPolicy` derive it from the node's capability tags. Because every node runs the same policy against every inbound `CapabilityAnnouncement`, the geometry emerges from local computation without a central registry — no directory service, no gossip protocol dedicated to subnets, just the capability broadcast from above.
+
+Channels then gate publish fan-out and subscribe authorization against that geometry. `Visibility::Global` reaches every peer; `Visibility::SubnetLocal` stays within peers whose `SubnetId` matches exactly; `Visibility::ParentVisible` allows the same subnet plus any ancestor or descendant. A cross-subnet subscribe to a `SubnetLocal` channel rejects with `Unauthorized`; filtered subscribers don't appear in `PublishReport.attempted`.
+
+Subnets are enforcement, not just labeling. Routing and channel auth consult the derived subnet on every publish. Multi-hop subnet-aware forwarding at the packet header — where a relay refuses to carry a `SubnetLocal` packet across a boundary — is a follow-up; the current enforcement model is end-to-end at subscribe + publish, which is sufficient when the whole fleet agrees on the same policy.
+
+Details: [`net/crates/net/README.md#subnets`](net/crates/net/README.md#subnets), [`net/crates/net/docs/SUBNET_ENFORCEMENT_PLAN.md`](net/crates/net/docs/SUBNET_ENFORCEMENT_PLAN.md).
+
+## Security surface
+
+Identity, capability announcements, subnet visibility, and channel authentication are not four features. They're one security surface that operates as a single unit at runtime — the mesh's subprotocol dispatch threads identity + capabilities + subnets + channel auth together, and every binding (Rust, TypeScript, Python, Go) surfaces all four pieces through the same handles.
+
+Every node has an ed25519 `Identity` — a 32-byte seed the caller owns. `node_id` and `entity_id` derive deterministically from that seed, so a node that loses power and comes back up is the same node cryptographically. Permission tokens are ed25519-signed grants tying a `(subject, scope, channel, TTL)` tuple together; they cross the boundary as 159-byte opaque buffers. Scope is a bitfield — `publish | subscribe | admin | delegate`. Tokens can be re-delegated down a chain, each hop decrementing a `delegation_depth` counter and chained back to the issuer's signature; the chain is verified end-to-end on the receiving side.
+
+The pieces compose. A channel declares `publish_caps`, `subscribe_caps`, `require_token`, and `visibility` on its `ChannelConfig`. A subscribe packet arrives carrying a token; the publisher verifies the ed25519 signature, checks that the subject matches the subscribing peer's entity id (pinned TOFU against their capability announcement), confirms their capabilities satisfy `subscribe_caps`, and confirms their derived subnet satisfies the visibility rule. All four checks run off one 20 ns fast-path hit per published packet thereafter.
+
+Details: [`net/crates/net/README.md#security-surface`](net/crates/net/README.md#security-surface), [`net/crates/net/docs/SDK_SECURITY_SURFACE_PLAN.md`](net/crates/net/docs/SDK_SECURITY_SURFACE_PLAN.md).
+
+## Daemons
+
+A `MeshDaemon` is the compute unit of the mesh: a stateful event processor with a deterministic causal chain. The trait is minimal — `name`, `requirements`, `process`, and optional `snapshot`/`restore` — and each method is synchronous by contract. Every event a daemon produces is wrapped in a 24-byte `CausalLink` (origin, sequence, parent hash, compressed horizon) before it leaves the host; downstream consumers see an unforgeable chain that can be verified against the daemon's ed25519 identity.
+
+`DaemonRuntime` owns the factory table, the per-daemon hosts, and the lifecycle gate (`Registering → Ready → ShuttingDown`). Callers register factories under string kinds, call `start()`, then `spawn(kind, identity, config)` — the runtime hands the placement decision to a `PlacementScheduler` which consults the local capability index, picks a node that satisfies the daemon's `requirements()`, and registers the host there. A daemon that needs a GPU lands on a GPU node or fails to spawn; there's no notion of "default placement" that ignores requirements.
+
+Daemons compose with the rest of the mesh through the same handles applications use. A daemon subscribes to channels via the runtime; the causal chain it produces is routed, forwarded, and (if configured) persisted exactly like application events. From the daemon's perspective every event is local — the mesh has already resolved routing, decryption, and auth before `process(event)` fires. Migration, replicas, forks, and standby groups then extend this compute model with mobility and redundancy — see *Mikoshi* below.
+
+Details: [`net/crates/net/README.md#daemons`](net/crates/net/README.md#daemons), [`net/crates/net/docs/SDK_COMPUTE_SURFACE_PLAN.md`](net/crates/net/docs/SDK_COMPUTE_SURFACE_PLAN.md), [`net/crates/net/docs/DAEMON_RUNTIME_READINESS_PLAN.md`](net/crates/net/docs/DAEMON_RUNTIME_READINESS_PLAN.md).
+
 ## Mikoshi
 
 In Cyberpunk, Mikoshi is Arasaka's construct for storing engrams — consciousness held in digital space, minds persisting outside their original hardware.
@@ -206,6 +258,26 @@ This means processing can happen anywhere without first solving "where is the da
 Storage becomes a choice, not an assumption. A node can choose to persist events to Redis. A node can choose to replay from JetStream. But the mesh itself doesn't require storage to function. Events exist in the ring buffers of the nodes they're passing through, for as long as they're relevant, and then they're gone. If you need them later, that's what the persistence adapters are for. But the processing path — the hot path — never touches disk, never queries a database, never waits on storage I/O.
 
 This is why the latency numbers are what they are. Processing isn't waiting on storage. Storage isn't blocking processing. They're independent decisions made by independent nodes.
+
+## RedEX
+
+Storage in Net is opt-in and local. RedEX is the primitive: an append-only log with a fixed 20-byte index record (seq + offset + len + checksum+flags) and a payload segment. A `Redex` manager owns a `ChannelName → RedexFile` map; every file is an independent monotonic sequence. There's no replication, no distributed consensus, no multi-node convergence — a RedEX file is whatever the owning node chose to persist, nothing more.
+
+Two payload paths. Inline uses exactly 8 bytes of the index record itself (repurposing the offset+len fields under an `INLINE` flag) — zero segment allocation, the fast path for tick counters, sensor readings, small enums. Heap appends to an in-memory segment and stores `(offset, len)` in the index; a typed `TypedRedexFile<T>` wrapper auto-serdes on append and tail so callers never touch postcard directly. A `tail(from_seq)` stream atomically backfills the retained range then switches to live appends without a gap. Count-, size-, and time-based retention policies drive a background sweep.
+
+Enable the `redex-disk` feature and a `RedexFileConfig::persistent` file writes `<base>/<channel_path>/{idx,dat}`. On reopen, the full `dat` replays into the heap segment and the `idx` restores the index. A partial 20-byte record from a crash is truncated on recovery; `close()` fsyncs; unsynced writes live in OS page cache — exactly matches the documented "recover minus unsynced tail" semantics. RedEX is what higher layers (CortEX, NetDB, application logs) build on; nothing in RedEX knows about them.
+
+Details: [`net/crates/net/README.md#redex`](net/crates/net/README.md#redex), [`net/crates/net/docs/REDEX_PLAN.md`](net/crates/net/docs/REDEX_PLAN.md).
+
+## CortEX + NetDB
+
+CortEX drives a deterministic fold from a RedEX tail into an in-memory `State`, exposed under `Arc<RwLock<State>>`. Every event gets a fixed 20-byte `EventMeta` prefix (dispatch / flags / origin_hash / seq_or_ts / checksum); the adapter projects that into a `RedexFold<State>` implementation, handles replay semantics (`FromBeginning` / `LiveOnly` / `FromSeq(n)`), and exposes a `wait_for_seq(seq)` barrier so readers can block until a specific event has been folded. A `changes()` stream broadcasts post-fold sequence numbers; reactive watchers compose over it.
+
+Two concrete models ship today. Tasks is mutate-by-id CRUD (`create` / `rename` / `complete` / `delete` over `Task { id, title, status, created_ns, updated_ns }`). Memories is a content-addressed log with set-valued tag metadata (`store` / `retag` / `pin` / `unpin` / `delete`). Both expose a fluent query builder (`state.query().where_*(...).order_by(...).limit(n)`) and a reactive watcher (`adapter.watch().where_*(...).stream()`) that emits the initial filter result then deduplicated re-evaluations on every fold tick where the output changes. Snapshot/resume is built in: `snapshot()` serializes the materialized state under the write lock, `open_from_snapshot()` rehydrates and resumes tailing at `FromSeq(last_seq + 1)`.
+
+NetDB is the query façade over one or more CortEX models. A `NetDb` handle bundles adapters under per-model accessors (`db.tasks`, `db.memories`), exposes Prisma-style methods (`find_unique`, `find_many`, `count_where`, `exists_where`), and supports whole-db snapshots that bundle every enabled model's state into a single postcard blob. NetDB is strictly local and strictly query-oriented — raw events and streams stay at the RedEX / Net layer. The surface is identical across Rust, TypeScript, and Python; snapshot bundles round-trip between languages.
+
+Details: [`net/crates/net/README.md#cortex`](net/crates/net/README.md#cortex), [`net/crates/net/docs/CORTEX_ADAPTER_PLAN.md`](net/crates/net/docs/CORTEX_ADAPTER_PLAN.md), [`net/crates/net/docs/NETDB_PLAN.md`](net/crates/net/docs/NETDB_PLAN.md), [`net/crates/net/docs/STORAGE_AND_CORTEX.md`](net/crates/net/docs/STORAGE_AND_CORTEX.md).
 
 ## Non-localized event bus
 
