@@ -1,0 +1,35 @@
+net/crates/net/bindings/go/net/net.h
+  5bf3f089eecaef7a 908-913
+net/crates/net/bindings/go/compute-ffi/Cargo.toml
+  5bf3f089eecaef7a 16-26
+net/crates/net/bindings/go/compute-ffi/src/lib.rs
+  5bf3f089eecaef7a 1569-1577,1588-1589,1595
+net/crates/net/bindings/go/net/groups_testhelpers.go
+  5bf3f089eecaef7a 1-67
+net/crates/net/sdk-ts/src/groups.ts
+  5bf3f089eecaef7a 20-23,25
+net/crates/net/bindings/go/net/groups_test.go
+  5bf3f089eecaef7a 2-12
+net/crates/net/sdk-py/README.md
+  5bf3f089eecaef7a 294-295,299-314,317-322,332,351-355,358-362
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "9b97827285b9861a315a370ca2179162ba18da68",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2664,
+      "total_deletions": 51,
+      "accepted_lines": 150,
+      "overriden_lines": 0
+    }
+  }
+}
