@@ -12,7 +12,7 @@ Stage 4a landed the `reflex_override` surface: both config-level (`MeshNodeConfi
 
 ### What the parent plan specifies
 
-Parent §4 sketches the behavior in 6 bullets (probe gateway, try NAT-PMP first with 1 s deadline, fall back to UPnP with 2 s, 30 min renewal, `DeletePortMapping` on shutdown) and mentions two deps (`igd-next`, `rust-natpmp`). It leaves the implementation-level decisions below open.
+Parent §4 sketches the behavior in 6 bullets (probe gateway, try NAT-PMP first with 1 s deadline, fall back to UPnP with 2 s, 30 min renewal, `DeletePortMapping` on shutdown) and mentions two deps (`igd-next`, `rust-natpmp`). Decision 10 below resolved the NAT-PMP side by inlining the ~100-line wire codec directly — `rust-natpmp` is *not* a dep; only `igd-next` is pulled in for UPnP. The implementation-level decisions below document the remaining choices.
 
 ## Goals
 
@@ -28,9 +28,9 @@ Parent §4 sketches the behavior in 6 bullets (probe gateway, try NAT-PMP first 
 
 - **Install-side retry / exponential backoff.** Parent decision 5 ("best-effort side quest") applies — one shot per protocol on startup, no retry loop. If both fail, the task logs + exits and the classifier takes over.
 - **Multi-mapping.** We install one mapping for the mesh's bind port. No per-subprotocol granularity; no per-peer mapping.
-- **PCP v2 features.** `rust-natpmp` covers PCP via its shared wire format with NAT-PMP. Advanced PCP-only features (`PEER` opcodes, `ANNOUNCE`) are out of scope.
+- **PCP (RFC 6887).** Out of scope entirely for this plan. NAT-PMP (RFC 6886) and PCP share UDP port 5351 and the first version byte is how routers distinguish them, but the wire formats diverge past that — PCP uses a 60-byte header with opcode-specific trailers, NAT-PMP uses 2/12/16-byte packets. Our inlined `natpmp.rs` codec implements RFC 6886 only; `rust-natpmp` (mentioned in the parent plan) is similarly NAT-PMP-only and does *not* speak PCP despite the shared port. Advanced PCP features (`PEER` opcodes, `ANNOUNCE`, filtering) require a separate client and are punted to a follow-up if practical deployments need them.
 - **Persistent mapping state across restarts.** Each mesh boot re-probes and re-installs. Parent decision 12 ("accept the crash leak") covers the case where shutdown skips revoke; the router cleans up on TTL expiry.
-- **Windows NAT-PMP.** Likely works via `rust-natpmp`'s default-gateway helper, but we don't make it load-bearing. If only UPnP works on Windows in practice, that's fine.
+- **Windows NAT-PMP.** Parent plan assumed `rust-natpmp`'s default-gateway helper; 4b-2 inlined the wire codec instead (decision 10 below), so gateway discovery on Windows needs its own path and is not load-bearing. If only UPnP works on Windows in practice, that's fine.
 
 ---
 
@@ -83,11 +83,11 @@ pub struct PortMapping {
 
 ### 2. Gateway discovery: lean on the libs; optional `default-net` for NAT-PMP
 
-UPnP-IGD uses SSDP multicast for discovery — no gateway IP needed upfront. NAT-PMP / PCP needs the default gateway's IPv4 address to send the 12-byte probe packet.
+UPnP-IGD uses SSDP multicast for discovery — no gateway IP needed upfront. NAT-PMP needs the default gateway's IPv4 address to send the 2-byte probe packet.
 
-`rust-natpmp` includes a `Natpmp::new()` that calls into platform-specific defaults (unix: `netstat -rn` / `ip route`; macOS: `route get default`). On platforms where it fails, we degrade gracefully by skipping NAT-PMP and falling through to UPnP.
+Because we inlined the wire codec (decision 10), there's no `rust-natpmp` helper to lean on for gateway discovery; stage-4b-4's sequencer parses the OS routing table itself (unix: `netstat -rn` / `ip route`; macOS: `route get default`) or accepts an operator-supplied gateway when auto-detection fails. On platforms where auto-detection fails we degrade gracefully by skipping NAT-PMP and falling through to UPnP.
 
-**Decision:** No explicit `default-net` dep in stage 4b. The NAT-PMP lib's own helper is sufficient for unix + macOS, and Windows can rely on UPnP. Revisit if we see a non-trivial number of Windows-only deployments where UPnP is disabled but NAT-PMP would work.
+**Decision:** No explicit `default-net` dep in stage 4b. The sequencer's own routing-table reader is sufficient for unix + macOS, and Windows can rely on UPnP. Revisit if we see a non-trivial number of Windows-only deployments where UPnP is disabled but NAT-PMP would work.
 
 ### 3. Task lifecycle: 5-state machine with single-attempt install
 
@@ -184,15 +184,10 @@ Behind `#[cfg(feature = "nat-traversal")]` (not `port-mapping`) so code compiled
 
 ### 10. Dependency review at implementation time
 
-The parent plan names `igd-next` (MIT, actively maintained, ≈150 KB) and `rust-natpmp` (MIT, sparse maintenance, ≈50 KB, stable wire format). Before landing 4b-2 / 4b-3:
+The parent plan names `igd-next` (MIT, actively maintained, ≈150 KB) and `rust-natpmp` (MIT, sparse maintenance, ≈50 KB, stable wire format). Resolved outcomes at landing time:
 
-- **`igd-next`:** check current crates.io version + open issues. If healthy, use as-is.
-- **`rust-natpmp`:** if dormant (no releases in 18+ months, unaddressed CVEs, maintainer-unresponsive issues), alternatives:
-  1. Pin to a last-known-good version (the NAT-PMP wire format is stable RFC 6886).
-  2. Vendor the crate into `crates/net/third-party/natpmp/` with minor maintenance patches.
-  3. Implement the ~100 lines of NAT-PMP wire logic directly (12-byte request, 16-byte response) — fastest to audit, drops the dep entirely.
-
-**Recommendation at this point:** inline the NAT-PMP wire format ourselves. The payload is small enough to fit in a single module (`portmap/natpmp_wire.rs`) with unit tests covering the byte layout, and we shed a dep that has no other user inside the codebase. Decision deferred to 4b-2 when we're actually writing it.
+- **`igd-next`:** kept as-is; `port-mapping` feature adds `dep:igd-next`.
+- **`rust-natpmp`:** **rejected.** NAT-PMP wire format (RFC 6886) is ~100 lines — we inlined it in `portmap/natpmp.rs` with its own `encode_request` / `decode_response` + unit tests. Benefits: one less dep (no other user in-tree), explicit control over the kernel-level source-address filter (RFC 6886 §3.1 mandate, implemented via `UdpSocket::connect`), and no coupling to a sparsely-maintained external crate. Alternatives considered and not needed: (1) pinning to a last-known-good version, (2) vendoring into `crates/net/third-party/natpmp/`.
 
 ---
 
@@ -215,9 +210,9 @@ No new external deps. Testable entirely in-process.
 
 ### Stage 4b-2 — NAT-PMP client
 
-- Either add the `rust-natpmp` dep (conditional on dep-review outcome) OR implement the wire format inline in `portmap/natpmp_wire.rs`.
-- Gateway discovery via the lib's helper (unix + macOS); fail-fast on Windows if the helper doesn't resolve.
-- `NatPmpMapper` impls `PortMapperClient`.
+- Wire format inlined in `portmap/natpmp.rs` (decision 10 resolved): `encode_request` / `decode_response` covering the RFC 6886 external-address + map-UDP shapes, plus a `ResultCode` enum.
+- `NatPmpMapper` impls `PortMapperClient`, using `UdpSocket::connect` to pin the kernel-side source-address filter per RFC 6886 §3.1 (rejects spoofed responses from non-gateway hosts).
+- Gateway discovery handled by the sequencer at 4b-4 time — the mapper accepts a known gateway `Ipv4Addr` at construction.
 - Manual test against a NAT-PMP-capable router (most consumer routers support one of the two; test setup: pfSense or a Unifi Dream Router).
 
 Feature-gate: behind `port-mapping` cargo feature.
@@ -252,12 +247,12 @@ No new methods on the mesh — the flag is a constructor-time decision. Stage-4a
 ## Critical files
 
 - `adapter/net/traversal/portmap.rs` — new module. Trait, task, state machine, error enum, null + mock mappers.
-- `adapter/net/traversal/portmap/natpmp.rs` — NAT-PMP client (or `portmap/natpmp_wire.rs` if inlined).
+- `adapter/net/traversal/portmap/natpmp.rs` — NAT-PMP client (inlined RFC 6886 wire codec + `NatPmpMapper`).
 - `adapter/net/traversal/portmap/upnp.rs` — UPnP client.
 - `adapter/net/traversal/mod.rs` — re-export `PortMapperClient`, `PortMapping`, `PortMappingError`, `Protocol`.
 - `adapter/net/traversal/config.rs` — no change (`port_mapping_renewal` already exists).
 - `adapter/net/mesh.rs` — `MeshNodeConfig::try_port_mapping` field + `with_try_port_mapping` setter; task spawn in `start()`; `TraversalStatsSnapshot` fields.
-- `Cargo.toml` — `port-mapping` feature gains `dep:igd-next` + (conditionally) `dep:rust-natpmp`.
+- `Cargo.toml` — `port-mapping` feature gains `dep:igd-next`. NAT-PMP is inlined (decision 10), so no `rust-natpmp` dep.
 - `sdk/src/mesh.rs`, `bindings/node/src/lib.rs`, `bindings/python/src/lib.rs`, `bindings/go/net/mesh.go` — `try_port_mapping` parity (stage 4b-5).
 
 ---
@@ -276,7 +271,7 @@ Per parent §4 plus stage-specific additions:
 
 ## Open questions
 
-- **Does our IPv6 story change?** UPnP-IGD v2 supports IPv6 (WANIPv6FirewallControl); NAT-PMP / PCP supports it via PCP's `ANNOUNCE`. For the MVP we target IPv4 only; IPv6 on a dual-stack node with separate IPv6 reachability falls into the "already NatType::Open" bucket per parent §Non-goals. Flag if practical deployments surface a mismatch.
+- **Does our IPv6 story change?** UPnP-IGD v2 supports IPv6 (WANIPv6FirewallControl). NAT-PMP is IPv4-only by spec; PCP (RFC 6887) adds IPv6 via its `ANNOUNCE` opcode, but we don't speak PCP. For the MVP we target IPv4 only; IPv6 on a dual-stack node with separate IPv6 reachability falls into the "already NatType::Open" bucket per parent §Non-goals. Flag if practical deployments surface a mismatch.
 - **Should the task continue running after probe failure?** Current plan (decision 3) says no: both protocols fail → task exits. Alternative: leave it dormant, re-probe on a slow cadence (e.g., every hour) so a router that gets UPnP turned on mid-session can be picked up. Decision: no — matches "best-effort side quest" framing; operators wanting this can toggle `try_port_mapping` via a restart.
 - **Do we need a metric for time-to-map?** Currently just `port_mapping_active` + a renewals counter. A histogram of probe-to-install latency could surface flaky routers. Decision: add if an operator asks; not load-bearing for correctness.
 
@@ -298,10 +293,10 @@ Total: ~4.5 days serial. 4b-1 is the only sub-stage that's strictly blocking —
 
 ## Dependencies
 
-- `igd-next` ≈ 150 KB, MIT. Confirm maintenance status at 4b-3 time.
-- `rust-natpmp` ≈ 50 KB, MIT. Review at 4b-2 time per decision 10; likely inline the wire format instead.
+- `igd-next` ≈ 150 KB, MIT. Gated by `port-mapping` feature.
+- `rust-natpmp`: **not used.** Decision 10 resolved to inline the RFC 6886 wire codec directly in `portmap/natpmp.rs` (~100 lines + unit tests), eliminating the dep entirely.
 
-Both gated by `port-mapping` feature. Stage 4b-1 adds no external deps — it's pure module + task scaffolding.
+Stage 4b-1 adds no external deps — it's pure module + task scaffolding. Stage 4b-3 introduces the sole port-mapping dep (`igd-next`).
 
 ---
 
