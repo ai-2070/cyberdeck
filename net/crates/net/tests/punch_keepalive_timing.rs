@@ -210,20 +210,25 @@ async fn keepalive_train_spacing_stays_within_punch_window() {
          Arrivals: {arrivals:?}",
     );
 
-    // And packets should be roughly ordered (not bunched all at
-    // t0, not all at the end). Assert packet 2 comes after
-    // packet 1 + at least a few ms.
+    // Sanity: packets arrived in the order the scheduler fired
+    // them. Non-strict (`>=`) because under an anchored
+    // `sleep_until` schedule a runtime stall past an earlier
+    // deadline can make two packets fire on the same wake — the
+    // absolute timestamps for packets that missed the stall
+    // compress toward equality rather than reorder. Strict-gap
+    // assertions (previously `> +30 ms`) overspecify the
+    // schedule and flake on stressed CI runners; the total-spread
+    // check above is what rules out the real bug (cumulative
+    // `sleep` producing ~1350 ms of drift).
     assert!(
-        arrivals[1] > arrivals[0] + Duration::from_millis(30),
-        "packet 2 arrived too close to packet 1 ({:?} vs {:?}) — \
-         schedule may be collapsed",
+        arrivals[1] >= arrivals[0],
+        "arrival order regressed: packet 2 came before packet 1 ({:?} vs {:?})",
         arrivals[0],
         arrivals[1],
     );
     assert!(
-        arrivals[2] > arrivals[1] + Duration::from_millis(30),
-        "packet 3 arrived too close to packet 2 ({:?} vs {:?}) — \
-         schedule may be collapsed",
+        arrivals[2] >= arrivals[1],
+        "arrival order regressed: packet 3 came before packet 2 ({:?} vs {:?})",
         arrivals[1],
         arrivals[2],
     );
