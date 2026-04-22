@@ -15,7 +15,12 @@ use napi::bindgen_prelude::*;
 ///   non-negative BigInt"`. A raw `BigInt::get_u64()` would
 ///   bitwise-reinterpret a negative and silently yield a huge
 ///   u64.
-/// - `words.len() != 1` → doesn't fit in a single u64. Reject
+/// - `words.len() == 0` → zero. Some napi runtime versions
+///   encode `0n` as an empty word slice rather than `[0]`.
+///   Accept it and return 0. A cubic review flagged a strict
+///   "len != 1" check as breakage for any API that legitimately
+///   passes 0 (node ids, punch_id, seqs, empty-bigint timestamps).
+/// - `words.len() > 1` → doesn't fit in a single u64. Reject
 ///   with `"BigInt value exceeds u64 range"`. Any extra word —
 ///   even a zero upper word — is treated as oversize because
 ///   an idiomatic producer wouldn't emit a trailing zero.
@@ -26,10 +31,11 @@ pub(crate) fn validate_bigint_u64_parts(
     if sign_bit {
         return Err("expected non-negative BigInt");
     }
-    if words.len() != 1 {
-        return Err("BigInt value exceeds u64 range");
+    match words.len() {
+        0 => Ok(0),
+        1 => Ok(words[0]),
+        _ => Err("BigInt value exceeds u64 range"),
     }
-    Ok(words[0])
 }
 
 /// Convert a JS `BigInt` to `u64`, rejecting negatives and values
@@ -77,6 +83,38 @@ mod tests {
         assert_eq!(validate_bigint_u64_parts(false, &[0]), Ok(0));
     }
 
+    /// Regression test for a cubic-flagged P1 bug. Some napi
+    /// runtime versions encode the JS value `0n` as `sign_bit:
+    /// false, words: []` — an empty slice, not `[0]`. The
+    /// earlier strict `words.len() != 1` check rejected that as
+    /// "exceeds u64 range," which broke every API in the NAPI
+    /// surface that legitimately accepts 0 (node ids,
+    /// `punch_id`, sequence numbers, empty timestamps). The fix
+    /// treats an empty word slice as zero.
+    #[test]
+    fn accepts_empty_words_as_zero() {
+        assert_eq!(
+            validate_bigint_u64_parts(false, &[]),
+            Ok(0),
+            "empty words slice must decode as 0 — napi runtimes \
+             that encode `0n` this way would otherwise fail every \
+             API call that passes 0 as a BigInt",
+        );
+    }
+
+    /// Belt-and-braces: an empty slice combined with a negative
+    /// sign bit is degenerate (`-0n`), but the sign check fires
+    /// first and rejects before we ever reach the length check.
+    /// Pin that ordering so a future refactor doesn't accidentally
+    /// surface an empty-slice negative as zero.
+    #[test]
+    fn rejects_empty_words_when_sign_bit_set() {
+        assert!(
+            validate_bigint_u64_parts(true, &[]).is_err(),
+            "negative sign bit must reject regardless of word slice shape",
+        );
+    }
+
     #[test]
     fn accepts_u64_max() {
         assert_eq!(validate_bigint_u64_parts(false, &[u64::MAX]), Ok(u64::MAX));
@@ -115,9 +153,11 @@ mod tests {
     #[test]
     fn rejects_multi_word_even_when_upper_words_zero() {
         // An idiomatic BigInt producer wouldn't emit trailing
-        // zero words, but a misbehaving caller might. Our
-        // `words.len() != 1` check is strict — any extra word,
-        // zero or not, rejects.
+        // zero words, but a misbehaving caller might. The
+        // validator is strict on oversize: `words.len() > 1`
+        // always rejects, even when the extra words are zero.
+        // Empty-slice (zero) and single-word paths are handled
+        // separately above.
         assert!(validate_bigint_u64_parts(false, &[42, 0, 0]).is_err());
     }
 }
