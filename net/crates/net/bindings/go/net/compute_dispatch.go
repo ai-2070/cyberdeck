@@ -32,6 +32,7 @@ extern int bridgeProcess(uint64_t daemon_id, uint32_t origin_hash, uint64_t sequ
 extern int bridgeSnapshot(uint64_t daemon_id, uint8_t** out_ptr, size_t* out_len);
 extern int bridgeRestore(uint64_t daemon_id, const uint8_t* state, size_t state_len);
 extern void bridgeFree(uint64_t daemon_id);
+extern int bridgeFactory(const char* kind_ptr, size_t kind_len, uint64_t* out_daemon_id);
 */
 import "C"
 
@@ -86,11 +87,44 @@ type CausalEvent struct {
 // Daemon registry — process-wide map of live MeshDaemon instances.
 // -------------------------------------------------------------------------
 
+// DaemonFactory is a zero-arg constructor that produces a fresh
+// `MeshDaemon` per invocation. Registered via
+// `DaemonRuntime.RegisterFactoryFunc`; the runtime's
+// migration-target reconstruction path calls it whenever the SDK
+// needs a new daemon instance for an inbound migration.
+type DaemonFactory func() MeshDaemon
+
 var (
 	daemonsMu sync.RWMutex
 	daemons   = make(map[uint64]MeshDaemon)
 	nextID    atomic.Uint64
+
+	// Factory funcs keyed by kind string. Populated by
+	// `DaemonRuntime.RegisterFactoryFunc`; looked up by
+	// `goComputeFactory` on migration-target reconstruction.
+	// Process-wide because the Rust side's SDK factory closure is
+	// likewise process-wide — there's no per-runtime scoping
+	// boundary on the C-ABI.
+	factoryFuncsMu sync.RWMutex
+	factoryFuncs   = make(map[string]DaemonFactory)
 )
+
+// setFactoryFunc stores `fn` under `kind`. Called by
+// `DaemonRuntime.RegisterFactoryFunc` before it asks Rust to
+// install the SDK factory closure — by the time the first
+// migration lands, the Go-side map has the entry.
+func setFactoryFunc(kind string, fn DaemonFactory) {
+	factoryFuncsMu.Lock()
+	defer factoryFuncsMu.Unlock()
+	factoryFuncs[kind] = fn
+}
+
+// lookupFactoryFunc returns the factory for `kind` or nil.
+func lookupFactoryFunc(kind string) DaemonFactory {
+	factoryFuncsMu.RLock()
+	defer factoryFuncsMu.RUnlock()
+	return factoryFuncs[kind]
+}
 
 // registerDaemon stores `d` in the registry under a fresh uint64
 // ID and returns the ID. Called by `DaemonRuntime.Spawn`.
@@ -233,6 +267,40 @@ func goComputeFree(daemonID C.uint64_t) {
 	unregisterDaemon(uint64(daemonID))
 }
 
+//export goComputeFactory
+func goComputeFactory(kindPtr *C.char, kindLen C.size_t, outDaemonID *C.uint64_t) C.int {
+	if outDaemonID == nil {
+		return -1
+	}
+	kind := ""
+	if kindLen > 0 && kindPtr != nil {
+		// `C.GoStringN` copies — safer than GoString which stops at
+		// the first NUL.
+		kind = C.GoStringN(kindPtr, C.int(kindLen))
+	}
+	fn := lookupFactoryFunc(kind)
+	if fn == nil {
+		return -1
+	}
+	// Call the user's factory. Recover from panics so a buggy
+	// factory can't take down the whole tokio worker.
+	var inst MeshDaemon
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				inst = nil
+			}
+		}()
+		inst = fn()
+	}()
+	if inst == nil {
+		return -1
+	}
+	id := registerDaemon(inst)
+	*outDaemonID = C.uint64_t(id)
+	return C.NET_COMPUTE_OK
+}
+
 // -------------------------------------------------------------------------
 // init — register the dispatcher with Rust.
 // -------------------------------------------------------------------------
@@ -241,14 +309,15 @@ func init() {
 	// OnceLock on the Rust side makes this idempotent: a second
 	// call (e.g., from a test harness re-init) is a no-op.
 	// Pass the C-side `bridge*` wrappers — they have the exact
-	// `net_compute_*_fn` signatures (with `const uint8_t*`
-	// parameters) and thunk into the `//export`ed Go functions
-	// which cgo emits with non-const pointer parameters.
+	// `net_compute_*_fn` signatures (with `const uint8_t*` /
+	// `const char*` parameters) and thunk into the `//export`ed Go
+	// functions which cgo emits with non-const pointer parameters.
 	code := C.net_compute_set_dispatcher(
 		C.net_compute_process_fn(C.bridgeProcess),
 		C.net_compute_snapshot_fn(C.bridgeSnapshot),
 		C.net_compute_restore_fn(C.bridgeRestore),
 		C.net_compute_free_fn(C.bridgeFree),
+		C.net_compute_factory_fn(C.bridgeFactory),
 	)
 	if code != C.NET_COMPUTE_OK {
 		// Panic is appropriate here — without the dispatcher,

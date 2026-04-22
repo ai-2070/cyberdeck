@@ -648,10 +648,20 @@ int                     net_compute_runtime_is_ready(net_compute_runtime_t* hand
 /* Number of daemons registered. Returns -1 on NULL handle. */
 int64_t                 net_compute_runtime_daemon_count(net_compute_runtime_t* handle);
 
-/* Register a placeholder kind. Returns NET_COMPUTE_ERR_DUPLICATE_KIND
- * on second registration of the same kind, NET_COMPUTE_OK on first.
- * Sub-step 2 will wire the Go callback table here. */
+/* Register a placeholder kind. Enables `spawn`; migration-target
+ * reconstruction falls back to NoopBridge (migrated-in daemons on
+ * this node run as no-op). Use `net_compute_register_factory_with_func`
+ * when you need migrated-in daemons to run user code. */
 int                     net_compute_register_factory(
+    net_compute_runtime_t* handle,
+    const char* kind_ptr,
+    size_t kind_len);
+
+/* Register a kind with a Go-side factory func (the caller already
+ * stored the func in the Go-side factoryFuncs map; we install an
+ * SDK factory closure that reaches back via the dispatcher's
+ * factory trampoline on every migration-target reconstruction). */
+int                     net_compute_register_factory_with_func(
     net_compute_runtime_t* handle,
     const char* kind_ptr,
     size_t kind_len);
@@ -691,14 +701,20 @@ typedef int (*net_compute_restore_fn)(
 
 typedef void (*net_compute_free_fn)(uint64_t daemon_id);
 
+typedef int (*net_compute_factory_fn)(
+    const char* kind_ptr,
+    size_t kind_len,
+    uint64_t* out_daemon_id);
+
 /* Install the Go dispatcher. Call once from Go's init; second call
- * is ignored (first registration wins). All four pointers must be
+ * is ignored (first registration wins). All five pointers must be
  * non-NULL. */
 int                     net_compute_set_dispatcher(
     net_compute_process_fn process,
     net_compute_snapshot_fn snapshot,
     net_compute_restore_fn restore,
-    net_compute_free_fn free);
+    net_compute_free_fn free,
+    net_compute_factory_fn factory);
 
 /* Push one output payload into the outputs vec. Called by Go's
  * process trampoline. Copies `len` bytes. */

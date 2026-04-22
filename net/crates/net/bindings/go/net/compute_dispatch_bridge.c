@@ -37,3 +37,7 @@ int bridgeRestore(uint64_t daemon_id, const uint8_t* state, size_t state_len) {
 void bridgeFree(uint64_t daemon_id) {
     goComputeFree(daemon_id);
 }
+
+int bridgeFactory(const char* kind_ptr, size_t kind_len, uint64_t* out_daemon_id) {
+    return goComputeFactory((char*)kind_ptr, kind_len, out_daemon_id);
+}

@@ -394,6 +394,79 @@ pub extern "C" fn net_compute_register_factory(
     NET_COMPUTE_OK
 }
 
+/// Register a factory kind with a real Go-side factory function
+/// so migration-target reconstruction builds a fresh user daemon
+/// instead of falling back to `NoopBridge`. The Go caller supplied
+/// the factory via [`RegisterFactoryFunc`](../../../net/net/migration.go);
+/// we look it up via the dispatcher's `factory` trampoline on
+/// every reconstruction.
+///
+/// Use this instead of [`net_compute_register_factory`] when you
+/// want migrated-in daemons on this target to actually run user
+/// code. Same duplicate-kind semantics as the plain variant.
+#[no_mangle]
+pub extern "C" fn net_compute_register_factory_with_func(
+    handle: *mut DaemonRuntimeHandle,
+    kind_ptr: *const c_char,
+    kind_len: usize,
+) -> c_int {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NET_COMPUTE_ERR_NULL;
+    };
+    if kind_ptr.is_null() {
+        return NET_COMPUTE_ERR_NULL;
+    }
+    let kind = match cstr_to_string(kind_ptr, kind_len) {
+        Some(s) => s,
+        None => return NET_COMPUTE_ERR_NULL,
+    };
+    use dashmap::mapref::entry::Entry;
+    match h.factories.entry(kind.clone()) {
+        Entry::Occupied(_) => return NET_COMPUTE_ERR_DUPLICATE_KIND,
+        Entry::Vacant(slot) => {
+            slot.insert(());
+        }
+    }
+
+    // SDK closure reaches back into Go via the factory trampoline
+    // to build a fresh daemon per invocation. Dispatcher MUST be
+    // set before the first migration lands — we panic lazily if
+    // it's missing rather than failing silently.
+    let kind_for_closure = kind.clone();
+    let closure = move || -> Box<dyn MeshDaemon> {
+        let Some(d) = DISPATCHER.get() else {
+            eprintln!(
+                "net-compute-ffi: factory closure fired with no dispatcher; returning NoopBridge"
+            );
+            return Box::new(NoopBridge::new(kind_for_closure.clone()));
+        };
+        let mut daemon_id: u64 = 0;
+        let code = unsafe {
+            (d.factory)(
+                kind_for_closure.as_ptr() as *const c_char,
+                kind_for_closure.len(),
+                &mut daemon_id,
+            )
+        };
+        if code != NET_COMPUTE_OK {
+            eprintln!(
+                "net-compute-ffi: Go factory for '{kind_for_closure}' returned {code}; falling back to NoopBridge"
+            );
+            return Box::new(NoopBridge::new(kind_for_closure.clone()));
+        }
+        Box::new(GoBridge {
+            name: kind_for_closure.clone(),
+            daemon_id,
+        })
+    };
+
+    if let Err(_) = h.inner.register_factory(&kind, closure) {
+        h.factories.remove(&kind);
+        return NET_COMPUTE_ERR_DUPLICATE_KIND;
+    }
+    NET_COMPUTE_OK
+}
+
 // =========================================================================
 // Callback dispatcher — Go side registers these once
 // =========================================================================
@@ -428,13 +501,32 @@ pub type RestoreFn =
 /// bridge (e.g., daemon stopped, migration source cutover).
 pub type FreeFn = unsafe extern "C" fn(daemon_id: u64);
 
-/// The four trampolines registered once from Go's `init()`. Stored
+/// C-ABI type: migration-target factory trampoline. Rust invokes
+/// it on every migration-target reconstruction via the factory
+/// closure mirrored into the SDK by
+/// [`net_compute_register_factory_with_func`]; the Go side looks
+/// up the registered factory by `kind`, invokes it to build a
+/// fresh `MeshDaemon`, inserts it into the daemon registry, and
+/// writes the new `daemon_id` into `*out_daemon_id`.
+///
+/// Returns `NET_COMPUTE_OK` on success; non-zero means the Go
+/// side couldn't build a daemon (no factory registered, factory
+/// panicked, etc.). The Rust bridge falls back to `NoopBridge` on
+/// failure.
+pub type FactoryFn = unsafe extern "C" fn(
+    kind_ptr: *const c_char,
+    kind_len: usize,
+    out_daemon_id: *mut u64,
+) -> c_int;
+
+/// The five trampolines registered once from Go's `init()`. Stored
 /// in a `OnceLock` so invocation is lock-free.
 struct DispatcherFns {
     process: ProcessFn,
     snapshot: SnapshotFn,
     restore: RestoreFn,
     free: FreeFn,
+    factory: FactoryFn,
 }
 
 static DISPATCHER: OnceLock<DispatcherFns> = OnceLock::new();
@@ -446,16 +538,17 @@ static DISPATCHER: OnceLock<DispatcherFns> = OnceLock::new();
 ///
 /// # Safety
 ///
-/// The four function pointers MUST have C linkage, must be valid
+/// The five function pointers MUST have C linkage, must be valid
 /// for the remaining lifetime of the process, and must follow the
 /// contracts of [`ProcessFn`] / [`SnapshotFn`] / [`RestoreFn`] /
-/// [`FreeFn`]. Passing NULL is a hard error.
+/// [`FreeFn`] / [`FactoryFn`]. Passing NULL is a hard error.
 #[no_mangle]
 pub extern "C" fn net_compute_set_dispatcher(
     process: Option<ProcessFn>,
     snapshot: Option<SnapshotFn>,
     restore: Option<RestoreFn>,
     free: Option<FreeFn>,
+    factory: Option<FactoryFn>,
 ) -> c_int {
     let Some(process) = process else {
         return NET_COMPUTE_ERR_NULL;
@@ -469,11 +562,15 @@ pub extern "C" fn net_compute_set_dispatcher(
     let Some(free) = free else {
         return NET_COMPUTE_ERR_NULL;
     };
+    let Some(factory) = factory else {
+        return NET_COMPUTE_ERR_NULL;
+    };
     let _ = DISPATCHER.set(DispatcherFns {
         process,
         snapshot,
         restore,
         free,
+        factory,
     });
     NET_COMPUTE_OK
 }
@@ -1126,7 +1223,7 @@ pub extern "C" fn net_compute_start_migration(
     origin_hash: u32,
     source_node: u64,
     target_node: u64,
-    transport_identity: u8, // 0 = false, non-zero = true
+    transport_identity: u8,  // 0 = false, non-zero = true
     retry_not_ready_ms: u64, // 0 = disabled
     out_handle: *mut *mut MigrationHandleC,
     err_out: *mut *mut c_char,

@@ -177,11 +177,72 @@ func setupMigrationPair(t *testing.T, kind string) (*DaemonRuntime, *DaemonRunti
 	return rtA, rtB, a, b, cleanup
 }
 
+// setupMigrationPairWithFactory mirrors setupMigrationPair but
+// uses `RegisterFactoryFunc` on both sides so inbound migrations
+// reconstruct a real user daemon instead of falling back to
+// NoopBridge.
+func setupMigrationPairWithFactory(t *testing.T, kind string, factory DaemonFactory) (*DaemonRuntime, *DaemonRuntime, *MeshNode, *MeshNode, func()) {
+	t.Helper()
+	a, b, meshCleanup := meshHandshakePair(t)
+
+	rtA, err := NewDaemonRuntime(a)
+	if err != nil {
+		meshCleanup()
+		t.Fatalf("NewDaemonRuntime A: %v", err)
+	}
+	if err := rtA.RegisterFactoryFunc(kind, factory); err != nil {
+		rtA.Close()
+		meshCleanup()
+		t.Fatalf("RegisterFactoryFunc A: %v", err)
+	}
+	if err := rtA.Start(); err != nil {
+		rtA.Close()
+		meshCleanup()
+		t.Fatalf("Start A: %v", err)
+	}
+
+	rtB, err := NewDaemonRuntime(b)
+	if err != nil {
+		rtA.Close()
+		meshCleanup()
+		t.Fatalf("NewDaemonRuntime B: %v", err)
+	}
+	if err := rtB.RegisterFactoryFunc(kind, factory); err != nil {
+		rtA.Close()
+		rtB.Close()
+		meshCleanup()
+		t.Fatalf("RegisterFactoryFunc B: %v", err)
+	}
+	if err := rtB.Start(); err != nil {
+		rtA.Close()
+		rtB.Close()
+		meshCleanup()
+		t.Fatalf("Start B: %v", err)
+	}
+
+	cleanup := func() {
+		rtA.Close()
+		rtB.Close()
+		meshCleanup()
+	}
+	return rtA, rtB, a, b, cleanup
+}
+
 func TestMigration_EndToEndCounterSurvivesAToB(t *testing.T) {
 	// Stage 6 exit criterion: spawn a stateful Go daemon on A,
 	// drive the counter via deliveries, migrate to B with envelope
-	// transport, verify counter state survived + continues on B.
-	rtA, rtB, a, b, cleanup := setupMigrationPair(t, "counter")
+	// transport, verify counter state survived + the daemon
+	// continues running user code on B.
+	//
+	// Uses `RegisterFactoryFunc` so the SDK's target-side factory
+	// closure (see `net_compute_register_factory_with_func` in
+	// compute-ffi) rebuilds a fresh counterDaemon on B via the
+	// Go callback table, then Restore seeds its count from the
+	// snapshot. This is what makes counter-continuation on B
+	// actually work — sub-step 4's NoopBridge path returned empty.
+	rtA, rtB, a, b, cleanup := setupMigrationPairWithFactory(t, "counter",
+		func() MeshDaemon { return &counterDaemon{} },
+	)
 	defer cleanup()
 
 	id, _ := GenerateIdentity()
@@ -226,25 +287,19 @@ func TestMigration_EndToEndCounterSurvivesAToB(t *testing.T) {
 		t.Errorf("rtB.DaemonCount = %d after migration, want 1", rtB.DaemonCount())
 	}
 
-	// Stage 6 sub-step 4 caveat: target-side factory
-	// reconstruction currently falls back to `NoopBridge` (see
-	// `net_compute_register_factory` in compute-ffi). The Go
-	// daemon's state IS snapshotted + transferred; the target just
-	// doesn't re-invoke the user's Process on inbound events yet.
-	//
-	// Counter-on-B continuation (like the Node / Python end-to-end
-	// tests prove) requires a C-ABI factory-callback trampoline
-	// parallel to the `process/snapshot/restore` dispatcher — that
-	// lands in sub-step 5. For now, we assert the migration
-	// completed and B picked up the daemon entry; delivering on B
-	// returns an empty output from NoopBridge, which is the
-	// documented-stable behavior.
+	// Drive one more event on B. Target-side factory
+	// reconstruction should have seeded the counter from the
+	// snapshot (3) via the factory trampoline + Restore — this
+	// step brings it to 4.
 	out, err := rtB.Deliver(h.OriginHash(), CausalEvent{OriginHash: id.OriginHash(), Sequence: 4})
 	if err != nil {
 		t.Fatalf("Deliver on B: %v", err)
 	}
-	if len(out) != 0 {
-		t.Errorf("len(out) = %d, want 0 (NoopBridge on target until sub-step 5)", len(out))
+	if len(out) != 1 {
+		t.Fatalf("len(out) = %d, want 1", len(out))
+	}
+	if got := readU32LE(out[0]); got != 4 {
+		t.Errorf("counter on B after migration = %d, want 4", got)
 	}
 
 	// Original handle on A was already stopped by the migration

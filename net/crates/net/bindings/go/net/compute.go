@@ -170,11 +170,57 @@ func (rt *DaemonRuntime) DaemonCount() int64 {
 	return n
 }
 
-// RegisterFactory registers a placeholder entry under kind.
-// Sub-step 1 only tracks the kind string; sub-step 2 will wire
-// the Go callback table so Rust can construct daemons on demand.
+// RegisterFactoryFunc registers a kind with a real Go factory
+// function. Enables both local spawn AND migration-target
+// reconstruction — an inbound migration for this kind will
+// invoke `factory()` on the target to build a fresh daemon, then
+// Restore is called with the snapshot state. This is what lets a
+// stateful daemon migrate to a Go node and continue running.
+//
+// Use this instead of [`RegisterFactory`] unless you have a
+// reason to opt out of migration support for a kind (e.g., spawn-
+// only local daemons).
+//
+// Duplicate kind registration returns `*DuplicateKindError`.
+func (rt *DaemonRuntime) RegisterFactoryFunc(kind string, factory DaemonFactory) error {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if rt.handle == nil {
+		return ErrRuntimeShutDown
+	}
+	if factory == nil {
+		return &DaemonError{Message: "factory is nil"}
+	}
+	// Populate the Go-side map BEFORE calling Rust so the first
+	// migration that lands can resolve the factory immediately.
+	setFactoryFunc(kind, factory)
+
+	kindBytes := []byte(kind)
+	var ptr *C.char
+	if len(kindBytes) > 0 {
+		ptr = (*C.char)(unsafe.Pointer(&kindBytes[0]))
+	}
+	code := C.net_compute_register_factory_with_func(rt.handle, ptr, C.size_t(len(kindBytes)))
+	runtime.KeepAlive(kindBytes)
+	switch code {
+	case C.NET_COMPUTE_OK:
+		return nil
+	case C.NET_COMPUTE_ERR_DUPLICATE_KIND:
+		return &DuplicateKindError{Kind: kind}
+	case C.NET_COMPUTE_ERR_NULL:
+		return &DaemonError{Message: "register_factory_with_func: null argument"}
+	default:
+		return &DaemonError{Message: fmt.Sprintf("register_factory_with_func: unexpected code %d", code)}
+	}
+}
+
+// RegisterFactory registers a kind without a Go factory func.
+// Enables `Spawn`; inbound migrations to this node for this kind
+// run as a no-op (`NoopBridge`). Use `RegisterFactoryFunc` when
+// you want migrated-in daemons to run user code.
+//
 // Second registration of the same kind returns a
-// *DuplicateKindError.
+// `*DuplicateKindError`.
 func (rt *DaemonRuntime) RegisterFactory(kind string) error {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
