@@ -11,7 +11,7 @@ The core `net` crate is the engine. This SDK is what Rust developers import.
 net-sdk = { path = "sdk" }
 ```
 
-Features: `redis`, `jetstream`, `net` (mesh transport), `nat-traversal` (classifier + `connect_direct`), `port-mapping` (NAT-PMP + UPnP), `cortex` (event-sourced tasks/memories + NetDb), `compute` (daemons + migration), `groups` (replica / fork / standby), `local` (convenience bundle), `full` (all).
+Features: `redis`, `jetstream`, `net` (mesh transport), `nat-traversal` (classifier + `connect_direct`, opt-in), `port-mapping` (NAT-PMP + UPnP, opt-in), `cortex` (event-sourced tasks/memories + NetDb), `compute` (daemons + migration), `groups` (replica / fork / standby), `local` (bundles `net` + `cortex` + `compute` + `groups`), `full` (bundles `local` + `redis` + `jetstream`). NAT features stay opt-in — they are *not* pulled in by `full`.
 
 ## Quick Start
 
