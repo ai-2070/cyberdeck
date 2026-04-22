@@ -424,12 +424,14 @@ export class ForkGroup {
  * active failure, {@link promote} (or automatic failover via
  * {@link onNodeFailure}) picks the most-synced standby.
  *
- * **Caller-driven buffering:** after every
- * `runtime.deliver(group.activeOrigin, event)` the caller must
- * also call `group.onEventDelivered(event)` so the standby
- * replay buffer is accurate on promotion. See
- * `SDK_GROUPS_SURFACE_PLAN.md` → "Open questions" for the
- * manual-vs-hook rationale.
+ * **Automatic replay buffering.** The group installs a
+ * post-delivery observer on its active member's origin at spawn
+ * and re-points it on promote / failover. Every
+ * `runtime.deliver(group.activeOrigin, event)` automatically
+ * feeds the standby replay buffer — no paired
+ * `onEventDelivered` call required from the caller. The method
+ * remains on the class for test scenarios that simulate a gap
+ * without a live runtime; production code should ignore it.
  */
 export class StandbyGroup {
   private readonly inner: NapiStandbyGroup;
@@ -473,13 +475,16 @@ export class StandbyGroup {
   }
 
   /**
-   * Buffer an event for replay on promotion. Call after every
-   * `runtime.deliver(group.activeOrigin, event)` so standbys
-   * have the event in their replay queue if they're promoted
-   * before the next {@link sync}. Without this the replay
-   * buffer is empty and a promoted standby silently loses any
-   * event that arrived after the last sync — the exact gap the
-   * class docstring warns about.
+   * **Test-only.** Manually push an event into the replay
+   * buffer. Production code does NOT need to call this — the
+   * post-delivery observer installed at `spawn` / `promote`
+   * automatically feeds the buffer on every
+   * `runtime.deliver(group.activeOrigin, event)`. Exposed so
+   * tests can simulate a gap between the last sync and a
+   * failure without driving a live runtime. Not part of the
+   * stable public API.
+   *
+   * @internal
    */
   onEventDelivered(event: CausalEvent): void {
     try {

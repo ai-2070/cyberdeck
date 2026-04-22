@@ -578,10 +578,11 @@ pub struct StandbyGroup {
 
 #[napi]
 impl StandbyGroup {
-    /// `origin_hash` of the current active. Feed to
-    /// `runtime.deliver(...)` for every event, then call
-    /// `onEventDelivered` with the same event so standbys have
-    /// it in their replay buffer on promotion.
+    /// `origin_hash` of the current active. Deliver events by
+    /// calling `runtime.deliver(group.activeOrigin, event)`; the
+    /// group installs an internal post-delivery observer at spawn
+    /// so every delivery is automatically captured in the replay
+    /// buffer — no caller-side pairing required.
     #[napi(getter)]
     pub fn active_origin(&self) -> u32 {
         self.inner.active_origin()
@@ -593,12 +594,14 @@ impl StandbyGroup {
         Ok(BigInt::from(seq))
     }
 
-    /// Buffer an event for replay on promotion. Call after every
-    /// `runtime.deliver(group.activeOrigin, event)` so standbys
-    /// have the event in their replay queue if they're promoted
-    /// before the next `syncStandbys()`. Without this the replay
-    /// buffer is empty and a promoted standby silently loses any
-    /// event that arrived after the last sync.
+    /// **Test-only.** Manually push an event into the replay
+    /// buffer. Production code does NOT need to call this — a
+    /// post-delivery observer installed at `spawn` / `promote`
+    /// automatically feeds the buffer on every
+    /// `runtime.deliver(group.activeOrigin, event)`. Exposed only
+    /// so JS tests can simulate a gap between the last sync and
+    /// a failure without driving a live runtime. Not part of the
+    /// stable public API.
     #[napi]
     pub fn on_event_delivered(&self, event: crate::compute::CausalEventJs) -> Result<()> {
         use ::net::adapter::net::state::causal::{CausalEvent, CausalLink};

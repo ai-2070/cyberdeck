@@ -934,20 +934,23 @@ export declare class ReplicaGroup {
 
 export declare class StandbyGroup {
   /**
-   * `origin_hash` of the current active. Feed to
-   * `runtime.deliver(...)` for every event, then call
-   * `onEventDelivered` with the same event so standbys have
-   * it in their replay buffer on promotion.
+   * `origin_hash` of the current active. Deliver events by
+   * calling `runtime.deliver(group.activeOrigin, event)`; the
+   * group installs an internal post-delivery observer at spawn
+   * so every delivery is automatically captured in the replay
+   * buffer — no caller-side pairing required.
    */
   get activeOrigin(): number
   syncStandbys(): Promise<bigint>
   /**
-   * Buffer an event for replay on promotion. Call after every
-   * `runtime.deliver(group.activeOrigin, event)` so standbys
-   * have the event in their replay queue if they're promoted
-   * before the next `syncStandbys()`. Without this the replay
-   * buffer is empty and a promoted standby silently loses any
-   * event that arrived after the last sync.
+   * **Test-only.** Manually push an event into the replay
+   * buffer. Production code does NOT need to call this — a
+   * post-delivery observer installed at `spawn` / `promote`
+   * automatically feeds the buffer on every
+   * `runtime.deliver(group.activeOrigin, event)`. Exposed only
+   * so JS tests can simulate a gap between the last sync and
+   * a failure without driving a live runtime. Not part of the
+   * stable public API.
    */
   onEventDelivered(event: CausalEventJs): void
   promote(): Promise<number>

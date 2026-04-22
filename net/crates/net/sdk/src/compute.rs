@@ -219,6 +219,66 @@ struct Inner {
     /// the migration handler and the Registering→Ready CAS.
     /// Measured in milliseconds; `0` = no stall.
     start_stall_ms: std::sync::atomic::AtomicU32,
+    /// Per-origin post-delivery observers. Fired on every successful
+    /// `deliver(origin_hash, event)`, inside the registry call and
+    /// after the daemon's `process` returns Ok.
+    ///
+    /// **Why this exists.** `StandbyGroup` needs every event routed
+    /// to its active member captured in a replay buffer so a
+    /// promoted standby can reapply the window between the last
+    /// `sync_standbys` and the failure. A manual `on_event_delivered`
+    /// hook relied on the caller pairing every `deliver` with the
+    /// buffering call, which silently lost events on omission.
+    /// Observers close that gap: a group installs a weak-ref
+    /// closure that pushes the event into its buffer automatically,
+    /// with no contract on the caller.
+    ///
+    /// `pub(crate)` so `sdk/src/groups/*` can register; not a
+    /// stable public API. The observer list is a `Vec` so unrelated
+    /// subsystems (future audit / metrics hooks) could coexist on
+    /// the same origin without one overwriting another.
+    observers: Mutex<HashMap<u32, Vec<(u64, DeliverObserver)>>>,
+    /// Monotonic id minted by `register_deliver_observer`, used by
+    /// the returned `ObserverHandle` to identify its entry on
+    /// `Drop`/`unregister`.
+    observer_id_counter: std::sync::atomic::AtomicU64,
+}
+
+/// A post-delivery observer closure registered against an
+/// `origin_hash`. Fires on every successful `DaemonRuntime::deliver`
+/// for that origin.
+///
+/// Observers MUST be cheap — they run on the delivery thread, after
+/// the daemon's `process` but before `deliver` returns. A slow or
+/// panicking observer stalls delivery. The in-tree use (standby
+/// replay buffer) is a single `VecDeque::push_back` under a
+/// short-lived lock; new observers should aim for similar.
+pub(crate) type DeliverObserver = Arc<dyn Fn(&CausalEvent) + Send + Sync>;
+
+/// Handle returned by
+/// [`DaemonRuntime::register_deliver_observer`]. Dropping the
+/// handle removes the observer from the runtime's per-origin
+/// observer list. Safe to drop after the runtime itself has been
+/// dropped: the `Weak` upgrade in `Drop` silently no-ops.
+pub(crate) struct ObserverHandle {
+    runtime: std::sync::Weak<Inner>,
+    origin: u32,
+    id: u64,
+}
+
+impl Drop for ObserverHandle {
+    fn drop(&mut self) {
+        if let Some(inner) = self.runtime.upgrade() {
+            if let Ok(mut map) = inner.observers.lock() {
+                if let Some(v) = map.get_mut(&self.origin) {
+                    v.retain(|(id, _)| *id != self.id);
+                    if v.is_empty() {
+                        map.remove(&self.origin);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl DaemonRuntime {
@@ -264,7 +324,40 @@ impl DaemonRuntime {
                 simulate_not_ready: AtomicBool::new(false),
                 spawn_stall_ms: std::sync::atomic::AtomicU32::new(0),
                 start_stall_ms: std::sync::atomic::AtomicU32::new(0),
+                observers: Mutex::new(HashMap::new()),
+                observer_id_counter: std::sync::atomic::AtomicU64::new(1),
             }),
+        }
+    }
+
+    /// Register a post-delivery observer for `origin_hash`. Every
+    /// successful `deliver(origin_hash, event)` fires the closure
+    /// after the daemon's `process` returns Ok. Returns an
+    /// [`ObserverHandle`] whose `Drop` unregisters the observer.
+    ///
+    /// `pub(crate)` — only the SDK's own group wrappers use this.
+    /// See the `observers` field on [`Inner`] for the design rationale.
+    pub(crate) fn register_deliver_observer(
+        &self,
+        origin: u32,
+        cb: DeliverObserver,
+    ) -> ObserverHandle {
+        let id = self
+            .inner
+            .observer_id_counter
+            .fetch_add(1, Ordering::Relaxed);
+        {
+            let mut map = self
+                .inner
+                .observers
+                .lock()
+                .expect("DaemonRuntime observers mutex poisoned");
+            map.entry(origin).or_default().push((id, cb));
+        }
+        ObserverHandle {
+            runtime: Arc::downgrade(&self.inner),
+            origin,
+            id,
         }
     }
 
@@ -930,10 +1023,34 @@ impl DaemonRuntime {
         event: &CausalEvent,
     ) -> Result<Vec<CausalEvent>, DaemonError> {
         self.require_ready()?;
-        self.inner
+        let outputs = self
+            .inner
             .registry
             .deliver(origin_hash, event)
-            .map_err(DaemonError::Core)
+            .map_err(DaemonError::Core)?;
+
+        // Fire post-delivery observers (e.g. `StandbyGroup`'s replay
+        // buffer). Observers run AFTER a successful `process` so
+        // replay on promotion doesn't re-apply events the active
+        // rejected. Snapshot the observer list into a local `Vec`
+        // so each callback runs without the map's mutex held —
+        // prevents a misbehaving observer from blocking unrelated
+        // deliveries and rules out re-entrant-lock deadlocks if an
+        // observer ever calls back into `deliver`.
+        let to_fire: Vec<DeliverObserver> = {
+            let map = self
+                .inner
+                .observers
+                .lock()
+                .expect("DaemonRuntime observers mutex poisoned");
+            map.get(&origin_hash)
+                .map(|v| v.iter().map(|(_, cb)| cb.clone()).collect())
+                .unwrap_or_default()
+        };
+        for cb in to_fire {
+            cb(event);
+        }
+        Ok(outputs)
     }
 
     /// Number of daemons currently registered.

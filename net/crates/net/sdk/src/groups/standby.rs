@@ -35,7 +35,7 @@ use ::net::adapter::net::compute::{
 };
 use ::net::adapter::net::state::causal::CausalEvent;
 
-use crate::compute::DaemonRuntime;
+use crate::compute::{DaemonRuntime, ObserverHandle};
 use crate::groups::common::{GroupHealth, MemberInfo, MemberRole};
 use crate::groups::error::GroupError;
 
@@ -63,6 +63,17 @@ impl From<StandbyGroupConfig> for CoreStandbyGroupConfig {
 
 /// A standby group. See module docs for the usage pattern.
 pub struct StandbyGroup {
+    /// Observer registered against the current active's origin
+    /// hash. Populated on `spawn`; replaced on `promote` /
+    /// `on_node_failure` when the active changes; cleared on drop.
+    ///
+    /// Declared first so it drops first on `StandbyGroup::drop`,
+    /// unregistering from the runtime's observer map BEFORE `inner`
+    /// drops. This eliminates any chance of a concurrent
+    /// `deliver` seeing the observer and attempting to upgrade a
+    /// `Weak` to an already-dead `Arc` (it'd no-op anyway, but
+    /// cleaner).
+    observer_handle: Mutex<Option<ObserverHandle>>,
     inner: Arc<Mutex<CoreStandbyGroup>>,
     runtime: DaemonRuntime,
     /// Kind the group was spawned under. Pinned at spawn so
@@ -71,6 +82,21 @@ pub struct StandbyGroup {
     /// a different implementation than the original active +
     /// standbys were built from.
     kind: String,
+}
+
+/// Build a post-delivery observer closure that pushes the delivered
+/// event into the standby group's replay buffer. Captures a `Weak`
+/// to the core group so the observer outliving the group is a
+/// no-op rather than a leak.
+fn make_buffer_observer(inner: &Arc<Mutex<CoreStandbyGroup>>) -> crate::compute::DeliverObserver {
+    let weak = Arc::downgrade(inner);
+    Arc::new(move |event: &CausalEvent| {
+        if let Some(core) = weak.upgrade() {
+            if let Ok(mut guard) = core.lock() {
+                guard.on_event_delivered(event.clone());
+            }
+        }
+    })
 }
 
 impl StandbyGroup {
@@ -92,11 +118,39 @@ impl StandbyGroup {
         let registry = runtime.registry_arc();
         let core =
             CoreStandbyGroup::spawn(config.into(), move || (factory)(), &scheduler, &registry)?;
+        let inner = Arc::new(Mutex::new(core));
+
+        // Install the replay-buffer observer on the active's origin
+        // so every `DaemonRuntime::deliver` to the active
+        // automatically feeds the buffer — no caller-side pairing
+        // required.
+        let active_origin = inner
+            .lock()
+            .expect("StandbyGroup mutex poisoned")
+            .active_origin();
+        let observer = make_buffer_observer(&inner);
+        let handle = runtime.register_deliver_observer(active_origin, observer);
+
         Ok(Self {
-            inner: Arc::new(Mutex::new(core)),
+            observer_handle: Mutex::new(Some(handle)),
+            inner,
             runtime: runtime.clone(),
             kind: kind.to_string(),
         })
+    }
+
+    /// Replace the observer so it now fires for `new_origin`. Used
+    /// on promote / on_node_failure when the active member changes.
+    fn rebind_observer(&self, new_origin: u32) {
+        let observer = make_buffer_observer(&self.inner);
+        let new_handle = self.runtime.register_deliver_observer(new_origin, observer);
+        // Swap in the new handle; the old one's `Drop` unregisters
+        // its entry from the runtime's observer map.
+        let mut slot = self
+            .observer_handle
+            .lock()
+            .expect("StandbyGroup observer-handle mutex poisoned");
+        *slot = Some(new_handle);
     }
 
     /// The kind this group was spawned with.
@@ -113,10 +167,15 @@ impl StandbyGroup {
             .active_origin()
     }
 
-    /// Buffer an event for standby replay. Call after every
-    /// `DaemonRuntime::deliver` to the active — on promotion the
-    /// new active replays events that arrived between the last
-    /// successful `sync_standbys` and the failure.
+    /// **Test-only.** Manually push an event into the replay
+    /// buffer. Production code does NOT need to call this — a
+    /// post-delivery observer installed at `spawn` / `promote`
+    /// automatically feeds the buffer on every
+    /// `DaemonRuntime::deliver(active_origin, event)`. The method
+    /// stays public (and `#[doc(hidden)]`) so tests can simulate
+    /// a gap between the last sync and a failure without a live
+    /// runtime, but it's not part of the stable public API.
+    #[doc(hidden)]
     pub fn on_event_delivered(&self, event: CausalEvent) {
         self.inner
             .lock()
@@ -145,8 +204,15 @@ impl StandbyGroup {
             .map_err(|_| GroupError::FactoryNotFound(self.kind.clone()))?;
         let scheduler = self.runtime.scheduler_arc();
         let registry = self.runtime.registry_arc();
-        let mut guard = self.inner.lock().expect("StandbyGroup mutex poisoned");
-        Ok(guard.promote(move || (factory)(), &registry, &scheduler)?)
+        let new_origin = {
+            let mut guard = self.inner.lock().expect("StandbyGroup mutex poisoned");
+            guard.promote(move || (factory)(), &registry, &scheduler)?
+        };
+        // Re-point the post-delivery observer at the new active so
+        // future `DaemonRuntime::deliver(new_origin, ...)` calls
+        // populate the replay buffer without caller cooperation.
+        self.rebind_observer(new_origin);
+        Ok(new_origin)
     }
 
     /// Handle node failure. If the active was on `failed_node_id`,
@@ -160,8 +226,17 @@ impl StandbyGroup {
             .map_err(|_| GroupError::FactoryNotFound(self.kind.clone()))?;
         let scheduler = self.runtime.scheduler_arc();
         let registry = self.runtime.registry_arc();
-        let mut guard = self.inner.lock().expect("StandbyGroup mutex poisoned");
-        Ok(guard.on_node_failure(failed_node_id, move || (factory)(), &scheduler, &registry)?)
+        let result = {
+            let mut guard = self.inner.lock().expect("StandbyGroup mutex poisoned");
+            guard.on_node_failure(failed_node_id, move || (factory)(), &scheduler, &registry)?
+        };
+        // If the active was the one that failed, the core returns
+        // the promoted member's new origin — rebind the observer so
+        // replay buffering follows the new active.
+        if let Some(new_origin) = result {
+            self.rebind_observer(new_origin);
+        }
+        Ok(result)
     }
 
     pub fn on_node_recovery(&self, recovered_node_id: u64) {

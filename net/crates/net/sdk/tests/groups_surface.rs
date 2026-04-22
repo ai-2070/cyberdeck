@@ -291,3 +291,55 @@ async fn standby_group_unknown_kind_errors() {
         other => panic!("expected FactoryNotFound, got {other:?}"),
     }
 }
+
+// Regression: the replay buffer must grow automatically on
+// `DaemonRuntime::deliver(active_origin, event)` — no caller-side
+// `on_event_delivered` pairing required. Before the fix,
+// `StandbyGroup` relied on the caller to make both calls; a
+// forgotten buffering call silently dropped events on failover.
+// The fix installs a post-delivery observer at spawn so every
+// successful delivery to the active's origin automatically feeds
+// the buffer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standby_group_buffers_events_without_manual_hook() {
+    use ::net::adapter::net::state::causal::{CausalEvent, CausalLink};
+    use bytes::Bytes;
+
+    let rt = runtime_with_peers(3).await;
+    let group = StandbyGroup::spawn(
+        &rt,
+        "noop",
+        StandbyGroupConfig {
+            member_count: 3,
+            group_seed: [0xAAu8; 32],
+            host_config: DaemonHostConfig::default(),
+        },
+    )
+    .expect("spawn standby");
+
+    let active = group.active_origin();
+    assert_eq!(group.buffered_event_count(), 0, "buffer starts empty");
+
+    // Deliver three events through the plain `rt.deliver` path —
+    // NO `group.on_event_delivered` call. The auto-wired observer
+    // must catch every one.
+    for i in 1..=3u64 {
+        let event = CausalEvent {
+            link: CausalLink {
+                origin_hash: active,
+                horizon_encoded: 0,
+                sequence: i,
+                parent_hash: 0,
+            },
+            payload: Bytes::from(format!("tick-{i}")),
+            received_at: 0,
+        };
+        rt.deliver(active, &event).expect("deliver");
+    }
+
+    assert_eq!(
+        group.buffered_event_count(),
+        3,
+        "expected 3 buffered events from automatic observer",
+    );
+}
