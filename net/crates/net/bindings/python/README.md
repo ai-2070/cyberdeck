@@ -103,6 +103,47 @@ initiator.ingest_raw('{"event": "data"}')
 - `"drop_oldest"` - Evict oldest events to make room
 - `"fail_producer"` - Raise an error
 
+### NAT traversal (optimization, not correctness)
+
+Two NATed peers already reach each other through the mesh's routed-handshake path. NAT traversal opens a shorter direct path when the NAT shape allows it; it's never required for connectivity. Every method below is safe to call regardless of NAT type — a failed punch or a `TraversalError` is not a connectivity failure, traffic keeps riding the relay. The whole surface is a no-op when the native module was built without `--features nat-traversal`: every call raises `TraversalError` with `kind="unsupported"`.
+
+```python
+from net import TraversalError
+
+# Access via the PyO3 NetMesh handle on the node.
+mesh = node.mesh  # or however your app exposes it
+
+mesh.reclassify_nat()
+
+klass  = mesh.nat_type()            # "open" | "cone" | "symmetric" | "unknown"
+reflex = mesh.reflex_addr()         # "203.0.113.5:9001" or None
+
+observed = mesh.probe_reflex(peer_node_id)   # "ip:port"
+
+# Attempt a direct connection via the pair-type matrix.
+# `coordinator` mediates the punch when the matrix picks one.
+# Always returns — inspect stats to learn which path won.
+mesh.connect_direct(peer_node_id, peer_pubkey_hex, coordinator_node_id)
+
+# Cumulative counters — all int, monotonic.
+s = mesh.traversal_stats()
+s.punches_attempted   # coordinator mediated a PunchRequest + Introduce
+s.punches_succeeded   # ack arrived AND direct handshake landed
+s.relay_fallbacks     # landed on the routed path after skip/fail
+```
+
+Operators with a known-public address skip the classifier sweep entirely. The override pins `"open"` + the supplied address on every capability announcement; call `announce_capabilities()` after to propagate (the setter resets the rate-limit floor so the next announce is guaranteed to broadcast).
+
+```python
+mesh.set_reflex_override('203.0.113.5:9001')
+mesh.announce_capabilities(caps)
+# later:
+mesh.clear_reflex_override()
+mesh.announce_capabilities(caps)
+```
+
+`TraversalError` carries a stable `kind` discriminator: `reflex-timeout` | `peer-not-reachable` | `transport` | `rendezvous-no-relay` | `rendezvous-rejected` | `punch-failed` | `port-map-unavailable` | `unsupported`. Match on `e.kind` for machine-readable branching. `"unsupported"` is the signal that the bindings are linked unconditionally and the native module doesn't have the feature — callers can branch cleanly without probing for symbol presence.
+
 ## Channels (distributed pub/sub)
 
 Named pub/sub over the encrypted mesh. Publishers register channels
