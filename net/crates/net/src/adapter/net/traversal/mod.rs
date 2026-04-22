@@ -32,14 +32,15 @@
 //!
 //! Implemented incrementally per `docs/NAT_TRAVERSAL_PLAN.md`:
 //!
-//! | Stage | Surface                          | Status            |
-//! |-------|----------------------------------|-------------------|
-//! | 0     | Module scaffolding + feature gate | **this file**    |
-//! | 1     | Reflex probe subprotocol         | pending           |
-//! | 2     | NAT type classification          | pending           |
-//! | 3     | Hole-punch rendezvous            | pending           |
-//! | 4     | Port mapping (UPnP / NAT-PMP)    | pending           |
-//! | 5     | SDK + binding surface            | pending           |
+//! | Stage | Surface                                    | Status            |
+//! |-------|--------------------------------------------|-------------------|
+//! | 0     | Module scaffolding + feature gate          | **done**          |
+//! | 1     | Reflex probe subprotocol                   | **done**          |
+//! | 2     | NAT type classification + `reflex_addr`    | **done**          |
+//! | 3     | Hole-punch rendezvous (coordinator + ack + keep-alive train) | **done** |
+//! | 4a    | Reflex override (config + runtime setters) | **done**          |
+//! | 4b    | UPnP / NAT-PMP / PCP port-mapping client   | deferred (needs `igd-next` + `rust-natpmp` deps + real-router testing; the `set_reflex_override` runtime setter in stage 4a is the hook point) |
+//! | 5     | SDK + NAPI + PyO3 + Go binding surface     | **done**          |
 //!
 //! Every stage is independently shippable. Earlier stages provide
 //! observability (`nat_type`, `reflex_addr`) without the later
