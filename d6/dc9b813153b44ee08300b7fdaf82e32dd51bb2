@@ -1,0 +1,23 @@
+net/crates/net/docs/PORT_MAPPING_PLAN.md
+  5bf3f089eecaef7a 1-315
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "d6dc9b813153b44ee08300b7fdaf82e32dd51bb2",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 315,
+      "total_deletions": 0,
+      "accepted_lines": 318,
+      "overriden_lines": 0
+    }
+  }
+}
