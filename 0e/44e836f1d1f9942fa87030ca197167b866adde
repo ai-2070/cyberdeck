@@ -1,0 +1,33 @@
+net/crates/net/bindings/go/net/net.h
+  5bf3f089eecaef7a 651-654,660-668,704-708,710,716-717
+net/crates/net/bindings/go/compute-ffi/src/lib.rs
+  5bf3f089eecaef7a 397-469,504-522,529,541,544,551,565-567,573,1226
+net/crates/net/bindings/go/net/migration_test.go
+  5bf3f089eecaef7a 180-230,234-245,290-293,298-302
+net/crates/net/bindings/go/net/compute.go
+  5bf3f089eecaef7a 173-221,223
+net/crates/net/bindings/go/net/compute_dispatch.go
+  5bf3f089eecaef7a 35,90-96,101-109,112-128,270-303,312-314,320
+net/crates/net/bindings/go/net/compute_dispatch_bridge.c
+  5bf3f089eecaef7a 40-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "0e44e836f1d1f9942fa87030ca197167b866adde",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3771,
+      "total_deletions": 36,
+      "accepted_lines": 323,
+      "overriden_lines": 0
+    }
+  }
+}
