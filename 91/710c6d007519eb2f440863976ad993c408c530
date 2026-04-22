@@ -1,0 +1,29 @@
+net/crates/net/src/adapter/net/mesh.rs
+  5bf3f089eecaef7a 683-738,3983-3986,3988-3996,3998-4022,6085-6116,6228-6492
+net/crates/net/src/adapter/net/traversal/portmap/natpmp.rs
+  5bf3f089eecaef7a 338-343,353-366,391-402,407-415,420-421,740-743,745-756,774,908-1021
+net/crates/net/bindings/node/src/lib.rs
+  5bf3f089eecaef7a 1936-1941,1957,2028-2033
+net/crates/net/bindings/node/src/common.rs
+  5bf3f089eecaef7a 5-34,40-42,45-46,48-124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "91710c6d007519eb2f440863976ad993c408c530",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 13568,
+      "total_deletions": 212,
+      "accepted_lines": 693,
+      "overriden_lines": 0
+    }
+  }
+}
