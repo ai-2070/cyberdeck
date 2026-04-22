@@ -304,3 +304,111 @@ async fn no_override_uses_classifier_path() {
     assert_eq!(a.nat_class(), NatClass::Open);
     assert_eq!(a.reflex_addr(), Some(a.local_addr()));
 }
+
+/// Regression test for a cubic-flagged P1 bug: the three
+/// traversal atomics (`nat_class`, `reflex_addr`,
+/// `reflex_override_active`) were written independently by
+/// `set_reflex_override` / `clear_reflex_override` /
+/// `commit_reclassify_observations`, and read independently by
+/// `announce_capabilities_with`. A concurrent announce could
+/// interleave between writes and publish a torn state — e.g.
+/// the new override's reflex paired with the pre-override
+/// `nat_class`, or the cleared flag paired with a not-yet-
+/// reset reflex.
+///
+/// The fix wraps the multi-field writes + the
+/// `(nat_class, reflex_addr)` read in `announce` under a
+/// shared `traversal_publish_mu`. This test stresses the race:
+/// two tasks run in parallel, one toggling the override, the
+/// other announcing as fast as it can. After each announce we
+/// inspect `local_announcement` and assert the (class, reflex)
+/// pair is *coherent* — i.e. matches one of the two valid
+/// steady states, never the torn combinations the bug allowed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn override_set_clear_is_atomic_with_announce_read() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let a = build_mesh_plain().await;
+    let override_addr: SocketAddr = "203.0.113.88:55555".parse().unwrap();
+
+    // Seed a stable pre-override state: classifier sweep gives
+    // Open + bind addr. From here the toggler flips Open+bind
+    // (cleared) ↔ Open+override (set). Note `Unknown` is only
+    // transient during the classifier path; once we've swept
+    // the steady states are both class=Open, distinguished by
+    // reflex.
+    //
+    // Actually we can't easily pre-sweep without peers; instead
+    // start in the override-set state and toggle between
+    // {override set} and {override cleared (Unknown + None)}.
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let node_toggler = a.clone();
+    let stop_toggler = stop.clone();
+    let toggler = tokio::spawn(async move {
+        for _ in 0..2_000 {
+            if stop_toggler.load(Ordering::Relaxed) {
+                break;
+            }
+            node_toggler.set_reflex_override(override_addr);
+            node_toggler.clear_reflex_override();
+        }
+    });
+
+    let node_announcer = a.clone();
+    let stop_announcer = stop.clone();
+    let announcer = tokio::spawn(async move {
+        let mut torn = 0u64;
+        for _ in 0..1_000 {
+            if stop_announcer.load(Ordering::Relaxed) {
+                break;
+            }
+            node_announcer
+                .announce_capabilities(CapabilitySet::new())
+                .await
+                .expect("announce");
+            // Inspect the announcement `announce_capabilities`
+            // *actually published*, not the separate atomic
+            // accessors (those are lock-free and can observe a
+            // torn pair under concurrent mutation — that's
+            // reader-side torn, not the publish-side race
+            // cubic flagged). The stored announcement captures
+            // its (class, reflex) pair under the publication
+            // mutex, so it's a coherent snapshot by construction.
+            let Some(ann) = node_announcer.local_announcement_for_test() else {
+                continue;
+            };
+            let class = ann
+                .caps
+                .tags
+                .iter()
+                .find_map(|t| NatClass::from_tag(t))
+                .unwrap_or(NatClass::Unknown);
+            let reflex = ann.reflex_addr;
+            // Steady states:
+            //   (Open, Some(override_addr))  — override active
+            //   (Unknown, None)              — override cleared
+            // Anything else is a torn read from the race.
+            let coherent = (class == NatClass::Open && reflex == Some(override_addr))
+                || (class == NatClass::Unknown && reflex.is_none());
+            if !coherent {
+                torn += 1;
+            }
+        }
+        torn
+    });
+
+    let torn = announcer.await.expect("announcer task panicked");
+    stop.store(true, Ordering::Relaxed);
+    toggler.await.expect("toggler task panicked");
+
+    // Any torn snapshot is a failure. Under the pre-fix bug
+    // this test reliably produced torn reads on a stressed
+    // runner. Post-fix, the publication mutex rules them out.
+    assert_eq!(
+        torn, 0,
+        "observed {torn} torn (nat_class, reflex_addr) snapshots from \
+         concurrent announces racing set/clear override — the three \
+         traversal atomics must publish + read atomically as a group",
+    );
+}

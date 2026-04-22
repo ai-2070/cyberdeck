@@ -980,6 +980,29 @@ pub struct MeshNode {
     /// announce-capabilities path.
     #[cfg(feature = "nat-traversal")]
     reflex_override_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Publication barrier held briefly during any code path
+    /// that touches more than one of `nat_class`, `reflex_addr`,
+    /// and `reflex_override_active` as a group. The three atomics
+    /// underneath are still lock-free for single-field readers
+    /// (`nat_class()`, `reflex_addr()`, and the traversal-loop
+    /// branches that only check one value), but the setters
+    /// (`set_reflex_override`, `clear_reflex_override`) and the
+    /// classifier commit (`commit_reclassify_observations`) write
+    /// the triple under this lock, and readers that need a
+    /// consistent snapshot (`announce_capabilities_with` emits
+    /// `nat_class` AND `reflex_addr` into the same outbound
+    /// announcement) read the triple under this lock too.
+    ///
+    /// A cubic P1 review flagged that reading the three atomics
+    /// independently let a concurrent announce publish a torn
+    /// state — e.g., a just-cleared override with reflex=None
+    /// paired with the still-Open NAT class, or a just-set
+    /// override's new reflex paired with the pre-override
+    /// Unknown class. This mutex closes that window; writers
+    /// serialize against each other and against the multi-field
+    /// read in announce.
+    #[cfg(feature = "nat-traversal")]
+    traversal_publish_mu: Arc<parking_lot::Mutex<()>>,
     /// Traversal tunables — probe timeouts, classification
     /// deadline, punch cadence, and port-mapping renewal interval.
     /// Defaults match `docs/NAT_TRAVERSAL_PLAN.md`. Exposed via
@@ -1257,6 +1280,8 @@ impl MeshNode {
             reflex_override_active: Arc::new(std::sync::atomic::AtomicBool::new(
                 initial_reflex_override.is_some(),
             )),
+            #[cfg(feature = "nat-traversal")]
+            traversal_publish_mu: Arc::new(parking_lot::Mutex::new(())),
             #[cfg(feature = "nat-traversal")]
             traversal_config: super::traversal::TraversalConfig::default(),
             #[cfg(feature = "nat-traversal")]
@@ -1644,6 +1669,7 @@ impl MeshNode {
             let reflex_addr = self.reflex_addr.clone();
             let nat_class = self.nat_class.clone();
             let reflex_override_active = self.reflex_override_active.clone();
+            let publish_mu = self.traversal_publish_mu.clone();
             let shutdown = self.shutdown.clone();
             let shutdown_notify = self.shutdown_notify.clone();
             let internal_port = self.config.bind_addr.port();
@@ -1664,6 +1690,7 @@ impl MeshNode {
                     reflex_addr,
                     nat_class,
                     reflex_override_active,
+                    publish_mu,
                 );
                 let task = PortMapperTask::new(
                     client,
@@ -1808,6 +1835,7 @@ impl MeshNode {
             self.reflex_addr.clone(),
             self.nat_class.clone(),
             self.reflex_override_active.clone(),
+            self.traversal_publish_mu.clone(),
         );
         let internal_port = self.config.bind_addr.port();
         let renewal = self.traversal_config.port_mapping_renewal;
@@ -4811,17 +4839,29 @@ impl MeshNode {
         // separate discovery round-trip. Both are feature-gated on
         // `nat-traversal` — callers compiled without the feature
         // emit announcements identical to the pre-traversal format.
+        //
+        // The two reads happen under `traversal_publish_mu` so
+        // the announcement always carries a consistent (class,
+        // reflex) pair. Without the mutex, a concurrent
+        // set/clear/commit could interleave between our reads
+        // and let us publish a torn state — e.g., the new
+        // override's reflex paired with the pre-override NAT
+        // class. Cubic P1. The lock is held only for the two
+        // atomic reads, not across the signing or network send.
         #[cfg(feature = "nat-traversal")]
-        let caps = {
+        let (caps, reflex_snapshot) = {
             use super::traversal::classify::NatClass;
+            let _g = self.traversal_publish_mu.lock();
             let class =
                 NatClass::from_u8(self.nat_class.load(std::sync::atomic::Ordering::Acquire));
+            let reflex = self.reflex_addr.load_full().map(|arc| *arc);
             // Strip any prior `nat:*` tags before adding the fresh
             // one so a reclassification doesn't leave a stale tag
             // behind when the class transitions.
             let mut next = caps;
             next.tags.retain(|t| !t.starts_with("nat:"));
-            next.add_tag(class.tag().to_string())
+            let next = next.add_tag(class.tag().to_string());
+            (next, reflex)
         };
 
         let mut ann = CapabilityAnnouncement::new(
@@ -4833,7 +4873,7 @@ impl MeshNode {
         .with_ttl(ttl.as_secs().min(u32::MAX as u64) as u32);
         #[cfg(feature = "nat-traversal")]
         {
-            ann = ann.with_reflex_addr(self.reflex_addr.load_full().map(|arc| *arc));
+            ann = ann.with_reflex_addr(reflex_snapshot);
         }
         if sign {
             ann.sign(&self.identity);
@@ -6033,10 +6073,15 @@ impl MeshNode {
     #[cfg(feature = "nat-traversal")]
     pub fn set_reflex_override(&self, external: SocketAddr) {
         use std::sync::atomic::Ordering;
-        // Order matters: publish the reflex address + NAT class
-        // first, then flip the active flag. A concurrent reader
-        // that sees the flag set is guaranteed to see the
-        // already-installed reflex below.
+        // Hold the publication mutex across the triple-write.
+        // Without it, a concurrent `announce_capabilities_with`
+        // could interleave its two reads between our three
+        // writes and publish a torn state (e.g. the new reflex
+        // paired with the pre-override NAT class). The mutex is
+        // briefly contended only with other override writers or
+        // the announce multi-field read; single-field readers
+        // stay lock-free.
+        let _g = self.traversal_publish_mu.lock();
         self.reflex_addr.store(Some(Arc::new(external)));
         self.nat_class.store(
             super::traversal::classify::NatClass::Open.as_u8(),
@@ -6060,6 +6105,12 @@ impl MeshNode {
     #[cfg(feature = "nat-traversal")]
     pub fn clear_reflex_override(&self) {
         use std::sync::atomic::Ordering;
+        // Hold the publication mutex across the flag flip + the
+        // field resets so a concurrent announce can't observe
+        // the cleared flag alongside the not-yet-reset reflex /
+        // NAT class (or vice versa). Same invariant as in
+        // `set_reflex_override`.
+        let _g = self.traversal_publish_mu.lock();
         if !self.reflex_override_active.swap(false, Ordering::AcqRel) {
             return;
         }
@@ -6096,6 +6147,20 @@ impl MeshNode {
     #[doc(hidden)]
     pub fn force_nat_class_for_test(&self, class: super::traversal::classify::NatClass) {
         self.nat_class.store(class.as_u8(), Ordering::Release);
+    }
+
+    /// Test / debug accessor for the most-recent local
+    /// capability announcement. Returns `None` until the first
+    /// `announce_capabilities*` call. The stored value is the
+    /// coherent snapshot published by
+    /// [`Self::announce_capabilities_with`] under
+    /// `traversal_publish_mu` — regression tests for the
+    /// (class, reflex_addr) race read this instead of the
+    /// separate atomic accessors, which are lock-free and can
+    /// return torn pairs under concurrent mutation.
+    #[doc(hidden)]
+    pub fn local_announcement_for_test(&self) -> Option<Arc<CapabilityAnnouncement>> {
+        self.local_announcement.load_full()
     }
 
     /// Send a `PunchRequest` to a coordinator peer `relay`, asking
@@ -6357,6 +6422,14 @@ impl MeshNode {
         latest_reflex: Option<std::net::SocketAddr>,
     ) {
         use std::sync::atomic::Ordering;
+        // Hold the publication mutex across the re-check + the
+        // (potentially) paired writes. This both makes the
+        // override mid-sweep guard atomic with the commit
+        // (no TOCTOU on the flag vs stores), and serializes
+        // against concurrent `announce_capabilities_with` reads
+        // so the classifier can't publish nat_class without
+        // reflex_addr (or vice versa) being visible together.
+        let _g = self.traversal_publish_mu.lock();
         if self.reflex_override_active.load(Ordering::Acquire) {
             tracing::debug!("nat-traversal: reflex override installed mid-sweep, skipping commit");
             return;

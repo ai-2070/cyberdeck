@@ -224,24 +224,37 @@ pub struct MappingSink {
     reflex_addr: Arc<ArcSwapOption<std::net::SocketAddr>>,
     nat_class: Arc<AtomicU8>,
     reflex_override_active: Arc<AtomicBool>,
+    /// Shared publication mutex — the same one `MeshNode` holds
+    /// around its triple-atomic writes + multi-field reads.
+    /// Held briefly across the sink's `apply_install` /
+    /// `apply_revoke` / `apply_renewal` critical sections so a
+    /// concurrent `announce_capabilities_with` can't observe a
+    /// torn state across the port-mapping task's updates
+    /// (cubic P1). The mutex is unit type — the data it's
+    /// guarding is the set of atomics above; the lock only
+    /// provides a publication barrier.
+    publish_mu: Arc<parking_lot::Mutex<()>>,
 }
 
 impl MappingSink {
     /// Construct a sink from the three reflex-override atomics
-    /// `MeshNode` already owns, plus the stats block. Called
-    /// from `MeshNode::spawn_port_mapping_loop` where all four
-    /// are available as `Arc`-clones.
+    /// `MeshNode` already owns, plus the stats block and the
+    /// shared publication mutex. Called from
+    /// `MeshNode::spawn_port_mapping_loop` where all five are
+    /// available as `Arc`-clones.
     pub fn new(
         stats: Arc<TraversalStats>,
         reflex_addr: Arc<ArcSwapOption<std::net::SocketAddr>>,
         nat_class: Arc<AtomicU8>,
         reflex_override_active: Arc<AtomicBool>,
+        publish_mu: Arc<parking_lot::Mutex<()>>,
     ) -> Self {
         Self {
             stats,
             reflex_addr,
             nat_class,
             reflex_override_active,
+            publish_mu,
         }
     }
 
@@ -257,7 +270,9 @@ impl MappingSink {
         // reflex_addr below.
         self.stats.record_port_mapping_install(mapping.external);
 
-        // Reflex override (matches `MeshNode::set_reflex_override`):
+        // Reflex override (matches `MeshNode::set_reflex_override`),
+        // with the same publication mutex held across the triple.
+        let _g = self.publish_mu.lock();
         self.reflex_addr.store(Some(Arc::new(mapping.external)));
         self.nat_class
             .store(NatClass::Open.as_u8(), Ordering::Release);
@@ -284,7 +299,10 @@ impl MappingSink {
             // either sees the old address or the new one, never
             // a torn mix. No need to re-flip the override flag
             // — it's already set and stays set across the
-            // rebind.
+            // rebind. Mutex held across the publish step so
+            // `announce_capabilities_with` doesn't observe a
+            // partial snapshot during the rebind.
+            let _g = self.publish_mu.lock();
             self.reflex_addr.store(Some(Arc::new(mapping.external)));
             self.stats.replace_port_mapping_external(mapping.external);
         }
@@ -295,7 +313,9 @@ impl MappingSink {
     /// the reflex override (matches `MeshNode::clear_reflex_override`).
     pub(crate) fn apply_revoke(&self) {
         self.stats.record_port_mapping_revoke();
-        // clear_reflex_override semantics:
+        // clear_reflex_override semantics with the shared
+        // publication mutex held across the triple.
+        let _g = self.publish_mu.lock();
         if self.reflex_override_active.swap(false, Ordering::AcqRel) {
             self.reflex_addr.store(None);
             self.nat_class
@@ -611,11 +631,13 @@ mod tests {
         let reflex_addr = Arc::new(ArcSwapOption::empty());
         let nat_class = Arc::new(AtomicU8::new(NatClass::Unknown.as_u8()));
         let override_active = Arc::new(AtomicBool::new(false));
+        let publish_mu = Arc::new(parking_lot::Mutex::new(()));
         let sink = MappingSink::new(
             Arc::clone(&stats),
             reflex_addr,
             nat_class,
             Arc::clone(&override_active),
+            publish_mu,
         );
         (sink, stats, override_active)
     }
