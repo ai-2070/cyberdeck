@@ -1,0 +1,23 @@
+net/crates/net/bindings/python/README.md
+  5bf3f089eecaef7a 106-146
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "29ab508fbbab54a4e510f8592fd67ec12d2506cc",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 133,
+      "total_deletions": 0,
+      "accepted_lines": 136,
+      "overriden_lines": 0
+    }
+  }
+}
