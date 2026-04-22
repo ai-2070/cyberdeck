@@ -57,6 +57,94 @@ pub mod rendezvous;
 pub use config::TraversalConfig;
 
 // =========================================================================
+// Traversal stats
+// =========================================================================
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Counters tracking traversal decisions + outcomes. Exposed via
+/// [`crate::adapter::net::MeshNode::traversal_stats`]. Every
+/// counter is monotonic; resetting isn't supported because the
+/// values are only meaningful cumulatively.
+///
+/// The three counters partition all `connect_direct` outcomes:
+///
+/// - **`punches_attempted`** — the pair-type matrix decided to
+///   attempt a hole-punch. Increments whether the punch
+///   eventually succeeds or fails.
+/// - **`relay_fallbacks`** — connection ended up on the routed-
+///   handshake path: either because the pair-type matrix skipped
+///   punching, or because the punch attempt failed and fell back.
+///   Every `connect_direct` that doesn't establish a directly-
+///   punched session increments this counter.
+/// - **`punches_succeeded`** — the punch completed within the
+///   deadline and produced a direct session. Always `≤
+///   punches_attempted`; the difference is the punch-failure
+///   rate.
+///
+/// Read via [`TraversalStats::snapshot`] for a consistent
+/// `(attempted, succeeded, fallbacks)` tuple.
+#[derive(Debug, Default)]
+pub struct TraversalStats {
+    punches_attempted: AtomicU64,
+    punches_succeeded: AtomicU64,
+    relay_fallbacks: AtomicU64,
+}
+
+/// Consistent point-in-time view of the three
+/// [`TraversalStats`] counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraversalStatsSnapshot {
+    /// Number of punches the pair-type matrix elected to attempt.
+    pub punches_attempted: u64,
+    /// Number of those attempts that produced a direct session.
+    pub punches_succeeded: u64,
+    /// Number of `connect_direct` calls that ended on the routed-
+    /// handshake path — matrix-skipped + punch-failed.
+    pub relay_fallbacks: u64,
+}
+
+impl TraversalStats {
+    /// Construct a zeroed stats block. Identical to
+    /// `Default::default()`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Read all three counters. Reads are `Relaxed` — the stats
+    /// are observability, not synchronization primitives, and
+    /// cross-counter skew at observation time is meaningless
+    /// (none of the three counters imply anything about the
+    /// others' current value).
+    pub fn snapshot(&self) -> TraversalStatsSnapshot {
+        TraversalStatsSnapshot {
+            punches_attempted: self.punches_attempted.load(Ordering::Relaxed),
+            punches_succeeded: self.punches_succeeded.load(Ordering::Relaxed),
+            relay_fallbacks: self.relay_fallbacks.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Bump `punches_attempted`. Called when the pair-type matrix
+    /// elects to try a hole-punch, regardless of outcome.
+    pub(crate) fn record_punch_attempt(&self) {
+        self.punches_attempted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `punches_succeeded`. Called when a punch attempt
+    /// completes with a direct session.
+    pub(crate) fn record_punch_success(&self) {
+        self.punches_succeeded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `relay_fallbacks`. Called when `connect_direct`
+    /// resolves on the routed-handshake path — matrix-skipped or
+    /// punch-failed.
+    pub(crate) fn record_relay_fallback(&self) {
+        self.relay_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// =========================================================================
 // Error surface
 // =========================================================================
 

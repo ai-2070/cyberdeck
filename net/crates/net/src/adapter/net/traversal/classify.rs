@@ -109,6 +109,71 @@ impl NatClass {
     }
 }
 
+/// Decision returned by the pair-type matrix (plan §3 "Connect-
+/// time pair-type matrix"). Drives `connect_direct`'s choice of
+/// whether to attempt a punch, route through the relay, or skip
+/// the punch entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PairAction {
+    /// Connect directly to the peer without a hole-punch attempt.
+    /// Used when at least one side is Open — NAT traversal is
+    /// unnecessary. Stats: no counters bumped until
+    /// `connect_direct` resolves; a successful direct connect
+    /// isn't a "fallback" because no punch was offered in the
+    /// first place.
+    Direct,
+    /// Fire exactly one rendezvous-coordinated punch (plan
+    /// decision 8 — no retry on failure). Stats:
+    /// `punches_attempted` bumps when this action is selected;
+    /// `punches_succeeded` or `relay_fallbacks` bumps on outcome.
+    SinglePunch,
+    /// Skip the punch and connect via the routed-handshake path
+    /// only. Used for Symmetric × Symmetric (direct punch
+    /// infeasible) and Symmetric × Unknown (not worth the
+    /// coordinator round-trip when one side can't hole-punch
+    /// reliably). Stats: `relay_fallbacks` bumps.
+    SkipPunch,
+}
+
+/// Decide what `connect_direct` should do given the local and
+/// remote NAT classifications. Pure function — no I/O, no state.
+///
+/// Matrix (plan §3 "Connect-time pair-type matrix"):
+///
+/// | Local → | Remote → `Open`      | Remote → `Cone`     | Remote → `Symmetric`  | Remote → `Unknown`   |
+/// |---------|----------------------|---------------------|-----------------------|----------------------|
+/// | `Open`       | `Direct`         | `Direct`            | `SinglePunch`         | `Direct`             |
+/// | `Cone`       | `Direct`         | `SinglePunch`       | `SinglePunch`         | `SinglePunch`        |
+/// | `Symmetric`  | `SinglePunch`    | `SinglePunch`       | `SkipPunch`           | `SkipPunch`          |
+/// | `Unknown`    | `Direct`         | `SinglePunch`       | `SkipPunch`           | `Direct`             |
+///
+/// `Unknown × Unknown` goes `Direct` (attempt direct, fall back
+/// on first failure) — plan decision 8's "never treat Unknown as
+/// do-not-attempt" rule. `Symmetric × Unknown` goes `SkipPunch`
+/// because the Symmetric side can't reliably punch regardless of
+/// the other end's type.
+pub fn pair_action(local: NatClass, remote: NatClass) -> PairAction {
+    use NatClass::*;
+    match (local, remote) {
+        // Open never needs a punch — it's directly reachable.
+        (Open, _) | (_, Open) => PairAction::Direct,
+
+        // Symmetric × Symmetric: punch is not reliable either way.
+        (Symmetric, Symmetric) => PairAction::SkipPunch,
+
+        // Symmetric × Unknown (or vice versa): don't waste the
+        // coordinator round-trip; the symmetric side can't punch.
+        (Symmetric, Unknown) | (Unknown, Symmetric) => PairAction::SkipPunch,
+
+        // Cone × anything else (Cone, Symmetric, Unknown): worth
+        // a single-shot punch. Cone × Open is handled above.
+        (Cone, _) | (_, Cone) => PairAction::SinglePunch,
+
+        // Unknown × Unknown: attempt direct, fall back on failure.
+        (Unknown, Unknown) => PairAction::Direct,
+    }
+}
+
 /// NAT classification state machine.
 ///
 /// Accumulates per-peer reflex observations and produces a
@@ -353,5 +418,102 @@ mod tests {
         // read back garbage elsewhere.
         assert_eq!(NatClass::from_u8(4), NatClass::Unknown);
         assert_eq!(NatClass::from_u8(255), NatClass::Unknown);
+    }
+
+    #[test]
+    fn pair_action_open_always_direct() {
+        // Open on either side = directly reachable; no punch
+        // needed. Stable across every remote classification,
+        // including Unknown.
+        for remote in [
+            NatClass::Open,
+            NatClass::Cone,
+            NatClass::Symmetric,
+            NatClass::Unknown,
+        ] {
+            assert_eq!(
+                pair_action(NatClass::Open, remote),
+                PairAction::Direct,
+                "Open × {remote:?} should be Direct",
+            );
+            assert_eq!(
+                pair_action(remote, NatClass::Open),
+                PairAction::Direct,
+                "{remote:?} × Open should be Direct",
+            );
+        }
+    }
+
+    #[test]
+    fn pair_action_symmetric_symmetric_skips_punch() {
+        // Plan decision: neither side can reliably hole-punch,
+        // so skip the coordinator round-trip entirely.
+        assert_eq!(
+            pair_action(NatClass::Symmetric, NatClass::Symmetric),
+            PairAction::SkipPunch,
+        );
+    }
+
+    #[test]
+    fn pair_action_cone_cone_single_punch() {
+        // The canonical "worth a punch" pair: both sides cone-
+        // typed, single-shot attempt.
+        assert_eq!(
+            pair_action(NatClass::Cone, NatClass::Cone),
+            PairAction::SinglePunch,
+        );
+    }
+
+    #[test]
+    fn pair_action_symmetric_cone_attempts_one() {
+        // Plan decision 8: symmetric × cone gets one shot.
+        assert_eq!(
+            pair_action(NatClass::Symmetric, NatClass::Cone),
+            PairAction::SinglePunch,
+        );
+        assert_eq!(
+            pair_action(NatClass::Cone, NatClass::Symmetric),
+            PairAction::SinglePunch,
+        );
+    }
+
+    #[test]
+    fn pair_action_unknown_unknown_is_direct() {
+        // Unknown × Unknown: attempt direct, fall back on first
+        // failure. Plan's "never treat Unknown as do-not-attempt"
+        // rule.
+        assert_eq!(
+            pair_action(NatClass::Unknown, NatClass::Unknown),
+            PairAction::Direct,
+        );
+    }
+
+    #[test]
+    fn pair_action_symmetric_unknown_skips_punch() {
+        // Symmetric side can't punch reliably regardless of the
+        // other end — skip the coordinator round-trip.
+        assert_eq!(
+            pair_action(NatClass::Symmetric, NatClass::Unknown),
+            PairAction::SkipPunch,
+        );
+        assert_eq!(
+            pair_action(NatClass::Unknown, NatClass::Symmetric),
+            PairAction::SkipPunch,
+        );
+    }
+
+    #[test]
+    fn pair_action_cone_unknown_attempts_one() {
+        // Cone × Unknown: worth a punch — cone side can
+        // definitely receive if the other side reaches it, and
+        // Unknown isn't "can't punch."
+        assert_eq!(
+            pair_action(NatClass::Cone, NatClass::Unknown),
+            PairAction::SinglePunch,
+        );
+        assert_eq!(
+            pair_action(NatClass::Unknown, NatClass::Cone),
+            PairAction::SinglePunch,
+        );
     }
 }

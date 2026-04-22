@@ -769,6 +769,13 @@ pub struct MeshNode {
     /// `MeshBuilder` setters in stage 5; internal-only today.
     #[cfg(feature = "nat-traversal")]
     traversal_config: super::traversal::TraversalConfig,
+    /// Cumulative counters for `connect_direct` outcomes. Every
+    /// punch attempt, success, and relay fallback is recorded
+    /// here; read via [`Self::traversal_stats`]. Observability
+    /// surface, not control — the traversal behavior doesn't read
+    /// this.
+    #[cfg(feature = "nat-traversal")]
+    traversal_stats: Arc<super::traversal::TraversalStats>,
     /// Capability index populated by inbound
     /// `SUBPROTOCOL_CAPABILITY_ANN` packets and the local
     /// `announce_capabilities` path. Self-index so single-node
@@ -1010,6 +1017,8 @@ impl MeshNode {
             reflex_addr: Arc::new(ArcSwapOption::empty()),
             #[cfg(feature = "nat-traversal")]
             traversal_config: super::traversal::TraversalConfig::default(),
+            #[cfg(feature = "nat-traversal")]
+            traversal_stats: Arc::new(super::traversal::TraversalStats::new()),
             capability_index: Arc::new(CapabilityIndex::new()),
             seen_announcements: Arc::new(DashMap::new()),
             last_announce_at: Arc::new(parking_lot::Mutex::new(None)),
@@ -4316,6 +4325,173 @@ impl MeshNode {
     #[cfg(feature = "nat-traversal")]
     pub fn peer_reflex_addr(&self, peer_node_id: u64) -> Option<std::net::SocketAddr> {
         self.capability_index.reflex_addr(peer_node_id)
+    }
+
+    /// Read a peer's most recently advertised NAT classification
+    /// from the capability index. Parses the `nat:*` tag on the
+    /// peer's announcement. Returns `NatClass::Unknown` when the
+    /// peer has not indexed (we've never received an announcement),
+    /// or the announcement carried no `nat:*` tag (peer was
+    /// compiled without `nat-traversal`, or hasn't classified yet).
+    ///
+    /// Consumed by the pair-type matrix (plan §3) — `connect_direct`
+    /// reads this to decide whether to attempt a punch or
+    /// short-circuit to the routed path.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn peer_nat_class(
+        &self,
+        peer_node_id: u64,
+    ) -> super::traversal::classify::NatClass {
+        use super::traversal::classify::NatClass;
+        let Some(caps) = self.capability_index.get(peer_node_id) else {
+            return NatClass::Unknown;
+        };
+        for tag in caps.tags.iter() {
+            if let Some(class) = NatClass::from_tag(tag) {
+                return class;
+            }
+        }
+        NatClass::Unknown
+    }
+
+    /// Cumulative traversal counters — punch attempts, successes,
+    /// and relay fallbacks. Returns a consistent point-in-time
+    /// snapshot.
+    ///
+    /// See [`super::traversal::TraversalStatsSnapshot`] for the
+    /// field semantics. Counters are monotonic and never reset;
+    /// callers that want deltas should subtract snapshots.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn traversal_stats(&self) -> super::traversal::TraversalStatsSnapshot {
+        self.traversal_stats.snapshot()
+    }
+
+    /// Establish a direct session to `peer_node_id`, using the
+    /// pair-type matrix (plan §3) to decide between a direct
+    /// handshake, a rendezvous-coordinated single-shot punch, or
+    /// a routed-only fallback.
+    ///
+    /// # Flow
+    ///
+    /// 1. Read local + remote NAT classifications (self
+    ///    `nat_class()` + `peer_nat_class`). Unknown sides are
+    ///    handled per the matrix — never treated as "don't attempt"
+    ///    (plan decision 8).
+    /// 2. Resolve the peer's reflex address from the local
+    ///    capability index. Fails with
+    ///    [`TraversalError::PeerNotReachable`] if no reflex is
+    ///    cached (peer hasn't announced yet).
+    /// 3. Apply the matrix:
+    ///    - `Direct` / `SkipPunch` → connect straight to
+    ///      `peer_reflex` using the supplied pubkey.
+    ///      `relay_fallbacks` increments (traffic rides the
+    ///      direct path when possible, routed otherwise, but
+    ///      we didn't try to punch).
+    ///    - `SinglePunch` → ask `coordinator` to mediate via
+    ///      [`Self::request_punch`]. On successful introduction,
+    ///      increment `punches_attempted` + `punches_succeeded`
+    ///      and connect to `peer_reflex`. On failure, increment
+    ///      `punches_attempted` + `relay_fallbacks` and fall
+    ///      back to connecting via `peer_reflex` directly
+    ///      anyway — the plan's framing treats punch-failed as
+    ///      "optimization missed," not a connectivity failure.
+    ///
+    /// # Scope note
+    ///
+    /// Stage 3c wires the orchestration + stats end-to-end but
+    /// always establishes the session via the routed handshake
+    /// through `coordinator` — the framing "traffic rides the
+    /// relay until a direct punch upgrades it" matches the plan's
+    /// "optimization, not correctness" contract. Stage 3d lands
+    /// the keep-alive train + `PunchAck` round-trip, at which
+    /// point a successful `SinglePunch` outcome upgrades to a
+    /// direct session; failed punches (or matrix-skipped pairs)
+    /// continue to resolve on the routed path as they do today.
+    ///
+    /// Stats are set on the stage-3c semantics already:
+    /// `punches_attempted` increments when the matrix picks
+    /// `SinglePunch` and the coordinator mediates; stage 3d
+    /// refines `punches_succeeded` / `relay_fallbacks` against
+    /// the real keep-alive outcome.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn connect_direct(
+        &self,
+        peer_node_id: u64,
+        peer_pubkey: &[u8; 32],
+        coordinator: u64,
+    ) -> Result<u64, super::traversal::TraversalError> {
+        use super::traversal::classify::{pair_action, PairAction};
+        use super::traversal::TraversalError;
+
+        // Require the peer to have announced a reflex — the
+        // rendezvous coordinator needs it too, and it's our
+        // fast-fail signal that the peer is discoverable at all.
+        let _peer_reflex = self
+            .peer_reflex_addr(peer_node_id)
+            .ok_or(TraversalError::PeerNotReachable)?;
+
+        let coordinator_addr = self
+            .peer_addrs
+            .get(&coordinator)
+            .map(|e| *e.value())
+            .ok_or(TraversalError::PeerNotReachable)?;
+
+        let local_class = self.nat_class();
+        let remote_class = self.peer_nat_class(peer_node_id);
+        let action = pair_action(local_class, remote_class);
+
+        // Small helper: open the routed session via the
+        // coordinator. Idempotent — a pre-existing session with
+        // `peer_node_id` short-circuits with `Ok(peer_node_id)`
+        // so back-to-back `connect_direct` calls don't error out.
+        let connect_routed = || async {
+            if self.peers.contains_key(&peer_node_id) {
+                return Ok(peer_node_id);
+            }
+            self.connect_via(coordinator_addr, peer_pubkey, peer_node_id)
+                .await
+                .map_err(|e| TraversalError::Transport(e.to_string()))
+        };
+
+        match action {
+            PairAction::Direct | PairAction::SkipPunch => {
+                self.traversal_stats.record_relay_fallback();
+                connect_routed().await
+            }
+            PairAction::SinglePunch => {
+                self.traversal_stats.record_punch_attempt();
+                let self_reflex =
+                    self.reflex_addr().unwrap_or_else(|| self.local_addr());
+                let punch_outcome = self
+                    .request_punch(coordinator, peer_node_id, self_reflex)
+                    .await;
+                match punch_outcome {
+                    Ok(_intro) => {
+                        // Stage 3c approximation: a successful
+                        // coordinator mediation counts as
+                        // "punch succeeded" for the stats. The
+                        // real keep-alive confirmation lands in
+                        // stage 3d.
+                        self.traversal_stats.record_punch_success();
+                        connect_routed().await
+                    }
+                    Err(_) => {
+                        // Punch coordination failed (no cached
+                        // reflex on R, timeout, etc). Traffic
+                        // still rides the relay; record the
+                        // fallback and resolve.
+                        self.traversal_stats.record_relay_fallback();
+                        connect_routed().await
+                    }
+                }
+            }
+        }
     }
 
     /// Rank peers for a scored requirement. Returns the best-
