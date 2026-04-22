@@ -19,26 +19,14 @@ use net::adapter::net::behavior::capability::{
     CapabilityAnnouncement, CapabilityFilter, CapabilitySet,
 };
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
-use tokio::net::UdpSocket;
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
 
-async fn find_ports(n: usize) -> Vec<u16> {
-    let mut ports = Vec::with_capacity(n);
-    let mut sockets = Vec::with_capacity(n);
-    for _ in 0..n {
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        ports.push(sock.local_addr().unwrap().port());
-        sockets.push(sock);
-    }
-    drop(sockets);
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    ports
-}
-
-fn test_config(port: u16) -> MeshNodeConfig {
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+fn test_config() -> MeshNodeConfig {
+    // Bind via `127.0.0.1:0` so the OS picks a free port — no
+    // pre-bind reservation, no TOCTOU race with parallel tests.
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut cfg = MeshNodeConfig::new(addr, PSK)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))
@@ -52,16 +40,16 @@ fn test_config(port: u16) -> MeshNodeConfig {
 }
 
 /// Build an unstarted MeshNode and return it alongside its node_id.
-async fn build_node(port: u16) -> Arc<MeshNode> {
-    build_node_with(port, |cfg| cfg).await
+async fn build_node() -> Arc<MeshNode> {
+    build_node_with(|cfg| cfg).await
 }
 
 /// Build a MeshNode with a caller-supplied tweak to the test config.
-async fn build_node_with<F>(port: u16, tweak: F) -> Arc<MeshNode>
+async fn build_node_with<F>(tweak: F) -> Arc<MeshNode>
 where
     F: FnOnce(MeshNodeConfig) -> MeshNodeConfig,
 {
-    let cfg = tweak(test_config(port));
+    let cfg = tweak(test_config());
     let keypair = EntityKeypair::generate();
     Arc::new(MeshNode::new(keypair, cfg).await.expect("MeshNode::new"))
 }
@@ -116,9 +104,8 @@ where
 /// (migration falls back to `public_only` identity).
 #[tokio::test]
 async fn peer_static_x25519_returns_peer_noise_pubkey_after_handshake() {
-    let ports = find_ports(2).await;
-    let a = build_node(ports[0]).await;
-    let b = build_node(ports[1]).await;
+    let a = build_node().await;
+    let b = build_node().await;
     handshake(&a, &b).await;
 
     let a_id = a.node_id();
@@ -173,9 +160,8 @@ async fn migration_identity_context_unseals_envelope_without_exposing_key() {
     use net::adapter::net::state::causal::CausalLink;
     use net::adapter::net::state::snapshot::StateSnapshot;
 
-    let ports = find_ports(2).await;
-    let a = build_node(ports[0]).await;
-    let b = build_node(ports[1]).await;
+    let a = build_node().await;
+    let b = build_node().await;
     handshake(&a, &b).await;
 
     // Source-side daemon identity (what an envelope would carry).
@@ -247,9 +233,8 @@ async fn migration_identity_context_unseals_envelope_without_exposing_key() {
 
 #[tokio::test]
 async fn two_node_announce_is_visible() {
-    let ports = find_ports(2).await;
-    let a = build_node(ports[0]).await;
-    let b = build_node(ports[1]).await;
+    let a = build_node().await;
+    let b = build_node().await;
     handshake(&a, &b).await;
 
     let caps = CapabilitySet::new().add_tag("gpu").add_tag("inference");
@@ -268,9 +253,8 @@ async fn two_node_announce_is_visible() {
 
 #[tokio::test]
 async fn announcement_expires_after_ttl() {
-    let ports = find_ports(2).await;
-    let a = build_node(ports[0]).await;
-    let b = build_node(ports[1]).await;
+    let a = build_node().await;
+    let b = build_node().await;
     handshake(&a, &b).await;
 
     let caps = CapabilitySet::new().add_tag("ephemeral");
@@ -300,8 +284,7 @@ async fn announcement_expires_after_ttl() {
 
 #[tokio::test]
 async fn late_joiner_receives_session_open_push() {
-    let ports = find_ports(2).await;
-    let a = build_node(ports[0]).await;
+    let a = build_node().await;
 
     // A announces *before* B exists.
     let caps = CapabilitySet::new().add_tag("preannounced");
@@ -310,7 +293,7 @@ async fn late_joiner_receives_session_open_push() {
         .expect("announce failed");
 
     // B joins the party.
-    let b = build_node(ports[1]).await;
+    let b = build_node().await;
     handshake(&a, &b).await;
 
     let filter = CapabilityFilter::new().require_tag("preannounced");
@@ -331,9 +314,8 @@ async fn require_signed_capabilities_drops_unsigned_announcements() {
     // A self-indexes its own announcement (local path bypasses
     // receive), so a self-query on A still matches — only B's view
     // should be blank.
-    let ports = find_ports(2).await;
-    let a = build_node(ports[0]).await;
-    let b = build_node_with(ports[1], |cfg| cfg.with_require_signed_capabilities(true)).await;
+    let a = build_node().await;
+    let b = build_node_with(|cfg| cfg.with_require_signed_capabilities(true)).await;
     handshake(&a, &b).await;
 
     a.announce_capabilities_with(
@@ -411,9 +393,8 @@ async fn stale_versions_are_ignored_by_index() {
 async fn forged_node_id_rejected_even_with_valid_signature() {
     use net::adapter::net::behavior::SUBPROTOCOL_CAPABILITY_ANN;
 
-    let ports = find_ports(2).await;
-    let a = build_node(ports[0]).await;
-    let b = build_node(ports[1]).await;
+    let a = build_node().await;
+    let b = build_node().await;
     handshake(&a, &b).await;
 
     // Craft a forged announcement with a fresh keypair. The
@@ -469,9 +450,8 @@ async fn forged_node_id_rejected_even_with_valid_signature() {
 async fn forwarded_announcement_does_not_tofu_pin_forwarder_to_victim_entity() {
     use net::adapter::net::behavior::SUBPROTOCOL_CAPABILITY_ANN;
 
-    let ports = find_ports(2).await;
-    let attacker = build_node(ports[0]).await;
-    let receiver = build_node(ports[1]).await;
+    let attacker = build_node().await;
+    let receiver = build_node().await;
     handshake(&attacker, &receiver).await;
 
     // The victim never joins the network — the attacker harvested
@@ -540,9 +520,8 @@ async fn forwarded_announcement_does_not_tofu_pin_forwarder_to_victim_entity() {
 /// state guards still hold under it.
 #[tokio::test]
 async fn unsigned_announcement_does_not_tofu_pin_entity() {
-    let ports = find_ports(2).await;
-    let a = build_node(ports[0]).await;
-    let b = build_node_with(ports[1], |cfg| cfg.with_require_signed_capabilities(false)).await;
+    let a = build_node().await;
+    let b = build_node_with(|cfg| cfg.with_require_signed_capabilities(false)).await;
     handshake(&a, &b).await;
 
     // A announces UNSIGNED caps. B accepts (explicit opt-out
@@ -585,12 +564,11 @@ async fn forwarded_announcement_does_not_write_relay_peer_subnet() {
     use net::adapter::net::behavior::SUBPROTOCOL_CAPABILITY_ANN;
     use net::adapter::net::{SubnetPolicy, SubnetRule};
 
-    let ports = find_ports(2).await;
-    let attacker = build_node(ports[0]).await;
+    let attacker = build_node().await;
 
     let rule = SubnetRule::new("region:", 0).map("privileged", 1);
     let policy = SubnetPolicy::new().add_rule(rule);
-    let receiver = build_node_with(ports[1], |cfg| cfg.with_subnet_policy(Arc::new(policy))).await;
+    let receiver = build_node_with(|cfg| cfg.with_subnet_policy(Arc::new(policy))).await;
     handshake(&attacker, &receiver).await;
 
     // Harvested victim bytes: a real, signature-valid announcement
@@ -652,8 +630,7 @@ async fn forwarded_announcement_does_not_write_relay_peer_subnet() {
 async fn unsigned_announcement_does_not_write_peer_subnet() {
     use net::adapter::net::{SubnetPolicy, SubnetRule};
 
-    let ports = find_ports(2).await;
-    let a = build_node(ports[0]).await;
+    let a = build_node().await;
 
     // Receiver opts out of require_signed AND installs a subnet
     // policy whose rule maps `region:privileged` to a non-zero
@@ -663,7 +640,7 @@ async fn unsigned_announcement_does_not_write_peer_subnet() {
     // that subnet just by announcing the matching tag.
     let rule = SubnetRule::new("region:", 0).map("privileged", 1);
     let policy = SubnetPolicy::new().add_rule(rule);
-    let b = build_node_with(ports[1], |cfg| {
+    let b = build_node_with(|cfg| {
         cfg.with_require_signed_capabilities(false)
             .with_subnet_policy(Arc::new(policy))
     })

@@ -18,26 +18,14 @@ use net::adapter::net::{
     MeshNode, MeshNodeConfig, OnFailure, PermissionToken, PublishConfig, Reliability,
     SocketBufferConfig, TokenCache, TokenScope,
 };
-use tokio::net::UdpSocket;
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
 
-async fn find_ports(n: usize) -> Vec<u16> {
-    let mut ports = Vec::with_capacity(n);
-    let mut sockets = Vec::with_capacity(n);
-    for _ in 0..n {
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        ports.push(sock.local_addr().unwrap().port());
-        sockets.push(sock);
-    }
-    drop(sockets);
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    ports
-}
-
-fn test_config(port: u16) -> MeshNodeConfig {
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+fn test_config() -> MeshNodeConfig {
+    // Bind via `127.0.0.1:0` so the OS picks a free port — no
+    // pre-bind reservation, no TOCTOU race with parallel tests.
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut cfg = MeshNodeConfig::new(addr, PSK)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))
@@ -60,9 +48,9 @@ struct Node {
     registry: Arc<ChannelConfigRegistry>,
 }
 
-async fn build_node(port: u16) -> Node {
+async fn build_node() -> Node {
     let keypair = EntityKeypair::generate();
-    let cfg = test_config(port);
+    let cfg = test_config();
     let mut node = MeshNode::new(keypair.clone(), cfg)
         .await
         .expect("MeshNode::new");
@@ -110,14 +98,9 @@ where
 /// Handshake + start + both nodes announce capabilities so the
 /// publisher's peer_entity_ids has the subscriber's EntityId before
 /// any subscribe attempt.
-async fn setup_pair(
-    a_port: u16,
-    b_port: u16,
-    a_caps: CapabilitySet,
-    b_caps: CapabilitySet,
-) -> (Node, Node) {
-    let a = build_node(a_port).await;
-    let b = build_node(b_port).await;
+async fn setup_pair(a_caps: CapabilitySet, b_caps: CapabilitySet) -> (Node, Node) {
+    let a = build_node().await;
+    let b = build_node().await;
     handshake_no_start(&a.mesh, &b.mesh).await;
     a.mesh.start();
     b.mesh.start();
@@ -142,15 +125,7 @@ async fn setup_pair(
 
 #[tokio::test]
 async fn subscribe_denied_by_cap_filter() {
-    let ports = find_ports(2).await;
-    // B announces empty caps; A's channel requires `gpu` tag.
-    let (a, b) = setup_pair(
-        ports[0],
-        ports[1],
-        CapabilitySet::new(),
-        CapabilitySet::new(),
-    )
-    .await;
+    let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
 
     let name = ChannelName::new("lab/gpu").unwrap();
     let filter = CapabilityFilter::new().require_tag("gpu");
@@ -166,14 +141,7 @@ async fn subscribe_denied_by_cap_filter() {
 
 #[tokio::test]
 async fn subscribe_denied_by_missing_token() {
-    let ports = find_ports(2).await;
-    let (a, b) = setup_pair(
-        ports[0],
-        ports[1],
-        CapabilitySet::new(),
-        CapabilitySet::new(),
-    )
-    .await;
+    let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
 
     let name = ChannelName::new("lab/secret").unwrap();
     a.registry
@@ -189,14 +157,7 @@ async fn subscribe_denied_by_missing_token() {
 
 #[tokio::test]
 async fn subscribe_accepted_with_valid_token() {
-    let ports = find_ports(2).await;
-    let (a, b) = setup_pair(
-        ports[0],
-        ports[1],
-        CapabilitySet::new(),
-        CapabilitySet::new(),
-    )
-    .await;
+    let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
 
     let name = ChannelName::new("lab/signed").unwrap();
     a.registry
@@ -221,14 +182,7 @@ async fn subscribe_accepted_with_valid_token() {
 
 #[tokio::test]
 async fn subscribe_rejected_with_expired_token() {
-    let ports = find_ports(2).await;
-    let (a, b) = setup_pair(
-        ports[0],
-        ports[1],
-        CapabilitySet::new(),
-        CapabilitySet::new(),
-    )
-    .await;
+    let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
 
     let name = ChannelName::new("lab/short").unwrap();
     a.registry
@@ -255,14 +209,7 @@ async fn subscribe_rejected_with_expired_token() {
 
 #[tokio::test]
 async fn subscribe_rejected_with_wrong_subject_token() {
-    let ports = find_ports(2).await;
-    let (a, b) = setup_pair(
-        ports[0],
-        ports[1],
-        CapabilitySet::new(),
-        CapabilitySet::new(),
-    )
-    .await;
+    let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
 
     let name = ChannelName::new("lab/wrong").unwrap();
     a.registry
@@ -303,14 +250,7 @@ async fn rejected_subscribe_does_not_leak_token_into_shared_cache() {
     // attacker-controlled `(subject, channel_hash)` keys.
     //
     // The fix defers the insert until authorization passes.
-    let ports = find_ports(2).await;
-    let (a, b) = setup_pair(
-        ports[0],
-        ports[1],
-        CapabilitySet::new(),
-        CapabilitySet::new(),
-    )
-    .await;
+    let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
 
     let name = ChannelName::new("lab/leak").unwrap();
     a.registry
@@ -354,10 +294,7 @@ async fn rejected_subscribe_does_not_leak_token_into_shared_cache() {
 
 #[tokio::test]
 async fn publish_denied_by_own_cap_filter() {
-    let ports = find_ports(2).await;
     let (a, b) = setup_pair(
-        ports[0],
-        ports[1],
         CapabilitySet::new(), // A has NO `admin` tag
         CapabilitySet::new(),
     )
@@ -390,14 +327,7 @@ async fn publish_denied_by_own_cap_filter() {
 async fn unauth_channel_accepts_everyone() {
     // Backwards-compat regression: no subscribe_caps, no
     // publish_caps, no require_token → open channel.
-    let ports = find_ports(2).await;
-    let (a, b) = setup_pair(
-        ports[0],
-        ports[1],
-        CapabilitySet::new(),
-        CapabilitySet::new(),
-    )
-    .await;
+    let (a, b) = setup_pair(CapabilitySet::new(), CapabilitySet::new()).await;
 
     let name = ChannelName::new("lab/open").unwrap();
     a.registry

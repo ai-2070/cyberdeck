@@ -27,26 +27,14 @@ use net::adapter::net::{
     SocketBufferConfig, TokenCache, TokenScope,
 };
 use net::adapter::Adapter;
-use tokio::net::UdpSocket;
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
 
-async fn find_ports(n: usize) -> Vec<u16> {
-    let mut ports = Vec::with_capacity(n);
-    let mut sockets = Vec::with_capacity(n);
-    for _ in 0..n {
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        ports.push(sock.local_addr().unwrap().port());
-        sockets.push(sock);
-    }
-    drop(sockets);
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    ports
-}
-
-fn test_config(port: u16) -> MeshNodeConfig {
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+fn test_config() -> MeshNodeConfig {
+    // Bind via `127.0.0.1:0` so the OS picks a free port — no
+    // pre-bind reservation, no TOCTOU race with parallel tests.
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut cfg = MeshNodeConfig::new(addr, PSK)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))
@@ -70,13 +58,12 @@ struct Node {
     token_cache: Arc<TokenCache>,
 }
 
-async fn build_node(port: u16) -> Node {
-    build_node_with_cfg(port, test_config(port)).await
+async fn build_node() -> Node {
+    build_node_with_cfg(test_config()).await
 }
 
-async fn build_node_with_cfg(port: u16, cfg: MeshNodeConfig) -> Node {
+async fn build_node_with_cfg(cfg: MeshNodeConfig) -> Node {
     let keypair = EntityKeypair::generate();
-    let _ = port; // keypair + cfg are the load-bearing inputs
     let mut node = MeshNode::new(keypair.clone(), cfg)
         .await
         .expect("MeshNode::new");
@@ -141,9 +128,8 @@ async fn auth_guard_populated_on_open_channel_subscribe() {
     // Open channel (no auth required). `authorize_subscribe` takes
     // the accept path and calls `auth_guard.allow_channel`; we
     // observe it via `is_authorized_full`.
-    let ports = find_ports(2).await;
-    let a = build_node(ports[0]).await;
-    let b = build_node(ports[1]).await;
+    let a = build_node().await;
+    let b = build_node().await;
     handshake(&a.mesh, &b.mesh).await;
 
     let channel = ChannelName::new("auth/guarded").unwrap();
@@ -169,9 +155,8 @@ async fn auth_guard_populated_on_open_channel_subscribe() {
 
 #[tokio::test]
 async fn auth_guard_revoked_on_unsubscribe() {
-    let ports = find_ports(2).await;
-    let a = build_node(ports[0]).await;
-    let b = build_node(ports[1]).await;
+    let a = build_node().await;
+    let b = build_node().await;
     handshake(&a.mesh, &b.mesh).await;
 
     let channel = ChannelName::new("auth/unsub").unwrap();
@@ -210,9 +195,8 @@ async fn auth_guard_populated_for_token_gated_subscribe() {
     // before B arrives, so both sides exchange capability
     // announcements first. This mirrors the `setup_pair` helper in
     // `tests/channel_auth.rs`.
-    let ports = find_ports(2).await;
-    let a = build_node(ports[0]).await;
-    let b = build_node(ports[1]).await;
+    let a = build_node().await;
+    let b = build_node().await;
     handshake(&a.mesh, &b.mesh).await;
 
     a.mesh
@@ -274,9 +258,8 @@ async fn publish_skips_revoked_subscriber() {
     // A revokes B's guard entry directly. The next publish must
     // NOT attempt delivery to B — the fan-out filter drops
     // subscribers the guard denies.
-    let ports = find_ports(2).await;
-    let a = build_node(ports[0]).await;
-    let b = build_node(ports[1]).await;
+    let a = build_node().await;
+    let b = build_node().await;
     handshake(&a.mesh, &b.mesh).await;
 
     let channel = ChannelName::new("auth/revoke").unwrap();
@@ -325,9 +308,8 @@ async fn publish_admits_normal_subscriber() {
     // Regression for the fast path's happy case — an open channel
     // with a subscribed peer should publish normally. Keeps us
     // honest: AG-2 must not block valid deliveries by mistake.
-    let ports = find_ports(2).await;
-    let a = build_node(ports[0]).await;
-    let b = build_node(ports[1]).await;
+    let a = build_node().await;
+    let b = build_node().await;
     handshake(&a.mesh, &b.mesh).await;
 
     let channel = ChannelName::new("auth/happy").unwrap();
@@ -359,11 +341,11 @@ async fn publish_admits_normal_subscriber() {
 // AG-3 — token-expiry sweep evicts subscribers whose tokens have aged out
 // ============================================================================
 
-async fn build_node_fast_sweep(port: u16) -> Node {
+async fn build_node_fast_sweep() -> Node {
     // Tight sweep interval so tests don't wait 30 seconds for
     // eviction.
-    let cfg = test_config(port).with_token_sweep_interval(Duration::from_millis(200));
-    build_node_with_cfg(port, cfg).await
+    let cfg = test_config().with_token_sweep_interval(Duration::from_millis(200));
+    build_node_with_cfg(cfg).await
 }
 
 #[tokio::test]
@@ -371,9 +353,8 @@ async fn expired_token_evicts_subscriber_within_one_sweep() {
     // B subscribes with a 1-second token. After the TTL passes
     // AND the sweep runs, B's roster entry + AuthGuard entry are
     // gone.
-    let ports = find_ports(2).await;
-    let a = build_node_fast_sweep(ports[0]).await;
-    let b = build_node(ports[1]).await;
+    let a = build_node_fast_sweep().await;
+    let b = build_node().await;
     handshake(&a.mesh, &b.mesh).await;
 
     a.mesh
@@ -455,9 +436,9 @@ async fn expired_token_evicts_subscriber_within_one_sweep() {
     );
 }
 
-async fn build_node_sweep_disabled(port: u16) -> Node {
-    let cfg = test_config(port).with_token_sweep_interval(Duration::MAX);
-    build_node_with_cfg(port, cfg).await
+async fn build_node_sweep_disabled() -> Node {
+    let cfg = test_config().with_token_sweep_interval(Duration::MAX);
+    build_node_with_cfg(cfg).await
 }
 
 /// Regression for a cubic-flagged P1: when `token_sweep_interval`
@@ -470,9 +451,8 @@ async fn build_node_sweep_disabled(port: u16) -> Node {
 /// sweep-disabled branch end-to-end.
 #[tokio::test]
 async fn publish_skips_expired_subscriber_when_sweep_is_disabled() {
-    let ports = find_ports(2).await;
-    let a = build_node_sweep_disabled(ports[0]).await;
-    let b = build_node(ports[1]).await;
+    let a = build_node_sweep_disabled().await;
+    let b = build_node().await;
     handshake(&a.mesh, &b.mesh).await;
 
     a.mesh
@@ -583,15 +563,12 @@ async fn publish_skips_expired_subscriber_when_sweep_is_disabled() {
 // AG-4 — auth-failure rate limit throttles repeat offenders
 // ============================================================================
 
-async fn build_node_tight_rate_limit(port: u16) -> Node {
+async fn build_node_tight_rate_limit() -> Node {
     // 3 failures per window, 5s throttle, tight window so tests
     // don't wait minutes for a reset.
-    let cfg = test_config(port).with_auth_failure_limit(
-        3,
-        Duration::from_secs(10),
-        Duration::from_secs(5),
-    );
-    build_node_with_cfg(port, cfg).await
+    let cfg =
+        test_config().with_auth_failure_limit(3, Duration::from_secs(10), Duration::from_secs(5));
+    build_node_with_cfg(cfg).await
 }
 
 #[tokio::test]
@@ -603,9 +580,8 @@ async fn auth_failure_rate_limit_kicks_in() {
     // further ed25519 work.
     use net::adapter::net::behavior::capability::CapabilityFilter;
 
-    let ports = find_ports(2).await;
-    let a = build_node_tight_rate_limit(ports[0]).await;
-    let b = build_node(ports[1]).await;
+    let a = build_node_tight_rate_limit().await;
+    let b = build_node().await;
     handshake(&a.mesh, &b.mesh).await;
 
     a.mesh
@@ -664,9 +640,8 @@ async fn successful_subscribe_clears_failure_counter() {
     // auth failures (UnknownChannel), then successfully subscribes
     // to an open channel — the success path must clear the counter
     // so subsequent probes don't count against the old total.
-    let ports = find_ports(2).await;
-    let a = build_node_tight_rate_limit(ports[0]).await;
-    let b = build_node(ports[1]).await;
+    let a = build_node_tight_rate_limit().await;
+    let b = build_node().await;
     handshake(&a.mesh, &b.mesh).await;
 
     // Two subscribes to unknown channels — fail counter = 2.
@@ -778,9 +753,8 @@ fn tokio_interval_panics_on_zero_and_accepts_one_ms() {
 /// (e.g. a CLI accidentally lowering both intervals to zero).
 #[tokio::test]
 async fn start_tolerates_zero_gc_and_sweep_intervals() {
-    let ports = find_ports(1).await;
     let keypair = EntityKeypair::generate();
-    let cfg = test_config(ports[0])
+    let cfg = test_config()
         .with_capability_gc_interval(Duration::ZERO)
         .with_token_sweep_interval(Duration::ZERO);
     let mut node = MeshNode::new(keypair.clone(), cfg)
