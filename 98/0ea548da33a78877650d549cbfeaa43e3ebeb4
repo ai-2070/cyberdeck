@@ -1,0 +1,23 @@
+README.md
+  9dd91baf41ad3ddb 317
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "980ea548da33a78877650d549cbfeaa43e3ebeb4",
+  "prompts": {
+    "9dd91baf41ad3ddb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41773e95-80ac-459e-a612-84698892a467",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 7,
+      "total_deletions": 4,
+      "accepted_lines": 7,
+      "overriden_lines": 0
+    }
+  }
+}
