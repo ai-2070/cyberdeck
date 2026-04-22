@@ -831,6 +831,21 @@ pub struct MeshNode {
     /// separate discovery round-trip.
     #[cfg(feature = "nat-traversal")]
     reflex_addr: Arc<ArcSwapOption<SocketAddr>>,
+    /// Runtime flag: `true` when the current `reflex_addr` came
+    /// from an operator-set or port-mapper-installed override,
+    /// `false` when it came from classification observations.
+    /// When `true`, the classifier sweep short-circuits and
+    /// `reflex_addr` stays pinned until
+    /// [`Self::clear_reflex_override`] is called.
+    ///
+    /// Separate from `MeshNodeConfig::reflex_override` because the
+    /// config is moved into `MeshNode` at construction time and
+    /// can't be mutated afterward. A stage-4b `PortMapper` task
+    /// installs a mapping mid-session; this atomic is what lets
+    /// a `&self` setter turn the override on without racing the
+    /// announce-capabilities path.
+    #[cfg(feature = "nat-traversal")]
+    reflex_override_active: Arc<std::sync::atomic::AtomicBool>,
     /// Traversal tunables — probe timeouts, classification
     /// deadline, punch cadence, and port-mapping renewal interval.
     /// Defaults match `docs/NAT_TRAVERSAL_PLAN.md`. Exposed via
@@ -1102,6 +1117,10 @@ impl MeshNode {
                 Some(addr) => ArcSwapOption::from_pointee(addr),
                 None => ArcSwapOption::empty(),
             }),
+            #[cfg(feature = "nat-traversal")]
+            reflex_override_active: Arc::new(std::sync::atomic::AtomicBool::new(
+                initial_reflex_override.is_some(),
+            )),
             #[cfg(feature = "nat-traversal")]
             traversal_config: super::traversal::TraversalConfig::default(),
             #[cfg(feature = "nat-traversal")]
@@ -5556,6 +5575,68 @@ impl MeshNode {
         self.reflex_addr.load_full().map(|arc| *arc)
     }
 
+    /// Install a runtime reflex override. Forces `nat_class =
+    /// Open` and `reflex_addr = Some(external)` immediately, and
+    /// short-circuits any further classifier sweeps until
+    /// [`Self::clear_reflex_override`] is called.
+    ///
+    /// **Optimization, not correctness.** A node with no override
+    /// still reaches every peer through the routed-handshake
+    /// path; the override just pins the publicly-advertised
+    /// address when it's already known (port-forwarded server, a
+    /// successful stage-4 port-mapping install, etc).
+    ///
+    /// Safe to call concurrently with `announce_capabilities` —
+    /// the atomic + ArcSwap writes publish in order (override
+    /// flag first, then reflex address, then NAT class), so a
+    /// concurrent announce either sees the pre-override state or
+    /// the fully-installed override, never a torn mix.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn set_reflex_override(&self, external: SocketAddr) {
+        use std::sync::atomic::Ordering;
+        // Order matters: publish the reflex address + NAT class
+        // first, then flip the active flag. A concurrent reader
+        // that sees the flag set is guaranteed to see the
+        // already-installed reflex below.
+        self.reflex_addr.store(Some(Arc::new(external)));
+        self.nat_class.store(
+            super::traversal::classify::NatClass::Open.as_u8(),
+            Ordering::Release,
+        );
+        self.reflex_override_active.store(true, Ordering::Release);
+    }
+
+    /// Drop a previously-installed runtime reflex override. The
+    /// classifier sweep resumes on its normal cadence; the next
+    /// sweep repopulates `reflex_addr` and `nat_class` from real
+    /// probe observations. `reflex_addr` is cleared to `None`
+    /// immediately so a between-sweep read doesn't return a stale
+    /// override value as "still current."
+    ///
+    /// No-op when no override is active — safe to call
+    /// unconditionally during shutdown / port-mapping revoke
+    /// paths.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn clear_reflex_override(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.reflex_override_active.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        // Reset reflex_addr + nat_class to their pre-classification
+        // defaults so a caller reading immediately gets an honest
+        // "no current observation" answer rather than the stale
+        // override.
+        self.reflex_addr.store(None);
+        self.nat_class.store(
+            super::traversal::classify::NatClass::Unknown.as_u8(),
+            Ordering::Release,
+        );
+    }
+
     /// Send a `PunchRequest` to a coordinator peer `relay`, asking
     /// it to mediate a hole-punch to `target`. Returns the
     /// `PunchIntroduce` produced by the coordinator (the one
@@ -5723,7 +5804,10 @@ impl MeshNode {
         // reflex is the override. Running the multi-peer probe
         // sweep would only replace the overridden values with
         // (possibly worse) observations — skip it.
-        if self.config.reflex_override.is_some() {
+        if self
+            .reflex_override_active
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             return;
         }
 

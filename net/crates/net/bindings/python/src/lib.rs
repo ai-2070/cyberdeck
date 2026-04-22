@@ -1146,9 +1146,9 @@ mod mesh_bindings {
             }
             #[cfg(feature = "nat-traversal")]
             if let Some(external_str) = reflex_override {
-                let external: std::net::SocketAddr = external_str.parse().map_err(|e| {
-                    PyValueError::new_err(format!("invalid reflex_override: {e}"))
-                })?;
+                let external: std::net::SocketAddr = external_str
+                    .parse()
+                    .map_err(|e| PyValueError::new_err(format!("invalid reflex_override: {e}")))?;
                 config = config.with_reflex_override(external);
             }
             // Silently accept + ignore the kwarg in builds without

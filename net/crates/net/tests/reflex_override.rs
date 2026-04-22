@@ -202,6 +202,101 @@ async fn override_propagates_through_capability_broadcast() {
     );
 }
 
+/// Runtime setter: a node that started without an override can
+/// have one installed mid-session (the future stage-4b
+/// PortMapper path). After install, `nat_class` flips to `Open`,
+/// `reflex_addr` returns the installed address, and reclassify
+/// becomes a no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_set_reflex_override_flips_open() {
+    let ports = find_ports(3).await;
+    let a = build_mesh_plain(ports[0]).await;
+    let b = build_mesh_plain(ports[1]).await;
+    let c = build_mesh_plain(ports[2]).await;
+
+    connect_pair(&a, &b).await;
+    connect_pair(&a, &c).await;
+    a.start();
+    b.start();
+    c.start();
+
+    // Pre-override: plain classifier path. Start Unknown,
+    // classify on demand to Open via localhost reflex.
+    assert_eq!(a.nat_class(), NatClass::Unknown);
+    a.reclassify_nat().await;
+    assert_eq!(a.nat_class(), NatClass::Open);
+    assert_eq!(a.reflex_addr(), Some(a.local_addr()));
+
+    // Install a runtime override. `nat_class` stays Open but
+    // `reflex_addr` switches to the operator-supplied value.
+    let external: SocketAddr = "203.0.113.99:4242".parse().unwrap();
+    a.set_reflex_override(external);
+    assert_eq!(a.nat_class(), NatClass::Open);
+    assert_eq!(a.reflex_addr(), Some(external));
+
+    // Reclassify is now a no-op — the override is load-bearing
+    // regardless of how we got there.
+    a.reclassify_nat().await;
+    assert_eq!(a.nat_class(), NatClass::Open);
+    assert_eq!(a.reflex_addr(), Some(external));
+}
+
+/// Runtime clear: a previously-installed override drops back to
+/// `Unknown` + `None`, and the classifier resumes producing real
+/// observations on the next sweep. This is the port-mapper
+/// revoke path — a failed renewal yanks the override so the
+/// mesh doesn't keep advertising a defunct reflex.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_clear_reflex_override_resumes_classifier() {
+    let ports = find_ports(3).await;
+    let a = build_mesh_plain(ports[0]).await;
+    let b = build_mesh_plain(ports[1]).await;
+    let c = build_mesh_plain(ports[2]).await;
+
+    connect_pair(&a, &b).await;
+    connect_pair(&a, &c).await;
+    a.start();
+    b.start();
+    c.start();
+
+    // Install, then clear.
+    let external: SocketAddr = "203.0.113.99:4242".parse().unwrap();
+    a.set_reflex_override(external);
+    assert_eq!(a.nat_class(), NatClass::Open);
+    assert_eq!(a.reflex_addr(), Some(external));
+
+    a.clear_reflex_override();
+    // Immediately after clear: back to Unknown / None. The
+    // override value is gone so a concurrent announce can't
+    // stamp the defunct reflex onto an outbound packet.
+    assert_eq!(a.nat_class(), NatClass::Unknown);
+    assert!(a.reflex_addr().is_none());
+
+    // Classifier can now run and produce a real observation.
+    a.reclassify_nat().await;
+    assert_eq!(a.nat_class(), NatClass::Open);
+    assert_eq!(a.reflex_addr(), Some(a.local_addr()));
+}
+
+/// `clear_reflex_override` is a no-op when no override is
+/// active. Shutdown / revoke paths can call it unconditionally
+/// without first checking state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_clear_is_noop_when_no_override() {
+    let ports = find_ports(1).await;
+    let a = build_mesh_plain(ports[0]).await;
+
+    // State before: Unknown / None.
+    assert_eq!(a.nat_class(), NatClass::Unknown);
+    assert!(a.reflex_addr().is_none());
+
+    a.clear_reflex_override();
+
+    // State after: unchanged.
+    assert_eq!(a.nat_class(), NatClass::Unknown);
+    assert!(a.reflex_addr().is_none());
+}
+
 /// A plain mesh (no override) still uses the classifier path
 /// unchanged — Unknown until sweep, then Open via real probes.
 /// Regression guard: adding the override should not affect the
