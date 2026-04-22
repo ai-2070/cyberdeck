@@ -136,12 +136,14 @@ jobs:
         run: npm ci
 
       # Build napi binding with the features the vitest suite covers:
-      # `net` for the mesh surface + `cortex` for the CortEX / NetDB tests.
-      # `cortex` transitively enables redex + netdb via the binding's
-      # feature graph. Skip the `redis` default — the Node suite doesn't
-      # hit it, and pulling it in would need a service container.
+      # `net` for the mesh surface + `cortex` for the CortEX / NetDB tests
+      # + `compute` for the MeshDaemon / migration tests (Stage 3 + 4
+      # of SDK_COMPUTE_SURFACE_PLAN). `cortex` transitively enables
+      # redex + netdb via the binding's feature graph. Skip the
+      # `redis` default — the Node suite doesn't hit it, and pulling
+      # it in would need a service container.
       - name: Build native module
-        run: npm run build:debug -- --no-default-features --features net,cortex
+        run: npm run build:debug -- --no-default-features --features net,cortex,compute
 
       - name: Run tests
         run: npm test
@@ -187,10 +189,12 @@ jobs:
       - name: Install maturin and pytest
         run: pip install --upgrade pip maturin pytest
 
-      # `net,cortex` mirrors the Node binding's feature set; skip the
-      # default `redis` feature for the same reason.
+      # `net,cortex,compute` mirrors the Node binding's feature set;
+      # skip the default `redis` feature for the same reason. The
+      # `compute` feature is required for `test_compute.py` to
+      # import `CausalEvent` / `DaemonRuntime` / `MigrationHandle`.
       - name: Build and install bindings
-        run: maturin develop --no-default-features --features net,cortex
+        run: maturin develop --no-default-features --features net,cortex,compute
 
       - name: Run tests
         run: pytest -v
