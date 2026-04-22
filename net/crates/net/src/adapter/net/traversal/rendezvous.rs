@@ -190,13 +190,21 @@ pub struct Keepalive {
 
 /// Encode a keep-alive packet. Output length is always
 /// [`KEEPALIVE_LEN`].
+///
+/// All three fields are little-endian. An earlier revision mixed
+/// encodings (LE magic, BE body via `BytesMut::put_u64` /
+/// `put_u32`, which default to big-endian) — the round-trip
+/// worked within the crate because `decode_keepalive` used
+/// `from_be_bytes` for the body, but it diverged from the Net
+/// packet header (LE) and from every other wire field in the
+/// traversal path. Anyone reading the codec against the wire
+/// layout, or reusing these helpers outside the crate, would
+/// mis-correlate. Cubic flagged this as P2; unified on LE here.
 pub fn encode_keepalive(ka: &Keepalive) -> Bytes {
     let mut buf = BytesMut::with_capacity(KEEPALIVE_LEN);
-    // Magic is written little-endian so the receive-loop
-    // recognition check (also LE) compares the same bytes.
     buf.put_slice(&KEEPALIVE_MAGIC.to_le_bytes());
-    buf.put_u64(ka.sender_node_id);
-    buf.put_u32(ka.punch_id);
+    buf.put_u64_le(ka.sender_node_id);
+    buf.put_u32_le(ka.punch_id);
     debug_assert_eq!(buf.len(), KEEPALIVE_LEN);
     buf.freeze()
 }
@@ -205,6 +213,8 @@ pub fn encode_keepalive(ka: &Keepalive) -> Bytes {
 /// doesn't match or the magic prefix is wrong. A packet that
 /// fails this check isn't a keep-alive and should continue down
 /// the normal receive-loop dispatch path.
+///
+/// Matches [`encode_keepalive`]: little-endian throughout.
 pub fn decode_keepalive(data: &[u8]) -> Option<Keepalive> {
     if data.len() != KEEPALIVE_LEN {
         return None;
@@ -213,8 +223,8 @@ pub fn decode_keepalive(data: &[u8]) -> Option<Keepalive> {
     if magic != KEEPALIVE_MAGIC {
         return None;
     }
-    let sender_node_id = u64::from_be_bytes(data[2..10].try_into().ok()?);
-    let punch_id = u32::from_be_bytes(data[10..14].try_into().ok()?);
+    let sender_node_id = u64::from_le_bytes(data[2..10].try_into().ok()?);
+    let punch_id = u32::from_le_bytes(data[10..14].try_into().ok()?);
     Some(Keepalive {
         sender_node_id,
         punch_id,
@@ -633,6 +643,40 @@ mod tests {
             Some(out) => assert_eq!(out, ka),
             None => panic!("decode_keepalive returned None on a valid packet"),
         }
+    }
+
+    /// Regression test for a cubic-flagged P2 bug: an earlier
+    /// revision encoded the magic in LE but the body in BE (via
+    /// the default `BytesMut::put_u64` / `put_u32`). The intra-
+    /// crate round-trip worked because the decoder used
+    /// `from_be_bytes` to match, but the layout diverged from
+    /// every other wire field in the mesh (packet header / all
+    /// other traversal codecs are LE). Anyone reading the codec
+    /// against the wire dump, or reusing it outside this crate,
+    /// would mis-correlate. This test pins the layout to
+    /// little-endian throughout by asserting the exact byte
+    /// sequence for a known fixture.
+    #[test]
+    fn keepalive_byte_layout_is_all_little_endian() {
+        let ka = Keepalive {
+            sender_node_id: 0x0102_0304_0506_0708,
+            punch_id: 0x1A2B_3C4D,
+        };
+        let encoded = encode_keepalive(&ka);
+        let expected: [u8; 14] = [
+            // magic 0x4850 LE
+            0x50, 0x48,
+            // sender_node_id 0x0102030405060708 LE (least-significant byte first)
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+            // punch_id 0x1A2B3C4D LE
+            0x4D, 0x3C, 0x2B, 0x1A,
+        ];
+        assert_eq!(
+            &encoded[..],
+            &expected[..],
+            "keep-alive must be little-endian on the wire — \
+             mixing endianness with the packet header is fragile",
+        );
     }
 
     #[test]

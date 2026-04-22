@@ -395,33 +395,27 @@ async fn connect_direct_skip_punch_still_requires_reachable_coordinator() {
 /// optimization the plan promises never took effect.
 ///
 /// The fix makes the success branch attempt a direct handshake
-/// against the peer's advertised reflex; `punches_succeeded`
-/// only increments when that handshake lands. A failed direct
-/// handshake (post-`start()` recv-loop contention, peer not
-/// listening, etc.) falls back to the routed path and the stats
-/// flip to `relay_fallbacks`.
+/// against the peer's advertised reflex via the dispatch-loop
+/// routed-handshake path (which avoids the recv-loop contention
+/// that plain `connect()` has post-`start()`). On localhost a
+/// SinglePunch pair now actually lands a direct session:
+/// `punches_succeeded` increments AND `a.peer_addr(b_id)`
+/// resolves to B's bind, not the coordinator's.
 ///
-/// # What this test observes
+/// # Observable invariants
 ///
-/// Drive `connect_direct` through the `SinglePunch` branch
-/// (forced by pushing both endpoints' advertised `NatClass` to
-/// `Cone`, since loopback otherwise classifies as `Open` and
-/// collapses everything to `Direct`). In this setup the punch
-/// path *cannot* complete the direct handshake on localhost —
-/// both nodes' recv loops are running and there's no post-start
-/// accept primitive wired for the responder. That means the
-/// fix's "attempt direct; fall back on failure" control flow
-/// is exactly the path we exercise.
-///
-/// Under the old bug: `punches_succeeded == 1` (wrongly — the
-///   punch was never actually used).
-/// Under the fix:     `punches_succeeded == 0`, `relay_fallbacks
-///   == 1` (honest: punch ack landed, direct handshake didn't,
-///   relay fallback was taken).
-///
-/// The counter behavior cleanly distinguishes the two.
+/// - `punches_attempted` increments (Cone×Cone ran the punch).
+/// - `punches_succeeded` increments (ack + direct handshake
+///   both landed).
+/// - `relay_fallbacks` does NOT increment for this call.
+/// - `a.peer_addr(b_id) == Some(b.local_addr())` — the session
+///   transport is B's real address, not R's. **This is the
+///   load-bearing assertion:** under the pre-fix bug the
+///   transport was R's addr because `connect_routed()` was the
+///   last write to the peer map, even though `punches_succeeded`
+///   was bumped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn connect_direct_does_not_record_punch_success_when_direct_handshake_fails() {
+async fn connect_direct_upgrades_session_to_punched_path_on_success() {
     use net::adapter::net::traversal::classify::NatClass;
 
     let (a, r, b, _x) = punch_topology().await;
@@ -460,7 +454,7 @@ async fn connect_direct_does_not_record_punch_success_when_direct_handshake_fail
     let session_id = a
         .connect_direct(b_id, &b_pub, r.node_id())
         .await
-        .expect("connect_direct should still return Ok via the relay fallback");
+        .expect("connect_direct on SinglePunch pair should land on localhost");
     assert_eq!(session_id, b_id);
 
     let after = a.traversal_stats();
@@ -470,31 +464,35 @@ async fn connect_direct_does_not_record_punch_success_when_direct_handshake_fail
         before.punches_attempted + 1,
         "Cone×Cone should attempt a punch",
     );
-    // Load-bearing. Under the old bug this was
-    // `before.punches_succeeded + 1` because the fix was bypassed
-    // — the counter got bumped even though the data plane
-    // stayed on the relay.
     assert_eq!(
-        after.punches_succeeded, before.punches_succeeded,
-        "direct handshake on the punched path did not land — \
-         punches_succeeded must NOT increment. Under the pre-fix bug \
-         this counter would wrongly be +1 and the caller would think \
-         it had a direct session when in fact the session runs over \
-         the relay.",
+        after.punches_succeeded,
+        before.punches_succeeded + 1,
+        "ack + direct handshake both landed — punches_succeeded \
+         must increment. The bug this regression guards against \
+         is the OPPOSITE shape (counter bumped without a direct \
+         session); see the peer_addr assertion below.",
     );
     assert_eq!(
-        after.relay_fallbacks,
-        before.relay_fallbacks + 1,
-        "failed direct handshake on the punched path must fall back \
-         to relay and bump relay_fallbacks",
+        after.relay_fallbacks, before.relay_fallbacks,
+        "successful punch must not also bump relay_fallbacks",
     );
 
-    // And the session's transport is R's addr (relay path),
-    // matching relay_fallbacks being what actually happened.
+    // Load-bearing. Under the pre-fix bug (cubic P1) the session
+    // transport was R's addr because `connect_direct` fell
+    // through to `connect_routed()` after bumping
+    // `punches_succeeded`. The fix routes the post-ack handshake
+    // directly to B's reflex, so peer_addr is B's real bind.
     assert_eq!(
         a.peer_addr(b_id),
+        Some(b_bind),
+        "after a successful punch, A's session to B must use B's \
+         reflex directly — not the coordinator's address. If this \
+         is R's addr, the punch succeeded in stats but the data \
+         plane still goes via the coordinator.",
+    );
+    assert_ne!(
+        a.peer_addr(b_id),
         Some(r.local_addr()),
-        "session transport should be R's address — the relay path \
-         that the fallback established",
+        "session transport must not equal the coordinator R's addr",
     );
 }

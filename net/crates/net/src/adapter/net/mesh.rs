@@ -180,7 +180,8 @@ struct DispatchCtx {
     /// replaces the pending entry and the previous caller sees
     /// `ReflexTimeout`.
     #[cfg(feature = "nat-traversal")]
-    pending_reflex_probes: Arc<DashMap<u64, tokio::sync::oneshot::Sender<std::net::SocketAddr>>>,
+    pending_reflex_probes:
+        Arc<DashMap<u64, (u64, tokio::sync::oneshot::Sender<std::net::SocketAddr>)>>,
     /// Waiters for incoming `PunchIntroduce` messages, keyed by
     /// the counterpart endpoint's `node_id` (the `peer` field in
     /// the introduce). Mirrors `pending_reflex_probes` — the
@@ -188,15 +189,28 @@ struct DispatchCtx {
     /// lands; a message with no waiter is dropped silently.
     #[cfg(feature = "nat-traversal")]
     pending_punch_introduces: Arc<
-        DashMap<u64, tokio::sync::oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>>,
+        DashMap<
+            u64,
+            (
+                u64,
+                tokio::sync::oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>,
+            ),
+        >,
     >,
     /// Waiters for incoming `PunchAck` messages, keyed by the
     /// sender's `node_id` (the `from_peer` field in the ack).
     /// `connect_direct`'s `SinglePunch` path awaits on this map
     /// to confirm the peer completed their side of the punch.
     #[cfg(feature = "nat-traversal")]
-    pending_punch_acks:
-        Arc<DashMap<u64, tokio::sync::oneshot::Sender<super::traversal::rendezvous::PunchAck>>>,
+    pending_punch_acks: Arc<
+        DashMap<
+            u64,
+            (
+                u64,
+                tokio::sync::oneshot::Sender<super::traversal::rendezvous::PunchAck>,
+            ),
+        >,
+    >,
     /// Keep-alive observers, keyed by the `SocketAddr` of the
     /// counterpart's `peer_reflex`. Fired by the receive loop
     /// when a matching `Keepalive`-formatted packet arrives;
@@ -893,7 +907,7 @@ pub struct MeshNode {
     /// `MeshNode`. Details on the field's usage in the
     /// `DispatchCtx` docstring.
     #[cfg(feature = "nat-traversal")]
-    pending_reflex_probes: Arc<DashMap<u64, oneshot::Sender<std::net::SocketAddr>>>,
+    pending_reflex_probes: Arc<DashMap<u64, (u64, oneshot::Sender<std::net::SocketAddr>)>>,
     /// In-flight rendezvous handshakes keyed by the *counterpart*
     /// endpoint's `node_id` — i.e. the `peer` field in the
     /// incoming `PunchIntroduce`. The coordinator-side fanout
@@ -902,15 +916,39 @@ pub struct MeshNode {
     /// observe an introduce install an entry here via the
     /// stage-3c surface before calling the coordinator.
     #[cfg(feature = "nat-traversal")]
-    pending_punch_introduces:
-        Arc<DashMap<u64, oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>>>,
+    pending_punch_introduces: Arc<
+        DashMap<
+            u64,
+            (
+                u64,
+                oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>,
+            ),
+        >,
+    >,
     /// In-flight punch acknowledgements keyed by the *sender*
     /// endpoint's `node_id` — i.e. the `from_peer` field on the
     /// arriving `PunchAck`. `connect_direct` awaits this map on
     /// the `SinglePunch` path so `punches_succeeded` only bumps
     /// when the peer actually confirmed the punch.
     #[cfg(feature = "nat-traversal")]
-    pending_punch_acks: Arc<DashMap<u64, oneshot::Sender<super::traversal::rendezvous::PunchAck>>>,
+    pending_punch_acks: Arc<
+        DashMap<
+            u64,
+            (
+                u64,
+                oneshot::Sender<super::traversal::rendezvous::PunchAck>,
+            ),
+        >,
+    >,
+    /// Monotonic counter for waiter generations used by the
+    /// three `pending_*` maps above. Each insert stamps its
+    /// entry with a unique `gen`; removal is a `remove_if` check
+    /// that the entry's gen matches ours. Without this, a
+    /// timeout cleanup racing a concurrent replacement could
+    /// evict the new waiter — a cubic-flagged P1 bug
+    /// (`connect_direct` + `request_punch` both affected).
+    #[cfg(feature = "nat-traversal")]
+    next_waiter_gen: Arc<std::sync::atomic::AtomicU64>,
     /// Keep-alive observers for in-progress punches, keyed by
     /// the `SocketAddr` we're watching for inbound traffic (the
     /// counterpart's `peer_reflex`). The receive loop fires the
@@ -1205,6 +1243,8 @@ impl MeshNode {
             pending_punch_introduces: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
             pending_punch_acks: Arc::new(DashMap::new()),
+            #[cfg(feature = "nat-traversal")]
+            next_waiter_gen: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             #[cfg(feature = "nat-traversal")]
             punch_observers: Arc::new(DashMap::new()),
             #[cfg(feature = "nat-traversal")]
@@ -2737,7 +2777,7 @@ impl MeshNode {
                     // Complete the pending probe (if any). A probe
                     // that already timed out has no oneshot entry;
                     // the late response is dropped silently.
-                    if let Some((_, tx)) = ctx.pending_reflex_probes.remove(&from_node) {
+                    if let Some((_, (_gen, tx))) = ctx.pending_reflex_probes.remove(&from_node) {
                         let _ = tx.send(observed);
                     }
                 }
@@ -2787,7 +2827,9 @@ impl MeshNode {
                     // sees inbound traffic from `peer_reflex`
                     // (or — on localhost — at the punch_deadline
                     // fallback). Plan §3 endpoint semantics.
-                    if let Some((_, tx)) = ctx.pending_punch_introduces.remove(&intro.peer) {
+                    if let Some((_, (_gen, tx))) =
+                        ctx.pending_punch_introduces.remove(&intro.peer)
+                    {
                         let _ = tx.send(intro);
                     }
                     Self::schedule_punch(from_node, intro, ctx);
@@ -2798,7 +2840,9 @@ impl MeshNode {
                         // oneshot keyed by `from_peer`. A late ack
                         // for an abandoned `connect_direct` is
                         // dropped silently.
-                        if let Some((_, tx)) = ctx.pending_punch_acks.remove(&ack.from_peer) {
+                        if let Some((_, (_gen, tx))) =
+                            ctx.pending_punch_acks.remove(&ack.from_peer)
+                        {
                             let _ = tx.send(ack);
                         }
                     } else {
@@ -4978,7 +5022,7 @@ impl MeshNode {
         // Require the peer to have announced a reflex — the
         // rendezvous coordinator needs it too, and it's our
         // fast-fail signal that the peer is discoverable at all.
-        let _peer_reflex = self
+        let peer_reflex = self
             .peer_reflex_addr(peer_node_id)
             .ok_or(TraversalError::PeerNotReachable)?;
 
@@ -5006,10 +5050,44 @@ impl MeshNode {
                 .ok_or(TraversalError::PeerNotReachable)
         };
 
-        // Small helper: open a relayed session via the
-        // coordinator. Idempotent — a pre-existing session with
-        // `peer_node_id` short-circuits with `Ok(peer_node_id)`
-        // so back-to-back `connect_direct` calls don't error out.
+        // Helper: `true` iff we already have a session with
+        // `peer_node_id` whose transport points at `want_addr`.
+        // Used by the branches below to decide whether to
+        // short-circuit (session is already on the path we want)
+        // vs. re-handshake to upgrade (session exists but on the
+        // wrong path — typically a relayed session that a fresh
+        // direct/punched attempt should replace). Cubic P1
+        // flagged that unconditionally short-circuiting on any
+        // existing session left callers stuck on the relay
+        // forever, defeating the optimization.
+        let session_matches = |want_addr: std::net::SocketAddr| {
+            self.peers
+                .get(&peer_node_id)
+                .map(|e| e.value().addr == want_addr)
+                .unwrap_or(false)
+        };
+
+        // Helper: open a session directly to `target_addr` by
+        // wrapping msg1 in a routing header and sending straight
+        // to the peer. Works for `Direct` (target_addr = peer_reflex)
+        // and for post-punch upgrade (same). Uses the dispatch-
+        // loop pending_handshakes path via `connect_via`, which
+        // avoids recv-loop contention on a post-`start()` node.
+        let connect_on_direct_path = |target_addr: std::net::SocketAddr| async move {
+            if session_matches(target_addr) {
+                return Ok(peer_node_id);
+            }
+            self.connect_via(target_addr, peer_pubkey, peer_node_id)
+                .await
+                .map_err(|e| TraversalError::Transport(e.to_string()))
+        };
+
+        // Helper: open a relayed session via the coordinator.
+        // Short-circuits only when an existing session is already
+        // on THIS coordinator's path — a session already on the
+        // target coordinator's path is the outcome we want, but
+        // a session on some other path (direct / another relay)
+        // is preserved untouched (don't downgrade).
         let connect_via_coordinator = |coord_addr: std::net::SocketAddr| async move {
             if self.peers.contains_key(&peer_node_id) {
                 return Ok(peer_node_id);
@@ -5019,35 +5097,33 @@ impl MeshNode {
                 .map_err(|e| TraversalError::Transport(e.to_string()))
         };
 
-        // Small helper: open a direct session using the punched
-        // path. Same idempotency as `connect_via_coordinator`.
-        // Returns `Err` on handshake failure — caller falls back
-        // to relay to still produce a usable session.
-        let connect_on_punched_path = |peer_reflex: std::net::SocketAddr| async move {
-            if self.peers.contains_key(&peer_node_id) {
-                return Ok(peer_node_id);
-            }
-            self.connect(peer_reflex, peer_pubkey, peer_node_id)
-                .await
-                .map_err(|e| TraversalError::Transport(e.to_string()))
-        };
-
         match action {
             PairAction::Direct => {
                 // `Direct` pairs (Open/Open, Open/Cone,
                 // Open/Unknown, Unknown/Unknown, etc.) don't
-                // need the coordinator — the routing table's
-                // first-hop is enough to reach the peer. Use
-                // the public `connect_routed` helper which
-                // looks up that first-hop itself and error-
-                // wraps cleanly if no route is cached.
+                // need the coordinator — the peer is publicly
+                // reachable at its advertised reflex. Send the
+                // routed-handshake packet straight to
+                // `peer_reflex`; the peer's dispatch loop sees
+                // `dest == self` and completes locally. Only
+                // when that direct attempt fails do we try the
+                // routing table's first-hop as a fallback
+                // (pingwave-installed routes, etc.). Cubic P2:
+                // the earlier implementation always went via
+                // the routing table, which added an unnecessary
+                // relay hop when a direct path was available.
                 self.traversal_stats.record_relay_fallback();
-                if self.peers.contains_key(&peer_node_id) {
-                    return Ok(peer_node_id);
+                match connect_on_direct_path(peer_reflex).await {
+                    Ok(id) => Ok(id),
+                    Err(_) => {
+                        if self.peers.contains_key(&peer_node_id) {
+                            return Ok(peer_node_id);
+                        }
+                        self.connect_routed(peer_pubkey, peer_node_id)
+                            .await
+                            .map_err(|e| TraversalError::Transport(e.to_string()))
+                    }
                 }
-                self.connect_routed(peer_pubkey, peer_node_id)
-                    .await
-                    .map_err(|e| TraversalError::Transport(e.to_string()))
             }
             PairAction::SkipPunch => {
                 // Symmetric × Symmetric (and Symmetric ×
@@ -5070,9 +5146,15 @@ impl MeshNode {
 
                 // Install the PunchAck waiter BEFORE firing the
                 // request so a fast round-trip can't beat us to
-                // the correlation map.
+                // the correlation map. Generation-stamped so
+                // cleanup paths below only evict our own entry,
+                // not a racing concurrent call.
                 let (ack_tx, ack_rx) = oneshot::channel();
-                self.pending_punch_acks.insert(peer_node_id, ack_tx);
+                let ack_gen = self
+                    .next_waiter_gen
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.pending_punch_acks
+                    .insert(peer_node_id, (ack_gen, ack_tx));
 
                 let punch_outcome = self
                     .request_punch(coordinator, peer_node_id, self_reflex)
@@ -5094,7 +5176,7 @@ impl MeshNode {
                         let deadline = self.traversal_config.punch_deadline;
                         match tokio::time::timeout(deadline, ack_rx).await {
                             Ok(Ok(_ack)) => {
-                                match connect_on_punched_path(intro.peer_reflex).await {
+                                match connect_on_direct_path(intro.peer_reflex).await {
                                     Ok(id) => {
                                         self.traversal_stats.record_punch_success();
                                         Ok(id)
@@ -5111,8 +5193,18 @@ impl MeshNode {
                                     }
                                 }
                             }
-                            Ok(Err(_)) | Err(_) => {
-                                self.pending_punch_acks.remove(&peer_node_id);
+                            Ok(Err(_)) => {
+                                // Our sender was replaced by a
+                                // concurrent call — the map
+                                // entry is now theirs, do NOT
+                                // remove. Fall through to relay
+                                // on our side.
+                                self.traversal_stats.record_relay_fallback();
+                                connect_via_coordinator(coord).await
+                            }
+                            Err(_) => {
+                                self.pending_punch_acks
+                                    .remove_if(&peer_node_id, |_, (g, _)| *g == ack_gen);
                                 self.traversal_stats.record_relay_fallback();
                                 connect_via_coordinator(coord).await
                             }
@@ -5121,9 +5213,11 @@ impl MeshNode {
                     Err(_) => {
                         // Coordinator mediation failed — no
                         // point waiting for an ack that will
-                        // never come. Evict the waiter + record
-                        // the fallback and continue.
-                        self.pending_punch_acks.remove(&peer_node_id);
+                        // never come. Evict the waiter only if
+                        // it's still ours (a concurrent call may
+                        // have replaced it; cubic P1).
+                        self.pending_punch_acks
+                            .remove_if(&peer_node_id, |_, (g, _)| *g == ack_gen);
                         self.traversal_stats.record_relay_fallback();
                         connect_via_coordinator(coord).await
                     }
@@ -5823,8 +5917,15 @@ impl MeshNode {
         // previously-in-flight probe to the same peer is
         // overwritten — its waiter will hit ReflexTimeout, which
         // matches the "one probe per peer in flight" contract.
+        //
+        // Stamp each waiter with a unique generation so our
+        // timeout cleanup only evicts *our* entry, not a racing
+        // replacement. See `next_waiter_gen` doc for the race.
         let (tx, rx) = oneshot::channel();
-        self.pending_reflex_probes.insert(peer_node_id, tx);
+        let gen = self
+            .next_waiter_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pending_reflex_probes.insert(peer_node_id, (gen, tx));
 
         // Empty-body event frame on the reflex subprotocol.
         let body = reflex::encode_request();
@@ -5832,7 +5933,8 @@ impl MeshNode {
             .send_subprotocol(peer_addr, super::traversal::SUBPROTOCOL_REFLEX, &body)
             .await
         {
-            self.pending_reflex_probes.remove(&peer_node_id);
+            self.pending_reflex_probes
+                .remove_if(&peer_node_id, |_, (g, _)| *g == gen);
             return Err(TraversalError::Transport(e.to_string()));
         }
 
@@ -5842,11 +5944,13 @@ impl MeshNode {
             Ok(Err(_recv_err)) => {
                 // oneshot cancelled — treat as timeout. Only
                 // happens if a concurrent probe to the same peer
-                // replaced our sender.
+                // replaced our sender; the replacement owns the
+                // map entry now and we must NOT touch it.
                 Err(TraversalError::ReflexTimeout)
             }
             Err(_elapsed) => {
-                self.pending_reflex_probes.remove(&peer_node_id);
+                self.pending_reflex_probes
+                    .remove_if(&peer_node_id, |_, (g, _)| *g == gen);
                 Err(TraversalError::ReflexTimeout)
             }
         }
@@ -6007,8 +6111,17 @@ impl MeshNode {
         // otherwise arrive before the oneshot is registered.
         // Keyed by `target` because the introduce we'll receive
         // has `peer = target` in its body.
+        //
+        // Generation-stamped so our cleanup only evicts our own
+        // entry — a concurrent `request_punch` to the same
+        // target installs a new entry (and drops our sender),
+        // and that replacement must survive our timeout/send-
+        // failure remove. (Cubic P1.)
         let (tx, rx) = oneshot::channel();
-        self.pending_punch_introduces.insert(target, tx);
+        let gen = self
+            .next_waiter_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pending_punch_introduces.insert(target, (gen, tx));
 
         let body = RendezvousMsg::PunchRequest(PunchRequest {
             target,
@@ -6019,7 +6132,8 @@ impl MeshNode {
             .send_subprotocol(relay_addr, super::traversal::SUBPROTOCOL_RENDEZVOUS, &body)
             .await
         {
-            self.pending_punch_introduces.remove(&target);
+            self.pending_punch_introduces
+                .remove_if(&target, |_, (g, _)| *g == gen);
             return Err(TraversalError::Transport(e.to_string()));
         }
 
@@ -6028,11 +6142,13 @@ impl MeshNode {
             Ok(Ok(intro)) => Ok(intro),
             Ok(Err(_recv_err)) => {
                 // oneshot cancelled — another request_punch to the
-                // same target replaced our sender.
+                // same target replaced our sender. Don't touch the
+                // map: the replacement owns the entry now.
                 Err(TraversalError::PunchFailed)
             }
             Err(_elapsed) => {
-                self.pending_punch_introduces.remove(&target);
+                self.pending_punch_introduces
+                    .remove_if(&target, |_, (g, _)| *g == gen);
                 Err(TraversalError::PunchFailed)
             }
         }
@@ -6058,13 +6174,17 @@ impl MeshNode {
     {
         use super::traversal::TraversalError;
         let (tx, rx) = oneshot::channel();
-        self.pending_punch_introduces.insert(counterpart, tx);
+        let gen = self
+            .next_waiter_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pending_punch_introduces.insert(counterpart, (gen, tx));
         let deadline = self.traversal_config.punch_deadline;
         match tokio::time::timeout(deadline, rx).await {
             Ok(Ok(intro)) => Ok(intro),
             Ok(Err(_)) => Err(TraversalError::PunchFailed),
             Err(_) => {
-                self.pending_punch_introduces.remove(&counterpart);
+                self.pending_punch_introduces
+                    .remove_if(&counterpart, |_, (g, _)| *g == gen);
                 Err(TraversalError::PunchFailed)
             }
         }
@@ -6091,13 +6211,17 @@ impl MeshNode {
     ) -> Result<super::traversal::rendezvous::PunchAck, super::traversal::TraversalError> {
         use super::traversal::TraversalError;
         let (tx, rx) = oneshot::channel();
-        self.pending_punch_acks.insert(counterpart, tx);
+        let gen = self
+            .next_waiter_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pending_punch_acks.insert(counterpart, (gen, tx));
         let deadline = self.traversal_config.punch_deadline;
         match tokio::time::timeout(deadline, rx).await {
             Ok(Ok(ack)) => Ok(ack),
             Ok(Err(_)) => Err(TraversalError::PunchFailed),
             Err(_) => {
-                self.pending_punch_acks.remove(&counterpart);
+                self.pending_punch_acks
+                    .remove_if(&counterpart, |_, (g, _)| *g == gen);
                 Err(TraversalError::PunchFailed)
             }
         }
