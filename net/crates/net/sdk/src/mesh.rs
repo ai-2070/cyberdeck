@@ -116,6 +116,10 @@ pub struct MeshBuilder {
     identity: Option<crate::identity::Identity>,
     subnet: Option<net::adapter::net::SubnetId>,
     subnet_policy: Option<Arc<net::adapter::net::SubnetPolicy>>,
+    #[cfg(feature = "nat-traversal")]
+    reflex_override: Option<SocketAddr>,
+    #[cfg(feature = "port-mapping")]
+    try_port_mapping: bool,
 }
 
 impl MeshBuilder {
@@ -133,6 +137,10 @@ impl MeshBuilder {
             identity: None,
             subnet: None,
             subnet_policy: None,
+            #[cfg(feature = "nat-traversal")]
+            reflex_override: None,
+            #[cfg(feature = "port-mapping")]
+            try_port_mapping: false,
         })
     }
 
@@ -195,6 +203,62 @@ impl MeshBuilder {
         self
     }
 
+    /// Pin this mesh's publicly-advertised reflex `SocketAddr` to
+    /// the supplied external address. The classifier's background
+    /// sweep is skipped; the node starts in `NatClass::Open` with
+    /// `reflex_addr = Some(external)` on outbound capability
+    /// announcements.
+    ///
+    /// Intended for:
+    ///
+    /// - **Port-forwarded servers.** An operator who has manually
+    ///   configured a port forward knows the external address and
+    ///   shouldn't wait on peer-probing to discover it.
+    /// - **Stage-4 port mapping (UPnP / NAT-PMP / PCP).** A
+    ///   successful mapping installation will set this on behalf
+    ///   of the caller.
+    ///
+    /// **Optimization, not correctness.** Nodes without an
+    /// override still reach every peer through the routed-
+    /// handshake path — the override just cuts the classifier
+    /// round-trip when the answer is already known.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn reflex_override(mut self, external: SocketAddr) -> Self {
+        self.reflex_override = Some(external);
+        self
+    }
+
+    /// Opt into opportunistic UPnP-IGD / NAT-PMP / PCP port
+    /// mapping at startup. When set, the mesh spawns a
+    /// [`PortMapperTask`](net::adapter::net::traversal::portmap)
+    /// during `start()` that:
+    ///
+    /// 1. Probes NAT-PMP against the OS-discovered default
+    ///    gateway (1 s deadline).
+    /// 2. Falls back to UPnP via SSDP discovery (2 s deadline).
+    /// 3. On install success, pins the reflex override to the
+    ///    mapped external address — the mesh advertises itself
+    ///    as `Open` to peers without a classifier round-trip.
+    /// 4. Renews every 30 min; revokes on shutdown; falls back
+    ///    to the classifier on three consecutive renewal
+    ///    failures.
+    ///
+    /// **Optimization, not correctness.** A node whose router
+    /// doesn't speak UPnP / NAT-PMP still reaches every peer
+    /// through the routed-handshake path. Off by default
+    /// because port mapping modifies state on the operator's
+    /// router.
+    ///
+    /// Requires the `port-mapping` cargo feature. The flag is
+    /// silently ignored when the feature is off.
+    #[cfg(feature = "port-mapping")]
+    pub fn try_port_mapping(mut self, enabled: bool) -> Self {
+        self.try_port_mapping = enabled;
+        self
+    }
+
     /// Build the mesh node.
     pub async fn build(self) -> Result<Mesh> {
         // Use the caller's identity if one was set, otherwise mint an
@@ -215,6 +279,14 @@ impl MeshBuilder {
         }
         if let Some(policy) = self.subnet_policy {
             config = config.with_subnet_policy(policy);
+        }
+        #[cfg(feature = "nat-traversal")]
+        if let Some(external) = self.reflex_override {
+            config = config.with_reflex_override(external);
+        }
+        #[cfg(feature = "port-mapping")]
+        if self.try_port_mapping {
+            config = config.with_try_port_mapping(true);
         }
 
         let mut node = MeshNode::new(keypair, config).await?;
@@ -732,6 +804,192 @@ impl Mesh {
     /// keypair).
     pub fn identity(&self) -> Option<&crate::identity::Identity> {
         self.identity.as_ref()
+    }
+
+    // ── NAT traversal ──────────────────────────────────────────
+    //
+    // Framing (load-bearing — see `docs/NAT_TRAVERSAL_PLAN.md`
+    // stage 5): every user-visible docstring here must position
+    // NAT traversal as **optimization, not correctness**. Nodes
+    // behind NAT can always talk through the mesh's routed-
+    // handshake path. These APIs let the mesh upgrade to a
+    // *direct* path when the underlying NATs allow it, cutting
+    // relay hops out of the data plane. A `nat_type` of
+    // `symmetric` or a `PunchFailed` error is not a
+    // connectivity failure — it just means traffic keeps
+    // riding the relay.
+    //
+    // Anti-phrasings to avoid: "required for NATed peers",
+    // "enables cross-NAT connectivity", "fixes NAT issues."
+    // Each of these implies the mesh otherwise can't reach
+    // NATed peers, which is false.
+
+    /// Current NAT classification for this mesh's public face,
+    /// as observed against other peers during the classification
+    /// sweep. One of `Open`, `Cone`, `Symmetric`, or `Unknown`
+    /// (pre-sweep or insufficient data).
+    ///
+    /// **Optimization, not correctness.** A `Symmetric`
+    /// classification doesn't prevent this mesh from
+    /// communicating with any peer — it just means the direct-
+    /// punch optimization is unlikely to succeed against some
+    /// peers, and traffic will keep riding the routed path.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn nat_type(&self) -> net::adapter::net::traversal::classify::NatClass {
+        self.node.nat_class()
+    }
+
+    /// This mesh's public-facing `SocketAddr` as observed by a
+    /// remote peer, or `None` before the first classification
+    /// sweep has produced an observation.
+    ///
+    /// Piggybacks on outbound `CapabilityAnnouncement`s so peers
+    /// can attempt a direct-connect without a separate
+    /// discovery round-trip. Read by peers implementing the
+    /// `connect_direct` rendezvous path.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn reflex_addr(&self) -> Option<SocketAddr> {
+        self.node.reflex_addr()
+    }
+
+    /// The NAT classification most recently advertised by
+    /// `peer_node_id` (parsed from the `nat:*` tag on their
+    /// capability announcement). Returns `NatClass::Unknown`
+    /// when the peer hasn't announced or was compiled without
+    /// NAT traversal — the pair-type matrix treats Unknown as
+    /// "attempt direct, fall back on failure," not as
+    /// "don't attempt."
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn peer_nat_type(
+        &self,
+        peer_node_id: u64,
+    ) -> net::adapter::net::traversal::classify::NatClass {
+        self.node.peer_nat_class(peer_node_id)
+    }
+
+    /// Send one reflex probe to `peer_node_id` and return the
+    /// public `SocketAddr` the peer observed on the probe's UDP
+    /// envelope. Useful for tests and for operators diagnosing a
+    /// NAT-type classification that seems off.
+    ///
+    /// Times out after `TraversalConfig::reflex_timeout` (3 s
+    /// default) on network delays, and fast-fails with
+    /// `peer-not-reachable` on an unknown peer.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn probe_reflex(&self, peer_node_id: u64) -> Result<SocketAddr> {
+        Ok(self.node.probe_reflex(peer_node_id).await?)
+    }
+
+    /// Explicitly re-run the NAT classification sweep against
+    /// this node's currently-connected peers. Normally the
+    /// background loop (spawned by `start()`) takes care of
+    /// this; call this after a suspected NAT rebind (e.g. a
+    /// gateway reboot) to accelerate the re-classification.
+    ///
+    /// No-op when fewer than 2 peers are connected — the
+    /// two-probe rule needs two distinct targets to produce a
+    /// classification. Never returns an error; a failed sweep
+    /// leaves the previous classification intact.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn reclassify_nat(&self) {
+        self.node.reclassify_nat().await
+    }
+
+    /// Establish a session to `peer_node_id` via the rendezvous
+    /// path, using the pair-type matrix to decide between a
+    /// direct handshake and a relay-coordinated punch. The
+    /// returned session is equivalent in correctness to
+    /// `connect()` — the *only* difference is that a
+    /// `connect_direct` that lands on the punched path cuts
+    /// relay hops out of the data plane.
+    ///
+    /// **Optimization, not correctness.** `connect_direct`
+    /// always resolves: on a punch-failed outcome, the session
+    /// is established via the routed-handshake fallback.
+    /// Inspect `traversal_stats()` afterward to distinguish a
+    /// successful punch from a relay fallback.
+    ///
+    /// `coordinator` names a peer we already have a session
+    /// with — typically a stable relay-capable node. The
+    /// coordinator mediates the introduction; it doesn't carry
+    /// user-plane traffic once the punch succeeds.
+    ///
+    /// Fails with an `SdkError::Traversal` variant whose `kind`
+    /// is `peer-not-reachable` (no cached reflex for `peer`),
+    /// `transport` (socket-level error on the final handshake),
+    /// or (internal, retried on fallback) `punch-failed`.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn connect_direct(
+        &self,
+        peer_node_id: u64,
+        peer_pubkey: &[u8; 32],
+        coordinator: u64,
+    ) -> Result<()> {
+        self.node
+            .connect_direct(peer_node_id, peer_pubkey, coordinator)
+            .await?;
+        Ok(())
+    }
+
+    /// Cumulative counters for this mesh's NAT-traversal
+    /// activity: punch attempts, successful punches, and relay
+    /// fallbacks. Monotonic — counters never reset. Useful for
+    /// diagnostics + telemetry (success rate, relay load
+    /// trends).
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn traversal_stats(&self) -> net::adapter::net::traversal::TraversalStatsSnapshot {
+        self.node.traversal_stats()
+    }
+
+    /// Install a runtime reflex override. Forces `nat_type() =
+    /// "open"` and `reflex_addr() = Some(external)` immediately,
+    /// short-circuiting any further classifier sweeps.
+    ///
+    /// Intended for operator-driven updates — a port-forward
+    /// that went live mid-session, or a stage-4 port-mapping
+    /// task that just installed a UPnP / NAT-PMP mapping.
+    /// Builder-level [`MeshBuilder::reflex_override`] covers the
+    /// startup-time case; this is the runtime equivalent.
+    ///
+    /// **Optimization, not correctness.** Nodes without an
+    /// override still reach every peer via the routed-handshake
+    /// path. The override pins the publicly-advertised address
+    /// when it's already known.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn set_reflex_override(&self, external: SocketAddr) {
+        self.node.set_reflex_override(external);
+    }
+
+    /// Drop a previously-installed reflex override. The
+    /// classifier resumes on its normal cadence; the next sweep
+    /// repopulates `reflex_addr` and `nat_type` from real probe
+    /// observations. `reflex_addr` clears to `None` immediately
+    /// so a between-sweep read doesn't return a stale override.
+    ///
+    /// No-op when no override is active — safe to call
+    /// unconditionally during shutdown or a port-mapper revoke
+    /// path.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn clear_reflex_override(&self) {
+        self.node.clear_reflex_override();
     }
 }
 

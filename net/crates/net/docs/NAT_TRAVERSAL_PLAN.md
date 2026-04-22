@@ -132,6 +132,72 @@ Symmetric × cone is the partial-success case: the cone side's outbound port map
 
 **Cone × cone stays unchanged** (single attempt, high success rate). **Symmetric × symmetric skips punch entirely** (decision 4 — no point in coordinating a shot that can't land).
 
+### 9. Rendezvous relay selection — relay-capable preferred, graceful degradation
+
+A caller that wants to punch to B needs to pick a coordinator R. Always using "any mutually-connected peer" concentrates coordination load on whichever peer happens to bridge the most pairs. Always requiring `relay-capable` is too strict — early-mesh deployments might have no nodes advertising the tag, and refusing to even attempt a punch would violate the "optimization, not correctness" framing.
+
+**Decision:** three-tier policy, graceful degradation:
+
+1. **Preferred.** Among peers mutually connected to both A and B, pick one that advertises the `relay-capable` tag. If more than one, use random-two-choices (pick two at random, forward to the one with lower current coordination load from A's perspective). Avoids hot-spotting on a single relay-capable node.
+2. **Fallback.** If no mutually-connected peer has `relay-capable`, pick any mutually-connected peer. Worse than a dedicated relay but still better than failing the optimization.
+3. **Skip.** If no peer is mutually connected to both A and B, skip rendezvous entirely and fall through to routed-handshake. `connect()` still resolves — the punch just didn't get attempted.
+
+**Never fail the connection** because rendezvous isn't available. Direct connect is an optimization; the routed-handshake path is the correctness guarantee (see the top-of-doc framing).
+
+**Alternative considered:** strictly require `relay-capable`, failing with `rendezvous-no-relay` otherwise. Rejected — would make the optimization non-functional in any mesh without explicit relay-tagged nodes, which is the common early-deployment case.
+
+### 10. Punch packet-loss resilience — single attempt, caller-driven retry
+
+If all three keep-alive packets in the punch train drop, the punch fails. Options for handling: (a) internal retry loop with longer backoff, (b) single shot with caller-driven retry.
+
+**Decision:** single attempt per `connect_direct()` call. Three keep-alives (100 / 250 / 500 ms) as already specified. If the train doesn't land a `PunchAck` within the 5 s window, mark the punch failed and immediately fall back to routed-handshake. If the caller wants a fresh attempt, they call `connect_direct` again — which runs a fresh rendezvous + a fresh punch, not a retry of the same failed window.
+
+**Rationale:** an internal retry loop spends time + network budget chasing links whose lossiness is likely about to cause the session to fail anyway. The higher-level connect logic is in a better position to decide whether retrying at all is the right move (maybe the caller wants to back off to routed-handshake permanently, maybe it wants to re-probe reflex first). Keeping the primitive single-shot keeps the cost predictable.
+
+**Alternative considered:** one internal retry after 2 s backoff. Rejected — doubles the worst-case punch-establishment latency with marginal success-rate improvement. If data shows retries actually help, a follow-up can add an opt-in `connect_direct_with_retry` without changing the base primitive.
+
+### 11. IPv6 is not special — same code path, explicit test coverage
+
+IPv6 usually doesn't need punching (most IPv6 stacks are `NatType::Open`), but CGNAT / NAT64 / 464XLAT deployments do apply v6-to-v4 rewrites that make punching as relevant as on IPv4.
+
+**Decision:** no IPv6-specific code paths. Reflex probes, classification, rendezvous, and port mapping all handle `SocketAddr::V6` transparently — the `family: u8` byte in the wire format already discriminates. Stage 3 exit criteria add two explicit tests: (a) dual-stack peers with both on IPv6-open → direct connect, no punch attempted; (b) simulated NAT64/464XLAT pair → classification + punch behave identically to the IPv4 case.
+
+**Rationale:** the temptation to write "v6 needs no NAT logic" special cases into the SDK or docs is the thing that breaks later when someone deploys behind CGNAT-v6. The explicit tests catch the "I assumed v6 is always open" regression.
+
+### 12. Port-mapping lease on crash — accept the leak
+
+UPnP / NAT-PMP / PCP mappings outlive the process if it crashes without sending `DeletePortMapping`. The mapping stays on the router's forwarding table until its TTL expires.
+
+**Decision:** TTL 3600 s, renewal every 30 min, no aggressive TTL-shortening to compensate for crashes. A crashed process leaves one extra entry on the local router for up to an hour; every typical UPnP-using application does the same.
+
+**Rationale:** the alternative is either (a) a tiny TTL with high renewal traffic (chewing router CPU for zero benefit in the common no-crash case) or (b) a supervisor that survives the crash to clean up (wildly out of scope). Leaking one entry for ≤ 1 hour is not an operational concern until someone produces evidence of a router whose NAT table overflows at that rate.
+
+Revisit only if field data shows real router-table pressure.
+
+### 13. `relay-capable` covers both forwarding and coordination
+
+A node that advertises `relay-capable` is offering two distinct services: (a) data-plane forwarding for encrypted packets, (b) control-plane rendezvous coordination. They could be split into separate tags — but in practice a node that's willing to forward traffic is also willing to run a three-message rendezvous dance.
+
+**Decision:** one tag (`relay-capable`) covers both. Internally the node keeps two rate-limit budgets so heavy data-forwarding pressure doesn't starve rendezvous coordination and vice versa — a loaded data relay can still introduce new punches cheaply, and a rendezvous-busy node can still carry its existing data forwarding.
+
+**Future-friendly escape hatch:** if an operator shows up wanting "coordination only, no data forwarding," split into `relay-capable` + `rendezvous-capable` at that point. The single-tag default is fine until the split has a concrete use case.
+
+**Alternative considered:** separate tags from the start. Rejected — extra configuration surface, extra capability-filter composition, for a distinction users don't currently need to make.
+
+### 14. Classification re-run: explicit triggers only, never per-failure
+
+A node's NAT type can legitimately change (mobile network transitions, VPN turning on, WiFi → cellular, interface flap). Re-classifying on every handshake failure sounds responsive but in practice turns transient per-peer issues into mesh-wide NAT-type flapping that the capability broadcast then re-announces at 10 s cadence. That's observable as NAT-type thrash in operator dashboards and triggers cascading re-evaluation across peers.
+
+**Decision:** three triggers only, none of them per-failure:
+
+1. **Startup.** Classify once on `MeshNode::start()`.
+2. **Capability re-announce cadence.** If a scheduled capability re-announce is about to fire and the cached reflex from any anchor peer differs from the last observation, re-classify first.
+3. **Explicit upcalls.** `mesh.reclassify_nat()` for tests + mobile-aware apps; the mesh also queues a re-classify internally on observable network-stack events (interface down/up, OS `ConnectivityManager` transitions where the platform exposes them) — coarse-grained and rare, not per-failure.
+
+Handshake failures stay on the existing mesh-healing path (failure detector → reroute → routed handshake). Normal mesh resilience handles transient per-peer issues; NAT reclassification is for genuine topology shifts.
+
+**Alternative considered:** auto-reclassify on any handshake failure. Rejected — converts per-peer flakiness into mesh-wide NAT flapping, and the signal is noisy enough that the classifier would re-run on every lossy link without actually changing its output.
+
 ---
 
 ## Stage 0 — Scaffolding
@@ -244,10 +310,11 @@ Classification runs on `MeshNode::start()`:
 5. Store the observed reflex address on the local `CapabilityAnnouncement` builder (see decision 7 — the `reflex_addr` field).
 6. Trigger a fresh `announce_capabilities` so peers see both the new tag and the new reflex address in one round-trip.
 
-Re-classification triggers:
+Re-classification triggers (locked by decision 14 — no per-handshake-failure path):
 
-- Capability re-announce cadence (default every 10 s min-interval); if the cached reflex address from either anchor peer differs from the last observation, re-classify.
-- Explicit `mesh.reclassify_nat()` on demand (useful after mobile network transitions).
+- **Capability re-announce cadence.** Default every 10 s min-interval; if the cached reflex address from any anchor peer differs from the last observation at re-announce time, re-classify first so the new tag + reflex ship together.
+- **Explicit upcall.** `mesh.reclassify_nat()` — called by mobile-aware apps and integration tests.
+- **Coarse network-stack events.** Interface down/up or platform `ConnectivityManager` transitions (Android, iOS, Win32 NLM) queue one re-classification. Never per-peer handshake failure — that path stays on the existing mesh-healing reroute logic to avoid NAT-type flapping under transient per-link loss.
 
 ### Reflex address on the wire
 
@@ -483,31 +550,39 @@ Kind vocabulary for cross-binding parity (TS / Python / Go map to classes with a
 
 ---
 
+## Implementation status
+
+Current state against the staging plan:
+
+| Stage | Scope                                       | Status       |
+|-------|---------------------------------------------|--------------|
+| 0     | Module scaffolding, feature gates           | **done**     |
+| 1     | Reflex probe subprotocol (`SUBPROTOCOL_REFLEX = 0x0D00`) | **done** |
+| 2     | NAT classification FSM, `reflex_addr` on capability announcements, background classifier loop | **done** |
+| 3a    | Rendezvous wire format (`PunchRequest / PunchIntroduce / PunchAck`) | **done** |
+| 3b    | Coordinator fan-out — resolves peer reflex, sends `PunchIntroduce` to both endpoints | **done** |
+| 3c    | Pair-type matrix, `connect_direct`, `TraversalStats` | **done** |
+| 3d    | Keep-alive train + observer + `PunchAck` round-trip (routed via coordinator) | **done** |
+| 4a    | `reflex_override` — config field + runtime `set_reflex_override` / `clear_reflex_override` across all 4 surfaces | **done** |
+| 4b    | UPnP-IGD / NAT-PMP client + renewal task | **done** |
+| 5     | SDK + NAPI + PyO3 + Go binding surface (nat_type / reflex_addr / probe_reflex / connect_direct / traversal_stats / reflex_override) | **done** |
+
+**Stage 4b landing notes.** Implemented per [`PORT_MAPPING_PLAN.md`](PORT_MAPPING_PLAN.md): `PortMapperClient` trait, `NatPmpMapper` (inlined RFC 6886 wire codec with `UdpSocket::connect` source-address filter), `UpnpMapper` (`igd-next`-backed), `SequentialMapper` composer, and a `PortMapperTask` lifecycle state machine driving probe → install → renew → revoke. Install calls `set_reflex_override(external)`; renewal failures clear it via `clear_reflex_override()`. Surface-wide binding parity for the `try_port_mapping` flag across SDK / NAPI / PyO3 / Go. PCP is explicitly out of scope (§PORT_MAPPING_PLAN non-goals — different wire format from NAT-PMP despite the shared port).
+
+Testing coverage summary (as of stage 5 / 4a):
+
+- **33 NAT-traversal integration tests** across 7 files in `crates/net/tests/`: reflex probe, classification, rendezvous coordinator, rendezvous ack round-trip, connect_direct orchestration, keep-alive observer, reflex override. Plus 7 SDK-level integration tests in `sdk/tests/mesh_nat_traversal.rs`.
+- **45 new unit tests** across the traversal module: classify FSM + pair-action matrix (19), rendezvous wire codec (13), reflex probe codec (7), TraversalConfig defaults (1), capability-index reflex storage (2), capability `reflex_addr` serde round-trip (3).
+- All 987 lib tests pass; no regressions from any stage in this rollout.
+- Clean compile across no-default-features, `net`, `net,nat-traversal`, `port-mapping` feature combos.
+
+---
+
 ## Open questions
 
-### Rendezvous relay selection
+None — the initial design review resolved all of them. Decisions captured in the numbered design decisions section above (specifically §9–§14 correspond to the formerly-open rendezvous / retry / IPv6 / port-mapping-lease / relay-tag / reclassification questions).
 
-How does A pick which peer to use as rendezvous R? The first mutually-connected peer is the simplest rule, but may bias toward a single overloaded node. A random-two-choices pick across mutually-connected peers advertising `relay-capable` is probably the right default. **Open for decision:** if no `relay-capable` peer is mutually connected, do we (a) fail, (b) use any mutually-connected peer, or (c) fall through to routed-handshake immediately?
-
-### Punch packet-loss resilience
-
-3 keep-alives spaced 100/250/500 ms. On a lossy link, all 3 might drop. **Decision needed:** retry the punch once before giving up, or let the caller retry? Recommend single-shot — upper layers already handle connection-establishment retry.
-
-### IPv6 hole punching
-
-IPv6 usually doesn't need punching (most IPv6 stacks are `Open`), but some CGNAT deployments do apply NAT64 / 464XLAT. Stage 2 classification handles this correctly via the usual probe logic; stage 3 rendezvous works the same over IPv6. Worth an explicit dual-stack test in stage 3 exit criteria.
-
-### Port-mapping lease on crash
-
-If a node crashes after installing a UPnP mapping, the mapping leaks until its TTL expires (we request 3600 s). **Decision needed:** aggressive TTL (60 s) with frequent renewal, or let leaks decay naturally? Recommend 3600 s — renewal traffic is load on the router's control plane.
-
-### Relay autonomy vs. rendezvous responsibility
-
-A node advertises `relay-capable` to volunteer as a data relay. Is the same opt-in sufficient to volunteer as a rendezvous coordinator, or should rendezvous get its own tag (`rendezvous-capable`)? Data relaying is a per-packet ongoing cost; rendezvous is a handful of control packets per introduction. **Tentatively:** one tag covers both — the relay's autonomy envelope can rate-limit rendezvous separately.
-
-### Classification churn on mobile networks
-
-A node on a mobile carrier may shift NAT type mid-session. The capability broadcast cadence (10 s min-interval) will eventually propagate the new tag, but active hole-punch coordinators may have stale info. **Worth deciding:** auto-reclassify on every handshake failure, or only on explicit trigger? Recommend explicit — avoid classification thrash.
+Future open questions land here as implementation reveals them.
 
 ---
 

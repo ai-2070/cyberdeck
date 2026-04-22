@@ -106,6 +106,48 @@ Net::builder().jetstream(JetStreamAdapterConfig::new("nats://localhost:4222"))
 Net::builder().mesh(NetAdapterConfig::initiator(bind, peer, psk, peer_pubkey))
 ```
 
+## NAT Traversal (optimization, not correctness)
+
+Two NATed peers already reach each other through the mesh's routed-handshake path. NAT traversal opens a shorter direct path when the NAT shape allows it, cutting the per-packet relay tax. Everything in this section is disabled unless the core is built with `--features nat-traversal`; without it the routed path keeps working unchanged and the five reader methods below return `Unsupported`.
+
+```rust
+// Run a reflex probe + peer-probed classification.
+mesh.reclassify_nat().await;
+
+// Read the current classification + public reflex the mesh
+// advertises to peers. NatClass is Open | Cone | Symmetric | Unknown.
+let class = mesh.nat_type();
+let reflex = mesh.reflex_addr();                   // Option<SocketAddr>
+
+// Directly query any connected peer's reflex.
+let observed = mesh.probe_reflex(peer_node_id).await?; // -> SocketAddr
+
+// Attempt a direct connection via the pair-type matrix.
+// `coordinator` mediates the punch when the matrix picks one.
+// Returns Ok regardless of path — inspect stats to learn which.
+mesh.connect_direct(peer_node_id, &peer_pubkey, coordinator_node_id).await?;
+
+// Cumulative counters partition real activity.
+let stats = mesh.traversal_stats();
+stats.punches_attempted;   // coordinator mediated a PunchRequest + Introduce
+stats.punches_succeeded;   // ack arrived AND direct handshake landed
+stats.relay_fallbacks;     // landed on the routed path after skip/fail
+```
+
+Operators with a known-public address — port-forwarded servers, successful UPnP / NAT-PMP installs — can skip the classifier sweep entirely. A runtime override forces `"open"` and the supplied `SocketAddr` on every capability announcement from this node; call `announce_capabilities` after to propagate to peers (the setter resets the rate-limit floor so the next announce is guaranteed to broadcast).
+
+```rust
+mesh.set_reflex_override("203.0.113.5:9001".parse().unwrap());
+mesh.announce_capabilities(CapabilitySet::new()).await?;
+// ... later, if the mapping drops:
+mesh.clear_reflex_override();
+mesh.announce_capabilities(CapabilitySet::new()).await?;
+```
+
+Opt into automatic UPnP-IGD / NAT-PMP port mapping via `MeshBuilder::try_port_mapping(true)` (requires `--features port-mapping`). The mesh spawns a task that probes NAT-PMP first, falls back to UPnP, installs a mapping on success, and renews every 30 minutes; on install it calls `set_reflex_override(external)` for you. A router that doesn't speak either protocol leaves the node on the classifier path — that's fine.
+
+`SdkError::Traversal` wraps every `TraversalError` variant with a stable `kind` discriminator (`reflex-timeout` | `peer-not-reachable` | `transport` | `rendezvous-no-relay` | `rendezvous-rejected` | `punch-failed` | `port-map-unavailable` | `unsupported`). None of these is a connectivity failure — the routed path is always available regardless.
+
 ## Mesh Streams (multi-peer + back-pressure)
 
 For direct peer-to-peer messaging outside the event bus — open a typed

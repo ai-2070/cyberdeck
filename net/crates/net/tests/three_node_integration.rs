@@ -52,7 +52,29 @@ struct Link {
     responder: net::adapter::net::NetAdapter,
 }
 
-/// Find N available UDP ports by binding to :0 and reading the assigned port.
+/// Find N available UDP ports by binding to `:0` and reading the
+/// assigned port.
+///
+/// # Residual race
+///
+/// This test exercises the `NetAdapter` layer directly, whose
+/// config API takes both `bind_addr` and `peer_addr` up front —
+/// peers need each other's concrete port before anyone binds. So
+/// unlike the `MeshNode`-based suites (which pass `:0` all the
+/// way through and read `local_addr()` post-bind), this harness
+/// has to pre-reserve ports, drop the sockets, then let
+/// `NetAdapter::new` re-bind. That leaves a microsecond-wide
+/// TOCTOU window on loopback where a parallel process could grab
+/// a port between drop and re-bind.
+///
+/// Earlier revisions slept for 10 ms between drop and return,
+/// which *widened* the window without buying anything — UDP
+/// sockets have no TIME_WAIT on unix. The sleep is gone;
+/// `local_addr()` is read immediately before the socket drops
+/// and the caller binds the adapter on the very next scheduler
+/// tick. Collapsing the race to zero requires handing a
+/// pre-bound socket into `NetAdapter`, which is a bigger API
+/// change than this test file is worth.
 async fn find_ports(n: usize) -> Vec<u16> {
     let mut ports = Vec::with_capacity(n);
     let mut sockets = Vec::with_capacity(n);
@@ -62,7 +84,6 @@ async fn find_ports(n: usize) -> Vec<u16> {
         sockets.push(sock);
     }
     drop(sockets);
-    tokio::time::sleep(Duration::from_millis(10)).await;
     ports
 }
 

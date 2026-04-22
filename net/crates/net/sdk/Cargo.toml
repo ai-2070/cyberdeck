@@ -31,6 +31,24 @@ jetstream = ["net/jetstream"]
 # them as separate SDK flags created pick-your-own-subset
 # combinations that weren't actually meaningful.
 net = ["net/net"]
+# NAT traversal — reflex probes, classification, and
+# rendezvous-coordinated hole-punch. Exposes `Mesh::nat_type`,
+# `reflex_addr`, `connect_direct`, `traversal_stats`,
+# `probe_reflex`, and `reclassify_nat`. Off by default because
+# the surface is optional: callers that rely solely on the
+# routed-handshake path never need it. Framing: these APIs are
+# *optimization, not correctness* — routed-handshake reaches
+# every peer regardless, and a `symmetric` NAT type or a
+# `punch-failed` error just means traffic keeps riding the
+# relay.
+nat-traversal = ["net", "net/nat-traversal"]
+# Port mapping — opportunistic UPnP-IGD / NAT-PMP / PCP install
+# at startup. Exposes `MeshBuilder::try_port_mapping(bool)` on
+# the SDK surface. Builds on `nat-traversal` (the port-mapping
+# task calls the same `set_reflex_override` / `clear_reflex_override`
+# runtime setters). Off by default — port mapping modifies
+# state on the user's router and some environments forbid it.
+port-mapping = ["nat-traversal", "net/port-mapping"]
 # CortEX adds the typed event-sourced adapters (tasks + memories) plus
 # the NetDb facade. `redex-disk` comes along so `.persistent(true)` is
 # usable from the SDK without a separate feature flip.

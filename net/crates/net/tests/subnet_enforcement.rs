@@ -27,23 +27,9 @@ use net::adapter::net::{
     MeshNode, MeshNodeConfig, OnFailure, PublishConfig, Reliability, SocketBufferConfig, SubnetId,
     SubnetPolicy, SubnetRule, Visibility,
 };
-use tokio::net::UdpSocket;
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
-
-async fn find_ports(n: usize) -> Vec<u16> {
-    let mut ports = Vec::with_capacity(n);
-    let mut sockets = Vec::with_capacity(n);
-    for _ in 0..n {
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        ports.push(sock.local_addr().unwrap().port());
-        sockets.push(sock);
-    }
-    drop(sockets);
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    ports
-}
 
 /// Build the same `SubnetPolicy` every node uses. Three rules map
 /// `region:<x>` / `fleet:<x>` / `unit:<x>` tags onto levels 0–2.
@@ -64,8 +50,10 @@ fn shared_policy() -> Arc<SubnetPolicy> {
     )
 }
 
-fn test_config(port: u16, subnet: SubnetId, policy: Arc<SubnetPolicy>) -> MeshNodeConfig {
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+fn test_config(subnet: SubnetId, policy: Arc<SubnetPolicy>) -> MeshNodeConfig {
+    // Bind via `127.0.0.1:0` so the OS picks a free port — no
+    // pre-bind reservation, no TOCTOU race with parallel tests.
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut cfg = MeshNodeConfig::new(addr, PSK)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))
@@ -83,12 +71,11 @@ fn test_config(port: u16, subnet: SubnetId, policy: Arc<SubnetPolicy>) -> MeshNo
 /// Build a MeshNode and pre-install a shared channel-config
 /// registry so subscribers can be authorized per-channel.
 async fn build_node(
-    port: u16,
     subnet: SubnetId,
     policy: Arc<SubnetPolicy>,
     registry: Arc<ChannelConfigRegistry>,
 ) -> Arc<MeshNode> {
-    let cfg = test_config(port, subnet, policy);
+    let cfg = test_config(subnet, policy);
     let keypair = EntityKeypair::generate();
     let mut node = MeshNode::new(keypair, cfg).await.expect("MeshNode::new");
     node.set_channel_configs(registry);
@@ -142,7 +129,6 @@ fn caps_for(region: &str, fleet: &str, unit: &str) -> CapabilitySet {
 #[tokio::test]
 async fn subnet_local_partitions_a_b_from_c() {
     let policy = shared_policy();
-    let ports = find_ports(3).await;
 
     let a_registry = Arc::new(ChannelConfigRegistry::new());
     let b_registry = Arc::new(ChannelConfigRegistry::new());
@@ -150,15 +136,9 @@ async fn subnet_local_partitions_a_b_from_c() {
 
     // A and B both on exact subnet [3,7,2]; C on [3,8,1].
     let shared_subnet = SubnetId::new(&[3, 7, 2]);
-    let a = build_node(ports[0], shared_subnet, policy.clone(), a_registry.clone()).await;
-    let b = build_node(ports[1], shared_subnet, policy.clone(), b_registry).await;
-    let c = build_node(
-        ports[2],
-        SubnetId::new(&[3, 8, 1]),
-        policy.clone(),
-        c_registry,
-    )
-    .await;
+    let a = build_node(shared_subnet, policy.clone(), a_registry.clone()).await;
+    let b = build_node(shared_subnet, policy.clone(), b_registry).await;
+    let c = build_node(SubnetId::new(&[3, 8, 1]), policy.clone(), c_registry).await;
 
     // Hub topology — A connects to B and C.
     handshake(&a, &b).await;
@@ -241,34 +221,20 @@ async fn subnet_local_partitions_a_b_from_c() {
 #[tokio::test]
 async fn parent_visible_admits_descendant_rejects_sibling() {
     let policy = shared_policy();
-    let ports = find_ports(3).await;
     let a_registry = Arc::new(ChannelConfigRegistry::new());
     let b_registry = Arc::new(ChannelConfigRegistry::new());
     let c_registry = Arc::new(ChannelConfigRegistry::new());
 
     let a = build_node(
-        ports[0],
         SubnetId::new(&[3, 7, 2]),
         policy.clone(),
         a_registry.clone(),
     )
     .await;
     // Descendant: shares A's first three levels, adds one more.
-    let descendant = build_node(
-        ports[1],
-        SubnetId::new(&[3, 7, 2, 5]),
-        policy.clone(),
-        b_registry,
-    )
-    .await;
+    let descendant = build_node(SubnetId::new(&[3, 7, 2, 5]), policy.clone(), b_registry).await;
     // Sibling at level 1 — breaks the ancestor chain.
-    let sibling = build_node(
-        ports[2],
-        SubnetId::new(&[3, 9, 1]),
-        policy.clone(),
-        c_registry,
-    )
-    .await;
+    let sibling = build_node(SubnetId::new(&[3, 9, 1]), policy.clone(), c_registry).await;
 
     handshake(&a, &descendant).await;
     handshake(&a, &sibling).await;
@@ -333,13 +299,12 @@ async fn parent_visible_admits_descendant_rejects_sibling() {
 /// still deliver as if there were no partitioning.
 #[tokio::test]
 async fn without_policy_subnet_local_delivers_everywhere() {
-    let ports = find_ports(2).await;
     let a_registry = Arc::new(ChannelConfigRegistry::new());
     let b_registry = Arc::new(ChannelConfigRegistry::new());
 
     // No policy, default subnet (GLOBAL) on both nodes.
-    let a_cfg = test_config_no_policy(ports[0]);
-    let b_cfg = test_config_no_policy(ports[1]);
+    let a_cfg = test_config_no_policy();
+    let b_cfg = test_config_no_policy();
     let mut a_owned = MeshNode::new(EntityKeypair::generate(), a_cfg)
         .await
         .unwrap();
@@ -381,8 +346,8 @@ async fn without_policy_subnet_local_delivers_everywhere() {
     assert_eq!(report.delivered, 1);
 }
 
-fn test_config_no_policy(port: u16) -> MeshNodeConfig {
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+fn test_config_no_policy() -> MeshNodeConfig {
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut cfg = MeshNodeConfig::new(addr, PSK)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))

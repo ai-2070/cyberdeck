@@ -172,6 +172,60 @@ struct DispatchCtx {
     channel_configs: Option<Arc<ChannelConfigRegistry>>,
     /// In-flight Subscribe/Unsubscribe requests awaiting an Ack, keyed by nonce.
     pending_membership_acks: Arc<DashMap<u64, oneshot::Sender<MembershipAck>>>,
+    /// In-flight reflex probes keyed by the responder's `node_id`.
+    /// Populated by `MeshNode::probe_reflex`; the dispatch branch
+    /// for `SUBPROTOCOL_REFLEX` completes the oneshot with the
+    /// decoded observed-address on response receipt. Only one
+    /// probe per peer is in flight at a time — a second call
+    /// replaces the pending entry and the previous caller sees
+    /// `ReflexTimeout`.
+    #[cfg(feature = "nat-traversal")]
+    pending_reflex_probes:
+        Arc<DashMap<u64, (u64, tokio::sync::oneshot::Sender<std::net::SocketAddr>)>>,
+    /// Waiters for incoming `PunchIntroduce` messages, keyed by
+    /// the counterpart endpoint's `node_id` (the `peer` field in
+    /// the introduce). Mirrors `pending_reflex_probes` — the
+    /// dispatcher completes the oneshot when a matching introduce
+    /// lands; a message with no waiter is dropped silently.
+    #[cfg(feature = "nat-traversal")]
+    pending_punch_introduces: Arc<
+        DashMap<
+            u64,
+            (
+                u64,
+                tokio::sync::oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>,
+            ),
+        >,
+    >,
+    /// Waiters for incoming `PunchAck` messages, keyed by the
+    /// sender's `node_id` (the `from_peer` field in the ack).
+    /// `connect_direct`'s `SinglePunch` path awaits on this map
+    /// to confirm the peer completed their side of the punch.
+    #[cfg(feature = "nat-traversal")]
+    pending_punch_acks: Arc<
+        DashMap<
+            u64,
+            (
+                u64,
+                tokio::sync::oneshot::Sender<super::traversal::rendezvous::PunchAck>,
+            ),
+        >,
+    >,
+    /// Keep-alive observers, keyed by the `SocketAddr` of the
+    /// counterpart's `peer_reflex`. Fired by the receive loop
+    /// when a matching `Keepalive`-formatted packet arrives;
+    /// consumed by the endpoint's punch-scheduling task to
+    /// decide when to emit a `PunchAck`.
+    #[cfg(feature = "nat-traversal")]
+    punch_observers: Arc<
+        DashMap<SocketAddr, tokio::sync::oneshot::Sender<super::traversal::rendezvous::Keepalive>>,
+    >,
+    /// NAT-traversal tunables (probe timeouts, punch cadence,
+    /// classification deadlines). Shared with `MeshNode` by value
+    /// since `TraversalConfig` is `Clone` and small. The dispatch
+    /// path only reads it — no need for an Arc.
+    #[cfg(feature = "nat-traversal")]
+    traversal_config: super::traversal::TraversalConfig,
     /// Max distinct channels a single peer may subscribe to.
     max_channels_per_peer: usize,
     /// Capability index shared with `MeshNode`. Inbound
@@ -326,6 +380,66 @@ pub struct MeshNodeConfig {
     /// How long a peer stays throttled after tripping the
     /// failure threshold. Default: 30 s.
     pub auth_throttle_duration: Duration,
+    /// Override the mesh's public-facing `SocketAddr` — the
+    /// address peers see this node as reachable at. When `Some`,
+    /// the classifier's background sweep is skipped entirely and
+    /// the node immediately advertises `NatClass::Open` with the
+    /// supplied `SocketAddr` on its capability announcements.
+    ///
+    /// Intended for:
+    ///
+    /// - **Port-forwarded servers.** An operator who has manually
+    ///   configured a port forward knows the external address
+    ///   directly; setting this short-circuits the multi-peer
+    ///   classification that wouldn't discover anything new.
+    /// - **Stage-4 port mapping (UPnP / NAT-PMP / PCP).** A
+    ///   successful mapping installation records the mapped
+    ///   external `ip:port` here, so subsequent peers see the
+    ///   node as `Open` without the classifier needing to probe
+    ///   for a reflex.
+    ///
+    /// Framing (plan §4): this is an optimization surface, not a
+    /// connectivity requirement — a node with no override still
+    /// reaches every peer through routed-handshake. Stored on
+    /// `MeshNodeConfig` so both programmatic callers and future
+    /// port-mapping runtime writers have a single site to update.
+    ///
+    /// Default: `None` (use classifier observations).
+    #[cfg(feature = "nat-traversal")]
+    pub reflex_override: Option<SocketAddr>,
+    /// Attempt to install a UPnP-IGD / NAT-PMP / PCP port
+    /// mapping on the operator's router at [`MeshNode::start`]
+    /// time, lifting this node to `NatClass::Open` with the
+    /// router's external `SocketAddr` when the mapping succeeds.
+    ///
+    /// Off by default because port mapping modifies state on a
+    /// device the operator owns — some deployments explicitly
+    /// disable router control from software, and the mesh should
+    /// never silently change that.
+    ///
+    /// When set, `start()` spawns a `PortMapperTask` that:
+    ///
+    /// 1. Probes NAT-PMP (1 s), falls back to UPnP (2 s).
+    /// 2. On install success: calls [`MeshNode::set_reflex_override`]
+    ///    with the mapped external address.
+    /// 3. Renews on [`super::traversal::TraversalConfig::port_mapping_renewal`]
+    ///    cadence (default 30 min).
+    /// 4. On 3 consecutive renewal failures: calls
+    ///    [`MeshNode::clear_reflex_override`] and exits.
+    /// 5. On mesh shutdown: removes the mapping (best-effort).
+    ///
+    /// **Optimization, not correctness.** Setting this to
+    /// `true` on a network without UPnP / NAT-PMP support is
+    /// safe — the task exits cleanly after one failed probe
+    /// cycle and the classifier takes over as usual.
+    ///
+    /// Requires the `port-mapping` cargo feature. Reading this
+    /// field on a build without the feature is always `false`
+    /// at runtime.
+    ///
+    /// Default: `false`.
+    #[cfg(feature = "port-mapping")]
+    pub try_port_mapping: bool,
 }
 
 impl MeshNodeConfig {
@@ -357,7 +471,34 @@ impl MeshNodeConfig {
             max_auth_failures_per_window: 16,
             auth_failure_window: Duration::from_secs(60),
             auth_throttle_duration: Duration::from_secs(30),
+            #[cfg(feature = "nat-traversal")]
+            reflex_override: None,
+            #[cfg(feature = "port-mapping")]
+            try_port_mapping: false,
         }
+    }
+
+    /// Set the reflex override — the public `SocketAddr` this
+    /// node advertises to peers. See
+    /// [`MeshNodeConfig::reflex_override`] for semantics.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn with_reflex_override(mut self, external: SocketAddr) -> Self {
+        self.reflex_override = Some(external);
+        self
+    }
+
+    /// Opt into opportunistic UPnP-IGD / NAT-PMP / PCP port
+    /// mapping at `start()` time. See
+    /// [`MeshNodeConfig::try_port_mapping`] for lifecycle
+    /// semantics.
+    ///
+    /// Requires the `port-mapping` cargo feature.
+    #[cfg(feature = "port-mapping")]
+    pub fn with_try_port_mapping(mut self, enabled: bool) -> Self {
+        self.try_port_mapping = enabled;
+        self
     }
 
     /// Set heartbeat interval.
@@ -553,6 +694,62 @@ fn nonzero_interval(d: Duration) -> Duration {
     }
 }
 
+/// Race a punch-observer `oneshot::Receiver` against a deadline
+/// and handle cleanup of the shared `punch_observers` map with
+/// the correct semantics for each outcome. Returns `true` when
+/// the observer fired (caller should emit a `PunchAck`), `false`
+/// otherwise.
+///
+/// Three outcomes, each with a distinct cleanup rule:
+///
+/// - **`Ok(Ok(ka))`** — a matching keep-alive arrived and the
+///   receive loop fired our sender. Returns `true`; caller emits
+///   the ack. The receive loop already consumed the map entry
+///   via `remove` when it fired the oneshot, so no cleanup
+///   needed here.
+/// - **`Ok(Err(_))`** — our sender was dropped without firing.
+///   This happens when a newer observer replaced ours in the
+///   map (`DashMap::insert` drops the old value, which wakes
+///   our `rx` with `RecvError`). Returning without removing the
+///   key is load-bearing: removing would evict the replacement
+///   observer that's now legitimately in the map.
+/// - **`Err(_)`** — the deadline expired. Our sender is still
+///   in the map — if it had been replaced we'd be in the
+///   `Ok(Err)` branch above, not here. Remove our stale entry
+///   so a late keep-alive doesn't find it.
+///
+/// History: earlier revisions collapsed `Ok(Err)` and `Err(_)`
+/// into a single `remove`-in-both-cases arm, which evicted
+/// replacement observers. cubic flagged this as a P2. The
+/// three-arm split is tested in `await_punch_observer_outcome`'s
+/// unit tests below.
+#[cfg(feature = "nat-traversal")]
+async fn await_punch_observer_outcome(
+    obs_rx: tokio::sync::oneshot::Receiver<super::traversal::rendezvous::Keepalive>,
+    deadline: Duration,
+    punch_observers: &DashMap<
+        SocketAddr,
+        tokio::sync::oneshot::Sender<super::traversal::rendezvous::Keepalive>,
+    >,
+    peer_reflex: SocketAddr,
+) -> bool {
+    match tokio::time::timeout(deadline, obs_rx).await {
+        // Observer fired with a real keep-alive.
+        Ok(Ok(_ka)) => true,
+        // Sender was dropped — almost certainly replaced by a
+        // newer observer for the same peer_reflex. Leaving the
+        // map alone is correct: the replacement's sender is the
+        // current value and a remove would evict it.
+        Ok(Err(_)) => false,
+        // Deadline fired with our sender still in the map. Evict
+        // so a late keep-alive doesn't find a stale entry.
+        Err(_) => {
+            punch_observers.remove(&peer_reflex);
+            false
+        }
+    }
+}
+
 /// Rolling-window auth-failure tracker, one entry per peer.
 /// Lives behind a per-key `Mutex` so updates from concurrent
 /// subscribes don't race each other on the same peer's counter.
@@ -704,6 +901,121 @@ pub struct MeshNode {
     channel_configs: Option<Arc<ChannelConfigRegistry>>,
     /// In-flight Subscribe/Unsubscribe requests keyed by nonce.
     pending_membership_acks: Arc<DashMap<u64, oneshot::Sender<MembershipAck>>>,
+    /// In-flight reflex probes keyed by the responder's `node_id`.
+    /// Shared with `DispatchCtx` via `Arc` clone so the dispatcher
+    /// can complete oneshots without routing back through
+    /// `MeshNode`. Details on the field's usage in the
+    /// `DispatchCtx` docstring.
+    #[cfg(feature = "nat-traversal")]
+    pending_reflex_probes: Arc<DashMap<u64, (u64, oneshot::Sender<std::net::SocketAddr>)>>,
+    /// In-flight rendezvous handshakes keyed by the *counterpart*
+    /// endpoint's `node_id` — i.e. the `peer` field in the
+    /// incoming `PunchIntroduce`. The coordinator-side fanout
+    /// (stage 3b) drops `PunchIntroduce` messages silently when
+    /// no waiter is installed; endpoint callers that want to
+    /// observe an introduce install an entry here via the
+    /// stage-3c surface before calling the coordinator.
+    #[cfg(feature = "nat-traversal")]
+    pending_punch_introduces: Arc<
+        DashMap<
+            u64,
+            (
+                u64,
+                oneshot::Sender<super::traversal::rendezvous::PunchIntroduce>,
+            ),
+        >,
+    >,
+    /// In-flight punch acknowledgements keyed by the *sender*
+    /// endpoint's `node_id` — i.e. the `from_peer` field on the
+    /// arriving `PunchAck`. `connect_direct` awaits this map on
+    /// the `SinglePunch` path so `punches_succeeded` only bumps
+    /// when the peer actually confirmed the punch.
+    #[cfg(feature = "nat-traversal")]
+    pending_punch_acks:
+        Arc<DashMap<u64, (u64, oneshot::Sender<super::traversal::rendezvous::PunchAck>)>>,
+    /// Monotonic counter for waiter generations used by the
+    /// three `pending_*` maps above. Each insert stamps its
+    /// entry with a unique `gen`; removal is a `remove_if` check
+    /// that the entry's gen matches ours. Without this, a
+    /// timeout cleanup racing a concurrent replacement could
+    /// evict the new waiter — a cubic-flagged P1 bug
+    /// (`connect_direct` + `request_punch` both affected).
+    #[cfg(feature = "nat-traversal")]
+    next_waiter_gen: Arc<std::sync::atomic::AtomicU64>,
+    /// Keep-alive observers for in-progress punches, keyed by
+    /// the `SocketAddr` we're watching for inbound traffic (the
+    /// counterpart's `peer_reflex`). The receive loop fires the
+    /// oneshot on the first matching keep-alive and the punch-
+    /// scheduler task reacts by emitting a `PunchAck`.
+    #[cfg(feature = "nat-traversal")]
+    punch_observers:
+        Arc<DashMap<SocketAddr, oneshot::Sender<super::traversal::rendezvous::Keepalive>>>,
+    /// Current NAT classification, encoded via
+    /// [`super::traversal::classify::NatClass::as_u8`]. Starts as
+    /// `Unknown` (`0`) and is updated by the classification sweep
+    /// spawned in [`Self::start`]. Stored atomically so the
+    /// announce-capabilities hot path can read without locking.
+    #[cfg(feature = "nat-traversal")]
+    nat_class: Arc<std::sync::atomic::AtomicU8>,
+    /// Current reflex address (this node's public-facing
+    /// `SocketAddr` as observed by remote peers), or `None` until
+    /// the classification sweep has produced at least one reflex
+    /// observation. Piggybacks on outbound `CapabilityAnnouncement`
+    /// payloads so peers can attempt a direct connect without a
+    /// separate discovery round-trip.
+    #[cfg(feature = "nat-traversal")]
+    reflex_addr: Arc<ArcSwapOption<SocketAddr>>,
+    /// Runtime flag: `true` when the current `reflex_addr` came
+    /// from an operator-set or port-mapper-installed override,
+    /// `false` when it came from classification observations.
+    /// When `true`, the classifier sweep short-circuits and
+    /// `reflex_addr` stays pinned until
+    /// [`Self::clear_reflex_override`] is called.
+    ///
+    /// Separate from `MeshNodeConfig::reflex_override` because the
+    /// config is moved into `MeshNode` at construction time and
+    /// can't be mutated afterward. A stage-4b `PortMapper` task
+    /// installs a mapping mid-session; this atomic is what lets
+    /// a `&self` setter turn the override on without racing the
+    /// announce-capabilities path.
+    #[cfg(feature = "nat-traversal")]
+    reflex_override_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Publication barrier held briefly during any code path
+    /// that touches more than one of `nat_class`, `reflex_addr`,
+    /// and `reflex_override_active` as a group. The three atomics
+    /// underneath are still lock-free for single-field readers
+    /// (`nat_class()`, `reflex_addr()`, and the traversal-loop
+    /// branches that only check one value), but the setters
+    /// (`set_reflex_override`, `clear_reflex_override`) and the
+    /// classifier commit (`commit_reclassify_observations`) write
+    /// the triple under this lock, and readers that need a
+    /// consistent snapshot (`announce_capabilities_with` emits
+    /// `nat_class` AND `reflex_addr` into the same outbound
+    /// announcement) read the triple under this lock too.
+    ///
+    /// A cubic P1 review flagged that reading the three atomics
+    /// independently let a concurrent announce publish a torn
+    /// state — e.g., a just-cleared override with reflex=None
+    /// paired with the still-Open NAT class, or a just-set
+    /// override's new reflex paired with the pre-override
+    /// Unknown class. This mutex closes that window; writers
+    /// serialize against each other and against the multi-field
+    /// read in announce.
+    #[cfg(feature = "nat-traversal")]
+    traversal_publish_mu: Arc<parking_lot::Mutex<()>>,
+    /// Traversal tunables — probe timeouts, classification
+    /// deadline, punch cadence, and port-mapping renewal interval.
+    /// Defaults match `docs/NAT_TRAVERSAL_PLAN.md`. Exposed via
+    /// `MeshBuilder` setters in stage 5; internal-only today.
+    #[cfg(feature = "nat-traversal")]
+    traversal_config: super::traversal::TraversalConfig,
+    /// Cumulative counters for `connect_direct` outcomes. Every
+    /// punch attempt, success, and relay fallback is recorded
+    /// here; read via [`Self::traversal_stats`]. Observability
+    /// surface, not control — the traversal behavior doesn't read
+    /// this.
+    #[cfg(feature = "nat-traversal")]
+    traversal_stats: Arc<super::traversal::TraversalStats>,
     /// Capability index populated by inbound
     /// `SUBPROTOCOL_CAPABILITY_ANN` packets and the local
     /// `announce_capabilities` path. Self-index so single-node
@@ -912,6 +1224,14 @@ impl MeshNode {
         // without going back through `config`.
         let local_subnet = config.subnet;
         let local_subnet_policy = config.subnet_policy.clone();
+        // Pre-apply the reflex override so the node starts in
+        // `Open` + `reflex_addr = Some(override)` state before
+        // the first capability announcement leaves the box. Skips
+        // the classifier sweep — operators with manually-forwarded
+        // ports (or stage-4 port mapping) don't need multi-peer
+        // probing to discover what they already know.
+        #[cfg(feature = "nat-traversal")]
+        let initial_reflex_override = config.reflex_override;
 
         Ok(Self {
             identity,
@@ -933,6 +1253,39 @@ impl MeshNode {
             roster,
             channel_configs: None,
             pending_membership_acks: Arc::new(DashMap::new()),
+            #[cfg(feature = "nat-traversal")]
+            pending_reflex_probes: Arc::new(DashMap::new()),
+            #[cfg(feature = "nat-traversal")]
+            pending_punch_introduces: Arc::new(DashMap::new()),
+            #[cfg(feature = "nat-traversal")]
+            pending_punch_acks: Arc::new(DashMap::new()),
+            #[cfg(feature = "nat-traversal")]
+            next_waiter_gen: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            #[cfg(feature = "nat-traversal")]
+            punch_observers: Arc::new(DashMap::new()),
+            #[cfg(feature = "nat-traversal")]
+            nat_class: Arc::new(std::sync::atomic::AtomicU8::new(
+                if initial_reflex_override.is_some() {
+                    super::traversal::classify::NatClass::Open.as_u8()
+                } else {
+                    super::traversal::classify::NatClass::Unknown.as_u8()
+                },
+            )),
+            #[cfg(feature = "nat-traversal")]
+            reflex_addr: Arc::new(match initial_reflex_override {
+                Some(addr) => ArcSwapOption::from_pointee(addr),
+                None => ArcSwapOption::empty(),
+            }),
+            #[cfg(feature = "nat-traversal")]
+            reflex_override_active: Arc::new(std::sync::atomic::AtomicBool::new(
+                initial_reflex_override.is_some(),
+            )),
+            #[cfg(feature = "nat-traversal")]
+            traversal_publish_mu: Arc::new(parking_lot::Mutex::new(())),
+            #[cfg(feature = "nat-traversal")]
+            traversal_config: super::traversal::TraversalConfig::default(),
+            #[cfg(feature = "nat-traversal")]
+            traversal_stats: Arc::new(super::traversal::TraversalStats::new()),
             capability_index: Arc::new(CapabilityIndex::new()),
             seen_announcements: Arc::new(DashMap::new()),
             last_announce_at: Arc::new(parking_lot::Mutex::new(None)),
@@ -1295,6 +1648,63 @@ impl MeshNode {
         let router_handle = self.router.start();
         let capability_gc_handle = self.spawn_capability_gc_loop();
         let token_sweep_handle = self.spawn_token_sweep_loop();
+        // Port-mapping task is opt-in — only spawned when the
+        // operator set `try_port_mapping(true)`. Real client is
+        // the `SequentialMapper` (NAT-PMP first, UPnP fallback
+        // — stage 4b-4). Construction is async because LAN-IP
+        // resolution needs a UDP socket bind, so we spawn an
+        // outer task that resolves the sequencer then drives
+        // the port-mapper task inline. If OS gateway discovery
+        // AND LAN-IP resolution both fail, we fall back to the
+        // `NullPortMapper` — the task exits quickly without
+        // side effects, identical to an unavailable-router
+        // environment.
+        #[cfg(feature = "port-mapping")]
+        let port_mapping_handle = if self.config.try_port_mapping {
+            use super::traversal::portmap::{
+                sequential_mapper_from_os, MappingSink, NullPortMapper, PortMapperClient,
+                PortMapperTask,
+            };
+            let traversal_stats = self.traversal_stats.clone();
+            let reflex_addr = self.reflex_addr.clone();
+            let nat_class = self.nat_class.clone();
+            let reflex_override_active = self.reflex_override_active.clone();
+            let publish_mu = self.traversal_publish_mu.clone();
+            let shutdown = self.shutdown.clone();
+            let shutdown_notify = self.shutdown_notify.clone();
+            let internal_port = self.config.bind_addr.port();
+            let renewal = self.traversal_config.port_mapping_renewal;
+            Some(tokio::spawn(async move {
+                let client: Box<dyn PortMapperClient> = match sequential_mapper_from_os().await {
+                    Some(seq) => Box::new(seq),
+                    None => {
+                        tracing::debug!(
+                            "port-mapping: OS gateway + LAN IP resolution failed; \
+                                 falling back to NullPortMapper",
+                        );
+                        Box::new(NullPortMapper::new())
+                    }
+                };
+                let sink = MappingSink::new(
+                    traversal_stats,
+                    reflex_addr,
+                    nat_class,
+                    reflex_override_active,
+                    publish_mu,
+                );
+                let task = PortMapperTask::new(
+                    client,
+                    sink,
+                    internal_port,
+                    renewal,
+                    shutdown,
+                    shutdown_notify,
+                );
+                task.run().await;
+            }))
+        } else {
+            None
+        };
 
         // Store handles — can't block here, but we need them for shutdown
         let tasks = self.tasks.clone();
@@ -1305,7 +1715,139 @@ impl MeshNode {
             tasks.push(router_handle);
             tasks.push(capability_gc_handle);
             tasks.push(token_sweep_handle);
+            #[cfg(feature = "port-mapping")]
+            if let Some(h) = port_mapping_handle {
+                tasks.push(h);
+            }
         });
+    }
+
+    /// Spawn the NAT classification loop. Waits until at least 2
+    /// peers are connected, fires the initial sweep, then re-checks
+    /// periodically so a mid-session NAT rebind (e.g. gateway
+    /// reboot) gets picked up without operator intervention.
+    ///
+    /// Separate from [`Self::start`] because the loop needs an
+    /// `Arc<MeshNode>` to call [`Self::reclassify_nat`] across
+    /// `.await` points. Callers that hold a `MeshNode` behind an
+    /// `Arc` (SDK, FFI, all production paths) can spawn this
+    /// alongside `start` to get continuous classification; callers
+    /// that don't can call [`Self::reclassify_nat`] manually via
+    /// the `&self` surface.
+    ///
+    /// The loop is best-effort — it never returns an error surface
+    /// to the node, and a failed sweep leaves the previous
+    /// classification intact. Exits on `shutdown_notify`.
+    #[cfg(feature = "nat-traversal")]
+    pub fn spawn_nat_classify_loop(self: &Arc<Self>) -> JoinHandle<()> {
+        let node = Arc::clone(self);
+        let shutdown = self.shutdown.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
+        let reclassify_interval = self.traversal_config.classify_deadline.saturating_mul(12);
+
+        tokio::spawn(async move {
+            // Poll loop: wait for ≥2 peers before the first sweep.
+            // The routed-handshake path seeds `peers` as each
+            // connect/accept lands, so the wait is bounded by how
+            // fast the operator hands us peers — not something we
+            // can tune from here.
+            let mut poll = tokio::time::interval(Duration::from_millis(200));
+            poll.tick().await; // skip the immediate first tick
+            loop {
+                if shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                tokio::select! {
+                    _ = shutdown_notify.notified() => return,
+                    _ = poll.tick() => {
+                        if node.peers.len() >= 2 {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Initial classification sweep — produces the first
+            // `nat:*` tag value that any subsequent announce can
+            // emit. Callers that want the tag on their very first
+            // announce should `await` this future before calling
+            // `announce_capabilities`.
+            node.reclassify_nat().await;
+
+            // Periodic re-check. `classify_deadline × 12` is long
+            // enough to be cheap (probe traffic is cheap but not
+            // free) and short enough that a gateway reboot is
+            // reflected in outbound announcements within ~1 min of
+            // the next re-announce.
+            let mut tick = tokio::time::interval(nonzero_interval(reclassify_interval));
+            tick.tick().await; // skip the immediate tick
+            while !shutdown.load(Ordering::Acquire) {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        node.reclassify_nat().await;
+                    }
+                    _ = shutdown_notify.notified() => break,
+                }
+            }
+        })
+    }
+
+    /// Spawn a port-mapping task driven by `client`. Drives the
+    /// UPnP-IGD / NAT-PMP / PCP lifecycle per
+    /// `docs/PORT_MAPPING_PLAN.md`:
+    ///
+    /// 1. Probe the client; on failure, exit without side
+    ///    effects.
+    /// 2. On probe success, install a mapping for this mesh's
+    ///    bind port. On install success, pin the reflex override
+    ///    to the mapped external address — same publish order
+    ///    as [`Self::set_reflex_override`].
+    /// 3. Renew every
+    ///    [`super::traversal::TraversalConfig::port_mapping_renewal`];
+    ///    3-strike consecutive failures revoke + clear override.
+    /// 4. On shutdown, remove the mapping (best-effort), clear
+    ///    the override, and exit.
+    ///
+    /// Callers that want `MeshNode::start` to auto-spawn a
+    /// [`super::traversal::portmap::NullPortMapper`] (the
+    /// stage-4b-1 default) should set
+    /// [`MeshNodeConfig::try_port_mapping`] to `true`; this
+    /// method is the explicit-client path used by stages 4b-4+
+    /// (real sequencer) and by unit tests that inject mocks.
+    ///
+    /// Requires the `port-mapping` cargo feature.
+    ///
+    /// Takes `&self` (not `&Arc<Self>`) because the task body
+    /// only needs `Arc`-clones of specific fields
+    /// (`traversal_stats`, `reflex_addr`, `nat_class`,
+    /// `reflex_override_active`, `shutdown`, `shutdown_notify`),
+    /// not the whole `MeshNode`. Callable from `start()` without
+    /// forcing the entire `start()` surface to consume an
+    /// `Arc<Self>`.
+    #[cfg(feature = "port-mapping")]
+    pub fn spawn_port_mapping_loop(
+        &self,
+        client: Box<dyn super::traversal::portmap::PortMapperClient>,
+    ) -> JoinHandle<()> {
+        use super::traversal::portmap::{MappingSink, PortMapperTask};
+        let sink = MappingSink::new(
+            self.traversal_stats.clone(),
+            self.reflex_addr.clone(),
+            self.nat_class.clone(),
+            self.reflex_override_active.clone(),
+            self.traversal_publish_mu.clone(),
+        );
+        let internal_port = self.config.bind_addr.port();
+        let renewal = self.traversal_config.port_mapping_renewal;
+        let task = PortMapperTask::new(
+            client,
+            sink,
+            internal_port,
+            renewal,
+            self.shutdown.clone(),
+            self.shutdown_notify.clone(),
+        );
+        tokio::spawn(task.run())
     }
 
     /// Spawn a periodic sweep that evicts expired entries from the
@@ -1434,6 +1976,16 @@ impl MeshNode {
             roster: self.roster.clone(),
             channel_configs: self.channel_configs.clone(),
             pending_membership_acks: self.pending_membership_acks.clone(),
+            #[cfg(feature = "nat-traversal")]
+            pending_reflex_probes: self.pending_reflex_probes.clone(),
+            #[cfg(feature = "nat-traversal")]
+            pending_punch_introduces: self.pending_punch_introduces.clone(),
+            #[cfg(feature = "nat-traversal")]
+            pending_punch_acks: self.pending_punch_acks.clone(),
+            #[cfg(feature = "nat-traversal")]
+            punch_observers: self.punch_observers.clone(),
+            #[cfg(feature = "nat-traversal")]
+            traversal_config: self.traversal_config.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
             capability_index: self.capability_index.clone(),
             seen_announcements: self.seen_announcements.clone(),
@@ -1485,6 +2037,28 @@ impl MeshNode {
         // Partition filter: silently drop packets from blocked peers
         if ctx.partition_filter.contains(&source) {
             return;
+        }
+
+        // Pre-session keep-alive recognition. Keep-alives are
+        // 14-byte packets with `KEEPALIVE_MAGIC` at offset 0. The
+        // receive loop fires any observer watching `source` and
+        // returns — these packets never continue down the
+        // session-decrypt path because no session exists between
+        // the peers at punch time. See
+        // `traversal::rendezvous`'s module docstring for the
+        // wire layout rationale.
+        //
+        // Ordered BEFORE the pingwave check because both reach
+        // into `data[0..2]`; keep-alives are shorter (14 vs 72)
+        // so the length guard disambiguates without cost.
+        #[cfg(feature = "nat-traversal")]
+        if data.len() == super::traversal::rendezvous::KEEPALIVE_LEN {
+            if let Some(ka) = super::traversal::rendezvous::decode_keepalive(&data) {
+                if let Some((_, tx)) = ctx.punch_observers.remove(&source) {
+                    let _ = tx.send(ka);
+                }
+                return;
+            }
         }
 
         // Check for pingwave. Pingwaves are a fixed 72-byte wire format
@@ -2154,6 +2728,153 @@ impl MeshNode {
                 .unwrap_or(0);
 
             Self::handle_capability_announcement(&payload, from_node, ctx);
+            return;
+        }
+
+        // Reflex probe: request → observer echoes the UDP-source
+        // SocketAddr of the requester. Response → completes the
+        // requester's pending oneshot. Both directions ride the
+        // same subprotocol; dispatch is length-based
+        // (see `traversal::reflex::decode`).
+        #[cfg(feature = "nat-traversal")]
+        if parsed.header.subprotocol_id == super::traversal::SUBPROTOCOL_REFLEX {
+            use super::traversal::reflex;
+            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let payload = events.into_iter().next().unwrap_or_default();
+            let Some(msg) = reflex::decode(&payload) else {
+                return;
+            };
+
+            let from_node = ctx
+                .peers
+                .iter()
+                .find(|e| e.value().session.session_id() == session.session_id())
+                .map(|e| e.value().node_id)
+                .unwrap_or(0);
+            if from_node == 0 {
+                return;
+            }
+
+            match msg {
+                reflex::ReflexMsg::Request => {
+                    // Echo the observed source address back. Source
+                    // is read from `PeerInfo.addr` — the last
+                    // address our kernel saw packets from this peer
+                    // arrive on, equivalent to a STUN server's
+                    // "observed source" because NAT-rewriting is
+                    // applied by the time packets reach our socket.
+                    let Some((dest_addr, dest_sess)) = ctx
+                        .peers
+                        .get(&from_node)
+                        .map(|e| (e.value().addr, e.value().session.clone()))
+                    else {
+                        return;
+                    };
+                    if ctx.partition_filter.contains(&dest_addr) {
+                        return;
+                    }
+                    let response = reflex::encode_response(dest_addr);
+                    let socket = ctx.socket.clone();
+                    tokio::spawn(async move {
+                        let pool = dest_sess.thread_local_pool();
+                        let mut builder = pool.get();
+                        let seq = {
+                            let stream = dest_sess
+                                .get_or_create_stream(super::traversal::SUBPROTOCOL_REFLEX as u64);
+                            stream.next_tx_seq()
+                        };
+                        let events = vec![response];
+                        let packet = builder.build_subprotocol(
+                            super::traversal::SUBPROTOCOL_REFLEX as u64,
+                            seq,
+                            &events,
+                            PacketFlags::NONE,
+                            super::traversal::SUBPROTOCOL_REFLEX,
+                        );
+                        let _ = socket.send_to(&packet, dest_addr).await;
+                    });
+                }
+                reflex::ReflexMsg::Response(observed) => {
+                    // Complete the pending probe (if any). A probe
+                    // that already timed out has no oneshot entry;
+                    // the late response is dropped silently.
+                    if let Some((_, (_gen, tx))) = ctx.pending_reflex_probes.remove(&from_node) {
+                        let _ = tx.send(observed);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Rendezvous coordinator: on `PunchRequest` from peer A,
+        // look up target B's reflex in the capability index and
+        // send `PunchIntroduce` to both sides with the shared
+        // `fire_at` timestamp. Plan §3 — the three-message dance
+        // for synchronized hole-punch.
+        //
+        // `PunchIntroduce` and `PunchAck` inbound wiring lands in
+        // stage 3c (endpoint role); stage 3b only handles the
+        // coordinator branch so the unit under test is the
+        // fan-out itself.
+        #[cfg(feature = "nat-traversal")]
+        if parsed.header.subprotocol_id == super::traversal::SUBPROTOCOL_RENDEZVOUS {
+            use super::traversal::rendezvous;
+            let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let payload = events.into_iter().next().unwrap_or_default();
+            let Some(msg) = rendezvous::decode(&payload) else {
+                return;
+            };
+
+            let from_node = ctx
+                .peers
+                .iter()
+                .find(|e| e.value().session.session_id() == session.session_id())
+                .map(|e| e.value().node_id)
+                .unwrap_or(0);
+            if from_node == 0 {
+                return;
+            }
+
+            match msg {
+                rendezvous::RendezvousMsg::PunchRequest(req) => {
+                    Self::handle_punch_request(from_node, req, ctx);
+                }
+                rendezvous::RendezvousMsg::PunchIntroduce(intro) => {
+                    // Endpoint side of the rendezvous. Complete
+                    // any installed observer waiter (for tests /
+                    // explicit awaits), then schedule the
+                    // keep-alive train + observer. The
+                    // `PunchAck` fires only once the observer
+                    // sees inbound traffic from `peer_reflex`
+                    // (or — on localhost — at the punch_deadline
+                    // fallback). Plan §3 endpoint semantics.
+                    if let Some((_, (_gen, tx))) = ctx.pending_punch_introduces.remove(&intro.peer)
+                    {
+                        let _ = tx.send(intro);
+                    }
+                    Self::schedule_punch(from_node, intro, ctx);
+                }
+                rendezvous::RendezvousMsg::PunchAck(ack) => {
+                    if ack.to_peer == ctx.local_node_id {
+                        // Final recipient: complete the correlation
+                        // oneshot keyed by `from_peer`. A late ack
+                        // for an abandoned `connect_direct` is
+                        // dropped silently.
+                        if let Some((_, (_gen, tx))) = ctx.pending_punch_acks.remove(&ack.from_peer)
+                        {
+                            let _ = tx.send(ack);
+                        }
+                    } else {
+                        // Coordinator role: forward verbatim to
+                        // `to_peer` via our session with that
+                        // peer. The forwarded ack keeps the same
+                        // bytes — `from_peer` still points at the
+                        // original sender, which is what the
+                        // recipient correlates on.
+                        Self::forward_punch_ack(ack, ctx);
+                    }
+                }
+            }
             return;
         }
 
@@ -3065,6 +3786,349 @@ impl MeshNode {
         });
     }
 
+    /// Coordinator-side handler for a `PunchRequest` from peer A
+    /// (who wants to punch to target B).
+    ///
+    /// Behavior (plan §3 coordinator steps 1–3):
+    ///
+    /// 1. Resolve B's reflex address. Preferred source is the
+    ///    `reflex_addr` field on B's latest signed
+    ///    `CapabilityAnnouncement` in the local index. Without a
+    ///    cached reflex, coordination can't proceed — we drop the
+    ///    request silently. A's side times out on
+    ///    `connect_direct` and falls back to routed-handshake.
+    /// 2. Pick `fire_at = now() + TraversalConfig::punch_fire_lead`
+    ///    (default 500 ms) — short enough to be under any plausible
+    ///    NAT keep-alive row timeout, long enough for both
+    ///    endpoints to receive `PunchIntroduce` and arm their
+    ///    timers.
+    /// 3. Fan out `PunchIntroduce` to both A and B with the
+    ///    respective counterpart's reflex and the shared
+    ///    `fire_at`.
+    ///
+    /// Best-effort: A unreachable-from-us or B not-in-our-peer-
+    /// table short-circuits. Neither is surfaced — the caller's
+    /// `connect_direct` timeout is the recovery path.
+    #[cfg(feature = "nat-traversal")]
+    fn handle_punch_request(
+        from_node: u64,
+        req: super::traversal::rendezvous::PunchRequest,
+        ctx: &DispatchCtx,
+    ) {
+        use super::traversal::rendezvous::{PunchIntroduce, RendezvousMsg};
+
+        // 1. Resolve B's reflex address. A's self-reported reflex
+        //    (carried on the request) is the fallback when the
+        //    capability cache doesn't have one yet — matches plan
+        //    decision 7's "prefer-cached, fall-back-to-announced."
+        //    But we do NOT override A's reflex with the cached one
+        //    if A also announces it: the cache may be stale after
+        //    a NAT rebind, and A's self-report is the freshest
+        //    observation from A's own perspective.
+        let Some(b_reflex) = ctx.capability_index.reflex_addr(req.target) else {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                target = format!("{:#x}", req.target),
+                "rendezvous: no cached reflex for target; dropping PunchRequest",
+            );
+            return;
+        };
+
+        // A's reflex comes from the request body. R trusts A's
+        // self-report over the cached value for A-side, per the
+        // note above; a mid-session rebind on A's gateway is
+        // visible to A before it propagates into R's capability
+        // cache via a re-announce.
+        let a_reflex = req.self_reflex;
+
+        // 2. Compute the shared fire time.
+        let fire_lead = ctx.traversal_config.punch_fire_lead;
+        let fire_at_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d
+                .saturating_add(fire_lead)
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+            Err(_) => {
+                // System clock pre-1970 — can't compute a
+                // meaningful fire_at. Drop rather than introduce
+                // with a garbage time that endpoints would
+                // interpret as "already past."
+                return;
+            }
+        };
+
+        // 3. Build introduce payloads. Each side learns the
+        //    counterpart's reflex + the shared fire_at.
+        let intro_to_a = RendezvousMsg::PunchIntroduce(PunchIntroduce {
+            peer: req.target,
+            peer_reflex: b_reflex,
+            fire_at_ms,
+        })
+        .encode();
+        let intro_to_b = RendezvousMsg::PunchIntroduce(PunchIntroduce {
+            peer: from_node,
+            peer_reflex: a_reflex,
+            fire_at_ms,
+        })
+        .encode();
+
+        // Look up sessions for both endpoints. If B isn't in our
+        // peer table we can't introduce — stage 5 SDK surface
+        // will map this to `RendezvousNoRelay` on A's side via
+        // the `connect_direct` timeout.
+        let Some((a_addr, a_session)) = ctx
+            .peers
+            .get(&from_node)
+            .map(|e| (e.value().addr, e.value().session.clone()))
+        else {
+            return;
+        };
+        let Some((b_addr, b_session)) = ctx
+            .peers
+            .get(&req.target)
+            .map(|e| (e.value().addr, e.value().session.clone()))
+        else {
+            tracing::trace!(
+                from_node = format!("{:#x}", from_node),
+                target = format!("{:#x}", req.target),
+                "rendezvous: target peer not directly connected; dropping",
+            );
+            return;
+        };
+
+        if ctx.partition_filter.contains(&a_addr) || ctx.partition_filter.contains(&b_addr) {
+            return;
+        }
+
+        let socket_a = ctx.socket.clone();
+        let socket_b = ctx.socket.clone();
+        tokio::spawn(async move {
+            let pool = a_session.thread_local_pool();
+            let mut builder = pool.get();
+            let seq = {
+                let stream =
+                    a_session.get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
+                stream.next_tx_seq()
+            };
+            let events = vec![intro_to_a];
+            let packet = builder.build_subprotocol(
+                super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                seq,
+                &events,
+                PacketFlags::NONE,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS,
+            );
+            let _ = socket_a.send_to(&packet, a_addr).await;
+        });
+        tokio::spawn(async move {
+            let pool = b_session.thread_local_pool();
+            let mut builder = pool.get();
+            let seq = {
+                let stream =
+                    b_session.get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
+                stream.next_tx_seq()
+            };
+            let events = vec![intro_to_b];
+            let packet = builder.build_subprotocol(
+                super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                seq,
+                &events,
+                PacketFlags::NONE,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS,
+            );
+            let _ = socket_b.send_to(&packet, b_addr).await;
+        });
+    }
+
+    /// Endpoint-side: schedule the keep-alive train + observer
+    /// after receiving a `PunchIntroduce`. Plan §3 endpoint
+    /// behavior, end-to-end:
+    ///
+    /// 1. At `fire_at`, `fire_at + 100ms`, `fire_at + 250ms`
+    ///    send a keep-alive packet to `intro.peer_reflex`. Raw
+    ///    UDP, no encryption — the peer has no session with us
+    ///    yet. The purpose is to open our side's NAT
+    ///    connection-tracking row, so the peer's keep-alive
+    ///    (fired in the same window on their side) can arrive.
+    /// 2. Install an observer on `punch_observers[peer_reflex]`.
+    ///    The receive loop's pre-session keep-alive recognition
+    ///    fires it on first matching inbound.
+    /// 3. Wait up to `punch_deadline` for the observer. On
+    ///    success, emit a `PunchAck` via the coordinator; on
+    ///    timeout, drop silently — the counterpart's
+    ///    `await_punch_ack` times out too, and `connect_direct`
+    ///    records the fallback.
+    ///
+    /// Best-effort throughout: a failed send at any step is
+    /// logged-and-skipped. Rendezvous is an optimization (plan
+    /// framing); routed-handshake is always the safety net.
+    #[cfg(feature = "nat-traversal")]
+    fn schedule_punch(
+        coordinator_node_id: u64,
+        intro: super::traversal::rendezvous::PunchIntroduce,
+        ctx: &DispatchCtx,
+    ) {
+        use super::traversal::rendezvous::{encode_keepalive, Keepalive, PunchAck, RendezvousMsg};
+
+        let Some((coord_addr, coord_session)) = ctx
+            .peers
+            .get(&coordinator_node_id)
+            .map(|e| (e.value().addr, e.value().session.clone()))
+        else {
+            return;
+        };
+        if ctx.partition_filter.contains(&coord_addr) {
+            return;
+        }
+        if ctx.partition_filter.contains(&intro.peer_reflex) {
+            return;
+        }
+
+        // Install the observer. A prior pending entry at the same
+        // addr (unusual — would mean two simultaneous punches to
+        // the same peer_reflex) is replaced; the earlier scheduler
+        // task sees a `SendError` on its oneshot.
+        let (obs_tx, obs_rx) = oneshot::channel();
+        ctx.punch_observers.insert(intro.peer_reflex, obs_tx);
+
+        // Compute keep-alive send delays. `fire_at_ms` is a Unix
+        // epoch millisecond value synthesized by R; we subtract
+        // "now" to get the lead. If the computed lead is
+        // negative (clock skew, slow path), treat as "fire
+        // immediately" rather than as an error.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let base_lead_ms = intro.fire_at_ms.saturating_sub(now_ms);
+        let base_lead = std::time::Duration::from_millis(base_lead_ms);
+        let offsets = [
+            base_lead,
+            base_lead.saturating_add(std::time::Duration::from_millis(100)),
+            base_lead.saturating_add(std::time::Duration::from_millis(250)),
+        ];
+
+        let local_node_id = ctx.local_node_id;
+        let peer_reflex = intro.peer_reflex;
+        let peer = intro.peer;
+        let socket_send = ctx.socket.clone();
+        let socket_ack = ctx.socket.clone();
+        let deadline = ctx.traversal_config.punch_deadline;
+        let punch_observers = ctx.punch_observers.clone();
+
+        // Keep-alive sender task: fires three packets at
+        // absolute offsets from the spawn instant. Each
+        // `offsets[i]` is the intended delay from `start`, not
+        // from the previous iteration — `sleep_until(start + offset)`
+        // keeps the schedule anchored so a slow `send_to` on
+        // packet N doesn't push packet N+1 past its deadline.
+        //
+        // History: an earlier revision did `sleep(offset)` in
+        // the loop, which cumulatively summed to 500 / 1100 /
+        // 1850 ms instead of 500 / 600 / 750 ms at the default
+        // fire_lead — the later packets missed the peer's punch
+        // window entirely. cubic flagged this as P1.
+        let keepalive_payload = encode_keepalive(&Keepalive {
+            sender_node_id: local_node_id,
+            punch_id: 0, // reserved; no generator wiring yet
+        });
+        tokio::spawn(async move {
+            let start = tokio::time::Instant::now();
+            for offset in offsets {
+                tokio::time::sleep_until(start + offset).await;
+                let _ = socket_send
+                    .send_to(&keepalive_payload[..], peer_reflex)
+                    .await;
+            }
+        });
+
+        // Observer task: waits for the receive loop to fire the
+        // oneshot. On success emits the PunchAck; on timeout /
+        // cancellation defers to `await_punch_observer_outcome`
+        // for cleanup so the map-eviction race against a
+        // replacement observer is handled in one place.
+        tokio::spawn(async move {
+            let outcome =
+                await_punch_observer_outcome(obs_rx, deadline, &punch_observers, peer_reflex).await;
+            if !outcome {
+                return;
+            }
+            // Observer fired — build + send the ack via the
+            // coordinator session, same shape as the former
+            // `send_punch_ack_via` helper.
+            let ack_body = RendezvousMsg::PunchAck(PunchAck {
+                from_peer: local_node_id,
+                to_peer: peer,
+                punch_id: 0,
+            })
+            .encode();
+            let pool = coord_session.thread_local_pool();
+            let mut builder = pool.get();
+            let seq = {
+                let stream = coord_session
+                    .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
+                stream.next_tx_seq()
+            };
+            let events = vec![ack_body];
+            let packet = builder.build_subprotocol(
+                super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                seq,
+                &events,
+                PacketFlags::NONE,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS,
+            );
+            let _ = socket_ack.send_to(&packet, coord_addr).await;
+        });
+    }
+
+    /// Coordinator-side: forward a `PunchAck` whose `to_peer`
+    /// isn't us to the session with `to_peer`. Best-effort —
+    /// if we don't have a session with `to_peer`, drop.
+    ///
+    /// Wire bytes are preserved intact: `from_peer` still names
+    /// the original sender so the recipient can correlate
+    /// against its `pending_punch_acks` map.
+    #[cfg(feature = "nat-traversal")]
+    fn forward_punch_ack(ack: super::traversal::rendezvous::PunchAck, ctx: &DispatchCtx) {
+        use super::traversal::rendezvous::RendezvousMsg;
+
+        let Some((dest_addr, dest_session)) = ctx
+            .peers
+            .get(&ack.to_peer)
+            .map(|e| (e.value().addr, e.value().session.clone()))
+        else {
+            tracing::trace!(
+                to_peer = format!("{:#x}", ack.to_peer),
+                "rendezvous: no session with PunchAck.to_peer; dropping",
+            );
+            return;
+        };
+        if ctx.partition_filter.contains(&dest_addr) {
+            return;
+        }
+
+        let body = RendezvousMsg::PunchAck(ack).encode();
+        let socket = ctx.socket.clone();
+        tokio::spawn(async move {
+            let pool = dest_session.thread_local_pool();
+            let mut builder = pool.get();
+            let seq = {
+                let stream = dest_session
+                    .get_or_create_stream(super::traversal::SUBPROTOCOL_RENDEZVOUS as u64);
+                stream.next_tx_seq()
+            };
+            let events = vec![body];
+            let packet = builder.build_subprotocol(
+                super::traversal::SUBPROTOCOL_RENDEZVOUS as u64,
+                seq,
+                &events,
+                PacketFlags::NONE,
+                super::traversal::SUBPROTOCOL_RENDEZVOUS,
+            );
+            let _ = socket.send_to(&packet, dest_addr).await;
+        });
+    }
+
     /// Decide whether a Subscribe from `from_node` on `channel` is allowed.
     ///
     /// Rules, in order:
@@ -3767,6 +4831,39 @@ impl MeshNode {
         sign: bool,
     ) -> Result<(), AdapterError> {
         let version = self.capability_version.fetch_add(1, Ordering::Relaxed) + 1;
+
+        // Piggyback the current NAT classification as a `nat:*`
+        // capability tag so peers can filter-match on NAT type,
+        // and the reflex address on the dedicated announcement
+        // field so peers have a direct-connect candidate without a
+        // separate discovery round-trip. Both are feature-gated on
+        // `nat-traversal` — callers compiled without the feature
+        // emit announcements identical to the pre-traversal format.
+        //
+        // The two reads happen under `traversal_publish_mu` so
+        // the announcement always carries a consistent (class,
+        // reflex) pair. Without the mutex, a concurrent
+        // set/clear/commit could interleave between our reads
+        // and let us publish a torn state — e.g., the new
+        // override's reflex paired with the pre-override NAT
+        // class. Cubic P1. The lock is held only for the two
+        // atomic reads, not across the signing or network send.
+        #[cfg(feature = "nat-traversal")]
+        let (caps, reflex_snapshot) = {
+            use super::traversal::classify::NatClass;
+            let _g = self.traversal_publish_mu.lock();
+            let class =
+                NatClass::from_u8(self.nat_class.load(std::sync::atomic::Ordering::Acquire));
+            let reflex = self.reflex_addr.load_full().map(|arc| *arc);
+            // Strip any prior `nat:*` tags before adding the fresh
+            // one so a reclassification doesn't leave a stale tag
+            // behind when the class transitions.
+            let mut next = caps;
+            next.tags.retain(|t| !t.starts_with("nat:"));
+            let next = next.add_tag(class.tag().to_string());
+            (next, reflex)
+        };
+
         let mut ann = CapabilityAnnouncement::new(
             self.node_id,
             self.identity.entity_id().clone(),
@@ -3774,6 +4871,10 @@ impl MeshNode {
             caps,
         )
         .with_ttl(ttl.as_secs().min(u32::MAX as u64) as u32);
+        #[cfg(feature = "nat-traversal")]
+        {
+            ann = ann.with_reflex_addr(reflex_snapshot);
+        }
         if sign {
             ann.sign(&self.identity);
         }
@@ -3829,6 +4930,406 @@ impl MeshNode {
     /// own `node_id`) whose latest announcement matches `filter`.
     pub fn find_peers_by_filter(&self, filter: &CapabilityFilter) -> Vec<u64> {
         self.capability_index.query(filter)
+    }
+
+    /// Read a peer's most recently advertised public reflex
+    /// `SocketAddr` from the capability index. `None` before the
+    /// peer has sent a stage-2 announcement, or when the peer was
+    /// compiled without `nat-traversal`.
+    ///
+    /// Stage 3 (rendezvous) reads this field to resolve the punch
+    /// target's public address. Exposed for observability and for
+    /// tests that want to verify capability-announcement propagation
+    /// of the reflex field.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn peer_reflex_addr(&self, peer_node_id: u64) -> Option<std::net::SocketAddr> {
+        self.capability_index.reflex_addr(peer_node_id)
+    }
+
+    /// Read a peer's most recently advertised NAT classification
+    /// from the capability index. Parses the `nat:*` tag on the
+    /// peer's announcement. Returns `NatClass::Unknown` when the
+    /// peer has not indexed (we've never received an announcement),
+    /// or the announcement carried no `nat:*` tag (peer was
+    /// compiled without `nat-traversal`, or hasn't classified yet).
+    ///
+    /// Consumed by the pair-type matrix (plan §3) — `connect_direct`
+    /// reads this to decide whether to attempt a punch or
+    /// short-circuit to the routed path.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn peer_nat_class(&self, peer_node_id: u64) -> super::traversal::classify::NatClass {
+        use super::traversal::classify::NatClass;
+        let Some(caps) = self.capability_index.get(peer_node_id) else {
+            return NatClass::Unknown;
+        };
+        for tag in caps.tags.iter() {
+            if let Some(class) = NatClass::from_tag(tag) {
+                return class;
+            }
+        }
+        NatClass::Unknown
+    }
+
+    /// Cumulative traversal counters — punch attempts, successes,
+    /// and relay fallbacks. Returns a consistent point-in-time
+    /// snapshot.
+    ///
+    /// See [`super::traversal::TraversalStatsSnapshot`] for the
+    /// field semantics. Counters are monotonic and never reset;
+    /// callers that want deltas should subtract snapshots.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn traversal_stats(&self) -> super::traversal::TraversalStatsSnapshot {
+        self.traversal_stats.snapshot()
+    }
+
+    /// Establish a direct session to `peer_node_id`, using the
+    /// pair-type matrix (plan §3) to decide between a direct
+    /// handshake, a rendezvous-coordinated single-shot punch, or
+    /// a routed-only fallback.
+    ///
+    /// # Flow
+    ///
+    /// 1. Read local + remote NAT classifications (self
+    ///    `nat_class()` + `peer_nat_class`). Unknown sides are
+    ///    handled per the matrix — never treated as "don't attempt"
+    ///    (plan decision 8).
+    /// 2. Resolve the peer's reflex address from the local
+    ///    capability index. Fails with
+    ///    [`super::traversal::TraversalError::PeerNotReachable`] if no reflex is
+    ///    cached (peer hasn't announced yet).
+    /// 3. Apply the matrix:
+    ///    - `Direct` → connect via the routing table's
+    ///      first-hop; `coordinator` is not consulted and its
+    ///      reachability is irrelevant. `relay_fallbacks`
+    ///      increments (we didn't attempt a punch).
+    ///    - `SkipPunch` → connect via `coordinator` as the
+    ///      relay; symmetric pairs have no better option.
+    ///      Fails with `PeerNotReachable` if `coordinator`
+    ///      isn't a live peer.
+    ///    - `SinglePunch` → ask `coordinator` to mediate via
+    ///      [`Self::request_punch`]. On successful introduction,
+    ///      increment `punches_attempted` + `punches_succeeded`
+    ///      and connect to `peer_reflex`. On failure, increment
+    ///      `punches_attempted` + `relay_fallbacks` and fall
+    ///      back to connecting via the coordinator — the plan's
+    ///      framing treats punch-failed as "optimization missed,"
+    ///      not a connectivity failure.
+    ///
+    /// # Scope note
+    ///
+    /// Stage 3c wires the orchestration + stats end-to-end but
+    /// always establishes the session via the routed handshake
+    /// through `coordinator` — the framing "traffic rides the
+    /// relay until a direct punch upgrades it" matches the plan's
+    /// "optimization, not correctness" contract. Stage 3d lands
+    /// the keep-alive train + `PunchAck` round-trip, at which
+    /// point a successful `SinglePunch` outcome upgrades to a
+    /// direct session; failed punches (or matrix-skipped pairs)
+    /// continue to resolve on the routed path as they do today.
+    ///
+    /// Stats are set on the stage-3c semantics already:
+    /// `punches_attempted` increments when the matrix picks
+    /// `SinglePunch` and the coordinator mediates; stage 3d
+    /// refines `punches_succeeded` / `relay_fallbacks` against
+    /// the real keep-alive outcome.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn connect_direct(
+        &self,
+        peer_node_id: u64,
+        peer_pubkey: &[u8; 32],
+        coordinator: u64,
+    ) -> Result<u64, super::traversal::TraversalError> {
+        use super::traversal::classify::{pair_action, PairAction};
+        use super::traversal::TraversalError;
+
+        // NOTE: `peer_reflex` and `coordinator` are deliberately
+        // NOT resolved here. Two separate cubic P1 reviews
+        // flagged that eager lookups + `PeerNotReachable` fast-
+        // fails at the top broke branches that didn't actually
+        // need those inputs — `Direct` doesn't need the
+        // coordinator, and `SkipPunch` / `SinglePunch` don't need
+        // the peer's reflex (SinglePunch gets it from the
+        // coordinator's `PunchIntroduce`; SkipPunch rides the
+        // coordinator relay and doesn't probe the peer directly).
+        // Both lookups now happen lazily inside the arms that
+        // actually consume them.
+
+        let local_class = self.nat_class();
+        let remote_class = self.peer_nat_class(peer_node_id);
+        let action = pair_action(local_class, remote_class);
+
+        // Resolve `coordinator` into a wire address. Only call
+        // from the SkipPunch / SinglePunch arms — `Direct`
+        // routes via the routing table (below).
+        let coordinator_addr = || {
+            self.peer_addrs
+                .get(&coordinator)
+                .map(|e| *e.value())
+                .ok_or(TraversalError::PeerNotReachable)
+        };
+
+        // Helper: `true` iff we already have a session with
+        // `peer_node_id` whose transport points at `want_addr`.
+        // Used by the branches below to decide whether to
+        // short-circuit (session is already on the path we want)
+        // vs. re-handshake to upgrade (session exists but on the
+        // wrong path — typically a relayed session that a fresh
+        // direct/punched attempt should replace). Cubic P1
+        // flagged that unconditionally short-circuiting on any
+        // existing session left callers stuck on the relay
+        // forever, defeating the optimization.
+        let session_matches = |want_addr: std::net::SocketAddr| {
+            self.peers
+                .get(&peer_node_id)
+                .map(|e| e.value().addr == want_addr)
+                .unwrap_or(false)
+        };
+
+        // Helper: open a session directly to `target_addr` by
+        // wrapping msg1 in a routing header and sending straight
+        // to the peer. Works for `Direct` (target_addr = peer_reflex)
+        // and for post-punch upgrade (same). Uses the dispatch-
+        // loop pending_handshakes path via `connect_via`, which
+        // avoids recv-loop contention on a post-`start()` node.
+        let connect_on_direct_path = |target_addr: std::net::SocketAddr| async move {
+            if session_matches(target_addr) {
+                return Ok(peer_node_id);
+            }
+            self.connect_via(target_addr, peer_pubkey, peer_node_id)
+                .await
+                .map_err(|e| TraversalError::Transport(e.to_string()))
+        };
+
+        // Helper: open a relayed session via `coord_addr`. Short-
+        // circuits only when an existing session is already on
+        // exactly that coordinator's path. An unrelated session
+        // (stale, dead, on a different hop) is NOT treated as
+        // success — Cubic P1 flagged that `contains_key`-based
+        // short-circuit here would mask a failed direct attempt
+        // behind whatever stale session happened to still be in
+        // the peers map, so `connect_direct` reported "success"
+        // without actually establishing the intended path. The
+        // handshake runs unless we can confirm the existing
+        // session is already the one this call was asked to
+        // resolve.
+        let connect_via_coordinator = |coord_addr: std::net::SocketAddr| async move {
+            if session_matches(coord_addr) {
+                return Ok(peer_node_id);
+            }
+            self.connect_via(coord_addr, peer_pubkey, peer_node_id)
+                .await
+                .map_err(|e| TraversalError::Transport(e.to_string()))
+        };
+
+        match action {
+            PairAction::Direct => {
+                // `Direct` pairs (Open/Open, Open/Cone,
+                // Open/Unknown, Unknown/Unknown, etc.) don't
+                // need the coordinator — the peer is publicly
+                // reachable at its advertised reflex. Send the
+                // routed-handshake packet straight to
+                // `peer_reflex`; the peer's dispatch loop sees
+                // `dest == self` and completes locally. Only
+                // when that direct attempt fails do we try the
+                // routing table's first-hop as a fallback
+                // (pingwave-installed routes, etc.). Cubic P2:
+                // the earlier implementation always went via
+                // the routing table, which added an unnecessary
+                // relay hop when a direct path was available.
+                //
+                // Stats note (cubic P1): `record_relay_fallback`
+                // fires only when we actually fall back to the
+                // routed path — not on entry. A successful
+                // direct connect is not a fallback; attributing
+                // it as one breaks `TraversalStats.relay_fallbacks`'s
+                // documented meaning ("ended up on the routed-
+                // handshake path") and makes the counter useless
+                // for assessing NAT-traversal effectiveness.
+                // `Direct` is the one branch that genuinely
+                // needs the peer's reflex — it's the wire target
+                // for the direct-handshake attempt. Resolve it
+                // lazily here (cubic P1): putting this lookup
+                // at the top of the function used to reject
+                // `SkipPunch` pairs (which don't need a reflex
+                // at all) with `PeerNotReachable`.
+                let peer_reflex = self
+                    .peer_reflex_addr(peer_node_id)
+                    .ok_or(TraversalError::PeerNotReachable)?;
+
+                match connect_on_direct_path(peer_reflex).await {
+                    Ok(id) => Ok(id),
+                    Err(_) => {
+                        // Direct handshake on `peer_reflex` failed.
+                        // Run the routing-table fallback
+                        // *unconditionally* — cubic P2 flagged
+                        // that short-circuiting on "any session
+                        // exists" would mask the failed direct
+                        // attempt behind a stale / unrelated
+                        // session, preventing the upgrade this
+                        // API is meant to attempt. If
+                        // `connect_routed` itself finds the
+                        // existing session is already on a valid
+                        // first-hop it'll succeed quickly; if no
+                        // route is cached it returns an honest
+                        // error the caller can observe.
+                        //
+                        // Stats ordering (cubic P2):
+                        // `record_relay_fallback` only fires
+                        // *after* `connect_routed` actually
+                        // succeeds. Bumping it before the
+                        // fallback runs would overcount — if
+                        // the routing-table path also fails,
+                        // the call returns Err and the counter
+                        // would still have moved, breaking
+                        // `relay_fallbacks`'s documented meaning
+                        // ("resolutions that stayed on the
+                        // routed path").
+                        let id = self
+                            .connect_routed(peer_pubkey, peer_node_id)
+                            .await
+                            .map_err(|e| TraversalError::Transport(e.to_string()))?;
+                        self.traversal_stats.record_relay_fallback();
+                        Ok(id)
+                    }
+                }
+            }
+            PairAction::SkipPunch => {
+                // Symmetric × Symmetric (and Symmetric ×
+                // Unknown). Punch can't land; the coordinator
+                // is the only way to relay. Fail fast if the
+                // caller's coordinator isn't reachable — there
+                // is no viable fallback in this branch.
+                //
+                // Stats note (cubic P2): `record_relay_fallback`
+                // runs only *after* `connect_via_coordinator`
+                // actually succeeds. A failed coordinator
+                // handshake returns Err without bumping, so
+                // `relay_fallbacks` continues to mean "ended
+                // up on the routed-handshake path" — not "the
+                // matrix picked the routed path but the
+                // handshake also failed."
+                let coord = coordinator_addr()?;
+                let id = connect_via_coordinator(coord).await?;
+                self.traversal_stats.record_relay_fallback();
+                Ok(id)
+            }
+            PairAction::SinglePunch => {
+                // Punch requires the coordinator for rendezvous
+                // mediation. Resolve it here (not eagerly at the
+                // top) so Direct-path callers with no active
+                // coordinator peer can still succeed.
+                let coord = coordinator_addr()?;
+                let self_reflex = self.reflex_addr().unwrap_or_else(|| self.local_addr());
+
+                // Install the PunchAck waiter BEFORE firing the
+                // request so a fast round-trip can't beat us to
+                // the correlation map. Generation-stamped so
+                // cleanup paths below only evict our own entry,
+                // not a racing concurrent call.
+                let (ack_tx, ack_rx) = oneshot::channel();
+                let ack_gen = self
+                    .next_waiter_gen
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.pending_punch_acks
+                    .insert(peer_node_id, (ack_gen, ack_tx));
+
+                let punch_outcome = self
+                    .request_punch(coordinator, peer_node_id, self_reflex)
+                    .await;
+
+                // Stats ordering (cubic P2): `record_punch_attempt`
+                // fires only when `request_punch` returns Ok —
+                // i.e., the coordinator mediated the introduction,
+                // which proves the send succeeded and the intro
+                // arrived. Bumping before knowing the outcome
+                // would overcount cases where no wire activity
+                // actually happened (coordinator unreachable,
+                // socket send failed). Similarly, the relay-
+                // fallback counters below only fire after the
+                // fallback handshake itself lands.
+                let intro = match punch_outcome {
+                    Ok(intro) => {
+                        self.traversal_stats.record_punch_attempt();
+                        intro
+                    }
+                    Err(_) => {
+                        // Coordinator mediation failed — no
+                        // point waiting for an ack that will
+                        // never come. Evict the waiter only if
+                        // it's still ours (a concurrent call may
+                        // have replaced it; cubic P1). No
+                        // `record_punch_attempt` — the wire
+                        // punch didn't happen. The relay-
+                        // fallback counter is bumped only after
+                        // `connect_via_coordinator` actually
+                        // succeeds.
+                        self.pending_punch_acks
+                            .remove_if(&peer_node_id, |_, (g, _)| *g == ack_gen);
+                        let id = connect_via_coordinator(coord).await?;
+                        self.traversal_stats.record_relay_fallback();
+                        return Ok(id);
+                    }
+                };
+
+                // Await the counterpart's PunchAck, forwarded by
+                // the coordinator. On success we try a direct
+                // handshake to the peer's advertised reflex —
+                // that's the whole point of the punch, and
+                // without it this code path is a fancy way of
+                // doing a relayed connect while lying in stats
+                // that a punch happened. On ack-timeout or
+                // direct-handshake failure we fall back to relay
+                // so the caller still gets a usable session.
+                let deadline = self.traversal_config.punch_deadline;
+                match tokio::time::timeout(deadline, ack_rx).await {
+                    Ok(Ok(_ack)) => {
+                        match connect_on_direct_path(intro.peer_reflex).await {
+                            Ok(id) => {
+                                self.traversal_stats.record_punch_success();
+                                Ok(id)
+                            }
+                            Err(_) => {
+                                // Punch opened but direct
+                                // handshake failed (NAT rebound
+                                // between ack and handshake, or
+                                // the peer's socket buffer
+                                // filled). Relay fallback — bump
+                                // `relay_fallbacks` only after
+                                // the coordinator handshake
+                                // actually lands.
+                                let id = connect_via_coordinator(coord).await?;
+                                self.traversal_stats.record_relay_fallback();
+                                Ok(id)
+                            }
+                        }
+                    }
+                    Ok(Err(_)) => {
+                        // Our sender was replaced by a concurrent
+                        // call — the map entry is now theirs, do
+                        // NOT remove. Fall through to relay on
+                        // our side.
+                        let id = connect_via_coordinator(coord).await?;
+                        self.traversal_stats.record_relay_fallback();
+                        Ok(id)
+                    }
+                    Err(_) => {
+                        self.pending_punch_acks
+                            .remove_if(&peer_node_id, |_, (g, _)| *g == ack_gen);
+                        let id = connect_via_coordinator(coord).await?;
+                        self.traversal_stats.record_relay_fallback();
+                        Ok(id)
+                    }
+                }
+            }
+        }
     }
 
     /// Rank peers for a scored requirement. Returns the best-
@@ -4478,6 +5979,543 @@ impl MeshNode {
 
         Ok((keys, source))
     }
+
+    // ── NAT traversal ──────────────────────────────────────────────────
+    //
+    // `SUBPROTOCOL_REFLEX` client. The handler half lives in the
+    // packet-dispatch loop (`process_local_packet`, in the
+    // `SUBPROTOCOL_REFLEX` branch) and echoes the observed UDP
+    // source back as a `ReflexResponse`. This method is the
+    // requester side: send an empty-body request, await the
+    // pending-oneshot, return the observed `SocketAddr`.
+    //
+    // Remember: reflex discovery is an optimization, not a
+    // connectivity guarantee. A `ReflexTimeout` or `PeerNotReachable`
+    // doesn't mean the peers can't talk; it means this specific
+    // address-discovery path didn't resolve.
+
+    /// Send one reflex probe to `peer_node_id` and return the
+    /// public `SocketAddr` the peer observed on the probe's UDP
+    /// envelope.
+    ///
+    /// Waits up to [`super::traversal::TraversalConfig::reflex_timeout`] (default
+    /// 3 s) for the response. Fails with [`super::traversal::TraversalError::ReflexTimeout`]
+    /// on timeout, [`super::traversal::TraversalError::PeerNotReachable`] if the peer
+    /// has no active session, or [`super::traversal::TraversalError::Transport`] on
+    /// a socket-level send failure.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn probe_reflex(
+        &self,
+        peer_node_id: u64,
+    ) -> Result<std::net::SocketAddr, super::traversal::TraversalError> {
+        use super::traversal::{reflex, TraversalError};
+
+        let peer_addr = self
+            .peer_addrs
+            .get(&peer_node_id)
+            .map(|e| *e.value())
+            .ok_or(TraversalError::PeerNotReachable)?;
+
+        // Install the pending-oneshot BEFORE sending so an
+        // improbably-fast response can still complete it. A
+        // previously-in-flight probe to the same peer is
+        // overwritten — its waiter will hit ReflexTimeout, which
+        // matches the "one probe per peer in flight" contract.
+        //
+        // Stamp each waiter with a unique generation so our
+        // timeout cleanup only evicts *our* entry, not a racing
+        // replacement. See `next_waiter_gen` doc for the race.
+        let (tx, rx) = oneshot::channel();
+        let gen = self
+            .next_waiter_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pending_reflex_probes.insert(peer_node_id, (gen, tx));
+
+        // Empty-body event frame on the reflex subprotocol.
+        let body = reflex::encode_request();
+        if let Err(e) = self
+            .send_subprotocol(peer_addr, super::traversal::SUBPROTOCOL_REFLEX, &body)
+            .await
+        {
+            self.pending_reflex_probes
+                .remove_if(&peer_node_id, |_, (g, _)| *g == gen);
+            return Err(TraversalError::Transport(e.to_string()));
+        }
+
+        let timeout = self.traversal_config.reflex_timeout;
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(addr)) => Ok(addr),
+            Ok(Err(_recv_err)) => {
+                // oneshot cancelled — treat as timeout. Only
+                // happens if a concurrent probe to the same peer
+                // replaced our sender; the replacement owns the
+                // map entry now and we must NOT touch it.
+                Err(TraversalError::ReflexTimeout)
+            }
+            Err(_elapsed) => {
+                self.pending_reflex_probes
+                    .remove_if(&peer_node_id, |_, (g, _)| *g == gen);
+                Err(TraversalError::ReflexTimeout)
+            }
+        }
+    }
+
+    /// The current NAT classification for this node. `Unknown`
+    /// until the classification sweep has run; updated atomically
+    /// by the sweep and by [`Self::reclassify_nat`]. Read-only for
+    /// external callers — the sweep is the only writer.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn nat_class(&self) -> super::traversal::classify::NatClass {
+        super::traversal::classify::NatClass::from_u8(
+            self.nat_class.load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    /// This node's public-facing `SocketAddr` as observed by a
+    /// remote peer during the classification sweep. `None` before
+    /// the first sweep has produced an observation. Exposed
+    /// primarily for tests + observability; the announce-
+    /// capabilities path piggybacks this value onto every signed
+    /// `CapabilityAnnouncement`.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn reflex_addr(&self) -> Option<std::net::SocketAddr> {
+        self.reflex_addr.load_full().map(|arc| *arc)
+    }
+
+    /// Install a runtime reflex override. Forces `nat_class =
+    /// Open` and `reflex_addr = Some(external)` immediately, and
+    /// short-circuits any further classifier sweeps until
+    /// [`Self::clear_reflex_override`] is called.
+    ///
+    /// # Publishing to peers
+    ///
+    /// This method updates only *local* state. To propagate the
+    /// change to peers, call [`Self::announce_capabilities`]
+    /// afterward. The setter resets the announce rate-limit
+    /// floor so the next announce is guaranteed to broadcast
+    /// rather than coalesce against the previous send — cubic
+    /// P2 pinned this, after flagging that callers who set an
+    /// override within `min_announce_interval` of a prior
+    /// announce would find peers still seeing the old reflex.
+    ///
+    /// **Optimization, not correctness.** A node with no override
+    /// still reaches every peer through the routed-handshake
+    /// path; the override just pins the publicly-advertised
+    /// address when it's already known (port-forwarded server, a
+    /// successful stage-4 port-mapping install, etc).
+    ///
+    /// Safe to call concurrently with `announce_capabilities` —
+    /// the triple-write runs under `traversal_publish_mu`
+    /// (alongside the announce's multi-field read), so a
+    /// concurrent announce either sees the pre-override state
+    /// or the fully-installed override, never a torn mix.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn set_reflex_override(&self, external: SocketAddr) {
+        use std::sync::atomic::Ordering;
+        // Hold the publication mutex across the triple-write.
+        // Without it, a concurrent `announce_capabilities_with`
+        // could interleave its two reads between our three
+        // writes and publish a torn state (e.g. the new reflex
+        // paired with the pre-override NAT class). The mutex is
+        // briefly contended only with other override writers or
+        // the announce multi-field read; single-field readers
+        // stay lock-free.
+        let _g = self.traversal_publish_mu.lock();
+        self.reflex_addr.store(Some(Arc::new(external)));
+        self.nat_class.store(
+            super::traversal::classify::NatClass::Open.as_u8(),
+            Ordering::Release,
+        );
+        self.reflex_override_active.store(true, Ordering::Release);
+
+        // Reset the rate-limit floor so the next
+        // `announce_capabilities` call is guaranteed to
+        // broadcast — cubic P2 flagged that the override
+        // setter's doc implies immediate peer visibility, but
+        // the rate limit could coalesce an announce that lands
+        // inside `min_announce_interval`. Callers that want
+        // peers to see the new reflex "right away" still need
+        // to call announce themselves; this just makes that
+        // call's broadcast step unconditional instead of
+        // coalesced.
+        *self.last_announce_at.lock() = None;
+    }
+
+    /// Drop a previously-installed runtime reflex override. The
+    /// classifier sweep resumes on its normal cadence; the next
+    /// sweep repopulates `reflex_addr` and `nat_class` from real
+    /// probe observations. `reflex_addr` is cleared to `None`
+    /// immediately so a between-sweep read doesn't return a stale
+    /// override value as "still current."
+    ///
+    /// # Publishing to peers
+    ///
+    /// Mirrors [`Self::set_reflex_override`]: only local state
+    /// changes here. Call [`Self::announce_capabilities`] after
+    /// this to tell peers. The rate-limit floor is reset so that
+    /// call broadcasts unconditionally.
+    ///
+    /// No-op when no override is active — safe to call
+    /// unconditionally during shutdown / port-mapping revoke
+    /// paths.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub fn clear_reflex_override(&self) {
+        use std::sync::atomic::Ordering;
+        // Hold the publication mutex across the flag flip + the
+        // field resets so a concurrent announce can't observe
+        // the cleared flag alongside the not-yet-reset reflex /
+        // NAT class (or vice versa). Same invariant as in
+        // `set_reflex_override`.
+        let _g = self.traversal_publish_mu.lock();
+        if !self.reflex_override_active.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        // Reset reflex_addr + nat_class to their pre-classification
+        // defaults so a caller reading immediately gets an honest
+        // "no current observation" answer rather than the stale
+        // override.
+        self.reflex_addr.store(None);
+        self.nat_class.store(
+            super::traversal::classify::NatClass::Unknown.as_u8(),
+            Ordering::Release,
+        );
+        // Same rate-limit reset as `set_reflex_override` — the
+        // next `announce_capabilities` call broadcasts
+        // unconditionally instead of coalescing against the
+        // previous send. See that method's comment for details
+        // (cubic P2).
+        *self.last_announce_at.lock() = None;
+    }
+
+    /// Testing / debugging hook: force this node's advertised
+    /// `NatClass` without running the probe sweep. On loopback
+    /// every node classifies as `Open`, which means the pair-type
+    /// matrix always picks `Direct` — useful for Open×Open cases
+    /// but leaves the `SinglePunch` path unexercised. Regression
+    /// tests that need to drive `connect_direct` through the
+    /// punch branch set this to `Cone` (or `Symmetric`) before
+    /// calling `announce_capabilities`, then the peer reads it
+    /// back via `peer_nat_class` and the matrix resolves to
+    /// `SinglePunch`.
+    ///
+    /// Not for production use: the classifier is the intended
+    /// writer, and forcing a class short-circuits real NAT
+    /// observation. Exposed as `pub` (not `pub(crate)`) only so
+    /// `tests/connect_direct.rs` can reach it from a separate
+    /// crate.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    #[doc(hidden)]
+    pub fn force_nat_class_for_test(&self, class: super::traversal::classify::NatClass) {
+        self.nat_class.store(class.as_u8(), Ordering::Release);
+    }
+
+    /// Test / debug accessor for the most-recent local
+    /// capability announcement. Returns `None` until the first
+    /// `announce_capabilities*` call. The stored value is the
+    /// coherent snapshot published by
+    /// [`Self::announce_capabilities_with`] under
+    /// `traversal_publish_mu` — regression tests for the
+    /// (class, reflex_addr) race read this instead of the
+    /// separate atomic accessors, which are lock-free and can
+    /// return torn pairs under concurrent mutation.
+    #[doc(hidden)]
+    pub fn local_announcement_for_test(&self) -> Option<Arc<CapabilityAnnouncement>> {
+        self.local_announcement.load_full()
+    }
+
+    /// Send a `PunchRequest` to a coordinator peer `relay`, asking
+    /// it to mediate a hole-punch to `target`. Returns the
+    /// `PunchIntroduce` produced by the coordinator (the one
+    /// arriving on this node's side of the introduction — carrying
+    /// `target`'s reflex and the shared `fire_at`).
+    ///
+    /// This is a stage-3b primitive: it exercises the coordinator
+    /// fan-out end-to-end but does not itself schedule the
+    /// keep-alive train or finalize the punched session. The
+    /// full `connect_direct` flow lands in stage 3c.
+    ///
+    /// Fails with:
+    /// - [`super::traversal::TraversalError::PeerNotReachable`] if `relay` has no
+    ///   active session.
+    /// - [`super::traversal::TraversalError::Transport`] on a socket-level send
+    ///   failure.
+    /// - [`super::traversal::TraversalError::PunchFailed`] if the coordinator
+    ///   doesn't introduce within [`super::traversal::TraversalConfig::punch_deadline`]
+    ///   (likely: R has no cached reflex for `target`).
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn request_punch(
+        &self,
+        relay: u64,
+        target: u64,
+        self_reflex: std::net::SocketAddr,
+    ) -> Result<super::traversal::rendezvous::PunchIntroduce, super::traversal::TraversalError>
+    {
+        use super::traversal::rendezvous::{PunchRequest, RendezvousMsg};
+        use super::traversal::TraversalError;
+
+        let relay_addr = self
+            .peer_addrs
+            .get(&relay)
+            .map(|e| *e.value())
+            .ok_or(TraversalError::PeerNotReachable)?;
+
+        // Install the waiter BEFORE sending. An improbably fast
+        // coordinator response (R is local, A is local) could
+        // otherwise arrive before the oneshot is registered.
+        // Keyed by `target` because the introduce we'll receive
+        // has `peer = target` in its body.
+        //
+        // Generation-stamped so our cleanup only evicts our own
+        // entry — a concurrent `request_punch` to the same
+        // target installs a new entry (and drops our sender),
+        // and that replacement must survive our timeout/send-
+        // failure remove. (Cubic P1.)
+        let (tx, rx) = oneshot::channel();
+        let gen = self
+            .next_waiter_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pending_punch_introduces.insert(target, (gen, tx));
+
+        let body = RendezvousMsg::PunchRequest(PunchRequest {
+            target,
+            self_reflex,
+        })
+        .encode();
+        if let Err(e) = self
+            .send_subprotocol(relay_addr, super::traversal::SUBPROTOCOL_RENDEZVOUS, &body)
+            .await
+        {
+            self.pending_punch_introduces
+                .remove_if(&target, |_, (g, _)| *g == gen);
+            return Err(TraversalError::Transport(e.to_string()));
+        }
+
+        let deadline = self.traversal_config.punch_deadline;
+        match tokio::time::timeout(deadline, rx).await {
+            Ok(Ok(intro)) => Ok(intro),
+            Ok(Err(_recv_err)) => {
+                // oneshot cancelled — another request_punch to the
+                // same target replaced our sender. Don't touch the
+                // map: the replacement owns the entry now.
+                Err(TraversalError::PunchFailed)
+            }
+            Err(_elapsed) => {
+                self.pending_punch_introduces
+                    .remove_if(&target, |_, (g, _)| *g == gen);
+                Err(TraversalError::PunchFailed)
+            }
+        }
+    }
+
+    /// Install a waiter for an incoming `PunchIntroduce` from
+    /// `counterpart`. The returned future resolves when the
+    /// dispatcher decodes a matching introduce, or with
+    /// [`super::traversal::TraversalError::PunchFailed`] after
+    /// [`super::traversal::TraversalConfig::punch_deadline`].
+    ///
+    /// Stage-3b responder-side primitive: the peer being punched
+    /// *into* uses this to observe the introduce without
+    /// initiating the flow itself. Stage 3c wires the keep-alive
+    /// train onto the returned introduce.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn await_punch_introduce(
+        &self,
+        counterpart: u64,
+    ) -> Result<super::traversal::rendezvous::PunchIntroduce, super::traversal::TraversalError>
+    {
+        use super::traversal::TraversalError;
+        let (tx, rx) = oneshot::channel();
+        let gen = self
+            .next_waiter_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pending_punch_introduces.insert(counterpart, (gen, tx));
+        let deadline = self.traversal_config.punch_deadline;
+        match tokio::time::timeout(deadline, rx).await {
+            Ok(Ok(intro)) => Ok(intro),
+            Ok(Err(_)) => Err(TraversalError::PunchFailed),
+            Err(_) => {
+                self.pending_punch_introduces
+                    .remove_if(&counterpart, |_, (g, _)| *g == gen);
+                Err(TraversalError::PunchFailed)
+            }
+        }
+    }
+
+    /// Install a waiter for an incoming `PunchAck` whose
+    /// `from_peer` matches `counterpart`. Stage-3d correlation
+    /// surface — the `SinglePunch` path in `connect_direct`
+    /// registers the waiter before firing `request_punch` and
+    /// awaits it afterward. Times out with
+    /// [`super::traversal::TraversalError::PunchFailed`] after
+    /// [`super::traversal::TraversalConfig::punch_deadline`].
+    ///
+    /// Note: the caller inserts the oneshot sender into
+    /// `pending_punch_acks` before issuing the request so the ack
+    /// can't arrive and be dropped before the await call is
+    /// entered.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn await_punch_ack(
+        &self,
+        counterpart: u64,
+    ) -> Result<super::traversal::rendezvous::PunchAck, super::traversal::TraversalError> {
+        use super::traversal::TraversalError;
+        let (tx, rx) = oneshot::channel();
+        let gen = self
+            .next_waiter_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pending_punch_acks.insert(counterpart, (gen, tx));
+        let deadline = self.traversal_config.punch_deadline;
+        match tokio::time::timeout(deadline, rx).await {
+            Ok(Ok(ack)) => Ok(ack),
+            Ok(Err(_)) => Err(TraversalError::PunchFailed),
+            Err(_) => {
+                self.pending_punch_acks
+                    .remove_if(&counterpart, |_, (g, _)| *g == gen);
+                Err(TraversalError::PunchFailed)
+            }
+        }
+    }
+
+    /// Fire the classification sweep. Picks up to two currently-
+    /// connected peers, runs [`Self::probe_reflex`] against each in
+    /// parallel, feeds the observations to
+    /// [`super::traversal::classify::ClassifyFsm`], and updates
+    /// `nat_class` + `reflex_addr` with the result.
+    ///
+    /// Runs at most one sweep at a time — a second call while a
+    /// sweep is in flight is a no-op. Exits early if fewer than 2
+    /// peers are currently connected; callers should check
+    /// [`Self::nat_class`] after the returned future completes to
+    /// see whether classification produced a definite verdict or
+    /// stayed at `Unknown`.
+    ///
+    /// Bounded by [`super::traversal::TraversalConfig::classify_deadline`] — even if
+    /// probes hang, the sweep returns within that window with
+    /// whatever observations arrived.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn reclassify_nat(&self) {
+        use super::traversal::classify::ClassifyFsm;
+
+        // Reflex-override short-circuit: an operator-set (or
+        // port-mapping installed) external address already tells
+        // us everything the classifier would: NAT type is Open,
+        // reflex is the override. Running the multi-peer probe
+        // sweep would only replace the overridden values with
+        // (possibly worse) observations — skip it.
+        if self
+            .reflex_override_active
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+
+        // Snapshot up to two peers. Two is enough to distinguish
+        // Cone vs. Symmetric (plan §2); sampling more adds probe
+        // traffic for no classification gain.
+        let peers: Vec<u64> = self.peers.iter().map(|e| *e.key()).take(2).collect();
+        if peers.len() < 2 {
+            return;
+        }
+
+        // Fire probes in parallel so the sweep finishes in one
+        // reflex_timeout window rather than N*timeout. Each probe
+        // already respects its own timeout via `probe_reflex`.
+        let bind = self.local_addr();
+        let futures = peers.iter().copied().map(|peer| async move {
+            let res = self.probe_reflex(peer).await;
+            (peer, res)
+        });
+        let deadline = self.traversal_config.classify_deadline;
+        let results = match tokio::time::timeout(deadline, futures::future::join_all(futures)).await
+        {
+            Ok(results) => results,
+            Err(_elapsed) => {
+                // Classification-deadline blown. Leave current
+                // classification untouched — a later sweep can
+                // retry; treating deadline-expired as "Unknown"
+                // would flap state on a temporarily slow link.
+                tracing::debug!("nat-traversal: classify_deadline elapsed, keeping prior state");
+                return;
+            }
+        };
+
+        let mut fsm = ClassifyFsm::new();
+        let mut latest_reflex: Option<std::net::SocketAddr> = None;
+        for (peer, res) in results {
+            if let Ok(addr) = res {
+                fsm.observe(peer, addr);
+                latest_reflex = Some(addr);
+            }
+        }
+
+        let class = fsm.classify(bind);
+        self.commit_reclassify_observations(class, latest_reflex);
+    }
+
+    /// Commit the result of a classification sweep.
+    ///
+    /// Split out from [`Self::reclassify_nat`] so the
+    /// override-race guard is unit-testable without standing up
+    /// a full probe mesh. The guard fixes a cubic-flagged P1
+    /// bug: the entry-time check in `reclassify_nat` races with
+    /// any `set_reflex_override` call that lands *during* the
+    /// probe sweep — the flag flips false→true while we're
+    /// awaiting probe futures, and a blind commit would silently
+    /// stomp the fresh override with whatever the classifier
+    /// observed. A port-mapping install is a strong signal (we
+    /// have a known-public `external` address) that outranks
+    /// peer-probed reflex; clobbering it would demote the node
+    /// from Open back to whatever NAT class the probes inferred
+    /// and could re-advertise the wrong reflex to peers.
+    #[cfg(feature = "nat-traversal")]
+    fn commit_reclassify_observations(
+        &self,
+        class: super::traversal::classify::NatClass,
+        latest_reflex: Option<std::net::SocketAddr>,
+    ) {
+        use std::sync::atomic::Ordering;
+        // Hold the publication mutex across the re-check + the
+        // (potentially) paired writes. This both makes the
+        // override mid-sweep guard atomic with the commit
+        // (no TOCTOU on the flag vs stores), and serializes
+        // against concurrent `announce_capabilities_with` reads
+        // so the classifier can't publish nat_class without
+        // reflex_addr (or vice versa) being visible together.
+        let _g = self.traversal_publish_mu.lock();
+        if self.reflex_override_active.load(Ordering::Acquire) {
+            tracing::debug!("nat-traversal: reflex override installed mid-sweep, skipping commit");
+            return;
+        }
+        self.nat_class.store(class.as_u8(), Ordering::Release);
+        if let Some(addr) = latest_reflex {
+            self.reflex_addr.store(Some(Arc::new(addr)));
+        }
+        tracing::debug!(
+            nat_class = ?class,
+            reflex = ?latest_reflex,
+            "nat-traversal: reclassified",
+        );
+    }
 }
 
 // ── Adapter trait impl ──────────────────────────────────────────────────
@@ -4578,5 +6616,269 @@ impl Drop for MeshNode {
         self.shutdown.store(true, Ordering::Release);
         self.shutdown_notify.notify_waiters();
         self.router.stop();
+    }
+}
+
+#[cfg(all(test, feature = "nat-traversal"))]
+mod punch_observer_tests {
+    //! Tests for [`await_punch_observer_outcome`].
+    //!
+    //! Regression coverage for a cubic-flagged bug (P2): earlier
+    //! revisions collapsed the `Ok(Err(_))` (sender dropped) and
+    //! `Err(_)` (deadline) arms into a single `remove`-in-both
+    //! branch, which evicted replacement observers. Each test
+    //! below pins one of the three outcomes independently.
+    use super::*;
+    use crate::adapter::net::traversal::rendezvous::Keepalive;
+    use tokio::sync::oneshot;
+
+    fn sample_ka() -> Keepalive {
+        Keepalive {
+            sender_node_id: 0x1234,
+            punch_id: 0,
+        }
+    }
+
+    fn sample_peer() -> SocketAddr {
+        "198.51.100.5:9001".parse().unwrap()
+    }
+
+    /// Keep-alive fires before the deadline — outcome is `true`
+    /// (caller emits ack). The map entry was consumed by the
+    /// receive loop when it fired the oneshot, so the helper
+    /// doesn't need to remove anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fires_true_when_keepalive_arrives() {
+        let observers: DashMap<SocketAddr, oneshot::Sender<Keepalive>> = DashMap::new();
+        let peer = sample_peer();
+        let (tx, rx) = oneshot::channel();
+        observers.insert(peer, tx);
+
+        // Simulate the receive loop firing the oneshot: remove
+        // from the map + send the keepalive.
+        let (_, fired_tx) = observers.remove(&peer).unwrap();
+        fired_tx.send(sample_ka()).expect("send");
+
+        let result =
+            await_punch_observer_outcome(rx, Duration::from_secs(1), &observers, peer).await;
+        assert!(result, "keepalive arrival should return true");
+    }
+
+    /// Deadline expires while our sender is still the live value
+    /// in the map — helper must evict the stale entry so a late
+    /// keep-alive doesn't find it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeout_evicts_own_stale_entry() {
+        let observers: DashMap<SocketAddr, oneshot::Sender<Keepalive>> = DashMap::new();
+        let peer = sample_peer();
+        let (tx, rx) = oneshot::channel();
+        observers.insert(peer, tx);
+
+        // Very short deadline; nobody fires.
+        let result =
+            await_punch_observer_outcome(rx, Duration::from_millis(50), &observers, peer).await;
+        assert!(!result, "timeout should return false");
+        assert!(
+            !observers.contains_key(&peer),
+            "timeout should evict our own stale entry",
+        );
+    }
+
+    /// The cubic-flagged regression: a newer observer replaces
+    /// ours (our sender is dropped). Our task's `Ok(Err(_))` arm
+    /// must **not** remove the peer_reflex key — it would evict
+    /// the replacement observer that's the current live value
+    /// in the map.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sender_dropped_leaves_replacement_observer_intact() {
+        let observers: DashMap<SocketAddr, oneshot::Sender<Keepalive>> = DashMap::new();
+        let peer = sample_peer();
+
+        // Install observer A.
+        let (tx_a, rx_a) = oneshot::channel::<Keepalive>();
+        observers.insert(peer, tx_a);
+
+        // Install observer B via insert — this drops A's sender
+        // (the old value returned from the insert is dropped
+        // immediately). Now the map contains B's sender.
+        let (tx_b, _rx_b) = oneshot::channel::<Keepalive>();
+        observers.insert(peer, tx_b);
+        assert!(observers.contains_key(&peer), "B's sender in map");
+
+        // A's task runs the cleanup helper. A's rx_a sees
+        // RecvError (tx_a dropped), outcome is `Ok(Err(_))`.
+        let result =
+            await_punch_observer_outcome(rx_a, Duration::from_secs(5), &observers, peer).await;
+        assert!(!result, "sender-dropped path returns false");
+        assert!(
+            observers.contains_key(&peer),
+            "B's sender must still be in the map — A's cleanup must not evict",
+        );
+    }
+
+    /// Idempotent-by-peer check: after a timeout-eviction,
+    /// removing again is a no-op. Prevents a hypothetical
+    /// double-eviction regression where the helper called
+    /// `remove` on every cleanup path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeout_then_sender_drop_does_not_double_evict() {
+        let observers: DashMap<SocketAddr, oneshot::Sender<Keepalive>> = DashMap::new();
+        let peer = sample_peer();
+
+        // First task: install A, let it time out, evict.
+        let (tx_a, rx_a) = oneshot::channel::<Keepalive>();
+        observers.insert(peer, tx_a);
+        let r1 =
+            await_punch_observer_outcome(rx_a, Duration::from_millis(20), &observers, peer).await;
+        assert!(!r1);
+        assert!(!observers.contains_key(&peer));
+
+        // Second task: install B, drop B's sender via a fresh
+        // insert from C — simulates the "replacement" scenario
+        // but now for a different observer lineage.
+        let (tx_b, rx_b) = oneshot::channel::<Keepalive>();
+        observers.insert(peer, tx_b);
+        let (tx_c, _rx_c) = oneshot::channel::<Keepalive>();
+        observers.insert(peer, tx_c);
+
+        // B's task cleanup. Must NOT remove peer (C is live).
+        let r2 = await_punch_observer_outcome(rx_b, Duration::from_secs(5), &observers, peer).await;
+        assert!(!r2);
+        assert!(
+            observers.contains_key(&peer),
+            "C's sender must remain after B's sender-dropped cleanup",
+        );
+    }
+}
+
+#[cfg(all(test, feature = "nat-traversal"))]
+mod reclassify_override_race_tests {
+    //! Regression coverage for a cubic-flagged P1 bug:
+    //! [`MeshNode::reclassify_nat`] checked
+    //! `reflex_override_active` only at entry, then ran the
+    //! multi-peer probe sweep, then committed the result. A
+    //! `set_reflex_override` call landing *after* the entry
+    //! check but *before* the commit was silently stomped:
+    //! the commit unconditionally overwrote `nat_class` and
+    //! `reflex_addr` with the probe-derived values, undoing
+    //! the freshly-installed override.
+    //!
+    //! Fix: [`MeshNode::reclassify_nat`] now calls
+    //! [`MeshNode::commit_reclassify_observations`], which
+    //! re-loads the flag before any store and bails out if an
+    //! override landed mid-sweep. Tests below pin that guard
+    //! without needing to stand up a real probe mesh.
+    use super::*;
+    use crate::adapter::net::traversal::classify::NatClass;
+    use std::net::SocketAddr;
+
+    async fn build_node_for_test() -> Arc<MeshNode> {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = MeshNodeConfig::new(addr, [0x17u8; 32]);
+        Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("MeshNode::new"),
+        )
+    }
+
+    /// Pre-fix behavior: with override inactive, the commit
+    /// path overwrites both `nat_class` and `reflex_addr`.
+    /// This pins the positive case so the guard doesn't
+    /// silently turn into a no-op.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_applies_when_override_inactive() {
+        let node = build_node_for_test().await;
+        let probed: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+
+        // Override flag is false by default.
+        node.commit_reclassify_observations(NatClass::Cone, Some(probed));
+
+        assert_eq!(node.nat_class(), NatClass::Cone);
+        assert_eq!(node.reflex_addr(), Some(probed));
+    }
+
+    /// The race guard: flag flipped true mid-sweep →
+    /// commit must be a no-op. Without the fix the `nat_class`
+    /// store and the `reflex_addr` store would land regardless,
+    /// demoting the override-provided Open/external-ip back to
+    /// the classifier's observation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_skips_when_override_installed_mid_sweep() {
+        let node = build_node_for_test().await;
+        let override_addr: SocketAddr = "203.0.113.77:9999".parse().unwrap();
+        let probed: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+
+        // Simulate the race: `reclassify_nat` passed its entry
+        // check with the flag false, ran probes, and is about
+        // to commit. In between, port-mapping install fires
+        // `set_reflex_override` — the flag flips true and the
+        // reflex/class are written.
+        node.set_reflex_override(override_addr);
+        assert_eq!(node.nat_class(), NatClass::Open);
+        assert_eq!(node.reflex_addr(), Some(override_addr));
+
+        // Now the classifier's (stale) commit tries to land.
+        // With the guard in place, it must be skipped.
+        node.commit_reclassify_observations(NatClass::Symmetric, Some(probed));
+
+        assert_eq!(
+            node.nat_class(),
+            NatClass::Open,
+            "mid-sweep commit stomped the override's NAT class — \
+             the node would be demoted from Open back to Symmetric",
+        );
+        assert_eq!(
+            node.reflex_addr(),
+            Some(override_addr),
+            "mid-sweep commit stomped the override reflex — the \
+             node would advertise the classifier's observation \
+             instead of the known-public mapping",
+        );
+    }
+
+    /// Same guard, but the `latest_reflex = None` path — when
+    /// every probe failed, the buggy commit *still* wrote
+    /// `nat_class` (only the `reflex_addr` store was gated by
+    /// `Some`). The fix's guard covers both stores.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_skips_nat_class_store_even_when_reflex_absent() {
+        let node = build_node_for_test().await;
+        let override_addr: SocketAddr = "203.0.113.77:9999".parse().unwrap();
+
+        node.set_reflex_override(override_addr);
+
+        // Classifier gave up (all probes failed); it would
+        // still store `Unknown` without the guard.
+        node.commit_reclassify_observations(NatClass::Unknown, None);
+
+        assert_eq!(
+            node.nat_class(),
+            NatClass::Open,
+            "`nat_class` was overwritten with Unknown even though \
+             `latest_reflex` was None — demonstrates the second \
+             half of the bug that the bare `if let Some` would've \
+             missed",
+        );
+        assert_eq!(node.reflex_addr(), Some(override_addr));
+    }
+
+    /// After `clear_reflex_override` is called, the classifier
+    /// regains write access. Without this, the fix would
+    /// permanently freeze classification once any override had
+    /// ever been installed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_resumes_after_override_cleared() {
+        let node = build_node_for_test().await;
+        let override_addr: SocketAddr = "203.0.113.77:9999".parse().unwrap();
+        let probed: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+
+        node.set_reflex_override(override_addr);
+        node.clear_reflex_override();
+
+        node.commit_reclassify_observations(NatClass::Cone, Some(probed));
+
+        assert_eq!(node.nat_class(), NatClass::Cone);
+        assert_eq!(node.reflex_addr(), Some(probed));
     }
 }

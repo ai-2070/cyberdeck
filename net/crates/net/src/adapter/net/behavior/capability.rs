@@ -730,6 +730,32 @@ pub struct CapabilityAnnouncement {
     /// omitted-when-zero form.
     #[serde(default, skip_serializing_if = "is_hop_count_zero")]
     pub hop_count: u8,
+    /// Observer-visible reflexive `SocketAddr` as seen by this
+    /// node's anchor peers during NAT classification. Populated
+    /// once [`crate::adapter::net::traversal::classify::ClassifyFsm`]
+    /// has ≥ 2 probe results; stays `None` on nodes that haven't
+    /// classified yet, ran with `nat-traversal` disabled, or
+    /// landed in the `Unknown` bucket (different peers disagree
+    /// on our port so no single address is truthful).
+    ///
+    /// **Peer usage.** Receivers cache this alongside the
+    /// `nat:*` tag and use it as the initial rendezvous target
+    /// for hole punching — one fewer reflex round-trip per
+    /// first-contact punch. The field is advisory: the punch
+    /// step still waits for a real keep-alive exchange on the
+    /// advertised address before handing off to the Noise
+    /// handshake, so a lying peer can only fail its own
+    /// incoming punches, not redirect traffic to a third party
+    /// (see `docs/NAT_TRAVERSAL_PLAN.md` §7 for the trust model).
+    ///
+    /// **Wire compat.** `skip_serializing_if` keeps the old
+    /// on-wire shape when the field is `None`, so pre-stage-2
+    /// nodes round-trip through a post-stage-2 deserializer
+    /// without breaking signatures. A post-stage-2 node
+    /// deserializing a pre-stage-2 announcement sees the field
+    /// default to `None` via `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflex_addr: Option<std::net::SocketAddr>,
 }
 
 /// Serde predicate: skip serializing `hop_count` when it's zero.
@@ -823,12 +849,26 @@ impl CapabilityAnnouncement {
             capabilities,
             signature: None,
             hop_count: 0,
+            reflex_addr: None,
         }
     }
 
     /// Set TTL
     pub fn with_ttl(mut self, ttl_secs: u32) -> Self {
         self.ttl_secs = ttl_secs;
+        self
+    }
+
+    /// Attach the classifier's observed reflex address. Typically
+    /// called by the mesh's capability-broadcast path after NAT
+    /// classification has completed at least two probes. Pass
+    /// `None` to clear a previously-set address — e.g. if
+    /// reclassification landed in `Unknown`.
+    ///
+    /// Included in the signed envelope: a post-signing change
+    /// invalidates verification.
+    pub fn with_reflex_addr(mut self, reflex: Option<std::net::SocketAddr>) -> Self {
+        self.reflex_addr = reflex;
         self
     }
 
@@ -1176,6 +1216,14 @@ pub struct IndexedNode {
     pub indexed_at: Instant,
     /// TTL
     pub ttl: Duration,
+    /// Peer's public-facing `SocketAddr` as advertised on the
+    /// announcement (stage 2 of `NAT_TRAVERSAL_PLAN.md`). `None`
+    /// when the sender was compiled without `nat-traversal` or
+    /// hasn't finished its classification sweep yet. Consumed by
+    /// the rendezvous coordinator (stage 3) — R looks up the
+    /// punch target's `reflex_addr` from the index instead of
+    /// probing it directly.
+    pub reflex_addr: Option<std::net::SocketAddr>,
 }
 
 /// High-performance capability index with inverted indexes
@@ -1251,6 +1299,7 @@ impl CapabilityIndex {
             version: ann.version,
             indexed_at: Instant::now(),
             ttl: Duration::from_secs(ann.ttl_secs as u64),
+            reflex_addr: ann.reflex_addr,
         };
         self.nodes.insert(node_id, indexed);
 
@@ -1456,6 +1505,15 @@ impl CapabilityIndex {
     /// Get node capabilities
     pub fn get(&self, node_id: u64) -> Option<CapabilitySet> {
         self.nodes.get(&node_id).map(|n| n.capabilities.clone())
+    }
+
+    /// Get the peer's last-advertised reflex address from the
+    /// index. Returns `None` when the peer hasn't indexed, or
+    /// indexed a version with no `reflex_addr` attached. Consumed
+    /// by the rendezvous coordinator (stage 3) — R looks up the
+    /// punch target's public `SocketAddr` here.
+    pub fn reflex_addr(&self, node_id: u64) -> Option<std::net::SocketAddr> {
+        self.nodes.get(&node_id).and_then(|n| n.reflex_addr)
     }
 
     /// Get all node IDs
@@ -1846,6 +1904,67 @@ mod tests {
     /// `CapabilityAnnouncement`'s derived Serialize writes in
     /// struct-declaration order. The mirror struct keeps the same
     /// serialization path.
+    #[test]
+    fn reflex_addr_roundtrips_through_serde_when_set() {
+        // Stage 2 of NAT traversal: `reflex_addr` rides the
+        // signed envelope when the classifier has an observed
+        // address. Round-trip must preserve it intact.
+        let reflex: std::net::SocketAddr = "198.51.100.5:54321".parse().unwrap();
+        let ann = CapabilityAnnouncement::new(1, test_entity(), 1, sample_capability_set())
+            .with_reflex_addr(Some(reflex));
+        let bytes = ann.to_bytes();
+        let restored = CapabilityAnnouncement::from_bytes(&bytes).expect("parse");
+        assert_eq!(restored.reflex_addr, Some(reflex));
+    }
+
+    #[test]
+    fn index_stores_and_returns_reflex_addr() {
+        // Stage 3 (rendezvous): the coordinator looks up the
+        // punch target's reflex address in its capability index.
+        // Regression-guard the storage path — without it, the
+        // coordinator would never find any reflex, effectively
+        // disabling the rendezvous optimization.
+        let reflex: std::net::SocketAddr = "198.51.100.9:40000".parse().unwrap();
+        let ann = CapabilityAnnouncement::new(42, test_entity(), 1, sample_capability_set())
+            .with_reflex_addr(Some(reflex));
+        let index = CapabilityIndex::new();
+        index.index(ann);
+        assert_eq!(index.reflex_addr(42), Some(reflex));
+        // Unknown node returns None — not a panic, not a default.
+        assert_eq!(index.reflex_addr(999), None);
+    }
+
+    #[test]
+    fn index_reflex_addr_none_when_unset_on_announcement() {
+        // A node compiled without nat-traversal (or that hasn't
+        // classified yet) announces with `reflex_addr = None`.
+        // The index round-trip must preserve that, not invent a
+        // bogus default that the coordinator would then try to
+        // punch to.
+        let ann = CapabilityAnnouncement::new(77, test_entity(), 1, sample_capability_set());
+        let index = CapabilityIndex::new();
+        index.index(ann);
+        assert_eq!(index.reflex_addr(77), None);
+    }
+
+    #[test]
+    fn reflex_addr_none_is_omitted_from_wire_bytes() {
+        // The `skip_serializing_if = "Option::is_none"` on
+        // `reflex_addr` is what preserves on-wire byte-compat
+        // with pre-stage-2 announcements. The canonical bytes
+        // must not mention `reflex_addr` at all when it's None —
+        // otherwise pre-stage-2 nodes' signatures wouldn't
+        // verify on post-stage-2 nodes (same shape of
+        // compatibility guarantee as `hop_count`).
+        let ann = CapabilityAnnouncement::new(1, test_entity(), 1, sample_capability_set());
+        let bytes = ann.to_bytes();
+        let text = std::str::from_utf8(&bytes).expect("valid utf8");
+        assert!(
+            !text.contains("reflex_addr"),
+            "reflex_addr key must be omitted when the field is None; got: {text}",
+        );
+    }
+
     #[test]
     fn signed_payload_stays_compatible_with_pre_hop_count_format() {
         use super::super::super::identity::{EntityId, EntityKeypair};

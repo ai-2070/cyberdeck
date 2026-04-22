@@ -23,6 +23,18 @@ jetstream = ["net/jetstream"]
 # separate NAPI flags would only enable combinations that don't
 # actually work end-to-end.
 net = ["net/net", "dep:hex"]
+# NAT traversal — reflex probes, classification, rendezvous-
+# coordinated hole-punch, and the stats surface. Exposed as
+# optional on the NAPI class (methods return a typed Traversal
+# error with stable `kind` discriminator when invoked; none of
+# the existing surface changes). Framing (plan §5): traversal
+# is an optimization, not a connectivity requirement. See the
+# `NAT_TRAVERSAL_PLAN.md` top-of-doc framing rules.
+nat-traversal = ["net", "net/nat-traversal"]
+# Port mapping — opportunistic UPnP-IGD / NAT-PMP / PCP at
+# startup. Exposes `tryPortMapping?: boolean` on `MeshOptions`.
+# Builds on `nat-traversal`.
+port-mapping = ["nat-traversal", "net/port-mapping"]
 cortex = ["net/netdb", "net/redex-disk"]
 # Compute surface — `DaemonRuntime`, `MeshDaemon`, migration. Stage 3
 # of SDK_COMPUTE_SURFACE_PLAN. Depends on `net` (mesh transport is

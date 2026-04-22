@@ -1,0 +1,115 @@
+//! Regression test for the ephemeral-port TOCTOU race that used
+//! to live in every NAT-traversal test file.
+//!
+//! # Background
+//!
+//! The old `find_ports(n)` helper pattern:
+//!
+//! ```ignore
+//! let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+//! ports.push(sock.local_addr().unwrap().port());
+//! sockets.push(sock);
+//! // ...
+//! drop(sockets);
+//! tokio::time::sleep(Duration::from_millis(10)).await;
+//! ports
+//! ```
+//!
+//! reserved a port, read it, dropped the socket, then later fed
+//! the port to `MeshNode::new(addr, psk)` which re-bound. Between
+//! the drop and the rebind, any other process (or parallel test)
+//! could grab the port, flaking the bind with `EADDRINUSE`. cubic
+//! flagged this as P2.
+//!
+//! # Fix
+//!
+//! All NAT-traversal test helpers now bind to `127.0.0.1:0` and
+//! let the OS pick a free port — no predetermined-port pattern,
+//! no reservation window. `local_addr()` reads the actually-bound
+//! port after construction.
+//!
+//! # This test
+//!
+//! Concurrently spawns `N_NODES` mesh nodes at `127.0.0.1:0` and
+//! asserts:
+//!
+//! 1. Every node binds successfully.
+//! 2. The ports are all distinct (the OS really did pick N free
+//!    ports rather than handing us the same port twice).
+//!
+//! Without the fix, running this test alongside itself (or any
+//! other test suite with a `find_ports` helper) would eventually
+//! produce `EADDRINUSE` flakes. After the fix, parallel binding
+//! is race-free by construction.
+//!
+//! Run: `cargo test --features net --test parallel_bind_stress`
+
+#![cfg(feature = "net")]
+
+use std::collections::HashSet;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
+
+const N_NODES: usize = 32;
+const TEST_BUFFER_SIZE: usize = 256 * 1024;
+const PSK: [u8; 32] = [0x42u8; 32];
+
+fn test_config() -> MeshNodeConfig {
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut cfg = MeshNodeConfig::new(addr, PSK)
+        .with_heartbeat_interval(Duration::from_millis(200))
+        .with_session_timeout(Duration::from_secs(5))
+        .with_handshake(3, Duration::from_secs(2));
+    cfg.socket_buffers = SocketBufferConfig {
+        send_buffer_size: TEST_BUFFER_SIZE,
+        recv_buffer_size: TEST_BUFFER_SIZE,
+    };
+    cfg
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_mesh_nodes_bind_to_distinct_ports() {
+    // Spawn N_NODES concurrent construction tasks. Each binds to
+    // `:0` independently; the OS allocates a distinct port per
+    // socket.
+    let handles: Vec<_> = (0..N_NODES)
+        .map(|_| {
+            tokio::spawn(async move {
+                let keypair = EntityKeypair::generate();
+                MeshNode::new(keypair, test_config())
+                    .await
+                    .map(|node| node.local_addr())
+            })
+        })
+        .collect();
+
+    let mut ports: Vec<u16> = Vec::with_capacity(N_NODES);
+    for (i, h) in handles.into_iter().enumerate() {
+        let addr = h
+            .await
+            .expect("spawn task panicked")
+            .unwrap_or_else(|e| panic!("node {i}: MeshNode::new failed: {e}"));
+        ports.push(addr.port());
+    }
+
+    // Distinct-port property. A HashSet of the collected ports
+    // must have exactly N_NODES entries — any collision means the
+    // OS handed us the same port twice, which shouldn't happen on
+    // any platform we support.
+    let distinct: HashSet<u16> = ports.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        N_NODES,
+        "expected {N_NODES} distinct ports; got {} ({:?})",
+        distinct.len(),
+        ports,
+    );
+
+    // Sanity: all non-zero (we asked for `:0`; kernel must pick a
+    // real port).
+    for (i, p) in ports.iter().enumerate() {
+        assert_ne!(*p, 0, "node {i} got port 0; kernel didn't allocate");
+    }
+}

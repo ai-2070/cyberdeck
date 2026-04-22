@@ -61,6 +61,8 @@ pub mod subnet;
 pub mod subprotocol;
 mod swarm;
 mod transport;
+#[cfg(feature = "nat-traversal")]
+pub mod traversal;
 
 #[cfg(target_os = "linux")]
 mod linux;

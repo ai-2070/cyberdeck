@@ -18,6 +18,18 @@ default = ["redis", "net"]
 redis = ["net/redis"]
 jetstream = ["net/jetstream"]
 net = ["net/net", "dep:hex"]
+# NAT traversal — reflex probes, classification, rendezvous-
+# coordinated hole-punch, and the stats surface. Exposes
+# `nat_type`, `reflex_addr`, `probe_reflex`, `reclassify_nat`,
+# `traversal_stats`, and `connect_direct` on `NetMesh`. Off by
+# default — the routed-handshake path reaches every peer
+# regardless of this feature. Framing (plan §5): traversal is
+# an optimization, not a connectivity requirement.
+nat-traversal = ["net", "net/nat-traversal"]
+# Port mapping — opportunistic UPnP / NAT-PMP / PCP. Exposes
+# `try_port_mapping=None` as a `NetMesh.__init__` kwarg. Builds
+# on `nat-traversal`.
+port-mapping = ["nat-traversal", "net/port-mapping"]
 cortex = ["net/netdb", "net/redex-disk"]
 # Stage 5 of `SDK_COMPUTE_SURFACE_PLAN.md` — Python surface for
 # the `MeshDaemon` / migration runtime. Requires the `net` feature

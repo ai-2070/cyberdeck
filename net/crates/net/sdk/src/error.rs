@@ -42,6 +42,28 @@ pub enum SdkError {
     /// structured reason.
     #[error("channel membership rejected: {0:?}")]
     ChannelRejected(Option<net::adapter::net::AckReason>),
+
+    /// NAT-traversal failure — a reflex probe, hole-punch, or
+    /// port-mapping path couldn't complete. Always represents a
+    /// missed *optimization*, never a connectivity failure:
+    /// every NATed peer remains reachable through the routed-
+    /// handshake path. `kind` is a stable discriminator
+    /// matching the `nat-traversal` crate's error vocabulary
+    /// (`reflex-timeout` / `peer-not-reachable` / `transport` /
+    /// `rendezvous-no-relay` / `rendezvous-rejected` /
+    /// `punch-failed` / `port-map-unavailable` / `unsupported`).
+    #[cfg(feature = "nat-traversal")]
+    #[error("traversal {kind}: {message}")]
+    Traversal {
+        /// Stable machine-readable discriminator — same value as
+        /// `TraversalError::kind()`. Never localized; never
+        /// changed once a variant has shipped.
+        kind: &'static str,
+        /// Human-readable detail (e.g. the underlying socket
+        /// error on a `transport` failure). Empty for kinds
+        /// that have no variable detail.
+        message: String,
+    },
 }
 
 #[cfg(feature = "net")]
@@ -71,6 +93,16 @@ impl From<net::error::ConsumerError> for SdkError {
 impl From<net::error::AdapterError> for SdkError {
     fn from(e: net::error::AdapterError) -> Self {
         SdkError::Adapter(e.to_string())
+    }
+}
+
+#[cfg(feature = "nat-traversal")]
+impl From<net::adapter::net::traversal::TraversalError> for SdkError {
+    fn from(e: net::adapter::net::traversal::TraversalError) -> Self {
+        SdkError::Traversal {
+            kind: e.kind(),
+            message: e.to_string(),
+        }
     }
 }
 

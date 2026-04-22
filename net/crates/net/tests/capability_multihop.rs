@@ -17,26 +17,14 @@ use std::time::Duration;
 
 use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet};
 use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
-use tokio::net::UdpSocket;
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
 
-async fn find_ports(n: usize) -> Vec<u16> {
-    let mut ports = Vec::with_capacity(n);
-    let mut sockets = Vec::with_capacity(n);
-    for _ in 0..n {
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        ports.push(sock.local_addr().unwrap().port());
-        sockets.push(sock);
-    }
-    drop(sockets);
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    ports
-}
-
-fn test_config(port: u16) -> MeshNodeConfig {
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+fn test_config() -> MeshNodeConfig {
+    // Bind via `127.0.0.1:0` so the OS picks a free port — no
+    // pre-bind reservation, no TOCTOU race with parallel tests.
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut cfg = MeshNodeConfig::new(addr, PSK)
         .with_heartbeat_interval(Duration::from_millis(200))
         .with_session_timeout(Duration::from_secs(5))
@@ -49,8 +37,8 @@ fn test_config(port: u16) -> MeshNodeConfig {
     cfg
 }
 
-async fn build_node(port: u16) -> Arc<MeshNode> {
-    let cfg = test_config(port);
+async fn build_node() -> Arc<MeshNode> {
+    let cfg = test_config();
     let keypair = EntityKeypair::generate();
     Arc::new(MeshNode::new(keypair, cfg).await.expect("MeshNode::new"))
 }
@@ -102,10 +90,9 @@ where
 async fn three_node_chain_propagates() {
     // Topology: A ↔ B ↔ C (no direct A-C link).
     // Expect: C sees A's announcement via B's re-broadcast.
-    let ports = find_ports(3).await;
-    let a = build_node(ports[0]).await;
-    let b = build_node(ports[1]).await;
-    let c = build_node(ports[2]).await;
+    let a = build_node().await;
+    let b = build_node().await;
+    let c = build_node().await;
 
     handshake_no_start(&a, &b).await;
     handshake_no_start(&b, &c).await;
@@ -143,14 +130,13 @@ async fn origin_rate_limit_coalesces_bursts() {
     // window coalesces. A's own self-index still reflects the
     // latest caps because `capability_index.index` runs before the
     // rate-limit gate.
-    let ports = find_ports(2).await;
 
     let a = {
-        let cfg = test_config(ports[0]).with_min_announce_interval(Duration::from_secs(5));
+        let cfg = test_config().with_min_announce_interval(Duration::from_secs(5));
         let keypair = EntityKeypair::generate();
         Arc::new(MeshNode::new(keypair, cfg).await.expect("MeshNode::new"))
     };
-    let b = build_node(ports[1]).await;
+    let b = build_node().await;
 
     handshake_no_start(&a, &b).await;
     start_all(&[&a, &b]);
@@ -208,10 +194,9 @@ async fn route_install_from_multihop_receipt() {
     // to B's address. The metric carries the pingwave convention
     // (hop_count + 2) so direct routes always beat announcement-
     // installed routes.
-    let ports = find_ports(3).await;
-    let a = build_node(ports[0]).await;
-    let b = build_node(ports[1]).await;
-    let c = build_node(ports[2]).await;
+    let a = build_node().await;
+    let b = build_node().await;
+    let c = build_node().await;
 
     handshake_no_start(&a, &b).await;
     handshake_no_start(&b, &c).await;
@@ -262,11 +247,10 @@ async fn dedup_drops_duplicate_at_converge_point() {
     // assert the observable consequence: D's capability index
     // holds exactly one version entry for A, and the announcement
     // lands visible via `find_peers_by_filter`.
-    let ports = find_ports(4).await;
-    let a = build_node(ports[0]).await;
-    let b = build_node(ports[1]).await;
-    let c = build_node(ports[2]).await;
-    let d = build_node(ports[3]).await;
+    let a = build_node().await;
+    let b = build_node().await;
+    let c = build_node().await;
+    let d = build_node().await;
 
     // Wire the diamond. Each edge is an independent handshake so D
     // receives the announcement through two disjoint paths.
@@ -320,16 +304,15 @@ async fn late_joiner_converges_via_multihop_rebroadcast() {
     //
     // Tight min_announce_interval so the second announce actually
     // broadcasts; otherwise the 10s default rate-limits it.
-    let ports = find_ports(3).await;
 
-    let build_with_interval = |port: u16, interval: Duration| async move {
-        let cfg = test_config(port).with_min_announce_interval(interval);
+    let build_with_interval = |interval: Duration| async move {
+        let cfg = test_config().with_min_announce_interval(interval);
         let keypair = EntityKeypair::generate();
         Arc::new(MeshNode::new(keypair, cfg).await.expect("MeshNode::new"))
     };
 
-    let a = build_with_interval(ports[0], Duration::from_millis(50)).await;
-    let b = build_node(ports[1]).await;
+    let a = build_with_interval(Duration::from_millis(50)).await;
+    let b = build_node().await;
 
     handshake_no_start(&a, &b).await;
     start_all(&[&a, &b]);
@@ -347,7 +330,7 @@ async fn late_joiner_converges_via_multihop_rebroadcast() {
     );
 
     // C joins later through B.
-    let c = build_node(ports[2]).await;
+    let c = build_node().await;
     handshake_no_start(&b, &c).await;
     c.start();
 

@@ -250,6 +250,20 @@ ProximityGraph for Node A:
 
 Discovery is emergent. There are no bootstrap servers, no DNS, no service registry. After first contact (manual address, LAN broadcast, QR code, cached peers), pingwaves propagate and the proximity graph builds itself. Nodes that go silent are pruned. Nodes that appear are integrated. The graph is always a reflection of current reality.
 
+## NAT Traversal
+
+**Optimization, not correctness.** Two peers behind NATs already reach each other through routed handshakes + relay forwarding — the fallback path never goes away. What NAT traversal adds is a shorter path when a direct punch is feasible, cutting the per-packet relay tax and the load concentrated on topological relays. Nothing below is required to talk to NATed peers; it's required to talk to them *faster*. Full design in [`NAT_TRAVERSAL_PLAN.md`](docs/NAT_TRAVERSAL_PLAN.md).
+
+**Classification is peer-probed, not STUN-style.** Each node sends a reflex probe on `SUBPROTOCOL_REFLEX` (`0x0D00`) to a small set of connected peers and classifies itself as `Open`, `Cone`, `Symmetric`, or `Unknown` from the observed reflex addresses. The result rides on capability announcements as a `nat:*` tag + a dedicated `reflex_addr` field, so every peer gains a direct-connect candidate without a separate discovery round-trip.
+
+**Rendezvous is three messages on `SUBPROTOCOL_RENDEZVOUS` (`0x0D01`).** A sends `PunchRequest` to a mutually-connected coordinator R; R fans out `PunchIntroduce` to both A and B carrying the counterpart's reflex + a synchronized `fire_at`; at `fire_at` each side sends a short keep-alive train to prime NAT state, and the observer fires a `PunchAck` via the routed path to confirm. A pair-type matrix (plan §8) decides per connection whether to punch, skip (Symmetric × Symmetric), or go direct — `MeshNode::connect_direct` drives this end-to-end.
+
+**Port mapping is opt-in.** `MeshNodeConfig::with_try_port_mapping(true)` spawns a task that probes NAT-PMP (RFC 6886, inlined codec with RFC-mandated kernel source-address filter), falls back to UPnP-IGD (`igd-next`), installs a mapping on success, and renews every 30 minutes. On install it calls `set_reflex_override(external)` which promotes the node to `Open` with the mapped address; on 3 consecutive renewal failures or shutdown it revokes and clears. Port mapping is a latency optimization on top of an already-working routed mesh — a router that doesn't speak either protocol leaves the node on the classifier path, which is fine. Full design in [`PORT_MAPPING_PLAN.md`](docs/PORT_MAPPING_PLAN.md).
+
+**Stats are decision / action / outcome, not matrix guesses.** `MeshNode::traversal_stats()` returns three monotonic counters: `punches_attempted` (coordinator mediated a `PunchRequest` + `PunchIntroduce` round-trip — bumped only on successful wire activity), `punches_succeeded` (ack arrived AND direct handshake landed), `relay_fallbacks` (session landed on the routed-handshake path after either a `SkipPunch` decision, a failed punch, or a failed direct attempt — bumped only after the fallback handshake itself succeeds). The counters partition real activity; operators can use them to gauge traversal effectiveness without inflation from matrix-only decisions or double-failed calls.
+
+**Feature-gated.** `nat-traversal` turns on the classifier, rendezvous, and `connect_direct`; `port-mapping` adds the router-control surface. Both are disabled by default so a build without the features produces a cdylib identical to the pre-traversal one — the Go / NAPI / PyO3 bindings keep their NAT-traversal symbols as fallback stubs that return `ErrTraversalUnsupported` (or the binding's equivalent), so callers can link unconditionally and discover the feature gate at runtime.
+
 ## Subnets
 
 The mesh is logically flat but scales via hierarchical partitioning. A `SubnetId` packs 4 levels into 4 bytes:
@@ -750,6 +764,8 @@ net_shutdown(node);
 | Redis Streams | `redis` | `redis` crate |
 | NATS JetStream | `jetstream` | `async-nats` |
 | Net transport | `net` | `chacha20poly1305`, `snow`, `blake2`, `dashmap`, `socket2`, `ed25519-dalek` |
+| NAT traversal (classifier + rendezvous + `connect_direct`) | `nat-traversal` | `net` |
+| Port mapping (NAT-PMP inlined + UPnP-IGD) | `port-mapping` | `nat-traversal`, `igd-next` |
 | Regex filters | `regex` | `regex` crate |
 | C FFI | `ffi` | -- |
 | RedEX (local append-only log) | `redex` | `net`, `tokio-stream`, `postcard` |
@@ -887,6 +903,8 @@ cargo bench --bench parallel
 | `0x0900` | Replica group coordination (reserved) |
 | `0x0A00` | Channel membership (subscribe / unsubscribe / ack) |
 | `0x0B00` | Stream credit window (v2 backpressure — receiver→sender grants, 12-byte fixed message; see [`STREAM_BACKPRESSURE_PLAN_V2.md`](docs/STREAM_BACKPRESSURE_PLAN_V2.md)) |
+| `0x0D00` | NAT reflex probe (request / response, `nat-traversal` feature) |
+| `0x0D01` | NAT rendezvous (`PunchRequest` / `PunchIntroduce` / `PunchAck`, `nat-traversal` feature) |
 | `0x1000..0xEFFF` | Vendor / third-party |
 | `0xF000..0xFFFF` | Experimental / ephemeral |
 
