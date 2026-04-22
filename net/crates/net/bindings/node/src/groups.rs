@@ -302,6 +302,23 @@ fn parse_seed(buf: Buffer) -> Result<[u8; 32]> {
 // TSFN factory round-trip can unblock on the Node main thread.
 // =========================================================================
 
+/// Narrow a `u32` member-count to `u8` with a typed error on
+/// overflow. Naming the error through `daemon: group: invalid-config`
+/// keeps it in the same typed-error namespace as the other group
+/// validation paths; a silent `as u8` wrap would turn a caller's
+/// `replicaCount: 300` into 44 replicas with no diagnostic.
+fn count_u8(field: &str, n: u32) -> Result<u8> {
+    u8::try_from(n).map_err(|_| {
+        Error::from_reason(format!(
+            "{} group: invalid-config: {} {} exceeds {}",
+            ERR_DAEMON_PREFIX,
+            field,
+            n,
+            u8::MAX,
+        ))
+    })
+}
+
 pub(crate) async fn spawn_replica_group(
     runtime: SdkDaemonRuntime,
     kind: String,
@@ -309,7 +326,7 @@ pub(crate) async fn spawn_replica_group(
 ) -> Result<ReplicaGroup> {
     let seed = parse_seed(config.group_seed)?;
     let cfg = SdkReplicaGroupConfig {
-        replica_count: config.replica_count as u8,
+        replica_count: count_u8("replicaCount", config.replica_count)?,
         group_seed: seed,
         lb_strategy: config.lb_strategy.into(),
         host_config: match config.host_config {
@@ -336,7 +353,7 @@ pub(crate) async fn spawn_fork_group(
     config: ForkGroupConfigJs,
 ) -> Result<ForkGroup> {
     let cfg = SdkForkGroupConfig {
-        fork_count: config.fork_count as u8,
+        fork_count: count_u8("forkCount", config.fork_count)?,
         lb_strategy: config.lb_strategy.into(),
         host_config: match config.host_config {
             Some(h) => h.into_core()?,
@@ -358,7 +375,7 @@ pub(crate) async fn spawn_standby_group(
 ) -> Result<StandbyGroup> {
     let seed = parse_seed(config.group_seed)?;
     let cfg = SdkStandbyGroupConfig {
-        member_count: config.member_count as u8,
+        member_count: count_u8("memberCount", config.member_count)?,
         group_seed: seed,
         host_config: match config.host_config {
             Some(h) => h.into_core()?,
@@ -392,34 +409,39 @@ impl ReplicaGroup {
         self.inner.route_event(&rc).map_err(group_err)
     }
 
-    /// Resize the group to `n` replicas. `kind` may be omitted to
-    /// re-use the kind the group was spawned with.
+    /// Resize the group to `n` replicas. The kind is fixed at
+    /// spawn time — no external `kind` parameter is accepted so
+    /// callers can't accidentally grow a group with a different
+    /// factory than the one that produced the existing replicas.
     ///
     /// Async: growing calls the factory once per new replica, which
     /// fires the TSFN dispatcher. Main-thread invocation would
     /// deadlock on the TSFN callback — same argument as
     /// `spawnReplicaGroup`.
     #[napi]
-    pub async fn scale_to(&self, n: u32, kind: Option<String>) -> Result<()> {
-        let k = kind.unwrap_or_else(|| self.kind.clone());
+    pub async fn scale_to(&self, n: u32) -> Result<()> {
+        let n_u8 = u8::try_from(n).map_err(|_| {
+            Error::from_reason(format!(
+                "{} group: invalid-config: replica count {} exceeds {}",
+                ERR_DAEMON_PREFIX,
+                n,
+                u8::MAX,
+            ))
+        })?;
         let inner = self.inner.clone();
-        inner.scale_to(n as u8, &k).map_err(group_err)
+        inner.scale_to(n_u8).map_err(group_err)
     }
 
     /// Handle failure of a node hosting one or more replicas.
     /// Returns the indices of replicas that were successfully
     /// respawned on other nodes. Async for the same
-    /// deadlock-avoidance reason as `scaleTo`.
+    /// deadlock-avoidance reason as `scaleTo`. Reuses the group's
+    /// spawn kind — see `scaleTo` for the rationale.
     #[napi]
-    pub async fn on_node_failure(
-        &self,
-        failed_node_id: BigInt,
-        kind: Option<String>,
-    ) -> Result<Vec<u32>> {
+    pub async fn on_node_failure(&self, failed_node_id: BigInt) -> Result<Vec<u32>> {
         let node = group_bigint_u64("failedNodeId", failed_node_id)?;
-        let k = kind.unwrap_or_else(|| self.kind.clone());
         let inner = self.inner.clone();
-        let replaced = inner.on_node_failure(node, &k).map_err(group_err)?;
+        let replaced = inner.on_node_failure(node).map_err(group_err)?;
         Ok(replaced.into_iter().map(|i| i as u32).collect())
     }
 
@@ -474,22 +496,24 @@ impl ForkGroup {
     }
 
     #[napi]
-    pub async fn scale_to(&self, n: u32, kind: Option<String>) -> Result<()> {
-        let k = kind.unwrap_or_else(|| self.kind.clone());
-        self.inner.clone().scale_to(n as u8, &k).map_err(group_err)
+    pub async fn scale_to(&self, n: u32) -> Result<()> {
+        let n_u8 = u8::try_from(n).map_err(|_| {
+            Error::from_reason(format!(
+                "{} group: invalid-config: fork count {} exceeds {}",
+                ERR_DAEMON_PREFIX,
+                n,
+                u8::MAX,
+            ))
+        })?;
+        self.inner.clone().scale_to(n_u8).map_err(group_err)
     }
 
     #[napi]
-    pub async fn on_node_failure(
-        &self,
-        failed_node_id: BigInt,
-        kind: Option<String>,
-    ) -> Result<Vec<u32>> {
+    pub async fn on_node_failure(&self, failed_node_id: BigInt) -> Result<Vec<u32>> {
         let node = group_bigint_u64("failedNodeId", failed_node_id)?;
-        let k = kind.unwrap_or_else(|| self.kind.clone());
         self.inner
             .clone()
-            .on_node_failure(node, &k)
+            .on_node_failure(node)
             .map_err(group_err)
             .map(|v| v.into_iter().map(|i| i as u32).collect())
     }
@@ -569,24 +593,39 @@ impl StandbyGroup {
         Ok(BigInt::from(seq))
     }
 
+    /// Buffer an event for replay on promotion. Call after every
+    /// `runtime.deliver(group.activeOrigin, event)` so standbys
+    /// have the event in their replay queue if they're promoted
+    /// before the next `syncStandbys()`. Without this the replay
+    /// buffer is empty and a promoted standby silently loses any
+    /// event that arrived after the last sync.
     #[napi]
-    pub async fn promote(&self, kind: Option<String>) -> Result<u32> {
-        let k = kind.unwrap_or_else(|| self.kind.clone());
-        self.inner.clone().promote(&k).map_err(group_err)
+    pub fn on_event_delivered(&self, event: crate::compute::CausalEventJs) -> Result<()> {
+        use ::net::adapter::net::state::causal::{CausalEvent, CausalLink};
+        let sequence = crate::compute::daemon_bigint_u64("event.sequence", event.sequence)?;
+        let core_event = CausalEvent {
+            link: CausalLink {
+                origin_hash: event.origin_hash,
+                horizon_encoded: 0,
+                sequence,
+                parent_hash: 0,
+            },
+            payload: bytes::Bytes::copy_from_slice(event.payload.as_ref()),
+            received_at: 0,
+        };
+        self.inner.on_event_delivered(core_event);
+        Ok(())
     }
 
     #[napi]
-    pub async fn on_node_failure(
-        &self,
-        failed_node_id: BigInt,
-        kind: Option<String>,
-    ) -> Result<Option<u32>> {
+    pub async fn promote(&self) -> Result<u32> {
+        self.inner.clone().promote().map_err(group_err)
+    }
+
+    #[napi]
+    pub async fn on_node_failure(&self, failed_node_id: BigInt) -> Result<Option<u32>> {
         let node = group_bigint_u64("failedNodeId", failed_node_id)?;
-        let k = kind.unwrap_or_else(|| self.kind.clone());
-        self.inner
-            .clone()
-            .on_node_failure(node, &k)
-            .map_err(group_err)
+        self.inner.clone().on_node_failure(node).map_err(group_err)
     }
 
     #[napi]

@@ -253,21 +253,20 @@ impl PyReplicaGroup {
         self.inner.route_event(&rc).map_err(group_err)
     }
 
-    /// Resize the group to `n` replicas. Optional `kind`
-    /// defaults to the kind the group was spawned with.
-    #[pyo3(signature = (n, kind=None))]
-    fn scale_to(&self, n: u8, kind: Option<String>) -> PyResult<()> {
-        let k = kind.unwrap_or_else(|| self.kind.clone());
-        self.inner.scale_to(n, &k).map_err(group_err)
+    /// Resize the group to `n` replicas. The kind is fixed at
+    /// spawn time and not accepted as a parameter — passing a
+    /// different kind would silently grow the group with a
+    /// different daemon implementation.
+    fn scale_to(&self, n: u8) -> PyResult<()> {
+        self.inner.scale_to(n).map_err(group_err)
     }
 
     /// Handle failure of a node hosting one or more replicas.
     /// Returns the indices of replicas that were re-spawned.
-    #[pyo3(signature = (failed_node_id, kind=None))]
-    fn on_node_failure(&self, failed_node_id: u64, kind: Option<String>) -> PyResult<Vec<u8>> {
-        let k = kind.unwrap_or_else(|| self.kind.clone());
+    /// Reuses the group's spawn kind.
+    fn on_node_failure(&self, failed_node_id: u64) -> PyResult<Vec<u8>> {
         self.inner
-            .on_node_failure(failed_node_id, &k)
+            .on_node_failure(failed_node_id)
             .map_err(group_err)
     }
 
@@ -357,17 +356,13 @@ impl PyForkGroup {
         self.inner.route_event(&rc).map_err(group_err)
     }
 
-    #[pyo3(signature = (n, kind=None))]
-    fn scale_to(&self, n: u8, kind: Option<String>) -> PyResult<()> {
-        let k = kind.unwrap_or_else(|| self.kind.clone());
-        self.inner.scale_to(n, &k).map_err(group_err)
+    fn scale_to(&self, n: u8) -> PyResult<()> {
+        self.inner.scale_to(n).map_err(group_err)
     }
 
-    #[pyo3(signature = (failed_node_id, kind=None))]
-    fn on_node_failure(&self, failed_node_id: u64, kind: Option<String>) -> PyResult<Vec<u8>> {
-        let k = kind.unwrap_or_else(|| self.kind.clone());
+    fn on_node_failure(&self, failed_node_id: u64) -> PyResult<Vec<u8>> {
         self.inner
-            .on_node_failure(failed_node_id, &k)
+            .on_node_failure(failed_node_id)
             .map_err(group_err)
     }
 
@@ -477,17 +472,13 @@ impl PyStandbyGroup {
         self.inner.sync_standbys().map_err(group_err)
     }
 
-    #[pyo3(signature = (kind=None))]
-    fn promote(&self, kind: Option<String>) -> PyResult<u32> {
-        let k = kind.unwrap_or_else(|| self.kind.clone());
-        self.inner.promote(&k).map_err(group_err)
+    fn promote(&self) -> PyResult<u32> {
+        self.inner.promote().map_err(group_err)
     }
 
-    #[pyo3(signature = (failed_node_id, kind=None))]
-    fn on_node_failure(&self, failed_node_id: u64, kind: Option<String>) -> PyResult<Option<u32>> {
-        let k = kind.unwrap_or_else(|| self.kind.clone());
+    fn on_node_failure(&self, failed_node_id: u64) -> PyResult<Option<u32>> {
         self.inner
-            .on_node_failure(failed_node_id, &k)
+            .on_node_failure(failed_node_id)
             .map_err(group_err)
     }
 

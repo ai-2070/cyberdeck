@@ -42,12 +42,20 @@ impl From<ForkGroupConfig> for CoreForkGroupConfig {
 pub struct ForkGroup {
     inner: Arc<Mutex<CoreForkGroup>>,
     runtime: DaemonRuntime,
+    /// Kind the group was forked under. Pinned at `fork()` so
+    /// every subsequent `scale_to` / `on_node_failure` reuses the
+    /// same factory — a fork group with mixed implementations
+    /// would produce forks whose `ForkRecord` lineage wouldn't
+    /// correspond to the code actually running.
+    kind: String,
 }
 
 impl ForkGroup {
     /// Fork N new daemons from a parent at `fork_seq`. `kind`
     /// resolves to the factory registered via
     /// [`DaemonRuntime::register_factory`](crate::compute::DaemonRuntime::register_factory).
+    /// Stored and reused by every subsequent mutator — see
+    /// [`ForkGroup::kind`].
     pub fn fork(
         runtime: &DaemonRuntime,
         kind: &str,
@@ -74,7 +82,14 @@ impl ForkGroup {
         Ok(Self {
             inner: Arc::new(Mutex::new(core)),
             runtime: runtime.clone(),
+            kind: kind.to_string(),
         })
+    }
+
+    /// The kind this group was forked under. Stable for the
+    /// group's lifetime.
+    pub fn kind(&self) -> &str {
+        &self.kind
     }
 
     pub fn route_event(&self, ctx: &RequestContext) -> Result<u32, GroupError> {
@@ -85,11 +100,11 @@ impl ForkGroup {
             .route_event(ctx)?)
     }
 
-    pub fn scale_to(&self, n: u8, kind: &str) -> Result<(), GroupError> {
+    pub fn scale_to(&self, n: u8) -> Result<(), GroupError> {
         let factory = self
             .runtime
-            .factory_for_kind_pub(kind)
-            .map_err(|_| GroupError::FactoryNotFound(kind.to_string()))?;
+            .factory_for_kind_pub(&self.kind)
+            .map_err(|_| GroupError::FactoryNotFound(self.kind.clone()))?;
         let scheduler = self.runtime.scheduler_arc();
         let registry = self.runtime.registry_arc();
         let mut guard = self.inner.lock().expect("ForkGroup mutex poisoned");
@@ -97,11 +112,11 @@ impl ForkGroup {
         Ok(())
     }
 
-    pub fn on_node_failure(&self, failed_node_id: u64, kind: &str) -> Result<Vec<u8>, GroupError> {
+    pub fn on_node_failure(&self, failed_node_id: u64) -> Result<Vec<u8>, GroupError> {
         let factory = self
             .runtime
-            .factory_for_kind_pub(kind)
-            .map_err(|_| GroupError::FactoryNotFound(kind.to_string()))?;
+            .factory_for_kind_pub(&self.kind)
+            .map_err(|_| GroupError::FactoryNotFound(self.kind.clone()))?;
         let scheduler = self.runtime.scheduler_arc();
         let registry = self.runtime.registry_arc();
         let mut guard = self.inner.lock().expect("ForkGroup mutex poisoned");

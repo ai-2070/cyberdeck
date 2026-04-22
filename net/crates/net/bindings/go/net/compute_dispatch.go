@@ -109,14 +109,51 @@ var (
 	factoryFuncs   = make(map[string]DaemonFactory)
 )
 
-// setFactoryFunc stores `fn` under `kind`. Called by
-// `DaemonRuntime.RegisterFactoryFunc` before it asks Rust to
-// install the SDK factory closure — by the time the first
-// migration lands, the Go-side map has the entry.
+// setFactoryFunc stores `fn` under `kind`, unconditionally.
+// Multiple `DaemonRuntime`s in the same process can register the
+// same `kind` — the factory map is process-global because the
+// C-side trampoline is keyed on `kind` alone with no runtime
+// discriminator. So duplicate-kind rejection happens at the
+// *Rust* layer (which IS per-runtime) while the Go map just holds
+// the callback the trampoline invokes.
+//
+// Public registration should go through `swapFactoryFunc` instead
+// so the previous value can be restored if the native register
+// call fails after the Go map was already mutated — otherwise a
+// failed registration silently overwrites the previous factory.
 func setFactoryFunc(kind string, fn DaemonFactory) {
 	factoryFuncsMu.Lock()
 	defer factoryFuncsMu.Unlock()
 	factoryFuncs[kind] = fn
+}
+
+// swapFactoryFunc stores `fn` under `kind` and returns the prior
+// entry (if any) so it can be restored on rollback. Used by
+// `RegisterFactoryFunc`: mutate first so the trampoline has the
+// entry ready before the native register call lets migrations
+// fire, then restore via `restoreFactoryFunc` if the native side
+// rejected.
+func swapFactoryFunc(kind string, fn DaemonFactory) (prev DaemonFactory, existed bool) {
+	factoryFuncsMu.Lock()
+	defer factoryFuncsMu.Unlock()
+	prev, existed = factoryFuncs[kind]
+	factoryFuncs[kind] = fn
+	return
+}
+
+// restoreFactoryFunc undoes a `swapFactoryFunc`. If the kind had
+// no prior entry, the new entry is deleted; otherwise the prior
+// factory is put back. Called on every non-OK branch of
+// `RegisterFactoryFunc` so a rejected registration doesn't leave
+// a stale factory bound to the kind.
+func restoreFactoryFunc(kind string, prev DaemonFactory, existed bool) {
+	factoryFuncsMu.Lock()
+	defer factoryFuncsMu.Unlock()
+	if existed {
+		factoryFuncs[kind] = prev
+	} else {
+		delete(factoryFuncs, kind)
+	}
 }
 
 // lookupFactoryFunc returns the factory for `kind` or nil.

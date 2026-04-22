@@ -59,12 +59,22 @@ impl From<ReplicaGroupConfig> for CoreReplicaGroupConfig {
 pub struct ReplicaGroup {
     inner: Arc<Mutex<CoreReplicaGroup>>,
     runtime: DaemonRuntime,
+    /// Kind the group was spawned with. Pinned at spawn time so that
+    /// `scale_to` / `on_node_failure` reuse the *same* factory that
+    /// produced the existing replicas. Allowing a caller to pass a
+    /// different kind on these methods would silently grow the group
+    /// with a different daemon implementation — a replica-4 of an
+    /// "echo" group running "counter" code — which violates the
+    /// interchangeable-members contract.
+    kind: String,
 }
 
 impl ReplicaGroup {
     /// Spawn a replica group of `config.replica_count` members,
     /// each constructed by the factory previously registered under
-    /// `kind` via [`DaemonRuntime::register_factory`].
+    /// `kind` via [`DaemonRuntime::register_factory`]. The kind is
+    /// stored and reused by every subsequent `scale_to` /
+    /// `on_node_failure`.
     ///
     /// Errors:
     /// - [`GroupError::NotReady`] if the runtime hasn't started.
@@ -92,7 +102,14 @@ impl ReplicaGroup {
         Ok(Self {
             inner: Arc::new(Mutex::new(core)),
             runtime: runtime.clone(),
+            kind: kind.to_string(),
         })
+    }
+
+    /// The kind this group was spawned with. Stable for the
+    /// group's lifetime.
+    pub fn kind(&self) -> &str {
+        &self.kind
     }
 
     /// Route an inbound event to the best available replica,
@@ -105,13 +122,15 @@ impl ReplicaGroup {
     }
 
     /// Resize the group to `n` replicas. Growing re-uses the
-    /// factory registered under the group's kind; shrinking
+    /// factory registered under the group's spawn kind; shrinking
     /// unregisters the trailing members in reverse index order.
-    pub fn scale_to(&self, n: u8, kind: &str) -> Result<(), GroupError> {
+    /// The kind is fixed at spawn time and not accepted as a
+    /// parameter — see [`ReplicaGroup::kind`] for the rationale.
+    pub fn scale_to(&self, n: u8) -> Result<(), GroupError> {
         let factory = self
             .runtime
-            .factory_for_kind_pub(kind)
-            .map_err(|_| GroupError::FactoryNotFound(kind.to_string()))?;
+            .factory_for_kind_pub(&self.kind)
+            .map_err(|_| GroupError::FactoryNotFound(self.kind.clone()))?;
         let scheduler = self.runtime.scheduler_arc();
         let registry = self.runtime.registry_arc();
         let mut guard = self.inner.lock().expect("ReplicaGroup mutex poisoned");
@@ -123,11 +142,12 @@ impl ReplicaGroup {
     /// Re-derives each affected replica's deterministic keypair
     /// and re-spawns on a new node (excluding `failed_node_id`).
     /// Returns the list of replica indices that were replaced.
-    pub fn on_node_failure(&self, failed_node_id: u64, kind: &str) -> Result<Vec<u8>, GroupError> {
+    /// Reuses the group's spawn kind; no external parameter.
+    pub fn on_node_failure(&self, failed_node_id: u64) -> Result<Vec<u8>, GroupError> {
         let factory = self
             .runtime
-            .factory_for_kind_pub(kind)
-            .map_err(|_| GroupError::FactoryNotFound(kind.to_string()))?;
+            .factory_for_kind_pub(&self.kind)
+            .map_err(|_| GroupError::FactoryNotFound(self.kind.clone()))?;
         let scheduler = self.runtime.scheduler_arc();
         let registry = self.runtime.registry_arc();
         let mut guard = self.inner.lock().expect("ReplicaGroup mutex poisoned");

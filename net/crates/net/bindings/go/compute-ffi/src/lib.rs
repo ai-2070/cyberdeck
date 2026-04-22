@@ -394,9 +394,7 @@ pub extern "C" fn net_compute_register_factory(
         // apart from "runtime is gone."
         return match e {
             SdkDaemonError::FactoryAlreadyRegistered(_) => NET_COMPUTE_ERR_DUPLICATE_KIND,
-            SdkDaemonError::ShuttingDown | SdkDaemonError::NotReady => {
-                NET_COMPUTE_ERR_CALL_FAILED
-            }
+            SdkDaemonError::ShuttingDown | SdkDaemonError::NotReady => NET_COMPUTE_ERR_CALL_FAILED,
             _ => NET_COMPUTE_ERR_CALL_FAILED,
         };
     }
@@ -477,9 +475,7 @@ pub extern "C" fn net_compute_register_factory_with_func(
         // `ErrRuntimeShutDown` to the caller.
         return match e {
             SdkDaemonError::FactoryAlreadyRegistered(_) => NET_COMPUTE_ERR_DUPLICATE_KIND,
-            SdkDaemonError::ShuttingDown | SdkDaemonError::NotReady => {
-                NET_COMPUTE_ERR_CALL_FAILED
-            }
+            SdkDaemonError::ShuttingDown | SdkDaemonError::NotReady => NET_COMPUTE_ERR_CALL_FAILED,
             _ => NET_COMPUTE_ERR_CALL_FAILED,
         };
     }
@@ -1649,6 +1645,16 @@ fn group_err_out(err_out: *mut *mut c_char, e: &SdkGroupError) -> c_int {
     NET_COMPUTE_ERR_CALL_FAILED
 }
 
+/// Same wire format as [`group_err_out`] but takes a raw reason
+/// string — used on the FFI-side validation paths (e.g. u32→u8
+/// overflow) that detect the error before it reaches the SDK.
+/// The reason is expected to already include the `group: <kind>`
+/// prefix (e.g. `"invalid-config: replica count 300 exceeds 255"`).
+fn group_err_out_reason(err_out: *mut *mut c_char, reason: String) -> c_int {
+    write_err(err_out, &format!("group: {reason}"));
+    NET_COMPUTE_ERR_CALL_FAILED
+}
+
 fn parse_seed(ptr: *const u8) -> Option<[u8; 32]> {
     if ptr.is_null() {
         return None;
@@ -1914,7 +1920,16 @@ pub extern "C" fn net_compute_replica_group_scale_to(
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
-    match h.inner.scale_to(n as u8, &h.kind) {
+    let n_u8 = match u8::try_from(n) {
+        Ok(v) => v,
+        Err(_) => {
+            return group_err_out_reason(
+                err_out,
+                format!("invalid-config: replica count {n} exceeds {}", u8::MAX),
+            );
+        }
+    };
+    match h.inner.scale_to(n_u8) {
         Ok(()) => NET_COMPUTE_OK,
         Err(e) => group_err_out(err_out, &e),
     }
@@ -2072,7 +2087,16 @@ pub extern "C" fn net_compute_fork_group_scale_to(
     let Some(h) = (unsafe { h.as_ref() }) else {
         return NET_COMPUTE_ERR_NULL;
     };
-    match h.inner.scale_to(n as u8, &h.kind) {
+    let n_u8 = match u8::try_from(n) {
+        Ok(v) => v,
+        Err(_) => {
+            return group_err_out_reason(
+                err_out,
+                format!("invalid-config: fork count {n} exceeds {}", u8::MAX),
+            );
+        }
+    };
+    match h.inner.scale_to(n_u8) {
         Ok(()) => NET_COMPUTE_OK,
         Err(e) => group_err_out(err_out, &e),
     }
@@ -2276,7 +2300,7 @@ pub extern "C" fn net_compute_standby_group_promote(
     if out_origin.is_null() {
         return NET_COMPUTE_ERR_NULL;
     }
-    match h.inner.promote(&h.kind) {
+    match h.inner.promote() {
         Ok(origin) => {
             unsafe { *out_origin = origin };
             NET_COMPUTE_OK

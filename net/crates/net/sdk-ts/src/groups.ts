@@ -47,8 +47,9 @@ import {
   StrategyJs,
 } from '@ai2070/net';
 
+import { getNapiRuntime } from './_internal.js';
 import { DaemonError } from './compute';
-import type { DaemonRuntime } from './compute';
+import type { CausalEvent, DaemonRuntime } from './compute';
 
 // ----------------------------------------------------------------------------
 // GroupError — typed subclass of DaemonError
@@ -230,7 +231,7 @@ export class ReplicaGroup {
     config: ReplicaGroupConfig,
   ): Promise<ReplicaGroup> {
     try {
-      const napi = await runtime._napiRuntime().spawnReplicaGroup(kind, {
+      const napi = await getNapiRuntime(runtime).spawnReplicaGroup(kind, {
         replicaCount: config.replicaCount,
         groupSeed: toBuffer(config.groupSeed),
         lbStrategy: config.lbStrategy,
@@ -252,22 +253,24 @@ export class ReplicaGroup {
     }
   }
 
-  /** Resize the group to `n` members. `kind` defaults to the
-   *  kind the group was spawned with. Async because growing
-   *  invokes the factory (TSFN) once per new replica. */
-  async scaleTo(n: number, kind?: string): Promise<void> {
+  /** Resize the group to `n` members. The kind is fixed at
+   *  spawn time and not accepted here — see the class docstring
+   *  for why. Async because growing invokes the factory (TSFN)
+   *  once per new replica. */
+  async scaleTo(n: number): Promise<void> {
     try {
-      await this.inner.scaleTo(n, kind);
+      await this.inner.scaleTo(n);
     } catch (e) {
       toGroupError(e);
     }
   }
 
   /** Replace all members on `failedNodeId` onto other nodes.
-   *  Returns the indices of replicas that were respawned. */
-  async onNodeFailure(failedNodeId: bigint, kind?: string): Promise<number[]> {
+   *  Returns the indices of replicas that were respawned.
+   *  Reuses the group's spawn kind. */
+  async onNodeFailure(failedNodeId: bigint): Promise<number[]> {
     try {
-      return await this.inner.onNodeFailure(failedNodeId, kind);
+      return await this.inner.onNodeFailure(failedNodeId);
     } catch (e) {
       return toGroupError(e);
     }
@@ -326,9 +329,12 @@ export class ForkGroup {
     config: ForkGroupConfig,
   ): Promise<ForkGroup> {
     try {
-      const napi = await runtime
-        ._napiRuntime()
-        .spawnForkGroup(kind, parentOrigin, forkSeq, config);
+      const napi = await getNapiRuntime(runtime).spawnForkGroup(
+        kind,
+        parentOrigin,
+        forkSeq,
+        config,
+      );
       return new ForkGroup(napi);
     } catch (e) {
       return toGroupError(e);
@@ -343,17 +349,17 @@ export class ForkGroup {
     }
   }
 
-  async scaleTo(n: number, kind?: string): Promise<void> {
+  async scaleTo(n: number): Promise<void> {
     try {
-      await this.inner.scaleTo(n, kind);
+      await this.inner.scaleTo(n);
     } catch (e) {
       toGroupError(e);
     }
   }
 
-  async onNodeFailure(failedNodeId: bigint, kind?: string): Promise<number[]> {
+  async onNodeFailure(failedNodeId: bigint): Promise<number[]> {
     try {
-      return await this.inner.onNodeFailure(failedNodeId, kind);
+      return await this.inner.onNodeFailure(failedNodeId);
     } catch (e) {
       return toGroupError(e);
     }
@@ -429,7 +435,7 @@ export class StandbyGroup {
     config: StandbyGroupConfig,
   ): Promise<StandbyGroup> {
     try {
-      const napi = await runtime._napiRuntime().spawnStandbyGroup(kind, {
+      const napi = await getNapiRuntime(runtime).spawnStandbyGroup(kind, {
         memberCount: config.memberCount,
         groupSeed: toBuffer(config.groupSeed),
         hostConfig: config.hostConfig,
@@ -456,12 +462,31 @@ export class StandbyGroup {
     }
   }
 
-  /** Promote the most-synced standby to active. Call manually for
-   *  planned failover; {@link onNodeFailure} calls automatically
-   *  when the active's node fails. */
-  async promote(kind?: string): Promise<number> {
+  /**
+   * Buffer an event for replay on promotion. Call after every
+   * `runtime.deliver(group.activeOrigin, event)` so standbys
+   * have the event in their replay queue if they're promoted
+   * before the next {@link sync}. Without this the replay
+   * buffer is empty and a promoted standby silently loses any
+   * event that arrived after the last sync — the exact gap the
+   * class docstring warns about.
+   */
+  onEventDelivered(event: CausalEvent): void {
     try {
-      return await this.inner.promote(kind);
+      this.inner.onEventDelivered(event);
+    } catch (e) {
+      toGroupError(e);
+    }
+  }
+
+  /** Promote the most-synced standby to active. Reuses the
+   *  group's spawn kind — no external parameter, so callers
+   *  can't accidentally promote with the wrong factory. Call
+   *  manually for planned failover; {@link onNodeFailure} calls
+   *  automatically when the active's node fails. */
+  async promote(): Promise<number> {
+    try {
+      return await this.inner.promote();
     } catch (e) {
       return toGroupError(e);
     }
@@ -469,10 +494,10 @@ export class StandbyGroup {
 
   /** Handle node failure. Returns the new active's `origin_hash`
    *  if the active was on `failedNodeId`; `null` if only standbys
-   *  were affected. */
-  async onNodeFailure(failedNodeId: bigint, kind?: string): Promise<number | null> {
+   *  were affected. Reuses the group's spawn kind. */
+  async onNodeFailure(failedNodeId: bigint): Promise<number | null> {
     try {
-      const r = await this.inner.onNodeFailure(failedNodeId, kind);
+      const r = await this.inner.onNodeFailure(failedNodeId);
       return r ?? null;
     } catch (e) {
       return toGroupError(e);

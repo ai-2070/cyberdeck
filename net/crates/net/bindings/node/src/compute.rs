@@ -78,7 +78,7 @@ fn daemon_err(msg: impl Into<String>) -> Error {
 /// identifiers, sequence numbers, node IDs, or timeouts. Reject
 /// both with a `daemon:`-prefixed error so the TS side classifies
 /// them as `DaemonError`.
-fn daemon_bigint_u64(field: &str, b: BigInt) -> Result<u64> {
+pub(crate) fn daemon_bigint_u64(field: &str, b: BigInt) -> Result<u64> {
     crate::common::bigint_u64(b).map_err(|e| daemon_err(format!("{}: {}", field, e.reason)))
 }
 

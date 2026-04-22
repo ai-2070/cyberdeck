@@ -265,8 +265,8 @@ export declare class DaemonRuntime {
 
 export declare class ForkGroup {
   routeEvent(ctx: RequestContextJs): number
-  scaleTo(n: number, kind?: string | undefined | null): Promise<void>
-  onNodeFailure(failedNodeId: bigint, kind?: string | undefined | null): Promise<Array<number>>
+  scaleTo(n: number): Promise<void>
+  onNodeFailure(failedNodeId: bigint): Promise<Array<number>>
   onNodeRecovery(recoveredNodeId: bigint): void
   get health(): GroupHealthJs
   get parentOrigin(): number
@@ -782,13 +782,11 @@ export declare class NetMesh {
    * into the local capability index, simulating a peer
    * announcement without going through a real handshake.
    *
-   * Production code should NOT use this — the mesh's
-   * normal `announce_capabilities` path is what peers
-   * broadcast through at runtime. This exists so
-   * `groups.test.ts` can stage enough placement candidates
-   * for `ReplicaGroup` / `ForkGroup` / `StandbyGroup`
-   * `place_with_spread` calls without spinning up a 3-node
-   * handshake in every test.
+   * Gated behind the `test-helpers` feature so it is
+   * **not** exported to production JS consumers. Enabling
+   * `groups` alone does not pull this in; vitest builds with
+   * `--features groups,test-helpers` explicitly. Production
+   * code uses the normal `announce_capabilities` path.
    */
   testInjectSyntheticPeer(nodeId: bigint): void
   /**
@@ -909,22 +907,25 @@ export declare class ReplicaGroup {
    */
   routeEvent(ctx: RequestContextJs): number
   /**
-   * Resize the group to `n` replicas. `kind` may be omitted to
-   * re-use the kind the group was spawned with.
+   * Resize the group to `n` replicas. The kind is fixed at
+   * spawn time — no external `kind` parameter is accepted so
+   * callers can't accidentally grow a group with a different
+   * factory than the one that produced the existing replicas.
    *
    * Async: growing calls the factory once per new replica, which
    * fires the TSFN dispatcher. Main-thread invocation would
    * deadlock on the TSFN callback — same argument as
    * `spawnReplicaGroup`.
    */
-  scaleTo(n: number, kind?: string | undefined | null): Promise<void>
+  scaleTo(n: number): Promise<void>
   /**
    * Handle failure of a node hosting one or more replicas.
    * Returns the indices of replicas that were successfully
    * respawned on other nodes. Async for the same
-   * deadlock-avoidance reason as `scaleTo`.
+   * deadlock-avoidance reason as `scaleTo`. Reuses the group's
+   * spawn kind — see `scaleTo` for the rationale.
    */
-  onNodeFailure(failedNodeId: bigint, kind?: string | undefined | null): Promise<Array<number>>
+  onNodeFailure(failedNodeId: bigint): Promise<Array<number>>
   onNodeRecovery(recoveredNodeId: bigint): void
   get health(): GroupHealthJs
   get groupId(): number
@@ -942,8 +943,17 @@ export declare class StandbyGroup {
    */
   get activeOrigin(): number
   syncStandbys(): Promise<bigint>
-  promote(kind?: string | undefined | null): Promise<number>
-  onNodeFailure(failedNodeId: bigint, kind?: string | undefined | null): Promise<number | null>
+  /**
+   * Buffer an event for replay on promotion. Call after every
+   * `runtime.deliver(group.activeOrigin, event)` so standbys
+   * have the event in their replay queue if they're promoted
+   * before the next `syncStandbys()`. Without this the replay
+   * buffer is empty and a promoted standby silently loses any
+   * event that arrived after the last sync.
+   */
+  onEventDelivered(event: CausalEventJs): void
+  promote(): Promise<number>
+  onNodeFailure(failedNodeId: bigint): Promise<number | null>
   onNodeRecovery(recoveredNodeId: bigint): void
   get health(): GroupHealthJs
   get activeHealthy(): boolean

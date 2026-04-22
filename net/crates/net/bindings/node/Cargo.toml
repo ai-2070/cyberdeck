@@ -33,11 +33,20 @@ cortex = ["net/netdb", "net/redex-disk"]
 compute = ["net", "dep:net-sdk", "dep:dashmap"]
 # HA / scaling overlays — `ReplicaGroup` / `ForkGroup` / `StandbyGroup`.
 # Follows `SDK_GROUPS_SURFACE_PLAN.md`. Sits on top of `compute`.
-groups = ["compute"]
+# Forwards to `net-sdk/groups` so the SDK groups surface is only
+# pulled into the build when this flag is set — a `compute`-only
+# build doesn't compile the groups code.
+groups = ["compute", "net-sdk/groups"]
+# Test-only helpers (`testInjectSyntheticPeer`, etc.). Gated
+# separately so enabling `groups` alone does NOT export test-only
+# APIs to production JS consumers. The vitest suite builds with
+# `--features groups,test-helpers`; release / consumer builds stop
+# at `--features groups`.
+test-helpers = ["groups"]
 
 [dependencies]
 net = { path = "../..", default-features = false }
-net-sdk = { path = "../../sdk", default-features = false, features = ["compute", "groups"], optional = true }
+net-sdk = { path = "../../sdk", default-features = false, features = ["compute"], optional = true }
 dashmap = { version = "6", optional = true }
 napi = { version = "3.7.0", default-features = false, features = ["napi4", "napi6", "async", "tokio_rt"] }
 napi-derive = "3.4.0"

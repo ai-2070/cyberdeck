@@ -208,9 +208,18 @@ func (rt *DaemonRuntime) RegisterFactoryFunc(kind string, factory DaemonFactory)
 	if factory == nil {
 		return &DaemonError{Message: "factory is nil"}
 	}
-	// Populate the Go-side map BEFORE calling Rust so the first
-	// migration that lands can resolve the factory immediately.
-	setFactoryFunc(kind, factory)
+	// Swap-with-restore. Mutate the Go map first so the
+	// trampoline has the entry by the time the native register
+	// call returns OK (a migration can land and fire the factory
+	// the instant `net_compute_register_factory_with_func`
+	// returns). If the native call rejects, restore the prior
+	// value — a failed registration must not leave a stale entry
+	// bound to the kind. The Go map is process-global because
+	// the trampoline is keyed on `kind` with no runtime
+	// discriminator; per-runtime duplicate-kind rejection is the
+	// Rust layer's job (it returns `DUPLICATE_KIND` from the FFI
+	// when a given DaemonRuntime already has `kind` registered).
+	prev, existed := swapFactoryFunc(kind, factory)
 
 	kindBytes := []byte(kind)
 	var ptr *C.char
@@ -223,16 +232,23 @@ func (rt *DaemonRuntime) RegisterFactoryFunc(kind string, factory DaemonFactory)
 	case C.NET_COMPUTE_OK:
 		return nil
 	case C.NET_COMPUTE_ERR_DUPLICATE_KIND:
+		// Rust says this runtime already had the kind. Restore
+		// the prior Go-side factory so a subsequent migration
+		// into the original runtime still resolves correctly.
+		restoreFactoryFunc(kind, prev, existed)
 		return &DuplicateKindError{Kind: kind}
 	case C.NET_COMPUTE_ERR_CALL_FAILED:
 		// The Rust side maps `DaemonError::ShuttingDown` /
 		// `NotReady` to this code. Callers racing a concurrent
 		// `Shutdown` should see the typed shutdown sentinel, not
 		// a generic CALL_FAILED message.
+		restoreFactoryFunc(kind, prev, existed)
 		return ErrRuntimeShutDown
 	case C.NET_COMPUTE_ERR_NULL:
+		restoreFactoryFunc(kind, prev, existed)
 		return &DaemonError{Message: "register_factory_with_func: null argument"}
 	default:
+		restoreFactoryFunc(kind, prev, existed)
 		return &DaemonError{Message: fmt.Sprintf("register_factory_with_func: unexpected code %d", code)}
 	}
 }

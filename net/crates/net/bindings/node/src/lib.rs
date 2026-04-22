@@ -1712,19 +1712,23 @@ mod mesh_bindings {
         /// into the local capability index, simulating a peer
         /// announcement without going through a real handshake.
         ///
-        /// Production code should NOT use this — the mesh's
-        /// normal `announce_capabilities` path is what peers
-        /// broadcast through at runtime. This exists so
-        /// `groups.test.ts` can stage enough placement candidates
-        /// for `ReplicaGroup` / `ForkGroup` / `StandbyGroup`
-        /// `place_with_spread` calls without spinning up a 3-node
-        /// handshake in every test.
+        /// Gated behind the `test-helpers` feature so it is
+        /// **not** exported to production JS consumers. Enabling
+        /// `groups` alone does not pull this in; vitest builds with
+        /// `--features groups,test-helpers` explicitly. Production
+        /// code uses the normal `announce_capabilities` path.
         #[napi]
-        #[cfg(feature = "groups")]
+        #[cfg(feature = "test-helpers")]
         pub fn test_inject_synthetic_peer(&self, node_id: BigInt) -> Result<()> {
             use net::adapter::net::behavior::capability::{CapabilityAnnouncement, CapabilitySet};
             use net::adapter::net::identity::EntityId;
-            let (_, nid, _) = node_id.get_u64();
+            // Validate sign/lossless — a negative or >u64::MAX
+            // BigInt would otherwise silently wrap into a garbage
+            // node id and corrupt the capability index the test
+            // is trying to stage.
+            let nid = crate::common::bigint_u64(node_id).map_err(|e| {
+                Error::from_reason(format!("test_inject_synthetic_peer: {}", e.reason))
+            })?;
             let guard = self.load_node()?;
             let node = guard.as_ref().unwrap();
             let index = node.capability_index().clone();

@@ -65,11 +65,18 @@ impl From<StandbyGroupConfig> for CoreStandbyGroupConfig {
 pub struct StandbyGroup {
     inner: Arc<Mutex<CoreStandbyGroup>>,
     runtime: DaemonRuntime,
+    /// Kind the group was spawned under. Pinned at spawn so
+    /// `promote` / `on_node_failure` can't be passed a different
+    /// kind that would reconstruct the newly-active member from
+    /// a different implementation than the original active +
+    /// standbys were built from.
+    kind: String,
 }
 
 impl StandbyGroup {
     /// Spawn a standby group. Member 0 starts as active; the rest
     /// start as standbys with no snapshot (`synced_through == 0`).
+    /// The kind is stored and reused by every subsequent mutator.
     pub fn spawn(
         runtime: &DaemonRuntime,
         kind: &str,
@@ -88,7 +95,13 @@ impl StandbyGroup {
         Ok(Self {
             inner: Arc::new(Mutex::new(core)),
             runtime: runtime.clone(),
+            kind: kind.to_string(),
         })
+    }
+
+    /// The kind this group was spawned with.
+    pub fn kind(&self) -> &str {
+        &self.kind
     }
 
     /// `origin_hash` of the current active member. Events always
@@ -124,11 +137,12 @@ impl StandbyGroup {
     /// can also be called manually for planned failover.
     /// Returns the promoted member's new `origin_hash` (stays
     /// the same as before — keypair is re-derived deterministically).
-    pub fn promote(&self, kind: &str) -> Result<u32, GroupError> {
+    /// Reuses the group's spawn kind; no external parameter.
+    pub fn promote(&self) -> Result<u32, GroupError> {
         let factory = self
             .runtime
-            .factory_for_kind_pub(kind)
-            .map_err(|_| GroupError::FactoryNotFound(kind.to_string()))?;
+            .factory_for_kind_pub(&self.kind)
+            .map_err(|_| GroupError::FactoryNotFound(self.kind.clone()))?;
         let scheduler = self.runtime.scheduler_arc();
         let registry = self.runtime.registry_arc();
         let mut guard = self.inner.lock().expect("StandbyGroup mutex poisoned");
@@ -139,15 +153,11 @@ impl StandbyGroup {
     /// auto-promotes the most-synced standby and returns its
     /// `origin_hash`. If only standbys were affected, returns
     /// `None` — the caller can re-sync those standbys later.
-    pub fn on_node_failure(
-        &self,
-        failed_node_id: u64,
-        kind: &str,
-    ) -> Result<Option<u32>, GroupError> {
+    pub fn on_node_failure(&self, failed_node_id: u64) -> Result<Option<u32>, GroupError> {
         let factory = self
             .runtime
-            .factory_for_kind_pub(kind)
-            .map_err(|_| GroupError::FactoryNotFound(kind.to_string()))?;
+            .factory_for_kind_pub(&self.kind)
+            .map_err(|_| GroupError::FactoryNotFound(self.kind.clone()))?;
         let scheduler = self.runtime.scheduler_arc();
         let registry = self.runtime.registry_arc();
         let mut guard = self.inner.lock().expect("StandbyGroup mutex poisoned");

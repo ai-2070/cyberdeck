@@ -34,6 +34,7 @@ import {
   MigrationHandle as NapiMigrationHandle,
 } from '@ai2070/net';
 
+import { getNapiMesh, setNapiRuntime } from './_internal.js';
 import { Identity } from './identity.js';
 import { MeshNode } from './mesh.js';
 
@@ -575,12 +576,6 @@ export class MigrationHandle {
 export class DaemonRuntime {
   private readonly inner: NapiDaemonRuntime;
 
-  /** @internal Used by the `groups` module to pass this runtime
-   *  into NAPI group factories. NOT part of the stable API. */
-  _napiRuntime(): NapiDaemonRuntime {
-    return this.inner;
-  }
-
   /**
    * TS-side factory table, keyed by `kind`. `registerFactory`
    * inserts here; `spawn` looks up and invokes. Duplicates the
@@ -592,6 +587,11 @@ export class DaemonRuntime {
 
   private constructor(inner: NapiDaemonRuntime) {
     this.inner = inner;
+    // Register on the WeakMap so sibling SDK modules (currently
+    // `groups`) can reach the native pointer without a public
+    // escape-hatch method on the class instance. See
+    // `./_internal.ts` for the rationale.
+    setNapiRuntime(this, inner);
   }
 
   /**
@@ -599,7 +599,7 @@ export class DaemonRuntime {
    */
   static create(mesh: MeshNode): DaemonRuntime {
     try {
-      return new DaemonRuntime(NapiDaemonRuntime.create(mesh._napiNetMesh()));
+      return new DaemonRuntime(NapiDaemonRuntime.create(getNapiMesh(mesh)));
     } catch (e) {
       return toDaemonError(e);
     }

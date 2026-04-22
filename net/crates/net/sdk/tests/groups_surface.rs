@@ -131,11 +131,11 @@ async fn replica_group_scale_up_and_down_tracks_daemon_count() {
     let group = ReplicaGroup::spawn(&rt, "noop", replica_config(2, 0x33)).expect("spawn");
     assert_eq!(rt.daemon_count(), 2);
 
-    group.scale_to(5, "noop").expect("scale up");
+    group.scale_to(5).expect("scale up");
     assert_eq!(group.replica_count(), 5);
     assert_eq!(rt.daemon_count(), 5);
 
-    group.scale_to(1, "noop").expect("scale down");
+    group.scale_to(1).expect("scale down");
     assert_eq!(group.replica_count(), 1);
     assert_eq!(rt.daemon_count(), 1);
 }
