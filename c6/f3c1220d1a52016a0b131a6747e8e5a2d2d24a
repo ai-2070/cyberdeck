@@ -1,0 +1,25 @@
+net/crates/net/bindings/python/tests/test_groups.py
+  5bf3f089eecaef7a 14-41
+.github/workflows/ci.yml
+  5bf3f089eecaef7a 199-204,206
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "c6f3c1220d1a52016a0b131a6747e8e5a2d2d24a",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 35,
+      "total_deletions": 16,
+      "accepted_lines": 38,
+      "overriden_lines": 0
+    }
+  }
+}
