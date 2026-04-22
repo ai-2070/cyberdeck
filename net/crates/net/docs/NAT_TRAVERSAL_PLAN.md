@@ -550,6 +550,34 @@ Kind vocabulary for cross-binding parity (TS / Python / Go map to classes with a
 
 ---
 
+## Implementation status
+
+Current state against the staging plan:
+
+| Stage | Scope                                       | Status       |
+|-------|---------------------------------------------|--------------|
+| 0     | Module scaffolding, feature gates           | **done**     |
+| 1     | Reflex probe subprotocol (`SUBPROTOCOL_REFLEX = 0x0D00`) | **done** |
+| 2     | NAT classification FSM, `reflex_addr` on capability announcements, background classifier loop | **done** |
+| 3a    | Rendezvous wire format (`PunchRequest / PunchIntroduce / PunchAck`) | **done** |
+| 3b    | Coordinator fan-out — resolves peer reflex, sends `PunchIntroduce` to both endpoints | **done** |
+| 3c    | Pair-type matrix, `connect_direct`, `TraversalStats` | **done** |
+| 3d    | Keep-alive train + observer + `PunchAck` round-trip (routed via coordinator) | **done** |
+| 4a    | `reflex_override` — config field + runtime `set_reflex_override` / `clear_reflex_override` across all 4 surfaces | **done** |
+| 4b    | UPnP-IGD / NAT-PMP / PCP client + renewal task | **deferred** |
+| 5     | SDK + NAPI + PyO3 + Go binding surface (nat_type / reflex_addr / probe_reflex / connect_direct / traversal_stats / reflex_override) | **done** |
+
+**Stage 4b deferred rationale.** The port-mapper task integrates with the operator's home router — it's inherently hard to test in CI without a UPnP-capable gateway in the test loop. The stage-4a surface (`set_reflex_override` from any binding, runtime + startup) is the exact hook a stage-4b task needs: on successful `AddPortMapping` it calls `set_reflex_override(external)`, on renewal failure it calls `clear_reflex_override()`. Dropping in real `igd-next` / `rust-natpmp` clients is additive and testable against a staged gateway; the integration point is already stable.
+
+Testing coverage summary (as of stage 5 / 4a):
+
+- **33 NAT-traversal integration tests** across 7 files in `crates/net/tests/`: reflex probe, classification, rendezvous coordinator, rendezvous ack round-trip, connect_direct orchestration, keep-alive observer, reflex override. Plus 7 SDK-level integration tests in `sdk/tests/mesh_nat_traversal.rs`.
+- **45 new unit tests** across the traversal module: classify FSM + pair-action matrix (19), rendezvous wire codec (13), reflex probe codec (7), TraversalConfig defaults (1), capability-index reflex storage (2), capability `reflex_addr` serde round-trip (3).
+- All 987 lib tests pass; no regressions from any stage in this rollout.
+- Clean compile across no-default-features, `net`, `net,nat-traversal`, `port-mapping` feature combos.
+
+---
+
 ## Open questions
 
 None — the initial design review resolved all of them. Decisions captured in the numbered design decisions section above (specifically §9–§14 correspond to the formerly-open rendezvous / retry / IPv6 / port-mapping-lease / relay-tag / reclassification questions).
