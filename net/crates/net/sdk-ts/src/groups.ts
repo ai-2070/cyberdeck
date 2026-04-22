@@ -216,25 +216,26 @@ export class ReplicaGroup {
    * the group calls the factory once per replica at spawn and
    * again on scale-up / failure replacement.
    *
+   * Async because the underlying SDK `spawn` runs on a tokio
+   * worker — the factory TSFN round-trip needs the Node main
+   * thread free to execute the JS factory callback, so a sync
+   * main-thread spawn would deadlock.
+   *
    * Throws {@link GroupError} on `not-ready`, `factory-not-found`,
    * `placement-failed`, `invalid-config`, or `registry-failed`.
    */
-  static spawn(
+  static async spawn(
     runtime: DaemonRuntime,
     kind: string,
     config: ReplicaGroupConfig,
-  ): ReplicaGroup {
+  ): Promise<ReplicaGroup> {
     try {
-      const napi = NapiReplicaGroup.spawn(
-        runtime._napiRuntime(),
-        kind,
-        {
-          replicaCount: config.replicaCount,
-          groupSeed: toBuffer(config.groupSeed),
-          lbStrategy: config.lbStrategy,
-          hostConfig: config.hostConfig,
-        },
-      );
+      const napi = await runtime._napiRuntime().spawnReplicaGroup(kind, {
+        replicaCount: config.replicaCount,
+        groupSeed: toBuffer(config.groupSeed),
+        lbStrategy: config.lbStrategy,
+        hostConfig: config.hostConfig,
+      });
       return new ReplicaGroup(napi);
     } catch (e) {
       return toGroupError(e);
@@ -252,10 +253,11 @@ export class ReplicaGroup {
   }
 
   /** Resize the group to `n` members. `kind` defaults to the
-   *  kind the group was spawned with. */
-  scaleTo(n: number, kind?: string): void {
+   *  kind the group was spawned with. Async because growing
+   *  invokes the factory (TSFN) once per new replica. */
+  async scaleTo(n: number, kind?: string): Promise<void> {
     try {
-      this.inner.scaleTo(n, kind);
+      await this.inner.scaleTo(n, kind);
     } catch (e) {
       toGroupError(e);
     }
@@ -263,9 +265,9 @@ export class ReplicaGroup {
 
   /** Replace all members on `failedNodeId` onto other nodes.
    *  Returns the indices of replicas that were respawned. */
-  onNodeFailure(failedNodeId: bigint, kind?: string): number[] {
+  async onNodeFailure(failedNodeId: bigint, kind?: string): Promise<number[]> {
     try {
-      return this.inner.onNodeFailure(failedNodeId, kind);
+      return await this.inner.onNodeFailure(failedNodeId, kind);
     } catch (e) {
       return toGroupError(e);
     }
@@ -314,22 +316,19 @@ export class ForkGroup {
 
   /** Fork `config.forkCount` new daemons from `parentOrigin` at
    *  `forkSeq`. Each fork gets a fresh unique keypair + a
-   *  `ForkRecord` linking it to the parent. */
-  static fork(
+   *  `ForkRecord` linking it to the parent. Async for the same
+   *  deadlock-avoidance reason as {@link ReplicaGroup.spawn}. */
+  static async fork(
     runtime: DaemonRuntime,
     kind: string,
     parentOrigin: number,
     forkSeq: bigint,
     config: ForkGroupConfig,
-  ): ForkGroup {
+  ): Promise<ForkGroup> {
     try {
-      const napi = NapiForkGroup.fork(
-        runtime._napiRuntime(),
-        kind,
-        parentOrigin,
-        forkSeq,
-        config,
-      );
+      const napi = await runtime
+        ._napiRuntime()
+        .spawnForkGroup(kind, parentOrigin, forkSeq, config);
       return new ForkGroup(napi);
     } catch (e) {
       return toGroupError(e);
@@ -344,17 +343,17 @@ export class ForkGroup {
     }
   }
 
-  scaleTo(n: number, kind?: string): void {
+  async scaleTo(n: number, kind?: string): Promise<void> {
     try {
-      this.inner.scaleTo(n, kind);
+      await this.inner.scaleTo(n, kind);
     } catch (e) {
       toGroupError(e);
     }
   }
 
-  onNodeFailure(failedNodeId: bigint, kind?: string): number[] {
+  async onNodeFailure(failedNodeId: bigint, kind?: string): Promise<number[]> {
     try {
-      return this.inner.onNodeFailure(failedNodeId, kind);
+      return await this.inner.onNodeFailure(failedNodeId, kind);
     } catch (e) {
       return toGroupError(e);
     }
@@ -424,21 +423,17 @@ export class StandbyGroup {
     this.inner = inner;
   }
 
-  static spawn(
+  static async spawn(
     runtime: DaemonRuntime,
     kind: string,
     config: StandbyGroupConfig,
-  ): StandbyGroup {
+  ): Promise<StandbyGroup> {
     try {
-      const napi = NapiStandbyGroup.spawn(
-        runtime._napiRuntime(),
-        kind,
-        {
-          memberCount: config.memberCount,
-          groupSeed: toBuffer(config.groupSeed),
-          hostConfig: config.hostConfig,
-        },
-      );
+      const napi = await runtime._napiRuntime().spawnStandbyGroup(kind, {
+        memberCount: config.memberCount,
+        groupSeed: toBuffer(config.groupSeed),
+        hostConfig: config.hostConfig,
+      });
       return new StandbyGroup(napi);
     } catch (e) {
       return toGroupError(e);
@@ -453,9 +448,9 @@ export class StandbyGroup {
 
   /** Snapshot the active and push to every standby. Returns the
    *  sequence number the sync caught up through. */
-  sync(): bigint {
+  async sync(): Promise<bigint> {
     try {
-      return this.inner.syncStandbys();
+      return await this.inner.syncStandbys();
     } catch (e) {
       return toGroupError(e);
     }
@@ -464,9 +459,9 @@ export class StandbyGroup {
   /** Promote the most-synced standby to active. Call manually for
    *  planned failover; {@link onNodeFailure} calls automatically
    *  when the active's node fails. */
-  promote(kind?: string): number {
+  async promote(kind?: string): Promise<number> {
     try {
-      return this.inner.promote(kind);
+      return await this.inner.promote(kind);
     } catch (e) {
       return toGroupError(e);
     }
@@ -475,9 +470,9 @@ export class StandbyGroup {
   /** Handle node failure. Returns the new active's `origin_hash`
    *  if the active was on `failedNodeId`; `null` if only standbys
    *  were affected. */
-  onNodeFailure(failedNodeId: bigint, kind?: string): number | null {
+  async onNodeFailure(failedNodeId: bigint, kind?: string): Promise<number | null> {
     try {
-      const r = this.inner.onNodeFailure(failedNodeId, kind);
+      const r = await this.inner.onNodeFailure(failedNodeId, kind);
       return r ?? null;
     } catch (e) {
       return toGroupError(e);

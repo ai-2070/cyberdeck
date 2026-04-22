@@ -173,6 +173,29 @@ export declare class DaemonRuntime {
    */
   deliver(originHash: number, event: CausalEventJs): Promise<Array<Buffer>>
   /**
+   * Spawn a `ReplicaGroup` bound to this runtime. `kind` must
+   * have been registered via [`Self::register_factory`]; the
+   * group invokes the factory once per replica at spawn and
+   * again on scale-up / failure replacement.
+   *
+   * Async so the SDK-level spawn runs on a tokio worker. The
+   * factory round-trip goes through the TSFN dispatcher — if
+   * this method were sync on the Node main thread, the TSFN
+   * callback would queue behind the blocked spawn and deadlock.
+   */
+  spawnReplicaGroup(kind: string, config: ReplicaGroupConfigJs): Promise<ReplicaGroup>
+  /**
+   * Fork `config.forkCount` new daemons from a parent at
+   * `forkSeq`. Same deadlock-avoidance argument as
+   * `spawnReplicaGroup`.
+   */
+  spawnForkGroup(kind: string, parentOrigin: number, forkSeq: bigint, config: ForkGroupConfigJs): Promise<ForkGroup>
+  /**
+   * Spawn a `StandbyGroup`. Same deadlock-avoidance argument
+   * as `spawnReplicaGroup`.
+   */
+  spawnStandbyGroup(kind: string, config: StandbyGroupConfigJs): Promise<StandbyGroup>
+  /**
    * Initiate a migration for the daemon identified by
    * `originHash`, moving it from `sourceNode` to `targetNode`.
    *
@@ -241,10 +264,9 @@ export declare class DaemonRuntime {
 }
 
 export declare class ForkGroup {
-  static fork(runtime: DaemonRuntime, kind: string, parentOrigin: number, forkSeq: bigint, config: ForkGroupConfigJs): ForkGroup
   routeEvent(ctx: RequestContextJs): number
-  scaleTo(n: number, kind?: string | undefined | null): void
-  onNodeFailure(failedNodeId: bigint, kind?: string | undefined | null): Array<number>
+  scaleTo(n: number, kind?: string | undefined | null): Promise<void>
+  onNodeFailure(failedNodeId: bigint, kind?: string | undefined | null): Promise<Array<number>>
   onNodeRecovery(recoveredNodeId: bigint): void
   get health(): GroupHealthJs
   get parentOrigin(): number
@@ -882,11 +904,6 @@ export declare class RedexTailIter {
 
 export declare class ReplicaGroup {
   /**
-   * Spawn a replica group bound to an existing runtime. `kind`
-   * must have been registered via `runtime.registerFactory`.
-   */
-  static spawn(runtime: DaemonRuntime, kind: string, config: ReplicaGroupConfigJs): ReplicaGroup
-  /**
    * Resolve `ctx` to the best-available replica's `origin_hash`.
    * Caller hands the returned hash to `runtime.deliver(...)`.
    */
@@ -894,14 +911,20 @@ export declare class ReplicaGroup {
   /**
    * Resize the group to `n` replicas. `kind` may be omitted to
    * re-use the kind the group was spawned with.
+   *
+   * Async: growing calls the factory once per new replica, which
+   * fires the TSFN dispatcher. Main-thread invocation would
+   * deadlock on the TSFN callback — same argument as
+   * `spawnReplicaGroup`.
    */
-  scaleTo(n: number, kind?: string | undefined | null): void
+  scaleTo(n: number, kind?: string | undefined | null): Promise<void>
   /**
    * Handle failure of a node hosting one or more replicas.
    * Returns the indices of replicas that were successfully
-   * respawned on other nodes.
+   * respawned on other nodes. Async for the same
+   * deadlock-avoidance reason as `scaleTo`.
    */
-  onNodeFailure(failedNodeId: bigint, kind?: string | undefined | null): Array<number>
+  onNodeFailure(failedNodeId: bigint, kind?: string | undefined | null): Promise<Array<number>>
   onNodeRecovery(recoveredNodeId: bigint): void
   get health(): GroupHealthJs
   get groupId(): number
@@ -911,7 +934,6 @@ export declare class ReplicaGroup {
 }
 
 export declare class StandbyGroup {
-  static spawn(runtime: DaemonRuntime, kind: string, config: StandbyGroupConfigJs): StandbyGroup
   /**
    * `origin_hash` of the current active. Feed to
    * `runtime.deliver(...)` for every event, then call
@@ -919,9 +941,9 @@ export declare class StandbyGroup {
    * it in their replay buffer on promotion.
    */
   get activeOrigin(): number
-  syncStandbys(): bigint
-  promote(kind?: string | undefined | null): number
-  onNodeFailure(failedNodeId: bigint, kind?: string | undefined | null): number | null
+  syncStandbys(): Promise<bigint>
+  promote(kind?: string | undefined | null): Promise<number>
+  onNodeFailure(failedNodeId: bigint, kind?: string | undefined | null): Promise<number | null>
   onNodeRecovery(recoveredNodeId: bigint): void
   get health(): GroupHealthJs
   get activeHealthy(): boolean

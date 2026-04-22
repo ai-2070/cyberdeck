@@ -35,7 +35,7 @@ use net_sdk::groups::{
 use net::adapter::net::behavior::loadbalance::Strategy as CoreStrategy;
 use net::adapter::net::compute::DaemonHostConfig;
 
-use crate::compute::DaemonRuntime;
+use net_sdk::compute::DaemonRuntime as SdkDaemonRuntime;
 
 // =========================================================================
 // Error prefix — `daemon: group:` namespace
@@ -278,6 +278,73 @@ fn parse_seed(buf: Buffer) -> Result<[u8; 32]> {
 }
 
 // =========================================================================
+// Async constructor helpers — run on tokio workers via napi's async
+// method wrapping. Called from `DaemonRuntime::spawn_*_group` so the
+// TSFN factory round-trip can unblock on the Node main thread.
+// =========================================================================
+
+pub(crate) async fn spawn_replica_group(
+    runtime: SdkDaemonRuntime,
+    kind: String,
+    config: ReplicaGroupConfigJs,
+) -> Result<ReplicaGroup> {
+    let seed = parse_seed(config.group_seed)?;
+    let cfg = SdkReplicaGroupConfig {
+        replica_count: config.replica_count as u8,
+        group_seed: seed,
+        lb_strategy: config.lb_strategy.into(),
+        host_config: config.host_config.map(Into::into).unwrap_or_default(),
+    };
+    // `SdkReplicaGroup::spawn` is a sync function that invokes the
+    // factory inline. Running it on this tokio worker (rather than
+    // the Node main thread) lets the TSFN factory callback complete
+    // without deadlock — see the docstring on `spawnReplicaGroup`.
+    let group = SdkReplicaGroup::spawn(&runtime, &kind, cfg).map_err(group_err)?;
+    Ok(ReplicaGroup {
+        inner: Arc::new(group),
+        kind,
+    })
+}
+
+pub(crate) async fn spawn_fork_group(
+    runtime: SdkDaemonRuntime,
+    kind: String,
+    parent_origin: u32,
+    fork_seq: u64,
+    config: ForkGroupConfigJs,
+) -> Result<ForkGroup> {
+    let cfg = SdkForkGroupConfig {
+        fork_count: config.fork_count as u8,
+        lb_strategy: config.lb_strategy.into(),
+        host_config: config.host_config.map(Into::into).unwrap_or_default(),
+    };
+    let group = SdkForkGroup::fork(&runtime, &kind, parent_origin, fork_seq, cfg)
+        .map_err(group_err)?;
+    Ok(ForkGroup {
+        inner: Arc::new(group),
+        kind,
+    })
+}
+
+pub(crate) async fn spawn_standby_group(
+    runtime: SdkDaemonRuntime,
+    kind: String,
+    config: StandbyGroupConfigJs,
+) -> Result<StandbyGroup> {
+    let seed = parse_seed(config.group_seed)?;
+    let cfg = SdkStandbyGroupConfig {
+        member_count: config.member_count as u8,
+        group_seed: seed,
+        host_config: config.host_config.map(Into::into).unwrap_or_default(),
+    };
+    let group = SdkStandbyGroup::spawn(&runtime, &kind, cfg).map_err(group_err)?;
+    Ok(StandbyGroup {
+        inner: Arc::new(group),
+        kind,
+    })
+}
+
+// =========================================================================
 // ReplicaGroup
 // =========================================================================
 
@@ -289,28 +356,6 @@ pub struct ReplicaGroup {
 
 #[napi]
 impl ReplicaGroup {
-    /// Spawn a replica group bound to an existing runtime. `kind`
-    /// must have been registered via `runtime.registerFactory`.
-    #[napi(factory)]
-    pub fn spawn(
-        runtime: &DaemonRuntime,
-        kind: String,
-        config: ReplicaGroupConfigJs,
-    ) -> Result<ReplicaGroup> {
-        let seed = parse_seed(config.group_seed)?;
-        let cfg = SdkReplicaGroupConfig {
-            replica_count: config.replica_count as u8,
-            group_seed: seed,
-            lb_strategy: config.lb_strategy.into(),
-            host_config: config.host_config.map(Into::into).unwrap_or_default(),
-        };
-        let group =
-            SdkReplicaGroup::spawn(runtime.sdk_runtime(), &kind, cfg).map_err(group_err)?;
-        Ok(ReplicaGroup {
-            inner: Arc::new(group),
-            kind,
-        })
-    }
 
     /// Resolve `ctx` to the best-available replica's `origin_hash`.
     /// Caller hands the returned hash to `runtime.deliver(...)`.
@@ -322,20 +367,32 @@ impl ReplicaGroup {
 
     /// Resize the group to `n` replicas. `kind` may be omitted to
     /// re-use the kind the group was spawned with.
+    ///
+    /// Async: growing calls the factory once per new replica, which
+    /// fires the TSFN dispatcher. Main-thread invocation would
+    /// deadlock on the TSFN callback — same argument as
+    /// `spawnReplicaGroup`.
     #[napi]
-    pub fn scale_to(&self, n: u32, kind: Option<String>) -> Result<()> {
+    pub async fn scale_to(&self, n: u32, kind: Option<String>) -> Result<()> {
         let k = kind.unwrap_or_else(|| self.kind.clone());
-        self.inner.scale_to(n as u8, &k).map_err(group_err)
+        let inner = self.inner.clone();
+        inner.scale_to(n as u8, &k).map_err(group_err)
     }
 
     /// Handle failure of a node hosting one or more replicas.
     /// Returns the indices of replicas that were successfully
-    /// respawned on other nodes.
+    /// respawned on other nodes. Async for the same
+    /// deadlock-avoidance reason as `scaleTo`.
     #[napi]
-    pub fn on_node_failure(&self, failed_node_id: BigInt, kind: Option<String>) -> Result<Vec<u32>> {
+    pub async fn on_node_failure(
+        &self,
+        failed_node_id: BigInt,
+        kind: Option<String>,
+    ) -> Result<Vec<u32>> {
         let (_, node, _) = failed_node_id.get_u64();
         let k = kind.unwrap_or_else(|| self.kind.clone());
-        let replaced = self.inner.on_node_failure(node, &k).map_err(group_err)?;
+        let inner = self.inner.clone();
+        let replaced = inner.on_node_failure(node, &k).map_err(group_err)?;
         Ok(replaced.into_iter().map(|i| i as u32).collect())
     }
 
@@ -383,28 +440,6 @@ pub struct ForkGroup {
 
 #[napi]
 impl ForkGroup {
-    #[napi(factory)]
-    pub fn fork(
-        runtime: &DaemonRuntime,
-        kind: String,
-        parent_origin: u32,
-        fork_seq: BigInt,
-        config: ForkGroupConfigJs,
-    ) -> Result<ForkGroup> {
-        let (_, seq, _) = fork_seq.get_u64();
-        let cfg = SdkForkGroupConfig {
-            fork_count: config.fork_count as u8,
-            lb_strategy: config.lb_strategy.into(),
-            host_config: config.host_config.map(Into::into).unwrap_or_default(),
-        };
-        let group =
-            SdkForkGroup::fork(runtime.sdk_runtime(), &kind, parent_origin, seq, cfg)
-                .map_err(group_err)?;
-        Ok(ForkGroup {
-            inner: Arc::new(group),
-            kind,
-        })
-    }
 
     #[napi]
     pub fn route_event(&self, ctx: RequestContextJs) -> Result<u32> {
@@ -414,16 +449,21 @@ impl ForkGroup {
     }
 
     #[napi]
-    pub fn scale_to(&self, n: u32, kind: Option<String>) -> Result<()> {
+    pub async fn scale_to(&self, n: u32, kind: Option<String>) -> Result<()> {
         let k = kind.unwrap_or_else(|| self.kind.clone());
-        self.inner.scale_to(n as u8, &k).map_err(group_err)
+        self.inner.clone().scale_to(n as u8, &k).map_err(group_err)
     }
 
     #[napi]
-    pub fn on_node_failure(&self, failed_node_id: BigInt, kind: Option<String>) -> Result<Vec<u32>> {
+    pub async fn on_node_failure(
+        &self,
+        failed_node_id: BigInt,
+        kind: Option<String>,
+    ) -> Result<Vec<u32>> {
         let (_, node, _) = failed_node_id.get_u64();
         let k = kind.unwrap_or_else(|| self.kind.clone());
         self.inner
+            .clone()
             .on_node_failure(node, &k)
             .map_err(group_err)
             .map(|v| v.into_iter().map(|i| i as u32).collect())
@@ -488,25 +528,6 @@ pub struct StandbyGroup {
 
 #[napi]
 impl StandbyGroup {
-    #[napi(factory)]
-    pub fn spawn(
-        runtime: &DaemonRuntime,
-        kind: String,
-        config: StandbyGroupConfigJs,
-    ) -> Result<StandbyGroup> {
-        let seed = parse_seed(config.group_seed)?;
-        let cfg = SdkStandbyGroupConfig {
-            member_count: config.member_count as u8,
-            group_seed: seed,
-            host_config: config.host_config.map(Into::into).unwrap_or_default(),
-        };
-        let group =
-            SdkStandbyGroup::spawn(runtime.sdk_runtime(), &kind, cfg).map_err(group_err)?;
-        Ok(StandbyGroup {
-            inner: Arc::new(group),
-            kind,
-        })
-    }
 
     /// `origin_hash` of the current active. Feed to
     /// `runtime.deliver(...)` for every event, then call
@@ -518,26 +539,29 @@ impl StandbyGroup {
     }
 
     #[napi]
-    pub fn sync_standbys(&self) -> Result<BigInt> {
-        let seq = self.inner.sync_standbys().map_err(group_err)?;
+    pub async fn sync_standbys(&self) -> Result<BigInt> {
+        let seq = self.inner.clone().sync_standbys().map_err(group_err)?;
         Ok(BigInt::from(seq))
     }
 
     #[napi]
-    pub fn promote(&self, kind: Option<String>) -> Result<u32> {
+    pub async fn promote(&self, kind: Option<String>) -> Result<u32> {
         let k = kind.unwrap_or_else(|| self.kind.clone());
-        self.inner.promote(&k).map_err(group_err)
+        self.inner.clone().promote(&k).map_err(group_err)
     }
 
     #[napi]
-    pub fn on_node_failure(
+    pub async fn on_node_failure(
         &self,
         failed_node_id: BigInt,
         kind: Option<String>,
     ) -> Result<Option<u32>> {
         let (_, node, _) = failed_node_id.get_u64();
         let k = kind.unwrap_or_else(|| self.kind.clone());
-        self.inner.on_node_failure(node, &k).map_err(group_err)
+        self.inner
+            .clone()
+            .on_node_failure(node, &k)
+            .map_err(group_err)
     }
 
     #[napi]

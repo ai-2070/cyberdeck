@@ -17,7 +17,9 @@ import {
 
 const PSK = '42'.repeat(32);
 
-let portSeed = 30_100;
+// Start high to avoid collisions with other test files in the
+// suite. Each port is used exactly once per vitest run.
+let portSeed = 31_500;
 function nextPort(): string {
   return `127.0.0.1:${portSeed++}`;
 }
@@ -71,7 +73,7 @@ describe('ReplicaGroup', () => {
     cleanups.push(() => mesh.shutdown());
     cleanups.push(() => rt.shutdown());
 
-    const group = ReplicaGroup.spawn(rt, 'noop', {
+    const group = await ReplicaGroup.spawn(rt, 'noop', {
       replicaCount: 3,
       groupSeed: seed(0x11),
       lbStrategy: 'round-robin',
@@ -93,7 +95,7 @@ describe('ReplicaGroup', () => {
     cleanups.push(() => mesh.shutdown());
     cleanups.push(() => rt.shutdown());
 
-    const group = ReplicaGroup.spawn(rt, 'noop', {
+    const group = await ReplicaGroup.spawn(rt, 'noop', {
       replicaCount: 3,
       groupSeed: seed(0x22),
       lbStrategy: 'consistent-hash',
@@ -111,18 +113,18 @@ describe('ReplicaGroup', () => {
     cleanups.push(() => mesh.shutdown());
     cleanups.push(() => rt.shutdown());
 
-    const group = ReplicaGroup.spawn(rt, 'noop', {
+    const group = await ReplicaGroup.spawn(rt, 'noop', {
       replicaCount: 2,
       groupSeed: seed(0x33),
       lbStrategy: 'round-robin',
     });
     expect(rt.daemonCount()).toBe(2);
 
-    group.scaleTo(5);
+    await group.scaleTo(5);
     expect(group.replicaCount).toBe(5);
     expect(rt.daemonCount()).toBe(5);
 
-    group.scaleTo(1);
+    await group.scaleTo(1);
     expect(group.replicaCount).toBe(1);
     expect(rt.daemonCount()).toBe(1);
   });
@@ -136,7 +138,7 @@ describe('ReplicaGroup', () => {
     // Intentionally skip rt.start()
 
     try {
-      ReplicaGroup.spawn(rt, 'noop', {
+      await ReplicaGroup.spawn(rt, 'noop', {
         replicaCount: 2,
         groupSeed: seed(0x44),
         lbStrategy: 'round-robin',
@@ -155,7 +157,7 @@ describe('ReplicaGroup', () => {
     cleanups.push(() => rt.shutdown());
 
     try {
-      ReplicaGroup.spawn(rt, 'never-registered', {
+      await ReplicaGroup.spawn(rt, 'never-registered', {
         replicaCount: 2,
         groupSeed: seed(0x55),
         lbStrategy: 'round-robin',
@@ -189,7 +191,7 @@ describe('ForkGroup', () => {
     cleanups.push(() => mesh.shutdown());
     cleanups.push(() => rt.shutdown());
 
-    const group = ForkGroup.fork(rt, 'noop', 0xabcd_ef01, 42n, {
+    const group = await ForkGroup.fork(rt, 'noop', 0xabcd_ef01, 42n, {
       forkCount: 3,
       lbStrategy: 'round-robin',
     });
@@ -212,7 +214,7 @@ describe('ForkGroup', () => {
     rt.registerFactory('noop', () => new NoopDaemon());
 
     try {
-      ForkGroup.fork(rt, 'noop', 0x1234, 1n, {
+      await ForkGroup.fork(rt, 'noop', 0x1234, 1n, {
         forkCount: 2,
         lbStrategy: 'round-robin',
       });
@@ -243,7 +245,7 @@ describe('StandbyGroup', () => {
     cleanups.push(() => mesh.shutdown());
     cleanups.push(() => rt.shutdown());
 
-    const group = StandbyGroup.spawn(rt, 'noop', {
+    const group = await StandbyGroup.spawn(rt, 'noop', {
       memberCount: 3,
       groupSeed: seed(0x77),
     });
@@ -265,7 +267,7 @@ describe('StandbyGroup', () => {
     cleanups.push(() => rt.shutdown());
 
     try {
-      StandbyGroup.spawn(rt, 'noop', {
+      await StandbyGroup.spawn(rt, 'noop', {
         memberCount: 1,
         groupSeed: seed(0x88),
       });
@@ -282,7 +284,7 @@ describe('StandbyGroup', () => {
     cleanups.push(() => rt.shutdown());
 
     try {
-      StandbyGroup.spawn(rt, 'never-registered', {
+      await StandbyGroup.spawn(rt, 'never-registered', {
         memberCount: 2,
         groupSeed: seed(0x99),
       });
@@ -300,7 +302,7 @@ describe('StandbyGroup', () => {
     // Invalid: 16 bytes instead of 32. NAPI-side `parse_seed`
     // surfaces this as `daemon: group: invalid-config: ...`.
     try {
-      StandbyGroup.spawn(rt, 'noop', {
+      await StandbyGroup.spawn(rt, 'noop', {
         memberCount: 2,
         groupSeed: Buffer.alloc(16, 0xaa),
       });
