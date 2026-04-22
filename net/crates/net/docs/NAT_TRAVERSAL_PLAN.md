@@ -310,10 +310,11 @@ Classification runs on `MeshNode::start()`:
 5. Store the observed reflex address on the local `CapabilityAnnouncement` builder (see decision 7 — the `reflex_addr` field).
 6. Trigger a fresh `announce_capabilities` so peers see both the new tag and the new reflex address in one round-trip.
 
-Re-classification triggers:
+Re-classification triggers (locked by decision 14 — no per-handshake-failure path):
 
-- Capability re-announce cadence (default every 10 s min-interval); if the cached reflex address from either anchor peer differs from the last observation, re-classify.
-- Explicit `mesh.reclassify_nat()` on demand (useful after mobile network transitions).
+- **Capability re-announce cadence.** Default every 10 s min-interval; if the cached reflex address from any anchor peer differs from the last observation at re-announce time, re-classify first so the new tag + reflex ship together.
+- **Explicit upcall.** `mesh.reclassify_nat()` — called by mobile-aware apps and integration tests.
+- **Coarse network-stack events.** Interface down/up or platform `ConnectivityManager` transitions (Android, iOS, Win32 NLM) queue one re-classification. Never per-peer handshake failure — that path stays on the existing mesh-healing reroute logic to avoid NAT-type flapping under transient per-link loss.
 
 ### Reflex address on the wire
 
@@ -551,29 +552,9 @@ Kind vocabulary for cross-binding parity (TS / Python / Go map to classes with a
 
 ## Open questions
 
-### Rendezvous relay selection
+None — the initial design review resolved all of them. Decisions captured in the numbered design decisions section above (specifically §9–§14 correspond to the formerly-open rendezvous / retry / IPv6 / port-mapping-lease / relay-tag / reclassification questions).
 
-How does A pick which peer to use as rendezvous R? The first mutually-connected peer is the simplest rule, but may bias toward a single overloaded node. A random-two-choices pick across mutually-connected peers advertising `relay-capable` is probably the right default. **Open for decision:** if no `relay-capable` peer is mutually connected, do we (a) fail, (b) use any mutually-connected peer, or (c) fall through to routed-handshake immediately?
-
-### Punch packet-loss resilience
-
-3 keep-alives spaced 100/250/500 ms. On a lossy link, all 3 might drop. **Decision needed:** retry the punch once before giving up, or let the caller retry? Recommend single-shot — upper layers already handle connection-establishment retry.
-
-### IPv6 hole punching
-
-IPv6 usually doesn't need punching (most IPv6 stacks are `Open`), but some CGNAT deployments do apply NAT64 / 464XLAT. Stage 2 classification handles this correctly via the usual probe logic; stage 3 rendezvous works the same over IPv6. Worth an explicit dual-stack test in stage 3 exit criteria.
-
-### Port-mapping lease on crash
-
-If a node crashes after installing a UPnP mapping, the mapping leaks until its TTL expires (we request 3600 s). **Decision needed:** aggressive TTL (60 s) with frequent renewal, or let leaks decay naturally? Recommend 3600 s — renewal traffic is load on the router's control plane.
-
-### Relay autonomy vs. rendezvous responsibility
-
-A node advertises `relay-capable` to volunteer as a data relay. Is the same opt-in sufficient to volunteer as a rendezvous coordinator, or should rendezvous get its own tag (`rendezvous-capable`)? Data relaying is a per-packet ongoing cost; rendezvous is a handful of control packets per introduction. **Tentatively:** one tag covers both — the relay's autonomy envelope can rate-limit rendezvous separately.
-
-### Classification churn on mobile networks
-
-A node on a mobile carrier may shift NAT type mid-session. The capability broadcast cadence (10 s min-interval) will eventually propagate the new tag, but active hole-punch coordinators may have stale info. **Worth deciding:** auto-reclassify on every handshake failure, or only on explicit trigger? Recommend explicit — avoid classification thrash.
+Future open questions land here as implementation reveals them.
 
 ---
 
