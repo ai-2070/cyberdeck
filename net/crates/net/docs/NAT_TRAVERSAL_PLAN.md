@@ -2,6 +2,8 @@
 
 Give nodes behind NAT a path to direct peer connectivity — reflexive-address discovery, NAT-type classification, hole-punch rendezvous, opportunistic port mapping — while keeping the existing mesh-relay fallback as the safety net for the cases direct connectivity can't solve. Mesh-native throughout: no external STUN / TURN servers, no WebRTC ICE, no third-party signalling.
 
+> **Framing.** NAT traversal in this codebase is a **latency / throughput optimization**, not a correctness requirement. Connectivity between two NATed peers already works today via routed handshakes + relay forwarding — every message reaches its destination regardless of NAT type. What this plan adds is a shorter path for the cases where a direct punch is feasible, reducing the per-packet relay tax and the load concentrated on topological relays. Everything below is safe to ship incrementally because the fallback path never goes away. Docstrings and READMEs written as part of the rollout must make this framing load-bearing: nothing in this design should read as "needed to talk to NATed peers" — it's "needed to talk to NATed peers *faster*."
+
 ## Context
 
 The mesh already has two load-bearing pieces that a NAT-traversal design can lean on:
@@ -107,6 +109,28 @@ When A can't reach B directly and the existing `RoutingTable::lookup` returns mu
 **Decision:** add an optional `prefer_relay_tag: Option<&str>` to `RoutingTable::lookup` paths that matter for unreachable pairs. Default behavior unchanged; hole-punch-failure handlers opt in.
 
 **Alternative considered:** hard routing rule that forces all unreachable-pair traffic through declared relays. Rejected — violates node autonomy (a relay can be overloaded, withdraw its `relay-capable` tag, or simply refuse to forward) and would require mesh-wide coordination on which relays to use.
+
+### 7. Piggyback the reflex address on capability announcements
+
+Once a node has observed its own reflexive address via stage-1 probes, it publishes that address so peers can skip the round-trip on first contact. The two natural places are (a) a dedicated subprotocol broadcast, (b) an extension of the capability announcement envelope. Capability announcements already fan out multi-hop, already ride the origin's ed25519 signature, and already carry arbitrary tag data — adding one signed field costs no new subprotocol.
+
+**Decision:** extend `CapabilityAnnouncement` with `reflex_addr: Option<SocketAddr>`. Included in the signed envelope so peers cannot forge a target's reflexive address to redirect punch traffic. Absent / `None` on nodes that haven't run classification yet, or where classification yielded `Unknown`. Rate-limited + dedup'd on the existing capability broadcast path.
+
+**Alternative considered:** peer-to-peer lazy discovery (A probes B directly only when A decides to punch to B). Rejected — adds 1 RTT to every new punch target and needlessly hits random peers with reflex traffic when the information is cheaply propagatable. Piggybacking on an already-signed broadcast turns address discovery from O(N peers × probes) into O(1 announcement per node) on the network side.
+
+**Wire cost:** 18 bytes per announcement (`family | addr | port`). Negligible against the envelope's existing signature overhead.
+
+**Trust model:** the reflex address is advisory, not authoritative. The punch step still waits for a real keep-alive exchange on the advertised address before handing off to the Noise handshake. A lying node can only cause its own incoming punches to fail silently; it can't redirect traffic to a third party because the Noise prologue binds the target's `node_id` to the destination of every packet in the session.
+
+### 8. Single punch attempt for symmetric × cone
+
+Symmetric × cone is the partial-success case: the cone side's outbound port mapping is deterministic (same external port per local source port), so if the symmetric side happens to hash the peer's address into the same outbound port it used for the coordinator, the punch works. Retrying doesn't improve odds — the symmetric side's port mapping is deterministic per destination, not randomized per attempt — so a retry just delays the inevitable fallback to routed-handshake.
+
+**Decision:** attempt the punch exactly once for symmetric × cone pairs. On failure (no `PunchAck` within the 5 s window), fall back to routed-handshake without retry. The SDK records the outcome in `traversal_stats` so operators can see the symmetric-NAT population directly.
+
+**Alternative considered:** two attempts (first with the coordinator's observed reflex address, second with a fresh probe in case the symmetric side rebound). Rejected — rebinds only happen on timing events the client can't observe, so a naive retry at a short interval has the same success rate as the first attempt. Worth revisiting if real-world data shows a meaningful second-attempt hit rate.
+
+**Cone × cone stays unchanged** (single attempt, high success rate). **Symmetric × symmetric skips punch entirely** (decision 4 — no point in coordinating a shot that can't land).
 
 ---
 
@@ -217,18 +241,33 @@ Classification runs on `MeshNode::start()`:
 2. Fire `probe_reflex` to each in parallel; wait up to 5 s total.
 3. Feed results into `ClassifyFsm`, write result to `NodeMetadata.nat_type`.
 4. Add one of `nat:open` / `nat:cone` / `nat:symmetric` / `nat:unknown` to the local `CapabilitySet`.
-5. Trigger a fresh `announce_capabilities` so peers see the new tag.
+5. Store the observed reflex address on the local `CapabilityAnnouncement` builder (see decision 7 — the `reflex_addr` field).
+6. Trigger a fresh `announce_capabilities` so peers see both the new tag and the new reflex address in one round-trip.
 
 Re-classification triggers:
 
 - Capability re-announce cadence (default every 10 s min-interval); if the cached reflex address from either anchor peer differs from the last observation, re-classify.
 - Explicit `mesh.reclassify_nat()` on demand (useful after mobile network transitions).
 
+### Reflex address on the wire
+
+`CapabilityAnnouncement` grows one optional field:
+
+```rust
+pub struct CapabilityAnnouncement {
+    // ... existing fields ...
+    pub reflex_addr: Option<SocketAddr>,
+}
+```
+
+Encoding: 1 byte presence flag + 18 bytes address when present (`family: u8 | addr: [u8; 16] | port: u16`) = 19 bytes in the signed envelope when populated, 1 byte when absent. Absence means "node hasn't run classification yet" or "classification returned Unknown." Peers treat absence as "probe lazily on first punch target," present as "use this as the initial target for stage-3 rendezvous, no per-target probe needed."
+
 ### Exit criteria
 
 - `mesh.node_metadata().nat_type` populates within 5 s of `start()` when ≥ 2 peers are handshaken.
-- Capability announcements after start carry exactly one `nat:*` tag.
+- Capability announcements after start carry exactly one `nat:*` tag and, when classification succeeded, the `reflex_addr` field.
 - `find_peers(CapabilityFilter::new().require_tag("nat:open"))` returns relay-capable candidates.
+- A fresh joiner observing its first capability announcement from a classified peer can initiate a rendezvous punch without emitting its own `probe_reflex` to that peer first.
 
 ---
 
@@ -268,10 +307,9 @@ pub struct PunchAck {
 
 On `PunchRequest { target, self_reflex }` from A:
 
-1. Look up target's reflexive address (must be in R's observations — either from capability announcements carrying a `reflex:<addr>` hint, or from R's own past `PunchIntroduce` to this pair).
-2. If reflex unknown, reject with a typed error; caller falls back to routed-handshake.
-3. Pick `fire_at = now() + 500 ms`.
-4. Send `PunchIntroduce` to both A and B with the other's reflex and the shared `fire_at`.
+1. Look up target's reflexive address. Preferred source: the `reflex_addr` field on the latest signed `CapabilityAnnouncement` from `target` in R's local cache (decision 7). Secondary: R's own past `PunchIntroduce` to this pair. If neither available, reject with a typed error and the caller falls back to routed-handshake.
+2. Pick `fire_at = now() + 500 ms`.
+3. Send `PunchIntroduce` to both A and B with the other's reflex and the shared `fire_at`.
 
 ### Endpoints (A's and B's role)
 
@@ -281,23 +319,40 @@ On receipt of `PunchIntroduce { peer, peer_reflex, fire_at }`:
 2. Arm a 5 s timer: if no inbound packet from `peer_reflex` arrives, declare punch failed.
 3. On first inbound packet from `peer_reflex`, send `PunchAck` via routed path (not the punched one — we don't know yet if it's reliable) and begin Noise handshake on the punched path.
 
+### Connect-time pair-type matrix
+
+`connect(peer)` uses the cached NAT classifications from capability announcements to pick the path:
+
+| Local → | Remote → `Open`     | Remote → `Cone`        | Remote → `Symmetric` |
+|---------|---------------------|------------------------|----------------------|
+| `Open`  | Direct, no punch    | Direct, no punch       | Single-shot punch (decision 8) |
+| `Cone`  | Direct, no punch    | Single-shot punch      | Single-shot punch (decision 8) |
+| `Symmetric` | Single-shot punch (decision 8) | Single-shot punch (decision 8) | Skip punch, routed-handshake only |
+| `Unknown` | Direct attempt, fall back on first-packet failure | Single-shot punch | Skip punch, routed-handshake |
+
+"Single-shot" means one rendezvous round — no retry on punch failure. Record the outcome in `traversal_stats`; the caller's upper-layer retry loop (if any) handles reconnection.
+
 ### SDK surface
 
 ```rust
 impl MeshNode {
     /// Attempt a direct connection via rendezvous punch. Falls back
-    /// to routed-handshake on failure.
+    /// to routed-handshake on failure — connectivity is always
+    /// available via the relay path, the punch is a latency
+    /// optimization.
     pub async fn connect_direct(&self, peer: NodeId) -> Result<(), MeshError>;
 }
 ```
 
-Default behavior for an ordinary `connect()`: attempt punch if *both* sides advertise `nat:cone` or `nat:open`; skip punch entirely if either side is `nat:symmetric` (go straight to routed-handshake).
+Default behavior for an ordinary `connect()`: consult the pair-type matrix above. Under the hood `connect()` always yields a working session — via punch if feasible, via routed-handshake if not.
 
 ### Exit criteria
 
 - Three-node integration test: A behind NAT1, B behind NAT2, R reachable by both. `A.connect_direct(B)` completes. Inspect the resulting session: `peer_addr()` is the punched socket, not the relay's.
-- Symmetric×symmetric test: `connect_direct` short-circuits to routed-handshake without attempting a punch.
-- Punch-failure test: simulate a dropped keep-alive; assert the 5 s timer fires and routed-handshake takes over.
+- Symmetric × symmetric test: `connect_direct` short-circuits to routed-handshake without attempting a punch (`traversal_stats.punches_attempted` stays 0, `relay_fallbacks` increments).
+- Symmetric × cone test: exactly one punch attempt. `traversal_stats.punches_attempted == 1` regardless of outcome; on failure `relay_fallbacks == 1`.
+- Punch-failure test (dropped keep-alives, cone × cone): 5 s timer fires, routed-handshake takes over, `connect()` still resolves.
+- Pre-announced reflex test: joiner C receives A's capability announcement carrying `reflex_addr`, then calls `connect_direct(A)` — the rendezvous succeeds without C ever having emitted a `probe_reflex` to A first.
 
 ---
 
@@ -350,8 +405,22 @@ Symmetric across Rust, TS, Python, Go. Each binding exposes:
 - `mesh.nat_type() -> "open" | "cone" | "symmetric" | "unknown"` (getter).
 - `mesh.reflex_addr() -> Option<String>` (the observed / mapped public address).
 - `mesh.probe_reflex(peer_node_id) -> Promise<string>` (test/debugging).
-- `mesh.connect_direct(peer_node_id)` (non-default; ordinary `connect()` picks punch vs. routed automatically).
+- `mesh.connect_direct(peer_node_id)` (non-default; ordinary `connect()` picks punch vs. routed automatically per the pair-type matrix).
 - `mesh.traversal_stats() -> { punches_attempted, punches_succeeded, punches_failed, relay_fallbacks, port_mapping_active }`.
+
+### Docstring framing (load-bearing, per the top-of-doc note)
+
+Every user-visible docstring added as part of this stage — `nat_type`, `reflex_addr`, `connect_direct`, `traversal_stats`, the `TraversalError` class, each binding's README section — must position NAT traversal as **optimization, not correctness**. A sample phrasing to reuse:
+
+> Nodes behind NAT can always talk to each other through the mesh's routed-handshake path. These APIs let the mesh upgrade to a **direct** path when the underlying NATs allow it, cutting relay hops out of the data plane. A `nat_type` of `symmetric` or a `punch-failed` error is not a connectivity failure — it just means traffic keeps riding the relay.
+
+Anti-phrasings to avoid in docs:
+
+- "Required for NATed peers to communicate."
+- "Enables cross-NAT connectivity."
+- "Fixes NAT issues."
+
+Each of these implies the mesh otherwise can't reach NATed peers, which is false. Reviewers should treat these as language bugs on the same severity as an API-signature mistake.
 
 ### Error surface
 
@@ -419,14 +488,6 @@ Kind vocabulary for cross-binding parity (TS / Python / Go map to classes with a
 ### Rendezvous relay selection
 
 How does A pick which peer to use as rendezvous R? The first mutually-connected peer is the simplest rule, but may bias toward a single overloaded node. A random-two-choices pick across mutually-connected peers advertising `relay-capable` is probably the right default. **Open for decision:** if no `relay-capable` peer is mutually connected, do we (a) fail, (b) use any mutually-connected peer, or (c) fall through to routed-handshake immediately?
-
-### Reflex address in capability announcements
-
-Should peers advertise their observed reflex address so a fresh joiner can pre-populate its routing table without needing to probe? **Tradeoff:** reduces probe traffic + speeds up initial classification; leaks slightly more address info (though a peer already knows its own reflex from the handshake). Tentatively yes — add `reflex: SocketAddr` to `CapabilityAnnouncement`, signed with the identity keypair.
-
-### Symmetric × cone
-
-Two cone NATs punch reliably. A symmetric × cone pair *can* sometimes punch if the cone side opens first and the symmetric side's outbound port happens to match — but it's flaky. **Decision needed:** attempt with retries, or skip to relay? Recommend: attempt twice (since the cone side's outbound port is deterministic), skip after.
 
 ### Punch packet-loss resilience
 
