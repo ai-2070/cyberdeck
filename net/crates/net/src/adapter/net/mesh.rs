@@ -172,6 +172,16 @@ struct DispatchCtx {
     channel_configs: Option<Arc<ChannelConfigRegistry>>,
     /// In-flight Subscribe/Unsubscribe requests awaiting an Ack, keyed by nonce.
     pending_membership_acks: Arc<DashMap<u64, oneshot::Sender<MembershipAck>>>,
+    /// In-flight reflex probes keyed by the responder's `node_id`.
+    /// Populated by `MeshNode::probe_reflex`; the dispatch branch
+    /// for `SUBPROTOCOL_REFLEX` completes the oneshot with the
+    /// decoded observed-address on response receipt. Only one
+    /// probe per peer is in flight at a time — a second call
+    /// replaces the pending entry and the previous caller sees
+    /// `ReflexTimeout`.
+    #[cfg(feature = "nat-traversal")]
+    pending_reflex_probes:
+        Arc<DashMap<u64, tokio::sync::oneshot::Sender<std::net::SocketAddr>>>,
     /// Max distinct channels a single peer may subscribe to.
     max_channels_per_peer: usize,
     /// Capability index shared with `MeshNode`. Inbound
@@ -704,6 +714,14 @@ pub struct MeshNode {
     channel_configs: Option<Arc<ChannelConfigRegistry>>,
     /// In-flight Subscribe/Unsubscribe requests keyed by nonce.
     pending_membership_acks: Arc<DashMap<u64, oneshot::Sender<MembershipAck>>>,
+    /// In-flight reflex probes keyed by the responder's `node_id`.
+    /// Shared with `DispatchCtx` via `Arc` clone so the dispatcher
+    /// can complete oneshots without routing back through
+    /// `MeshNode`. Details on the field's usage in the
+    /// `DispatchCtx` docstring.
+    #[cfg(feature = "nat-traversal")]
+    pending_reflex_probes:
+        Arc<DashMap<u64, oneshot::Sender<std::net::SocketAddr>>>,
     /// Capability index populated by inbound
     /// `SUBPROTOCOL_CAPABILITY_ANN` packets and the local
     /// `announce_capabilities` path. Self-index so single-node
@@ -933,6 +951,8 @@ impl MeshNode {
             roster,
             channel_configs: None,
             pending_membership_acks: Arc::new(DashMap::new()),
+            #[cfg(feature = "nat-traversal")]
+            pending_reflex_probes: Arc::new(DashMap::new()),
             capability_index: Arc::new(CapabilityIndex::new()),
             seen_announcements: Arc::new(DashMap::new()),
             last_announce_at: Arc::new(parking_lot::Mutex::new(None)),
@@ -1434,6 +1454,8 @@ impl MeshNode {
             roster: self.roster.clone(),
             channel_configs: self.channel_configs.clone(),
             pending_membership_acks: self.pending_membership_acks.clone(),
+            #[cfg(feature = "nat-traversal")]
+            pending_reflex_probes: self.pending_reflex_probes.clone(),
             max_channels_per_peer: self.config.max_channels_per_peer,
             capability_index: self.capability_index.clone(),
             seen_announcements: self.seen_announcements.clone(),
@@ -2154,6 +2176,86 @@ impl MeshNode {
                 .unwrap_or(0);
 
             Self::handle_capability_announcement(&payload, from_node, ctx);
+            return;
+        }
+
+        // Reflex probe: request → observer echoes the UDP-source
+        // SocketAddr of the requester. Response → completes the
+        // requester's pending oneshot. Both directions ride the
+        // same subprotocol; dispatch is length-based
+        // (see `traversal::reflex::decode`).
+        #[cfg(feature = "nat-traversal")]
+        if parsed.header.subprotocol_id == super::traversal::SUBPROTOCOL_REFLEX {
+            use super::traversal::reflex;
+            let events =
+                EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
+            let payload = events
+                .into_iter()
+                .next()
+                .unwrap_or_else(Bytes::new);
+            let Some(msg) = reflex::decode(&payload) else {
+                return;
+            };
+
+            let from_node = ctx
+                .peers
+                .iter()
+                .find(|e| e.value().session.session_id() == session.session_id())
+                .map(|e| e.value().node_id)
+                .unwrap_or(0);
+            if from_node == 0 {
+                return;
+            }
+
+            match msg {
+                reflex::ReflexMsg::Request => {
+                    // Echo the observed source address back. Source
+                    // is read from `PeerInfo.addr` — the last
+                    // address our kernel saw packets from this peer
+                    // arrive on, equivalent to a STUN server's
+                    // "observed source" because NAT-rewriting is
+                    // applied by the time packets reach our socket.
+                    let Some((dest_addr, dest_sess)) = ctx
+                        .peers
+                        .get(&from_node)
+                        .map(|e| (e.value().addr, e.value().session.clone()))
+                    else {
+                        return;
+                    };
+                    if ctx.partition_filter.contains(&dest_addr) {
+                        return;
+                    }
+                    let response = reflex::encode_response(dest_addr);
+                    let socket = ctx.socket.clone();
+                    tokio::spawn(async move {
+                        let pool = dest_sess.thread_local_pool();
+                        let mut builder = pool.get();
+                        let seq = {
+                            let stream = dest_sess.get_or_create_stream(
+                                super::traversal::SUBPROTOCOL_REFLEX as u64,
+                            );
+                            stream.next_tx_seq()
+                        };
+                        let events = vec![response];
+                        let packet = builder.build_subprotocol(
+                            super::traversal::SUBPROTOCOL_REFLEX as u64,
+                            seq,
+                            &events,
+                            PacketFlags::NONE,
+                            super::traversal::SUBPROTOCOL_REFLEX,
+                        );
+                        let _ = socket.send_to(&packet, dest_addr).await;
+                    });
+                }
+                reflex::ReflexMsg::Response(observed) => {
+                    // Complete the pending probe (if any). A probe
+                    // that already timed out has no oneshot entry;
+                    // the late response is dropped silently.
+                    if let Some((_, tx)) = ctx.pending_reflex_probes.remove(&from_node) {
+                        let _ = tx.send(observed);
+                    }
+                }
+            }
             return;
         }
 
@@ -4477,6 +4579,78 @@ impl MeshNode {
             .map_err(|e| AdapterError::Fatal(format!("key extraction failed: {}", e)))?;
 
         Ok((keys, source))
+    }
+
+    // ── NAT traversal ──────────────────────────────────────────────────
+    //
+    // `SUBPROTOCOL_REFLEX` client. The handler half lives in the
+    // packet-dispatch loop (`process_local_packet`, in the
+    // `SUBPROTOCOL_REFLEX` branch) and echoes the observed UDP
+    // source back as a `ReflexResponse`. This method is the
+    // requester side: send an empty-body request, await the
+    // pending-oneshot, return the observed `SocketAddr`.
+    //
+    // Remember: reflex discovery is an optimization, not a
+    // connectivity guarantee. A `ReflexTimeout` or `PeerNotReachable`
+    // doesn't mean the peers can't talk; it means this specific
+    // address-discovery path didn't resolve.
+
+    /// Send one reflex probe to `peer_node_id` and return the
+    /// public `SocketAddr` the peer observed on the probe's UDP
+    /// envelope.
+    ///
+    /// Waits up to [`TraversalConfig::reflex_timeout`] (default
+    /// 3 s) for the response. Fails with [`TraversalError::ReflexTimeout`]
+    /// on timeout, [`TraversalError::PeerNotReachable`] if the peer
+    /// has no active session, or [`TraversalError::Transport`] on
+    /// a socket-level send failure.
+    ///
+    /// Requires the `nat-traversal` cargo feature.
+    #[cfg(feature = "nat-traversal")]
+    pub async fn probe_reflex(
+        &self,
+        peer_node_id: u64,
+    ) -> Result<std::net::SocketAddr, super::traversal::TraversalError> {
+        use super::traversal::{reflex, TraversalError, TraversalConfig};
+
+        let peer_addr = self
+            .peer_addrs
+            .get(&peer_node_id)
+            .map(|e| *e.value())
+            .ok_or(TraversalError::PeerNotReachable)?;
+
+        // Install the pending-oneshot BEFORE sending so an
+        // improbably-fast response can still complete it. A
+        // previously-in-flight probe to the same peer is
+        // overwritten — its waiter will hit ReflexTimeout, which
+        // matches the "one probe per peer in flight" contract.
+        let (tx, rx) = oneshot::channel();
+        self.pending_reflex_probes.insert(peer_node_id, tx);
+
+        // Empty-body event frame on the reflex subprotocol.
+        let body = reflex::encode_request();
+        if let Err(e) = self
+            .send_subprotocol(peer_addr, super::traversal::SUBPROTOCOL_REFLEX, &body)
+            .await
+        {
+            self.pending_reflex_probes.remove(&peer_node_id);
+            return Err(TraversalError::Transport(e.to_string()));
+        }
+
+        let timeout = TraversalConfig::default().reflex_timeout;
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(addr)) => Ok(addr),
+            Ok(Err(_recv_err)) => {
+                // oneshot cancelled — treat as timeout. Only
+                // happens if a concurrent probe to the same peer
+                // replaced our sender.
+                Err(TraversalError::ReflexTimeout)
+            }
+            Err(_elapsed) => {
+                self.pending_reflex_probes.remove(&peer_node_id);
+                Err(TraversalError::ReflexTimeout)
+            }
+        }
     }
 }
 
