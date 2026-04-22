@@ -314,7 +314,7 @@ When processing can be offloaded to the mesh, edge devices don't need to be smar
 
 A sensor node doesn't need a GPU to run inference. It needs a network interface and a microcontroller. It streams raw data into the mesh and the mesh routes the processing to a node that has the capability. A camera doesn't need to run object detection. A thermostat doesn't need to run a language model. A brake sensor doesn't need to run path planning. They produce data. The mesh finds compute.
 
-The entire transport library — Noise protocol, ChaCha20-Poly1305 encryption, routing, swarm discovery, failure detection, capability system — compiles to ~1MB stripped. About a megabyte. It fits on anything with a network interface.
+The entire transport library — Noise protocol, ChaCha20-Poly1305 encryption, routing, swarm discovery, failure detection, capability system — compiles to ~2MB stripped. About a megabyte. It fits on anything with a network interface.
 
 This inverts the economics of edge deployment. Today, every device that needs intelligence must contain intelligence — or pay for a round trip to a cloud that does. That means expensive hardware at the edge, or latency to a data center, or both. Net eliminates this choice. Devices can be cheap, dumb, and deterministic. They do one thing well — sense, actuate, relay — and the mesh provides the intelligence dynamically.
 
@@ -649,19 +649,21 @@ Benchmarks captured 2026-04-19 via `cargo bench --bench redex --features "redex 
 
 `[profile.release]`: `lto = true`, `codegen-units = 1`, `panic = "abort"`, `opt-level = 3`. Three additional profiles ship in the crate's `Cargo.toml`: `release-with-debug` (release + `debug = true` for profiling), `native` (release + thin LTO for faster local links — pair with `RUSTFLAGS="-C target-cpu=native"`), and `bench` (full LTO, single codegen unit).
 
-Feature set affects `.rlib` and `.a` (which keep all compiled code for downstream linking) but is **almost invisible on the shipped cdylib** — LTO + dead-code elimination strips unreferenced code across feature boundaries, so the deployed `.dylib`/`.dll`/`.so` stays near-constant across feature combinations.
+Feature set affects `.rlib` and `.a` (which keep all compiled code for downstream linking) but is **near-invisible on the shipped cdylib for pure-Rust features** — LTO + dead-code elimination strips unreferenced code across feature boundaries, so the deployed `.dylib`/`.dll`/`.so` stays near-constant across the storage / compute / NAT-classifier combinations. Features that pull in substantial external dependency trees (UPnP's HTTP + XML stack) are the exception, and the table makes that explicit.
 
 | Features | `libnet.dylib` (cdylib) | `libnet.rlib` | `libnet.a` |
 |----------|------------------------:|--------------:|-----------:|
-| `net` | **1.08 MB** | 18.5 MB | 32.7 MB |
-| `net` + `redex` | **1.08 MB** | 18.8 MB | 33.0 MB |
-| `net` + `redex` + `redex-disk` | **1.08 MB** | 18.9 MB | 33.1 MB |
-| `net` + `redex` + `redex-disk` + `cortex` | **1.08 MB** | 20.7 MB | 34.0 MB |
+| `net` | **1.90 MB** | 22.2 MB | 35.2 MB |
+| `net` + `redex` | **1.90 MB** | 22.6 MB | 35.5 MB |
+| `net` + `redex` + `redex-disk` | **1.90 MB** | 22.7 MB | 35.6 MB |
+| `net` + `redex` + `redex-disk` + `cortex` | **1.90 MB** | 24.6 MB | 36.5 MB |
+| `net` + `nat-traversal` | **1.99 MB** | 23.4 MB | 36.0 MB |
+| `net` + `nat-traversal` + `port-mapping` | **3.41 MB** | 26.8 MB | 47.5 MB |
 
 - `libnet.dylib` — shipped cdylib (consumed by Node / Python / C bindings).
 - `libnet.rlib` — Rust static lib with metadata (consumed by other Rust crates).
 - `libnet.a` — C/C++ static lib, pre-LTO, expected for `staticlib`.
 
-Measured on `aarch64-apple-darwin`, 2026-04-20.
+Measured on `aarch64-apple-darwin`, 2026-04-22.
 
-The shipped cdylib stays at **1.08 MB across all four feature configurations** — opting into RedEX, disk durability, or CortEX adds well under 1% to the deployed binary because dead-code elimination strips whatever the caller doesn't reference. The `.rlib` and `.a` grow with features because they must preserve every compiled symbol for downstream linkers; only the shipped cdylib feels the full benefit of LTO.
+The shipped cdylib stays at **1.90 MB across the four storage / compute combinations** — opting into RedEX, disk durability, or CortEX adds well under 1% to the deployed binary because dead-code elimination strips whatever the caller doesn't reference. `nat-traversal` adds ~90 KB (classifier FSM + rendezvous wire codec + the `connect_direct` orchestration path). `port-mapping` is the outlier at **+1.42 MB** — the extra weight is `igd-next`'s UPnP-IGD client, which pulls in a SOAP / XML stack and HTTP machinery that the rest of the mesh doesn't use; NAT-PMP alone is ~100 lines of wire codec inlined in the crate (no external dep), so a deployment that only needs NAT-PMP could strip UPnP support and stay near the `nat-traversal` line. The `.rlib` and `.a` grow with features because they must preserve every compiled symbol for downstream linkers; only the shipped cdylib feels the full benefit of LTO.
