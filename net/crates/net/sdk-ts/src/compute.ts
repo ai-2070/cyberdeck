@@ -348,6 +348,26 @@ export interface DaemonHostConfig {
   readonly autoSnapshotInterval?: bigint;
   /** Maximum events to buffer before forcing a snapshot. */
   readonly maxLogEntries?: number;
+  /**
+   * Maximum time (milliseconds) the Rust side will wait for a JS
+   * `process` / `snapshot` / `restore` callback to return before
+   * surfacing a `DaemonError` with a timeout message. Default
+   * `60_000` (60 s).
+   *
+   * **Why it exists.** The core daemon registry holds a per-daemon
+   * mutex across `process`. If a user callback re-enters the runtime
+   * synchronously on that same daemon, or the Node main thread is
+   * blocked and the TSFN callback can't fire, an unbounded wait
+   * would deadlock silently. A bounded wait converts the deadlock
+   * into a typed error so the daemon's event becomes one failure
+   * instead of a frozen runtime.
+   *
+   * Set a shorter value (e.g. 500) in tests that intentionally
+   * stall the callback and assert the timeout path. Set a longer
+   * value for daemons that legitimately do heavy sync work per
+   * event.
+   */
+  readonly callbackTimeoutMs?: number;
 }
 
 // ----------------------------------------------------------------------------
@@ -724,6 +744,7 @@ export class DaemonRuntime {
           ? {
               autoSnapshotInterval: config.autoSnapshotInterval,
               maxLogEntries: config.maxLogEntries,
+              callbackTimeoutMs: config.callbackTimeoutMs,
             }
           : undefined,
       );
@@ -786,6 +807,7 @@ export class DaemonRuntime {
           ? {
               autoSnapshotInterval: config.autoSnapshotInterval,
               maxLogEntries: config.maxLogEntries,
+              callbackTimeoutMs: config.callbackTimeoutMs,
             }
           : undefined,
       );
@@ -949,6 +971,7 @@ export class DaemonRuntime {
           ? {
               autoSnapshotInterval: config.autoSnapshotInterval,
               maxLogEntries: config.maxLogEntries,
+              callbackTimeoutMs: config.callbackTimeoutMs,
             }
           : undefined,
       );
@@ -981,6 +1004,7 @@ export class DaemonRuntime {
           ? {
               autoSnapshotInterval: config.autoSnapshotInterval,
               maxLogEntries: config.maxLogEntries,
+              callbackTimeoutMs: config.callbackTimeoutMs,
             }
           : undefined,
       );

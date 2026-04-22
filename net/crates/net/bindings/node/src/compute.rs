@@ -27,6 +27,25 @@ use napi_derive::napi;
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Default ceiling on how long we block a tokio worker waiting for a
+/// JS callback (`process` / `snapshot` / `restore`) to respond.
+///
+/// **Why bounded:** `DaemonRegistry::deliver` holds the per-daemon
+/// `parking_lot::Mutex` across `MeshDaemon::process`. If any
+/// re-entrant path — a user callback that reaches back into the
+/// runtime synchronously, or a Node main-thread blockage that
+/// prevents the TSFN callback from firing — tries to reacquire that
+/// mutex, an unbounded `rx.recv()` would deadlock with no diagnostic.
+/// A bounded wait converts the deadlock into a typed
+/// `DaemonError::ProcessFailed` (or `RestoreFailed`) with a clear
+/// message, bounding blast radius to a single event.
+///
+/// Configurable per-daemon via `DaemonHostConfigJs.callbackTimeoutMs`
+/// — default 60 s, which is long enough for legitimate heavy JS work
+/// and short enough that a genuine deadlock surfaces promptly.
+const DEFAULT_CALLBACK_TIMEOUT_MS: u32 = 60_000;
 
 use net::adapter::net::behavior::capability::CapabilityFilter;
 use net::adapter::net::compute::{DaemonError as CoreDaemonError, DaemonHostConfig, MeshDaemon};
@@ -511,6 +530,10 @@ impl DaemonRuntime {
         };
 
         let sdk_identity = identity.to_sdk_identity();
+        let callback_timeout = config
+            .as_ref()
+            .map(|c| c.callback_timeout())
+            .unwrap_or(Duration::from_millis(DEFAULT_CALLBACK_TIMEOUT_MS as u64));
         let sdk_config = match config { Some(c) => c.into_core()?, None => DaemonHostConfig::default() };
         let runtime = self.inner.clone();
         let kind_label = kind.clone();
@@ -520,6 +543,7 @@ impl DaemonRuntime {
             process: process_tsfn,
             snapshot: snapshot_tsfn,
             restore: restore_tsfn,
+            callback_timeout,
         });
 
         // Kind-factory closure for migration-target reconstruction.
@@ -633,6 +657,10 @@ impl DaemonRuntime {
         };
 
         let sdk_identity = identity.to_sdk_identity();
+        let callback_timeout = config
+            .as_ref()
+            .map(|c| c.callback_timeout())
+            .unwrap_or(Duration::from_millis(DEFAULT_CALLBACK_TIMEOUT_MS as u64));
         let sdk_config = match config { Some(c) => c.into_core()?, None => DaemonHostConfig::default() };
         let runtime = self.inner.clone();
         let kind_label = kind.clone();
@@ -642,6 +670,7 @@ impl DaemonRuntime {
             process: process_tsfn,
             snapshot: snapshot_tsfn,
             restore: restore_tsfn,
+            callback_timeout,
         });
 
         // Same NoopBridge fallback for migration-target reconstruction
@@ -1085,6 +1114,11 @@ pub struct DaemonHostConfigJs {
     pub auto_snapshot_interval: Option<BigInt>,
     /// Maximum events to buffer before forcing a snapshot.
     pub max_log_entries: Option<u32>,
+    /// Maximum time (milliseconds) to wait for a JS `process` /
+    /// `snapshot` / `restore` callback to respond before surfacing
+    /// a timeout error. Default 60_000 (60 s). See
+    /// [`DEFAULT_CALLBACK_TIMEOUT_MS`] for the rationale.
+    pub callback_timeout_ms: Option<u32>,
 }
 
 impl DaemonHostConfigJs {
@@ -1101,6 +1135,15 @@ impl DaemonHostConfigJs {
             cfg.max_log_entries = max;
         }
         Ok(cfg)
+    }
+
+    /// Resolve the per-bridge callback timeout. Borrowing here (vs.
+    /// consuming via `into_core`) lets the caller read it at spawn
+    /// time and still hand the config to the core conversion.
+    pub(crate) fn callback_timeout(&self) -> Duration {
+        Duration::from_millis(
+            self.callback_timeout_ms.unwrap_or(DEFAULT_CALLBACK_TIMEOUT_MS) as u64,
+        )
     }
 }
 
@@ -1209,6 +1252,9 @@ struct EventDispatchBridge {
     process: ProcessTsfn,
     snapshot: Option<SnapshotTsfn>,
     restore: Option<RestoreTsfn>,
+    /// Bounded wait applied to every `rx.recv_timeout(...)` below.
+    /// See [`DEFAULT_CALLBACK_TIMEOUT_MS`] for why this exists.
+    callback_timeout: Duration,
 }
 
 impl MeshDaemon for EventDispatchBridge {
@@ -1231,13 +1277,16 @@ impl MeshDaemon for EventDispatchBridge {
     /// returns; that callback sends through an `std::sync::mpsc`
     /// channel which this tokio task blocks on.
     ///
-    /// Deadlock avoidance: `process` runs on a tokio worker, not
-    /// the Node main thread. Blocking on the channel is safe
-    /// because the Node event loop — where the JS `process`
-    /// function actually executes — is a separate thread. The
-    /// caller that reached us (`DaemonRuntime::deliver`) returns
-    /// a `Promise` to JS, so the JS caller's `await` yields the
-    /// event loop long enough for the TSFN callback to fire.
+    /// **Bounded wait.** `DaemonRegistry::deliver` holds the
+    /// per-daemon `parking_lot::Mutex` across this call. If a
+    /// re-entrant path (user callback calling back into the
+    /// runtime, or main-thread blockage preventing the TSFN
+    /// callback from firing) ever needs that same mutex, an
+    /// unbounded `rx.recv()` would deadlock silently. We use
+    /// `recv_timeout(self.callback_timeout)` instead so a real
+    /// deadlock surfaces as a typed `ProcessFailed` error within
+    /// a bounded budget (default 60 s; configurable via
+    /// `DaemonHostConfigJs.callbackTimeoutMs`).
     fn process(&mut self, event: &CausalEvent) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
         let event_js = CausalEventJs::from(event);
         let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<Buffer>>>(1);
@@ -1261,8 +1310,14 @@ impl MeshDaemon for EventDispatchBridge {
             )));
         }
 
-        let result = rx.recv().map_err(|e| {
-            CoreDaemonError::ProcessFailed(format!("JS `process` callback did not respond: {e}"))
+        let result = rx.recv_timeout(self.callback_timeout).map_err(|e| match e {
+            std::sync::mpsc::RecvTimeoutError::Timeout => CoreDaemonError::ProcessFailed(format!(
+                "JS `process` callback did not respond within {} ms (possible re-entrant deadlock or blocked Node main thread)",
+                self.callback_timeout.as_millis(),
+            )),
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                CoreDaemonError::ProcessFailed("JS `process` callback channel disconnected".into())
+            }
         })?;
 
         match result {
@@ -1313,15 +1368,26 @@ impl MeshDaemon for EventDispatchBridge {
             eprintln!("EventDispatchBridge::snapshot enqueue failed: {status:?}");
             return None;
         }
-        match rx.recv() {
+        // Bounded wait — same rationale as `process`. On timeout we
+        // return `None` (the `snapshot()` contract is fallible-by-
+        // absence since the signature returns `Option<Bytes>`), and
+        // emit an `eprintln!` trail so operators can spot the stall.
+        match rx.recv_timeout(self.callback_timeout) {
             Ok(Ok(Some(buf))) => Some(Bytes::copy_from_slice(buf.as_ref())),
             Ok(Ok(None)) => None,
             Ok(Err(e)) => {
                 eprintln!("EventDispatchBridge::snapshot JS callback threw: {e}");
                 None
             }
-            Err(e) => {
-                eprintln!("EventDispatchBridge::snapshot channel recv failed: {e}");
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                eprintln!(
+                    "EventDispatchBridge::snapshot timed out after {} ms (possible re-entrant deadlock)",
+                    self.callback_timeout.as_millis(),
+                );
+                None
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!("EventDispatchBridge::snapshot channel disconnected");
                 None
             }
         }
@@ -1357,8 +1423,14 @@ impl MeshDaemon for EventDispatchBridge {
                 "threadsafe_function enqueue failed: {status:?}"
             )));
         }
-        let result = rx.recv().map_err(|e| {
-            CoreDaemonError::RestoreFailed(format!("JS `restore` callback did not respond: {e}"))
+        let result = rx.recv_timeout(self.callback_timeout).map_err(|e| match e {
+            std::sync::mpsc::RecvTimeoutError::Timeout => CoreDaemonError::RestoreFailed(format!(
+                "JS `restore` callback did not respond within {} ms (possible re-entrant deadlock or blocked Node main thread)",
+                self.callback_timeout.as_millis(),
+            )),
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                CoreDaemonError::RestoreFailed("JS `restore` callback channel disconnected".into())
+            }
         })?;
         match result {
             Ok(_) => Ok(()),
@@ -1450,12 +1522,18 @@ fn build_bridge_from_tsfn(factory: Arc<FactoryTsfn>, kind: String) -> Box<dyn Me
         );
         return Box::new(NoopBridge::new(kind));
     }
-    match rx.recv() {
+    // Bounded wait — same deadlock rationale as `EventDispatchBridge::process`.
+    // This path runs on a migration target during reconstruction; if the
+    // Node main thread is wedged we want `NoopBridge` (with an `eprintln!`
+    // trail) rather than a silent hang.
+    let factory_timeout = Duration::from_millis(DEFAULT_CALLBACK_TIMEOUT_MS as u64);
+    match rx.recv_timeout(factory_timeout) {
         Ok(Ok(tsfns)) => Box::new(EventDispatchBridge {
             name: kind,
             process: tsfns.process,
             snapshot: tsfns.snapshot,
             restore: tsfns.restore,
+            callback_timeout: factory_timeout,
         }),
         Ok(Err(e)) => {
             eprintln!(
@@ -1463,9 +1541,16 @@ fn build_bridge_from_tsfn(factory: Arc<FactoryTsfn>, kind: String) -> Box<dyn Me
             );
             Box::new(NoopBridge::new(kind))
         }
-        Err(e) => {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             eprintln!(
-                "build_bridge_from_tsfn: channel recv failed for kind '{kind}': {e}; falling back to NoopBridge"
+                "build_bridge_from_tsfn: TSFN factory for kind '{kind}' did not respond within {} ms; falling back to NoopBridge",
+                factory_timeout.as_millis(),
+            );
+            Box::new(NoopBridge::new(kind))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            eprintln!(
+                "build_bridge_from_tsfn: channel disconnected for kind '{kind}'; falling back to NoopBridge"
             );
             Box::new(NoopBridge::new(kind))
         }

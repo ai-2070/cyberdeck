@@ -1214,6 +1214,13 @@ export interface DaemonHostConfigJs {
   autoSnapshotInterval?: bigint
   /** Maximum events to buffer before forcing a snapshot. */
   maxLogEntries?: number
+  /**
+   * Maximum time (milliseconds) to wait for a JS `process` /
+   * `snapshot` / `restore` callback to respond before surfacing
+   * a timeout error. Default 60_000 (60 s). See
+   * [`DEFAULT_CALLBACK_TIMEOUT_MS`] for the rationale.
+   */
+  callbackTimeoutMs?: number
 }
 
 /**

@@ -1409,6 +1409,73 @@ describe('DaemonRuntime (Stage 3 sub-step 4: snapshot + restore round-trip)', ()
   }, 30_000);
 });
 
+// Regression: bounded wait for JS callback responses.
+//
+// `DaemonRegistry::deliver` holds a per-daemon `parking_lot::Mutex`
+// across `process()`. If a re-entrant path (user callback reaching
+// back into the runtime on the same daemon) or a blocked Node main
+// thread prevents the TSFN return callback from firing, an
+// unbounded `rx.recv()` on the Rust side would deadlock silently.
+// The fix bounds the wait via `rx.recv_timeout(config.callbackTimeoutMs)`
+// so a deadlock surfaces as a typed `DaemonError` within a budget.
+// This test sets a very short budget and blocks the Node main thread
+// past it; the Rust side must return a timeout error before the
+// busy-wait completes.
+describe('regression: bounded JS callback wait (deadlock protection)', () => {
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    while (cleanups.length > 0) {
+      const fn = cleanups.pop();
+      if (fn) {
+        try {
+          await fn();
+        } catch {
+          // Best-effort teardown.
+        }
+      }
+    }
+  });
+
+  it('deliver rejects with a timeout when the main thread is blocked past callbackTimeoutMs', async () => {
+    const mesh = await buildMesh();
+    cleanups.push(() => mesh.shutdown());
+    const rt = DaemonRuntime.create(mesh);
+    cleanups.push(() => rt.shutdown());
+
+    rt.registerFactory('stall', () => ({
+      name: 'stall',
+      // Synchronous busy-wait. Blocks the Node main thread —
+      // which is where the TSFN return callback would run —
+      // so the Rust side's `rx.recv_timeout` must win the race.
+      process: (event) => {
+        const deadline = Date.now() + 400;
+        while (Date.now() < deadline) {
+          /* busy-wait, spins the main thread */
+        }
+        return [event.payload];
+      },
+    }));
+    await rt.start();
+
+    // Spawn with a 75 ms callback budget — well under the 400 ms
+    // stall above. With an unbounded recv this would hang for
+    // ~400 ms and then succeed; with the timeout fix it rejects
+    // after ~75 ms with a "did not respond within" message.
+    const handle = await rt.spawn('stall', Identity.generate(), {
+      callbackTimeoutMs: 75,
+    });
+
+    await expect(
+      rt.deliver(handle.originHash, {
+        originHash: handle.originHash,
+        sequence: 1n,
+        payload: Buffer.from('x'),
+      }),
+    ).rejects.toThrow(/did not respond within 75 ms/);
+  }, 5_000);
+});
+
 // Regression: BigInt boundary validation at the compute FFI surface.
 //
 // The NAPI layer used to call `BigInt::get_u64()` and discard the
