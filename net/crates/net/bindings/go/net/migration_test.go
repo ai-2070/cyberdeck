@@ -56,7 +56,7 @@ func TestStartMigration_NotReadyReturnsError(t *testing.T) {
 	defer rt.Close()
 	// Intentionally skip Start()
 
-	id, _ := GenerateIdentity()
+	id := newTestIdentity(t)
 	defer id.Close()
 	_, err = rt.StartMigration(id.OriginHash(), m.NodeID(), m.NodeID())
 	if err == nil {
@@ -112,7 +112,7 @@ func TestRegisterMigrationTargetIdentity_DuplicateErrors(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	id, _ := GenerateIdentity()
+	id := newTestIdentity(t)
 	defer id.Close()
 	if err := rt.RegisterMigrationTargetIdentity("counter", id, nil); err != nil {
 		t.Fatalf("first RegisterMigrationTargetIdentity: %v", err)
@@ -245,7 +245,7 @@ func TestMigration_EndToEndCounterSurvivesAToB(t *testing.T) {
 	)
 	defer cleanup()
 
-	id, _ := GenerateIdentity()
+	id := newTestIdentity(t)
 	defer id.Close()
 
 	h, err := rtA.Spawn("counter", id, &counterDaemon{}, nil)
@@ -316,7 +316,7 @@ func TestMigration_FactoryNotFoundOnTarget(t *testing.T) {
 	defer cleanup()
 	_ = rtB // ensure both mesh nodes' runtimes are alive
 
-	id, _ := GenerateIdentity()
+	id := newTestIdentity(t)
 	defer id.Close()
 	h, err := rtA.Spawn("counter", id, &counterDaemon{}, nil)
 	if err != nil {
@@ -407,7 +407,7 @@ func TestMigration_StateFailedWhenRestoreThrows(t *testing.T) {
 
 	// Source uses the normal counter daemon so Snapshot emits
 	// valid bytes.
-	id, _ := GenerateIdentity()
+	id := newTestIdentity(t)
 	defer id.Close()
 	h, err := rtA.Spawn("counter", id, &counterDaemon{}, nil)
 	if err != nil {
@@ -479,7 +479,7 @@ func TestMigration_PhasesChannelYieldsDistinctTransitions(t *testing.T) {
 	rtA, rtB, a, b, cleanup := setupMigrationPair(t, "counter")
 	defer cleanup()
 
-	id, _ := GenerateIdentity()
+	id := newTestIdentity(t)
 	defer id.Close()
 	h, err := rtA.Spawn("counter", id, &counterDaemon{}, nil)
 	if err != nil {

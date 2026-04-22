@@ -224,6 +224,12 @@ func (rt *DaemonRuntime) RegisterFactoryFunc(kind string, factory DaemonFactory)
 		return nil
 	case C.NET_COMPUTE_ERR_DUPLICATE_KIND:
 		return &DuplicateKindError{Kind: kind}
+	case C.NET_COMPUTE_ERR_CALL_FAILED:
+		// The Rust side maps `DaemonError::ShuttingDown` /
+		// `NotReady` to this code. Callers racing a concurrent
+		// `Shutdown` should see the typed shutdown sentinel, not
+		// a generic CALL_FAILED message.
+		return ErrRuntimeShutDown
 	case C.NET_COMPUTE_ERR_NULL:
 		return &DaemonError{Message: "register_factory_with_func: null argument"}
 	default:
@@ -261,6 +267,11 @@ func (rt *DaemonRuntime) RegisterFactory(kind string) error {
 		return nil
 	case C.NET_COMPUTE_ERR_DUPLICATE_KIND:
 		return &DuplicateKindError{Kind: kind}
+	case C.NET_COMPUTE_ERR_CALL_FAILED:
+		// The Rust side maps `DaemonError::ShuttingDown` /
+		// `NotReady` to this code. See `RegisterFactoryFunc` for
+		// the same branch.
+		return ErrRuntimeShutDown
 	case C.NET_COMPUTE_ERR_NULL:
 		return &DaemonError{Message: "register_factory: null argument"}
 	default:

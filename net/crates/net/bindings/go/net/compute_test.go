@@ -30,6 +30,21 @@ func newLocalMesh(t *testing.T) *MeshNode {
 	return m
 }
 
+// newTestIdentity wraps `GenerateIdentity()` with a `t.Fatalf` on
+// failure, so tests can't accidentally proceed with a nil `*Identity`
+// whose `Close` / `OriginHash` / `EntityID` calls would panic.
+// Caller is still responsible for `defer id.Close()` — we want the
+// close sequencing to be visible in each test, same convention as
+// `newLocalMesh`.
+func newTestIdentity(t *testing.T) *Identity {
+	t.Helper()
+	id, err := GenerateIdentity()
+	if err != nil {
+		t.Fatalf("GenerateIdentity failed: %v", err)
+	}
+	return id
+}
+
 func TestDaemonRuntime_BuildsAndReportsNotReadyBeforeStart(t *testing.T) {
 	m := newLocalMesh(t)
 	defer m.Shutdown()
@@ -293,7 +308,7 @@ func TestDaemonSpawn_StopReducesDaemonCount(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	id, _ := GenerateIdentity()
+	id := newTestIdentity(t)
 	defer id.Close()
 
 	h, err := rt.Spawn("echo", id, echoDaemon{}, nil)
@@ -325,7 +340,7 @@ func TestDeliver_EchoDaemonRoundTrip(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	id, _ := GenerateIdentity()
+	id := newTestIdentity(t)
 	defer id.Close()
 	h, err := rt.Spawn("echo", id, echoDaemon{}, nil)
 	if err != nil {
@@ -362,7 +377,7 @@ func TestDeliver_CounterDaemonAccumulatesState(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	id, _ := GenerateIdentity()
+	id := newTestIdentity(t)
 	defer id.Close()
 	h, err := rt.Spawn("counter", id, &counterDaemon{}, nil)
 	if err != nil {
@@ -403,7 +418,7 @@ func TestDeliver_FanoutReturnsMultipleOutputs(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	id, _ := GenerateIdentity()
+	id := newTestIdentity(t)
 	defer id.Close()
 
 	// Use a closure-based daemon to avoid another top-level type.
@@ -454,7 +469,7 @@ func TestDeliver_ProcessErrorSurfaces(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	id, _ := GenerateIdentity()
+	id := newTestIdentity(t)
 	defer id.Close()
 
 	h, err := rt.Spawn("buggy", id, &buggyDaemon{}, nil)
@@ -558,7 +573,7 @@ func TestSnapshot_CounterRoundTrip(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	id, _ := GenerateIdentity()
+	id := newTestIdentity(t)
 	defer id.Close()
 	h, err := rt.Spawn("counter", id, &counterDaemon{}, nil)
 	if err != nil {
@@ -621,7 +636,7 @@ func TestSnapshot_StatelessDaemonReturnsNil(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	id, _ := GenerateIdentity()
+	id := newTestIdentity(t)
 	defer id.Close()
 	h, err := rt.Spawn("echo", id, echoDaemon{}, nil)
 	if err != nil {
@@ -667,7 +682,7 @@ func TestSpawnFromSnapshot_CorruptedBytesErrors(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	id, _ := GenerateIdentity()
+	id := newTestIdentity(t)
 	defer id.Close()
 	_, err = rt.SpawnFromSnapshot("counter", id, []byte("not a real snapshot"), &counterDaemon{}, nil)
 	if err == nil {
@@ -728,7 +743,7 @@ func TestSnapshot_EarlierVsLaterCapturesDifferentState(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	id, _ := GenerateIdentity()
+	id := newTestIdentity(t)
 	defer id.Close()
 	h, err := rt.Spawn("counter", id, &counterDaemon{}, nil)
 	if err != nil {

@@ -223,16 +223,28 @@ func (h *MigrationHandle) Wait() error {
 
 // WaitWithTimeout is like Wait but aborts the migration on
 // timeout and returns a *MigrationError describing the stall.
+//
+// A zero or negative timeout aborts immediately — the Rust FFI
+// takes a `u64`, so a negative `time.Duration` would otherwise
+// wrap to a massive wait (~584 million years for -1 ns), turning
+// a past-deadline call into effectively infinite blocking.
 func (h *MigrationHandle) WaitWithTimeout(timeout time.Duration) error {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	if h.handle == nil {
 		return ErrRuntimeShutDown
 	}
+	// Clamp non-positive durations to zero so the FFI treats
+	// them as "check once and return" rather than wrapping to
+	// a garbage u64.
+	ms := timeout.Milliseconds()
+	if ms < 0 {
+		ms = 0
+	}
 	var errOut *C.char
 	code := C.net_compute_migration_handle_wait_with_timeout(
 		h.handle,
-		C.uint64_t(timeout.Milliseconds()),
+		C.uint64_t(ms),
 		&errOut,
 	)
 	return migrationErr(code, errOut)

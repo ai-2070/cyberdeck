@@ -385,11 +385,20 @@ pub extern "C" fn net_compute_register_factory(
         // SDK rejected the mirror — roll back our kind-set entry
         // so the two registries stay in sync.
         h.factories.remove(&kind);
-        // Translate to DUPLICATE_KIND for the only realistic
-        // failure mode (already-registered); any other SDK error
-        // shouldn't happen here under current invariants.
-        let _ = e; // silence unused binding
-        return NET_COMPUTE_ERR_DUPLICATE_KIND;
+        // Discriminate between the two realistic failure modes.
+        // A concurrent `Shutdown()` is just as likely as a
+        // duplicate-kind collision (the mirror+FFI-side entry
+        // would have been caught already by the `Entry::Occupied`
+        // arm above), so `ShuttingDown` must not masquerade as
+        // a duplicate — callers need to tell "already registered"
+        // apart from "runtime is gone."
+        return match e {
+            SdkDaemonError::FactoryAlreadyRegistered(_) => NET_COMPUTE_ERR_DUPLICATE_KIND,
+            SdkDaemonError::ShuttingDown | SdkDaemonError::NotReady => {
+                NET_COMPUTE_ERR_CALL_FAILED
+            }
+            _ => NET_COMPUTE_ERR_CALL_FAILED,
+        };
     }
     NET_COMPUTE_OK
 }
@@ -460,9 +469,19 @@ pub extern "C" fn net_compute_register_factory_with_func(
         })
     };
 
-    if let Err(_) = h.inner.register_factory(&kind, closure) {
+    if let Err(e) = h.inner.register_factory(&kind, closure) {
         h.factories.remove(&kind);
-        return NET_COMPUTE_ERR_DUPLICATE_KIND;
+        // Same discrimination as `net_compute_register_factory`
+        // above — `ShuttingDown` / `NotReady` must not masquerade
+        // as duplicate-kind so the Go layer can surface
+        // `ErrRuntimeShutDown` to the caller.
+        return match e {
+            SdkDaemonError::FactoryAlreadyRegistered(_) => NET_COMPUTE_ERR_DUPLICATE_KIND,
+            SdkDaemonError::ShuttingDown | SdkDaemonError::NotReady => {
+                NET_COMPUTE_ERR_CALL_FAILED
+            }
+            _ => NET_COMPUTE_ERR_CALL_FAILED,
+        };
     }
     NET_COMPUTE_OK
 }
