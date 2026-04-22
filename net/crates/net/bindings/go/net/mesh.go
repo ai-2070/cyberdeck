@@ -38,6 +38,20 @@ var (
 	ErrMeshTransport    = errors.New("mesh transport error")
 	ErrChannel          = errors.New("channel error")
 	ErrChannelAuth      = errors.New("channel: unauthorized")
+
+	// NAT traversal errors. One sentinel per `TraversalError`
+	// variant so callers can `errors.Is(err, net.ErrTraversalPunchFailed)`.
+	// Framing (plan §5): every one of these represents a missed
+	// *optimization*, not a connectivity failure — the routed-
+	// handshake path is always available regardless of NAT shape.
+	ErrTraversalReflexTimeout      = errors.New("traversal: reflex-timeout")
+	ErrTraversalPeerNotReachable   = errors.New("traversal: peer-not-reachable")
+	ErrTraversalTransport          = errors.New("traversal: transport")
+	ErrTraversalRendezvousNoRelay  = errors.New("traversal: rendezvous-no-relay")
+	ErrTraversalRendezvousRejected = errors.New("traversal: rendezvous-rejected")
+	ErrTraversalPunchFailed        = errors.New("traversal: punch-failed")
+	ErrTraversalPortMapUnavailable = errors.New("traversal: port-map-unavailable")
+	ErrTraversalUnsupported        = errors.New("traversal: unsupported")
 )
 
 func meshErrorFromCode(code C.int) error {
@@ -64,6 +78,22 @@ func meshErrorFromCode(code C.int) error {
 		return ErrChannel
 	case -116:
 		return ErrChannelAuth
+	case -130:
+		return ErrTraversalReflexTimeout
+	case -131:
+		return ErrTraversalPeerNotReachable
+	case -132:
+		return ErrTraversalTransport
+	case -133:
+		return ErrTraversalRendezvousNoRelay
+	case -134:
+		return ErrTraversalRendezvousRejected
+	case -135:
+		return ErrTraversalPunchFailed
+	case -136:
+		return ErrTraversalPortMapUnavailable
+	case -137:
+		return ErrTraversalUnsupported
 	default:
 		return fmt.Errorf("mesh unknown error (code %d)", code)
 	}
@@ -312,6 +342,194 @@ func (m *MeshNode) Start() error {
 		return ErrShuttingDown
 	}
 	return meshErrorFromCode(C.net_mesh_start(m.handle))
+}
+
+// ---------------------------------------------------------------------------
+// NAT traversal
+// ---------------------------------------------------------------------------
+//
+// Framing (plan §5, load-bearing): every one of these APIs is an
+// *optimization*, not a connectivity requirement. Nodes behind
+// NAT can always reach each other through the routed-handshake
+// path. A NatType of "symmetric" or an ErrTraversal* is not a
+// connectivity failure — traffic keeps riding the relay.
+//
+// Compiled when the Rust cdylib has `--features nat-traversal`.
+// Bindings are always present at Go compile time so callers can
+// link unconditionally; at runtime, an unsupported build surfaces
+// as ErrTraversalUnsupported from the shared-library stubs.
+
+// TraversalStats is the snapshot returned by
+// MeshNode.TraversalStats(). All counters are monotonic u64 —
+// they never reset, so callers that want deltas should subtract
+// successive snapshots.
+//
+// - PunchesAttempted: the pair-type matrix elected to attempt a
+//   hole-punch. Increments per attempt, regardless of outcome.
+// - PunchesSucceeded: subset of attempts that produced a direct
+//   session. Always <= PunchesAttempted.
+// - RelayFallbacks: MeshNode.ConnectDirect resolutions that
+//   stayed on the routed-handshake path — matrix-skipped pairs
+//   plus punch-failed attempts.
+type TraversalStats struct {
+	PunchesAttempted uint64
+	PunchesSucceeded uint64
+	RelayFallbacks   uint64
+}
+
+// NatType returns this mesh's NAT classification as a stable
+// string: "open" | "cone" | "symmetric" | "unknown". "unknown"
+// is the pre-classification state; classification runs in the
+// background after Start once >=2 peers are connected.
+func (m *MeshNode) NatType() (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return "", ErrShuttingDown
+	}
+	var out *C.char
+	var outLen C.size_t
+	code := C.net_mesh_nat_type(m.handle, &out, &outLen)
+	if err := meshErrorFromCode(code); err != nil {
+		return "", err
+	}
+	defer C.net_free_string(out)
+	return C.GoStringN(out, C.int(outLen)), nil
+}
+
+// ReflexAddr returns this mesh's public-facing "ip:port" as
+// observed by a remote peer, or the empty string when no
+// reflex has been observed yet. Piggybacks on outbound
+// capability announcements so peers can attempt direct
+// connects without a separate discovery round-trip.
+func (m *MeshNode) ReflexAddr() (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return "", ErrShuttingDown
+	}
+	var out *C.char
+	var outLen C.size_t
+	code := C.net_mesh_reflex_addr(m.handle, &out, &outLen)
+	if err := meshErrorFromCode(code); err != nil {
+		return "", err
+	}
+	defer C.net_free_string(out)
+	return C.GoStringN(out, C.int(outLen)), nil
+}
+
+// PeerNatType returns peerNodeID's NAT classification as
+// advertised on its latest capability announcement. Returns
+// "unknown" when the peer hasn't announced. The pair-type
+// matrix treats "unknown" as "attempt direct, fall back on
+// failure" — never as "don't attempt."
+func (m *MeshNode) PeerNatType(peerNodeID uint64) (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return "", ErrShuttingDown
+	}
+	var out *C.char
+	var outLen C.size_t
+	code := C.net_mesh_peer_nat_type(
+		m.handle, C.uint64_t(peerNodeID), &out, &outLen)
+	if err := meshErrorFromCode(code); err != nil {
+		return "", err
+	}
+	defer C.net_free_string(out)
+	return C.GoStringN(out, C.int(outLen)), nil
+}
+
+// ProbeReflex sends one reflex probe to peerNodeID and returns
+// the public "ip:port" the peer observed on the probe's UDP
+// envelope. Useful for diagnosing misclassifications.
+//
+// Returns ErrTraversalReflexTimeout on probe timeout or
+// ErrTraversalPeerNotReachable when we have no session with
+// peerNodeID.
+func (m *MeshNode) ProbeReflex(peerNodeID uint64) (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return "", ErrShuttingDown
+	}
+	var out *C.char
+	var outLen C.size_t
+	code := C.net_mesh_probe_reflex(
+		m.handle, C.uint64_t(peerNodeID), &out, &outLen)
+	if err := meshErrorFromCode(code); err != nil {
+		return "", err
+	}
+	defer C.net_free_string(out)
+	return C.GoStringN(out, C.int(outLen)), nil
+}
+
+// ReclassifyNat explicitly re-runs the classification sweep.
+// The background loop takes care of this on its own cadence;
+// call this after a suspected NAT rebind (gateway reboot,
+// address change) to accelerate re-classification. No-op when
+// fewer than 2 peers are connected. Never returns an error.
+func (m *MeshNode) ReclassifyNat() error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return ErrShuttingDown
+	}
+	return meshErrorFromCode(C.net_mesh_reclassify_nat(m.handle))
+}
+
+// TraversalStats returns a cumulative snapshot of NAT-traversal
+// counters. See TraversalStats for per-field semantics.
+func (m *MeshNode) TraversalStats() (TraversalStats, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return TraversalStats{}, ErrShuttingDown
+	}
+	var stats TraversalStats
+	code := C.net_mesh_traversal_stats(
+		m.handle,
+		(*C.uint64_t)(unsafe.Pointer(&stats.PunchesAttempted)),
+		(*C.uint64_t)(unsafe.Pointer(&stats.PunchesSucceeded)),
+		(*C.uint64_t)(unsafe.Pointer(&stats.RelayFallbacks)),
+	)
+	if err := meshErrorFromCode(code); err != nil {
+		return TraversalStats{}, err
+	}
+	return stats, nil
+}
+
+// ConnectDirect establishes a session to peerNodeID via the
+// rendezvous path, with coordinator mediating the introduction.
+// The pair-type matrix picks between a direct handshake and a
+// coordinated punch; either way the returned session is
+// equivalent in correctness to Connect.
+//
+// Optimization, not correctness: ConnectDirect always resolves
+// (on punch-failed, the session is established via the routed-
+// handshake fallback). Inspect TraversalStats afterward to
+// distinguish a successful punch from a relay fallback.
+//
+// Returns ErrTraversalPeerNotReachable when we have no cached
+// reflex for peerNodeID, or ErrMeshHandshake on a socket-level
+// handshake error.
+func (m *MeshNode) ConnectDirect(
+	peerNodeID uint64, peerPubkeyHex string, coordinator uint64,
+) error {
+	cPk := C.CString(peerPubkeyHex)
+	defer C.free(unsafe.Pointer(cPk))
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return ErrShuttingDown
+	}
+	code := C.net_mesh_connect_direct(
+		m.handle,
+		C.uint64_t(peerNodeID),
+		cPk,
+		C.uint64_t(coordinator),
+	)
+	return meshErrorFromCode(code)
 }
 
 // ---------------------------------------------------------------------------

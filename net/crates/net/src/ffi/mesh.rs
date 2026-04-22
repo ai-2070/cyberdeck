@@ -64,6 +64,60 @@ pub(crate) const NET_ERR_TOKEN_DELEGATION_EXHAUSTED: c_int = -125;
 pub(crate) const NET_ERR_TOKEN_DELEGATION_NOT_ALLOWED: c_int = -126;
 pub(crate) const NET_ERR_TOKEN_NOT_AUTHORIZED: c_int = -127;
 
+// NAT-traversal error codes. Block -130..-139 — one integer per
+// `TraversalError::kind()` so Go callers can
+// `errors.Is(err, net.ErrTraversalPunchFailed)` without parsing
+// strings, matching the token-error pattern above. Framing (plan
+// §5): every `TraversalError` represents a missed *optimization*,
+// not a connectivity failure — the routed-handshake path is
+// always available. See `TraversalError` docs for per-variant
+// semantics.
+#[cfg(feature = "nat-traversal")]
+pub(crate) const NET_ERR_TRAVERSAL_REFLEX_TIMEOUT: c_int = -130;
+#[cfg(feature = "nat-traversal")]
+pub(crate) const NET_ERR_TRAVERSAL_PEER_NOT_REACHABLE: c_int = -131;
+#[cfg(feature = "nat-traversal")]
+pub(crate) const NET_ERR_TRAVERSAL_TRANSPORT: c_int = -132;
+#[cfg(feature = "nat-traversal")]
+pub(crate) const NET_ERR_TRAVERSAL_RENDEZVOUS_NO_RELAY: c_int = -133;
+#[cfg(feature = "nat-traversal")]
+pub(crate) const NET_ERR_TRAVERSAL_RENDEZVOUS_REJECTED: c_int = -134;
+#[cfg(feature = "nat-traversal")]
+pub(crate) const NET_ERR_TRAVERSAL_PUNCH_FAILED: c_int = -135;
+#[cfg(feature = "nat-traversal")]
+pub(crate) const NET_ERR_TRAVERSAL_PORT_MAP_UNAVAILABLE: c_int = -136;
+#[cfg(feature = "nat-traversal")]
+pub(crate) const NET_ERR_TRAVERSAL_UNSUPPORTED: c_int = -137;
+
+#[cfg(feature = "nat-traversal")]
+fn traversal_err_to_code(e: &crate::adapter::net::traversal::TraversalError) -> c_int {
+    use crate::adapter::net::traversal::TraversalError;
+    match e {
+        TraversalError::ReflexTimeout => NET_ERR_TRAVERSAL_REFLEX_TIMEOUT,
+        TraversalError::PeerNotReachable => NET_ERR_TRAVERSAL_PEER_NOT_REACHABLE,
+        TraversalError::Transport(_) => NET_ERR_TRAVERSAL_TRANSPORT,
+        TraversalError::RendezvousNoRelay => NET_ERR_TRAVERSAL_RENDEZVOUS_NO_RELAY,
+        TraversalError::RendezvousRejected(_) => NET_ERR_TRAVERSAL_RENDEZVOUS_REJECTED,
+        TraversalError::PunchFailed => NET_ERR_TRAVERSAL_PUNCH_FAILED,
+        TraversalError::PortMapUnavailable => NET_ERR_TRAVERSAL_PORT_MAP_UNAVAILABLE,
+        TraversalError::Unsupported => NET_ERR_TRAVERSAL_UNSUPPORTED,
+    }
+}
+
+/// Stable string form of a `NatClass`. Same vocabulary as the
+/// NAPI / PyO3 bindings — callers branch on
+/// `"open" | "cone" | "symmetric" | "unknown"`.
+#[cfg(feature = "nat-traversal")]
+fn nat_class_to_str(class: crate::adapter::net::traversal::classify::NatClass) -> &'static str {
+    use crate::adapter::net::traversal::classify::NatClass;
+    match class {
+        NatClass::Open => "open",
+        NatClass::Cone => "cone",
+        NatClass::Symmetric => "symmetric",
+        NatClass::Unknown => "unknown",
+    }
+}
+
 fn token_err_to_code(e: &CoreTokenError) -> c_int {
     match e {
         CoreTokenError::InvalidFormat => NET_ERR_TOKEN_INVALID_FORMAT,
@@ -554,6 +608,210 @@ pub extern "C" fn net_mesh_shutdown(handle: *mut MeshNodeHandle) -> c_int {
     match rt.block_on(async { h.inner.shutdown().await }) {
         Ok(()) => 0,
         Err(e) => adapter_err_to_code(&e),
+    }
+}
+
+// =========================================================================
+// NAT traversal
+// =========================================================================
+//
+// Framing (plan §5, load-bearing): every user-visible docstring
+// positions NAT traversal as **optimization, not correctness**.
+// Nodes behind NAT can always reach each other through the
+// routed-handshake path. A `nat_type` of `"symmetric"` or any
+// `NET_ERR_TRAVERSAL_*` code is not a connectivity failure —
+// traffic keeps riding the relay. Each function returns early
+// with `NetError::Unsupported` (= -1 NetError variant) when the
+// crate is built without `nat-traversal`, so cgo call sites that
+// unconditionally reference these symbols still link.
+
+/// Write this mesh's NAT classification into `out_str` as one of
+/// `"open" | "cone" | "symmetric" | "unknown"`. Stable vocabulary
+/// — matches the NAPI / PyO3 binding strings. Caller frees via
+/// `net_free_string`.
+///
+/// Returns `0` on success or a NetError code on failure. Only
+/// present when the crate is built with `--features nat-traversal`.
+#[cfg(feature = "nat-traversal")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_nat_type(
+    handle: *mut MeshNodeHandle,
+    out_str: *mut *mut c_char,
+    out_len: *mut usize,
+) -> c_int {
+    if handle.is_null() || out_str.is_null() || out_len.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    write_string_out(
+        nat_class_to_str(h.inner.nat_class()).to_string(),
+        out_str,
+        out_len,
+    )
+}
+
+/// Write this mesh's last-observed reflex `ip:port` into
+/// `out_str`. When no reflex has been observed yet (pre-
+/// classification, or only one peer connected), writes an empty
+/// string and still returns `0`.
+#[cfg(feature = "nat-traversal")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_reflex_addr(
+    handle: *mut MeshNodeHandle,
+    out_str: *mut *mut c_char,
+    out_len: *mut usize,
+) -> c_int {
+    if handle.is_null() || out_str.is_null() || out_len.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let s = h
+        .inner
+        .reflex_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    write_string_out(s, out_str, out_len)
+}
+
+/// Write `peer_node_id`'s advertised NAT classification (read
+/// from its `nat:*` capability tag) into `out_str`. Returns
+/// `"unknown"` when we have no announcement from that peer.
+#[cfg(feature = "nat-traversal")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_peer_nat_type(
+    handle: *mut MeshNodeHandle,
+    peer_node_id: u64,
+    out_str: *mut *mut c_char,
+    out_len: *mut usize,
+) -> c_int {
+    if handle.is_null() || out_str.is_null() || out_len.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    write_string_out(
+        nat_class_to_str(h.inner.peer_nat_class(peer_node_id)).to_string(),
+        out_str,
+        out_len,
+    )
+}
+
+/// Send one reflex probe to `peer_node_id` and write the public
+/// `ip:port` the peer observed into `out_str`. Blocks on the
+/// shared runtime until the probe completes or times out.
+///
+/// Returns `0` on success or a `NET_ERR_TRAVERSAL_*` code on
+/// failure. `NET_ERR_TRAVERSAL_REFLEX_TIMEOUT` means the probe
+/// didn't complete in time; `NET_ERR_TRAVERSAL_PEER_NOT_REACHABLE`
+/// means we have no session with `peer_node_id`.
+#[cfg(feature = "nat-traversal")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_probe_reflex(
+    handle: *mut MeshNodeHandle,
+    peer_node_id: u64,
+    out_str: *mut *mut c_char,
+    out_len: *mut usize,
+) -> c_int {
+    if handle.is_null() || out_str.is_null() || out_len.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let rt = runtime();
+    let node = h.inner.clone();
+    match rt.block_on(async move { node.probe_reflex(peer_node_id).await }) {
+        Ok(addr) => write_string_out(addr.to_string(), out_str, out_len),
+        Err(e) => traversal_err_to_code(&e),
+    }
+}
+
+/// Explicitly re-run the NAT classification sweep. No-op when
+/// fewer than 2 peers are connected. Never returns an error;
+/// callers that want the result should read `nat_type` +
+/// `reflex_addr` afterward.
+#[cfg(feature = "nat-traversal")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_reclassify_nat(handle: *mut MeshNodeHandle) -> c_int {
+    if handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let rt = runtime();
+    let node = h.inner.clone();
+    rt.block_on(async move { node.reclassify_nat().await });
+    0
+}
+
+/// Fill `out_punches_attempted`, `out_punches_succeeded`,
+/// `out_relay_fallbacks` with the current cumulative counters.
+/// Each pointer may be null to skip that field. Monotonic —
+/// counters never decrease or reset.
+#[cfg(feature = "nat-traversal")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_traversal_stats(
+    handle: *mut MeshNodeHandle,
+    out_punches_attempted: *mut u64,
+    out_punches_succeeded: *mut u64,
+    out_relay_fallbacks: *mut u64,
+) -> c_int {
+    if handle.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let snap = h.inner.traversal_stats();
+    unsafe {
+        if !out_punches_attempted.is_null() {
+            *out_punches_attempted = snap.punches_attempted;
+        }
+        if !out_punches_succeeded.is_null() {
+            *out_punches_succeeded = snap.punches_succeeded;
+        }
+        if !out_relay_fallbacks.is_null() {
+            *out_relay_fallbacks = snap.relay_fallbacks;
+        }
+    }
+    0
+}
+
+/// Establish a session to `peer_node_id` via rendezvous through
+/// `coordinator`, picking between direct-handshake and a
+/// coordinated punch per the pair-type matrix. Always resolves
+/// (on punch-failed, falls back to routed). Inspect the stats
+/// counters afterward to distinguish outcomes.
+///
+/// `peer_pubkey_hex` is the peer's 32-byte Noise static public
+/// key as a 64-char hex string.
+///
+/// Returns `0` on success or a `NET_ERR_TRAVERSAL_*` /
+/// `NET_ERR_MESH_HANDSHAKE` code on failure.
+#[cfg(feature = "nat-traversal")]
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_connect_direct(
+    handle: *mut MeshNodeHandle,
+    peer_node_id: u64,
+    peer_pubkey_hex: *const c_char,
+    coordinator: u64,
+) -> c_int {
+    if handle.is_null() || peer_pubkey_hex.is_null() {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let Some(pk_s) = (unsafe { c_str_to_str(peer_pubkey_hex) }) else {
+        return NetError::InvalidUtf8.into();
+    };
+    let pk_bytes = match hex::decode(pk_s) {
+        Ok(b) => b,
+        Err(_) => return NET_ERR_MESH_HANDSHAKE,
+    };
+    if pk_bytes.len() != 32 {
+        return NET_ERR_MESH_HANDSHAKE;
+    }
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&pk_bytes);
+
+    let rt = runtime();
+    let node = h.inner.clone();
+    match rt.block_on(async move { node.connect_direct(peer_node_id, &pk, coordinator).await }) {
+        Ok(_) => 0,
+        Err(e) => traversal_err_to_code(&e),
     }
 }
 

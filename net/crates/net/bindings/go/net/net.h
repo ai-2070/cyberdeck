@@ -61,7 +61,22 @@ typedef enum {
     NET_ERR_TOKEN_NOT_AUTHORIZED = -127,
     /* Capability announce / find_peers errors. Wraps core
      * `AdapterError` when announcement dispatch fails. */
-    NET_ERR_CAPABILITY = -128
+    NET_ERR_CAPABILITY = -128,
+    /* NAT-traversal surface (compiled when the Rust cdylib has
+     * the `nat-traversal` feature on). Codes mirror core
+     * `TraversalError` variants — one integer per `kind` so Go
+     * callers can `errors.Is(err, net.ErrTraversalPunchFailed)`.
+     * Framing (plan §5): every traversal error is a missed
+     * optimization, not a connectivity failure — the routed-
+     * handshake path is always available. */
+    NET_ERR_TRAVERSAL_REFLEX_TIMEOUT = -130,
+    NET_ERR_TRAVERSAL_PEER_NOT_REACHABLE = -131,
+    NET_ERR_TRAVERSAL_TRANSPORT = -132,
+    NET_ERR_TRAVERSAL_RENDEZVOUS_NO_RELAY = -133,
+    NET_ERR_TRAVERSAL_RENDEZVOUS_REJECTED = -134,
+    NET_ERR_TRAVERSAL_PUNCH_FAILED = -135,
+    NET_ERR_TRAVERSAL_PORT_MAP_UNAVAILABLE = -136,
+    NET_ERR_TRAVERSAL_UNSUPPORTED = -137
 } net_error_t;
 
 /* Watch / tail cursor status codes. Returned from net_*_next functions
@@ -551,6 +566,60 @@ int      net_delegate_token(net_identity_t* signer,
 
 /* Writes the mesh's 32-byte ed25519 entity id into `out[32]`. */
 int      net_mesh_entity_id(net_meshnode_t* handle, uint8_t* out);
+
+/* =========================================================================
+ * NAT traversal surface (compiled when the Rust cdylib has the
+ * `nat-traversal` feature on). Framing (plan §5): these APIs let
+ * the mesh upgrade to a *direct* path when the underlying NATs
+ * allow it — they are NOT required for NATed peers to
+ * communicate. The routed-handshake path reaches every peer
+ * regardless. Strings use the stable vocabulary
+ * `"open" | "cone" | "symmetric" | "unknown"`.
+ * ========================================================================= */
+
+/* Write this mesh's NAT classification into `out_str`. Caller
+ * frees via `net_free_string`. */
+int      net_mesh_nat_type(net_meshnode_t* handle,
+                           char** out_str, size_t* out_len);
+
+/* Write this mesh's last-observed reflex `ip:port`. Empty string
+ * when classification has not yet produced an observation. */
+int      net_mesh_reflex_addr(net_meshnode_t* handle,
+                              char** out_str, size_t* out_len);
+
+/* Write `peer_node_id`'s advertised NAT classification (read
+ * from its `nat:*` capability tag). Returns `"unknown"` when we
+ * have no announcement from that peer. */
+int      net_mesh_peer_nat_type(net_meshnode_t* handle,
+                                uint64_t peer_node_id,
+                                char** out_str, size_t* out_len);
+
+/* Send one reflex probe to `peer_node_id` and write the public
+ * `ip:port` the peer observed. Blocks on the shared runtime. */
+int      net_mesh_probe_reflex(net_meshnode_t* handle,
+                               uint64_t peer_node_id,
+                               char** out_str, size_t* out_len);
+
+/* Explicitly re-run the classification sweep. No-op when fewer
+ * than 2 peers are connected; never returns an error. */
+int      net_mesh_reclassify_nat(net_meshnode_t* handle);
+
+/* Fill cumulative traversal counters. Any of the out-pointers may
+ * be NULL to skip that field. Monotonic — counters never reset. */
+int      net_mesh_traversal_stats(net_meshnode_t* handle,
+                                  uint64_t* out_punches_attempted,
+                                  uint64_t* out_punches_succeeded,
+                                  uint64_t* out_relay_fallbacks);
+
+/* Establish a session via rendezvous through `coordinator`. The
+ * pair-type matrix picks between a direct handshake and a
+ * coordinated punch. Always resolves (on punch-failed, falls
+ * back to routed). Inspect `net_mesh_traversal_stats` afterward
+ * to distinguish outcomes. */
+int      net_mesh_connect_direct(net_meshnode_t* handle,
+                                 uint64_t peer_node_id,
+                                 const char* peer_pubkey_hex,
+                                 uint64_t coordinator);
 
 /* Hash a channel name to its 16-bit wire representation. */
 int      net_channel_hash(const char* channel, uint16_t* out_hash);
