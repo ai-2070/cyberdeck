@@ -1,0 +1,27 @@
+net/crates/net/src/ffi/mesh.rs
+  5bf3f089eecaef7a 75-78,93-97,902-1008,2658-2754
+net/crates/net/src/adapter/net/mesh.rs
+  5bf3f089eecaef7a 5005-5017,5038,5041-5049,5053-5068,5073,5899-5922
+net/crates/net/tests/connect_direct.rs
+  5bf3f089eecaef7a 272-385
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "15020c4c529509e0b558e2db8b3744338a1acf32",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 487,
+      "total_deletions": 9796,
+      "accepted_lines": 401,
+      "overriden_lines": 0
+    }
+  }
+}
