@@ -1,0 +1,39 @@
+net/crates/net/sdk-ts/src/mesh.ts
+  5bf3f089eecaef7a 247-263
+net/crates/net/bindings/node/src/compute.rs
+  5bf3f089eecaef7a 281-290
+net/crates/net/sdk-ts/src/compute.ts
+  5bf3f089eecaef7a 557-563
+net/crates/net/bindings/node/Cargo.toml
+  5bf3f089eecaef7a 34-36,40
+net/crates/net/sdk-ts/src/index.ts
+  5bf3f089eecaef7a 139-153
+net/crates/net/bindings/node/src/groups.rs
+  5bf3f089eecaef7a 1-611
+net/crates/net/sdk-ts/src/groups.ts
+  5bf3f089eecaef7a 1-532
+net/crates/net/bindings/node/src/lib.rs
+  5bf3f089eecaef7a 16-17,1710-1742
+net/crates/net/sdk-ts/test/groups.test.ts
+  5bf3f089eecaef7a 1-312
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "5e42fa46fd771147cd2e92d3d1074f93afb6e306",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 5892,
+      "total_deletions": 8144,
+      "accepted_lines": 1546,
+      "overriden_lines": 0
+    }
+  }
+}
