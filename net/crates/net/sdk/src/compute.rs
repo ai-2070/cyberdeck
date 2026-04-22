@@ -61,9 +61,11 @@ pub use ::net::adapter::net::state::snapshot::StateSnapshot;
 use ::net::adapter::net::channel::ChannelName;
 use ::net::adapter::net::identity::PermissionToken;
 
+use ::net::adapter::net::behavior::capability::CapabilitySet;
 use ::net::adapter::net::compute::{
     orchestrator::wire as migration_wire, DaemonFactoryRegistry, DaemonHost, DaemonRegistry,
     MigrationMessage, MigrationOrchestrator, MigrationSourceHandler, MigrationTargetHandler,
+    Scheduler,
 };
 use ::net::adapter::net::identity::EntityId;
 use ::net::adapter::net::subprotocol::{
@@ -165,6 +167,21 @@ struct Inner {
     /// daemons restored from an inbound snapshot land in the same
     /// map a local `spawn` uses.
     registry: Arc<DaemonRegistry>,
+    /// Core scheduler — built once at `new()` from the mesh's
+    /// shared `CapabilityIndex`. Used by the `groups` feature's
+    /// `ReplicaGroup` / `ForkGroup` / `StandbyGroup` for
+    /// capability-based placement.
+    ///
+    /// `local_caps` is `CapabilitySet::default()` because the mesh
+    /// doesn't currently expose the locally-announced caps as a
+    /// readable snapshot. The only behavioral impact is that
+    /// capability-filtered daemons which could run locally won't
+    /// get `LocalPreferred` short-circuit placement — they fall
+    /// through to the `CapabilityIndex::query` path, which still
+    /// returns the local node (with the right announcements) and
+    /// places correctly. Revisit when a `MeshNode::local_caps()`
+    /// getter lands.
+    scheduler: Arc<Scheduler>,
     /// Core factory registry, keyed by `origin_hash`. `spawn` mirrors
     /// each SDK-side kind registration into this map with the
     /// concrete keypair attached so the migration target restores
@@ -222,12 +239,23 @@ impl DaemonRuntime {
             registry.clone(),
             factory_registry.clone(),
         ));
+        // Scheduler shares the mesh's `CapabilityIndex`, so
+        // announcements the mesh publishes become visible to
+        // placement queries immediately. `CapabilitySet::default()`
+        // for `local_caps` is a known gap — see the `scheduler`
+        // field's docstring on [`Inner`].
+        let scheduler = Arc::new(Scheduler::new(
+            mesh.inner().capability_index().clone(),
+            local_node_id,
+            CapabilitySet::default(),
+        ));
         Self {
             inner: Arc::new(Inner {
                 mesh,
                 state: AtomicU8::new(State::Registering as u8),
                 factories: RwLock::new(HashMap::new()),
                 registry,
+                scheduler,
                 factory_registry,
                 orchestrator,
                 source_handler,
@@ -1419,6 +1447,45 @@ impl DaemonRuntime {
             .get(kind)
             .cloned()
             .ok_or_else(|| DaemonError::FactoryNotFound(kind.to_string()))
+    }
+
+    // ─── `groups` feature accessors ─────────────────────────────────
+    //
+    // These surface the internal `Scheduler` / `DaemonRegistry` /
+    // factory closures that the `groups` module (ReplicaGroup /
+    // ForkGroup / StandbyGroup) needs to wire into core group
+    // constructors. Kept `pub(crate)` so they don't leak into the
+    // SDK's public API — group types wrap them in their own
+    // ergonomic surfaces and callers stay on the clean side of the
+    // boundary.
+
+    /// Shared scheduler for capability-based placement.
+    #[cfg(feature = "groups")]
+    pub(crate) fn scheduler_arc(&self) -> Arc<Scheduler> {
+        self.inner.scheduler.clone()
+    }
+
+    /// Shared daemon registry (group members register/unregister
+    /// here alongside direct-spawn daemons).
+    #[cfg(feature = "groups")]
+    pub(crate) fn registry_arc(&self) -> Arc<DaemonRegistry> {
+        self.inner.registry.clone()
+    }
+
+    /// Look up a factory closure by kind. Used by group constructors
+    /// to build members via the same factory the caller registered
+    /// with `register_factory`.
+    #[cfg(feature = "groups")]
+    pub(crate) fn factory_for_kind_pub(&self, kind: &str) -> Result<FactoryFn, DaemonError> {
+        self.factory_for_kind(kind)
+    }
+
+    /// `true` iff the runtime is in the `Ready` state. Groups use
+    /// this to gate `spawn` (rejecting early-spawn calls with a
+    /// typed `GroupError::NotReady`).
+    #[cfg(feature = "groups")]
+    pub(crate) fn is_ready_pub(&self) -> bool {
+        self.state() == State::Ready
     }
 }
 

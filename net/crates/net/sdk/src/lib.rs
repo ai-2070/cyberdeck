@@ -36,6 +36,8 @@
 
 #[cfg(feature = "compute")]
 pub mod compute;
+#[cfg(feature = "groups")]
+pub mod groups;
 pub mod config;
 #[cfg(feature = "cortex")]
 pub mod cortex;
