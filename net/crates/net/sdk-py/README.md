@@ -406,10 +406,9 @@ hot = StandbyGroup.spawn(
     member_count=3,                  # 1 active + 2 standbys
     group_seed=bytes([0x77] * 32),
 )
-active_origin = hot.active_origin()
+active_origin = hot.active_origin
 active_event = CausalEvent(active_origin, sequence=1, payload=b"tick")
 rt.deliver(active_origin, active_event)
-hot.on_event_delivered(active_event)  # keep standby replay buffer accurate
 hot.sync_standbys()                   # periodic catchup
 
 try:
@@ -422,7 +421,7 @@ except GroupError as e:
     kind = group_error_kind(e)
     # kind ∈ { "not-ready", "factory-not-found", "no-healthy-member",
     #         "placement-failed", "registry-failed", "invalid-config",
-    #         "daemon", "unknown" }
+    #         "daemon" }
 ```
 
 Full surface + runnable examples:

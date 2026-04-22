@@ -206,7 +206,7 @@ Benchmarks accurate as of 2026-04-19. Core / Net / Routing / Forwarding / Swarm 
 
 Thread-local packet pools scale to **23x contention advantage** over shared pools at 32 threads. All SDKs exceed **2M events/sec** with optimal ingestion patterns. CortEX ingest on a single `TasksAdapter` sustains **~3.6M events/sec** before any consumer back-pressure (measured without `waitForSeq`); the full fold round-trip — append → RedEX tail → state mutation → `waitForSeq` returns — lands at **6 us**, so reactive watchers see an event roughly one fold tick after the writer. Query methods at 10 K state size run in **double-digit microseconds** on a cold read lock, which is why NetDB ships with an always-on `find_many` + `count_where` + `exists_where` surface: even on cold state they're cheap enough to call inside a hot loop. NetDB **bundle encode/decode is 2-3x faster than the bincode era and produces bundles 60-70% smaller** — the win that matters most for cross-language snapshot transfer.
 
-1,146 Rust tests + 36 Node + 33 Python SDK smoke tests. ~1MB deployed binary.
+1,146 Rust tests + 36 Node + 33 Python SDK smoke tests. ~2MB deployed binary.
 
 ## Capabilities
 
@@ -480,7 +480,6 @@ src/adapter/net/
 ├── mesh.rs                # MeshNode — multi-peer mesh runtime (single socket, forwarding, subprotocol dispatch)
 ├── config.rs              # NetAdapterConfig
 ├── crypto.rs              # Noise NKpsk0 handshake, ChaCha20-Poly1305 AEAD
-├── handshake_relay.rs     # Handshake relay (SUBPROTOCOL_HANDSHAKE 0x0601), connect_via
 ├── protocol.rs            # 64-byte wire header, EventFrame, NackPayload
 ├── transport.rs           # UDP socket abstraction, batched I/O
 ├── session.rs             # Session state, stream multiplexing, thread-local pools
@@ -773,16 +772,19 @@ net_shutdown(node);
 | CortEX (adapter core + tasks + memories) | `cortex` | `redex` |
 | NetDB (unified query façade) | `netdb` | `cortex` |
 
-Default feature is `redis`.
+No features are enabled by default — opt into `redis`, `jetstream`, `net`, etc. explicitly.
 
 ## Building
 
 ```bash
-# Default (Redis adapter)
+# Core only — no adapters (opt in with a feature flag).
 cargo build --release
 
-# Net only (1MB binary)
-cargo build --release --no-default-features --features net
+# Redis adapter
+cargo build --release --features redis
+
+# Net only (2MB binary)
+cargo build --release --features net
 
 # Everything
 cargo build --release --all-features

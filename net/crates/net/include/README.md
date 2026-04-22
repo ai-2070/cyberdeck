@@ -99,7 +99,7 @@ DYLD_LIBRARY_PATH=target/release ./app     # macOS
 
 | Function | Description |
 |----------|-------------|
-| `net_poll(handle, request_json, buf, buf_len)` | Poll (JSON interface). |
+| `net_poll(handle, request_json, out_buffer, buffer_len)` | Poll (JSON interface). |
 | `net_poll_ex(handle, limit, cursor, &result)` | Poll (structured, no JSON). Free with `net_free_poll_result`. |
 | `net_free_poll_result(&result)` | Free a structured poll result. |
 
@@ -107,7 +107,7 @@ DYLD_LIBRARY_PATH=target/release ./app     # macOS
 
 | Function | Description |
 |----------|-------------|
-| `net_stats(handle, buf, buf_len)` | Stats (JSON interface). |
+| `net_stats(handle, out_buffer, buffer_len)` | Stats (JSON interface). |
 | `net_stats_ex(handle, &stats)` | Stats (structured, no JSON). |
 
 ### Utilities

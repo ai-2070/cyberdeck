@@ -505,9 +505,10 @@ except MigrationError as e:
 `start_migration_with(origin, src, dst, opts)` exposes
 options such as `seal_seed=False` for test scenarios. On the
 *target* node, call
-`rt.register_migration_target_identity(identity)` before any
-migration lands; without it the runtime rejects sealed-seed
-envelopes with `migration_error_kind == "identity-transport-failed"`.
+`rt.register_migration_target_identity(kind, identity)` before
+any migration of that kind lands; without it the runtime rejects
+sealed-seed envelopes with
+`migration_error_kind == "identity-transport-failed"`.
 
 ### Surface at a glance
 
@@ -522,7 +523,7 @@ envelopes with `migration_error_kind == "identity-transport-failed"`.
 | `rt.snapshot(origin)` | Capture bytes for persistence / migration |
 | `rt.deliver(origin, event)` | Feed an event (returns `list[bytes]`) |
 | `rt.start_migration(origin, src, dst)` | Orchestrate a live migration |
-| `rt.register_migration_target_identity(id)` | Pin unseal keypair on target |
+| `rt.register_migration_target_identity(kind, id)` | Pin unseal keypair on target for `kind` |
 | `handle.origin_hash` / `entity_id` / `stats()` | Per-daemon identity + stats |
 | `DaemonError` / `MigrationError` | Typed exceptions; `migration_error_kind(e)` parses `e.kind` |
 
@@ -585,8 +586,7 @@ hot = StandbyGroup.spawn(
     member_count=3,                  # 1 active + 2 standbys
     group_seed=bytes([0x77] * 32),
 )
-rt.deliver(hot.active_origin(), event)
-hot.on_event_delivered(event)        # keep replay buffer accurate
+rt.deliver(hot.active_origin, event)
 hot.sync_standbys()                  # periodic catchup
 # On active-node failure:
 # new_origin = hot.on_node_failure(failed_node_id)  # auto-promotes
