@@ -1,0 +1,25 @@
+net/crates/net/bindings/node/Cargo.toml
+  5bf3f089eecaef7a 26-33
+net/crates/net/bindings/node/src/lib.rs
+  5bf3f089eecaef7a 163-224,1843-1992
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "9aca7ea3a8c5555849e74855c47255d8eb574e30",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2488,
+      "total_deletions": 152,
+      "accepted_lines": 223,
+      "overriden_lines": 0
+    }
+  }
+}
