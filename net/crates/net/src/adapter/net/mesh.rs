@@ -5073,14 +5073,20 @@ impl MeshNode {
                 .map_err(|e| TraversalError::Transport(e.to_string()))
         };
 
-        // Helper: open a relayed session via the coordinator.
-        // Short-circuits only when an existing session is already
-        // on THIS coordinator's path — a session already on the
-        // target coordinator's path is the outcome we want, but
-        // a session on some other path (direct / another relay)
-        // is preserved untouched (don't downgrade).
+        // Helper: open a relayed session via `coord_addr`. Short-
+        // circuits only when an existing session is already on
+        // exactly that coordinator's path. An unrelated session
+        // (stale, dead, on a different hop) is NOT treated as
+        // success — Cubic P1 flagged that `contains_key`-based
+        // short-circuit here would mask a failed direct attempt
+        // behind whatever stale session happened to still be in
+        // the peers map, so `connect_direct` reported "success"
+        // without actually establishing the intended path. The
+        // handshake runs unless we can confirm the existing
+        // session is already the one this call was asked to
+        // resolve.
         let connect_via_coordinator = |coord_addr: std::net::SocketAddr| async move {
-            if self.peers.contains_key(&peer_node_id) {
+            if session_matches(coord_addr) {
                 return Ok(peer_node_id);
             }
             self.connect_via(coord_addr, peer_pubkey, peer_node_id)
@@ -5115,9 +5121,19 @@ impl MeshNode {
                 match connect_on_direct_path(peer_reflex).await {
                     Ok(id) => Ok(id),
                     Err(_) => {
-                        if self.peers.contains_key(&peer_node_id) {
-                            return Ok(peer_node_id);
-                        }
+                        // Direct handshake on `peer_reflex` failed.
+                        // Run the routing-table fallback
+                        // *unconditionally* — cubic P2 flagged
+                        // that short-circuiting on "any session
+                        // exists" would mask the failed direct
+                        // attempt behind a stale / unrelated
+                        // session, preventing the upgrade this
+                        // API is meant to attempt. If
+                        // `connect_routed` itself finds the
+                        // existing session is already on a valid
+                        // first-hop it'll succeed quickly; if no
+                        // route is cached it returns an honest
+                        // error the caller can observe.
                         self.traversal_stats.record_relay_fallback();
                         self.connect_routed(peer_pubkey, peer_node_id)
                             .await

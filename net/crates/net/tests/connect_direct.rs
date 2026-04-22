@@ -514,3 +514,89 @@ async fn connect_direct_upgrades_session_to_punched_path_on_success() {
         "session transport must not equal the coordinator R's addr",
     );
 }
+
+/// Regression test for a cubic-flagged P1 bug: the
+/// `connect_via_coordinator` helper short-circuited on any
+/// existing peer-map entry, so a second `connect_direct` call
+/// that *should* have re-established the session via a
+/// *different* coordinator silently returned the stale entry
+/// still pointed at the first coordinator. Callers saw
+/// "success" but the data plane still rode the previous path.
+///
+/// # Scenario
+///
+/// 1. Force Symmetric×Symmetric → pair_action is `SkipPunch`;
+///    the only viable path is the routed one via the supplied
+///    coordinator.
+/// 2. First `connect_direct(..., coordinator = R)` establishes
+///    a session; peer_addr ends up at R.
+/// 3. Second `connect_direct(..., coordinator = X)` targets a
+///    different coordinator. Under the pre-fix bug this would
+///    short-circuit on `peers.contains_key` and return the R-
+///    pathed session unchanged. Under the fix,
+///    `session_matches(X.addr)` is false so the handshake runs
+///    and the entry gets overwritten with an X-pathed session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connect_direct_retargets_coordinator_does_not_short_circuit_on_stale_session() {
+    use net::adapter::net::traversal::classify::NatClass;
+
+    let (a, r, b, x) = punch_topology().await;
+
+    a.reclassify_nat().await;
+    b.reclassify_nat().await;
+    a.force_nat_class_for_test(NatClass::Symmetric);
+    b.force_nat_class_for_test(NatClass::Symmetric);
+
+    a.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("A announce");
+    b.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("B announce");
+
+    let a_for_poll = a.clone();
+    let b_id = b.node_id();
+    let b_bind = b.local_addr();
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            a_for_poll.peer_reflex_addr(b_id) == Some(b_bind)
+                && a_for_poll.peer_nat_class(b_id) == NatClass::Symmetric
+        })
+        .await,
+        "A should see B's Symmetric class + reflex",
+    );
+
+    let b_pub = *b.public_key();
+
+    // First call: SkipPunch via R. Session should land on R.
+    a.connect_direct(b_id, &b_pub, r.node_id())
+        .await
+        .expect("first connect_direct via R should succeed");
+    assert_eq!(
+        a.peer_addr(b_id),
+        Some(r.local_addr()),
+        "after first call, session should be pathed via R",
+    );
+
+    // Second call: different coordinator (X). Under the old
+    // `contains_key` short-circuit this returned Ok without
+    // touching the peers map; the caller thinks they're on X
+    // but the data plane is still on R.
+    a.connect_direct(b_id, &b_pub, x.node_id())
+        .await
+        .expect("second connect_direct via X should succeed");
+    assert_eq!(
+        a.peer_addr(b_id),
+        Some(x.local_addr()),
+        "after re-targeting to coordinator X, session transport \
+         must move to X. If still pointed at R, the fix to \
+         `connect_via_coordinator` regressed — it silently \
+         short-circuited on the stale entry, masking the \
+         caller's explicit request to re-home via X.",
+    );
+    assert_ne!(
+        a.peer_addr(b_id),
+        Some(r.local_addr()),
+        "session transport must not still equal the old coordinator R",
+    );
+}
