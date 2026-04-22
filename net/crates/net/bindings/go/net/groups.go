@@ -809,39 +809,4 @@ func (g *StandbyGroup) MemberRole(index uint8) string {
 	return C.GoString(c)
 }
 
-// ------------------------------------------------------------------------
-// Test-only helper — inject synthetic peers into a mesh's
-// capability index so group tests have placement candidates
-// without spinning up a real 3-node handshake.
-// ------------------------------------------------------------------------
-
-// TestInjectSyntheticPeer is test-only — DO NOT use in production.
-// Stages a synthetic peer entry in the given mesh's capability
-// index so `place_with_spread` can spread group members across
-// multiple "nodes". Mirrors the helpers in the NAPI + Python
-// bindings. Kept exported for cross-package tests in this module.
-func TestInjectSyntheticPeer(mesh *MeshNode, nodeID uint64) {
-	if mesh == nil {
-		return
-	}
-	// Same TOCTOU guard as `NewDaemonRuntime`: hold the read lock
-	// across the Arc-clone so a concurrent `mesh.Shutdown()` can't
-	// free the native handle between the `mesh.handle` load and
-	// `net_mesh_arc_clone(h)`. Once the Arc is cloned it keeps the
-	// underlying object alive for the duration of this call.
-	mesh.mu.RLock()
-	h := mesh.handle
-	if h == nil {
-		mesh.mu.RUnlock()
-		return
-	}
-	arc := C.net_mesh_arc_clone(h)
-	mesh.mu.RUnlock()
-	if arc == nil {
-		return
-	}
-	defer C.net_mesh_arc_free(arc)
-	C.net_compute_test_inject_synthetic_peer(arc, C.uint64_t(nodeID))
-}
-
 var _ = fmt.Sprintf

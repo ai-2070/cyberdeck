@@ -1566,7 +1566,15 @@ fn cstr_to_string(ptr: *const c_char, len: usize) -> Option<String> {
 }
 
 // =========================================================================
-// Test-only helpers (feature-gated behind the groups-testing path)
+// Test-only helpers — compiled only under `--features test-helpers`.
+//
+// These symbols exist for the `go test` suite's group-placement
+// fixtures. Production builds of the cdylib ship without this
+// feature, so `libnet_compute.{dylib,so}` does not export the
+// helpers and the Go production wrapper (which elides its
+// `TestInjectSyntheticPeer` under the same build tag) never
+// references them. A consumer bypassing the Go wrapper with
+// `dlsym` would find the symbol missing in a shipped binary.
 // =========================================================================
 
 /// **Test-only** helper for `groups_test.go`. Injects a synthetic
@@ -1577,12 +1585,14 @@ fn cstr_to_string(ptr: *const c_char, len: usize) -> Option<String> {
 ///
 /// Production code should NOT use this — the mesh's normal
 /// `announce_capabilities` is what peers broadcast through at
-/// runtime.
+/// runtime. Gated behind the `test-helpers` feature so the symbol
+/// is absent from release binaries.
 ///
 /// # Safety
 ///
 /// `mesh_arc` must be a pointer returned by `net_mesh_arc_clone`
 /// (from `net::ffi::mesh`); it is NOT consumed by this call.
+#[cfg(feature = "test-helpers")]
 #[no_mangle]
 pub extern "C" fn net_compute_test_inject_synthetic_peer(
     mesh_arc: *mut std::sync::Arc<MeshNode>,

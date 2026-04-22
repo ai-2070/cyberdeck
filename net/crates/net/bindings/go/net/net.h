@@ -905,11 +905,12 @@ int                     net_compute_migration_handle_cancel(
     net_compute_migration_handle_t* handle,
     char** err_out);
 
-/* Test-only helper — injects a synthetic capability announcement
- * into the mesh's capability index so group tests can stage
- * multi-candidate placement without a real handshake. */
-void net_compute_test_inject_synthetic_peer(
-    net_compute_mesh_arc_t* mesh_arc, uint64_t node_id);
+/* Test-only helper — `net_compute_test_inject_synthetic_peer` —
+ * lives in the test-only Go file `groups_testhelpers_test.go`,
+ * gated at the Rust layer behind the `test-helpers` cargo
+ * feature on compute-ffi. Intentionally NOT declared here
+ * because this header ships with production consumers; the test
+ * binary supplies its own extern declaration. */
 
 /* =========================================================================
  * Groups — Stage 4 of SDK_GROUPS_SURFACE_PLAN.md.

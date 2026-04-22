@@ -1,4 +1,15 @@
 // Tests for the groups surface — Stage 4 of SDK_GROUPS_SURFACE_PLAN.md.
+//
+// Requires the `test_helpers` build tag so
+// `TestInjectSyntheticPeer` (from `groups_testhelpers.go`) is
+// compiled in. Run with:
+//
+//   DYLD_LIBRARY_PATH=.../target/release go test -tags test_helpers ./net/...
+//
+// and the cdylib must be built with `--features test-helpers`.
+
+//go:build test_helpers
+
 package net
 
 import (

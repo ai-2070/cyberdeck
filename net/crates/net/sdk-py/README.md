@@ -291,12 +291,35 @@ package (when built with the `groups` feature). Import directly:
 
 ```python
 from net import (
-    DaemonRuntime, ReplicaGroup, ForkGroup, StandbyGroup,
+    DaemonRuntime, NetMesh, Identity, CausalEvent,
+    ReplicaGroup, ForkGroup, StandbyGroup,
     GroupError, group_error_kind,
 )
 
+
+class CounterDaemon:
+    """Minimal stateful daemon — increments on every event."""
+
+    name = "counter"
+
+    def __init__(self):
+        self._count = 0
+
+    def process(self, event: CausalEvent) -> list[bytes]:
+        self._count += 1
+        return [self._count.to_bytes(4, "little")]
+
+
+# Build a mesh + runtime, register the factory, flip to Ready.
+mesh = NetMesh("127.0.0.1:9000", "42" * 32)
 rt = DaemonRuntime(mesh)
 rt.register_factory("counter", lambda: CounterDaemon())
+rt.start()
+
+# A sample event — `rt.deliver` expects a `CausalEvent` per the
+# compute surface. The origin/sequence match the replica the
+# group routes to.
+event = CausalEvent(0x1234_5678, sequence=1, payload=b"tick")
 
 # N interchangeable replicas with deterministic per-index identity.
 replicas = ReplicaGroup.spawn(
@@ -306,7 +329,7 @@ replicas = ReplicaGroup.spawn(
     lb_strategy="consistent-hash",   # or "round-robin" | "least-load" | ...
 )
 origin = replicas.route_event({"routing_key": "user:42"})
-rt.deliver(origin, event)
+rt.deliver(origin, CausalEvent(origin, sequence=1, payload=b"tick"))
 replicas.scale_to(5)
 
 # N independent daemons forked from a common parent; verifiable lineage.
@@ -325,12 +348,18 @@ hot = StandbyGroup.spawn(
     member_count=3,                  # 1 active + 2 standbys
     group_seed=bytes([0x77] * 32),
 )
-rt.deliver(hot.active_origin(), event)
-hot.on_event_delivered(event)        # keep standby replay buffer accurate
-hot.sync_standbys()                  # periodic catchup
+active_origin = hot.active_origin()
+active_event = CausalEvent(active_origin, sequence=1, payload=b"tick")
+rt.deliver(active_origin, active_event)
+hot.on_event_delivered(active_event)  # keep standby replay buffer accurate
+hot.sync_standbys()                   # periodic catchup
 
 try:
-    ReplicaGroup.spawn(rt, "never-registered", replica_count=2, group_seed=bytes(32))
+    ReplicaGroup.spawn(
+        rt, "never-registered",
+        replica_count=2, group_seed=bytes(32),
+        lb_strategy="round-robin",
+    )
 except GroupError as e:
     kind = group_error_kind(e)
     # kind ∈ { "not-ready", "factory-not-found", "no-healthy-member",

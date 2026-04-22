@@ -17,10 +17,12 @@
  * // Register the factory the group will invoke for each member.
  * rt.registerFactory('counter', () => new CounterDaemon());
  *
- * // Spawn a 3-member replica group.
- * const group = ReplicaGroup.spawn(rt, 'counter', {
+ * // Spawn a 3-member replica group. `spawn` is async — the
+ * // factory TSFN round-trip runs on a tokio worker so the Node
+ * // main thread stays free to execute JS factory callbacks.
+ * const group = await ReplicaGroup.spawn(rt, 'counter', {
  *   replicaCount: 3,
- *   groupSeed: Buffer.from('...'),  // 32 bytes
+ *   groupSeed: Buffer.alloc(32, 0x11),  // 32 bytes
  *   lbStrategy: 'round-robin',
  * });
  *
