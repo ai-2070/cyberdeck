@@ -1185,10 +1185,7 @@ mod tests {
         // times out). We never send a probe in this test, so
         // the probe-response behavior doesn't matter.
         let (port, gw) = spawn_mock_gateway(|req| {
-            if req.len() == MAP_REQUEST_LEN
-                && req[0] == NATPMP_VERSION
-                && req[1] == OP_MAP_UDP
-            {
+            if req.len() == MAP_REQUEST_LEN && req[0] == NATPMP_VERSION && req[1] == OP_MAP_UDP {
                 let internal = u16::from_be_bytes([req[4], req[5]]);
                 Some(encode_map_success(internal, internal, 3600))
             } else {
@@ -1224,9 +1221,7 @@ mod tests {
                  the gateway's private address to capability announcements",
                 mapping.external,
             ),
-            Err(other) => panic!(
-                "expected Transport(<precondition msg>); got {other:?}",
-            ),
+            Err(other) => panic!("expected Transport(<precondition msg>); got {other:?}",),
         }
 
         // And the cache is still empty — a refused install
