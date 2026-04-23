@@ -77,13 +77,20 @@ fn runtime() -> &'static Arc<Runtime> {
     })
 }
 
-/// Copy a C string into a Rust string. Returns `None` on null /
-/// non-UTF-8.
-unsafe fn c_str_to_str<'a>(p: *const c_char) -> Option<&'a str> {
+/// Copy a C string into an owned `String`. Returns `None` on null or
+/// non-UTF-8 input.
+///
+/// Returns `String` (not `&str`) by design: a helper that returned a
+/// borrow would need a free-choice lifetime like `Option<&'a str>`,
+/// which would let callers pick `'static` and silently produce a
+/// dangling reference once the caller's `*const c_char` goes out of
+/// scope. Owning the copy eliminates the footgun at a small allocation
+/// cost per FFI call (these paths already allocate for JSON parsing).
+unsafe fn c_str_to_owned(p: *const c_char) -> Option<String> {
     if p.is_null() {
         return None;
     }
-    CStr::from_ptr(p).to_str().ok()
+    CStr::from_ptr(p).to_str().ok().map(|s| s.to_owned())
 }
 
 /// Serialize `value` as JSON into a C-owned string + length. On
@@ -125,7 +132,7 @@ pub extern "C" fn net_redex_new(persistent_dir: *const c_char) -> *mut RedexHand
     let dir = if persistent_dir.is_null() {
         None
     } else {
-        unsafe { c_str_to_str(persistent_dir) }.map(|s| s.to_owned())
+        unsafe { c_str_to_owned(persistent_dir) }
     };
     let inner = match dir {
         Some(d) => InnerRedex::new().with_persistent_dir(d),
@@ -183,19 +190,19 @@ pub extern "C" fn net_redex_open_file(
         return NetError::NullPointer.into();
     }
     let redex = unsafe { &*redex };
-    let Some(name_str) = (unsafe { c_str_to_str(name) }) else {
+    let Some(name_str) = (unsafe { c_str_to_owned(name) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let Ok(channel) = ChannelName::new(name_str) else {
+    let Ok(channel) = ChannelName::new(&name_str) else {
         return NET_ERR_REDEX;
     };
     let cfg_json: RedexFileConfigJson = if config_json.is_null() {
         RedexFileConfigJson::default()
     } else {
-        let Some(s) = (unsafe { c_str_to_str(config_json) }) else {
+        let Some(s) = (unsafe { c_str_to_owned(config_json) }) else {
             return NetError::InvalidUtf8.into();
         };
-        match serde_json::from_str(s) {
+        match serde_json::from_str(&s) {
             Ok(v) => v,
             Err(_) => return NetError::InvalidJson.into(),
         }
@@ -548,7 +555,7 @@ pub extern "C" fn net_tasks_create(
         return NetError::NullPointer.into();
     }
     let tasks = unsafe { &*handle };
-    let Some(title) = (unsafe { c_str_to_str(title) }) else {
+    let Some(title) = (unsafe { c_str_to_owned(title) }) else {
         return NetError::InvalidUtf8.into();
     };
     match tasks.inner.create(id, title, now_ns) {
@@ -574,7 +581,7 @@ pub extern "C" fn net_tasks_rename(
         return NetError::NullPointer.into();
     }
     let tasks = unsafe { &*handle };
-    let Some(nt) = (unsafe { c_str_to_str(new_title) }) else {
+    let Some(nt) = (unsafe { c_str_to_owned(new_title) }) else {
         return NetError::InvalidUtf8.into();
     };
     match tasks.inner.rename(id, nt, now_ns) {
@@ -682,10 +689,10 @@ fn build_tasks_watcher(
     if filter_json.is_null() {
         return Ok(w);
     }
-    let Some(s) = (unsafe { c_str_to_str(filter_json) }) else {
+    let Some(s) = (unsafe { c_str_to_owned(filter_json) }) else {
         return Err(NetError::InvalidUtf8.into());
     };
-    let f: TasksFilterJson = match serde_json::from_str(s) {
+    let f: TasksFilterJson = match serde_json::from_str(&s) {
         Ok(v) => v,
         Err(_) => return Err(NetError::InvalidJson.into()),
     };
@@ -733,10 +740,10 @@ fn build_tasks_list_filter(filter_json: *const c_char) -> Result<TasksFilter, c_
     if filter_json.is_null() {
         return Ok(TasksFilter::default());
     }
-    let Some(s) = (unsafe { c_str_to_str(filter_json) }) else {
+    let Some(s) = (unsafe { c_str_to_owned(filter_json) }) else {
         return Err(NetError::InvalidUtf8.into());
     };
-    let f: TasksFilterJson = match serde_json::from_str(s) {
+    let f: TasksFilterJson = match serde_json::from_str(&s) {
         Ok(v) => v,
         Err(_) => return Err(NetError::InvalidJson.into()),
     };
@@ -1039,10 +1046,10 @@ pub extern "C" fn net_memories_store(
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
-    let Some(s) = (unsafe { c_str_to_str(input_json) }) else {
+    let Some(s) = (unsafe { c_str_to_owned(input_json) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let input: MemoryStoreInput = match serde_json::from_str(s) {
+    let input: MemoryStoreInput = match serde_json::from_str(&s) {
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
@@ -1080,10 +1087,10 @@ pub extern "C" fn net_memories_retag(
         return NetError::NullPointer.into();
     }
     let mem = unsafe { &*handle };
-    let Some(s) = (unsafe { c_str_to_str(input_json) }) else {
+    let Some(s) = (unsafe { c_str_to_owned(input_json) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let input: MemoryRetagInput = match serde_json::from_str(s) {
+    let input: MemoryRetagInput = match serde_json::from_str(&s) {
         Ok(v) => v,
         Err(_) => return NetError::InvalidJson.into(),
     };
@@ -1227,10 +1234,10 @@ fn build_memories_watcher(
     if filter_json.is_null() {
         return Ok(w);
     }
-    let Some(s) = (unsafe { c_str_to_str(filter_json) }) else {
+    let Some(s) = (unsafe { c_str_to_owned(filter_json) }) else {
         return Err(NetError::InvalidUtf8.into());
     };
-    let f: MemoriesFilterJson = match serde_json::from_str(s) {
+    let f: MemoriesFilterJson = match serde_json::from_str(&s) {
         Ok(v) => v,
         Err(_) => return Err(NetError::InvalidJson.into()),
     };
@@ -1282,10 +1289,10 @@ fn build_memories_list_filter(filter_json: *const c_char) -> Result<MemoriesFilt
     if filter_json.is_null() {
         return Ok(MemoriesFilter::default());
     }
-    let Some(s) = (unsafe { c_str_to_str(filter_json) }) else {
+    let Some(s) = (unsafe { c_str_to_owned(filter_json) }) else {
         return Err(NetError::InvalidUtf8.into());
     };
-    let f: MemoriesFilterJson = match serde_json::from_str(s) {
+    let f: MemoriesFilterJson = match serde_json::from_str(&s) {
         Ok(v) => v,
         Err(_) => return Err(NetError::InvalidJson.into()),
     };

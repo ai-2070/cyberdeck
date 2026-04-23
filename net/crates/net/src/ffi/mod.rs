@@ -613,6 +613,40 @@ pub extern "C" fn net_ingest_batch(handle: *mut NetHandle, events_json: *const c
     c_int::try_from(count).unwrap_or_else(|_| NetError::IntOverflow.into())
 }
 
+/// Parse the JSON request body passed to `net_poll` into a
+/// `ConsumeRequest`. Returns the negative `NetError` code on parse
+/// failure so the caller can surface it back across FFI. Both `limit`
+/// and `cursor` are optional, but if either key is present with the
+/// wrong JSON type it is an explicit error — silently falling back to
+/// the default would hide caller bugs (e.g. the Go binding that
+/// previously serialized `cursor` but had it dropped server-side).
+fn parse_poll_request_json(json_str: &str) -> Result<ConsumeRequest, c_int> {
+    let value: serde_json::Value =
+        serde_json::from_str(json_str).map_err(|_| c_int::from(NetError::InvalidJson))?;
+
+    let limit = match value.get("limit") {
+        None | Some(serde_json::Value::Null) => 100usize,
+        Some(v) => match v.as_u64() {
+            // `as usize` would silently truncate on 32-bit targets for
+            // values above `usize::MAX`. Reject such inputs explicitly
+            // so a caller asking for e.g. 2^33 events on a wasm32
+            // build gets `InvalidJson` instead of a tiny wrap-around.
+            Some(n) => usize::try_from(n).map_err(|_| c_int::from(NetError::InvalidJson))?,
+            None => return Err(NetError::InvalidJson.into()),
+        },
+    };
+    let cursor = match value.get("cursor") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => match v.as_str() {
+            Some(s) => Some(s.to_owned()),
+            None => return Err(NetError::InvalidJson.into()),
+        },
+    };
+    let mut req = ConsumeRequest::new(limit);
+    req.from_id = cursor;
+    Ok(req)
+}
+
 /// Poll events from the bus.
 ///
 /// # Parameters
@@ -652,15 +686,10 @@ pub extern "C" fn net_poll(
             Ok(s) => s,
             Err(_) => return NetError::InvalidUtf8.into(),
         };
-
-        // Parse limit from JSON
-        let value: serde_json::Value = match serde_json::from_str(json_str) {
-            Ok(v) => v,
-            Err(_) => return NetError::InvalidJson.into(),
-        };
-
-        let limit = value.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
-        ConsumeRequest::new(limit)
+        match parse_poll_request_json(json_str) {
+            Ok(req) => req,
+            Err(code) => return code,
+        }
     };
 
     // Poll
@@ -1248,5 +1277,78 @@ mod tests {
     fn test_parse_config_empty() {
         let config = parse_config_json(r#"{}"#);
         assert!(config.is_some(), "empty config should use defaults");
+    }
+
+    // Regression: the Go binding's `Poll(limit, cursor)` serializes a
+    // `"cursor"` field that the FFI JSON path previously ignored —
+    // cross-shard pagination silently broke. `parse_poll_request_json`
+    // must round-trip the cursor into `ConsumeRequest.from_id`.
+    #[test]
+    fn test_parse_poll_request_preserves_cursor() {
+        let req = parse_poll_request_json(r#"{"limit": 50, "cursor": "abc:123"}"#).unwrap();
+        assert_eq!(req.limit, 50);
+        assert_eq!(req.from_id.as_deref(), Some("abc:123"));
+    }
+
+    #[test]
+    fn test_parse_poll_request_no_cursor_defaults_to_none() {
+        let req = parse_poll_request_json(r#"{"limit": 10}"#).unwrap();
+        assert_eq!(req.limit, 10);
+        assert_eq!(req.from_id, None);
+    }
+
+    #[test]
+    fn test_parse_poll_request_empty_uses_default_limit() {
+        let req = parse_poll_request_json(r#"{}"#).unwrap();
+        assert_eq!(req.limit, 100);
+        assert_eq!(req.from_id, None);
+    }
+
+    // Regression: a wrong-typed `"limit"` previously hit
+    // `.as_u64().unwrap_or(100)` and silently defaulted. Caller bugs
+    // (e.g. sending a string or a negative number) must surface as
+    // `InvalidJson` instead.
+    #[test]
+    fn test_parse_poll_request_wrong_type_limit_errors() {
+        let err = parse_poll_request_json(r#"{"limit": "50"}"#).unwrap_err();
+        assert_eq!(err, c_int::from(NetError::InvalidJson));
+        let err = parse_poll_request_json(r#"{"limit": -1}"#).unwrap_err();
+        assert_eq!(err, c_int::from(NetError::InvalidJson));
+    }
+
+    #[test]
+    fn test_parse_poll_request_wrong_type_cursor_errors() {
+        let err = parse_poll_request_json(r#"{"cursor": 123}"#).unwrap_err();
+        assert_eq!(err, c_int::from(NetError::InvalidJson));
+    }
+
+    #[test]
+    fn test_parse_poll_request_null_fields_use_defaults() {
+        let req = parse_poll_request_json(r#"{"limit": null, "cursor": null}"#).unwrap();
+        assert_eq!(req.limit, 100);
+        assert_eq!(req.from_id, None);
+    }
+
+    /// `usize::MAX` is always a valid usize regardless of target
+    /// pointer width, so it must parse successfully on both 32- and
+    /// 64-bit builds. This pins the boundary case.
+    #[test]
+    fn test_parse_poll_request_limit_at_usize_max() {
+        let json = format!(r#"{{"limit": {}}}"#, usize::MAX);
+        let req = parse_poll_request_json(&json).unwrap();
+        assert_eq!(req.limit, usize::MAX);
+    }
+
+    /// Regression: `as usize` silently truncates on 32-bit targets
+    /// for `u64` values above `usize::MAX`. The parser must return
+    /// `InvalidJson` instead of wrapping. We only run this on 32-bit
+    /// targets because on 64-bit `usize::MAX == u64::MAX`, leaving
+    /// nothing that fits in u64 but not usize.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn test_parse_poll_request_limit_overflows_usize_on_32bit() {
+        // 2^33 — fits in u64, but exceeds usize::MAX on a 32-bit build.
+        let err = parse_poll_request_json(r#"{"limit": 8589934592}"#).unwrap_err();
+        assert_eq!(err, c_int::from(NetError::InvalidJson));
     }
 }

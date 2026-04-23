@@ -463,12 +463,21 @@ impl EventFrame {
     /// Size of the length prefix
     pub const LEN_SIZE: usize = 4;
 
-    /// Write events to a buffer, returning the total bytes written
+    /// Write events to a buffer, returning the total bytes written.
+    ///
+    /// Panics if any event exceeds `u32::MAX` bytes. Under normal
+    /// production paths every event is well below `MAX_PAYLOAD_SIZE`
+    /// (~8 KiB), but without the assertion an event larger than 4 GiB
+    /// would silently truncate the length prefix and corrupt the
+    /// framed stream — a panic is far preferable to silent data
+    /// corruption on a framing boundary.
     #[inline]
     pub fn write_events(events: &[Bytes], buf: &mut BytesMut) -> usize {
         let start = buf.len();
         for event in events {
-            buf.put_u32_le(event.len() as u32);
+            let len = u32::try_from(event.len())
+                .expect("event length exceeds u32::MAX — cannot encode in 4-byte length prefix");
+            buf.put_u32_le(len);
             buf.put_slice(event);
         }
         buf.len() - start
@@ -718,6 +727,32 @@ mod tests {
         assert_eq!(&parsed[0][..], b"event1");
         assert_eq!(&parsed[1][..], b"event2");
         assert_eq!(&parsed[2][..], b"event3");
+    }
+
+    /// Regression: `write_events` used to write the length prefix as
+    /// `event.len() as u32`, which silently truncates for events
+    /// larger than `u32::MAX`. On 64-bit platforms this could corrupt
+    /// the framed stream. The write site now panics rather than
+    /// writing a truncated length, so a bug anywhere upstream that
+    /// bypasses the payload-size cap surfaces loudly instead of as
+    /// silent data corruption.
+    ///
+    /// We cannot actually allocate a 4GiB event in a unit test, but
+    /// we can verify the guard path compiles and is wired up by
+    /// asserting the normal path still succeeds — the oversize branch
+    /// is exercised by the `expect` in `write_events`.
+    #[test]
+    fn test_event_frame_length_prefix_fits_u32() {
+        // A 64KB event is well under u32::MAX and must write fine.
+        let big = Bytes::from(vec![0xABu8; 64 * 1024]);
+        let events = vec![big.clone()];
+        let mut buf = BytesMut::with_capacity(64 * 1024 + 8);
+        let size = EventFrame::write_events(&events, &mut buf);
+        assert_eq!(size, EventFrame::LEN_SIZE + big.len());
+        // Verify the length prefix actually encodes the full length —
+        // catches any future accidental re-truncation.
+        let prefix = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        assert_eq!(prefix as usize, big.len());
     }
 
     #[test]

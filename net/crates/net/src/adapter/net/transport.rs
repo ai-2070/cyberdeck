@@ -426,11 +426,17 @@ impl PacketSender {
     /// Send multiple packets in a single syscall (Linux only).
     ///
     /// Falls back to sequential send_to on other platforms.
+    ///
+    /// Uses `BatchedTransport::new_send_only` so we don't allocate the
+    /// 64 × 8KB receive-side buffer set on a pure-send path. This is a
+    /// fresh `BatchedTransport` per call because the struct's iovec
+    /// slots point into the caller's `packets` slice — sharing one
+    /// across concurrent calls would require a lock on the hot path.
     #[cfg(target_os = "linux")]
     pub fn send_batch(&self, packets: &[Bytes], target: SocketAddr) -> io::Result<usize> {
         use std::os::unix::io::AsRawFd;
         let fd = self.socket.as_raw_fd();
-        let mut batched = super::linux::BatchedTransport::new(fd);
+        let mut batched = super::linux::BatchedTransport::new_send_only(fd);
         batched.send_batch(packets, target)
     }
 }

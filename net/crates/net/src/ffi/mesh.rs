@@ -1614,13 +1614,29 @@ pub struct IdentityHandle {
     cache: Arc<TokenCache>,
 }
 
+/// Allocate and copy `src` into a freshly allocated buffer owned by
+/// `std::alloc::alloc` with a layout of `Layout::array::<u8>(len)`.
+/// The matching `net_free_bytes` must deallocate with the same layout
+/// — both sides pin the capacity to `len`, so there is no reliance on
+/// `Vec::shrink_to_fit` producing `capacity == len` (which is not
+/// guaranteed by the allocator API).
 fn alloc_bytes(src: &[u8], out_ptr: *mut *mut u8, out_len: *mut usize) -> c_int {
-    let mut vec = src.to_vec();
-    vec.shrink_to_fit();
-    let len = vec.len();
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
+    let len = src.len();
+    if len == 0 {
+        unsafe {
+            *out_ptr = std::ptr::null_mut();
+            *out_len = 0;
+        }
+        return 0;
+    }
+    // Layout::array for u8 cannot overflow for any valid usize.
+    let layout = std::alloc::Layout::array::<u8>(len).expect("byte layout");
+    let ptr = unsafe { std::alloc::alloc(layout) };
+    if ptr.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
     unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), ptr, len);
         *out_ptr = ptr;
         *out_len = len;
     }
@@ -1628,16 +1644,17 @@ fn alloc_bytes(src: &[u8], out_ptr: *mut *mut u8, out_len: *mut usize) -> c_int 
 }
 
 /// Free a byte buffer allocated by the Rust side (tokens, entity ids
-/// returned by reference, etc.). Uses the length returned in the
-/// matching out parameter — do not pass `0` or a mismatched length or
-/// the Vec reconstruction will tear the allocator state down.
+/// returned by reference, etc.). The `len` argument MUST match the
+/// length returned by the allocating call — the buffer was allocated
+/// with `Layout::array::<u8>(len)` and is freed with the same layout.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_free_bytes(ptr: *mut u8, len: usize) {
     if ptr.is_null() || len == 0 {
         return;
     }
+    let layout = std::alloc::Layout::array::<u8>(len).expect("byte layout");
     unsafe {
-        drop(Vec::from_raw_parts(ptr, len, len));
+        std::alloc::dealloc(ptr, layout);
     }
 }
 
@@ -2594,6 +2611,51 @@ mod tests {
         assert_eq!(saturating_u16_cap(u16::MAX as u32), u16::MAX);
         assert_eq!(saturating_u16_cap(u16::MAX as u32 + 1), u16::MAX);
         assert_eq!(saturating_u16_cap(u32::MAX), u16::MAX);
+    }
+
+    /// Regression: `alloc_bytes` used to call `Vec::shrink_to_fit`
+    /// and then hand the raw `(ptr, len)` to C, expecting
+    /// `net_free_bytes` to reconstruct with
+    /// `Vec::from_raw_parts(ptr, len, len)`. `shrink_to_fit` is not
+    /// guaranteed to make `capacity == len`, so the reconstruction
+    /// could UB on drop (allocator size mismatch). The fix uses
+    /// `Layout::array::<u8>(len)` on both sides so the capacity is
+    /// always exactly `len`.
+    ///
+    /// This test exercises the alloc/free round-trip across a range
+    /// of sizes; under miri (or with the system allocator) any size
+    /// mismatch would surface here.
+    #[test]
+    fn alloc_bytes_round_trip_across_sizes() {
+        for size in [0usize, 1, 15, 16, 17, 32, 64, 1024, 8192] {
+            let src: Vec<u8> = (0..size).map(|i| (i as u8).wrapping_mul(37)).collect();
+            let mut ptr: *mut u8 = std::ptr::null_mut();
+            let mut len: usize = 0;
+            let rc = alloc_bytes(&src, &mut ptr as *mut _, &mut len as *mut _);
+            assert_eq!(rc, 0);
+            assert_eq!(len, size);
+            if size == 0 {
+                assert!(ptr.is_null());
+            } else {
+                assert!(!ptr.is_null());
+                let observed = unsafe { std::slice::from_raw_parts(ptr, len) };
+                assert_eq!(observed, &src[..]);
+            }
+            // Freeing with a null or zero-len must be a no-op; freeing
+            // a real buffer must not abort or corrupt the allocator.
+            net_free_bytes(ptr, len);
+        }
+    }
+
+    #[test]
+    fn net_free_bytes_null_and_zero_len_are_noops() {
+        // Both explicitly documented as safe no-ops.
+        net_free_bytes(std::ptr::null_mut(), 0);
+        net_free_bytes(std::ptr::null_mut(), 42);
+        // A non-null pointer with len == 0 is also a no-op — we must
+        // not try to free it, since we never allocated.
+        let mut sentinel: u8 = 0;
+        net_free_bytes(&mut sentinel as *mut u8, 0);
     }
 
     /// Regression for a cubic-flagged P1: `net_mesh_shutdown`
