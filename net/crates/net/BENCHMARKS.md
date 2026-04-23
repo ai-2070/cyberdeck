@@ -519,11 +519,11 @@ RUSTFLAGS="-C target-cpu=native" cargo bench --features net --bench net
 
 ## Key Insights
 
-1. **Header serialize/deserialize runs at ~770M ops/sec** (i9) / ~500M ops/sec (M1) — sub-2ns per operation
-2. **Routing header operations achieve 1.6–2.0G ops/sec** — sub-nanosecond serialization
+1. **Header serialize/deserialize runs at ~660–770M ops/sec** (i9) / ~475–505M ops/sec (M1) — sub-2ns per operation
+2. **Routing header operations achieve ~1.06–2.0G ops/sec** — sub-nanosecond serialization
 3. **Thread-local pool eliminates contention** — up to 16x faster than shared pool at 32 threads (M1: 67.6M vs 3.77M ops/sec)
-4. **Capability filters run at 200–580M ops/sec** — fast enough for inline packet decisions
+4. **Capability filters run at ~97–580M ops/sec** — fast enough for inline packet decisions
 5. **Circuit breaker checks are ~10ns** — negligible overhead per packet
-6. **Event frame write scales with payload** — 3.3 GiB/s at 64B, 36–48 GiB/s at 4KB on M1
+6. **Event frame write scales with payload** — 3.3 GiB/s at 64B, ~48 GiB/s at 4KB on M1 (~36 GiB/s on i9)
 7. **Multi-hop forwarding adds ~30–60ns per hop** — linear scaling, no amplification
 8. **i9-14900K wins on routing/lookup and large payloads** due to higher single-thread clock and wider memory bandwidth; **M1 Max wins on small-frame batch writes and event frame serialization**

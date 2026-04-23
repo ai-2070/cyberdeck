@@ -639,7 +639,7 @@ The numbers that matter for real workloads — ingest, fold, query, snapshot —
 | Bundle decode @ 1 K | 26.5 us | -- |
 | Bundle decode @ 10 K | 309 us | -- |
 
-Ingest onto a single `TasksAdapter` sustains **~3.7M events/sec** before consumer back-pressure (no `waitForSeq`). The full fold round-trip is **5.6 us** — so a reactive watcher observes a newly appended event within ~one fold tick of the writer. Query methods at 10 K state size are double-digit microseconds even against a cold read lock, which is why the NetDB surface ships `find_many` / `count_where` / `exists_where` always-on: they're cheap enough to call inside a hot loop without a cache layer.
+Ingest onto a single `TasksAdapter` sustains **~3.7M events/sec** before consumer back-pressure (no `waitForSeq`). The full fold round-trip is **5.6 us** — so a reactive watcher observes a newly appended event within ~one fold tick of the writer. Query methods at 10 K state size range from double-digit to low triple-digit microseconds even against a cold read lock, which is why the NetDB surface ships `find_many` / `count_where` / `exists_where` always-on: they're cheap enough to call inside a hot loop without a cache layer.
 
 NetDB bundle encode + decode got **2-3x faster** and **60-70% smaller** when CortEX moved off bincode onto postcard in v0.5 — the biggest single win for cross-language snapshot transfer. Example at 1K entries: the bincode era shipped a 135 KB bundle in 63 us (encode) + 95 us (decode); postcard ships the same bundle at 48 KB in 22 us + 27 us.
 
