@@ -1,0 +1,37 @@
+net/crates/net/src/adapter/net/protocol.rs
+  8d0ea8d6325c5af9 466-473,478-480,732-757
+net/crates/net/src/adapter/net/crypto.rs
+  8d0ea8d6325c5af9 361-366,371-372,505-516,522,540,740-766
+net/crates/net/src/ffi/mesh.rs
+  8d0ea8d6325c5af9 1617-1622,1624-1637,1639,1647-1649,1655,1657,2616-2660
+net/crates/net/src/ffi/mod.rs
+  8d0ea8d6325c5af9 616-645,685-688,1277-1326
+net/crates/net/src/adapter/net/transport.rs
+  8d0ea8d6325c5af9 429-434,439
+net/crates/net/src/ffi/cortex.rs
+  8d0ea8d6325c5af9 80-89,93,135,193,196,202,205,558,584,692,695,743,746,1049,1052,1090,1093,1237,1240,1292,1295
+net/crates/net/src/adapter/net/linux.rs
+  8d0ea8d6325c5af9 36-39,41-52,56-60,83-85
+net/crates/net/src/adapter/net/pool.rs
+  8d0ea8d6325c5af9 11,154-158,214
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "1c56ac525ba922dae6d4cc7a4d9d51b976c336a6",
+  "prompts": {
+    "8d0ea8d6325c5af9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "022eba8e-0c16-48e2-b0fd-3d23fd6617c4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 10164,
+      "total_deletions": 85,
+      "accepted_lines": 309,
+      "overriden_lines": 0
+    }
+  }
+}
