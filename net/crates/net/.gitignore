@@ -3,6 +3,8 @@
 debug/
 release/
 
+fuzz/corpus/
+
 # Cargo lock for libraries (optional - some prefer to commit it)
 # Cargo.lock
 

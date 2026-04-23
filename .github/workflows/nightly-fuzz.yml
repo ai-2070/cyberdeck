@@ -1,0 +1,138 @@
+name: Nightly Fuzz
+
+# Stage 1 of `docs/FAILURE_PATH_HARDENING_PLAN.md` — exhaustively
+# explore each wire-boundary decoder for 1 hour per night on a
+# matrix job. Crashes surface as job failures and upload the
+# failing input to the `crashes-<target>` artifact so operators
+# can reproduce via:
+#
+#   gh run download <run-id> -n crashes-<target>
+#   cd net/crates/net/fuzz
+#   cargo +nightly fuzz run <target> path/to/crash-<hash>
+#
+# Each run also uploads the post-run corpus. libfuzzer discovers
+# new coverage-expanding inputs during the run; committing a
+# sampled subset back to `net/crates/net/fuzz/corpus/<target>/`
+# seeds subsequent runs (and fresh clones) with a richer starting
+# point — this workflow stops short of auto-committing back, so
+# a human picks which discovered inputs are worth pinning.
+
+on:
+  schedule:
+    # 03:00 UTC daily. Off-peak for GitHub Actions runner
+    # availability; the 5 fuzz jobs fan out in parallel and
+    # finish in ~1 h of wall-clock time.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: "Max seconds per target (libfuzzer -max_total_time)"
+        default: "3600"
+        required: false
+      targets:
+        description: "Space-separated target names (blank = all)"
+        default: ""
+        required: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      # One target's crash should not cancel sibling targets —
+      # we want every failing target's artifact uploaded on the
+      # same night so post-mortem has the full picture.
+      fail-fast: false
+      matrix:
+        target:
+          - capability_announcement_from_bytes
+          - snapshot_reassembler_feed
+          - nat_pmp_decode_response
+          - migration_wire_decode
+          - routing_header_from_bytes
+    defaults:
+      run:
+        working-directory: net/crates/net/fuzz
+    steps:
+      - uses: actions/checkout@v6
+
+      # libfuzzer-sys requires nightly; `cargo-fuzz` wraps the
+      # nightly-only sanitizer flags. Pin `nightly` explicitly
+      # so a future `rust-toolchain.toml` override can't silently
+      # pick a stable compiler that won't build the harness.
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      # Per-target cache. A regression or corpus-shape change in
+      # one target shouldn't invalidate the others' build
+      # artifacts.
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/fuzz/target/
+          key: ${{ runner.os }}-cargo-fuzz-${{ matrix.target }}-${{ hashFiles('net/crates/net/fuzz/Cargo.toml', 'net/crates/net/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fuzz-${{ matrix.target }}-
+            ${{ runner.os }}-cargo-fuzz-
+
+      # `--locked` pins cargo-fuzz's own deps so a transient
+      # upstream break can't fail this job.
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Workflow_dispatch callers can restrict the matrix via
+      # the `targets` input. Matches plain-string presence; if
+      # non-empty and this target isn't listed, skip.
+      - name: Check target selection
+        id: select
+        run: |
+          requested="${{ github.event.inputs.targets }}"
+          if [ -n "$requested" ] && ! echo " $requested " | grep -q " ${{ matrix.target }} "; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "skipping ${{ matrix.target }} — not in requested list"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run fuzz target
+        if: steps.select.outputs.run == 'true'
+        run: |
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -max_total_time=${{ github.event.inputs.max_total_time || '3600' }}
+
+      # Crashes: always upload the artifact dir so a human can
+      # reproduce with `cargo fuzz run <target> <path>`. 30-day
+      # retention gives post-mortem runway; crash files are
+      # small (attacker-shaped input, not corpus-sized).
+      - name: Upload crash artifacts
+        if: failure() && steps.select.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: crashes-${{ matrix.target }}
+          path: net/crates/net/fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # Post-run corpus: libfuzzer writes newly-discovered
+      # coverage-expanding inputs here during the run. Upload
+      # them so a maintainer can `gh run download` and review
+      # which ones are worth committing back to the repo
+      # (committed corpus seeds future runs and cold-start CI
+      # re-reaches the same branches without re-exploring).
+      - name: Upload discovered corpus
+        if: always() && steps.select.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-${{ matrix.target }}
+          path: net/crates/net/fuzz/corpus/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 14

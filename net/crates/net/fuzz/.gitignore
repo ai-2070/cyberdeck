@@ -1,0 +1,7 @@
+target
+artifacts
+# corpus/ is committed — checked-in inputs help the fuzzer
+# re-reach interesting branches in CI and on fresh clones.
+# Crashes from previous runs go in artifacts/ and should NOT
+# be committed; the crash input itself is logged in the
+# failure message and can be reproduced by re-running.

@@ -18,65 +18,38 @@
 //! matched against the retained session), but short enough that
 //! permanently-gone peers are eventually dropped.
 //!
+//! Refactored onto the Stage-3 chaos harness (`tests/common/`)
+//! so the polling + config + setup boilerplate — previously 80
+//! lines of local helpers — reduces to two lines of imports.
+//! The original behavior this regression pins is unchanged;
+//! only the plumbing is shared.
+//!
 //! Run: `cargo test --features net --test peer_death_evicts_peer_map`
 
 #![cfg(feature = "net")]
 
-use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
-use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
+use net::adapter::net::{MeshNodeConfig, SocketBufferConfig};
 
-const TEST_BUFFER_SIZE: usize = 256 * 1024;
-const PSK: [u8; 32] = [0x42u8; 32];
+mod common;
+use common::*;
 
-fn test_config() -> MeshNodeConfig {
-    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let mut cfg = MeshNodeConfig::new(addr, PSK)
+/// Config with a shorter session_timeout (300 ms) than the
+/// harness default (500 ms) — the peer-eviction sweep fires at
+/// 30 × session_timeout, so this keeps the wall-clock under 10 s
+/// rather than ~15 s with the default.
+fn config() -> MeshNodeConfig {
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut cfg = MeshNodeConfig::new(addr, CHAOS_PSK)
         .with_heartbeat_interval(Duration::from_millis(100))
         .with_session_timeout(Duration::from_millis(300))
         .with_handshake(3, Duration::from_secs(2));
     cfg.socket_buffers = SocketBufferConfig {
-        send_buffer_size: TEST_BUFFER_SIZE,
-        recv_buffer_size: TEST_BUFFER_SIZE,
+        send_buffer_size: CHAOS_BUFFER_SIZE,
+        recv_buffer_size: CHAOS_BUFFER_SIZE,
     };
     cfg
-}
-
-async fn build_node() -> Arc<MeshNode> {
-    Arc::new(
-        MeshNode::new(EntityKeypair::generate(), test_config())
-            .await
-            .expect("MeshNode::new"),
-    )
-}
-
-async fn connect_pair(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
-    let a_id = a.node_id();
-    let b_pub = *b.public_key();
-    let b_addr = b.local_addr();
-    let b_id = b.node_id();
-    let b_clone = b.clone();
-    let accept = tokio::spawn(async move { b_clone.accept(a_id).await });
-    a.connect(b_addr, &b_pub, b_id)
-        .await
-        .expect("connect failed");
-    accept
-        .await
-        .expect("accept task panicked")
-        .expect("accept failed");
-}
-
-async fn wait_for<F: Fn() -> bool>(limit: Duration, check: F) -> bool {
-    let start = tokio::time::Instant::now();
-    while start.elapsed() < limit {
-        if check() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    check()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -87,8 +60,8 @@ async fn peers_map_evicts_permanently_failed_peer() {
     // and evicts. The 30× multiplier leaves plenty of room for
     // transient-partition recovery; this test only exercises the
     // permanently-gone path by never unblocking.
-    let a = build_node().await;
-    let b = build_node().await;
+    let a = build_node_with(config()).await;
+    let b = build_node_with(config()).await;
     connect_pair(&a, &b).await;
     a.start();
     b.start();
@@ -105,33 +78,18 @@ async fn peers_map_evicts_permanently_failed_peer() {
     );
 
     // Simulate B going permanently silent from A's perspective.
-    a.block_peer(b_bind);
+    chaos_one_sided_block(&a, &b);
 
-    // Drive check_all so the Failed transition fires. Then wait
-    // past 30 × session_timeout = 9 s for the heartbeat-loop sweep
-    // to observe the extended silence and evict.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
-    while tokio::time::Instant::now() < deadline {
-        let _ = a.failure_detector().check_all();
-        if a.peer_addr(b_id).is_none() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    // Drive FD through Failed, then wait past 30 × session_timeout
+    // = 9 s for the heartbeat-loop sweep to run and evict B.
+    await_peer_failed(&a, b_id, Duration::from_secs(3)).await;
+    await_peer_count(&a, 0, Duration::from_secs(12)).await;
 
-    let evicted = wait_for(Duration::from_secs(2), || a.peer_addr(b_id).is_none()).await;
+    // Post-condition: both the peer-by-id lookup and the
+    // peer_count invariant agree on B's eviction.
     assert!(
-        evicted,
-        "A's `peers` map must evict B after the heartbeat-loop \
-         sweep runs (~30 × session_timeout of silence). \
-         peer_addr(B) = {:?}, peer_count = {}",
+        a.peer_addr(b_id).is_none(),
+        "A's peer_addr(B) must be None after eviction; got {:?}",
         a.peer_addr(b_id),
-        a.peer_count(),
-    );
-    assert_eq!(
-        a.peer_count(),
-        0,
-        "peer_count must reflect the eviction; got {}",
-        a.peer_count()
     );
 }
