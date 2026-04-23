@@ -1,0 +1,23 @@
+.claude/skills/net-event-bus/apis.md
+  3f966a086d8a12b3 1-217
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "92de45ecb23c63599c379c9f4919b808c1d27a77",
+  "prompts": {
+    "3f966a086d8a12b3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "810349f5-7270-476a-9d85-7326a78cf746",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 217,
+      "total_deletions": 0,
+      "accepted_lines": 217,
+      "overriden_lines": 0
+    }
+  }
+}
