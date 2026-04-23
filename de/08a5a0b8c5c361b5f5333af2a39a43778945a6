@@ -1,0 +1,41 @@
+.claude/skills/net-event-bus/runtime.md
+  3f966a086d8a12b3 1-254
+.claude/skills/net-event-bus/examples/hello.c
+  3f966a086d8a12b3 1-49
+.claude/skills/net-event-bus/examples/hello.ts
+  3f966a086d8a12b3 1-32
+.claude/skills/net-event-bus/testing.md
+  3f966a086d8a12b3 1-155
+.claude/skills/net-event-bus/examples/hello.py
+  3f966a086d8a12b3 1-44
+.claude/skills/net-event-bus/SKILL.md
+  3f966a086d8a12b3 15,22-24,26,48-57
+.claude/skills/net-event-bus/examples/README.md
+  3f966a086d8a12b3 1-15
+.claude/skills/net-event-bus/examples/hello.go
+  3f966a086d8a12b3 1-40
+.claude/skills/net-event-bus/payloads.md
+  3f966a086d8a12b3 1-71
+.claude/skills/net-event-bus/examples/hello.rs
+  3f966a086d8a12b3 1-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "de08a5a0b8c5c361b5f5333af2a39a43778945a6",
+  "prompts": {
+    "3f966a086d8a12b3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "810349f5-7270-476a-9d85-7326a78cf746",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 722,
+      "total_deletions": 6,
+      "accepted_lines": 722,
+      "overriden_lines": 0
+    }
+  }
+}
