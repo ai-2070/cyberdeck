@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/channel/guard.rs
+  5bf3f089eecaef7a 38-181,207-210,237,246-259,262,277-286,288,365,368
+net/crates/net/tests/loom_models.rs
+  5bf3f089eecaef7a 264-422
+net/crates/net/docs/FAILURE_PATH_HARDENING_PLAN.md
+  5bf3f089eecaef7a 173-174,177-197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "09494a46660a050169a789944a7a03204efd424b",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1239,
+      "total_deletions": 1782,
+      "accepted_lines": 359,
+      "overriden_lines": 0
+    }
+  }
+}
