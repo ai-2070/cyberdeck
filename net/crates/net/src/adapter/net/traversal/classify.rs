@@ -913,8 +913,7 @@ mod tests {
                 unique_peers.insert(peer);
                 let ip_octet = rng.pick_ip_last_octet();
                 let port = rng.pick_port();
-                let reflex: SocketAddr =
-                    format!("198.51.100.{ip_octet}:{port}").parse().unwrap();
+                let reflex: SocketAddr = format!("198.51.100.{ip_octet}:{port}").parse().unwrap();
                 fsm.observe(peer, reflex);
             }
 
@@ -1001,9 +1000,7 @@ mod tests {
                 .map(|i| {
                     let port = rng.pick_port();
                     let ip_octet = rng.pick_ip_last_octet();
-                    let sa: SocketAddr = format!("198.51.100.{ip_octet}:{port}")
-                        .parse()
-                        .unwrap();
+                    let sa: SocketAddr = format!("198.51.100.{ip_octet}:{port}").parse().unwrap();
                     (i, sa)
                 })
                 .collect();
