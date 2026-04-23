@@ -485,4 +485,246 @@ mod tests {
         let dir = channel_dir(&base, &name);
         assert_eq!(dir, PathBuf::from("/tmp/base/sensors/lidar/front"));
     }
+
+    /// Externally truncating the dat file (admin action, FS bug,
+    /// crash mid-rename) past a heap entry's tail must drop only
+    /// the torn entries — every preceding heap entry AND every
+    /// inline entry between them must survive. The recovery walk
+    /// at lines 127-160 documents this scenario; this test pins
+    /// the documented behavior so a refactor can't quietly trim
+    /// too much (data loss) or too little (stale offset → garbage
+    /// reads). Lay-out under test:
+    ///
+    ///     idx: [heap1, inline1, heap2, inline2, heap3]
+    ///     dat: [<h1 bytes>, <h2 bytes>, <h3 bytes>]
+    ///
+    /// Truncate dat to keep h1 and h2 but kill h3. After reopen,
+    /// the surviving index must be `[heap1, inline1, heap2,
+    /// inline2]`.
+    #[test]
+    fn test_external_dat_truncation_drops_torn_heap_after_inlines() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/external-trunc").unwrap();
+
+        // Inline payloads must be exactly INLINE_PAYLOAD_SIZE bytes.
+        let inline_a = *b"in_a____";
+        let inline_b = *b"in_b____";
+        let h1_payload = b"heap1";
+        let h2_payload = b"heap2_longer";
+        let h3_payload = b"heap3_data";
+
+        let h1_off = 0u32;
+        let h2_off = h1_off + h1_payload.len() as u32;
+        let h3_off = h2_off + h2_payload.len() as u32;
+        let dat_keep_len = (h2_off + h2_payload.len() as u32) as u64;
+
+        // Phase 1 — write the layout.
+        {
+            let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+
+            recovered
+                .disk
+                .append_entry(
+                    &RedexEntry::new_heap(
+                        0,
+                        h1_off,
+                        h1_payload.len() as u32,
+                        0,
+                        payload_checksum(h1_payload),
+                    ),
+                    h1_payload,
+                )
+                .unwrap();
+
+            recovered
+                .disk
+                .append_entry(
+                    &RedexEntry::new_inline(1, &inline_a, payload_checksum(&inline_a)),
+                    &inline_a,
+                )
+                .unwrap();
+
+            recovered
+                .disk
+                .append_entry(
+                    &RedexEntry::new_heap(
+                        2,
+                        h2_off,
+                        h2_payload.len() as u32,
+                        0,
+                        payload_checksum(h2_payload),
+                    ),
+                    h2_payload,
+                )
+                .unwrap();
+
+            recovered
+                .disk
+                .append_entry(
+                    &RedexEntry::new_inline(3, &inline_b, payload_checksum(&inline_b)),
+                    &inline_b,
+                )
+                .unwrap();
+
+            recovered
+                .disk
+                .append_entry(
+                    &RedexEntry::new_heap(
+                        4,
+                        h3_off,
+                        h3_payload.len() as u32,
+                        0,
+                        payload_checksum(h3_payload),
+                    ),
+                    h3_payload,
+                )
+                .unwrap();
+
+            recovered.disk.sync().unwrap();
+        }
+
+        // Phase 2 — externally truncate dat to kill heap3 only.
+        let dat_path = channel_dir(&base, &name).join("dat");
+        OpenOptions::new()
+            .write(true)
+            .open(&dat_path)
+            .unwrap()
+            .set_len(dat_keep_len)
+            .unwrap();
+
+        // Phase 3 — reopen and assert.
+        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let seqs: Vec<u64> = recovered.index.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![0, 1, 2, 3],
+            "expected heap1,inline1,heap2,inline2 to survive (got seqs {:?})",
+            seqs
+        );
+
+        // Both inlines must still report inline.
+        assert!(!recovered.index[0].is_inline(), "seq 0 should be heap");
+        assert!(recovered.index[1].is_inline(), "seq 1 should be inline");
+        assert!(!recovered.index[2].is_inline(), "seq 2 should be heap");
+        assert!(recovered.index[3].is_inline(), "seq 3 should be inline");
+
+        // Dat must have been re-trimmed to exactly the surviving
+        // heap entries' end. (Lines 161-177 do a final sweep that
+        // truncates dat to the highest retained `(offset + len)`.)
+        assert_eq!(
+            recovered.payload_bytes.len() as u64,
+            dat_keep_len,
+            "dat should be exactly heap1+heap2 bytes after recovery"
+        );
+        assert_eq!(
+            std::fs::metadata(&dat_path).unwrap().len(),
+            dat_keep_len,
+            "dat file size mismatch after recovery"
+        );
+        // Index must have been re-trimmed to drop heap3's record
+        // (one 20-byte slot removed from the tail).
+        let idx_path = channel_dir(&base, &name).join("idx");
+        assert_eq!(
+            std::fs::metadata(&idx_path).unwrap().len(),
+            (4 * REDEX_ENTRY_SIZE) as u64,
+            "idx file should have exactly 4 records after recovery"
+        );
+
+        cleanup(&base);
+    }
+
+    /// Truncating dat all the way back to BEFORE heap2 must drop
+    /// heap2 and heap3, but keep heap1 and any inlines between
+    /// them. Layout:
+    ///
+    ///     idx: [heap1, inline1, heap2, inline2, heap3]
+    ///     dat truncated to: <h1 bytes>
+    ///
+    /// Surviving index: `[heap1, inline1]`. heap2's tail is
+    /// torn → it and everything after it must be dropped. inline2
+    /// sits *after* heap2 in the index, so even though it does
+    /// not depend on dat, it is dropped by the backward-walk
+    /// because heap2's tear marks position 2 as truncated and
+    /// later positions are torn-or-later.
+    #[test]
+    fn test_external_dat_truncation_to_first_heap_drops_everything_after() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/external-trunc-deep").unwrap();
+
+        let inline_a = *b"in_a____";
+        let inline_b = *b"in_b____";
+        let h1_payload = b"heap1";
+        let h2_payload = b"heap2";
+        let h3_payload = b"heap3";
+
+        {
+            let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+
+            recovered
+                .disk
+                .append_entry(
+                    &RedexEntry::new_heap(0, 0, 5, 0, payload_checksum(h1_payload)),
+                    h1_payload,
+                )
+                .unwrap();
+            recovered
+                .disk
+                .append_entry(
+                    &RedexEntry::new_inline(1, &inline_a, payload_checksum(&inline_a)),
+                    &inline_a,
+                )
+                .unwrap();
+            recovered
+                .disk
+                .append_entry(
+                    &RedexEntry::new_heap(2, 5, 5, 0, payload_checksum(h2_payload)),
+                    h2_payload,
+                )
+                .unwrap();
+            recovered
+                .disk
+                .append_entry(
+                    &RedexEntry::new_inline(3, &inline_b, payload_checksum(&inline_b)),
+                    &inline_b,
+                )
+                .unwrap();
+            recovered
+                .disk
+                .append_entry(
+                    &RedexEntry::new_heap(4, 10, 5, 0, payload_checksum(h3_payload)),
+                    h3_payload,
+                )
+                .unwrap();
+            recovered.disk.sync().unwrap();
+        }
+
+        // Truncate dat to keep heap1 only.
+        let dat_path = channel_dir(&base, &name).join("dat");
+        OpenOptions::new()
+            .write(true)
+            .open(&dat_path)
+            .unwrap()
+            .set_len(5)
+            .unwrap();
+
+        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let seqs: Vec<u64> = recovered.index.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![0, 1],
+            "deep dat truncation must keep only entries up to (but not past) the earliest torn heap (got seqs {:?})",
+            seqs
+        );
+        assert!(!recovered.index[0].is_inline());
+        assert!(recovered.index[1].is_inline());
+
+        // Dat file should be re-trimmed to heap1 only.
+        assert_eq!(
+            std::fs::metadata(&dat_path).unwrap().len(),
+            5,
+            "dat should remain exactly heap1's bytes after recovery"
+        );
+
+        cleanup(&base);
+    }
 }

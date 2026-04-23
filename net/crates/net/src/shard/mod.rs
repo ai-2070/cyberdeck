@@ -759,6 +759,51 @@ mod tests {
         );
     }
 
+    /// Pin the current contract for `BackpressureMode::Sample`:
+    /// it returns `IngestionError::Sampled` once the buffer fills,
+    /// indistinguishable in shape from a `Backpressure` rejection.
+    /// Sampling itself ("keep 1 in N events") is **not implemented**
+    /// — the comments in `ingest` / `ingest_raw` defer it to "a
+    /// higher level" that does not exist. A consumer setting this
+    /// mode today gets a rejection signal, never probabilistic
+    /// admission.
+    ///
+    /// This test pins that contract so it cannot quietly change
+    /// without an explicit decision. If sampling is ever wired up,
+    /// this test will fail and force an update — at which point
+    /// the implementer should also add coverage for the
+    /// rate-proportional admission rate.
+    #[test]
+    fn sample_mode_currently_returns_sampled_after_buffer_fills() {
+        // TODO(coverage round 2): `BackpressureMode::Sample` is
+        // dead-on-arrival until "higher level" sampling lands;
+        // see comments at `ShardManager::ingest` / `ingest_raw`.
+        let manager = ShardManager::new(1, 4, BackpressureMode::Sample { rate: 2 });
+
+        // Fill the buffer (capacity 4, usable 3).
+        for i in 0..3 {
+            manager.ingest(json!({"i": i})).unwrap();
+        }
+
+        // Both ingest paths must report `Sampled` — not `Backpressure`,
+        // not `Ok` — so callers can distinguish the (currently
+        // unused) sampling rejection from a hard backpressure
+        // rejection in case sampling is wired up later.
+        let json_result = manager.ingest(json!({"i": 999}));
+        assert!(
+            matches!(json_result, Err(IngestionError::Sampled)),
+            "Sample mode must return Sampled on a full buffer (got {:?})",
+            json_result
+        );
+
+        let raw_result = manager.ingest_raw(RawEvent::from_str(r#"{"i": 999}"#));
+        assert!(
+            matches!(raw_result, Err(IngestionError::Sampled)),
+            "Sample mode must return Sampled on a full buffer via ingest_raw (got {:?})",
+            raw_result
+        );
+    }
+
     #[test]
     fn test_drop_oldest_multiple_cycles() {
         let manager = ShardManager::new(1, 4, BackpressureMode::DropOldest);
