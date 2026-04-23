@@ -1915,6 +1915,143 @@ mod tests {
     }
 
     // ========================================================================
+    // Custom TTL coverage (TEST_COVERAGE_PLAN §P3-16)
+    //
+    // Table-driven cases that exercise TTLs the default-300s unit
+    // tests never touch: 0s, 1s, 1h, 1yr, u32::MAX. Two flavors —
+    // one drives the index's `gc()` on freshly-indexed entries, the
+    // other drives `CapabilityAnnouncement::is_expired()` directly
+    // so the "age >= ttl" boundary can be pinned against an exact
+    // past timestamp (Instant::now() is not manipulable at test
+    // time, but `timestamp_ns` is).
+    // ========================================================================
+
+    /// `gc()` on a freshly-indexed entry evicts only when the TTL
+    /// is zero. Everything from 1s up is a "not yet expired" case
+    /// because less than a second has elapsed between `index()` and
+    /// `gc()`. Pins the sign of the comparison in `gc` — a flipped
+    /// inequality would evict an entry with a year-long TTL after
+    /// one microsecond of wall-clock age.
+    #[test]
+    fn gc_respects_ttl_bounds_on_freshly_indexed_entries() {
+        // (node_id, ttl_secs, expected_evicted_on_immediate_gc)
+        let cases: &[(u64, u32, bool)] = &[
+            (100, 0, true),
+            (101, 1, false),
+            (102, 3_600, false),          // 1 hour
+            (103, 31_536_000, false),     // 1 year
+            (104, u32::MAX, false),       // ~136 years
+        ];
+
+        for &(node_id, ttl_secs, should_evict) in cases {
+            let index = CapabilityIndex::new();
+            let mut ann =
+                CapabilityAnnouncement::new(node_id, test_entity(), 1, sample_capability_set());
+            ann.ttl_secs = ttl_secs;
+            index.index(ann);
+
+            let removed = index.gc();
+            if should_evict {
+                assert_eq!(
+                    removed, 1,
+                    "TTL={ttl_secs}s: entry must be evicted on immediate gc",
+                );
+                assert!(
+                    index.get(node_id).is_none(),
+                    "TTL={ttl_secs}s: evicted entry must not be queryable",
+                );
+            } else {
+                assert_eq!(
+                    removed, 0,
+                    "TTL={ttl_secs}s: fresh entry must not be evicted on immediate gc",
+                );
+                assert!(
+                    index.get(node_id).is_some(),
+                    "TTL={ttl_secs}s: live entry must remain queryable",
+                );
+            }
+        }
+    }
+
+    /// `CapabilityAnnouncement::is_expired()` uses `SystemTime`, so
+    /// we can backdate `timestamp_ns` and exercise the ttl boundary
+    /// directly. Covers the inclusive-expiry contract at every TTL
+    /// bucket in the plan.
+    #[test]
+    fn announcement_is_expired_table_driven_across_ttl_buckets() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let sec_ns = 1_000_000_000u64;
+
+        // (ttl_secs, age_secs, expected_is_expired, label)
+        let cases: &[(u32, u64, bool, &str)] = &[
+            // TTL=0: inclusive-expiry — any age (including 0) is expired.
+            (0, 0, true, "ttl=0 fresh"),
+            // TTL=1: 0s age → fresh; 2s age → expired.
+            (1, 0, false, "ttl=1s fresh"),
+            (1, 2, true, "ttl=1s aged 2s"),
+            // TTL=1h: boundary at 3600s.
+            (3_600, 1, false, "ttl=1h aged 1s"),
+            (3_600, 3_599, false, "ttl=1h aged 3599s"),
+            (3_600, 3_600, true, "ttl=1h aged exactly 3600s (inclusive)"),
+            (3_600, 3_601, true, "ttl=1h aged 3601s"),
+            // TTL=1yr: day-old is fresh, 2yr-old is expired.
+            (31_536_000, 86_400, false, "ttl=1yr aged 1 day"),
+            (31_536_000, 31_536_001, true, "ttl=1yr aged just past"),
+            // TTL=u32::MAX: a 1-year-old entry is still fresh. Pins
+            // that `ttl_secs as u64` widens without wrapping.
+            (u32::MAX, 31_536_000, false, "ttl=u32::MAX aged 1 year"),
+        ];
+
+        for &(ttl_secs, age_secs, expected, label) in cases {
+            let mut ann = CapabilityAnnouncement::new(1, test_entity(), 1, sample_capability_set());
+            ann.ttl_secs = ttl_secs;
+            ann.timestamp_ns = now_ns.saturating_sub(age_secs.saturating_mul(sec_ns));
+
+            assert_eq!(
+                ann.is_expired(),
+                expected,
+                "is_expired({label}) must be {expected}",
+            );
+        }
+    }
+
+    /// `with_ttl()` applied after construction must actually change
+    /// the announcement's effective lifetime — pins that the
+    /// builder-style setter doesn't silently ignore the new value
+    /// or leak the `DEFAULT_TTL_SECS` default through.
+    #[test]
+    fn with_ttl_mutation_round_trips_through_is_expired_and_gc() {
+        let ann = CapabilityAnnouncement::new(9, test_entity(), 1, sample_capability_set())
+            .with_ttl(0);
+        assert_eq!(ann.ttl_secs, 0, "with_ttl must write through");
+
+        let index = CapabilityIndex::new();
+        index.index(ann);
+        // Immediate gc should evict because `with_ttl(0)` applied.
+        assert_eq!(
+            index.gc(),
+            1,
+            "with_ttl(0) must propagate into the indexed entry's TTL \
+             so gc treats it the same as a fresh ttl_secs=0 announcement",
+        );
+
+        // Long TTL path: with_ttl(u32::MAX) keeps the entry
+        // indefinitely on a fresh gc.
+        let ann2 = CapabilityAnnouncement::new(10, test_entity(), 1, sample_capability_set())
+            .with_ttl(u32::MAX);
+        assert_eq!(ann2.ttl_secs, u32::MAX);
+        let index = CapabilityIndex::new();
+        index.index(ann2);
+        assert_eq!(index.gc(), 0, "u32::MAX TTL must survive gc");
+        assert!(index.get(10).is_some());
+    }
+
+    // ========================================================================
     // Multi-hop wire format (M-1)
     // ========================================================================
 
