@@ -1,7 +1,7 @@
 // ABI-stability cgo round-trip test. Paired with
-// `abi_stability_cgo.go` — same `test_helpers` build tag — so
+// `abi_stability_cgo.go` — same `abi_stability` build tag — so
 // the cgo helper function and the test that drives it compile
-// together only when invoked via `go test -tags test_helpers`.
+// together only when invoked via `go test -tags abi_stability`.
 //
 // Why the tag: cgo directives are disallowed inside `_test.go`
 // files, so the helper must live in a regular `.go` file. We

@@ -89,6 +89,12 @@ fn ffi_shutdown_dekker_handshake_holds_under_contention() {
     const MAX_OPS_PER_WORKER: usize = 50_000;
 
     let total_acceptable = Arc::new(AtomicU64::new(0));
+    // Count workers that actually observed `ShuttingDown`. If
+    // this stays at 0 across every iteration, we never raced
+    // shutdown against a live worker — the test would pass
+    // without exercising the thing it claims to cover
+    // (cubic-flagged P2).
+    let total_saw_shutdown = Arc::new(AtomicU64::new(0));
 
     for iter in 0..ITERATIONS {
         let handle = net_init(ptr::null());
@@ -176,18 +182,13 @@ fn ffi_shutdown_dekker_handshake_holds_under_contention() {
         // not fail on, the saw_shutdown flag: with very small
         // delays + very fast machines, some workers may finish
         // their entire op budget before shutdown is even called.
-        let mut saw_shutdown_count = 0;
+        let mut saw_shutdown_count = 0u64;
         for w in workers {
             if w.join().expect("worker thread panicked") {
                 saw_shutdown_count += 1;
             }
         }
-
-        // Sanity: across the whole test, at least *some* iterations
-        // must have workers that observed ShuttingDown — otherwise
-        // we are not actually exercising the race. Asserted on
-        // total below.
-        let _ = saw_shutdown_count;
+        total_saw_shutdown.fetch_add(saw_shutdown_count, Ordering::Relaxed);
     }
 
     // Across the whole test we should have racked up a sizeable
@@ -198,5 +199,21 @@ fn ffi_shutdown_dekker_handshake_holds_under_contention() {
     assert!(
         total >= (ITERATIONS as u64),
         "test did not exercise the FFI surface (only {total} successful ops)"
+    );
+
+    // Race-exercise sanity check: at least some workers, across
+    // the 20 iterations × 8 workers = 160 worker-runs, must have
+    // been mid-op when shutdown landed and returned
+    // `ShuttingDown`. If every run finished ahead of shutdown we
+    // never actually exercised the Dekker handshake this test
+    // claims to cover — the randomized 0–5 ms delay is tuned so
+    // most iterations overlap, and a stable zero here would
+    // indicate either the delay tuning broke or the FFI started
+    // silently buffering past shutdown.
+    let shutdown_observers = total_saw_shutdown.load(Ordering::Relaxed);
+    assert!(
+        shutdown_observers > 0,
+        "no worker across {ITERATIONS} iterations observed ShuttingDown — \
+         test is not exercising the shutdown-vs-in-flight race",
     );
 }
