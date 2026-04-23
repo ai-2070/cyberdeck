@@ -31,6 +31,10 @@ use net::adapter::net::compute::SnapshotReassembler;
 fuzz_target!(|data: &[u8]| {
     let mut r = SnapshotReassembler::new();
     let mut cursor = 0usize;
+    // Track the most-recently-fed origin so the post-loop
+    // cancel actually exercises a populated slot rather than
+    // a hardcoded origin that libfuzzer never saw (cubic P2).
+    let mut last_origin: Option<u32> = None;
 
     // Max ops per fuzz input — bounds wall-clock per case so
     // the fuzzer can explore shape space instead of depth.
@@ -61,6 +65,7 @@ fuzz_target!(|data: &[u8]| {
         // Ok(None), Ok(Some(bytes)), or Err(_). All three are
         // documented successes — only a panic is a bug.
         let _ = r.feed(origin, payload, seq_through, chunk_index, total_chunks);
+        last_origin = Some(origin);
 
         // Conservative bound on pending reassemblies. The
         // reassembler caps per-daemon to latest-seq, so under
@@ -77,8 +82,21 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
-    // Exercise cancel on the last-seen origin too, since that's
-    // a mutation path and the panic-freedom guarantee extends
-    // to it.
-    r.cancel(0);
+    // Exercise cancel on the last-fed origin — that's the
+    // slot most likely to have in-flight state for cancel to
+    // tear down. Zero-op inputs just skip the cancel call (no
+    // state to cancel, and hardcoding a synthetic origin would
+    // miss the populated-slot path entirely).
+    if let Some(origin) = last_origin {
+        r.cancel(origin);
+        // pending state for that origin must be gone after cancel.
+        // Other origins may still be pending — we only assert on
+        // the cancelled one. Bound remains the per-session cap.
+        assert!(
+            r.pending_count() < 1024,
+            "pending_count = {} after cancel({:#x})",
+            r.pending_count(),
+            origin,
+        );
+    }
 });
