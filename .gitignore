@@ -4,3 +4,5 @@ net/crates/net/sdk-ts/dist/
 .DS_Store
 **/.DS_Store
 net/crates/net/bindings/python/python/net/*.so
+.claude/settings.local.json
+net/crates/net/.claude/settings.local.json
