@@ -55,10 +55,11 @@ await node.shutdown();
 
 **Key facts:**
 - `NetNode.create(config)` is **async** — must `await`.
-- All ingestion is sync, but the return shape varies by method:
-  - `emit(obj)` and `emitRaw(json)` return `Receipt | null` — `null` when the bus rejects the ingest under backpressure (`fail_producer` mode). Check the result.
-  - `emitBatch(objs)` and `emitRawBatch(jsons)` return `number` (count actually ingested — short of input length means partial drop).
-  - `channel.publish(event)`, `channel.publishBatch(events)`, `emitBuffer(Buffer)`, `fire(json)`, `fireBatch(jsons)` return `boolean` / `number` from the underlying fire path. A `false` return means the bus dropped it. **No exception is thrown for ring-buffer backpressure** — you must read the return.
+- All ingestion is sync, but the failure shape varies by method:
+  - `emit(obj)` and `emitRaw(json)` are typed `Receipt | null`, but the underlying napi binding **throws** on ingestion failure (e.g. `fail_producer` mode, shutdown). The `| null` is vestigial — wrap in `try/catch`, don't null-check.
+  - `emitBatch(objs)` / `emitRawBatch(jsons)` return `number` (count ingested). They throw on shutdown; on `drop_*` backpressure they return a short count. Compare against input length to detect partial drops.
+  - `channel.publish(event)`, `channel.publishBatch(events)`, `emitBuffer(Buffer)`, `fire(json)`, `fireBatch(jsons)` go through the fire path and return `boolean` / `number`. A `false` / short return means the bus rejected the event — they don't throw.
+  - With the default `drop_oldest` / `drop_newest` modes, the throwing methods don't throw on backpressure either: drops are silent and visible only via `node.stats().eventsDropped`.
 - `subscribe()` returns an async iterable. Always consume with `for await...of`.
 - `emitBuffer(Buffer)` is the zero-copy path. Use when the payload is already serialized.
 - Validators are optional: `node.channel<T>('name', validator)` runs your function on each received event.
@@ -205,11 +206,11 @@ These bite people regardless of language. Internalize them.
 - **JSON everywhere.** The wire format is JSON bytes. There is no schema registry. The JSON either parses on the consumer or it doesn't.
 - **Shutdown is required.** Don't rely on process exit. Call `shutdown()` / `Shutdown()` / `net_shutdown()`. The ring buffer needs a clean drain.
 - **Subscribe is hot.** A subscriber sees events emitted *after* it subscribed, plus whatever's still in the ring buffer. No replay-from-zero. If the user wants replay, they need RedEX or an adapter — not the bus.
-- **Backpressure is silent.** Producers may quietly fail. Check return values:
-  - Rust: `Result<Receipt, SdkError>` — error variant `Ingestion(...)` (or `Backpressure` on mesh streams).
-  - TS: `emit`/`emitRaw` return `Receipt | null`; `publish`/`publishBatch`/`emitBuffer`/`fire`/`fireBatch` return `boolean`/`number`. **Nothing throws** for ring-buffer drops — read the return value.
-  - Python: `emit` raises on `fail_producer` mode; otherwise drops are silent and visible only via `node.stats().events_dropped`.
-  - Go / C: methods return error codes; check them. Drops happen below the API surface and surface only via stats.
+- **Backpressure is silent under `drop_*` modes; under `fail_producer`, it surfaces per-language.** Always also watch `stats().events_dropped`:
+  - Rust: `emit` returns `Result<Receipt, SdkError>` — `fail_producer` overflow comes back as `SdkError::Ingestion(...)`. (Mesh-stream sends use `SdkError::Backpressure` instead.)
+  - TS: `emit`/`emitRaw` **throw** under `fail_producer`/shutdown (the `Receipt | null` annotation is vestigial — use `try/catch`). `publish`/`publishBatch`/`emitBuffer`/`fire`/`fireBatch` go through the fire path and return `false` / a short count instead of throwing.
+  - Python: `emit` raises (`RuntimeError` / `BackpressureError` from the binding) under `fail_producer`/shutdown. Under `drop_*`, drops are silent.
+  - Go / C: methods return error codes; check them. `drop_*` drops never reach the API — only `stats()` shows them.
 - **`_channel` is reserved** in TS/Python channel payloads. Don't put your own field there.
 - **Transport is set at construction.** A node can have only one transport. To bridge transports, run two nodes in the same process and forward between them.
 - **`shards` is a parallelism knob, not a partitioning scheme.** It does not give you Kafka-style ordered partitions. It just parallelizes ingestion. Default is fine for most workloads.
