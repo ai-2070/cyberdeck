@@ -1,0 +1,74 @@
+# cargo-fuzz scaffold for FAILURE_PATH_HARDENING_PLAN Stage 1.
+#
+# Wire-boundary fuzz targets. Each binary takes a `&[u8]` from
+# libfuzzer and feeds it through a production decode path,
+# asserting no panic / no unbounded allocation / no slow-parse.
+#
+# Run an individual target:
+#   cargo fuzz run <target_name>          # infinite
+#   cargo fuzz run <target_name> -- -max_total_time=60   # 60 s
+#
+# Committed corpus under `corpus/<target>/` seeds interesting
+# inputs (known-good messages, known-bad from past bugs). The
+# runner writes newly-discovered inputs here automatically.
+#
+# Crashes land in `artifacts/<target>/crash-<hash>` and are
+# reproducible with `cargo fuzz run <target> artifacts/<target>/crash-<hash>`.
+#
+# Rust-nightly required (libfuzzer-sys constraint).
+
+[package]
+name = "net-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# Depend on the parent crate with every feature the fuzz
+# targets need. `port-mapping` pulls in NAT-PMP + UPnP decoders;
+# `nat-traversal` surfaces classify + reflex types.
+net = { path = "..", features = ["net", "nat-traversal", "port-mapping"] }
+
+# Prevent this from being pulled into the parent workspace —
+# cargo-fuzz is designed to be invoked from inside this dir.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "capability_announcement_from_bytes"
+path = "fuzz_targets/capability_announcement_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_reassembler_feed"
+path = "fuzz_targets/snapshot_reassembler_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nat_pmp_decode_response"
+path = "fuzz_targets/nat_pmp_decode_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "migration_wire_decode"
+path = "fuzz_targets/migration_wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "routing_header_from_bytes"
+path = "fuzz_targets/routing_header_from_bytes.rs"
+test = false
+doc = false
+bench = false

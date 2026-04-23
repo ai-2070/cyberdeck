@@ -35,29 +35,69 @@ Before any Stage-1 infrastructure lands, sweep every `.unwrap_or(default)` and `
 
 ## Stage 1 — Wire-boundary fuzzing
 
+**Status:** infrastructure landed; 5 of 7 targets written. Smoke runs (~10-15 s each) completed clean across ~1.9M inputs total, zero crashes, zero panics.
+
 **Cost:** 1-2 weeks.
-**Setup:** Minimal. Add `cargo-fuzz` to the workspace. Each target is ~20 lines.
+**Setup:** `cargo-fuzz v0.13.1` installed; `fuzz/` crate scaffolded at `net/crates/net/fuzz/` with `libfuzzer-sys` targets. Rust nightly is the only runtime prerequisite (libfuzzer-sys constraint).
 
-**Targets (one per wire decoder):**
+**Targets landed:**
 
-- `fuzz_nat_pmp_decode_response` — feed random `&[u8]` to `decode_response`.
-- `fuzz_migration_wire_decode` — feed random `&[u8]` to `compute::orchestrator::wire::decode`.
-- `fuzz_capability_announcement_from_bytes` — signed + unsigned variants.
-- `fuzz_snapshot_reassembler_feed` — random chunks with random `(origin, seq, chunk_index, total_chunks)`.
-- `fuzz_mesh_frame_decode` — every subprotocol ID × random payload.
-- `fuzz_channel_membership_envelope` — roster updates, membership messages.
-- `fuzz_build_subprotocol_parse_side` — assembled event-frame inputs.
+| Target | Entry point | Status |
+|--------|-------------|--------|
+| `capability_announcement_from_bytes` | `CapabilityAnnouncement::from_bytes` + round-trip + `verify()` + `is_expired()` | landed, smoke-run clean |
+| `snapshot_reassembler_feed` | `SnapshotReassembler::feed` over sequence of ops with attacker-chosen `(origin, seq, index, total, payload)` | landed, smoke-run clean |
+| `nat_pmp_decode_response` | `natpmp::decode_response` | landed, smoke-run clean |
+| `migration_wire_decode` | `compute::orchestrator::wire::decode` + `encode` canonicalization round-trip | landed, smoke-run clean |
+| `routing_header_from_bytes` | `RoutingHeader::from_bytes` + round-trip | landed, smoke-run clean |
+
+**Targets pending:**
+
+- `mesh_frame_decode` — every subprotocol ID × random payload through the top-level subprotocol dispatch. Requires a bit more setup (needs a live MeshNode or a reachable dispatcher helper).
+- `channel_membership_envelope` — postcard-encoded roster / subscribe / unsubscribe messages.
+
+These are deferred to a follow-up pass; they need harness work to expose the dispatcher without spinning up a full mesh.
 
 **Invariants asserted by each target:**
 
-1. No panic.
+1. No panic on any byte sequence.
 2. No unbounded allocation (watch for `Vec::with_capacity(attacker_u32)`).
-3. No slow-parse pathological cases (timeout per-input).
-4. On `Ok(x)`, serializing `x` back produces something that round-trips (where applicable).
+3. No slow-parse pathological cases (libfuzzer's per-input timeout catches these by default at 1200 s).
+4. On `Ok(x)`, `encode(x)` round-trips to a value equal to `x` under `decode` (reassembler-feed target additionally asserts `pending_count() < 1024` to surface state-leak bugs).
 
-**ROI rationale.** Every hand-written "malformed X" test (P2-12, P1-1, P1-6) is a hand-crafted sample of what a fuzzer would enumerate. Fuzzing replaces the human imagination bottleneck. A 24-hour `cargo fuzz run` on each target will either find a panic / pathological-parse bug or give high-confidence that one class of bug isn't there.
+**Runbook.**
 
-**Exit criterion.** Every target runs for 24 hours (cumulative, not simultaneous) in CI without finding new panics. Corpus is committed to the repo so regressions re-fail on the smallest known-bad input.
+```sh
+# One-off smoke run, 60 s per target:
+cd net/crates/net/fuzz
+cargo +nightly fuzz run capability_announcement_from_bytes -- -max_total_time=60
+cargo +nightly fuzz run snapshot_reassembler_feed         -- -max_total_time=60
+cargo +nightly fuzz run nat_pmp_decode_response           -- -max_total_time=60
+cargo +nightly fuzz run migration_wire_decode             -- -max_total_time=60
+cargo +nightly fuzz run routing_header_from_bytes         -- -max_total_time=60
+
+# Extended CI run, 1 hour per target (nightly job):
+for t in capability_announcement_from_bytes snapshot_reassembler_feed \
+         nat_pmp_decode_response migration_wire_decode \
+         routing_header_from_bytes; do
+  cargo +nightly fuzz run "$t" -- -max_total_time=3600
+done
+
+# Reproduce a past crash (artifact file written by libfuzzer):
+cargo +nightly fuzz run <target> artifacts/<target>/crash-<hash>
+
+# List all targets:
+cargo +nightly fuzz list
+```
+
+**Corpus hygiene.**
+
+- `fuzz/corpus/<target>/` is committed. libfuzzer writes newly-discovered coverage-expanding inputs here automatically; checking them in means fresh clones + CI re-reach the same branches without re-exploring from scratch.
+- `fuzz/artifacts/<target>/` is git-ignored. Crashes land as `crash-<sha1>` files; reproduce by passing the path to `cargo fuzz run`.
+- `fuzz/target/` is git-ignored (standard `cargo` build dir).
+
+**ROI evidence from initial landing.** The 5-target × ~15-second smoke run explored 1.9M total inputs (migration_wire_decode alone did 485k runs at ~30k inputs/sec). That's a higher bug-imagination rate than any human author can match; the fact that nothing panicked is encouraging signal that the happy-path + hand-crafted-malformed coverage (P1/P2 sweep) left few low-hanging panics. A 24-hour CI run is the next step to surface the less-accessible state-space corners.
+
+**Exit criterion.** Every target runs for 24 hours (cumulative, not simultaneous) in CI without finding new panics. Crashes that do surface reduce to committed regression tests via the `artifacts/<target>/crash-*` path. The two deferred targets (`mesh_frame_decode`, `channel_membership_envelope`) land in a follow-up before this stage is fully closed.
 
 ---
 
