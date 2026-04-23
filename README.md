@@ -643,7 +643,7 @@ Ingest onto a single `TasksAdapter` sustains **~3.7M events/sec** before consume
 
 NetDB bundle encode + decode got **2-3x faster** and **60-70% smaller** when CortEX moved off bincode onto postcard in v0.5 — the biggest single win for cross-language snapshot transfer. Example at 1K entries: the bincode era shipped a 135 KB bundle in 63 us (encode) + 95 us (decode); postcard ships the same bundle at 48 KB in 22 us + 27 us.
 
-CortEX numbers re-captured 2026-04-23; RedEX numbers (above) captured 2026-04-19 via `cargo bench --bench redex --features "redex redex-disk"` and `cargo bench --bench cortex --features "cortex netdb"`. CortEX state serialization is on postcard (varint-encoded, serde-compatible, no-std friendly); bincode 1.x support was dropped after the original crate went unmaintained.
+CortEX numbers re-captured 2026-04-23; RedEX numbers (above) captured 2026-04-23 via `cargo bench --bench redex --features "redex redex-disk"` and `cargo bench --bench cortex --features "cortex netdb"`. CortEX state serialization is on postcard (varint-encoded, serde-compatible, no-std friendly); bincode 1.x support was dropped after the original crate went unmaintained.
 
 ### Binary size
 
