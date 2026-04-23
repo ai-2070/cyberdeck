@@ -1,0 +1,27 @@
+.claude/skills/net-event-bus/examples/hello.c
+  e0d79fdca371a8f9 38-44,46
+.claude/skills/net-event-bus/runtime.md
+  e0d79fdca371a8f9 16,166
+.claude/skills/net-event-bus/testing.md
+  e0d79fdca371a8f9 92,111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "e45bce79538a7937d466ae078f7910d0bd877fa5",
+  "prompts": {
+    "e0d79fdca371a8f9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "770f31ec-b8e9-45e2-8d3b-43ed30f59f49",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 12,
+      "total_deletions": 4,
+      "accepted_lines": 12,
+      "overriden_lines": 0
+    }
+  }
+}
