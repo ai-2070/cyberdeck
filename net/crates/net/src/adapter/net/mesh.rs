@@ -1264,10 +1264,8 @@ impl MeshNode {
             // registration with a different addr survives.
             if let Some((_, old_info)) = peers_failure.remove(&node_id) {
                 let old_addr = old_info.addr;
-                addr_to_node_failure
-                    .remove_if(&old_addr, |_, n| *n == node_id);
-                peer_addrs_failure
-                    .remove_if(&node_id, |_, addr| *addr == old_addr);
+                addr_to_node_failure.remove_if(&old_addr, |_, n| *n == node_id);
+                peer_addrs_failure.remove_if(&node_id, |_, addr| *addr == old_addr);
             }
         })
         .on_recovery(move |node_id| rp_recovery.on_recovery(node_id));
