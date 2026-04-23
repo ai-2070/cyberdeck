@@ -1,0 +1,29 @@
+net/crates/net/bindings/go/net/abi_stability_cgo.go
+  5bf3f089eecaef7a 1-34
+net/crates/net/src/adapter/net/behavior/capability.rs
+  5bf3f089eecaef7a 1956-1963,1966
+net/crates/net/bindings/go/net/abi_stability_cgo_test.go
+  5bf3f089eecaef7a 1-69
+net/crates/net/bindings/go/net/abi_stability_test.go
+  5bf3f089eecaef7a 23-28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "dab98c9e70fd2c292bd3e6fd13619390b1c1918d",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 473,
+      "total_deletions": 3057,
+      "accepted_lines": 402,
+      "overriden_lines": 0
+    }
+  }
+}
