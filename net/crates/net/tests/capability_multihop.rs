@@ -387,3 +387,171 @@ async fn late_joiner_converges_via_multihop_rebroadcast() {
 //   beyond what the test harness currently spins up. Left as
 //   follow-up.
 // ---------------------------------------------------------------------------
+
+// =========================================================================
+// Dedup — `(node_id, version)` cache prevents re-processing the same
+// announcement when it arrives twice (wire replay or a same-version
+// collision from a misbehaving origin).
+//
+// TEST_COVERAGE_PLAN §P1-3. Diamond convergence is already covered by
+// the existing multi-hop tests above; the cases below exercise the
+// remaining two: wire-replay and version-collision. TTL-expiry of the
+// dedup cache is covered alongside the clock-skew tests (§P1-2).
+// =========================================================================
+
+/// Replay of the exact wire bytes of an already-indexed
+/// announcement is silently dropped at the `(node_id, version)`
+/// dedup check, before signature verification or re-indexing.
+/// Observable via the index-event counter — `total_indexed`
+/// bumps once for the legitimate announcement and does NOT bump
+/// for the replays.
+#[tokio::test]
+async fn wire_replay_is_dropped_at_dedup_cache() {
+    use net::adapter::net::behavior::SUBPROTOCOL_CAPABILITY_ANN;
+
+    let a = build_node().await;
+    let b = build_node().await;
+    handshake_no_start(&a, &b).await;
+    start_all(&[&a, &b]);
+
+    // Legitimate announce: A emits v1, B indexes it naturally
+    // through the recv loop.
+    a.announce_capabilities(CapabilitySet::new().add_tag("dedup-test"))
+        .await
+        .expect("A announce");
+
+    let a_id = a.node_id();
+    let filter = CapabilityFilter::new().require_tag("dedup-test");
+    assert!(
+        wait_until(&b, |n| n.find_peers_by_filter(&filter).contains(&a_id)).await,
+        "B should index A's first announce",
+    );
+
+    let baseline = b.capability_index().stats().total_indexed;
+
+    // Grab A's own announcement wire bytes.
+    let ann = a
+        .local_announcement_for_test()
+        .expect("A should have a stored announcement after announce");
+    let bytes = ann.to_bytes();
+
+    // Replay the same wire bytes to B three times. Each arrives
+    // at B's dispatch with subprotocol_id=SUBPROTOCOL_CAPABILITY_ANN;
+    // the dedup check on `(a_id, v1)` must short-circuit each
+    // replay before it reaches `capability_index.index()`.
+    let b_addr = b.local_addr();
+    for _ in 0..3 {
+        a.send_subprotocol(b_addr, SUBPROTOCOL_CAPABILITY_ANN, &bytes)
+            .await
+            .expect("replay send");
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let after = b.capability_index().stats().total_indexed;
+    assert_eq!(
+        after, baseline,
+        "total_indexed must not bump on wire-replay — dedup cache \
+         should short-circuit all three replays BEFORE index() runs. \
+         baseline={baseline}, after={after}",
+    );
+    assert!(
+        b.find_peers_by_filter(&filter).contains(&a_id),
+        "A's tag should still be indexed after the replay barrage",
+    );
+}
+
+/// Two distinct announcements from the same origin with the same
+/// `version` number but different capability content — simulates
+/// a `capability_version.fetch_add` wrap-around or a misbehaving
+/// origin that reused a version. The dedup cache pins the
+/// first-writer-wins invariant: whichever announcement lands
+/// first is indexed; the second is silently dropped. Protects
+/// against a split-brain view where B ends up with the second
+/// announcement's tags even though the first was already
+/// propagated downstream.
+#[tokio::test]
+async fn version_collision_from_same_origin_is_dropped_at_dedup_cache() {
+    use net::adapter::net::behavior::capability::CapabilityAnnouncement;
+    use net::adapter::net::behavior::SUBPROTOCOL_CAPABILITY_ANN;
+
+    // Build A with a named keypair we keep so we can sign
+    // synthesized announcements below (default config's
+    // `require_signed_capabilities = true` drops unsigned on the
+    // receiver side, which would mask the dedup check we're
+    // trying to observe).
+    let a_keypair = EntityKeypair::generate();
+    let a = Arc::new(
+        MeshNode::new(a_keypair.clone(), test_config())
+            .await
+            .expect("A"),
+    );
+    let b = build_node().await;
+    handshake_no_start(&a, &b).await;
+    start_all(&[&a, &b]);
+
+    // Craft announcement #1 with version 42 + tag "first", signed.
+    let a_id = a.node_id();
+    let a_entity_id = a.entity_id().clone();
+    let mut ann1 = CapabilityAnnouncement::new(
+        a_id,
+        a_entity_id.clone(),
+        42,
+        CapabilitySet::new().add_tag("first"),
+    );
+    ann1.sign(&a_keypair);
+    let bytes1 = ann1.to_bytes();
+
+    // Craft announcement #2 with the SAME version 42 but a
+    // different tag "second", also signed.
+    let mut ann2 = CapabilityAnnouncement::new(
+        a_id,
+        a_entity_id,
+        42,
+        CapabilitySet::new().add_tag("second"),
+    );
+    ann2.sign(&a_keypair);
+    let bytes2 = ann2.to_bytes();
+
+    let b_addr = b.local_addr();
+
+    // Send #1 first — B should index it and see tag "first".
+    a.send_subprotocol(b_addr, SUBPROTOCOL_CAPABILITY_ANN, &bytes1)
+        .await
+        .expect("send #1");
+
+    let first_filter = CapabilityFilter::new().require_tag("first");
+    assert!(
+        wait_until(&b, |n| n
+            .find_peers_by_filter(&first_filter)
+            .contains(&a_id))
+        .await,
+        "B should index announcement #1 (tag=first, v=42)",
+    );
+
+    let indexed_after_first = b.capability_index().stats().total_indexed;
+
+    // Send #2 — same version, different tag. Dedup must drop it
+    // at the `(a_id, 42)` cache check.
+    a.send_subprotocol(b_addr, SUBPROTOCOL_CAPABILITY_ANN, &bytes2)
+        .await
+        .expect("send #2");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let indexed_after_second = b.capability_index().stats().total_indexed;
+    assert_eq!(
+        indexed_after_second, indexed_after_first,
+        "second same-version announcement must NOT increment total_indexed",
+    );
+
+    // B's view of A's caps is still #1's tag, not #2's. No
+    // split-brain.
+    let second_filter = CapabilityFilter::new().require_tag("second");
+    assert!(
+        !b.find_peers_by_filter(&second_filter).contains(&a_id),
+        "B must not have #2's tag — dedup dropped the collision",
+    );
+    assert!(
+        b.find_peers_by_filter(&first_filter).contains(&a_id),
+        "B must still have #1's tag (first-writer-wins)",
+    );
+}

@@ -68,10 +68,11 @@ pub fn reconcile_entity(
     split_seq: u64,
 ) -> Result<ReconcileOutcome, ChainError> {
     // Validate the remote chain before trusting it for reconciliation.
-    // Pass the local origin so a remote cannot win a "longest chain"
-    // conflict by submitting a well-formed chain anchored to a fabricated
-    // origin_hash.
-    verify_remote_chain(our_log.origin_hash(), their_events)?;
+    // Pass the local origin AND the expected first-sequence so a
+    // remote cannot win a "longest chain" conflict by submitting a
+    // well-formed chain anchored to a fabricated origin_hash or
+    // starting at an arbitrary sequence unrelated to our split.
+    verify_remote_chain(our_log.origin_hash(), their_events, Some(split_seq))?;
 
     let our_events = our_log.after(split_seq);
 
@@ -189,20 +190,49 @@ pub fn reconcile_entity(
 /// Validate that a sequence of remote events forms a valid chain anchored
 /// to `expected_origin`.
 ///
-/// Checks two things:
+/// Checks:
 /// - the first event's `origin_hash` matches `expected_origin` (so an
 ///   attacker cannot submit an internally well-formed chain for a
-///   fabricated entity and have it win a "longest chain" conflict), and
+///   fabricated entity and have it win a "longest chain" conflict),
+/// - when `expected_first_seq` is `Some(split_seq)`: the first event's
+///   sequence is exactly `split_seq + 1`, so a remote cannot submit
+///   a chain starting at an arbitrary sequence unrelated to our split
+///   point (zip-wise divergence detection in `reconcile_entity`
+///   compares index-by-index, so mismatched starting sequences would
+///   otherwise produce bogus "conflict" outcomes), and
 /// - parent_hash / sequence / origin linkage between consecutive events.
 ///
 /// Returns `Ok(())` on an empty slice (nothing to trust).
-pub fn verify_remote_chain(expected_origin: u32, events: &[CausalEvent]) -> Result<(), ChainError> {
+pub fn verify_remote_chain(
+    expected_origin: u32,
+    events: &[CausalEvent],
+    expected_first_seq: Option<u64>,
+) -> Result<(), ChainError> {
     if let Some(first) = events.first() {
         if first.link.origin_hash != expected_origin {
             return Err(ChainError::OriginMismatch {
                 expected: expected_origin,
                 got: first.link.origin_hash,
             });
+        }
+        if let Some(split_seq) = expected_first_seq {
+            // `checked_add(1)` rather than `saturating_add(1)`: at
+            // `split_seq == u64::MAX` there's no legitimate next
+            // sequence — the chain is already at the 64-bit ceiling,
+            // so any remote claiming to extend it is malformed by
+            // construction. Saturating would silently accept
+            // `first.link.sequence == u64::MAX` as a continuation of
+            // a chain that already hit the end (cubic code review P3).
+            let expected = split_seq.checked_add(1).ok_or(ChainError::SequenceGap {
+                expected: u64::MAX,
+                got: first.link.sequence,
+            })?;
+            if first.link.sequence != expected {
+                return Err(ChainError::SequenceGap {
+                    expected,
+                    got: first.link.sequence,
+                });
+            }
         }
     }
     for i in 1..events.len() {
@@ -392,7 +422,7 @@ mod tests {
             .map(|i| builder.append(Bytes::from(format!("e{}", i)), 0).unwrap())
             .collect();
 
-        assert!(verify_remote_chain(kp.origin_hash(), &events).is_ok());
+        assert!(verify_remote_chain(kp.origin_hash(), &events, None).is_ok());
     }
 
     #[test]
@@ -407,13 +437,50 @@ mod tests {
         // Tamper with the middle event
         events[1].link.parent_hash = 0xBADBADBAD;
 
-        assert!(verify_remote_chain(kp.origin_hash(), &events).is_err());
+        assert!(verify_remote_chain(kp.origin_hash(), &events, None).is_err());
     }
 
     #[test]
     fn test_verify_remote_chain_empty_is_ok() {
         // Nothing to trust, nothing to reject.
-        assert!(verify_remote_chain(0xDEADBEEF, &[]).is_ok());
+        assert!(verify_remote_chain(0xDEADBEEF, &[], None).is_ok());
+    }
+
+    #[test]
+    fn test_regression_verify_remote_chain_rejects_wrong_start_sequence() {
+        // Regression (LOW, BUGS.md): `verify_remote_chain` validated
+        // that the remote chain was internally linked but never
+        // checked that it actually started at the agreed split point.
+        // A remote could submit a well-formed chain anchored at an
+        // arbitrary sequence, and `reconcile_entity`'s index-by-index
+        // divergence detection would produce a bogus conflict outcome.
+        //
+        // Fix: pass `Some(split_seq)` and require the first event's
+        // `sequence` to equal `split_seq + 1`.
+        let kp = EntityKeypair::generate();
+        let mut builder = CausalChainBuilder::new(kp.origin_hash());
+        // Build a chain covering seqs 1..=10.
+        let events: Vec<CausalEvent> = (0..10)
+            .map(|i| builder.append(Bytes::from(format!("e{i}")), 0).unwrap())
+            .collect();
+        // Take the tail starting at seq 5 (so the remote-submitted
+        // chain "starts at" seq 5).
+        let tail: Vec<CausalEvent> = events[4..].to_vec();
+
+        // Split seq was 0 (so expected first is seq 1). The remote
+        // starts at seq 5 — must be rejected.
+        let rejected = verify_remote_chain(kp.origin_hash(), &tail, Some(0));
+        assert!(
+            matches!(rejected, Err(ChainError::SequenceGap { .. })),
+            "remote chain starting at seq 5 must be rejected when split_seq = 0",
+        );
+
+        // With matching expected (split_seq = 4 → expect first = 5),
+        // the same chain is accepted.
+        assert!(
+            verify_remote_chain(kp.origin_hash(), &tail, Some(4)).is_ok(),
+            "remote chain starting at seq 5 must be accepted when split_seq = 4",
+        );
     }
 
     // ---- Regression tests for Cubic AI findings ----
@@ -538,10 +605,10 @@ mod tests {
             .collect();
 
         // Chain itself is internally valid under `theirs`...
-        assert!(verify_remote_chain(theirs.origin_hash(), &forged).is_ok());
+        assert!(verify_remote_chain(theirs.origin_hash(), &forged, None).is_ok());
 
         // ...but must be rejected when we claim it belongs to `ours`.
-        let rejected = verify_remote_chain(ours.origin_hash(), &forged);
+        let rejected = verify_remote_chain(ours.origin_hash(), &forged, None);
         assert!(
             matches!(rejected, Err(ChainError::OriginMismatch { .. })),
             "verify_remote_chain must reject a chain whose first event's origin \

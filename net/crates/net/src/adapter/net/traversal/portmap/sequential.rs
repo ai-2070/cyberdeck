@@ -43,13 +43,22 @@ pub struct SequentialMapper {
     /// gateway IPv4. `None` on platforms where we couldn't
     /// discover the gateway (Windows; *BSD; unusual Linux) —
     /// in which case we skip straight to UPnP.
-    nat_pmp: Option<NatPmpMapper>,
+    ///
+    /// Held as a trait object so unit tests can inject a
+    /// `MockPortMapperClient` to drive specific state
+    /// transitions (e.g., probe-succeeds-but-install-fails to
+    /// exercise the install-time fallback path). Production
+    /// always wraps a real `NatPmpMapper`.
+    nat_pmp: Option<Box<dyn PortMapperClient>>,
     /// UPnP client. Always constructed; SSDP discovery happens
-    /// internally on the first call.
-    upnp: UpnpMapper,
+    /// internally on the first call. Trait-object for the same
+    /// test-injection reason as `nat_pmp` above.
+    upnp: Box<dyn PortMapperClient>,
     /// Which protocol succeeded on the most recent probe.
-    /// `None` means either no probe has run or the last probe
-    /// failed on both protocols.
+    /// `None` means either no probe has run, the last probe
+    /// failed on both protocols, or the cache was invalidated
+    /// by an `install` / `renew` failure so the next call
+    /// re-runs the sequence.
     active: Mutex<Option<Protocol>>,
 }
 
@@ -64,8 +73,26 @@ impl SequentialMapper {
     ///   [`super::upnp::UpnpMapper::new`].
     pub fn new(gateway: Option<Ipv4Addr>, local_ip: IpAddr) -> Self {
         Self {
-            nat_pmp: gateway.map(NatPmpMapper::new),
-            upnp: UpnpMapper::new(local_ip),
+            nat_pmp: gateway.map(|g| Box::new(NatPmpMapper::new(g)) as Box<dyn PortMapperClient>),
+            upnp: Box::new(UpnpMapper::new(local_ip)),
+            active: Mutex::new(None),
+        }
+    }
+
+    /// Test-only constructor: inject arbitrary trait-object
+    /// clients. Lets unit tests drive state transitions that
+    /// can't be reached with real NAT-PMP / UPnP loopback
+    /// fixtures (e.g., probe-succeeds-but-install-fails on the
+    /// same client). Production callers use [`Self::new`]
+    /// or [`sequential_mapper_from_os`].
+    #[cfg(test)]
+    pub(crate) fn new_with_clients(
+        nat_pmp: Option<Box<dyn PortMapperClient>>,
+        upnp: Box<dyn PortMapperClient>,
+    ) -> Self {
+        Self {
+            nat_pmp,
+            upnp,
             active: Mutex::new(None),
         }
     }
@@ -105,19 +132,79 @@ impl PortMapperClient for SequentialMapper {
         ttl: Duration,
     ) -> Result<PortMapping, PortMappingError> {
         let active = self.active_protocol();
-        match active {
+
+        // First attempt: the cached active protocol.
+        let first_err = match active {
+            None => return Err(PortMappingError::Unavailable),
             Some(Protocol::NatPmp) => {
                 // .expect is safe: active = Some(NatPmp) only
                 // set when we had a NatPmpMapper AND its probe
                 // succeeded.
-                self.nat_pmp
+                let pmp = self
+                    .nat_pmp
                     .as_ref()
-                    .expect("active NatPmp without nat_pmp client")
-                    .install(internal_port, ttl)
-                    .await
+                    .expect("active NatPmp without nat_pmp client");
+                match pmp.install(internal_port, ttl).await {
+                    Ok(m) => return Ok(m),
+                    Err(e) => e,
+                }
             }
-            Some(Protocol::Upnp) => self.upnp.install(internal_port, ttl).await,
-            None => Err(PortMappingError::Unavailable),
+            Some(Protocol::Upnp) => match self.upnp.install(internal_port, ttl).await {
+                Ok(m) => return Ok(m),
+                Err(e) => e,
+            },
+        };
+
+        // Cached protocol's install failed — the probe answered
+        // but the router refused the MAP (common on gateways
+        // whose NAT-PMP responder exists but has policy against
+        // arbitrary port mappings). Invalidate the cache and
+        // fall back to the other protocol. Cubic-flagged P1:
+        // without this retry, the sequencer was stuck on the
+        // losing protocol for the whole task lifetime and UPnP
+        // was never attempted.
+        self.set_active(None);
+        let fallback_proto = match active {
+            Some(Protocol::NatPmp) => Protocol::Upnp,
+            Some(Protocol::Upnp) => Protocol::NatPmp,
+            None => unreachable!("handled above"),
+        };
+        match fallback_proto {
+            Protocol::NatPmp => {
+                // Fall back to NAT-PMP if we have a client;
+                // otherwise surface the original error.
+                let Some(pmp) = self.nat_pmp.as_ref() else {
+                    return Err(first_err);
+                };
+                // Probe before install: `NatPmpMapper::install`
+                // reads its external IP from the cache populated
+                // by `probe()`. Without this probe, a successful
+                // fallback install on a router whose NAT-PMP path
+                // is actually serving the gateway would publish
+                // the gateway's private LAN IP as the mapping's
+                // external address — cubic-flagged P1. The main
+                // path doesn't hit this because it uses whichever
+                // protocol's own `probe()` primed the cache; the
+                // fallback is the only cross-protocol transition,
+                // so it's the one that must re-probe.
+                if pmp.probe().await.is_err() {
+                    return Err(first_err);
+                }
+                match pmp.install(internal_port, ttl).await {
+                    Ok(m) => {
+                        self.set_active(Some(Protocol::NatPmp));
+                        Ok(m)
+                    }
+                    Err(_) => Err(first_err),
+                }
+            }
+            Protocol::Upnp => match self.upnp.install(internal_port, ttl).await {
+                Ok(m) => {
+                    self.set_active(Some(Protocol::Upnp));
+                    Ok(m)
+                }
+                Err(_) => Err(first_err),
+            },
         }
     }
 
@@ -172,6 +259,7 @@ pub async fn sequential_mapper_from_os() -> Option<SequentialMapper> {
 mod tests {
     use super::*;
     use crate::adapter::net::traversal::portmap::MockPortMapperClient;
+    use std::sync::Arc;
 
     // NB: SequentialMapper composes concrete `NatPmpMapper` +
     // `UpnpMapper` clients — the trait field isn't generic. To
@@ -233,18 +321,233 @@ mod tests {
 
     // ---- mock-based state-transition tests ----
     //
-    // `SequentialMapper` holds concrete mappers, so to unit-test
-    // "active protocol is cached across calls" we can't inject
-    // a mock into it directly. The round-trip is covered by
-    // the integration tests in `tests/port_mapping_null.rs`
-    // (which drive the task via a `MockPortMapperClient`) —
-    // those verify the cached-state property at the task level
-    // rather than here. `_mock` is kept to satisfy the
-    // use-import check under `#[cfg(test)]`.
+    // `SequentialMapper` now holds trait objects (see the
+    // `Box<dyn PortMapperClient>` fields), so unit tests can
+    // inject `MockPortMapperClient` via the test-only
+    // `new_with_clients` constructor and drive specific
+    // state transitions directly.
+
+    fn sample_mapping(protocol: Protocol) -> PortMapping {
+        PortMapping {
+            external: "203.0.113.42:9001".parse().unwrap(),
+            internal_port: 9001,
+            ttl: Duration::from_secs(3600),
+            protocol,
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mock_client_surface_remains_usable() {
         let mock = MockPortMapperClient::new();
         mock.queue_probe(Ok(()));
         assert!(mock.probe().await.is_ok());
+    }
+
+    /// Regression test for a cubic-flagged P1 bug (TEST_COVERAGE_PLAN
+    /// §P1-7): `SequentialMapper` cached `active = NatPmp` on a
+    /// successful probe but left the cache in place when the
+    /// *install* on that same protocol subsequently failed.
+    /// Common case: a router's NAT-PMP responder answers
+    /// external-address queries (probe succeeds) but its policy
+    /// refuses arbitrary port MAP requests (install fails).
+    /// Pre-fix, UPnP was never attempted even though it might
+    /// have worked; the task exited on the first install error.
+    /// The fix invalidates the cache on install failure and
+    /// tries the other protocol exactly once before surfacing
+    /// the original error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_failure_on_cached_protocol_falls_back_to_other() {
+        // NAT-PMP: probe Ok, install Err (router refused MAP).
+        let pmp = MockPortMapperClient::new();
+        pmp.queue_probe(Ok(()));
+        pmp.queue_install(Err(PortMappingError::Refused("nat-pmp policy".into())));
+
+        // UPnP: install Ok with a UPnP-tagged mapping.
+        let upnp = MockPortMapperClient::new();
+        upnp.queue_install(Ok(sample_mapping(Protocol::Upnp)));
+
+        let seq = SequentialMapper::new_with_clients(Some(Box::new(pmp)), Box::new(upnp));
+
+        // Probe succeeds on NAT-PMP, cache pins to NatPmp.
+        seq.probe().await.expect("probe should succeed on NAT-PMP");
+        assert_eq!(seq.active_protocol(), Some(Protocol::NatPmp));
+
+        // Install on cached NAT-PMP fails; sequencer must fall
+        // back to UPnP and land on its mapping. The cached
+        // protocol flips to UPnP.
+        let mapping = seq
+            .install(9001, Duration::from_secs(3600))
+            .await
+            .expect("install should fall back to UPnP when NAT-PMP refuses MAP");
+        assert_eq!(
+            mapping.protocol,
+            Protocol::Upnp,
+            "mapping should be tagged UPnP after fallback",
+        );
+        assert_eq!(
+            seq.active_protocol(),
+            Some(Protocol::Upnp),
+            "cache should repoint to UPnP after successful fallback",
+        );
+    }
+
+    /// Complement: if the fallback protocol ALSO fails, the
+    /// sequencer surfaces the ORIGINAL error (from the cached
+    /// protocol), not the fallback's error. Preserves the
+    /// diagnostic signal operators actually care about — the
+    /// first protocol's "why did NAT-PMP refuse" detail is
+    /// more actionable than "UPnP SSDP discovery timed out."
+    /// Also asserts the cache is invalidated (not left
+    /// stuck on the failed protocol).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_failure_on_both_surfaces_original_error_and_clears_cache() {
+        let pmp = MockPortMapperClient::new();
+        pmp.queue_probe(Ok(()));
+        pmp.queue_install(Err(PortMappingError::Refused("nat-pmp policy".into())));
+
+        let upnp = MockPortMapperClient::new();
+        upnp.queue_install(Err(PortMappingError::Unavailable));
+
+        let seq = SequentialMapper::new_with_clients(Some(Box::new(pmp)), Box::new(upnp));
+        seq.probe().await.expect("probe");
+
+        let err = seq
+            .install(9001, Duration::from_secs(3600))
+            .await
+            .expect_err("both installs fail — result must be Err");
+        match err {
+            PortMappingError::Refused(msg) => assert!(
+                msg.contains("nat-pmp policy"),
+                "should surface the original NAT-PMP error, got {msg:?}",
+            ),
+            other => panic!("expected original Refused error; got {other:?}"),
+        }
+        assert!(
+            seq.active_protocol().is_none(),
+            "cache must be cleared when both installs fail",
+        );
+    }
+
+    /// Regression (cubic P1 follow-up): when UPnP is the cached
+    /// protocol and its install fails, the fallback to NAT-PMP
+    /// MUST call `probe()` before `install()`. Rationale: the
+    /// real `NatPmpMapper::install` reads its external IP from
+    /// a cache that only gets populated by `probe()`. If we
+    /// skip the probe, a successful install on a router whose
+    /// NAT-PMP path is up would publish the *gateway's LAN IP*
+    /// as the mapping's external address — visible on the
+    /// capability announcement to peers that then try to punch
+    /// to a private address. The fix probes first; this test
+    /// pins that ordering by queueing two successful probes on
+    /// the NAT-PMP mock and verifying the second (the fallback
+    /// one) is consumed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fallback_to_nat_pmp_probes_before_installing() {
+        let pmp = Arc::new(MockPortMapperClient::new());
+        // Probe #1: fails so the main-path probe lands on UPnP.
+        // Probe #2: succeeds — the fallback-path probe that the
+        // fix requires before install.
+        pmp.queue_probe(Err(PortMappingError::Unavailable));
+        pmp.queue_probe(Ok(()));
+        pmp.queue_install(Ok(sample_mapping(Protocol::NatPmp)));
+
+        let upnp = MockPortMapperClient::new();
+        upnp.queue_probe(Ok(()));
+        upnp.queue_install(Err(PortMappingError::Refused("upnp gateway busy".into())));
+
+        let seq = SequentialMapper::new_with_clients(Some(Box::new(pmp.clone())), Box::new(upnp));
+
+        // Main probe: NAT-PMP fails, UPnP wins.
+        seq.probe().await.expect("upnp probe should succeed");
+        assert_eq!(seq.active_protocol(), Some(Protocol::Upnp));
+
+        // Install: UPnP fails; fallback must probe NAT-PMP first,
+        // then install. Returns the NAT-PMP-tagged mapping.
+        let mapping = seq
+            .install(9001, Duration::from_secs(3600))
+            .await
+            .expect("fallback to NAT-PMP must succeed");
+        assert_eq!(mapping.protocol, Protocol::NatPmp);
+        assert_eq!(seq.active_protocol(), Some(Protocol::NatPmp));
+
+        // Probe queue on NAT-PMP must be empty — both queued
+        // probes were consumed (main-path + fallback-path). A
+        // regression that skipped the fallback probe would leave
+        // the second entry in the queue.
+        assert_eq!(
+            pmp.remaining_probes(),
+            0,
+            "fallback path must have consumed the queued NAT-PMP probe",
+        );
+    }
+
+    /// Companion: if the fallback's NAT-PMP probe fails, the
+    /// fallback must NOT call `install()` — any mapping
+    /// produced without a successful probe would carry the
+    /// gateway's LAN IP as its external address. The sequencer
+    /// surfaces the ORIGINAL UPnP error instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fallback_nat_pmp_probe_failure_surfaces_original_upnp_error() {
+        let pmp = Arc::new(MockPortMapperClient::new());
+        // Main-path probe: fails so UPnP wins.
+        pmp.queue_probe(Err(PortMappingError::Unavailable));
+        // Fallback-path probe: also fails — must short-circuit.
+        pmp.queue_probe(Err(PortMappingError::Transport("no responder".into())));
+        // Install: queued a success to prove it is NOT called.
+        // If the fix regressed and install ran, the sequencer
+        // would erroneously return Ok(sample_mapping).
+        pmp.queue_install(Ok(sample_mapping(Protocol::NatPmp)));
+
+        let upnp = MockPortMapperClient::new();
+        upnp.queue_probe(Ok(()));
+        upnp.queue_install(Err(PortMappingError::Refused("upnp gateway busy".into())));
+
+        let seq = SequentialMapper::new_with_clients(Some(Box::new(pmp.clone())), Box::new(upnp));
+        seq.probe().await.expect("upnp probe");
+
+        let err = seq
+            .install(9001, Duration::from_secs(3600))
+            .await
+            .expect_err("fallback probe failure must short-circuit");
+        match err {
+            PortMappingError::Refused(msg) => assert!(
+                msg.contains("upnp gateway busy"),
+                "must surface the original UPnP error, got {msg:?}",
+            ),
+            other => panic!("expected original UPnP Refused error, got {other:?}"),
+        }
+        // Install queue must be untouched — the fix must short-
+        // circuit BEFORE install when the probe fails.
+        assert_eq!(
+            pmp.remaining_installs(),
+            1,
+            "fallback install must NOT fire when the fallback probe fails",
+        );
+    }
+
+    /// Guardrail: if only UPnP exists (no gateway → no NAT-PMP
+    /// client) and its install fails, there's no fallback to
+    /// attempt. The sequencer surfaces UPnP's error directly
+    /// without crashing on an unreachable `nat_pmp` client.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_failure_with_no_nat_pmp_fallback_surfaces_upnp_error() {
+        let upnp = MockPortMapperClient::new();
+        upnp.queue_probe(Ok(()));
+        upnp.queue_install(Err(PortMappingError::Unavailable));
+
+        let seq = SequentialMapper::new_with_clients(None, Box::new(upnp));
+        seq.probe().await.expect("upnp probe");
+        assert_eq!(seq.active_protocol(), Some(Protocol::Upnp));
+
+        let err = seq.install(9001, Duration::from_secs(3600)).await;
+        assert!(
+            matches!(err, Err(PortMappingError::Unavailable)),
+            "UPnP-only deployment with install failure should surface \
+             Unavailable without panicking on missing NAT-PMP client; got {err:?}",
+        );
+        assert!(
+            seq.active_protocol().is_none(),
+            "cache cleared on install failure regardless of fallback availability",
+        );
     }
 }

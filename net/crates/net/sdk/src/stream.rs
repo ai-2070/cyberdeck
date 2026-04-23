@@ -156,9 +156,33 @@ impl Stream for EventStream {
                 if response.events.is_empty() {
                     // Backoff: double the interval, up to max.
                     this.current_interval = (this.current_interval * 2).min(this.opts.max_backoff);
-                    this.sleep = Some(Box::pin(tokio::time::sleep(this.current_interval)));
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+                    let mut sleep = Box::pin(tokio::time::sleep(this.current_interval));
+                    // Poll the sleep once now so the timer registers
+                    // its waker with the executor. Returning Pending
+                    // here parks the task on the timer directly,
+                    // rather than paying an extra round-trip through
+                    // the scheduler (the old code did
+                    // `cx.waker().wake_by_ref()` immediately after
+                    // creating the sleep, forcing one wasted re-poll
+                    // per idle backoff tick).
+                    //
+                    // If the sleep resolves immediately (zero / already-
+                    // elapsed duration), re-wake the task so the next
+                    // `poll_next` kicks off a fresh poll instead of
+                    // silently parking without a wake (cubic code
+                    // review P2).
+                    match sleep.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            this.sleep = Some(sleep);
+                            Poll::Pending
+                        }
+                        Poll::Ready(()) => {
+                            // Don't stash the fired sleep; let the
+                            // next poll build a fresh one.
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    }
                 } else {
                     // Reset backoff on activity.
                     this.current_interval = this.opts.poll_interval;

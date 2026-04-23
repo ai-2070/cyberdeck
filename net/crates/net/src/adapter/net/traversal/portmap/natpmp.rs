@@ -671,6 +671,56 @@ mod tests {
         assert!(decode_response(&buf).is_none());
     }
 
+    /// Regression test for TEST_COVERAGE_PLAN §P2-12: the
+    /// decoder must never panic on malformed input. A gateway
+    /// responding with a truncated / corrupted packet (stack
+    /// bug, MTU clip, malicious on-path tamper, or just cosmic
+    /// rays) must surface as a clean `None` so the caller falls
+    /// back to UPnP or propagates `Transport` cleanly. Pins that
+    /// every byte access inside `decode_response` is bounds-
+    /// checked.
+    ///
+    /// Table-driven over all lengths 0..=32 (covers both below
+    /// `EXTERNAL_RESPONSE_LEN` and above `MAP_RESPONSE_LEN`),
+    /// with three byte patterns chosen to trip different
+    /// validation branches (all-zero → wrong op, all-`0xFF` →
+    /// version + op + magic values, ascending → potentially
+    /// valid prefix with truncated tail). Each combination must
+    /// return either `Some(_)` or `None`, never panic.
+    #[test]
+    fn decode_response_never_panics_on_malformed_input() {
+        for len in 0..=32 {
+            // All zeros: version=0, op=0, which violates the
+            // "op must have high bit set" rule → None.
+            let zeros = vec![0u8; len];
+            let _ = decode_response(&zeros);
+
+            // All 0xFF: version=255 ≠ 0 → None.
+            let ones = vec![0xFFu8; len];
+            let _ = decode_response(&ones);
+
+            // Ascending bytes 0..len — has a valid version byte
+            // at [0]=0, some op at [1] that MAY or may not look
+            // like a response, and whatever the rest lands on.
+            let ascending: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let _ = decode_response(&ascending);
+
+            // Descending bytes — different magic / op layout.
+            let descending: Vec<u8> = (0..len).map(|i| (255 - i) as u8).collect();
+            let _ = decode_response(&descending);
+        }
+
+        // Explicit edge case: a response that claims to be a
+        // MAP-UDP reply (op = 0x81) but is only 12 bytes long
+        // (EXTERNAL_RESPONSE_LEN, not MAP_RESPONSE_LEN). The
+        // op-specific inner length check must reject without
+        // indexing past the buffer end.
+        let mut short_map = vec![0u8; EXTERNAL_RESPONSE_LEN];
+        short_map[0] = NATPMP_VERSION;
+        short_map[1] = OP_MAP_UDP + RESPONSE_OP_OFFSET;
+        assert!(decode_response(&short_map).is_none());
+    }
+
     // ---- live UdpSocket round-trip against a mock gateway ----
 
     /// Spawn a tokio task that binds a local UDP socket and plays

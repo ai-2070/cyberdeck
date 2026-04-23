@@ -85,10 +85,20 @@ impl Filter {
     }
 
     /// Check if an event matches this filter.
+    ///
+    /// Empty `And` children are rejected as "matches nothing" rather
+    /// than "matches everything" — `.all()` on an empty iterator
+    /// returns `true`, which would silently turn an externally-
+    /// supplied filter JSON like `{"and": []}` into a universal
+    /// pass-through. Empty `Or` naturally returns `false` via
+    /// `.any()` on an empty iterator and keeps its documented
+    /// "matches nothing" behavior.
     #[inline]
     pub fn matches(&self, event: &JsonValue) -> bool {
         match self {
-            Self::And { filters } => filters.iter().all(|f| f.matches(event)),
+            Self::And { filters } => {
+                !filters.is_empty() && filters.iter().all(|f| f.matches(event))
+            }
             Self::Or { filters } => filters.iter().any(|f| f.matches(event)),
             Self::Not { filter } => !filter.matches(event),
             Self::EqWrapped { condition } => {
@@ -194,6 +204,66 @@ mod tests {
         assert!(filter.matches(&json!({"type": "token", "value": "hello"})));
         assert!(!filter.matches(&json!({"type": "message", "value": "hello"})));
         assert!(!filter.matches(&json!({"value": "hello"}))); // Missing field
+    }
+
+    /// `Filter::from_json` is reachable from any FFI / SDK path
+    /// that accepts an externally-supplied filter. A deeply
+    /// nested adversarial input must NOT crash the consumer
+    /// thread via stack overflow. We rely on `serde_json`'s
+    /// recursion limit (default 128) to reject the JSON form;
+    /// this test pins that the limit is in force, so a future
+    /// switch to a non-recursive deserializer doesn't silently
+    /// open a DoS vector. Constructed depth (10_000) is well
+    /// past any plausible user filter and well past serde_json's
+    /// limit.
+    #[test]
+    fn from_json_rejects_adversarially_nested_filter() {
+        let depth = 10_000usize;
+        let mut json = String::with_capacity(depth * 8 + 32);
+        for _ in 0..depth {
+            json.push_str(r#"{"$not":"#);
+        }
+        json.push_str(r#"{"path":"x","value":1}"#);
+        for _ in 0..depth {
+            json.push('}');
+        }
+
+        let parsed = Filter::from_json(&json);
+        assert!(
+            parsed.is_err(),
+            "depth-{depth} filter JSON must be rejected by serde_json's recursion limit"
+        );
+    }
+
+    /// Programmatic construction bypasses `from_json` and can
+    /// nest arbitrarily — but that's a Rust-API-only path, not a
+    /// DoS surface. We verify here that `matches` handles a
+    /// modest depth (256 — the same `recursion_limit` set in
+    /// `lib.rs:55`) without overflow even on a small thread
+    /// stack. A future change that materially deepens recursion
+    /// per frame (e.g. wrapping in `Box::pin`) would surface
+    /// here.
+    #[test]
+    fn matches_handles_modest_depth_on_small_stack() {
+        const DEPTH: usize = 256;
+        // Build (depth-many) `Not` wrappers around an Eq leaf.
+        let mut f = Filter::eq("x", json!(1));
+        for _ in 0..DEPTH {
+            f = Filter::not(f);
+        }
+
+        // 256 KiB is well below typical defaults; if `matches`
+        // were to use materially more than ~1 KiB per frame this
+        // would overflow.
+        let result = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || f.matches(&json!({"x": 1})))
+            .expect("spawn small-stack thread")
+            .join()
+            .expect("matches() must not panic at depth 256 on a small stack");
+
+        // Even number of `Not` wraps → unchanged truth value.
+        assert!(result, "depth-256 nested Not over true Eq should be true");
     }
 
     #[test]
@@ -427,9 +497,17 @@ mod tests {
 
     #[test]
     fn test_empty_and_filter() {
+        // Regression (LOW, BUGS.md): empty `And` used to match
+        // everything via `.all()` on an empty iterator returning
+        // `true`. A filter JSON like `{"and": []}` reaching the
+        // matcher would silently become a universal pass-through.
+        // Now empty `And` matches nothing, consistent with the
+        // conservative "an empty filter isn't a filter" choice.
         let filter = Filter::and(vec![]);
-        // Empty AND should match everything (vacuous truth)
-        assert!(filter.matches(&json!({"any": "value"})));
+        assert!(
+            !filter.matches(&json!({"any": "value"})),
+            "empty And must not match — was silently universal-pass before"
+        );
     }
 
     #[test]

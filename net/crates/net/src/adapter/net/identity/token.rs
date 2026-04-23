@@ -28,7 +28,16 @@ impl TokenScope {
     pub const ADMIN: Self = Self { bits: 0b0100 };
     /// Can delegate this token to other entities.
     pub const DELEGATE: Self = Self { bits: 0b1000 };
-    /// Full access.
+    /// Wildcard over channels: authorizes the token's actions on *every*
+    /// channel, regardless of the token's `channel_hash` field. Must be
+    /// set explicitly by the issuer — the previous "`channel_hash == 0`
+    /// means wildcard" overload is no longer honored, so a legitimate
+    /// channel whose 16-bit xxh3 happens to hash to 0 cannot
+    /// accidentally be authorized as a universal grant.
+    pub const WILDCARD: Self = Self { bits: 0b1_0000 };
+    /// Full access (all actions on a single channel). Does NOT include
+    /// [`Self::WILDCARD`] — callers that want cross-channel access
+    /// must opt in explicitly.
     pub const ALL: Self = Self { bits: 0b1111 };
 
     /// Create a scope from raw bits.
@@ -215,12 +224,28 @@ impl PermissionToken {
     }
 
     /// Check if this token authorizes a specific action on a channel.
+    ///
+    /// Returns `true` iff the token's `scope` contains the requested
+    /// `action` AND either:
+    ///
+    /// - the token has the [`TokenScope::WILDCARD`] bit set (authorized
+    ///   on every channel regardless of `channel_hash`), OR
+    /// - the token's `channel_hash` matches the supplied `channel`.
+    ///
+    /// The previous convention — `channel_hash == 0` meaning "wildcard,
+    /// all channels" — is no longer honored. A legitimate channel
+    /// whose 16-bit xxh3 hashes to 0 (1 in 65 536) would otherwise
+    /// accidentally turn a narrowly-scoped token into a universal
+    /// grant, which an attacker able to register channel names could
+    /// brute-force since xxh3 is non-cryptographic.
     pub fn authorizes(&self, action: TokenScope, channel: u16) -> bool {
         if !self.scope.contains(action) {
             return false;
         }
-        // channel_hash 0 = wildcard (all channels)
-        self.channel_hash == 0 || self.channel_hash == channel
+        if self.scope.contains(TokenScope::WILDCARD) {
+            return true;
+        }
+        self.channel_hash == channel
     }
 
     /// Delegate this token to another entity with restricted scope.
@@ -408,8 +433,19 @@ impl TokenCache {
     /// Insert a token without verification (for trusted internal use).
     ///
     /// Only use this when the token is known to be valid (e.g., just issued locally).
+    ///
+    /// WILDCARD-scoped tokens are always stored under the dedicated
+    /// wildcard slot (`channel_hash = 0`) regardless of the token's
+    /// own `channel_hash` field — that slot is where `check()` looks
+    /// for a cross-channel fallback. Non-wildcard tokens live in
+    /// their exact `channel_hash` slot.
     pub fn insert_unchecked(&self, token: PermissionToken) {
-        let key = (*token.subject.as_bytes(), token.channel_hash);
+        let slot_channel = if token.scope.contains(TokenScope::WILDCARD) {
+            0
+        } else {
+            token.channel_hash
+        };
+        let key = (*token.subject.as_bytes(), slot_channel);
         let mut entry = self.tokens.entry(key).or_default();
         // Replace any existing token with exactly the same scope;
         // otherwise push so distinct-scope tokens coexist.
@@ -582,8 +618,10 @@ mod tests {
         let token = PermissionToken::issue(
             &issuer,
             subject.entity_id().clone(),
-            TokenScope::PUBLISH.union(TokenScope::SUBSCRIBE),
-            0, // all channels
+            TokenScope::PUBLISH
+                .union(TokenScope::SUBSCRIBE)
+                .union(TokenScope::WILDCARD),
+            0, // channel_hash ignored for WILDCARD tokens
             3600,
             0,
         );
@@ -777,11 +815,14 @@ mod tests {
         let issuer = EntityKeypair::generate();
         let subject = EntityKeypair::generate();
 
+        // Wildcard tokens must explicitly opt in via the WILDCARD
+        // scope bit — the old "channel_hash == 0 implies wildcard"
+        // overload no longer applies.
         let token = PermissionToken::issue(
             &issuer,
             subject.entity_id().clone(),
-            TokenScope::PUBLISH,
-            0, // all channels
+            TokenScope::PUBLISH.union(TokenScope::WILDCARD),
+            0,
             3600,
             0,
         );
@@ -789,6 +830,39 @@ mod tests {
         assert!(token.authorizes(TokenScope::PUBLISH, 0xABCD));
         assert!(token.authorizes(TokenScope::PUBLISH, 0x1234));
         assert!(token.authorizes(TokenScope::PUBLISH, 0));
+    }
+
+    #[test]
+    fn test_regression_channel_hash_zero_is_not_wildcard() {
+        // Regression (MEDIUM, BUGS.md): a token with `channel_hash = 0`
+        // but no WILDCARD scope bit must NOT authorize arbitrary
+        // channels. A legitimate channel whose 16-bit xxh3 happens
+        // to hash to 0 (1 in 65 536) would otherwise turn a narrowly-
+        // scoped token into a universal grant — and since xxh3 is
+        // non-cryptographic, an attacker able to register names
+        // could brute-force such a collision.
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+
+        let token = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH, // no WILDCARD
+            0,                   // channel_hash 0 — pretend some channel hashed here
+            3600,
+            0,
+        );
+
+        // Token authorizes channel 0 only (exact match), not other channels.
+        assert!(token.authorizes(TokenScope::PUBLISH, 0));
+        assert!(
+            !token.authorizes(TokenScope::PUBLISH, 0xABCD),
+            "channel_hash=0 without WILDCARD must not grant access to arbitrary channels"
+        );
+        assert!(
+            !token.authorizes(TokenScope::PUBLISH, 0x1234),
+            "channel_hash=0 without WILDCARD must not grant access to arbitrary channels"
+        );
     }
 
     #[test]
@@ -938,11 +1012,11 @@ mod tests {
 
         let cache = TokenCache::new();
 
-        // Wildcard token (channel_hash = 0)
+        // Wildcard token: explicit WILDCARD scope bit.
         let token = PermissionToken::issue(
             &issuer,
             subject.entity_id().clone(),
-            TokenScope::PUBLISH,
+            TokenScope::PUBLISH.union(TokenScope::WILDCARD),
             0,
             3600,
             0,
@@ -985,12 +1059,12 @@ mod tests {
         expired_token.signature = issuer.sign(&payload).to_bytes();
         cache.insert_unchecked(expired_token);
 
-        // Insert a valid wildcard token
+        // Insert a valid wildcard token (explicit WILDCARD scope bit).
         let wildcard_token = PermissionToken::issue(
             &issuer,
             subject.entity_id().clone(),
-            TokenScope::PUBLISH,
-            0, // wildcard
+            TokenScope::PUBLISH.union(TokenScope::WILDCARD),
+            0,
             3600,
             0,
         );
@@ -1307,5 +1381,195 @@ mod tests {
         // read, so it's ≥ parent.not_before — which is correct.
         assert!(child.not_before >= parent.not_before);
         assert!(child.verify().is_ok());
+    }
+
+    // ========================================================================
+    // TEST_COVERAGE_PLAN §P2-9 — TokenCache concurrency safety.
+    //
+    // The cache is a DashMap, so entry-level writes are atomic,
+    // but the mesh-side usage pattern runs insert / check /
+    // evict_expired on the same entry from three different
+    // tokio tasks under load. These tests pin: no panic, no
+    // torn reads, terminal state coherent.
+    // ========================================================================
+
+    /// Concurrent `insert_unchecked` (authorize) + `check`
+    /// (authorize-gate) + `evict_expired` (sweep) on the same
+    /// subject+channel must not panic or produce an inconsistent
+    /// terminal state. The observer thread's `check` must always
+    /// return a deterministic `Ok(())` or `Err(NotAuthorized)`
+    /// — never a corrupted DashMap state (which would manifest
+    /// as a panic inside `iter().any(...)`).
+    #[test]
+    fn concurrent_insert_check_evict_is_panic_free() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let cache = Arc::new(TokenCache::new());
+        let issuer = EntityKeypair::generate();
+        let subject_kp = EntityKeypair::generate();
+        let subject_id = subject_kp.entity_id().clone();
+        let channel_hash = 0xABCDu16;
+        let iters = 500u32;
+        // Start barrier — without it thread scheduling can let
+        // the evictor run its whole loop before the inserter
+        // even starts, trivializing the race.
+        let start = Arc::new(Barrier::new(3));
+
+        // Inserter: re-issue + replace the token on each
+        // iteration. Each insert overwrites the previous entry
+        // (same scope → `insert_unchecked`'s `iter_mut().find`
+        // path replaces rather than pushes).
+        let inserter = {
+            let cache = cache.clone();
+            let issuer = issuer.clone();
+            let subject_id = subject_id.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..iters {
+                    let token = PermissionToken::issue(
+                        &issuer,
+                        subject_id.clone(),
+                        TokenScope::SUBSCRIBE,
+                        channel_hash,
+                        300,
+                        0,
+                    );
+                    cache.insert_unchecked(token);
+                }
+            })
+        };
+
+        // Checker: gate queries fire on the hot path. Must not
+        // panic, must return a deterministic Result.
+        let checker = {
+            let cache = cache.clone();
+            let subject_id = subject_id.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..iters {
+                    let _ = cache.check(&subject_id, TokenScope::SUBSCRIBE, channel_hash);
+                }
+            })
+        };
+
+        // Evictor: periodic sweep. `evict_expired` walks every
+        // slot and retains only not-yet-expired tokens; with
+        // 300 s TTLs and a sub-second test, no tokens expire so
+        // no entries should actually be removed, but the retain
+        // closure must run safely against the writer.
+        let evictor = {
+            let cache = cache.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..iters {
+                    cache.evict_expired();
+                }
+            })
+        };
+
+        inserter.join().expect("inserter panicked");
+        checker.join().expect("checker panicked");
+        evictor.join().expect("evictor panicked");
+
+        // Terminal state: exactly one token present for this
+        // (subject, channel_hash, SUBSCRIBE) slot. The inserter
+        // replaced on every iteration — the final token must
+        // be valid, and `check` must return Ok(()) against it.
+        assert!(
+            cache
+                .check(&subject_id, TokenScope::SUBSCRIBE, channel_hash)
+                .is_ok(),
+            "terminal check must succeed — the last insert's token is unexpired",
+        );
+        assert_eq!(
+            cache.len(),
+            1,
+            "exactly one token should remain (same-scope replace path); got {}",
+            cache.len(),
+        );
+    }
+
+    /// A token that expires mid-test must be dropped by a
+    /// concurrent `evict_expired`. The checker's `check` must
+    /// return `Ok(())` while the token is still valid and
+    /// consistently `Err(NotAuthorized)` after eviction, never
+    /// a panic from a retain that ran mid-iter.
+    #[test]
+    fn evict_expired_races_with_check_without_panic() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use std::time::Duration;
+
+        let cache = Arc::new(TokenCache::new());
+        let issuer = EntityKeypair::generate();
+        let subject_kp = EntityKeypair::generate();
+        let subject_id = subject_kp.entity_id().clone();
+        let channel_hash = 0xBEEFu16;
+
+        // Short-lived token: 1 s TTL. Insert it then let it
+        // expire naturally during the race.
+        let token = PermissionToken::issue(
+            &issuer,
+            subject_id.clone(),
+            TokenScope::PUBLISH,
+            channel_hash,
+            1, // 1-second TTL
+            0,
+        );
+        cache.insert_unchecked(token);
+        assert!(
+            cache
+                .check(&subject_id, TokenScope::PUBLISH, channel_hash)
+                .is_ok(),
+            "pre-expiry check should succeed",
+        );
+
+        let start = Arc::new(Barrier::new(2));
+        let checker = {
+            let cache = cache.clone();
+            let subject_id = subject_id.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..2_000 {
+                    // Outcome may transition from Ok → Err
+                    // exactly once during this loop as the TTL
+                    // elapses. Either result is valid; panic
+                    // is not.
+                    let _ = cache.check(&subject_id, TokenScope::PUBLISH, channel_hash);
+                }
+            })
+        };
+        let evictor = {
+            let cache = cache.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..2_000 {
+                    cache.evict_expired();
+                }
+            })
+        };
+
+        // Wait for TTL to elapse. `current_timestamp` is
+        // second-resolution, so 1.5 s of wall clock guarantees
+        // `not_after` < `now`.
+        thread::sleep(Duration::from_millis(1_500));
+
+        checker.join().expect("checker panicked");
+        evictor.join().expect("evictor panicked");
+
+        // Terminal: a fresh evict + check — the token's TTL
+        // has expired and the evictor swept at least once since,
+        // so check must return NotAuthorized.
+        cache.evict_expired();
+        match cache.check(&subject_id, TokenScope::PUBLISH, channel_hash) {
+            Err(TokenError::NotAuthorized) => {}
+            other => panic!("expected NotAuthorized after TTL + evict; got {other:?}"),
+        }
     }
 }

@@ -54,8 +54,13 @@ pub struct EventBus {
     adapter: Arc<dyn Adapter>,
     /// Poll merger for cross-shard consumption.
     poll_merger: arc_swap::ArcSwap<PollMerger>,
-    /// Batch worker handles, keyed by shard ID for per-shard cleanup.
-    batch_workers: parking_lot::Mutex<std::collections::HashMap<u16, Vec<JoinHandle<()>>>>,
+    /// Per-shard worker handles. Stored separately so shutdown can
+    /// await drain workers *before* batch workers — the drain
+    /// worker's final sweep races the batch worker's exit
+    /// otherwise, and any events the drain worker pushes to the
+    /// channel after the batch worker has stopped reading are
+    /// silently lost.
+    batch_workers: parking_lot::Mutex<std::collections::HashMap<u16, ShardWorkers>>,
     /// Channels for sending batches to workers (shard_id -> sender).
     batch_senders: parking_lot::RwLock<
         std::collections::HashMap<u16, mpsc::Sender<Vec<crate::event::InternalEvent>>>,
@@ -68,6 +73,15 @@ pub struct EventBus {
     stats: EventBusStats,
     /// Scaling monitor task handle.
     scaling_monitor: parking_lot::Mutex<Option<JoinHandle<()>>>,
+}
+
+/// Worker handles for a single shard. The drain worker pumps
+/// events from the ring buffer into an mpsc channel; the batch
+/// worker reads from that channel and dispatches to the adapter.
+/// Shutdown ordering is load-bearing — see `EventBus::shutdown`.
+struct ShardWorkers {
+    batch: JoinHandle<()>,
+    drain: JoinHandle<()>,
 }
 
 /// Event bus statistics.
@@ -84,12 +98,8 @@ pub struct EventBusStats {
 impl EventBus {
     /// Create a new event bus with the given configuration.
     pub async fn new(config: EventBusConfig) -> Result<Self, AdapterError> {
-        config
-            .validate()
-            .map_err(|e| AdapterError::Fatal(e.to_string()))?;
-
-        // Create adapter
-        let mut adapter: Box<dyn Adapter> = match &config.adapter {
+        // Create adapter from config
+        let adapter: Box<dyn Adapter> = match &config.adapter {
             AdapterConfig::Noop => Box::new(NoopAdapter::new()),
             #[cfg(feature = "redis")]
             AdapterConfig::Redis(redis_config) => {
@@ -102,6 +112,24 @@ impl EventBus {
             #[cfg(feature = "net")]
             AdapterConfig::Net(net_config) => Box::new(NetAdapter::new((**net_config).clone())?),
         };
+
+        Self::new_with_adapter(config, adapter).await
+    }
+
+    /// Create a new event bus with a caller-supplied adapter.
+    ///
+    /// `config.adapter` is ignored — the supplied `adapter` is used
+    /// instead. Useful for tests that need to observe or inject
+    /// behavior at the adapter boundary (e.g. a counting adapter
+    /// for end-to-end delivery assertions, a flaky adapter for
+    /// retry-path coverage).
+    pub async fn new_with_adapter(
+        config: EventBusConfig,
+        mut adapter: Box<dyn Adapter>,
+    ) -> Result<Self, AdapterError> {
+        config
+            .validate()
+            .map_err(|e| AdapterError::Fatal(e.to_string()))?;
 
         // Initialize adapter (with timeout to prevent hanging on unreachable backends)
         tokio::time::timeout(config.adapter_timeout, adapter.init())
@@ -136,7 +164,7 @@ impl EventBus {
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // Create batch workers for each shard
-        let mut batch_workers: std::collections::HashMap<u16, Vec<JoinHandle<()>>> =
+        let mut batch_workers: std::collections::HashMap<u16, ShardWorkers> =
             std::collections::HashMap::with_capacity(config.num_shards as usize);
         let mut batch_senders =
             std::collections::HashMap::with_capacity(config.num_shards as usize);
@@ -144,26 +172,25 @@ impl EventBus {
         for shard_id in 0..config.num_shards {
             let (tx, rx) = mpsc::channel::<Vec<crate::event::InternalEvent>>(1024);
 
-            let worker = spawn_batch_worker(BatchWorkerParams {
+            let batch = spawn_batch_worker(BatchWorkerParams {
                 shard_id,
                 rx,
                 adapter: adapter.clone(),
                 shard_manager: shard_manager.clone(),
                 config: config.batch.clone(),
-                shutdown: shutdown.clone(),
                 adapter_timeout: config.adapter_timeout,
                 batch_retries: config.adapter_batch_retries,
             });
 
-            batch_workers.entry(shard_id).or_default().push(worker);
-            batch_senders.insert(shard_id, tx);
-        }
+            let drain = spawn_drain_worker_for_shard(
+                shard_id,
+                shard_manager.clone(),
+                tx.clone(),
+                shutdown.clone(),
+            );
 
-        // Spawn drain workers that pull from ring buffers
-        for (shard_id, handle) in
-            spawn_drain_workers(shard_manager.clone(), &batch_senders, shutdown.clone())
-        {
-            batch_workers.entry(shard_id).or_default().push(handle);
+            batch_workers.insert(shard_id, ShardWorkers { batch, drain });
+            batch_senders.insert(shard_id, tx);
         }
 
         let bus = Self {
@@ -276,13 +303,12 @@ impl EventBus {
         // Create batch worker for the new shard
         let (tx, rx) = mpsc::channel::<Vec<crate::event::InternalEvent>>(1024);
 
-        let worker = spawn_batch_worker(BatchWorkerParams {
+        let batch = spawn_batch_worker(BatchWorkerParams {
             shard_id: new_id,
             rx,
             adapter: self.adapter.clone(),
             shard_manager: self.shard_manager.clone(),
             config: self.config.batch.clone(),
-            shutdown: self.shutdown.clone(),
             adapter_timeout: self.config.adapter_timeout,
             batch_retries: self.config.adapter_batch_retries,
         });
@@ -291,7 +317,7 @@ impl EventBus {
         self.batch_senders.write().insert(new_id, tx.clone());
 
         // Spawn drain worker for the new shard
-        let drain_worker = spawn_drain_worker_for_shard(
+        let drain = spawn_drain_worker_for_shard(
             new_id,
             self.shard_manager.clone(),
             tx,
@@ -299,12 +325,9 @@ impl EventBus {
         );
 
         // Add workers
-        {
-            let mut workers = self.batch_workers.lock();
-            let handles = workers.entry(new_id).or_default();
-            handles.push(worker);
-            handles.push(drain_worker);
-        }
+        self.batch_workers
+            .lock()
+            .insert(new_id, ShardWorkers { batch, drain });
 
         // Update poll merger
         self.poll_merger.store(Arc::new(PollMerger::new(
@@ -511,22 +534,58 @@ impl EventBus {
     }
 
     /// Gracefully shut down the event bus.
+    ///
+    /// The shutdown order is load-bearing:
+    ///
+    ///   1. Signal `shutdown` so drain workers stop pulling from
+    ///      ring buffers after their final sweep.
+    ///   2. Await **drain workers** so every event the producer
+    ///      has handed to the bus is now in the per-shard mpsc
+    ///      channel.
+    ///   3. Drop `batch_senders` so each channel's last sender is
+    ///      gone — the next `recv().await` in a batch worker will
+    ///      return `None`.
+    ///   4. Await **batch workers**, which drain everything
+    ///      remaining in their channel and exit on `recv() = None`.
+    ///
+    /// Reversing steps 2 and 4 (the previous design) silently
+    /// dropped events: a batch worker that exited on the shutdown
+    /// flag could leave events the drain worker pushed *after* its
+    /// `try_recv` sweep stranded in the channel.
     pub async fn shutdown(self) -> Result<(), AdapterError> {
-        // Signal shutdown
+        // 1. Signal shutdown.
         self.shutdown.store(true, AtomicOrdering::Release);
 
-        // Take handles without holding lock across await
+        // Stop the scaling monitor first — it's independent of the
+        // ingestion path and just needs to observe the flag.
         let scaling_handle = self.scaling_monitor.lock().take();
         if let Some(handle) = scaling_handle {
             let _ = handle.await;
         }
 
-        // Take workers without holding lock across await
+        // Take workers without holding the lock across await.
         let workers = std::mem::take(&mut *self.batch_workers.lock());
-        for (_shard_id, handles) in workers {
-            for handle in handles {
-                let _ = handle.await;
-            }
+
+        // 2. Await drain workers. Each one pops a final batch (up
+        //    to 10k events) from its ring buffer, sends it on the
+        //    channel, and exits. After this loop, every event in
+        //    the ring buffers has been pushed to its channel.
+        let mut batch_handles = Vec::with_capacity(workers.len());
+        for (_shard_id, ShardWorkers { batch, drain }) in workers {
+            let _ = drain.await;
+            batch_handles.push(batch);
+        }
+
+        // 3. Drop the original senders so the channels close once
+        //    drain-worker sender clones (already dropped above)
+        //    are gone too. Without this, batch workers would block
+        //    on `recv().await` forever.
+        drop(std::mem::take(&mut *self.batch_senders.write()));
+
+        // 4. Await batch workers. They drain their channel until
+        //    `recv() = None`, flush, and exit.
+        for handle in batch_handles {
+            let _ = handle.await;
         }
 
         // Flush and shutdown adapter (with timeout to prevent hanging)
@@ -626,7 +685,6 @@ struct BatchWorkerParams {
     adapter: Arc<dyn Adapter>,
     shard_manager: Arc<ShardManager>,
     config: BatchConfig,
-    shutdown: Arc<AtomicBool>,
     adapter_timeout: Duration,
     batch_retries: u32,
 }
@@ -638,7 +696,6 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
         adapter,
         shard_manager,
         config,
-        shutdown,
         adapter_timeout,
         batch_retries,
     } = params;
@@ -646,29 +703,12 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
         let mut worker = BatchWorker::new(shard_id, config.clone());
 
         loop {
-            // Check shutdown
-            if shutdown.load(AtomicOrdering::Acquire) {
-                // Drain any remaining events from the channel that the
-                // drain worker may have sent after we last checked.
-                // Without this, final events sent by the drain worker
-                // during its shutdown sweep could sit in the channel
-                // buffer and be silently dropped.
-                while let Ok(events) = rx.try_recv() {
-                    if let Some(batch) = worker.add_events(events) {
-                        dispatch_batch(&*adapter, batch, shard_id, adapter_timeout, 0).await;
-                    }
-                }
-                // Flush remaining events (best-effort, no retries)
-                if worker.has_pending() {
-                    let batch = worker.flush();
-                    if !batch.is_empty() {
-                        dispatch_batch(&*adapter, batch, shard_id, adapter_timeout, 0).await;
-                    }
-                }
-                break;
-            }
-
-            // Wait for events with timeout
+            // Wait for events with timeout. The batch worker exits
+            // only when its channel is closed — i.e. after every
+            // upstream sender (the drain worker for this shard +
+            // `EventBus::batch_senders`) has been dropped.
+            // `EventBus::shutdown` enforces that ordering so no
+            // event is left stranded in the channel.
             let recv_timeout = worker.time_until_timeout().unwrap_or(config.max_delay);
 
             match tokio::time::timeout(recv_timeout, rx.recv()).await {
@@ -690,7 +730,20 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                     }
                 }
                 Ok(None) => {
-                    // Channel closed
+                    // Channel closed — drain any pending and exit.
+                    if worker.has_pending() {
+                        let batch = worker.flush();
+                        if !batch.is_empty() {
+                            dispatch_batch(
+                                &*adapter,
+                                batch,
+                                shard_id,
+                                adapter_timeout,
+                                batch_retries,
+                            )
+                            .await;
+                        }
+                    }
                     break;
                 }
                 Err(_) => {
@@ -716,30 +769,6 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
     })
 }
 
-/// Spawn drain workers that pull from ring buffers.
-/// Returns `(shard_id, handle)` pairs for per-shard tracking.
-fn spawn_drain_workers(
-    shard_manager: Arc<ShardManager>,
-    senders: &std::collections::HashMap<u16, mpsc::Sender<Vec<crate::event::InternalEvent>>>,
-    shutdown: Arc<AtomicBool>,
-) -> Vec<(u16, JoinHandle<()>)> {
-    let mut handles = Vec::with_capacity(shard_manager.num_shards() as usize);
-
-    for shard_id in 0..shard_manager.num_shards() {
-        let sender = match senders.get(&shard_id) {
-            Some(s) => s.clone(),
-            None => continue,
-        };
-
-        let handle =
-            spawn_drain_worker_for_shard(shard_id, shard_manager.clone(), sender, shutdown.clone());
-
-        handles.push((shard_id, handle));
-    }
-
-    handles
-}
-
 /// Spawn a drain worker for a single shard.
 fn spawn_drain_worker_for_shard(
     shard_id: u16,
@@ -750,12 +779,21 @@ fn spawn_drain_worker_for_shard(
     tokio::spawn(async move {
         loop {
             if shutdown.load(AtomicOrdering::Acquire) {
-                // Final drain
-                let events = shard_manager
-                    .with_shard(shard_id, |shard| shard.pop_batch(10_000))
-                    .unwrap_or_default();
-                if !events.is_empty() {
-                    let _ = sender.send(events).await;
+                // Final drain: loop until the ring buffer is empty.
+                // A single 10k batch is not enough — the ring
+                // buffer can hold up to `ring_buffer_capacity`
+                // events (default 1M) and any leftover would be
+                // silently lost on shutdown.
+                loop {
+                    let events = shard_manager
+                        .with_shard(shard_id, |shard| shard.pop_batch(10_000))
+                        .unwrap_or_default();
+                    if events.is_empty() {
+                        break;
+                    }
+                    if sender.send(events).await.is_err() {
+                        break;
+                    }
                 }
                 break;
             }

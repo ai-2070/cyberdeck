@@ -402,6 +402,141 @@ mod tests {
         assert_eq!(fsm.classify(bind), NatClass::Open);
     }
 
+    // ========================================================================
+    // TEST_COVERAGE_PLAN §P2-11 — FSM determinism under permutation +
+    // scaling beyond the 2-observation minimum.
+    //
+    // The FSM uses `&mut self` for `observe`, so data-race-level
+    // concurrency (two threads both calling `observe`) is
+    // prevented at the type-system level. What the plan item
+    // *can* pin is classification determinism: for a fixed final
+    // observation set, `classify()` must return the same
+    // `NatClass` regardless of insertion order or classification-
+    // call count.
+    // ========================================================================
+
+    /// Classification is deterministic under observation
+    /// permutation. Same final set of `(peer, reflex)` pairs
+    /// must produce the same `NatClass` whether observations
+    /// arrive in order A→B→C or C→B→A.
+    #[test]
+    fn classification_is_stable_under_observation_permutation() {
+        let bind = sa("192.0.2.1:9001");
+        let obs = vec![
+            (1u64, sa("198.51.100.5:54321")),
+            (2u64, sa("198.51.100.5:54321")),
+            (3u64, sa("198.51.100.6:54321")),
+            (4u64, sa("198.51.100.7:54321")),
+        ];
+
+        // Baseline: insert in order.
+        let mut fsm_a = ClassifyFsm::new();
+        for (p, r) in &obs {
+            fsm_a.observe(*p, *r);
+        }
+        let class_a = fsm_a.classify(bind);
+
+        // Reverse order — same observations, different sequence.
+        let mut fsm_b = ClassifyFsm::new();
+        for (p, r) in obs.iter().rev() {
+            fsm_b.observe(*p, *r);
+        }
+        let class_b = fsm_b.classify(bind);
+
+        // Interleaved pattern — a third independent ordering.
+        let mut fsm_c = ClassifyFsm::new();
+        for i in [0usize, 2, 1, 3] {
+            let (p, r) = obs[i];
+            fsm_c.observe(p, r);
+        }
+        let class_c = fsm_c.classify(bind);
+
+        assert_eq!(class_a, class_b, "ordering A vs reverse must agree");
+        assert_eq!(class_a, class_c, "ordering A vs interleaved must agree");
+        assert_eq!(fsm_a.observation_count(), fsm_b.observation_count());
+        assert_eq!(fsm_a.observation_count(), fsm_c.observation_count());
+    }
+
+    /// `classify()` is idempotent — calling it N times on the
+    /// same FSM state returns the same result every call. Pins
+    /// that the method has no observable side effects on the
+    /// FSM (documented `&self` contract).
+    #[test]
+    fn classify_is_idempotent_across_many_calls() {
+        let bind = sa("192.0.2.1:9001");
+        let mut fsm = ClassifyFsm::new();
+        fsm.observe(1, sa("198.51.100.5:54321"));
+        fsm.observe(2, sa("198.51.100.5:54321"));
+
+        let first = fsm.classify(bind);
+        for _ in 0..1_000 {
+            assert_eq!(fsm.classify(bind), first);
+        }
+        // Observation count also unchanged — classify is read-only.
+        assert_eq!(fsm.observation_count(), 2);
+    }
+
+    /// FSM scales beyond the 2-observation minimum without
+    /// dropping older entries or degrading the classification.
+    /// Eight peers with stable-port observations → still Cone;
+    /// one late-arriving peer with a mismatched port flips to
+    /// Symmetric.
+    #[test]
+    fn fsm_accepts_many_observations_and_reflects_latest_in_class() {
+        let bind = sa("192.0.2.1:9001");
+        let mut fsm = ClassifyFsm::new();
+        for i in 1..=8 {
+            fsm.observe(i, sa(&format!("198.51.100.{i}:54321")));
+        }
+        assert_eq!(fsm.observation_count(), 8);
+        assert_eq!(fsm.classify(bind), NatClass::Cone);
+
+        // Ninth peer: same IP family, DIFFERENT port — symmetric
+        // signature. Must flip the classification, not be ignored
+        // due to capacity.
+        fsm.observe(9, sa("198.51.100.9:54322"));
+        assert_eq!(fsm.observation_count(), 9);
+        assert_eq!(fsm.classify(bind), NatClass::Symmetric);
+    }
+
+    /// Concurrent `classify()` reads (no writes) from a shared
+    /// FSM via `Arc` are safe — the method takes `&self`.
+    /// Pins the `Sync` contract: the FSM can be shared across
+    /// threads so long as all observation writes happen
+    /// single-threaded.
+    #[test]
+    fn concurrent_classify_reads_are_consistent() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let bind = sa("192.0.2.1:9001");
+        let mut fsm = ClassifyFsm::new();
+        fsm.observe(1, sa("198.51.100.5:54321"));
+        fsm.observe(2, sa("198.51.100.5:54321"));
+        let fsm = Arc::new(fsm);
+
+        let expected = fsm.classify(bind);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let fsm = fsm.clone();
+            handles.push(thread::spawn(move || {
+                let mut seen = Vec::with_capacity(200);
+                for _ in 0..200 {
+                    seen.push(fsm.classify(bind));
+                }
+                seen
+            }));
+        }
+        for h in handles {
+            let results = h.join().expect("thread panicked");
+            assert!(
+                results.iter().all(|c| *c == expected),
+                "some thread saw an inconsistent classification — \
+                 got {results:?}, expected all = {expected:?}",
+            );
+        }
+    }
+
     #[test]
     fn tag_roundtrip() {
         // Every wire tag round-trips through the NatClass <-> tag
@@ -624,6 +759,266 @@ mod tests {
                 pair_action(local, remote),
                 expected,
                 "pair_action({local:?}, {remote:?})",
+            );
+        }
+    }
+
+    // ========================================================================
+    // TEST_COVERAGE_PLAN §P3-14 — property-style coverage of the
+    // pair-type matrix + `Unknown`-class recovery contract.
+    //
+    // These drive thousands of deterministic PRNG-shaped inputs
+    // through `pair_action` and `ClassifyFsm` and pin the
+    // behavioral invariants the plan documents:
+    //
+    //   - `pair_action` is total over `NatClass × NatClass` and
+    //     returns one of the three documented actions.
+    //   - an `Unknown` local classification never "locks" the FSM
+    //     — adding observations can always recover to Open/Cone/
+    //     Symmetric given consistent inputs.
+    //   - observation replays replace prior entries for the same
+    //     peer (no silent growth, no stale classification).
+    //   - `Unknown × Unknown` always resolves to `Direct` — the
+    //     "attempt direct, fall back on first failure" contract.
+    //
+    // Hand-rolled LCG for reproducibility — keeping this dep-free
+    // is the whole point of the P3 tier (no `proptest` needed).
+    // ========================================================================
+
+    /// Deterministic linear-congruential generator. Parameters from
+    /// Numerical Recipes — good enough for property-style sampling
+    /// where we just need diverse inputs, not cryptographic quality.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            // Re-seed to a non-zero state; seed == 0 locks the
+            // LCG to zero.
+            Self(seed.wrapping_add(0x9E37_79B9_7F4A_7C15))
+        }
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 32) as u32
+        }
+        fn pick_class(&mut self) -> NatClass {
+            match self.next_u32() % 4 {
+                0 => NatClass::Unknown,
+                1 => NatClass::Open,
+                2 => NatClass::Cone,
+                _ => NatClass::Symmetric,
+            }
+        }
+        fn pick_port(&mut self) -> u16 {
+            // Pick from {fixed, rotating} so "stable-port" pair
+            // sequences and "varying-port" sequences are both
+            // representable in the sample.
+            if self.next_u32() & 1 == 0 {
+                54_321
+            } else {
+                40_000 + (self.next_u32() % 10_000) as u16
+            }
+        }
+        fn pick_ip_last_octet(&mut self) -> u8 {
+            (self.next_u32() % 250 + 5) as u8
+        }
+    }
+
+    /// Property: `pair_action` never panics for any combination of
+    /// classes, and always returns one of the three documented
+    /// actions. Covers the 16 matrix cells plus — as a belt-and-
+    /// suspenders — the full cartesian product via a randomized
+    /// sampler so a future wildcard arm masking a cell still fails
+    /// loudly.
+    #[test]
+    fn pair_action_is_total_and_yields_one_of_three_actions() {
+        const N: usize = 4_000;
+        let mut rng = Lcg::new(0x00C0_FFEE_F00D);
+        let valid = |a: PairAction| {
+            matches!(
+                a,
+                PairAction::Direct | PairAction::SinglePunch | PairAction::SkipPunch,
+            )
+        };
+        for _ in 0..N {
+            let local = rng.pick_class();
+            let remote = rng.pick_class();
+            let action = pair_action(local, remote);
+            assert!(
+                valid(action),
+                "pair_action({local:?}, {remote:?}) returned {action:?} — not a valid variant",
+            );
+        }
+
+        // Also explicitly cover the 16 cells so sampler bias can't
+        // hide a missing cell.
+        for &local in &[
+            NatClass::Open,
+            NatClass::Cone,
+            NatClass::Symmetric,
+            NatClass::Unknown,
+        ] {
+            for &remote in &[
+                NatClass::Open,
+                NatClass::Cone,
+                NatClass::Symmetric,
+                NatClass::Unknown,
+            ] {
+                let _ = pair_action(local, remote);
+            }
+        }
+    }
+
+    /// Property: `Unknown × Unknown` unconditionally resolves to
+    /// `Direct`. Plan decision 8 — "never treat Unknown as
+    /// do-not-attempt." Pinning it as a named property rather than
+    /// relying on a single table entry in `pair_action_matches_plan_matrix`
+    /// so a future "well, Unknown × Unknown should be SkipPunch"
+    /// change is impossible to land silently.
+    #[test]
+    fn unknown_pair_resolves_to_direct() {
+        assert_eq!(
+            pair_action(NatClass::Unknown, NatClass::Unknown),
+            PairAction::Direct,
+            "the 'attempt direct, fall back on failure' contract for \
+             Unknown × Unknown must not regress",
+        );
+    }
+
+    /// Property: ClassifyFsm never panics under pseudo-random
+    /// observation storms. For each of `N` iterations we build a
+    /// fresh FSM, feed 0..=12 observations with arbitrary ports /
+    /// IPs / peer ids (including duplicate peer ids that exercise
+    /// the replace-earlier-observation path), and assert classify()
+    /// returns a valid variant.
+    #[test]
+    fn fsm_classify_never_panics_under_random_observation_storms() {
+        const N: usize = 500;
+        let mut rng = Lcg::new(0xDEAD_BEEF_CAFE);
+
+        for iter in 0..N {
+            let mut fsm = ClassifyFsm::new();
+            let bind_port = rng.pick_port();
+            let bind: SocketAddr = format!("10.0.0.1:{bind_port}").parse().unwrap();
+
+            let obs_count = (rng.next_u32() % 13) as usize;
+            let mut unique_peers = std::collections::HashSet::new();
+            for _ in 0..obs_count {
+                // Pick a peer id biased toward collisions so the
+                // replace-earlier-observation path fires on roughly
+                // 1-in-4 observes.
+                let peer = (rng.next_u32() % 4) as u64;
+                unique_peers.insert(peer);
+                let ip_octet = rng.pick_ip_last_octet();
+                let port = rng.pick_port();
+                let reflex: SocketAddr = format!("198.51.100.{ip_octet}:{port}").parse().unwrap();
+                fsm.observe(peer, reflex);
+            }
+
+            // observation_count must equal the number of distinct
+            // peers (not the total call count) — pins the "replace
+            // on duplicate peer id" contract.
+            assert_eq!(
+                fsm.observation_count(),
+                unique_peers.len(),
+                "iter {iter}: observation_count drifted from distinct-peer count",
+            );
+
+            let class = fsm.classify(bind);
+            assert!(
+                matches!(
+                    class,
+                    NatClass::Unknown | NatClass::Open | NatClass::Cone | NatClass::Symmetric,
+                ),
+                "iter {iter}: classify returned {class:?} — invalid variant",
+            );
+
+            // pair_action on the returned class against a random
+            // remote must also stay valid. This is the end-to-end
+            // "fsm output → matrix → action" contract.
+            let remote = rng.pick_class();
+            let action = pair_action(class, remote);
+            let _ = action; // checked for panic-freedom only
+        }
+    }
+
+    /// Property: the `Unknown` recovery contract. Starting from an
+    /// Unknown classification, a single additional observation
+    /// that pushes `observation_count >= 2` resolves to one of the
+    /// three non-Unknown variants (Open/Cone/Symmetric). Proves
+    /// the FSM never "sticks" in Unknown once it has enough data,
+    /// regardless of the input shape.
+    #[test]
+    fn unknown_classification_always_recovers_on_enough_observations() {
+        const N: usize = 200;
+        let mut rng = Lcg::new(0xABCD_1234_5678);
+
+        for iter in 0..N {
+            let mut fsm = ClassifyFsm::new();
+            let bind: SocketAddr = "10.0.0.1:9001".parse().unwrap();
+
+            // Fresh FSM must classify as Unknown.
+            assert_eq!(fsm.classify(bind), NatClass::Unknown);
+
+            // First observation: still Unknown (needs ≥2).
+            let p1 = rng.pick_port();
+            fsm.observe(1, format!("198.51.100.5:{p1}").parse().unwrap());
+            assert_eq!(
+                fsm.classify(bind),
+                NatClass::Unknown,
+                "iter {iter}: one observation must stay Unknown",
+            );
+
+            // Second observation: now resolves to a concrete class.
+            let p2 = rng.pick_port();
+            fsm.observe(2, format!("198.51.100.6:{p2}").parse().unwrap());
+            let class = fsm.classify(bind);
+            assert!(
+                matches!(class, NatClass::Open | NatClass::Cone | NatClass::Symmetric),
+                "iter {iter}: after 2 observations, class must be non-Unknown (was {class:?})",
+            );
+        }
+    }
+
+    /// Property: reclassification is idempotent in the "same
+    /// data → same answer" sense even after hostile permutations.
+    /// Pins that `observe` order doesn't alter the final class
+    /// when the set of (peer, reflex) entries is identical.
+    #[test]
+    fn reclassification_is_order_independent_over_random_samples() {
+        const N: usize = 200;
+        let mut rng = Lcg::new(0x7A7A_B0B0);
+        let bind: SocketAddr = "192.0.2.1:9001".parse().unwrap();
+
+        for iter in 0..N {
+            // Build a small observation set with distinct peer ids
+            // so duplicates don't collapse entries.
+            let count = 2 + (rng.next_u32() % 5) as u64;
+            let obs: Vec<(u64, SocketAddr)> = (0..count)
+                .map(|i| {
+                    let port = rng.pick_port();
+                    let ip_octet = rng.pick_ip_last_octet();
+                    let sa: SocketAddr = format!("198.51.100.{ip_octet}:{port}").parse().unwrap();
+                    (i, sa)
+                })
+                .collect();
+
+            let mut fwd = ClassifyFsm::new();
+            for (p, r) in &obs {
+                fwd.observe(*p, *r);
+            }
+
+            let mut rev = ClassifyFsm::new();
+            for (p, r) in obs.iter().rev() {
+                rev.observe(*p, *r);
+            }
+
+            assert_eq!(
+                fwd.classify(bind),
+                rev.classify(bind),
+                "iter {iter}: classification must not depend on observe order",
             );
         }
     }

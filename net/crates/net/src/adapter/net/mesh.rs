@@ -81,7 +81,7 @@ fn wire_bytes_for_payload(payload_bytes: usize) -> u32 {
         .min(u32::MAX as usize) as u32
 }
 use super::reroute::ReroutePolicy;
-use super::route::{RoutingHeader, ROUTING_HEADER_SIZE};
+use super::route::{RoutingHeader, ROUTING_HEADER_SIZE, ROUTING_MAGIC};
 use super::router::{NetRouter, RouterConfig};
 use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
@@ -1153,6 +1153,18 @@ impl MeshNode {
 
         let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
 
+        // Hoist `peers` and `addr_to_node` out of the struct literal so
+        // the failure-detector `on_failure` callback below can evict
+        // dead peers from them. A previous implementation removed the
+        // failed peer from the reroute policy, roster, subnet map,
+        // entity-id map, and capability index — but left the PeerInfo
+        // (including its session) in `peers` indefinitely. Subsequent
+        // `send_to_peer` calls would then route through a dead session
+        // and silently drop packets via UDP until an application-layer
+        // timeout fired.
+        let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
+        let addr_to_node: Arc<DashMap<SocketAddr, u64>> = Arc::new(DashMap::new());
+
         // Create proximity graph for topology awareness.
         //
         // Peers are seeded into the graph via `node_id_to_graph_id(peer_node_id)`
@@ -1190,12 +1202,36 @@ impl MeshNode {
         // the old identity.
         let peer_entity_ids: Arc<DashMap<u64, EntityId>> = Arc::new(DashMap::new());
 
+        // Capability index — hoisted out of the struct literal so
+        // the failure-detector `on_failure` callback can hold a
+        // clone. Without this eviction, a failed peer's advertised
+        // reflex would linger in the index and the rendezvous
+        // coordinator could hand it to a PunchRequest initiator
+        // even though the peer is known dead (TEST_COVERAGE_PLAN
+        // §P1-5 / TRANSPORT-adjacent bug: three-way agreement
+        // between the failure detector, the routing table, and
+        // the capability index on peer-death).
+        let capability_index: Arc<CapabilityIndex> = Arc::new(CapabilityIndex::new());
+
         // Wire failure detector with reroute callbacks + roster eviction.
+        //
+        // Note: the `peers` / `addr_to_node` / `peer_addrs` maps are
+        // *not* evicted here. Keeping the session entry lets a
+        // transient-partition recovery work — once `b`'s heartbeats
+        // resume, the packet-dispatch path matches them against the
+        // retained session_id, calls `failure_detector.heartbeat`,
+        // and the detector's `on_recovery` callback undoes the
+        // reroute. Permanent failures are swept separately by the
+        // heartbeat loop (see `spawn_heartbeat` — once a peer has
+        // been `Failed` for longer than the cleanup window and has
+        // not produced any traffic, the loop drops the entry from
+        // `peers` / `addr_to_node` / `peer_addrs`).
         let rp_failure = reroute_policy.clone();
         let rp_recovery = reroute_policy.clone();
         let roster_failure = roster.clone();
         let peer_subnets_failure = peer_subnets.clone();
         let peer_entity_ids_failure = peer_entity_ids.clone();
+        let capability_index_failure = capability_index.clone();
         let failure_detector = FailureDetector::with_config(FailureDetectorConfig {
             timeout: config.session_timeout,
             miss_threshold: 3,
@@ -1214,6 +1250,15 @@ impl MeshNode {
             }
             peer_subnets_failure.remove(&node_id);
             peer_entity_ids_failure.remove(&node_id);
+            // Drop the dead peer's cached capabilities + reflex.
+            // Without this, a rendezvous coordinator could still
+            // hand a PunchRequest initiator the failed peer's
+            // (stale) reflex, leading to wasted punch attempts
+            // against a dead address. The three maps above
+            // (routes, subnets, entity-ids) are all cleared on
+            // failure; the capability index is now consistent
+            // with them.
+            capability_index_failure.remove(node_id);
         })
         .on_recovery(move |node_id| rp_recovery.on_recovery(node_id));
 
@@ -1239,8 +1284,8 @@ impl MeshNode {
             node_id,
             config,
             socket,
-            peers: Arc::new(DashMap::new()),
-            addr_to_node: Arc::new(DashMap::new()),
+            peers,
+            addr_to_node,
             router,
             failure_detector: Arc::new(failure_detector),
             inbound: Arc::new(DashMap::new()),
@@ -1286,7 +1331,7 @@ impl MeshNode {
             traversal_config: super::traversal::TraversalConfig::default(),
             #[cfg(feature = "nat-traversal")]
             traversal_stats: Arc::new(super::traversal::TraversalStats::new()),
-            capability_index: Arc::new(CapabilityIndex::new()),
+            capability_index,
             seen_announcements: Arc::new(DashMap::new()),
             last_announce_at: Arc::new(parking_lot::Mutex::new(None)),
             local_announcement: Arc::new(ArcSwapOption::empty()),
@@ -2162,13 +2207,26 @@ impl MeshNode {
         let failure_detector = &ctx.failure_detector;
         // Distinguish routed packets from direct packets.
         //
-        // Direct packets start with the Net header magic (0x4E45).
-        // Routed packets start with a 16-byte routing header (dest_id,
-        // src_id, ttl, hop_count, flags) followed by the Net header.
-        // Since dest_id is a u64 node ID, its first two bytes will
-        // almost never equal 0x4E45 by accident.
-        let is_routed = data.len() >= ROUTING_HEADER_SIZE + protocol::HEADER_SIZE
-            && u16::from_le_bytes([data[0], data[1]]) != MAGIC;
+        // Bytes 0-1 of a direct Net packet are [`MAGIC`] (`0x4E45`);
+        // bytes 0-1 of a routing header are [`ROUTING_MAGIC`]
+        // (`0x5254`). Anything else is malformed and dropped. The
+        // previous discriminator ("anything that isn't MAGIC is
+        // routed") mis-classified routed packets whenever the
+        // recipient's own `node_id` had low-16-bits equal to
+        // `MAGIC` — 1-in-65 536 node_ids — silently dropping
+        // routed traffic at the AEAD layer.
+        let first2 = if data.len() >= 2 {
+            u16::from_le_bytes([data[0], data[1]])
+        } else {
+            0
+        };
+        let is_routed =
+            first2 == ROUTING_MAGIC && data.len() >= ROUTING_HEADER_SIZE + protocol::HEADER_SIZE;
+        let is_direct = first2 == MAGIC;
+        if !is_routed && !is_direct {
+            // Malformed / unrecognized prefix — drop silently.
+            return;
+        }
 
         if is_routed {
             // Routed packet: parse routing header, decide forward or local
@@ -3027,6 +3085,9 @@ impl MeshNode {
     fn spawn_heartbeat_loop(&self) -> JoinHandle<()> {
         let socket = self.socket.clone();
         let peers = self.peers.clone();
+        let addr_to_node = self.addr_to_node.clone();
+        let peer_addrs = self.peer_addrs.clone();
+        let failure_detector = self.failure_detector.clone();
         let interval = self.config.heartbeat_interval;
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
@@ -3038,6 +3099,20 @@ impl MeshNode {
         // pingwave emission; indirect (pingwave-learned) routes age out
         // here if their origin goes silent.
         let max_route_age = self.config.session_timeout.saturating_mul(3);
+        // Dead-peer eviction threshold: a peer that has been Failed
+        // for this long with no observed traffic is considered
+        // permanently gone and dropped from `peers`. Until then we
+        // keep the session entry so a transient-partition recovery
+        // (the heartbeat the peer sends on the heal triggers
+        // `failure_detector.heartbeat`, which `on_recovery`'s the
+        // reroute) can succeed — evicting immediately on the first
+        // Failed transition would require a full re-handshake to
+        // come back. The 30× multiplier gives partitions plenty of
+        // time to heal (at the default 30 s session_timeout that's
+        // a 15-minute cleanup delay; at test-tight 300 ms timeouts
+        // it's 9 s, still comfortably longer than typical test
+        // partition-heal windows).
+        let dead_peer_timeout = self.config.session_timeout.saturating_mul(30);
         // Stream lifecycle: drop idle streams past `stream_idle_timeout`
         // and enforce `max_streams` cap via LRU.
         let stream_idle_timeout = self.config.stream_idle_timeout;
@@ -3088,6 +3163,52 @@ impl MeshNode {
                                 max_streams,
                                 "idle_timeout",
                             );
+                        }
+
+                        // Dead-peer eviction: walk peers in Failed
+                        // state whose session has been inactive for
+                        // longer than `dead_peer_timeout`. The
+                        // failure-detector `on_failure` callback
+                        // does not evict `peers` itself — see the
+                        // note in `MeshNode::new` — so this sweep is
+                        // the single point where a permanently-gone
+                        // peer's session / address mapping drops.
+                        // Short-term partitions stay in `peers` long
+                        // enough for `on_recovery` to fire when the
+                        // heartbeats resume.
+                        //
+                        // Drive `check_all()` first: the failure
+                        // detector only transitions `Healthy → Suspected
+                        // → Failed` when its state machine runs. Without
+                        // this call, `failed_nodes()` would always be
+                        // empty outside tests and the sweep would be a
+                        // silent no-op even for permanently-dead peers
+                        // (cubic code review P1).
+                        let _ = failure_detector.check_all();
+                        let failed = failure_detector.failed_nodes();
+                        for node_id in failed {
+                            let still_silent = match peers.get(&node_id) {
+                                Some(e) => e.value().session.is_timed_out(dead_peer_timeout),
+                                None => false,
+                            };
+                            if !still_silent {
+                                continue;
+                            }
+                            if let Some((_, old_info)) = peers.remove(&node_id) {
+                                let old_addr = old_info.addr;
+                                addr_to_node
+                                    .remove_if(&old_addr, |_, n| *n == node_id);
+                                peer_addrs
+                                    .remove_if(&node_id, |_, addr| *addr == old_addr);
+                                tracing::info!(
+                                    node_id = format!("{:#x}", node_id),
+                                    "evicted permanently-dead peer from peer map",
+                                );
+                            }
+                            // Also drop the failure-detector entry so
+                            // a later reconnect under the same node_id
+                            // starts from a clean slate.
+                            failure_detector.remove(node_id);
                         }
                     }
                     _ = shutdown_notify.notified() => {

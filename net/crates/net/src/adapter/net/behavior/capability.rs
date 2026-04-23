@@ -68,8 +68,14 @@ pub struct GpuInfo {
     pub compute_units: u16,
     /// Tensor cores (0 if none)
     pub tensor_cores: u16,
-    /// FP16 TFLOPS (scaled by 10, e.g., 825 = 82.5 TFLOPS)
-    pub fp16_tflops_x10: u16,
+    /// FP16 TFLOPS (scaled by 10, e.g., 825 = 82.5 TFLOPS).
+    ///
+    /// Widened from `u16` to `u32` because the old ceiling
+    /// (`u16::MAX / 10 ≈ 6.5 PFLOPS`) silently saturated on any
+    /// aggregated cluster figure worth reporting; individual GPUs
+    /// still fit in `u16` but operators roll these up per-node
+    /// and per-mesh.
+    pub fp16_tflops_x10: u32,
 }
 
 impl Default for GpuInfo {
@@ -108,9 +114,18 @@ impl GpuInfo {
         self
     }
 
-    /// Set FP16 performance
+    /// Set FP16 performance.
+    ///
+    /// Clamped at `u32::MAX` to be explicit about the ceiling: a
+    /// pathological f32 (NaN, negative, > ~4.3e8 TFLOPS) saturates
+    /// rather than wrapping to a garbage value.
     pub fn with_fp16_tflops(mut self, tflops: f32) -> Self {
-        self.fp16_tflops_x10 = (tflops * 10.0) as u16;
+        let scaled = (tflops * 10.0).max(0.0);
+        self.fp16_tflops_x10 = if scaled.is_finite() && scaled < u32::MAX as f32 {
+            scaled as u32
+        } else {
+            u32::MAX
+        };
         self
     }
 }
@@ -1359,13 +1374,20 @@ impl CapabilityIndex {
         }
     }
 
-    /// Remove node from inverted indexes
+    /// Remove node from inverted indexes.
+    ///
+    /// After each `HashSet::remove`, the outer-map entry is dropped
+    /// if the inner set is now empty. Without that drop, ephemeral
+    /// tag / model-id / tool-id / vendor keys accumulated as empty
+    /// `HashSet` shells in the outer `DashMap`s — a slow unbounded
+    /// leak over long-running deployments with high peer churn.
     fn remove_from_indexes(&self, node_id: u64, caps: &CapabilitySet) {
         // Tags
         for tag in &caps.tags {
             if let Some(mut set) = self.by_tag.get_mut(tag) {
                 set.remove(&node_id);
             }
+            self.by_tag.remove_if(tag, |_, set| set.is_empty());
         }
 
         // Models
@@ -1373,6 +1395,8 @@ impl CapabilityIndex {
             if let Some(mut set) = self.by_model.get_mut(&model.model_id) {
                 set.remove(&node_id);
             }
+            self.by_model
+                .remove_if(&model.model_id, |_, set| set.is_empty());
         }
 
         // Tools
@@ -1380,9 +1404,12 @@ impl CapabilityIndex {
             if let Some(mut set) = self.by_tool.get_mut(&tool.tool_id) {
                 set.remove(&node_id);
             }
+            self.by_tool
+                .remove_if(&tool.tool_id, |_, set| set.is_empty());
         }
 
-        // GPU
+        // GPU (two-value bucket; entries are intentionally permanent
+        // because lookups for both `true` and `false` are expected).
         let has_gpu = caps.has_gpu();
         if let Some(mut set) = self.gpu_nodes.get_mut(&has_gpu) {
             set.remove(&node_id);
@@ -1392,6 +1419,8 @@ impl CapabilityIndex {
             if let Some(mut set) = self.by_gpu_vendor.get_mut(&vendor) {
                 set.remove(&node_id);
             }
+            self.by_gpu_vendor
+                .remove_if(&vendor, |_, set| set.is_empty());
         }
     }
 
@@ -1803,6 +1832,278 @@ mod tests {
 
         // Should be expired now
         assert!(ann.is_expired());
+    }
+
+    // ========================================================================
+    // CapabilityIndex::gc() boundary + race coverage (TEST_COVERAGE_PLAN §P1-2)
+    // ========================================================================
+
+    /// A zero-TTL announcement is evicted on the very next `gc()`
+    /// sweep. Zero-TTL is a legitimate operator choice for
+    /// "announce-and-forget" diagnostics; the index must respect
+    /// it rather than silently promoting zero to some default.
+    #[test]
+    fn gc_evicts_entries_with_ttl_zero() {
+        let index = CapabilityIndex::new();
+        let mut ann = CapabilityAnnouncement::new(1, test_entity(), 1, sample_capability_set());
+        ann.ttl_secs = 0;
+        index.index(ann);
+
+        assert_eq!(index.stats().node_count, 1, "entry should be indexed");
+        // No sleep needed — with ttl=0, `now.duration_since(indexed_at)`
+        // is already >= ttl on the first gc call.
+        let removed = index.gc();
+        assert_eq!(removed, 1, "zero-TTL entry must be evicted on first gc");
+        assert_eq!(index.stats().node_count, 0);
+        assert!(
+            index.get(1).is_none(),
+            "evicted entry must not be queryable"
+        );
+    }
+
+    /// A u32::MAX-TTL announcement (~136 years in seconds) must
+    /// NOT be evicted on the first gc sweep. Pins that the
+    /// `Duration::from_secs(ttl_secs as u64)` conversion doesn't
+    /// wrap or overflow — a regression here would produce a
+    /// zero-valued `Duration` and evict long-lived entries
+    /// immediately.
+    #[test]
+    fn gc_retains_entries_with_max_ttl_no_wraparound() {
+        let index = CapabilityIndex::new();
+        let mut ann = CapabilityAnnouncement::new(7, test_entity(), 1, sample_capability_set());
+        ann.ttl_secs = u32::MAX;
+        index.index(ann);
+
+        assert_eq!(index.stats().node_count, 1);
+        let removed = index.gc();
+        assert_eq!(
+            removed, 0,
+            "u32::MAX-TTL entry must not be evicted — regression \
+             would indicate the `ttl_secs as u64` widening wrapped \
+             to zero and produced a zero-`Duration` ttl",
+        );
+        assert!(index.get(7).is_some(), "entry still queryable");
+    }
+
+    /// Concurrent `index()` on one thread + `gc()` on another —
+    /// the two dashmap operations must not corrupt the index or
+    /// panic. With a long TTL every indexed entry is gc-safe
+    /// (not expired), so gc should never remove anything; we
+    /// assert that invariant after the race completes. Guards
+    /// the `versions` + `nodes` lock-ordering contract
+    /// documented on `remove` (versions before nodes).
+    #[test]
+    fn gc_and_index_concurrent_race_is_panic_free_and_does_not_evict_live_entries() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let index = Arc::new(CapabilityIndex::new());
+        let iters = 500u64;
+        // Start barrier: both threads must be at their first loop
+        // iteration before either runs. Without it the GC thread
+        // could race ahead and finish all 500 gc() sweeps before
+        // the indexer's thread even started — a silent green pass
+        // that wouldn't have exercised the versions↔nodes
+        // lock-ordering at all (cubic-flagged P2).
+        let start = Arc::new(Barrier::new(2));
+
+        // Indexer thread: reindex node_id 42 with a bumped
+        // version each iteration. TTL default (300s), so no
+        // entry is ever actually expired.
+        let indexer = {
+            let index = index.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                for v in 1..=iters {
+                    let ann =
+                        CapabilityAnnouncement::new(42, test_entity(), v, sample_capability_set());
+                    index.index(ann);
+                }
+            })
+        };
+
+        // GC thread: run `gc()` repeatedly while the indexer
+        // is active. Count removals — since all entries have a
+        // 300-second TTL and the test takes milliseconds,
+        // `gc` must return 0 every time.
+        let gc_runner = {
+            let index = index.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                let mut total_removed = 0usize;
+                for _ in 0..iters {
+                    total_removed += index.gc();
+                }
+                total_removed
+            })
+        };
+
+        indexer.join().expect("indexer panicked");
+        let gc_removed = gc_runner.join().expect("gc thread panicked");
+
+        assert_eq!(
+            gc_removed, 0,
+            "gc must not evict any entry during the race — every \
+             indexed version has a 300-second TTL and the test \
+             completes in milliseconds. A nonzero removal count \
+             indicates a lock-ordering bug that lets gc see an \
+             indexed-then-still-present entry as expired.",
+        );
+
+        // Final state: node 42 is present, at some version
+        // between 1 and `iters`. No data structure corruption.
+        let final_entry = index.get(42);
+        assert!(
+            final_entry.is_some(),
+            "node 42 must be indexed after the race"
+        );
+    }
+
+    // ========================================================================
+    // Custom TTL coverage (TEST_COVERAGE_PLAN §P3-16)
+    //
+    // Table-driven cases that exercise TTLs the default-300s unit
+    // tests never touch: 0s, 1s, 1h, 1yr, u32::MAX. Two flavors —
+    // one drives the index's `gc()` on freshly-indexed entries, the
+    // other drives `CapabilityAnnouncement::is_expired()` directly
+    // so the "age >= ttl" boundary can be pinned against an exact
+    // past timestamp (Instant::now() is not manipulable at test
+    // time, but `timestamp_ns` is).
+    // ========================================================================
+
+    /// `gc()` on a freshly-indexed entry evicts only when the TTL
+    /// is zero. Everything from 1s up is a "not yet expired" case
+    /// because less than a second has elapsed between `index()` and
+    /// `gc()`. Pins the sign of the comparison in `gc` — a flipped
+    /// inequality would evict an entry with a year-long TTL after
+    /// one microsecond of wall-clock age.
+    #[test]
+    fn gc_respects_ttl_bounds_on_freshly_indexed_entries() {
+        // (node_id, ttl_secs, expected_evicted_on_immediate_gc)
+        //
+        // NB: the smallest non-zero TTL is 10 s, not 1 s — a
+        // 1 s bound is timing-sensitive (a paused scheduler or
+        // CI VM stall between `index()` and `gc()` could push
+        // wall-clock age past the boundary and flip the
+        // assertion). 10 s leaves comfortable slack for CI
+        // under load while still covering the "short, non-zero
+        // TTL" class.
+        let cases: &[(u64, u32, bool)] = &[
+            (100, 0, true),
+            (101, 10, false),         // 10 s — short but non-flaky
+            (102, 3_600, false),      // 1 hour
+            (103, 31_536_000, false), // 1 year
+            (104, u32::MAX, false),   // ~136 years
+        ];
+
+        for &(node_id, ttl_secs, should_evict) in cases {
+            let index = CapabilityIndex::new();
+            let mut ann =
+                CapabilityAnnouncement::new(node_id, test_entity(), 1, sample_capability_set());
+            ann.ttl_secs = ttl_secs;
+            index.index(ann);
+
+            let removed = index.gc();
+            if should_evict {
+                assert_eq!(
+                    removed, 1,
+                    "TTL={ttl_secs}s: entry must be evicted on immediate gc",
+                );
+                assert!(
+                    index.get(node_id).is_none(),
+                    "TTL={ttl_secs}s: evicted entry must not be queryable",
+                );
+            } else {
+                assert_eq!(
+                    removed, 0,
+                    "TTL={ttl_secs}s: fresh entry must not be evicted on immediate gc",
+                );
+                assert!(
+                    index.get(node_id).is_some(),
+                    "TTL={ttl_secs}s: live entry must remain queryable",
+                );
+            }
+        }
+    }
+
+    /// `CapabilityAnnouncement::is_expired()` uses `SystemTime`, so
+    /// we can backdate `timestamp_ns` and exercise the ttl boundary
+    /// directly. Covers the inclusive-expiry contract at every TTL
+    /// bucket in the plan.
+    #[test]
+    fn announcement_is_expired_table_driven_across_ttl_buckets() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let sec_ns = 1_000_000_000u64;
+
+        // (ttl_secs, age_secs, expected_is_expired, label)
+        let cases: &[(u32, u64, bool, &str)] = &[
+            // TTL=0: inclusive-expiry — any age (including 0) is expired.
+            (0, 0, true, "ttl=0 fresh"),
+            // TTL=1: 0s age → fresh; 2s age → expired.
+            (1, 0, false, "ttl=1s fresh"),
+            (1, 2, true, "ttl=1s aged 2s"),
+            // TTL=1h: boundary at 3600s.
+            (3_600, 1, false, "ttl=1h aged 1s"),
+            (3_600, 3_599, false, "ttl=1h aged 3599s"),
+            (3_600, 3_600, true, "ttl=1h aged exactly 3600s (inclusive)"),
+            (3_600, 3_601, true, "ttl=1h aged 3601s"),
+            // TTL=1yr: day-old is fresh, 2yr-old is expired.
+            (31_536_000, 86_400, false, "ttl=1yr aged 1 day"),
+            (31_536_000, 31_536_001, true, "ttl=1yr aged just past"),
+            // TTL=u32::MAX: a 1-year-old entry is still fresh. Pins
+            // that `ttl_secs as u64` widens without wrapping.
+            (u32::MAX, 31_536_000, false, "ttl=u32::MAX aged 1 year"),
+        ];
+
+        for &(ttl_secs, age_secs, expected, label) in cases {
+            let mut ann = CapabilityAnnouncement::new(1, test_entity(), 1, sample_capability_set());
+            ann.ttl_secs = ttl_secs;
+            ann.timestamp_ns = now_ns.saturating_sub(age_secs.saturating_mul(sec_ns));
+
+            assert_eq!(
+                ann.is_expired(),
+                expected,
+                "is_expired({label}) must be {expected}",
+            );
+        }
+    }
+
+    /// `with_ttl()` applied after construction must actually change
+    /// the announcement's effective lifetime — pins that the
+    /// builder-style setter doesn't silently ignore the new value
+    /// or leak the `DEFAULT_TTL_SECS` default through.
+    #[test]
+    fn with_ttl_mutation_round_trips_through_is_expired_and_gc() {
+        let ann =
+            CapabilityAnnouncement::new(9, test_entity(), 1, sample_capability_set()).with_ttl(0);
+        assert_eq!(ann.ttl_secs, 0, "with_ttl must write through");
+
+        let index = CapabilityIndex::new();
+        index.index(ann);
+        // Immediate gc should evict because `with_ttl(0)` applied.
+        assert_eq!(
+            index.gc(),
+            1,
+            "with_ttl(0) must propagate into the indexed entry's TTL \
+             so gc treats it the same as a fresh ttl_secs=0 announcement",
+        );
+
+        // Long TTL path: with_ttl(u32::MAX) keeps the entry
+        // indefinitely on a fresh gc.
+        let ann2 = CapabilityAnnouncement::new(10, test_entity(), 1, sample_capability_set())
+            .with_ttl(u32::MAX);
+        assert_eq!(ann2.ttl_secs, u32::MAX);
+        let index = CapabilityIndex::new();
+        index.index(ann2);
+        assert_eq!(index.gc(), 0, "u32::MAX TTL must survive gc");
+        assert!(index.get(10).is_some());
     }
 
     // ========================================================================

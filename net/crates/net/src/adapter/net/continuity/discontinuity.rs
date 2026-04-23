@@ -181,8 +181,15 @@ impl ForkRecord {
     }
 
     /// Deserialize from bytes.
+    ///
+    /// Rejects buffers whose length is anything other than exactly
+    /// [`Self::WIRE_SIZE`]. Silently accepting trailing bytes
+    /// weakened the wire-format contract: two concatenated
+    /// `ForkRecord`s could parse as the first one alone, and
+    /// callers framing this type inside a larger payload could
+    /// smuggle extra bytes past the parser.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < Self::WIRE_SIZE {
+        if data.len() != Self::WIRE_SIZE {
             return None;
         }
         let original_origin = u32::from_le_bytes(data[0..4].try_into().unwrap());

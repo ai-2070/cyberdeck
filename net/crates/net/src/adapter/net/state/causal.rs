@@ -231,11 +231,28 @@ pub fn validate_chain_link(
 /// Write causal events into a buffer (CausalLink prepended to each event).
 ///
 /// Format per event: `[len: u32][CausalLink: 24 bytes][payload: len-24 bytes]`
+///
+/// Events whose serialized size would overflow the `u32` length
+/// prefix (payload > ~4 GiB − 24 bytes) are silently skipped
+/// instead of panicking. The paired `read_causal_events` is already
+/// defensive about malformed input; the writer is now symmetric.
+/// No realistic caller hands in payloads this size, but an FFI path
+/// forwarding arbitrary `Bytes` could — making a crash on oversized
+/// input a DoS vector.
 pub fn write_causal_events(events: &[CausalEvent], buf: &mut BytesMut) -> usize {
     let start = buf.len();
     for event in events {
         let total_len = CAUSAL_LINK_SIZE + event.payload.len();
-        let total_len_u32 = u32::try_from(total_len).expect("causal event exceeds 4 GiB");
+        let total_len_u32 = match u32::try_from(total_len) {
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!(
+                    payload_len = event.payload.len(),
+                    "write_causal_events: skipping event whose serialized size exceeds u32",
+                );
+                continue;
+            }
+        };
         buf.put_u32_le(total_len_u32);
         buf.put_slice(&event.link.to_bytes());
         buf.put_slice(&event.payload);

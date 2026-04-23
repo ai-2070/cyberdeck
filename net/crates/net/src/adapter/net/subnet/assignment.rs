@@ -19,6 +19,30 @@ use crate::adapter::net::behavior::capability::CapabilitySet;
 /// - `SubnetRule { tag_prefix: "fleet:", level: 1, values: {"alpha": 2} }`
 ///
 /// Would get `SubnetId::new(&[1, 2])`.
+///
+/// # Semantics (rule precedence and matching contract)
+///
+/// Pinned by unit tests in this module — changes here are
+/// behavioral breaks for operators configuring subnets:
+///
+/// 1. **Rule order is declaration order.** `assign()` walks
+///    `rules` in the order passed to `add_rule()`. Two rules
+///    targeting the *same* `level` with overlapping values
+///    resolve as *later-rule-wins*: the earlier rule may write
+///    the level byte first, but a subsequent match at the same
+///    level overwrites it.
+/// 2. **First tag wins per rule.** Inside one rule, the first
+///    capability tag whose stripped suffix is present in `values`
+///    wins — subsequent tags matching the same rule are ignored.
+/// 3. **No partial-prefix match on values.** `tag_prefix` is
+///    stripped by [`str::strip_prefix`]; the remaining value is
+///    then looked up by *exact* string equality against `values`.
+///    A rule `region:` matching on `"us"` will **not** match the
+///    tag `region:us:extra` (the stripped suffix `"us:extra"` is
+///    not in the values map).
+/// 4. **Unmatched levels stay zero.** Levels with no rule (or a
+///    rule that failed to match) remain `0`, which [`SubnetId`]
+///    interprets as "no restriction at this level".
 #[derive(Debug, Clone)]
 pub struct SubnetPolicy {
     rules: Vec<SubnetRule>,
@@ -190,5 +214,151 @@ mod tests {
 
         let caps = caps_with_tags(&["region:us", "fleet:f1", "vehicle:v42", "subsystem:lidar"]);
         assert_eq!(policy.assign(&caps), SubnetId::new(&[1, 2, 3, 4]));
+    }
+
+    // ========================================================================
+    // Tie-breaking / ambiguity semantics (TEST_COVERAGE_PLAN §P3-17)
+    //
+    // Pins the three ambiguity cases the doc contract on
+    // `SubnetPolicy` calls out: same-prefix duplicate rules,
+    // rule-order dependency for the same level, and the no-partial-
+    // match contract on values. If any of these assertions flips,
+    // either the doc contract is wrong or a silent behavior change
+    // snuck in — the PR touching `assign()` needs to decide which.
+    // ========================================================================
+
+    /// Duplicate `tag_prefix` rules both writing the same level:
+    /// the later rule wins (last write). An earlier rule's mapping
+    /// is overwritten if a later rule matches the same tag input.
+    #[test]
+    fn duplicate_prefix_same_level_later_rule_wins() {
+        let policy = SubnetPolicy::new()
+            // First rule writes level 0 = 1
+            .add_rule(SubnetRule::new("region:", 0).map("us", 1))
+            // Second rule at the same level remaps "us" to 9
+            .add_rule(SubnetRule::new("region:", 0).map("us", 9));
+
+        let caps = caps_with_tags(&["region:us"]);
+        assert_eq!(
+            policy.assign(&caps),
+            SubnetId::new(&[9]),
+            "a later rule with the same prefix + level must overwrite \
+             the earlier rule's value — pinned as last-write-wins",
+        );
+    }
+
+    /// Duplicate `tag_prefix` rules writing *different* levels
+    /// coexist: both writes land on their respective level slots.
+    /// Exercises the "rules evaluated in declaration order, each
+    /// writes its own level independently" part of the contract.
+    #[test]
+    fn duplicate_prefix_different_levels_both_apply() {
+        let policy = SubnetPolicy::new()
+            .add_rule(SubnetRule::new("region:", 0).map("us", 1))
+            // Same prefix, different level — coexists with the first
+            .add_rule(SubnetRule::new("region:", 2).map("us", 5));
+
+        let caps = caps_with_tags(&["region:us"]);
+        assert_eq!(
+            policy.assign(&caps),
+            SubnetId::new(&[1, 0, 5, 0]),
+            "two rules sharing a prefix but targeting different \
+             levels must both fire; level 1 + 3 remain unset",
+        );
+    }
+
+    /// Rule-order dependency: when two rules both claim the same
+    /// level but match *different* tags, the later rule's match
+    /// still overwrites the earlier rule's match if both tags are
+    /// present on the node. Pins "later rule wins" even across
+    /// different tag prefixes targeting the same level.
+    #[test]
+    fn rule_order_dependency_later_rule_overwrites_earlier_level_write() {
+        let policy = SubnetPolicy::new()
+            // Earlier: region:* writes level 0
+            .add_rule(SubnetRule::new("region:", 0).map("us", 1))
+            // Later: zone:* ALSO writes level 0 — this rule comes
+            // after the first, so it wins when both tags match
+            .add_rule(SubnetRule::new("zone:", 0).map("west", 4));
+
+        let caps = caps_with_tags(&["region:us", "zone:west"]);
+        assert_eq!(
+            policy.assign(&caps),
+            SubnetId::new(&[4]),
+            "later rule targeting the same level must overwrite earlier one",
+        );
+
+        // And: if only the earlier rule's tag is present, level 0
+        // still ends up with the earlier rule's value (the later
+        // rule does not match any tag).
+        let caps = caps_with_tags(&["region:us"]);
+        assert_eq!(
+            policy.assign(&caps),
+            SubnetId::new(&[1]),
+            "later rule does not clobber when it has no matching tag",
+        );
+    }
+
+    /// No partial-match on the stripped value: `values` is an
+    /// exact-string lookup table, not a prefix matcher. A tag
+    /// carrying extra suffix after the prefix does not hit a rule
+    /// keyed on the bare inner token.
+    #[test]
+    fn partial_prefix_on_value_does_not_match() {
+        let policy = SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0).map("us", 1));
+
+        // `region:us` → stripped "us" → hits values map.
+        let caps = caps_with_tags(&["region:us"]);
+        assert_eq!(policy.assign(&caps), SubnetId::new(&[1]));
+
+        // `region:us:extra` → stripped "us:extra" → NOT in map,
+        // so rule doesn't fire and level stays at zero.
+        let caps = caps_with_tags(&["region:us:extra"]);
+        assert_eq!(
+            policy.assign(&caps),
+            SubnetId::GLOBAL,
+            "values map is exact-match; suffixes after the matching \
+             inner token must not partial-match against the map key",
+        );
+
+        // Cousin case: tag where the stripped value is a *prefix*
+        // of a values-map entry doesn't match either.
+        let policy = SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0).map("us-west", 1));
+        let caps = caps_with_tags(&["region:us"]);
+        assert_eq!(
+            policy.assign(&caps),
+            SubnetId::GLOBAL,
+            "stripped value \"us\" is a prefix of \"us-west\" but \
+             must not partial-match the values map key",
+        );
+    }
+
+    /// First matching tag wins *within* a single rule — a second
+    /// tag for the same rule is ignored (the `break` in `assign`).
+    /// Combined with rule order, this fully determines which value
+    /// lands in the level slot.
+    #[test]
+    fn first_tag_wins_within_a_single_rule() {
+        let policy =
+            SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0).map("us", 1).map("eu", 2));
+
+        // Tag order on the capability set is iterated in insertion
+        // order (CapabilitySet uses a Vec). Whichever tag hits the
+        // values map first wins — pinning declaration/insertion
+        // order is the contract.
+        let caps = caps_with_tags(&["region:us", "region:eu"]);
+        assert_eq!(
+            policy.assign(&caps),
+            SubnetId::new(&[1]),
+            "first matching tag wins for a rule; subsequent matches are ignored",
+        );
+
+        let caps = caps_with_tags(&["region:eu", "region:us"]);
+        assert_eq!(
+            policy.assign(&caps),
+            SubnetId::new(&[2]),
+            "swapping tag order swaps which one wins — first-wins is \
+             insensitive to values-map ordering, only to tag iteration order",
+        );
     }
 }

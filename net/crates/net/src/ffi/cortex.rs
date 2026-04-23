@@ -1479,3 +1479,159 @@ pub extern "C" fn net_memories_watch_free(cursor: *mut MemoriesWatchHandle) {
 pub fn _ffi_cortex_keep_alive() -> *mut c_void {
     ptr::null_mut()
 }
+
+#[cfg(test)]
+mod tests {
+    //! Direct Rust-side coverage for the C FFI shims. The Go / Node
+    //! / Python binding tests cover happy-path round-trips; these
+    //! pin the corner cases that those tests don't exercise:
+    //! invalid config rejection, watch-cursor lifetime, and the
+    //! shared-runtime contract.
+
+    use super::*;
+    use std::ffi::CString;
+    use std::ptr;
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::thread;
+
+    fn redex() -> *mut RedexHandle {
+        net_redex_new(ptr::null())
+    }
+
+    fn open_file(redex: *mut RedexHandle, name: &str, cfg_json: Option<&str>) -> c_int {
+        let name_c = CString::new(name).unwrap();
+        let cfg_c = cfg_json.map(|s| CString::new(s).unwrap());
+        let cfg_ptr = cfg_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null());
+        let mut handle: *mut RedexFileHandle = ptr::null_mut();
+        let rc = net_redex_open_file(redex, name_c.as_ptr(), cfg_ptr, &mut handle);
+        if rc == 0 && !handle.is_null() {
+            net_redex_file_free(handle);
+        }
+        rc
+    }
+
+    /// Conflicting `fsync_every_n` AND `fsync_interval_ms`, as well
+    /// as either set to 0, must be rejected with `NET_ERR_REDEX`.
+    /// Go-side configs come straight from JSON without further
+    /// validation; if these slip past the FFI, the file opens with
+    /// silently-default fsync behavior and durability claims become
+    /// untrue.
+    #[test]
+    fn redex_open_file_rejects_conflicting_or_zero_fsync_config() {
+        let r = redex();
+        // Pre-checks: defaults and each individual setting succeed.
+        assert_eq!(open_file(r, "ok-default", None), 0);
+        assert_eq!(open_file(r, "ok-everyn", Some(r#"{"fsync_every_n":4}"#)), 0);
+        assert_eq!(
+            open_file(r, "ok-interval", Some(r#"{"fsync_interval_ms":50}"#),),
+            0
+        );
+
+        // Rejected combinations. Each row tests one invalid config.
+        let invalid = [
+            ("both-set", r#"{"fsync_every_n":4,"fsync_interval_ms":50}"#),
+            ("zero-everyn", r#"{"fsync_every_n":0}"#),
+            ("zero-interval", r#"{"fsync_interval_ms":0}"#),
+            ("both-zero", r#"{"fsync_every_n":0,"fsync_interval_ms":0}"#),
+            (
+                "everyn-set-interval-zero",
+                r#"{"fsync_every_n":4,"fsync_interval_ms":0}"#,
+            ),
+        ];
+        for (name, cfg) in invalid {
+            let rc = open_file(r, name, Some(cfg));
+            assert_eq!(
+                rc, NET_ERR_REDEX,
+                "config {name:?} ({cfg}) should be rejected with NET_ERR_REDEX (got {rc})"
+            );
+        }
+
+        net_redex_free(r);
+    }
+
+    /// `net_redex_open_file` with non-JSON config must return
+    /// `InvalidJson`, not silently default. Pinned because the Go
+    /// SDK relies on this distinction to surface a useful error.
+    #[test]
+    fn redex_open_file_rejects_non_json_config() {
+        let r = redex();
+        let name = CString::new("bad-json").unwrap();
+        let cfg = CString::new("not-json {").unwrap();
+        let mut handle: *mut RedexFileHandle = ptr::null_mut();
+        let rc = net_redex_open_file(r, name.as_ptr(), cfg.as_ptr(), &mut handle);
+        assert_eq!(rc, NetError::InvalidJson as c_int);
+        assert!(handle.is_null());
+        net_redex_free(r);
+    }
+
+    /// Once the underlying RedexFile is closed, an outstanding tail
+    /// cursor's next `tail_next` call must observe `STREAM_ENDED`
+    /// cleanly. This is the load-bearing lifetime contract for any
+    /// language binding that pumps the cursor into a goroutine /
+    /// task — without it, the consumer would block on a closed
+    /// stream forever.
+    #[test]
+    fn redex_tail_cursor_observes_close_with_stream_ended() {
+        let r = redex();
+        let name = CString::new("tail-close").unwrap();
+        let mut file: *mut RedexFileHandle = ptr::null_mut();
+        assert_eq!(
+            net_redex_open_file(r, name.as_ptr(), ptr::null(), &mut file),
+            0
+        );
+
+        let mut cursor: *mut RedexTailHandle = ptr::null_mut();
+        assert_eq!(net_redex_file_tail(file, 0, &mut cursor), 0);
+
+        // Close the file while the cursor is live.
+        assert_eq!(net_redex_file_close(file), 0);
+
+        // Next call on the cursor must return STREAM_ENDED, not
+        // block, not panic, not return an error code.
+        let mut out_json: *mut c_char = ptr::null_mut();
+        let mut out_len: usize = 0;
+        let rc = net_redex_tail_next(cursor, 1_000, &mut out_json, &mut out_len);
+        assert_eq!(
+            rc, NET_ERR_STREAM_ENDED,
+            "expected STREAM_ENDED after file close (got {rc})"
+        );
+        assert!(out_json.is_null(), "no event payload should be written");
+
+        net_redex_tail_free(cursor);
+        net_redex_file_free(file);
+        net_redex_free(r);
+    }
+
+    /// `runtime()` is a process-wide `OnceLock<Arc<Runtime>>`. Many
+    /// FFI entry points call it on first use. We assert that
+    /// concurrent first-callers from N threads all observe the
+    /// same runtime instance — i.e. that `OnceLock` initialization
+    /// is correctly atomic and no thread sees a half-built
+    /// runtime. (`OnceLock` guarantees this; the test pins the
+    /// guarantee against an accidental refactor to a non-atomic
+    /// alternative.)
+    #[test]
+    fn runtime_first_call_returns_same_instance_under_concurrency() {
+        const THREADS: usize = 16;
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let b = barrier.clone();
+            handles.push(thread::spawn(move || {
+                b.wait();
+                let rt = runtime();
+                Arc::as_ptr(rt) as usize
+            }));
+        }
+        let mut ptrs: Vec<usize> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        ptrs.sort();
+        ptrs.dedup();
+        assert_eq!(
+            ptrs.len(),
+            1,
+            "concurrent first-callers observed {} distinct runtimes (must be exactly 1)",
+            ptrs.len()
+        );
+    }
+}

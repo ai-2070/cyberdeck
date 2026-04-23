@@ -510,13 +510,19 @@ impl ShardMapper {
     ///
     /// Creates new shards and makes them available for routing.
     pub fn scale_up(&self, count: u16) -> Result<Vec<u16>, ScalingError> {
-        // Early check (may race, but avoids unnecessary lock acquisition)
+        // Early checks (may race, but avoid acquiring the write lock).
+        // Use `checked_add` so that `current + count` can never wrap
+        // past `u16::MAX` into a small value that slips under the
+        // `max_shards` cap. The id-exhaustion gate at line ~557 also
+        // catches overflow, but this keeps the primary budget check
+        // authoritative.
         let current = self.active_count.load(AtomicOrdering::Acquire);
-        if current + count > self.policy.max_shards {
+        let would_be = current
+            .checked_add(count)
+            .ok_or(ScalingError::AtMaxShards)?;
+        if would_be > self.policy.max_shards {
             return Err(ScalingError::AtMaxShards);
         }
-
-        // Check cooldown
         {
             let last = self.last_scaling.read();
             if let Some(ts) = *last {
@@ -528,10 +534,28 @@ impl ShardMapper {
 
         let mut shards = self.shards.write();
 
-        // Re-check max_shards under the lock to prevent race conditions
+        // Re-check max_shards under the lock to prevent race conditions.
         let current = self.active_count.load(AtomicOrdering::Acquire);
-        if current + count > self.policy.max_shards {
+        let would_be = current
+            .checked_add(count)
+            .ok_or(ScalingError::AtMaxShards)?;
+        if would_be > self.policy.max_shards {
             return Err(ScalingError::AtMaxShards);
+        }
+        // Re-check cooldown under the same write lock that gates
+        // mutation. Without this, two concurrent scale_up calls
+        // could both pass the read-locked early check, both
+        // serialize through `shards.write()`, and both succeed —
+        // breaking the cooldown contract and (with a unit-count
+        // call) potentially exceeding `max_shards` between the
+        // outer check and the inner check.
+        {
+            let last = self.last_scaling.read();
+            if let Some(ts) = *last {
+                if ts.elapsed() < self.policy.cooldown {
+                    return Err(ScalingError::InCooldown);
+                }
+            }
         }
 
         let mut new_ids = Vec::with_capacity(count as usize);
@@ -561,9 +585,17 @@ impl ShardMapper {
             new_ids.push(new_id);
         }
 
-        // Update counts
+        // Update counts. `fetch_add` cannot wrap here — the
+        // `checked_add` gate above ensures `current + count <=
+        // max_shards <= u16::MAX` — but keep the ordering explicit
+        // so the next contender's cooldown re-check sees the fresh
+        // timestamp.
         self.active_count.fetch_add(count, AtomicOrdering::Release);
         *self.last_scaling.write() = Some(Instant::now());
+
+        // Drop the write lock before notifying callbacks — they
+        // are user-supplied and may take arbitrary time.
+        drop(shards);
 
         // Notify callback
         if let Some(callback) = self.on_shard_created.read().as_ref() {
@@ -580,7 +612,7 @@ impl ShardMapper {
     /// Marks shards as draining so they stop receiving new events.
     /// Shards will be removed once they're empty.
     pub fn scale_down(&self, count: u16) -> Result<Vec<u16>, ScalingError> {
-        // Early check (may race, but avoids unnecessary lock acquisition)
+        // Early checks (may race, but avoid acquiring the write lock)
         let current = self.active_count.load(AtomicOrdering::Acquire);
         if current <= self.policy.min_shards {
             return Err(ScalingError::AtMinShards);
@@ -590,8 +622,6 @@ impl ShardMapper {
         if to_drain == 0 {
             return Err(ScalingError::AtMinShards);
         }
-
-        // Check cooldown
         {
             let last = self.last_scaling.read();
             if let Some(ts) = *last {
@@ -611,6 +641,16 @@ impl ShardMapper {
         let to_drain = count.min(current - self.policy.min_shards);
         if to_drain == 0 {
             return Err(ScalingError::AtMinShards);
+        }
+        // Re-check cooldown under the same write lock that gates
+        // mutation — see the matching note in `scale_up`.
+        {
+            let last = self.last_scaling.read();
+            if let Some(ts) = *last {
+                if ts.elapsed() < self.policy.cooldown {
+                    return Err(ScalingError::InCooldown);
+                }
+            }
         }
 
         let mut drained_ids = Vec::with_capacity(to_drain as usize);
@@ -1004,6 +1044,77 @@ mod tests {
             "should never exceed max_shards, got {}",
             mapper.active_shard_count()
         );
+    }
+
+    /// Two concurrent `scale_up(1)` calls must never both succeed
+    /// inside a single cooldown window. Before the fix, the
+    /// cooldown check happened only under a read lock that was
+    /// released *before* the mutating write lock, so two threads
+    /// could both observe `last_scaling=None` (or stale), both
+    /// acquire the write lock in turn, and both succeed — racing
+    /// past the cooldown floor and (on a max-shard-bounded
+    /// scenario) potentially the `max_shards` cap.
+    ///
+    /// Pin: across `ITERATIONS` rounds of two-thread races, every
+    /// iteration sees exactly one success and one `InCooldown`.
+    #[test]
+    fn cooldown_is_enforced_under_concurrent_scale_up() {
+        use std::sync::Arc;
+        use std::sync::Barrier;
+        use std::thread;
+
+        const ITERATIONS: usize = 1_000;
+
+        for iter in 0..ITERATIONS {
+            let policy = ScalingPolicy {
+                min_shards: 1,
+                max_shards: 16,
+                // Large cooldown so a single iteration can't pass
+                // the floor between the two threads' calls.
+                cooldown: Duration::from_secs(60),
+                ..Default::default()
+            };
+            let mapper = Arc::new(ShardMapper::new(2, 1024, policy).unwrap());
+            let barrier = Arc::new(Barrier::new(2));
+
+            let m1 = mapper.clone();
+            let b1 = barrier.clone();
+            let m2 = mapper.clone();
+            let b2 = barrier.clone();
+
+            let h1 = thread::spawn(move || {
+                b1.wait();
+                m1.scale_up(1)
+            });
+            let h2 = thread::spawn(move || {
+                b2.wait();
+                m2.scale_up(1)
+            });
+
+            let r1 = h1.join().unwrap();
+            let r2 = h2.join().unwrap();
+
+            let oks = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+            let cooldowns = [&r1, &r2]
+                .iter()
+                .filter(|r| matches!(r, Err(ScalingError::InCooldown)))
+                .count();
+
+            assert_eq!(
+                oks, 1,
+                "iter {iter}: expected exactly one Ok, got r1={r1:?}, r2={r2:?}"
+            );
+            assert_eq!(
+                cooldowns, 1,
+                "iter {iter}: expected exactly one InCooldown, got r1={r1:?}, r2={r2:?}"
+            );
+            assert_eq!(
+                mapper.active_shard_count(),
+                3,
+                "iter {iter}: cooldown violated — both calls mutated state (shard count {})",
+                mapper.active_shard_count()
+            );
+        }
     }
 
     #[test]

@@ -153,6 +153,30 @@ Every field is used by at least one layer. Forwarding nodes read one cache line,
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
+## Routing Header (18 bytes)
+
+Routed (multi-hop) packets prepend an 18-byte routing header to the Net header. Direct packets use the Net header alone.
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   ROUTING_MAGIC ("RT" = 0x52,0x54)  |  TTL  |   HOP_COUNT   |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     FLAGS     |   RESERVED    |          SRC_ID (low)         |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|          SRC_ID (high)        |        DEST_ID (lowest)       |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       DEST_ID (middle)                        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|        DEST_ID (highest)      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+`ROUTING_MAGIC` is the ASCII bytes `"RT"` (`0x52, 0x54`) on the wire, or `0x5452` as a little-endian `u16`. It's chosen disjoint from the Net header's `MAGIC = 0x4E45` so the receive loop distinguishes the two formats by peeking at bytes 0-1 alone. The previous 16-byte layout placed `dest_id` at bytes 0-7, which let a 1-in-65 536 `node_id` collide with `MAGIC` and silently mis-classify its own incoming routed packets as direct packets. Any node controls the collision probability by its own hash, so the 18-byte layout with explicit tag is the only reliable fix.
+
+`SRC_ID` is the 32-bit routing-id projection of a node's 64-bit node_id (top bits truncated). `DEST_ID` is the full 64-bit node_id. `TTL` decrements at each forwarder; `HOP_COUNT` increments. `FLAGS` carry the `RouteFlags` bitmask (control / requires-ack / priority / end-of-stream).
+
 ## Performance
 
 Benchmarked on Apple M1 Max, macOS.
@@ -910,7 +934,7 @@ cargo bench --bench parallel
 | `0x1000..0xEFFF` | Vendor / third-party |
 | `0xF000..0xFFFF` | Experimental / ephemeral |
 
-Note: handshake relay no longer consumes a subprotocol ID — it rides as a routed Net packet with the `HANDSHAKE` flag in the routing header, sharing the forwarding path with data packets.
+Note: handshake relay no longer consumes a subprotocol ID — it rides as a routed Net packet with the `HANDSHAKE` flag set in the **Net header's** `PacketFlags`, wrapped in the 18-byte routing header for forwarding, sharing the forwarding path with data packets.
 
 ## License
 
