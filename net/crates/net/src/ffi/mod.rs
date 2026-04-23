@@ -627,7 +627,11 @@ fn parse_poll_request_json(json_str: &str) -> Result<ConsumeRequest, c_int> {
     let limit = match value.get("limit") {
         None | Some(serde_json::Value::Null) => 100usize,
         Some(v) => match v.as_u64() {
-            Some(n) => n as usize,
+            // `as usize` would silently truncate on 32-bit targets for
+            // values above `usize::MAX`. Reject such inputs explicitly
+            // so a caller asking for e.g. 2^33 events on a wasm32
+            // build gets `InvalidJson` instead of a tiny wrap-around.
+            Some(n) => usize::try_from(n).map_err(|_| c_int::from(NetError::InvalidJson))?,
             None => return Err(NetError::InvalidJson.into()),
         },
     };
@@ -1323,5 +1327,28 @@ mod tests {
         let req = parse_poll_request_json(r#"{"limit": null, "cursor": null}"#).unwrap();
         assert_eq!(req.limit, 100);
         assert_eq!(req.from_id, None);
+    }
+
+    /// `usize::MAX` is always a valid usize regardless of target
+    /// pointer width, so it must parse successfully on both 32- and
+    /// 64-bit builds. This pins the boundary case.
+    #[test]
+    fn test_parse_poll_request_limit_at_usize_max() {
+        let json = format!(r#"{{"limit": {}}}"#, usize::MAX);
+        let req = parse_poll_request_json(&json).unwrap();
+        assert_eq!(req.limit, usize::MAX);
+    }
+
+    /// Regression: `as usize` silently truncates on 32-bit targets
+    /// for `u64` values above `usize::MAX`. The parser must return
+    /// `InvalidJson` instead of wrapping. We only run this on 32-bit
+    /// targets because on 64-bit `usize::MAX == u64::MAX`, leaving
+    /// nothing that fits in u64 but not usize.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn test_parse_poll_request_limit_overflows_usize_on_32bit() {
+        // 2^33 — fits in u64, but exceeds usize::MAX on a 32-bit build.
+        let err = parse_poll_request_json(r#"{"limit": 8589934592}"#).unwrap_err();
+        assert_eq!(err, c_int::from(NetError::InvalidJson));
     }
 }
