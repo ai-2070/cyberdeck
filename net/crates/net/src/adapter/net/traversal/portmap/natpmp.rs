@@ -475,14 +475,31 @@ impl PortMapperClient for NatPmpMapper {
                 lifetime: granted,
                 ..
             } => {
-                // External IP from the cached probe response.
-                // If the caller somehow skipped probe (shouldn't
-                // happen via `PortMapperTask`), the mapper falls
-                // back to pairing the mapped port with the
-                // gateway's own IP — incorrect for multi-hop
-                // NAT but better than refusing to produce a
-                // mapping at all.
-                let external_ip = self.cached_external().unwrap_or(self.gateway);
+                // External IP comes from the cached probe response.
+                // If probe wasn't run (or returned an error that
+                // left the cache empty), we refuse to produce a
+                // mapping rather than silently substituting
+                // `self.gateway` — that field holds the router's
+                // *private* LAN address, and publishing it as
+                // the mapping's "external" surface would poison
+                // the capability announcement with an
+                // unroutable-from-outside address.
+                //
+                // Legitimate callers go through `PortMapperTask`
+                // or `SequentialMapper`, both of which probe
+                // before install. A direct consumer reaching here
+                // without probing is a misuse — surface it as a
+                // transport error with a diagnostic so the
+                // operator finds the missing step instead of
+                // staring at peers that can't reach them.
+                let external_ip = self.cached_external().ok_or_else(|| {
+                    PortMappingError::Transport(
+                        "NAT-PMP install called before successful probe — \
+                         external address cache empty, refusing to publish \
+                         gateway's private IP as external"
+                            .into(),
+                    )
+                })?;
                 Ok(PortMapping {
                     external: SocketAddr::new(IpAddr::V4(external_ip), mapped_port),
                     internal_port,
@@ -1145,5 +1162,76 @@ mod tests {
         );
 
         drop(silent);
+    }
+
+    /// Regression test for the `.unwrap_or(self.gateway)` audit
+    /// (FAILURE_PATH_HARDENING_PLAN pre-flight): `install` must
+    /// refuse to produce a `PortMapping` when `cached_external`
+    /// is empty, rather than silently substituting the gateway's
+    /// private LAN IP as the mapping's external address.
+    ///
+    /// Scenario: a mock gateway cheerfully answers `MapUdp`
+    /// install requests with success — but we never call
+    /// `probe`, so the mapper has no cached external IP. The
+    /// old code path returned `Ok(PortMapping { external: <LAN
+    /// gateway IP>, .. })`, poisoning downstream capability
+    /// announcements. The new behavior surfaces a `Transport`
+    /// error so the caller finds the missing precondition
+    /// instead of publishing an unroutable address to peers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_without_prior_probe_refuses_rather_than_publishing_gateway_ip() {
+        // Mock gateway that responds to MapUdp but would fail
+        // any ExternalAddress probe (returns None → client
+        // times out). We never send a probe in this test, so
+        // the probe-response behavior doesn't matter.
+        let (port, gw) = spawn_mock_gateway(|req| {
+            if req.len() == MAP_REQUEST_LEN
+                && req[0] == NATPMP_VERSION
+                && req[1] == OP_MAP_UDP
+            {
+                let internal = u16::from_be_bytes([req[4], req[5]]);
+                Some(encode_map_success(internal, internal, 3600))
+            } else {
+                None
+            }
+        })
+        .await;
+
+        let mapper = NatPmpMapper::new_for_test(Ipv4Addr::LOCALHOST, port);
+        assert!(
+            mapper.cached_external().is_none(),
+            "freshly-constructed mapper must have an empty external-IP cache",
+        );
+
+        // Call install directly, without a preceding probe.
+        // The round-trip succeeds (gateway returns MapUdp
+        // success), but the mapper has no cached external IP
+        // to pair with the mapped port. The new behavior must
+        // refuse rather than substitute `self.gateway`
+        // (which is the router's private LAN address).
+        let res = mapper.install(9001, Duration::from_secs(3600)).await;
+
+        match res {
+            Err(PortMappingError::Transport(msg)) => {
+                assert!(
+                    msg.contains("install called before successful probe"),
+                    "error detail must identify the precondition violation; got {msg:?}",
+                );
+            }
+            Ok(mapping) => panic!(
+                "install must NOT silently substitute the gateway LAN IP — \
+                 got mapping with external={:?}. Pre-fix behavior would publish \
+                 the gateway's private address to capability announcements",
+                mapping.external,
+            ),
+            Err(other) => panic!(
+                "expected Transport(<precondition msg>); got {other:?}",
+            ),
+        }
+
+        // And the cache is still empty — a refused install
+        // must not somehow populate the cache as a side effect.
+        assert!(mapper.cached_external().is_none());
+        gw.abort();
     }
 }
