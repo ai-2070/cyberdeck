@@ -28,7 +28,7 @@ A node is identified by an **ed25519 keypair**. The public key is the node ID. T
 
 In Kafka, a topic is a thing — a partitioned log living on a broker cluster, with retention policy, replication factor, and a leader per partition. In NATS, a subject is also a thing — the broker holds the subscription registry and routes messages.
 
-In Net, a channel is just a *name to match on*. There is no broker holding a subscription registry. The publisher holds the subscriber roster directly. A subscriber asks the publisher (or any reachable node) to be added to the roster for channel name X. When the publisher emits, it does N per-peer unicasts over its already-encrypted sessions to every roster member.
+In Net, a channel is just a *name to match on*. There is no broker holding a subscription registry. The publisher holds the subscriber roster directly. A subscriber asks the publisher (or any reachable node) to be added to the roster for channel name X. When the publisher emits, it does N per-peer unicasts to every roster member. On the **mesh** transport those unicasts ride already-encrypted sessions end-to-end; on **memory** there is no wire; on **Redis / JetStream** the payload sits in plaintext at the broker and transport security is whatever you configured for that system (TLS, etc.). See the "Encryption" section below for the full picture.
 
 Consequences:
 - **Publish-without-subscribers is a no-op.** The roster is empty, the fan-out loop runs zero times. No buffer fills up at a broker, because there is no broker.
@@ -36,7 +36,12 @@ Consequences:
 - **Channels cost nothing when idle.** A channel with zero subscribers consumes zero resources mesh-wide. There's no metadata to maintain.
 - **Channels with thousands of subscribers work.** They just fan out more packets. The cost is linear in subscriber count, paid by the publisher node.
 
-In TS and Python, the named-channel API is exposed as `node.channel("name")`. In Rust, Go, and C, there is no named-channel helper — you publish typed events on a single firehose and consumers filter on the receive side. (See `apis.md`.)
+The named-channel API exists in TS and Python (`node.channel("name")`). The other SDKs do not have it, and they don't all replace it the same way:
+
+- **Rust** has a typed firehose: `node.emit(&MyType)` and `node.subscribe_typed::<T>()`. Consumers receive every event of that type and filter on payload content.
+- **Go and C** have neither named channels nor a typed firehose. They use raw JSON ingest + cursor-based polling: `bus.IngestRaw(json)` / `bus.Poll(limit, cursor)` (Go) and `net_ingest_raw` / `net_poll_ex` (C). Consumers parse the JSON in their own loop.
+
+(See `apis.md` for the per-SDK code.)
 
 ## Subscriber
 
@@ -75,7 +80,7 @@ Sharding (`shards` / `num_shards`) is the parallelism knob — more shards = mor
 
 ## Transport
 
-A node's transport is what physically moves bytes between nodes. The same publish/subscribe code works across all transports — **the choice is at node construction, not in your application logic.** This is the second most important concept after "a channel is a name."
+A node's transport is what physically moves bytes between nodes. In TS, Python, and Rust, the same publish/subscribe code works across all transports — **the choice is at node construction, not in your application logic.** This is the second most important concept after "a channel is a name." (The Go and C bindings are poll-based and currently expose a smaller, more transport-coupled surface — switching transports there may require code changes; see `apis.md`.)
 
 | Transport | When to use | Notes |
 |---|---|---|
@@ -86,7 +91,7 @@ A node's transport is what physically moves bytes between nodes. The same publis
 
 Selection happens via constructor parameters — see `apis.md`. **A node can have only one transport at a time** (it's set at construction). To bridge transports, run two nodes in the same process.
 
-The application code does not know which transport it got. Code written for the memory transport runs unmodified on mesh transport. This is the "location-transparent consumption" property — the call signature for `publish` is identical whether the subscriber is in the same process or five hops away on a different continent.
+In TS, Python, and Rust, application code does not know which transport it got. Code written for the memory transport runs unmodified on mesh transport. This is the "location-transparent consumption" property — the call signature for `publish` is identical whether the subscriber is in the same process or five hops away on a different continent. (Go and C are an exception: their poll-based surface and current binding shape can require explicit changes when switching transports — `NewMeshNode` for mesh, etc.)
 
 ## Encryption (for mesh transport)
 

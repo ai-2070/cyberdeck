@@ -29,7 +29,7 @@ You have several reference files in this directory. Load them on demand — do n
 
 If you remember nothing else from `concepts.md`, remember these five things — they are what makes Net different from every other bus:
 
-1. **There is no broker.** A channel is a name, not a process. The publisher holds the subscriber list. Fan-out is N per-peer unicasts over already-encrypted sessions. "The bus" is the mesh of nodes themselves; nothing to provision, scale, or fail over.
+1. **There is no broker.** A channel is a name, not a process. The publisher holds the subscriber list. Fan-out is N per-peer unicasts. On the **mesh** transport those unicasts ride already-encrypted sessions end-to-end; on **memory** there is no wire at all; on **Redis / JetStream** payloads sit in plaintext at the broker and rely on that system's TLS for transport security. "The bus" is the mesh of nodes themselves; nothing to provision, scale, or fail over.
 
 2. **Backpressure is silence, not a signal.** Overloaded nodes drop packets and stop responding. They do not tell the sender. Neighbors detect the silence within a heartbeat and the mesh routes around them. Producers do not slow down — the mesh finds a different consumer.
 
@@ -37,7 +37,7 @@ If you remember nothing else from `concepts.md`, remember these five things — 
 
 4. **Every node is a peer.** No clients, no servers. Producer and consumer are the same primitive (`NetNode` / `Net`). A node can publish, subscribe, relay, and persist all at once.
 
-5. **The transport is a runtime choice, not a code change.** The same publish/subscribe code works in-process (memory transport), across a LAN (mesh), through Redis, or via JetStream. You pick the transport at node construction. The application code does not know which one it got.
+5. **In TS, Python, and Rust, the transport is a runtime choice, not a code change.** The same publish/subscribe code works in-process (memory), across a LAN (mesh), through Redis, or via JetStream — you pick the transport at node construction and application logic doesn't know which one it got. **Go and C are different**: their API surface is poll-based regardless of transport, and the binding currently exposes a smaller, transport-specific surface, so swapping transports may require code changes (e.g. `NewMeshNode` constructor for mesh). Confirm against the SDK source when designing for portability across these.
 
 If the user's design language conflicts with any of these (e.g. "the broker", "the cluster", "consumer group", "partition leader"), stop and read `gotchas.md` — they're carrying assumptions from another system that will break here.
 
