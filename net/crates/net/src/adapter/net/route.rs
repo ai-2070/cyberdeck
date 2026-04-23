@@ -16,9 +16,9 @@ use std::time::Instant;
 /// Layout is `magic(2) + ttl(1) + hop_count(1) + flags(1) + _reserved(1)
 /// + src_id(4) + dest_id(8)` = 18 bytes. The magic tag at bytes 0-1
 /// unambiguously distinguishes routing headers from direct Net
-/// packets (whose own magic is [`super::protocol::MAGIC`]) so the
-/// receive-loop discriminator doesn't depend on `dest_id` happening
-/// to not collide with `0x4E45`.
+/// packets (whose own magic is `0x4E45`) so the receive-loop
+/// discriminator doesn't depend on `dest_id` happening to not
+/// collide with it.
 pub const ROUTING_HEADER_SIZE: usize = 18;
 
 /// Magic bytes identifying a routing header: `[0x52, 0x54]` on the
@@ -83,13 +83,14 @@ impl RouteFlags {
 /// └───────────────────────────────────────────────────────────────────┘
 /// ```
 ///
-/// `magic` is always [`ROUTING_MAGIC`] (`0x5254`), distinct from the
-/// direct-packet magic `0x4E45` ([`super::protocol::MAGIC`]). The
-/// receive-loop discriminator reads bytes 0-1 alone and dispatches
-/// unambiguously — the previous 16-byte layout put `dest_id` at bytes
-/// 0-7, and any recipient whose `node_id` had low-16-bits equal to
-/// the direct-packet magic (~1 in 65 536) silently mis-classified
-/// its own incoming routed packets as Net packets.
+/// `magic` is always `ROUTING_MAGIC` (ASCII `"RT"` on the wire —
+/// `0x5452` as a little-endian `u16`), distinct from the direct-
+/// packet magic `0x4E45`. The receive-loop discriminator reads bytes
+/// 0-1 alone and dispatches unambiguously — the previous 16-byte
+/// layout put `dest_id` at bytes 0-7, and any recipient whose
+/// `node_id` had low-16-bits equal to the direct-packet magic
+/// (~1 in 65 536) silently mis-classified its own incoming routed
+/// packets as Net packets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct RoutingHeader {
@@ -147,7 +148,7 @@ impl RoutingHeader {
     /// Serialize to bytes.
     ///
     /// The magic tag rides at bytes 0-1 so the receive-loop
-    /// discriminator reads it directly — see [`ROUTING_MAGIC`].
+    /// discriminator reads it directly — see `ROUTING_MAGIC`.
     pub fn to_bytes(&self) -> [u8; ROUTING_HEADER_SIZE] {
         let mut buf = [0u8; ROUTING_HEADER_SIZE];
         buf[0..2].copy_from_slice(&ROUTING_MAGIC.to_le_bytes());
