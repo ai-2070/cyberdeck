@@ -174,8 +174,17 @@ Three options for covering the DashMap-heavy cores:
 
 ## Stage 3 — Failure-injection integration-test matrix
 
-**Cost:** 2-3 weeks.
-**Setup:** Extend the existing `punch_topology` / `build_node` helpers with a `chaos` module that supports: `crash_task(handle)`, `panic_in_callback(hook)`, `drop_next_packet(filter)`, `delay_next_packet(filter, duration)`.
+**Status:** harness landed at `tests/common/mod.rs`; first vertical slice (failure-detector × 4 failure modes + 1 composite) landed at `tests/failure_detector_matrix.rs`; one existing test (`peer_death_evicts_peer_map.rs`) refactored onto the harness as a proof-point (137 lines → 75 lines, identical behavior).
+
+**Cost:** 2-3 weeks for the full matrix. This first pass proved the pattern in ~1 day.
+
+**Harness.** `tests/common/mod.rs` centralizes the patterns the five pre-existing failure-injection tests each reimplemented:
+
+- **Setup:** `fast_fd_config` (heartbeat=100 ms, session_timeout=500 ms → Failed after ~1.5 s), `build_fast_node`, `build_node_with(cfg)`, `connect_pair`.
+- **Polling:** `await_condition`, `await_peer_failed`, `await_peer_recovered`, `await_capability_index_evicts`, `await_peer_count`.
+- **Chaos injection:** `chaos_partition` (bilateral), `chaos_heal`, `chaos_one_sided_block`, `chaos_one_sided_heal`, `drive_failure_detection`.
+
+Cargo's integration-test model treats `tests/common/` as a shared module, not a test binary — each test file adds `mod common; use common::*;` and picks up the harness.
 
 **Matrix.** For each (subprotocol, phase, failure-mode) triple, one test asserting the documented invariant survives the failure.
 
@@ -185,7 +194,49 @@ Phases (per subprotocol): roughly `init → negotiate → establish → steady �
 
 Failure modes: `peer-crash-mid-phase`, `wire-packet-drop`, `wire-packet-duplicate`, `wire-packet-reorder`, `wire-packet-delay`, `clock-jump-forward`, `clock-jump-backward`, `partition-split`, `partition-heal-mid-phase`, `resource-exhaustion`.
 
-**Existing tests this generalizes.** `tests/peer_death_clears_capability_index.rs`, `tests/migration_target_failure_mid_chunking.rs`, and `tests/rendezvous_coordinator.rs`'s staleness case are hand-crafted instances. The matrix systematizes what's currently ad-hoc.
+### Coverage map (today)
+
+Green = harness-backed, ad-hoc = pre-harness test covering the cell, empty = not yet covered.
+
+| Subprotocol ↓ / Failure mode → | peer-crash | partition-split | partition-heal | wire-drop | wire-delay | wire-reorder | wire-duplicate | clock-jump | resource-exh |
+|--|--|--|--|--|--|--|--|--|--|
+| `failure-detector` | ✅ harness | ✅ harness | ✅ harness | — | — | — | — | — | — |
+| `capability` | ✅ harness + ad-hoc | — | — | — | — | — | — | — | — |
+| `migration` | ad-hoc | — | — | — | — | — | — | — | — |
+| `rendezvous` | ad-hoc | — | — | — | — | — | — | — | — |
+| `channel` | — | — | — | — | — | — | — | — | — |
+| `handshake` | — | — | — | — | — | — | — | — | — |
+| `pingwave` | — | — | — | — | — | — | — | — | — |
+| `reflex-probe` | — | — | — | — | — | — | — | — | — |
+| `port-mapping` | — | — | — | — | — | — | — | — | — |
+| `partition` | — | — | — | — | — | — | — | — | — |
+
+**Existing ad-hoc cells** (pre-harness, valid but not yet refactored):
+- `tests/peer_death_clears_capability_index.rs` → `capability × peer-crash`.
+- `tests/migration_target_failure_mid_chunking.rs` → `migration × peer-crash (mid-Transfer phase)`.
+- `tests/rendezvous_coordinator.rs` staleness case → `rendezvous × peer-crash (post-announce TTL expiry)`.
+
+### Harness-blocked failure modes
+
+Four failure modes in the plan matrix cannot be implemented today without extending the crate's public API:
+
+- **`wire-packet-drop`, `wire-packet-delay`, `wire-packet-reorder`, `wire-packet-duplicate`** — require a dispatch-layer interception hook on `MeshNode`. `LossSimulator` exists as a standalone struct (`src/adapter/net/failure.rs:337-472`) but is not wired into `MeshNode`'s `DispatchCtx::recv_batch` path. A small additive change (install an optional `Box<dyn PacketFilter>` on the dispatch ctx) would unblock all four cells across every subprotocol.
+- **`clock-jump-forward`, `clock-jump-backward`** — require a deterministic-time-injection layer. Today every timeout calls `Instant::now()` or `SystemTime::now()` directly; a `Clock` trait threaded through the TTL / GC / session-timeout machinery would unblock. Non-trivial refactor; independently valuable as a Stage 4 prerequisite.
+- **`resource-exhaustion`** — OOM / socket-limit / memory-pressure simulation is outside Rust's safe surface. Best implemented as a wrapper script around `cgroups` / `ulimit` on Linux; testable but structurally different from the in-process harness.
+
+The eight cells for `partition-split` × `{channel, handshake, pingwave, reflex-probe, port-mapping, partition, ...}` and `partition-heal` × same are NOT blocked — they just need writing. Each cell is ~20 lines with the harness.
+
+### Vertical slice landed (proof of harness design)
+
+`tests/failure_detector_matrix.rs` — 5 tests, all green (1.84 s total):
+
+1. `bilateral_partition_marks_peer_failed_on_both_sides` — baseline "partition → failure" invariant.
+2. `partition_heal_recovers_peer_to_healthy_status` — recovery path of the FD state machine.
+3. `one_sided_block_marks_peer_failed_from_blocking_side` — asymmetric block (observer sees peer as gone).
+4. `partition_of_one_peer_does_not_mark_unrelated_peers_failed` — three-node, partition A↔B, assert C stays Healthy on A.
+5. `peer_failure_clears_capability_index_via_harness` — composite: the P1-5 three-way-agreement invariant falls out of `await_peer_failed` + `await_capability_index_evicts`.
+
+Adding a new matrix cell on top of the harness is ~20 lines; the `peer_death_evicts_peer_map.rs` refactor (137 → 75 lines) is a worked example of the compression.
 
 **Invariants the matrix asserts (examples):**
 
@@ -195,9 +246,13 @@ Failure modes: `peer-crash-mid-phase`, `wire-packet-drop`, `wire-packet-duplicat
 - Channel rosters converge within `N × heartbeat_interval` of partition heal.
 - No duplicate event delivery across partition heal.
 
-**ROI rationale.** This is where the hand-authored sweep hit diminishing returns: each new test is ~100 lines and covers one cell of the matrix. Mechanizing the matrix means 50 tests generated from a 200-line harness instead of 50 × 100 = 5,000 lines of hand-written code. More importantly, it forces explicit enumeration: when a new subprotocol lands, it gets N rows in the matrix by default rather than being silently untested against partition heal.
+**ROI rationale.** Before the harness landed, each new test was ~100 lines of setup + polling + assertion boilerplate. With the harness, matrix cells are ~20 lines. The worked example (137 → 75) shows the compression on an existing test; new tests compress even more because they don't need to repeat the production-bug preamble.
 
-**Exit criterion.** Every subprotocol has a row for every failure-mode, and every cell is either a passing test or a documented "this combination isn't meaningful because X." No cell is silently missing.
+**Exit criterion (revised).**
+
+- Coverage map has no blank cells without a documented blocker.
+- Harness-blocked failure modes (`wire-*`, `clock-*`, `resource-exhaustion`) have a dated follow-up issue or a committed refactor plan.
+- Every ad-hoc failure-injection test is either refactored onto the harness or has a committed rationale for staying pre-harness.
 
 ---
 
