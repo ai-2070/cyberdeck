@@ -140,8 +140,14 @@ async fn concurrent_send_to_unknown_peer_is_consistently_errored() {
             Err(other) => panic!("unexpected error variant: {other:?}"),
         }
     }
-    assert_eq!(ok_count, 0, "no concurrent send should have spuriously succeeded");
-    assert_eq!(err_count, 16, "every concurrent send should have errored cleanly");
+    assert_eq!(
+        ok_count, 0,
+        "no concurrent send should have spuriously succeeded"
+    );
+    assert_eq!(
+        err_count, 16,
+        "every concurrent send should have errored cleanly"
+    );
 }
 
 /// `block_peer(addr)` adds the addr to the partition filter.

@@ -149,7 +149,9 @@ async fn capability_index_is_cleared_when_failure_detector_marks_peer_failed() {
     // Wait for R to index B's reflex — proxy for "announcement
     // has been absorbed by R's capability index."
     assert!(
-        wait_for(Duration::from_secs(3), || r.peer_reflex_addr(b_id) == Some(b_bind)).await,
+        wait_for(Duration::from_secs(3), || r.peer_reflex_addr(b_id)
+            == Some(b_bind))
+        .await,
         "R should index B's announced reflex; got {:?}",
         r.peer_reflex_addr(b_id),
     );
@@ -201,9 +203,7 @@ async fn capability_index_is_cleared_when_failure_detector_marks_peer_failed() {
     // silently. A times out with PunchFailed — the same outcome
     // as "B never announced" (see §P1-4 test).
     let start = tokio::time::Instant::now();
-    let result = a
-        .request_punch(r.node_id(), b_id, a.local_addr())
-        .await;
+    let result = a.request_punch(r.node_id(), b_id, a.local_addr()).await;
     let elapsed = start.elapsed();
 
     match result {

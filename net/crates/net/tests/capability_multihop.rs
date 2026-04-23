@@ -521,7 +521,10 @@ async fn version_collision_from_same_origin_is_dropped_at_dedup_cache() {
 
     let first_filter = CapabilityFilter::new().require_tag("first");
     assert!(
-        wait_until(&b, |n| n.find_peers_by_filter(&first_filter).contains(&a_id)).await,
+        wait_until(&b, |n| n
+            .find_peers_by_filter(&first_filter)
+            .contains(&a_id))
+        .await,
         "B should index announcement #1 (tag=first, v=42)",
     );
 

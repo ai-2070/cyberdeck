@@ -323,8 +323,7 @@ mod tests {
 
         // Cousin case: tag where the stripped value is a *prefix*
         // of a values-map entry doesn't match either.
-        let policy = SubnetPolicy::new()
-            .add_rule(SubnetRule::new("region:", 0).map("us-west", 1));
+        let policy = SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0).map("us-west", 1));
         let caps = caps_with_tags(&["region:us"]);
         assert_eq!(
             policy.assign(&caps),
@@ -340,8 +339,8 @@ mod tests {
     /// lands in the level slot.
     #[test]
     fn first_tag_wins_within_a_single_rule() {
-        let policy = SubnetPolicy::new()
-            .add_rule(SubnetRule::new("region:", 0).map("us", 1).map("eu", 2));
+        let policy =
+            SubnetPolicy::new().add_rule(SubnetRule::new("region:", 0).map("us", 1).map("eu", 2));
 
         // Tag order on the capability set is iterated in insertion
         // order (CapabilitySet uses a Vec). Whichever tag hits the

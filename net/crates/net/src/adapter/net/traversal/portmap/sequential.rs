@@ -73,8 +73,7 @@ impl SequentialMapper {
     ///   [`super::upnp::UpnpMapper::new`].
     pub fn new(gateway: Option<Ipv4Addr>, local_ip: IpAddr) -> Self {
         Self {
-            nat_pmp: gateway
-                .map(|g| Box::new(NatPmpMapper::new(g)) as Box<dyn PortMapperClient>),
+            nat_pmp: gateway.map(|g| Box::new(NatPmpMapper::new(g)) as Box<dyn PortMapperClient>),
             upnp: Box::new(UpnpMapper::new(local_ip)),
             active: Mutex::new(None),
         }

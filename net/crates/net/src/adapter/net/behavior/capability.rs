@@ -1826,7 +1826,10 @@ mod tests {
         let removed = index.gc();
         assert_eq!(removed, 1, "zero-TTL entry must be evicted on first gc");
         assert_eq!(index.stats().node_count, 0);
-        assert!(index.get(1).is_none(), "evicted entry must not be queryable");
+        assert!(
+            index.get(1).is_none(),
+            "evicted entry must not be queryable"
+        );
     }
 
     /// A u32::MAX-TTL announcement (~136 years in seconds) must
@@ -1875,7 +1878,8 @@ mod tests {
             let index = index.clone();
             thread::spawn(move || {
                 for v in 1..=iters {
-                    let ann = CapabilityAnnouncement::new(42, test_entity(), v, sample_capability_set());
+                    let ann =
+                        CapabilityAnnouncement::new(42, test_entity(), v, sample_capability_set());
                     index.index(ann);
                 }
             })
@@ -1911,7 +1915,10 @@ mod tests {
         // Final state: node 42 is present, at some version
         // between 1 and `iters`. No data structure corruption.
         let final_entry = index.get(42);
-        assert!(final_entry.is_some(), "node 42 must be indexed after the race");
+        assert!(
+            final_entry.is_some(),
+            "node 42 must be indexed after the race"
+        );
     }
 
     // ========================================================================
@@ -1938,9 +1945,9 @@ mod tests {
         let cases: &[(u64, u32, bool)] = &[
             (100, 0, true),
             (101, 1, false),
-            (102, 3_600, false),          // 1 hour
-            (103, 31_536_000, false),     // 1 year
-            (104, u32::MAX, false),       // ~136 years
+            (102, 3_600, false),      // 1 hour
+            (103, 31_536_000, false), // 1 year
+            (104, u32::MAX, false),   // ~136 years
         ];
 
         for &(node_id, ttl_secs, should_evict) in cases {
@@ -2026,8 +2033,8 @@ mod tests {
     /// or leak the `DEFAULT_TTL_SECS` default through.
     #[test]
     fn with_ttl_mutation_round_trips_through_is_expired_and_gc() {
-        let ann = CapabilityAnnouncement::new(9, test_entity(), 1, sample_capability_set())
-            .with_ttl(0);
+        let ann =
+            CapabilityAnnouncement::new(9, test_entity(), 1, sample_capability_set()).with_ttl(0);
         assert_eq!(ann.ttl_secs, 0, "with_ttl must write through");
 
         let index = CapabilityIndex::new();

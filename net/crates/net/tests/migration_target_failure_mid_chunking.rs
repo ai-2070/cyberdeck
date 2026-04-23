@@ -373,4 +373,3 @@ fn reassembler_cancel_is_idempotent_across_repeated_target_failures() {
     r.feed(origin, vec![0u8; 16], seq + 1, 0, 1).unwrap();
     assert_eq!(r.pending_count(), 0);
 }
-

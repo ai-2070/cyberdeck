@@ -347,7 +347,10 @@ async fn request_punch_times_out_when_targets_reflex_was_evicted_by_ttl_gc() {
         r_for_poll.peer_reflex_addr(b_id) == Some(b_bind)
     })
     .await;
-    assert!(indexed, "R must index B's announcement before its TTL expires");
+    assert!(
+        indexed,
+        "R must index B's announcement before its TTL expires"
+    );
 
     // Now wait for the TTL (1 s) + a GC cycle (100 ms) + margin
     // so R has definitely evicted B.
