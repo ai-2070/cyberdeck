@@ -835,7 +835,7 @@ mod tests {
     #[test]
     fn pair_action_is_total_and_yields_one_of_three_actions() {
         const N: usize = 4_000;
-        let mut rng = Lcg::new(0xC0FFEE_F00D);
+        let mut rng = Lcg::new(0x00C0_FFEE_F00D);
         let valid = |a: PairAction| {
             matches!(
                 a,
