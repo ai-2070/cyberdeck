@@ -20,12 +20,17 @@
 // an SDK release.
 //
 // Corresponds to TEST_COVERAGE_PLAN §P3-15.
+//
+// The FFI round-trip test that actually exercises the Go↔C
+// uint64 boundary lives in `abi_stability_cgo_test.go`, gated
+// on `//go:build test_helpers` — cgo directives aren't allowed
+// inside `_test.go` files, so the helper lives in a paired
+// non-test file with the same build tag.
 
 package net
 
 import (
 	"errors"
-	"math"
 	"strings"
 	"testing"
 )
@@ -225,22 +230,3 @@ func TestABIStabilityParseMigrationErrorRoundTrip(t *testing.T) {
 	}
 }
 
-// TestABIStabilityBigIntBoundaryConstants pins the u64 boundary
-// values the SDK uses in conversions between Go `uint64` and the
-// native FFI. The raw constants aren't defined in the package,
-// but code in `capabilities.go` and elsewhere routes through the
-// `math` package; this asserts the values are what the FFI
-// contract documents (u64::MAX = 2^64-1, u64::MIN = 0) so a
-// refactor that accidentally narrows to int32 is caught here.
-func TestABIStabilityBigIntBoundaryConstants(t *testing.T) {
-	// If these ever get narrowed to int, the test file will fail
-	// to compile — a stronger signal than a runtime assertion.
-	const u64Max uint64 = math.MaxUint64
-	const u64Min uint64 = 0
-	if u64Max != ^uint64(0) {
-		t.Fatalf("math.MaxUint64 drifted from ^uint64(0)")
-	}
-	if u64Min != 0 {
-		t.Fatalf("u64Min drifted from 0")
-	}
-}

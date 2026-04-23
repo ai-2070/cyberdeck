@@ -1953,9 +1953,17 @@ mod tests {
     #[test]
     fn gc_respects_ttl_bounds_on_freshly_indexed_entries() {
         // (node_id, ttl_secs, expected_evicted_on_immediate_gc)
+        //
+        // NB: the smallest non-zero TTL is 10 s, not 1 s — a
+        // 1 s bound is timing-sensitive (a paused scheduler or
+        // CI VM stall between `index()` and `gc()` could push
+        // wall-clock age past the boundary and flip the
+        // assertion). 10 s leaves comfortable slack for CI
+        // under load while still covering the "short, non-zero
+        // TTL" class.
         let cases: &[(u64, u32, bool)] = &[
             (100, 0, true),
-            (101, 1, false),
+            (101, 10, false),         // 10 s — short but non-flaky
             (102, 3_600, false),      // 1 hour
             (103, 31_536_000, false), // 1 year
             (104, u32::MAX, false),   // ~136 years
