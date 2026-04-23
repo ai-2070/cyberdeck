@@ -588,18 +588,18 @@ Pool contention (thread-local acquire/release):
 
 | SDK | Method | Throughput | Latency |
 |-----|--------|------------|---------|
-| Go | IngestRaw (9B) | **2.65M/sec** | 377 ns |
-| Go | Batch (1000) | **2.44M/sec** | 411 ns/event |
-| Python | ingest_raw (9B) | **2.53M/sec** | 0.40 us |
-| Python | Batch (1000) | **2.78M/sec** | 0.36 us |
-| Node.js | pushBatch | **2.89M/sec** | 0.35 us |
-| Node.js | push (single) | **2.26M/sec** | 0.44 us |
-| Bun | Batch (1000) | **3.37M/sec** | 0.30 us |
-| Bun | push (single) | **2.05M/sec** | 0.49 us |
+| Go | IngestRaw (9B) | **4.01M/sec** | 249 ns |
+| Go | Batch (1000) | **4.77M/sec** | 210 ns/event |
+| Python | ingest_raw (9B) | **6.16M/sec** | 0.16 us |
+| Python | Batch (1000) | **6.80M/sec** | 0.15 us |
+| Node.js | pushBatch | **4.72M/sec** | 0.21 us |
+| Node.js | push (single) | **3.83M/sec** | 0.26 us |
+| Bun | pushBatch | **5.07M/sec** | 0.20 us |
+| Bun | push (single) | **3.95M/sec** | 0.25 us |
 
-Net core benchmarks (Routing through Multi-threaded Scaling, above) captured 2026-04-23. SDK Ingestion numbers above accurate as of April 15, 2026.
+All benchmarks re-captured 2026-04-23 on M1 Max with release-mode bindings.
 
-All SDKs exceed **2M events/sec** with optimal ingestion patterns. Go achieves zero allocations on raw ingestion. Node.js sync methods are 31x faster than async. Bun batch ingestion is ~17% faster than Node.js.
+All SDKs exceed **3.8M events/sec** even on single-event ingestion, and **4.7M+ events/sec** on batch. Go achieves zero allocations on raw ingestion. Node.js sync methods are ~40x faster than async (`push` 3.83M vs async `ingestRaw` 95K). Bun batch (5.07M) is ~7% faster than Node.js batch (4.72M) on the same `pushBatch` call. Python (via PyO3) is the fastest binding at 6.8M/sec — the GIL releases for the duration of the FFI call so per-event overhead is the bare PyO3 marshalling.
 
 ### RedEX (storage primitive)
 

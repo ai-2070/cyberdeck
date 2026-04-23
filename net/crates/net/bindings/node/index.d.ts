@@ -782,19 +782,6 @@ export declare class NetMesh {
   findPeers(filter: CapabilityFilterJs): Array<bigint>
   /** Shutdown the mesh node. */
   shutdown(): Promise<void>
-  /**
-   * **Test-only** helper for the vitest groups suite.
-   * Injects a synthetic capability announcement directly
-   * into the local capability index, simulating a peer
-   * announcement without going through a real handshake.
-   *
-   * Gated behind the `test-helpers` feature so it is
-   * **not** exported to production JS consumers. Enabling
-   * `groups` alone does not pull this in; vitest builds with
-   * `--features groups,test-helpers` explicitly. Production
-   * code uses the normal `announce_capabilities` path.
-   */
-  testInjectSyntheticPeer(nodeId: bigint): void
 }
 
 /**
@@ -1481,6 +1468,38 @@ export interface MeshOptions {
    * ephemeral ones. Treat as secret material.
    */
   identitySeed?: Buffer
+  /**
+   * Pin this mesh's publicly-advertised reflex to the
+   * supplied external `"ip:port"`. Classification is
+   * skipped; the node starts in `nat:open` and advertises
+   * this address on capability announcements.
+   *
+   * Use for port-forwarded servers (operator knows the
+   * external address) and stage-4 UPnP / NAT-PMP
+   * integration. **Optimization, not correctness** —
+   * nodes without an override still reach every peer via
+   * the routed-handshake path.
+   *
+   * Silently ignored when the Rust cdylib was built
+   * without `--features nat-traversal`.
+   */
+  reflexOverride?: string
+  /**
+   * Opt into opportunistic UPnP-IGD / NAT-PMP / PCP port
+   * mapping at `start()` time. When `true`, the mesh
+   * spawns a port-mapping task that probes NAT-PMP + UPnP,
+   * installs a mapping against the operator's router on
+   * success, pins the reflex to the mapped external, and
+   * renews every 30 min.
+   *
+   * **Optimization, not correctness.** Safe to set
+   * `true` on any network — the task degrades cleanly
+   * when no router responds.
+   *
+   * Silently ignored when the Rust cdylib was built
+   * without `--features port-mapping`.
+   */
+  tryPortMapping?: boolean
 }
 
 /**

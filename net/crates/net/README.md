@@ -199,10 +199,10 @@ Benchmarked on Apple M1 Max, macOS.
 | **Capability** | Filter (single tag) | 9.99 ns | 100M ops/sec |
 | **Capability** | GPU check | 0.31 ns | 3.20G ops/sec |
 | **Auth** | Bloom filter check | ~20 ns | 49.8M ops/sec |
-| **SDK** | Go raw ingest | 377 ns | 2.65M/sec |
-| **SDK** | Python batch ingest | 0.36 us | 2.78M/sec |
-| **SDK** | Node.js push batch | 0.35 us | 2.89M/sec |
-| **SDK** | Bun batch ingest | 0.30 us | 3.37M/sec |
+| **SDK** | Go raw ingest | 249 ns | 4.01M/sec |
+| **SDK** | Python batch ingest | 0.15 us | 6.80M/sec |
+| **SDK** | Node.js push batch | 0.21 us | 4.72M/sec |
+| **SDK** | Bun push batch | 0.20 us | 5.07M/sec |
 | **RedEX** | Append inline (≤8 B) | 47 ns | 21.3M ops/sec |
 | **RedEX** | Append heap (32 B) | 54 ns | 18.6M ops/sec |
 | **RedEX** | Append heap (256 B) | 97 ns | 10.3M ops/sec |
