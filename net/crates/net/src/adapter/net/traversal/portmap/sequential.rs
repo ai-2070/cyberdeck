@@ -176,6 +176,20 @@ impl PortMapperClient for SequentialMapper {
                 let Some(pmp) = self.nat_pmp.as_ref() else {
                     return Err(first_err);
                 };
+                // Probe before install: `NatPmpMapper::install`
+                // reads its external IP from the cache populated
+                // by `probe()`. Without this probe, a successful
+                // fallback install on a router whose NAT-PMP path
+                // is actually serving the gateway would publish
+                // the gateway's private LAN IP as the mapping's
+                // external address — cubic-flagged P1. The main
+                // path doesn't hit this because it uses whichever
+                // protocol's own `probe()` primed the cache; the
+                // fallback is the only cross-protocol transition,
+                // so it's the one that must re-probe.
+                if pmp.probe().await.is_err() {
+                    return Err(first_err);
+                }
                 match pmp.install(internal_port, ttl).await {
                     Ok(m) => {
                         self.set_active(Some(Protocol::NatPmp));
@@ -245,6 +259,7 @@ pub async fn sequential_mapper_from_os() -> Option<SequentialMapper> {
 mod tests {
     use super::*;
     use crate::adapter::net::traversal::portmap::MockPortMapperClient;
+    use std::sync::Arc;
 
     // NB: SequentialMapper composes concrete `NatPmpMapper` +
     // `UpnpMapper` clients — the trait field isn't generic. To
@@ -410,6 +425,103 @@ mod tests {
         assert!(
             seq.active_protocol().is_none(),
             "cache must be cleared when both installs fail",
+        );
+    }
+
+    /// Regression (cubic P1 follow-up): when UPnP is the cached
+    /// protocol and its install fails, the fallback to NAT-PMP
+    /// MUST call `probe()` before `install()`. Rationale: the
+    /// real `NatPmpMapper::install` reads its external IP from
+    /// a cache that only gets populated by `probe()`. If we
+    /// skip the probe, a successful install on a router whose
+    /// NAT-PMP path is up would publish the *gateway's LAN IP*
+    /// as the mapping's external address — visible on the
+    /// capability announcement to peers that then try to punch
+    /// to a private address. The fix probes first; this test
+    /// pins that ordering by queueing two successful probes on
+    /// the NAT-PMP mock and verifying the second (the fallback
+    /// one) is consumed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fallback_to_nat_pmp_probes_before_installing() {
+        let pmp = Arc::new(MockPortMapperClient::new());
+        // Probe #1: fails so the main-path probe lands on UPnP.
+        // Probe #2: succeeds — the fallback-path probe that the
+        // fix requires before install.
+        pmp.queue_probe(Err(PortMappingError::Unavailable));
+        pmp.queue_probe(Ok(()));
+        pmp.queue_install(Ok(sample_mapping(Protocol::NatPmp)));
+
+        let upnp = MockPortMapperClient::new();
+        upnp.queue_probe(Ok(()));
+        upnp.queue_install(Err(PortMappingError::Refused("upnp gateway busy".into())));
+
+        let seq = SequentialMapper::new_with_clients(Some(Box::new(pmp.clone())), Box::new(upnp));
+
+        // Main probe: NAT-PMP fails, UPnP wins.
+        seq.probe().await.expect("upnp probe should succeed");
+        assert_eq!(seq.active_protocol(), Some(Protocol::Upnp));
+
+        // Install: UPnP fails; fallback must probe NAT-PMP first,
+        // then install. Returns the NAT-PMP-tagged mapping.
+        let mapping = seq
+            .install(9001, Duration::from_secs(3600))
+            .await
+            .expect("fallback to NAT-PMP must succeed");
+        assert_eq!(mapping.protocol, Protocol::NatPmp);
+        assert_eq!(seq.active_protocol(), Some(Protocol::NatPmp));
+
+        // Probe queue on NAT-PMP must be empty — both queued
+        // probes were consumed (main-path + fallback-path). A
+        // regression that skipped the fallback probe would leave
+        // the second entry in the queue.
+        assert_eq!(
+            pmp.remaining_probes(),
+            0,
+            "fallback path must have consumed the queued NAT-PMP probe",
+        );
+    }
+
+    /// Companion: if the fallback's NAT-PMP probe fails, the
+    /// fallback must NOT call `install()` — any mapping
+    /// produced without a successful probe would carry the
+    /// gateway's LAN IP as its external address. The sequencer
+    /// surfaces the ORIGINAL UPnP error instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fallback_nat_pmp_probe_failure_surfaces_original_upnp_error() {
+        let pmp = Arc::new(MockPortMapperClient::new());
+        // Main-path probe: fails so UPnP wins.
+        pmp.queue_probe(Err(PortMappingError::Unavailable));
+        // Fallback-path probe: also fails — must short-circuit.
+        pmp.queue_probe(Err(PortMappingError::Transport("no responder".into())));
+        // Install: queued a success to prove it is NOT called.
+        // If the fix regressed and install ran, the sequencer
+        // would erroneously return Ok(sample_mapping).
+        pmp.queue_install(Ok(sample_mapping(Protocol::NatPmp)));
+
+        let upnp = MockPortMapperClient::new();
+        upnp.queue_probe(Ok(()));
+        upnp.queue_install(Err(PortMappingError::Refused("upnp gateway busy".into())));
+
+        let seq = SequentialMapper::new_with_clients(Some(Box::new(pmp.clone())), Box::new(upnp));
+        seq.probe().await.expect("upnp probe");
+
+        let err = seq
+            .install(9001, Duration::from_secs(3600))
+            .await
+            .expect_err("fallback probe failure must short-circuit");
+        match err {
+            PortMappingError::Refused(msg) => assert!(
+                msg.contains("upnp gateway busy"),
+                "must surface the original UPnP error, got {msg:?}",
+            ),
+            other => panic!("expected original UPnP Refused error, got {other:?}"),
+        }
+        // Install queue must be untouched — the fix must short-
+        // circuit BEFORE install when the probe fails.
+        assert_eq!(
+            pmp.remaining_installs(),
+            1,
+            "fallback install must NOT fire when the fallback probe fails",
         );
     }
 

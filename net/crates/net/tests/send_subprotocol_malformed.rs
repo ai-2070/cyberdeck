@@ -285,12 +285,32 @@ async fn receiver_survives_unknown_subprotocol_id() {
     // be dead; we verify the peer is still accepting new sends.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Prove B is still healthy: send to it via a known-good
-    // subprotocol ID (0x0500 — migration; safe to send without
-    // a daemon registered, it'll just be logged+dropped).
-    a.send_subprotocol(b_addr, 0x0500, b"after junk")
+    // Prove B's recv loop is *actually processing* packets, not
+    // just that A's UDP send returns Ok. (Cubic-flagged P2:
+    // `send_subprotocol(...).await` only confirms A enqueued to
+    // its local socket — a dead recv loop on B would pass that
+    // check.) Drive a real capability announcement from A and
+    // verify B's capability index observes it — that requires
+    // B's recv loop + dispatcher + capability handler all to be
+    // alive.
+    let a_id = a.node_id();
+    a.announce_capabilities(net::adapter::net::behavior::capability::CapabilitySet::new())
         .await
-        .expect("B's recv loop should still be processing after unknown-ID barrage");
+        .expect("real announce after junk barrage");
+    let mut propagated = false;
+    for _ in 0..40 {
+        if b.capability_index().get(a_id).is_some() {
+            propagated = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        propagated,
+        "B's receive loop must survive the unknown-ID barrage and still \
+         dispatch a follow-up capability announcement — if B's recv loop \
+         had died this would time out",
+    );
 }
 
 /// A malformed CapabilityAnnouncement payload — wrong magic, wrong

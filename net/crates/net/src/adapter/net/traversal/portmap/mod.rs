@@ -427,6 +427,22 @@ impl MockPortMapperClient {
     pub fn remove_call_count(&self) -> u32 {
         self.remove_calls.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Number of queued `probe()` responses not yet consumed.
+    /// Tests use this to assert a code path either DID or DID
+    /// NOT call `probe()` — e.g. the sequential-mapper fallback
+    /// must probe NAT-PMP before installing, so a regression
+    /// leaves an unconsumed probe entry behind.
+    pub fn remaining_probes(&self) -> usize {
+        self.probe_results.lock().len()
+    }
+
+    /// Number of queued `install()` responses not yet consumed.
+    /// Mirror of [`Self::remaining_probes`] — lets a test assert
+    /// that a code path short-circuited before calling install.
+    pub fn remaining_installs(&self) -> usize {
+        self.install_results.lock().len()
+    }
 }
 
 impl Default for MockPortMapperClient {

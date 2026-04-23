@@ -539,17 +539,20 @@ mod tests {
     /// corrupted) and no panic along the way.
     #[test]
     fn concurrent_authorize_and_revoke_on_same_key_is_panic_free() {
-        use std::sync::Arc;
+        use std::sync::{Arc, Barrier};
         use std::thread;
 
         let guard = Arc::new(AuthGuard::new());
         let origin = 0x1234_5678_9ABC_DEF0u64;
         let channel = 0x4242u16;
         let iters = 1_000u32;
+        let start = Arc::new(Barrier::new(3));
 
         let authorizer = {
             let guard = guard.clone();
+            let start = start.clone();
             thread::spawn(move || {
+                start.wait();
                 for _ in 0..iters {
                     guard.authorize(origin, channel);
                 }
@@ -557,7 +560,9 @@ mod tests {
         };
         let revoker = {
             let guard = guard.clone();
+            let start = start.clone();
             thread::spawn(move || {
+                start.wait();
                 for _ in 0..iters {
                     guard.revoke(origin, channel);
                 }
@@ -569,7 +574,9 @@ mod tests {
         // (covered by the other assertions after join).
         let observer = {
             let guard = guard.clone();
+            let start = start.clone();
             thread::spawn(move || {
+                start.wait();
                 for _ in 0..iters {
                     let _ = guard.is_authorized(origin, channel);
                     let _ = guard.check_fast(origin, channel);
@@ -609,18 +616,21 @@ mod tests {
     /// paths consult via `is_authorized_full`.
     #[test]
     fn concurrent_allow_and_revoke_channel_on_same_key_is_panic_free() {
-        use std::sync::Arc;
+        use std::sync::{Arc, Barrier};
         use std::thread;
 
         let guard = Arc::new(AuthGuard::new());
         let origin = 0xDEAD_BEEF_FEED_CAFEu64;
         let name = ChannelName::new("auth/contended").expect("channel name");
         let iters = 1_000u32;
+        let start = Arc::new(Barrier::new(3));
 
         let allower = {
             let guard = guard.clone();
             let name = name.clone();
+            let start = start.clone();
             thread::spawn(move || {
+                start.wait();
                 for _ in 0..iters {
                     guard.allow_channel(origin, &name);
                 }
@@ -629,7 +639,9 @@ mod tests {
         let revoker = {
             let guard = guard.clone();
             let name = name.clone();
+            let start = start.clone();
             thread::spawn(move || {
+                start.wait();
                 for _ in 0..iters {
                     guard.revoke_channel(origin, &name);
                 }
@@ -638,7 +650,9 @@ mod tests {
         let observer = {
             let guard = guard.clone();
             let name = name.clone();
+            let start = start.clone();
             thread::spawn(move || {
+                start.wait();
                 for _ in 0..iters {
                     let _ = guard.is_authorized_full(origin, &name);
                 }

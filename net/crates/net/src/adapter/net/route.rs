@@ -920,16 +920,19 @@ mod tests {
     /// the final metric is the minimum any thread inserted.
     #[test]
     fn concurrent_add_route_with_metric_converges_on_lowest_metric() {
-        use std::sync::Arc;
+        use std::sync::{Arc, Barrier};
         use std::thread;
 
         let table = Arc::new(RoutingTable::new(0x1111));
         let dest = 0x2222u64;
+        let start = Arc::new(Barrier::new(8));
 
         let mut handles = Vec::new();
         for metric in 1u16..=8 {
             let table = table.clone();
+            let start = start.clone();
             handles.push(thread::spawn(move || {
+                start.wait();
                 // Each thread hammers its own metric on the
                 // same destination 500 times. The dashmap entry
                 // API guarantees atomic compare-and-swap per
@@ -974,7 +977,7 @@ mod tests {
     /// stay pinned.
     #[test]
     fn direct_route_survives_concurrent_worse_indirect_inserts() {
-        use std::sync::Arc;
+        use std::sync::{Arc, Barrier};
         use std::thread;
 
         let table = Arc::new(RoutingTable::new(0x1111));
@@ -982,11 +985,14 @@ mod tests {
         let direct: SocketAddr = "127.0.0.1:2000".parse().unwrap();
         table.add_route(dest, direct);
         assert_eq!(table.lookup(dest), Some(direct));
+        let start = Arc::new(Barrier::new(9));
 
         let mut handles = Vec::new();
         for metric in 2u16..=10 {
             let table = table.clone();
+            let start = start.clone();
             handles.push(thread::spawn(move || {
+                start.wait();
                 let indirect: SocketAddr =
                     format!("127.0.0.1:{}", 20_000 + metric).parse().unwrap();
                 for _ in 0..500 {

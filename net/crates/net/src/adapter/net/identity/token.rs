@@ -1328,7 +1328,7 @@ mod tests {
     /// as a panic inside `iter().any(...)`).
     #[test]
     fn concurrent_insert_check_evict_is_panic_free() {
-        use std::sync::Arc;
+        use std::sync::{Arc, Barrier};
         use std::thread;
 
         let cache = Arc::new(TokenCache::new());
@@ -1337,6 +1337,10 @@ mod tests {
         let subject_id = subject_kp.entity_id().clone();
         let channel_hash = 0xABCDu16;
         let iters = 500u32;
+        // Start barrier — without it thread scheduling can let
+        // the evictor run its whole loop before the inserter
+        // even starts, trivializing the race.
+        let start = Arc::new(Barrier::new(3));
 
         // Inserter: re-issue + replace the token on each
         // iteration. Each insert overwrites the previous entry
@@ -1346,7 +1350,9 @@ mod tests {
             let cache = cache.clone();
             let issuer = issuer.clone();
             let subject_id = subject_id.clone();
+            let start = start.clone();
             thread::spawn(move || {
+                start.wait();
                 for _ in 0..iters {
                     let token = PermissionToken::issue(
                         &issuer,
@@ -1366,7 +1372,9 @@ mod tests {
         let checker = {
             let cache = cache.clone();
             let subject_id = subject_id.clone();
+            let start = start.clone();
             thread::spawn(move || {
+                start.wait();
                 for _ in 0..iters {
                     let _ = cache.check(&subject_id, TokenScope::SUBSCRIBE, channel_hash);
                 }
@@ -1380,7 +1388,9 @@ mod tests {
         // closure must run safely against the writer.
         let evictor = {
             let cache = cache.clone();
+            let start = start.clone();
             thread::spawn(move || {
+                start.wait();
                 for _ in 0..iters {
                     cache.evict_expired();
                 }
@@ -1416,7 +1426,7 @@ mod tests {
     /// a panic from a retain that ran mid-iter.
     #[test]
     fn evict_expired_races_with_check_without_panic() {
-        use std::sync::Arc;
+        use std::sync::{Arc, Barrier};
         use std::thread;
         use std::time::Duration;
 
@@ -1444,10 +1454,13 @@ mod tests {
             "pre-expiry check should succeed",
         );
 
+        let start = Arc::new(Barrier::new(2));
         let checker = {
             let cache = cache.clone();
             let subject_id = subject_id.clone();
+            let start = start.clone();
             thread::spawn(move || {
+                start.wait();
                 for _ in 0..2_000 {
                     // Outcome may transition from Ok → Err
                     // exactly once during this loop as the TTL
@@ -1459,7 +1472,9 @@ mod tests {
         };
         let evictor = {
             let cache = cache.clone();
+            let start = start.clone();
             thread::spawn(move || {
+                start.wait();
                 for _ in 0..2_000 {
                     cache.evict_expired();
                 }

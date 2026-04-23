@@ -1865,18 +1865,27 @@ mod tests {
     /// documented on `remove` (versions before nodes).
     #[test]
     fn gc_and_index_concurrent_race_is_panic_free_and_does_not_evict_live_entries() {
-        use std::sync::Arc;
+        use std::sync::{Arc, Barrier};
         use std::thread;
 
         let index = Arc::new(CapabilityIndex::new());
         let iters = 500u64;
+        // Start barrier: both threads must be at their first loop
+        // iteration before either runs. Without it the GC thread
+        // could race ahead and finish all 500 gc() sweeps before
+        // the indexer's thread even started — a silent green pass
+        // that wouldn't have exercised the versions↔nodes
+        // lock-ordering at all (cubic-flagged P2).
+        let start = Arc::new(Barrier::new(2));
 
         // Indexer thread: reindex node_id 42 with a bumped
         // version each iteration. TTL default (300s), so no
         // entry is ever actually expired.
         let indexer = {
             let index = index.clone();
+            let start = start.clone();
             thread::spawn(move || {
+                start.wait();
                 for v in 1..=iters {
                     let ann =
                         CapabilityAnnouncement::new(42, test_entity(), v, sample_capability_set());
@@ -1891,7 +1900,9 @@ mod tests {
         // `gc` must return 0 every time.
         let gc_runner = {
             let index = index.clone();
+            let start = start.clone();
             thread::spawn(move || {
+                start.wait();
                 let mut total_removed = 0usize;
                 for _ in 0..iters {
                     total_removed += index.gc();
