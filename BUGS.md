@@ -579,6 +579,130 @@ changing any honest-path behavior.
 
 ---
 
+# Sixth-pass findings
+
+Final sweep covering `redex/disk` crash recovery, `continuity/discontinuity`,
+`contested/partition`, `compute/orchestrator` chunking, the mesh.rs direct/
+routed dispatch discriminator, `behavior/api` path-parameter parsing,
+`subnet/id`, and the `subprotocol/registry`. One cross-cutting hygiene
+pattern, one packet-classification quirk, and a positive-coverage summary.
+
+## LOW — `from_bytes` codecs accept trailing bytes instead of rejecting them
+
+**Files / lines (selected):**
+
+- `net/crates/net/src/adapter/net/continuity/discontinuity.rs:184-207` (`ForkRecord::from_bytes`)
+- `net/crates/net/src/adapter/net/continuity/chain.rs:151-162` (`ContinuityProof::from_bytes`)
+- `net/crates/net/src/adapter/net/state/causal.rs:82-93` (`CausalLink::from_bytes`)
+- `net/crates/net/src/adapter/net/behavior/capability.rs:679`, `924`
+- `net/crates/net/src/adapter/net/behavior/diff.rs:215`
+- `net/crates/net/src/adapter/net/behavior/proximity.rs:172`
+- `net/crates/net/src/adapter/net/swarm.rs:70, 226, 320`
+- `net/crates/net/src/adapter/net/route.rs:138`
+- `net/crates/net/src/adapter/net/subprotocol/negotiation.rs:73`
+- `net/crates/net/src/adapter/net/protocol.rs:382, 531`
+
+All of the above guard their `from_bytes` with
+
+```rust
+if data.len() < Self::WIRE_SIZE {
+    return None;
+}
+```
+
+and then slice the leading bytes. Input longer than `WIRE_SIZE` is
+silently accepted and the trailer is ignored. Three codecs in the crate
+already rejected the longer-input case explicitly —
+`PermissionToken::from_bytes` (token.rs:323-326), `IdentityEnvelope::from_bytes`
+(envelope.rs:352-355), and `StreamWindow::decode` (stream_window.rs:69-83),
+with `token.rs` carrying a docstring explaining exactly why:
+
+> Rejects buffers whose length is anything other than exactly `Self::WIRE_SIZE`.
+> Previously this method only guarded the lower bound, silently accepting
+> concatenated or trailing-garbage payloads — which weakened the wire-format
+> contract and let malformed blobs parse as valid tokens.
+
+The fix was applied to those three but not to the dozen-plus others. In
+practice most of these types are framed by the upstream length prefix
+(event-frame, subprotocol payload, routing header), so trailing bytes
+are filtered out before `from_bytes` sees them. The risk surface is the
+places that aren't framed — e.g. `ForkRecord` carried inside a
+reconciliation payload, or `ContinuityProof` appended to a snapshot —
+where concatenating multiple records or smuggling a trailer past the
+parser could matter.
+
+**Fix:** change each `data.len() < Self::WIRE_SIZE` to `!= Self::WIRE_SIZE`
+(or the callsite-appropriate inequality) and update the small number of
+call sites that intentionally slice out a prefix to pre-trim first.
+
+## LOW — routing-vs-direct packet classification breaks for ~1-in-17M node_ids
+
+**File:** `net/crates/net/src/adapter/net/mesh.rs`
+**Lines:** `2170-2173`
+
+```rust
+let is_routed = data.len() >= ROUTING_HEADER_SIZE + protocol::HEADER_SIZE
+    && u16::from_le_bytes([data[0], data[1]]) != MAGIC;
+```
+
+The discriminator peeks at the first two bytes of the packet and treats
+it as routed iff they aren't `0x4E45` (`MAGIC`). Routed packets begin
+with `RoutingHeader`, whose first field is `dest_id: u64` in LE — so
+the first two bytes are the low 16 bits of the recipient's own
+`node_id`. `node_id` is a truncated BLAKE2s hash of the entity keypair
+(`identity/entity.rs:47-50`), effectively uniform. When a node's
+low-16-bits happen to equal `MAGIC` **and** bit 16–23 happen to equal
+`VERSION` (`1`), routed packets **to that node** pass the fake
+Net-header `validate()` at `protocol.rs:447-452` and fall into the
+direct-packet path.
+
+AEAD fails and the packet is dropped, so no security or state
+corruption — but that node silently fails to receive any routed packet
+from the ~1-in-17M node_id ambiguity. The owner has no way to diagnose
+it because the mesh looks healthy otherwise.
+
+**Fix:** discriminate on a cheap tag byte in the routing header instead
+of "anything that doesn't look like a Net magic." Set the top bit of
+`RouteFlags` to `1` on all routing headers and use that bit as the
+discriminator, or move `dest_id` out of byte-0 in the routing header so
+the collision window shrinks to 1-in-2^{48+} and becomes effectively
+zero.
+
+---
+
+## Notes on what this pass covered without finding anything
+
+- `DiskSegment::append_entry` / `append_entries` (redex/disk.rs:258-307):
+  dat-before-idx write order, proper torn-tail + torn-dat recovery at
+  reopen (`open` / `read_index`), `set_len` truncation for either
+  direction of torn state, and the external state lock in
+  `RedexFile::append` serializes the two per-file locks here —
+  concurrent appends can't interleave dat and idx writes.
+- `SnapshotReassembler` wire-framing (`orchestrator.rs:302-346`):
+  `total_chunks == 0`, overflow, oversize-chunk, stale `seq_through`,
+  and `total_chunks_mismatch` are all rejected at the decoder
+  boundary, and the in-memory feed is additionally re-validated.
+- `PartitionDetector` (partition.rs): `healing_progress`
+  divide-by-zero is guarded at line 87, duplicate recoveries are
+  filtered (line 198), and `take_healed` drains atomically.
+- `CausalLink::validate_chain_link` and `assess_continuity`
+  (state/causal.rs, continuity/chain.rs): `sequence.checked_add(1)` used
+  throughout, payload hash covers both ancestor and payload so payload
+  tampering is detected as a parent-hash mismatch.
+- `StandbyGroup::promote` (compute/standby_group.rs:241-281): old active
+  marked unhealthy *before* searching for a replacement; `max_by_key`
+  on `synced_through` is the longest-chain rule; NoHealthyMember is
+  returned when no standby is eligible.
+- `SubnetId` (subnet/id.rs:24-147): bit-packing is correct for all
+  level indices 0..4, `mask_for_depth(d) == 0xFFFFFFFF` for
+  out-of-range `d` (defensive saturation), `is_ancestor_of` handles
+  global-as-ancestor correctly.
+- `SubprotocolRegistry` (subprotocol/registry.rs): DashMap-based, no
+  locks held across calls, `with_defaults` pre-populates the five
+  core subprotocols without side effects.
+
+---
+
 ## Notes on findings the initial sweep got wrong
 
 An earlier exploratory pass flagged several issues that don't hold up under
