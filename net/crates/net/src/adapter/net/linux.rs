@@ -33,12 +33,31 @@ pub struct BatchedTransport {
 }
 
 impl BatchedTransport {
-    /// Create a new batched transport from a socket file descriptor.
+    /// Create a new batched transport from a socket file descriptor,
+    /// allocating both send-side scratch (iovecs/msgs/addrs) and the
+    /// full recv-side 8KB-per-slot buffer set. Use this when the
+    /// transport will be used for recvmmsg.
     pub fn new(socket_fd: RawFd) -> Self {
+        Self::new_inner(socket_fd, true)
+    }
+
+    /// Like `new`, but skips the recv_buffers allocation (64 × 8KB =
+    /// 512 KiB) for callers that only ever call `send_batch`. The
+    /// full struct is returned with an empty `recv_buffers`; any
+    /// `recv_*` call that needs them must use `new` instead.
+    pub fn new_send_only(socket_fd: RawFd) -> Self {
+        Self::new_inner(socket_fd, false)
+    }
+
+    fn new_inner(socket_fd: RawFd, with_recv_buffers: bool) -> Self {
         let mut iovecs = Vec::with_capacity(MAX_BATCH_SIZE);
         let mut msgs = Vec::with_capacity(MAX_BATCH_SIZE);
         let mut addrs = Vec::with_capacity(MAX_BATCH_SIZE);
-        let mut recv_buffers = Vec::with_capacity(MAX_BATCH_SIZE);
+        let mut recv_buffers = if with_recv_buffers {
+            Vec::with_capacity(MAX_BATCH_SIZE)
+        } else {
+            Vec::new()
+        };
 
         for _ in 0..MAX_BATCH_SIZE {
             iovecs.push(libc::iovec {
@@ -61,7 +80,9 @@ impl BatchedTransport {
                 msg_len: 0,
             });
 
-            recv_buffers.push(BytesMut::with_capacity(MAX_PACKET_SIZE));
+            if with_recv_buffers {
+                recv_buffers.push(BytesMut::with_capacity(MAX_PACKET_SIZE));
+            }
         }
 
         Self {

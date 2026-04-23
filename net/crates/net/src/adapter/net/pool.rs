@@ -8,7 +8,7 @@ use crossbeam_queue::ArrayQueue;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use super::crypto::PacketCipher;
+use super::crypto::{session_prefix_from_id, PacketCipher};
 use super::protocol::{
     EventFrame, NetHeader, PacketFlags, MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE, NONCE_SIZE,
 };
@@ -151,8 +151,11 @@ impl PacketBuilder {
             ),
         };
 
-        // Patch nonce into serialized header (bytes 12..24)
-        header_bytes[12..16].copy_from_slice(&(self.session_id as u32).to_le_bytes());
+        // Patch nonce into serialized header (bytes 12..24). The
+        // 4-byte prefix must be derived the same way the cipher does
+        // (`session_prefix_from_id`), otherwise the receiver will
+        // reconstruct a different nonce and AEAD verification fails.
+        header_bytes[12..16].copy_from_slice(&session_prefix_from_id(self.session_id));
         header_bytes[16..24].copy_from_slice(&counter.to_le_bytes());
 
         // Patch payload_len to exclude the 16-byte auth tag (bytes 60..62)
@@ -208,7 +211,7 @@ impl PacketBuilder {
             ),
         };
 
-        header_bytes[12..16].copy_from_slice(&(self.session_id as u32).to_le_bytes());
+        header_bytes[12..16].copy_from_slice(&session_prefix_from_id(self.session_id));
         header_bytes[16..24].copy_from_slice(&counter.to_le_bytes());
         let payload_len = (self.payload.len() - 16) as u16;
         header_bytes[60..62].copy_from_slice(&payload_len.to_le_bytes());

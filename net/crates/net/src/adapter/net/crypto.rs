@@ -358,12 +358,18 @@ impl NoiseHandshake {
 /// Packet cipher using ChaCha20-Poly1305 with counter-based nonces.
 ///
 /// Nonce format: `[session_prefix: 4 bytes][counter: 8 bytes]`
-/// - session_prefix: derived from session_id, ensures uniqueness across sessions
+/// - session_prefix: derived by folding the 64-bit session_id into 4
+///   bytes (hi ^ lo). Every session also derives a fresh key in
+///   `derive_session_keys`, so nonce uniqueness per key is guaranteed
+///   by the counter alone — the prefix is defense-in-depth only, and
+///   XORing both halves retains more entropy than a plain 32-bit
+///   truncation of session_id.
 /// - counter: monotonically increasing, ensures uniqueness within session
 ///
 /// Safety: Counter-based nonces are safe because:
 /// - Counter never repeats within a session (AtomicU64)
-/// - Session prefix ensures uniqueness across sessions
+/// - Each session has a unique per-direction key, so (key, nonce) pairs
+///   never collide across sessions regardless of prefix entropy
 /// - 2^64 packets before rollover (unreachable in practice)
 ///
 /// When used inside a `PacketPool`, the TX counter should be shared across
@@ -496,12 +502,24 @@ impl ReplayWindow {
     }
 }
 
+/// Derive the 4-byte nonce prefix from a 64-bit session id. Folds the
+/// high and low halves together so every bit of session_id contributes,
+/// rather than silently truncating the high 32 bits. Both sender and
+/// receiver — and the wire header patching in `pool.rs` — must call
+/// this so the on-the-wire nonce matches what the cipher used.
+#[inline]
+pub(crate) fn session_prefix_from_id(session_id: u64) -> [u8; 4] {
+    let lo = session_id as u32;
+    let hi = (session_id >> 32) as u32;
+    (lo ^ hi).to_le_bytes()
+}
+
 impl PacketCipher {
     /// Create a new fast cipher from a 32-byte key and session ID
     pub fn new(key: &[u8; 32], session_id: u64) -> Self {
         Self {
             cipher: ChaCha20Poly1305::new(key.into()),
-            session_prefix: (session_id as u32).to_le_bytes(),
+            session_prefix: session_prefix_from_id(session_id),
             tx_counter: Arc::new(AtomicU64::new(0)),
             rx_window: Mutex::new(ReplayWindow::new()),
         }
@@ -519,7 +537,7 @@ impl PacketCipher {
     ) -> Self {
         Self {
             cipher: ChaCha20Poly1305::new(key.into()),
-            session_prefix: (session_id as u32).to_le_bytes(),
+            session_prefix: session_prefix_from_id(session_id),
             tx_counter,
             rx_window: Mutex::new(ReplayWindow::new()),
         }
@@ -718,6 +736,33 @@ fn hex_string(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: previously `session_prefix` was just
+    /// `(session_id as u32).to_le_bytes()` — truncating the high 32
+    /// bits of session_id silently. Two different session IDs that
+    /// happened to agree in their low 32 bits would produce an
+    /// identical nonce prefix. The new derivation XORs hi^lo so both
+    /// halves contribute, and the pool-side header patch goes through
+    /// the same helper so the wire nonce matches what the cipher used.
+    #[test]
+    fn session_prefix_uses_high_bits_of_session_id() {
+        // Low 32 bits identical, high 32 bits differ — old code would
+        // produce the same prefix; new code must not.
+        let a: u64 = 0x0000_0001_1234_5678;
+        let b: u64 = 0xFFFF_FFFF_1234_5678;
+        let pa = session_prefix_from_id(a);
+        let pb = session_prefix_from_id(b);
+        assert_ne!(
+            pa, pb,
+            "prefixes that only differ in high 32 bits of session_id must not collide"
+        );
+    }
+
+    #[test]
+    fn session_prefix_stable_for_same_id() {
+        let id = 0xDEAD_BEEF_CAFE_F00D_u64;
+        assert_eq!(session_prefix_from_id(id), session_prefix_from_id(id));
+    }
 
     #[test]
     fn test_static_keypair_generate() {
