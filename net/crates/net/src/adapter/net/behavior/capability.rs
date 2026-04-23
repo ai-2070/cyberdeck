@@ -1806,6 +1806,115 @@ mod tests {
     }
 
     // ========================================================================
+    // CapabilityIndex::gc() boundary + race coverage (TEST_COVERAGE_PLAN §P1-2)
+    // ========================================================================
+
+    /// A zero-TTL announcement is evicted on the very next `gc()`
+    /// sweep. Zero-TTL is a legitimate operator choice for
+    /// "announce-and-forget" diagnostics; the index must respect
+    /// it rather than silently promoting zero to some default.
+    #[test]
+    fn gc_evicts_entries_with_ttl_zero() {
+        let index = CapabilityIndex::new();
+        let mut ann = CapabilityAnnouncement::new(1, test_entity(), 1, sample_capability_set());
+        ann.ttl_secs = 0;
+        index.index(ann);
+
+        assert_eq!(index.stats().node_count, 1, "entry should be indexed");
+        // No sleep needed — with ttl=0, `now.duration_since(indexed_at)`
+        // is already >= ttl on the first gc call.
+        let removed = index.gc();
+        assert_eq!(removed, 1, "zero-TTL entry must be evicted on first gc");
+        assert_eq!(index.stats().node_count, 0);
+        assert!(index.get(1).is_none(), "evicted entry must not be queryable");
+    }
+
+    /// A u32::MAX-TTL announcement (~136 years in seconds) must
+    /// NOT be evicted on the first gc sweep. Pins that the
+    /// `Duration::from_secs(ttl_secs as u64)` conversion doesn't
+    /// wrap or overflow — a regression here would produce a
+    /// zero-valued `Duration` and evict long-lived entries
+    /// immediately.
+    #[test]
+    fn gc_retains_entries_with_max_ttl_no_wraparound() {
+        let index = CapabilityIndex::new();
+        let mut ann = CapabilityAnnouncement::new(7, test_entity(), 1, sample_capability_set());
+        ann.ttl_secs = u32::MAX;
+        index.index(ann);
+
+        assert_eq!(index.stats().node_count, 1);
+        let removed = index.gc();
+        assert_eq!(
+            removed, 0,
+            "u32::MAX-TTL entry must not be evicted — regression \
+             would indicate the `ttl_secs as u64` widening wrapped \
+             to zero and produced a zero-`Duration` ttl",
+        );
+        assert!(index.get(7).is_some(), "entry still queryable");
+    }
+
+    /// Concurrent `index()` on one thread + `gc()` on another —
+    /// the two dashmap operations must not corrupt the index or
+    /// panic. With a long TTL every indexed entry is gc-safe
+    /// (not expired), so gc should never remove anything; we
+    /// assert that invariant after the race completes. Guards
+    /// the `versions` + `nodes` lock-ordering contract
+    /// documented on `remove` (versions before nodes).
+    #[test]
+    fn gc_and_index_concurrent_race_is_panic_free_and_does_not_evict_live_entries() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let index = Arc::new(CapabilityIndex::new());
+        let iters = 500u64;
+
+        // Indexer thread: reindex node_id 42 with a bumped
+        // version each iteration. TTL default (300s), so no
+        // entry is ever actually expired.
+        let indexer = {
+            let index = index.clone();
+            thread::spawn(move || {
+                for v in 1..=iters {
+                    let ann = CapabilityAnnouncement::new(42, test_entity(), v, sample_capability_set());
+                    index.index(ann);
+                }
+            })
+        };
+
+        // GC thread: run `gc()` repeatedly while the indexer
+        // is active. Count removals — since all entries have a
+        // 300-second TTL and the test takes milliseconds,
+        // `gc` must return 0 every time.
+        let gc_runner = {
+            let index = index.clone();
+            thread::spawn(move || {
+                let mut total_removed = 0usize;
+                for _ in 0..iters {
+                    total_removed += index.gc();
+                }
+                total_removed
+            })
+        };
+
+        indexer.join().expect("indexer panicked");
+        let gc_removed = gc_runner.join().expect("gc thread panicked");
+
+        assert_eq!(
+            gc_removed, 0,
+            "gc must not evict any entry during the race — every \
+             indexed version has a 300-second TTL and the test \
+             completes in milliseconds. A nonzero removal count \
+             indicates a lock-ordering bug that lets gc see an \
+             indexed-then-still-present entry as expired.",
+        );
+
+        // Final state: node 42 is present, at some version
+        // between 1 and `iters`. No data structure corruption.
+        let final_entry = index.get(42);
+        assert!(final_entry.is_some(), "node 42 must be indexed after the race");
+    }
+
+    // ========================================================================
     // Multi-hop wire format (M-1)
     // ========================================================================
 
