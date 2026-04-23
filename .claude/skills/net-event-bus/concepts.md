@@ -1,0 +1,139 @@
+# Net Concepts — the Mental Model
+
+This file exists because the Net API looks like Kafka/NATS/Redis Streams but the underlying model is fundamentally different. If you generate code without internalizing these concepts, you'll write something that compiles, runs, and is wrong in subtle ways (the worst kind of wrong).
+
+Read this **once per session** before writing any integration code. It is roughly a 5-minute read.
+
+---
+
+## What Net is, in one sentence
+
+Net is a latency-first encrypted mesh where every device is a peer, the event bus is the mesh itself (not a process you connect to), and overload is handled by dropping rather than queueing.
+
+It's an *engineering take* on the Net concept from Cyberpunk 2077 — flat topology, encrypted hop-to-hop, every device a first-class citizen — built as a Rust library with bindings in TypeScript, Python, Go, and C. Not affiliated with CD Projekt Red.
+
+---
+
+## Node
+
+**A node is the unit of participation.** Every running instance of the SDK — a CLI, a daemon, an embedded device, a test process — is a node. There is no "client SDK" and no "broker process." `NetNode` (TS/Python) and `Net` (Rust/Go/C) are the same primitive. A node can publish, subscribe, relay, and persist all at once.
+
+A node is identified by an **ed25519 keypair**. The public key is the node ID. The private key is the authority to act as that node. Identity is cryptographic, not topological — a node keeps its identity when it changes IPs, traverses NAT, or roams between networks.
+
+**Practical implication:** when you instantiate a node in your application, you are joining the mesh, not connecting to it. There is no server on the other end. Two processes that both create a `NetNode` on the same machine are already two nodes; if they share a transport (memory, mesh, Redis, JetStream), they can already communicate.
+
+## Channel
+
+**A channel is a name, not a thing.** This is the single most important concept to internalize.
+
+In Kafka, a topic is a thing — a partitioned log living on a broker cluster, with retention policy, replication factor, and a leader per partition. In NATS, a subject is also a thing — the broker holds the subscription registry and routes messages.
+
+In Net, a channel is just a *name to match on*. There is no broker holding a subscription registry. The publisher holds the subscriber roster directly. A subscriber asks the publisher (or any reachable node) to be added to the roster for channel name X. When the publisher emits, it does N per-peer unicasts over its already-encrypted sessions to every roster member.
+
+Consequences:
+- **Publish-without-subscribers is a no-op.** The roster is empty, the fan-out loop runs zero times. No buffer fills up at a broker, because there is no broker.
+- **Channel creation is implicit.** No "create topic" API call. A channel exists as soon as someone publishes or subscribes to a name. There is no central registry to update.
+- **Channels cost nothing when idle.** A channel with zero subscribers consumes zero resources mesh-wide. There's no metadata to maintain.
+- **Channels with thousands of subscribers work.** They just fan out more packets. The cost is linear in subscriber count, paid by the publisher node.
+
+In TS and Python, the named-channel API is exposed as `node.channel("name")`. In Rust, Go, and C, there is no named-channel helper — you publish typed events on a single firehose and consumers filter on the receive side. (See `apis.md`.)
+
+## Subscriber
+
+A subscriber is a node that has joined a channel's roster. Subscriptions are **hot, not cold** — a subscriber receives events emitted *after* it subscribed, plus whatever is still in the publisher's local ring buffer at the moment it joined. There is no "replay from the beginning of time" semantic.
+
+If the user wants durable replay from a specific offset, they need a persistence layer (RedEX, Redis adapter, or JetStream adapter). That is a deliberate, separate decision — not a default.
+
+If a subscriber goes silent (overload, crash, network partition), the publisher's failure detector evicts it from the roster. No in-band error message. The subscriber's neighbors observe the silence and the mesh routes around it.
+
+## Publisher
+
+A publisher is a node that holds a roster and emits to it. Publisher and subscriber are not separate types — they are roles a `NetNode` plays per channel. The same node can publish on `sensors/temp` and subscribe to `commands/actuator` simultaneously.
+
+When a publisher emits, the call returns a `Receipt` (or null/error under backpressure). The receipt confirms the event was accepted into the local ring buffer for fan-out — it does **not** confirm delivery to all subscribers. Net does not guarantee delivery; it guarantees fast attempts.
+
+## Backpressure: silence, not a signal
+
+In TCP, backpressure is negotiated. The receiver advertises a window, the sender respects it, congestion control slows everyone down. Round trips are involved.
+
+In Net, backpressure is **immediate and unilateral**. A node that can't keep up stops processing. Its ring buffer is full, so new data either evicts the oldest entry (`DropOldest`, default) or gets dropped at the boundary (`DropNewest`), or the producer's emit call fails (`FailProducer`). The slow node does not tell anyone — it just goes silent on that stream.
+
+Silence propagates through the proximity graph. Neighbors observe the missed heartbeat within a heartbeat interval, mark the node as degraded, open the circuit breaker, and **route new traffic to other capable nodes**. The sender does not slow down. The mesh has other nodes.
+
+**Practical implication for the SDK user:**
+- `emit` / `publish` may silently lose data under backpressure. Check return values: TS returns `null`, batch APIs return ingested counts, Rust returns `Result`.
+- "Lossy by default" is the design. If the user needs reliability, they need either `Reliability::Reliable` per-stream (mesh transport), an explicit persistence layer, or end-to-end acks at the application level.
+- Don't add timeouts and retries against the bus. Backpressure handling is the bus's job.
+
+## Ring buffer
+
+The local data structure on each node is a fixed-capacity sharded ring buffer. It is **a speed buffer, not a waiting room.** When full, old data is evicted or new data is dropped. There is no unbounded growth.
+
+Capacity is configurable per node (`buffer_capacity` / `ring_buffer_capacity`). Default is sensible for most workloads. Tune up if you have bursty traffic and want to absorb more before dropping; tune down if memory is the constraint.
+
+Sharding (`shards` / `num_shards`) is the parallelism knob — more shards = more parallel ingestion at the cost of more memory and more drain workers. Default is reasonable; only tune if you've measured a bottleneck.
+
+## Transport
+
+A node's transport is what physically moves bytes between nodes. The same publish/subscribe code works across all transports — **the choice is at node construction, not in your application logic.** This is the second most important concept after "a channel is a name."
+
+| Transport | When to use | Notes |
+|---|---|---|
+| **Memory** (default) | Single process, multiple components, tests | No network, no encryption, no persistence. Pure in-process ring buffer. Fastest. |
+| **Mesh** (UDP, peer-to-peer) | Production multi-host deployments | Encrypted (Noise + ChaCha20-Poly1305), no broker, NAT traversal opt-in, automatic rerouting. The "real" Net. |
+| **Redis** | When you already run Redis and need cross-process pub/sub with optional persistence | Net publishes to Redis Streams; subscribers read from them. You get Redis's durability semantics. |
+| **JetStream** (NATS) | When you already run NATS JetStream and want its durability/retention | Same idea as Redis adapter, different backend. |
+
+Selection happens via constructor parameters — see `apis.md`. **A node can have only one transport at a time** (it's set at construction). To bridge transports, run two nodes in the same process.
+
+The application code does not know which transport it got. Code written for the memory transport runs unmodified on mesh transport. This is the "location-transparent consumption" property — the call signature for `publish` is identical whether the subscriber is in the same process or five hops away on a different continent.
+
+## Encryption (for mesh transport)
+
+Every packet on the mesh transport is encrypted **end-to-end** between source and destination using ChaCha20-Poly1305 with counter-based nonces, after a Noise NKpsk0 handshake. Intermediate relay nodes forward encrypted bytes they cannot read.
+
+Practical implications:
+- Relay nodes do not need to be trusted with payload content. They are part of the routing path, not the trust path.
+- A compromised relay leaks nothing — session keys are between source and destination, never shared with relays.
+- The encryption is invisible to your application code. You don't configure it; it's how the mesh transport works.
+
+For memory transport there is no encryption (it's intra-process). Redis and JetStream transports rely on those systems' transport security (TLS, etc.) — the payload is plaintext at the broker, unlike mesh.
+
+## Identity, capabilities, and routing (brief)
+
+Out of scope for most event-bus integrations, but you should know the words:
+
+- **Identity:** the ed25519 keypair that defines a node. Persists across IP changes, NAT traversal, network roaming.
+- **Capabilities:** a node announces what it can do — hardware (CPU, GPU, RAM), loaded models, installed tools, operator tags (`region:us`, `env:prod`). The mesh routes based on capabilities, not just node IDs. Relevant if the user wants a channel to land on "any node with a GPU" rather than a specific node.
+- **Subnets:** application-derived boundaries from capability tags. A `SubnetLocal` channel only delivers to peers whose tags map to the same subnet. Used for "dev nodes can't see prod data" — a one-line policy, not a firewall rule.
+- **Permission tokens:** signed delegations that authorize a subscriber to join a channel. Checked on every publish via a 20ns bloom filter. Revocation is immediate (next packet after token expiry stops getting events).
+
+If the user is just publishing and subscribing on a single trusted mesh, you don't need any of this. If they ask "how do I keep dev events out of prod?" or "can I require auth for this channel?" — point at `net/README.md` § Capabilities, Subnets, and Security surface.
+
+## Persistence (brief)
+
+The bus itself is **transient by design**. Events flow through ring buffers; if no one consumes them in time, they are gone. This is not a bug — it is the property that makes nanosecond-scale operation possible.
+
+If the user needs durability, they choose how:
+- **Redis transport** — events go to Redis Streams with the broker's durability semantics.
+- **JetStream transport** — events go to NATS JetStream with its retention policies.
+- **RedEX** (memory transport + local append-only log) — per-channel local file (`<base>/<channel_path>/{idx,dat}`), per-node retention policy, no cluster, no consensus. Each node decides what to keep.
+- **CortEX** — RedEX, folded into a queryable in-memory state. For tasks/memories/anything you'd otherwise put in SQLite.
+- **NetDB** — a query façade over CortEX state with Prisma-style methods.
+
+For a basic event-bus integration these are usually unnecessary. Point at them if the user asks for "exactly-once delivery", "replay from offset N", or "durable subscription" — those are RedEX/persistence concerns, not bus concerns.
+
+## What Net is not
+
+Common analogy traps. If the user is using these mental models, gently redirect:
+
+- **Not a broker.** No central process, no cluster to provision. The mesh is the bus.
+- **Not Kafka.** No partition leader, no consumer groups, no offset commits, no replication factor.
+- **Not a database.** The stream is transient unless you opt into RedEX or an adapter.
+- **Not a service mesh.** No sidecars, no service discovery via DNS, no mTLS configuration. Identity is built in.
+- **Not actor model.** Daemons exist (see Mikoshi) but the basic publish/subscribe model is just typed pub/sub, not message-passing-with-mailboxes.
+- **Not best-effort UDP.** The mesh transport adds encryption, ordering (optional, per stream), causal chains, and automatic rerouting on top of UDP.
+
+---
+
+When you've internalized this, go to `apis.md` for the actual code patterns, and `patterns.md` for task-shape recipes.
