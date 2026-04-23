@@ -1,0 +1,25 @@
+.claude/skills/net-event-bus/concepts.md
+  3f966a086d8a12b3 31,39-44,83,94
+.claude/skills/net-event-bus/SKILL.md
+  3f966a086d8a12b3 32,40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "d248e35796e7a45d76d998fd0e8278003978e380",
+  "prompts": {
+    "3f966a086d8a12b3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "810349f5-7270-476a-9d85-7326a78cf746",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 11,
+      "total_deletions": 6,
+      "accepted_lines": 11,
+      "overriden_lines": 0
+    }
+  }
+}
