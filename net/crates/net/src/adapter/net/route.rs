@@ -21,10 +21,12 @@ use std::time::Instant;
 /// to not collide with `0x4E45`.
 pub const ROUTING_HEADER_SIZE: usize = 18;
 
-/// Magic bytes identifying a routing header: "TR" in LE (`0x5254`).
-/// Chosen disjoint from the Net packet magic (`0x4E45`) so the
-/// receive-loop can discriminate on the first two bytes alone.
-pub const ROUTING_MAGIC: u16 = 0x5254;
+/// Magic bytes identifying a routing header: `[0x52, 0x54]` on the
+/// wire — ASCII "RT" in read order, for "routing". Stored as a u16
+/// little-endian value, that's `0x5452`. Chosen disjoint from the
+/// Net packet magic (`0x4E45`) so the receive-loop can discriminate
+/// on the first two bytes alone.
+pub const ROUTING_MAGIC: u16 = 0x5452;
 
 /// Maximum TTL for multi-hop routing
 pub const _MAX_TTL: u8 = 16;

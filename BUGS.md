@@ -657,12 +657,13 @@ corruption — but the affected node silently lost all routed traffic.
 ### The fix
 
 Routing-header wire format bumped from **16 → 18 bytes** with an
-explicit `ROUTING_MAGIC = 0x5254` tag at bytes 0-1:
+explicit `ROUTING_MAGIC` tag at bytes 0-1 (ASCII `"RT"` on the wire,
+`0x5452` as a little-endian `u16`):
 
 ```rust
 // route.rs
 pub const ROUTING_HEADER_SIZE: usize = 18;
-pub const ROUTING_MAGIC: u16 = 0x5254;  // "TR"
+pub const ROUTING_MAGIC: u16 = 0x5452;  // "RT" — bytes [0x52, 0x54] on the wire
 
 // new on-wire layout
 // ┌────────┬────┬────┬──────┬─────┬──────────┬────────────┐
