@@ -276,6 +276,20 @@ fn bench_snapshot(c: &mut Criterion) {
 // NetDb build — constructing a NetDb handle with both models.
 // ============================================================================
 
+// Disabled: `Redex::new()` + `with_tasks()` + `with_memories()`
+// allocates 2 × 64 MiB `HeapSegment`s (see
+// `src/adapter/net/redex/file.rs:82`). Criterion's warmup runs
+// this closure thousands of times in ~3 s, and macOS's allocator
+// aborts with a bare-allocation-failure signal partway through.
+// The bench also measures construction cost, which is dominated
+// by the preallocated segments and isn't representative of
+// steady-state NetDb open.
+//
+// TODO: re-enable with a bounded-capacity `RedexFileConfig` or
+// rewrite via `Criterion::iter_batched` so the 128 MiB/iter
+// allocation amortizes across a measured batch instead of
+// repeating inside the hot loop.
+#[allow(dead_code)]
 fn bench_netdb_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("netdb_build");
     group.throughput(Throughput::Elements(1));
@@ -303,6 +317,7 @@ criterion_group!(
     bench_fold_barrier,
     bench_query,
     bench_snapshot,
-    bench_netdb_build,
+    // bench_netdb_build — disabled, see the function's docstring
+    // for the allocator-abort context.
 );
 criterion_main!(benches);
