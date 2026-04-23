@@ -359,6 +359,192 @@ fn test_config_no_policy() -> MeshNodeConfig {
     cfg
 }
 
+// ────────────────────────────────────────────────────────────────────
+// default_visibility knob — pins the fail-open (Global) back-compat
+// default and the fail-closed (SubnetLocal) operator opt-in. Pre-flight
+// .unwrap_or audit (FAILURE_PATH_HARDENING_PLAN) replaced a hard-coded
+// `Visibility::Global` with `config.default_visibility`; these tests
+// pin both paths so a future refactor can't silently flip the default.
+// ────────────────────────────────────────────────────────────────────
+
+/// Build a node on a given subnet with an explicit
+/// `default_visibility`, no policy attached. Peer subnets then
+/// stay at `SubnetId::GLOBAL` (no policy → no derivation), which
+/// is exactly the `unregistered-channel-meets-unknown-peer-subnet`
+/// case the knob targets.
+async fn build_node_with_default_visibility(
+    subnet: SubnetId,
+    default_visibility: Visibility,
+) -> (Arc<MeshNode>, Arc<ChannelConfigRegistry>) {
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut cfg = MeshNodeConfig::new(addr, PSK)
+        .with_heartbeat_interval(Duration::from_millis(200))
+        .with_session_timeout(Duration::from_secs(5))
+        .with_handshake(3, Duration::from_secs(2))
+        .with_subnet(subnet)
+        .with_default_visibility(default_visibility);
+    cfg.socket_buffers = SocketBufferConfig {
+        send_buffer_size: TEST_BUFFER_SIZE,
+        recv_buffer_size: TEST_BUFFER_SIZE,
+    };
+    let mut node = MeshNode::new(EntityKeypair::generate(), cfg).await.unwrap();
+    let registry = Arc::new(ChannelConfigRegistry::new());
+    node.set_channel_configs(registry.clone());
+    (Arc::new(node), registry)
+}
+
+/// Register a channel on A, let B subscribe through the
+/// membership handshake, then remove A's registry entry. The
+/// roster retains B, but a subsequent publish finds no config
+/// for the channel and falls back to `default_visibility`.
+/// This is the exact path the knob guards — a channel that was
+/// configured at deployment but later dropped from the registry
+/// (or never registered on a node that publishes across a
+/// replicated registry).
+async fn subscribe_then_unregister(
+    a: &Arc<MeshNode>,
+    a_reg: &Arc<ChannelConfigRegistry>,
+    b: &Arc<MeshNode>,
+    channel_name: &ChannelName,
+) {
+    a_reg.insert(
+        ChannelConfig::new(ChannelId::new(channel_name.clone()))
+            .with_visibility(Visibility::Global),
+    );
+    b.subscribe_channel(a.node_id(), channel_name.clone())
+        .await
+        .expect("B subscribe");
+    // Now the roster has B. Drop A's entry so the next publish
+    // hits the cfg_snapshot=None fallback.
+    a_reg.remove_by_name(channel_name.as_str());
+}
+
+/// Default behavior: `default_visibility = Global`. A publish on
+/// a channel whose registry entry is missing at publish time
+/// still delivers cross-subnet — fail-open preserves back-compat.
+#[tokio::test]
+async fn default_visibility_global_delivers_across_subnets_on_unregistered_publish() {
+    let a_subnet = SubnetId::new(&[3, 7, 2]);
+    let b_subnet = SubnetId::new(&[3, 8, 1]);
+    let (a, a_reg) = build_node_with_default_visibility(a_subnet, Visibility::Global).await;
+    let (b, _b_reg) = build_node_with_default_visibility(b_subnet, Visibility::Global).await;
+
+    handshake(&a, &b).await;
+
+    let channel_name = ChannelName::new("lab/unregistered-global").expect("channel name");
+    subscribe_then_unregister(&a, &a_reg, &b, &channel_name).await;
+
+    let publisher = ChannelPublisher::new(
+        channel_name,
+        PublishConfig {
+            reliability: Reliability::FireAndForget,
+            on_failure: OnFailure::BestEffort,
+            max_inflight: 16,
+        },
+    );
+    let report = a
+        .publish(&publisher, bytes::Bytes::from_static(b"hi"))
+        .await
+        .expect("publish");
+    assert_eq!(
+        report.delivered, 1,
+        "default_visibility=Global must admit cross-subnet delivery \
+         when the channel config is missing at publish time (back-compat default)",
+    );
+}
+
+/// Fail-closed: `default_visibility = SubnetLocal`. Same
+/// subscribe-then-drop setup, but A is configured so a missing
+/// registry entry confines publishes to the local subnet. B —
+/// on a different subnet — is filtered out, guarding against
+/// accidental cross-subnet leakage when a channel config is
+/// lost or never propagated.
+#[tokio::test]
+async fn default_visibility_subnet_local_filters_unregistered_publish_cross_subnet() {
+    let a_subnet = SubnetId::new(&[3, 7, 2]);
+    let b_subnet = SubnetId::new(&[3, 8, 1]);
+    let (a, a_reg) = build_node_with_default_visibility(a_subnet, Visibility::SubnetLocal).await;
+    let (b, _b_reg) = build_node_with_default_visibility(b_subnet, Visibility::Global).await;
+
+    handshake(&a, &b).await;
+
+    let channel_name = ChannelName::new("lab/unregistered-strict").expect("channel name");
+    subscribe_then_unregister(&a, &a_reg, &b, &channel_name).await;
+
+    let publisher = ChannelPublisher::new(
+        channel_name,
+        PublishConfig {
+            reliability: Reliability::FireAndForget,
+            on_failure: OnFailure::BestEffort,
+            max_inflight: 16,
+        },
+    );
+    let report = a
+        .publish(&publisher, bytes::Bytes::from_static(b"secret"))
+        .await
+        .expect("publish");
+    // A's local subnet is [3,7,2]; B (no policy) is indexed as
+    // `SubnetId::GLOBAL` from A's view. `SubnetLocal` requires
+    // exact equality, so B is filtered before the send loop.
+    // Filtered subscribers don't count as attempted or
+    // delivered — they're policy decisions, not failures.
+    assert_eq!(
+        report.delivered, 0,
+        "default_visibility=SubnetLocal must filter cross-subnet delivery \
+         for a channel whose config is missing at publish time; got delivered={}",
+        report.delivered,
+    );
+    assert_eq!(
+        report.attempted, 0,
+        "policy-filtered subscribers must not count as attempted",
+    );
+}
+
+/// Back-compat: an explicit registry entry always wins, even when
+/// `default_visibility=SubnetLocal`. A channel that's been
+/// registered with `Visibility::Global` must still deliver
+/// cross-subnet — the knob is only a fallback for UNREGISTERED
+/// channels.
+#[tokio::test]
+async fn registered_visibility_overrides_default_visibility_knob() {
+    let a_subnet = SubnetId::new(&[3, 7, 2]);
+    let b_subnet = SubnetId::new(&[3, 8, 1]);
+    let (a, a_reg) = build_node_with_default_visibility(a_subnet, Visibility::SubnetLocal).await;
+    let (b, _b_reg) = build_node_with_default_visibility(b_subnet, Visibility::Global).await;
+
+    handshake(&a, &b).await;
+
+    let channel_name = ChannelName::new("lab/explicit").expect("channel name");
+    // Registered with Global explicitly — this must win over the
+    // SubnetLocal default.
+    a_reg.insert(
+        ChannelConfig::new(ChannelId::new(channel_name.clone()))
+            .with_visibility(Visibility::Global),
+    );
+
+    b.subscribe_channel(a.node_id(), channel_name.clone())
+        .await
+        .expect("B subscribe");
+
+    let publisher = ChannelPublisher::new(
+        channel_name,
+        PublishConfig {
+            reliability: Reliability::FireAndForget,
+            on_failure: OnFailure::BestEffort,
+            max_inflight: 16,
+        },
+    );
+    let report = a
+        .publish(&publisher, bytes::Bytes::from_static(b"open"))
+        .await
+        .expect("publish");
+    assert_eq!(
+        report.delivered, 1,
+        "an explicit registry entry with Visibility::Global must win over \
+         default_visibility=SubnetLocal — the knob is a fallback, not a floor",
+    );
+}
+
 /// SubnetId geometry sanity — the invariants the enforcement
 /// paths lean on. Co-located here so a refactor of the core
 /// helpers surfaces a failure in the same test file as the

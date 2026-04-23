@@ -350,6 +350,23 @@ pub struct MeshNodeConfig {
     /// practice means `Visibility::SubnetLocal` channels ship only
     /// when both sides are `GLOBAL`.
     pub subnet_policy: Option<Arc<SubnetPolicy>>,
+    /// Visibility applied on publish when a channel has **no**
+    /// registered config in the local
+    /// [`ChannelConfigRegistry`]. Defaults to
+    /// [`Visibility::Global`] — simple deployments without a
+    /// registry publish unrestricted, which is the lowest-
+    /// friction default for single-subnet meshes.
+    ///
+    /// Security-conservative deployments (fleets where forgetting
+    /// to register a channel should not silently leak messages
+    /// across subnets) set this to
+    /// [`Visibility::SubnetLocal`]. The publish path reads it on
+    /// every fanout, so toggling it propagates without a restart.
+    ///
+    /// This is **only** the fallback for unregistered channels —
+    /// a channel with an explicit registry entry always uses
+    /// its configured visibility.
+    pub default_visibility: Visibility,
     /// Minimum time between successive
     /// [`MeshNode::announce_capabilities`] broadcasts from this
     /// origin. Calls within the window coalesce: the local index
@@ -466,6 +483,7 @@ impl MeshNodeConfig {
             capability_gc_interval: Duration::from_secs(60),
             subnet: SubnetId::GLOBAL,
             subnet_policy: None,
+            default_visibility: Visibility::Global,
             min_announce_interval: Duration::from_secs(10),
             token_sweep_interval: Duration::from_secs(30),
             max_auth_failures_per_window: 16,
@@ -580,6 +598,22 @@ impl MeshNodeConfig {
     /// asymmetric views of peer subnets.
     pub fn with_subnet_policy(mut self, policy: Arc<SubnetPolicy>) -> Self {
         self.subnet_policy = Some(policy);
+        self
+    }
+
+    /// Override the visibility applied to publishes on channels
+    /// that have **no** registered config. Defaults to
+    /// [`Visibility::Global`] — messages flow unrestricted when
+    /// no registry entry exists. Flip to
+    /// [`Visibility::SubnetLocal`] for fail-closed deployments
+    /// where forgetting to register a channel should confine
+    /// messages to the local subnet rather than broadcasting
+    /// them mesh-wide.
+    ///
+    /// No effect on channels that *do* have a registry entry —
+    /// their configured visibility always wins.
+    pub fn with_default_visibility(mut self, visibility: Visibility) -> Self {
+        self.default_visibility = visibility;
         self
     }
 }
@@ -4583,16 +4617,21 @@ impl MeshNode {
         // are documented non-goals.
         let mut subscribers = self.roster.members(publisher.channel());
 
-        // Subnet visibility filter. Look up the channel's visibility
-        // (default `Global` for unregistered names so a publisher
-        // without a registry still delivers) and drop any subscriber
-        // whose subnet isn't visible under that rule. Filtered
-        // subscribers don't show up in `attempted` or `errors` —
-        // they're policy decisions, not failures.
+        // Subnet visibility filter. Look up the channel's
+        // configured visibility; if the channel has no registry
+        // entry, fall back to `config.default_visibility` (which
+        // itself defaults to `Visibility::Global` for back-compat
+        // with simple registry-less deployments). Fleet operators
+        // who want fail-closed behavior set
+        // `with_default_visibility(Visibility::SubnetLocal)` so
+        // a forgotten registry entry confines messages to the
+        // local subnet rather than leaking them mesh-wide.
+        // Filtered subscribers don't show up in `attempted` or
+        // `errors` — they're policy decisions, not failures.
         let visibility = cfg_snapshot
             .as_ref()
             .map(|c| c.visibility)
-            .unwrap_or(Visibility::Global);
+            .unwrap_or(self.config.default_visibility);
         subscribers.retain(|peer_id| {
             let peer_subnet = self
                 .peer_subnets
