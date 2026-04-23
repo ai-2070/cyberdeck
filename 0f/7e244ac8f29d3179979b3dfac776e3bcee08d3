@@ -1,0 +1,23 @@
+net/crates/net/tests/migration_target_failure_mid_chunking.rs
+  5bf3f089eecaef7a 1-380
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "0f7e244ac8f29d3179979b3dfac776e3bcee08d3",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 382,
+      "total_deletions": 382,
+      "accepted_lines": 664,
+      "overriden_lines": 0
+    }
+  }
+}
