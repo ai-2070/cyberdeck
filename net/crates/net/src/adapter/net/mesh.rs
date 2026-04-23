@@ -1190,12 +1190,24 @@ impl MeshNode {
         // the old identity.
         let peer_entity_ids: Arc<DashMap<u64, EntityId>> = Arc::new(DashMap::new());
 
+        // Capability index — hoisted out of the struct literal so
+        // the failure-detector `on_failure` callback can hold a
+        // clone. Without this eviction, a failed peer's advertised
+        // reflex would linger in the index and the rendezvous
+        // coordinator could hand it to a PunchRequest initiator
+        // even though the peer is known dead (TEST_COVERAGE_PLAN
+        // §P1-5 / TRANSPORT-adjacent bug: three-way agreement
+        // between the failure detector, the routing table, and
+        // the capability index on peer-death).
+        let capability_index: Arc<CapabilityIndex> = Arc::new(CapabilityIndex::new());
+
         // Wire failure detector with reroute callbacks + roster eviction.
         let rp_failure = reroute_policy.clone();
         let rp_recovery = reroute_policy.clone();
         let roster_failure = roster.clone();
         let peer_subnets_failure = peer_subnets.clone();
         let peer_entity_ids_failure = peer_entity_ids.clone();
+        let capability_index_failure = capability_index.clone();
         let failure_detector = FailureDetector::with_config(FailureDetectorConfig {
             timeout: config.session_timeout,
             miss_threshold: 3,
@@ -1214,6 +1226,15 @@ impl MeshNode {
             }
             peer_subnets_failure.remove(&node_id);
             peer_entity_ids_failure.remove(&node_id);
+            // Drop the dead peer's cached capabilities + reflex.
+            // Without this, a rendezvous coordinator could still
+            // hand a PunchRequest initiator the failed peer's
+            // (stale) reflex, leading to wasted punch attempts
+            // against a dead address. The three maps above
+            // (routes, subnets, entity-ids) are all cleared on
+            // failure; the capability index is now consistent
+            // with them.
+            capability_index_failure.remove(node_id);
         })
         .on_recovery(move |node_id| rp_recovery.on_recovery(node_id));
 
@@ -1286,7 +1307,7 @@ impl MeshNode {
             traversal_config: super::traversal::TraversalConfig::default(),
             #[cfg(feature = "nat-traversal")]
             traversal_stats: Arc::new(super::traversal::TraversalStats::new()),
-            capability_index: Arc::new(CapabilityIndex::new()),
+            capability_index,
             seen_announcements: Arc::new(DashMap::new()),
             last_announce_at: Arc::new(parking_lot::Mutex::new(None)),
             local_announcement: Arc::new(ArcSwapOption::empty()),

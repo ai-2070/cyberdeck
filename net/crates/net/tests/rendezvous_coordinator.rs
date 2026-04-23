@@ -283,3 +283,99 @@ async fn request_punch_unknown_relay_fails_fast() {
         "fast-fail took {elapsed:?}; want < 500 ms",
     );
 }
+
+/// Regression test for TEST_COVERAGE_PLAN §P1-4 case (a): B
+/// announced at some point, R indexed B's reflex, but B's TTL
+/// expired and R's capability-GC has since evicted B. When A
+/// fires a PunchRequest, R must drop it silently — the
+/// coordinator-side lookup at `capability_index.reflex_addr(b_id)`
+/// returns None once GC has swept, same as if B had never
+/// announced at all. A observes a `PunchFailed` timeout.
+///
+/// Case (b) — B never announced — is covered by the existing
+/// `request_punch_times_out_when_target_has_no_cached_reflex`
+/// above. Case (c) — GC racing the handler itself — isn't
+/// exercised here: the handler + GC operate over DashMap, so
+/// each entry-level read is atomic; a mid-handler eviction can
+/// only cause the same observable outcome as a pre-handler
+/// eviction (this test), not a torn dispatch state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_punch_times_out_when_targets_reflex_was_evicted_by_ttl_gc() {
+    // Build R with a short GC interval so it sweeps frequently.
+    // Default 60 s would keep B's entry indexed past any
+    // practical test deadline.
+    let r = {
+        let cfg = test_config().with_capability_gc_interval(Duration::from_millis(100));
+        Arc::new(
+            MeshNode::new(EntityKeypair::generate(), cfg)
+                .await
+                .expect("R build"),
+        )
+    };
+    let a = build_node().await;
+    let b = build_node().await;
+    let x = build_node().await;
+    connect_pair(&a, &r).await;
+    connect_pair(&b, &r).await;
+    connect_pair(&a, &x).await;
+    connect_pair(&b, &x).await;
+    connect_pair(&r, &x).await;
+    a.start();
+    r.start();
+    b.start();
+    x.start();
+
+    // A announces normally (5-min default TTL, plenty of runway).
+    a.reclassify_nat().await;
+    a.announce_capabilities(CapabilitySet::new())
+        .await
+        .expect("A announce");
+
+    // B classifies + announces with a TINY TTL (1 second). After
+    // R indexes, its GC will evict within the sweep cadence.
+    b.reclassify_nat().await;
+    b.announce_capabilities_with(CapabilitySet::new(), Duration::from_secs(1), true)
+        .await
+        .expect("B short-TTL announce");
+
+    // Wait for R to first see B's reflex — otherwise the test
+    // reduces to "never announced" which is the existing test.
+    let r_for_poll = r.clone();
+    let b_id = b.node_id();
+    let b_bind = b.local_addr();
+    let indexed = wait_for(Duration::from_secs(3), || {
+        r_for_poll.peer_reflex_addr(b_id) == Some(b_bind)
+    })
+    .await;
+    assert!(indexed, "R must index B's announcement before its TTL expires");
+
+    // Now wait for the TTL (1 s) + a GC cycle (100 ms) + margin
+    // so R has definitely evicted B.
+    tokio::time::sleep(Duration::from_millis(1_400)).await;
+    assert!(
+        r.peer_reflex_addr(b_id).is_none(),
+        "R's capability-GC should have evicted B by now; got {:?}",
+        r.peer_reflex_addr(b_id),
+    );
+
+    // A fires a PunchRequest against B. R's coordinator looks up
+    // B's reflex, finds nothing, drops silently. A times out.
+    let start = tokio::time::Instant::now();
+    let result = a
+        .request_punch(r.node_id(), b.node_id(), a.local_addr())
+        .await;
+    let elapsed = start.elapsed();
+
+    match result {
+        Err(TraversalError::PunchFailed) => {}
+        other => panic!("expected PunchFailed after TTL eviction, got {other:?}"),
+    }
+    assert!(
+        elapsed >= Duration::from_secs(4),
+        "should wait ~punch_deadline (5s) before failing; elapsed {elapsed:?}",
+    );
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "should not wait much past punch_deadline; elapsed {elapsed:?}",
+    );
+}

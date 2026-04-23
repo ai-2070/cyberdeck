@@ -678,3 +678,106 @@ async fn unsigned_announcement_does_not_write_peer_subnet() {
          subnet_visible decisions become attacker-controlled",
     );
 }
+
+/// Regression test for TEST_COVERAGE_PLAN §P1-6: a signed
+/// announcement whose `entity_id` derivation doesn't match its
+/// claimed `node_id` must be dropped by the receiver even when
+/// the signature itself verifies cleanly. The origin's keypair
+/// owns one `node_id`; an announcement that ships a different
+/// `node_id` is an attempt to poison the capability index /
+/// routing table for a peer the signer doesn't control.
+///
+/// The binding check (`ann.entity_id.node_id() != ann.node_id`
+/// in the handler) is what blocks this — signature validity
+/// alone is insufficient because the signature covers `entity_id`
+/// but not `node_id`. The check fires on every code path (direct
+/// hop_count==0 AND forwarded hop_count>0), so a valid-signed
+/// malformed-binding announcement can't sneak through by
+/// claiming to have been forwarded.
+///
+/// This test sends from the attacker's session. Assertions:
+/// (1) receiver does NOT index the spoofed `node_id`;
+/// (2) receiver's `peer_entity_id(attacker)` is not rebound to
+///     the victim's entity_id (the TOFU path would be skipped
+///     because the binding check rejects before TOFU runs).
+///
+/// Defense-in-depth with `require_signed_capabilities = true`
+/// (the default): the receiver's first gate is
+/// "unsigned → drop"; this test's announcement is signed, so
+/// that gate passes and the binding check is the load-bearing
+/// line.
+#[tokio::test]
+async fn signed_announcement_with_mismatched_node_id_entity_id_is_rejected() {
+    use net::adapter::net::behavior::SUBPROTOCOL_CAPABILITY_ANN;
+
+    let attacker = build_node().await;
+    let receiver = build_node().await;
+    handshake(&attacker, &receiver).await;
+
+    // Victim keypair — the attacker knows victim's public key
+    // (capability announcements are public) but not the
+    // private key. Still, construct one to get a valid
+    // `EntityId` that derives to some `node_id`.
+    let victim_kp = EntityKeypair::generate();
+    let victim_entity = victim_kp.entity_id().clone();
+    let victim_node_id = victim_kp.node_id();
+
+    // Malformed announcement: claim a `node_id` that differs
+    // from `entity_id.node_id()`. Sign with the victim's
+    // keypair so the signature is genuinely valid.
+    let bogus_node_id = victim_node_id.wrapping_add(1);
+    assert_ne!(
+        bogus_node_id, victim_node_id,
+        "bogus_node_id must differ from the legitimate derivation",
+    );
+
+    let caps = CapabilitySet::new().add_tag("binding-mismatch-probe");
+    let mut ann = CapabilityAnnouncement::new(bogus_node_id, victim_entity.clone(), 1, caps);
+    ann.sign(&victim_kp);
+    assert!(
+        ann.verify().is_ok(),
+        "signature must verify — we want to isolate the binding check",
+    );
+
+    // Send as a forwarded announcement (hop_count > 0) to exercise
+    // the forwarding-path code. The binding check fires on both
+    // hop_count==0 and hop_count>0 paths; the plan notes the
+    // forwarding path specifically because TOFU-skip on
+    // hop_count>0 might be mistaken for "no validation at all."
+    ann.hop_count = 1;
+    let payload = ann.to_bytes();
+    attacker
+        .send_subprotocol(receiver.local_addr(), SUBPROTOCOL_CAPABILITY_ANN, &payload)
+        .await
+        .expect("send bogus forwarded announcement");
+
+    // Give the dispatch path time to process + reject.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // (1) Neither node_id was indexed. The bogus announcement
+    //     must not have produced an entry for bogus_node_id or
+    //     for victim_node_id (the caps tag is bogus either way).
+    let filter = CapabilityFilter::new().require_tag("binding-mismatch-probe");
+    let matches = receiver.find_peers_by_filter(&filter);
+    assert!(
+        !matches.contains(&bogus_node_id),
+        "receiver indexed the spoofed node_id despite the binding mismatch — \
+         the entity_id→node_id binding check failed to reject the announcement",
+    );
+    assert!(
+        !matches.contains(&victim_node_id),
+        "receiver indexed the victim's legitimate node_id using data from the \
+         spoofed announcement — binding check should reject BEFORE index runs",
+    );
+
+    // (2) Attacker's session is not TOFU-pinned to the victim's
+    //     entity_id. The binding check runs before the TOFU path
+    //     so a rejected announcement never reaches the pin logic.
+    let attacker_node_id = attacker.node_id();
+    assert!(
+        receiver.peer_entity_id(attacker_node_id) != Some(victim_entity),
+        "attacker's session got TOFU-pinned to victim's entity_id via a \
+         binding-mismatched announcement — forwarder / sender can impersonate \
+         the victim for channel-auth purposes",
+    );
+}
