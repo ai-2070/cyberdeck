@@ -38,7 +38,8 @@ import { NetNode } from '@ai2070/net-sdk';
 interface TempReading { sensor_id: string; celsius: number }
 
 const node = await NetNode.create({ shards: 4 });
-// Other transports: pass redisUrl, jetstreamUrl, or mesh* options to create()
+// Other transports: pass `transport: { type: 'redis' | 'jetstream' | 'mesh', ... }`
+// to create() — see `Transport` in src/types.ts for per-transport fields.
 
 // Named-channel publisher
 const temps = node.channel<TempReading>('sensors/temperature');
@@ -54,10 +55,14 @@ await node.shutdown();
 
 **Key facts:**
 - `NetNode.create(config)` is **async** — must `await`.
-- `emit`, `publish`, `emitRaw`, `emitBatch` are sync. Return value may be `null` under backpressure.
+- All ingestion is sync, but the return shape varies by method:
+  - `emit(obj)` and `emitRaw(json)` return `Receipt | null` — `null` when the bus rejects the ingest under backpressure (`fail_producer` mode). Check the result.
+  - `emitBatch(objs)` and `emitRawBatch(jsons)` return `number` (count actually ingested — short of input length means partial drop).
+  - `channel.publish(event)`, `channel.publishBatch(events)`, `emitBuffer(Buffer)`, `fire(json)`, `fireBatch(jsons)` return `boolean` / `number` from the underlying fire path. A `false` return means the bus dropped it. **No exception is thrown for ring-buffer backpressure** — you must read the return.
 - `subscribe()` returns an async iterable. Always consume with `for await...of`.
 - `emitBuffer(Buffer)` is the zero-copy path. Use when the payload is already serialized.
 - Validators are optional: `node.channel<T>('name', validator)` runs your function on each received event.
+- `BackpressureError` / `NotConnectedError` and the `sendWithRetry` helper are **mesh-stream APIs** (peer-to-peer streams on `MeshNode`), not bus APIs. The bus emit path never throws them — see `runtime.md`.
 
 ## Python (`net-sdk`)
 
@@ -112,7 +117,7 @@ async fn main() -> net_sdk::error::Result<()> {
     let node = Net::builder()
         .shards(4)
         .backpressure(Backpressure::DropOldest)
-        .memory()                          // or .redis(url) / .jetstream(url) / .mesh(config)
+        .memory()                          // or .redis(RedisAdapterConfig) / .jetstream(JetStreamAdapterConfig) / .mesh(NetAdapterConfig)
         .build()
         .await?;
 
@@ -131,10 +136,11 @@ async fn main() -> net_sdk::error::Result<()> {
 
 **Key facts:**
 - **No `node.channel()` API.** Rust has only the raw firehose. To split topics, use distinct types/enum variants in the payload and match on the consumer, or run separate `Net` instances per logical channel.
-- Builder pattern selects transport: `.memory()`, `.redis(...)`, `.jetstream(...)`, `.mesh(...)`.
-- `emit(&T)` returns `Receipt { shard_id, timestamp }`. `emit_batch(&[T])` returns count.
+- Builder pattern selects transport: `.memory()`, `.redis(...)`, `.jetstream(...)`, `.mesh(...)`. Adapter methods take typed configs (`RedisAdapterConfig`, `JetStreamAdapterConfig`, `NetAdapterConfig`) — not raw URL strings. Each is gated on a feature flag (`redis`, `jetstream`, `net`).
+- `emit(&T)` returns `Receipt { shard_id, timestamp }`. `emit_batch(&[T])` returns count (`usize`).
 - `subscribe()` and `subscribe_typed::<T>()` return async streams. Poll with `.next().await`.
-- `Backpressure::{DropOldest, DropNewest, FailProducer}` set at build time.
+- `Backpressure::{DropOldest (default), DropNewest, FailProducer, Sample(u32)}` set at build time. `Sample(N)` keeps 1 in N events when overloaded.
+- Convenience presets on the builder: `.high_throughput()`, `.low_latency()`, `.batch(BatchConfig)`, `.scaling(ScalingPolicy)`, `.adapter_timeout(Duration)`.
 - Reference: `net/crates/net/sdk/examples/channels.rs` is the canonical typed-emit example.
 
 ## Go (`bindings/go/net`)
@@ -199,7 +205,11 @@ These bite people regardless of language. Internalize them.
 - **JSON everywhere.** The wire format is JSON bytes. There is no schema registry. The JSON either parses on the consumer or it doesn't.
 - **Shutdown is required.** Don't rely on process exit. Call `shutdown()` / `Shutdown()` / `net_shutdown()`. The ring buffer needs a clean drain.
 - **Subscribe is hot.** A subscriber sees events emitted *after* it subscribed, plus whatever's still in the ring buffer. No replay-from-zero. If the user wants replay, they need RedEX or an adapter — not the bus.
-- **Backpressure is silent.** Producers may quietly fail. Check return values: TS returns `null`; batch APIs return ingested counts; Rust returns `Result`.
+- **Backpressure is silent.** Producers may quietly fail. Check return values:
+  - Rust: `Result<Receipt, SdkError>` — error variant `Ingestion(...)` (or `Backpressure` on mesh streams).
+  - TS: `emit`/`emitRaw` return `Receipt | null`; `publish`/`publishBatch`/`emitBuffer`/`fire`/`fireBatch` return `boolean`/`number`. **Nothing throws** for ring-buffer drops — read the return value.
+  - Python: `emit` raises on `fail_producer` mode; otherwise drops are silent and visible only via `node.stats().events_dropped`.
+  - Go / C: methods return error codes; check them. Drops happen below the API surface and surface only via stats.
 - **`_channel` is reserved** in TS/Python channel payloads. Don't put your own field there.
 - **Transport is set at construction.** A node can have only one transport. To bridge transports, run two nodes in the same process and forward between them.
 - **`shards` is a parallelism knob, not a partitioning scheme.** It does not give you Kafka-style ordered partitions. It just parallelizes ingestion. Default is fine for most workloads.

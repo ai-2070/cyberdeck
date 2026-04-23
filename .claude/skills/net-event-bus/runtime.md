@@ -71,19 +71,15 @@ Verified against `net/crates/net/sdk/src/error.rs`. The full enum:
 
 ### TypeScript
 
-Errors are thrown (not returned). Two named subclasses you can `instanceof`:
-- `BackpressureError` — equivalent to Rust's `Backpressure`. Use `sendWithRetry` or apply your own.
-- `NotConnectedError` — peer gone. Reconnect at app layer.
+Bus-level (`NetNode`) errors are not thrown for backpressure — `emit` / `emitRaw` return `null`, and `publish` / `emitBuffer` / `fire*` return `false`/short counts. **Check return values.** Construction and other unrecoverable problems arrive as plain `Error`.
 
-Other errors arrive as plain `Error` with descriptive messages. The synchronous `emit` / `emitRaw` may return `null` instead of throwing under backpressure — **check the return value**.
+`BackpressureError` and `NotConnectedError` (with `instanceof` support) are **mesh-stream-only** — they're thrown by `MeshNode.send(...)` / `MeshStream.send(...)` when a per-stream credit window is full or the peer session is gone. The `sendWithRetry` helper on `MeshNode` retries `BackpressureError` (5–200 ms exponential). None of this applies to bus emit.
 
 ### Python
 
-Equivalent named exceptions:
-- `BackpressureError` — retry with backoff.
-- `NotConnectedError` — peer gone.
-
-Other failures raise plain `Exception` or `RuntimeError`. The `send_with_retry` helper is built in (5ms → 200ms exponential, retries `BackpressureError` only).
+Same shape as TS:
+- Bus emit is silent on ring-buffer drops (visible only in `node.stats().events_dropped`). With `backpressure='fail_producer'`, the underlying PyO3 binding raises an exception — handle it at the call site.
+- `BackpressureError` / `NotConnectedError` are **mesh-stream exceptions** raised by `MeshNode.send(...)`. The `send_with_retry` helper (5–200 ms exponential) and `send_blocking` (releases the GIL) live on `MeshNode`, not on `NetNode`.
 
 ### Go
 
