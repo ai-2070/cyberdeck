@@ -89,7 +89,7 @@ def test_roundtrip(node):
     ch = node.channel('test', dict)
     received = []
 
-    import threading
+    import threading, time
     def consume():
         for ev in ch.subscribe():
             received.append(ev)
@@ -108,6 +108,7 @@ def test_roundtrip(node):
 Set ring buffer small, emit in a tight loop, assert `events_dropped > 0`:
 
 ```python
+import time
 node = NetNode(shards=1, buffer_capacity=8, backpressure='drop_oldest')
 for i in range(1000):
     node.emit({'i': i})

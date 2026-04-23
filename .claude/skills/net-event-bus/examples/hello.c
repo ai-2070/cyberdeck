@@ -35,8 +35,15 @@ int main(void) {
     usleep(20 * 1000);
 
     net_poll_result_t result;
-    if (net_poll_ex(node, 10, NULL, &result) != 0 || result.count == 0) {
+    int rc = net_poll_ex(node, 10, NULL, &result);
+    if (rc != 0) {
+        fprintf(stderr, "net_poll_ex failed (rc=%d)\n", rc);
+        net_shutdown(node);
+        return 1;
+    }
+    if (result.count == 0) {
         fprintf(stderr, "no events received\n");
+        net_free_poll_result(&result);
         net_shutdown(node);
         return 1;
     }

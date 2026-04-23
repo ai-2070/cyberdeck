@@ -13,7 +13,7 @@ This is the file that prevents production fires. Read it when:
 ### The shutdown contract
 
 Calling `shutdown` does three things, in order:
-1. **Stop accepting new emits.** Subsequent `emit` calls return `Shutdown` errors (Rust) or fail silently (TS/Python sync paths).
+1. **Stop accepting new emits.** Subsequent `emit` calls return `Shutdown` errors (Rust) or raise binding errors in TS/Python sync paths (`Error` / `RuntimeError`).
 2. **Drain the local ring buffer.** In-flight events finish their current dispatch cycle. Events that have not yet been picked up by a drain worker are lost.
 3. **Disconnect transports.** Mesh sessions close, Redis/JetStream connections close, file handles flush.
 
@@ -163,7 +163,7 @@ Run this checklist top-to-bottom. Stop at the first hit.
 
 ### 1. Is the subscriber actually running before the publisher emits?
 
-Subscriptions are hot. If the publisher emits at T=0 and the subscriber subscribes at T=1ms, the subscriber misses the event. Common in tests and demos.
+Subscriptions are hot. If the publisher emits at T=0 and the subscriber subscribes at T=1ms, the subscriber may miss the event unless it is still in the publisher's local ring buffer when the subscribe lands. Common in tests and demos.
 
 **Check:** add a log line before `emit` and before the first iteration of the subscribe loop. Confirm the subscribe-side logs first.
 
