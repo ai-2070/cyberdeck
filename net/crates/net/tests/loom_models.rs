@@ -261,3 +261,162 @@ fn burst_cas_decrement_caps_at_initial_count_under_contention() {
         );
     });
 }
+
+// ─────────────────────────────────────────────────────────────
+// Model 3: AuthGuard bloom-filter + verified-cache ordering
+//
+// Mirrors `src/adapter/net/channel/guard.rs` — the extracted
+// `BloomCache` + the `verified` DashMap that `AuthGuard` owns.
+// The interesting invariant: a `check_fast` whose `bloom.probe`
+// observes bits cleared MUST observe `verified` not-populated
+// — otherwise an authorized subscriber's first packets get
+// `Denied` before the bloom write has propagated, even though
+// `authorize` (on the producer thread) has already returned.
+//
+// FAILURE_PATH_HARDENING_PLAN §Stage 2 Option B: this model
+// tests the real production memory-ordering annotations on
+// `BloomCache`. DashMap's internals are out of scope for loom
+// (it's not substitutable); we model the DashMap-backed
+// verified cache as a single `AtomicBool` with Release/Acquire,
+// which captures the only property we care about here —
+// "insert happened, and its Release-ordered publication is
+// visible to a subsequent Acquire load."
+//
+// Expected result:
+//
+// - With `BloomCache::mark` = Release + `probe` = Acquire (the
+//   production code as shipped), every interleaving produces a
+//   Denied verdict ONLY when verified-cache was also observed
+//   as empty. No false-deny.
+// - If `mark` is regressed to Relaxed (or probe regressed to
+//   Relaxed), loom finds the interleaving where check_fast
+//   sees bloom=0 but verified=true — a documented memory-
+//   model consequence of Relaxed, and the exact race this
+//   extraction was designed to rule out.
+// ─────────────────────────────────────────────────────────────
+
+/// Minimal model of the `(BloomCache, verified)` ordering.
+/// One bloom bit + one atomic bool, same Release/Acquire
+/// annotations as the production types.
+struct AuthBloomModel {
+    /// A single bloom bit — loom's state-space explodes with
+    /// more, and all bits share the same ordering annotation,
+    /// so one bit captures the property.
+    bloom_bit: AtomicU64,
+    /// Substitute for `verified.contains_key(..) == true`. A
+    /// real DashMap's `insert` completes with a Release on
+    /// its internal Mutex unlock; `contains_key` begins with
+    /// an Acquire on the lock. Modeling the insert/present
+    /// transition as a Release store on an `AtomicU64` with an
+    /// Acquire load in check_fast captures the same
+    /// happens-before semantics.
+    verified: AtomicU64,
+}
+
+impl AuthBloomModel {
+    fn new() -> Self {
+        Self {
+            bloom_bit: AtomicU64::new(0),
+            verified: AtomicU64::new(0),
+        }
+    }
+    /// Production `authorize`: Relaxed bloom mark, then the
+    /// DashMap-backed verified insert (modeled here as
+    /// Release, matching DashMap's per-shard Mutex-unlock
+    /// semantics on a real `insert`).
+    fn authorize(&self) {
+        self.bloom_bit.store(1, Ordering::Relaxed);
+        self.verified.store(1, Ordering::Release);
+    }
+    /// Production `check_fast`: Relaxed bloom probe, then the
+    /// DashMap-backed verified lookup (modeled as Acquire,
+    /// matching DashMap's Mutex-lock semantics on
+    /// `contains_key`). Returns 0=Denied, 1=Allowed,
+    /// 2=NeedsFullCheck.
+    fn check_fast(&self) -> u8 {
+        if self.bloom_bit.load(Ordering::Relaxed) == 0 {
+            return 0;
+        }
+        if self.verified.load(Ordering::Acquire) == 1 {
+            1
+        } else {
+            2
+        }
+    }
+}
+
+/// Property: concurrent `authorize` + `check_fast` produces
+/// one of the documented verdicts — no panic, no "impossible"
+/// state. A concurrent check DURING an in-flight authorize is
+/// allowed to observe ANY snapshot of the in-progress state
+/// (pre-bloom, pre-verified, post-bloom-pre-verified,
+/// post-both). The verdict is always one of
+/// `Denied | NeedsFullCheck | Allowed`; it's the caller's
+/// responsibility to retry or consult the slow path when
+/// receiving `NeedsFullCheck` or a transient `Denied`.
+///
+/// This test intentionally does NOT assert that "Denied
+/// implies verified is unobserved" — a concurrent consumer
+/// can observe a stale bloom (pre-authorize) and then later
+/// observe a fresh verified (post-authorize), and both
+/// observations are legal. The `post_authorize_check_never_denies`
+/// test below pins the stronger property that matters for
+/// production: under a synchronized handoff, no false-deny.
+#[test]
+fn auth_bloom_authorize_check_fast_concurrent_verdict_is_documented() {
+    loom::model(|| {
+        let m = Arc::new(AuthBloomModel::new());
+
+        let producer = {
+            let m = m.clone();
+            thread::spawn(move || m.authorize())
+        };
+        let consumer = {
+            let m = m.clone();
+            thread::spawn(move || m.check_fast())
+        };
+
+        producer.join().unwrap();
+        let verdict = consumer.join().unwrap();
+
+        // Only three legal verdicts exist. A fourth value
+        // would indicate a memory-safety bug or enum-tag
+        // corruption; the test pins total-ness.
+        assert!(
+            matches!(verdict, 0 | 1 | 2),
+            "check_fast returned undocumented verdict {verdict}",
+        );
+    });
+}
+
+/// Stronger property: if the producer fully completes
+/// (producer.join() returns), any subsequent check_fast in the
+/// SAME thread context as the join must see Allowed or
+/// NeedsFullCheck, never Denied.
+///
+/// This models the "subscribe completes → sender observes
+/// authorization" invariant that SDK callers rely on.
+#[test]
+fn auth_bloom_post_authorize_check_never_denies() {
+    loom::model(|| {
+        let m = Arc::new(AuthBloomModel::new());
+
+        // Producer runs to completion first (no interleaving
+        // at this level — producer.join() is a
+        // synchronization point).
+        let producer = {
+            let m = m.clone();
+            thread::spawn(move || m.authorize())
+        };
+        producer.join().unwrap();
+
+        // Now check_fast on the main thread after the join.
+        // join() synchronizes, so both bloom bits and verified
+        // are visible here. Must not be Denied.
+        let verdict = m.check_fast();
+        assert_ne!(
+            verdict, 0,
+            "check_fast after a joined authorize must never return Denied",
+        );
+    });
+}

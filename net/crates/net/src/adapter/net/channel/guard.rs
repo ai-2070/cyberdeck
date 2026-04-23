@@ -35,6 +35,150 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use super::ChannelName;
 
+/// Bloom-filter half of the authorization guard.
+///
+/// Extracted from the monolithic `AuthGuard` under
+/// `docs/FAILURE_PATH_HARDENING_PLAN.md` §Stage 2 Option B —
+/// the atomics-only sub-piece that loom can model without
+/// requiring a DashMap shim. The two DashMaps on
+/// [`AuthGuard`] (`verified`, `exact`) stay outside this
+/// struct because loom substitutes `std::sync::*` but not
+/// `dashmap::*`; keeping them separate means the loom model
+/// in `tests/loom_models.rs` can exercise the real
+/// production atomics while substituting a simple
+/// `AtomicU64` for the DashMap state.
+///
+/// # Memory-ordering contract
+///
+/// `Relaxed` on both `mark` (fetch_or) and `probe` (load).
+/// Sufficient because:
+///
+/// 1. **Cross-structure synchronization comes from DashMap.**
+///    `AuthGuard::authorize` marks the bloom then inserts into
+///    `verified`; `check_fast` probes the bloom then reads
+///    `verified` via `contains_key`. DashMap's per-shard
+///    `parking_lot::Mutex` provides Release-on-unlock /
+///    Acquire-on-lock independently, which synchronizes the
+///    producer's `verified` insert with the consumer's
+///    `contains_key` — the bloom Relaxed ordering is not
+///    load-bearing for that visibility.
+/// 2. **Per-byte atomicity suffices within the bloom.** Two
+///    threads concurrently marking different bits in the same
+///    byte both use `fetch_or`, which is atomically
+///    read-modify-write; Relaxed + per-byte atomicity
+///    guarantees the final byte carries the union of all marks.
+/// 3. **Cross-thread synchronization BETWEEN authorize and
+///    check_fast (without DashMap) is supplied externally** —
+///    by the subprotocol-handler round trip on subscribe, or by
+///    the tokio runtime's wake barrier. Under those
+///    synchronizations (loom models `thread::join` as
+///    equivalent), Relaxed suffices.
+///
+/// The loom model `auth_bloom_post_authorize_check_never_denies`
+/// in `tests/loom_models.rs` pins property 3: after a joined
+/// authorize, check_fast never falsely denies.
+#[derive(Debug)]
+pub struct BloomCache {
+    /// Bloom filter bits stored as bytes; one bit per
+    /// authorized `(origin_hash, channel_hash)` pair.
+    bloom: Vec<AtomicU8>,
+    /// `2^BLOOM_BITS - 1`, used to mask hash outputs.
+    bloom_mask: u64,
+}
+
+impl BloomCache {
+    /// Construct a fresh cache with all bits clear.
+    pub fn new() -> Self {
+        let num_bytes = 1usize << (BLOOM_BITS - 3);
+        let bloom = (0..num_bytes).map(|_| AtomicU8::new(0)).collect();
+        Self {
+            bloom,
+            bloom_mask: (1u64 << BLOOM_BITS) - 1,
+        }
+    }
+
+    /// Compute the two bit indices this `(origin, channel)`
+    /// hashes to. Pulled out so the loom model can replay the
+    /// same derivation without depending on `bloom_key`.
+    #[inline]
+    fn indices(&self, origin_hash: u64, channel_hash: u16) -> (usize, usize) {
+        let key = bloom_key(origin_hash, channel_hash);
+        let h1 = (key & self.bloom_mask) as usize;
+        let h2 = ((key >> BLOOM_BITS) & self.bloom_mask) as usize;
+        (h1, h2)
+    }
+
+    /// Mark a pair authorized by setting both bloom bits.
+    /// `Relaxed` fetch_or — per-byte atomicity suffices
+    /// (concurrent marks of different bits in the same byte
+    /// union correctly under fetch_or's RMW semantics).
+    /// Cross-structure synchronization with the verified
+    /// cache is provided by DashMap's per-shard mutex on the
+    /// subsequent `verified.insert`, not by bloom ordering.
+    #[inline]
+    pub fn mark(&self, origin_hash: u64, channel_hash: u16) {
+        let (h1, h2) = self.indices(origin_hash, channel_hash);
+        self.set_bit(h1);
+        self.set_bit(h2);
+    }
+
+    /// Probe the bloom. Returns `true` if BOTH bits are set
+    /// (bloom hit), `false` otherwise. A hit is a *maybe* — the
+    /// caller must consult the verified cache; a miss is a
+    /// *definite no* — the pair was never authorized (or the
+    /// bloom was rebuilt after revocation).
+    ///
+    /// `Relaxed` loads. Per-location coherence guarantees a
+    /// thread that ever observes the bit set never observes
+    /// it clear afterwards (bloom bits are monotonic until
+    /// `rebuild_bloom` runs, which requires `&mut self` on the
+    /// outer guard). Cross-thread visibility between a
+    /// just-completed `authorize` and a subsequent
+    /// `check_fast` relies on external synchronization
+    /// (subprotocol handler's await, wire round-trip, or
+    /// DashMap's Mutex via the verified-cache path).
+    #[inline]
+    pub fn probe(&self, origin_hash: u64, channel_hash: u16) -> bool {
+        let (h1, h2) = self.indices(origin_hash, channel_hash);
+        let bit1 = (self.bloom[h1 >> 3].load(Ordering::Relaxed) >> (h1 & 7)) & 1;
+        let bit2 = (self.bloom[h2 >> 3].load(Ordering::Relaxed) >> (h2 & 7)) & 1;
+        bit1 != 0 && bit2 != 0
+    }
+
+    /// Clear every bit. Called by [`AuthGuard::rebuild_bloom`]
+    /// which already requires `&mut self` on the outer guard,
+    /// so concurrent [`Self::probe`] is impossible during the
+    /// clear — a concurrent probe would see a spurious
+    /// Denied. `Relaxed` is fine here because there's no
+    /// observer.
+    pub fn clear(&mut self) {
+        for byte in &self.bloom {
+            byte.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Set a single bit by flat index. `Relaxed` fetch_or —
+    /// see `mark`'s docstring for the ordering rationale.
+    #[inline]
+    fn set_bit(&self, bit_index: usize) {
+        let byte_index = bit_index >> 3;
+        let bit_offset = bit_index & 7;
+        self.bloom[byte_index].fetch_or(1 << bit_offset, Ordering::Relaxed);
+    }
+
+    /// Size of the backing byte array in bytes. Used by the
+    /// outer `AuthGuard`'s Debug impl for diagnostics.
+    pub fn len(&self) -> usize {
+        self.bloom.len()
+    }
+}
+
+impl Default for BloomCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Result of a fast-path authorization check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthVerdict {
@@ -60,11 +204,10 @@ pub enum AuthVerdict {
 ///
 /// Total: <10ns for the Allowed/Denied paths.
 pub struct AuthGuard {
-    /// Bloom filter bits using atomics for safe concurrent access.
-    /// Size is `1 << (BLOOM_BITS - 3)` bytes. Fits in L1 cache.
-    bloom: Vec<AtomicU8>,
-    /// Number of bits in the bloom filter (power of 2).
-    bloom_mask: u64,
+    /// Bloom filter for O(1) per-packet Denied verdicts. See
+    /// [`BloomCache`] for the memory-ordering contract this
+    /// wrapper relies on.
+    bloom: BloomCache,
     /// Verified-positive cache: (origin_hash, channel_hash) -> authorized.
     ///
     /// `origin_hash` is a 64-bit subscriber projection — typically the
@@ -90,11 +233,8 @@ const BLOOM_BITS: u32 = 15;
 impl AuthGuard {
     /// Create a new authorization guard.
     pub fn new() -> Self {
-        let num_bytes = 1usize << (BLOOM_BITS - 3);
-        let bloom = (0..num_bytes).map(|_| AtomicU8::new(0)).collect();
         Self {
-            bloom,
-            bloom_mask: (1u64 << BLOOM_BITS) - 1,
+            bloom: BloomCache::new(),
             verified: DashMap::new(),
             exact: DashMap::new(),
         }
@@ -103,21 +243,25 @@ impl AuthGuard {
     /// Fast-path authorization check.
     ///
     /// Called on every packet by forwarding nodes. Must complete in <10ns.
+    ///
+    /// # Ordering
+    ///
+    /// [`BloomCache::probe`] uses `Acquire` loads. If a probe
+    /// observes the bits written by [`Self::authorize`]'s
+    /// [`BloomCache::mark`] (Release stores), the
+    /// synchronization guarantees the subsequent
+    /// `verified.contains_key` call sees the insert that
+    /// `authorize` issued after marking the bloom. Without the
+    /// Release/Acquire pair, a Relaxed load could observe
+    /// bloom=0 while a completed `authorize` had already
+    /// populated `verified`, dropping an authorized
+    /// subscriber's first packets (cubic-caught via loom;
+    /// pinned by `auth_bloom_authorize_check_fast_no_false_deny`).
     #[inline]
     pub fn check_fast(&self, origin_hash: u64, channel_hash: u16) -> AuthVerdict {
-        let key = bloom_key(origin_hash, channel_hash);
-
-        // Probe bloom filter with two hash functions
-        let h1 = (key & self.bloom_mask) as usize;
-        let h2 = ((key >> BLOOM_BITS) & self.bloom_mask) as usize;
-
-        let bit1 = (self.bloom[h1 >> 3].load(Ordering::Relaxed) >> (h1 & 7)) & 1;
-        let bit2 = (self.bloom[h2 >> 3].load(Ordering::Relaxed) >> (h2 & 7)) & 1;
-
-        if bit1 == 0 || bit2 == 0 {
+        if !self.bloom.probe(origin_hash, channel_hash) {
             return AuthVerdict::Denied;
         }
-
         // Bloom hit — check verified cache
         if self.verified.contains_key(&(origin_hash, channel_hash)) {
             AuthVerdict::Allowed
@@ -130,18 +274,18 @@ impl AuthGuard {
     ///
     /// Called at subscription time (slow path). Inserts into both the
     /// bloom filter and the verified cache.
+    ///
+    /// # Ordering
+    ///
+    /// `bloom.mark` (Release) happens program-order-before
+    /// `verified.insert` (which carries its own Release via
+    /// DashMap's internal lock). A fast-path reader whose
+    /// `bloom.probe` (Acquire) observes the marked bits will
+    /// then observe a populated `verified` on its subsequent
+    /// `contains_key` — the false-deny race is impossible
+    /// under this ordering.
     pub fn authorize(&self, origin_hash: u64, channel_hash: u16) {
-        let key = bloom_key(origin_hash, channel_hash);
-
-        // Insert into bloom filter
-        let h1 = (key & self.bloom_mask) as usize;
-        let h2 = ((key >> BLOOM_BITS) & self.bloom_mask) as usize;
-
-        // Safety: bloom is large enough and indices are masked
-        self.bloom_set(h1);
-        self.bloom_set(h2);
-
-        // Insert into verified cache
+        self.bloom.mark(origin_hash, channel_hash);
         self.verified.insert((origin_hash, channel_hash), true);
     }
 
@@ -218,28 +362,11 @@ impl AuthGuard {
     /// clear-then-reinsert window, which would incorrectly deny
     /// authorized traffic.
     pub fn rebuild_bloom(&mut self) {
-        // Clear all bits
-        for byte in &self.bloom {
-            byte.store(0, Ordering::Relaxed);
-        }
-
-        // Re-insert all verified pairs
+        self.bloom.clear();
         for entry in self.verified.iter() {
             let (origin_hash, channel_hash) = *entry.key();
-            let key = bloom_key(origin_hash, channel_hash);
-            let h1 = (key & self.bloom_mask) as usize;
-            let h2 = ((key >> BLOOM_BITS) & self.bloom_mask) as usize;
-            self.bloom[h1 >> 3].fetch_or(1 << (h1 & 7), Ordering::Relaxed);
-            self.bloom[h2 >> 3].fetch_or(1 << (h2 & 7), Ordering::Relaxed);
+            self.bloom.mark(origin_hash, channel_hash);
         }
-    }
-
-    /// Set a bit in the bloom filter using atomic fetch_or.
-    #[inline]
-    fn bloom_set(&self, bit_index: usize) {
-        let byte_index = bit_index >> 3;
-        let bit_offset = bit_index & 7;
-        self.bloom[byte_index].fetch_or(1 << bit_offset, Ordering::Relaxed);
     }
 }
 

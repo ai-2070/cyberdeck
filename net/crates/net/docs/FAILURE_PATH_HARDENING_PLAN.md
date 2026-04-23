@@ -170,11 +170,31 @@ LOOM_LOG=1 RUSTFLAGS="--cfg loom" cargo test --release --test loom_models \
 
 Three options for covering the DashMap-heavy cores:
 
-- **Option A: DashMap loom shim (~2-3 weeks).** Implement a `loom_sync::DashMap` that models concurrent access via per-shard loom `Mutex`es. High upfront cost; once it exists, every DashMap-using core becomes loom-testable. The shim is also usable by the compute-surface cores (orchestrator, source/target handlers) which also depend on DashMap.
-- **Option B: Extract atomics-only sub-structs (~1 week per core).** Pull the correctness-bearing logic out of each core into a DashMap-free inner struct. This is a production-code refactor; benefit extends beyond loom (the extracted logic becomes unit-testable, clippy-visible in isolation, etc.). Risk: changes the shape of the API.
+- **Option A: DashMap loom shim (~2-3 weeks).** Implement a `loom_sync::DashMap` that models concurrent access via per-shard loom `Mutex`es. High upfront cost; once it exists, every DashMap-using core becomes loom-testable. The shim is also usable by the compute-surface cores (orchestrator, source/target handlers) which also depend on DashMap. **Considered and rejected** for AuthGuard (see Option B landing below): a shim's single-Mutex-HashMap model tests a different concurrency model than DashMap's per-shard sharding, so bugs catchable under the shim may not exist under production and vice-versa — false-confidence risk without a clear win.
+- **Option B: Extract atomics-only sub-structs (~1 week per core, landed for AuthGuard).** Pull the correctness-bearing logic out of each core into a DashMap-free inner struct. This is a production-code refactor; benefit extends beyond loom (the extracted logic becomes unit-testable, clippy-visible in isolation, etc.). **Landed** for AuthGuard — see "Option B landing: BloomCache" below.
 - **Option C: Skip the DashMap-heavy cores and rely on Stage 3 (failure-injection) + Stage 4 (DST) to catch what loom would.** Cheapest but leaves the memory-ordering correctness claim weaker — Stage 4 DST finds lost updates probabilistically, not exhaustively.
 
-**Recommendation:** Option A if Stage 2 rigor matters beyond what Stage 4 buys. Option C if the team is moving toward DST anyway — the bug class loom catches (exhaustive interleaving verification) is a subset of what DST eventually covers at higher cost, so double-investing has diminishing returns.
+**Recommendation:** Option B for each core where there's *custom* atomic ordering worth pinning (like AuthGuard's bloom-filter). Option C for cores whose concurrency is fully delegated to DashMap (TokenCache, CapabilityIndex's membership side, RoutingTable's routes side) — loom over those mostly re-validates DashMap's own guarantees and doesn't catch production bugs.
+
+### Option B landing: `BloomCache` extracted from `AuthGuard`
+
+`src/adapter/net/channel/guard.rs` now hosts a standalone `BloomCache` struct holding just the bloom-filter atomics — `Vec<AtomicU8>` + the mask, with `mark`/`probe`/`clear` methods. The outer `AuthGuard` composes `BloomCache` + the two DashMaps (`verified`, `exact`) and delegates all atomic operations. Extraction was ~60 lines of code movement; `AuthGuard`'s public API is unchanged, and the existing 1,562-test suite + P2-8 stress tests pass unmodified.
+
+Three loom models in `tests/loom_models.rs` now cover it:
+
+1. **`auth_bloom_authorize_check_fast_concurrent_verdict_is_documented`** — concurrent authorize + check_fast. Asserts the verdict is always one of the three documented values (panic-freedom + enum-tag stability under all interleavings).
+2. **`auth_bloom_post_authorize_check_never_denies`** — sequential: full authorize then check_fast via `thread::join()`. Asserts check_fast never returns Denied after a synchronized completion. This pins the production-relevant invariant — "subscribe-completes-before-first-packet-arrives" via wire barrier or subprotocol-handler await.
+3. **`stream_stats_counter_battery_is_atomic_under_concurrent_record`** (pattern-level, unchanged) — complements the Option B coverage for `SchedulerStreamStats`.
+
+### What loom's exploration taught us
+
+Running loom exhaustively against the AuthGuard model surfaced something useful: **the bloom's ordering annotations are not load-bearing for cross-structure visibility**. DashMap's per-shard `parking_lot::Mutex` provides Release-on-unlock / Acquire-on-lock independently, which synchronizes the producer's `verified.insert` with the consumer's `contains_key` regardless of what ordering the bloom uses. The bloom stores/loads can be `Relaxed` and the system still behaves correctly, because any "meaningful" synchronization between authorize and check_fast flows through DashMap's locks or external wire barriers.
+
+I initially promoted the bloom ordering to `Release`/`Acquire` as a defensive change, then reverted to `Relaxed` once loom confirmed it wasn't load-bearing. Keeping `Relaxed` matches the original production semantics, preserves the AArch64 perf (no `ldar`/`stlr` barriers on the hot path), and lets the loom tests serve as living documentation for WHY `Relaxed` is correct here. If a future refactor removes the DashMap-provided synchronization, the loom tests would need re-examination.
+
+### Remaining cores
+
+TokenCache, CapabilityIndex, and RoutingTable all have their correctness-bearing logic primarily in DashMap operations. Option B extraction on them would produce structs that don't have interesting custom atomic ordering to test — the loom coverage would be trivial (just verifying DashMap's guarantees, which aren't ours to re-verify). The pragmatic call is to leave those cores as-is and let Stage 3 failure injection + Stage 4 DST cover concurrent-access bugs in those paths.
 
 **What loom catches that stress tests don't:**
 
