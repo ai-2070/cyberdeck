@@ -130,15 +130,18 @@ struct UnackedPacket {
 /// - Session lifecycle events
 /// - Error propagation
 pub struct ReliableStream {
-    /// Highest contiguous sequence received
-    ack_seq: u64,
-    /// Bitmap of received sequences beyond ack_seq (64-bit sliding window)
+    /// The next sequence number we haven't yet received. All sequences
+    /// `< next_expected` have been received contiguously. Starts at 0,
+    /// expecting seq 0 as the first packet of the stream.
+    ///
+    /// Use `next_expected()` / `ack_seq()` accessors externally.
+    next_expected: u64,
+    /// SACK bitmap for out-of-order packets. Bit `i` is set iff sequence
+    /// `next_expected + 1 + i` has been received. This represents up to
+    /// 64 future sequences after the contiguous range. As `next_expected`
+    /// advances, the bitmap is right-shifted so bit 0 always represents
+    /// `next_expected + 1`.
     sack_bitmap: u64,
-    /// Whether we have received at least one packet. Needed to distinguish
-    /// "never received anything" (ack_seq=0, received_first=false) from
-    /// "received seq 0" (ack_seq=0, received_first=true) so that
-    /// duplicate deliveries of sequence 0 are correctly rejected.
-    received_first: bool,
     /// Pending unacknowledged packets (bounded)
     pending: VecDeque<UnackedPacket>,
     /// Retransmit timeout
@@ -162,9 +165,8 @@ impl ReliableStream {
     /// Create a new reliable stream with default settings
     pub fn new() -> Self {
         Self {
-            ack_seq: 0,
+            next_expected: 0,
             sack_bitmap: 0,
-            received_first: false,
             pending: VecDeque::with_capacity(Self::DEFAULT_MAX_PENDING),
             rto: Self::DEFAULT_RTO,
             max_pending: Self::DEFAULT_MAX_PENDING,
@@ -175,9 +177,8 @@ impl ReliableStream {
     /// Create with custom settings
     pub fn with_settings(rto: Duration, max_pending: usize, max_retries: u8) -> Self {
         Self {
-            ack_seq: 0,
+            next_expected: 0,
             sack_bitmap: 0,
-            received_first: false,
             pending: VecDeque::with_capacity(max_pending),
             rto,
             max_pending,
@@ -190,16 +191,38 @@ impl ReliableStream {
         self.rto = rto;
     }
 
-    /// Get the current ack sequence
-    pub fn ack_seq(&self) -> u64 {
-        self.ack_seq
+    /// Lowest sequence number we have not yet received. All sequences
+    /// strictly below this value are contiguously received.
+    #[inline]
+    pub fn next_expected(&self) -> u64 {
+        self.next_expected
     }
 
-    /// Process an acknowledgment
-    pub fn on_ack(&mut self, ack_seq: u64) {
-        // Remove all pending packets up to ack_seq
+    /// Highest contiguously-received sequence number, or `None` if no
+    /// packets have been received yet.
+    #[inline]
+    pub fn last_received_contiguous(&self) -> Option<u64> {
+        if self.next_expected == 0 {
+            None
+        } else {
+            Some(self.next_expected - 1)
+        }
+    }
+
+    /// Get the current ack sequence (highest contiguously-received seq).
+    /// Returns 0 when nothing has been received yet — callers that need
+    /// to distinguish "received seq 0" from "received nothing" should use
+    /// [`Self::last_received_contiguous`] instead.
+    pub fn ack_seq(&self) -> u64 {
+        self.next_expected.saturating_sub(1)
+    }
+
+    /// Process an acknowledgment. `acked` is the highest sequence the
+    /// peer has contiguously received.
+    pub fn on_ack(&mut self, acked: u64) {
+        // Remove all pending packets up to and including acked.
         while let Some(front) = self.pending.front() {
-            if front.seq <= ack_seq {
+            if front.seq <= acked {
                 self.pending.pop_front();
             } else {
                 break;
@@ -207,15 +230,27 @@ impl ReliableStream {
         }
     }
 
-    /// Check if there are gaps in received sequences
+    /// Check if there are gaps in received sequences.
+    ///
+    /// A gap exists whenever at least one future sequence has been
+    /// received out of order — meaning `next_expected` itself is still
+    /// pending (the implicit gap) and any interior missing seqs show
+    /// up as zero bits in the SACK bitmap below the highest received.
     fn has_gaps(&self) -> bool {
-        self.missing_bitmap() != 0
+        self.sack_bitmap != 0
     }
 
-    /// Get bitmap of missing sequences
+    /// Get bitmap of missing sequences after `next_expected`.
+    ///
+    /// Bit `i` set means sequence `next_expected + 1 + i` is missing.
+    /// Sequence `next_expected` itself is always implicitly missing
+    /// whenever `has_gaps()` returns true (that's what makes the NACK
+    /// meaningful) — `missing_sequences()` on the resulting NACK emits
+    /// `next_expected` first, then the bits of this bitmap.
     fn missing_bitmap(&self) -> u64 {
-        // Invert sack_bitmap to get missing sequences
-        // Only consider bits up to the highest received
+        // Invert sack_bitmap to get missing sequences; only consider
+        // bits up to the highest received (otherwise we'd claim
+        // sequences we've never heard of are "missing").
         if self.sack_bitmap == 0 {
             return 0;
         }
@@ -254,43 +289,62 @@ impl ReliabilityMode for ReliableStream {
     }
 
     fn on_receive(&mut self, seq: u64) -> bool {
-        if seq == 0 {
-            if !self.received_first {
-                // First packet ever received (sequence 0).
-                self.ack_seq = 0;
-                self.received_first = true;
-                return true;
-            }
-            // Duplicate of seq 0 after it was already received
+        // Anything below next_expected has already been received
+        // contiguously; reject as a duplicate.
+        if seq < self.next_expected {
             return false;
         }
-
-        if seq == self.ack_seq + 1 {
-            // Next expected sequence
-            self.ack_seq = seq;
-            self.received_first = true;
-            // Shift bitmap since we advanced by 1
-            self.sack_bitmap >>= 1;
-
-            // Advance through any buffered sequences (now bit 0 represents ack_seq + 1)
+        if seq == self.next_expected {
+            // Next expected sequence — advance the contiguous range,
+            // then absorb any already-received future seqs that have
+            // just become contiguous.
+            //
+            // Bitmap invariant (before this call): bit i is set iff
+            // seq (old next_expected + 1 + i) has been received. After
+            // incrementing next_expected by 1 (but BEFORE shifting),
+            // bit 0 of the bitmap now refers to seq new_next_expected
+            // itself — which, if set, means that seq was also received
+            // out-of-order earlier and we can advance past it too.
+            self.next_expected += 1;
             while self.sack_bitmap & 1 != 0 {
-                self.ack_seq += 1;
+                self.next_expected += 1;
                 self.sack_bitmap >>= 1;
             }
-            true
-        } else if seq > self.ack_seq && seq <= self.ack_seq + 64 {
-            // Future sequence within window - mark in SACK bitmap
-            let offset = seq - self.ack_seq - 1;
-            self.sack_bitmap |= 1 << offset;
-            self.received_first = true;
-            true
-        } else if seq <= self.ack_seq {
-            // Duplicate (already received)
-            false
-        } else {
-            // Too far ahead - reject
-            false
+            // Restore the bitmap invariant: after the loop,
+            // bit 0 of the bitmap still refers to seq `next_expected`
+            // (not yet received; otherwise the loop would have
+            // consumed it). The invariant wants bit 0 to refer to
+            // seq `next_expected + 1`, so shift once more.
+            self.sack_bitmap >>= 1;
+            return true;
         }
+        // seq > next_expected: future sequence.
+        //
+        // The bitmap can represent up to 64 future seqs past the
+        // contiguous range. `offset` here is (seq - next_expected),
+        // which is ≥ 1. Bit 0 of the bitmap represents
+        // `next_expected + 1`, so the bit index is `offset - 1`.
+        //
+        // If the first packet of a stream arrives with seq > 0, this
+        // branch records it without advancing next_expected, so
+        // sequences `[0, seq)` remain flagged as missing in the
+        // SACK bitmap — the receiver will request them via a NACK
+        // instead of silently skipping them (which is what the old
+        // code's `seq == ack_seq + 1` branch did, treating seq 0 as
+        // already-acknowledged when the stream actually started with
+        // a lost packet).
+        let offset = seq - self.next_expected;
+        if offset > 64 {
+            return false;
+        }
+        let bit = offset - 1;
+        let mask = 1u64 << bit;
+        if self.sack_bitmap & mask != 0 {
+            // Duplicate of a previously-recorded future seq.
+            return false;
+        }
+        self.sack_bitmap |= mask;
+        true
     }
 
     #[inline]
@@ -301,7 +355,7 @@ impl ReliabilityMode for ReliableStream {
     fn build_nack(&self) -> Option<NackPayload> {
         if self.has_gaps() {
             Some(NackPayload {
-                ack_seq: self.ack_seq,
+                next_expected: self.next_expected,
                 missing_bitmap: self.missing_bitmap(),
             })
         } else {
@@ -358,7 +412,7 @@ impl ReliabilityMode for ReliableStream {
 impl std::fmt::Debug for ReliableStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReliableStream")
-            .field("ack_seq", &self.ack_seq)
+            .field("next_expected", &self.next_expected)
             .field("sack_bitmap", &format!("{:064b}", self.sack_bitmap))
             .field("pending_count", &self.pending.len())
             .field("rto_ms", &self.rto.as_millis())
@@ -402,7 +456,12 @@ mod tests {
     fn test_reliable_stream_in_order() {
         let mut mode = ReliableStream::new();
 
-        // Receive in order
+        // Receive in order starting from seq 0 (the sender always
+        // begins at 0).
+        assert!(mode.on_receive(0));
+        assert_eq!(mode.ack_seq(), 0);
+        assert_eq!(mode.last_received_contiguous(), Some(0));
+
         assert!(mode.on_receive(1));
         assert_eq!(mode.ack_seq(), 1);
 
@@ -420,7 +479,9 @@ mod tests {
     fn test_reliable_stream_gap() {
         let mut mode = ReliableStream::new();
 
-        // Receive with gap
+        // Receive with gap (after an initial in-order seq 0 so the
+        // gap is a real mid-stream hole, not a missing prefix).
+        assert!(mode.on_receive(0));
         assert!(mode.on_receive(1));
         assert!(mode.on_receive(3)); // Gap at 2
         assert!(mode.on_receive(5)); // Gap at 4
@@ -429,9 +490,9 @@ mod tests {
 
         // Should have NACK
         let nack = mode.build_nack().unwrap();
-        assert_eq!(nack.ack_seq, 1);
+        assert_eq!(nack.next_expected, 2);
 
-        // Missing: 2, 4 (relative to ack_seq + 1)
+        // Missing: 2 (the next expected — implicit), 4 (bitmap bit 1).
         let missing: Vec<_> = nack.missing_sequences().collect();
         assert!(missing.contains(&2));
         assert!(missing.contains(&4));
@@ -441,7 +502,9 @@ mod tests {
     fn test_reliable_stream_fill_gap() {
         let mut mode = ReliableStream::new();
 
-        // Receive out of order
+        // Receive out of order (with seq 0 so the gap is interior, not
+        // a missing prefix).
+        assert!(mode.on_receive(0));
         assert!(mode.on_receive(1));
         assert!(mode.on_receive(3));
         assert!(mode.on_receive(4));
@@ -461,6 +524,7 @@ mod tests {
     fn test_reliable_stream_duplicate() {
         let mut mode = ReliableStream::new();
 
+        assert!(mode.on_receive(0));
         assert!(mode.on_receive(1));
         assert!(mode.on_receive(2));
 
@@ -495,10 +559,11 @@ mod tests {
         mode.on_send(2, Bytes::from_static(b"packet2"));
         mode.on_send(3, Bytes::from_static(b"packet3"));
 
-        // NACK for packet 2
+        // NACK saying "received through seq 1, seq 2 is the next
+        // expected (and therefore missing)".
         let nack = NackPayload {
-            ack_seq: 1,
-            missing_bitmap: 0b01, // Missing sequence 2
+            next_expected: 2,
+            missing_bitmap: 0,
         };
 
         let retransmits = mode.on_nack(&nack);
@@ -510,6 +575,7 @@ mod tests {
     fn test_reliable_stream_too_far_ahead() {
         let mut mode = ReliableStream::new();
 
+        assert!(mode.on_receive(0));
         assert!(mode.on_receive(1));
 
         // Sequence 100 is too far ahead (beyond 64-bit window)
@@ -525,7 +591,9 @@ mod tests {
         // in release.
         let mut mode = ReliableStream::new();
 
-        // Receive packet 1, then packet 65 (exactly 64 ahead, at the edge of the window)
+        // Receive packet 0, 1, then packet 65 (exactly 64 past `1`, at
+        // the edge of the window).
+        assert!(mode.on_receive(0));
         assert!(mode.on_receive(1));
         assert!(mode.on_receive(65));
 
@@ -576,7 +644,7 @@ mod tests {
 
         // Receiver builds NACK
         let nack = receiver.build_nack().expect("should have gaps");
-        assert_eq!(nack.ack_seq, 1);
+        assert_eq!(nack.next_expected, 2);
         let missing: Vec<u64> = nack.missing_sequences().collect();
         assert!(missing.contains(&2), "should report seq 2 missing");
         assert!(missing.contains(&4), "should report seq 4 missing");
@@ -683,7 +751,8 @@ mod tests {
         // is correct by construction regardless of bitmap invariants.
         let mut mode = ReliableStream::new();
 
-        // Receive 1, 2, 4 — gap at 3
+        // Receive 0, 1, 2, 4 — gap at 3
+        assert!(mode.on_receive(0));
         assert!(mode.on_receive(1));
         assert!(mode.on_receive(2));
         assert!(mode.on_receive(4));
@@ -701,7 +770,8 @@ mod tests {
         // immediately after ack_seq are present.
         let mut mode = ReliableStream::new();
 
-        // Receive 1, 3, 5, 7 — gaps at 2, 4, 6
+        // Receive 0, 1, 3, 5, 7 — gaps at 2, 4, 6
+        assert!(mode.on_receive(0));
         assert!(mode.on_receive(1));
         assert!(mode.on_receive(3));
         assert!(mode.on_receive(5));
@@ -714,6 +784,7 @@ mod tests {
         assert!(missing.contains(&2), "should detect gap at seq 2");
         assert!(missing.contains(&4), "should detect gap at seq 4");
         assert!(missing.contains(&6), "should detect gap at seq 6");
+        // 4 entries: next_expected=2 (implicit), plus bits for 4 and 6.
         assert_eq!(missing.len(), 3);
     }
 
@@ -753,10 +824,11 @@ mod tests {
             "should retain the most recent packets"
         );
 
-        // NACK for packet 5 should succeed (it's tracked)
+        // NACK saying "seq 5 is the next expected (and therefore
+        // missing)" — receiver is asking for the retransmit.
         let nack = NackPayload {
-            ack_seq: 4,
-            missing_bitmap: 0b01, // missing seq 5
+            next_expected: 5,
+            missing_bitmap: 0,
         };
         let retransmits = mode.on_nack(&nack);
         assert_eq!(retransmits.len(), 1);
@@ -812,24 +884,102 @@ mod tests {
     }
 
     #[test]
-    fn test_regression_seq_zero_rejected_when_stream_starts_at_one() {
-        // Regression: received_first was only set in the seq==0 branch.
-        // If a stream starts at seq 1 (seq 0 never sent), received_first
-        // stayed false. A late/spurious seq 0 would then be accepted and
-        // reset ack_seq to 0, corrupting the entire stream window.
+    fn test_regression_first_received_seq_one_nacks_seq_zero() {
+        // Regression (HIGH, BUGS.md): when the first received packet
+        // on a reliable stream had seq > 0 (the real-world case where
+        // seq 0 was lost in transit), the receiver silently advanced
+        // `ack_seq` to that seq, claiming seq 0 had been acknowledged.
+        // The sender's retransmit of seq 0 was then rejected as a
+        // duplicate, and seq 0 was permanently lost to the application
+        // — a reliability-contract violation.
+        //
+        // Fix: the receiver now leaves `next_expected` at 0 whenever
+        // the first received seq is > 0, so the prefix gap is visible
+        // to `build_nack()` and the retransmit of seq 0 is accepted
+        // when it arrives.
         let mut mode = ReliableStream::new();
 
-        // Stream starts at seq 1 (seq 0 was never sent)
+        // First received packet has seq 1 (seq 0 was lost in transit).
         assert!(mode.on_receive(1));
-        assert!(mode.on_receive(2));
-        assert!(mode.on_receive(3));
-        assert_eq!(mode.ack_seq(), 3);
-
-        // Spurious seq 0 must be rejected
-        assert!(
-            !mode.on_receive(0),
-            "seq 0 must be rejected after stream advanced past it"
+        // next_expected must stay at 0 — we haven't received seq 0.
+        assert_eq!(mode.next_expected(), 0);
+        assert_eq!(
+            mode.last_received_contiguous(),
+            None,
+            "no contiguous prefix yet"
         );
-        assert_eq!(mode.ack_seq(), 3, "ack_seq must not reset to 0");
+
+        // A NACK must be generated reporting seq 0 as missing.
+        let nack = mode.build_nack().expect("prefix gap must produce a NACK");
+        assert_eq!(nack.next_expected, 0, "next_expected in NACK is 0");
+        let missing: Vec<u64> = nack.missing_sequences().collect();
+        assert!(
+            missing.contains(&0),
+            "NACK must report seq 0 as missing (was the lost first packet)"
+        );
+
+        // Retransmit of seq 0 must be accepted and advance the stream.
+        assert!(
+            mode.on_receive(0),
+            "retransmit of seq 0 must be accepted after it was NACK'd"
+        );
+        // Now we have seq 0 and 1 contiguously; next_expected advances.
+        assert_eq!(mode.next_expected(), 2);
+        assert_eq!(mode.ack_seq(), 1);
+
+        // No more gaps.
+        assert!(
+            mode.build_nack().is_none(),
+            "no gaps after the retransmit filled the prefix"
+        );
+    }
+
+    #[test]
+    fn test_regression_first_received_large_seq_bounded_by_window() {
+        // When the first received packet has a large seq (e.g. the
+        // first 10 packets were all lost), the receiver can still
+        // NACK up to the 64-bit bitmap window's worth of gaps. The
+        // important property is that seq 0 is reported missing and
+        // can be accepted on retransmit — not that *every* gap before
+        // the first received seq fits in the bitmap.
+        let mut mode = ReliableStream::new();
+
+        // First received packet is seq 10 (0..9 all lost).
+        assert!(mode.on_receive(10));
+        assert_eq!(mode.next_expected(), 0);
+
+        let nack = mode.build_nack().expect("prefix gap must produce a NACK");
+        let missing: Vec<u64> = nack.missing_sequences().collect();
+        // seq 0 is always reported as missing when any prefix gap exists.
+        assert!(missing.contains(&0), "NACK must report seq 0 missing");
+        // seq 1..9 also missing (within the 64-bit bitmap window).
+        for expected in 1..=9 {
+            assert!(
+                missing.contains(&expected),
+                "NACK must report seq {expected} missing"
+            );
+        }
+
+        // Sender retransmits seq 0..9 in order.
+        for seq in 0..10u64 {
+            assert!(mode.on_receive(seq), "retransmit of seq {seq} accepted");
+        }
+        assert_eq!(mode.next_expected(), 11);
+    }
+
+    #[test]
+    fn test_regression_first_received_duplicate_rejected() {
+        // When seq 1 arrives first and is accepted (with seq 0 still
+        // pending NACK), a subsequent duplicate of seq 1 must be
+        // rejected — not double-counted in the bitmap.
+        let mut mode = ReliableStream::new();
+
+        assert!(mode.on_receive(1), "first seq 1 accepted");
+        assert!(
+            !mode.on_receive(1),
+            "duplicate of seq 1 must be rejected for exactly-once delivery"
+        );
+        // State unchanged.
+        assert_eq!(mode.next_expected(), 0);
     }
 }

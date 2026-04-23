@@ -1153,6 +1153,18 @@ impl MeshNode {
 
         let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
 
+        // Hoist `peers` and `addr_to_node` out of the struct literal so
+        // the failure-detector `on_failure` callback below can evict
+        // dead peers from them. A previous implementation removed the
+        // failed peer from the reroute policy, roster, subnet map,
+        // entity-id map, and capability index — but left the PeerInfo
+        // (including its session) in `peers` indefinitely. Subsequent
+        // `send_to_peer` calls would then route through a dead session
+        // and silently drop packets via UDP until an application-layer
+        // timeout fired.
+        let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
+        let addr_to_node: Arc<DashMap<SocketAddr, u64>> = Arc::new(DashMap::new());
+
         // Create proximity graph for topology awareness.
         //
         // Peers are seeded into the graph via `node_id_to_graph_id(peer_node_id)`
@@ -1208,6 +1220,9 @@ impl MeshNode {
         let peer_subnets_failure = peer_subnets.clone();
         let peer_entity_ids_failure = peer_entity_ids.clone();
         let capability_index_failure = capability_index.clone();
+        let peers_failure = peers.clone();
+        let addr_to_node_failure = addr_to_node.clone();
+        let peer_addrs_failure = peer_addrs.clone();
         let failure_detector = FailureDetector::with_config(FailureDetectorConfig {
             timeout: config.session_timeout,
             miss_threshold: 3,
@@ -1235,6 +1250,25 @@ impl MeshNode {
             // failure; the capability index is now consistent
             // with them.
             capability_index_failure.remove(node_id);
+
+            // Drop the dead peer's session + address mapping so
+            // subsequent `send_to_peer` / `send_routed` calls don't
+            // route through a session whose transport has gone
+            // silent. UDP `send_to` succeeds even when the peer is
+            // unreachable, so without this eviction the mesh
+            // appears healthy until an application-layer timeout
+            // fires. A concurrent reconnect under the same
+            // `node_id` is handled via `remove_if`: we only remove
+            // entries whose `addr` still matches what was cached
+            // when the peer was declared failed — a fresh
+            // registration with a different addr survives.
+            if let Some((_, old_info)) = peers_failure.remove(&node_id) {
+                let old_addr = old_info.addr;
+                addr_to_node_failure
+                    .remove_if(&old_addr, |_, n| *n == node_id);
+                peer_addrs_failure
+                    .remove_if(&node_id, |_, addr| *addr == old_addr);
+            }
         })
         .on_recovery(move |node_id| rp_recovery.on_recovery(node_id));
 
@@ -1260,8 +1294,8 @@ impl MeshNode {
             node_id,
             config,
             socket,
-            peers: Arc::new(DashMap::new()),
-            addr_to_node: Arc::new(DashMap::new()),
+            peers,
+            addr_to_node,
             router,
             failure_detector: Arc::new(failure_detector),
             inbound: Arc::new(DashMap::new()),

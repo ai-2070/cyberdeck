@@ -506,10 +506,25 @@ impl RateLimiter {
         self.maybe_reset();
         let current = self.global_tokens.load(Ordering::Relaxed);
         let effective_limit = (limit as f64 * burst as f64) as u64;
-        if current + tokens > effective_limit {
+        // `checked_add` guards against attacker-influenced `tokens`
+        // plus accumulated `current` wrapping `u64::MAX`. In debug
+        // builds the raw `current + tokens` panics (DoS); in release
+        // it wraps and silently bypasses the check. Treat overflow
+        // as definitely over the limit.
+        let would_be = match current.checked_add(tokens) {
+            Some(sum) => sum,
+            None => {
+                return Err(SafetyViolation::RateLimitExceeded {
+                    limit_type: RateLimitType::TokensPerMinute,
+                    current: u64::MAX,
+                    limit: effective_limit,
+                });
+            }
+        };
+        if would_be > effective_limit {
             return Err(SafetyViolation::RateLimitExceeded {
                 limit_type: RateLimitType::TokensPerMinute,
-                current: current + tokens,
+                current: would_be,
                 limit: effective_limit,
             });
         }
@@ -1602,6 +1617,36 @@ mod tests {
         assert_eq!(
             final_tokens, 0,
             "tokens should be 0 after release, not underflowed"
+        );
+    }
+
+    #[test]
+    fn test_regression_check_tokens_overflow_is_rejected() {
+        // Regression (MEDIUM, BUGS.md): `check_tokens` computed
+        // `current + tokens` on two u64 values without an overflow
+        // guard. Under high accumulated `current` the addition
+        // panicked in debug (DoS) or wrapped in release (bypass).
+        //
+        // Fix: use `checked_add` and treat overflow as "over limit".
+        let limiter = RateLimiter::new();
+        // Seed the counter to near-saturation so the next `tokens`
+        // value would wrap.
+        limiter
+            .global_tokens
+            .store(u64::MAX - 10, Ordering::Relaxed);
+
+        // Asking to add 100 more tokens would overflow u64.
+        let result = limiter.check_tokens(100, 1_000_000, 1.0);
+        assert!(
+            matches!(
+                result,
+                Err(SafetyViolation::RateLimitExceeded {
+                    limit_type: RateLimitType::TokensPerMinute,
+                    ..
+                })
+            ),
+            "overflow must be rejected, got {:?}",
+            result
         );
     }
 }

@@ -504,14 +504,43 @@ impl EventFrame {
     }
 }
 
-/// NACK payload for reliable streams
-#[derive(Debug, Clone, Copy)]
+/// NACK payload for reliable streams.
+///
+/// A NACK is sent by the receiver when there is at least one gap in the
+/// received-sequence range. It tells the sender:
+///
+/// - `next_expected`: the next sequence the receiver is waiting for.
+///   By construction, this sequence is missing (otherwise the receiver
+///   would have advanced past it).
+/// - `missing_bitmap`: bit `i` set iff sequence `next_expected + 1 + i`
+///   is missing (up to 64 future sequences).
 pub struct NackPayload {
-    /// Highest contiguous sequence received
-    pub ack_seq: u64,
-    /// Bitmap of missing sequences (relative to ack_seq + 1)
+    /// Next sequence the receiver expects. All seqs `< next_expected`
+    /// have been received contiguously.
+    pub next_expected: u64,
+    /// Bitmap of missing sequences after `next_expected`.
     pub missing_bitmap: u64,
 }
+
+impl std::fmt::Debug for NackPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NackPayload")
+            .field("next_expected", &self.next_expected)
+            .field(
+                "missing_bitmap",
+                &format_args!("{:#b}", self.missing_bitmap),
+            )
+            .finish()
+    }
+}
+
+impl Clone for NackPayload {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl Copy for NackPayload {}
 
 impl NackPayload {
     /// Size of NACK payload
@@ -521,37 +550,46 @@ impl NackPayload {
     #[inline]
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
-        buf[0..8].copy_from_slice(&self.ack_seq.to_le_bytes());
+        buf[0..8].copy_from_slice(&self.next_expected.to_le_bytes());
         buf[8..16].copy_from_slice(&self.missing_bitmap.to_le_bytes());
         buf
     }
 
-    /// Parse from bytes
+    /// Parse from bytes. Rejects buffers whose length is anything other
+    /// than exactly [`Self::SIZE`] so trailing garbage isn't silently
+    /// accepted.
     #[inline]
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < Self::SIZE {
+        if data.len() != Self::SIZE {
             return None;
         }
 
-        let ack_seq = u64::from_le_bytes(data[0..8].try_into().ok()?);
+        let next_expected = u64::from_le_bytes(data[0..8].try_into().ok()?);
         let missing_bitmap = u64::from_le_bytes(data[8..16].try_into().ok()?);
 
         Some(Self {
-            ack_seq,
+            next_expected,
             missing_bitmap,
         })
     }
 
-    /// Get missing sequence numbers
+    /// Get missing sequence numbers.
+    ///
+    /// Emits `next_expected` (always missing by construction when a NACK
+    /// is sent), followed by every future seq whose bit is set in the
+    /// missing bitmap.
     #[inline]
     pub fn missing_sequences(&self) -> impl Iterator<Item = u64> + '_ {
-        (0..64).filter_map(move |i| {
+        let base = self.next_expected;
+        std::iter::once(base).chain((0..64).filter_map(move |i| {
             if (self.missing_bitmap >> i) & 1 != 0 {
-                Some(self.ack_seq + 1 + i)
+                // `base + 1 + i` cannot overflow in any realistic
+                // stream (2^64 packets is far beyond any deployment).
+                Some(base.saturating_add(1).saturating_add(i))
             } else {
                 None
             }
-        })
+        }))
     }
 }
 
@@ -684,19 +722,38 @@ mod tests {
 
     #[test]
     fn test_nack_payload_roundtrip() {
+        // With `next_expected = 100` and bits 0,2,5,7 set, the missing
+        // sequences are: 100 (always, implicit) plus 101, 103, 106, 108.
         let nack = NackPayload {
-            ack_seq: 100,
+            next_expected: 100,
             missing_bitmap: 0b1010_0101,
         };
 
         let bytes = nack.to_bytes();
         let parsed = NackPayload::from_bytes(&bytes).unwrap();
 
-        assert_eq!(parsed.ack_seq, 100);
+        assert_eq!(parsed.next_expected, 100);
         assert_eq!(parsed.missing_bitmap, 0b1010_0101);
 
         let missing: Vec<_> = parsed.missing_sequences().collect();
-        assert_eq!(missing, vec![101, 103, 106, 108]);
+        assert_eq!(missing, vec![100, 101, 103, 106, 108]);
+    }
+
+    #[test]
+    fn test_nack_payload_rejects_trailing_bytes() {
+        // Regression: from_bytes used `< SIZE` so trailing garbage was
+        // silently accepted. Now we require exactly SIZE bytes.
+        let nack = NackPayload {
+            next_expected: 1,
+            missing_bitmap: 0b10,
+        };
+        let mut bytes = nack.to_bytes().to_vec();
+        bytes.push(0xFF); // one byte of trailing garbage
+
+        assert!(
+            NackPayload::from_bytes(&bytes).is_none(),
+            "NackPayload::from_bytes must reject buffers longer than SIZE"
+        );
     }
 
     #[test]

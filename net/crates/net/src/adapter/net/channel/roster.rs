@@ -39,19 +39,30 @@ impl SubscriberRoster {
 
     /// Add `node_id` as a subscriber of `channel`. Returns true if the
     /// pair was newly inserted, false if it was already present.
+    ///
+    /// Insertion into each inner `DashSet` happens **inside** the
+    /// outer-map entry guard. A previous implementation cloned the
+    /// inner `Arc` out of the guard first and then inserted; between
+    /// those two steps a concurrent `remove()` on the same channel
+    /// could observe an empty set and evict the outer entry via
+    /// `remove_if`, leaving our cloned `Arc` orphaned — the
+    /// subscription would appear in `by_peer` but never in
+    /// `members(channel)`, silently breaking fan-out.
     pub fn add(&self, channel: ChannelId, node_id: u64) -> bool {
-        let subs = self
-            .subs
-            .entry(channel.clone())
-            .or_insert_with(|| Arc::new(DashSet::new()))
-            .clone();
-        let peers = self
-            .by_peer
-            .entry(node_id)
-            .or_insert_with(|| Arc::new(DashSet::new()))
-            .clone();
-        let inserted = subs.insert(node_id);
-        peers.insert(channel);
+        let inserted = {
+            let entry = self
+                .subs
+                .entry(channel.clone())
+                .or_insert_with(|| Arc::new(DashSet::new()));
+            entry.insert(node_id)
+        };
+        {
+            let entry = self
+                .by_peer
+                .entry(node_id)
+                .or_insert_with(|| Arc::new(DashSet::new()));
+            entry.insert(channel);
+        }
         inserted
     }
 
@@ -240,5 +251,67 @@ mod tests {
         let r = SubscriberRoster::new();
         let channels = r.remove_peer(99);
         assert!(channels.is_empty());
+    }
+
+    #[test]
+    fn test_regression_concurrent_add_remove_same_channel_no_orphan() {
+        // Regression (MEDIUM, BUGS.md): `add` used to clone the inner
+        // `Arc<DashSet>` out of the entry guard before inserting the
+        // member. A concurrent `remove(channel, other_node)` in the
+        // narrow window between the two could observe the still-empty
+        // inner set and evict the outer entry via `remove_if`,
+        // orphaning our cloned Arc — the subscription showed up in
+        // `by_peer` but was missing from `members(channel)`, silently
+        // breaking fan-out.
+        //
+        // This test hammers `add(channel, N)` from many threads while
+        // another thread tries to `remove(channel, 9999)` (a peer
+        // that's never added) — which under the old code drove the
+        // `remove_if` path that triggered the bug. After all adds
+        // return, every inserted member must be visible in `members`.
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        let r = StdArc::new(SubscriberRoster::new());
+        let ch = ch("race/target");
+        const N: u64 = 200;
+
+        let mut handles = Vec::new();
+
+        // Adders: each inserts one distinct node_id.
+        for i in 0..N {
+            let r = StdArc::clone(&r);
+            let ch = ch.clone();
+            handles.push(thread::spawn(move || {
+                r.add(ch, i);
+            }));
+        }
+
+        // Remover: repeatedly tries to remove a peer that was never
+        // added, which drives the `remove_if(is_empty)` path for any
+        // momentarily-empty outer entry.
+        for _ in 0..50 {
+            let r = StdArc::clone(&r);
+            let ch = ch.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    let _ = r.remove(&ch, 9999);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let members = r.members(&ch);
+        for i in 0..N {
+            assert!(
+                members.contains(&i),
+                "subscriber {i} must appear in members after concurrent add/remove; \
+                 got {} members",
+                members.len(),
+            );
+        }
     }
 }

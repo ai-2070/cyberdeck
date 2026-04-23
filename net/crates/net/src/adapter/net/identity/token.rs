@@ -28,7 +28,16 @@ impl TokenScope {
     pub const ADMIN: Self = Self { bits: 0b0100 };
     /// Can delegate this token to other entities.
     pub const DELEGATE: Self = Self { bits: 0b1000 };
-    /// Full access.
+    /// Wildcard over channels: authorizes the token's actions on *every*
+    /// channel, regardless of the token's `channel_hash` field. Must be
+    /// set explicitly by the issuer — the previous "`channel_hash == 0`
+    /// means wildcard" overload is no longer honored, so a legitimate
+    /// channel whose 16-bit xxh3 happens to hash to 0 cannot
+    /// accidentally be authorized as a universal grant.
+    pub const WILDCARD: Self = Self { bits: 0b1_0000 };
+    /// Full access (all actions on a single channel). Does NOT include
+    /// [`Self::WILDCARD`] — callers that want cross-channel access
+    /// must opt in explicitly.
     pub const ALL: Self = Self { bits: 0b1111 };
 
     /// Create a scope from raw bits.
@@ -215,12 +224,28 @@ impl PermissionToken {
     }
 
     /// Check if this token authorizes a specific action on a channel.
+    ///
+    /// Returns `true` iff the token's `scope` contains the requested
+    /// `action` AND either:
+    ///
+    /// - the token has the [`TokenScope::WILDCARD`] bit set (authorized
+    ///   on every channel regardless of `channel_hash`), OR
+    /// - the token's `channel_hash` matches the supplied `channel`.
+    ///
+    /// The previous convention — `channel_hash == 0` meaning "wildcard,
+    /// all channels" — is no longer honored. A legitimate channel
+    /// whose 16-bit xxh3 hashes to 0 (1 in 65 536) would otherwise
+    /// accidentally turn a narrowly-scoped token into a universal
+    /// grant, which an attacker able to register channel names could
+    /// brute-force since xxh3 is non-cryptographic.
     pub fn authorizes(&self, action: TokenScope, channel: u16) -> bool {
         if !self.scope.contains(action) {
             return false;
         }
-        // channel_hash 0 = wildcard (all channels)
-        self.channel_hash == 0 || self.channel_hash == channel
+        if self.scope.contains(TokenScope::WILDCARD) {
+            return true;
+        }
+        self.channel_hash == channel
     }
 
     /// Delegate this token to another entity with restricted scope.
@@ -408,8 +433,19 @@ impl TokenCache {
     /// Insert a token without verification (for trusted internal use).
     ///
     /// Only use this when the token is known to be valid (e.g., just issued locally).
+    ///
+    /// WILDCARD-scoped tokens are always stored under the dedicated
+    /// wildcard slot (`channel_hash = 0`) regardless of the token's
+    /// own `channel_hash` field — that slot is where `check()` looks
+    /// for a cross-channel fallback. Non-wildcard tokens live in
+    /// their exact `channel_hash` slot.
     pub fn insert_unchecked(&self, token: PermissionToken) {
-        let key = (*token.subject.as_bytes(), token.channel_hash);
+        let slot_channel = if token.scope.contains(TokenScope::WILDCARD) {
+            0
+        } else {
+            token.channel_hash
+        };
+        let key = (*token.subject.as_bytes(), slot_channel);
         let mut entry = self.tokens.entry(key).or_default();
         // Replace any existing token with exactly the same scope;
         // otherwise push so distinct-scope tokens coexist.
@@ -582,8 +618,10 @@ mod tests {
         let token = PermissionToken::issue(
             &issuer,
             subject.entity_id().clone(),
-            TokenScope::PUBLISH.union(TokenScope::SUBSCRIBE),
-            0, // all channels
+            TokenScope::PUBLISH
+                .union(TokenScope::SUBSCRIBE)
+                .union(TokenScope::WILDCARD),
+            0, // channel_hash ignored for WILDCARD tokens
             3600,
             0,
         );
@@ -777,11 +815,14 @@ mod tests {
         let issuer = EntityKeypair::generate();
         let subject = EntityKeypair::generate();
 
+        // Wildcard tokens must explicitly opt in via the WILDCARD
+        // scope bit — the old "channel_hash == 0 implies wildcard"
+        // overload no longer applies.
         let token = PermissionToken::issue(
             &issuer,
             subject.entity_id().clone(),
-            TokenScope::PUBLISH,
-            0, // all channels
+            TokenScope::PUBLISH.union(TokenScope::WILDCARD),
+            0,
             3600,
             0,
         );
@@ -789,6 +830,39 @@ mod tests {
         assert!(token.authorizes(TokenScope::PUBLISH, 0xABCD));
         assert!(token.authorizes(TokenScope::PUBLISH, 0x1234));
         assert!(token.authorizes(TokenScope::PUBLISH, 0));
+    }
+
+    #[test]
+    fn test_regression_channel_hash_zero_is_not_wildcard() {
+        // Regression (MEDIUM, BUGS.md): a token with `channel_hash = 0`
+        // but no WILDCARD scope bit must NOT authorize arbitrary
+        // channels. A legitimate channel whose 16-bit xxh3 happens
+        // to hash to 0 (1 in 65 536) would otherwise turn a narrowly-
+        // scoped token into a universal grant — and since xxh3 is
+        // non-cryptographic, an attacker able to register names
+        // could brute-force such a collision.
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+
+        let token = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH, // no WILDCARD
+            0,                   // channel_hash 0 — pretend some channel hashed here
+            3600,
+            0,
+        );
+
+        // Token authorizes channel 0 only (exact match), not other channels.
+        assert!(token.authorizes(TokenScope::PUBLISH, 0));
+        assert!(
+            !token.authorizes(TokenScope::PUBLISH, 0xABCD),
+            "channel_hash=0 without WILDCARD must not grant access to arbitrary channels"
+        );
+        assert!(
+            !token.authorizes(TokenScope::PUBLISH, 0x1234),
+            "channel_hash=0 without WILDCARD must not grant access to arbitrary channels"
+        );
     }
 
     #[test]
@@ -938,11 +1012,11 @@ mod tests {
 
         let cache = TokenCache::new();
 
-        // Wildcard token (channel_hash = 0)
+        // Wildcard token: explicit WILDCARD scope bit.
         let token = PermissionToken::issue(
             &issuer,
             subject.entity_id().clone(),
-            TokenScope::PUBLISH,
+            TokenScope::PUBLISH.union(TokenScope::WILDCARD),
             0,
             3600,
             0,
@@ -985,12 +1059,12 @@ mod tests {
         expired_token.signature = issuer.sign(&payload).to_bytes();
         cache.insert_unchecked(expired_token);
 
-        // Insert a valid wildcard token
+        // Insert a valid wildcard token (explicit WILDCARD scope bit).
         let wildcard_token = PermissionToken::issue(
             &issuer,
             subject.entity_id().clone(),
-            TokenScope::PUBLISH,
-            0, // wildcard
+            TokenScope::PUBLISH.union(TokenScope::WILDCARD),
+            0,
             3600,
             0,
         );
