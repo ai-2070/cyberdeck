@@ -148,8 +148,13 @@ impl ContinuityProof {
     }
 
     /// Deserialize from bytes.
+    ///
+    /// Rejects buffers whose length differs from
+    /// [`CONTINUITY_PROOF_SIZE`] so trailing bytes aren't silently
+    /// accepted (the old `< SIZE` guard let concatenated proofs or
+    /// framing garbage parse as the first proof).
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < CONTINUITY_PROOF_SIZE {
+        if data.len() != CONTINUITY_PROOF_SIZE {
             return None;
         }
         Some(Self {

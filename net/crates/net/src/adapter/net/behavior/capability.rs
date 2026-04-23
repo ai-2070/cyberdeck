@@ -68,8 +68,14 @@ pub struct GpuInfo {
     pub compute_units: u16,
     /// Tensor cores (0 if none)
     pub tensor_cores: u16,
-    /// FP16 TFLOPS (scaled by 10, e.g., 825 = 82.5 TFLOPS)
-    pub fp16_tflops_x10: u16,
+    /// FP16 TFLOPS (scaled by 10, e.g., 825 = 82.5 TFLOPS).
+    ///
+    /// Widened from `u16` to `u32` because the old ceiling
+    /// (`u16::MAX / 10 ≈ 6.5 PFLOPS`) silently saturated on any
+    /// aggregated cluster figure worth reporting; individual GPUs
+    /// still fit in `u16` but operators roll these up per-node
+    /// and per-mesh.
+    pub fp16_tflops_x10: u32,
 }
 
 impl Default for GpuInfo {
@@ -108,9 +114,18 @@ impl GpuInfo {
         self
     }
 
-    /// Set FP16 performance
+    /// Set FP16 performance.
+    ///
+    /// Clamped at `u32::MAX` to be explicit about the ceiling: a
+    /// pathological f32 (NaN, negative, > ~4.3e8 TFLOPS) saturates
+    /// rather than wrapping to a garbage value.
     pub fn with_fp16_tflops(mut self, tflops: f32) -> Self {
-        self.fp16_tflops_x10 = (tflops * 10.0) as u16;
+        let scaled = (tflops * 10.0).max(0.0);
+        self.fp16_tflops_x10 = if scaled.is_finite() && scaled < u32::MAX as f32 {
+            scaled as u32
+        } else {
+            u32::MAX
+        };
         self
     }
 }
@@ -1359,13 +1374,20 @@ impl CapabilityIndex {
         }
     }
 
-    /// Remove node from inverted indexes
+    /// Remove node from inverted indexes.
+    ///
+    /// After each `HashSet::remove`, the outer-map entry is dropped
+    /// if the inner set is now empty. Without that drop, ephemeral
+    /// tag / model-id / tool-id / vendor keys accumulated as empty
+    /// `HashSet` shells in the outer `DashMap`s — a slow unbounded
+    /// leak over long-running deployments with high peer churn.
     fn remove_from_indexes(&self, node_id: u64, caps: &CapabilitySet) {
         // Tags
         for tag in &caps.tags {
             if let Some(mut set) = self.by_tag.get_mut(tag) {
                 set.remove(&node_id);
             }
+            self.by_tag.remove_if(tag, |_, set| set.is_empty());
         }
 
         // Models
@@ -1373,6 +1395,8 @@ impl CapabilityIndex {
             if let Some(mut set) = self.by_model.get_mut(&model.model_id) {
                 set.remove(&node_id);
             }
+            self.by_model
+                .remove_if(&model.model_id, |_, set| set.is_empty());
         }
 
         // Tools
@@ -1380,9 +1404,12 @@ impl CapabilityIndex {
             if let Some(mut set) = self.by_tool.get_mut(&tool.tool_id) {
                 set.remove(&node_id);
             }
+            self.by_tool
+                .remove_if(&tool.tool_id, |_, set| set.is_empty());
         }
 
-        // GPU
+        // GPU (two-value bucket; entries are intentionally permanent
+        // because lookups for both `true` and `false` are expected).
         let has_gpu = caps.has_gpu();
         if let Some(mut set) = self.gpu_nodes.get_mut(&has_gpu) {
             set.remove(&node_id);
@@ -1392,6 +1419,8 @@ impl CapabilityIndex {
             if let Some(mut set) = self.by_gpu_vendor.get_mut(&vendor) {
                 set.remove(&node_id);
             }
+            self.by_gpu_vendor
+                .remove_if(&vendor, |_, set| set.is_empty());
         }
     }
 

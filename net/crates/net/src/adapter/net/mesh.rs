@@ -1214,15 +1214,24 @@ impl MeshNode {
         let capability_index: Arc<CapabilityIndex> = Arc::new(CapabilityIndex::new());
 
         // Wire failure detector with reroute callbacks + roster eviction.
+        //
+        // Note: the `peers` / `addr_to_node` / `peer_addrs` maps are
+        // *not* evicted here. Keeping the session entry lets a
+        // transient-partition recovery work — once `b`'s heartbeats
+        // resume, the packet-dispatch path matches them against the
+        // retained session_id, calls `failure_detector.heartbeat`,
+        // and the detector's `on_recovery` callback undoes the
+        // reroute. Permanent failures are swept separately by the
+        // heartbeat loop (see `spawn_heartbeat` — once a peer has
+        // been `Failed` for longer than the cleanup window and has
+        // not produced any traffic, the loop drops the entry from
+        // `peers` / `addr_to_node` / `peer_addrs`).
         let rp_failure = reroute_policy.clone();
         let rp_recovery = reroute_policy.clone();
         let roster_failure = roster.clone();
         let peer_subnets_failure = peer_subnets.clone();
         let peer_entity_ids_failure = peer_entity_ids.clone();
         let capability_index_failure = capability_index.clone();
-        let peers_failure = peers.clone();
-        let addr_to_node_failure = addr_to_node.clone();
-        let peer_addrs_failure = peer_addrs.clone();
         let failure_detector = FailureDetector::with_config(FailureDetectorConfig {
             timeout: config.session_timeout,
             miss_threshold: 3,
@@ -1250,23 +1259,6 @@ impl MeshNode {
             // failure; the capability index is now consistent
             // with them.
             capability_index_failure.remove(node_id);
-
-            // Drop the dead peer's session + address mapping so
-            // subsequent `send_to_peer` / `send_routed` calls don't
-            // route through a session whose transport has gone
-            // silent. UDP `send_to` succeeds even when the peer is
-            // unreachable, so without this eviction the mesh
-            // appears healthy until an application-layer timeout
-            // fires. A concurrent reconnect under the same
-            // `node_id` is handled via `remove_if`: we only remove
-            // entries whose `addr` still matches what was cached
-            // when the peer was declared failed — a fresh
-            // registration with a different addr survives.
-            if let Some((_, old_info)) = peers_failure.remove(&node_id) {
-                let old_addr = old_info.addr;
-                addr_to_node_failure.remove_if(&old_addr, |_, n| *n == node_id);
-                peer_addrs_failure.remove_if(&node_id, |_, addr| *addr == old_addr);
-            }
         })
         .on_recovery(move |node_id| rp_recovery.on_recovery(node_id));
 
@@ -3080,6 +3072,9 @@ impl MeshNode {
     fn spawn_heartbeat_loop(&self) -> JoinHandle<()> {
         let socket = self.socket.clone();
         let peers = self.peers.clone();
+        let addr_to_node = self.addr_to_node.clone();
+        let peer_addrs = self.peer_addrs.clone();
+        let failure_detector = self.failure_detector.clone();
         let interval = self.config.heartbeat_interval;
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
@@ -3091,6 +3086,20 @@ impl MeshNode {
         // pingwave emission; indirect (pingwave-learned) routes age out
         // here if their origin goes silent.
         let max_route_age = self.config.session_timeout.saturating_mul(3);
+        // Dead-peer eviction threshold: a peer that has been Failed
+        // for this long with no observed traffic is considered
+        // permanently gone and dropped from `peers`. Until then we
+        // keep the session entry so a transient-partition recovery
+        // (the heartbeat the peer sends on the heal triggers
+        // `failure_detector.heartbeat`, which `on_recovery`'s the
+        // reroute) can succeed — evicting immediately on the first
+        // Failed transition would require a full re-handshake to
+        // come back. The 30× multiplier gives partitions plenty of
+        // time to heal (at the default 30 s session_timeout that's
+        // a 15-minute cleanup delay; at test-tight 300 ms timeouts
+        // it's 9 s, still comfortably longer than typical test
+        // partition-heal windows).
+        let dead_peer_timeout = self.config.session_timeout.saturating_mul(30);
         // Stream lifecycle: drop idle streams past `stream_idle_timeout`
         // and enforce `max_streams` cap via LRU.
         let stream_idle_timeout = self.config.stream_idle_timeout;
@@ -3141,6 +3150,43 @@ impl MeshNode {
                                 max_streams,
                                 "idle_timeout",
                             );
+                        }
+
+                        // Dead-peer eviction: walk peers in Failed
+                        // state whose session has been inactive for
+                        // longer than `dead_peer_timeout`. The
+                        // failure-detector `on_failure` callback
+                        // does not evict `peers` itself — see the
+                        // note in `MeshNode::new` — so this sweep is
+                        // the single point where a permanently-gone
+                        // peer's session / address mapping drops.
+                        // Short-term partitions stay in `peers` long
+                        // enough for `on_recovery` to fire when the
+                        // heartbeats resume.
+                        let failed = failure_detector.failed_nodes();
+                        for node_id in failed {
+                            let still_silent = match peers.get(&node_id) {
+                                Some(e) => e.value().session.is_timed_out(dead_peer_timeout),
+                                None => false,
+                            };
+                            if !still_silent {
+                                continue;
+                            }
+                            if let Some((_, old_info)) = peers.remove(&node_id) {
+                                let old_addr = old_info.addr;
+                                addr_to_node
+                                    .remove_if(&old_addr, |_, n| *n == node_id);
+                                peer_addrs
+                                    .remove_if(&node_id, |_, addr| *addr == old_addr);
+                                tracing::info!(
+                                    node_id = format!("{:#x}", node_id),
+                                    "evicted permanently-dead peer from peer map",
+                                );
+                            }
+                            // Also drop the failure-detector entry so
+                            // a later reconnect under the same node_id
+                            // starts from a clean slate.
+                            failure_detector.remove(node_id);
                         }
                     }
                     _ = shutdown_notify.notified() => {

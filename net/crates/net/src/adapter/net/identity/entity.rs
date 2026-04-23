@@ -8,7 +8,7 @@ use blake2::{
     digest::{consts::U32, Mac},
     Blake2sMac,
 };
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 /// Entity identity — a 32-byte ed25519 public key.
 ///
@@ -55,9 +55,16 @@ impl EntityId {
     }
 
     /// Verify a signature against this entity's public key.
+    ///
+    /// Uses `verify_strict` so that signature malleability (the
+    /// `(R, S + L)` variant permitted by the lax `verify`) is
+    /// rejected. Callers cache tokens / announcements keyed on the
+    /// signed bytes; accepting malleated variants would let the
+    /// same logical message appear under two different byte
+    /// encodings and bypass content-hash dedup.
     pub fn verify(&self, message: &[u8], signature: &Signature) -> Result<(), EntityError> {
         let vk = self.verifying_key()?;
-        vk.verify(message, signature)
+        vk.verify_strict(message, signature)
             .map_err(|_| EntityError::InvalidSignature)
     }
 

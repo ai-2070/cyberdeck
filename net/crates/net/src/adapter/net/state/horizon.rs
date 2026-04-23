@@ -68,7 +68,11 @@ impl ObservedHorizon {
                 *entry = seq;
             }
         }
-        self.logical_time = self.logical_time.max(other.logical_time) + 1;
+        // `saturating_add` so a pathological u64::MAX logical clock
+        // on either side doesn't panic in debug or wrap in release.
+        // Unreachable in practice but consistent with `observe()`'s
+        // counter-hygiene convention.
+        self.logical_time = self.logical_time.max(other.logical_time).saturating_add(1);
     }
 
     /// Encode to a 4-byte compressed horizon for CausalLink.

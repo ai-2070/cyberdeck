@@ -424,7 +424,18 @@ impl ReplayWindow {
     /// that marked it — a `false` return means the counter was already
     /// committed by a concurrent caller (replay detected at commit time) or
     /// is outside the retained window.
+    ///
+    /// Once `rx_counter` has saturated at `u64::MAX` the session has
+    /// exhausted its 64-bit nonce space; further commits are refused
+    /// so a crafted `received == u64::MAX` cannot be "re-committed"
+    /// repeatedly and bypass replay detection. In practice this
+    /// boundary is unreachable (2^64 packets per session), but we
+    /// prefer an explicit refusal to a subtle ambiguity at the
+    /// ceiling.
     fn commit(&mut self, received: u64) -> bool {
+        if self.rx_counter == u64::MAX {
+            return false;
+        }
         if received >= self.rx_counter {
             // saturating_add guards `received == u64::MAX` (with
             // rx_counter == 0 the `+ 1` would panic in debug and wrap
@@ -1120,6 +1131,37 @@ mod tests {
         assert!(
             !cipher.update_rx_counter(100),
             "out-of-window counter must also fail at commit time"
+        );
+    }
+
+    #[test]
+    fn test_regression_replay_rejected_at_u64_max_boundary() {
+        // Regression (LOW, BUGS.md): once `rx_counter` saturated at
+        // u64::MAX, a repeated `commit(u64::MAX)` could re-shift the
+        // bitmap by 1 and re-set bit 0, returning `true` each time
+        // — replaying the same nonce would pass replay detection.
+        //
+        // Fix: once `rx_counter == u64::MAX`, all further commits
+        // return `false` explicitly.
+        let key = [0x42u8; 32];
+        let cipher = PacketCipher::new(&key, 0x1234);
+
+        // Force rx_counter to saturate by committing u64::MAX.
+        // (Practical attackers can't reach this — 2^64 packets per
+        // session is unreachable — but we want the ceiling to refuse
+        // cleanly rather than silently re-accept.)
+        assert!(cipher.update_rx_counter(u64::MAX));
+
+        // The window internally saturated rx_counter at u64::MAX
+        // (saturating_add). A second commit of the same counter must
+        // be rejected, not silently reaccepted.
+        assert!(
+            !cipher.update_rx_counter(u64::MAX),
+            "second commit of u64::MAX must be rejected (replay)"
+        );
+        assert!(
+            !cipher.update_rx_counter(u64::MAX - 1),
+            "any further commit after ceiling must also be rejected"
         );
     }
 }

@@ -10,10 +10,13 @@
 //! and UDP silently dropped packets until an application-layer
 //! timeout fired.
 //!
-//! The fix adds the eviction to the `on_failure` closure. This
-//! test pins it: after the failure detector marks a peer Failed,
-//! that peer's `node_id` and `addr` must both be gone from the
-//! live maps.
+//! The fix adds a sweep to the heartbeat loop that evicts peers
+//! which have been in the failure detector's `Failed` state with
+//! session-idle for longer than `10 × session_timeout` — long
+//! enough that transient-partition recovery still works (the
+//! `on_recovery` callback runs off incoming heartbeats that are
+//! matched against the retained session), but short enough that
+//! permanently-gone peers are eventually dropped.
 //!
 //! Run: `cargo test --features net --test peer_death_evicts_peer_map`
 
@@ -32,7 +35,7 @@ fn test_config() -> MeshNodeConfig {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut cfg = MeshNodeConfig::new(addr, PSK)
         .with_heartbeat_interval(Duration::from_millis(100))
-        .with_session_timeout(Duration::from_millis(500))
+        .with_session_timeout(Duration::from_millis(300))
         .with_handshake(3, Duration::from_secs(2));
     cfg.socket_buffers = SocketBufferConfig {
         send_buffer_size: TEST_BUFFER_SIZE,
@@ -77,7 +80,13 @@ async fn wait_for<F: Fn() -> bool>(limit: Duration, check: F) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn peers_map_evicts_failed_peer() {
+async fn peers_map_evicts_permanently_failed_peer() {
+    // session_timeout = 300 ms → dead_peer_timeout = 9 s
+    // (30 × session_timeout). Block B from A's perspective and
+    // wait past that threshold so the heartbeat-loop sweep runs
+    // and evicts. The 30× multiplier leaves plenty of room for
+    // transient-partition recovery; this test only exercises the
+    // permanently-gone path by never unblocking.
     let a = build_node().await;
     let b = build_node().await;
     connect_pair(&a, &b).await;
@@ -95,26 +104,30 @@ async fn peers_map_evicts_failed_peer() {
         "A must know B's address via peer_addr()"
     );
 
-    // Simulate B going silent from A's perspective.
+    // Simulate B going permanently silent from A's perspective.
     a.block_peer(b_bind);
 
-    // Wait past 3 × session_timeout, then explicitly drive
-    // `check_all()` to trigger the `on_failure` callback.
-    tokio::time::sleep(Duration::from_millis(2_000)).await;
-    let _ = a.failure_detector().check_all();
+    // Drive check_all so the Failed transition fires. Then wait
+    // past 30 × session_timeout = 9 s for the heartbeat-loop sweep
+    // to observe the extended silence and evict.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    while tokio::time::Instant::now() < deadline {
+        let _ = a.failure_detector().check_all();
+        if a.peer_addr(b_id).is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 
-    // After failure, B must be gone from A's `peers` map.
     let evicted = wait_for(Duration::from_secs(2), || a.peer_addr(b_id).is_none()).await;
     assert!(
         evicted,
-        "A's `peers` map must evict B after the failure detector \
-         fires. peer_addr(B) = {:?}, peer_count = {}",
+        "A's `peers` map must evict B after the heartbeat-loop \
+         sweep runs (~30 × session_timeout of silence). \
+         peer_addr(B) = {:?}, peer_count = {}",
         a.peer_addr(b_id),
         a.peer_count(),
     );
-
-    // `peer_count` should drop to zero — A no longer has any live
-    // peers.
     assert_eq!(
         a.peer_count(),
         0,

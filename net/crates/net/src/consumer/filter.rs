@@ -85,10 +85,20 @@ impl Filter {
     }
 
     /// Check if an event matches this filter.
+    ///
+    /// Empty `And` children are rejected as "matches nothing" rather
+    /// than "matches everything" — `.all()` on an empty iterator
+    /// returns `true`, which would silently turn an externally-
+    /// supplied filter JSON like `{"and": []}` into a universal
+    /// pass-through. Empty `Or` naturally returns `false` via
+    /// `.any()` on an empty iterator and keeps its documented
+    /// "matches nothing" behavior.
     #[inline]
     pub fn matches(&self, event: &JsonValue) -> bool {
         match self {
-            Self::And { filters } => filters.iter().all(|f| f.matches(event)),
+            Self::And { filters } => {
+                !filters.is_empty() && filters.iter().all(|f| f.matches(event))
+            }
             Self::Or { filters } => filters.iter().any(|f| f.matches(event)),
             Self::Not { filter } => !filter.matches(event),
             Self::EqWrapped { condition } => {
@@ -487,9 +497,17 @@ mod tests {
 
     #[test]
     fn test_empty_and_filter() {
+        // Regression (LOW, BUGS.md): empty `And` used to match
+        // everything via `.all()` on an empty iterator returning
+        // `true`. A filter JSON like `{"and": []}` reaching the
+        // matcher would silently become a universal pass-through.
+        // Now empty `And` matches nothing, consistent with the
+        // conservative "an empty filter isn't a filter" choice.
         let filter = Filter::and(vec![]);
-        // Empty AND should match everything (vacuous truth)
-        assert!(filter.matches(&json!({"any": "value"})));
+        assert!(
+            !filter.matches(&json!({"any": "value"})),
+            "empty And must not match — was silently universal-pass before"
+        );
     }
 
     #[test]

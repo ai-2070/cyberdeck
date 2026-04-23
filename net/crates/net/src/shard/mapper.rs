@@ -510,9 +510,17 @@ impl ShardMapper {
     ///
     /// Creates new shards and makes them available for routing.
     pub fn scale_up(&self, count: u16) -> Result<Vec<u16>, ScalingError> {
-        // Early checks (may race, but avoid acquiring the write lock)
+        // Early checks (may race, but avoid acquiring the write lock).
+        // Use `checked_add` so that `current + count` can never wrap
+        // past `u16::MAX` into a small value that slips under the
+        // `max_shards` cap. The id-exhaustion gate at line ~557 also
+        // catches overflow, but this keeps the primary budget check
+        // authoritative.
         let current = self.active_count.load(AtomicOrdering::Acquire);
-        if current + count > self.policy.max_shards {
+        let would_be = current
+            .checked_add(count)
+            .ok_or(ScalingError::AtMaxShards)?;
+        if would_be > self.policy.max_shards {
             return Err(ScalingError::AtMaxShards);
         }
         {
@@ -526,9 +534,12 @@ impl ShardMapper {
 
         let mut shards = self.shards.write();
 
-        // Re-check max_shards under the lock to prevent race conditions
+        // Re-check max_shards under the lock to prevent race conditions.
         let current = self.active_count.load(AtomicOrdering::Acquire);
-        if current + count > self.policy.max_shards {
+        let would_be = current
+            .checked_add(count)
+            .ok_or(ScalingError::AtMaxShards)?;
+        if would_be > self.policy.max_shards {
             return Err(ScalingError::AtMaxShards);
         }
         // Re-check cooldown under the same write lock that gates
@@ -574,9 +585,10 @@ impl ShardMapper {
             new_ids.push(new_id);
         }
 
-        // Update counts. last_scaling MUST be updated while still
-        // holding `shards.write()` so that the next contender
-        // observing the cooldown re-check above sees the fresh
+        // Update counts. `fetch_add` cannot wrap here — the
+        // `checked_add` gate above ensures `current + count <=
+        // max_shards <= u16::MAX` — but keep the ordering explicit
+        // so the next contender's cooldown re-check sees the fresh
         // timestamp.
         self.active_count.fetch_add(count, AtomicOrdering::Release);
         *self.last_scaling.write() = Some(Instant::now());

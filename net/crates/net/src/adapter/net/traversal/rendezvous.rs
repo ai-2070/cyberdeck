@@ -196,10 +196,16 @@ pub struct Keepalive {
 /// `put_u32`, which default to big-endian) — the round-trip
 /// worked within the crate because `decode_keepalive` used
 /// `from_be_bytes` for the body, but it diverged from the Net
-/// packet header (LE) and from every other wire field in the
-/// traversal path. Anyone reading the codec against the wire
+/// packet header (LE). Anyone reading the codec against the wire
 /// layout, or reusing these helpers outside the crate, would
 /// mis-correlate. Cubic flagged this as P2; unified on LE here.
+///
+/// Note: the rendezvous `Punch*` messages elsewhere in this file
+/// still use big-endian `put_u64` / `put_u16` with matching
+/// `from_be_bytes` on the decode side — round-trip is consistent
+/// internally but diverges from the Net header's LE convention.
+/// That's an unresolved wire-format nit (`BUGS.md` INFO entry),
+/// not a functional bug.
 pub fn encode_keepalive(ka: &Keepalive) -> Bytes {
     let mut buf = BytesMut::with_capacity(KEEPALIVE_LEN);
     buf.put_slice(&KEEPALIVE_MAGIC.to_le_bytes());

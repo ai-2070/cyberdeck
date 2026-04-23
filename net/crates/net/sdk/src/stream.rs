@@ -156,8 +156,18 @@ impl Stream for EventStream {
                 if response.events.is_empty() {
                     // Backoff: double the interval, up to max.
                     this.current_interval = (this.current_interval * 2).min(this.opts.max_backoff);
-                    this.sleep = Some(Box::pin(tokio::time::sleep(this.current_interval)));
-                    cx.waker().wake_by_ref();
+                    let mut sleep = Box::pin(tokio::time::sleep(this.current_interval));
+                    // Poll the sleep once now so the timer registers
+                    // its waker with the executor. Returning Pending
+                    // here parks the task on the timer directly,
+                    // rather than paying an extra round-trip through
+                    // the scheduler (the old code did
+                    // `cx.waker().wake_by_ref()` immediately after
+                    // creating the sleep, forcing one wasted re-poll
+                    // per idle backoff tick).
+                    let first = sleep.as_mut().poll(cx);
+                    this.sleep = Some(sleep);
+                    debug_assert!(matches!(first, Poll::Pending));
                     Poll::Pending
                 } else {
                     // Reset backoff on activity.
