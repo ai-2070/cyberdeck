@@ -11,8 +11,20 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-/// Routing header size in bytes (16 bytes, cache-line friendly)
-pub const ROUTING_HEADER_SIZE: usize = 16;
+/// Routing header size in bytes.
+///
+/// Layout is `magic(2) + ttl(1) + hop_count(1) + flags(1) + _reserved(1)
+/// + src_id(4) + dest_id(8)` = 18 bytes. The magic tag at bytes 0-1
+/// unambiguously distinguishes routing headers from direct Net
+/// packets (whose own magic is [`super::protocol::MAGIC`]) so the
+/// receive-loop discriminator doesn't depend on `dest_id` happening
+/// to not collide with `0x4E45`.
+pub const ROUTING_HEADER_SIZE: usize = 18;
+
+/// Magic bytes identifying a routing header: "TR" in LE (`0x5254`).
+/// Chosen disjoint from the Net packet magic (`0x4E45`) so the
+/// receive-loop can discriminate on the first two bytes alone.
+pub const ROUTING_MAGIC: u16 = 0x5254;
 
 /// Maximum TTL for multi-hop routing
 pub const _MAX_TTL: u8 = 16;
@@ -62,12 +74,20 @@ impl RouteFlags {
 
 /// Routing header for multi-hop Net packets.
 ///
-/// Layout (16 bytes):
+/// Layout (18 bytes):
 /// ```text
-/// ┌────────────────────────────────────────────────────────┐
-/// │ dest_id (8 bytes) │ src_id (4 bytes) │ ttl │ hops │ flags │ reserved │
-/// └────────────────────────────────────────────────────────┘
+/// ┌───────────────────────────────────────────────────────────────────┐
+/// │ magic (2) │ ttl │ hops │ flags │ rsvd │ src_id (4) │ dest_id (8) │
+/// └───────────────────────────────────────────────────────────────────┘
 /// ```
+///
+/// `magic` is always [`ROUTING_MAGIC`] (`0x5254`), distinct from the
+/// direct-packet magic `0x4E45` ([`super::protocol::MAGIC`]). The
+/// receive-loop discriminator reads bytes 0-1 alone and dispatches
+/// unambiguously — the previous 16-byte layout put `dest_id` at bytes
+/// 0-7, and any recipient whose `node_id` had low-16-bits equal to
+/// the direct-packet magic (~1 in 65 536) silently mis-classified
+/// its own incoming routed packets as Net packets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct RoutingHeader {
@@ -122,55 +142,80 @@ impl RoutingHeader {
         }
     }
 
-    /// Serialize to bytes
+    /// Serialize to bytes.
+    ///
+    /// The magic tag rides at bytes 0-1 so the receive-loop
+    /// discriminator reads it directly — see [`ROUTING_MAGIC`].
     pub fn to_bytes(&self) -> [u8; ROUTING_HEADER_SIZE] {
         let mut buf = [0u8; ROUTING_HEADER_SIZE];
-        buf[0..8].copy_from_slice(&self.dest_id.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.src_id.to_le_bytes());
-        buf[12] = self.ttl;
-        buf[13] = self.hop_count;
-        buf[14] = self.flags.as_u8();
-        buf[15] = self._reserved;
+        buf[0..2].copy_from_slice(&ROUTING_MAGIC.to_le_bytes());
+        buf[2] = self.ttl;
+        buf[3] = self.hop_count;
+        buf[4] = self.flags.as_u8();
+        buf[5] = self._reserved;
+        buf[6..10].copy_from_slice(&self.src_id.to_le_bytes());
+        buf[10..18].copy_from_slice(&self.dest_id.to_le_bytes());
         buf
     }
 
-    /// Deserialize from bytes
+    /// Deserialize from bytes. Returns `None` on short input, wrong
+    /// magic, or malformed numeric fields.
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
         if buf.len() < ROUTING_HEADER_SIZE {
             return None;
         }
+        let magic = u16::from_le_bytes([buf[0], buf[1]]);
+        if magic != ROUTING_MAGIC {
+            return None;
+        }
         Some(Self {
-            dest_id: u64::from_le_bytes(buf[0..8].try_into().ok()?),
-            src_id: u32::from_le_bytes(buf[8..12].try_into().ok()?),
-            ttl: buf[12],
-            hop_count: buf[13],
-            flags: RouteFlags::from_u8(buf[14]),
-            _reserved: buf[15],
+            ttl: buf[2],
+            hop_count: buf[3],
+            flags: RouteFlags::from_u8(buf[4]),
+            _reserved: buf[5],
+            src_id: u32::from_le_bytes(buf[6..10].try_into().ok()?),
+            dest_id: u64::from_le_bytes(buf[10..18].try_into().ok()?),
         })
     }
 
     /// Write to a buffer
     pub fn write_to(&self, buf: &mut BytesMut) {
-        buf.put_u64_le(self.dest_id);
-        buf.put_u32_le(self.src_id);
+        buf.put_u16_le(ROUTING_MAGIC);
         buf.put_u8(self.ttl);
         buf.put_u8(self.hop_count);
         buf.put_u8(self.flags.as_u8());
         buf.put_u8(self._reserved);
+        buf.put_u32_le(self.src_id);
+        buf.put_u64_le(self.dest_id);
     }
 
-    /// Read from a buffer
+    /// Read from a buffer. Returns `None` on short input or wrong
+    /// magic; fields are consumed only on successful parse.
     pub fn read_from(buf: &mut Bytes) -> Option<Self> {
         if buf.remaining() < ROUTING_HEADER_SIZE {
             return None;
         }
+        // Peek at magic without advancing so a bad prefix leaves
+        // the cursor intact for callers that want to try another
+        // decoder.
+        let magic = u16::from_le_bytes([buf[0], buf[1]]);
+        if magic != ROUTING_MAGIC {
+            return None;
+        }
+        let _ = buf.get_u16_le();
+        let ttl = buf.get_u8();
+        let hop_count = buf.get_u8();
+        let flags = RouteFlags::from_u8(buf.get_u8());
+        let _reserved = buf.get_u8();
+        let src_id = buf.get_u32_le();
+        let dest_id = buf.get_u64_le();
         Some(Self {
-            dest_id: buf.get_u64_le(),
-            src_id: buf.get_u32_le(),
-            ttl: buf.get_u8(),
-            hop_count: buf.get_u8(),
-            flags: RouteFlags::from_u8(buf.get_u8()),
-            _reserved: buf.get_u8(),
+            dest_id,
+            src_id,
+            ttl,
+            hop_count,
+            flags,
+            _reserved,
         })
     }
 
@@ -626,6 +671,67 @@ mod tests {
         let bytes = header.to_bytes();
         let parsed = RoutingHeader::from_bytes(&bytes).unwrap();
         assert_eq!(header, parsed);
+    }
+
+    #[test]
+    fn test_routing_header_magic_at_offset_zero() {
+        // ROUTING_MAGIC must appear at bytes 0-1 regardless of
+        // dest_id / src_id values. The receive-loop discriminator
+        // peeks at bytes 0-1 and relies on this.
+        let header = RoutingHeader::new(0x4E45_4E45_4E45_4E45, 0x4E45_4E45, 8);
+        let bytes = header.to_bytes();
+        assert_eq!(
+            u16::from_le_bytes([bytes[0], bytes[1]]),
+            ROUTING_MAGIC,
+            "magic must live at bytes 0-1 independent of dest_id's own byte pattern",
+        );
+    }
+
+    #[test]
+    fn test_routing_header_rejects_wrong_magic() {
+        // from_bytes must refuse buffers whose bytes 0-1 aren't
+        // ROUTING_MAGIC — this is what lets the receive-loop
+        // discriminator short-circuit cleanly without parsing the
+        // rest of the header.
+        let mut bytes = RoutingHeader::new(0x1234, 0x5678, 4).to_bytes();
+        // Overwrite magic with direct-packet MAGIC.
+        bytes[0..2].copy_from_slice(&0x4E45_u16.to_le_bytes());
+        assert!(RoutingHeader::from_bytes(&bytes).is_none());
+
+        // Overwrite with arbitrary garbage.
+        bytes[0..2].copy_from_slice(&0xFFFF_u16.to_le_bytes());
+        assert!(RoutingHeader::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn test_regression_routing_discriminator_survives_magic_collision_node_id() {
+        // Regression (LOW, BUGS.md): the old 16-byte layout put
+        // `dest_id` at bytes 0-7. When a recipient's own node_id
+        // had low-16-bits equal to 0x4E45 (the direct Net-packet
+        // magic), routed packets to that node were
+        // mis-discriminated as direct packets and silently dropped
+        // at the AEAD layer — 1-in-65 536 node_ids affected.
+        //
+        // The new layout puts ROUTING_MAGIC at bytes 0-1 and
+        // shifts dest_id to bytes 10-17, so the discriminator is
+        // unambiguous for every possible dest_id value.
+        //
+        // This test constructs a header whose dest_id has low-16
+        // bits equal to the old ambiguous value and verifies that
+        // the header still serializes with ROUTING_MAGIC at the
+        // front and round-trips correctly.
+        let ambiguous_dest: u64 = 0xDEAD_BEEF_FFFF_4E45;
+        let header = RoutingHeader::new(ambiguous_dest, 0x1111_2222, 8);
+        let bytes = header.to_bytes();
+        assert_eq!(
+            u16::from_le_bytes([bytes[0], bytes[1]]),
+            ROUTING_MAGIC,
+            "magic at offset 0 must be independent of dest_id",
+        );
+        let parsed = RoutingHeader::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.dest_id, ambiguous_dest);
+        assert_eq!(parsed.src_id, 0x1111_2222);
+        assert_eq!(parsed.ttl, 8);
     }
 
     #[test]

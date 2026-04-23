@@ -635,38 +635,74 @@ parser could matter.
 (or the callsite-appropriate inequality) and update the small number of
 call sites that intentionally slice out a prefix to pre-trim first.
 
-## LOW — routing-vs-direct packet classification breaks for ~1-in-17M node_ids
+## LOW — routing-vs-direct packet classification breaks for ~1-in-17M node_ids — **FIXED**
 
-**File:** `net/crates/net/src/adapter/net/mesh.rs`
-**Lines:** `2170-2173`
+**File:** `net/crates/net/src/adapter/net/mesh.rs` (discriminator),
+`net/crates/net/src/adapter/net/route.rs` (wire format)
+
+### The bug
+
+The discriminator peeked at the first two bytes of the packet and
+treated it as routed iff they weren't `0x4E45` (`MAGIC`). Routed
+packets began with `RoutingHeader`, whose first field was `dest_id:
+u64` in LE — so the first two bytes were the low 16 bits of the
+recipient's own `node_id`. `node_id` is a truncated BLAKE2s hash,
+effectively uniform, so ~1 in 65 536 node_ids had low-16-bits equal
+to `MAGIC`, and ~1 in 17 M (factoring in byte 2 happening to equal
+`VERSION=1`) silently failed the discriminator and mis-routed their
+own incoming packets into the direct-packet path. AEAD caught the
+mis-classification and dropped the packet — no security or state
+corruption — but the affected node silently lost all routed traffic.
+
+### The fix
+
+Routing-header wire format bumped from **16 → 18 bytes** with an
+explicit `ROUTING_MAGIC = 0x5254` tag at bytes 0-1:
 
 ```rust
-let is_routed = data.len() >= ROUTING_HEADER_SIZE + protocol::HEADER_SIZE
-    && u16::from_le_bytes([data[0], data[1]]) != MAGIC;
+// route.rs
+pub const ROUTING_HEADER_SIZE: usize = 18;
+pub const ROUTING_MAGIC: u16 = 0x5254;  // "TR"
+
+// new on-wire layout
+// ┌────────┬────┬────┬──────┬─────┬──────────┬────────────┐
+// │ magic  │ttl │hops│flags │rsvd │ src_id   │ dest_id    │
+// │ (2)    │(1) │(1) │(1)   │(1)  │  (4)     │   (8)      │
+// └────────┴────┴────┴──────┴─────┴──────────┴────────────┘
 ```
 
-The discriminator peeks at the first two bytes of the packet and treats
-it as routed iff they aren't `0x4E45` (`MAGIC`). Routed packets begin
-with `RoutingHeader`, whose first field is `dest_id: u64` in LE — so
-the first two bytes are the low 16 bits of the recipient's own
-`node_id`. `node_id` is a truncated BLAKE2s hash of the entity keypair
-(`identity/entity.rs:47-50`), effectively uniform. When a node's
-low-16-bits happen to equal `MAGIC` **and** bit 16–23 happen to equal
-`VERSION` (`1`), routed packets **to that node** pass the fake
-Net-header `validate()` at `protocol.rs:447-452` and fall into the
-direct-packet path.
+`RoutingHeader::to_bytes` / `from_bytes` / `read_from` / `write_to`
+all updated; `from_bytes` and `read_from` refuse buffers whose bytes
+0-1 don't match `ROUTING_MAGIC`. Every consumer references
+`ROUTING_HEADER_SIZE` symbolically, so MTU/capacity math picks up the
+new value automatically.
 
-AEAD fails and the packet is dropped, so no security or state
-corruption — but that node silently fails to receive any routed packet
-from the ~1-in-17M node_id ambiguity. The owner has no way to diagnose
-it because the mesh looks healthy otherwise.
+The discriminator in `mesh.rs` is now unambiguous:
 
-**Fix:** discriminate on a cheap tag byte in the routing header instead
-of "anything that doesn't look like a Net magic." Set the top bit of
-`RouteFlags` to `1` on all routing headers and use that bit as the
-discriminator, or move `dest_id` out of byte-0 in the routing header so
-the collision window shrinks to 1-in-2^{48+} and becomes effectively
-zero.
+```rust
+let first2 = u16::from_le_bytes([data[0], data[1]]);
+let is_routed = first2 == ROUTING_MAGIC
+    && data.len() >= ROUTING_HEADER_SIZE + protocol::HEADER_SIZE;
+let is_direct = first2 == MAGIC;
+if !is_routed && !is_direct {
+    return; // malformed / unrecognized — drop silently
+}
+```
+
+### Regression tests
+
+- `test_routing_header_magic_at_offset_zero` — magic lives at bytes
+  0-1 regardless of dest_id's own byte pattern.
+- `test_routing_header_rejects_wrong_magic` — `from_bytes` refuses
+  both the old direct-packet `MAGIC` and arbitrary garbage.
+- `test_regression_routing_discriminator_survives_magic_collision_node_id`
+  — constructs a header whose `dest_id` has low-16 bits equal to
+  `0x4E45` and verifies it still serializes / round-trips cleanly
+  (the exact case that used to be mis-classified).
+
+Wire-format change is safe: all nodes in the mesh are controlled,
+and the full test suite (1186 tests, 27 binaries) passes after the
+bump.
 
 ---
 

@@ -81,7 +81,7 @@ fn wire_bytes_for_payload(payload_bytes: usize) -> u32 {
         .min(u32::MAX as usize) as u32
 }
 use super::reroute::ReroutePolicy;
-use super::route::{RoutingHeader, ROUTING_HEADER_SIZE};
+use super::route::{RoutingHeader, ROUTING_HEADER_SIZE, ROUTING_MAGIC};
 use super::router::{NetRouter, RouterConfig};
 use super::session::{NetSession, TxAdmit, CONTROL_STREAM_ID};
 use super::stream::{Stream, StreamConfig, StreamError, StreamStats};
@@ -2207,13 +2207,26 @@ impl MeshNode {
         let failure_detector = &ctx.failure_detector;
         // Distinguish routed packets from direct packets.
         //
-        // Direct packets start with the Net header magic (0x4E45).
-        // Routed packets start with a 16-byte routing header (dest_id,
-        // src_id, ttl, hop_count, flags) followed by the Net header.
-        // Since dest_id is a u64 node ID, its first two bytes will
-        // almost never equal 0x4E45 by accident.
-        let is_routed = data.len() >= ROUTING_HEADER_SIZE + protocol::HEADER_SIZE
-            && u16::from_le_bytes([data[0], data[1]]) != MAGIC;
+        // Bytes 0-1 of a direct Net packet are [`MAGIC`] (`0x4E45`);
+        // bytes 0-1 of a routing header are [`ROUTING_MAGIC`]
+        // (`0x5254`). Anything else is malformed and dropped. The
+        // previous discriminator ("anything that isn't MAGIC is
+        // routed") mis-classified routed packets whenever the
+        // recipient's own `node_id` had low-16-bits equal to
+        // `MAGIC` — 1-in-65 536 node_ids — silently dropping
+        // routed traffic at the AEAD layer.
+        let first2 = if data.len() >= 2 {
+            u16::from_le_bytes([data[0], data[1]])
+        } else {
+            0
+        };
+        let is_routed =
+            first2 == ROUTING_MAGIC && data.len() >= ROUTING_HEADER_SIZE + protocol::HEADER_SIZE;
+        let is_direct = first2 == MAGIC;
+        if !is_routed && !is_direct {
+            // Malformed / unrecognized prefix — drop silently.
+            return;
+        }
 
         if is_routed {
             // Routed packet: parse routing header, decide forward or local
