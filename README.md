@@ -655,20 +655,20 @@ Feature set affects `.rlib` and `.a` (which keep all compiled code for downstrea
 
 | Features | `libnet.dylib` (cdylib) | `libnet.rlib` | `libnet.a` |
 |----------|------------------------:|--------------:|-----------:|
-| `net` | **1.90 MB** | 22.2 MB | 35.2 MB |
-| `net` + `redex` | **1.90 MB** | 22.6 MB | 35.5 MB |
-| `net` + `redex` + `redex-disk` | **1.90 MB** | 22.7 MB | 35.6 MB |
-| `net` + `redex` + `redex-disk` + `cortex` | **1.90 MB** | 24.6 MB | 36.5 MB |
-| `net` + `redex` + `redex-disk` + `cortex` + `netdb` | **2.19 MB** | 25.7 MB | 37.1 MB |
-| `net` + `nat-traversal` | **1.99 MB** | 23.4 MB | 36.0 MB |
-| `net` + `nat-traversal` + `port-mapping` | **3.41 MB** | 26.8 MB | 47.5 MB |
+| `net` | **1.92 MB** | 22.2 MB | 35.2 MB |
+| `net` + `redex` | **1.92 MB** | 22.6 MB | 35.5 MB |
+| `net` + `redex` + `redex-disk` | **1.92 MB** | 22.8 MB | 35.6 MB |
+| `net` + `redex` + `redex-disk` + `cortex` | **1.92 MB** | 24.7 MB | 36.5 MB |
+| `net` + `redex` + `redex-disk` + `cortex` + `netdb` | **2.20 MB** | 25.7 MB | 37.2 MB |
+| `net` + `nat-traversal` | **2.01 MB** | 23.5 MB | 36.0 MB |
+| `net` + `nat-traversal` + `port-mapping` | **3.43 MB** | 26.9 MB | 47.5 MB |
 
 **Binding cdylib** (`libnet_node.dylib`, the `.node` file shipped to Node users; the Python PyO3 module has the same shape):
 
 | Features | `libnet_node.dylib` |
 |----------|--------------------:|
-| `net` | **2.64 MB** |
-| `net` + `compute` | **3.00 MB** |
+| `net` | **2.66 MB** |
+| `net` + `compute` | **3.01 MB** |
 | `net` + `compute` + `groups` | **3.21 MB** |
 
 - `libnet.dylib` — shipped core cdylib (consumed by Node / Python / C bindings).
