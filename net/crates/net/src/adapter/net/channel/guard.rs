@@ -246,17 +246,18 @@ impl AuthGuard {
     ///
     /// # Ordering
     ///
-    /// [`BloomCache::probe`] uses `Acquire` loads. If a probe
-    /// observes the bits written by [`Self::authorize`]'s
-    /// [`BloomCache::mark`] (Release stores), the
-    /// synchronization guarantees the subsequent
-    /// `verified.contains_key` call sees the insert that
-    /// `authorize` issued after marking the bloom. Without the
-    /// Release/Acquire pair, a Relaxed load could observe
-    /// bloom=0 while a completed `authorize` had already
-    /// populated `verified`, dropping an authorized
-    /// subscriber's first packets (cubic-caught via loom;
-    /// pinned by `auth_bloom_authorize_check_fast_no_false_deny`).
+    /// The inner `bloom.probe` uses `Relaxed` loads. Cross-
+    /// structure synchronization between a just-completed
+    /// [`Self::authorize`] and this call is provided by
+    /// DashMap's per-shard `parking_lot::Mutex` on the
+    /// `verified.contains_key` path (Acquire on shard-lock),
+    /// not by bloom ordering. See the module-internal
+    /// `BloomCache` struct docstring for the full rationale
+    /// and the loom models at `tests/loom_models.rs` for the
+    /// pinned invariants
+    /// (`auth_bloom_post_authorize_check_never_denies` in
+    /// particular pins the "subscribe-completes-before-first-
+    /// packet-arrives" no-false-deny property).
     #[inline]
     pub fn check_fast(&self, origin_hash: u64, channel_hash: u16) -> AuthVerdict {
         if !self.bloom.probe(origin_hash, channel_hash) {
@@ -277,13 +278,15 @@ impl AuthGuard {
     ///
     /// # Ordering
     ///
-    /// `bloom.mark` (Release) happens program-order-before
-    /// `verified.insert` (which carries its own Release via
-    /// DashMap's internal lock). A fast-path reader whose
-    /// `bloom.probe` (Acquire) observes the marked bits will
-    /// then observe a populated `verified` on its subsequent
-    /// `contains_key` — the false-deny race is impossible
-    /// under this ordering.
+    /// `bloom.mark` uses `Relaxed` fetch_or; `verified.insert`
+    /// carries a Release via DashMap's per-shard Mutex unlock.
+    /// A subsequent `check_fast` that observes `verified`
+    /// populated is guaranteed — via DashMap's Acquire on
+    /// shard-lock — to also observe the bloom bits, regardless
+    /// of the bloom's own ordering. See the module-internal
+    /// `BloomCache` docstring for the full analysis of why
+    /// `Relaxed` on the bloom is sufficient, and
+    /// `tests/loom_models.rs` for the pinned invariants.
     pub fn authorize(&self, origin_hash: u64, channel_hash: u16) {
         self.bloom.mark(origin_hash, channel_hash);
         self.verified.insert((origin_hash, channel_hash), true);
