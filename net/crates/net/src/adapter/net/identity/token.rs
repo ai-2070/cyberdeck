@@ -1308,4 +1308,179 @@ mod tests {
         assert!(child.not_before >= parent.not_before);
         assert!(child.verify().is_ok());
     }
+
+    // ========================================================================
+    // TEST_COVERAGE_PLAN §P2-9 — TokenCache concurrency safety.
+    //
+    // The cache is a DashMap, so entry-level writes are atomic,
+    // but the mesh-side usage pattern runs insert / check /
+    // evict_expired on the same entry from three different
+    // tokio tasks under load. These tests pin: no panic, no
+    // torn reads, terminal state coherent.
+    // ========================================================================
+
+    /// Concurrent `insert_unchecked` (authorize) + `check`
+    /// (authorize-gate) + `evict_expired` (sweep) on the same
+    /// subject+channel must not panic or produce an inconsistent
+    /// terminal state. The observer thread's `check` must always
+    /// return a deterministic `Ok(())` or `Err(NotAuthorized)`
+    /// — never a corrupted DashMap state (which would manifest
+    /// as a panic inside `iter().any(...)`).
+    #[test]
+    fn concurrent_insert_check_evict_is_panic_free() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let cache = Arc::new(TokenCache::new());
+        let issuer = EntityKeypair::generate();
+        let subject_kp = EntityKeypair::generate();
+        let subject_id = subject_kp.entity_id().clone();
+        let channel_hash = 0xABCDu16;
+        let iters = 500u32;
+
+        // Inserter: re-issue + replace the token on each
+        // iteration. Each insert overwrites the previous entry
+        // (same scope → `insert_unchecked`'s `iter_mut().find`
+        // path replaces rather than pushes).
+        let inserter = {
+            let cache = cache.clone();
+            let issuer = issuer.clone();
+            let subject_id = subject_id.clone();
+            thread::spawn(move || {
+                for _ in 0..iters {
+                    let token = PermissionToken::issue(
+                        &issuer,
+                        subject_id.clone(),
+                        TokenScope::SUBSCRIBE,
+                        channel_hash,
+                        300,
+                        0,
+                    );
+                    cache.insert_unchecked(token);
+                }
+            })
+        };
+
+        // Checker: gate queries fire on the hot path. Must not
+        // panic, must return a deterministic Result.
+        let checker = {
+            let cache = cache.clone();
+            let subject_id = subject_id.clone();
+            thread::spawn(move || {
+                for _ in 0..iters {
+                    let _ = cache.check(&subject_id, TokenScope::SUBSCRIBE, channel_hash);
+                }
+            })
+        };
+
+        // Evictor: periodic sweep. `evict_expired` walks every
+        // slot and retains only not-yet-expired tokens; with
+        // 300 s TTLs and a sub-second test, no tokens expire so
+        // no entries should actually be removed, but the retain
+        // closure must run safely against the writer.
+        let evictor = {
+            let cache = cache.clone();
+            thread::spawn(move || {
+                for _ in 0..iters {
+                    cache.evict_expired();
+                }
+            })
+        };
+
+        inserter.join().expect("inserter panicked");
+        checker.join().expect("checker panicked");
+        evictor.join().expect("evictor panicked");
+
+        // Terminal state: exactly one token present for this
+        // (subject, channel_hash, SUBSCRIBE) slot. The inserter
+        // replaced on every iteration — the final token must
+        // be valid, and `check` must return Ok(()) against it.
+        assert!(
+            cache
+                .check(&subject_id, TokenScope::SUBSCRIBE, channel_hash)
+                .is_ok(),
+            "terminal check must succeed — the last insert's token is unexpired",
+        );
+        assert_eq!(
+            cache.len(),
+            1,
+            "exactly one token should remain (same-scope replace path); got {}",
+            cache.len(),
+        );
+    }
+
+    /// A token that expires mid-test must be dropped by a
+    /// concurrent `evict_expired`. The checker's `check` must
+    /// return `Ok(())` while the token is still valid and
+    /// consistently `Err(NotAuthorized)` after eviction, never
+    /// a panic from a retain that ran mid-iter.
+    #[test]
+    fn evict_expired_races_with_check_without_panic() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let cache = Arc::new(TokenCache::new());
+        let issuer = EntityKeypair::generate();
+        let subject_kp = EntityKeypair::generate();
+        let subject_id = subject_kp.entity_id().clone();
+        let channel_hash = 0xBEEFu16;
+
+        // Short-lived token: 1 s TTL. Insert it then let it
+        // expire naturally during the race.
+        let token = PermissionToken::issue(
+            &issuer,
+            subject_id.clone(),
+            TokenScope::PUBLISH,
+            channel_hash,
+            1, // 1-second TTL
+            0,
+        );
+        cache.insert_unchecked(token);
+        assert!(
+            cache
+                .check(&subject_id, TokenScope::PUBLISH, channel_hash)
+                .is_ok(),
+            "pre-expiry check should succeed",
+        );
+
+        let checker = {
+            let cache = cache.clone();
+            let subject_id = subject_id.clone();
+            thread::spawn(move || {
+                for _ in 0..2_000 {
+                    // Outcome may transition from Ok → Err
+                    // exactly once during this loop as the TTL
+                    // elapses. Either result is valid; panic
+                    // is not.
+                    let _ = cache.check(&subject_id, TokenScope::PUBLISH, channel_hash);
+                }
+            })
+        };
+        let evictor = {
+            let cache = cache.clone();
+            thread::spawn(move || {
+                for _ in 0..2_000 {
+                    cache.evict_expired();
+                }
+            })
+        };
+
+        // Wait for TTL to elapse. `current_timestamp` is
+        // second-resolution, so 1.5 s of wall clock guarantees
+        // `not_after` < `now`.
+        thread::sleep(Duration::from_millis(1_500));
+
+        checker.join().expect("checker panicked");
+        evictor.join().expect("evictor panicked");
+
+        // Terminal: a fresh evict + check — the token's TTL
+        // has expired and the evictor swept at least once since,
+        // so check must return NotAuthorized.
+        cache.evict_expired();
+        match cache.check(&subject_id, TokenScope::PUBLISH, channel_hash) {
+            Err(TokenError::NotAuthorized) => {}
+            other => panic!("expected NotAuthorized after TTL + evict; got {other:?}"),
+        }
+    }
 }

@@ -900,4 +900,112 @@ mod tests {
         // Even though the next_hop isn't excluded, staleness drops it.
         assert!(table.lookup_alternate(0x4444, c).is_none());
     }
+
+    // ========================================================================
+    // TEST_COVERAGE_PLAN §P2-10 — routing-table concurrency safety.
+    //
+    // The mesh's receive loop calls `add_route_with_metric` from
+    // whatever task decoded the pingwave; under high pingwave
+    // volume multiple tasks hit the same entry simultaneously.
+    // DashMap entry semantics + the metric-precedence rule must
+    // converge on a deterministic best-metric winner without
+    // torn writes or lost inserts.
+    // ========================================================================
+
+    /// N threads inserting routes with mixed metrics for the
+    /// same destination must converge on the lowest metric seen.
+    /// Pins the `Entry::Occupied` + metric-compare contract
+    /// under contention. No assertion about *which* next_hop
+    /// wins (ties are tolerant of the interleaving), only that
+    /// the final metric is the minimum any thread inserted.
+    #[test]
+    fn concurrent_add_route_with_metric_converges_on_lowest_metric() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let table = Arc::new(RoutingTable::new(0x1111));
+        let dest = 0x2222u64;
+
+        let mut handles = Vec::new();
+        for metric in 1u16..=8 {
+            let table = table.clone();
+            handles.push(thread::spawn(move || {
+                // Each thread hammers its own metric on the
+                // same destination 500 times. The dashmap entry
+                // API guarantees atomic compare-and-swap per
+                // iteration.
+                let next_hop: SocketAddr =
+                    format!("127.0.0.1:{}", 10_000 + metric).parse().unwrap();
+                for _ in 0..500 {
+                    table.add_route_with_metric(dest, next_hop, metric);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        // After the race, the entry must exist and its metric
+        // must be the lowest any thread offered.
+        let entry = table
+            .routes
+            .get(&dest)
+            .expect("route must exist after all threads inserted");
+        assert_eq!(
+            entry.metric, 1,
+            "final metric must be the minimum (1) across all concurrent inserts — \
+             a metric > 1 indicates a lost update or a torn compare-and-swap",
+        );
+        // Lookup returns the winning next_hop.
+        let winner = table.lookup(dest).expect("dest must resolve");
+        assert_eq!(
+            winner,
+            "127.0.0.1:10001".parse::<SocketAddr>().unwrap(),
+            "lookup should return the next_hop paired with the winning metric",
+        );
+    }
+
+    /// Direct routes (metric=1 via `add_route`) must never be
+    /// displaced by concurrent pingwave-driven `add_route_with_metric`
+    /// inserts carrying `metric >= 2`. Proves the metric-precedence
+    /// rule holds under contention — a direct route's freshness
+    /// timestamp may update (evidence of reachability from a
+    /// pingwave along the same path) but the next_hop + metric
+    /// stay pinned.
+    #[test]
+    fn direct_route_survives_concurrent_worse_indirect_inserts() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let table = Arc::new(RoutingTable::new(0x1111));
+        let dest = 0x2222u64;
+        let direct: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        table.add_route(dest, direct);
+        assert_eq!(table.lookup(dest), Some(direct));
+
+        let mut handles = Vec::new();
+        for metric in 2u16..=10 {
+            let table = table.clone();
+            handles.push(thread::spawn(move || {
+                let indirect: SocketAddr =
+                    format!("127.0.0.1:{}", 20_000 + metric).parse().unwrap();
+                for _ in 0..500 {
+                    table.add_route_with_metric(dest, indirect, metric);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        // The direct route must still be in place.
+        assert_eq!(
+            table.lookup(dest),
+            Some(direct),
+            "direct route (metric=1) must not be displaced by any \
+             concurrent indirect insert with metric >= 2",
+        );
+        let entry = table.routes.get(&dest).unwrap();
+        assert_eq!(entry.metric, 1, "metric must still be 1 (direct)");
+    }
 }

@@ -516,4 +516,145 @@ mod tests {
             }
         }
     }
+
+    // ========================================================================
+    // TEST_COVERAGE_PLAN §P2-8 — concurrent authorize + revoke on the
+    // same (origin, channel) key.
+    //
+    // The existing regression above stresses writer + reader races on
+    // disjoint keys. Subscribe / unsubscribe on the SAME pair is the
+    // harder case: authorize sets the bloom bits + inserts the
+    // verified entry, revoke removes the verified entry. Bloom bits
+    // never clear, so the only read-observable state is the verified
+    // map. A torn interleaving could leave the map in either state
+    // depending on last-writer-wins, but it must not panic, must not
+    // leak a half-inserted entry, and `is_authorized` / `check_fast`
+    // must never observe a half-committed state.
+    // ========================================================================
+
+    /// Authorize + revoke on the SAME key racing across N threads.
+    /// The final `is_authorized` state depends on the
+    /// last-writer-wins interleaving, but the map must end in a
+    /// coherent state (either entry present or absent, never
+    /// corrupted) and no panic along the way.
+    #[test]
+    fn concurrent_authorize_and_revoke_on_same_key_is_panic_free() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let guard = Arc::new(AuthGuard::new());
+        let origin = 0x1234_5678_9ABC_DEF0u64;
+        let channel = 0x4242u16;
+        let iters = 1_000u32;
+
+        let authorizer = {
+            let guard = guard.clone();
+            thread::spawn(move || {
+                for _ in 0..iters {
+                    guard.authorize(origin, channel);
+                }
+            })
+        };
+        let revoker = {
+            let guard = guard.clone();
+            thread::spawn(move || {
+                for _ in 0..iters {
+                    guard.revoke(origin, channel);
+                }
+            })
+        };
+        // Observer: constantly check the auth state. Every
+        // observation must return a bool, never panic, and the
+        // internal DashMap state must remain self-consistent
+        // (covered by the other assertions after join).
+        let observer = {
+            let guard = guard.clone();
+            thread::spawn(move || {
+                for _ in 0..iters {
+                    let _ = guard.is_authorized(origin, channel);
+                    let _ = guard.check_fast(origin, channel);
+                }
+            })
+        };
+
+        authorizer.join().expect("authorizer panicked");
+        revoker.join().expect("revoker panicked");
+        observer.join().expect("observer panicked");
+
+        // Final state is SOME boolean — either "last op was
+        // authorize → entry present" or "last op was revoke →
+        // entry absent". Both are legitimate; asserting that
+        // the state is NOT torn means the two calls round-trip.
+        let final_state = guard.is_authorized(origin, channel);
+        // Double-query to ensure read stability.
+        assert_eq!(
+            final_state,
+            guard.is_authorized(origin, channel),
+            "two sequential is_authorized calls must agree — \
+             torn read would indicate DashMap corruption",
+        );
+        // And authorized_count must equal exactly 0 or 1 — no
+        // phantom entries, no duplicates.
+        let count = guard.authorized_count();
+        assert!(
+            count == 0 || count == 1,
+            "authorized_count should be 0 or 1 after the race; got {count}",
+        );
+    }
+
+    /// Control-plane variant: `allow_channel` + `revoke_channel`
+    /// race on the same `(origin, ChannelName)` entry. Same
+    /// invariants — panic-free, coherent final state — applied
+    /// to the exact-match ACL that storage / control-plane
+    /// paths consult via `is_authorized_full`.
+    #[test]
+    fn concurrent_allow_and_revoke_channel_on_same_key_is_panic_free() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let guard = Arc::new(AuthGuard::new());
+        let origin = 0xDEAD_BEEF_FEED_CAFEu64;
+        let name = ChannelName::new("auth/contended").expect("channel name");
+        let iters = 1_000u32;
+
+        let allower = {
+            let guard = guard.clone();
+            let name = name.clone();
+            thread::spawn(move || {
+                for _ in 0..iters {
+                    guard.allow_channel(origin, &name);
+                }
+            })
+        };
+        let revoker = {
+            let guard = guard.clone();
+            let name = name.clone();
+            thread::spawn(move || {
+                for _ in 0..iters {
+                    guard.revoke_channel(origin, &name);
+                }
+            })
+        };
+        let observer = {
+            let guard = guard.clone();
+            let name = name.clone();
+            thread::spawn(move || {
+                for _ in 0..iters {
+                    let _ = guard.is_authorized_full(origin, &name);
+                }
+            })
+        };
+
+        allower.join().expect("allower panicked");
+        revoker.join().expect("revoker panicked");
+        observer.join().expect("observer panicked");
+
+        // Coherent terminal state — true or false, never torn.
+        let final_state = guard.is_authorized_full(origin, &name);
+        assert_eq!(
+            final_state,
+            guard.is_authorized_full(origin, &name),
+            "sequential is_authorized_full reads must agree",
+        );
+    }
 }

@@ -402,6 +402,141 @@ mod tests {
         assert_eq!(fsm.classify(bind), NatClass::Open);
     }
 
+    // ========================================================================
+    // TEST_COVERAGE_PLAN §P2-11 — FSM determinism under permutation +
+    // scaling beyond the 2-observation minimum.
+    //
+    // The FSM uses `&mut self` for `observe`, so data-race-level
+    // concurrency (two threads both calling `observe`) is
+    // prevented at the type-system level. What the plan item
+    // *can* pin is classification determinism: for a fixed final
+    // observation set, `classify()` must return the same
+    // `NatClass` regardless of insertion order or classification-
+    // call count.
+    // ========================================================================
+
+    /// Classification is deterministic under observation
+    /// permutation. Same final set of `(peer, reflex)` pairs
+    /// must produce the same `NatClass` whether observations
+    /// arrive in order A→B→C or C→B→A.
+    #[test]
+    fn classification_is_stable_under_observation_permutation() {
+        let bind = sa("192.0.2.1:9001");
+        let obs = vec![
+            (1u64, sa("198.51.100.5:54321")),
+            (2u64, sa("198.51.100.5:54321")),
+            (3u64, sa("198.51.100.6:54321")),
+            (4u64, sa("198.51.100.7:54321")),
+        ];
+
+        // Baseline: insert in order.
+        let mut fsm_a = ClassifyFsm::new();
+        for (p, r) in &obs {
+            fsm_a.observe(*p, *r);
+        }
+        let class_a = fsm_a.classify(bind);
+
+        // Reverse order — same observations, different sequence.
+        let mut fsm_b = ClassifyFsm::new();
+        for (p, r) in obs.iter().rev() {
+            fsm_b.observe(*p, *r);
+        }
+        let class_b = fsm_b.classify(bind);
+
+        // Interleaved pattern — a third independent ordering.
+        let mut fsm_c = ClassifyFsm::new();
+        for i in [0usize, 2, 1, 3] {
+            let (p, r) = obs[i];
+            fsm_c.observe(p, r);
+        }
+        let class_c = fsm_c.classify(bind);
+
+        assert_eq!(class_a, class_b, "ordering A vs reverse must agree");
+        assert_eq!(class_a, class_c, "ordering A vs interleaved must agree");
+        assert_eq!(fsm_a.observation_count(), fsm_b.observation_count());
+        assert_eq!(fsm_a.observation_count(), fsm_c.observation_count());
+    }
+
+    /// `classify()` is idempotent — calling it N times on the
+    /// same FSM state returns the same result every call. Pins
+    /// that the method has no observable side effects on the
+    /// FSM (documented `&self` contract).
+    #[test]
+    fn classify_is_idempotent_across_many_calls() {
+        let bind = sa("192.0.2.1:9001");
+        let mut fsm = ClassifyFsm::new();
+        fsm.observe(1, sa("198.51.100.5:54321"));
+        fsm.observe(2, sa("198.51.100.5:54321"));
+
+        let first = fsm.classify(bind);
+        for _ in 0..1_000 {
+            assert_eq!(fsm.classify(bind), first);
+        }
+        // Observation count also unchanged — classify is read-only.
+        assert_eq!(fsm.observation_count(), 2);
+    }
+
+    /// FSM scales beyond the 2-observation minimum without
+    /// dropping older entries or degrading the classification.
+    /// Eight peers with stable-port observations → still Cone;
+    /// one late-arriving peer with a mismatched port flips to
+    /// Symmetric.
+    #[test]
+    fn fsm_accepts_many_observations_and_reflects_latest_in_class() {
+        let bind = sa("192.0.2.1:9001");
+        let mut fsm = ClassifyFsm::new();
+        for i in 1..=8 {
+            fsm.observe(i, sa(&format!("198.51.100.{i}:54321")));
+        }
+        assert_eq!(fsm.observation_count(), 8);
+        assert_eq!(fsm.classify(bind), NatClass::Cone);
+
+        // Ninth peer: same IP family, DIFFERENT port — symmetric
+        // signature. Must flip the classification, not be ignored
+        // due to capacity.
+        fsm.observe(9, sa("198.51.100.9:54322"));
+        assert_eq!(fsm.observation_count(), 9);
+        assert_eq!(fsm.classify(bind), NatClass::Symmetric);
+    }
+
+    /// Concurrent `classify()` reads (no writes) from a shared
+    /// FSM via `Arc` are safe — the method takes `&self`.
+    /// Pins the `Sync` contract: the FSM can be shared across
+    /// threads so long as all observation writes happen
+    /// single-threaded.
+    #[test]
+    fn concurrent_classify_reads_are_consistent() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let bind = sa("192.0.2.1:9001");
+        let mut fsm = ClassifyFsm::new();
+        fsm.observe(1, sa("198.51.100.5:54321"));
+        fsm.observe(2, sa("198.51.100.5:54321"));
+        let fsm = Arc::new(fsm);
+
+        let expected = fsm.classify(bind);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let fsm = fsm.clone();
+            handles.push(thread::spawn(move || {
+                let mut seen = Vec::with_capacity(200);
+                for _ in 0..200 {
+                    seen.push(fsm.classify(bind));
+                }
+                seen
+            }));
+        }
+        for h in handles {
+            let results = h.join().expect("thread panicked");
+            assert!(
+                results.iter().all(|c| *c == expected),
+                "some thread saw an inconsistent classification — \
+                 got {results:?}, expected all = {expected:?}",
+            );
+        }
+    }
+
     #[test]
     fn tag_roundtrip() {
         // Every wire tag round-trips through the NatClass <-> tag
