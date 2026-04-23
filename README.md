@@ -496,110 +496,110 @@ All numbers below measure **packet scheduling** — the time to process, route, 
 
 | Operation | M1 Max | i9-14900K |
 |-----------|--------|-----------|
-| Header serialize | 2.05 ns / **487M ops/sec** | 1.25 ns / **803M ops/sec** |
-| Header deserialize | 2.18 ns / **458M ops/sec** | 1.25 ns / **800M ops/sec** |
-| Routing header serialize | 0.58 ns / **1.71G ops/sec** | 0.31 ns / **3.24G ops/sec** |
-| Routing header forward | 0.58 ns / **1.72G ops/sec** | 0.24 ns / **4.21G ops/sec** |
-| Routing lookup (hit) | 20.19 ns / **49.5M ops/sec** | 13.84 ns / **72.3M ops/sec** |
-| Decision pipeline | 17.96 ns / **55.7M ops/sec** | 14.38 ns / **69.6M ops/sec** |
+| Header serialize | 1.98 ns / **505M ops/sec** | 1.30 ns / **767M ops/sec** |
+| Header deserialize | 2.11 ns / **475M ops/sec** | 1.52 ns / **659M ops/sec** |
+| Routing header serialize | 0.63 ns / **1.58G ops/sec** | 0.59 ns / **1.71G ops/sec** |
+| Routing header forward | 0.57 ns / **1.74G ops/sec** | 0.51 ns / **1.98G ops/sec** |
+| Routing lookup (hit) | 38.27 ns / **26.1M ops/sec** | 57.79 ns / **17.3M ops/sec** |
+| Decision pipeline | 37.83 ns / **26.4M ops/sec** | 37.74 ns / **26.5M ops/sec** |
 
 ### Multi-hop Forwarding
 
 | Hops | M1 Max | i9-14900K |
 |-----:|--------|-----------|
-| 1 | 59.63 ns / **16.8M ops/sec** | 52.97 ns / **18.9M ops/sec** |
-| 2 | 118.82 ns / **8.42M ops/sec** | 85.62 ns / **11.7M ops/sec** |
-| 3 | 168.94 ns / **5.92M ops/sec** | 118.60 ns / **8.43M ops/sec** |
-| 5 | 290.57 ns / **3.44M ops/sec** | 187.23 ns / **5.34M ops/sec** |
+| 1 | 60.08 ns / **16.6M ops/sec** | 52.15 ns / **19.2M ops/sec** |
+| 2 | 115.48 ns / **8.66M ops/sec** | 84.54 ns / **11.8M ops/sec** |
+| 3 | 163.31 ns / **6.12M ops/sec** | 119.24 ns / **8.39M ops/sec** |
+| 5 | 298.76 ns / **3.35M ops/sec** | 186.41 ns / **5.36M ops/sec** |
 
 | Threads | M1 Max | i9-14900K |
 |--------:|--------|-----------|
-| 4 | 5.14 M/s | 3.53 M/s |
-| 8 | 6.60 M/s | 9.12 M/s |
-| 16 | 7.87 M/s | 13.6 M/s |
+| 4 | 5.39 M/s | 7.16 M/s |
+| 8 | 7.48 M/s | 11.4 M/s |
+| 16 | 7.04 M/s | 12.3 M/s |
 
 ### Failure Detection & Recovery
 
 | Operation | M1 Max | i9-14900K |
 |-----------|--------|-----------|
-| Heartbeat (existing node) | 32.41 ns / **30.9M ops/sec** | 35.79 ns / **27.9M ops/sec** |
-| Status check | 12.87 ns / **77.7M ops/sec** | 13.45 ns / **74.3M ops/sec** |
-| Circuit breaker check | 10.60 ns / **94.3M ops/sec** | 10.60 ns / **94.4M ops/sec** |
-| Recovery (evaluate alternates) | 253.63 ns / **3.94M ops/sec** | 314.80 ns / **3.18M ops/sec** |
-| Full fail + recover cycle | 313.28 ns / **3.19M ops/sec** | 323.40 ns / **3.09M ops/sec** |
+| Heartbeat (existing node) | 28.98 ns / **34.5M ops/sec** | 33.77 ns / **29.6M ops/sec** |
+| Status check | 13.42 ns / **74.5M ops/sec** | 12.91 ns / **77.5M ops/sec** |
+| Circuit breaker check | 13.48 ns / **74.2M ops/sec** | 9.86 ns / **101M ops/sec** |
+| Recovery (evaluate alternates) | 275.92 ns / **3.62M ops/sec** | 241.75 ns / **4.14M ops/sec** |
+| Full fail + recover cycle | 303.14 ns / **3.30M ops/sec** | 242.68 ns / **4.12M ops/sec** |
 
 ### Swarm / Discovery
 
 | Operation | M1 Max | i9-14900K |
 |-----------|--------|-----------|
-| Pingwave serialize | 0.82 ns / **1.22G ops/sec** | 0.53 ns / **1.89G ops/sec** |
-| Pingwave roundtrip | 0.98 ns / **1.02G ops/sec** | 0.68 ns / **1.47G ops/sec** |
-| New peer discovery | 153.17 ns / **6.53M ops/sec** | 196.14 ns / **5.10M ops/sec** |
+| Pingwave serialize | 0.78 ns / **1.29G ops/sec** | 0.53 ns / **1.87G ops/sec** |
+| Pingwave roundtrip | 0.93 ns / **1.07G ops/sec** | 0.63 ns / **1.58G ops/sec** |
+| New peer discovery | 112.51 ns / **8.89M ops/sec** | 174.15 ns / **5.74M ops/sec** |
 
 | Nodes | M1 Max (all_nodes) | i9-14900K (all_nodes) |
 |------:|-------------------:|----------------------:|
-| 100 | 7.43 us | 7.71 us |
-| 500 | 16.12 us | 17.10 us |
-| 1,000 | 27.60 us | 27.88 us |
-| 5,000 | 232.72 us | 229.45 us |
+| 100 | 2.47 us | 7.21 us |
+| 500 | 7.90 us | 15.86 us |
+| 1,000 | 160.51 us | 26.18 us |
+| 5,000 | 223.50 us | 216.45 us |
 
 ### Encryption (ChaCha20-Poly1305)
 
 | Payload | M1 Max | i9-14900K |
 |--------:|--------|-----------|
-| 64B | 742.76 ns / 82.2 MiB/s | 1.14 us / 53.6 MiB/s |
-| 256B | 1.32 us / 185.1 MiB/s | 1.21 us / 201.7 MiB/s |
-| 1KB | 3.65 us / 267.7 MiB/s | 1.60 us / 609.3 MiB/s |
-| 4KB | 12.94 us / 301.8 MiB/s | 3.18 us / 1.20 GiB/s |
+| 64B | 486.18 ns / 125.5 MiB/s | 1.10 us / 55.3 MiB/s |
+| 256B | 923.05 ns / 264.5 MiB/s | 1.25 us / 195.8 MiB/s |
+| 1KB | 2.70 us / 361.9 MiB/s | 2.10 us / 465.3 MiB/s |
+| 4KB | 9.77 us / 399.8 MiB/s | 5.49 us / 711.0 MiB/s |
 
 ### Capability System
 
 | Operation | M1 Max | i9-14900K |
 |-----------|--------|-----------|
-| Filter (single tag) | 10.65 ns / **93.9M ops/sec** | 3.66 ns / **273M ops/sec** |
-| Filter (require GPU) | 4.39 ns / **228M ops/sec** | 1.94 ns / **516M ops/sec** |
-| GPU check | 0.33 ns / **3.06G ops/sec** | 0.20 ns / **4.92G ops/sec** |
-| Capability announcement | 542.44 ns / **1.84M ops/sec** | 1.57 us / **638K ops/sec** |
+| Filter (single tag) | 9.99 ns / **100M ops/sec** | 3.27 ns / **306M ops/sec** |
+| Filter (require GPU) | 4.07 ns / **246M ops/sec** | 1.73 ns / **577M ops/sec** |
+| GPU check | 0.31 ns / **3.20G ops/sec** | 0.19 ns / **5.22G ops/sec** |
+| Capability announcement | 374.32 ns / **2.67M ops/sec** | 1.47 us / **679K ops/sec** |
 
 | Nodes | M1 Max (tag query) | i9-14900K (tag query) |
 |------:|-------------------:|----------------------:|
-| 1,000 | 15.10 us | 10.84 us |
-| 5,000 | 76.25 us | 58.63 us |
-| 10,000 | 163.33 us | 188.14 us |
-| 50,000 | 1.82 ms | 1.85 ms |
+| 1,000 | 12.57 us | 10.22 us |
+| 5,000 | 70.29 us | 53.86 us |
+| 10,000 | 294.00 us | 173.48 us |
+| 50,000 | 2.71 ms | 1.18 ms |
 
 ### Multi-threaded Scaling (thread-local pool)
 
 | Threads | M1 Max | i9-14900K |
 |--------:|--------|-----------|
-| 8 | **5.96 M/s** | **5.16 M/s** |
-| 16 | **7.49 M/s** | **7.56 M/s** |
-| 32 | **8.36 M/s** | **8.61 M/s** |
+| 8 | **8.97 M/s** | **5.55 M/s** |
+| 16 | **9.25 M/s** | **8.27 M/s** |
+| 32 | **9.74 M/s** | **9.80 M/s** |
 
 Pool contention (thread-local acquire/release):
 
 | Threads | M1 Max | i9-14900K |
 |--------:|--------|-----------|
-| 8 | **80.6 M/s** | **82.6 M/s** |
-| 16 | **102.8 M/s** | **121.7 M/s** |
-| 32 | **114.2 M/s** | **142.7 M/s** |
+| 8 | **72.1 M/s** | **63.9 M/s** |
+| 16 | **70.1 M/s** | **76.9 M/s** |
+| 32 | **67.6 M/s** | **101.7 M/s** |
 
 ### SDK Ingestion
 
 | SDK | Method | Throughput | Latency |
 |-----|--------|------------|---------|
-| Go | IngestRaw (9B) | **2.65M/sec** | 377 ns |
-| Go | Batch (1000) | **2.44M/sec** | 411 ns/event |
-| Python | ingest_raw (9B) | **2.53M/sec** | 0.40 us |
-| Python | Batch (1000) | **2.78M/sec** | 0.36 us |
-| Node.js | pushBatch | **2.89M/sec** | 0.35 us |
-| Node.js | push (single) | **2.26M/sec** | 0.44 us |
-| Bun | Batch (1000) | **3.37M/sec** | 0.30 us |
-| Bun | push (single) | **2.05M/sec** | 0.49 us |
+| Go | IngestRaw (9B) | **4.01M/sec** | 249 ns |
+| Go | Batch (1000) | **4.77M/sec** | 210 ns/event |
+| Python | ingest_raw (9B) | **6.16M/sec** | 0.16 us |
+| Python | Batch (1000) | **6.80M/sec** | 0.15 us |
+| Node.js | pushBatch | **4.72M/sec** | 0.21 us |
+| Node.js | push (single) | **3.83M/sec** | 0.26 us |
+| Bun | pushBatch | **5.07M/sec** | 0.20 us |
+| Bun | push (single) | **3.95M/sec** | 0.25 us |
 
-Benchmarks accurate as of April 15, 2026.
+All benchmarks re-captured 2026-04-23 on M1 Max with release-mode bindings.
 
-All SDKs exceed **2M events/sec** with optimal ingestion patterns. Go achieves zero allocations on raw ingestion. Node.js sync methods are 31x faster than async. Bun batch ingestion is ~17% faster than Node.js.
+All SDKs exceed **3.8M events/sec** even on single-event ingestion, and **4.7M+ events/sec** on batch. Go achieves zero allocations on raw ingestion. Node.js sync methods are ~40x faster than async (`push` 3.83M vs async `ingestRaw` 95K). Bun batch (5.07M) is ~7% faster than Node.js batch (4.72M) on the same `pushBatch` call. Python (via PyO3) is the fastest binding at 6.8M/sec — the GIL releases for the duration of the FFI call so per-event overhead is the bare PyO3 marshalling.
 
 ### RedEX (storage primitive)
 
@@ -624,26 +624,26 @@ The numbers that matter for real workloads — ingest, fold, query, snapshot —
 
 | Operation | Latency | Throughput |
 |-----------|--------:|-----------:|
-| `tasks.create` ingest (no barrier) | 275 ns | **3.64M ops/sec** |
-| `memories.store` ingest | 466 ns | **2.14M ops/sec** |
-| Fold round-trip (`create` + `waitForSeq`) | 6.23 us | **161k ops/sec** |
-| `find_unique` (state lookup) | 9.2 ns | **109M ops/sec** |
-| `find_many` @ 1 K tasks (status filter) | 7.92 us | **126M elements/sec** |
-| `find_many` @ 10 K tasks | 137 us | **73.2M elements/sec** |
-| `count_where` @ 10 K tasks | 30.7 us | **326M elements/sec** |
-| `find_many` @ 1 K memories (tag filter) | 51.0 us | **19.6M elements/sec** |
-| Tasks snapshot encode @ 10 K | 350 us | -- |
-| Memories snapshot encode @ 10 K | 775 us | -- |
+| `tasks.create` ingest (no barrier) | 270 ns | **3.71M ops/sec** |
+| `memories.store` ingest | 404 ns | **2.47M ops/sec** |
+| Fold round-trip (`create` + `waitForSeq`) | 5.61 us | **178k ops/sec** |
+| `find_unique` (state lookup) | 8.92 ns | **112M ops/sec** |
+| `find_many` @ 1 K tasks (status filter) | 7.90 us | **126M elements/sec** |
+| `find_many` @ 10 K tasks | 172 us | **58.3M elements/sec** |
+| `count_where` @ 10 K tasks | 23.3 us | **429M elements/sec** |
+| `find_many` @ 1 K memories (tag filter) | 49.3 us | **20.3M elements/sec** |
+| Tasks snapshot encode @ 10 K | 363 us | -- |
+| Memories snapshot encode @ 10 K | 669 us | -- |
 | `NetDb::open` (both models) | 6.30 us | **159k ops/sec** |
-| Bundle encode @ 1 K (48 KB output) | 22.8 us | -- |
-| Bundle decode @ 1 K | 27.0 us | -- |
-| Bundle decode @ 10 K | 289 us | -- |
+| Bundle encode @ 1 K (48 KB output) | 22.2 us | -- |
+| Bundle decode @ 1 K | 26.5 us | -- |
+| Bundle decode @ 10 K | 309 us | -- |
 
-Ingest onto a single `TasksAdapter` sustains **~3.6M events/sec** before consumer back-pressure (no `waitForSeq`). The full fold round-trip is **6 us** — so a reactive watcher observes a newly appended event within ~one fold tick of the writer. Query methods at 10 K state size are double-digit microseconds even against a cold read lock, which is why the NetDB surface ships `find_many` / `count_where` / `exists_where` always-on: they're cheap enough to call inside a hot loop without a cache layer.
+Ingest onto a single `TasksAdapter` sustains **~3.7M events/sec** before consumer back-pressure (no `waitForSeq`). The full fold round-trip is **5.6 us** — so a reactive watcher observes a newly appended event within ~one fold tick of the writer. Query methods at 10 K state size range from double-digit to low triple-digit microseconds even against a cold read lock, which is why the NetDB surface ships `find_many` / `count_where` / `exists_where` always-on: they're cheap enough to call inside a hot loop without a cache layer.
 
-NetDB bundle encode + decode got **2-3x faster** and **60-70% smaller** when CortEX moved off bincode onto postcard in v0.5 — the biggest single win for cross-language snapshot transfer. Example at 1K entries: the bincode era shipped a 135 KB bundle in 63 us (encode) + 95 us (decode); postcard ships the same bundle at 48 KB in 23 us + 27 us.
+NetDB bundle encode + decode got **2-3x faster** and **60-70% smaller** when CortEX moved off bincode onto postcard in v0.5 — the biggest single win for cross-language snapshot transfer. Example at 1K entries: the bincode era shipped a 135 KB bundle in 63 us (encode) + 95 us (decode); postcard ships the same bundle at 48 KB in 22 us + 27 us.
 
-Benchmarks captured 2026-04-19 via `cargo bench --bench redex --features "redex redex-disk"` and `cargo bench --bench cortex --features "cortex netdb"` at 20 samples × 3 s measurement time. CortEX state serialization is on postcard (varint-encoded, serde-compatible, no-std friendly); bincode 1.x support was dropped after the original crate went unmaintained.
+CortEX numbers re-captured 2026-04-23; RedEX numbers (above) captured 2026-04-23 via `cargo bench --bench redex --features "redex redex-disk"` and `cargo bench --bench cortex --features "cortex netdb"`. CortEX state serialization is on postcard (varint-encoded, serde-compatible, no-std friendly); bincode 1.x support was dropped after the original crate went unmaintained.
 
 ### Binary size
 
@@ -655,20 +655,20 @@ Feature set affects `.rlib` and `.a` (which keep all compiled code for downstrea
 
 | Features | `libnet.dylib` (cdylib) | `libnet.rlib` | `libnet.a` |
 |----------|------------------------:|--------------:|-----------:|
-| `net` | **1.90 MB** | 22.2 MB | 35.2 MB |
-| `net` + `redex` | **1.90 MB** | 22.6 MB | 35.5 MB |
-| `net` + `redex` + `redex-disk` | **1.90 MB** | 22.7 MB | 35.6 MB |
-| `net` + `redex` + `redex-disk` + `cortex` | **1.90 MB** | 24.6 MB | 36.5 MB |
-| `net` + `redex` + `redex-disk` + `cortex` + `netdb` | **2.19 MB** | 25.7 MB | 37.1 MB |
-| `net` + `nat-traversal` | **1.99 MB** | 23.4 MB | 36.0 MB |
-| `net` + `nat-traversal` + `port-mapping` | **3.41 MB** | 26.8 MB | 47.5 MB |
+| `net` | **1.92 MB** | 22.2 MB | 35.2 MB |
+| `net` + `redex` | **1.92 MB** | 22.6 MB | 35.5 MB |
+| `net` + `redex` + `redex-disk` | **1.92 MB** | 22.8 MB | 35.6 MB |
+| `net` + `redex` + `redex-disk` + `cortex` | **1.92 MB** | 24.7 MB | 36.5 MB |
+| `net` + `redex` + `redex-disk` + `cortex` + `netdb` | **2.20 MB** | 25.7 MB | 37.2 MB |
+| `net` + `nat-traversal` | **2.01 MB** | 23.5 MB | 36.0 MB |
+| `net` + `nat-traversal` + `port-mapping` | **3.43 MB** | 26.9 MB | 47.5 MB |
 
 **Binding cdylib** (`libnet_node.dylib`, the `.node` file shipped to Node users; the Python PyO3 module has the same shape):
 
 | Features | `libnet_node.dylib` |
 |----------|--------------------:|
-| `net` | **2.64 MB** |
-| `net` + `compute` | **3.00 MB** |
+| `net` | **2.66 MB** |
+| `net` + `compute` | **3.01 MB** |
 | `net` + `compute` + `groups` | **3.21 MB** |
 
 - `libnet.dylib` — shipped core cdylib (consumed by Node / Python / C bindings).
@@ -676,8 +676,8 @@ Feature set affects `.rlib` and `.a` (which keep all compiled code for downstrea
 - `libnet.a` — C/C++ static lib, pre-LTO, expected for `staticlib`.
 - `libnet_node.dylib` — Node binding cdylib (what ships as `net.darwin-arm64.node`).
 
-Measured on `aarch64-apple-darwin`, 2026-04-22.
+Measured on `aarch64-apple-darwin`, 2026-04-23.
 
-The core cdylib stays at **1.90 MB across the four storage / compute combinations** — opting into RedEX, disk durability, or CortEX adds well under 1% to the deployed binary because dead-code elimination strips whatever the caller doesn't reference. `netdb` (the cross-model query façade that builds on `cortex`) adds **~290 KB** of Prisma-style query code paths. `nat-traversal` adds **~90 KB** (classifier FSM + rendezvous wire codec + the `connect_direct` orchestration path). `port-mapping` is the outlier at **+1.42 MB** — the extra weight is `igd-next`'s UPnP-IGD client, which pulls in a SOAP / XML stack and HTTP machinery that the rest of the mesh doesn't use; NAT-PMP alone is ~100 lines of wire codec inlined in the crate (no external dep), so a deployment that only needs NAT-PMP could strip UPnP support and stay near the `nat-traversal` line.
+The core cdylib stays at **1.92 MB across the four storage / compute combinations** — opting into RedEX, disk durability, or CortEX adds well under 1% to the deployed binary because dead-code elimination strips whatever the caller doesn't reference. `netdb` (the cross-model query façade that builds on `cortex`) adds **~285 KB** of Prisma-style query code paths. `nat-traversal` adds **~96 KB** (classifier FSM + rendezvous wire codec + the `connect_direct` orchestration path). `port-mapping` is the outlier at **+1.42 MB** — the extra weight is `igd-next`'s UPnP-IGD client, which pulls in a SOAP / XML stack and HTTP machinery that the rest of the mesh doesn't use; NAT-PMP alone is ~100 lines of wire codec inlined in the crate (no external dep), so a deployment that only needs NAT-PMP could strip UPnP support and stay near the `nat-traversal` line.
 
-The `compute` and `groups` features live at the binding / SDK layer (`net-sdk`'s `DaemonRuntime`, `Mikoshi` migration orchestrator, `ReplicaGroup` / `ForkGroup` / `StandbyGroup`) rather than in the core crate, so they don't appear in the core cdylib table. Enabling them on the binding cdylib adds **~360 KB** for `compute` and another **~220 KB** for `groups` on top — the Node `.node` file grows from 2.64 MB to 3.21 MB with the full stack. The `.rlib` and `.a` grow with features because they must preserve every compiled symbol for downstream linkers; only the shipped cdylibs feel the full benefit of LTO.
+The `compute` and `groups` features live at the binding / SDK layer (`net-sdk`'s `DaemonRuntime`, `Mikoshi` migration orchestrator, `ReplicaGroup` / `ForkGroup` / `StandbyGroup`) rather than in the core crate, so they don't appear in the core cdylib table. Enabling them on the binding cdylib adds **~367 KB** for `compute` and another **~200 KB** for `groups` on top — the Node `.node` file grows from 2.66 MB to 3.21 MB with the full stack. The `.rlib` and `.a` grow with features because they must preserve every compiled symbol for downstream linkers; only the shipped cdylibs feel the full benefit of LTO.
