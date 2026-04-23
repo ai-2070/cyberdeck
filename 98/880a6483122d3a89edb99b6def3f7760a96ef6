@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/mesh.rs
+  c5c47f96fd3344af 3179-3187
+net/crates/net/src/adapter/net/contested/reconcile.rs
+  c5c47f96fd3344af 219-229
+net/crates/net/sdk/src/stream.rs
+  c5c47f96fd3344af 168-185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "98880a6483122d3a89edb99b6def3f7760a96ef6",
+  "prompts": {
+    "c5c47f96fd3344af": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "265281de-e892-4f18-97bb-8b0a52554673",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 7919,
+      "total_deletions": 7886,
+      "accepted_lines": 721,
+      "overriden_lines": 0
+    }
+  }
+}
