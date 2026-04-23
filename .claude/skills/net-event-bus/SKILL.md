@@ -12,14 +12,18 @@ Net is **not Kafka**. It is not NATS, not Redis Streams, not Pulsar. The API sur
 
 ## How to use this skill
 
-You have four reference files in this directory. Load them on demand — do not read them all up front.
+You have several reference files in this directory. Load them on demand — do not read them all up front.
 
 | File | Read when |
 |---|---|
 | `concepts.md` | **Always** — before writing any integration code. The mental model. ~5 min read. |
 | `apis.md` | When generating actual code. Verified per-SDK templates for publish, subscribe, lifecycle. |
 | `patterns.md` | When the user describes a task ("I need a relay", "I need persistence", "I need fan-out across machines"). Maps tasks to recipes. |
+| `runtime.md` | When writing a `shutdown` path, handling errors, integrating into an existing async runtime (axum, FastAPI, Express), or debugging "why are my events missing?" |
+| `payloads.md` | When the user is shaping their event schema or asking about size limits, large blobs, or batching. |
+| `testing.md` | When writing unit/integration tests against the SDK. Covers fixtures, race conditions, CI gotchas. |
 | `gotchas.md` | When the user is migrating from Kafka / NATS / Redis Streams / Pulsar, or when their question reveals broker-thinking. |
+| `examples/` | When the user is starting from scratch — minimal, runnable hello-world for each SDK. Use as the first thing they run after install, before they write application code. |
 
 ## TL;DR mental model (the absolute minimum)
 
@@ -41,11 +45,16 @@ If the user's design language conflicts with any of these (e.g. "the broker", "t
 
 1. **Identify the language** — Rust, TypeScript, Python, Go, or C. There are no other bindings.
 2. **Read `concepts.md`** if this is your first invocation in the session.
-3. **Clarify the task shape** — single-process or multi-host? Channels (named topics) or raw firehose? Need persistence? Need typed payloads? Read `patterns.md` for the recipe that matches.
-4. **Pick the transport** — memory (single process), mesh (peer-to-peer over UDP), Redis, or JetStream. `concepts.md` covers the trade-offs. Default to `memory` for single-process tests and `mesh` for production.
-5. **Generate code from `apis.md`** — these templates are verified against the SDK source. Adapt the payload type and channel name; do not invent new methods.
-6. **Add a `shutdown` path.** Always. The ring buffer needs a clean drain.
-7. **If you're unsure about an API**, read the SDK source directly:
+3. **If the user is starting from scratch**, run the matching script in `examples/` first. Confirm the SDK is installed and working before writing application code.
+4. **Clarify the task shape** — single-process or multi-host? Channels (named topics) or raw firehose? Need persistence? Need typed payloads? Read `patterns.md` for the recipe that matches.
+5. **Pick the transport** — memory (single process), mesh (peer-to-peer over UDP), Redis, or JetStream. `concepts.md` covers the trade-offs. Default to `memory` for single-process tests and `mesh` for production.
+6. **Generate code from `apis.md`** — these templates are verified against the SDK source. Adapt the payload type and channel name; do not invent new methods.
+7. **Wire the lifecycle correctly** — read `runtime.md` for the shutdown contract and async-runtime integration before plugging into the user's existing app. Always add a `shutdown` path. The ring buffer needs a clean drain.
+8. **Handle errors per `runtime.md`** — `Backpressure` is the only retry-safe error; everything else indicates state change, bug, or config issue.
+9. **Shape the payload using `payloads.md`** — small JSON events on the bus, references for large blobs, batched events for telemetry streams.
+10. **Write tests using `testing.md`** — memory transport, two in-process nodes, subscribe-before-publish, clean shutdown in teardown.
+11. **If the user is migrating** from Kafka / NATS / Redis Streams / Pulsar, read `gotchas.md` first — broker assumptions will produce broken-but-compiling code.
+12. **If you're unsure about an API**, read the SDK source directly:
    - Rust: `net/crates/net/sdk/src/` and `net/crates/net/sdk/examples/`
    - TypeScript: `net/crates/net/sdk-ts/src/`
    - Python: `net/crates/net/sdk-py/src/net_sdk/`
