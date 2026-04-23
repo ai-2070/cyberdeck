@@ -29,7 +29,7 @@ use net::adapter::net::compute::{
     SnapshotReassembler, MAX_SNAPSHOT_CHUNK_SIZE,
 };
 use net::adapter::net::identity::EntityKeypair;
-use net::adapter::net::state::causal::{CausalEvent, CausalLink};
+use net::adapter::net::state::causal::CausalEvent;
 
 /// A daemon whose snapshot grows proportionally to `payload_size`
 /// so the migration path is forced onto the multi-chunk code path.
@@ -374,7 +374,3 @@ fn reassembler_cancel_is_idempotent_across_repeated_target_failures() {
     assert_eq!(r.pending_count(), 0);
 }
 
-// Bring causal types into use so rustc doesn't warn about the
-// import (it's used only inside the BulkyDaemon impl).
-#[allow(dead_code)]
-fn _keep_causal_imports(_e: CausalEvent, _l: CausalLink) {}
