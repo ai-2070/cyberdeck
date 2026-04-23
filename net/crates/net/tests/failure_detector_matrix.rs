@@ -148,8 +148,7 @@ async fn partition_of_one_peer_does_not_mark_unrelated_peers_failed() {
     // have fired by now.
     let _ = a.failure_detector().check_all();
     assert_eq!(
-        a.failure_detector()
-            .status(c_id),
+        a.failure_detector().status(c_id),
         net::adapter::net::NodeStatus::Healthy,
         "FD must be per-peer — a partition of B must not \
          cascade to C; got status={:?}",

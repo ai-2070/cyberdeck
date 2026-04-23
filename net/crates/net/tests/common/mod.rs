@@ -59,9 +59,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use net::adapter::net::{
-    EntityKeypair, MeshNode, MeshNodeConfig, NodeStatus, SocketBufferConfig,
-};
+use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, NodeStatus, SocketBufferConfig};
 
 /// Default socket buffer for all chaos-harness tests. 256 KiB
 /// is comfortably above the OS defaults on Linux + macOS so
@@ -142,11 +140,7 @@ pub async fn connect_pair(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
 /// 50 ms poll interval is the same cadence the pre-harness
 /// tests used; tight enough that FD transitions are caught
 /// promptly, loose enough that CPU cost is negligible.
-pub async fn await_condition<F: FnMut() -> bool>(
-    limit: Duration,
-    description: &str,
-    mut check: F,
-) {
+pub async fn await_condition<F: FnMut() -> bool>(limit: Duration, description: &str, mut check: F) {
     let start = tokio::time::Instant::now();
     while start.elapsed() < limit {
         if check() {
@@ -159,9 +153,7 @@ pub async fn await_condition<F: FnMut() -> bool>(
     // that the condition became true between the last poll
     // and the timeout. One more chance before we panic.
     if !check() {
-        panic!(
-            "await_condition({description:?}) did not hold within {limit:?}",
-        );
+        panic!("await_condition({description:?}) did not hold within {limit:?}",);
     }
 }
 
@@ -170,31 +162,19 @@ pub async fn await_condition<F: FnMut() -> bool>(
 /// iteration (via `check_all()`) because production-config
 /// `check_all` runs on a heartbeat cadence that tests shouldn't
 /// rely on firing within the window.
-pub async fn await_peer_failed(
-    observer: &Arc<MeshNode>,
-    target_id: u64,
-    limit: Duration,
-) {
+pub async fn await_peer_failed(observer: &Arc<MeshNode>, target_id: u64, limit: Duration) {
     let observer = observer.clone();
-    await_condition(
-        limit,
-        &format!("peer {target_id:#x} marked Failed"),
-        || {
-            let _ = observer.failure_detector().check_all();
-            observer.failure_detector().status(target_id) == NodeStatus::Failed
-        },
-    )
+    await_condition(limit, &format!("peer {target_id:#x} marked Failed"), || {
+        let _ = observer.failure_detector().check_all();
+        observer.failure_detector().status(target_id) == NodeStatus::Failed
+    })
     .await;
 }
 
 /// Wait for `observer.failure_detector()` to mark `target_id`
 /// as `NodeStatus::Healthy`. Used after partition heal to pin
 /// the recovery path.
-pub async fn await_peer_recovered(
-    observer: &Arc<MeshNode>,
-    target_id: u64,
-    limit: Duration,
-) {
+pub async fn await_peer_recovered(observer: &Arc<MeshNode>, target_id: u64, limit: Duration) {
     let observer = observer.clone();
     await_condition(
         limit,
@@ -225,17 +205,11 @@ pub async fn await_capability_index_evicts(
 /// Wait until `observer.peer_count()` reaches `expected`.
 /// Useful for teardown assertions ("after failure, the peers
 /// map should have shrunk by 1").
-pub async fn await_peer_count(
-    observer: &Arc<MeshNode>,
-    expected: usize,
-    limit: Duration,
-) {
+pub async fn await_peer_count(observer: &Arc<MeshNode>, expected: usize, limit: Duration) {
     let observer = observer.clone();
-    await_condition(
-        limit,
-        &format!("peer_count == {expected}"),
-        || observer.peer_count() == expected,
-    )
+    await_condition(limit, &format!("peer_count == {expected}"), || {
+        observer.peer_count() == expected
+    })
     .await;
 }
 
@@ -284,10 +258,7 @@ pub fn chaos_one_sided_heal(observer: &Arc<MeshNode>, target: &Arc<MeshNode>) {
 /// `wait` should be `>= miss_threshold × session_timeout` —
 /// with [`fast_fd_config`] that's 3 × 500 ms = 1.5 s, so
 /// 2 s gives a comfortable margin.
-pub async fn drive_failure_detection(
-    observer: &Arc<MeshNode>,
-    wait: Duration,
-) -> Vec<u64> {
+pub async fn drive_failure_detection(observer: &Arc<MeshNode>, wait: Duration) -> Vec<u64> {
     tokio::time::sleep(wait).await;
     observer.failure_detector().check_all()
 }
