@@ -1502,10 +1502,7 @@ mod tests {
     fn open_file(redex: *mut RedexHandle, name: &str, cfg_json: Option<&str>) -> c_int {
         let name_c = CString::new(name).unwrap();
         let cfg_c = cfg_json.map(|s| CString::new(s).unwrap());
-        let cfg_ptr = cfg_c
-            .as_ref()
-            .map(|c| c.as_ptr())
-            .unwrap_or(ptr::null());
+        let cfg_ptr = cfg_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null());
         let mut handle: *mut RedexFileHandle = ptr::null_mut();
         let rc = net_redex_open_file(redex, name_c.as_ptr(), cfg_ptr, &mut handle);
         if rc == 0 && !handle.is_null() {
@@ -1525,31 +1522,18 @@ mod tests {
         let r = redex();
         // Pre-checks: defaults and each individual setting succeed.
         assert_eq!(open_file(r, "ok-default", None), 0);
+        assert_eq!(open_file(r, "ok-everyn", Some(r#"{"fsync_every_n":4}"#)), 0);
         assert_eq!(
-            open_file(r, "ok-everyn", Some(r#"{"fsync_every_n":4}"#)),
-            0
-        );
-        assert_eq!(
-            open_file(
-                r,
-                "ok-interval",
-                Some(r#"{"fsync_interval_ms":50}"#),
-            ),
+            open_file(r, "ok-interval", Some(r#"{"fsync_interval_ms":50}"#),),
             0
         );
 
         // Rejected combinations. Each row tests one invalid config.
         let invalid = [
-            (
-                "both-set",
-                r#"{"fsync_every_n":4,"fsync_interval_ms":50}"#,
-            ),
+            ("both-set", r#"{"fsync_every_n":4,"fsync_interval_ms":50}"#),
             ("zero-everyn", r#"{"fsync_every_n":0}"#),
             ("zero-interval", r#"{"fsync_interval_ms":0}"#),
-            (
-                "both-zero",
-                r#"{"fsync_every_n":0,"fsync_interval_ms":0}"#,
-            ),
+            ("both-zero", r#"{"fsync_every_n":0,"fsync_interval_ms":0}"#),
             (
                 "everyn-set-interval-zero",
                 r#"{"fsync_every_n":4,"fsync_interval_ms":0}"#,

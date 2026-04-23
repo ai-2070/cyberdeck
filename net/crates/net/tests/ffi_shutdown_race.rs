@@ -23,14 +23,14 @@
 
 use std::os::raw::c_char;
 use std::ptr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use net::ffi::{
-    NetEvent, NetHandle, NetPollResult, NetReceipt, net_free_poll_result, net_ingest_raw_ex,
-    net_init, net_poll_ex, net_shutdown,
+    net_free_poll_result, net_ingest_raw_ex, net_init, net_poll_ex, net_shutdown, NetEvent,
+    NetHandle, NetPollResult, NetReceipt,
 };
 use rand::RngExt;
 
