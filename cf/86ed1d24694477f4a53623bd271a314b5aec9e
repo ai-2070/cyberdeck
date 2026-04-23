@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/reliability.rs
+  c5c47f96fd3344af 233-238,240,243-249,251-253,292-294,297-308,310,313-319,321-347,358,415,459-464,482-484,493,495,505-507,527,562-563,565-566,578,594-596,647,754-755,773-774,787,827-828,830-831,887-899,902,904-910,912-915,917-980,982-983
+net/crates/net/src/adapter/net/behavior/safety.rs
+  c5c47f96fd3344af 509-524,527,1622-1651
+net/crates/net/src/adapter/net/identity/token.rs
+  c5c47f96fd3344af 31-40,227-240,245-248,436-441,443-448,621-624,818-820,824-825,835-867,1015,1019,1062,1066-1067
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "cf86ed1d24694477f4a53623bd271a314b5aec9e",
+  "prompts": {
+    "c5c47f96fd3344af": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "265281de-e892-4f18-97bb-8b0a52554673",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1252,
+      "total_deletions": 52,
+      "accepted_lines": 285,
+      "overriden_lines": 0
+    }
+  }
+}
