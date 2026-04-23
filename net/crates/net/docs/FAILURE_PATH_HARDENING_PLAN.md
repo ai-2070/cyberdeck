@@ -75,7 +75,7 @@ cargo +nightly fuzz run nat_pmp_decode_response           -- -max_total_time=60
 cargo +nightly fuzz run migration_wire_decode             -- -max_total_time=60
 cargo +nightly fuzz run routing_header_from_bytes         -- -max_total_time=60
 
-# Extended CI run, 1 hour per target (nightly job):
+# Extended local run, 1 hour per target:
 for t in capability_announcement_from_bytes snapshot_reassembler_feed \
          nat_pmp_decode_response migration_wire_decode \
          routing_header_from_bytes; do
@@ -88,6 +88,24 @@ cargo +nightly fuzz run <target> artifacts/<target>/crash-<hash>
 # List all targets:
 cargo +nightly fuzz list
 ```
+
+**CI automation.** `.github/workflows/nightly-fuzz.yml` fans the 5 targets out as a matrix job (parallel, `fail-fast: false`) and runs each for 1 hour nightly at 03:00 UTC. Triggered on schedule + `workflow_dispatch` (manual).
+
+On any crash, the workflow uploads the failing inputs as the `crashes-<target>` artifact with 30-day retention. Reproduce locally via:
+
+```sh
+gh run download <run-id> -n crashes-<target>
+cd net/crates/net/fuzz
+cargo +nightly fuzz run <target> path/to/crash-<hash>
+```
+
+After every run (crash or not), the post-run corpus uploads as `corpus-<target>` with 14-day retention. Maintainers can `gh run download` and commit back the inputs that expand coverage beyond the seed corpus — this gives subsequent runs + fresh clones a richer starting point without re-exploring branches libfuzzer already found.
+
+Manual `workflow_dispatch` accepts two inputs:
+- `max_total_time` — seconds per target (default `3600`).
+- `targets` — space-separated target subset to run (blank = all).
+
+Useful for extended campaigns: dispatch with `max_total_time=86400 targets=snapshot_reassembler_feed` for a one-off 24-hour sweep on the highest-complexity target.
 
 **Corpus hygiene.**
 
