@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/route.rs
+  c5c47f96fd3344af 16-20
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "c88763af5ddb452f3dce1f40cf726da9d71ce8f3",
+  "prompts": {
+    "c5c47f96fd3344af": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "265281de-e892-4f18-97bb-8b0a52554673",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 5,
+      "total_deletions": 6,
+      "accepted_lines": 688,
+      "overriden_lines": 0
+    }
+  }
+}
