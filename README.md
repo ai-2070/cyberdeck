@@ -597,7 +597,7 @@ Pool contention (thread-local acquire/release):
 | Bun | Batch (1000) | **3.37M/sec** | 0.30 us |
 | Bun | push (single) | **2.05M/sec** | 0.49 us |
 
-Net core benchmarks (Routing through Multi-threaded Scaling, above) re-captured 2026-04-23. SDK Ingestion numbers above accurate as of April 15, 2026.
+Net core benchmarks (Routing through Multi-threaded Scaling, above) captured 2026-04-23. SDK Ingestion numbers above accurate as of April 15, 2026.
 
 All SDKs exceed **2M events/sec** with optimal ingestion patterns. Go achieves zero allocations on raw ingestion. Node.js sync methods are 31x faster than async. Bun batch ingestion is ~17% faster than Node.js.
 
@@ -676,8 +676,8 @@ Feature set affects `.rlib` and `.a` (which keep all compiled code for downstrea
 - `libnet.a` — C/C++ static lib, pre-LTO, expected for `staticlib`.
 - `libnet_node.dylib` — Node binding cdylib (what ships as `net.darwin-arm64.node`).
 
-Measured on `aarch64-apple-darwin`, 2026-04-22.
+Measured on `aarch64-apple-darwin`, 2026-04-23.
 
-The core cdylib stays at **1.90 MB across the four storage / compute combinations** — opting into RedEX, disk durability, or CortEX adds well under 1% to the deployed binary because dead-code elimination strips whatever the caller doesn't reference. `netdb` (the cross-model query façade that builds on `cortex`) adds **~290 KB** of Prisma-style query code paths. `nat-traversal` adds **~90 KB** (classifier FSM + rendezvous wire codec + the `connect_direct` orchestration path). `port-mapping` is the outlier at **+1.42 MB** — the extra weight is `igd-next`'s UPnP-IGD client, which pulls in a SOAP / XML stack and HTTP machinery that the rest of the mesh doesn't use; NAT-PMP alone is ~100 lines of wire codec inlined in the crate (no external dep), so a deployment that only needs NAT-PMP could strip UPnP support and stay near the `nat-traversal` line.
+The core cdylib stays at **1.92 MB across the four storage / compute combinations** — opting into RedEX, disk durability, or CortEX adds well under 1% to the deployed binary because dead-code elimination strips whatever the caller doesn't reference. `netdb` (the cross-model query façade that builds on `cortex`) adds **~285 KB** of Prisma-style query code paths. `nat-traversal` adds **~96 KB** (classifier FSM + rendezvous wire codec + the `connect_direct` orchestration path). `port-mapping` is the outlier at **+1.42 MB** — the extra weight is `igd-next`'s UPnP-IGD client, which pulls in a SOAP / XML stack and HTTP machinery that the rest of the mesh doesn't use; NAT-PMP alone is ~100 lines of wire codec inlined in the crate (no external dep), so a deployment that only needs NAT-PMP could strip UPnP support and stay near the `nat-traversal` line.
 
-The `compute` and `groups` features live at the binding / SDK layer (`net-sdk`'s `DaemonRuntime`, `Mikoshi` migration orchestrator, `ReplicaGroup` / `ForkGroup` / `StandbyGroup`) rather than in the core crate, so they don't appear in the core cdylib table. Enabling them on the binding cdylib adds **~360 KB** for `compute` and another **~220 KB** for `groups` on top — the Node `.node` file grows from 2.64 MB to 3.21 MB with the full stack. The `.rlib` and `.a` grow with features because they must preserve every compiled symbol for downstream linkers; only the shipped cdylibs feel the full benefit of LTO.
+The `compute` and `groups` features live at the binding / SDK layer (`net-sdk`'s `DaemonRuntime`, `Mikoshi` migration orchestrator, `ReplicaGroup` / `ForkGroup` / `StandbyGroup`) rather than in the core crate, so they don't appear in the core cdylib table. Enabling them on the binding cdylib adds **~367 KB** for `compute` and another **~200 KB** for `groups` on top — the Node `.node` file grows from 2.66 MB to 3.21 MB with the full stack. The `.rlib` and `.a` grow with features because they must preserve every compiled symbol for downstream linkers; only the shipped cdylibs feel the full benefit of LTO.
