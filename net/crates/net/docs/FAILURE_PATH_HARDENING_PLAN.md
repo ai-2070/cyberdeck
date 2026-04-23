@@ -256,7 +256,7 @@ Green = harness-backed, ad-hoc = pre-harness test covering the cell, empty = not
 
 ### Harness-blocked failure modes
 
-Four failure modes in the plan matrix cannot be implemented today without extending the crate's public API:
+Seven failure modes in the plan matrix cannot be implemented today without extending the crate's public API:
 
 - **`wire-packet-drop`, `wire-packet-delay`, `wire-packet-reorder`, `wire-packet-duplicate`** — require a dispatch-layer interception hook on `MeshNode`. `LossSimulator` exists as a standalone struct (`src/adapter/net/failure.rs:337-472`) but is not wired into `MeshNode`'s `DispatchCtx::recv_batch` path. A small additive change (install an optional `Box<dyn PacketFilter>` on the dispatch ctx) would unblock all four cells across every subprotocol.
 - **`clock-jump-forward`, `clock-jump-backward`** — require a deterministic-time-injection layer. Today every timeout calls `Instant::now()` or `SystemTime::now()` directly; a `Clock` trait threaded through the TTL / GC / session-timeout machinery would unblock. Non-trivial refactor; independently valuable as a Stage 4 prerequisite.
