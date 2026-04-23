@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/subnet/assignment.rs
+  5bf3f089eecaef7a 22-45,218-364
+net/crates/net/bindings/go/net/abi_stability_test.go
+  5bf3f089eecaef7a 1-246
+net/crates/net/src/adapter/net/behavior/capability.rs
+  5bf3f089eecaef7a 1918-2053
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "4801cf47047a2550210158c07fb7742b92544643",
+  "prompts": {
+    "5bf3f089eecaef7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f0f80f-e7fe-4398-b4c2-52310d7669df",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 800,
+      "total_deletions": 3177,
+      "accepted_lines": 838,
+      "overriden_lines": 0
+    }
+  }
+}
