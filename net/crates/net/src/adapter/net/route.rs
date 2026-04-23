@@ -13,12 +13,11 @@ use std::time::Instant;
 
 /// Routing header size in bytes.
 ///
-/// Layout is `magic(2) + ttl(1) + hop_count(1) + flags(1) + _reserved(1)
-/// + src_id(4) + dest_id(8)` = 18 bytes. The magic tag at bytes 0-1
-/// unambiguously distinguishes routing headers from direct Net
-/// packets (whose own magic is `0x4E45`) so the receive-loop
-/// discriminator doesn't depend on `dest_id` happening to not
-/// collide with it.
+/// Layout: `magic(2) | ttl(1) | hop_count(1) | flags(1) | _reserved(1) | src_id(4) | dest_id(8)`
+/// — 18 bytes total. The magic tag at bytes 0-1 unambiguously
+/// distinguishes routing headers from direct Net packets (whose
+/// own magic is `0x4E45`), so the receive-loop discriminator
+/// doesn't depend on `dest_id` happening to not collide with it.
 pub const ROUTING_HEADER_SIZE: usize = 18;
 
 /// Magic bytes identifying a routing header: `[0x52, 0x54]` on the
