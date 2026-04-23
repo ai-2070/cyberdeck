@@ -165,10 +165,24 @@ impl Stream for EventStream {
                     // `cx.waker().wake_by_ref()` immediately after
                     // creating the sleep, forcing one wasted re-poll
                     // per idle backoff tick).
-                    let first = sleep.as_mut().poll(cx);
-                    this.sleep = Some(sleep);
-                    debug_assert!(matches!(first, Poll::Pending));
-                    Poll::Pending
+                    //
+                    // If the sleep resolves immediately (zero / already-
+                    // elapsed duration), re-wake the task so the next
+                    // `poll_next` kicks off a fresh poll instead of
+                    // silently parking without a wake (cubic code
+                    // review P2).
+                    match sleep.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            this.sleep = Some(sleep);
+                            Poll::Pending
+                        }
+                        Poll::Ready(()) => {
+                            // Don't stash the fired sleep; let the
+                            // next poll build a fresh one.
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    }
                 } else {
                     // Reset backoff on activity.
                     this.current_interval = this.opts.poll_interval;

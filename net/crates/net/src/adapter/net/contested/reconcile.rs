@@ -216,7 +216,17 @@ pub fn verify_remote_chain(
             });
         }
         if let Some(split_seq) = expected_first_seq {
-            let expected = split_seq.saturating_add(1);
+            // `checked_add(1)` rather than `saturating_add(1)`: at
+            // `split_seq == u64::MAX` there's no legitimate next
+            // sequence — the chain is already at the 64-bit ceiling,
+            // so any remote claiming to extend it is malformed by
+            // construction. Saturating would silently accept
+            // `first.link.sequence == u64::MAX` as a continuation of
+            // a chain that already hit the end (cubic code review P3).
+            let expected = split_seq.checked_add(1).ok_or(ChainError::SequenceGap {
+                expected: u64::MAX,
+                got: first.link.sequence,
+            })?;
             if first.link.sequence != expected {
                 return Err(ChainError::SequenceGap {
                     expected,

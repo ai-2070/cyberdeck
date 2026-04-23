@@ -3176,6 +3176,15 @@ impl MeshNode {
                         // Short-term partitions stay in `peers` long
                         // enough for `on_recovery` to fire when the
                         // heartbeats resume.
+                        //
+                        // Drive `check_all()` first: the failure
+                        // detector only transitions `Healthy → Suspected
+                        // → Failed` when its state machine runs. Without
+                        // this call, `failed_nodes()` would always be
+                        // empty outside tests and the sweep would be a
+                        // silent no-op even for permanently-dead peers
+                        // (cubic code review P1).
+                        let _ = failure_detector.check_all();
                         let failed = failure_detector.failed_nodes();
                         for node_id in failed {
                             let still_silent = match peers.get(&node_id) {
