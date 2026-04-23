@@ -17,6 +17,13 @@ repository = "https://github.com/ai-2070/net"
 keywords = ["event-bus", "high-performance", "streaming"]
 categories = ["asynchronous", "concurrency", "data-structures"]
 
+[lints.rust]
+# `loom` is a custom cfg activated via RUSTFLAGS="--cfg loom"
+# for `tests/loom_models.rs` (FAILURE_PATH_HARDENING_PLAN
+# Stage 2). Declaring it here suppresses the stable-compiler
+# `unexpected_cfgs` warning without affecting default builds.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [lib]
 crate-type = ["lib", "cdylib", "staticlib"]
 
@@ -133,6 +140,11 @@ postcard = { version = "1", features = ["alloc"], optional = true, default-featu
 tokio = { version = "1", features = ["full", "test-util"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
 rand = "0.10"
+# Loom only enters the dep graph when tests are built with
+# `RUSTFLAGS="--cfg loom"`. Gating via cfg so the default
+# `cargo test` / `cargo build` paths don't pay its build cost.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
 
 [[bench]]
 name = "ingestion"

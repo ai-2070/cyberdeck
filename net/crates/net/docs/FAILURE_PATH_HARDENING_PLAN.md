@@ -103,16 +103,60 @@ cargo +nightly fuzz list
 
 ## Stage 2 — Concurrency model checking with loom
 
-**Cost:** 1-2 weeks.
-**Setup:** Add `loom` as a dev-dependency gated on `#[cfg(loom)]`. Wrap atomics / `Mutex` / `RwLock` uses with `loom::sync::*` aliases.
+**Status:** infrastructure landed; 3 pattern-level loom models pass. 3 of 5 target cores are blocked by a DashMap / parking_lot substitution gap that loom does not cover directly — the plan reality-check landed via the triage pass (below).
 
-**Cores to model-check:**
+**Cost:** 1-2 weeks for the two pattern models + infrastructure. The full core coverage is blocked on a separate refactor (see "DashMap blocker" below).
 
-- `AuthGuard` — bloom-bit writes + verified-map updates + exact-match ACL. The authorize/revoke race (P2-8) is barrier-stress-tested; loom would verify the memory-ordering annotations are correct, not just probabilistically-not-broken.
-- `TokenCache` — insert / check / evict under concurrency (P2-9 barrier-stressed).
-- `RoutingTable` — metric precedence under concurrent `add_route_with_metric` (P2-10).
-- `CapabilityIndex` — versions↔nodes lock-ordering (P1-2 barrier-stressed).
-- `FailureDetector` — `check_all` vs `on_failure` callback race.
+**Setup landed.** `loom = "0.7"` is declared as a `[target.'cfg(loom)'.dev-dependencies]` entry so it only enters the dep graph when tests are built with `RUSTFLAGS="--cfg loom"` — default builds pay no cost. A `[lints.rust] unexpected_cfgs` allowlist suppresses the stable-compiler warning for the custom cfg.
+
+### Triage: what loom can cover directly today
+
+A readiness survey of the 5 cores (AuthGuard, TokenCache, RoutingTable, CapabilityIndex, FailureDetector) found:
+
+| Core | Primary storage | Loom verdict |
+|------|----------------|--------------|
+| `AuthGuard` | `DashMap` (verified + exact) + `Vec<AtomicU8>` bloom | **Blocked** — DashMap is load-bearing for correctness |
+| `TokenCache` | `DashMap<(EntityId, u16), Vec<PermissionToken>>` | **Blocked** — no non-DashMap sub-piece |
+| `RoutingTable` | `DashMap<u64, RouteEntry>` + `AtomicU64` maxage | **Partial** — `SchedulerStreamStats` atomic battery is loom-ready; routes table is not |
+| `CapabilityIndex` | 6× `DashMap` + 2× `AtomicU64` stats | **Blocked** — multi-map consistency is load-bearing |
+| `FailureDetector` | `DashMap<u64, NodeState>` + `std::Mutex<Instant>` | **Partial** — `LossSimulator` burst-CAS loop is loom-ready; main detector is not |
+
+Loom substitutes `std::sync::atomic`, `std::sync::{Mutex, RwLock, Arc}`, `std::thread`, and `std::sync::mpsc`. It does **not** substitute `parking_lot::*` or `dashmap::DashMap`. Three of the five cores are DashMap-heavy throughout — verifying them under loom would require either (a) a multi-week DashMap-shim refactor or (b) extracting the correctness-bearing atomics into DashMap-free sub-structs.
+
+### Pattern-level landing (this pass)
+
+The two cores with loom-ready sub-pieces additionally call `SystemTime::now()` in-situ, which loom's deterministic scheduler can't observe. Rather than refactor those out, this pass models the *patterns* in `tests/loom_models.rs` using loom's atomics directly. The production struct using the same pattern is correct by construction; if the production struct ever diverges from the pattern, the drift is a code-review issue and the model stays as the pinned reference.
+
+Three models landed:
+
+1. **`stream_stats_counter_battery_is_atomic_under_concurrent_record`** — mirrors `SchedulerStreamStats::record_in/out/drop`. Pins that concurrent `record_*` calls under `Ordering::Relaxed` preserve the sum invariant (final counts equal total increments).
+
+2. **`burst_cas_decrement_never_underflows_under_contention`** — mirrors `LossSimulator::should_drop`'s burst CAS loop. Two threads race to decrement a counter of initial=2; loom exhaustively explores the interleaving and pins that both succeed exactly once and the counter reaches exactly 0.
+
+3. **`burst_cas_decrement_caps_at_initial_count_under_contention`** — same pattern, initial=1. Pins that exactly one of two racing threads wins and the counter does not wrap past 0. Direct protection against the `load; fetch_sub` regression that cubic flagged in `tests/bus_shutdown_drain.rs`.
+
+All 3 models pass under `RUSTFLAGS="--cfg loom" cargo test --release --test loom_models`, in 0.01 s (loom is fast when the workload is kept small — 2-3 threads × 2-3 ops).
+
+**Runbook.**
+
+```sh
+# Run all loom models (fast — sub-second):
+RUSTFLAGS="--cfg loom" cargo test --release --test loom_models
+
+# Run a single model with verbose loom output for debugging:
+LOOM_LOG=1 RUSTFLAGS="--cfg loom" cargo test --release --test loom_models \
+  stream_stats_counter_battery
+```
+
+### DashMap blocker + follow-up path
+
+Three options for covering the DashMap-heavy cores:
+
+- **Option A: DashMap loom shim (~2-3 weeks).** Implement a `loom_sync::DashMap` that models concurrent access via per-shard loom `Mutex`es. High upfront cost; once it exists, every DashMap-using core becomes loom-testable. The shim is also usable by the compute-surface cores (orchestrator, source/target handlers) which also depend on DashMap.
+- **Option B: Extract atomics-only sub-structs (~1 week per core).** Pull the correctness-bearing logic out of each core into a DashMap-free inner struct. This is a production-code refactor; benefit extends beyond loom (the extracted logic becomes unit-testable, clippy-visible in isolation, etc.). Risk: changes the shape of the API.
+- **Option C: Skip the DashMap-heavy cores and rely on Stage 3 (failure-injection) + Stage 4 (DST) to catch what loom would.** Cheapest but leaves the memory-ordering correctness claim weaker — Stage 4 DST finds lost updates probabilistically, not exhaustively.
+
+**Recommendation:** Option A if Stage 2 rigor matters beyond what Stage 4 buys. Option C if the team is moving toward DST anyway — the bug class loom catches (exhaustive interleaving verification) is a subset of what DST eventually covers at higher cost, so double-investing has diminishing returns.
 
 **What loom catches that stress tests don't:**
 
@@ -120,9 +164,11 @@ cargo +nightly fuzz list
 - Missing publication barriers (loom surfaces torn reads that hardware caches happened to hide).
 - Lock-ordering deadlocks that only occur under specific interleavings.
 
-**ROI rationale.** The barrier-retrofit pass this session found that 7 concurrency tests weren't actually racing under default scheduler behavior — a silent false-green. Loom makes the "are we actually exploring interleavings?" question moot: it explores all of them. Atomics-heavy code that passes loom has a much stronger correctness claim than code that passes `cargo test --release`.
+**Exit criterion (revised).**
 
-**Exit criterion.** One loom harness per core, covering both main-path and recovery-path paths. Runs in < 10 minutes total so it can be part of the default test suite, not just nightly.
+- Pattern-level models for every concurrency pattern the production cores rely on, landed in `tests/loom_models.rs`.
+- Runs under `RUSTFLAGS="--cfg loom"` in < 30 s total so it can be part of the default CI matrix.
+- Full-core coverage (AuthGuard, TokenCache, CapabilityIndex, etc.) deferred to a follow-up PR that commits to Option A, B, or C above.
 
 ---
 
