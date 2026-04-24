@@ -1,0 +1,23 @@
+README.md
+  271d48f296711bef 658-664,670-672,681,683
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "e16ec8a7d828858dd9e8238c9aa228f2aec1da53",
+  "prompts": {
+    "271d48f296711bef": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b1a64117-8944-4fa8-a903-7ca28c9099d0",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 12,
+      "total_deletions": 12,
+      "accepted_lines": 12,
+      "overriden_lines": 0
+    }
+  }
+}
