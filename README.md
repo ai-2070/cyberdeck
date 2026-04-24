@@ -588,18 +588,18 @@ Pool contention (thread-local acquire/release):
 
 | SDK | Method | Throughput | Latency |
 |-----|--------|------------|---------|
-| Go | IngestRaw (9B) | **4.01M/sec** | 249 ns |
-| Go | Batch (1000) | **4.77M/sec** | 210 ns/event |
-| Python | ingest_raw (9B) | **6.16M/sec** | 0.16 us |
-| Python | Batch (1000) | **6.80M/sec** | 0.15 us |
-| Node.js | pushBatch | **4.72M/sec** | 0.21 us |
-| Node.js | push (single) | **3.83M/sec** | 0.26 us |
-| Bun | pushBatch | **5.07M/sec** | 0.20 us |
-| Bun | push (single) | **3.95M/sec** | 0.25 us |
+| Go | IngestRaw (9B) | **4.15M/sec** | 241 ns |
+| Go | Batch (1000) | **4.83M/sec** | 207 ns/event |
+| Python | ingest_raw (9B) | **6.69M/sec** | 0.15 us |
+| Python | Batch (1000) | **6.86M/sec** | 0.15 us |
+| Node.js | pushBatch | **4.86M/sec** | 0.21 us |
+| Node.js | push (single) | **3.88M/sec** | 0.26 us |
+| Bun | pushBatch | **5.20M/sec** | 0.19 us |
+| Bun | push (single) | **4.07M/sec** | 0.25 us |
 
-All benchmarks re-captured 2026-04-23 on M1 Max with release-mode bindings.
+All benchmarks re-captured 2026-04-24 on M1 Max with release-mode bindings.
 
-All SDKs exceed **3.8M events/sec** even on single-event ingestion, and **4.7M+ events/sec** on batch. Go achieves zero allocations on raw ingestion. Node.js sync methods are ~40x faster than async (`push` 3.83M vs async `ingestRaw` 95K). Bun batch (5.07M) is ~7% faster than Node.js batch (4.72M) on the same `pushBatch` call. Python (via PyO3) is the fastest binding at 6.8M/sec — the GIL releases for the duration of the FFI call so per-event overhead is the bare PyO3 marshalling.
+All SDKs exceed **3.9M events/sec** even on single-event ingestion, and **4.8M+ events/sec** on batch. Go achieves zero allocations on raw ingestion. Node.js sync methods are ~38x faster than async (`push` 3.88M vs async `ingestRaw` 101K). Bun batch (5.20M) is ~7% faster than Node.js batch (4.86M) on the same `pushBatch` call. Python (via PyO3) is the fastest binding at 6.9M/sec — the GIL releases for the duration of the FFI call so per-event overhead is the bare PyO3 marshalling.
 
 ### RedEX (storage primitive)
 
