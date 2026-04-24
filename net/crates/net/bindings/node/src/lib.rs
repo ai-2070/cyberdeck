@@ -346,8 +346,11 @@ impl Net {
         if sign || !lossless {
             return false;
         }
-        let raw =
-            RawEvent::from_bytes_with_hash(bytes::Bytes::copy_from_slice(data.as_ref()), value);
+        // Zero-copy: the `Bytes` owns the `Buffer`, which holds the
+        // napi_ref keeping the V8 ArrayBuffer alive. napi-rs schedules
+        // the ref release on the env thread when `Bytes` (and thus
+        // `Buffer`) drops, so the bus may hold the event indefinitely.
+        let raw = RawEvent::from_bytes_with_hash(bytes::Bytes::from_owner(data), value);
         bus.ingest_raw(raw).is_ok()
     }
 
@@ -363,7 +366,7 @@ impl Net {
             None => return false,
         };
 
-        let raw = RawEvent::from_bytes(bytes::Bytes::copy_from_slice(data.as_ref()));
+        let raw = RawEvent::from_bytes(bytes::Bytes::from_owner(data));
         bus.ingest_raw(raw).is_ok()
     }
 
@@ -379,8 +382,8 @@ impl Net {
         };
 
         let raw_events: Vec<RawEvent> = events
-            .iter()
-            .map(|b| RawEvent::from_bytes(bytes::Bytes::copy_from_slice(b.as_ref())))
+            .into_iter()
+            .map(|b| RawEvent::from_bytes(bytes::Bytes::from_owner(b)))
             .collect();
         bus.ingest_raw_batch(raw_events) as u32
     }

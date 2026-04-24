@@ -278,10 +278,12 @@ impl RedexFile {
     /// seqs as `first + 0, first + 1, ...`.
     #[napi]
     pub fn append_batch(&self, payloads: Vec<Buffer>) -> Result<BigInt> {
-        let bytes: Vec<Bytes> = payloads
-            .into_iter()
-            .map(|b| Bytes::copy_from_slice(b.as_ref()))
-            .collect();
+        // Zero-copy: each `Bytes` takes ownership of its `Buffer`,
+        // which holds a napi_ref keeping the V8 ArrayBuffer alive
+        // for the lifetime of the `Bytes`. Avoids the per-element
+        // `copy_from_slice` that previously turned this into an
+        // O(total_bytes) allocation per batch.
+        let bytes: Vec<Bytes> = payloads.into_iter().map(Bytes::from_owner).collect();
         let seq = self
             .inner
             .append_batch(&bytes)

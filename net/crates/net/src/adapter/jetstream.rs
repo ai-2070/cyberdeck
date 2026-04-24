@@ -88,20 +88,30 @@ impl JetStreamAdapter {
     }
 
     /// Deserialize a stored event.
+    ///
+    /// Uses `RawValue` to slice the `r` field directly out of the
+    /// stored bytes — no full JSON tree allocation, no re-serialize.
     fn deserialize_event(seq: u64, data: &[u8]) -> Result<StoredEvent, AdapterError> {
-        let value: serde_json::Value =
-            serde_json::from_slice(data).map_err(|e| AdapterError::Serialization(e.to_string()))?;
+        #[derive(serde::Deserialize)]
+        struct StoredFormat<'a> {
+            #[serde(borrow)]
+            r: &'a serde_json::value::RawValue,
+            #[serde(default)]
+            t: u64,
+            #[serde(default)]
+            s: u16,
+        }
 
-        let raw = value.get("r").cloned().unwrap_or(serde_json::Value::Null);
-        let raw_bytes = Bytes::from(serde_json::to_vec(&raw).unwrap_or_default());
-        let insertion_ts = value.get("t").and_then(|v| v.as_u64()).unwrap_or(0);
-        let shard_id = value.get("s").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+        let parsed: StoredFormat = serde_json::from_slice(data)
+            .map_err(|e| AdapterError::Serialization(e.to_string()))?;
+
+        let raw_bytes = Bytes::copy_from_slice(parsed.r.get().as_bytes());
 
         Ok(StoredEvent::new(
             seq.to_string(),
             raw_bytes,
-            insertion_ts,
-            shard_id,
+            parsed.t,
+            parsed.s,
         ))
     }
 
@@ -281,7 +291,8 @@ impl Adapter for JetStreamAdapter {
         from_id: Option<&str>,
         limit: usize,
     ) -> Result<ShardPollResult, AdapterError> {
-        let mut stream = self.get_or_create_stream(shard_id).await?;
+        let stream = self.get_or_create_stream(shard_id).await?;
+        let subject = self.subject(shard_id);
 
         // Parse the cursor (sequence number)
         let start_seq = from_id
@@ -292,54 +303,43 @@ impl Adapter for JetStreamAdapter {
         // Fetch one extra to detect has_more
         let fetch_limit = limit + 1;
 
-        // Get messages directly from the stream
-        let mut events = Vec::with_capacity(limit);
+        let mut events = Vec::with_capacity(fetch_limit);
         let mut current_seq = start_seq;
 
-        // Use the stream's actual last sequence to bound the search,
-        // rather than an arbitrary multiplier that can miss events in
-        // streams with large gaps (deletions, compaction).
-        let max_seq = match stream.info().await {
-            Ok(info) => info.state.last_sequence,
-            Err(_) => start_seq.saturating_add(fetch_limit as u64 * 10),
-        };
-
-        // Use direct get to fetch messages by sequence
-        // Use while loop so gaps don't consume our fetch count
+        // `direct_get_next_for_subject` skips gaps server-side: it
+        // returns the next available message at or after `current_seq`
+        // in a single RPC, regardless of how many sequences have been
+        // deleted/compacted between. That removes both the per-gap
+        // RTT walk that `direct_get(seq)` required AND the
+        // `stream.info()` pre-check we used to bound it.
         while events.len() < fetch_limit {
-            if current_seq > max_seq {
-                // Searched too far without finding enough events
-                break;
-            }
-
-            match stream.direct_get(current_seq).await {
+            match stream
+                .direct_get_next_for_subject(subject.clone(), Some(current_seq))
+                .await
+            {
                 Ok(msg) => {
-                    match Self::deserialize_event(current_seq, &msg.payload) {
+                    let seq = msg.sequence;
+                    match Self::deserialize_event(seq, &msg.payload) {
                         Ok(event) => events.push(event),
                         Err(e) => {
                             tracing::warn!(
                                 stream = %self.stream_name(shard_id),
-                                seq = current_seq,
+                                seq,
                                 error = %e,
                                 "Failed to deserialize event, skipping"
                             );
                         }
                     }
-                    current_seq += 1;
+                    current_seq = seq.saturating_add(1);
                 }
                 Err(e) => {
                     use async_nats::jetstream::stream::DirectGetErrorKind;
                     match e.kind() {
-                        DirectGetErrorKind::NotFound => {
-                            // Try next sequence (there might be gaps due to deletions)
-                            current_seq += 1;
-                        }
-                        DirectGetErrorKind::InvalidSubject => {
-                            // No more messages or invalid request
-                            break;
-                        }
+                        // No more messages at or after `current_seq` —
+                        // we've reached the tail.
+                        DirectGetErrorKind::NotFound
+                        | DirectGetErrorKind::InvalidSubject => break,
                         _ => {
-                            // For other errors, check if we have any events
                             if events.is_empty() {
                                 return Err(AdapterError::Transient(e.to_string()));
                             }
