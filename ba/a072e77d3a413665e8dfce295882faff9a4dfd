@@ -1,0 +1,25 @@
+net/crates/net/sdk-ts/src/stream.ts
+  87bb90c35fad4179 8-15,77-85
+net/crates/net/sdk-ts/test/stream.bench.ts
+  87bb90c35fad4179 1-210
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "baa072e77d3a413665e8dfce295882faff9a4dfd",
+  "prompts": {
+    "87bb90c35fad4179": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6cc25025-bc7f-4f77-9983-0178e2603a6e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 570,
+      "total_deletions": 21,
+      "accepted_lines": 227,
+      "overriden_lines": 0
+    }
+  }
+}
