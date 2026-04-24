@@ -1,0 +1,29 @@
+net/crates/net/bindings/node/src/lib.rs
+  87bb90c35fad4179 349-353,369,385-386
+net/crates/net/src/adapter/jetstream.rs
+  87bb90c35fad4179 91-93,95-106,108,113-114,294-295,306,309-314,316-319,321-322,327,333,338-341
+net/crates/net/Cargo.toml
+  87bb90c35fad4179 73
+net/crates/net/bindings/node/src/cortex.rs
+  87bb90c35fad4179 281-286
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "da86ab3cb89efd08dc4eee2bf44bf99481e3eabd",
+  "prompts": {
+    "87bb90c35fad4179": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6cc25025-bc7f-4f77-9983-0178e2603a6e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 5732,
+      "total_deletions": 53,
+      "accepted_lines": 54,
+      "overriden_lines": 0
+    }
+  }
+}
