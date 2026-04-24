@@ -5,7 +5,14 @@
 import type { Net as NapiNet } from '@ai2070/net';
 import type { StoredEvent, SubscribeOpts } from './types';
 
-const DEFAULT_POLL_INTERVAL = 1;
+// Starting backoff for idle polls and the inter-poll wait on
+// partial-batch responses. `1` would have us re-issue an FFI poll
+// hundreds of times per second on a near-drained stream that returns
+// 1-2 events per call; `5` keeps us at a 200/s ceiling on that path
+// while still feeling instant. Saturated streams (full `limit`
+// batches) skip the sleep entirely and continue to drain at full
+// speed.
+const DEFAULT_POLL_INTERVAL = 5;
 const DEFAULT_MAX_BACKOFF = 100;
 const DEFAULT_LIMIT = 100;
 
@@ -66,6 +73,15 @@ export class EventStream implements AsyncIterable<StoredEvent> {
             insertionTs: event.insertionTs,
             shardId: event.shardId,
           };
+        }
+
+        // Partial-batch sleep: a poll that returned fewer than `limit`
+        // events has drained (or nearly drained) the bus; re-issuing
+        // immediately would just spam FFI calls for trickle streams.
+        // A full-batch response means more events are queued, so we
+        // skip the sleep and loop tight to keep up.
+        if (response.events.length < this.opts.limit) {
+          await sleep(this.opts.pollIntervalMs);
         }
       } else {
         // Exponential backoff when idle.
