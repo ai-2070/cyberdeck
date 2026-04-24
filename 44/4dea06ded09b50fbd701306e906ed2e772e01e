@@ -1,0 +1,23 @@
+net/crates/net/bindings/go/net/cortex.go
+  87bb90c35fad4179 291-295,297,362,365,570,572,615,617,643,646,877,879,911,913,939,942
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "444dea06ded09b50fbd701306e906ed2e772e01e",
+  "prompts": {
+    "87bb90c35fad4179": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6cc25025-bc7f-4f77-9983-0178e2603a6e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 20,
+      "total_deletions": 16,
+      "accepted_lines": 20,
+      "overriden_lines": 0
+    }
+  }
+}
