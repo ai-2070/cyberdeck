@@ -23,6 +23,11 @@ use crate::consumer::filter::Filter;
 use crate::error::{AdapterError, ConsumerError};
 use crate::event::StoredEvent;
 
+/// Backing type for per-shard cursor positions. `Arc<str>` makes
+/// cursor clones (and internal copies during poll merging) cheap by
+/// reference-counting the id bytes rather than copying them.
+type CursorPos = Arc<str>;
+
 /// Ordering mode for consumed events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Ordering {
@@ -37,8 +42,12 @@ pub enum Ordering {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompositeCursor {
     /// Per-shard positions (shard_id -> stream_id).
+    ///
+    /// Stored as `Arc<str>` so internal copies (e.g. `cursor.clone()`
+    /// inside the poll merger) bump a refcount instead of duplicating
+    /// each id's bytes.
     #[serde(flatten)]
-    pub positions: HashMap<u16, String>,
+    pub positions: HashMap<u16, CursorPos>,
 }
 
 impl CompositeCursor {
@@ -59,7 +68,7 @@ impl CompositeCursor {
             .decode(s)
             .map_err(|e| ConsumerError::InvalidCursor(e.to_string()))?;
 
-        let positions: HashMap<u16, String> = serde_json::from_slice(&bytes)
+        let positions: HashMap<u16, CursorPos> = serde_json::from_slice(&bytes)
             .map_err(|e| ConsumerError::InvalidCursor(e.to_string()))?;
 
         Ok(Self { positions })
@@ -67,18 +76,24 @@ impl CompositeCursor {
 
     /// Get the position for a specific shard.
     pub fn get(&self, shard_id: u16) -> Option<&str> {
-        self.positions.get(&shard_id).map(|s| s.as_str())
+        self.positions.get(&shard_id).map(|s| s.as_ref())
     }
 
     /// Set the position for a specific shard.
-    pub fn set(&mut self, shard_id: u16, position: String) {
-        self.positions.insert(shard_id, position);
+    ///
+    /// Accepts anything that converts into an `Arc<str>` — notably
+    /// `String`, `&str`, and `Arc<str>` itself. This lets adapters
+    /// hand us a freshly-allocated `String` (becomes a single boxed
+    /// allocation) without forcing a second copy for the cursor.
+    pub fn set(&mut self, shard_id: u16, position: impl Into<CursorPos>) {
+        self.positions.insert(shard_id, position.into());
     }
 
     /// Update positions from consumed events.
     pub fn update_from_events(&mut self, events: &[StoredEvent]) {
         for event in events {
-            self.positions.insert(event.shard_id, event.id.clone());
+            self.positions
+                .insert(event.shard_id, Arc::from(event.id.as_str()));
         }
     }
 }
@@ -229,7 +244,14 @@ impl PollMerger {
             .sum();
         let mut all_events = Vec::with_capacity(total_events);
         let mut any_has_more = false;
-        let mut new_cursor = cursor.clone();
+        // `new_cursor` (fetched-position tracking) is only consulted on the
+        // filter path — building it for unfiltered polls wastes a full
+        // HashMap clone plus a `set()` per shard every poll.
+        let mut new_cursor = if request.filter.is_some() {
+            Some(cursor.clone())
+        } else {
+            None
+        };
 
         for (shard_id, result) in shard_results {
             match result {
@@ -241,8 +263,8 @@ impl PollMerger {
                         next_id,
                         has_more,
                     } = shard_result;
-                    if let Some(next_id) = next_id {
-                        new_cursor.set(shard_id, next_id);
+                    if let (Some(nc), Some(next_id)) = (new_cursor.as_mut(), next_id) {
+                        nc.set(shard_id, next_id);
                     }
                     any_has_more |= has_more;
                     all_events.extend(events);
@@ -264,11 +286,32 @@ impl PollMerger {
         // still advance past those events. Without this, filtered-out events
         // would be re-fetched on every subsequent poll, causing an infinite loop.
         if let Some(filter) = &request.filter {
-            // `parsed()` caches the JSON parse on the event itself, so a
-            // subsequent serialize of surviving events (e.g. the
-            // `Serialize` impl on the wire) reuses this result instead of
-            // re-parsing.
-            all_events.retain(|e| e.parsed().map(|v| filter.matches(v)).unwrap_or(false));
+            // Lazy-parse optimization: when we don't need to sort, stop
+            // parsing & matching once we have `limit + 1` survivors — the
+            // extra one signals `has_more`. Saves parse work on heavily
+            // over-fetched polls where most results would be truncated.
+            // Sorting requires seeing every event first, so the filtered
+            // sort path must fully scan.
+            if request.ordering == Ordering::None {
+                let target = request.limit.saturating_add(1);
+                let mut kept: Vec<StoredEvent> = Vec::with_capacity(target.min(all_events.len()));
+                for event in all_events.drain(..) {
+                    if kept.len() >= target {
+                        // Stop parsing further — we already know we have
+                        // more matches than the caller asked for.
+                        break;
+                    }
+                    // `parsed()` caches the JSON parse on the event itself,
+                    // so any subsequent serialize of surviving events reuses
+                    // this result instead of re-parsing.
+                    if event.parsed().map(|v| filter.matches(v)).unwrap_or(false) {
+                        kept.push(event);
+                    }
+                }
+                all_events = kept;
+            } else {
+                all_events.retain(|e| e.parsed().map(|v| filter.matches(v)).unwrap_or(false));
+            }
         }
 
         // Apply ordering
@@ -308,10 +351,14 @@ impl PollMerger {
         // no returned events (due to limit truncation) don't skip ahead.
         // When filtering, move `new_cursor` (no longer needed separately).
         // Otherwise clone the original `cursor` since it is compared below.
-        let mut final_cursor = if request.filter.is_some() {
-            new_cursor
-        } else {
-            cursor.clone()
+        let mut final_cursor = match new_cursor {
+            // Filter path: `new_cursor` tracks fetched positions; reuse it
+            // so shards whose events were entirely filtered out still
+            // advance past them.
+            Some(nc) => nc,
+            // Non-filter path: start from the original `cursor` so shards
+            // with no returned events don't skip ahead.
+            None => cursor.clone(),
         };
         // Only the last returned event per shard matters for the cursor, so
         // iterate in reverse and skip shards already seen. This reduces id

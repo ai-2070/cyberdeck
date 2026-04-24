@@ -500,8 +500,7 @@ impl ShardManager {
         // cheaper than a HashMap for the common case of a small
         // shard count.
         let mut groups: Vec<Vec<Bytes>> = (0..table.shards.len()).map(|_| Vec::new()).collect();
-        let mut group_ids: Vec<u16> = Vec::with_capacity(groups.len());
-        group_ids.resize(groups.len(), 0);
+        let mut group_ids: Vec<u16> = vec![0; groups.len()];
 
         for event in events {
             let shard_id = self.select_shard_by_hash(event.hash());
