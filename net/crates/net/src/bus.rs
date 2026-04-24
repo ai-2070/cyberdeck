@@ -653,30 +653,32 @@ async fn dispatch_batch(
     timeout: Duration,
     retries: u32,
 ) -> bool {
-    for attempt in 0..=retries {
-        let is_last = attempt == retries;
-        let batch_clone = batch.clone();
-
-        match tokio::time::timeout(timeout, adapter.on_batch(batch_clone)).await {
+    // Retry attempts clone the batch; the final attempt moves it, saving
+    // one clone per dispatch (the common path is retries == 0).
+    for attempt in 0..retries {
+        match tokio::time::timeout(timeout, adapter.on_batch(batch.clone())).await {
             Ok(Ok(())) => return true,
             Ok(Err(e)) => {
-                if is_last {
-                    tracing::error!(shard_id, error = %e, "Failed to dispatch batch, dropping");
-                    return false;
-                }
                 tracing::warn!(shard_id, error = %e, attempt, "Batch dispatch failed, retrying");
             }
             Err(_) => {
-                if is_last {
-                    tracing::error!(shard_id, "Adapter on_batch timed out, dropping batch");
-                    return false;
-                }
                 tracing::warn!(shard_id, attempt, "Adapter on_batch timed out, retrying");
             }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    false
+
+    match tokio::time::timeout(timeout, adapter.on_batch(batch)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            tracing::error!(shard_id, error = %e, "Failed to dispatch batch, dropping");
+            false
+        }
+        Err(_) => {
+            tracing::error!(shard_id, "Adapter on_batch timed out, dropping batch");
+            false
+        }
+    }
 }
 
 struct BatchWorkerParams {

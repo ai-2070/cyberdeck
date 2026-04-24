@@ -221,8 +221,13 @@ impl PollMerger {
         let shard_results: Vec<(u16, Result<ShardPollResult, AdapterError>)> =
             futures::future::join_all(poll_futures).await;
 
-        // Collect results, tracking errors
-        let mut all_events = Vec::new();
+        // Collect results, tracking errors. Pre-allocate to the exact total
+        // event count so extend() below never reallocates.
+        let total_events: usize = shard_results
+            .iter()
+            .filter_map(|(_, r)| r.as_ref().ok().map(|sr| sr.events.len()))
+            .sum();
+        let mut all_events = Vec::with_capacity(total_events);
         let mut any_has_more = false;
         let mut new_cursor = cursor.clone();
 
@@ -291,13 +296,22 @@ impl PollMerger {
         //
         // Without filtering: start from the original `cursor` so shards with
         // no returned events (due to limit truncation) don't skip ahead.
+        // When filtering, move `new_cursor` (no longer needed separately).
+        // Otherwise clone the original `cursor` since it is compared below.
         let mut final_cursor = if request.filter.is_some() {
-            new_cursor.clone()
+            new_cursor
         } else {
             cursor.clone()
         };
-        for event in &all_events {
-            final_cursor.set(event.shard_id, event.id.clone());
+        // Only the last returned event per shard matters for the cursor, so
+        // iterate in reverse and skip shards already seen. This reduces id
+        // clones from O(all_events.len()) to O(shards.len()).
+        let mut seen_shards: std::collections::HashSet<u16> =
+            std::collections::HashSet::with_capacity(shards.len());
+        for event in all_events.iter().rev() {
+            if seen_shards.insert(event.shard_id) {
+                final_cursor.set(event.shard_id, event.id.clone());
+            }
         }
 
         let cursor_advanced = final_cursor.positions != cursor.positions;

@@ -31,7 +31,7 @@ use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
 /// Statistics for a single shard.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct ShardStats {
     /// Total events ingested.
     pub events_ingested: u64,
@@ -178,11 +178,6 @@ impl Shard {
     /// Get shard statistics.
     pub fn stats(&self) -> &ShardStats {
         &self.stats
-    }
-
-    /// Get a clone of shard statistics.
-    pub fn stats_clone(&self) -> ShardStats {
-        self.stats.clone()
     }
 
     /// Record a batch dispatch.
@@ -466,7 +461,7 @@ impl ShardManager {
         let mut total = ShardStats::default();
         let shards = self.shards.read();
         for shard_lock in shards.iter() {
-            let stats = shard_lock.lock().stats_clone();
+            let stats = *shard_lock.lock().stats();
             total.events_ingested += stats.events_ingested;
             total.events_dropped += stats.events_dropped;
             total.batches_dispatched += stats.batches_dispatched;
