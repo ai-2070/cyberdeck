@@ -1,0 +1,27 @@
+net/crates/net/src/shard/mod.rs
+  98bf9cd8fdc02ab8 503
+net/crates/net/src/consumer/merge.rs
+  98bf9cd8fdc02ab8 26-30,45-48,50,71,79,83-89,95-96,247-254,266-267,289-314,354-361
+net/crates/net/Cargo.toml
+  98bf9cd8fdc02ab8 72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "1140492339a98588d71cd0f294adc27554b2dd03",
+  "prompts": {
+    "98bf9cd8fdc02ab8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6b60a7d5-10fb-4c01-a45b-78341d891511",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 986,
+      "accepted_lines": 114,
+      "overriden_lines": 0
+    }
+  }
+}
