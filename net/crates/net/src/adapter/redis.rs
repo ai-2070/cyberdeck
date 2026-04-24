@@ -22,6 +22,7 @@ use bytes::Bytes;
 use redis::aio::ConnectionManager;
 use redis::{Client, RedisError, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::adapter::{Adapter, ShardPollResult};
 use crate::config::RedisAdapterConfig;
@@ -38,6 +39,11 @@ pub struct RedisAdapter {
     config: RedisAdapterConfig,
     /// Whether the adapter has been initialized.
     initialized: AtomicBool,
+    /// Interned stream keys indexed by shard id. Avoids rebuilding
+    /// `"{prefix}:shard:{n}"` on every `on_batch` / `poll_shard`.
+    /// `RwLock<Vec<_>>` because shards can be added at runtime via
+    /// dynamic scaling; growth is rare and amortized.
+    stream_keys: parking_lot::RwLock<Vec<Arc<str>>>,
 }
 
 impl RedisAdapter {
@@ -51,13 +57,28 @@ impl RedisAdapter {
             conn: None,
             config,
             initialized: AtomicBool::new(false),
+            stream_keys: parking_lot::RwLock::new(Vec::new()),
         })
     }
 
-    /// Get the stream key for a shard.
+    /// Get the stream key for a shard, populating the cache on first
+    /// access for that shard id.
     #[inline]
-    fn stream_key(&self, shard_id: u16) -> String {
-        format!("{}:shard:{}", self.config.prefix, shard_id)
+    fn stream_key(&self, shard_id: u16) -> Arc<str> {
+        let idx = shard_id as usize;
+        // Fast path: cache hit under read lock.
+        if let Some(k) = self.stream_keys.read().get(idx) {
+            return k.clone();
+        }
+        // Slow path: lazily fill the cache up to and including `idx`.
+        let mut cache = self.stream_keys.write();
+        while cache.len() <= idx {
+            let id = cache.len();
+            cache.push(Arc::from(
+                format!("{}:shard:{}", self.config.prefix, id).as_str(),
+            ));
+        }
+        cache[idx].clone()
     }
 
     /// Serialize an event for storage.
@@ -165,7 +186,7 @@ impl Adapter for RedisAdapter {
         for data in &serialized {
             // Build XADD command
             let mut cmd = redis::cmd("XADD");
-            cmd.arg(&stream_key);
+            cmd.arg(&*stream_key);
 
             // Add MAXLEN if configured
             if let Some(max_len) = self.config.max_stream_len {
@@ -233,7 +254,7 @@ impl Adapter for RedisAdapter {
         // XRANGE key start + COUNT limit
         // Returns array of [id, [field, value, field, value, ...]]
         let results: Value = redis::cmd("XRANGE")
-            .arg(&stream_key)
+            .arg(&*stream_key)
             .arg(&start)
             .arg("+") // To end
             .arg("COUNT")
@@ -384,7 +405,10 @@ mod tests {
         let config = RedisAdapterConfig::new("redis://localhost:6379").with_prefix("myapp");
         let adapter = RedisAdapter::new(config).unwrap();
 
-        assert_eq!(adapter.stream_key(0), "myapp:shard:0");
-        assert_eq!(adapter.stream_key(15), "myapp:shard:15");
+        assert_eq!(&*adapter.stream_key(0), "myapp:shard:0");
+        assert_eq!(&*adapter.stream_key(15), "myapp:shard:15");
+        // Repeat access should hit the interned cache rather than
+        // re-running `format!`.
+        assert_eq!(&*adapter.stream_key(0), "myapp:shard:0");
     }
 }
