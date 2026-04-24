@@ -266,7 +266,11 @@ impl PollMerger {
         // still advance past those events. Without this, filtered-out events
         // would be re-fetched on every subsequent poll, causing an infinite loop.
         if let Some(filter) = &request.filter {
-            all_events.retain(|e| e.parse().map(|v| filter.matches(&v)).unwrap_or(false));
+            // `parsed()` caches the JSON parse on the event itself, so a
+            // subsequent serialize of surviving events (e.g. the
+            // `Serialize` impl on the wire) reuses this result instead of
+            // re-parsing.
+            all_events.retain(|e| e.parsed().map(|v| filter.matches(v)).unwrap_or(false));
         }
 
         // Apply ordering
