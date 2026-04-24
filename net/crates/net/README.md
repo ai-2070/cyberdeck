@@ -185,24 +185,24 @@ Benchmarked on Apple M1 Max, macOS.
 |-------|-----------|---------|------------|
 | **Core** | Event ingestion | < 1 us p99 | 10M+ events/sec sustained |
 | **Net** | Header serialize | 1.98 ns | 505M ops/sec |
-| **Net** | Packet build (50 events) | 8.20 us | -- |
-| **Net** | Encryption (ChaCha20) | 486 ns (64B) | -- |
+| **Net** | Packet build (50 events) | 8.22 us | -- |
+| **Net** | Encryption (ChaCha20) | 483 ns (64B) | -- |
 | **Routing** | Header roundtrip | 0.94 ns | 1.07G ops/sec |
-| **Routing** | Lookup hit | 38.3 ns | 26.1M ops/sec |
-| **Routing** | Decision pipeline | 37.8 ns | 26.4M ops/sec |
-| **Forwarding** | Per-hop (64B) | 29.8 ns | -- |
-| **Forwarding** | 5-hop chain | 299 ns | 3.35M ops/sec |
-| **Swarm** | Pingwave roundtrip | 0.93 ns | 1.07G ops/sec |
-| **Swarm** | Graph (5,000 nodes) | 223 us | 22.4M/sec |
-| **Failure** | Heartbeat | 29.0 ns | 34.5M ops/sec |
-| **Failure** | Full recovery cycle | 303 ns | 3.30M ops/sec |
+| **Routing** | Lookup hit | 37.8 ns | 26.5M ops/sec |
+| **Routing** | Decision pipeline | 39.6 ns | 25.3M ops/sec |
+| **Forwarding** | Per-hop (64B) | 29.6 ns | -- |
+| **Forwarding** | 5-hop chain | 276 ns | 3.62M ops/sec |
+| **Swarm** | Pingwave roundtrip | 0.96 ns | 1.05G ops/sec |
+| **Swarm** | Graph (5,000 nodes) | 264 us | 18.9M/sec |
+| **Failure** | Heartbeat | 29.3 ns | 34.1M ops/sec |
+| **Failure** | Full recovery cycle | 307 ns | 3.26M ops/sec |
 | **Capability** | Filter (single tag) | 9.99 ns | 100M ops/sec |
 | **Capability** | GPU check | 0.31 ns | 3.20G ops/sec |
 | **Auth** | Bloom filter check | ~20 ns | 49.8M ops/sec |
-| **SDK** | Go raw ingest | 249 ns | 4.01M/sec |
-| **SDK** | Python batch ingest | 0.15 us | 6.80M/sec |
-| **SDK** | Node.js push batch | 0.21 us | 4.72M/sec |
-| **SDK** | Bun push batch | 0.20 us | 5.07M/sec |
+| **SDK** | Go raw ingest | 241 ns | 4.15M/sec |
+| **SDK** | Python batch ingest | 0.15 us | 6.86M/sec |
+| **SDK** | Node.js push batch | 0.21 us | 4.86M/sec |
+| **SDK** | Bun push batch | 0.19 us | 5.20M/sec |
 | **RedEX** | Append inline (≤8 B) | 47 ns | 21.3M ops/sec |
 | **RedEX** | Append heap (32 B) | 54 ns | 18.6M ops/sec |
 | **RedEX** | Append heap (256 B) | 97 ns | 10.3M ops/sec |
@@ -211,24 +211,24 @@ Benchmarked on Apple M1 Max, macOS.
 | **RedEX** | Append disk (32 B, `redex-disk`) | 3.11 us | 321k ops/sec |
 | **RedEX** | Append disk (1 KB, `redex-disk`) | 6.42 us | 156k ops/sec |
 | **RedEX** | Tail latency (append → subscriber) | 138 ns | -- |
-| **CortEX** | `tasks.create` ingest | 270 ns | 3.71M ops/sec |
+| **CortEX** | `tasks.create` ingest | 266 ns | 3.77M ops/sec |
 | **CortEX** | `memories.store` ingest | 404 ns | 2.47M ops/sec |
-| **CortEX** | Fold round-trip (`create` + `waitForSeq`) | 5.61 us | 178k ops/sec |
-| **CortEX** | `find_unique` (state lookup) | 8.92 ns | 112M ops/sec |
-| **CortEX** | `find_many` @ 1 K tasks (status filter) | 7.90 us | 126M elements/sec |
-| **CortEX** | `find_many` @ 10 K tasks | 172 us | 58.3M elements/sec |
-| **CortEX** | `count_where` @ 10 K tasks | 23.3 us | 429M elements/sec |
-| **CortEX** | `find_many` @ 1 K memories (tag filter) | 49.3 us | 20.3M elements/sec |
-| **CortEX** | Tasks snapshot encode @ 10 K | 363 us | -- |
-| **CortEX** | Memories snapshot encode @ 10 K | 669 us | -- |
+| **CortEX** | Fold round-trip (`create` + `waitForSeq`) | 5.62 us | 178k ops/sec |
+| **CortEX** | `find_unique` (state lookup) | 8.98 ns | 111M ops/sec |
+| **CortEX** | `find_many` @ 1 K tasks (status filter) | 7.51 us | 133M elements/sec |
+| **CortEX** | `find_many` @ 10 K tasks | 113 us | 88.6M elements/sec |
+| **CortEX** | `count_where` @ 10 K tasks | 38.2 us | 262M elements/sec |
+| **CortEX** | `find_many` @ 1 K memories (tag filter) | 49.0 us | 20.4M elements/sec |
+| **CortEX** | Tasks snapshot encode @ 10 K | 329 us | -- |
+| **CortEX** | Memories snapshot encode @ 10 K | 714 us | -- |
 | **NetDB** | `NetDb::open` (both models) | 6.30 us | 159k ops/sec |
 | **NetDB** | Bundle encode @ 1 K (48 KB output) | 22.2 us | -- |
 | **NetDB** | Bundle decode @ 1 K | 26.5 us | -- |
-| **NetDB** | Bundle decode @ 10 K | 309 us | -- |
+| **NetDB** | Bundle decode @ 10 K | 281 us | -- |
 
-Benchmarks accurate as of 2026-04-23. Core / Net / Routing / Forwarding / Swarm / Failure / Capability / CortEX / NetDB rows re-captured 2026-04-23; RedEX rows captured 2026-04-19 via `cargo bench --bench redex --features "redex redex-disk"` and `cargo bench --bench cortex --features "cortex netdb"` at 20 samples × 3 s measurement. CortEX / NetDB numbers are on **postcard** serialization (varint-encoded, no-std friendly) — the CortEX adapter serialized state with `bincode` 1.x until the migration in v0.5; callers persisting pre-migration snapshot bytes must re-snapshot on upgrade. The RedEX table splits the storage primitive (inline vs heap, memory vs disk, tail latency) from the end-to-end CortEX path (ingest → fold → query → snapshot) — CortEX numbers include RedEX underneath, since that's the layering real workloads see.
+Benchmarks accurate as of 2026-04-24. Core / Net / Routing / Forwarding / Swarm / Failure / Capability / CortEX / NetDB rows re-captured 2026-04-24; RedEX rows captured 2026-04-19 via `cargo bench --bench redex --features "redex redex-disk"` and `cargo bench --bench cortex --features "cortex netdb"` at 20 samples × 3 s measurement. CortEX / NetDB numbers are on **postcard** serialization (varint-encoded, no-std friendly) — the CortEX adapter serialized state with `bincode` 1.x until the migration in v0.5; callers persisting pre-migration snapshot bytes must re-snapshot on upgrade. The RedEX table splits the storage primitive (inline vs heap, memory vs disk, tail latency) from the end-to-end CortEX path (ingest → fold → query → snapshot) — CortEX numbers include RedEX underneath, since that's the layering real workloads see.
 
-Thread-local packet pools scale to **18x contention advantage** over shared pools at 32 threads (M1: 67.6M vs 3.77M ops/sec). All SDKs exceed **2M events/sec** with optimal ingestion patterns. CortEX ingest on a single `TasksAdapter` sustains **~3.7M events/sec** before any consumer back-pressure (measured without `waitForSeq`); the full fold round-trip — append → RedEX tail → state mutation → `waitForSeq` returns — lands at **5.6 us**, so reactive watchers see an event roughly one fold tick after the writer. Query methods at 10 K state size range from **double-digit to low triple-digit microseconds** on a cold read lock, which is why NetDB ships with an always-on `find_many` + `count_where` + `exists_where` surface: even on cold state they're cheap enough to call inside a hot loop. NetDB **bundle encode/decode is 2-3x faster than the bincode era and produces bundles 60-70% smaller** — the win that matters most for cross-language snapshot transfer.
+Thread-local packet pools scale to **~21x contention advantage** over shared pools at 32 threads (M1: 75.9M vs 3.65M ops/sec; i9: 113.8M vs 6.87M ops/sec). All SDKs exceed **2M events/sec** with optimal ingestion patterns. CortEX ingest on a single `TasksAdapter` sustains **~3.8M events/sec** before any consumer back-pressure (measured without `waitForSeq`); the full fold round-trip — append → RedEX tail → state mutation → `waitForSeq` returns — lands at **5.6 us**, so reactive watchers see an event roughly one fold tick after the writer. Query methods at 10 K state size range from **~38 µs (`count_where`) to ~113 µs (`find_many`)** on a cold read lock, which is why NetDB ships with an always-on `find_many` + `count_where` + `exists_where` surface: even on cold state they're cheap enough to call inside a hot loop. NetDB **bundle encode/decode is 2-3x faster than the bincode era and produces bundles 60-70% smaller** — the win that matters most for cross-language snapshot transfer.
 
 1,146 Rust tests + 36 Node + 33 Python SDK smoke tests. ~2MB deployed binary.
 
