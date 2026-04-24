@@ -301,16 +301,13 @@ impl PollMerger {
                         // more matches than the caller asked for.
                         break;
                     }
-                    // `parsed()` caches the JSON parse on the event itself,
-                    // so any subsequent serialize of surviving events reuses
-                    // this result instead of re-parsing.
-                    if event.parsed().map(|v| filter.matches(v)).unwrap_or(false) {
+                    if event.parse().map(|v| filter.matches(&v)).unwrap_or(false) {
                         kept.push(event);
                     }
                 }
                 all_events = kept;
             } else {
-                all_events.retain(|e| e.parsed().map(|v| filter.matches(v)).unwrap_or(false));
+                all_events.retain(|e| e.parse().map(|v| filter.matches(&v)).unwrap_or(false));
             }
         }
 

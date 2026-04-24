@@ -315,10 +315,6 @@ impl Batch {
 }
 
 /// An event retrieved from storage with its backend-specific ID.
-///
-/// Carries an internal cache of the parsed JSON so that callers that
-/// both filter on and serialize the event don't pay the JSON parse
-/// cost twice.
 #[derive(Debug, Clone)]
 pub struct StoredEvent {
     /// Backend-specific identifier.
@@ -332,12 +328,6 @@ pub struct StoredEvent {
 
     /// Shard this event belongs to.
     pub shard_id: u16,
-
-    /// Memoized parse of `raw`. Shared across clones so that parsing
-    /// in one view populates the cache seen by other clones of the
-    /// same event. Intentionally not a public field — mutating `raw`
-    /// directly would leave a stale cached value.
-    parsed: std::sync::Arc<std::sync::OnceLock<JsonValue>>,
 }
 
 impl StoredEvent {
@@ -349,7 +339,6 @@ impl StoredEvent {
             raw,
             insertion_ts,
             shard_id,
-            parsed: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -358,49 +347,18 @@ impl StoredEvent {
     pub fn from_value(id: String, value: JsonValue, insertion_ts: u64, shard_id: u16) -> Self {
         let raw =
             Bytes::from(serde_json::to_vec(&value).expect("Value serialization is infallible"));
-        let parsed = std::sync::Arc::new(std::sync::OnceLock::new());
-        // Seed the cache with the value we already have — avoids the
-        // caller paying to re-parse on the first access.
-        let _ = parsed.set(value);
         Self {
             id,
             raw,
             insertion_ts,
             shard_id,
-            parsed,
         }
     }
 
     /// Parse the raw bytes into a JSON value on demand.
-    ///
-    /// Returns an owned `JsonValue`. Prefer `parsed()` if you only
-    /// need a borrow — it caches the result so subsequent calls are
-    /// free.
     #[inline]
     pub fn parse(&self) -> Result<JsonValue, serde_json::Error> {
-        if let Some(v) = self.parsed.get() {
-            return Ok(v.clone());
-        }
         serde_json::from_slice(&self.raw)
-    }
-
-    /// Parse and cache the raw bytes, returning a borrowed reference.
-    ///
-    /// Subsequent calls on this event (and its clones) return the
-    /// cached value without re-parsing. Prefer this over `parse()`
-    /// when borrowing is sufficient — e.g. filter matching, serialize.
-    pub fn parsed(&self) -> Result<&JsonValue, serde_json::Error> {
-        if let Some(v) = self.parsed.get() {
-            return Ok(v);
-        }
-        let value: JsonValue = serde_json::from_slice(&self.raw)?;
-        // `set` fails only if another thread raced and won; in that
-        // case `get()` below returns the value they stored.
-        let _ = self.parsed.set(value);
-        Ok(self
-            .parsed
-            .get()
-            .expect("parsed cache populated above or by a racing thread"))
     }
 
     /// Get the raw bytes as a string slice (for serialization).
@@ -421,13 +379,11 @@ impl Serialize for StoredEvent {
         use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("StoredEvent", 4)?;
         state.serialize_field("id", &self.id)?;
-        // Use the cached parse — re-uses any prior `parsed()` call from
-        // e.g. a filter pass, avoiding a second JSON deserialize per
-        // event on the consumer's return path.
-        let value = self
-            .parsed()
+        // Serialize raw bytes as a JSON value (parse then embed).
+        // Propagate errors rather than silently substituting null.
+        let value: JsonValue = serde_json::from_slice(&self.raw)
             .map_err(|e| serde::ser::Error::custom(format!("invalid raw JSON: {}", e)))?;
-        state.serialize_field("raw", value)?;
+        state.serialize_field("raw", &value)?;
         state.serialize_field("insertion_ts", &self.insertion_ts)?;
         state.serialize_field("shard_id", &self.shard_id)?;
         state.end()
