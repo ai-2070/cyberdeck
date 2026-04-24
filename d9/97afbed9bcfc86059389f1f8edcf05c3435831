@@ -1,0 +1,25 @@
+net/crates/net/sdk-py/src/net_sdk/channel.py
+  87bb90c35fad4179 49-52,78,102
+net/crates/net/sdk-py/src/net_sdk/stream.py
+  87bb90c35fad4179 5,8,15-22,40-41,43-46,48,51-57,70-77,88,91,96-104,107-132,137-138,161-163
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "d997afbed9bcfc86059389f1f8edcf05c3435831",
+  "prompts": {
+    "87bb90c35fad4179": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6cc25025-bc7f-4f77-9983-0178e2603a6e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 350,
+      "total_deletions": 290,
+      "accepted_lines": 83,
+      "overriden_lines": 0
+    }
+  }
+}
