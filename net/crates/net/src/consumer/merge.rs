@@ -203,15 +203,17 @@ impl PollMerger {
             .saturating_mul(over_fetch_factor)
             .min(10_000);
 
-        // Poll all shards in parallel
+        // Poll all shards in parallel. Each future borrows its start
+        // position directly from `cursor` (which outlives `join_all` below),
+        // avoiding a per-shard `String` allocation on every poll.
         let poll_futures: Vec<_> = shards
             .iter()
             .map(|&shard_id| {
                 let adapter = self.adapter.clone();
-                let from = cursor.get(shard_id).map(|s| s.to_string());
+                let from: Option<&str> = cursor.get(shard_id);
                 async move {
                     let result = adapter
-                        .poll_shard(shard_id, from.as_deref(), per_shard_limit)
+                        .poll_shard(shard_id, from, per_shard_limit)
                         .await;
                     (shard_id, result)
                 }
@@ -234,12 +236,18 @@ impl PollMerger {
         for (shard_id, result) in shard_results {
             match result {
                 Ok(shard_result) => {
-                    // Update cursor with last position from this shard
-                    if let Some(next_id) = &shard_result.next_id {
-                        new_cursor.set(shard_id, next_id.clone());
+                    // Destructure to move `next_id` out without cloning the
+                    // String that the adapter already allocated for us.
+                    let ShardPollResult {
+                        events,
+                        next_id,
+                        has_more,
+                    } = shard_result;
+                    if let Some(next_id) = next_id {
+                        new_cursor.set(shard_id, next_id);
                     }
-                    any_has_more |= shard_result.has_more;
-                    all_events.extend(shard_result.events);
+                    any_has_more |= has_more;
+                    all_events.extend(events);
                 }
                 Err(e) => {
                     tracing::warn!(

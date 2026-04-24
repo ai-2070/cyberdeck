@@ -286,9 +286,11 @@ impl ShardManager {
     /// Uses weighted selection if dynamic scaling is enabled.
     #[inline]
     pub fn select_shard(&self, event: &JsonValue) -> u16 {
-        // Use xxhash for fast, deterministic hashing
-        let bytes = event.to_string();
-        let hash = xxhash_rust::xxh3::xxh3_64(bytes.as_bytes());
+        // Use xxhash for fast, deterministic hashing. `to_vec` avoids the
+        // extra UTF-8 validation that `to_string` performs on the serialized
+        // buffer, since we only need the bytes for hashing.
+        let bytes = serde_json::to_vec(event).expect("Value serialization is infallible");
+        let hash = xxhash_rust::xxh3::xxh3_64(&bytes);
 
         if let Some(ref mapper) = self.mapper {
             // Dynamic mode: use weighted selection
