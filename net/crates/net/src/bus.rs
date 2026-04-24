@@ -425,7 +425,8 @@ impl EventBus {
 
     /// Ingest a batch of events.
     ///
-    /// This is more efficient than calling `ingest` repeatedly.
+    /// This is more efficient than calling `ingest` repeatedly: events
+    /// destined for the same shard share a single mutex acquisition.
     ///
     /// # Returns
     ///
@@ -435,16 +436,16 @@ impl EventBus {
             return 0;
         }
 
-        let mut success_count = 0;
-        for event in events {
-            if self.ingest(event).is_ok() {
-                success_count += 1;
-            }
-        }
-        success_count
+        // Convert once to `RawEvent` (pre-serializes + hashes each
+        // event) and dispatch through the grouped batch path.
+        let raw: Vec<RawEvent> = events.into_iter().map(|e| e.into_raw()).collect();
+        self.ingest_raw_batch(raw)
     }
 
     /// Ingest a batch of raw events (fastest batch ingestion).
+    ///
+    /// Groups events by their destination shard and pushes each group
+    /// under a single mutex acquisition.
     ///
     /// # Returns
     ///
@@ -454,13 +455,20 @@ impl EventBus {
             return 0;
         }
 
-        let mut success_count = 0;
-        for event in events {
-            if self.ingest_raw(event).is_ok() {
-                success_count += 1;
-            }
+        let total = events.len();
+        let success = self.shard_manager.ingest_raw_batch(events);
+        if success > 0 {
+            self.stats
+                .events_ingested
+                .fetch_add(success as u64, AtomicOrdering::Relaxed);
         }
-        success_count
+        let dropped = total.saturating_sub(success);
+        if dropped > 0 {
+            self.stats
+                .events_dropped
+                .fetch_add(dropped as u64, AtomicOrdering::Relaxed);
+        }
+        success
     }
 
     /// Poll events from the bus.
@@ -507,13 +515,7 @@ impl EventBus {
         let mut backoff = Duration::from_micros(100);
 
         loop {
-            let all_empty = self.shard_manager.shard_ids().into_iter().all(|shard_id| {
-                self.shard_manager
-                    .with_shard(shard_id, |shard| shard.is_empty())
-                    .unwrap_or(true)
-            });
-
-            if all_empty {
+            if self.shard_manager.all_shards_empty() {
                 break;
             }
             if start.elapsed() >= timeout {

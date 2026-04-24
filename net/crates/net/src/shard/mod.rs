@@ -28,9 +28,23 @@ use crate::event::{InternalEvent, RawEvent};
 use crate::timestamp::TimestampGenerator;
 
 use serde_json::Value as JsonValue;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
-/// Statistics for a single shard.
+/// Atomic counters for a single shard. Kept outside `Shard` as `Arc`s
+/// so `ShardManager::stats()` can aggregate them without locking each
+/// shard's mutex.
+#[derive(Debug, Default)]
+pub struct ShardCounters {
+    /// Total events ingested into this shard.
+    pub events_ingested: AtomicU64,
+    /// Events dropped due to backpressure.
+    pub events_dropped: AtomicU64,
+    /// Batches successfully dispatched to the adapter.
+    pub batches_dispatched: AtomicU64,
+}
+
+/// Statistics for a single shard (snapshot).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ShardStats {
     /// Total events ingested.
@@ -41,6 +55,18 @@ pub struct ShardStats {
     pub batches_dispatched: u64,
 }
 
+impl ShardCounters {
+    /// Load a consistent snapshot of the counters.
+    #[inline]
+    pub fn snapshot(&self) -> ShardStats {
+        ShardStats {
+            events_ingested: self.events_ingested.load(AtomicOrdering::Relaxed),
+            events_dropped: self.events_dropped.load(AtomicOrdering::Relaxed),
+            batches_dispatched: self.batches_dispatched.load(AtomicOrdering::Relaxed),
+        }
+    }
+}
+
 /// A single shard with its own ring buffer and timestamp generator.
 pub struct Shard {
     /// Shard identifier.
@@ -49,8 +75,9 @@ pub struct Shard {
     ring_buffer: RingBuffer<InternalEvent>,
     /// Shard-local timestamp generator (no contention).
     timestamp_gen: TimestampGenerator,
-    /// Shard statistics.
-    stats: ShardStats,
+    /// Shared atomic counters (also referenced from `ShardTable` for
+    /// lock-free aggregation).
+    counters: Arc<ShardCounters>,
     /// Optional metrics collector for dynamic scaling.
     metrics_collector: Option<Arc<ShardMetricsCollector>>,
     /// Ring buffer capacity (for metrics).
@@ -64,7 +91,7 @@ impl Shard {
             id,
             ring_buffer: RingBuffer::new(capacity),
             timestamp_gen: TimestampGenerator::new(),
-            stats: ShardStats::default(),
+            counters: Arc::new(ShardCounters::default()),
             metrics_collector: None,
             capacity,
         }
@@ -76,10 +103,16 @@ impl Shard {
             id,
             ring_buffer: RingBuffer::new(capacity),
             timestamp_gen: TimestampGenerator::new(),
-            stats: ShardStats::default(),
+            counters: Arc::new(ShardCounters::default()),
             metrics_collector: Some(metrics),
             capacity,
         }
+    }
+
+    /// Clone the atomic counter handle (for lock-free aggregation).
+    #[inline]
+    pub fn counters(&self) -> Arc<ShardCounters> {
+        self.counters.clone()
     }
 
     /// Set the metrics collector.
@@ -98,11 +131,15 @@ impl Shard {
 
         match self.ring_buffer.try_push(event) {
             Ok(()) => {
-                self.stats.events_ingested += 1;
+                self.counters
+                    .events_ingested
+                    .fetch_add(1, AtomicOrdering::Relaxed);
                 Ok(ts)
             }
             Err(_) => {
-                self.stats.events_dropped += 1;
+                self.counters
+                    .events_dropped
+                    .fetch_add(1, AtomicOrdering::Relaxed);
                 Err(IngestionError::Backpressure)
             }
         }
@@ -119,11 +156,15 @@ impl Shard {
 
         match self.ring_buffer.try_push(event) {
             Ok(()) => {
-                self.stats.events_ingested += 1;
+                self.counters
+                    .events_ingested
+                    .fetch_add(1, AtomicOrdering::Relaxed);
                 Ok(ts)
             }
             Err(_) => {
-                self.stats.events_dropped += 1;
+                self.counters
+                    .events_dropped
+                    .fetch_add(1, AtomicOrdering::Relaxed);
                 Err(IngestionError::Backpressure)
             }
         }
@@ -175,14 +216,54 @@ impl Shard {
         self.capacity
     }
 
-    /// Get shard statistics.
-    pub fn stats(&self) -> &ShardStats {
-        &self.stats
+    /// Get a snapshot of shard statistics.
+    pub fn stats(&self) -> ShardStats {
+        self.counters.snapshot()
     }
 
     /// Record a batch dispatch.
-    pub fn record_batch_dispatch(&mut self) {
-        self.stats.batches_dispatched += 1;
+    pub fn record_batch_dispatch(&self) {
+        self.counters
+            .batches_dispatched
+            .fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
+
+/// Immutable routing table: shards + index + counter handles.
+///
+/// Placed behind an `ArcSwap` on `ShardManager` so the common read
+/// path (`ingest`, `ingest_raw`, `with_shard`, `stats`) is
+/// lock-free. Rebuilt on scale up/down via RCU-style swap.
+pub struct ShardTable {
+    /// All shards, indexed by position. `Arc<Mutex<Shard>>` lets a new
+    /// table share shard handles with the previous table (cheap Arc
+    /// clones during rebuild).
+    shards: Vec<Arc<parking_lot::Mutex<Shard>>>,
+    /// Parallel vector of counter handles. Exposes stats without
+    /// locking the shard mutex.
+    counters: Vec<Arc<ShardCounters>>,
+    /// Map from shard ID to index in `shards`/`counters`.
+    shard_index: std::collections::HashMap<u16, usize>,
+}
+
+impl ShardTable {
+    fn new(shards: Vec<Shard>) -> Self {
+        let mut shard_index = std::collections::HashMap::with_capacity(shards.len());
+        let mut counters = Vec::with_capacity(shards.len());
+        let shards: Vec<_> = shards
+            .into_iter()
+            .enumerate()
+            .map(|(idx, s)| {
+                shard_index.insert(s.id, idx);
+                counters.push(s.counters());
+                Arc::new(parking_lot::Mutex::new(s))
+            })
+            .collect();
+        Self {
+            shards,
+            counters,
+            shard_index,
+        }
     }
 }
 
@@ -192,10 +273,9 @@ impl Shard {
 /// 1. Static mode (default): Fixed number of shards, simple hash-based routing
 /// 2. Dynamic mode: Shards can be added/removed based on load, weighted routing
 pub struct ShardManager {
-    /// All shards (indexed by position, not shard ID).
-    shards: parking_lot::RwLock<Vec<parking_lot::Mutex<Shard>>>,
-    /// Map from shard ID to index in shards vector.
-    shard_index: parking_lot::RwLock<std::collections::HashMap<u16, usize>>,
+    /// Routing table. Swapped atomically on scale up/down so readers
+    /// never see a partially-updated `(shards, shard_index)` pair.
+    table: arc_swap::ArcSwap<ShardTable>,
     /// Current number of active shards.
     num_shards: std::sync::atomic::AtomicU16,
     /// Backpressure mode.
@@ -204,6 +284,9 @@ pub struct ShardManager {
     ring_buffer_capacity: usize,
     /// Optional shard mapper for dynamic scaling.
     mapper: Option<Arc<ShardMapper>>,
+    /// Serializes concurrent `add_shard` / `remove_shard` rebuilds.
+    /// Not on the ingest path.
+    rebuild_lock: parking_lot::Mutex<()>,
 }
 
 impl ShardManager {
@@ -213,20 +296,17 @@ impl ShardManager {
         ring_buffer_capacity: usize,
         backpressure_mode: BackpressureMode,
     ) -> Self {
-        let shards: Vec<_> = (0..num_shards)
-            .map(|id| parking_lot::Mutex::new(Shard::new(id, ring_buffer_capacity)))
+        let shards: Vec<Shard> = (0..num_shards)
+            .map(|id| Shard::new(id, ring_buffer_capacity))
             .collect();
 
-        let shard_index: std::collections::HashMap<u16, usize> =
-            (0..num_shards).map(|id| (id, id as usize)).collect();
-
         Self {
-            shards: parking_lot::RwLock::new(shards),
-            shard_index: parking_lot::RwLock::new(shard_index),
+            table: arc_swap::ArcSwap::from_pointee(ShardTable::new(shards)),
             num_shards: std::sync::atomic::AtomicU16::new(num_shards),
             backpressure_mode,
             ring_buffer_capacity,
             mapper: None,
+            rebuild_lock: parking_lot::Mutex::new(()),
         }
     }
 
@@ -239,29 +319,22 @@ impl ShardManager {
     ) -> Result<Self, ScalingError> {
         let mapper = Arc::new(ShardMapper::new(num_shards, ring_buffer_capacity, policy)?);
 
-        let shards: Vec<_> = (0..num_shards)
+        let shards: Vec<Shard> = (0..num_shards)
             .map(|id| {
                 let metrics = mapper.metrics_collector(id).ok_or_else(|| {
                     ScalingError::InvalidPolicy(format!("no metrics collector for shard {}", id))
                 })?;
-                Ok(parking_lot::Mutex::new(Shard::with_metrics(
-                    id,
-                    ring_buffer_capacity,
-                    metrics,
-                )))
+                Ok(Shard::with_metrics(id, ring_buffer_capacity, metrics))
             })
             .collect::<Result<Vec<_>, ScalingError>>()?;
 
-        let shard_index: std::collections::HashMap<u16, usize> =
-            (0..num_shards).map(|id| (id, id as usize)).collect();
-
         Ok(Self {
-            shards: parking_lot::RwLock::new(shards),
-            shard_index: parking_lot::RwLock::new(shard_index),
+            table: arc_swap::ArcSwap::from_pointee(ShardTable::new(shards)),
             num_shards: std::sync::atomic::AtomicU16::new(num_shards),
             backpressure_mode,
             ring_buffer_capacity,
             mapper: Some(mapper),
+            rebuild_lock: parking_lot::Mutex::new(()),
         })
     }
 
@@ -317,6 +390,59 @@ impl ShardManager {
         }
     }
 
+    /// Resolve a shard ID to its table index, using the fast path in
+    /// static mode (shard_id == index).
+    #[inline]
+    fn resolve_idx(&self, table: &ShardTable, shard_id: u16) -> Option<usize> {
+        if self.mapper.is_none() {
+            Some(shard_id as usize)
+        } else {
+            table.shard_index.get(&shard_id).copied()
+        }
+    }
+
+    /// Push `raw` into `shard`, handling backpressure. Only clones the
+    /// bytes when `DropOldest` needs them for the retry path.
+    #[inline]
+    fn push_with_backpressure(
+        &self,
+        shard: &mut Shard,
+        shard_id: u16,
+        raw: Bytes,
+    ) -> Result<(u16, u64), IngestionError> {
+        match self.backpressure_mode {
+            BackpressureMode::DropOldest => match shard.try_push_raw(raw.clone()) {
+                Ok(ts) => Ok((shard_id, ts)),
+                Err(IngestionError::Backpressure) => {
+                    // The failed try_push_raw incremented events_dropped for
+                    // the *new* event, but the new event isn't actually
+                    // dropped — the oldest is. Correct the stats: undo the
+                    // spurious drop count, pop the oldest (which is the real
+                    // drop), and retry with the same ref-counted bytes.
+                    shard
+                        .counters
+                        .events_dropped
+                        .fetch_sub(1, AtomicOrdering::Relaxed);
+                    let _ = shard.try_pop();
+                    shard
+                        .counters
+                        .events_dropped
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    shard.try_push_raw(raw).map(|ts| (shard_id, ts))
+                }
+                Err(e) => Err(e),
+            },
+            BackpressureMode::Sample { .. } => match shard.try_push_raw(raw) {
+                Ok(ts) => Ok((shard_id, ts)),
+                Err(IngestionError::Backpressure) => Err(IngestionError::Sampled),
+                Err(e) => Err(e),
+            },
+            BackpressureMode::DropNewest | BackpressureMode::FailProducer => {
+                shard.try_push_raw(raw).map(|ts| (shard_id, ts))
+            }
+        }
+    }
+
     /// Ingest an event into the appropriate shard.
     pub fn ingest(&self, event: JsonValue) -> Result<(u16, u64), IngestionError> {
         // Serialize once upfront - avoids clone on retry
@@ -326,49 +452,14 @@ impl ShardManager {
         let hash = xxhash_rust::xxh3::xxh3_64(&raw);
         let shard_id = self.select_shard_by_hash(hash);
 
-        // Fast path for static mode: shard_id == index, skip HashMap lookup
-        let shards = self.shards.read();
-        let idx = if self.mapper.is_none() {
-            shard_id as usize
-        } else {
-            let shard_index = self.shard_index.read();
-            match shard_index.get(&shard_id).copied() {
-                Some(idx) => idx,
-                None => return Err(IngestionError::Backpressure),
-            }
-        };
-
-        let Some(shard_lock) = shards.get(idx) else {
-            return Err(IngestionError::Backpressure);
-        };
+        let table = self.table.load();
+        let idx = self
+            .resolve_idx(&table, shard_id)
+            .ok_or(IngestionError::Backpressure)?;
+        let shard_lock = table.shards.get(idx).ok_or(IngestionError::Backpressure)?;
 
         let mut shard = shard_lock.lock();
-
-        match shard.try_push_raw(raw.clone()) {
-            Ok(ts) => Ok((shard_id, ts)),
-            Err(IngestionError::Backpressure) => {
-                match self.backpressure_mode {
-                    BackpressureMode::DropNewest => Err(IngestionError::Backpressure),
-                    BackpressureMode::DropOldest => {
-                        // The failed try_push_raw incremented events_dropped for the
-                        // *new* event, but the new event isn't actually dropped — the
-                        // oldest is. Correct the stats: undo the spurious drop count,
-                        // pop the oldest (which is the real drop), and retry.
-                        shard.stats.events_dropped -= 1;
-                        let _ = shard.try_pop();
-                        shard.stats.events_dropped += 1;
-                        // Retry with the same bytes (Bytes clone is ref-counted)
-                        shard.try_push_raw(raw).map(|ts| (shard_id, ts))
-                    }
-                    BackpressureMode::FailProducer => Err(IngestionError::Backpressure),
-                    BackpressureMode::Sample { .. } => {
-                        // Sampling is handled at a higher level
-                        Err(IngestionError::Sampled)
-                    }
-                }
-            }
-            Err(e) => Err(e),
-        }
+        self.push_with_backpressure(&mut shard, shard_id, raw)
     }
 
     /// Ingest a raw event (pre-serialized with cached hash).
@@ -380,60 +471,80 @@ impl ShardManager {
     pub fn ingest_raw(&self, event: RawEvent) -> Result<(u16, u64), IngestionError> {
         let shard_id = self.select_shard_by_hash(event.hash());
 
-        // Fast path for static mode: shard_id == index, skip HashMap lookup
-        let shards = self.shards.read();
-        let idx = if self.mapper.is_none() {
-            shard_id as usize
-        } else {
-            let shard_index = self.shard_index.read();
-            match shard_index.get(&shard_id).copied() {
-                Some(idx) => idx,
-                None => return Err(IngestionError::Backpressure),
-            }
-        };
-
-        let Some(shard_lock) = shards.get(idx) else {
-            return Err(IngestionError::Backpressure);
-        };
+        let table = self.table.load();
+        let idx = self
+            .resolve_idx(&table, shard_id)
+            .ok_or(IngestionError::Backpressure)?;
+        let shard_lock = table.shards.get(idx).ok_or(IngestionError::Backpressure)?;
 
         let mut shard = shard_lock.lock();
+        self.push_with_backpressure(&mut shard, shard_id, event.bytes())
+    }
 
-        match shard.try_push_raw(event.bytes()) {
-            Ok(ts) => Ok((shard_id, ts)),
-            Err(IngestionError::Backpressure) => {
-                match self.backpressure_mode {
-                    BackpressureMode::DropNewest => Err(IngestionError::Backpressure),
-                    BackpressureMode::DropOldest => {
-                        shard.stats.events_dropped -= 1;
-                        let _ = shard.try_pop();
-                        shard.stats.events_dropped += 1;
-                        // Retry the push
-                        shard.try_push_raw(event.bytes()).map(|ts| (shard_id, ts))
-                    }
-                    BackpressureMode::FailProducer => Err(IngestionError::Backpressure),
-                    BackpressureMode::Sample { .. } => {
-                        // Sampling is handled at a higher level
-                        Err(IngestionError::Sampled)
-                    }
+    /// Ingest a batch of pre-serialized events, grouped by shard.
+    ///
+    /// Each destination shard's mutex is acquired once and all of that
+    /// shard's events are pushed before releasing. With a uniform hash
+    /// distribution this amortizes lock acquisitions from O(events) to
+    /// O(shards). Backpressure semantics match per-event `ingest_raw`.
+    ///
+    /// Returns the number of successfully ingested events.
+    pub fn ingest_raw_batch(&self, events: Vec<RawEvent>) -> usize {
+        if events.is_empty() {
+            return 0;
+        }
+
+        let table = self.table.load();
+
+        // Bucket by table index. Using a Vec<Vec<_>> keyed by index is
+        // cheaper than a HashMap for the common case of a small
+        // shard count.
+        let mut groups: Vec<Vec<Bytes>> = (0..table.shards.len()).map(|_| Vec::new()).collect();
+        let mut group_ids: Vec<u16> = Vec::with_capacity(groups.len());
+        group_ids.resize(groups.len(), 0);
+
+        for event in events {
+            let shard_id = self.select_shard_by_hash(event.hash());
+            let Some(idx) = self.resolve_idx(&table, shard_id) else {
+                continue;
+            };
+            if let Some(g) = groups.get_mut(idx) {
+                if g.is_empty() {
+                    group_ids[idx] = shard_id;
+                }
+                g.push(event.bytes());
+            }
+        }
+
+        let mut success = 0usize;
+        for (idx, group) in groups.into_iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+            let shard_id = group_ids[idx];
+            let Some(shard_lock) = table.shards.get(idx) else {
+                continue;
+            };
+            let mut shard = shard_lock.lock();
+            for bytes in group {
+                if self
+                    .push_with_backpressure(&mut shard, shard_id, bytes)
+                    .is_ok()
+                {
+                    success += 1;
                 }
             }
-            Err(e) => Err(e),
         }
+
+        success
     }
 
     /// Get a reference to a shard by ID.
-    pub fn shard(&self, id: u16) -> Option<ShardRef<'_>> {
-        let shards = self.shards.read();
-        let shard_index = self.shard_index.read();
-
-        let idx = shard_index.get(&id).copied()?;
-        drop(shard_index);
-
-        if idx < shards.len() {
-            Some(ShardRef { guard: shards, idx })
-        } else {
-            None
-        }
+    pub fn shard(&self, id: u16) -> Option<ShardRef> {
+        let table = self.table.load();
+        let idx = self.resolve_idx(&table, id)?;
+        let shard = table.shards.get(idx)?.clone();
+        Some(ShardRef { shard })
     }
 
     /// Execute a function with exclusive access to a shard.
@@ -441,34 +552,61 @@ impl ShardManager {
     where
         F: FnOnce(&mut Shard) -> R,
     {
-        let shards = self.shards.read();
-        let shard_index = self.shard_index.read();
-
-        let idx = shard_index.get(&id).copied()?;
-        drop(shard_index);
-
-        shards.get(idx).map(|shard_lock| {
+        let table = self.table.load();
+        let idx = self.resolve_idx(&table, id)?;
+        table.shards.get(idx).map(|shard_lock| {
             let mut shard = shard_lock.lock();
             f(&mut shard)
         })
     }
 
+    /// Returns true if every shard's ring buffer is empty.
+    ///
+    /// Cheaper than `shard_ids()` + repeated `with_shard`: loads the
+    /// routing table once and checks each shard behind a brief lock.
+    pub fn all_shards_empty(&self) -> bool {
+        let table = self.table.load();
+        table.shards.iter().all(|s| s.lock().is_empty())
+    }
+
     /// Iterate over all active shard IDs.
     pub fn shard_ids(&self) -> Vec<u16> {
-        self.shard_index.read().keys().copied().collect()
+        self.table.load().shard_index.keys().copied().collect()
     }
 
     /// Get aggregated statistics from all shards.
+    ///
+    /// Lock-free: reads each shard's atomic counters directly via the
+    /// parallel `counters` vector on the routing table, with no per-
+    /// shard mutex acquisition.
     pub fn stats(&self) -> ShardStats {
+        let table = self.table.load();
         let mut total = ShardStats::default();
-        let shards = self.shards.read();
-        for shard_lock in shards.iter() {
-            let stats = *shard_lock.lock().stats();
-            total.events_ingested += stats.events_ingested;
-            total.events_dropped += stats.events_dropped;
-            total.batches_dispatched += stats.batches_dispatched;
+        for counters in table.counters.iter() {
+            let snap = counters.snapshot();
+            total.events_ingested += snap.events_ingested;
+            total.events_dropped += snap.events_dropped;
+            total.batches_dispatched += snap.batches_dispatched;
         }
         total
+    }
+
+    /// Rebuild the routing table with a closure that sees the old
+    /// `(shards, counters, shard_index)` and produces the new ones.
+    /// Serialized by `rebuild_lock` so concurrent scaling operations
+    /// can't race on read-modify-write of the table.
+    fn rebuild_table<F>(&self, f: F)
+    where
+        F: FnOnce(
+            &Vec<Arc<parking_lot::Mutex<Shard>>>,
+            &Vec<Arc<ShardCounters>>,
+            &std::collections::HashMap<u16, usize>,
+        ) -> ShardTable,
+    {
+        let _guard = self.rebuild_lock.lock();
+        let old = self.table.load();
+        let new = f(&old.shards, &old.counters, &old.shard_index);
+        self.table.store(Arc::new(new));
     }
 
     /// Add a new shard (for dynamic scaling).
@@ -487,14 +625,23 @@ impl ShardManager {
             ScalingError::InvalidPolicy(format!("no metrics collector for shard {}", new_id))
         })?;
         let new_shard = Shard::with_metrics(new_id, self.ring_buffer_capacity, metrics);
+        let new_counters = new_shard.counters();
+        let new_shard = Arc::new(parking_lot::Mutex::new(new_shard));
 
-        // Add to our collections
-        let mut shards = self.shards.write();
-        let mut shard_index = self.shard_index.write();
-
-        let idx = shards.len();
-        shards.push(parking_lot::Mutex::new(new_shard));
-        shard_index.insert(new_id, idx);
+        self.rebuild_table(|shards, counters, shard_index| {
+            let mut shards = shards.clone();
+            let mut counters = counters.clone();
+            let mut shard_index = shard_index.clone();
+            let idx = shards.len();
+            shards.push(new_shard.clone());
+            counters.push(new_counters.clone());
+            shard_index.insert(new_id, idx);
+            ShardTable {
+                shards,
+                counters,
+                shard_index,
+            }
+        });
 
         self.num_shards
             .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -523,20 +670,32 @@ impl ShardManager {
             "Dynamic scaling not enabled".into(),
         ))?;
 
-        let mut shards = self.shards.write();
-        let mut shard_index = self.shard_index.write();
+        let mut removed = false;
+        self.rebuild_table(|shards, counters, shard_index| {
+            let mut shards = shards.clone();
+            let mut counters = counters.clone();
+            let mut shard_index = shard_index.clone();
 
-        if let Some(idx) = shard_index.remove(&shard_id) {
-            // Remove the shard (swap_remove for efficiency)
-            shards.swap_remove(idx);
-
-            // Update indices for any shard that was swapped
-            if idx < shards.len() {
-                // Find the shard that was at the end and is now at idx
-                let moved_shard_id = shards[idx].lock().id;
-                shard_index.insert(moved_shard_id, idx);
+            if let Some(idx) = shard_index.remove(&shard_id) {
+                removed = true;
+                shards.swap_remove(idx);
+                counters.swap_remove(idx);
+                // swap_remove moved the last element into `idx`: update its
+                // index mapping.
+                if idx < shards.len() {
+                    let moved_shard_id = shards[idx].lock().id;
+                    shard_index.insert(moved_shard_id, idx);
+                }
             }
 
+            ShardTable {
+                shards,
+                counters,
+                shard_index,
+            }
+        });
+
+        if removed {
             self.num_shards
                 .fetch_sub(1, std::sync::atomic::Ordering::Release);
         }
@@ -558,16 +717,17 @@ impl ShardManager {
     }
 }
 
-/// A reference to a shard that holds the read lock.
-pub struct ShardRef<'a> {
-    guard: parking_lot::RwLockReadGuard<'a, Vec<parking_lot::Mutex<Shard>>>,
-    idx: usize,
+/// An owned handle to a shard. Holding this does not block scaling
+/// operations; the shard stays alive via `Arc` refcount even if
+/// removed from the table.
+pub struct ShardRef {
+    shard: Arc<parking_lot::Mutex<Shard>>,
 }
 
-impl<'a> ShardRef<'a> {
+impl ShardRef {
     /// Lock the shard for exclusive access.
     pub fn lock(&self) -> parking_lot::MutexGuard<'_, Shard> {
-        self.guard[self.idx].lock()
+        self.shard.lock()
     }
 }
 
