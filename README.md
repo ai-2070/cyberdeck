@@ -676,7 +676,7 @@ Feature set affects `.rlib` and `.a` (which keep all compiled code for downstrea
 - `libnet.a` — C/C++ static lib, pre-LTO, expected for `staticlib`.
 - `libnet_node.dylib` — Node binding cdylib (what ships as `net.darwin-arm64.node`).
 
-Measured on `aarch64-apple-darwin`, 2026-04-23.
+Measured on `aarch64-apple-darwin`, 2026-04-24.
 
 The core cdylib stays at **1.92 MB across the four storage / compute combinations** — opting into RedEX, disk durability, or CortEX adds well under 1% to the deployed binary because dead-code elimination strips whatever the caller doesn't reference. `netdb` (the cross-model query façade that builds on `cortex`) adds **~301 KB** of Prisma-style query code paths. `nat-traversal` adds **~112 KB** (classifier FSM + rendezvous wire codec + the `connect_direct` orchestration path). `port-mapping` is the outlier at **+1.41 MB** — the extra weight is `igd-next`'s UPnP-IGD client, which pulls in a SOAP / XML stack and HTTP machinery that the rest of the mesh doesn't use; NAT-PMP alone is ~100 lines of wire codec inlined in the crate (no external dep), so a deployment that only needs NAT-PMP could strip UPnP support and stay near the `nat-traversal` line.
 
