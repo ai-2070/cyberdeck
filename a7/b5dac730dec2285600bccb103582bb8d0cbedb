@@ -1,0 +1,23 @@
+net/crates/net/src/consumer/merge.rs
+  98bf9cd8fdc02ab8 215
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "a7b5dac730dec2285600bccb103582bb8d0cbedb",
+  "prompts": {
+    "98bf9cd8fdc02ab8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6b60a7d5-10fb-4c01-a45b-78341d891511",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 3,
+      "accepted_lines": 1,
+      "overriden_lines": 0
+    }
+  }
+}
