@@ -212,9 +212,7 @@ impl PollMerger {
                 let adapter = self.adapter.clone();
                 let from: Option<&str> = cursor.get(shard_id);
                 async move {
-                    let result = adapter
-                        .poll_shard(shard_id, from, per_shard_limit)
-                        .await;
+                    let result = adapter.poll_shard(shard_id, from, per_shard_limit).await;
                     (shard_id, result)
                 }
             })
