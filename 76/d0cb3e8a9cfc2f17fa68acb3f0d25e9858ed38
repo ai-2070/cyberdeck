@@ -1,0 +1,23 @@
+PERFORMANCE_WINS.md
+  87bb90c35fad4179 1-201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "76d0cb3e8a9cfc2f17fa68acb3f0d25e9858ed38",
+  "prompts": {
+    "87bb90c35fad4179": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6cc25025-bc7f-4f77-9983-0178e2603a6e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 201,
+      "total_deletions": 0,
+      "accepted_lines": 201,
+      "overriden_lines": 0
+    }
+  }
+}
