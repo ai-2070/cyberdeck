@@ -655,21 +655,21 @@ Feature set affects `.rlib` and `.a` (which keep all compiled code for downstrea
 
 | Features | `libnet.dylib` (cdylib) | `libnet.rlib` | `libnet.a` |
 |----------|------------------------:|--------------:|-----------:|
-| `net` | **1.92 MB** | 22.2 MB | 35.2 MB |
-| `net` + `redex` | **1.92 MB** | 22.6 MB | 35.5 MB |
-| `net` + `redex` + `redex-disk` | **1.92 MB** | 22.8 MB | 35.6 MB |
-| `net` + `redex` + `redex-disk` + `cortex` | **1.92 MB** | 24.7 MB | 36.5 MB |
-| `net` + `redex` + `redex-disk` + `cortex` + `netdb` | **2.20 MB** | 25.7 MB | 37.2 MB |
-| `net` + `nat-traversal` | **2.01 MB** | 23.5 MB | 36.0 MB |
-| `net` + `nat-traversal` + `port-mapping` | **3.43 MB** | 26.9 MB | 47.5 MB |
+| `net` | **1.92 MB** | 22.4 MB | 35.3 MB |
+| `net` + `redex` | **1.92 MB** | 22.8 MB | 35.6 MB |
+| `net` + `redex` + `redex-disk` | **1.92 MB** | 22.9 MB | 35.7 MB |
+| `net` + `redex` + `redex-disk` + `cortex` | **1.92 MB** | 24.8 MB | 36.6 MB |
+| `net` + `redex` + `redex-disk` + `cortex` + `netdb` | **2.21 MB** | 25.9 MB | 37.3 MB |
+| `net` + `nat-traversal` | **2.03 MB** | 23.6 MB | 36.1 MB |
+| `net` + `nat-traversal` + `port-mapping` | **3.44 MB** | 27.0 MB | 47.6 MB |
 
 **Binding cdylib** (`libnet_node.dylib`, the `.node` file shipped to Node users; the Python PyO3 module has the same shape):
 
 | Features | `libnet_node.dylib` |
 |----------|--------------------:|
-| `net` | **2.66 MB** |
-| `net` + `compute` | **3.01 MB** |
-| `net` + `compute` + `groups` | **3.21 MB** |
+| `net` | **2.68 MB** |
+| `net` + `compute` | **3.02 MB** |
+| `net` + `compute` + `groups` | **3.23 MB** |
 
 - `libnet.dylib` — shipped core cdylib (consumed by Node / Python / C bindings).
 - `libnet.rlib` — Rust static lib with metadata (consumed by other Rust crates).
@@ -678,6 +678,6 @@ Feature set affects `.rlib` and `.a` (which keep all compiled code for downstrea
 
 Measured on `aarch64-apple-darwin`, 2026-04-23.
 
-The core cdylib stays at **1.92 MB across the four storage / compute combinations** — opting into RedEX, disk durability, or CortEX adds well under 1% to the deployed binary because dead-code elimination strips whatever the caller doesn't reference. `netdb` (the cross-model query façade that builds on `cortex`) adds **~285 KB** of Prisma-style query code paths. `nat-traversal` adds **~96 KB** (classifier FSM + rendezvous wire codec + the `connect_direct` orchestration path). `port-mapping` is the outlier at **+1.42 MB** — the extra weight is `igd-next`'s UPnP-IGD client, which pulls in a SOAP / XML stack and HTTP machinery that the rest of the mesh doesn't use; NAT-PMP alone is ~100 lines of wire codec inlined in the crate (no external dep), so a deployment that only needs NAT-PMP could strip UPnP support and stay near the `nat-traversal` line.
+The core cdylib stays at **1.92 MB across the four storage / compute combinations** — opting into RedEX, disk durability, or CortEX adds well under 1% to the deployed binary because dead-code elimination strips whatever the caller doesn't reference. `netdb` (the cross-model query façade that builds on `cortex`) adds **~301 KB** of Prisma-style query code paths. `nat-traversal` adds **~112 KB** (classifier FSM + rendezvous wire codec + the `connect_direct` orchestration path). `port-mapping` is the outlier at **+1.41 MB** — the extra weight is `igd-next`'s UPnP-IGD client, which pulls in a SOAP / XML stack and HTTP machinery that the rest of the mesh doesn't use; NAT-PMP alone is ~100 lines of wire codec inlined in the crate (no external dep), so a deployment that only needs NAT-PMP could strip UPnP support and stay near the `nat-traversal` line.
 
-The `compute` and `groups` features live at the binding / SDK layer (`net-sdk`'s `DaemonRuntime`, `Mikoshi` migration orchestrator, `ReplicaGroup` / `ForkGroup` / `StandbyGroup`) rather than in the core crate, so they don't appear in the core cdylib table. Enabling them on the binding cdylib adds **~367 KB** for `compute` and another **~200 KB** for `groups` on top — the Node `.node` file grows from 2.66 MB to 3.21 MB with the full stack. The `.rlib` and `.a` grow with features because they must preserve every compiled symbol for downstream linkers; only the shipped cdylibs feel the full benefit of LTO.
+The `compute` and `groups` features live at the binding / SDK layer (`net-sdk`'s `DaemonRuntime`, `Mikoshi` migration orchestrator, `ReplicaGroup` / `ForkGroup` / `StandbyGroup`) rather than in the core crate, so they don't appear in the core cdylib table. Enabling them on the binding cdylib adds **~349 KB** for `compute` and another **~216 KB** for `groups` on top — the Node `.node` file grows from 2.68 MB to 3.23 MB with the full stack. The `.rlib` and `.a` grow with features because they must preserve every compiled symbol for downstream linkers; only the shipped cdylibs feel the full benefit of LTO.
