@@ -78,6 +78,50 @@ fn bench_append_heap(c: &mut Criterion) {
 }
 
 // ============================================================================
+// Append: no-watcher fast path vs. with-tail path.
+//
+// `append` skips the `Bytes::copy_from_slice` event materialization
+// when nobody is tailing — most production traffic. The "with_tail"
+// variant pre-subscribes (and drains) a tail stream so the copy +
+// `notify_watchers` path is exercised. The delta between the two is
+// the cost paid solely for live delivery.
+// ============================================================================
+
+fn bench_append_watcher_paths(c: &mut Criterion) {
+    let mut group = c.benchmark_group("redex_append_watcher_paths");
+    let runtime = rt();
+    let payload = vec![0xCDu8; 256];
+    group.throughput(Throughput::Bytes(payload.len() as u64));
+
+    group.bench_function("no_watchers", |b| {
+        let r = Redex::new();
+        let f = r
+            .open_file(&cn("bench/watcher/none"), RedexFileConfig::default())
+            .unwrap();
+        b.iter(|| f.append(&payload).unwrap());
+    });
+
+    group.bench_function("with_tail", |b| {
+        let _enter = runtime.enter();
+        let r = Redex::new();
+        let f = r
+            .open_file(&cn("bench/watcher/with"), RedexFileConfig::default())
+            .unwrap();
+        let mut stream = Box::pin(f.tail(0));
+        b.iter(|| {
+            f.append(&payload).unwrap();
+            // Drain so the bounded buffer never saturates and the
+            // benchmark doesn't measure disconnect handling.
+            runtime.block_on(async {
+                let _ = stream.next().await.unwrap();
+            });
+        });
+    });
+
+    group.finish();
+}
+
+// ============================================================================
 // Batch append.
 //
 // Amortizes the seq-allocation and lock overhead across N payloads in
@@ -190,6 +234,7 @@ criterion_group!(
     benches,
     bench_append_inline,
     bench_append_heap,
+    bench_append_watcher_paths,
     bench_append_batch,
     bench_append_disk,
     bench_tail_latency,
@@ -200,6 +245,7 @@ criterion_group!(
     benches,
     bench_append_inline,
     bench_append_heap,
+    bench_append_watcher_paths,
     bench_append_batch,
     bench_tail_latency,
 );

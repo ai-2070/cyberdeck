@@ -25,12 +25,19 @@ fn cn(s: &str) -> ChannelName {
 /// seq 0, assert every event arrives in order.
 #[tokio::test]
 async fn test_redex_10k_roundtrip() {
+    const N: u64 = 10_000;
+
     let r = Redex::new();
     let f = r
-        .open_file(&cn("throughput/10k"), RedexFileConfig::default())
+        .open_file(
+            &cn("throughput/10k"),
+            // Producer yields every 1024 events; size the tail buffer
+            // generously above that so transient consumer-scheduling
+            // gaps don't trip the disconnect-on-full policy.
+            RedexFileConfig::default().with_tail_buffer_size(N as usize),
+        )
         .unwrap();
 
-    const N: u64 = 10_000;
     let mut stream = Box::pin(f.tail(0));
 
     let f2 = f.clone();

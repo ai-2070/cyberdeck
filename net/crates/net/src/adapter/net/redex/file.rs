@@ -7,7 +7,7 @@ use bytes::Bytes;
 use futures::Stream;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 
 use super::super::channel::ChannelName;
 use super::config::RedexFileConfig;
@@ -30,8 +30,8 @@ use tokio::sync::Notify;
 struct TailWatcher {
     /// Minimum seq to deliver (inclusive).
     from_seq: u64,
-    /// Channel back to the subscriber.
-    sender: mpsc::UnboundedSender<Result<RedexEvent, RedexError>>,
+    /// Channel back to the subscriber. Bounded — see [`TAIL_BUFFER_SIZE`].
+    sender: mpsc::Sender<Result<RedexEvent, RedexError>>,
 }
 
 /// Mutable state: index, parallel timestamps, segment, and live
@@ -270,11 +270,16 @@ impl RedexFile {
         state.index.push(entry);
         state.timestamps.push(ts);
 
-        let event = RedexEvent {
-            entry,
-            payload: Bytes::copy_from_slice(payload),
-        };
-        notify_watchers(&mut state.watchers, &event);
+        // The `Bytes::copy_from_slice` below is purely for watcher
+        // delivery; durable storage already landed via `segment.append`.
+        // Skip the copy entirely when nobody is tailing.
+        if !state.watchers.is_empty() {
+            let event = RedexEvent {
+                entry,
+                payload: Bytes::copy_from_slice(payload),
+            };
+            notify_watchers(&mut state.watchers, &event);
+        }
 
         Ok(seq)
     }
@@ -303,11 +308,13 @@ impl RedexFile {
         state.index.push(entry);
         state.timestamps.push(ts);
 
-        let event = RedexEvent {
-            entry,
-            payload: Bytes::copy_from_slice(payload),
-        };
-        notify_watchers(&mut state.watchers, &event);
+        if !state.watchers.is_empty() {
+            let event = RedexEvent {
+                entry,
+                payload: Bytes::copy_from_slice(payload),
+            };
+            notify_watchers(&mut state.watchers, &event);
+        }
 
         Ok(seq)
     }
@@ -471,11 +478,13 @@ impl RedexFile {
         state.index.push(entry);
         state.timestamps.push(ts);
 
-        let event = RedexEvent {
-            entry,
-            payload: Bytes::copy_from_slice(payload),
-        };
-        notify_watchers(&mut state.watchers, &event);
+        if !state.watchers.is_empty() {
+            let event = RedexEvent {
+                entry,
+                payload: Bytes::copy_from_slice(payload),
+            };
+            notify_watchers(&mut state.watchers, &event);
+        }
 
         Ok(seq)
     }
@@ -505,11 +514,13 @@ impl RedexFile {
         state.index.push(entry);
         state.timestamps.push(ts);
 
-        let event = RedexEvent {
-            entry,
-            payload: Bytes::copy_from_slice(payload),
-        };
-        notify_watchers(&mut state.watchers, &event);
+        if !state.watchers.is_empty() {
+            let event = RedexEvent {
+                entry,
+                payload: Bytes::copy_from_slice(payload),
+            };
+            notify_watchers(&mut state.watchers, &event);
+        }
 
         Ok(seq)
     }
@@ -644,11 +655,20 @@ impl RedexFile {
     /// Backfill and live registration happen atomically under the
     /// state lock: no event can interleave between backfill delivery
     /// and live subscription.
+    ///
+    /// Delivery is backed by a per-subscription bounded channel of
+    /// depth [`RedexFileConfig::tail_buffer_size`]. A subscriber that
+    /// cannot drain events fast enough (or requests a backfill
+    /// larger than the buffer without concurrent draining) is
+    /// disconnected with a best-effort [`RedexError::Lagged`]
+    /// signal; see [`notify_watchers`].
     pub fn tail(
         &self,
         from_seq: u64,
     ) -> impl Stream<Item = Result<RedexEvent, RedexError>> + Send + 'static {
-        let (tx, rx) = mpsc::unbounded_channel();
+        // mpsc::channel panics on 0; clamp to a minimum of 1.
+        let buffer = self.inner.config.tail_buffer_size.max(1);
+        let (tx, rx) = mpsc::channel(buffer);
 
         let mut state = self.inner.state.lock();
 
@@ -661,11 +681,15 @@ impl RedexFile {
         // subscriber hanging with no `Closed` signal.
         if self.inner.closed.load(Ordering::Acquire) {
             drop(state);
-            let _ = tx.send(Err(RedexError::Closed));
-            return UnboundedReceiverStream::new(rx);
+            let _ = tx.try_send(Err(RedexError::Closed));
+            return ReceiverStream::new(rx);
         }
 
-        // Backfill.
+        // Backfill. Uses `try_send` under the state lock so backfill +
+        // registration is still atomic with respect to concurrent
+        // appends. If the backfill set is larger than the channel
+        // buffer the subscriber is already lagging before live
+        // delivery starts — signal Lagged, skip registration.
         for entry in state.index.iter() {
             if entry.seq < from_seq {
                 continue;
@@ -674,9 +698,16 @@ impl RedexFile {
                 Some(e) => e,
                 None => continue, // payload evicted between index retain and read
             };
-            if tx.send(Ok(event)).is_err() {
-                // Receiver dropped before stream was even used.
-                return UnboundedReceiverStream::new(rx);
+            match tx.try_send(Ok(event)) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    let _ = tx.try_send(Err(RedexError::Lagged));
+                    return ReceiverStream::new(rx);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // Receiver dropped before stream was polled.
+                    return ReceiverStream::new(rx);
+                }
             }
         }
 
@@ -687,7 +718,7 @@ impl RedexFile {
         });
         drop(state);
 
-        UnboundedReceiverStream::new(rx)
+        ReceiverStream::new(rx)
     }
 
     /// One-shot read of the half-open range `[start, end)` from the
@@ -769,7 +800,11 @@ impl RedexFile {
         }
         let mut state = self.inner.state.lock();
         for w in state.watchers.drain(..) {
-            let _ = w.sender.send(Err(RedexError::Closed));
+            // Best-effort `Closed` signal. If the per-subscriber
+            // buffer is saturated the signal is dropped, but the
+            // sender is dropped at end-of-iteration regardless, so
+            // the subscriber still observes a clean stream end.
+            let _ = w.sender.try_send(Err(RedexError::Closed));
         }
         drop(state);
 
@@ -854,12 +889,23 @@ fn materialize(entry: &RedexEntry, segment: &HeapSegment) -> Option<RedexEvent> 
 }
 
 fn notify_watchers(watchers: &mut Vec<TailWatcher>, event: &RedexEvent) {
-    // Walk watchers; drop those whose receiver is gone.
+    // Walk watchers; drop those whose receiver is gone or whose
+    // buffer is saturated. On `Full` we make a best-effort attempt
+    // to signal `Lagged` before dropping — under true saturation
+    // that signal may itself fail, in which case the subscriber
+    // sees a plain stream end.
     watchers.retain(|w| {
         if event.entry.seq < w.from_seq {
             return true; // keep, but don't deliver
         }
-        w.sender.send(Ok(event.clone())).is_ok()
+        match w.sender.try_send(Ok(event.clone())) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let _ = w.sender.try_send(Err(RedexError::Lagged));
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
     });
 }
 

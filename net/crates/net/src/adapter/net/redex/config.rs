@@ -76,6 +76,17 @@ pub struct RedexFileConfig {
     /// as their fake timestamp — age retention starts fresh from
     /// the reopen moment. v2 mmap tier will persist timestamps.
     pub retention_max_age_ns: Option<u64>,
+
+    /// Per-subscription buffer depth for `tail()` streams. Caps the
+    /// memory a slow subscriber can pin at `tail_buffer_size *
+    /// avg_event_size`. Subscribers that can't drain this many
+    /// pending events get disconnected with a best-effort
+    /// `RedexError::Lagged` signal.
+    ///
+    /// Tune up for bursty workloads with brief consumer pauses;
+    /// tune down to reclaim memory faster from misbehaving
+    /// subscribers. Default: 1024.
+    pub tail_buffer_size: usize,
 }
 
 impl Default for RedexFileConfig {
@@ -87,6 +98,7 @@ impl Default for RedexFileConfig {
             retention_max_events: None,
             retention_max_bytes: None,
             retention_max_age_ns: None,
+            tail_buffer_size: 1024,
         }
     }
 }
@@ -134,6 +146,13 @@ impl RedexFileConfig {
     /// against `SystemTime::now()` at append time.
     pub fn with_retention_max_age(mut self, max_age: Duration) -> Self {
         self.retention_max_age_ns = Some(max_age.as_nanos() as u64);
+        self
+    }
+
+    /// Set the per-subscription buffer depth for `tail()` streams.
+    /// See the field doc on [`Self::tail_buffer_size`].
+    pub fn with_tail_buffer_size(mut self, size: usize) -> Self {
+        self.tail_buffer_size = size;
         self
     }
 }
