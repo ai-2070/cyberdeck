@@ -530,7 +530,7 @@ To re-parse raw criterion output into structured markdown, use the helper script
 1. **Header serialize/deserialize runs at ~660–770M ops/sec** (i9) / ~475–505M ops/sec (M1) — sub-2ns per operation
 2. **Routing header operations achieve ~1.06–2.15G ops/sec** — sub-nanosecond serialization
 3. **Thread-local pool eliminates contention** — up to ~21x faster than shared pool at 32 threads (M1: 75.9M vs 3.65M ops/sec; i9: 113.8M vs 6.87M ops/sec)
-4. **Capability filters run at ~94–580M ops/sec** — fast enough for inline packet decisions
+4. **Capability filters run at ~94–552M ops/sec** — fast enough for inline packet decisions
 5. **Circuit breaker checks are ~10ns** — negligible overhead per packet
 6. **Event frame write scales with payload** — ~1.7–3.3 GiB/s at 64B, ~49 GiB/s on M1 / ~75 GiB/s on i9 at 4KB
 7. **Multi-hop forwarding adds ~30–60ns per hop** — linear scaling, no amplification
