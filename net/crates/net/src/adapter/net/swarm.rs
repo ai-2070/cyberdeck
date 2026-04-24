@@ -612,7 +612,11 @@ impl LocalGraph {
             .collect()
     }
 
-    /// Get shortest path to a node (BFS)
+    /// Get shortest path to a node (BFS).
+    ///
+    /// Reconstructs the path from a parent map at the end rather than
+    /// cloning the full path per neighbor — avoids quadratic behavior
+    /// on long paths or wide frontiers.
     pub fn path_to(&self, dest: u64) -> Option<Vec<u64>> {
         if dest == self.my_id {
             return Some(vec![self.my_id]);
@@ -624,27 +628,31 @@ impl LocalGraph {
             adjacency.entry(edge.from).or_default().push(edge.to);
         }
 
-        // BFS from my_id to dest
+        // BFS from my_id to dest, tracking parents for path reconstruction
+        let mut parent: HashMap<u64, u64> = HashMap::new();
         let mut visited: HashSet<u64> = HashSet::new();
-        let mut queue: VecDeque<Vec<u64>> = VecDeque::new();
+        let mut queue: VecDeque<u64> = VecDeque::new();
 
-        queue.push_back(vec![self.my_id]);
+        queue.push_back(self.my_id);
         visited.insert(self.my_id);
 
-        while let Some(path) = queue.pop_front() {
-            let current = *path.last()?;
-
+        while let Some(current) = queue.pop_front() {
             if current == dest {
+                let mut path = vec![current];
+                let mut node = current;
+                while node != self.my_id {
+                    node = *parent.get(&node)?;
+                    path.push(node);
+                }
+                path.reverse();
                 return Some(path);
             }
 
             if let Some(neighbors) = adjacency.get(&current) {
                 for &neighbor in neighbors {
-                    if !visited.contains(&neighbor) {
-                        visited.insert(neighbor);
-                        let mut new_path = path.clone();
-                        new_path.push(neighbor);
-                        queue.push_back(new_path);
+                    if visited.insert(neighbor) {
+                        parent.insert(neighbor, current);
+                        queue.push_back(neighbor);
                     }
                 }
             }

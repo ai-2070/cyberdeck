@@ -425,7 +425,8 @@ impl EventBus {
 
     /// Ingest a batch of events.
     ///
-    /// This is more efficient than calling `ingest` repeatedly.
+    /// This is more efficient than calling `ingest` repeatedly: events
+    /// destined for the same shard share a single mutex acquisition.
     ///
     /// # Returns
     ///
@@ -435,16 +436,16 @@ impl EventBus {
             return 0;
         }
 
-        let mut success_count = 0;
-        for event in events {
-            if self.ingest(event).is_ok() {
-                success_count += 1;
-            }
-        }
-        success_count
+        // Convert once to `RawEvent` (pre-serializes + hashes each
+        // event) and dispatch through the grouped batch path.
+        let raw: Vec<RawEvent> = events.into_iter().map(|e| e.into_raw()).collect();
+        self.ingest_raw_batch(raw)
     }
 
     /// Ingest a batch of raw events (fastest batch ingestion).
+    ///
+    /// Groups events by their destination shard and pushes each group
+    /// under a single mutex acquisition.
     ///
     /// # Returns
     ///
@@ -454,13 +455,20 @@ impl EventBus {
             return 0;
         }
 
-        let mut success_count = 0;
-        for event in events {
-            if self.ingest_raw(event).is_ok() {
-                success_count += 1;
-            }
+        let total = events.len();
+        let success = self.shard_manager.ingest_raw_batch(events);
+        if success > 0 {
+            self.stats
+                .events_ingested
+                .fetch_add(success as u64, AtomicOrdering::Relaxed);
         }
-        success_count
+        let dropped = total.saturating_sub(success);
+        if dropped > 0 {
+            self.stats
+                .events_dropped
+                .fetch_add(dropped as u64, AtomicOrdering::Relaxed);
+        }
+        success
     }
 
     /// Poll events from the bus.
@@ -507,13 +515,7 @@ impl EventBus {
         let mut backoff = Duration::from_micros(100);
 
         loop {
-            let all_empty = self.shard_manager.shard_ids().into_iter().all(|shard_id| {
-                self.shard_manager
-                    .with_shard(shard_id, |shard| shard.is_empty())
-                    .unwrap_or(true)
-            });
-
-            if all_empty {
+            if self.shard_manager.all_shards_empty() {
                 break;
             }
             if start.elapsed() >= timeout {
@@ -653,30 +655,32 @@ async fn dispatch_batch(
     timeout: Duration,
     retries: u32,
 ) -> bool {
-    for attempt in 0..=retries {
-        let is_last = attempt == retries;
-        let batch_clone = batch.clone();
-
-        match tokio::time::timeout(timeout, adapter.on_batch(batch_clone)).await {
+    // Retry attempts clone the batch; the final attempt moves it, saving
+    // one clone per dispatch (the common path is retries == 0).
+    for attempt in 0..retries {
+        match tokio::time::timeout(timeout, adapter.on_batch(batch.clone())).await {
             Ok(Ok(())) => return true,
             Ok(Err(e)) => {
-                if is_last {
-                    tracing::error!(shard_id, error = %e, "Failed to dispatch batch, dropping");
-                    return false;
-                }
                 tracing::warn!(shard_id, error = %e, attempt, "Batch dispatch failed, retrying");
             }
             Err(_) => {
-                if is_last {
-                    tracing::error!(shard_id, "Adapter on_batch timed out, dropping batch");
-                    return false;
-                }
                 tracing::warn!(shard_id, attempt, "Adapter on_batch timed out, retrying");
             }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    false
+
+    match tokio::time::timeout(timeout, adapter.on_batch(batch)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            tracing::error!(shard_id, error = %e, "Failed to dispatch batch, dropping");
+            false
+        }
+        Err(_) => {
+            tracing::error!(shard_id, "Adapter on_batch timed out, dropping batch");
+            false
+        }
+    }
 }
 
 struct BatchWorkerParams {

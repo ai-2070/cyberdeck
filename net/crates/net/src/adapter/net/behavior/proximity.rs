@@ -711,7 +711,11 @@ impl ProximityGraph {
         matching
     }
 
-    /// Get shortest path to node (BFS)
+    /// Get shortest path to node (BFS).
+    ///
+    /// Uses a parent map to reconstruct the path once on arrival,
+    /// avoiding the quadratic `path.clone()`-per-neighbor cost of the
+    /// naive "queue of paths" BFS.
     pub fn path_to(&self, dest: &NodeId) -> Option<Vec<NodeId>> {
         if *dest == self.my_id {
             return Some(vec![self.my_id]);
@@ -723,27 +727,32 @@ impl ProximityGraph {
             adjacency.entry(edge.from).or_default().push(edge.to);
         }
 
-        // BFS
+        // BFS with parent pointers
+        let mut parent: HashMap<NodeId, NodeId> = HashMap::new();
         let mut visited: HashSet<NodeId> = HashSet::new();
-        let mut queue: VecDeque<Vec<NodeId>> = VecDeque::new();
+        let mut queue: VecDeque<NodeId> = VecDeque::new();
 
-        queue.push_back(vec![self.my_id]);
+        queue.push_back(self.my_id);
         visited.insert(self.my_id);
 
-        while let Some(path) = queue.pop_front() {
-            let current = *path.last()?;
-
+        while let Some(current) = queue.pop_front() {
             if current == *dest {
+                // Walk back through the parent map to recover the path.
+                let mut path = vec![current];
+                let mut node = current;
+                while node != self.my_id {
+                    node = *parent.get(&node)?;
+                    path.push(node);
+                }
+                path.reverse();
                 return Some(path);
             }
 
             if let Some(neighbors) = adjacency.get(&current) {
-                for neighbor in neighbors {
-                    if !visited.contains(neighbor) {
-                        visited.insert(*neighbor);
-                        let mut new_path = path.clone();
-                        new_path.push(*neighbor);
-                        queue.push_back(new_path);
+                for &neighbor in neighbors {
+                    if visited.insert(neighbor) {
+                        parent.insert(neighbor, current);
+                        queue.push_back(neighbor);
                     }
                 }
             }
