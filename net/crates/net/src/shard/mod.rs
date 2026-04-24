@@ -839,6 +839,104 @@ mod tests {
         assert_eq!(stats.events_dropped, 0);
     }
 
+    /// `ingest_raw_batch` groups events by destination shard before
+    /// pushing — verify the grouping preserves FIFO within a shard,
+    /// honors hash-based routing, and that totals match `ingest_raw`.
+    #[test]
+    fn test_ingest_raw_batch_routes_and_preserves_order() {
+        let manager = ShardManager::new(4, 1024, BackpressureMode::DropNewest);
+        let events: Vec<RawEvent> = (0..200)
+            .map(|i| RawEvent::from_str(&format!(r#"{{"i":{}}}"#, i)))
+            .collect();
+
+        // Snapshot the expected destination for each event so we can
+        // compare against what actually landed in each shard.
+        let expected_dests: Vec<u16> = events
+            .iter()
+            .map(|e| manager.select_shard_by_hash(e.hash()))
+            .collect();
+
+        let success = manager.ingest_raw_batch(events.clone());
+        assert_eq!(success, 200, "all events should land with ample capacity");
+
+        // Aggregate totals must match.
+        let stats = manager.stats();
+        assert_eq!(stats.events_ingested, 200);
+        assert_eq!(stats.events_dropped, 0);
+
+        // Per-shard totals must match the expected routing distribution,
+        // and the distribution must span more than one shard (otherwise
+        // the test wouldn't exercise the grouping path).
+        let mut expected_by_shard: std::collections::HashMap<u16, u64> =
+            std::collections::HashMap::new();
+        for d in &expected_dests {
+            *expected_by_shard.entry(*d).or_default() += 1;
+        }
+        assert!(
+            expected_by_shard.len() > 1,
+            "hash distribution should span multiple shards"
+        );
+        for shard_id in 0..4u16 {
+            let got = manager
+                .with_shard(shard_id, |s| s.stats().events_ingested)
+                .unwrap();
+            let want = expected_by_shard.get(&shard_id).copied().unwrap_or(0);
+            assert_eq!(got, want, "shard {} ingested count mismatch", shard_id);
+        }
+
+        // FIFO within a shard: the events a shard received, in the order
+        // we batched them, must come out of the ring buffer in the same
+        // order.
+        for shard_id in 0..4u16 {
+            let expected_payloads: Vec<&[u8]> = events
+                .iter()
+                .zip(expected_dests.iter())
+                .filter(|(_, d)| **d == shard_id)
+                .map(|(e, _)| e.as_bytes())
+                .collect();
+            let popped = manager.with_shard(shard_id, |s| s.pop_batch(1024)).unwrap();
+            assert_eq!(popped.len(), expected_payloads.len());
+            for (i, ev) in popped.iter().enumerate() {
+                assert_eq!(
+                    ev.as_bytes(),
+                    expected_payloads[i],
+                    "shard {} position {} out of order",
+                    shard_id,
+                    i
+                );
+            }
+        }
+    }
+
+    /// Batching past a shard's capacity must account every dropped
+    /// event under `DropNewest`: `success` + `events_dropped` =
+    /// `len(input)`.
+    #[test]
+    fn test_ingest_raw_batch_drop_accounting() {
+        // Single shard, usable capacity 3 (ring buffer reserves one slot).
+        let manager = ShardManager::new(1, 4, BackpressureMode::DropNewest);
+        let events: Vec<RawEvent> = (0..10)
+            .map(|i| RawEvent::from_str(&format!(r#"{{"i":{}}}"#, i)))
+            .collect();
+
+        let success = manager.ingest_raw_batch(events);
+        assert_eq!(success, 3, "only 3 should fit under DropNewest");
+
+        let stats = manager.stats();
+        assert_eq!(stats.events_ingested, 3);
+        assert_eq!(stats.events_dropped, 7);
+    }
+
+    /// Empty batch is a no-op and must not touch stats.
+    #[test]
+    fn test_ingest_raw_batch_empty() {
+        let manager = ShardManager::new(4, 1024, BackpressureMode::DropNewest);
+        assert_eq!(manager.ingest_raw_batch(Vec::new()), 0);
+        let stats = manager.stats();
+        assert_eq!(stats.events_ingested, 0);
+        assert_eq!(stats.events_dropped, 0);
+    }
+
     #[test]
     fn test_remove_shard_requires_dynamic_scaling() {
         // Static mode - no dynamic scaling

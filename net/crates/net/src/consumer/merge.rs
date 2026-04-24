@@ -1420,4 +1420,62 @@ mod tests {
             "cursor must advance past filtered events even when none match"
         );
     }
+
+    /// Exercises the non-lazy filter branch: when `Ordering::InsertionTs`
+    /// is requested we can't short-circuit at `limit + 1` matches (the
+    /// sort needs every event first), so the code falls through to
+    /// `retain` → sort → truncate. This test pins:
+    /// - Results are globally sorted by `insertion_ts` (not input order).
+    /// - Only filter-matching events come through.
+    /// - Truncation picks the `limit` *earliest* matches by ts.
+    /// - `has_more` is set when matches exceed `limit`.
+    #[tokio::test]
+    async fn test_poll_merger_filter_insertion_ts_truncates_after_sort() {
+        let adapter = Arc::new(MockAdapter::new());
+
+        // Interleave shards with out-of-order timestamps and a mix of
+        // matching / non-matching events. Matching timestamps: 120, 200,
+        // 260, 400. Non-matching timestamps: 100, 300.
+        adapter.add_events(
+            0,
+            vec![
+                StoredEvent::from_value("0-1".to_string(), json!({"type": "token"}), 400, 0),
+                StoredEvent::from_value("0-2".to_string(), json!({"type": "noise"}), 100, 0),
+                StoredEvent::from_value("0-3".to_string(), json!({"type": "token"}), 200, 0),
+            ],
+        );
+        adapter.add_events(
+            1,
+            vec![
+                StoredEvent::from_value("1-1".to_string(), json!({"type": "token"}), 260, 1),
+                StoredEvent::from_value("1-2".to_string(), json!({"type": "noise"}), 300, 1),
+                StoredEvent::from_value("1-3".to_string(), json!({"type": "token"}), 120, 1),
+            ],
+        );
+
+        let merger = PollMerger::new(adapter, 2);
+        let filter = Filter::eq("type", json!("token"));
+
+        // 4 matches exist; asking for 2 must yield the two earliest
+        // after a full sort (120, 200) and signal has_more.
+        let response = merger
+            .poll(
+                ConsumeRequest::new(2)
+                    .filter(filter)
+                    .ordering(Ordering::InsertionTs),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.events.len(), 2);
+        assert_eq!(
+            response.events[0].insertion_ts, 120,
+            "earliest match must come first"
+        );
+        assert_eq!(response.events[1].insertion_ts, 200);
+        assert!(
+            response.has_more,
+            "two more matching events remain past the limit"
+        );
+    }
 }
