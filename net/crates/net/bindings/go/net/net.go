@@ -30,9 +30,20 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strconv"
 	"sync"
 	"unsafe"
 )
+
+// emptyByte is a single-byte array used as a non-null pointer
+// substitute for empty-string FFI arguments. Passing the literal
+// `nil` `*C.char` would change behavior — the C side maps a null
+// `json` pointer to `ErrNullPointer` even when `len == 0`, whereas
+// the previous `C.CString("")` produced a valid pointer to a `\0`
+// byte and the C side treats it as a (zero-length, valid) input.
+// One package-level byte preserves the previous semantics without
+// allocating per call.
+var emptyByte [1]byte
 
 // Error codes
 var (
@@ -209,10 +220,22 @@ func (bs *Net) IngestRaw(json string) error {
 		return ErrShuttingDown
 	}
 
-	cJSON := C.CString(json)
-	defer C.free(unsafe.Pointer(cJSON))
-
-	result := C.net_ingest_raw(bs.handle, cJSON, C.size_t(len(json)))
+	// Zero-copy: the C side accepts (ptr, size_t) pairs and treats
+	// the bytes as immutable, so we can hand it Go's own string
+	// backing store via unsafe.StringData. C.CString would malloc +
+	// copy; the (ptr, len) pattern matches what compute.go already
+	// uses for short-lived args. For empty input we hand it a
+	// non-null sentinel so the C side doesn't reject the call as
+	// `ErrNullPointer` — preserves the previous `C.CString("")`
+	// shape without per-call malloc.
+	var ptr *C.char
+	if len(json) > 0 {
+		ptr = (*C.char)(unsafe.Pointer(unsafe.StringData(json)))
+	} else {
+		ptr = (*C.char)(unsafe.Pointer(&emptyByte[0]))
+	}
+	result := C.net_ingest_raw(bs.handle, ptr, C.size_t(len(json)))
+	runtime.KeepAlive(json)
 	return errorFromCode(result)
 }
 
@@ -231,28 +254,34 @@ func (bs *Net) IngestRawBatch(jsons []string) int {
 		return 0
 	}
 
-	// Prepare C arrays
-	cJSONs := make([]*C.char, len(jsons))
-	cLens := make([]C.size_t, len(jsons))
-
+	// Zero-copy per element: each entry points at the Go string's
+	// own backing store, so the only per-batch allocation is the
+	// pointer + length tables themselves. Previously each event
+	// paid a full malloc + memcpy through C.CString.
+	ptrs := make([]*C.char, len(jsons))
+	lens := make([]C.size_t, len(jsons))
 	for i, j := range jsons {
-		cJSONs[i] = C.CString(j)
-		cLens[i] = C.size_t(len(j))
-	}
-
-	// Free all strings after the call
-	defer func() {
-		for _, cj := range cJSONs {
-			C.free(unsafe.Pointer(cj))
+		if len(j) > 0 {
+			ptrs[i] = (*C.char)(unsafe.Pointer(unsafe.StringData(j)))
+		} else {
+			// Same null-vs-sentinel rationale as IngestRaw above.
+			ptrs[i] = (*C.char)(unsafe.Pointer(&emptyByte[0]))
 		}
-	}()
+		lens[i] = C.size_t(len(j))
+	}
 
 	result := C.net_ingest_raw_batch(
 		bs.handle,
-		(**C.char)(unsafe.Pointer(&cJSONs[0])),
-		(*C.size_t)(unsafe.Pointer(&cLens[0])),
+		(**C.char)(unsafe.Pointer(&ptrs[0])),
+		(*C.size_t)(unsafe.Pointer(&lens[0])),
 		C.size_t(len(jsons)),
 	)
+	// Keep the slice (and transitively the strings it references)
+	// alive across the cgo call. Go's escape analysis won't see the
+	// reachability through the raw pointers we passed.
+	runtime.KeepAlive(jsons)
+	runtime.KeepAlive(ptrs)
+	runtime.KeepAlive(lens)
 
 	return int(result)
 }
@@ -296,14 +325,15 @@ func (bs *Net) Poll(limit int, cursor string) (*PollResponse, error) {
 		return nil, ErrShuttingDown
 	}
 
-	// Build request JSON
-	request := map[string]interface{}{"limit": limit}
-	if cursor != "" {
-		request["cursor"] = cursor
-	}
-	requestData, _ := json.Marshal(request)
-	cRequest := C.CString(string(requestData))
-	defer C.free(unsafe.Pointer(cRequest))
+	// Build the request JSON inline. The previous map +
+	// `json.Marshal` path allocated a `map[string]interface{}`,
+	// boxed the int, ran the reflect-based marshaler, *and* paid
+	// a `C.CString` malloc + copy to hand it across the FFI
+	// boundary. Hand-rolling produces a single null-terminated
+	// byte slice and passes it directly via the Go-managed
+	// pointer — kept alive across the cgo call by KeepAlive.
+	cRequestBuf := buildPollRequest(limit, cursor)
+	cRequest := (*C.char)(unsafe.Pointer(&cRequestBuf[0]))
 
 	// Allocate output buffer (start with 64KB, grow if needed)
 	bufferSize := 65536
@@ -315,6 +345,9 @@ func (bs *Net) Poll(limit int, cursor string) (*PollResponse, error) {
 			(*C.char)(unsafe.Pointer(&buffer[0])),
 			C.size_t(bufferSize),
 		)
+		// Keep the request buffer alive across each cgo call —
+		// `cRequest` is a raw pointer the GC otherwise can't trace.
+		runtime.KeepAlive(cRequestBuf)
 
 		if result == -7 { // NET_ERR_BUFFER_TOO_SMALL
 			bufferSize *= 2
@@ -336,6 +369,30 @@ func (bs *Net) Poll(limit int, cursor string) (*PollResponse, error) {
 
 		return &response, nil
 	}
+}
+
+// buildPollRequest produces a null-terminated UTF-8 byte slice of
+// the form `{"limit":<N>}` or `{"limit":<N>,"cursor":<JSON>}`. The
+// trailing `0x00` lets us hand the slice's data pointer to a C
+// function expecting `const char*` without paying for a C-side
+// malloc + copy via `C.CString`.
+//
+// Cursor escaping deliberately routes through `json.Marshal` so any
+// quotes / control bytes / backslashes in a future cursor format
+// stay correctly encoded. The simple-limit-only path skips Marshal
+// entirely.
+func buildPollRequest(limit int, cursor string) []byte {
+	// Capacity guess: prefix + ~20 digits for limit + cursor block + close + null.
+	buf := make([]byte, 0, 32+len(cursor)+8)
+	buf = append(buf, `{"limit":`...)
+	buf = strconv.AppendInt(buf, int64(limit), 10)
+	if cursor != "" {
+		buf = append(buf, `,"cursor":`...)
+		cursorJSON, _ := json.Marshal(cursor)
+		buf = append(buf, cursorJSON...)
+	}
+	buf = append(buf, '}', 0)
+	return buf
 }
 
 // Stats returns event bus statistics.

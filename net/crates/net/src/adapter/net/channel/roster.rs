@@ -96,9 +96,22 @@ impl SubscriberRoster {
     /// the failure-detector hook when a peer transitions to `Failed`. Returns
     /// the list of channels the peer was removed from, for diagnostics.
     pub fn remove_peer(&self, node_id: u64) -> Vec<ChannelId> {
-        let channels: Vec<ChannelId> = match self.by_peer.remove(&node_id) {
-            Some((_, set)) => set.iter().map(|c| c.clone()).collect(),
+        let arc_set = match self.by_peer.remove(&node_id) {
+            Some((_, set)) => set,
             None => return Vec::new(),
+        };
+        // We just removed the only `by_peer` reference to this `Arc`.
+        // Within this module the `by_peer` map is the sole owner —
+        // `add()` and `remove()` are the only sites that touch the
+        // `Arc<DashSet<ChannelId>>` and neither hands out clones — so
+        // `try_unwrap` succeeds in the steady state and we can drain
+        // the set into owned `ChannelId`s without per-element
+        // `String` allocations. Fall back to the elementwise clone
+        // path defensively in case a future caller hands out an
+        // `Arc::clone` we didn't anticipate.
+        let channels: Vec<ChannelId> = match Arc::try_unwrap(arc_set) {
+            Ok(dashset) => dashset.into_iter().collect(),
+            Err(arc) => arc.iter().map(|c| c.clone()).collect(),
         };
         for ch in &channels {
             if let Some(set) = self.subs.get(ch) {

@@ -25,12 +25,19 @@ fn cn(s: &str) -> ChannelName {
 /// seq 0, assert every event arrives in order.
 #[tokio::test]
 async fn test_redex_10k_roundtrip() {
+    const N: u64 = 10_000;
+
     let r = Redex::new();
     let f = r
-        .open_file(&cn("throughput/10k"), RedexFileConfig::default())
+        .open_file(
+            &cn("throughput/10k"),
+            // Producer yields every 1024 events; size the tail buffer
+            // generously above that so transient consumer-scheduling
+            // gaps don't trip the disconnect-on-full policy.
+            RedexFileConfig::default().with_tail_buffer_size(N as usize),
+        )
         .unwrap();
 
-    const N: u64 = 10_000;
     let mut stream = Box::pin(f.tail(0));
 
     let f2 = f.clone();
@@ -431,6 +438,160 @@ async fn test_redex_close_signals_tail() {
 
     // Stream ends after the Closed signal.
     assert!(stream.next().await.is_none());
+}
+
+/// A `tail(from_seq)` whose backfill set is larger than the
+/// per-subscription buffer must surface `RedexError::Lagged` as
+/// the FIRST stream item — not a silently-truncated history. This
+/// is stronger than the live-overflow guarantee (which is
+/// best-effort under saturation) because the channel is empty at
+/// subscription time, so the pre-flight check can guarantee
+/// delivery of the Lagged signal.
+#[tokio::test]
+async fn test_redex_tail_backfill_overflow_yields_lagged_first() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    // A regression in disconnect signaling could leave the stream
+    // hanging on `next().await`. Bound every await so a hang fails
+    // the test explicitly instead of running until the test
+    // runner's outer kill window.
+    const AWAIT_BUDGET: Duration = Duration::from_secs(2);
+
+    const BUFFER: usize = 4;
+    let r = Redex::new();
+    let f = r
+        .open_file(
+            &cn("backfill-overflow"),
+            RedexFileConfig::default().with_tail_buffer_size(BUFFER),
+        )
+        .unwrap();
+
+    // Build retained history far past the buffer.
+    for i in 0..50u64 {
+        f.append(format!("seed-{}", i).as_bytes()).unwrap();
+    }
+
+    let mut stream = Box::pin(f.tail(0));
+
+    // The first item must be `Lagged` — no truncated history.
+    let first = timeout(AWAIT_BUDGET, stream.next())
+        .await
+        .expect("stream.next() hung waiting for backfill-overflow Lagged signal");
+    match first {
+        Some(Err(RedexError::Lagged)) => { /* expected */ }
+        Some(Ok(ev)) => panic!(
+            "backfill overflow must signal Lagged before any event; \
+             instead got event seq {}",
+            ev.entry.seq
+        ),
+        Some(Err(e)) => panic!("unexpected error: {:?}", e),
+        None => panic!("stream ended without Lagged signal"),
+    }
+
+    // Stream ends after the Lagged signal — the watcher was never
+    // registered.
+    let after = timeout(AWAIT_BUDGET, stream.next())
+        .await
+        .expect("stream.next() hung after Lagged; expected stream end");
+    assert!(
+        after.is_none(),
+        "stream must end after backfill-overflow Lagged"
+    );
+}
+
+/// Slow tail subscriber overflowing the per-subscription buffer must
+/// be disconnected, never silently grow memory. Pins the
+/// disconnect-on-full semantics introduced when `tail()` switched
+/// from an unbounded channel to a bounded one with a
+/// `RedexError::Lagged` signal.
+///
+/// The test is intentionally pessimistic: it never drains the stream
+/// while appending, so the bounded channel saturates and the
+/// best-effort `Lagged` signal may itself be dropped on a full
+/// buffer. We accept either delivery outcome (Lagged surfaces, or
+/// the stream simply ends), and assert two invariants in both:
+///   1. We never receive more events than the buffer can hold —
+///      i.e., the watcher really was disconnected, not just
+///      momentarily backpressured.
+///   2. After the disconnect, the stream stays ended even as new
+///      appends land — a regression here would mean the watcher
+///      survived past its disconnect or got reattached.
+#[tokio::test]
+async fn test_redex_tail_lagged_disconnects_slow_subscriber() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    // Bound every `stream.next()` so a regression in disconnect
+    // signaling fails fast and explicitly rather than hanging until
+    // the test runner's kill window.
+    const AWAIT_BUDGET: Duration = Duration::from_secs(2);
+
+    const BUFFER: usize = 4;
+    let r = Redex::new();
+    let f = r
+        .open_file(
+            &cn("lagged"),
+            RedexFileConfig::default().with_tail_buffer_size(BUFFER),
+        )
+        .unwrap();
+
+    let mut stream = Box::pin(f.tail(0));
+
+    // Flood far past the buffer without ever draining.
+    for i in 0..50u64 {
+        f.append(format!("event-{}", i).as_bytes()).unwrap();
+    }
+
+    // Drain whatever the channel had room to retain. Stop on either
+    // a `Lagged` error or natural end-of-stream.
+    let mut delivered_seqs = Vec::new();
+    let mut saw_lagged = false;
+    loop {
+        let item = timeout(AWAIT_BUDGET, stream.next())
+            .await
+            .expect("stream.next() hung while draining lagged subscription");
+        match item {
+            None => break,
+            Some(Ok(event)) => delivered_seqs.push(event.entry.seq),
+            Some(Err(RedexError::Lagged)) => {
+                saw_lagged = true;
+                break;
+            }
+            Some(Err(other)) => panic!("unexpected error from lagged stream: {:?}", other),
+        }
+    }
+
+    // Invariant 1: deliveries are bounded by the buffer size, and form
+    // a contiguous prefix from seq 0 — the events that fit before the
+    // disconnect.
+    assert!(
+        !delivered_seqs.is_empty(),
+        "subscriber should see at least one event before the disconnect"
+    );
+    assert!(
+        delivered_seqs.len() <= BUFFER,
+        "subscriber received {} events, exceeds bounded buffer of {}",
+        delivered_seqs.len(),
+        BUFFER,
+    );
+    for (i, seq) in delivered_seqs.iter().enumerate() {
+        assert_eq!(*seq, i as u64, "events must arrive in seq order");
+    }
+
+    // Invariant 2: the stream stays ended. Append more events and
+    // confirm the disconnected stream does not resurrect.
+    for i in 50..60u64 {
+        f.append(format!("late-{}", i).as_bytes()).unwrap();
+    }
+    let after = timeout(AWAIT_BUDGET, stream.next())
+        .await
+        .expect("stream.next() hung after disconnect; expected stream end");
+    assert!(
+        after.is_none(),
+        "stream must remain ended after lagged disconnect; saw_lagged = {}",
+        saw_lagged,
+    );
 }
 
 #[test]

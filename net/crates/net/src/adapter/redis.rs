@@ -101,18 +101,33 @@ impl RedisAdapter {
     }
 
     /// Deserialize a stored event.
-    fn deserialize_event(id: String, data: &[u8]) -> Result<StoredEvent, AdapterError> {
-        let value: serde_json::Value =
+    ///
+    /// Borrows `id` so the caller can defer the owned-String
+    /// allocation until success. Uses `RawValue` to slice the `r`
+    /// field directly out of the stored bytes — no full JSON tree
+    /// allocation, no re-serialize.
+    fn deserialize_event(id: &str, data: &[u8]) -> Result<StoredEvent, AdapterError> {
+        #[derive(serde::Deserialize)]
+        struct StoredFormat<'a> {
+            #[serde(borrow)]
+            r: &'a serde_json::value::RawValue,
+            #[serde(default)]
+            t: u64,
+            #[serde(default)]
+            s: u16,
+        }
+
+        let parsed: StoredFormat =
             serde_json::from_slice(data).map_err(|e| AdapterError::Serialization(e.to_string()))?;
 
-        let raw = value.get("r").cloned().unwrap_or(serde_json::Value::Null);
-        let raw_bytes = Bytes::from(serde_json::to_vec(&raw).unwrap_or_default());
+        let raw_bytes = Bytes::copy_from_slice(parsed.r.get().as_bytes());
 
-        let insertion_ts = value.get("t").and_then(|v| v.as_u64()).unwrap_or(0);
-
-        let shard_id = value.get("s").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
-
-        Ok(StoredEvent::new(id, raw_bytes, insertion_ts, shard_id))
+        Ok(StoredEvent::new(
+            id.to_string(),
+            raw_bytes,
+            parsed.t,
+            parsed.s,
+        ))
     }
 
     /// Get a connection (with error handling).
@@ -270,32 +285,33 @@ impl Adapter for RedisAdapter {
             for entry in entries.iter().take(limit) {
                 if let Value::Array(parts) = entry {
                     if parts.len() >= 2 {
-                        // First element is the ID
-                        let id = match &parts[0] {
-                            Value::BulkString(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                            Value::SimpleString(s) => s.clone(),
+                        // First element is the ID. Borrow it as `&str`
+                        // until we know we'll keep the event — defers
+                        // the owned `String` allocation to the success
+                        // path inside `deserialize_event`.
+                        let id: std::borrow::Cow<str> = match &parts[0] {
+                            Value::BulkString(bytes) => String::from_utf8_lossy(bytes),
+                            Value::SimpleString(s) => std::borrow::Cow::Borrowed(s.as_str()),
                             _ => continue,
                         };
 
-                        // Second element is array of field-value pairs
+                        // Second element is array of field-value pairs.
                         if let Value::Array(ref fields) = parts[1] {
-                            // Find "d" field
+                            // Find the "d" field. Compare against the
+                            // byte literal directly — no allocation
+                            // for what is otherwise a constant-name
+                            // probe on every entry.
                             let mut i = 0;
                             while i + 1 < fields.len() {
-                                let field_name = match &fields[i] {
-                                    Value::BulkString(bytes) => {
-                                        String::from_utf8_lossy(bytes).to_string()
-                                    }
-                                    Value::SimpleString(s) => s.clone(),
-                                    _ => {
-                                        i += 2;
-                                        continue;
-                                    }
+                                let is_data_field = match &fields[i] {
+                                    Value::BulkString(bytes) => bytes.as_slice() == b"d",
+                                    Value::SimpleString(s) => s == "d",
+                                    _ => false,
                                 };
 
-                                if field_name == "d" {
+                                if is_data_field {
                                     if let Value::BulkString(data) = &fields[i + 1] {
-                                        match Self::deserialize_event(id.clone(), data) {
+                                        match Self::deserialize_event(&id, data) {
                                             Ok(event) => events.push(event),
                                             Err(e) => {
                                                 tracing::warn!(
@@ -391,7 +407,7 @@ mod tests {
     #[test]
     fn test_deserialize_event() {
         let data = br#"{"r":{"token":"world"},"t":9999,"s":7}"#;
-        let event = RedisAdapter::deserialize_event("1702123456789-0".to_string(), data).unwrap();
+        let event = RedisAdapter::deserialize_event("1702123456789-0", data).unwrap();
 
         assert_eq!(event.id, "1702123456789-0");
         assert_eq!(event.insertion_ts, 9999);

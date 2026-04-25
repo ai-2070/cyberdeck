@@ -56,6 +56,13 @@ pub enum RedexError {
     /// The file has been closed.
     #[error("file closed")]
     Closed,
+
+    /// A tail subscriber fell behind the per-subscription buffer and
+    /// was disconnected. Delivery is best-effort: under saturation
+    /// the buffer may be too full to accept this signal itself, in
+    /// which case the subscriber observes only a plain stream end.
+    #[error("tail subscriber lagged; stream disconnected")]
+    Lagged,
 }
 
 impl RedexError {

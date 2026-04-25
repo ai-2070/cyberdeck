@@ -29,11 +29,16 @@ export class TypedChannel<T> {
   private bus: NapiNet;
   private channelName: string;
   private validator?: (data: unknown) => T;
+  // Filter is a constant for the lifetime of the channel; build the
+  // JSON string once instead of regenerating it on every subscribe /
+  // subscribeRaw call.
+  private readonly filter: string;
 
   constructor(bus: NapiNet, channelName: string, validator?: (data: unknown) => T) {
     this.bus = bus;
     this.channelName = channelName;
     this.validator = validator;
+    this.filter = JSON.stringify({ path: '_channel', value: channelName });
   }
 
   /** The channel name. */
@@ -75,10 +80,9 @@ export class TypedChannel<T> {
    * each event.
    */
   subscribe(opts: SubscribeOpts = {}): TypedEventStream<T> {
-    const filter = JSON.stringify({ path: '_channel', value: this.channelName });
     const mergedOpts: SubscribeOpts = {
       ...opts,
-      filter: opts.filter ?? filter,
+      filter: opts.filter ?? this.filter,
     };
 
     const parse = this.validator
@@ -92,10 +96,9 @@ export class TypedChannel<T> {
    * Subscribe to raw events on this channel.
    */
   subscribeRaw(opts: SubscribeOpts = {}): EventStream {
-    const filter = JSON.stringify({ path: '_channel', value: this.channelName });
     const mergedOpts: SubscribeOpts = {
       ...opts,
-      filter: opts.filter ?? filter,
+      filter: opts.filter ?? this.filter,
     };
     return new EventStream(this.bus, mergedOpts);
   }

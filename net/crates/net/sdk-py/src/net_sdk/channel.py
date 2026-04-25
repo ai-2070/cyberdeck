@@ -46,6 +46,10 @@ class TypedChannel(Generic[T]):
         self._name = name
         self._model = model
         self._parse = parse
+        # Filter is a constant for the lifetime of the channel; build
+        # the JSON string once instead of regenerating it on every
+        # subscribe / subscribe_raw call.
+        self._filter = json.dumps({"path": "_channel", "value": name})
 
     @property
     def name(self) -> str:
@@ -69,10 +73,9 @@ class TypedChannel(Generic[T]):
 
     def subscribe(self, opts: Optional[SubscribeOpts] = None) -> TypedEventStream[T]:
         """Subscribe to typed events on this channel."""
-        filter_str = json.dumps({"path": "_channel", "value": self._name})
         merged = opts or SubscribeOpts()
         if merged.filter is None:
-            merged.filter = filter_str
+            merged.filter = self._filter
 
         if self._parse is not None:
             parse_fn = self._parse
@@ -94,8 +97,7 @@ class TypedChannel(Generic[T]):
 
     def subscribe_raw(self, opts: Optional[SubscribeOpts] = None) -> EventStream:
         """Subscribe to raw events on this channel."""
-        filter_str = json.dumps({"path": "_channel", "value": self._name})
         merged = opts or SubscribeOpts()
         if merged.filter is None:
-            merged.filter = filter_str
+            merged.filter = self._filter
         return EventStream(self._bus, merged)

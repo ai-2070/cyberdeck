@@ -747,11 +747,12 @@ pub struct CapabilityAnnouncement {
     pub hop_count: u8,
     /// Observer-visible reflexive `SocketAddr` as seen by this
     /// node's anchor peers during NAT classification. Populated
-    /// once [`crate::adapter::net::traversal::classify::ClassifyFsm`]
-    /// has ≥ 2 probe results; stays `None` on nodes that haven't
-    /// classified yet, ran with `nat-traversal` disabled, or
-    /// landed in the `Unknown` bucket (different peers disagree
-    /// on our port so no single address is truthful).
+    /// once the `ClassifyFsm` (under the `nat-traversal` feature,
+    /// in `adapter/net/traversal/classify.rs`) has ≥ 2 probe
+    /// results; stays `None` on nodes that haven't classified
+    /// yet, ran with `nat-traversal` disabled, or landed in the
+    /// `Unknown` bucket (different peers disagree on our port
+    /// so no single address is truthful).
     ///
     /// **Peer usage.** Receivers cache this alongside the
     /// `nat:*` tag and use it as the initial rendezvous target
@@ -1113,6 +1114,18 @@ impl CapabilityFilter {
 
         true
     }
+
+    /// True if the filter has any predicate that the inverted indexes
+    /// (tags / models / tools / GPU / vendor) cannot satisfy on their
+    /// own. When this returns `false`, [`CapabilityIndex::query`]
+    /// can trust the index intersection as authoritative and skip
+    /// the per-candidate `nodes` lookup + full re-check.
+    fn needs_full_check(&self) -> bool {
+        self.min_memory_mb.is_some()
+            || self.min_vram_mb.is_some()
+            || self.min_context_length.is_some()
+            || !self.require_modalities.is_empty()
+    }
 }
 
 // ============================================================================
@@ -1339,34 +1352,59 @@ impl CapabilityIndex {
         }
     }
 
-    /// Add node to inverted indexes
+    /// Add node to inverted indexes.
+    ///
+    /// On the steady-state re-announcement path (peer re-broadcasts
+    /// the same `CapabilitySet` periodically), the inverted-index
+    /// entries for its tags / models / tools already exist. We do a
+    /// borrowing `get_mut` first and only fall through to the
+    /// owned-key `entry()` insert on a true cache miss — this skips
+    /// the per-tag `String` clone for every existing key. The
+    /// fallback is still atomic via DashMap's `entry().or_default()`,
+    /// so concurrent first-time inserts of the same key are safe
+    /// (the loser pays a redundant clone, which is the original
+    /// cost; correctness is unchanged).
     fn add_to_indexes(&self, node_id: u64, caps: &CapabilitySet) {
         // Tags
         for tag in &caps.tags {
-            self.by_tag.entry(tag.clone()).or_default().insert(node_id);
+            if let Some(mut set) = self.by_tag.get_mut(tag) {
+                set.insert(node_id);
+            } else {
+                self.by_tag.entry(tag.clone()).or_default().insert(node_id);
+            }
         }
 
         // Models
         for model in &caps.models {
-            self.by_model
-                .entry(model.model_id.clone())
-                .or_default()
-                .insert(node_id);
+            if let Some(mut set) = self.by_model.get_mut(&model.model_id) {
+                set.insert(node_id);
+            } else {
+                self.by_model
+                    .entry(model.model_id.clone())
+                    .or_default()
+                    .insert(node_id);
+            }
         }
 
         // Tools
         for tool in &caps.tools {
-            self.by_tool
-                .entry(tool.tool_id.clone())
-                .or_default()
-                .insert(node_id);
+            if let Some(mut set) = self.by_tool.get_mut(&tool.tool_id) {
+                set.insert(node_id);
+            } else {
+                self.by_tool
+                    .entry(tool.tool_id.clone())
+                    .or_default()
+                    .insert(node_id);
+            }
         }
 
-        // GPU
+        // GPU. Key is `bool`, no allocation either way.
         let has_gpu = caps.has_gpu();
         self.gpu_nodes.entry(has_gpu).or_default().insert(node_id);
 
         if let Some(vendor) = caps.hardware.gpu_vendor() {
+            // Vendor key is `Copy` (small enum), so the entry-only
+            // form is already allocation-free.
             self.by_gpu_vendor
                 .entry(vendor)
                 .or_default()
@@ -1424,45 +1462,50 @@ impl CapabilityIndex {
         }
     }
 
-    /// Query nodes by filter
-    pub fn query(&self, filter: &CapabilityFilter) -> Vec<u64> {
-        self.query_count.fetch_add(1, Ordering::Relaxed);
-
-        // Start with candidate set
+    /// Walk the inverted indexes to build the candidate set narrowed
+    /// by `filter`'s indexed predicates (GPU, vendor, tags, models,
+    /// tools). Returns:
+    ///
+    /// - `Some(set)` when at least one indexed predicate applied. The
+    ///   set may be empty, in which case downstream filtering trivially
+    ///   yields no results.
+    /// - `None` when the filter has zero indexed predicates — callers
+    ///   fall back to "all nodes" before applying any non-indexed
+    ///   predicates.
+    fn build_candidate_set(&self, filter: &CapabilityFilter) -> Option<HashSet<u64>> {
         let mut candidates: Option<HashSet<u64>> = None;
-
-        // Use inverted indexes to narrow down candidates
 
         // GPU filter (most selective often)
         if filter.require_gpu {
-            if let Some(gpu_nodes) = self.gpu_nodes.get(&true) {
-                candidates = Some(gpu_nodes.clone());
-            } else {
-                return Vec::new();
+            match self.gpu_nodes.get(&true) {
+                Some(gpu_nodes) => candidates = Some(gpu_nodes.clone()),
+                None => return Some(HashSet::new()),
             }
         }
 
         // GPU vendor filter
         if let Some(vendor) = filter.gpu_vendor {
-            if let Some(vendor_nodes) = self.by_gpu_vendor.get(&vendor) {
-                candidates = Some(match candidates {
-                    Some(c) => c.intersection(&vendor_nodes).copied().collect(),
-                    None => vendor_nodes.clone(),
-                });
-            } else {
-                return Vec::new();
+            match self.by_gpu_vendor.get(&vendor) {
+                Some(vendor_nodes) => {
+                    candidates = Some(match candidates {
+                        Some(c) => c.intersection(&vendor_nodes).copied().collect(),
+                        None => vendor_nodes.clone(),
+                    });
+                }
+                None => return Some(HashSet::new()),
             }
         }
 
         // Tag filter (all required)
         for tag in &filter.require_tags {
-            if let Some(tag_nodes) = self.by_tag.get(tag) {
-                candidates = Some(match candidates {
-                    Some(c) => c.intersection(&tag_nodes).copied().collect(),
-                    None => tag_nodes.clone(),
-                });
-            } else {
-                return Vec::new();
+            match self.by_tag.get(tag) {
+                Some(tag_nodes) => {
+                    candidates = Some(match candidates {
+                        Some(c) => c.intersection(&tag_nodes).copied().collect(),
+                        None => tag_nodes.clone(),
+                    });
+                }
+                None => return Some(HashSet::new()),
             }
         }
 
@@ -1475,7 +1518,7 @@ impl CapabilityIndex {
                 }
             }
             if model_candidates.is_empty() {
-                return Vec::new();
+                return Some(HashSet::new());
             }
             candidates = Some(match candidates {
                 Some(c) => c.intersection(&model_candidates).copied().collect(),
@@ -1492,7 +1535,7 @@ impl CapabilityIndex {
                 }
             }
             if tool_candidates.is_empty() {
-                return Vec::new();
+                return Some(HashSet::new());
             }
             candidates = Some(match candidates {
                 Some(c) => c.intersection(&tool_candidates).copied().collect(),
@@ -1500,11 +1543,33 @@ impl CapabilityIndex {
             });
         }
 
-        // If no indexed filters applied, start with all nodes
-        let candidates =
-            candidates.unwrap_or_else(|| self.nodes.iter().map(|r| *r.key()).collect());
+        candidates
+    }
 
-        // Apply remaining filters that need full capability check
+    /// Query nodes by filter
+    pub fn query(&self, filter: &CapabilityFilter) -> Vec<u64> {
+        self.query_count.fetch_add(1, Ordering::Relaxed);
+
+        let candidates = self
+            .build_candidate_set(filter)
+            .unwrap_or_else(|| self.nodes.iter().map(|r| *r.key()).collect());
+
+        // Fast path: if the filter only constrains dimensions covered
+        // by the inverted indexes, the intersection above is already
+        // the answer. Skip the per-candidate `nodes.get()` + full
+        // `matches()` re-check — but still confirm presence via
+        // `contains_key` so a node evicted in the race window between
+        // the index read and now does not leak into the result.
+        if !filter.needs_full_check() {
+            return candidates
+                .into_iter()
+                .filter(|&node_id| self.nodes.contains_key(&node_id))
+                .collect();
+        }
+
+        // Slow path: filter has non-indexed predicates (memory, vram,
+        // context length, modalities). Pull each candidate's full
+        // capability set and re-check.
         candidates
             .into_iter()
             .filter(|&node_id| {
@@ -1516,16 +1581,31 @@ impl CapabilityIndex {
             .collect()
     }
 
-    /// Find best matching node using requirements
+    /// Find best matching node using requirements.
+    ///
+    /// Iterates the index-narrowed candidate set once, folding the
+    /// non-indexed-predicate check (when needed) and the score
+    /// computation into a single `nodes.get()` per candidate.
+    /// Previously this called [`Self::query`] and then re-fetched
+    /// each candidate again to score it — a double DashMap lookup
+    /// per candidate that has now collapsed to one.
     pub fn find_best(&self, req: &CapabilityRequirement) -> Option<u64> {
-        let candidates = self.query(&req.filter);
+        self.query_count.fetch_add(1, Ordering::Relaxed);
+
+        let candidates = self
+            .build_candidate_set(&req.filter)
+            .unwrap_or_else(|| self.nodes.iter().map(|r| *r.key()).collect());
+
+        let needs_full = req.filter.needs_full_check();
 
         candidates
             .into_iter()
             .filter_map(|node_id| {
-                self.nodes
-                    .get(&node_id)
-                    .map(|n| (node_id, req.score(&n.capabilities)))
+                let node = self.nodes.get(&node_id)?;
+                if needs_full && !req.filter.matches(&node.capabilities) {
+                    return None;
+                }
+                Some((node_id, req.score(&node.capabilities)))
             })
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(node_id, _)| node_id)
@@ -2370,6 +2450,125 @@ mod tests {
             "hop_count>0 must survive serialization so forwarders \
              can read + bump. Got: {}",
             bumped_str,
+        );
+    }
+
+    /// `query()` has two paths after the index intersection: a fast
+    /// path that trusts the indexes when the filter constrains only
+    /// indexed dimensions, and a slow path that re-applies
+    /// `filter.matches()` per candidate when non-indexed predicates
+    /// are set. The two must produce identical results for any
+    /// filter with no truly-non-indexed predicates.
+    ///
+    /// We force the slow path by adding `min_memory_mb = 0` — an
+    /// always-true predicate (memory_mb is unsigned, so the
+    /// `memory_mb < 0` check can never fire) that nonetheless makes
+    /// `needs_full_check()` return true. If a future change to
+    /// `needs_full_check()` ever omits a non-indexed field, this
+    /// test catches it: the fast and slow paths would diverge.
+    #[test]
+    fn query_fast_path_matches_slow_path_for_indexed_only_filter() {
+        let index = CapabilityIndex::new();
+
+        for i in 0..30u64 {
+            let mut caps = sample_capability_set();
+            // sample_capability_set already has tag "inference" + "gpu"; vary
+            // additional tags so filters discriminate.
+            if i % 2 == 0 {
+                caps.tags.push("even".into());
+            }
+            if i % 3 == 0 {
+                caps.tags.push("triple".into());
+            }
+            let ann = CapabilityAnnouncement::new(i, test_entity(), 1, caps);
+            index.index(ann);
+        }
+
+        // Indexed-only filter — exercises the fast path.
+        let indexed_only = CapabilityFilter::new()
+            .require_tag("even")
+            .require_tag("inference");
+        // Same predicates plus an always-true non-indexed predicate to
+        // force the slow path.
+        let mut force_slow = indexed_only.clone();
+        force_slow.min_memory_mb = Some(0);
+
+        assert!(
+            !indexed_only.needs_full_check(),
+            "filter with only tags must take the fast path"
+        );
+        assert!(
+            force_slow.needs_full_check(),
+            "filter with min_memory_mb must take the slow path"
+        );
+
+        let mut fast: Vec<u64> = index.query(&indexed_only);
+        let mut slow: Vec<u64> = index.query(&force_slow);
+        fast.sort();
+        slow.sort();
+        assert_eq!(
+            fast, slow,
+            "fast path and slow path must agree when filters are equivalent"
+        );
+        assert!(
+            !fast.is_empty(),
+            "sample data must produce non-empty results"
+        );
+    }
+
+    /// After the `find_best()` refactor that folds the index lookup
+    /// and the score lookup into a single pass, the chosen node must
+    /// still match what `query()` returns intersected with the
+    /// highest-scoring candidate. Pins the contract: any future
+    /// re-derivation of the candidate set must keep `find_best`'s
+    /// answer inside `query`'s result set.
+    #[test]
+    fn find_best_returns_a_member_of_query_results() {
+        let index = CapabilityIndex::new();
+
+        for i in 0..20u64 {
+            let mut caps = sample_capability_set();
+            // Discriminator tag.
+            if i % 4 == 0 {
+                caps.tags.push("preferred".into());
+            }
+            // Vary memory so `prefer_memory` produces a real ordering.
+            caps.hardware.memory_mb = 1024 * (i as u32 + 1);
+            let ann = CapabilityAnnouncement::new(i, test_entity(), 1, caps);
+            index.index(ann);
+        }
+
+        let filter = CapabilityFilter::new().require_tag("preferred");
+        let req = CapabilityRequirement::from_filter(filter.clone()).prefer_memory(1.0);
+
+        let candidates = index.query(&filter);
+        let chosen = index
+            .find_best(&req)
+            .expect("non-empty candidate set must yield a winner");
+
+        assert!(
+            candidates.contains(&chosen),
+            "find_best returned {} which is not in query() candidates {:?}",
+            chosen,
+            candidates,
+        );
+
+        // With `prefer_memory(1.0)` and our memory_mb assignment, the
+        // largest-memory candidate must win — pins the score path.
+        let expected_winner = candidates
+            .iter()
+            .max_by_key(|&&id| {
+                index
+                    .nodes
+                    .get(&id)
+                    .map(|n| n.capabilities.hardware.memory_mb)
+                    .unwrap_or(0)
+            })
+            .copied()
+            .expect("non-empty candidates");
+        assert_eq!(
+            chosen, expected_winner,
+            "find_best must pick the highest-memory candidate under prefer_memory(1.0)"
         );
     }
 }
