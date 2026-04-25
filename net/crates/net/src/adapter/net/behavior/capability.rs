@@ -1339,34 +1339,59 @@ impl CapabilityIndex {
         }
     }
 
-    /// Add node to inverted indexes
+    /// Add node to inverted indexes.
+    ///
+    /// On the steady-state re-announcement path (peer re-broadcasts
+    /// the same `CapabilitySet` periodically), the inverted-index
+    /// entries for its tags / models / tools already exist. We do a
+    /// borrowing `get_mut` first and only fall through to the
+    /// owned-key `entry()` insert on a true cache miss — this skips
+    /// the per-tag `String` clone for every existing key. The
+    /// fallback is still atomic via DashMap's `entry().or_default()`,
+    /// so concurrent first-time inserts of the same key are safe
+    /// (the loser pays a redundant clone, which is the original
+    /// cost; correctness is unchanged).
     fn add_to_indexes(&self, node_id: u64, caps: &CapabilitySet) {
         // Tags
         for tag in &caps.tags {
-            self.by_tag.entry(tag.clone()).or_default().insert(node_id);
+            if let Some(mut set) = self.by_tag.get_mut(tag) {
+                set.insert(node_id);
+            } else {
+                self.by_tag.entry(tag.clone()).or_default().insert(node_id);
+            }
         }
 
         // Models
         for model in &caps.models {
-            self.by_model
-                .entry(model.model_id.clone())
-                .or_default()
-                .insert(node_id);
+            if let Some(mut set) = self.by_model.get_mut(&model.model_id) {
+                set.insert(node_id);
+            } else {
+                self.by_model
+                    .entry(model.model_id.clone())
+                    .or_default()
+                    .insert(node_id);
+            }
         }
 
         // Tools
         for tool in &caps.tools {
-            self.by_tool
-                .entry(tool.tool_id.clone())
-                .or_default()
-                .insert(node_id);
+            if let Some(mut set) = self.by_tool.get_mut(&tool.tool_id) {
+                set.insert(node_id);
+            } else {
+                self.by_tool
+                    .entry(tool.tool_id.clone())
+                    .or_default()
+                    .insert(node_id);
+            }
         }
 
-        // GPU
+        // GPU. Key is `bool`, no allocation either way.
         let has_gpu = caps.has_gpu();
         self.gpu_nodes.entry(has_gpu).or_default().insert(node_id);
 
         if let Some(vendor) = caps.hardware.gpu_vendor() {
+            // Vendor key is `Copy` (small enum), so the entry-only
+            // form is already allocation-free.
             self.by_gpu_vendor
                 .entry(vendor)
                 .or_default()
