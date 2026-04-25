@@ -284,6 +284,39 @@ not_yet_valid | delegation_exhausted | delegation_not_allowed |
 not_authorized`. Parse with `str(e).removeprefix("token: ")` for
 programmatic dispatch.
 
+### Scoped capability discovery (reserved `scope:*` tags)
+
+A provider can narrow *who its query result reaches* by tagging
+its `CapabilitySet` with reserved `scope:*` tags (e.g.
+`scope:tenant:oem-123`, `scope:region:eu-west`,
+`scope:subnet-local`). Queries call `mesh.find_nodes_scoped(filter,
+scope)` to filter candidates. The wire format and forwarders are
+untouched — enforcement is purely query-side.
+
+```python
+# GPU pool advertised to one tenant only.
+mesh.announce_capabilities({
+    "tags": ["model:llama3-70b", "scope:tenant:oem-123"],
+})
+
+# Tenant-scoped query — returns this node + any Global (untagged) peers.
+oem_nodes = mesh.find_nodes_scoped(
+    {"require_tags": ["model:llama3-70b"]},
+    {"kind": "tenant", "tenant": "oem-123"},
+)
+```
+
+`scope` accepts the dict form `{"kind": "<kind>", ...}`:
+`"any"` (default), `"global_only"`, `"same_subnet"`,
+`{"kind": "tenant", "tenant": "<id>"}`,
+`{"kind": "tenants", "tenants": [...]}`,
+`{"kind": "region", "region": "<name>"}`,
+`{"kind": "regions", "regions": [...]}`. Strictest scope wins —
+`scope:subnet-local` dominates tenant/region tags on the same set.
+Untagged peers resolve to `Global` and stay visible under
+permissive queries (matches the v1 default). Full design:
+[`docs/SCOPED_CAPABILITIES_PLAN.md`](../docs/SCOPED_CAPABILITIES_PLAN.md).
+
 Full surface + runnable examples:
 [`bindings/python/README.md`](../bindings/python/README.md#security-surface-stage-ae).
 Cross-SDK contract + rationale:

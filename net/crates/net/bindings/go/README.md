@@ -564,6 +564,35 @@ gpuNodes, _ := mesh.FindNodes(net.CapabilityFilter{
 })
 ```
 
+#### Scoped discovery (reserved `scope:*` tags)
+
+A provider can narrow *who its query result reaches* by tagging
+its `CapabilitySet` with reserved `scope:*` tags. Queries call
+`FindNodesScoped(filter, scope)` to filter candidates. The wire
+format and forwarders are untouched — enforcement is purely
+query-side.
+
+```go
+// GPU pool advertised to one tenant only.
+mesh.AnnounceCapabilities(net.CapabilitySet{
+    Tags: []string{"model:llama3-70b", "scope:tenant:oem-123"},
+})
+
+// Tenant-scoped query — returns this node + any Global (untagged) peers.
+oemNodes, _ := mesh.FindNodesScoped(
+    net.CapabilityFilter{RequireTags: []string{"model:llama3-70b"}},
+    net.ScopeFilter{Kind: "tenant", Tenant: "oem-123"},
+)
+```
+
+`ScopeFilter.Kind` accepts: `"any"` (default), `"global_only"`,
+`"same_subnet"`, `"tenant"` (with `Tenant`), `"tenants"` (with
+`Tenants`), `"region"` (with `Region`), `"regions"` (with
+`Regions`). Strictest scope wins — `scope:subnet-local` dominates
+tenant/region tags on the same set. Untagged peers resolve to
+`Global` and stay visible under permissive queries. Full design:
+[`docs/SCOPED_CAPABILITIES_PLAN.md`](../../docs/SCOPED_CAPABILITIES_PLAN.md).
+
 Capability propagation is multi-hop, bounded by
 `MAX_CAPABILITY_HOPS = 16` with `(origin, version)` dedup on every
 forwarder. `CapabilityGCIntervalMs` controls both the index TTL

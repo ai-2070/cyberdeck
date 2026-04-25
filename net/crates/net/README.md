@@ -254,6 +254,17 @@ Routing follows capabilities. A request tagged `subprotocol:0x1000` routes to th
 
 The `CapabilityAd` struct is what travels on the wire: compact, versioned, and signed with the node's identity. A node that claims capabilities it doesn't have will be routed around when its behavior diverges from its advertisement — the proximity graph measures actual latency, not claimed latency.
 
+**Scoped discovery via reserved tags.** Capability announcements gossip permissively across the mesh, but providers can narrow *who their query result reaches* by tagging their `CapabilitySet` with reserved `scope:*` tags. The wire format and forwarders are untouched — `find_nodes_scoped(filter, scope)` evaluates the tags as a post-filter on the index. Useful for per-tenant pools, per-region rendezvous, and subnet-local app discovery.
+
+| Tag                       | Effect                                                                          |
+| ------------------------- | ------------------------------------------------------------------------------- |
+| _(no `scope:*` tag)_      | `Global` (default) — visible to every query that doesn't explicitly opt out.    |
+| `scope:subnet-local`      | Visible only under `ScopeFilter::SameSubnet` queries.                           |
+| `scope:tenant:<id>`       | Visible to `ScopeFilter::Tenant(<id>)` queries (and untagged-`Global` callers). |
+| `scope:region:<name>`     | Visible to `ScopeFilter::Region(<name>)` queries.                               |
+
+Strictest scope wins (`subnet-local` > tenants/regions > global). Enforcement is **query-side only**, not on the path; cross-tenant *routing* still flows freely. Full design: [`SCOPED_CAPABILITIES_PLAN.md`](docs/SCOPED_CAPABILITIES_PLAN.md).
+
 ## Proximity & Discovery
 
 Nodes find each other through `Pingwave` — periodic broadcasts that propagate outward within a configurable hop radius. A pingwave carries the node's identity, capabilities summary, and a timestamp. If you can hear a node's pingwave, you know it exists, how far away it is, and what it can do.

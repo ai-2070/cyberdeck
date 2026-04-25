@@ -357,6 +357,39 @@ gpu_peers = mesh.find_nodes({
 })
 ```
 
+#### Scoped discovery (reserved `scope:*` tags)
+
+A provider can narrow *who its query result reaches* by tagging
+its `CapabilitySet` with reserved `scope:*` tags. Queries call
+`mesh.find_nodes_scoped(filter, scope)` to filter candidates. The
+wire format and forwarders are untouched — enforcement is purely
+query-side.
+
+```python
+# GPU pool advertised to one tenant only.
+mesh.announce_capabilities({
+    "tags": ["model:llama3-70b", "scope:tenant:oem-123"],
+})
+
+# Tenant-scoped query — returns this node + any Global (untagged) peers.
+oem_nodes = mesh.find_nodes_scoped(
+    {"require_tags": ["model:llama3-70b"]},
+    {"kind": "tenant", "tenant": "oem-123"},
+)
+```
+
+Accepted `scope` dict shapes: `{"kind": "any"}` (default),
+`{"kind": "global_only"}`, `{"kind": "same_subnet"}`,
+`{"kind": "tenant", "tenant": "<id>"}`,
+`{"kind": "tenants", "tenants": [...]}`,
+`{"kind": "region", "region": "<name>"}`,
+`{"kind": "regions", "regions": [...]}`. Reserved announcement
+tags: `scope:subnet-local` (visible only under `same_subnet`),
+`scope:tenant:<id>`, `scope:region:<name>` — strictest scope
+wins. Untagged peers resolve to `Global` and stay visible under
+permissive queries. Full design:
+[`docs/SCOPED_CAPABILITIES_PLAN.md`](../../docs/SCOPED_CAPABILITIES_PLAN.md).
+
 Capability propagation is multi-hop, bounded by
 `MAX_CAPABILITY_HOPS = 16` with `(origin, version)` dedup on every
 forwarder. `capability_gc_interval_ms` controls both the index TTL

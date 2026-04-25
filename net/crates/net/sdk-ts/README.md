@@ -302,6 +302,43 @@ const gpuPeers = mesh.findNodes({
 // gpuPeers includes mesh.nodeId() on self-match.
 ```
 
+#### Scoped discovery (reserved `scope:*` tags)
+
+A provider can narrow *who its query result reaches* by tagging
+its `CapabilitySet` with reserved `scope:*` tags. Queries call
+`mesh.findNodesScoped(filter, scope)` to filter candidates. The
+wire format and forwarders are untouched — enforcement is
+purely query-side.
+
+```typescript
+import { withTenantScope } from '@ai2070/net-sdk';
+
+// GPU pool advertised to one tenant only.
+await mesh.announceCapabilities({
+  tags: withTenantScope(['model:llama3-70b'], 'oem-123'),
+});
+
+// Tenant-scoped query — returns this node + any Global (untagged) peers.
+const oemNodes = mesh.findNodesScoped(
+  { requireTags: ['model:llama3-70b'] },
+  { kind: 'tenant', tenant: 'oem-123' },
+);
+```
+
+`ScopeFilter` is a tagged union by `kind`:
+`{ kind: 'any' }` (default), `{ kind: 'globalOnly' }`,
+`{ kind: 'sameSubnet' }`, `{ kind: 'tenant', tenant }`,
+`{ kind: 'tenants', tenants: [...] }`,
+`{ kind: 'region', region }`,
+`{ kind: 'regions', regions: [...] }`. Reserved announcement
+tags: `scope:subnet-local` (visible only under `sameSubnet`),
+`scope:tenant:<id>`, `scope:region:<name>` — strictest scope
+wins. Helpers `withTenantScope`, `withRegionScope`,
+`withSubnetLocalScope` build the tag list idempotently.
+Untagged peers resolve to `Global` and stay visible under
+permissive queries. Full design:
+[`docs/SCOPED_CAPABILITIES_PLAN.md`](../docs/SCOPED_CAPABILITIES_PLAN.md).
+
 Propagation is multi-hop, bounded by `MAX_CAPABILITY_HOPS = 16`.
 Forwarders re-broadcast every received announcement to their other
 peers; dedup on `(origin, version)` drops duplicates at convergence
