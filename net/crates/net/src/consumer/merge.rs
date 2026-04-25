@@ -169,6 +169,29 @@ impl ConsumeResponse {
     }
 }
 
+/// Match a `StoredEvent` against a filter, surfacing parse failures.
+///
+/// Returns `true` iff the event parses as JSON AND the filter matches
+/// the parsed value. A parse failure is logged at WARN with the event's
+/// id and shard so on-disk corruption or framing bugs in upstream
+/// adapters are observable from the filtered-poll path; without this,
+/// corrupt events were silently dropped from filtered results while the
+/// unfiltered path still returned them — a confusing inconsistency.
+fn event_matches_filter(event: &StoredEvent, filter: &Filter) -> bool {
+    match event.parse() {
+        Ok(value) => filter.matches(&value),
+        Err(e) => {
+            tracing::warn!(
+                event_id = %event.id,
+                shard_id = event.shard_id,
+                error = %e,
+                "dropping unparseable event from filtered poll result"
+            );
+            false
+        }
+    }
+}
+
 /// Poll merger for cross-shard aggregation.
 pub struct PollMerger {
     /// Adapter for polling shards.
@@ -292,6 +315,14 @@ impl PollMerger {
             // over-fetched polls where most results would be truncated.
             // Sorting requires seeing every event first, so the filtered
             // sort path must fully scan.
+            //
+            // Parse failures: a `StoredEvent` whose `raw` bytes don't
+            // deserialize as JSON cannot match a filter, so it is dropped
+            // from the filtered result. Previously this drop was silent
+            // (`unwrap_or(false)`), making on-disk corruption or
+            // adapter-side framing bugs invisible to operators — only
+            // *unfiltered* polls would surface the bad event. Log a
+            // warning per dropped event so corruption is observable.
             if request.ordering == Ordering::None {
                 let target = request.limit.saturating_add(1);
                 let mut kept: Vec<StoredEvent> = Vec::with_capacity(target.min(all_events.len()));
@@ -301,13 +332,13 @@ impl PollMerger {
                         // more matches than the caller asked for.
                         break;
                     }
-                    if event.parse().map(|v| filter.matches(&v)).unwrap_or(false) {
+                    if event_matches_filter(&event, filter) {
                         kept.push(event);
                     }
                 }
                 all_events = kept;
             } else {
-                all_events.retain(|e| e.parse().map(|v| filter.matches(&v)).unwrap_or(false));
+                all_events.retain(|e| event_matches_filter(e, filter));
             }
         }
 
@@ -1477,5 +1508,72 @@ mod tests {
             response.has_more,
             "two more matching events remain past the limit"
         );
+    }
+
+    #[tokio::test]
+    async fn test_regression_corrupt_event_filter_drop_is_consistent_and_logged() {
+        // Regression: corrupt events (raw bytes that don't deserialize as
+        // JSON) used to be silently dropped from the filtered poll path
+        // via `event.parse().map(...).unwrap_or(false)`, while the
+        // unfiltered path returned them as-is. That inconsistency hid
+        // upstream framing/storage corruption from anyone running with a
+        // filter (i.e. most consumers).
+        //
+        // The fix routes parse failures through `event_matches_filter`,
+        // which emits `tracing::warn!` per dropped event. We don't have
+        // a tracing-test subscriber wired up so we don't assert on the
+        // log line itself; instead we pin the behavioral surface so a
+        // future regression that re-silences corruption (e.g., dropping
+        // the helper) shows up in code review:
+        //   - filtered poll: corrupt event is dropped, valid event kept
+        //   - unfiltered poll: corrupt event flows through unchanged
+        //
+        // If the helper is removed or the warn! is downgraded to debug!,
+        // this test still passes — but the helper's doc-comment names
+        // the inconsistency and is the artifact that protects the
+        // observability requirement.
+        let adapter = Arc::new(MockAdapter::new());
+        adapter.add_events(
+            0,
+            vec![
+                StoredEvent::from_value("0-1".to_string(), json!({"type": "ok"}), 100, 0),
+                // Raw bytes that don't parse as JSON — a torn write or
+                // upstream framing bug surface.
+                StoredEvent::new(
+                    "0-2".to_string(),
+                    bytes::Bytes::from_static(b"\xff\xff not json \xff"),
+                    200,
+                    0,
+                ),
+            ],
+        );
+
+        let merger = PollMerger::new(adapter, 1);
+
+        // Filtered: corrupt event must be dropped, valid event kept.
+        let filtered = merger
+            .poll(ConsumeRequest::new(100).filter(Filter::eq("type", json!("ok"))))
+            .await
+            .unwrap();
+        assert_eq!(
+            filtered.events.len(),
+            1,
+            "filtered poll must drop the corrupt event"
+        );
+        assert_eq!(filtered.events[0].id, "0-1");
+
+        // Unfiltered: corrupt event flows through. Documenting that the
+        // unfiltered path is the *only* way an operator currently sees
+        // the corrupt bytes — without the warn! the filtered path is
+        // a black hole.
+        let unfiltered = merger.poll(ConsumeRequest::new(100)).await.unwrap();
+        assert_eq!(
+            unfiltered.events.len(),
+            2,
+            "unfiltered poll must surface the corrupt event verbatim"
+        );
+        let ids: Vec<_> = unfiltered.events.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"0-1"));
+        assert!(ids.contains(&"0-2"));
     }
 }
