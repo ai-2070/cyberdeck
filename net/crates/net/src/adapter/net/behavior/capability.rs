@@ -592,6 +592,204 @@ impl ResourceLimits {
 }
 
 // ============================================================================
+// Capability Scope (reserved-tag discovery filter)
+// ============================================================================
+
+/// Reserved tag prefix marking a capability set as advertised under
+/// a specific tenant. Format: `scope:tenant:<id>`.
+pub const TAG_SCOPE_TENANT_PREFIX: &str = "scope:tenant:";
+
+/// Reserved tag prefix marking a capability set as advertised under
+/// a specific region. Format: `scope:region:<name>`.
+pub const TAG_SCOPE_REGION_PREFIX: &str = "scope:region:";
+
+/// Reserved tag marking a capability set as visible only to peers
+/// in the same subnet as the announcer. Mutually exclusive with
+/// tenant / region scopes — when present, [`CapabilityScope`]
+/// resolves to [`CapabilityScope::SubnetLocal`] regardless of the
+/// other reserved tags.
+pub const TAG_SCOPE_SUBNET_LOCAL: &str = "scope:subnet-local";
+
+/// Optional explicit form of the default global scope. Carries no
+/// extra meaning over absence of any `scope:*` tag — included so
+/// callers can spell their intent.
+pub const TAG_SCOPE_GLOBAL: &str = "scope:global";
+
+/// Resolved scope of a capability announcement, derived from the
+/// reserved `scope:*` tags inside the announcer's [`CapabilitySet`].
+/// Pure derivation — never stored, recomputed on each query via
+/// [`scope_from_tags`].
+///
+/// Precedence: `SubnetLocal` > tenants/regions > `Global`. A node
+/// that tags itself with both `scope:subnet-local` and
+/// `scope:tenant:foo` resolves to `SubnetLocal` (strictest wins).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CapabilityScope {
+    /// No `scope:*` tag, or `scope:global` only — visible to every
+    /// query that doesn't explicitly opt out (`GlobalOnly` /
+    /// `SameSubnet`).
+    Global,
+    /// `scope:subnet-local` present — visible only under
+    /// [`ScopeFilter::SameSubnet`]. Excluded from
+    /// [`ScopeFilter::Any`] and every other filter, because the
+    /// announcer has explicitly opted out of cross-subnet
+    /// discovery.
+    SubnetLocal,
+    /// One or more `scope:tenant:*` tags, no regions, no
+    /// subnet-local.
+    Tenants(Vec<String>),
+    /// One or more `scope:region:*` tags, no tenants, no
+    /// subnet-local.
+    Regions(Vec<String>),
+    /// Both tenants and regions present. Queries match if either
+    /// list satisfies the filter (logical OR — a tenant query and
+    /// a region query against the same node are independent
+    /// concerns).
+    TenantsAndRegions {
+        /// Tenant ids declared via `scope:tenant:*` tags.
+        tenants: Vec<String>,
+        /// Region names declared via `scope:region:*` tags.
+        regions: Vec<String>,
+    },
+}
+
+/// Resolve a list of `CapabilitySet::tags` into the
+/// announcer's effective [`CapabilityScope`]. Empty tenant /
+/// region values (`scope:tenant:` with no id) are silently dropped
+/// — defensive, since reading them as the empty string would let
+/// a peer match any tenant query that also had an empty id.
+pub(crate) fn scope_from_tags(tags: &[String]) -> CapabilityScope {
+    let mut tenants = Vec::new();
+    let mut regions = Vec::new();
+    let mut subnet_local = false;
+
+    for t in tags {
+        if t == TAG_SCOPE_SUBNET_LOCAL {
+            subnet_local = true;
+        } else if let Some(id) = t.strip_prefix(TAG_SCOPE_TENANT_PREFIX) {
+            if !id.is_empty() {
+                tenants.push(id.to_string());
+            }
+        } else if let Some(name) = t.strip_prefix(TAG_SCOPE_REGION_PREFIX) {
+            if !name.is_empty() {
+                regions.push(name.to_string());
+            }
+        }
+        // `scope:global` is the default; presence is a no-op.
+    }
+
+    if subnet_local {
+        CapabilityScope::SubnetLocal
+    } else {
+        match (tenants.is_empty(), regions.is_empty()) {
+            (true, true) => CapabilityScope::Global,
+            (false, true) => CapabilityScope::Tenants(tenants),
+            (true, false) => CapabilityScope::Regions(regions),
+            (false, false) => CapabilityScope::TenantsAndRegions { tenants, regions },
+        }
+    }
+}
+
+/// Caller's intent for narrowing peer discovery by reserved scope
+/// tags, paired with [`CapabilityIndex::find_peers_scoped`] /
+/// [`CapabilityIndex::find_best_scoped`].
+///
+/// `Any` reproduces v1 behavior for non-`SubnetLocal` peers but
+/// excludes peers that explicitly tagged themselves
+/// `scope:subnet-local` — that tag is an opt-out from cross-subnet
+/// discovery.
+#[derive(Debug, Clone)]
+pub enum ScopeFilter<'a> {
+    /// Match every peer regardless of scope, except those tagged
+    /// `scope:subnet-local` (which always require [`Self::SameSubnet`]).
+    Any,
+    /// Match only peers with no `scope:*` tag (resolve to
+    /// `Global`). Useful for opting out of all scoped peers.
+    GlobalOnly,
+    /// Match peers whose subnet equals the caller's. The actual
+    /// subnet comparison is supplied by the caller (typically by
+    /// closing over `MeshNode::peer_subnets`); the index doesn't
+    /// own subnet state.
+    SameSubnet,
+    /// Match peers tagged `scope:tenant:<t>` OR untagged
+    /// (`Global` is permissive across tenants by design).
+    Tenant(&'a str),
+    /// Match peers tagged `scope:tenant:<t>` for any `t` in the
+    /// list, OR untagged.
+    Tenants(&'a [&'a str]),
+    /// Match peers tagged `scope:region:<r>` OR untagged.
+    Region(&'a str),
+    /// Match peers tagged `scope:region:<r>` for any `r` in the
+    /// list, OR untagged.
+    Regions(&'a [&'a str]),
+}
+
+/// Predicate: does this candidate's resolved [`CapabilityScope`]
+/// satisfy the caller's [`ScopeFilter`]?
+///
+/// `same_subnet` is supplied by the caller and is consulted only
+/// when the filter is [`ScopeFilter::SameSubnet`] or the candidate
+/// is [`CapabilityScope::SubnetLocal`] (which always requires
+/// same-subnet membership). For the warm-up case where one
+/// side's subnet isn't known yet, callers default `same_subnet`
+/// to `true` (permissive).
+pub(crate) fn matches_scope(
+    candidate_scope: &CapabilityScope,
+    filter: &ScopeFilter<'_>,
+    same_subnet: bool,
+) -> bool {
+    use CapabilityScope as S;
+    use ScopeFilter as F;
+    match (filter, candidate_scope) {
+        // SubnetLocal is asymmetric: the announcer has explicitly
+        // opted out of cross-subnet discovery, so it shows up only
+        // under SameSubnet.
+        (F::SameSubnet, S::SubnetLocal) => same_subnet,
+        (_, S::SubnetLocal) => false,
+
+        // Any matches every non-SubnetLocal peer.
+        (F::Any, _) => true,
+
+        // GlobalOnly is the strict opposite of "include scoped peers."
+        (F::GlobalOnly, S::Global) => true,
+        (F::GlobalOnly, _) => false,
+
+        // SameSubnet for non-SubnetLocal candidates falls through to
+        // the caller-supplied predicate. Permissive when subnet is
+        // unknown for either side.
+        (F::SameSubnet, _) => same_subnet,
+
+        // Global candidates match every tenant/region query —
+        // permissive default, matches the v1 expectation that a
+        // node which doesn't tag itself stays discoverable.
+        (F::Tenant(_), S::Global)
+        | (F::Tenants(_), S::Global)
+        | (F::Region(_), S::Global)
+        | (F::Regions(_), S::Global) => true,
+
+        (F::Tenant(t), S::Tenants(ts))
+        | (F::Tenant(t), S::TenantsAndRegions { tenants: ts, .. }) => ts.iter().any(|x| x == t),
+        (F::Tenant(_), S::Regions(_)) => false,
+
+        (F::Tenants(wanted), S::Tenants(ts))
+        | (F::Tenants(wanted), S::TenantsAndRegions { tenants: ts, .. }) => {
+            ts.iter().any(|x| wanted.iter().any(|w| w == x))
+        }
+        (F::Tenants(_), S::Regions(_)) => false,
+
+        (F::Region(r), S::Regions(rs))
+        | (F::Region(r), S::TenantsAndRegions { regions: rs, .. }) => rs.iter().any(|x| x == r),
+        (F::Region(_), S::Tenants(_)) => false,
+
+        (F::Regions(wanted), S::Regions(rs))
+        | (F::Regions(wanted), S::TenantsAndRegions { regions: rs, .. }) => {
+            rs.iter().any(|x| wanted.iter().any(|w| w == x))
+        }
+        (F::Regions(_), S::Tenants(_)) => false,
+    }
+}
+
+// ============================================================================
 // Capability Set
 // ============================================================================
 
@@ -645,6 +843,50 @@ impl CapabilitySet {
     /// Add tag
     pub fn add_tag(mut self, tag: impl Into<String>) -> Self {
         self.tags.push(tag.into());
+        self
+    }
+
+    /// Add a `scope:tenant:<id>` reserved tag, marking this
+    /// announcement as advertised under the given tenant. Idempotent
+    /// — repeated calls with the same id do not duplicate. Empty
+    /// `tenant_id` is silently dropped (matches the
+    /// [`scope_from_tags`] resolver).
+    pub fn with_tenant_scope(mut self, tenant_id: impl Into<String>) -> Self {
+        let id = tenant_id.into();
+        if id.is_empty() {
+            return self;
+        }
+        let tag = format!("{TAG_SCOPE_TENANT_PREFIX}{id}");
+        if !self.tags.iter().any(|t| t == &tag) {
+            self.tags.push(tag);
+        }
+        self
+    }
+
+    /// Add a `scope:region:<name>` reserved tag, marking this
+    /// announcement as advertised under the given region.
+    /// Idempotent. Empty `region` is silently dropped.
+    pub fn with_region_scope(mut self, region: impl Into<String>) -> Self {
+        let name = region.into();
+        if name.is_empty() {
+            return self;
+        }
+        let tag = format!("{TAG_SCOPE_REGION_PREFIX}{name}");
+        if !self.tags.iter().any(|t| t == &tag) {
+            self.tags.push(tag);
+        }
+        self
+    }
+
+    /// Add the `scope:subnet-local` reserved tag, opting this
+    /// announcement out of cross-subnet discovery. The strictest
+    /// scope wins: any tenant / region tags also present on this
+    /// set are ignored by the [`CapabilityScope`] resolver while
+    /// `scope:subnet-local` is set. Idempotent.
+    pub fn with_subnet_local_scope(mut self) -> Self {
+        if !self.tags.iter().any(|t| t == TAG_SCOPE_SUBNET_LOCAL) {
+            self.tags.push(TAG_SCOPE_SUBNET_LOCAL.to_string());
+        }
         self
     }
 
@@ -1590,6 +1832,87 @@ impl CapabilityIndex {
                 // matches the filter into the scoring step. See
                 // `query()` for the same fix.
                 if !req.filter.matches(&node.capabilities) {
+                    return None;
+                }
+                Some((node_id, req.score(&node.capabilities)))
+            })
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(node_id, _)| node_id)
+    }
+
+    /// Like [`Self::query`], but additionally filters candidates
+    /// through a [`ScopeFilter`] derived from each node's
+    /// `scope:*` reserved tags. See [`CapabilityScope`] for the
+    /// resolution rules.
+    ///
+    /// `same_subnet_lookup` is invoked at most once per candidate
+    /// — only when the filter is [`ScopeFilter::SameSubnet`] or
+    /// the candidate resolves to [`CapabilityScope::SubnetLocal`]
+    /// (which always requires same-subnet membership). The
+    /// closure should return `true` when the candidate's subnet
+    /// equals the caller's; for the warm-up case where one
+    /// side's subnet is unknown, callers default to permissive
+    /// (`true`), matching the channel-path warm-up behavior.
+    ///
+    /// The closure is supplied by the caller because
+    /// [`CapabilityIndex`] does not own subnet state — that
+    /// lives on `MeshNode::peer_subnets`.
+    pub fn find_peers_scoped(
+        &self,
+        filter: &CapabilityFilter,
+        scope_filter: &ScopeFilter<'_>,
+        mut same_subnet_lookup: impl FnMut(u64) -> bool,
+    ) -> Vec<u64> {
+        let base = self.query(filter);
+        base.into_iter()
+            .filter(|&node_id| {
+                let Some(caps) = self.get(node_id) else {
+                    return false;
+                };
+                let scope = scope_from_tags(&caps.tags);
+                let needs_subnet = matches!(scope_filter, ScopeFilter::SameSubnet)
+                    || matches!(scope, CapabilityScope::SubnetLocal);
+                let same_subnet = if needs_subnet {
+                    same_subnet_lookup(node_id)
+                } else {
+                    false
+                };
+                matches_scope(&scope, scope_filter, same_subnet)
+            })
+            .collect()
+    }
+
+    /// Scoped variant of [`Self::find_best`]. Same scope-resolution
+    /// semantics as [`Self::find_peers_scoped`]; selection picks the
+    /// highest-scoring candidate within the scoped set.
+    pub fn find_best_scoped(
+        &self,
+        req: &CapabilityRequirement,
+        scope_filter: &ScopeFilter<'_>,
+        mut same_subnet_lookup: impl FnMut(u64) -> bool,
+    ) -> Option<u64> {
+        self.query_count.fetch_add(1, Ordering::Relaxed);
+
+        let candidates = self
+            .build_candidate_set(&req.filter)
+            .unwrap_or_else(|| self.nodes.iter().map(|r| *r.key()).collect());
+
+        candidates
+            .into_iter()
+            .filter_map(|node_id| {
+                let node = self.nodes.get(&node_id)?;
+                if !req.filter.matches(&node.capabilities) {
+                    return None;
+                }
+                let scope = scope_from_tags(&node.capabilities.tags);
+                let needs_subnet = matches!(scope_filter, ScopeFilter::SameSubnet)
+                    || matches!(scope, CapabilityScope::SubnetLocal);
+                let same_subnet = if needs_subnet {
+                    same_subnet_lookup(node_id)
+                } else {
+                    false
+                };
+                if !matches_scope(&scope, scope_filter, same_subnet) {
                     return None;
                 }
                 Some((node_id, req.score(&node.capabilities)))
@@ -2618,5 +2941,119 @@ mod tests {
             index.find_best(&req).is_none(),
             "find_best(beta) leaked a non-matching node from the stale inverted index"
         );
+    }
+
+    // ========================================================================
+    // Scope helpers (`scope_from_tags` + `matches_scope`)
+    // ========================================================================
+
+    #[test]
+    fn scope_from_tags_no_scope_tag_is_global() {
+        assert!(matches!(
+            scope_from_tags(&[]),
+            CapabilityScope::Global
+        ));
+        assert!(matches!(
+            scope_from_tags(&["gpu".to_string(), "model:llama3".to_string()]),
+            CapabilityScope::Global
+        ));
+        // Explicit `scope:global` resolves the same as no tag.
+        assert!(matches!(
+            scope_from_tags(&[TAG_SCOPE_GLOBAL.to_string()]),
+            CapabilityScope::Global
+        ));
+    }
+
+    #[test]
+    fn scope_from_tags_subnet_local_wins() {
+        // Even with tenants and regions present, `subnet-local` is
+        // the strictest form and dominates.
+        let tags = vec![
+            TAG_SCOPE_SUBNET_LOCAL.to_string(),
+            format!("{TAG_SCOPE_TENANT_PREFIX}foo"),
+            format!("{TAG_SCOPE_REGION_PREFIX}eu-west"),
+        ];
+        assert_eq!(scope_from_tags(&tags), CapabilityScope::SubnetLocal);
+    }
+
+    #[test]
+    fn scope_from_tags_multiple_tenants() {
+        let tags = vec![
+            format!("{TAG_SCOPE_TENANT_PREFIX}a"),
+            format!("{TAG_SCOPE_TENANT_PREFIX}b"),
+            "gpu".to_string(),
+        ];
+        match scope_from_tags(&tags) {
+            CapabilityScope::Tenants(ts) => {
+                assert_eq!(ts, vec!["a".to_string(), "b".to_string()]);
+            }
+            other => panic!("expected Tenants, got {other:?}"),
+        }
+
+        // Empty tenant id is silently dropped.
+        let tags = vec![
+            format!("{TAG_SCOPE_TENANT_PREFIX}"),
+            format!("{TAG_SCOPE_TENANT_PREFIX}real"),
+        ];
+        match scope_from_tags(&tags) {
+            CapabilityScope::Tenants(ts) => assert_eq!(ts, vec!["real".to_string()]),
+            other => panic!("expected Tenants, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scope_from_tags_tenants_and_regions() {
+        let tags = vec![
+            format!("{TAG_SCOPE_TENANT_PREFIX}oem-123"),
+            format!("{TAG_SCOPE_REGION_PREFIX}eu-west"),
+        ];
+        match scope_from_tags(&tags) {
+            CapabilityScope::TenantsAndRegions { tenants, regions } => {
+                assert_eq!(tenants, vec!["oem-123".to_string()]);
+                assert_eq!(regions, vec!["eu-west".to_string()]);
+            }
+            other => panic!("expected TenantsAndRegions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matches_scope_global_visible_to_tenant_filter() {
+        // A peer that doesn't tag itself stays discoverable under
+        // tenant queries — this is the v1-permissive default that
+        // keeps existing announcements working when scoped queries
+        // ship.
+        let global = CapabilityScope::Global;
+        assert!(matches_scope(&global, &ScopeFilter::Tenant("oem-123"), false));
+        assert!(matches_scope(&global, &ScopeFilter::Region("eu-west"), false));
+        assert!(matches_scope(&global, &ScopeFilter::Any, false));
+
+        // GlobalOnly filter: only Global candidates pass.
+        assert!(matches_scope(&global, &ScopeFilter::GlobalOnly, false));
+        let tenant_only = CapabilityScope::Tenants(vec!["foo".to_string()]);
+        assert!(!matches_scope(&tenant_only, &ScopeFilter::GlobalOnly, false));
+    }
+
+    #[test]
+    fn matches_scope_subnet_local_excluded_from_any() {
+        // SubnetLocal is opt-out from cross-subnet discovery: it
+        // shows up only under SameSubnet (and only when the
+        // caller-supplied predicate confirms membership).
+        let sl = CapabilityScope::SubnetLocal;
+        assert!(!matches_scope(&sl, &ScopeFilter::Any, false));
+        assert!(!matches_scope(&sl, &ScopeFilter::Any, true));
+        assert!(!matches_scope(&sl, &ScopeFilter::Tenant("foo"), true));
+        assert!(!matches_scope(&sl, &ScopeFilter::GlobalOnly, true));
+
+        // SameSubnet with same_subnet=true admits SubnetLocal.
+        assert!(matches_scope(&sl, &ScopeFilter::SameSubnet, true));
+        // SameSubnet with same_subnet=false rejects SubnetLocal.
+        assert!(!matches_scope(&sl, &ScopeFilter::SameSubnet, false));
+
+        // Tenant filter against a tenant-tagged candidate behaves
+        // as expected — verifies the SubnetLocal branch isn't
+        // bleeding into the tenant arm.
+        let tenants = CapabilityScope::Tenants(vec!["oem-123".to_string()]);
+        assert!(matches_scope(&tenants, &ScopeFilter::Tenant("oem-123"), false));
+        assert!(!matches_scope(&tenants, &ScopeFilter::Tenant("other"), false));
     }
 }

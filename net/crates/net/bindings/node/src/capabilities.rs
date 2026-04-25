@@ -430,6 +430,110 @@ pub fn capability_filter_from_js(f: CapabilityFilterJs) -> CapabilityFilter {
 }
 
 // =========================================================================
+// Scope filter (reserved-tag discovery filter)
+// =========================================================================
+
+/// JS-side representation of [`net::adapter::net::behavior::capability::ScopeFilter`].
+///
+/// Tagged union by `kind`:
+/// - `{ kind: 'any' }` — every non-`SubnetLocal` peer.
+/// - `{ kind: 'globalOnly' }` — only peers with no `scope:*` tag.
+/// - `{ kind: 'sameSubnet' }` — peers in the caller's subnet.
+/// - `{ kind: 'tenant', tenant: '<id>' }` — that tenant + Global.
+/// - `{ kind: 'tenants', tenants: ['<id>', ...] }` — any of the
+///   listed tenants + Global.
+/// - `{ kind: 'region', region: '<name>' }` — that region + Global.
+/// - `{ kind: 'regions', regions: ['<name>', ...] }` — any of the
+///   listed regions + Global.
+///
+/// Unknown `kind` values are treated as `'any'` defensively
+/// (warns in `tracing`); real validation lives at the type-script
+/// layer.
+#[napi(object)]
+pub struct ScopeFilterJs {
+    pub kind: String,
+    pub tenant: Option<String>,
+    pub tenants: Option<Vec<String>>,
+    pub region: Option<String>,
+    pub regions: Option<Vec<String>>,
+}
+
+/// Owned form of [`net::adapter::net::behavior::capability::ScopeFilter`]
+/// — the core enum borrows `&str` slices, which can't cross the NAPI
+/// boundary. Callers convert the JS POJO into this owned shape, then
+/// run the query inside [`with_scope_filter`] so the closure gets a
+/// borrowed view that's alive for the duration of the call.
+pub enum ScopeFilterOwned {
+    Any,
+    GlobalOnly,
+    SameSubnet,
+    Tenant(String),
+    Tenants(Vec<String>),
+    Region(String),
+    Regions(Vec<String>),
+}
+
+/// Run `f` with a borrowed [`ScopeFilter`] projected from `owned`.
+/// Encapsulates the `Vec<String>` → `Vec<&str>` → `&[&str]` chain
+/// the core enum requires for its multi-element variants. The
+/// intermediate borrows live on this function's stack so the slice
+/// stays valid for the entire `f` call.
+pub fn with_scope_filter<R>(
+    owned: &ScopeFilterOwned,
+    f: impl FnOnce(&net::adapter::net::behavior::capability::ScopeFilter<'_>) -> R,
+) -> R {
+    use net::adapter::net::behavior::capability::ScopeFilter as F;
+    match owned {
+        ScopeFilterOwned::Any => f(&F::Any),
+        ScopeFilterOwned::GlobalOnly => f(&F::GlobalOnly),
+        ScopeFilterOwned::SameSubnet => f(&F::SameSubnet),
+        ScopeFilterOwned::Tenant(t) => f(&F::Tenant(t.as_str())),
+        ScopeFilterOwned::Tenants(ts) => {
+            let refs: Vec<&str> = ts.iter().map(|s| s.as_str()).collect();
+            f(&F::Tenants(refs.as_slice()))
+        }
+        ScopeFilterOwned::Region(r) => f(&F::Region(r.as_str())),
+        ScopeFilterOwned::Regions(rs) => {
+            let refs: Vec<&str> = rs.iter().map(|s| s.as_str()).collect();
+            f(&F::Regions(refs.as_slice()))
+        }
+    }
+}
+
+/// Convert a JS scope filter POJO to the owned form. Empty strings
+/// or empty lists collapse to [`ScopeFilterOwned::Any`] —
+/// `scope:tenant:` (no id) is rejected by [`scope_from_tags`] in
+/// the core, so passing it as a query would never match anything;
+/// `Any` is the more honest result.
+pub fn scope_filter_from_js(f: ScopeFilterJs) -> ScopeFilterOwned {
+    match f.kind.as_str() {
+        "any" => ScopeFilterOwned::Any,
+        "globalOnly" => ScopeFilterOwned::GlobalOnly,
+        "sameSubnet" => ScopeFilterOwned::SameSubnet,
+        "tenant" => match f.tenant {
+            Some(t) if !t.is_empty() => ScopeFilterOwned::Tenant(t),
+            _ => ScopeFilterOwned::Any,
+        },
+        "tenants" => match f.tenants {
+            Some(ts) if !ts.is_empty() => ScopeFilterOwned::Tenants(ts),
+            _ => ScopeFilterOwned::Any,
+        },
+        "region" => match f.region {
+            Some(r) if !r.is_empty() => ScopeFilterOwned::Region(r),
+            _ => ScopeFilterOwned::Any,
+        },
+        "regions" => match f.regions {
+            Some(rs) if !rs.is_empty() => ScopeFilterOwned::Regions(rs),
+            _ => ScopeFilterOwned::Any,
+        },
+        // Unrecognized `kind` values fall through to Any. The
+        // typescript layer's tagged union catches typos at compile
+        // time; this is the runtime safety net for raw JS callers.
+        _ => ScopeFilterOwned::Any,
+    }
+}
+
+// =========================================================================
 // Small helper exported to JS for TS-side vendor-string normalization.
 // =========================================================================
 

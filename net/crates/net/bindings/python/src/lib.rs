@@ -1784,6 +1784,28 @@ mod mesh_bindings {
             Ok(node.find_peers_by_filter(&core))
         }
 
+        /// Scoped variant of [`Self::find_peers`]. Filters candidates
+        /// through a `scope` dict derived from each peer's `scope:*`
+        /// reserved tags. See
+        /// `super::capabilities::scope_filter_from_py` for the
+        /// accepted dict shapes.
+        ///
+        /// Untagged peers stay visible under most filters by design;
+        /// peers tagged `scope:subnet-local` only show up under
+        /// `{"kind": "same_subnet"}`.
+        fn find_peers_scoped(
+            &self,
+            filter: &Bound<'_, PyDict>,
+            scope: &Bound<'_, PyDict>,
+        ) -> PyResult<Vec<u64>> {
+            let node = self.get_node()?;
+            let core = super::capabilities::capability_filter_from_py(filter)?;
+            let owned = super::capabilities::scope_filter_from_py(scope)?;
+            Ok(super::capabilities::with_scope_filter(&owned, |sf| {
+                node.find_peers_by_filter_scoped(&core, sf)
+            }))
+        }
+
         // ── NAT traversal ──────────────────────────────────────
         //
         // Framing (plan §5, load-bearing): every user-visible

@@ -62,6 +62,6 @@
 pub use net::adapter::net::behavior::capability::{
     AcceleratorInfo, AcceleratorType, CapabilityAnnouncement, CapabilityFilter, CapabilityIndex,
     CapabilityIndexStats, CapabilityRequirement, CapabilitySet, GpuInfo, GpuVendor,
-    HardwareCapabilities, IndexedNode, Modality, ModelCapability, ResourceLimits, Signature64,
-    SoftwareCapabilities, ToolCapability,
+    HardwareCapabilities, IndexedNode, Modality, ModelCapability, ResourceLimits, ScopeFilter,
+    Signature64, SoftwareCapabilities, ToolCapability,
 };

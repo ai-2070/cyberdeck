@@ -391,6 +391,99 @@ pub fn capability_filter_from_py(d: &Bound<'_, PyDict>) -> PyResult<CapabilityFi
 }
 
 // =========================================================================
+// Scope filter (reserved-tag discovery filter)
+// =========================================================================
+
+/// Owned form of [`net::adapter::net::behavior::capability::ScopeFilter`].
+/// The core enum borrows `&str` — Python dicts don't survive across
+/// lifetimes that way. Callers convert the dict to this owned shape,
+/// then run the query inside [`with_scope_filter`] so the borrowed
+/// view is alive for the actual call.
+pub enum ScopeFilterOwned {
+    Any,
+    GlobalOnly,
+    SameSubnet,
+    Tenant(String),
+    Tenants(Vec<String>),
+    Region(String),
+    Regions(Vec<String>),
+}
+
+/// Run `f` with a borrowed [`ScopeFilter`] projected from `owned`.
+/// Multi-element variants (`Tenants` / `Regions`) require an
+/// intermediate `Vec<&str>`; that intermediate lives on this
+/// function's stack so the slice stays valid for `f`.
+pub fn with_scope_filter<R>(
+    owned: &ScopeFilterOwned,
+    f: impl FnOnce(&net::adapter::net::behavior::capability::ScopeFilter<'_>) -> R,
+) -> R {
+    use net::adapter::net::behavior::capability::ScopeFilter as F;
+    match owned {
+        ScopeFilterOwned::Any => f(&F::Any),
+        ScopeFilterOwned::GlobalOnly => f(&F::GlobalOnly),
+        ScopeFilterOwned::SameSubnet => f(&F::SameSubnet),
+        ScopeFilterOwned::Tenant(t) => f(&F::Tenant(t.as_str())),
+        ScopeFilterOwned::Tenants(ts) => {
+            let refs: Vec<&str> = ts.iter().map(|s| s.as_str()).collect();
+            f(&F::Tenants(refs.as_slice()))
+        }
+        ScopeFilterOwned::Region(r) => f(&F::Region(r.as_str())),
+        ScopeFilterOwned::Regions(rs) => {
+            let refs: Vec<&str> = rs.iter().map(|s| s.as_str()).collect();
+            f(&F::Regions(refs.as_slice()))
+        }
+    }
+}
+
+/// Convert a Python scope-filter dict to the owned form.
+///
+/// Accepted shapes (driven by the dict's `kind` key):
+/// - `{"kind": "any"}`
+/// - `{"kind": "global_only"}` (also `"globalOnly"`)
+/// - `{"kind": "same_subnet"}` (also `"sameSubnet"`)
+/// - `{"kind": "tenant", "tenant": "<id>"}`
+/// - `{"kind": "tenants", "tenants": ["<id>", ...]}`
+/// - `{"kind": "region", "region": "<name>"}`
+/// - `{"kind": "regions", "regions": ["<name>", ...]}`
+///
+/// Unknown `kind` falls through to `Any` defensively. Empty
+/// strings / lists collapse to `Any` (an empty tenant id is
+/// rejected by the resolver, so `Any` is the more useful default).
+pub fn scope_filter_from_py(d: &Bound<'_, PyDict>) -> PyResult<ScopeFilterOwned> {
+    let kind = get_opt_str(d, "kind")?.unwrap_or_else(|| "any".to_string());
+    Ok(match kind.as_str() {
+        "any" => ScopeFilterOwned::Any,
+        "global_only" | "globalOnly" => ScopeFilterOwned::GlobalOnly,
+        "same_subnet" | "sameSubnet" => ScopeFilterOwned::SameSubnet,
+        "tenant" => match get_opt_str(d, "tenant")? {
+            Some(t) if !t.is_empty() => ScopeFilterOwned::Tenant(t),
+            _ => ScopeFilterOwned::Any,
+        },
+        "tenants" => {
+            let ts = get_opt_str_list(d, "tenants")?;
+            if ts.is_empty() {
+                ScopeFilterOwned::Any
+            } else {
+                ScopeFilterOwned::Tenants(ts)
+            }
+        }
+        "region" => match get_opt_str(d, "region")? {
+            Some(r) if !r.is_empty() => ScopeFilterOwned::Region(r),
+            _ => ScopeFilterOwned::Any,
+        },
+        "regions" => {
+            let rs = get_opt_str_list(d, "regions")?;
+            if rs.is_empty() {
+                ScopeFilterOwned::Any
+            } else {
+                ScopeFilterOwned::Regions(rs)
+            }
+        }
+        _ => ScopeFilterOwned::Any,
+    })
+}
+
+// =========================================================================
 // Module-level helpers
 // =========================================================================
 

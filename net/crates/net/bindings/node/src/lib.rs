@@ -1835,6 +1835,27 @@ mod mesh_bindings {
                 .collect())
         }
 
+        /// Scoped variant of [`Self::find_peers`]. Filters candidates
+        /// through a [`crate::capabilities::ScopeFilterJs`] derived
+        /// from each peer's `scope:*` reserved tags. Untagged peers
+        /// stay visible under most filters by design; peers tagged
+        /// `scope:subnet-local` only show up under `sameSubnet`.
+        #[napi]
+        pub fn find_peers_scoped(
+            &self,
+            filter: crate::capabilities::CapabilityFilterJs,
+            scope: crate::capabilities::ScopeFilterJs,
+        ) -> Result<Vec<BigInt>> {
+            let guard = self.load_node()?;
+            let node = guard.as_ref().unwrap();
+            let core = crate::capabilities::capability_filter_from_js(filter);
+            let owned = crate::capabilities::scope_filter_from_js(scope);
+            let ids = crate::capabilities::with_scope_filter(&owned, |f| {
+                node.find_peers_by_filter_scoped(&core, f)
+            });
+            Ok(ids.into_iter().map(BigInt::from).collect())
+        }
+
         /// Shutdown the mesh node.
         #[napi]
         pub async fn shutdown(&self) -> Result<()> {

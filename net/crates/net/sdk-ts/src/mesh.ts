@@ -42,8 +42,10 @@ import { setNapiMesh } from './_internal.js';
 import {
   capabilityFilterToNapi,
   capabilitySetToNapi,
+  scopeFilterToNapi,
   type CapabilityFilter,
   type CapabilitySet,
+  type ScopeFilter,
 } from './capabilities';
 import type { SubnetId, SubnetPolicy } from './subnets';
 import type { Token } from './identity';
@@ -534,6 +536,33 @@ export class MeshNode {
    */
   findPeers(filter: CapabilityFilter): bigint[] {
     return this.native.findPeers(capabilityFilterToNapi(filter));
+  }
+
+  /**
+   * Scoped variant of {@link findPeers}. Filters candidates through
+   * a {@link ScopeFilter} derived from each peer's `scope:*`
+   * reserved tags (e.g. `scope:tenant:oem-123`,
+   * `scope:region:eu-west`, `scope:subnet-local`).
+   *
+   * Untagged peers stay visible under most filters by design;
+   * peers tagged `scope:subnet-local` only show up under
+   * `{ kind: 'sameSubnet' }`. See `docs/SCOPED_CAPABILITIES_PLAN.md`
+   * for the full table.
+   *
+   * @example
+   * ```typescript
+   * // GPU pool for a specific tenant.
+   * const peers = node.findPeersScoped(
+   *   { requireTags: ['model:llama3-70b'] },
+   *   { kind: 'tenant', tenant: 'oem-123' },
+   * );
+   * ```
+   */
+  findPeersScoped(filter: CapabilityFilter, scope: ScopeFilter): bigint[] {
+    return this.native.findPeersScoped(
+      capabilityFilterToNapi(filter),
+      scopeFilterToNapi(scope),
+    );
   }
 
   /** Shutdown the mesh node. */

@@ -50,7 +50,7 @@ use super::pool::PacketBuilder;
 use super::behavior::broadcast::SUBPROTOCOL_CAPABILITY_ANN;
 use super::behavior::capability::{
     CapabilityAnnouncement, CapabilityFilter, CapabilityIndex, CapabilityRequirement,
-    CapabilitySet, MAX_CAPABILITY_HOPS,
+    CapabilitySet, ScopeFilter, MAX_CAPABILITY_HOPS,
 };
 use super::behavior::loadbalance::HealthStatus;
 use super::behavior::proximity::{EnhancedPingwave, ProximityConfig, ProximityGraph};
@@ -5092,6 +5092,34 @@ impl MeshNode {
         self.capability_index.query(filter)
     }
 
+    /// Scoped variant of [`Self::find_peers_by_filter`]. Filters
+    /// candidates through `scope` (derived from each peer's
+    /// `scope:*` reserved tags) on top of the capability filter.
+    /// `SubnetLocal` peers and the [`ScopeFilter::SameSubnet`]
+    /// filter resolve same-subnet membership against
+    /// `peer_subnets` — when either side's subnet is unknown, the
+    /// candidate is admitted (warm-up permissive).
+    pub fn find_peers_by_filter_scoped(
+        &self,
+        filter: &CapabilityFilter,
+        scope: &ScopeFilter<'_>,
+    ) -> Vec<u64> {
+        let my_subnet = self.local_subnet;
+        let peer_subnets = self.peer_subnets.clone();
+        let local_node_id = self.node_id;
+        self.capability_index
+            .find_peers_scoped(filter, scope, |nid| {
+                if nid == local_node_id {
+                    // Querying our own node: same subnet by definition.
+                    return true;
+                }
+                match peer_subnets.get(&nid).map(|e| *e.value()) {
+                    Some(s) => s == my_subnet,
+                    None => true, // warm-up permissive
+                }
+            })
+    }
+
     /// Read a peer's most recently advertised public reflex
     /// `SocketAddr` from the capability index. `None` before the
     /// peer has sent a stage-2 announcement, or when the peer was
@@ -5496,6 +5524,29 @@ impl MeshNode {
     /// scoring node's id, or `None` if no peer matches.
     pub fn rank_peers(&self, req: &CapabilityRequirement) -> Option<u64> {
         self.capability_index.find_best(req)
+    }
+
+    /// Scoped variant of [`Self::rank_peers`]. See
+    /// [`Self::find_peers_by_filter_scoped`] for the scope
+    /// resolution semantics; selection picks the highest-scoring
+    /// candidate within the scoped set.
+    pub fn rank_peers_scoped(
+        &self,
+        req: &CapabilityRequirement,
+        scope: &ScopeFilter<'_>,
+    ) -> Option<u64> {
+        let my_subnet = self.local_subnet;
+        let peer_subnets = self.peer_subnets.clone();
+        let local_node_id = self.node_id;
+        self.capability_index.find_best_scoped(req, scope, |nid| {
+            if nid == local_node_id {
+                return true;
+            }
+            match peer_subnets.get(&nid).map(|e| *e.value()) {
+                Some(s) => s == my_subnet,
+                None => true,
+            }
+        })
     }
 
     /// Shared reference to the capability index. Use this for

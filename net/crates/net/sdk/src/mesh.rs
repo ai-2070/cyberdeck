@@ -739,10 +739,35 @@ impl Mesh {
         self.node.find_peers_by_filter(filter)
     }
 
+    /// Scoped variant of [`Self::find_peers`]. Filters candidates
+    /// through a [`crate::capabilities::ScopeFilter`] derived from
+    /// each peer's `scope:*` reserved tags. Untagged peers resolve
+    /// to `Global` and remain visible under most filters by design;
+    /// peers tagged `scope:subnet-local` only show up under
+    /// [`crate::capabilities::ScopeFilter::SameSubnet`]. See
+    /// `docs/SCOPED_CAPABILITIES_PLAN.md` for the full table.
+    pub fn find_peers_scoped(
+        &self,
+        filter: &crate::capabilities::CapabilityFilter,
+        scope: &crate::capabilities::ScopeFilter<'_>,
+    ) -> Vec<u64> {
+        self.node.find_peers_by_filter_scoped(filter, scope)
+    }
+
     /// Rank peers for a scored placement requirement. Returns the
     /// single best-scoring node's id, or `None` if no peer matches.
     pub fn rank_peers(&self, req: &crate::capabilities::CapabilityRequirement) -> Option<u64> {
         self.node.rank_peers(req)
+    }
+
+    /// Scoped variant of [`Self::rank_peers`]. Picks the highest-
+    /// scoring peer within the scope-filtered candidate set.
+    pub fn rank_peers_scoped(
+        &self,
+        req: &crate::capabilities::CapabilityRequirement,
+        scope: &crate::capabilities::ScopeFilter<'_>,
+    ) -> Option<u64> {
+        self.node.rank_peers_scoped(req, scope)
     }
 
     // ---- Lifecycle ----

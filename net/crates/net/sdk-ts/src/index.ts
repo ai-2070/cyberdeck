@@ -111,6 +111,15 @@ export type {
   ModelCapability,
   ToolCapability,
   Modality,
+  ScopeFilter,
+} from './capabilities';
+export {
+  SCOPE_TENANT_PREFIX,
+  SCOPE_REGION_PREFIX,
+  SCOPE_SUBNET_LOCAL,
+  withTenantScope,
+  withRegionScope,
+  withSubnetLocalScope,
 } from './capabilities';
 
 // Subnets (visibility enforcement).
