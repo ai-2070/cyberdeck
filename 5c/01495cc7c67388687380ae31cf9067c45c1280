@@ -1,0 +1,45 @@
+net/crates/net/bindings/node/src/capabilities.rs
+  a9d311afc8324224 518-531,538-547
+net/crates/net/src/adapter/net/behavior/capability.rs
+  a9d311afc8324224 3076-3151
+net/crates/net/src/adapter/net/mesh.rs
+  a9d311afc8324224 5100-5111,5120-5122,5131,5554-5556,5564
+net/crates/net/src/ffi/mesh.rs
+  a9d311afc8324224 2629-2642,2649-2658
+net/crates/net/include/README.md
+  a9d311afc8324224 174-309
+net/crates/net/sdk-ts/test/capabilities.test.ts
+  a9d311afc8324224 219-369
+net/crates/net/README.md
+  a9d311afc8324224 263-264
+net/crates/net/docs/SDK_SECURITY_SURFACE_PLAN.md
+  a9d311afc8324224 804-805
+net/crates/net/tests/capability_scope.rs
+  a9d311afc8324224 28-33,61-75,77-89,223-274,276-558,560-600
+net/crates/net/bindings/go/net/capabilities_test.go
+  a9d311afc8324224 337-439
+net/crates/net/bindings/python/src/capabilities.rs
+  a9d311afc8324224 463-467,469-470,473,481,483-484,487
+net/crates/net/bindings/python/tests/test_capabilities.py
+  a9d311afc8324224 179-359
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "5c01495cc7c67388687380ae31cf9067c45c1280",
+  "prompts": {
+    "a9d311afc8324224": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8e12ea48-52c3-40e2-9655-6d0ab0878bb6",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 18963,
+      "total_deletions": 2308,
+      "accepted_lines": 1266,
+      "overriden_lines": 123
+    }
+  }
+}
