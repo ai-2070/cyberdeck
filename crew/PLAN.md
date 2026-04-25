@@ -1,189 +1,306 @@
 # Plan — `@ai2070/crew`
 
-A deterministic, replayable, for-loop crew orchestrator. Validates two JSON blobs (shape + counts) with Zod, materializes a virtual graph, and steps through it. Everything runtime-side (model calls, tool dispatch) is behind interfaces — the library itself is pure orchestration.
+A deterministic, replayable, bus-agnostic crew orchestrator. Validates two JSON blobs (shape + counts) with Zod, materializes a virtual graph, and runs it as a **state machine** that emits lifecycle events and consumes responses. The library does no I/O: it does not call models, subscribe to a bus, or persist anything. Plug it onto whatever transport you want — Net later, in-process `EventEmitter` now, anything in between.
 
 ## Design invariants
 
-These are the load-bearing constraints. Everything else flexes around them.
-
-1. **Determinism.** Same `(shape, counts, inputs, hook outputs, runtime outputs)` → same event log. No `Date.now()`, no `Math.random()`, no `Map` iteration order leaks. All time/randomness comes from an injected `Clock` + `Rng`.
-2. **Event log is the source of truth.** The crew loop emits an append-only stream of typed events (`crew.started`, `role.entered`, `agent.step`, `vote.resolved`, `checkpoint.taken`, `memex.delta_emitted`, `crew.completed`). State is derivable from the log.
-3. **Replay = re-derivation.** Given the log + the same `AgentRuntime` outputs (or a recorded transcript of them), the loop produces the same final state. This is what makes checkpoints atomic.
-4. **No I/O in core.** MemEX, model calls, tools, persistence — all behind interfaces. Core has zero side-effects beyond emitting events to a sink you provide.
-5. **Cancellation, timeouts, and budgets are first-class.** `AbortSignal` threads through every async edge; per-step and per-crew budgets are part of the schema, not best-effort wrappers.
+1. **Event-driven state machine.** No `Promise<Output>` from agent calls. The session emits `agent.step.requested` lifecycle events; the caller delivers `agent.step.completed` / `.failed` events back. The library is a coroutine, not an executor.
+2. **Bus-agnostic.** No L0 import, no Net import, no preferred transport. The session interface is `start(input) → events`, `deliver(event) → events`, `tick(now) → events`, `cancel() → events`. Wire it however.
+3. **Determinism.** Same `(shape, counts, ordered inbound events)` → same outbound event sequence. `Clock` and `Rng` are injected. No hidden time, no hidden randomness, no `Map` iteration leaks.
+4. **Event log is the source of truth.** Every state transition is an event. State is `replay(log)`. Snapshots are an optimization, not authoritative.
+5. **Replay = re-derivation.** Identical inbound event sequence → identical outbound event sequence.
+6. **Cancellation and timeouts are first-class.** `cancel()` is part of the API. Timeouts are scheduled internally; expiry produces an `agent.step.timed_out` event without external prompting.
 
 ## External dependencies
 
-- **Zod v4 only.** No v3 support. Lock the major in `peerDependencies`.
-- **`@ai2070/memex`** (peer, optional). Used through `MemexAdapter`. Crew library does not import it directly.
-- **L0 inference substrate** (peer). Streaming, token transport, and runtime concurrency live there. The crew loop sees one-shot `runAgentStep` returns; whether the substrate streams underneath is invisible to the loop.
-- **Schema version locked at `1.0`.** No backcompat shims this round — breaking changes are fine until 1.0 ships externally.
+- **Zod v4 only.** No v3. MemEX exposes Zod v4 schemas under `@ai2070/memex/schemas` — reuse them, don't redefine memory types.
+- **`@ai2070/memex`** (`^0.12`, peer, optional). Used through `MemexAdapter`. Crew core never imports it. The bundled adapter lives at `@ai2070/crew/memex` and wraps `applyCommand` / `getItems` / `smartRetrieve` / `exportSlice` / `importSlice` / `toJSON`.
+- **No L0 dependency.** L0 is a typical worker on the other side of the bus, not a dependency. An L0 worker recipe lives in docs.
+- **No bus dependency.** Caller wires the session to whatever transport (Net, `EventEmitter`, in-process queue, Kafka, …) they want.
+- **Schema version locked at `1.0`.** Breaking changes are fine until 1.0 ships externally.
+
+## Architecture
+
+```
+                 ┌────────────────────────┐
+                 │     crew library       │
+                 │  (state machine only)  │
+                 └────────────────────────┘
+                       ▲              │
+              inbound  │              │ outbound
+              events   │              │ lifecycle events
+                       │              ▼
+                 ┌────────────────────────┐
+                 │         bus            │  ← Net, EventEmitter, …
+                 │  (caller's choice)     │
+                 └────────────────────────┘
+                       ▲              │
+                       │              ▼
+                 ┌────────────────────────┐    ┌──────────────┐
+                 │     agent worker       │ →  │      L0      │
+                 │   (caller's code)      │    │   (model)    │
+                 └────────────────────────┘    └──────────────┘
+```
+
+The library is the box at the top. Everything else is the caller's wiring.
+
+## Public API
+
+```ts
+import type { CrewGraph, CrewSnapshot, CrewEvent, CrewStatus, HookRegistry, MemexAdapter } from "@ai2070/crew";
+
+export function createCrewSession(
+  graph: CrewGraph,
+  opts: {
+    crewId: string;                 // caller-injected, deterministic
+    hooks?: HookRegistry;
+    memex?: MemexAdapter;           // optional
+    clock: Clock;                   // injected — no Date.now() inside the lib
+    rng: Rng;                       // injected
+    resumePolicy?: ResumePolicy;
+  },
+): CrewSession;
+
+export function resumeCrewSession(
+  snapshot: CrewSnapshot,
+  laterEvents: CrewEvent[],         // inbound events that arrived after the snapshot
+  opts: SameAsAbove,
+): CrewSession;
+
+export interface CrewSession {
+  start(rootInput: unknown): CrewEvent[];
+  deliver(event: CrewEvent): CrewEvent[];           // inbound → outbound burst
+  tick(now: number): CrewEvent[];                   // drives internal timeouts
+  cancel(reason: "cancelled" | "timeout"): CrewEvent[];
+  status(): CrewStatus;                             // "idle" | "awaiting_responses" | "completed" | "aborted"
+  pendingRequests(): readonly AgentStepRequest[];
+  snapshot(): CrewSnapshot;
+}
+```
+
+`deliver(agent.stream.chunk)` does not advance state — the chunk is appended to the session's internal log for downstream observers but the state machine ignores it for transitions.
 
 ## Package layout
 
 ```
 crew/
-├── package.json              # @ai2070/crew, ESM, peerDeps: zod, @ai2070/memex (optional)
-├── tsconfig.json             # strict, NodeNext
+├── package.json              # @ai2070/crew, ESM, peerDeps: zod
+├── tsconfig.json
 ├── src/
 │   ├── index.ts              # public surface
-│   ├── schema/
-│   │   ├── shape.ts          # CrewShapeSchema
-│   │   ├── agents.ts         # CrewAgentsSchema
-│   │   ├── consensus.ts      # ConsensusConfigSchema, VotingMode
-│   │   └── hooks.ts          # LifecycleHooksSchema
+│   ├── schema/               # Zod v4
+│   │   ├── shape.ts
+│   │   ├── agents.ts
+│   │   ├── consensus.ts
+│   │   └── hooks.ts
 │   ├── graph/
-│   │   ├── types.ts          # CrewGraph, CrewRole, CrewAgent, RoleId, AgentId
-│   │   └── build.ts          # buildCrewGraph(shape, counts, registry?)
-│   ├── runtime/
-│   │   ├── types.ts          # AgentRuntime, HookRegistry, Clock, Rng
-│   │   ├── hooks.ts          # InMemoryHookRegistry
-│   │   └── ids.ts            # deterministic agent/event id generation
+│   │   ├── types.ts
+│   │   └── build.ts          # buildCrewGraph + lintCrewShape
 │   ├── events/
 │   │   ├── types.ts          # CrewEvent discriminated union
-│   │   ├── log.ts            # EventSink interface, InMemoryEventLog
-│   │   └── replay.ts         # replay(log, runtime, hooks) -> state
+│   │   └── canonical.ts      # canonicalize(value) — stable JSON
+│   ├── runtime/
+│   │   ├── clock.ts          # Clock interface + system + frozen impls
+│   │   ├── rng.ts            # Rng interface + deterministic + system impls
+│   │   ├── ids.ts            # deterministic correlation/event ids
+│   │   └── hooks.ts          # HookRegistry
+│   ├── session/              # the state machine
+│   │   ├── types.ts          # CrewSession, CrewStatus, CrewSnapshot, AgentStepRequest
+│   │   ├── machine.ts        # start / deliver / tick / cancel
+│   │   ├── permissions.ts    # talk_to / delegate_to / escalate_to enforcement
+│   │   ├── timeout.ts        # internal timeout scheduling
+│   │   └── nested.ts         # nested crew bookkeeping
 │   ├── memex/
-│   │   ├── adapter.ts        # MemexAdapter interface (read view + delta sink)
-│   │   └── ai2070.ts         # optional adapter against @ai2070/memex
+│   │   ├── adapter.ts        # MemexAdapter interface + AgentMemexHandle
+│   │   └── ai2070.ts         # adapter against @ai2070/memex
 │   ├── checkpoint/
-│   │   ├── types.ts          # Checkpoint shape (graph snapshot + log offset + memex cursor)
-│   │   └── store.ts          # CheckpointStore interface, InMemoryCheckpointStore
-│   ├── voting/
-│   │   └── resolve.ts        # resolveVotes(...) — first_valid | unanimous | majority | weighted
-│   └── loop/
-│       ├── run.ts            # runCrewOnce(graph, runtime, hooks, opts)
-│       └── nested.ts         # runAgentOrNested(...)
+│   │   ├── types.ts
+│   │   └── store.ts          # CheckpointStore interface, in-memory impl
+│   └── voting/
+│       └── resolve.ts
 └── test/
     ├── schema.test.ts
     ├── build.test.ts
-    ├── loop.test.ts
-    ├── replay.test.ts        # determinism: log -> replay -> identical final state
-    ├── checkpoint.test.ts    # checkpoint -> resume -> identical outcome
-    └── nested.test.ts
+    ├── machine.test.ts
+    ├── replay.test.ts
+    ├── checkpoint.test.ts
+    ├── nested.test.ts
+    └── permissions.test.ts
 ```
 
 ## Phases
 
-### Phase 1 — Schemas + graph builder (the boilerplate, hardened)
+### Phase 1 — Schemas + graph builder
 
-Take the second snippet from the draft verbatim as the starting point, plus:
+- Zod v4 (`z.object`, `z.discriminatedUnion`, `.parse`, `.safeParse`).
+- `CrewShapeSchema` requires `schema_version: "1.0"`. Reject anything else.
+- `CrewAgentsSchema` for counts.
+- `buildCrewGraph(shape, counts, registry?)` is pure: deterministic, no I/O, sorts by declaration order so the for-loop is stable.
+- `lintCrewShape(shape)` — semantic checks Zod can't express:
+  - Exactly one role with `first_input: true`, exactly one with `final_output: true`.
+  - Every `talk_to` / `delegate_to` / `escalate_to` / `invite[].role` references a declared role.
+  - No role escalates to itself.
+  - Fixer's `talk_to` covers everyone in its `delegate_to`.
+  - Returns `{ errors, warnings }`. Errors block runtime; warnings surface to the caller.
+- Optional per-role `input_schema` / `output_schema` (Zod schemas). When present, the session validates I/O at the role boundary.
+- `permissions.invite` is **accepted** by the schema (so existing shapes parse) but **never honored** in v1 — invitations belong to the v2 dynamic-crew plan.
 
-- Reject the input early if a role with `first_input: true` does not appear, or if more than one role has `first_input` / `final_output`.
-- Enforce `permissions.talk_to`, `delegate_to`, `escalate_to`, `invite[].role` reference declared roles. Mismatch → schema-level error, not runtime.
-- Enforce `max_allowed` ≥ requested count (warn vs throw is a config flag — default throw, since silent capping is a footgun).
-- Sort `roles.entries()` deterministically by declaration order so the for-loop is stable.
-- `buildCrewGraph` is pure: takes `(shape, counts, registry?)`, returns `CrewGraph`. No I/O.
-- Schemas authored against **Zod v4** APIs (`z.object`, `z.discriminatedUnion`, `.parse` / `.safeParse`).
-- Top-level shape requires `schema_version: "1.0"`. Reject anything else.
-- Add a separate `lintCrewShape(shape)` pass for semantic checks Zod can't express: no role escalates to itself, every `delegate_to` / `talk_to` / `escalate_to` / `invite[].role` references a declared role, exactly one `first_input` and exactly one `final_output`, fixer's `talk_to` covers everyone in its `delegate_to`. Returns warnings + errors; runtime refuses errors, surfaces warnings.
-- Optional per-role `input_schema` / `output_schema` (Zod schemas). When present, the loop validates I/O at the role boundary.
+Deliverable: `parse + lintCrewShape + buildCrewGraph` against the `DEFAULT_CREW` example.
 
-Deliverable: `CrewShapeSchema.parse(...)` + `buildCrewGraph(...)` + `lintCrewShape(...)` + tests against the `DEFAULT_CREW` example.
+### Phase 2 — Event vocabulary + canonical JSON
 
-### Phase 2 — Event log + atomic/replayable runner
-
-The thing that turns the loop from "a script" into a real orchestrator.
+Every state transition is an event. Outbound events are emitted by the session; inbound events are delivered by the caller.
 
 ```ts
-type Usage = { tokens_in?: number; tokens_out?: number; cost?: number; latency_ms?: number };
-
 type CrewEvent =
+  // ─── outbound (session-emitted) ───
   | { type: "crew.started"; crewId: string; rootInput: unknown; ts: number }
   | { type: "role.entered"; roleId: string; ts: number }
-  | { type: "agent.step.requested"; agentId: string; roleId: string; input: unknown; ts: number }
-  | { type: "agent.step.completed"; agentId: string; output: unknown; usage?: Usage; fault?: boolean; stalled?: boolean; ts: number }
-  | { type: "agent.step.failed"; agentId: string; error: { name: string; message: string }; ts: number }
-  | { type: "agent.step.timed_out"; agentId: string; budget_ms: number; ts: number }
+  | { type: "agent.step.requested"; correlationId: string; agentId: string; roleId: string; input: unknown; timeoutMs?: number; ts: number }
   | { type: "fixer.invoked"; agentId: string; reason: "fault" | "stall" | "timeout" | "permission_denied"; ts: number }
-  | { type: "permission.denied"; from: string; to: string; action: "talk_to" | "delegate_to" | "escalate_to" | "invite"; ts: number }
+  | { type: "permission.denied"; from: string; to: string; action: "talk_to" | "delegate_to" | "escalate_to"; ts: number }
   | { type: "vote.resolved"; roleId: string; mode: VotingMode; resolved: unknown; ts: number }
   | { type: "checkpoint.taken"; checkpointId: string; ts: number }
-  | { type: "memex.delta.emitted"; agentId: string; delta: MemexDelta; ts: number }
+  | { type: "memex.command.emitted"; agentId: string; command: MemoryCommand; ts: number }
   | { type: "nested.crew.started"; agentId: string; nestedName: string; ts: number }
   | { type: "nested.crew.completed"; agentId: string; output: unknown; ts: number }
-  | { type: "crew.aborted"; reason: "cancelled" | "budget_exceeded" | "timeout"; ts: number }
-  | { type: "crew.completed"; finalOutput: unknown; usage?: Usage; ts: number };
+  | { type: "crew.aborted"; reason: "cancelled" | "timeout"; ts: number }
+  | { type: "crew.completed"; finalOutput: unknown; ts: number }
+  // ─── inbound (caller-delivered) ───
+  | { type: "agent.step.completed"; correlationId: string; output: unknown; fault?: boolean; stalled?: boolean; ts: number }
+  | { type: "agent.step.failed"; correlationId: string; error: { name: string; message: string }; ts: number }
+  | { type: "agent.step.timed_out"; correlationId: string; ts: number }     // caller may inject; session also self-emits
+  | { type: "agent.stream.chunk"; correlationId: string; chunk: unknown; ts: number }; // pass-through, non-state-advancing
 ```
 
-`runCrewOnce` writes to an `EventSink`. A second function, `replay(log, runtimeStub)`, walks events and reconstructs the final state (used in tests + checkpoint resume). Deterministic IDs: `agent.step` event id = hash of `(crewId, roleId, agentId, parentEventId)`.
+Three things this phase pins down:
 
-This is also where the **atomicity** guarantee lives: the loop never updates external state directly. It emits a `memex.delta.emitted` event; the adapter applies it. If the loop crashes mid-phase, replaying the log up to the last checkpoint reconstructs identical state.
+- **Canonical JSON.** Ship `canonicalize(value)` (sorted keys, normalized number forms). Used wherever events or outputs are hashed or compared. Stock `JSON.stringify` is not stable across object key order.
+- **Correlation ids.** Each `agent.step.requested` carries `correlationId = hash(crewId, roleId, agentId, attempt)`. Inbound events match by id. Determinism + parallelism = inbound order doesn't matter.
+- **Idempotency on resume.** If the log has `agent.step.requested` with no matching `completed` / `failed` / `timed_out`, resume consults `ResumePolicy` (`"re-emit-request" | "treat-as-failed" | "abort"`, caller-supplied). Default `"abort"`.
 
-Three things this phase also pins down:
+### Phase 3 — Session state machine
 
-- **Canonical JSON.** Ship `canonicalize(value)` (sorted keys, normalized number forms). Used wherever events or vote outputs are hashed/compared. Stock `JSON.stringify` is not stable across object key order.
-- **Exception model.** Throws inside `runAgentStep` are caught and turned into `agent.step.failed` events (distinct from modeled `{ fault: true }` outputs). Failed steps are eligible for fixer intervention if the role's `activation.on_fault` is set.
-- **Idempotency on resume.** If the log has `agent.step.requested` with no matching `completed` / `failed` / `timed_out`, resume consults a `ResumePolicy` (`"retry" | "skip" | "abort"`, caller-supplied). Default `"abort"` — the caller has to make the call explicitly.
+The core. Replaces the async/await for-loop with an event-driven machine.
 
-### Phase 3 — Loop with hooks, fixer, nested crews, parallelism
+```
+   idle
+    │ start(rootInput)
+    ▼
+   awaiting_caller    (one outstanding agent.step.requested)
+    │ agent.step.completed
+    ▼
+   awaiting_phase     (N outstanding requests for current role)
+    │ all completed/failed/timed_out
+    ▼
+   ... next phase ... → final phase → completed
+                         │
+                         │ cancel() at any point
+                         ▼
+                       aborted
+```
 
-This is the second snippet from the draft, lightly cleaned. Concrete additions:
+Mechanics:
 
-1. **`runAgentOrNested`** passes through the same `HookRegistry` and `EventSink` (the draft passes `{ get: () => undefined }` which silently swallows hooks in nested crews — change to inherited registry).
-2. **Nested crew memex flow:** parent passes its `MemexAdapter` view down by default, but a role can declare `memex: { isolation: "soft" | "hard" }`. `"hard"` means the adapter exports a slice (`exportSlice` from MemEX) before the nested run and `importSlice`s the result on completion — this maps onto the patterns in `memex/README.md` §"Hard isolation (exported slices)". `"soft"` is the default and just shares the adapter.
-3. **Parallelism within a phase.** All agents in the same role run via `Promise.all`. After settle, results are sorted by `agentId` before voting/aggregation. Determinism preserved regardless of completion order. Roles can opt out with `execution.serial: true`.
-4. **AbortSignal everywhere.** `runCrewOnce(graph, runtime, hooks, { signal })`. Cancellation aborts in-flight steps via the runtime, drains pending phases, emits `crew.aborted`. Nested crews receive a child signal.
-5. **Timeouts.** Per-role `execution.timeout_ms` (and a per-crew default in `opts`). Step exceeds budget → `agent.step.timed_out` → fixer if `activation.on_fault` (timeout counts as fault for activation purposes; the event type stays distinct so traces can tell them apart).
-6. **Permission enforcement.** `talk_to` / `delegate_to` / `escalate_to` are enforced by the loop, not informational. Hooks/runtime request an action via `crew.requestAction({ from, to, action })`; if the source role's permission set doesn't allow it, the loop emits `permission.denied` and the action is rejected. Fixer can be activated on denial via `activation.on_permission_denied`.
-7. **Per-step budgets.** Optional `execution.max_tokens` / `execution.max_cost` on a role. Runtime is expected to surface `usage` on each completion; the loop accumulates into a per-crew total and emits `crew.aborted { reason: "budget_exceeded" }` if exceeded.
+1. **`start(rootInput)`** transitions to `awaiting_caller`. Emits `crew.started` + `role.entered` (caller) + `agent.step.requested` for the caller. Schedules a timeout via `Clock`.
+2. **`deliver(event)`** matches by `correlationId`. Advances when all in-flight requests for the current phase have resolved (`completed` / `failed` / `timed_out`).
+3. **`tick(now)`** is the timeout cranks. For every in-flight request whose `requested.ts + timeoutMs ≤ now`, emit `agent.step.timed_out` and treat as a fault. Caller is responsible for calling `tick()` periodically (or wiring it to a real `setTimeout`); a deterministic test can call `tick(t)` with synthetic times.
+4. **`cancel(reason)`** drains the queue, emits `crew.aborted`, transitions to `aborted`. In-flight workers are expected to observe `crew.aborted` on the bus and stop. The library does not cancel them — that's bus territory.
+5. **Permission enforcement.** Hooks call `crewControl.requestAction({ from, to, action })`. The machine consults the source role's `permissions`; on disallow, emits `permission.denied` and returns `false`. `fixer.activation.on_permission_denied` (new) can route to fixer.
+6. **Parallelism.** All agents in a role emit `agent.step.requested` simultaneously. Machine waits for all to resolve before voting. Outputs sorted by `agentId` before voting (determinism). Roles can opt into serial with `execution.serial: true`.
+7. **Nested crews.** When an agent has a `nestedCrew`, the machine instantiates an inner `CrewSession`, prefixes correlation ids (`{outer}/{inner}`), and proxies events. Inner `crew.completed.finalOutput` becomes the outer agent's step output.
+8. **Fixer activation.** `fault` / `stalled` / `timed_out` / `permission_denied` route to fixer if the corresponding `activation.*` is set. Fixer is itself an agent step (its own `agent.step.requested` / `completed`), so activation is just another bus round-trip.
 
-### Phase 4 — MemEX integration
+### Phase 4 — MemEX adapter
 
-Define `MemexAdapter` minimally:
+The agent worker on the other side of the bus does not talk to MemEX directly. Two paths for memory:
+
+- **Memex context goes out with the request.** Before emitting `agent.step.requested`, the session calls `handle.retrieve(...)` (params from `role.execution.memex`) and embeds the result in `input.memex_context`. No round-trip from the worker.
+- **Memex commands come back with the response.** The worker returns `{ output, memex_commands?: MemoryCommand[] }` in `agent.step.completed`. The session emits one `memex.command.emitted` event per command, then calls `adapter.apply(cmd)`. The event sits between worker and MemEX so replay reconstructs identical state without re-running the model.
+
+Adapter shape:
 
 ```ts
+import type { MemoryCommand, MemoryItem, MemexExport, GraphState, MemoryFilter, SmartRetrievalOptions } from "@ai2070/memex";
+
+type MemexView = "self" | "role" | "crew" | "all";
+
+interface AgentMemexHandle {
+  read(filter?: MemoryFilter): MemoryItem[];                  // wraps getItems
+  retrieve(opts: SmartRetrievalOptions): MemoryItem[];        // wraps smartRetrieve
+}
+
 interface MemexAdapter {
-  view(scope?: string): MemexGraph;          // read-only handle for runtime
-  applyDelta(delta: MemexDelta, ctx: { agentId: string; crewId: string }): void;
-  exportSlice?(memory_ids: string[]): MemexSlice;
-  importSlice?(slice: MemexSlice): { created: number; updated: number };
+  handleFor(agent: CrewAgent, role: CrewRole, view: MemexView): AgentMemexHandle;
+  apply(cmd: MemoryCommand, ctx: { agentId: string; crewId: string; roleId: string }): void;
+  exportSlice(opts: ExportOptions): MemexExport;
+  importSlice(slice: MemexExport): ImportReport;
+  snapshot(): GraphState;                                     // for checkpointing — toJSON-friendly
 }
 ```
 
-Ship one concrete adapter, `createMemexAdapter(state)`, that wraps `@ai2070/memex`'s `applyCommand` / `getItems` / `exportSlice` / `importSlice`. The crew library does **not** depend on MemEX at runtime — peer-dependency, behind a feature import: `import { createMemexAdapter } from "@ai2070/crew/memex"`.
+The adapter stamps every applied command with:
 
-Each agent step that produces a `memexOut` flows: agent → event log (`memex.delta.emitted`) → adapter (`applyDelta`). The event sits between them so replay works without re-running the model.
+- `author = agent:{agentId}`
+- `meta.agent_id = {agentId}`
+- `meta.crew_id = {crewId}`
+- `meta.role = {roleId}`
+- `scope = crew:{crewId}/agent:{agentId}` (when not already set)
 
-**Per-agent scoped memory.** The adapter auto-populates `meta.agent_id`, `meta.crew_id`, and a `scope` of `crew:{crewId}/agent:{agentId}` on every write. The runtime never has to set these — they come from the adapter wrapper around `applyCommand`. Reads default to the agent's own scope; cross-agent visibility is opt-in via `view({ scope_prefix: "crew:{crewId}/" })` (orchestrator pattern from `memex/README.md` §"Soft isolation"). Roles declare visibility on the shape: `memex.view: "self" | "role" | "crew" | "all"` (default `"self"`).
+Reads scope by `view`:
+
+| `view` | Filter |
+|--------|--------|
+| `"self"` (default) | `meta.agent_id = {agentId}` |
+| `"role"` | `meta.role = {roleId}` |
+| `"crew"` | `meta.crew_id = {crewId}` |
+| `"all"` | no filter |
+
+Maps directly onto `memex/API.md` §"Multi-Agent Memory Segmentation" — no new MemEX features needed.
+
+**Hard isolation for nested crews.** A role can declare `memex.isolation: "soft" | "hard"`. `"hard"` calls `exportSlice` before the nested session starts and `importSlice` on completion (`memex/API.md` §"Hard isolation via transplant"). `"soft"` (default) shares the adapter.
 
 ### Phase 5 — Checkpointing
 
-A checkpoint = `{ graph snapshot, event log offset, memex cursor (or slice digest), timestamp }`. Triggered:
+Snapshot = `{ session machine state, internal log offset, memex GraphState (via toJSON), timestamp, schema_version: "1.0" }`. Triggered:
 
-- Per role's `execution.checkpoints[]` (declarative, from the shape).
-- Programmatically via `crew.checkpoint(id)` from inside a hook.
-- Automatically at phase boundaries if `opts.autoCheckpoint = "phase"`.
+- Per role's `execution.checkpoints[]` (declarative).
+- Programmatically via `crewControl.checkpoint(id)` from a hook.
+- Automatically at phase boundaries when `opts.autoCheckpoint = "phase"`.
 
-`resumeCrew(checkpoint, runtime, hooks)` reads the checkpoint, re-hydrates state, and continues the loop. Resume must produce a log that, concatenated with the pre-checkpoint log, equals what a fresh run would have produced — this is the property tested in `checkpoint.test.ts`.
+`resumeCrewSession(snapshot, laterEvents, opts)` re-hydrates state and continues. Resume must produce a log that, concatenated with the pre-checkpoint log, equals what a fresh run would have produced. `checkpoint.test.ts` asserts this property.
 
 ### Phase 6 — Voting / resolution (later, but stub now)
 
-Take `resolveVotes` from the draft as Phase-6 scaffolding. Ship `first_valid` working, the rest as named-but-stubbed strategies that throw "not implemented". This way the schema accepts them and roles can declare `execution.voting`, but we don't pretend to support semantics we haven't built. Wire `weighted_consensus` first since it's what the example shape uses.
-
-### Phase 7 — Dynamic crews (later)
-
-`fixer.permissions.modify_structure` is the hook. Add a `CrewMutation` event type (`role.added`, `agent.added`, `agent.removed`, `permission.changed`). The fixer hook returns a list of mutations; the loop applies them between phases (never mid-phase — that's where determinism dies). All mutations land in the event log so replay still works.
-
-`permissions.invite` is part of this phase. In v1 the schema accepts it (so existing crew shapes parse) but the loop rejects invitations at runtime with `permission.denied { action: "invite" }`. Don't pretend to honor an invite when there's no machinery behind it.
-
-Defer until Phase 1–5 are stable and tested.
+Ship `first_valid` working. `unanimous`, `majority`, `weighted_consensus`, `best_of_n` are accepted by the schema; the resolver throws `NotImplementedError`. Wire `weighted_consensus` first since the example shape uses it. Vote dedup uses `canonicalize` from Phase 2.
 
 ## Decisions
 
 - **Zod v4** only. Locked.
 - **Schema version `1.0`**. No backcompat shims pre-1.0 release.
-- **`talk_to` / `delegate_to` / `escalate_to`** are enforced by the loop. See Phase 3 §6.
-- **Streaming** is L0's responsibility. The crew loop sees one-shot `runAgentStep` returns.
-- **Per-agent scoped memory** is the default. See Phase 4.
+- **`talk_to` / `delegate_to` / `escalate_to`** are enforced by the loop. See Phase 3 §5.
+- **Streaming agent outputs** are bus events. The library emits `agent.step.requested`, observes `agent.stream.chunk` passthroughs, advances on `agent.step.completed`.
+- **Per-agent scoped memory** is the default (Phase 4).
 - **Crew id** is caller-injected. The library does not generate it — too easy to leak nondeterminism.
-- **Phase order** is declaration order minus `first_input` / `final_output`. Explicit `phase: number` revisits if/when this is too coarse.
+- **Phase order** is declaration order minus `first_input` / `final_output`.
+- **Cost tracking is out of scope.** No usage/cost fields, no budget aborts. Wall-clock timeouts only.
+- **Dynamic crews and `permissions.invite` are v2.** Schema accepts `invite` for forward-compat; v1 silently ignores it.
+- **No L0 dependency.** L0 is the typical worker on the other side of the bus, not a dependency of this library.
+- **No bus dependency.** Library accepts/emits events; caller wires transport.
+
+## Out of scope (v1)
+
+- Cost / token-budget tracking.
+- Dynamic crew mutation (`fixer.modify_structure`, invitations).
+- Built-in workers. The library does not ship a "default" L0 worker — that's a recipe in docs.
+- Persistence of the event log. The session keeps a small internal log for snapshots and correlation; durable storage is the caller's job (the bus already moves through the events).
+- Cross-process / distributed crew runs. The session is local; multiple processes coordinating one session is out of scope.
 
 ## What to build first (smallest useful slice)
 
-1. Phase 1 schemas + builder.
-2. Phase 2 event log + a no-op `AgentRuntime` that echoes input.
-3. Phase 3 loop (caller → mercs → specialist → caller) running against the example, producing a deterministic event log.
-4. Replay test: run twice, assert event logs are byte-identical.
+1. Phase 1 — schemas + builder + linter. Tests against the `DEFAULT_CREW` example.
+2. Phase 2 — event vocabulary + `canonicalize()`.
+3. Phase 3 — state machine: `start` / `deliver` / `tick` / `cancel`. Tests use a synchronous "echo worker" stub in the test file that immediately delivers `agent.step.completed` for every `agent.step.requested`. No real bus, no L0.
+4. Replay test — feed the same inbound event sequence twice, assert outbound logs are byte-identical (after `canonicalize`).
 
-Everything past that — fixer, MemEX, checkpoints, voting, dynamic — slots onto this skeleton without rewriting it.
+Everything past that — fixer activation, MemEX, checkpoints, voting — slots onto this skeleton without rewriting it.
