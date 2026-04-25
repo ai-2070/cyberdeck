@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/compute/migration_target.rs
+  0f2df0e612c625ad 954-1042
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "f62fa8e9bbd2e650ae9e10e60405635ebe4df5bb",
+  "prompts": {
+    "0f2df0e612c625ad": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e832c279-3821-4470-a3eb-bc6fb918a853",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 89,
+      "total_deletions": 0,
+      "accepted_lines": 89,
+      "overriden_lines": 0
+    }
+  }
+}
