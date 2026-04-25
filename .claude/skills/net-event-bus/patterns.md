@@ -100,7 +100,7 @@ Out of scope for the basic skill. Point at `net/README.md` § Subnets.
 
 ## "I want per-tenant capability discovery without standing up subnets"
 
-Use **scoped capability discovery** with reserved `scope:*` tags. Tag the provider's capability set with `scope:tenant:<id>` (or `scope:region:<name>`, or `scope:subnet-local`); have the consumer call `find_nodes_scoped(filter, ScopeFilter::Tenant("<id>"))`. The consumer gets only the matching pool plus any untagged "Global" providers (permissive default — opt *in* to narrowing, never out by accident).
+Use **scoped capability discovery** with reserved `scope:*` tags. Tag the provider's capability set with `scope:tenant:<id>` (or `scope:region:<name>`, or `scope:subnet-local`); have the consumer call `mesh.find_nodes_scoped(filter, &ScopeFilter::Tenant("<id>"))`. (The scope is taken by reference: `&ScopeFilter<'_>` — `net/crates/net/sdk/src/mesh.rs:749-752`. Variants: `Any`, `GlobalOnly`, `SameSubnet`, `Tenant(&str)`, `Tenants(&[&str])`, `Region(&str)`, `Regions(&[&str])` — the plural forms accept a slice for "any of these tenants/regions".) The consumer gets only the matching pool plus any untagged "Global" providers (permissive default — opt *in* to narrowing, never out by accident).
 
 This is purely a discovery filter, not a routing gate — the wire format and forwarders are unchanged. Useful when:
 - A GPU pool is shared across tenants and the placement layer needs per-tenant isolation.

@@ -37,7 +37,7 @@ If you remember nothing else from `concepts.md`, remember these five things — 
 
 4. **Every node is a peer.** No clients, no servers. Producer and consumer are the same primitive (`NetNode` / `Net`). A node can publish, subscribe, relay, and persist all at once.
 
-5. **In TS, Python, and Rust, the transport is a runtime choice, not a code change.** The same publish/subscribe code works in-process (memory), across a LAN (mesh), through Redis, or via JetStream — you pick the transport at node construction and application logic doesn't know which one it got. **Go and C are different**: their API surface is poll-based regardless of transport, and the binding currently exposes a smaller, transport-specific surface, so swapping transports may require code changes (e.g. `NewMeshNode` constructor for mesh). Confirm against the SDK source when designing for portability across these.
+5. **In TS, Python, and Rust, the transport is a runtime choice, not a code change.** Same publish/subscribe code works on memory, mesh, Redis, or JetStream — you pick at node construction. **Go and C are the exception** (poll-based, transport-specific constructors). See `concepts.md` § Transport for the full picture before designing for portability.
 
 If the user's design language conflicts with any of these (e.g. "the broker", "the cluster", "consumer group", "partition leader"), stop and read `gotchas.md` — they're carrying assumptions from another system that will break here.
 
