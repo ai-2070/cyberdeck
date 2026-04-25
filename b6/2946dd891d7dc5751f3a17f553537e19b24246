@@ -1,0 +1,45 @@
+net/crates/net/bindings/node/src/lib.rs
+  a9d311afc8324224 1838-1858
+net/crates/net/sdk/src/mesh.rs
+  a9d311afc8324224 742-756,763-770
+net/crates/net/src/adapter/net/behavior/capability.rs
+  a9d311afc8324224 595-791,849-892,1843-1923,2945-3058
+net/crates/net/bindings/node/src/capabilities.rs
+  a9d311afc8324224 433-535
+net/crates/net/bindings/python/src/capabilities.rs
+  a9d311afc8324224 394-485
+net/crates/net/bindings/node/index.d.ts
+  a9d311afc8324224 783-790,1800-1823
+net/crates/net/sdk/src/capabilities.rs
+  a9d311afc8324224 65-66
+net/crates/net/src/adapter/net/mesh.rs
+  a9d311afc8324224 53,5095-5122,5529-5551
+net/crates/net/sdk-ts/src/capabilities.ts
+  a9d311afc8324224 376-474
+net/crates/net/sdk-ts/src/index.ts
+  a9d311afc8324224 114-122
+net/crates/net/bindings/python/src/lib.rs
+  a9d311afc8324224 1787-1808
+net/crates/net/sdk-ts/src/mesh.ts
+  a9d311afc8324224 45,48,541-567
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "b62946dd891d7dc5751f3a17f553537e19b24246",
+  "prompts": {
+    "a9d311afc8324224": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8e12ea48-52c3-40e2-9655-6d0ab0878bb6",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 14564,
+      "total_deletions": 21928,
+      "accepted_lines": 1116,
+      "overriden_lines": 0
+    }
+  }
+}
