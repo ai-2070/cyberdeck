@@ -1980,18 +1980,18 @@ mod tests {
         }
 
         let cases: &[&str] = &[
-            "",                  // empty
-            "/",                 // a lone separator
-            "//",                // two separators, nothing between
-            "//a",               // empty leading segment, then content
-            "/a",                // single leading-slash segment
-            "/a/",               // trailing slash
-            "a",                 // no slashes at all
-            "a/",                // single segment + trailing slash
-            "/api",              // typical absolute root
-            "/api/users",        // two-segment absolute
-            "/api/users/123",    // deep absolute
-            "api/users/123",     // deep relative
+            "",               // empty
+            "/",              // a lone separator
+            "//",             // two separators, nothing between
+            "//a",            // empty leading segment, then content
+            "/a",             // single leading-slash segment
+            "/a/",            // trailing slash
+            "a",              // no slashes at all
+            "a/",             // single segment + trailing slash
+            "/api",           // typical absolute root
+            "/api/users",     // two-segment absolute
+            "/api/users/123", // deep absolute
+            "api/users/123",  // deep relative
             "/api/users/v2/list",
             "////",
         ];

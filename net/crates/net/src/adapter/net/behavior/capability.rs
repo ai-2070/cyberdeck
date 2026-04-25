@@ -2509,7 +2509,10 @@ mod tests {
             fast, slow,
             "fast path and slow path must agree when filters are equivalent"
         );
-        assert!(!fast.is_empty(), "sample data must produce non-empty results");
+        assert!(
+            !fast.is_empty(),
+            "sample data must produce non-empty results"
+        );
     }
 
     /// After the `find_best()` refactor that folds the index lookup

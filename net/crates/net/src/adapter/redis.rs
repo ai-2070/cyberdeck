@@ -117,8 +117,8 @@ impl RedisAdapter {
             s: u16,
         }
 
-        let parsed: StoredFormat = serde_json::from_slice(data)
-            .map_err(|e| AdapterError::Serialization(e.to_string()))?;
+        let parsed: StoredFormat =
+            serde_json::from_slice(data).map_err(|e| AdapterError::Serialization(e.to_string()))?;
 
         let raw_bytes = Bytes::copy_from_slice(parsed.r.get().as_bytes());
 
