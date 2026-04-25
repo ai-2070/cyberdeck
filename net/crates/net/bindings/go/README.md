@@ -593,6 +593,46 @@ tenant/region tags on the same set. Untagged peers resolve to
 `Global` and stay visible under permissive queries. Full design:
 [`docs/SCOPED_CAPABILITIES_PLAN.md`](../../docs/SCOPED_CAPABILITIES_PLAN.md).
 
+#### Scored placement (`FindBestNode`)
+
+When you want the *single best* node for a placement requirement
+rather than every match, use `FindBestNode` (or its scoped sibling
+`FindBestNodeScoped`). The requirement combines a hard filter with
+optional scoring weights in `[0.0, 1.0]` that tip ties toward more
+memory / VRAM / faster inference / pre-loaded models.
+
+```go
+req := net.CapabilityRequirement{
+    Filter: net.CapabilityFilter{
+        RequireGPU: true,
+        MinVRAMMB:  40_000,
+    },
+    PreferMoreVRAM:        1.0,
+    PreferFasterInference: 0.5,
+}
+
+nodeID, ok, err := mesh.FindBestNode(req)
+if err != nil {
+    log.Fatal(err)
+}
+if !ok {
+    // No node satisfies the filter. `nodeID` is zero on miss; the
+    // bool is the only correct way to discriminate, since 0 is a
+    // valid id.
+    return
+}
+log.Printf("placement → node %d", nodeID)
+```
+
+Scoped variant — pick the best within a tenant pool:
+
+```go
+nodeID, ok, _ := mesh.FindBestNodeScoped(
+    req,
+    net.ScopeFilter{Kind: "tenant", Tenant: "oem-123"},
+)
+```
+
 Capability propagation is multi-hop, bounded by
 `MAX_CAPABILITY_HOPS = 16` with `(origin, version)` dedup on every
 forwarder. `CapabilityGCIntervalMs` controls both the index TTL
