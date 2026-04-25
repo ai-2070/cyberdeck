@@ -185,16 +185,27 @@ written for the Go cgo bindings and is the de-facto reference for
 C consumers who want the mesh API. Symbols are stable in practice
 but not committed in the same way as `include/net.h`.
 
-C consumers who want the mesh surface have two options:
-1. **Include both headers** in your C project (the symbols don't
-   conflict — different prefixes, separate handle types).
-2. **Use only the bus header** if you only need the event-bus
-   surface above.
+**Pick one header per translation unit.** Both files use the same
+`#ifndef NET_SDK_H` include guard, so including both in the same
+`.c` file silently drops one — the second include becomes a no-op
+and any of its symbols you reference will fail to link or
+compile. The split is by concern, not by additivity:
+
+- **`include/net.h`** — bus-only consumers. Stable surface.
+- **`bindings/go/net/net.h`** — mesh-using consumers. Includes the
+  bus surface as well, plus the mesh, channels, capabilities, NAT,
+  etc. (because the symbols are in the same dylib, the broader
+  header is a *superset* — it just isn't the public/stable one).
+
+If your project needs both surfaces, include the broader header —
+it's a strict superset. If you need only the bus surface,
+including the narrow header keeps you on the stable contract and
+won't pull in mesh declarations you don't use.
 
 A mesh node is its own handle (`net_meshnode_t*`), created via
 `net_mesh_new` and torn down via `net_mesh_shutdown` — independent
 of the bus handle (`net_handle_t`). A single process can hold both
-simultaneously.
+simultaneously regardless of how the headers are included.
 
 The Go bindings (`bindings/go/net/`) wrap this surface; their
 README has runnable examples for every function family. The
