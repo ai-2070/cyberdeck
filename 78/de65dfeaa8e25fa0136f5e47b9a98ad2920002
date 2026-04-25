@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/behavior/capability.rs
+  a9d311afc8324224 608-610,852-853,884,1845-1846,1850-1851
+net/crates/net/src/ffi/mesh.rs
+  a9d311afc8324224 2671,2676-2688
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "78de65dfeaa8e25fa0136f5e47b9a98ad2920002",
+  "prompts": {
+    "a9d311afc8324224": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8e12ea48-52c3-40e2-9655-6d0ab0878bb6",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 851,
+      "total_deletions": 863,
+      "accepted_lines": 35,
+      "overriden_lines": 9
+    }
+  }
+}
