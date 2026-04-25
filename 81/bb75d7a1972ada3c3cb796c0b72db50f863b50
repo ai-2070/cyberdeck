@@ -1,0 +1,41 @@
+net/crates/net/sdk-py/tests/test_channel_subscribe_opts.py
+  0f2df0e612c625ad 1-105
+net/crates/net/bindings/node/index.d.ts
+  0f2df0e612c625ad 1808-1817,1820,1822
+net/crates/net/src/adapter/net/redex/manager.rs
+  0f2df0e612c625ad 13,33-41,54,70,118-119,124-141,143,151,164-173,324-372
+net/crates/net/benches/cortex.rs
+  0f2df0e612c625ad 60-65,67-74
+net/crates/net/bindings/go/net/net.go
+  0f2df0e612c625ad 261-271,276-278,280-282,296-297,364-370,372
+net/crates/net/sdk-py/tests/conftest.py
+  0f2df0e612c625ad 1-58
+net/crates/net/benches/parallel.rs
+  0f2df0e612c625ad 16-24,33-34
+net/crates/net/sdk-py/src/net_sdk/channel.py
+  0f2df0e612c625ad 6,76-85,108-113
+net/crates/net/benches/ingestion.rs
+  0f2df0e612c625ad 86-93,97-98,105,110
+net/crates/net/bindings/node/src/lib.rs
+  0f2df0e612c625ad 265-271,275,277,581-590
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "81bb75d7a1972ada3c3cb796c0b72db50f863b50",
+  "prompts": {
+    "0f2df0e612c625ad": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e832c279-3821-4470-a3eb-bc6fb918a853",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 10881,
+      "total_deletions": 170,
+      "accepted_lines": 387,
+      "overriden_lines": 0
+    }
+  }
+}
