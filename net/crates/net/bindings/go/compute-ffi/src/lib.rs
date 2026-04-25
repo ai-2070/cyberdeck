@@ -919,8 +919,10 @@ pub extern "C" fn net_compute_spawn(
     }
     let sdk_identity = SdkIdentity::from_seed(seed);
 
-    let mut cfg = DaemonHostConfig::default();
-    cfg.auto_snapshot_interval = auto_snapshot_interval;
+    let mut cfg = DaemonHostConfig {
+        auto_snapshot_interval,
+        ..DaemonHostConfig::default()
+    };
     if max_log_entries > 0 {
         cfg.max_log_entries = max_log_entries;
     }
@@ -1104,8 +1106,10 @@ pub extern "C" fn net_compute_spawn_from_snapshot(
     }
     let sdk_identity = SdkIdentity::from_seed(seed);
 
-    let mut cfg = DaemonHostConfig::default();
-    cfg.auto_snapshot_interval = auto_snapshot_interval;
+    let mut cfg = DaemonHostConfig {
+        auto_snapshot_interval,
+        ..DaemonHostConfig::default()
+    };
     if max_log_entries > 0 {
         cfg.max_log_entries = max_log_entries;
     }
@@ -1319,12 +1323,13 @@ pub extern "C" fn net_compute_start_migration(
     if out_handle.is_null() {
         return NET_COMPUTE_ERR_NULL;
     }
-    let mut opts = MigrationOpts::default();
-    opts.transport_identity = transport_identity != 0;
-    opts.retry_not_ready = if retry_not_ready_ms == 0 {
-        None
-    } else {
-        Some(std::time::Duration::from_millis(retry_not_ready_ms))
+    let opts = MigrationOpts {
+        transport_identity: transport_identity != 0,
+        retry_not_ready: if retry_not_ready_ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(retry_not_ready_ms))
+        },
     };
 
     let inner = h.inner.clone();
@@ -1377,8 +1382,10 @@ pub extern "C" fn net_compute_expect_migration(
     let Some(kind) = cstr_to_string(kind_ptr, kind_len) else {
         return NET_COMPUTE_ERR_NULL;
     };
-    let mut cfg = DaemonHostConfig::default();
-    cfg.auto_snapshot_interval = auto_snapshot_interval;
+    let mut cfg = DaemonHostConfig {
+        auto_snapshot_interval,
+        ..DaemonHostConfig::default()
+    };
     if max_log_entries > 0 {
         cfg.max_log_entries = max_log_entries;
     }
@@ -1419,8 +1426,10 @@ pub extern "C" fn net_compute_register_migration_target_identity(
         std::ptr::copy_nonoverlapping(identity_seed, seed.as_mut_ptr(), 32);
     }
     let sdk_identity = SdkIdentity::from_seed(seed);
-    let mut cfg = DaemonHostConfig::default();
-    cfg.auto_snapshot_interval = auto_snapshot_interval;
+    let mut cfg = DaemonHostConfig {
+        auto_snapshot_interval,
+        ..DaemonHostConfig::default()
+    };
     if max_log_entries > 0 {
         cfg.max_log_entries = max_log_entries;
     }
@@ -1863,7 +1872,6 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 pub struct ReplicaGroupHandle {
     inner: std::sync::Arc<SdkReplicaGroup>,
-    kind: String,
 }
 
 /// Spawn a replica group bound to an existing `DaemonRuntime`.
@@ -1910,8 +1918,10 @@ pub extern "C" fn net_compute_replica_group_spawn(
         return NET_COMPUTE_ERR_CALL_FAILED;
     };
 
-    let mut host = DaemonHostConfig::default();
-    host.auto_snapshot_interval = auto_snapshot_interval;
+    let mut host = DaemonHostConfig {
+        auto_snapshot_interval,
+        ..DaemonHostConfig::default()
+    };
     if max_log_entries > 0 {
         host.max_log_entries = max_log_entries;
     }
@@ -1926,7 +1936,6 @@ pub extern "C" fn net_compute_replica_group_spawn(
         Ok(g) => {
             let h = ReplicaGroupHandle {
                 inner: std::sync::Arc::new(g),
-                kind,
             };
             unsafe { *out_handle = Box::into_raw(Box::new(h)) };
             NET_COMPUTE_OK
@@ -2083,7 +2092,6 @@ pub extern "C" fn net_compute_replica_group_members_json(
 
 pub struct ForkGroupHandle {
     inner: std::sync::Arc<SdkForkGroup>,
-    kind: String,
 }
 
 #[no_mangle]
@@ -2115,8 +2123,10 @@ pub extern "C" fn net_compute_fork_group_spawn(
         write_err(err_out, "group: invalid-config: unknown lb strategy");
         return NET_COMPUTE_ERR_CALL_FAILED;
     };
-    let mut host = DaemonHostConfig::default();
-    host.auto_snapshot_interval = auto_snapshot_interval;
+    let mut host = DaemonHostConfig {
+        auto_snapshot_interval,
+        ..DaemonHostConfig::default()
+    };
     if max_log_entries > 0 {
         host.max_log_entries = max_log_entries;
     }
@@ -2129,7 +2139,6 @@ pub extern "C" fn net_compute_fork_group_spawn(
         Ok(g) => {
             let h = ForkGroupHandle {
                 inner: std::sync::Arc::new(g),
-                kind,
             };
             unsafe { *out_handle = Box::into_raw(Box::new(h)) };
             NET_COMPUTE_OK
@@ -2256,7 +2265,6 @@ pub extern "C" fn net_compute_fork_group_fork_records_json(
 
 pub struct StandbyGroupHandle {
     inner: std::sync::Arc<SdkStandbyGroup>,
-    kind: String,
 }
 
 #[no_mangle]
@@ -2288,8 +2296,10 @@ pub extern "C" fn net_compute_standby_group_spawn(
         );
         return NET_COMPUTE_ERR_CALL_FAILED;
     };
-    let mut host = DaemonHostConfig::default();
-    host.auto_snapshot_interval = auto_snapshot_interval;
+    let mut host = DaemonHostConfig {
+        auto_snapshot_interval,
+        ..DaemonHostConfig::default()
+    };
     if max_log_entries > 0 {
         host.max_log_entries = max_log_entries;
     }
@@ -2302,7 +2312,6 @@ pub extern "C" fn net_compute_standby_group_spawn(
         Ok(g) => {
             let h = StandbyGroupHandle {
                 inner: std::sync::Arc::new(g),
-                kind,
             };
             unsafe { *out_handle = Box::into_raw(Box::new(h)) };
             NET_COMPUTE_OK

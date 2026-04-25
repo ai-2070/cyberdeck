@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import Any, Callable, Generic, Iterator, Optional, TypeVar
 
 from net import Net
@@ -72,8 +73,16 @@ class TypedChannel(Generic[T]):
         return self._bus.ingest_raw_batch(payloads)
 
     def subscribe(self, opts: Optional[SubscribeOpts] = None) -> TypedEventStream[T]:
-        """Subscribe to typed events on this channel."""
-        merged = opts or SubscribeOpts()
+        """Subscribe to typed events on this channel.
+
+        `opts` is treated as read-only: a copy is made before defaulting
+        the filter to this channel's filter. The previous code aliased
+        the caller's `SubscribeOpts` (`merged = opts or SubscribeOpts()`)
+        and then mutated `merged.filter` in place, so reusing one
+        `SubscribeOpts` across two channels silently delivered the
+        first channel's events on the second subscription.
+        """
+        merged = SubscribeOpts() if opts is None else replace(opts)
         if merged.filter is None:
             merged.filter = self._filter
 
@@ -96,8 +105,12 @@ class TypedChannel(Generic[T]):
         return TypedEventStream(self._bus, parse_fn, merged)
 
     def subscribe_raw(self, opts: Optional[SubscribeOpts] = None) -> EventStream:
-        """Subscribe to raw events on this channel."""
-        merged = opts or SubscribeOpts()
+        """Subscribe to raw events on this channel.
+
+        See `subscribe()` — `opts` is copied before mutation for the
+        same reason.
+        """
+        merged = SubscribeOpts() if opts is None else replace(opts)
         if merged.filter is None:
             merged.filter = self._filter
         return EventStream(self._bus, merged)

@@ -294,29 +294,56 @@ impl MigrationTargetHandler {
     /// the authoritative copy. Also removes the factory entry, since the
     /// target won't need to re-restore from an orchestrator retry once
     /// the migration has successfully completed.
+    ///
+    /// Atomicity vs `activate()` and `abort()`: the `migrations` write
+    /// entry is held across the entire operation. That guard serializes
+    /// us against:
+    ///
+    /// - a retried `activate()`, which calls `migrations.get()` and
+    ///   blocks on the shard write lock; once we drop the entry the
+    ///   migration is gone but `completed` already has the idempotency
+    ///   record, so the retry resolves through the `completed` lookup;
+    /// - a concurrent `abort()`, which would otherwise observe an empty
+    ///   `migrations` after a remove-first, insert-second ordering and
+    ///   `daemon_registry.unregister()` a daemon we just promoted to
+    ///   authoritative. Holding the entry forces abort to wait, and
+    ///   it then finds nothing and no-ops — which matches the legacy
+    ///   semantics where a successful complete makes a racing abort a
+    ///   no-op.
+    ///
+    /// `completed.insert` happens while the entry is held, so a third
+    /// thread observing both maps still sees the migration in at least
+    /// one of them at every instant — closing the original
+    /// `DaemonNotFound` gap on `activate()` retries.
     pub fn complete(&self, daemon_origin: u32) -> Result<(), MigrationError> {
-        // Precedence: if there is an active migration, finalize it. Only
-        // if there is no active migration AND a completed record exists
-        // do we treat this as an idempotent no-op (the retry case for a
-        // lost ActivateAck).
-        let (_, entry) = match self.migrations.remove(&daemon_origin) {
-            Some(pair) => pair,
-            None => {
+        use dashmap::mapref::entry::Entry;
+        match self.migrations.entry(daemon_origin) {
+            Entry::Occupied(occ) => {
+                let completion = {
+                    let state = occ.get().lock();
+                    CompletedTargetState {
+                        orchestrator_node: state.orchestrator_node,
+                        replayed_through: state.replayed_through,
+                        completed_at: Instant::now(),
+                    }
+                };
+                // Insert into `completed` before dropping the entry
+                // guard so a concurrent `activate()` cannot observe
+                // both maps empty.
+                self.completed.insert(daemon_origin, completion);
+                // Removes from `migrations` and drops the entry guard.
+                occ.remove();
+            }
+            Entry::Vacant(_) => {
+                // Vacant + completed-record-present is the lost-ack
+                // retry path. Vacant + no completed record is a stale
+                // origin we never knew about.
                 if self.completed.contains_key(&daemon_origin) {
                     return Ok(());
                 }
                 return Err(MigrationError::DaemonNotFound(daemon_origin));
             }
-        };
-        let state = entry.into_inner();
-        self.completed.insert(
-            daemon_origin,
-            CompletedTargetState {
-                orchestrator_node: state.orchestrator_node,
-                replayed_through: state.replayed_through,
-                completed_at: Instant::now(),
-            },
-        );
+        }
         // The factory is single-shot on a successful migration: keeping it
         // registered would let a stale or replayed SnapshotReady re-trigger
         // restore against what is now the authoritative copy.
@@ -809,5 +836,208 @@ mod tests {
             Some(0x4444),
             "completed record must reflect the second (new) orchestrator"
         );
+    }
+
+    #[test]
+    fn test_regression_complete_activate_no_intermediate_gap() {
+        // Regression: `complete()` removed from `migrations` BEFORE
+        // inserting into `completed`. A concurrent `activate()` retry
+        // landing in the gap would observe neither map and return
+        // `DaemonNotFound`, breaking the idempotency contract that
+        // `activate()` documents.
+        //
+        // The race window is sub-microsecond, so the test is structured
+        // as continuous mutual stress: a long-lived observer thread
+        // spin-loops calling `activate()` while the main thread cycles
+        // through many `restore → activate → complete` rounds. Tight
+        // atomic-flag handshakes (rather than a `Barrier`) keep the
+        // threads aligned closely enough to land observer probes inside
+        // the gap. With the bug, this hits `DaemonNotFound` reliably.
+        // With the fix, it never does.
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+        use std::thread;
+
+        const TRIALS: u32 = 2_000;
+        const STOP: u32 = u32::MAX;
+
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = Arc::new(MigrationTargetHandler::new(reg.clone()));
+
+        // Observer is signaled by writing the current trial's origin
+        // into `current_origin`; `STOP` ends the observer. The observer
+        // reports any DaemonNotFound it sees via `gap_seen`.
+        let current_origin = Arc::new(AtomicU32::new(0));
+        let gap_seen = Arc::new(AtomicU64::new(0));
+
+        let h_observer = handler.clone();
+        let origin_observer = current_origin.clone();
+        let gap_observer = gap_seen.clone();
+        let observer = thread::spawn(move || loop {
+            let origin = origin_observer.load(Ordering::Acquire);
+            if origin == STOP {
+                return;
+            }
+            if origin == 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            match h_observer.activate(origin) {
+                Ok(_) => {}
+                Err(MigrationError::DaemonNotFound(o)) => {
+                    gap_observer.store(o as u64, Ordering::Release);
+                    return;
+                }
+                Err(_) => {}
+            }
+        });
+
+        // Track origins we've already used so a 32-bit `origin_hash`
+        // collision doesn't trip `restore_snapshot` (the daemon
+        // registry rejects re-registration of an already-registered
+        // origin since we deliberately do NOT unregister between
+        // trials). The birthday probability of a collision over
+        // 2_000 trials of a 32-bit space is ~5e-4, so without this
+        // guard the test would hang on the unwrap a small fraction
+        // of the time.
+        let mut seen_origins: HashSet<u32> = HashSet::with_capacity(TRIALS as usize);
+
+        for _ in 0..TRIALS {
+            if gap_seen.load(Ordering::Acquire) != 0 {
+                break;
+            }
+            let kp = EntityKeypair::generate();
+            let origin = kp.origin_hash();
+            // Skip the reserved sentinels and any origin already used
+            // by a prior trial.
+            if origin == 0 || origin == STOP || !seen_origins.insert(origin) {
+                continue;
+            }
+            let snapshot = make_snapshot(&kp, 5, 0);
+            handler
+                .restore_snapshot(
+                    RestoreContext {
+                        daemon_origin: origin,
+                        snapshot: &snapshot,
+                        source_node: 0x1111,
+                        orchestrator_node: 0x2222,
+                    },
+                    kp.clone(),
+                    || Box::new(AccumDaemon { total: 0 }),
+                    DaemonHostConfig::default(),
+                )
+                .unwrap();
+            handler.activate(origin).unwrap();
+
+            // Hand the origin to the observer, then race complete()
+            // against its activate() spin-loop. We deliberately do NOT
+            // call `forget_completed` / `unregister` between trials:
+            // doing so would let the observer race and read a forgotten
+            // origin (test artifact, not a production bug). Each trial
+            // uses a fresh origin so accumulation is bounded by TRIALS.
+            current_origin.store(origin, Ordering::Release);
+            handler.complete(origin).unwrap();
+            current_origin.store(0, Ordering::Release);
+        }
+
+        current_origin.store(STOP, Ordering::Release);
+        observer.join().unwrap();
+
+        let gap = gap_seen.load(Ordering::Acquire);
+        assert_eq!(
+            gap, 0,
+            "concurrent activate() observed a DaemonNotFound gap during complete() \
+             for origin {gap:#x} — the migration was unobservable in both \
+             `migrations` and `completed`"
+        );
+    }
+
+    #[test]
+    fn test_regression_complete_abort_no_inconsistent_state() {
+        // Regression: an earlier version of the `complete()` ordering
+        // fix did `completed.insert(...)` followed by
+        // `migrations.remove(...)` outside any shared guard. A
+        // concurrent `abort()` racing in between would observe
+        // `migrations` still occupied (from before the insert step
+        // released the shard) and unregister the daemon — leaving
+        // `completed` with an idempotency record for an origin that
+        // is no longer present in the registry. A subsequent
+        // `activate()` retry would then resolve happily through the
+        // completed record while routing pointed at a daemon that
+        // had been silently torn down.
+        //
+        // The fix takes a write entry on `migrations` and holds it
+        // across both `completed.insert` and the migrations remove.
+        // With the entry held, `abort()`'s `migrations.remove()`
+        // serializes after us and finds nothing, so it never reaches
+        // its `unregister` branch. This test stresses the race and
+        // asserts the invariant: `completed.contains(origin)` implies
+        // `daemon_registry.contains(origin)`.
+        use std::collections::HashSet;
+        use std::sync::Barrier;
+        use std::thread;
+
+        const TRIALS: u32 = 1_000;
+
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = Arc::new(MigrationTargetHandler::new(reg.clone()));
+        let mut seen_origins: HashSet<u32> = HashSet::with_capacity(TRIALS as usize);
+
+        for _ in 0..TRIALS {
+            let kp = EntityKeypair::generate();
+            let origin = kp.origin_hash();
+            if origin == 0 || !seen_origins.insert(origin) {
+                continue;
+            }
+            let snapshot = make_snapshot(&kp, 5, 0);
+            handler
+                .restore_snapshot(
+                    RestoreContext {
+                        daemon_origin: origin,
+                        snapshot: &snapshot,
+                        source_node: 0x1111,
+                        orchestrator_node: 0x2222,
+                    },
+                    kp.clone(),
+                    || Box::new(AccumDaemon { total: 0 }),
+                    DaemonHostConfig::default(),
+                )
+                .unwrap();
+            handler.activate(origin).unwrap();
+
+            let barrier = Arc::new(Barrier::new(2));
+
+            let h_complete = handler.clone();
+            let b_complete = barrier.clone();
+            let completer = thread::spawn(move || {
+                b_complete.wait();
+                let _ = h_complete.complete(origin);
+            });
+
+            let h_abort = handler.clone();
+            let b_abort = barrier.clone();
+            let aborter = thread::spawn(move || {
+                b_abort.wait();
+                let _ = h_abort.abort(origin);
+            });
+
+            completer.join().unwrap();
+            aborter.join().unwrap();
+
+            // Invariant: if a completed record exists for this origin,
+            // the daemon must still be registered. Bug allowed the
+            // opposite — completed.insert wins, abort.unregister wins,
+            // resulting in a "completed" record for an unregistered
+            // daemon.
+            if handler.orchestrator_node(origin).is_some() {
+                assert!(
+                    reg.contains(origin),
+                    "complete() promoted origin {origin:#x} to authoritative \
+                     while a concurrent abort() unregistered it — \
+                     completed-record-without-registered-daemon is the bug \
+                     this test is pinning"
+                );
+            }
+        }
     }
 }

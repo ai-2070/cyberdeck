@@ -83,22 +83,31 @@ fn bench_event_creation(c: &mut Criterion) {
 fn bench_batch_pop(c: &mut Criterion) {
     let mut group = c.benchmark_group("batch");
 
+    // Steady-state pop-after-refill: every iteration pops `size`
+    // elements then immediately re-pushes the same count to keep the
+    // buffer at its target depth. The number we report is therefore
+    // *not* a pure pop cost — it includes the refill and the
+    // partial-pop branch. That's intentional for tracking real
+    // workloads (consumers that drain into the same ring), but call
+    // it out so future readers don't compare it against an
+    // isolated-pop benchmark.
     for batch_size in [100, 1000, 10000].iter() {
         let buffer: RingBuffer<u64> = RingBuffer::new(1 << 20);
 
-        // Pre-fill buffer
+        // Pre-fill the buffer once so the first iteration starts in
+        // steady state.
         for i in 0..(*batch_size * 10) {
             let _ = buffer.try_push(i as u64);
         }
 
         group.throughput(Throughput::Elements(*batch_size as u64));
         group.bench_with_input(
-            BenchmarkId::new("pop_batch", batch_size),
+            BenchmarkId::new("pop_batch_steady_state", batch_size),
             batch_size,
             |b, &size| {
                 b.iter(|| {
                     let batch = buffer.pop_batch(size);
-                    // Refill what we popped
+                    // Refill what we popped to maintain depth.
                     for i in 0..batch.len() {
                         let _ = buffer.try_push(i as u64);
                     }

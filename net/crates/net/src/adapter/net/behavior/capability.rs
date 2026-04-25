@@ -1114,18 +1114,6 @@ impl CapabilityFilter {
 
         true
     }
-
-    /// True if the filter has any predicate that the inverted indexes
-    /// (tags / models / tools / GPU / vendor) cannot satisfy on their
-    /// own. When this returns `false`, [`CapabilityIndex::query`]
-    /// can trust the index intersection as authoritative and skip
-    /// the per-candidate `nodes` lookup + full re-check.
-    fn needs_full_check(&self) -> bool {
-        self.min_memory_mb.is_some()
-            || self.min_vram_mb.is_some()
-            || self.min_context_length.is_some()
-            || !self.require_modalities.is_empty()
-    }
 }
 
 // ============================================================================
@@ -1554,22 +1542,17 @@ impl CapabilityIndex {
             .build_candidate_set(filter)
             .unwrap_or_else(|| self.nodes.iter().map(|r| *r.key()).collect());
 
-        // Fast path: if the filter only constrains dimensions covered
-        // by the inverted indexes, the intersection above is already
-        // the answer. Skip the per-candidate `nodes.get()` + full
-        // `matches()` re-check — but still confirm presence via
-        // `contains_key` so a node evicted in the race window between
-        // the index read and now does not leak into the result.
-        if !filter.needs_full_check() {
-            return candidates
-                .into_iter()
-                .filter(|&node_id| self.nodes.contains_key(&node_id))
-                .collect();
-        }
-
-        // Slow path: filter has non-indexed predicates (memory, vram,
-        // context length, modalities). Pull each candidate's full
-        // capability set and re-check.
+        // Re-check `filter.matches()` against each candidate's current
+        // `nodes` entry, even when the filter only constrains indexed
+        // dimensions. The inverted indexes update non-atomically with
+        // `nodes` (`remove_from_indexes` → `add_to_indexes` →
+        // `nodes.insert`), so during a re-announcement that swaps a
+        // capability set the inverted index can list a node under a
+        // tag/model/tool that the node's current `nodes` entry does
+        // not actually advertise. Skipping the re-check on a "fast
+        // path" lets that stale index leak into the result. The
+        // matches() call here re-verifies under the current
+        // capabilities and closes the window.
         candidates
             .into_iter()
             .filter(|&node_id| {
@@ -1596,13 +1579,17 @@ impl CapabilityIndex {
             .build_candidate_set(&req.filter)
             .unwrap_or_else(|| self.nodes.iter().map(|r| *r.key()).collect());
 
-        let needs_full = req.filter.needs_full_check();
-
         candidates
             .into_iter()
             .filter_map(|node_id| {
                 let node = self.nodes.get(&node_id)?;
-                if needs_full && !req.filter.matches(&node.capabilities) {
+                // Always re-check the filter under the current
+                // capabilities — the inverted indexes update
+                // non-atomically with `nodes`, so a stale index can
+                // otherwise advance a candidate that no longer
+                // matches the filter into the scoring step. See
+                // `query()` for the same fix.
+                if !req.filter.matches(&node.capabilities) {
                     return None;
                 }
                 Some((node_id, req.score(&node.capabilities)))
@@ -2453,21 +2440,15 @@ mod tests {
         );
     }
 
-    /// `query()` has two paths after the index intersection: a fast
-    /// path that trusts the indexes when the filter constrains only
-    /// indexed dimensions, and a slow path that re-applies
-    /// `filter.matches()` per candidate when non-indexed predicates
-    /// are set. The two must produce identical results for any
-    /// filter with no truly-non-indexed predicates.
-    ///
-    /// We force the slow path by adding `min_memory_mb = 0` — an
-    /// always-true predicate (memory_mb is unsigned, so the
-    /// `memory_mb < 0` check can never fire) that nonetheless makes
-    /// `needs_full_check()` return true. If a future change to
-    /// `needs_full_check()` ever omits a non-indexed field, this
-    /// test catches it: the fast and slow paths would diverge.
+    /// `query()` re-checks `filter.matches()` per candidate against
+    /// the live `nodes` entry, so a filter with an always-true
+    /// non-indexed predicate (e.g., `min_memory_mb = 0`) must produce
+    /// the same result as the equivalent indexed-only filter. This
+    /// pins the equivalence under semantically-redundant predicate
+    /// expansions and would catch a future regression that special-
+    /// cased the index-only path again without re-running matches().
     #[test]
-    fn query_fast_path_matches_slow_path_for_indexed_only_filter() {
+    fn query_indexed_only_matches_with_redundant_non_indexed_predicate() {
         let index = CapabilityIndex::new();
 
         for i in 0..30u64 {
@@ -2484,36 +2465,23 @@ mod tests {
             index.index(ann);
         }
 
-        // Indexed-only filter — exercises the fast path.
         let indexed_only = CapabilityFilter::new()
             .require_tag("even")
             .require_tag("inference");
-        // Same predicates plus an always-true non-indexed predicate to
-        // force the slow path.
-        let mut force_slow = indexed_only.clone();
-        force_slow.min_memory_mb = Some(0);
+        // Same predicates plus an always-true non-indexed predicate.
+        // `memory_mb` is unsigned so `>= 0` is trivially true.
+        let mut with_non_indexed = indexed_only.clone();
+        with_non_indexed.min_memory_mb = Some(0);
 
-        assert!(
-            !indexed_only.needs_full_check(),
-            "filter with only tags must take the fast path"
-        );
-        assert!(
-            force_slow.needs_full_check(),
-            "filter with min_memory_mb must take the slow path"
-        );
-
-        let mut fast: Vec<u64> = index.query(&indexed_only);
-        let mut slow: Vec<u64> = index.query(&force_slow);
-        fast.sort();
-        slow.sort();
+        let mut a: Vec<u64> = index.query(&indexed_only);
+        let mut b: Vec<u64> = index.query(&with_non_indexed);
+        a.sort();
+        b.sort();
         assert_eq!(
-            fast, slow,
-            "fast path and slow path must agree when filters are equivalent"
+            a, b,
+            "adding an always-true predicate must not change the result set"
         );
-        assert!(
-            !fast.is_empty(),
-            "sample data must produce non-empty results"
-        );
+        assert!(!a.is_empty(), "sample data must produce non-empty results");
     }
 
     /// After the `find_best()` refactor that folds the index lookup
@@ -2569,6 +2537,86 @@ mod tests {
         assert_eq!(
             chosen, expected_winner,
             "find_best must pick the highest-memory candidate under prefer_memory(1.0)"
+        );
+    }
+
+    #[test]
+    fn test_regression_query_rejects_stale_inverted_index_entry() {
+        // Regression: `query()` had a fast path that, when the filter
+        // only constrained indexed dimensions, returned every candidate
+        // produced by the inverted indexes after only a `contains_key`
+        // presence check on `nodes`. The inverted indexes update
+        // non-atomically with `nodes` (`remove_from_indexes(old)` →
+        // `add_to_indexes(new)` → `nodes.insert(new)`), so during a
+        // capability re-announcement that swaps a tag the inverted
+        // index could already advertise the node under the new tag
+        // while `nodes` still held the old `CapabilitySet`. The fast
+        // path then leaked the node into a query that did not actually
+        // match its current capabilities.
+        //
+        // The fix removes the fast path and always re-runs
+        // `filter.matches()` against the current capabilities. This
+        // test deterministically reproduces the inconsistent state by
+        // directly manipulating the private indexes — no thread race
+        // needed.
+        let index = CapabilityIndex::new();
+
+        // Step 1: index the node honestly via the public API with
+        // tags = ["alpha"].
+        let caps_alpha = CapabilitySet::new().add_tag("alpha");
+        let ann = CapabilityAnnouncement::new(1, test_entity(), 1, caps_alpha);
+        index.index(ann);
+
+        // Sanity: alpha matches, beta does not.
+        let filter_alpha = CapabilityFilter::new().require_tag("alpha");
+        let filter_beta = CapabilityFilter::new().require_tag("beta");
+        assert_eq!(index.query(&filter_alpha), vec![1]);
+        assert!(index.query(&filter_beta).is_empty());
+
+        // Step 2: simulate the mid-reindex race window. Move node 1
+        // from `by_tag["alpha"]` to `by_tag["beta"]` WITHOUT updating
+        // `nodes`. This is exactly the state the inverted-index update
+        // produces between `add_to_indexes(new)` and
+        // `nodes.insert(new)` when "alpha"→"beta" tags swap.
+        //
+        // Faithful to production: `remove_from_indexes` drops the
+        // outer-map entry once its inner set is empty (the `remove_if`
+        // call that prevents an unbounded leak of empty `HashSet`
+        // shells). Without that drop here, the simulation would leave
+        // `by_tag["alpha"]` as an empty entry — observable to
+        // `build_candidate_set` as `Some(empty)` instead of the real
+        // `None`, which paper-thinly changes the candidate-set
+        // construction shape compared to what production emits.
+        index
+            .by_tag
+            .get_mut("alpha")
+            .expect("alpha tag entry was indexed")
+            .remove(&1);
+        index.by_tag.remove_if("alpha", |_, set| set.is_empty());
+        index
+            .by_tag
+            .entry("beta".to_string())
+            .or_default()
+            .insert(1);
+
+        // Step 3: with the fix, query(beta) does NOT return node 1
+        // because nodes[1] still has tags=["alpha"] which does not
+        // match beta. The buggy fast path would return it via
+        // contains_key alone.
+        assert!(
+            index.query(&filter_beta).is_empty(),
+            "query(beta) leaked a node whose nodes[] entry does not advertise beta"
+        );
+
+        // Step 4: same invariant for find_best — its previous
+        // implementation gated `filter.matches()` on
+        // `needs_full_check()` and skipped the re-check on
+        // index-only filters, surfacing the same leak as a chosen
+        // node that did not actually match.
+        let req = CapabilityRequirement::from_filter(filter_beta.clone());
+        assert!(
+            index.find_best(&req).is_none(),
+            "find_best(beta) leaked a non-matching node from the stale inverted index"
         );
     }
 }
