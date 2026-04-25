@@ -495,6 +495,10 @@ impl DaemonRuntime {
     /// hands all-`Send` state to `env.spawn_future`) is the
     /// idiomatic napi-rs pattern for "sync setup, async
     /// continuation."
+    // The argument list is the public NAPI/TS contract; bundling
+    // into a single struct would force every TS caller to wrap
+    // arguments in an object and break ABI compatibility.
+    #[allow(clippy::too_many_arguments)]
     #[napi]
     pub fn spawn<'env>(
         &'env self,
@@ -629,6 +633,8 @@ impl DaemonRuntime {
     /// Same sync-with-PromiseRaw shape as `spawn` — `Function`
     /// values are `!Send`, so we build TSFNs synchronously before
     /// handing off to the async continuation.
+    // Same NAPI/TS-contract reasoning as `spawn` above.
+    #[allow(clippy::too_many_arguments)]
     #[napi]
     pub fn spawn_from_snapshot<'env>(
         &'env self,

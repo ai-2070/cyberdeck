@@ -245,7 +245,7 @@ fn gpu_info_to_js(g: &GpuInfo) -> GpuInfoJs {
         vram_mb: g.vram_mb,
         compute_units: Some(g.compute_units as u32),
         tensor_cores: Some(g.tensor_cores as u32),
-        fp16_tflops_x10: Some(g.fp16_tflops_x10 as u32),
+        fp16_tflops_x10: Some(g.fp16_tflops_x10),
     }
 }
 
