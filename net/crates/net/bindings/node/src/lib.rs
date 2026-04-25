@@ -262,12 +262,19 @@ pub struct IngestResult {
 }
 
 /// Ingestion statistics.
+///
+/// Counters are surfaced as `BigInt` rather than `number` so that
+/// long-running nodes report exact totals past 2^53. The previous
+/// surface clamped `u64` values into `i64` and silently capped at
+/// `i64::MAX`; production busses ingesting millions of events per
+/// second hit that cap inside a few months and the metric started
+/// lying.
 #[napi(object)]
 pub struct Stats {
     /// Total events ingested
-    pub events_ingested: i64,
+    pub events_ingested: BigInt,
     /// Events dropped due to backpressure
-    pub events_dropped: i64,
+    pub events_dropped: BigInt,
 }
 
 /// High-performance event bus for Node.js.
@@ -571,14 +578,16 @@ impl Net {
 
         let stats = bus.stats();
         Ok(Stats {
-            events_ingested: stats
-                .events_ingested
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .min(i64::MAX as u64) as i64,
-            events_dropped: stats
-                .events_dropped
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .min(i64::MAX as u64) as i64,
+            events_ingested: BigInt::from(
+                stats
+                    .events_ingested
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            events_dropped: BigInt::from(
+                stats
+                    .events_dropped
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
         })
     }
 

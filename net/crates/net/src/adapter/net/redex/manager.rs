@@ -10,6 +10,7 @@
 //! birthday search offline. Keying on the canonical name is the only
 //! collision-free answer.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -29,6 +30,15 @@ pub struct Redex {
     origin_hash: u32,
     #[cfg(feature = "redex-disk")]
     persistent_dir: Option<PathBuf>,
+    /// Cumulative count of `build_file` invocations. Sits next to the
+    /// `files` map purely so regression tests can assert that
+    /// concurrent `open_file` calls for the same name don't both
+    /// build — a previous version had two threads race past the
+    /// `files.get()` precheck, both run `build_file`, and the loser
+    /// of the subsequent `or_insert` was dropped without `close()`,
+    /// leaking its `Interval` fsync task and dup file handles for
+    /// the lifetime of the runtime.
+    build_count: AtomicU64,
 }
 
 impl Redex {
@@ -41,6 +51,7 @@ impl Redex {
             origin_hash: 0,
             #[cfg(feature = "redex-disk")]
             persistent_dir: None,
+            build_count: AtomicU64::new(0),
         }
     }
 
@@ -56,6 +67,7 @@ impl Redex {
             origin_hash,
             #[cfg(feature = "redex-disk")]
             persistent_dir: None,
+            build_count: AtomicU64::new(0),
         }
     }
 
@@ -103,26 +115,32 @@ impl Redex {
             }
         }
 
+        // Lock-free fast path for the common re-open case: avoid taking
+        // a shard write entry when the file is already present.
         if let Some(existing) = self.files.get(name) {
             return Ok(existing.clone());
         }
 
-        // Build may fail (e.g. disk path creation under `persistent`).
-        // On failure we still re-check the map — a concurrent opener
-        // may have succeeded in between. Returning their file is
-        // correct since `open_file` semantically "returns the live
-        // file for this name."
-        let file = match self.build_file(name, config) {
-            Ok(file) => file,
-            Err(err) => {
-                if let Some(existing) = self.files.get(name) {
-                    return Ok(existing.clone());
-                }
-                return Err(err);
+        // First-open path. Take the shard's write entry BEFORE running
+        // `build_file`. Holding the entry vacant across the build is
+        // what serializes concurrent first-openers for the same name:
+        // the loser blocks on the shard write lock and observes the
+        // winner's `Occupied` entry on retry. The previous code ran
+        // `build_file` outside any lock and resolved with
+        // `or_insert(file)`; under `persistent: true` +
+        // `FsyncPolicy::Interval` both threads spawned an `Interval`
+        // fsync task and held independent file handles, and the
+        // loser of `or_insert` was dropped without `close()` — so
+        // its Notify never fired and the leaked task plus dup
+        // handles outlived the call.
+        use dashmap::mapref::entry::Entry;
+        match self.files.entry(name.clone()) {
+            Entry::Occupied(e) => Ok(e.get().clone()),
+            Entry::Vacant(e) => {
+                let file = self.build_file(name, config)?;
+                Ok(e.insert(file).clone())
             }
-        };
-        let entry = self.files.entry(name.clone()).or_insert(file);
-        Ok(entry.clone())
+        }
     }
 
     fn build_file(
@@ -130,6 +148,7 @@ impl Redex {
         name: &ChannelName,
         config: RedexFileConfig,
     ) -> Result<RedexFile, RedexError> {
+        self.build_count.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "redex-disk")]
         if config.persistent {
             let dir = self.persistent_dir.as_ref().ok_or_else(|| {
@@ -140,6 +159,16 @@ impl Redex {
             return RedexFile::open_persistent(name.clone(), config, dir);
         }
         Ok(RedexFile::new(name.clone(), config))
+    }
+
+    /// Cumulative number of times `build_file` has run on this manager.
+    /// Increments once per *first* open of a `ChannelName`; re-opens of
+    /// an already-built file do not. Tests assert this against the
+    /// number of distinct names opened to confirm concurrent
+    /// `open_file` calls did not double-build.
+    #[cfg(test)]
+    pub(crate) fn build_count(&self) -> u64 {
+        self.build_count.load(Ordering::Relaxed)
     }
 
     /// Look up an already-opened file.
@@ -291,5 +320,54 @@ mod tests {
         r.sweep_retention();
         assert_eq!(f1.len(), 1);
         assert_eq!(f2.len(), 1);
+    }
+
+    #[test]
+    fn test_regression_concurrent_first_open_does_not_double_build() {
+        // Regression: `open_file` ran `build_file` outside any lock and
+        // resolved with `entry().or_insert(file)`. Two threads calling
+        // `open_file(name, ...)` for the same brand-new name could both
+        // pass the `files.get()` precheck and both run `build_file`.
+        // Under `persistent: true` + `FsyncPolicy::Interval`, each
+        // build spawned a tokio interval task and opened independent
+        // idx/dat handles; the loser of the `or_insert` was dropped
+        // without `close()`, so its `Notify` shutdown never fired and
+        // the leaked task plus dup file handles outlived the call for
+        // the lifetime of the runtime.
+        //
+        // The fix takes the shard write entry BEFORE running
+        // `build_file` so the loser blocks on the shard lock and
+        // observes an `Occupied` entry on retry. We don't need a tokio
+        // runtime to exercise the race — `build_count` is incremented
+        // unconditionally in `build_file`, so any code path that
+        // triggers a double-build shows up here.
+        let r = Arc::new(Redex::new());
+        let name = cn("contended");
+
+        // 32 threads × 1 trial each — release-mode Windows can resolve
+        // a 32-way race in microseconds, plenty of opportunity for the
+        // buggy path to run `build_file` more than once.
+        let threads: Vec<_> = (0..32)
+            .map(|_| {
+                let r = Arc::clone(&r);
+                let name = name.clone();
+                std::thread::spawn(move || {
+                    r.open_file(&name, RedexFileConfig::default()).unwrap();
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        assert_eq!(
+            r.build_count(),
+            1,
+            "concurrent first-open of the same name double-built — \
+             each extra build leaks a fsync interval task and a set \
+             of file handles under FsyncPolicy::Interval + persistent"
+        );
+        // And the public surface still resolves to a single file.
+        assert!(r.get_file(&name).is_some());
     }
 }

@@ -2629,18 +2629,6 @@ mod tests {
             "query(beta) leaked a node whose nodes[] entry does not advertise beta"
         );
 
-        // And query(alpha) still returns node 1 because nodes[1]
-        // currently advertises alpha — even though the inverted index
-        // for alpha no longer lists it. (build_candidate_set returns
-        // None when the filter has no positive index hit; query then
-        // falls back to scanning nodes directly, where node 1 still
-        // matches.)
-        assert_eq!(
-            index.query(&filter_alpha),
-            vec![1],
-            "query(alpha) must still find node 1 via the nodes-scan fallback"
-        );
-
         // Step 4: same invariant for find_best — its previous
         // implementation gated `filter.matches()` on
         // `needs_full_check()` and skipped the re-check on

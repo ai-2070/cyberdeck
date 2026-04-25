@@ -258,13 +258,28 @@ func (bs *Net) IngestRawBatch(jsons []string) int {
 	// own backing store, so the only per-batch allocation is the
 	// pointer + length tables themselves. Previously each event
 	// paid a full malloc + memcpy through C.CString.
+	//
+	// Cgo rule note: passing `&ptrs[0]` to C means we're passing Go
+	// memory that contains pointers into other Go memory (the string
+	// backing stores). The cgo rules forbid that unless every such
+	// pointer is pinned via `runtime.Pinner`. Without pinning, the
+	// Go runtime's `cgocheck=2` would flag this and a future GC
+	// could move a string's backing store out from under the C call.
+	// `IngestRaw` doesn't have this problem because it passes a flat
+	// `*C.char` (single Go pointer, not a Go slice of Go pointers).
+	var pinner runtime.Pinner
+	defer pinner.Unpin()
 	ptrs := make([]*C.char, len(jsons))
 	lens := make([]C.size_t, len(jsons))
 	for i, j := range jsons {
 		if len(j) > 0 {
-			ptrs[i] = (*C.char)(unsafe.Pointer(unsafe.StringData(j)))
+			data := unsafe.StringData(j)
+			pinner.Pin(data)
+			ptrs[i] = (*C.char)(unsafe.Pointer(data))
 		} else {
-			// Same null-vs-sentinel rationale as IngestRaw above.
+			// `emptyByte` is a package-level Go variable; pin its
+			// element so the same rule applies uniformly.
+			pinner.Pin(&emptyByte[0])
 			ptrs[i] = (*C.char)(unsafe.Pointer(&emptyByte[0]))
 		}
 		lens[i] = C.size_t(len(j))
@@ -278,7 +293,8 @@ func (bs *Net) IngestRawBatch(jsons []string) int {
 	)
 	// Keep the slice (and transitively the strings it references)
 	// alive across the cgo call. Go's escape analysis won't see the
-	// reachability through the raw pointers we passed.
+	// reachability through the raw pointers we passed; the pinner
+	// itself does not extend lifetimes, only relocation/freeing.
 	runtime.KeepAlive(jsons)
 	runtime.KeepAlive(ptrs)
 	runtime.KeepAlive(lens)
@@ -345,9 +361,15 @@ func (bs *Net) Poll(limit int, cursor string) (*PollResponse, error) {
 			(*C.char)(unsafe.Pointer(&buffer[0])),
 			C.size_t(bufferSize),
 		)
-		// Keep the request buffer alive across each cgo call —
-		// `cRequest` is a raw pointer the GC otherwise can't trace.
+		// Keep both the request and response buffers alive across the
+		// cgo call. The request side was already pinned via
+		// KeepAlive(cRequestBuf); the response side relied on Go's
+		// escape analysis (the `buffer[:result]` slice below keeps it
+		// reachable today) which is fragile and inconsistent with the
+		// adjacent KeepAlive on the request. Be explicit so the C side
+		// can never write into a buffer the GC reclaimed mid-call.
 		runtime.KeepAlive(cRequestBuf)
+		runtime.KeepAlive(buffer)
 
 		if result == -7 { // NET_ERR_BUFFER_TOO_SMALL
 			bufferSize *= 2

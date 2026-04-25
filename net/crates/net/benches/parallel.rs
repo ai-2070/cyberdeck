@@ -13,9 +13,16 @@ use net::shard::ShardManager;
 fn bench_parallel_ingestion(c: &mut Criterion) {
     let mut group = c.benchmark_group("parallel");
 
-    // Measure total throughput with multiple producer threads
+    // Measure total throughput with multiple producer threads.
+    //
+    // Construct the `ShardManager` *inside* `bench_with_input` so each
+    // thread-count variant starts from a fresh, empty manager. The
+    // previous version hoisted `let manager = Arc::new(...)` to the
+    // outer for-loop, which meant the 1-thread run pre-loaded ring-
+    // buffer state that the 2/4/8-thread runs then inherited — making
+    // their measurements depend on prior history and the across-
+    // variant comparison no longer apples-to-apples.
     for num_threads in [1, 2, 4, 8].iter() {
-        let manager = Arc::new(ShardManager::new(16, 1 << 20, BackpressureMode::DropOldest));
         let ops_per_iter = 10_000u64;
 
         group.throughput(Throughput::Elements(ops_per_iter * (*num_threads as u64)));
@@ -23,6 +30,8 @@ fn bench_parallel_ingestion(c: &mut Criterion) {
             BenchmarkId::new("threads", num_threads),
             num_threads,
             |b, &num_threads| {
+                let manager =
+                    Arc::new(ShardManager::new(16, 1 << 20, BackpressureMode::DropOldest));
                 b.iter(|| {
                     let handles: Vec<_> = (0..num_threads)
                         .map(|_| {

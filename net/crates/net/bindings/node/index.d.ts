@@ -1805,12 +1805,21 @@ export interface StandbyGroupConfigJs {
   hostConfig?: GroupHostConfigJs
 }
 
-/** Ingestion statistics. */
+/**
+ * Ingestion statistics.
+ *
+ * Counters are surfaced as `BigInt` rather than `number` so that
+ * long-running nodes report exact totals past 2^53. The previous
+ * surface clamped `u64` values into `i64` and silently capped at
+ * `i64::MAX`; production busses ingesting millions of events per
+ * second hit that cap inside a few months and the metric started
+ * lying.
+ */
 export interface Stats {
   /** Total events ingested */
-  eventsIngested: number
+  eventsIngested: bigint
   /** Events dropped due to backpressure */
-  eventsDropped: number
+  eventsDropped: bigint
 }
 
 /** A stored event returned from polling. */

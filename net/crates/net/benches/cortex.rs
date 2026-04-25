@@ -57,14 +57,21 @@ fn bench_ingest(c: &mut Criterion) {
         let _enter = runtime.enter();
         let redex = Redex::new();
         let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
-        let tags = vec!["bench".to_string()];
+        // Pre-build the tags vec once and `clone()` outside the timed
+        // block so the per-iteration cost we measure is the store path,
+        // not the Vec<String> allocation. The `store` signature takes
+        // an owned `Vec<String>`; cloning per iteration is unavoidable
+        // but the clone itself shouldn't be inside `b.iter`.
+        let tags_template = vec!["bench".to_string()];
         let mut id: u64 = 0;
-        b.iter(|| {
-            id = id.wrapping_add(1);
-            memories
-                .store(id, "content", tags.clone(), "source", 0)
-                .unwrap()
-        });
+        b.iter_batched(
+            || tags_template.clone(),
+            |tags| {
+                id = id.wrapping_add(1);
+                memories.store(id, "content", tags, "source", 0).unwrap()
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 
     group.finish();
