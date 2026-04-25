@@ -43,7 +43,7 @@ If you skip step 1, late emits race with step 4 and surface as `Shutdown` errors
 
 ### Rust: subscribe streams hold the bus
 
-`Net::subscribe()` and `subscribe_typed()` clone the inner `Arc<EventBus>` into the returned stream. `node.shutdown()` consumes `self` and then calls `Arc::try_unwrap` on the bus — if **any** stream is still alive, that fails and `shutdown` returns `SdkError::Adapter("cannot shutdown: outstanding references exist")` (`sdk/src/net.rs:236-246`). Drop every stream you spawned (`task.abort()`, break the loop and let it fall out of scope) **before** calling `shutdown`. This is why steps 1 and 3 in the order above are non-negotiable on Rust.
+`Net::subscribe()` and `subscribe_typed()` clone the inner `Arc<EventBus>` into the returned stream. `node.shutdown()` consumes `self` and then calls `Arc::try_unwrap` on the bus — if **any** stream is still alive, that fails and `shutdown` returns `SdkError::Adapter("cannot shutdown: outstanding references exist")` (`net/crates/net/sdk/src/net.rs:236-246`). Drop every stream you spawned (`task.abort()`, break the loop and let it fall out of scope) **before** calling `shutdown`. This is why steps 1 and 3 in the order above are non-negotiable on Rust.
 
 ### Tests
 
@@ -69,7 +69,7 @@ Verified against `net/crates/net/sdk/src/error.rs`. The full enum:
 | `Backpressure` | Stream's per-stream send window full | Use `send_with_retry` (5–200ms exponential) or `send_blocking` helpers, or apply your own policy. |
 | `NotConnected` | Peer session is gone | Reconnect or reroute at the application layer. Mesh layer will already be trying. |
 | `ChannelRejected(Option<AckReason>)` | Publisher's ack rejected your subscribe/unsubscribe | Permission token issue or capacity limit. Inspect the reason. |
-| `Traversal { kind, message }` | NAT-traversal optimization failed | **Never a connectivity failure** — fallback path still works. Log and ignore unless tuning. *Only present when the SDK is built with `features = ["nat-traversal"]` (`sdk/src/error.rs:55-66`)* — projects without that feature won't see this variant. |
+| `Traversal { kind, message }` | NAT-traversal optimization failed | **Never a connectivity failure** — fallback path still works. Log and ignore unless tuning. *Only present when the SDK is built with `features = ["nat-traversal"]` (`net/crates/net/sdk/src/error.rs:55-66`)* — projects without that feature won't see this variant. |
 
 `pub type Result<T> = std::result::Result<T, SdkError>;` — most APIs return this.
 
@@ -132,7 +132,7 @@ The `net_sdk` package is **synchronous**. The underlying PyO3 binding owns its o
 
 - For sync apps (Flask, scripts): just use it directly.
 - For async apps (FastAPI, asyncio): wrap blocking calls in `asyncio.to_thread(...)` or `loop.run_in_executor(None, ...)` so they don't block the event loop.
-- `subscribe()` returns an `EventStream` that supports **both** sync (`for ... in`) and async (`async for`) iteration. In an asyncio app, prefer `async for` directly on the stream — no worker thread needed. Pick one iteration mode per stream instance; interleaving on the same instance is undefined (`sdk-py/src/net_sdk/stream.py:38-58`).
+- `subscribe()` returns an `EventStream` that supports **both** sync (`for ... in`) and async (`async for`) iteration (`net/crates/net/sdk-py/src/net_sdk/stream.py:38-58`). The `async for` path still calls the same blocking `bus.poll(...)` per step — the GIL is released during the FFI wait, but the asyncio event loop is single-threaded and stalls until the call returns. Fine for low-latency polls; if event-loop responsiveness matters under load, consume the **sync** iterator inside `asyncio.to_thread(...)` (or a dedicated worker thread). Pick one iteration mode per stream instance; interleaving on the same instance is undefined.
 - `send_blocking` (mesh) explicitly releases the GIL for the whole retry loop.
 
 Python int handles `u64` natively (arbitrary precision) — no BigInt glue needed.

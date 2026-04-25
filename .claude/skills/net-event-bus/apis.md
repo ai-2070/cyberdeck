@@ -105,7 +105,7 @@ with NetNode(shards=4) as node:
 
 **Key facts:**
 - `NetNode(...)` is **synchronous**. Use the context manager (`with`) for auto-shutdown.
-- `subscribe()` returns an `EventStream` that supports **both** `for ... in` (sync) and `async for` (asyncio). Pick one mode per stream instance — interleaving on the same instance is undefined (`sdk-py/src/net_sdk/stream.py:38-58`).
+- `subscribe()` returns an `EventStream` that supports **both** `for ... in` (sync) and `async for` (asyncio) (`net/crates/net/sdk-py/src/net_sdk/stream.py:38-58`). Pick one mode per stream instance — interleaving on the same instance is undefined. Note: the `async for` path still calls a blocking FFI poll per step; in an asyncio app where event-loop responsiveness matters, prefer the sync iterator inside `asyncio.to_thread(...)`. See `runtime.md` § Python.
 - Models can be `@dataclass`, Pydantic models (anything with `model_dump()`), or plain classes (anything with `__dict__`).
 - The native `net` module (PyO3 binding) is the escape hatch — `node.bus` exposes it. Use only for features not surfaced in `net_sdk`.
 
@@ -152,9 +152,9 @@ async fn main() -> net_sdk::error::Result<()> {
 **Key facts:**
 - **No `node.channel()` API.** Rust has only the raw firehose. To split topics, use distinct types/enum variants in the payload and match on the consumer, or run separate `Net` instances per logical channel.
 - Builder pattern selects transport: `.memory()`, `.redis(...)`, `.jetstream(...)`, `.mesh(...)`. Adapter methods take typed configs (`RedisAdapterConfig`, `JetStreamAdapterConfig`, `NetAdapterConfig`) — not raw URL strings. Each adapter is gated on a feature flag (`redis`, `jetstream`, `net`).
-- **Feature umbrella** (from `sdk/Cargo.toml`): default is `[]` (memory only). `local = ["net", "cortex", "compute", "groups"]` is the right shape for a single-node or LAN-only deployment; `full = ["local", "redis", "jetstream"]` is everything. NAT traversal lives behind its own `nat-traversal` feature (and `port-mapping` builds on top). When wiring `Cargo.toml`, prefer the umbrella feature over hand-listing.
+- **Feature umbrella** (from `net/crates/net/sdk/Cargo.toml`): default is `[]` (memory only). `local = ["net", "cortex", "compute", "groups"]` is the right shape for a single-node or LAN-only deployment; `full = ["local", "redis", "jetstream"]` is everything. NAT traversal lives behind its own `nat-traversal` feature (and `port-mapping` builds on top). When wiring `Cargo.toml`, prefer the umbrella feature over hand-listing.
 - `emit(&T)` returns `Receipt { shard_id, timestamp }`. `emit_batch(&[T])` returns count (`usize`).
-- **Fast-path emit variants** (`sdk/src/net.rs:128-160`): `emit_raw(impl Into<Bytes>)` for already-serialized bytes (zero-copy), `emit_str(&str)` for JSON-as-string, `emit_raw_batch(Vec<Bytes>)` for batched bytes. All return the same `Receipt` (or `usize` for the batch form).
+- **Fast-path emit variants** (`net/crates/net/sdk/src/net.rs:128-160`): `emit_raw(impl Into<Bytes>)` for already-serialized bytes (zero-copy), `emit_str(&str)` for JSON-as-string, `emit_raw_batch(Vec<Bytes>)` for batched bytes. All return the same `Receipt` (or `usize` for the batch form).
 - `subscribe()` and `subscribe_typed::<T>()` return async streams. Poll with `.next().await`. Both clone the inner `Arc<EventBus>` — see `runtime.md` § "Rust: subscribe streams hold the bus" before calling `shutdown`.
 - One-shot pull (no streaming): `node.poll(PollRequest { limit, cursor, filter, ordering, shards }).await?` returns a `PollResponse { events, next_id, has_more }`. Use this when you want explicit cursor management instead of an `EventStream`.
 - Lifecycle helpers: `node.flush().await?` waits for pending batches to drain into the adapter (call before `shutdown` if you can't tolerate the in-flight loss); `node.health().await -> bool` and `node.shards() -> u16` for observability; `node.bus() -> &EventBus` is the escape hatch to the underlying core API.
