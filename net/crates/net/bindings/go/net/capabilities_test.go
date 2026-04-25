@@ -201,6 +201,82 @@ func TestNormalizeGPUVendor(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Scoped discovery (reserved scope:* tags)
+// ---------------------------------------------------------------------------
+
+func TestFindNodesScoped_TenantTagFiltersOutOtherTenants(t *testing.T) {
+	m := newMeshForCaps(t)
+	defer m.Shutdown()
+
+	// Announce ourselves under tenant `oem-123`.
+	caps := CapabilitySet{
+		Tags: []string{"model:llama3-70b", "scope:tenant:oem-123"},
+	}
+	if err := m.AnnounceCapabilities(caps); err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+	filter := CapabilityFilter{RequireTags: []string{"model:llama3-70b"}}
+
+	// Tenant("oem-123"): includes us.
+	peers, err := m.FindNodesScoped(filter, ScopeFilter{Kind: "tenant", Tenant: "oem-123"})
+	if err != nil {
+		t.Fatalf("find_nodes_scoped tenant=oem-123: %v", err)
+	}
+	if !slices.Contains(peers, m.NodeID()) {
+		t.Fatalf("own node missing under tenant=oem-123: %v", peers)
+	}
+
+	// Tenant("corp-acme"): excludes us — different tenant.
+	peers, err = m.FindNodesScoped(filter, ScopeFilter{Kind: "tenant", Tenant: "corp-acme"})
+	if err != nil {
+		t.Fatalf("find_nodes_scoped tenant=corp-acme: %v", err)
+	}
+	if slices.Contains(peers, m.NodeID()) {
+		t.Fatalf("own node leaked into tenant=corp-acme: %v", peers)
+	}
+
+	// Any: includes us (no SubnetLocal exclusion applies).
+	peers, err = m.FindNodesScoped(filter, ScopeFilter{Kind: "any"})
+	if err != nil {
+		t.Fatalf("find_nodes_scoped any: %v", err)
+	}
+	if !slices.Contains(peers, m.NodeID()) {
+		t.Fatalf("own node missing under any: %v", peers)
+	}
+
+	// GlobalOnly: excludes us — we have a tenant tag.
+	peers, err = m.FindNodesScoped(filter, ScopeFilter{Kind: "global_only"})
+	if err != nil {
+		t.Fatalf("find_nodes_scoped global_only: %v", err)
+	}
+	if slices.Contains(peers, m.NodeID()) {
+		t.Fatalf("tenant-tagged node leaked into global_only: %v", peers)
+	}
+}
+
+func TestFindNodesScoped_GlobalNodeVisibleToTenantQuery(t *testing.T) {
+	// A node without any `scope:*` tag is `Global` — visible to
+	// tenant queries by design (permissive default; matches the v1
+	// behaviour for nodes that don't opt in to scope tagging).
+	m := newMeshForCaps(t)
+	defer m.Shutdown()
+
+	if err := m.AnnounceCapabilities(CapabilitySet{Tags: []string{"gpu"}}); err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+	peers, err := m.FindNodesScoped(
+		CapabilityFilter{RequireTags: []string{"gpu"}},
+		ScopeFilter{Kind: "tenant", Tenant: "oem-123"},
+	)
+	if err != nil {
+		t.Fatalf("find_nodes_scoped: %v", err)
+	}
+	if !slices.Contains(peers, m.NodeID()) {
+		t.Fatalf("untagged (Global) node should match tenant query, got %v", peers)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Constructor kwargs (capability_gc + signed)
 // ---------------------------------------------------------------------------
 
