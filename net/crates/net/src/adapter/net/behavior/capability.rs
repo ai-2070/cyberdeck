@@ -2609,11 +2609,21 @@ mod tests {
         // `nodes`. This is exactly the state the inverted-index update
         // produces between `add_to_indexes(new)` and
         // `nodes.insert(new)` when "alpha"→"beta" tags swap.
+        //
+        // Faithful to production: `remove_from_indexes` drops the
+        // outer-map entry once its inner set is empty (the `remove_if`
+        // call that prevents an unbounded leak of empty `HashSet`
+        // shells). Without that drop here, the simulation would leave
+        // `by_tag["alpha"]` as an empty entry — observable to
+        // `build_candidate_set` as `Some(empty)` instead of the real
+        // `None`, which paper-thinly changes the candidate-set
+        // construction shape compared to what production emits.
         index
             .by_tag
             .get_mut("alpha")
             .expect("alpha tag entry was indexed")
             .remove(&1);
+        index.by_tag.remove_if("alpha", |_, set| set.is_empty());
         index
             .by_tag
             .entry("beta".to_string())

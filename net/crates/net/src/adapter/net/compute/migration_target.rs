@@ -295,39 +295,55 @@ impl MigrationTargetHandler {
     /// target won't need to re-restore from an orchestrator retry once
     /// the migration has successfully completed.
     ///
-    /// Order matters: the `completed` record is inserted **before** the
-    /// `migrations` entry is removed. A concurrent `activate()` retry
-    /// from the orchestrator (after a lost `ActivateAck`) walks
-    /// `migrations` first and falls back to `completed`. If the remove
-    /// happened first and the insert second, a retry landing in the gap
-    /// would observe neither map and fail with `DaemonNotFound`,
-    /// breaking the idempotency contract documented on `activate()`.
-    /// With this ordering the daemon is observable in at least one
-    /// map at every instant.
+    /// Atomicity vs `activate()` and `abort()`: the `migrations` write
+    /// entry is held across the entire operation. That guard serializes
+    /// us against:
+    ///
+    /// - a retried `activate()`, which calls `migrations.get()` and
+    ///   blocks on the shard write lock; once we drop the entry the
+    ///   migration is gone but `completed` already has the idempotency
+    ///   record, so the retry resolves through the `completed` lookup;
+    /// - a concurrent `abort()`, which would otherwise observe an empty
+    ///   `migrations` after a remove-first, insert-second ordering and
+    ///   `daemon_registry.unregister()` a daemon we just promoted to
+    ///   authoritative. Holding the entry forces abort to wait, and
+    ///   it then finds nothing and no-ops — which matches the legacy
+    ///   semantics where a successful complete makes a racing abort a
+    ///   no-op.
+    ///
+    /// `completed.insert` happens while the entry is held, so a third
+    /// thread observing both maps still sees the migration in at least
+    /// one of them at every instant — closing the original
+    /// `DaemonNotFound` gap on `activate()` retries.
     pub fn complete(&self, daemon_origin: u32) -> Result<(), MigrationError> {
-        // Precedence: if there is an active migration, finalize it. Only
-        // if there is no active migration AND a completed record exists
-        // do we treat this as an idempotent no-op (the retry case for a
-        // lost ActivateAck).
-        let completion = {
-            let entry = match self.migrations.get(&daemon_origin) {
-                Some(e) => e,
-                None => {
-                    if self.completed.contains_key(&daemon_origin) {
-                        return Ok(());
+        use dashmap::mapref::entry::Entry;
+        match self.migrations.entry(daemon_origin) {
+            Entry::Occupied(occ) => {
+                let completion = {
+                    let state = occ.get().lock();
+                    CompletedTargetState {
+                        orchestrator_node: state.orchestrator_node,
+                        replayed_through: state.replayed_through,
+                        completed_at: Instant::now(),
                     }
-                    return Err(MigrationError::DaemonNotFound(daemon_origin));
-                }
-            };
-            let state = entry.lock();
-            CompletedTargetState {
-                orchestrator_node: state.orchestrator_node,
-                replayed_through: state.replayed_through,
-                completed_at: Instant::now(),
+                };
+                // Insert into `completed` before dropping the entry
+                // guard so a concurrent `activate()` cannot observe
+                // both maps empty.
+                self.completed.insert(daemon_origin, completion);
+                // Removes from `migrations` and drops the entry guard.
+                occ.remove();
             }
-        };
-        self.completed.insert(daemon_origin, completion);
-        self.migrations.remove(&daemon_origin);
+            Entry::Vacant(_) => {
+                // Vacant + completed-record-present is the lost-ack
+                // retry path. Vacant + no completed record is a stale
+                // origin we never knew about.
+                if self.completed.contains_key(&daemon_origin) {
+                    return Ok(());
+                }
+                return Err(MigrationError::DaemonNotFound(daemon_origin));
+            }
+        }
         // The factory is single-shot on a successful migration: keeping it
         // registered would let a stale or replayed SnapshotReady re-trigger
         // restore against what is now the authoritative copy.
@@ -838,6 +854,7 @@ mod tests {
         // threads aligned closely enough to land observer probes inside
         // the gap. With the bug, this hits `DaemonNotFound` reliably.
         // With the fix, it never does.
+        use std::collections::HashSet;
         use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
         use std::thread;
 
@@ -875,15 +892,25 @@ mod tests {
             }
         });
 
+        // Track origins we've already used so a 32-bit `origin_hash`
+        // collision doesn't trip `restore_snapshot` (the daemon
+        // registry rejects re-registration of an already-registered
+        // origin since we deliberately do NOT unregister between
+        // trials). The birthday probability of a collision over
+        // 2_000 trials of a 32-bit space is ~5e-4, so without this
+        // guard the test would hang on the unwrap a small fraction
+        // of the time.
+        let mut seen_origins: HashSet<u32> = HashSet::with_capacity(TRIALS as usize);
+
         for _ in 0..TRIALS {
             if gap_seen.load(Ordering::Acquire) != 0 {
                 break;
             }
             let kp = EntityKeypair::generate();
             let origin = kp.origin_hash();
-            // origin = 0 is reserved as "no active trial" — collisions
-            // are vanishingly rare but skip if hit.
-            if origin == 0 || origin == STOP {
+            // Skip the reserved sentinels and any origin already used
+            // by a prior trial.
+            if origin == 0 || origin == STOP || !seen_origins.insert(origin) {
                 continue;
             }
             let snapshot = make_snapshot(&kp, 5, 0);
