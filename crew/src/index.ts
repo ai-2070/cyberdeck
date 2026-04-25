@@ -1,6 +1,7 @@
 // @ai2070/crew — public surface
 // Phase 1: schemas + graph builder + linter
 // Phase 2: event vocabulary + canonical JSON + correlation ids
+// Phase 3: state machine session (start/deliver/tick/cancel) + voting
 
 export { CrewShapeSchema } from "./schema/shape.js";
 export type {
@@ -48,3 +49,18 @@ export { canonicalize } from "./events/canonical.js";
 
 export { correlationId, hashHex } from "./runtime/ids.js";
 export type { CorrelationParts } from "./runtime/ids.js";
+
+export { systemClock, frozenClock } from "./runtime/clock.js";
+export type { Clock, MutableClock } from "./runtime/clock.js";
+
+export { createCrewSession } from "./session/machine.js";
+export type {
+  CrewSession,
+  CrewSnapshot,
+  CrewStatus,
+  ResumePolicy,
+  CreateCrewSessionOpts,
+} from "./session/types.js";
+
+export { resolveVotes, NotImplementedError } from "./voting/resolve.js";
+export type { VoteEntry } from "./voting/resolve.js";

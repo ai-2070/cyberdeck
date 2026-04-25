@@ -118,7 +118,7 @@ crew/
 │   │   └── store.ts          # CheckpointStore interface, in-memory impl
 │   └── voting/
 │       └── resolve.ts
-└── test/
+└── tests/
     ├── schema.test.ts
     ├── build.test.ts
     ├── machine.test.ts
