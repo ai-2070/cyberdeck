@@ -557,7 +557,7 @@ mesh.AnnounceCapabilities(net.CapabilitySet{
     Tags: []string{"gpu", "prod"},
 })
 
-gpuPeers, _ := mesh.FindPeers(net.CapabilityFilter{
+gpuNodes, _ := mesh.FindNodes(net.CapabilityFilter{
     RequireGPU: true,
     GPUVendor:  "nvidia",
     MinVRAMMB:  40_000,

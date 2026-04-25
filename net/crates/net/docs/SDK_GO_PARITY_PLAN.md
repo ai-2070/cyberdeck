@@ -267,7 +267,7 @@ New files:
 - `bindings/go/net/identity.go` — `Identity` struct + methods +
   free functions + token errors
 - `bindings/go/net/capabilities.go` — `CapabilitySet` / `CapabilityFilter` types
-  + `(m *MeshNode) AnnounceCapabilities` / `FindPeers`
+  + `(m *MeshNode) AnnounceCapabilities` / `FindNodes`
 - `bindings/go/net/subnets.go` — `SubnetID` / `SubnetPolicy` types
 
 `mesh.go` gets:
@@ -302,7 +302,7 @@ validation).
 `bindings/go/net/capabilities_test.go` (new, G-2) — single-mesh
 self-match:
 
-1. `AnnounceCapabilities({Tags: []string{"gpu"}})` → `FindPeers({RequireTags: []string{"gpu"}})` includes own node id.
+1. `AnnounceCapabilities({Tags: []string{"gpu"}})` → `FindNodes({RequireTags: []string{"gpu"}})` includes own node id.
 2. Non-matching filter returns empty slice.
 3. `NormalizeGpuVendor("NVIDIA") == "nvidia"`.
 4. Wrong-shape filter input returns `ErrCapability`.

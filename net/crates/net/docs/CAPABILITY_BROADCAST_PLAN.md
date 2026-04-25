@@ -257,7 +257,7 @@ impl MeshNode {
 
     /// Scored query — for callers that want ranked placement rather
     /// than a set membership check.
-    pub fn rank_peers(
+    pub fn find_best_node(
         &self,
         req: &CapabilityRequirement,
     ) -> Option<u64>;
