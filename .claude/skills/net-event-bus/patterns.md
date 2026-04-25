@@ -98,6 +98,17 @@ Use **subnet policies** with capability tags. Tag dev nodes with `env:dev`, prod
 
 Out of scope for the basic skill. Point at `net/README.md` § Subnets.
 
+## "I want per-tenant capability discovery without standing up subnets"
+
+Use **scoped capability discovery** with reserved `scope:*` tags. Tag the provider's capability set with `scope:tenant:<id>` (or `scope:region:<name>`, or `scope:subnet-local`); have the consumer call `find_nodes_scoped(filter, ScopeFilter::Tenant("<id>"))`. The consumer gets only the matching pool plus any untagged "Global" providers (permissive default — opt *in* to narrowing, never out by accident).
+
+This is purely a discovery filter, not a routing gate — the wire format and forwarders are unchanged. Useful when:
+- A GPU pool is shared across tenants and the placement layer needs per-tenant isolation.
+- Region-aware rendezvous selection ("only show me relays in `eu-west`").
+- Subnet-local app discovery on a Deck without setting up a `SubnetPolicy`.
+
+If the user actually wants channel routing scoped (publish/subscribe denied across boundaries), that's a *different* feature — point at the Subnets pattern above. Scope tags are about *who can be found*, not *what packets cross*.
+
 ## "I want to run a single-process test before deploying multi-host"
 
 **Recipe:** memory transport. Same code, no network.
