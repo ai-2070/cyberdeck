@@ -605,9 +605,9 @@ pub const TAG_SCOPE_REGION_PREFIX: &str = "scope:region:";
 
 /// Reserved tag marking a capability set as visible only to peers
 /// in the same subnet as the announcer. Mutually exclusive with
-/// tenant / region scopes — when present, [`CapabilityScope`]
-/// resolves to [`CapabilityScope::SubnetLocal`] regardless of the
-/// other reserved tags.
+/// tenant / region scopes — when present, the scope resolver
+/// returns `SubnetLocal` regardless of the other reserved tags
+/// (strictest scope wins).
 pub const TAG_SCOPE_SUBNET_LOCAL: &str = "scope:subnet-local";
 
 /// Optional explicit form of the default global scope. Carries no
@@ -849,8 +849,8 @@ impl CapabilitySet {
     /// Add a `scope:tenant:<id>` reserved tag, marking this
     /// announcement as advertised under the given tenant. Idempotent
     /// — repeated calls with the same id do not duplicate. Empty
-    /// `tenant_id` is silently dropped (matches the
-    /// [`scope_from_tags`] resolver).
+    /// `tenant_id` is silently dropped (matches the scope resolver,
+    /// which rejects empty ids).
     pub fn with_tenant_scope(mut self, tenant_id: impl Into<String>) -> Self {
         let id = tenant_id.into();
         if id.is_empty() {
@@ -881,7 +881,7 @@ impl CapabilitySet {
     /// Add the `scope:subnet-local` reserved tag, opting this
     /// announcement out of cross-subnet discovery. The strictest
     /// scope wins: any tenant / region tags also present on this
-    /// set are ignored by the [`CapabilityScope`] resolver while
+    /// set are ignored by the scope resolver while
     /// `scope:subnet-local` is set. Idempotent.
     pub fn with_subnet_local_scope(mut self) -> Self {
         if !self.tags.iter().any(|t| t == TAG_SCOPE_SUBNET_LOCAL) {
@@ -1842,13 +1842,13 @@ impl CapabilityIndex {
 
     /// Like [`Self::query`], but additionally filters candidates
     /// through a [`ScopeFilter`] derived from each node's
-    /// `scope:*` reserved tags. See [`CapabilityScope`] for the
-    /// resolution rules.
+    /// `scope:*` reserved tags. See `docs/SCOPED_CAPABILITIES_PLAN.md`
+    /// for the resolution rules.
     ///
     /// `same_subnet_lookup` is invoked at most once per candidate
     /// — only when the filter is [`ScopeFilter::SameSubnet`] or
-    /// the candidate resolves to [`CapabilityScope::SubnetLocal`]
-    /// (which always requires same-subnet membership). The
+    /// the candidate resolves to `SubnetLocal` (which always
+    /// requires same-subnet membership). The
     /// closure should return `true` when the candidate's subnet
     /// equals the caller's; for the warm-up case where one
     /// side's subnet is unknown, callers default to permissive

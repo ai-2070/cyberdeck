@@ -2668,12 +2668,24 @@ fn with_scope_filter<R>(
 }
 
 /// Scoped variant of [`net_mesh_find_nodes`]. Filters candidates
-/// through a [`ScopeFilterJson`] derived from each node's `scope:*`
+/// through a scope filter derived from each node's `scope:*`
 /// reserved tags. Untagged nodes resolve to `Global` and stay
 /// visible under most filters; nodes tagged `scope:subnet-local`
 /// only show up under `{"kind":"same_subnet"}`.
 ///
-/// `scope_json` is the JSON form documented on [`ScopeFilterJson`].
+/// `scope_json` is a tagged-union JSON form (see the private
+/// `ScopeFilterJson` struct above):
+///
+/// ```text
+/// {"kind": "any"}
+/// {"kind": "global_only"}
+/// {"kind": "same_subnet"}
+/// {"kind": "tenant", "tenant": "<id>"}
+/// {"kind": "tenants", "tenants": ["<id>", ...]}
+/// {"kind": "region", "region": "<name>"}
+/// {"kind": "regions", "regions": ["<name>", ...]}
+/// ```
+///
 /// `filter_json` is the same shape as [`net_mesh_find_nodes`].
 /// Result: JSON array of u64 node ids written to `*out_json`;
 /// caller frees via `net_free_string`.
