@@ -1,0 +1,29 @@
+net/crates/net/bindings/go/net/capabilities.go
+  a9d311afc8324224 266-346
+net/crates/net/bindings/go/net/net.h
+  a9d311afc8324224 681-704
+net/crates/net/src/ffi/mesh.rs
+  a9d311afc8324224 2731-2867
+net/crates/net/bindings/go/net/capabilities_test.go
+  a9d311afc8324224 280-371
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "d2ca76b25ef7c727a4c25be3d68246a92a93dc30",
+  "prompts": {
+    "a9d311afc8324224": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8e12ea48-52c3-40e2-9655-6d0ab0878bb6",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3444,
+      "total_deletions": 5029,
+      "accepted_lines": 355,
+      "overriden_lines": 0
+    }
+  }
+}
