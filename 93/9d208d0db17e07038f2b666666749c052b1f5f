@@ -1,0 +1,47 @@
+net/crates/net/README.md
+  a9d311afc8324224 339
+net/crates/net/bindings/python/README.md
+  a9d311afc8324224 353
+net/crates/net/docs/SDK_GO_PARITY_PLAN.md
+  a9d311afc8324224 29,44,205
+net/crates/net/docs/BEHAVIOR.md
+  a9d311afc8324224 45,55
+net/crates/net/docs/SDK_PYTHON_PARITY_PLAN.md
+  a9d311afc8324224 18,213,217,230,257,311
+net/crates/net/docs/SDK_SECURITY_SURFACE_PLAN.md
+  a9d311afc8324224 40,215,392,583,759,817,862
+net/crates/net/docs/CAPABILITY_BROADCAST_PLAN.md
+  a9d311afc8324224 7-8,189,253,282,336,389-390,404,407,460,462,476
+net/crates/net/bindings/python/python/net/_net.pyi
+  a9d311afc8324224 284,332,416,750,792,799,904
+net/crates/net/docs/MULTIHOP_CAPABILITY_PLAN.md
+  a9d311afc8324224 23,211,240,353
+net/crates/net/sdk-py/README.md
+  a9d311afc8324224 236,246
+net/crates/net/docs/SCOPED_CAPABILITIES_PLAN.md
+  a9d311afc8324224 18,51,118,122,124,323,341,369,385,392,454,508,539,548,594
+net/crates/net/sdk/README.md
+  a9d311afc8324224 270,292
+net/crates/net/docs/NAT_TRAVERSAL_PLAN.md
+  a9d311afc8324224 336
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "939d208d0db17e07038f2b666666749c052b1f5f",
+  "prompts": {
+    "a9d311afc8324224": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8e12ea48-52c3-40e2-9655-6d0ab0878bb6",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 64,
+      "total_deletions": 70,
+      "accepted_lines": 64,
+      "overriden_lines": 0
+    }
+  }
+}
