@@ -449,6 +449,15 @@ async fn test_redex_close_signals_tail() {
 /// delivery of the Lagged signal.
 #[tokio::test]
 async fn test_redex_tail_backfill_overflow_yields_lagged_first() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    // A regression in disconnect signaling could leave the stream
+    // hanging on `next().await`. Bound every await so a hang fails
+    // the test explicitly instead of running until the test
+    // runner's outer kill window.
+    const AWAIT_BUDGET: Duration = Duration::from_secs(2);
+
     const BUFFER: usize = 4;
     let r = Redex::new();
     let f = r
@@ -466,7 +475,10 @@ async fn test_redex_tail_backfill_overflow_yields_lagged_first() {
     let mut stream = Box::pin(f.tail(0));
 
     // The first item must be `Lagged` — no truncated history.
-    match stream.next().await {
+    let first = timeout(AWAIT_BUDGET, stream.next())
+        .await
+        .expect("stream.next() hung waiting for backfill-overflow Lagged signal");
+    match first {
         Some(Err(RedexError::Lagged)) => { /* expected */ }
         Some(Ok(ev)) => panic!(
             "backfill overflow must signal Lagged before any event; \
@@ -479,8 +491,11 @@ async fn test_redex_tail_backfill_overflow_yields_lagged_first() {
 
     // Stream ends after the Lagged signal — the watcher was never
     // registered.
+    let after = timeout(AWAIT_BUDGET, stream.next())
+        .await
+        .expect("stream.next() hung after Lagged; expected stream end");
     assert!(
-        stream.next().await.is_none(),
+        after.is_none(),
         "stream must end after backfill-overflow Lagged"
     );
 }
@@ -504,6 +519,14 @@ async fn test_redex_tail_backfill_overflow_yields_lagged_first() {
 ///      survived past its disconnect or got reattached.
 #[tokio::test]
 async fn test_redex_tail_lagged_disconnects_slow_subscriber() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    // Bound every `stream.next()` so a regression in disconnect
+    // signaling fails fast and explicitly rather than hanging until
+    // the test runner's kill window.
+    const AWAIT_BUDGET: Duration = Duration::from_secs(2);
+
     const BUFFER: usize = 4;
     let r = Redex::new();
     let f = r
@@ -524,14 +547,18 @@ async fn test_redex_tail_lagged_disconnects_slow_subscriber() {
     // a `Lagged` error or natural end-of-stream.
     let mut delivered_seqs = Vec::new();
     let mut saw_lagged = false;
-    while let Some(item) = stream.next().await {
+    loop {
+        let item = timeout(AWAIT_BUDGET, stream.next())
+            .await
+            .expect("stream.next() hung while draining lagged subscription");
         match item {
-            Ok(event) => delivered_seqs.push(event.entry.seq),
-            Err(RedexError::Lagged) => {
+            None => break,
+            Some(Ok(event)) => delivered_seqs.push(event.entry.seq),
+            Some(Err(RedexError::Lagged)) => {
                 saw_lagged = true;
                 break;
             }
-            Err(other) => panic!("unexpected error from lagged stream: {:?}", other),
+            Some(Err(other)) => panic!("unexpected error from lagged stream: {:?}", other),
         }
     }
 
@@ -557,8 +584,11 @@ async fn test_redex_tail_lagged_disconnects_slow_subscriber() {
     for i in 50..60u64 {
         f.append(format!("late-{}", i).as_bytes()).unwrap();
     }
+    let after = timeout(AWAIT_BUDGET, stream.next())
+        .await
+        .expect("stream.next() hung after disconnect; expected stream end");
     assert!(
-        stream.next().await.is_none(),
+        after.is_none(),
         "stream must remain ended after lagged disconnect; saw_lagged = {}",
         saw_lagged,
     );
