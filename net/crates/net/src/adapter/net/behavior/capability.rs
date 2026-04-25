@@ -1113,6 +1113,18 @@ impl CapabilityFilter {
 
         true
     }
+
+    /// True if the filter has any predicate that the inverted indexes
+    /// (tags / models / tools / GPU / vendor) cannot satisfy on their
+    /// own. When this returns `false`, [`CapabilityIndex::query`]
+    /// can trust the index intersection as authoritative and skip
+    /// the per-candidate `nodes` lookup + full re-check.
+    fn needs_full_check(&self) -> bool {
+        self.min_memory_mb.is_some()
+            || self.min_vram_mb.is_some()
+            || self.min_context_length.is_some()
+            || !self.require_modalities.is_empty()
+    }
 }
 
 // ============================================================================
@@ -1529,7 +1541,22 @@ impl CapabilityIndex {
         let candidates =
             candidates.unwrap_or_else(|| self.nodes.iter().map(|r| *r.key()).collect());
 
-        // Apply remaining filters that need full capability check
+        // Fast path: if the filter only constrains dimensions covered
+        // by the inverted indexes, the intersection above is already
+        // the answer. Skip the per-candidate `nodes.get()` + full
+        // `matches()` re-check — but still confirm presence via
+        // `contains_key` so a node evicted in the race window between
+        // the index read and now does not leak into the result.
+        if !filter.needs_full_check() {
+            return candidates
+                .into_iter()
+                .filter(|&node_id| self.nodes.contains_key(&node_id))
+                .collect();
+        }
+
+        // Slow path: filter has non-indexed predicates (memory, vram,
+        // context length, modalities). Pull each candidate's full
+        // capability set and re-check.
         candidates
             .into_iter()
             .filter(|&node_id| {
