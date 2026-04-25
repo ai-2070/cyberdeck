@@ -757,10 +757,7 @@ impl Mesh {
     /// Pick the single best-scoring node for a placement
     /// requirement. Returns the winning node's id, or `None` if no
     /// node matches.
-    pub fn find_best_node(
-        &self,
-        req: &crate::capabilities::CapabilityRequirement,
-    ) -> Option<u64> {
+    pub fn find_best_node(&self, req: &crate::capabilities::CapabilityRequirement) -> Option<u64> {
         self.node.find_best_node(req)
     }
 

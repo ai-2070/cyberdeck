@@ -660,6 +660,24 @@ int      net_mesh_find_nodes(net_meshnode_t* handle,
                              const char* filter_json,
                              char** out_json, size_t* out_len);
 
+/* Scoped variant of `net_mesh_find_nodes`. `scope_json` is a tagged
+ * union by `kind`:
+ *   {"kind": "any"}                              — all non-SubnetLocal nodes
+ *   {"kind": "global_only"}                      — only untagged nodes
+ *   {"kind": "same_subnet"}                      — caller's subnet only
+ *   {"kind": "tenant", "tenant": "<id>"}         — that tenant + Global
+ *   {"kind": "tenants", "tenants": ["<id>", …]}  — any of those + Global
+ *   {"kind": "region", "region": "<name>"}       — that region + Global
+ *   {"kind": "regions", "regions": ["<name>", …]}— any of those + Global
+ *
+ * Untagged nodes resolve to Global and stay visible under most
+ * filters; nodes tagged `scope:subnet-local` only show up under
+ * `same_subnet`. */
+int      net_mesh_find_nodes_scoped(net_meshnode_t* handle,
+                                    const char* filter_json,
+                                    const char* scope_json,
+                                    char** out_json, size_t* out_len);
+
 /* Normalize a GPU vendor string to canonical lowercase
  * (`"nvidia"` | `"amd"` | `"intel"` | `"apple"` | `"qualcomm"` |
  * `"unknown"`). Writes the result via `*out` / `*out_len`; free via

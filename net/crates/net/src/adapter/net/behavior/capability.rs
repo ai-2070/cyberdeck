@@ -2949,10 +2949,7 @@ mod tests {
 
     #[test]
     fn scope_from_tags_no_scope_tag_is_global() {
-        assert!(matches!(
-            scope_from_tags(&[]),
-            CapabilityScope::Global
-        ));
+        assert!(matches!(scope_from_tags(&[]), CapabilityScope::Global));
         assert!(matches!(
             scope_from_tags(&["gpu".to_string(), "model:llama3".to_string()]),
             CapabilityScope::Global
@@ -3023,14 +3020,26 @@ mod tests {
         // keeps existing announcements working when scoped queries
         // ship.
         let global = CapabilityScope::Global;
-        assert!(matches_scope(&global, &ScopeFilter::Tenant("oem-123"), false));
-        assert!(matches_scope(&global, &ScopeFilter::Region("eu-west"), false));
+        assert!(matches_scope(
+            &global,
+            &ScopeFilter::Tenant("oem-123"),
+            false
+        ));
+        assert!(matches_scope(
+            &global,
+            &ScopeFilter::Region("eu-west"),
+            false
+        ));
         assert!(matches_scope(&global, &ScopeFilter::Any, false));
 
         // GlobalOnly filter: only Global candidates pass.
         assert!(matches_scope(&global, &ScopeFilter::GlobalOnly, false));
         let tenant_only = CapabilityScope::Tenants(vec!["foo".to_string()]);
-        assert!(!matches_scope(&tenant_only, &ScopeFilter::GlobalOnly, false));
+        assert!(!matches_scope(
+            &tenant_only,
+            &ScopeFilter::GlobalOnly,
+            false
+        ));
     }
 
     #[test]
@@ -3053,7 +3062,15 @@ mod tests {
         // as expected — verifies the SubnetLocal branch isn't
         // bleeding into the tenant arm.
         let tenants = CapabilityScope::Tenants(vec!["oem-123".to_string()]);
-        assert!(matches_scope(&tenants, &ScopeFilter::Tenant("oem-123"), false));
-        assert!(!matches_scope(&tenants, &ScopeFilter::Tenant("other"), false));
+        assert!(matches_scope(
+            &tenants,
+            &ScopeFilter::Tenant("oem-123"),
+            false
+        ));
+        assert!(!matches_scope(
+            &tenants,
+            &ScopeFilter::Tenant("other"),
+            false
+        ));
     }
 }

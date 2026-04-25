@@ -198,6 +198,71 @@ func (m *MeshNode) FindNodes(filter CapabilityFilter) ([]uint64, error) {
 	return ids, nil
 }
 
+// ScopeFilter narrows `FindNodesScoped` results by reserved
+// `scope:*` tags on each node's `CapabilitySet`. Tagged-union by
+// `Kind`; mirrors the NAPI / PyO3 shape so cross-binding fixtures
+// round-trip.
+//
+// Recognized `Kind` values:
+//   - `"any"` — every non-`SubnetLocal` node
+//   - `"global_only"` — only untagged (Global) nodes
+//   - `"same_subnet"` — caller's subnet only
+//   - `"tenant"` — that tenant + Global; `Tenant` field required
+//   - `"tenants"` — any of those + Global; `Tenants` field required
+//   - `"region"` — that region + Global; `Region` field required
+//   - `"regions"` — any of those + Global; `Regions` field required
+//
+// Unknown `Kind` values fall through to `"any"` defensively. Empty
+// strings or empty lists also collapse to `"any"`.
+type ScopeFilter struct {
+	Kind    string   `json:"kind"`
+	Tenant  string   `json:"tenant,omitempty"`
+	Tenants []string `json:"tenants,omitempty"`
+	Region  string   `json:"region,omitempty"`
+	Regions []string `json:"regions,omitempty"`
+}
+
+// FindNodesScoped is the scoped variant of FindNodes. Filters
+// candidates through `scope` (derived from each node's `scope:*`
+// reserved tags) on top of the capability filter. Untagged nodes
+// stay visible under most filters; nodes tagged `scope:subnet-local`
+// only show up under `ScopeFilter{Kind: "same_subnet"}`.
+//
+// See `docs/SCOPED_CAPABILITIES_PLAN.md` for the full table.
+func (m *MeshNode) FindNodesScoped(filter CapabilityFilter, scope ScopeFilter) ([]uint64, error) {
+	filterJSON, err := json.Marshal(filter)
+	if err != nil {
+		return nil, fmt.Errorf("marshal filter: %w", err)
+	}
+	scopeJSON, err := json.Marshal(scope)
+	if err != nil {
+		return nil, fmt.Errorf("marshal scope: %w", err)
+	}
+	cFilter := C.CString(string(filterJSON))
+	defer C.free(unsafe.Pointer(cFilter))
+	cScope := C.CString(string(scopeJSON))
+	defer C.free(unsafe.Pointer(cScope))
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	var outJSON *C.char
+	var outLen C.size_t
+	code := C.net_mesh_find_nodes_scoped(m.handle, cFilter, cScope, &outJSON, &outLen)
+	if err := capabilityErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	defer C.net_free_string(outJSON)
+	raw := C.GoStringN(outJSON, C.int(outLen))
+	var ids []uint64
+	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
+		return nil, fmt.Errorf("parse find_nodes_scoped response: %w", err)
+	}
+	return ids, nil
+}
+
 // NormalizeGPUVendor maps a GPU vendor string to its canonical
 // lowercase form (`nvidia`, `amd`, `intel`, `apple`, `qualcomm`,
 // `unknown`). Matches the NAPI / PyO3 helper so every SDK produces

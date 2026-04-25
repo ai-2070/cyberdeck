@@ -5538,15 +5538,16 @@ impl MeshNode {
         let my_subnet = self.local_subnet;
         let peer_subnets = self.peer_subnets.clone();
         let local_node_id = self.node_id;
-        self.capability_index.find_best_node_scoped(req, scope, |nid| {
-            if nid == local_node_id {
-                return true;
-            }
-            match peer_subnets.get(&nid).map(|e| *e.value()) {
-                Some(s) => s == my_subnet,
-                None => true,
-            }
-        })
+        self.capability_index
+            .find_best_node_scoped(req, scope, |nid| {
+                if nid == local_node_id {
+                    return true;
+                }
+                match peer_subnets.get(&nid).map(|e| *e.value()) {
+                    Some(s) => s == my_subnet,
+                    None => true,
+                }
+            })
     }
 
     /// Shared reference to the capability index. Use this for
