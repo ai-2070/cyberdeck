@@ -1,0 +1,23 @@
+crew/PLAN.md
+  e48dc961ad3c1a17 1-189
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "56d3aac13f426972815b002ed7a0a82b7415698f",
+  "prompts": {
+    "e48dc961ad3c1a17": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca50c99d-a28a-4b8c-8cee-20b6bca23864",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 201,
+      "total_deletions": 12,
+      "accepted_lines": 189,
+      "overriden_lines": 0
+    }
+  }
+}
