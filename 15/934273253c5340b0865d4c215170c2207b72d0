@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/behavior/capability.rs
+  87bb90c35fad4179 1464-1474,1479-1481,1487-1494,1500-1507,1520,1537,1545-1554,1583-1590,1592-1598,1603-1607
+net/crates/net/src/adapter/net/behavior/api.rs
+  87bb90c35fad4179 1437-1449,1691,1693,1715
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "15934273253c5340b0865d4c215170c2207b72d0",
+  "prompts": {
+    "87bb90c35fad4179": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6cc25025-bc7f-4f77-9983-0178e2603a6e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2540,
+      "total_deletions": 56,
+      "accepted_lines": 78,
+      "overriden_lines": 0
+    }
+  }
+}
