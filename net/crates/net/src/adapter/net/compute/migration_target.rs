@@ -951,4 +951,93 @@ mod tests {
              `migrations` and `completed`"
         );
     }
+
+    #[test]
+    fn test_regression_complete_abort_no_inconsistent_state() {
+        // Regression: an earlier version of the `complete()` ordering
+        // fix did `completed.insert(...)` followed by
+        // `migrations.remove(...)` outside any shared guard. A
+        // concurrent `abort()` racing in between would observe
+        // `migrations` still occupied (from before the insert step
+        // released the shard) and unregister the daemon — leaving
+        // `completed` with an idempotency record for an origin that
+        // is no longer present in the registry. A subsequent
+        // `activate()` retry would then resolve happily through the
+        // completed record while routing pointed at a daemon that
+        // had been silently torn down.
+        //
+        // The fix takes a write entry on `migrations` and holds it
+        // across both `completed.insert` and the migrations remove.
+        // With the entry held, `abort()`'s `migrations.remove()`
+        // serializes after us and finds nothing, so it never reaches
+        // its `unregister` branch. This test stresses the race and
+        // asserts the invariant: `completed.contains(origin)` implies
+        // `daemon_registry.contains(origin)`.
+        use std::collections::HashSet;
+        use std::sync::Barrier;
+        use std::thread;
+
+        const TRIALS: u32 = 1_000;
+
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = Arc::new(MigrationTargetHandler::new(reg.clone()));
+        let mut seen_origins: HashSet<u32> = HashSet::with_capacity(TRIALS as usize);
+
+        for _ in 0..TRIALS {
+            let kp = EntityKeypair::generate();
+            let origin = kp.origin_hash();
+            if origin == 0 || !seen_origins.insert(origin) {
+                continue;
+            }
+            let snapshot = make_snapshot(&kp, 5, 0);
+            handler
+                .restore_snapshot(
+                    RestoreContext {
+                        daemon_origin: origin,
+                        snapshot: &snapshot,
+                        source_node: 0x1111,
+                        orchestrator_node: 0x2222,
+                    },
+                    kp.clone(),
+                    || Box::new(AccumDaemon { total: 0 }),
+                    DaemonHostConfig::default(),
+                )
+                .unwrap();
+            handler.activate(origin).unwrap();
+
+            let barrier = Arc::new(Barrier::new(2));
+
+            let h_complete = handler.clone();
+            let b_complete = barrier.clone();
+            let completer = thread::spawn(move || {
+                b_complete.wait();
+                let _ = h_complete.complete(origin);
+            });
+
+            let h_abort = handler.clone();
+            let b_abort = barrier.clone();
+            let aborter = thread::spawn(move || {
+                b_abort.wait();
+                let _ = h_abort.abort(origin);
+            });
+
+            completer.join().unwrap();
+            aborter.join().unwrap();
+
+            // Invariant: if a completed record exists for this origin,
+            // the daemon must still be registered. Bug allowed the
+            // opposite — completed.insert wins, abort.unregister wins,
+            // resulting in a "completed" record for an unregistered
+            // daemon.
+            if handler.orchestrator_node(origin).is_some() {
+                assert!(
+                    reg.contains(origin),
+                    "complete() promoted origin {origin:#x} to authoritative \
+                     while a concurrent abort() unregistered it — \
+                     completed-record-without-registered-daemon is the bug \
+                     this test is pinning"
+                );
+            }
+        }
+    }
 }
