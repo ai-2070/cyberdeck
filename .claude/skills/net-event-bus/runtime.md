@@ -33,13 +33,17 @@ If you skip step 1, late emits race with step 4 and surface as `Shutdown` errors
 
 ### Per-SDK shutdown specifics
 
-| SDK | Call | Async? | Idempotent? |
+| SDK | Call | Async? | Multi-call safety |
 |---|---|---|---|
-| Rust | `node.shutdown().await?` | Yes | Yes — second call returns `Ok(())` |
-| TypeScript | `await node.shutdown()` | Yes | Yes |
-| Python | `node.shutdown()` or context manager exit | No | Yes |
-| Go | `bus.Shutdown()` (typically `defer bus.Shutdown()`) | No | Yes |
+| Rust | `node.shutdown().await?` | Yes | **Consumes `self`** (single call enforced by ownership). See "Rust: subscribe streams hold the bus" below — outstanding clones cause `SdkError::Adapter("cannot shutdown: outstanding references exist")`. |
+| TypeScript | `await node.shutdown()` | Yes | Idempotent — safe to call twice |
+| Python | `node.shutdown()` or context manager exit | No | Idempotent |
+| Go | `bus.Shutdown()` (typically `defer bus.Shutdown()`) | No | Idempotent |
 | C | `net_shutdown(handle)` then stop using the handle | No | Calling twice is undefined — don't |
+
+### Rust: subscribe streams hold the bus
+
+`Net::subscribe()` and `subscribe_typed()` clone the inner `Arc<EventBus>` into the returned stream. `node.shutdown()` consumes `self` and then calls `Arc::try_unwrap` on the bus — if **any** stream is still alive, that fails and `shutdown` returns `SdkError::Adapter("cannot shutdown: outstanding references exist")` (`sdk/src/net.rs:236-246`). Drop every stream you spawned (`task.abort()`, break the loop and let it fall out of scope) **before** calling `shutdown`. This is why steps 1 and 3 in the order above are non-negotiable on Rust.
 
 ### Tests
 
@@ -65,7 +69,7 @@ Verified against `net/crates/net/sdk/src/error.rs`. The full enum:
 | `Backpressure` | Stream's per-stream send window full | Use `send_with_retry` (5–200ms exponential) or `send_blocking` helpers, or apply your own policy. |
 | `NotConnected` | Peer session is gone | Reconnect or reroute at the application layer. Mesh layer will already be trying. |
 | `ChannelRejected(Option<AckReason>)` | Publisher's ack rejected your subscribe/unsubscribe | Permission token issue or capacity limit. Inspect the reason. |
-| `Traversal { kind, message }` | NAT-traversal optimization failed | **Never a connectivity failure** — fallback path still works. Log and ignore unless tuning. |
+| `Traversal { kind, message }` | NAT-traversal optimization failed | **Never a connectivity failure** — fallback path still works. Log and ignore unless tuning. *Only present when the SDK is built with `features = ["nat-traversal"]` (`sdk/src/error.rs:55-66`)* — projects without that feature won't see this variant. |
 
 `pub type Result<T> = std::result::Result<T, SdkError>;` — most APIs return this.
 
@@ -127,7 +131,8 @@ If you're inside a request handler (Express, Fastify, Hono), `emit` is sync and 
 The `net_sdk` package is **synchronous**. The underlying PyO3 binding owns its own tokio runtime and **releases the GIL** during waits, so calling `emit` from one thread while `subscribe` iterates on another works.
 
 - For sync apps (Flask, scripts): just use it directly.
-- For async apps (FastAPI, asyncio): wrap calls in `asyncio.to_thread(...)` or `loop.run_in_executor(None, ...)` so they don't block the event loop. Subscribe iterators are sync generators — iterate them in a worker thread, not in an async coroutine.
+- For async apps (FastAPI, asyncio): wrap blocking calls in `asyncio.to_thread(...)` or `loop.run_in_executor(None, ...)` so they don't block the event loop.
+- `subscribe()` returns an `EventStream` that supports **both** sync (`for ... in`) and async (`async for`) iteration. In an asyncio app, prefer `async for` directly on the stream — no worker thread needed. Pick one iteration mode per stream instance; interleaving on the same instance is undefined (`sdk-py/src/net_sdk/stream.py:38-58`).
 - `send_blocking` (mesh) explicitly releases the GIL for the whole retry loop.
 
 Python int handles `u64` natively (arbitrary precision) — no BigInt glue needed.
@@ -224,7 +229,11 @@ Typed subscribe (`subscribeTyped<T>`, `subscribe(MyDataclass)`, `subscribe_typed
 
 **Check:** subscribe raw (no type), log the bytes, then debug deserialization separately.
 
-### 10. Last resort: are you sure both processes are running the same SDK version?
+### 10. Rust only: did `shutdown()` return `Adapter("cannot shutdown: outstanding references exist")`?
+
+Means a subscribe stream (or anything else holding the inner `Arc<EventBus>`) is still alive. The bus didn't drain — events from that point on are lost. See "Rust: subscribe streams hold the bus" above; drop the stream first.
+
+### 11. Last resort: are you sure both processes are running the same SDK version?
 
 Wire format is JSON, but transport-layer protocol details (framing, handshake versions, subprotocol IDs) can shift between Net releases. Match versions across all nodes that talk to each other.
 

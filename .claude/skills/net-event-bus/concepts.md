@@ -74,9 +74,9 @@ Silence propagates through the proximity graph. Neighbors observe the missed hea
 
 The local data structure on each node is a fixed-capacity sharded ring buffer. It is **a speed buffer, not a waiting room.** When full, old data is evicted or new data is dropped. There is no unbounded growth.
 
-Capacity is configurable per node (`buffer_capacity` / `ring_buffer_capacity`). Default is sensible for most workloads. Tune up if you have bursty traffic and want to absorb more before dropping; tune down if memory is the constraint.
+Capacity is configurable per node (`buffer_capacity` / `ring_buffer_capacity`). **Default: `1 << 20` = 1,048,576 events per shard** (`net/src/config.rs:46-60`), must be a power of 2 and ≥ 1024. Tune up if you have bursty traffic and want to absorb more before dropping; tune down if memory is the constraint (each slot is roughly the size of one event payload + header).
 
-Sharding (`shards` / `num_shards`) is the parallelism knob — more shards = more parallel ingestion at the cost of more memory and more drain workers. Default is reasonable; only tune if you've measured a bottleneck.
+Sharding (`shards` / `num_shards`) is the parallelism knob — more shards = more parallel ingestion at the cost of more memory and more drain workers. **Default: physical CPU core count**. Memory cost is `num_shards × ring_buffer_capacity × avg_event_size`, so the defaults can land in the GB range on a 16-core box with 1KB events — drop `buffer_capacity` first if that's a problem. The other defaults: `backpressure_mode = DropOldest`, `adapter_timeout = 30s`, `adapter_batch_retries = 0`.
 
 ## Transport
 

@@ -36,5 +36,7 @@ func main() {
 	if len(resp.Events) == 0 {
 		log.Fatal("no events received")
 	}
-	fmt.Println("received:", resp.Events[0])
+	// resp.Events is []json.RawMessage (=[][]byte). Print as string,
+	// otherwise fmt.Println renders the raw bytes as `[123 34 ...]`.
+	fmt.Println("received:", string(resp.Events[0]))
 }

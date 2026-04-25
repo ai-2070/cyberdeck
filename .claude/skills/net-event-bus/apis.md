@@ -1,6 +1,16 @@
 # Net SDK API Reference
 
-Verified against the SDK source as of skill creation. If anything looks wrong, **read the SDK source directly** — it is authoritative. The README is a good intro; the source is ground truth.
+Verified against `net-sdk` v0.1.0 (Rust) / `@ai2070/net-sdk` ≥ 0.5.0 peer (TS) / `net-sdk` Python (current `main`). Last full pass: 2026-04-25.
+
+**Drift check before trusting these signatures:**
+```bash
+# Rust: confirms emit/emit_raw/emit_str/emit_batch/emit_raw_batch are still exported (expect 5)
+grep -cE "^\s*pub fn emit" net/crates/net/sdk/src/net.rs
+# Rust: confirms the SdkError variant set this skill enumerates (expect 11)
+grep -cE "^\s*(Shutdown|Ingestion|Poll|Adapter|Serialization|Config|NoMesh|Backpressure|NotConnected|ChannelRejected|Traversal)" net/crates/net/sdk/src/error.rs
+```
+
+If any count drops, the SDK has churned underneath this doc — re-verify from source. If anything else looks wrong, **read the SDK source directly** — it is authoritative. The README is a good intro; the source is ground truth.
 
 | Language | Path | Key files |
 |---|---|---|
@@ -85,13 +95,17 @@ with NetNode(shards=4) as node:
     temps = node.channel('sensors/temperature', TempReading)
     temps.publish(TempReading(sensor_id='A1', celsius=22.5))
 
-    for r in temps.subscribe():           # generator, NOT async
+    for r in temps.subscribe():           # sync generator
         print(f'{r.sensor_id}: {r.celsius}°C')
+
+    # ...or, in an asyncio app:
+    # async for r in temps.subscribe():
+    #     ...
 ```
 
 **Key facts:**
 - `NetNode(...)` is **synchronous**. Use the context manager (`with`) for auto-shutdown.
-- `subscribe()` returns a regular generator. Use `for ... in`, never `async for`.
+- `subscribe()` returns an `EventStream` that supports **both** `for ... in` (sync) and `async for` (asyncio). Pick one mode per stream instance — interleaving on the same instance is undefined (`sdk-py/src/net_sdk/stream.py:38-58`).
 - Models can be `@dataclass`, Pydantic models (anything with `model_dump()`), or plain classes (anything with `__dict__`).
 - The native `net` module (PyO3 binding) is the escape hatch — `node.bus` exposes it. Use only for features not surfaced in `net_sdk`.
 
@@ -137,9 +151,13 @@ async fn main() -> net_sdk::error::Result<()> {
 
 **Key facts:**
 - **No `node.channel()` API.** Rust has only the raw firehose. To split topics, use distinct types/enum variants in the payload and match on the consumer, or run separate `Net` instances per logical channel.
-- Builder pattern selects transport: `.memory()`, `.redis(...)`, `.jetstream(...)`, `.mesh(...)`. Adapter methods take typed configs (`RedisAdapterConfig`, `JetStreamAdapterConfig`, `NetAdapterConfig`) — not raw URL strings. Each is gated on a feature flag (`redis`, `jetstream`, `net`).
+- Builder pattern selects transport: `.memory()`, `.redis(...)`, `.jetstream(...)`, `.mesh(...)`. Adapter methods take typed configs (`RedisAdapterConfig`, `JetStreamAdapterConfig`, `NetAdapterConfig`) — not raw URL strings. Each adapter is gated on a feature flag (`redis`, `jetstream`, `net`).
+- **Feature umbrella** (from `sdk/Cargo.toml`): default is `[]` (memory only). `local = ["net", "cortex", "compute", "groups"]` is the right shape for a single-node or LAN-only deployment; `full = ["local", "redis", "jetstream"]` is everything. NAT traversal lives behind its own `nat-traversal` feature (and `port-mapping` builds on top). When wiring `Cargo.toml`, prefer the umbrella feature over hand-listing.
 - `emit(&T)` returns `Receipt { shard_id, timestamp }`. `emit_batch(&[T])` returns count (`usize`).
-- `subscribe()` and `subscribe_typed::<T>()` return async streams. Poll with `.next().await`.
+- **Fast-path emit variants** (`sdk/src/net.rs:128-160`): `emit_raw(impl Into<Bytes>)` for already-serialized bytes (zero-copy), `emit_str(&str)` for JSON-as-string, `emit_raw_batch(Vec<Bytes>)` for batched bytes. All return the same `Receipt` (or `usize` for the batch form).
+- `subscribe()` and `subscribe_typed::<T>()` return async streams. Poll with `.next().await`. Both clone the inner `Arc<EventBus>` — see `runtime.md` § "Rust: subscribe streams hold the bus" before calling `shutdown`.
+- One-shot pull (no streaming): `node.poll(PollRequest { limit, cursor, filter, ordering, shards }).await?` returns a `PollResponse { events, next_id, has_more }`. Use this when you want explicit cursor management instead of an `EventStream`.
+- Lifecycle helpers: `node.flush().await?` waits for pending batches to drain into the adapter (call before `shutdown` if you can't tolerate the in-flight loss); `node.health().await -> bool` and `node.shards() -> u16` for observability; `node.bus() -> &EventBus` is the escape hatch to the underlying core API.
 - `Backpressure::{DropOldest (default), DropNewest, FailProducer, Sample(u32)}` set at build time. `Sample(N)` keeps 1 in N events when overloaded.
 - Convenience presets on the builder: `.high_throughput()`, `.low_latency()`, `.batch(BatchConfig)`, `.scaling(ScalingPolicy)`, `.adapter_timeout(Duration)`.
 - Reference: `net/crates/net/sdk/examples/channels.rs` is the canonical typed-emit example.
@@ -157,7 +175,9 @@ bus.IngestRaw(`{"sensor_id":"A1","celsius":22.5}`)
 
 resp, _ := bus.Poll(100, "")
 for _, raw := range resp.Events {
-    fmt.Println(raw)
+    // resp.Events is []json.RawMessage (=[][]byte). Convert to string
+    // before printing or `fmt.Println` will render the raw bytes.
+    fmt.Println(string(raw))
 }
 if resp.HasMore {
     resp, _ = bus.Poll(100, resp.NextID)   // pass cursor for next page
@@ -166,6 +186,7 @@ if resp.HasMore {
 
 **Key facts:**
 - **No async iterator and no named-channel API.** Write the polling loop yourself; manage the `NextID` cursor across calls.
+- `PollResponse.Events` is `[]json.RawMessage` (= `[][]byte`) — pass each through `string(...)` to print or `json.Unmarshal` to parse.
 - All methods are thread-safe.
 - Filter by inspecting the JSON in your loop.
 - Mesh transport requires `NewMeshNode` (separate constructor — check the README).
@@ -206,11 +227,7 @@ These bite people regardless of language. Internalize them.
 - **JSON everywhere.** The wire format is JSON bytes. There is no schema registry. The JSON either parses on the consumer or it doesn't.
 - **Shutdown is required.** Don't rely on process exit. Call `shutdown()` / `Shutdown()` / `net_shutdown()`. The ring buffer needs a clean drain.
 - **Subscribe is hot.** A subscriber sees events emitted *after* it subscribed, plus whatever's still in the ring buffer. No replay-from-zero. If the user wants replay, they need RedEX or an adapter — not the bus.
-- **Backpressure is silent under `drop_*` modes; under `fail_producer`, it surfaces per-language.** Always also watch `stats().events_dropped`:
-  - Rust: `emit` returns `Result<Receipt, SdkError>` — `fail_producer` overflow comes back as `SdkError::Ingestion(...)`. (Mesh-stream sends use `SdkError::Backpressure` instead.)
-  - TS: `emit`/`emitRaw` **throw** under `fail_producer`/shutdown (the `Receipt | null` annotation is vestigial — use `try/catch`). `publish`/`publishBatch`/`emitBuffer`/`fire`/`fireBatch` go through the fire path and return `false` / a short count instead of throwing.
-  - Python: `emit` raises (`RuntimeError` / `BackpressureError` from the binding) under `fail_producer`/shutdown. Under `drop_*`, drops are silent.
-  - Go / C: methods return error codes; check them. `drop_*` drops never reach the API — only `stats()` shows them.
+- **Backpressure is silent under `drop_*` modes; under `fail_producer` it surfaces per-language.** Always also watch `stats().events_dropped`. Per-SDK error shapes are detailed in each SDK's "Key facts" above and in `runtime.md` § Errors — don't duplicate the matrix here. The one-line summary: Rust returns `SdkError::Ingestion`, TS throws on the `emit*` path / returns `false`/short on the `publish*`/`fire*` path, Python raises from the binding, Go/C return error codes.
 - **`_channel` is reserved** in TS/Python channel payloads. Don't put your own field there.
 - **Transport is set at construction.** A node can have only one transport. To bridge transports, run two nodes in the same process and forward between them.
 - **`shards` is a parallelism knob, not a partitioning scheme.** It does not give you Kafka-style ordered partitions. It just parallelizes ingestion. Default is fine for most workloads.

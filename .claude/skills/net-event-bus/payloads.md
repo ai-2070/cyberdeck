@@ -58,6 +58,7 @@ The "good" version uses more total bytes (more JSON envelope per event) but is f
 
 - **UTF-8.** JSON requires it. Don't put binary in a JSON string field unless you base64-encode it (and at that point, see "Reference, don't embed").
 - **Numbers.** JSON numbers are floats by default. For `u64` IDs and timestamps, the SDKs already handle the precision boundary (BigInt in TS, native int in Python, u64 in Rust/Go/C) — but if you're constructing JSON manually, pass IDs as strings to avoid silent precision loss.
+- **TS-specific gotcha:** `Receipt.timestamp` is typed as `number` (`sdk-ts/src/types.ts:52`), not `bigint` like other u64 fields. Nanosecond timestamps exceed `Number.MAX_SAFE_INTEGER` (~285 years past the epoch in ns is safe, so the absolute value is fine — but **subtraction between two close timestamps loses sub-microsecond resolution**). Don't compute latency-style deltas off this field; for that, read `StoredEvent.insertion_ts` (BigInt) or compare via `BigInt(receipt.timestamp)` and accept the lower bound on precision.
 - **Reserved field: `_channel`.** TS and Python channel APIs inject this on publish and filter on it during subscribe. Don't put a `_channel` field in your own payload.
 - **No null-padding, no fixed-width encoding.** This is JSON, not binary protocol — payloads are variable-length.
 
