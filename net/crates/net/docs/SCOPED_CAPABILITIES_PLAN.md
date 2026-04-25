@@ -1,4 +1,4 @@
-# Scoped capability announcements
+# Scoped capability announcements (tag-based)
 
 ## Context
 
@@ -6,552 +6,668 @@ Today every `CapabilityAnnouncement` is permissive-global: the
 origin's `CapabilitySet` (hardware, software, models, tools, tags,
 limits) fans out to every directly-connected peer, then forwards
 hop-by-hop up to `MAX_CAPABILITY_HOPS = 16`
-(`behavior/capability.rs:787`). There is no way for the origin to
-say "this announcement is for my subnet only," even when the
-mesh already understands subnet visibility for *channels*
-(`channel/config.rs:14` — `Visibility::SubnetLocal /
-ParentVisible / Exported / Global`) and the
-`SubnetGateway::should_forward` machinery
-(`subnet/gateway.rs:103`) is ready to enforce it on the data
-path.
+(`behavior/capability.rs:787`). There is no way for the origin
+to say "this announcement is for my tenant / my subnet / my
+region only," so:
 
-The gap matters in three concrete scenarios:
+1. **Per-tenant GPU pools leak across tenants.** A provider for
+   tenant `oem-123` advertises `model:llama3-70b` to every node
+   in the mesh; client placement for an unrelated tenant happily
+   picks it.
+2. **Desktop app discovery for a Deck pulls in unrelated subnets.**
+   `find_peers(software:*)` returns apps from any node in the
+   mesh, not just the user's local cluster.
+3. **Regional rendezvous selection is opaque.** No way to say
+   "give me a relay in `eu-west`" without burning the discovery
+   into application code.
 
-1. **Private-tooling leakage.** A node in subnet `[3,7,2]` runs an
-   internal `tool:billing-export` that should never be discoverable
-   from siblings or unrelated subnets — but its full `CapabilitySet`
-   (with that tool advertised) is gossiped to every peer, and any
-   `find_peers(filter)` call from anywhere in the mesh returns it.
-2. **Model fingerprinting at the perimeter.** A high-value model
-   (`model_id = "internal-finetuned-llm-3"`) advertises through a
-   permissive-global announcement; downstream nodes outside the
-   parent subnet see it via multi-hop forwarding even though they
-   could never get a session-auth token to use it.
-3. **Cross-tenant `find_peers` polluting score-and-pick.** The SDK
-   `find_best(req)` happily returns a winner in the wrong subnet;
-   the publish path then drops the resulting traffic at the gateway,
-   wasting the work and surprising the caller.
+`SDK_SECURITY_SURFACE_PLAN.md:801` and `MULTIHOP_CAPABILITY_PLAN.md`
+both list scoped announcements as a deferred non-goal of v1.
+This plan covers the v2 — but **not** the heavyweight v3 that
+adds wire-level scope, signatures, and path-level enforcement.
 
-`SDK_SECURITY_SURFACE_PLAN.md:801` and
-`MULTIHOP_CAPABILITY_PLAN.md` both list `AnnouncementScope` as an
-explicit *deferred* non-goal — "v1 is permissive-global." This
-plan makes it the v2.
+## Approach
+
+**Scope is a query-time concern, not a path-time concern.**
+
+Instead of a new `AnnouncementScope` enum on
+`CapabilityAnnouncement` (signed, enforced at every forwarder),
+we encode scope as **reserved tags** inside the existing
+`CapabilitySet.tags`:
+
+| Tag                       | Meaning                                                 |
+| ------------------------- | ------------------------------------------------------- |
+| _(no `scope:*` tag)_      | Global (default; same as v1)                            |
+| `scope:global`            | Global (explicit form)                                  |
+| `scope:subnet-local`      | Visible only to nodes in the announcer's subnet         |
+| `scope:tenant:<id>`       | Visible only when the caller queries with that tenant   |
+| `scope:region:<name>`     | Visible only when the caller queries with that region   |
+
+A node may carry multiple `scope:tenant:*` / `scope:region:*`
+tags simultaneously (e.g. a GPU shared between two tenants).
+`scope:subnet-local` is mutually exclusive with the others —
+when present, it wins (see `scope_from_tags` below).
+
+**Enforcement happens at `find_peers_scoped` / `find_best_scoped`,
+not on the wire.** The announcement still gossips permissively;
+the *consumer* of the index does the filter. This is a
+deliberate cut: it's enough for tenant- / subnet- / region-aware
+discovery, doesn't touch the multi-hop forwarder, requires no
+signed-envelope changes, and keeps v1 callers byte-identical.
+
+### Why not the wire-level enum approach
+
+The earlier draft of this plan added an `AnnouncementScope` enum
+to `CapabilityAnnouncement` (signed, enforced at origin +
+forwarder + gateway). Reasons we backed off:
+
+- **Doesn't unlock more functionality** for the immediate use
+  cases (GPU pools, Deck app discovery, regional relays). All
+  three are already solvable as "pick the right peer at query
+  time."
+- **Wire change ripples through three plans.** Forwarder logic
+  changes, gateway gets a new helper, signed envelope grows two
+  fields, and rolling upgrades require a v2-receivers-first
+  ordering.
+- **Real anti-widening is heavier than the field.** A signed
+  scope is only honest if every forwarder also enforces it;
+  during a partial upgrade a v1 forwarder permissively re-broadcasts
+  and the guarantee silently degrades. To make it robust we'd
+  also need an `Audience(Vec<EntityId>)` ACL and per-receiver
+  decryption — which is the *next* layer entirely.
+
+We keep the wire-level approach in the back pocket as v3, gated
+on:
+
+- Multiple organizations sharing one mesh under strict
+  cross-tenant requirements.
+- A real anti-widening threat model (compromised relay nodes,
+  cross-region compliance).
+- A reason to accept the protocol surface & complexity.
+
+For now, tag-based discovery scope is enough.
 
 ## Design invariants
 
-Non-negotiables, carried from the multi-hop work:
+1. **No wire change.** `CapabilityAnnouncement`,
+   `SUBPROTOCOL_CAPABILITY_ANN = 0x0C00`, and the signing
+   payload all stay byte-identical to v1. A v1 node deserializing
+   a v2 announcement sees `tags: [..., "scope:tenant:oem-123"]`
+   and ignores the prefix entirely.
+2. **No path-level enforcement.** Forwarders, gateways,
+   `handle_capability_announcement` — no changes. The plan stays
+   inside `capability.rs` and the SDK surface.
+3. **Permissive default.** A `CapabilitySet` with no `scope:*` tag
+   resolves to `CapabilityScope::Global`. v1 announcements
+   continue to match every scoped query that allows global.
+4. **One scope per announcement.** A node carrying multiple
+   `scope:tenant:*` tags is in *all those tenants*; a node with
+   `scope:subnet-local` plus `scope:tenant:foo` is treated as
+   `SubnetLocal` (the strictest form wins). Documented behavior;
+   tested below.
 
-1. **Signed by the origin, never re-signed in transit.** Forwarders
-   copy the signed payload byte-for-byte. The new scope field is
-   inside the signed envelope so a forwarder can't relax it.
-2. **Bounded CPU / bandwidth.** Scope filtering must be a *prune*
-   of the existing fan-out — never a fan-in (no new subprotocol,
-   no second packet per peer).
-3. **No new subprotocol id.** `SUBPROTOCOL_CAPABILITY_ANN = 0x0C00`
-   stays. The wire change is one additive field on
-   `CapabilityAnnouncement`, gated by `#[serde(default,
-   skip_serializing_if = "is_scope_global")]` so old-format
-   announcements (no field) deserialize as `Global` and continue
-   to round-trip with byte-identical signatures during a rolling
-   upgrade — same trick `hop_count` and `reflex_addr` already use
-   (`capability.rs:746, 772`).
-4. **Late joiners still converge inside their scope.** Session-open
-   re-push at `mesh.rs:2802` already pushes our latest local
-   announcement to a fresh peer — that path applies the same scope
-   filter, so a peer in a sibling subnet that opens a direct
-   session to us gets a *no-op* on the per-session re-push when
-   our local announcement is `SubnetLocal`. (More on the exit
-   criteria below.)
-5. **Permissive default.** A `CapabilityAnnouncement` constructed
-   the old way (no scope set) is `Global`. No silent narrowing.
-
-## Scope (the meta one — what's in / out of *this* plan)
+## Scope (the meta one)
 
 **In scope:**
 
-- New `AnnouncementScope` enum on `CapabilityAnnouncement`,
-  mirroring channel `Visibility`: `Global` /
-  `ParentVisible` / `Exported(Vec<SubnetId>)` / `SubnetLocal`.
-- Origin-side fan-out filter on `MeshNode::announce_capabilities`:
-  prune the per-peer broadcast list by checking *the origin's
-  scope* against *each peer's known subnet*.
-- Forwarder-side fan-out filter in `forward_capability_announcement`
-  (`mesh.rs:3887`): same check, but using *the origin's scope* +
-  *the origin's subnet derived from the announcement's own
-  capabilities* + *the candidate forward target's subnet*. (Origin
-  subnet is not on the announcement today; see "Origin subnet
-  encoding" below.)
-- Gateway integration: `SubnetGateway::should_forward` already
-  exists for the *channel* path; we add a sibling
-  `should_forward_announcement` that takes scope + origin subnet
-  + dest subnet and returns `ForwardDecision`. Reuses the
-  existing `DropReason` variants.
-- `MeshNodeConfig::with_announcement_scope(AnnouncementScope)`
-  builder knob for the local node's scope. Default = `Global`.
-- Per-call override on `announce_capabilities`:
-  `announce_capabilities_with(caps, scope)` so callers can publish
-  a more-restricted announcement than the node-wide default
-  without rebuilding the node.
-- SDK + NAPI + Python surface for the new builder method and
-  the per-call override.
-- Five integration tests (see "Tests" below).
+- `CapabilityScope` enum + `scope_from_tags(&HashSet<String>) ->
+  CapabilityScope` helper in `behavior/capability.rs` (module-
+  private).
+- `ScopeFilter` enum + `matches_scope` predicate in the same
+  file, exported from the crate.
+- `CapabilityIndex::find_peers_scoped(filter, scope_filter,
+  my_node_id) -> Vec<u64>`.
+- `CapabilityIndex::find_best_scoped(req, scope_filter,
+  my_node_id) -> Option<u64>`.
+- `MeshNode::find_peers_by_filter_scoped` /
+  `find_best_capability_scoped` pass-throughs.
+- SDK surface (`Mesh::find_peers_scoped`,
+  `Mesh::find_best_scoped`) in Rust + Node + Python.
+- Reserved-tag string contract documented in `BEHAVIOR.md` and
+  `CHANNELS.md` cross-references.
+- 6 unit tests in `behavior/capability.rs` + 1 integration
+  test in `tests/capability_scope.rs`.
 
 **Out of scope:**
 
-- **Per-tag scope.** A scope per `tag` (or per `model` / per `tool`)
-  inside one announcement would let a node simultaneously advertise
-  `tool:billing-export` as `SubnetLocal` and `model:llama-3.1-70b`
-  as `Global` in a single packet. Real, but adds index complexity
-  (multiple effective `CapabilitySet` views per origin) and a
-  partial-trust verification model. Defer; v2 ships with one scope
-  per announcement.
-- **Receiver-side scope filtering.** The origin and the forwarders
-  do all enforcement. A *receiver* deep inside another subnet that
-  somehow gets a `SubnetLocal` announcement (because a gateway is
-  misconfigured or a peer is malicious) does not also re-validate
-  scope on indexing — that would be a useful defense in depth, but
-  it duplicates the path-cut and the only realistic attacker is
-  the gateway operator, who has bigger levers. Document as a
-  follow-up.
-- **Dynamic scope changes via `CapabilityDiff`.** Today
-  `CapabilityDiff` only diffs the `CapabilitySet` content, not
-  the wrapper `CapabilityAnnouncement` fields. Scope changes
-  arrive via a new full announcement (different `version`).
-  Adding a `DiffOp::SetScope` is straightforward but mostly cosmetic
-  — defer.
-- **Scope-aware `CapabilityIndex::query`.** Today
-  `CapabilityIndex` stores whatever announcements arrive at a node
-  and serves them all to local `find_peers` callers. After
-  filtering at the path level there is no useful "scope" for the
-  receiver to filter on — by construction, only announcements
-  whose origin allowed our subnet to see them reached the index
-  in the first place. The index field stays a u64 → caps map.
-- **Capability `Exported` export tables** managed via SDK. The
-  `Exported(Vec<SubnetId>)` variant carries its own target list
-  inside the announcement, so no separate export-table state is
-  required (unlike channels). The SDK surface accepts a
-  `Vec<SubnetId>` directly; if a node operator wants to manage a
-  shared export table across many announcements they can keep their
-  own `Vec` and pass it in.
+- **Path-level enforcement** (forwarders dropping
+  out-of-scope announcements). Defer to v3.
+- **Signed-scope / anti-widening guarantees.** A malicious
+  forwarder can't *forge* `scope:tenant:foo` (it can't re-sign),
+  but it can *re-broadcast* an announcement to peers the origin
+  intended to keep out — same as today. Defer.
+- **`Audience(Vec<EntityId>)` ACLs.** Per-receiver visibility is
+  a different shape (ACL list, not a tag string). v3.
+- **Capability-index *partitioning* by scope.** The index stays
+  one DashMap keyed by node_id; the filter is applied at query
+  time. If profiling later shows we want a sharded index by
+  tenant, the change is internal and doesn't affect the public
+  API.
+- **Channel-scoped announcements** (announcements scoped to a
+  specific `ChannelId`). Channels already have their own
+  visibility (`channel/config.rs:14`); this plan is about
+  capability discovery, not channel routing.
+- **Per-tag scope in one announcement.** A node that wants to
+  share `model:llama3-70b` globally and `tool:billing-export`
+  subnet-local must split into two announcements (which
+  `CapabilityAnnouncement` doesn't support — there's only one
+  per node). For v2, advertise the union with the strictest
+  applicable scope; for v3, see "per-tag scope" in
+  `SCOPED_CAPABILITIES_PLAN.md` follow-ups.
 
 ## Design
 
-### Wire format
+### `CapabilityScope` and `scope_from_tags`
 
-Add one field at the end of `CapabilityAnnouncement`:
+Module-private helper inside
+`src/adapter/net/behavior/capability.rs`:
 
 ```rust
-pub struct CapabilityAnnouncement {
-    // … existing fields …
-    /// Origin's intent for how widely this announcement should
-    /// propagate. `Global` (default) keeps the pre-v2 permissive
-    /// behavior. Inside the signed envelope, so a forwarder can't
-    /// relax it from `SubnetLocal` to `Global` without invalidating
-    /// the signature.
-    #[serde(default, skip_serializing_if = "is_scope_global")]
-    pub scope: AnnouncementScope,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum AnnouncementScope {
-    #[default]
+/// Resolved scope of a capability announcement, derived from the
+/// reserved `scope:*` tags inside the announcer's `CapabilitySet`.
+/// Pure derivation — never stored, recomputed on each query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CapabilityScope {
     Global,
-    ParentVisible,
-    Exported(Vec<SubnetId>),
     SubnetLocal,
+    Tenants(Vec<String>),
+    Regions(Vec<String>),
+    /// Both tenants and regions specified — query must satisfy
+    /// at least one membership in EITHER list (logical OR).
+    TenantsAndRegions { tenants: Vec<String>, regions: Vec<String> },
 }
 
-fn is_scope_global(s: &AnnouncementScope) -> bool {
-    matches!(s, AnnouncementScope::Global)
-}
-```
+const TAG_SCOPE_GLOBAL: &str = "scope:global";
+const TAG_SCOPE_SUBNET_LOCAL: &str = "scope:subnet-local";
+const TAG_SCOPE_TENANT_PREFIX: &str = "scope:tenant:";
+const TAG_SCOPE_REGION_PREFIX: &str = "scope:region:";
 
-`SubnetId` is `Copy` and already `Serialize + Deserialize`
-(`subnet/id.rs`); `Exported(Vec<SubnetId>)` serializes as
-`{"Exported": […]}` in the JSON-on-wire form. Total wire-size
-overhead for the common-case `Global` path: zero bytes (skipped).
-For a typical `Exported` with 2–3 targets: ~40 bytes.
+pub(crate) fn scope_from_tags(tags: &[String]) -> CapabilityScope {
+    let mut tenants = Vec::new();
+    let mut regions = Vec::new();
+    let mut subnet_local = false;
 
-`hop_count` continues to sit *outside* the signed envelope so
-forwarders can bump it; `scope` sits *inside*. `signed_payload()`
-(`capability.rs:902`) zeros `hop_count` before serializing — no
-change needed for `scope`, it just serializes through.
-
-### Origin subnet encoding
-
-Forwarder-side filtering needs to know the origin's subnet to
-evaluate `ParentVisible` ("dest is ancestor of source") and
-`SubnetLocal` ("source == dest"). Today the announcement does NOT
-carry the origin's subnet directly — the receiver derives it via
-`local_subnet_policy.assign(&ann.capabilities)`
-(`mesh.rs:3829`).
-
-Two options:
-
-1. **Re-derive on every forward.** Each forwarder applies
-   *its own* `local_subnet_policy` to `ann.capabilities` and
-   treats that as the origin's subnet. Cheap, no wire change. But
-   it assumes every node in the mesh runs the *same* subnet
-   policy — which is the implicit invariant of Stage D today
-   (`SDK_SECURITY_SURFACE_PLAN.md:436`). A node with a divergent
-   policy could shift the effective scope on the forwarding path.
-2. **Origin attaches its own subnet.** Add `origin_subnet:
-   Option<SubnetId>` to the announcement (signed). The origin
-   writes `Some(self.local_subnet)` when scope ≠ `Global`, `None`
-   otherwise. Forwarders trust the origin's claim because it's
-   covered by the signature.
-
-Pick **(2).** It is more robust under heterogeneous-policy meshes,
-and the wire cost is one optional 4-byte (or empty-when-`None`)
-field. The `Global` fast path serializes nothing and stays byte-
-identical to v1.
-
-```rust
-/// Origin's claimed subnet, signed alongside `scope`. `None` for
-/// `Global` announcements (no enforcement needed) and for legacy
-/// announcements (no scope field at all).
-#[serde(default, skip_serializing_if = "Option::is_none")]
-pub origin_subnet: Option<SubnetId>,
-```
-
-Origin-subnet validation on receipt: if `scope != Global` but
-`origin_subnet` is `None`, drop the announcement (`tracing::warn!`).
-This is a soft invariant — a misbehaving origin could omit the
-field deliberately, but doing so removes its own scope enforcement
-and doesn't grant it any extra visibility, so it's a self-DoS, not
-a privilege escalation.
-
-### Origin-side fan-out filter
-
-Today's `announce_capabilities` (`mesh.rs:5076`):
-
-```rust
-let peer_addrs: Vec<SocketAddr> = self.peers.iter().map(|e| e.value().addr).collect();
-for addr in peer_addrs {
-    self.send_subprotocol(addr, SUBPROTOCOL_CAPABILITY_ANN, &bytes).await?;
-}
-```
-
-Becomes:
-
-```rust
-for entry in self.peers.iter() {
-    let peer = entry.value();
-    let peer_subnet = self
-        .peer_subnets
-        .get(&peer.node_id)
-        .map(|e| *e.value())
-        .unwrap_or(SubnetId::GLOBAL);
-    if !announcement_visible(self.local_subnet, peer_subnet, &ann.scope) {
-        continue;
+    for t in tags {
+        if t == TAG_SCOPE_SUBNET_LOCAL {
+            subnet_local = true;
+        } else if let Some(id) = t.strip_prefix(TAG_SCOPE_TENANT_PREFIX) {
+            if !id.is_empty() {
+                tenants.push(id.to_string());
+            }
+        } else if let Some(name) = t.strip_prefix(TAG_SCOPE_REGION_PREFIX) {
+            if !name.is_empty() {
+                regions.push(name.to_string());
+            }
+        }
+        // `scope:global` is the default; presence is a no-op.
     }
-    let _ = self.send_subprotocol(peer.addr, SUBPROTOCOL_CAPABILITY_ANN, &bytes).await;
-}
-```
 
-Where `announcement_visible(source, dest, scope)` is a free
-function that mirrors `subnet_visible` (`mesh.rs:4489`) for the
-`AnnouncementScope` enum. Same shape:
-
-| scope            | rule                                                                          |
-| ---------------- | ----------------------------------------------------------------------------- |
-| `Global`         | always true                                                                   |
-| `SubnetLocal`    | `source == dest`                                                              |
-| `ParentVisible`  | `source == dest \|\| dest.is_ancestor_of(source) \|\| source.is_ancestor_of(dest)` |
-| `Exported(targets)` | `targets.iter().any(\|t\| t == dest \|\| t.is_ancestor_of(dest))`             |
-
-Identical predicate logic to `SubnetGateway::should_forward`
-(`gateway.rs:130`) so the channel path and the announcement path
-drop on the same conditions.
-
-**Edge case: peer subnet unknown.** A peer we've just connected to
-hasn't announced yet — `peer_subnets` returns `None`, defaults to
-`SubnetId::GLOBAL`. A `SubnetLocal` announcement to a `GLOBAL`
-peer is `false` (different subnets), so we skip the send. *Result:*
-the new peer doesn't get our `SubnetLocal` caps until they announce
-themselves and we learn their subnet. The next session-open
-re-push (or our next periodic announce) re-evaluates and pushes
-through if the subnet matches. This is a feature: scoped caps stay
-private until the receiver proves their subnet.
-
-### Forwarder-side fan-out filter
-
-`forward_capability_announcement` (`mesh.rs:3887`) currently fans
-out to every peer except the sender and the split-horizon-excluded
-next-hop-to-origin. Add the same `announcement_visible` check, but
-using `ann.origin_subnet` (with the `None` → `GLOBAL` fallback)
-as `source`:
-
-```rust
-let origin_subnet = ann.origin_subnet.unwrap_or(SubnetId::GLOBAL);
-for entry in peers.iter() {
-    let peer = entry.value();
-    if peer.node_id == sender_node_id { continue; }
-    if Some(peer.addr) == next_hop_addr { continue; }
-    if partition_filter.contains(&peer.addr) { continue; }
-    let peer_subnet = peer_subnets.get(&peer.node_id)
-        .map(|e| *e.value())
-        .unwrap_or(SubnetId::GLOBAL);
-    if !announcement_visible(origin_subnet, peer_subnet, &ann.scope) {
-        continue;
+    if subnet_local {
+        // Strictest form wins: subnet-local trumps tenants/regions.
+        // A node that wants a tenant-and-subnet hybrid runs two
+        // queries.
+        CapabilityScope::SubnetLocal
+    } else {
+        match (tenants.is_empty(), regions.is_empty()) {
+            (true, true) => CapabilityScope::Global,
+            (false, true) => CapabilityScope::Tenants(tenants),
+            (true, false) => CapabilityScope::Regions(regions),
+            (false, false) => CapabilityScope::TenantsAndRegions { tenants, regions },
+        }
     }
-    // … existing build_subprotocol + send_to …
 }
 ```
 
-`peer_subnets` needs to be cloned into the spawned forwarding task
-the same way `partition_filter` and `router` already are
-(`mesh.rs:3893`).
+`tags` comes from `CapabilitySet::tags: Vec<String>`. We don't
+move to `HashSet` — keep the field `Vec<String>` (existing API)
+and tolerate the linear scan. Tag count is small (<32 typical).
 
-### Receiver-side handling
+### `ScopeFilter` and `matches_scope`
 
-`handle_capability_announcement` (`mesh.rs:3682`) does NOT need
-to filter on scope. Any announcement that reached us already
-passed the path-level filter at every hop, so by construction we
-are an allowed destination. The only receive-time invariants we
-add:
-
-1. **Reject `scope != Global` with `origin_subnet == None`** —
-   defensive guard against malformed announcements. Drop with
-   `tracing::trace!` log line, same as the existing decode-failure
-   branch (`mesh.rs:3683`).
-2. **Verify origin_subnet vs derived subnet** when both are
-   present. If `local_subnet_policy.is_some()` and
-   `policy.assign(&ann.capabilities) != ann.origin_subnet`, log
-   a warning. Don't drop — the local policy may legitimately
-   diverge from the origin's. This is an observability hook for
-   debugging policy drift, not an enforcement gate.
-
-Forwarding (`mesh.rs:3867`) inherits the origin-side rule: a
-forwarder sees `ann.scope` directly and applies the same path-cut
-when re-broadcasting.
-
-### Gateway integration
-
-For nodes that *are* gateways (sit at subnet boundaries with
-multiple `peer_subnets` entries spanning subnets), the existing
-`SubnetGateway::should_forward` handles channels but not the
-capability-announcement subprotocol. Add:
+Public API:
 
 ```rust
-impl SubnetGateway {
-    pub fn should_forward_announcement(
+/// Caller's intent for narrowing peer discovery by reserved scope
+/// tags. `Any` reproduces the v1 behavior: every indexed peer is a
+/// candidate regardless of `scope:*` tags.
+#[derive(Debug, Clone)]
+pub enum ScopeFilter<'a> {
+    /// Match every peer (default; v1 behavior).
+    Any,
+    /// Match peers whose announcement has no `scope:*` tag, i.e.
+    /// `Global`. Useful for opting *out* of scoped peers entirely.
+    GlobalOnly,
+    /// Match peers whose subnet equals ours. We compare against
+    /// the local node's `peer_subnets` map. If either side's
+    /// subnet is unknown, the candidate is included (warm-up
+    /// permissive).
+    SameSubnet,
+    /// Match peers tagged `scope:tenant:<t>` OR `scope:global`.
+    Tenant(&'a str),
+    /// Match peers tagged `scope:tenant:<t>` for any `t` in the
+    /// list, OR `scope:global`.
+    Tenants(&'a [&'a str]),
+    /// Match peers tagged `scope:region:<r>` OR `scope:global`.
+    Region(&'a str),
+    /// Match peers tagged `scope:region:<r>` for any `r` in the
+    /// list, OR `scope:global`.
+    Regions(&'a [&'a str]),
+}
+
+pub(crate) fn matches_scope(
+    candidate_scope: &CapabilityScope,
+    filter: &ScopeFilter<'_>,
+    same_subnet: bool, // pre-resolved by caller for SameSubnet
+) -> bool {
+    use CapabilityScope as S;
+    use ScopeFilter as F;
+    match (filter, candidate_scope) {
+        (F::Any, _) => true,
+        (F::GlobalOnly, S::Global) => true,
+        (F::GlobalOnly, _) => false,
+
+        (F::SameSubnet, S::SubnetLocal) => same_subnet,
+        // SubnetLocal candidates only show up when SameSubnet —
+        // any other filter excludes them (they're explicitly opted
+        // out of cross-subnet discovery).
+        (_, S::SubnetLocal) => false,
+        (F::SameSubnet, _) => same_subnet,
+
+        (F::Tenant(t), S::Global) => {
+            // Global peers are visible to every tenant query —
+            // permissive by default. Callers wanting strict tenant
+            // membership use `GlobalOnly` ∪ `Tenant`.
+            let _ = t;
+            true
+        }
+        (F::Tenant(t), S::Tenants(ts)) | (F::Tenant(t), S::TenantsAndRegions { tenants: ts, .. }) => {
+            ts.iter().any(|x| x == t)
+        }
+        (F::Tenant(_), S::Regions(_)) => false,
+
+        (F::Tenants(wanted), S::Global) => { let _ = wanted; true }
+        (F::Tenants(wanted), S::Tenants(ts))
+        | (F::Tenants(wanted), S::TenantsAndRegions { tenants: ts, .. }) => {
+            ts.iter().any(|x| wanted.iter().any(|w| w == x))
+        }
+        (F::Tenants(_), S::Regions(_)) => false,
+
+        (F::Region(r), S::Global) => { let _ = r; true }
+        (F::Region(r), S::Regions(rs))
+        | (F::Region(r), S::TenantsAndRegions { regions: rs, .. }) => {
+            rs.iter().any(|x| x == r)
+        }
+        (F::Region(_), S::Tenants(_)) => false,
+
+        (F::Regions(wanted), S::Global) => { let _ = wanted; true }
+        (F::Regions(wanted), S::Regions(rs))
+        | (F::Regions(wanted), S::TenantsAndRegions { regions: rs, .. }) => {
+            rs.iter().any(|x| wanted.iter().any(|w| w == x))
+        }
+        (F::Regions(_), S::Tenants(_)) => false,
+    }
+}
+```
+
+Invariants the predicate enforces:
+
+- `SubnetLocal` candidates are only visible under `SameSubnet`.
+  They are *not* visible under `Any` — `Any` means "any
+  *discoverable* peer," and a node tagged `scope:subnet-local`
+  has explicitly opted out of cross-subnet discovery.
+- `Global` candidates are visible under any non-`GlobalOnly`,
+  non-`SameSubnet` filter. Permissive by design — a node that
+  doesn't tag itself is the v1 default and shouldn't disappear
+  from queries.
+
+### `CapabilityIndex::find_peers_scoped`
+
+Wraps the existing `query` with a scope filter applied per
+candidate:
+
+```rust
+impl CapabilityIndex {
+    /// Like [`Self::query`], but additionally filters by a scope
+    /// derived from the candidate's `scope:*` tags. See
+    /// [`ScopeFilter`] for the available filter variants.
+    ///
+    /// `same_subnet_lookup` is invoked for each candidate when the
+    /// filter is `SameSubnet`, returning whether the candidate's
+    /// subnet equals the caller's. The closure is supplied by the
+    /// caller because the index does not own subnet state — that
+    /// lives on `MeshNode::peer_subnets`. Closure returns `true`
+    /// also for "subnet unknown" (warm-up permissive); see
+    /// `ScopeFilter::SameSubnet` rationale.
+    pub fn find_peers_scoped(
         &self,
-        origin_subnet: SubnetId,
-        dest_subnet: SubnetId,
-        scope: &AnnouncementScope,
-        hop_ttl: u8,
-        hop_count: u8,
-    ) -> ForwardDecision { … }
+        filter: &CapabilityFilter,
+        scope_filter: &ScopeFilter<'_>,
+        mut same_subnet_lookup: impl FnMut(u64) -> bool,
+    ) -> Vec<u64> {
+        let base = self.query(filter);
+        base.into_iter()
+            .filter(|node_id| {
+                let Some(caps) = self.get(*node_id) else {
+                    return false;
+                };
+                let scope = scope_from_tags(&caps.tags);
+                let same_subnet = matches!(scope_filter, ScopeFilter::SameSubnet)
+                    .then(|| same_subnet_lookup(*node_id))
+                    .unwrap_or(false);
+                matches_scope(&scope, scope_filter, same_subnet)
+            })
+            .collect()
+    }
+
+    /// Scoped variant of [`Self::find_best`].
+    pub fn find_best_scoped(
+        &self,
+        req: &CapabilityRequirement,
+        scope_filter: &ScopeFilter<'_>,
+        same_subnet_lookup: impl FnMut(u64) -> bool,
+    ) -> Option<u64> {
+        let candidates = self.find_peers_scoped(&req.filter, scope_filter, same_subnet_lookup);
+        candidates.into_iter()
+            .filter_map(|nid| {
+                self.nodes.get(&nid).map(|n| (nid, req.score(&n.capabilities)))
+            })
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(nid, _)| nid)
+    }
 }
 ```
 
-Same `DropReason` variants (`SubnetLocal`, `NotAncestor`,
-`NotExported`, `TtlExpired`). The gateway is currently consulted
-only on the channel path; capability announcements use
-subprotocol routing through the regular `MeshNode` peers DashMap.
-For v2, mesh-internal forwarding (above) is sufficient; a gateway
-node carrying capability announcements through a subprotocol
-session uses the same per-peer fan-out filter as a non-gateway
-node. The new `should_forward_announcement` is a pure helper
-function that gateway implementations and tests can call directly.
-
-### Builder + per-call override
+The closure-based `same_subnet_lookup` keeps `CapabilityIndex`
+free of `MeshNode` knowledge. `MeshNode` provides the closure:
 
 ```rust
-// MeshNodeConfig
-pub fn with_announcement_scope(mut self, scope: AnnouncementScope) -> Self {
-    self.announcement_scope = scope;
-    self
-}
+impl MeshNode {
+    pub fn find_peers_scoped(
+        &self,
+        filter: &CapabilityFilter,
+        scope: &ScopeFilter<'_>,
+    ) -> Vec<u64> {
+        let my_subnet = self.local_subnet;
+        let peer_subnets = self.peer_subnets.clone();
+        self.capability_index.find_peers_scoped(filter, scope, |nid| {
+            match peer_subnets.get(&nid).map(|e| *e.value()) {
+                Some(s) => s == my_subnet,
+                None => true, // warm-up permissive
+            }
+        })
+    }
 
-// MeshNode
-pub async fn announce_capabilities(&self, caps: CapabilitySet) -> Result<()> {
-    self.announce_capabilities_with(caps, self.config.announcement_scope.clone()).await
-}
-
-pub async fn announce_capabilities_with(
-    &self,
-    caps: CapabilitySet,
-    scope: AnnouncementScope,
-) -> Result<()> {
-    // … existing body, but assigns `ann.scope = scope` and
-    // `ann.origin_subnet = (scope != Global).then_some(self.local_subnet)`
-    // before signing.
+    pub fn find_best_scoped(
+        &self,
+        req: &CapabilityRequirement,
+        scope: &ScopeFilter<'_>,
+    ) -> Option<u64> {
+        let my_subnet = self.local_subnet;
+        let peer_subnets = self.peer_subnets.clone();
+        self.capability_index.find_best_scoped(req, scope, |nid| {
+            match peer_subnets.get(&nid).map(|e| *e.value()) {
+                Some(s) => s == my_subnet,
+                None => true,
+            }
+        })
+    }
 }
 ```
 
-The default-scoped variant calls into the override variant — the
-existing call sites in tests and SDK pass through unchanged with
-scope = `Global`, preserving permissive-global v1 behavior for
-nodes that don't opt in.
+### Helper builders on `CapabilitySet`
+
+Ergonomic shorthands so callers don't have to spell the tag
+prefix string:
+
+```rust
+impl CapabilitySet {
+    /// Add a `scope:tenant:<id>` reserved tag. Idempotent —
+    /// repeated calls with the same id do not duplicate.
+    pub fn with_tenant_scope(mut self, tenant_id: impl Into<String>) -> Self {
+        let tag = format!("{}{}", TAG_SCOPE_TENANT_PREFIX, tenant_id.into());
+        if !self.tags.iter().any(|t| t == &tag) {
+            self.tags.push(tag);
+        }
+        self
+    }
+
+    /// Add a `scope:region:<name>` reserved tag.
+    pub fn with_region_scope(mut self, region: impl Into<String>) -> Self { /* … */ self }
+
+    /// Mark this announcement subnet-local. Mutually exclusive with
+    /// tenant/region scopes — the `CapabilityScope` resolver picks
+    /// `SubnetLocal` when this tag is present even if others are
+    /// also set.
+    pub fn with_subnet_local_scope(mut self) -> Self { /* … */ self }
+}
+```
+
+`tenant_id` / `region` strings are caller-owned. We don't
+namespace or hash them — exact bytes match. Empty strings are
+silently dropped by `scope_from_tags` (defensive).
 
 ## SDK surface
 
 ### Rust SDK (`sdk/src/capabilities.rs` + `sdk/src/mesh.rs`)
 
-- Re-export `AnnouncementScope` from `net::adapter::net::behavior::capability`.
-- `MeshBuilder::announcement_scope(scope: AnnouncementScope) -> Self`.
-- `Mesh::announce_capabilities_scoped(&self, caps: CapabilitySet, scope: AnnouncementScope) -> impl Future<…>`.
+- Re-export `ScopeFilter` from `net::adapter::net::behavior::capability`.
+- `Mesh::find_peers_scoped(filter, scope) -> Vec<u64>`.
+- `Mesh::find_best_scoped(req, scope) -> Option<u64>`.
+- Convenience: `CapabilitySetBuilder::tenant(t)`, `region(r)`,
+  `subnet_local()`.
 
-### Node.js (`bindings/node/src/capabilities.rs` + `sdk-ts/src/capabilities.ts`)
+### Node.js (`bindings/node/src/capabilities.rs` + `sdk-ts/`)
 
-- TS `type AnnouncementScope = 'global' | 'parentVisible' | 'subnetLocal' | { exported: SubnetId[] }`.
-- NAPI converts the union to the Rust enum (string compare on
-  the discriminator field).
-- `MeshConfig.announcementScope?: AnnouncementScope` plumbed through
-  `with_announcement_scope`.
-- `Mesh.announceCapabilitiesScoped(caps, scope)` per-call.
+```ts
+type ScopeFilter =
+  | { kind: 'any' }
+  | { kind: 'globalOnly' }
+  | { kind: 'sameSubnet' }
+  | { kind: 'tenant'; tenant: string }
+  | { kind: 'tenants'; tenants: string[] }
+  | { kind: 'region'; region: string }
+  | { kind: 'regions'; regions: string[] };
+
+const peers = await mesh.findPeersScoped(
+  { tags: ['model:llama3-70b'] },
+  { kind: 'tenant', tenant: 'oem-123' },
+);
+```
+
+NAPI converts the union to the Rust enum by inspecting `kind`.
+Validation: unknown `kind` → `NetError::InvalidArgument`.
 
 ### Python (`bindings/python/src/lib.rs` + `sdk-py/`)
 
-- Mirror Node's surface. `announcement_scope` config key, taking
-  either a string or a tuple `("Exported", [SubnetId, ...])`.
-- `mesh.announce_capabilities_scoped(caps, scope)`.
+Mirror the same surface; scope is a tuple `("tenant", "oem-123")`
+or a string `"any" | "globalOnly" | "sameSubnet"`.
 
 ## Tests
 
-Add `tests/capability_scope.rs` (sibling to `tests/capability_multihop.rs`):
+Unit tests in `behavior/capability.rs` (6):
 
-1. **`subnet_local_does_not_cross_boundary`** — three nodes, A and
-   B in subnet `[1,1]`, C in `[1,2]`. A announces `SubnetLocal`. B
-   indexes A's caps; C does not. Verify via `find_peers` from each.
-2. **`parent_visible_reaches_ancestor_not_sibling`** — A in
-   `[1,1,1]`, parent gateway in `[1,1]`, sibling C in `[1,2]`. A
-   announces `ParentVisible`. Parent indexes A's caps; sibling does
-   not.
-3. **`exported_targets_are_explicit`** — A in `[1,1]`, B in
-   `[2,1]`, C in `[3,1]`. A announces `Exported(vec![[2,1]])`. B
-   indexes; C does not.
-4. **`scope_signature_invariant_across_forward`** — A announces
-   `SubnetLocal` to B in same subnet; B forwards to D (also same
-   subnet) with `hop_count = 1`. D verifies the signature
-   end-to-end. Same shape as
-   `tests/capability_multihop.rs::wire_format_signature_survives_hop_bump`.
-5. **`malformed_scope_without_origin_subnet_drops`** — craft an
-   announcement (via test-only `unsafe` constructor) with `scope =
-   SubnetLocal` and `origin_subnet = None`. Receiver drops; index
-   does not contain the origin.
+1. **`scope_from_tags_no_scope_tag_is_global`** — empty tags →
+   `Global`; `["gpu"]` → `Global`.
+2. **`scope_from_tags_subnet_local_wins`** — `["scope:subnet-local",
+   "scope:tenant:foo"]` → `SubnetLocal`.
+3. **`scope_from_tags_multiple_tenants`** —
+   `["scope:tenant:a", "scope:tenant:b"]` → `Tenants(["a", "b"])`.
+4. **`scope_from_tags_tenants_and_regions`** —
+   `["scope:tenant:a", "scope:region:eu-west"]` →
+   `TenantsAndRegions { … }`.
+5. **`matches_scope_global_visible_to_tenant_filter`** — `Global`
+   candidate matches `Tenant("foo")` (permissive default).
+6. **`matches_scope_subnet_local_excluded_from_any`** —
+   `SubnetLocal` candidate does NOT match `ScopeFilter::Any`
+   (explicit opt-out of cross-subnet discovery).
 
-Plus 3 unit tests in `behavior/capability.rs`:
+Integration test in `tests/capability_scope.rs` (1, three-node):
 
-6. **`scope_default_is_global`** — `CapabilityAnnouncement::new`
-   produces `scope == Global, origin_subnet == None`.
-7. **`scope_serializes_omitted_when_global`** — JSON round-trip of
-   a `Global` announcement is byte-identical to a v1 announcement
-   without the field. Locks in rolling-upgrade compat.
-8. **`scope_in_signed_payload`** — sign with `scope = Global`,
-   mutate to `scope = SubnetLocal` post-signing, verify fails.
-   Sign with `scope = SubnetLocal`, verify passes. (`signed_payload`
-   includes `scope`; mutating it should invalidate.)
+7. **`tenant_scoped_discovery`** — A in tenant `oem-123`, B in
+   tenant `corp-acme`, C unscoped. From a fresh node D, query
+   `find_peers_scoped(filter, ScopeFilter::Tenant("oem-123"))`.
+   Expect: A and C in result; B excluded. Same query with
+   `ScopeFilter::Any`: A, B, C all present.
 
-Plus 3 unit tests in `subnet/gateway.rs`:
-
-9. **`gateway_announcement_subnet_local_drops`** — direct call to
-   `should_forward_announcement` returns
-   `Drop(DropReason::SubnetLocal)` for cross-subnet pair.
-10. **`gateway_announcement_parent_visible_to_ancestor_forwards`**.
-11. **`gateway_announcement_exported_targets_match`**.
+(Path-level tests like "subnet-local doesn't cross
+boundary" are explicitly NOT added at this layer because there's
+no path-level enforcement to test. The `SubnetLocal` semantics
+are tested through the `matches_scope` predicate.)
 
 ## Implementation steps
 
-Each step is independently reviewable; full sequence ~3 days for
-Rust core + 2 days for SDK surface.
+Each step is independently reviewable; total ≈ 1.5 days for
+core + 1 day for SDK surface.
 
-### Step 1 — Wire format + sign/verify
+### Step 1 — Helpers
 
-`src/adapter/net/behavior/capability.rs` (~80 lines):
+`src/adapter/net/behavior/capability.rs` (~120 lines):
 
-- Add `AnnouncementScope` enum, `Default for AnnouncementScope`,
-  `is_scope_global` predicate.
-- Add `scope` and `origin_subnet` fields to
-  `CapabilityAnnouncement` with the `#[serde(default,
-  skip_serializing_if = …)]` attributes.
-- Update `CapabilityAnnouncement::new` to default both to
-  `Global` / `None`.
-- Add `with_scope(scope)` builder.
-- Verify `signed_payload()` covers `scope` + `origin_subnet`
-  (no code change needed — it's already
-  `to_bytes()` of the full struct minus signature + hop_count).
-- Tests 6, 7, 8.
+- Add `CapabilityScope` enum (module-private, unless we want to
+  expose for tests — leave private; expose via `ScopeFilter`).
+- Add `ScopeFilter` enum (public).
+- Add `scope_from_tags`, `matches_scope` (module-private).
+- Add reserved-tag prefix constants.
+- Add `with_tenant_scope` / `with_region_scope` /
+  `with_subnet_local_scope` builders on `CapabilitySet`.
+- Tests 1–6.
 
-### Step 2 — Origin-side fan-out filter
+### Step 2 — Index API
 
-`src/adapter/net/mesh.rs` (~50 lines):
+`src/adapter/net/behavior/capability.rs` (~40 lines):
 
-- Add `announcement_scope: AnnouncementScope` to `MeshNodeConfig`
-  and `with_announcement_scope` builder.
-- Add `announcement_visible(source, dest, scope)` free function
-  next to the existing `subnet_visible`.
-- Modify `announce_capabilities` to take an optional scope
-  override, build the announcement with `scope` +
-  `origin_subnet`, and apply the per-peer filter on fan-out.
-- Add `announce_capabilities_with(caps, scope)` public entry
-  point.
-- Tests 1, 3.
+- `CapabilityIndex::find_peers_scoped` and `find_best_scoped`.
+- Bench target: scoped query overhead < 5% over non-scoped on a
+  10k-node index — measured by adding a benchmark next to the
+  existing `bench_capability_query`.
 
-### Step 3 — Forwarder-side filter
+### Step 3 — `MeshNode` pass-throughs
 
 `src/adapter/net/mesh.rs` (~30 lines):
 
-- Modify `forward_capability_announcement` signature to take
-  `peer_subnets` and the parsed `ann` (or the scope + origin
-  subnet pair).
-- Apply `announcement_visible` per candidate forward target.
-- Add receiver-side validation guards in
-  `handle_capability_announcement`: reject
-  `scope != Global && origin_subnet == None`; warn on policy
-  drift.
-- Tests 2, 4, 5.
+- `find_peers_scoped` and `find_best_scoped` methods that close
+  over `local_subnet` + `peer_subnets`.
+- Test 7.
 
-### Step 4 — Gateway helper
+### Step 4 — SDK surface
 
-`src/adapter/net/subnet/gateway.rs` (~40 lines):
-
-- Add `should_forward_announcement` mirroring `should_forward`.
-- Tests 9, 10, 11.
-
-### Step 5 — SDK surface
-
-`sdk/src/capabilities.rs`, `sdk/src/mesh.rs` (~40 lines).
+`sdk/src/capabilities.rs`, `sdk/src/mesh.rs` (~30 lines).
 `bindings/node/src/capabilities.rs`,
-`sdk-ts/src/capabilities.ts`, `sdk-ts/src/mesh.ts` (~80 lines).
+`sdk-ts/src/capabilities.ts`, `sdk-ts/src/mesh.ts` (~80 lines
+including TS type union).
 `bindings/python/src/lib.rs`, `sdk-py/` (~60 lines).
 
-- Re-export `AnnouncementScope` and the builder method.
-- Add `announceCapabilitiesScoped` / `announce_capabilities_scoped`
-  per language.
-- One smoke test per SDK that round-trips a `SubnetLocal`
-  announcement through the wire and asserts visibility on a
-  same-subnet peer + invisibility on a cross-subnet peer.
+- Per-language smoke test: announce with `scope:tenant:foo`,
+  query with `ScopeFilter::Tenant("foo")` from another node,
+  assert visibility.
 
-### Step 6 — Documentation
+### Step 5 — Documentation
 
-- Add a paragraph to `CHANNELS.md` and `BEHAVIOR.md` explaining
-  that announcement visibility now mirrors channel visibility.
+- Add a section to `BEHAVIOR.md` documenting the reserved tag
+  forms and the scope-resolution precedence
+  (`subnet-local` > tenants+regions > global).
+- Cross-reference from `CHANNELS.md` (channels and capability
+  scopes are independent — channel visibility is a *routing*
+  concept, capability scope is a *discovery* concept).
 - Update `CAPABILITY_BROADCAST_PLAN.md` and
-  `MULTIHOP_CAPABILITY_PLAN.md` to remove `AnnouncementScope`
-  from "Out of scope" / "non-goals" sections.
-- Update `SDK_SECURITY_SURFACE_PLAN.md:801` (the explicit
-  non-goal block) to reference this plan.
+  `MULTIHOP_CAPABILITY_PLAN.md` "non-goals" sections to point at
+  this plan.
+- README snippet: GPU pool example, Deck app discovery example,
+  regional relay example (lifted from Kyra's notes).
+
+## Concrete usage
+
+### GPU compute pool per tenant
+
+Provider node:
+```rust
+let caps = CapabilitySet::new()
+    .add_tag("gpu")
+    .add_tag("model:llama3-70b")
+    .add_tag("cap:compute")
+    .with_tenant_scope("oem-123");
+mesh.announce_capabilities(caps).await?;
+```
+
+Tenant client:
+```rust
+let peers = mesh.find_peers_scoped(
+    &CapabilityFilter::new().require_tag("model:llama3-70b"),
+    &ScopeFilter::Tenant("oem-123"),
+);
+```
+
+### CyberDeck app discovery
+
+Desktop:
+```rust
+let caps = CapabilitySet::new()
+    .add_tag("software:Adobe Photoshop@25.1.0")
+    .with_subnet_local_scope();
+mesh.announce_capabilities(caps).await?;
+```
+
+Deck:
+```ts
+const peers = await mesh.findPeersScoped(
+  { tags: ['software:'] },           // prefix-matching filter
+  { kind: 'sameSubnet' },
+);
+```
+
+### Regional rendezvous
+
+Relay:
+```rust
+let caps = CapabilitySet::new()
+    .add_tag("relay-capable")
+    .with_region_scope("eu-west");
+mesh.announce_capabilities(caps).await?;
+```
+
+NAT traversal selection:
+```rust
+let relay = mesh.find_best_scoped(
+    &CapabilityRequirement::new(CapabilityFilter::new().require_tag("relay-capable")),
+    &ScopeFilter::Region("eu-west"),
+).or_else(|| {
+    mesh.find_best_capability(
+        &CapabilityRequirement::new(CapabilityFilter::new().require_tag("relay-capable")),
+    )
+});
+```
+
+## Follow-ups (v3, not this plan)
+
+- **Path-level enforcement.** Forwarders drop announcements
+  whose `scope` excludes the candidate's subnet. Wire-level
+  field, signed-envelope change, gateway integration. Triggers:
+  multi-tenant compliance, untrusted-relay threat model.
+- **`Audience(Vec<EntityId>)` per-receiver ACLs.** Wire-level,
+  signed, plus a per-receiver decryption key model. Triggers:
+  per-customer feature gating with a real attacker model.
+- **Per-tag scope.** Different scopes for different tags inside
+  one announcement. Triggers: nodes that share most caps
+  globally and a few caps narrowly, when splitting into multiple
+  announcements becomes painful (probably never — split is
+  fine).
+- **Capability index partitioning.** If profiling shows scoped
+  queries are slow on a large mesh, partition by tenant. Pure
+  internal change to `CapabilityIndex`.
 
 ## Open questions
 
-- **Rollout under heterogeneous deployments.** A v1 node that
-  doesn't know about `scope` deserializes the field as
-  `Global` (default) and re-broadcasts permissively. That means
-  during a partial upgrade, a `SubnetLocal` announcement reaching a
-  v1 forwarder is effectively widened to that forwarder's reach.
-  Mitigation: ship v2 receivers first, then v2 origins. The
-  in-cluster upgrade order is already documented for the multi-hop
-  rollout — this plan piggybacks.
-- **`peer_subnets` warm-up race.** First-contact peer hasn't
-  announced → unknown subnet → `SubnetLocal` filter skips the
-  send → the peer remains uninformed until they announce. The
-  *channel* path has the same warm-up window
-  (`mesh.rs:4331`); the symmetry is the right answer. Document
-  in `CHANNELS.md`.
-- **Should `Global` still carry `origin_subnet`?** Cleaner if it
-  did (forwarders never have to fall back to GLOBAL), but it
-  breaks the v1-byte-identical signing path. Leave as `None` for
-  `Global`, accept the `unwrap_or(GLOBAL)` fallback.
+- **Should `Tenants` filter intersect with `GlobalOnly` to mean
+  "strict tenant only"?** Current design: `Tenant("foo")` matches
+  `Global` ∪ `Tenants(contains "foo")`. A strict caller intersects
+  with `GlobalOnly` themselves — but `GlobalOnly` excludes tenant
+  membership, so the intersection is empty. Add a `StrictTenant`
+  variant if a use case appears; defer.
+- **Tag namespace collision.** Reserved prefix `scope:` is owned
+  by this design; user tags must not start with `scope:`.
+  Document in `BEHAVIOR.md`. Validation: optional, since misuse
+  by a peer is harmless (the tag just doesn't resolve to a
+  meaningful scope and the peer behaves as if `Global`).
+- **Empty tenant id.** `scope:tenant:` (no value) is silently
+  dropped by `scope_from_tags`. Consider rejecting at announce
+  time? Probably noise — leave as silent ignore.
