@@ -294,29 +294,40 @@ impl MigrationTargetHandler {
     /// the authoritative copy. Also removes the factory entry, since the
     /// target won't need to re-restore from an orchestrator retry once
     /// the migration has successfully completed.
+    ///
+    /// Order matters: the `completed` record is inserted **before** the
+    /// `migrations` entry is removed. A concurrent `activate()` retry
+    /// from the orchestrator (after a lost `ActivateAck`) walks
+    /// `migrations` first and falls back to `completed`. If the remove
+    /// happened first and the insert second, a retry landing in the gap
+    /// would observe neither map and fail with `DaemonNotFound`,
+    /// breaking the idempotency contract documented on `activate()`.
+    /// With this ordering the daemon is observable in at least one
+    /// map at every instant.
     pub fn complete(&self, daemon_origin: u32) -> Result<(), MigrationError> {
         // Precedence: if there is an active migration, finalize it. Only
         // if there is no active migration AND a completed record exists
         // do we treat this as an idempotent no-op (the retry case for a
         // lost ActivateAck).
-        let (_, entry) = match self.migrations.remove(&daemon_origin) {
-            Some(pair) => pair,
-            None => {
-                if self.completed.contains_key(&daemon_origin) {
-                    return Ok(());
+        let completion = {
+            let entry = match self.migrations.get(&daemon_origin) {
+                Some(e) => e,
+                None => {
+                    if self.completed.contains_key(&daemon_origin) {
+                        return Ok(());
+                    }
+                    return Err(MigrationError::DaemonNotFound(daemon_origin));
                 }
-                return Err(MigrationError::DaemonNotFound(daemon_origin));
-            }
-        };
-        let state = entry.into_inner();
-        self.completed.insert(
-            daemon_origin,
+            };
+            let state = entry.lock();
             CompletedTargetState {
                 orchestrator_node: state.orchestrator_node,
                 replayed_through: state.replayed_through,
                 completed_at: Instant::now(),
-            },
-        );
+            }
+        };
+        self.completed.insert(daemon_origin, completion);
+        self.migrations.remove(&daemon_origin);
         // The factory is single-shot on a successful migration: keeping it
         // registered would let a stale or replayed SnapshotReady re-trigger
         // restore against what is now the authoritative copy.
@@ -808,6 +819,111 @@ mod tests {
             handler.orchestrator_node(origin),
             Some(0x4444),
             "completed record must reflect the second (new) orchestrator"
+        );
+    }
+
+    #[test]
+    fn test_regression_complete_activate_no_intermediate_gap() {
+        // Regression: `complete()` removed from `migrations` BEFORE
+        // inserting into `completed`. A concurrent `activate()` retry
+        // landing in the gap would observe neither map and return
+        // `DaemonNotFound`, breaking the idempotency contract that
+        // `activate()` documents.
+        //
+        // The race window is sub-microsecond, so the test is structured
+        // as continuous mutual stress: a long-lived observer thread
+        // spin-loops calling `activate()` while the main thread cycles
+        // through many `restore → activate → complete` rounds. Tight
+        // atomic-flag handshakes (rather than a `Barrier`) keep the
+        // threads aligned closely enough to land observer probes inside
+        // the gap. With the bug, this hits `DaemonNotFound` reliably.
+        // With the fix, it never does.
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+        use std::thread;
+
+        const TRIALS: u32 = 2_000;
+        const STOP: u32 = u32::MAX;
+
+        let reg = Arc::new(DaemonRegistry::new());
+        let handler = Arc::new(MigrationTargetHandler::new(reg.clone()));
+
+        // Observer is signaled by writing the current trial's origin
+        // into `current_origin`; `STOP` ends the observer. The observer
+        // reports any DaemonNotFound it sees via `gap_seen`.
+        let current_origin = Arc::new(AtomicU32::new(0));
+        let gap_seen = Arc::new(AtomicU64::new(0));
+
+        let h_observer = handler.clone();
+        let origin_observer = current_origin.clone();
+        let gap_observer = gap_seen.clone();
+        let observer = thread::spawn(move || {
+            loop {
+                let origin = origin_observer.load(Ordering::Acquire);
+                if origin == STOP {
+                    return;
+                }
+                if origin == 0 {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                match h_observer.activate(origin) {
+                    Ok(_) => {}
+                    Err(MigrationError::DaemonNotFound(o)) => {
+                        gap_observer.store(o as u64, Ordering::Release);
+                        return;
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+
+        for _ in 0..TRIALS {
+            if gap_seen.load(Ordering::Acquire) != 0 {
+                break;
+            }
+            let kp = EntityKeypair::generate();
+            let origin = kp.origin_hash();
+            // origin = 0 is reserved as "no active trial" — collisions
+            // are vanishingly rare but skip if hit.
+            if origin == 0 || origin == STOP {
+                continue;
+            }
+            let snapshot = make_snapshot(&kp, 5, 0);
+            handler
+                .restore_snapshot(
+                    RestoreContext {
+                        daemon_origin: origin,
+                        snapshot: &snapshot,
+                        source_node: 0x1111,
+                        orchestrator_node: 0x2222,
+                    },
+                    kp.clone(),
+                    || Box::new(AccumDaemon { total: 0 }),
+                    DaemonHostConfig::default(),
+                )
+                .unwrap();
+            handler.activate(origin).unwrap();
+
+            // Hand the origin to the observer, then race complete()
+            // against its activate() spin-loop. We deliberately do NOT
+            // call `forget_completed` / `unregister` between trials:
+            // doing so would let the observer race and read a forgotten
+            // origin (test artifact, not a production bug). Each trial
+            // uses a fresh origin so accumulation is bounded by TRIALS.
+            current_origin.store(origin, Ordering::Release);
+            handler.complete(origin).unwrap();
+            current_origin.store(0, Ordering::Release);
+        }
+
+        current_origin.store(STOP, Ordering::Release);
+        observer.join().unwrap();
+
+        let gap = gap_seen.load(Ordering::Acquire);
+        assert_eq!(
+            gap, 0,
+            "concurrent activate() observed a DaemonNotFound gap during complete() \
+             for origin {gap:#x} — the migration was unobservable in both \
+             `migrations` and `completed`"
         );
     }
 }
