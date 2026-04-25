@@ -1,0 +1,29 @@
+net/crates/net/docs/BEHAVIOR.md
+  a9d311afc8324224 31-62
+net/crates/net/docs/SDK_SECURITY_SURFACE_PLAN.md
+  a9d311afc8324224 802-805
+net/crates/net/docs/MULTIHOP_CAPABILITY_PLAN.md
+  a9d311afc8324224 158-163,322-326
+net/crates/net/docs/CAPABILITY_BROADCAST_PLAN.md
+  a9d311afc8324224 62-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "634d6c76139b4eb41caccc6fb8d8a395f7cb1204",
+  "prompts": {
+    "a9d311afc8324224": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8e12ea48-52c3-40e2-9655-6d0ab0878bb6",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 51,
+      "total_deletions": 262,
+      "accepted_lines": 51,
+      "overriden_lines": 0
+    }
+  }
+}
