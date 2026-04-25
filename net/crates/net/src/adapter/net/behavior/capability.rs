@@ -2451,4 +2451,120 @@ mod tests {
             bumped_str,
         );
     }
+
+    /// `query()` has two paths after the index intersection: a fast
+    /// path that trusts the indexes when the filter constrains only
+    /// indexed dimensions, and a slow path that re-applies
+    /// `filter.matches()` per candidate when non-indexed predicates
+    /// are set. The two must produce identical results for any
+    /// filter with no truly-non-indexed predicates.
+    ///
+    /// We force the slow path by adding `min_memory_mb = 0` — an
+    /// always-true predicate (memory_mb is unsigned, so the
+    /// `memory_mb < 0` check can never fire) that nonetheless makes
+    /// `needs_full_check()` return true. If a future change to
+    /// `needs_full_check()` ever omits a non-indexed field, this
+    /// test catches it: the fast and slow paths would diverge.
+    #[test]
+    fn query_fast_path_matches_slow_path_for_indexed_only_filter() {
+        let index = CapabilityIndex::new();
+
+        for i in 0..30u64 {
+            let mut caps = sample_capability_set();
+            // sample_capability_set already has tag "inference" + "gpu"; vary
+            // additional tags so filters discriminate.
+            if i % 2 == 0 {
+                caps.tags.push("even".into());
+            }
+            if i % 3 == 0 {
+                caps.tags.push("triple".into());
+            }
+            let ann = CapabilityAnnouncement::new(i, test_entity(), 1, caps);
+            index.index(ann);
+        }
+
+        // Indexed-only filter — exercises the fast path.
+        let indexed_only = CapabilityFilter::new()
+            .require_tag("even")
+            .require_tag("inference");
+        // Same predicates plus an always-true non-indexed predicate to
+        // force the slow path.
+        let mut force_slow = indexed_only.clone();
+        force_slow.min_memory_mb = Some(0);
+
+        assert!(
+            !indexed_only.needs_full_check(),
+            "filter with only tags must take the fast path"
+        );
+        assert!(
+            force_slow.needs_full_check(),
+            "filter with min_memory_mb must take the slow path"
+        );
+
+        let mut fast: Vec<u64> = index.query(&indexed_only);
+        let mut slow: Vec<u64> = index.query(&force_slow);
+        fast.sort();
+        slow.sort();
+        assert_eq!(
+            fast, slow,
+            "fast path and slow path must agree when filters are equivalent"
+        );
+        assert!(!fast.is_empty(), "sample data must produce non-empty results");
+    }
+
+    /// After the `find_best()` refactor that folds the index lookup
+    /// and the score lookup into a single pass, the chosen node must
+    /// still match what `query()` returns intersected with the
+    /// highest-scoring candidate. Pins the contract: any future
+    /// re-derivation of the candidate set must keep `find_best`'s
+    /// answer inside `query`'s result set.
+    #[test]
+    fn find_best_returns_a_member_of_query_results() {
+        let index = CapabilityIndex::new();
+
+        for i in 0..20u64 {
+            let mut caps = sample_capability_set();
+            // Discriminator tag.
+            if i % 4 == 0 {
+                caps.tags.push("preferred".into());
+            }
+            // Vary memory so `prefer_memory` produces a real ordering.
+            caps.hardware.memory_mb = 1024 * (i as u32 + 1);
+            let ann = CapabilityAnnouncement::new(i, test_entity(), 1, caps);
+            index.index(ann);
+        }
+
+        let filter = CapabilityFilter::new().require_tag("preferred");
+        let req = CapabilityRequirement::from_filter(filter.clone()).prefer_memory(1.0);
+
+        let candidates = index.query(&filter);
+        let chosen = index
+            .find_best(&req)
+            .expect("non-empty candidate set must yield a winner");
+
+        assert!(
+            candidates.contains(&chosen),
+            "find_best returned {} which is not in query() candidates {:?}",
+            chosen,
+            candidates,
+        );
+
+        // With `prefer_memory(1.0)` and our memory_mb assignment, the
+        // largest-memory candidate must win — pins the score path.
+        let expected_winner = candidates
+            .iter()
+            .max_by_key(|&&id| {
+                index
+                    .nodes
+                    .get(&id)
+                    .map(|n| n.capabilities.hardware.memory_mb)
+                    .unwrap_or(0)
+            })
+            .copied()
+            .expect("non-empty candidates");
+        assert_eq!(
+            chosen, expected_winner,
+            "find_best must pick the highest-memory candidate under prefer_memory(1.0)"
+        );
+    }
 }

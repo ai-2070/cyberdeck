@@ -1962,4 +1962,46 @@ mod tests {
         assert_eq!(stats.queries, 2);
         assert_eq!(stats.updates, 5);
     }
+
+    /// `endpoint_prefix` replaces the previous
+    /// `path.split('/').take(2).collect::<Vec<_>>().join("/")` with a
+    /// `match_indices('/').nth(1)`-based slice. The replacement
+    /// must be byte-identical for every shape we feed it — a single
+    /// drift here would put `add_to_indexes` and
+    /// `remove_from_indexes` out of sync and silently leak entries
+    /// in `by_endpoint`. Each case below names the previous
+    /// behavior explicitly so a future reviewer can see the
+    /// equivalence at a glance.
+    #[test]
+    fn endpoint_prefix_matches_previous_split_join_behavior() {
+        // Helper that runs the OLD logic for ground truth.
+        fn old(path: &str) -> String {
+            path.split('/').take(2).collect::<Vec<_>>().join("/")
+        }
+
+        let cases: &[&str] = &[
+            "",                  // empty
+            "/",                 // a lone separator
+            "//",                // two separators, nothing between
+            "//a",               // empty leading segment, then content
+            "/a",                // single leading-slash segment
+            "/a/",               // trailing slash
+            "a",                 // no slashes at all
+            "a/",                // single segment + trailing slash
+            "/api",              // typical absolute root
+            "/api/users",        // two-segment absolute
+            "/api/users/123",    // deep absolute
+            "api/users/123",     // deep relative
+            "/api/users/v2/list",
+            "////",
+        ];
+
+        for path in cases {
+            assert_eq!(
+                endpoint_prefix(path),
+                old(path),
+                "endpoint_prefix divergence for {path:?}",
+            );
+        }
+    }
 }

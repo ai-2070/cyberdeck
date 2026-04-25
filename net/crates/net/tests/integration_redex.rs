@@ -440,6 +440,85 @@ async fn test_redex_close_signals_tail() {
     assert!(stream.next().await.is_none());
 }
 
+/// Slow tail subscriber overflowing the per-subscription buffer must
+/// be disconnected, never silently grow memory. Pins the
+/// disconnect-on-full semantics introduced when `tail()` switched
+/// from an unbounded channel to a bounded one with a
+/// `RedexError::Lagged` signal.
+///
+/// The test is intentionally pessimistic: it never drains the stream
+/// while appending, so the bounded channel saturates and the
+/// best-effort `Lagged` signal may itself be dropped on a full
+/// buffer. We accept either delivery outcome (Lagged surfaces, or
+/// the stream simply ends), and assert two invariants in both:
+///   1. We never receive more events than the buffer can hold —
+///      i.e., the watcher really was disconnected, not just
+///      momentarily backpressured.
+///   2. After the disconnect, the stream stays ended even as new
+///      appends land — a regression here would mean the watcher
+///      survived past its disconnect or got reattached.
+#[tokio::test]
+async fn test_redex_tail_lagged_disconnects_slow_subscriber() {
+    const BUFFER: usize = 4;
+    let r = Redex::new();
+    let f = r
+        .open_file(
+            &cn("lagged"),
+            RedexFileConfig::default().with_tail_buffer_size(BUFFER),
+        )
+        .unwrap();
+
+    let mut stream = Box::pin(f.tail(0));
+
+    // Flood far past the buffer without ever draining.
+    for i in 0..50u64 {
+        f.append(format!("event-{}", i).as_bytes()).unwrap();
+    }
+
+    // Drain whatever the channel had room to retain. Stop on either
+    // a `Lagged` error or natural end-of-stream.
+    let mut delivered_seqs = Vec::new();
+    let mut saw_lagged = false;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(event) => delivered_seqs.push(event.entry.seq),
+            Err(RedexError::Lagged) => {
+                saw_lagged = true;
+                break;
+            }
+            Err(other) => panic!("unexpected error from lagged stream: {:?}", other),
+        }
+    }
+
+    // Invariant 1: deliveries are bounded by the buffer size, and form
+    // a contiguous prefix from seq 0 — the events that fit before the
+    // disconnect.
+    assert!(
+        !delivered_seqs.is_empty(),
+        "subscriber should see at least one event before the disconnect"
+    );
+    assert!(
+        delivered_seqs.len() <= BUFFER,
+        "subscriber received {} events, exceeds bounded buffer of {}",
+        delivered_seqs.len(),
+        BUFFER,
+    );
+    for (i, seq) in delivered_seqs.iter().enumerate() {
+        assert_eq!(*seq, i as u64, "events must arrive in seq order");
+    }
+
+    // Invariant 2: the stream stays ended. Append more events and
+    // confirm the disconnected stream does not resurrect.
+    for i in 50..60u64 {
+        f.append(format!("late-{}", i).as_bytes()).unwrap();
+    }
+    assert!(
+        stream.next().await.is_none(),
+        "stream must remain ended after lagged disconnect; saw_lagged = {}",
+        saw_lagged,
+    );
+}
+
 #[test]
 fn test_redex_auth_enforcement() {
     // Unauthorized origin is rejected at open_file even on a local
