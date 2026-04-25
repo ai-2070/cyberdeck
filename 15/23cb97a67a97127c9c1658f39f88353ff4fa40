@@ -1,0 +1,27 @@
+net/crates/net/bindings/python/src/cortex.rs
+  0f2df0e612c625ad 217-220,264,476,514,929,979
+.github/workflows/ci.yml
+  0f2df0e612c625ad 244-307
+net/crates/net/bindings/python/src/compute.rs
+  0f2df0e612c625ad 173,1033
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "1523cb97a67a97127c9c1658f39f88353ff4fa40",
+  "prompts": {
+    "0f2df0e612c625ad": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e832c279-3821-4470-a3eb-bc6fb918a853",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 75,
+      "total_deletions": 16,
+      "accepted_lines": 75,
+      "overriden_lines": 0
+    }
+  }
+}
