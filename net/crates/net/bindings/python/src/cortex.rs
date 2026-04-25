@@ -214,8 +214,10 @@ impl PyRedex {
         retention_max_age_ms: Option<u64>,
     ) -> PyResult<PyRedexFile> {
         let channel = ChannelName::new(name).map_err(|e| RedexError::new_err(format!("{}", e)))?;
-        let mut cfg = RedexFileConfig::default();
-        cfg.persistent = persistent;
+        let mut cfg = RedexFileConfig {
+            persistent,
+            ..RedexFileConfig::default()
+        };
         match (fsync_every_n, fsync_interval_ms) {
             (Some(_), Some(_)) => {
                 return Err(RedexError::new_err(
@@ -259,7 +261,7 @@ impl PyRedex {
 
 /// A materialized RedEX event: `seq` + `payload` + checksum / inline
 /// flag. Clone is O(payload size).
-#[pyclass(name = "RedexEvent")]
+#[pyclass(name = "RedexEvent", from_py_object)]
 #[derive(Clone)]
 pub struct PyRedexEvent {
     #[pyo3(get)]
@@ -471,7 +473,7 @@ enum TailNext {
 // =========================================================================
 
 /// A materialized task record.
-#[pyclass(name = "Task")]
+#[pyclass(name = "Task", from_py_object)]
 #[derive(Clone)]
 pub struct PyTask {
     #[pyo3(get)]
@@ -509,7 +511,7 @@ impl PyTask {
 }
 
 /// Typed tasks adapter handle.
-#[pyclass(name = "TasksAdapter")]
+#[pyclass(name = "TasksAdapter", from_py_object)]
 #[derive(Clone)]
 pub struct PyTasksAdapter {
     inner: Arc<InnerTasksAdapter>,
@@ -924,7 +926,7 @@ impl PyTaskWatchIter {
 // =========================================================================
 
 /// A materialized memory record.
-#[pyclass(name = "Memory")]
+#[pyclass(name = "Memory", from_py_object)]
 #[derive(Clone)]
 pub struct PyMemory {
     #[pyo3(get)]
@@ -974,7 +976,7 @@ impl PyMemory {
 }
 
 /// Typed memories adapter handle.
-#[pyclass(name = "MemoriesAdapter")]
+#[pyclass(name = "MemoriesAdapter", from_py_object)]
 #[derive(Clone)]
 pub struct PyMemoriesAdapter {
     inner: Arc<InnerMemoriesAdapter>,

@@ -170,7 +170,7 @@ fn migration_phase_str(phase: CoreMigrationPhase) -> &'static str {
 /// Field shape matches `net::adapter::net::state::causal::CausalEvent`.
 /// The 64-bit `sequence` is exposed as a Python `int` — Python
 /// integers are unbounded so no precision concerns.
-#[pyclass(name = "CausalEvent", module = "net._net")]
+#[pyclass(name = "CausalEvent", module = "net._net", from_py_object)]
 #[derive(Clone)]
 pub struct PyCausalEvent {
     /// 32-bit hash of the emitting entity.
@@ -1030,7 +1030,7 @@ impl MeshDaemon for PyDaemonBridge {
 /// Accepts any iterable whose elements convert to `bytes`.
 fn parse_output_list(obj: &Bound<'_, PyAny>) -> std::result::Result<Vec<Bytes>, CoreDaemonError> {
     // Common case: list of bytes.
-    if let Ok(list) = obj.downcast::<PyList>() {
+    if let Ok(list) = obj.cast::<PyList>() {
         let mut out = Vec::with_capacity(list.len());
         for item in list.iter() {
             let v: Vec<u8> = item.extract().map_err(|e| {

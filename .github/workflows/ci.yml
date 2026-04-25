@@ -241,6 +241,70 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-features --all-targets -- -D warnings
 
+  # The `clippy` job above lints only the root `net` package — `cargo
+  # clippy` without `--workspace` doesn't traverse workspace members,
+  # and the bindings each need a different feature combination so a
+  # single `--workspace --all-features` invocation isn't workable
+  # either (the Python and Node bindings carry build-tool-specific
+  # default features that conflict in CI). This matrix lints each
+  # FFI / SDK crate with the same feature flags its build / test job
+  # uses, so a clippy regression in any binding fails CI before it
+  # lands.
+  ffi-clippy:
+    name: FFI clippy (${{ matrix.crate.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - name: rust-sdk
+            path: net/crates/net/sdk
+            # `full` enables every SDK feature flag (net, cortex,
+            # compute, groups, redis, jetstream). Mirrors the
+            # `rust-sdk-tests` job's surface plus the optional
+            # adapter features.
+            features: --features full
+          - name: node
+            path: net/crates/net/bindings/node
+            # Mirrors the `node-tests` napi build (no redis default,
+            # plus `test-helpers` so the test-only FFI symbols are
+            # included in the lint set).
+            features: --no-default-features --features net,cortex,compute,groups,test-helpers
+          - name: python
+            path: net/crates/net/bindings/python
+            # Mirrors the `python-tests` `maturin develop` invocation.
+            features: --no-default-features --features net,cortex,compute,groups
+          - name: go-compute-ffi
+            path: net/crates/net/bindings/go/compute-ffi
+            # Default features only — the cdylib production build
+            # ships without `test-helpers`, and that is the surface
+            # we want CI to enforce against. The `test-helpers`
+            # symbols are exercised by the `go test` suite, not by
+            # consumers.
+            features: ""
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            net/crates/net/target/
+          key: ${{ runner.os }}-cargo-clippy-ffi-${{ matrix.crate.name }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run clippy
+        working-directory: ${{ matrix.crate.path }}
+        run: cargo clippy ${{ matrix.crate.features }} --all-targets -- -D warnings
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

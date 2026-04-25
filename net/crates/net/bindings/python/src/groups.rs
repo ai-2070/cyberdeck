@@ -28,7 +28,6 @@
 
 use std::sync::Arc;
 
-use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -198,7 +197,6 @@ fn fork_record_to_dict<'py>(py: Python<'py>, r: &SdkForkRecord) -> PyResult<Boun
 #[pyclass(name = "ReplicaGroup", module = "net._net")]
 pub struct PyReplicaGroup {
     inner: Arc<SdkReplicaGroup>,
-    kind: String,
 }
 
 #[pymethods]
@@ -241,7 +239,6 @@ impl PyReplicaGroup {
         let group = SdkReplicaGroup::spawn(runtime.sdk_runtime(), &kind, cfg).map_err(group_err)?;
         Ok(PyReplicaGroup {
             inner: Arc::new(group),
-            kind,
         })
     }
 
@@ -320,7 +317,6 @@ impl PyReplicaGroup {
 #[pyclass(name = "ForkGroup", module = "net._net")]
 pub struct PyForkGroup {
     inner: Arc<SdkForkGroup>,
-    kind: String,
 }
 
 #[pymethods]
@@ -346,7 +342,6 @@ impl PyForkGroup {
             .map_err(group_err)?;
         Ok(PyForkGroup {
             inner: Arc::new(group),
-            kind,
         })
     }
 
@@ -435,7 +430,6 @@ impl PyForkGroup {
 #[pyclass(name = "StandbyGroup", module = "net._net")]
 pub struct PyStandbyGroup {
     inner: Arc<SdkStandbyGroup>,
-    kind: String,
 }
 
 #[pymethods]
@@ -459,7 +453,6 @@ impl PyStandbyGroup {
         let group = SdkStandbyGroup::spawn(runtime.sdk_runtime(), &kind, cfg).map_err(group_err)?;
         Ok(PyStandbyGroup {
             inner: Arc::new(group),
-            kind,
         })
     }
 
