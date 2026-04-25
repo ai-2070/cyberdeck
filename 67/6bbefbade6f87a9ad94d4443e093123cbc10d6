@@ -1,0 +1,23 @@
+net/crates/net/README.md
+  6c621f380b22d6a6 523,526,537,544-547,551,553,575,592-593,608-620,632-634,650,660
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "676bbefbade6f87a9ad94d4443e093123cbc10d6",
+  "prompts": {
+    "6c621f380b22d6a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cee8fef5-fb34-4a15-83fb-6ade7934a6c7",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 30,
+      "total_deletions": 3,
+      "accepted_lines": 30,
+      "overriden_lines": 0
+    }
+  }
+}
