@@ -468,7 +468,7 @@ type ScopeFilter =
   | { kind: 'region'; region: string }
   | { kind: 'regions'; regions: string[] };
 
-const peers = await mesh.findPeersScoped(
+const peers = await mesh.findNodesScoped(
   { tags: ['model:llama3-70b'] },
   { kind: 'tenant', tenant: 'oem-123' },
 );
@@ -609,7 +609,7 @@ mesh.announce_capabilities(caps).await?;
 
 Deck:
 ```ts
-const peers = await mesh.findPeersScoped(
+const peers = await mesh.findNodesScoped(
   { tags: ['software:'] },           // prefix-matching filter
   { kind: 'sameSubnet' },
 );

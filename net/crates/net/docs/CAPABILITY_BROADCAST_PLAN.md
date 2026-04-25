@@ -373,7 +373,7 @@ Extend `MeshNode`:
 
 ```ts
 async announceCapabilities(caps: CapabilitySet): Promise<void>;
-findPeers(filter: CapabilityFilter): PeerMatch[];
+findNodes(filter: CapabilityFilter): PeerMatch[];
 ```
 
 Camel-case conversion is explicit in the wrapper (no reflection), so
@@ -388,8 +388,8 @@ are a single logical unit (don't merge C-1 without C-2).
 |---|---|---|
 | **C-1** | Core: subprotocol, receiver dispatch, index on MeshNode, GC task, `announce_capabilities_with` + `find_nodes_by_filter` on `MeshNode`. Rust integration test (two in-process mesh nodes). | 2 |
 | **C-2** | Rust SDK: thin `Mesh::announce_capabilities` / `find_nodes` wrappers + doctest. | 0.5 |
-| **C-3** | NAPI: POJOs, conversions, `NetMesh.announceCapabilities` / `findPeers`, `capabilities` feature flag, smoke test. | 1 |
-| **C-4** | TS SDK: interfaces, `MeshNode.announceCapabilities` / `findPeers`, `sdk-ts/src/capabilities.ts`, two-node TS test. | 1 |
+| **C-3** | NAPI: POJOs, conversions, `NetMesh.announceCapabilities` / `findNodes`, `capabilities` feature flag, smoke test. | 1 |
+| **C-4** | TS SDK: interfaces, `MeshNode.announceCapabilities` / `findNodes`, `sdk-ts/src/capabilities.ts`, two-node TS test. | 1 |
 | **C-5** | TTL expiry test (Rust + TS), signature-present path regression, README Security section expansion, docs cross-link from `SDK_SECURITY_SURFACE_PLAN.md`. | 0.5 |
 
 **Total: ~5 days** — ~1.5× the original Stage C estimate, which is
@@ -466,7 +466,7 @@ from `channels.test.ts`, plus TTL expiry.
 | `bindings/node/src/capabilities.rs` (new) | POJOs + conversions |
 | `bindings/node/src/lib.rs` | declare the module, add methods on `NetMesh` |
 | `sdk-ts/src/capabilities.ts` (new) | interfaces + conversion helpers |
-| `sdk-ts/src/mesh.ts` | `MeshNode.announceCapabilities` / `findPeers` |
+| `sdk-ts/src/mesh.ts` | `MeshNode.announceCapabilities` / `findNodes` |
 | `sdk-ts/src/index.ts` | export new types |
 | `sdk-ts/test/capabilities.test.ts` (new) | two-node + TTL tests |
 

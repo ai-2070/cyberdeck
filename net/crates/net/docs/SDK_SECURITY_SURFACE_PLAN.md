@@ -416,13 +416,13 @@ export interface CapabilityFilter {
 
 // on MeshNode
 async announceCapabilities(caps: CapabilitySet): Promise<void>;
-findPeers(filter: CapabilityFilter): Array<{ nodeId: bigint; score: number }>;
+findNodes(filter: CapabilityFilter): Array<{ nodeId: bigint; score: number }>;
 ```
 
 ### Exit criteria
 
-- Two-node test: A announces `{tags:["gpu","inference"]}`, B's `findPeers({requireTags:["gpu"]})` returns A.
-- Announcement TTL expiry: advance mock clock past TTL → `findPeers` no longer returns A until re-announce.
+- Two-node test: A announces `{tags:["gpu","inference"]}`, B's `findNodes({requireTags:["gpu"]})` returns A.
+- Announcement TTL expiry: advance mock clock past TTL → `findNodes` no longer returns A until re-announce.
 
 ---
 
@@ -825,7 +825,7 @@ wire format + signature invariance across hop bumps.
 ### Stage C (TS capabilities)
 - `net/crates/net/bindings/node/src/capabilities.rs` (new).
 - `net/crates/net/sdk-ts/src/capabilities.ts` (new).
-- `net/crates/net/sdk-ts/src/mesh.ts` — add `announceCapabilities`, `findPeers`.
+- `net/crates/net/sdk-ts/src/mesh.ts` — add `announceCapabilities`, `findNodes`.
 
 ### Stage D (TS subnets)
 - `net/crates/net/sdk-ts/src/mesh.ts` — extend `MeshConfig` with `subnet` / `subnetPolicy`.
@@ -859,7 +859,7 @@ wire format + signature invariance across hop bumps.
 
 ### Performance
 
-- **`find_nodes` cost.** `CapabilityIndex::query` is DashMap lookups; fast. But returning `Vec<(u64, f64)>` for a large filter match on a large mesh could be big. Add an implicit limit (top 100 by score) in the SDK and expose `findPeersLimit` for the rare caller who wants more.
+- **`find_nodes` cost.** `CapabilityIndex::query` is DashMap lookups; fast. But returning `Vec<(u64, f64)>` for a large filter match on a large mesh could be big. Add an implicit limit (top 100 by score) in the SDK and expose `findNodesLimit` for the rare caller who wants more.
 - **Token cache size.** `TokenCache` is unbounded today (expired entries evicted on access). For long-lived nodes with many delegations this could grow. Add a soft cap (e.g., 10_000 entries) in the SDK `Identity` wrapper; evict LRU when over cap. Not a core-crate change.
 - **Signing on the hot path.** `announceCapabilities` signs. If a user hammers it (bad idea), they pay ~70µs per call. Document as "call on state change, not in a tight loop."
 

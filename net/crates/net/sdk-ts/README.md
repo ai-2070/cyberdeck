@@ -271,7 +271,7 @@ so `try/catch` + `instanceof` work as expected.
 
 `mesh.announceCapabilities(caps)` broadcasts a `CapabilitySet` to
 every directly-connected peer and self-indexes locally.
-`mesh.findPeers(filter)` queries the local index — results include
+`mesh.findNodes(filter)` queries the local index — results include
 this node's own id when self matches.
 
 ```typescript
@@ -294,7 +294,7 @@ await mesh.announceCapabilities({
   tags: ['gpu', 'prod'],
 });
 
-const gpuPeers = mesh.findPeers({
+const gpuPeers = mesh.findNodes({
   requireGpu: true,
   gpuVendor: 'nvidia',
   minVramMb: 40_000,
