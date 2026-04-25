@@ -1114,18 +1114,6 @@ impl CapabilityFilter {
 
         true
     }
-
-    /// True if the filter has any predicate that the inverted indexes
-    /// (tags / models / tools / GPU / vendor) cannot satisfy on their
-    /// own. When this returns `false`, [`CapabilityIndex::query`]
-    /// can trust the index intersection as authoritative and skip
-    /// the per-candidate `nodes` lookup + full re-check.
-    fn needs_full_check(&self) -> bool {
-        self.min_memory_mb.is_some()
-            || self.min_vram_mb.is_some()
-            || self.min_context_length.is_some()
-            || !self.require_modalities.is_empty()
-    }
 }
 
 // ============================================================================
@@ -1596,11 +1584,11 @@ impl CapabilityIndex {
             .filter_map(|node_id| {
                 let node = self.nodes.get(&node_id)?;
                 // Always re-check the filter under the current
-                // capabilities, not just when `needs_full_check()` is
-                // true: the inverted indexes update non-atomically with
-                // `nodes`, so a stale index can otherwise advance a
-                // candidate that no longer matches the filter into the
-                // scoring step. See `query()` for the same fix.
+                // capabilities — the inverted indexes update
+                // non-atomically with `nodes`, so a stale index can
+                // otherwise advance a candidate that no longer
+                // matches the filter into the scoring step. See
+                // `query()` for the same fix.
                 if !req.filter.matches(&node.capabilities) {
                     return None;
                 }
@@ -2452,21 +2440,15 @@ mod tests {
         );
     }
 
-    /// `query()` has two paths after the index intersection: a fast
-    /// path that trusts the indexes when the filter constrains only
-    /// indexed dimensions, and a slow path that re-applies
-    /// `filter.matches()` per candidate when non-indexed predicates
-    /// are set. The two must produce identical results for any
-    /// filter with no truly-non-indexed predicates.
-    ///
-    /// We force the slow path by adding `min_memory_mb = 0` — an
-    /// always-true predicate (memory_mb is unsigned, so the
-    /// `memory_mb < 0` check can never fire) that nonetheless makes
-    /// `needs_full_check()` return true. If a future change to
-    /// `needs_full_check()` ever omits a non-indexed field, this
-    /// test catches it: the fast and slow paths would diverge.
+    /// `query()` re-checks `filter.matches()` per candidate against
+    /// the live `nodes` entry, so a filter with an always-true
+    /// non-indexed predicate (e.g., `min_memory_mb = 0`) must produce
+    /// the same result as the equivalent indexed-only filter. This
+    /// pins the equivalence under semantically-redundant predicate
+    /// expansions and would catch a future regression that special-
+    /// cased the index-only path again without re-running matches().
     #[test]
-    fn query_fast_path_matches_slow_path_for_indexed_only_filter() {
+    fn query_indexed_only_matches_with_redundant_non_indexed_predicate() {
         let index = CapabilityIndex::new();
 
         for i in 0..30u64 {
@@ -2483,36 +2465,23 @@ mod tests {
             index.index(ann);
         }
 
-        // Indexed-only filter — exercises the fast path.
         let indexed_only = CapabilityFilter::new()
             .require_tag("even")
             .require_tag("inference");
-        // Same predicates plus an always-true non-indexed predicate to
-        // force the slow path.
-        let mut force_slow = indexed_only.clone();
-        force_slow.min_memory_mb = Some(0);
+        // Same predicates plus an always-true non-indexed predicate.
+        // `memory_mb` is unsigned so `>= 0` is trivially true.
+        let mut with_non_indexed = indexed_only.clone();
+        with_non_indexed.min_memory_mb = Some(0);
 
-        assert!(
-            !indexed_only.needs_full_check(),
-            "filter with only tags must take the fast path"
-        );
-        assert!(
-            force_slow.needs_full_check(),
-            "filter with min_memory_mb must take the slow path"
-        );
-
-        let mut fast: Vec<u64> = index.query(&indexed_only);
-        let mut slow: Vec<u64> = index.query(&force_slow);
-        fast.sort();
-        slow.sort();
+        let mut a: Vec<u64> = index.query(&indexed_only);
+        let mut b: Vec<u64> = index.query(&with_non_indexed);
+        a.sort();
+        b.sort();
         assert_eq!(
-            fast, slow,
-            "fast path and slow path must agree when filters are equivalent"
+            a, b,
+            "adding an always-true predicate must not change the result set"
         );
-        assert!(
-            !fast.is_empty(),
-            "sample data must produce non-empty results"
-        );
+        assert!(!a.is_empty(), "sample data must produce non-empty results");
     }
 
     /// After the `find_best()` refactor that folds the index lookup
