@@ -48,7 +48,7 @@ tags simultaneously (e.g. a GPU shared between two tenants).
 `scope:subnet-local` is mutually exclusive with the others —
 when present, it wins (see `scope_from_tags` below).
 
-**Enforcement happens at `find_nodes_scoped` / `find_best_scoped`,
+**Enforcement happens at `find_nodes_scoped` / `find_best_node_scoped`,
 not on the wire.** The announcement still gossips permissively;
 the *consumer* of the index does the filter. This is a
 deliberate cut: it's enough for tenant- / subnet- / region-aware
@@ -117,12 +117,12 @@ For now, tag-based discovery scope is enough.
   file, exported from the crate.
 - `CapabilityIndex::find_nodes_scoped(filter, scope_filter,
   my_node_id) -> Vec<u64>`.
-- `CapabilityIndex::find_best_scoped(req, scope_filter,
+- `CapabilityIndex::find_best_node_scoped(req, scope_filter,
   my_node_id) -> Option<u64>`.
 - `MeshNode::find_nodes_by_filter_scoped` /
-  `find_best_capability_scoped` pass-throughs.
+  `find_best_node_scoped` pass-throughs.
 - SDK surface (`Mesh::find_nodes_scoped`,
-  `Mesh::find_best_scoped`) in Rust + Node + Python.
+  `Mesh::find_best_node_scoped`) in Rust + Node + Python.
 - Reserved-tag string contract documented in `BEHAVIOR.md` and
   `CHANNELS.md` cross-references.
 - 6 unit tests in `behavior/capability.rs` + 1 integration
@@ -360,7 +360,7 @@ impl CapabilityIndex {
     }
 
     /// Scoped variant of [`Self::find_best`].
-    pub fn find_best_scoped(
+    pub fn find_best_node_scoped(
         &self,
         req: &CapabilityRequirement,
         scope_filter: &ScopeFilter<'_>,
@@ -397,14 +397,14 @@ impl MeshNode {
         })
     }
 
-    pub fn find_best_scoped(
+    pub fn find_best_node_scoped(
         &self,
         req: &CapabilityRequirement,
         scope: &ScopeFilter<'_>,
     ) -> Option<u64> {
         let my_subnet = self.local_subnet;
         let peer_subnets = self.peer_subnets.clone();
-        self.capability_index.find_best_scoped(req, scope, |nid| {
+        self.capability_index.find_best_node_scoped(req, scope, |nid| {
             match peer_subnets.get(&nid).map(|e| *e.value()) {
                 Some(s) => s == my_subnet,
                 None => true,
@@ -452,7 +452,7 @@ silently dropped by `scope_from_tags` (defensive).
 
 - Re-export `ScopeFilter` from `net::adapter::net::behavior::capability`.
 - `Mesh::find_nodes_scoped(filter, scope) -> Vec<u64>`.
-- `Mesh::find_best_scoped(req, scope) -> Option<u64>`.
+- `Mesh::find_best_node_scoped(req, scope) -> Option<u64>`.
 - Convenience: `CapabilitySetBuilder::tenant(t)`, `region(r)`,
   `subnet_local()`.
 
@@ -536,7 +536,7 @@ core + 1 day for SDK surface.
 
 `src/adapter/net/behavior/capability.rs` (~40 lines):
 
-- `CapabilityIndex::find_nodes_scoped` and `find_best_scoped`.
+- `CapabilityIndex::find_nodes_scoped` and `find_best_node_scoped`.
 - Bench target: scoped query overhead < 5% over non-scoped on a
   10k-node index — measured by adding a benchmark next to the
   existing `bench_capability_query`.
@@ -545,7 +545,7 @@ core + 1 day for SDK surface.
 
 `src/adapter/net/mesh.rs` (~30 lines):
 
-- `find_nodes_scoped` and `find_best_scoped` methods that close
+- `find_nodes_scoped` and `find_best_node_scoped` methods that close
   over `local_subnet` + `peer_subnets`.
 - Test 7.
 
@@ -627,7 +627,7 @@ mesh.announce_capabilities(caps).await?;
 
 NAT traversal selection:
 ```rust
-let relay = mesh.find_best_scoped(
+let relay = mesh.find_best_node_scoped(
     &CapabilityRequirement::new(CapabilityFilter::new().require_tag("relay-capable")),
     &ScopeFilter::Region("eu-west"),
 ).or_else(|| {
