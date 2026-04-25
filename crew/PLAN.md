@@ -143,6 +143,7 @@ crew/
   - Fixer's `talk_to` covers everyone in its `delegate_to`.
   - Returns `{ errors, warnings }`. Errors block runtime; warnings surface to the caller.
 - Optional per-role `input_schema` / `output_schema` (Zod schemas). When present, the session validates I/O at the role boundary.
+- Extend `activation` beyond the boilerplate: `{ on_fault?: boolean; on_stall?: boolean; on_timeout?: boolean; on_permission_denied?: boolean }`. Each flag routes the corresponding event to the fixer when set.
 - `permissions.invite` is **accepted** by the schema (so existing shapes parse) but **never honored** in v1 — invitations belong to the v2 dynamic-crew plan.
 
 Deliverable: `parse + lintCrewShape + buildCrewGraph` against the `DEFAULT_CREW` example.
@@ -156,7 +157,22 @@ type CrewEvent =
   // ─── outbound (session-emitted) ───
   | { type: "crew.started"; crewId: string; rootInput: unknown; ts: number }
   | { type: "role.entered"; roleId: string; ts: number }
-  | { type: "agent.step.requested"; correlationId: string; agentId: string; roleId: string; input: unknown; timeoutMs?: number; ts: number }
+  | {
+      type: "agent.step.requested";
+      correlationId: string;
+      agentId: string;
+      roleId: string;
+      input: unknown;
+      memex_context?: unknown;            // sampled per request — see Phase 3 phase→phase flow
+      role: {                              // self-contained snapshot — workers don't load shape out-of-band
+        name: string;
+        description?: string;
+        capabilities?: { model?: string; tools?: string[]; thinking_allowed?: boolean };
+        permissions: { talk_to: string[]; delegate_to: string[]; escalate_to: string[] };
+      };
+      timeoutMs?: number;
+      ts: number;
+    }
   | { type: "fixer.invoked"; agentId: string; reason: "fault" | "stall" | "timeout" | "permission_denied"; ts: number }
   | { type: "permission.denied"; from: string; to: string; action: "talk_to" | "delegate_to" | "escalate_to"; ts: number }
   | { type: "vote.resolved"; roleId: string; mode: VotingMode; resolved: unknown; ts: number }
@@ -173,11 +189,12 @@ type CrewEvent =
   | { type: "agent.stream.chunk"; correlationId: string; chunk: unknown; ts: number }; // pass-through, non-state-advancing
 ```
 
-Three things this phase pins down:
+Four things this phase pins down:
 
 - **Canonical JSON.** Ship `canonicalize(value)` (sorted keys, normalized number forms). Used wherever events or outputs are hashed or compared. Stock `JSON.stringify` is not stable across object key order.
 - **Correlation ids.** Each `agent.step.requested` carries `correlationId = hash(crewId, roleId, agentId, attempt)`. Inbound events match by id. Determinism + parallelism = inbound order doesn't matter.
-- **Idempotency on resume.** If the log has `agent.step.requested` with no matching `completed` / `failed` / `timed_out`, resume consults `ResumePolicy` (`"re-emit-request" | "treat-as-failed" | "abort"`, caller-supplied). Default `"abort"`.
+- **Idempotency on duplicate `deliver`.** Buses retry. The session tracks per-`correlationId` terminal status. The first terminal event (`completed` / `failed` / `timed_out`) wins; subsequent terminal events for the same id are no-ops returning `[]`. Stream chunks always append (duplicates produce duplicate chunks, harmless).
+- **Idempotency on resume.** If the log has `agent.step.requested` with no matching terminal event, resume consults `ResumePolicy` (`"re-emit-request" | "treat-as-failed" | "abort"`, caller-supplied). Default `"abort"`.
 
 ### Phase 3 — Session state machine
 
@@ -206,10 +223,14 @@ Mechanics:
 2. **`deliver(event)`** matches by `correlationId`. Advances when all in-flight requests for the current phase have resolved (`completed` / `failed` / `timed_out`).
 3. **`tick(now)`** is the timeout cranks. For every in-flight request whose `requested.ts + timeoutMs ≤ now`, emit `agent.step.timed_out` and treat as a fault. Caller is responsible for calling `tick()` periodically (or wiring it to a real `setTimeout`); a deterministic test can call `tick(t)` with synthetic times.
 4. **`cancel(reason)`** drains the queue, emits `crew.aborted`, transitions to `aborted`. In-flight workers are expected to observe `crew.aborted` on the bus and stop. The library does not cancel them — that's bus territory.
-5. **Permission enforcement.** Hooks call `crewControl.requestAction({ from, to, action })`. The machine consults the source role's `permissions`; on disallow, emits `permission.denied` and returns `false`. `fixer.activation.on_permission_denied` (new) can route to fixer.
+5. **Permission enforcement (ACL gates only).** `talk_to` / `delegate_to` / `escalate_to` are validated, not orchestrated. The library does not spawn delegated steps, route messages, or create subflows. Hooks/workers call `crewControl.requestAction({ from, to, action })`; the machine consults the source role's `permissions`, emits `permission.denied` if disallowed, and returns `false` to the caller. The actual delegation/messaging is the worker's or hook's job — outside the library. (Dynamic auto-delegation is v2.)
 6. **Parallelism.** All agents in a role emit `agent.step.requested` simultaneously. Machine waits for all to resolve before voting. Outputs sorted by `agentId` before voting (determinism). Roles can opt into serial with `execution.serial: true`.
 7. **Nested crews.** When an agent has a `nestedCrew`, the machine instantiates an inner `CrewSession`, prefixes correlation ids (`{outer}/{inner}`), and proxies events. Inner `crew.completed.finalOutput` becomes the outer agent's step output.
-8. **Fixer activation.** `fault` / `stalled` / `timed_out` / `permission_denied` route to fixer if the corresponding `activation.*` is set. Fixer is itself an agent step (its own `agent.step.requested` / `completed`), so activation is just another bus round-trip.
+8. **Fixer activation.** `fault` / `stalled` / `timed_out` / `permission_denied` route to fixer if the corresponding `activation.*` flag is set on the fixer role. Fixer is itself an agent step (its own `agent.step.requested` / `completed`), so activation is just another bus round-trip.
+9. **Hooks are synchronous.** `HookRegistry` callbacks return `void`, never `Promise<void>`. The library does not `await` hooks. If a hook needs async work, it fires it off out-of-band — it cannot delay or reorder the event burst returned from `start` / `deliver` / `tick`. Preserves the `(events in) → (events out)` contract and replay determinism.
+10. **`tick()` is caller-driven.** Timeouts only fire when `session.tick(now)` is called. The library never calls `setTimeout` or `Date.now()` itself. Callers must either schedule `tick(Date.now())` periodically (e.g., `setInterval`) or drive it deterministically in tests. **A session whose worker is stuck will hang silently if `tick` is never called.** Document this in the README and the `Clock` docs.
+
+**Phase → phase data flow.** Phase N produces a single resolved output via `vote.resolved`; that becomes Phase N+1's `input`. Memex context is sampled fresh on every `agent.step.requested` (per role's `execution.memex` config) — memory grows during the run, later roles see updates from earlier ones. Roles can opt out of retrieval with `execution.memex.enabled: false`.
 
 ### Phase 4 — MemEX adapter
 
@@ -260,6 +281,10 @@ Maps directly onto `memex/API.md` §"Multi-Agent Memory Segmentation" — no new
 
 **Hard isolation for nested crews.** A role can declare `memex.isolation: "soft" | "hard"`. `"hard"` calls `exportSlice` before the nested session starts and `importSlice` on completion (`memex/API.md` §"Hard isolation via transplant"). `"soft"` (default) shares the adapter.
 
+**Adapter is session-scoped.** Don't share one `MemexAdapter` instance across concurrent crew sessions. The caller passes a fresh adapter (or factory) per `createCrewSession`. If shared global memory is desired, that's the adapter's internal wiring — not literal instance reuse. Documented contract: adapters hold mutable session state.
+
+**Hooks don't write MemEX.** Only agent steps emit `MemoryCommand[]`. Hooks are observability: they see events, log/metric/trace, but cannot mutate MemEX through the library. If a hook needs to write, the caller wires it to its own MemEX handle out-of-band. (We can add `crewControl.recordMemex(...)` later if a concrete use case lands — routed through the same `memex.command.emitted` event for replay.)
+
 ### Phase 5 — Checkpointing
 
 Snapshot = `{ session machine state, internal log offset, memex GraphState (via toJSON), timestamp, schema_version: "1.0" }`. Triggered:
@@ -272,15 +297,21 @@ Snapshot = `{ session machine state, internal log offset, memex GraphState (via 
 
 ### Phase 6 — Voting / resolution (later, but stub now)
 
-Ship `first_valid` working. `unanimous`, `majority`, `weighted_consensus`, `best_of_n` are accepted by the schema; the resolver throws `NotImplementedError`. Wire `weighted_consensus` first since the example shape uses it. Vote dedup uses `canonicalize` from Phase 2.
+Ship `first_valid` and `majority` working in v1 (majority dedups outputs via `canonicalize` from Phase 2). `unanimous`, `weighted_consensus`, `best_of_n` are accepted by the schema; the resolver throws `NotImplementedError`. Wire `weighted_consensus` next since the example shape uses it.
 
 ## Decisions
 
 - **Zod v4** only. Locked.
 - **Schema version `1.0`**. No backcompat shims pre-1.0 release.
-- **`talk_to` / `delegate_to` / `escalate_to`** are enforced by the loop. See Phase 3 §5.
+- **`talk_to` / `delegate_to` / `escalate_to`** are ACL gates, not orchestration. Library validates and gates; actual delegation/messaging is the worker's or hook's job. See Phase 3 §5.
 - **Streaming agent outputs** are bus events. The library emits `agent.step.requested`, observes `agent.stream.chunk` passthroughs, advances on `agent.step.completed`.
+- **`agent.step.requested` is self-contained.** Carries a role snapshot (capabilities + permissions); workers don't need to load the shape out-of-band.
+- **Hooks are sync.** No `Promise<void>`, no awaits inside the library. Async hook work happens out-of-band.
+- **`tick()` is caller-driven.** Library never schedules its own timers. Without `tick`, timeouts never fire.
+- **Duplicate terminal `deliver` is a no-op.** First `completed` / `failed` / `timed_out` per `correlationId` wins. Stream chunks always append.
 - **Per-agent scoped memory** is the default (Phase 4).
+- **MemEX adapter is session-scoped.** Don't share a single instance across concurrent sessions.
+- **Hooks don't write MemEX.** Observability only in v1.
 - **Crew id** is caller-injected. The library does not generate it — too easy to leak nondeterminism.
 - **Phase order** is declaration order minus `first_input` / `final_output`.
 - **Cost tracking is out of scope.** No usage/cost fields, no budget aborts. Wall-clock timeouts only.
