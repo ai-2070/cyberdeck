@@ -1,0 +1,23 @@
+net/crates/net/tests/integration_redex.rs
+  87bb90c35fad4179 452-460,478-481,494-496,498,522-529,550-553,555-557,561,587-589,591
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "099d49212c40a4bed830a0fbe7c6a04cb3bdf67a",
+  "prompts": {
+    "87bb90c35fad4179": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6cc25025-bc7f-4f77-9983-0178e2603a6e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1088,
+      "total_deletions": 1058,
+      "accepted_lines": 37,
+      "overriden_lines": 0
+    }
+  }
+}
