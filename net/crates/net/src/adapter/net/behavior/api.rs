@@ -1434,6 +1434,19 @@ pub struct ApiRegistry {
     max_capacity: Option<usize>,
 }
 
+/// Extract the leading path prefix used as the `by_endpoint` index
+/// key. Slices up to (but not including) the second `/` so the
+/// computation matches between `add_to_indexes` and
+/// `remove_from_indexes` without allocating an intermediate
+/// `Vec<&str>` for the split + join. Equivalent to the previous
+/// `path.split('/').take(2).collect::<Vec<_>>().join("/")`.
+fn endpoint_prefix(path: &str) -> String {
+    match path.match_indices('/').nth(1) {
+        Some((idx, _)) => path[..idx].to_string(),
+        None => path.to_string(),
+    }
+}
+
 impl ApiRegistry {
     /// Create a new registry
     pub fn new() -> Self {
@@ -1675,14 +1688,9 @@ impl ApiRegistry {
                 self.by_tag.entry(tag.clone()).or_default().insert(node_id);
             }
 
-            // Endpoint index (simplified - just uses path prefix)
+            // Endpoint index (simplified - just uses path prefix).
             for endpoint in &schema.endpoints {
-                let prefix = endpoint
-                    .path
-                    .split('/')
-                    .take(2)
-                    .collect::<Vec<_>>()
-                    .join("/");
+                let prefix = endpoint_prefix(&endpoint.path);
                 self.by_endpoint.entry(prefix).or_default().insert(node_id);
             }
         }
@@ -1704,12 +1712,7 @@ impl ApiRegistry {
             }
 
             for endpoint in &schema.endpoints {
-                let prefix = endpoint
-                    .path
-                    .split('/')
-                    .take(2)
-                    .collect::<Vec<_>>()
-                    .join("/");
+                let prefix = endpoint_prefix(&endpoint.path);
                 if let Some(mut set) = self.by_endpoint.get_mut(&prefix) {
                     set.remove(&node_id);
                 }

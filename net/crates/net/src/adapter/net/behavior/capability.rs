@@ -1461,45 +1461,50 @@ impl CapabilityIndex {
         }
     }
 
-    /// Query nodes by filter
-    pub fn query(&self, filter: &CapabilityFilter) -> Vec<u64> {
-        self.query_count.fetch_add(1, Ordering::Relaxed);
-
-        // Start with candidate set
+    /// Walk the inverted indexes to build the candidate set narrowed
+    /// by `filter`'s indexed predicates (GPU, vendor, tags, models,
+    /// tools). Returns:
+    ///
+    /// - `Some(set)` when at least one indexed predicate applied. The
+    ///   set may be empty, in which case downstream filtering trivially
+    ///   yields no results.
+    /// - `None` when the filter has zero indexed predicates — callers
+    ///   fall back to "all nodes" before applying any non-indexed
+    ///   predicates.
+    fn build_candidate_set(&self, filter: &CapabilityFilter) -> Option<HashSet<u64>> {
         let mut candidates: Option<HashSet<u64>> = None;
-
-        // Use inverted indexes to narrow down candidates
 
         // GPU filter (most selective often)
         if filter.require_gpu {
-            if let Some(gpu_nodes) = self.gpu_nodes.get(&true) {
-                candidates = Some(gpu_nodes.clone());
-            } else {
-                return Vec::new();
+            match self.gpu_nodes.get(&true) {
+                Some(gpu_nodes) => candidates = Some(gpu_nodes.clone()),
+                None => return Some(HashSet::new()),
             }
         }
 
         // GPU vendor filter
         if let Some(vendor) = filter.gpu_vendor {
-            if let Some(vendor_nodes) = self.by_gpu_vendor.get(&vendor) {
-                candidates = Some(match candidates {
-                    Some(c) => c.intersection(&vendor_nodes).copied().collect(),
-                    None => vendor_nodes.clone(),
-                });
-            } else {
-                return Vec::new();
+            match self.by_gpu_vendor.get(&vendor) {
+                Some(vendor_nodes) => {
+                    candidates = Some(match candidates {
+                        Some(c) => c.intersection(&vendor_nodes).copied().collect(),
+                        None => vendor_nodes.clone(),
+                    });
+                }
+                None => return Some(HashSet::new()),
             }
         }
 
         // Tag filter (all required)
         for tag in &filter.require_tags {
-            if let Some(tag_nodes) = self.by_tag.get(tag) {
-                candidates = Some(match candidates {
-                    Some(c) => c.intersection(&tag_nodes).copied().collect(),
-                    None => tag_nodes.clone(),
-                });
-            } else {
-                return Vec::new();
+            match self.by_tag.get(tag) {
+                Some(tag_nodes) => {
+                    candidates = Some(match candidates {
+                        Some(c) => c.intersection(&tag_nodes).copied().collect(),
+                        None => tag_nodes.clone(),
+                    });
+                }
+                None => return Some(HashSet::new()),
             }
         }
 
@@ -1512,7 +1517,7 @@ impl CapabilityIndex {
                 }
             }
             if model_candidates.is_empty() {
-                return Vec::new();
+                return Some(HashSet::new());
             }
             candidates = Some(match candidates {
                 Some(c) => c.intersection(&model_candidates).copied().collect(),
@@ -1529,7 +1534,7 @@ impl CapabilityIndex {
                 }
             }
             if tool_candidates.is_empty() {
-                return Vec::new();
+                return Some(HashSet::new());
             }
             candidates = Some(match candidates {
                 Some(c) => c.intersection(&tool_candidates).copied().collect(),
@@ -1537,9 +1542,16 @@ impl CapabilityIndex {
             });
         }
 
-        // If no indexed filters applied, start with all nodes
-        let candidates =
-            candidates.unwrap_or_else(|| self.nodes.iter().map(|r| *r.key()).collect());
+        candidates
+    }
+
+    /// Query nodes by filter
+    pub fn query(&self, filter: &CapabilityFilter) -> Vec<u64> {
+        self.query_count.fetch_add(1, Ordering::Relaxed);
+
+        let candidates = self
+            .build_candidate_set(filter)
+            .unwrap_or_else(|| self.nodes.iter().map(|r| *r.key()).collect());
 
         // Fast path: if the filter only constrains dimensions covered
         // by the inverted indexes, the intersection above is already
@@ -1568,16 +1580,31 @@ impl CapabilityIndex {
             .collect()
     }
 
-    /// Find best matching node using requirements
+    /// Find best matching node using requirements.
+    ///
+    /// Iterates the index-narrowed candidate set once, folding the
+    /// non-indexed-predicate check (when needed) and the score
+    /// computation into a single `nodes.get()` per candidate.
+    /// Previously this called [`Self::query`] and then re-fetched
+    /// each candidate again to score it — a double DashMap lookup
+    /// per candidate that has now collapsed to one.
     pub fn find_best(&self, req: &CapabilityRequirement) -> Option<u64> {
-        let candidates = self.query(&req.filter);
+        self.query_count.fetch_add(1, Ordering::Relaxed);
+
+        let candidates = self
+            .build_candidate_set(&req.filter)
+            .unwrap_or_else(|| self.nodes.iter().map(|r| *r.key()).collect());
+
+        let needs_full = req.filter.needs_full_check();
 
         candidates
             .into_iter()
             .filter_map(|node_id| {
-                self.nodes
-                    .get(&node_id)
-                    .map(|n| (node_id, req.score(&n.capabilities)))
+                let node = self.nodes.get(&node_id)?;
+                if needs_full && !req.filter.matches(&node.capabilities) {
+                    return None;
+                }
+                Some((node_id, req.score(&node.capabilities)))
             })
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(node_id, _)| node_id)
