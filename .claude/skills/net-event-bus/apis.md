@@ -223,6 +223,7 @@ Out-of-scope features (read these directly from source):
 
 - **Mesh transport configuration** (peer discovery, NAT traversal, port mapping, identity keys) — each SDK exposes mesh-specific kwargs. See SDK README's "Mesh" section.
 - **Subnets and capability tags** — set on node construction; affect channel visibility. See `net/README.md` § Subnets and Capabilities.
+- **Capability discovery** — `mesh.find_nodes(filter)` / `find_nodes_scoped(filter, scope)` / `find_best_node(req)` for picking the right peer by hardware/model/tag. Reserved `scope:tenant:*` / `scope:region:*` / `scope:subnet-local` tags narrow discovery to per-tenant or per-region pools without channel-level subnet routing.
 - **Permission tokens for channel auth** — see `net/README.md` § Security surface.
 - **RedEX / CortEX / NetDB** — separate APIs for persistence and queryable state. See `net/README.md` § RedEX and CortEX + NetDB.
 - **Mikoshi (live daemon migration)** — separate API for stateful event processors. See `net/README.md` § Daemons and Mikoshi.

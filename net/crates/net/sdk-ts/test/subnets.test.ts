@@ -125,8 +125,8 @@ describe('Subnet enforcement', () => {
     const cId = c.nodeId();
 
     const learned = await waitUntil(() => {
-      const bMatches = a.findPeers({ requireTags: ['fleet:blue'] }).includes(bId);
-      const cMatches = a.findPeers({ requireTags: ['fleet:green'] }).includes(cId);
+      const bMatches = a.findNodes({ requireTags: ['fleet:blue'] }).includes(bId);
+      const cMatches = a.findNodes({ requireTags: ['fleet:green'] }).includes(cId);
       return bMatches && cMatches;
     });
     expect(learned).toBe(true);
@@ -207,10 +207,10 @@ describe('Subnet enforcement', () => {
 
     const learned = await waitUntil(() => {
       const descMatches = a
-        .findPeers({ requireTags: ['fleet:blue'] })
+        .findNodes({ requireTags: ['fleet:blue'] })
         .includes(desc.nodeId());
       const sibMatches = a
-        .findPeers({ requireTags: ['fleet:green'] })
+        .findNodes({ requireTags: ['fleet:green'] })
         .includes(sibling.nodeId());
       return descMatches && sibMatches;
     });

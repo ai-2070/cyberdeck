@@ -1327,7 +1327,7 @@ struct ChannelConfigInput {
     max_rate_pps: Option<u32>,
     /// Capability filter restricting who may publish on this
     /// channel. Same POJO shape as `CapabilityFilter` (see
-    /// `net_mesh_find_peers`).
+    /// `net_mesh_find_nodes`).
     publish_caps: Option<CapabilityFilterJson>,
     /// Capability filter restricting who may subscribe. Subscribers
     /// whose announced caps miss this filter are rejected with
@@ -2106,7 +2106,7 @@ pub extern "C" fn net_channel_hash(channel: *const c_char, out_hash: *mut u16) -
 }
 
 // =========================================================================
-// Capabilities (announce / find_peers)
+// Capabilities (announce / find_nodes)
 // =========================================================================
 
 // Local alias to keep the capability helpers out of the mesh module's
@@ -2517,7 +2517,7 @@ fn capability_filter_from_json(f: CapabilityFilterJson) -> CapabilityFilter {
 pub(crate) const NET_ERR_CAPABILITY: c_int = -128;
 
 /// Announce this node's capabilities to every directly-connected
-/// peer. Also self-indexes, so `find_peers` on the same node matches
+/// peer. Also self-indexes, so `find_nodes` on the same node matches
 /// on the announcement. Multi-hop propagation is deferred.
 ///
 /// `caps_json` is the same POJO shape as PyO3 / NAPI:
@@ -2550,7 +2550,7 @@ pub extern "C" fn net_mesh_announce_capabilities(
 /// Query the local capability index. Writes a JSON array of node
 /// ids (u64) to `*out_json`; caller frees via `net_free_string`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_find_peers(
+pub extern "C" fn net_mesh_find_nodes(
     handle: *mut MeshNodeHandle,
     filter_json: *const c_char,
     out_json: *mut *mut c_char,
@@ -2568,8 +2568,321 @@ pub extern "C" fn net_mesh_find_peers(
         Err(_) => return NetError::InvalidJson.into(),
     };
     let filter = capability_filter_from_json(parsed);
-    let ids = h.inner.find_peers_by_filter(&filter);
+    let ids = h.inner.find_nodes_by_filter(&filter);
     write_json_out(&ids, out_json, out_len)
+}
+
+/// JSON shape of a [`ScopeFilter`] for the C ABI. Mirrors the
+/// NAPI / PyO3 tagged-union form:
+///
+/// ```text
+/// {"kind": "any"}
+/// {"kind": "global_only"}
+/// {"kind": "same_subnet"}
+/// {"kind": "tenant", "tenant": "<id>"}
+/// {"kind": "tenants", "tenants": ["<id>", ...]}
+/// {"kind": "region", "region": "<name>"}
+/// {"kind": "regions", "regions": ["<name>", ...]}
+/// ```
+///
+/// Unrecognized `kind` values fall through to `Any` defensively;
+/// empty strings or empty lists also collapse to `Any` (matches
+/// the PyO3 / NAPI converters).
+#[derive(serde::Deserialize)]
+struct ScopeFilterJson {
+    kind: String,
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    tenants: Option<Vec<String>>,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    regions: Option<Vec<String>>,
+}
+
+/// Owned scope filter holding the strings the borrowed
+/// [`net::adapter::net::behavior::capability::ScopeFilter`] points
+/// into. Constructed inside [`net_mesh_find_nodes_scoped`] and
+/// dropped at the end of the call so the borrow stays valid for
+/// the query.
+enum ScopeFilterOwned {
+    Any,
+    GlobalOnly,
+    SameSubnet,
+    Tenant(String),
+    Tenants(Vec<String>),
+    Region(String),
+    Regions(Vec<String>),
+}
+
+fn scope_filter_from_json(f: ScopeFilterJson) -> ScopeFilterOwned {
+    match f.kind.as_str() {
+        "any" => ScopeFilterOwned::Any,
+        "global_only" | "globalOnly" => ScopeFilterOwned::GlobalOnly,
+        "same_subnet" | "sameSubnet" => ScopeFilterOwned::SameSubnet,
+        "tenant" => match f.tenant {
+            Some(t) if !t.is_empty() => ScopeFilterOwned::Tenant(t),
+            _ => ScopeFilterOwned::Any,
+        },
+        "tenants" => match f.tenants {
+            // Drop empty tenant ids — `scope_from_tags` rejects
+            // empty announcements, so a query containing `[""]`
+            // would never match a real tenant and would only pin
+            // to Global candidates. Fall back to Any when cleaned
+            // list is empty (Cubic P2).
+            Some(ts) => {
+                let cleaned: Vec<String> = ts.into_iter().filter(|t| !t.is_empty()).collect();
+                if cleaned.is_empty() {
+                    ScopeFilterOwned::Any
+                } else {
+                    ScopeFilterOwned::Tenants(cleaned)
+                }
+            }
+            None => ScopeFilterOwned::Any,
+        },
+        "region" => match f.region {
+            Some(r) if !r.is_empty() => ScopeFilterOwned::Region(r),
+            _ => ScopeFilterOwned::Any,
+        },
+        "regions" => match f.regions {
+            // Same reasoning as `tenants` above (Cubic P2).
+            Some(rs) => {
+                let cleaned: Vec<String> = rs.into_iter().filter(|r| !r.is_empty()).collect();
+                if cleaned.is_empty() {
+                    ScopeFilterOwned::Any
+                } else {
+                    ScopeFilterOwned::Regions(cleaned)
+                }
+            }
+            None => ScopeFilterOwned::Any,
+        },
+        _ => ScopeFilterOwned::Any,
+    }
+}
+
+/// Run `f` with a borrowed scope filter projected from `owned`.
+/// Multi-element variants need an intermediate `Vec<&str>` that
+/// outlives the borrow — that intermediate lives on this call's
+/// stack, matching the NAPI / PyO3 helpers.
+fn with_scope_filter<R>(
+    owned: &ScopeFilterOwned,
+    f: impl FnOnce(&crate::adapter::net::behavior::capability::ScopeFilter<'_>) -> R,
+) -> R {
+    use crate::adapter::net::behavior::capability::ScopeFilter as F;
+    match owned {
+        ScopeFilterOwned::Any => f(&F::Any),
+        ScopeFilterOwned::GlobalOnly => f(&F::GlobalOnly),
+        ScopeFilterOwned::SameSubnet => f(&F::SameSubnet),
+        ScopeFilterOwned::Tenant(t) => f(&F::Tenant(t.as_str())),
+        ScopeFilterOwned::Tenants(ts) => {
+            let refs: Vec<&str> = ts.iter().map(|s| s.as_str()).collect();
+            f(&F::Tenants(refs.as_slice()))
+        }
+        ScopeFilterOwned::Region(r) => f(&F::Region(r.as_str())),
+        ScopeFilterOwned::Regions(rs) => {
+            let refs: Vec<&str> = rs.iter().map(|s| s.as_str()).collect();
+            f(&F::Regions(refs.as_slice()))
+        }
+    }
+}
+
+/// Scoped variant of [`net_mesh_find_nodes`]. Filters candidates
+/// through a scope filter derived from each node's `scope:*`
+/// reserved tags. Untagged nodes resolve to `Global` and stay
+/// visible under most filters; nodes tagged `scope:subnet-local`
+/// only show up under `{"kind":"same_subnet"}`.
+///
+/// `scope_json` is a tagged-union JSON form (see the private
+/// `ScopeFilterJson` struct above):
+///
+/// ```text
+/// {"kind": "any"}
+/// {"kind": "global_only"}
+/// {"kind": "same_subnet"}
+/// {"kind": "tenant", "tenant": "<id>"}
+/// {"kind": "tenants", "tenants": ["<id>", ...]}
+/// {"kind": "region", "region": "<name>"}
+/// {"kind": "regions", "regions": ["<name>", ...]}
+/// ```
+///
+/// `filter_json` is the same shape as [`net_mesh_find_nodes`].
+/// Result: JSON array of u64 node ids written to `*out_json`;
+/// caller frees via `net_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_find_nodes_scoped(
+    handle: *mut MeshNodeHandle,
+    filter_json: *const c_char,
+    scope_json: *const c_char,
+    out_json: *mut *mut c_char,
+    out_len: *mut usize,
+) -> c_int {
+    if handle.is_null()
+        || filter_json.is_null()
+        || scope_json.is_null()
+        || out_json.is_null()
+        || out_len.is_null()
+    {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let Some(filter_s) = (unsafe { c_str_to_str(filter_json) }) else {
+        return NetError::InvalidUtf8.into();
+    };
+    let Some(scope_s) = (unsafe { c_str_to_str(scope_json) }) else {
+        return NetError::InvalidUtf8.into();
+    };
+    let parsed_filter: CapabilityFilterJson = match serde_json::from_str(filter_s) {
+        Ok(v) => v,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
+    let parsed_scope: ScopeFilterJson = match serde_json::from_str(scope_s) {
+        Ok(v) => v,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
+    let filter = capability_filter_from_json(parsed_filter);
+    let owned = scope_filter_from_json(parsed_scope);
+    let ids = with_scope_filter(&owned, |sf| {
+        h.inner.find_nodes_by_filter_scoped(&filter, sf)
+    });
+    write_json_out(&ids, out_json, out_len)
+}
+
+/// JSON shape of [`CapabilityRequirement`] for the C ABI. Mirrors
+/// the field set of the core type with snake_case keys; weights are
+/// f32 in [0.0, 1.0] (the core clamps).
+///
+/// ```text
+/// {
+///   "filter": { … CapabilityFilter shape … },
+///   "prefer_more_memory":     0.5,
+///   "prefer_more_vram":       1.0,
+///   "prefer_faster_inference": 0.0,
+///   "prefer_loaded_models":   0.0
+/// }
+/// ```
+#[derive(serde::Deserialize)]
+struct CapabilityRequirementJson {
+    #[serde(default)]
+    filter: CapabilityFilterJson,
+    #[serde(default)]
+    prefer_more_memory: f32,
+    #[serde(default)]
+    prefer_more_vram: f32,
+    #[serde(default)]
+    prefer_faster_inference: f32,
+    #[serde(default)]
+    prefer_loaded_models: f32,
+}
+
+fn capability_requirement_from_json(
+    j: CapabilityRequirementJson,
+) -> crate::adapter::net::behavior::capability::CapabilityRequirement {
+    crate::adapter::net::behavior::capability::CapabilityRequirement::from_filter(
+        capability_filter_from_json(j.filter),
+    )
+    .prefer_memory(j.prefer_more_memory)
+    .prefer_vram(j.prefer_more_vram)
+    .prefer_speed(j.prefer_faster_inference)
+    .prefer_loaded(j.prefer_loaded_models)
+}
+
+/// Pick the best-scoring node for a placement requirement. Writes
+/// the winning node id to `*out_node_id` and `1` to `*out_has_match`
+/// when a node matches; writes `0` to `*out_has_match` and leaves
+/// `*out_node_id` untouched when no node matches. Returns `0` for
+/// success in either case; non-zero only on input / parse error.
+///
+/// `requirement_json` is the JSON form documented on the private
+/// `CapabilityRequirementJson` struct above — a `filter` object
+/// plus four optional `prefer_*` weights in `[0.0, 1.0]`.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_find_best_node(
+    handle: *mut MeshNodeHandle,
+    requirement_json: *const c_char,
+    out_node_id: *mut u64,
+    out_has_match: *mut c_int,
+) -> c_int {
+    if handle.is_null()
+        || requirement_json.is_null()
+        || out_node_id.is_null()
+        || out_has_match.is_null()
+    {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let Some(s) = (unsafe { c_str_to_str(requirement_json) }) else {
+        return NetError::InvalidUtf8.into();
+    };
+    let parsed: CapabilityRequirementJson = match serde_json::from_str(s) {
+        Ok(v) => v,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
+    let req = capability_requirement_from_json(parsed);
+    match h.inner.find_best_node(&req) {
+        Some(node_id) => unsafe {
+            *out_node_id = node_id;
+            *out_has_match = 1;
+        },
+        None => unsafe {
+            *out_has_match = 0;
+        },
+    }
+    0
+}
+
+/// Scoped variant of [`net_mesh_find_best_node`]. Filters
+/// candidates through `scope_json` (same shape as
+/// [`net_mesh_find_nodes_scoped`]) before scoring; picks the
+/// highest-scoring node within the scope-filtered set.
+///
+/// Same out-param contract as [`net_mesh_find_best_node`]:
+/// `*out_has_match = 1` + `*out_node_id = winner` on hit;
+/// `*out_has_match = 0` on no match.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_find_best_node_scoped(
+    handle: *mut MeshNodeHandle,
+    requirement_json: *const c_char,
+    scope_json: *const c_char,
+    out_node_id: *mut u64,
+    out_has_match: *mut c_int,
+) -> c_int {
+    if handle.is_null()
+        || requirement_json.is_null()
+        || scope_json.is_null()
+        || out_node_id.is_null()
+        || out_has_match.is_null()
+    {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let Some(req_s) = (unsafe { c_str_to_str(requirement_json) }) else {
+        return NetError::InvalidUtf8.into();
+    };
+    let Some(scope_s) = (unsafe { c_str_to_str(scope_json) }) else {
+        return NetError::InvalidUtf8.into();
+    };
+    let parsed_req: CapabilityRequirementJson = match serde_json::from_str(req_s) {
+        Ok(v) => v,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
+    let parsed_scope: ScopeFilterJson = match serde_json::from_str(scope_s) {
+        Ok(v) => v,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
+    let req = capability_requirement_from_json(parsed_req);
+    let owned = scope_filter_from_json(parsed_scope);
+    let result = with_scope_filter(&owned, |sf| h.inner.find_best_node_scoped(&req, sf));
+    match result {
+        Some(node_id) => unsafe {
+            *out_node_id = node_id;
+            *out_has_match = 1;
+        },
+        None => unsafe {
+            *out_has_match = 0;
+        },
+    }
+    0
 }
 
 /// Normalize a GPU vendor string to its canonical lowercase form.

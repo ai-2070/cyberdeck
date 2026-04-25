@@ -20,7 +20,7 @@ file.
 Today, `MeshNode::announce_capabilities` pushes a signed
 `CapabilityAnnouncement` to every directly-connected peer — and
 stops there. Peers more than one hop away are invisible to
-`find_peers`. This caveat is documented in every SDK README and in
+`find_nodes`. This caveat is documented in every SDK README and in
 [`CAPABILITY_BROADCAST_PLAN.md`](CAPABILITY_BROADCAST_PLAN.md)
 ("Multi-hop capability gossip is deferred").
 
@@ -155,10 +155,12 @@ capabilities propagate across subnet boundaries? Today `Visibility`
 is a *channel* concept, not a node concept.
 
 Leave this out of v1. Multi-hop capability propagation lands with
-permissive (global) semantics; subnet-scoped announcements are a
-follow-up (`ann.scope: AnnouncementScope` defaulting to `Global`,
-enforced at the forwarder before re-broadcast). Flagged in the
-"follow-ups" list below.
+permissive (global) semantics; subnet-scoped *forwarding* (a wire-
+level `AnnouncementScope` enforced at the forwarder before re-
+broadcast) is the v3 path. **Tag-based discovery scope** —
+reserved `scope:*` tags filtered at query time, no wire change —
+shipped in the meantime via
+[`SCOPED_CAPABILITIES_PLAN.md`](SCOPED_CAPABILITIES_PLAN.md).
 
 ## Wire format change
 
@@ -206,7 +208,7 @@ pattern is reusable scaffolding.
 New tests in `crates/net/tests/capability_multihop.rs`:
 
 1. **`three_node_chain_propagates`** — A ↔ B ↔ C with no direct
-   A-C link. `A.announce_capabilities(caps_A)` → `C.find_peers(filter)`
+   A-C link. `A.announce_capabilities(caps_A)` → `C.find_nodes(filter)`
    returns A's node_id within `propagation_deadline_ms`.
 2. **`dedup_drops_duplicate_at_converge_point`** — Diamond A → {B, C}
    → D. D sees A's announcement twice (via B and via C); index
@@ -235,7 +237,7 @@ New tests in `crates/net/tests/capability_multihop.rs`:
 Plus SDK-layer tests:
 
 - **Rust SDK** (`sdk/tests/multihop_capability.rs`) — user-facing
-  `find_peers` returns far peers.
+  `find_nodes` returns far peers.
 - **TS SDK** (`sdk-ts/test/multihop_capability.test.ts`) — same.
 - **Python / Go** — skip for v1 (the cross-binding contract is fixed
   by the Rust integration test; adding per-binding multi-hop tests
@@ -317,7 +319,11 @@ Plus SDK-layer tests:
 - **`AnnouncementScope` field.** Add subnet-scoped visibility for
   capability announcements (`Global | ParentVisible | SubnetLocal`).
   Follows the channel `Visibility` pattern. Requires subnet-gateway
-  logic at forward time.
+  logic at forward time. Partially addressed: tag-based discovery
+  scope (per-tenant / per-region / subnet-local *queries*, no wire
+  change) shipped via
+  [`SCOPED_CAPABILITIES_PLAN.md`](SCOPED_CAPABILITIES_PLAN.md). The
+  full wire-level enforcement is the remaining v3 work.
 - **Incremental capability diffs.** Main README mentions
   `CapabilityDiff` — computing + propagating minimal diffs rather
   than full announcements. Bandwidth optimization for large
@@ -344,5 +350,5 @@ Plus SDK-layer tests:
    data *without* using it for routing might prefer to opt in.
 4. **Hop_count in `parse_token`-style dict output for bindings?**
    Currently the bindings don't expose `CapabilityAnnouncement`
-   details at all — only `find_peers` results. This plan keeps it
+   details at all — only `find_nodes` results. This plan keeps it
    that way. Confirm.

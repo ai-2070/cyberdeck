@@ -50,7 +50,7 @@ use super::pool::PacketBuilder;
 use super::behavior::broadcast::SUBPROTOCOL_CAPABILITY_ANN;
 use super::behavior::capability::{
     CapabilityAnnouncement, CapabilityFilter, CapabilityIndex, CapabilityRequirement,
-    CapabilitySet, MAX_CAPABILITY_HOPS,
+    CapabilitySet, ScopeFilter, MAX_CAPABILITY_HOPS,
 };
 use super::behavior::loadbalance::HealthStatus;
 use super::behavior::proximity::{EnhancedPingwave, ProximityConfig, ProximityGraph};
@@ -4962,7 +4962,7 @@ impl MeshNode {
     // v1; multi-hop gossip is a follow-up.
 
     /// Announce this node's capabilities to every directly-connected
-    /// peer. Also self-indexes so single-node `find_peers_by_filter`
+    /// peer. Also self-indexes so single-node `find_nodes_by_filter`
     /// queries return us too.
     ///
     /// TTL defaults to 5 minutes. Unsigned (signatures tie in with
@@ -5088,8 +5088,49 @@ impl MeshNode {
 
     /// Query the capability index. Returns node ids (including our
     /// own `node_id`) whose latest announcement matches `filter`.
-    pub fn find_peers_by_filter(&self, filter: &CapabilityFilter) -> Vec<u64> {
+    pub fn find_nodes_by_filter(&self, filter: &CapabilityFilter) -> Vec<u64> {
         self.capability_index.query(filter)
+    }
+
+    /// Scoped variant of [`Self::find_nodes_by_filter`]. Filters
+    /// candidates through `scope` (derived from each peer's
+    /// `scope:*` reserved tags) on top of the capability filter.
+    /// `SubnetLocal` peers and the [`ScopeFilter::SameSubnet`]
+    /// filter resolve same-subnet membership against
+    /// `peer_subnets`.
+    ///
+    /// **Warm-up rule.** When a peer's subnet is unknown:
+    /// - **With** a `local_subnet_policy`, the candidate is
+    ///   admitted (a fresh peer's announcement may not have
+    ///   landed yet — the policy will resolve it on receipt).
+    /// - **Without** a `local_subnet_policy`, `peer_subnets`
+    ///   stays permanently empty (the dispatch handler only
+    ///   writes it when a policy is installed), so "unknown"
+    ///   means "will never resolve" — admitting unknowns there
+    ///   leaks every peer through `SameSubnet`. The candidate
+    ///   is excluded.
+    pub fn find_nodes_by_filter_scoped(
+        &self,
+        filter: &CapabilityFilter,
+        scope: &ScopeFilter<'_>,
+    ) -> Vec<u64> {
+        let my_subnet = self.local_subnet;
+        let peer_subnets = self.peer_subnets.clone();
+        let local_node_id = self.node_id;
+        // See doc-comment: without a policy, an unresolvable
+        // "unknown" cannot be admitted as same-subnet (Cubic P1).
+        let policy_installed = self.local_subnet_policy.is_some();
+        self.capability_index
+            .find_nodes_scoped(filter, scope, |nid| {
+                if nid == local_node_id {
+                    // Querying our own node: same subnet by definition.
+                    return true;
+                }
+                match peer_subnets.get(&nid).map(|e| *e.value()) {
+                    Some(s) => s == my_subnet,
+                    None => policy_installed,
+                }
+            })
     }
 
     /// Read a peer's most recently advertised public reflex
@@ -5494,8 +5535,35 @@ impl MeshNode {
 
     /// Rank peers for a scored requirement. Returns the best-
     /// scoring node's id, or `None` if no peer matches.
-    pub fn rank_peers(&self, req: &CapabilityRequirement) -> Option<u64> {
+    pub fn find_best_node(&self, req: &CapabilityRequirement) -> Option<u64> {
         self.capability_index.find_best(req)
+    }
+
+    /// Scoped variant of [`Self::find_best_node`]. See
+    /// [`Self::find_nodes_by_filter_scoped`] for the scope
+    /// resolution semantics; selection picks the highest-scoring
+    /// candidate within the scoped set.
+    pub fn find_best_node_scoped(
+        &self,
+        req: &CapabilityRequirement,
+        scope: &ScopeFilter<'_>,
+    ) -> Option<u64> {
+        let my_subnet = self.local_subnet;
+        let peer_subnets = self.peer_subnets.clone();
+        let local_node_id = self.node_id;
+        // Same warm-up rule as `find_nodes_by_filter_scoped` —
+        // see that doc-comment for the rationale (Cubic P1).
+        let policy_installed = self.local_subnet_policy.is_some();
+        self.capability_index
+            .find_best_node_scoped(req, scope, |nid| {
+                if nid == local_node_id {
+                    return true;
+                }
+                match peer_subnets.get(&nid).map(|e| *e.value()) {
+                    Some(s) => s == my_subnet,
+                    None => policy_installed,
+                }
+            })
     }
 
     /// Shared reference to the capability index. Use this for

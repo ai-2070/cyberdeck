@@ -557,11 +557,80 @@ mesh.AnnounceCapabilities(net.CapabilitySet{
     Tags: []string{"gpu", "prod"},
 })
 
-gpuPeers, _ := mesh.FindPeers(net.CapabilityFilter{
+gpuNodes, _ := mesh.FindNodes(net.CapabilityFilter{
     RequireGPU: true,
     GPUVendor:  "nvidia",
     MinVRAMMB:  40_000,
 })
+```
+
+#### Scoped discovery (reserved `scope:*` tags)
+
+A provider can narrow *who its query result reaches* by tagging
+its `CapabilitySet` with reserved `scope:*` tags. Queries call
+`FindNodesScoped(filter, scope)` to filter candidates. The wire
+format and forwarders are untouched — enforcement is purely
+query-side.
+
+```go
+// GPU pool advertised to one tenant only.
+mesh.AnnounceCapabilities(net.CapabilitySet{
+    Tags: []string{"model:llama3-70b", "scope:tenant:oem-123"},
+})
+
+// Tenant-scoped query — returns this node + any Global (untagged) peers.
+oemNodes, _ := mesh.FindNodesScoped(
+    net.CapabilityFilter{RequireTags: []string{"model:llama3-70b"}},
+    net.ScopeFilter{Kind: "tenant", Tenant: "oem-123"},
+)
+```
+
+`ScopeFilter.Kind` accepts: `"any"` (default), `"global_only"`,
+`"same_subnet"`, `"tenant"` (with `Tenant`), `"tenants"` (with
+`Tenants`), `"region"` (with `Region`), `"regions"` (with
+`Regions`). Strictest scope wins — `scope:subnet-local` dominates
+tenant/region tags on the same set. Untagged peers resolve to
+`Global` and stay visible under permissive queries. Full design:
+[`docs/SCOPED_CAPABILITIES_PLAN.md`](../../docs/SCOPED_CAPABILITIES_PLAN.md).
+
+#### Scored placement (`FindBestNode`)
+
+When you want the *single best* node for a placement requirement
+rather than every match, use `FindBestNode` (or its scoped sibling
+`FindBestNodeScoped`). The requirement combines a hard filter with
+optional scoring weights in `[0.0, 1.0]` that tip ties toward more
+memory / VRAM / faster inference / pre-loaded models.
+
+```go
+req := net.CapabilityRequirement{
+    Filter: net.CapabilityFilter{
+        RequireGPU: true,
+        MinVRAMMB:  40_000,
+    },
+    PreferMoreVRAM:        1.0,
+    PreferFasterInference: 0.5,
+}
+
+nodeID, ok, err := mesh.FindBestNode(req)
+if err != nil {
+    log.Fatal(err)
+}
+if !ok {
+    // No node satisfies the filter. `nodeID` is zero on miss; the
+    // bool is the only correct way to discriminate, since 0 is a
+    // valid id.
+    return
+}
+log.Printf("placement → node %d", nodeID)
+```
+
+Scoped variant — pick the best within a tenant pool:
+
+```go
+nodeID, ok, _ := mesh.FindBestNodeScoped(
+    req,
+    net.ScopeFilter{Kind: "tenant", Tenant: "oem-123"},
+)
 ```
 
 Capability propagation is multi-hop, bounded by

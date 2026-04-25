@@ -84,7 +84,7 @@ describe('Channel authentication', () => {
     // B's caps, even though in this case there are no caps to
     // match and the check fails for that reason).
     const bId = b.nodeId();
-    await waitUntil(() => a.findPeers({}).includes(bId));
+    await waitUntil(() => a.findNodes({}).includes(bId));
 
     await expect(b.subscribeChannel(a.nodeId(), chan.name)).rejects.toThrow();
   });
@@ -148,7 +148,7 @@ describe('Channel authentication', () => {
     // not bad token) and the test flakes positive → negative
     // under load. Flagged by cubic as a race.
     const bId = b.nodeId();
-    await waitUntil(() => a.findPeers({}).includes(bId));
+    await waitUntil(() => a.findNodes({}).includes(bId));
 
     // Publisher issues a SUBSCRIBE-scoped token for B.
     const token = aIdentity.issueToken({
@@ -186,7 +186,7 @@ describe('Channel authentication', () => {
     // the "entity unknown" branch, not the "token subject
     // mismatch" branch we want to exercise.
     const bId = b.nodeId();
-    await waitUntil(() => a.findPeers({}).includes(bId));
+    await waitUntil(() => a.findNodes({}).includes(bId));
 
     // Token issued for a third, unrelated entity — B attempts
     // to use it anyway. Publisher's cache will be keyed by the

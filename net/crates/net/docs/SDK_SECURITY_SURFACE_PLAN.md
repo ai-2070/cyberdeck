@@ -37,7 +37,7 @@ This plan closes that gap. It is **additive** on top of [`SDK_EXPANSION_PLAN.md`
 | `TokenCache` | ✓ | ✓ | ✓ | ✓ |
 | `CapabilitySet` construction | ✓ | ✓ | ✓ (dict) | ✓ (struct) |
 | `CapabilityAnnouncement` emit | ✓ | ✓ | ✓ | ✓ |
-| `CapabilityIndex` query (`find_peers`) | ✓ | ✓ | ✓ | ✓ |
+| `CapabilityIndex` query (`find_nodes`) | ✓ | ✓ | ✓ | ✓ |
 | `SubnetId` / `SubnetPolicy` | ✓ | ✓ | ✓ | ✓ |
 | `SubnetGateway` forwarding | ✗ (core only) | ✗ | ✗ | ✗ |
 | Channel auth — `publish_caps` / `subscribe_caps` | ✓ | ✓ | ✓ | ✓ |
@@ -212,7 +212,7 @@ impl Mesh {
 
     /// Query the local capability index for peers matching `filter`.
     /// Returns (node_id, score) pairs ordered by score descending.
-    pub fn find_peers(&self, filter: &CapabilityFilter)
+    pub fn find_nodes(&self, filter: &CapabilityFilter)
         -> Vec<(u64, f64)>;
 }
 ```
@@ -389,7 +389,7 @@ impl NetMesh {
         -> napi::Result<()>;
 
     #[napi]
-    pub fn find_peers(&self, filter: CapabilityFilterJs)
+    pub fn find_nodes(&self, filter: CapabilityFilterJs)
         -> Vec<PeerMatchJs>;
 }
 ```
@@ -416,13 +416,13 @@ export interface CapabilityFilter {
 
 // on MeshNode
 async announceCapabilities(caps: CapabilitySet): Promise<void>;
-findPeers(filter: CapabilityFilter): Array<{ nodeId: bigint; score: number }>;
+findNodes(filter: CapabilityFilter): Array<{ nodeId: bigint; score: number }>;
 ```
 
 ### Exit criteria
 
-- Two-node test: A announces `{tags:["gpu","inference"]}`, B's `findPeers({requireTags:["gpu"]})` returns A.
-- Announcement TTL expiry: advance mock clock past TTL → `findPeers` no longer returns A until re-announce.
+- Two-node test: A announces `{tags:["gpu","inference"]}`, B's `findNodes({requireTags:["gpu"]})` returns A.
+- Announcement TTL expiry: advance mock clock past TTL → `findNodes` no longer returns A until re-announce.
 
 ---
 
@@ -580,7 +580,7 @@ Files shipped:
   require_signed_capabilities, subnet, subnet_policy),
   `register_channel` (publish_caps / subscribe_caps),
   `subscribe_channel` (token), plus `announce_capabilities` /
-  `find_peers` / `entity_id`
+  `find_nodes` / `entity_id`
 - `net/crates/net/bindings/python/python/net/{__init__.py,_net.pyi}` — exports + stubs
 - `net/crates/net/bindings/python/tests/test_{identity,capabilities,subnets,channel_auth}.py`
 - `net/crates/net/bindings/python/README.md` — Security Surface section
@@ -756,7 +756,7 @@ follow-ups):
 ## Stage M — Multi-hop capability propagation — SHIPPED
 
 Stage C's "announcements are one-hop only" caveat left nodes more
-than one hop away invisible to `find_peers`. Stage M closes that by
+than one hop away invisible to `find_nodes`. Stage M closes that by
 reusing the pingwave forwarding pattern: hop-count-bounded
 re-broadcast with `(origin_node_id, version)` dedup.
 
@@ -799,7 +799,10 @@ wire format + signature invariance across hop bumps.
 **Explicit non-goals** (deferred):
 
 - `AnnouncementScope` field (subnet-local / parent-visible /
-  global). v1 is permissive-global.
+  global). v1 is permissive-global. **Partially addressed in v2**:
+  tag-based discovery scope landed via reserved `scope:*` tags +
+  `ScopeFilter` ([`SCOPED_CAPABILITIES_PLAN.md`](SCOPED_CAPABILITIES_PLAN.md)).
+  Wire-level enforcement remains deferred.
 - Delta / diff encoding for bandwidth reduction.
 - Gossipsub-style lazy/eager-push mesh peer selection.
 
@@ -811,7 +814,7 @@ wire format + signature invariance across hop bumps.
 - `net/crates/net/sdk/Cargo.toml` — add `identity`, `capabilities`, `subnets`, `security` features.
 - `net/crates/net/sdk/src/lib.rs` — module wiring, `NetBuilder::identity`, `MeshBuilder::identity` / `subnet` / `subnet_policy`.
 - `net/crates/net/sdk/src/identity.rs` (new) — `Identity` handle.
-- `net/crates/net/sdk/src/capabilities.rs` (new) — re-exports + `Mesh::announce_capabilities` / `find_peers`.
+- `net/crates/net/sdk/src/capabilities.rs` (new) — re-exports + `Mesh::announce_capabilities` / `find_nodes`.
 - `net/crates/net/sdk/src/subnets.rs` (new) — re-exports + builder methods.
 
 ### Stage B (TS tokens)
@@ -822,7 +825,7 @@ wire format + signature invariance across hop bumps.
 ### Stage C (TS capabilities)
 - `net/crates/net/bindings/node/src/capabilities.rs` (new).
 - `net/crates/net/sdk-ts/src/capabilities.ts` (new).
-- `net/crates/net/sdk-ts/src/mesh.ts` — add `announceCapabilities`, `findPeers`.
+- `net/crates/net/sdk-ts/src/mesh.ts` — add `announceCapabilities`, `findNodes`.
 
 ### Stage D (TS subnets)
 - `net/crates/net/sdk-ts/src/mesh.ts` — extend `MeshConfig` with `subnet` / `subnetPolicy`.
@@ -856,7 +859,7 @@ wire format + signature invariance across hop bumps.
 
 ### Performance
 
-- **`find_peers` cost.** `CapabilityIndex::query` is DashMap lookups; fast. But returning `Vec<(u64, f64)>` for a large filter match on a large mesh could be big. Add an implicit limit (top 100 by score) in the SDK and expose `findPeersLimit` for the rare caller who wants more.
+- **`find_nodes` cost.** `CapabilityIndex::query` is DashMap lookups; fast. But returning `Vec<(u64, f64)>` for a large filter match on a large mesh could be big. Add an implicit limit (top 100 by score) in the SDK and expose `findNodesLimit` for the rare caller who wants more.
 - **Token cache size.** `TokenCache` is unbounded today (expired entries evicted on access). For long-lived nodes with many delegations this could grow. Add a soft cap (e.g., 10_000 entries) in the SDK `Identity` wrapper; evict LRU when over cap. Not a core-crate change.
 - **Signing on the hot path.** `announceCapabilities` signs. If a user hammers it (bad idea), they pay ~70µs per call. Document as "call on state change, not in a tight loop."
 

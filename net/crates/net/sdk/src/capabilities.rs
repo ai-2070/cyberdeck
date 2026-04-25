@@ -29,7 +29,7 @@
 //!
 //! With `--features net`, `Mesh` has
 //! [`announce_capabilities`](crate::mesh::Mesh::announce_capabilities)
-//! and [`find_peers`](crate::mesh::Mesh::find_peers). Announce-side
+//! and [`find_nodes`](crate::mesh::Mesh::find_nodes). Announce-side
 //! self-indexes, so a single-node test is round-trippable:
 //!
 //! ```
@@ -47,7 +47,7 @@
 //!     .await?;
 //!
 //! // Self-match hits.
-//! let hits = node.find_peers(&CapabilityFilter::new().require_tag("gpu"));
+//! let hits = node.find_nodes(&CapabilityFilter::new().require_tag("gpu"));
 //! assert!(hits.contains(&node.node_id()));
 //!
 //! node.shutdown().await?;
@@ -62,6 +62,6 @@
 pub use net::adapter::net::behavior::capability::{
     AcceleratorInfo, AcceleratorType, CapabilityAnnouncement, CapabilityFilter, CapabilityIndex,
     CapabilityIndexStats, CapabilityRequirement, CapabilitySet, GpuInfo, GpuVendor,
-    HardwareCapabilities, IndexedNode, Modality, ModelCapability, ResourceLimits, Signature64,
-    SoftwareCapabilities, ToolCapability,
+    HardwareCapabilities, IndexedNode, Modality, ModelCapability, ResourceLimits, ScopeFilter,
+    Signature64, SoftwareCapabilities, ToolCapability,
 };

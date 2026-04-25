@@ -1,4 +1,4 @@
-// Package net — capability announce / find_peers surface.
+// Package net — capability announce / find_nodes surface.
 //
 // Mirrors the PyO3 / NAPI dict shape byte-for-byte so cross-binding
 // fixtures round-trip. Capabilities cross as JSON; filters cross as
@@ -130,7 +130,7 @@ type CapabilitySet struct {
 }
 
 // CapabilityFilter describes the subset of announcements that
-// `FindPeers` should return. Empty filter matches every announcer.
+// `FindNodes` should return. Empty filter matches every announcer.
 type CapabilityFilter struct {
 	RequireTags       []string `json:"require_tags,omitempty"`
 	RequireModels     []string `json:"require_models,omitempty"`
@@ -148,7 +148,7 @@ type CapabilityFilter struct {
 // ---------------------------------------------------------------------------
 
 // AnnounceCapabilities broadcasts `caps` to every directly-connected
-// peer and self-indexes, so `FindPeers` on this same node matches
+// peer and self-indexes, so `FindNodes` on this same node matches
 // when the filter is compatible. Multi-hop propagation is deferred.
 func (m *MeshNode) AnnounceCapabilities(caps CapabilitySet) error {
 	data, err := json.Marshal(caps)
@@ -167,10 +167,10 @@ func (m *MeshNode) AnnounceCapabilities(caps CapabilitySet) error {
 	return capabilityErrorFromCode(code)
 }
 
-// FindPeers queries the local capability index. Returns the node ids
+// FindNodes queries the local capability index. Returns the node ids
 // (u64) of every announcer whose latest announcement matches
 // `filter`, including own node id on self-match.
-func (m *MeshNode) FindPeers(filter CapabilityFilter) ([]uint64, error) {
+func (m *MeshNode) FindNodes(filter CapabilityFilter) ([]uint64, error) {
 	data, err := json.Marshal(filter)
 	if err != nil {
 		return nil, fmt.Errorf("marshal filter: %w", err)
@@ -185,7 +185,7 @@ func (m *MeshNode) FindPeers(filter CapabilityFilter) ([]uint64, error) {
 	}
 	var outJSON *C.char
 	var outLen C.size_t
-	code := C.net_mesh_find_peers(m.handle, cJSON, &outJSON, &outLen)
+	code := C.net_mesh_find_nodes(m.handle, cJSON, &outJSON, &outLen)
 	if err := capabilityErrorFromCode(code); err != nil {
 		return nil, err
 	}
@@ -193,9 +193,155 @@ func (m *MeshNode) FindPeers(filter CapabilityFilter) ([]uint64, error) {
 	raw := C.GoStringN(outJSON, C.int(outLen))
 	var ids []uint64
 	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
-		return nil, fmt.Errorf("parse find_peers response: %w", err)
+		return nil, fmt.Errorf("parse find_nodes response: %w", err)
 	}
 	return ids, nil
+}
+
+// ScopeFilter narrows `FindNodesScoped` results by reserved
+// `scope:*` tags on each node's `CapabilitySet`. Tagged-union by
+// `Kind`; mirrors the NAPI / PyO3 shape so cross-binding fixtures
+// round-trip.
+//
+// Recognized `Kind` values:
+//   - `"any"` — every non-`SubnetLocal` node
+//   - `"global_only"` — only untagged (Global) nodes
+//   - `"same_subnet"` — caller's subnet only
+//   - `"tenant"` — that tenant + Global; `Tenant` field required
+//   - `"tenants"` — any of those + Global; `Tenants` field required
+//   - `"region"` — that region + Global; `Region` field required
+//   - `"regions"` — any of those + Global; `Regions` field required
+//
+// Unknown `Kind` values fall through to `"any"` defensively. Empty
+// strings or empty lists also collapse to `"any"`.
+type ScopeFilter struct {
+	Kind    string   `json:"kind"`
+	Tenant  string   `json:"tenant,omitempty"`
+	Tenants []string `json:"tenants,omitempty"`
+	Region  string   `json:"region,omitempty"`
+	Regions []string `json:"regions,omitempty"`
+}
+
+// FindNodesScoped is the scoped variant of FindNodes. Filters
+// candidates through `scope` (derived from each node's `scope:*`
+// reserved tags) on top of the capability filter. Untagged nodes
+// stay visible under most filters; nodes tagged `scope:subnet-local`
+// only show up under `ScopeFilter{Kind: "same_subnet"}`.
+//
+// See `docs/SCOPED_CAPABILITIES_PLAN.md` for the full table.
+func (m *MeshNode) FindNodesScoped(filter CapabilityFilter, scope ScopeFilter) ([]uint64, error) {
+	filterJSON, err := json.Marshal(filter)
+	if err != nil {
+		return nil, fmt.Errorf("marshal filter: %w", err)
+	}
+	scopeJSON, err := json.Marshal(scope)
+	if err != nil {
+		return nil, fmt.Errorf("marshal scope: %w", err)
+	}
+	cFilter := C.CString(string(filterJSON))
+	defer C.free(unsafe.Pointer(cFilter))
+	cScope := C.CString(string(scopeJSON))
+	defer C.free(unsafe.Pointer(cScope))
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return nil, ErrShuttingDown
+	}
+	var outJSON *C.char
+	var outLen C.size_t
+	code := C.net_mesh_find_nodes_scoped(m.handle, cFilter, cScope, &outJSON, &outLen)
+	if err := capabilityErrorFromCode(code); err != nil {
+		return nil, err
+	}
+	defer C.net_free_string(outJSON)
+	raw := C.GoStringN(outJSON, C.int(outLen))
+	var ids []uint64
+	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
+		return nil, fmt.Errorf("parse find_nodes_scoped response: %w", err)
+	}
+	return ids, nil
+}
+
+// CapabilityRequirement is a placement requirement: a base
+// capability filter plus optional scoring weights. Higher weight
+// (in [0.0, 1.0]) tips ties toward more memory / VRAM / faster
+// inference / pre-loaded models. Weights are clamped on the Rust
+// side; values outside the range are silently capped.
+type CapabilityRequirement struct {
+	Filter                CapabilityFilter `json:"filter"`
+	PreferMoreMemory      float32          `json:"prefer_more_memory,omitempty"`
+	PreferMoreVRAM        float32          `json:"prefer_more_vram,omitempty"`
+	PreferFasterInference float32          `json:"prefer_faster_inference,omitempty"`
+	PreferLoadedModels    float32          `json:"prefer_loaded_models,omitempty"`
+}
+
+// FindBestNode picks the highest-scoring node for a placement
+// requirement. Returns `(nodeId, true, nil)` on hit,
+// `(0, false, nil)` on no match, or `(_, _, err)` on parse / FFI
+// failure. The boolean disambiguates "no match" from `nodeId == 0`,
+// which is a valid id.
+func (m *MeshNode) FindBestNode(req CapabilityRequirement) (uint64, bool, error) {
+	data, err := json.Marshal(req)
+	if err != nil {
+		return 0, false, fmt.Errorf("marshal requirement: %w", err)
+	}
+	cJSON := C.CString(string(data))
+	defer C.free(unsafe.Pointer(cJSON))
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return 0, false, ErrShuttingDown
+	}
+	var outNodeID C.uint64_t
+	var outHasMatch C.int
+	code := C.net_mesh_find_best_node(m.handle, cJSON, &outNodeID, &outHasMatch)
+	if err := capabilityErrorFromCode(code); err != nil {
+		return 0, false, err
+	}
+	if outHasMatch == 0 {
+		return 0, false, nil
+	}
+	return uint64(outNodeID), true, nil
+}
+
+// FindBestNodeScoped is the scoped variant of FindBestNode. Filters
+// candidates through `scope` (same semantics as FindNodesScoped)
+// before scoring; returns the highest-scoring node within the
+// scope-filtered set.
+func (m *MeshNode) FindBestNodeScoped(
+	req CapabilityRequirement,
+	scope ScopeFilter,
+) (uint64, bool, error) {
+	reqJSON, err := json.Marshal(req)
+	if err != nil {
+		return 0, false, fmt.Errorf("marshal requirement: %w", err)
+	}
+	scopeJSON, err := json.Marshal(scope)
+	if err != nil {
+		return 0, false, fmt.Errorf("marshal scope: %w", err)
+	}
+	cReq := C.CString(string(reqJSON))
+	defer C.free(unsafe.Pointer(cReq))
+	cScope := C.CString(string(scopeJSON))
+	defer C.free(unsafe.Pointer(cScope))
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return 0, false, ErrShuttingDown
+	}
+	var outNodeID C.uint64_t
+	var outHasMatch C.int
+	code := C.net_mesh_find_best_node_scoped(m.handle, cReq, cScope, &outNodeID, &outHasMatch)
+	if err := capabilityErrorFromCode(code); err != nil {
+		return 0, false, err
+	}
+	if outHasMatch == 0 {
+		return 0, false, nil
+	}
+	return uint64(outNodeID), true, nil
 }
 
 // NormalizeGPUVendor maps a GPU vendor string to its canonical

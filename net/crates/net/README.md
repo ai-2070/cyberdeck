@@ -254,6 +254,17 @@ Routing follows capabilities. A request tagged `subprotocol:0x1000` routes to th
 
 The `CapabilityAd` struct is what travels on the wire: compact, versioned, and signed with the node's identity. A node that claims capabilities it doesn't have will be routed around when its behavior diverges from its advertisement — the proximity graph measures actual latency, not claimed latency.
 
+**Scoped discovery via reserved tags.** Capability announcements gossip permissively across the mesh, but providers can narrow *who their query result reaches* by tagging their `CapabilitySet` with reserved `scope:*` tags. The wire format and forwarders are untouched — `find_nodes_scoped(filter, scope)` evaluates the tags as a post-filter on the index. Useful for per-tenant pools, per-region rendezvous, and subnet-local app discovery.
+
+| Tag                       | Effect                                                                          |
+| ------------------------- | ------------------------------------------------------------------------------- |
+| _(no `scope:*` tag)_      | `Global` (default) — visible to every query that doesn't explicitly opt out.    |
+| `scope:subnet-local`      | Visible only under `ScopeFilter::SameSubnet` queries.                           |
+| `scope:tenant:<id>`       | Visible to `ScopeFilter::Tenant(<id>)` (and `Tenants` lists containing `<id>`). Hidden from other tenants and from `GlobalOnly`. |
+| `scope:region:<name>`     | Visible to `ScopeFilter::Region(<name>)` (and `Regions` lists containing `<name>`). Hidden from other regions and from `GlobalOnly`. |
+
+Strictest scope wins (`subnet-local` > tenants/regions > global). Enforcement is **query-side only**, not on the path; cross-tenant *routing* still flows freely. Full design: [`SCOPED_CAPABILITIES_PLAN.md`](docs/SCOPED_CAPABILITIES_PLAN.md).
+
 ## Proximity & Discovery
 
 Nodes find each other through `Pingwave` — periodic broadcasts that propagate outward within a configurable hop radius. A pingwave carries the node's identity, capabilities summary, and a timestamp. If you can hear a node's pingwave, you know it exists, how far away it is, and what it can do.
@@ -336,7 +347,7 @@ Identity, capability announcements, subnet visibility, and channel authenticatio
 
 - **Ed25519 identities.** `Identity` bundles a caller-owned 32-byte seed with a local `TokenCache`. `node_id` and `entity_id` are reproducible across restarts when the seed is pinned on `MeshBuilder` (or `identity_seed` / `identitySeed` / `IdentitySeedHex` on the Python / TS / Go mesh constructors and configs).
 - **Permission tokens.** ed25519-signed grants tying a `(subject, scope, channel, TTL)` tuple together. `TokenScope` is a bitfield of `publish | subscribe | admin | delegate`; delegation is capped per-token and the chain is verified end-to-end. Tokens cross the boundary as 159-byte opaque buffers (no hex round-trip, no JSON tax).
-- **Capability announcements.** Multi-hop broadcast (up to `MAX_CAPABILITY_HOPS = 16`) of each node's `CapabilitySet` (hardware, software, models, tools, tags, limits). `find_peers(filter)` queries the local index in constant time; self-match returns the owning node's id. Forwarders increment `hop_count` outside the signed envelope so the origin's ed25519 signature verifies at every hop; `(origin, version)` dedup drops duplicates at diamond-topology converge points. The `node_id → entity_id` binding is pinned TOFU-style on first sight. See [`MULTIHOP_CAPABILITY_PLAN.md`](docs/MULTIHOP_CAPABILITY_PLAN.md).
+- **Capability announcements.** Multi-hop broadcast (up to `MAX_CAPABILITY_HOPS = 16`) of each node's `CapabilitySet` (hardware, software, models, tools, tags, limits). `find_nodes(filter)` queries the local index in constant time; self-match returns the owning node's id. Forwarders increment `hop_count` outside the signed envelope so the origin's ed25519 signature verifies at every hop; `(origin, version)` dedup drops duplicates at diamond-topology converge points. The `node_id → entity_id` binding is pinned TOFU-style on first sight. See [`MULTIHOP_CAPABILITY_PLAN.md`](docs/MULTIHOP_CAPABILITY_PLAN.md).
 - **Subnets.** A `SubnetId` is a 4-level u32; `SubnetPolicy` derives each peer's subnet from their capability tags so every node in the mesh agrees on the geometry without a central directory. `Visibility` on a channel gates publish fan-out and subscribe authorization against that geometry.
 - **Channel authentication.** `ChannelConfig` carries `publish_caps`, `subscribe_caps`, and `require_token`. Publishers check their own caps before fan-out; subscribers present a `PermissionToken` whose subject matches their entity id. Successful subscribes populate the `AuthGuard` fast path (4 KB bloom filter + verified-subscribe cache) so every subsequent publish packet admits or drops the subscriber in constant time. A periodic token-expiry sweep (default 30 s) evicts subscribers whose tokens age out; a per-peer auth-failure rate limiter (default 16 failures per 60 s window, 30 s throttle) short-circuits bad-token storms before ed25519 verification runs. Any denial surfaces as `Unauthorized` / `RateLimited` at the subscribe gate or as a `PublishReport` miss on the publish side.
 

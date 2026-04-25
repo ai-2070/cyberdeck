@@ -28,6 +28,38 @@ pub struct SoftwareCapabilities {
 
 **Benchmark:** Single tag filter in 10.5 ns, GPU check in 0.33 ns.
 
+### Scoped discovery (`scope:*` reserved tags)
+
+Capability announcements gossip permissively across the mesh. To narrow *who sees what* at query time, providers tag their `CapabilitySet` with reserved `scope:*` tags. The `scope:*` namespace is owned by the discovery layer; user tags must not start with `scope:`.
+
+| Tag                       | Meaning                                                                                          |
+| ------------------------- | ------------------------------------------------------------------------------------------------ |
+| _(no `scope:*` tag)_      | Global (default) — discoverable to every query that doesn't explicitly opt out.                  |
+| `scope:global`            | Global (explicit form) — same effect as no tag.                                                  |
+| `scope:subnet-local`      | Visible only to peers in the same subnet as the announcer.                                       |
+| `scope:tenant:<id>`       | Visible to queries with `ScopeFilter::Tenant(<id>)` (and to global queries that aren't tenant-scoped). |
+| `scope:region:<name>`     | Visible to queries with `ScopeFilter::Region(<name>)` (and to global queries that aren't region-scoped). |
+
+A node may carry multiple `scope:tenant:*` / `scope:region:*` tags simultaneously. **Precedence:** `scope:subnet-local` dominates — when present, tenant/region tags are ignored by the resolver. Strictest scope wins.
+
+Enforcement is **query-side only**. The wire format, forwarder logic, and gateway rules stay untouched — `find_nodes_by_filter_scoped(filter, scope)` evaluates `scope:*` tags as a post-filter on the index. Cross-tenant *routing* still flows freely; what changes is which peers a tenant-scoped query *returns*. See `docs/SCOPED_CAPABILITIES_PLAN.md` for the full design and the v3 deferred work (path-level enforcement, signed-scope, audience ACLs).
+
+```rust
+// Provider tags itself for tenant `oem-123`.
+let caps = CapabilitySet::new()
+    .add_tag("model:llama3-70b")
+    .with_tenant_scope("oem-123");
+mesh.announce_capabilities(caps).await?;
+
+// Query that filters to only that tenant + globally-tagged peers.
+let peers = mesh.find_nodes_by_filter_scoped(
+    &CapabilityFilter::new().require_tag("model:llama3-70b"),
+    &ScopeFilter::Tenant("oem-123"),
+);
+```
+
+The `Visibility` enum on `ChannelConfig` is a separate concept — channel visibility is a *routing* concern enforced by `SubnetGateway::should_forward`. Capability scope is a *discovery* concern. They can be combined (a `SubnetLocal` channel that publishes only to subnet-local capability matches) but neither implies the other.
+
 ## Capability Diffs (CAP-DIFF)
 
 `DiffEngine` computes minimal diffs when capabilities change, avoiding full re-announcement.

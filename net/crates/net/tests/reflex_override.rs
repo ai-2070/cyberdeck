@@ -177,7 +177,7 @@ async fn override_propagates_through_capability_broadcast() {
     );
 
     // B should also see A's nat:open tag (override implies Open).
-    let peers = b.find_peers_by_filter(
+    let peers = b.find_nodes_by_filter(
         &net::adapter::net::behavior::capability::CapabilityFilter::new().require_tag("nat:open"),
     );
     assert!(

@@ -42,8 +42,10 @@ import { setNapiMesh } from './_internal.js';
 import {
   capabilityFilterToNapi,
   capabilitySetToNapi,
+  scopeFilterToNapi,
   type CapabilityFilter,
   type CapabilitySet,
+  type ScopeFilter,
 } from './capabilities';
 import type { SubnetId, SubnetPolicy } from './subnets';
 import type { Token } from './identity';
@@ -519,7 +521,7 @@ export class MeshNode {
 
   /**
    * Announce this node's capabilities to every directly-connected
-   * peer. Self-indexes too, so `findPeers` on this same node matches
+   * peer. Self-indexes too, so `findNodes` on this same node matches
    * on the announcement. Multi-hop propagation is deferred — peers
    * more than one hop away will not see the announcement.
    */
@@ -532,8 +534,35 @@ export class MeshNode {
    * our own `nodeId()` if self matches) whose latest announcement
    * matches `filter`.
    */
-  findPeers(filter: CapabilityFilter): bigint[] {
-    return this.native.findPeers(capabilityFilterToNapi(filter));
+  findNodes(filter: CapabilityFilter): bigint[] {
+    return this.native.findNodes(capabilityFilterToNapi(filter));
+  }
+
+  /**
+   * Scoped variant of {@link findNodes}. Filters candidates through
+   * a {@link ScopeFilter} derived from each peer's `scope:*`
+   * reserved tags (e.g. `scope:tenant:oem-123`,
+   * `scope:region:eu-west`, `scope:subnet-local`).
+   *
+   * Untagged peers stay visible under most filters by design;
+   * peers tagged `scope:subnet-local` only show up under
+   * `{ kind: 'sameSubnet' }`. See `docs/SCOPED_CAPABILITIES_PLAN.md`
+   * for the full table.
+   *
+   * @example
+   * ```typescript
+   * // GPU pool for a specific tenant.
+   * const peers = node.findNodesScoped(
+   *   { requireTags: ['model:llama3-70b'] },
+   *   { kind: 'tenant', tenant: 'oem-123' },
+   * );
+   * ```
+   */
+  findNodesScoped(filter: CapabilityFilter, scope: ScopeFilter): bigint[] {
+    return this.native.findNodesScoped(
+      capabilityFilterToNapi(filter),
+      scopeFilterToNapi(scope),
+    );
   }
 
   /** Shutdown the mesh node. */

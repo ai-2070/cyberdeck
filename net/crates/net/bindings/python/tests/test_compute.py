@@ -124,7 +124,7 @@ def test_daemon_runtime_does_not_shut_down_underlying_mesh() -> None:
     # but leaves the NetMesh alive. Caller owns the mesh lifecycle.
     #
     # Liveness check: exercise a real mesh operation (announce +
-    # find_peers self-match) rather than reading `node_id`, since
+    # find_nodes self-match) rather than reading `node_id`, since
     # the node_id is a derived identifier that would still be valid
     # even if the underlying mesh runtime had been torn down.
     mesh = _mesh()
@@ -136,7 +136,7 @@ def test_daemon_runtime_does_not_shut_down_underlying_mesh() -> None:
         # announcements and self-indexes them, proving the
         # capability subprotocol + local index are still wired up.
         mesh.announce_capabilities({"tags": ["post-runtime-shutdown-probe"]})
-        peers = mesh.find_peers({"require_tags": ["post-runtime-shutdown-probe"]})
+        peers = mesh.find_nodes({"require_tags": ["post-runtime-shutdown-probe"]})
         assert mesh.node_id in peers
     finally:
         mesh.shutdown()

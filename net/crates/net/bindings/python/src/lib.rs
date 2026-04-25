@@ -1734,7 +1734,7 @@ mod mesh_bindings {
         // =====================================================
 
         /// Announce this node's capabilities to every directly-
-        /// connected peer. Also self-indexes, so `find_peers` on this
+        /// connected peer. Also self-indexes, so `find_nodes` on this
         /// same node matches on the announcement.
         ///
         /// Multi-hop propagation is deferred — peers more than one
@@ -1778,10 +1778,32 @@ mod mesh_bindings {
         /// Query the local capability index. Returns node ids
         /// (including our own when we self-match) whose latest
         /// announcement matches `filter`.
-        fn find_peers(&self, filter: &Bound<'_, PyDict>) -> PyResult<Vec<u64>> {
+        fn find_nodes(&self, filter: &Bound<'_, PyDict>) -> PyResult<Vec<u64>> {
             let node = self.get_node()?;
             let core = super::capabilities::capability_filter_from_py(filter)?;
-            Ok(node.find_peers_by_filter(&core))
+            Ok(node.find_nodes_by_filter(&core))
+        }
+
+        /// Scoped variant of [`Self::find_nodes`]. Filters candidates
+        /// through a `scope` dict derived from each peer's `scope:*`
+        /// reserved tags. See
+        /// `super::capabilities::scope_filter_from_py` for the
+        /// accepted dict shapes.
+        ///
+        /// Untagged peers stay visible under most filters by design;
+        /// peers tagged `scope:subnet-local` only show up under
+        /// `{"kind": "same_subnet"}`.
+        fn find_nodes_scoped(
+            &self,
+            filter: &Bound<'_, PyDict>,
+            scope: &Bound<'_, PyDict>,
+        ) -> PyResult<Vec<u64>> {
+            let node = self.get_node()?;
+            let core = super::capabilities::capability_filter_from_py(filter)?;
+            let owned = super::capabilities::scope_filter_from_py(scope)?;
+            Ok(super::capabilities::with_scope_filter(&owned, |sf| {
+                node.find_nodes_by_filter_scoped(&core, sf)
+            }))
         }
 
         // ── NAT traversal ──────────────────────────────────────

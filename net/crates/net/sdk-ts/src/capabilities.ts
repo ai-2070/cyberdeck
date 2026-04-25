@@ -6,7 +6,7 @@
  * runs, hand it to {@link MeshNode.announceCapabilities}, and the
  * mesh pushes it to every directly-connected peer. Peers keep the
  * latest announcement from each node in their local capability
- * index; {@link MeshNode.findPeers} queries that index.
+ * index; {@link MeshNode.findNodes} queries that index.
  *
  * @example
  * ```ts
@@ -22,7 +22,7 @@
  *   models: [{ modelId: 'llama-3.1-70b', family: 'llama' }],
  * });
  *
- * const peers = node.findPeers({ requireTags: ['gpu'], minVramMb: 16_384 });
+ * const peers = node.findNodes({ requireTags: ['gpu'], minVramMb: 16_384 });
  * ```
  *
  * Multi-hop propagation is deferred; today peers more than one hop
@@ -262,7 +262,7 @@ export interface NapiCapabilitySet {
   limits?: NapiLimits;
 }
 
-/** Shape that napi-rs expects for `findPeers`. */
+/** Shape that napi-rs expects for `findNodes`. */
 export interface NapiCapabilityFilter {
   requireTags?: string[];
   requireModels?: string[];
@@ -372,4 +372,103 @@ export function capabilityFilterToNapi(f: CapabilityFilter): NapiCapabilityFilte
     minContextLength: f.minContextLength,
     requireModalities: f.requireModalities as string[] | undefined,
   };
+}
+
+// =====================================================
+// Scope filter (reserved-tag discovery filter)
+// =====================================================
+
+/**
+ * Caller's intent for narrowing peer discovery by reserved
+ * `scope:*` tags. See {@link MeshNode.findNodesScoped}.
+ *
+ * Tag-based scope is a query-time concern — the wire format is
+ * untouched. Untagged peers resolve to `Global` and stay visible
+ * under most filters by design (matches the v1-permissive
+ * default). Peers tagged `scope:subnet-local` only show up under
+ * `sameSubnet`.
+ */
+export type ScopeFilter =
+  | { kind: 'any' }
+  | { kind: 'globalOnly' }
+  | { kind: 'sameSubnet' }
+  | { kind: 'tenant'; tenant: string }
+  | { kind: 'tenants'; tenants: string[] }
+  | { kind: 'region'; region: string }
+  | { kind: 'regions'; regions: string[] };
+
+/** Shape that napi-rs expects for `findNodesScoped`. */
+export interface NapiScopeFilter {
+  kind: string;
+  tenant?: string;
+  tenants?: string[];
+  region?: string;
+  regions?: string[];
+}
+
+export function scopeFilterToNapi(s: ScopeFilter): NapiScopeFilter {
+  switch (s.kind) {
+    case 'any':
+    case 'globalOnly':
+    case 'sameSubnet':
+      return { kind: s.kind };
+    case 'tenant':
+      return { kind: 'tenant', tenant: s.tenant };
+    case 'tenants':
+      return { kind: 'tenants', tenants: s.tenants };
+    case 'region':
+      return { kind: 'region', region: s.region };
+    case 'regions':
+      return { kind: 'regions', regions: s.regions };
+  }
+}
+
+// =====================================================
+// Reserved scope tag helpers
+// =====================================================
+
+/** Reserved tag prefix for tenant-scoped announcements. */
+export const SCOPE_TENANT_PREFIX = 'scope:tenant:';
+/** Reserved tag prefix for region-scoped announcements. */
+export const SCOPE_REGION_PREFIX = 'scope:region:';
+/** Reserved tag marking an announcement subnet-local. */
+export const SCOPE_SUBNET_LOCAL = 'scope:subnet-local';
+
+/**
+ * Append a `scope:tenant:<id>` tag to a tag list. Idempotent —
+ * safe to call repeatedly with the same id. Empty `tenantId` is a
+ * no-op.
+ */
+export function withTenantScope(
+  tags: string[] | undefined,
+  tenantId: string,
+): string[] {
+  if (!tenantId) return tags ?? [];
+  const tag = `${SCOPE_TENANT_PREFIX}${tenantId}`;
+  const list = tags ?? [];
+  return list.includes(tag) ? list : [...list, tag];
+}
+
+/** Append a `scope:region:<name>` tag to a tag list. Idempotent. */
+export function withRegionScope(
+  tags: string[] | undefined,
+  region: string,
+): string[] {
+  if (!region) return tags ?? [];
+  const tag = `${SCOPE_REGION_PREFIX}${region}`;
+  const list = tags ?? [];
+  return list.includes(tag) ? list : [...list, tag];
+}
+
+/**
+ * Append the `scope:subnet-local` tag to a tag list. Idempotent.
+ * Strictest form wins on the resolver — when this tag is present,
+ * tenant/region tags on the same set are ignored by
+ * `CapabilityScope`.
+ */
+export function withSubnetLocalScope(tags: string[] | undefined): string[] {
+  const list = tags ?? [];
+  return list.includes(SCOPE_SUBNET_LOCAL)
+    ? list
+    : [...list, SCOPE_SUBNET_LOCAL];
 }

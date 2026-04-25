@@ -171,6 +171,158 @@ while (running) {
 free(cursor);
 ```
 
+## Mesh transport
+
+The header in this directory (`include/net.h`) is intentionally a
+**narrow, public, event-bus-only** surface — every symbol declared
+here is a stability commitment.
+
+The mesh transport (encrypted peer sessions, channels, NAT
+traversal, capability discovery) is implemented in the same
+shared library but lives behind a **separate, broader header**:
+[`bindings/go/net/net.h`](../bindings/go/net/net.h). That header is
+written for the Go cgo bindings and is the de-facto reference for
+C consumers who want the mesh API. Symbols are stable in practice
+but not committed in the same way as `include/net.h`.
+
+**One header per translation unit.** Both files use the same
+`#ifndef NET_SDK_H` include guard, so including both in the same
+`.c` file silently drops the second include — symbols only declared
+there will fail to compile. The two headers are also **not a strict
+superset of each other**:
+
+- `include/net.h` declares `net_ingest_raw_ex`, `net_poll_ex`,
+  `net_stats_ex` (structured no-JSON paths) that
+  `bindings/go/net/net.h` does not.
+- `bindings/go/net/net.h` declares the entire mesh surface
+  (sessions, streams, channels, capabilities, NAT) that
+  `include/net.h` does not.
+
+Pick the header that matches the surface your translation unit
+actually uses. If a single program needs both — the structured
+`_ex` poll path *and* the mesh API — split them across translation
+units: one `.c` file includes `include/net.h` and exposes a thin
+internal API to the rest of your program, another includes
+`bindings/go/net/net.h`. The resulting object files link against
+the same `libnet.{so,dylib,dll}` regardless of which header
+declared each symbol.
+
+A mesh node is its own handle (`net_meshnode_t*`), created via
+`net_mesh_new` and torn down via `net_mesh_shutdown` — independent
+of the bus handle (`net_handle_t`). A single process can hold both
+simultaneously regardless of how the headers are included.
+
+The Go bindings (`bindings/go/net/`) wrap this surface; their
+README has runnable examples for every function family. The
+section below is a function inventory — for usage prose, see
+[`bindings/go/README.md`](../bindings/go/README.md).
+
+### Quick start (mesh)
+
+```c
+#include "../bindings/go/net/net.h"   /* broader header */
+
+net_meshnode_t* mesh = NULL;
+const char* cfg =
+    "{\"bind_addr\":\"127.0.0.1:9000\",\"psk_hex\":\"42424242...\"}";
+if (net_mesh_new(cfg, &mesh) != 0) return 1;
+net_mesh_start(mesh);
+
+/* Announce hardware/software/tag fingerprints. */
+net_mesh_announce_capabilities(mesh, "{\"tags\":[\"gpu\",\"prod\"]}");
+
+/* Query the local capability index. Result is a JSON array of
+ * node ids; free with net_free_string. */
+char* result = NULL;
+size_t result_len = 0;
+net_mesh_find_nodes(mesh, "{\"require_tags\":[\"gpu\"]}",
+                    &result, &result_len);
+printf("matches: %.*s\n", (int)result_len, result);
+net_free_string(result);
+
+net_mesh_shutdown(mesh);
+```
+
+### Mesh function families
+
+| Family | Functions | Purpose |
+|--------|-----------|---------|
+| Lifecycle | `net_mesh_new`, `net_mesh_shutdown`, `net_mesh_start`, `net_mesh_public_key_hex`, `net_mesh_entity_id` | Create / start / tear down a mesh node. |
+| Connections | `net_mesh_connect`, `net_mesh_accept`, `net_mesh_connect_direct` | Establish encrypted peer sessions. |
+| Streams | `net_mesh_open_stream`, `net_mesh_send`, `net_mesh_send_with_retry`, `net_mesh_send_blocking`, `net_mesh_stream_stats`, `net_mesh_recv_shard` | Per-peer ordered byte streams. |
+| Channels | `net_mesh_register_channel`, `net_mesh_subscribe_channel`, `net_mesh_subscribe_channel_with_token`, `net_mesh_unsubscribe_channel`, `net_mesh_publish` | Topic-based pub/sub over the mesh. |
+| Capabilities | `net_mesh_announce_capabilities`, `net_mesh_find_nodes`, `net_mesh_find_nodes_scoped`, `net_mesh_find_best_node`, `net_mesh_find_best_node_scoped` | Capability discovery + scored placement. |
+| NAT traversal | `net_mesh_nat_type`, `net_mesh_reflex_addr`, `net_mesh_peer_nat_type`, `net_mesh_probe_reflex`, `net_mesh_reclassify_nat`, `net_mesh_traversal_stats`, `net_mesh_set_reflex_override`, `net_mesh_clear_reflex_override` | Optional optimization — routed-handshake fallback always works. |
+
+### Scoped capability discovery
+
+`scope:*` reserved tags on a `CapabilitySet` narrow *who finds whom*
+at query time. The wire format and forwarders are unchanged —
+enforcement is purely query-side.
+
+| Tag form               | Effect                                                          |
+|------------------------|-----------------------------------------------------------------|
+| _(none)_               | `Global` (default) — visible to every query that doesn't opt out. |
+| `scope:subnet-local`   | Visible only under `{"kind":"same_subnet"}` queries.            |
+| `scope:tenant:<id>`    | Visible to `{"kind":"tenant","tenant":"<id>"}` queries (and to permissive global queries). |
+| `scope:region:<name>`  | Visible to `{"kind":"region","region":"<name>"}` queries.       |
+
+```c
+// GPU pool advertised to one tenant only.
+net_mesh_announce_capabilities(mesh,
+    "{\"tags\":[\"model:llama3-70b\",\"scope:tenant:oem-123\"]}");
+
+// Tenant-scoped query.
+char* result = NULL; size_t result_len = 0;
+net_mesh_find_nodes_scoped(mesh,
+    "{\"require_tags\":[\"model:llama3-70b\"]}",
+    "{\"kind\":\"tenant\",\"tenant\":\"oem-123\"}",
+    &result, &result_len);
+net_free_string(result);
+
+// Scored placement — pick the highest-scoring node within a scope.
+uint64_t winner = 0;
+int has_match = 0;
+net_mesh_find_best_node_scoped(mesh,
+    "{\"filter\":{\"require_gpu\":true},\"prefer_more_vram\":1.0}",
+    "{\"kind\":\"tenant\",\"tenant\":\"oem-123\"}",
+    &winner, &has_match);
+if (has_match) printf("placement -> %llu\n", (unsigned long long)winner);
+```
+
+`scope.kind` accepts `any` (default) | `global_only` | `same_subnet`
+| `tenant` (with `tenant`) | `tenants` (with `tenants`) | `region`
+(with `region`) | `regions` (with `regions`). Both snake_case
+(`global_only`) and camelCase (`globalOnly`) are accepted so
+fixtures round-trip across SDKs. Strictest scope wins —
+`scope:subnet-local` dominates tenant/region tags on the same set.
+
+`net_mesh_find_best_node[_scoped]` use an out-param contract: the
+return code is 0 on both hit and miss; `*out_has_match` is `1` on
+hit (with `*out_node_id` populated) or `0` on miss. The boolean
+disambiguates from `node_id == 0`, which is a valid id.
+
+Full design + cross-SDK rationale:
+[`docs/SCOPED_CAPABILITIES_PLAN.md`](../docs/SCOPED_CAPABILITIES_PLAN.md).
+
+### Mesh types
+
+```c
+net_meshnode_t      // Opaque mesh-node handle (separate from net_handle_t).
+net_mesh_stream_t   // Opaque per-peer stream handle.
+```
+
+### Where to look for full prose
+
+- [`net.h`](../bindings/go/net/net.h) — every function has a doc-comment
+  with input shapes, error codes, and ownership rules.
+- [`bindings/go/README.md`](../bindings/go/README.md) — runnable
+  examples for the full mesh surface (the Go bindings are a thin
+  wrapper over `net.h`, so the example translation back to C is
+  near-1:1).
+- [`net/README.md`](../README.md) — architectural overview, NAT
+  traversal design, channel visibility model.
+
 ## License
 
 Apache-2.0

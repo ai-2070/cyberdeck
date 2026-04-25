@@ -26,7 +26,7 @@ Current Go state (from a fresh survey of
 | `MeshNode` basics (new/shutdown/connect/accept/start/open_stream/publish) | ✅ Present |
 | `net_generate_keypair` (Noise keypair) | ✅ Present — but ed25519 `Identity` is absent |
 | Identity / `PermissionToken` / `TokenCache` | ❌ Zero FFI symbols |
-| Capabilities (announce / find_peers) | ❌ Zero FFI symbols |
+| Capabilities (announce / find_nodes) | ❌ Zero FFI symbols |
 | Subnets (`subnet`, `subnet_policy`) | ❌ Zero FFI symbols |
 | Channel auth (`publish_caps` / `subscribe_caps` on register, token on subscribe) | ❌ `RequireToken` flag exists; ACL + token path unwired |
 | `CapabilityAnnouncement.entity_id` + signing | ✅ Core emits signed announcements; unused by Go |
@@ -41,7 +41,7 @@ Current Go state (from a fresh survey of
   / verify / delegate / channel-hash / issue / install / lookup).
   Tokens cross the boundary as raw `uint8_t*` buffers (159 bytes);
   entity ids as `uint8_t*` (32 bytes).
-- Greenfield C-ABI exports for capabilities (announce / find_peers)
+- Greenfield C-ABI exports for capabilities (announce / find_nodes)
   and subnets (config extension on `net_mesh_new`). Capability sets,
   filters, and subnet policies cross as JSON strings — matches the
   existing ChannelConfigInput / PublishConfigInput pattern in
@@ -202,7 +202,7 @@ int32_t net_mesh_announce_capabilities(
     const char* caps_json
 );
 
-int32_t net_mesh_find_peers(
+int32_t net_mesh_find_nodes(
     net_meshnode_t* handle,
     const char* filter_json,
     char** out_json, size_t* out_len     // JSON: [nodeid, ...]
@@ -267,7 +267,7 @@ New files:
 - `bindings/go/net/identity.go` — `Identity` struct + methods +
   free functions + token errors
 - `bindings/go/net/capabilities.go` — `CapabilitySet` / `CapabilityFilter` types
-  + `(m *MeshNode) AnnounceCapabilities` / `FindPeers`
+  + `(m *MeshNode) AnnounceCapabilities` / `FindNodes`
 - `bindings/go/net/subnets.go` — `SubnetID` / `SubnetPolicy` types
 
 `mesh.go` gets:
@@ -302,7 +302,7 @@ validation).
 `bindings/go/net/capabilities_test.go` (new, G-2) — single-mesh
 self-match:
 
-1. `AnnounceCapabilities({Tags: []string{"gpu"}})` → `FindPeers({RequireTags: []string{"gpu"}})` includes own node id.
+1. `AnnounceCapabilities({Tags: []string{"gpu"}})` → `FindNodes({RequireTags: []string{"gpu"}})` includes own node id.
 2. Non-matching filter returns empty slice.
 3. `NormalizeGpuVendor("NVIDIA") == "nvidia"`.
 4. Wrong-shape filter input returns `ErrCapability`.

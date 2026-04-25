@@ -4,8 +4,8 @@
 
 [`SDK_SECURITY_SURFACE_PLAN.md`](SDK_SECURITY_SURFACE_PLAN.md) Stage C
 proposes adding `Mesh::announce_capabilities(caps)` and
-`Mesh::find_peers(filter)` to the SDK. The stated exit criterion is a
-two-node test where A announces capabilities and B's `find_peers`
+`Mesh::find_nodes(filter)` to the SDK. The stated exit criterion is a
+two-node test where A announces capabilities and B's `find_nodes`
 returns A.
 
 A survey of `src/adapter/net/` turned up three gaps in the core crate
@@ -59,7 +59,10 @@ Stage C's own dependencies remain unchanged: it requires Stages A
   profiling shows it.
 - Cross-subnet visibility. Subnet filtering of announcement fan-out
   ties into Stage D's `SubnetGateway` wiring and is treated as an
-  extension of that work, not this one.
+  extension of that work, not this one. Tag-based discovery scope
+  (per-tenant / per-region / subnet-local query filtering) shipped
+  via reserved `scope:*` tags + `ScopeFilter` —
+  see [`SCOPED_CAPABILITIES_PLAN.md`](SCOPED_CAPABILITIES_PLAN.md).
 - `CapabilityAd` / `LocalGraph` (the swarm.rs topology system). It is
   a parallel subsystem with its own lifecycle; this plan does **not**
   integrate them.
@@ -183,7 +186,7 @@ Add to `MeshNode` (in `src/adapter/net/mesh.rs:319` struct):
 ```rust
 /// Per-mesh capability index, populated by inbound
 /// `SUBPROTOCOL_CAPABILITY_ANN` packets and queried by
-/// `find_peers_by_filter`.
+/// `find_nodes_by_filter`.
 capability_index: Arc<CapabilityIndex>,
 /// Most recent announcement this node published. Pushed to new
 /// peers on session-open; `None` until the first `announce_*` call.
@@ -247,14 +250,14 @@ impl MeshNode {
 
     /// Query the local capability index. Returns (node_id, score)
     /// pairs ordered by score descending.
-    pub fn find_peers_by_filter(
+    pub fn find_nodes_by_filter(
         &self,
         filter: &CapabilityFilter,
     ) -> Vec<u64>;
 
     /// Scored query — for callers that want ranked placement rather
     /// than a set membership check.
-    pub fn rank_peers(
+    pub fn find_best_node(
         &self,
         req: &CapabilityRequirement,
     ) -> Option<u64>;
@@ -276,7 +279,7 @@ impl Mesh {
         caps: CapabilitySet,
     ) -> Result<()>;
 
-    pub fn find_peers(
+    pub fn find_nodes(
         &self,
         filter: &CapabilityFilter,
     ) -> Vec<u64>;
@@ -330,7 +333,7 @@ Methods on `NetMesh`:
 pub async fn announce_capabilities(&self, caps: CapabilitySetJs) -> Result<()>;
 
 #[napi]
-pub fn find_peers(&self, filter: CapabilityFilterJs) -> Vec<PeerMatchJs>;
+pub fn find_nodes(&self, filter: CapabilityFilterJs) -> Vec<PeerMatchJs>;
 ```
 
 POJO ↔ core conversions sit in `capabilities.rs` as pure functions.
@@ -370,7 +373,7 @@ Extend `MeshNode`:
 
 ```ts
 async announceCapabilities(caps: CapabilitySet): Promise<void>;
-findPeers(filter: CapabilityFilter): PeerMatch[];
+findNodes(filter: CapabilityFilter): PeerMatch[];
 ```
 
 Camel-case conversion is explicit in the wrapper (no reflection), so
@@ -383,10 +386,10 @@ are a single logical unit (don't merge C-1 without C-2).
 
 | Stage | What | Days |
 |---|---|---|
-| **C-1** | Core: subprotocol, receiver dispatch, index on MeshNode, GC task, `announce_capabilities_with` + `find_peers_by_filter` on `MeshNode`. Rust integration test (two in-process mesh nodes). | 2 |
-| **C-2** | Rust SDK: thin `Mesh::announce_capabilities` / `find_peers` wrappers + doctest. | 0.5 |
-| **C-3** | NAPI: POJOs, conversions, `NetMesh.announceCapabilities` / `findPeers`, `capabilities` feature flag, smoke test. | 1 |
-| **C-4** | TS SDK: interfaces, `MeshNode.announceCapabilities` / `findPeers`, `sdk-ts/src/capabilities.ts`, two-node TS test. | 1 |
+| **C-1** | Core: subprotocol, receiver dispatch, index on MeshNode, GC task, `announce_capabilities_with` + `find_nodes_by_filter` on `MeshNode`. Rust integration test (two in-process mesh nodes). | 2 |
+| **C-2** | Rust SDK: thin `Mesh::announce_capabilities` / `find_nodes` wrappers + doctest. | 0.5 |
+| **C-3** | NAPI: POJOs, conversions, `NetMesh.announceCapabilities` / `findNodes`, `capabilities` feature flag, smoke test. | 1 |
+| **C-4** | TS SDK: interfaces, `MeshNode.announceCapabilities` / `findNodes`, `sdk-ts/src/capabilities.ts`, two-node TS test. | 1 |
 | **C-5** | TTL expiry test (Rust + TS), signature-present path regression, README Security section expansion, docs cross-link from `SDK_SECURITY_SURFACE_PLAN.md`. | 0.5 |
 
 **Total: ~5 days** — ~1.5× the original Stage C estimate, which is
@@ -398,10 +401,10 @@ the real cost of the work Stage C implicitly required.
 
 1. **Two-node announce → find**: spin up A and B, handshake,
    `A.announce_capabilities(CapabilitySet::new().add_tag("gpu"))`,
-   poll `B.find_peers_by_filter(...)` until it contains `A.node_id`
+   poll `B.find_nodes_by_filter(...)` until it contains `A.node_id`
    or a 2 s deadline expires.
 2. **TTL expiry**: A announces with `ttl = 1s`, wait 2 s (advance
-   beyond TTL + GC tick), assert `B.find_peers_by_filter` no longer
+   beyond TTL + GC tick), assert `B.find_nodes_by_filter` no longer
    returns A.
 3. **Late joiner**: A announces, *then* C connects, assert C's index
    contains A's announcement after session-open.
@@ -454,23 +457,23 @@ from `channels.test.ts`, plus TTL expiry.
 |---|---|
 | `src/adapter/net/behavior/broadcast.rs` (new) | `SUBPROTOCOL_CAPABILITY_ANN` + receiver helper |
 | `src/adapter/net/behavior/mod.rs` | re-export the const |
-| `src/adapter/net/mesh.rs` | `MeshNode` fields, dispatch branch, `announce_capabilities*`, `find_peers_by_filter`, GC task, session-open push |
+| `src/adapter/net/mesh.rs` | `MeshNode` fields, dispatch branch, `announce_capabilities*`, `find_nodes_by_filter`, GC task, session-open push |
 | `src/adapter/net/mesh/config.rs` *or inline* | `require_signed_capabilities`, `capability_gc_interval` |
-| `sdk/src/mesh.rs` | `Mesh::announce_capabilities`, `Mesh::find_peers` |
+| `sdk/src/mesh.rs` | `Mesh::announce_capabilities`, `Mesh::find_nodes` |
 | `sdk/src/capabilities.rs` | (exists; no change — re-exports already cover the new types) |
 | `sdk/README.md` | extend Security section |
 | `bindings/node/Cargo.toml` | add `capabilities` feature |
 | `bindings/node/src/capabilities.rs` (new) | POJOs + conversions |
 | `bindings/node/src/lib.rs` | declare the module, add methods on `NetMesh` |
 | `sdk-ts/src/capabilities.ts` (new) | interfaces + conversion helpers |
-| `sdk-ts/src/mesh.ts` | `MeshNode.announceCapabilities` / `findPeers` |
+| `sdk-ts/src/mesh.ts` | `MeshNode.announceCapabilities` / `findNodes` |
 | `sdk-ts/src/index.ts` | export new types |
 | `sdk-ts/test/capabilities.test.ts` (new) | two-node + TTL tests |
 
 ## Exit criteria
 
 - Two-node Rust test passes: A announces `{tags: ["gpu", "inference"]}`,
-  B's `find_peers_by_filter({require_tags: ["gpu"]})` returns A's
+  B's `find_nodes_by_filter({require_tags: ["gpu"]})` returns A's
   `node_id` within 2 s.
 - TTL test passes: re-query after `ttl + gc_interval` returns empty.
 - Two-node TS test passes (mirrors Rust).

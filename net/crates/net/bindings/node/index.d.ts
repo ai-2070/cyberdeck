@@ -767,7 +767,7 @@ export declare class NetMesh {
   publish(channel: string, payload: Buffer, config?: PublishConfigJs | undefined | null): Promise<PublishReportJs>
   /**
    * Announce this node's capabilities to every directly-
-   * connected peer. Also self-indexes, so `findPeers` on the
+   * connected peer. Also self-indexes, so `findNodes` on the
    * same node matches on the announcement.
    *
    * Multi-hop propagation is deferred — peers more than one
@@ -779,7 +779,15 @@ export declare class NetMesh {
    * (including our own if we self-match) whose latest
    * announcement matches `filter`.
    */
-  findPeers(filter: CapabilityFilterJs): Array<bigint>
+  findNodes(filter: CapabilityFilterJs): Array<bigint>
+  /**
+   * Scoped variant of [`Self::find_nodes`]. Filters candidates
+   * through a [`crate::capabilities::ScopeFilterJs`] derived
+   * from each node's `scope:*` reserved tags. Untagged nodes
+   * stay visible under most filters by design; nodes tagged
+   * `scope:subnet-local` only show up under `sameSubnet`.
+   */
+  findNodesScoped(filter: CapabilityFilterJs, scope: ScopeFilterJs): Array<bigint>
   /** Shutdown the mesh node. */
   shutdown(): Promise<void>
 }
@@ -1787,6 +1795,32 @@ export interface RequestContextJs {
   routingKey?: string
   sessionId?: string
   requestId?: string
+}
+
+/**
+ * JS-side representation of [`net::adapter::net::behavior::capability::ScopeFilter`].
+ *
+ * Tagged union by `kind`:
+ * - `{ kind: 'any' }` — every non-`SubnetLocal` peer.
+ * - `{ kind: 'globalOnly' }` — only peers with no `scope:*` tag.
+ * - `{ kind: 'sameSubnet' }` — peers in the caller's subnet.
+ * - `{ kind: 'tenant', tenant: '<id>' }` — that tenant + Global.
+ * - `{ kind: 'tenants', tenants: ['<id>', ...] }` — any of the
+ *   listed tenants + Global.
+ * - `{ kind: 'region', region: '<name>' }` — that region + Global.
+ * - `{ kind: 'regions', regions: ['<name>', ...] }` — any of the
+ *   listed regions + Global.
+ *
+ * Unknown `kind` values are treated as `'any'` defensively
+ * (warns in `tracing`); real validation lives at the type-script
+ * layer.
+ */
+export interface ScopeFilterJs {
+  kind: string
+  tenant?: string
+  tenants?: Array<string>
+  region?: string
+  regions?: Array<string>
 }
 
 export interface SoftwareJs {

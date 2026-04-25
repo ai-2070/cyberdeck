@@ -267,7 +267,7 @@ you put the bytes (disk, vault, enclave, k8s secret) is your call.
 
 `Mesh::announce_capabilities(caps)` pushes a `CapabilityAnnouncement`
 to every directly-connected peer and self-indexes locally.
-`Mesh::find_peers(filter)` queries the local index — results include
+`Mesh::find_nodes(filter)` queries the local index — results include
 this node's own id when self matches.
 
 ```rust
@@ -289,7 +289,7 @@ mesh.announce_capabilities(
 .await?;
 
 // Self-match: returns our own node_id.
-let hits = mesh.find_peers(
+let hits = mesh.find_nodes(
     &CapabilityFilter::new().require_gpu().with_min_vram(16_384),
 );
 assert!(hits.contains(&mesh.node_id()));
@@ -297,6 +297,44 @@ mesh.shutdown().await?;
 # Ok(())
 # }
 ```
+
+#### Scoped discovery (reserved `scope:*` tags)
+
+A provider can narrow *who their query result reaches* by tagging
+its `CapabilitySet` with reserved `scope:*` tags. Queries call
+`find_nodes_scoped(filter, scope)` (or `find_best_node_scoped`)
+to filter candidates. The wire format and forwarders are
+untouched — enforcement is purely query-side.
+
+```rust
+use net_sdk::capabilities::{CapabilityFilter, CapabilitySet, ScopeFilter};
+# async fn example(mesh: &net_sdk::mesh::Mesh) -> net_sdk::error::Result<()> {
+// GPU pool advertised to one tenant only.
+mesh.announce_capabilities(
+    CapabilitySet::new()
+        .add_tag("model:llama3-70b")
+        .with_tenant_scope("oem-123"),
+)
+.await?;
+
+// Tenant-scoped query — returns this node + any `Global` (untagged) peers.
+let oem = mesh.find_nodes_scoped(
+    &CapabilityFilter::new().require_tag("model:llama3-70b"),
+    &ScopeFilter::Tenant("oem-123"),
+);
+# let _ = oem;
+# Ok(())
+# }
+```
+
+Reserved tag forms: `scope:subnet-local` (visible only under
+`ScopeFilter::SameSubnet`), `scope:tenant:<id>`,
+`scope:region:<name>`. Strictest scope wins —
+`subnet-local` dominates tenant/region tags on the same set.
+Untagged peers resolve to `Global` and stay visible under
+permissive queries (matches the v1 default; you opt *in* to
+narrowing, never out by accident). Full design:
+[`docs/SCOPED_CAPABILITIES_PLAN.md`](../docs/SCOPED_CAPABILITIES_PLAN.md).
 
 **Scope today:**
 

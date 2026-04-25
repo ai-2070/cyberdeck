@@ -68,7 +68,7 @@ describe('MeshNode capabilities', () => {
 
     await a.announceCapabilities({ tags: ['gpu', 'inference'] });
 
-    const hits = a.findPeers({ requireTags: ['gpu'] });
+    const hits = a.findNodes({ requireTags: ['gpu'] });
     expect(hits).toContain(a.nodeId());
   });
 
@@ -77,7 +77,7 @@ describe('MeshNode capabilities', () => {
     nodes.push(a);
     await a.announceCapabilities({ tags: ['gpu'] });
 
-    expect(a.findPeers({ requireTags: ['nope'] })).toEqual([]);
+    expect(a.findNodes({ requireTags: ['nope'] })).toEqual([]);
   });
 
   it('announce → find propagates across the handshake (two nodes)', async () => {
@@ -96,7 +96,7 @@ describe('MeshNode capabilities', () => {
     const aId = a.nodeId();
     const filter: CapabilityFilter = { requireGpu: true, minVramMb: 16_384 };
 
-    const arrived = await waitUntil(() => b.findPeers(filter).includes(aId));
+    const arrived = await waitUntil(() => b.findNodes(filter).includes(aId));
     expect(arrived).toBe(true);
   });
 
@@ -114,7 +114,7 @@ describe('MeshNode capabilities', () => {
 
     const aId = a.nodeId();
     const arrived = await waitUntil(() =>
-      b.findPeers({ requireTags: ['preannounced'] }).includes(aId),
+      b.findNodes({ requireTags: ['preannounced'] }).includes(aId),
     );
     expect(arrived).toBe(true);
   });
@@ -162,11 +162,11 @@ describe('MeshNode capabilities', () => {
     await a.announceCapabilities(caps);
 
     // Each require* dimension resolves back to self.
-    expect(a.findPeers({ requireTags: ['prod'] })).toContain(a.nodeId());
-    expect(a.findPeers({ requireModels: ['llama-3.1-70b'] })).toContain(a.nodeId());
-    expect(a.findPeers({ requireTools: ['web_search'] })).toContain(a.nodeId());
-    expect(a.findPeers({ requireModalities: ['code'] })).toContain(a.nodeId());
-    expect(a.findPeers({ gpuVendor: 'nvidia', minVramMb: 40_000 })).toContain(a.nodeId());
+    expect(a.findNodes({ requireTags: ['prod'] })).toContain(a.nodeId());
+    expect(a.findNodes({ requireModels: ['llama-3.1-70b'] })).toContain(a.nodeId());
+    expect(a.findNodes({ requireTools: ['web_search'] })).toContain(a.nodeId());
+    expect(a.findNodes({ requireModalities: ['code'] })).toContain(a.nodeId());
+    expect(a.findNodes({ gpuVendor: 'nvidia', minVramMb: 40_000 })).toContain(a.nodeId());
   });
 
   it('drops expired entries after TTL + a GC sweep', async () => {
@@ -195,7 +195,7 @@ describe('MeshNode capabilities', () => {
     });
     nodes.push(a);
     await a.announceCapabilities({ tags: ['gc-smoke'] });
-    expect(a.findPeers({ requireTags: ['gc-smoke'] })).toContain(a.nodeId());
+    expect(a.findNodes({ requireTags: ['gc-smoke'] })).toContain(a.nodeId());
   });
 
   it('accepts the requireSignedCapabilities knob without breaking the local path', async () => {
@@ -214,6 +214,157 @@ describe('MeshNode capabilities', () => {
     });
     nodes.push(a);
     await a.announceCapabilities({ tags: ['local-only'] });
-    expect(a.findPeers({ requireTags: ['local-only'] })).toContain(a.nodeId());
+    expect(a.findNodes({ requireTags: ['local-only'] })).toContain(a.nodeId());
+  });
+
+  // Scope-tag discovery — the NAPI layer has unique plumbing
+  // (`ScopeFilterJs` → `ScopeFilterOwned` → `with_scope_filter`
+  // borrow trampoline). Exercise it end-to-end with a single-node
+  // self-match; the underlying matching logic is covered by the
+  // Rust unit + integration suites.
+  it('findNodesScoped: tenant-tagged self matches under matching tenant', async () => {
+    const a = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk: PSK });
+    nodes.push(a);
+
+    await a.announceCapabilities({
+      tags: ['model:llama3-70b', 'scope:tenant:oem-123'],
+    });
+
+    const filter: CapabilityFilter = { requireTags: ['model:llama3-70b'] };
+
+    // Matching tenant — own node id appears.
+    expect(a.findNodesScoped(filter, { kind: 'tenant', tenant: 'oem-123' })).toContain(
+      a.nodeId(),
+    );
+
+    // Non-matching tenant — own node id is excluded (tenant-tagged
+    // peer is invisible to other-tenant queries).
+    expect(a.findNodesScoped(filter, { kind: 'tenant', tenant: 'corp-acme' })).not.toContain(
+      a.nodeId(),
+    );
+
+    // GlobalOnly — tenant-tagged peer also excluded.
+    expect(a.findNodesScoped(filter, { kind: 'globalOnly' })).not.toContain(a.nodeId());
+  });
+
+  it('findNodesScoped: untagged Global peer remains visible to tenant queries', async () => {
+    // The permissive default — a node that doesn't tag itself stays
+    // discoverable under tenant-scoped queries. Locks in the v1
+    // backwards-compat behaviour through the JS-side scope filter.
+    const a = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk: PSK });
+    nodes.push(a);
+
+    await a.announceCapabilities({ tags: ['gpu'] });
+
+    expect(
+      a.findNodesScoped({ requireTags: ['gpu'] }, { kind: 'tenant', tenant: 'oem-123' }),
+    ).toContain(a.nodeId());
+  });
+
+  it('findNodesScoped: regions list variant marshals correctly through NAPI', async () => {
+    // Multi-element variants (`tenants` / `regions`) take a separate
+    // path in `with_scope_filter` because they need an intermediate
+    // `Vec<&str>` whose lifetime outlives the borrow. This test
+    // hits that borrow trampoline end-to-end.
+    const a = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk: PSK });
+    nodes.push(a);
+
+    await a.announceCapabilities({
+      tags: ['relay-capable', 'scope:region:eu-west'],
+    });
+
+    const filter: CapabilityFilter = { requireTags: ['relay-capable'] };
+
+    // Multi-region list including ours — match.
+    expect(
+      a.findNodesScoped(filter, { kind: 'regions', regions: ['us-east', 'eu-west'] }),
+    ).toContain(a.nodeId());
+
+    // Multi-region list excluding ours — no match.
+    expect(
+      a.findNodesScoped(filter, { kind: 'regions', regions: ['us-east', 'ap-south'] }),
+    ).not.toContain(a.nodeId());
+  });
+
+  // Regression: P2 (Cubic) — empty-string sanitization on
+  // `tenants` / `regions` lists. Unsanitized input like `[""]`
+  // used to flow through to a `Tenants([""])` filter, which
+  // matches no real tenant and silently narrows results to
+  // Global candidates. Fix: drop empties; if list is empty
+  // after cleaning, fall back to Any.
+  it('findNodesScoped: tenants list with only empty strings falls back to Any', async () => {
+    const a = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk: PSK });
+    nodes.push(a);
+
+    // Tenant-tagged provider — without sanitization, a
+    // `tenants: [""]` query would *not* return this node
+    // (empty string never matches "oem-123") and would NOT
+    // return Global nodes either (none exist here).
+    await a.announceCapabilities({
+      tags: ['gpu', 'scope:tenant:oem-123'],
+    });
+
+    // After sanitization: `tenants: [""]` collapses to Any,
+    // which matches every non-SubnetLocal candidate including
+    // tenant-tagged ones.
+    expect(
+      a.findNodesScoped({ requireTags: ['gpu'] }, { kind: 'tenants', tenants: [''] }),
+    ).toContain(a.nodeId());
+
+    // `tenants: []` (empty list) also falls back to Any.
+    expect(
+      a.findNodesScoped({ requireTags: ['gpu'] }, { kind: 'tenants', tenants: [] }),
+    ).toContain(a.nodeId());
+  });
+
+  it('findNodesScoped: tenants list with mixed empty and real ids drops empties', async () => {
+    // P2 partial-cleaning case: `tenants: ["", "oem-123"]`
+    // sanitizes to `Tenants(["oem-123"])` — real tenant filter
+    // semantics preserved, empty entry silently dropped.
+    const a = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk: PSK });
+    nodes.push(a);
+
+    await a.announceCapabilities({
+      tags: ['gpu', 'scope:tenant:oem-123'],
+    });
+
+    expect(
+      a.findNodesScoped(
+        { requireTags: ['gpu'] },
+        { kind: 'tenants', tenants: ['', 'oem-123'] },
+      ),
+    ).toContain(a.nodeId());
+
+    // Real tenant filter: empty + non-matching tenant excludes us.
+    expect(
+      a.findNodesScoped(
+        { requireTags: ['gpu'] },
+        { kind: 'tenants', tenants: ['', 'corp-acme'] },
+      ),
+    ).not.toContain(a.nodeId());
+  });
+
+  it('findNodesScoped: regions list with only empty strings falls back to Any', async () => {
+    // Same shape as the tenants regression but for regions.
+    const a = await MeshNode.create({ bindAddr: '127.0.0.1:0', psk: PSK });
+    nodes.push(a);
+
+    await a.announceCapabilities({
+      tags: ['relay-capable', 'scope:region:eu-west'],
+    });
+
+    expect(
+      a.findNodesScoped(
+        { requireTags: ['relay-capable'] },
+        { kind: 'regions', regions: [''] },
+      ),
+    ).toContain(a.nodeId());
+
+    expect(
+      a.findNodesScoped(
+        { requireTags: ['relay-capable'] },
+        { kind: 'regions', regions: [] },
+      ),
+    ).toContain(a.nodeId());
   });
 });

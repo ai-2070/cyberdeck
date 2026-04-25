@@ -59,7 +59,7 @@ typedef enum {
     NET_ERR_TOKEN_DELEGATION_EXHAUSTED = -125,
     NET_ERR_TOKEN_DELEGATION_NOT_ALLOWED = -126,
     NET_ERR_TOKEN_NOT_AUTHORIZED = -127,
-    /* Capability announce / find_peers errors. Wraps core
+    /* Capability announce / find_nodes errors. Wraps core
      * `AdapterError` when announcement dispatch fails. */
     NET_ERR_CAPABILITY = -128,
     /* NAT-traversal surface (compiled when the Rust cdylib has
@@ -637,7 +637,7 @@ int      net_mesh_clear_reflex_override(net_meshnode_t* handle);
 int      net_channel_hash(const char* channel, uint16_t* out_hash);
 
 /* =========================================================================
- * Capabilities (announce / find_peers).
+ * Capabilities (announce / find_nodes).
  *
  * `caps_json` is the same POJO shape as PyO3 / NAPI:
  *   { "hardware": {...}, "software": {...},
@@ -654,11 +654,53 @@ int      net_channel_hash(const char* channel, uint16_t* out_hash);
 int      net_mesh_announce_capabilities(net_meshnode_t* handle,
                                         const char* caps_json);
 
-/* Writes a JSON array `[node_id, ...]` of matching peers (including
+/* Writes a JSON array `[node_id, ...]` of matching nodes (including
  * own node id when self-match). Free `*out_json` via `net_free_string`. */
-int      net_mesh_find_peers(net_meshnode_t* handle,
+int      net_mesh_find_nodes(net_meshnode_t* handle,
                              const char* filter_json,
                              char** out_json, size_t* out_len);
+
+/* Scoped variant of `net_mesh_find_nodes`. `scope_json` is a tagged
+ * union by `kind`:
+ *   {"kind": "any"}                              — all non-SubnetLocal nodes
+ *   {"kind": "global_only"}                      — only untagged nodes
+ *   {"kind": "same_subnet"}                      — caller's subnet only
+ *   {"kind": "tenant", "tenant": "<id>"}         — that tenant + Global
+ *   {"kind": "tenants", "tenants": ["<id>", …]}  — any of those + Global
+ *   {"kind": "region", "region": "<name>"}       — that region + Global
+ *   {"kind": "regions", "regions": ["<name>", …]}— any of those + Global
+ *
+ * Untagged nodes resolve to Global and stay visible under most
+ * filters; nodes tagged `scope:subnet-local` only show up under
+ * `same_subnet`. */
+int      net_mesh_find_nodes_scoped(net_meshnode_t* handle,
+                                    const char* filter_json,
+                                    const char* scope_json,
+                                    char** out_json, size_t* out_len);
+
+/* Pick the best-scoring node for a placement requirement. Writes
+ * the winning node id to `*out_node_id` and `1` to `*out_has_match`
+ * on hit; writes `0` to `*out_has_match` on no match. Returns 0 in
+ * either case; non-zero only on input / parse error.
+ *
+ * `requirement_json` is `{"filter": <CapabilityFilter>,
+ * "prefer_more_memory": f, "prefer_more_vram": f,
+ * "prefer_faster_inference": f, "prefer_loaded_models": f}` —
+ * weights are optional and clamped to `[0.0, 1.0]`. */
+int      net_mesh_find_best_node(net_meshnode_t* handle,
+                                 const char* requirement_json,
+                                 uint64_t* out_node_id,
+                                 int* out_has_match);
+
+/* Scoped variant of `net_mesh_find_best_node`. `scope_json` accepts
+ * the same shapes as `net_mesh_find_nodes_scoped`. Picks the highest-
+ * scoring node within the scope-filtered set. Same out-param
+ * contract as `net_mesh_find_best_node`. */
+int      net_mesh_find_best_node_scoped(net_meshnode_t* handle,
+                                        const char* requirement_json,
+                                        const char* scope_json,
+                                        uint64_t* out_node_id,
+                                        int* out_has_match);
 
 /* Normalize a GPU vendor string to canonical lowercase
  * (`"nvidia"` | `"amd"` | `"intel"` | `"apple"` | `"qualcomm"` |

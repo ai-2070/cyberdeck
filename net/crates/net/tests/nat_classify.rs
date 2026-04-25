@@ -18,7 +18,7 @@
 //! - **`nat:*` tag rides the broadcast.** After reclassification,
 //!   the next `announce_capabilities` emits the `nat:*` tag, and a
 //!   peer can find the announcer via
-//!   `find_peers_by_filter(require_tag("nat:open"))`.
+//!   `find_nodes_by_filter(require_tag("nat:open"))`.
 //! - **Fewer than 2 peers leaves state at `Unknown`.** Running
 //!   reclassification with a lone peer is a no-op, preserving the
 //!   pre-classification `Unknown` state.
@@ -169,7 +169,7 @@ async fn reclassify_on_localhost_is_open() {
 }
 
 /// A peer receiving an announcement from a classified node can find
-/// it via `find_peers_by_filter` on the `nat:*` tag.
+/// it via `find_nodes_by_filter` on the `nat:*` tag.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nat_tag_propagates_through_capability_broadcast() {
     let (a, b, _c) = three_node_star().await;
@@ -188,7 +188,7 @@ async fn nat_tag_propagates_through_capability_broadcast() {
     let filter = CapabilityFilter::new().require_tag("nat:open");
     let mut found = false;
     for _ in 0..30 {
-        let peers = b.find_peers_by_filter(&filter);
+        let peers = b.find_nodes_by_filter(&filter);
         if peers.contains(&a.node_id()) {
             found = true;
             break;
@@ -198,7 +198,7 @@ async fn nat_tag_propagates_through_capability_broadcast() {
     assert!(
         found,
         "B should see A's `nat:open` tag within 3s; got peers: {:?}",
-        b.find_peers_by_filter(&filter),
+        b.find_nodes_by_filter(&filter),
     );
 }
 

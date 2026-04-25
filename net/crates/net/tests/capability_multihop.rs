@@ -107,13 +107,13 @@ async fn three_node_chain_propagates() {
 
     // B must see it (direct peer).
     assert!(
-        wait_until(&b, |n| n.find_peers_by_filter(&filter).contains(&a_id)).await,
+        wait_until(&b, |n| n.find_nodes_by_filter(&filter).contains(&a_id)).await,
         "B (direct peer of A) did not receive announcement",
     );
 
     // C must see it (via B's re-broadcast).
     assert!(
-        wait_until(&c, |n| n.find_peers_by_filter(&filter).contains(&a_id)).await,
+        wait_until(&c, |n| n.find_nodes_by_filter(&filter).contains(&a_id)).await,
         "C did not receive A's announcement via B's re-broadcast",
     );
 }
@@ -149,7 +149,7 @@ async fn origin_rate_limit_coalesces_bursts() {
     let a_id = a.node_id();
     let v1_filter = CapabilityFilter::new().require_tag("burst-v1");
     assert!(
-        wait_until(&b, |n| n.find_peers_by_filter(&v1_filter).contains(&a_id)).await,
+        wait_until(&b, |n| n.find_nodes_by_filter(&v1_filter).contains(&a_id)).await,
         "B did not receive the first announcement",
     );
 
@@ -165,7 +165,7 @@ async fn origin_rate_limit_coalesces_bursts() {
     // A's self-index reflects the latest tag…
     let v10_filter = CapabilityFilter::new().require_tag("burst-v10");
     assert!(
-        a.find_peers_by_filter(&v10_filter).contains(&a_id),
+        a.find_nodes_by_filter(&v10_filter).contains(&a_id),
         "A's self-index doesn't reflect the latest caps",
     );
 
@@ -176,7 +176,7 @@ async fn origin_rate_limit_coalesces_bursts() {
         let tag = format!("burst-v{}", i);
         let filter = CapabilityFilter::new().require_tag(tag);
         assert!(
-            !b.find_peers_by_filter(&filter).contains(&a_id),
+            !b.find_nodes_by_filter(&filter).contains(&a_id),
             "B received coalesced announcement (tag burst-v{}) that should have been rate-limited",
             i
         );
@@ -209,7 +209,7 @@ async fn route_install_from_multihop_receipt() {
     let filter = CapabilityFilter::new().require_tag("route-probe");
     let a_id = a.node_id();
     assert!(
-        wait_until(&c, |n| n.find_peers_by_filter(&filter).contains(&a_id)).await,
+        wait_until(&c, |n| n.find_nodes_by_filter(&filter).contains(&a_id)).await,
         "C never saw A's announcement — upstream forwarding failed",
     );
 
@@ -246,7 +246,7 @@ async fn dedup_drops_duplicate_at_converge_point() {
     // inspect the dedup cache from outside `MeshNode`, so we
     // assert the observable consequence: D's capability index
     // holds exactly one version entry for A, and the announcement
-    // lands visible via `find_peers_by_filter`.
+    // lands visible via `find_nodes_by_filter`.
     let a = build_node().await;
     let b = build_node().await;
     let c = build_node().await;
@@ -267,7 +267,7 @@ async fn dedup_drops_duplicate_at_converge_point() {
     let a_id = a.node_id();
     let filter = CapabilityFilter::new().require_tag("diamond");
     assert!(
-        wait_until(&d, |n| n.find_peers_by_filter(&filter).contains(&a_id)).await,
+        wait_until(&d, |n| n.find_nodes_by_filter(&filter).contains(&a_id)).await,
         "D did not see A's diamond announcement",
     );
 
@@ -277,12 +277,12 @@ async fn dedup_drops_duplicate_at_converge_point() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // D still shows A exactly once — the tag hasn't been
-    // "re-indexed" into a second node entry. `find_peers_by_filter`
+    // "re-indexed" into a second node entry. `find_nodes_by_filter`
     // returns each matching node at most once by construction, so
     // this is more of a liveness check than a dedup check, but it
     // does confirm no panic / double-index / cache thrash happened
     // when the duplicate arrived.
-    let hits = d.find_peers_by_filter(&filter);
+    let hits = d.find_nodes_by_filter(&filter);
     assert_eq!(
         hits.iter().filter(|&&id| id == a_id).count(),
         1,
@@ -325,7 +325,7 @@ async fn late_joiner_converges_via_multihop_rebroadcast() {
     let a_id = a.node_id();
     let filter = CapabilityFilter::new().require_tag("pre-late");
     assert!(
-        wait_until(&b, |n| n.find_peers_by_filter(&filter).contains(&a_id)).await,
+        wait_until(&b, |n| n.find_nodes_by_filter(&filter).contains(&a_id)).await,
         "B didn't see initial announcement",
     );
 
@@ -337,7 +337,7 @@ async fn late_joiner_converges_via_multihop_rebroadcast() {
     // Right after join, C hasn't seen A's caps yet — there was no
     // origin re-announce nor any multi-hop forwarding event.
     assert!(
-        !c.find_peers_by_filter(&filter).contains(&a_id),
+        !c.find_nodes_by_filter(&filter).contains(&a_id),
         "C unexpectedly converged before the re-announce"
     );
 
@@ -349,7 +349,7 @@ async fn late_joiner_converges_via_multihop_rebroadcast() {
 
     // Now C must observe A via B's forwarding of the re-announce.
     assert!(
-        wait_until(&c, |n| n.find_peers_by_filter(&filter).contains(&a_id)).await,
+        wait_until(&c, |n| n.find_nodes_by_filter(&filter).contains(&a_id)).await,
         "C never converged after A's re-announce",
     );
 }
@@ -423,7 +423,7 @@ async fn wire_replay_is_dropped_at_dedup_cache() {
     let a_id = a.node_id();
     let filter = CapabilityFilter::new().require_tag("dedup-test");
     assert!(
-        wait_until(&b, |n| n.find_peers_by_filter(&filter).contains(&a_id)).await,
+        wait_until(&b, |n| n.find_nodes_by_filter(&filter).contains(&a_id)).await,
         "B should index A's first announce",
     );
 
@@ -455,7 +455,7 @@ async fn wire_replay_is_dropped_at_dedup_cache() {
          baseline={baseline}, after={after}",
     );
     assert!(
-        b.find_peers_by_filter(&filter).contains(&a_id),
+        b.find_nodes_by_filter(&filter).contains(&a_id),
         "A's tag should still be indexed after the replay barrage",
     );
 }
@@ -522,7 +522,7 @@ async fn version_collision_from_same_origin_is_dropped_at_dedup_cache() {
     let first_filter = CapabilityFilter::new().require_tag("first");
     assert!(
         wait_until(&b, |n| n
-            .find_peers_by_filter(&first_filter)
+            .find_nodes_by_filter(&first_filter)
             .contains(&a_id))
         .await,
         "B should index announcement #1 (tag=first, v=42)",
@@ -547,11 +547,11 @@ async fn version_collision_from_same_origin_is_dropped_at_dedup_cache() {
     // split-brain.
     let second_filter = CapabilityFilter::new().require_tag("second");
     assert!(
-        !b.find_peers_by_filter(&second_filter).contains(&a_id),
+        !b.find_nodes_by_filter(&second_filter).contains(&a_id),
         "B must not have #2's tag — dedup dropped the collision",
     );
     assert!(
-        b.find_peers_by_filter(&first_filter).contains(&a_id),
+        b.find_nodes_by_filter(&first_filter).contains(&a_id),
         "B must still have #1's tag (first-writer-wins)",
     );
 }
