@@ -2728,6 +2728,143 @@ pub extern "C" fn net_mesh_find_nodes_scoped(
     write_json_out(&ids, out_json, out_len)
 }
 
+/// JSON shape of [`CapabilityRequirement`] for the C ABI. Mirrors
+/// the field set of the core type with snake_case keys; weights are
+/// f32 in [0.0, 1.0] (the core clamps).
+///
+/// ```text
+/// {
+///   "filter": { … CapabilityFilter shape … },
+///   "prefer_more_memory":     0.5,
+///   "prefer_more_vram":       1.0,
+///   "prefer_faster_inference": 0.0,
+///   "prefer_loaded_models":   0.0
+/// }
+/// ```
+#[derive(serde::Deserialize)]
+struct CapabilityRequirementJson {
+    #[serde(default)]
+    filter: CapabilityFilterJson,
+    #[serde(default)]
+    prefer_more_memory: f32,
+    #[serde(default)]
+    prefer_more_vram: f32,
+    #[serde(default)]
+    prefer_faster_inference: f32,
+    #[serde(default)]
+    prefer_loaded_models: f32,
+}
+
+fn capability_requirement_from_json(
+    j: CapabilityRequirementJson,
+) -> crate::adapter::net::behavior::capability::CapabilityRequirement {
+    crate::adapter::net::behavior::capability::CapabilityRequirement::from_filter(
+        capability_filter_from_json(j.filter),
+    )
+    .prefer_memory(j.prefer_more_memory)
+    .prefer_vram(j.prefer_more_vram)
+    .prefer_speed(j.prefer_faster_inference)
+    .prefer_loaded(j.prefer_loaded_models)
+}
+
+/// Pick the best-scoring node for a placement requirement. Writes
+/// the winning node id to `*out_node_id` and `1` to `*out_has_match`
+/// when a node matches; writes `0` to `*out_has_match` and leaves
+/// `*out_node_id` untouched when no node matches. Returns `0` for
+/// success in either case; non-zero only on input / parse error.
+///
+/// `requirement_json` is the JSON form documented on the private
+/// `CapabilityRequirementJson` struct above — a `filter` object
+/// plus four optional `prefer_*` weights in `[0.0, 1.0]`.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_find_best_node(
+    handle: *mut MeshNodeHandle,
+    requirement_json: *const c_char,
+    out_node_id: *mut u64,
+    out_has_match: *mut c_int,
+) -> c_int {
+    if handle.is_null()
+        || requirement_json.is_null()
+        || out_node_id.is_null()
+        || out_has_match.is_null()
+    {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let Some(s) = (unsafe { c_str_to_str(requirement_json) }) else {
+        return NetError::InvalidUtf8.into();
+    };
+    let parsed: CapabilityRequirementJson = match serde_json::from_str(s) {
+        Ok(v) => v,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
+    let req = capability_requirement_from_json(parsed);
+    match h.inner.find_best_node(&req) {
+        Some(node_id) => unsafe {
+            *out_node_id = node_id;
+            *out_has_match = 1;
+        },
+        None => unsafe {
+            *out_has_match = 0;
+        },
+    }
+    0
+}
+
+/// Scoped variant of [`net_mesh_find_best_node`]. Filters
+/// candidates through `scope_json` (same shape as
+/// [`net_mesh_find_nodes_scoped`]) before scoring; picks the
+/// highest-scoring node within the scope-filtered set.
+///
+/// Same out-param contract as [`net_mesh_find_best_node`]:
+/// `*out_has_match = 1` + `*out_node_id = winner` on hit;
+/// `*out_has_match = 0` on no match.
+#[unsafe(no_mangle)]
+pub extern "C" fn net_mesh_find_best_node_scoped(
+    handle: *mut MeshNodeHandle,
+    requirement_json: *const c_char,
+    scope_json: *const c_char,
+    out_node_id: *mut u64,
+    out_has_match: *mut c_int,
+) -> c_int {
+    if handle.is_null()
+        || requirement_json.is_null()
+        || scope_json.is_null()
+        || out_node_id.is_null()
+        || out_has_match.is_null()
+    {
+        return NetError::NullPointer.into();
+    }
+    let h = unsafe { &*handle };
+    let Some(req_s) = (unsafe { c_str_to_str(requirement_json) }) else {
+        return NetError::InvalidUtf8.into();
+    };
+    let Some(scope_s) = (unsafe { c_str_to_str(scope_json) }) else {
+        return NetError::InvalidUtf8.into();
+    };
+    let parsed_req: CapabilityRequirementJson = match serde_json::from_str(req_s) {
+        Ok(v) => v,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
+    let parsed_scope: ScopeFilterJson = match serde_json::from_str(scope_s) {
+        Ok(v) => v,
+        Err(_) => return NetError::InvalidJson.into(),
+    };
+    let req = capability_requirement_from_json(parsed_req);
+    let owned = scope_filter_from_json(parsed_scope);
+    let result = with_scope_filter(&owned, |sf| h.inner.find_best_node_scoped(&req, sf));
+    match result {
+        Some(node_id) => unsafe {
+            *out_node_id = node_id;
+            *out_has_match = 1;
+        },
+        None => unsafe {
+            *out_has_match = 0;
+        },
+    }
+    0
+}
+
 /// Normalize a GPU vendor string to its canonical lowercase form.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_normalize_gpu_vendor(

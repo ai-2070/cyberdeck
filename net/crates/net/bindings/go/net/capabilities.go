@@ -263,6 +263,87 @@ func (m *MeshNode) FindNodesScoped(filter CapabilityFilter, scope ScopeFilter) (
 	return ids, nil
 }
 
+// CapabilityRequirement is a placement requirement: a base
+// capability filter plus optional scoring weights. Higher weight
+// (in [0.0, 1.0]) tips ties toward more memory / VRAM / faster
+// inference / pre-loaded models. Weights are clamped on the Rust
+// side; values outside the range are silently capped.
+type CapabilityRequirement struct {
+	Filter                CapabilityFilter `json:"filter"`
+	PreferMoreMemory      float32          `json:"prefer_more_memory,omitempty"`
+	PreferMoreVRAM        float32          `json:"prefer_more_vram,omitempty"`
+	PreferFasterInference float32          `json:"prefer_faster_inference,omitempty"`
+	PreferLoadedModels    float32          `json:"prefer_loaded_models,omitempty"`
+}
+
+// FindBestNode picks the highest-scoring node for a placement
+// requirement. Returns `(nodeId, true, nil)` on hit,
+// `(0, false, nil)` on no match, or `(_, _, err)` on parse / FFI
+// failure. The boolean disambiguates "no match" from `nodeId == 0`,
+// which is a valid id.
+func (m *MeshNode) FindBestNode(req CapabilityRequirement) (uint64, bool, error) {
+	data, err := json.Marshal(req)
+	if err != nil {
+		return 0, false, fmt.Errorf("marshal requirement: %w", err)
+	}
+	cJSON := C.CString(string(data))
+	defer C.free(unsafe.Pointer(cJSON))
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return 0, false, ErrShuttingDown
+	}
+	var outNodeID C.uint64_t
+	var outHasMatch C.int
+	code := C.net_mesh_find_best_node(m.handle, cJSON, &outNodeID, &outHasMatch)
+	if err := capabilityErrorFromCode(code); err != nil {
+		return 0, false, err
+	}
+	if outHasMatch == 0 {
+		return 0, false, nil
+	}
+	return uint64(outNodeID), true, nil
+}
+
+// FindBestNodeScoped is the scoped variant of FindBestNode. Filters
+// candidates through `scope` (same semantics as FindNodesScoped)
+// before scoring; returns the highest-scoring node within the
+// scope-filtered set.
+func (m *MeshNode) FindBestNodeScoped(
+	req CapabilityRequirement,
+	scope ScopeFilter,
+) (uint64, bool, error) {
+	reqJSON, err := json.Marshal(req)
+	if err != nil {
+		return 0, false, fmt.Errorf("marshal requirement: %w", err)
+	}
+	scopeJSON, err := json.Marshal(scope)
+	if err != nil {
+		return 0, false, fmt.Errorf("marshal scope: %w", err)
+	}
+	cReq := C.CString(string(reqJSON))
+	defer C.free(unsafe.Pointer(cReq))
+	cScope := C.CString(string(scopeJSON))
+	defer C.free(unsafe.Pointer(cScope))
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return 0, false, ErrShuttingDown
+	}
+	var outNodeID C.uint64_t
+	var outHasMatch C.int
+	code := C.net_mesh_find_best_node_scoped(m.handle, cReq, cScope, &outNodeID, &outHasMatch)
+	if err := capabilityErrorFromCode(code); err != nil {
+		return 0, false, err
+	}
+	if outHasMatch == 0 {
+		return 0, false, nil
+	}
+	return uint64(outNodeID), true, nil
+}
+
 // NormalizeGPUVendor maps a GPU vendor string to its canonical
 // lowercase form (`nvidia`, `amd`, `intel`, `apple`, `qualcomm`,
 // `unknown`). Matches the NAPI / PyO3 helper so every SDK produces

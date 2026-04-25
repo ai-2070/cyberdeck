@@ -277,6 +277,99 @@ func TestFindNodesScoped_GlobalNodeVisibleToTenantQuery(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// FindBestNode — scored placement
+// ---------------------------------------------------------------------------
+
+func TestFindBestNode_SelfMatchesOnFilter(t *testing.T) {
+	m := newMeshForCaps(t)
+	defer m.Shutdown()
+
+	if err := m.AnnounceCapabilities(CapabilitySet{
+		Hardware: &HardwareCaps{
+			MemoryMB: 65_536,
+			GPU:      &GPUInfo{Vendor: "nvidia", Model: "h100", VRAMMB: 81_920},
+		},
+		Tags: []string{"gpu"},
+	}); err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+	// Filter that matches us; weights aren't load-bearing for a
+	// single-candidate set but exercise the scoring path.
+	req := CapabilityRequirement{
+		Filter:           CapabilityFilter{RequireGPU: true, MinVRAMMB: 40_000},
+		PreferMoreVRAM:   1.0,
+		PreferMoreMemory: 0.5,
+	}
+	nodeID, ok, err := m.FindBestNode(req)
+	if err != nil {
+		t.Fatalf("find_best_node: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected a match, got none")
+	}
+	if nodeID != m.NodeID() {
+		t.Fatalf("expected own node id %d, got %d", m.NodeID(), nodeID)
+	}
+}
+
+func TestFindBestNode_NoMatchReturnsFalseNotError(t *testing.T) {
+	m := newMeshForCaps(t)
+	defer m.Shutdown()
+
+	if err := m.AnnounceCapabilities(CapabilitySet{Tags: []string{"cpu"}}); err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+	req := CapabilityRequirement{
+		Filter: CapabilityFilter{RequireGPU: true},
+	}
+	nodeID, ok, err := m.FindBestNode(req)
+	if err != nil {
+		t.Fatalf("find_best_node: %v", err)
+	}
+	if ok {
+		t.Fatalf("expected no match, got node %d", nodeID)
+	}
+	if nodeID != 0 {
+		t.Fatalf("expected nodeID=0 on miss, got %d", nodeID)
+	}
+}
+
+func TestFindBestNodeScoped_SelfMatchesUnderTenantScope(t *testing.T) {
+	m := newMeshForCaps(t)
+	defer m.Shutdown()
+
+	if err := m.AnnounceCapabilities(CapabilitySet{
+		Tags: []string{"model:llama3-70b", "scope:tenant:oem-123"},
+	}); err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+
+	req := CapabilityRequirement{
+		Filter: CapabilityFilter{RequireTags: []string{"model:llama3-70b"}},
+	}
+
+	// Tenant("oem-123") — own node matches.
+	nodeID, ok, err := m.FindBestNodeScoped(req, ScopeFilter{Kind: "tenant", Tenant: "oem-123"})
+	if err != nil {
+		t.Fatalf("find_best_node_scoped tenant=oem-123: %v", err)
+	}
+	if !ok || nodeID != m.NodeID() {
+		t.Fatalf("expected own node id %d under matching tenant, got (%d, %v)",
+			m.NodeID(), nodeID, ok)
+	}
+
+	// Tenant("corp-acme") — no match (different tenant; tenant-tagged
+	// nodes are excluded from non-matching tenant queries).
+	nodeID, ok, err = m.FindBestNodeScoped(req, ScopeFilter{Kind: "tenant", Tenant: "corp-acme"})
+	if err != nil {
+		t.Fatalf("find_best_node_scoped tenant=corp-acme: %v", err)
+	}
+	if ok {
+		t.Fatalf("expected no match under non-matching tenant, got node %d", nodeID)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Constructor kwargs (capability_gc + signed)
 // ---------------------------------------------------------------------------
 

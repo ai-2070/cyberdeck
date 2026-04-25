@@ -678,6 +678,30 @@ int      net_mesh_find_nodes_scoped(net_meshnode_t* handle,
                                     const char* scope_json,
                                     char** out_json, size_t* out_len);
 
+/* Pick the best-scoring node for a placement requirement. Writes
+ * the winning node id to `*out_node_id` and `1` to `*out_has_match`
+ * on hit; writes `0` to `*out_has_match` on no match. Returns 0 in
+ * either case; non-zero only on input / parse error.
+ *
+ * `requirement_json` is `{"filter": <CapabilityFilter>,
+ * "prefer_more_memory": f, "prefer_more_vram": f,
+ * "prefer_faster_inference": f, "prefer_loaded_models": f}` —
+ * weights are optional and clamped to `[0.0, 1.0]`. */
+int      net_mesh_find_best_node(net_meshnode_t* handle,
+                                 const char* requirement_json,
+                                 uint64_t* out_node_id,
+                                 int* out_has_match);
+
+/* Scoped variant of `net_mesh_find_best_node`. `scope_json` accepts
+ * the same shapes as `net_mesh_find_nodes_scoped`. Picks the highest-
+ * scoring node within the scope-filtered set. Same out-param
+ * contract as `net_mesh_find_best_node`. */
+int      net_mesh_find_best_node_scoped(net_meshnode_t* handle,
+                                        const char* requirement_json,
+                                        const char* scope_json,
+                                        uint64_t* out_node_id,
+                                        int* out_has_match);
+
 /* Normalize a GPU vendor string to canonical lowercase
  * (`"nvidia"` | `"amd"` | `"intel"` | `"apple"` | `"qualcomm"` |
  * `"unknown"`). Writes the result via `*out` / `*out_len`; free via
