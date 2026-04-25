@@ -460,11 +460,17 @@ pub fn scope_filter_from_py(d: &Bound<'_, PyDict>) -> PyResult<ScopeFilterOwned>
             _ => ScopeFilterOwned::Any,
         },
         "tenants" => {
+            // Drop empty tenant ids before constructing the filter.
+            // `scope_from_tags` rejects empty announcements, so a
+            // query containing `[""]` would never match a real
+            // tenant and would only pin to Global candidates. Fall
+            // back to Any when the cleaned list is empty (Cubic P2).
             let ts = get_opt_str_list(d, "tenants")?;
-            if ts.is_empty() {
+            let cleaned: Vec<String> = ts.into_iter().filter(|t| !t.is_empty()).collect();
+            if cleaned.is_empty() {
                 ScopeFilterOwned::Any
             } else {
-                ScopeFilterOwned::Tenants(ts)
+                ScopeFilterOwned::Tenants(cleaned)
             }
         }
         "region" => match get_opt_str(d, "region")? {
@@ -472,11 +478,13 @@ pub fn scope_filter_from_py(d: &Bound<'_, PyDict>) -> PyResult<ScopeFilterOwned>
             _ => ScopeFilterOwned::Any,
         },
         "regions" => {
+            // Same reasoning as `tenants` above (Cubic P2).
             let rs = get_opt_str_list(d, "regions")?;
-            if rs.is_empty() {
+            let cleaned: Vec<String> = rs.into_iter().filter(|r| !r.is_empty()).collect();
+            if cleaned.is_empty() {
                 ScopeFilterOwned::Any
             } else {
-                ScopeFilterOwned::Regions(rs)
+                ScopeFilterOwned::Regions(cleaned)
             }
         }
         _ => ScopeFilterOwned::Any,

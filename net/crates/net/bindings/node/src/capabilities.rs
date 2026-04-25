@@ -515,16 +515,36 @@ pub fn scope_filter_from_js(f: ScopeFilterJs) -> ScopeFilterOwned {
             _ => ScopeFilterOwned::Any,
         },
         "tenants" => match f.tenants {
-            Some(ts) if !ts.is_empty() => ScopeFilterOwned::Tenants(ts),
-            _ => ScopeFilterOwned::Any,
+            Some(ts) => {
+                // Drop empty tenant ids — `scope_from_tags` rejects
+                // empty announcements, so passing `[""]` through as a
+                // query would never match real tenants and would only
+                // pin to Global candidates (since `Tenants(["",])` is
+                // a valid filter that matches no tenant tag). Cubic P2.
+                let cleaned: Vec<String> = ts.into_iter().filter(|t| !t.is_empty()).collect();
+                if cleaned.is_empty() {
+                    ScopeFilterOwned::Any
+                } else {
+                    ScopeFilterOwned::Tenants(cleaned)
+                }
+            }
+            None => ScopeFilterOwned::Any,
         },
         "region" => match f.region {
             Some(r) if !r.is_empty() => ScopeFilterOwned::Region(r),
             _ => ScopeFilterOwned::Any,
         },
         "regions" => match f.regions {
-            Some(rs) if !rs.is_empty() => ScopeFilterOwned::Regions(rs),
-            _ => ScopeFilterOwned::Any,
+            // Same reasoning as `tenants` above (Cubic P2).
+            Some(rs) => {
+                let cleaned: Vec<String> = rs.into_iter().filter(|r| !r.is_empty()).collect();
+                if cleaned.is_empty() {
+                    ScopeFilterOwned::Any
+                } else {
+                    ScopeFilterOwned::Regions(cleaned)
+                }
+            }
+            None => ScopeFilterOwned::Any,
         },
         // Unrecognized `kind` values fall through to Any. The
         // typescript layer's tagged union catches typos at compile

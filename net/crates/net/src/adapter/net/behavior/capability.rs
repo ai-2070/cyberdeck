@@ -3073,4 +3073,80 @@ mod tests {
             false
         ));
     }
+
+    // ========================================================================
+    // CapabilitySet builders for reserved scope tags
+    // ========================================================================
+
+    #[test]
+    fn with_tenant_scope_appends_prefixed_tag() {
+        let caps = CapabilitySet::new()
+            .add_tag("gpu")
+            .with_tenant_scope("oem-123");
+        assert!(caps.has_tag("gpu"));
+        assert!(caps.has_tag("scope:tenant:oem-123"));
+
+        // The tag list resolves through `scope_from_tags` to the
+        // expected variant — proves the builder writes the form
+        // the resolver matches on.
+        assert_eq!(
+            scope_from_tags(&caps.tags),
+            CapabilityScope::Tenants(vec!["oem-123".to_string()]),
+        );
+    }
+
+    #[test]
+    fn with_tenant_scope_is_idempotent_and_drops_empty() {
+        let caps = CapabilitySet::new()
+            .with_tenant_scope("oem-123")
+            .with_tenant_scope("oem-123") // duplicate
+            .with_tenant_scope(""); // empty — silently dropped
+        let tenant_tags: Vec<&String> = caps
+            .tags
+            .iter()
+            .filter(|t| t.starts_with(TAG_SCOPE_TENANT_PREFIX))
+            .collect();
+        assert_eq!(
+            tenant_tags.len(),
+            1,
+            "duplicate not deduped: {:?}",
+            caps.tags
+        );
+        assert_eq!(tenant_tags[0], "scope:tenant:oem-123");
+    }
+
+    #[test]
+    fn with_region_and_subnet_local_scope_compose_with_resolver() {
+        // Region builder produces a Regions scope.
+        let caps_region = CapabilitySet::new().with_region_scope("eu-west");
+        assert!(caps_region.has_tag("scope:region:eu-west"));
+        assert_eq!(
+            scope_from_tags(&caps_region.tags),
+            CapabilityScope::Regions(vec!["eu-west".to_string()]),
+        );
+
+        // Empty region is dropped by the builder (matches the
+        // resolver's empty-id rejection).
+        let caps_empty_region = CapabilitySet::new().with_region_scope("");
+        assert!(caps_empty_region.tags.is_empty());
+
+        // SubnetLocal builder is idempotent and dominates tenant
+        // tags (strictest scope wins) — the resolver test below
+        // is what locks in the precedence; the builder just has
+        // to produce a list the resolver reads correctly.
+        let caps_local = CapabilitySet::new()
+            .with_tenant_scope("oem-123")
+            .with_subnet_local_scope()
+            .with_subnet_local_scope(); // idempotent
+        let local_tags: Vec<&String> = caps_local
+            .tags
+            .iter()
+            .filter(|t| t.as_str() == TAG_SCOPE_SUBNET_LOCAL)
+            .collect();
+        assert_eq!(local_tags.len(), 1);
+        assert_eq!(
+            scope_from_tags(&caps_local.tags),
+            CapabilityScope::SubnetLocal
+        );
+    }
 }

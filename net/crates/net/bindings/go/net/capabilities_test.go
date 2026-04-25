@@ -334,6 +334,109 @@ func TestFindBestNode_NoMatchReturnsFalseNotError(t *testing.T) {
 	}
 }
 
+// Regression: P2 (Cubic) — empty-string sanitization on
+// `Tenants` / `Regions` lists. Unsanitized input like `[""]` used
+// to flow through to a `Tenants([""])` filter, which matches no
+// real tenant and silently narrows results to Global candidates.
+// Fix: drop empties; fall back to Any when cleaned list is empty.
+
+func TestFindNodesScoped_TenantsEmptyListFallsBackToAny(t *testing.T) {
+	m := newMeshForCaps(t)
+	defer m.Shutdown()
+
+	// Tenant-tagged provider — without sanitization, a
+	// `tenants: [""]` query would NOT return this node, and
+	// would NOT return any Global node either.
+	if err := m.AnnounceCapabilities(CapabilitySet{
+		Tags: []string{"gpu", "scope:tenant:oem-123"},
+	}); err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+	filter := CapabilityFilter{RequireTags: []string{"gpu"}}
+
+	// `[""]` sanitizes to Any → matches own node.
+	peers, err := m.FindNodesScoped(filter, ScopeFilter{Kind: "tenants", Tenants: []string{""}})
+	if err != nil {
+		t.Fatalf("find_nodes_scoped tenants=[\"\"]: %v", err)
+	}
+	if !slices.Contains(peers, m.NodeID()) {
+		t.Fatalf("tenants=[\"\"] must fall back to Any (P2 regression); got %v", peers)
+	}
+
+	// `nil` / empty list also falls back to Any.
+	peers, err = m.FindNodesScoped(filter, ScopeFilter{Kind: "tenants", Tenants: []string{}})
+	if err != nil {
+		t.Fatalf("find_nodes_scoped tenants=[]: %v", err)
+	}
+	if !slices.Contains(peers, m.NodeID()) {
+		t.Fatalf("tenants=[] must fall back to Any; got %v", peers)
+	}
+}
+
+func TestFindNodesScoped_TenantsPartialCleanDropsEmpties(t *testing.T) {
+	m := newMeshForCaps(t)
+	defer m.Shutdown()
+
+	if err := m.AnnounceCapabilities(CapabilitySet{
+		Tags: []string{"gpu", "scope:tenant:oem-123"},
+	}); err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+	filter := CapabilityFilter{RequireTags: []string{"gpu"}}
+
+	// `["", "oem-123"]` sanitizes to `Tenants(["oem-123"])`.
+	peers, err := m.FindNodesScoped(filter, ScopeFilter{
+		Kind:    "tenants",
+		Tenants: []string{"", "oem-123"},
+	})
+	if err != nil {
+		t.Fatalf("find_nodes_scoped: %v", err)
+	}
+	if !slices.Contains(peers, m.NodeID()) {
+		t.Fatalf("partial-clean must keep \"oem-123\" filter; got %v", peers)
+	}
+
+	// `["", "corp-acme"]` excludes us (different tenant).
+	peers, err = m.FindNodesScoped(filter, ScopeFilter{
+		Kind:    "tenants",
+		Tenants: []string{"", "corp-acme"},
+	})
+	if err != nil {
+		t.Fatalf("find_nodes_scoped: %v", err)
+	}
+	if slices.Contains(peers, m.NodeID()) {
+		t.Fatalf("partial-clean with non-matching tenant must exclude us; got %v", peers)
+	}
+}
+
+func TestFindNodesScoped_RegionsEmptyListFallsBackToAny(t *testing.T) {
+	m := newMeshForCaps(t)
+	defer m.Shutdown()
+
+	if err := m.AnnounceCapabilities(CapabilitySet{
+		Tags: []string{"relay-capable", "scope:region:eu-west"},
+	}); err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+	filter := CapabilityFilter{RequireTags: []string{"relay-capable"}}
+
+	peers, err := m.FindNodesScoped(filter, ScopeFilter{Kind: "regions", Regions: []string{""}})
+	if err != nil {
+		t.Fatalf("find_nodes_scoped regions=[\"\"]: %v", err)
+	}
+	if !slices.Contains(peers, m.NodeID()) {
+		t.Fatalf("regions=[\"\"] must fall back to Any (P2 regression); got %v", peers)
+	}
+
+	peers, err = m.FindNodesScoped(filter, ScopeFilter{Kind: "regions", Regions: []string{}})
+	if err != nil {
+		t.Fatalf("find_nodes_scoped regions=[]: %v", err)
+	}
+	if !slices.Contains(peers, m.NodeID()) {
+		t.Fatalf("regions=[] must fall back to Any; got %v", peers)
+	}
+}
+
 func TestFindBestNodeScoped_SelfMatchesUnderTenantScope(t *testing.T) {
 	m := newMeshForCaps(t)
 	defer m.Shutdown()

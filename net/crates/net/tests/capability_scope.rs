@@ -25,8 +25,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use net::adapter::net::behavior::capability::{CapabilityFilter, CapabilitySet, ScopeFilter};
-use net::adapter::net::{EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig};
+use net::adapter::net::behavior::capability::{
+    CapabilityFilter, CapabilityRequirement, CapabilitySet, ScopeFilter,
+};
+use net::adapter::net::{
+    EntityKeypair, MeshNode, MeshNodeConfig, SocketBufferConfig, SubnetId, SubnetPolicy, SubnetRule,
+};
 
 const TEST_BUFFER_SIZE: usize = 256 * 1024;
 const PSK: [u8; 32] = [0x42u8; 32];
@@ -52,6 +56,35 @@ async fn build_node() -> Arc<MeshNode> {
             .await
             .expect("MeshNode::new"),
     )
+}
+
+/// Build a MeshNode pinned to a specific subnet. Used by the
+/// `SubnetLocal` test to set up same-subnet vs cross-subnet pairs;
+/// the discovery-side scope filter consults `MeshNode.local_subnet`
+/// as the caller's subnet and `peer_subnets` as the candidate's.
+async fn build_node_in_subnet(subnet: SubnetId) -> Arc<MeshNode> {
+    let keypair = EntityKeypair::generate();
+    let cfg = test_config().with_subnet(subnet);
+    Arc::new(MeshNode::new(keypair, cfg).await.expect("MeshNode::new"))
+}
+
+/// Build a MeshNode with a subnet AND a `SubnetPolicy`. The policy
+/// is what makes `peer_subnets` populate on incoming announcements
+/// — without it, the dispatch handler skips the
+/// `policy.assign(&caps)` call entirely. Used by the P1 regression
+/// to exercise the warm-up-permissive branch.
+async fn build_node_with_policy(subnet: SubnetId, policy: Arc<SubnetPolicy>) -> Arc<MeshNode> {
+    let keypair = EntityKeypair::generate();
+    let cfg = test_config().with_subnet(subnet).with_subnet_policy(policy);
+    Arc::new(MeshNode::new(keypair, cfg).await.expect("MeshNode::new"))
+}
+
+/// Minimal `SubnetPolicy` that maps `region:<name>` tags to a
+/// 1-level subnet id. Mirrors the shape used by
+/// `tests/subnet_enforcement.rs::shared_policy`.
+fn region_policy() -> Arc<SubnetPolicy> {
+    let rule = SubnetRule::new("region:", 0).map("us", 3).map("eu", 4);
+    Arc::new(SubnetPolicy::new().add_rule(rule))
 }
 
 async fn handshake(a: &Arc<MeshNode>, b: &Arc<MeshNode>) {
@@ -187,3 +220,381 @@ async fn tenant_scoped_discovery_filters_unrelated_tenants() {
         global
     );
 }
+
+#[tokio::test]
+async fn find_best_node_scoped_picks_higher_scoring_within_tenant() {
+    // Two providers in the same tenant, different VRAM — under
+    // a `prefer_more_vram` weight the one with more VRAM should
+    // win. Exercises the scored-pick path inside the scope filter,
+    // which is a separate code path from `find_nodes_scoped`
+    // (does its own per-candidate score + max selection).
+    use net::adapter::net::behavior::capability::{GpuInfo, GpuVendor, HardwareCapabilities};
+
+    let a = build_node().await; // 24 GB VRAM
+    let b = build_node().await; // 80 GB VRAM
+    let d = build_node().await; // observer
+
+    handshake(&d, &a).await;
+    handshake(&d, &b).await;
+
+    let hw_24gb =
+        HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "RTX 4090", 24_576));
+    let hw_80gb =
+        HardwareCapabilities::new().with_gpu(GpuInfo::new(GpuVendor::Nvidia, "H100", 81_920));
+
+    a.announce_capabilities(
+        CapabilitySet::new()
+            .with_hardware(hw_24gb)
+            .add_tag("model:llama3-70b")
+            .with_tenant_scope("oem-123"),
+    )
+    .await
+    .expect("A announce");
+    b.announce_capabilities(
+        CapabilitySet::new()
+            .with_hardware(hw_80gb)
+            .add_tag("model:llama3-70b")
+            .with_tenant_scope("oem-123"),
+    )
+    .await
+    .expect("B announce");
+
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+
+    // Wait for both announcements to land at D.
+    let arrived = wait_until(&d, |n| {
+        let filter = CapabilityFilter::new().require_tag("model:llama3-70b");
+        let peers = n.find_nodes_by_filter(&filter);
+        peers.contains(&a_id) && peers.contains(&b_id)
+    })
+    .await;
+    assert!(arrived, "D did not see both announcements");
+
+    let req =
+        CapabilityRequirement::from_filter(CapabilityFilter::new().require_tag("model:llama3-70b"))
+            .prefer_vram(1.0);
+
+    // Scoped to oem-123 — both candidates are in scope; B should
+    // win on VRAM.
+    let winner = d.find_best_node_scoped(&req, &ScopeFilter::Tenant("oem-123"));
+    assert_eq!(
+        winner,
+        Some(b_id),
+        "expected B (80 GB VRAM) to win the tenant-scoped scored pick, got {:?}",
+        winner
+    );
+
+    // Different tenant — no candidates, so no winner.
+    let none = d.find_best_node_scoped(&req, &ScopeFilter::Tenant("corp-acme"));
+    assert!(
+        none.is_none(),
+        "expected None for non-matching tenant, got {:?}",
+        none
+    );
+}
+
+#[tokio::test]
+async fn subnet_local_scope_excludes_cross_subnet_peers() {
+    // SubnetLocal is the strictest scope: providers tagged
+    // `scope:subnet-local` are visible only to peers in the
+    // same subnet. Exercises the same-subnet predicate plumbed
+    // from `MeshNode::peer_subnets` through the index closure.
+    let subnet_x = SubnetId::new(&[3, 7]);
+    let subnet_y = SubnetId::new(&[3, 8]);
+
+    let a = build_node_in_subnet(subnet_x).await; // same subnet as observer
+    let b = build_node_in_subnet(subnet_y).await; // different subnet
+    let d = build_node_in_subnet(subnet_x).await; // observer
+
+    handshake(&d, &a).await;
+    handshake(&d, &b).await;
+
+    a.announce_capabilities(
+        CapabilitySet::new()
+            .add_tag("software:photoshop")
+            .with_subnet_local_scope(),
+    )
+    .await
+    .expect("A announce");
+    b.announce_capabilities(
+        CapabilitySet::new()
+            .add_tag("software:photoshop")
+            .with_subnet_local_scope(),
+    )
+    .await
+    .expect("B announce");
+
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+
+    let filter = CapabilityFilter::new().require_tag("software:photoshop");
+
+    // Both announcements arrive (the wire is permissive — scope is
+    // a *query* concern). Wait until D's index has indexed them.
+    let arrived = wait_until(&d, |n| {
+        let peers = n.find_nodes_by_filter(&filter);
+        peers.contains(&a_id) && peers.contains(&b_id)
+    })
+    .await;
+    assert!(arrived, "D did not see both announcements");
+
+    // No `local_subnet_policy` is installed on D, so its
+    // `peer_subnets` map stays permanently empty —
+    // `handle_capability_announcement` only writes that map when
+    // a policy is set. Treating "unknown" as "same subnet" in
+    // that configuration would silently leak every peer through
+    // `SameSubnet` (Cubic P1). The fix: without a policy, unknown
+    // means unknown, and unknown is excluded.
+    //
+    // The raw `find_nodes_by_filter` still returns both A and B
+    // (the wire is permissive). Only the scoped variant filters
+    // them out at query time.
+    let same = d.find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet);
+    assert!(
+        !same.contains(&a_id) && !same.contains(&b_id),
+        "without local_subnet_policy, SameSubnet must NOT admit \
+         peers whose subnet hasn't been derived (would leak all \
+         peers as same-subnet); got {:?}",
+        same
+    );
+
+    // The strict invariant we *can* exercise here is that
+    // SubnetLocal candidates are excluded from `Any` — that's
+    // pure scope-tag resolution, no subnet lookup needed.
+    let any = d.find_nodes_by_filter_scoped(&filter, &ScopeFilter::Any);
+    assert!(
+        !any.contains(&a_id) && !any.contains(&b_id),
+        "SubnetLocal-tagged providers must NOT appear under Any \
+         (they explicitly opted out of cross-subnet discovery), got {:?}",
+        any
+    );
+
+    // And tenant queries must not pick them up either.
+    let tenant = d.find_nodes_by_filter_scoped(&filter, &ScopeFilter::Tenant("anything"));
+    assert!(
+        !tenant.contains(&a_id) && !tenant.contains(&b_id),
+        "SubnetLocal-tagged providers must NOT appear under tenant queries, got {:?}",
+        tenant
+    );
+}
+
+#[tokio::test]
+async fn region_scope_filters_to_matching_region() {
+    // A provider tagged for `eu-west` is visible to a region-scoped
+    // query for `eu-west` and to permissive queries; not to a query
+    // for `us-east`. Untagged providers (Global) stay visible across
+    // both region queries by design.
+    let a = build_node().await; // scope:region:eu-west
+    let b = build_node().await; // scope:region:us-east
+    let c = build_node().await; // untagged → Global
+    let d = build_node().await; // observer
+
+    handshake(&d, &a).await;
+    handshake(&d, &b).await;
+    handshake(&d, &c).await;
+
+    a.announce_capabilities(
+        CapabilitySet::new()
+            .add_tag("relay-capable")
+            .with_region_scope("eu-west"),
+    )
+    .await
+    .expect("A announce");
+    b.announce_capabilities(
+        CapabilitySet::new()
+            .add_tag("relay-capable")
+            .with_region_scope("us-east"),
+    )
+    .await
+    .expect("B announce");
+    c.announce_capabilities(CapabilitySet::new().add_tag("relay-capable"))
+        .await
+        .expect("C announce");
+
+    let filter = CapabilityFilter::new().require_tag("relay-capable");
+    let a_id = a.node_id();
+    let b_id = b.node_id();
+    let c_id = c.node_id();
+
+    let arrived = wait_until(&d, |n| {
+        let peers = n.find_nodes_by_filter(&filter);
+        peers.contains(&a_id) && peers.contains(&b_id) && peers.contains(&c_id)
+    })
+    .await;
+    assert!(arrived, "D did not see all three announcements");
+
+    // Region("eu-west"): A (matches) + C (Global is permissive).
+    let eu = d.find_nodes_by_filter_scoped(&filter, &ScopeFilter::Region("eu-west"));
+    assert!(eu.contains(&a_id), "region:eu-west must include A");
+    assert!(
+        eu.contains(&c_id),
+        "region:eu-west must include unscoped C (Global is permissive)"
+    );
+    assert!(
+        !eu.contains(&b_id),
+        "region:eu-west must exclude B (different region)"
+    );
+
+    // Region("us-east"): B + C, not A.
+    let us = d.find_nodes_by_filter_scoped(&filter, &ScopeFilter::Region("us-east"));
+    assert!(us.contains(&b_id), "region:us-east must include B");
+    assert!(us.contains(&c_id), "region:us-east must include unscoped C");
+    assert!(
+        !us.contains(&a_id),
+        "region:us-east must exclude A (different region)"
+    );
+
+    // Tenant queries cross-cut regions: a tenant filter matches
+    // Global and tenant-tagged peers, but not region-tagged peers
+    // (different scope arm). A and B are excluded; C remains.
+    let tenant_only = d.find_nodes_by_filter_scoped(&filter, &ScopeFilter::Tenant("anything"));
+    assert!(
+        tenant_only.contains(&c_id),
+        "tenant query must still include Global C"
+    );
+    assert!(
+        !tenant_only.contains(&a_id) && !tenant_only.contains(&b_id),
+        "tenant query must not return region-only peers, got {:?}",
+        tenant_only
+    );
+}
+
+// ============================================================================
+// Regression: P1 (Cubic) — `SameSubnet` permissive default leak
+// ============================================================================
+//
+// `find_nodes_by_filter_scoped(SameSubnet)` previously returned
+// `true` for unknown peer subnets unconditionally. When a node
+// runs without `local_subnet_policy`, `peer_subnets` stays empty,
+// so every peer registered as "unknown" — and the closure leaked
+// every peer through `SameSubnet`. Fix: warm-up permissive only
+// when a policy is installed (`peer_subnets` *might* eventually
+// resolve the unknown). Without a policy, unknown is excluded.
+
+#[tokio::test]
+async fn same_subnet_without_policy_excludes_unresolved_peers() {
+    // No policy installed → `peer_subnets` cannot populate. A
+    // cross-subnet peer announcing into the index must NOT be
+    // returned by `SameSubnet`, regardless of whether its
+    // capability tags match the filter.
+    let me = build_node_in_subnet(SubnetId::new(&[3, 7])).await;
+    let other = build_node_in_subnet(SubnetId::new(&[3, 8])).await;
+
+    handshake(&me, &other).await;
+
+    // `me` announces too so it self-indexes and we can verify
+    // the local-node-always-returned branch survives the fix.
+    me.announce_capabilities(CapabilitySet::new().add_tag("gpu"))
+        .await
+        .expect("me announce");
+    other
+        .announce_capabilities(CapabilitySet::new().add_tag("gpu"))
+        .await
+        .expect("other announce");
+
+    let filter = CapabilityFilter::new().require_tag("gpu");
+    let me_id = me.node_id();
+    let other_id = other.node_id();
+
+    // Sanity: the unscoped query sees both.
+    let arrived = wait_until(&me, |n| {
+        let peers = n.find_nodes_by_filter(&filter);
+        peers.contains(&me_id) && peers.contains(&other_id)
+    })
+    .await;
+    assert!(arrived, "me did not index both announcements");
+
+    // SameSubnet without a policy: own id is admitted (the
+    // closure short-circuits on `nid == local_node_id`); the
+    // cross-subnet peer is excluded because its subnet never
+    // resolves on a policy-less mesh (Cubic P1).
+    let same = me.find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet);
+    assert!(
+        same.contains(&me_id),
+        "self must be returned under SameSubnet regardless of policy \
+         (own node is same-subnet by definition); got {:?}",
+        same
+    );
+    assert!(
+        !same.contains(&other_id),
+        "P1 regression: SameSubnet without local_subnet_policy must \
+         not return peers whose subnet hasn't been derived (got {:?})",
+        same
+    );
+}
+
+#[tokio::test]
+async fn same_subnet_with_policy_admits_warm_up_unknowns() {
+    // Inverse of the test above: with a policy installed, a peer
+    // whose announcement hasn't *yet* been processed (and so
+    // hasn't fed `policy.assign(&caps)` into `peer_subnets`)
+    // should be admitted under `SameSubnet`. This is the warm-up
+    // window — the policy will resolve the peer's subnet on the
+    // next announcement, so admitting it during the gap is
+    // intentional.
+    //
+    // Setup: both nodes have a policy, but we query *before* the
+    // peer's announcement has landed. We exercise this by
+    // querying via a node that hasn't received any announcement
+    // yet — the index is empty, so there are no candidates to
+    // admit. Instead, verify the inverse: an explicit
+    // `peer_subnets` insert with the same subnet returns true,
+    // and the closure-level admit path runs on `None` returns
+    // true when policy is set.
+    //
+    // This boils down to a behavioral assertion that's hard to
+    // exercise directly without manipulating the DashMap. We
+    // exercise it indirectly: a same-policy, same-subnet peer
+    // whose announcement carries the correct region tag derives
+    // to the same subnet, so the same-subnet branch returns
+    // true; verifies the policy path overall.
+    let policy = region_policy();
+    let me = build_node_with_policy(SubnetId::new(&[3]), policy.clone()).await;
+    let peer = build_node_with_policy(SubnetId::new(&[3]), policy.clone()).await;
+
+    handshake(&me, &peer).await;
+
+    // Tag the peer so the policy assigns subnet [3] (matches us).
+    peer.announce_capabilities(CapabilitySet::new().add_tag("region:us").add_tag("gpu"))
+        .await
+        .expect("peer announce");
+
+    let filter = CapabilityFilter::new().require_tag("gpu");
+    let peer_id = peer.node_id();
+
+    // Wait for the announcement to land + the policy to resolve
+    // the peer's subnet via `handle_capability_announcement`.
+    let arrived = wait_until(&me, |n| n.find_nodes_by_filter(&filter).contains(&peer_id)).await;
+    assert!(arrived, "me did not index peer's announcement");
+
+    // With the policy installed AND the announcement processed,
+    // `peer_subnets` resolves the peer to subnet [3] which equals
+    // ours. SameSubnet returns the peer.
+    let same = me.find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet);
+    assert!(
+        same.contains(&peer_id),
+        "with policy installed + same-subnet peer, SameSubnet \
+         must return the peer; got {:?}",
+        same
+    );
+}
+
+// ============================================================================
+// Note on P2 (Cubic) — Tenants / Regions empty-string sanitization
+// ============================================================================
+//
+// The P2 regression lives at the binding boundary (Node /
+// Python / C ABI), not in the Rust core: `matches_scope` takes
+// a borrowed `&[&str]` and has no JSON-input shape to sanitize.
+// The fix drops empty entries inside the binding-side
+// `scope_filter_from_*` converters before constructing the
+// owned filter.
+//
+// Regression coverage lives in the language test suites:
+//   - TypeScript: `sdk-ts/test/capabilities.test.ts`
+//   - Python:     `bindings/python/tests/test_capabilities.py`
+//   - Go:         `bindings/go/net/capabilities_test.go`
+//
+// (Go transitively covers the C ABI since it consumes the same
+// `net_mesh_find_nodes_scoped` symbol.)

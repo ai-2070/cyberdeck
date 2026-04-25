@@ -801,8 +801,8 @@ wire format + signature invariance across hop bumps.
 - `AnnouncementScope` field (subnet-local / parent-visible /
   global). v1 is permissive-global. **Partially addressed in v2**:
   tag-based discovery scope landed via reserved `scope:*` tags +
-  `ScopeFilter` (`docs/SCOPED_CAPABILITIES_PLAN.md`). Wire-level
-  enforcement remains deferred.
+  `ScopeFilter` ([`SCOPED_CAPABILITIES_PLAN.md`](SCOPED_CAPABILITIES_PLAN.md)).
+  Wire-level enforcement remains deferred.
 - Delta / diff encoding for bandwidth reduction.
 - Gossipsub-style lazy/eager-push mesh peer selection.
 

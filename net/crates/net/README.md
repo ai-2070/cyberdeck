@@ -260,8 +260,8 @@ The `CapabilityAd` struct is what travels on the wire: compact, versioned, and s
 | ------------------------- | ------------------------------------------------------------------------------- |
 | _(no `scope:*` tag)_      | `Global` (default) — visible to every query that doesn't explicitly opt out.    |
 | `scope:subnet-local`      | Visible only under `ScopeFilter::SameSubnet` queries.                           |
-| `scope:tenant:<id>`       | Visible to `ScopeFilter::Tenant(<id>)` queries (and untagged-`Global` callers). |
-| `scope:region:<name>`     | Visible to `ScopeFilter::Region(<name>)` queries.                               |
+| `scope:tenant:<id>`       | Visible to `ScopeFilter::Tenant(<id>)` (and `Tenants` lists containing `<id>`). Hidden from other tenants and from `GlobalOnly`. |
+| `scope:region:<name>`     | Visible to `ScopeFilter::Region(<name>)` (and `Regions` lists containing `<name>`). Hidden from other regions and from `GlobalOnly`. |
 
 Strictest scope wins (`subnet-local` > tenants/regions > global). Enforcement is **query-side only**, not on the path; cross-tenant *routing* still flows freely. Full design: [`SCOPED_CAPABILITIES_PLAN.md`](docs/SCOPED_CAPABILITIES_PLAN.md).
 

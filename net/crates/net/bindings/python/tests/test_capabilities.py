@@ -176,3 +176,184 @@ def test_find_nodes_rejects_wrong_type_for_require_tags() -> None:
             m.find_nodes({"require_tags": "gpu"})  # must be list
     finally:
         m.shutdown()
+
+
+# -------------------------------------------------------------------------
+# Scoped discovery (`scope:*` reserved tags)
+# -------------------------------------------------------------------------
+#
+# The PyO3 layer has unique plumbing — `scope_filter_from_py` parses
+# the dict, `with_scope_filter` projects to the borrowed core enum.
+# These tests exercise the JS↔Rust boundary end-to-end with a
+# single-node self-match; the underlying matching logic is covered
+# by the Rust unit + integration suites.
+
+
+def test_find_nodes_scoped_tenant_self_matches_under_matching_tenant() -> None:
+    m = NetMesh(_port(9), PSK)
+    try:
+        m.announce_capabilities(
+            {"tags": ["model:llama3-70b", "scope:tenant:oem-123"]}
+        )
+
+        # Matching tenant — self appears.
+        peers = m.find_nodes_scoped(
+            {"require_tags": ["model:llama3-70b"]},
+            {"kind": "tenant", "tenant": "oem-123"},
+        )
+        assert m.node_id in peers
+
+        # Non-matching tenant — self excluded.
+        peers = m.find_nodes_scoped(
+            {"require_tags": ["model:llama3-70b"]},
+            {"kind": "tenant", "tenant": "corp-acme"},
+        )
+        assert m.node_id not in peers
+
+        # GlobalOnly — tenant-tagged node also excluded.
+        peers = m.find_nodes_scoped(
+            {"require_tags": ["model:llama3-70b"]},
+            {"kind": "global_only"},
+        )
+        assert m.node_id not in peers
+    finally:
+        m.shutdown()
+
+
+def test_find_nodes_scoped_global_node_visible_to_tenant_query() -> None:
+    # Permissive default: an untagged ("Global") node stays
+    # discoverable under tenant-scoped queries. Locks in v1
+    # backwards-compat through the dict→Rust scope-filter path.
+    m = NetMesh(_port(10), PSK)
+    try:
+        m.announce_capabilities({"tags": ["gpu"]})
+        peers = m.find_nodes_scoped(
+            {"require_tags": ["gpu"]},
+            {"kind": "tenant", "tenant": "oem-123"},
+        )
+        assert m.node_id in peers
+    finally:
+        m.shutdown()
+
+
+def test_find_nodes_scoped_regions_list_marshals_through_pyo3() -> None:
+    # Multi-element variants (`tenants` / `regions`) take a separate
+    # path in `with_scope_filter` — they need an intermediate
+    # `Vec<&str>` whose lifetime outlives the borrow. This test
+    # exercises that borrow trampoline end-to-end.
+    m = NetMesh(_port(11), PSK)
+    try:
+        m.announce_capabilities(
+            {"tags": ["relay-capable", "scope:region:eu-west"]}
+        )
+
+        # Multi-region list including ours — match.
+        peers = m.find_nodes_scoped(
+            {"require_tags": ["relay-capable"]},
+            {"kind": "regions", "regions": ["us-east", "eu-west"]},
+        )
+        assert m.node_id in peers
+
+        # Multi-region list excluding ours — no match.
+        peers = m.find_nodes_scoped(
+            {"require_tags": ["relay-capable"]},
+            {"kind": "regions", "regions": ["us-east", "ap-south"]},
+        )
+        assert m.node_id not in peers
+    finally:
+        m.shutdown()
+
+
+def test_find_nodes_scoped_camelcase_kinds_accepted() -> None:
+    # The PyO3 converter accepts both snake_case (`global_only`,
+    # `same_subnet`) and camelCase (`globalOnly`, `sameSubnet`) so
+    # cross-binding fixtures (TS uses camelCase) round-trip.
+    m = NetMesh(_port(12), PSK)
+    try:
+        m.announce_capabilities({"tags": ["gpu"]})
+        # Untagged node is Global → globalOnly returns it.
+        peers = m.find_nodes_scoped(
+            {"require_tags": ["gpu"]},
+            {"kind": "globalOnly"},
+        )
+        assert m.node_id in peers
+    finally:
+        m.shutdown()
+
+
+# Regression: P2 (Cubic) — empty-string sanitization on `tenants` /
+# `regions` lists. Unsanitized input like `[""]` used to flow through
+# to a `Tenants([""])` filter, which matches no real tenant and
+# silently narrows results to Global candidates. Fix: drop empties;
+# fall back to Any when the cleaned list is empty.
+
+
+def test_find_nodes_scoped_tenants_with_only_empty_strings_falls_back_to_any() -> None:
+    m = NetMesh(_port(13), PSK)
+    try:
+        # Tenant-tagged provider — without sanitization, a
+        # `tenants: [""]` query would not return this node and
+        # would not return any Global node either.
+        m.announce_capabilities({"tags": ["gpu", "scope:tenant:oem-123"]})
+
+        # After sanitization, `tenants: [""]` collapses to Any.
+        peers = m.find_nodes_scoped(
+            {"require_tags": ["gpu"]},
+            {"kind": "tenants", "tenants": [""]},
+        )
+        assert m.node_id in peers
+
+        # Empty list also falls back to Any.
+        peers = m.find_nodes_scoped(
+            {"require_tags": ["gpu"]},
+            {"kind": "tenants", "tenants": []},
+        )
+        assert m.node_id in peers
+    finally:
+        m.shutdown()
+
+
+def test_find_nodes_scoped_tenants_partial_clean_drops_empties() -> None:
+    m = NetMesh(_port(14), PSK)
+    try:
+        m.announce_capabilities({"tags": ["gpu", "scope:tenant:oem-123"]})
+
+        # `["", "oem-123"]` sanitizes to `Tenants(["oem-123"])`
+        # — real tenant semantics preserved, empty silently
+        # dropped.
+        peers = m.find_nodes_scoped(
+            {"require_tags": ["gpu"]},
+            {"kind": "tenants", "tenants": ["", "oem-123"]},
+        )
+        assert m.node_id in peers
+
+        # `["", "corp-acme"]` excludes us (not our tenant).
+        peers = m.find_nodes_scoped(
+            {"require_tags": ["gpu"]},
+            {"kind": "tenants", "tenants": ["", "corp-acme"]},
+        )
+        assert m.node_id not in peers
+    finally:
+        m.shutdown()
+
+
+def test_find_nodes_scoped_regions_with_only_empty_strings_falls_back_to_any() -> None:
+    m = NetMesh(_port(15), PSK)
+    try:
+        m.announce_capabilities(
+            {"tags": ["relay-capable", "scope:region:eu-west"]}
+        )
+
+        peers = m.find_nodes_scoped(
+            {"require_tags": ["relay-capable"]},
+            {"kind": "regions", "regions": [""]},
+        )
+        assert m.node_id in peers
+
+        peers = m.find_nodes_scoped(
+            {"require_tags": ["relay-capable"]},
+            {"kind": "regions", "regions": []},
+        )
+        assert m.node_id in peers
+    finally:
+        m.shutdown()

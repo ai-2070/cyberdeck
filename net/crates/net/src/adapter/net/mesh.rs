@@ -5097,8 +5097,18 @@ impl MeshNode {
     /// `scope:*` reserved tags) on top of the capability filter.
     /// `SubnetLocal` peers and the [`ScopeFilter::SameSubnet`]
     /// filter resolve same-subnet membership against
-    /// `peer_subnets` — when either side's subnet is unknown, the
-    /// candidate is admitted (warm-up permissive).
+    /// `peer_subnets`.
+    ///
+    /// **Warm-up rule.** When a peer's subnet is unknown:
+    /// - **With** a `local_subnet_policy`, the candidate is
+    ///   admitted (a fresh peer's announcement may not have
+    ///   landed yet — the policy will resolve it on receipt).
+    /// - **Without** a `local_subnet_policy`, `peer_subnets`
+    ///   stays permanently empty (the dispatch handler only
+    ///   writes it when a policy is installed), so "unknown"
+    ///   means "will never resolve" — admitting unknowns there
+    ///   leaks every peer through `SameSubnet`. The candidate
+    ///   is excluded.
     pub fn find_nodes_by_filter_scoped(
         &self,
         filter: &CapabilityFilter,
@@ -5107,6 +5117,9 @@ impl MeshNode {
         let my_subnet = self.local_subnet;
         let peer_subnets = self.peer_subnets.clone();
         let local_node_id = self.node_id;
+        // See doc-comment: without a policy, an unresolvable
+        // "unknown" cannot be admitted as same-subnet (Cubic P1).
+        let policy_installed = self.local_subnet_policy.is_some();
         self.capability_index
             .find_nodes_scoped(filter, scope, |nid| {
                 if nid == local_node_id {
@@ -5115,7 +5128,7 @@ impl MeshNode {
                 }
                 match peer_subnets.get(&nid).map(|e| *e.value()) {
                     Some(s) => s == my_subnet,
-                    None => true, // warm-up permissive
+                    None => policy_installed,
                 }
             })
     }
@@ -5538,6 +5551,9 @@ impl MeshNode {
         let my_subnet = self.local_subnet;
         let peer_subnets = self.peer_subnets.clone();
         let local_node_id = self.node_id;
+        // Same warm-up rule as `find_nodes_by_filter_scoped` —
+        // see that doc-comment for the rationale (Cubic P1).
+        let policy_installed = self.local_subnet_policy.is_some();
         self.capability_index
             .find_best_node_scoped(req, scope, |nid| {
                 if nid == local_node_id {
@@ -5545,7 +5561,7 @@ impl MeshNode {
                 }
                 match peer_subnets.get(&nid).map(|e| *e.value()) {
                     Some(s) => s == my_subnet,
-                    None => true,
+                    None => policy_installed,
                 }
             })
     }

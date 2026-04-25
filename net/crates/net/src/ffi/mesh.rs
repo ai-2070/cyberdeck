@@ -2626,16 +2626,36 @@ fn scope_filter_from_json(f: ScopeFilterJson) -> ScopeFilterOwned {
             _ => ScopeFilterOwned::Any,
         },
         "tenants" => match f.tenants {
-            Some(ts) if !ts.is_empty() => ScopeFilterOwned::Tenants(ts),
-            _ => ScopeFilterOwned::Any,
+            // Drop empty tenant ids — `scope_from_tags` rejects
+            // empty announcements, so a query containing `[""]`
+            // would never match a real tenant and would only pin
+            // to Global candidates. Fall back to Any when cleaned
+            // list is empty (Cubic P2).
+            Some(ts) => {
+                let cleaned: Vec<String> = ts.into_iter().filter(|t| !t.is_empty()).collect();
+                if cleaned.is_empty() {
+                    ScopeFilterOwned::Any
+                } else {
+                    ScopeFilterOwned::Tenants(cleaned)
+                }
+            }
+            None => ScopeFilterOwned::Any,
         },
         "region" => match f.region {
             Some(r) if !r.is_empty() => ScopeFilterOwned::Region(r),
             _ => ScopeFilterOwned::Any,
         },
         "regions" => match f.regions {
-            Some(rs) if !rs.is_empty() => ScopeFilterOwned::Regions(rs),
-            _ => ScopeFilterOwned::Any,
+            // Same reasoning as `tenants` above (Cubic P2).
+            Some(rs) => {
+                let cleaned: Vec<String> = rs.into_iter().filter(|r| !r.is_empty()).collect();
+                if cleaned.is_empty() {
+                    ScopeFilterOwned::Any
+                } else {
+                    ScopeFilterOwned::Regions(cleaned)
+                }
+            }
+            None => ScopeFilterOwned::Any,
         },
         _ => ScopeFilterOwned::Any,
     }
