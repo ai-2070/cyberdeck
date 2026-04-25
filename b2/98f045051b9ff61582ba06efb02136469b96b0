@@ -1,0 +1,69 @@
+net/crates/net/bindings/go/net/net.h
+  a9d311afc8324224 62,640,657,659
+net/crates/net/tests/nat_classify.rs
+  a9d311afc8324224 21,172,191,201
+net/crates/net/sdk-ts/src/capabilities.ts
+  a9d311afc8324224 9,25,265,383,400
+net/crates/net/src/ffi/mesh.rs
+  a9d311afc8324224 1330,2109,2520,2553,2571
+net/crates/net/tests/capability_scope.rs
+  a9d311afc8324224 5,139,150,162,174,182
+net/crates/net/sdk-ts/test/capabilities.test.ts
+  a9d311afc8324224 71,80,99,117,165-169,198,217
+net/crates/net/sdk-ts/test/channel_auth.test.ts
+  a9d311afc8324224 87,151,189
+net/crates/net/bindings/go/net/capabilities.go
+  a9d311afc8324224 1,133,151,170,173,188,196
+net/crates/net/src/adapter/net/mesh.rs
+  a9d311afc8324224 4965,5091,5095,5102,5111,5525,5529-5530,5533,5541
+net/crates/net/bindings/node/index.d.ts
+  a9d311afc8324224 770,782,784,786-787,790
+net/crates/net/tests/reflex_override.rs
+  a9d311afc8324224 180
+net/crates/net/sdk/src/capabilities.rs
+  a9d311afc8324224 32,50
+net/crates/net/bindings/node/src/lib.rs
+  a9d311afc8324224 1802,1824,1832,1838,1840-1841,1844,1854
+net/crates/net/src/adapter/net/behavior/capability.rs
+  a9d311afc8324224 694-695,1860,1886,1888
+net/crates/net/sdk/src/mesh.rs
+  a9d311afc8324224 704,738-739,742,744,746,749,754,757-764,767-769,774
+net/crates/net/tests/capability_broadcast.rs
+  a9d311afc8324224 248,272,278,301,332,341,431,485,540,602,662,761
+net/crates/net/bindings/go/net/capabilities_test.go
+  a9d311afc8324224 36,38,41,45,52,54,61,65,67,94,101,107,109,134,138,142,150,152,166,168
+net/crates/net/bindings/python/tests/test_capabilities.py
+  a9d311afc8324224 32,38,42,48,51,79,90,113,116-117,120,130,172,176
+net/crates/net/bindings/python/src/lib.rs
+  a9d311afc8324224 1737,1781,1784,1787,1796,1805
+net/crates/net/sdk-ts/test/subnets.test.ts
+  a9d311afc8324224 128-129,210,213
+net/crates/net/bindings/python/tests/test_compute.py
+  a9d311afc8324224 127,139
+net/crates/net/tests/capability_multihop.rs
+  a9d311afc8324224 110,116,152,168,179,212,249,270,280,285,328,340,352,426,458,525,550,554
+net/crates/net/sdk-ts/src/mesh.ts
+  a9d311afc8324224 524,537-538,542,555,561-562
+net/crates/net/bindings/python/src/capabilities.rs
+  a9d311afc8324224 507
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "b298f045051b9ff61582ba06efb02136469b96b0",
+  "prompts": {
+    "a9d311afc8324224": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8e12ea48-52c3-40e2-9655-6d0ab0878bb6",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 6870,
+      "total_deletions": 31866,
+      "accepted_lines": 181,
+      "overriden_lines": 0
+    }
+  }
+}
