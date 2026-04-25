@@ -233,7 +233,7 @@ contract.
 
 The full security surface — ed25519 `Identity`, `PermissionToken`
 issue / install / delegate, `CapabilityAnnouncement` broadcast +
-`find_peers`, `SubnetId` / `SubnetPolicy`, channel auth with
+`find_nodes`, `SubnetId` / `SubnetPolicy`, channel auth with
 `publish_caps` / `subscribe_caps` / `require_token` — is shipped
 on the underlying **`net`** PyO3 package, not this wrapper. Import
 directly:
@@ -243,7 +243,7 @@ from net import (
     Identity, TokenError, IdentityError,
     parse_token, verify_token, delegate_token, channel_hash,
 )
-from net import NetMesh  # adds announce_capabilities / find_peers /
+from net import NetMesh  # adds announce_capabilities / find_nodes /
                         # entity_id / subscribe_channel(..., token=)
 ```
 

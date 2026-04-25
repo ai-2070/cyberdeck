@@ -42,7 +42,7 @@ Capability announcements gossip permissively across the mesh. To narrow *who see
 
 A node may carry multiple `scope:tenant:*` / `scope:region:*` tags simultaneously. **Precedence:** `scope:subnet-local` dominates — when present, tenant/region tags are ignored by the resolver. Strictest scope wins.
 
-Enforcement is **query-side only**. The wire format, forwarder logic, and gateway rules stay untouched — `find_peers_by_filter_scoped(filter, scope)` evaluates `scope:*` tags as a post-filter on the index. Cross-tenant *routing* still flows freely; what changes is which peers a tenant-scoped query *returns*. See `docs/SCOPED_CAPABILITIES_PLAN.md` for the full design and the v3 deferred work (path-level enforcement, signed-scope, audience ACLs).
+Enforcement is **query-side only**. The wire format, forwarder logic, and gateway rules stay untouched — `find_nodes_by_filter_scoped(filter, scope)` evaluates `scope:*` tags as a post-filter on the index. Cross-tenant *routing* still flows freely; what changes is which peers a tenant-scoped query *returns*. See `docs/SCOPED_CAPABILITIES_PLAN.md` for the full design and the v3 deferred work (path-level enforcement, signed-scope, audience ACLs).
 
 ```rust
 // Provider tags itself for tenant `oem-123`.
@@ -52,7 +52,7 @@ let caps = CapabilitySet::new()
 mesh.announce_capabilities(caps).await?;
 
 // Query that filters to only that tenant + globally-tagged peers.
-let peers = mesh.find_peers_by_filter_scoped(
+let peers = mesh.find_nodes_by_filter_scoped(
     &CapabilityFilter::new().require_tag("model:llama3-70b"),
     &ScopeFilter::Tenant("oem-123"),
 );

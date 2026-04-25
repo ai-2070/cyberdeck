@@ -15,7 +15,7 @@ region only," so:
    in the mesh; client placement for an unrelated tenant happily
    picks it.
 2. **Desktop app discovery for a Deck pulls in unrelated subnets.**
-   `find_peers(software:*)` returns apps from any node in the
+   `find_nodes(software:*)` returns apps from any node in the
    mesh, not just the user's local cluster.
 3. **Regional rendezvous selection is opaque.** No way to say
    "give me a relay in `eu-west`" without burning the discovery
@@ -48,7 +48,7 @@ tags simultaneously (e.g. a GPU shared between two tenants).
 `scope:subnet-local` is mutually exclusive with the others —
 when present, it wins (see `scope_from_tags` below).
 
-**Enforcement happens at `find_peers_scoped` / `find_best_scoped`,
+**Enforcement happens at `find_nodes_scoped` / `find_best_scoped`,
 not on the wire.** The announcement still gossips permissively;
 the *consumer* of the index does the filter. This is a
 deliberate cut: it's enough for tenant- / subnet- / region-aware
@@ -115,13 +115,13 @@ For now, tag-based discovery scope is enough.
   private).
 - `ScopeFilter` enum + `matches_scope` predicate in the same
   file, exported from the crate.
-- `CapabilityIndex::find_peers_scoped(filter, scope_filter,
+- `CapabilityIndex::find_nodes_scoped(filter, scope_filter,
   my_node_id) -> Vec<u64>`.
 - `CapabilityIndex::find_best_scoped(req, scope_filter,
   my_node_id) -> Option<u64>`.
-- `MeshNode::find_peers_by_filter_scoped` /
+- `MeshNode::find_nodes_by_filter_scoped` /
   `find_best_capability_scoped` pass-throughs.
-- SDK surface (`Mesh::find_peers_scoped`,
+- SDK surface (`Mesh::find_nodes_scoped`,
   `Mesh::find_best_scoped`) in Rust + Node + Python.
 - Reserved-tag string contract documented in `BEHAVIOR.md` and
   `CHANNELS.md` cross-references.
@@ -320,7 +320,7 @@ Invariants the predicate enforces:
   doesn't tag itself is the v1 default and shouldn't disappear
   from queries.
 
-### `CapabilityIndex::find_peers_scoped`
+### `CapabilityIndex::find_nodes_scoped`
 
 Wraps the existing `query` with a scope filter applied per
 candidate:
@@ -338,7 +338,7 @@ impl CapabilityIndex {
     /// lives on `MeshNode::peer_subnets`. Closure returns `true`
     /// also for "subnet unknown" (warm-up permissive); see
     /// `ScopeFilter::SameSubnet` rationale.
-    pub fn find_peers_scoped(
+    pub fn find_nodes_scoped(
         &self,
         filter: &CapabilityFilter,
         scope_filter: &ScopeFilter<'_>,
@@ -366,7 +366,7 @@ impl CapabilityIndex {
         scope_filter: &ScopeFilter<'_>,
         same_subnet_lookup: impl FnMut(u64) -> bool,
     ) -> Option<u64> {
-        let candidates = self.find_peers_scoped(&req.filter, scope_filter, same_subnet_lookup);
+        let candidates = self.find_nodes_scoped(&req.filter, scope_filter, same_subnet_lookup);
         candidates.into_iter()
             .filter_map(|nid| {
                 self.nodes.get(&nid).map(|n| (nid, req.score(&n.capabilities)))
@@ -382,14 +382,14 @@ free of `MeshNode` knowledge. `MeshNode` provides the closure:
 
 ```rust
 impl MeshNode {
-    pub fn find_peers_scoped(
+    pub fn find_nodes_scoped(
         &self,
         filter: &CapabilityFilter,
         scope: &ScopeFilter<'_>,
     ) -> Vec<u64> {
         let my_subnet = self.local_subnet;
         let peer_subnets = self.peer_subnets.clone();
-        self.capability_index.find_peers_scoped(filter, scope, |nid| {
+        self.capability_index.find_nodes_scoped(filter, scope, |nid| {
             match peer_subnets.get(&nid).map(|e| *e.value()) {
                 Some(s) => s == my_subnet,
                 None => true, // warm-up permissive
@@ -451,7 +451,7 @@ silently dropped by `scope_from_tags` (defensive).
 ### Rust SDK (`sdk/src/capabilities.rs` + `sdk/src/mesh.rs`)
 
 - Re-export `ScopeFilter` from `net::adapter::net::behavior::capability`.
-- `Mesh::find_peers_scoped(filter, scope) -> Vec<u64>`.
+- `Mesh::find_nodes_scoped(filter, scope) -> Vec<u64>`.
 - `Mesh::find_best_scoped(req, scope) -> Option<u64>`.
 - Convenience: `CapabilitySetBuilder::tenant(t)`, `region(r)`,
   `subnet_local()`.
@@ -505,7 +505,7 @@ Integration test in `tests/capability_scope.rs` (1, three-node):
 
 7. **`tenant_scoped_discovery`** — A in tenant `oem-123`, B in
    tenant `corp-acme`, C unscoped. From a fresh node D, query
-   `find_peers_scoped(filter, ScopeFilter::Tenant("oem-123"))`.
+   `find_nodes_scoped(filter, ScopeFilter::Tenant("oem-123"))`.
    Expect: A and C in result; B excluded. Same query with
    `ScopeFilter::Any`: A, B, C all present.
 
@@ -536,7 +536,7 @@ core + 1 day for SDK surface.
 
 `src/adapter/net/behavior/capability.rs` (~40 lines):
 
-- `CapabilityIndex::find_peers_scoped` and `find_best_scoped`.
+- `CapabilityIndex::find_nodes_scoped` and `find_best_scoped`.
 - Bench target: scoped query overhead < 5% over non-scoped on a
   10k-node index — measured by adding a benchmark next to the
   existing `bench_capability_query`.
@@ -545,7 +545,7 @@ core + 1 day for SDK surface.
 
 `src/adapter/net/mesh.rs` (~30 lines):
 
-- `find_peers_scoped` and `find_best_scoped` methods that close
+- `find_nodes_scoped` and `find_best_scoped` methods that close
   over `local_subnet` + `peer_subnets`.
 - Test 7.
 
@@ -591,7 +591,7 @@ mesh.announce_capabilities(caps).await?;
 
 Tenant client:
 ```rust
-let peers = mesh.find_peers_scoped(
+let peers = mesh.find_nodes_scoped(
     &CapabilityFilter::new().require_tag("model:llama3-70b"),
     &ScopeFilter::Tenant("oem-123"),
 );

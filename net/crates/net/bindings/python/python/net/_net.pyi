@@ -281,6 +281,7 @@ class Redex:
 class RedexEvent:
     """A materialized RedEX event: `seq` + `payload` + checksum /
     inline flag. Yielded by `RedexFile.read_range` / `RedexTailIter`."""
+
     seq: int
     payload: bytes
     checksum: int
@@ -328,6 +329,7 @@ class RedexTailIter(Iterator[RedexEvent]):
 
 class Task:
     """A materialized task record."""
+
     id: int
     title: str
     status: str  # "pending" | "completed"
@@ -411,6 +413,7 @@ class TaskWatchIter(Iterator[List[Task]]):
 
 class Memory:
     """A materialized memory record."""
+
     id: int
     content: str
     tags: List[str]
@@ -522,7 +525,6 @@ class NetDb:
         with_tasks: bool = False,
         with_memories: bool = False,
     ) -> "NetDb": ...
-
     @staticmethod
     def open_from_snapshot(
         bundle: bytes,
@@ -533,15 +535,11 @@ class NetDb:
         with_tasks: bool = False,
         with_memories: bool = False,
     ) -> "NetDb": ...
-
     @property
     def tasks(self) -> Optional[TasksAdapter]: ...
-
     @property
     def memories(self) -> Optional[MemoriesAdapter]: ...
-
     def snapshot(self) -> bytes: ...
-
     def close(self) -> None: ...
 
 class CortexError(Exception):
@@ -686,7 +684,6 @@ class NetMesh:
         ...
     def peer_count(self) -> int: ...
     def discovered_nodes(self) -> int: ...
-
     def open_stream(
         self,
         peer_node_id: int,
@@ -733,7 +730,6 @@ class NetMesh:
     def __enter__(self) -> "NetMesh": ...
     def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> bool: ...
     def __repr__(self) -> str: ...
-
     def register_channel(
         self,
         name: str,
@@ -751,7 +747,7 @@ class NetMesh:
 
         ``publish_caps`` / ``subscribe_caps`` are ``CapabilityFilter``
         dicts (same shape as the ``filter`` argument to
-        :meth:`find_peers`) that restrict who may publish or subscribe
+        :meth:`find_nodes`) that restrict who may publish or subscribe
         based on the other node's announced capabilities.
 
         Raises ``ChannelError`` for invalid names / visibility."""
@@ -793,14 +789,14 @@ class NetMesh:
 
     def announce_capabilities(self, caps: dict) -> None:
         """Broadcast `caps` to every directly-connected peer and
-        self-index so :meth:`find_peers` matches. Multi-hop
+        self-index so :meth:`find_nodes` matches. Multi-hop
         propagation is deferred — peers more than one hop away do
         not see the announcement. See ``SDK_SECURITY_SURFACE_PLAN.md``
         for the capability dict shape (hardware, software, models,
         tools, tags, limits)."""
         ...
 
-    def find_peers(self, filter: dict) -> list[int]:
+    def find_nodes(self, filter: dict) -> list[int]:
         """Query the local capability index. Returns node ids
         (including own when the filter matches this node's own
         announcement) whose latest announcement matches `filter`.
@@ -905,9 +901,7 @@ class Identity:
         insert; raises :class:`TokenError` on bad signature or
         malformed bytes."""
         ...
-    def lookup_token(
-        self, subject: bytes, channel: str
-    ) -> Optional[bytes]:
+    def lookup_token(self, subject: bytes, channel: str) -> Optional[bytes]:
         """Look up a cached token by ``(subject, channel)``.
         Returns ``None`` if no exact-channel token is cached."""
         ...

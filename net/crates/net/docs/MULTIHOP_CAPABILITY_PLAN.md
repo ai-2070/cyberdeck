@@ -20,7 +20,7 @@ file.
 Today, `MeshNode::announce_capabilities` pushes a signed
 `CapabilityAnnouncement` to every directly-connected peer — and
 stops there. Peers more than one hop away are invisible to
-`find_peers`. This caveat is documented in every SDK README and in
+`find_nodes`. This caveat is documented in every SDK README and in
 [`CAPABILITY_BROADCAST_PLAN.md`](CAPABILITY_BROADCAST_PLAN.md)
 ("Multi-hop capability gossip is deferred").
 
@@ -208,7 +208,7 @@ pattern is reusable scaffolding.
 New tests in `crates/net/tests/capability_multihop.rs`:
 
 1. **`three_node_chain_propagates`** — A ↔ B ↔ C with no direct
-   A-C link. `A.announce_capabilities(caps_A)` → `C.find_peers(filter)`
+   A-C link. `A.announce_capabilities(caps_A)` → `C.find_nodes(filter)`
    returns A's node_id within `propagation_deadline_ms`.
 2. **`dedup_drops_duplicate_at_converge_point`** — Diamond A → {B, C}
    → D. D sees A's announcement twice (via B and via C); index
@@ -237,7 +237,7 @@ New tests in `crates/net/tests/capability_multihop.rs`:
 Plus SDK-layer tests:
 
 - **Rust SDK** (`sdk/tests/multihop_capability.rs`) — user-facing
-  `find_peers` returns far peers.
+  `find_nodes` returns far peers.
 - **TS SDK** (`sdk-ts/test/multihop_capability.test.ts`) — same.
 - **Python / Go** — skip for v1 (the cross-binding contract is fixed
   by the Rust integration test; adding per-binding multi-hop tests
@@ -350,5 +350,5 @@ Plus SDK-layer tests:
    data *without* using it for routing might prefer to opt in.
 4. **Hop_count in `parse_token`-style dict output for bindings?**
    Currently the bindings don't expose `CapabilityAnnouncement`
-   details at all — only `find_peers` results. This plan keeps it
+   details at all — only `find_nodes` results. This plan keeps it
    that way. Confirm.

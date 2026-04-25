@@ -350,7 +350,7 @@ mesh.announce_capabilities({
     "tags": ["gpu", "prod"],
 })
 
-gpu_peers = mesh.find_peers({
+gpu_peers = mesh.find_nodes({
     "require_gpu": True,
     "gpu_vendor": "nvidia",
     "min_vram_mb": 40_000,

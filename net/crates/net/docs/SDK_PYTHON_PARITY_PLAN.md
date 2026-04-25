@@ -15,7 +15,7 @@ Current Python state (from a fresh survey of
 |---|---|
 | `NetMesh` basics (connect/accept/start/open_stream/publish) | ✅ Present |
 | Identity / `PermissionToken` / `TokenCache` | ❌ Zero bindings |
-| Capabilities (announce / find_peers) | ❌ Zero bindings |
+| Capabilities (announce / find_nodes) | ❌ Zero bindings |
 | Subnets (`subnet`, `subnet_policy`) | ❌ Not on `NetMesh.__new__` |
 | Channel auth (`publish_caps` / `subscribe_caps` on register, token on subscribe) | ❌ `require_token` flag exists; ACL + token path unwired |
 | `CapabilityAnnouncement.entity_id` + signing | ✅ Core already emits signed announcements |
@@ -210,11 +210,11 @@ fn subscribe_channel(
 
 Keyword-only after `channel` so positional callers don't break.
 
-### `announce_capabilities` / `find_peers`
+### `announce_capabilities` / `find_nodes`
 
 ```rust
 fn announce_capabilities(&self, caps: &PyDict) -> PyResult<()>;
-fn find_peers(&self, filter: &PyDict) -> PyResult<Vec<u64>>;
+fn find_nodes(&self, filter: &PyDict) -> PyResult<Vec<u64>>;
 ```
 
 Returns `List[int]` (node ids as plain Python ints — u64 fits
@@ -227,7 +227,7 @@ Five PRs, mirroring the original stage split:
 | Stage | What | Days |
 |---|---|---|
 | **F-1** | Identity + tokens pyclass + helpers + `identity_seed` + `entity_id()` on `NetMesh`. Type stubs + `IdentityError` / `TokenError` exception classes. pytest round-trip. | 1.5 |
-| **F-2** | Capabilities dict conversion + `announce_capabilities` / `find_peers` on `NetMesh`. `require_signed_capabilities` + `capability_gc_interval_ms`. pytest self-match. | 1 |
+| **F-2** | Capabilities dict conversion + `announce_capabilities` / `find_nodes` on `NetMesh`. `require_signed_capabilities` + `capability_gc_interval_ms`. pytest self-match. | 1 |
 | **F-3** | Subnets (`subnet`, `subnet_policy` on `__new__`) + a minimal pytest enforcement test using two meshes in one process. | 0.5 |
 | **F-4** | `register_channel` extended with `publish_caps` / `subscribe_caps`; `subscribe_channel` with `token`. pytest: cap-denied, token-denied, token round-trip. | 1 |
 | **F-5** | README Python section, `__init__.py` re-exports for new types, cross-link from `SDK_SECURITY_SURFACE_PLAN.md`. | 0.5 |
@@ -254,7 +254,7 @@ small buffer.
 `bindings/python/tests/test_capabilities.py` (new, F-2):
 
 1. Single-node self-match: `announce_capabilities({tags: ["gpu"]})`
-   → `find_peers({require_tags: ["gpu"]})` contains own node id.
+   → `find_nodes({require_tags: ["gpu"]})` contains own node id.
 2. Non-matching filter returns empty list.
 3. GpuVendor normalization via `normalize_gpu_vendor("NVIDIA") ==
    "nvidia"` (optional convenience if exposed).
@@ -308,7 +308,7 @@ Keep existing test; no regression changes required.
 | `bindings/python/src/identity.rs` (new) | `Identity` pyclass + helper `#[pyfunction]`s |
 | `bindings/python/src/capabilities.rs` (new) | dict ↔ core conversion |
 | `bindings/python/src/subnets.rs` (new) | `SubnetId` / `SubnetPolicy` conversion |
-| `bindings/python/src/lib.rs` | wire new modules; add fields to `NetMesh.__new__`; extend `register_channel` / `subscribe_channel`; add `announce_capabilities` / `find_peers`; add `entity_id` getter |
+| `bindings/python/src/lib.rs` | wire new modules; add fields to `NetMesh.__new__`; extend `register_channel` / `subscribe_channel`; add `announce_capabilities` / `find_nodes`; add `entity_id` getter |
 | `bindings/python/python/net/_net.pyi` | add stubs for `Identity`, new kwargs, exceptions |
 | `bindings/python/python/net/__init__.py` | re-export `Identity`, `TokenError`, `IdentityError` |
 | `bindings/python/tests/test_identity.py` (new) | F-1 tests |

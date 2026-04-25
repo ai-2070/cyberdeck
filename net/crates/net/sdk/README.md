@@ -267,7 +267,7 @@ you put the bytes (disk, vault, enclave, k8s secret) is your call.
 
 `Mesh::announce_capabilities(caps)` pushes a `CapabilityAnnouncement`
 to every directly-connected peer and self-indexes locally.
-`Mesh::find_peers(filter)` queries the local index — results include
+`Mesh::find_nodes(filter)` queries the local index — results include
 this node's own id when self matches.
 
 ```rust
@@ -289,7 +289,7 @@ mesh.announce_capabilities(
 .await?;
 
 // Self-match: returns our own node_id.
-let hits = mesh.find_peers(
+let hits = mesh.find_nodes(
     &CapabilityFilter::new().require_gpu().with_min_vram(16_384),
 );
 assert!(hits.contains(&mesh.node_id()));

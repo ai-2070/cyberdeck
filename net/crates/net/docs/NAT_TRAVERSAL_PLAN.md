@@ -333,7 +333,7 @@ Encoding: 1 byte presence flag + 18 bytes address when present (`family: u8 | ad
 
 - `mesh.node_metadata().nat_type` populates within 5 s of `start()` when ≥ 2 peers are handshaken.
 - Capability announcements after start carry exactly one `nat:*` tag and, when classification succeeded, the `reflex_addr` field.
-- `find_peers(CapabilityFilter::new().require_tag("nat:open"))` returns relay-capable candidates.
+- `find_nodes(CapabilityFilter::new().require_tag("nat:open"))` returns relay-capable candidates.
 - A fresh joiner observing its first capability announcement from a classified peer can initiate a rendezvous punch without emitting its own `probe_reflex` to that peer first.
 
 ---
