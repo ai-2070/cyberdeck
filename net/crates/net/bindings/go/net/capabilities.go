@@ -1,4 +1,4 @@
-// Package net — capability announce / find_peers surface.
+// Package net — capability announce / find_nodes surface.
 //
 // Mirrors the PyO3 / NAPI dict shape byte-for-byte so cross-binding
 // fixtures round-trip. Capabilities cross as JSON; filters cross as
@@ -130,7 +130,7 @@ type CapabilitySet struct {
 }
 
 // CapabilityFilter describes the subset of announcements that
-// `FindPeers` should return. Empty filter matches every announcer.
+// `FindNodes` should return. Empty filter matches every announcer.
 type CapabilityFilter struct {
 	RequireTags       []string `json:"require_tags,omitempty"`
 	RequireModels     []string `json:"require_models,omitempty"`
@@ -148,7 +148,7 @@ type CapabilityFilter struct {
 // ---------------------------------------------------------------------------
 
 // AnnounceCapabilities broadcasts `caps` to every directly-connected
-// peer and self-indexes, so `FindPeers` on this same node matches
+// peer and self-indexes, so `FindNodes` on this same node matches
 // when the filter is compatible. Multi-hop propagation is deferred.
 func (m *MeshNode) AnnounceCapabilities(caps CapabilitySet) error {
 	data, err := json.Marshal(caps)
@@ -167,10 +167,10 @@ func (m *MeshNode) AnnounceCapabilities(caps CapabilitySet) error {
 	return capabilityErrorFromCode(code)
 }
 
-// FindPeers queries the local capability index. Returns the node ids
+// FindNodes queries the local capability index. Returns the node ids
 // (u64) of every announcer whose latest announcement matches
 // `filter`, including own node id on self-match.
-func (m *MeshNode) FindPeers(filter CapabilityFilter) ([]uint64, error) {
+func (m *MeshNode) FindNodes(filter CapabilityFilter) ([]uint64, error) {
 	data, err := json.Marshal(filter)
 	if err != nil {
 		return nil, fmt.Errorf("marshal filter: %w", err)
@@ -185,7 +185,7 @@ func (m *MeshNode) FindPeers(filter CapabilityFilter) ([]uint64, error) {
 	}
 	var outJSON *C.char
 	var outLen C.size_t
-	code := C.net_mesh_find_peers(m.handle, cJSON, &outJSON, &outLen)
+	code := C.net_mesh_find_nodes(m.handle, cJSON, &outJSON, &outLen)
 	if err := capabilityErrorFromCode(code); err != nil {
 		return nil, err
 	}
@@ -193,7 +193,7 @@ func (m *MeshNode) FindPeers(filter CapabilityFilter) ([]uint64, error) {
 	raw := C.GoStringN(outJSON, C.int(outLen))
 	var ids []uint64
 	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
-		return nil, fmt.Errorf("parse find_peers response: %w", err)
+		return nil, fmt.Errorf("parse find_nodes response: %w", err)
 	}
 	return ids, nil
 }

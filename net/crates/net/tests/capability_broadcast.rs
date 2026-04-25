@@ -245,7 +245,7 @@ async fn two_node_announce_is_visible() {
     let filter = CapabilityFilter::new().require_tag("gpu");
     let a_id = a.node_id();
     let arrived = wait_until(&b, |node| {
-        node.find_peers_by_filter(&filter).contains(&a_id)
+        node.find_nodes_by_filter(&filter).contains(&a_id)
     })
     .await;
     assert!(arrived, "B did not observe A's capability announcement");
@@ -269,13 +269,13 @@ async fn announcement_expires_after_ttl() {
     let filter = CapabilityFilter::new().require_tag("ephemeral");
     let a_id = a.node_id();
     assert!(
-        wait_until(&b, |n| n.find_peers_by_filter(&filter).contains(&a_id)).await,
+        wait_until(&b, |n| n.find_nodes_by_filter(&filter).contains(&a_id)).await,
         "B never indexed A's announcement in the first place"
     );
 
     // Wait beyond TTL; GC should evict.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
-    let still_present = b.find_peers_by_filter(&filter).contains(&a_id);
+    let still_present = b.find_nodes_by_filter(&filter).contains(&a_id);
     assert!(
         !still_present,
         "B still returns A after TTL expiry (GC not running?)"
@@ -298,7 +298,7 @@ async fn late_joiner_receives_session_open_push() {
 
     let filter = CapabilityFilter::new().require_tag("preannounced");
     let a_id = a.node_id();
-    let arrived = wait_until(&b, |n| n.find_peers_by_filter(&filter).contains(&a_id)).await;
+    let arrived = wait_until(&b, |n| n.find_nodes_by_filter(&filter).contains(&a_id)).await;
     assert!(
         arrived,
         "session-open push did not deliver the pre-announcement"
@@ -329,7 +329,7 @@ async fn require_signed_capabilities_drops_unsigned_announcements() {
     // A sees itself (local self-index isn't subject to the flag).
     let filter = CapabilityFilter::new().require_tag("classified");
     assert!(
-        a.find_peers_by_filter(&filter).contains(&a.node_id()),
+        a.find_nodes_by_filter(&filter).contains(&a.node_id()),
         "sender lost its own self-index"
     );
 
@@ -338,7 +338,7 @@ async fn require_signed_capabilities_drops_unsigned_announcements() {
 
     // B must not have indexed A's unsigned announcement.
     assert!(
-        !b.find_peers_by_filter(&filter).contains(&a.node_id()),
+        !b.find_nodes_by_filter(&filter).contains(&a.node_id()),
         "receiver accepted an unsigned announcement despite require_signed_capabilities=true"
     );
 }
@@ -428,7 +428,7 @@ async fn forged_node_id_rejected_even_with_valid_signature() {
     let filter = CapabilityFilter::new().require_tag("forged-node-id-probe");
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
-        !b.find_peers_by_filter(&filter).contains(&forged_node_id),
+        !b.find_nodes_by_filter(&filter).contains(&forged_node_id),
         "receiver indexed a forged node_id despite derivation mismatch — \
          node_id must be bound to entity_id cryptographically",
     );
@@ -482,7 +482,7 @@ async fn forwarded_announcement_does_not_tofu_pin_forwarder_to_victim_entity() {
     // the victim's node_id — that's fine, the signature is real.
     let filter = CapabilityFilter::new().require_tag("forwarded-tofu-probe");
     let arrived = wait_until(&receiver, |n| {
-        n.find_peers_by_filter(&filter).contains(&victim_node_id)
+        n.find_nodes_by_filter(&filter).contains(&victim_node_id)
     })
     .await;
     assert!(
@@ -537,7 +537,7 @@ async fn unsigned_announcement_does_not_tofu_pin_entity() {
     // Index still admits the announcement under the opt-out.
     let filter = CapabilityFilter::new().require_tag("unsigned-tofu-probe");
     let a_id = a.node_id();
-    let arrived = wait_until(&b, |n| n.find_peers_by_filter(&filter).contains(&a_id)).await;
+    let arrived = wait_until(&b, |n| n.find_nodes_by_filter(&filter).contains(&a_id)).await;
     assert!(arrived, "unsigned announcement should still index");
 
     // But the TOFU map must stay empty for this peer — no pin
@@ -599,7 +599,7 @@ async fn forwarded_announcement_does_not_write_relay_peer_subnet() {
     let filter = CapabilityFilter::new().require_tag("region:privileged");
     let victim_node_id = victim_kp.node_id();
     let arrived = wait_until(&receiver, |n| {
-        n.find_peers_by_filter(&filter).contains(&victim_node_id)
+        n.find_nodes_by_filter(&filter).contains(&victim_node_id)
     })
     .await;
     assert!(arrived, "receiver should still index the victim by node_id");
@@ -659,7 +659,7 @@ async fn unsigned_announcement_does_not_write_peer_subnet() {
     // discovery still work).
     let filter = CapabilityFilter::new().require_tag("region:privileged");
     let a_id = a.node_id();
-    let arrived = wait_until(&b, |n| n.find_peers_by_filter(&filter).contains(&a_id)).await;
+    let arrived = wait_until(&b, |n| n.find_nodes_by_filter(&filter).contains(&a_id)).await;
     assert!(
         arrived,
         "unsigned announcement should still index under opt-out",
@@ -758,7 +758,7 @@ async fn signed_announcement_with_mismatched_node_id_entity_id_is_rejected() {
     //     must not have produced an entry for bogus_node_id or
     //     for victim_node_id (the caps tag is bogus either way).
     let filter = CapabilityFilter::new().require_tag("binding-mismatch-probe");
-    let matches = receiver.find_peers_by_filter(&filter);
+    let matches = receiver.find_nodes_by_filter(&filter);
     assert!(
         !matches.contains(&bogus_node_id),
         "receiver indexed the spoofed node_id despite the binding mismatch — \

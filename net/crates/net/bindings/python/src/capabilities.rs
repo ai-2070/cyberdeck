@@ -504,7 +504,7 @@ mod tests {
     /// `hardware_from_dict`, turning 65536 cores into 0. Every
     /// conversion site now routes through `saturating_u16`.
     ///
-    /// End-to-end observability through `find_peers` is limited —
+    /// End-to-end observability through `find_nodes` is limited —
     /// the `CapabilityFilter` surface doesn't filter on
     /// `cpu_cores` / `cpu_threads` / `compute_units` /
     /// `tensor_cores`. The helper is the contract; NAPI's tests

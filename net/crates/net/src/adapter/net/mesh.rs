@@ -4962,7 +4962,7 @@ impl MeshNode {
     // v1; multi-hop gossip is a follow-up.
 
     /// Announce this node's capabilities to every directly-connected
-    /// peer. Also self-indexes so single-node `find_peers_by_filter`
+    /// peer. Also self-indexes so single-node `find_nodes_by_filter`
     /// queries return us too.
     ///
     /// TTL defaults to 5 minutes. Unsigned (signatures tie in with
@@ -5088,18 +5088,18 @@ impl MeshNode {
 
     /// Query the capability index. Returns node ids (including our
     /// own `node_id`) whose latest announcement matches `filter`.
-    pub fn find_peers_by_filter(&self, filter: &CapabilityFilter) -> Vec<u64> {
+    pub fn find_nodes_by_filter(&self, filter: &CapabilityFilter) -> Vec<u64> {
         self.capability_index.query(filter)
     }
 
-    /// Scoped variant of [`Self::find_peers_by_filter`]. Filters
+    /// Scoped variant of [`Self::find_nodes_by_filter`]. Filters
     /// candidates through `scope` (derived from each peer's
     /// `scope:*` reserved tags) on top of the capability filter.
     /// `SubnetLocal` peers and the [`ScopeFilter::SameSubnet`]
     /// filter resolve same-subnet membership against
     /// `peer_subnets` — when either side's subnet is unknown, the
     /// candidate is admitted (warm-up permissive).
-    pub fn find_peers_by_filter_scoped(
+    pub fn find_nodes_by_filter_scoped(
         &self,
         filter: &CapabilityFilter,
         scope: &ScopeFilter<'_>,
@@ -5108,7 +5108,7 @@ impl MeshNode {
         let peer_subnets = self.peer_subnets.clone();
         let local_node_id = self.node_id;
         self.capability_index
-            .find_peers_scoped(filter, scope, |nid| {
+            .find_nodes_scoped(filter, scope, |nid| {
                 if nid == local_node_id {
                     // Querying our own node: same subnet by definition.
                     return true;
@@ -5522,15 +5522,15 @@ impl MeshNode {
 
     /// Rank peers for a scored requirement. Returns the best-
     /// scoring node's id, or `None` if no peer matches.
-    pub fn rank_peers(&self, req: &CapabilityRequirement) -> Option<u64> {
+    pub fn find_best_node(&self, req: &CapabilityRequirement) -> Option<u64> {
         self.capability_index.find_best(req)
     }
 
-    /// Scoped variant of [`Self::rank_peers`]. See
-    /// [`Self::find_peers_by_filter_scoped`] for the scope
+    /// Scoped variant of [`Self::find_best_node`]. See
+    /// [`Self::find_nodes_by_filter_scoped`] for the scope
     /// resolution semantics; selection picks the highest-scoring
     /// candidate within the scoped set.
-    pub fn rank_peers_scoped(
+    pub fn find_best_node_scoped(
         &self,
         req: &CapabilityRequirement,
         scope: &ScopeFilter<'_>,
@@ -5538,7 +5538,7 @@ impl MeshNode {
         let my_subnet = self.local_subnet;
         let peer_subnets = self.peer_subnets.clone();
         let local_node_id = self.node_id;
-        self.capability_index.find_best_scoped(req, scope, |nid| {
+        self.capability_index.find_best_node_scoped(req, scope, |nid| {
             if nid == local_node_id {
                 return true;
             }

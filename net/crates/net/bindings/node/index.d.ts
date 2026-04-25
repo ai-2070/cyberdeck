@@ -767,7 +767,7 @@ export declare class NetMesh {
   publish(channel: string, payload: Buffer, config?: PublishConfigJs | undefined | null): Promise<PublishReportJs>
   /**
    * Announce this node's capabilities to every directly-
-   * connected peer. Also self-indexes, so `findPeers` on the
+   * connected peer. Also self-indexes, so `findNodes` on the
    * same node matches on the announcement.
    *
    * Multi-hop propagation is deferred — peers more than one
@@ -779,15 +779,15 @@ export declare class NetMesh {
    * (including our own if we self-match) whose latest
    * announcement matches `filter`.
    */
-  findPeers(filter: CapabilityFilterJs): Array<bigint>
+  findNodes(filter: CapabilityFilterJs): Array<bigint>
   /**
-   * Scoped variant of [`Self::find_peers`]. Filters candidates
+   * Scoped variant of [`Self::find_nodes`]. Filters candidates
    * through a [`crate::capabilities::ScopeFilterJs`] derived
-   * from each peer's `scope:*` reserved tags. Untagged peers
-   * stay visible under most filters by design; peers tagged
+   * from each node's `scope:*` reserved tags. Untagged nodes
+   * stay visible under most filters by design; nodes tagged
    * `scope:subnet-local` only show up under `sameSubnet`.
    */
-  findPeersScoped(filter: CapabilityFilterJs, scope: ScopeFilterJs): Array<bigint>
+  findNodesScoped(filter: CapabilityFilterJs, scope: ScopeFilterJs): Array<bigint>
   /** Shutdown the mesh node. */
   shutdown(): Promise<void>
 }

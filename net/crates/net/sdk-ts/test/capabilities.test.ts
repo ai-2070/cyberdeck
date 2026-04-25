@@ -68,7 +68,7 @@ describe('MeshNode capabilities', () => {
 
     await a.announceCapabilities({ tags: ['gpu', 'inference'] });
 
-    const hits = a.findPeers({ requireTags: ['gpu'] });
+    const hits = a.findNodes({ requireTags: ['gpu'] });
     expect(hits).toContain(a.nodeId());
   });
 
@@ -77,7 +77,7 @@ describe('MeshNode capabilities', () => {
     nodes.push(a);
     await a.announceCapabilities({ tags: ['gpu'] });
 
-    expect(a.findPeers({ requireTags: ['nope'] })).toEqual([]);
+    expect(a.findNodes({ requireTags: ['nope'] })).toEqual([]);
   });
 
   it('announce → find propagates across the handshake (two nodes)', async () => {
@@ -96,7 +96,7 @@ describe('MeshNode capabilities', () => {
     const aId = a.nodeId();
     const filter: CapabilityFilter = { requireGpu: true, minVramMb: 16_384 };
 
-    const arrived = await waitUntil(() => b.findPeers(filter).includes(aId));
+    const arrived = await waitUntil(() => b.findNodes(filter).includes(aId));
     expect(arrived).toBe(true);
   });
 
@@ -114,7 +114,7 @@ describe('MeshNode capabilities', () => {
 
     const aId = a.nodeId();
     const arrived = await waitUntil(() =>
-      b.findPeers({ requireTags: ['preannounced'] }).includes(aId),
+      b.findNodes({ requireTags: ['preannounced'] }).includes(aId),
     );
     expect(arrived).toBe(true);
   });
@@ -162,11 +162,11 @@ describe('MeshNode capabilities', () => {
     await a.announceCapabilities(caps);
 
     // Each require* dimension resolves back to self.
-    expect(a.findPeers({ requireTags: ['prod'] })).toContain(a.nodeId());
-    expect(a.findPeers({ requireModels: ['llama-3.1-70b'] })).toContain(a.nodeId());
-    expect(a.findPeers({ requireTools: ['web_search'] })).toContain(a.nodeId());
-    expect(a.findPeers({ requireModalities: ['code'] })).toContain(a.nodeId());
-    expect(a.findPeers({ gpuVendor: 'nvidia', minVramMb: 40_000 })).toContain(a.nodeId());
+    expect(a.findNodes({ requireTags: ['prod'] })).toContain(a.nodeId());
+    expect(a.findNodes({ requireModels: ['llama-3.1-70b'] })).toContain(a.nodeId());
+    expect(a.findNodes({ requireTools: ['web_search'] })).toContain(a.nodeId());
+    expect(a.findNodes({ requireModalities: ['code'] })).toContain(a.nodeId());
+    expect(a.findNodes({ gpuVendor: 'nvidia', minVramMb: 40_000 })).toContain(a.nodeId());
   });
 
   it('drops expired entries after TTL + a GC sweep', async () => {
@@ -195,7 +195,7 @@ describe('MeshNode capabilities', () => {
     });
     nodes.push(a);
     await a.announceCapabilities({ tags: ['gc-smoke'] });
-    expect(a.findPeers({ requireTags: ['gc-smoke'] })).toContain(a.nodeId());
+    expect(a.findNodes({ requireTags: ['gc-smoke'] })).toContain(a.nodeId());
   });
 
   it('accepts the requireSignedCapabilities knob without breaking the local path', async () => {
@@ -214,6 +214,6 @@ describe('MeshNode capabilities', () => {
     });
     nodes.push(a);
     await a.announceCapabilities({ tags: ['local-only'] });
-    expect(a.findPeers({ requireTags: ['local-only'] })).toContain(a.nodeId());
+    expect(a.findNodes({ requireTags: ['local-only'] })).toContain(a.nodeId());
   });
 });

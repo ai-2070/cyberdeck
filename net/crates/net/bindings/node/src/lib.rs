@@ -1799,7 +1799,7 @@ mod mesh_bindings {
         }
 
         /// Announce this node's capabilities to every directly-
-        /// connected peer. Also self-indexes, so `findPeers` on the
+        /// connected peer. Also self-indexes, so `findNodes` on the
         /// same node matches on the announcement.
         ///
         /// Multi-hop propagation is deferred — peers more than one
@@ -1821,7 +1821,7 @@ mod mesh_bindings {
         /// (including our own if we self-match) whose latest
         /// announcement matches `filter`.
         #[napi]
-        pub fn find_peers(
+        pub fn find_nodes(
             &self,
             filter: crate::capabilities::CapabilityFilterJs,
         ) -> Result<Vec<BigInt>> {
@@ -1829,19 +1829,19 @@ mod mesh_bindings {
             let node = guard.as_ref().unwrap();
             let core = crate::capabilities::capability_filter_from_js(filter);
             Ok(node
-                .find_peers_by_filter(&core)
+                .find_nodes_by_filter(&core)
                 .into_iter()
                 .map(BigInt::from)
                 .collect())
         }
 
-        /// Scoped variant of [`Self::find_peers`]. Filters candidates
+        /// Scoped variant of [`Self::find_nodes`]. Filters candidates
         /// through a [`crate::capabilities::ScopeFilterJs`] derived
-        /// from each peer's `scope:*` reserved tags. Untagged peers
-        /// stay visible under most filters by design; peers tagged
+        /// from each node's `scope:*` reserved tags. Untagged nodes
+        /// stay visible under most filters by design; nodes tagged
         /// `scope:subnet-local` only show up under `sameSubnet`.
         #[napi]
-        pub fn find_peers_scoped(
+        pub fn find_nodes_scoped(
             &self,
             filter: crate::capabilities::CapabilityFilterJs,
             scope: crate::capabilities::ScopeFilterJs,
@@ -1851,7 +1851,7 @@ mod mesh_bindings {
             let core = crate::capabilities::capability_filter_from_js(filter);
             let owned = crate::capabilities::scope_filter_from_js(scope);
             let ids = crate::capabilities::with_scope_filter(&owned, |f| {
-                node.find_peers_by_filter_scoped(&core, f)
+                node.find_nodes_by_filter_scoped(&core, f)
             });
             Ok(ids.into_iter().map(BigInt::from).collect())
         }

@@ -691,8 +691,8 @@ pub(crate) fn scope_from_tags(tags: &[String]) -> CapabilityScope {
 }
 
 /// Caller's intent for narrowing peer discovery by reserved scope
-/// tags, paired with [`CapabilityIndex::find_peers_scoped`] /
-/// [`CapabilityIndex::find_best_scoped`].
+/// tags, paired with [`CapabilityIndex::find_nodes_scoped`] /
+/// [`CapabilityIndex::find_best_node_scoped`].
 ///
 /// `Any` reproduces v1 behavior for non-`SubnetLocal` peers but
 /// excludes peers that explicitly tagged themselves
@@ -1857,7 +1857,7 @@ impl CapabilityIndex {
     /// The closure is supplied by the caller because
     /// [`CapabilityIndex`] does not own subnet state — that
     /// lives on `MeshNode::peer_subnets`.
-    pub fn find_peers_scoped(
+    pub fn find_nodes_scoped(
         &self,
         filter: &CapabilityFilter,
         scope_filter: &ScopeFilter<'_>,
@@ -1883,9 +1883,9 @@ impl CapabilityIndex {
     }
 
     /// Scoped variant of [`Self::find_best`]. Same scope-resolution
-    /// semantics as [`Self::find_peers_scoped`]; selection picks the
+    /// semantics as [`Self::find_nodes_scoped`]; selection picks the
     /// highest-scoring candidate within the scoped set.
-    pub fn find_best_scoped(
+    pub fn find_best_node_scoped(
         &self,
         req: &CapabilityRequirement,
         scope_filter: &ScopeFilter<'_>,

@@ -2,7 +2,7 @@
 //!
 //! Reserved `scope:*` tags inside the announcer's `CapabilitySet`
 //! resolve to a `CapabilityScope` that callers can filter against
-//! via `MeshNode::find_peers_by_filter_scoped`. Enforcement is
+//! via `MeshNode::find_nodes_by_filter_scoped`. Enforcement is
 //! purely query-side — the wire format and forwarder logic are
 //! untouched (see `docs/SCOPED_CAPABILITIES_PLAN.md`).
 //!
@@ -136,7 +136,7 @@ async fn tenant_scoped_discovery_filters_unrelated_tenants() {
     // an unfiltered query — the scope filter is a per-call concern,
     // it shouldn't affect propagation.
     let arrived = wait_until(&d, |n| {
-        let peers = n.find_peers_by_filter(&filter);
+        let peers = n.find_nodes_by_filter(&filter);
         peers.contains(&a_id) && peers.contains(&b_id) && peers.contains(&c_id)
     })
     .await;
@@ -147,7 +147,7 @@ async fn tenant_scoped_discovery_filters_unrelated_tenants() {
 
     // Tenant("oem-123"): A (matches tenant) + C (Global is
     // permissive). B excluded — its tenant tag doesn't match.
-    let oem = d.find_peers_by_filter_scoped(&filter, &ScopeFilter::Tenant("oem-123"));
+    let oem = d.find_nodes_by_filter_scoped(&filter, &ScopeFilter::Tenant("oem-123"));
     assert!(oem.contains(&a_id), "tenant:oem-123 must include A");
     assert!(
         oem.contains(&c_id),
@@ -159,7 +159,7 @@ async fn tenant_scoped_discovery_filters_unrelated_tenants() {
     );
 
     // Tenant("corp-acme"): B + C, not A.
-    let acme = d.find_peers_by_filter_scoped(&filter, &ScopeFilter::Tenant("corp-acme"));
+    let acme = d.find_nodes_by_filter_scoped(&filter, &ScopeFilter::Tenant("corp-acme"));
     assert!(acme.contains(&b_id), "tenant:corp-acme must include B");
     assert!(
         acme.contains(&c_id),
@@ -171,7 +171,7 @@ async fn tenant_scoped_discovery_filters_unrelated_tenants() {
     );
 
     // Any: all three (no SubnetLocal candidates here).
-    let any = d.find_peers_by_filter_scoped(&filter, &ScopeFilter::Any);
+    let any = d.find_nodes_by_filter_scoped(&filter, &ScopeFilter::Any);
     assert!(
         any.contains(&a_id) && any.contains(&b_id) && any.contains(&c_id),
         "ScopeFilter::Any must return all non-SubnetLocal peers; got {:?}",
@@ -179,7 +179,7 @@ async fn tenant_scoped_discovery_filters_unrelated_tenants() {
     );
 
     // GlobalOnly: just C (the only untagged peer).
-    let global = d.find_peers_by_filter_scoped(&filter, &ScopeFilter::GlobalOnly);
+    let global = d.find_nodes_by_filter_scoped(&filter, &ScopeFilter::GlobalOnly);
     assert!(global.contains(&c_id), "GlobalOnly must include C");
     assert!(
         !global.contains(&a_id) && !global.contains(&b_id),

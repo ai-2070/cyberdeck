@@ -6,7 +6,7 @@
  * runs, hand it to {@link MeshNode.announceCapabilities}, and the
  * mesh pushes it to every directly-connected peer. Peers keep the
  * latest announcement from each node in their local capability
- * index; {@link MeshNode.findPeers} queries that index.
+ * index; {@link MeshNode.findNodes} queries that index.
  *
  * @example
  * ```ts
@@ -22,7 +22,7 @@
  *   models: [{ modelId: 'llama-3.1-70b', family: 'llama' }],
  * });
  *
- * const peers = node.findPeers({ requireTags: ['gpu'], minVramMb: 16_384 });
+ * const peers = node.findNodes({ requireTags: ['gpu'], minVramMb: 16_384 });
  * ```
  *
  * Multi-hop propagation is deferred; today peers more than one hop
@@ -262,7 +262,7 @@ export interface NapiCapabilitySet {
   limits?: NapiLimits;
 }
 
-/** Shape that napi-rs expects for `findPeers`. */
+/** Shape that napi-rs expects for `findNodes`. */
 export interface NapiCapabilityFilter {
   requireTags?: string[];
   requireModels?: string[];
@@ -380,7 +380,7 @@ export function capabilityFilterToNapi(f: CapabilityFilter): NapiCapabilityFilte
 
 /**
  * Caller's intent for narrowing peer discovery by reserved
- * `scope:*` tags. See {@link MeshNode.findPeersScoped}.
+ * `scope:*` tags. See {@link MeshNode.findNodesScoped}.
  *
  * Tag-based scope is a query-time concern — the wire format is
  * untouched. Untagged peers resolve to `Global` and stay visible
@@ -397,7 +397,7 @@ export type ScopeFilter =
   | { kind: 'region'; region: string }
   | { kind: 'regions'; regions: string[] };
 
-/** Shape that napi-rs expects for `findPeersScoped`. */
+/** Shape that napi-rs expects for `findNodesScoped`. */
 export interface NapiScopeFilter {
   kind: string;
   tenant?: string;

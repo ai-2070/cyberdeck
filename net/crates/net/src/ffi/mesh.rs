@@ -1327,7 +1327,7 @@ struct ChannelConfigInput {
     max_rate_pps: Option<u32>,
     /// Capability filter restricting who may publish on this
     /// channel. Same POJO shape as `CapabilityFilter` (see
-    /// `net_mesh_find_peers`).
+    /// `net_mesh_find_nodes`).
     publish_caps: Option<CapabilityFilterJson>,
     /// Capability filter restricting who may subscribe. Subscribers
     /// whose announced caps miss this filter are rejected with
@@ -2106,7 +2106,7 @@ pub extern "C" fn net_channel_hash(channel: *const c_char, out_hash: *mut u16) -
 }
 
 // =========================================================================
-// Capabilities (announce / find_peers)
+// Capabilities (announce / find_nodes)
 // =========================================================================
 
 // Local alias to keep the capability helpers out of the mesh module's
@@ -2517,7 +2517,7 @@ fn capability_filter_from_json(f: CapabilityFilterJson) -> CapabilityFilter {
 pub(crate) const NET_ERR_CAPABILITY: c_int = -128;
 
 /// Announce this node's capabilities to every directly-connected
-/// peer. Also self-indexes, so `find_peers` on the same node matches
+/// peer. Also self-indexes, so `find_nodes` on the same node matches
 /// on the announcement. Multi-hop propagation is deferred.
 ///
 /// `caps_json` is the same POJO shape as PyO3 / NAPI:
@@ -2550,7 +2550,7 @@ pub extern "C" fn net_mesh_announce_capabilities(
 /// Query the local capability index. Writes a JSON array of node
 /// ids (u64) to `*out_json`; caller frees via `net_free_string`.
 #[unsafe(no_mangle)]
-pub extern "C" fn net_mesh_find_peers(
+pub extern "C" fn net_mesh_find_nodes(
     handle: *mut MeshNodeHandle,
     filter_json: *const c_char,
     out_json: *mut *mut c_char,
@@ -2568,7 +2568,7 @@ pub extern "C" fn net_mesh_find_peers(
         Err(_) => return NetError::InvalidJson.into(),
     };
     let filter = capability_filter_from_json(parsed);
-    let ids = h.inner.find_peers_by_filter(&filter);
+    let ids = h.inner.find_nodes_by_filter(&filter);
     write_json_out(&ids, out_json, out_len)
 }
 

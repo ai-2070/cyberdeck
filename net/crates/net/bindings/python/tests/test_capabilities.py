@@ -29,26 +29,26 @@ def test_announce_then_find_self_matches_on_tag() -> None:
     m = NetMesh(_port(1), PSK)
     try:
         m.announce_capabilities({"tags": ["gpu", "prod"]})
-        peers = m.find_peers({"require_tags": ["gpu"]})
+        peers = m.find_nodes({"require_tags": ["gpu"]})
         assert m.node_id in peers
     finally:
         m.shutdown()
 
 
-def test_find_peers_empty_when_filter_mismatches() -> None:
+def test_find_nodes_empty_when_filter_mismatches() -> None:
     m = NetMesh(_port(2), PSK)
     try:
         m.announce_capabilities({"tags": ["cpu"]})
-        peers = m.find_peers({"require_tags": ["gpu"]})
+        peers = m.find_nodes({"require_tags": ["gpu"]})
         assert peers == []
     finally:
         m.shutdown()
 
 
-def test_find_peers_without_announcement_is_empty() -> None:
+def test_find_nodes_without_announcement_is_empty() -> None:
     m = NetMesh(_port(3), PSK)
     try:
-        peers = m.find_peers({"require_tags": ["anything"]})
+        peers = m.find_nodes({"require_tags": ["anything"]})
         assert peers == []
     finally:
         m.shutdown()
@@ -76,7 +76,7 @@ def test_hardware_and_gpu_filter_matches() -> None:
                 "tags": ["gpu"],
             }
         )
-        peers = m.find_peers(
+        peers = m.find_nodes(
             {
                 "require_gpu": True,
                 "gpu_vendor": "nvidia",
@@ -87,7 +87,7 @@ def test_hardware_and_gpu_filter_matches() -> None:
         assert m.node_id in peers
 
         # Too-strict VRAM requirement should reject.
-        peers_strict = m.find_peers({"min_vram_mb": 200_000})
+        peers_strict = m.find_nodes({"min_vram_mb": 200_000})
         assert peers_strict == []
     finally:
         m.shutdown()
@@ -110,14 +110,14 @@ def test_model_and_tool_filter_matches() -> None:
                 "tools": [{"tool_id": "sql_exec", "name": "SQL Exec"}],
             }
         )
-        assert m.node_id in m.find_peers(
+        assert m.node_id in m.find_nodes(
             {"require_models": ["llama-3.1-70b"]}
         )
-        assert m.node_id in m.find_peers({"require_tools": ["sql_exec"]})
-        assert m.node_id in m.find_peers(
+        assert m.node_id in m.find_nodes({"require_tools": ["sql_exec"]})
+        assert m.node_id in m.find_nodes(
             {"require_modalities": ["code"], "min_context_length": 100_000}
         )
-        assert m.find_peers({"require_models": ["missing"]}) == []
+        assert m.find_nodes({"require_models": ["missing"]}) == []
     finally:
         m.shutdown()
 
@@ -127,7 +127,7 @@ def test_empty_announcement_still_self_indexes() -> None:
     try:
         m.announce_capabilities({})
         # Empty filter matches any announcer in the index.
-        peers = m.find_peers({})
+        peers = m.find_nodes({})
         assert m.node_id in peers
     finally:
         m.shutdown()
@@ -169,10 +169,10 @@ def test_announce_rejects_wrong_type_for_hardware() -> None:
         m.shutdown()
 
 
-def test_find_peers_rejects_wrong_type_for_require_tags() -> None:
+def test_find_nodes_rejects_wrong_type_for_require_tags() -> None:
     m = NetMesh(_port(8), PSK)
     try:
         with pytest.raises(TypeError):
-            m.find_peers({"require_tags": "gpu"})  # must be list
+            m.find_nodes({"require_tags": "gpu"})  # must be list
     finally:
         m.shutdown()
