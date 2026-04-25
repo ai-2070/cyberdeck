@@ -525,58 +525,106 @@ async fn same_subnet_without_policy_excludes_unresolved_peers() {
 }
 
 #[tokio::test]
-async fn same_subnet_with_policy_admits_warm_up_unknowns() {
-    // Inverse of the test above: with a policy installed, a peer
-    // whose announcement hasn't *yet* been processed (and so
-    // hasn't fed `policy.assign(&caps)` into `peer_subnets`)
-    // should be admitted under `SameSubnet`. This is the warm-up
-    // window — the policy will resolve the peer's subnet on the
-    // next announcement, so admitting it during the gap is
-    // intentional.
+async fn same_subnet_with_policy_admits_unresolved_peers_via_warm_up() {
+    // Genuine warm-up regression: exercises the
+    // `None => policy_installed` branch in the SameSubnet
+    // closure on `MeshNode::find_nodes_by_filter_scoped`.
     //
-    // Setup: both nodes have a policy, but we query *before* the
-    // peer's announcement has landed. We exercise this by
-    // querying via a node that hasn't received any announcement
-    // yet — the index is empty, so there are no candidates to
-    // admit. Instead, verify the inverse: an explicit
-    // `peer_subnets` insert with the same subnet returns true,
-    // and the closure-level admit path runs on `None` returns
-    // true when policy is set.
+    // The dispatch handler at `mesh.rs::handle_capability_announcement`
+    // gates the `peer_subnets.insert(from_node, ...)` call on
+    // `signature_verified && ann.hop_count == 0`. Forwarded
+    // announcements (`hop_count > 0`) skip that insert but still
+    // index the announcement — leaving an indexed candidate
+    // whose subnet is unknown to the receiver. That's the
+    // warm-up window the closure's `None` branch handles.
     //
-    // This boils down to a behavioral assertion that's hard to
-    // exercise directly without manipulating the DashMap. We
-    // exercise it indirectly: a same-policy, same-subnet peer
-    // whose announcement carries the correct region tag derives
-    // to the same subnet, so the same-subnet branch returns
-    // true; verifies the policy path overall.
+    // Topology: A — B — D, no direct session between A and D.
+    //   - A announces with `region:eu` → A's policy assigns
+    //     subnet [4].
+    //   - B receives directly (hop_count=0), populates its own
+    //     peer_subnets[A] = [4], indexes A, then forwards to D
+    //     with hop_count=1.
+    //   - D receives forwarded (hop_count=1), skips the
+    //     peer_subnets.insert(A) gate, indexes A. Result: D's
+    //     index has A but D's peer_subnets has only B.
+    //
+    // D is in subnet [3]. A is *actually* in [4] per the policy.
+    // If D's SameSubnet closure ran the policy-installed warm-up
+    // admit, A is returned (the warm-up admits unknowns). If the
+    // closure ran the strict path, A is excluded. We assert A is
+    // returned — that's the only way the `None` branch could
+    // have produced this result.
     let policy = region_policy();
-    let me = build_node_with_policy(SubnetId::new(&[3]), policy.clone()).await;
-    let peer = build_node_with_policy(SubnetId::new(&[3]), policy.clone()).await;
+    let a = build_node_with_policy(SubnetId::new(&[4]), policy.clone()).await; // region:eu
+    let b = build_node_with_policy(SubnetId::new(&[3]), policy.clone()).await; // region:us
+    let d = build_node_with_policy(SubnetId::new(&[3]), policy.clone()).await; // observer
 
-    handshake(&me, &peer).await;
+    // A↔B, B↔D — but NOT A↔D. Without a direct session, A's
+    // announcement reaches D only via B's forward.
+    handshake(&a, &b).await;
+    handshake(&b, &d).await;
 
-    // Tag the peer so the policy assigns subnet [3] (matches us).
-    peer.announce_capabilities(CapabilitySet::new().add_tag("region:us").add_tag("gpu"))
-        .await
-        .expect("peer announce");
+    a.announce_capabilities(
+        CapabilitySet::new()
+            .add_tag("region:eu") // policy → subnet [4]
+            .add_tag("warm-up-canary"),
+    )
+    .await
+    .expect("A announce");
 
-    let filter = CapabilityFilter::new().require_tag("gpu");
-    let peer_id = peer.node_id();
+    let filter = CapabilityFilter::new().require_tag("warm-up-canary");
+    let a_id = a.node_id();
 
-    // Wait for the announcement to land + the policy to resolve
-    // the peer's subnet via `handle_capability_announcement`.
-    let arrived = wait_until(&me, |n| n.find_nodes_by_filter(&filter).contains(&peer_id)).await;
-    assert!(arrived, "me did not index peer's announcement");
-
-    // With the policy installed AND the announcement processed,
-    // `peer_subnets` resolves the peer to subnet [3] which equals
-    // ours. SameSubnet returns the peer.
-    let same = me.find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet);
+    // Wait for the forwarded announcement to land at D. (B
+    // re-broadcasts on receipt; the indexing tick is quick but
+    // the test harness uses 200ms heartbeats so we allow up to
+    // 2s via wait_until.)
+    let arrived = wait_until(&d, |n| n.find_nodes_by_filter(&filter).contains(&a_id)).await;
     assert!(
-        same.contains(&peer_id),
-        "with policy installed + same-subnet peer, SameSubnet \
-         must return the peer; got {:?}",
+        arrived,
+        "forwarded announcement from A did not land at D — \
+         multi-hop forwarding regressed?"
+    );
+
+    // The load-bearing assertion: D returns A under SameSubnet
+    // even though A is *actually* in subnet [4] (different from
+    // D's [3]). The only way this can be true is if D's
+    // peer_subnets does NOT contain A (so the closure hits the
+    // `None` branch) AND `policy_installed` is true (so the
+    // branch returns admit). That's the warm-up regression
+    // path covered.
+    let same = d.find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet);
+    assert!(
+        same.contains(&a_id),
+        "policy-installed warm-up branch must admit unresolved \
+         (forwarded-only) peers under SameSubnet; got {:?}. If \
+         this assertion fails the closure's `None` branch is \
+         running strict — the real-world warm-up window for \
+         late-arriving direct announcements would now exclude \
+         peers it shouldn't.",
         same
+    );
+
+    // Sanity: a B (whose subnet IS resolved in D's peer_subnets
+    // because B handshook with D directly and announced) is also
+    // included — this confirms the `Some(s) => s == my_subnet`
+    // path still works alongside the warm-up branch.
+    b.announce_capabilities(
+        CapabilitySet::new()
+            .add_tag("region:us") // policy → subnet [3], same as D
+            .add_tag("warm-up-canary"),
+    )
+    .await
+    .expect("B announce");
+    let b_id = b.node_id();
+    let arrived = wait_until(&d, |n| {
+        n.find_nodes_by_filter_scoped(&filter, &ScopeFilter::SameSubnet)
+            .contains(&b_id)
+    })
+    .await;
+    assert!(
+        arrived,
+        "B (resolved same-subnet peer) must also appear under SameSubnet"
     );
 }
 
