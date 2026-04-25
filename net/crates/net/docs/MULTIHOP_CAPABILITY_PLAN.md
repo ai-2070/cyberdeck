@@ -155,10 +155,12 @@ capabilities propagate across subnet boundaries? Today `Visibility`
 is a *channel* concept, not a node concept.
 
 Leave this out of v1. Multi-hop capability propagation lands with
-permissive (global) semantics; subnet-scoped announcements are a
-follow-up (`ann.scope: AnnouncementScope` defaulting to `Global`,
-enforced at the forwarder before re-broadcast). Flagged in the
-"follow-ups" list below.
+permissive (global) semantics; subnet-scoped *forwarding* (a wire-
+level `AnnouncementScope` enforced at the forwarder before re-
+broadcast) is the v3 path. **Tag-based discovery scope** —
+reserved `scope:*` tags filtered at query time, no wire change —
+shipped in the meantime via
+[`SCOPED_CAPABILITIES_PLAN.md`](SCOPED_CAPABILITIES_PLAN.md).
 
 ## Wire format change
 
@@ -317,7 +319,11 @@ Plus SDK-layer tests:
 - **`AnnouncementScope` field.** Add subnet-scoped visibility for
   capability announcements (`Global | ParentVisible | SubnetLocal`).
   Follows the channel `Visibility` pattern. Requires subnet-gateway
-  logic at forward time.
+  logic at forward time. Partially addressed: tag-based discovery
+  scope (per-tenant / per-region / subnet-local *queries*, no wire
+  change) shipped via
+  [`SCOPED_CAPABILITIES_PLAN.md`](SCOPED_CAPABILITIES_PLAN.md). The
+  full wire-level enforcement is the remaining v3 work.
 - **Incremental capability diffs.** Main README mentions
   `CapabilityDiff` — computing + propagating minimal diffs rather
   than full announcements. Bandwidth optimization for large

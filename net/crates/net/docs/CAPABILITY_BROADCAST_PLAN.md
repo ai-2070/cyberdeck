@@ -59,7 +59,10 @@ Stage C's own dependencies remain unchanged: it requires Stages A
   profiling shows it.
 - Cross-subnet visibility. Subnet filtering of announcement fan-out
   ties into Stage D's `SubnetGateway` wiring and is treated as an
-  extension of that work, not this one.
+  extension of that work, not this one. Tag-based discovery scope
+  (per-tenant / per-region / subnet-local query filtering) shipped
+  via reserved `scope:*` tags + `ScopeFilter` —
+  see [`SCOPED_CAPABILITIES_PLAN.md`](SCOPED_CAPABILITIES_PLAN.md).
 - `CapabilityAd` / `LocalGraph` (the swarm.rs topology system). It is
   a parallel subsystem with its own lifecycle; this plan does **not**
   integrate them.
