@@ -520,8 +520,10 @@ src/adapter/net/
 ├── protocol.rs            # 64-byte wire header, EventFrame, NackPayload
 ├── transport.rs           # UDP socket abstraction, batched I/O
 ├── session.rs             # Session state, stream multiplexing, thread-local pools
+├── stream.rs              # Application-facing typed Stream handle over NetSession
 ├── router.rs              # FairScheduler, stream routing, priority bypass
 ├── route.rs               # RoutingTable, multi-hop headers, stream stats
+├── reroute.rs             # Automatic rerouting policy — failure-detector-driven route updates
 ├── proxy.rs               # Zero-copy multi-hop forwarding, TTL enforcement
 ├── pool.rs                # Zero-alloc PacketPool, PacketBuilder, ThreadLocalPool
 ├── batch.rs               # AdaptiveBatcher, latency-aware sizing
@@ -532,18 +534,23 @@ src/adapter/net/
 │
 ├── identity/              # Layer 1 — Trust & Identity
 │   ├── entity.rs          #   EntityId, EntityKeypair (ed25519)
+│   ├── envelope.rs        #   Encrypted daemon-keypair transport for migration
 │   ├── origin.rs          #   OriginStamp binding
 │   └── token.rs           #   PermissionToken, TokenScope, TokenCache
 │
 ├── channel/               # Layer 2 — Channels & Authorization
 │   ├── config.rs          #   ChannelConfig, Visibility, ChannelConfigRegistry
 │   ├── guard.rs           #   AuthGuard, AuthVerdict, bloom filter
-│   └── name.rs            #   ChannelId, ChannelName (hierarchical hashing)
+│   ├── name.rs            #   ChannelId, ChannelName (hierarchical hashing)
+│   ├── membership.rs      #   Subscribe / Unsubscribe / Ack subprotocol
+│   ├── roster.rs          #   Per-channel subscriber roster for daemon-layer fan-out
+│   └── publisher.rs       #   Thin per-peer fan-out helper for channel publishes
 │
 ├── behavior/              # Behavior Plane — Semantic Layer
 │   ├── capability.rs      #   HardwareCapabilities, CapabilityIndex, GpuInfo
+│   ├── broadcast.rs       #   Capability-broadcast subprotocol (CapabilityAnnouncement fan-out)
 │   ├── diff.rs            #   CapabilityDiff, DiffEngine
-│   ├── metadata.rs        #   NodeMetadata, MetadataStore, TopologyHints
+│   ├── metadata.rs        #   NodeMetadata, MetadataStore, TopologyHints, NatType
 │   ├── api.rs             #   ApiRegistry, ApiSchema, version validation
 │   ├── rules.rs           #   RuleEngine, RuleSet, device autonomy policies
 │   ├── context.rs         #   Context, ContextStore, Span, distributed tracing
@@ -565,6 +572,7 @@ src/adapter/net/
 ├── compute/               # Layer 5 — Compute Runtime
 │   ├── daemon.rs          #   MeshDaemon trait
 │   ├── daemon_factory.rs  #   DaemonFactoryRegistry (origin_hash → factory + keypair + config) for target-side restore
+│   ├── bindings.rs        #   Daemon subscription ledger — replay channel bindings on migration target
 │   ├── host.rs            #   DaemonHost runtime, from_snapshot(), from_fork()
 │   ├── migration.rs       #   MigrationState, MigrationPhase, 6-phase state machine
 │   ├── orchestrator.rs    #   MigrationOrchestrator, wire protocol, snapshot chunking, ActivateTarget/ActivateAck
@@ -581,7 +589,8 @@ src/adapter/net/
 │   ├── descriptor.rs      #   SubprotocolDescriptor, versioning
 │   ├── migration_handler.rs #  Migration message dispatch (0x0500)
 │   ├── negotiation.rs     #   Version negotiation, SubprotocolManifest
-│   └── registry.rs        #   SubprotocolRegistry, capability enrichment
+│   ├── registry.rs        #   SubprotocolRegistry, capability enrichment
+│   └── stream_window.rs   #   Receiver → sender credit grants for stream flow control
 │
 ├── continuity/            # Layer 7 — Observational Continuity
 │   ├── chain.rs           #   ContinuityProof (36B), ContinuityStatus
@@ -596,6 +605,19 @@ src/adapter/net/
 │   ├── partition.rs       #   PartitionDetector, PartitionPhase, healing
 │   └── reconcile.rs       #   Log reconciliation, longest-chain-wins, ForkRecord
 │
+├── traversal/             # NAT Traversal — reflex discovery, classification, hole-punch, port mapping
+│   ├── mod.rs             #   Module entry — framing & wire surface
+│   ├── config.rs          #   Tunables (probe counts, timeouts, refresh windows)
+│   ├── classify.rs        #   Wire NAT taxonomy (Open / Cone / Symmetric / Unknown)
+│   ├── reflex.rs          #   Reflex-probe subprotocol — mesh-native STUN analog
+│   ├── rendezvous.rs      #   Hole-punch rendezvous — three-message simultaneous-open dance
+│   └── portmap/           #   Port mapping (UPnP-IGD + NAT-PMP / PCP)
+│       ├── mod.rs         #     PortMapperClient trait + install/renew/revoke task
+│       ├── gateway.rs     #     Default-gateway + LAN-IP discovery
+│       ├── natpmp.rs      #     NAT-PMP / PCP wire codec + UDP client (RFC 6886 / 6887)
+│       ├── upnp.rs        #     UPnP-IGD client backed by `igd-next`
+│       └── sequential.rs  #     Composing mapper: NAT-PMP first, UPnP fallback
+│
 ├── redex/                 # RedEX — local append-only event log (feature `redex`)
 │   ├── mod.rs             #   Re-exports: Redex, RedexFile, RedexEvent, RedexError, ...
 │   ├── entry.rs           #   20-byte RedexEntry codec, RedexFlags, payload_checksum
@@ -607,6 +629,9 @@ src/adapter/net/
 │   ├── fold.rs            #   RedexFold<State> trait (CortEX / NetDB integration hook)
 │   ├── file.rs            #   RedexFile (append / tail / read_range / close)
 │   ├── manager.rs         #   Redex manager (open_file / get_file / with_persistent_dir)
+│   ├── ordered.rs         #   OrderedAppender — single-threaded append for deterministic replay
+│   ├── typed.rs           #   TypedRedexFile<T> — postcard-backed typed wrapper
+│   ├── index.rs           #   RedexIndex<K, V> — generic tail-driven secondary index
 │   └── disk.rs            #   DiskSegment (feature `redex-disk`): idx + dat append-only files, torn-write recovery
 │
 ├── cortex/                # CortEX adapter — NetDB fold driver (feature `cortex`)
@@ -622,6 +647,7 @@ src/adapter/net/
 │   │   ├── dispatch.rs    #     DISPATCH_TASK_* (0x01..0x04), TASKS_CHANNEL
 │   │   ├── state.rs       #     TasksState + basic accessors
 │   │   ├── fold.rs        #     TasksFold (decodes EventMeta, routes by dispatch)
+│   │   ├── filter.rs      #     Plain-data TasksFilter (Prisma-ish surface, mirrors SDK shape)
 │   │   ├── query.rs       #     TasksQuery fluent builder + TasksFilterSpec + OrderBy
 │   │   ├── watch.rs       #     TasksWatcher reactive stream (initial + dedup)
 │   │   └── adapter.rs     #     TasksAdapter wrapper (typed ingest + watch)
@@ -631,6 +657,7 @@ src/adapter/net/
 │       ├── dispatch.rs    #     DISPATCH_MEMORY_* (0x10..0x14), MEMORIES_CHANNEL
 │       ├── state.rs       #     MemoriesState + pinned/unpinned splits
 │       ├── fold.rs        #     MemoriesFold
+│       ├── filter.rs      #     Plain-data MemoriesFilter (Prisma-ish surface)
 │       ├── query.rs       #     MemoriesQuery with single/any/all tag predicates
 │       ├── watch.rs       #     MemoriesWatcher
 │       └── adapter.rs     #     MemoriesAdapter wrapper
