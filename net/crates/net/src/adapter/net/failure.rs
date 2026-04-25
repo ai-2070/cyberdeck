@@ -520,21 +520,43 @@ impl CircuitBreaker {
 
     /// Check if request should be allowed
     pub fn allow(&self) -> bool {
-        let state = *self.state.read().unwrap();
-        match state {
-            CircuitState::Closed => true,
+        // Fast path: read lock for the common Closed/HalfOpen case so
+        // typical allow() calls don't contend on the writer lock.
+        {
+            let state = *self.state.read().unwrap();
+            match state {
+                CircuitState::Closed | CircuitState::HalfOpen => return true,
+                CircuitState::Open => {} // fall through to slow path
+            }
+        }
+        // Slow path: when the fast path observed Open, hold the write
+        // lock across the entire read-decide-transition. Dropping it
+        // between the read and the transition (the previous
+        // implementation) lets a concurrent reset() — which transitions
+        // Open → Closed — be silently undone by this method's
+        // transition Open → HalfOpen layered on top of the Closed
+        // state. record_success/record_failure deliberately hold the
+        // write lock throughout for the same reason; allow() was the
+        // outlier.
+        let mut state = self.state.write().unwrap();
+        match *state {
+            CircuitState::Closed | CircuitState::HalfOpen => true,
             CircuitState::Open => {
-                // Check if we should transition to half-open
-                let last = self.last_state_change.lock().unwrap();
-                if last.elapsed() >= self.reset_timeout {
-                    drop(last);
-                    self.transition_to(CircuitState::HalfOpen);
+                let elapsed = self.last_state_change.lock().unwrap().elapsed();
+                if elapsed >= self.reset_timeout {
+                    Self::transition_locked(
+                        &mut state,
+                        CircuitState::HalfOpen,
+                        &self.failure_count,
+                        &self.success_count,
+                        &self.last_state_change,
+                        &self.total_trips,
+                    );
                     true
                 } else {
                     false
                 }
             }
-            CircuitState::HalfOpen => true,
         }
     }
 
@@ -1114,6 +1136,83 @@ mod tests {
         assert!(
             trips <= 8_000,
             "total_trips ({trips}) is unreasonably high, suggests corruption"
+        );
+    }
+
+    #[test]
+    fn test_regression_allow_does_not_undo_reset() {
+        // Regression: allow() previously read state under the read lock,
+        // dropped it, then called transition_to(HalfOpen) without
+        // re-checking. A reset() that ran in that gap (transition_to
+        // Closed) was silently overwritten when allow()'s transition_to
+        // re-acquired the write lock and stamped HalfOpen on top.
+        //
+        // Fix: allow() holds the write lock across the read-decide-
+        // transition path, so a state change between the fast-path read
+        // and the slow-path write lock is observed before any
+        // transition runs.
+        //
+        // The test repeatedly trips the breaker to Open, then races
+        // allow() (in an observer thread) against reset() (on the main
+        // thread). The reset_timeout is 1ns so allow() always sees the
+        // timeout as elapsed and would transition to HalfOpen if it
+        // could. Final state should always be Closed: either reset()
+        // ran "after" allow()'s transition (write-lock serialization
+        // guarantees Closed wins), or it ran "before" and allow()
+        // observed Closed under the write lock and skipped the
+        // transition. With the bug, some trials end in HalfOpen.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::thread;
+
+        const TRIALS: u32 = 5_000;
+
+        let cb = Arc::new(CircuitBreaker::new(1, 1, Duration::from_nanos(1)));
+        let signal = Arc::new(AtomicU8::new(0)); // 0=idle, 1=run, 2=stop
+
+        let cb_observer = cb.clone();
+        let signal_observer = signal.clone();
+        let observer = thread::spawn(move || {
+            loop {
+                match signal_observer.load(Ordering::Acquire) {
+                    0 => std::hint::spin_loop(),
+                    1 => {
+                        cb_observer.allow();
+                        signal_observer.store(0, Ordering::Release);
+                    }
+                    _ => return,
+                }
+            }
+        });
+
+        let mut bug_count = 0u32;
+        for _ in 0..TRIALS {
+            // Trip Closed → Open (failure_threshold = 1).
+            cb.record_failure();
+            assert_eq!(cb.state(), CircuitState::Open);
+
+            // Hand off to observer; race reset() against its allow().
+            signal.store(1, Ordering::Release);
+            cb.reset();
+            while signal.load(Ordering::Acquire) != 0 {
+                std::hint::spin_loop();
+            }
+
+            if cb.state() != CircuitState::Closed {
+                bug_count += 1;
+                // Recover for the next trial so the assertion below
+                // surfaces the race count, not a stuck state.
+                cb.reset();
+            }
+        }
+
+        signal.store(2, Ordering::Release);
+        observer.join().unwrap();
+
+        assert_eq!(
+            bug_count, 0,
+            "{bug_count} of {TRIALS} trials ended in non-Closed state — \
+             allow() transitioned to HalfOpen on top of a fresh reset()"
         );
     }
 
