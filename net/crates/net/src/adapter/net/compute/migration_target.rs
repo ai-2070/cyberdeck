@@ -856,24 +856,22 @@ mod tests {
         let h_observer = handler.clone();
         let origin_observer = current_origin.clone();
         let gap_observer = gap_seen.clone();
-        let observer = thread::spawn(move || {
-            loop {
-                let origin = origin_observer.load(Ordering::Acquire);
-                if origin == STOP {
+        let observer = thread::spawn(move || loop {
+            let origin = origin_observer.load(Ordering::Acquire);
+            if origin == STOP {
+                return;
+            }
+            if origin == 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            match h_observer.activate(origin) {
+                Ok(_) => {}
+                Err(MigrationError::DaemonNotFound(o)) => {
+                    gap_observer.store(o as u64, Ordering::Release);
                     return;
                 }
-                if origin == 0 {
-                    std::hint::spin_loop();
-                    continue;
-                }
-                match h_observer.activate(origin) {
-                    Ok(_) => {}
-                    Err(MigrationError::DaemonNotFound(o)) => {
-                        gap_observer.store(o as u64, Ordering::Release);
-                        return;
-                    }
-                    Err(_) => {}
-                }
+                Err(_) => {}
             }
         });
 

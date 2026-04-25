@@ -1161,8 +1161,8 @@ mod tests {
         // guarantees Closed wins), or it ran "before" and allow()
         // observed Closed under the write lock and skipped the
         // transition. With the bug, some trials end in HalfOpen.
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicU8, Ordering};
+        use std::sync::Arc;
         use std::thread;
 
         const TRIALS: u32 = 5_000;
@@ -1172,16 +1172,14 @@ mod tests {
 
         let cb_observer = cb.clone();
         let signal_observer = signal.clone();
-        let observer = thread::spawn(move || {
-            loop {
-                match signal_observer.load(Ordering::Acquire) {
-                    0 => std::hint::spin_loop(),
-                    1 => {
-                        cb_observer.allow();
-                        signal_observer.store(0, Ordering::Release);
-                    }
-                    _ => return,
+        let observer = thread::spawn(move || loop {
+            match signal_observer.load(Ordering::Acquire) {
+                0 => std::hint::spin_loop(),
+                1 => {
+                    cb_observer.allow();
+                    signal_observer.store(0, Ordering::Release);
                 }
+                _ => return,
             }
         });
 

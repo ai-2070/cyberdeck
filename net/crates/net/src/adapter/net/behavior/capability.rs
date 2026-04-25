@@ -1554,22 +1554,17 @@ impl CapabilityIndex {
             .build_candidate_set(filter)
             .unwrap_or_else(|| self.nodes.iter().map(|r| *r.key()).collect());
 
-        // Fast path: if the filter only constrains dimensions covered
-        // by the inverted indexes, the intersection above is already
-        // the answer. Skip the per-candidate `nodes.get()` + full
-        // `matches()` re-check — but still confirm presence via
-        // `contains_key` so a node evicted in the race window between
-        // the index read and now does not leak into the result.
-        if !filter.needs_full_check() {
-            return candidates
-                .into_iter()
-                .filter(|&node_id| self.nodes.contains_key(&node_id))
-                .collect();
-        }
-
-        // Slow path: filter has non-indexed predicates (memory, vram,
-        // context length, modalities). Pull each candidate's full
-        // capability set and re-check.
+        // Re-check `filter.matches()` against each candidate's current
+        // `nodes` entry, even when the filter only constrains indexed
+        // dimensions. The inverted indexes update non-atomically with
+        // `nodes` (`remove_from_indexes` → `add_to_indexes` →
+        // `nodes.insert`), so during a re-announcement that swaps a
+        // capability set the inverted index can list a node under a
+        // tag/model/tool that the node's current `nodes` entry does
+        // not actually advertise. Skipping the re-check on a "fast
+        // path" lets that stale index leak into the result. The
+        // matches() call here re-verifies under the current
+        // capabilities and closes the window.
         candidates
             .into_iter()
             .filter(|&node_id| {
@@ -1596,13 +1591,17 @@ impl CapabilityIndex {
             .build_candidate_set(&req.filter)
             .unwrap_or_else(|| self.nodes.iter().map(|r| *r.key()).collect());
 
-        let needs_full = req.filter.needs_full_check();
-
         candidates
             .into_iter()
             .filter_map(|node_id| {
                 let node = self.nodes.get(&node_id)?;
-                if needs_full && !req.filter.matches(&node.capabilities) {
+                // Always re-check the filter under the current
+                // capabilities, not just when `needs_full_check()` is
+                // true: the inverted indexes update non-atomically with
+                // `nodes`, so a stale index can otherwise advance a
+                // candidate that no longer matches the filter into the
+                // scoring step. See `query()` for the same fix.
+                if !req.filter.matches(&node.capabilities) {
                     return None;
                 }
                 Some((node_id, req.score(&node.capabilities)))
@@ -2569,6 +2568,88 @@ mod tests {
         assert_eq!(
             chosen, expected_winner,
             "find_best must pick the highest-memory candidate under prefer_memory(1.0)"
+        );
+    }
+
+    #[test]
+    fn test_regression_query_rejects_stale_inverted_index_entry() {
+        // Regression: `query()` had a fast path that, when the filter
+        // only constrained indexed dimensions, returned every candidate
+        // produced by the inverted indexes after only a `contains_key`
+        // presence check on `nodes`. The inverted indexes update
+        // non-atomically with `nodes` (`remove_from_indexes(old)` →
+        // `add_to_indexes(new)` → `nodes.insert(new)`), so during a
+        // capability re-announcement that swaps a tag the inverted
+        // index could already advertise the node under the new tag
+        // while `nodes` still held the old `CapabilitySet`. The fast
+        // path then leaked the node into a query that did not actually
+        // match its current capabilities.
+        //
+        // The fix removes the fast path and always re-runs
+        // `filter.matches()` against the current capabilities. This
+        // test deterministically reproduces the inconsistent state by
+        // directly manipulating the private indexes — no thread race
+        // needed.
+        let index = CapabilityIndex::new();
+
+        // Step 1: index the node honestly via the public API with
+        // tags = ["alpha"].
+        let caps_alpha = CapabilitySet::new().add_tag("alpha");
+        let ann = CapabilityAnnouncement::new(1, test_entity(), 1, caps_alpha);
+        index.index(ann);
+
+        // Sanity: alpha matches, beta does not.
+        let filter_alpha = CapabilityFilter::new().require_tag("alpha");
+        let filter_beta = CapabilityFilter::new().require_tag("beta");
+        assert_eq!(index.query(&filter_alpha), vec![1]);
+        assert!(index.query(&filter_beta).is_empty());
+
+        // Step 2: simulate the mid-reindex race window. Move node 1
+        // from `by_tag["alpha"]` to `by_tag["beta"]` WITHOUT updating
+        // `nodes`. This is exactly the state the inverted-index update
+        // produces between `add_to_indexes(new)` and
+        // `nodes.insert(new)` when "alpha"→"beta" tags swap.
+        index
+            .by_tag
+            .get_mut("alpha")
+            .expect("alpha tag entry was indexed")
+            .remove(&1);
+        index
+            .by_tag
+            .entry("beta".to_string())
+            .or_default()
+            .insert(1);
+
+        // Step 3: with the fix, query(beta) does NOT return node 1
+        // because nodes[1] still has tags=["alpha"] which does not
+        // match beta. The buggy fast path would return it via
+        // contains_key alone.
+        assert!(
+            index.query(&filter_beta).is_empty(),
+            "query(beta) leaked a node whose nodes[] entry does not advertise beta"
+        );
+
+        // And query(alpha) still returns node 1 because nodes[1]
+        // currently advertises alpha — even though the inverted index
+        // for alpha no longer lists it. (build_candidate_set returns
+        // None when the filter has no positive index hit; query then
+        // falls back to scanning nodes directly, where node 1 still
+        // matches.)
+        assert_eq!(
+            index.query(&filter_alpha),
+            vec![1],
+            "query(alpha) must still find node 1 via the nodes-scan fallback"
+        );
+
+        // Step 4: same invariant for find_best — its previous
+        // implementation gated `filter.matches()` on
+        // `needs_full_check()` and skipped the re-check on
+        // index-only filters, surfacing the same leak as a chosen
+        // node that did not actually match.
+        let req = CapabilityRequirement::from_filter(filter_beta.clone());
+        assert!(
+            index.find_best(&req).is_none(),
+            "find_best(beta) leaked a non-matching node from the stale inverted index"
         );
     }
 }
