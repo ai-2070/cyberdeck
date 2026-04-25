@@ -185,22 +185,27 @@ written for the Go cgo bindings and is the de-facto reference for
 C consumers who want the mesh API. Symbols are stable in practice
 but not committed in the same way as `include/net.h`.
 
-**Pick one header per translation unit.** Both files use the same
+**One header per translation unit.** Both files use the same
 `#ifndef NET_SDK_H` include guard, so including both in the same
-`.c` file silently drops one — the second include becomes a no-op
-and any of its symbols you reference will fail to link or
-compile. The split is by concern, not by additivity:
+`.c` file silently drops the second include — symbols only declared
+there will fail to compile. The two headers are also **not a strict
+superset of each other**:
 
-- **`include/net.h`** — bus-only consumers. Stable surface.
-- **`bindings/go/net/net.h`** — mesh-using consumers. Includes the
-  bus surface as well, plus the mesh, channels, capabilities, NAT,
-  etc. (because the symbols are in the same dylib, the broader
-  header is a *superset* — it just isn't the public/stable one).
+- `include/net.h` declares `net_ingest_raw_ex`, `net_poll_ex`,
+  `net_stats_ex` (structured no-JSON paths) that
+  `bindings/go/net/net.h` does not.
+- `bindings/go/net/net.h` declares the entire mesh surface
+  (sessions, streams, channels, capabilities, NAT) that
+  `include/net.h` does not.
 
-If your project needs both surfaces, include the broader header —
-it's a strict superset. If you need only the bus surface,
-including the narrow header keeps you on the stable contract and
-won't pull in mesh declarations you don't use.
+Pick the header that matches the surface your translation unit
+actually uses. If a single program needs both — the structured
+`_ex` poll path *and* the mesh API — split them across translation
+units: one `.c` file includes `include/net.h` and exposes a thin
+internal API to the rest of your program, another includes
+`bindings/go/net/net.h`. The resulting object files link against
+the same `libnet.{so,dylib,dll}` regardless of which header
+declared each symbol.
 
 A mesh node is its own handle (`net_meshnode_t*`), created via
 `net_mesh_new` and torn down via `net_mesh_shutdown` — independent
