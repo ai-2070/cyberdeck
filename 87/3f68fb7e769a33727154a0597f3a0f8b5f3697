@@ -1,0 +1,27 @@
+net/crates/net/bindings/python/src/identity.rs
+  0f2df0e612c625ad 131
+net/crates/net/bindings/python/src/lib.rs
+  0f2df0e612c625ad 45,65,96,155,175,996
+net/crates/net/bindings/go/compute-ffi/src/lib.rs
+  0f2df0e612c625ad 922-925,1109-1112,1326-1332,1385-1388,1429-1432,1921-1924,2126-2129,2299-2301
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "873f68fb7e769a33727154a0597f3a0f8b5f3697",
+  "prompts": {
+    "0f2df0e612c625ad": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e832c279-3821-4470-a3eb-bc6fb918a853",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2606,
+      "total_deletions": 5497,
+      "accepted_lines": 42,
+      "overriden_lines": 0
+    }
+  }
+}
