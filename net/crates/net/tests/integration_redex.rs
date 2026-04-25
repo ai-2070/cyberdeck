@@ -440,6 +440,51 @@ async fn test_redex_close_signals_tail() {
     assert!(stream.next().await.is_none());
 }
 
+/// A `tail(from_seq)` whose backfill set is larger than the
+/// per-subscription buffer must surface `RedexError::Lagged` as
+/// the FIRST stream item — not a silently-truncated history. This
+/// is stronger than the live-overflow guarantee (which is
+/// best-effort under saturation) because the channel is empty at
+/// subscription time, so the pre-flight check can guarantee
+/// delivery of the Lagged signal.
+#[tokio::test]
+async fn test_redex_tail_backfill_overflow_yields_lagged_first() {
+    const BUFFER: usize = 4;
+    let r = Redex::new();
+    let f = r
+        .open_file(
+            &cn("backfill-overflow"),
+            RedexFileConfig::default().with_tail_buffer_size(BUFFER),
+        )
+        .unwrap();
+
+    // Build retained history far past the buffer.
+    for i in 0..50u64 {
+        f.append(format!("seed-{}", i).as_bytes()).unwrap();
+    }
+
+    let mut stream = Box::pin(f.tail(0));
+
+    // The first item must be `Lagged` — no truncated history.
+    match stream.next().await {
+        Some(Err(RedexError::Lagged)) => { /* expected */ }
+        Some(Ok(ev)) => panic!(
+            "backfill overflow must signal Lagged before any event; \
+             instead got event seq {}",
+            ev.entry.seq
+        ),
+        Some(Err(e)) => panic!("unexpected error: {:?}", e),
+        None => panic!("stream ended without Lagged signal"),
+    }
+
+    // Stream ends after the Lagged signal — the watcher was never
+    // registered.
+    assert!(
+        stream.next().await.is_none(),
+        "stream must end after backfill-overflow Lagged"
+    );
+}
+
 /// Slow tail subscriber overflowing the per-subscription buffer must
 /// be disconnected, never silently grow memory. Pins the
 /// disconnect-on-full semantics introduced when `tail()` switched

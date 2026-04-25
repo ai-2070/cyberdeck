@@ -657,11 +657,19 @@ impl RedexFile {
     /// and live subscription.
     ///
     /// Delivery is backed by a per-subscription bounded channel of
-    /// depth [`RedexFileConfig::tail_buffer_size`]. A subscriber that
-    /// cannot drain events fast enough (or requests a backfill
-    /// larger than the buffer without concurrent draining) is
-    /// disconnected with a best-effort [`RedexError::Lagged`]
-    /// signal; see [`notify_watchers`].
+    /// depth [`RedexFileConfig::tail_buffer_size`].
+    ///
+    /// - **Backfill overflow** (requested `from_seq` produces more
+    ///   retained events than the buffer can hold): pre-flighted
+    ///   under the state lock; the subscriber observes
+    ///   [`RedexError::Lagged`] as the first stream item and no
+    ///   truncated history. Guaranteed deliverable because the
+    ///   channel is empty at that point.
+    /// - **Live overflow** (subscriber falls behind during live
+    ///   delivery): disconnected with a best-effort
+    ///   [`RedexError::Lagged`]; see [`notify_watchers`]. Under
+    ///   sustained saturation the signal itself may be dropped, in
+    ///   which case the subscriber sees a clean stream end.
     pub fn tail(
         &self,
         from_seq: u64,
@@ -685,15 +693,29 @@ impl RedexFile {
             return ReceiverStream::new(rx);
         }
 
+        // Backfill pre-flight. The index is in seq order so we can
+        // binary-search for the first matching entry and compute the
+        // backfill size in O(log n). If it can't fit in the channel,
+        // we signal `Lagged` *before* enqueuing any events — the
+        // channel is empty at this point so the signal is guaranteed
+        // to land, and the subscriber sees a clean "you missed
+        // history" error rather than a silently-truncated prefix
+        // (the case the prior best-effort `try_send(Err(Lagged))`
+        // could not deliver if the buffer was already saturated).
+        let start = state.index.partition_point(|e| e.seq < from_seq);
+        let backfill_count = state.index.len() - start;
+        if backfill_count > buffer {
+            drop(state);
+            let _ = tx.try_send(Err(RedexError::Lagged));
+            return ReceiverStream::new(rx);
+        }
+
         // Backfill. Uses `try_send` under the state lock so backfill +
         // registration is still atomic with respect to concurrent
-        // appends. If the backfill set is larger than the channel
-        // buffer the subscriber is already lagging before live
-        // delivery starts — signal Lagged, skip registration.
-        for entry in state.index.iter() {
-            if entry.seq < from_seq {
-                continue;
-            }
+        // appends. The pre-flight above guarantees we won't hit the
+        // `Full` path here — defensively handle it anyway in case a
+        // payload evicts between the count and the materialize.
+        for entry in state.index[start..].iter() {
             let event = match materialize(entry, &state.segment) {
                 Some(e) => e,
                 None => continue, // payload evicted between index retain and read
@@ -701,6 +723,7 @@ impl RedexFile {
             match tx.try_send(Ok(event)) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
+                    // Defensive: pre-flight should have prevented this.
                     let _ = tx.try_send(Err(RedexError::Lagged));
                     return ReceiverStream::new(rx);
                 }

@@ -35,6 +35,16 @@ import (
 	"unsafe"
 )
 
+// emptyByte is a single-byte array used as a non-null pointer
+// substitute for empty-string FFI arguments. Passing the literal
+// `nil` `*C.char` would change behavior — the C side maps a null
+// `json` pointer to `ErrNullPointer` even when `len == 0`, whereas
+// the previous `C.CString("")` produced a valid pointer to a `\0`
+// byte and the C side treats it as a (zero-length, valid) input.
+// One package-level byte preserves the previous semantics without
+// allocating per call.
+var emptyByte [1]byte
+
 // Error codes
 var (
 	ErrNullPointer     = errors.New("null pointer")
@@ -214,10 +224,15 @@ func (bs *Net) IngestRaw(json string) error {
 	// the bytes as immutable, so we can hand it Go's own string
 	// backing store via unsafe.StringData. C.CString would malloc +
 	// copy; the (ptr, len) pattern matches what compute.go already
-	// uses for short-lived args.
+	// uses for short-lived args. For empty input we hand it a
+	// non-null sentinel so the C side doesn't reject the call as
+	// `ErrNullPointer` — preserves the previous `C.CString("")`
+	// shape without per-call malloc.
 	var ptr *C.char
 	if len(json) > 0 {
 		ptr = (*C.char)(unsafe.Pointer(unsafe.StringData(json)))
+	} else {
+		ptr = (*C.char)(unsafe.Pointer(&emptyByte[0]))
 	}
 	result := C.net_ingest_raw(bs.handle, ptr, C.size_t(len(json)))
 	runtime.KeepAlive(json)
@@ -248,6 +263,9 @@ func (bs *Net) IngestRawBatch(jsons []string) int {
 	for i, j := range jsons {
 		if len(j) > 0 {
 			ptrs[i] = (*C.char)(unsafe.Pointer(unsafe.StringData(j)))
+		} else {
+			// Same null-vs-sentinel rationale as IngestRaw above.
+			ptrs[i] = (*C.char)(unsafe.Pointer(&emptyByte[0]))
 		}
 		lens[i] = C.size_t(len(j))
 	}

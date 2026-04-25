@@ -76,7 +76,14 @@ class EventStream:
         )
 
     def __iter__(self) -> Iterator[StoredEvent]:
-        backoff = self._opts.poll_interval
+        # Clamp the user-provided knobs to non-negative locals once,
+        # so every `time.sleep` site below is safe regardless of what
+        # the caller put in `SubscribeOpts`. `time.sleep` raises
+        # `ValueError` on negative input; clamping at the boundary
+        # keeps the loop correct against misconfiguration.
+        poll_interval = max(0.0, self._opts.poll_interval)
+        max_backoff = max(0.0, self._opts.max_backoff)
+        backoff = poll_interval
         start = time.monotonic()
 
         while not self._stopped:
@@ -88,7 +95,7 @@ class EventStream:
             response = self._poll()
 
             if len(response) > 0:
-                backoff = self._opts.poll_interval
+                backoff = poll_interval
                 self._cursor = response.next_id
 
                 for event in response:
@@ -101,13 +108,17 @@ class EventStream:
                 # means more events are queued, so we skip the sleep
                 # and loop tight to keep up.
                 if len(response) < self._opts.limit:
-                    time.sleep(self._opts.poll_interval)
+                    time.sleep(poll_interval)
             else:
                 time.sleep(backoff)
-                backoff = min(backoff * 2, self._opts.max_backoff)
+                backoff = min(backoff * 2, max_backoff)
 
     async def __aiter__(self) -> AsyncIterator[StoredEvent]:
-        backoff = self._opts.poll_interval
+        # Same clamp rationale as `__iter__`. `asyncio.sleep` raises
+        # `ValueError` on negative input.
+        poll_interval = max(0.0, self._opts.poll_interval)
+        max_backoff = max(0.0, self._opts.max_backoff)
+        backoff = poll_interval
         start = time.monotonic()
 
         while not self._stopped:
@@ -119,17 +130,17 @@ class EventStream:
             response = self._poll()
 
             if len(response) > 0:
-                backoff = self._opts.poll_interval
+                backoff = poll_interval
                 self._cursor = response.next_id
 
                 for event in response:
                     yield event
 
                 if len(response) < self._opts.limit:
-                    await asyncio.sleep(self._opts.poll_interval)
+                    await asyncio.sleep(poll_interval)
             else:
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, self._opts.max_backoff)
+                backoff = min(backoff * 2, max_backoff)
 
 
 class TypedEventStream(Generic[T]):
