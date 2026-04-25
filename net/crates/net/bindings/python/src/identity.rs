@@ -128,7 +128,7 @@ fn channel_to_hash(channel: &str) -> PyResult<u16> {
 
 /// ed25519 keypair + local token cache. Cheap to clone (both
 /// inner members are `Arc`).
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct Identity {
     pub(crate) keypair: Arc<EntityKeypair>,

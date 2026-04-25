@@ -42,7 +42,7 @@ use net::config::JetStreamAdapterConfig;
 use net::adapter::net::{NetAdapterConfig, ReliabilityConfig, StaticKeypair};
 
 /// Result of an ingestion operation.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct IngestResult {
     #[pyo3(get)]
@@ -62,7 +62,7 @@ impl IngestResult {
 }
 
 /// A stored event returned from polling.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct StoredEvent {
     #[pyo3(get)]
@@ -93,7 +93,7 @@ impl StoredEvent {
 }
 
 /// Poll response containing events and cursor.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct PollResponse {
     #[pyo3(get)]
@@ -152,7 +152,7 @@ impl EventIterator {
 }
 
 /// Ingestion statistics.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct Stats {
     #[pyo3(get)]
@@ -172,7 +172,7 @@ impl Stats {
 }
 
 /// Net keypair for encrypted UDP transport.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct NetKeypair {
     /// Hex-encoded 32-byte public key
@@ -993,7 +993,7 @@ mod mesh_bindings {
     }
 
     /// Snapshot of per-stream stats.
-    #[pyclass]
+    #[pyclass(from_py_object)]
     #[derive(Clone)]
     pub struct NetStreamStats {
         #[pyo3(get)]
