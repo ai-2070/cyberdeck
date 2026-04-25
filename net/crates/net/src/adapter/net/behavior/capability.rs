@@ -747,11 +747,12 @@ pub struct CapabilityAnnouncement {
     pub hop_count: u8,
     /// Observer-visible reflexive `SocketAddr` as seen by this
     /// node's anchor peers during NAT classification. Populated
-    /// once [`crate::adapter::net::traversal::classify::ClassifyFsm`]
-    /// has ≥ 2 probe results; stays `None` on nodes that haven't
-    /// classified yet, ran with `nat-traversal` disabled, or
-    /// landed in the `Unknown` bucket (different peers disagree
-    /// on our port so no single address is truthful).
+    /// once the `ClassifyFsm` (under the `nat-traversal` feature,
+    /// in `adapter/net/traversal/classify.rs`) has ≥ 2 probe
+    /// results; stays `None` on nodes that haven't classified
+    /// yet, ran with `nat-traversal` disabled, or landed in the
+    /// `Unknown` bucket (different peers disagree on our port
+    /// so no single address is truthful).
     ///
     /// **Peer usage.** Receivers cache this alongside the
     /// `nat:*` tag and use it as the initial rendezvous target

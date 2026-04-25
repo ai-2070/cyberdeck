@@ -667,9 +667,10 @@ impl RedexFile {
     ///   channel is empty at that point.
     /// - **Live overflow** (subscriber falls behind during live
     ///   delivery): disconnected with a best-effort
-    ///   [`RedexError::Lagged`]; see [`notify_watchers`]. Under
-    ///   sustained saturation the signal itself may be dropped, in
-    ///   which case the subscriber sees a clean stream end.
+    ///   [`RedexError::Lagged`]. Under sustained saturation the
+    ///   signal itself may be dropped (the channel is full when we
+    ///   try to enqueue it), in which case the subscriber sees a
+    ///   clean stream end.
     pub fn tail(
         &self,
         from_seq: u64,
