@@ -599,7 +599,7 @@ Pool contention (thread-local acquire/release):
 
 All benchmarks re-captured 2026-04-27 on M1 Max with release-mode bindings.
 
-All SDKs exceed **3.9M events/sec** even on single-event ingestion, and **5M+ events/sec** on batch. Go now leads single-event ingestion at **6.31M/sec** (zero allocations on raw ingestion path). Python (via PyO3) is the fastest binding on batch at **6.97M/sec** — the GIL releases for the duration of the FFI call so per-event overhead is the bare PyO3 marshalling. Node.js sync methods are ~41x faster than async (`push` 3.96M vs async `ingestRaw` 96K). Bun batch (5.37M) is ~6% faster than Node.js batch (5.08M) on the same `pushBatch` call.
+All SDKs exceed **3.93M events/sec** even on single-event ingestion, and **5M+ events/sec** on batch. Go now leads single-event ingestion at **6.31M/sec** (zero allocations on raw ingestion path). Python (via PyO3) is the fastest binding on batch at **6.97M/sec** — the GIL releases for the duration of the FFI call so per-event overhead is the bare PyO3 marshalling. Node.js sync methods are ~41x faster than async (`push` 3.96M vs async `ingestRaw` 96K). Bun batch (5.37M) is ~6% faster than Node.js batch (5.08M) on the same `pushBatch` call.
 
 ### RedEX (storage primitive)
 
