@@ -3,6 +3,9 @@ import { z } from "zod";
 const CrewAgentCountSchema = z.object({
   role: z.string().min(1),
   amount: z.number().int().min(0),
+  // Optional per-role system prompt override. When present, it replaces the
+  // shape's system_prompt for this role at buildCrewGraph time.
+  system_prompt: z.string().optional(),
 });
 
 export const CrewAgentsSchema = z.object({

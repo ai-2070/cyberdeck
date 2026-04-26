@@ -96,6 +96,87 @@ describe("CrewSession.start", () => {
     });
   });
 
+  it("task set at start() appears on crew.started but NOT on agent.step.requested", () => {
+    const { session } = setup();
+    const task = { description: "Research bird sleep patterns" };
+
+    const log: CrewEvent[] = [];
+    const queue: CrewEvent[] = session.start("ROOT", task);
+
+    while (queue.length > 0) {
+      const e = queue.shift()!;
+      log.push(e);
+      if (e.type === "agent.step.requested") {
+        queue.push(
+          ...session.deliver({
+            type: "agent.step.completed",
+            correlationId: e.correlationId,
+            output: "ok",
+            ts: 1000,
+          }),
+        );
+      }
+    }
+
+    const started = log.find((e) => e.type === "crew.started") as Extract<
+      CrewEvent,
+      { type: "crew.started" }
+    >;
+    expect(started.task).toEqual(task);
+
+    // Per-step requests must NOT carry the task — each phase only sees the
+    // upstream phase's resolved output as its input.
+    const requests = log.filter(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>[];
+    expect(requests.length).toBeGreaterThan(0);
+    for (const r of requests) {
+      expect((r as { task?: unknown }).task).toBeUndefined();
+    }
+  });
+
+  it("crew.started has no task field when start() was called without one", () => {
+    const { session } = setup();
+    const initial = session.start("ROOT");
+    const started = initial.find((e) => e.type === "crew.started") as Extract<
+      CrewEvent,
+      { type: "crew.started" }
+    >;
+    expect(started.task).toBeUndefined();
+  });
+
+  it("RoleSnapshot carries the role's system_prompt (with agents-config override)", () => {
+    const shape = CrewShapeSchema.parse({
+      ...DEFAULT_CREW_SHAPE,
+      roles: DEFAULT_CREW_SHAPE.roles.map((r) =>
+        r.role === "caller"
+          ? { ...r, system_prompt: "default-caller-instructions" }
+          : r,
+      ),
+    });
+    const counts = CrewAgentsSchema.parse({
+      schema_version: "1.0",
+      name: "DEFAULT_CREW",
+      agents: [
+        { role: "merc", amount: 4 },
+        { role: "specialist", amount: 1 },
+        { role: "fixer", amount: 1 },
+        { role: "caller", amount: 1, system_prompt: "research bird sleep" },
+      ],
+    });
+    const graph = buildCrewGraph(shape, counts);
+    const session = createCrewSession({
+      crewId: "sp-test",
+      graph,
+      clock: frozenClock(0),
+    });
+    const events = session.start("ROOT");
+    const req = events.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
+    expect(req.role.system_prompt).toBe("research bird sleep");
+  });
+
   it("throws if start() is called twice", () => {
     const { session } = setup();
     session.start("ROOT");

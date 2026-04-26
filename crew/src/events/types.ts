@@ -62,11 +62,29 @@ export type MemoryCommand =
     }
   | { type: "edge.retract"; edge_id: string; author: string; reason?: string };
 
+// The crew's purpose — set at session.start() and emitted once on
+// crew.started. Session-level metadata only: it does NOT propagate to
+// per-step requests. Each phase only sees the upstream phase's resolved
+// output as its `input`. The caller (entry-point role) receives the
+// rootInput (which is typically derived from the task) and is responsible
+// for formulating the prompt the next phase sees.
+//
+// Useful for observers, logging, replay snapshots, and (later) memex
+// Intent linkage. v1 keeps this minimal — future fields: priority,
+// deadline, success_criteria, intent_id, parents.
+export interface Task {
+  description: string;
+}
+
 // Self-contained role snapshot embedded in agent.step.requested.
 // Workers receive this and don't need to load the crew shape out-of-band.
 export interface RoleSnapshot {
   name: string;
   description?: string;
+  // The system prompt the worker should use for the model. Sourced from the
+  // shape's role.system_prompt, with the agents-config's per-role override
+  // applied at buildCrewGraph time.
+  system_prompt?: string;
   capabilities?: {
     model?: string;
     tools?: string[];
@@ -85,7 +103,7 @@ export type AbortReason = "cancelled" | "timeout";
 
 export type CrewEvent =
   // ─── outbound (session-emitted) ───
-  | { type: "crew.started"; crewId: string; rootInput: unknown; ts: number }
+  | { type: "crew.started"; crewId: string; rootInput: unknown; task?: Task; ts: number }
   | { type: "role.entered"; roleId: RoleId; ts: number }
   | {
       type: "agent.step.requested";

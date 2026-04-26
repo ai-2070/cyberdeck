@@ -96,6 +96,45 @@ describe("buildCrewGraph", () => {
     expect(() => buildCrewGraph(shape, counts)).toThrow(/unknown role/);
   });
 
+  it("agents-config system_prompt overrides the role's shape default", () => {
+    const shape = CrewShapeSchema.parse({
+      ...DEFAULT_CREW_SHAPE,
+      roles: DEFAULT_CREW_SHAPE.roles.map((r) =>
+        r.role === "merc"
+          ? { ...r, system_prompt: "default-merc-prompt" }
+          : r,
+      ),
+    });
+    const counts = CrewAgentsSchema.parse({
+      schema_version: "1.0",
+      name: "DEFAULT_CREW",
+      agents: [
+        { role: "merc", amount: 4, system_prompt: "research-bird-sleep" },
+        { role: "specialist", amount: 1 },
+        { role: "fixer", amount: 1 },
+        { role: "caller", amount: 1 },
+      ],
+    });
+    const graph = buildCrewGraph(shape, counts);
+    expect(graph.roles.get("merc")!.system_prompt).toBe("research-bird-sleep");
+    // Role without override keeps its shape default (or undefined)
+    expect(graph.roles.get("specialist")!.system_prompt).toBeUndefined();
+  });
+
+  it("agents-config without system_prompt leaves the shape default in place", () => {
+    const shape = CrewShapeSchema.parse({
+      ...DEFAULT_CREW_SHAPE,
+      roles: DEFAULT_CREW_SHAPE.roles.map((r) =>
+        r.role === "merc"
+          ? { ...r, system_prompt: "default-merc-prompt" }
+          : r,
+      ),
+    });
+    const counts = CrewAgentsSchema.parse(DEFAULT_CREW_AGENTS);
+    const graph = buildCrewGraph(shape, counts);
+    expect(graph.roles.get("merc")!.system_prompt).toBe("default-merc-prompt");
+  });
+
   it("throws on name mismatch between shape and counts", () => {
     const shape = CrewShapeSchema.parse(DEFAULT_CREW_SHAPE);
     const counts = CrewAgentsSchema.parse({

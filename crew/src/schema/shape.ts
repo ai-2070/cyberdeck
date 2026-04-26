@@ -65,6 +65,10 @@ const RoleExecutionSchema = z.object({
 const CrewRoleSchema = z.object({
   role: z.string().min(1),
   description: z.string().optional(),
+  // Default system prompt for this role. Workers receive it via RoleSnapshot
+  // and use it as the model's system message. The agents config can override
+  // per role (see CrewAgentCountSchema.system_prompt).
+  system_prompt: z.string().optional(),
   capabilities: RoleCapabilitiesSchema.default({ thinking_allowed: true }),
   permissions: RolePermissionsSchema,
   delegation: RoleDelegationSchema.optional(),

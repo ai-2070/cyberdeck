@@ -5,6 +5,7 @@ import type {
   AgentStepRequest,
   GatedAction,
   RoleSnapshot,
+  Task,
 } from "../events/types.js";
 import type { HookRegistry } from "../runtime/hooks.js";
 import type { MemexAdapter } from "../memex/adapter.js";
@@ -63,6 +64,7 @@ export interface CrewSnapshot {
   status: CrewStatus;
   phaseIndex: number;
   currentInput: unknown;
+  task?: Task;
   agentAttempts: Array<[AgentId, number]>;
   currentPhase: SerializedPhaseState | null;
   nested: SerializedNestedHandle[];
@@ -81,7 +83,7 @@ export interface RequestActionResult {
 }
 
 export interface CrewSession {
-  start(rootInput: unknown): CrewEvent[];
+  start(rootInput: unknown, task?: Task): CrewEvent[];
   deliver(event: CrewEvent): CrewEvent[];
   tick(now: number): CrewEvent[];
   cancel(reason: "cancelled" | "timeout"): CrewEvent[];

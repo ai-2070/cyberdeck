@@ -39,9 +39,20 @@ export function buildCrewGraph(
     throw new Error(`CrewShape failed lint: ${summary}`);
   }
 
+  // Per-role overrides from the agents config — currently `system_prompt`.
+  // Applied to the role before it's stored in the graph so snapshotRole sees
+  // the effective value with no further plumbing.
+  const systemPromptOverrides = new Map<RoleId, string>();
+  for (const a of agentsCfg.agents) {
+    if (a.system_prompt !== undefined) {
+      systemPromptOverrides.set(a.role, a.system_prompt);
+    }
+  }
+
   const roles = new Map<RoleId, CrewRole>();
   for (const r of shape.roles) {
-    roles.set(r.role, r);
+    const override = systemPromptOverrides.get(r.role);
+    roles.set(r.role, override !== undefined ? { ...r, system_prompt: override } : r);
   }
 
   const requested = new Map<RoleId, number>();

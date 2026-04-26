@@ -217,6 +217,38 @@ describe("CheckpointStore", () => {
   });
 });
 
+describe("Task in snapshot", () => {
+  it("snapshot captures the task; resumed session retains it as session-level metadata", () => {
+    const { graph } = tinySetup();
+    const session = createCrewSession({
+      crewId: "task-resume",
+      graph,
+      clock: frozenClock(0),
+    });
+    const task = { description: "Find the answer to life" };
+    session.start("ROOT", task);
+
+    const snap = session.snapshot();
+    expect(snap.task).toEqual(task);
+
+    // Resume — re-emitted agent.step.requested events do NOT carry task
+    // (it's session-level metadata, not a per-step instruction).
+    const { session: resumed, events } = resumeCrewSession(snap, [], {
+      crewId: "task-resume",
+      graph,
+      clock: frozenClock(0),
+      resumePolicy: "re-emit-request",
+    });
+    const reEmitted = events.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
+    expect((reEmitted as { task?: unknown }).task).toBeUndefined();
+
+    // The resumed session's snapshot still has it.
+    expect(resumed.snapshot().task).toEqual(task);
+  });
+});
+
 describe("Snapshot + resume round-trip", () => {
   it("snapshot at completion + resume + zero events == same final state", () => {
     const { graph } = tinySetup();
