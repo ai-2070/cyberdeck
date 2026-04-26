@@ -1,0 +1,27 @@
+net/crates/net/src/ffi/mesh.rs
+  0038305acb702339 3129-3146
+net/crates/net/bindings/go/compute-ffi/Cargo.toml
+  0038305acb702339 33-45
+net/crates/net/src/adapter/net/behavior/capability.rs
+  0038305acb702339 3152-3212
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "de7c0b563e55bd6c5e402ee08f9f1858c863e66d",
+  "prompts": {
+    "0038305acb702339": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "58d04d40-6590-4d09-8de7-333bb1bd2109",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 6609,
+      "total_deletions": 6526,
+      "accepted_lines": 773,
+      "overriden_lines": 0
+    }
+  }
+}
