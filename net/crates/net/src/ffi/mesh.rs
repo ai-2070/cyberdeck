@@ -3126,4 +3126,22 @@ mod nat_traversal_stub_tests {
     fn unsupported_code_is_stable() {
         assert_eq!(NET_ERR_TRAVERSAL_UNSUPPORTED, -137);
     }
+
+    /// Repro for the failing Go `TestHardwareAndGpuFilter_Matches`:
+    /// parse the exact JSON the Go binding marshals, convert via
+    /// the FFI helpers, then verify the GpuVendor lands as Nvidia.
+    #[test]
+    fn capability_set_from_go_marshal_preserves_gpu_vendor() {
+        let json = r#"{"hardware":{"cpu_cores":16,"memory_mb":65536,"gpu":{"vendor":"nvidia","model":"h100","vram_mb":81920}},"tags":["gpu"]}"#;
+        let parsed: CapabilitySetJson = serde_json::from_str(json).expect("JSON should parse");
+        let caps = capability_set_from_json(parsed);
+        assert_eq!(
+            caps.hardware.gpu_vendor(),
+            Some(super::GpuVendor::Nvidia),
+            "vendor lost in conversion"
+        );
+        assert_eq!(caps.hardware.memory_mb, 65536);
+        assert_eq!(caps.hardware.total_vram_mb(), 81920);
+        assert!(caps.has_tag("gpu"));
+    }
 }

@@ -3149,4 +3149,61 @@ mod tests {
             CapabilityScope::SubnetLocal
         );
     }
+
+    /// Repro for the failing Go `TestHardwareAndGpuFilter_Matches`:
+    /// announce a node with NVIDIA GPU + memory, then query for
+    /// `RequireGPU + GPUVendor=Nvidia + MinVRAMMB + MinMemoryMB`.
+    /// Self-match must succeed.
+    #[test]
+    fn hardware_and_gpu_filter_self_matches() {
+        let gpu = GpuInfo::new(GpuVendor::Nvidia, "h100", 81920);
+        let hw = HardwareCapabilities::new()
+            .with_cpu(16, 16)
+            .with_memory(65536)
+            .with_gpu(gpu);
+        let caps = CapabilitySet::new().with_hardware(hw).add_tag("gpu");
+
+        let index = CapabilityIndex::new();
+        let ann = CapabilityAnnouncement::new(42u64, test_entity(), 1, caps);
+        index.index(ann);
+
+        let filter = CapabilityFilter::new()
+            .require_gpu()
+            .with_gpu_vendor(GpuVendor::Nvidia)
+            .with_min_vram(40_000)
+            .with_min_memory(32_768);
+        let hits = index.query(&filter);
+        assert!(hits.contains(&42u64), "self-match expected, got {:?}", hits);
+    }
+
+    /// Repro that exercises announcement signing + clone, mirroring
+    /// what `MeshNode::announce_capabilities` does before calling
+    /// `CapabilityIndex::index`. Catches any mutation of the GPU
+    /// vendor field across that path.
+    #[test]
+    fn hardware_and_gpu_filter_self_matches_after_sign_and_clone() {
+        use super::super::super::identity::EntityKeypair;
+        let keypair = EntityKeypair::generate();
+
+        let gpu = GpuInfo::new(GpuVendor::Nvidia, "h100", 81920);
+        let hw = HardwareCapabilities::new()
+            .with_cpu(16, 16)
+            .with_memory(65536)
+            .with_gpu(gpu);
+        let caps = CapabilitySet::new().with_hardware(hw).add_tag("gpu");
+
+        let mut ann = CapabilityAnnouncement::new(42u64, keypair.entity_id().clone(), 1, caps);
+        ann.sign(&keypair);
+
+        let index = CapabilityIndex::new();
+        index.index(ann.clone());
+
+        let filter = CapabilityFilter::new()
+            .require_gpu()
+            .with_gpu_vendor(GpuVendor::Nvidia)
+            .with_min_vram(40_000)
+            .with_min_memory(32_768);
+        let hits = index.query(&filter);
+        assert!(hits.contains(&42u64), "self-match expected, got {:?}", hits);
+    }
 }
