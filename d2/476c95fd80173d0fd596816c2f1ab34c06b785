@@ -1,0 +1,59 @@
+crew/tests/machine.test.ts
+  e48dc961ad3c1a17 645-652
+crew/src/memex/ai2070.ts
+  e48dc961ad3c1a17 19,47-50,62,64-68,74,79-80,83-84,137-140,149-150,168
+crew/tests/memex.test.ts
+  e48dc961ad3c1a17 104-144
+crew/src/session/types.ts
+  e48dc961ad3c1a17 3-8,17-21,25-26,32-33
+crew/src/graph/build.ts
+  e48dc961ad3c1a17 20,27-32,71,161-183
+crew/src/voting/resolve.ts
+  e48dc961ad3c1a17 53-54,90-98,104
+crew/src/session/resume.ts
+  e48dc961ad3c1a17 72-75,83-84
+crew/src/memex/adapter.ts
+  e48dc961ad3c1a17 2,4-10,12,20-24,28-30,32
+crew/src/events/canonical.ts
+  e48dc961ad3c1a17 40-46
+crew/src/events/types.ts
+  e48dc961ad3c1a17 4-29
+crew/tests/voting.test.ts
+  e48dc961ad3c1a17 190-228
+crew/tests/canonical.test.ts
+  e48dc961ad3c1a17 55-63
+crew/src/runtime/hooks.ts
+  e48dc961ad3c1a17 49-56
+crew/src/session/machine.ts
+  e48dc961ad3c1a17 16,45-50,54,118-125,145-153,191-199,278,284,322,345,359-363,534-540,548,562,724,836-841
+crew/src/schema/shape.ts
+  e48dc961ad3c1a17 27-40
+crew/PLAN.md
+  e48dc961ad3c1a17 186,239
+crew/tests/build.test.ts
+  e48dc961ad3c1a17 251-349
+crew/tests/replay.test.ts
+  e48dc961ad3c1a17 166-330
+crew/tests/schema.test.ts
+  e48dc961ad3c1a17 78-138
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "d2476c95fd80173d0fd596816c2f1ab34c06b785",
+  "prompts": {
+    "e48dc961ad3c1a17": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca50c99d-a28a-4b8c-8cee-20b6bca23864",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2735,
+      "total_deletions": 104,
+      "accepted_lines": 644,
+      "overriden_lines": 0
+    }
+  }
+}
