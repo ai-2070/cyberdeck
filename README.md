@@ -588,18 +588,18 @@ Pool contention (thread-local acquire/release):
 
 | SDK | Method | Throughput | Latency |
 |-----|--------|------------|---------|
-| Go | IngestRaw (9B) | **4.15M/sec** | 241 ns |
-| Go | Batch (1000) | **4.83M/sec** | 207 ns/event |
-| Python | ingest_raw (9B) | **6.69M/sec** | 0.15 us |
-| Python | Batch (1000) | **6.86M/sec** | 0.15 us |
-| Node.js | pushBatch | **4.86M/sec** | 0.21 us |
-| Node.js | push (single) | **3.88M/sec** | 0.26 us |
-| Bun | pushBatch | **5.20M/sec** | 0.19 us |
-| Bun | push (single) | **4.07M/sec** | 0.25 us |
+| Go | IngestRaw (9B) | **6.31M/sec** | 158 ns |
+| Go | Batch (1000) | **5.71M/sec** | 175 ns/event |
+| Python | ingest_raw (9B) | **5.69M/sec** | 0.18 us |
+| Python | Batch (1000) | **6.97M/sec** | 0.14 us |
+| Node.js | pushBatch | **5.08M/sec** | 0.20 us |
+| Node.js | push (single) | **3.96M/sec** | 0.25 us |
+| Bun | pushBatch | **5.37M/sec** | 0.19 us |
+| Bun | push (single) | **3.93M/sec** | 0.25 us |
 
-All benchmarks re-captured 2026-04-24 on M1 Max with release-mode bindings.
+All benchmarks re-captured 2026-04-27 on M1 Max with release-mode bindings.
 
-All SDKs exceed **3.9M events/sec** even on single-event ingestion, and **4.8M+ events/sec** on batch. Go achieves zero allocations on raw ingestion. Node.js sync methods are ~38x faster than async (`push` 3.88M vs async `ingestRaw` 101K). Bun batch (5.20M) is ~7% faster than Node.js batch (4.86M) on the same `pushBatch` call. Python (via PyO3) is the fastest binding at 6.9M/sec — the GIL releases for the duration of the FFI call so per-event overhead is the bare PyO3 marshalling.
+All SDKs exceed **3.9M events/sec** even on single-event ingestion, and **5M+ events/sec** on batch. Go now leads single-event ingestion at **6.31M/sec** (zero allocations on raw ingestion path). Python (via PyO3) is the fastest binding on batch at **6.97M/sec** — the GIL releases for the duration of the FFI call so per-event overhead is the bare PyO3 marshalling. Node.js sync methods are ~41x faster than async (`push` 3.96M vs async `ingestRaw` 96K). Bun batch (5.37M) is ~6% faster than Node.js batch (5.08M) on the same `pushBatch` call.
 
 ### RedEX (storage primitive)
 
