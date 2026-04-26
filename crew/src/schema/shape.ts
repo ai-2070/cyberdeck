@@ -42,6 +42,8 @@ const RoleMemexSchema = z.object({
   view: MemexViewSchema.optional(),
   isolation: MemexIsolationSchema.optional(),
   enabled: z.boolean().optional(),
+  // Pass-through SmartRetrievalOptions (validated structurally by memex itself).
+  retrieval: z.unknown().optional(),
 });
 
 const RoleExecutionSchema = z.object({

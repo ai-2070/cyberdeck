@@ -1,7 +1,9 @@
 // @ai2070/crew — public surface
 // Phase 1: schemas + graph builder + linter
 // Phase 2: event vocabulary + canonical JSON + correlation ids
-// Phase 3: state machine session (start/deliver/tick/cancel) + voting
+// Phase 3: state machine session (start/deliver/tick/cancel) + voting + hooks + permissions + fixer + nested
+// Phase 4: MemEX adapter (memex_context out, memex_commands in)
+// Phase 5: snapshot / resume / checkpoint store
 
 export { CrewShapeSchema } from "./schema/shape.js";
 export type {
@@ -13,7 +15,6 @@ export type {
   CrewRoleExecution,
   CrewRoleMemex,
   CrewInvitePermission,
-  MemexView,
   MemexIsolation,
 } from "./schema/shape.js";
 
@@ -54,13 +55,30 @@ export { systemClock, frozenClock } from "./runtime/clock.js";
 export type { Clock, MutableClock } from "./runtime/clock.js";
 
 export { createCrewSession } from "./session/machine.js";
+export { resumeCrewSession } from "./session/resume.js";
+export type { ResumeResult } from "./session/resume.js";
 export type {
   CrewSession,
   CrewSnapshot,
   CrewStatus,
   ResumePolicy,
   CreateCrewSessionOpts,
+  AgentStepDetail,
+  SerializedPhaseState,
+  SerializedPendingEntry,
+  SerializedNestedHandle,
 } from "./session/types.js";
+
+export { createInMemoryCheckpointStore } from "./checkpoint/store.js";
+export type { CheckpointStore } from "./checkpoint/types.js";
+
+// MemEX adapter (peer dep — `@ai2070/memex` resolved at runtime).
+export type {
+  AgentMemexHandle,
+  MemexAdapter,
+  MemexStampContext,
+  MemexView,
+} from "./memex/adapter.js";
 
 export { resolveVotes, NotImplementedError } from "./voting/resolve.js";
 export type { VoteEntry } from "./voting/resolve.js";

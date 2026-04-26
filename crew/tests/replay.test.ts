@@ -3,11 +3,13 @@ import { CrewShapeSchema } from "../src/schema/shape.js";
 import { CrewAgentsSchema } from "../src/schema/agents.js";
 import { buildCrewGraph } from "../src/graph/build.js";
 import { createCrewSession } from "../src/session/machine.js";
+import { resumeCrewSession } from "../src/session/resume.js";
 import { frozenClock } from "../src/runtime/clock.js";
 import { canonicalize } from "../src/events/canonical.js";
 import type { CrewEvent } from "../src/events/types.js";
 import type { CrewSession } from "../src/session/types.js";
 import { DEFAULT_CREW_SHAPE, DEFAULT_CREW_AGENTS } from "./fixtures/default-crew.js";
+import { TINY_CREW_SHAPE, TINY_CREW_AGENTS } from "./fixtures/tiny-crew.js";
 
 function freshSession(): CrewSession {
   const shape = CrewShapeSchema.parse(DEFAULT_CREW_SHAPE);
@@ -104,7 +106,82 @@ describe("Replay determinism", () => {
     );
   });
 
-  // Resume policy tests come with Phase 5 (checkpointing).
-  it.todo("ResumePolicy 'abort' refuses to resume if a step is requested but unresolved");
-  it.todo("ResumePolicy 're-emit-request' replays the missing request");
+});
+
+describe("ResumePolicy", () => {
+  function tinyGraph() {
+    const shape = CrewShapeSchema.parse(TINY_CREW_SHAPE);
+    const counts = CrewAgentsSchema.parse(TINY_CREW_AGENTS);
+    return buildCrewGraph(shape, counts);
+  }
+
+  it("'abort' (default) throws when there are unresolved pending requests", () => {
+    const graph = tinyGraph();
+    const session = createCrewSession({
+      crewId: "abort-test",
+      graph,
+      clock: frozenClock(0),
+    });
+    session.start("ROOT");
+    const snap = session.snapshot();
+
+    expect(() =>
+      resumeCrewSession(snap, [], {
+        crewId: "abort-test",
+        graph,
+        clock: frozenClock(0),
+        resumePolicy: "abort",
+      }),
+    ).toThrow(/unresolved/i);
+  });
+
+  it("'re-emit-request' produces a fresh agent.step.requested for each unresolved pending", () => {
+    const graph = tinyGraph();
+    const session = createCrewSession({
+      crewId: "reemit-test",
+      graph,
+      clock: frozenClock(0),
+    });
+    const initial = session.start("ROOT");
+    const alphaReq = initial.find((e) => e.type === "agent.step.requested") as
+      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const snap = session.snapshot();
+
+    const { events } = resumeCrewSession(snap, [], {
+      crewId: "reemit-test",
+      graph,
+      clock: frozenClock(100),
+      resumePolicy: "re-emit-request",
+    });
+
+    const reEmitted = events.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
+    expect(reEmitted).toBeDefined();
+    expect(reEmitted.correlationId).toBe(alphaReq.correlationId);
+    expect(reEmitted.input).toBe("ROOT");
+    expect(reEmitted.role.name).toBe("alpha");
+  });
+
+  it("'treat-as-failed' synthesizes failed terminals so the phase can advance", () => {
+    const graph = tinyGraph();
+    const session = createCrewSession({
+      crewId: "fail-test",
+      graph,
+      clock: frozenClock(0),
+    });
+    session.start("ROOT");
+    const snap = session.snapshot();
+
+    const { session: resumed, events } = resumeCrewSession(snap, [], {
+      crewId: "fail-test",
+      graph,
+      clock: frozenClock(0),
+      resumePolicy: "treat-as-failed",
+    });
+    expect(events.some((e) => e.type === "vote.resolved")).toBe(true);
+    expect(events.some((e) => e.type === "role.entered")).toBe(true);
+    expect(resumed.status()).toBe("awaiting_responses");
+    expect(resumed.pendingRequests().every((r) => r.roleId === "beta")).toBe(true);
+  });
 });

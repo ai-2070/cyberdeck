@@ -12,8 +12,11 @@ import type {
   HookRegistry,
   HookStage,
 } from "../runtime/hooks.js";
+import type { MemexAdapter } from "../memex/adapter.js";
+import type { SmartRetrievalOptions } from "@ai2070/memex";
 import type {
   ActionRequest,
+  AgentStepDetail,
   CreateCrewSessionOpts,
   CrewSession,
   CrewSnapshot,
@@ -28,9 +31,21 @@ export function createCrewSession(opts: CreateCrewSessionOpts): CrewSession {
   return new CrewSessionImpl(opts);
 }
 
+// Internal escape hatch used by resumeCrewSession to reconstruct an impl with
+// pre-restored state. Not exposed via createCrewSession.
+export function restoreCrewSession(
+  snapshot: CrewSnapshot,
+  opts: CreateCrewSessionOpts,
+): CrewSession {
+  const impl = new CrewSessionImpl(opts);
+  impl.applySnapshot(snapshot);
+  return impl;
+}
+
 interface PhaseState {
   roleId: RoleId;
   pending: Map<string, AgentStepRequest>;     // correlationId -> request
+  pendingInputs: Map<string, unknown>;         // correlationId -> the input passed at emit time
   outputs: Map<AgentId, VoteEntry>;            // agentId -> response (substitution-aware)
   terminalSeen: Set<string>;                   // correlationIds we've processed
   fixerSteps: Map<string, AgentId>;            // fixer cid -> original failed agent
@@ -52,6 +67,7 @@ class CrewSessionImpl implements CrewSession {
   private readonly graph: CrewGraph;
   private readonly clock: Clock;
   private readonly hooks?: HookRegistry;
+  private readonly memex?: MemexAdapter;
   private readonly defaultTimeoutMs?: number;
   private readonly phaseOrder: RoleId[];
 
@@ -68,6 +84,7 @@ class CrewSessionImpl implements CrewSession {
     this.graph = opts.graph;
     this.clock = opts.clock;
     this.hooks = opts.hooks;
+    this.memex = opts.memex;
     this.defaultTimeoutMs = opts.defaultTimeoutMs;
     this.phaseOrder = computePhaseOrder(opts.graph);
   }
@@ -85,13 +102,107 @@ class CrewSessionImpl implements CrewSession {
     return out;
   }
 
+  pendingDetails(): readonly AgentStepDetail[] {
+    if (!this.currentPhase) return [];
+    const out: AgentStepDetail[] = [];
+    for (const [cid, req] of this.currentPhase.pending.entries()) {
+      out.push({ request: req, input: this.currentPhase.pendingInputs.get(cid) });
+    }
+    for (const handle of this.innerByOuter.values()) {
+      out.push(...handle.innerSession.pendingDetails());
+    }
+    return out;
+  }
+
   snapshot(): CrewSnapshot {
+    const cp = this.currentPhase;
     return {
       schema_version: "1.0",
       crewId: this.crewId,
       status: this.status_,
       phaseIndex: this.phaseIndex,
+      currentInput: this.currentInput,
+      agentAttempts: [...this.agentAttempts.entries()],
+      currentPhase: cp
+        ? {
+            roleId: cp.roleId,
+            pending: [...cp.pending.entries()].map(([cid, req]) => ({
+              request: req,
+              input: cp.pendingInputs.get(cid),
+            })),
+            outputs: [...cp.outputs.entries()],
+            terminalSeen: [...cp.terminalSeen],
+            fixerSteps: [...cp.fixerSteps.entries()],
+            nestedPending: [...cp.nestedPending],
+          }
+        : null,
+      nested: [...this.innerByOuter.values()].map((h) => ({
+        outerAgentId: h.outerAgentId,
+        outerRoleId: h.outerRoleId,
+        innerCids: [...h.innerCids],
+        innerSnapshot: h.innerSession.snapshot(),
+      })),
+      ts: this.clock.now(),
     };
+  }
+
+  // Internal: rehydrate machine state from a snapshot. Called by
+  // restoreCrewSession before any deliver/tick/cancel happens.
+  applySnapshot(snap: CrewSnapshot): void {
+    if (snap.crewId !== this.crewId) {
+      throw new Error(
+        `Snapshot crewId mismatch: snapshot="${snap.crewId}" session="${this.crewId}"`,
+      );
+    }
+
+    this.status_ = snap.status;
+    this.phaseIndex = snap.phaseIndex;
+    this.currentInput = snap.currentInput;
+    this.agentAttempts = new Map(snap.agentAttempts);
+
+    if (snap.currentPhase) {
+      const cp = snap.currentPhase;
+      this.currentPhase = {
+        roleId: cp.roleId,
+        pending: new Map(
+          cp.pending.map((p) => [p.request.correlationId, p.request]),
+        ),
+        pendingInputs: new Map(
+          cp.pending.map((p) => [p.request.correlationId, p.input]),
+        ),
+        outputs: new Map(cp.outputs),
+        terminalSeen: new Set(cp.terminalSeen),
+        fixerSteps: new Map(cp.fixerSteps),
+        nestedPending: new Set(cp.nestedPending),
+      };
+    }
+
+    for (const nh of snap.nested) {
+      const outerAgent = this.graph.agents.find((a) => a.id === nh.outerAgentId);
+      if (!outerAgent || !outerAgent.nestedCrew) {
+        throw new Error(
+          `Cannot restore nested handle: outer agent "${nh.outerAgentId}" not found or has no nested crew`,
+        );
+      }
+      const innerSession = restoreCrewSession(nh.innerSnapshot, {
+        crewId: nh.innerSnapshot.crewId,
+        graph: outerAgent.nestedCrew,
+        clock: this.clock,
+        hooks: this.hooks,
+        memex: this.memex,
+        defaultTimeoutMs: this.defaultTimeoutMs,
+      });
+      const handle: InnerHandle = {
+        outerAgentId: nh.outerAgentId,
+        outerRoleId: nh.outerRoleId,
+        innerSession,
+        innerCids: new Set(nh.innerCids),
+      };
+      this.innerByOuter.set(nh.outerAgentId, handle);
+      for (const cid of nh.innerCids) {
+        this.innerByCid.set(cid, handle);
+      }
+    }
   }
 
   start(rootInput: unknown): CrewEvent[] {
@@ -135,15 +246,18 @@ class CrewSessionImpl implements CrewSession {
     phase.terminalSeen.add(cid);
     const req = phase.pending.get(cid)!;
     phase.pending.delete(cid);
+    phase.pendingInputs.delete(cid);
 
     let output: unknown;
     let fault = false;
     let stalled = false;
     let timedOut = false;
+    let memexCommands: ReadonlyArray<import("@ai2070/memex").MemoryCommand> = [];
     if (event.type === "agent.step.completed") {
       output = event.output;
       fault = event.fault === true;
       stalled = event.stalled === true;
+      memexCommands = event.memex_commands ?? [];
     } else if (event.type === "agent.step.failed") {
       output = undefined;
       fault = true;
@@ -153,6 +267,27 @@ class CrewSessionImpl implements CrewSession {
     }
 
     const events: CrewEvent[] = [];
+
+    // Apply any memex commands the worker returned. Emit memex.command.emitted
+    // first so the event log captures the intent before the adapter mutates state.
+    if (memexCommands.length > 0) {
+      for (const cmd of memexCommands) {
+        events.push({
+          type: "memex.command.emitted",
+          agentId: req.agentId,
+          command: cmd,
+          ts: this.clock.now(),
+        });
+        if (this.memex) {
+          this.memex.apply(cmd, {
+            agentId: req.agentId,
+            crewId: this.crewId,
+            roleId: req.roleId,
+          });
+        }
+      }
+    }
+
     this.processTerminal(phase, req, cid, { output, fault, stalled, timedOut }, events);
 
     if (phase.pending.size === 0) {
@@ -178,6 +313,7 @@ class CrewSessionImpl implements CrewSession {
       if (phase.terminalSeen.has(cid)) continue;
       phase.terminalSeen.add(cid);
       phase.pending.delete(cid);
+      phase.pendingInputs.delete(cid);
       events.push({
         type: "agent.step.timed_out",
         correlationId: cid,
@@ -357,9 +493,13 @@ class CrewSessionImpl implements CrewSession {
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     };
     phase.pending.set(cid, req);
+    phase.pendingInputs.set(cid, input);
     if (fixerForAgent !== undefined) {
       phase.fixerSteps.set(cid, fixerForAgent);
     }
+
+    const memex_context = this.computeMemexContext(role, agent);
+
     events.push({
       type: "agent.step.requested",
       correlationId: cid,
@@ -367,9 +507,22 @@ class CrewSessionImpl implements CrewSession {
       roleId: role.role,
       input,
       role: snapshotRole(role),
+      ...(memex_context !== undefined ? { memex_context } : {}),
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
       ts: this.clock.now(),
     });
+  }
+
+  private computeMemexContext(role: CrewRole, agent: CrewAgent): unknown {
+    if (!this.memex) return undefined;
+    const cfg = role.execution?.memex;
+    if (!cfg || cfg.enabled === false) return undefined;
+    const view = cfg.view ?? "self";
+    const handle = this.memex.handleFor(agent, role, view);
+    if (cfg.retrieval !== undefined) {
+      return handle.retrieve(cfg.retrieval as SmartRetrievalOptions);
+    }
+    return undefined;
   }
 
   private spawnNested(
@@ -397,6 +550,7 @@ class CrewSessionImpl implements CrewSession {
       graph: agent.nestedCrew!,
       clock: this.clock,
       hooks: this.hooks,
+      memex: this.memex,                  // soft isolation: share parent's adapter
       defaultTimeoutMs: this.defaultTimeoutMs,
     });
 
@@ -509,6 +663,7 @@ class CrewSessionImpl implements CrewSession {
     const phase: PhaseState = {
       roleId,
       pending: new Map(),
+      pendingInputs: new Map(),
       outputs: new Map(),
       terminalSeen: new Set(),
       fixerSteps: new Map(),

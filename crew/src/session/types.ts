@@ -1,18 +1,53 @@
-import type { AgentId, CrewGraph } from "../graph/types.js";
+import type { AgentId, CrewGraph, RoleId } from "../graph/types.js";
 import type { Clock } from "../runtime/clock.js";
 import type { CrewEvent, AgentStepRequest, GatedAction } from "../events/types.js";
 import type { HookRegistry } from "../runtime/hooks.js";
+import type { MemexAdapter } from "../memex/adapter.js";
+import type { VoteEntry } from "../voting/resolve.js";
 
 export type CrewStatus = "idle" | "awaiting_responses" | "completed" | "aborted";
 
 export type ResumePolicy = "re-emit-request" | "treat-as-failed" | "abort";
+
+// Public projection of an in-flight step that includes the original input —
+// used by resumeCrewSession when ResumePolicy is "re-emit-request" and by
+// callers who want to inspect what's actually pending.
+export interface AgentStepDetail {
+  request: AgentStepRequest;
+  input: unknown;
+}
+
+export interface SerializedPendingEntry {
+  request: AgentStepRequest;
+  input: unknown;
+}
+
+export interface SerializedPhaseState {
+  roleId: RoleId;
+  pending: SerializedPendingEntry[];
+  outputs: Array<[AgentId, VoteEntry]>;
+  terminalSeen: string[];
+  fixerSteps: Array<[string, AgentId]>;
+  nestedPending: AgentId[];
+}
+
+export interface SerializedNestedHandle {
+  outerAgentId: AgentId;
+  outerRoleId: RoleId;
+  innerCids: string[];
+  innerSnapshot: CrewSnapshot;
+}
 
 export interface CrewSnapshot {
   schema_version: "1.0";
   crewId: string;
   status: CrewStatus;
   phaseIndex: number;
-  // Phase 5 will expand this to capture full machine state for resume.
+  currentInput: unknown;
+  agentAttempts: Array<[AgentId, number]>;
+  currentPhase: SerializedPhaseState | null;
+  nested: SerializedNestedHandle[];
+  ts: number;
 }
 
 export interface ActionRequest {
@@ -33,10 +68,8 @@ export interface CrewSession {
   cancel(reason: "cancelled" | "timeout"): CrewEvent[];
   status(): CrewStatus;
   pendingRequests(): readonly AgentStepRequest[];
+  pendingDetails(): readonly AgentStepDetail[];
   snapshot(): CrewSnapshot;
-  // Workers/external code can ask the session to validate an action.
-  // Returns `allowed` plus any events the session emitted (permission.denied,
-  // optionally fixer.invoked + agent.step.requested for fixer activation).
   requestAction(req: ActionRequest): RequestActionResult;
 }
 
@@ -45,6 +78,7 @@ export interface CreateCrewSessionOpts {
   graph: CrewGraph;
   clock: Clock;
   hooks?: HookRegistry;
+  memex?: MemexAdapter;
   defaultTimeoutMs?: number;
   resumePolicy?: ResumePolicy;
 }

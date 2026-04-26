@@ -1,11 +1,8 @@
+import type { MemoryCommand } from "@ai2070/memex";
 import type { VotingMode } from "../schema/consensus.js";
 import type { AgentId, RoleId } from "../graph/types.js";
 
-// Phase 4 will replace this with `import type { MemoryCommand } from "@ai2070/memex"`
-// once the adapter is built and the workspace link is in place. The crew library
-// never inspects the command shape — it's a passthrough between worker and adapter —
-// so `unknown` is semantically accurate today.
-type MemoryCommand = unknown;
+export type { MemoryCommand };
 
 // Self-contained role snapshot embedded in agent.step.requested.
 // Workers receive this and don't need to load the crew shape out-of-band.
@@ -84,6 +81,7 @@ export type CrewEvent =
       type: "agent.step.completed";
       correlationId: string;
       output: unknown;
+      memex_commands?: MemoryCommand[];   // Phase 4: worker-emitted memex writes
       fault?: boolean;
       stalled?: boolean;
       ts: number;
