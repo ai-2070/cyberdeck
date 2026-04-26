@@ -64,3 +64,19 @@ export type {
 
 export { resolveVotes, NotImplementedError } from "./voting/resolve.js";
 export type { VoteEntry } from "./voting/resolve.js";
+
+export { createHookRegistry } from "./runtime/hooks.js";
+export type {
+  HookFn,
+  HookRegistry,
+  HookContext,
+  HookStage,
+  CrewControl,
+} from "./runtime/hooks.js";
+
+export { checkPermission } from "./session/permissions.js";
+
+export type {
+  ActionRequest,
+  RequestActionResult,
+} from "./session/types.js";

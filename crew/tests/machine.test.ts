@@ -4,9 +4,11 @@ import { CrewAgentsSchema } from "../src/schema/agents.js";
 import { buildCrewGraph } from "../src/graph/build.js";
 import { createCrewSession } from "../src/session/machine.js";
 import { frozenClock } from "../src/runtime/clock.js";
+import { createHookRegistry } from "../src/runtime/hooks.js";
 import type { CrewEvent } from "../src/events/types.js";
 import type { CrewSession } from "../src/session/types.js";
 import { DEFAULT_CREW_SHAPE, DEFAULT_CREW_AGENTS } from "./fixtures/default-crew.js";
+import { TINY_CREW_SHAPE, TINY_CREW_AGENTS } from "./fixtures/tiny-crew.js";
 
 function setup(opts?: { defaultTimeoutMs?: number }) {
   const shape = CrewShapeSchema.parse(DEFAULT_CREW_SHAPE);
@@ -195,9 +197,13 @@ describe("CrewSession.deliver", () => {
     expect(mercVote.resolved).toBe("merc-1-out");
   });
 
-  it("first_valid voting skips faulted outputs", () => {
+  it("fault triggers fixer, fixer's response substitutes in voting", () => {
+    // DEFAULT_CREW has fixer.activation.on_fault: true, so a fault must spawn
+    // a fixer step. The fixer's response substitutes for the failed agent's
+    // output, and first_valid picks merc-1's slot (now fixer's output).
     const { session } = setup();
     const log: CrewEvent[] = session.start("ROOT");
+
     const callerReq = log.find((e) => e.type === "agent.step.requested") as
       Extract<CrewEvent, { type: "agent.step.requested" }>;
     log.push(
@@ -215,15 +221,24 @@ describe("CrewSession.deliver", () => {
         (e as Extract<CrewEvent, { type: "agent.step.requested" }>).roleId === "merc",
     ) as Extract<CrewEvent, { type: "agent.step.requested" }>[];
 
-    log.push(
-      ...session.deliver({
-        type: "agent.step.completed",
-        correlationId: mercReqs[0].correlationId,
-        output: "merc-1-out",
-        fault: true,
-        ts: 1000,
-      }),
-    );
+    // merc-1 faults — should emit fixer.invoked + agent.step.requested for fixer-1
+    const burst = session.deliver({
+      type: "agent.step.completed",
+      correlationId: mercReqs[0].correlationId,
+      output: "merc-1-attempted",
+      fault: true,
+      ts: 1000,
+    });
+    log.push(...burst);
+    expect(burst.some((e) => e.type === "fixer.invoked")).toBe(true);
+    const fixerReq = burst.find(
+      (e) =>
+        e.type === "agent.step.requested" &&
+        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).agentId === "fixer-1",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
+    expect(fixerReq).toBeDefined();
+
+    // mercs 2..4 succeed
     for (let i = 1; i < 4; i++) {
       log.push(
         ...session.deliver({
@@ -235,12 +250,22 @@ describe("CrewSession.deliver", () => {
       );
     }
 
+    // Fixer responds — phase should now complete and merc-1's slot is the fixer output
+    log.push(
+      ...session.deliver({
+        type: "agent.step.completed",
+        correlationId: fixerReq.correlationId,
+        output: "fixer-rescued",
+        ts: 1000,
+      }),
+    );
+
     const mercVote = log.find(
       (e) =>
         e.type === "vote.resolved" &&
         (e as Extract<CrewEvent, { type: "vote.resolved" }>).roleId === "merc",
     ) as Extract<CrewEvent, { type: "vote.resolved" }>;
-    expect(mercVote.resolved).toBe("merc-2-out");
+    expect(mercVote.resolved).toBe("fixer-rescued");
   });
 
   it("duplicate terminal deliver is a no-op (returns [])", () => {
@@ -397,5 +422,259 @@ describe("CrewSession.snapshot", () => {
     expect(session.snapshot().status).toBe("awaiting_responses");
     expect(session.snapshot().phaseIndex).toBe(0);
     expect(session.snapshot().crewId).toBe("crew-test-1");
+  });
+});
+
+describe("Fixer activation", () => {
+  it("fault triggers fixer when activation.on_fault is set", () => {
+    const { session } = setup();
+    const initial = session.start("ROOT");
+    const callerReq = initial.find((e) => e.type === "agent.step.requested") as
+      Extract<CrewEvent, { type: "agent.step.requested" }>;
+
+    // caller faults — DEFAULT_CREW fixer has on_fault: true
+    const burst = session.deliver({
+      type: "agent.step.completed",
+      correlationId: callerReq.correlationId,
+      output: "boom",
+      fault: true,
+      ts: 1000,
+    });
+
+    const fixerInvoked = burst.find((e) => e.type === "fixer.invoked") as
+      Extract<CrewEvent, { type: "fixer.invoked" }>;
+    expect(fixerInvoked).toBeDefined();
+    expect(fixerInvoked.reason).toBe("fault");
+
+    const fixerReq = burst.find(
+      (e) =>
+        e.type === "agent.step.requested" &&
+        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).agentId === "fixer-1",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
+    expect(fixerReq).toBeDefined();
+    // Fixer's input describes the failure
+    const fixerInput = fixerReq.input as { reason: string; failedAgentId: string };
+    expect(fixerInput.reason).toBe("fault");
+    expect(fixerInput.failedAgentId).toBe("caller-1");
+  });
+
+  it("no activation flag = no fixer; fault stays as a faulted output", () => {
+    const tinyShape = CrewShapeSchema.parse(TINY_CREW_SHAPE);
+    const tinyAgents = CrewAgentsSchema.parse(TINY_CREW_AGENTS);
+    const tinyGraph = buildCrewGraph(tinyShape, tinyAgents);
+    const tinySession = createCrewSession({
+      crewId: "tiny-1",
+      graph: tinyGraph,
+      clock: frozenClock(0),
+    });
+
+    const initial = tinySession.start("ROOT");
+    const alphaReq = initial.find((e) => e.type === "agent.step.requested") as
+      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const burst = tinySession.deliver({
+      type: "agent.step.completed",
+      correlationId: alphaReq.correlationId,
+      output: "alpha-fail",
+      fault: true,
+      ts: 0,
+    });
+
+    expect(burst.some((e) => e.type === "fixer.invoked")).toBe(false);
+    // Phase advances since alpha was the only agent in its phase — fault is
+    // recorded as the resolved output (first_valid skipped, returns undefined).
+    const alphaVote = burst.find(
+      (e) =>
+        e.type === "vote.resolved" &&
+        (e as Extract<CrewEvent, { type: "vote.resolved" }>).roleId === "alpha",
+    ) as Extract<CrewEvent, { type: "vote.resolved" }>;
+    expect(alphaVote.resolved).toBeUndefined();
+  });
+
+  it("stall triggers fixer when activation.on_stall is set", () => {
+    const { session } = setup();
+    const initial = session.start("ROOT");
+    const callerReq = initial.find((e) => e.type === "agent.step.requested") as
+      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const burst = session.deliver({
+      type: "agent.step.completed",
+      correlationId: callerReq.correlationId,
+      output: "stalled-output",
+      stalled: true,
+      ts: 1000,
+    });
+    const fixerInvoked = burst.find((e) => e.type === "fixer.invoked") as
+      Extract<CrewEvent, { type: "fixer.invoked" }>;
+    expect(fixerInvoked).toBeDefined();
+    expect(fixerInvoked.reason).toBe("stall");
+  });
+
+  it("timeout does NOT trigger fixer when activation.on_timeout is not set", () => {
+    // DEFAULT_CREW has only on_fault and on_stall.
+    const { session } = setup({ defaultTimeoutMs: 5000 });
+    session.start("ROOT");
+    const burst = session.tick(6000);
+    expect(burst.some((e) => e.type === "agent.step.timed_out")).toBe(true);
+    expect(burst.some((e) => e.type === "fixer.invoked")).toBe(false);
+  });
+
+  it("does not recursively invoke fixer when fixer itself faults", () => {
+    const { session } = setup();
+    const initial = session.start("ROOT");
+    const callerReq = initial.find((e) => e.type === "agent.step.requested") as
+      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const burst1 = session.deliver({
+      type: "agent.step.completed",
+      correlationId: callerReq.correlationId,
+      output: "boom",
+      fault: true,
+      ts: 1000,
+    });
+    const fixerReq = burst1.find(
+      (e) =>
+        e.type === "agent.step.requested" &&
+        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).agentId === "fixer-1",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
+
+    // Fixer also faults
+    const burst2 = session.deliver({
+      type: "agent.step.completed",
+      correlationId: fixerReq.correlationId,
+      output: "fixer-bombed",
+      fault: true,
+      ts: 1000,
+    });
+    // No additional fixer.invoked event
+    expect(burst2.some((e) => e.type === "fixer.invoked")).toBe(false);
+    // Phase completes (single-agent caller phase, fixer's faulted output substitutes)
+    expect(burst2.some((e) => e.type === "vote.resolved")).toBe(true);
+  });
+});
+
+describe("Hooks", () => {
+  it("before_role and after_role fire around a phase", () => {
+    const stages: string[] = [];
+    const hooks = createHookRegistry({
+      log: (ctx) => stages.push(`${ctx.stage}:${ctx.role.role}`),
+    });
+
+    const shape = CrewShapeSchema.parse({
+      ...TINY_CREW_SHAPE,
+      roles: TINY_CREW_SHAPE.roles.map((r) => ({
+        ...r,
+        hooks: { before_role: "log", after_role: "log" },
+      })),
+    });
+    const counts = CrewAgentsSchema.parse(TINY_CREW_AGENTS);
+    const graph = buildCrewGraph(shape, counts);
+    const sess = createCrewSession({
+      crewId: "hooked",
+      graph,
+      clock: frozenClock(0),
+      hooks,
+    });
+
+    const queue = sess.start("ROOT");
+    while (queue.length > 0) {
+      const e = queue.shift()!;
+      if (e.type === "agent.step.requested") {
+        queue.push(
+          ...sess.deliver({
+            type: "agent.step.completed",
+            correlationId: e.correlationId,
+            output: "ok",
+            ts: 0,
+          }),
+        );
+      }
+    }
+
+    expect(stages).toEqual([
+      "before_role:alpha",
+      "after_role:alpha",
+      "before_role:beta",
+      "after_role:beta",
+      "before_role:gamma",
+      "after_role:gamma",
+    ]);
+  });
+
+  it("before_agent and after_agent fire per agent", () => {
+    const events: string[] = [];
+    const hooks = createHookRegistry({
+      track: (ctx) => events.push(`${ctx.stage}:${ctx.agent?.id ?? "?"}`),
+    });
+
+    const shape = CrewShapeSchema.parse({
+      ...TINY_CREW_SHAPE,
+      roles: TINY_CREW_SHAPE.roles.map((r) =>
+        r.role === "beta"
+          ? { ...r, hooks: { before_agent: "track", after_agent: "track" } }
+          : r,
+      ),
+    });
+    const counts = CrewAgentsSchema.parse(TINY_CREW_AGENTS);
+    const graph = buildCrewGraph(shape, counts);
+    const sess = createCrewSession({
+      crewId: "hooked",
+      graph,
+      clock: frozenClock(0),
+      hooks,
+    });
+
+    const queue = sess.start("ROOT");
+    while (queue.length > 0) {
+      const e = queue.shift()!;
+      if (e.type === "agent.step.requested") {
+        queue.push(
+          ...sess.deliver({
+            type: "agent.step.completed",
+            correlationId: e.correlationId,
+            output: "ok",
+            ts: 0,
+          }),
+        );
+      }
+    }
+
+    expect(events).toContain("before_agent:beta-1");
+    expect(events).toContain("before_agent:beta-2");
+    expect(events).toContain("after_agent:beta-1");
+    expect(events).toContain("after_agent:beta-2");
+  });
+
+  it("control.checkpoint emits checkpoint.taken into the same burst", () => {
+    const hooks = createHookRegistry({
+      checkpoint: (ctx) => ctx.control.checkpoint("phase-end"),
+    });
+
+    const shape = CrewShapeSchema.parse({
+      ...TINY_CREW_SHAPE,
+      roles: TINY_CREW_SHAPE.roles.map((r) =>
+        r.role === "alpha" ? { ...r, hooks: { after_role: "checkpoint" } } : r,
+      ),
+    });
+    const counts = CrewAgentsSchema.parse(TINY_CREW_AGENTS);
+    const graph = buildCrewGraph(shape, counts);
+    const sess = createCrewSession({
+      crewId: "ckpt",
+      graph,
+      clock: frozenClock(0),
+      hooks,
+    });
+
+    const initial = sess.start("ROOT");
+    const alphaReq = initial.find((e) => e.type === "agent.step.requested") as
+      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const burst = sess.deliver({
+      type: "agent.step.completed",
+      correlationId: alphaReq.correlationId,
+      output: "ok",
+      ts: 0,
+    });
+
+    const ckpt = burst.find((e) => e.type === "checkpoint.taken") as
+      Extract<CrewEvent, { type: "checkpoint.taken" }>;
+    expect(ckpt).toBeDefined();
+    expect(ckpt.checkpointId).toBe("phase-end");
   });
 });
