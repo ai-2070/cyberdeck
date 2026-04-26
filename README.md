@@ -496,93 +496,93 @@ All numbers below measure **packet scheduling** — the time to process, route, 
 
 | Operation | M1 Max | i9-14900K |
 |-----------|--------|-----------|
-| Header serialize | 1.98 ns / **505M ops/sec** | 1.30 ns / **767M ops/sec** |
-| Header deserialize | 2.11 ns / **475M ops/sec** | 1.52 ns / **659M ops/sec** |
-| Routing header serialize | 0.63 ns / **1.59G ops/sec** | 0.47 ns / **2.15G ops/sec** |
-| Routing header forward | 0.57 ns / **1.74G ops/sec** | 0.51 ns / **1.98G ops/sec** |
-| Routing lookup (hit) | 37.77 ns / **26.5M ops/sec** | 38.56 ns / **25.9M ops/sec** |
-| Decision pipeline | 39.59 ns / **25.3M ops/sec** | 38.73 ns / **25.8M ops/sec** |
+| Header serialize | 1.98 ns / **505M ops/sec** | 1.31 ns / **762M ops/sec** |
+| Header deserialize | 2.11 ns / **475M ops/sec** | 1.21 ns / **829M ops/sec** |
+| Routing header serialize | 0.63 ns / **1.59G ops/sec** | 0.46 ns / **2.18G ops/sec** |
+| Routing header forward | 0.57 ns / **1.75G ops/sec** | 0.20 ns / **5.06G ops/sec** |
+| Routing lookup (hit) | 38.09 ns / **26.3M ops/sec** | 37.52 ns / **26.7M ops/sec** |
+| Decision pipeline | 38.89 ns / **25.7M ops/sec** | 38.62 ns / **25.9M ops/sec** |
 
 ### Multi-hop Forwarding
 
 | Hops | M1 Max | i9-14900K |
 |-----:|--------|-----------|
-| 1 | 59.97 ns / **16.7M ops/sec** | 53.32 ns / **18.8M ops/sec** |
-| 2 | 114.06 ns / **8.77M ops/sec** | 87.65 ns / **11.4M ops/sec** |
-| 3 | 159.79 ns / **6.26M ops/sec** | 121.82 ns / **8.21M ops/sec** |
-| 5 | 275.93 ns / **3.62M ops/sec** | 190.77 ns / **5.24M ops/sec** |
+| 1 | 59.07 ns / **16.9M ops/sec** | 53.37 ns / **18.7M ops/sec** |
+| 2 | 117.32 ns / **8.52M ops/sec** | 86.87 ns / **11.5M ops/sec** |
+| 3 | 163.16 ns / **6.13M ops/sec** | 120.66 ns / **8.29M ops/sec** |
+| 5 | 273.51 ns / **3.66M ops/sec** | 189.73 ns / **5.27M ops/sec** |
 
 | Threads | M1 Max | i9-14900K |
 |--------:|--------|-----------|
-| 4 | 5.82 M/s | 7.09 M/s |
-| 8 | 8.13 M/s | 10.7 M/s |
-| 16 | 7.73 M/s | 11.7 M/s |
+| 4 | 4.68 M/s | 7.09 M/s |
+| 8 | 8.14 M/s | 9.96 M/s |
+| 16 | 7.93 M/s | 12.8 M/s |
 
 ### Failure Detection & Recovery
 
 | Operation | M1 Max | i9-14900K |
 |-----------|--------|-----------|
-| Heartbeat (existing node) | 29.33 ns / **34.1M ops/sec** | 35.35 ns / **28.3M ops/sec** |
-| Status check | 14.10 ns / **70.9M ops/sec** | 13.53 ns / **73.9M ops/sec** |
-| Circuit breaker check | 13.48 ns / **74.2M ops/sec** | 10.30 ns / **97.1M ops/sec** |
-| Recovery (evaluate alternates) | 268.97 ns / **3.72M ops/sec** | 264.70 ns / **3.78M ops/sec** |
-| Full fail + recover cycle | 306.54 ns / **3.26M ops/sec** | 260.79 ns / **3.83M ops/sec** |
+| Heartbeat (existing node) | 29.03 ns / **34.5M ops/sec** | 35.27 ns / **28.4M ops/sec** |
+| Status check | 14.74 ns / **67.8M ops/sec** | 13.42 ns / **74.5M ops/sec** |
+| Circuit breaker check | 13.44 ns / **74.4M ops/sec** | 10.17 ns / **98.4M ops/sec** |
+| Recovery (evaluate alternates) | 251.67 ns / **3.97M ops/sec** | 254.20 ns / **3.93M ops/sec** |
+| Full fail + recover cycle | 287.97 ns / **3.47M ops/sec** | 255.40 ns / **3.92M ops/sec** |
 
 ### Swarm / Discovery
 
 | Operation | M1 Max | i9-14900K |
 |-----------|--------|-----------|
-| Pingwave serialize | 0.79 ns / **1.27G ops/sec** | 0.53 ns / **1.87G ops/sec** |
-| Pingwave roundtrip | 0.96 ns / **1.05G ops/sec** | 0.63 ns / **1.58G ops/sec** |
-| New peer discovery | 122.80 ns / **8.14M ops/sec** | 179.72 ns / **5.56M ops/sec** |
+| Pingwave serialize | 0.78 ns / **1.28G ops/sec** | 0.54 ns / **1.86G ops/sec** |
+| Pingwave roundtrip | 0.93 ns / **1.07G ops/sec** | 0.65 ns / **1.55G ops/sec** |
+| New peer discovery | 113.27 ns / **8.83M ops/sec** | 151.82 ns / **6.59M ops/sec** |
 
 | Nodes | M1 Max (all_nodes) | i9-14900K (all_nodes) |
 |------:|-------------------:|----------------------:|
-| 100 | 2.45 us | 7.57 us |
-| 500 | 8.18 us | 16.34 us |
-| 1,000 | 200.0 us | 27.25 us |
-| 5,000 | 264.12 us | 230.49 us |
+| 100 | 2.52 us | 7.47 us |
+| 500 | 8.09 us | 16.09 us |
+| 1,000 | 132.7 us | 26.86 us |
+| 5,000 | 113.29 us | 237.66 us |
 
 ### Encryption (ChaCha20-Poly1305)
 
 | Payload | M1 Max | i9-14900K |
 |--------:|--------|-----------|
-| 64B | 483.38 ns / 126.3 MiB/s | 1.14 us / 53.7 MiB/s |
-| 256B | 922.20 ns / 264.7 MiB/s | 1.20 us / 203.2 MiB/s |
-| 1KB | 2.69 us / 362.6 MiB/s | 1.58 us / 619.5 MiB/s |
-| 4KB | 9.77 us / 399.7 MiB/s | 3.13 us / 1.22 GiB/s |
+| 64B | 483.14 ns / 126.3 MiB/s | 1.14 us / 53.7 MiB/s |
+| 256B | 922.69 ns / 264.6 MiB/s | 1.20 us / 203.0 MiB/s |
+| 1KB | 2.69 us / 362.8 MiB/s | 1.58 us / 618.4 MiB/s |
+| 4KB | 9.74 us / 400.9 MiB/s | 3.10 us / 1.23 GiB/s |
 
 ### Capability System
 
 | Operation | M1 Max | i9-14900K |
 |-----------|--------|-----------|
-| Filter (single tag) | 9.99 ns / **100M ops/sec** | 3.44 ns / **291M ops/sec** |
-| Filter (require GPU) | 4.06 ns / **246M ops/sec** | 1.81 ns / **552M ops/sec** |
-| GPU check | 0.31 ns / **3.20G ops/sec** | 0.19 ns / **5.22G ops/sec** |
-| Capability announcement | 376.79 ns / **2.65M ops/sec** | 1.51 us / **661K ops/sec** |
+| Filter (single tag) | 9.97 ns / **100M ops/sec** | 3.43 ns / **291M ops/sec** |
+| Filter (require GPU) | 4.05 ns / **247M ops/sec** | 1.78 ns / **561M ops/sec** |
+| GPU check | 0.31 ns / **3.21G ops/sec** | 0.20 ns / **5.01G ops/sec** |
+| Capability announcement | 374.61 ns / **2.67M ops/sec** | 2.34 us / **428K ops/sec** |
 
 | Nodes | M1 Max (tag query) | i9-14900K (tag query) |
 |------:|-------------------:|----------------------:|
-| 1,000 | 12.54 us | 10.59 us |
-| 5,000 | 70.40 us | 55.18 us |
-| 10,000 | 175.94 us | 173.09 us |
-| 50,000 | 2.42 ms | 1.26 ms |
+| 1,000 | 12.53 us | 10.35 us |
+| 5,000 | 70.27 us | 54.41 us |
+| 10,000 | 154.98 us | 171.99 us |
+| 50,000 | 2.56 ms | 1.23 ms |
 
 ### Multi-threaded Scaling (thread-local pool)
 
 | Threads | M1 Max | i9-14900K |
 |--------:|--------|-----------|
-| 8 | **8.97 M/s** | **5.56 M/s** |
-| 16 | **9.31 M/s** | **8.58 M/s** |
-| 32 | **9.72 M/s** | **10.36 M/s** |
+| 8 | **9.18 M/s** | **5.45 M/s** |
+| 16 | **9.42 M/s** | **8.43 M/s** |
+| 32 | **9.80 M/s** | **9.89 M/s** |
 
 Pool contention (thread-local acquire/release):
 
 | Threads | M1 Max | i9-14900K |
 |--------:|--------|-----------|
-| 8 | **71.0 M/s** | **69.3 M/s** |
-| 16 | **69.5 M/s** | **88.9 M/s** |
-| 32 | **75.9 M/s** | **113.8 M/s** |
+| 8 | **72.5 M/s** | **63.2 M/s** |
+| 16 | **70.4 M/s** | **88.0 M/s** |
+| 32 | **76.9 M/s** | **110.4 M/s** |
 
 ### SDK Ingestion
 
@@ -624,26 +624,22 @@ The numbers that matter for real workloads — ingest, fold, query, snapshot —
 
 | Operation | Latency | Throughput |
 |-----------|--------:|-----------:|
-| `tasks.create` ingest (no barrier) | 266 ns | **3.77M ops/sec** |
-| `memories.store` ingest | 404 ns | **2.47M ops/sec** |
-| Fold round-trip (`create` + `waitForSeq`) | 5.62 us | **178k ops/sec** |
+| `tasks.create` ingest (no barrier) | 113 ns | **8.87M ops/sec** |
+| `memories.store` ingest | 218 ns | **4.58M ops/sec** |
+| Fold round-trip (`create` + `waitForSeq`) | 5.59 us | **179k ops/sec** |
 | `find_unique` (state lookup) | 8.98 ns | **111M ops/sec** |
-| `find_many` @ 1 K tasks (status filter) | 7.51 us | **133M elements/sec** |
-| `find_many` @ 10 K tasks | 113 us | **88.6M elements/sec** |
-| `count_where` @ 10 K tasks | 38.2 us | **262M elements/sec** |
-| `find_many` @ 1 K memories (tag filter) | 49.0 us | **20.4M elements/sec** |
-| Tasks snapshot encode @ 10 K | 329 us | -- |
-| Memories snapshot encode @ 10 K | 714 us | -- |
+| `find_many` @ 1 K tasks (status filter) | 7.61 us | **131M elements/sec** |
+| `find_many` @ 10 K tasks | 125 us | **80.2M elements/sec** |
+| `count_where` @ 10 K tasks | 6.67 us | **1.50G elements/sec** |
+| `find_many` @ 1 K memories (tag filter) | 49.4 us | **20.3M elements/sec** |
+| Tasks snapshot encode @ 10 K | 83.2 us | -- |
+| Memories snapshot encode @ 10 K | 697 us | -- |
 | `NetDb::open` (both models) | 6.30 us | **159k ops/sec** |
-| Bundle encode @ 1 K (48 KB output) | 22.2 us | -- |
+| Bundle encode @ 1 K (48 KB output) | 31.8 us | -- |
 | Bundle decode @ 1 K | 26.5 us | -- |
-| Bundle decode @ 10 K | 281 us | -- |
+| Bundle decode @ 10 K | 203 us | -- |
 
-Ingest onto a single `TasksAdapter` sustains **~3.8M events/sec** before consumer back-pressure (no `waitForSeq`). The full fold round-trip is **5.6 us** — so a reactive watcher observes a newly appended event within ~one fold tick of the writer. Query methods at 10 K state size range from **~38 µs (`count_where`) to ~113 µs (`find_many`)** even against a cold read lock, which is why the NetDB surface ships `find_many` / `count_where` / `exists_where` always-on: they're cheap enough to call inside a hot loop without a cache layer.
 
-NetDB bundle encode + decode got **2-3x faster** and **60-70% smaller** when CortEX moved off bincode onto postcard in v0.5 — the biggest single win for cross-language snapshot transfer. Example at 1K entries: the bincode era shipped a 135 KB bundle in 63 us (encode) + 95 us (decode); postcard ships the same bundle at 48 KB in 22 us + 27 us.
-
-Net core + CortEX + NetDB numbers re-captured 2026-04-24; RedEX numbers (above) captured 2026-04-19 via `cargo bench --bench redex --features "redex redex-disk"` and `cargo bench --bench cortex --features "cortex netdb"`. CortEX state serialization is on postcard (varint-encoded, serde-compatible, no-std friendly); bincode 1.x support was dropped after the original crate went unmaintained.
 
 ### Binary size
 
