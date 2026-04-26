@@ -3161,9 +3161,7 @@ mod tests {
             .with_cpu(16, 16)
             .with_memory(65536)
             .with_gpu(gpu);
-        let caps = CapabilitySet::new()
-            .with_hardware(hw)
-            .add_tag("gpu");
+        let caps = CapabilitySet::new().with_hardware(hw).add_tag("gpu");
 
         let index = CapabilityIndex::new();
         let ann = CapabilityAnnouncement::new(42u64, test_entity(), 1, caps);
@@ -3192,9 +3190,7 @@ mod tests {
             .with_cpu(16, 16)
             .with_memory(65536)
             .with_gpu(gpu);
-        let caps = CapabilitySet::new()
-            .with_hardware(hw)
-            .add_tag("gpu");
+        let caps = CapabilitySet::new().with_hardware(hw).add_tag("gpu");
 
         let mut ann = CapabilityAnnouncement::new(42u64, keypair.entity_id().clone(), 1, caps);
         ann.sign(&keypair);

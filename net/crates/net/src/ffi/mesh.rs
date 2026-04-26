@@ -3133,8 +3133,7 @@ mod nat_traversal_stub_tests {
     #[test]
     fn capability_set_from_go_marshal_preserves_gpu_vendor() {
         let json = r#"{"hardware":{"cpu_cores":16,"memory_mb":65536,"gpu":{"vendor":"nvidia","model":"h100","vram_mb":81920}},"tags":["gpu"]}"#;
-        let parsed: CapabilitySetJson =
-            serde_json::from_str(json).expect("JSON should parse");
+        let parsed: CapabilitySetJson = serde_json::from_str(json).expect("JSON should parse");
         let caps = capability_set_from_json(parsed);
         assert_eq!(
             caps.hardware.gpu_vendor(),
