@@ -1,4 +1,10 @@
-import type { AgentId, CrewAgent, CrewGraph, CrewRole, RoleId } from "../graph/types.js";
+import type {
+  AgentId,
+  CrewAgent,
+  CrewGraph,
+  CrewRole,
+  RoleId,
+} from "../graph/types.js";
 import type {
   AgentStepRequest,
   CrewEvent,
@@ -50,24 +56,26 @@ interface PendingMeta {
 
 interface PhaseState {
   roleId: RoleId;
-  pending: Map<string, AgentStepRequest>;     // correlationId -> request
-  pendingMeta: Map<string, PendingMeta>;       // correlationId -> input + role snapshot + memex_context
-  outputs: Map<AgentId, VoteEntry>;            // agentId -> response (substitution-aware)
-  terminalSeen: Set<string>;                   // correlationIds we've processed
-  fixerSteps: Map<string, AgentId>;            // fixer cid -> original failed agent
-  nestedPending: Set<AgentId>;                 // outer agentIds whose inner session is in flight
+  pending: Map<string, AgentStepRequest>; // correlationId -> request
+  pendingMeta: Map<string, PendingMeta>; // correlationId -> input + role snapshot + memex_context
+  outputs: Map<AgentId, VoteEntry>; // agentId -> response (substitution-aware)
+  terminalSeen: Set<string>; // correlationIds we've processed
+  fixerSteps: Map<string, AgentId>; // fixer cid -> original failed agent
+  nestedPending: Set<AgentId>; // outer agentIds whose inner session is in flight
 }
 
 interface InnerHandle {
   outerAgentId: AgentId;
   outerRoleId: RoleId;
   innerSession: CrewSession;
-  innerCids: Set<string>;                      // cids the inner session is currently waiting on
-  innerAdapter?: MemexAdapter;                 // present when isolation === "hard"
+  innerCids: Set<string>; // cids the inner session is currently waiting on
+  innerAdapter?: MemexAdapter; // present when isolation === "hard"
 }
 
 type HookCtxPartial = Pick<HookContext, "role"> &
-  Partial<Pick<HookContext, "agent" | "input" | "output" | "fault" | "stalled">>;
+  Partial<
+    Pick<HookContext, "agent" | "input" | "output" | "fault" | "stalled">
+  >;
 
 class CrewSessionImpl implements CrewSession {
   private readonly crewId: string;
@@ -121,7 +129,9 @@ class CrewSessionImpl implements CrewSession {
         request: req,
         input: meta.input,
         roleSnapshot: meta.roleSnapshot,
-        ...(meta.memexContext !== undefined ? { memexContext: meta.memexContext } : {}),
+        ...(meta.memexContext !== undefined
+          ? { memexContext: meta.memexContext }
+          : {}),
       });
     }
     for (const handle of this.innerByOuter.values()) {
@@ -147,8 +157,12 @@ class CrewSessionImpl implements CrewSession {
               return {
                 request: req,
                 input: meta?.input,
-                roleSnapshot: meta?.roleSnapshot ?? snapshotRole(this.graph.roles.get(req.roleId)!),
-                ...(meta?.memexContext !== undefined ? { memexContext: meta.memexContext } : {}),
+                roleSnapshot:
+                  meta?.roleSnapshot ??
+                  snapshotRole(this.graph.roles.get(req.roleId)!),
+                ...(meta?.memexContext !== undefined
+                  ? { memexContext: meta.memexContext }
+                  : {}),
               };
             }),
             outputs: [...cp.outputs.entries()],
@@ -200,7 +214,9 @@ class CrewSessionImpl implements CrewSession {
             {
               input: p.input,
               roleSnapshot: p.roleSnapshot,
-              ...(p.memexContext !== undefined ? { memexContext: p.memexContext } : {}),
+              ...(p.memexContext !== undefined
+                ? { memexContext: p.memexContext }
+                : {}),
             },
           ]),
         ),
@@ -212,7 +228,9 @@ class CrewSessionImpl implements CrewSession {
     }
 
     for (const nh of snap.nested) {
-      const outerAgent = this.graph.agents.find((a) => a.id === nh.outerAgentId);
+      const outerAgent = this.graph.agents.find(
+        (a) => a.id === nh.outerAgentId,
+      );
       if (!outerAgent || !outerAgent.nestedCrew) {
         throw new Error(
           `Cannot restore nested handle: outer agent "${nh.outerAgentId}" not found or has no nested crew`,
@@ -264,7 +282,12 @@ class CrewSessionImpl implements CrewSession {
     this.currentInput = rootInput;
 
     const events: CrewEvent[] = [
-      { type: "crew.started", crewId: this.crewId, rootInput, ts: this.clock.now() },
+      {
+        type: "crew.started",
+        crewId: this.crewId,
+        rootInput,
+        ts: this.clock.now(),
+      },
     ];
     this.advanceToNextPhase(events);
     return events;
@@ -339,7 +362,13 @@ class CrewSessionImpl implements CrewSession {
       }
     }
 
-    this.processTerminal(phase, req, cid, { output, fault, stalled, timedOut }, events);
+    this.processTerminal(
+      phase,
+      req,
+      cid,
+      { output, fault, stalled, timedOut },
+      events,
+    );
 
     if (phase.pending.size === 0 && phase.nestedPending.size === 0) {
       this.completeCurrentPhase(events);
@@ -407,11 +436,18 @@ class CrewSessionImpl implements CrewSession {
     phase: PhaseState,
     req: AgentStepRequest,
     cid: string,
-    res: { output: unknown; fault: boolean; stalled: boolean; timedOut: boolean },
+    res: {
+      output: unknown;
+      fault: boolean;
+      stalled: boolean;
+      timedOut: boolean;
+    },
     events: CrewEvent[],
   ): void {
     const isFixerStep = phase.fixerSteps.has(cid);
-    const targetAgentId = isFixerStep ? phase.fixerSteps.get(cid)! : req.agentId;
+    const targetAgentId = isFixerStep
+      ? phase.fixerSteps.get(cid)!
+      : req.agentId;
 
     phase.outputs.set(targetAgentId, {
       agentId: targetAgentId,
@@ -426,11 +462,26 @@ class CrewSessionImpl implements CrewSession {
     // Per-reason hooks fire only for the original (non-fixer) agent.
     if (!isFixerStep) {
       if (res.fault) {
-        this.callHook(role.hooks?.on_fault, "on_fault", { role, agent, output: res.output, fault: true }, events);
+        this.callHook(
+          role.hooks?.on_fault,
+          "on_fault",
+          { role, agent, output: res.output, fault: true },
+          events,
+        );
       } else if (res.stalled) {
-        this.callHook(role.hooks?.on_stall, "on_stall", { role, agent, output: res.output, stalled: true }, events);
+        this.callHook(
+          role.hooks?.on_stall,
+          "on_stall",
+          { role, agent, output: res.output, stalled: true },
+          events,
+        );
       } else if (res.timedOut) {
-        this.callHook(role.hooks?.on_timeout, "on_timeout", { role, agent }, events);
+        this.callHook(
+          role.hooks?.on_timeout,
+          "on_timeout",
+          { role, agent },
+          events,
+        );
       }
     }
 
@@ -438,18 +489,31 @@ class CrewSessionImpl implements CrewSession {
     this.callHook(
       role.hooks?.after_agent,
       "after_agent",
-      { role, agent, output: res.output, fault: res.fault, stalled: res.stalled },
+      {
+        role,
+        agent,
+        output: res.output,
+        fault: res.fault,
+        stalled: res.stalled,
+      },
       events,
     );
 
     // Activation: only for non-fixer normal agents that faulted/stalled/timed out.
     if (!isFixerStep && (res.fault || res.stalled || res.timedOut)) {
-      const reason: FixerReason = res.timedOut ? "timeout" : res.stalled ? "stall" : "fault";
+      const reason: FixerReason = res.timedOut
+        ? "timeout"
+        : res.stalled
+          ? "stall"
+          : "fault";
       this.maybeInvokeFixer(req.agentId, reason, events);
     }
   }
 
-  private requestActionInternal(req: ActionRequest, events: CrewEvent[]): boolean {
+  private requestActionInternal(
+    req: ActionRequest,
+    events: CrewEvent[],
+  ): boolean {
     const allowed = checkPermission(this.graph, req.from, req.to, req.action);
     if (allowed) return true;
 
@@ -477,7 +541,11 @@ class CrewSessionImpl implements CrewSession {
     return false;
   }
 
-  private maybeInvokeFixer(failedAgentId: AgentId, reason: FixerReason, events: CrewEvent[]): void {
+  private maybeInvokeFixer(
+    failedAgentId: AgentId,
+    reason: FixerReason,
+    events: CrewEvent[],
+  ): void {
     const phase = this.currentPhase;
     if (!phase) return;
 
@@ -492,7 +560,9 @@ class CrewSessionImpl implements CrewSession {
     });
     if (!fixerRole) return;
 
-    const fixerAgents = this.graph.agents.filter((a) => a.role === fixerRole.role);
+    const fixerAgents = this.graph.agents.filter(
+      (a) => a.role === fixerRole.role,
+    );
     if (fixerAgents.length === 0) return;
     const fixerAgent = fixerAgents[0];
 
@@ -512,7 +582,13 @@ class CrewSessionImpl implements CrewSession {
       upstreamInput: this.currentInput,
     };
 
-    this.emitStepRequest(fixerAgent, fixerRole, fixerInput, events, failedAgentId);
+    this.emitStepRequest(
+      fixerAgent,
+      fixerRole,
+      fixerInput,
+      events,
+      failedAgentId,
+    );
   }
 
   private emitStepRequest(
@@ -529,7 +605,12 @@ class CrewSessionImpl implements CrewSession {
 
     const phase = this.currentPhase!;
 
-    this.callHook(role.hooks?.before_agent, "before_agent", { role, agent, input }, events);
+    this.callHook(
+      role.hooks?.before_agent,
+      "before_agent",
+      { role, agent, input },
+      events,
+    );
 
     const attempt = (this.agentAttempts.get(agent.id) ?? 0) + 1;
     this.agentAttempts.set(agent.id, attempt);
@@ -594,7 +675,12 @@ class CrewSessionImpl implements CrewSession {
   ): void {
     const phase = this.currentPhase!;
 
-    this.callHook(role.hooks?.before_agent, "before_agent", { role, agent, input }, events);
+    this.callHook(
+      role.hooks?.before_agent,
+      "before_agent",
+      { role, agent, input },
+      events,
+    );
 
     const attempt = (this.agentAttempts.get(agent.id) ?? 0) + 1;
     this.agentAttempts.set(agent.id, attempt);
@@ -706,7 +792,9 @@ class CrewSessionImpl implements CrewSession {
     });
 
     const role = this.graph.roles.get(handle.outerRoleId);
-    const outerAgent = this.graph.agents.find((a) => a.id === handle.outerAgentId);
+    const outerAgent = this.graph.agents.find(
+      (a) => a.id === handle.outerAgentId,
+    );
     if (role && outerAgent) {
       this.callHook(
         role.hooks?.after_agent,
@@ -751,7 +839,12 @@ class CrewSessionImpl implements CrewSession {
     };
     this.currentPhase = phase;
 
-    this.callHook(role.hooks?.before_role, "before_role", { role, input: this.currentInput }, events);
+    this.callHook(
+      role.hooks?.before_role,
+      "before_role",
+      { role, input: this.currentInput },
+      events,
+    );
 
     for (const agent of agents) {
       this.emitStepRequest(agent, role, this.currentInput, events);
@@ -770,7 +863,9 @@ class CrewSessionImpl implements CrewSession {
     const cfg = role.execution?.voting;
     const mode = cfg?.mode ?? "first_valid";
 
-    const phaseAgents = this.graph.agents.filter((a) => a.role === phase.roleId);
+    const phaseAgents = this.graph.agents.filter(
+      (a) => a.role === phase.roleId,
+    );
     const ordered: VoteEntry[] = [];
     for (const a of phaseAgents) {
       const out = phase.outputs.get(a.id);
@@ -786,14 +881,28 @@ class CrewSessionImpl implements CrewSession {
       ts: this.clock.now(),
     });
 
-    this.callHook(role.hooks?.after_role, "after_role", { role, output: resolved }, events);
+    this.callHook(
+      role.hooks?.after_role,
+      "after_role",
+      { role, output: resolved },
+      events,
+    );
 
     // Declarative checkpoints: emit one event per declared name + fire on_checkpoint hook.
     const declaredCheckpoints = role.execution?.checkpoints;
     if (declaredCheckpoints) {
       for (const cpId of declaredCheckpoints) {
-        events.push({ type: "checkpoint.taken", checkpointId: cpId, ts: this.clock.now() });
-        this.callHook(role.hooks?.on_checkpoint, "on_checkpoint", { role }, events);
+        events.push({
+          type: "checkpoint.taken",
+          checkpointId: cpId,
+          ts: this.clock.now(),
+        });
+        this.callHook(
+          role.hooks?.on_checkpoint,
+          "on_checkpoint",
+          { role },
+          events,
+        );
       }
     }
 
@@ -822,7 +931,11 @@ class CrewSessionImpl implements CrewSession {
     const control: CrewControl = {
       requestAction: (req) => this.requestActionInternal(req, events),
       checkpoint: (id) => {
-        events.push({ type: "checkpoint.taken", checkpointId: id, ts: this.clock.now() });
+        events.push({
+          type: "checkpoint.taken",
+          checkpointId: id,
+          ts: this.clock.now(),
+        });
       },
     };
     fn({
@@ -854,7 +967,9 @@ function computePhaseOrder(graph: CrewGraph): RoleId[] {
 function snapshotRole(role: CrewRole): RoleSnapshot {
   return {
     name: role.role,
-    ...(role.description !== undefined ? { description: role.description } : {}),
+    ...(role.description !== undefined
+      ? { description: role.description }
+      : {}),
     capabilities: {
       ...role.capabilities,
       ...(role.capabilities.tools !== undefined

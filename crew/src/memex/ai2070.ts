@@ -59,12 +59,18 @@ export function createMemexAdapter(opts: CreateMemexAdapterOpts): MemexAdapter {
       const baseFilter = filterForView(view, agent.id, role.role, crewId);
       return {
         read(filter) {
-          return getItems(mem, mergeFilters(baseFilter, filter as MemoryFilter | undefined));
+          return getItems(
+            mem,
+            mergeFilters(baseFilter, filter as MemoryFilter | undefined),
+          );
         },
         retrieve(retrievalOpts) {
           return smartRetrieve(
             mem,
-            mergeFilterIntoSmart(retrievalOpts as SmartRetrievalOptions, baseFilter),
+            mergeFilterIntoSmart(
+              retrievalOpts as SmartRetrievalOptions,
+              baseFilter,
+            ),
           );
         },
       };
@@ -175,7 +181,10 @@ function mergeFilterIntoSmart(
 // Stamp memory.create with author/meta/scope so cross-agent visibility filters
 // work without the worker remembering to set them. Other commands pass through —
 // the worker is responsible for setting `author` on update/retract.
-function stampCommand(cmd: MemexMemoryCommand, ctx: MemexStampContext): MemexMemoryCommand {
+function stampCommand(
+  cmd: MemexMemoryCommand,
+  ctx: MemexStampContext,
+): MemexMemoryCommand {
   if (cmd.type !== "memory.create") return cmd;
 
   const item: MemoryItem = { ...cmd.item };

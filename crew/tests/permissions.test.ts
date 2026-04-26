@@ -5,7 +5,10 @@ import { buildCrewGraph } from "../src/graph/build.js";
 import { createCrewSession } from "../src/session/machine.js";
 import { frozenClock } from "../src/runtime/clock.js";
 import type { CrewEvent } from "../src/events/types.js";
-import { DEFAULT_CREW_SHAPE, DEFAULT_CREW_AGENTS } from "./fixtures/default-crew.js";
+import {
+  DEFAULT_CREW_SHAPE,
+  DEFAULT_CREW_AGENTS,
+} from "./fixtures/default-crew.js";
 
 function setup() {
   const shape = CrewShapeSchema.parse(DEFAULT_CREW_SHAPE);
@@ -41,8 +44,9 @@ describe("Permission ACL gates", () => {
       action: "talk_to",
     });
     expect(result.allowed).toBe(false);
-    const denial = result.events.find((e) => e.type === "permission.denied") as
-      Extract<CrewEvent, { type: "permission.denied" }>;
+    const denial = result.events.find(
+      (e) => e.type === "permission.denied",
+    ) as Extract<CrewEvent, { type: "permission.denied" }>;
     expect(denial).toBeDefined();
     expect(denial.from).toBe("merc-1");
     expect(denial.to).toBe("caller-1");
@@ -114,7 +118,8 @@ describe("Permission ACL gates", () => {
       result.events.some(
         (e) =>
           e.type === "agent.step.requested" &&
-          (e as Extract<CrewEvent, { type: "agent.step.requested" }>).agentId === "fixer-1",
+          (e as Extract<CrewEvent, { type: "agent.step.requested" }>)
+            .agentId === "fixer-1",
       ),
     ).toBe(true);
   });
@@ -129,6 +134,8 @@ describe("Permission ACL gates", () => {
       action: "talk_to",
     });
     expect(result.allowed).toBe(true);
-    expect(result.events.some((e) => e.type === "agent.step.requested")).toBe(false);
+    expect(result.events.some((e) => e.type === "agent.step.requested")).toBe(
+      false,
+    );
   });
 });

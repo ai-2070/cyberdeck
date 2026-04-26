@@ -33,7 +33,9 @@ export function buildCrewGraph(
 
   const lint = lintCrewShape(shape);
   if (lint.errors.length > 0) {
-    const summary = lint.errors.map((e) => `[${e.code}] ${e.message}`).join("; ");
+    const summary = lint.errors
+      .map((e) => `[${e.code}] ${e.message}`)
+      .join("; ");
     throw new Error(`CrewShape failed lint: ${summary}`);
   }
 

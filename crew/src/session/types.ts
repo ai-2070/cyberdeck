@@ -10,7 +10,11 @@ import type { HookRegistry } from "../runtime/hooks.js";
 import type { MemexAdapter } from "../memex/adapter.js";
 import type { VoteEntry } from "../voting/resolve.js";
 
-export type CrewStatus = "idle" | "awaiting_responses" | "completed" | "aborted";
+export type CrewStatus =
+  | "idle"
+  | "awaiting_responses"
+  | "completed"
+  | "aborted";
 
 export type ResumePolicy = "re-emit-request" | "treat-as-failed" | "abort";
 

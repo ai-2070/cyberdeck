@@ -85,7 +85,9 @@ function setup() {
   const parentShape = CrewShapeSchema.parse(PARENT_SHAPE);
   const innerShape = CrewShapeSchema.parse(INNER_SHAPE);
   const parentAgents = CrewAgentsSchema.parse(PARENT_AGENTS);
-  const graph = buildCrewGraph(parentShape, parentAgents, { INNER: innerShape });
+  const graph = buildCrewGraph(parentShape, parentAgents, {
+    INNER: innerShape,
+  });
   const session = createCrewSession({
     crewId: "outer",
     graph,
@@ -126,8 +128,9 @@ describe("Nested crews", () => {
   it("spawning a nested agent emits nested.crew.started", () => {
     const { session } = setup();
     const initial = session.start("ROOT");
-    const hostReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const hostReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
 
     const burst = session.deliver({
       type: "agent.step.completed",
@@ -137,8 +140,9 @@ describe("Nested crews", () => {
     });
 
     expect(burst.some((e) => e.type === "nested.crew.started")).toBe(true);
-    const nestedStart = burst.find((e) => e.type === "nested.crew.started") as
-      Extract<CrewEvent, { type: "nested.crew.started" }>;
+    const nestedStart = burst.find(
+      (e) => e.type === "nested.crew.started",
+    ) as Extract<CrewEvent, { type: "nested.crew.started" }>;
     expect(nestedStart.agentId).toBe("worker-1");
     expect(nestedStart.nestedName).toBe("INNER");
   });
@@ -149,7 +153,9 @@ describe("Nested crews", () => {
     const innerCrewStarted = log.filter(
       (e) =>
         e.type === "crew.started" &&
-        (e as Extract<CrewEvent, { type: "crew.started" }>).crewId.includes("worker-1"),
+        (e as Extract<CrewEvent, { type: "crew.started" }>).crewId.includes(
+          "worker-1",
+        ),
     );
     expect(innerCrewStarted).toHaveLength(1);
 
@@ -170,8 +176,9 @@ describe("Nested crews", () => {
         // inner's crew.completed appears before outer's
         log.indexOf(e) < log.length - 1,
     ) as Extract<CrewEvent, { type: "crew.completed" }>;
-    const nestedComplete = log.find((e) => e.type === "nested.crew.completed") as
-      Extract<CrewEvent, { type: "nested.crew.completed" }>;
+    const nestedComplete = log.find(
+      (e) => e.type === "nested.crew.completed",
+    ) as Extract<CrewEvent, { type: "nested.crew.completed" }>;
     expect(nestedComplete).toBeDefined();
     expect(nestedComplete.agentId).toBe("worker-1");
     expect(nestedComplete.output).toEqual(innerComplete.finalOutput);
@@ -180,8 +187,9 @@ describe("Nested crews", () => {
   it("outer phase does not complete until inner crew completes", () => {
     const { session } = setup();
     const initial = session.start("ROOT");
-    const hostReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const hostReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     const afterHost = session.deliver({
       type: "agent.step.completed",
       correlationId: hostReq.correlationId,
@@ -195,7 +203,8 @@ describe("Nested crews", () => {
       afterHost.some(
         (e) =>
           e.type === "vote.resolved" &&
-          (e as Extract<CrewEvent, { type: "vote.resolved" }>).roleId === "worker",
+          (e as Extract<CrewEvent, { type: "vote.resolved" }>).roleId ===
+            "worker",
       ),
     ).toBe(false);
 
@@ -203,7 +212,8 @@ describe("Nested crews", () => {
     const alphaReq = afterHost.find(
       (e) =>
         e.type === "agent.step.requested" &&
-        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).roleId === "alpha",
+        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).roleId ===
+          "alpha",
     ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     const afterAlpha = session.deliver({
       type: "agent.step.completed",
@@ -216,7 +226,8 @@ describe("Nested crews", () => {
       afterAlpha.some(
         (e) =>
           e.type === "vote.resolved" &&
-          (e as Extract<CrewEvent, { type: "vote.resolved" }>).roleId === "worker",
+          (e as Extract<CrewEvent, { type: "vote.resolved" }>).roleId ===
+            "worker",
       ),
     ).toBe(false);
 
@@ -224,7 +235,8 @@ describe("Nested crews", () => {
     const betaReq = afterAlpha.find(
       (e) =>
         e.type === "agent.step.requested" &&
-        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).roleId === "beta",
+        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).roleId ===
+          "beta",
     ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     const afterBeta = session.deliver({
       type: "agent.step.completed",
@@ -233,20 +245,24 @@ describe("Nested crews", () => {
       ts: 0,
     });
 
-    expect(afterBeta.some((e) => e.type === "nested.crew.completed")).toBe(true);
+    expect(afterBeta.some((e) => e.type === "nested.crew.completed")).toBe(
+      true,
+    );
     expect(
       afterBeta.some(
         (e) =>
           e.type === "vote.resolved" &&
-          (e as Extract<CrewEvent, { type: "vote.resolved" }>).roleId === "worker",
+          (e as Extract<CrewEvent, { type: "vote.resolved" }>).roleId ===
+            "worker",
       ),
     ).toBe(true);
   });
 
   it("inner correlation ids differ from outer correlation ids", () => {
     const log = runEcho(setup().session);
-    const reqs = log.filter((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>[];
+    const reqs = log.filter(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>[];
     const cids = new Set(reqs.map((r) => r.correlationId));
     expect(cids.size).toBe(reqs.length); // all unique
   });
@@ -255,7 +271,10 @@ describe("Nested crews", () => {
     const log = runEcho(setup().session);
     expect(log[log.length - 1].type).toBe("crew.completed");
     // The last crew.completed is the OUTER one — its crewId is "outer"
-    const lastComplete = log[log.length - 1] as Extract<CrewEvent, { type: "crew.completed" }>;
+    const lastComplete = log[log.length - 1] as Extract<
+      CrewEvent,
+      { type: "crew.completed" }
+    >;
     expect(lastComplete).toBeDefined();
   });
 });
@@ -272,7 +291,9 @@ describe("Nested crews — hard memex isolation", () => {
     });
     const innerShape = CrewShapeSchema.parse(INNER_SHAPE);
     const parentAgents = CrewAgentsSchema.parse(PARENT_AGENTS);
-    const graph = buildCrewGraph(parentShape, parentAgents, { INNER: innerShape });
+    const graph = buildCrewGraph(parentShape, parentAgents, {
+      INNER: innerShape,
+    });
     const adapter = createMemexAdapter({ crewId: "outer-hard" });
 
     // Pre-load a memory item in parent's adapter
@@ -303,8 +324,9 @@ describe("Nested crews — hard memex isolation", () => {
   it("inner adapter is forked from parent (inner sees parent's items at fork)", () => {
     const { session, adapter } = setupHardIsolated();
     const initial = session.start("ROOT");
-    const hostReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const hostReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     session.deliver({
       type: "agent.step.completed",
       correlationId: hostReq.correlationId,
@@ -370,8 +392,9 @@ describe("Nested crews — hard memex isolation", () => {
 
     // Drive: host completes
     const initial = session.start("ROOT");
-    const hostReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const hostReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     const afterHost = session.deliver({
       type: "agent.step.completed",
       correlationId: hostReq.correlationId,
@@ -384,7 +407,8 @@ describe("Nested crews — hard memex isolation", () => {
     const alphaReq = afterHost.find(
       (e) =>
         e.type === "agent.step.requested" &&
-        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).roleId === "alpha",
+        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).roleId ===
+          "alpha",
     ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     session.deliver({
       type: "agent.step.completed",
@@ -418,19 +442,24 @@ describe("Nested crews — hard memex isolation", () => {
     // Resume from snapshot. The inner adapter should be rebuilt from
     // innerAdapterSnapshot — NOT downgraded to soft (which would have inner
     // writing directly to parent).
-    const { session: resumed, events: resumeEvents } = resumeCrewSession(snap, [], {
-      crewId: "outer-hard",
-      graph,
-      clock: frozenClock(0),
-      memex: adapter,
-      resumePolicy: "re-emit-request",
-    });
+    const { session: resumed, events: resumeEvents } = resumeCrewSession(
+      snap,
+      [],
+      {
+        crewId: "outer-hard",
+        graph,
+        clock: frozenClock(0),
+        memex: adapter,
+        resumePolicy: "re-emit-request",
+      },
+    );
 
     // Re-emitted beta request is in resumeEvents; deliver beta with another write (Y).
     const betaReq = resumeEvents.find(
       (e) =>
         e.type === "agent.step.requested" &&
-        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).roleId === "beta",
+        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).roleId ===
+          "beta",
     ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     expect(betaReq).toBeDefined();
 

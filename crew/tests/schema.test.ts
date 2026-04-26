@@ -1,7 +1,10 @@
 import { describe, it, expect } from "vitest";
 import { CrewShapeSchema } from "../src/schema/shape.js";
 import { CrewAgentsSchema } from "../src/schema/agents.js";
-import { DEFAULT_CREW_SHAPE, DEFAULT_CREW_AGENTS } from "./fixtures/default-crew.js";
+import {
+  DEFAULT_CREW_SHAPE,
+  DEFAULT_CREW_AGENTS,
+} from "./fixtures/default-crew.js";
 
 describe("CrewShapeSchema", () => {
   it("parses the DEFAULT_CREW example", () => {
@@ -33,7 +36,12 @@ describe("CrewShapeSchema", () => {
       roles: [
         {
           role: "only",
-          permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] },
+          permissions: {
+            talk_to: [],
+            delegate_to: [],
+            escalate_to: [],
+            invite: [],
+          },
           first_input: true,
           final_output: true,
         },
@@ -72,7 +80,11 @@ describe("CrewShapeSchema", () => {
 
   it("requires at least one role", () => {
     expect(() =>
-      CrewShapeSchema.parse({ schema_version: "1.0", name: "EMPTY", roles: [] }),
+      CrewShapeSchema.parse({
+        schema_version: "1.0",
+        name: "EMPTY",
+        roles: [],
+      }),
     ).toThrow();
   });
 
@@ -84,7 +96,12 @@ describe("CrewShapeSchema", () => {
         roles: [
           {
             role: "dead",
-            permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] },
+            permissions: {
+              talk_to: [],
+              delegate_to: [],
+              escalate_to: [],
+              invite: [],
+            },
             activation: {}, // empty — silently dead
             first_input: true,
             final_output: true,
@@ -102,7 +119,12 @@ describe("CrewShapeSchema", () => {
         roles: [
           {
             role: "dead",
-            permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] },
+            permissions: {
+              talk_to: [],
+              delegate_to: [],
+              escalate_to: [],
+              invite: [],
+            },
             activation: { on_fault: false, on_stall: false },
             first_input: true,
             final_output: true,
@@ -119,17 +141,32 @@ describe("CrewShapeSchema", () => {
       roles: [
         {
           role: "alpha",
-          permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] },
+          permissions: {
+            talk_to: [],
+            delegate_to: [],
+            escalate_to: [],
+            invite: [],
+          },
           first_input: true,
         },
         {
           role: "beta",
-          permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] },
+          permissions: {
+            talk_to: [],
+            delegate_to: [],
+            escalate_to: [],
+            invite: [],
+          },
           final_output: true,
         },
         {
           role: "fixer",
-          permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] },
+          permissions: {
+            talk_to: [],
+            delegate_to: [],
+            escalate_to: [],
+            invite: [],
+          },
           activation: { on_fault: true },
         },
       ],

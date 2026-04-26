@@ -94,8 +94,20 @@ describe("createMemexAdapter — unit", () => {
     );
 
     const alphaAgent = { id: "alpha-1", role: "alpha" };
-    const alphaRole = { role: "alpha", permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] } } as unknown as Parameters<typeof adapter.handleFor>[1];
-    const handle = adapter.handleFor(alphaAgent as Parameters<typeof adapter.handleFor>[0], alphaRole, "self");
+    const alphaRole = {
+      role: "alpha",
+      permissions: {
+        talk_to: [],
+        delegate_to: [],
+        escalate_to: [],
+        invite: [],
+      },
+    } as unknown as Parameters<typeof adapter.handleFor>[1];
+    const handle = adapter.handleFor(
+      alphaAgent as Parameters<typeof adapter.handleFor>[0],
+      alphaRole,
+      "self",
+    );
     const items = handle.read();
     expect(items).toHaveLength(1);
     expect(items[0].meta?.agent_id).toBe("alpha-1");
@@ -132,8 +144,18 @@ describe("createMemexAdapter — unit", () => {
       { agentId: "beta-1", crewId: "c1", roleId: "beta" },
     );
 
-    const alphaAgent = { id: "alpha-1", role: "alpha" } as Parameters<typeof adapter.handleFor>[0];
-    const alphaRole = { role: "alpha", permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] } } as Parameters<typeof adapter.handleFor>[1];
+    const alphaAgent = { id: "alpha-1", role: "alpha" } as Parameters<
+      typeof adapter.handleFor
+    >[0];
+    const alphaRole = {
+      role: "alpha",
+      permissions: {
+        talk_to: [],
+        delegate_to: [],
+        escalate_to: [],
+        invite: [],
+      },
+    } as Parameters<typeof adapter.handleFor>[1];
     const handle = adapter.handleFor(alphaAgent, alphaRole, "self");
 
     // Caller tries to read beta's items by overriding meta.agent_id — must be rejected.
@@ -173,8 +195,18 @@ describe("createMemexAdapter — unit", () => {
       { agentId: "beta-1", crewId: "c1", roleId: "beta" },
     );
 
-    const alphaAgent = { id: "alpha-1", role: "alpha" } as Parameters<typeof adapter.handleFor>[0];
-    const alphaRole = { role: "alpha", permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] } } as Parameters<typeof adapter.handleFor>[1];
+    const alphaAgent = { id: "alpha-1", role: "alpha" } as Parameters<
+      typeof adapter.handleFor
+    >[0];
+    const alphaRole = {
+      role: "alpha",
+      permissions: {
+        talk_to: [],
+        delegate_to: [],
+        escalate_to: [],
+        invite: [],
+      },
+    } as Parameters<typeof adapter.handleFor>[1];
     const handle = adapter.handleFor(alphaAgent, alphaRole, "crew");
     const items = handle.read();
     expect(items).toHaveLength(2);
@@ -231,8 +263,9 @@ describe("Session × MemEX integration", () => {
     });
 
     const initial = session.start("ROOT");
-    const alphaReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const alphaReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     expect(alphaReq.memex_context).toBeDefined();
     expect(Array.isArray(alphaReq.memex_context)).toBe(true);
   });
@@ -256,8 +289,9 @@ describe("Session × MemEX integration", () => {
       memex: adapter,
     });
     const initial = session.start("ROOT");
-    const alphaReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const alphaReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     expect(alphaReq.memex_context).toBeUndefined();
   });
 
@@ -290,8 +324,9 @@ describe("Session × MemEX integration", () => {
       clock: frozenClock(0),
     });
     const initial = session.start("ROOT");
-    const alphaReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const alphaReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     expect(alphaReq.memex_context).toBeUndefined();
   });
 
@@ -308,8 +343,9 @@ describe("Session × MemEX integration", () => {
     });
 
     const initial = session.start("ROOT");
-    const alphaReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const alphaReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
 
     const cmd: MemoryCommand = {
       type: "memory.create",
@@ -331,8 +367,9 @@ describe("Session × MemEX integration", () => {
       ts: 0,
     });
 
-    const emitted = burst.find((e) => e.type === "memex.command.emitted") as
-      Extract<CrewEvent, { type: "memex.command.emitted" }>;
+    const emitted = burst.find(
+      (e) => e.type === "memex.command.emitted",
+    ) as Extract<CrewEvent, { type: "memex.command.emitted" }>;
     expect(emitted).toBeDefined();
     expect(emitted.agentId).toBe("alpha-1");
     expect(emitted.command).toBe(cmd);
@@ -402,8 +439,9 @@ describe("Session × MemEX integration", () => {
       clock: frozenClock(0),
     });
     const initial = session.start("ROOT");
-    const alphaReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const alphaReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
 
     const burst = session.deliver({
       type: "agent.step.completed",

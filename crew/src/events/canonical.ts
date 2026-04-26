@@ -15,7 +15,9 @@ function canonicalizeValue(value: unknown, seen: WeakSet<object>): string {
   if (t === "number") {
     const n = value as number;
     if (!Number.isFinite(n)) {
-      throw new Error(`canonicalize: non-finite number ${n} is not representable`);
+      throw new Error(
+        `canonicalize: non-finite number ${n} is not representable`,
+      );
     }
     return Object.is(n, -0) ? "0" : String(n);
   }
@@ -27,7 +29,9 @@ function canonicalizeValue(value: unknown, seen: WeakSet<object>): string {
   }
 
   if (t === "undefined") {
-    throw new Error("canonicalize: undefined is not representable at the top level");
+    throw new Error(
+      "canonicalize: undefined is not representable at the top level",
+    );
   }
 
   if (t === "function" || t === "symbol") {

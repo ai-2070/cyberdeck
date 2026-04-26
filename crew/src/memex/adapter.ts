@@ -23,7 +23,11 @@ export interface AgentMemexHandle {
 }
 
 export interface MemexAdapter {
-  handleFor(agent: CrewAgent, role: CrewRole, view: MemexView): AgentMemexHandle;
+  handleFor(
+    agent: CrewAgent,
+    role: CrewRole,
+    view: MemexView,
+  ): AgentMemexHandle;
   apply(cmd: MemoryCommand, ctx: MemexStampContext): void;
   exportSlice(opts: unknown): unknown;
   importSlice(slice: unknown): unknown;

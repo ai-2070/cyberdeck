@@ -7,7 +7,10 @@ import { frozenClock } from "../src/runtime/clock.js";
 import { createHookRegistry } from "../src/runtime/hooks.js";
 import type { CrewEvent } from "../src/events/types.js";
 import type { CrewSession } from "../src/session/types.js";
-import { DEFAULT_CREW_SHAPE, DEFAULT_CREW_AGENTS } from "./fixtures/default-crew.js";
+import {
+  DEFAULT_CREW_SHAPE,
+  DEFAULT_CREW_AGENTS,
+} from "./fixtures/default-crew.js";
 import { TINY_CREW_SHAPE, TINY_CREW_AGENTS } from "./fixtures/tiny-crew.js";
 
 function setup(opts?: { defaultTimeoutMs?: number }) {
@@ -26,7 +29,10 @@ function setup(opts?: { defaultTimeoutMs?: number }) {
 
 // Run the session with a synchronous "echo worker": every agent.step.requested
 // gets answered with an agent.step.completed whose output mirrors the input.
-function runEcho(session: CrewSession, rootInput: unknown = "ROOT"): CrewEvent[] {
+function runEcho(
+  session: CrewSession,
+  rootInput: unknown = "ROOT",
+): CrewEvent[] {
   const log: CrewEvent[] = [];
   const queue: CrewEvent[] = session.start(rootInput);
 
@@ -56,10 +62,15 @@ describe("CrewSession.start", () => {
     const events = session.start("ROOT");
     expect(events[0].type).toBe("crew.started");
     expect(events[1].type).toBe("role.entered");
-    expect((events[1] as Extract<CrewEvent, { type: "role.entered" }>).roleId).toBe("caller");
+    expect(
+      (events[1] as Extract<CrewEvent, { type: "role.entered" }>).roleId,
+    ).toBe("caller");
     expect(events[2].type).toBe("agent.step.requested");
 
-    const req = events[2] as Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const req = events[2] as Extract<
+      CrewEvent,
+      { type: "agent.step.requested" }
+    >;
     expect(req.agentId).toBe("caller-1");
     expect(req.input).toBe("ROOT");
 
@@ -70,7 +81,10 @@ describe("CrewSession.start", () => {
   it("agent.step.requested carries a self-contained role snapshot", () => {
     const { session } = setup();
     const events = session.start("ROOT");
-    const req = events[2] as Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const req = events[2] as Extract<
+      CrewEvent,
+      { type: "agent.step.requested" }
+    >;
     expect(req.role).toEqual({
       name: "caller",
       capabilities: { thinking_allowed: false },
@@ -99,8 +113,12 @@ describe("CrewSession.deliver", () => {
       .map((e) => (e as Extract<CrewEvent, { type: "role.entered" }>).roleId);
     expect(roleEnters).toEqual(["caller", "merc", "specialist", "caller"]);
 
-    expect(log.filter((e) => e.type === "agent.step.requested")).toHaveLength(7);
-    expect(log.filter((e) => e.type === "agent.step.completed")).toHaveLength(7);
+    expect(log.filter((e) => e.type === "agent.step.requested")).toHaveLength(
+      7,
+    );
+    expect(log.filter((e) => e.type === "agent.step.completed")).toHaveLength(
+      7,
+    );
     expect(log.filter((e) => e.type === "vote.resolved")).toHaveLength(4);
     expect(log[log.length - 1].type).toBe("crew.completed");
 
@@ -110,8 +128,9 @@ describe("CrewSession.deliver", () => {
   it("parallel mercs all emit requests; machine waits for all to resolve", () => {
     const { session } = setup();
     const initial = session.start("ROOT");
-    const callerReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const callerReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
 
     const phase2 = session.deliver({
       type: "agent.step.completed",
@@ -120,8 +139,9 @@ describe("CrewSession.deliver", () => {
       ts: 1000,
     });
 
-    const mercReqs = phase2.filter((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>[];
+    const mercReqs = phase2.filter(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>[];
     expect(mercReqs).toHaveLength(4);
     expect(session.pendingRequests()).toHaveLength(4);
 
@@ -150,7 +170,8 @@ describe("CrewSession.deliver", () => {
       after.some(
         (e) =>
           e.type === "role.entered" &&
-          (e as Extract<CrewEvent, { type: "role.entered" }>).roleId === "specialist",
+          (e as Extract<CrewEvent, { type: "role.entered" }>).roleId ===
+            "specialist",
       ),
     ).toBe(true);
   });
@@ -160,8 +181,9 @@ describe("CrewSession.deliver", () => {
     const log: CrewEvent[] = session.start("ROOT");
 
     // resolve caller phase
-    const callerReq = log.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const callerReq = log.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     log.push(
       ...session.deliver({
         type: "agent.step.completed",
@@ -174,7 +196,8 @@ describe("CrewSession.deliver", () => {
     const mercReqs = log.filter(
       (e) =>
         e.type === "agent.step.requested" &&
-        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).roleId === "merc",
+        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).roleId ===
+          "merc",
     ) as Extract<CrewEvent, { type: "agent.step.requested" }>[];
 
     // Deliver in REVERSE order: 4, 3, 2, 1
@@ -204,8 +227,9 @@ describe("CrewSession.deliver", () => {
     const { session } = setup();
     const log: CrewEvent[] = session.start("ROOT");
 
-    const callerReq = log.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const callerReq = log.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     log.push(
       ...session.deliver({
         type: "agent.step.completed",
@@ -218,7 +242,8 @@ describe("CrewSession.deliver", () => {
     const mercReqs = log.filter(
       (e) =>
         e.type === "agent.step.requested" &&
-        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).roleId === "merc",
+        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).roleId ===
+          "merc",
     ) as Extract<CrewEvent, { type: "agent.step.requested" }>[];
 
     // merc-1 faults — should emit fixer.invoked + agent.step.requested for fixer-1
@@ -234,7 +259,8 @@ describe("CrewSession.deliver", () => {
     const fixerReq = burst.find(
       (e) =>
         e.type === "agent.step.requested" &&
-        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).agentId === "fixer-1",
+        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).agentId ===
+          "fixer-1",
     ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     expect(fixerReq).toBeDefined();
 
@@ -271,8 +297,9 @@ describe("CrewSession.deliver", () => {
   it("duplicate terminal deliver is a no-op (returns [])", () => {
     const { session } = setup();
     const initial = session.start("ROOT");
-    const callerReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const callerReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
 
     const first = session.deliver({
       type: "agent.step.completed",
@@ -294,8 +321,9 @@ describe("CrewSession.deliver", () => {
   it("agent.stream.chunk passes through without advancing state", () => {
     const { session } = setup();
     const initial = session.start("ROOT");
-    const callerReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const callerReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
 
     const result = session.deliver({
       type: "agent.stream.chunk",
@@ -391,8 +419,9 @@ describe("CrewSession.cancel", () => {
   it("subsequent deliver after cancel is a no-op", () => {
     const { session } = setup();
     const initial = session.start("ROOT");
-    const callerReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const callerReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
 
     session.cancel("cancelled");
     expect(
@@ -429,8 +458,9 @@ describe("Fixer activation", () => {
   it("fault triggers fixer when activation.on_fault is set", () => {
     const { session } = setup();
     const initial = session.start("ROOT");
-    const callerReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const callerReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
 
     // caller faults — DEFAULT_CREW fixer has on_fault: true
     const burst = session.deliver({
@@ -441,19 +471,24 @@ describe("Fixer activation", () => {
       ts: 1000,
     });
 
-    const fixerInvoked = burst.find((e) => e.type === "fixer.invoked") as
-      Extract<CrewEvent, { type: "fixer.invoked" }>;
+    const fixerInvoked = burst.find(
+      (e) => e.type === "fixer.invoked",
+    ) as Extract<CrewEvent, { type: "fixer.invoked" }>;
     expect(fixerInvoked).toBeDefined();
     expect(fixerInvoked.reason).toBe("fault");
 
     const fixerReq = burst.find(
       (e) =>
         e.type === "agent.step.requested" &&
-        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).agentId === "fixer-1",
+        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).agentId ===
+          "fixer-1",
     ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     expect(fixerReq).toBeDefined();
     // Fixer's input describes the failure
-    const fixerInput = fixerReq.input as { reason: string; failedAgentId: string };
+    const fixerInput = fixerReq.input as {
+      reason: string;
+      failedAgentId: string;
+    };
     expect(fixerInput.reason).toBe("fault");
     expect(fixerInput.failedAgentId).toBe("caller-1");
   });
@@ -469,8 +504,9 @@ describe("Fixer activation", () => {
     });
 
     const initial = tinySession.start("ROOT");
-    const alphaReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const alphaReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     const burst = tinySession.deliver({
       type: "agent.step.completed",
       correlationId: alphaReq.correlationId,
@@ -493,8 +529,9 @@ describe("Fixer activation", () => {
   it("stall triggers fixer when activation.on_stall is set", () => {
     const { session } = setup();
     const initial = session.start("ROOT");
-    const callerReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const callerReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     const burst = session.deliver({
       type: "agent.step.completed",
       correlationId: callerReq.correlationId,
@@ -502,8 +539,9 @@ describe("Fixer activation", () => {
       stalled: true,
       ts: 1000,
     });
-    const fixerInvoked = burst.find((e) => e.type === "fixer.invoked") as
-      Extract<CrewEvent, { type: "fixer.invoked" }>;
+    const fixerInvoked = burst.find(
+      (e) => e.type === "fixer.invoked",
+    ) as Extract<CrewEvent, { type: "fixer.invoked" }>;
     expect(fixerInvoked).toBeDefined();
     expect(fixerInvoked.reason).toBe("stall");
   });
@@ -520,8 +558,9 @@ describe("Fixer activation", () => {
   it("does not recursively invoke fixer when fixer itself faults", () => {
     const { session } = setup();
     const initial = session.start("ROOT");
-    const callerReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const callerReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     const burst1 = session.deliver({
       type: "agent.step.completed",
       correlationId: callerReq.correlationId,
@@ -532,7 +571,8 @@ describe("Fixer activation", () => {
     const fixerReq = burst1.find(
       (e) =>
         e.type === "agent.step.requested" &&
-        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).agentId === "fixer-1",
+        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).agentId ===
+          "fixer-1",
     ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
 
     // Fixer also faults
@@ -671,8 +711,9 @@ describe("Hooks", () => {
     });
 
     const initial = sess.start("ROOT");
-    const alphaReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const alphaReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     const burst = sess.deliver({
       type: "agent.step.completed",
       correlationId: alphaReq.correlationId,
@@ -680,8 +721,10 @@ describe("Hooks", () => {
       ts: 0,
     });
 
-    const ckpt = burst.find((e) => e.type === "checkpoint.taken") as
-      Extract<CrewEvent, { type: "checkpoint.taken" }>;
+    const ckpt = burst.find((e) => e.type === "checkpoint.taken") as Extract<
+      CrewEvent,
+      { type: "checkpoint.taken" }
+    >;
     expect(ckpt).toBeDefined();
     expect(ckpt.checkpointId).toBe("phase-end");
   });

@@ -81,8 +81,12 @@ function applyResumePolicy(
         roleId: d.request.roleId,
         input: d.input,
         role: d.roleSnapshot,
-        ...(d.memexContext !== undefined ? { memex_context: d.memexContext } : {}),
-        ...(d.request.timeoutMs !== undefined ? { timeoutMs: d.request.timeoutMs } : {}),
+        ...(d.memexContext !== undefined
+          ? { memex_context: d.memexContext }
+          : {}),
+        ...(d.request.timeoutMs !== undefined
+          ? { timeoutMs: d.request.timeoutMs }
+          : {}),
         ts: opts.clock.now(),
       });
     }

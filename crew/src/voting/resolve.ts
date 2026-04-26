@@ -22,7 +22,10 @@ export type VotingConfig =
 
 // resolveVotes is called with entries already in deterministic order
 // (by graph.agents declaration order) so tie-breaking is stable across runs.
-export function resolveVotes(votes: VoteEntry[], config: VotingConfig): unknown {
+export function resolveVotes(
+  votes: VoteEntry[],
+  config: VotingConfig,
+): unknown {
   const cfg =
     typeof config === "string"
       ? { mode: config, weight_function: "equal", threshold: 0.66 }

@@ -8,7 +8,10 @@ import { frozenClock } from "../src/runtime/clock.js";
 import { canonicalize } from "../src/events/canonical.js";
 import type { CrewEvent } from "../src/events/types.js";
 import type { CrewSession } from "../src/session/types.js";
-import { DEFAULT_CREW_SHAPE, DEFAULT_CREW_AGENTS } from "./fixtures/default-crew.js";
+import {
+  DEFAULT_CREW_SHAPE,
+  DEFAULT_CREW_AGENTS,
+} from "./fixtures/default-crew.js";
 import { TINY_CREW_SHAPE, TINY_CREW_AGENTS } from "./fixtures/tiny-crew.js";
 
 function freshSession(): CrewSession {
@@ -105,7 +108,6 @@ describe("Replay determinism", () => {
       canonicalize(outboundOnly(inOrder)),
     );
   });
-
 });
 
 describe("ResumePolicy", () => {
@@ -143,8 +145,9 @@ describe("ResumePolicy", () => {
       clock: frozenClock(0),
     });
     const initial = session.start("ROOT");
-    const alphaReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const alphaReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     const snap = session.snapshot();
 
     const { events } = resumeCrewSession(snap, [], {
@@ -212,8 +215,9 @@ describe("ResumePolicy", () => {
       memex: adapter,
     });
     const initial = session.start("ROOT");
-    const alphaReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const alphaReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     expect(alphaReq.memex_context).toBeDefined();
 
     const snap = session.snapshot();
@@ -224,13 +228,15 @@ describe("ResumePolicy", () => {
       memex: adapter,
       resumePolicy: "re-emit-request",
     });
-    const reEmitted = events.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const reEmitted = events.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     expect(reEmitted.memex_context).toEqual(alphaReq.memex_context);
   });
 
   it("'re-emit-request' works for nested-crew pendings (inner role not in outer graph)", async () => {
-    const { createCrewSession: createCrewSessionFn } = await import("../src/session/machine.js");
+    const { createCrewSession: createCrewSessionFn } =
+      await import("../src/session/machine.js");
     const PARENT = {
       schema_version: "1.0",
       name: "PARENT",
@@ -298,8 +304,9 @@ describe("ResumePolicy", () => {
       clock: frozenClock(0),
     });
     const initial = session.start("ROOT");
-    const hostReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const hostReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     session.deliver({
       type: "agent.step.completed",
       correlationId: hostReq.correlationId,
@@ -321,7 +328,8 @@ describe("ResumePolicy", () => {
     const reEmitted = events.find(
       (e) =>
         e.type === "agent.step.requested" &&
-        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).roleId === "alpha",
+        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).roleId ===
+          "alpha",
     ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     expect(reEmitted).toBeDefined();
     expect(reEmitted.role.name).toBe("alpha");
@@ -347,6 +355,8 @@ describe("ResumePolicy", () => {
     expect(events.some((e) => e.type === "vote.resolved")).toBe(true);
     expect(events.some((e) => e.type === "role.entered")).toBe(true);
     expect(resumed.status()).toBe("awaiting_responses");
-    expect(resumed.pendingRequests().every((r) => r.roleId === "beta")).toBe(true);
+    expect(resumed.pendingRequests().every((r) => r.roleId === "beta")).toBe(
+      true,
+    );
   });
 });

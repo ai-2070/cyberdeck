@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { resolveVotes, NotImplementedError, type VoteEntry } from "../src/voting/resolve.js";
+import {
+  resolveVotes,
+  NotImplementedError,
+  type VoteEntry,
+} from "../src/voting/resolve.js";
 
 describe("resolveVotes", () => {
   describe("first_valid", () => {
@@ -56,7 +60,10 @@ describe("resolveVotes", () => {
         { agentId: "a-2", output: { b: 2, a: 1 } },
         { agentId: "a-3", output: { a: 1, b: 9 } },
       ];
-      const resolved = resolveVotes(votes, "majority") as { a: number; b: number };
+      const resolved = resolveVotes(votes, "majority") as {
+        a: number;
+        b: number;
+      };
       expect(resolved.a).toBe(1);
       expect(resolved.b).toBe(2);
     });
@@ -228,8 +235,9 @@ describe("resolveVotes", () => {
 
   describe("not implemented modes", () => {
     it("best_of_n throws NotImplementedError", () => {
-      expect(() => resolveVotes([{ agentId: "a", output: "x" }], "best_of_n"))
-        .toThrow(NotImplementedError);
+      expect(() =>
+        resolveVotes([{ agentId: "a", output: "x" }], "best_of_n"),
+      ).toThrow(NotImplementedError);
     });
   });
 });

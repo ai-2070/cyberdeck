@@ -44,7 +44,9 @@ export interface HookRegistry {
   get(name: string): HookFn | undefined;
 }
 
-export function createHookRegistry(hooks: Record<string, HookFn>): HookRegistry {
+export function createHookRegistry(
+  hooks: Record<string, HookFn>,
+): HookRegistry {
   return {
     get: (name) => {
       // Refuse prototype-chain lookups (e.g. "__proto__", "constructor") and

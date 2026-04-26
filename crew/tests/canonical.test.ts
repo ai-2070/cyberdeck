@@ -58,7 +58,7 @@ describe("canonicalize", () => {
 
     const arr = new Array(3); // length 3, all holes
     arr[1] = "x";
-    expect(canonicalize(arr)).toBe("[null,\"x\",null]");
+    expect(canonicalize(arr)).toBe('[null,"x",null]');
   });
 
   it("skips undefined values in objects but converts undefined in arrays to null", () => {
@@ -134,7 +134,12 @@ describe("hashHex / correlationId", () => {
   });
 
   it("correlationId differs across distinct (crew, role, agent, attempt) tuples", () => {
-    const base = { crewId: "c1", roleId: "merc", agentId: "merc-1", attempt: 1 };
+    const base = {
+      crewId: "c1",
+      roleId: "merc",
+      agentId: "merc-1",
+      attempt: 1,
+    };
     const seen = new Set<string>();
     seen.add(correlationId(base));
     seen.add(correlationId({ ...base, crewId: "c2" }));

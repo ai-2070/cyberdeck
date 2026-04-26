@@ -56,7 +56,10 @@ function runEchoUntil(
   return { log, remaining: queue };
 }
 
-function runEcho(session: CrewSession, rootInput: unknown = "ROOT"): CrewEvent[] {
+function runEcho(
+  session: CrewSession,
+  rootInput: unknown = "ROOT",
+): CrewEvent[] {
   const log: CrewEvent[] = [];
   const queue: CrewEvent[] = session.start(rootInput);
   while (queue.length > 0) {
@@ -157,8 +160,9 @@ describe("CheckpointStore", () => {
     });
 
     const initial = session.start("ROOT");
-    const alphaReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const alphaReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     const burst = session.deliver({
       type: "agent.step.completed",
       correlationId: alphaReq.correlationId,
@@ -169,7 +173,10 @@ describe("CheckpointStore", () => {
     const checkpoints = burst.filter(
       (e) => e.type === "checkpoint.taken",
     ) as Extract<CrewEvent, { type: "checkpoint.taken" }>[];
-    expect(checkpoints.map((c) => c.checkpointId)).toEqual(["sync-1", "sync-2"]);
+    expect(checkpoints.map((c) => c.checkpointId)).toEqual([
+      "sync-1",
+      "sync-2",
+    ]);
   });
 
   it("checkpoint.taken event is emitted when crewControl.checkpoint(id) is called", () => {
@@ -192,16 +199,19 @@ describe("CheckpointStore", () => {
     });
 
     const initial = session.start("ROOT");
-    const alphaReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const alphaReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     const burst = session.deliver({
       type: "agent.step.completed",
       correlationId: alphaReq.correlationId,
       output: "ok",
       ts: 0,
     });
-    const ckpt = burst.find((e) => e.type === "checkpoint.taken") as
-      Extract<CrewEvent, { type: "checkpoint.taken" }>;
+    const ckpt = burst.find((e) => e.type === "checkpoint.taken") as Extract<
+      CrewEvent,
+      { type: "checkpoint.taken" }
+    >;
     expect(ckpt).toBeDefined();
     expect(ckpt.checkpointId).toBe("phase-end");
   });
@@ -225,7 +235,9 @@ describe("Snapshot + resume round-trip", () => {
     });
     expect(sessB.status()).toBe("completed");
     expect(laterB).toEqual([]); // nothing more to emit
-    expect(sessB.snapshot().currentInput).toEqual(sessA.snapshot().currentInput);
+    expect(sessB.snapshot().currentInput).toEqual(
+      sessA.snapshot().currentInput,
+    );
   });
 
   it("snapshot mid-phase + drive resumed session forward = same final state as fresh run", () => {
@@ -238,8 +250,9 @@ describe("Snapshot + resume round-trip", () => {
     // Run B: stop after delivering 1 completion (alpha-1 done, betas now pending)
     const sessB = newSession(graph);
     const initial = sessB.start("ROOT");
-    const alphaReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const alphaReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     sessB.deliver({
       type: "agent.step.completed",
       correlationId: alphaReq.correlationId,
@@ -249,12 +262,16 @@ describe("Snapshot + resume round-trip", () => {
     const snap = sessB.snapshot();
 
     // Resume with re-emit-request (so resume doesn't throw on the pending betas).
-    const { session: sessC, events: resumeEvents } = resumeCrewSession(snap, [], {
-      crewId: "ckpt-test",
-      graph,
-      clock: frozenClock(0),
-      resumePolicy: "re-emit-request",
-    });
+    const { session: sessC, events: resumeEvents } = resumeCrewSession(
+      snap,
+      [],
+      {
+        crewId: "ckpt-test",
+        graph,
+        clock: frozenClock(0),
+        resumePolicy: "re-emit-request",
+      },
+    );
 
     // The re-emitted requests are the betas — echo them
     const echoQueue: CrewEvent[] = resumeEvents
@@ -309,8 +326,9 @@ describe("Snapshot + resume round-trip", () => {
     const sessA = newSession(graph);
 
     const initial = sessA.start("ROOT");
-    const alphaReq = initial.find((e) => e.type === "agent.step.requested") as
-      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const alphaReq = initial.find(
+      (e) => e.type === "agent.step.requested",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
     sessA.deliver({
       type: "agent.step.completed",
       correlationId: alphaReq.correlationId,
@@ -321,7 +339,9 @@ describe("Snapshot + resume round-trip", () => {
     // Now in beta phase. Snapshot.
     const snap = sessA.snapshot();
     expect(snap.phaseIndex).toBe(1); // beta phase
-    expect(canonicalize(snap.currentInput)).toBe(canonicalize({ processed: true }));
+    expect(canonicalize(snap.currentInput)).toBe(
+      canonicalize({ processed: true }),
+    );
 
     // Resume in a parallel universe (use re-emit so the unresolved betas don't abort).
     const { session: sessB } = resumeCrewSession(snap, [], {
@@ -331,9 +351,11 @@ describe("Snapshot + resume round-trip", () => {
       resumePolicy: "re-emit-request",
     });
     expect(sessB.status()).toBe("awaiting_responses");
-    expect(sessB.pendingRequests().map((r) => r.agentId).sort()).toEqual([
-      "beta-1",
-      "beta-2",
-    ]);
+    expect(
+      sessB
+        .pendingRequests()
+        .map((r) => r.agentId)
+        .sort(),
+    ).toEqual(["beta-1", "beta-2"]);
   });
 });

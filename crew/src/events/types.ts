@@ -139,7 +139,7 @@ export type CrewEvent =
       type: "agent.step.completed";
       correlationId: string;
       output: unknown;
-      memex_commands?: MemoryCommand[];   // Phase 4: worker-emitted memex writes
+      memex_commands?: MemoryCommand[]; // Phase 4: worker-emitted memex writes
       fault?: boolean;
       stalled?: boolean;
       ts: number;

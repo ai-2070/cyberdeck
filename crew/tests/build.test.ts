@@ -2,7 +2,10 @@ import { describe, it, expect } from "vitest";
 import { CrewShapeSchema } from "../src/schema/shape.js";
 import { CrewAgentsSchema } from "../src/schema/agents.js";
 import { buildCrewGraph, lintCrewShape } from "../src/graph/build.js";
-import { DEFAULT_CREW_SHAPE, DEFAULT_CREW_AGENTS } from "./fixtures/default-crew.js";
+import {
+  DEFAULT_CREW_SHAPE,
+  DEFAULT_CREW_AGENTS,
+} from "./fixtures/default-crew.js";
 
 describe("buildCrewGraph", () => {
   it("builds a graph with the right agent counts from DEFAULT_CREW", () => {
@@ -130,7 +133,9 @@ describe("lintCrewShape", () => {
       ),
     });
     const lint = lintCrewShape(shape);
-    expect(lint.errors.some((e) => e.code === "missing_first_input")).toBe(true);
+    expect(lint.errors.some((e) => e.code === "missing_first_input")).toBe(
+      true,
+    );
   });
 
   it("errors when more than one role has first_input", () => {
@@ -141,7 +146,9 @@ describe("lintCrewShape", () => {
       ),
     });
     const lint = lintCrewShape(shape);
-    expect(lint.errors.some((e) => e.code === "multiple_first_input")).toBe(true);
+    expect(lint.errors.some((e) => e.code === "multiple_first_input")).toBe(
+      true,
+    );
   });
 
   it("errors when no role has final_output", () => {
@@ -152,7 +159,9 @@ describe("lintCrewShape", () => {
       ),
     });
     const lint = lintCrewShape(shape);
-    expect(lint.errors.some((e) => e.code === "missing_final_output")).toBe(true);
+    expect(lint.errors.some((e) => e.code === "missing_final_output")).toBe(
+      true,
+    );
   });
 
   it("errors when more than one role has final_output", () => {
@@ -163,7 +172,9 @@ describe("lintCrewShape", () => {
       ),
     });
     const lint = lintCrewShape(shape);
-    expect(lint.errors.some((e) => e.code === "multiple_final_output")).toBe(true);
+    expect(lint.errors.some((e) => e.code === "multiple_final_output")).toBe(
+      true,
+    );
   });
 
   it("errors when a permission references an unknown role", () => {
@@ -176,7 +187,9 @@ describe("lintCrewShape", () => {
       ),
     });
     const lint = lintCrewShape(shape);
-    expect(lint.errors.some((e) => e.code === "unknown_role_reference")).toBe(true);
+    expect(lint.errors.some((e) => e.code === "unknown_role_reference")).toBe(
+      true,
+    );
   });
 
   it("errors when invite references an unknown role (string form)", () => {
@@ -189,7 +202,9 @@ describe("lintCrewShape", () => {
       ),
     });
     const lint = lintCrewShape(shape);
-    expect(lint.errors.some((e) => e.code === "unknown_role_reference")).toBe(true);
+    expect(lint.errors.some((e) => e.code === "unknown_role_reference")).toBe(
+      true,
+    );
   });
 
   it("errors when invite references an unknown role (object form)", () => {
@@ -208,7 +223,9 @@ describe("lintCrewShape", () => {
       ),
     });
     const lint = lintCrewShape(shape);
-    expect(lint.errors.some((e) => e.code === "unknown_role_reference")).toBe(true);
+    expect(lint.errors.some((e) => e.code === "unknown_role_reference")).toBe(
+      true,
+    );
   });
 
   it("errors when a role escalates to itself", () => {
@@ -216,7 +233,10 @@ describe("lintCrewShape", () => {
       ...DEFAULT_CREW_SHAPE,
       roles: DEFAULT_CREW_SHAPE.roles.map((r) =>
         r.role === "specialist"
-          ? { ...r, permissions: { ...r.permissions, escalate_to: ["specialist"] } }
+          ? {
+              ...r,
+              permissions: { ...r.permissions, escalate_to: ["specialist"] },
+            }
           : r,
       ),
     });
@@ -240,7 +260,9 @@ describe("lintCrewShape", () => {
       ),
     });
     const lint = lintCrewShape(shape);
-    expect(lint.warnings.some((w) => w.code === "delegate_without_talk")).toBe(true);
+    expect(lint.warnings.some((w) => w.code === "delegate_without_talk")).toBe(
+      true,
+    );
   });
 
   it("DEFAULT_CREW produces no warnings either", () => {
@@ -254,12 +276,23 @@ describe("lintCrewShape", () => {
       ...DEFAULT_CREW_SHAPE,
       roles: DEFAULT_CREW_SHAPE.roles.map((r) =>
         r.role === "merc"
-          ? { ...r, execution: { voting: { mode: "best_of_n", weight_function: "equal", threshold: 0.5 } } }
+          ? {
+              ...r,
+              execution: {
+                voting: {
+                  mode: "best_of_n",
+                  weight_function: "equal",
+                  threshold: 0.5,
+                },
+              },
+            }
           : r,
       ),
     });
     const lint = lintCrewShape(shape);
-    expect(lint.errors.some((e) => e.code === "unsupported_voting_mode")).toBe(true);
+    expect(lint.errors.some((e) => e.code === "unsupported_voting_mode")).toBe(
+      true,
+    );
   });
 
   it("errors on unsupported weight_function for weighted_consensus", () => {
@@ -281,7 +314,9 @@ describe("lintCrewShape", () => {
       ),
     });
     const lint = lintCrewShape(shape);
-    expect(lint.errors.some((e) => e.code === "unsupported_weight_function")).toBe(true);
+    expect(
+      lint.errors.some((e) => e.code === "unsupported_weight_function"),
+    ).toBe(true);
   });
 });
 
@@ -293,7 +328,12 @@ describe("buildCrewGraph — cycle detection", () => {
       roles: [
         {
           role: "only",
-          permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] },
+          permissions: {
+            talk_to: [],
+            delegate_to: [],
+            escalate_to: [],
+            invite: [],
+          },
           first_input: true,
           final_output: true,
           nested_crew: "SELF",
@@ -318,7 +358,12 @@ describe("buildCrewGraph — cycle detection", () => {
       roles: [
         {
           role: "x",
-          permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] },
+          permissions: {
+            talk_to: [],
+            delegate_to: [],
+            escalate_to: [],
+            invite: [],
+          },
           first_input: true,
           final_output: true,
           nested_crew: "B",
@@ -332,7 +377,12 @@ describe("buildCrewGraph — cycle detection", () => {
       roles: [
         {
           role: "y",
-          permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] },
+          permissions: {
+            talk_to: [],
+            delegate_to: [],
+            escalate_to: [],
+            invite: [],
+          },
           first_input: true,
           final_output: true,
           nested_crew: "A",
@@ -345,6 +395,8 @@ describe("buildCrewGraph — cycle detection", () => {
       name: "A",
       agents: [{ role: "x", amount: 1 }],
     });
-    expect(() => buildCrewGraph(A, counts, { A, B })).toThrow(/Cyclic nested crew/i);
+    expect(() => buildCrewGraph(A, counts, { A, B })).toThrow(
+      /Cyclic nested crew/i,
+    );
   });
 });

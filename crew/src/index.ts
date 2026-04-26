@@ -30,7 +30,13 @@ export type { LifecycleHooks } from "./schema/hooks.js";
 export { buildCrewGraph, lintCrewShape } from "./graph/build.js";
 export type { LintIssue, LintResult } from "./graph/build.js";
 
-export type { CrewGraph, CrewRole, CrewAgent, RoleId, AgentId } from "./graph/types.js";
+export type {
+  CrewGraph,
+  CrewRole,
+  CrewAgent,
+  RoleId,
+  AgentId,
+} from "./graph/types.js";
 
 export type {
   CrewEvent,
@@ -97,7 +103,4 @@ export type {
 
 export { checkPermission } from "./session/permissions.js";
 
-export type {
-  ActionRequest,
-  RequestActionResult,
-} from "./session/types.js";
+export type { ActionRequest, RequestActionResult } from "./session/types.js";
