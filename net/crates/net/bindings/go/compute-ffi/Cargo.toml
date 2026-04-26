@@ -30,7 +30,19 @@ test-helpers = []
 # `bindings/go/net` (via the `net_mesh` FFI), and because daemons
 # reach into `adapter::net::compute::MeshDaemon` / `CausalEvent`
 # types at the bridge layer.
-net = { path = "../../..", features = ["net"] }
+#
+# The feature list MUST match what the standalone `libnet.dylib`
+# build enables (see `bindings/go/README.md` — `cargo build --release
+# --features "netdb redex-disk"`). Both cdylibs (`libnet.dylib` and
+# `libnet_compute.dylib`) export the same `#[no_mangle]` FFI symbols
+# from `net::ffi`; the Go test binary's link order resolves them to
+# `libnet_compute.dylib`'s copy. If the two crates compile `net` with
+# different features, cfg-gated fields on shared types (`CapabilitySet`,
+# `MeshNode`, etc) shift offsets and the announce/find paths read
+# through the wrong layout — a subtle UB that surfaces as garbage in
+# the GPU vendor field on `find_nodes`. Keep these in sync with the
+# Go binding's documented build command.
+net = { path = "../../..", features = ["net", "netdb", "redex-disk"] }
 # SDK compute surface — `DaemonRuntime`, `DaemonHandle`,
 # `MigrationHandle`, `StateSnapshot`. The Go FFI delegates to this
 # layer so all three language bindings stay behavior-aligned.
