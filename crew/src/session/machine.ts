@@ -57,6 +57,7 @@ interface InnerHandle {
   outerRoleId: RoleId;
   innerSession: CrewSession;
   innerCids: Set<string>;                      // cids the inner session is currently waiting on
+  innerAdapter?: MemexAdapter;                 // present when isolation === "hard"
 }
 
 type HookCtxPartial = Pick<HookContext, "role"> &
@@ -69,6 +70,7 @@ class CrewSessionImpl implements CrewSession {
   private readonly hooks?: HookRegistry;
   private readonly memex?: MemexAdapter;
   private readonly defaultTimeoutMs?: number;
+  private readonly autoCheckpoint?: "phase";
   private readonly phaseOrder: RoleId[];
 
   private status_: CrewStatus = "idle";
@@ -86,6 +88,7 @@ class CrewSessionImpl implements CrewSession {
     this.hooks = opts.hooks;
     this.memex = opts.memex;
     this.defaultTimeoutMs = opts.defaultTimeoutMs;
+    this.autoCheckpoint = opts.autoCheckpoint;
     this.phaseOrder = computePhaseOrder(opts.graph);
   }
 
@@ -191,6 +194,7 @@ class CrewSessionImpl implements CrewSession {
         hooks: this.hooks,
         memex: this.memex,
         defaultTimeoutMs: this.defaultTimeoutMs,
+        autoCheckpoint: this.autoCheckpoint,
       });
       const handle: InnerHandle = {
         outerAgentId: nh.outerAgentId,
@@ -545,13 +549,23 @@ class CrewSessionImpl implements CrewSession {
       ts: this.clock.now(),
     });
 
+    const innerCrewId = `${this.crewId}/${agent.id}#${attempt}`;
+    const isolation = role.execution?.memex?.isolation ?? "soft";
+    let innerAdapter: MemexAdapter | undefined;
+    let memexForInner: MemexAdapter | undefined = this.memex;
+    if (isolation === "hard" && this.memex) {
+      innerAdapter = this.memex.fork(innerCrewId);
+      memexForInner = innerAdapter;
+    }
+
     const innerSession = createCrewSession({
-      crewId: `${this.crewId}/${agent.id}#${attempt}`,
+      crewId: innerCrewId,
       graph: agent.nestedCrew!,
       clock: this.clock,
       hooks: this.hooks,
-      memex: this.memex,                  // soft isolation: share parent's adapter
+      memex: memexForInner,
       defaultTimeoutMs: this.defaultTimeoutMs,
+      autoCheckpoint: this.autoCheckpoint,
     });
 
     const handle: InnerHandle = {
@@ -559,6 +573,7 @@ class CrewSessionImpl implements CrewSession {
       outerRoleId: role.role,
       innerSession,
       innerCids: new Set(),
+      ...(innerAdapter !== undefined ? { innerAdapter } : {}),
     };
     this.innerByOuter.set(agent.id, handle);
     phase.nestedPending.add(agent.id);
@@ -607,6 +622,14 @@ class CrewSessionImpl implements CrewSession {
     }
     handle.innerCids.clear();
     this.innerByOuter.delete(handle.outerAgentId);
+
+    // Hard isolation: import everything the inner adapter accumulated into
+    // parent's adapter. Skips items that already exist in parent (default
+    // importSlice behavior is append-only).
+    if (handle.innerAdapter && this.memex && !aborted) {
+      const slice = handle.innerAdapter.exportAll();
+      this.memex.importSlice(slice);
+    }
 
     const phase = this.currentPhase;
     if (!phase) return;
@@ -687,7 +710,8 @@ class CrewSessionImpl implements CrewSession {
     if (!phase) return;
 
     const role = this.graph.roles.get(phase.roleId)!;
-    const mode = role.execution?.voting?.mode ?? "first_valid";
+    const cfg = role.execution?.voting;
+    const mode = cfg?.mode ?? "first_valid";
 
     const phaseAgents = this.graph.agents.filter((a) => a.role === phase.roleId);
     const ordered: VoteEntry[] = [];
@@ -695,7 +719,7 @@ class CrewSessionImpl implements CrewSession {
       const out = phase.outputs.get(a.id);
       if (out) ordered.push(out);
     }
-    const resolved = resolveVotes(ordered, mode);
+    const resolved = resolveVotes(ordered, cfg ?? mode);
 
     events.push({
       type: "vote.resolved",
@@ -706,6 +730,24 @@ class CrewSessionImpl implements CrewSession {
     });
 
     this.callHook(role.hooks?.after_role, "after_role", { role, output: resolved }, events);
+
+    // Declarative checkpoints: emit one event per declared name + fire on_checkpoint hook.
+    const declaredCheckpoints = role.execution?.checkpoints;
+    if (declaredCheckpoints) {
+      for (const cpId of declaredCheckpoints) {
+        events.push({ type: "checkpoint.taken", checkpointId: cpId, ts: this.clock.now() });
+        this.callHook(role.hooks?.on_checkpoint, "on_checkpoint", { role }, events);
+      }
+    }
+
+    // Auto-checkpoint at phase boundary.
+    if (this.autoCheckpoint === "phase") {
+      events.push({
+        type: "checkpoint.taken",
+        checkpointId: `phase:${phase.roleId}:${this.phaseIndex}`,
+        ts: this.clock.now(),
+      });
+    }
 
     this.currentInput = resolved;
     this.advanceToNextPhase(events);

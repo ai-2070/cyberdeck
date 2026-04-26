@@ -36,4 +36,11 @@ export interface MemexAdapter {
   exportSlice(opts: ExportOptions): MemexExport;
   importSlice(slice: MemexExport): ImportReport;
   snapshot(): GraphState;
+
+  // Hard-isolation helpers (used by nested crews with memex.isolation: "hard").
+  // `fork` produces a child adapter seeded with a deep copy of this adapter's
+  // memory state under a new crewId. `exportAll` returns every memory item in
+  // the adapter as a slice (so the parent can importSlice it on completion).
+  fork(crewId: string): MemexAdapter;
+  exportAll(): MemexExport;
 }

@@ -81,4 +81,8 @@ export interface CreateCrewSessionOpts {
   memex?: MemexAdapter;
   defaultTimeoutMs?: number;
   resumePolicy?: ResumePolicy;
+  // When set to "phase", the session emits a checkpoint.taken event after every
+  // vote.resolved with id `phase:{roleId}:{phaseIndex}`. The caller is expected
+  // to observe and persist via session.snapshot() if they want durable resume.
+  autoCheckpoint?: "phase";
 }

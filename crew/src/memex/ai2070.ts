@@ -1,10 +1,13 @@
 import {
   applyCommand,
+  cloneGraphState,
   createGraphState,
   createIntentState,
   createTaskState,
   exportSlice as memexExportSlice,
+  getIntents,
   getItems,
+  getTasks,
   importSlice as memexImportSlice,
   smartRetrieve,
 } from "@ai2070/memex";
@@ -82,6 +85,28 @@ export function createMemexAdapter(opts: CreateMemexAdapterOpts): MemexAdapter {
 
     snapshot() {
       return mem;
+    },
+
+    fork(newCrewId: string): MemexAdapter {
+      // Memory state is deep-cloned via memex's cloneGraphState. Intent and
+      // task states start empty in the fork — memex doesn't expose clone
+      // helpers for them yet, and the common case for hard-isolated nested
+      // crews is "I want my own scratch space for memories".
+      return createMemexAdapter({
+        crewId: newCrewId,
+        memState: cloneGraphState(mem),
+      });
+    },
+
+    exportAll(): MemexExport {
+      const memItems = getItems(mem);
+      const intents = getIntents(intent);
+      const tasks = getTasks(task);
+      return memexExportSlice(mem, intent, task, {
+        memory_ids: memItems.map((i) => i.id),
+        intent_ids: intents.map((i) => i.id),
+        task_ids: tasks.map((t) => t.id),
+      });
     },
   };
 }

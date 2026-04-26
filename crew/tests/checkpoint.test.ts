@@ -105,6 +105,73 @@ describe("CheckpointStore", () => {
     expect(store.get("a")).toBeUndefined();
   });
 
+  it("autoCheckpoint='phase' emits checkpoint.taken after every vote.resolved", () => {
+    const { graph } = tinySetup();
+    const session = createCrewSession({
+      crewId: "auto-ckpt",
+      graph,
+      clock: frozenClock(0),
+      autoCheckpoint: "phase",
+    });
+    const log: CrewEvent[] = [];
+    const queue: CrewEvent[] = session.start("ROOT");
+    while (queue.length > 0) {
+      const e = queue.shift()!;
+      log.push(e);
+      if (e.type === "agent.step.requested") {
+        queue.push(
+          ...session.deliver({
+            type: "agent.step.completed",
+            correlationId: e.correlationId,
+            output: "ok",
+            ts: 0,
+          }),
+        );
+      }
+    }
+    const checkpoints = log.filter(
+      (e) => e.type === "checkpoint.taken",
+    ) as Extract<CrewEvent, { type: "checkpoint.taken" }>[];
+    // 3 phases (alpha, beta, gamma) -> 3 phase checkpoints
+    expect(checkpoints).toHaveLength(3);
+    expect(checkpoints[0].checkpointId).toBe("phase:alpha:0");
+    expect(checkpoints[1].checkpointId).toBe("phase:beta:1");
+    expect(checkpoints[2].checkpointId).toBe("phase:gamma:2");
+  });
+
+  it("declarative role.execution.checkpoints emits one event per declared name", () => {
+    const shape = CrewShapeSchema.parse({
+      ...TINY_CREW_SHAPE,
+      roles: TINY_CREW_SHAPE.roles.map((r) =>
+        r.role === "alpha"
+          ? { ...r, execution: { checkpoints: ["sync-1", "sync-2"] } }
+          : r,
+      ),
+    });
+    const counts = CrewAgentsSchema.parse(TINY_CREW_AGENTS);
+    const graph = buildCrewGraph(shape, counts);
+    const session = createCrewSession({
+      crewId: "decl-ckpt",
+      graph,
+      clock: frozenClock(0),
+    });
+
+    const initial = session.start("ROOT");
+    const alphaReq = initial.find((e) => e.type === "agent.step.requested") as
+      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const burst = session.deliver({
+      type: "agent.step.completed",
+      correlationId: alphaReq.correlationId,
+      output: "ok",
+      ts: 0,
+    });
+
+    const checkpoints = burst.filter(
+      (e) => e.type === "checkpoint.taken",
+    ) as Extract<CrewEvent, { type: "checkpoint.taken" }>[];
+    expect(checkpoints.map((c) => c.checkpointId)).toEqual(["sync-1", "sync-2"]);
+  });
+
   it("checkpoint.taken event is emitted when crewControl.checkpoint(id) is called", () => {
     const hooks = createHookRegistry({
       ckpt: (ctx) => ctx.control.checkpoint("phase-end"),

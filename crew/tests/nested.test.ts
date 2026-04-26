@@ -1,8 +1,10 @@
 import { describe, it, expect } from "vitest";
+import { createMemoryItem, getItems } from "@ai2070/memex";
 import { CrewShapeSchema } from "../src/schema/shape.js";
 import { CrewAgentsSchema } from "../src/schema/agents.js";
 import { buildCrewGraph } from "../src/graph/build.js";
 import { createCrewSession } from "../src/session/machine.js";
+import { createMemexAdapter } from "../src/memex/ai2070.js";
 import { frozenClock } from "../src/runtime/clock.js";
 import type { CrewEvent } from "../src/events/types.js";
 import type { CrewSession } from "../src/session/types.js";
@@ -254,5 +256,111 @@ describe("Nested crews", () => {
     // The last crew.completed is the OUTER one — its crewId is "outer"
     const lastComplete = log[log.length - 1] as Extract<CrewEvent, { type: "crew.completed" }>;
     expect(lastComplete).toBeDefined();
+  });
+});
+
+describe("Nested crews — hard memex isolation", () => {
+  function setupHardIsolated() {
+    const parentShape = CrewShapeSchema.parse({
+      ...PARENT_SHAPE,
+      roles: PARENT_SHAPE.roles.map((r) =>
+        r.role === "worker"
+          ? { ...r, execution: { memex: { isolation: "hard" } } }
+          : r,
+      ),
+    });
+    const innerShape = CrewShapeSchema.parse(INNER_SHAPE);
+    const parentAgents = CrewAgentsSchema.parse(PARENT_AGENTS);
+    const graph = buildCrewGraph(parentShape, parentAgents, { INNER: innerShape });
+    const adapter = createMemexAdapter({ crewId: "outer-hard" });
+
+    // Pre-load a memory item in parent's adapter
+    adapter.apply(
+      {
+        type: "memory.create",
+        item: createMemoryItem({
+          kind: "observation",
+          content: { key: "parent-pre", value: "before-fork" },
+          author: "agent:host-1",
+          source_kind: "observed",
+          authority: 0.9,
+          importance: 0.5,
+        }),
+      },
+      { agentId: "host-1", crewId: "outer-hard", roleId: "host" },
+    );
+
+    const session = createCrewSession({
+      crewId: "outer-hard",
+      graph,
+      clock: frozenClock(0),
+      memex: adapter,
+    });
+    return { session, adapter };
+  }
+
+  it("inner adapter is forked from parent (inner sees parent's items at fork)", () => {
+    const { session, adapter } = setupHardIsolated();
+    const initial = session.start("ROOT");
+    const hostReq = initial.find((e) => e.type === "agent.step.requested") as
+      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    session.deliver({
+      type: "agent.step.completed",
+      correlationId: hostReq.correlationId,
+      output: "host-out",
+      ts: 0,
+    });
+
+    // Parent's adapter still has its pre-loaded item
+    expect(getItems(adapter.snapshot())).toHaveLength(1);
+  });
+
+  it("inner agent's memex_commands write to inner adapter only; on completion they merge into parent", () => {
+    const { session, adapter } = setupHardIsolated();
+    const log: CrewEvent[] = [];
+    const queue: CrewEvent[] = session.start("ROOT");
+
+    let innerWroteItem = false;
+    while (queue.length > 0) {
+      const e = queue.shift()!;
+      log.push(e);
+      if (e.type === "agent.step.requested") {
+        // Inner alpha-1 attaches a memex_commands write
+        const memex_commands =
+          e.agentId === "alpha-1" && !innerWroteItem
+            ? [
+                {
+                  type: "memory.create" as const,
+                  item: createMemoryItem({
+                    kind: "observation",
+                    content: { key: "inner-write", value: "written-inside" },
+                    author: "agent:alpha-1",
+                    source_kind: "observed",
+                    authority: 0.9,
+                    importance: 0.5,
+                  }),
+                },
+              ]
+            : undefined;
+        if (memex_commands) innerWroteItem = true;
+        queue.push(
+          ...session.deliver({
+            type: "agent.step.completed",
+            correlationId: e.correlationId,
+            output: "ok",
+            ...(memex_commands ? { memex_commands } : {}),
+            ts: 0,
+          }),
+        );
+      }
+    }
+
+    // After full run, parent's adapter should have BOTH the pre-loaded item
+    // (parent-pre) AND the inner-written item (inner-write), the latter
+    // imported from the inner adapter when the nested crew completed.
+    const items = getItems(adapter.snapshot());
+    expect(items).toHaveLength(2);
+    const keys = items.map((i) => (i.content as { key: string }).key).sort();
+    expect(keys).toEqual(["inner-write", "parent-pre"]);
   });
 });
