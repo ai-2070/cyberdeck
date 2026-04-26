@@ -47,6 +47,10 @@ export interface SerializedNestedHandle {
   outerRoleId: RoleId;
   innerCids: string[];
   innerSnapshot: CrewSnapshot;
+  // Set when the nested crew has memex.isolation: "hard" — captures the
+  // inner adapter's memory state so resume can rebuild it without
+  // downgrading to soft isolation. Opaque GraphState payload.
+  innerAdapterSnapshot?: unknown;
 }
 
 export interface CrewSnapshot {

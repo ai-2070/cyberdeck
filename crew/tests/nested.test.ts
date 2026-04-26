@@ -4,6 +4,7 @@ import { CrewShapeSchema } from "../src/schema/shape.js";
 import { CrewAgentsSchema } from "../src/schema/agents.js";
 import { buildCrewGraph } from "../src/graph/build.js";
 import { createCrewSession } from "../src/session/machine.js";
+import { resumeCrewSession } from "../src/session/resume.js";
 import { createMemexAdapter } from "../src/memex/ai2070.js";
 import { frozenClock } from "../src/runtime/clock.js";
 import type { CrewEvent } from "../src/events/types.js";
@@ -296,7 +297,7 @@ describe("Nested crews — hard memex isolation", () => {
       clock: frozenClock(0),
       memex: adapter,
     });
-    return { session, adapter };
+    return { session, adapter, graph };
   }
 
   it("inner adapter is forked from parent (inner sees parent's items at fork)", () => {
@@ -362,5 +363,120 @@ describe("Nested crews — hard memex isolation", () => {
     expect(items).toHaveLength(2);
     const keys = items.map((i) => (i.content as { key: string }).key).sort();
     expect(keys).toEqual(["inner-write", "parent-pre"]);
+  });
+
+  it("snapshot/resume preserves inner adapter state — inner writes don't leak to parent until completion, even across resume", () => {
+    const { session, adapter, graph } = setupHardIsolated();
+
+    // Drive: host completes
+    const initial = session.start("ROOT");
+    const hostReq = initial.find((e) => e.type === "agent.step.requested") as
+      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    const afterHost = session.deliver({
+      type: "agent.step.completed",
+      correlationId: hostReq.correlationId,
+      output: "host-out",
+      ts: 0,
+    });
+
+    // Inner alpha is now pending (and got memex_context from forked adapter
+    // including parent-pre). Worker writes item X via memex_commands.
+    const alphaReq = afterHost.find(
+      (e) =>
+        e.type === "agent.step.requested" &&
+        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).roleId === "alpha",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
+    session.deliver({
+      type: "agent.step.completed",
+      correlationId: alphaReq.correlationId,
+      output: "alpha-out",
+      memex_commands: [
+        {
+          type: "memory.create",
+          item: createMemoryItem({
+            kind: "observation",
+            content: { key: "X", value: "from-alpha" },
+            author: "agent:alpha-1",
+            source_kind: "observed",
+            authority: 0.9,
+            importance: 0.5,
+          }),
+        },
+      ],
+      ts: 0,
+    });
+
+    // Beta is now pending in the inner. SNAPSHOT here.
+    const snap = session.snapshot();
+
+    // Sanity: parent's adapter still has only parent-pre (X is in inner adapter).
+    const parentDuringNested = getItems(adapter.snapshot()).map(
+      (i) => (i.content as { key: string }).key,
+    );
+    expect(parentDuringNested).toEqual(["parent-pre"]);
+
+    // Resume from snapshot. The inner adapter should be rebuilt from
+    // innerAdapterSnapshot — NOT downgraded to soft (which would have inner
+    // writing directly to parent).
+    const { session: resumed, events: resumeEvents } = resumeCrewSession(snap, [], {
+      crewId: "outer-hard",
+      graph,
+      clock: frozenClock(0),
+      memex: adapter,
+      resumePolicy: "re-emit-request",
+    });
+
+    // Re-emitted beta request is in resumeEvents; deliver beta with another write (Y).
+    const betaReq = resumeEvents.find(
+      (e) =>
+        e.type === "agent.step.requested" &&
+        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).roleId === "beta",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
+    expect(betaReq).toBeDefined();
+
+    resumed.deliver({
+      type: "agent.step.completed",
+      correlationId: betaReq.correlationId,
+      output: "beta-out",
+      memex_commands: [
+        {
+          type: "memory.create",
+          item: createMemoryItem({
+            kind: "observation",
+            content: { key: "Y", value: "from-beta-after-resume" },
+            author: "agent:beta-1",
+            source_kind: "observed",
+            authority: 0.9,
+            importance: 0.5,
+          }),
+        },
+      ],
+      ts: 0,
+    });
+
+    // Inner crew.completed should have fired, triggering importSlice from the
+    // (rebuilt) inner adapter into parent. Outer is now in the final host phase.
+    // Drive the final host to completion.
+    let pending = resumed.pendingRequests();
+    while (pending.length > 0) {
+      for (const req of pending) {
+        resumed.deliver({
+          type: "agent.step.completed",
+          correlationId: req.correlationId,
+          output: "ok",
+          ts: 0,
+        });
+      }
+      pending = resumed.pendingRequests();
+    }
+
+    // Parent's adapter now has parent-pre + X + Y — proving:
+    //   1. X was preserved across snapshot/resume (it was in the rebuilt inner adapter).
+    //   2. Y was written to the rebuilt inner adapter, not directly to parent.
+    //   3. Both X and Y were imported into parent when the inner crew completed.
+    const finalKeys = getItems(adapter.snapshot())
+      .map((i) => (i.content as { key: string }).key)
+      .sort();
+    expect(finalKeys).toEqual(["X", "Y", "parent-pre"]);
   });
 });

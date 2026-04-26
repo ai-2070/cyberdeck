@@ -43,6 +43,9 @@ export type {
   GatedAction,
   AbortReason,
   AgentStepRequest,
+  MemoryCommand,
+  MemoryItemShape,
+  EdgeShape,
 } from "./events/types.js";
 export { isInboundEvent, isTerminalInbound } from "./events/types.js";
 

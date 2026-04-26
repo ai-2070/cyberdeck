@@ -28,6 +28,13 @@ export interface MemexAdapter {
   exportSlice(opts: unknown): unknown;
   importSlice(slice: unknown): unknown;
   snapshot(): unknown;
+  // Hard-isolation helpers. `fork` deep-clones this adapter's memory state
+  // into a new adapter under `crewId`. `restoreFrom` builds a sibling
+  // pre-loaded with a previously-captured snapshot — used by
+  // resumeCrewSession to rebuild a hard-isolated inner adapter without
+  // downgrading to soft isolation. `exportAll` returns every memory item in
+  // this adapter as a slice (used to import-on-complete).
   fork(crewId: string): MemexAdapter;
+  restoreFrom(snapshot: unknown, crewId: string): MemexAdapter;
   exportAll(): unknown;
 }

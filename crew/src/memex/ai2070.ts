@@ -103,6 +103,16 @@ export function createMemexAdapter(opts: CreateMemexAdapterOpts): MemexAdapter {
       });
     },
 
+    restoreFrom(snapshot: unknown, newCrewId: string): MemexAdapter {
+      // Used by resumeCrewSession to rebuild a hard-isolated inner adapter
+      // from a captured GraphState. Same internal shape as fork, but
+      // pre-loaded with the caller's state instead of cloning ours.
+      return createMemexAdapter({
+        crewId: newCrewId,
+        memState: snapshot as GraphState,
+      });
+    },
+
     exportAll(): MemexExport {
       const memItems = getItems(mem);
       const intents = getIntents(intent);

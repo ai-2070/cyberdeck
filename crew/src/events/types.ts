@@ -1,30 +1,64 @@
 import type { VotingMode } from "../schema/consensus.js";
 import type { AgentId, RoleId } from "../graph/types.js";
 
-// Structural mirror of @ai2070/memex's MemoryCommand. Defined locally to keep
-// the root public surface free of a hard transitive type-import on
-// @ai2070/memex (which is an optional peer). Memex's strict MemoryCommand is
-// structurally assignable to this type, so consumers that DO use memex pass
-// real commands through without casting. Consumers who don't use memex can
-// build minimal command objects against this shape.
+// Structural mirrors of @ai2070/memex's MemoryItem / Edge / MemoryCommand.
+// Defined locally so the root `@ai2070/crew` surface stays decoupled from
+// `@ai2070/memex` (an optional peer dep). The required-field set matches
+// memex's strict types — memex's MemoryItem / Edge / MemoryCommand are
+// structurally assignable to these, so workers that use `@ai2070/memex` pass
+// real commands through without casting. Workers without memex still get
+// compile-time checking on required fields (kind, author, scope, authority,
+// from/to, etc.) instead of `Record<string, unknown>`.
+
+export interface MemoryItemShape {
+  id: string;
+  scope: string;
+  kind: string;
+  content: Record<string, unknown>;
+  author: string;
+  source_kind: string;
+  authority: number;
+  conviction?: number;
+  importance?: number;
+  parents?: string[];
+  created_at?: number;
+  intent_id?: string;
+  task_id?: string;
+  meta?: Record<string, unknown>;
+}
+
+export interface EdgeShape {
+  edge_id: string;
+  from: string;
+  to: string;
+  kind: string;
+  author: string;
+  source_kind: string;
+  authority: number;
+  active: boolean;
+  weight?: number;
+  meta?: Record<string, unknown>;
+}
+
 export type MemoryCommand =
-  | { type: "memory.create"; item: Record<string, unknown> }
+  | { type: "memory.create"; item: MemoryItemShape }
   | {
       type: "memory.update";
       item_id: string;
-      partial: Record<string, unknown>;
+      partial: Partial<MemoryItemShape>;
       author: string;
       reason?: string;
       basis?: Record<string, unknown>;
     }
   | { type: "memory.retract"; item_id: string; author: string; reason?: string }
-  | { type: "edge.create"; edge: Record<string, unknown> }
+  | { type: "edge.create"; edge: EdgeShape }
   | {
       type: "edge.update";
       edge_id: string;
-      partial?: Record<string, unknown>;
+      partial?: Partial<EdgeShape>;
       author: string;
       reason?: string;
+      basis?: Record<string, unknown>;
     }
   | { type: "edge.retract"; edge_id: string; author: string; reason?: string };
 

@@ -162,6 +162,12 @@ class CrewSessionImpl implements CrewSession {
         outerRoleId: h.outerRoleId,
         innerCids: [...h.innerCids],
         innerSnapshot: h.innerSession.snapshot(),
+        // Capture the hard-isolated inner adapter's state so resume can
+        // rebuild it. Soft-isolated nested handles share parent's adapter
+        // and don't need a separate snapshot.
+        ...(h.innerAdapter !== undefined
+          ? { innerAdapterSnapshot: h.innerAdapter.snapshot() }
+          : {}),
       })),
       ts: this.clock.now(),
     };
@@ -212,12 +218,27 @@ class CrewSessionImpl implements CrewSession {
           `Cannot restore nested handle: outer agent "${nh.outerAgentId}" not found or has no nested crew`,
         );
       }
+
+      // If the original was hard-isolated, rebuild the inner adapter from
+      // the captured snapshot so the inner session keeps its own state and
+      // the import-on-complete flow runs as it would have on a fresh run.
+      // Otherwise (soft), the inner shares parent's adapter.
+      let innerAdapter: MemexAdapter | undefined;
+      let memexForInner: MemexAdapter | undefined = this.memex;
+      if (nh.innerAdapterSnapshot !== undefined && this.memex) {
+        innerAdapter = this.memex.restoreFrom(
+          nh.innerAdapterSnapshot,
+          nh.innerSnapshot.crewId,
+        );
+        memexForInner = innerAdapter;
+      }
+
       const innerSession = restoreCrewSession(nh.innerSnapshot, {
         crewId: nh.innerSnapshot.crewId,
         graph: outerAgent.nestedCrew,
         clock: this.clock,
         hooks: this.hooks,
-        memex: this.memex,
+        memex: memexForInner,
         defaultTimeoutMs: this.defaultTimeoutMs,
         autoCheckpoint: this.autoCheckpoint,
       });
@@ -226,6 +247,7 @@ class CrewSessionImpl implements CrewSession {
         outerRoleId: nh.outerRoleId,
         innerSession,
         innerCids: new Set(nh.innerCids),
+        ...(innerAdapter !== undefined ? { innerAdapter } : {}),
       };
       this.innerByOuter.set(nh.outerAgentId, handle);
       for (const cid of nh.innerCids) {

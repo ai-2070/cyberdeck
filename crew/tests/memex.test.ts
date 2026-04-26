@@ -344,6 +344,54 @@ describe("Session × MemEX integration", () => {
     expect(items[0].meta?.crew_id).toBe("write-test");
   });
 
+  it("MemoryCommand structural type accepts well-formed commands and memex's real shape", () => {
+    type Cmd = import("../src/events/types.js").MemoryCommand;
+
+    // Required fields satisfied — type-checks.
+    const fromLiteral: Cmd = {
+      type: "memory.create",
+      item: {
+        id: "i1",
+        scope: "test",
+        kind: "observation",
+        content: { k: "v" },
+        author: "agent:a",
+        source_kind: "observed",
+        authority: 0.9,
+      },
+    };
+    expect(fromLiteral.type).toBe("memory.create");
+
+    // memex's strict MemoryItem result is structurally assignable.
+    const realItem = createMemoryItem({
+      scope: "s",
+      kind: "observation",
+      content: { k: "v" },
+      author: "agent:test",
+      source_kind: "observed",
+      authority: 0.9,
+      importance: 0.5,
+    });
+    const fromMemex: Cmd = { type: "memory.create", item: realItem };
+    expect(fromMemex.type).toBe("memory.create");
+
+    // Edge command requires from/to/edge_id/etc.
+    const edgeCmd: Cmd = {
+      type: "edge.create",
+      edge: {
+        edge_id: "e1",
+        from: "i1",
+        to: "i2",
+        kind: "ABOUT",
+        author: "agent:a",
+        source_kind: "observed",
+        authority: 0.5,
+        active: true,
+      },
+    };
+    expect(edgeCmd.type).toBe("edge.create");
+  });
+
   it("session works without memex even when memex_commands are sent (no-op)", () => {
     const shape = CrewShapeSchema.parse(TINY_CREW_SHAPE);
     const counts = CrewAgentsSchema.parse(TINY_CREW_AGENTS);
