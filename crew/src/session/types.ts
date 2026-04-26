@@ -1,6 +1,11 @@
 import type { AgentId, CrewGraph, RoleId } from "../graph/types.js";
 import type { Clock } from "../runtime/clock.js";
-import type { CrewEvent, AgentStepRequest, GatedAction } from "../events/types.js";
+import type {
+  CrewEvent,
+  AgentStepRequest,
+  GatedAction,
+  RoleSnapshot,
+} from "../events/types.js";
 import type { HookRegistry } from "../runtime/hooks.js";
 import type { MemexAdapter } from "../memex/adapter.js";
 import type { VoteEntry } from "../voting/resolve.js";
@@ -9,17 +14,23 @@ export type CrewStatus = "idle" | "awaiting_responses" | "completed" | "aborted"
 
 export type ResumePolicy = "re-emit-request" | "treat-as-failed" | "abort";
 
-// Public projection of an in-flight step that includes the original input —
-// used by resumeCrewSession when ResumePolicy is "re-emit-request" and by
-// callers who want to inspect what's actually pending.
+// Public projection of an in-flight step. Carries the input, the role
+// snapshot the worker received, and the memex context that was sampled when
+// the request was emitted. Resume's "re-emit-request" path uses these so it
+// never needs to look up the role in some outer graph (which doesn't have
+// inner-crew roles).
 export interface AgentStepDetail {
   request: AgentStepRequest;
   input: unknown;
+  roleSnapshot: RoleSnapshot;
+  memexContext?: unknown;
 }
 
 export interface SerializedPendingEntry {
   request: AgentStepRequest;
   input: unknown;
+  roleSnapshot: RoleSnapshot;
+  memexContext?: unknown;
 }
 
 export interface SerializedPhaseState {

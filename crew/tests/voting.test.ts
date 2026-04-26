@@ -187,6 +187,45 @@ describe("resolveVotes", () => {
     });
   });
 
+  describe("undefined outputs", () => {
+    it("majority does not crash on a vote with output: undefined", () => {
+      const votes: VoteEntry[] = [
+        { agentId: "a-1", output: undefined },
+        { agentId: "a-2", output: undefined },
+        { agentId: "a-3", output: "yes" },
+      ];
+      // Two undefined votes, one "yes" → undefined wins (majority)
+      expect(resolveVotes(votes, "majority")).toBeUndefined();
+    });
+
+    it("unanimous treats all-undefined as agreement", () => {
+      const votes: VoteEntry[] = [
+        { agentId: "a-1", output: undefined },
+        { agentId: "a-2", output: undefined },
+      ];
+      expect(resolveVotes(votes, "unanimous")).toBeUndefined();
+    });
+
+    it("unanimous distinguishes undefined from defined values", () => {
+      const votes: VoteEntry[] = [
+        { agentId: "a-1", output: undefined },
+        { agentId: "a-2", output: "yes" },
+      ];
+      // Different outputs → no consensus
+      expect(resolveVotes(votes, "unanimous")).toBeUndefined();
+    });
+
+    it("weighted_consensus does not crash on undefined votes", () => {
+      const votes: VoteEntry[] = [
+        { agentId: "a-1", output: undefined },
+        { agentId: "a-2", output: undefined },
+        { agentId: "a-3", output: "yes" },
+      ];
+      // 2/3 undefined, threshold 0.66 → undefined wins
+      expect(resolveVotes(votes, "weighted_consensus")).toBeUndefined();
+    });
+  });
+
   describe("not implemented modes", () => {
     it("best_of_n throws NotImplementedError", () => {
       expect(() => resolveVotes([{ agentId: "a", output: "x" }], "best_of_n"))

@@ -101,6 +101,47 @@ describe("createMemexAdapter — unit", () => {
     expect(items[0].meta?.agent_id).toBe("alpha-1");
   });
 
+  it("view scope filters cannot be overridden by caller-supplied filters", () => {
+    const adapter = createMemexAdapter({ crewId: "c1" });
+    adapter.apply(
+      {
+        type: "memory.create",
+        item: createMemoryItem({
+          kind: "observation",
+          content: { key: "k", value: "alpha-only" },
+          author: "",
+          source_kind: "observed",
+          authority: 0.9,
+          importance: 0.5,
+        }),
+      },
+      { agentId: "alpha-1", crewId: "c1", roleId: "alpha" },
+    );
+    adapter.apply(
+      {
+        type: "memory.create",
+        item: createMemoryItem({
+          kind: "observation",
+          content: { key: "k", value: "beta-only" },
+          author: "",
+          source_kind: "observed",
+          authority: 0.9,
+          importance: 0.5,
+        }),
+      },
+      { agentId: "beta-1", crewId: "c1", roleId: "beta" },
+    );
+
+    const alphaAgent = { id: "alpha-1", role: "alpha" } as Parameters<typeof adapter.handleFor>[0];
+    const alphaRole = { role: "alpha", permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] } } as Parameters<typeof adapter.handleFor>[1];
+    const handle = adapter.handleFor(alphaAgent, alphaRole, "self");
+
+    // Caller tries to read beta's items by overriding meta.agent_id — must be rejected.
+    const items = handle.read({ meta: { agent_id: "beta-1" } });
+    expect(items).toHaveLength(1);
+    expect(items[0].meta?.agent_id).toBe("alpha-1");
+  });
+
   it("handleFor with view='crew' returns items from any agent in the crew", () => {
     const adapter = createMemexAdapter({ crewId: "c1" });
     adapter.apply(

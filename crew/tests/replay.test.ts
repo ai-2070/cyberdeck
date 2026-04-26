@@ -163,6 +163,171 @@ describe("ResumePolicy", () => {
     expect(reEmitted.role.name).toBe("alpha");
   });
 
+  it("'re-emit-request' preserves memex_context that was sampled at original emit time", async () => {
+    const { createMemexAdapter } = await import("../src/memex/ai2070.js");
+    const { createMemoryItem } = await import("@ai2070/memex");
+
+    const adapter = createMemexAdapter({ crewId: "ctx-resume" });
+    adapter.apply(
+      {
+        type: "memory.create",
+        item: createMemoryItem({
+          kind: "observation",
+          content: { key: "k", value: "preload" },
+          author: "agent:alpha-1",
+          source_kind: "observed",
+          authority: 0.9,
+          importance: 0.5,
+        }),
+      },
+      { agentId: "alpha-1", crewId: "ctx-resume", roleId: "alpha" },
+    );
+
+    const shape = CrewShapeSchema.parse({
+      ...TINY_CREW_SHAPE,
+      roles: TINY_CREW_SHAPE.roles.map((r) =>
+        r.role === "alpha"
+          ? {
+              ...r,
+              execution: {
+                memex: {
+                  enabled: true,
+                  retrieval: {
+                    budget: 1024,
+                    weights: { authority: 1, conviction: 0, importance: 0 },
+                    costFn: () => 1,
+                  },
+                },
+              },
+            }
+          : r,
+      ),
+    });
+    const counts = CrewAgentsSchema.parse(TINY_CREW_AGENTS);
+    const graph = buildCrewGraph(shape, counts);
+    const session = createCrewSession({
+      crewId: "ctx-resume",
+      graph,
+      clock: frozenClock(0),
+      memex: adapter,
+    });
+    const initial = session.start("ROOT");
+    const alphaReq = initial.find((e) => e.type === "agent.step.requested") as
+      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    expect(alphaReq.memex_context).toBeDefined();
+
+    const snap = session.snapshot();
+    const { events } = resumeCrewSession(snap, [], {
+      crewId: "ctx-resume",
+      graph,
+      clock: frozenClock(100),
+      memex: adapter,
+      resumePolicy: "re-emit-request",
+    });
+    const reEmitted = events.find((e) => e.type === "agent.step.requested") as
+      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    expect(reEmitted.memex_context).toEqual(alphaReq.memex_context);
+  });
+
+  it("'re-emit-request' works for nested-crew pendings (inner role not in outer graph)", async () => {
+    const { createCrewSession: createCrewSessionFn } = await import("../src/session/machine.js");
+    const PARENT = {
+      schema_version: "1.0",
+      name: "PARENT",
+      roles: [
+        {
+          role: "host",
+          capabilities: { thinking_allowed: true },
+          permissions: {
+            talk_to: ["worker"],
+            delegate_to: [],
+            escalate_to: [],
+            invite: [],
+          },
+          first_input: true,
+          final_output: true,
+        },
+        {
+          role: "worker",
+          capabilities: { thinking_allowed: true },
+          permissions: {
+            talk_to: ["host"],
+            delegate_to: [],
+            escalate_to: [],
+            invite: [],
+          },
+          nested_crew: "INNER",
+          amount: 1,
+        },
+      ],
+    };
+    const INNER = {
+      schema_version: "1.0",
+      name: "INNER",
+      roles: [
+        {
+          role: "alpha",
+          capabilities: { thinking_allowed: true },
+          permissions: {
+            talk_to: [],
+            delegate_to: [],
+            escalate_to: [],
+            invite: [],
+          },
+          first_input: true,
+          final_output: true,
+          amount: 1,
+        },
+      ],
+    };
+    const parentShape = CrewShapeSchema.parse(PARENT);
+    const innerShape = CrewShapeSchema.parse(INNER);
+    const counts = CrewAgentsSchema.parse({
+      schema_version: "1.0",
+      name: "PARENT",
+      agents: [
+        { role: "host", amount: 1 },
+        { role: "worker", amount: 1 },
+      ],
+    });
+    const graph = buildCrewGraph(parentShape, counts, { INNER: innerShape });
+
+    const session = createCrewSessionFn({
+      crewId: "nested-resume",
+      graph,
+      clock: frozenClock(0),
+    });
+    const initial = session.start("ROOT");
+    const hostReq = initial.find((e) => e.type === "agent.step.requested") as
+      Extract<CrewEvent, { type: "agent.step.requested" }>;
+    session.deliver({
+      type: "agent.step.completed",
+      correlationId: hostReq.correlationId,
+      output: "host-out",
+      ts: 0,
+    });
+    // Now in worker phase; inner alpha is pending. Snapshot.
+    const snap = session.snapshot();
+
+    const { events } = resumeCrewSession(snap, [], {
+      crewId: "nested-resume",
+      graph,
+      clock: frozenClock(0),
+      resumePolicy: "re-emit-request",
+    });
+
+    // The re-emitted request must be alpha (inner role), with the inner role
+    // snapshot, even though "alpha" isn't in the outer graph's roles.
+    const reEmitted = events.find(
+      (e) =>
+        e.type === "agent.step.requested" &&
+        (e as Extract<CrewEvent, { type: "agent.step.requested" }>).roleId === "alpha",
+    ) as Extract<CrewEvent, { type: "agent.step.requested" }>;
+    expect(reEmitted).toBeDefined();
+    expect(reEmitted.role.name).toBe("alpha");
+    expect(reEmitted.agentId).toMatch(/alpha/);
+  });
+
   it("'treat-as-failed' synthesizes failed terminals so the phase can advance", () => {
     const graph = tinyGraph();
     const session = createCrewSession({

@@ -17,12 +17,19 @@ export function buildCrewGraph(
   shape: CrewShape,
   agentsCfg: CrewAgents,
   registry?: Record<string, CrewShape>,
+  visited: ReadonlySet<string> = new Set(),
 ): CrewGraph {
   if (shape.name !== agentsCfg.name) {
     throw new Error(
       `Crew name mismatch: shape="${shape.name}" agents="${agentsCfg.name}"`,
     );
   }
+  if (visited.has(shape.name)) {
+    throw new Error(
+      `Cyclic nested crew reference: "${shape.name}" is already being expanded in this chain`,
+    );
+  }
+  const nextVisited = new Set(visited).add(shape.name);
 
   const lint = lintCrewShape(shape);
   if (lint.errors.length > 0) {
@@ -61,6 +68,7 @@ export function buildCrewGraph(
           nestedShape,
           { schema_version: "1.0", name: nestedShape.name, agents: [] },
           registry,
+          nextVisited,
         );
       }
       agents.push(agent);
@@ -148,6 +156,29 @@ export function lintCrewShape(shape: CrewShape): LintResult {
         message: `Role "${r.role}" cannot escalate_to itself`,
         path: `${r.role}.permissions.escalate_to`,
       });
+    }
+
+    // Voting modes that the v1 resolver doesn't implement. Catch them at lint
+    // time so configs don't crash mid-phase.
+    const voting = r.execution?.voting;
+    if (voting) {
+      if (voting.mode === "best_of_n") {
+        errors.push({
+          code: "unsupported_voting_mode",
+          message: `Role "${r.role}" uses voting mode "best_of_n" which is not implemented in v1`,
+          path: `${r.role}.execution.voting.mode`,
+        });
+      }
+      if (
+        voting.mode === "weighted_consensus" &&
+        voting.weight_function !== "equal"
+      ) {
+        errors.push({
+          code: "unsupported_weight_function",
+          message: `Role "${r.role}" uses weight_function "${voting.weight_function}" — v1 supports only "equal"`,
+          path: `${r.role}.execution.voting.weight_function`,
+        });
+      }
     }
 
     for (const target of r.permissions.delegate_to) {

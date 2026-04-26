@@ -50,8 +50,8 @@ export function resolveVotes(votes: VoteEntry[], config: VotingConfig): unknown 
 
     case "unanimous": {
       if (valid.length === 0) return undefined;
-      const first = canonicalize(valid[0].output);
-      const allSame = valid.every((v) => canonicalize(v.output) === first);
+      const first = voteKey(valid[0].output);
+      const allSame = valid.every((v) => voteKey(v.output) === first);
       return allSame ? valid[0].output : undefined;
     }
 
@@ -87,12 +87,21 @@ export function resolveVotes(votes: VoteEntry[], config: VotingConfig): unknown 
   }
 }
 
+// canonicalize() rejects top-level undefined (intentionally, for replay). But
+// a worker is allowed to return `output: undefined` — that's a valid vote,
+// just for the "no value" bucket. Use a sentinel key so undefined doesn't
+// crash the resolver and votes for it cluster correctly.
+const UNDEFINED_BUCKET = "__crew/undefined__";
+function voteKey(value: unknown): string {
+  return value === undefined ? UNDEFINED_BUCKET : canonicalize(value);
+}
+
 function bucketByCanonical(
   entries: VoteEntry[],
 ): Map<string, { output: unknown; weight: number }> {
   const out = new Map<string, { output: unknown; weight: number }>();
   for (const v of entries) {
-    const key = canonicalize(v.output);
+    const key = voteKey(v.output);
     const existing = out.get(key);
     if (existing) {
       existing.weight += 1;

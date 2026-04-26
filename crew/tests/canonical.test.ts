@@ -52,6 +52,15 @@ describe("canonicalize", () => {
     expect(canonicalize([1, 2, 3])).toBe("[1,2,3]");
   });
 
+  it("preserves length of sparse arrays (holes become null)", () => {
+    const sparse = [1, , 3]; // length 3, hole at index 1
+    expect(canonicalize(sparse)).toBe("[1,null,3]");
+
+    const arr = new Array(3); // length 3, all holes
+    arr[1] = "x";
+    expect(canonicalize(arr)).toBe("[null,\"x\",null]");
+  });
+
   it("skips undefined values in objects but converts undefined in arrays to null", () => {
     expect(canonicalize({ a: 1, b: undefined, c: 3 })).toBe('{"a":1,"c":3}');
     expect(canonicalize([1, undefined, 3])).toBe("[1,null,3]");

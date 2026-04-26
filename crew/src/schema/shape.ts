@@ -24,12 +24,20 @@ const RolePermissionsSchema = z.object({
   modify_structure: z.boolean().optional(),
 });
 
-const RoleActivationSchema = z.object({
-  on_fault: z.boolean().optional(),
-  on_stall: z.boolean().optional(),
-  on_timeout: z.boolean().optional(),
-  on_permission_denied: z.boolean().optional(),
-});
+// `activation` excludes a role from normal phase order. Empty activation =
+// silently dead role. Force callers to specify at least one trigger so the
+// "fixer-style" intent is explicit.
+const RoleActivationSchema = z
+  .object({
+    on_fault: z.boolean().optional(),
+    on_stall: z.boolean().optional(),
+    on_timeout: z.boolean().optional(),
+    on_permission_denied: z.boolean().optional(),
+  })
+  .refine(
+    (v) => Object.values(v).some((flag) => flag === true),
+    "activation must include at least one trigger flag set to true",
+  );
 
 const RoleDelegationSchema = z.object({
   max_depth: z.number().int().min(0).default(0),

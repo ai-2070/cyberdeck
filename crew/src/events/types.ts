@@ -1,8 +1,32 @@
-import type { MemoryCommand } from "@ai2070/memex";
 import type { VotingMode } from "../schema/consensus.js";
 import type { AgentId, RoleId } from "../graph/types.js";
 
-export type { MemoryCommand };
+// Structural mirror of @ai2070/memex's MemoryCommand. Defined locally to keep
+// the root public surface free of a hard transitive type-import on
+// @ai2070/memex (which is an optional peer). Memex's strict MemoryCommand is
+// structurally assignable to this type, so consumers that DO use memex pass
+// real commands through without casting. Consumers who don't use memex can
+// build minimal command objects against this shape.
+export type MemoryCommand =
+  | { type: "memory.create"; item: Record<string, unknown> }
+  | {
+      type: "memory.update";
+      item_id: string;
+      partial: Record<string, unknown>;
+      author: string;
+      reason?: string;
+      basis?: Record<string, unknown>;
+    }
+  | { type: "memory.retract"; item_id: string; author: string; reason?: string }
+  | { type: "edge.create"; edge: Record<string, unknown> }
+  | {
+      type: "edge.update";
+      edge_id: string;
+      partial?: Record<string, unknown>;
+      author: string;
+      reason?: string;
+    }
+  | { type: "edge.retract"; edge_id: string; author: string; reason?: string };
 
 // Self-contained role snapshot embedded in agent.step.requested.
 // Workers receive this and don't need to load the crew shape out-of-band.

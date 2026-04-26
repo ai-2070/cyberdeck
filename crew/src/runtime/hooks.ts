@@ -46,6 +46,13 @@ export interface HookRegistry {
 
 export function createHookRegistry(hooks: Record<string, HookFn>): HookRegistry {
   return {
-    get: (name) => hooks[name],
+    get: (name) => {
+      // Refuse prototype-chain lookups (e.g. "__proto__", "constructor") and
+      // anything that isn't a function. Hook names come from the validated
+      // shape, but defense in depth is cheap.
+      if (!Object.prototype.hasOwnProperty.call(hooks, name)) return undefined;
+      const fn = hooks[name];
+      return typeof fn === "function" ? fn : undefined;
+    },
   };
 }

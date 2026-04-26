@@ -183,7 +183,7 @@ type CrewEvent =
   | { type: "crew.aborted"; reason: "cancelled" | "timeout"; ts: number }
   | { type: "crew.completed"; finalOutput: unknown; ts: number }
   // ─── inbound (caller-delivered) ───
-  | { type: "agent.step.completed"; correlationId: string; output: unknown; fault?: boolean; stalled?: boolean; ts: number }
+  | { type: "agent.step.completed"; correlationId: string; output: unknown; memex_commands?: MemoryCommand[]; fault?: boolean; stalled?: boolean; ts: number }
   | { type: "agent.step.failed"; correlationId: string; error: { name: string; message: string }; ts: number }
   | { type: "agent.step.timed_out"; correlationId: string; ts: number }     // caller may inject; session also self-emits
   | { type: "agent.stream.chunk"; correlationId: string; chunk: unknown; ts: number }; // pass-through, non-state-advancing
@@ -236,7 +236,7 @@ Mechanics:
 
 The agent worker on the other side of the bus does not talk to MemEX directly. Two paths for memory:
 
-- **Memex context goes out with the request.** Before emitting `agent.step.requested`, the session calls `handle.retrieve(...)` (params from `role.execution.memex`) and embeds the result in `input.memex_context`. No round-trip from the worker.
+- **Memex context goes out with the request.** Before emitting `agent.step.requested`, the session calls `handle.retrieve(...)` (params from `role.execution.memex`) and embeds the result in the event's top-level `memex_context` field (matching the Phase 2 vocabulary). No round-trip from the worker.
 - **Memex commands come back with the response.** The worker returns `{ output, memex_commands?: MemoryCommand[] }` in `agent.step.completed`. The session emits one `memex.command.emitted` event per command, then calls `adapter.apply(cmd)`. The event sits between worker and MemEX so replay reconstructs identical state without re-running the model.
 
 Adapter shape:

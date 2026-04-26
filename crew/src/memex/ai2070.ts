@@ -16,7 +16,7 @@ import type {
   GraphState,
   IntentState,
   MemexExport,
-  MemoryCommand,
+  MemoryCommand as MemexMemoryCommand,
   MemoryFilter,
   MemoryItem,
   SmartRetrievalOptions,
@@ -44,8 +44,10 @@ export interface CreateMemexAdapterOpts {
   taskState?: TaskState;
 }
 
-// Concrete adapter against @ai2070/memex. Wraps mutable graph/intent/task
-// state and stamps meta on outbound writes. Created per crew session.
+// Concrete adapter against @ai2070/memex. Uses memex's strict types
+// internally; the returned adapter conforms to the opaque MemexAdapter
+// interface (from ./adapter.ts) so the root `@ai2070/crew` surface stays
+// memex-free for type checking.
 export function createMemexAdapter(opts: CreateMemexAdapterOpts): MemexAdapter {
   const crewId = opts.crewId;
   let mem: GraphState = opts.memState ?? createGraphState();
@@ -57,26 +59,29 @@ export function createMemexAdapter(opts: CreateMemexAdapterOpts): MemexAdapter {
       const baseFilter = filterForView(view, agent.id, role.role, crewId);
       return {
         read(filter) {
-          return getItems(mem, mergeFilters(baseFilter, filter));
+          return getItems(mem, mergeFilters(baseFilter, filter as MemoryFilter | undefined));
         },
-        retrieve(retrievalOpts: SmartRetrievalOptions) {
-          return smartRetrieve(mem, mergeFilterIntoSmart(retrievalOpts, baseFilter));
+        retrieve(retrievalOpts) {
+          return smartRetrieve(
+            mem,
+            mergeFilterIntoSmart(retrievalOpts as SmartRetrievalOptions, baseFilter),
+          );
         },
       };
     },
 
     apply(cmd, ctx) {
-      const stamped = stampCommand(cmd, ctx);
+      const stamped = stampCommand(cmd as MemexMemoryCommand, ctx);
       const result = applyCommand(mem, stamped);
       mem = result.state;
     },
 
-    exportSlice(o: ExportOptions): MemexExport {
-      return memexExportSlice(mem, intent, task, o);
+    exportSlice(o): MemexExport {
+      return memexExportSlice(mem, intent, task, o as ExportOptions);
     },
 
-    importSlice(slice: MemexExport) {
-      const r = memexImportSlice(mem, intent, task, slice);
+    importSlice(slice) {
+      const r = memexImportSlice(mem, intent, task, slice as MemexExport);
       mem = r.memState;
       intent = r.intentState;
       task = r.taskState;
@@ -129,6 +134,10 @@ function filterForView(
   }
 }
 
+// Scope filters from the view (self/role/crew) MUST win over caller-supplied
+// filters — otherwise an agent could pass `meta: { agent_id: "other" }` and read
+// outside its scope. `base` is always the view scope here; caller filters can
+// only refine within it.
 function mergeFilters(
   base: MemoryFilter | undefined,
   override: MemoryFilter | undefined,
@@ -136,9 +145,9 @@ function mergeFilters(
   if (!base) return override;
   if (!override) return base;
   return {
-    ...base,
     ...override,
-    meta: { ...(base.meta ?? {}), ...(override.meta ?? {}) },
+    ...base,
+    meta: { ...(override.meta ?? {}), ...(base.meta ?? {}) },
   };
 }
 
@@ -156,7 +165,7 @@ function mergeFilterIntoSmart(
 // Stamp memory.create with author/meta/scope so cross-agent visibility filters
 // work without the worker remembering to set them. Other commands pass through —
 // the worker is responsible for setting `author` on update/retract.
-function stampCommand(cmd: MemoryCommand, ctx: MemexStampContext): MemoryCommand {
+function stampCommand(cmd: MemexMemoryCommand, ctx: MemexStampContext): MemexMemoryCommand {
   if (cmd.type !== "memory.create") return cmd;
 
   const item: MemoryItem = { ...cmd.item };

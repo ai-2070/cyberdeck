@@ -1,46 +1,33 @@
-import type {
-  ExportOptions,
-  GraphState,
-  MemexExport,
-  MemoryCommand,
-  MemoryFilter,
-  MemoryItem,
-  ImportReport,
-  ScoredItem,
-  SmartRetrievalOptions,
-} from "@ai2070/memex";
 import type { CrewAgent, CrewRole } from "../graph/types.js";
+import type { MemoryCommand } from "../events/types.js";
+
+// adapter.ts is the contract surface reachable from `@ai2070/crew`'s root
+// (CreateCrewSessionOpts.memex references MemexAdapter). To keep memex an
+// optional peer, this file deliberately uses opaque types (`unknown`) for
+// memex-derived inputs and outputs. The concrete factory at
+// `@ai2070/crew/memex` (memex/ai2070.ts) provides the strict-typed
+// implementation. Consumers who use memex can cast results from
+// `handle.read()` etc. to memex's `MemoryItem[]` / `ScoredItem[]` themselves.
 
 export type MemexView = "self" | "role" | "crew" | "all";
 
-// Per-agent read handle. Reads are scoped by `view`; writes happen via the
-// adapter's `apply()` (called by the session machine after a worker returns
-// memex_commands in agent.step.completed).
-export interface AgentMemexHandle {
-  read(filter?: MemoryFilter): MemoryItem[];
-  retrieve(opts: SmartRetrievalOptions): ScoredItem[];
-}
-
-// Context passed to apply() so the adapter can stamp meta on outbound writes.
 export interface MemexStampContext {
   agentId: string;
   crewId: string;
   roleId: string;
 }
 
-// Adapter is session-scoped mutable state. Don't share one instance across
-// concurrent sessions. See PLAN.md Phase 4.
+export interface AgentMemexHandle {
+  read(filter?: unknown): unknown[];
+  retrieve(opts: unknown): unknown[];
+}
+
 export interface MemexAdapter {
   handleFor(agent: CrewAgent, role: CrewRole, view: MemexView): AgentMemexHandle;
   apply(cmd: MemoryCommand, ctx: MemexStampContext): void;
-  exportSlice(opts: ExportOptions): MemexExport;
-  importSlice(slice: MemexExport): ImportReport;
-  snapshot(): GraphState;
-
-  // Hard-isolation helpers (used by nested crews with memex.isolation: "hard").
-  // `fork` produces a child adapter seeded with a deep copy of this adapter's
-  // memory state under a new crewId. `exportAll` returns every memory item in
-  // the adapter as a slice (so the parent can importSlice it on completion).
+  exportSlice(opts: unknown): unknown;
+  importSlice(slice: unknown): unknown;
+  snapshot(): unknown;
   fork(crewId: string): MemexAdapter;
-  exportAll(): MemexExport;
+  exportAll(): unknown;
 }

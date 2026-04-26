@@ -13,7 +13,7 @@ import type {
   HookStage,
 } from "../runtime/hooks.js";
 import type { MemexAdapter } from "../memex/adapter.js";
-import type { SmartRetrievalOptions } from "@ai2070/memex";
+import type { MemoryCommand } from "../events/types.js";
 import type {
   ActionRequest,
   AgentStepDetail,
@@ -42,10 +42,16 @@ export function restoreCrewSession(
   return impl;
 }
 
+interface PendingMeta {
+  input: unknown;
+  roleSnapshot: RoleSnapshot;
+  memexContext?: unknown;
+}
+
 interface PhaseState {
   roleId: RoleId;
   pending: Map<string, AgentStepRequest>;     // correlationId -> request
-  pendingInputs: Map<string, unknown>;         // correlationId -> the input passed at emit time
+  pendingMeta: Map<string, PendingMeta>;       // correlationId -> input + role snapshot + memex_context
   outputs: Map<AgentId, VoteEntry>;            // agentId -> response (substitution-aware)
   terminalSeen: Set<string>;                   // correlationIds we've processed
   fixerSteps: Map<string, AgentId>;            // fixer cid -> original failed agent
@@ -109,7 +115,14 @@ class CrewSessionImpl implements CrewSession {
     if (!this.currentPhase) return [];
     const out: AgentStepDetail[] = [];
     for (const [cid, req] of this.currentPhase.pending.entries()) {
-      out.push({ request: req, input: this.currentPhase.pendingInputs.get(cid) });
+      const meta = this.currentPhase.pendingMeta.get(cid);
+      if (!meta) continue;
+      out.push({
+        request: req,
+        input: meta.input,
+        roleSnapshot: meta.roleSnapshot,
+        ...(meta.memexContext !== undefined ? { memexContext: meta.memexContext } : {}),
+      });
     }
     for (const handle of this.innerByOuter.values()) {
       out.push(...handle.innerSession.pendingDetails());
@@ -129,10 +142,15 @@ class CrewSessionImpl implements CrewSession {
       currentPhase: cp
         ? {
             roleId: cp.roleId,
-            pending: [...cp.pending.entries()].map(([cid, req]) => ({
-              request: req,
-              input: cp.pendingInputs.get(cid),
-            })),
+            pending: [...cp.pending.entries()].map(([cid, req]) => {
+              const meta = cp.pendingMeta.get(cid);
+              return {
+                request: req,
+                input: meta?.input,
+                roleSnapshot: meta?.roleSnapshot ?? snapshotRole(this.graph.roles.get(req.roleId)!),
+                ...(meta?.memexContext !== undefined ? { memexContext: meta.memexContext } : {}),
+              };
+            }),
             outputs: [...cp.outputs.entries()],
             terminalSeen: [...cp.terminalSeen],
             fixerSteps: [...cp.fixerSteps.entries()],
@@ -170,8 +188,15 @@ class CrewSessionImpl implements CrewSession {
         pending: new Map(
           cp.pending.map((p) => [p.request.correlationId, p.request]),
         ),
-        pendingInputs: new Map(
-          cp.pending.map((p) => [p.request.correlationId, p.input]),
+        pendingMeta: new Map(
+          cp.pending.map((p) => [
+            p.request.correlationId,
+            {
+              input: p.input,
+              roleSnapshot: p.roleSnapshot,
+              ...(p.memexContext !== undefined ? { memexContext: p.memexContext } : {}),
+            },
+          ]),
         ),
         outputs: new Map(cp.outputs),
         terminalSeen: new Set(cp.terminalSeen),
@@ -250,13 +275,13 @@ class CrewSessionImpl implements CrewSession {
     phase.terminalSeen.add(cid);
     const req = phase.pending.get(cid)!;
     phase.pending.delete(cid);
-    phase.pendingInputs.delete(cid);
+    phase.pendingMeta.delete(cid);
 
     let output: unknown;
     let fault = false;
     let stalled = false;
     let timedOut = false;
-    let memexCommands: ReadonlyArray<import("@ai2070/memex").MemoryCommand> = [];
+    let memexCommands: ReadonlyArray<MemoryCommand> = [];
     if (event.type === "agent.step.completed") {
       output = event.output;
       fault = event.fault === true;
@@ -294,7 +319,7 @@ class CrewSessionImpl implements CrewSession {
 
     this.processTerminal(phase, req, cid, { output, fault, stalled, timedOut }, events);
 
-    if (phase.pending.size === 0) {
+    if (phase.pending.size === 0 && phase.nestedPending.size === 0) {
       this.completeCurrentPhase(events);
     }
     return events;
@@ -317,7 +342,7 @@ class CrewSessionImpl implements CrewSession {
       if (phase.terminalSeen.has(cid)) continue;
       phase.terminalSeen.add(cid);
       phase.pending.delete(cid);
-      phase.pendingInputs.delete(cid);
+      phase.pendingMeta.delete(cid);
       events.push({
         type: "agent.step.timed_out",
         correlationId: cid,
@@ -331,7 +356,11 @@ class CrewSessionImpl implements CrewSession {
         events,
       );
     }
-    if (phase.pending.size === 0 && expired.length > 0) {
+    if (
+      phase.pending.size === 0 &&
+      phase.nestedPending.size === 0 &&
+      expired.length > 0
+    ) {
       this.completeCurrentPhase(events);
     }
     return events;
@@ -497,12 +526,18 @@ class CrewSessionImpl implements CrewSession {
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     };
     phase.pending.set(cid, req);
-    phase.pendingInputs.set(cid, input);
     if (fixerForAgent !== undefined) {
       phase.fixerSteps.set(cid, fixerForAgent);
     }
 
     const memex_context = this.computeMemexContext(role, agent);
+    const roleSnapshotValue = snapshotRole(role);
+
+    phase.pendingMeta.set(cid, {
+      input,
+      roleSnapshot: roleSnapshotValue,
+      ...(memex_context !== undefined ? { memexContext: memex_context } : {}),
+    });
 
     events.push({
       type: "agent.step.requested",
@@ -510,7 +545,7 @@ class CrewSessionImpl implements CrewSession {
       agentId: agent.id,
       roleId: role.role,
       input,
-      role: snapshotRole(role),
+      role: roleSnapshotValue,
       ...(memex_context !== undefined ? { memex_context } : {}),
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
       ts: this.clock.now(),
@@ -524,7 +559,7 @@ class CrewSessionImpl implements CrewSession {
     const view = cfg.view ?? "self";
     const handle = this.memex.handleFor(agent, role, view);
     if (cfg.retrieval !== undefined) {
-      return handle.retrieve(cfg.retrieval as SmartRetrievalOptions);
+      return handle.retrieve(cfg.retrieval);
     }
     return undefined;
   }
@@ -686,7 +721,7 @@ class CrewSessionImpl implements CrewSession {
     const phase: PhaseState = {
       roleId,
       pending: new Map(),
-      pendingInputs: new Map(),
+      pendingMeta: new Map(),
       outputs: new Map(),
       terminalSeen: new Set(),
       fixerSteps: new Map(),
@@ -798,7 +833,12 @@ function snapshotRole(role: CrewRole): RoleSnapshot {
   return {
     name: role.role,
     ...(role.description !== undefined ? { description: role.description } : {}),
-    capabilities: role.capabilities,
+    capabilities: {
+      ...role.capabilities,
+      ...(role.capabilities.tools !== undefined
+        ? { tools: [...role.capabilities.tools] }
+        : {}),
+    },
     permissions: {
       talk_to: [...role.permissions.talk_to],
       delegate_to: [...role.permissions.delegate_to],

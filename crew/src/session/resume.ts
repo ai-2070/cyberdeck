@@ -69,25 +69,19 @@ function applyResumePolicy(
   }
 
   if (policy === "re-emit-request") {
+    // pendingDetails carries each step's role snapshot and memex context as
+    // they were when the request was originally emitted — so we don't have
+    // to look up roles in opts.graph (which doesn't contain inner-crew roles)
+    // and we don't drop the memex context.
     for (const d of details) {
-      const role = opts.graph.roles.get(d.request.roleId);
-      if (!role) continue;
       events.push({
         type: "agent.step.requested",
         correlationId: d.request.correlationId,
         agentId: d.request.agentId,
         roleId: d.request.roleId,
         input: d.input,
-        role: {
-          name: role.role,
-          ...(role.description !== undefined ? { description: role.description } : {}),
-          capabilities: role.capabilities,
-          permissions: {
-            talk_to: [...role.permissions.talk_to],
-            delegate_to: [...role.permissions.delegate_to],
-            escalate_to: [...role.permissions.escalate_to],
-          },
-        },
+        role: d.roleSnapshot,
+        ...(d.memexContext !== undefined ? { memex_context: d.memexContext } : {}),
         ...(d.request.timeoutMs !== undefined ? { timeoutMs: d.request.timeoutMs } : {}),
         ts: opts.clock.now(),
       });

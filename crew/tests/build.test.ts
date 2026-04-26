@@ -248,4 +248,103 @@ describe("lintCrewShape", () => {
     const lint = lintCrewShape(shape);
     expect(lint.warnings).toEqual([]);
   });
+
+  it("errors on unsupported voting mode (best_of_n)", () => {
+    const shape = CrewShapeSchema.parse({
+      ...DEFAULT_CREW_SHAPE,
+      roles: DEFAULT_CREW_SHAPE.roles.map((r) =>
+        r.role === "merc"
+          ? { ...r, execution: { voting: { mode: "best_of_n", weight_function: "equal", threshold: 0.5 } } }
+          : r,
+      ),
+    });
+    const lint = lintCrewShape(shape);
+    expect(lint.errors.some((e) => e.code === "unsupported_voting_mode")).toBe(true);
+  });
+
+  it("errors on unsupported weight_function for weighted_consensus", () => {
+    const shape = CrewShapeSchema.parse({
+      ...DEFAULT_CREW_SHAPE,
+      roles: DEFAULT_CREW_SHAPE.roles.map((r) =>
+        r.role === "merc"
+          ? {
+              ...r,
+              execution: {
+                voting: {
+                  mode: "weighted_consensus",
+                  weight_function: "by_confidence",
+                  threshold: 0.66,
+                },
+              },
+            }
+          : r,
+      ),
+    });
+    const lint = lintCrewShape(shape);
+    expect(lint.errors.some((e) => e.code === "unsupported_weight_function")).toBe(true);
+  });
+});
+
+describe("buildCrewGraph — cycle detection", () => {
+  it("throws on direct self-cycle", () => {
+    const shape = CrewShapeSchema.parse({
+      schema_version: "1.0",
+      name: "SELF",
+      roles: [
+        {
+          role: "only",
+          permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] },
+          first_input: true,
+          final_output: true,
+          nested_crew: "SELF",
+          amount: 1,
+        },
+      ],
+    });
+    const counts = CrewAgentsSchema.parse({
+      schema_version: "1.0",
+      name: "SELF",
+      agents: [{ role: "only", amount: 1 }],
+    });
+    expect(() => buildCrewGraph(shape, counts, { SELF: shape })).toThrow(
+      /Cyclic nested crew/i,
+    );
+  });
+
+  it("throws on multi-step cycle (A → B → A)", () => {
+    const A = CrewShapeSchema.parse({
+      schema_version: "1.0",
+      name: "A",
+      roles: [
+        {
+          role: "x",
+          permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] },
+          first_input: true,
+          final_output: true,
+          nested_crew: "B",
+          amount: 1,
+        },
+      ],
+    });
+    const B = CrewShapeSchema.parse({
+      schema_version: "1.0",
+      name: "B",
+      roles: [
+        {
+          role: "y",
+          permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] },
+          first_input: true,
+          final_output: true,
+          nested_crew: "A",
+          amount: 1,
+        },
+      ],
+    });
+    const counts = CrewAgentsSchema.parse({
+      schema_version: "1.0",
+      name: "A",
+      agents: [{ role: "x", amount: 1 }],
+    });
+    expect(() => buildCrewGraph(A, counts, { A, B })).toThrow(/Cyclic nested crew/i);
+  });
 });

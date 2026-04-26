@@ -642,6 +642,14 @@ describe("Hooks", () => {
     expect(events).toContain("after_agent:beta-2");
   });
 
+  it("registry refuses prototype lookups (e.g. '__proto__')", () => {
+    const reg = createHookRegistry({ legit: () => {} });
+    expect(reg.get("legit")).toBeTypeOf("function");
+    expect(reg.get("__proto__")).toBeUndefined();
+    expect(reg.get("constructor")).toBeUndefined();
+    expect(reg.get("toString")).toBeUndefined();
+  });
+
   it("control.checkpoint emits checkpoint.taken into the same burst", () => {
     const hooks = createHookRegistry({
       checkpoint: (ctx) => ctx.control.checkpoint("phase-end"),

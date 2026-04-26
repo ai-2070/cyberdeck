@@ -37,9 +37,13 @@ function canonicalizeValue(value: unknown, seen: WeakSet<object>): string {
   if (Array.isArray(value)) {
     if (seen.has(value)) throw new Error("canonicalize: circular reference");
     seen.add(value);
-    const parts = value.map((v) =>
-      v === undefined ? "null" : canonicalizeValue(v, seen),
-    );
+    // Iterate by index (not .map) so sparse-array holes are preserved as
+    // `null` instead of being skipped — matches JSON.stringify's behavior.
+    const parts: string[] = [];
+    for (let i = 0; i < value.length; i++) {
+      const v = value[i];
+      parts.push(v === undefined ? "null" : canonicalizeValue(v, seen));
+    }
     seen.delete(value);
     return `[${parts.join(",")}]`;
   }

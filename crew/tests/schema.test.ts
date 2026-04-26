@@ -75,6 +75,67 @@ describe("CrewShapeSchema", () => {
       CrewShapeSchema.parse({ schema_version: "1.0", name: "EMPTY", roles: [] }),
     ).toThrow();
   });
+
+  it("requires at least one trigger flag when activation is provided", () => {
+    expect(() =>
+      CrewShapeSchema.parse({
+        schema_version: "1.0",
+        name: "BAD",
+        roles: [
+          {
+            role: "dead",
+            permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] },
+            activation: {}, // empty — silently dead
+            first_input: true,
+            final_output: true,
+          },
+        ],
+      }),
+    ).toThrow();
+  });
+
+  it("activation with explicit false flags is also rejected (no triggers set to true)", () => {
+    expect(() =>
+      CrewShapeSchema.parse({
+        schema_version: "1.0",
+        name: "BAD",
+        roles: [
+          {
+            role: "dead",
+            permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] },
+            activation: { on_fault: false, on_stall: false },
+            first_input: true,
+            final_output: true,
+          },
+        ],
+      }),
+    ).toThrow();
+  });
+
+  it("activation with at least one trigger set to true is accepted", () => {
+    const shape = CrewShapeSchema.parse({
+      schema_version: "1.0",
+      name: "OK",
+      roles: [
+        {
+          role: "alpha",
+          permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] },
+          first_input: true,
+        },
+        {
+          role: "beta",
+          permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] },
+          final_output: true,
+        },
+        {
+          role: "fixer",
+          permissions: { talk_to: [], delegate_to: [], escalate_to: [], invite: [] },
+          activation: { on_fault: true },
+        },
+      ],
+    });
+    expect(shape.roles).toHaveLength(3);
+  });
 });
 
 describe("CrewAgentsSchema", () => {
