@@ -6,3 +6,5 @@ net/crates/net/sdk-ts/dist/
 net/crates/net/bindings/python/python/net/*.so
 .claude/settings.local.json
 net/crates/net/.claude/settings.local.json
+
+package-lock.json
