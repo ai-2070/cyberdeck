@@ -65,6 +65,12 @@ const RoleExecutionSchema = z.object({
 const CrewRoleSchema = z.object({
   role: z.string().min(1),
   description: z.string().optional(),
+  // Optional system prompt for this role. Workers receive it via the
+  // RoleSnapshot embedded in agent.step.requested and use it as the model's
+  // system message. The library does NOT enforce its presence — even for
+  // roles with thinking_allowed: true. If you want to require it, do that
+  // check yourself before passing the parsed shape to buildCrewGraph.
+  system_prompt: z.string().optional(),
   capabilities: RoleCapabilitiesSchema.default({ thinking_allowed: true }),
   permissions: RolePermissionsSchema,
   delegation: RoleDelegationSchema.optional(),

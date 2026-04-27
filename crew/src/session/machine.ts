@@ -10,6 +10,7 @@ import type {
   CrewEvent,
   FixerReason,
   RoleSnapshot,
+  Task,
 } from "../events/types.js";
 import type { Clock } from "../runtime/clock.js";
 import type {
@@ -91,6 +92,7 @@ class CrewSessionImpl implements CrewSession {
   private phaseIndex = -1;
   private currentPhase?: PhaseState;
   private currentInput: unknown = undefined;
+  private task?: Task;
   private agentAttempts = new Map<AgentId, number>();
   private innerByCid = new Map<string, InnerHandle>();
   private innerByOuter = new Map<AgentId, InnerHandle>();
@@ -148,6 +150,7 @@ class CrewSessionImpl implements CrewSession {
       status: this.status_,
       phaseIndex: this.phaseIndex,
       currentInput: this.currentInput,
+      ...(this.task !== undefined ? { task: this.task } : {}),
       agentAttempts: [...this.agentAttempts.entries()],
       currentPhase: cp
         ? {
@@ -199,6 +202,7 @@ class CrewSessionImpl implements CrewSession {
     this.status_ = snap.status;
     this.phaseIndex = snap.phaseIndex;
     this.currentInput = snap.currentInput;
+    if (snap.task !== undefined) this.task = snap.task;
     this.agentAttempts = new Map(snap.agentAttempts);
 
     if (snap.currentPhase) {
@@ -274,18 +278,20 @@ class CrewSessionImpl implements CrewSession {
     }
   }
 
-  start(rootInput: unknown): CrewEvent[] {
+  start(rootInput: unknown, task?: Task): CrewEvent[] {
     if (this.status_ !== "idle") {
       throw new Error(`Cannot start: session is ${this.status_}`);
     }
     this.status_ = "awaiting_responses";
     this.currentInput = rootInput;
+    if (task !== undefined) this.task = task;
 
     const events: CrewEvent[] = [
       {
         type: "crew.started",
         crewId: this.crewId,
         rootInput,
+        ...(this.task !== undefined ? { task: this.task } : {}),
         ts: this.clock.now(),
       },
     ];
@@ -969,6 +975,9 @@ function snapshotRole(role: CrewRole): RoleSnapshot {
     name: role.role,
     ...(role.description !== undefined
       ? { description: role.description }
+      : {}),
+    ...(role.system_prompt !== undefined
+      ? { system_prompt: role.system_prompt }
       : {}),
     capabilities: {
       ...role.capabilities,

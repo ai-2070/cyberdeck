@@ -48,6 +48,7 @@ const shape: CrewShape = CrewShapeSchema.parse(jsonInput);
 |---|---|---|
 | `role` | `string` | Role name (used as id) |
 | `description` | `string?` | Free-form description |
+| `system_prompt` | `string?` | **Optional, unenforced.** The model's system message for this role. Carried in `RoleSnapshot`. The library does NOT check that LLM-driven roles have one — see [system_prompt is optional](#system_prompt-is-optional). |
 | `capabilities` | `RoleCapabilities` | `thinking_allowed` (default `true`), `tools?: string[]`, `model?: string` |
 | `permissions` | `RolePermissions` | `talk_to`, `delegate_to`, `escalate_to`, `invite` arrays; optional `modify_structure` |
 | `delegation` | `{ max_depth }?` | Optional depth limit |
@@ -59,6 +60,28 @@ const shape: CrewShape = CrewShapeSchema.parse(jsonInput);
 | `nested_crew` | `string?` | Reference to another crew shape in the registry |
 | `hooks` | `LifecycleHooks?` | Hook name bindings |
 | `execution` | `RoleExecution?` | `voting`, `checkpoints`, `timeout_ms`, `serial`, `memex` |
+
+#### `system_prompt` is optional
+
+Roles can declare a `system_prompt` on the shape; it propagates into the `RoleSnapshot` that workers receive on every `agent.step.requested`. The library does **not** require it — even for roles with `capabilities.thinking_allowed: true`. There's no schema-time error and no lint warning for missing prompts.
+
+This is deliberate:
+
+- Non-LLM glue roles (e.g. a `caller` with `thinking_allowed: false`) legitimately don't need a prompt.
+- Workers may construct the system message from other inputs (a registry of personas, the role description, etc.).
+- The crew library doesn't know what your worker's prompt assembly looks like.
+
+If you want strict enforcement, do it in your own pre-flight check before calling `buildCrewGraph`:
+
+```ts
+const shape = CrewShapeSchema.parse(jsonInput);
+for (const r of shape.roles) {
+  if (r.capabilities.thinking_allowed !== false && !r.system_prompt) {
+    throw new Error(`Role "${r.role}" needs a system_prompt`);
+  }
+}
+const graph = buildCrewGraph(shape, counts);
+```
 
 **`permissions.invite`** entries can be either `"role-name"` strings or `{ role: string; consensus?: ConsensusConfig }` objects. Accepted by the schema for forward-compat with v2 dynamic crews; v1 silently ignores them.
 
@@ -208,7 +231,7 @@ import type { CrewEvent } from "@ai2070/crew";
 
 | Type | Notable fields |
 |---|---|
-| `crew.started` | `crewId`, `rootInput` |
+| `crew.started` | `crewId`, `rootInput`, `task?` |
 | `role.entered` | `roleId` |
 | `agent.step.requested` | `correlationId`, `agentId`, `roleId`, `input`, `memex_context?`, `role` (RoleSnapshot), `timeoutMs?` |
 | `fixer.invoked` | `agentId`, `reason: "fault" \| "stall" \| "timeout" \| "permission_denied"` |
@@ -240,10 +263,24 @@ Self-contained role projection embedded in `agent.step.requested`. Workers don't
 interface RoleSnapshot {
   name: string;
   description?: string;
+  system_prompt?: string;          // see "system_prompt is optional" above
   capabilities?: { model?: string; tools?: string[]; thinking_allowed?: boolean };
   permissions: { talk_to: string[]; delegate_to: string[]; escalate_to: string[] };
 }
 ```
+
+### `Task`
+
+Session-level metadata that describes the crew's purpose. Set at `start()`, emitted once on `crew.started`, captured in the snapshot. **Does not propagate** to per-step `agent.step.requested` events — each phase only sees the upstream phase's resolved output as its `input`. The caller (entry-point role) receives `rootInput` (typically derived from the task) and is responsible for formulating prompts the next phase sees.
+
+```ts
+interface Task {
+  description: string;
+  // Future: priority, deadline, success_criteria, intent_id (memex Intent linkage), parents.
+}
+```
+
+Use `Task` for observability (logs, traces), replay metadata, and (later) cross-crew coordination via memex Intent. It is NOT a per-agent prompt — that's what `role.system_prompt` plus the cascading `input` are for.
 
 ### `MemoryCommand`, `MemoryItemShape`, `EdgeShape`
 
@@ -474,7 +511,7 @@ const session: CrewSession = createCrewSession({
 
 ```ts
 interface CrewSession {
-  start(rootInput: unknown): CrewEvent[];
+  start(rootInput: unknown, task?: Task): CrewEvent[];
   deliver(event: CrewEvent): CrewEvent[];
   tick(now: number): CrewEvent[];
   cancel(reason: "cancelled" | "timeout"): CrewEvent[];
@@ -486,7 +523,7 @@ interface CrewSession {
 }
 ```
 
-**`start(rootInput)`** — transitions from `"idle"` to `"awaiting_responses"`. Emits `crew.started` + `role.entered` (caller) + `agent.step.requested` (caller). Throws if called twice.
+**`start(rootInput, task?)`** — transitions from `"idle"` to `"awaiting_responses"`. Emits `crew.started` (with `task` field if provided) + `role.entered` (caller) + `agent.step.requested` (caller). The `task` is stashed at the session level — present on `crew.started` and in the snapshot, NOT on per-step requests. Throws if called twice.
 
 **`deliver(event)`** — feeds an inbound event back. Returns the burst of outbound events emitted in response. Idempotent on duplicate terminals (first wins). `agent.stream.chunk` is a no-op (chunks pass through the bus, not the session). Returns `[]` after `cancel` or `complete`.
 
@@ -550,7 +587,7 @@ for (const e of events) bus.publish(e);
 
 ### `CrewSnapshot`
 
-Fully serializable. Captures: machine status, phase index, current input, per-agent attempt counters, the current phase's pending requests (with input, role snapshot, and memex context for each), processed terminals, fixer-step substitution map, nested handles (recursive snapshots, plus inner adapter state when hard-isolated), and timestamp.
+Fully serializable. Captures: machine status, phase index, current input, the session-level `task` (if set at `start()`), per-agent attempt counters, the current phase's pending requests (with input, role snapshot, and memex context for each), processed terminals, fixer-step substitution map, nested handles (recursive snapshots, plus inner adapter state when hard-isolated), and timestamp.
 
 `toJSON(snapshot)` is unnecessary — the snapshot is plain serializable data.
 

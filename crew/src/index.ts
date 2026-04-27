@@ -52,6 +52,7 @@ export type {
   MemoryCommand,
   MemoryItemShape,
   EdgeShape,
+  Task,
 } from "./events/types.js";
 export { isInboundEvent, isTerminalInbound } from "./events/types.js";
 

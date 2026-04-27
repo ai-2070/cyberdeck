@@ -84,6 +84,7 @@ const shape = CrewShapeSchema.parse({
     {
       role: "merc",
       capabilities: { thinking_allowed: true, model: "claude-sonnet-4-6" },
+      system_prompt: "You are a research operative. Gather facts efficiently.",
       permissions: { talk_to: ["caller"], delegate_to: [], escalate_to: ["fixer"], invite: [] },
       amount: 4,
     },
@@ -122,8 +123,12 @@ const session = createCrewSession({
   clock: systemClock(),
 });
 
-// 4. Drive the session against your bus.
-const initial = session.start("What sleep patterns do birds have?");
+// 4. Drive the session against your bus. The optional `task` argument is
+//    session-level metadata — emitted once on `crew.started`, captured in
+//    snapshots, NOT propagated to per-step requests.
+const initial = session.start("What sleep patterns do birds have?", {
+  description: "Research bird sleep patterns",
+});
 for (const e of initial) bus.publish(e);
 
 bus.subscribe("agent.step.completed", (e) => {
@@ -144,9 +149,15 @@ The bus consumer (somewhere else in your stack) listens for `agent.step.requeste
 - **The session emits requests** — when a phase starts, the session emits `agent.step.requested` for every agent in that role with a self-contained role snapshot, the input, and the optional memex context. Workers handle them however.
 - **The session waits for responses** — every request has a deterministic `correlationId`. Responses match by id. Phases wait for all agents to resolve before voting.
 - **Voting picks one output per phase** — `first_valid` (default), `majority`, `unanimous`, or `weighted_consensus`. The resolved value becomes the input to the next phase.
+- **The cascade is one-way** — phase N+1 only sees phase N's resolved output as its `input`. The original `rootInput` only reaches the caller (entry-point role). Each role brings its own memex view and own `system_prompt`. Workers compose the model prompt from those three pieces.
 - **Faults route to fixer** — if any role has `activation.on_fault`, an agent's failure spawns a fixer step whose response substitutes for the failed agent's slot in voting.
 - **Nested crews are recursive** — a role can declare `nested_crew`, which causes its agents to spawn inner sessions instead of going to the bus. Memory can be soft-isolated (shared adapter) or hard-isolated (forked, merged on completion).
-- **Snapshot/resume preserves it all** — `session.snapshot()` returns a serializable record of every pending step's input, role snapshot, memex context, and inner-session state. `resumeCrewSession(snap, laterEvents, opts)` rebuilds it.
+- **Task is session-level metadata** — `start(rootInput, task?)` accepts an optional `Task = { description: string }`. It rides on `crew.started` once and lives in the snapshot for replay/observability. It does **not** propagate onto per-step requests; it's not a substitute for the input cascade.
+- **Snapshot/resume preserves it all** — `session.snapshot()` returns a serializable record of every pending step's input, role snapshot, memex context, the session-level task, and inner-session state. `resumeCrewSession(snap, laterEvents, opts)` rebuilds it.
+
+### `system_prompt` is optional and unenforced
+
+Each role can declare a `system_prompt: string` on the shape. It's carried in the `RoleSnapshot` embedded in `agent.step.requested` so workers can use it as the model's system message. The library does **not** validate that LLM-driven roles (`capabilities.thinking_allowed: true`) actually have one — that's a worker-side / caller-side concern. If you want strict checks, walk the parsed shape yourself before `buildCrewGraph` and reject roles that need a prompt and don't have one.
 
 ## Determinism
 
