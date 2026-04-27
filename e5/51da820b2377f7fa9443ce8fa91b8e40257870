@@ -1,0 +1,35 @@
+crew/src/schema/shape.ts
+  e48dc961ad3c1a17 68-73
+crew/README.md
+  e48dc961ad3c1a17 87,126-131,152,155-160
+crew/src/events/types.ts
+  e48dc961ad3c1a17 65-78,84-87,106
+crew/src/session/machine.ts
+  e48dc961ad3c1a17 13,95,153,205,281,287,294,979-981
+crew/src/session/types.ts
+  e48dc961ad3c1a17 8,67,86
+crew/src/index.ts
+  e48dc961ad3c1a17 55
+crew/API.md
+  e48dc961ad3c1a17 51,64-85,234,266,272-284,514,526,590
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "e551da820b2377f7fa9443ce8fa91b8e40257870",
+  "prompts": {
+    "e48dc961ad3c1a17": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca50c99d-a28a-4b8c-8cee-20b6bca23864",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 94,
+      "overriden_lines": 0
+    }
+  }
+}
