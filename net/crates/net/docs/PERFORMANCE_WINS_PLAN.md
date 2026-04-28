@@ -197,6 +197,69 @@ shard counts.
 
 ---
 
+### 14. Shard mutex serializes producers around the lock-free ring buffer
+
+**File:** `src/shard/mod.rs:241, 128, 461, 480, 527`
+
+```rust
+// mod.rs:241 — routing table holds shards behind a mutex
+shards: Vec<Arc<parking_lot::Mutex<Shard>>>,
+
+// mod.rs:128 — try_push_raw takes &mut self, which forces the lock
+pub fn try_push_raw(&mut self, raw: Bytes) -> Result<u64, IngestionError> { ... }
+
+// mod.rs:461 — every single-event ingest path acquires the mutex
+let mut shard = shard_lock.lock();
+self.push_with_backpressure(&mut shard, shard_id, raw)
+```
+
+The `RingBuffer::try_push` underneath is `&self` and lock-free, with
+cache-padded head/tail and a documented SPSC contract. The wrapping
+`parking_lot::Mutex<Shard>` makes the producer side single-threaded
+*via the mutex* — correct in the sense that it preserves SPSC, but it
+throws away the point of the lock-free ring. Every multi-producer
+ingest into a single shard now pays a mutex acquisition.
+
+Nothing the producer touches actually needs `&mut self`:
+`RingBuffer::try_push` is already `&self`; `counters` are atomics;
+`metrics_collector` is an `Arc`; `timestamp_gen.next()` is internally
+CAS-based.
+
+**Fix.** Two viable options:
+
+1. **Switch to a true MPSC lock-free queue.** `crossbeam-queue::ArrayQueue`
+   (already pulled in under the `net` feature) is a bounded MPMC
+   lock-free ring. Producer side goes lockless under contention;
+   consumer side too. Drop `Mutex<Shard>` entirely — the batch worker
+   becomes the only consumer post-#4 and can use `try_pop` directly.
+2. **Keep the SPSC ring, flip `Shard::try_push_raw` to `&self`.** More
+   delicate: SPSC requires effectively single-producer, which the
+   mutex preserves but a bare `Arc<Shard>` does not. Only viable if
+   you can guarantee per-shard producer affinity (pinned executor /
+   thread-local). Doing this naively reintroduces the UB call out at
+   `ring_buffer.rs:62-67`.
+
+Option 1 is the safer default; the dep already exists.
+
+Interactions with other items:
+
+- #4 (Notify drain worker) eliminates *consumer*-side empty-poll
+  mutex acquisitions; #14 eliminates the producer-side ones. Land
+  both for the full picture.
+- #5's third sub-point ("verify `push_with_backpressure` is a pure
+  fast path") becomes moot once the lock is gone.
+- #9 (timestamp CAS): a hot CAS on a per-shard `AtomicU64` becomes
+  load-bearing once producers go truly concurrent. Keep the CAS;
+  re-evaluate the spin hint under real contention.
+
+**Estimated impact:** uncontended (one producer per shard, e.g. one
+tokio worker pinned per shard), ~20-40 ns saved per ingest. Under
+realistic multi-tokio-worker load where traffic lands in the same
+shard, expect **2-10× publish throughput** at the boundary. Single
+biggest perf change available in the crate.
+
+---
+
 ## MEDIUM
 
 ### 6. Shutdown flag uses `Acquire` on every ingest
@@ -385,6 +448,144 @@ pattern.
 
 ---
 
+### 15. `RingBuffer::pop_batch` allocates a fresh `Vec<T>` every call
+
+**File:** `src/shard/ring_buffer.rs:199-242`
+
+```rust
+pub fn pop_batch(&self, max: usize) -> Vec<T> {
+    ...
+    let mut result = Vec::with_capacity(count);
+    for i in 0..count { result.push(...); }
+    ...
+    result
+}
+```
+
+Called by the drain worker on every cycle (`bus.rs:793, 806`). The
+returned `Vec` is sent over an mpsc, consumed, and dropped — so each
+cycle allocates a buffer the consumer immediately frees. Under load
+this is 100k+ allocs/sec/shard.
+
+**Fix.** Add `pop_batch_into(&self, dst: &mut Vec<T>, max: usize) -> usize`
+that drains into a caller-owned buffer; keep the allocating variant
+for ergonomics. The drain/batch worker keeps one reused `Vec`.
+
+If #4 collapses drain+batch into one task (which it should), this
+becomes "drain directly into the worker's `current_batch`" — no
+intermediate allocation at all. Land #4 first, then this becomes a
+trivial follow-on.
+
+**Estimated impact:** one heap alloc + free removed per drain cycle
+per shard. Modest but free.
+
+---
+
+### 16. `ShardTable::shard_index` uses SipHash; a dense `Vec` is strictly better
+
+**File:** `src/shard/mod.rs:246, 393-402`
+
+```rust
+shard_index: std::collections::HashMap<u16, usize>,
+...
+fn resolve_idx(&self, table: &ShardTable, shard_id: u16) -> Option<usize> {
+    if self.mapper.is_none() {
+        Some(shard_id as usize)              // static-mode fast path
+    } else {
+        table.shard_index.get(&shard_id).copied()  // dynamic mode
+    }
+}
+```
+
+The static-mode path bypasses the map, so this only matters for
+dynamic scaling. But there it runs once per event in the hot path,
+through `HashMap::get(&u16)` with the default SipHash — chosen for
+HashDoS resistance, irrelevant for u16 ids the bus assigns itself.
+
+**Fix.** Either swap to `rustc_hash::FxHashMap` (drop-in, ~2-3× faster
+hash) or — since shard ids are bounded and small — use
+`Vec<Option<usize>>` indexed by `shard_id as usize`. The dense Vec is
+strictly better: bounds check + load, no hashing. With shard counts
+that can grow during scaling, also consider a sparse `Vec` keyed by
+`shard_id` allocated lazily up to the current max id.
+
+**Estimated impact:** ~10-20 ns/lookup → ~2 ns. Per-event in dynamic
+scaling mode; zero in static mode. Pairs with #5's hoisting of
+`resolve_idx`.
+
+---
+
+### 17. Cursor-advance check compares two `HashMap`s for full equality every poll
+
+**File:** `src/consumer/merge.rs:402`
+
+```rust
+let cursor_advanced = final_cursor.positions != cursor.positions;
+```
+
+Sets a single boolean by structurally comparing two
+`HashMap<u16, Arc<str>>` — every shard's `Arc<str>` content compared
+end-to-end. The mutations that actually change the cursor are
+explicit and trackable: line 290 (`nc.set(...)` from adapter result)
+and line 398 (`final_cursor.set(event.shard_id, event.id.clone())`).
+
+**Fix.** Maintain `cursor_advanced: bool` directly: set it `true` at
+those two mutation sites, drop the equality comparison. The
+equivalent flag is both faster and easier to reason about than the
+structural compare.
+
+**Estimated impact:** O(shards) Arc-content compares saved per poll —
+~200-400 ns at 16 shards. Adds up at high consumer poll rates.
+
+---
+
+### 18. `EventBus::ingest_batch` allocates an intermediate `Vec<RawEvent>` for type conversion
+
+**File:** `src/bus.rs:441-442`
+
+```rust
+let raw: Vec<RawEvent> = events.into_iter().map(|e| e.into_raw()).collect();
+self.ingest_raw_batch(raw)
+```
+
+Pure type-conversion alloc: the `Vec<RawEvent>` exists only to be
+consumed once by `ingest_raw_batch`.
+
+**Fix.** Make `ingest_raw_batch` (here and `ShardManager::ingest_raw_batch`
+at `mod.rs:492`) accept `impl IntoIterator<Item = RawEvent>`. The
+`into_raw()` map then fuses with the bucket-grouping pass — no
+intermediate `Vec`. Combines naturally with #5.
+
+**Estimated impact:** one heap alloc removed per `ingest_batch` call.
+Trivial diff.
+
+---
+
+### 19. `PollMerger::poll` allocates a shards `Vec` on every all-shards poll
+
+**File:** `src/consumer/merge.rs:225-228`
+
+```rust
+let shards: Vec<u16> = request
+    .shards
+    .clone()
+    .unwrap_or_else(|| (0..self.num_shards).collect());
+```
+
+When the caller didn't specify any shards (the common case), this
+allocates a fresh `Vec<u16>` of `0..N` just to iterate it once at
+line 247.
+
+**Fix.** Split the two paths: borrow `request.shards.as_deref()`
+when present, iterate `0..self.num_shards` directly otherwise. No
+allocation on the common path.
+
+**Estimated impact:** one ~128-byte allocation removed per poll at
+64 shards. Low per-call but high call frequency on consumer-heavy
+deployments.
+
+---
+
 ## LOW / already in good shape
 
 - `Cargo.toml` release profile: LTO=fat, `codegen-units=1`, `panic=abort`,
@@ -401,15 +602,25 @@ pattern.
 
 ## Suggested order of attack
 
-1. **#1 — JetStream pipelining.** Single biggest gain in the crate; the
-   change is local to `on_batch`.
-2. **#4 — Notify-based drain worker.** Biggest latency improvement;
-   modest effort.
+1. **#1 — JetStream pipelining.** Biggest single adapter gain; local to
+   `on_batch`.
+2. **#14 + #4 together — drop the shard mutex, switch the drain worker
+   to `Notify`.** Eliminates producer-side and consumer-side mutex
+   traffic on the same shard at once; biggest publish-side throughput
+   win in the crate. Land as a paired change so the SPSC/MPSC contract
+   never goes stale between commits.
 3. **#3, #2 — Kill per-event String allocations in adapters.**
    Straightforward, measurable.
-4. **#5 — Batch ingest cleanup.** Touches a hot path and simplifies the
-   locking story.
-5. **#6 — `Acquire` → `Relaxed`.** 15-minute change; measure to confirm.
+4. **#5 + #16 + #18 — Batch ingest cleanup.** Hoist `resolve_idx`,
+   replace `shard_index` HashMap with a dense Vec, take
+   `IntoIterator<Item = RawEvent>`. Touches the same code; do in one
+   pass.
+5. **#15 — `pop_batch_into`.** Trivial follow-on once #4 is in place
+   (or "drain straight into the worker buffer" if drain+batch get
+   collapsed).
+6. **#17 — cursor-advance flag.** Pairs with #11/#12 in the merge
+   path; one-file diff.
+7. **#6 — `Acquire` → `Relaxed`.** 15-minute change; measure to confirm.
 
 Each item should land with a benchmark in `benches/` or a numbers
 update in `BENCHMARKS.md` so regressions are caught.
