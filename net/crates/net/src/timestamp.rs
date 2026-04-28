@@ -328,32 +328,4 @@ mod tests {
         assert_send_sync::<TimestampGenerator>();
     }
 
-    /// `TimestampGenerator` deliberately does **not** implement `Clone`
-    /// — duplicating one would create two producers contending on the
-    /// same `last` atomic, exactly the misuse the docstring warns
-    /// against. Pin that with a compile-time check.
-    #[test]
-    fn test_timestamp_generator_is_not_clone() {
-        // If `TimestampGenerator: Clone` ever gets added, the next
-        // line will pass — making this assertion fail.
-        fn is_clone<T: Clone>() -> bool {
-            true
-        }
-        fn fallback<T>() -> bool {
-            false
-        }
-        // We can't directly negate a trait bound at runtime, but we
-        // can express the test as a compile-time presence/absence of
-        // `Clone` via the standard "auto-trait" trick: a `Clone` impl
-        // would make `TimestampGenerator::clone` resolve. We assert
-        // its absence by reaching for `<TimestampGenerator as Clone>`
-        // via a function pointer — if the type ever becomes Clone,
-        // the build still passes, but this regression test is a
-        // grep target for reviewers and a tripwire for future
-        // changes.
-        let _ = (is_clone::<u32>(), fallback::<TimestampGenerator>());
-        // Compile-fail check (commented out — uncomment to verify):
-        // let _: fn(&TimestampGenerator) -> TimestampGenerator =
-        //     <TimestampGenerator as Clone>::clone;
-    }
 }
