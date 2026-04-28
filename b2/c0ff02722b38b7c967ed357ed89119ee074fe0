@@ -1,0 +1,23 @@
+net/crates/net/docs/PERFORMANCE_WINS_PLAN.md
+  5ed51f0c1077c040 1-292
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "b2c0ff02722b38b7c967ed357ed89119ee074fe0",
+  "prompts": {
+    "5ed51f0c1077c040": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bd9f022f-2837-4955-bb55-1d9abced23f5",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 292,
+      "total_deletions": 0,
+      "accepted_lines": 292,
+      "overriden_lines": 0
+    }
+  }
+}
