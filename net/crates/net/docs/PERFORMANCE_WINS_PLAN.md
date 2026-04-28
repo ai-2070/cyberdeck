@@ -262,6 +262,129 @@ in the API or add a debug assertion.
 
 ---
 
+### 10. `dispatch_batch` clones the entire `Batch` per retry attempt
+
+**File:** `src/bus.rs:651-671`
+
+```rust
+async fn dispatch_batch(
+    adapter: &dyn Adapter,
+    batch: Batch,
+    shard_id: u16,
+    timeout: Duration,
+    retries: u32,
+) -> bool {
+    // Retry attempts clone the batch; the final attempt moves it, saving
+    // one clone per dispatch (the common path is retries == 0).
+    for attempt in 0..retries {
+        match tokio::time::timeout(timeout, adapter.on_batch(batch.clone())).await {
+            ...
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    match tokio::time::timeout(timeout, adapter.on_batch(batch)).await { ... }
+}
+```
+
+The existing comment acknowledges the trade-off: common path moves on
+the final attempt, but with `adapter_batch_retries=3` (default) a
+flapping adapter clones the full `Vec<Event>` up to 3 times per
+dispatch. Cost is zero when retries don't fire and meaningful when
+they do.
+
+**Fix.** Change `Adapter::on_batch` (currently `adapter/mod.rs:104`) to
+take `Arc<Batch>` and call `Arc::clone` (refcount bump) on each retry.
+Adapter implementations that mutate the batch internally — none
+currently do — would need `Arc::try_unwrap` on the final attempt or a
+`&Batch` signature instead.
+
+**Estimated impact:** zero on the happy path; eliminates O(retries)
+batch-sized allocations during adapter degradation. Trait signature
+change touches every adapter (`noop`, `redis`, `jetstream`, `net`) but
+each call site is one line.
+
+---
+
+### 11. Poll cursor finalization clones every event id as `String`
+
+**File:** `src/consumer/merge.rs:391-400`
+
+```rust
+// Only the last returned event per shard matters for the cursor, so
+// iterate in reverse and skip shards already seen. This reduces id
+// clones from O(all_events.len()) to O(shards.len()).
+let mut seen_shards: std::collections::HashSet<u16> =
+    std::collections::HashSet::with_capacity(shards.len());
+for event in all_events.iter().rev() {
+    if seen_shards.insert(event.shard_id) {
+        final_cursor.set(event.shard_id, event.id.clone());
+    }
+}
+```
+
+Reverse iteration already pinned the clone count to O(shards) — but
+each clone is still a heap-allocating `String::clone`. `CursorPos`
+internals already use `Arc<str>` for stored positions; the event-side
+type doesn't yet, so every poll merge re-allocates strings the cursor
+will turn around and refcount.
+
+**Fix.** Make `event.id` (and the matching cursor setter) carry
+`Arc<str>` end-to-end. `.clone()` becomes a refcount bump and the
+allocation moves once, to event construction.
+
+**Estimated impact:** poll-rate × shard-count fewer string allocations.
+Real on consumer-heavy workloads, modest otherwise.
+
+---
+
+### 12. `seen_shards` HashSet allocated per poll merge
+
+**File:** `src/consumer/merge.rs:394-395`
+
+`HashSet<u16>` with capacity = `shards.len()` is allocated once per
+poll merge purely as a "have I seen this shard yet" flag. With typical
+shard counts in the 4-64 range a `u64` / `u128` bitset is faster, has
+no allocation, and stays in a register.
+
+**Fix.** Replace with a stack-allocated bitset for `shards.len() <=
+128`; fall back to the existing `HashSet` only above that.
+
+**Estimated impact:** one allocation removed per poll; micro-win, but
+trivially small diff and complements #11.
+
+---
+
+### 13. Public `select_shard()` re-serializes the JSON value
+
+**File:** `src/shard/mod.rs:358-376`
+
+```rust
+pub fn select_shard(&self, event: &JsonValue) -> u16 {
+    let bytes = serde_json::to_vec(event).expect("Value serialization is infallible");
+    let hash = xxhash_rust::xxh3::xxh3_64(&bytes);
+    ...
+}
+```
+
+The internal hot path (`ingest`, `ingest_raw`, `ingest_raw_batch`) all
+correctly use `select_shard_by_hash` and serialize exactly once, so
+this is **not** a hot-path issue inside the crate. But the method is
+`pub`, so any SDK / FFI consumer that calls it as part of its own
+ingestion routing pays a second `serde_json::to_vec` for the same
+event the bus is about to serialize again.
+
+**Fix.** Either deprecate `select_shard(&JsonValue)` in favor of
+`RawEvent::from_value(...).hash()` + `select_shard_by_hash`, or make
+the public method take `&RawEvent` directly. Document the hash-then-
+select pattern as the intended public API.
+
+**Estimated impact:** zero on internal benchmarks; up to 2× alloc
+savings for external producers that don't follow the `RawEvent`
+pattern.
+
+---
+
 ## LOW / already in good shape
 
 - `Cargo.toml` release profile: LTO=fat, `codegen-units=1`, `panic=abort`,
