@@ -372,7 +372,10 @@ impl EventBus {
     /// The shard ID and insertion timestamp on success.
     #[inline]
     pub fn ingest(&self, event: Event) -> IngestionResult<(u16, u64)> {
-        if self.shutdown.load(AtomicOrdering::Acquire) {
+        // Relaxed: shutdown is a one-way latch; producers don't gate any
+        // memory observation on the flag, only their own decision to
+        // continue. Pair with `Release` in `shutdown()`.
+        if self.shutdown.load(AtomicOrdering::Relaxed) {
             return Err(IngestionError::ShuttingDown);
         }
 
@@ -403,7 +406,7 @@ impl EventBus {
     /// The shard ID and insertion timestamp on success.
     #[inline]
     pub fn ingest_raw(&self, event: RawEvent) -> IngestionResult<(u16, u64)> {
-        if self.shutdown.load(AtomicOrdering::Acquire) {
+        if self.shutdown.load(AtomicOrdering::Relaxed) {
             return Err(IngestionError::ShuttingDown);
         }
 
@@ -428,18 +431,21 @@ impl EventBus {
     /// This is more efficient than calling `ingest` repeatedly: events
     /// destined for the same shard share a single mutex acquisition.
     ///
+    /// Accepts any `IntoIterator<Item = Event>` so the `Event → RawEvent`
+    /// conversion fuses with the bucket-grouping pass — no intermediate
+    /// `Vec` is materialized.
+    ///
     /// # Returns
     ///
     /// The number of successfully ingested events.
-    pub fn ingest_batch(&self, events: Vec<Event>) -> usize {
-        if self.shutdown.load(AtomicOrdering::Acquire) {
+    pub fn ingest_batch(&self, events: impl IntoIterator<Item = Event>) -> usize {
+        if self.shutdown.load(AtomicOrdering::Relaxed) {
             return 0;
         }
 
-        // Convert once to `RawEvent` (pre-serializes + hashes each
-        // event) and dispatch through the grouped batch path.
-        let raw: Vec<RawEvent> = events.into_iter().map(|e| e.into_raw()).collect();
-        self.ingest_raw_batch(raw)
+        // Fuses the Event→RawEvent conversion with the grouping pass;
+        // no intermediate Vec.
+        self.ingest_raw_batch(events.into_iter().map(|e| e.into_raw()))
     }
 
     /// Ingest a batch of raw events (fastest batch ingestion).
@@ -450,13 +456,12 @@ impl EventBus {
     /// # Returns
     ///
     /// The number of successfully ingested events.
-    pub fn ingest_raw_batch(&self, events: Vec<RawEvent>) -> usize {
-        if self.shutdown.load(AtomicOrdering::Acquire) {
+    pub fn ingest_raw_batch(&self, events: impl IntoIterator<Item = RawEvent>) -> usize {
+        if self.shutdown.load(AtomicOrdering::Relaxed) {
             return 0;
         }
 
-        let total = events.len();
-        let success = self.shard_manager.ingest_raw_batch(events);
+        let (success, total) = self.shard_manager.ingest_raw_batch(events);
         if success > 0 {
             self.stats
                 .events_ingested
@@ -557,6 +562,10 @@ impl EventBus {
     pub async fn shutdown(self) -> Result<(), AdapterError> {
         // 1. Signal shutdown.
         self.shutdown.store(true, AtomicOrdering::Release);
+        // Wake every drain worker that's parked on its `Notify` so it
+        // observes the shutdown flag immediately instead of waiting up
+        // to `DRAIN_SAFETY_INTERVAL` for the periodic safety wakeup.
+        self.shard_manager.notify_all_drain_workers();
 
         // Stop the scaling monitor first — it's independent of the
         // ingestion path and just needs to observe the flag.
@@ -642,6 +651,10 @@ impl Drop for EventBus {
         // scaling monitor) observe the flag and exit. We cannot await futures
         // in Drop, but setting the atomic flag triggers eventual termination.
         self.shutdown.store(true, AtomicOrdering::Release);
+        // Drain workers may be parked on their per-shard `Notify`; wake
+        // them so they observe the shutdown flag without waiting for
+        // the safety timer.
+        self.shard_manager.notify_all_drain_workers();
     }
 }
 
@@ -773,7 +786,24 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
     })
 }
 
+/// Periodic safety wake for the drain worker. Producers normally fire
+/// `Notify::notify_one()` after every successful push, so a drain
+/// worker shouldn't ever sit in a `notified()` await for longer than
+/// one event arrival. This timeout is the belt-and-suspenders fallback
+/// for cases where a permit was missed (e.g. a producer that died
+/// mid-push) — the worker re-checks the ring buffer every interval no
+/// matter what. Long enough that idle CPU is essentially zero, short
+/// enough that any miss is invisible to operators.
+const DRAIN_SAFETY_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Spawn a drain worker for a single shard.
+///
+/// The worker awaits a per-shard [`tokio::sync::Notify`] instead of
+/// polling on a 100µs sleep timer (the prior design): producers call
+/// `notify_one()` immediately after a successful push, so the drain
+/// worker wakes up on the *first* event rather than at the next 100µs
+/// tick. That removes the empty-poll mutex acquisitions and the
+/// first-event latency floor flagged in PERF #4.
 fn spawn_drain_worker_for_shard(
     shard_id: u16,
     shard_manager: Arc<ShardManager>,
@@ -781,8 +811,15 @@ fn spawn_drain_worker_for_shard(
     shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // Grab the wake handle once. If the shard has already been
+        // removed before this task starts, exit cleanly.
+        let notify = match shard_manager.shard_notify(shard_id) {
+            Some(n) => n,
+            None => return,
+        };
+
         loop {
-            if shutdown.load(AtomicOrdering::Acquire) {
+            if shutdown.load(AtomicOrdering::Relaxed) {
                 // Final drain: loop until the ring buffer is empty.
                 // A single 10k batch is not enough — the ring
                 // buffer can hold up to `ring_buffer_capacity`
@@ -812,13 +849,21 @@ fn spawn_drain_worker_for_shard(
                     }
                 }
                 Some(_) => {
-                    // No events — yield briefly. The 100μs sleep is deliberate:
-                    // this is a latency-first system where the drain loop is the
-                    // hot path. Longer backoff would add milliseconds of latency
-                    // to the first event after a quiet period, violating the
-                    // sub-microsecond design target. The CPU cost of 100μs polling
-                    // is acceptable for a system that processes 10M+ events/sec.
-                    tokio::time::sleep(Duration::from_micros(100)).await;
+                    // Buffer empty — wait for a producer to wake us, or
+                    // for the periodic safety timer to fire. Notify
+                    // permits stack to one, so the next push following
+                    // this empty drain wakes us with no spin loop.
+                    //
+                    // Construct the notified future *before* checking the
+                    // ring buffer state — that ordering closes the race
+                    // where a notify_one() arrives between our last pop
+                    // and the start of the await.
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    tokio::select! {
+                        _ = &mut notified => {}
+                        _ = tokio::time::sleep(DRAIN_SAFETY_INTERVAL) => {}
+                    }
                 }
                 None => {
                     // Shard no longer exists (was removed)

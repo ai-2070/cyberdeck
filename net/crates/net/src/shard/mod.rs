@@ -28,8 +28,51 @@ use crate::event::{InternalEvent, RawEvent};
 use crate::timestamp::TimestampGenerator;
 
 use serde_json::Value as JsonValue;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
+
+/// Identity hasher specialized for `u16` shard ids.
+///
+/// The default `HashMap` hasher is SipHash, which is HashDoS-resistant
+/// — irrelevant here because shard ids are assigned by the bus itself,
+/// never derived from user input. For a 1-2 byte key, SipHash adds
+/// ~10 ns of setup per probe; an identity-style hasher (just promote
+/// the u16 to a u64) is 2-3 ns. With thousands of `resolve_idx` calls
+/// per second on the dynamic-scaling ingest path, the difference adds
+/// up.
+#[derive(Default, Clone, Copy)]
+struct U16IdHasher(u64);
+
+impl Hasher for U16IdHasher {
+    #[inline]
+    fn write_u16(&mut self, n: u16) {
+        // Spread the 16-bit key across the 64-bit hash space so the
+        // low-order bits the HashMap uses for bucket selection are
+        // not always zero. Multiply by a large odd constant — same
+        // trick FxHash uses for u64s.
+        self.0 = (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // The HashMap only ever calls `write_u16` for `u16` keys, but
+        // the `Hasher` trait requires `write(&[u8])` to be present.
+        // Fall back to a byte-wise mix; not on the hot path.
+        for &b in bytes {
+            self.0 = self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (b as u64);
+        }
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// `HashMap` keyed by `u16` shard id, using the identity-style hasher
+/// above. Construct with `ShardIdMap::default()`.
+type ShardIdMap<V> = std::collections::HashMap<u16, V, BuildHasherDefault<U16IdHasher>>;
 
 /// Atomic counters for a single shard. Kept outside `Shard` as `Arc`s
 /// so `ShardManager::stats()` can aggregate them without locking each
@@ -80,6 +123,12 @@ pub struct Shard {
     counters: Arc<ShardCounters>,
     /// Optional metrics collector for dynamic scaling.
     metrics_collector: Option<Arc<ShardMetricsCollector>>,
+    /// Wakes the drain worker when an event lands. Producers call
+    /// `notify_one()` after a successful push; the drain worker
+    /// `await`s `notified()` instead of polling on a fixed timer.
+    /// Stored as an `Arc` so the producer can grab a clone, drop the
+    /// shard mutex, and notify outside the critical section.
+    notify: Arc<tokio::sync::Notify>,
     /// Ring buffer capacity (for metrics).
     capacity: usize,
 }
@@ -93,6 +142,7 @@ impl Shard {
             timestamp_gen: TimestampGenerator::new(),
             counters: Arc::new(ShardCounters::default()),
             metrics_collector: None,
+            notify: Arc::new(tokio::sync::Notify::new()),
             capacity,
         }
     }
@@ -105,6 +155,7 @@ impl Shard {
             timestamp_gen: TimestampGenerator::new(),
             counters: Arc::new(ShardCounters::default()),
             metrics_collector: Some(metrics),
+            notify: Arc::new(tokio::sync::Notify::new()),
             capacity,
         }
     }
@@ -113,6 +164,14 @@ impl Shard {
     #[inline]
     pub fn counters(&self) -> Arc<ShardCounters> {
         self.counters.clone()
+    }
+
+    /// Clone the wake handle. Producers call `notify_one()` after a
+    /// successful push so the drain worker can `await` events instead
+    /// of polling.
+    #[inline]
+    pub fn notify_handle(&self) -> Arc<tokio::sync::Notify> {
+        self.notify.clone()
     }
 
     /// Set the metrics collector.
@@ -171,9 +230,26 @@ impl Shard {
     }
 
     /// Pop a batch of events from the ring buffer.
+    ///
+    /// Allocates a fresh `Vec`. Prefer [`pop_batch_into`] in the drain
+    /// loop where reusing a scratch buffer eliminates one allocation
+    /// per cycle.
+    ///
+    /// [`pop_batch_into`]: Self::pop_batch_into
     #[inline]
     pub fn pop_batch(&mut self, max: usize) -> Vec<InternalEvent> {
         self.ring_buffer.pop_batch(max)
+    }
+
+    /// Pop a batch of events into a caller-owned buffer.
+    ///
+    /// Returns the number of events drained. Appends to `dst` (does not
+    /// clear it first), so the drain worker can hold a single scratch
+    /// `Vec`, drain into it, hand the contents off, and reuse the
+    /// allocation on the next cycle.
+    #[inline]
+    pub fn pop_batch_into(&mut self, dst: &mut Vec<InternalEvent>, max: usize) -> usize {
+        self.ring_buffer.pop_batch_into(dst, max)
     }
 
     /// Try to pop a single event from the ring buffer.
@@ -243,12 +319,18 @@ pub struct ShardTable {
     /// locking the shard mutex.
     counters: Vec<Arc<ShardCounters>>,
     /// Map from shard ID to index in `shards`/`counters`.
-    shard_index: std::collections::HashMap<u16, usize>,
+    ///
+    /// Uses an identity-style hasher (see [`U16IdHasher`]) — shard ids
+    /// are bus-assigned u16s, not user input, so the HashDoS-resistant
+    /// default SipHash is wasted overhead on the dynamic-scaling
+    /// ingest path that hits this map per event.
+    shard_index: ShardIdMap<usize>,
 }
 
 impl ShardTable {
     fn new(shards: Vec<Shard>) -> Self {
-        let mut shard_index = std::collections::HashMap::with_capacity(shards.len());
+        let mut shard_index: ShardIdMap<usize> =
+            ShardIdMap::with_capacity_and_hasher(shards.len(), Default::default());
         let mut counters = Vec::with_capacity(shards.len());
         let shards: Vec<_> = shards
             .into_iter()
@@ -357,22 +439,27 @@ impl ShardManager {
 
     /// Select a shard for an event based on its content hash.
     /// Uses weighted selection if dynamic scaling is enabled.
+    ///
+    /// **Prefer [`select_shard_by_hash`].** This method serializes the
+    /// `JsonValue` to bytes just to compute the hash; if you already
+    /// have a `RawEvent` (or any pre-computed `xxh3_64` of the
+    /// canonical bytes), pass that hash directly. The internal
+    /// ingest paths all do — this method exists for ad-hoc external
+    /// callers that haven't yet adopted the `RawEvent` pattern.
+    ///
+    /// [`select_shard_by_hash`]: Self::select_shard_by_hash
     #[inline]
+    #[deprecated(
+        since = "0.5.1",
+        note = "serializes the value just to hash it; prefer `RawEvent::from_value(v).hash()` + `select_shard_by_hash` to avoid the duplicate serialization"
+    )]
     pub fn select_shard(&self, event: &JsonValue) -> u16 {
         // Use xxhash for fast, deterministic hashing. `to_vec` avoids the
         // extra UTF-8 validation that `to_string` performs on the serialized
         // buffer, since we only need the bytes for hashing.
         let bytes = serde_json::to_vec(event).expect("Value serialization is infallible");
         let hash = xxhash_rust::xxh3::xxh3_64(&bytes);
-
-        if let Some(ref mapper) = self.mapper {
-            // Dynamic mode: use weighted selection
-            mapper.select_shard(hash)
-        } else {
-            // Static mode: simple modulo
-            let num_shards = self.num_shards.load(std::sync::atomic::Ordering::Acquire);
-            (hash % num_shards as u64) as u16
-        }
+        self.select_shard_by_hash(hash)
     }
 
     /// Select a shard using a pre-computed hash.
@@ -458,8 +545,21 @@ impl ShardManager {
             .ok_or(IngestionError::Backpressure)?;
         let shard_lock = table.shards.get(idx).ok_or(IngestionError::Backpressure)?;
 
-        let mut shard = shard_lock.lock();
-        self.push_with_backpressure(&mut shard, shard_id, raw)
+        // Push under the lock; grab the notify handle while still
+        // holding it so we can wake the drain worker after release.
+        // Calling `notify_one()` outside the lock keeps the critical
+        // section minimal — the drain worker, which the wake hands
+        // off to, doesn't fight the producer for the same mutex.
+        let (result, notify) = {
+            let mut shard = shard_lock.lock();
+            let r = self.push_with_backpressure(&mut shard, shard_id, raw);
+            let n = r.is_ok().then(|| shard.notify_handle());
+            (r, n)
+        };
+        if let Some(n) = notify {
+            n.notify_one();
+        }
+        result
     }
 
     /// Ingest a raw event (pre-serialized with cached hash).
@@ -477,8 +577,16 @@ impl ShardManager {
             .ok_or(IngestionError::Backpressure)?;
         let shard_lock = table.shards.get(idx).ok_or(IngestionError::Backpressure)?;
 
-        let mut shard = shard_lock.lock();
-        self.push_with_backpressure(&mut shard, shard_id, event.bytes())
+        let (result, notify) = {
+            let mut shard = shard_lock.lock();
+            let r = self.push_with_backpressure(&mut shard, shard_id, event.bytes());
+            let n = r.is_ok().then(|| shard.notify_handle());
+            (r, n)
+        };
+        if let Some(n) = notify {
+            n.notify_one();
+        }
+        result
     }
 
     /// Ingest a batch of pre-serialized events, grouped by shard.
@@ -488,54 +596,95 @@ impl ShardManager {
     /// distribution this amortizes lock acquisitions from O(events) to
     /// O(shards). Backpressure semantics match per-event `ingest_raw`.
     ///
-    /// Returns the number of successfully ingested events.
-    pub fn ingest_raw_batch(&self, events: Vec<RawEvent>) -> usize {
-        if events.is_empty() {
-            return 0;
+    /// Accepts any `IntoIterator<Item = RawEvent>` so callers (notably
+    /// `EventBus::ingest_batch`, which converts `Event` → `RawEvent`)
+    /// can avoid materializing an intermediate `Vec`.
+    ///
+    /// Returns `(success, total)` — number of successfully ingested
+    /// events, and the total number of events the caller produced.
+    /// The difference is what backpressure dropped.
+    pub fn ingest_raw_batch(
+        &self,
+        events: impl IntoIterator<Item = RawEvent>,
+    ) -> (usize, usize) {
+        let table = self.table.load();
+        let nshards = table.shards.len();
+
+        if nshards == 0 {
+            // No shards to route into — count the input but drop everything.
+            let total = events.into_iter().count();
+            return (0, total);
         }
 
-        let table = self.table.load();
+        // In static mode, `select_shard_by_hash` already produces a value
+        // equal to the table index (`shard_id == idx`). Hoist the mode
+        // check out of the per-event loop so the dynamic-mode HashMap
+        // lookup is paid only when actually needed.
+        let static_mode = self.mapper.is_none();
 
-        // Bucket by table index. Using a Vec<Vec<_>> keyed by index is
-        // cheaper than a HashMap for the common case of a small
-        // shard count.
-        let mut groups: Vec<Vec<Bytes>> = (0..table.shards.len()).map(|_| Vec::new()).collect();
-        let mut group_ids: Vec<u16> = vec![0; groups.len()];
+        // Lazy buckets: only allocate a `Vec<Bytes>` for shards that
+        // actually receive events in this batch. The outer Vec is one
+        // contiguous allocation; previously we eagerly allocated `nshards`
+        // separate empty inner Vecs every call.
+        let mut groups: Vec<Option<Vec<Bytes>>> =
+            std::iter::repeat_with(|| None).take(nshards).collect();
 
+        let mut total = 0usize;
         for event in events {
+            total += 1;
             let shard_id = self.select_shard_by_hash(event.hash());
-            let Some(idx) = self.resolve_idx(&table, shard_id) else {
-                continue;
-            };
-            if let Some(g) = groups.get_mut(idx) {
-                if g.is_empty() {
-                    group_ids[idx] = shard_id;
+            let idx = if static_mode {
+                shard_id as usize
+            } else {
+                match table.shard_index.get(&shard_id).copied() {
+                    Some(i) => i,
+                    None => continue,
                 }
-                g.push(event.bytes());
+            };
+            if idx >= nshards {
+                continue;
             }
+            groups[idx]
+                .get_or_insert_with(Vec::new)
+                .push(event.bytes());
         }
 
         let mut success = 0usize;
-        for (idx, group) in groups.into_iter().enumerate() {
-            if group.is_empty() {
-                continue;
-            }
-            let shard_id = group_ids[idx];
+        for (idx, group_opt) in groups.into_iter().enumerate() {
+            let Some(group) = group_opt else { continue };
             let Some(shard_lock) = table.shards.get(idx) else {
                 continue;
             };
-            let mut shard = shard_lock.lock();
-            for bytes in group {
-                if self
-                    .push_with_backpressure(&mut shard, shard_id, bytes)
-                    .is_ok()
-                {
-                    success += 1;
+            // Notify once per shard after the locked push run — single
+            // wake covers the whole group, drain worker drains all of
+            // it on one trip.
+            let notify = {
+                let mut shard = shard_lock.lock();
+                // Pull `shard_id` from the locked shard rather than
+                // carrying a parallel `group_ids` Vec.
+                let shard_id = shard.id;
+                let mut any_ok = false;
+                for bytes in group {
+                    if self
+                        .push_with_backpressure(&mut shard, shard_id, bytes)
+                        .is_ok()
+                    {
+                        success += 1;
+                        any_ok = true;
+                    }
                 }
+                if any_ok {
+                    Some(shard.notify_handle())
+                } else {
+                    None
+                }
+            };
+            if let Some(n) = notify {
+                n.notify_one();
             }
         }
 
-        success
+        (success, total)
     }
 
     /// Get a reference to a shard by ID.
@@ -544,6 +693,39 @@ impl ShardManager {
         let idx = self.resolve_idx(&table, id)?;
         let shard = table.shards.get(idx)?.clone();
         Some(ShardRef { shard })
+    }
+
+    /// Get the wake handle for a shard by ID.
+    ///
+    /// The drain worker holds this `Arc<Notify>` and `await`s
+    /// `notified()` instead of polling on a fixed timer; producers
+    /// fire `notify_one()` after a successful push. Returns `None` if
+    /// the shard id isn't currently in the routing table.
+    ///
+    /// Briefly locks the shard mutex to clone the handle. Called once
+    /// at drain-worker startup, not on the hot path.
+    pub fn shard_notify(&self, id: u16) -> Option<Arc<tokio::sync::Notify>> {
+        let table = self.table.load();
+        let idx = self.resolve_idx(&table, id)?;
+        let shard_lock = table.shards.get(idx)?;
+        let handle = shard_lock.lock().notify_handle();
+        Some(handle)
+    }
+
+    /// Wake every drain worker by notifying all pending waiters on
+    /// every shard. Used at shutdown so workers exit promptly without
+    /// waiting for the periodic safety timer.
+    pub fn notify_all_drain_workers(&self) {
+        let table = self.table.load();
+        for shard_lock in &table.shards {
+            // Brief lock to grab the Notify handle. Cheap: shutdown
+            // is rare and the handle clone is just an Arc bump.
+            let n = shard_lock.lock().notify_handle();
+            n.notify_waiters();
+            // Also leave a permit so a worker that wasn't yet awaiting
+            // sees one when it next calls `notified()`.
+            n.notify_one();
+        }
     }
 
     /// Execute a function with exclusive access to a shard.
@@ -599,7 +781,7 @@ impl ShardManager {
         F: FnOnce(
             &Vec<Arc<parking_lot::Mutex<Shard>>>,
             &Vec<Arc<ShardCounters>>,
-            &std::collections::HashMap<u16, usize>,
+            &ShardIdMap<usize>,
         ) -> ShardTable,
     {
         let _guard = self.rebuild_lock.lock();
@@ -735,6 +917,29 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Sanity-check that `U16IdHasher` actually distinguishes adjacent
+    /// shard ids — a buggy hasher that always returned `0` would
+    /// degrade `shard_index` to a linked list. Probe a few adjacent
+    /// pairs and confirm the produced hashes differ.
+    #[test]
+    fn test_u16_id_hasher_spreads_adjacent_keys() {
+        use std::hash::{Hash, Hasher};
+        let probe = |k: u16| {
+            let mut h = U16IdHasher::default();
+            k.hash(&mut h);
+            h.finish()
+        };
+        for k in 0..16u16 {
+            assert_ne!(
+                probe(k),
+                probe(k + 1),
+                "adjacent shard ids must hash differently (k={k})"
+            );
+        }
+        // And: the hash of 0 is not equal to the hash of u16::MAX.
+        assert_ne!(probe(0), probe(u16::MAX));
+    }
+
     #[test]
     fn test_shard_push_pop() {
         let mut shard = Shard::new(0, 1024);
@@ -750,6 +955,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // exercises the deprecated `select_shard` path
     fn test_shard_manager_routing() {
         let manager = ShardManager::new(4, 1024, BackpressureMode::DropNewest);
 
@@ -766,6 +972,26 @@ mod tests {
 
         // With 100 random events and 4 shards, we should hit multiple shards
         assert!(shards.len() > 1);
+    }
+
+    /// Regression: the deprecated `select_shard(&JsonValue)` must produce
+    /// the same shard id as `select_shard_by_hash` would for the
+    /// equivalent `RawEvent`. They share underlying logic now, but if a
+    /// future refactor splits them this test catches the divergence
+    /// before consumers do.
+    #[test]
+    #[allow(deprecated)]
+    fn test_select_shard_matches_select_shard_by_hash() {
+        let manager = ShardManager::new(8, 1024, BackpressureMode::DropNewest);
+        for i in 0..200 {
+            let v = json!({"i": i, "tag": format!("user-{i}")});
+            let raw = RawEvent::from_value(v.clone());
+            assert_eq!(
+                manager.select_shard(&v),
+                manager.select_shard_by_hash(raw.hash()),
+                "select_shard and select_shard_by_hash must agree (i={i})"
+            );
+        }
     }
 
     #[test]
@@ -856,8 +1082,9 @@ mod tests {
             .map(|e| manager.select_shard_by_hash(e.hash()))
             .collect();
 
-        let success = manager.ingest_raw_batch(events.clone());
+        let (success, total) = manager.ingest_raw_batch(events.clone());
         assert_eq!(success, 200, "all events should land with ample capacity");
+        assert_eq!(total, 200, "total count must equal input length");
 
         // Aggregate totals must match.
         let stats = manager.stats();
@@ -919,8 +1146,9 @@ mod tests {
             .map(|i| RawEvent::from_str(&format!(r#"{{"i":{}}}"#, i)))
             .collect();
 
-        let success = manager.ingest_raw_batch(events);
+        let (success, total) = manager.ingest_raw_batch(events);
         assert_eq!(success, 3, "only 3 should fit under DropNewest");
+        assert_eq!(total, 10, "total must reflect every input event");
 
         let stats = manager.stats();
         assert_eq!(stats.events_ingested, 3);
@@ -931,10 +1159,31 @@ mod tests {
     #[test]
     fn test_ingest_raw_batch_empty() {
         let manager = ShardManager::new(4, 1024, BackpressureMode::DropNewest);
-        assert_eq!(manager.ingest_raw_batch(Vec::new()), 0);
+        assert_eq!(
+            manager.ingest_raw_batch(Vec::<RawEvent>::new()),
+            (0, 0),
+            "empty input yields (success=0, total=0)"
+        );
         let stats = manager.stats();
         assert_eq!(stats.events_ingested, 0);
         assert_eq!(stats.events_dropped, 0);
+    }
+
+    /// Regression: `ShardManager::ingest_raw_batch` accepts any
+    /// `IntoIterator<Item = RawEvent>`, so callers can fuse the
+    /// `Event → RawEvent` conversion without materializing an
+    /// intermediate `Vec`. Pin the iterator-based call site here so a
+    /// future refactor that re-tightens the signature to `Vec<RawEvent>`
+    /// fails the test, not the downstream caller.
+    #[test]
+    fn test_ingest_raw_batch_accepts_iterator() {
+        let manager = ShardManager::new(4, 1024, BackpressureMode::DropNewest);
+        // Call with a map-iterator (no intermediate Vec).
+        let (success, total) = manager.ingest_raw_batch(
+            (0..50).map(|i| RawEvent::from_str(&format!(r#"{{"i":{}}}"#, i))),
+        );
+        assert_eq!(total, 50);
+        assert_eq!(success, 50);
     }
 
     #[test]
@@ -1078,5 +1327,114 @@ mod tests {
             stats.events_dropped, 5,
             "each DropOldest cycle should count one drop"
         );
+    }
+
+    /// Successful `ingest` must hand off a wake to the per-shard
+    /// `Notify`. Without this, the drain worker would have to fall
+    /// back on the periodic safety timer (currently 100ms) and the
+    /// "first event after idle" latency would regress to that
+    /// interval — exactly the bug PERF #4 is meant to fix.
+    #[tokio::test]
+    async fn test_ingest_wakes_drain_notify() {
+        // Single-shard manager so we know exactly which shard gets the
+        // event, regardless of hash distribution.
+        let manager = ShardManager::new(1, 1024, BackpressureMode::DropNewest);
+        let notify = manager.shard_notify(0).expect("shard 0 exists");
+
+        // No producer yet — `notified()` should not be ready.
+        let try_immediate = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            notify.notified(),
+        )
+        .await;
+        assert!(
+            try_immediate.is_err(),
+            "notify must NOT have a permit before any push"
+        );
+
+        // After ingest, the next `notified().await` must resolve
+        // immediately — Notify's stack-up-to-1 permit semantics are
+        // what makes the drain worker's empty-then-await pattern race-free.
+        manager.ingest(json!({"k": "v"})).unwrap();
+        let woke = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            notify.notified(),
+        )
+        .await;
+        assert!(
+            woke.is_ok(),
+            "successful ingest must call notify_one(); drain worker would otherwise spin",
+        );
+    }
+
+    /// `ingest_raw_batch` must notify each destination shard exactly
+    /// once (per shard, not per event) so a drain worker that already
+    /// got the wake doesn't get a wasteful storm of `notify_one`s for
+    /// the rest of the batch.
+    #[tokio::test]
+    async fn test_ingest_raw_batch_notifies_per_shard() {
+        let manager = ShardManager::new(4, 1024, BackpressureMode::DropNewest);
+
+        // Send a small batch of events that should distribute across
+        // shards. Just verify each shard with at least one event has a
+        // wake permit available.
+        let events: Vec<RawEvent> = (0..50)
+            .map(|i| RawEvent::from_str(&format!(r#"{{"i":{i}}}"#)))
+            .collect();
+        let expected_dests: std::collections::HashSet<u16> = events
+            .iter()
+            .map(|e| manager.select_shard_by_hash(e.hash()))
+            .collect();
+
+        let (success, total) = manager.ingest_raw_batch(events);
+        assert_eq!(success, 50);
+        assert_eq!(total, 50);
+
+        // Every shard that received events must have a wake permit.
+        for shard_id in expected_dests {
+            let notify = manager.shard_notify(shard_id).unwrap();
+            let woke = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                notify.notified(),
+            )
+            .await;
+            assert!(woke.is_ok(), "shard {shard_id} did not receive a wake");
+        }
+    }
+
+    /// `notify_all_drain_workers` is what `EventBus::shutdown` uses to
+    /// pull every drain worker out of its `Notify::notified()` await
+    /// without waiting for the periodic safety timer.
+    #[tokio::test]
+    async fn test_notify_all_drain_workers_wakes_idle_waiters() {
+        let manager = ShardManager::new(3, 1024, BackpressureMode::DropNewest);
+        let n0 = manager.shard_notify(0).unwrap();
+        let n1 = manager.shard_notify(1).unwrap();
+        let n2 = manager.shard_notify(2).unwrap();
+
+        // Each shard's notify must initially be "no permit available".
+        for n in [&n0, &n1, &n2] {
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(10),
+                    n.notified()
+                )
+                .await
+                .is_err()
+            );
+        }
+
+        manager.notify_all_drain_workers();
+
+        // After the broadcast wake, every shard's notify must have a
+        // permit (or wake an existing waiter).
+        for (i, n) in [&n0, &n1, &n2].iter().enumerate() {
+            let woke = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                n.notified(),
+            )
+            .await;
+            assert!(woke.is_ok(), "shard {i} not woken by broadcast");
+        }
     }
 }

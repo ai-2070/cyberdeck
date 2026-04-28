@@ -195,8 +195,32 @@ impl<T> RingBuffer<T> {
     ///
     /// This is more efficient than calling `try_pop` repeatedly as it
     /// reduces atomic operations.
+    ///
+    /// Allocates a fresh `Vec`; prefer [`pop_batch_into`] in steady-state
+    /// drain loops where the caller can reuse a buffer across cycles.
+    ///
+    /// [`pop_batch_into`]: Self::pop_batch_into
     #[inline]
     pub fn pop_batch(&self, max: usize) -> Vec<T> {
+        let mut out = Vec::new();
+        self.pop_batch_into(&mut out, max);
+        out
+    }
+
+    /// Pop up to `max` elements from the buffer into a caller-owned `Vec`.
+    ///
+    /// Appends to `dst` (does not clear it first). Returns the number of
+    /// elements actually drained — may be less than `max` if the buffer
+    /// has fewer available.
+    ///
+    /// This is the steady-state drain primitive: the drain worker keeps a
+    /// single `Vec` and reuses it across cycles, eliminating one heap
+    /// allocation + free per drain. The allocating [`pop_batch`] is a
+    /// thin wrapper for ergonomics.
+    ///
+    /// [`pop_batch`]: Self::pop_batch
+    #[inline]
+    pub fn pop_batch_into(&self, dst: &mut Vec<T>, max: usize) -> usize {
         #[cfg(test)]
         {
             let current = std::thread::current().id();
@@ -222,23 +246,23 @@ impl<T> RingBuffer<T> {
         let count = available.min(max);
 
         if count == 0 {
-            return Vec::new();
+            return 0;
         }
 
-        // Pre-allocate the result vector
-        let mut result = Vec::with_capacity(count);
+        // Reserve up-front so the push loop has no reallocation branch.
+        dst.reserve(count);
 
         // Read all elements
         for i in 0..count {
             let index = (tail.wrapping_add(i)) & self.mask;
             let value = unsafe { (*self.buffer[index].get()).assume_init_read() };
-            result.push(value);
+            dst.push(value);
         }
 
         // Publish all reads at once
         self.tail.store(tail.wrapping_add(count), Ordering::Release);
 
-        result
+        count
     }
 
     /// Get the current number of elements in the buffer.
@@ -339,6 +363,56 @@ mod tests {
         assert_eq!(batch, vec![3, 4]);
 
         assert!(buf.is_empty());
+    }
+
+    /// `pop_batch_into` appends to a caller-owned buffer and returns the
+    /// number drained. Used by the drain worker to avoid one allocation
+    /// per drain cycle.
+    #[test]
+    fn test_pop_batch_into_appends_and_reports_count() {
+        let buf = RingBuffer::new(16);
+        for i in 0..7 {
+            buf.try_push(i).unwrap();
+        }
+
+        let mut dst = vec![100, 101]; // pre-existing entries should survive
+        let n = buf.pop_batch_into(&mut dst, 3);
+        assert_eq!(n, 3);
+        assert_eq!(dst, vec![100, 101, 0, 1, 2]);
+
+        // Drain remaining; cap larger than available is fine.
+        let n = buf.pop_batch_into(&mut dst, 100);
+        assert_eq!(n, 4);
+        assert_eq!(dst, vec![100, 101, 0, 1, 2, 3, 4, 5, 6]);
+        assert!(buf.is_empty());
+
+        // Empty buffer returns 0 without touching dst.
+        let n = buf.pop_batch_into(&mut dst, 10);
+        assert_eq!(n, 0);
+        assert_eq!(dst.len(), 9);
+    }
+
+    /// Reuse one buffer across many drain cycles — the steady-state
+    /// pattern the drain worker uses.
+    #[test]
+    fn test_pop_batch_into_buffer_reuse() {
+        let buf = RingBuffer::new(8);
+        let mut scratch: Vec<i32> = Vec::with_capacity(8);
+
+        for round in 0..5 {
+            for i in 0..3 {
+                buf.try_push(round * 10 + i).unwrap();
+            }
+
+            scratch.clear();
+            let n = buf.pop_batch_into(&mut scratch, 100);
+            assert_eq!(n, 3);
+            assert_eq!(
+                scratch,
+                vec![round * 10, round * 10 + 1, round * 10 + 2],
+                "round {round} drained out of order",
+            );
+        }
     }
 
     #[test]
