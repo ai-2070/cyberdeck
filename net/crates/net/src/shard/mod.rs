@@ -603,10 +603,7 @@ impl ShardManager {
     /// Returns `(success, total)` — number of successfully ingested
     /// events, and the total number of events the caller produced.
     /// The difference is what backpressure dropped.
-    pub fn ingest_raw_batch(
-        &self,
-        events: impl IntoIterator<Item = RawEvent>,
-    ) -> (usize, usize) {
+    pub fn ingest_raw_batch(&self, events: impl IntoIterator<Item = RawEvent>) -> (usize, usize) {
         let table = self.table.load();
         let nshards = table.shards.len();
 
@@ -644,9 +641,7 @@ impl ShardManager {
             if idx >= nshards {
                 continue;
             }
-            groups[idx]
-                .get_or_insert_with(Vec::new)
-                .push(event.bytes());
+            groups[idx].get_or_insert_with(Vec::new).push(event.bytes());
         }
 
         let mut success = 0usize;
@@ -1179,9 +1174,8 @@ mod tests {
     fn test_ingest_raw_batch_accepts_iterator() {
         let manager = ShardManager::new(4, 1024, BackpressureMode::DropNewest);
         // Call with a map-iterator (no intermediate Vec).
-        let (success, total) = manager.ingest_raw_batch(
-            (0..50).map(|i| RawEvent::from_str(&format!(r#"{{"i":{}}}"#, i))),
-        );
+        let (success, total) = manager
+            .ingest_raw_batch((0..50).map(|i| RawEvent::from_str(&format!(r#"{{"i":{}}}"#, i))));
         assert_eq!(total, 50);
         assert_eq!(success, 50);
     }
@@ -1342,11 +1336,8 @@ mod tests {
         let notify = manager.shard_notify(0).expect("shard 0 exists");
 
         // No producer yet — `notified()` should not be ready.
-        let try_immediate = tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            notify.notified(),
-        )
-        .await;
+        let try_immediate =
+            tokio::time::timeout(std::time::Duration::from_millis(20), notify.notified()).await;
         assert!(
             try_immediate.is_err(),
             "notify must NOT have a permit before any push"
@@ -1356,11 +1347,8 @@ mod tests {
         // immediately — Notify's stack-up-to-1 permit semantics are
         // what makes the drain worker's empty-then-await pattern race-free.
         manager.ingest(json!({"k": "v"})).unwrap();
-        let woke = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            notify.notified(),
-        )
-        .await;
+        let woke =
+            tokio::time::timeout(std::time::Duration::from_millis(50), notify.notified()).await;
         assert!(
             woke.is_ok(),
             "successful ingest must call notify_one(); drain worker would otherwise spin",
@@ -1393,11 +1381,8 @@ mod tests {
         // Every shard that received events must have a wake permit.
         for shard_id in expected_dests {
             let notify = manager.shard_notify(shard_id).unwrap();
-            let woke = tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                notify.notified(),
-            )
-            .await;
+            let woke =
+                tokio::time::timeout(std::time::Duration::from_millis(50), notify.notified()).await;
             assert!(woke.is_ok(), "shard {shard_id} did not receive a wake");
         }
     }
@@ -1415,12 +1400,9 @@ mod tests {
         // Each shard's notify must initially be "no permit available".
         for n in [&n0, &n1, &n2] {
             assert!(
-                tokio::time::timeout(
-                    std::time::Duration::from_millis(10),
-                    n.notified()
-                )
-                .await
-                .is_err()
+                tokio::time::timeout(std::time::Duration::from_millis(10), n.notified())
+                    .await
+                    .is_err()
             );
         }
 
@@ -1429,11 +1411,8 @@ mod tests {
         // After the broadcast wake, every shard's notify must have a
         // permit (or wake an existing waiter).
         for (i, n) in [&n0, &n1, &n2].iter().enumerate() {
-            let woke = tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                n.notified(),
-            )
-            .await;
+            let woke =
+                tokio::time::timeout(std::time::Duration::from_millis(50), n.notified()).await;
             assert!(woke.is_ok(), "shard {i} not woken by broadcast");
         }
     }

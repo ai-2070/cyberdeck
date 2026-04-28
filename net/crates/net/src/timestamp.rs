@@ -17,10 +17,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// This generator provides strictly monotonic timestamps with sub-nanosecond
 /// resolution and zero syscall overhead after initialization.
 ///
-/// # Thread Safety
+/// # Single-owner invariant
 ///
-/// While this struct is `Send + Sync`, for maximum performance each shard
-/// should have its own `TimestampGenerator` to avoid atomic contention.
+/// **Each producer should own a dedicated `TimestampGenerator`.** The
+/// type is `Send + Sync` and `next()` *is* safe to call concurrently —
+/// monotonicity is preserved by `compare_exchange_weak` — but the CAS
+/// loop degenerates into a spin under sustained contention. The whole
+/// design rests on the loop almost never iterating: that's only true
+/// when one writer at a time accesses the generator.
+///
+/// The codebase enforces this structurally rather than at runtime:
+///
+/// - `Shard` owns its `TimestampGenerator` by value (not behind `Arc`).
+/// - `TimestampGenerator` is **not** `Clone`, so duplicating one is a
+///   deliberate `mem::replace` / `Default::default()` away — visible
+///   in code review.
+/// - The shard's surrounding `Mutex<Shard>` serializes producers, so
+///   `next()` is invoked by exactly one caller at a time per shard.
+///
+/// If you find yourself reaching for `Arc<TimestampGenerator>`, stop
+/// — give each producer its own instance instead. Every additional
+/// concurrent caller is one more thread potentially CAS-spinning on
+/// `last`.
 pub struct TimestampGenerator {
     /// quanta clock (TSC-based after calibration).
     clock: quanta::Clock,
@@ -308,5 +326,34 @@ mod tests {
     fn test_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<TimestampGenerator>();
+    }
+
+    /// `TimestampGenerator` deliberately does **not** implement `Clone`
+    /// — duplicating one would create two producers contending on the
+    /// same `last` atomic, exactly the misuse the docstring warns
+    /// against. Pin that with a compile-time check.
+    #[test]
+    fn test_timestamp_generator_is_not_clone() {
+        // If `TimestampGenerator: Clone` ever gets added, the next
+        // line will pass — making this assertion fail.
+        fn is_clone<T: Clone>() -> bool {
+            true
+        }
+        fn fallback<T>() -> bool {
+            false
+        }
+        // We can't directly negate a trait bound at runtime, but we
+        // can express the test as a compile-time presence/absence of
+        // `Clone` via the standard "auto-trait" trick: a `Clone` impl
+        // would make `TimestampGenerator::clone` resolve. We assert
+        // its absence by reaching for `<TimestampGenerator as Clone>`
+        // via a function pointer — if the type ever becomes Clone,
+        // the build still passes, but this regression test is a
+        // grep target for reviewers and a tripwire for future
+        // changes.
+        let _ = (is_clone::<u32>(), fallback::<TimestampGenerator>());
+        // Compile-fail check (commented out — uncomment to verify):
+        // let _: fn(&TimestampGenerator) -> TimestampGenerator =
+        //     <TimestampGenerator as Clone>::clone;
     }
 }

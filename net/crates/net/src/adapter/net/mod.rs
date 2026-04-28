@@ -574,13 +574,28 @@ impl NetAdapter {
             stream.update_rx_seq(parsed.header.sequence);
         }
 
-        // Queue events for poll_shard
+        // Queue events for poll_shard.
+        //
+        // Event id format: "{seq}:{i}". `seq` is constant for the
+        // whole loop, so render it once into a prefix string and only
+        // re-format the trailing index per event. Each iteration still
+        // produces an owned `String` (StoredEvent stores it by value)
+        // but we avoid running the formatting machinery for `seq` on
+        // every iteration — the per-event allocation pressure called
+        // out in PERF #3.
         let queue = inbound.entry(shard_id).or_default();
         let seq = parsed.header.sequence;
+        use std::fmt::Write;
+        let mut prefix = String::with_capacity(24);
+        let _ = write!(prefix, "{seq}:");
+        let prefix_len = prefix.len();
         for (i, event_data) in events.into_iter().enumerate() {
-            use std::fmt::Write;
-            let mut event_id = String::with_capacity(24);
-            let _ = write!(event_id, "{}:{}", seq, i);
+            // Allocate the event_id buffer with capacity sized for
+            // prefix + a 10-digit-max u32 index, so the `push_str` +
+            // `write!` below never reallocates.
+            let mut event_id = String::with_capacity(prefix_len + 10);
+            event_id.push_str(&prefix);
+            let _ = write!(event_id, "{i}");
             queue.push(StoredEvent::new(event_id, event_data, seq, shard_id));
         }
 
