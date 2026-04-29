@@ -23,6 +23,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::adapter::{Adapter, ShardPollResult};
@@ -210,7 +211,10 @@ impl Adapter for JetStreamAdapter {
             .as_ref()
             .ok_or_else(|| AdapterError::Connection("adapter not initialized".into()))?;
 
-        let subject = self.subject(batch.shard_id);
+        // Convert to `async_nats::Subject` once — internally `Bytes`-
+        // backed, so per-iteration `subject.clone()` is an Arc-style
+        // refcount bump rather than a fresh `String` allocation.
+        let subject: async_nats::Subject = self.subject(batch.shard_id).into();
 
         // Ensure stream exists
         let _ = self.get_or_create_stream(batch.shard_id).await?;
@@ -232,18 +236,22 @@ impl Adapter for JetStreamAdapter {
         // the prior serial-await loop paid 1 RTT *per event*;
         // pipelining drops that to ~1 RTT per batch.
         //
+        // Mid-batch failure is safe: if `publish_with_headers` returns
+        // `Err` for event N, we drop the in-flight `PublishAckFuture`s
+        // for events 0..N — but dropping them does not cancel the
+        // publishes (the bytes are already on the wire to the server).
+        // The caller retries the whole batch, and the JetStream dedup
+        // window discards the prior copies via `Nats-Msg-Id`.
+        //
         // The message-id buffer (`Nats-Msg-Id` header) is reused
         // across iterations: the `{shard_id}:{seq_start}` prefix is
         // the same for every event in the batch, so we render it once
         // and only rewrite the trailing `:{i}` per event, eliminating
         // the per-event `format!` allocation.
-        use std::fmt::Write;
         let mut acks = Vec::with_capacity(serialized.len());
         let mut msg_id_buf = String::new();
-        let prefix_len = {
-            let _ = write!(msg_id_buf, "{}:{}", batch.shard_id, batch.sequence_start);
-            msg_id_buf.len()
-        };
+        let _ = write!(msg_id_buf, "{}:{}", batch.shard_id, batch.sequence_start);
+        let prefix_len = msg_id_buf.len();
 
         for (i, data) in serialized.into_iter().enumerate() {
             // Reset to the cached prefix and append `:{i}`.

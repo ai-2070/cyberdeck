@@ -233,14 +233,17 @@ impl EventBus {
         let interval = policy.metrics_window;
 
         loop {
-            if self.shutdown.load(AtomicOrdering::Acquire) {
+            // Relaxed: we're only deciding whether to break the loop;
+            // no memory observation is gated on the flag. See the
+            // shutdown-ordering note on `ingest()`.
+            if self.shutdown.load(AtomicOrdering::Relaxed) {
                 break;
             }
 
             tokio::time::sleep(interval).await;
 
             // Check shutdown again after sleep
-            if self.shutdown.load(AtomicOrdering::Acquire) {
+            if self.shutdown.load(AtomicOrdering::Relaxed) {
                 break;
             }
 
@@ -372,9 +375,11 @@ impl EventBus {
     /// The shard ID and insertion timestamp on success.
     #[inline]
     pub fn ingest(&self, event: Event) -> IngestionResult<(u16, u64)> {
-        // Relaxed: shutdown is a one-way latch. Producers don't gate
-        // any memory observation on the flag — they just decide
-        // whether to continue. Pair with `Release` in `shutdown()`.
+        // Relaxed: shutdown is a one-way latch and we don't need to
+        // observe any writes ordered before the store — we're only
+        // checking whether to abort. The Release on `store(true)` is
+        // preserved for cross-language FFI callers (Python/Node
+        // bindings) that still use Acquire.
         if self.shutdown.load(AtomicOrdering::Relaxed) {
             return Err(IngestionError::ShuttingDown);
         }
@@ -777,44 +782,60 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
 }
 
 /// Spawn a drain worker for a single shard.
+///
+/// Uses a scratch `Vec` + `pop_batch_into` so the per-cycle
+/// allocation happens *outside* the shard mutex critical section.
+/// Each cycle: lock → drain into scratch (no alloc, capacity already
+/// reserved) → unlock → `mem::replace` swaps the filled scratch out
+/// for a fresh empty `Vec` (alloc *outside* the lock) → send the
+/// filled batch on the channel.
 fn spawn_drain_worker_for_shard(
     shard_id: u16,
     shard_manager: Arc<ShardManager>,
     sender: mpsc::Sender<Vec<crate::event::InternalEvent>>,
     shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
+    const STEADY_BATCH: usize = 1_000;
+    const FINAL_BATCH: usize = 10_000;
+
     tokio::spawn(async move {
+        let mut scratch: Vec<crate::event::InternalEvent> = Vec::with_capacity(STEADY_BATCH);
+
         loop {
-            if shutdown.load(AtomicOrdering::Acquire) {
+            // Relaxed: same rationale as ingest — see `EventBus::ingest`.
+            if shutdown.load(AtomicOrdering::Relaxed) {
                 // Final drain: loop until the ring buffer is empty.
                 // A single 10k batch is not enough — the ring
                 // buffer can hold up to `ring_buffer_capacity`
                 // events (default 1M) and any leftover would be
                 // silently lost on shutdown.
+                let mut final_scratch: Vec<crate::event::InternalEvent> =
+                    Vec::with_capacity(FINAL_BATCH);
                 loop {
-                    let events = shard_manager
-                        .with_shard(shard_id, |shard| shard.pop_batch(10_000))
-                        .unwrap_or_default();
-                    if events.is_empty() {
+                    let popped = shard_manager
+                        .with_shard(shard_id, |shard| {
+                            shard.pop_batch_into(&mut final_scratch, FINAL_BATCH)
+                        })
+                        .unwrap_or(0);
+                    if popped == 0 {
                         break;
                     }
-                    if sender.send(events).await.is_err() {
+                    let batch =
+                        std::mem::replace(&mut final_scratch, Vec::with_capacity(FINAL_BATCH));
+                    if sender.send(batch).await.is_err() {
                         break;
                     }
                 }
                 break;
             }
 
-            // Drain events from ring buffer
-            let events = shard_manager.with_shard(shard_id, |shard| shard.pop_batch(1_000));
+            // Drain events from ring buffer.
+            let popped = shard_manager.with_shard(shard_id, |shard| {
+                shard.pop_batch_into(&mut scratch, STEADY_BATCH)
+            });
 
-            match events {
-                Some(events) if !events.is_empty() => {
-                    if sender.send(events).await.is_err() {
-                        break;
-                    }
-                }
-                Some(_) => {
+            match popped {
+                Some(0) => {
                     // No events — yield briefly. The 100μs sleep is deliberate:
                     // this is a latency-first system where the drain loop is the
                     // hot path. Longer backoff would add milliseconds of latency
@@ -822,6 +843,12 @@ fn spawn_drain_worker_for_shard(
                     // sub-microsecond design target. The CPU cost of 100μs polling
                     // is acceptable for a system that processes 10M+ events/sec.
                     tokio::time::sleep(Duration::from_micros(100)).await;
+                }
+                Some(_) => {
+                    let batch = std::mem::replace(&mut scratch, Vec::with_capacity(STEADY_BATCH));
+                    if sender.send(batch).await.is_err() {
+                        break;
+                    }
                 }
                 None => {
                     // Shard no longer exists (was removed)

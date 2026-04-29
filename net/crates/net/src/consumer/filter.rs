@@ -551,6 +551,56 @@ mod tests {
         }
     }
 
+    /// Fast path must recurse correctly when the single child is
+    /// itself a composite filter (Not, nested And/Or, Eq, etc.) — the
+    /// straight-line `filters[0].matches(event)` call has to dispatch
+    /// the same way the slow path's closure would.
+    #[test]
+    fn test_single_element_fast_path_recurses_into_composite() {
+        let leaf = Filter::eq("k", json!("v"));
+        let yes = json!({"k": "v"});
+        let no = json!({"k": "other"});
+
+        // And{[Not{leaf}]}
+        let nested_not = Filter::and(vec![Filter::not(leaf.clone())]);
+        assert!(!nested_not.matches(&yes));
+        assert!(nested_not.matches(&no));
+
+        // Or{[And{[leaf]}]} — both layers hit the fast path.
+        let nested_double = Filter::or(vec![Filter::and(vec![leaf.clone()])]);
+        assert!(nested_double.matches(&yes));
+        assert!(!nested_double.matches(&no));
+
+        // Or{[And{[leaf, leaf2]}]} — outer hits the fast path, inner
+        // falls through to the iterator path. Verifies the two paths
+        // compose correctly.
+        let leaf2 = Filter::eq("x", json!(1));
+        let mixed = Filter::or(vec![Filter::and(vec![leaf.clone(), leaf2.clone()])]);
+        assert!(mixed.matches(&json!({"k": "v", "x": 1})));
+        assert!(!mixed.matches(&json!({"k": "v", "x": 2})));
+        assert!(!mixed.matches(&json!({"k": "other", "x": 1})));
+    }
+
+    /// Regression: multi-element `And` / `Or` must keep using the
+    /// iterator path (not silently fall into the single-element
+    /// shortcut). Guards against a future refactor of the fast-path
+    /// guard.
+    #[test]
+    fn test_multi_element_and_or_uses_slow_path() {
+        let f1 = Filter::eq("k", json!("v"));
+        let f2 = Filter::eq("x", json!(1));
+
+        let and = Filter::and(vec![f1.clone(), f2.clone()]);
+        assert!(and.matches(&json!({"k": "v", "x": 1})));
+        assert!(!and.matches(&json!({"k": "v", "x": 2})));
+        assert!(!and.matches(&json!({"k": "other", "x": 1})));
+
+        let or = Filter::or(vec![f1.clone(), f2.clone()]);
+        assert!(or.matches(&json!({"k": "v", "x": 99})));
+        assert!(or.matches(&json!({"k": "nope", "x": 1})));
+        assert!(!or.matches(&json!({"k": "nope", "x": 2})));
+    }
+
     #[test]
     fn test_filter_builder_default() {
         let builder = FilterBuilder::default();

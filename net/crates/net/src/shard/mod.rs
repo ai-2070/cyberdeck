@@ -172,11 +172,13 @@ impl Shard {
 
     /// Pop a batch of events from the ring buffer.
     ///
-    /// Allocates a fresh `Vec`. Prefer [`pop_batch_into`] in the drain
-    /// loop where reusing a scratch buffer eliminates one allocation
-    /// per cycle.
+    /// Allocates a fresh `Vec`. Prefer [`pop_batch_into`] in drain
+    /// loops where the per-cycle `Vec` allocation should happen
+    /// outside the shard mutex (see [`RingBuffer::pop_batch_into`] for
+    /// the typical pattern).
     ///
     /// [`pop_batch_into`]: Self::pop_batch_into
+    /// [`RingBuffer::pop_batch_into`]: crate::shard::ring_buffer::RingBuffer::pop_batch_into
     #[inline]
     pub fn pop_batch(&mut self, max: usize) -> Vec<InternalEvent> {
         self.ring_buffer.pop_batch(max)
@@ -184,10 +186,10 @@ impl Shard {
 
     /// Pop a batch of events into a caller-owned buffer.
     ///
-    /// Appends to `dst` (does not clear it first). Returns the number
-    /// of events drained, so the drain worker can hold a single
-    /// scratch `Vec`, drain into it, hand the contents off, and reuse
-    /// the allocation on the next cycle.
+    /// Append semantics — see [`RingBuffer::pop_batch_into`] for
+    /// details and the typical drain-loop pattern.
+    ///
+    /// [`RingBuffer::pop_batch_into`]: crate::shard::ring_buffer::RingBuffer::pop_batch_into
     #[inline]
     pub fn pop_batch_into(&mut self, dst: &mut Vec<InternalEvent>, max: usize) -> usize {
         self.ring_buffer.pop_batch_into(dst, max)
