@@ -13,6 +13,16 @@ pub enum IngestionError {
     #[error("event dropped due to sampling")]
     Sampled,
 
+    /// Hashed shard id is not in the routing table (e.g. a concurrent
+    /// scale-down removed it, or the shard is still provisioning).
+    /// BUG_REPORT.md #44: previously collapsed into `Backpressure`,
+    /// which made callers apply the wrong remediation (back-off-and-
+    /// retry on a routing miss is futile until the topology
+    /// stabilizes). Distinct from `Backpressure` so callers can
+    /// distinguish "buffer full" from "no destination".
+    #[error("event has no routable shard")]
+    Unrouted,
+
     /// The event bus has been shut down.
     #[error("event bus is shutting down")]
     ShuttingDown,

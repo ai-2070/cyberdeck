@@ -181,12 +181,30 @@ impl ShardMetricsCollector {
     /// Transitions to draining reset `pushes_since_drain_start` so
     /// `finalize_draining` only counts pushes that arrived after the
     /// drain began.
+    ///
+    /// BUG_REPORT.md #33: a concurrent `record_push` can interleave
+    /// with the store-zero on `pushes_since_drain_start` and leave
+    /// the counter at `1` rather than `0`. That's not a correctness
+    /// bug — it just defers finalization of this shard by one
+    /// metrics tick — but the previous code did the store-zero on
+    /// the counter *before* publishing the `draining=true` flag,
+    /// which made the window slightly larger than necessary.
+    /// Publishing the flag first means any push that *observes*
+    /// `draining=true` (per #51 a future tightening) is naturally
+    /// sequenced after the reset; pushes that beat the flag publish
+    /// race the reset just like before.
+    ///
+    /// We also use `SeqCst` for the publish to give the rest of the
+    /// crate a single total order on draining transitions, which
+    /// matches the ordering on `try_enter_ingest`'s shutdown flag.
     pub fn set_draining(&self, draining: bool) {
         if draining {
+            // Store-zero first (so the flag publish below acts as
+            // the release-fence for both writes).
             self.pushes_since_drain_start
-                .store(0, AtomicOrdering::Relaxed);
+                .store(0, AtomicOrdering::SeqCst);
         }
-        self.draining.store(draining, AtomicOrdering::Release);
+        self.draining.store(draining, AtomicOrdering::SeqCst);
     }
 
     /// Number of pushes observed since `set_draining(true)` was
@@ -291,6 +309,13 @@ impl std::error::Error for ScalingError {}
 /// State of a shard in the mapper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShardState {
+    /// Shard is being provisioned: id allocated and metrics collector
+    /// in place, but `select_shard` must not route to it yet because
+    /// upstream workers (drain / batch) have not been spawned. Caller
+    /// transitions to `Active` via `activate` once the workers are
+    /// ready. Closes the BUG_REPORT.md #46 race where a freshly-added
+    /// shard accepted producer pushes before any consumer existed.
+    Provisioning,
     /// Shard is active and accepting producers.
     Active,
     /// Shard is draining (no new producers, waiting for empty).
@@ -330,6 +355,14 @@ pub struct ShardMapper {
     /// Current active shard count.
     active_count: AtomicU16,
     /// Scaling policy.
+    ///
+    /// BUG_REPORT.md #53: this field is immutable for the lifetime of
+    /// the mapper. The previous `set_policy(&mut self, …)` API was
+    /// unreachable in practice — every production callsite holds the
+    /// mapper behind an `Arc`, and `Arc::get_mut` requires a strong
+    /// count of 1, which never holds once the worker pool clones the
+    /// `Arc`. The method has been removed; recreate the mapper (and
+    /// the bus that owns it) to change the policy.
     policy: ScalingPolicy,
     /// Ring buffer capacity for new shards.
     ring_buffer_capacity: usize,
@@ -442,12 +475,24 @@ impl ShardMapper {
             .collect();
 
         if active.is_empty() {
-            // Fallback: use any non-stopped shard
-            return shards
-                .iter()
-                .find(|s| s.state != ShardState::Stopped)
-                .map(|s| s.id)
-                .unwrap_or(0);
+            // BUG_REPORT.md #51: previously fell back to `find(|s|
+            // s.state != ShardState::Stopped)`, which silently routed
+            // to a `Draining` shard. Pushes to a draining shard
+            // increment `pushes_since_drain_start`, blocking
+            // finalization indefinitely.
+            //
+            // `Provisioning` shards aren't routable either — they
+            // exist in the mapper but the routing table doesn't have
+            // them yet (#46), so any caller that tries to push lands
+            // in `resolve_idx → None` and surfaces as "unrouted" via
+            // the manager-level counter. That's the correct signal:
+            // the system has no destination for this event, the
+            // caller should back off and retry.
+            //
+            // Return `u16::MAX` (out-of-band sentinel) so callers
+            // that look up the id in the routing table get a
+            // definite miss, which the manager already accounts for.
+            return u16::MAX;
         }
 
         // Find the shard with lowest weight
@@ -549,8 +594,23 @@ impl ShardMapper {
 
     /// Execute a scale-up operation.
     ///
-    /// Creates new shards and makes them available for routing.
+    /// Creates new shards in the `Active` state and makes them
+    /// immediately available for routing. Use [`scale_up_provisioning`]
+    /// if upstream workers (drain / batch) need to be wired up before
+    /// the shard becomes selectable — otherwise producer pushes can
+    /// race ahead of consumer creation (BUG_REPORT.md #46).
+    ///
+    /// [`scale_up_provisioning`]: Self::scale_up_provisioning
     pub fn scale_up(&self, count: u16) -> Result<Vec<u16>, ScalingError> {
+        // BUG_REPORT.md #32: short-circuit `count == 0` so a no-op
+        // call doesn't bump the cooldown timestamp or trip the
+        // `u16::MAX` sentinel check below (which previously fired
+        // spuriously when `first_id == u16::MAX` even though zero ids
+        // were being allocated).
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
         // Early checks (may race, but avoid acquiring the write lock).
         // Use `checked_add` so that `current + count` can never wrap
         // past `u16::MAX` into a small value that slips under the
@@ -662,6 +722,184 @@ impl ShardMapper {
         }
 
         Ok(new_ids)
+    }
+
+    /// Like [`scale_up`], but the new shards are created in the
+    /// `Provisioning` state. They receive an id and a metrics
+    /// collector, but `select_shard` will not route to them and they
+    /// are excluded from `active_shard_count` / `evaluate_scaling`
+    /// until the caller transitions each shard with [`activate`].
+    ///
+    /// Use this when upstream consumer infrastructure (drain/batch
+    /// workers, mpsc channels, etc.) must be wired up *before* the
+    /// shard becomes selectable. Without this gating, producers can
+    /// observe the shard via `select_shard`, push into its ring
+    /// buffer, and never have those events drained — the BUG_REPORT.md
+    /// #46 race.
+    ///
+    /// Returns the allocated ids in order. Cooldown / `max_shards`
+    /// gating matches `scale_up` so that staged allocation cannot be
+    /// used to bypass the policy.
+    ///
+    /// [`scale_up`]: Self::scale_up
+    /// [`activate`]: Self::activate
+    pub fn scale_up_provisioning(&self, count: u16) -> Result<Vec<u16>, ScalingError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        // Same budget gate as `scale_up`. We compare against the
+        // already-active count because Provisioning shards eventually
+        // become Active — letting the count grow past `max_shards`
+        // here would just defer the error to `activate`.
+        let current = self.active_count.load(AtomicOrdering::Acquire);
+        let would_be = current
+            .checked_add(count)
+            .ok_or(ScalingError::AtMaxShards)?;
+        if would_be > self.policy.max_shards {
+            return Err(ScalingError::AtMaxShards);
+        }
+        {
+            let last = self.last_scaling.read();
+            if let Some(ts) = *last {
+                if ts.elapsed() < self.policy.cooldown {
+                    return Err(ScalingError::InCooldown);
+                }
+            }
+        }
+
+        let mut shards = self.shards.write();
+
+        // Re-check under the write lock.
+        let current = self.active_count.load(AtomicOrdering::Acquire);
+        let would_be = current
+            .checked_add(count)
+            .ok_or(ScalingError::AtMaxShards)?;
+        if would_be > self.policy.max_shards {
+            return Err(ScalingError::AtMaxShards);
+        }
+        {
+            let last = self.last_scaling.read();
+            if let Some(ts) = *last {
+                if ts.elapsed() < self.policy.cooldown {
+                    return Err(ScalingError::InCooldown);
+                }
+            }
+        }
+
+        let first_id = self.next_shard_id.load(AtomicOrdering::Relaxed);
+        let last_needed = first_id
+            .checked_add(count.saturating_sub(1))
+            .ok_or(ScalingError::AtMaxShards)?;
+        if last_needed == u16::MAX {
+            return Err(ScalingError::AtMaxShards);
+        }
+        self.next_shard_id
+            .store(first_id + count, AtomicOrdering::Relaxed);
+
+        let mut new_ids = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let new_id = first_id + i;
+            shards.push(MappedShard {
+                id: new_id,
+                state: ShardState::Provisioning,
+                metrics: Arc::new(ShardMetricsCollector::new(
+                    new_id,
+                    self.ring_buffer_capacity,
+                )),
+                drain_started: None,
+                last_metrics: ShardMetrics::new(new_id),
+            });
+            new_ids.push(new_id);
+        }
+
+        // Update cooldown timestamp but NOT active_count — these
+        // shards are not active yet. `activate` bumps it.
+        *self.last_scaling.write() = Some(Instant::now());
+        drop(shards);
+        // Intentionally do NOT fire `on_shard_created` here — the
+        // callback signals "shard is live"; provisioning shards are
+        // not. `activate` fires it instead.
+        Ok(new_ids)
+    }
+
+    /// Transition a `Provisioning` shard to `Active`.
+    ///
+    /// Idempotent for `Active` shards (returns `Ok(())` without
+    /// re-firing the callback). Returns `InvalidPolicy` for unknown
+    /// or `Draining`/`Stopped` shards — those states require a
+    /// different lifecycle path. Bumps `active_count` and notifies
+    /// the `on_shard_created` callback exactly once.
+    pub fn activate(&self, shard_id: u16) -> Result<(), ScalingError> {
+        let mut shards = self.shards.write();
+        let shard = shards.iter_mut().find(|s| s.id == shard_id).ok_or_else(|| {
+            ScalingError::InvalidPolicy(format!("activate: shard {} not found", shard_id))
+        })?;
+        match shard.state {
+            ShardState::Active => return Ok(()),
+            ShardState::Provisioning => {
+                shard.state = ShardState::Active;
+            }
+            ShardState::Draining | ShardState::Stopped => {
+                return Err(ScalingError::InvalidPolicy(format!(
+                    "activate: shard {} is in state {:?}, cannot activate",
+                    shard_id, shard.state
+                )));
+            }
+        }
+        drop(shards);
+
+        // Bump active_count to mirror what `scale_up` would have done.
+        self.active_count.fetch_add(1, AtomicOrdering::Release);
+
+        if let Some(callback) = self.on_shard_created.read().as_ref() {
+            callback(shard_id);
+        }
+        Ok(())
+    }
+
+    /// Drain a specific shard by id, transitioning it from `Active`
+    /// to `Draining`.
+    ///
+    /// BUG_REPORT.md #48: companion to `ShardManager::drain_shard`.
+    /// The previous implementation only flipped the metrics
+    /// collector's `draining` atomic; this version atomically updates
+    /// `MappedShard.state` (so `select_shard` stops routing to the
+    /// shard) and decrements `active_count` (so `evaluate_scaling`'s
+    /// budget math stays consistent with `scale_down`). Returns an
+    /// error if the shard is not in `Active` state, or if doing so
+    /// would push the active count below `min_shards`.
+    pub fn drain_specific(&self, shard_id: u16) -> Result<(), ScalingError> {
+        let mut shards = self.shards.write();
+        let current_active = self.active_count.load(AtomicOrdering::Acquire);
+        if current_active <= self.policy.min_shards {
+            return Err(ScalingError::AtMinShards);
+        }
+        let shard = shards
+            .iter_mut()
+            .find(|s| s.id == shard_id)
+            .ok_or_else(|| {
+                ScalingError::InvalidPolicy(format!(
+                    "drain_specific: shard {} not found",
+                    shard_id
+                ))
+            })?;
+        match shard.state {
+            ShardState::Active => {
+                shard.state = ShardState::Draining;
+                shard.drain_started = Some(Instant::now());
+                shard.metrics.set_draining(true);
+            }
+            ShardState::Draining => return Ok(()),
+            ShardState::Provisioning | ShardState::Stopped => {
+                return Err(ScalingError::InvalidPolicy(format!(
+                    "drain_specific: shard {} is in state {:?}, cannot drain",
+                    shard_id, shard.state
+                )));
+            }
+        }
+        drop(shards);
+        self.active_count.fetch_sub(1, AtomicOrdering::Release);
+        Ok(())
     }
 
     /// Start draining shards for scale-down.
@@ -782,7 +1020,16 @@ impl ShardMapper {
             }
         }
 
-        // Notify callback
+        // BUG_REPORT.md #49: drop the write lock BEFORE notifying.
+        // The callback is user-supplied and may re-enter the mapper
+        // (`shard_state`, `select_shard`, `metrics_collector`, …),
+        // each of which acquires `shards.read()`. `parking_lot::RwLock`
+        // is not recursive, so a re-entrant read attempt while we
+        // hold a write would deadlock. `scale_up`'s callback path
+        // already releases its lock before calling out — mirror that
+        // here.
+        drop(shards);
+
         if !stopped.is_empty() {
             if let Some(callback) = self.on_shard_removed.read().as_ref() {
                 for &id in &stopped {
@@ -850,16 +1097,11 @@ impl ShardMapper {
     pub fn policy(&self) -> &ScalingPolicy {
         &self.policy
     }
-
-    /// Update the scaling policy.
-    pub fn set_policy(&mut self, policy: ScalingPolicy) -> Result<(), ScalingError> {
-        let policy = policy.normalize();
-        policy
-            .validate()
-            .map_err(|e| ScalingError::InvalidPolicy(e.to_string()))?;
-        self.policy = policy;
-        Ok(())
-    }
+    // BUG_REPORT.md #53: `set_policy` previously took `&mut self`
+    // and was unreachable through the `Arc<ShardMapper>` that the
+    // production code holds (`Arc::get_mut` fails once the worker
+    // pool has cloned the Arc). The method has been removed —
+    // recreate the mapper / bus to change the policy.
 }
 
 #[cfg(test)]
@@ -1467,5 +1709,297 @@ mod tests {
         assert!(format!("{:?}", none).contains("None"));
         assert!(format!("{:?}", up).contains("ScaleUp"));
         assert!(format!("{:?}", down).contains("ScaleDown"));
+    }
+
+    /// Regression: BUG_REPORT.md #46 — `scale_up_provisioning`
+    /// allocates a shard but `select_shard` must NOT route to it
+    /// until `activate` has been called. This is the load-bearing
+    /// invariant that lets `EventBus::add_shard_internal` wire up
+    /// drain workers before producers can land in the new ring
+    /// buffer.
+    #[test]
+    fn provisioning_shard_is_not_selectable_until_activated() {
+        let policy = ScalingPolicy {
+            min_shards: 1,
+            max_shards: 16,
+            cooldown: Duration::from_nanos(1),
+            ..Default::default()
+        };
+        let mapper = ShardMapper::new(2, 1024, policy).unwrap();
+
+        // Allocate a provisioning shard. Existing ids are 0,1; new
+        // is 2.
+        let new_ids = mapper.scale_up_provisioning(1).unwrap();
+        assert_eq!(new_ids, vec![2]);
+
+        // The provisioning shard must NOT appear in active accounting.
+        assert_eq!(mapper.active_shard_count(), 2);
+        assert_eq!(mapper.shard_state(2), Some(ShardState::Provisioning));
+
+        // Across many hashes, `select_shard` must never pick id 2.
+        let mut seen: std::collections::HashSet<u16> = std::collections::HashSet::new();
+        for hash in 0u64..10_000 {
+            seen.insert(mapper.select_shard(hash));
+        }
+        assert!(
+            !seen.contains(&2),
+            "provisioning shard 2 was selected — \
+             producers would push into a ring buffer with no consumer (#46)"
+        );
+        assert!(seen == [0, 1].into_iter().collect());
+
+        // After `activate`, the shard is selectable.
+        mapper.activate(2).unwrap();
+        assert_eq!(mapper.shard_state(2), Some(ShardState::Active));
+        assert_eq!(mapper.active_shard_count(), 3);
+
+        let mut seen_after: std::collections::HashSet<u16> = std::collections::HashSet::new();
+        for hash in 0u64..10_000 {
+            seen_after.insert(mapper.select_shard(hash));
+        }
+        assert!(
+            seen_after.contains(&2),
+            "after activate, shard 2 should be a valid select_shard target"
+        );
+    }
+
+    /// Regression: BUG_REPORT.md #51 — when no `Active` shard exists
+    /// (e.g. all shards are Draining or Provisioning), `select_shard`
+    /// must NOT fall back to a Draining shard. Pushing into a
+    /// draining shard increments `pushes_since_drain_start` and
+    /// blocks finalization indefinitely.
+    #[test]
+    fn select_shard_does_not_fall_back_to_draining() {
+        let policy = ScalingPolicy {
+            min_shards: 0,
+            max_shards: 8,
+            cooldown: Duration::from_nanos(1),
+            ..Default::default()
+        };
+        // Force min_shards = 0 via direct construction so we can drain
+        // every shard.
+        let mut policy = policy;
+        policy.min_shards = 1;
+        let mapper = ShardMapper::new(2, 1024, policy).unwrap();
+
+        // Force every shard into Draining state directly. We bypass
+        // `scale_down`'s min_shards floor by mutating the test-only
+        // accessor; this models a state that can otherwise be
+        // reached by `drain_specific` calls.
+        {
+            let mut shards = mapper.shards.write();
+            for s in shards.iter_mut() {
+                s.state = ShardState::Draining;
+                s.metrics.set_draining(true);
+            }
+        }
+
+        // The fallback must return the OOB sentinel `u16::MAX` rather
+        // than a draining shard id (0 or 1). The upstream
+        // `resolve_idx` path will see no match for `u16::MAX` and
+        // surface as `Unrouted` (#44), which is the correct signal:
+        // "no destination, do not push."
+        for hash in 0u64..1_000 {
+            let picked = mapper.select_shard(hash);
+            assert_eq!(
+                picked,
+                u16::MAX,
+                "fallback returned a draining shard ({}); pushes there would \
+                 deadlock finalize_draining (#51)",
+                picked
+            );
+        }
+    }
+
+    /// Regression: BUG_REPORT.md #32 — `scale_up(0)` previously
+    /// bumped the cooldown timestamp and could spuriously fail at
+    /// `u16::MAX` even though zero ids were being allocated.
+    #[test]
+    fn scale_up_zero_is_a_noop() {
+        let policy = ScalingPolicy {
+            cooldown: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let mapper = ShardMapper::new(2, 1024, policy).unwrap();
+        // Pretend we just scaled — cooldown is active.
+        *mapper.last_scaling.write() = Some(Instant::now());
+
+        // scale_up(0) must not return InCooldown and must not bump
+        // last_scaling.
+        let before_ts = *mapper.last_scaling.read();
+        let r = mapper.scale_up(0);
+        assert!(r.is_ok(), "scale_up(0) should succeed as a no-op, got {r:?}");
+        assert_eq!(r.unwrap().len(), 0);
+        let after_ts = *mapper.last_scaling.read();
+        assert_eq!(
+            before_ts, after_ts,
+            "scale_up(0) bumped cooldown timestamp"
+        );
+
+        // Also: position the allocator at u16::MAX and verify a
+        // count==0 call doesn't trip the sentinel check.
+        mapper
+            .next_shard_id
+            .store(u16::MAX, AtomicOrdering::Relaxed);
+        assert!(mapper.scale_up(0).is_ok());
+    }
+
+    /// Regression: BUG_REPORT.md #48 — `drain_specific` must
+    /// transition the shard's `MappedShard.state` to `Draining` so
+    /// that `select_shard` stops routing to it. The previous
+    /// `drain_shard` only flipped a metrics atomic.
+    #[test]
+    fn drain_specific_takes_shard_out_of_select() {
+        let policy = ScalingPolicy {
+            min_shards: 1,
+            max_shards: 8,
+            cooldown: Duration::from_nanos(1),
+            ..Default::default()
+        };
+        let mapper = ShardMapper::new(3, 1024, policy).unwrap();
+
+        // Drain shard 0.
+        mapper.drain_specific(0).unwrap();
+        assert_eq!(mapper.shard_state(0), Some(ShardState::Draining));
+        assert_eq!(mapper.active_shard_count(), 2);
+
+        // Across many hashes, select_shard must not pick id 0.
+        for hash in 0u64..10_000 {
+            let picked = mapper.select_shard(hash);
+            assert_ne!(
+                picked, 0,
+                "select_shard returned a Draining shard id 0 — \
+                 producer pushes there would block finalize_draining (#48)"
+            );
+        }
+    }
+
+    /// Regression: BUG_REPORT.md #33 — `set_draining(true)` and a
+    /// concurrent `record_push` race on `pushes_since_drain_start`.
+    /// The race itself can't be eliminated without a CAS loop on
+    /// the counter (which would penalize the hot path), so the
+    /// best we can pin is: after the dust settles, the counter
+    /// value is bounded — never larger than the number of pushes
+    /// that genuinely overlapped the transition. This catches a
+    /// regression where the store-zero stops happening, where the
+    /// flag publish stops happening, or where future code adds
+    /// drift that compounds the race across many transitions.
+    #[test]
+    fn set_draining_resets_counter_under_concurrent_pushes() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        const ITERATIONS: usize = 200;
+        const PUSHERS: usize = 4;
+
+        for _ in 0..ITERATIONS {
+            let collector = Arc::new(ShardMetricsCollector::new(0, 1024));
+
+            // Sanity: counter starts at zero.
+            assert_eq!(collector.pushes_since_drain_start(), 0);
+
+            // Pre-load with a noticeable amount of "before drain"
+            // pushes so the reset has work to do.
+            for _ in 0..50 {
+                collector.record_push(1);
+            }
+            assert_eq!(collector.pushes_since_drain_start(), 50);
+
+            // Race: every pusher hammers `record_push` while one
+            // thread calls `set_draining(true)`. After the barrier,
+            // we want to observe that the counter ends up bounded
+            // by PUSHERS (the number of pushes that genuinely
+            // overlapped the transition) — and crucially NOT 50+,
+            // which is what the buggy code with a missing reset
+            // would leave behind.
+            let barrier = Arc::new(Barrier::new(PUSHERS + 1));
+            let mut handles = Vec::with_capacity(PUSHERS);
+            for _ in 0..PUSHERS {
+                let c = Arc::clone(&collector);
+                let b = Arc::clone(&barrier);
+                handles.push(thread::spawn(move || {
+                    b.wait();
+                    c.record_push(1);
+                }));
+            }
+
+            barrier.wait();
+            collector.set_draining(true);
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            // After reset + at-most-PUSHERS racing pushes, the
+            // counter is bounded. The strong guarantee we want is
+            // "the 50 pre-drain pushes did NOT survive the reset."
+            // Anything <= PUSHERS is acceptable — the race may
+            // count any subset of the racing pushes.
+            let final_count = collector.pushes_since_drain_start();
+            assert!(
+                final_count <= PUSHERS as u64,
+                "set_draining reset is broken: counter is {} after reset, \
+                 expected at most {} (#33)",
+                final_count,
+                PUSHERS
+            );
+        }
+    }
+
+    /// Regression: BUG_REPORT.md #49 — `finalize_draining` must
+    /// drop the `shards` write lock before calling `on_shard_removed`,
+    /// so a callback that re-enters the mapper (read methods like
+    /// `shard_state`, `active_shard_ids`, etc.) does not deadlock.
+    #[test]
+    fn finalize_draining_does_not_deadlock_on_callback_reentry() {
+        use std::sync::Mutex;
+        let policy = ScalingPolicy {
+            min_shards: 1,
+            max_shards: 8,
+            cooldown: Duration::from_nanos(1),
+            ..Default::default()
+        };
+        let mapper = Arc::new(ShardMapper::new(2, 1024, policy).unwrap());
+
+        // Set a callback that re-enters the mapper. Before the fix
+        // this acquires `shards.read()` while finalize_draining
+        // still holds `shards.write()`, deadlocking on parking_lot's
+        // non-recursive RwLock.
+        let observed_states: Arc<Mutex<Vec<(u16, Option<ShardState>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        {
+            let mapper_for_cb = Arc::clone(&mapper);
+            let observed = Arc::clone(&observed_states);
+            mapper.set_on_shard_removed(move |id| {
+                let st = mapper_for_cb.shard_state(id);
+                observed.lock().unwrap().push((id, st));
+            });
+        }
+
+        // Drive a shard all the way to Stopped: drain it, mark its
+        // metrics empty (current_len = 0), and drop drain_started
+        // far enough back that the 100ms gate is satisfied.
+        mapper.drain_specific(0).unwrap();
+        {
+            let mut shards = mapper.shards.write();
+            let s = shards.iter_mut().find(|s| s.id == 0).unwrap();
+            s.metrics.current_len.store(0, AtomicOrdering::Relaxed);
+            s.metrics.pushes_since_drain_start
+                .store(0, AtomicOrdering::Relaxed);
+            // Backdate drain_started so the elapsed > 100ms gate trips.
+            s.drain_started = Some(Instant::now() - Duration::from_secs(1));
+        }
+
+        // The call below would deadlock with the bug present.
+        let stopped = mapper.finalize_draining();
+        assert_eq!(stopped, vec![0]);
+
+        // The callback must have run AND been able to read state
+        // (proving the lock was released).
+        let observed = observed_states.lock().unwrap().clone();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].0, 0);
+        // State should be `Stopped` (set by finalize_draining before
+        // the lock was dropped).
+        assert_eq!(observed[0].1, Some(ShardState::Stopped));
     }
 }

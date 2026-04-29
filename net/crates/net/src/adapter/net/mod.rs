@@ -566,22 +566,46 @@ impl NetAdapter {
             0
         };
 
-        {
+        // BUG_REPORT.md #5: previously the boolean result of
+        // `r.on_receive(seq)` was discarded — a duplicate (NACK
+        // retransmit, rebroadcast, etc.) returned `false` but the
+        // events were still queued for poll_shard, breaking
+        // exactly-once delivery on reliable streams. The cipher's
+        // replay window doesn't catch this because each retransmit
+        // is re-encrypted with a fresh outer counter.
+        //
+        // Now: if `on_receive` reports a duplicate, we still call
+        // `session.touch()` (the peer is alive) but skip the queue
+        // step entirely — the original delivery already queued the
+        // events.
+        let is_fresh = {
             let stream = session.get_or_create_stream(stream_id);
-            stream.with_reliability(|r| {
-                r.on_receive(parsed.header.sequence);
-            });
+            // `with_reliability` always invokes the closure (it
+            // locks an internal `Mutex<Box<dyn ReliabilityMode>>`).
+            // For streams without a meaningful reliability mode the
+            // implementation returns `true` for every `on_receive`,
+            // matching the historical "always queue" behavior.
+            let fresh = stream.with_reliability(|r| r.on_receive(parsed.header.sequence));
             stream.update_rx_seq(parsed.header.sequence);
-        }
+            fresh
+        };
 
-        // Queue events for poll_shard
-        let queue = inbound.entry(shard_id).or_default();
-        let seq = parsed.header.sequence;
-        for (i, event_data) in events.into_iter().enumerate() {
-            use std::fmt::Write;
-            let mut event_id = String::with_capacity(24);
-            let _ = write!(event_id, "{}:{}", seq, i);
-            queue.push(StoredEvent::new(event_id, event_data, seq, shard_id));
+        if is_fresh {
+            // Queue events for poll_shard
+            let queue = inbound.entry(shard_id).or_default();
+            let seq = parsed.header.sequence;
+            for (i, event_data) in events.into_iter().enumerate() {
+                use std::fmt::Write;
+                let mut event_id = String::with_capacity(24);
+                let _ = write!(event_id, "{}:{}", seq, i);
+                queue.push(StoredEvent::new(event_id, event_data, seq, shard_id));
+            }
+        } else {
+            tracing::debug!(
+                seq = parsed.header.sequence,
+                stream_id,
+                "Dropping duplicate packet (BUG_REPORT.md #5)"
+            );
         }
 
         session.touch();
@@ -1486,5 +1510,80 @@ mod tests {
             rx_cipher.is_valid_rx_counter(0),
             "counter 0 should be valid initially"
         );
+    }
+
+    /// Regression: BUG_REPORT.md #5 — `process_packet` previously
+    /// discarded the bool returned by `r.on_receive(seq)` on the
+    /// reliability layer, queueing events even for duplicates.
+    /// Each retransmit re-encrypts with a fresh outer counter, so
+    /// the cipher's replay window does not catch this; without
+    /// honoring `on_receive`, the inbound queue accumulates
+    /// duplicates and breaks exactly-once delivery on reliable
+    /// streams.
+    ///
+    /// We construct the duplicate-detection scenario by building
+    /// two distinct packets that share the same stream sequence.
+    /// On a reliable session the second one's `on_receive` returns
+    /// `false`, so `process_packet` must not enqueue its events.
+    /// (The cipher's outer counter is fresh on both packets, so
+    /// the replay window can't filter them — only the reliability
+    /// layer's check stops the duplicate.)
+    #[test]
+    fn process_packet_drops_duplicates_per_reliability_decision() {
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let (init_keys, resp_keys) = make_session_keys();
+
+        // Reliable session — its streams use `ReliableStream`,
+        // whose `on_receive` returns `false` for `seq <
+        // next_expected` (duplicates).
+        let resp_session = Arc::new(NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            true, // default_reliable
+        ));
+        let inbound: InboundQueues = Arc::new(DashMap::new());
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // Two packets on stream 7. First carries sequences 0..1,
+        // second is a duplicate (same seq=0) that should be
+        // filtered. We deliver seq=0 then seq=1 first to advance
+        // `next_expected` past 0, then a packet with seq=0 — that
+        // last one is the duplicate.
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let packet0 = builder.build(7, 0, &[Bytes::from(r#"{"first":0}"#)], PacketFlags::NONE);
+        let packet1 = builder.build(7, 1, &[Bytes::from(r#"{"first":1}"#)], PacketFlags::NONE);
+        // Re-encrypted retransmit of seq=0 — same stream, same seq,
+        // different payload. This is the scenario the bug allowed
+        // through.
+        let packet0_dup = builder.build(
+            7,
+            0,
+            &[Bytes::from(r#"{"dup":"should_not_appear"}"#)],
+            PacketFlags::NONE,
+        );
+
+        NetAdapter::process_packet(packet0, source, &resp_session, &inbound, 1);
+        NetAdapter::process_packet(packet1, source, &resp_session, &inbound, 1);
+        NetAdapter::process_packet(packet0_dup, source, &resp_session, &inbound, 1);
+
+        let queue = inbound.get(&0).expect("shard 0 should exist");
+        assert_eq!(
+            queue.len(),
+            2,
+            "duplicate packet must NOT enqueue (BUG_REPORT.md #5); \
+             got {} events, expected exactly 2 (seq=0 and seq=1, no dup)",
+            queue.len()
+        );
+
+        // Drain in FIFO order and assert no `should_not_appear`
+        // event sneaked through.
+        let e0 = queue.pop().unwrap();
+        assert_eq!(&e0.raw[..], br#"{"first":0}"#);
+        let e1 = queue.pop().unwrap();
+        assert_eq!(&e1.raw[..], br#"{"first":1}"#);
+        assert!(queue.is_empty());
     }
 }
