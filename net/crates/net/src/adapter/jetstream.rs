@@ -374,13 +374,13 @@ impl Adapter for JetStreamAdapter {
         // Use the stream's actual last sequence to bound the search,
         // rather than an arbitrary multiplier that can miss events in
         // streams with large gaps (deletions, compaction). The
-        // fallback uses `checked_mul` + `saturating_add` so a
-        // caller-supplied `limit` near `usize::MAX` cannot wrap to a
-        // tiny `max_seq` and silently cap the poll at zero events.
+        // fallback saturates so a caller-supplied `limit` near
+        // `usize::MAX` cannot wrap to a tiny `max_seq` and silently
+        // cap the poll at zero events.
         let max_seq = match stream.info().await {
             Ok(info) => info.state.last_sequence,
             Err(_) => {
-                let span = (fetch_limit as u64).checked_mul(10).unwrap_or(u64::MAX);
+                let span = (fetch_limit as u64).saturating_mul(10);
                 start_seq.saturating_add(span)
             }
         };

@@ -612,7 +612,11 @@ impl ShardMapper {
         let last_needed = first_id
             .checked_add(count.saturating_sub(1))
             .ok_or(ScalingError::AtMaxShards)?;
-        if last_needed >= u16::MAX {
+        // Reserve `u16::MAX` as a sentinel so the post-allocation
+        // `next_shard_id.store(first_id + count, ...)` below cannot
+        // wrap (the next call would observe `first_id == u16::MAX`
+        // and attempt `MAX + 1`).
+        if last_needed == u16::MAX {
             return Err(ScalingError::AtMaxShards);
         }
         // CAS-bump the allocator. The write lock on `shards` already

@@ -991,8 +991,10 @@ mod tests {
     /// every adapter call time out instantly.
     #[test]
     fn test_validate_rejects_zero_adapter_timeout() {
-        let mut config = EventBusConfig::default();
-        config.adapter_timeout = Duration::ZERO;
+        let config = EventBusConfig {
+            adapter_timeout: Duration::ZERO,
+            ..EventBusConfig::default()
+        };
         assert!(config.validate().is_err());
     }
 
