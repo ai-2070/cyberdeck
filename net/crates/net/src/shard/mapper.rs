@@ -121,6 +121,13 @@ pub struct ShardMetricsCollector {
     draining: AtomicBool,
     /// Window start time.
     window_start: RwLock<Instant>,
+    /// Pushes observed since `set_draining(true)` was last called.
+    /// Distinct from `events_in_window` because this counter is NOT
+    /// reset by `collect_and_reset`. `finalize_draining` reads this
+    /// instead of `events_in_window` so a drain-window-overlap with
+    /// a metrics tick can no longer race the counter to zero before
+    /// the producer is observed.
+    pushes_since_drain_start: AtomicU64,
 }
 
 impl ShardMetricsCollector {
@@ -137,6 +144,7 @@ impl ShardMetricsCollector {
             flush_count: AtomicU64::new(0),
             draining: AtomicBool::new(false),
             window_start: RwLock::new(Instant::now()),
+            pushes_since_drain_start: AtomicU64::new(0),
         }
     }
 
@@ -153,6 +161,11 @@ impl ShardMetricsCollector {
         self.push_latency_sum_ns
             .fetch_add(latency_ns, AtomicOrdering::Relaxed);
         self.push_count.fetch_add(1, AtomicOrdering::Relaxed);
+        // Always increment — the cost is one fetch_add and the
+        // counter only matters when the shard is draining. Cheaper
+        // than branching on `self.draining.load()` in the hot path.
+        self.pushes_since_drain_start
+            .fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Record a batch flush.
@@ -164,8 +177,24 @@ impl ShardMetricsCollector {
     }
 
     /// Set drain mode.
+    ///
+    /// Transitions to draining reset `pushes_since_drain_start` so
+    /// `finalize_draining` only counts pushes that arrived after the
+    /// drain began.
     pub fn set_draining(&self, draining: bool) {
+        if draining {
+            self.pushes_since_drain_start
+                .store(0, AtomicOrdering::Relaxed);
+        }
         self.draining.store(draining, AtomicOrdering::Release);
+    }
+
+    /// Number of pushes observed since `set_draining(true)` was
+    /// last called. Used by `finalize_draining` to detect lingering
+    /// producers that the window-reset `events_in_window` counter
+    /// can race past.
+    pub fn pushes_since_drain_start(&self) -> u64 {
+        self.pushes_since_drain_start.load(AtomicOrdering::Relaxed)
     }
 
     /// Check if draining.
@@ -723,8 +752,21 @@ impl ShardMapper {
                 } else {
                     0.0
                 };
-                let event_rate = shard.metrics.events_in_window.load(AtomicOrdering::Relaxed);
-                if fill_ratio == 0.0 && event_rate == 0 {
+                // BUG_REPORT.md #9: previously read `events_in_window`
+                // here, which `collect_and_reset` zeros every metrics
+                // tick. A producer push that landed in the window
+                // between two ticks could be silently zeroed out, so a
+                // draining shard whose buffer transiently emptied was
+                // finalized with a producer still attached.
+                // `pushes_since_drain_start` is a separate counter that
+                // is only reset by `set_draining(true)`, so any push
+                // observed since the drain began is sticky — exactly
+                // the signal we want.
+                let pushes_after_drain = shard
+                    .metrics
+                    .pushes_since_drain_start
+                    .load(AtomicOrdering::Relaxed);
+                if fill_ratio == 0.0 && pushes_after_drain == 0 {
                     // Check if we've waited long enough
                     if let Some(drain_start) = shard.drain_started {
                         if drain_start.elapsed() > Duration::from_millis(100) {
@@ -872,7 +914,7 @@ mod tests {
     fn test_scale_down() {
         let policy = ScalingPolicy {
             min_shards: 1,
-            cooldown: Duration::from_millis(0), // Disable cooldown for test
+            cooldown: Duration::from_nanos(1), // Disable cooldown for test
             ..Default::default()
         };
         let mapper = ShardMapper::new(4, 1024, policy).unwrap();
@@ -916,7 +958,7 @@ mod tests {
     fn test_draining_excludes_from_selection() {
         let policy = ScalingPolicy {
             min_shards: 1,
-            cooldown: Duration::from_millis(0),
+            cooldown: Duration::from_nanos(1),
             ..Default::default()
         };
         let mapper = ShardMapper::new(2, 1024, policy).unwrap();
@@ -983,7 +1025,7 @@ mod tests {
         let policy = ScalingPolicy {
             min_shards: 1,
             max_shards: 16,
-            cooldown: Duration::from_millis(0),
+            cooldown: Duration::from_nanos(1),
             ..Default::default()
         };
         let mapper = ShardMapper::new(2, 1024, policy).unwrap();
@@ -1085,7 +1127,7 @@ mod tests {
 
         let policy = ScalingPolicy {
             max_shards: 10,
-            cooldown: Duration::from_millis(0), // Disable cooldown for test
+            cooldown: Duration::from_nanos(1), // Disable cooldown for test
             ..Default::default()
         };
         let mapper = Arc::new(ShardMapper::new(5, 1024, policy).unwrap());
@@ -1253,7 +1295,7 @@ mod tests {
         let policy = ScalingPolicy {
             fill_ratio_threshold: 0.7,
             max_shards: 8,
-            cooldown: Duration::from_millis(0),
+            cooldown: Duration::from_nanos(1),
             ..Default::default()
         };
         let mapper = ShardMapper::new(4, 1024, policy).unwrap();
@@ -1275,7 +1317,7 @@ mod tests {
         let policy = ScalingPolicy {
             push_latency_threshold_ns: 10,
             max_shards: 8,
-            cooldown: Duration::from_millis(0),
+            cooldown: Duration::from_nanos(1),
             ..Default::default()
         };
         let mapper = ShardMapper::new(4, 1024, policy).unwrap();
@@ -1297,7 +1339,7 @@ mod tests {
         let policy = ScalingPolicy {
             underutilized_threshold: 0.2,
             min_shards: 2,
-            cooldown: Duration::from_millis(0),
+            cooldown: Duration::from_nanos(1),
             ..Default::default()
         };
         let mapper = ShardMapper::new(4, 1024, policy).unwrap();
@@ -1320,7 +1362,7 @@ mod tests {
         let policy = ScalingPolicy {
             fill_ratio_threshold: 0.7,
             max_shards: 4, // Already at max
-            cooldown: Duration::from_millis(0),
+            cooldown: Duration::from_nanos(1),
             ..Default::default()
         };
         let mapper = ShardMapper::new(4, 1024, policy).unwrap();
@@ -1342,7 +1384,7 @@ mod tests {
         let policy = ScalingPolicy {
             underutilized_threshold: 0.2,
             min_shards: 4, // Already at min
-            cooldown: Duration::from_millis(0),
+            cooldown: Duration::from_nanos(1),
             ..Default::default()
         };
         let mapper = ShardMapper::new(4, 1024, policy).unwrap();
@@ -1365,7 +1407,7 @@ mod tests {
         let policy = ScalingPolicy {
             fill_ratio_threshold: 0.7,
             max_shards: 8,
-            cooldown: Duration::from_millis(0),
+            cooldown: Duration::from_nanos(1),
             ..Default::default()
         };
         let mapper = ShardMapper::new(4, 1024, policy).unwrap();

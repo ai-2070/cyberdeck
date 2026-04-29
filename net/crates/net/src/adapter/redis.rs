@@ -142,11 +142,7 @@ impl RedisAdapter {
     /// last successfully-deserialized event. If every entry fails to
     /// deserialize, the cursor must still advance past them or the consumer
     /// re-fetches the same corrupt entries indefinitely.
-    fn parse_xrange_response(
-        results: Value,
-        limit: usize,
-        stream_key: &str,
-    ) -> ShardPollResult {
+    fn parse_xrange_response(results: Value, limit: usize, stream_key: &str) -> ShardPollResult {
         let entries = match results {
             Value::Array(entries) => entries,
             _ => return ShardPollResult::empty(),
@@ -172,7 +168,9 @@ impl RedisAdapter {
 
             last_seen_id = Some(id.to_string());
 
-            let Value::Array(fields) = &parts[1] else { continue };
+            let Value::Array(fields) = &parts[1] else {
+                continue;
+            };
             // Find the "d" field. Compare against the byte literal directly
             // — no allocation for what is otherwise a constant-name probe
             // on every entry.
@@ -296,7 +294,19 @@ impl Adapter for RedisAdapter {
             pipe.add_command(cmd);
         }
 
-        // Execute pipeline with command timeout
+        // Execute pipeline with command timeout.
+        //
+        // BUG_REPORT.md #12: `tokio::time::timeout` cancels the
+        // future locally but does NOT roll back bytes already on
+        // the wire. Redis can still execute the EXEC after the
+        // future is dropped, so a timeout-then-retry can produce
+        // duplicate XADDs (each with a fresh `*` auto-id). The
+        // delivery semantics are therefore at-least-once *with
+        // duplicates on retry* — not exactly-once. Consumers must
+        // be idempotent (e.g. dedup on the event's `r.id` field).
+        // Removing this footgun would require a per-event dedup
+        // token gated by a server-side Lua script; that has not
+        // been wired up yet.
         let fut = pipe.query_async::<()>(&mut conn);
         tokio::time::timeout(self.config.command_timeout, fut)
             .await
@@ -492,7 +502,10 @@ mod tests {
         let result = RedisAdapter::parse_xrange_response(response, 10, "myapp:shard:0");
 
         // No events deserialized successfully.
-        assert!(result.events.is_empty(), "all corrupt entries should be skipped");
+        assert!(
+            result.events.is_empty(),
+            "all corrupt entries should be skipped"
+        );
         // But the cursor MUST advance, otherwise the consumer will
         // re-fetch the same corrupt range forever.
         assert_eq!(
@@ -527,11 +540,7 @@ mod tests {
     /// cursor — the caller should not advance.
     #[test]
     fn test_poll_shard_empty_response_has_no_cursor() {
-        let result = RedisAdapter::parse_xrange_response(
-            Value::Array(vec![]),
-            10,
-            "myapp:shard:0",
-        );
+        let result = RedisAdapter::parse_xrange_response(Value::Array(vec![]), 10, "myapp:shard:0");
         assert!(result.events.is_empty());
         assert!(result.next_id.is_none());
         assert!(!result.has_more);

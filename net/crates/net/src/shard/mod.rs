@@ -212,6 +212,20 @@ impl Shard {
         self.ring_buffer.try_pop()
     }
 
+    /// Producer-side eviction of the oldest event.
+    ///
+    /// Used by `BackpressureMode::DropOldest` to make room for a
+    /// new push when the buffer is full. Bypasses the ring buffer's
+    /// consumer-thread tracking (the producer thread is calling
+    /// what is normally a consumer-side operation). Safe because
+    /// the outer shard mutex serializes this against any concurrent
+    /// `try_pop` from the legitimate consumer (the batch worker).
+    /// See BUG_REPORT.md #8.
+    #[inline]
+    pub(crate) fn evict_oldest(&mut self) -> Option<InternalEvent> {
+        self.ring_buffer.evict_oldest()
+    }
+
     /// Get the current buffer length.
     #[inline]
     pub fn len(&self) -> usize {
@@ -469,13 +483,20 @@ impl ShardManager {
                     // The failed try_push_raw incremented events_dropped for
                     // the *new* event, but the new event isn't actually
                     // dropped — the oldest is. Correct the stats: undo the
-                    // spurious drop count, pop the oldest (which is the real
+                    // spurious drop count, evict the oldest (which is the real
                     // drop), and retry with the same ref-counted bytes.
+                    //
+                    // BUG_REPORT.md #8: use the producer-side
+                    // `evict_oldest` rather than `try_pop`. Calling
+                    // `try_pop` from the producer thread would
+                    // violate the SPSC consumer contract (the
+                    // legitimate consumer is the batch worker, on a
+                    // different task / thread).
                     shard
                         .counters
                         .events_dropped
                         .fetch_sub(1, AtomicOrdering::Relaxed);
-                    let _ = shard.try_pop();
+                    let _ = shard.evict_oldest();
                     shard
                         .counters
                         .events_dropped

@@ -5,7 +5,7 @@
 //! - Event consumption (async polling with filtering)
 //! - Lifecycle management
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,6 +67,20 @@ pub struct EventBus {
     >,
     /// Shutdown flag.
     shutdown: Arc<AtomicBool>,
+    /// In-flight ingest counter. Incremented before each ingest's
+    /// shutdown check and decremented after the push completes (or
+    /// bails). `shutdown()` waits for this to drop to zero *after*
+    /// setting `shutdown=true` so no producer is mid-push when the
+    /// drain workers do their final sweep — closing the race where
+    /// a producer that observed `shutdown=false` could push *after*
+    /// the drain worker's last `pop_batch_into` returned zero,
+    /// leaving the event stranded in the ring buffer.
+    in_flight_ingests: AtomicU32,
+    /// Set to `true` after `shutdown()` runs to completion. `Drop`
+    /// uses this to detect "dropped without an awaited shutdown" —
+    /// in that case events still in the ring buffers / mpsc channels
+    /// are silently lost (see `Drop` impl).
+    shutdown_completed: AtomicBool,
     /// Configuration.
     config: EventBusConfig,
     /// Statistics.
@@ -82,6 +96,21 @@ pub struct EventBus {
 struct ShardWorkers {
     batch: JoinHandle<()>,
     drain: JoinHandle<()>,
+}
+
+/// RAII guard for an in-flight ingest. Decrements
+/// `in_flight_ingests` on drop so `shutdown()` can wait for the
+/// counter to reach zero.
+struct IngestGuard<'a> {
+    bus: &'a EventBus,
+}
+
+impl Drop for IngestGuard<'_> {
+    fn drop(&mut self) {
+        self.bus
+            .in_flight_ingests
+            .fetch_sub(1, AtomicOrdering::SeqCst);
+    }
 }
 
 /// Event bus statistics.
@@ -200,6 +229,8 @@ impl EventBus {
             batch_workers: parking_lot::Mutex::new(batch_workers),
             batch_senders: parking_lot::RwLock::new(batch_senders),
             shutdown,
+            in_flight_ingests: AtomicU32::new(0),
+            shutdown_completed: AtomicBool::new(false),
             config,
             stats: EventBusStats::default(),
             scaling_monitor: parking_lot::Mutex::new(None),
@@ -210,90 +241,31 @@ impl EventBus {
 
     /// Start the scaling monitor (if dynamic scaling is enabled).
     /// This spawns a background task that periodically evaluates scaling decisions.
+    ///
+    /// BUG_REPORT.md #24: the spawned task holds a `Weak<Self>`
+    /// rather than a strong `Arc<Self>` clone. With a strong clone
+    /// the task kept the bus alive forever, and `shutdown(self)`
+    /// (which consumes by value) was unreachable: callers with an
+    /// `Arc<EventBus>` could not `Arc::try_unwrap` to consume it
+    /// because the spawned task always held one of the strong refs.
+    ///
+    /// With a `Weak`, the monitor task upgrades each tick. Once the
+    /// last caller-held `Arc` is dropped, the upgrade fails and the
+    /// task exits cleanly. To shut down via `shutdown(self)`, the
+    /// caller must hold the only strong reference: `Arc::try_unwrap`
+    /// on the resulting bus succeeds because the spawned task only
+    /// holds a Weak.
     pub fn start_scaling_monitor(self: &Arc<Self>) {
         if self.config.scaling.is_none() {
             return;
         }
 
-        let bus = Arc::clone(self);
+        let weak = Arc::downgrade(self);
         let handle = tokio::spawn(async move {
-            bus.run_scaling_monitor().await;
+            run_scaling_monitor_via_weak(weak).await;
         });
 
         *self.scaling_monitor.lock() = Some(handle);
-    }
-
-    /// Run the scaling monitor loop.
-    async fn run_scaling_monitor(&self) {
-        let policy = match &self.config.scaling {
-            Some(p) => p,
-            None => return,
-        };
-
-        let interval = policy.metrics_window;
-
-        loop {
-            // Relaxed: we're only deciding whether to break the loop;
-            // no memory observation is gated on the flag. See the
-            // shutdown-ordering note on `ingest()`.
-            if self.shutdown.load(AtomicOrdering::Relaxed) {
-                break;
-            }
-
-            tokio::time::sleep(interval).await;
-
-            // Check shutdown again after sleep
-            if self.shutdown.load(AtomicOrdering::Relaxed) {
-                break;
-            }
-
-            // Collect metrics
-            if let Some(metrics) = self.shard_manager.collect_metrics() {
-                // Log metrics for observability
-                for m in &metrics {
-                    if m.fill_ratio > 0.5 {
-                        tracing::debug!(
-                            shard_id = m.shard_id,
-                            fill_ratio = m.fill_ratio,
-                            event_rate = m.event_rate,
-                            "Shard metrics"
-                        );
-                    }
-                }
-            }
-
-            // Evaluate scaling
-            match self.shard_manager.evaluate_scaling() {
-                ScalingDecision::ScaleUp(count) => {
-                    tracing::info!(count = count, "Scaling up shards");
-                    for _ in 0..count {
-                        if let Err(e) = self.add_shard_internal().await {
-                            tracing::error!(error = %e, "Failed to add shard");
-                            break;
-                        }
-                    }
-                }
-                ScalingDecision::ScaleDown(count) => {
-                    tracing::info!(count = count, "Scaling down shards");
-                    if let Some(mapper) = self.shard_manager.mapper() {
-                        if let Ok(drained) = mapper.scale_down(count) {
-                            for shard_id in drained {
-                                let _ = self.shard_manager.drain_shard(shard_id);
-                            }
-                        }
-                    }
-                }
-                ScalingDecision::None => {}
-            }
-
-            // Finalize any draining shards
-            if let Some(mapper) = self.shard_manager.mapper() {
-                let stopped = mapper.finalize_draining();
-                for shard_id in stopped {
-                    let _ = self.remove_shard_internal(shard_id).await;
-                }
-            }
-        }
     }
 
     /// Internal: Add a new shard with its workers.
@@ -365,6 +337,29 @@ impl EventBus {
         Ok(())
     }
 
+    /// Try to enter an ingest critical section. Returns `None` if
+    /// shutdown is in progress, in which case the caller must
+    /// return `IngestionError::ShuttingDown` without touching the
+    /// shard manager.
+    ///
+    /// The `fetch_add` + load(`shutdown`) sequence pairs with
+    /// `shutdown()`'s store(`shutdown=true`) + wait-for-zero on
+    /// `in_flight_ingests`. SeqCst on both sides closes the
+    /// stranding race: every ingest that is observed as in-flight
+    /// during shutdown's wait is guaranteed to complete before the
+    /// drain workers do their final ring-buffer sweep, so no event
+    /// can land in a ring buffer after the drain worker has stopped
+    /// reading from it.
+    #[inline(always)]
+    fn try_enter_ingest(&self) -> Option<IngestGuard<'_>> {
+        self.in_flight_ingests.fetch_add(1, AtomicOrdering::SeqCst);
+        if self.shutdown.load(AtomicOrdering::SeqCst) {
+            self.in_flight_ingests.fetch_sub(1, AtomicOrdering::SeqCst);
+            return None;
+        }
+        Some(IngestGuard { bus: self })
+    }
+
     /// Ingest an event.
     ///
     /// This is a non-blocking operation. The event is added to the appropriate
@@ -375,14 +370,9 @@ impl EventBus {
     /// The shard ID and insertion timestamp on success.
     #[inline]
     pub fn ingest(&self, event: Event) -> IngestionResult<(u16, u64)> {
-        // Relaxed: shutdown is a one-way latch and we don't need to
-        // observe any writes ordered before the store — we're only
-        // checking whether to abort. The Release on `store(true)` is
-        // preserved for cross-language FFI callers (Python/Node
-        // bindings) that still use Acquire.
-        if self.shutdown.load(AtomicOrdering::Relaxed) {
-            return Err(IngestionError::ShuttingDown);
-        }
+        let _g = self
+            .try_enter_ingest()
+            .ok_or(IngestionError::ShuttingDown)?;
 
         match self.shard_manager.ingest(event.into_inner()) {
             Ok((shard_id, ts)) => {
@@ -411,9 +401,9 @@ impl EventBus {
     /// The shard ID and insertion timestamp on success.
     #[inline]
     pub fn ingest_raw(&self, event: RawEvent) -> IngestionResult<(u16, u64)> {
-        if self.shutdown.load(AtomicOrdering::Relaxed) {
-            return Err(IngestionError::ShuttingDown);
-        }
+        let _g = self
+            .try_enter_ingest()
+            .ok_or(IngestionError::ShuttingDown)?;
 
         match self.shard_manager.ingest_raw(event) {
             Ok((shard_id, ts)) => {
@@ -440,12 +430,11 @@ impl EventBus {
     ///
     /// The number of successfully ingested events.
     pub fn ingest_batch(&self, events: Vec<Event>) -> usize {
-        if self.shutdown.load(AtomicOrdering::Relaxed) {
-            return 0;
-        }
-
-        // Convert once to `RawEvent` (pre-serializes + hashes each
-        // event) and dispatch through the grouped batch path.
+        // The shutdown gate lives in `ingest_raw_batch`, which we
+        // forward to. No separate guard here — that would double-
+        // count `in_flight_ingests` (once for this call, once for
+        // the inner call) and could deadlock shutdown under high
+        // contention.
         let raw: Vec<RawEvent> = events.into_iter().map(|e| e.into_raw()).collect();
         self.ingest_raw_batch(raw)
     }
@@ -459,9 +448,10 @@ impl EventBus {
     ///
     /// The number of successfully ingested events.
     pub fn ingest_raw_batch(&self, events: Vec<RawEvent>) -> usize {
-        if self.shutdown.load(AtomicOrdering::Relaxed) {
-            return 0;
-        }
+        let _g = match self.try_enter_ingest() {
+            Some(g) => g,
+            None => return 0,
+        };
 
         let total = events.len();
         let success = self.shard_manager.ingest_raw_batch(events);
@@ -563,8 +553,37 @@ impl EventBus {
     /// flag could leave events the drain worker pushed *after* its
     /// `try_recv` sweep stranded in the channel.
     pub async fn shutdown(self) -> Result<(), AdapterError> {
-        // 1. Signal shutdown.
-        self.shutdown.store(true, AtomicOrdering::Release);
+        // 1. Signal shutdown. SeqCst pairs with `try_enter_ingest` —
+        // any producer that observed the previous `false` and is
+        // mid-push has its `in_flight_ingests` increment ordered
+        // before this store, and so will be visible to the wait
+        // below.
+        self.shutdown.store(true, AtomicOrdering::SeqCst);
+
+        // 1a. BUG_REPORT.md #6: wait for in-flight ingests to drain
+        // BEFORE the drain workers do their final ring-buffer sweep.
+        // Otherwise a producer that observed `shutdown=false` could
+        // push *after* the drain worker's last `pop_batch_into`
+        // returned zero, leaving the event stranded in the ring
+        // buffer when the bus is dropped.
+        //
+        // This is bounded: every producer either bails on the
+        // SeqCst-synchronized shutdown check (no progress past the
+        // increment) or completes its single non-blocking push and
+        // decrements. Both paths take constant time; the total
+        // wait is O(producer threads).
+        let in_flight_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.in_flight_ingests.load(AtomicOrdering::SeqCst) > 0 {
+            if std::time::Instant::now() >= in_flight_deadline {
+                tracing::warn!(
+                    in_flight = self.in_flight_ingests.load(AtomicOrdering::SeqCst),
+                    "shutdown timed out waiting for in-flight ingests; \
+                     proceeding with potential event loss"
+                );
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
 
         // Stop the scaling monitor first — it's independent of the
         // ingestion path and just needs to observe the flag.
@@ -606,9 +625,13 @@ impl EventBus {
         {
             tracing::error!("Adapter flush timed out during shutdown");
         }
-        tokio::time::timeout(timeout, self.adapter.shutdown())
+        let result = tokio::time::timeout(timeout, self.adapter.shutdown())
             .await
-            .map_err(|_| AdapterError::Fatal("adapter shutdown timed out".into()))?
+            .map_err(|_| AdapterError::Fatal("adapter shutdown timed out".into()))?;
+
+        // Mark shutdown as completed so Drop knows not to warn.
+        self.shutdown_completed.store(true, AtomicOrdering::Release);
+        result
     }
 
     /// Get shard metrics (if dynamic scaling is enabled).
@@ -646,10 +669,113 @@ impl EventBus {
 
 impl Drop for EventBus {
     fn drop(&mut self) {
-        // Signal shutdown so background tasks (drain workers, batch workers,
-        // scaling monitor) observe the flag and exit. We cannot await futures
-        // in Drop, but setting the atomic flag triggers eventual termination.
+        // Signal shutdown so background tasks (drain workers, batch
+        // workers, scaling monitor) observe the flag and exit. We
+        // cannot await futures in Drop, but setting the atomic flag
+        // triggers eventual termination.
         self.shutdown.store(true, AtomicOrdering::Release);
+
+        // BUG_REPORT.md #17: if `shutdown()` was never awaited, any
+        // events still in the per-shard ring buffers or mpsc
+        // channels are lost — the adapter's `flush()` and
+        // `shutdown()` won't run, so durable backends never see
+        // them. We can't fix that from `Drop` (no async), but we
+        // *can* surface the data-loss risk loudly so it doesn't
+        // hide. The check is bounded to "shutdown was never
+        // started"; an in-progress shutdown is fine because the
+        // call site is awaiting it.
+        if !self.shutdown_completed.load(AtomicOrdering::Acquire) {
+            let stats = self.shard_manager.stats();
+            tracing::warn!(
+                events_ingested = stats.events_ingested,
+                events_dropped = stats.events_dropped,
+                "EventBus dropped without an awaited shutdown(). Any in-flight \
+                 events still in the ring buffers or batch channels will be lost \
+                 — the adapter's flush()/shutdown() never ran. Call \
+                 `bus.shutdown().await` before dropping for durable shutdown."
+            );
+        }
+    }
+}
+
+/// Body of the scaling monitor task spawned by
+/// `EventBus::start_scaling_monitor`. Holds a `Weak<EventBus>` and
+/// upgrades it once per tick so the spawned task does not keep the
+/// bus alive past the caller's last `Arc` reference. Without this,
+/// `Arc::try_unwrap` (which the consuming `shutdown(self)` API
+/// requires) would fail forever (BUG_REPORT.md #24).
+async fn run_scaling_monitor_via_weak(weak: std::sync::Weak<EventBus>) {
+    let interval = match weak.upgrade() {
+        Some(bus) => match &bus.config.scaling {
+            Some(p) => p.metrics_window,
+            None => return,
+        },
+        None => return,
+    };
+
+    loop {
+        tokio::time::sleep(interval).await;
+
+        let bus = match weak.upgrade() {
+            Some(b) => b,
+            // Last strong ref dropped — caller is shutting down (or
+            // already gone). Exit cleanly.
+            None => break,
+        };
+
+        if bus.shutdown.load(AtomicOrdering::Relaxed) {
+            break;
+        }
+
+        // Collect metrics for observability.
+        if let Some(metrics) = bus.shard_manager.collect_metrics() {
+            for m in &metrics {
+                if m.fill_ratio > 0.5 {
+                    tracing::debug!(
+                        shard_id = m.shard_id,
+                        fill_ratio = m.fill_ratio,
+                        event_rate = m.event_rate,
+                        "Shard metrics"
+                    );
+                }
+            }
+        }
+
+        // Evaluate scaling.
+        match bus.shard_manager.evaluate_scaling() {
+            ScalingDecision::ScaleUp(count) => {
+                tracing::info!(count = count, "Scaling up shards");
+                for _ in 0..count {
+                    if let Err(e) = bus.add_shard_internal().await {
+                        tracing::error!(error = %e, "Failed to add shard");
+                        break;
+                    }
+                }
+            }
+            ScalingDecision::ScaleDown(count) => {
+                tracing::info!(count = count, "Scaling down shards");
+                if let Some(mapper) = bus.shard_manager.mapper() {
+                    if let Ok(drained) = mapper.scale_down(count) {
+                        for shard_id in drained {
+                            let _ = bus.shard_manager.drain_shard(shard_id);
+                        }
+                    }
+                }
+            }
+            ScalingDecision::None => {}
+        }
+
+        if let Some(mapper) = bus.shard_manager.mapper() {
+            let stopped = mapper.finalize_draining();
+            for shard_id in stopped {
+                let _ = bus.remove_shard_internal(shard_id).await;
+            }
+        }
+
+        // CRITICAL: drop the strong ref BEFORE the next sleep so a
+        // concurrent `shutdown(self)` caller can `Arc::try_unwrap`
+        // the last strong ref while we're sleeping.
+        drop(bus);
     }
 }
 
@@ -966,7 +1092,7 @@ mod tests {
         let policy = ScalingPolicy {
             min_shards: 2,
             max_shards: 8,
-            cooldown: Duration::from_millis(0), // Disable cooldown for test
+            cooldown: Duration::from_nanos(1), // Effectively disable cooldown for test
             ..Default::default()
         };
 
@@ -1094,8 +1220,7 @@ mod tests {
             Ok(())
         }
         async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err((self.make_err)())
         }
         async fn flush(&self) -> Result<(), AdapterError> {

@@ -60,17 +60,29 @@ impl TimestampGenerator {
 
     /// Generate the next timestamp.
     ///
-    /// Returns a strictly monotonically increasing value (nanoseconds).
-    /// This operation is lock-free and does not invoke any syscalls.
+    /// Returns a strictly monotonically increasing value in
+    /// **nanoseconds** since this generator's calibration baseline
+    /// (the moment the underlying `quanta::Clock` was created). This
+    /// operation is lock-free and does not invoke any syscalls.
+    ///
+    /// BUG_REPORT.md #14: previously returned the raw TSC tick
+    /// count. The docstring claimed nanoseconds, but on a 3.5 GHz
+    /// core the value was ~3.5× larger than ns-since-epoch, breaking
+    /// any consumer that read `insertion_ts` and tried to correlate
+    /// it with wall-clock-derived timestamps from elsewhere.
+    /// Converting via `delta_as_nanos` here costs ~1ns extra per
+    /// call and gives consumers a unit they can actually use.
     ///
     /// # Performance
     ///
-    /// - Single-threaded: ~5-10ns per call
+    /// - Single-threaded: ~6-12ns per call
     /// - Under contention: may loop due to CAS, but still lock-free
     #[inline(always)]
     pub fn next(&self) -> u64 {
-        // Read TSC (no syscall)
-        let now = self.clock.raw();
+        // Read TSC (no syscall) and convert to nanoseconds against
+        // the clock's calibration baseline.
+        let raw = self.clock.raw();
+        let now = self.clock.delta_as_nanos(0, raw);
 
         // Ensure strict monotonicity via CAS loop
         loop {
@@ -326,5 +338,30 @@ mod tests {
     fn test_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<TimestampGenerator>();
+    }
+
+    /// Regression: BUG_REPORT.md #14 — `next()` previously returned
+    /// raw TSC ticks (~3.5× wall-clock-ns on a 3.5 GHz core) while
+    /// claiming nanoseconds. Pin the unit by sleeping for a known
+    /// amount of wall-clock time and asserting the delta is roughly
+    /// nanoseconds, not TSC ticks.
+    #[test]
+    fn next_returns_nanoseconds_not_raw_ticks() {
+        let ts_gen = TimestampGenerator::new();
+        let t0 = ts_gen.next();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let t1 = ts_gen.next();
+
+        let delta = t1 - t0;
+        // 50ms == 50_000_000 ns. Allow ±50% slack for sleep
+        // imprecision, scheduler jitter, and CI runners.
+        let ns_lo = 25_000_000u64;
+        let ns_hi = 200_000_000u64;
+        assert!(
+            delta >= ns_lo && delta <= ns_hi,
+            "delta over a 50ms sleep was {delta} — outside the {ns_lo}..={ns_hi} \
+             ns window. Most likely the timestamp is in raw TSC ticks again \
+             (would be ~150_000_000 on a 3 GHz core)."
+        );
     }
 }

@@ -151,8 +151,7 @@ pub struct NetHandle {
 /// leaked rather than read out — leaking is correct (the box is
 /// already leaked permanently for soundness reasons) but means the
 /// adapter's `flush()` / `shutdown()` won't run.
-const FFI_SHUTDOWN_DEADLINE: std::time::Duration =
-    std::time::Duration::from_secs(5);
+const FFI_SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// RAII guard that increments `active_ops` on creation and decrements on drop.
 struct FfiOpGuard<'a> {
@@ -1068,15 +1067,34 @@ pub struct NetReceipt {
 }
 
 /// A single stored event for C consumers.
+///
+/// # Safety contract for callers
+///
+/// `id`/`id_len` and `raw`/`raw_len` are produced by Rust as a
+/// `Box<[u8]>` whose fat-pointer length is reconstructed at free
+/// time from `id_len` / `raw_len`. The fields are `pub` because
+/// `#[repr(C)]` exposes them to C, **but they must be treated as
+/// read-only** between the `net_poll_*` call that produced them
+/// and the `net_free_poll_result` that consumes them.
+///
+/// Mutating `id_len` or `raw_len` (or copying the struct, replacing
+/// the pointer, and then freeing) causes
+/// `Box::from_raw(slice_from_raw_parts_mut(ptr, wrong_len))` to be
+/// undefined behavior on free — the allocator records the
+/// allocation size and any mismatch is UB. See BUG_REPORT.md #22.
 #[repr(C)]
 pub struct NetEvent {
     /// Event ID (not null-terminated, use `id_len`).
+    /// Read-only after `net_poll_*`; do not mutate.
     pub id: *const c_char,
-    /// Length of the event ID.
+    /// Length of the event ID. Read-only after `net_poll_*`; do not
+    /// mutate (mutation causes UB on free).
     pub id_len: usize,
     /// Raw JSON payload (not null-terminated, use `raw_len`).
+    /// Read-only after `net_poll_*`; do not mutate.
     pub raw: *const c_char,
-    /// Length of the raw JSON payload.
+    /// Length of the raw JSON payload. Read-only after
+    /// `net_poll_*`; do not mutate (mutation causes UB on free).
     pub raw_len: usize,
     /// Insertion timestamp (nanoseconds).
     pub insertion_ts: u64,

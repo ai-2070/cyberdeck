@@ -3179,11 +3179,7 @@ mod nat_traversal_stub_tests {
     fn collect_payloads_rejects_null_entry_with_nonzero_length() {
         let buf_a = b"hello".as_slice();
         let buf_b = b"world".as_slice();
-        let ptrs: [*const u8; 3] = [
-            buf_a.as_ptr(),
-            std::ptr::null(),
-            buf_b.as_ptr(),
-        ];
+        let ptrs: [*const u8; 3] = [buf_a.as_ptr(), std::ptr::null(), buf_b.as_ptr()];
         let lens: [usize; 3] = [buf_a.len(), 4, buf_b.len()];
 
         let result = unsafe { collect_payloads(ptrs.as_ptr(), lens.as_ptr(), 3) };

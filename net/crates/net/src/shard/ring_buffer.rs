@@ -33,23 +33,29 @@ impl std::error::Error for BufferFullError {}
 ///
 /// # ⚠️  Single-Producer, Single-Consumer contract
 ///
-/// `try_push` MUST only ever be called from one thread, and
-/// `try_pop` / `pop_batch` MUST only ever be called from one (other)
-/// thread. The atomics rely on this contract for correctness; sharing
-/// the buffer across multiple producers or multiple consumers
-/// **silently corrupts state** and is undefined behavior.
+/// At most one thread at a time may call `try_push`, and at most one
+/// (other) thread at a time may call `try_pop` / `pop_batch`. The
+/// atomics rely on that contract for correctness; concurrent access
+/// from multiple producers or multiple consumers **silently corrupts
+/// state** and is undefined behavior.
+///
+/// Note: "single producer" allows the *task* / *handle* doing the
+/// pushing to migrate between OS threads (e.g. across an `await`
+/// point in a tokio task) — what matters is non-concurrency, not a
+/// fixed thread id. Likewise for the consumer.
 ///
 /// The `Sync` impl below makes `&RingBuffer<T>` shareable across
 /// threads — that is the *only* way to legitimately split a producer
 /// and consumer onto two threads — but it also makes the SPSC
 /// contract a footgun: nothing in the public API stops a caller from
-/// pushing from two threads. Debug builds (`debug_assertions`) check
-/// the invariant at runtime via thread-ID tracking; release builds
-/// trust the caller.
+/// pushing from two threads concurrently. Internal callers in this
+/// crate serialize access via `parking_lot::Mutex<Shard>`.
 ///
 /// External users: prefer wrapping this in a higher-level type that
-/// hands out producer/consumer halves separately. This crate uses
-/// `parking_lot::Mutex<Shard>` to serialize access internally.
+/// hands out producer/consumer halves separately. Unit tests
+/// (`#[cfg(test)]`) track thread ids and panic on concurrent
+/// multi-producer or multi-consumer access — that is a *minimum*
+/// catch, not a complete check; release builds trust the caller.
 ///
 /// # Type Parameters
 ///
@@ -75,10 +81,10 @@ pub struct RingBuffer<T> {
     /// active under `debug_assertions`, not just `cfg(test)`, so dev
     /// runs of the binary catch SPSC violations even outside of unit
     /// tests).
-    #[cfg(debug_assertions)]
+    #[cfg(test)]
     producer_thread: std::sync::Mutex<Option<std::thread::ThreadId>>,
     /// Thread ID of the consumer (debug-build SPSC enforcement).
-    #[cfg(debug_assertions)]
+    #[cfg(test)]
     consumer_thread: std::sync::Mutex<Option<std::thread::ThreadId>>,
 }
 
@@ -114,9 +120,9 @@ impl<T> RingBuffer<T> {
             mask: capacity - 1,
             head: CachePadded::new(AtomicUsize::new(0)),
             tail: CachePadded::new(AtomicUsize::new(0)),
-            #[cfg(debug_assertions)]
+            #[cfg(test)]
             producer_thread: std::sync::Mutex::new(None),
-            #[cfg(debug_assertions)]
+            #[cfg(test)]
             consumer_thread: std::sync::Mutex::new(None),
         }
     }
@@ -131,7 +137,7 @@ impl<T> RingBuffer<T> {
     /// external synchronization.
     #[inline]
     pub fn try_push(&self, value: T) -> Result<(), BufferFullError> {
-        #[cfg(debug_assertions)]
+        #[cfg(test)]
         {
             let current = std::thread::current().id();
             let mut guard = self
@@ -169,6 +175,38 @@ impl<T> RingBuffer<T> {
         Ok(())
     }
 
+    /// Producer-side eviction of the oldest element.
+    ///
+    /// Identical to `try_pop` but bypasses the consumer-thread
+    /// tracking. Intended exclusively for the `BackpressureMode::
+    /// DropOldest` retry path, where the *producer* needs to evict
+    /// the oldest event to make room for a new push. The shard's
+    /// outer mutex serializes this evict against any concurrent
+    /// `try_pop` from the legitimate consumer (the batch worker), so
+    /// the SPSC atomic invariants are upheld even though two
+    /// different OS threads call into this producer-side method and
+    /// the consumer-side `try_pop` at different times.
+    ///
+    /// Without this method, `DropOldest` calls `try_pop` from the
+    /// producer's thread, which is a SPSC contract violation:
+    /// `try_pop` documents itself as the *consumer* path, and the
+    /// thread-id tracking under `cfg(test)` panics on the violation
+    /// (see BUG_REPORT.md #8).
+    #[inline]
+    pub(crate) fn evict_oldest(&self) -> Option<T> {
+        // Same atomic ordering as `try_pop`; only the thread
+        // tracking differs.
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        if tail == head {
+            return None;
+        }
+        let index = tail & self.mask;
+        let value = unsafe { (*self.buffer[index].get()).assume_init_read() };
+        self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        Some(value)
+    }
+
     /// Try to pop an element from the buffer.
     ///
     /// Returns `Some(value)` if successful, or `None` if the buffer is empty.
@@ -179,7 +217,7 @@ impl<T> RingBuffer<T> {
     /// external synchronization.
     #[inline]
     pub fn try_pop(&self) -> Option<T> {
-        #[cfg(debug_assertions)]
+        #[cfg(test)]
         {
             let current = std::thread::current().id();
             let mut guard = self
@@ -220,7 +258,7 @@ impl<T> RingBuffer<T> {
     /// reduces atomic operations.
     #[inline]
     pub fn pop_batch(&self, max: usize) -> Vec<T> {
-        #[cfg(debug_assertions)]
+        #[cfg(test)]
         {
             let current = std::thread::current().id();
             let mut guard = self
@@ -296,7 +334,7 @@ impl<T> RingBuffer<T> {
     /// [`pop_batch`]: Self::pop_batch
     #[inline]
     pub fn pop_batch_into(&self, dst: &mut Vec<T>, max: usize) -> usize {
-        #[cfg(debug_assertions)]
+        #[cfg(test)]
         {
             let current = std::thread::current().id();
             let mut guard = self
@@ -376,7 +414,7 @@ impl<T> Drop for RingBuffer<T> {
         // so draining from any thread is safe here. unwrap_or_else
         // recovers from poisoned mutexes (a spawned thread may have
         // panicked during SPSC violation detection).
-        #[cfg(debug_assertions)]
+        #[cfg(test)]
         {
             *self
                 .producer_thread

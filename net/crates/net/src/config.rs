@@ -450,7 +450,9 @@ impl RedisAdapterConfig {
     /// caught at startup rather than at the first batch dispatch.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.url.is_empty() {
-            return Err(ConfigError::InvalidValue("redis url must be non-empty".into()));
+            return Err(ConfigError::InvalidValue(
+                "redis url must be non-empty".into(),
+            ));
         }
         if self.pipeline_size == 0 {
             return Err(ConfigError::InvalidValue(
@@ -959,7 +961,10 @@ mod tests {
         let result = EventBusConfig::builder()
             .backpressure_mode(BackpressureMode::Sample { rate: 0 })
             .build();
-        assert!(result.is_err(), "BackpressureMode::Sample.rate == 0 must reject");
+        assert!(
+            result.is_err(),
+            "BackpressureMode::Sample.rate == 0 must reject"
+        );
     }
 
     /// Regression: BUG_REPORT.md #3 — zero `velocity_window` with
