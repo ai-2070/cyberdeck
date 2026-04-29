@@ -1,0 +1,27 @@
+net/crates/net/src/config.rs
+  5cd91e04ef8701a9 994-997
+net/crates/net/src/adapter/jetstream.rs
+  5cd91e04ef8701a9 377-379,383
+net/crates/net/src/shard/mapper.rs
+  5cd91e04ef8701a9 615-619
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "7f4181e4f38f7bf8d08e2ae44ab1fed9212d9ad5",
+  "prompts": {
+    "5cd91e04ef8701a9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ae0fcc0d-933c-4c8d-9638-71cc91316d24",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 13,
+      "total_deletions": 7,
+      "accepted_lines": 13,
+      "overriden_lines": 0
+    }
+  }
+}
