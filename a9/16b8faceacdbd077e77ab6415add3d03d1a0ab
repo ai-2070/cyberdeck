@@ -1,0 +1,43 @@
+net/crates/net/src/error.rs
+  2ac14869e0ac1223 20-21,23,45-47,49,95-98,105-119,163-165
+net/crates/net/src/adapter/redis.rs
+  2ac14869e0ac1223 24,43,45-47,61,70,73-74,76-81,120,138-220,363,448-538
+net/crates/net/src/shard/batch.rs
+  2ac14869e0ac1223 220-225,381-401
+net/crates/net/src/adapter/jetstream.rs
+  2ac14869e0ac1223 93,315-319,321-328,358-361,364-367,371-375,384,423-429,459-465,467-479,530-564
+net/crates/net/src/bus.rs
+  2ac14869e0ac1223 659-665,679-687,1082-1165
+net/crates/net/src/ffi/mesh.rs
+  2ac14869e0ac1223 1092-1097,1102,1107-1113,1117,1137-1140,1167-1170,1199-1202,3169-3221
+net/crates/net/src/shard/mapper.rs
+  2ac14869e0ac1223 313-321,358-360,575-586,589-594,597,975-1026,1198-1202,1209-1214,1219
+net/crates/net/src/consumer/merge.rs
+  2ac14869e0ac1223 307-329,331,344-357,364-375,377-379,384-414,1600-1734
+net/crates/net/tests/ffi_shutdown_race.rs
+  2ac14869e0ac1223 220-286
+net/crates/net/src/ffi/mod.rs
+  2ac14869e0ac1223 100-123,125-134,137-138,140-146,149-156,163-164,166-172,463-464,467,888-897,904-907,909-911,916-932,936-971,978-979
+net/crates/net/src/shard/mod.rs
+  2ac14869e0ac1223 56-61,66-69,76,320-326,347,376,431-435,437-440,501,555,559-564,574-577,641-643,653
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "a916b8faceacdbd077e77ab6415add3d03d1a0ab",
+  "prompts": {
+    "2ac14869e0ac1223": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5eb651b6-fe27-4d97-b5a6-cccd440fea61",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1134,
+      "total_deletions": 12429,
+      "accepted_lines": 1079,
+      "overriden_lines": 0
+    }
+  }
+}
