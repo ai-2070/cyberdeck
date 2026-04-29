@@ -79,27 +79,14 @@ impl CompositeCursor {
         self.positions.get(&shard_id).map(|s| s.as_ref())
     }
 
-    /// Set the position for a specific shard. Returns `true` if the
-    /// stored value actually changed (or was new), `false` if it was
-    /// already at this exact id.
+    /// Set the position for a specific shard.
     ///
     /// Accepts anything that converts into an `Arc<str>` — notably
     /// `String`, `&str`, and `Arc<str>` itself. This lets adapters
     /// hand us a freshly-allocated `String` (becomes a single boxed
     /// allocation) without forcing a second copy for the cursor.
-    ///
-    /// The boolean return is what `PollMerger::poll` uses to track
-    /// `cursor_advanced` directly, instead of structurally comparing
-    /// the full `HashMap` after the fact.
-    pub fn set(&mut self, shard_id: u16, position: impl Into<CursorPos>) -> bool {
-        let new_pos: CursorPos = position.into();
-        match self.positions.get(&shard_id) {
-            Some(existing) if **existing == *new_pos => false,
-            _ => {
-                self.positions.insert(shard_id, new_pos);
-                true
-            }
-        }
+    pub fn set(&mut self, shard_id: u16, position: impl Into<CursorPos>) {
+        self.positions.insert(shard_id, position.into());
     }
 
     /// Update positions from consumed events.
@@ -234,16 +221,13 @@ impl PollMerger {
             None => CompositeCursor::new(),
         };
 
-        // Determine which shards to poll. On the common all-shards path
-        // we iterate `0..num_shards` directly instead of materializing a
-        // `Vec<u16>`, saving one allocation per poll.
-        let user_shards: Option<&[u16]> = request.shards.as_deref();
-        let shard_count = match user_shards {
-            Some(s) => s.len(),
-            None => self.num_shards as usize,
-        };
+        // Determine which shards to poll
+        let shards: Vec<u16> = request
+            .shards
+            .clone()
+            .unwrap_or_else(|| (0..self.num_shards).collect());
 
-        if shard_count == 0 {
+        if shards.is_empty() {
             return Ok(ConsumeResponse::empty());
         }
 
@@ -252,7 +236,7 @@ impl PollMerger {
         let over_fetch_factor = if request.filter.is_some() { 3 } else { 2 };
         let per_shard_limit = request
             .limit
-            .div_ceil(shard_count)
+            .div_ceil(shards.len())
             .max(1)
             .saturating_mul(over_fetch_factor)
             .min(10_000);
@@ -260,18 +244,17 @@ impl PollMerger {
         // Poll all shards in parallel. Each future borrows its start
         // position directly from `cursor` (which outlives `join_all` below),
         // avoiding a per-shard `String` allocation on every poll.
-        let make_future = |shard_id: u16| {
-            let adapter = self.adapter.clone();
-            let from: Option<&str> = cursor.get(shard_id);
-            async move {
-                let result = adapter.poll_shard(shard_id, from, per_shard_limit).await;
-                (shard_id, result)
-            }
-        };
-        let poll_futures: Vec<_> = match user_shards {
-            Some(shards) => shards.iter().copied().map(make_future).collect(),
-            None => (0..self.num_shards).map(make_future).collect(),
-        };
+        let poll_futures: Vec<_> = shards
+            .iter()
+            .map(|&shard_id| {
+                let adapter = self.adapter.clone();
+                let from: Option<&str> = cursor.get(shard_id);
+                async move {
+                    let result = adapter.poll_shard(shard_id, from, per_shard_limit).await;
+                    (shard_id, result)
+                }
+            })
+            .collect();
 
         let shard_results: Vec<(u16, Result<ShardPollResult, AdapterError>)> =
             futures::future::join_all(poll_futures).await;
@@ -284,10 +267,6 @@ impl PollMerger {
             .sum();
         let mut all_events = Vec::with_capacity(total_events);
         let mut any_has_more = false;
-        // Tracked directly during `set()` calls below instead of via a
-        // post-hoc HashMap equality comparison — same answer, O(1) vs
-        // O(shards) per poll.
-        let mut cursor_advanced = false;
         // `new_cursor` (fetched-position tracking) is only consulted on the
         // filter path — building it for unfiltered polls wastes a full
         // HashMap clone plus a `set()` per shard every poll.
@@ -308,7 +287,7 @@ impl PollMerger {
                         has_more,
                     } = shard_result;
                     if let (Some(nc), Some(next_id)) = (new_cursor.as_mut(), next_id) {
-                        cursor_advanced |= nc.set(shard_id, next_id);
+                        nc.set(shard_id, next_id);
                     }
                     any_has_more |= has_more;
                     all_events.extend(events);
@@ -413,13 +392,14 @@ impl PollMerger {
         // iterate in reverse and skip shards already seen. This reduces id
         // clones from O(all_events.len()) to O(shards.len()).
         let mut seen_shards: std::collections::HashSet<u16> =
-            std::collections::HashSet::with_capacity(shard_count);
+            std::collections::HashSet::with_capacity(shards.len());
         for event in all_events.iter().rev() {
             if seen_shards.insert(event.shard_id) {
-                cursor_advanced |= final_cursor.set(event.shard_id, event.id.clone());
+                final_cursor.set(event.shard_id, event.id.clone());
             }
         }
 
+        let cursor_advanced = final_cursor.positions != cursor.positions;
         // When filtering removed everything but we did advance past fetched
         // events, signal has_more so the caller keeps polling forward.
         let all_filtered = request.filter.is_some() && all_events.is_empty() && cursor_advanced;
