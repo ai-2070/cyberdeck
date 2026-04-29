@@ -1,0 +1,23 @@
+net/crates/net/src/shard/mod.rs
+  5cd91e04ef8701a9 195,205-210
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "4e0d7b945c5aa6f0c1bd22c8f173e4ac4d69d47b",
+  "prompts": {
+    "5cd91e04ef8701a9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ae0fcc0d-933c-4c8d-9638-71cc91316d24",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1202,
+      "total_deletions": 7,
+      "accepted_lines": 7,
+      "overriden_lines": 0
+    }
+  }
+}
