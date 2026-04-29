@@ -80,11 +80,43 @@ impl EventBusConfig {
                 "ring_buffer_capacity must be >= 1024".into(),
             ));
         }
+        // Adapter timeout of zero would make every adapter call time
+        // out instantly. Reject at config time.
+        if self.adapter_timeout.is_zero() {
+            return Err(ConfigError::InvalidValue(
+                "adapter_timeout must be > 0".into(),
+            ));
+        }
+        // BUG_REPORT.md #3: `Sample { rate: 0 }` was accepted but
+        // crashed downstream sampling (counter % 0).
+        if let BackpressureMode::Sample { rate: 0 } = self.backpressure_mode {
+            return Err(ConfigError::InvalidValue(
+                "BackpressureMode::Sample.rate must be > 0".into(),
+            ));
+        }
         self.batch.validate()?;
         if let Some(ref scaling) = self.scaling {
             scaling
                 .validate()
                 .map_err(|e| ConfigError::InvalidValue(format!("scaling policy: {}", e)))?;
+        }
+        // Recurse into adapter configs. Previously these were
+        // accepted blindly and zero-divisor fields like
+        // `RedisAdapterConfig::pipeline_size: 0` shipped through to
+        // runtime panics.
+        match &self.adapter {
+            AdapterConfig::Noop => {}
+            #[cfg(feature = "redis")]
+            AdapterConfig::Redis(c) => c
+                .validate()
+                .map_err(|e| ConfigError::InvalidValue(format!("redis adapter: {}", e)))?,
+            #[cfg(feature = "jetstream")]
+            AdapterConfig::JetStream(c) => c
+                .validate()
+                .map_err(|e| ConfigError::InvalidValue(format!("jetstream adapter: {}", e)))?,
+            #[cfg(feature = "net")]
+            AdapterConfig::Net(_) => {} // Net adapter has its own
+                                        // validation pipeline, not in scope here.
         }
         Ok(())
     }
@@ -273,6 +305,14 @@ impl BatchConfig {
         if self.max_delay.is_zero() {
             return Err(ConfigError::InvalidValue("max_delay must be > 0".into()));
         }
+        // Zero `velocity_window` div-by-zeros the throughput
+        // calculator when adaptive batching is enabled. Validate
+        // only when the field is actually consulted.
+        if self.adaptive && self.velocity_window.is_zero() {
+            return Err(ConfigError::InvalidValue(
+                "velocity_window must be > 0 when adaptive batching is enabled".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -404,6 +444,33 @@ impl RedisAdapterConfig {
         self.max_stream_len = Some(len);
         self
     }
+
+    /// Validate the configuration. Called from
+    /// `EventBusConfig::validate` so adapter misconfiguration is
+    /// caught at startup rather than at the first batch dispatch.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.url.is_empty() {
+            return Err(ConfigError::InvalidValue(
+                "redis url must be non-empty".into(),
+            ));
+        }
+        if self.pipeline_size == 0 {
+            return Err(ConfigError::InvalidValue(
+                "redis pipeline_size must be > 0".into(),
+            ));
+        }
+        if self.connect_timeout.is_zero() {
+            return Err(ConfigError::InvalidValue(
+                "redis connect_timeout must be > 0".into(),
+            ));
+        }
+        if self.command_timeout.is_zero() {
+            return Err(ConfigError::InvalidValue(
+                "redis command_timeout must be > 0".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// NATS JetStream adapter configuration.
@@ -500,6 +567,33 @@ impl JetStreamAdapterConfig {
     pub fn with_replicas(mut self, replicas: usize) -> Self {
         self.replicas = replicas;
         self
+    }
+
+    /// Validate the configuration. Called from
+    /// `EventBusConfig::validate` so adapter misconfiguration is
+    /// caught at startup rather than at the first batch dispatch.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.url.is_empty() {
+            return Err(ConfigError::InvalidValue(
+                "jetstream url must be non-empty".into(),
+            ));
+        }
+        if self.connect_timeout.is_zero() {
+            return Err(ConfigError::InvalidValue(
+                "jetstream connect_timeout must be > 0".into(),
+            ));
+        }
+        if self.request_timeout.is_zero() {
+            return Err(ConfigError::InvalidValue(
+                "jetstream request_timeout must be > 0".into(),
+            ));
+        }
+        if self.replicas == 0 {
+            return Err(ConfigError::InvalidValue(
+                "jetstream replicas must be >= 1".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -650,6 +744,24 @@ impl ScalingPolicy {
         if self.max_shards < self.min_shards {
             return Err(ConfigError::InvalidValue(
                 "max_shards must be >= min_shards".into(),
+            ));
+        }
+        // BUG_REPORT.md #3: zero durations on the scaling path
+        // either div-by-zero (`metrics_window`), thrash the scaler
+        // (`cooldown`), or scale down on the first underutilized
+        // sample (`scale_down_delay`). Reject all three at config
+        // time.
+        if self.cooldown.is_zero() {
+            return Err(ConfigError::InvalidValue("cooldown must be > 0".into()));
+        }
+        if self.metrics_window.is_zero() {
+            return Err(ConfigError::InvalidValue(
+                "metrics_window must be > 0".into(),
+            ));
+        }
+        if self.scale_down_delay.is_zero() {
+            return Err(ConfigError::InvalidValue(
+                "scale_down_delay must be > 0".into(),
             ));
         }
         Ok(())
@@ -840,5 +952,98 @@ mod tests {
         let policy = ScalingPolicy::high_throughput();
         assert!(policy.max_shards >= policy.min_shards);
         assert!(policy.validate().is_ok());
+    }
+
+    /// Regression: BUG_REPORT.md #3 — zero-rate `Sample` previously
+    /// passed validation but div-by-zero'd downstream.
+    #[test]
+    fn test_validate_rejects_sample_rate_zero() {
+        let result = EventBusConfig::builder()
+            .backpressure_mode(BackpressureMode::Sample { rate: 0 })
+            .build();
+        assert!(
+            result.is_err(),
+            "BackpressureMode::Sample.rate == 0 must reject"
+        );
+    }
+
+    /// Regression: BUG_REPORT.md #3 — zero `velocity_window` with
+    /// adaptive batching div-by-zero'd the throughput calculator.
+    #[test]
+    fn test_validate_rejects_zero_velocity_window_when_adaptive() {
+        let bad = BatchConfig {
+            adaptive: true,
+            velocity_window: Duration::ZERO,
+            ..Default::default()
+        };
+        assert!(bad.validate().is_err());
+
+        // Non-adaptive ignores the field.
+        let ok = BatchConfig {
+            adaptive: false,
+            velocity_window: Duration::ZERO,
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    /// Regression: BUG_REPORT.md #3 — zero `adapter_timeout` made
+    /// every adapter call time out instantly.
+    #[test]
+    fn test_validate_rejects_zero_adapter_timeout() {
+        let config = EventBusConfig {
+            adapter_timeout: Duration::ZERO,
+            ..EventBusConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    /// Regression: BUG_REPORT.md #3 — `ScalingPolicy` durations of
+    /// zero either div-by-zero'd, thrashed the scaler, or scaled
+    /// down on the first underutilized sample.
+    #[test]
+    fn test_validate_rejects_zero_scaling_durations() {
+        let base = ScalingPolicy::default();
+
+        let mut p = base.clone();
+        p.cooldown = Duration::ZERO;
+        assert!(p.validate().is_err());
+
+        let mut p = base.clone();
+        p.metrics_window = Duration::ZERO;
+        assert!(p.validate().is_err());
+
+        let mut p = base;
+        p.scale_down_delay = Duration::ZERO;
+        assert!(p.validate().is_err());
+    }
+
+    /// Regression: BUG_REPORT.md #3 — `RedisAdapterConfig` had no
+    /// `validate()` and `pipeline_size: 0` shipped through to a
+    /// runtime panic.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn test_validate_redis_pipeline_size_zero_rejected() {
+        let mut redis = RedisAdapterConfig::new("redis://localhost:6379");
+        redis.pipeline_size = 0;
+
+        let result = EventBusConfig::builder()
+            .adapter(AdapterConfig::Redis(redis))
+            .build();
+        assert!(result.is_err(), "redis pipeline_size == 0 must reject");
+    }
+
+    /// Regression: BUG_REPORT.md #3 — `JetStreamAdapterConfig` had
+    /// no `validate()` either.
+    #[cfg(feature = "jetstream")]
+    #[test]
+    fn test_validate_jetstream_replicas_zero_rejected() {
+        let mut js = JetStreamAdapterConfig::new("nats://localhost:4222");
+        js.replicas = 0;
+
+        let result = EventBusConfig::builder()
+            .adapter(AdapterConfig::JetStream(js))
+            .build();
+        assert!(result.is_err(), "jetstream replicas == 0 must reject");
     }
 }

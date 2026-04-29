@@ -304,42 +304,31 @@ impl PollMerger {
         }
 
         // Apply filter.
-        // IMPORTANT: Use `new_cursor` (which tracks fetched positions) as the
-        // base cursor so that shards whose events are entirely filtered out
-        // still advance past those events. Without this, filtered-out events
-        // would be re-fetched on every subsequent poll, causing an infinite loop.
+        //
+        // IMPORTANT: Use `new_cursor` (which tracks fetched positions) as
+        // the base cursor so that shards whose events are entirely filtered
+        // out still advance past those events. Without this, filtered-out
+        // events would be re-fetched on every subsequent poll, causing an
+        // infinite loop.
+        //
+        // Parse failures: a `StoredEvent` whose `raw` bytes don't
+        // deserialize as JSON cannot match a filter, so it is dropped
+        // from the filtered result. Previously this drop was silent
+        // (`unwrap_or(false)`), making on-disk corruption or
+        // adapter-side framing bugs invisible to operators — only
+        // *unfiltered* polls would surface the bad event.
+        //
+        // BUG_REPORT.md #2 / #23: the previous `Ordering::None` path
+        // had a `break` once `kept.len() >= limit + 1`, which discarded
+        // events from later shards without ever filtering them. Combined
+        // with the cursor advancing past every fetched event, that meant
+        // matching events on un-inspected shards were silently lost. The
+        // fix uses a single full `retain` pass for both ordering modes;
+        // the `lazy parse` micro-optimization is gone, but per-event
+        // filter-matching is cheap and consistent semantics with the
+        // sort path is worth more than parse-skip on over-fetches.
         if let Some(filter) = &request.filter {
-            // Lazy-parse optimization: when we don't need to sort, stop
-            // parsing & matching once we have `limit + 1` survivors — the
-            // extra one signals `has_more`. Saves parse work on heavily
-            // over-fetched polls where most results would be truncated.
-            // Sorting requires seeing every event first, so the filtered
-            // sort path must fully scan.
-            //
-            // Parse failures: a `StoredEvent` whose `raw` bytes don't
-            // deserialize as JSON cannot match a filter, so it is dropped
-            // from the filtered result. Previously this drop was silent
-            // (`unwrap_or(false)`), making on-disk corruption or
-            // adapter-side framing bugs invisible to operators — only
-            // *unfiltered* polls would surface the bad event. Log a
-            // warning per dropped event so corruption is observable.
-            if request.ordering == Ordering::None {
-                let target = request.limit.saturating_add(1);
-                let mut kept: Vec<StoredEvent> = Vec::with_capacity(target.min(all_events.len()));
-                for event in all_events.drain(..) {
-                    if kept.len() >= target {
-                        // Stop parsing further — we already know we have
-                        // more matches than the caller asked for.
-                        break;
-                    }
-                    if event_matches_filter(&event, filter) {
-                        kept.push(event);
-                    }
-                }
-                all_events = kept;
-            } else {
-                all_events.retain(|e| event_matches_filter(e, filter));
-            }
+            all_events.retain(|e| event_matches_filter(e, filter));
         }
 
         // Apply ordering
@@ -352,45 +341,77 @@ impl PollMerger {
             }
         }
 
+        // BUG_REPORT.md #23: track per-shard match counts *before*
+        // truncate. After truncation, any shard whose match count
+        // shrank means matches were dropped — and those matches must
+        // be re-fetched on the next poll, otherwise they are silently
+        // lost (the cursor would otherwise advance past them via
+        // `new_cursor`).
+        let mut matched_per_shard: std::collections::HashMap<u16, usize> =
+            std::collections::HashMap::new();
+        if request.filter.is_some() {
+            for e in &all_events {
+                *matched_per_shard.entry(e.shard_id).or_insert(0) += 1;
+            }
+        }
+
         // Truncate to requested limit
         let had_extra = all_events.len() > request.limit;
         all_events.truncate(request.limit);
 
         // Build the final cursor.
         //
-        // With filtering: start from `new_cursor` (fetched positions) so shards
-        // whose events were entirely filtered out advance past them. Then
-        // override with the last *returned* event per shard — this prevents
-        // skipping matching events that were fetched but truncated by the limit.
+        // With filtering: start from `new_cursor` (fetched positions) so
+        // shards whose events were entirely filtered out advance past
+        // them. Then:
+        //   1. For shards that had matches truncated (returned <
+        //      total_matched), roll the cursor *back* to the original
+        //      pre-poll position. The override step then bumps it
+        //      forward to the last returned match for that shard, so
+        //      the unreturned matches re-appear on the next poll.
+        //   2. Override with the last *returned* event id per shard —
+        //      this also prevents skipping matching events that were
+        //      fetched but truncated by the limit on shards that did
+        //      land in the returned set.
         //
-        // Trade-off: the override can move a shard's cursor backward from the
-        // fetched position to the last returned (matching) event. This causes
-        // non-matching events between the last match and the fetch boundary to
-        // be re-fetched on the next poll. This is bounded and terminates:
-        // on the re-fetch, those events are filtered out again, no returned
-        // events override the cursor, so `new_cursor` advances past them.
-        // At most one extra fetch per shard per poll cycle.
-        //
-        // The alternative (keeping `new_cursor` without override) would skip
-        // matching events that were over-fetched but not returned due to the
-        // limit — a correctness violation.
-        //
-        // Without filtering: start from the original `cursor` so shards with
-        // no returned events (due to limit truncation) don't skip ahead.
-        // When filtering, move `new_cursor` (no longer needed separately).
-        // Otherwise clone the original `cursor` since it is compared below.
+        // Without filtering: start from the original `cursor` so shards
+        // with no returned events (due to limit truncation) don't skip
+        // ahead.
         let mut final_cursor = match new_cursor {
-            // Filter path: `new_cursor` tracks fetched positions; reuse it
-            // so shards whose events were entirely filtered out still
-            // advance past them.
             Some(nc) => nc,
-            // Non-filter path: start from the original `cursor` so shards
-            // with no returned events don't skip ahead.
             None => cursor.clone(),
         };
-        // Only the last returned event per shard matters for the cursor, so
-        // iterate in reverse and skip shards already seen. This reduces id
-        // clones from O(all_events.len()) to O(shards.len()).
+
+        // Step 1: rollback for shards with truncated matches.
+        if request.filter.is_some() && had_extra {
+            let mut returned_per_shard: std::collections::HashMap<u16, usize> =
+                std::collections::HashMap::new();
+            for e in &all_events {
+                *returned_per_shard.entry(e.shard_id).or_insert(0) += 1;
+            }
+            for (shard_id, &total_matched) in &matched_per_shard {
+                let returned = returned_per_shard.get(shard_id).copied().unwrap_or(0);
+                if returned < total_matched {
+                    // Some matches for this shard were truncated. Roll
+                    // back to the original cursor so they're re-fetched.
+                    // The override below will move us forward to the
+                    // last *returned* match (if any), so we still make
+                    // progress per poll.
+                    match cursor.positions.get(shard_id) {
+                        Some(orig) => final_cursor.set(*shard_id, orig.clone()),
+                        None => {
+                            final_cursor.positions.remove(shard_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 2: override to last returned event id per shard.
+        // Only the last returned event per shard matters for the
+        // cursor, so iterate in reverse and skip shards already seen.
+        // This reduces id clones from O(all_events.len()) to
+        // O(shards.len()).
         let mut seen_shards: std::collections::HashSet<u16> =
             std::collections::HashSet::with_capacity(shards.len());
         for event in all_events.iter().rev() {
@@ -1575,5 +1596,140 @@ mod tests {
         let ids: Vec<_> = unfiltered.events.iter().map(|e| e.id.as_str()).collect();
         assert!(ids.contains(&"0-1"));
         assert!(ids.contains(&"0-2"));
+    }
+
+    /// Regression: BUG_REPORT.md #2 — `Ordering::None` filter previously
+    /// broke out of the drain loop once `kept.len() >= limit + 1`,
+    /// which silently discarded events from later shards without
+    /// checking the filter. Combined with `new_cursor` advancing for
+    /// every polled shard, that meant matching events on un-inspected
+    /// shards were lost forever.
+    ///
+    /// Setup: shard 0 has matches followed by shard 1 with matches.
+    /// With `limit=2`, shard 0's first three events (two matches plus
+    /// one extra to trigger has_more) used to satisfy the early break,
+    /// silently dropping shard 1's matches AND advancing past them.
+    /// The fix runs a full `retain` pass over every fetched event,
+    /// then rolls back the cursor for shards whose matches were
+    /// truncated so they're re-fetched on the next poll.
+    #[tokio::test]
+    async fn test_regression_ordering_none_filter_does_not_strand_later_shards() {
+        let adapter = Arc::new(MockAdapter::new());
+
+        // Shard 0: 3 matching events.
+        adapter.add_events(
+            0,
+            vec![
+                StoredEvent::from_value("0-1".to_string(), json!({"type": "token"}), 100, 0),
+                StoredEvent::from_value("0-2".to_string(), json!({"type": "token"}), 110, 0),
+                StoredEvent::from_value("0-3".to_string(), json!({"type": "token"}), 120, 0),
+            ],
+        );
+        // Shard 1: 3 matching events.
+        adapter.add_events(
+            1,
+            vec![
+                StoredEvent::from_value("1-1".to_string(), json!({"type": "token"}), 200, 1),
+                StoredEvent::from_value("1-2".to_string(), json!({"type": "token"}), 210, 1),
+                StoredEvent::from_value("1-3".to_string(), json!({"type": "token"}), 220, 1),
+            ],
+        );
+
+        let merger = PollMerger::new(adapter, 2);
+        let filter = Filter::eq("type", json!("token"));
+
+        // Page through with a small limit — over many polls every
+        // matching event must surface exactly once. Bound iterations
+        // to detect either a stall or an explosion.
+        let mut all_returned: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..20 {
+            let mut req = ConsumeRequest::new(2).filter(filter.clone());
+            if let Some(c) = &cursor {
+                req = req.from(c.clone());
+            }
+            let resp = merger.poll(req).await.unwrap();
+            for e in &resp.events {
+                all_returned.push(e.id.clone());
+            }
+            if !resp.has_more {
+                break;
+            }
+            cursor = resp.next_id;
+        }
+
+        all_returned.sort();
+        all_returned.dedup();
+        assert_eq!(
+            all_returned,
+            vec!["0-1", "0-2", "0-3", "1-1", "1-2", "1-3"],
+            "every matching event from every shard must be returned exactly once"
+        );
+    }
+
+    /// Regression: BUG_REPORT.md #23 — `Ordering::InsertionTs` filter
+    /// previously stranded matches on shards whose matching events
+    /// all sorted later than `limit` matches from other shards. The
+    /// global sort+truncate dropped them, the cursor-override only
+    /// fired for shards present in the *returned* set, and so the
+    /// cursor for the un-returned shard advanced to its fetched
+    /// position via `new_cursor` — silently skipping the matches.
+    ///
+    /// Setup: shard 0 has 3 early-ts matches and shard 1 has 3
+    /// late-ts matches. With `limit=2` and `InsertionTs` ordering,
+    /// the first poll returns the two earliest from shard 0;
+    /// shard 1's matches must NOT be lost. The fix detects that
+    /// shard 1 had matches truncated and rolls its cursor back so
+    /// they're re-fetched on the next poll.
+    #[tokio::test]
+    async fn test_regression_insertion_ts_filter_does_not_strand_late_shard() {
+        let adapter = Arc::new(MockAdapter::new());
+
+        adapter.add_events(
+            0,
+            vec![
+                StoredEvent::from_value("0-1".to_string(), json!({"type": "token"}), 100, 0),
+                StoredEvent::from_value("0-2".to_string(), json!({"type": "token"}), 110, 0),
+                StoredEvent::from_value("0-3".to_string(), json!({"type": "token"}), 120, 0),
+            ],
+        );
+        adapter.add_events(
+            1,
+            vec![
+                StoredEvent::from_value("1-1".to_string(), json!({"type": "token"}), 1000, 1),
+                StoredEvent::from_value("1-2".to_string(), json!({"type": "token"}), 1010, 1),
+                StoredEvent::from_value("1-3".to_string(), json!({"type": "token"}), 1020, 1),
+            ],
+        );
+
+        let merger = PollMerger::new(adapter, 2);
+        let filter = Filter::eq("type", json!("token"));
+
+        let mut all_returned: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..20 {
+            let mut req = ConsumeRequest::new(2)
+                .filter(filter.clone())
+                .ordering(Ordering::InsertionTs);
+            if let Some(c) = &cursor {
+                req = req.from(c.clone());
+            }
+            let resp = merger.poll(req).await.unwrap();
+            for e in &resp.events {
+                all_returned.push(e.id.clone());
+            }
+            if !resp.has_more {
+                break;
+            }
+            cursor = resp.next_id;
+        }
+
+        all_returned.sort();
+        all_returned.dedup();
+        assert_eq!(
+            all_returned,
+            vec!["0-1", "0-2", "0-3", "1-1", "1-2", "1-3"],
+            "matches from the late-ts shard must not be lost to truncation"
+        );
     }
 }

@@ -121,6 +121,13 @@ pub struct ShardMetricsCollector {
     draining: AtomicBool,
     /// Window start time.
     window_start: RwLock<Instant>,
+    /// Pushes observed since `set_draining(true)` was last called.
+    /// Distinct from `events_in_window` because this counter is NOT
+    /// reset by `collect_and_reset`. `finalize_draining` reads this
+    /// instead of `events_in_window` so a drain-window-overlap with
+    /// a metrics tick can no longer race the counter to zero before
+    /// the producer is observed.
+    pushes_since_drain_start: AtomicU64,
 }
 
 impl ShardMetricsCollector {
@@ -137,6 +144,7 @@ impl ShardMetricsCollector {
             flush_count: AtomicU64::new(0),
             draining: AtomicBool::new(false),
             window_start: RwLock::new(Instant::now()),
+            pushes_since_drain_start: AtomicU64::new(0),
         }
     }
 
@@ -153,6 +161,11 @@ impl ShardMetricsCollector {
         self.push_latency_sum_ns
             .fetch_add(latency_ns, AtomicOrdering::Relaxed);
         self.push_count.fetch_add(1, AtomicOrdering::Relaxed);
+        // Always increment — the cost is one fetch_add and the
+        // counter only matters when the shard is draining. Cheaper
+        // than branching on `self.draining.load()` in the hot path.
+        self.pushes_since_drain_start
+            .fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Record a batch flush.
@@ -164,8 +177,24 @@ impl ShardMetricsCollector {
     }
 
     /// Set drain mode.
+    ///
+    /// Transitions to draining reset `pushes_since_drain_start` so
+    /// `finalize_draining` only counts pushes that arrived after the
+    /// drain began.
     pub fn set_draining(&self, draining: bool) {
+        if draining {
+            self.pushes_since_drain_start
+                .store(0, AtomicOrdering::Relaxed);
+        }
         self.draining.store(draining, AtomicOrdering::Release);
+    }
+
+    /// Number of pushes observed since `set_draining(true)` was
+    /// last called. Used by `finalize_draining` to detect lingering
+    /// producers that the window-reset `events_in_window` counter
+    /// can race past.
+    pub fn pushes_since_drain_start(&self) -> u64 {
+        self.pushes_since_drain_start.load(AtomicOrdering::Relaxed)
     }
 
     /// Check if draining.
@@ -310,6 +339,15 @@ pub struct ShardMapper {
     on_shard_created: RwLock<Option<ShardCallback>>,
     /// Callback for shard removal (provided by ShardManager).
     on_shard_removed: RwLock<Option<ShardCallback>>,
+    /// Monotonic shard-id allocator. The next `scale_up` call gets
+    /// `fetch_add(1)` from here. Distinct from `shards.iter().max() +
+    /// 1`: that approach reused ids whenever the highest-numbered
+    /// shard had been drained-and-removed, silently merging two
+    /// unrelated shard lifetimes in any external system that keys
+    /// metrics or checkpoints on shard id. Monotonic allocation
+    /// ensures every shard ever allocated has a globally unique id
+    /// for the lifetime of this mapper.
+    next_shard_id: AtomicU16,
 }
 
 impl ShardMapper {
@@ -346,6 +384,9 @@ impl ShardMapper {
             last_scaling: RwLock::new(None),
             on_shard_created: RwLock::new(None),
             on_shard_removed: RwLock::new(None),
+            // Initial shards occupy ids `[0, initial_shards)`, so the
+            // first scale-up takes `initial_shards`.
+            next_shard_id: AtomicU16::new(initial_shards),
         })
     }
 
@@ -560,17 +601,33 @@ impl ShardMapper {
 
         let mut new_ids = Vec::with_capacity(count as usize);
 
-        // Find the next available ID
-        let max_id = shards.iter().map(|s| s.id).max().unwrap_or(0);
-
-        // Check for potential overflow before allocating any shards
-        // We need max_id + count + 1 IDs (since we start at max_id + 1)
-        if max_id.checked_add(count).is_none() || max_id + count > u16::MAX - 1 {
+        // Allocate monotonically from `next_shard_id`. Reusing
+        // `shards.iter().max()` would give the same id back to a new
+        // shard whenever the previous occupant of that id had been
+        // drained-and-removed, conflating two distinct shard
+        // lifetimes in external metric / checkpoint systems.
+        // Pre-check that we have room for `count` more allocations
+        // without overflowing `u16`.
+        let first_id = self.next_shard_id.load(AtomicOrdering::Relaxed);
+        let last_needed = first_id
+            .checked_add(count.saturating_sub(1))
+            .ok_or(ScalingError::AtMaxShards)?;
+        // Reserve `u16::MAX` as a sentinel so the post-allocation
+        // `next_shard_id.store(first_id + count, ...)` below cannot
+        // wrap (the next call would observe `first_id == u16::MAX`
+        // and attempt `MAX + 1`).
+        if last_needed == u16::MAX {
             return Err(ScalingError::AtMaxShards);
         }
+        // CAS-bump the allocator. The write lock on `shards` already
+        // serializes scale_up with itself, so a relaxed `fetch_add`
+        // here would also be sound; using a check + store keeps the
+        // pre-check authoritative.
+        self.next_shard_id
+            .store(first_id + count, AtomicOrdering::Relaxed);
 
         for i in 0..count {
-            let new_id = max_id + 1 + i; // Safe: checked above
+            let new_id = first_id + i;
             let new_shard = MappedShard {
                 id: new_id,
                 state: ShardState::Active,
@@ -699,8 +756,21 @@ impl ShardMapper {
                 } else {
                     0.0
                 };
-                let event_rate = shard.metrics.events_in_window.load(AtomicOrdering::Relaxed);
-                if fill_ratio == 0.0 && event_rate == 0 {
+                // BUG_REPORT.md #9: previously read `events_in_window`
+                // here, which `collect_and_reset` zeros every metrics
+                // tick. A producer push that landed in the window
+                // between two ticks could be silently zeroed out, so a
+                // draining shard whose buffer transiently emptied was
+                // finalized with a producer still attached.
+                // `pushes_since_drain_start` is a separate counter that
+                // is only reset by `set_draining(true)`, so any push
+                // observed since the drain began is sticky — exactly
+                // the signal we want.
+                let pushes_after_drain = shard
+                    .metrics
+                    .pushes_since_drain_start
+                    .load(AtomicOrdering::Relaxed);
+                if fill_ratio == 0.0 && pushes_after_drain == 0 {
                     // Check if we've waited long enough
                     if let Some(drain_start) = shard.drain_started {
                         if drain_start.elapsed() > Duration::from_millis(100) {
@@ -848,7 +918,7 @@ mod tests {
     fn test_scale_down() {
         let policy = ScalingPolicy {
             min_shards: 1,
-            cooldown: Duration::from_millis(0), // Disable cooldown for test
+            cooldown: Duration::from_nanos(1), // Disable cooldown for test
             ..Default::default()
         };
         let mapper = ShardMapper::new(4, 1024, policy).unwrap();
@@ -892,7 +962,7 @@ mod tests {
     fn test_draining_excludes_from_selection() {
         let policy = ScalingPolicy {
             min_shards: 1,
-            cooldown: Duration::from_millis(0),
+            cooldown: Duration::from_nanos(1),
             ..Default::default()
         };
         let mapper = ShardMapper::new(2, 1024, policy).unwrap();
@@ -945,6 +1015,58 @@ mod tests {
         assert!(
             normalized.validate().is_ok(),
             "normalized policy should be valid"
+        );
+    }
+
+    /// Regression: BUG_REPORT.md #7 — `scale_up` previously allocated
+    /// new shard ids as `shards.iter().max() + 1`, which reused ids
+    /// after the highest-numbered shard was drained-and-removed.
+    /// Reusing ids merges two distinct shard lifetimes in any
+    /// external metric/checkpoint system that keys on shard id.
+    /// The fix uses a monotonic `next_shard_id` counter.
+    #[test]
+    fn scale_up_does_not_reuse_ids_after_remove() {
+        let policy = ScalingPolicy {
+            min_shards: 1,
+            max_shards: 16,
+            cooldown: Duration::from_nanos(1),
+            ..Default::default()
+        };
+        let mapper = ShardMapper::new(2, 1024, policy).unwrap();
+
+        // Initial ids are 0 and 1. Scale up to 4 — new ids must be
+        // 2 and 3 (the next two slots from the monotonic counter).
+        let new_ids = mapper.scale_up(2).unwrap();
+        assert_eq!(new_ids, vec![2, 3]);
+
+        // Drain one shard. `scale_down` picks by lowest weight, so
+        // we don't get to choose which id is drained. Whichever it
+        // is, we then force it through Stopped + remove and check
+        // that the removed id is *not* reissued by the next
+        // scale_up.
+        let drained = mapper.scale_down(1).unwrap();
+        let drained_id = drained[0];
+        for shard in mapper.shards.write().iter_mut() {
+            if shard.id == drained_id {
+                shard.state = ShardState::Stopped;
+            }
+        }
+        let removed = mapper.remove_stopped_shards();
+        assert_eq!(removed, vec![drained_id]);
+
+        // Scale up by 1. The broken `max(existing_ids) + 1` allocator
+        // could revive the just-removed id whenever `drained_id` had
+        // been the highest id present (e.g. id 3 with 0/1/2/3 → 0/1/2
+        // → next would be 3 again). The fix uses the monotonic
+        // counter, which sits at 4 after the earlier scale_up, so
+        // the new id must be 4 regardless of which id was drained.
+        let new_ids = mapper.scale_up(1).unwrap();
+        assert_eq!(
+            new_ids,
+            vec![4],
+            "shard id {drained_id} was just removed; reusing any \
+             previously-issued id would merge two distinct shard \
+             lifetimes in external systems"
         );
     }
 
@@ -1009,7 +1131,7 @@ mod tests {
 
         let policy = ScalingPolicy {
             max_shards: 10,
-            cooldown: Duration::from_millis(0), // Disable cooldown for test
+            cooldown: Duration::from_nanos(1), // Disable cooldown for test
             ..Default::default()
         };
         let mapper = Arc::new(ShardMapper::new(5, 1024, policy).unwrap());
@@ -1119,33 +1241,28 @@ mod tests {
 
     #[test]
     fn test_scale_up_overflow_protection() {
-        // Create mapper with a high starting shard ID to test overflow protection
+        // Create mapper with a high starting shard ID to test overflow
+        // protection. The monotonic id allocator advances by 1 per
+        // shard regardless of which shards have been removed, so we
+        // bump `next_shard_id` directly to simulate a near-`u16::MAX`
+        // state.
         let policy = ScalingPolicy {
             max_shards: u16::MAX,
             ..Default::default()
         };
         let mapper = ShardMapper::new(1, 1024, policy).unwrap();
 
-        // Manually set up a scenario where we're near the u16 limit
-        // by scaling up close to the limit
-        {
-            let mut shards = mapper.shards.write();
-            // Simulate a shard with ID close to u16::MAX
-            shards.clear();
-            shards.push(MappedShard {
-                id: u16::MAX - 2,
-                state: ShardState::Active,
-                metrics: Arc::new(ShardMetricsCollector::new(u16::MAX - 2, 1024)),
-                drain_started: None,
-                last_metrics: ShardMetrics::new(u16::MAX - 2),
-            });
-        }
+        // Position the allocator so the next id is u16::MAX - 1.
+        // Trying to allocate 3 ids would need {MAX-1, MAX, MAX+1};
+        // the last is unrepresentable in `u16`, so scale_up rejects.
+        mapper
+            .next_shard_id
+            .store(u16::MAX - 1, AtomicOrdering::Relaxed);
 
-        // Trying to add 3 shards should fail (would need IDs MAX-1, MAX, MAX+1)
         let result = mapper.scale_up(3);
         assert!(matches!(result, Err(ScalingError::AtMaxShards)));
 
-        // Adding 1 shard should still work (ID = MAX-1)
+        // Adding 1 shard should still work (id = MAX - 1).
         let result = mapper.scale_up(1);
         assert!(result.is_ok());
     }
@@ -1182,7 +1299,7 @@ mod tests {
         let policy = ScalingPolicy {
             fill_ratio_threshold: 0.7,
             max_shards: 8,
-            cooldown: Duration::from_millis(0),
+            cooldown: Duration::from_nanos(1),
             ..Default::default()
         };
         let mapper = ShardMapper::new(4, 1024, policy).unwrap();
@@ -1204,7 +1321,7 @@ mod tests {
         let policy = ScalingPolicy {
             push_latency_threshold_ns: 10,
             max_shards: 8,
-            cooldown: Duration::from_millis(0),
+            cooldown: Duration::from_nanos(1),
             ..Default::default()
         };
         let mapper = ShardMapper::new(4, 1024, policy).unwrap();
@@ -1226,7 +1343,7 @@ mod tests {
         let policy = ScalingPolicy {
             underutilized_threshold: 0.2,
             min_shards: 2,
-            cooldown: Duration::from_millis(0),
+            cooldown: Duration::from_nanos(1),
             ..Default::default()
         };
         let mapper = ShardMapper::new(4, 1024, policy).unwrap();
@@ -1249,7 +1366,7 @@ mod tests {
         let policy = ScalingPolicy {
             fill_ratio_threshold: 0.7,
             max_shards: 4, // Already at max
-            cooldown: Duration::from_millis(0),
+            cooldown: Duration::from_nanos(1),
             ..Default::default()
         };
         let mapper = ShardMapper::new(4, 1024, policy).unwrap();
@@ -1271,7 +1388,7 @@ mod tests {
         let policy = ScalingPolicy {
             underutilized_threshold: 0.2,
             min_shards: 4, // Already at min
-            cooldown: Duration::from_millis(0),
+            cooldown: Duration::from_nanos(1),
             ..Default::default()
         };
         let mapper = ShardMapper::new(4, 1024, policy).unwrap();
@@ -1294,7 +1411,7 @@ mod tests {
         let policy = ScalingPolicy {
             fill_ratio_threshold: 0.7,
             max_shards: 8,
-            cooldown: Duration::from_millis(0),
+            cooldown: Duration::from_nanos(1),
             ..Default::default()
         };
         let mapper = ShardMapper::new(4, 1024, policy).unwrap();

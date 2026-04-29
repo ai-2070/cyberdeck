@@ -17,9 +17,10 @@ pub enum IngestionError {
     #[error("event bus is shutting down")]
     ShuttingDown,
 
-    /// Serialization failed.
+    /// Serialization failed. Wraps the underlying `serde_json::Error` so
+    /// callers can read the category, line, and column via `source()`.
     #[error("serialization error: {0}")]
-    Serialization(String),
+    Serialization(#[from] serde_json::Error),
 }
 
 /// Errors that can occur in adapter operations.
@@ -41,9 +42,11 @@ pub enum AdapterError {
     #[error("connection error: {0}")]
     Connection(String),
 
-    /// Serialization/deserialization error.
+    /// Serialization/deserialization error. Wraps the underlying
+    /// `serde_json::Error` so callers can read the category, line, and
+    /// column via `source()`.
     #[error("serialization error: {0}")]
-    Serialization(String),
+    Serialization(#[from] serde_json::Error),
 }
 
 impl AdapterError {
@@ -89,13 +92,31 @@ pub type ConsumerResult<T> = Result<T, ConsumerError>;
 mod tests {
     use super::*;
 
+    fn make_serde_error() -> serde_json::Error {
+        serde_json::from_str::<serde_json::Value>("not json").unwrap_err()
+    }
+
     #[test]
     fn test_adapter_error_is_retryable() {
         assert!(AdapterError::Transient("temp".into()).is_retryable());
         assert!(AdapterError::Backpressure.is_retryable());
         assert!(!AdapterError::Fatal("dead".into()).is_retryable());
         assert!(!AdapterError::Connection("refused".into()).is_retryable());
-        assert!(!AdapterError::Serialization("bad json".into()).is_retryable());
+        assert!(!AdapterError::Serialization(make_serde_error()).is_retryable());
+    }
+
+    /// Regression: BUG_REPORT.md #18 — `Serialization` previously stored
+    /// the rendered error string and broke the `source()` chain. Wrapping
+    /// `serde_json::Error` directly preserves the category/line/column.
+    #[test]
+    fn test_serialization_error_preserves_source() {
+        let err = AdapterError::Serialization(make_serde_error());
+        // The Display impl still renders the inner error.
+        assert!(err.to_string().contains("serialization error"));
+        // And the source chain points at the original serde_json::Error.
+        let source = std::error::Error::source(&err)
+            .expect("Serialization variant should expose its source");
+        assert!(source.is::<serde_json::Error>());
     }
 
     #[test]
@@ -139,7 +160,9 @@ mod tests {
         // Connection errors cover both transient failures ("send failed") and
         // permanent ones ("adapter not initialized"). Since we can't distinguish
         // them at the type level, Connection is conservatively non-retryable.
-        // The batch dispatch path retries all errors regardless of this flag.
+        // `bus::dispatch_batch` honors `is_retryable()` and skips the retry
+        // loop when this returns false, so a Connection error drops the
+        // batch immediately rather than burning the retry budget.
         assert!(!AdapterError::Connection("refused".into()).is_retryable());
         assert!(!AdapterError::Connection("adapter not initialized".into()).is_retryable());
     }

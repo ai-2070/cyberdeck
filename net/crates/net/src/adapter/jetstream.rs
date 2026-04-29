@@ -25,6 +25,8 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::sync::OnceCell;
 
 use crate::adapter::{Adapter, ShardPollResult};
 use crate::config::JetStreamAdapterConfig;
@@ -39,8 +41,18 @@ pub struct JetStreamAdapter {
     jetstream: Option<jetstream::Context>,
     /// Configuration.
     config: JetStreamAdapterConfig,
-    /// Stream cache (shard_id -> stream).
-    streams: Mutex<HashMap<u16, Stream>>,
+    /// Per-shard stream cache.
+    ///
+    /// Each shard's slot is an `Arc<OnceCell<Stream>>` so concurrent
+    /// `on_batch` callers for the same cold shard race only on the
+    /// outer `Mutex` (a brief get-or-insert) and then serialize on
+    /// `OnceCell::get_or_try_init`. Without the per-shard `OnceCell`,
+    /// two concurrent callers could both miss a flat
+    /// `HashMap<u16, Stream>` cache, both call `get_stream` /
+    /// `create_stream`, and both insert — extra RPCs on cold start
+    /// and a hazard if create_stream configs ever diverge between
+    /// callers (BUG_REPORT.md #10.3).
+    streams: Mutex<HashMap<u16, Arc<OnceCell<Stream>>>>,
     /// Whether the adapter has been initialized.
     initialized: AtomicBool,
 }
@@ -90,8 +102,7 @@ impl JetStreamAdapter {
 
     /// Deserialize a stored event.
     fn deserialize_event(seq: u64, data: &[u8]) -> Result<StoredEvent, AdapterError> {
-        let value: serde_json::Value =
-            serde_json::from_slice(data).map_err(|e| AdapterError::Serialization(e.to_string()))?;
+        let value: serde_json::Value = serde_json::from_slice(data)?;
 
         let raw = value.get("r").cloned().unwrap_or(serde_json::Value::Null);
         let raw_bytes = Bytes::from(serde_json::to_vec(&raw).unwrap_or_default());
@@ -107,61 +118,67 @@ impl JetStreamAdapter {
     }
 
     /// Get or create a stream for a shard.
+    ///
+    /// Cold-start single-flight: only one `get_stream`/`create_stream`
+    /// pair runs per shard regardless of how many concurrent
+    /// `on_batch` calls land here at once. The brief outer `Mutex`
+    /// just resolves "which `OnceCell` does this shard map to";
+    /// the actual create-once happens inside
+    /// `OnceCell::get_or_try_init`, which serializes initialization
+    /// across all callers and surfaces the same `Stream` clone (or
+    /// the same error) to each (BUG_REPORT.md #10.3). On error the
+    /// cell stays uninitialized and a subsequent call will retry.
     async fn get_or_create_stream(&self, shard_id: u16) -> Result<Stream, AdapterError> {
-        let stream_name = self.stream_name(shard_id);
-
-        // Check cache first
-        {
-            let streams = self.streams.lock();
-            if let Some(stream) = streams.get(&shard_id) {
-                return Ok(stream.clone());
-            }
-        }
-
-        let js = self
-            .jetstream
-            .as_ref()
-            .ok_or_else(|| AdapterError::Connection("adapter not initialized".into()))?;
-
-        // Try to get existing stream
-        let stream = match js.get_stream(&stream_name).await {
-            Ok(stream) => stream,
-            Err(_) => {
-                // Create new stream
-                let mut stream_config = jetstream::stream::Config {
-                    name: stream_name.clone(),
-                    subjects: vec![self.subject(shard_id)],
-                    retention: jetstream::stream::RetentionPolicy::Limits,
-                    storage: jetstream::stream::StorageType::File,
-                    num_replicas: self.config.replicas,
-                    discard: jetstream::stream::DiscardPolicy::Old,
-                    allow_direct: true, // Required for direct_get API
-                    ..Default::default()
-                };
-
-                if let Some(max_messages) = self.config.max_messages {
-                    stream_config.max_messages = max_messages;
-                }
-                if let Some(max_bytes) = self.config.max_bytes {
-                    stream_config.max_bytes = max_bytes;
-                }
-                if let Some(max_age) = self.config.max_age {
-                    stream_config.max_age = max_age;
-                }
-
-                js.create_stream(stream_config)
-                    .await
-                    .map_err(|e| AdapterError::Connection(e.to_string()))?
-            }
+        let cell = {
+            let mut streams = self.streams.lock();
+            streams
+                .entry(shard_id)
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
         };
 
-        // Cache the stream
-        {
-            let mut streams = self.streams.lock();
-            streams.insert(shard_id, stream.clone());
-        }
+        let stream = cell
+            .get_or_try_init(|| async {
+                let stream_name = self.stream_name(shard_id);
+                let js = self
+                    .jetstream
+                    .as_ref()
+                    .ok_or_else(|| AdapterError::Connection("adapter not initialized".into()))?;
 
-        Ok(stream)
+                // Try to get existing stream first; only create if missing.
+                match js.get_stream(&stream_name).await {
+                    Ok(stream) => Ok(stream),
+                    Err(_) => {
+                        let mut stream_config = jetstream::stream::Config {
+                            name: stream_name.clone(),
+                            subjects: vec![self.subject(shard_id)],
+                            retention: jetstream::stream::RetentionPolicy::Limits,
+                            storage: jetstream::stream::StorageType::File,
+                            num_replicas: self.config.replicas,
+                            discard: jetstream::stream::DiscardPolicy::Old,
+                            allow_direct: true, // Required for direct_get API
+                            ..Default::default()
+                        };
+
+                        if let Some(max_messages) = self.config.max_messages {
+                            stream_config.max_messages = max_messages;
+                        }
+                        if let Some(max_bytes) = self.config.max_bytes {
+                            stream_config.max_bytes = max_bytes;
+                        }
+                        if let Some(max_age) = self.config.max_age {
+                            stream_config.max_age = max_age;
+                        }
+
+                        js.create_stream(stream_config)
+                            .await
+                            .map_err(|e| AdapterError::Connection(e.to_string()))
+                    }
+                }
+            })
+            .await?;
+
+        Ok(stream.clone())
     }
 }
 
@@ -313,9 +330,20 @@ impl Adapter for JetStreamAdapter {
             streams.clear();
         }
 
-        // Drain the NATS client to flush pending messages and close cleanly.
+        // Drain the NATS client to flush pending messages and close
+        // cleanly. Surface drain errors as `Transient` rather than
+        // discarding them — the trait contract is "shutdown should
+        // flush", and a silent failure here means in-flight messages
+        // are quietly lost.
         if let Some(client) = &self.client {
-            let _ = client.drain().await;
+            if let Err(e) = client.drain().await {
+                tracing::error!(
+                    adapter = "jetstream",
+                    error = %e,
+                    "drain() failed during JetStream shutdown"
+                );
+                return Err(AdapterError::Transient(format!("nats drain: {e}")));
+            }
         }
 
         tracing::info!(adapter = "jetstream", "JetStream adapter shut down");
@@ -345,14 +373,24 @@ impl Adapter for JetStreamAdapter {
 
         // Use the stream's actual last sequence to bound the search,
         // rather than an arbitrary multiplier that can miss events in
-        // streams with large gaps (deletions, compaction).
+        // streams with large gaps (deletions, compaction). The
+        // fallback saturates so a caller-supplied `limit` near
+        // `usize::MAX` cannot wrap to a tiny `max_seq` and silently
+        // cap the poll at zero events.
         let max_seq = match stream.info().await {
             Ok(info) => info.state.last_sequence,
-            Err(_) => start_seq.saturating_add(fetch_limit as u64 * 10),
+            Err(_) => {
+                let span = (fetch_limit as u64).saturating_mul(10);
+                start_seq.saturating_add(span)
+            }
         };
 
         // Use direct get to fetch messages by sequence
-        // Use while loop so gaps don't consume our fetch count
+        // Use while loop so gaps don't consume our fetch count.
+        // Track every sequence we observe (regardless of deserialize
+        // outcome) so the cursor can advance past corrupt entries
+        // instead of stalling on them.
+        let mut last_seen_seq: Option<u64> = None;
         while events.len() < fetch_limit {
             if current_seq > max_seq {
                 // Searched too far without finding enough events
@@ -361,6 +399,7 @@ impl Adapter for JetStreamAdapter {
 
             match stream.direct_get(current_seq).await {
                 Ok(msg) => {
+                    last_seen_seq = Some(current_seq);
                     match Self::deserialize_event(current_seq, &msg.payload) {
                         Ok(event) => events.push(event),
                         Err(e) => {
@@ -399,7 +438,13 @@ impl Adapter for JetStreamAdapter {
 
         let has_more = events.len() > limit;
         let events: Vec<_> = events.into_iter().take(limit).collect();
-        let next_id = events.last().map(|e| e.id.clone());
+        // Prefer the last *seen* sequence over the last successfully
+        // deserialized event id. Otherwise a run of trailing corrupt
+        // entries leaves the cursor stuck, re-fetching them forever
+        // (analog of BUG_REPORT.md #4 for the JetStream path).
+        let next_id = last_seen_seq
+            .map(|s| s.to_string())
+            .or_else(|| events.last().map(|e| e.id.clone()));
 
         Ok(ShardPollResult {
             events,
@@ -429,14 +474,27 @@ impl Adapter for JetStreamAdapter {
     }
 }
 
-/// Check if a NATS error is transient (retryable).
+/// Check if a NATS publish error is transient (retryable).
+///
+/// Enumerates the retryable kinds explicitly rather than treating
+/// every error other than `WrongLastSequence` as retryable. The
+/// permissive default amplified misconfiguration into infinite
+/// retry storms — `StreamNotFound` and the `WrongLast*` variants
+/// are structural problems that do not become recoverable on retry.
 fn is_transient_error(e: &async_nats::jetstream::context::PublishError) -> bool {
-    // Most JetStream errors are transient (network, timeout)
-    // Only configuration errors are fatal
-    !matches!(
-        e.kind(),
-        async_nats::jetstream::context::PublishErrorKind::WrongLastSequence
-    )
+    use async_nats::jetstream::context::PublishErrorKind;
+    match e.kind() {
+        // Network / connection / timing / backpressure — retry is meaningful.
+        PublishErrorKind::TimedOut
+        | PublishErrorKind::BrokenPipe
+        | PublishErrorKind::MaxAckPending
+        | PublishErrorKind::Other => true,
+        // Structural failures: missing stream and optimistic-concurrency
+        // mismatches don't fix themselves under retry.
+        PublishErrorKind::StreamNotFound
+        | PublishErrorKind::WrongLastMessageId
+        | PublishErrorKind::WrongLastSequence => false,
+    }
 }
 
 #[cfg(test)]
@@ -486,5 +544,40 @@ mod tests {
 
         assert_eq!(adapter.subject(0), "myapp.shard.0");
         assert_eq!(adapter.subject(15), "myapp.shard.15");
+    }
+
+    /// Regression: BUG_REPORT.md #10 — `is_transient_error` previously
+    /// classified every error other than `WrongLastSequence` as
+    /// retryable, which meant config errors like `StreamNotFound`
+    /// triggered infinite retry storms. The fix enumerates retryable
+    /// kinds explicitly and treats structural failures as fatal.
+    #[test]
+    fn is_transient_error_classifies_kinds() {
+        use async_nats::jetstream::context::{PublishError, PublishErrorKind};
+
+        // Retryable: network / timing / backpressure.
+        assert!(is_transient_error(&PublishError::new(
+            PublishErrorKind::TimedOut
+        )));
+        assert!(is_transient_error(&PublishError::new(
+            PublishErrorKind::BrokenPipe
+        )));
+        assert!(is_transient_error(&PublishError::new(
+            PublishErrorKind::MaxAckPending
+        )));
+        assert!(is_transient_error(&PublishError::new(
+            PublishErrorKind::Other
+        )));
+
+        // Fatal: structural / config / concurrency.
+        assert!(!is_transient_error(&PublishError::new(
+            PublishErrorKind::StreamNotFound
+        )));
+        assert!(!is_transient_error(&PublishError::new(
+            PublishErrorKind::WrongLastMessageId
+        )));
+        assert!(!is_transient_error(&PublishError::new(
+            PublishErrorKind::WrongLastSequence
+        )));
     }
 }

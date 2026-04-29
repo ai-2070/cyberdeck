@@ -3,39 +3,54 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::json;
 
-use net::event::InternalEvent;
-use net::shard::RingBuffer;
+use net::config::BackpressureMode;
+use net::event::{InternalEvent, RawEvent};
+use net::shard::ShardManager;
 use net::timestamp::TimestampGenerator;
 
-/// Benchmark ring buffer push/pop operations.
-fn bench_ring_buffer(c: &mut Criterion) {
-    let mut group = c.benchmark_group("ring_buffer");
+/// Benchmark shard ingest/drain through the public API.
+///
+/// Replaces a previous bench against the raw `RingBuffer` type. That
+/// type is now `pub(crate)` (BUG_REPORT.md #5), so the next-cleanest
+/// proxy is `ShardManager`, which is what real ingestion paths use.
+/// The numbers therefore include the per-shard atomic counter
+/// updates and the `Mutex<Shard>` acquire/release — i.e. the actual
+/// hot-path overhead, not just the lock-free ring atomics.
+fn bench_shard(c: &mut Criterion) {
+    let mut group = c.benchmark_group("shard");
 
-    for size in [1024, 8192, 65536, 1048576].iter() {
+    // Single shard so the hash routing is deterministic and the
+    // bench measures the push/pop hot path rather than hashing.
+    for capacity in [1024, 8192, 65536, 1_048_576].iter() {
         group.throughput(Throughput::Elements(1));
 
-        group.bench_with_input(BenchmarkId::new("push", size), size, |b, &size| {
-            let buffer: RingBuffer<u64> = RingBuffer::new(size);
-            let mut i = 0u64;
-            b.iter(|| {
-                // Push until full, then pop to make room
-                if buffer.try_push(i).is_err() {
-                    let _ = buffer.try_pop();
-                    let _ = buffer.try_push(i);
-                }
-                i = i.wrapping_add(1);
-            });
-        });
+        // Pre-built `RawEvent` so each iteration measures only ingest,
+        // not JSON construction.
+        let raw_template = RawEvent::from_str(r#"{"i":0}"#);
 
-        group.bench_with_input(BenchmarkId::new("push_pop", size), size, |b, &size| {
-            let buffer: RingBuffer<u64> = RingBuffer::new(size);
-            let mut i = 0u64;
-            b.iter(|| {
-                let _ = buffer.try_push(i);
-                let _ = buffer.try_pop();
-                i = i.wrapping_add(1);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("ingest_raw", capacity),
+            capacity,
+            |b, &cap| {
+                let manager = ShardManager::new(1, cap, BackpressureMode::DropOldest);
+                b.iter(|| {
+                    let _ = manager.ingest_raw(raw_template.clone());
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("ingest_raw_pop", capacity),
+            capacity,
+            |b, &cap| {
+                let manager = ShardManager::new(1, cap, BackpressureMode::DropNewest);
+                b.iter(|| {
+                    let _ = manager.ingest_raw(raw_template.clone());
+                    // Pop one to make room for the next push.
+                    let _ = manager.with_shard(0, |s| s.try_pop());
+                });
+            },
+        );
     }
 
     group.finish();
@@ -80,24 +95,27 @@ fn bench_event_creation(c: &mut Criterion) {
 }
 
 /// Benchmark batch operations.
+///
+/// Steady-state pop-after-refill: every iteration pops `size`
+/// elements then immediately re-pushes the same count to keep the
+/// buffer at its target depth. The number we report is therefore
+/// *not* a pure pop cost — it includes the refill and the
+/// partial-pop branch. That's intentional for tracking real
+/// workloads (consumers that drain into the same ring), but call
+/// it out so future readers don't compare it against an
+/// isolated-pop benchmark.
 fn bench_batch_pop(c: &mut Criterion) {
     let mut group = c.benchmark_group("batch");
 
-    // Steady-state pop-after-refill: every iteration pops `size`
-    // elements then immediately re-pushes the same count to keep the
-    // buffer at its target depth. The number we report is therefore
-    // *not* a pure pop cost — it includes the refill and the
-    // partial-pop branch. That's intentional for tracking real
-    // workloads (consumers that drain into the same ring), but call
-    // it out so future readers don't compare it against an
-    // isolated-pop benchmark.
-    for batch_size in [100, 1000, 10000].iter() {
-        let buffer: RingBuffer<u64> = RingBuffer::new(1 << 20);
+    let raw_template = RawEvent::from_value(json!({"i": 0}));
 
-        // Pre-fill the buffer once so the first iteration starts in
+    for batch_size in [100, 1000, 10000].iter() {
+        let manager = ShardManager::new(1, 1 << 20, BackpressureMode::DropNewest);
+
+        // Pre-fill the shard once so the first iteration starts in
         // steady state.
-        for i in 0..(*batch_size * 10) {
-            let _ = buffer.try_push(i as u64);
+        for _ in 0..(*batch_size * 10) {
+            let _ = manager.ingest_raw(raw_template.clone());
         }
 
         group.throughput(Throughput::Elements(*batch_size as u64));
@@ -106,10 +124,13 @@ fn bench_batch_pop(c: &mut Criterion) {
             batch_size,
             |b, &size| {
                 b.iter(|| {
-                    let batch = buffer.pop_batch(size);
+                    let batch = manager
+                        .with_shard(0, |s| s.pop_batch(size))
+                        .unwrap_or_default();
                     // Refill what we popped to maintain depth.
-                    for i in 0..batch.len() {
-                        let _ = buffer.try_push(i as u64);
+                    let popped = batch.len();
+                    for _ in 0..popped {
+                        let _ = manager.ingest_raw(raw_template.clone());
                     }
                     batch
                 });
@@ -122,7 +143,7 @@ fn bench_batch_pop(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_ring_buffer,
+    bench_shard,
     bench_timestamp,
     bench_event_creation,
     bench_batch_pop,

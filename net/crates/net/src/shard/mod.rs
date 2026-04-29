@@ -15,7 +15,14 @@ pub use batch::{AdaptiveBatcher, BatchWorker};
 pub use mapper::{
     ScalingDecision, ScalingError, ShardMapper, ShardMetrics, ShardMetricsCollector, ShardState,
 };
-pub use ring_buffer::{BufferFullError, RingBuffer};
+// `RingBuffer` and `BufferFullError` are intentionally NOT re-exported.
+// External callers go through `EventBus` / `ShardManager`, which
+// uphold the SPSC contract via `Mutex<Shard>`. Exposing the raw ring
+// buffer publicly was a silent-UB footgun — anyone wrapping it in an
+// `Arc` and pushing from two threads got data corruption with no
+// compile-time signal (BUG_REPORT.md #5). `BufferFullError` is not
+// re-exported here either: callers see it as `IngestionError::Backpressure`.
+pub(crate) use ring_buffer::RingBuffer;
 
 // Re-export ScalingPolicy from config for convenience
 pub use crate::config::ScalingPolicy;
@@ -53,16 +60,27 @@ pub struct ShardStats {
     pub events_dropped: u64,
     /// Batches dispatched to adapter.
     pub batches_dispatched: u64,
+    /// Events that arrived at `ingest_raw_batch` but had no resolvable
+    /// shard (e.g. the routing table was rebuilt mid-dispatch and the
+    /// hashed shard id is no longer present). These cannot be
+    /// attributed to a per-shard counter, so they are tracked at the
+    /// `ShardManager` level and surfaced through aggregated `stats()`.
+    pub events_unrouted: u64,
 }
 
 impl ShardCounters {
     /// Load a consistent snapshot of the counters.
+    ///
+    /// `events_unrouted` is left at zero here — it is a manager-level
+    /// counter, not a per-shard one. `ShardManager::stats()` fills it
+    /// in after summing per-shard fields.
     #[inline]
     pub fn snapshot(&self) -> ShardStats {
         ShardStats {
             events_ingested: self.events_ingested.load(AtomicOrdering::Relaxed),
             events_dropped: self.events_dropped.load(AtomicOrdering::Relaxed),
             batches_dispatched: self.batches_dispatched.load(AtomicOrdering::Relaxed),
+            events_unrouted: 0,
         }
     }
 }
@@ -174,11 +192,9 @@ impl Shard {
     ///
     /// Allocates a fresh `Vec`. Prefer [`pop_batch_into`] in drain
     /// loops where the per-cycle `Vec` allocation should happen
-    /// outside the shard mutex (see [`RingBuffer::pop_batch_into`] for
-    /// the typical pattern).
+    /// outside the shard mutex.
     ///
     /// [`pop_batch_into`]: Self::pop_batch_into
-    /// [`RingBuffer::pop_batch_into`]: crate::shard::ring_buffer::RingBuffer::pop_batch_into
     #[inline]
     pub fn pop_batch(&mut self, max: usize) -> Vec<InternalEvent> {
         self.ring_buffer.pop_batch(max)
@@ -186,10 +202,12 @@ impl Shard {
 
     /// Pop a batch of events into a caller-owned buffer.
     ///
-    /// Append semantics — see [`RingBuffer::pop_batch_into`] for
-    /// details and the typical drain-loop pattern.
-    ///
-    /// [`RingBuffer::pop_batch_into`]: crate::shard::ring_buffer::RingBuffer::pop_batch_into
+    /// Append semantics: does **not** clear `dst`; reserves
+    /// `count` slots and pushes drained elements onto the end.
+    /// Returns the number drained this call. Use this in
+    /// steady-state drain loops where the caller keeps a scratch
+    /// `Vec` across cycles, so the per-cycle allocation moves out
+    /// of the consumer's critical section.
     #[inline]
     pub fn pop_batch_into(&mut self, dst: &mut Vec<InternalEvent>, max: usize) -> usize {
         self.ring_buffer.pop_batch_into(dst, max)
@@ -199,6 +217,20 @@ impl Shard {
     #[inline]
     pub fn try_pop(&mut self) -> Option<InternalEvent> {
         self.ring_buffer.try_pop()
+    }
+
+    /// Producer-side eviction of the oldest event.
+    ///
+    /// Used by `BackpressureMode::DropOldest` to make room for a
+    /// new push when the buffer is full. Bypasses the ring buffer's
+    /// consumer-thread tracking (the producer thread is calling
+    /// what is normally a consumer-side operation). Safe because
+    /// the outer shard mutex serializes this against any concurrent
+    /// `try_pop` from the legitimate consumer (the batch worker).
+    /// See BUG_REPORT.md #8.
+    #[inline]
+    pub(crate) fn evict_oldest(&mut self) -> Option<InternalEvent> {
+        self.ring_buffer.evict_oldest()
     }
 
     /// Get the current buffer length.
@@ -306,6 +338,13 @@ pub struct ShardManager {
     /// Serializes concurrent `add_shard` / `remove_shard` rebuilds.
     /// Not on the ingest path.
     rebuild_lock: parking_lot::Mutex<()>,
+    /// Events dropped because no destination shard was resolvable.
+    /// Distinct from per-shard `events_dropped` (which tracks
+    /// backpressure on a known shard) — this counts events whose
+    /// hashed shard id was missing from the routing table at lookup
+    /// time, e.g. due to a concurrent scale-down. Surfaced via
+    /// `stats().events_unrouted`.
+    events_unrouted: AtomicU64,
 }
 
 impl ShardManager {
@@ -326,6 +365,7 @@ impl ShardManager {
             ring_buffer_capacity,
             mapper: None,
             rebuild_lock: parking_lot::Mutex::new(()),
+            events_unrouted: AtomicU64::new(0),
         }
     }
 
@@ -354,6 +394,7 @@ impl ShardManager {
             ring_buffer_capacity,
             mapper: Some(mapper),
             rebuild_lock: parking_lot::Mutex::new(()),
+            events_unrouted: AtomicU64::new(0),
         })
     }
 
@@ -408,8 +449,16 @@ impl ShardManager {
             // Dynamic mode: use weighted selection
             mapper.select_shard(hash)
         } else {
-            // Static mode: simple modulo
+            // Static mode: simple modulo. Defensive guard against
+            // `num_shards == 0` — config validation rejects 0 at
+            // startup and `scale_down` requires `current > min_shards
+            // >= 1`, so this branch is unreachable today, but a stray
+            // 0 here would otherwise panic on the `%` below.
             let num_shards = self.num_shards.load(std::sync::atomic::Ordering::Acquire);
+            debug_assert!(num_shards > 0, "num_shards must be > 0");
+            if num_shards == 0 {
+                return 0;
+            }
             (hash % num_shards as u64) as u16
         }
     }
@@ -441,13 +490,20 @@ impl ShardManager {
                     // The failed try_push_raw incremented events_dropped for
                     // the *new* event, but the new event isn't actually
                     // dropped — the oldest is. Correct the stats: undo the
-                    // spurious drop count, pop the oldest (which is the real
+                    // spurious drop count, evict the oldest (which is the real
                     // drop), and retry with the same ref-counted bytes.
+                    //
+                    // BUG_REPORT.md #8: use the producer-side
+                    // `evict_oldest` rather than `try_pop`. Calling
+                    // `try_pop` from the producer thread would
+                    // violate the SPSC consumer contract (the
+                    // legitimate consumer is the batch worker, on a
+                    // different task / thread).
                     shard
                         .counters
                         .events_dropped
                         .fetch_sub(1, AtomicOrdering::Relaxed);
-                    let _ = shard.try_pop();
+                    let _ = shard.evict_oldest();
                     shard
                         .counters
                         .events_dropped
@@ -470,9 +526,7 @@ impl ShardManager {
     /// Ingest an event into the appropriate shard.
     pub fn ingest(&self, event: JsonValue) -> Result<(u16, u64), IngestionError> {
         // Serialize once upfront - avoids clone on retry
-        let raw = Bytes::from(
-            serde_json::to_vec(&event).map_err(|e| IngestionError::Serialization(e.to_string()))?,
-        );
+        let raw = Bytes::from(serde_json::to_vec(&event)?);
         let hash = xxhash_rust::xxh3::xxh3_64(&raw);
         let shard_id = self.select_shard_by_hash(hash);
 
@@ -526,9 +580,16 @@ impl ShardManager {
         let mut groups: Vec<Vec<Bytes>> = (0..table.shards.len()).map(|_| Vec::new()).collect();
         let mut group_ids: Vec<u16> = vec![0; groups.len()];
 
+        let mut unrouted = 0u64;
         for event in events {
             let shard_id = self.select_shard_by_hash(event.hash());
             let Some(idx) = self.resolve_idx(&table, shard_id) else {
+                // Routing table doesn't contain the chosen shard
+                // (e.g. concurrent scale-down removed it). The drop
+                // can't be attributed to a per-shard counter; track
+                // it on the manager-level `events_unrouted` so
+                // bus-level vs. per-shard reconciliation is exact.
+                unrouted += 1;
                 continue;
             };
             if let Some(g) = groups.get_mut(idx) {
@@ -537,6 +598,10 @@ impl ShardManager {
                 }
                 g.push(event.bytes());
             }
+        }
+        if unrouted > 0 {
+            self.events_unrouted
+                .fetch_add(unrouted, AtomicOrdering::Relaxed);
         }
 
         let mut success = 0usize;
@@ -601,7 +666,9 @@ impl ShardManager {
     ///
     /// Lock-free: reads each shard's atomic counters directly via the
     /// parallel `counters` vector on the routing table, with no per-
-    /// shard mutex acquisition.
+    /// shard mutex acquisition. `events_unrouted` is sourced from the
+    /// `ShardManager` itself rather than the per-shard counters since
+    /// unrouted events have no shard to attribute to.
     pub fn stats(&self) -> ShardStats {
         let table = self.table.load();
         let mut total = ShardStats::default();
@@ -611,6 +678,7 @@ impl ShardManager {
             total.events_dropped += snap.events_dropped;
             total.batches_dispatched += snap.batches_dispatched;
         }
+        total.events_unrouted = self.events_unrouted.load(AtomicOrdering::Relaxed);
         total
     }
 
