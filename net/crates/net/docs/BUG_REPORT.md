@@ -8,23 +8,77 @@ Audit of the Rust event-bus crate at `crates/net/src/`. Findings are based on th
 
 | # | Severity | File | Issue |
 |---|---|---|---|
-| 1 | HIGH | `consumer/merge.rs:326-339` | Lazy filter drops matching events from un-inspected shards |
-| 2 | HIGH | `config.rs` | Multiple unvalidated zero-divisors in `validate()` |
-| 3 | MEDIUM | `bus.rs:565-599` | Shutdown vs. concurrent `ingest` race strands events |
-| 4 | MEDIUM | `shard/mapper.rs:564` | Shard ID reuse after `remove_stopped_shards` |
-| 5 | MEDIUM | `shard/mod.rs:438-456` | `DropOldest` retry violates SPSC contract |
-| 6 | MEDIUM | `shard/mapper.rs:688-712` | `finalize_draining` reads a destructively-reset counter |
-| 7 | MEDIUM | `adapter/jetstream.rs` | Silent failures and bad transient classification |
-| 8 | MEDIUM | `adapter/redis.rs:198-228` | Pipeline timeout-then-retry produces duplicates |
-| 9 | MEDIUM | `adapter/redis.rs:46-82` | `stream_key` cache uses `Vec` keyed by sparse shard_id |
-| 10 | MEDIUM | `timestamp.rs:63` | `next()` returns raw TSC ticks; doc says nanoseconds |
-| 11 | MEDIUM | `ffi/mesh.rs:1092-1105` | `collect_payloads` lacks per-entry null check |
-| 12 | MEDIUM | `ffi/mod.rs:866-875` | `net_shutdown` spin-waits unboundedly on in-flight ops |
-| 13 | LOW | `error.rs:21-22, 45-46` | `Serialization(String)` discards underlying serde error |
+| 1 | CRITICAL | `ffi/mod.rs:133-148, 849-877` | Use-after-free in `net_shutdown` Dekker handshake |
+| 2 | HIGH | `consumer/merge.rs:326-339` | Lazy filter drops matching events from un-inspected shards |
+| 3 | HIGH | `config.rs` | Multiple unvalidated zero-divisors in `validate()` |
+| 4 | HIGH | `adapter/redis.rs:336` | `poll_shard` cursor stalls when every entry fails to deserialize |
+| 5 | HIGH | `shard/ring_buffer.rs:62-71` | Public `unsafe impl Sync for RingBuffer` is a silent-UB footgun |
+| 6 | MEDIUM | `bus.rs:565-599` | Shutdown vs. concurrent `ingest` race strands events |
+| 7 | MEDIUM | `shard/mapper.rs:564` | Shard ID reuse after `remove_stopped_shards` |
+| 8 | MEDIUM | `shard/mod.rs:438-456` | `DropOldest` retry violates SPSC contract |
+| 9 | MEDIUM | `shard/mapper.rs:688-712` | `finalize_draining` reads a destructively-reset counter |
+| 10 | MEDIUM | `adapter/jetstream.rs` | Silent failures and bad transient classification |
+| 11 | MEDIUM | `adapter/jetstream.rs:351, 363-376` | `poll_shard` overflow + silent skip on deserialize errors |
+| 12 | MEDIUM | `adapter/redis.rs:198-228` | Pipeline timeout-then-retry produces duplicates |
+| 13 | MEDIUM | `adapter/redis.rs:46-82` | `stream_key` cache uses `Vec` keyed by sparse shard_id |
+| 14 | MEDIUM | `timestamp.rs:63` | `next()` returns raw TSC ticks; doc says nanoseconds |
+| 15 | MEDIUM | `ffi/mesh.rs:1092-1105` | `collect_payloads` lacks per-entry null check |
+| 16 | MEDIUM | `ffi/mod.rs:866-875` | `net_shutdown` spin-waits unboundedly on in-flight ops |
+| 17 | MEDIUM | `bus.rs:647-654` | `EventBus::Drop` only flips the flag — in-flight events lost on implicit drop |
+| 18 | LOW | `error.rs:21-22, 45-46` | `Serialization(String)` discards underlying serde error |
+| 19 | LOW | `shard/batch.rs:220` | `next_sequence += events.len() as u64` is unchecked |
+| 20 | LOW | `shard/mod.rs:413` | `hash % num_shards` panics if `num_shards == 0` |
+| 21 | LOW | `error.rs` / `bus.rs:659-692` | `is_retryable()` is defined but `dispatch_batch` retries everything |
+| 22 | LOW | `ffi/mod.rs:1102-1126, 1156-1180` | `NetEvent.id_len` / `raw_len` are publicly mutable from C — UB on size mismatch |
 
 ---
 
-## 1. HIGH — `consumer/merge.rs:326-339` — Lazy filter drops matching events from un-inspected shards
+## 1. CRITICAL — `ffi/mod.rs:133-148, 849-877` — Use-after-free in `net_shutdown` Dekker handshake
+
+**What's wrong.** The Dekker-style SeqCst handshake between `FfiOpGuard::try_enter` and `net_shutdown` correctly prevents an FFI op from *proceeding* past the shutdown gate, but does not prevent UAF on the increment itself.
+
+`try_enter` (lines 133-148):
+
+```rust
+fn try_enter(handle: &'a NetHandle) -> Option<Self> {
+    handle.active_ops.fetch_add(1, SeqCst);
+    if handle.shutting_down.load(SeqCst) {
+        handle.active_ops.fetch_sub(1, AcqRel);
+        None
+    } else { Some(Self { handle }) }
+}
+```
+
+`net_shutdown` (lines 861-877):
+
+```rust
+let handle_ref = unsafe { &*handle };
+handle_ref.shutting_down.store(true, SeqCst);
+while handle_ref.active_ops.load(SeqCst) > 0 { spin_loop(); }
+let handle = unsafe { Box::from_raw(handle) };  // FREE
+```
+
+Legal SeqCst-consistent interleaving:
+
+1. Thread A: `shutting_down.store(true, SeqCst)`
+2. Thread A: `active_ops.load(SeqCst)` → sees 0
+3. Thread A: `Box::from_raw(handle)` — frees the storage (non-atomic, **not** in SeqCst total order)
+4. Thread B: `handle.active_ops.fetch_add(1, SeqCst)` — **dereferences freed memory**
+
+SeqCst gives a single total order over the atomic ops: if A's load saw 0, B's fetch_add must come *after* A's load in that order, which forces B to subsequently observe `shutting_down == true` and bail. That is what the existing comment relies on. But the `Box::from_raw` between A's load and B's fetch_add is non-atomic and is **not** ordered by SeqCst — A is free to deallocate before B's fetch_add ever runs.
+
+The check that *acts* on `shutting_down == true` happens *after* the increment, so by the time B is told to bail it has already accessed freed memory. This is reachable from valid concurrent FFI use.
+
+**Failure scenario.** Any C client that calls a non-shutdown FFI entry on one thread while another thread calls `net_shutdown` can hit the race. UAF is silent in release builds and may corrupt unrelated allocations or crash later.
+
+**Fix.** Keep the handle alive across the increment. Two options:
+
+- **Arc-clone before atomic access.** Box an `Arc<NetHandle>` and have every FFI entry clone the `Arc` from a `*const Arc<NetHandle>` before touching `active_ops`. `net_shutdown` then drops its `Arc`; the box is freed only when the last in-flight op drops its clone. The atomic `active_ops` becomes redundant.
+- **Leak the handle.** Don't `Box::from_raw` in `net_shutdown` at all — just `bus.shutdown().await` and `Box::leak(handle)`. Trades a one-time leak per process for soundness.
+
+---
+
+## 2. HIGH — `consumer/merge.rs:326-339` — Lazy filter drops matching events from un-inspected shards
 
 **What's wrong.** The `Ordering::None` filter loop breaks once `kept.len() >= limit + 1`:
 
@@ -47,7 +101,7 @@ Because `all_events` is built shard-by-shard via `extend()`, hitting the target 
 
 ---
 
-## 2. HIGH — `config.rs` — Multiple unvalidated zero-divisors in `validate()`
+## 3. HIGH — `config.rs` — Multiple unvalidated zero-divisors in `validate()`
 
 **What's wrong.** Several config knobs that act as divisors are accepted as 0 by `EventBusConfig::validate`:
 
@@ -63,7 +117,40 @@ Because `all_events` is built shard-by-shard via `extend()`, hitting the target 
 
 ---
 
-## 3. MEDIUM — `bus.rs:565-599` — Shutdown vs. concurrent `ingest` race strands events
+## 4. HIGH — `adapter/redis.rs:336` — `poll_shard` cursor stalls when every entry fails to deserialize
+
+**What's wrong.** After `XRANGE` returns, the adapter computes the next cursor from the *deserialized* events:
+
+```rust
+let has_more = entries.len() > limit;
+let next_id = events.last().map(|e| e.id.clone());
+```
+
+If every fetched entry fails `deserialize_event` (logged-and-skipped at lines 314-323), `events` is empty, so `next_id == None`. The merger only advances its per-shard cursor when `next_id` is `Some` (`consumer/merge.rs:290`), so the consumer re-fetches from the same start, hits the same corrupt entries, logs the same warnings forever — and never makes progress.
+
+**Failure scenario.** A single corrupt or schema-mismatched run of XRANGE entries silently wedges a consumer in a hot infinite loop with no observable forward motion.
+
+**Fix.** Track the last *raw entry id* seen during iteration (regardless of deserialize result) and use that as `next_id`. Skipping a corrupt event must still advance past it.
+
+---
+
+## 5. HIGH — `shard/ring_buffer.rs:62-71` — Public `unsafe impl Sync for RingBuffer` is a silent-UB footgun
+
+**What's wrong.** `RingBuffer<T>` is documented and implemented as SPSC. The `Sync` impl is sound only under the SPSC contract, but the type is `pub` (re-exported from `shard/mod.rs:18`) and `try_push(&self, ..)` / `try_pop(&self) -> Option<T>` are safe-Rust methods. The `#[cfg(test)]` consumer-thread-id assertion catches mis-use only in test builds — release builds silently corrupt.
+
+In production the buffer is wrapped in `parking_lot::Mutex<Shard>`, which serializes producer and consumer across mutex acquisitions, so the SPSC invariant holds inside this crate today. But the public surface advertises a lock-free SPSC buffer that any external caller can call `try_push` on from two threads simultaneously, with no `unsafe` token to flag the hazard.
+
+**Failure scenario.** Any consumer of the crate that constructs an `Arc<RingBuffer<T>>` and shares it across threads compiles cleanly, runs the test suite cleanly (consumer-thread asserts compile out), and silently corrupts the head/tail atomics in release.
+
+**Fix.** Pick one:
+
+- Make the type `pub(crate)` (preferred — there's no documented external use).
+- Drop the `Sync` impl and require external synchronization at the type level.
+- Make `try_push` / `try_pop` `unsafe fn` and document the SPSC contract as a safety precondition.
+
+---
+
+## 6. MEDIUM — `bus.rs:565-599` — Shutdown vs. concurrent `ingest` race strands events
 
 **What's wrong.** `ingest` does `shutdown.load(Relaxed)` and the drain worker uses `Relaxed` reads too. There is no happens-before relationship between "producer's ring-buffer push completes" and "drain worker observed empty + shutdown".
 
@@ -73,7 +160,7 @@ Because `all_events` is built shard-by-shard via `extend()`, hitting the target 
 
 ---
 
-## 4. MEDIUM — `shard/mapper.rs:564` — Shard ID reuse after `remove_stopped_shards`
+## 7. MEDIUM — `shard/mapper.rs:564` — Shard ID reuse after `remove_stopped_shards`
 
 **What's wrong.**
 
@@ -89,7 +176,7 @@ let max_id = shards.iter().map(|s| s.id).max().unwrap_or(0);
 
 ---
 
-## 5. MEDIUM — `shard/mod.rs:438-456` — `DropOldest` retry violates SPSC contract
+## 8. MEDIUM — `shard/mod.rs:438-456` — `DropOldest` retry violates SPSC contract
 
 **What's wrong.** `push_with_backpressure` calls `shard.try_pop()` from the producer's call stack to evict the oldest event when the buffer is full. The ring buffer is documented SPSC (`ring_buffer.rs:62-67`), and the test build asserts a single consumer thread ID — the legitimate consumer is the batch worker.
 
@@ -99,7 +186,7 @@ let max_id = shards.iter().map(|s| s.id).max().unwrap_or(0);
 
 ---
 
-## 6. MEDIUM — `shard/mapper.rs:688-712` — `finalize_draining` reads a destructively-reset counter
+## 9. MEDIUM — `shard/mapper.rs:688-712` — `finalize_draining` reads a destructively-reset counter
 
 **What's wrong.** The "is the shard quiescent?" check uses `events_in_window`, but `collect_and_reset()` swaps that field to 0 on every metrics tick.
 
@@ -109,7 +196,7 @@ let max_id = shards.iter().map(|s| s.id).max().unwrap_or(0);
 
 ---
 
-## 7. MEDIUM — `adapter/jetstream.rs` — Silent failures and bad transient classification
+## 10. MEDIUM — `adapter/jetstream.rs` — Silent failures and bad transient classification
 
 **Three independent issues:**
 
@@ -121,7 +208,25 @@ let max_id = shards.iter().map(|s| s.id).max().unwrap_or(0);
 
 ---
 
-## 8. MEDIUM — `adapter/redis.rs:198-228` — Pipeline timeout-then-retry produces duplicates
+## 11. MEDIUM — `adapter/jetstream.rs:351, 363-376` — `poll_shard` overflow + silent skip on deserialize errors
+
+**Two related issues on the JetStream poll path:**
+
+1. **Unchecked multiplication in `max_seq` fallback** (line 351):
+
+   ```rust
+   Err(_) => start_seq.saturating_add(fetch_limit as u64 * 10),
+   ```
+
+   `fetch_limit as u64 * 10` is plain `*`, not `checked_mul`. `Adapter::poll_shard` is on a `pub trait` and `fetch_limit` derives from caller-supplied `limit`. The merger caps fetches at 10_000 today but anyone calling the adapter directly can overflow before `saturating_add` runs, producing a tiny `max_seq` that silently caps the poll.
+
+2. **Silent skip on deserialize failure** (lines 363-376). When `deserialize_event` fails on a successful `direct_get`, the code logs and bumps `current_seq`, then continues. Combined with #1's possibly-too-small `max_seq`, a long run of corrupt sequences silently shrinks the effective fetch window, dropping events from results without surfacing an error.
+
+**Fix.** Use `checked_mul` (or compute `max_seq` from `stream_info()` directly without the fallback). Track per-poll deserialize failures and either return them as a partial-error variant or surface a counter so silent corruption is observable.
+
+---
+
+## 12. MEDIUM — `adapter/redis.rs:198-228` — Pipeline timeout-then-retry produces duplicates
 
 **What's wrong.** `tokio::time::timeout` over a `MULTI/EXEC` does not roll back bytes already on the wire. Redis can execute the EXEC after the future is dropped; the subsequent retry then double-publishes via XADD with auto-generated `*` IDs and no dedup.
 
@@ -131,7 +236,7 @@ let max_id = shards.iter().map(|s| s.id).max().unwrap_or(0);
 
 ---
 
-## 9. MEDIUM — `adapter/redis.rs:46-82` — `stream_key` cache uses a `Vec` keyed by shard_id
+## 13. MEDIUM — `adapter/redis.rs:46-82` — `stream_key` cache uses a `Vec` keyed by shard_id
 
 **What's wrong.**
 
@@ -147,7 +252,7 @@ If the first access is `shard_id = 65535`, this allocates 65536 placeholder entr
 
 ---
 
-## 10. MEDIUM — `timestamp.rs:63` — `next()` returns raw TSC ticks; doc says nanoseconds
+## 14. MEDIUM — `timestamp.rs:63` — `next()` returns raw TSC ticks; doc says nanoseconds
 
 **What's wrong.** `quanta::Clock::raw()` returns the raw TSC counter, not nanoseconds. The docstring at line 63 says "Returns a strictly monotonically increasing value (nanoseconds)". `insertion_ts` is plumbed into `StoredEvent`, serialized externally, and used cross-shard for sorting in `consumer/merge.rs:351`.
 
@@ -157,7 +262,7 @@ If the first access is `shard_id = 65535`, this allocates 65536 placeholder entr
 
 ---
 
-## 11. MEDIUM — `ffi/mesh.rs:1092-1105` — `collect_payloads` lacks per-entry null check
+## 15. MEDIUM — `ffi/mesh.rs:1092-1105` — `collect_payloads` lacks per-entry null check
 
 **What's wrong.** After verifying that the outer `payloads` / `lens` arrays are non-null, the function dereferences each `*payloads.add(i)` and feeds the result straight to `slice::from_raw_parts(ptr, lens[i])`. Per-entry pointers are not null-checked.
 
@@ -167,21 +272,79 @@ If the first access is `shard_id = 65535`, this allocates 65536 placeholder entr
 
 ---
 
-## 12. MEDIUM — `ffi/mod.rs:866-875` — `net_shutdown` spin-waits unboundedly
+## 16. MEDIUM — `ffi/mod.rs:866-875` — `net_shutdown` spin-waits unboundedly
 
-**What's wrong.** The atomic `FfiOpGuard` correctly prevents `Box::from_raw` while ops are in flight, but if a concurrent op blocks (e.g. `net_flush` against a hung adapter), `net_shutdown` busy-waits forever with no progress and no timeout.
+**What's wrong.** The atomic `FfiOpGuard` correctly prevents `Box::from_raw` while ops are in flight (modulo bug #1 above), but if a concurrent op blocks (e.g. `net_flush` against a hung adapter), `net_shutdown` busy-waits forever with no progress and no timeout.
 
 **Failure scenario.** A hung adapter pins one CPU at 100% inside `net_shutdown` and the C client has no recovery path.
 
-**Fix.** Bounded wait with a deadline; on timeout, return a `Busy` / `Timeout` error code. Or convert to `tokio::sync::Notify` so the wakeup is event-driven.
+**Fix.** Bounded wait with a deadline; on timeout, return a `Busy` / `Timeout` error code. Or convert to `tokio::sync::Notify` so the wakeup is event-driven. Note: this fix should be designed jointly with the fix to bug #1, since both touch the same handshake.
 
 ---
 
-## 13. LOW — `error.rs:21-22, 45-46` — `Serialization(String)` discards underlying serde error
+## 17. MEDIUM — `bus.rs:647-654` — `EventBus::Drop` only flips the flag — in-flight events lost on implicit drop
+
+**What's wrong.**
+
+```rust
+impl Drop for EventBus {
+    fn drop(&mut self) {
+        self.shutdown.store(true, AtomicOrdering::Release);
+    }
+}
+```
+
+`Drop` sets the shutdown flag but doesn't await drain workers, batch workers, or `adapter.shutdown()`. The documented contract is to call `shutdown().await`, but Rust gives no compile-time enforcement of "must call X before drop." If the runtime is dropped (or the bus dropped without an awaited shutdown), in-flight events in the per-shard mpsc channels and ring buffers are silently discarded — `adapter.flush()` and `adapter.shutdown()` never run.
+
+**Failure scenario.** A test or short-lived process that forgets `bus.shutdown().await` loses any events that were ingested but not yet dispatched. `test_regression_eventbus_drop_signals_shutdown` only asserts that drop doesn't hang; it does not assert durability.
+
+**Fix.** Either (a) document the requirement loudly and have `Drop` log a warning when in-flight work is observed at drop time, or (b) use a sync-blocking drain in `Drop` (e.g. `Handle::block_on` if a runtime handle is held), or (c) refactor to a typestate that makes `shutdown()` mandatory (`bus.into_shutdown_handle()` consumes the bus).
+
+---
+
+## 18. LOW — `error.rs:21-22, 45-46` — `Serialization(String)` discards underlying serde error
 
 **What's wrong.** `Serialization(String)` instead of `Serialization(#[from] serde_json::Error)` loses category, line, column, and breaks the `source()` chain.
 
 **Fix.** Change to `Serialization(#[from] serde_json::Error)`.
+
+---
+
+## 19. LOW — `shard/batch.rs:220` — `next_sequence += events.len() as u64` is unchecked
+
+**What's wrong.** Plain `+=` on a `u64` running counter. Theoretical only — at 1B events/sec, u64 takes ~584 years to wrap — but if it ever does, it wraps silently.
+
+**Fix.** Use `checked_add` and surface as a fatal error, or document the assumption explicitly.
+
+---
+
+## 20. LOW — `shard/mod.rs:413` — `hash % num_shards` panics if `num_shards == 0`
+
+**What's wrong.**
+
+```rust
+(hash % num_shards as u64) as u16
+```
+
+Panics on division by zero if `num_shards` is ever 0. Static config validation enforces `num_shards >= 1`, and `scale_down` requires `current > min_shards >= 1`, so this is unreachable in current code.
+
+**Fix.** Defense-in-depth `debug_assert!(num_shards > 0)` and either return shard 0 or return a typed error if ever reached.
+
+---
+
+## 21. LOW — `error.rs` / `bus.rs:659-692` — `is_retryable()` is defined but `dispatch_batch` retries everything
+
+**What's wrong.** `AdapterError::is_retryable()` distinguishes `Connection` (non-retryable) from `Transient` (retryable). `dispatch_batch` ignores the flag and runs the full retry loop on any error. The `Connection` variant comment in `error.rs:138-145` even acknowledges "The batch dispatch path retries all errors regardless of this flag."
+
+**Fix.** Either gate `dispatch_batch`'s retry loop on `err.is_retryable()`, or remove the API as dead code.
+
+---
+
+## 22. LOW — `ffi/mod.rs:1102-1126, 1156-1180` — `NetEvent.id_len` / `raw_len` are publicly mutable from C — UB on size mismatch
+
+**What's wrong.** `Box::into_raw(bytes: Box<[u8]>) as *const c_char` strips the fat-pointer length; reconstruction relies on the separately stored `id_len` / `raw_len`. The struct is `#[repr(C)]` with public fields, so a C caller that mutates `id_len` between alloc and free causes `Box::from_raw(slice_from_raw_parts_mut(ptr, wrong_len))` to be UB (allocator size mismatch).
+
+**Fix.** Document that the length fields are read-only after `net_poll`. For stronger guarantees, store the actual allocated length in a side table keyed by pointer, and ignore the C-visible `id_len` at free time.
 
 ---
 
@@ -197,10 +360,13 @@ These were flagged by the audit but did not survive a check of the source. Docum
 
 ## Recommended order of fixes
 
-1. **`merge.rs:326-339`** — silent data loss; drop the early `break` or restrict cursor advance to fully-drained shards.
-2. **`config.rs` zero-divisor validation** — turn panics on misconfiguration into config errors.
-3. **`mapper.rs:564` shard ID monotonicity** — replace `max+1` with `next_id: AtomicU16`.
-4. **`bus.rs::shutdown` quiescence step** — close the concurrent-ingest stranding window.
-5. **`ffi/mesh.rs::collect_payloads` per-entry null check** + **`net_shutdown` bounded wait**.
-6. **`jetstream.rs` `is_transient_error` enumeration** + **stop swallowing `drain()`**.
-7. Remaining MEDIUM items as time permits; LOW item is a clean refactor.
+1. **`ffi/mod.rs` UAF in `net_shutdown` handshake (#1)** — memory-unsafety reachable from valid C usage; switch to `Arc`-based lifetime extension or leak-on-shutdown.
+2. **`merge.rs:326-339` (#2)** — silent data loss; drop the early `break` or restrict cursor advance to fully-drained shards.
+3. **`adapter/redis.rs:336` cursor stall (#4)** — single-line fix (track raw entry id, not deserialized event id) that prevents silent infinite-loop wedging.
+4. **`config.rs` zero-divisor validation (#3)** — turn panics on misconfiguration into config errors.
+5. **`shard/ring_buffer.rs` Sync footgun (#5)** — make the type `pub(crate)` or mark methods `unsafe`.
+6. **`mapper.rs:564` shard ID monotonicity (#7)** — replace `max+1` with `next_id: AtomicU16`.
+7. **`bus.rs::shutdown` quiescence step (#6)** + **`EventBus::Drop` durability (#17)** — close the concurrent-ingest stranding window and surface dropped-without-shutdown.
+8. **`ffi/mesh.rs::collect_payloads` per-entry null check (#15)** + **`net_shutdown` bounded wait (#16)**.
+9. **`jetstream.rs` `is_transient_error` enumeration + drain swallow (#10)** + **poll_shard overflow/silent-skip (#11)**.
+10. Remaining MEDIUM items as time permits; LOW items are clean refactors.
