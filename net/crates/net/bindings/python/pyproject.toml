@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "net"
-version = "0.5.0"
+version = "0.8.0"
 description = "High-performance, schema-agnostic event bus for AI runtime workloads"
 readme = "README.md"
 license = { text = "Apache-2.0" }
