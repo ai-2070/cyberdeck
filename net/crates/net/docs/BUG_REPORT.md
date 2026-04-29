@@ -30,6 +30,9 @@ Audit of the Rust event-bus crate at `crates/net/src/`. Findings are based on th
 | 20 | LOW | `shard/mod.rs:413` | `hash % num_shards` panics if `num_shards == 0` |
 | 21 | LOW | `error.rs` / `bus.rs:659-692` | `is_retryable()` is defined but `dispatch_batch` retries everything |
 | 22 | LOW | `ffi/mod.rs:1102-1126, 1156-1180` | `NetEvent.id_len` / `raw_len` are publicly mutable from C — UB on size mismatch |
+| 23 | MEDIUM | `consumer/merge.rs:340-353, 396-400` | Sort+truncate filter path strands matches on shards whose events all sort late |
+| 24 | MEDIUM | `bus.rs:213-224, 565` | `shutdown()` is unreachable after `start_scaling_monitor()` (Arc ownership) |
+| 25 | LOW | `shard/mod.rs:529-540` | `ingest_raw_batch` silently skips unresolvable shard IDs without counter update |
 
 ---
 
@@ -345,6 +348,68 @@ Panics on division by zero if `num_shards` is ever 0. Static config validation e
 **What's wrong.** `Box::into_raw(bytes: Box<[u8]>) as *const c_char` strips the fat-pointer length; reconstruction relies on the separately stored `id_len` / `raw_len`. The struct is `#[repr(C)]` with public fields, so a C caller that mutates `id_len` between alloc and free causes `Box::from_raw(slice_from_raw_parts_mut(ptr, wrong_len))` to be UB (allocator size mismatch).
 
 **Fix.** Document that the length fields are read-only after `net_poll`. For stronger guarantees, store the actual allocated length in a side table keyed by pointer, and ignore the C-visible `id_len` at free time.
+
+---
+
+## 23. MEDIUM — `consumer/merge.rs:340-353, 396-400` — Sort+truncate filter path strands matches on shards whose events all sort late
+
+**What's wrong.** Same root cause as #2 but on the *other* filter branch (`Ordering::InsertionTs`). After `retain` keeps every match, the global `sort_by_key(|e| e.insertion_ts)` followed by `truncate(request.limit)` can drop *every* match from a shard whose matching events all sort later than `limit` other matches. The override loop at lines 396-400 only writes `final_cursor[shard]` for shards that appear in the (truncated) returned set — a shard whose matches were entirely truncated has no representative event left to override with, so `final_cursor[shard]` keeps the value `new_cursor` got at lines 289-291: the adapter's reported `next_id` (i.e. the *fetched* boundary). Subsequent polls for that shard start *after* the boundary, silently skipping every match that was retained-but-truncated.
+
+The trade-off comment at lines 364-379 names this exact failure mode ("matching events that were over-fetched but not returned due to the limit — a correctness violation") and credits the override with preventing it — but the override only fires for shards present in the returned events, so the protection is asymmetric and incomplete.
+
+**Failure scenario.** 2 shards, `Ordering::InsertionTs`, filter `type=="token"`, `limit=5`, `over_fetch_factor=3` ⇒ `per_shard_limit=9`. Shard 0 has 30 matching events with ts 10..300; shard 1 has 30 matching events with ts 1000..1290. First poll fetches 9 from each: 18 retained, sorted by ts puts shard 0 ahead of shard 1, `truncate(5)` keeps only shard 0's first 5. Override sets `cursor[0]="0-5"`; shard 1 is absent from returned events so `cursor[1]` stays at `new_cursor[1]="1-9"`. Next poll fetches shard 1 events 1-10..1-30 — events 1-1..1-9 (matching) are gone forever.
+
+**Fix.** Same shape as the recommended fix for #2: don't advance `final_cursor[shard]` to the adapter's `next_id` when the shard had matches that didn't make it into the returned set. The straightforward implementation: for each shard in the polled set, compute "did this shard appear in returned events?" — if yes, override to the last returned id (current behavior); if no, **leave the cursor at the original `cursor[shard]`** (forcing re-fetch) rather than letting `new_cursor[shard]` win. This re-fetches non-matches for shards that had no matches at all, which is the trade-off the existing comment claims to make but actually doesn't.
+
+---
+
+## 24. MEDIUM — `bus.rs:213-224, 565` — `shutdown()` is unreachable after `start_scaling_monitor()`
+
+**What's wrong.** The two API shapes are incompatible:
+
+```rust
+pub fn start_scaling_monitor(self: &Arc<Self>) {
+    let bus = Arc::clone(self);
+    let handle = tokio::spawn(async move { bus.run_scaling_monitor().await; });
+    *self.scaling_monitor.lock() = Some(handle);
+}
+
+pub async fn shutdown(self) -> Result<(), AdapterError> { ... }
+```
+
+`start_scaling_monitor` requires `Arc<Self>` and the spawned task keeps a clone for the lifetime of the monitor loop. `shutdown(self)` consumes the bus by value — to call it you need a non-`Arc` `EventBus`, i.e. you need `Arc::try_unwrap(arc)` to succeed. But the spawned task is still holding a strong ref, so `try_unwrap` returns `Err` and there is no path to ever call `shutdown()`.
+
+The monitor loop itself only exits on `self.shutdown.load(...) == true`, but the only public method that flips that flag is `shutdown(self)` — which you can't call. Setting it manually requires reaching into the private field.
+
+**Failure scenario.** A user wires up dynamic scaling per the `start_scaling_monitor` API, then later wants to gracefully drain on process exit. There is no clean way to do it: the only options are (a) `drop(arc)` and rely on the `Drop` impl (which only flips the flag — see #17 for the durability hole) or (b) `std::process::exit` and lose in-flight events. None of the existing tests call `start_scaling_monitor` *and then* `shutdown`, so the deadlock-by-API isn't exercised in CI.
+
+**Fix.** Either:
+- Change `shutdown` to take `self: Arc<Self>` (and on entry, drop the monitor's `JoinHandle` after setting the flag, then `Arc::try_unwrap` once the monitor task observes the flag and exits), or
+- Split out a `ShutdownHandle` returned from `start_scaling_monitor` that holds the cancellation primitive and a way to await monitor exit, so `shutdown(self)` can stay as-is and the caller drops the handle first.
+
+---
+
+## 25. LOW — `shard/mod.rs:529-540` — `ingest_raw_batch` silently skips unresolvable shard IDs without counter update
+
+**What's wrong.** During the bucket-by-shard pass:
+
+```rust
+for event in events {
+    let shard_id = self.select_shard_by_hash(event.hash());
+    let Some(idx) = self.resolve_idx(&table, shard_id) else {
+        continue;       // <- silently dropped
+    };
+    if let Some(g) = groups.get_mut(idx) {
+        ...
+    }
+}
+```
+
+When the table loaded at the top of the function doesn't contain the chosen `shard_id` (e.g., the mapper returned a shard that was just removed in a concurrent scale-down), the event is `continue`d — no error, no counter update. `EventBus::ingest_raw_batch` (`bus.rs:461-480`) computes drops as `total - success`, so the bus-level `events_dropped` is correct, but the per-shard `events_dropped` counter aggregated across `ShardManager::stats()` undercounts: there's no shard to attribute the drop to (the shard wasn't in the table).
+
+**Failure scenario.** Consumers reconciling per-shard `events_dropped` against bus-level `events_dropped` see a discrepancy that shows up only during scale-down events. Hard to diagnose because the discrepancy is real and proportional to scale-down activity.
+
+**Fix.** Either (a) account these "no shard available" drops in a separate `events_unrouted` counter on `ShardManager` and surface it via `stats()`, or (b) treat unresolvable shard IDs as a fatal config invariant and `debug_assert!` on them — they should be impossible if the mapper and table are kept in sync.
 
 ---
 
