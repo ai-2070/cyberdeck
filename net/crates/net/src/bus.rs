@@ -656,6 +656,13 @@ impl Drop for EventBus {
 /// Spawn a batch worker for a shard.
 /// Dispatch a batch to the adapter with timeout and optional retries.
 /// Returns true if the batch was accepted, false if all attempts failed.
+///
+/// Non-retryable errors (e.g. `AdapterError::Connection`,
+/// `AdapterError::Fatal`, `AdapterError::Serialization`) skip the
+/// retry loop and drop the batch immediately. Retrying a fatal error
+/// just delays the inevitable while burning CPU and amplifying log
+/// noise. Use `AdapterError::is_retryable` as the single source of
+/// truth for this decision.
 async fn dispatch_batch(
     adapter: &dyn Adapter,
     batch: Batch,
@@ -669,6 +676,15 @@ async fn dispatch_batch(
         match tokio::time::timeout(timeout, adapter.on_batch(batch.clone())).await {
             Ok(Ok(())) => return true,
             Ok(Err(e)) => {
+                if !e.is_retryable() {
+                    tracing::error!(
+                        shard_id,
+                        error = %e,
+                        attempt,
+                        "Non-retryable error from adapter, dropping batch"
+                    );
+                    return false;
+                }
                 tracing::warn!(shard_id, error = %e, attempt, "Batch dispatch failed, retrying");
             }
             Err(_) => {
@@ -1062,5 +1078,89 @@ mod tests {
         assert_eq!(bus.num_shards(), 4);
 
         bus.shutdown().await.unwrap();
+    }
+
+    /// Mock adapter that counts `on_batch` invocations and returns a
+    /// configurable error variant. Used to assert dispatch retry
+    /// semantics without dragging in a real adapter.
+    struct CountingErrAdapter {
+        calls: Arc<std::sync::atomic::AtomicU32>,
+        make_err: Box<dyn Fn() -> AdapterError + Send + Sync>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::adapter::Adapter for CountingErrAdapter {
+        async fn init(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err((self.make_err)())
+        }
+        async fn flush(&self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn shutdown(&self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn poll_shard(
+            &self,
+            _shard_id: u16,
+            _from_id: Option<&str>,
+            _limit: usize,
+        ) -> Result<crate::adapter::ShardPollResult, AdapterError> {
+            Ok(crate::adapter::ShardPollResult::empty())
+        }
+        fn name(&self) -> &'static str {
+            "counting_err"
+        }
+        async fn is_healthy(&self) -> bool {
+            true
+        }
+    }
+
+    /// Regression: BUG_REPORT.md #21 — `dispatch_batch` previously
+    /// retried every error variant, ignoring `AdapterError::is_retryable`.
+    /// A non-retryable error (Connection / Fatal / Serialization)
+    /// should now drop the batch immediately rather than burn the
+    /// retry budget on something that cannot succeed.
+    #[tokio::test(start_paused = true)]
+    async fn dispatch_batch_skips_retries_on_non_retryable_error() {
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let adapter = CountingErrAdapter {
+            calls: calls.clone(),
+            make_err: Box::new(|| AdapterError::Connection("refused".into())),
+        };
+
+        let batch = Batch::new(0, vec![], 0);
+        let ok = dispatch_batch(&adapter, batch, 0, Duration::from_secs(1), 5).await;
+
+        assert!(!ok, "non-retryable error must drop batch");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Connection error must not be retried; expected exactly 1 on_batch call"
+        );
+    }
+
+    /// Sanity: a retryable error *does* go through the full retry
+    /// budget. Without this companion check, the previous test could
+    /// pass for the wrong reason (e.g. if dispatch always returned on
+    /// the first error).
+    #[tokio::test(start_paused = true)]
+    async fn dispatch_batch_retries_transient_errors() {
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let adapter = CountingErrAdapter {
+            calls: calls.clone(),
+            make_err: Box::new(|| AdapterError::Transient("temp".into())),
+        };
+
+        let batch = Batch::new(0, vec![], 0);
+        let ok = dispatch_batch(&adapter, batch, 0, Duration::from_secs(1), 3).await;
+
+        assert!(!ok);
+        // 3 retries + 1 final attempt = 4 total calls.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 }

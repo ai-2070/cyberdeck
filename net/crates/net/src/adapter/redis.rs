@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use redis::aio::ConnectionManager;
 use redis::{Client, RedisError, Value};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -39,11 +40,11 @@ pub struct RedisAdapter {
     config: RedisAdapterConfig,
     /// Whether the adapter has been initialized.
     initialized: AtomicBool,
-    /// Interned stream keys indexed by shard id. Avoids rebuilding
+    /// Interned stream keys keyed by shard id. Avoids rebuilding
     /// `"{prefix}:shard:{n}"` on every `on_batch` / `poll_shard`.
-    /// `RwLock<Vec<_>>` because shards can be added at runtime via
-    /// dynamic scaling; growth is rare and amortized.
-    stream_keys: parking_lot::RwLock<Vec<Arc<str>>>,
+    /// `HashMap` rather than `Vec` so sparse / hashed shard ids do not
+    /// allocate placeholder entries up to `max_shard_id`.
+    stream_keys: parking_lot::RwLock<HashMap<u16, Arc<str>>>,
 }
 
 impl RedisAdapter {
@@ -57,7 +58,7 @@ impl RedisAdapter {
             conn: None,
             config,
             initialized: AtomicBool::new(false),
-            stream_keys: parking_lot::RwLock::new(Vec::new()),
+            stream_keys: parking_lot::RwLock::new(HashMap::new()),
         })
     }
 
@@ -65,20 +66,19 @@ impl RedisAdapter {
     /// access for that shard id.
     #[inline]
     fn stream_key(&self, shard_id: u16) -> Arc<str> {
-        let idx = shard_id as usize;
         // Fast path: cache hit under read lock.
-        if let Some(k) = self.stream_keys.read().get(idx) {
+        if let Some(k) = self.stream_keys.read().get(&shard_id) {
             return k.clone();
         }
-        // Slow path: lazily fill the cache up to and including `idx`.
+        // Slow path: insert just this shard's key. No placeholder fill
+        // for sparse / hashed shard ids.
         let mut cache = self.stream_keys.write();
-        while cache.len() <= idx {
-            let id = cache.len();
-            cache.push(Arc::from(
-                format!("{}:shard:{}", self.config.prefix, id).as_str(),
-            ));
-        }
-        cache[idx].clone()
+        cache
+            .entry(shard_id)
+            .or_insert_with(|| {
+                Arc::from(format!("{}:shard:{}", self.config.prefix, shard_id).as_str())
+            })
+            .clone()
     }
 
     /// Serialize an event for storage.
@@ -117,8 +117,7 @@ impl RedisAdapter {
             s: u16,
         }
 
-        let parsed: StoredFormat =
-            serde_json::from_slice(data).map_err(|e| AdapterError::Serialization(e.to_string()))?;
+        let parsed: StoredFormat = serde_json::from_slice(data)?;
 
         let raw_bytes = Bytes::copy_from_slice(parsed.r.get().as_bytes());
 
@@ -135,6 +134,89 @@ impl RedisAdapter {
         self.conn
             .clone()
             .ok_or_else(|| AdapterError::Connection("adapter not initialized".into()))
+    }
+
+    /// Parse an XRANGE response into a `ShardPollResult`.
+    ///
+    /// `next_id` is computed from the last *raw* entry id observed, not the
+    /// last successfully-deserialized event. If every entry fails to
+    /// deserialize, the cursor must still advance past them or the consumer
+    /// re-fetches the same corrupt entries indefinitely.
+    fn parse_xrange_response(
+        results: Value,
+        limit: usize,
+        stream_key: &str,
+    ) -> ShardPollResult {
+        let entries = match results {
+            Value::Array(entries) => entries,
+            _ => return ShardPollResult::empty(),
+        };
+
+        let mut events = Vec::with_capacity(limit);
+        let mut last_seen_id: Option<String> = None;
+
+        for entry in entries.iter().take(limit) {
+            let Value::Array(parts) = entry else { continue };
+            if parts.len() < 2 {
+                continue;
+            }
+
+            // First element is the ID. Borrow it as `&str` until we know
+            // we'll keep the event — defers the owned `String` allocation
+            // to the success path inside `deserialize_event`.
+            let id: std::borrow::Cow<str> = match &parts[0] {
+                Value::BulkString(bytes) => String::from_utf8_lossy(bytes),
+                Value::SimpleString(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                _ => continue,
+            };
+
+            last_seen_id = Some(id.to_string());
+
+            let Value::Array(fields) = &parts[1] else { continue };
+            // Find the "d" field. Compare against the byte literal directly
+            // — no allocation for what is otherwise a constant-name probe
+            // on every entry.
+            let mut i = 0;
+            while i + 1 < fields.len() {
+                let is_data_field = match &fields[i] {
+                    Value::BulkString(bytes) => bytes.as_slice() == b"d",
+                    Value::SimpleString(s) => s == "d",
+                    _ => false,
+                };
+
+                if is_data_field {
+                    if let Value::BulkString(data) = &fields[i + 1] {
+                        match Self::deserialize_event(&id, data) {
+                            Ok(event) => events.push(event),
+                            Err(e) => {
+                                tracing::warn!(
+                                    stream = %stream_key,
+                                    id = %id,
+                                    error = %e,
+                                    "Failed to deserialize event, skipping"
+                                );
+                            }
+                        }
+                    }
+                    break;
+                }
+                i += 2;
+            }
+        }
+
+        let has_more = entries.len() > limit;
+        // Always prefer the last *seen* id — `last_seen_id` is set on
+        // every iterated entry regardless of deserialize outcome, so it
+        // is a strict superset of `events.last().id`. Using
+        // `events.last()` here would leave the cursor stuck behind any
+        // *trailing* corrupt entries.
+        let next_id = last_seen_id.or_else(|| events.last().map(|e| e.id.clone()));
+
+        ShardPollResult {
+            events,
+            next_id,
+            has_more,
+        }
     }
 }
 
@@ -278,71 +360,7 @@ impl Adapter for RedisAdapter {
             .await
             .map_err(|e| AdapterError::Transient(e.to_string()))?;
 
-        // Parse results manually
-        let mut events = Vec::with_capacity(limit);
-
-        if let Value::Array(entries) = results {
-            for entry in entries.iter().take(limit) {
-                if let Value::Array(parts) = entry {
-                    if parts.len() >= 2 {
-                        // First element is the ID. Borrow it as `&str`
-                        // until we know we'll keep the event — defers
-                        // the owned `String` allocation to the success
-                        // path inside `deserialize_event`.
-                        let id: std::borrow::Cow<str> = match &parts[0] {
-                            Value::BulkString(bytes) => String::from_utf8_lossy(bytes),
-                            Value::SimpleString(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                            _ => continue,
-                        };
-
-                        // Second element is array of field-value pairs.
-                        if let Value::Array(ref fields) = parts[1] {
-                            // Find the "d" field. Compare against the
-                            // byte literal directly — no allocation
-                            // for what is otherwise a constant-name
-                            // probe on every entry.
-                            let mut i = 0;
-                            while i + 1 < fields.len() {
-                                let is_data_field = match &fields[i] {
-                                    Value::BulkString(bytes) => bytes.as_slice() == b"d",
-                                    Value::SimpleString(s) => s == "d",
-                                    _ => false,
-                                };
-
-                                if is_data_field {
-                                    if let Value::BulkString(data) = &fields[i + 1] {
-                                        match Self::deserialize_event(&id, data) {
-                                            Ok(event) => events.push(event),
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    stream = %stream_key,
-                                                    id = %id,
-                                                    error = %e,
-                                                    "Failed to deserialize event, skipping"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    break;
-                                }
-                                i += 2;
-                            }
-                        }
-                    }
-                }
-            }
-
-            let has_more = entries.len() > limit;
-            let next_id = events.last().map(|e| e.id.clone());
-
-            Ok(ShardPollResult {
-                events,
-                next_id,
-                has_more,
-            })
-        } else {
-            Ok(ShardPollResult::empty())
-        }
+        Ok(Self::parse_xrange_response(results, limit, &stream_key))
     }
 
     fn name(&self) -> &'static str {
@@ -426,5 +444,96 @@ mod tests {
         // Repeat access should hit the interned cache rather than
         // re-running `format!`.
         assert_eq!(&*adapter.stream_key(0), "myapp:shard:0");
+    }
+
+    /// Regression: BUG_REPORT.md #13 — sparse shard ids must not
+    /// allocate placeholder entries up to `max_shard_id`. Cold-accessing
+    /// shard 65535 with the previous `Vec`-keyed-by-index cache
+    /// allocated 65536 entries; a `HashMap` cache stores only what is
+    /// touched.
+    #[test]
+    fn test_stream_key_sparse_shard_ids() {
+        let config = RedisAdapterConfig::new("redis://localhost:6379").with_prefix("myapp");
+        let adapter = RedisAdapter::new(config).unwrap();
+
+        assert_eq!(&*adapter.stream_key(65535), "myapp:shard:65535");
+        assert_eq!(&*adapter.stream_key(7), "myapp:shard:7");
+
+        // Only the two shards we actually touched should be in the cache.
+        assert_eq!(adapter.stream_keys.read().len(), 2);
+    }
+
+    /// Build a synthetic XRANGE entry: `[id, ["d", payload_bytes]]`.
+    fn xrange_entry(id: &str, payload: &[u8]) -> Value {
+        Value::Array(vec![
+            Value::BulkString(id.as_bytes().to_vec()),
+            Value::Array(vec![
+                Value::BulkString(b"d".to_vec()),
+                Value::BulkString(payload.to_vec()),
+            ]),
+        ])
+    }
+
+    /// Regression: BUG_REPORT.md #4 — when every XRANGE entry fails to
+    /// deserialize, `parse_xrange_response` previously returned
+    /// `next_id == None`, which wedged the consumer on the same start
+    /// position forever. The fix advances `next_id` from the last raw
+    /// entry id observed, not from the last successfully-deserialized
+    /// event.
+    #[test]
+    fn test_poll_shard_advances_cursor_on_all_corrupt_entries() {
+        // Every payload is malformed JSON — every deserialize will fail.
+        let response = Value::Array(vec![
+            xrange_entry("1-0", b"not json"),
+            xrange_entry("2-0", b"{also not"),
+            xrange_entry("3-0", b"][broken"),
+        ]);
+
+        let result = RedisAdapter::parse_xrange_response(response, 10, "myapp:shard:0");
+
+        // No events deserialized successfully.
+        assert!(result.events.is_empty(), "all corrupt entries should be skipped");
+        // But the cursor MUST advance, otherwise the consumer will
+        // re-fetch the same corrupt range forever.
+        assert_eq!(
+            result.next_id.as_deref(),
+            Some("3-0"),
+            "next_id must advance to the last raw entry id, not None"
+        );
+    }
+
+    /// Regression: mixed-success path. Some entries deserialize, some
+    /// don't — `next_id` should still come from the last *seen* id even
+    /// if the final entry was corrupt.
+    #[test]
+    fn test_poll_shard_advances_past_trailing_corrupt_entries() {
+        let good = br#"{"r":{"k":"v"},"t":1,"s":0}"#;
+        let response = Value::Array(vec![
+            xrange_entry("1-0", good),
+            xrange_entry("2-0", b"corrupt"),
+            xrange_entry("3-0", b"also corrupt"),
+        ]);
+
+        let result = RedisAdapter::parse_xrange_response(response, 10, "myapp:shard:0");
+
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.events[0].id, "1-0");
+        // Cursor must advance past the trailing corrupt entries, not
+        // just to the last successful event ("1-0").
+        assert_eq!(result.next_id.as_deref(), Some("3-0"));
+    }
+
+    /// Sanity: empty XRANGE result returns an empty poll result with no
+    /// cursor — the caller should not advance.
+    #[test]
+    fn test_poll_shard_empty_response_has_no_cursor() {
+        let result = RedisAdapter::parse_xrange_response(
+            Value::Array(vec![]),
+            10,
+            "myapp:shard:0",
+        );
+        assert!(result.events.is_empty());
+        assert!(result.next_id.is_none());
+        assert!(!result.has_more);
     }
 }

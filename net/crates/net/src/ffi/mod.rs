@@ -97,20 +97,62 @@ use std::ffi::CString;
 /// Opaque handle to an event bus instance.
 ///
 /// This wraps the EventBus along with a Tokio runtime for async operations.
-/// The handle is reference-counted so that concurrent FFI calls keep it alive
-/// even if `net_shutdown` races against them.
+///
+/// # Lifetime / soundness
+///
+/// The handle storage is *intentionally leaked* on `net_shutdown` rather
+/// than freed via `Box::from_raw`. Reasoning: every FFI entry point
+/// dereferences the C-side `*mut NetHandle` to access the atomics that
+/// gate shutdown. The previous Dekker-style SeqCst handshake between
+/// `FfiOpGuard::try_enter` (which calls `fetch_add` on `active_ops`) and
+/// `net_shutdown` (which loads `active_ops` then `Box::from_raw`s the
+/// handle) was unsound: SeqCst orders the atomic operations only — the
+/// non-atomic `Box::from_raw` could deallocate the storage between
+/// shutdown's load and a concurrent FFI op's `fetch_add`, producing a
+/// use-after-free on the freed atomic. By never freeing the box, the
+/// atomic memory backing the handle is always valid; concurrent FFI ops
+/// observe `shutting_down=true` after shutdown signals it and bail
+/// before touching `bus`/`runtime`.
+///
+/// `bus` and `runtime` are stored in `ManuallyDrop` so that
+/// `net_shutdown` can `take` them out (via `ptr::read`) in order to
+/// call `bus.shutdown().await`. Because `shutting_down` is set first
+/// and shutdown waits for `active_ops` to drop to zero before reading
+/// these fields, no FFI op can be racing the read. If the wait times
+/// out, the `ptr::read` is skipped and both fields are leaked along
+/// with the box.
 pub struct NetHandle {
-    bus: EventBus,
-    runtime: Runtime,
-    /// Set to `true` once `net_shutdown` begins. All other FFI functions
-    /// check this flag and return `ShuttingDown` early, reducing the
-    /// window for use-after-free when a C caller races shutdown against
-    /// concurrent operations.
+    /// Owned `EventBus`. Read out via `ManuallyDrop::take` during
+    /// shutdown once `active_ops` has drained to zero. After that
+    /// point, `shutting_down` is `true` and no FFI op may access this
+    /// field.
+    bus: std::mem::ManuallyDrop<EventBus>,
+    /// Owned tokio runtime. Same lifetime contract as `bus`.
+    runtime: std::mem::ManuallyDrop<Runtime>,
+    /// Set to `true` once `net_shutdown` begins. All other FFI
+    /// functions check this flag and return `ShuttingDown` before
+    /// touching `bus` / `runtime`.
     shutting_down: std::sync::atomic::AtomicBool,
     /// Number of in-flight FFI operations (excluding shutdown itself).
-    /// `net_shutdown` spins until this drops to zero before deallocating.
+    /// `net_shutdown` spins until this drops to zero (with a deadline)
+    /// before reading `bus` / `runtime` to call shutdown.
     active_ops: std::sync::atomic::AtomicU32,
+    /// Set to `true` after `net_shutdown` has consumed `bus` /
+    /// `runtime` via `ManuallyDrop::take`. A second `net_shutdown`
+    /// call observes this and returns `Success` without re-taking
+    /// (which would be UB). FFI ops also check this before touching
+    /// `bus` / `runtime`, defending against a contract-violating
+    /// caller that races a post-shutdown call.
+    bus_taken: std::sync::atomic::AtomicBool,
 }
+
+/// Maximum time `net_shutdown` will wait for in-flight FFI operations
+/// to complete before giving up. If the deadline expires, the bus is
+/// leaked rather than read out — leaking is correct (the box is
+/// already leaked permanently for soundness reasons) but means the
+/// adapter's `flush()` / `shutdown()` won't run.
+const FFI_SHUTDOWN_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(5);
 
 /// RAII guard that increments `active_ops` on creation and decrements on drop.
 struct FfiOpGuard<'a> {
@@ -118,18 +160,16 @@ struct FfiOpGuard<'a> {
 }
 
 impl<'a> FfiOpGuard<'a> {
-    /// Try to enter an FFI operation. Returns `None` if the handle is shutting down.
+    /// Try to enter an FFI operation. Returns `None` if the handle is
+    /// shutting down.
     ///
-    /// The fetch_add on `active_ops` and the load of `shutting_down` here,
-    /// together with the store on `shutting_down` and the load of
-    /// `active_ops` in `net_shutdown`, form a Dekker-style handshake
-    /// across two separate atomics. Release/Acquire only orders operations
-    /// on the *same* variable, so it is legal under that ordering for both
-    /// sides to see the "pre" value of the other atomic simultaneously —
-    /// the caller would then proceed into an FFI op while the shutdown
-    /// frees the handle, causing a use-after-free. `SeqCst` imposes a
-    /// single total order over these four operations, eliminating that
-    /// possibility.
+    /// Soundness rests on the fact that the box backing `handle` is
+    /// never freed (see `NetHandle` doc). The `fetch_add` is therefore
+    /// always on valid memory regardless of whether shutdown is in
+    /// progress. The subsequent load of `shutting_down` decides
+    /// whether the op is allowed to proceed; if shutdown was signaled
+    /// before our increment was visible, we bail without touching
+    /// `bus` / `runtime`.
     fn try_enter(handle: &'a NetHandle) -> Option<Self> {
         handle
             .active_ops
@@ -420,10 +460,11 @@ fn create_with_config(runtime: Runtime, config: EventBusConfig) -> *mut NetHandl
     };
 
     let handle = Box::new(NetHandle {
-        bus,
-        runtime,
+        bus: std::mem::ManuallyDrop::new(bus),
+        runtime: std::mem::ManuallyDrop::new(runtime),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
         active_ops: std::sync::atomic::AtomicU32::new(0),
+        bus_taken: std::sync::atomic::AtomicBool::new(false),
     });
 
     Box::into_raw(handle)
@@ -844,43 +885,98 @@ pub extern "C" fn net_flush(handle: *mut NetHandle) -> c_int {
 /// # Returns
 ///
 /// - `0` on success
-/// - Negative error code on failure
+/// - Negative error code on failure (including `Unknown` if the
+///   bounded wait for in-flight FFI operations expired before the bus
+///   could be shut down cleanly)
+///
+/// # Notes
+///
+/// The handle's storage is intentionally leaked: the box is never
+/// returned to the allocator. See `NetHandle`'s docs for why. This is
+/// a one-time cost per shutdown — typically per-process, since most C
+/// callers initialize the bus once and shut down once.
 #[unsafe(no_mangle)]
 pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
     if handle.is_null() {
         return NetError::NullPointer.into();
     }
 
-    // Signal shutdown *before* taking ownership so that concurrent FFI
-    // calls on other threads see the flag and bail out early.
-    //
-    // The store on `shutting_down` and the subsequent load on `active_ops`
-    // both use `SeqCst` to pair with `FfiOpGuard::try_enter` — see the
-    // comment there for why Release/Acquire is not sufficient for this
-    // Dekker-style handshake across two atomics.
+    // SAFETY: The C contract guarantees `handle` is valid here and that
+    // `net_shutdown` is not called concurrently with itself. Future
+    // dereferences of the box from concurrent FFI ops on other threads
+    // are also sound because we never free the box (see below).
     let handle_ref = unsafe { &*handle };
+
+    // Signal shutdown so concurrent FFI calls bail before touching
+    // `bus`/`runtime`. SeqCst pairs with `FfiOpGuard::try_enter`.
     handle_ref
         .shutting_down
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
-    // Spin-wait until all in-flight FFI operations have completed.
-    // Each operation holds an FfiOpGuard that decrements active_ops on drop,
-    // so this loop is bounded by the longest concurrent FFI call.
-    while handle_ref
-        .active_ops
-        .load(std::sync::atomic::Ordering::SeqCst)
-        > 0
-    {
+    // Bounded wait for in-flight ops to drain. Without a deadline, a
+    // hung concurrent operation (e.g. `net_flush` against a stalled
+    // adapter) would pin a CPU at 100% inside this loop forever.
+    let deadline = std::time::Instant::now() + FFI_SHUTDOWN_DEADLINE;
+    let mut drained = false;
+    loop {
+        if handle_ref
+            .active_ops
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            drained = true;
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
         std::hint::spin_loop();
     }
 
-    let handle = unsafe { Box::from_raw(handle) };
-    let NetHandle { bus, runtime, .. } = *handle;
+    if !drained {
+        // In-flight ops may still be reading `bus`/`runtime`; reading
+        // them out via `ManuallyDrop::take` would race those readers.
+        // Leak both fields along with the box. Future ops still see
+        // `shutting_down=true` and bail before touching either field,
+        // so the leaked memory is never read again.
+        return NetError::Unknown.into();
+    }
+
+    // Idempotent shutdown: if a previous `net_shutdown` already moved
+    // out the bus/runtime, do not call `ManuallyDrop::take` a second
+    // time (that would be UB). The first call has already done the
+    // work; report success.
+    if handle_ref
+        .bus_taken
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return NetError::Success.into();
+    }
+
+    // SAFETY: `active_ops` reached zero with `shutting_down=true`, so:
+    //   - Every FFI op that started before shutdown has fully
+    //     completed (decremented `active_ops` on guard drop).
+    //   - Any future FFI op will observe `shutting_down=true` and
+    //     bail in `try_enter` before touching `bus` / `runtime`.
+    // Plus, `bus_taken` was just CAS'd from false → true, so no other
+    // shutdown is concurrently moving the same fields out.
+    //
+    // We deliberately do NOT call `Box::from_raw` here. The box's
+    // `shutting_down` / `active_ops` / `bus_taken` atomics must remain
+    // valid memory because future FFI ops still dereference the
+    // C-side pointer to check them. Leaking the box is the
+    // correctness fix for the previous use-after-free; the per-handle
+    // storage cost is a one-time overhead.
+    let bus = unsafe { std::mem::ManuallyDrop::take(&mut (*handle).bus) };
+    let runtime = unsafe { std::mem::ManuallyDrop::take(&mut (*handle).runtime) };
 
     // Flush pending batches and gracefully shut down the adapter
     // before dropping the runtime. Without this, pending events in
     // ring buffers and batch workers would be silently lost.
     let result = runtime.block_on(bus.shutdown());
+
+    // `bus` and `runtime` go out of scope here and are dropped.
+    // The leaked box keeps the atomics alive for any straggler ops.
 
     match result {
         Ok(()) => NetError::Success.into(),

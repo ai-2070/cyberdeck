@@ -53,16 +53,27 @@ pub struct ShardStats {
     pub events_dropped: u64,
     /// Batches dispatched to adapter.
     pub batches_dispatched: u64,
+    /// Events that arrived at `ingest_raw_batch` but had no resolvable
+    /// shard (e.g. the routing table was rebuilt mid-dispatch and the
+    /// hashed shard id is no longer present). These cannot be
+    /// attributed to a per-shard counter, so they are tracked at the
+    /// `ShardManager` level and surfaced through aggregated `stats()`.
+    pub events_unrouted: u64,
 }
 
 impl ShardCounters {
     /// Load a consistent snapshot of the counters.
+    ///
+    /// `events_unrouted` is left at zero here — it is a manager-level
+    /// counter, not a per-shard one. `ShardManager::stats()` fills it
+    /// in after summing per-shard fields.
     #[inline]
     pub fn snapshot(&self) -> ShardStats {
         ShardStats {
             events_ingested: self.events_ingested.load(AtomicOrdering::Relaxed),
             events_dropped: self.events_dropped.load(AtomicOrdering::Relaxed),
             batches_dispatched: self.batches_dispatched.load(AtomicOrdering::Relaxed),
+            events_unrouted: 0,
         }
     }
 }
@@ -306,6 +317,13 @@ pub struct ShardManager {
     /// Serializes concurrent `add_shard` / `remove_shard` rebuilds.
     /// Not on the ingest path.
     rebuild_lock: parking_lot::Mutex<()>,
+    /// Events dropped because no destination shard was resolvable.
+    /// Distinct from per-shard `events_dropped` (which tracks
+    /// backpressure on a known shard) — this counts events whose
+    /// hashed shard id was missing from the routing table at lookup
+    /// time, e.g. due to a concurrent scale-down. Surfaced via
+    /// `stats().events_unrouted`.
+    events_unrouted: AtomicU64,
 }
 
 impl ShardManager {
@@ -326,6 +344,7 @@ impl ShardManager {
             ring_buffer_capacity,
             mapper: None,
             rebuild_lock: parking_lot::Mutex::new(()),
+            events_unrouted: AtomicU64::new(0),
         }
     }
 
@@ -354,6 +373,7 @@ impl ShardManager {
             ring_buffer_capacity,
             mapper: Some(mapper),
             rebuild_lock: parking_lot::Mutex::new(()),
+            events_unrouted: AtomicU64::new(0),
         })
     }
 
@@ -408,8 +428,16 @@ impl ShardManager {
             // Dynamic mode: use weighted selection
             mapper.select_shard(hash)
         } else {
-            // Static mode: simple modulo
+            // Static mode: simple modulo. Defensive guard against
+            // `num_shards == 0` — config validation rejects 0 at
+            // startup and `scale_down` requires `current > min_shards
+            // >= 1`, so this branch is unreachable today, but a stray
+            // 0 here would otherwise panic on the `%` below.
             let num_shards = self.num_shards.load(std::sync::atomic::Ordering::Acquire);
+            debug_assert!(num_shards > 0, "num_shards must be > 0");
+            if num_shards == 0 {
+                return 0;
+            }
             (hash % num_shards as u64) as u16
         }
     }
@@ -470,9 +498,7 @@ impl ShardManager {
     /// Ingest an event into the appropriate shard.
     pub fn ingest(&self, event: JsonValue) -> Result<(u16, u64), IngestionError> {
         // Serialize once upfront - avoids clone on retry
-        let raw = Bytes::from(
-            serde_json::to_vec(&event).map_err(|e| IngestionError::Serialization(e.to_string()))?,
-        );
+        let raw = Bytes::from(serde_json::to_vec(&event)?);
         let hash = xxhash_rust::xxh3::xxh3_64(&raw);
         let shard_id = self.select_shard_by_hash(hash);
 
@@ -526,9 +552,16 @@ impl ShardManager {
         let mut groups: Vec<Vec<Bytes>> = (0..table.shards.len()).map(|_| Vec::new()).collect();
         let mut group_ids: Vec<u16> = vec![0; groups.len()];
 
+        let mut unrouted = 0u64;
         for event in events {
             let shard_id = self.select_shard_by_hash(event.hash());
             let Some(idx) = self.resolve_idx(&table, shard_id) else {
+                // Routing table doesn't contain the chosen shard
+                // (e.g. concurrent scale-down removed it). The drop
+                // can't be attributed to a per-shard counter; track
+                // it on the manager-level `events_unrouted` so
+                // bus-level vs. per-shard reconciliation is exact.
+                unrouted += 1;
                 continue;
             };
             if let Some(g) = groups.get_mut(idx) {
@@ -537,6 +570,10 @@ impl ShardManager {
                 }
                 g.push(event.bytes());
             }
+        }
+        if unrouted > 0 {
+            self.events_unrouted
+                .fetch_add(unrouted, AtomicOrdering::Relaxed);
         }
 
         let mut success = 0usize;
@@ -601,7 +638,9 @@ impl ShardManager {
     ///
     /// Lock-free: reads each shard's atomic counters directly via the
     /// parallel `counters` vector on the routing table, with no per-
-    /// shard mutex acquisition.
+    /// shard mutex acquisition. `events_unrouted` is sourced from the
+    /// `ShardManager` itself rather than the per-shard counters since
+    /// unrouted events have no shard to attribute to.
     pub fn stats(&self) -> ShardStats {
         let table = self.table.load();
         let mut total = ShardStats::default();
@@ -611,6 +650,7 @@ impl ShardManager {
             total.events_dropped += snap.events_dropped;
             total.batches_dispatched += snap.batches_dispatched;
         }
+        total.events_unrouted = self.events_unrouted.load(AtomicOrdering::Relaxed);
         total
     }
 

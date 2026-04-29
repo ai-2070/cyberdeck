@@ -217,3 +217,70 @@ fn ffi_shutdown_dekker_handshake_holds_under_contention() {
          test is not exercising the shutdown-vs-in-flight race",
     );
 }
+
+/// Regression: BUG_REPORT.md #1 — under the previous design,
+/// `net_shutdown` `Box::from_raw`d the handle storage. The Dekker
+/// handshake prevented an in-flight FFI op from *proceeding* past
+/// shutdown but did not prevent its `fetch_add` from dereferencing
+/// the freed atomic, producing a use-after-free.
+///
+/// The fix leaks the box on shutdown so the atomics remain valid
+/// memory forever; concurrent / late FFI ops still observe
+/// `shutting_down=true` and bail before touching `bus`/`runtime`.
+///
+/// This test calls FFI methods *after* `net_shutdown` returns —
+/// technically a contract violation, but one whose consequence under
+/// the old code would be UAF. Under the fix, every call must return
+/// `ShuttingDown` and the process must remain stable.
+#[test]
+fn ffi_calls_after_shutdown_return_shutting_down_not_uaf() {
+    let handle = net_init(ptr::null());
+    assert!(!handle.is_null());
+
+    // Clean shutdown with no in-flight ops.
+    let code = net_shutdown(handle);
+    assert_eq!(code, NET_ERR_SUCCESS);
+
+    // Now intentionally violate the "don't use after shutdown"
+    // contract from multiple threads. The previous design would
+    // segfault here (`fetch_add` on freed atomic). The fix keeps the
+    // atomics alive via the leaked box, so every call cleanly returns
+    // ShuttingDown.
+    let h = HandlePtr(handle);
+    let mut joins = Vec::new();
+    for _ in 0..4 {
+        let h = h;
+        joins.push(thread::spawn(move || {
+            let h = h;
+            let json = b"{\"x\":1}";
+            for _ in 0..1000 {
+                let mut receipt = NetReceipt {
+                    shard_id: 0,
+                    timestamp: 0,
+                };
+                let code = net_ingest_raw_ex(
+                    h.0,
+                    json.as_ptr() as *const c_char,
+                    json.len(),
+                    &mut receipt as *mut NetReceipt,
+                );
+                assert_eq!(
+                    code, NET_ERR_SHUTTING_DOWN,
+                    "post-shutdown ingest must return ShuttingDown, got {code}"
+                );
+            }
+        }));
+    }
+    for j in joins {
+        j.join().expect("post-shutdown thread panicked");
+    }
+
+    // Calling shutdown again is also legal (idempotent) and must not
+    // crash. It returns Unknown because the bus has already been
+    // taken out, but that's fine — the contract violation is
+    // calling FFI after shutdown, and the caller has been told.
+    let code = net_shutdown(handle);
+    // Either Success (if a no-op fast path) or Unknown is acceptable;
+    // the only thing that must not happen is a crash.
+    assert!(code == NET_ERR_SUCCESS || code == -99, "got {code}");
+}

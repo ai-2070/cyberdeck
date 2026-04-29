@@ -310,6 +310,15 @@ pub struct ShardMapper {
     on_shard_created: RwLock<Option<ShardCallback>>,
     /// Callback for shard removal (provided by ShardManager).
     on_shard_removed: RwLock<Option<ShardCallback>>,
+    /// Monotonic shard-id allocator. The next `scale_up` call gets
+    /// `fetch_add(1)` from here. Distinct from `shards.iter().max() +
+    /// 1`: that approach reused ids whenever the highest-numbered
+    /// shard had been drained-and-removed, silently merging two
+    /// unrelated shard lifetimes in any external system that keys
+    /// metrics or checkpoints on shard id. Monotonic allocation
+    /// ensures every shard ever allocated has a globally unique id
+    /// for the lifetime of this mapper.
+    next_shard_id: AtomicU16,
 }
 
 impl ShardMapper {
@@ -346,6 +355,9 @@ impl ShardMapper {
             last_scaling: RwLock::new(None),
             on_shard_created: RwLock::new(None),
             on_shard_removed: RwLock::new(None),
+            // Initial shards occupy ids `[0, initial_shards)`, so the
+            // first scale-up takes `initial_shards`.
+            next_shard_id: AtomicU16::new(initial_shards),
         })
     }
 
@@ -560,17 +572,29 @@ impl ShardMapper {
 
         let mut new_ids = Vec::with_capacity(count as usize);
 
-        // Find the next available ID
-        let max_id = shards.iter().map(|s| s.id).max().unwrap_or(0);
-
-        // Check for potential overflow before allocating any shards
-        // We need max_id + count + 1 IDs (since we start at max_id + 1)
-        if max_id.checked_add(count).is_none() || max_id + count > u16::MAX - 1 {
+        // Allocate monotonically from `next_shard_id`. Reusing
+        // `shards.iter().max()` would give the same id back to a new
+        // shard whenever the previous occupant of that id had been
+        // drained-and-removed, conflating two distinct shard
+        // lifetimes in external metric / checkpoint systems.
+        // Pre-check that we have room for `count` more allocations
+        // without overflowing `u16`.
+        let first_id = self.next_shard_id.load(AtomicOrdering::Relaxed);
+        let last_needed = first_id
+            .checked_add(count.saturating_sub(1))
+            .ok_or(ScalingError::AtMaxShards)?;
+        if last_needed >= u16::MAX {
             return Err(ScalingError::AtMaxShards);
         }
+        // CAS-bump the allocator. The write lock on `shards` already
+        // serializes scale_up with itself, so a relaxed `fetch_add`
+        // here would also be sound; using a check + store keeps the
+        // pre-check authoritative.
+        self.next_shard_id
+            .store(first_id + count, AtomicOrdering::Relaxed);
 
         for i in 0..count {
-            let new_id = max_id + 1 + i; // Safe: checked above
+            let new_id = first_id + i;
             let new_shard = MappedShard {
                 id: new_id,
                 state: ShardState::Active,
@@ -948,6 +972,58 @@ mod tests {
         );
     }
 
+    /// Regression: BUG_REPORT.md #7 — `scale_up` previously allocated
+    /// new shard ids as `shards.iter().max() + 1`, which reused ids
+    /// after the highest-numbered shard was drained-and-removed.
+    /// Reusing ids merges two distinct shard lifetimes in any
+    /// external metric/checkpoint system that keys on shard id.
+    /// The fix uses a monotonic `next_shard_id` counter.
+    #[test]
+    fn scale_up_does_not_reuse_ids_after_remove() {
+        let policy = ScalingPolicy {
+            min_shards: 1,
+            max_shards: 16,
+            cooldown: Duration::from_millis(0),
+            ..Default::default()
+        };
+        let mapper = ShardMapper::new(2, 1024, policy).unwrap();
+
+        // Initial ids are 0 and 1. Scale up to 4 — new ids must be
+        // 2 and 3 (the next two slots from the monotonic counter).
+        let new_ids = mapper.scale_up(2).unwrap();
+        assert_eq!(new_ids, vec![2, 3]);
+
+        // Drain one shard. `scale_down` picks by lowest weight, so
+        // we don't get to choose which id is drained. Whichever it
+        // is, we then force it through Stopped + remove and check
+        // that the removed id is *not* reissued by the next
+        // scale_up.
+        let drained = mapper.scale_down(1).unwrap();
+        let drained_id = drained[0];
+        for shard in mapper.shards.write().iter_mut() {
+            if shard.id == drained_id {
+                shard.state = ShardState::Stopped;
+            }
+        }
+        let removed = mapper.remove_stopped_shards();
+        assert_eq!(removed, vec![drained_id]);
+
+        // Scale up by 1. The broken `max(existing_ids) + 1` allocator
+        // could revive the just-removed id whenever `drained_id` had
+        // been the highest id present (e.g. id 3 with 0/1/2/3 → 0/1/2
+        // → next would be 3 again). The fix uses the monotonic
+        // counter, which sits at 4 after the earlier scale_up, so
+        // the new id must be 4 regardless of which id was drained.
+        let new_ids = mapper.scale_up(1).unwrap();
+        assert_eq!(
+            new_ids,
+            vec![4],
+            "shard id {drained_id} was just removed; reusing any \
+             previously-issued id would merge two distinct shard \
+             lifetimes in external systems"
+        );
+    }
+
     #[test]
     fn test_policy_normalize_preserves_valid_config() {
         // When max_shards >= min_shards, normalize() should not change anything
@@ -1119,33 +1195,28 @@ mod tests {
 
     #[test]
     fn test_scale_up_overflow_protection() {
-        // Create mapper with a high starting shard ID to test overflow protection
+        // Create mapper with a high starting shard ID to test overflow
+        // protection. The monotonic id allocator advances by 1 per
+        // shard regardless of which shards have been removed, so we
+        // bump `next_shard_id` directly to simulate a near-`u16::MAX`
+        // state.
         let policy = ScalingPolicy {
             max_shards: u16::MAX,
             ..Default::default()
         };
         let mapper = ShardMapper::new(1, 1024, policy).unwrap();
 
-        // Manually set up a scenario where we're near the u16 limit
-        // by scaling up close to the limit
-        {
-            let mut shards = mapper.shards.write();
-            // Simulate a shard with ID close to u16::MAX
-            shards.clear();
-            shards.push(MappedShard {
-                id: u16::MAX - 2,
-                state: ShardState::Active,
-                metrics: Arc::new(ShardMetricsCollector::new(u16::MAX - 2, 1024)),
-                drain_started: None,
-                last_metrics: ShardMetrics::new(u16::MAX - 2),
-            });
-        }
+        // Position the allocator so the next id is u16::MAX - 1.
+        // Trying to allocate 3 ids would need {MAX-1, MAX, MAX+1};
+        // the last is unrepresentable in `u16`, so scale_up rejects.
+        mapper
+            .next_shard_id
+            .store(u16::MAX - 1, AtomicOrdering::Relaxed);
 
-        // Trying to add 3 shards should fail (would need IDs MAX-1, MAX, MAX+1)
         let result = mapper.scale_up(3);
         assert!(matches!(result, Err(ScalingError::AtMaxShards)));
 
-        // Adding 1 shard should still work (ID = MAX-1)
+        // Adding 1 shard should still work (id = MAX - 1).
         let result = mapper.scale_up(1);
         assert!(result.is_ok());
     }

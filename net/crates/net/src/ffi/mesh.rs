@@ -1089,19 +1089,32 @@ pub extern "C" fn net_mesh_stream_free(handle: *mut MeshStreamHandle) {
 /// Collect an array of borrowed `(ptr, len)` pairs into a
 /// `Vec<Bytes>`. Caller must keep the pointer / length arrays alive
 /// for the duration of the C call.
+///
+/// Returns `None` if any per-entry pointer is null *with* a non-zero
+/// length — the C contract has no "skip this entry" channel, so the
+/// only correct response is to refuse the whole batch. A null pointer
+/// with `len == 0` is treated as an empty payload (it never gets
+/// dereferenced).
 unsafe fn collect_payloads(
     payloads: *const *const u8,
     lens: *const usize,
     count: usize,
-) -> Vec<Bytes> {
+) -> Option<Vec<Bytes>> {
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let ptr = *payloads.add(i);
         let len = *lens.add(i);
+        if ptr.is_null() {
+            if len == 0 {
+                out.push(Bytes::new());
+                continue;
+            }
+            return None;
+        }
         let slice = std::slice::from_raw_parts(ptr, len);
         out.push(Bytes::copy_from_slice(slice));
     }
-    out
+    Some(out)
 }
 
 #[unsafe(no_mangle)]
@@ -1121,7 +1134,10 @@ pub extern "C" fn net_mesh_send(
     let sh = unsafe { &*handle };
     let nh = unsafe { &*node_handle };
     let rt = runtime();
-    let payloads = unsafe { collect_payloads(payloads, lens, count) };
+    let payloads = match unsafe { collect_payloads(payloads, lens, count) } {
+        Some(v) => v,
+        None => return NetError::NullPointer.into(),
+    };
     let node = nh.inner.clone();
     let stream = sh.stream.clone();
     match rt.block_on(async move { node.send_on_stream(&stream, &payloads).await }) {
@@ -1148,7 +1164,10 @@ pub extern "C" fn net_mesh_send_with_retry(
     let sh = unsafe { &*handle };
     let nh = unsafe { &*node_handle };
     let rt = runtime();
-    let payloads = unsafe { collect_payloads(payloads, lens, count) };
+    let payloads = match unsafe { collect_payloads(payloads, lens, count) } {
+        Some(v) => v,
+        None => return NetError::NullPointer.into(),
+    };
     let node = nh.inner.clone();
     let stream = sh.stream.clone();
     match rt.block_on(async move {
@@ -1177,7 +1196,10 @@ pub extern "C" fn net_mesh_send_blocking(
     let sh = unsafe { &*handle };
     let nh = unsafe { &*node_handle };
     let rt = runtime();
-    let payloads = unsafe { collect_payloads(payloads, lens, count) };
+    let payloads = match unsafe { collect_payloads(payloads, lens, count) } {
+        Some(v) => v,
+        None => return NetError::NullPointer.into(),
+    };
     let node = nh.inner.clone();
     let stream = sh.stream.clone();
     match rt.block_on(async move { node.send_blocking(&stream, &payloads).await }) {
@@ -3143,5 +3165,58 @@ mod nat_traversal_stub_tests {
         assert_eq!(caps.hardware.memory_mb, 65536);
         assert_eq!(caps.hardware.total_vram_mb(), 81920);
         assert!(caps.has_tag("gpu"));
+    }
+
+    /// Regression: BUG_REPORT.md #15 — `collect_payloads` previously
+    /// dereferenced every per-entry pointer without a null check, so a C
+    /// caller passing an array containing a null entry produced UB on
+    /// `from_raw_parts(null, len)`. The fix returns `None` for any null
+    /// pointer with non-zero length so the caller can return
+    /// `NetError::NullPointer`. A null pointer with length 0 is treated
+    /// as an empty payload (allowed because the pointer is never
+    /// dereferenced).
+    #[test]
+    fn collect_payloads_rejects_null_entry_with_nonzero_length() {
+        let buf_a = b"hello".as_slice();
+        let buf_b = b"world".as_slice();
+        let ptrs: [*const u8; 3] = [
+            buf_a.as_ptr(),
+            std::ptr::null(),
+            buf_b.as_ptr(),
+        ];
+        let lens: [usize; 3] = [buf_a.len(), 4, buf_b.len()];
+
+        let result = unsafe { collect_payloads(ptrs.as_ptr(), lens.as_ptr(), 3) };
+        assert!(
+            result.is_none(),
+            "null entry with non-zero length must reject the whole batch"
+        );
+    }
+
+    #[test]
+    fn collect_payloads_allows_null_entry_with_zero_length() {
+        let buf_a = b"hello".as_slice();
+        let ptrs: [*const u8; 2] = [buf_a.as_ptr(), std::ptr::null()];
+        let lens: [usize; 2] = [buf_a.len(), 0];
+
+        let result = unsafe { collect_payloads(ptrs.as_ptr(), lens.as_ptr(), 2) }
+            .expect("zero-length null is treated as empty payload");
+        assert_eq!(result.len(), 2);
+        assert_eq!(&result[0][..], b"hello");
+        assert!(result[1].is_empty());
+    }
+
+    #[test]
+    fn collect_payloads_happy_path() {
+        let buf_a = b"abc".as_slice();
+        let buf_b = b"defg".as_slice();
+        let ptrs: [*const u8; 2] = [buf_a.as_ptr(), buf_b.as_ptr()];
+        let lens: [usize; 2] = [buf_a.len(), buf_b.len()];
+
+        let result = unsafe { collect_payloads(ptrs.as_ptr(), lens.as_ptr(), 2) }
+            .expect("non-null entries should succeed");
+        assert_eq!(result.len(), 2);
+        assert_eq!(&result[0][..], b"abc");
+        assert_eq!(&result[1][..], b"defg");
     }
 }

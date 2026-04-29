@@ -217,7 +217,12 @@ impl BatchWorker {
         );
 
         let sequence_start = self.next_sequence;
-        self.next_sequence += events.len() as u64;
+        // `saturating_add` rather than `+=`: at u64 granularity this can
+        // only happen after wraparound (~584 years at 1 B events/s), but
+        // the wrap would silently corrupt sequence numbering. Saturating
+        // pins the counter at u64::MAX so downstream consumers see a
+        // monotonic, observable terminal state instead.
+        self.next_sequence = self.next_sequence.saturating_add(events.len() as u64);
         self.batch_start = None;
 
         Batch::new(self.shard_id, events, sequence_start)
@@ -372,5 +377,26 @@ mod tests {
         worker.add_events(make_events(25, 0));
         let batch3 = worker.flush();
         assert_eq!(batch3.sequence_start, 150);
+    }
+
+    /// Regression: BUG_REPORT.md #19 — `next_sequence` previously used
+    /// unchecked `+=`, which would silently wrap on overflow. Saturating
+    /// pins it at `u64::MAX` so downstream consumers see a stable
+    /// terminal state instead of restarting at 0.
+    #[test]
+    fn test_sequence_saturates_on_overflow() {
+        let config = BatchConfig::default();
+        let mut worker = BatchWorker::new(0, config);
+
+        // Force the counter near overflow.
+        worker.next_sequence = u64::MAX - 3;
+
+        worker.add_events(make_events(10, 0));
+        let batch = worker.flush();
+
+        assert_eq!(batch.sequence_start, u64::MAX - 3);
+        // Without saturation this would wrap to 6 and the next batch
+        // would restart sequencing from there.
+        assert_eq!(worker.next_sequence, u64::MAX);
     }
 }
