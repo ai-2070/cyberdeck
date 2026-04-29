@@ -1,0 +1,35 @@
+net/crates/net/src/error.rs
+  4f40616bb3482b98 16-25
+net/crates/net/src/adapter/net/mod.rs
+  4f40616bb3482b98 569-581,583-588,590-591,593-608,1514-1588
+net/crates/net/src/consumer/merge.rs
+  4f40616bb3482b98 340-362,449-470,475,1778-1897
+net/crates/net/src/shard/mod.rs
+  4f40616bb3482b98 534-548,564-572,720-733,739-741,751-754,770-784,787,791-799,804,807-824,829-842,873,1274-1421
+net/crates/net/src/shard/mapper.rs
+  4f40616bb3482b98 184-199,202-203,205,207,312-318,358-365,478-495,597-603,605-613,727-904,1023-1032,1100-1104,1713-2004
+net/crates/net/src/bus.rs
+  4f40616bb3482b98 290-306,308,314,341-346,358-375,377-380,383-387,391-427,605-617,623-624,630-633,640-670,672-684,835-844,853,885-891,893-899,1597-1664
+net/crates/net/docs/BUG_AUDIT_2026_04_30.md
+  4f40616bb3482b98 5-15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "7b7b9c7e9a2033777971a63929f4cee27d6ac96c",
+  "prompts": {
+    "4f40616bb3482b98": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4364a44-daa1-40ed-9f76-d0eea8143568",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1935,
+      "total_deletions": 220,
+      "accepted_lines": 1351,
+      "overriden_lines": 0
+    }
+  }
+}
