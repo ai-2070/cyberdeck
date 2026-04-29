@@ -246,12 +246,15 @@ fn ffi_calls_after_shutdown_return_shutting_down_not_uaf() {
     // segfault here (`fetch_add` on freed atomic). The fix keeps the
     // atomics alive via the leaked box, so every call cleanly returns
     // ShuttingDown.
-    let h = HandlePtr(handle);
+    let worker_handle = HandlePtr(handle);
     let mut joins = Vec::new();
     for _ in 0..4 {
-        let h = h;
         joins.push(thread::spawn(move || {
-            let h = h;
+            // Bind the Send-wrapped handle inside the closure body
+            // so the captured upvar is the wrapper, not the bare
+            // `*mut NetHandle` (which is not Send under Rust 2021
+            // disjoint closure capture).
+            let h = worker_handle;
             let json = b"{\"x\":1}";
             for _ in 0..1000 {
                 let mut receipt = NetReceipt {
