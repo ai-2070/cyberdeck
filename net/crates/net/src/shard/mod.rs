@@ -171,9 +171,28 @@ impl Shard {
     }
 
     /// Pop a batch of events from the ring buffer.
+    ///
+    /// Allocates a fresh `Vec`. Prefer [`pop_batch_into`] in drain
+    /// loops where the per-cycle `Vec` allocation should happen
+    /// outside the shard mutex (see [`RingBuffer::pop_batch_into`] for
+    /// the typical pattern).
+    ///
+    /// [`pop_batch_into`]: Self::pop_batch_into
+    /// [`RingBuffer::pop_batch_into`]: crate::shard::ring_buffer::RingBuffer::pop_batch_into
     #[inline]
     pub fn pop_batch(&mut self, max: usize) -> Vec<InternalEvent> {
         self.ring_buffer.pop_batch(max)
+    }
+
+    /// Pop a batch of events into a caller-owned buffer.
+    ///
+    /// Append semantics — see [`RingBuffer::pop_batch_into`] for
+    /// details and the typical drain-loop pattern.
+    ///
+    /// [`RingBuffer::pop_batch_into`]: crate::shard::ring_buffer::RingBuffer::pop_batch_into
+    #[inline]
+    pub fn pop_batch_into(&mut self, dst: &mut Vec<InternalEvent>, max: usize) -> usize {
+        self.ring_buffer.pop_batch_into(dst, max)
     }
 
     /// Try to pop a single event from the ring buffer.
@@ -357,22 +376,27 @@ impl ShardManager {
 
     /// Select a shard for an event based on its content hash.
     /// Uses weighted selection if dynamic scaling is enabled.
+    ///
+    /// **Prefer [`select_shard_by_hash`].** This method serializes the
+    /// `JsonValue` to bytes just to compute the hash; if you already
+    /// have a `RawEvent` (or any pre-computed `xxh3_64` of the
+    /// canonical bytes), pass that hash directly. The internal
+    /// ingest paths all do — this method exists for ad-hoc external
+    /// callers that haven't yet adopted the `RawEvent` pattern.
+    ///
+    /// [`select_shard_by_hash`]: Self::select_shard_by_hash
     #[inline]
+    #[deprecated(
+        since = "0.5.1",
+        note = "serializes the value just to hash it; prefer `RawEvent::from_value(v).hash()` + `select_shard_by_hash` to avoid the duplicate serialization"
+    )]
     pub fn select_shard(&self, event: &JsonValue) -> u16 {
         // Use xxhash for fast, deterministic hashing. `to_vec` avoids the
         // extra UTF-8 validation that `to_string` performs on the serialized
         // buffer, since we only need the bytes for hashing.
         let bytes = serde_json::to_vec(event).expect("Value serialization is infallible");
         let hash = xxhash_rust::xxh3::xxh3_64(&bytes);
-
-        if let Some(ref mapper) = self.mapper {
-            // Dynamic mode: use weighted selection
-            mapper.select_shard(hash)
-        } else {
-            // Static mode: simple modulo
-            let num_shards = self.num_shards.load(std::sync::atomic::Ordering::Acquire);
-            (hash % num_shards as u64) as u16
-        }
+        self.select_shard_by_hash(hash)
     }
 
     /// Select a shard using a pre-computed hash.
@@ -750,6 +774,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // exercises the deprecated `select_shard` path
     fn test_shard_manager_routing() {
         let manager = ShardManager::new(4, 1024, BackpressureMode::DropNewest);
 
@@ -766,6 +791,26 @@ mod tests {
 
         // With 100 random events and 4 shards, we should hit multiple shards
         assert!(shards.len() > 1);
+    }
+
+    /// Regression: the deprecated `select_shard(&JsonValue)` must produce
+    /// the same shard id as `select_shard_by_hash` would for the
+    /// equivalent `RawEvent`. They share underlying logic now, but if a
+    /// future refactor splits them this test catches the divergence
+    /// before consumers do.
+    #[test]
+    #[allow(deprecated)]
+    fn test_select_shard_matches_select_shard_by_hash() {
+        let manager = ShardManager::new(8, 1024, BackpressureMode::DropNewest);
+        for i in 0..200 {
+            let v = json!({"i": i, "tag": format!("user-{i}")});
+            let raw = RawEvent::from_value(v.clone());
+            assert_eq!(
+                manager.select_shard(&v),
+                manager.select_shard_by_hash(raw.hash()),
+                "select_shard and select_shard_by_hash must agree (i={i})"
+            );
+        }
     }
 
     #[test]

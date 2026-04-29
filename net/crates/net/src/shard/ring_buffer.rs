@@ -241,6 +241,79 @@ impl<T> RingBuffer<T> {
         result
     }
 
+    /// Pop up to `max` elements into a caller-owned `Vec`.
+    ///
+    /// **Append semantics**: this method does **not** clear `dst` first.
+    /// It calls `dst.reserve(count)` then pushes drained elements onto
+    /// the end. Returns the number of elements drained this call (may
+    /// be less than `max` if the buffer has fewer available, including
+    /// `0`).
+    ///
+    /// Use this in steady-state drain loops where the caller keeps a
+    /// scratch `Vec` across cycles. Compared to [`pop_batch`], the
+    /// per-cycle `Vec` allocation moves *out of the consumer's
+    /// critical section* — hot when the ring buffer sits behind a
+    /// mutex, since the allocator is no longer called under the lock.
+    ///
+    /// Typical usage:
+    ///
+    /// ```ignore
+    /// let mut scratch = Vec::with_capacity(BATCH);
+    /// loop {
+    ///     let popped = ring.pop_batch_into(&mut scratch, BATCH);
+    ///     if popped == 0 { break; }
+    ///     // mem::replace allocates the fresh scratch *outside* any
+    ///     // critical section the caller might have held while
+    ///     // calling pop_batch_into.
+    ///     let batch = std::mem::replace(&mut scratch, Vec::with_capacity(BATCH));
+    ///     consume(batch);
+    /// }
+    /// ```
+    ///
+    /// [`pop_batch`]: Self::pop_batch
+    #[inline]
+    pub fn pop_batch_into(&self, dst: &mut Vec<T>, max: usize) -> usize {
+        #[cfg(test)]
+        {
+            let current = std::thread::current().id();
+            let mut guard = self
+                .consumer_thread
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(tid) = *guard {
+                assert_eq!(
+                    tid, current,
+                    "SPSC violation: pop_batch_into called from multiple threads"
+                );
+            } else {
+                *guard = Some(current);
+            }
+        }
+
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+
+        let available = head.wrapping_sub(tail);
+        let count = available.min(max);
+
+        if count == 0 {
+            return 0;
+        }
+
+        // Reserve up-front so the push loop has no reallocation branch.
+        dst.reserve(count);
+
+        for i in 0..count {
+            let index = (tail.wrapping_add(i)) & self.mask;
+            let value = unsafe { (*self.buffer[index].get()).assume_init_read() };
+            dst.push(value);
+        }
+
+        self.tail.store(tail.wrapping_add(count), Ordering::Release);
+
+        count
+    }
+
     /// Get the current number of elements in the buffer.
     #[inline]
     pub fn len(&self) -> usize {
@@ -339,6 +412,59 @@ mod tests {
         assert_eq!(batch, vec![3, 4]);
 
         assert!(buf.is_empty());
+    }
+
+    /// `pop_batch_into` is the steady-state drain primitive: it must
+    /// produce the same elements as `pop_batch`, append (not replace)
+    /// onto `dst`, return `0` when the buffer is empty, and tolerate
+    /// being called with `max` larger than what's available.
+    #[test]
+    fn test_pop_batch_into() {
+        let buf = RingBuffer::new(8);
+        for i in 0..5 {
+            buf.try_push(i).unwrap();
+        }
+
+        // Append onto an existing element — verifies the documented
+        // append semantics (does not clear `dst`).
+        let mut dst = vec![999u32];
+        let drained = buf.pop_batch_into(&mut dst, 3);
+        assert_eq!(drained, 3);
+        assert_eq!(dst, vec![999, 0, 1, 2]);
+
+        // Request more than available; should drain only what's there.
+        dst.clear();
+        let drained = buf.pop_batch_into(&mut dst, 10);
+        assert_eq!(drained, 2);
+        assert_eq!(dst, vec![3, 4]);
+        assert!(buf.is_empty());
+
+        // Empty buffer returns 0 without allocating or pushing.
+        dst.clear();
+        let drained = buf.pop_batch_into(&mut dst, 100);
+        assert_eq!(drained, 0);
+        assert!(dst.is_empty());
+    }
+
+    /// Reusing a scratch `Vec` across cycles (the canonical drain
+    /// pattern) must not corrupt or skip elements across wraparound.
+    #[test]
+    fn test_pop_batch_into_scratch_reuse_across_wraparound() {
+        let buf = RingBuffer::new(4);
+        let mut scratch: Vec<u32> = Vec::with_capacity(2);
+        let mut seen: Vec<u32> = Vec::new();
+
+        for round in 0..10u32 {
+            for i in 0..3 {
+                buf.try_push(round * 3 + i).unwrap();
+            }
+            let drained = buf.pop_batch_into(&mut scratch, 3);
+            assert_eq!(drained, 3);
+            seen.append(&mut scratch); // empties scratch, retains capacity
+        }
+
+        let expected: Vec<u32> = (0..30).collect();
+        assert_eq!(seen, expected);
     }
 
     #[test]

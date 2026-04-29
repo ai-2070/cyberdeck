@@ -96,6 +96,13 @@ impl Filter {
     #[inline]
     pub fn matches(&self, event: &JsonValue) -> bool {
         match self {
+            // Single-element fast path: skip the iterator + closure
+            // setup and recurse directly. `And { filters: [f] }` and
+            // `Or { filters: [f] }` are common after deserializing
+            // small filter trees and were otherwise paying iter+all/any
+            // overhead per event.
+            Self::And { filters } if filters.len() == 1 => filters[0].matches(event),
+            Self::Or { filters } if filters.len() == 1 => filters[0].matches(event),
             Self::And { filters } => {
                 !filters.is_empty() && filters.iter().all(|f| f.matches(event))
             }
@@ -515,6 +522,83 @@ mod tests {
         let filter = Filter::or(vec![]);
         // Empty OR should match nothing
         assert!(!filter.matches(&json!({"any": "value"})));
+    }
+
+    /// Single-element `And` / `Or` must produce the same result as
+    /// the inner filter alone — the fast path in `matches()` recurses
+    /// directly without the iterator+closure setup, but it has to be
+    /// semantically identical to the iter-based path.
+    #[test]
+    fn test_single_element_and_or_match_inner_filter() {
+        let inner = Filter::eq("k", json!("v"));
+        let single_and = Filter::and(vec![inner.clone()]);
+        let single_or = Filter::or(vec![inner.clone()]);
+
+        let yes = json!({"k": "v"});
+        let no = json!({"k": "other"});
+
+        for ev in &[yes, no] {
+            assert_eq!(
+                single_and.matches(ev),
+                inner.matches(ev),
+                "single-element And must match inner: {ev}",
+            );
+            assert_eq!(
+                single_or.matches(ev),
+                inner.matches(ev),
+                "single-element Or must match inner: {ev}",
+            );
+        }
+    }
+
+    /// Fast path must recurse correctly when the single child is
+    /// itself a composite filter (Not, nested And/Or, Eq, etc.) — the
+    /// straight-line `filters[0].matches(event)` call has to dispatch
+    /// the same way the slow path's closure would.
+    #[test]
+    fn test_single_element_fast_path_recurses_into_composite() {
+        let leaf = Filter::eq("k", json!("v"));
+        let yes = json!({"k": "v"});
+        let no = json!({"k": "other"});
+
+        // And{[Not{leaf}]}
+        let nested_not = Filter::and(vec![Filter::not(leaf.clone())]);
+        assert!(!nested_not.matches(&yes));
+        assert!(nested_not.matches(&no));
+
+        // Or{[And{[leaf]}]} — both layers hit the fast path.
+        let nested_double = Filter::or(vec![Filter::and(vec![leaf.clone()])]);
+        assert!(nested_double.matches(&yes));
+        assert!(!nested_double.matches(&no));
+
+        // Or{[And{[leaf, leaf2]}]} — outer hits the fast path, inner
+        // falls through to the iterator path. Verifies the two paths
+        // compose correctly.
+        let leaf2 = Filter::eq("x", json!(1));
+        let mixed = Filter::or(vec![Filter::and(vec![leaf.clone(), leaf2.clone()])]);
+        assert!(mixed.matches(&json!({"k": "v", "x": 1})));
+        assert!(!mixed.matches(&json!({"k": "v", "x": 2})));
+        assert!(!mixed.matches(&json!({"k": "other", "x": 1})));
+    }
+
+    /// Regression: multi-element `And` / `Or` must keep using the
+    /// iterator path (not silently fall into the single-element
+    /// shortcut). Guards against a future refactor of the fast-path
+    /// guard.
+    #[test]
+    fn test_multi_element_and_or_uses_slow_path() {
+        let f1 = Filter::eq("k", json!("v"));
+        let f2 = Filter::eq("x", json!(1));
+
+        let and = Filter::and(vec![f1.clone(), f2.clone()]);
+        assert!(and.matches(&json!({"k": "v", "x": 1})));
+        assert!(!and.matches(&json!({"k": "v", "x": 2})));
+        assert!(!and.matches(&json!({"k": "other", "x": 1})));
+
+        let or = Filter::or(vec![f1.clone(), f2.clone()]);
+        assert!(or.matches(&json!({"k": "v", "x": 99})));
+        assert!(or.matches(&json!({"k": "nope", "x": 1})));
+        assert!(!or.matches(&json!({"k": "nope", "x": 2})));
     }
 
     #[test]

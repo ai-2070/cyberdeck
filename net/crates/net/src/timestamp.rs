@@ -17,10 +17,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// This generator provides strictly monotonic timestamps with sub-nanosecond
 /// resolution and zero syscall overhead after initialization.
 ///
-/// # Thread Safety
+/// # Single-owner invariant
 ///
-/// While this struct is `Send + Sync`, for maximum performance each shard
-/// should have its own `TimestampGenerator` to avoid atomic contention.
+/// **Each producer should own a dedicated `TimestampGenerator`.** The
+/// type is `Send + Sync` and `next()` *is* safe to call concurrently —
+/// monotonicity is preserved by `compare_exchange_weak` — but the CAS
+/// loop degenerates into a spin under sustained contention. The whole
+/// design rests on the loop almost never iterating: that's only true
+/// when one writer at a time accesses the generator.
+///
+/// The codebase enforces this structurally rather than at runtime:
+///
+/// - `Shard` owns its `TimestampGenerator` by value (not behind `Arc`).
+/// - `TimestampGenerator` is **not** `Clone`, so duplicating one is a
+///   deliberate `mem::replace` / `Default::default()` away — visible
+///   in code review.
+/// - The shard's surrounding `Mutex<Shard>` serializes producers, so
+///   `next()` is invoked by exactly one caller at a time per shard.
+///
+/// If you find yourself reaching for `Arc<TimestampGenerator>`, stop
+/// — give each producer its own instance instead. Every additional
+/// concurrent caller is one more thread potentially CAS-spinning on
+/// `last`.
 pub struct TimestampGenerator {
     /// quanta clock (TSC-based after calibration).
     clock: quanta::Clock,
