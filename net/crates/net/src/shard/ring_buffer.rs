@@ -16,10 +16,13 @@ use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
 /// Error returned when the ring buffer is full.
+///
+/// Crate-internal: surfaced to public callers as
+/// `IngestionError::Backpressure`. Kept `pub(crate)` for symmetry
+/// with the `pub(crate) RingBuffer` (BUG_REPORT.md #5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BufferFullError;
+pub(crate) struct BufferFullError;
 
 impl std::fmt::Display for BufferFullError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -34,28 +37,34 @@ impl std::error::Error for BufferFullError {}
 /// # ⚠️  Single-Producer, Single-Consumer contract
 ///
 /// At most one thread at a time may call `try_push`, and at most one
-/// (other) thread at a time may call `try_pop` / `pop_batch`. The
-/// atomics rely on that contract for correctness; concurrent access
-/// from multiple producers or multiple consumers **silently corrupts
-/// state** and is undefined behavior.
+/// (other) thread at a time may call `try_pop` / `pop_batch` /
+/// `pop_batch_into`. The atomics rely on that contract for
+/// correctness; concurrent access from multiple producers or
+/// multiple consumers **silently corrupts state** and is undefined
+/// behavior.
 ///
 /// Note: "single producer" allows the *task* / *handle* doing the
 /// pushing to migrate between OS threads (e.g. across an `await`
 /// point in a tokio task) — what matters is non-concurrency, not a
 /// fixed thread id. Likewise for the consumer.
 ///
-/// The `Sync` impl below makes `&RingBuffer<T>` shareable across
-/// threads — that is the *only* way to legitimately split a producer
-/// and consumer onto two threads — but it also makes the SPSC
-/// contract a footgun: nothing in the public API stops a caller from
-/// pushing from two threads concurrently. Internal callers in this
-/// crate serialize access via `parking_lot::Mutex<Shard>`.
+/// # Visibility
 ///
-/// External users: prefer wrapping this in a higher-level type that
-/// hands out producer/consumer halves separately. Unit tests
-/// (`#[cfg(test)]`) track thread ids and panic on concurrent
-/// multi-producer or multi-consumer access — that is a *minimum*
-/// catch, not a complete check; release builds trust the caller.
+/// This type is `pub(crate)` — there is no public re-export. The
+/// only legitimate use inside this crate wraps the buffer in
+/// `parking_lot::Mutex<Shard>`, which serializes producer and
+/// consumer access trivially. External callers should use
+/// `EventBus` / `ShardManager`, which expose the SPSC fast path
+/// without the footgun of `Sync`-shareable `&RingBuffer`. The bug
+/// report (#5) flagged that prior `pub` exposure: any external
+/// caller that put this in an `Arc` and called `try_push` from two
+/// threads would silently corrupt state with no compile-time signal.
+/// `pub(crate)` removes that surface entirely.
+///
+/// Internal unit tests (`#[cfg(test)]`) track producer/consumer
+/// thread ids and panic on concurrent multi-producer or
+/// multi-consumer access — a sanity check, not a complete one;
+/// release builds trust the caller.
 ///
 /// # Type Parameters
 ///
@@ -66,7 +75,7 @@ impl std::error::Error for BufferFullError {}
 /// The capacity must be a power of 2 and is fixed at construction time.
 /// The actual usable capacity is `capacity - 1` to distinguish between
 /// full and empty states.
-pub struct RingBuffer<T> {
+pub(crate) struct RingBuffer<T> {
     /// Pre-allocated buffer storage.
     buffer: Box<[UnsafeCell<MaybeUninit<T>>]>,
     /// Capacity (power of 2).
@@ -131,10 +140,9 @@ impl<T> RingBuffer<T> {
     ///
     /// Returns `Ok(())` if successful, or `Err(BufferFullError)` if the buffer is full.
     ///
-    /// # Safety
-    ///
-    /// This is safe for a single producer thread. Multiple producers require
-    /// external synchronization.
+    /// SPSC contract: at most one thread may call `try_push` at a
+    /// time. The `pub(crate)` visibility plus the in-crate mutex
+    /// wrapping in `Shard` upholds this trivially.
     #[inline]
     pub fn try_push(&self, value: T) -> Result<(), BufferFullError> {
         #[cfg(test)]
@@ -211,10 +219,9 @@ impl<T> RingBuffer<T> {
     ///
     /// Returns `Some(value)` if successful, or `None` if the buffer is empty.
     ///
-    /// # Safety
-    ///
-    /// This is safe for a single consumer thread. Multiple consumers require
-    /// external synchronization.
+    /// SPSC contract: at most one thread may call `try_pop` /
+    /// `pop_batch` / `pop_batch_into` at a time. Upheld by the
+    /// in-crate mutex on `Shard`.
     #[inline]
     pub fn try_pop(&self) -> Option<T> {
         #[cfg(test)]
@@ -256,6 +263,8 @@ impl<T> RingBuffer<T> {
     ///
     /// This is more efficient than calling `try_pop` repeatedly as it
     /// reduces atomic operations.
+    ///
+    /// Same single-consumer contract as `try_pop`.
     #[inline]
     pub fn pop_batch(&self, max: usize) -> Vec<T> {
         #[cfg(test)]
@@ -331,6 +340,8 @@ impl<T> RingBuffer<T> {
     /// }
     /// ```
     ///
+    /// Same single-consumer contract as `try_pop`.
+    ///
     /// [`pop_batch`]: Self::pop_batch
     #[inline]
     pub fn pop_batch_into(&self, dst: &mut Vec<T>, max: usize) -> usize {
@@ -396,14 +407,22 @@ impl<T> RingBuffer<T> {
     }
 
     /// Get the capacity of the buffer.
+    ///
+    /// Test-only: the `Shard` wrapper stores its own `capacity` field
+    /// for the public API, so this is reachable only from in-file
+    /// tests.
+    #[cfg(test)]
     #[inline]
-    pub fn capacity(&self) -> usize {
+    fn capacity(&self) -> usize {
         self.capacity
     }
 
     /// Get the number of free slots in the buffer.
+    ///
+    /// Test-only — see `capacity()`.
+    #[cfg(test)]
     #[inline]
-    pub fn free_slots(&self) -> usize {
+    fn free_slots(&self) -> usize {
         self.capacity - 1 - self.len()
     }
 }
@@ -425,7 +444,8 @@ impl<T> Drop for RingBuffer<T> {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = None;
         }
-        // Drop any remaining elements
+        // Drop any remaining elements. `&mut self` proves we are the
+        // unique accessor, so the SPSC contract holds trivially.
         while self.try_pop().is_some() {}
     }
 }
@@ -555,6 +575,9 @@ mod tests {
 
         let count = 100_000;
 
+        // Exactly one thread calls `try_push` (producer) and exactly
+        // one calls `try_pop` (consumer). This is the SPSC happy path
+        // the buffer is designed for.
         let producer = thread::spawn(move || {
             for i in 0..count {
                 while buf_producer.try_push(i).is_err() {

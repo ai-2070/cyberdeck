@@ -15,7 +15,14 @@ pub use batch::{AdaptiveBatcher, BatchWorker};
 pub use mapper::{
     ScalingDecision, ScalingError, ShardMapper, ShardMetrics, ShardMetricsCollector, ShardState,
 };
-pub use ring_buffer::{BufferFullError, RingBuffer};
+// `RingBuffer` and `BufferFullError` are intentionally NOT re-exported.
+// External callers go through `EventBus` / `ShardManager`, which
+// uphold the SPSC contract via `Mutex<Shard>`. Exposing the raw ring
+// buffer publicly was a silent-UB footgun — anyone wrapping it in an
+// `Arc` and pushing from two threads got data corruption with no
+// compile-time signal (BUG_REPORT.md #5). `BufferFullError` is not
+// re-exported here either: callers see it as `IngestionError::Backpressure`.
+pub(crate) use ring_buffer::RingBuffer;
 
 // Re-export ScalingPolicy from config for convenience
 pub use crate::config::ScalingPolicy;

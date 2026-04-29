@@ -67,14 +67,28 @@ pub struct EventBus {
     >,
     /// Shutdown flag.
     shutdown: Arc<AtomicBool>,
+    /// Gate signaling drain workers that the in-flight wait has
+    /// completed and they may safely run their final ring-buffer
+    /// sweep. Distinct from `shutdown` because the drain worker
+    /// observing `shutdown=true` alone is not enough: a producer
+    /// that read `shutdown=false` may still be mid-push, and if the
+    /// drain worker rushes through its final sweep before that push
+    /// is visible the event is stranded. `shutdown()` sets this
+    /// after waiting for `in_flight_ingests==0`, at which point the
+    /// Acquire load on the drain side synchronizes-with the Release
+    /// store here, transitively chaining through the SeqCst
+    /// in-flight handshake to make every observed-pre-shutdown push
+    /// visible to the drain worker's subsequent `pop_batch_into`.
+    drain_finalize_ready: Arc<AtomicBool>,
     /// In-flight ingest counter. Incremented before each ingest's
     /// shutdown check and decremented after the push completes (or
     /// bails). `shutdown()` waits for this to drop to zero *after*
-    /// setting `shutdown=true` so no producer is mid-push when the
-    /// drain workers do their final sweep — closing the race where
-    /// a producer that observed `shutdown=false` could push *after*
-    /// the drain worker's last `pop_batch_into` returned zero,
-    /// leaving the event stranded in the ring buffer.
+    /// setting `shutdown=true` and *before* setting
+    /// `drain_finalize_ready=true` so no producer is mid-push when
+    /// the drain workers do their final sweep — closing the race
+    /// where a producer that observed `shutdown=false` could push
+    /// *after* the drain worker's last `pop_batch_into` returned
+    /// zero, leaving the event stranded in the ring buffer.
     in_flight_ingests: AtomicU32,
     /// Set to `true` after `shutdown()` runs to completion. `Drop`
     /// uses this to detect "dropped without an awaited shutdown" —
@@ -189,8 +203,10 @@ impl EventBus {
         let poll_merger =
             arc_swap::ArcSwap::from_pointee(PollMerger::new(adapter.clone(), config.num_shards));
 
-        // Shutdown flag
+        // Shutdown flag and drain-finalize gate. See `drain_finalize_ready`
+        // doc on `EventBus` for the synchronization contract.
         let shutdown = Arc::new(AtomicBool::new(false));
+        let drain_finalize_ready = Arc::new(AtomicBool::new(false));
 
         // Create batch workers for each shard
         let mut batch_workers: std::collections::HashMap<u16, ShardWorkers> =
@@ -216,6 +232,7 @@ impl EventBus {
                 shard_manager.clone(),
                 tx.clone(),
                 shutdown.clone(),
+                drain_finalize_ready.clone(),
             );
 
             batch_workers.insert(shard_id, ShardWorkers { batch, drain });
@@ -229,6 +246,7 @@ impl EventBus {
             batch_workers: parking_lot::Mutex::new(batch_workers),
             batch_senders: parking_lot::RwLock::new(batch_senders),
             shutdown,
+            drain_finalize_ready,
             in_flight_ingests: AtomicU32::new(0),
             shutdown_completed: AtomicBool::new(false),
             config,
@@ -297,6 +315,7 @@ impl EventBus {
             self.shard_manager.clone(),
             tx,
             self.shutdown.clone(),
+            self.drain_finalize_ready.clone(),
         );
 
         // Add workers
@@ -585,6 +604,14 @@ impl EventBus {
             tokio::task::yield_now().await;
         }
 
+        // 1b. Release the drain-finalize gate. The Release here pairs
+        // with the drain worker's Acquire load below, transitively
+        // making every push observed-pre-shutdown visible to the
+        // drain worker's final sweep. Set this even on the timeout
+        // path so a stuck producer doesn't deadlock the workers.
+        self.drain_finalize_ready
+            .store(true, AtomicOrdering::Release);
+
         // Stop the scaling monitor first — it's independent of the
         // ingestion path and just needs to observe the flag.
         let scaling_handle = self.scaling_monitor.lock().take();
@@ -674,6 +701,15 @@ impl Drop for EventBus {
         // cannot await futures in Drop, but setting the atomic flag
         // triggers eventual termination.
         self.shutdown.store(true, AtomicOrdering::Release);
+        // Also release the drain-finalize gate so any drain worker
+        // already parked waiting for it can proceed and exit. Without
+        // this, drop-without-shutdown leaves drain workers blocked on
+        // `drain_finalize_ready` until their internal deadline fires
+        // (which delays task cleanup by `DRAIN_FINALIZE_TIMEOUT`).
+        // Best-effort durability: drop never gets the in-flight wait,
+        // so any push that lands after this point is still lost.
+        self.drain_finalize_ready
+            .store(true, AtomicOrdering::Release);
 
         // BUG_REPORT.md #17: if `shutdown()` was never awaited, any
         // events still in the per-shard ring buffers or mpsc
@@ -923,6 +959,14 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
     })
 }
 
+/// Maximum time a drain worker waits for `drain_finalize_ready`
+/// after observing `shutdown=true`. Defense in depth: if a caller
+/// drops the bus mid-shutdown without setting the gate, we don't
+/// want the worker pinned forever. The shutdown path *always* sets
+/// the gate (even on its own timeout), so this deadline is normally
+/// unreached.
+const DRAIN_FINALIZE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Spawn a drain worker for a single shard.
 ///
 /// Uses a scratch `Vec` + `pop_batch_into` so the per-cycle
@@ -936,6 +980,7 @@ fn spawn_drain_worker_for_shard(
     shard_manager: Arc<ShardManager>,
     sender: mpsc::Sender<Vec<crate::event::InternalEvent>>,
     shutdown: Arc<AtomicBool>,
+    drain_finalize_ready: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     const STEADY_BATCH: usize = 1_000;
     const FINAL_BATCH: usize = 10_000;
@@ -946,6 +991,33 @@ fn spawn_drain_worker_for_shard(
         loop {
             // Relaxed: same rationale as ingest — see `EventBus::ingest`.
             if shutdown.load(AtomicOrdering::Relaxed) {
+                // BUG_REPORT.md #6: before doing the final sweep, wait
+                // for `shutdown()` to release the finalize gate. The
+                // gate is set only after the in-flight ingest counter
+                // reaches zero, which means every producer that read
+                // `shutdown=false` has completed its push. Without
+                // this wait, the drain worker can race ahead of a
+                // late push under shard-mutex serialization (drain
+                // takes the lock first, sees nothing, exits; producer
+                // then takes the lock and pushes — event stranded).
+                //
+                // Acquire pairs with the Release in `EventBus::shutdown`
+                // and `EventBus::drop`, transitively making every
+                // producer push that happened-before its `in_flight`
+                // decrement visible to the subsequent `pop_batch_into`.
+                let finalize_deadline = std::time::Instant::now() + DRAIN_FINALIZE_TIMEOUT;
+                while !drain_finalize_ready.load(AtomicOrdering::Acquire) {
+                    if std::time::Instant::now() >= finalize_deadline {
+                        tracing::warn!(
+                            shard_id,
+                            "drain worker timed out waiting for finalize gate; \
+                             proceeding with potential event loss"
+                        );
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+
                 // Final drain: loop until the ring buffer is empty.
                 // A single 10k batch is not enough — the ring
                 // buffer can hold up to `ring_buffer_capacity`
@@ -1287,5 +1359,120 @@ mod tests {
         assert!(!ok);
         // 3 retries + 1 final attempt = 4 total calls.
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    /// Counting adapter that records the number of events delivered via
+    /// `on_batch`. Used by shutdown-durability tests below.
+    struct CountingAdapter {
+        received: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::adapter::Adapter for CountingAdapter {
+        async fn init(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+            self.received
+                .fetch_add(batch.events.len() as u64, AtomicOrdering::SeqCst);
+            Ok(())
+        }
+        async fn flush(&self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn shutdown(&self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn poll_shard(
+            &self,
+            _shard_id: u16,
+            _from_id: Option<&str>,
+            _limit: usize,
+        ) -> Result<crate::adapter::ShardPollResult, AdapterError> {
+            Ok(crate::adapter::ShardPollResult::empty())
+        }
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+        async fn is_healthy(&self) -> bool {
+            true
+        }
+    }
+
+    /// Regression: BUG_REPORT.md #6 — `shutdown()` must deliver every
+    /// successfully-ingested event to the adapter before returning.
+    /// Pins the broader durability contract that the
+    /// `drain_finalize_ready` gate supports: the drain worker may not
+    /// finalize until the in-flight wait completes.
+    ///
+    /// Tests across many shards with bursts large enough that the
+    /// drain workers are mid-loop when shutdown begins.
+    #[tokio::test]
+    async fn shutdown_delivers_every_successful_ingest_to_adapter() {
+        let received = Arc::new(AtomicU64::new(0));
+        let adapter: Box<dyn crate::adapter::Adapter> = Box::new(CountingAdapter {
+            received: received.clone(),
+        });
+
+        let config = EventBusConfig::builder()
+            .num_shards(4)
+            .ring_buffer_capacity(4096)
+            .build()
+            .unwrap();
+        let bus = EventBus::new_with_adapter(config, adapter).await.unwrap();
+
+        // Drive a sizable burst across all shards. Capacity > burst so
+        // we don't trip backpressure; every successful Ok must reach
+        // `on_batch` before shutdown returns.
+        let total = 10_000usize;
+        let mut successes = 0u64;
+        for i in 0..total {
+            if bus.ingest(Event::new(json!({"i": i}))).is_ok() {
+                successes += 1;
+            }
+        }
+
+        // Shutdown awaits drain workers; with the BUG_REPORT.md #6 fix
+        // those workers wait on `drain_finalize_ready` after observing
+        // `shutdown=true`, so any push the producer made before the
+        // shutdown flag is guaranteed to be in the ring buffer when
+        // the final sweep runs.
+        bus.shutdown().await.unwrap();
+
+        let delivered = received.load(AtomicOrdering::SeqCst);
+        assert_eq!(
+            delivered, successes,
+            "shutdown stranded events: {successes} ingested successfully, \
+             only {delivered} reached the adapter"
+        );
+    }
+
+    /// Regression: BUG_REPORT.md #6 — drop-without-shutdown must
+    /// still release the drain-finalize gate so detached drain
+    /// workers can exit instead of parking on the gate until the
+    /// internal `DRAIN_FINALIZE_TIMEOUT` deadline. Pinning this
+    /// keeps the `Drop` impl honest if someone refactors the
+    /// shutdown gates later.
+    #[tokio::test]
+    async fn drop_releases_drain_finalize_gate_promptly() {
+        let config = EventBusConfig::builder()
+            .num_shards(2)
+            .ring_buffer_capacity(1024)
+            .build()
+            .unwrap();
+        let bus = EventBus::new(config).await.unwrap();
+        let drain_gate = bus.drain_finalize_ready.clone();
+
+        // Drop without an awaited shutdown.
+        drop(bus);
+
+        // The Drop impl must have set the gate. `DRAIN_FINALIZE_TIMEOUT`
+        // is 10s; if Drop didn't flip the gate, drain workers would
+        // park for up to that long before exiting.
+        assert!(
+            drain_gate.load(AtomicOrdering::Acquire),
+            "Drop must release `drain_finalize_ready` so detached drain \
+             workers exit promptly"
+        );
     }
 }

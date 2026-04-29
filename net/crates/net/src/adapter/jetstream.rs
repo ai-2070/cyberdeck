@@ -25,6 +25,8 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::sync::OnceCell;
 
 use crate::adapter::{Adapter, ShardPollResult};
 use crate::config::JetStreamAdapterConfig;
@@ -39,8 +41,18 @@ pub struct JetStreamAdapter {
     jetstream: Option<jetstream::Context>,
     /// Configuration.
     config: JetStreamAdapterConfig,
-    /// Stream cache (shard_id -> stream).
-    streams: Mutex<HashMap<u16, Stream>>,
+    /// Per-shard stream cache.
+    ///
+    /// Each shard's slot is an `Arc<OnceCell<Stream>>` so concurrent
+    /// `on_batch` callers for the same cold shard race only on the
+    /// outer `Mutex` (a brief get-or-insert) and then serialize on
+    /// `OnceCell::get_or_try_init`. Without the per-shard `OnceCell`,
+    /// two concurrent callers could both miss a flat
+    /// `HashMap<u16, Stream>` cache, both call `get_stream` /
+    /// `create_stream`, and both insert — extra RPCs on cold start
+    /// and a hazard if create_stream configs ever diverge between
+    /// callers (BUG_REPORT.md #10.3).
+    streams: Mutex<HashMap<u16, Arc<OnceCell<Stream>>>>,
     /// Whether the adapter has been initialized.
     initialized: AtomicBool,
 }
@@ -106,61 +118,67 @@ impl JetStreamAdapter {
     }
 
     /// Get or create a stream for a shard.
+    ///
+    /// Cold-start single-flight: only one `get_stream`/`create_stream`
+    /// pair runs per shard regardless of how many concurrent
+    /// `on_batch` calls land here at once. The brief outer `Mutex`
+    /// just resolves "which `OnceCell` does this shard map to";
+    /// the actual create-once happens inside
+    /// `OnceCell::get_or_try_init`, which serializes initialization
+    /// across all callers and surfaces the same `Stream` clone (or
+    /// the same error) to each (BUG_REPORT.md #10.3). On error the
+    /// cell stays uninitialized and a subsequent call will retry.
     async fn get_or_create_stream(&self, shard_id: u16) -> Result<Stream, AdapterError> {
-        let stream_name = self.stream_name(shard_id);
-
-        // Check cache first
-        {
-            let streams = self.streams.lock();
-            if let Some(stream) = streams.get(&shard_id) {
-                return Ok(stream.clone());
-            }
-        }
-
-        let js = self
-            .jetstream
-            .as_ref()
-            .ok_or_else(|| AdapterError::Connection("adapter not initialized".into()))?;
-
-        // Try to get existing stream
-        let stream = match js.get_stream(&stream_name).await {
-            Ok(stream) => stream,
-            Err(_) => {
-                // Create new stream
-                let mut stream_config = jetstream::stream::Config {
-                    name: stream_name.clone(),
-                    subjects: vec![self.subject(shard_id)],
-                    retention: jetstream::stream::RetentionPolicy::Limits,
-                    storage: jetstream::stream::StorageType::File,
-                    num_replicas: self.config.replicas,
-                    discard: jetstream::stream::DiscardPolicy::Old,
-                    allow_direct: true, // Required for direct_get API
-                    ..Default::default()
-                };
-
-                if let Some(max_messages) = self.config.max_messages {
-                    stream_config.max_messages = max_messages;
-                }
-                if let Some(max_bytes) = self.config.max_bytes {
-                    stream_config.max_bytes = max_bytes;
-                }
-                if let Some(max_age) = self.config.max_age {
-                    stream_config.max_age = max_age;
-                }
-
-                js.create_stream(stream_config)
-                    .await
-                    .map_err(|e| AdapterError::Connection(e.to_string()))?
-            }
+        let cell = {
+            let mut streams = self.streams.lock();
+            streams
+                .entry(shard_id)
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
         };
 
-        // Cache the stream
-        {
-            let mut streams = self.streams.lock();
-            streams.insert(shard_id, stream.clone());
-        }
+        let stream = cell
+            .get_or_try_init(|| async {
+                let stream_name = self.stream_name(shard_id);
+                let js = self
+                    .jetstream
+                    .as_ref()
+                    .ok_or_else(|| AdapterError::Connection("adapter not initialized".into()))?;
 
-        Ok(stream)
+                // Try to get existing stream first; only create if missing.
+                match js.get_stream(&stream_name).await {
+                    Ok(stream) => Ok(stream),
+                    Err(_) => {
+                        let mut stream_config = jetstream::stream::Config {
+                            name: stream_name.clone(),
+                            subjects: vec![self.subject(shard_id)],
+                            retention: jetstream::stream::RetentionPolicy::Limits,
+                            storage: jetstream::stream::StorageType::File,
+                            num_replicas: self.config.replicas,
+                            discard: jetstream::stream::DiscardPolicy::Old,
+                            allow_direct: true, // Required for direct_get API
+                            ..Default::default()
+                        };
+
+                        if let Some(max_messages) = self.config.max_messages {
+                            stream_config.max_messages = max_messages;
+                        }
+                        if let Some(max_bytes) = self.config.max_bytes {
+                            stream_config.max_bytes = max_bytes;
+                        }
+                        if let Some(max_age) = self.config.max_age {
+                            stream_config.max_age = max_age;
+                        }
+
+                        js.create_stream(stream_config)
+                            .await
+                            .map_err(|e| AdapterError::Connection(e.to_string()))
+                    }
+                }
+            })
+            .await?;
+
+        Ok(stream.clone())
     }
 }
 
