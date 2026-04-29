@@ -241,6 +241,61 @@ impl<T> RingBuffer<T> {
         result
     }
 
+    /// Pop up to `max` elements into a caller-owned `Vec`.
+    ///
+    /// Appends to `dst` (does not clear it first). Returns the number
+    /// of elements actually drained — may be less than `max` if the
+    /// buffer has fewer available.
+    ///
+    /// Use this in steady-state drain loops where the caller can keep
+    /// a single scratch `Vec` across cycles, eliminating one heap
+    /// allocation + free per drain. The allocating [`pop_batch`] is
+    /// preserved as the convenient default.
+    ///
+    /// [`pop_batch`]: Self::pop_batch
+    #[inline]
+    pub fn pop_batch_into(&self, dst: &mut Vec<T>, max: usize) -> usize {
+        #[cfg(test)]
+        {
+            let current = std::thread::current().id();
+            let mut guard = self
+                .consumer_thread
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(tid) = *guard {
+                assert_eq!(
+                    tid, current,
+                    "SPSC violation: pop_batch_into called from multiple threads"
+                );
+            } else {
+                *guard = Some(current);
+            }
+        }
+
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+
+        let available = head.wrapping_sub(tail);
+        let count = available.min(max);
+
+        if count == 0 {
+            return 0;
+        }
+
+        // Reserve up-front so the push loop has no reallocation branch.
+        dst.reserve(count);
+
+        for i in 0..count {
+            let index = (tail.wrapping_add(i)) & self.mask;
+            let value = unsafe { (*self.buffer[index].get()).assume_init_read() };
+            dst.push(value);
+        }
+
+        self.tail.store(tail.wrapping_add(count), Ordering::Release);
+
+        count
+    }
+
     /// Get the current number of elements in the buffer.
     #[inline]
     pub fn len(&self) -> usize {

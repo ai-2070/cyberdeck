@@ -372,7 +372,10 @@ impl EventBus {
     /// The shard ID and insertion timestamp on success.
     #[inline]
     pub fn ingest(&self, event: Event) -> IngestionResult<(u16, u64)> {
-        if self.shutdown.load(AtomicOrdering::Acquire) {
+        // Relaxed: shutdown is a one-way latch. Producers don't gate
+        // any memory observation on the flag — they just decide
+        // whether to continue. Pair with `Release` in `shutdown()`.
+        if self.shutdown.load(AtomicOrdering::Relaxed) {
             return Err(IngestionError::ShuttingDown);
         }
 
@@ -403,7 +406,7 @@ impl EventBus {
     /// The shard ID and insertion timestamp on success.
     #[inline]
     pub fn ingest_raw(&self, event: RawEvent) -> IngestionResult<(u16, u64)> {
-        if self.shutdown.load(AtomicOrdering::Acquire) {
+        if self.shutdown.load(AtomicOrdering::Relaxed) {
             return Err(IngestionError::ShuttingDown);
         }
 
@@ -432,7 +435,7 @@ impl EventBus {
     ///
     /// The number of successfully ingested events.
     pub fn ingest_batch(&self, events: Vec<Event>) -> usize {
-        if self.shutdown.load(AtomicOrdering::Acquire) {
+        if self.shutdown.load(AtomicOrdering::Relaxed) {
             return 0;
         }
 
@@ -451,7 +454,7 @@ impl EventBus {
     ///
     /// The number of successfully ingested events.
     pub fn ingest_raw_batch(&self, events: Vec<RawEvent>) -> usize {
-        if self.shutdown.load(AtomicOrdering::Acquire) {
+        if self.shutdown.load(AtomicOrdering::Relaxed) {
             return 0;
         }
 

@@ -96,6 +96,13 @@ impl Filter {
     #[inline]
     pub fn matches(&self, event: &JsonValue) -> bool {
         match self {
+            // Single-element fast path: skip the iterator + closure
+            // setup and recurse directly. `And { filters: [f] }` and
+            // `Or { filters: [f] }` are common after deserializing
+            // small filter trees and were otherwise paying iter+all/any
+            // overhead per event.
+            Self::And { filters } if filters.len() == 1 => filters[0].matches(event),
+            Self::Or { filters } if filters.len() == 1 => filters[0].matches(event),
             Self::And { filters } => {
                 !filters.is_empty() && filters.iter().all(|f| f.matches(event))
             }
@@ -515,6 +522,33 @@ mod tests {
         let filter = Filter::or(vec![]);
         // Empty OR should match nothing
         assert!(!filter.matches(&json!({"any": "value"})));
+    }
+
+    /// Single-element `And` / `Or` must produce the same result as
+    /// the inner filter alone — the fast path in `matches()` recurses
+    /// directly without the iterator+closure setup, but it has to be
+    /// semantically identical to the iter-based path.
+    #[test]
+    fn test_single_element_and_or_match_inner_filter() {
+        let inner = Filter::eq("k", json!("v"));
+        let single_and = Filter::and(vec![inner.clone()]);
+        let single_or = Filter::or(vec![inner.clone()]);
+
+        let yes = json!({"k": "v"});
+        let no = json!({"k": "other"});
+
+        for ev in &[yes, no] {
+            assert_eq!(
+                single_and.matches(ev),
+                inner.matches(ev),
+                "single-element And must match inner: {ev}",
+            );
+            assert_eq!(
+                single_or.matches(ev),
+                inner.matches(ev),
+                "single-element Or must match inner: {ev}",
+            );
+        }
     }
 
     #[test]

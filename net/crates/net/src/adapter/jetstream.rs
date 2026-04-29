@@ -225,12 +225,39 @@ impl Adapter for JetStreamAdapter {
         // Publish each event with a deterministic message ID for dedup.
         // If a retry resends the same batch, NATS discards duplicates
         // within its dedup window (default 2 minutes).
-        for (i, data) in serialized.into_iter().enumerate() {
-            let msg_id = format!("{}:{}:{}", batch.shard_id, batch.sequence_start, i);
-            let mut headers = async_nats::HeaderMap::new();
-            headers.insert("Nats-Msg-Id", msg_id.as_str());
+        //
+        // Two-phase publish: enqueue all messages in order (each await
+        // returns a `PublishAckFuture` once enqueued — fast), then
+        // await every server ack in parallel. With one ack per event
+        // the prior serial-await loop paid 1 RTT *per event*;
+        // pipelining drops that to ~1 RTT per batch.
+        //
+        // The message-id buffer (`Nats-Msg-Id` header) is reused
+        // across iterations: the `{shard_id}:{seq_start}` prefix is
+        // the same for every event in the batch, so we render it once
+        // and only rewrite the trailing `:{i}` per event, eliminating
+        // the per-event `format!` allocation.
+        use std::fmt::Write;
+        let mut acks = Vec::with_capacity(serialized.len());
+        let mut msg_id_buf = String::new();
+        let prefix_len = {
+            let _ = write!(msg_id_buf, "{}:{}", batch.shard_id, batch.sequence_start);
+            msg_id_buf.len()
+        };
 
-            js.publish_with_headers(subject.clone(), headers, data.into())
+        for (i, data) in serialized.into_iter().enumerate() {
+            // Reset to the cached prefix and append `:{i}`.
+            msg_id_buf.truncate(prefix_len);
+            let _ = write!(msg_id_buf, ":{i}");
+
+            let mut headers = async_nats::HeaderMap::new();
+            // `From<&str> for HeaderValue` copies the bytes into the
+            // header, so reusing `msg_id_buf` on the next iteration is
+            // safe — the header now owns its own copy.
+            headers.insert("Nats-Msg-Id", msg_id_buf.as_str());
+
+            let ack = js
+                .publish_with_headers(subject.clone(), headers, data.into())
                 .await
                 .map_err(|e| {
                     if is_transient_error(&e) {
@@ -238,10 +265,22 @@ impl Adapter for JetStreamAdapter {
                     } else {
                         AdapterError::Fatal(e.to_string())
                     }
-                })?
-                .await
-                .map_err(|e| AdapterError::Transient(e.to_string()))?;
+                })?;
+            // `PublishAckFuture` implements `IntoFuture`, not `Future`,
+            // so it can't go straight into `try_join_all`. Wrap each
+            // in an async block that handles the await + error
+            // mapping in one place.
+            acks.push(async move {
+                ack.await
+                    .map_err(|e| AdapterError::Transient(e.to_string()))
+            });
         }
+
+        // Await all server acks in parallel. `try_join_all` short-
+        // circuits on the first error, which is the desired retry
+        // semantic — the JetStream stream's dedup window will discard
+        // duplicates on the retry.
+        futures::future::try_join_all(acks).await?;
 
         tracing::trace!(
             shard_id = batch.shard_id,
