@@ -9,7 +9,7 @@ members = [
 
 [package]
 name = "net"
-version = "0.5.0"
+version = "0.8.0"
 edition = "2021"
 description = "High-performance, schema-agnostic, backend-agnostic event bus"
 license = "Apache-2.0"

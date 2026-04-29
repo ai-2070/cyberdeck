@@ -28,7 +28,7 @@
     "test:watch": "vitest"
   },
   "peerDependencies": {
-    "@ai2070/net": ">=0.5.0"
+    "@ai2070/net": ">=0.8.0"
   },
   "devDependencies": {
     "@ai2070/net": "file:../bindings/node",

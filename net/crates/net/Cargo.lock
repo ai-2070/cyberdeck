@@ -1371,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "net"
-version = "0.5.0"
+version = "0.8.0"
 dependencies = [
  "arc-swap",
  "async-nats",
@@ -1411,7 +1411,7 @@ dependencies = [
 
 [[package]]
 name = "net-compute-ffi"
-version = "0.5.0"
+version = "0.8.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -1424,7 +1424,7 @@ dependencies = [
 
 [[package]]
 name = "net-node"
-version = "0.5.0"
+version = "0.8.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -1443,7 +1443,7 @@ dependencies = [
 
 [[package]]
 name = "net-python"
-version = "0.5.0"
+version = "0.8.0"
 dependencies = [
  "bytes",
  "dashmap",
