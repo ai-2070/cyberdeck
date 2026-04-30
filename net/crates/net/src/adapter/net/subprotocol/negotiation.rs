@@ -70,20 +70,40 @@ impl SubprotocolManifest {
     }
 
     /// Deserialize from bytes.
+    ///
+    /// BUG_REPORT.md #10: previously this accepted trailing
+    /// garbage past the declared `count` entries, and never
+    /// de-duplicated entry `id`s. A peer could advertise the
+    /// same subprotocol id twice — once with a strict version,
+    /// once with a permissive one — and whichever landed last
+    /// in `remote_by_id` would win, enabling a downgrade
+    /// attack. Now both inputs are rejected with `None`,
+    /// matching the strict-length contract on
+    /// `IdentityEnvelope::from_bytes` and
+    /// `PermissionToken::from_bytes`.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < 2 {
             return None;
         }
         let mut cursor = data;
         let count = cursor.get_u16_le() as usize;
+        let expected_body = count.checked_mul(MANIFEST_ENTRY_SIZE)?;
 
-        if cursor.remaining() < count * MANIFEST_ENTRY_SIZE {
+        // Strict-length: the cursor must hold exactly `count`
+        // entries, no more, no less.
+        if cursor.remaining() != expected_body {
             return None;
         }
 
         let mut entries = Vec::with_capacity(count);
+        let mut seen_ids: HashSet<u16> = HashSet::with_capacity(count);
         for _ in 0..count {
             let (id, version, min_compatible) = read_manifest_entry(&mut cursor)?;
+            // Reject duplicate ids — a peer can only declare each
+            // subprotocol once.
+            if !seen_ids.insert(id) {
+                return None;
+            }
             entries.push(ManifestEntry {
                 id,
                 version,
@@ -281,5 +301,59 @@ mod tests {
         assert!(!result.is_compatible(0x0500)); // local only
         assert!(!result.is_compatible(0x1000)); // local only
         assert!(!result.is_compatible(0x2000)); // remote only
+    }
+
+    /// Regression: BUG_REPORT.md #10 — `from_bytes` previously
+    /// accepted manifests with trailing garbage and with duplicate
+    /// `id` entries. Both conditions enable downgrade attacks: a
+    /// peer can advertise the same id twice with different
+    /// versions and the last-write-wins behavior in `remote_by_id`
+    /// silently picks whichever copy lands second.
+    #[test]
+    fn from_bytes_rejects_trailing_garbage_and_duplicate_ids() {
+        // Build a valid 1-entry manifest, then append junk bytes.
+        let manifest = SubprotocolManifest {
+            entries: vec![entry(0x0400, 1, 0)],
+        };
+        let mut bytes = manifest.to_bytes().to_vec();
+        // Sanity: the round-trip works as-is.
+        assert!(SubprotocolManifest::from_bytes(&bytes).is_some());
+
+        // Append a stray byte. Must reject.
+        bytes.push(0xff);
+        assert!(
+            SubprotocolManifest::from_bytes(&bytes).is_none(),
+            "trailing garbage must be rejected (#10)"
+        );
+
+        // Build a manifest with duplicate id 0x0400 — declare
+        // count=2 then write the same id twice with different
+        // versions. The historic bug let this through; the fix
+        // rejects it.
+        let mut buf = bytes::BytesMut::new();
+        use bytes::BufMut;
+        buf.put_u16_le(2);
+        let dup1 = SubprotocolDescriptor {
+            id: 0x0400,
+            name: String::new(),
+            version: SubprotocolVersion::new(1, 0),
+            min_compatible: SubprotocolVersion::new(1, 0),
+            handler_present: true,
+        };
+        let dup2 = SubprotocolDescriptor {
+            id: 0x0400,
+            name: String::new(),
+            version: SubprotocolVersion::new(0, 1), // permissive version
+            min_compatible: SubprotocolVersion::new(0, 1),
+            handler_present: true,
+        };
+        write_manifest_entry(&dup1, &mut buf);
+        write_manifest_entry(&dup2, &mut buf);
+        assert!(
+            SubprotocolManifest::from_bytes(&buf).is_none(),
+            "duplicate id must be rejected — without this guard a peer \
+             can advertise both `causal v1.0` and `causal v0.1` and \
+             trigger a downgrade (#10)"
+        );
     }
 }

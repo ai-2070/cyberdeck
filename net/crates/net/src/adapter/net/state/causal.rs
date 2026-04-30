@@ -232,15 +232,48 @@ pub fn validate_chain_link(
 ///
 /// Format per event: `[len: u32][CausalLink: 24 bytes][payload: len-24 bytes]`
 ///
+/// Result of a `write_causal_events` call.
+///
+/// BUG_REPORT.md #43: callers of this writer typically pass the
+/// pre-write `events.len()` to a downstream framing layer (e.g. as
+/// the `count` field on the next packet header) so the reader can
+/// know how many `[len][link][payload]` triples to expect. If the
+/// writer silently `continue`s past oversized events, the framing
+/// count and the actual events serialized mismatch — and
+/// `read_causal_events` parses junk for the missing slots.
+///
+/// Surface both numbers so the caller can either:
+///   - Use `events_written` as the framing count (correct), or
+///   - Detect `events_written < events.len()` and retry / split
+///     the batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteCausalEventsResult {
+    /// Bytes appended to `buf`.
+    pub bytes_written: usize,
+    /// Number of events actually serialized. Equal to
+    /// `events.len()` unless one or more events were too large
+    /// to encode (payload > `u32::MAX - 24`).
+    pub events_written: usize,
+    /// Events skipped because their serialized size would
+    /// overflow the `u32` length prefix.
+    pub events_skipped: usize,
+}
+
 /// Events whose serialized size would overflow the `u32` length
-/// prefix (payload > ~4 GiB − 24 bytes) are silently skipped
-/// instead of panicking. The paired `read_causal_events` is already
-/// defensive about malformed input; the writer is now symmetric.
-/// No realistic caller hands in payloads this size, but an FFI path
-/// forwarding arbitrary `Bytes` could — making a crash on oversized
-/// input a DoS vector.
-pub fn write_causal_events(events: &[CausalEvent], buf: &mut BytesMut) -> usize {
+/// prefix (payload > ~4 GiB − 24 bytes) are skipped rather than
+/// panicking. No realistic caller hands in payloads this size, but
+/// an FFI path forwarding arbitrary `Bytes` could — making a crash
+/// on oversized input a DoS vector. Callers MUST use the returned
+/// `events_written` as the framing count, not the input slice's
+/// length, or the reader will parse past valid data into noise
+/// (BUG_REPORT.md #43).
+pub fn write_causal_events(
+    events: &[CausalEvent],
+    buf: &mut BytesMut,
+) -> WriteCausalEventsResult {
     let start = buf.len();
+    let mut events_written = 0usize;
+    let mut events_skipped = 0usize;
     for event in events {
         let total_len = CAUSAL_LINK_SIZE + event.payload.len();
         let total_len_u32 = match u32::try_from(total_len) {
@@ -248,16 +281,24 @@ pub fn write_causal_events(events: &[CausalEvent], buf: &mut BytesMut) -> usize 
             Err(_) => {
                 tracing::warn!(
                     payload_len = event.payload.len(),
-                    "write_causal_events: skipping event whose serialized size exceeds u32",
+                    "write_causal_events: skipping event whose serialized \
+                     size exceeds u32 — caller MUST use \
+                     `events_written` as framing count, not events.len()",
                 );
+                events_skipped += 1;
                 continue;
             }
         };
         buf.put_u32_le(total_len_u32);
         buf.put_slice(&event.link.to_bytes());
         buf.put_slice(&event.payload);
+        events_written += 1;
     }
-    buf.len() - start
+    WriteCausalEventsResult {
+        bytes_written: buf.len() - start,
+        events_written,
+        events_skipped,
+    }
 }
 
 /// Read causal events from a buffer.
@@ -483,8 +524,10 @@ mod tests {
             .collect();
 
         let mut buf = BytesMut::new();
-        let written = write_causal_events(&events, &mut buf);
-        assert!(written > 0);
+        let result = write_causal_events(&events, &mut buf);
+        assert!(result.bytes_written > 0);
+        assert_eq!(result.events_written, events.len());
+        assert_eq!(result.events_skipped, 0);
 
         let parsed = read_causal_events(buf.freeze(), 3);
         assert_eq!(parsed.len(), 3);

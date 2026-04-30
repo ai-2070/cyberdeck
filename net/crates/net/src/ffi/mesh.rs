@@ -156,19 +156,40 @@ fn runtime() -> &'static Arc<Runtime> {
     })
 }
 
+/// BUG_REPORT.md #18: `'a` is now bound to the lifetime of an
+/// input reference (`&p`) so the caller cannot pick `'static` and
+/// produce a dangling borrow. The borrow lives only as long as
+/// the local stack frame holding the pointer — which is the
+/// caller's responsibility to keep valid for the duration of any
+/// resulting `&str` use, but no longer. Compare `cortex.rs::
+/// c_str_to_owned` which sidesteps the issue entirely by
+/// returning `Option<String>`.
+///
+/// # Safety
+/// Caller must ensure `p` is null or points to a NUL-terminated C
+/// string valid for at least the duration of the returned `&str`.
 #[inline]
-unsafe fn c_str_to_str<'a>(p: *const c_char) -> Option<&'a str> {
+unsafe fn c_str_to_str<'a>(p: &'a *const c_char) -> Option<&'a str> {
     if p.is_null() {
         return None;
     }
-    CStr::from_ptr(p).to_str().ok()
+    CStr::from_ptr(*p).to_str().ok()
 }
 
+/// BUG_REPORT.md #45: null-check `out_ptr` and `out_len` before
+/// writing through them. The helper is callable from any FFI
+/// boundary; a future caller forgetting to check produced UB
+/// (write through null). Returns `NetError::NullPointer` so the
+/// FFI caller can distinguish "I forgot to provide outputs" from
+/// "the operation failed."
 fn write_json_out<T: Serialize>(
     value: &T,
     out_ptr: *mut *mut c_char,
     out_len: *mut usize,
 ) -> c_int {
+    if out_ptr.is_null() || out_len.is_null() {
+        return NetError::NullPointer.into();
+    }
     let Ok(s) = serde_json::to_string(value) else {
         return NetError::Unknown.into();
     };
@@ -184,6 +205,9 @@ fn write_json_out<T: Serialize>(
 }
 
 fn write_string_out(s: String, out_ptr: *mut *mut c_char, out_len: *mut usize) -> c_int {
+    if out_ptr.is_null() || out_len.is_null() {
+        return NetError::NullPointer.into();
+    }
     let len = s.len();
     let Ok(cs) = CString::new(s) else {
         return NetError::Unknown.into();
@@ -336,7 +360,7 @@ pub extern "C" fn net_mesh_new(
     if config_json.is_null() || out_handle.is_null() {
         return NetError::NullPointer.into();
     }
-    let Some(s) = (unsafe { c_str_to_str(config_json) }) else {
+    let Some(s) = (unsafe { c_str_to_str(&config_json) }) else {
         return NetError::InvalidUtf8.into();
     };
     let cfg: MeshNewConfig = match serde_json::from_str(s) {
@@ -563,14 +587,14 @@ pub extern "C" fn net_mesh_connect(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(addr_s) = (unsafe { c_str_to_str(peer_addr) }) else {
+    let Some(addr_s) = (unsafe { c_str_to_str(&peer_addr) }) else {
         return NetError::InvalidUtf8.into();
     };
     let addr: std::net::SocketAddr = match addr_s.parse() {
         Ok(a) => a,
         Err(_) => return NET_ERR_MESH_HANDSHAKE,
     };
-    let Some(pk_s) = (unsafe { c_str_to_str(peer_pubkey_hex) }) else {
+    let Some(pk_s) = (unsafe { c_str_to_str(&peer_pubkey_hex) }) else {
         return NetError::InvalidUtf8.into();
     };
     let pk_bytes = match hex::decode(pk_s) {
@@ -833,7 +857,7 @@ pub extern "C" fn net_mesh_connect_direct(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(pk_s) = (unsafe { c_str_to_str(peer_pubkey_hex) }) else {
+    let Some(pk_s) = (unsafe { c_str_to_str(&peer_pubkey_hex) }) else {
         return NetError::InvalidUtf8.into();
     };
     let pk_bytes = match hex::decode(pk_s) {
@@ -871,7 +895,7 @@ pub extern "C" fn net_mesh_set_reflex_override(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(s) = (unsafe { c_str_to_str(external) }) else {
+    let Some(s) = (unsafe { c_str_to_str(&external) }) else {
         return NetError::InvalidUtf8.into();
     };
     let Ok(addr) = s.parse::<std::net::SocketAddr>() else {
@@ -1042,7 +1066,7 @@ pub extern "C" fn net_mesh_open_stream(
     let cfg_json: StreamOpenConfig = if config_json.is_null() {
         StreamOpenConfig::default()
     } else {
-        let Some(s) = (unsafe { c_str_to_str(config_json) }) else {
+        let Some(s) = (unsafe { c_str_to_str(&config_json) }) else {
             return NetError::InvalidUtf8.into();
         };
         match serde_json::from_str(s) {
@@ -1117,6 +1141,18 @@ unsafe fn collect_payloads(
     Some(out)
 }
 
+/// BUG_REPORT.md #19: ensure the supplied stream handle was
+/// created by the supplied node handle. Without this check,
+/// `net_mesh_send` would happily route bytes through whichever
+/// `MeshNode` was passed, even if the stream belonged to a
+/// different one — silent cross-session traffic. `Arc::ptr_eq`
+/// is O(1) and definitive: stream handles cache the originating
+/// node Arc in `_node` for exactly this purpose.
+#[inline]
+fn handles_match(sh: &MeshStreamHandle, nh: &MeshNodeHandle) -> bool {
+    Arc::ptr_eq(&sh._node, &nh.inner)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn net_mesh_send(
     handle: *mut MeshStreamHandle,
@@ -1133,6 +1169,9 @@ pub extern "C" fn net_mesh_send(
     }
     let sh = unsafe { &*handle };
     let nh = unsafe { &*node_handle };
+    if !handles_match(sh, nh) {
+        return NetError::MismatchedHandles.into();
+    }
     let rt = runtime();
     let payloads = match unsafe { collect_payloads(payloads, lens, count) } {
         Some(v) => v,
@@ -1163,6 +1202,9 @@ pub extern "C" fn net_mesh_send_with_retry(
     }
     let sh = unsafe { &*handle };
     let nh = unsafe { &*node_handle };
+    if !handles_match(sh, nh) {
+        return NetError::MismatchedHandles.into();
+    }
     let rt = runtime();
     let payloads = match unsafe { collect_payloads(payloads, lens, count) } {
         Some(v) => v,
@@ -1195,6 +1237,9 @@ pub extern "C" fn net_mesh_send_blocking(
     }
     let sh = unsafe { &*handle };
     let nh = unsafe { &*node_handle };
+    if !handles_match(sh, nh) {
+        return NetError::MismatchedHandles.into();
+    }
     let rt = runtime();
     let payloads = match unsafe { collect_payloads(payloads, lens, count) } {
         Some(v) => v,
@@ -1376,7 +1421,7 @@ pub extern "C" fn net_mesh_register_channel(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(s) = (unsafe { c_str_to_str(config_json) }) else {
+    let Some(s) = (unsafe { c_str_to_str(&config_json) }) else {
         return NetError::InvalidUtf8.into();
     };
     let input: ChannelConfigInput = match serde_json::from_str(s) {
@@ -1452,7 +1497,7 @@ pub extern "C" fn net_mesh_subscribe_channel_with_token(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(s) = (unsafe { c_str_to_str(channel) }) else {
+    let Some(s) = (unsafe { c_str_to_str(&channel) }) else {
         return NetError::InvalidUtf8.into();
     };
     let name = match InnerChannelName::new(s) {
@@ -1485,7 +1530,7 @@ fn subscribe_or_unsubscribe(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(s) = (unsafe { c_str_to_str(channel) }) else {
+    let Some(s) = (unsafe { c_str_to_str(&channel) }) else {
         return NetError::InvalidUtf8.into();
     };
     let name = match InnerChannelName::new(s) {
@@ -1566,7 +1611,7 @@ pub extern "C" fn net_mesh_publish(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(ch) = (unsafe { c_str_to_str(channel) }) else {
+    let Some(ch) = (unsafe { c_str_to_str(&channel) }) else {
         return NetError::InvalidUtf8.into();
     };
     let name = match InnerChannelName::new(ch) {
@@ -1576,7 +1621,7 @@ pub extern "C" fn net_mesh_publish(
     let cfg_in: PublishConfigInput = if config_json.is_null() {
         PublishConfigInput::default()
     } else {
-        let Some(s) = (unsafe { c_str_to_str(config_json) }) else {
+        let Some(s) = (unsafe { c_str_to_str(&config_json) }) else {
             return NetError::InvalidUtf8.into();
         };
         match serde_json::from_str(s) {
@@ -1878,13 +1923,13 @@ pub extern "C" fn net_identity_issue_token(
     let Some(subject_id) = entity_id_from_bytes(subject, subject_len) else {
         return NET_ERR_IDENTITY;
     };
-    let Some(scope_s) = (unsafe { c_str_to_str(scope_json) }) else {
+    let Some(scope_s) = (unsafe { c_str_to_str(&scope_json) }) else {
         return NetError::InvalidUtf8.into();
     };
     let Some(scope) = parse_scope_list(scope_s) else {
         return NET_ERR_IDENTITY;
     };
-    let Some(channel_s) = (unsafe { c_str_to_str(channel) }) else {
+    let Some(channel_s) = (unsafe { c_str_to_str(&channel) }) else {
         return NetError::InvalidUtf8.into();
     };
     let Some(channel_hash) = channel_name_to_hash(channel_s) else {
@@ -1944,7 +1989,7 @@ pub extern "C" fn net_identity_lookup_token(
     let Some(subject_id) = entity_id_from_bytes(subject, subject_len) else {
         return NET_ERR_IDENTITY;
     };
-    let Some(channel_s) = (unsafe { c_str_to_str(channel) }) else {
+    let Some(channel_s) = (unsafe { c_str_to_str(&channel) }) else {
         return NetError::InvalidUtf8.into();
     };
     let Some(channel_hash) = channel_name_to_hash(channel_s) else {
@@ -2095,7 +2140,7 @@ pub extern "C" fn net_delegate_token(
     let Some(subject_id) = entity_id_from_bytes(new_subject, new_subject_len) else {
         return NET_ERR_IDENTITY;
     };
-    let Some(scope_s) = (unsafe { c_str_to_str(restricted_scope_json) }) else {
+    let Some(scope_s) = (unsafe { c_str_to_str(&restricted_scope_json) }) else {
         return NetError::InvalidUtf8.into();
     };
     let Some(scope) = parse_scope_list(scope_s) else {
@@ -2115,7 +2160,7 @@ pub extern "C" fn net_channel_hash(channel: *const c_char, out_hash: *mut u16) -
     if channel.is_null() || out_hash.is_null() {
         return NetError::NullPointer.into();
     }
-    let Some(s) = (unsafe { c_str_to_str(channel) }) else {
+    let Some(s) = (unsafe { c_str_to_str(&channel) }) else {
         return NetError::InvalidUtf8.into();
     };
     let Some(hash) = channel_name_to_hash(s) else {
@@ -2553,7 +2598,7 @@ pub extern "C" fn net_mesh_announce_capabilities(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(s) = (unsafe { c_str_to_str(caps_json) }) else {
+    let Some(s) = (unsafe { c_str_to_str(&caps_json) }) else {
         return NetError::InvalidUtf8.into();
     };
     let parsed: CapabilitySetJson = match serde_json::from_str(s) {
@@ -2582,7 +2627,7 @@ pub extern "C" fn net_mesh_find_nodes(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(s) = (unsafe { c_str_to_str(filter_json) }) else {
+    let Some(s) = (unsafe { c_str_to_str(&filter_json) }) else {
         return NetError::InvalidUtf8.into();
     };
     let parsed: CapabilityFilterJson = match serde_json::from_str(s) {
@@ -2748,10 +2793,10 @@ pub extern "C" fn net_mesh_find_nodes_scoped(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(filter_s) = (unsafe { c_str_to_str(filter_json) }) else {
+    let Some(filter_s) = (unsafe { c_str_to_str(&filter_json) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let Some(scope_s) = (unsafe { c_str_to_str(scope_json) }) else {
+    let Some(scope_s) = (unsafe { c_str_to_str(&scope_json) }) else {
         return NetError::InvalidUtf8.into();
     };
     let parsed_filter: CapabilityFilterJson = match serde_json::from_str(filter_s) {
@@ -2833,7 +2878,7 @@ pub extern "C" fn net_mesh_find_best_node(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(s) = (unsafe { c_str_to_str(requirement_json) }) else {
+    let Some(s) = (unsafe { c_str_to_str(&requirement_json) }) else {
         return NetError::InvalidUtf8.into();
     };
     let parsed: CapabilityRequirementJson = match serde_json::from_str(s) {
@@ -2878,10 +2923,10 @@ pub extern "C" fn net_mesh_find_best_node_scoped(
         return NetError::NullPointer.into();
     }
     let h = unsafe { &*handle };
-    let Some(req_s) = (unsafe { c_str_to_str(requirement_json) }) else {
+    let Some(req_s) = (unsafe { c_str_to_str(&requirement_json) }) else {
         return NetError::InvalidUtf8.into();
     };
-    let Some(scope_s) = (unsafe { c_str_to_str(scope_json) }) else {
+    let Some(scope_s) = (unsafe { c_str_to_str(&scope_json) }) else {
         return NetError::InvalidUtf8.into();
     };
     let parsed_req: CapabilityRequirementJson = match serde_json::from_str(req_s) {
@@ -2917,7 +2962,7 @@ pub extern "C" fn net_normalize_gpu_vendor(
     if raw.is_null() || out_json.is_null() || out_len.is_null() {
         return NetError::NullPointer.into();
     }
-    let Some(s) = (unsafe { c_str_to_str(raw) }) else {
+    let Some(s) = (unsafe { c_str_to_str(&raw) }) else {
         return NetError::InvalidUtf8.into();
     };
     let canonical = gpu_vendor_to_string_cap(parse_gpu_vendor_cap(s));
@@ -3031,6 +3076,71 @@ mod tests {
 
         drop(inner_clone);
         let _ = unsafe { Box::from_raw(out) };
+    }
+
+    /// Regression: BUG_REPORT.md #19 — `net_mesh_send` family
+    /// accepted any `(MeshStreamHandle, MeshNodeHandle)` pair and
+    /// sent through the supplied node, regardless of whether the
+    /// stream was opened on it. The fix uses `Arc::ptr_eq` to
+    /// require the stream's cached `_node` to match the supplied
+    /// node handle's inner `Arc`.
+    ///
+    /// Build two distinct nodes via the FFI constructor (so all
+    /// the internal fields are populated correctly), open a stream
+    /// on the first, then verify `handles_match` accepts the
+    /// matched pair and rejects the cross-pair.
+    #[test]
+    fn handles_match_rejects_stream_node_mismatch() {
+        fn make_node_handle() -> *mut MeshNodeHandle {
+            let cfg = serde_json::json!({
+                "bind_addr": "127.0.0.1:0",
+                "psk_hex": "0".repeat(64),
+            });
+            let cfg_c = CString::new(cfg.to_string()).unwrap();
+            let mut out: *mut MeshNodeHandle = std::ptr::null_mut();
+            let rc = net_mesh_new(cfg_c.as_ptr(), &mut out);
+            assert_eq!(rc, 0);
+            assert!(!out.is_null());
+            out
+        }
+
+        let nh_a = make_node_handle();
+        let nh_b = make_node_handle();
+
+        // Build a stream handle whose `_node` Arc is node_a's
+        // inner. We can't go through `open_stream` here because
+        // that requires an established session with the peer
+        // (which the unit test can't synthesize), but `handles_match`
+        // only inspects the cached `_node` Arc — the stream fields
+        // are irrelevant to the check. Direct field init is fine
+        // since we're in the same module.
+        let sh_a = {
+            let h = unsafe { &*nh_a };
+            MeshStreamHandle {
+                stream: CoreStream {
+                    peer_node_id: 0xDEAD,
+                    stream_id: 1,
+                    epoch: 0,
+                    config: StreamConfig::new(),
+                },
+                _node: h.inner.clone(),
+            }
+        };
+
+        // Matched pair: stream's _node == nh_a.inner — accepted.
+        assert!(
+            handles_match(&sh_a, unsafe { &*nh_a }),
+            "stream from node_a + node_a handle must match"
+        );
+        // Mismatched pair: stream's _node != nh_b.inner — rejected.
+        assert!(
+            !handles_match(&sh_a, unsafe { &*nh_b }),
+            "stream from node_a + node_b handle must be rejected (#19)"
+        );
+
+        // Cleanup: drop the boxes.
+        let _ = unsafe { Box::from_raw(nh_a) };
+        let _ = unsafe { Box::from_raw(nh_b) };
     }
 
     #[test]

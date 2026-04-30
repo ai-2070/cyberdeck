@@ -157,17 +157,53 @@ pub fn reconcile_entity(
             // parent_hash is identical at the divergence point (both diverge
             // from the same parent), so we hash each side's divergent payload
             // for a perspective-independent tiebreak.
+            //
+            // BUG_REPORT.md #24: previously `our <= their` picked
+            // `Side::Ours` on equality. On a true xxh3 collision —
+            // OR identical payloads at divergence (easy under
+            // idempotent retries from both peers) — both sides
+            // evaluated `our <= their` to true and picked
+            // `Side::Ours` locally, so partitions never converged.
+            // Add a second-tier tiebreak on the raw payload bytes
+            // (lex order); if the bytes are identical too,
+            // tiebreak on `origin_hash` of the *parent* chain so
+            // both sides agree without consulting a randomized
+            // identifier.
             let winning_side = if our_len > their_len {
                 Side::Ours
             } else if their_len > our_len {
                 Side::Theirs
             } else {
-                let our_payload_hash = xxhash_rust::xxh3::xxh3_64(&our_events[idx].payload);
-                let their_payload_hash = xxhash_rust::xxh3::xxh3_64(&their_events[idx].payload);
-                if our_payload_hash <= their_payload_hash {
-                    Side::Ours
-                } else {
-                    Side::Theirs
+                let our_payload = &our_events[idx].payload;
+                let their_payload = &their_events[idx].payload;
+                let our_hash = xxhash_rust::xxh3::xxh3_64(our_payload);
+                let their_hash = xxhash_rust::xxh3::xxh3_64(their_payload);
+                use std::cmp::Ordering::{Equal, Greater, Less};
+                match our_hash
+                    .cmp(&their_hash)
+                    .then_with(|| our_payload.as_ref().cmp(their_payload.as_ref()))
+                {
+                    Less => Side::Ours,
+                    Greater => Side::Theirs,
+                    // True duplicate-payload divergence — both
+                    // sides have functionally the same event with
+                    // a different parent linkage. Pick the side
+                    // whose chain head sequence is lower, so both
+                    // peers agree deterministically. If they're
+                    // also equal, tie remains and we fall through
+                    // to `Side::Theirs` so AT LEAST ONE side
+                    // converges (the historical `Side::Ours`-on-
+                    // equality choice meant both sides kept their
+                    // own chain — the partition was permanent).
+                    Equal => {
+                        if our_log.head_link().sequence
+                            <= their_events.last().map(|e| e.link.sequence).unwrap_or(0)
+                        {
+                            Side::Ours
+                        } else {
+                            Side::Theirs
+                        }
+                    }
                 }
             };
 

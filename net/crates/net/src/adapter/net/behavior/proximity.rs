@@ -188,11 +188,20 @@ impl EnhancedPingwave {
             capability_hash: u64::from_le_bytes(buf[50..58].try_into().ok()?),
             capability_version: u32::from_le_bytes(buf[58..62].try_into().ok()?),
             load_level: buf[62],
+            // BUG_REPORT.md #38: previously coerced any unknown
+            // byte to `HealthStatus::Unknown`. A flipped byte
+            // downgrades the peer to `Unknown`, which
+            // `can_receive_traffic()` treats as unroutable —
+            // silent peer eviction on a single bit-flip.
+            // `from_bytes` callers already handle `None` (this
+            // returns `Option<Self>`), so refuse the parse on
+            // unknown discriminants instead of guessing.
             health: match buf[63] {
                 0 => HealthStatus::Healthy,
                 1 => HealthStatus::Degraded,
                 2 => HealthStatus::Unhealthy,
-                _ => HealthStatus::Unknown,
+                3 => HealthStatus::Unknown,
+                _ => return None,
             },
             primary_caps: PrimaryCapabilities::from_bytes(&caps_buf),
         })
@@ -994,6 +1003,44 @@ mod tests {
         assert_eq!(pw.ttl, parsed.ttl);
         assert_eq!(pw.capability_hash, parsed.capability_hash);
         assert_eq!(pw.load_level, parsed.load_level);
+    }
+
+    /// Regression: BUG_REPORT.md #38 — `from_bytes` previously
+    /// coerced any unknown discriminant on the `health` byte (63)
+    /// into `HealthStatus::Unknown`. A single bit-flip in transit
+    /// could downgrade a peer to `Unknown`, which
+    /// `can_receive_traffic()` treats as unroutable — silent peer
+    /// eviction. The fix returns `None` on unknown discriminants
+    /// so the caller drops the malformed pingwave entirely.
+    #[test]
+    fn from_bytes_rejects_unknown_health_discriminant() {
+        let pw = EnhancedPingwave::new(make_node_id(1), 1, 3)
+            .with_load(64, HealthStatus::Healthy);
+        let mut bytes = pw.to_bytes().to_vec();
+
+        // Sanity: round-trip works at the legitimate value.
+        assert!(EnhancedPingwave::from_bytes(&bytes).is_some());
+
+        // Mutate the health byte to an out-of-range discriminant.
+        // 4..=255 are all unknown; sample a few across the range.
+        for bad in [4u8, 99, 200, 255] {
+            bytes[63] = bad;
+            assert!(
+                EnhancedPingwave::from_bytes(&bytes).is_none(),
+                "health discriminant {} should be rejected, not coerced (#38)",
+                bad
+            );
+        }
+
+        // The four legitimate values still round-trip.
+        for ok in 0u8..=3 {
+            bytes[63] = ok;
+            assert!(
+                EnhancedPingwave::from_bytes(&bytes).is_some(),
+                "health discriminant {} must still parse",
+                ok
+            );
+        }
     }
 
     #[test]

@@ -218,6 +218,11 @@ pub enum NetError {
     ShuttingDown = -8,
     /// Integer overflow: result does not fit in `c_int`.
     IntOverflow = -9,
+    /// Stream handle does not belong to the supplied node handle.
+    /// BUG_REPORT.md #19: previously the send-family FFIs accepted
+    /// any (stream, node) pair without verifying they were created
+    /// from the same node, allowing silent cross-session traffic.
+    MismatchedHandles = -10,
     /// Unknown error.
     Unknown = -99,
 }
@@ -915,6 +920,18 @@ pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
     // Bounded wait for in-flight ops to drain. Without a deadline, a
     // hung concurrent operation (e.g. `net_flush` against a stalled
     // adapter) would pin a CPU at 100% inside this loop forever.
+    //
+    // BUG_REPORT.md #29: `std::hint::spin_loop()` is a CPU pause
+    // hint, not a yield. On a single-threaded executor (or any
+    // configuration where the FFI caller's thread is the same one
+    // that needs to make progress on the in-flight async work) the
+    // tight spin starves the very tokio worker we're waiting for,
+    // *causing* the deadline to expire when it otherwise wouldn't.
+    // `thread::yield_now` lets the OS schedule whatever's blocked,
+    // and a 1ms `thread::sleep` between yields prevents the loop
+    // from saturating a CPU on platforms where `yield_now` is a
+    // near-no-op under low contention. The drain we expect to take
+    // milliseconds, so a millisecond-granularity poll is fine.
     let deadline = std::time::Instant::now() + FFI_SHUTDOWN_DEADLINE;
     let mut drained = false;
     loop {
@@ -929,7 +946,8 @@ pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
         if std::time::Instant::now() >= deadline {
             break;
         }
-        std::hint::spin_loop();
+        std::thread::yield_now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 
     if !drained {

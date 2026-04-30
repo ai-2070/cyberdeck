@@ -174,7 +174,16 @@ impl ReplicaGroup {
 
         if n > current {
             let requirements = daemon_factory().requirements();
-            let used_nodes: HashSet<u64> = self.coord.members().iter().map(|m| m.node_id).collect();
+            // BUG_REPORT.md #6: `used_nodes` must be `mut` and
+            // updated inside the loop. Without this insert,
+            // `place_with_spread` sees the same exclusion set
+            // every iteration and returns the same first
+            // non-excluded node — colocating every new replica
+            // on a single node, defeating the spread invariant.
+            // `fork_group.rs:185-199` already did this correctly;
+            // bring this loop into parity.
+            let mut used_nodes: HashSet<u64> =
+                self.coord.members().iter().map(|m| m.node_id).collect();
 
             for index in current..n {
                 let keypair = derive_replica_keypair(&self.config.group_seed, index);
@@ -183,6 +192,7 @@ impl ReplicaGroup {
 
                 let placement =
                     GroupCoordinator::place_with_spread(scheduler, &requirements, &used_nodes)?;
+                used_nodes.insert(placement.node_id);
 
                 let daemon = daemon_factory();
                 let host = DaemonHost::new(daemon, keypair, self.config.host_config.clone());
@@ -439,6 +449,41 @@ mod tests {
             .unwrap();
         assert_eq!(group.replica_count(), 4);
         assert_eq!(reg.count(), 4);
+    }
+
+    /// Regression: BUG_REPORT.md #6 — `scale_to` previously
+    /// computed `used_nodes` once before the placement loop and
+    /// never inserted the newly-chosen node id between iterations.
+    /// `place_with_spread` saw the same exclusion set every
+    /// iteration and returned the same first non-excluded node,
+    /// so every newly-added replica got colocated on a single
+    /// node — the spread invariant was silently violated.
+    /// `fork_group.rs:185-199` had the correct `used_nodes.insert`
+    /// pattern; this test pins `replica_group` to that contract.
+    #[test]
+    fn scale_up_does_not_colocate_new_replicas() {
+        let reg = DaemonRegistry::new();
+        let sched = make_scheduler();
+
+        // Start with 1 replica, scale to 4 — the test scheduler
+        // exposes 4 distinct nodes (0x1111..0x4444), so all 4
+        // replicas should land on distinct nodes.
+        let mut group =
+            ReplicaGroup::spawn(test_config(1), || Box::new(NoopDaemon), &sched, &reg).unwrap();
+
+        group
+            .scale_to(4, || Box::new(NoopDaemon), &sched, &reg)
+            .unwrap();
+
+        let node_ids: HashSet<u64> = group.replicas().iter().map(|r| r.node_id).collect();
+        assert_eq!(
+            node_ids.len(),
+            4,
+            "all 4 replicas should land on distinct nodes — \
+             colocation indicates BUG_REPORT.md #6 has regressed; \
+             got node ids {:?}",
+            group.replicas().iter().map(|r| r.node_id).collect::<Vec<_>>()
+        );
     }
 
     #[test]

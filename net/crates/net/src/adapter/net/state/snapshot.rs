@@ -345,6 +345,13 @@ impl StateSnapshot {
         }
 
         let state = Bytes::copy_from_slice(&cursor[..state_len]);
+        // BUG_REPORT.md #40: enforce strict length. The v1 path
+        // already does this; v0 silently accepted trailing bytes,
+        // which made the parser tolerant to corrupted / partial
+        // input that should be rejected.
+        if cursor.len() != state_len {
+            return None;
+        }
 
         // Validate internal consistency
         if chain_link.sequence != through_seq {
@@ -807,6 +814,49 @@ mod tests {
             *bytes.last().expect("at least one byte"),
             0,
             "envelope_flag must be zero when None",
+        );
+    }
+
+    /// Regression: BUG_REPORT.md #40 — `from_bytes_v0` previously
+    /// accepted trailing bytes past the declared `state_len`. The
+    /// v1 path enforces strict length; v0 silently accepted junk
+    /// after the state, masking corrupt or partial input that
+    /// should be rejected. This test pins v0 to the same
+    /// strict-length contract.
+    #[test]
+    fn from_bytes_v0_rejects_trailing_garbage() {
+        // Build a v0 snapshot via the same chain builder used by
+        // other tests so `chain_link.sequence == through_seq` and
+        // `chain_link.origin_hash == entity_id.origin_hash()` (the
+        // parser enforces both invariants and we want them both to
+        // pass — we're isolating the trailing-bytes check).
+        let kp = EntityKeypair::generate();
+        let mut builder = CausalChainBuilder::new(kp.origin_hash());
+        builder.append(Bytes::from_static(b"e1"), 0).unwrap();
+        let head = *builder.head();
+        let through_seq = head.sequence;
+        let state = b"state-bytes";
+
+        let mut buf = bytes::BytesMut::new();
+        use bytes::BufMut;
+        buf.put_slice(kp.entity_id().as_bytes());
+        buf.put_u64_le(through_seq);
+        buf.put_slice(&head.to_bytes());
+        buf.put_u64_le(12345);
+        buf.put_u32_le(state.len() as u32);
+        buf.put_slice(state);
+
+        // Sanity: the round-trip works as-is.
+        assert!(
+            StateSnapshot::from_bytes_v0(&buf).is_some(),
+            "valid v0 snapshot must parse"
+        );
+
+        // Append trailing junk. The strict-length check rejects.
+        buf.put_slice(b"trailing-junk");
+        assert!(
+            StateSnapshot::from_bytes_v0(&buf).is_none(),
+            "v0 must reject trailing bytes past state_len (#40)"
         );
     }
 }
