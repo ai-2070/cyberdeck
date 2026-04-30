@@ -1,0 +1,45 @@
+net/crates/net/src/adapter/net/behavior/loadbalance.rs
+  36b642b129ab4a5e 362-378,390-407,410-421,726-739,743-747,1796-1887
+net/crates/net/src/adapter/net/compute/standby_group.rs
+  36b642b129ab4a5e 269-278,288-292,657-729
+net/crates/net/src/adapter/net/continuity/superposition.rs
+  36b642b129ab4a5e 133-157,159-163,166-172,277-364
+net/crates/net/docs/BUG_AUDIT_2026_04_30_CORE.md
+  36b642b129ab4a5e 34,56-59
+  cc974ff94fda85ff 706-732,775-776
+net/crates/net/src/adapter/net/behavior/safety.rs
+  36b642b129ab4a5e 1246-1268,1882-1946
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "b86b98496218b0ad9487f7ab9a96fb696e34d46a",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 877,
+      "total_deletions": 1,
+      "accepted_lines": 464,
+      "overriden_lines": 0
+    },
+    "cc974ff94fda85ff": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "48816362-03f0-4069-83e8-b8d78ad3693f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 30,
+      "total_deletions": 1,
+      "accepted_lines": 29,
+      "overriden_lines": 0
+    }
+  }
+}
