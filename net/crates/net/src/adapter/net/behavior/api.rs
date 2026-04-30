@@ -58,6 +58,21 @@ impl ApiMethod {
     }
 }
 
+/// Maximum recursion depth permitted by [`SchemaType::validate`].
+///
+/// Closes BUG #109 — `SchemaType` is `#[derive(Deserialize)]`
+/// and contains recursive variants (`Array { items: Box<SchemaType> }`,
+/// `Object { properties: HashMap<_, SchemaType> }`,
+/// `AnyOf { schemas: Vec<SchemaType> }`). An attacker who can
+/// ship a schema (announcements broadcast over the mesh, or
+/// any caller that parses untrusted JSON into `SchemaType`)
+/// could submit a deeply-nested schema and crash the validator
+/// (and the whole process) via stack overflow when validate
+/// recursed without a bound. 128 is generous for realistic
+/// schemas (typical JSON Schemas rarely exceed depth 10) and
+/// well clear of the typical default 8 MB Linux stack.
+pub const MAX_SCHEMA_DEPTH: usize = 128;
+
 /// JSON Schema type definitions
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -293,8 +308,34 @@ impl SchemaType {
         self
     }
 
-    /// Validate a JSON value against this schema
+    /// Validate a JSON value against this schema.
+    ///
+    /// BUG #109: pre-fix, recursive variants (`Array`, `Object`,
+    /// `AnyOf`) called `validate` recursively with no depth
+    /// bound. An attacker who could ship a `SchemaType`
+    /// (announcements broadcast over the mesh, or any caller
+    /// that parses untrusted JSON into `SchemaType`) submitted
+    /// a deeply-nested schema and crashed the validator — and
+    /// the whole process — via stack overflow when a request
+    /// got validated against it. Now the recursion is bounded
+    /// by [`MAX_SCHEMA_DEPTH`]; exceeding it returns
+    /// [`ValidationError::RecursionLimitExceeded`] instead of
+    /// blowing the stack.
     pub fn validate(&self, value: &serde_json::Value) -> Result<(), ValidationError> {
+        self.validate_with_depth(value, 0)
+    }
+
+    /// Internal depth-bounded validate — see [`validate`].
+    fn validate_with_depth(
+        &self,
+        value: &serde_json::Value,
+        depth: usize,
+    ) -> Result<(), ValidationError> {
+        if depth >= MAX_SCHEMA_DEPTH {
+            return Err(ValidationError::RecursionLimitExceeded {
+                limit: MAX_SCHEMA_DEPTH,
+            });
+        }
         match (self, value) {
             (SchemaType::Null, serde_json::Value::Null) => Ok(()),
             (SchemaType::Null, _) => Err(ValidationError::TypeMismatch {
@@ -463,12 +504,20 @@ impl SchemaType {
                     }
                 }
                 for (i, v) in arr.iter().enumerate() {
-                    items
-                        .validate(v)
-                        .map_err(|e| ValidationError::ArrayItemError {
+                    if let Err(e) = items.validate_with_depth(v, depth + 1) {
+                        // Surface the recursion-limit signal
+                        // unwrapped — wrapping it in
+                        // `ArrayItemError` would obscure the
+                        // anti-DoS check from callers walking
+                        // the error chain.
+                        if matches!(e, ValidationError::RecursionLimitExceeded { .. }) {
+                            return Err(e);
+                        }
+                        return Err(ValidationError::ArrayItemError {
                             index: i,
                             error: Box::new(e),
-                        })?;
+                        });
+                    }
                 }
                 Ok(())
             }
@@ -495,12 +544,17 @@ impl SchemaType {
                 // Validate properties
                 for (key, val) in obj {
                     if let Some(schema) = properties.get(key) {
-                        schema
-                            .validate(val)
-                            .map_err(|e| ValidationError::PropertyError {
+                        if let Err(e) = schema.validate_with_depth(val, depth + 1) {
+                            // Same as Array — surface the
+                            // recursion-limit signal unwrapped.
+                            if matches!(e, ValidationError::RecursionLimitExceeded { .. }) {
+                                return Err(e);
+                            }
+                            return Err(ValidationError::PropertyError {
                                 property: key.clone(),
                                 error: Box::new(e),
-                            })?;
+                            });
+                        }
                     } else if !additional_properties {
                         return Err(ValidationError::UnknownProperty {
                             property: key.clone(),
@@ -526,11 +580,20 @@ impl SchemaType {
             }
 
             (SchemaType::AnyOf { schemas }, v) => {
+                let mut hit_recursion_limit = false;
                 for schema in schemas {
-                    if schema.validate(v).is_ok() {
-                        return Ok(());
+                    match schema.validate_with_depth(v, depth + 1) {
+                        Ok(()) => return Ok(()),
+                        Err(ValidationError::RecursionLimitExceeded { limit }) => {
+                            // Don't swallow the recursion-limit
+                            // signal — surface it instead of
+                            // converting to AnyOfFailed.
+                            return Err(ValidationError::RecursionLimitExceeded { limit });
+                        }
+                        Err(_) => {}
                     }
                 }
+                let _ = hit_recursion_limit;
                 Err(ValidationError::AnyOfFailed {
                     schema_count: schemas.len(),
                 })
@@ -637,6 +700,19 @@ pub enum ValidationError {
         /// Number of candidate schemas that were all tried and failed
         schema_count: usize,
     },
+    /// Schema recursion depth exceeded (anti-DoS guard).
+    ///
+    /// Returned by [`SchemaType::validate`] when the recursive
+    /// walk through nested `Array`/`Object`/`AnyOf` variants
+    /// exceeds [`MAX_SCHEMA_DEPTH`]. Closes BUG #109 — pre-fix
+    /// an attacker who could ship a `SchemaType` (announcements
+    /// broadcast over the mesh, or any caller parsing untrusted
+    /// JSON) could submit a deeply nested schema and crash the
+    /// validator (and the process) via stack overflow.
+    RecursionLimitExceeded {
+        /// The depth limit that was exceeded.
+        limit: usize,
+    },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -675,6 +751,9 @@ impl std::fmt::Display for ValidationError {
             }
             ValidationError::AnyOfFailed { schema_count } => {
                 write!(f, "value did not match any of {} schemas", schema_count)
+            }
+            ValidationError::RecursionLimitExceeded { limit } => {
+                write!(f, "schema recursion depth exceeded {}", limit)
             }
         }
     }
@@ -1765,6 +1844,71 @@ mod tests {
         let schema = SchemaType::array(SchemaType::integer());
         assert!(schema.validate(&serde_json::json!([1, 2, 3])).is_ok());
         assert!(schema.validate(&serde_json::json!([1, "two", 3])).is_err());
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #109: pre-fix
+    /// `SchemaType::validate` recursed without bound through
+    /// `Array { items }` / `Object { properties }` / `AnyOf { schemas }`.
+    /// An attacker who could ship a `SchemaType` (announcements
+    /// broadcast over the mesh, or any caller parsing untrusted
+    /// JSON) could submit a deeply-nested schema and crash the
+    /// process via stack overflow when a request was validated.
+    /// Post-fix: depth is bounded by `MAX_SCHEMA_DEPTH`;
+    /// exceeding it returns `RecursionLimitExceeded` instead.
+    ///
+    /// We pin the bound by constructing a schema deeper than the
+    /// limit (chained Array variants — each `Array { items: ... }`
+    /// adds one level of recursion). With a payload that walks
+    /// through every level, validate must surface the
+    /// recursion-limit error rather than blowing the stack.
+    #[test]
+    fn validate_returns_recursion_limit_error_on_deeply_nested_schema() {
+        // Build an Array<Array<Array<...<Integer>...>>> with
+        // depth = MAX_SCHEMA_DEPTH + 5 (well past the cap).
+        let mut schema = SchemaType::integer();
+        for _ in 0..MAX_SCHEMA_DEPTH + 5 {
+            schema = SchemaType::array(schema);
+        }
+
+        // Build a matching nested-array payload so each level
+        // descends into the next.
+        let mut value = serde_json::json!(1);
+        for _ in 0..MAX_SCHEMA_DEPTH + 5 {
+            value = serde_json::json!([value]);
+        }
+
+        // Pre-fix: stack overflow. Post-fix: bounded error.
+        let result = schema.validate(&value);
+        match result {
+            Err(ValidationError::RecursionLimitExceeded { limit }) => {
+                assert_eq!(limit, MAX_SCHEMA_DEPTH);
+            }
+            other => panic!(
+                "expected RecursionLimitExceeded, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Sanity: a schema at exactly `MAX_SCHEMA_DEPTH` levels of
+    /// nesting must still validate successfully (no false-positive
+    /// recursion error).
+    #[test]
+    fn validate_accepts_schema_at_recursion_limit() {
+        let mut schema = SchemaType::integer();
+        // depth = MAX_SCHEMA_DEPTH - 1 means the validator visits
+        // depth values 0..MAX_SCHEMA_DEPTH, all under the cap.
+        for _ in 0..(MAX_SCHEMA_DEPTH - 1) {
+            schema = SchemaType::array(schema);
+        }
+        let mut value = serde_json::json!(1);
+        for _ in 0..(MAX_SCHEMA_DEPTH - 1) {
+            value = serde_json::json!([value]);
+        }
+        assert!(
+            schema.validate(&value).is_ok(),
+            "schema right at the depth limit must still validate"
+        );
     }
 
     #[test]

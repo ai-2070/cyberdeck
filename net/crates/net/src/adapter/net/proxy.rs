@@ -290,6 +290,15 @@ impl NetProxy {
         // Update routing header (decrement TTL, increment hop count)
         let mut new_header = header;
         new_header.forward();
+        // BUG #119 (mirror of `router.rs:512` fix): drop here if
+        // forwarding made the TTL 0 — the next hop would just
+        // drop it on its own `is_expired()` check, wasting
+        // bandwidth and a queue slot.
+        if new_header.is_expired() {
+            self.packets_dropped.fetch_add(1, Ordering::Relaxed);
+            self.record_hop_drop(header.dest_id);
+            return ForwardResult::Dropped(ProxyError::TtlExpired);
+        }
 
         // Build forwarded packet with updated header
         let mut fwd_data = BytesMut::with_capacity(data.len());

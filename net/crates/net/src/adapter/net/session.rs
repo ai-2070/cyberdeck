@@ -568,6 +568,24 @@ impl NetSession {
             }
         }
 
+        // BUG #105: pre-fix, `recently_closed` only got
+        // garbage-collected by `is_grant_quarantined`, which is
+        // called from `mesh.rs:2770` only when an inbound
+        // `StreamWindow` grant arrives for that exact
+        // `stream_id`. A long-lived peer that opens/closes many
+        // distinct stream IDs (e.g., one short-lived stream per
+        // RPC) and never receives a late grant for each closed
+        // stream would accumulate one entry per closed stream
+        // forever — N streams/sec → ~N*T entries after T seconds,
+        // unbounded.
+        //
+        // Piggyback on this idle-stream sweep: drop any entry
+        // whose insertion time is past `GRANT_QUARANTINE_WINDOW`.
+        // The sweep itself is bounded by the existing eviction
+        // cadence so there's no extra wakeup cost.
+        self.recently_closed
+            .retain(|_, inserted_at| inserted_at.elapsed() < GRANT_QUARANTINE_WINDOW);
+
         evicted
     }
 
@@ -1518,6 +1536,52 @@ mod tests {
         let evicted = session.evict_idle_streams(Duration::from_nanos(u64::MAX), 1, "test");
         assert_eq!(evicted, 2);
         assert_eq!(session.stream_count(), 1);
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #105: pre-fix
+    /// `recently_closed` only got garbage-collected by
+    /// `is_grant_quarantined` on inbound `StreamWindow` grants.
+    /// A peer churning short-lived streams without receiving a
+    /// late grant for each accumulates one entry per closed
+    /// stream forever. Post-fix `evict_idle_streams` also
+    /// sweeps `recently_closed`, dropping entries past
+    /// `GRANT_QUARANTINE_WINDOW`.
+    #[test]
+    fn evict_idle_streams_sweeps_recently_closed_past_quarantine_window() {
+        let keys = test_keys();
+        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let session = NetSession::new(keys, peer_addr, 4, false);
+
+        // Manually pre-populate `recently_closed` with entries
+        // whose timestamps are well past the quarantine window.
+        let stale_inserted_at = Instant::now()
+            - GRANT_QUARANTINE_WINDOW
+            - Duration::from_secs(1);
+        session.recently_closed.insert(0xAAAA, stale_inserted_at);
+        session.recently_closed.insert(0xBBBB, stale_inserted_at);
+
+        // Add a fresh entry that should NOT be swept yet.
+        session.recently_closed.insert(0xFEEDC0DE, Instant::now());
+
+        assert_eq!(session.recently_closed.len(), 3);
+
+        // Run the sweep. No streams to evict (we didn't open
+        // any), but the recently_closed sweep should still fire.
+        session.evict_idle_streams(Duration::from_millis(1), usize::MAX, "test");
+
+        // Stale entries dropped; fresh entry kept.
+        assert!(
+            !session.recently_closed.contains_key(&0xAAAA),
+            "stale recently_closed entry past quarantine window must be swept"
+        );
+        assert!(
+            !session.recently_closed.contains_key(&0xBBBB),
+            "stale recently_closed entry past quarantine window must be swept"
+        );
+        assert!(
+            session.recently_closed.contains_key(&0xFEEDC0DE),
+            "fresh recently_closed entry within quarantine window must survive"
+        );
     }
 
     #[test]

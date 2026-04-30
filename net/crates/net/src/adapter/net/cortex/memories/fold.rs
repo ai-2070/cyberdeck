@@ -46,18 +46,37 @@ impl RedexFold<MemoriesState> for MemoriesFold {
             DISPATCH_MEMORY_STORED => {
                 let p: MemoryStoredPayload =
                     postcard::from_bytes(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
-                state.memories.insert(
-                    p.id,
-                    Memory {
-                        id: p.id,
-                        content: p.content,
-                        tags: p.tags,
-                        source: p.source,
-                        created_ns: p.now_ns,
-                        updated_ns: p.now_ns,
-                        pinned: false,
-                    },
-                );
+                // BUG #115: pre-fix this constructed a fresh
+                // `Memory { pinned: false, created_ns: p.now_ns,
+                // ... }` and `insert`ed it, silently replacing
+                // any existing entry. So `memories.store(42,
+                // "updated", ...)` after `memories.pin(42)`
+                // dropped the pin flag and overwrote the
+                // original creation timestamp — operator had no
+                // observable signal. Treat STORED as a content-
+                // update for an existing id: preserve `pinned`
+                // and `created_ns`, advance `updated_ns`, and
+                // overwrite the rest.
+                if let Some(existing) = state.memories.get_mut(&p.id) {
+                    existing.content = p.content;
+                    existing.tags = p.tags;
+                    existing.source = p.source;
+                    existing.updated_ns = p.now_ns;
+                    // pinned + created_ns intentionally preserved.
+                } else {
+                    state.memories.insert(
+                        p.id,
+                        Memory {
+                            id: p.id,
+                            content: p.content,
+                            tags: p.tags,
+                            source: p.source,
+                            created_ns: p.now_ns,
+                            updated_ns: p.now_ns,
+                            pinned: false,
+                        },
+                    );
+                }
             }
             DISPATCH_MEMORY_RETAGGED => {
                 let p: MemoryRetaggedPayload =

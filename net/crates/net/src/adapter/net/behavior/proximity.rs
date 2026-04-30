@@ -279,10 +279,21 @@ impl Clone for ProximityNode {
 impl ProximityNode {
     /// Create new proximity node from pingwave
     pub fn from_pingwave(pw: &EnhancedPingwave, addr: SocketAddr) -> Self {
+        // BUG #108: pre-fix used `pw.hop_count + 1` which
+        // panics in debug at u8::MAX and silently wraps to 0 in
+        // release. A buggy or malicious peer can advertise
+        // `hop_count == 255`, after which:
+        //   - Debug builds panic the receive loop.
+        //   - Release builds record `hops=0`, falsely promoting
+        //     the node to "directly connected" status — a
+        //     proximity-routing poisoning vector.
+        // saturating_add(1) keeps hops at 255 in the overflow
+        // case; combined with `MAX_HOPS` cap on routing
+        // installation, this is a non-poisoning floor.
         Self {
             node_id: pw.origin_id,
             addr,
-            hops: pw.hop_count + 1,
+            hops: pw.hop_count.saturating_add(1),
             latency_us: pw.latency_estimate_us(),
             last_seen: Instant::now(),
             last_seq: pw.seq,
@@ -297,10 +308,15 @@ impl ProximityNode {
 
     /// Update from new pingwave
     pub fn update_from_pingwave(&mut self, pw: &EnhancedPingwave, addr: SocketAddr) {
+        // BUG #108: same `+ 1` overflow as `from_pingwave`. Use
+        // `saturating_add` here too. The "better path" comparison
+        // also uses the saturated value so a 255-hop pingwave
+        // can never falsely beat a real path.
+        let new_hops = pw.hop_count.saturating_add(1);
         // Only update if newer sequence or better path
-        if pw.seq > self.last_seq || pw.hop_count + 1 < self.hops {
+        if pw.seq > self.last_seq || new_hops < self.hops {
             self.addr = addr;
-            self.hops = pw.hop_count + 1;
+            self.hops = new_hops;
             self.latency_us = pw.latency_estimate_us();
             self.last_seq = pw.seq;
         }
@@ -1080,6 +1096,53 @@ mod tests {
         // New sequence should work
         let pw3 = EnhancedPingwave::new(make_node_id(2), 2, 3);
         assert!(graph.on_pingwave(pw3, from).is_some());
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #108: pre-fix
+    /// `from_pingwave` and `update_from_pingwave` used raw
+    /// `pw.hop_count + 1`, which panics in debug at `u8::MAX`
+    /// and silently wraps to 0 in release. A peer advertising
+    /// `hop_count == 255` could either crash the receive loop
+    /// or falsely promote itself to "0 hops" (directly
+    /// connected) — a proximity-routing poisoning vector.
+    /// Post-fix uses `saturating_add(1)` so 255 stays at 255.
+    #[test]
+    fn proximity_node_from_pingwave_saturates_at_max_hop_count() {
+        let mut pw = EnhancedPingwave::new(make_node_id(2), 1, 3);
+        pw.hop_count = u8::MAX;
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        // Pre-fix this would panic in debug builds and wrap to
+        // 0 in release builds. Post-fix it saturates at 255.
+        let node = ProximityNode::from_pingwave(&pw, from);
+        assert_eq!(
+            node.hops,
+            u8::MAX,
+            "saturating_add must clamp at u8::MAX, NOT wrap to 0"
+        );
+        assert_ne!(node.hops, 0, "a 255-hop peer must NOT be reported as 0 hops");
+    }
+
+    #[test]
+    fn proximity_node_update_from_pingwave_saturates_at_max_hop_count() {
+        let mut pw_initial = EnhancedPingwave::new(make_node_id(2), 1, 3);
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let mut node = ProximityNode::from_pingwave(&pw_initial, from);
+        let initial_hops = node.hops;
+
+        // Update with hop_count = 255. Pre-fix this would panic
+        // in debug. Post-fix the saturated 255+1→255 keeps the
+        // existing (lower) hops in place — better path comparison
+        // correctly rejects the new pingwave.
+        pw_initial.hop_count = u8::MAX;
+        pw_initial.seq = 2; // newer seq so the update path runs
+        node.update_from_pingwave(&pw_initial, from);
+        // The "newer seq" branch updates regardless of hops, so
+        // hops should be the saturated 255.
+        assert_eq!(node.hops, u8::MAX);
+        // Sanity: no panic, no wrap to 0.
+        assert_ne!(node.hops, 0);
+        let _ = initial_hops; // suppress unused
     }
 
     #[test]

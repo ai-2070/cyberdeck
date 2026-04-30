@@ -779,3 +779,73 @@ async fn test_regression_snapshot_and_watch_forwards_divergent_stream_initial() 
         );
     }
 }
+
+/// Regression for BUG_AUDIT_2026_04_30_CORE.md #115: pre-fix
+/// `MemoriesFold::DISPATCH_MEMORY_STORED` constructed a fresh
+/// `Memory { pinned: false, created_ns: now_ns, ... }` and
+/// `insert`ed it, silently replacing any existing entry. So
+/// `memories.store(42, "updated", ...)` after `memories.pin(42)`
+/// dropped the pin flag and overwrote the original
+/// creation timestamp — operator had no observable signal that
+/// the pin was lost.
+///
+/// Post-fix: re-storing an existing id treats it as a content
+/// update — `pinned` and `created_ns` are preserved; `content`,
+/// `tags`, `source`, and `updated_ns` are overwritten.
+#[tokio::test]
+async fn re_store_preserves_pinned_flag_and_created_ns() {
+    let redex = Redex::new();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+
+    // 1. Initial store at created_ns=100.
+    memories
+        .store(
+            1,
+            "first content",
+            vec!["initial".into()],
+            "alice",
+            100,
+        )
+        .unwrap();
+    let seq = memories.pin(1, 110).unwrap();
+    memories.wait_for_seq(seq).await;
+
+    {
+        let state = memories.state();
+        let guard = state.read();
+        let m = guard.get(1).unwrap();
+        assert!(m.pinned, "memory must be pinned after pin()");
+        assert_eq!(m.created_ns, 100);
+        assert_eq!(m.content, "first content");
+    }
+
+    // 2. Re-store with new content at now_ns=200.
+    let seq = memories
+        .store(
+            1,
+            "updated content",
+            vec!["updated".into()],
+            "bob",
+            200,
+        )
+        .unwrap();
+    memories.wait_for_seq(seq).await;
+
+    let state = memories.state();
+    let guard = state.read();
+    let m = guard.get(1).unwrap();
+    // Pre-fix: pinned would be false, created_ns would be 200.
+    assert!(
+        m.pinned,
+        "pinned flag must be preserved across re-store"
+    );
+    assert_eq!(
+        m.created_ns, 100,
+        "created_ns must be preserved across re-store"
+    );
+    // Updated fields:
+    assert_eq!(m.content, "updated content");
+    assert_eq!(m.tags, vec!["updated".to_string()]);
+    assert_eq!(m.source, "bob");
+    assert_eq!(m.updated_ns, 200);
+}
