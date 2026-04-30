@@ -1,0 +1,41 @@
+net/crates/net/src/adapter/net/session.rs
+  36b642b129ab4a5e 571-588,1541-1586
+net/crates/net/docs/BUG_AUDIT_2026_04_30_CORE.md
+  36b642b129ab4a5e 34,60-66
+net/crates/net/src/adapter/net/swarm.rs
+  36b642b129ab4a5e 430-450,510-520,533-540,544-561,842-928
+net/crates/net/src/adapter/net/router.rs
+  36b642b129ab4a5e 513-524,863-949
+net/crates/net/src/adapter/net/behavior/proximity.rs
+  36b642b129ab4a5e 282-292,296,311-315,317,319,1101-1147
+net/crates/net/tests/integration_cortex_memories.rs
+  36b642b129ab4a5e 782-851
+net/crates/net/src/adapter/net/traversal/portmap/natpmp.rs
+  36b642b129ab4a5e 462-478,690-729
+net/crates/net/src/adapter/net/cortex/memories/fold.rs
+  36b642b129ab4a5e 49-79
+net/crates/net/src/adapter/net/proxy.rs
+  36b642b129ab4a5e 293-301
+net/crates/net/src/adapter/net/behavior/api.rs
+  36b642b129ab4a5e 61-75,311-323,325-338,507-516,519-520,547-553,556-557,583,585-593,596,703-715,755-757,1849-1913
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "4e4128770725c5d06abfad3b1881a281166e199b",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1771,
+      "total_deletions": 33,
+      "accepted_lines": 704,
+      "overriden_lines": 0
+    }
+  }
+}
