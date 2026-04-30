@@ -22,6 +22,8 @@ mod config;
 mod envelope;
 mod error;
 mod meta;
+#[cfg(feature = "cortex")]
+mod watermark;
 
 #[cfg(feature = "cortex")]
 pub mod memories;

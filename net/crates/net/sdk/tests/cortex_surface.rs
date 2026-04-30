@@ -20,6 +20,7 @@ async fn netdb_builder_bundles_both_adapters() {
         .with_tasks()
         .with_memories()
         .build()
+        .await
         .expect("builder completes");
 
     let t_seq = db.tasks().create(1, "write docs", 100).unwrap();
@@ -39,8 +40,8 @@ async fn standalone_adapter_opens_without_netdb() {
     // Users who only need one model can open it directly without the
     // NetDb facade. The re-export surface must cover this path.
     let redex = Redex::new();
-    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
-    let memories = MemoriesAdapter::open(&redex, ORIGIN).unwrap();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
 
     let seq = tasks.create(1, "hello", 100).unwrap();
     tasks.wait_for_seq(seq).await;
@@ -60,6 +61,7 @@ async fn snapshot_and_watch_round_trip() {
         .origin(ORIGIN)
         .with_tasks()
         .build()
+        .await
         .unwrap();
 
     let seq = db.tasks().create(1, "seed", 100).unwrap();
@@ -89,6 +91,7 @@ async fn netdb_snapshot_bundle_round_trips() {
         .with_tasks()
         .with_memories()
         .build()
+        .await
         .unwrap();
     let t_seq = db_a.tasks().create(1, "task", 100).unwrap();
     let m_seq = db_a
@@ -106,6 +109,7 @@ async fn netdb_snapshot_bundle_round_trips() {
         .with_tasks()
         .with_memories()
         .build_from_snapshot(&snapshot)
+        .await
         .unwrap();
 
     assert_eq!(db_b.tasks().count(), 1);

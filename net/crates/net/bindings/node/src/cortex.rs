@@ -593,6 +593,7 @@ impl TasksAdapter {
     pub async fn open(redex: &Redex, origin_hash: u32, persistent: Option<bool>) -> Result<Self> {
         let cfg = redex_config_from_persistent(persistent);
         let inner = InnerTasksAdapter::open_with_config(&redex.inner, origin_hash, cfg)
+            .await
             .map_err(|e| cortex_err("TasksAdapter open failed", e))?;
         Ok(Self {
             inner: Arc::new(inner),
@@ -618,6 +619,7 @@ impl TasksAdapter {
             state_bytes.as_ref(),
             last,
         )
+        .await
         .map_err(|e| cortex_err("TasksAdapter open_from_snapshot failed", e))?;
         Ok(Self {
             inner: Arc::new(inner),
@@ -1067,6 +1069,7 @@ impl MemoriesAdapter {
     pub async fn open(redex: &Redex, origin_hash: u32, persistent: Option<bool>) -> Result<Self> {
         let cfg = redex_config_from_persistent(persistent);
         let inner = InnerMemoriesAdapter::open_with_config(&redex.inner, origin_hash, cfg)
+            .await
             .map_err(|e| cortex_err("MemoriesAdapter open failed", e))?;
         Ok(Self {
             inner: Arc::new(inner),
@@ -1091,6 +1094,7 @@ impl MemoriesAdapter {
             state_bytes.as_ref(),
             last,
         )
+        .await
         .map_err(|e| cortex_err("MemoriesAdapter open_from_snapshot failed", e))?;
         Ok(Self {
             inner: Arc::new(inner),
@@ -1420,6 +1424,7 @@ impl NetDb {
             Some(TasksAdapter {
                 inner: Arc::new(
                     InnerTasksAdapter::open_with_config(&redex, config.origin_hash, cfg)
+                        .await
                         .map_err(|e| cortex_err("NetDb open tasks", e))?,
                 ),
             })
@@ -1430,6 +1435,7 @@ impl NetDb {
             Some(MemoriesAdapter {
                 inner: Arc::new(
                     InnerMemoriesAdapter::open_with_config(&redex, config.origin_hash, cfg)
+                        .await
                         .map_err(|e| cortex_err("NetDb open memories", e))?,
                 ),
             })
@@ -1458,8 +1464,10 @@ impl NetDb {
                     &bytes,
                     last_seq,
                 )
+                .await
                 .map_err(|e| cortex_err("NetDb restore tasks", e))?,
                 None => InnerTasksAdapter::open_with_config(&redex, config.origin_hash, cfg)
+                    .await
                     .map_err(|e| cortex_err("NetDb open tasks", e))?,
             };
             Some(TasksAdapter {
@@ -1478,8 +1486,10 @@ impl NetDb {
                     &bytes,
                     last_seq,
                 )
+                .await
                 .map_err(|e| cortex_err("NetDb restore memories", e))?,
                 None => InnerMemoriesAdapter::open_with_config(&redex, config.origin_hash, cfg)
+                    .await
                     .map_err(|e| cortex_err("NetDb open memories", e))?,
             };
             Some(MemoriesAdapter {

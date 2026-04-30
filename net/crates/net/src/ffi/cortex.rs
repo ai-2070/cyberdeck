@@ -494,10 +494,9 @@ pub extern "C" fn net_tasks_adapter_open(
     // needs a live reactor; run under our runtime.
     let rt = runtime();
     let redex_inner = redex.inner.clone();
-    let result =
-        rt.block_on(
-            async move { InnerTasksAdapter::open_with_config(&redex_inner, origin_hash, cfg) },
-        );
+    let result = rt.block_on(async move {
+        InnerTasksAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
+    });
     match result {
         Ok(adapter) => {
             let handle = Box::new(TasksAdapterHandle {
@@ -977,7 +976,7 @@ pub extern "C" fn net_memories_adapter_open(
     let rt = runtime();
     let redex_inner = redex.inner.clone();
     let result = rt.block_on(async move {
-        InnerMemoriesAdapter::open_with_config(&redex_inner, origin_hash, cfg)
+        InnerMemoriesAdapter::open_with_config(&redex_inner, origin_hash, cfg).await
     });
     match result {
         Ok(adapter) => {

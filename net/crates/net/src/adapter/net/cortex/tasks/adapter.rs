@@ -14,7 +14,8 @@ use super::super::adapter::CortexAdapter;
 use super::super::config::CortexAdapterConfig;
 use super::super::envelope::EventEnvelope;
 use super::super::error::CortexAdapterError;
-use super::super::meta::{compute_checksum, EventMeta, EVENT_META_SIZE};
+use super::super::meta::{compute_checksum, EventMeta};
+use super::super::watermark::WatermarkingFold;
 use super::dispatch::{
     DISPATCH_TASK_COMPLETED, DISPATCH_TASK_CREATED, DISPATCH_TASK_DELETED, DISPATCH_TASK_RENAMED,
     TASKS_CHANNEL,
@@ -59,10 +60,15 @@ pub struct TasksAdapter {
     /// Producer identity stamped on every `EventMeta`.
     origin_hash: u32,
     /// Monotonic per-origin counter for `EventMeta::seq_or_ts`.
-    /// Starts at 0 and increments on every ingest through this
-    /// handle. This gives deterministic fold order for the stream of
-    /// events produced by this TasksAdapter instance.
-    app_seq: AtomicU64,
+    /// Shared with the inner [`WatermarkingFold`] wrapper around
+    /// [`TasksFold`] (BUG #148): the fold task advances this counter
+    /// via `fetch_max(seq_or_ts + 1)` for every replayed event whose
+    /// `origin_hash` matches ours, so reopening against a Redex with
+    /// pre-existing same-origin events produces a counter that's
+    /// already past every assigned `seq_or_ts` by the time the
+    /// constructor returns. `ingest_typed` then load-and-CAS-commits
+    /// against the same atomic.
+    app_seq: Arc<AtomicU64>,
 }
 
 impl TasksAdapter {
@@ -71,13 +77,20 @@ impl TasksAdapter {
     /// Uses [`TASKS_CHANNEL`] (`"cortex/tasks"`). Replays the full
     /// history into state on open; subsequent events are appended to
     /// the same channel.
-    pub fn open(redex: &Redex, origin_hash: u32) -> Result<Self, CortexAdapterError> {
-        Self::open_with_config(redex, origin_hash, RedexFileConfig::default())
+    ///
+    /// `async` because the constructor awaits the fold task's catch-up
+    /// before returning (BUG #148): the inner [`WatermarkingFold`]
+    /// observes every replayed event's `EventMeta` and advances
+    /// `app_seq` past any pre-existing same-origin `seq_or_ts`, so
+    /// the first `ingest_typed` after `open` cannot collide with an
+    /// already-stored event.
+    pub async fn open(redex: &Redex, origin_hash: u32) -> Result<Self, CortexAdapterError> {
+        Self::open_with_config(redex, origin_hash, RedexFileConfig::default()).await
     }
 
     /// Like [`Self::open`] but with a caller-supplied `RedexFileConfig`
     /// (useful for `persistent: true` or custom retention).
-    pub fn open_with_config(
+    pub async fn open_with_config(
         redex: &Redex,
         origin_hash: u32,
         redex_config: RedexFileConfig,
@@ -87,18 +100,32 @@ impl TasksAdapter {
                 e.to_string(),
             ))
         })?;
+        let app_seq = Arc::new(AtomicU64::new(0));
+        let fold = WatermarkingFold::new(TasksFold, app_seq.clone(), origin_hash);
         let inner = CortexAdapter::open(
             redex,
             &name,
             redex_config,
             CortexAdapterConfig::default(),
-            TasksFold,
+            fold,
             TasksState::new(),
         )?;
+
+        // Wait for the fold task to catch up so the wrapper has
+        // observed every pre-existing event before any caller-driven
+        // ingest can race against it. `redex.open_file` is idempotent
+        // (returns the same handle the inner adapter already holds),
+        // so re-opening here is cheap.
+        let file = redex.open_file(&name, redex_config)?;
+        let next_seq = file.next_seq();
+        if next_seq > 0 {
+            inner.wait_for_seq(next_seq - 1).await;
+        }
+
         Ok(Self {
             inner,
             origin_hash,
-            app_seq: AtomicU64::new(0),
+            app_seq,
         })
     }
 
@@ -258,7 +285,9 @@ impl TasksAdapter {
 
     /// Open the tasks adapter from a snapshot, skipping replay of
     /// events up through `last_seq`.
-    pub fn open_from_snapshot(
+    ///
+    /// See [`Self::open`] for why this is `async`.
+    pub async fn open_from_snapshot(
         redex: &Redex,
         origin_hash: u32,
         state_bytes: &[u8],
@@ -271,11 +300,12 @@ impl TasksAdapter {
             state_bytes,
             last_seq,
         )
+        .await
     }
 
     /// Like [`Self::open_from_snapshot`] but with a caller-supplied
     /// `RedexFileConfig` (e.g. for `persistent: true`).
-    pub fn open_from_snapshot_with_config(
+    pub async fn open_from_snapshot_with_config(
         redex: &Redex,
         origin_hash: u32,
         redex_config: RedexFileConfig,
@@ -287,44 +317,39 @@ impl TasksAdapter {
         })?;
         let name = ChannelName::new(TASKS_CHANNEL)
             .map_err(|e| CortexAdapterError::Redex(RedexError::Channel(e.to_string())))?;
+
+        // Pre-load the snapshot's persisted counter into the shared
+        // atomic. Pre-fix the typed adapter then walked the post-
+        // `last_seq` tail synchronously to bump the counter past any
+        // events written between snapshot capture and close. Now the
+        // wrapper fold does that work as part of its replay pass,
+        // avoiding the doubled IO/CPU (BUG #148).
+        let app_seq = Arc::new(AtomicU64::new(payload.app_seq));
+        let fold = WatermarkingFold::new(TasksFold, app_seq.clone(), origin_hash);
         let inner = CortexAdapter::open_from_snapshot(
             redex,
             &name,
             redex_config,
             CortexAdapterConfig::default(),
-            TasksFold,
+            fold,
             &payload.inner,
             last_seq,
         )?;
 
-        // Restore the app_seq counter so post-restore events continue
-        // per-origin monotonic sequencing. If the file has events for
-        // this origin with seq > last_seq (periodic-snapshot-while-
-        // ingesting pattern), the fold task will replay them, but
-        // THEIR seq_or_ts values have already been assigned — we
-        // must bump the counter past the highest one of our origin
-        // to avoid duplicates on the next ingest.
-        let mut app_seq = payload.app_seq;
-        let replay_start = last_seq.map(|s| s + 1).unwrap_or(0);
+        // Wait for the wrapper fold to observe every replay-tail
+        // event before returning. `next_seq` may be `last_seq + 1`
+        // (no post-snapshot writes) in which case the wait is a
+        // no-op fast path inside `wait_for_seq`.
         let file = redex.open_file(&name, redex_config)?;
-        let replay_end = file.next_seq();
-        if replay_start < replay_end {
-            for ev in file.read_range(replay_start, replay_end) {
-                if ev.payload.len() < EVENT_META_SIZE {
-                    continue;
-                }
-                if let Some(meta) = EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE]) {
-                    if meta.origin_hash == origin_hash && meta.seq_or_ts >= app_seq {
-                        app_seq = meta.seq_or_ts + 1;
-                    }
-                }
-            }
+        let next_seq = file.next_seq();
+        if next_seq > 0 {
+            inner.wait_for_seq(next_seq - 1).await;
         }
 
         Ok(Self {
             inner,
             origin_hash,
-            app_seq: AtomicU64::new(app_seq),
+            app_seq,
         })
     }
 

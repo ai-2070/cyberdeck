@@ -22,6 +22,7 @@ async fn test_netdb_build_with_both_models() {
         .with_tasks()
         .with_memories()
         .build()
+        .await
         .unwrap();
 
     assert!(db.try_tasks().is_some());
@@ -35,6 +36,7 @@ async fn test_netdb_build_with_only_tasks() {
         .origin(ORIGIN)
         .with_tasks()
         .build()
+        .await
         .unwrap();
 
     assert!(db.try_tasks().is_some());
@@ -48,6 +50,7 @@ async fn test_netdb_crud_through_tasks_handle() {
         .origin(ORIGIN)
         .with_tasks()
         .build()
+        .await
         .unwrap();
 
     let tasks = db.tasks();
@@ -69,6 +72,7 @@ async fn test_netdb_find_many_on_tasks_state() {
         .origin(ORIGIN)
         .with_tasks()
         .build()
+        .await
         .unwrap();
 
     for i in 1..=10u64 {
@@ -120,6 +124,7 @@ async fn test_netdb_find_many_on_memories_state() {
         .origin(ORIGIN)
         .with_memories()
         .build()
+        .await
         .unwrap();
 
     db.memories()
@@ -197,6 +202,7 @@ async fn test_netdb_whole_snapshot_and_restore() {
             .with_tasks()
             .with_memories()
             .build()
+            .await
             .unwrap();
 
         db.tasks().create(1, "alpha", 100).unwrap();
@@ -225,6 +231,7 @@ async fn test_netdb_whole_snapshot_and_restore() {
         .with_tasks()
         .with_memories()
         .build_from_snapshot(&restored)
+        .await
         .unwrap();
 
     // Tasks state restored.
@@ -259,6 +266,7 @@ async fn test_netdb_build_from_empty_snapshot_is_fresh_open() {
         .with_tasks()
         .with_memories()
         .build_from_snapshot(&empty)
+        .await
         .unwrap();
     assert_eq!(db.tasks().count(), 0);
     assert_eq!(db.memories().count(), 0);
@@ -272,6 +280,7 @@ async fn test_netdb_close_is_idempotent() {
         .with_tasks()
         .with_memories()
         .build()
+        .await
         .unwrap();
 
     db.close().unwrap();
@@ -286,6 +295,7 @@ async fn test_netdb_tasks_without_with_tasks_panics() {
         .origin(ORIGIN)
         .with_memories()
         .build()
+        .await
         .unwrap();
     // Should panic — tasks weren't enabled.
     let _ = db.tasks();
@@ -322,7 +332,8 @@ async fn test_regression_build_from_snapshot_error_path_is_clean() {
         .origin(ORIGIN)
         .with_tasks()
         .with_memories()
-        .build_from_snapshot(&corrupt_bundle);
+        .build_from_snapshot(&corrupt_bundle)
+        .await;
     assert!(
         first.is_err(),
         "corrupt memories snapshot must cause build to fail"
@@ -334,6 +345,7 @@ async fn test_regression_build_from_snapshot_error_path_is_clean() {
         .with_tasks()
         .with_memories()
         .build()
+        .await
         .unwrap();
     assert!(db.try_tasks().is_some());
     assert!(db.try_memories().is_some());
