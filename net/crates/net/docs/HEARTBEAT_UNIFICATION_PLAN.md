@@ -39,24 +39,60 @@ The two latent footguns behind #106 (parallel pools, parallel ciphers) are gone.
 
 The four steps below are *cleanup* — they do not fix new bugs, but they remove ~30 lines of duplication and prevent regression.
 
-### Step 1 — Move `verify_heartbeat_aead` from `mesh.rs` to `session.rs` (or to a shared module) and rewrite the legacy receive path to call it
+### Step 1 — Replace `verify_heartbeat_aead` (predicate) with `NetSession::verify_and_touch_heartbeat` (mutating method)
 
-`verify_heartbeat_aead` (`mesh.rs:760-771`) is a free function that operates on `(&ParsedPacket, &NetSession)`. It belongs alongside the session it verifies against, not inside the mesh module. Moving it (and exposing it `pub(crate)`) lets the legacy path replace 22 lines (`mod.rs:659-680`) with:
+The current shape — a free `verify_heartbeat_aead(&parsed, &session) -> bool` predicate where each caller is then responsible for calling `session.touch()` — has a footgun: a caller can verify and forget to touch (or touch before verify completes, or touch on a failed verify). The type system doesn't prevent it. Both current callers happen to do it correctly, but a future third caller has no structural guarantee.
+
+Move to a mutating method on `NetSession` that fuses verify + touch atomically:
 
 ```rust
+impl NetSession {
+    /// Verify an inbound heartbeat's AEAD tag against this session's
+    /// RX cipher, commit the counter into the replay window, and
+    /// refresh `last_activity`. Returns `true` if the packet was
+    /// accepted; the session is mutated only on success.
+    ///
+    /// Source-address validation and any failure-detector observation
+    /// remain the caller's responsibility — those policies vary by
+    /// adapter (legacy has 1:1 source/session; mesh has
+    /// session-id-keyed lookup) and don't belong inside the helper.
+    pub fn verify_and_touch_heartbeat(&self, parsed: &ParsedPacket) -> bool {
+        let aad = parsed.header.aad();
+        let counter = u64::from_le_bytes(
+            parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8])
+        );
+        if !self.rx_cipher.is_valid_rx_counter(counter) { return false; }
+        if self.rx_cipher.decrypt(counter, &aad, &parsed.payload).is_err() {
+            return false;
+        }
+        if !self.rx_cipher.update_rx_counter(counter) { return false; }
+        self.touch();
+        true
+    }
+}
+```
+
+After the move, both receive paths collapse:
+
+```rust
+// legacy — mod.rs:659-680
 if parsed.header.flags.is_heartbeat() {
-    if source != session.peer_addr() {
-        return;
-    }
-    if !verify_heartbeat_aead(&parsed, &session) {
-        return;
-    }
-    session.touch();
+    if source != session.peer_addr() { return; }
+    if !session.verify_and_touch_heartbeat(&parsed) { return; }
+    return;
+}
+
+// mesh — mesh.rs:2500-2522
+if parsed.header.flags.is_heartbeat() {
+    if !session.verify_and_touch_heartbeat(&parsed) { return; }
+    failure_detector.heartbeat(peer_node_id, source);
     return;
 }
 ```
 
-Why keep the source check at the call site, not inside the helper: mesh dispatch resolves the session by `session_id` first (so it doesn't have a single canonical "expected source"), while the legacy adapter has exactly one peer per session. Centralizing the source check would force the helper to either accept `Option<SocketAddr>` or duplicate again. The cheapest fix is to leave the source-check at the legacy call site and let the helper own the AEAD-only portion that's actually shared.
+The legacy path drops from 22 lines to 4. Mesh drops the inline `session.touch()`. The two genuinely-different parts (source check / failure detector) remain at the call sites where they belong.
+
+Delete `verify_heartbeat_aead` (`mesh.rs:760-771`) and its tests' usages migrate to the new method.
 
 ### Step 2 — Wrap the build-side two-liner in `NetSession::build_heartbeat()`
 
@@ -96,21 +132,21 @@ Add a CI grep (or a `compile_fail` test) asserting that no `*.rs` file outside `
 
 ## What's deliberately not done
 
-- **`Session::verify_inbound_heartbeat` (the original Step 1 of this plan).** The receive paths diverge enough — mesh's session lookup precedes verify; legacy's source check precedes verify; only mesh wants `failure_detector.heartbeat` after verify — that an opinionated "verify and touch" wrapper either needs flags (failure detector? source check?) or duplicates state-mutation logic in the caller anyway. The simpler `verify_heartbeat_aead(&parsed, &session) -> bool` predicate (currently in `mesh.rs`) covers the actually-shared portion and lets each caller compose the rest. Step 1 above moves that helper to its proper home rather than escalating it into a method.
 - **#56** (JetStream cross-process nonce) — different layer.
-- **Subnet-gateway heartbeat handling** — gateways don't process heartbeats today.
+- **Subnet-gateway heartbeat handling** — gateways don't process heartbeats today; if that changes, the new code must use `NetSession::verify_and_touch_heartbeat` rather than re-rolling the verify+touch sequence.
 
 ## Risks
 
 - **`pub` → `pub(crate)` on `PacketBuilder::new`.** Any external caller breaks. The constructor is not in the documented SDK surface, but the bindings (`bindings/`, `sdk*/`) need a quick grep before flipping.
-- **Moving `verify_heartbeat_aead` out of `mesh.rs`.** Tests at `mesh.rs:7407, 7424, 7676, 7682, 7698, 7702` reference the symbol via `super::*`. They keep working as long as the symbol is re-exported `pub(crate)` from its new location and the mesh module imports it. Verify the test imports compile after the move.
+- **Replacing `verify_heartbeat_aead` with a mutating method.** Tests at `mesh.rs:7407, 7424, 7676, 7682, 7698, 7702` currently call the predicate and assert its return value. After Step 1 the equivalent assertions read `assert!(session.verify_and_touch_heartbeat(&parsed))` — but they now also need to assert `last_activity` advanced (round-trip) or did NOT advance (forged) since touch is fused into the call. The existing legacy-side test at `mod.rs:1786` already covers exactly that pattern, so the mesh-side tests can mirror it.
 
 ## Acceptance criteria for the remaining work
 
-- Legacy receive path (`mod.rs:659-680`) calls a single shared `verify_heartbeat_aead`-style helper rather than re-implementing AEAD verify.
+- Both receive paths call `session.verify_and_touch_heartbeat(&parsed)` — verify + touch fused, no caller can forget one half.
 - Both build sites read `let packet = session.build_heartbeat();` (single line each).
 - `PacketBuilder::new` is `pub(crate)`.
-- Existing regression tests still pass; no new tests required for the cleanup itself (the helper is exercised by the same tests that already pin #85 and #97).
+- `verify_heartbeat_aead` (free function in `mesh.rs`) is gone.
+- Mesh-side tests assert `last_activity` advances on accept and stays put on reject (mirrors existing legacy-side coverage at `mod.rs:1786`); other regression tests for #85 and #97 continue to pass.
 
 ## Status
 
@@ -120,7 +156,7 @@ Add a CI grep (or a `compile_fail` test) asserting that no `*.rs` file outside `
 | Mesh receive-side fix (#85) — `verify_heartbeat_aead` helper | ✅ done |
 | Drop `Session::tx_cipher` / `Session::packet_pool` getters | ✅ done |
 | Regression tests for #85 and #97 | ✅ done |
-| 1 — Move `verify_heartbeat_aead` to `session.rs`, port legacy receive to call it | outstanding |
+| 1 — Replace `verify_heartbeat_aead` predicate with `NetSession::verify_and_touch_heartbeat` (verify + touch fused), port both receive sites | outstanding |
 | 2 — `NetSession::build_heartbeat()` wrapper, port both build sites | outstanding |
 | 3 — `PacketBuilder::new` → `pub(crate)` | outstanding |
 | 4 — Static check / CI grep | outstanding |
