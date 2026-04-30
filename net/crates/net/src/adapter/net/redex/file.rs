@@ -447,11 +447,13 @@ impl RedexFile {
         }
 
         // Commit to memory. Pre-validated capacity → infallible.
+        // One `append_many` call instead of N `append` calls: a
+        // single bounds check and a single reserve.
+        state
+            .segment
+            .append_many(payloads)
+            .expect("pre-validated capacity; segment append cannot fail under the state lock");
         for event in &events {
-            state
-                .segment
-                .append(&event.payload)
-                .expect("pre-validated capacity; segment append cannot fail under the state lock");
             state.index.push(event.entry);
             state.timestamps.push(ts);
         }
@@ -638,12 +640,13 @@ impl RedexFile {
             }
         }
 
-        // Commit to memory.
+        // Commit to memory. One `append_many` call instead of N
+        // `append` calls.
+        state
+            .segment
+            .append_many(payloads)
+            .expect("pre-validated capacity; segment append cannot fail under the state lock");
         for event in &events {
-            state
-                .segment
-                .append(&event.payload)
-                .expect("pre-validated capacity; segment append cannot fail under the state lock");
             state.index.push(event.entry);
             state.timestamps.push(ts);
         }

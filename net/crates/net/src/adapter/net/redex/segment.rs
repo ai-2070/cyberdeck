@@ -75,6 +75,30 @@ impl HeapSegment {
         Ok(offset)
     }
 
+    /// Append every payload in `payloads` in order. Returns the
+    /// absolute offset the FIRST payload was written at; subsequent
+    /// payloads land at successive offsets.
+    ///
+    /// Performs one bounds check against the total size and one
+    /// `reserve` before extending — equivalent to N `append` calls
+    /// but with a single capacity check and a single allocation
+    /// when the buffer needs to grow.
+    pub fn append_many(&mut self, payloads: &[Bytes]) -> Result<u64, RedexError> {
+        let total: usize = payloads.iter().map(|p| p.len()).sum();
+        if self.buf.len().saturating_add(total) > MAX_SEGMENT_BYTES {
+            return Err(RedexError::PayloadTooLarge {
+                size: total,
+                max: MAX_SEGMENT_BYTES.saturating_sub(self.buf.len()),
+            });
+        }
+        let first = self.base_offset + self.buf.len() as u64;
+        self.buf.reserve(total);
+        for p in payloads {
+            self.buf.extend_from_slice(p);
+        }
+        Ok(first)
+    }
+
     /// Read `len` bytes starting at absolute `offset`. Returns `None`
     /// if the slice is not fully contained in the live region
     /// (evicted or past end).
@@ -203,5 +227,61 @@ mod tests {
         assert_eq!(evicted, 3);
         assert_eq!(seg.base_offset(), 3);
         assert_eq!(seg.live_bytes(), 0);
+    }
+
+    #[test]
+    fn test_append_many_basic() {
+        let mut seg = HeapSegment::new();
+        // Pre-fill so the returned offset isn't 0 — pins that
+        // `append_many` honors the existing buffer length.
+        let pre = seg.append(b"prefix").unwrap();
+        assert_eq!(pre, 0);
+
+        let payloads: Vec<Bytes> = vec![
+            Bytes::from_static(b"alpha"),
+            Bytes::from_static(b"beta"),
+            Bytes::from_static(b"gamma"),
+        ];
+        let first = seg.append_many(&payloads).unwrap();
+        assert_eq!(first, 6, "first payload offset == prefix len");
+
+        // Each payload must be readable at first + sum(prev lens).
+        assert_eq!(seg.read(6, 5).unwrap().as_ref(), b"alpha");
+        assert_eq!(seg.read(11, 4).unwrap().as_ref(), b"beta");
+        assert_eq!(seg.read(15, 5).unwrap().as_ref(), b"gamma");
+        assert_eq!(seg.live_bytes(), 6 + 5 + 4 + 5);
+    }
+
+    #[test]
+    fn test_append_many_capacity_exceeded() {
+        let mut seg = HeapSegment::new();
+        // One huge payload (1 GiB) so the first append succeeds, then
+        // a batch whose total pushes us past `MAX_SEGMENT_BYTES` (3
+        // GiB). This is the multi-payload bounds-check path that a
+        // per-payload loop would not catch until partway through.
+        let big = vec![0u8; 1024 * 1024 * 1024];
+        seg.append(&big).unwrap();
+        seg.append(&big).unwrap();
+        seg.append(&big).unwrap();
+        // Now at MAX exactly. A two-payload batch totaling 2 bytes
+        // must still be rejected.
+        let payloads: Vec<Bytes> =
+            vec![Bytes::from_static(b"x"), Bytes::from_static(b"y")];
+        assert!(matches!(
+            seg.append_many(&payloads),
+            Err(RedexError::PayloadTooLarge { .. })
+        ));
+        // And the buffer state stayed clean — no partial extension.
+        assert_eq!(seg.live_bytes(), MAX_SEGMENT_BYTES);
+    }
+
+    #[test]
+    fn test_append_many_empty_returns_current_end() {
+        let mut seg = HeapSegment::new();
+        seg.append(b"xyz").unwrap();
+        // Empty batch is a no-op that returns the current end offset.
+        let off = seg.append_many(&[]).unwrap();
+        assert_eq!(off, 3);
+        assert_eq!(seg.live_bytes(), 3);
     }
 }
