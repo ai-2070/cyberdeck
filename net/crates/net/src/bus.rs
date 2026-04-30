@@ -98,7 +98,7 @@ pub struct EventBus {
     /// Configuration.
     config: EventBusConfig,
     /// Statistics.
-    stats: EventBusStats,
+    stats: Arc<EventBusStats>,
     /// Scaling monitor task handle.
     scaling_monitor: parking_lot::Mutex<Option<JoinHandle<()>>>,
 }
@@ -143,7 +143,23 @@ pub struct EventBusStats {
     /// Events dropped due to backpressure.
     pub events_dropped: AtomicU64,
     /// Batches dispatched to adapter.
+    ///
+    /// Pre-fix this field was declared but never incremented anywhere
+    /// — `flush()`'s Phase 2 progress probe (`bus.rs:815`) read it as
+    /// "did the BatchWorker make progress this `max_delay` window?",
+    /// observed `0 == 0`, and always early-broke after a single
+    /// window. On Windows-class timer resolution the race against the
+    /// BatchWorker's first `recv_timeout` tipped the wrong way for
+    /// `flush_is_a_delivery_barrier` regularly. Now incremented in
+    /// the BatchWorker spawn (after a successful `dispatch_batch`)
+    /// and in `remove_shard_internal`'s stranded-flush.
     pub batches_dispatched: AtomicU64,
+    /// Total events dispatched to the adapter (sum of batch lengths
+    /// from successful `on_batch` calls). Companion to
+    /// `batches_dispatched` — by the time `flush()` returns,
+    /// `events_dispatched + events_dropped == events_ingested`. FFI
+    /// consumers can also use this to monitor end-to-end delivery.
+    pub events_dispatched: AtomicU64,
 }
 
 impl EventBus {
@@ -216,6 +232,11 @@ impl EventBus {
         let shutdown = Arc::new(AtomicBool::new(false));
         let drain_finalize_ready = Arc::new(AtomicBool::new(false));
 
+        // Stats are shared with every BatchWorker spawn so successful
+        // dispatches increment `batches_dispatched` / `events_dispatched`
+        // — `flush()`'s Phase 2 progress probe gates on those.
+        let stats = Arc::new(EventBusStats::default());
+
         // Create batch workers for each shard
         let mut batch_workers: std::collections::HashMap<u16, ShardWorkers> =
             std::collections::HashMap::with_capacity(config.num_shards as usize);
@@ -236,6 +257,7 @@ impl EventBus {
                 adapter_timeout: config.adapter_timeout,
                 batch_retries: config.adapter_batch_retries,
                 next_sequence: next_sequence.clone(),
+                stats: stats.clone(),
             });
 
             let drain = spawn_drain_worker_for_shard(
@@ -268,7 +290,7 @@ impl EventBus {
             in_flight_ingests: AtomicU32::new(0),
             shutdown_completed: AtomicBool::new(false),
             config,
-            stats: EventBusStats::default(),
+            stats,
             scaling_monitor: parking_lot::Mutex::new(None),
         };
 
@@ -358,6 +380,7 @@ impl EventBus {
             adapter_timeout: self.config.adapter_timeout,
             batch_retries: self.config.adapter_batch_retries,
             next_sequence: next_sequence.clone(),
+            stats: self.stats.clone(),
         });
 
         self.batch_senders.write().insert(new_id, tx.clone());
@@ -539,6 +562,12 @@ impl EventBus {
             )
             .await;
             if dispatched {
+                self.stats
+                    .batches_dispatched
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                self.stats
+                    .events_dispatched
+                    .fetch_add(count as u64, AtomicOrdering::Relaxed);
                 tracing::info!(
                     shard_id,
                     count,
@@ -770,18 +799,33 @@ impl EventBus {
             backoff = (backoff * 2).min(Duration::from_millis(10));
         }
 
-        // Phase 2: wait for the per-shard mpsc channels to be
-        // empty. We approximate this by sleeping `batch.max_delay`
-        // — the batch worker's `recv_timeout` cap — at least once
-        // per shard's worth of pending batch state, so any
-        // partially-filled batch has a chance to time out and
-        // dispatch.
+        // Phase 2: wait until every event ingested before flush()
+        // started has been handed to the adapter via `on_batch`.
+        // Snapshot the `events_ingested` counter at flush entry —
+        // that's our target. We then poll `events_dispatched` (sum
+        // of batch lengths from successful adapter dispatches) plus
+        // `events_dropped` (events the adapter rejected after retry
+        // exhaustion or that never made it past backpressure). The
+        // barrier is met when `events_dispatched + events_dropped >=
+        // target`: every pre-flush ingest is accounted for in one
+        // bucket or the other.
         //
-        // We can't directly observe channel depth (mpsc::Receiver
-        // doesn't expose len without consuming), so use the
-        // worst-case timing: `max_delay` per outstanding batch
-        // worker. With the default 10 ms `max_delay` and a
-        // typical 8-shard config, that's ~80 ms.
+        // This is a true delivery barrier — it doesn't rely on
+        // "no progress this window" heuristics that race a
+        // BatchWorker whose `batch_start` was set just before
+        // flush() ran (BUG #16 originally fixed the
+        // single-`max_delay` sleep, but the post-fix progress
+        // gate read `batches_dispatched` which was declared but
+        // never incremented anywhere — see BUG #157 — and Windows
+        // timer resolution made the race a frequent flake).
+        let target_ingested = self.stats.events_ingested.load(AtomicOrdering::Acquire);
+        let dropped_at_start = self.stats.events_dropped.load(AtomicOrdering::Acquire);
+
+        // Outer deadline still bounds Phase 2 in case a wedged
+        // adapter never returns. `max_delay * num_workers` is the
+        // worst-case shape (one partially-filled batch per worker,
+        // each waiting its full `max_delay` to time out), capped at
+        // 2 s — same upper bound as before.
         let n_workers = self.batch_workers.lock().len();
         let phase2_budget = self
             .config
@@ -790,37 +834,40 @@ impl EventBus {
             .saturating_mul(n_workers.max(1) as u32);
         let phase2_deadline =
             tokio::time::Instant::now() + phase2_budget.min(Duration::from_secs(2));
-        // Sleep one `max_delay` window at a time. After each sleep,
-        // gate the early-break on the bus-level `batches_dispatched`
-        // counter being unchanged across the window — that's the
-        // load-bearing "no batch worker made progress this window"
-        // signal.
-        //
-        // BUG #76: pre-fix this used `all_shards_empty()` (a
-        // ring-buffer-fill probe) which Phase 1 had already drained,
-        // so the check was constant-true after the first sleep
-        // and Phase 2 always exited after exactly ONE `max_delay`
-        // — collapsing the documented multi-worker budget back to
-        // the single-window behavior #16 was supposed to replace.
-        // A flush-as-barrier caller on a many-shard config (default
-        // 8+) returning during a partial-batch dispatch saw the
-        // pre-#16 silent loss.
-        //
-        // The new gate: read `batches_dispatched` before each sleep,
-        // sleep one `max_delay`, then early-break only if the
-        // counter hasn't moved AND the ring buffers are still
-        // empty (defense-in-depth — a producer push during the
-        // window means new batches will appear and we shouldn't
-        // exit yet).
-        let mut last_dispatched = self.stats.batches_dispatched.load(AtomicOrdering::Acquire);
-        while tokio::time::Instant::now() < phase2_deadline {
-            tokio::time::sleep(self.config.batch.max_delay).await;
-            let now_dispatched = self.stats.batches_dispatched.load(AtomicOrdering::Acquire);
-            let dispatched_progress = now_dispatched != last_dispatched;
-            last_dispatched = now_dispatched;
-            if !dispatched_progress && self.shard_manager.all_shards_empty() {
+
+        // Inner poll cadence: re-check the counters every 1 ms (or
+        // `max_delay / 16`, whichever is larger). The fast cadence
+        // means we exit promptly once the BatchWorker dispatches,
+        // rather than waking exactly once per `max_delay` and
+        // potentially racing the dispatch by a few ms.
+        let poll_interval = (self.config.batch.max_delay / 16).max(Duration::from_millis(1));
+        loop {
+            let dispatched = self.stats.events_dispatched.load(AtomicOrdering::Acquire);
+            let dropped = self.stats.events_dropped.load(AtomicOrdering::Acquire);
+            // `dropped - dropped_at_start` is the number of events
+            // dropped *during* flush() (e.g. an adapter that
+            // exhausted retries on a pre-flush ingest). Those count
+            // toward the barrier — the corresponding `events_ingested`
+            // bumps already happened pre-flush so the dispatched
+            // bucket and the dropped-during-flush bucket together
+            // must catch up to `target_ingested` for the barrier to
+            // be met.
+            let dropped_during_flush = dropped.saturating_sub(dropped_at_start);
+            if dispatched.saturating_add(dropped_during_flush) >= target_ingested
+                && self.shard_manager.all_shards_empty()
+            {
                 break;
             }
+            if tokio::time::Instant::now() >= phase2_deadline {
+                tracing::warn!(
+                    target = target_ingested,
+                    dispatched,
+                    dropped = dropped.saturating_sub(dropped_at_start),
+                    "flush: Phase 2 deadline reached before all ingested events were dispatched",
+                );
+                break;
+            }
+            tokio::time::sleep(poll_interval).await;
         }
 
         // Phase 3: tell the adapter to flush whatever it has
@@ -1319,6 +1366,15 @@ struct BatchWorkerParams {
     /// `ShardWorkers::next_sequence` for the consumer side and
     /// BUG #153 for the rationale.
     next_sequence: Arc<AtomicU64>,
+    /// Bus-level stats. The worker increments
+    /// `batches_dispatched` and `events_dispatched` after every
+    /// successful `dispatch_batch`. Pre-fix `batches_dispatched`
+    /// was declared on `EventBusStats` but never incremented, so
+    /// `flush()`'s Phase 2 progress probe always observed zero
+    /// progress and early-broke after a single `max_delay` window
+    /// — racing the BatchWorker's first `recv_timeout` and
+    /// flaking on Windows-class timer resolution.
+    stats: Arc<EventBusStats>,
 }
 
 fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
@@ -1331,6 +1387,7 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
         adapter_timeout,
         batch_retries,
         next_sequence,
+        stats,
     } = params;
     tokio::spawn(async move {
         let mut worker = BatchWorker::new(shard_id, config.clone(), next_sequence);
@@ -1347,6 +1404,7 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
             match tokio::time::timeout(recv_timeout, rx.recv()).await {
                 Ok(Some(events)) => {
                     if let Some(batch) = worker.add_events(events) {
+                        let batch_len = batch.len() as u64;
                         if dispatch_batch(
                             &*adapter,
                             batch,
@@ -1356,6 +1414,10 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                         )
                         .await
                         {
+                            stats.batches_dispatched.fetch_add(1, AtomicOrdering::Relaxed);
+                            stats
+                                .events_dispatched
+                                .fetch_add(batch_len, AtomicOrdering::Relaxed);
                             if let Some(shard_ref) = shard_manager.shard(shard_id) {
                                 shard_ref.lock().record_batch_dispatch();
                             }
@@ -1367,14 +1429,21 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                     if worker.has_pending() {
                         let batch = worker.flush();
                         if !batch.is_empty() {
-                            dispatch_batch(
+                            let batch_len = batch.len() as u64;
+                            if dispatch_batch(
                                 &*adapter,
                                 batch,
                                 shard_id,
                                 adapter_timeout,
                                 batch_retries,
                             )
-                            .await;
+                            .await
+                            {
+                                stats.batches_dispatched.fetch_add(1, AtomicOrdering::Relaxed);
+                                stats
+                                    .events_dispatched
+                                    .fetch_add(batch_len, AtomicOrdering::Relaxed);
+                            }
                         }
                     }
                     break;
@@ -1382,6 +1451,7 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                 Err(_) => {
                     // Timeout - check if we need to flush
                     if let Some(batch) = worker.add_events(vec![]) {
+                        let batch_len = batch.len() as u64;
                         if dispatch_batch(
                             &*adapter,
                             batch,
@@ -1391,6 +1461,10 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
                         )
                         .await
                         {
+                            stats.batches_dispatched.fetch_add(1, AtomicOrdering::Relaxed);
+                            stats
+                                .events_dispatched
+                                .fetch_add(batch_len, AtomicOrdering::Relaxed);
                             if let Some(shard_ref) = shard_manager.shard(shard_id) {
                                 shard_ref.lock().record_batch_dispatch();
                             }
@@ -2015,6 +2089,57 @@ mod tests {
             "flush() returned but only {delivered} of {successes} \
              events reached the adapter (#16); flush waited {:?}",
             elapsed
+        );
+
+        bus.shutdown().await.unwrap();
+    }
+
+    /// Regression for BUG #157: `EventBusStats::batches_dispatched`
+    /// (and the new `events_dispatched`) must actually increment on
+    /// every successful adapter dispatch. Pre-fix `batches_dispatched`
+    /// was declared but never updated, so flush()'s Phase 2 progress
+    /// gate was constant-zero and early-broke after one window —
+    /// flake on Windows-class timer resolution. Pin both counters
+    /// directly here so a future refactor that drops the increment
+    /// fails this test, not the timing-dependent
+    /// `flush_is_a_delivery_barrier`.
+    #[tokio::test]
+    async fn dispatch_increments_bus_level_event_and_batch_counters() {
+        let received = Arc::new(AtomicU64::new(0));
+        let adapter: Box<dyn crate::adapter::Adapter> = Box::new(CountingAdapter {
+            received: received.clone(),
+        });
+
+        let config = EventBusConfig::builder()
+            .num_shards(2)
+            .ring_buffer_capacity(1024)
+            .batch(crate::config::BatchConfig {
+                min_size: 1,
+                max_size: 10,
+                max_delay: Duration::from_millis(10),
+                adaptive: false,
+                velocity_window: Duration::from_millis(100),
+            })
+            .build()
+            .unwrap();
+        let bus = EventBus::new_with_adapter(config, adapter).await.unwrap();
+
+        for i in 0..50 {
+            bus.ingest(Event::new(json!({"i": i}))).unwrap();
+        }
+        bus.flush().await.unwrap();
+
+        let batches = bus.stats().batches_dispatched.load(AtomicOrdering::Acquire);
+        let events = bus.stats().events_dispatched.load(AtomicOrdering::Acquire);
+        assert!(
+            batches > 0,
+            "batches_dispatched must be > 0 after flush — pre-fix it was \
+             never incremented anywhere, breaking flush()'s Phase 2 progress gate",
+        );
+        assert_eq!(
+            events, 50,
+            "events_dispatched must equal the number of events handed to \
+             the adapter (got {events}, expected 50)",
         );
 
         bus.shutdown().await.unwrap();
