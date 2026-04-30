@@ -585,61 +585,88 @@ impl DiskSegment {
         if self.fail_next_append.swap(false, Ordering::AcqRel) {
             return Err(RedexError::Io("test-injected append failure".into()));
         }
-        let mut dat = self.dat_file.lock();
-        let dat_pre_len = dat.metadata().map_err(RedexError::io)?.len();
-        for (entry, payload) in entries_and_payloads {
+
+        // Build one contiguous buffer per file in a single pass, then
+        // issue one `write_all` per file. A batch of N entries used to
+        // emit 3·N syscalls (one per entry per file); now it emits at
+        // most 3. Write order — dat → idx → ts — is preserved so
+        // recovery's torn-tail logic still holds: a crash mid-batch
+        // can only leave dat ahead of idx (or idx ahead of ts), never
+        // the reverse.
+        let total_dat: usize = entries_and_payloads
+            .iter()
+            .filter(|(e, _)| !e.is_inline())
+            .map(|(_, p)| p.len())
+            .sum();
+        let mut dat_buf: Vec<u8> = Vec::with_capacity(total_dat);
+        let mut idx_buf: Vec<u8> =
+            Vec::with_capacity(entries_and_payloads.len() * REDEX_ENTRY_SIZE);
+        let mut ts_buf: Vec<u8> = Vec::with_capacity(timestamps.len() * 8);
+        for ((entry, payload), &t) in entries_and_payloads.iter().zip(timestamps) {
             if !entry.is_inline() {
-                if let Err(e) = dat.write_all(payload) {
-                    drop(dat);
-                    let dat_path = self.dir.join("dat");
-                    if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                        let _ = f.set_len(dat_pre_len);
-                    }
-                    return Err(RedexError::io(e));
-                }
+                dat_buf.extend_from_slice(payload);
             }
+            idx_buf.extend_from_slice(&entry.to_bytes());
+            ts_buf.extend_from_slice(&t.to_le_bytes());
         }
-        drop(dat);
+
+        // Skip dat entirely when every entry is inline. Track
+        // `dat_pre_len` only when we actually wrote, so the idx/ts
+        // rollback paths know whether a dat truncation is needed.
+        let dat_pre_len: Option<u64> = if !dat_buf.is_empty() {
+            let mut dat = self.dat_file.lock();
+            let pre_len = dat.metadata().map_err(RedexError::io)?.len();
+            if let Err(e) = dat.write_all(&dat_buf) {
+                drop(dat);
+                let dat_path = self.dir.join("dat");
+                if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
+                    let _ = f.set_len(pre_len);
+                }
+                return Err(RedexError::io(e));
+            }
+            drop(dat);
+            Some(pre_len)
+        } else {
+            None
+        };
 
         let mut idx = self.idx_file.lock();
         let idx_pre_len = idx.metadata().map_err(RedexError::io)?.len();
-        for (entry, _) in entries_and_payloads {
-            if let Err(e) = idx.write_all(&entry.to_bytes()) {
-                drop(idx);
-                let idx_path = self.dir.join("idx");
-                if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
-                    let _ = f.set_len(idx_pre_len);
-                }
+        if let Err(e) = idx.write_all(&idx_buf) {
+            drop(idx);
+            let idx_path = self.dir.join("idx");
+            if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
+                let _ = f.set_len(idx_pre_len);
+            }
+            if let Some(pre_len) = dat_pre_len {
                 let dat_path = self.dir.join("dat");
                 if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                    let _ = f.set_len(dat_pre_len);
+                    let _ = f.set_len(pre_len);
                 }
-                return Err(RedexError::io(e));
             }
+            return Err(RedexError::io(e));
         }
         drop(idx);
 
-        // Persist timestamps. Same rollback discipline as the
-        // single-entry path.
         let mut ts = self.ts_file.lock();
         let ts_pre_len = ts.metadata().map_err(RedexError::io)?.len();
-        for &t in timestamps {
-            if let Err(e) = ts.write_all(&t.to_le_bytes()) {
-                drop(ts);
-                let ts_path = self.dir.join("ts");
-                if let Ok(f) = OpenOptions::new().write(true).open(&ts_path) {
-                    let _ = f.set_len(ts_pre_len);
-                }
-                let idx_path = self.dir.join("idx");
-                if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
-                    let _ = f.set_len(idx_pre_len);
-                }
+        if let Err(e) = ts.write_all(&ts_buf) {
+            drop(ts);
+            let ts_path = self.dir.join("ts");
+            if let Ok(f) = OpenOptions::new().write(true).open(&ts_path) {
+                let _ = f.set_len(ts_pre_len);
+            }
+            let idx_path = self.dir.join("idx");
+            if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
+                let _ = f.set_len(idx_pre_len);
+            }
+            if let Some(pre_len) = dat_pre_len {
                 let dat_path = self.dir.join("dat");
                 if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                    let _ = f.set_len(dat_pre_len);
+                    let _ = f.set_len(pre_len);
                 }
-                return Err(RedexError::io(e));
             }
+            return Err(RedexError::io(e));
         }
         drop(ts);
 
@@ -1436,6 +1463,138 @@ mod tests {
              positions of the surviving entries; pre-fix this would \
              have been [1000, 2000, 3000]"
         );
+
+        cleanup(&base);
+    }
+
+    /// Mixed heap + inline batch round-trip through the buffered
+    /// `append_entries_at` path. The disk-layer batch API stitches
+    /// `dat_buf` from heap payloads only while idx/ts cover every
+    /// entry; this test pins three things at once:
+    ///   1. inline payloads do NOT leak into dat,
+    ///   2. heap-payload bytes land at the offsets their idx records
+    ///      claim,
+    ///   3. each per-entry timestamp pairs with the matching idx
+    ///      record on reopen.
+    /// A zip-mismatch or wrong-buffer regression would surface as
+    /// either a checksum failure on reopen or a misaligned timestamp.
+    #[test]
+    fn test_disk_batch_mixed_heap_and_inline_roundtrip() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/batch_mixed").unwrap();
+
+        let h1 = b"heap-one";
+        let inline_a = *b"inline_A"; // 8 bytes
+        let h2 = b"heap-two-longer";
+        let inline_b = *b"inline_B";
+
+        let h1_off = 0u32;
+        let h2_off = h1_off + h1.len() as u32;
+
+        let entries = [
+            (
+                RedexEntry::new_heap(10, h1_off, h1.len() as u32, 0, payload_checksum(h1)),
+                h1.as_slice(),
+            ),
+            (
+                RedexEntry::new_inline(11, &inline_a, payload_checksum(&inline_a)),
+                inline_a.as_slice(),
+            ),
+            (
+                RedexEntry::new_heap(12, h2_off, h2.len() as u32, 0, payload_checksum(h2)),
+                h2.as_slice(),
+            ),
+            (
+                RedexEntry::new_inline(13, &inline_b, payload_checksum(&inline_b)),
+                inline_b.as_slice(),
+            ),
+        ];
+        let timestamps = [11_000u64, 22_000, 33_000, 44_000];
+
+        {
+            let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+            recovered
+                .disk
+                .append_entries_at(&entries, &timestamps)
+                .unwrap();
+            recovered.disk.sync().unwrap();
+        }
+
+        // dat must contain exactly h1 || h2 — inline bytes must NOT
+        // have been appended to the dat buffer during stitching.
+        let dat_path = channel_dir(&base, &name).join("dat");
+        let dat_bytes = std::fs::read(&dat_path).unwrap();
+        assert_eq!(dat_bytes.len(), h1.len() + h2.len());
+        assert_eq!(&dat_bytes[..h1.len()], h1);
+        assert_eq!(&dat_bytes[h1.len()..], h2);
+
+        // Reopen: all four entries survive with their correct seqs,
+        // inline flags, and timestamps.
+        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let seqs: Vec<u64> = recovered.index.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![10, 11, 12, 13]);
+        assert!(!recovered.index[0].is_inline());
+        assert!(recovered.index[1].is_inline());
+        assert!(!recovered.index[2].is_inline());
+        assert!(recovered.index[3].is_inline());
+        let ts = recovered.timestamps.expect("ts sidecar present");
+        assert_eq!(ts, vec![11_000, 22_000, 33_000, 44_000]);
+
+        cleanup(&base);
+    }
+
+    /// All-inline batch must skip the dat lock entirely (the new
+    /// `dat_pre_len: Option<u64>` branch). dat file stays at zero
+    /// bytes; idx and ts both receive their batched writes.
+    #[test]
+    fn test_disk_batch_all_inline_skips_dat() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/batch_all_inline").unwrap();
+
+        let p1 = *b"alpha___";
+        let p2 = *b"beta____";
+        let p3 = *b"gamma___";
+        let entries = [
+            (
+                RedexEntry::new_inline(0, &p1, payload_checksum(&p1)),
+                p1.as_slice(),
+            ),
+            (
+                RedexEntry::new_inline(1, &p2, payload_checksum(&p2)),
+                p2.as_slice(),
+            ),
+            (
+                RedexEntry::new_inline(2, &p3, payload_checksum(&p3)),
+                p3.as_slice(),
+            ),
+        ];
+        let timestamps = [100u64, 200, 300];
+
+        {
+            let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+            recovered
+                .disk
+                .append_entries_at(&entries, &timestamps)
+                .unwrap();
+            recovered.disk.sync().unwrap();
+        }
+
+        // dat file was created by `open` but should still be empty —
+        // no heap payloads means the dat write path was skipped.
+        let dat_path = channel_dir(&base, &name).join("dat");
+        assert_eq!(
+            std::fs::metadata(&dat_path).unwrap().len(),
+            0,
+            "all-inline batch must not write to dat"
+        );
+
+        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        assert_eq!(recovered.index.len(), 3);
+        for e in &recovered.index {
+            assert!(e.is_inline());
+        }
+        let ts = recovered.timestamps.expect("ts sidecar present");
+        assert_eq!(ts, vec![100, 200, 300]);
 
         cleanup(&base);
     }

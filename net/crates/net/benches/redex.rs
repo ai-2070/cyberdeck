@@ -176,6 +176,35 @@ fn bench_append_disk(c: &mut Criterion) {
     group.finish();
 }
 
+// Disk batch append. Targets the buffered-write path in
+// `DiskSegment::append_entries_inner`: a batch of N entries should
+// emit at most 3 syscalls (one each to dat / idx / ts), not 3·N.
+#[cfg(feature = "redex-disk")]
+fn bench_append_batch_disk(c: &mut Criterion) {
+    let mut group = c.benchmark_group("redex_append_batch_disk");
+    let tmp = tempdir_prefix("redex_bench_batch_disk");
+    const BATCH: usize = 64;
+    group.throughput(Throughput::Elements(BATCH as u64));
+
+    for &size in &[64usize, 1024] {
+        group.bench_with_input(
+            BenchmarkId::new(format!("batch_{}_x", BATCH), size),
+            &size,
+            |b, &s| {
+                let r = Redex::new().with_persistent_dir(&tmp);
+                let cfg = RedexFileConfig::default().with_persistent(true);
+                let name = cn(&format!("bench/disk_batch/{}/{}", s, rand_suffix()));
+                let f = r.open_file(&name, cfg).unwrap();
+                let payloads: Vec<Bytes> =
+                    (0..BATCH).map(|_| Bytes::from(vec![0xEE; s])).collect();
+                b.iter(|| f.append_batch(&payloads).unwrap());
+            },
+        );
+    }
+
+    group.finish();
+}
+
 #[cfg(feature = "redex-disk")]
 fn tempdir_prefix(prefix: &str) -> std::path::PathBuf {
     let mut dir = std::env::temp_dir();
@@ -237,6 +266,7 @@ criterion_group!(
     bench_append_watcher_paths,
     bench_append_batch,
     bench_append_disk,
+    bench_append_batch_disk,
     bench_tail_latency,
 );
 
