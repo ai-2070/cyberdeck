@@ -11,9 +11,19 @@ Extended scope (#80 onward): a follow-up multi-agent sweep added point-checks ac
 - `adapter/net/subnet/gateway.rs`
 - `adapter/net/contested/correlation.rs`
 
+Extended scope (#97 onward): a third multi-agent sweep covered the remaining UDP transport, behavior, compute, and continuity/state subtrees the prior pass left out of scope.
+- `adapter/net/{mod.rs, session.rs, pool.rs, reliability.rs, failure.rs, crypto.rs, protocol.rs}`
+- `adapter/net/{swarm.rs, route.rs, reroute.rs, proxy.rs, router.rs, traversal/classify.rs}`
+- `adapter/net/behavior/{safety.rs, loadbalance.rs, capability.rs, proximity.rs, api.rs, rules.rs}`
+- `adapter/net/compute/{orchestrator.rs, standby_group.rs, migration_target.rs, migration_source.rs}`
+- `adapter/net/subprotocol/migration_handler.rs`
+- `adapter/net/continuity/{chain.rs, superposition.rs, discontinuity.rs}`
+- `adapter/net/cortex/memories/fold.rs`
+- `adapter/net/traversal/portmap/natpmp.rs`
+
 ## Status (running tally)
 
-**Outstanding:** #55, #56, #57, #58, #59, #60, #61, #62, #63, #64, #65, #66, #67, #68, #69, #70, #71, #72, #73, #74, #75, #76, #77, #78, #79, #80, #81, #82, #83, #84, #85, #86, #87, #88, #89, #90, #91, #92, #93, #94, #95, #96
+**Outstanding:** #55, #56, #57, #58, #59, #60, #61, #62, #63, #64, #65, #66, #67, #68, #69, #70, #71, #72, #73, #74, #75, #76, #77, #78, #79, #80, #81, #82, #83, #84, #85, #86, #87, #88, #89, #90, #91, #92, #93, #94, #95, #96, #97, #98, #99, #100, #101, #102, #103, #104, #105, #106, #107, #108, #109, #110, #111, #112, #113, #114, #115, #116, #117, #118, #119, #120
 
 ## High
 
@@ -138,6 +148,61 @@ In both `append_entry_inner` and `append_entries_inner`, the `pre_*_len = file.m
 
 `sweep_retention` mutates in-memory state (drains `index`, `timestamps`, calls `evict_prefix_to`) before invoking `disk.compact_to`. If `compact_to` fails, the function logs a warning and returns `Ok(())` — but in-memory state has already evicted the head, while on-disk dat/idx/ts still contain everything. On the next reopen, recovery replays the full on-disk state, resurrecting the entries that were just evicted in memory. The inline comment on ~line 992 acknowledges the divergence but treats it as benign; combined with #92 it becomes a corruption vector (post-failure appends now interleave with resurrected entries on disk). Either roll back in-memory eviction on `compact_to` failure, or perform the disk compaction first and only mutate in-memory state on success.
 
+### 97. Legacy `NetAdapter` builds heartbeats with an all-zero key — every heartbeat fails AEAD verify on the receiver
+**File:** `adapter/net/mod.rs:841`
+
+```rust
+let mut builder = PacketBuilder::new(&[0u8; 32], session.session_id());
+let packet = builder.build_heartbeat();
+```
+
+`build_heartbeat` (`pool.rs:251`) AEAD-encrypts an empty payload with the builder's cipher. The builder is constructed with key `&[0u8; 32]`, so the on-wire Poly1305 tag is computed under key=0. The receiver in `process_packet` (`mod.rs:646-662`) verifies the tag with `session.rx_cipher()`, which holds the real session key derived from the Noise handshake. Verification therefore fails on every legitimate heartbeat → drop at line 657 → `session.touch()` is never called via heartbeats. The regression test at `mod.rs:1742` builds the heartbeat with the **real** `init_keys.tx_key` (line 1760) and asserts `touch()` runs; the production sender path uses `&[0u8; 32]` and would fail that same assertion. Inverse of #11 (heartbeat now AEAD-tagged on receive, but the sender uses the wrong key). Distinct from #85 — that one is the mesh-dispatch receiver fast-path skipping AEAD; this one is the legacy single-peer adapter sender. Pass `session.tx_cipher` key or wire heartbeat through the same pool builder used for data packets.
+
+### 98. `ContinuityProof::verify_against` only checks the two endpoint events, never validates the chain in between
+**File:** `adapter/net/continuity/chain.rs:103-137`
+
+`verify_against` recomputes the parent hashes for the events at `from_seq` and `to_seq` and asserts they match the proof's `from_hash` / `to_hash`. It never iterates the events between those two anchors and never verifies that consecutive `parent_hash` chains link up. A peer can claim a continuity proof spanning `from=0, to=1000` while having lost or fabricated events 1..999, and verification still passes as long as the two endpoints hash correctly. There is also no check that `from_seq <= to_seq` — reversed bounds are accepted. **Failure scenario:** node A produces a 1000-event chain. A malicious intermediary holding only events 0 and 999 builds a proof with the correct two endpoint hashes; B's `verify_against` accepts it and propagates "continuous chain from 0 to 999" even though the middle is missing. This is the primary continuity-bypass vector — exactly what the proof was supposed to prevent. Walk the event range, verify each `parent_hash` chains to the previous, and bound the iteration to a sane maximum.
+
+### 99. `SuperpositionState::continuity_proof` constructs a proof with backward-pointing parent hashes (verify will always fail)
+**File:** `adapter/net/continuity/superposition.rs:133-141`
+
+```rust
+ContinuityProof {
+    origin_hash: self.origin_hash,
+    from_seq: self.source_head.sequence.min(self.target_head.sequence),
+    to_seq:   self.source_head.sequence.max(self.target_head.sequence),
+    from_hash: self.source_head.parent_hash,
+    to_hash:   self.target_head.parent_hash,
+}
+```
+
+`CausalLink::parent_hash` is the **backward**-pointing predecessor hash. But `ContinuityProof::verify_against` (`chain.rs:110`) computes `compute_parent_hash(&event.link, &event.payload)` for the event at `from_seq` — the **forward**-pointing self hash. These are different bytes. The proof can never verify correctly against any log built from the same chain. Compounding: when `target_head.sequence < source_head.sequence` (the common case during Replay), `from_seq` is target's seq but `from_hash` is source's predecessor hash — mixing identities. **Failure scenario:** every migration that enters Replay phase advertises a continuity proof; every peer that runs `verify_against` rejects it; meshes treat the migration as `Forked` / `Unverifiable` and either refuse routing or trigger spurious re-bootstrapping. Use `compute_parent_hash(&head.link, &head.payload)` for both endpoints, and clamp the from/to ordering to a single direction.
+
+### 100. `LocalGraph::on_pingwave` lets unverified peers poison node addresses and flood the node DashMap
+**File:** `adapter/net/swarm.rs:489-531`
+
+A pingwave's `addr` field is taken from the forwarder's `from` socket address and stored unconditionally as `LocalGraph.nodes[origin_id].addr` (line 513). Any peer forwarding a pingwave for `origin_id=Y` overwrites Y's recorded address with the forwarder's address. A malicious peer can also flood pingwaves with arbitrary `origin_id` values (8 random bytes per packet), growing `LocalGraph.nodes` (line 517) and `seen_pingwaves` (line 502) at line-rate; cleanup runs on a 30s/10s timer, so per-window growth is bounded only by link bandwidth. `mesh.rs` route-install gates on `addr_to_node` (rule 4 at `mesh.rs:2181`), but `LocalGraph` itself has no such gate, and is exported as a public API in `mod.rs:146`. **Adverse outcome:** route-address poisoning + memory exhaustion from any peer that completes the cheap mesh-handshake gate. AEAD-verify pingwave origin / forwarder identity before insert, and cap `nodes`/`seen_pingwaves` size with an LRU policy.
+
+### 101. Half-open probe slot leaks via `is_circuit_open`'s filter-time side effect — the breaker becomes permanently stuck
+**File:** `adapter/net/behavior/loadbalance.rs:365-381` (claim) + `682-688, 720` (consumers)
+
+`is_circuit_open` is *both* a predicate AND has a side effect: when the recovery window has elapsed it CAS's `half_open_probe` from `false→true`, claiming the probe slot for whoever asked, and only `record_completion` ever clears it. But `is_circuit_open` is invoked from `get_available_endpoints` (line 720) — i.e. every endpoint the load balancer is filtering — so a single `select()` call with N circuit-open endpoints past their recovery window claims the probe slot on **all N** of them, while only one (or zero) endpoint will actually be selected. The N-1 others have `half_open_probe=true` with no in-flight request, no timer, and no completion path; the slot leaks and every subsequent `is_circuit_open` returns true forever for those endpoints. A second leak: even on the chosen endpoint, if `try_record_request` (line 684) legitimately fails (max-conn cap, race), the retry loop continues without clearing the slot. **Adverse outcome:** any cluster with >1 endpoint on long-running load — the first post-recovery `select()` after a multi-endpoint outage permanently strands every endpoint except the one chosen, and the chosen endpoint also strands itself if `try_record_request` happens to fail. The breaker recovery flow is practically un-recoverable until process restart. Either separate "test if open" from "claim probe", or guarantee the slot is released along every path that claims it.
+
+### 102. `SafetyEnforcer::release` underflows resource counters in `EnforcementMode::Disabled`
+**File:** `adapter/net/behavior/safety.rs:997-1003, 1245-1251`
+
+`acquire()` short-circuits in `Disabled` mode and returns a `ResourceGuard` **without** incrementing any usage counter (lines 997-1003). When the guard drops, `release()` unconditionally calls raw `fetch_sub` on the `concurrent` (AtomicU32) and `memory_mb` (AtomicU32) counters at lines 1247-1251. From a zero counter this wraps to ~`u32::MAX`. The matching tokens/cost code (lines 1254-1264) uses `fetch_update` with `saturating_sub` precisely because the comment at `check_resource_limits` (line 1417) acknowledges this hazard — but the same hardening was not applied to `concurrent` or `memory_mb`. **Failure scenario:** an operator runs in `Disabled` mode for warm-up / dry-run, then flips back to `Enforce` (envelope is hot-swappable via `update_envelope`). The first enforce-mode `acquire()` reads the wrapped counter, decides `current.saturating_add(claim) > max_concurrent`, and returns `ResourceLimitExceeded`. Every subsequent request is rejected forever until process restart. Use `fetch_update` with `saturating_sub` for `concurrent` and `memory_mb` like the tokens/cost paths already do.
+
+### 103. `StandbyGroup::promote` half-mutates state when no standby is healthy
+**File:** `adapter/net/compute/standby_group.rs:267-281`
+
+The function applies `mark_unhealthy(old_active)` and sets `members[old_active].role = Standby` *before* searching for `best_standby`. If the search returns `NoHealthyMember`, the function exits with `Err` but leaves `self.active_index` still pointing at `old_active` — whose role is now `Standby` and whose health is now `Unhealthy`. **Failure scenario:** a node fails such that the active and the only viable standby both go down (split-network). `on_node_failure` calls `promote()`, promotion errors out, and the group is now in a state where `active_origin()` returns a `Standby`/unhealthy member. A subsequent `on_node_recovery` for the old active doesn't re-promote — it only marks healthy, leaving `role = Standby`. The group is silently demoted forever. Move the role/health mutations after the standby search succeeds, or roll them back in the `Err` arm.
+
+### 104. Local-source migration silently mutates source daemon state after snapshot is sent
+**File:** `adapter/net/compute/orchestrator.rs:911-946`
+
+When `source_node == self.local_node_id`, `start_migration` calls `daemon_registry.snapshot()` directly and never invokes `MigrationSourceHandler::start_snapshot`. As a result, `source_handler.is_migrating(origin)` returns `false`, no events are buffered on the source side, and the source daemon stays registered — continuing to accept `deliver()` calls and mutating its in-memory state *after* the snapshot has been sent to the target. **Failure scenario:** daemon at origin O is migrating from local node. Caller invokes `start_migration(O, local, target)`; orchestrator captures snapshot at `seq=100`. While the target restores, more events arrive at the source via `DaemonRegistry::deliver()` and advance the daemon to `seq=120`. Nothing buffers them (orchestrator's own `buffer_event` is a separate code path the caller may not invoke). At cutover, source is unregistered with seq=120 of unsaved state; target activates at seq=100. Events 101-120 are lost. Compare to the dispatcher's `TakeSnapshot` path (`migration_handler.rs:310-312`) which DOES call `source_handler.start_snapshot` and then routes events through `buffer_event`. Mirror that path for local migrations.
+
 ## Medium
 
 ### 60. JetStream `poll_shard` `info()` race truncates concurrent writes
@@ -254,6 +319,81 @@ for (&subnet, &count) in &subnet_counts {
 
 `read_timestamps` accepts a ts file as long as `bytes.len() >= expected_entries * 8` and returns the first `expected_entries` u64s. This assumes the ts file's per-position semantics align with idx's, but if a previous run truncated idx via the torn-tail walk (`open` ~lines 247-266) without rewriting ts, the surviving entries' timestamps are misaligned (the first N timestamps refer to the *first* N entries the ts file ever held, not the surviving ones after truncation). The recovery code only rewrites ts when `bad_entries > 0`; torn-tail truncations skip the rewrite. Age-based retention then operates on wrong timestamps. Either rewrite ts whenever idx is truncated for any reason (capturing the surviving timestamps and rewriting in order), or store timestamps inside idx records.
 
+### 105. `recently_closed` quarantine map grows unbounded under stream open/close churn
+**File:** `adapter/net/session.rs:67-68, 464-487`
+
+`close_stream` and `evict_idle_streams` insert into `self.recently_closed`. The only GC site is `is_grant_quarantined` (line 475-487) — it removes a stream's entry when the entry is queried *and* its window has elapsed. `is_grant_quarantined` is only called from `mesh.rs:2770`, when an inbound `StreamWindow` grant arrives for that exact `stream_id`. **Failure scenario:** a long-lived peer that opens/closes many distinct stream IDs (e.g., one short-lived stream per RPC) and doesn't receive a grant for each closed stream after `GRANT_QUARANTINE_WINDOW` (2s) accumulates a `recently_closed` entry per closed stream forever. With N streams/sec churn, after T seconds the map holds ~N*T entries, bounded only by total distinct stream IDs ever closed. Add a periodic sweep that drops entries past `GRANT_QUARANTINE_WINDOW`, or piggyback on `evict_idle_streams`.
+
+### 106. `NetSession` constructs `tx_cipher`, `packet_pool`, and `thread_local_pool` with the same TX key but **independent** counters
+**File:** `adapter/net/session.rs:96-101`
+
+```rust
+let tx_cipher = PacketCipher::new(&keys.tx_key, keys.session_id);                       // counter A
+let packet_pool = super::pool::shared_pool(pool_size, &keys.tx_key, keys.session_id);   // counter B
+let thread_local_pool = super::pool::shared_local_pool(pool_size, &keys.tx_key, ...);   // counter C
+```
+
+All three share the same key. `PacketPool` and `ThreadLocalPool` each correctly serialize their internal counters within the pool (regression tests at `pool.rs:952, 992` confirm) — but the three constructions have independent counters that all start at 0. Currently dormant: `tx_cipher` (line 153) and `packet_pool` (line 562) getters are exposed, but no caller in the tree uses them — only `thread_local_pool` is wired through. The moment any caller obtains `session.packet_pool()` or `session.tx_cipher()` and encrypts a packet, ChaCha20-Poly1305 nonce reuse against the corresponding counter slot in `thread_local_pool` is guaranteed (same key + same nonce), giving an attacker XOR access to the plaintext. The pool-internal regression tests prevent this **within** a pool; the construction here defeats it across pools. Either share one `Arc<AtomicU64>` counter across all three, or remove the unused getters.
+
+### 107. `ClassifyFsm::classify` cannot recognize `Open` for nodes bound to wildcard addresses
+**File:** `adapter/net/traversal/classify.rs:280-294`
+
+The "Open" predicate is `reflex.port() == bind_addr.port() && reflex.ip() == bind_addr.ip()` (line 291). When the daemon binds to `0.0.0.0:9001` (the common default), peer reflex observations like `192.0.2.1:9001` will never compare equal — even though the ports match and the node is, in fact, directly reachable. The FSM classifies as `Cone` (or `Symmetric`) and `pair_action` triggers an unnecessary `SinglePunch`. Capability tags advertise `nat:cone` instead of `nat:open`, biasing peer-side decisions. The docstring at line 277 acknowledges callers should pre-resolve `bind_addr` to an interface address but provides no runtime guard — the API silently mis-classifies. Either resolve wildcard binds against the node's interface table before classification, or treat IP comparison as a wildcard match when `bind_addr.ip().is_unspecified()`.
+
+### 108. `NodeInfo::update_from_pingwave` and `from_pingwave` use raw `pw.hop_count + 1` (panics in debug, wraps in release)
+**File:** `adapter/net/behavior/proximity.rs:285, 301-303`
+
+`forward()` was hardened to `saturating_add` for the same field (regression test at line 1226), but the ingest sites that compute `pw.hop_count + 1` to set/compare `self.hops` were not. In debug builds this panics on `hop_count == 255`; in release it wraps to 0, taking the `pw.hop_count + 1 < self.hops` branch and recording the node as **0 hops away** (i.e., "self"). `from_bytes` accepts any u8 hop_count from the wire, so a single bit-flip in transit or a malicious peer can trick `find_best`/`routing_score` into selecting a 255-hop-away node as the lowest-cost route. Apply `saturating_add(1)` (or `checked_add(1)?` with reject-on-overflow) at both sites.
+
+### 109. `SchemaType::validate` recurses without bound on attacker-controlled schema → stack overflow DoS
+**File:** `adapter/net/behavior/api.rs:297, 466-471, 498-503, 528-537`
+
+`SchemaType` is `#[derive(Deserialize)]` (line 62) and contains recursive variants (`Array { items: Box<SchemaType> }`, `Object { properties: HashMap<_, SchemaType> }`, `AnyOf { schemas: Vec<SchemaType> }`). `validate` calls itself recursively on every branch with no depth cap. An attacker who can ship a schema (API announcements broadcast over the mesh, or any caller that parses untrusted JSON into `SchemaType`) submits a deeply nested `AnyOf`/`Array` chain and crashes the validator — and the whole process — via stack overflow when a request gets validated against it. Add a recursion-depth ceiling (or convert to iterative) on both deserialize and validate paths.
+
+### 110. Capability index admits expired announcements with a fresh local TTL
+**File:** `adapter/net/mesh.rs:3682-3877` (handler) + `adapter/net/behavior/capability.rs:1525-1565` (index) + `1953-1971` (gc)
+
+`handle_capability_announcement` never calls `ann.is_expired()` before forwarding + indexing. Even though the announcement carries `timestamp_ns` (in the signed envelope), `CapabilityIndex::index()` discards it and stores `indexed_at: Instant::now()` plus `ttl: Duration::from_secs(ann.ttl_secs as u64)` — meaning the entry is alive for `ttl_secs` *from local indexing time*, not from origin time. Combined with dedup keyed only on `(node_id, version)`, an attacker who saved a 9-month-old signed announcement (still cryptographically valid) and replays it to a peer that never saw that exact `(node_id, version)` (a fresh node, or a peer where the entry was GC'd while the source was offline) gets the stale capabilities reinstated with a fresh 5-minute lease. Useful for re-introducing a model/tag/scope an operator deliberately removed, or an old `reflex_addr` to misdirect NAT traversal. Reject announcements where `is_expired()`, and use `min(now+ttl, origin_timestamp+ttl_secs)` for the index lifetime.
+
+### 111. `MigrationFailed` dispatch doesn't clean up the snapshot reassembler — partial-snapshot leak
+**File:** `adapter/net/subprotocol/migration_handler.rs:629-651`
+
+When a `MigrationFailed` arrives, the dispatcher aborts source/target/orchestrator state but never calls `self.reassemblers.remove(&daemon_origin)`. Any partially-received snapshot chunks for that daemon stay pinned in the `DashMap` indefinitely. Compare to `fail_migration_with_reason` (line 1037) which correctly removes the reassembler — only the inbound-failure path forgets. **Failure scenario:** source begins a 400-chunk snapshot to target. After 200 chunks arrive, source aborts (e.g., `NotReady` retry exhausted) and broadcasts `MigrationFailed`. Target's dispatcher cleans `target_handler` + `orchestrator` but the 200 chunks (~1.4 MB per migration with default 7 KB chunks) stay in `reassemblers`. Future migrations with a *higher* `seq_through` for the same origin evict via the reassembler's own logic, but if the same origin never migrates again the memory is held until process exit. With many ephemeral daemons this is an unbounded leak.
+
+### 112. Remote-orchestrator `on_cleanup_complete` never resolves `SuperpositionState`
+**File:** `adapter/net/compute/orchestrator.rs:1152-1165`
+
+`on_cleanup_complete` advances the migration phase Cutover→Complete but does NOT call `record.superposition.advance(MigrationPhase::Complete)` or `record.superposition.resolve()`. Compare to `on_cutover_acknowledged` (line 1123-1139) which does both. When the orchestrator runs on a third party node, `on_cutover_acknowledged` is a no-op (the comment at line 1144-1148 confirms), so the remote path is the only authoritative one — and it leaves `SuperpositionState` stuck mid-collapse. **Failure scenario:** cross-node migration via a remote orchestrator. After `CleanupComplete`, the migration is functionally finished, but `superposition_phase()` continues to report a pre-resolution phase forever (until `on_activate_ack` removes the record entirely). Operator dashboards / readiness probes / SDK handles keyed on superposition state never observe resolution. Mirror `on_cutover_acknowledged` and call `advance` + `resolve`.
+
+### 113. `NatPmpMapper::install` with `ttl == Duration::ZERO` silently REMOVES the mapping instead of installing it
+**File:** `adapter/net/traversal/portmap/natpmp.rs:462`
+
+```rust
+let lifetime = ttl.as_secs().min(u32::MAX as u64) as u32;
+```
+
+If `ttl` is zero, `lifetime = 0`, which by RFC 6886 §3.3 is the "remove this mapping" signal — the same wire format `remove()` sends. The gateway acks (mapping removed); `install` returns `Ok(PortMapping { ttl: ZERO, .. })` which the caller treats as freshly installed. Compounds with the renewal loop (`mod.rs:611-647`): if a misbehaving gateway grants `lifetime=0` once, `mapping.ttl = ZERO`, and the next renewal calls `self.install(mapping.internal_port, mapping.ttl)` (`natpmp.rs:520`) which sends another remove. Renewals keep "succeeding" with lifetime=0 while the router has nothing mapped. **Failure scenario:** gateway responds to install with `granted_lifetime=0` (some BSD / legacy IGD setups do this on policy refusal). Mesh records `ttl=ZERO`. On the next renewal tick, the sequencer self-removes. Peers can't reach the node. Reject `ttl == ZERO` before sending the install request, or renew with a sane minimum (e.g. `max(ttl, 60s)`).
+
+### 114. `assess_continuity` reports `Continuous` for pruned logs missing genesis (no snapshot detection)
+**File:** `adapter/net/continuity/chain.rs:174-219`
+
+The function walks `log.range(0, u64::MAX)` and only validates consecutive pairs. After a `prune_through(N)`, the log only contains events with `seq > N`. The function never checks that the first event has `sequence == 0` or that the gap from `0..N` is accounted for by a snapshot — it just validates pair-wise linkage and returns `Continuous { head_seq, .. }`. A log containing only events 100..200 produces `Continuous` with `head_seq=200` even though events 0..99 may be entirely missing. **Failure scenario:** a node restarts with a corrupt/missing snapshot but a partial log carrying events 100..200. `assess_continuity` reports the chain is intact; the node propagates that belief, and downstream peers see "everything's fine" when in fact the entity has lost its first 100 events with no recoverable lineage. Take an optional snapshot reference and require `first_event.sequence == 0` OR `first_event.sequence == snapshot.seq + 1`; otherwise return `Unverifiable { gap_start: 0 }`.
+
+### 115. `MemoriesFold` `DISPATCH_MEMORY_STORED` resets `pinned` and `created_ns` on re-store
+**File:** `adapter/net/cortex/memories/fold.rs:46-61`
+
+When a `STORED` event lands for an existing memory id, the fold unconditionally constructs a new `Memory { ..., pinned: false, created_ns: p.now_ns, ... }`, replacing the existing entry. **Failure scenario:** user pins memory id=42, then later calls `memories.store(42, "updated content", ...)`. The pin flag silently resets to false; queries with `where_pinned(true)` no longer return id=42. The original `created_ns` is also overwritten, breaking any downstream "created_after" filter relying on it. Operator has no observable signal that the pin was dropped. Either preserve `pinned` and `created_ns` on re-store of an existing id (treating STORED as content-update, not full-replace), or split STORED into separate "create" and "update-content" verbs.
+
+### 116. `NetProxy.hop_stats` DashMap grows without bound and is not cleared by `remove_route`
+**File:** `adapter/net/proxy.rs:192, 234-236, 385-394`
+
+`record_hop_forward` and `record_hop_drop` call `hop_stats.entry(dest_id).or_default()` for every routed packet. There is no eviction logic anywhere — `remove_route(dest_id)` deletes the next_hop entry but leaves `hop_stats[dest_id]` in place. A peer churning through many destinations (or sending zero-route packets that hit `record_hop_drop`) grows the map indefinitely. Memory growth is proportional to total-distinct-dest-ids-ever-seen, not active dest count. Wire `remove_route` to also drop `hop_stats[dest_id]`, or apply a periodic LRU sweep.
+
+### 117. `ReroutePolicy::on_recovery` cannot match saved routes after peer NAT rebind, leaking `saved_routes`
+**File:** `adapter/net/reroute.rs:222-243`
+
+`on_recovery` resolves `recovered_addr = peer_addrs.get(&recovered_node_id)`, then filters `saved_routes` by `entry.next_hop == recovered_addr` (line 231). When a peer reconnects from a different `SocketAddr` (NAT rebind, reconnect on different port, mobile network change), `peer_addrs` reflects the new address but `saved_routes` was keyed on the old `next_hop`. The filter returns empty, no routes are restored, and the `saved_routes` entry persists indefinitely (DashMap entries are only dropped on successful match in line 242). **Adverse outcome:** routes stay pinned to alternate paths after the peer has actually recovered, causing avoidable extra-hop traffic; `saved_routes` grows without bound across mobile / NAT-changing peers. Index `saved_routes` by `node_id` rather than `next_hop`, and rewrite it on `peer_addrs` updates.
+
 ## Low
 
 ### 68. `JetStreamAdapterConfig::max_messages` / `max_bytes` typed `i64`, not validated for negatives
@@ -286,6 +426,15 @@ for (&subnet, &count) in &subnet_counts {
 ### 79. FFI returns `BufferTooSmall` for `c_int` overflow when the buffer was actually large enough
 `ffi/mod.rs:789-792, 849-852` — after the response JSON is successfully copied into the caller's C buffer, `c_int::try_from(response_json.len())` is converted to indicate the written length. On overflow the current path returns `NetError::BufferTooSmall`, which tells the caller "resize and retry" — but the data was already written and the buffer was big enough; the caller can't make progress by resizing. `NetError::IntOverflow` is defined at line 220 specifically for this case; both call sites should use it. Trivial fix.
 
+### 118. `current_timestamp` truncates `as_nanos()` (u128) → u64 silently
+`adapter/net/mod.rs:176-181` — practical wrap doesn't happen until ~year 2554, but: (a) on a system whose clock is misconfigured to a far-future date the timestamp wraps to a small number, immediately tripping `is_timed_out` everywhere; (b) `unwrap_or_default()` on `duration_since(UNIX_EPOCH)` returns `Duration::ZERO` when the clock is set **before** epoch, producing identical timestamps until correction. Use checked conversion (`u64::try_from(...).unwrap_or(u64::MAX)`) or move idle-timeout bookkeeping to monotonic `Instant`.
+
+### 119. `RoutingHeader::forward` decrements TTL even when the packet is for a local destination
+`adapter/net/router.rs:489-512`, `adapter/net/proxy.rs:268-293` — `route_packet` correctly delivers locally even at TTL=0 (line 490), but for non-local destinations the order is: TTL check → lookup → `forward()` (decrements TTL). The bug: `forward()` returns `false` if TTL is now 0 but the return value is discarded (line 512). The packet is still queued (line 525) and sent. The next hop receives a TTL=0 packet and drops it. Wastes one forward + bandwidth + queue slot whenever a packet reaches its last hop. Check `forward()`'s return value and drop locally if it's false.
+
+### 120. `LocalGraph::on_pingwave` rejects restart-induced sequence regressions, leaving stale node info
+`adapter/net/swarm.rs:510-515` — `and_modify` only updates a node's `addr`/`hops`/`last_seq`/`last_seen` if `pw.seq > n.last_seq || hops < n.hops`. When a peer restarts, `next_seq` resets to 1; the local node's `n.last_seq` is still the old high-water-mark (e.g. 10000). Incoming pingwaves with seq=1, 2, ... are dropped from updating, so neither `hops` nor `last_seen` advance. The node enters `is_stale` after 30s and gets removed by cleanup, only to be re-inserted as new — in the gap, capability lookups against the stale entry return outdated capabilities. Accept seq regression when the new value is much smaller than the recorded one (indicating a restart), or fall back to wall-time-based staleness independent of seq monotonicity.
+
 ---
 
 ## Notably clean
@@ -296,22 +445,34 @@ for (&subnet, &count) in &subnet_counts {
 
 1. **#80** — `Net::shutdown` silently no-ops with outstanding Arc clones (silent data loss on the documented graceful-shutdown path; trivially reproducible via `subscribe`)
 2. **#92** — Redex `compact_to` in-memory vs on-disk offset divergence (every event after retention sweep silently lost on restart — directly breaks the "redex-disk" merge's stated goal)
-3. **#55** — JetStream `direct_get` retention-rollover stall (consumer DoS after MAXLEN trim)
-4. **#57** — Redis MULTI/EXEC timeout duplicates (silent stream corruption)
-5. **#58** — `net_free_bytes` panic-across-FFI on adversarial `len`
-6. **#84** — `RxCreditState` auto-grants every consumed byte, defeating receive-side backpressure entirely
-7. **#59** — Bus shutdown timeout strands events despite the "no stranding" contract
-8. **#56** — JetStream cross-process retry duplicates (inverse trade-off of #9's fix)
-9. **#93** — Redex `compact_to` non-atomic three-rename + missing dir fsync (compounds #92 into segment corruption on crash)
-10. **#85** — Mesh dispatch fast-paths heartbeats without AEAD verify (off-path heartbeat spoofing defeats idle timeout)
-11. **#63** — NaN thresholds silently disable auto-scaling
-12. **#64** — `scale_up_provisioning` + `activate` over-allocates past `max_shards`
-13. **#66** — `update_from_events` cursor regression on unsorted input (re-delivery)
-14. **#75** — `add_shard_internal` permanent worker leak on activate failure
-15. **#76** — `flush()` phase-2 barrier collapses to one window (re-introduces #16-class loss on many-shard configs)
+3. **#98** — `ContinuityProof::verify_against` only checks endpoints, never validates the chain in between (primary continuity-bypass vector)
+4. **#99** — `SuperpositionState::continuity_proof` uses backward-pointing parent hashes (every migration's continuity assertion fails to verify)
+5. **#100** — `LocalGraph::on_pingwave` accepts attacker-poisoned addresses + grows `nodes` map at line-rate (DoS + route hijack)
+6. **#101** — Loadbalance probe slot leaks via filter-time side effect (circuit breaker permanently stuck on any multi-endpoint cluster)
+7. **#97** — Legacy `NetAdapter` heartbeat sender uses zero key (idle session keep-alive silently dead on the legacy single-peer path)
+8. **#55** — JetStream `direct_get` retention-rollover stall (consumer DoS after MAXLEN trim)
+9. **#57** — Redis MULTI/EXEC timeout duplicates (silent stream corruption)
+10. **#58** — `net_free_bytes` panic-across-FFI on adversarial `len`
+11. **#84** — `RxCreditState` auto-grants every consumed byte, defeating receive-side backpressure entirely
+12. **#103** — `StandbyGroup::promote` half-mutates state when no standby is healthy (group silently demoted forever)
+13. **#104** — Local-source migration silently mutates source daemon state after snapshot is sent (event loss across cutover)
+14. **#102** — `SafetyEnforcer::release` underflows `concurrent` / `memory_mb` in Disabled mode (Disabled → Enforce flip permanently rejects every request)
+15. **#59** — Bus shutdown timeout strands events despite the "no stranding" contract
+16. **#56** — JetStream cross-process retry duplicates (inverse trade-off of #9's fix)
+17. **#93** — Redex `compact_to` non-atomic three-rename + missing dir fsync (compounds #92 into segment corruption on crash)
+18. **#85** — Mesh dispatch fast-paths heartbeats without AEAD verify (off-path heartbeat spoofing defeats idle timeout)
+19. **#109** — `SchemaType::validate` unbounded recursion (stack-overflow DoS via attacker-shipped schema)
+20. **#110** — Capability index admits expired announcements with a fresh local TTL (replay vector for revoked capabilities)
+21. **#63** — NaN thresholds silently disable auto-scaling
+22. **#64** — `scale_up_provisioning` + `activate` over-allocates past `max_shards`
+23. **#66** — `update_from_events` cursor regression on unsorted input (re-delivery)
+24. **#75** — `add_shard_internal` permanent worker leak on activate failure
+25. **#76** — `flush()` phase-2 barrier collapses to one window (re-introduces #16-class loss on many-shard configs)
 
 ## Out of scope (deferred)
 
-The `adapter/net/` UDP transport stack — `cortex/`, `swarm/`, `traversal/`, `state/`, `behavior/`, `compute/`, `continuity/` — was not re-audited in this pass. The previous audit ([BUG_AUDIT_2026_04_30.md](./BUG_AUDIT_2026_04_30.md)) covers those subsystems through #54.
+The `adapter/net/` UDP transport stack — `cortex/`, `swarm/`, `traversal/`, `state/`, `behavior/`, `compute/`, `continuity/` — was deferred in the second pass and has now been spot-checked in the third pass (#97–#120). The earliest audit ([BUG_AUDIT_2026_04_30.md](./BUG_AUDIT_2026_04_30.md)) covers some of those subsystems through #54.
 
-The follow-up sweep that produced #80–#96 did spot-check `redex/`, `mesh.rs`, `session.rs`, `router.rs`, `linux.rs`, `subnet/gateway.rs`, `contested/correlation.rs`, and `sdk/src/net.rs`, but those were targeted point-checks, not a systematic re-audit — additional defects in those files may remain.
+Spot-checked across passes 2 and 3: `redex/`, `mesh.rs`, `session.rs`, `router.rs`, `linux.rs`, `subnet/gateway.rs`, `contested/correlation.rs`, `sdk/src/net.rs`, `adapter/net/{mod.rs, pool.rs, reliability.rs, failure.rs, crypto.rs, protocol.rs}`, `swarm.rs`, `route.rs`, `reroute.rs`, `proxy.rs`, `traversal/{classify.rs, portmap/natpmp.rs}`, `behavior/{safety.rs, loadbalance.rs, capability.rs, proximity.rs, api.rs, rules.rs}`, `compute/{orchestrator.rs, standby_group.rs, migration_target.rs, migration_source.rs}`, `subprotocol/migration_handler.rs`, `continuity/{chain.rs, superposition.rs, discontinuity.rs}`, `cortex/memories/fold.rs`. These are targeted point-checks, not a systematic re-audit — additional defects in those files may remain.
+
+Still **not re-audited** in any pass: most of `adapter/net/state/`, `cortex/` beyond `memories/fold.rs`, `netdb/`, `identity/`, `subprotocol/` beyond `migration_handler.rs`, and the `behavior/` files not listed above (`context.rs`, `metadata.rs`, `diff.rs`).
