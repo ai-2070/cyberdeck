@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/subprotocol/negotiation.rs
+  36b642b129ab4a5e 40,51-65,70,430-512
+net/crates/net/src/config.rs
+  36b642b129ab4a5e 730-741,743-747,753-757,939-1009
+net/crates/net/src/adapter/net/behavior/diff.rs
+  36b642b129ab4a5e 707-728,737-748,754-764,1191-1301
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "e9555d8842b5ce854344805404eddc07ffb49244",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1490,
+      "total_deletions": 8,
+      "accepted_lines": 349,
+      "overriden_lines": 0
+    }
+  }
+}
