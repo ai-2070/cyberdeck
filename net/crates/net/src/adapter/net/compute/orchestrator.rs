@@ -1166,6 +1166,22 @@ impl MigrationOrchestrator {
         if record.state.phase() == MigrationPhase::Cutover {
             record.state.cutover_complete()?;
         }
+        // BUG #112: also resolve `SuperpositionState`, mirroring
+        // `on_cutover_acknowledged`. Pre-fix only the local
+        // (source-collocated-orchestrator) path called
+        // `superposition.advance(Complete) + resolve()`; on a
+        // remote orchestrator `on_cutover_acknowledged` is a no-op
+        // (operates on the source's local orchestrator, which has
+        // no record for this daemon), so the remote path was the
+        // ONLY authoritative one and it left `SuperpositionState`
+        // stuck mid-collapse. Operator dashboards / readiness
+        // probes / SDK handles keyed on superposition state never
+        // observed resolution until `on_activate_ack` removed the
+        // record entirely. The advance/resolve is idempotent —
+        // safe to run on the local-orchestrator path too if both
+        // signals arrive on the same node.
+        record.superposition.advance(MigrationPhase::Complete);
+        record.superposition.resolve();
         Ok(MigrationMessage::ActivateTarget { daemon_origin })
     }
 

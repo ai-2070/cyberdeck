@@ -90,10 +90,34 @@ impl CompositeCursor {
     }
 
     /// Update positions from consumed events.
+    ///
+    /// BUG #66: pre-fix this unconditionally inserted each event's
+    /// `id` into the per-shard position map; whichever event for a
+    /// given `shard_id` appeared *last* in the slice won, regardless
+    /// of stream order. A caller that passed events sorted by
+    /// `insertion_ts` (not `id`), or merged from multiple buffers in
+    /// arbitrary order, could silently move the cursor BEHIND a
+    /// previously-returned id, causing those events to be re-
+    /// delivered on the next poll. Now we compare lexicographically
+    /// per shard and only update when the new id is strictly
+    /// greater than the stored one — matching the Redis-XSTREAM /
+    /// JetStream-`u64-seq` id formats both adapters use, where
+    /// lexicographic ordering coincides with stream order.
+    /// (CompositeCursor is adapter-agnostic but the id contract is
+    /// implicit: ids must compare lexicographically the same way
+    /// they compare in the source stream's natural order.)
     pub fn update_from_events(&mut self, events: &[StoredEvent]) {
         for event in events {
-            self.positions
-                .insert(event.shard_id, Arc::from(event.id.as_str()));
+            let new_id = event.id.as_str();
+            match self.positions.get(&event.shard_id) {
+                Some(existing) if existing.as_ref() >= new_id => {
+                    // Don't regress.
+                }
+                _ => {
+                    self.positions
+                        .insert(event.shard_id, Arc::from(new_id));
+                }
+            }
         }
     }
 }
@@ -353,6 +377,29 @@ impl PollMerger {
                 // tiebreakers. `id` is the storage backend's
                 // identifier and is unique within a shard, so the
                 // composite is a strict total order.
+                //
+                // BUG #73: `id.cmp(&b.id)` is a lexicographic
+                // (string) comparison. Adapter contract: ids
+                // MUST compare lexicographically the same way they
+                // compare in the source stream's natural order.
+                // Both built-in adapters satisfy this:
+                //   - JetStream uses zero-padded `seq` strings (or
+                //     fixed-width numerics)
+                //   - Redis Streams use `{ms}-{seq}` where both
+                //     components are fixed-width / zero-padded
+                //   - ULIDs / UUIDs / hex hashes are fixed-width
+                // Adapters that emit *unpadded* numeric ids
+                // (`"9"`, `"10"`, ...) would invert ordering here
+                // (`"10" < "9"` lexicographically). The tiebreak
+                // chain `(insertion_ts, shard_id)` resolves the
+                // common cases first — same `insertion_ts` across
+                // different shards is broken by `shard_id`, and
+                // `insertion_ts` is monotonic per shard so the
+                // same-shard tiebreak is unreachable in practice
+                // — but new adapters MUST follow the
+                // lex-comparable id contract for correctness on
+                // any future code path that reaches the `id`
+                // tiebreak.
                 all_events.sort_by(|a, b| {
                     a.insertion_ts
                         .cmp(&b.insertion_ts)
@@ -403,6 +450,13 @@ impl PollMerger {
         };
 
         // Step 1: rollback for shards with truncated matches.
+        // BUG #72 cross-reference: track which shards we rolled
+        // back here so Step 2 only overrides those shards (rather
+        // than every shard with a returned event, which would
+        // throw away the adapter's `next_id` advance for shards
+        // that returned all their matches).
+        let mut rolled_back: std::collections::HashSet<u16> =
+            std::collections::HashSet::new();
         if request.filter.is_some() && had_extra {
             let mut returned_per_shard: std::collections::HashMap<u16, usize> =
                 std::collections::HashMap::new();
@@ -423,6 +477,7 @@ impl PollMerger {
                             final_cursor.positions.remove(shard_id);
                         }
                     }
+                    rolled_back.insert(*shard_id);
                 }
             }
         }
@@ -432,11 +487,38 @@ impl PollMerger {
         // cursor, so iterate in reverse and skip shards already seen.
         // This reduces id clones from O(all_events.len()) to
         // O(shards.len()).
+        //
+        // BUG #72: when the filter path is active, Step 1 has
+        // already populated `final_cursor` with the adapter's
+        // `next_id` (a position past the last *fetched* event for
+        // each shard). The Step 2 override below moves the cursor
+        // back to the last *matched* event id, which is BEHIND
+        // the last fetched event for any shard with non-matched
+        // events. Subsequent polls then re-fetch and re-filter
+        // those non-matches — wasted work proportional to
+        // `over_fetch_factor` on low-match-rate streams. The fix:
+        // only Step 2-override for shards that were actually
+        // rolled back in Step 1 (those need a forward push past
+        // the last *returned* match), OR when the filter path
+        // wasn't used at all (filter is None).
+        //
+        // For filter=None, the previous Step-2 behavior was correct
+        // — `final_cursor` started as `cursor.clone()` (no
+        // `new_cursor` advance) and the only progress signal is
+        // the last returned event id.
         let mut seen_shards: std::collections::HashSet<u16> =
             std::collections::HashSet::with_capacity(shards.len());
         for event in all_events.iter().rev() {
             if seen_shards.insert(event.shard_id) {
-                final_cursor.set(event.shard_id, event.id.clone());
+                let should_override = request.filter.is_none()
+                    || rolled_back.contains(&event.shard_id);
+                if should_override {
+                    final_cursor.set(event.shard_id, event.id.clone());
+                }
+                // Else: the adapter's `next_id` (already in
+                // `final_cursor` via the `new_cursor` initial
+                // value) is more advanced than the last matched
+                // event — preserve it.
             }
         }
 
@@ -511,14 +593,61 @@ mod tests {
         let events = vec![
             StoredEvent::from_value("100-0".to_string(), json!({}), 100, 0),
             StoredEvent::from_value("200-0".to_string(), json!({}), 200, 1),
-            StoredEvent::from_value("150-0".to_string(), json!({}), 150, 0), // Later event in shard 0
+            // BUG #66: this used to be "later event in shard 0" by
+            // virtue of being LAST in the input slice, but its id
+            // (150-0) is stream-order BEFORE 200-0 — wait, this is
+            // for shard 0 not shard 1. shard 0 only had 100-0
+            // before this; 150-0 > 100-0, so it advances normally.
+            StoredEvent::from_value("150-0".to_string(), json!({}), 150, 0),
         ];
 
         cursor.update_from_events(&events);
 
-        // Should have the last position for each shard
-        assert_eq!(cursor.get(0), Some("150-0")); // Updated to later event
+        // Should have the highest id seen for each shard.
+        assert_eq!(cursor.get(0), Some("150-0"));
         assert_eq!(cursor.get(1), Some("200-0"));
+    }
+
+    /// BUG #66: cursor must NOT regress when events arrive in a
+    /// non-ascending order for the same shard. Pre-fix the cursor
+    /// for shard 0 would land on `100-0` (the last item in the
+    /// slice), regressing past `200-0`.
+    #[test]
+    fn cursor_does_not_regress_on_unsorted_per_shard_events() {
+        let mut cursor = CompositeCursor::new();
+        // For shard 0: stream-order 100-0 → 200-0, but the slice
+        // has them reversed (consumer received 200-0 first,
+        // then 100-0 because of merge ordering).
+        let events = vec![
+            StoredEvent::from_value("200-0".to_string(), json!({}), 200, 0),
+            StoredEvent::from_value("100-0".to_string(), json!({}), 100, 0),
+        ];
+        cursor.update_from_events(&events);
+        assert_eq!(
+            cursor.get(0),
+            Some("200-0"),
+            "cursor must hold the highest id, not the last-in-slice id (BUG #66)",
+        );
+    }
+
+    /// BUG #66: a partial overlap (advance for one shard, regression
+    /// attempt for another shard) must keep both cursors at their
+    /// respective max.
+    #[test]
+    fn cursor_compare_and_set_is_per_shard() {
+        let mut cursor = CompositeCursor::new();
+        cursor.update_from_events(&[
+            StoredEvent::from_value("500-0".to_string(), json!({}), 500, 0),
+            StoredEvent::from_value("500-0".to_string(), json!({}), 500, 1),
+        ]);
+        // Now "advance" with one regress attempt for shard 0 + a
+        // legitimate advance for shard 1.
+        cursor.update_from_events(&[
+            StoredEvent::from_value("100-0".to_string(), json!({}), 100, 0), // regress
+            StoredEvent::from_value("700-0".to_string(), json!({}), 700, 1), // advance
+        ]);
+        assert_eq!(cursor.get(0), Some("500-0"), "shard 0 must not regress");
+        assert_eq!(cursor.get(1), Some("700-0"), "shard 1 must advance");
     }
 
     #[test]

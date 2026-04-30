@@ -379,6 +379,39 @@ impl NodeStatus {
     }
 }
 
+/// Maximum allowed length of any single string field in
+/// `NodeMetadata` (`name`, `description`, `owner`, individual tag /
+/// role / `custom` keys and values). 1 KiB is far past any
+/// realistic operator-supplied label and bounds the per-string
+/// memory cost (BUG #124).
+pub const MAX_METADATA_STRING_LEN: usize = 1024;
+
+/// Maximum number of tags or roles in `NodeMetadata`. 256 is far
+/// past real usage (typical deployments use a handful of
+/// scope/tier/region tags); pre-fix a peer could ship millions and
+/// turn one announcement into millions of `by_tag` index entries
+/// (BUG #124).
+pub const MAX_METADATA_TAGS: usize = 256;
+
+/// Maximum number of entries in the `custom` key-value map. Same
+/// pattern as tags — bounds the per-announcement footprint (BUG
+/// #124).
+pub const MAX_METADATA_CUSTOM_ENTRIES: usize = 256;
+
+/// Maximum number of `preferred_peers` in `TopologyHints`. Each
+/// entry is a 32-byte `NodeId`; a 4096-cap bounds the wire/heap
+/// cost while staying well above any realistic peering preference
+/// list (BUG #124).
+pub const MAX_PREFERRED_PEERS: usize = 4096;
+
+/// Maximum number of `hop_distances` entries in `TopologyHints`
+/// (BUG #124).
+pub const MAX_HOP_DISTANCES: usize = 4096;
+
+/// Maximum number of `public_addresses` (multi-homed nodes
+/// typically advertise <16; 256 is generous) (BUG #124).
+pub const MAX_PUBLIC_ADDRESSES: usize = 256;
+
 /// Complete node metadata
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeMetadata {
@@ -411,6 +444,112 @@ pub struct NodeMetadata {
 }
 
 impl NodeMetadata {
+    /// Validate that the metadata fits within the per-field
+    /// boundedness caps (string lengths, tag/role/custom counts,
+    /// preferred-peers / hop-distances / public-addresses sizes).
+    ///
+    /// BUG #124: pre-fix the deserialize path was unbounded —
+    /// every `Vec` / `HashMap` / `String` accepted whatever the
+    /// peer shipped, and `MetadataStore::upsert` happily indexed
+    /// millions of attacker-supplied tags into the per-tag
+    /// inverted-index DashMap. Now `upsert` (and
+    /// `update_versioned`) call `validate_bounds` before touching
+    /// the indexes; oversized metadata surfaces as
+    /// `MetadataError::Invalid(...)`.
+    pub fn validate_bounds(&self) -> Result<(), MetadataError> {
+        if let Some(name) = &self.name {
+            if name.len() > MAX_METADATA_STRING_LEN {
+                return Err(MetadataError::Invalid(format!(
+                    "name exceeds {} bytes",
+                    MAX_METADATA_STRING_LEN
+                )));
+            }
+        }
+        if let Some(d) = &self.description {
+            if d.len() > MAX_METADATA_STRING_LEN {
+                return Err(MetadataError::Invalid(format!(
+                    "description exceeds {} bytes",
+                    MAX_METADATA_STRING_LEN
+                )));
+            }
+        }
+        if let Some(o) = &self.owner {
+            if o.len() > MAX_METADATA_STRING_LEN {
+                return Err(MetadataError::Invalid(format!(
+                    "owner exceeds {} bytes",
+                    MAX_METADATA_STRING_LEN
+                )));
+            }
+        }
+        if self.tags.len() > MAX_METADATA_TAGS {
+            return Err(MetadataError::Invalid(format!(
+                "tags exceed {} entries",
+                MAX_METADATA_TAGS
+            )));
+        }
+        for tag in &self.tags {
+            if tag.len() > MAX_METADATA_STRING_LEN {
+                return Err(MetadataError::Invalid(format!(
+                    "tag exceeds {} bytes",
+                    MAX_METADATA_STRING_LEN
+                )));
+            }
+        }
+        if self.roles.len() > MAX_METADATA_TAGS {
+            return Err(MetadataError::Invalid(format!(
+                "roles exceed {} entries",
+                MAX_METADATA_TAGS
+            )));
+        }
+        for role in &self.roles {
+            if role.len() > MAX_METADATA_STRING_LEN {
+                return Err(MetadataError::Invalid(format!(
+                    "role exceeds {} bytes",
+                    MAX_METADATA_STRING_LEN
+                )));
+            }
+        }
+        if self.custom.len() > MAX_METADATA_CUSTOM_ENTRIES {
+            return Err(MetadataError::Invalid(format!(
+                "custom map exceeds {} entries",
+                MAX_METADATA_CUSTOM_ENTRIES
+            )));
+        }
+        for (k, v) in &self.custom {
+            if k.len() > MAX_METADATA_STRING_LEN {
+                return Err(MetadataError::Invalid(format!(
+                    "custom key exceeds {} bytes",
+                    MAX_METADATA_STRING_LEN
+                )));
+            }
+            if v.len() > MAX_METADATA_STRING_LEN {
+                return Err(MetadataError::Invalid(format!(
+                    "custom value exceeds {} bytes",
+                    MAX_METADATA_STRING_LEN
+                )));
+            }
+        }
+        if self.topology.preferred_peers.len() > MAX_PREFERRED_PEERS {
+            return Err(MetadataError::Invalid(format!(
+                "preferred_peers exceed {} entries",
+                MAX_PREFERRED_PEERS
+            )));
+        }
+        if self.topology.hop_distances.len() > MAX_HOP_DISTANCES {
+            return Err(MetadataError::Invalid(format!(
+                "hop_distances exceed {} entries",
+                MAX_HOP_DISTANCES
+            )));
+        }
+        if self.topology.public_addresses.len() > MAX_PUBLIC_ADDRESSES {
+            return Err(MetadataError::Invalid(format!(
+                "public_addresses exceed {} entries",
+                MAX_PUBLIC_ADDRESSES
+            )));
+        }
+        Ok(())
+    }
+
     /// Create new node metadata
     pub fn new(node_id: NodeId) -> Self {
         let now = SystemTime::now()
@@ -825,6 +964,14 @@ impl MetadataStore {
 
     /// Insert or update node metadata
     pub fn upsert(&self, metadata: NodeMetadata) -> Result<(), MetadataError> {
+        // BUG #124: bound peer-supplied metadata before touching
+        // the indexes — without this, one peer could ship a single
+        // announcement carrying millions of unique tags and turn it
+        // into millions of `by_tag` DashMap entries. Validation
+        // runs first so we don't even pay the index-clear cost on a
+        // bad input.
+        metadata.validate_bounds()?;
+
         let node_id = metadata.node_id;
 
         // Check capacity
@@ -1050,8 +1197,46 @@ impl MetadataStore {
     }
 
     /// Clear all nodes
+    ///
+    /// BUG #139: pre-fix this called `nodes.clear()` first, then
+    /// six index `clear()`s in sequence. A concurrent `upsert`
+    /// landing between any two of those clears could observe
+    /// `nodes.get(&id) → None` (skipping `remove_from_indexes`),
+    /// then `add_to_indexes` (writing into the SAME index maps
+    /// `clear` was about to wipe), then `nodes.insert(...)` — the
+    /// final state was a node in `nodes` with NO index entries,
+    /// invisible to every indexed query and only retrievable via
+    /// the full-scan branch.
+    ///
+    /// Now we drain `nodes` FIRST and route every drained metadata
+    /// through `remove_from_indexes` — making the intermediate
+    /// state consistent (nodes exist alongside their indexes
+    /// throughout the drain). Any concurrent `upsert` landing
+    /// during the drain either races BEFORE this function reads
+    /// its key (the upsert wins; we drain its entry afterward) or
+    /// AFTER (the upsert observes a cleared `nodes` and proceeds
+    /// normally — no index drift, since `remove_from_indexes`
+    /// only touches keys that exist in `nodes`). The final
+    /// `clear`s on the index maps catch any residual entries
+    /// the per-key path missed (defense-in-depth; should be
+    /// no-ops on the happy path).
     pub fn clear(&self) {
-        self.nodes.clear();
+        // `dashmap::DashMap` doesn't have a `drain()` that takes
+        // ownership of every entry; use a remove-on-iter pattern.
+        // Collect keys first, then remove and route through
+        // `remove_from_indexes`. Holding the iter guard across
+        // `remove` would deadlock — the keys vec is the
+        // intermediate.
+        let keys: Vec<NodeId> = self.nodes.iter().map(|r| *r.key()).collect();
+        for key in keys {
+            if let Some((_, meta)) = self.nodes.remove(&key) {
+                self.remove_from_indexes(&meta);
+            }
+        }
+        // Defense-in-depth: clear any residual entries that may
+        // have leaked in via a concurrent upsert that landed
+        // after our key-collection iterator finished but before
+        // this point. These should be no-ops on the happy path.
         self.by_status.clear();
         self.by_tier.clear();
         self.by_continent.clear();
@@ -1379,6 +1564,72 @@ mod tests {
 
         // Can still update existing
         store.upsert(NodeMetadata::new(make_node_id(1))).unwrap();
+    }
+
+    // ========================================================================
+    // BUG #124: NodeMetadata bounds must be enforced before indexing
+    // ========================================================================
+
+    /// Oversized tag set is rejected by `upsert` before touching the
+    /// index DashMaps. Pre-fix a peer could ship a single
+    /// announcement with millions of unique tags and turn it into
+    /// millions of `by_tag` entries.
+    #[test]
+    fn upsert_rejects_oversized_tags() {
+        let store = MetadataStore::new();
+        let mut node = NodeMetadata::new(make_node_id(1));
+        for i in 0..(MAX_METADATA_TAGS + 1) {
+            node.tags.insert(format!("t{}", i));
+        }
+        let result = store.upsert(node);
+        assert!(
+            matches!(result, Err(MetadataError::Invalid(_))),
+            "oversized tags must surface as MetadataError::Invalid (BUG #124), got {:?}",
+            result,
+        );
+    }
+
+    /// Oversized custom-map is rejected.
+    #[test]
+    fn upsert_rejects_oversized_custom_map() {
+        let store = MetadataStore::new();
+        let mut node = NodeMetadata::new(make_node_id(2));
+        for i in 0..(MAX_METADATA_CUSTOM_ENTRIES + 1) {
+            node.custom.insert(format!("k{}", i), "v".to_string());
+        }
+        assert!(matches!(
+            store.upsert(node),
+            Err(MetadataError::Invalid(_))
+        ));
+    }
+
+    /// A single string field over the per-string cap is rejected.
+    #[test]
+    fn upsert_rejects_oversized_string_fields() {
+        let store = MetadataStore::new();
+        let huge = "x".repeat(MAX_METADATA_STRING_LEN + 1);
+        let node = NodeMetadata::new(make_node_id(3)).with_name(huge);
+        assert!(matches!(
+            store.upsert(node),
+            Err(MetadataError::Invalid(_))
+        ));
+    }
+
+    /// Metadata at exactly the boundaries is accepted — pins the
+    /// `<=` semantics so a future tightening to strict `<` doesn't
+    /// silently break legitimate-but-large announcements.
+    #[test]
+    fn upsert_accepts_metadata_at_exact_boundaries() {
+        let store = MetadataStore::new();
+        let mut node = NodeMetadata::new(make_node_id(4));
+        for i in 0..MAX_METADATA_TAGS {
+            node.tags.insert(format!("t{}", i));
+        }
+        let name_at_cap = "x".repeat(MAX_METADATA_STRING_LEN);
+        node = node.with_name(name_at_cap);
+        store
+            .upsert(node)
+            .expect("metadata at the exact boundaries must be accepted");
     }
 
     #[test]

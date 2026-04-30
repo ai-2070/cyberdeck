@@ -315,7 +315,11 @@ mod tests {
             .map(|t| t.id)
             .collect();
         ids.sort();
-        assert_eq!(ids, vec![4, 5]);
+        // BUG #142: bounds are inclusive. Task 3 (created_ns=300)
+        // qualifies — pre-fix the comparator was strict `>`, which
+        // dropped boundary events that should belong to either side
+        // of a `last_sync_ns`-style cutoff.
+        assert_eq!(ids, vec![3, 4, 5]);
     }
 
     #[test]
@@ -329,7 +333,8 @@ mod tests {
             .map(|t| t.id)
             .collect();
         ids.sort();
-        assert_eq!(ids, vec![1, 2]);
+        // BUG #142: inclusive — task 3 (created_ns=300) qualifies.
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 
     #[test]
@@ -344,8 +349,10 @@ mod tests {
             .map(|t| t.id)
             .collect();
         ids.sort();
-        // 3 (310), 4 (410) pass. 5 (520) is not strictly before 500. 2 (250) is not strictly after 250.
-        assert_eq!(ids, vec![3, 4]);
+        // BUG #142: inclusive bounds — task 2 (updated_ns=250) is
+        // included by `updated_after(250)`, and task 5 (520) is
+        // still excluded because it's strictly above 500.
+        assert_eq!(ids, vec![2, 3, 4]);
     }
 
     #[test]

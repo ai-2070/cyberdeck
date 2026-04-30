@@ -786,9 +786,15 @@ pub extern "C" fn net_poll(
         *out_buffer.add(response_json.len()) = 0; // Null terminate
     }
 
+    // BUG #79: data was already copied into the caller's buffer; a
+    // `c_int` overflow here means the byte count exceeds c_int's
+    // range, NOT that the buffer was too small. Returning
+    // `BufferTooSmall` would tell the caller to "resize and retry"
+    // when retrying can't fix the actual condition. `IntOverflow`
+    // is the documented variant for this case.
     match c_int::try_from(response_json.len()) {
         Ok(n) => n,
-        Err(_) => NetError::BufferTooSmall.into(),
+        Err(_) => NetError::IntOverflow.into(),
     }
 }
 
@@ -846,9 +852,12 @@ pub extern "C" fn net_stats(
         *out_buffer.add(stats_json.len()) = 0;
     }
 
+    // BUG #79: see net_poll above — the data was already copied,
+    // so an overflowing length is `IntOverflow`, not
+    // `BufferTooSmall`.
     match c_int::try_from(stats_json.len()) {
         Ok(n) => n,
-        Err(_) => NetError::BufferTooSmall.into(),
+        Err(_) => NetError::IntOverflow.into(),
     }
 }
 
@@ -905,70 +914,85 @@ pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
         return NetError::NullPointer.into();
     }
 
-    // SAFETY: The C contract guarantees `handle` is valid here and that
-    // `net_shutdown` is not called concurrently with itself. Future
-    // dereferences of the box from concurrent FFI ops on other threads
-    // are also sound because we never free the box (see below).
-    let handle_ref = unsafe { &*handle };
+    // BUG #74: scope the `&NetHandle` borrow into an inner block
+    // so it is verifiably out of scope before the
+    // `ManuallyDrop::take(&mut (*handle).bus)` calls below. Pre-fix
+    // an `&NetHandle` was held in scope for the entire function
+    // (lines 921-968) while a raw `&mut (*handle).bus` was taken
+    // at line 996; NLL likely ended the immutable borrow before
+    // the mutable take, but the pattern is fragile under
+    // stacked/tree borrow models — every future change has to
+    // re-prove the lifetime relationship. The block-scoped
+    // borrow makes the lifetime constraint explicit and obvious
+    // to both the compiler and any future maintainer.
+    let drained_and_taken = {
+        // SAFETY: The C contract guarantees `handle` is valid here and that
+        // `net_shutdown` is not called concurrently with itself. Future
+        // dereferences of the box from concurrent FFI ops on other threads
+        // are also sound because we never free the box (see below).
+        let handle_ref = unsafe { &*handle };
 
-    // Signal shutdown so concurrent FFI calls bail before touching
-    // `bus`/`runtime`. SeqCst pairs with `FfiOpGuard::try_enter`.
-    handle_ref
-        .shutting_down
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Signal shutdown so concurrent FFI calls bail before touching
+        // `bus`/`runtime`. SeqCst pairs with `FfiOpGuard::try_enter`.
+        handle_ref
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
-    // Bounded wait for in-flight ops to drain. Without a deadline, a
-    // hung concurrent operation (e.g. `net_flush` against a stalled
-    // adapter) would pin a CPU at 100% inside this loop forever.
-    //
-    // `std::hint::spin_loop()` is a CPU pause hint, not a yield. On
-    // a single-threaded executor (or any configuration where the FFI
-    // caller's thread is the same one that needs to make progress on
-    // the in-flight async work) the tight spin starves the very tokio
-    // worker we're waiting for, *causing* the deadline to expire when
-    // it otherwise wouldn't. `thread::yield_now` lets the OS schedule
-    // whatever's blocked, and a 1ms `thread::sleep` between yields
-    // prevents the loop from saturating a CPU on platforms where
-    // `yield_now` is a
-    // near-no-op under low contention. The drain we expect to take
-    // milliseconds, so a millisecond-granularity poll is fine.
-    let deadline = std::time::Instant::now() + FFI_SHUTDOWN_DEADLINE;
-    let mut drained = false;
-    loop {
+        // Bounded wait for in-flight ops to drain. Without a deadline, a
+        // hung concurrent operation (e.g. `net_flush` against a stalled
+        // adapter) would pin a CPU at 100% inside this loop forever.
+        //
+        // `std::hint::spin_loop()` is a CPU pause hint, not a yield. On
+        // a single-threaded executor (or any configuration where the FFI
+        // caller's thread is the same one that needs to make progress on
+        // the in-flight async work) the tight spin starves the very tokio
+        // worker we're waiting for, *causing* the deadline to expire when
+        // it otherwise wouldn't. `thread::yield_now` lets the OS schedule
+        // whatever's blocked, and a 1ms `thread::sleep` between yields
+        // prevents the loop from saturating a CPU on platforms where
+        // `yield_now` is a
+        // near-no-op under low contention. The drain we expect to take
+        // milliseconds, so a millisecond-granularity poll is fine.
+        let deadline = std::time::Instant::now() + FFI_SHUTDOWN_DEADLINE;
+        let mut drained = false;
+        loop {
+            if handle_ref
+                .active_ops
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                drained = true;
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        if !drained {
+            // In-flight ops may still be reading `bus`/`runtime`; reading
+            // them out via `ManuallyDrop::take` would race those readers.
+            // Leak both fields along with the box. Future ops still see
+            // `shutting_down=true` and bail before touching either field,
+            // so the leaked memory is never read again.
+            return NetError::Unknown.into();
+        }
+
+        // Idempotent shutdown: if a previous `net_shutdown` already moved
+        // out the bus/runtime, do not call `ManuallyDrop::take` a second
+        // time (that would be UB). The first call has already done the
+        // work; report success.
         if handle_ref
-            .active_ops
-            .load(std::sync::atomic::Ordering::SeqCst)
-            == 0
+            .bus_taken
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            drained = true;
-            break;
+            return NetError::Success.into();
         }
-        if std::time::Instant::now() >= deadline {
-            break;
-        }
-        std::thread::yield_now();
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-
-    if !drained {
-        // In-flight ops may still be reading `bus`/`runtime`; reading
-        // them out via `ManuallyDrop::take` would race those readers.
-        // Leak both fields along with the box. Future ops still see
-        // `shutting_down=true` and bail before touching either field,
-        // so the leaked memory is never read again.
-        return NetError::Unknown.into();
-    }
-
-    // Idempotent shutdown: if a previous `net_shutdown` already moved
-    // out the bus/runtime, do not call `ManuallyDrop::take` a second
-    // time (that would be UB). The first call has already done the
-    // work; report success.
-    if handle_ref
-        .bus_taken
-        .swap(true, std::sync::atomic::Ordering::SeqCst)
-    {
-        return NetError::Success.into();
-    }
+        drained
+    };
+    let _ = drained_and_taken;
 
     // SAFETY: `active_ops` reached zero with `shutting_down=true`, so:
     //   - Every FFI op that started before shutdown has fully
@@ -976,7 +1000,10 @@ pub extern "C" fn net_shutdown(handle: *mut NetHandle) -> c_int {
     //   - Any future FFI op will observe `shutting_down=true` and
     //     bail in `try_enter` before touching `bus` / `runtime`.
     // Plus, `bus_taken` was just CAS'd from false → true, so no other
-    // shutdown is concurrently moving the same fields out.
+    // shutdown is concurrently moving the same fields out. The
+    // immutable `handle_ref` borrow above has been dropped (block
+    // scope ended), so the `&mut`-via-raw-pointer below is the
+    // only live access — no stacked/tree-borrow race (BUG #74).
     //
     // We deliberately do NOT call `Box::from_raw` here. The box's
     // `shutting_down` / `active_ops` / `bus_taken` atomics must remain

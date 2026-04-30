@@ -794,6 +794,14 @@ pub struct ContextStore {
     sampled_count: AtomicU64,
     dropped_count: AtomicU64,
     expired_count: AtomicU64,
+    /// BUG #136: an authoritative atomic counter so the "is the
+    /// store full?" check can be a CAS-with-cap rather than a
+    /// `dashmap.len() >= max` racy probe. Bumped on insert via
+    /// `try_reserve_slot` (CAS), decremented on eviction
+    /// (`cleanup_expired`, explicit removal). DashMap's own `len()`
+    /// is the source of truth for queries; this counter exists
+    /// only to gate admission atomically.
+    active_count: std::sync::atomic::AtomicUsize,
 }
 
 impl ContextStore {
@@ -808,7 +816,40 @@ impl ContextStore {
             sampled_count: AtomicU64::new(0),
             dropped_count: AtomicU64::new(0),
             expired_count: AtomicU64::new(0),
+            active_count: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Atomically reserve a slot if `active_count < max_traces`.
+    /// Returns `true` on success (caller must follow up with a real
+    /// insert + decrement on failure), `false` when the cap is
+    /// already full. This is the BUG #136 admission gate — pre-fix
+    /// the check was `dashmap.len() >= max`, which lost the race
+    /// against concurrent inserters.
+    fn try_reserve_slot(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        // Fetch-update CAS loop: only commit if `cur < max`.
+        self.active_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                if cur < self.max_traces {
+                    Some(cur + 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+    }
+
+    /// Release a slot reserved by `try_reserve_slot` — call this on
+    /// the failure path of an insert that aborts after reserving,
+    /// or after a successful eviction.
+    fn release_slot(&self) {
+        use std::sync::atomic::Ordering;
+        self.active_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                Some(cur.saturating_sub(1))
+            })
+            .ok();
     }
 
     /// Override the default sampling strategy for this store
@@ -818,11 +859,20 @@ impl ContextStore {
     }
 
     /// Create a new context and register it
+    ///
+    /// BUG #136: capacity admission goes through the atomic
+    /// `try_reserve_slot` CAS instead of the racy
+    /// `contexts.len() >= max` probe. Pre-fix two threads inserting
+    /// at exactly capacity could both observe `len < max` after a
+    /// `cleanup_expired` and both insert, growing the map past
+    /// `max_traces`. Now the slot is reserved atomically before
+    /// the insert; if the reserve fails after a `cleanup_expired`
+    /// retry, we surface `CapacityExceeded`.
     pub fn create_context(&self, origin_node: NodeId) -> Result<Context, ContextError> {
-        // Check capacity
-        if self.contexts.len() >= self.max_traces {
+        // First reserve; on failure, run cleanup_expired and retry once.
+        if !self.try_reserve_slot() {
             self.cleanup_expired();
-            if self.contexts.len() >= self.max_traces {
+            if !self.try_reserve_slot() {
                 self.dropped_count.fetch_add(1, Ordering::Relaxed);
                 return Err(ContextError::CapacityExceeded);
             }
@@ -834,6 +884,9 @@ impl ContextStore {
         if !self.sampler.should_sample(None) {
             let mut unsampled = ctx.clone();
             unsampled.trace_flags = TraceFlags::not_sampled();
+            // Sampling-skip path: no insert happens, so the
+            // reserved slot must be released.
+            self.release_slot();
             return Ok(unsampled);
         }
 
@@ -868,10 +921,10 @@ impl ContextStore {
             return Ok(ctx);
         }
 
-        // Check capacity
-        if self.contexts.len() >= self.max_traces {
+        // BUG #136: atomic reserve; on failure cleanup + retry once.
+        if !self.try_reserve_slot() {
             self.cleanup_expired();
-            if self.contexts.len() >= self.max_traces {
+            if !self.try_reserve_slot() {
                 self.dropped_count.fetch_add(1, Ordering::Relaxed);
                 return Err(ContextError::CapacityExceeded);
             }
@@ -882,6 +935,8 @@ impl ContextStore {
             .sampler
             .should_sample(Some(ctx.trace_flags.is_sampled()))
         {
+            // Sampling-skip path — release the reserved slot.
+            self.release_slot();
             return Ok(ctx);
         }
 
@@ -927,13 +982,25 @@ impl ContextStore {
     }
 
     /// Complete a trace and return all spans
+    ///
+    /// BUG #136: also releases the `active_count` slot so the
+    /// `try_reserve_slot` admission gate can re-admit.
     pub fn complete_trace(&self, trace_id: &TraceId) -> Option<(Context, Vec<Span>)> {
-        self.contexts
+        let removed = self
+            .contexts
             .remove(trace_id)
-            .map(|(_, entry)| (entry.context, entry.spans))
+            .map(|(_, entry)| (entry.context, entry.spans));
+        if removed.is_some() {
+            self.release_slot();
+        }
+        removed
     }
 
     /// Cleanup expired traces
+    ///
+    /// BUG #136: every successful removal also releases an
+    /// `active_count` slot so the `try_reserve_slot` admission gate
+    /// can re-admit work as soon as expired entries are reclaimed.
     pub fn cleanup_expired(&self) {
         let now = Instant::now();
         let mut expired = Vec::new();
@@ -945,8 +1012,10 @@ impl ContextStore {
         }
 
         for trace_id in expired {
-            self.contexts.remove(&trace_id);
-            self.expired_count.fetch_add(1, Ordering::Relaxed);
+            if self.contexts.remove(&trace_id).is_some() {
+                self.expired_count.fetch_add(1, Ordering::Relaxed);
+                self.release_slot();
+            }
         }
     }
 
@@ -1355,6 +1424,90 @@ mod tests {
 
         // Cleanup the second one too
         store.complete_trace(&ctx2.trace_id);
+    }
+
+    // ========================================================================
+    // BUG #136: create_context capacity check must be atomic
+    // ========================================================================
+
+    /// Concurrent `create_context` calls must not grow `contexts` past
+    /// `max_traces`. Pre-fix, two threads could each observe
+    /// `len < max` after a `cleanup_expired` and both insert,
+    /// producing `len > max`. The new atomic `try_reserve_slot` CAS
+    /// gate guarantees the cap is hard.
+    #[test]
+    fn create_context_concurrent_inserts_do_not_exceed_max_traces() {
+        use std::sync::Arc;
+        use std::thread;
+
+        const MAX_TRACES: usize = 32;
+        let store = Arc::new(
+            ContextStore::new(MAX_TRACES, 10, Duration::from_secs(60))
+                .with_sampling(SamplingStrategy::AlwaysOn),
+        );
+
+        let node_id = test_node_id();
+        let n_threads = 16;
+        let attempts_per_thread = 8; // 16 * 8 = 128 total attempts
+
+        let barrier = Arc::new(std::sync::Barrier::new(n_threads));
+        let mut handles = Vec::new();
+        for _ in 0..n_threads {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..attempts_per_thread {
+                    let _ = store.create_context(node_id);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        let stats = store.stats();
+        assert!(
+            stats.active_traces <= MAX_TRACES as u64,
+            "active_traces ({}) exceeded MAX_TRACES ({}) — admission gate \
+             must hold under concurrent inserts (BUG #136)",
+            stats.active_traces,
+            MAX_TRACES,
+        );
+        // Also verify dropped_traces accounts for at least some
+        // attempts that were rejected at capacity.
+        assert!(
+            stats.dropped_traces > 0,
+            "with 128 attempts and a cap of 32, some inserts must have been dropped",
+        );
+    }
+
+    /// `complete_trace` releases an `active_count` slot so the
+    /// store can re-admit after a trace finishes. Without this,
+    /// the BUG #136 atomic counter would leak slots and the
+    /// admission gate would refuse new traces even after the
+    /// `contexts` map shrinks.
+    #[test]
+    fn complete_trace_re_admits_capacity() {
+        let store = ContextStore::new(2, 10, Duration::from_secs(60))
+            .with_sampling(SamplingStrategy::AlwaysOn);
+        let node_id = test_node_id();
+
+        let ctx1 = store.create_context(node_id).unwrap();
+        let _ctx2 = store.create_context(node_id).unwrap();
+        // At cap → next create must be rejected.
+        assert!(matches!(
+            store.create_context(node_id),
+            Err(ContextError::CapacityExceeded)
+        ));
+
+        // Complete one trace; the slot must be released and a new
+        // create must succeed.
+        store.complete_trace(&ctx1.trace_id);
+        assert!(
+            store.create_context(node_id).is_ok(),
+            "complete_trace must release a slot for re-admission",
+        );
     }
 
     #[test]

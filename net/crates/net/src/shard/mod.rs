@@ -581,10 +581,24 @@ impl ShardManager {
     /// distribution this amortizes lock acquisitions from O(events) to
     /// O(shards). Backpressure semantics match per-event `ingest_raw`.
     ///
-    /// Returns the number of successfully ingested events.
-    pub fn ingest_raw_batch(&self, events: Vec<RawEvent>) -> usize {
+    /// Returns `(success, unrouted)` where `success` is the count of
+    /// events successfully pushed onto a shard's ring buffer and
+    /// `unrouted` is the count of events whose destination shard was
+    /// not present in the routing table at the time of dispatch
+    /// (e.g. concurrent scale-down). The remainder
+    /// (`total - success - unrouted`) is the backpressure-class drop
+    /// count.
+    ///
+    /// BUG #155: pre-fix this returned only `success` (a single
+    /// `usize`); the bus computed `dropped = total - success` and
+    /// added `dropped` to `events_dropped` — but `unrouted` events
+    /// had ALREADY been counted on `events_unrouted` inside this
+    /// function, so the same event ended up in both stats.
+    /// Returning the unrouted count separately lets the bus subtract
+    /// it before publishing `events_dropped`.
+    pub fn ingest_raw_batch(&self, events: Vec<RawEvent>) -> (usize, usize) {
         if events.is_empty() {
-            return 0;
+            return (0, 0);
         }
 
         let table = self.table.load();
@@ -595,7 +609,7 @@ impl ShardManager {
         let mut groups: Vec<Vec<Bytes>> = (0..table.shards.len()).map(|_| Vec::new()).collect();
         let mut group_ids: Vec<u16> = vec![0; groups.len()];
 
-        let mut unrouted = 0u64;
+        let mut unrouted = 0usize;
         for event in events {
             let shard_id = self.select_shard_by_hash(event.hash());
             let Some(idx) = self.resolve_idx(&table, shard_id) else {
@@ -616,7 +630,7 @@ impl ShardManager {
         }
         if unrouted > 0 {
             self.events_unrouted
-                .fetch_add(unrouted, AtomicOrdering::Relaxed);
+                .fetch_add(unrouted as u64, AtomicOrdering::Relaxed);
         }
 
         let mut success = 0usize;
@@ -639,7 +653,7 @@ impl ShardManager {
             }
         }
 
-        success
+        (success, unrouted)
     }
 
     /// Get a reference to a shard by ID.
@@ -1064,8 +1078,9 @@ mod tests {
             .map(|e| manager.select_shard_by_hash(e.hash()))
             .collect();
 
-        let success = manager.ingest_raw_batch(events.clone());
+        let (success, unrouted) = manager.ingest_raw_batch(events.clone());
         assert_eq!(success, 200, "all events should land with ample capacity");
+        assert_eq!(unrouted, 0, "no scale-down so no unrouted events");
 
         // Aggregate totals must match.
         let stats = manager.stats();
@@ -1127,8 +1142,9 @@ mod tests {
             .map(|i| RawEvent::from_str(&format!(r#"{{"i":{}}}"#, i)))
             .collect();
 
-        let success = manager.ingest_raw_batch(events);
+        let (success, unrouted) = manager.ingest_raw_batch(events);
         assert_eq!(success, 3, "only 3 should fit under DropNewest");
+        assert_eq!(unrouted, 0, "single-shard config has no unrouted events");
 
         let stats = manager.stats();
         assert_eq!(stats.events_ingested, 3);
@@ -1139,7 +1155,7 @@ mod tests {
     #[test]
     fn test_ingest_raw_batch_empty() {
         let manager = ShardManager::new(4, 1024, BackpressureMode::DropNewest);
-        assert_eq!(manager.ingest_raw_batch(Vec::new()), 0);
+        assert_eq!(manager.ingest_raw_batch(Vec::new()), (0, 0));
         let stats = manager.stats();
         assert_eq!(stats.events_ingested, 0);
         assert_eq!(stats.events_dropped, 0);

@@ -672,6 +672,17 @@ impl MigrationSubprotocolHandler {
                 let _ = self
                     .orchestrator
                     .abort_migration_with_reason(daemon_origin, reason);
+                // BUG #111: also drop any partial reassembler we
+                // accumulated as the target. Pre-fix only the
+                // local-source-failure path (`fail_migration_with_reason`,
+                // line ~1061) cleared this, so an inbound
+                // `MigrationFailed` after the target had received
+                // some snapshot chunks left ~`chunk_size *
+                // chunks_received` bytes pinned in the DashMap
+                // forever (or until the same origin migrated again
+                // with a higher `seq_through`). With many ephemeral
+                // daemons this was an unbounded leak.
+                self.reassemblers.remove(&daemon_origin);
             }
 
             MigrationMessage::BufferedEvents {

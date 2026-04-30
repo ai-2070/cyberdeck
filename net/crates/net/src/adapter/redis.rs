@@ -231,6 +231,21 @@ impl std::fmt::Debug for RedisAdapter {
 #[async_trait]
 impl Adapter for RedisAdapter {
     async fn init(&mut self) -> Result<(), AdapterError> {
+        // BUG #71: idempotency. Same hazard pattern as
+        // `JetStreamAdapter::init` — a second `init` would have
+        // dropped the prior connection-manager (and any in-flight
+        // publishes piggybacking on it) when assigning
+        // `self.conn = Some(conn)`. Now we no-op when already
+        // initialized and log at warn so a misbehaving caller is
+        // observable.
+        if self.initialized.load(Ordering::Acquire) {
+            tracing::warn!(
+                adapter = "redis",
+                "Redis adapter::init called twice; ignoring (BUG #71)"
+            );
+            return Ok(());
+        }
+
         let conn = self
             .client
             .get_connection_manager()

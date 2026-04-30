@@ -2924,9 +2924,20 @@ impl MeshNode {
         // `tx_credit_remaining` without touching the inbound event
         // queue. The grant payload is an event frame carrying a
         // 12-byte `StreamWindow` message.
+        //
+        // BUG #147: pre-fix this used `events.into_iter().next()`,
+        // dropping every grant past the first when a peer batched
+        // multiple stream credits into one event-frame packet (the
+        // codec supports multi-event frames, and `StreamWindow` is
+        // fixed-size at 16 bytes — there's no codec ambiguity).
+        // The dropped grants stalled their streams until the
+        // sender retransmitted; `apply_authoritative_grant` is
+        // monotonic so retransmits eventually caught up
+        // (efficiency loss, not data loss). Now we iterate the
+        // full event vector and apply each grant.
         if parsed.header.subprotocol_id == SUBPROTOCOL_STREAM_WINDOW {
             let events = EventFrame::read_events(Bytes::from(decrypted), parsed.header.event_count);
-            if let Some(payload) = events.into_iter().next() {
+            for payload in events {
                 match StreamWindow::decode(&payload) {
                     Ok(grant) => {
                         // Quarantine guard: a grant that arrives for a

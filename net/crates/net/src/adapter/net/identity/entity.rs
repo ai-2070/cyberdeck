@@ -172,9 +172,27 @@ pub struct EntityKeypair {
 
 impl EntityKeypair {
     /// Generate a new random keypair.
+    ///
+    /// BUG #150: pre-fix this called
+    /// `getrandom::fill(...).expect("getrandom failed")`, which on
+    /// kernel-RNG failure (FD pressure, sandbox restriction,
+    /// kernel hang) panicked and unwound through any
+    /// `extern "C"` frame above (these helpers are reachable from
+    /// the FFI bindings under `ffi/mesh.rs`) — undefined behaviour.
+    /// `getrandom::fill` failure is a fatal condition for an
+    /// identity layer that issues secret keys (predictable bytes
+    /// produce a forgeable ed25519 secret), so the safe response
+    /// is to terminate the process rather than unwind. We use
+    /// `std::process::abort()` instead of `expect`/`panic!` because
+    /// `abort` does not unwind and is `extern "C"`-safe.
     pub fn generate() -> Self {
         let mut rng_bytes = [0u8; 32];
-        getrandom::fill(&mut rng_bytes).expect("getrandom failed");
+        if let Err(e) = getrandom::fill(&mut rng_bytes) {
+            eprintln!(
+                "FATAL: EntityKeypair::generate getrandom failure ({e:?}); aborting to avoid weak ed25519 secret"
+            );
+            std::process::abort();
+        }
         let signing_key = SigningKey::from_bytes(&rng_bytes);
         // Zeroize secret material — volatile write prevents optimizer elision
         for byte in rng_bytes.iter_mut() {

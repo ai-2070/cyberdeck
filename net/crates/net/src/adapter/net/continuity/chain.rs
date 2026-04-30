@@ -68,6 +68,17 @@ pub struct ContinuityProof {
 /// Wire size of a ContinuityProof.
 pub const CONTINUITY_PROOF_SIZE: usize = 36; // 4 + 8 + 8 + 8 + 8
 
+/// Maximum number of events `ContinuityProof::verify_against` will
+/// walk between `from_seq` and `to_seq` (inclusive). Without this
+/// cap, a peer could ship a proof spanning `[0, u64::MAX]` and force
+/// the verifier into a multi-billion-event walk on every dispatch.
+/// 1M is far past any realistic single-proof span (snapshots prune
+/// the chain to a small replay tail; long-lived chains use
+/// snapshot-anchored proofs that span far less than 1M events) and
+/// bounds verification cost at a fixed multiple of the chain's
+/// memory footprint. (BUG #98)
+pub const MAX_PROOF_VERIFY_SPAN: u64 = 1_000_000;
+
 impl ContinuityProof {
     /// Extract a proof from a local entity log.
     ///
@@ -99,39 +110,100 @@ impl ContinuityProof {
 
     /// Verify this proof against a local entity log.
     ///
-    /// Checks that the hash values match what the local log has
-    /// for the same sequence numbers.
+    /// Walks the entire event range `[from_seq, to_seq]`,
+    /// re-computing each `parent_hash` and asserting it matches
+    /// the chain link emitted by the previous event. The endpoint
+    /// hashes (`from_hash` / `to_hash`) are also verified against
+    /// the local log.
+    ///
+    /// BUG #98: pre-fix this only checked the two endpoint events
+    /// and never iterated the events between them — a malicious
+    /// intermediary holding events 0 and 999 could ship a proof
+    /// spanning `[0, 999]` with the correct two endpoint hashes
+    /// and `verify_against` accepted it, even though events 1..998
+    /// could be missing or fabricated. That defeated the whole
+    /// point of the proof. There was also no `from_seq <= to_seq`
+    /// check (reversed bounds were accepted) and no upper bound on
+    /// the walk — a peer could force a multi-billion-event scan.
+    /// Now: reject reversed bounds, cap the span at
+    /// [`MAX_PROOF_VERIFY_SPAN`], walk every event in range, and
+    /// validate each consecutive `parent_hash` link.
     pub fn verify_against(&self, log: &EntityLog) -> Result<(), ProofError> {
         if self.origin_hash != log.origin_hash() {
             return Err(ProofError::OriginMismatch);
         }
+        if self.from_seq > self.to_seq {
+            return Err(ProofError::InvalidRange {
+                from_seq: self.from_seq,
+                to_seq: self.to_seq,
+            });
+        }
+        // BUG #98: bound the walk. `to_seq - from_seq` is the
+        // *count - 1*; reject any span that would exceed
+        // MAX_PROOF_VERIFY_SPAN events (well past realistic).
+        let span = self.to_seq.saturating_sub(self.from_seq);
+        if span >= MAX_PROOF_VERIFY_SPAN {
+            return Err(ProofError::SpanTooLarge {
+                from_seq: self.from_seq,
+                to_seq: self.to_seq,
+                cap: MAX_PROOF_VERIFY_SPAN,
+            });
+        }
 
-        let from_events = log.range(self.from_seq, self.from_seq);
-        if let Some(event) = from_events.first() {
-            let local_hash = compute_parent_hash(&event.link, &event.payload);
-            if local_hash != self.from_hash {
-                return Err(ProofError::HashMismatch {
-                    seq: self.from_seq,
-                    expected: self.from_hash,
-                    got: local_hash,
-                });
-            }
-        } else {
+        let events = log.range(self.from_seq, self.to_seq);
+        if events.is_empty() {
             return Err(ProofError::MissingEvent(self.from_seq));
         }
 
-        let to_events = log.range(self.to_seq, self.to_seq);
-        if let Some(event) = to_events.first() {
-            let local_hash = compute_parent_hash(&event.link, &event.payload);
-            if local_hash != self.to_hash {
+        // Verify the FIRST event matches `from_hash` and its
+        // sequence is exactly `from_seq` (range may legitimately
+        // start later if `from_seq < log.first_seq`, in which case
+        // we treat the first slot as missing).
+        let first = &events[0];
+        if first.link.sequence != self.from_seq {
+            return Err(ProofError::MissingEvent(self.from_seq));
+        }
+        let from_local = compute_parent_hash(&first.link, &first.payload);
+        if from_local != self.from_hash {
+            return Err(ProofError::HashMismatch {
+                seq: self.from_seq,
+                expected: self.from_hash,
+                got: from_local,
+            });
+        }
+
+        // Walk each consecutive pair: every event's `parent_hash`
+        // must equal the prior event's forward hash, and the
+        // sequence must be strictly +1.
+        for i in 1..events.len() {
+            let prev = &events[i - 1];
+            let curr = &events[i];
+            if curr.link.sequence != prev.link.sequence + 1 {
+                return Err(ProofError::MissingEvent(prev.link.sequence + 1));
+            }
+            let expected_parent = compute_parent_hash(&prev.link, &prev.payload);
+            if curr.link.parent_hash != expected_parent {
                 return Err(ProofError::HashMismatch {
-                    seq: self.to_seq,
-                    expected: self.to_hash,
-                    got: local_hash,
+                    seq: curr.link.sequence,
+                    expected: expected_parent,
+                    got: curr.link.parent_hash,
                 });
             }
-        } else {
+        }
+
+        // Verify the LAST event matches `to_hash` and its sequence
+        // is exactly `to_seq` (the walk above guarantees no gap).
+        let last = events.last().unwrap();
+        if last.link.sequence != self.to_seq {
             return Err(ProofError::MissingEvent(self.to_seq));
+        }
+        let to_local = compute_parent_hash(&last.link, &last.payload);
+        if to_local != self.to_hash {
+            return Err(ProofError::HashMismatch {
+                seq: self.to_seq,
+                expected: self.to_hash,
+                got: to_local,
+            });
         }
 
         Ok(())
@@ -270,6 +342,23 @@ pub enum ProofError {
     },
     /// Event at the given sequence is missing from the local log.
     MissingEvent(u64),
+    /// Proof has `from_seq > to_seq` — reversed bounds (BUG #98).
+    InvalidRange {
+        /// Lower bound declared by the proof.
+        from_seq: u64,
+        /// Upper bound declared by the proof.
+        to_seq: u64,
+    },
+    /// Proof span exceeds [`MAX_PROOF_VERIFY_SPAN`] (BUG #98) —
+    /// `to_seq - from_seq` is too large to walk safely.
+    SpanTooLarge {
+        /// Lower bound declared by the proof.
+        from_seq: u64,
+        /// Upper bound declared by the proof.
+        to_seq: u64,
+        /// Configured maximum span the verifier will walk.
+        cap: u64,
+    },
 }
 
 impl std::fmt::Display for ProofError {
@@ -284,6 +373,20 @@ impl std::fmt::Display for ProofError {
                 )
             }
             Self::MissingEvent(seq) => write!(f, "missing event at seq {}", seq),
+            Self::InvalidRange { from_seq, to_seq } => write!(
+                f,
+                "invalid proof range: from_seq ({}) > to_seq ({})",
+                from_seq, to_seq
+            ),
+            Self::SpanTooLarge {
+                from_seq,
+                to_seq,
+                cap,
+            } => write!(
+                f,
+                "proof span too large: from_seq={}, to_seq={}, cap={}",
+                from_seq, to_seq, cap
+            ),
         }
     }
 }
@@ -478,5 +581,100 @@ mod tests {
         let kp = EntityKeypair::generate();
         let log = EntityLog::new(kp.entity_id().clone());
         assert!(ContinuityProof::from_log(&log).is_none());
+    }
+
+    // ========================================================================
+    // BUG #98: verify_against must walk the full chain, not just endpoints
+    // ========================================================================
+
+    /// `verify_against` rejects a proof whose middle is missing or
+    /// fabricated even when the two endpoint hashes are correct.
+    /// Pre-fix the verifier only checked `from_seq` and `to_seq`,
+    /// so an attacker holding only events 1 and N could ship a
+    /// proof spanning `[1, N]` and have it accepted.
+    ///
+    /// Setup: build a 5-event log, capture a proof from it, then
+    /// build a separate log with events 1 and 5 only (events 2..4
+    /// missing). Verifying the original proof against the
+    /// gap-laden log must fail.
+    #[test]
+    fn verify_against_rejects_proof_when_middle_events_are_missing() {
+        // Reference log + proof.
+        let (full_log, _) = build_log(5);
+        let proof = ContinuityProof::from_log(&full_log).unwrap();
+
+        // Build a peer log with only the first and last events
+        // (gap in between). We fake this by building a fresh log,
+        // appending event 1 (which is genesis-successor), then
+        // pruning through seq 4 — that leaves event 5 as the only
+        // entry with `base_link.sequence == 4`. Then the verify
+        // walk for `[1, 5]` finds events[0].sequence == 5, not 1.
+        let kp = EntityKeypair::generate();
+        let mut peer_log = EntityLog::new(full_log.entity_id().clone());
+        let _ = kp; // silence unused — we need the same origin
+        // Replicate full_log's chain into peer_log so origin matches.
+        for ev in full_log.range(1, 5) {
+            peer_log.append((*ev).clone()).unwrap();
+        }
+        // Drop events 2..4 by pruning through 4 (leaves event 5).
+        peer_log.prune_through(4);
+
+        // The proof spans `[1, 5]`. With events 1..4 missing, the
+        // verifier's first range lookup must surface a missing-event
+        // error rather than silently passing on the endpoints.
+        let result = proof.verify_against(&peer_log);
+        assert!(
+            matches!(result, Err(ProofError::MissingEvent(_))),
+            "verify_against must reject when middle events are missing (BUG #98), got {:?}",
+            result,
+        );
+    }
+
+    /// `verify_against` rejects a proof with reversed bounds
+    /// (`from_seq > to_seq`). Pre-fix there was no range check, so
+    /// a malformed proof could pass through the endpoint match if
+    /// both seqs happened to coincide (or be present in the log).
+    #[test]
+    fn verify_against_rejects_proof_with_reversed_bounds() {
+        let (log, _) = build_log(5);
+        let mut proof = ContinuityProof::from_log(&log).unwrap();
+        // Forge reversed bounds.
+        std::mem::swap(&mut proof.from_seq, &mut proof.to_seq);
+        let result = proof.verify_against(&log);
+        assert!(
+            matches!(result, Err(ProofError::InvalidRange { .. })),
+            "verify_against must reject reversed bounds (BUG #98), got {:?}",
+            result,
+        );
+    }
+
+    /// `verify_against` rejects a proof whose span exceeds
+    /// `MAX_PROOF_VERIFY_SPAN`. Pre-fix the walk was unbounded — a
+    /// peer could ship a proof spanning `[0, u64::MAX]` and force
+    /// a multi-billion-event scan on every dispatch.
+    #[test]
+    fn verify_against_rejects_proof_with_oversized_span() {
+        let (log, _) = build_log(5);
+        let mut proof = ContinuityProof::from_log(&log).unwrap();
+        proof.from_seq = 0;
+        proof.to_seq = MAX_PROOF_VERIFY_SPAN + 1;
+        let result = proof.verify_against(&log);
+        assert!(
+            matches!(result, Err(ProofError::SpanTooLarge { .. })),
+            "verify_against must reject spans over MAX_PROOF_VERIFY_SPAN (BUG #98), got {:?}",
+            result,
+        );
+    }
+
+    /// `verify_against` accepts a proof whose intermediate links
+    /// are all valid — pins the success path so the new walk
+    /// doesn't accidentally lock out legitimate chains.
+    #[test]
+    fn verify_against_accepts_intact_chain_with_intermediate_events() {
+        let (log, _) = build_log(10);
+        let proof = ContinuityProof::from_log(&log).unwrap();
+        proof
+            .verify_against(&log)
+            .expect("intact chain must verify");
     }
 }

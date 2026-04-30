@@ -64,16 +64,25 @@ pub(crate) const NET_ERR_STREAM_ENDED: c_int = 2;
 /// One tokio runtime, lazily initialized, used by every CortEX /
 /// RedEX FFI call. The watch / tail cursors rely on a single runtime
 /// so the spawned forwarding tasks survive across cursor calls.
+/// BUG #61: `eprintln! + std::process::abort()` on builder failure
+/// instead of `expect`-panic. See `ffi/mesh.rs::runtime()` for the
+/// full rationale.
 fn runtime() -> &'static Arc<Runtime> {
     use std::sync::OnceLock;
     static RT: OnceLock<Arc<Runtime>> = OnceLock::new();
     RT.get_or_init(|| {
-        Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("cortex ffi tokio runtime"),
-        )
+        match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => Arc::new(rt),
+            Err(e) => {
+                eprintln!(
+                    "FATAL: cortex FFI tokio runtime build failure ({e:?}); aborting to avoid panic across the FFI boundary"
+                );
+                std::process::abort();
+            }
+        }
     })
 }
 

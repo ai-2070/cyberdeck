@@ -152,8 +152,19 @@ impl PermissionToken {
         delegation_depth: u8,
     ) -> Self {
         let now = current_timestamp();
+        // BUG #150: abort on `getrandom` failure rather than
+        // panic-unwinding through the FFI boundary. Token nonces
+        // need uniqueness (replay-distinct re-issues), and a
+        // predictable nonce + signed payload would let an attacker
+        // re-mint identical-looking tokens — termination is the
+        // only safe response.
         let mut nonce_bytes = [0u8; 8];
-        getrandom::fill(&mut nonce_bytes).expect("getrandom failed");
+        if let Err(e) = getrandom::fill(&mut nonce_bytes) {
+            eprintln!(
+                "FATAL: PermissionToken nonce getrandom failure ({e:?}); aborting to avoid predictable token nonce"
+            );
+            std::process::abort();
+        }
         let nonce = u64::from_le_bytes(nonce_bytes);
 
         let mut token = Self {
@@ -294,8 +305,19 @@ impl PermissionToken {
         // clock read instead of two. Avoids the near-zero-lifetime
         // bug when the parent is near expiry.
         let now = current_timestamp();
+        // BUG #150: abort on `getrandom` failure rather than
+        // panic-unwinding through the FFI boundary. Token nonces
+        // need uniqueness (replay-distinct re-issues), and a
+        // predictable nonce + signed payload would let an attacker
+        // re-mint identical-looking tokens — termination is the
+        // only safe response.
         let mut nonce_bytes = [0u8; 8];
-        getrandom::fill(&mut nonce_bytes).expect("getrandom failed");
+        if let Err(e) = getrandom::fill(&mut nonce_bytes) {
+            eprintln!(
+                "FATAL: PermissionToken nonce getrandom failure ({e:?}); aborting to avoid predictable token nonce"
+            );
+            std::process::abort();
+        }
         let nonce = u64::from_le_bytes(nonce_bytes);
 
         let mut child = Self {

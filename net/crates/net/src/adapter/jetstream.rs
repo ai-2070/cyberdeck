@@ -195,6 +195,22 @@ impl std::fmt::Debug for JetStreamAdapter {
 #[async_trait]
 impl Adapter for JetStreamAdapter {
     async fn init(&mut self) -> Result<(), AdapterError> {
+        // BUG #71: idempotency. Pre-fix a second `init` call
+        // overwrote `client`/`jetstream`, dropping the prior
+        // client and any in-flight publishes — an orchestrator
+        // calling `init` defensively after a perceived failure
+        // silently lost messages. The trait says "Called once
+        // before any other methods" but didn't enforce it. Now
+        // we no-op when already initialized and log at warn so a
+        // misbehaving caller is observable.
+        if self.initialized.load(Ordering::Acquire) {
+            tracing::warn!(
+                adapter = "jetstream",
+                "JetStream adapter::init called twice; ignoring (BUG #71)"
+            );
+            return Ok(());
+        }
+
         let client = async_nats::ConnectOptions::new()
             .connection_timeout(self.config.connect_timeout)
             .request_timeout(Some(self.config.request_timeout))

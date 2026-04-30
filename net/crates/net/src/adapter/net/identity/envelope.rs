@@ -196,8 +196,19 @@ impl IdentityEnvelope {
 
         // Ephemeral X25519 keypair. `StaticSecret` is zeroize-on-drop,
         // so `eph_sk` is wiped as soon as the function returns.
+        //
+        // BUG #150: aborts on `getrandom` failure rather than
+        // panic-unwinding through the FFI boundary; same
+        // rationale as `EntityKeypair::generate`. A predictable
+        // X25519 ephemeral secret defeats the envelope's forward
+        // secrecy, so termination is the only safe response.
         let mut rng_bytes = [0u8; 32];
-        getrandom::fill(&mut rng_bytes).expect("getrandom failed");
+        if let Err(e) = getrandom::fill(&mut rng_bytes) {
+            eprintln!(
+                "FATAL: IdentityEnvelope::seal getrandom failure ({e:?}); aborting to avoid weak X25519 ephemeral"
+            );
+            std::process::abort();
+        }
         let eph_sk = X25519Secret::from(rng_bytes);
         volatile_zero(&mut rng_bytes);
         let eph_pk = X25519Pub::from(&eph_sk);

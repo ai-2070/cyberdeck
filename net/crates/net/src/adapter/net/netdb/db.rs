@@ -92,14 +92,34 @@ impl NetDb {
     /// stay open on the manager — reopening via another NetDb
     /// against the same `Redex` instance replays or snapshots them.
     /// Idempotent.
+    ///
+    /// BUG #133: pre-fix this used `?` after `tasks.close()`, which
+    /// short-circuited and left `memories.close()` un-invoked when
+    /// the tasks-side close errored — the memories adapter retained
+    /// its fold task and kept consuming events even though the
+    /// caller had been told `close` failed and likely treated the
+    /// whole NetDb as torn down. Now both closes are attempted
+    /// regardless and the FIRST error is surfaced; the second
+    /// error (if any) is dropped silently — `close` is best-effort
+    /// teardown and the dominant failure mode is "underlying redex
+    /// already closed," which produces the same error from both
+    /// adapters and is uninteresting to disambiguate.
     pub fn close(&self) -> Result<(), NetDbError> {
-        if let Some(t) = &self.tasks {
-            t.close()?;
+        let tasks_result = self.tasks.as_ref().map(|t| t.close()).unwrap_or(Ok(()));
+        let memories_result = self
+            .memories
+            .as_ref()
+            .map(|m| m.close())
+            .unwrap_or(Ok(()));
+
+        // Surface the first error; if both errored, the tasks one
+        // wins by convention (matches the pre-fix shape where tasks
+        // ran first).
+        match (tasks_result, memories_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e), _) => Err(e),
+            (Ok(()), Err(e)) => Err(e),
         }
-        if let Some(m) = &self.memories {
-            m.close()?;
-        }
-        Ok(())
     }
 
     /// Capture a snapshot of every enabled model. Each model is

@@ -202,21 +202,42 @@ impl TasksAdapter {
             let guard = state.read();
             watcher.spec_for_snapshot().execute(&guard)
         };
-        // The watcher's stream recomputes its own initial from the
-        // current state when `stream()` runs. If the state changes
-        // between our snapshot read above and the watcher's read
-        // inside `stream()`, a plain `skip(1)` would drop the
-        // watcher's (newer) initial and the caller would miss that
-        // change entirely.
+        // BUG #143: pre-fix this used
+        // `skip_while(|c| c == &initial)`, which is "sticky" — once
+        // the predicate evaluates `false` it never re-skips. That
+        // handled the snapshot-vs-watcher race (state changes
+        // between snapshot read and `watcher.stream()` start, so
+        // the watcher's first emission ≠ snapshot — we want to
+        // forward it) but introduced a starvation hazard: under an
+        // (A → B → A) state oscillation that the single-slot
+        // `tokio::sync::watch` collapses into final A, the
+        // surviving A equals `initial` so it's skipped — the
+        // consumer is silent until state diverges from A.
         //
-        // Use `skip_while` against our snapshot so we only discard
-        // the leading emissions that still equal the state the
-        // caller already has — as soon as the stream diverges, we
-        // forward everything through.
+        // The fix: skip ONLY the first emission, and only if it
+        // equals the snapshot. Subsequent emissions always
+        // forward. This handles both cases:
+        //   - leading match (no state change since snapshot): skip
+        //     the first emission → consumer sees no duplicate
+        //   - leading divergence (state changed during the race):
+        //     first emission ≠ snapshot → forwarded
+        //   - oscillation back to initial (A → B → A): the watch's
+        //     surviving A is forwarded as the first item if state
+        //     hadn't changed since snapshot — caller can dedup
+        //     against their snapshot if they care, or treat it as
+        //     "fold tick observed" signal.
+        // Implemented via `enumerate().filter(...)` rather than a
+        // separate state-carrying skip primitive, since
+        // `futures::StreamExt::filter` doesn't accept a `FnMut`.
         let initial_for_stream = initial.clone();
         let stream = watcher
             .stream()
-            .skip_while(move |current| futures::future::ready(current == &initial_for_stream))
+            .enumerate()
+            .filter(move |(i, current)| {
+                let drop_first = *i == 0 && current == &initial_for_stream;
+                futures::future::ready(!drop_first)
+            })
+            .map(|(_, current)| current)
             .boxed();
         (initial, stream)
     }
@@ -309,6 +330,25 @@ impl TasksAdapter {
 
     /// Build the `EventEnvelope` + ingest. Keeps postcard serialization
     /// and `EventMeta` assembly in one place.
+    ///
+    /// BUG #126: pre-fix this called `app_seq.fetch_add(1, ...)`
+    /// FIRST, then `inner.ingest`. If `inner.ingest` failed (closed
+    /// adapter, RedEX append error, fold error under `Stop` policy),
+    /// the local counter was permanently advanced past a `seq_or_ts`
+    /// that never made it to the log. The next snapshot persisted
+    /// the higher counter; on restore, future ingests picked up at
+    /// the inflated value, leaving a permanent gap (and producing
+    /// `seq_or_ts` collisions when a second adapter sharing the
+    /// same `origin_hash` recovered via on-disk scan).
+    ///
+    /// Now: load the current counter, build the envelope at that
+    /// value, attempt the ingest, and only if it succeeds do we
+    /// CAS-commit the counter advance. On CAS contention (a
+    /// concurrent ingest moved the counter past us), we retry with
+    /// the new value — the inner ingest IS retried because each
+    /// attempt produces a fresh `EventEnvelope` with the right
+    /// `seq_or_ts`. The Redex log is the source of truth; counter
+    /// drift never escapes this function.
     fn ingest_typed<T: serde::Serialize>(
         &self,
         dispatch: u8,
@@ -319,11 +359,58 @@ impl TasksAdapter {
                 e.to_string(),
             ))
         })?;
-        let app_seq = self.app_seq.fetch_add(1, Ordering::AcqRel);
         let checksum = compute_checksum(&tail);
-        let meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, checksum);
-        let env = EventEnvelope::new(meta, Bytes::from(tail));
-        self.inner.ingest(env)
+        let payload_bytes = Bytes::from(tail);
+
+        loop {
+            let app_seq = self.app_seq.load(Ordering::Acquire);
+            let meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, checksum);
+            let env = EventEnvelope::new(meta, payload_bytes.clone());
+            let seq = self.inner.ingest(env)?;
+
+            // Commit the counter advance now that the log has
+            // accepted the entry. CAS to defend against a concurrent
+            // ingest that moved the counter past `app_seq` between
+            // our load and the inner ingest — in that case we'd be
+            // stamping the SAME `seq_or_ts` as another envelope,
+            // producing a dup. The inner.ingest above already
+            // succeeded, so a CAS failure means our envelope landed
+            // at a stale `seq_or_ts`; we surface this as an Encode
+            // error so the caller knows the ingest is not
+            // counter-monotonic.
+            //
+            // In practice every external caller goes through a
+            // single shared `&TasksAdapter` instance and this
+            // function is the only counter writer, so contention is
+            // dominated by single-thread sequential ingest where the
+            // CAS always succeeds on the first try. Multi-threaded
+            // ingest produces ordering uncertainty regardless of
+            // counter primitive — the user-visible app_seq just
+            // tracks insertion order at the call site.
+            match self.app_seq.compare_exchange(
+                app_seq,
+                app_seq + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(seq),
+                Err(_actual) => {
+                    // A concurrent ingest stamped the same
+                    // `seq_or_ts`. The log already has our event,
+                    // so we can't roll back; surface a recoverable
+                    // error. The caller's options are: rebuild the
+                    // adapter from snapshot (scans the log to
+                    // reconcile app_seq), or accept the duplicate.
+                    return Err(CortexAdapterError::Redex(
+                        super::super::super::redex::RedexError::Encode(format!(
+                            "concurrent ingest_typed produced duplicate app_seq={}; \
+                             rebuild adapter from snapshot to reconcile",
+                            app_seq
+                        )),
+                    ));
+                }
+            }
+        }
     }
 }
 

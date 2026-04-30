@@ -200,17 +200,22 @@ impl MemoriesAdapter {
             let guard = state.read();
             watcher.spec_for_snapshot().execute(&guard)
         };
-        // The watcher recomputes its own initial from live state in
-        // `stream()`. A plain `skip(1)` would silently drop that
-        // value, so if the state mutated between our snapshot and
-        // the watcher's read the caller would never learn about it.
-        // Instead, drop only while the stream still matches the
-        // snapshot we already returned — any diverging emission is
-        // forwarded.
+        // BUG #143: pre-fix used the sticky `skip_while`, which
+        // starves consumers under (A → B → A) state oscillations
+        // collapsed by the single-slot `tokio::sync::watch` — see
+        // `tasks/adapter.rs::snapshot_and_watch` for the full
+        // rationale. The fix here is identical: skip ONLY the first
+        // emission if it still equals the snapshot, forward
+        // everything after that.
         let initial_for_stream = initial.clone();
         let stream = watcher
             .stream()
-            .skip_while(move |current| futures::future::ready(current == &initial_for_stream))
+            .enumerate()
+            .filter(move |(i, current)| {
+                let drop_first = *i == 0 && current == &initial_for_stream;
+                futures::future::ready(!drop_first)
+            })
+            .map(|(_, current)| current)
             .boxed();
         (initial, stream)
     }
@@ -302,6 +307,11 @@ impl MemoriesAdapter {
         })
     }
 
+    /// BUG #126: see `tasks/adapter.rs::ingest_typed` for the full
+    /// rationale. Same hazard pattern: pre-fix `app_seq` advanced
+    /// before the inner ingest, leaving a phantom seq on
+    /// `inner.ingest` failure. Now: load → build envelope → ingest
+    /// → CAS-commit, mirroring the tasks adapter.
     fn ingest_typed<T: serde::Serialize>(
         &self,
         dispatch: u8,
@@ -312,11 +322,33 @@ impl MemoriesAdapter {
                 e.to_string(),
             ))
         })?;
-        let app_seq = self.app_seq.fetch_add(1, Ordering::AcqRel);
         let checksum = compute_checksum(&tail);
-        let meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, checksum);
-        let env = EventEnvelope::new(meta, Bytes::from(tail));
-        self.inner.ingest(env)
+        let payload_bytes = Bytes::from(tail);
+
+        loop {
+            let app_seq = self.app_seq.load(Ordering::Acquire);
+            let meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, checksum);
+            let env = EventEnvelope::new(meta, payload_bytes.clone());
+            let seq = self.inner.ingest(env)?;
+
+            match self.app_seq.compare_exchange(
+                app_seq,
+                app_seq + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(seq),
+                Err(_actual) => {
+                    return Err(CortexAdapterError::Redex(
+                        super::super::super::redex::RedexError::Encode(format!(
+                            "concurrent ingest_typed produced duplicate app_seq={}; \
+                             rebuild adapter from snapshot to reconcile",
+                            app_seq
+                        )),
+                    ));
+                }
+            }
+        }
     }
 }
 

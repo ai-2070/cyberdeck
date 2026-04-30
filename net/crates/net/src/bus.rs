@@ -278,12 +278,27 @@ impl EventBus {
             return;
         }
 
+        // BUG #65: idempotency check. Pre-fix a second
+        // `start_scaling_monitor` call overwrote the slot without
+        // aborting the previous `JoinHandle` — the displaced task
+        // continued running, holding a `Weak<EventBus>`, only
+        // exiting when it next observed `shutdown` or failed to
+        // upgrade. Two concurrent monitors briefly competed for
+        // `evaluate_scaling`'s lock, doubling the metrics-tick
+        // wakeup rate. Now we no-op when a monitor is already
+        // installed.
+        let mut slot = self.scaling_monitor.lock();
+        if slot.is_some() {
+            tracing::debug!("start_scaling_monitor: monitor already running, skipping");
+            return;
+        }
+
         let weak = Arc::downgrade(self);
         let handle = tokio::spawn(async move {
             run_scaling_monitor_via_weak(weak).await;
         });
 
-        *self.scaling_monitor.lock() = Some(handle);
+        *slot = Some(handle);
     }
 
     /// Internal: Add a new shard with its workers.
@@ -340,9 +355,41 @@ impl EventBus {
 
         // Step 3: workers are live — flip the shard to Active so
         // `select_shard` will route to it.
-        self.shard_manager
-            .activate_shard(new_id)
-            .map_err(|e| AdapterError::Fatal(e.to_string()))?;
+        //
+        // BUG #75: pre-fix an `activate_shard` error returned
+        // immediately, leaving the new sender in `batch_senders`,
+        // both `JoinHandle`s in `batch_workers`, and the
+        // `Provisioning` mapper entry. The drain worker then
+        // looped indefinitely on an empty ring buffer (`with_shard`
+        // still found the entry; `select_shard` skipped it). Each
+        // retry of `add_shard_internal` allocated a fresh id while
+        // the dead one squatted. Now we mirror
+        // `remove_shard_internal`'s teardown: on Err, drop the
+        // sender, abort both join handles, unmap the provisioning
+        // entry, then return.
+        if let Err(e) = self.shard_manager.activate_shard(new_id) {
+            tracing::warn!(
+                shard_id = new_id,
+                error = %e,
+                "activate_shard failed; rolling back provisioning state"
+            );
+            // 1. Drop the sender so the batch worker's `recv()`
+            //    eventually returns None.
+            self.batch_senders.write().remove(&new_id);
+            // 2. Abort and forget the worker handles. The drain
+            //    worker is held alive by the channel sender we
+            //    just dropped, but it's also pinned to a `with_shard`
+            //    poll loop on an empty buffer — abort it so it
+            //    exits regardless of channel state.
+            if let Some(workers) = self.batch_workers.lock().remove(&new_id) {
+                workers.drain.abort();
+                workers.batch.abort();
+            }
+            // 3. Unmap the Provisioning entry so the mapper can
+            //    reuse the slot on retry.
+            let _ = self.shard_manager.remove_shard(new_id);
+            return Err(AdapterError::Fatal(e.to_string()));
+        }
 
         // Update poll merger
         self.poll_merger.store(Arc::new(PollMerger::new(
@@ -552,13 +599,19 @@ impl EventBus {
         };
 
         let total = events.len();
-        let success = self.shard_manager.ingest_raw_batch(events);
+        let (success, unrouted) = self.shard_manager.ingest_raw_batch(events);
         if success > 0 {
             self.stats
                 .events_ingested
                 .fetch_add(success as u64, AtomicOrdering::Relaxed);
         }
-        let dropped = total.saturating_sub(success);
+        // BUG #155: subtract `unrouted` from the buffer-fullness drop
+        // count so the same event isn't tallied in both
+        // `events_unrouted` (bumped inside `ShardManager::ingest_raw_batch`)
+        // and `events_dropped` (which historically used `total -
+        // success`, double-counting unrouted events). Backpressure
+        // drops = events that reached a shard but failed to push.
+        let dropped = total.saturating_sub(success).saturating_sub(unrouted);
         if dropped > 0 {
             self.stats
                 .events_dropped
@@ -792,11 +845,22 @@ impl EventBus {
         //    to 10k events) from its ring buffer, sends it on the
         //    channel, and exits. After this loop, every event in
         //    the ring buffers has been pushed to its channel.
-        let mut batch_handles = Vec::with_capacity(workers.len());
-        for (_shard_id, ShardWorkers { batch, drain }) in workers {
-            let _ = drain.await;
-            batch_handles.push(batch);
-        }
+        //
+        // BUG #70: pre-fix this loop awaited each drain handle
+        // sequentially (`for ... { drain.await; }`), serializing
+        // shutdown wall-clock as N×T instead of max(T). The
+        // default 1024-shard config × per-shard final-drain time
+        // made shutdown painful. `join_all` lets the runtime
+        // overlap them.
+        let (drains, batch_handles): (Vec<_>, Vec<_>) = workers
+            .into_iter()
+            .map(|(_shard_id, ShardWorkers { batch, drain })| (drain, batch))
+            .unzip();
+        // We don't care about individual results — `JoinError` from
+        // a panicking drain worker would already have surfaced
+        // through `tracing::error` inside the worker itself. Just
+        // wait for all of them to terminate.
+        let _ = futures::future::join_all(drains).await;
 
         // 3. Drop the original senders so the channels close once
         //    drain-worker sender clones (already dropped above)
@@ -806,9 +870,9 @@ impl EventBus {
 
         // 4. Await batch workers. They drain their channel until
         //    `recv() = None`, flush, and exit.
-        for handle in batch_handles {
-            let _ = handle.await;
-        }
+        //
+        // BUG #70: same parallelization as the drain phase.
+        let _ = futures::future::join_all(batch_handles).await;
 
         // Flush and shutdown adapter (with timeout to prevent hanging)
         let timeout = self.config.adapter_timeout;
@@ -990,7 +1054,16 @@ async fn run_scaling_monitor_via_weak(weak: std::sync::Weak<EventBus>) {
             None => break,
         };
 
-        if bus.shutdown.load(AtomicOrdering::Relaxed) {
+        // BUG #69: SeqCst to match the writer side
+        // (`EventBus::shutdown` / `Drop`). The Acquire/Release
+        // handshake on `drain_finalize_ready` already provides the
+        // load-bearing happens-before today — but a future code
+        // change that piggybacks on `shutdown`'s ordering (e.g. a
+        // producer that observes shutdown without going through
+        // `try_enter_ingest`) would silently break under Relaxed.
+        // Aligning the read-side ordering with the writer-side
+        // SeqCst is a one-instruction tax for the safety.
+        if bus.shutdown.load(AtomicOrdering::SeqCst) {
             break;
         }
 
@@ -1220,8 +1293,16 @@ fn spawn_drain_worker_for_shard(
         let mut scratch: Vec<crate::event::InternalEvent> = Vec::with_capacity(STEADY_BATCH);
 
         loop {
-            // Relaxed: same rationale as ingest — see `EventBus::ingest`.
-            if shutdown.load(AtomicOrdering::Relaxed) {
+            // BUG #69: SeqCst to match the writer side
+            // (`EventBus::shutdown` / `Drop`). Pre-fix this used
+            // `Relaxed` with a misleading "same rationale as ingest"
+            // comment — `try_enter_ingest` itself uses SeqCst, and
+            // the Acquire/Release handshake on `drain_finalize_ready`
+            // (below) is what actually makes the producer-push
+            // happen-before visible. Aligning to SeqCst here makes
+            // the contract robust to future producer-side changes
+            // that might piggyback on `shutdown`'s ordering.
+            if shutdown.load(AtomicOrdering::SeqCst) {
                 // Before doing the final sweep, wait for `shutdown()`
                 // to release the finalize gate. The gate is set only
                 // after the in-flight ingest counter reaches zero,
