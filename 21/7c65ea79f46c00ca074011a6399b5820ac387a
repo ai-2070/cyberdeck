@@ -1,0 +1,36 @@
+net/crates/net/docs/HEARTBEAT_UNIFICATION_PLAN.md
+  87a1155ef08e0372 42,44-46,49-70,72-88,93-95,136,141,145,148-149,159
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "217c65ea79f46c00ca074011a6399b5820ac387a",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 747,
+      "total_deletions": 3,
+      "accepted_lines": 239,
+      "overriden_lines": 0
+    },
+    "87a1155ef08e0372": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b5ea4d3-c78f-41ae-8a52-1fab2ec6aaba",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 52,
+      "total_deletions": 16,
+      "accepted_lines": 52,
+      "overriden_lines": 0
+    }
+  }
+}
