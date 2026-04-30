@@ -1149,23 +1149,26 @@ mod tests {
         spoofer_handle.abort();
     }
 
-    /// Regression test for a cubic-flagged P2 bug: the old
-    /// `remove` impl went through `round_trip`, which waited up
-    /// to [`NATPMP_DEADLINE`] (1 s) for a response. On shutdown
-    /// / revoke against a silent-or-gone gateway that stalls
-    /// the mesh teardown by a full second per remove call —
-    /// multiplied by however many mappings we held.
+    /// Regression test for the `remove`-on-silent-gateway path.
+    /// History:
+    ///   - Original: `remove` went through `round_trip`, which
+    ///     waited up to [`NATPMP_DEADLINE`] (1 s) per call —
+    ///     mesh teardown stalled a full second per held mapping.
+    ///   - Then: switched to fire-and-forget; the test pinned
+    ///     "elapsed < 200 ms".
+    ///   - Now (BUG_REPORT.md #41): UDP delivery to a gateway is
+    ///     not the same as gateway-side processing, and some
+    ///     routers refuse `lifetime=0`. The client never knew.
+    ///     `remove` now does a *short-deadline* recv (200 ms) so
+    ///     a healthy gateway's ack confirms removal and a
+    ///     misbehaving one doesn't stall shutdown longer than
+    ///     that bounded window.
     ///
-    /// The fix makes `remove` fire-and-forget: send the
-    /// lifetime=0 packet, return immediately. The gateway's
-    /// optional ack is informational — by the time our UDP
-    /// packet lands, the mapping is being torn down regardless,
-    /// and stalling mesh shutdown waiting for an ack the
-    /// gateway may not send is a poor tradeoff.
-    ///
-    /// This test points `remove` at a bound-but-silent
-    /// listener and asserts the call returns in well under
-    /// the old 1 s deadline.
+    /// The contract this test pins: against a silent gateway,
+    /// `remove` must complete within the bounded
+    /// `REMOVE_DEADLINE` (200 ms) plus reasonable scheduler
+    /// jitter — well under the original 1 s — and must NOT
+    /// hang or block mesh shutdown indefinitely.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remove_is_fire_and_forget_and_does_not_block_on_silent_gateway() {
         // Silent gateway — binds the port (so `connect` can
@@ -1185,16 +1188,17 @@ mod tests {
         mapper.remove(&mapping).await;
         let elapsed = start.elapsed();
 
-        // Old behavior: ~1000 ms (the `round_trip` NATPMP_DEADLINE).
-        // Fixed behavior: a single UDP `send`, which on loopback
-        // is sub-millisecond. Cap at 200 ms — 5× a generous
-        // scheduler-jitter margin, ~5× under the old deadline.
+        // `remove` waits up to `REMOVE_DEADLINE` (200 ms) for the
+        // gateway's ack so misconfigured routers that refuse
+        // `lifetime=0` are at least logged (#41). Cap the
+        // bounded wait at 500 ms total — the deadline plus
+        // generous scheduler jitter — so this test still catches
+        // a regression to the old 1 s `NATPMP_DEADLINE` path.
         assert!(
-            elapsed < Duration::from_millis(200),
-            "remove() blocked for {elapsed:?} — fire-and-forget regressed. \
-             On a silent gateway it must not wait for NATPMP_DEADLINE; the \
-             gateway's ack is informational and a dead-gateway scenario \
-             should not stall mesh shutdown per-mapping",
+            elapsed < Duration::from_millis(500),
+            "remove() blocked for {elapsed:?} — bounded recv regressed. \
+             On a silent gateway it must complete within REMOVE_DEADLINE \
+             (~200 ms) plus jitter, well under the original 1 s deadline",
         );
 
         drop(silent);
