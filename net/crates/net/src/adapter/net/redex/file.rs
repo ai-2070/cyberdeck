@@ -942,64 +942,97 @@ impl RedexFile {
             }
         }
 
-        // Drop the head of the index AND the parallel timestamps.
-        state.index.drain(..drop);
-        state.timestamps.drain(..drop);
+        // Compute the dat_base that the post-eviction segment would
+        // have:
+        //   - `new_base` if there's a surviving heap entry (the
+        //     segment's base advances to the first surviving heap
+        //     entry's absolute offset),
+        //   - `segment.base_offset() + live_bytes()` if every
+        //     survivor is inline (every byte of dat goes).
+        // Compute from pre-eviction state so we can pass it to
+        // `compact_to` BEFORE mutating any in-memory state.
+        let dat_base = match new_base {
+            Some(base) => base,
+            None => state.segment.base_offset() + state.segment.live_bytes() as u64,
+        };
 
-        // Evict the payload prefix up to new_base (or everything if
-        // surviving entries are all inline).
-        if let Some(base) = new_base {
-            state.segment.evict_prefix_to(base);
-        } else {
-            // All surviving entries are inline; reclaim the whole
-            // payload segment.
-            let cur = state.segment.base_offset() + state.segment.live_bytes() as u64;
-            state.segment.evict_prefix_to(cur);
-        }
-
-        // Persist the eviction. Without this, `sweep_retention`
-        // mutated only memory; the on-disk idx + dat files grew
-        // unbounded across restart, and on reopen the full dat
-        // was replayed — entries previously evicted came back
-        // from the dead. We call into `disk.compact_to` to
-        // atomically rewrite idx + dat + ts to match the
-        // post-sweep in-memory state.
+        // BUG #95: previously we mutated `state.index`,
+        // `state.timestamps`, and `state.segment` *before* calling
+        // into `disk.compact_to`. If the disk write failed, the
+        // log message admitted that "in-memory eviction succeeded
+        // but on-disk files retain evicted entries" — which on
+        // reopen replayed the full on-disk state and resurrected
+        // the entries that had been evicted only in memory.
+        //
+        // Now we attempt the disk compaction FIRST against a slice
+        // of the surviving entries, and only mutate in-memory
+        // state on success. On failure, in-memory state is left
+        // untouched so reopen replays a consistent picture rather
+        // than corrupting the channel.
         //
         // The state lock is held *across* `compact_to`. Releasing
         // it earlier opens a window where a concurrent
         // `append_entry_at` can land on disk with the in-memory
         // state updated to match — but `compact_to` then reads the
         // post-append on-disk dat and writes a new idx/ts derived
-        // from the pre-append `surviving_index` snapshot. The
-        // racing append's idx record is overwritten, leaving its
-        // payload bytes as orphaned dat tail that recovery's
-        // `retained_dat_end` truncation drops on next reopen — the
-        // append survives in memory until restart, then vanishes.
-        // Holding the lock makes appends queue behind this
-        // compaction.
+        // from the pre-append surviving slice. The racing append's
+        // idx record is overwritten, leaving its payload bytes as
+        // orphaned dat tail that recovery's `retained_dat_end`
+        // truncation drops on next reopen — the append survives in
+        // memory until restart, then vanishes. Holding the lock
+        // makes appends queue behind this compaction.
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.inner.disk.as_ref() {
-            let surviving_index = state.index.clone();
-            let surviving_timestamps = state.timestamps.clone();
-            // The disk's old dat had offsets [0..segment.base_offset() +
-            // segment.live_bytes()]. The new starts at
-            // segment.base_offset(). For inline-only surviving
-            // entries, base_offset is past the end of the live
-            // segment — every byte of dat goes.
-            let dat_base = state.segment.base_offset();
+            let surviving_index: Vec<RedexEntry> = state.index[drop..].to_vec();
+            let surviving_timestamps: Vec<u64> = state.timestamps[drop..].to_vec();
             let disk = disk.clone();
-            if let Err(e) = disk.compact_to(&surviving_index, &surviving_timestamps, dat_base) {
+            if let Err(e) =
+                disk.compact_to(&surviving_index, &surviving_timestamps, dat_base)
+            {
                 tracing::warn!(
                     error = %e,
                     "redex sweep_retention: disk compaction failed; \
-                     in-memory eviction succeeded but on-disk files retain \
-                     evicted entries"
+                     in-memory state left untouched so reopen replays \
+                     a consistent picture rather than resurrecting \
+                     in-memory-only-evicted entries"
                 );
+                return;
             }
-            // `state` drops at the end of the function — all
-            // subsequent appenders see the post-compaction layout.
-            std::mem::drop(state);
         }
+
+        // Disk compaction succeeded (or no disk segment is
+        // configured). Now mutate in-memory state to match.
+        state.index.drain(..drop);
+        state.timestamps.drain(..drop);
+        state.segment.evict_prefix_to(dat_base);
+
+        // BUG #92 fix: renormalize in-memory state to match the
+        // new on-disk format (segment-relative offsets, 0-based
+        // segment). `compact_to` rewrote each surviving entry's
+        // `payload_offset` as `entry.payload_offset - dat_base`;
+        // mirror that here so subsequent appends compute disk
+        // offsets (`segment.base_offset() + live_bytes()`) that
+        // match the new on-disk dat layout. Without this,
+        // post-sweep appends write absolute offsets that index
+        // past the end of the new (compacted) on-disk dat —
+        // torn-tail recovery silently drops them on reopen.
+        //
+        // Only relevant when a disk segment is present; for
+        // memory-only files there's no on-disk format to track.
+        #[cfg(feature = "redex-disk")]
+        if self.inner.disk.is_some() {
+            for entry in state.index.iter_mut() {
+                if !entry.is_inline() {
+                    entry.payload_offset =
+                        (entry.payload_offset as u64).saturating_sub(dat_base) as u32;
+                }
+            }
+            state.segment.rebase_to_zero();
+        }
+
+        // `state` drops at the end of the function — all
+        // subsequent appenders see the post-compaction layout.
+        std::mem::drop(state);
     }
 
     /// Close the file. Outstanding tail streams receive `RedexError::Closed`.
@@ -2427,6 +2460,170 @@ mod tests {
             vec![3, 4],
             "after reopen, only the entries that survived sweep should be present \
              (pre-fix all 5 would resurrect because sweep didn't touch disk)"
+        );
+        f2.close().unwrap();
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #95: when
+    /// `disk.compact_to` failed, `sweep_retention` previously
+    /// committed the in-memory eviction anyway and logged a
+    /// warning ("in-memory eviction succeeded but on-disk files
+    /// retain evicted entries"). On reopen, recovery replayed
+    /// the full on-disk state and resurrected the entries that
+    /// were only evicted in memory.
+    ///
+    /// The fix runs `compact_to` BEFORE mutating in-memory state,
+    /// and bails out without mutation on failure. We pin this by:
+    ///   1. Append entries past the retention max.
+    ///   2. Arm a one-shot `compact_to` failure on the next call.
+    ///   3. Run `sweep_retention`.
+    ///   4. Verify in-memory state is unchanged (no eviction
+    ///      happened — would have lost head entries pre-fix).
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn sweep_retention_keeps_in_memory_state_when_disk_compact_fails() {
+        let dir = tmp_persistent_dir("sweep_compact_fails");
+        let name = "sweep/compact_fails";
+
+        use super::super::manager::Redex;
+        let r = Redex::new().with_persistent_dir(&dir);
+        let f = r
+            .open_file(
+                &ChannelName::new(name).unwrap(),
+                RedexFileConfig::default()
+                    .with_persistent(true)
+                    .with_retention_max_events(2),
+            )
+            .unwrap();
+
+        // Append 5 heap entries (payloads > 8 bytes so they route
+        // through the dat segment, not inline).
+        f.append(b"AAAAAAAAA").unwrap();
+        f.append(b"BBBBBBBBB").unwrap();
+        f.append(b"CCCCCCCCC").unwrap();
+        f.append(b"DDDDDDDDD").unwrap();
+        f.append(b"EEEEEEEEE").unwrap();
+
+        // Arm a one-shot failure on the next `compact_to`.
+        f.inner
+            .disk
+            .as_ref()
+            .expect("persistent file must have a disk segment")
+            .arm_next_compact_failure();
+
+        // Sweep — `compact_to` will fail. Pre-fix, in-memory state
+        // would still be evicted (drained to [3, 4]). Post-fix, the
+        // in-memory state is left as [0, 1, 2, 3, 4] so reopen
+        // replays a consistent picture.
+        f.sweep_retention();
+
+        let post_sweep: Vec<u64> =
+            f.inner.state.lock().index.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            post_sweep,
+            vec![0, 1, 2, 3, 4],
+            "in-memory state must be left untouched when disk \
+             compaction fails — pre-fix this returned [3, 4] \
+             because eviction was committed before the disk write"
+        );
+
+        f.close().unwrap();
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #92: post-sweep
+    /// appends were silently lost on restart because `compact_to`
+    /// renormalized on-disk offsets to be segment-relative while
+    /// `state.index` kept absolute offsets. The next append then
+    /// computed `offset = segment.base_offset() + live_bytes()` —
+    /// also absolute — and wrote that to disk verbatim. On reopen,
+    /// the torn-tail recovery walk saw `(offset + len) > dat_len`
+    /// for every post-sweep record and truncated them.
+    ///
+    /// The fix renormalizes `state.index` and resets `segment`
+    /// base_offset to 0 after a successful `compact_to`, so
+    /// subsequent appends compute offsets against a 0-based
+    /// segment that matches the on-disk layout.
+    ///
+    /// We pin this by:
+    ///   1. Append more entries than the retention max allows.
+    ///   2. Run `sweep_retention` to evict the head.
+    ///   3. Append more entries AFTER the sweep — these are the
+    ///      ones the bug silently lost.
+    ///   4. Close and reopen.
+    ///   5. Verify the post-sweep appends survive restart.
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn sweep_retention_post_sweep_appends_survive_restart() {
+        let dir = tmp_persistent_dir("sweep_post_append");
+        let name = "sweep/post_append";
+
+        {
+            use super::super::manager::Redex;
+            let r = Redex::new().with_persistent_dir(&dir);
+            let f = r
+                .open_file(
+                    &ChannelName::new(name).unwrap(),
+                    RedexFileConfig::default()
+                        .with_persistent(true)
+                        .with_retention_max_events(2),
+                )
+                .unwrap();
+
+            // Append 5 heap entries (payloads > 8 bytes so they
+            // route through the dat segment, not inline).
+            f.append(b"AAAAAAAAA").unwrap();
+            f.append(b"BBBBBBBBB").unwrap();
+            f.append(b"CCCCCCCCC").unwrap();
+            f.append(b"DDDDDDDDD").unwrap();
+            f.append(b"EEEEEEEEE").unwrap();
+
+            // Sweep — evicts 0, 1, 2; keeps 3, 4.
+            f.sweep_retention();
+
+            // Post-sweep appends. Pre-fix, these record absolute
+            // offsets (300, 400, ...) into an idx whose other
+            // records are now relative (0, 100), and the on-disk
+            // dat is only 200 bytes — so reopen drops them.
+            f.append(b"FFFFFFFFF").unwrap(); // seq=5
+            f.append(b"GGGGGGGGG").unwrap(); // seq=6
+
+            // Confirm the in-memory state believes everything is
+            // present before close.
+            let pre_close: Vec<u64> =
+                f.inner.state.lock().index.iter().map(|e| e.seq).collect();
+            assert_eq!(
+                pre_close,
+                vec![3, 4, 5, 6],
+                "in-memory state must hold the post-sweep appends before close"
+            );
+
+            f.close().unwrap();
+        }
+
+        // Reopen — pre-fix, only [3, 4] would survive because the
+        // post-sweep appends got truncated by the torn-tail walk.
+        // Post-fix, all four are durable.
+        use super::super::manager::Redex;
+        let r2 = Redex::new().with_persistent_dir(&dir);
+        let f2 = r2
+            .open_file(
+                &ChannelName::new(name).unwrap(),
+                RedexFileConfig::default()
+                    .with_persistent(true)
+                    .with_retention_max_events(2),
+            )
+            .unwrap();
+        let restored_seqs: Vec<u64> =
+            f2.inner.state.lock().index.iter().map(|e| e.seq).collect();
+        assert!(
+            restored_seqs.contains(&5),
+            "post-sweep append seq=5 must survive restart, got {:?}",
+            restored_seqs
+        );
+        assert!(
+            restored_seqs.contains(&6),
+            "post-sweep append seq=6 must survive restart, got {:?}",
+            restored_seqs
         );
         f2.close().unwrap();
     }

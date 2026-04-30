@@ -180,6 +180,13 @@ pub(super) struct DiskSegment {
     /// terminating on a sync error.
     #[cfg(test)]
     fail_next_sync: AtomicBool,
+    /// Test-only injection: when set, the next `compact_to` returns
+    /// `RedexError::Io` before touching any file. Used to exercise
+    /// the `sweep_retention` rollback path (BUG #95) — verifies
+    /// that a failed disk compaction leaves in-memory state
+    /// untouched so reopen replays a consistent picture.
+    #[cfg(test)]
+    fail_next_compact: AtomicBool,
     /// Test-only counter: cumulative successful `sync()` calls —
     /// close-time, append-driven (EveryN), or external
     /// (Interval / explicit). Lets policy tests assert the observed
@@ -447,6 +454,8 @@ impl DiskSegment {
                 fail_after_dat_write: AtomicBool::new(false),
                 #[cfg(test)]
                 fail_next_sync: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_next_compact: AtomicBool::new(false),
                 #[cfg(test)]
                 sync_count: AtomicU64::new(0),
             },
@@ -903,6 +912,16 @@ impl DiskSegment {
         self.fail_next_sync.store(true, Ordering::Release);
     }
 
+    /// Test-only: arm a one-shot failure on the next `compact_to`
+    /// call. Used to verify the `sweep_retention` rollback path
+    /// (BUG #95) — that a failed disk compaction leaves in-memory
+    /// state untouched. The flag is consumed on the next
+    /// `compact_to` (success or failure clears it).
+    #[cfg(test)]
+    pub(super) fn arm_next_compact_failure(&self) {
+        self.fail_next_compact.store(true, Ordering::Release);
+    }
+
     /// Compact the on-disk segment to the surviving in-memory
     /// state. Called by `sweep_retention` so age / size eviction
     /// reflects on disk too — without this, the idx + dat files
@@ -920,6 +939,10 @@ impl DiskSegment {
         surviving_timestamps: &[u64],
         dat_base: u64,
     ) -> Result<(), RedexError> {
+        #[cfg(test)]
+        if self.fail_next_compact.swap(false, Ordering::AcqRel) {
+            return Err(RedexError::Io("test-injected compact_to failure".into()));
+        }
         if surviving_index.len() != surviving_timestamps.len() {
             return Err(RedexError::Io(format!(
                 "compact_to: index/timestamp length mismatch ({} vs {})",

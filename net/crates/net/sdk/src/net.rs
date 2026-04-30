@@ -9,7 +9,7 @@ use net::event::RawEvent;
 use net::{ConsumeRequest, Event, EventBus, StoredEvent};
 
 use crate::config::NetBuilder;
-use crate::error::{Result, SdkError};
+use crate::error::Result;
 use crate::stream::{EventStream, SubscribeOpts, TypedEventStream};
 
 /// Receipt from a successful ingestion.
@@ -233,16 +233,17 @@ impl Net {
     }
 
     /// Gracefully shut down the node.
+    ///
+    /// Drains pending events through the adapter and signals all
+    /// background tasks to exit. Safe to call even when other
+    /// `Arc<EventBus>` clones exist (e.g. an outstanding
+    /// `EventStream` from `subscribe`): `EventBus::shutdown_via_ref`
+    /// is idempotent and reference-based, so the shutdown work runs
+    /// regardless of strong-ref count, and outstanding clones
+    /// observe the bus as shut down on their next operation.
     pub async fn shutdown(self) -> Result<()> {
-        match Arc::try_unwrap(self.bus) {
-            Ok(bus) => {
-                bus.shutdown().await?;
-                Ok(())
-            }
-            Err(_) => Err(SdkError::Adapter(
-                "cannot shutdown: outstanding references exist".into(),
-            )),
-        }
+        self.bus.shutdown_via_ref().await?;
+        Ok(())
     }
 
     /// Get a reference to the underlying `EventBus`.

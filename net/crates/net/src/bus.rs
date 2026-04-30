@@ -702,12 +702,54 @@ impl EventBus {
     /// flag could leave events the drain worker pushed *after* its
     /// `try_recv` sweep stranded in the channel.
     pub async fn shutdown(self) -> Result<(), AdapterError> {
-        // 1. Signal shutdown. SeqCst pairs with `try_enter_ingest` —
-        // any producer that observed the previous `false` and is
-        // mid-push has its `in_flight_ingests` increment ordered
-        // before this store, and so will be visible to the wait
-        // below.
-        self.shutdown.store(true, AtomicOrdering::SeqCst);
+        self.shutdown_via_ref().await
+    }
+
+    /// Shutdown via shared reference — same semantics as
+    /// [`shutdown`](Self::shutdown), but does not consume `self`.
+    ///
+    /// Useful for callers that hold the bus behind `Arc<EventBus>`
+    /// (e.g., the SDK, where `subscribe` perpetuates an Arc clone
+    /// into every `EventStream`) and therefore cannot satisfy
+    /// `Arc::try_unwrap`. Idempotent: the first caller does the
+    /// work; concurrent or subsequent callers wait for the
+    /// `shutdown_completed` flag and return `Ok(())`.
+    pub async fn shutdown_via_ref(&self) -> Result<(), AdapterError> {
+        // 1. CAS the shutdown flag false→true. SeqCst pairs with
+        // `try_enter_ingest`'s shutdown check — any producer that
+        // observed the previous `false` and is mid-push has its
+        // `in_flight_ingests` increment ordered before this store
+        // (the CAS-success branch is a release of the new `true`),
+        // and so will be visible to the wait below.
+        //
+        // If the CAS loses (someone else — typically a concurrent
+        // call or `Drop` — already flipped the flag), spin until
+        // they finish. We can't run the rest of the body because
+        // workers/senders may already be partially torn down.
+        if self
+            .shutdown
+            .compare_exchange(
+                false,
+                true,
+                AtomicOrdering::SeqCst,
+                AtomicOrdering::SeqCst,
+            )
+            .is_err()
+        {
+            // Bound the wait so a `Drop`-only path (which sets
+            // `shutdown=true` but never sets `shutdown_completed`)
+            // doesn't spin forever. After the deadline, return Ok
+            // — the bus is at least signalled to stop.
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !self.shutdown_completed.load(AtomicOrdering::Acquire) {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(());
+                }
+                tokio::task::yield_now().await;
+            }
+            return Ok(());
+        }
 
         // 1a. Wait for in-flight ingests to drain BEFORE the drain
         // workers do their final ring-buffer sweep. Otherwise a
@@ -789,6 +831,20 @@ impl EventBus {
         // Mark shutdown as completed so Drop knows not to warn.
         self.shutdown_completed.store(true, AtomicOrdering::Release);
         result
+    }
+
+    /// True once `shutdown` / `shutdown_via_ref` has signaled — does
+    /// not imply the shutdown work has finished. Use
+    /// [`is_shutdown_completed`](Self::is_shutdown_completed) for
+    /// completion.
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(AtomicOrdering::Acquire)
+    }
+
+    /// True once `shutdown` / `shutdown_via_ref` has fully drained
+    /// workers and the adapter shutdown returned (success path only).
+    pub fn is_shutdown_completed(&self) -> bool {
+        self.shutdown_completed.load(AtomicOrdering::Acquire)
     }
 
     /// Get shard metrics (if dynamic scaling is enabled).
