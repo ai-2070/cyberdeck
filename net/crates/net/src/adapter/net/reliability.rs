@@ -9,12 +9,39 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use super::protocol::NackPayload;
+use super::protocol::{NackPayload, PacketFlags};
+
+/// Pre-encryption inputs needed to rebuild a packet for
+/// retransmission.
+///
+/// The reliable retransmit path used to stash the fully-encrypted
+/// packet bytes, but every encrypted packet carries the cipher's
+/// outer counter stamped at build time. Replaying those exact bytes
+/// produces the same wire counter on the wire, which the receiver's
+/// `update_rx_counter` rejects as a replay — making NACK-driven
+/// recovery a no-op the first time it fired. Stashing the rebuild
+/// inputs instead lets the retransmit driver call
+/// `PacketBuilder::build` with a fresh counter on each retransmit,
+/// so the receiver accepts the recovered packet.
+#[derive(Debug, Clone)]
+pub struct RetransmitDescriptor {
+    /// Per-stream sequence number stamped on the packet header.
+    pub seq: u64,
+    /// Stream id for the rebuild call.
+    pub stream_id: u64,
+    /// Pre-encryption event payloads (the same `&[Bytes]` originally
+    /// passed to `PacketBuilder::build`).
+    pub events: Vec<Bytes>,
+    /// Packet flags as stamped on the original send.
+    pub flags: PacketFlags,
+}
 
 /// Trait for reliability mode implementations
 pub trait ReliabilityMode: Send + Sync {
-    /// Called when a packet is sent
-    fn on_send(&mut self, seq: u64, packet: Bytes);
+    /// Called when a packet is sent. The descriptor carries pre-
+    /// encryption inputs so the retransmit path can rebuild a
+    /// fresh-counter packet rather than replaying stale ciphertext.
+    fn on_send(&mut self, descriptor: RetransmitDescriptor);
 
     /// Called when a packet is received. Returns true if accepted.
     fn on_receive(&mut self, seq: u64) -> bool;
@@ -25,11 +52,12 @@ pub trait ReliabilityMode: Send + Sync {
     /// Build a NACK payload if there are missing sequences
     fn build_nack(&self) -> Option<NackPayload>;
 
-    /// Process a received NACK and return packets to retransmit
-    fn on_nack(&mut self, nack: &NackPayload) -> Vec<Bytes>;
+    /// Process a received NACK and return descriptors for the
+    /// caller to rebuild + dispatch.
+    fn on_nack(&mut self, nack: &NackPayload) -> Vec<RetransmitDescriptor>;
 
-    /// Get packets that need retransmission due to timeout
-    fn get_timed_out(&mut self) -> Vec<Bytes>;
+    /// Get descriptors that need retransmission due to timeout.
+    fn get_timed_out(&mut self) -> Vec<RetransmitDescriptor>;
 
     /// Check if there are unacknowledged packets
     fn has_pending(&self) -> bool;
@@ -61,7 +89,7 @@ impl FireAndForget {
 
 impl ReliabilityMode for FireAndForget {
     #[inline]
-    fn on_send(&mut self, _seq: u64, _packet: Bytes) {
+    fn on_send(&mut self, _descriptor: RetransmitDescriptor) {
         // Nothing to track
     }
 
@@ -83,12 +111,12 @@ impl ReliabilityMode for FireAndForget {
     }
 
     #[inline]
-    fn on_nack(&mut self, _nack: &NackPayload) -> Vec<Bytes> {
+    fn on_nack(&mut self, _nack: &NackPayload) -> Vec<RetransmitDescriptor> {
         Vec::new()
     }
 
     #[inline]
-    fn get_timed_out(&mut self) -> Vec<Bytes> {
+    fn get_timed_out(&mut self) -> Vec<RetransmitDescriptor> {
         Vec::new()
     }
 
@@ -106,14 +134,21 @@ impl ReliabilityMode for FireAndForget {
 /// Unacknowledged packet waiting for ACK/NACK
 #[derive(Debug, Clone)]
 struct UnackedPacket {
-    /// Sequence number
-    seq: u64,
-    /// Packet data for retransmission
-    packet: Bytes,
+    /// Pre-encryption rebuild inputs. Stashing the descriptor (not
+    /// the encrypted bytes) is what lets the retransmit path
+    /// produce a fresh-counter packet on each NACK / timeout.
+    descriptor: RetransmitDescriptor,
     /// Time when packet was sent
     sent_at: Instant,
     /// Number of retransmission attempts
     retries: u8,
+}
+
+impl UnackedPacket {
+    #[inline]
+    fn seq(&self) -> u64 {
+        self.descriptor.seq
+    }
 }
 
 /// Reliable stream mode with selective NACKs.
@@ -222,7 +257,7 @@ impl ReliableStream {
     pub fn on_ack(&mut self, acked: u64) {
         // Remove all pending packets up to and including acked.
         while let Some(front) = self.pending.front() {
-            if front.seq <= acked {
+            if front.seq() <= acked {
                 self.pending.pop_front();
             } else {
                 break;
@@ -271,7 +306,7 @@ impl Default for ReliableStream {
 }
 
 impl ReliabilityMode for ReliableStream {
-    fn on_send(&mut self, seq: u64, packet: Bytes) {
+    fn on_send(&mut self, descriptor: RetransmitDescriptor) {
         // Evict oldest unacked packet if window is full so that the
         // newest packet is always tracked for retransmission.  Without
         // this, packets sent when the window is full are silently lost
@@ -281,8 +316,7 @@ impl ReliabilityMode for ReliableStream {
             self.pending.pop_front();
         }
         self.pending.push_back(UnackedPacket {
-            seq,
-            packet,
+            descriptor,
             sent_at: Instant::now(),
             retries: 0,
         });
@@ -363,15 +397,18 @@ impl ReliabilityMode for ReliableStream {
         }
     }
 
-    fn on_nack(&mut self, nack: &NackPayload) -> Vec<Bytes> {
+    fn on_nack(&mut self, nack: &NackPayload) -> Vec<RetransmitDescriptor> {
         let mut retransmits = Vec::new();
 
-        // Find packets to retransmit based on NACK
+        // Find packets to retransmit based on NACK. Return the
+        // pre-encryption descriptors so the caller can rebuild
+        // each packet with a fresh cipher counter — replaying the
+        // stashed encrypted bytes would trip the receiver's replay
+        // window.
         for missing_seq in nack.missing_sequences() {
-            // Find the packet in pending
             for unacked in &mut self.pending {
-                if unacked.seq == missing_seq && unacked.retries < self.max_retries {
-                    retransmits.push(unacked.packet.clone());
+                if unacked.seq() == missing_seq && unacked.retries < self.max_retries {
+                    retransmits.push(unacked.descriptor.clone());
                     unacked.retries += 1;
                     unacked.sent_at = Instant::now();
                     break;
@@ -382,14 +419,14 @@ impl ReliabilityMode for ReliableStream {
         retransmits
     }
 
-    fn get_timed_out(&mut self) -> Vec<Bytes> {
+    fn get_timed_out(&mut self) -> Vec<RetransmitDescriptor> {
         let now = Instant::now();
         let mut retransmits = Vec::new();
 
         for unacked in &mut self.pending {
             if now.duration_since(unacked.sent_at) > self.rto && unacked.retries < self.max_retries
             {
-                retransmits.push(unacked.packet.clone());
+                retransmits.push(unacked.descriptor.clone());
                 unacked.retries += 1;
                 unacked.sent_at = now;
             }
@@ -433,6 +470,19 @@ pub fn create_reliability_mode(reliable: bool) -> Box<dyn ReliabilityMode> {
 mod tests {
     use super::*;
 
+    /// Test helper: build a `RetransmitDescriptor` from the legacy
+    /// `(seq, packet_bytes)` shape these tests were written against.
+    /// Wraps the bytes as a single-event payload so the in-memory
+    /// shape has something to round-trip through.
+    fn descriptor(seq: u64, packet: Bytes) -> RetransmitDescriptor {
+        RetransmitDescriptor {
+            seq,
+            stream_id: 0,
+            events: vec![packet],
+            flags: PacketFlags::RELIABLE,
+        }
+    }
+
     #[test]
     fn test_fire_and_forget() {
         let mut mode = FireAndForget::new();
@@ -448,7 +498,7 @@ mod tests {
         assert!(!mode.has_pending());
 
         // No retransmits
-        mode.on_send(1, Bytes::from_static(b"test"));
+        mode.on_send(descriptor(1, Bytes::from_static(b"test")));
         assert!(mode.get_timed_out().is_empty());
     }
 
@@ -541,8 +591,8 @@ mod tests {
 
         assert!(!mode.has_pending());
 
-        mode.on_send(1, Bytes::from_static(b"packet1"));
-        mode.on_send(2, Bytes::from_static(b"packet2"));
+        mode.on_send(descriptor(1, Bytes::from_static(b"packet1")));
+        mode.on_send(descriptor(2, Bytes::from_static(b"packet2")));
 
         assert!(mode.has_pending());
 
@@ -555,9 +605,9 @@ mod tests {
     fn test_reliable_stream_nack_retransmit() {
         let mut mode = ReliableStream::new();
 
-        mode.on_send(1, Bytes::from_static(b"packet1"));
-        mode.on_send(2, Bytes::from_static(b"packet2"));
-        mode.on_send(3, Bytes::from_static(b"packet3"));
+        mode.on_send(descriptor(1, Bytes::from_static(b"packet1")));
+        mode.on_send(descriptor(2, Bytes::from_static(b"packet2")));
+        mode.on_send(descriptor(3, Bytes::from_static(b"packet3")));
 
         // NACK saying "received through seq 1, seq 2 is the next
         // expected (and therefore missing)".
@@ -568,7 +618,10 @@ mod tests {
 
         let retransmits = mode.on_nack(&nack);
         assert_eq!(retransmits.len(), 1);
-        assert_eq!(&retransmits[0][..], b"packet2");
+        // The descriptor's first event is the (test-helper-built)
+        // payload of the original send.
+        assert_eq!(&retransmits[0].events[0][..], b"packet2");
+        assert_eq!(retransmits[0].seq, 2);
     }
 
     #[test]
@@ -627,7 +680,7 @@ mod tests {
 
         // Sender sends packets 0..10
         for seq in 0..10u64 {
-            sender.on_send(seq, Bytes::from(format!("pkt-{}", seq)));
+            sender.on_send(descriptor(seq, Bytes::from(format!("pkt-{}", seq))));
         }
         assert!(sender.has_pending());
 
@@ -687,8 +740,8 @@ mod tests {
             3,
         );
 
-        mode.on_send(0, Bytes::from_static(b"pkt-0"));
-        mode.on_send(1, Bytes::from_static(b"pkt-1"));
+        mode.on_send(descriptor(0, Bytes::from_static(b"pkt-0")));
+        mode.on_send(descriptor(1, Bytes::from_static(b"pkt-1")));
 
         // Nothing should time out yet (we just sent)
         let too_early = mode.get_timed_out();
@@ -702,8 +755,8 @@ mod tests {
 
         let timed_out = mode.get_timed_out();
         assert_eq!(timed_out.len(), 2, "both packets should time out");
-        assert_eq!(&timed_out[0][..], b"pkt-0");
-        assert_eq!(&timed_out[1][..], b"pkt-1");
+        assert_eq!(&timed_out[0].events[0][..], b"pkt-0");
+        assert_eq!(&timed_out[1].events[0][..], b"pkt-1");
 
         // Immediately after retransmit, sent_at was reset — shouldn't time out
         // again until another RTO elapses
@@ -722,7 +775,7 @@ mod tests {
             2, // max 2 retries
         );
 
-        mode.on_send(0, Bytes::from_static(b"pkt-0"));
+        mode.on_send(descriptor(0, Bytes::from_static(b"pkt-0")));
 
         // Exhaust retries (each iteration waits past RTO then triggers retransmit)
         for _ in 0..3 {
@@ -805,7 +858,7 @@ mod tests {
 
         // Send 6 packets (exceeds max_pending of 4)
         for seq in 0..6u64 {
-            mode.on_send(seq, Bytes::from(format!("pkt-{}", seq)));
+            mode.on_send(descriptor(seq, Bytes::from(format!("pkt-{}", seq))));
         }
 
         // Should still have exactly max_pending packets tracked
@@ -817,7 +870,7 @@ mod tests {
 
         // The oldest packets (0, 1) should have been evicted;
         // the newest (2, 3, 4, 5) should be retained.
-        let seqs: Vec<u64> = mode.pending.iter().map(|p| p.seq).collect();
+        let seqs: Vec<u64> = mode.pending.iter().map(|p| p.seq()).collect();
         assert_eq!(
             seqs,
             vec![2, 3, 4, 5],
@@ -832,7 +885,8 @@ mod tests {
         };
         let retransmits = mode.on_nack(&nack);
         assert_eq!(retransmits.len(), 1);
-        assert_eq!(&retransmits[0][..], b"pkt-5");
+        assert_eq!(&retransmits[0].events[0][..], b"pkt-5");
+        assert_eq!(retransmits[0].seq, 5);
     }
 
     #[test]
@@ -981,5 +1035,81 @@ mod tests {
         );
         // State unchanged.
         assert_eq!(mode.next_expected(), 0);
+    }
+
+    /// Regression: the retransmit path now stashes pre-encryption
+    /// rebuild inputs (`RetransmitDescriptor`), not encrypted bytes.
+    /// Previously, `on_send` recorded the fully-encrypted packet
+    /// `Bytes` and `on_nack` / `get_timed_out` returned those exact
+    /// bytes. Replaying them produced the original wire counter on
+    /// the wire, which the receiver's `update_rx_counter` rejects
+    /// as a replay — making NACK-driven recovery dead-on-arrival.
+    ///
+    /// We pin the new shape: descriptors carry stream_id, seq,
+    /// events, and flags; multiple retransmits of the same packet
+    /// must yield the same descriptor (so the caller's
+    /// re-`builder.build` produces a fresh-counter packet each
+    /// time).
+    #[test]
+    fn retransmit_descriptors_carry_pre_encryption_inputs() {
+        let mut mode = ReliableStream::with_settings(Duration::from_millis(20), 32, 5);
+
+        // Send three packets with realistic descriptors (stream_id,
+        // events list, flags).
+        let events_a = vec![Bytes::from_static(b"event-A-payload")];
+        let events_b = vec![Bytes::from_static(b"event-B-payload")];
+        let events_c = vec![Bytes::from_static(b"event-C-payload")];
+        mode.on_send(RetransmitDescriptor {
+            seq: 0,
+            stream_id: 7,
+            events: events_a.clone(),
+            flags: PacketFlags::RELIABLE,
+        });
+        mode.on_send(RetransmitDescriptor {
+            seq: 1,
+            stream_id: 7,
+            events: events_b.clone(),
+            flags: PacketFlags::RELIABLE,
+        });
+        mode.on_send(RetransmitDescriptor {
+            seq: 2,
+            stream_id: 7,
+            events: events_c.clone(),
+            flags: PacketFlags::RELIABLE,
+        });
+
+        // NACK seq=1.
+        let nack = NackPayload {
+            next_expected: 1,
+            missing_bitmap: 0,
+        };
+        let retransmits = mode.on_nack(&nack);
+        assert_eq!(retransmits.len(), 1);
+        let r = &retransmits[0];
+        assert_eq!(r.seq, 1);
+        assert_eq!(r.stream_id, 7);
+        assert_eq!(r.events, events_b);
+        assert_eq!(r.flags, PacketFlags::RELIABLE);
+
+        // The descriptor has the inputs needed for
+        // `PacketBuilder::build(stream_id, seq, &events, flags)`.
+        // Each retransmit lets the caller produce a fresh-counter
+        // packet — distinct from the original even though the
+        // descriptor itself is identical to what was originally
+        // pushed. This is what fixes the replay-window rejection.
+        let nack2 = NackPayload {
+            next_expected: 1,
+            missing_bitmap: 0,
+        };
+        let retransmits2 = mode.on_nack(&nack2);
+        assert_eq!(retransmits2.len(), 1);
+        let r2 = &retransmits2[0];
+        // The descriptor is the same — the *cipher counter* freshness
+        // is the responsibility of the rebuild caller, not of the
+        // reliability layer.
+        assert_eq!(r2.seq, r.seq);
+        assert_eq!(r2.events, r.events);
+        assert_eq!(r2.flags, r.flags);
+        assert_eq!(r2.stream_id, r.stream_id);
     }
 }

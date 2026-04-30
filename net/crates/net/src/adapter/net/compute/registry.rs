@@ -112,6 +112,27 @@ impl DaemonRegistry {
         Ok(host.take_snapshot())
     }
 
+    /// Restore a daemon's state from a snapshot taken on another
+    /// daemon (typically the active member of a standby group).
+    /// Mutates the existing host in place — keypair and registry
+    /// entry stay put; only daemon-state bytes, chain head, and
+    /// horizon are replaced.
+    ///
+    /// Used by `StandbyGroup::sync_standbys` to push the active's
+    /// state onto each standby so a promoted standby has the same
+    /// state the active had at snapshot time.
+    pub fn restore_from_snapshot(
+        &self,
+        origin_hash: u32,
+        snapshot: &StateSnapshot,
+    ) -> Result<(), DaemonError> {
+        let arc = self
+            .get_arc(origin_hash)
+            .ok_or(DaemonError::NotFound(origin_hash))?;
+        let mut host = arc.lock();
+        host.restore_from_snapshot(snapshot)
+    }
+
     /// Get stats for a specific daemon.
     pub fn stats(&self, origin_hash: u32) -> Result<DaemonStats, DaemonError> {
         let arc = self

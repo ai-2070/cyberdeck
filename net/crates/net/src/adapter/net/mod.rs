@@ -119,7 +119,7 @@ pub use redex::{
     FsyncPolicy, IndexOp, IndexStart, OrderedAppender, Redex, RedexEntry, RedexError, RedexEvent,
     RedexFile, RedexFileConfig, RedexFlags, RedexFold, RedexIndex, TypedRedexFile,
 };
-pub use reliability::{FireAndForget, ReliabilityMode, ReliableStream};
+pub use reliability::{FireAndForget, ReliabilityMode, ReliableStream, RetransmitDescriptor};
 pub use reroute::ReroutePolicy;
 pub use route::{
     AggregateStats, RouteEntry, RouteFlags, RoutingHeader, RoutingTable, SchedulerStreamStats,
@@ -864,10 +864,21 @@ impl Adapter for NetAdapter {
                     .await
                     .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
 
-                // Track for reliability (brief lock)
+                // Track for reliability with PRE-encryption inputs.
+                // Stashing the encrypted bytes was unsound: the
+                // receiver's replay window rejects retransmits that
+                // carry a stale wire counter. The descriptor lets
+                // the retransmit driver call `builder.build` again
+                // with a fresh counter.
                 if reliable {
+                    let descriptor = reliability::RetransmitDescriptor {
+                        seq,
+                        stream_id,
+                        events: current_batch.clone(),
+                        flags,
+                    };
                     let stream = session.get_or_create_stream(stream_id);
-                    stream.with_reliability(|r| r.on_send(seq, packet));
+                    stream.with_reliability(|r| r.on_send(descriptor));
                 }
 
                 current_batch.clear();
@@ -900,8 +911,14 @@ impl Adapter for NetAdapter {
                 .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
 
             if reliable {
+                let descriptor = reliability::RetransmitDescriptor {
+                    seq,
+                    stream_id,
+                    events: current_batch.clone(),
+                    flags,
+                };
                 let stream = session.get_or_create_stream(stream_id);
-                stream.with_reliability(|r| r.on_send(seq, packet));
+                stream.with_reliability(|r| r.on_send(descriptor));
             }
         }
 

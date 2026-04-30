@@ -195,8 +195,19 @@ impl StandbyGroup {
 
     /// Sync state from the active to all standbys.
     ///
-    /// Takes a snapshot of the active daemon and restores it on each standby.
-    /// Clears the event buffer (standbys are now caught up to this point).
+    /// Takes a snapshot of the active daemon and pushes it onto each
+    /// standby via `registry.restore_from_snapshot`, so each standby's
+    /// state matches the active's at snapshot time. Clears the event
+    /// buffer — standbys are now caught up to this point.
+    ///
+    /// Previously this method only updated `synced_through` /
+    /// `last_sync` bookkeeping but never copied the snapshot bytes
+    /// onto the standby daemons. On `promote()`, the picked standby
+    /// was still in its initial default-constructed state, and
+    /// `promote()` only replays `buffered_since_sync` (just cleared
+    /// at the previous sync). Everything before the most recent sync
+    /// was silently lost — a critical correctness bug for any
+    /// stateful daemon that needs failover.
     ///
     /// Returns the snapshot's `through_seq` so the caller knows what's synced.
     pub fn sync_standbys(&mut self, registry: &DaemonRegistry) -> Result<u64, GroupError> {
@@ -211,11 +222,20 @@ impl StandbyGroup {
         let through_seq = snapshot.through_seq;
         let now = Instant::now();
 
-        // Standbys remain registered — they track readiness to promote.
-        // On promotion, the new active replays buffered events to catch up
-        // from synced_through to the current head. The protocol's job is
-        // tracking what sequence each standby is synced through. Persistence
-        // of snapshot bytes to disk is an application concern.
+        // Push snapshot state onto every standby. Each standby now
+        // holds the active's state at `through_seq` and is ready to
+        // promote without losing pre-sync history.
+        let standby_origins: Vec<u32> = self
+            .members
+            .iter()
+            .filter(|m| m.role == MemberRole::Standby)
+            .map(|m| self.coord.members()[m.index as usize].origin_hash)
+            .collect();
+        for standby_origin in standby_origins {
+            registry
+                .restore_from_snapshot(standby_origin, &snapshot)
+                .map_err(|e| GroupError::RegistryFailed(e.to_string()))?;
+        }
 
         // Update sync tracking
         for member in &mut self.members {
@@ -795,5 +815,96 @@ mod tests {
 
         assert_eq!(g1.group_id(), g2.group_id());
         assert_eq!(g1.active_origin(), g2.active_origin());
+    }
+
+    /// Regression: `sync_standbys` previously only updated
+    /// bookkeeping (`synced_through`, `last_sync`); it never copied
+    /// the active's snapshot bytes onto the standby daemons. On
+    /// `promote()`, the picked standby was still in its initial
+    /// default-constructed state (`StatefulDaemon::value == 0`),
+    /// and `promote()` only replays `buffered_since_sync` (just
+    /// cleared at the previous sync). Everything before the most
+    /// recent sync was silently lost.
+    ///
+    /// This test:
+    ///   1. Spawns a standby group with one stateful active.
+    ///   2. Drives the active to `value = 5` (5 events).
+    ///   3. Calls `sync_standbys` to push state to standbys.
+    ///   4. Drives the active to `value = 8` (3 more events,
+    ///      buffered as `buffered_since_sync`).
+    ///   5. Promotes a standby.
+    ///   6. Asserts the new active's `value == 8` (snapshot of 5 +
+    ///      buffered 3).
+    ///
+    /// Pre-fix: the new active reads value=3 (only the buffered
+    /// events; pre-sync value of 5 lost). Post-fix: value=8.
+    #[test]
+    fn sync_standbys_actually_restores_state_onto_standbys() {
+        let reg = DaemonRegistry::new();
+        let sched = make_scheduler();
+        let mut group = StandbyGroup::spawn(
+            test_config(2),
+            || Box::new(StatefulDaemon::new()),
+            &sched,
+            &reg,
+        )
+        .unwrap();
+
+        let active_origin = group.active_origin();
+
+        // Drive active to value=5.
+        for seq in 1..=5 {
+            let ev = make_event(seq);
+            // Deliver via registry (advances daemon state).
+            reg.deliver(active_origin, &ev).unwrap();
+            // Buffer for replay-on-promote (per sync contract).
+            group.on_event_delivered(ev);
+        }
+        // Sanity: active is at 5.
+        let snap = reg.snapshot(active_origin).unwrap().unwrap();
+        let pre_sync_value = u64::from_le_bytes(snap.state[..8].try_into().unwrap());
+        assert_eq!(pre_sync_value, 5);
+
+        // Sync state onto the standby. After this, the standby's
+        // daemon must hold value=5 too.
+        group.sync_standbys(&reg).unwrap();
+
+        // Verify: the standby's snapshot returns value=5 (the bug
+        // would leave the standby at its default value=0).
+        let standby_origin = group
+            .members
+            .iter()
+            .find(|m| m.role == MemberRole::Standby)
+            .map(|m| group.coord.members()[m.index as usize].origin_hash)
+            .unwrap();
+        let standby_snap = reg.snapshot(standby_origin).unwrap().unwrap();
+        let standby_value = u64::from_le_bytes(standby_snap.state[..8].try_into().unwrap());
+        assert_eq!(
+            standby_value, 5,
+            "standby must hold the active's pre-sync state after sync_standbys; \
+             pre-fix this would be 0 because sync only updated bookkeeping"
+        );
+
+        // Drive active to value=8 (3 buffered events).
+        for seq in 6..=8 {
+            let ev = make_event(seq);
+            reg.deliver(active_origin, &ev).unwrap();
+            group.on_event_delivered(ev);
+        }
+
+        // Promote the standby. It replays buffered_since_sync (3
+        // events) on top of the synced state (value=5), landing at 8.
+        let new_active = group
+            .promote(|| Box::new(StatefulDaemon::new()), &reg, &sched)
+            .unwrap();
+
+        let new_active_snap = reg.snapshot(new_active).unwrap().unwrap();
+        let new_active_value =
+            u64::from_le_bytes(new_active_snap.state[..8].try_into().unwrap());
+        assert_eq!(
+            new_active_value, 8,
+            "promoted active must hold sync-state (5) + buffered events (3) = 8; \
+             pre-fix this would be 3 because the standby's pre-sync state was 0"
+        );
     }
 }
