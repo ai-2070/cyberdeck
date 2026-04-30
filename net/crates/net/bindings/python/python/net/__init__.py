@@ -38,11 +38,11 @@ Example usage:
 """
 
 from ._net import (
-    Net,
     IngestResult,
-    StoredEvent,
+    Net,
     PollResponse,
     Stats,
+    StoredEvent,
 )
 
 __all__ = [
@@ -58,11 +58,11 @@ __all__ = [
 try:
     from ._net import (
         CortexError,
-        NetDb,
-        NetDbError,
         MemoriesAdapter,
         Memory,
         MemoryWatchIter,
+        NetDb,
+        NetDbError,
         Redex,
         RedexError,
         RedexEvent,
@@ -212,6 +212,7 @@ else:
         colon = body.find(":")
         return body if colon == -1 else body[:colon].strip()
 
+
 # Groups surface. Present iff the native module was built with
 # the `groups` feature. Stage 3 of SDK_GROUPS_SURFACE_PLAN.md.
 try:
@@ -259,4 +260,5 @@ else:
         colon = body.find(":")
         return body if colon == -1 else body[:colon].strip()
 
-__version__ = "0.1.0"
+
+__version__ = "0.8.0"

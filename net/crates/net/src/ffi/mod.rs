@@ -1083,7 +1083,7 @@ pub extern "C" fn net_num_shards(handle: *mut NetHandle) -> u16 {
 /// Version string (static, do not free).
 #[unsafe(no_mangle)]
 pub extern "C" fn net_version() -> *const c_char {
-    static VERSION: &[u8] = b"0.1.0\0";
+    static VERSION: &[u8] = b"0.8.0\0";
     VERSION.as_ptr() as *const c_char
 }
 

@@ -18,9 +18,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use net::adapter::net::channel::ChannelName;
-use net::adapter::net::cortex::{
-    CortexAdapter, CortexAdapterConfig, EventEnvelope, EventMeta, StartPosition,
-};
+use net::adapter::net::cortex::{CortexAdapter, CortexAdapterConfig, EventEnvelope, EventMeta};
 use net::adapter::net::redex::{Redex, RedexError, RedexEvent, RedexFileConfig, RedexFold};
 
 fn cn(s: &str) -> ChannelName {
@@ -28,7 +26,7 @@ fn cn(s: &str) -> ChannelName {
 }
 
 /// Fold that records every event's (dispatch, seq_or_ts) pair.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct RecorderState {
     seen: Vec<(u8, u64)>,
 }
@@ -133,19 +131,24 @@ async fn test_from_seq_checkpoint_resume() {
     a.close().unwrap();
 
     // Simulate a caller that has persisted state through seq 4 and
-    // rehydrates from an external snapshot. Resume at seq 5.
+    // rehydrates via the snapshot path. Resume at seq 5 — the
+    // public `open` API rejects `FromSeq(n>0)` (BUG #134); only
+    // `open_from_snapshot` is allowed to skip the event prefix
+    // because it carries the matching `(state, last_seq)` pair.
     let mut rehydrated = RecorderState::default();
     for i in 0..5u64 {
         rehydrated.seen.push((3, i));
     }
+    let snapshot_bytes = postcard::to_allocvec(&rehydrated).unwrap();
 
-    let a2 = CortexAdapter::<RecorderState>::open(
+    let a2 = CortexAdapter::<RecorderState>::open_from_snapshot(
         &redex,
         &cn("cortex/checkpoint"),
         RedexFileConfig::default(),
-        CortexAdapterConfig::new().with_start(StartPosition::FromSeq(5)),
+        CortexAdapterConfig::default(),
         RecorderFold,
-        rehydrated,
+        &snapshot_bytes,
+        Some(4),
     )
     .unwrap();
     a2.wait_for_seq(9).await;
@@ -180,15 +183,21 @@ async fn test_live_only_skips_pre_open_events() {
         a.close().unwrap();
     }
 
-    // Reopen with LiveOnly; fresh state should stay empty until new
-    // ingests arrive.
-    let a2 = CortexAdapter::<RecorderState>::open(
+    // Reopen via the snapshot path with `last_seq = Some(9)` — that
+    // routes the tail to start at seq 10, the live-only equivalent
+    // for a 10-event file. The public `open` API rejects
+    // `LiveOnly` directly (BUG #134) because skipping a non-empty
+    // event prefix without a matching state snapshot would advance
+    // the watermark past events the adapter never folded.
+    let empty_snapshot = postcard::to_allocvec(&RecorderState::default()).unwrap();
+    let a2 = CortexAdapter::<RecorderState>::open_from_snapshot(
         &redex,
         &cn("cortex/liveonly"),
         RedexFileConfig::default(),
-        CortexAdapterConfig::new().with_start(StartPosition::LiveOnly),
+        CortexAdapterConfig::default(),
         RecorderFold,
-        RecorderState::default(),
+        &empty_snapshot,
+        Some(9),
     )
     .unwrap();
 
