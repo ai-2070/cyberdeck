@@ -285,11 +285,25 @@ impl ClassifyFsm {
         // Open: any reflex equals bind. A port-mapping installed
         // via stage 4 produces the same shape (bind == external),
         // so this check naturally subsumes that case.
-        if self
-            .probes
-            .iter()
-            .any(|(_, reflex)| reflex.port() == bind_addr.port() && reflex.ip() == bind_addr.ip())
-        {
+        //
+        // BUG #107: when `bind_addr.ip()` is wildcard (0.0.0.0 or
+        // ::), a reflex observation like `192.0.2.1:9001` would
+        // never compare equal under the strict `reflex.ip() ==
+        // bind_addr.ip()` check — even though the ports match and
+        // the node is in fact directly reachable. The FSM then
+        // classified as `Cone` (or `Symmetric`) and
+        // `pair_action` triggered an unnecessary `SinglePunch`.
+        // Capability tags advertised `nat:cone` instead of
+        // `nat:open`, biasing peer-side decisions. The docstring
+        // says callers should pre-resolve `bind_addr` to an
+        // interface address, but no runtime guard enforced it.
+        // Now an unspecified bind IP is treated as a wildcard
+        // match — port-only equality suffices.
+        let bind_ip_is_wildcard = bind_addr.ip().is_unspecified();
+        if self.probes.iter().any(|(_, reflex)| {
+            reflex.port() == bind_addr.port()
+                && (bind_ip_is_wildcard || reflex.ip() == bind_addr.ip())
+        }) {
             return NatClass::Open;
         }
 
@@ -400,6 +414,60 @@ mod tests {
         fsm.observe(1, bind);
         fsm.observe(2, sa("198.51.100.5:54321"));
         assert_eq!(fsm.classify(bind), NatClass::Open);
+    }
+
+    // ========================================================================
+    // BUG #107: wildcard bind IP must not block Open detection
+    // ========================================================================
+
+    /// When the daemon binds to `0.0.0.0:9001` (the common
+    /// default), a reflex observation like `192.0.2.1:9001`
+    /// should classify as `Open` — the ports match and the node
+    /// is in fact directly reachable. Pre-fix the strict
+    /// `reflex.ip() == bind_addr.ip()` check rejected the match
+    /// (since `192.0.2.1 != 0.0.0.0`) and the FSM mis-classified
+    /// as `Cone`/`Symmetric`, advertising `nat:cone` instead of
+    /// `nat:open` in capability tags.
+    #[test]
+    fn wildcard_bind_v4_recognizes_open() {
+        let mut fsm = ClassifyFsm::new();
+        // Same port across two peers, different IPs — the bind
+        // is wildcard so port-only equality should suffice.
+        fsm.observe(1, sa("192.0.2.1:9001"));
+        fsm.observe(2, sa("203.0.113.7:9001"));
+        let bind = sa("0.0.0.0:9001");
+        assert_eq!(
+            fsm.classify(bind),
+            NatClass::Open,
+            "wildcard bind must classify port-matching reflex as Open (BUG #107)"
+        );
+    }
+
+    /// IPv6 wildcard (`[::]:9001`) — same hazard pattern.
+    #[test]
+    fn wildcard_bind_v6_recognizes_open() {
+        let mut fsm = ClassifyFsm::new();
+        fsm.observe(1, sa("[2001:db8::1]:9001"));
+        fsm.observe(2, sa("[2001:db8::2]:9001"));
+        let bind = sa("[::]:9001");
+        assert_eq!(
+            fsm.classify(bind),
+            NatClass::Open,
+            "wildcard v6 bind must classify port-matching reflex as Open (BUG #107)"
+        );
+    }
+
+    /// Wildcard bind + DIFFERENT reflex ports must still
+    /// classify as Symmetric (port mismatch trumps wildcard IP).
+    /// Pins that the wildcard relaxation only matches port-
+    /// equal reflexes — varying ports still mean a NAT.
+    #[test]
+    fn wildcard_bind_with_varying_ports_is_symmetric() {
+        let mut fsm = ClassifyFsm::new();
+        fsm.observe(1, sa("192.0.2.1:54321"));
+        fsm.observe(2, sa("203.0.113.7:54322"));
+        let bind = sa("0.0.0.0:9001");
+        assert_eq!(fsm.classify(bind), NatClass::Symmetric);
     }
 
     // ========================================================================

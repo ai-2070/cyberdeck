@@ -405,13 +405,33 @@ impl Adapter for JetStreamAdapter {
         // fallback saturates so a caller-supplied `limit` near
         // `usize::MAX` cannot wrap to a tiny `max_seq` and silently
         // cap the poll at zero events.
-        let max_seq = match stream.info().await {
-            Ok(info) => info.state.last_sequence,
+        //
+        // BUG #55: also extract `first_sequence` so the per-event
+        // walk below can skip past a long retention-rollover gap in
+        // a single jump. Pre-fix `direct_get(seq)` returned NotFound
+        // for every deleted seq and the loop incremented by one and
+        // tried again — after a MAXLEN trim of the first 10M
+        // sequences, `poll_shard(from_id=None)` resumed at
+        // `start_seq=1` and the consumer did 10M sequential network
+        // RTTs before returning a single event (hung for minutes,
+        // request timeout fires, next poll resumes from where it
+        // left off — never made progress). With `first_sequence`
+        // captured up-front, the first `NotFound` jumps `current_seq`
+        // to `first_sequence` in one step.
+        let (max_seq, first_seq) = match stream.info().await {
+            Ok(info) => (info.state.last_sequence, info.state.first_sequence),
             Err(_) => {
                 let span = (fetch_limit as u64).saturating_mul(10);
-                start_seq.saturating_add(span)
+                (start_seq.saturating_add(span), 0)
             }
         };
+        // Apply the BUG #55 jump up-front: if `start_seq` is below
+        // the stream's first retained sequence, advance the cursor
+        // immediately rather than walking the deleted range
+        // one-by-one.
+        if first_seq > current_seq {
+            current_seq = first_seq;
+        }
 
         // Use direct get to fetch messages by sequence
         // Use while loop so gaps don't consume our fetch count.
