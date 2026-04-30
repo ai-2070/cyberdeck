@@ -126,12 +126,14 @@ Extended scope (#121 onward): a fourth multi-agent sweep covered the subtrees ex
 
 **Refuted on verification:** #96 (`read_timestamps` torn-tail alignment — alignment is preserved by construction, see entry); #137 (`Sampler::should_sample` `RateLimited` over-sample — the entire arm runs inside `last_reset.lock()`, so the check+increment is already serialized, see entry).
 
-**Verified (read end-to-end on 2026-04-30):** #58, #61, #62, #63, #64, #65, #66, #67, #68, #69, #70, #71, #72, #73, #74, #75, #76, #77, #79, #80, #81, #82, #83, #85, #86, #87, #88, #89, #90, #91, #92, #93, #94, #95, #98, #110, #111, #112, #114, #117, #121, #122, #123, #124, #125, #126, #127, #128, #129, #131, #132, #133, #134, #136, #138, #139, #141, #143, #144, #146, #147, #149, #150, #151, #152, #155. #84 was found to be **mis-located** — the cited code is correct; the bug is at the upstream caller `mesh.rs:3000-3008` (see entry).
+**Verified (read end-to-end on 2026-04-30):** #55, #58, #61, #62, #63, #64, #65, #66, #67, #68, #69, #70, #71, #72, #73, #74, #75, #76, #77, #79, #80, #81, #82, #83, #85, #86, #87, #88, #89, #90, #91, #92, #93, #94, #95, #98, #107, #110, #111, #112, #114, #117, #121, #122, #123, #124, #125, #126, #127, #128, #129, #131, #132, #133, #134, #136, #138, #139, #141, #143, #144, #146, #147, #149, #150, #151, #152, #155. #84 was found to be **mis-located** — the cited code is correct; the bug is at the upstream caller `mesh.rs:3000-3008` (see entry).
 
 ## High
 
-### 55. JetStream `direct_get` walks deleted sequence range one RTT at a time
+### 55. JetStream `direct_get` walks deleted sequence range one RTT at a time — **[FIXED 2026-04-30]**
 **File:** `adapter/jetstream.rs:428-433`
+
+**Fix:** `poll_shard` now reads `first_sequence` from the existing `stream.info()` call and jumps `current_seq` past the retention-trimmed prefix in a single step. See the **Fixed on 2026-04-30** block above.
 
 After a long retention rollover (e.g. MAXLEN trimmed the first 10M sequences), `poll_shard(from_id=None)` resumes at `start_seq=1`. `direct_get(seq)` returns `NotFound` for every deleted seq; the loop simply increments by one and tries again. Result: 10M sequential network RTTs before a single event is returned. The consumer hangs for minutes — until the request timeout fires, at which point the next poll resumes from where it left off, never making progress. Should query `info().state.first_sequence` and bump `current_seq` to that on the first `NotFound`, or use `direct_get_next_for_subject` / a bounded fetch.
 
@@ -507,8 +509,10 @@ let thread_local_pool = super::pool::shared_local_pool(pool_size, &keys.tx_key, 
 
 All three share the same key. `PacketPool` and `ThreadLocalPool` each correctly serialize their internal counters within the pool (regression tests at `pool.rs:952, 992` confirm) — but the three constructions have independent counters that all start at 0. Currently dormant: `tx_cipher` (line 153) and `packet_pool` (line 562) getters are exposed, but no caller in the tree uses them — only `thread_local_pool` is wired through. The moment any caller obtains `session.packet_pool()` or `session.tx_cipher()` and encrypts a packet, ChaCha20-Poly1305 nonce reuse against the corresponding counter slot in `thread_local_pool` is guaranteed (same key + same nonce), giving an attacker XOR access to the plaintext. The pool-internal regression tests prevent this **within** a pool; the construction here defeats it across pools. Either share one `Arc<AtomicU64>` counter across all three, or remove the unused getters.
 
-### 107. `ClassifyFsm::classify` cannot recognize `Open` for nodes bound to wildcard addresses
+### 107. `ClassifyFsm::classify` cannot recognize `Open` for nodes bound to wildcard addresses — **[FIXED 2026-04-30]**
 **File:** `adapter/net/traversal/classify.rs:280-294`
+
+**Fix:** when `bind_addr.ip().is_unspecified()` (i.e. wildcard bind), the IP comparison is treated as a match — port-only equality suffices for the `Open` predicate. See the **Fixed on 2026-04-30** block above for tests.
 
 The "Open" predicate is `reflex.port() == bind_addr.port() && reflex.ip() == bind_addr.ip()` (line 291). When the daemon binds to `0.0.0.0:9001` (the common default), peer reflex observations like `192.0.2.1:9001` will never compare equal — even though the ports match and the node is, in fact, directly reachable. The FSM classifies as `Cone` (or `Symmetric`) and `pair_action` triggers an unnecessary `SinglePunch`. Capability tags advertise `nat:cone` instead of `nat:open`, biasing peer-side decisions. The docstring at line 277 acknowledges callers should pre-resolve `bind_addr` to an interface address but provides no runtime guard — the API silently mis-classifies. Either resolve wildcard binds against the node's interface table before classification, or treat IP comparison as a wildcard match when `bind_addr.ip().is_unspecified()`.
 
@@ -915,7 +919,7 @@ Inside `ingest_raw_batch`, routing-miss events (concurrent scale-down removed th
 5. **#100** — `LocalGraph::on_pingwave` accepts attacker-poisoned addresses + grows `nodes` map at line-rate (DoS + route hijack)
 6. **#101** — Loadbalance probe slot leaks via filter-time side effect (circuit breaker permanently stuck on any multi-endpoint cluster)
 7. **#97** — Legacy `NetAdapter` heartbeat sender uses zero key (idle session keep-alive silently dead on the legacy single-peer path)
-8. **#55** — JetStream `direct_get` retention-rollover stall (consumer DoS after MAXLEN trim)
+8. ~~**#55** — JetStream `direct_get` retention-rollover stall (consumer DoS after MAXLEN trim)~~ — **fixed 2026-04-30**
 9. **#57** — Redis MULTI/EXEC timeout duplicates (silent stream corruption)
 10. ~~**#58** — `net_free_bytes` panic-across-FFI on adversarial `len`~~ — **fixed 2026-04-30**
 11. **#84** — `RxCreditState` auto-grants every consumed byte, defeating receive-side backpressure entirely
