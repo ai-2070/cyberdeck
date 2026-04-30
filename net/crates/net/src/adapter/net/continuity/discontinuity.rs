@@ -188,7 +188,25 @@ impl ForkRecord {
     /// `ForkRecord`s could parse as the first one alone, and
     /// callers framing this type inside a larger payload could
     /// smuggle extra bytes past the parser.
+    ///
+    /// BUG_REPORT.md #42: also runs `verify()` before returning,
+    /// so a structurally-bogus record (sentinel mismatch, origin
+    /// collision, etc.) cannot reach a caller that forgot to
+    /// call `verify` themselves. Callers that need the raw
+    /// bytes-only parse for diagnostics can use
+    /// [`Self::from_bytes_unchecked`].
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        let parsed = Self::from_bytes_unchecked(data)?;
+        if !parsed.verify() {
+            return None;
+        }
+        Some(parsed)
+    }
+
+    /// Deserialize without `verify()`. Useful for diagnostics
+    /// (e.g. inspecting a malformed record before deciding what
+    /// to do); production callers should prefer [`from_bytes`].
+    pub fn from_bytes_unchecked(data: &[u8]) -> Option<Self> {
         if data.len() != Self::WIRE_SIZE {
             return None;
         }
@@ -279,5 +297,39 @@ mod tests {
         let (_, mut record, _) = fork_entity(0xAAAA, 100, None);
         record.fork_genesis.parent_hash = 0xBADBADBAD;
         assert!(!record.verify());
+    }
+
+    /// Regression: BUG_REPORT.md #42 — `from_bytes` previously
+    /// returned `Some(record)` for any bytes that *parsed* the
+    /// wire format, even if `verify()` would have rejected the
+    /// record (e.g. tampered sentinel, origin collision). The
+    /// caller had to remember to call `verify()` themselves; if
+    /// they didn't, an attacker could ship a structurally-bogus
+    /// fork record and the consumer would treat it as valid.
+    /// The fix calls `verify()` inside `from_bytes`. The
+    /// raw-parse path is preserved as `from_bytes_unchecked` for
+    /// diagnostic uses.
+    #[test]
+    fn from_bytes_runs_verify() {
+        // Build a valid fork record, tamper its sentinel, and
+        // serialize. `from_bytes` must reject; `from_bytes_unchecked`
+        // must succeed (returning the bogus record so a diagnostic
+        // tool can inspect it).
+        let (_, mut record, _) = fork_entity(0xCAFE, 7, None);
+        // Tamper: set the parent_hash to something that won't
+        // match the fork sentinel.
+        record.fork_genesis.parent_hash = 0xDEAD_BEEF;
+        let bytes = record.to_bytes();
+
+        assert!(
+            ForkRecord::from_bytes(&bytes).is_none(),
+            "from_bytes must reject a record whose sentinel \
+             doesn't verify (#42)"
+        );
+        assert!(
+            ForkRecord::from_bytes_unchecked(&bytes).is_some(),
+            "from_bytes_unchecked still parses the raw bytes for \
+             diagnostic use"
+        );
     }
 }

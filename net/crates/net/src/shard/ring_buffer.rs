@@ -185,23 +185,43 @@ impl<T> RingBuffer<T> {
 
     /// Producer-side eviction of the oldest element.
     ///
-    /// Identical to `try_pop` but bypasses the consumer-thread
-    /// tracking. Intended exclusively for the `BackpressureMode::
-    /// DropOldest` retry path, where the *producer* needs to evict
-    /// the oldest event to make room for a new push. The shard's
-    /// outer mutex serializes this evict against any concurrent
-    /// `try_pop` from the legitimate consumer (the batch worker), so
-    /// the SPSC atomic invariants are upheld even though two
-    /// different OS threads call into this producer-side method and
-    /// the consumer-side `try_pop` at different times.
+    /// Identical to `try_pop` but tracks the *producer* thread,
+    /// not the consumer. Intended exclusively for the
+    /// `BackpressureMode::DropOldest` retry path, where the
+    /// *producer* needs to evict the oldest event to make room
+    /// for a new push. The shard's outer mutex serializes this
+    /// evict against any concurrent `try_pop` from the legitimate
+    /// consumer (the batch worker), so the SPSC atomic invariants
+    /// are upheld even though two different OS threads call into
+    /// this producer-side method and the consumer-side `try_pop`
+    /// at different times.
     ///
-    /// Without this method, `DropOldest` calls `try_pop` from the
-    /// producer's thread, which is a SPSC contract violation:
-    /// `try_pop` documents itself as the *consumer* path, and the
-    /// thread-id tracking under `cfg(test)` panics on the violation
-    /// (see BUG_REPORT.md #8).
+    /// BUG_REPORT.md #35: previously this had no debug-build
+    /// thread guard at all. The thread it expects matches
+    /// `try_push` (the producer); we assert that here so a future
+    /// caller using `evict_oldest` from the consumer thread or
+    /// from a third thread is caught at test time the same way
+    /// `try_push`/`try_pop` are.
     #[inline]
     pub(crate) fn evict_oldest(&self) -> Option<T> {
+        #[cfg(test)]
+        {
+            let current = std::thread::current().id();
+            let mut guard = self
+                .producer_thread
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(tid) = *guard {
+                assert_eq!(
+                    tid, current,
+                    "SPSC violation: evict_oldest called from a different thread \
+                     than try_push (it must run on the producer thread)"
+                );
+            } else {
+                *guard = Some(current);
+            }
+        }
+
         // Same atomic ordering as `try_pop`; only the thread
         // tracking differs.
         let tail = self.tail.load(Ordering::Relaxed);
@@ -770,6 +790,39 @@ mod tests {
         assert!(
             result.is_err(),
             "SPSC violation should be detected when two threads push"
+        );
+    }
+
+    /// Regression: BUG_REPORT.md #35 — `evict_oldest` previously
+    /// had no debug-build thread guard, so a future refactor that
+    /// called it from the consumer thread (or a third thread) would
+    /// silently corrupt SPSC state with no compile- or test-time
+    /// signal. The fix makes `evict_oldest` track the producer
+    /// thread the same way `try_push` does. This test pins the
+    /// guard by spawning a second thread that calls `evict_oldest`
+    /// after the first thread already pinned the producer identity
+    /// via `try_push`.
+    #[cfg(test)]
+    #[test]
+    fn test_regression_evict_oldest_thread_guard() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let buf = Arc::new(RingBuffer::new(4));
+        // Pin producer identity via try_push from this thread.
+        buf.try_push(1).unwrap();
+
+        // Different thread calling evict_oldest should panic.
+        let buf2 = buf.clone();
+        let result = thread::spawn(move || {
+            let _ = buf2.evict_oldest();
+        })
+        .join();
+
+        assert!(
+            result.is_err(),
+            "evict_oldest must panic when called from a non-producer \
+             thread (BUG_REPORT.md #35)"
         );
     }
 

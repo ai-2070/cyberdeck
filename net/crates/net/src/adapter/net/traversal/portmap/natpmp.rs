@@ -522,17 +522,20 @@ impl PortMapperClient for NatPmpMapper {
 
     async fn remove(&self, mapping: &PortMapping) {
         // Lifetime=0 is the RFC 6886 §3.3 "drop mapping" signal.
-        // Best-effort — task shutdown calls this, and we don't
-        // want a timeout here to stall mesh teardown.
         //
-        // Fire-and-forget semantics: the old `round_trip` path
-        // waited up to `NATPMP_DEADLINE` (1 s) for a response
-        // that a misbehaving or already-torn-down gateway would
-        // never send, stalling the shutdown / revoke path by a
-        // full second per remove. The gateway's ack on a
-        // lifetime=0 request is informational — the mapping is
-        // already gone (or never existed) once our UDP packet
-        // lands — so we send and return without recv'ing.
+        // BUG_REPORT.md #41: previously fire-and-forget — UDP
+        // delivery to the gateway is not the same as gateway-side
+        // processing, and some routers refuse `lifetime=0` (or
+        // are already torn down on our side) without our knowing.
+        // Now we do a *short-deadline* recv (200 ms) so a healthy
+        // gateway's ack confirms removal, but a misbehaving one
+        // doesn't stall shutdown. On timeout we log a warning so
+        // operators can investigate stale mappings; on a successful
+        // recv with a non-zero result code, we log the failure
+        // verbatim.
+        const REMOVE_DEADLINE: std::time::Duration =
+            std::time::Duration::from_millis(200);
+
         let req = NatPmpRequest::MapUdp {
             internal_port: mapping.internal_port,
             external_port_hint: 0,
@@ -542,17 +545,52 @@ impl PortMapperClient for NatPmpMapper {
             return;
         };
         let target = SocketAddr::new(IpAddr::V4(self.gateway), self.target_port);
-        // Use `connect` for symmetry with `round_trip` — not
-        // strictly needed for a single send (there's no reply
-        // we care about), but matches the idiomatic UDP-client
-        // pattern for a bound gateway and makes the kernel
-        // treat later `send` as non-blocking-to-a-connected-
-        // peer semantics (faster failure on a torn route).
         if sock.connect(target).await.is_err() {
             return;
         }
         let bytes = encode_request(&req);
-        let _ = sock.send(&bytes).await;
+        if sock.send(&bytes).await.is_err() {
+            return;
+        }
+
+        let mut buf = [0u8; 16];
+        match tokio::time::timeout(REMOVE_DEADLINE, sock.recv(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                // RFC 6886 §3.5: bytes [2..4] is the result code (BE u16).
+                // 0 = success.
+                if n >= 4 {
+                    let result_code = u16::from_be_bytes([buf[2], buf[3]]);
+                    if result_code != 0 {
+                        tracing::warn!(
+                            internal_port = mapping.internal_port,
+                            result_code,
+                            "NAT-PMP remove: gateway returned non-zero result code"
+                        );
+                    }
+                }
+            }
+            Ok(Ok(_)) => {
+                tracing::warn!(
+                    internal_port = mapping.internal_port,
+                    "NAT-PMP remove: empty response from gateway"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    internal_port = mapping.internal_port,
+                    error = %e,
+                    "NAT-PMP remove: recv error"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    internal_port = mapping.internal_port,
+                    "NAT-PMP remove: gateway did not ack within {}ms — \
+                     mapping may still be live (BUG_REPORT.md #41)",
+                    REMOVE_DEADLINE.as_millis()
+                );
+            }
+        }
     }
 }
 

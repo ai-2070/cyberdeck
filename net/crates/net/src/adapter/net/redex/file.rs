@@ -68,6 +68,32 @@ struct RedexFileInner {
     interval_shutdown: Option<Arc<Notify>>,
 }
 
+/// BUG_REPORT.md #28: dropping the last `RedexFile` clone without
+/// calling `close()` previously leaked the `FsyncPolicy::Interval`
+/// background task — it kept a strong `Arc<DiskSegment>` and a
+/// shutdown `Notify` whose only firing site was inside `close()`.
+/// `redex/index.rs` already had a Drop impl that mirrored this
+/// pattern; we mirror it here so a misbehaving caller (or a panic
+/// path that bypasses the explicit close) doesn't leak the task
+/// for the lifetime of the runtime.
+///
+/// Drop is best-effort: it fires the notify so the spawned task
+/// observes the signal and exits at the next select. We do NOT
+/// flush or fsync from Drop because that would require an async
+/// runtime context that may not be available.
+impl Drop for RedexFileInner {
+    fn drop(&mut self) {
+        #[cfg(feature = "redex-disk")]
+        if let Some(notify) = self.interval_shutdown.as_ref() {
+            // `notify_one` stores a permit even if no waiter is
+            // currently parked, so a task that hasn't yet reached
+            // its first `notified().await` will still observe the
+            // signal on its next select.
+            notify.notify_one();
+        }
+    }
+}
+
 /// A handle to a RedEX file. Cheap to clone.
 ///
 /// Created via [`super::Redex::open_file`].
