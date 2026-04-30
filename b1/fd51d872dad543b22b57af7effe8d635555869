@@ -1,0 +1,29 @@
+net/crates/net/src/adapter/net/subprotocol/migration_handler.rs
+  36b642b129ab4a5e 349-372,375
+net/crates/net/docs/BUG_AUDIT_2026_04_30_CORE.md
+  36b642b129ab4a5e 34,83,649,652
+net/crates/net/src/adapter/net/state/snapshot.rs
+  36b642b129ab4a5e 42-78,249-293,323,797-892
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  36b642b129ab4a5e 922-927
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "b1fd51d872dad543b22b57af7effe8d635555869",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 215,
+      "total_deletions": 9,
+      "accepted_lines": 215,
+      "overriden_lines": 0
+    }
+  }
+}
