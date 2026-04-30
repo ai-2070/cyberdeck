@@ -1,0 +1,93 @@
+net/crates/net/src/shard/mod.rs
+  4f40616bb3482b98 23,495-498,533-534,563,723-730,791-797,807-814
+net/crates/net/src/adapter/net/state/log.rs
+  4f40616bb3482b98 79-87
+net/crates/net/src/adapter/jetstream.rs
+  4f40616bb3482b98 293-297,478-479
+net/crates/net/src/adapter/redis.rs
+  4f40616bb3482b98 299-308
+net/crates/net/src/adapter/net/session.rs
+  4f40616bb3482b98 1012-1019
+net/crates/net/src/adapter/net/route.rs
+  4f40616bb3482b98 232-240,250
+net/crates/net/src/adapter/net/traversal/portmap/mod.rs
+  4f40616bb3482b98 565-570,572-577
+net/crates/net/src/adapter/net/state/causal.rs
+  4f40616bb3482b98 237-243,268
+net/crates/net/src/adapter/net/compute/daemon.rs
+  4f40616bb3482b98 54-61,75-82
+net/crates/net/src/adapter/net/subprotocol/negotiation.rs
+  4f40616bb3482b98 74-81
+net/crates/net/src/adapter/net/compute/standby_group.rs
+  4f40616bb3482b98 322-324
+net/crates/net/src/adapter/net/state/snapshot.rs
+  4f40616bb3482b98 348-351
+net/crates/net/src/config.rs
+  4f40616bb3482b98 90-91,749-752
+net/crates/net/src/adapter/net/traversal/portmap/natpmp.rs
+  4f40616bb3482b98 526-534,588
+net/crates/net/src/bus.rs
+  4f40616bb3482b98 263-268,291-297,359-364,610-616,713-718,835-842,854-860,881,883-889,1139-1147
+net/crates/net/src/adapter/net/compute/fork_group.rs
+  4f40616bb3482b98 269-272
+net/crates/net/src/adapter/net/contested/reconcile.rs
+  4f40616bb3482b98 161-169
+net/crates/net/src/adapter/net/compute/replica_group.rs
+  4f40616bb3482b98 177-180,251-256
+net/crates/net/src/ffi/cortex.rs
+  4f40616bb3482b98 100-102
+net/crates/net/src/consumer/merge.rs
+  4f40616bb3482b98 321-326,340-350,365-369,447-448,465
+net/crates/net/src/adapter/net/linux.rs
+  4f40616bb3482b98 102-109
+net/crates/net/src/adapter/net/traversal/portmap/upnp.rs
+  4f40616bb3482b98 179-186,283-285
+net/crates/net/src/shard/ring_buffer.rs
+  4f40616bb3482b98 23,199-203
+net/crates/net/src/adapter/net/continuity/discontinuity.rs
+  4f40616bb3482b98 192-196
+net/crates/net/src/adapter/net/behavior/loadbalance.rs
+  4f40616bb3482b98 636-642,644-645,774-776,797-799
+net/crates/net/src/adapter/net/transport.rs
+  4f40616bb3482b98 305-312
+net/crates/net/src/timestamp.rs
+  4f40616bb3482b98 68-74
+net/crates/net/src/error.rs
+  4f40616bb3482b98 18-22
+net/crates/net/src/ffi/mod.rs
+  4f40616bb3482b98 222-224,924-932,1102
+net/crates/net/src/adapter/net/mod.rs
+  4f40616bb3482b98 569-575,607
+net/crates/net/src/shard/mapper.rs
+  4f40616bb3482b98 861-868,995-1004,1021-1027,1098-1102
+net/crates/net/src/adapter/net/router.rs
+  4f40616bb3482b98 156-158,162-163,228-230,249-256
+net/crates/net/src/ffi/mesh.rs
+  4f40616bb3482b98 159-165,178-182,1142-1147
+net/crates/net/src/adapter/net/behavior/safety.rs
+  4f40616bb3482b98 873,875-881
+net/crates/net/src/adapter/net/behavior/proximity.rs
+  4f40616bb3482b98 191-196
+net/crates/net/src/adapter/net/failure.rs
+  4f40616bb3482b98 188-196,221-228
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "845e5e77fb352a72c6e48ca64adf84cda7c5c641",
+  "prompts": {
+    "4f40616bb3482b98": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4364a44-daa1-40ed-9f76-d0eea8143568",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 237,
+      "total_deletions": 24654,
+      "accepted_lines": 517,
+      "overriden_lines": 0
+    }
+  }
+}
