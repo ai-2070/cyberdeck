@@ -1188,6 +1188,7 @@ impl SafetyEnforcer {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn check_resource_limits(
         &self,
         claim: &ResourceClaim,

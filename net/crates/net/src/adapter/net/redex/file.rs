@@ -68,14 +68,13 @@ struct RedexFileInner {
     interval_shutdown: Option<Arc<Notify>>,
 }
 
-/// BUG_REPORT.md #28: dropping the last `RedexFile` clone without
-/// calling `close()` previously leaked the `FsyncPolicy::Interval`
-/// background task — it kept a strong `Arc<DiskSegment>` and a
-/// shutdown `Notify` whose only firing site was inside `close()`.
-/// `redex/index.rs` already had a Drop impl that mirrored this
-/// pattern; we mirror it here so a misbehaving caller (or a panic
-/// path that bypasses the explicit close) doesn't leak the task
-/// for the lifetime of the runtime.
+/// Dropping the last `RedexFile` clone without calling `close()`
+/// previously leaked the `FsyncPolicy::Interval` background task —
+/// it kept a strong `Arc<DiskSegment>` and a shutdown `Notify` whose
+/// only firing site was inside `close()`. `redex/index.rs` already
+/// had a Drop impl that mirrored this pattern; we mirror it here so
+/// a misbehaving caller (or a panic path that bypasses the explicit
+/// close) doesn't leak the task for the lifetime of the runtime.
 ///
 /// Drop is best-effort: it fires the notify so the spawned task
 /// observes the signal and exits at the next select. We do NOT
@@ -926,12 +925,33 @@ impl std::fmt::Debug for RedexFile {
 
 // -- helpers ---------------------------------------------------------------
 
+/// Verify the entry's stored checksum against the actual payload
+/// bytes on every read. The 28-bit xxh3 is computed at append
+/// time; without verification at read time, on-disk corruption
+/// (torn writes, bit-rot, external tampering) would flow through
+/// `materialize` as a valid event and silently poison every
+/// downstream consumer. We surface a checksum mismatch by
+/// returning `None` (same channel `materialize` already uses for
+/// "couldn't construct an event" signals).
 fn materialize(entry: &RedexEntry, segment: &HeapSegment) -> Option<RedexEvent> {
     let payload = if entry.is_inline() {
         Bytes::copy_from_slice(&entry.inline_payload()?)
     } else {
         segment.read(entry.payload_offset as u64, entry.payload_len)?
     };
+
+    let stored = entry.checksum();
+    let computed = super::entry::payload_checksum(&payload);
+    if stored != computed {
+        tracing::error!(
+            seq = entry.seq,
+            stored_checksum = format_args!("{:#x}", stored),
+            computed_checksum = format_args!("{:#x}", computed),
+            "RedexFile::materialize: checksum mismatch — payload corrupt; dropping entry"
+        );
+        return None;
+    }
+
     Some(RedexEvent {
         entry: *entry,
         payload,
@@ -1535,5 +1555,58 @@ mod tests {
             )
             .unwrap();
         assert_eq!(f2.len(), 10, "all 10 entries must persist across close");
+    }
+
+    /// Regression: previously, the 28-bit xxh3 stored on every
+    /// `RedexEntry` was computed at append but never verified at
+    /// read. On-disk corruption (torn writes, bit-rot, external
+    /// tampering) flowed through `materialize` as a valid event.
+    /// The fix verifies the stored checksum matches the recomputed
+    /// payload checksum on every read; mismatched entries are
+    /// dropped from the result with an error log.
+    ///
+    /// We simulate corruption by mutating the in-memory segment
+    /// bytes after append and asserting `read_range` no longer
+    /// returns the corrupt entry.
+    #[test]
+    fn read_path_drops_entries_with_bad_checksum() {
+        let f = make_file("checksum_verify");
+
+        // Append three heap-stored entries (payload > inline size of
+        // 8 bytes, so they live in the segment).
+        f.append(b"first-payload-bytes").unwrap();
+        f.append(b"second-payload-bytes").unwrap();
+        f.append(b"third-payload-bytes").unwrap();
+
+        // Sanity: all three round-trip cleanly.
+        let events = f.read_range(0, 100);
+        assert_eq!(events.len(), 3);
+
+        // Corrupt the second entry's bytes in the heap segment.
+        // We mutate the byte at the entry's offset directly via the
+        // shared state lock — same access pattern `materialize` will
+        // use, just with a write.
+        {
+            let mut state = f.inner.state.lock();
+            // Find the second entry (seq == 1) and flip a byte at
+            // its payload_offset.
+            let entry = state.index.iter().find(|e| e.seq == 1).copied().unwrap();
+            assert!(!entry.is_inline(), "test premise: seq=1 must be heap-stored");
+            // Flip the first byte of the payload.
+            let off = entry.payload_offset as usize;
+            let old = state.segment.bytes_for_test_mut()[off];
+            state.segment.bytes_for_test_mut()[off] = old.wrapping_add(1);
+        }
+
+        // The corrupted entry must be dropped on read; the other
+        // two survive.
+        let events = f.read_range(0, 100);
+        assert_eq!(
+            events.len(),
+            2,
+            "corrupt entry must be dropped from read_range result"
+        );
+        let surviving_seqs: Vec<u64> = events.iter().map(|e| e.entry.seq).collect();
+        assert_eq!(surviving_seqs, vec![0, 2]);
     }
 }

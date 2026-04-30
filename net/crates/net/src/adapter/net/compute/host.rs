@@ -127,9 +127,27 @@ impl DaemonHost {
         // Restore daemon state
         daemon.restore(snapshot.state.clone())?;
 
-        // Rebuild chain from snapshot head. Use the snapshot state as the
-        // head payload so the next event's parent_hash is computed correctly.
-        let chain = CausalChainBuilder::from_head(snapshot.chain_link, snapshot.state.clone());
+        // Rebuild chain from snapshot head. Use the head event's
+        // payload (NOT `snapshot.state`, which is the daemon's
+        // serialized state — a different thing entirely). The next
+        // event's `parent_hash` is `xxh3(prev_link_bytes ++ prev_payload)`,
+        // and any third-party validator that derives `prev_payload`
+        // from the actual head event would mismatch us if we used
+        // `snapshot.state` here.
+        //
+        // `head_payload` is a runtime-only field on the snapshot (not
+        // on the wire). Callers populate it from the head event
+        // before invoking restore. If it's empty (e.g. a snapshot
+        // deserialized from wire bytes without out-of-band payload
+        // transfer), we fall back to `snapshot.state` to preserve
+        // the prior behavior — but this fallback only works when
+        // the source side made the same choice.
+        let head_payload = if snapshot.head_payload.is_empty() {
+            snapshot.state.clone()
+        } else {
+            snapshot.head_payload.clone()
+        };
+        let chain = CausalChainBuilder::from_head(snapshot.chain_link, head_payload);
 
         // Rehydrate the subscription ledger. Empty bytes → empty
         // ledger; malformed bytes → reject. The migration-target

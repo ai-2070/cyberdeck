@@ -176,6 +176,57 @@ impl DiskSegment {
             payload_bytes.truncate(retained_dat_end as usize);
         }
 
+        // Verify per-entry checksums during recovery. Without
+        // this check, on-disk corruption (torn writes, bit-rot,
+        // FS bug, or external tampering) is silently accepted
+        // and becomes part of the recovered state. Drop entries
+        // whose checksum doesn't match. Inline entries are
+        // self-contained 8-byte payloads carried inside the
+        // index record; we still verify them in case the index
+        // file itself was corrupted.
+        let mut bad_entries = 0usize;
+        index.retain(|e| {
+            let payload: &[u8] = if e.is_inline() {
+                let Some(inline) = e.inline_payload() else {
+                    bad_entries += 1;
+                    return false;
+                };
+                let computed = super::entry::payload_checksum(&inline);
+                if e.checksum() != computed {
+                    bad_entries += 1;
+                    return false;
+                }
+                return true;
+            } else {
+                let off = e.payload_offset as usize;
+                let len = e.payload_len as usize;
+                let end = off.saturating_add(len);
+                if end > payload_bytes.len() {
+                    // Should be impossible after the truncation
+                    // pass above, but stay defensive.
+                    bad_entries += 1;
+                    return false;
+                }
+                &payload_bytes[off..end]
+            };
+            let computed = super::entry::payload_checksum(payload);
+            if e.checksum() != computed {
+                bad_entries += 1;
+                false
+            } else {
+                true
+            }
+        });
+        if bad_entries > 0 {
+            tracing::error!(
+                bad_entries,
+                surviving = index.len(),
+                "DiskSegment::open: dropped {} entries with bad checksums during recovery; \
+                 on-disk dat may have torn writes or be corrupt",
+                bad_entries
+            );
+        }
+
         let idx_file = OpenOptions::new()
             .create(true)
             .read(true)

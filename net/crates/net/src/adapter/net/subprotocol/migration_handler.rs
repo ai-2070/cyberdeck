@@ -1253,6 +1253,7 @@ mod tests {
             created_at: 0,
             bindings_bytes: Vec::new(),
             identity_envelope: None,
+            head_payload: bytes::Bytes::new(),
         };
 
         // Wire the identity context so `peer_static_lookup` returns
@@ -1337,6 +1338,7 @@ mod tests {
             created_at: 0,
             bindings_bytes: Vec::new(),
             identity_envelope: None,
+            head_payload: bytes::Bytes::new(),
         };
         let passthrough = handler_no_ctx
             .maybe_seal_envelope(snapshot2, origin_hash, target_node_id)
@@ -1551,6 +1553,7 @@ mod tests {
             created_at: 0,
             bindings_bytes: Vec::new(),
             identity_envelope: Some(envelope),
+            head_payload: bytes::Bytes::new(),
         };
 
         // Build a handler with an identity_context whose unseal
@@ -1603,6 +1606,7 @@ mod tests {
         // branch above wasn't passing by coincidence.
         let snapshot_no_envelope = StateSnapshot {
             identity_envelope: None,
+            head_payload: bytes::Bytes::new(),
             ..snapshot.clone()
         };
         let resolved_fallback = handler
@@ -1663,6 +1667,7 @@ mod tests {
             created_at: 0,
             bindings_bytes: Vec::new(),
             identity_envelope: Some(envelope),
+            head_payload: bytes::Bytes::new(),
         };
 
         // Misbehaving unsealer: always returns `Ok(None)`, even

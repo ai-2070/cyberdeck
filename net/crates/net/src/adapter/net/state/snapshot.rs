@@ -74,6 +74,25 @@ pub struct StateSnapshot {
     /// a read-only keypair that can still serve `entity_id` /
     /// `origin_hash` queries but refuses to sign anything new.
     pub identity_envelope: Option<IdentityEnvelope>,
+    /// Runtime-only: payload bytes of the event at
+    /// `chain_link.sequence`. Required by
+    /// [`super::log::EntityLog::from_snapshot`] to validate the
+    /// next event's `parent_hash` after restore (the chain validator
+    /// computes `xxh3(prev_link_bytes ++ prev_payload)`).
+    ///
+    /// **Not serialized** — `to_bytes` / `from_bytes` skip this
+    /// field, so the wire format is unchanged. Callers reconstructing
+    /// a snapshot from the log have the head event in hand and
+    /// populate this via `with_head_payload` before passing the
+    /// snapshot to restore. Cross-node migration carries the head
+    /// event through the migration message itself, paired with the
+    /// snapshot bytes.
+    ///
+    /// Default for snapshots deserialized from wire bytes is
+    /// `Bytes::new()`; callers must populate it from the head event
+    /// before `EntityLog::from_snapshot` can validate subsequent
+    /// events.
+    pub head_payload: Bytes,
 }
 
 impl StateSnapshot {
@@ -95,7 +114,19 @@ impl StateSnapshot {
             created_at: current_timestamp(),
             bindings_bytes: Vec::new(),
             identity_envelope: None,
+            head_payload: Bytes::new(),
         }
+    }
+
+    /// Attach the head event's payload bytes — needed by
+    /// `EntityLog::from_snapshot` to validate the next event's
+    /// chain link after restore. Genesis snapshots
+    /// (`chain_link.sequence == 0`) carry empty bytes; subsequent
+    /// snapshots carry the payload of the event at
+    /// `chain_link.sequence`.
+    pub fn with_head_payload(mut self, head_payload: Bytes) -> Self {
+        self.head_payload = head_payload;
+        self
     }
 
     /// Attach an identity envelope sealed to `target_static_pub`,
@@ -173,8 +204,10 @@ impl StateSnapshot {
     /// [envelope:       208 bytes]  (if envelope_flag == 1)
     /// ```
     ///
-    /// Horizon is not serialized in the compact format — it is
-    /// transferred separately or reconstructed from the event log.
+    /// Horizon and `head_payload` are not serialized in the compact
+    /// format — `head_payload` is a runtime-only field populated by
+    /// the caller from the head event before invoking restore (see
+    /// the field's doc).
     pub fn to_bytes(&self) -> Vec<u8> {
         let envelope_bytes_len = if self.identity_envelope.is_some() {
             IDENTITY_ENVELOPE_SIZE
@@ -217,6 +250,11 @@ impl StateSnapshot {
     /// layouts. v0 bytes surface with defaulted `bindings_bytes` +
     /// `identity_envelope` so a rolling upgrade between pre- and
     /// post-v1 nodes doesn't stall.
+    ///
+    /// `head_payload` is runtime-only and always defaults to empty
+    /// after deserialize; callers must populate it from the head
+    /// event before passing the snapshot to
+    /// [`super::log::EntityLog::from_snapshot`].
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() >= V1_MAGIC.len() && data[..V1_MAGIC.len()] == V1_MAGIC {
             Self::from_bytes_v1(&data[V1_MAGIC.len()..])
@@ -316,6 +354,9 @@ impl StateSnapshot {
             created_at,
             bindings_bytes,
             identity_envelope,
+            // Runtime-only: not on the wire. Caller populates from
+            // the head event before invoking `EntityLog::from_snapshot`.
+            head_payload: Bytes::new(),
         })
     }
 
@@ -362,9 +403,10 @@ impl StateSnapshot {
         }
 
         Some(Self {
-            // Surface the snapshot as v1 for downstream uniformity;
-            // writers always emit v1, so a fresh round-trip is a
-            // v1 → v1 operation after this read.
+            // Surface the snapshot as the current version for
+            // downstream uniformity; writers always emit current,
+            // so a fresh round-trip is a v0 → current operation
+            // after this read.
             version: SNAPSHOT_VERSION,
             entity_id,
             through_seq,
@@ -374,6 +416,7 @@ impl StateSnapshot {
             created_at,
             bindings_bytes: Vec::new(),
             identity_envelope: None,
+            head_payload: Bytes::new(),
         })
     }
 
@@ -858,5 +901,84 @@ mod tests {
             StateSnapshot::from_bytes_v0(&buf).is_none(),
             "v0 must reject trailing bytes past state_len (#40)"
         );
+    }
+
+    /// Regression: `EntityLog::from_snapshot` requires the head
+    /// event's payload bytes to validate the next event's
+    /// `parent_hash`. The snapshot now carries `head_payload` as a
+    /// runtime-only field (not on the wire) that callers populate
+    /// from the head event before invoking restore. This test pins:
+    ///
+    /// 1. The default constructor leaves `head_payload` empty.
+    /// 2. `with_head_payload` stores the bytes.
+    /// 3. The wire format is unchanged — `head_payload` round-trips
+    ///    as empty regardless of what was set in-process (since the
+    ///    field isn't serialized).
+    /// 4. After deserialize, the caller can populate `head_payload`
+    ///    out-of-band and use the snapshot for restore.
+    #[test]
+    fn head_payload_is_runtime_only_not_on_wire() {
+        let kp = EntityKeypair::generate();
+        let mut builder = CausalChainBuilder::new(kp.origin_hash());
+        let head_event_payload = Bytes::from_static(b"head-event-payload");
+        builder.append(head_event_payload.clone(), 0).unwrap();
+
+        // Default constructor: head_payload is empty.
+        let mut snap = StateSnapshot::new(
+            kp.entity_id().clone(),
+            *builder.head(),
+            Bytes::from_static(b"daemon-state-bytes"),
+            ObservedHorizon::new(),
+        );
+        assert!(
+            snap.head_payload.is_empty(),
+            "default constructor leaves head_payload empty"
+        );
+
+        // Pin `created_at` so the wire-byte comparison below is
+        // deterministic — the field is sampled from the system
+        // clock at construction.
+        snap.created_at = 0;
+        // with_head_payload stores the bytes.
+        let snap = snap.with_head_payload(head_event_payload.clone());
+        assert_eq!(snap.head_payload, head_event_payload);
+
+        // Wire format is unchanged: head_payload is NOT serialized.
+        // We pin this two ways:
+        //   (a) the round-trip yields head_payload = empty
+        //       regardless of what was set in-process
+        //   (b) the byte length is identical to a snapshot with
+        //       empty head_payload (proves no length-prefix sneaked
+        //       into the wire format)
+        let bytes_with = snap.to_bytes();
+        let mut snap_empty = StateSnapshot::new(
+            kp.entity_id().clone(),
+            *builder.head(),
+            Bytes::from_static(b"daemon-state-bytes"),
+            ObservedHorizon::new(),
+        );
+        snap_empty.created_at = 0;
+        let bytes_without = snap_empty.to_bytes();
+        assert_eq!(
+            bytes_with.len(),
+            bytes_without.len(),
+            "head_payload must not appear in the wire format"
+        );
+        assert_eq!(
+            bytes_with, bytes_without,
+            "wire bytes must be identical regardless of head_payload"
+        );
+
+        // Round-trip: head_payload defaults to empty after parse.
+        let parsed = StateSnapshot::from_bytes(&bytes_with).unwrap();
+        assert!(
+            parsed.head_payload.is_empty(),
+            "head_payload after round-trip must be empty (runtime-only field)"
+        );
+
+        // Caller populates head_payload from the head event they
+        // already have, then restore can succeed.
+        let parsed = parsed.with_head_payload(head_event_payload.clone());
+        assert_eq!(parsed.head_payload, head_event_payload);
     }
 }
