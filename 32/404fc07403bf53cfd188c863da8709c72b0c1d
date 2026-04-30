@@ -1,0 +1,37 @@
+net/crates/net/src/adapter/net/cortex/adapter.rs
+  36b642b129ab4a5e 475-487,491,507-510,512-513
+net/crates/net/src/config.rs
+  36b642b129ab4a5e 596-618,1164-1194
+net/crates/net/docs/BUG_AUDIT_2026_04_30_CORE.md
+  36b642b129ab4a5e 34,111-115,119,150,153-154,617,620-621,726-729,761-764,788-791,907-908,916
+net/crates/net/src/ffi/mod.rs
+  36b642b129ab4a5e 272-284,289-293,296-297,299-306,475-490
+net/crates/net/src/adapter/net/redex/error.rs
+  36b642b129ab4a5e 73-94
+net/crates/net/src/ffi/mesh.rs
+  36b642b129ab4a5e 138-142,1997-2002,2009-2012
+net/crates/net/src/shard/ring_buffer.rs
+  36b642b129ab4a5e 92-96,98-100,136,138,152,210,250,293,371,458-460
+net/crates/net/src/adapter/net/identity/token.rs
+  36b642b129ab4a5e 146-153,162-186,216-220,222,372-380,696-699,712,1913-1994
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "32404fc07403bf53cfd188c863da8709c72b0c1d",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 6601,
+      "total_deletions": 51,
+      "accepted_lines": 336,
+      "overriden_lines": 0
+    }
+  }
+}
