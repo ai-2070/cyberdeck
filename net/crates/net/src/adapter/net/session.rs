@@ -576,6 +576,14 @@ impl NetSession {
             .store(current_timestamp(), Ordering::Release);
     }
 
+    /// Nanoseconds since epoch of the last activity. Useful for
+    /// tests / diagnostics that need to observe whether `touch`
+    /// has been called.
+    #[inline]
+    pub fn last_activity_ns(&self) -> u64 {
+        self.last_activity.load(Ordering::Acquire)
+    }
+
     /// Check if session has timed out
     #[inline]
     pub fn is_timed_out(&self, timeout: Duration) -> bool {

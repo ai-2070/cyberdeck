@@ -288,6 +288,36 @@ pub struct Batch {
     /// Sequence number of the first event in this batch.
     /// Used for idempotent retry handling.
     pub sequence_start: u64,
+
+    /// Per-process nonce sampled once at process start. Adapters
+    /// that persist `(shard_id, sequence_start)` for dedup
+    /// (JetStream `Nats-Msg-Id`, Redis stream MAXLEN keys, etc.)
+    /// must include this in the dedup key — otherwise a producer
+    /// that restarts within the backend's dedup window collides
+    /// with its prior incarnation on `(shard, 0, 0)` and the new
+    /// batches are silently discarded as duplicates.
+    ///
+    /// `BatchWorker::next_sequence` is process-local and resets to
+    /// zero on restart; the nonce is the global discriminator that
+    /// makes the composite key globally unique across restarts
+    /// even though the per-process counter is not durable.
+    pub process_nonce: u64,
+}
+
+/// Per-process nonce used by [`Batch::process_nonce`]. Sampled once
+/// (lazy) from the wall clock XOR'd with the process id, so two
+/// processes launched within a single nanosecond tick still differ
+/// on the pid component.
+pub fn batch_process_nonce() -> u64 {
+    use std::sync::OnceLock;
+    static NONCE: OnceLock<u64> = OnceLock::new();
+    *NONCE.get_or_init(|| {
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        now_nanos ^ (std::process::id() as u64)
+    })
 }
 
 impl Batch {
@@ -298,6 +328,7 @@ impl Batch {
             shard_id,
             events,
             sequence_start,
+            process_nonce: batch_process_nonce(),
         }
     }
 
@@ -619,5 +650,40 @@ mod tests {
             result.is_err(),
             "serializing invalid raw bytes should error, not silently return null"
         );
+    }
+
+    /// Regression: every `Batch` constructed in this process must
+    /// carry the same `process_nonce`. Adapters that persist
+    /// `(shard_id, sequence_start)` for dedup compose it with this
+    /// nonce so two processes that both happen to start sequencing
+    /// at zero (the default after `BatchWorker::new`) don't collide
+    /// on `(shard, 0, 0…)` in the backend's dedup window.
+    ///
+    /// We pin two contracts:
+    ///   1. The nonce is non-zero (a process started at exactly
+    ///      `UNIX_EPOCH` with pid 0 would defeat the XOR — defend
+    ///      against trivially predictable values).
+    ///   2. Multiple `Batch::new` calls in the same process yield
+    ///      the same nonce (so retries within a process land on
+    ///      the same dedup key).
+    #[test]
+    fn batch_process_nonce_is_stable_within_process() {
+        let nonce_a = batch_process_nonce();
+        let nonce_b = batch_process_nonce();
+        assert_eq!(
+            nonce_a, nonce_b,
+            "within a single process the nonce must be stable"
+        );
+
+        // And it shows up on every Batch.
+        let b1 = Batch::new(0, vec![], 0);
+        let b2 = Batch::new(1, vec![], 100);
+        assert_eq!(b1.process_nonce, nonce_a);
+        assert_eq!(b2.process_nonce, nonce_a);
+
+        // Best-effort: not-zero. UNIX_EPOCH+pid=0 would leave the
+        // XOR at zero; vanishingly unlikely on any real host but a
+        // cheap sanity check.
+        assert_ne!(nonce_a, 0, "process nonce should be non-zero");
     }
 }

@@ -295,12 +295,17 @@ impl Adapter for JetStreamAdapter {
         // restarted within JetStream's dedup window collided with its
         // prior incarnation's `shard:0:0…` ids and the new batches
         // were silently discarded.
+        // Use the batch's process_nonce — globally consistent
+        // across all adapters in this process. The adapter's own
+        // `process_nonce` field still exists as a fallback for
+        // pre-Batch-nonce code paths but the canonical source is
+        // `batch.process_nonce`.
         let mut acks = Vec::with_capacity(serialized.len());
         let mut msg_id_buf = String::new();
         let _ = write!(
             msg_id_buf,
             "{:x}:{}:{}",
-            self.process_nonce, batch.shard_id, batch.sequence_start
+            batch.process_nonce, batch.shard_id, batch.sequence_start
         );
         let prefix_len = msg_id_buf.len();
 

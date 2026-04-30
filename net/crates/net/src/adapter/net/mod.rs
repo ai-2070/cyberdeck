@@ -282,6 +282,58 @@ mod routing {
 /// Shared inbound queue type
 type InboundQueues = Arc<DashMap<u16, SegQueue<StoredEvent>>>;
 
+/// Per-source rate limiter for the handshake responder loop.
+///
+/// The responder used to accept whichever source emitted msg1
+/// first, with no per-source pacing — an attacker who knows the PSK
+/// (PSKs are typically multi-tenant) could race the legitimate
+/// initiator's msg1; even without the PSK an attacker could flood
+/// handshake-flagged datagrams to monopolize the recv loop.
+///
+/// `HandshakePacer` keeps a rolling count of recent attempts per
+/// source and rejects sources that exceed the budget within the
+/// window. Garbage-collects expired entries lazily on every
+/// check, so memory stays bounded under a steady-state attack.
+pub(crate) struct HandshakePacer {
+    /// Per-source `(count_in_window, window_start)`.
+    entries: std::collections::HashMap<std::net::SocketAddr, (u32, std::time::Instant)>,
+    /// Maximum attempts per source within `window`.
+    max_per_window: u32,
+    /// Window length.
+    window: std::time::Duration,
+}
+
+impl HandshakePacer {
+    pub(crate) fn new(max_per_window: u32, window: std::time::Duration) -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            max_per_window,
+            window,
+        }
+    }
+
+    /// Record an attempt from `source`. Returns `true` if the source
+    /// is within budget (caller may proceed); `false` if it has
+    /// exceeded the rate limit (caller must drop the packet).
+    pub(crate) fn check_and_record(&mut self, source: std::net::SocketAddr) -> bool {
+        let now = std::time::Instant::now();
+        // Lazy GC: evict entries whose window has fully expired.
+        // Done every call (not amortized) — entries are cheap and
+        // the responder is not in a hot path.
+        self.entries
+            .retain(|_, (_, start)| now.duration_since(*start) < self.window.saturating_mul(2));
+
+        let entry = self.entries.entry(source).or_insert((0, now));
+        if now.duration_since(entry.1) > self.window {
+            // Window expired; reset the counter.
+            entry.0 = 0;
+            entry.1 = now;
+        }
+        entry.0 = entry.0.saturating_add(1);
+        entry.0 <= self.max_per_window
+    }
+}
+
 /// Net adapter for high-performance UDP transport.
 pub struct NetAdapter {
     /// Configuration
@@ -302,6 +354,11 @@ pub struct NetAdapter {
     shutdown_notify: Arc<Notify>,
     /// Initialization state
     initialized: AtomicBool,
+    /// Per-source rate limiter for the handshake responder loop.
+    /// Without this, an attacker can flood handshake-flagged
+    /// datagrams to monopolize the recv path or race a legitimate
+    /// initiator's msg1.
+    handshake_pacer: parking_lot::Mutex<HandshakePacer>,
 }
 
 impl NetAdapter {
@@ -321,6 +378,13 @@ impl NetAdapter {
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
             initialized: AtomicBool::new(false),
+            // 5 attempts per second per source, plenty for any
+            // legitimate initiator (RTT-limited) and tight enough
+            // to throttle a flooder on consumer-grade hardware.
+            handshake_pacer: parking_lot::Mutex::new(HandshakePacer::new(
+                5,
+                std::time::Duration::from_secs(1),
+            )),
         })
     }
 
@@ -436,7 +500,11 @@ impl NetAdapter {
                 .ok_or_else(|| AdapterError::Fatal("missing static keypair".into()))?;
 
             // Wait for an initiator handshake message, discarding any
-            // non-handshake datagrams that arrive on the shared socket.
+            // non-handshake datagrams that arrive on the shared
+            // socket. Per-source pacing throttles flooders so the
+            // legitimate initiator's msg1 can land — without it,
+            // an attacker could blast handshake-flagged datagrams
+            // and monopolize this recv loop.
             let (parsed, source) = tokio::time::timeout(timeout, async {
                 loop {
                     let mut recv_buf = bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
@@ -452,6 +520,20 @@ impl NetAdapter {
 
                     if let Some(p) = ParsedPacket::parse(data, source) {
                         if p.header.flags.is_handshake() {
+                            // Per-source pacing: drop packets from
+                            // sources that exceed the budget.
+                            let allowed = self
+                                .handshake_pacer
+                                .lock()
+                                .check_and_record(source);
+                            if !allowed {
+                                tracing::debug!(
+                                    %source,
+                                    "handshake responder: dropping packet from \
+                                     rate-limited source"
+                                );
+                                continue;
+                            }
                             return Ok::<_, AdapterError>((p, source));
                         }
                     }
@@ -526,13 +608,41 @@ impl NetAdapter {
             return;
         }
 
-        // Heartbeats must come from the authenticated peer address and carry
-        // the correct session_id. Without source validation, an off-path
-        // attacker who can guess the session_id could keep a session alive.
+        // Heartbeats are AEAD-tagged: the empty payload encrypts to
+        // a 16-byte Poly1305 tag, and the receiver verifies the
+        // tag here. Without this check, an off-path attacker who
+        // observed or guessed the session_id could spoof
+        // heartbeats and keep a session alive (the source-address
+        // check on UDP is itself spoofable, and session_id is in
+        // cleartext on every prior packet).
+        //
+        // We still require `source == peer_addr` as a cheap
+        // first-line filter so an unauthenticated flood doesn't
+        // get to do the AEAD verify.
         if parsed.header.flags.is_heartbeat() {
-            if source == session.peer_addr() {
-                session.touch();
+            if source != session.peer_addr() {
+                return;
             }
+            let aad = parsed.header.aad();
+            let counter =
+                u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
+            let rx_cipher = session.rx_cipher();
+            if !rx_cipher.is_valid_rx_counter(counter) {
+                return;
+            }
+            // The "payload" of a heartbeat is just the 16-byte
+            // AEAD tag. Decrypting an empty plaintext over the
+            // tag is the verification step.
+            if rx_cipher
+                .decrypt(counter, &aad, &parsed.payload)
+                .is_err()
+            {
+                return;
+            }
+            if !rx_cipher.update_rx_counter(counter) {
+                return;
+            }
+            session.touch();
             return;
         }
 
@@ -1602,5 +1712,121 @@ mod tests {
         let e1 = queue.pop().unwrap();
         assert_eq!(&e1.raw[..], br#"{"first":1}"#);
         assert!(queue.is_empty());
+    }
+
+    /// Regression: heartbeats must be AEAD-authenticated so an
+    /// off-path attacker who knows or observes the session_id
+    /// cannot spoof them. Pre-fix the receiver only checked
+    /// `source == peer_addr` (UDP source — spoofable) and
+    /// `session_id` match (in cleartext on every packet); now the
+    /// 16-byte Poly1305 tag binds the heartbeat to the session
+    /// key.
+    #[test]
+    fn heartbeat_is_aead_authenticated() {
+        use crate::adapter::net::pool::PacketBuilder;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let (init_keys, resp_keys) = make_session_keys();
+
+        let resp_session = Arc::new(NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        ));
+        let inbound: InboundQueues = Arc::new(DashMap::new());
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // Build a legitimate heartbeat with the initiator's
+        // session key and tag it.
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let heartbeat = builder.build_heartbeat();
+        let last_activity_before = resp_session.last_activity_ns();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        // Process: this must succeed and call session.touch().
+        NetAdapter::process_packet(heartbeat, source, &resp_session, &inbound, 1);
+        let last_activity_after = resp_session.last_activity_ns();
+        assert!(
+            last_activity_after > last_activity_before,
+            "legitimate AEAD-tagged heartbeat must call session.touch()"
+        );
+
+        // Forge an unauthenticated heartbeat: header-only, no tag.
+        // Pre-fix this would have passed; post-fix it must be
+        // rejected.
+        let mut forged = bytes::BytesMut::new();
+        let header = NetHeader::heartbeat(resp_session.session_id());
+        forged.extend_from_slice(&header.to_bytes());
+        let forged = forged.freeze();
+        let last_activity_before = resp_session.last_activity_ns();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        NetAdapter::process_packet(forged, source, &resp_session, &inbound, 1);
+        let last_activity_after = resp_session.last_activity_ns();
+        assert_eq!(
+            last_activity_before, last_activity_after,
+            "unauthenticated heartbeat (no AEAD tag) must NOT touch the session"
+        );
+
+        // Forge a heartbeat with the right session_id but a
+        // garbage 16-byte "tag". Tag verification fails.
+        let mut forged_tag = bytes::BytesMut::new();
+        let mut header_bytes = NetHeader::heartbeat(resp_session.session_id()).to_bytes();
+        // Stamp a plausible nonce so the receiver gets to the
+        // decrypt step (otherwise it bails earlier on counter).
+        header_bytes[12..16].copy_from_slice(&[0u8; 4]);
+        header_bytes[16..24].copy_from_slice(&1u64.to_le_bytes());
+        forged_tag.extend_from_slice(&header_bytes);
+        forged_tag.extend_from_slice(&[0xAAu8; 16]); // garbage tag
+        let forged_tag = forged_tag.freeze();
+        let last_activity_before = resp_session.last_activity_ns();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        NetAdapter::process_packet(forged_tag, source, &resp_session, &inbound, 1);
+        let last_activity_after = resp_session.last_activity_ns();
+        assert_eq!(
+            last_activity_before, last_activity_after,
+            "heartbeat with garbage AEAD tag must NOT touch the session"
+        );
+    }
+
+    /// Regression: the handshake responder must rate-limit per
+    /// source so a flooder can't monopolize the recv loop.
+    /// `HandshakePacer` is the building block: it tracks
+    /// `(count, window_start)` per source and rejects after
+    /// `max_per_window` attempts within `window`.
+    #[test]
+    fn handshake_pacer_rejects_floods_per_source() {
+        use std::time::Duration;
+        let mut pacer = HandshakePacer::new(3, Duration::from_millis(50));
+
+        let attacker: std::net::SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let legit: std::net::SocketAddr = "10.0.0.2:9000".parse().unwrap();
+
+        // Attacker fires 3 attempts — all allowed (within budget).
+        for _ in 0..3 {
+            assert!(pacer.check_and_record(attacker));
+        }
+        // Fourth and beyond — rejected.
+        for _ in 0..10 {
+            assert!(
+                !pacer.check_and_record(attacker),
+                "attacker exceeding budget must be dropped"
+            );
+        }
+
+        // The legitimate initiator (different source) is unaffected
+        // by the attacker's burst — the budget is per-source.
+        assert!(
+            pacer.check_and_record(legit),
+            "legitimate source must still get through despite attacker flood"
+        );
+
+        // After the window expires the attacker's budget refills.
+        std::thread::sleep(Duration::from_millis(55));
+        assert!(
+            pacer.check_and_record(attacker),
+            "attacker budget must refill after window"
+        );
     }
 }
