@@ -42,6 +42,18 @@
 //! full synchronous fsync of all three files, regardless of policy —
 //! they are the caller's explicit durability barriers.
 //!
+//! Each of the three files is held twice: once behind the appender's
+//! `Mutex<File>` (locked for `write_all`) and once behind a parallel
+//! worker `Mutex<File>` (locked only by [`DiskSegment::sync`] and
+//! [`DiskSegment::compact_to`]). The two slots are cloned from the
+//! same `OpenOptions::new().append(true)` handle via
+//! [`std::fs::File::try_clone`], so they share the underlying OS
+//! file — `sync_all` on either flushes the same pending writes — but
+//! the worker's `sync_all` doesn't contend with the appender's
+//! `write_all`. Without this split, a high-cadence policy
+//! (`EveryN(1)`, byte-threshold-every-batch) would serialize every
+//! appender behind the worker's millisecond-range fsync.
+//!
 //! # Invariants (do not regress)
 //!
 //! 1. **No seeks on the hot path.** `idx`, `dat`, `ts` open with
@@ -51,10 +63,12 @@
 //! 2. **Write order is `dat → idx → ts`.** The reopen-time recovery
 //!    walk depends on `dat` being durable before `idx`, and `idx`
 //!    before `ts`. Reordering is a silent corruption risk.
-//! 3. **Lock acquisition order is `dat → idx → ts`.** Append paths
-//!    only ever hold one file lock at a time, so the order is
-//!    incidentally fine today; compaction is the one path that
-//!    holds all three simultaneously and must follow this order.
+//! 3. **Lock acquisition order is appender-dat → appender-idx →
+//!    appender-ts → worker-dat → worker-idx → worker-ts.** Appender,
+//!    worker, and rollback paths only ever hold one file lock at a
+//!    time, so the order is incidentally fine today; compaction is
+//!    the one path that holds multiple simultaneously and must
+//!    follow this order.
 //! 4. **Fsync order inside [`DiskSegment::sync`] is `dat → idx → ts`.**
 //!    A crash mid-sync can only leave `idx` shorter than `dat` (or
 //!    `ts` shorter than `idx`), which the reopen-time truncation
@@ -110,6 +124,19 @@ pub(super) struct DiskSegment {
     /// `append_entry` writes both, and rollback covers both
     /// together so no entry can be on disk without its timestamp.
     ts_file: Mutex<File>,
+    /// Worker-only fsync handles. Cloned via [`File::try_clone`]
+    /// from the appender handles above; both clones share the
+    /// underlying OS file, so `sync_all` on the worker handle
+    /// flushes the same pending writes the appender just made.
+    /// The point is that the worker doesn't go through the
+    /// appender's `Mutex<File>` — at high `EveryN` cadences the
+    /// worker would otherwise hold the appender's lock for the
+    /// duration of `sync_all` (millisecond-range on Windows
+    /// NVMe), stalling every concurrent `write_all`. Only
+    /// [`Self::sync`] and [`Self::compact_to`] touch these.
+    worker_idx_file: Mutex<File>,
+    worker_dat_file: Mutex<File>,
+    worker_ts_file: Mutex<File>,
     /// Append-path fsync interval: after `fsync_every_n` successful
     /// appends, the segment notifies the background fsync worker.
     /// `0` disables append-count-based syncing.
@@ -392,12 +419,23 @@ impl DiskSegment {
             .open(&ts_path)
             .map_err(RedexError::io)?;
 
+        // Worker handles share the underlying OS file with the
+        // appender handles via `try_clone`, but live behind their
+        // own mutexes so the worker's `sync_all` never contends
+        // with the appender's `write_all`.
+        let worker_idx_file = idx_file.try_clone().map_err(RedexError::io)?;
+        let worker_dat_file = dat_file.try_clone().map_err(RedexError::io)?;
+        let worker_ts_file = ts_file.try_clone().map_err(RedexError::io)?;
+
         Ok(RecoveredSegment {
             disk: DiskSegment {
                 dir,
                 idx_file: Mutex::new(idx_file),
                 dat_file: Mutex::new(dat_file),
                 ts_file: Mutex::new(ts_file),
+                worker_idx_file: Mutex::new(worker_idx_file),
+                worker_dat_file: Mutex::new(worker_dat_file),
+                worker_ts_file: Mutex::new(worker_ts_file),
                 fsync_every_n,
                 fsync_max_bytes,
                 appends_since_sync: AtomicU64::new(0),
@@ -775,28 +813,46 @@ impl DiskSegment {
         Ok(())
     }
 
-    /// Flush both files to durable storage. Order matters for crash
-    /// consistency: the payload (`dat`) must be durable before the
-    /// index entry (`idx`) that references it. A crash between the
-    /// two syncs with the old order could leave an index entry
-    /// pointing at bytes that were never flushed — on recovery the
-    /// index would reference torn payload data. With dat-first the
-    /// worst case is an index that's one or more entries shorter
-    /// than the dat, which the torn-tail truncation logic on reopen
-    /// already handles correctly.
+    /// Flush all three files to durable storage. Order matters for
+    /// crash consistency: the payload (`dat`) must be durable before
+    /// the index entry (`idx`) that references it, and `idx` before
+    /// `ts`. A crash between syncs in the wrong order could leave
+    /// an index entry pointing at bytes that were never flushed —
+    /// on recovery the index would reference torn payload data.
+    /// With dat-first the worst case is an index that's one or more
+    /// entries shorter than the dat, which the torn-tail truncation
+    /// logic on reopen already handles correctly.
+    ///
+    /// Goes through the *worker* handles, not the appender handles.
+    /// Both share the same OS file (via `try_clone` at open time),
+    /// so `sync_all` here flushes the same pending writes the
+    /// appender just made — but acquiring a lock the appender
+    /// doesn't touch means the appender's `write_all` doesn't stall
+    /// for the duration of the fsync. This is the fix that lets
+    /// `EveryN(1)` keep up with the appender instead of serializing
+    /// behind it.
     pub(super) fn sync(&self) -> Result<(), RedexError> {
         #[cfg(test)]
         if self.fail_next_sync.swap(false, Ordering::AcqRel) {
             return Err(RedexError::Io("test-injected sync failure".into()));
         }
-        self.dat_file.lock().sync_all().map_err(RedexError::io)?;
-        self.idx_file.lock().sync_all().map_err(RedexError::io)?;
+        self.worker_dat_file
+            .lock()
+            .sync_all()
+            .map_err(RedexError::io)?;
+        self.worker_idx_file
+            .lock()
+            .sync_all()
+            .map_err(RedexError::io)?;
         // The ts sidecar is fsynced last — same dat-before-idx
         // logic: a crash that loses the ts tail just means the
         // recovered timestamps for the trailing N entries fall
         // back to `now()`. Losing the idx tail without the dat
         // would be worse, so dat-first.
-        self.ts_file.lock().sync_all().map_err(RedexError::io)?;
+        self.worker_ts_file
+            .lock()
+            .sync_all()
+            .map_err(RedexError::io)?;
         // All bytes accumulated up to this point are now durable.
         // Reset the byte counter so `IntervalOrBytes` measures from
         // here forward; the timer-driven sync path relies on this
@@ -857,16 +913,26 @@ impl DiskSegment {
         // the original files aren't held open. We'll re-open
         // them at the end of this method.
         //
-        // Acquire in dat → idx → ts order to match the global lock
-        // discipline documented in the module rustdoc. This is the
-        // only path that holds all three simultaneously; append paths
-        // only ever hold one at a time, so the order is incidentally
-        // safe today, but a future change that overlaps locks on the
-        // append path could deadlock if compaction held them in any
-        // other order.
+        // Acquire in (appender) dat → idx → ts → (worker) dat → idx
+        // → ts order to match the global lock discipline documented
+        // in the module rustdoc. This is the only path that holds
+        // multiple file locks simultaneously; the appender and the
+        // worker each only hold one at a time, so the order is
+        // incidentally safe today, but a future change that
+        // overlaps locks on either path could deadlock if compaction
+        // held them in any other order.
+        //
+        // Worker handles also point at the destination paths (they
+        // were `try_clone`d at open time), so they pin the OS files
+        // the same way the appender handles do — both must be
+        // swapped to placeholders before the rename can succeed
+        // on Windows.
         let mut dat_guard = self.dat_file.lock();
         let mut idx_guard = self.idx_file.lock();
         let mut ts_guard = self.ts_file.lock();
+        let mut worker_dat_guard = self.worker_dat_file.lock();
+        let mut worker_idx_guard = self.worker_idx_file.lock();
+        let mut worker_ts_guard = self.worker_ts_file.lock();
 
         // Build the new idx, ts contents in-memory; the dat tail
         // we rewrite by reading the surviving range from the old
@@ -973,16 +1039,28 @@ impl DiskSegment {
             .truncate(false)
             .open(&placeholder_ts)
             .map_err(RedexError::io)?;
+        // Clone the placeholders for the worker slots — cheaper
+        // than opening three more temp files, and works for our
+        // purposes since the placeholder is just "any valid File
+        // value to park in the slot until we re-open."
+        let null_idx_worker = null_idx.try_clone().map_err(RedexError::io)?;
+        let null_dat_worker = null_dat.try_clone().map_err(RedexError::io)?;
+        let null_ts_worker = null_ts.try_clone().map_err(RedexError::io)?;
         *idx_guard = null_idx;
         *dat_guard = null_dat;
         *ts_guard = null_ts;
+        *worker_idx_guard = null_idx_worker;
+        *worker_dat_guard = null_dat_worker;
+        *worker_ts_guard = null_ts_worker;
 
         // Atomic renames.
         std::fs::rename(&idx_tmp, &idx_path).map_err(RedexError::io)?;
         std::fs::rename(&dat_tmp, &dat_path).map_err(RedexError::io)?;
         std::fs::rename(&ts_tmp, &ts_path).map_err(RedexError::io)?;
 
-        // Re-open the cached append handles on the new files.
+        // Re-open the cached append handles on the new files, then
+        // re-clone for the worker slots. Both kinds again share the
+        // same OS file post-compaction.
         *idx_guard = OpenOptions::new()
             .create(true)
             .read(true)
@@ -1001,6 +1079,9 @@ impl DiskSegment {
             .append(true)
             .open(&ts_path)
             .map_err(RedexError::io)?;
+        *worker_idx_guard = idx_guard.try_clone().map_err(RedexError::io)?;
+        *worker_dat_guard = dat_guard.try_clone().map_err(RedexError::io)?;
+        *worker_ts_guard = ts_guard.try_clone().map_err(RedexError::io)?;
 
         // Clean up placeholders. Best-effort; if the rename
         // succeeded we can tolerate a stray file in the OS temp
