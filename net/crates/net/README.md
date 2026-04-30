@@ -448,9 +448,9 @@ Durability is opt-in behind the `redex-disk` feature and `RedexFileConfig::persi
 Append-path fsyncs are governed by `FsyncPolicy`:
 
 - **`Never`** (default) — page cache only; `close()` is the durability barrier.
-- **`EveryN(N)`** — fsync after every N appends. The fsync runs on a background tokio worker — the appender returns as soon as bytes land in the page cache and signals the worker via `tokio::sync::Notify`. Concurrent notifies during an in-flight fsync coalesce into a single follow-up.
+- **`EveryN(N)`** — fsync after every N appends. The fsync runs on a background tokio worker — the appender returns as soon as bytes land in the page cache and signals the worker via `tokio::sync::Notify`. The worker holds its own file handles, cloned from the appender's via `File::try_clone` (same underlying OS file, separate mutex), so its `sync_all` doesn't lock against the appender's `write_all` — without that decoupling, high-cadence policies serialize every append behind the millisecond-range fsync.  Concurrent notifies during an in-flight fsync coalesce into a single follow-up.
 - **`Interval(d)`** — fsync on a per-file timer.
-- **`IntervalOrBytes { period, max_bytes }`** — fsync when **either** `period` elapses **or** `max_bytes` of accumulated writes (across `dat` + `idx` + `ts`) crosses the threshold, whichever comes first. Same background-worker shape as `EveryN`; the byte arm is signal-driven (no polling).
+- **`IntervalOrBytes { period, max_bytes }`** — fsync when **either** `period` elapses **or** `max_bytes` of accumulated writes (across `dat` + `idx` + `ts`) crosses the threshold, whichever comes first. Same background-worker shape as `EveryN`; the byte arm is signal-driven (no polling). `period: 0, max_bytes: N` gives byte-only triggering (no timer arm); `period: 0, max_bytes: 0` is equivalent to `Never`.
 
 Batched appends are syscall-coalesced: `append_batch` issues at most three `write_all` calls per batch (one each to `dat`, `idx`, `ts`) instead of three per entry, and the heap segment commits the whole batch with a single `append_many` call. See [`docs/REDEX_DISK_THROUGHPUT_PLAN.md`](docs/REDEX_DISK_THROUGHPUT_PLAN.md) for the full design and shipped invariants.
 
