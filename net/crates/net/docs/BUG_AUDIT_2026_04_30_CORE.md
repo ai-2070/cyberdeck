@@ -77,7 +77,7 @@ Extended scope (#121 onward): a fourth multi-agent sweep covered the subtrees ex
 
 **Refuted on verification:** #96 (`read_timestamps` torn-tail alignment — alignment is preserved by construction, see entry).
 
-**Verified (read end-to-end on 2026-04-30):** #80, #81, #82, #83, #85, #86, #87, #88, #89, #90, #91, #92, #93, #94, #95. #84 was found to be **mis-located** — the cited code is correct; the bug is at the upstream caller `mesh.rs:3000-3008` (see entry).
+**Verified (read end-to-end on 2026-04-30):** #80, #81, #82, #83, #85, #86, #87, #88, #89, #90, #91, #92, #93, #94, #95, #110, #114, #138, #146. #84 was found to be **mis-located** — the cited code is correct; the bug is at the upstream caller `mesh.rs:3000-3008` (see entry).
 
 ## High
 
