@@ -472,10 +472,23 @@ where
     let result = {
         let mut state = inner.state.write();
         let r = fold.apply(event, &mut state);
+        // BUG #141: under `Stop` policy, a per-event recoverable
+        // decode failure (postcard error, EventMeta shape
+        // mismatch — anything `RedexError::is_recoverable_decode`
+        // flags) is treated as skip-and-continue rather than
+        // halting. Pre-fix a single bad event (disk corruption
+        // past the #135 32-bit checksum, or a deliberately-
+        // crafted matching-collision tail) wedged the fold task
+        // permanently — DoS vector against multi-tenant cortex
+        // instances via one bad event. Stream-level errors
+        // (`Io`, `Closed`, `Lagged`) and authorization /
+        // configuration errors still halt under `Stop` as
+        // documented.
+        let recoverable_decode = matches!(&r, Err(e) if e.is_recoverable_decode());
         let advance = matches!(
             (&r, policy),
             (Ok(()), _) | (Err(_), FoldErrorPolicy::LogAndContinue)
-        );
+        ) || recoverable_decode;
         if advance {
             inner.folded_through_seq.store(seq, Ordering::Release);
         }
@@ -491,9 +504,13 @@ where
         Err(err) => {
             inner.fold_errors.fetch_add(1, Ordering::AcqRel);
             tracing::warn!(seq = seq, error = %err, "cortex fold error");
+            // BUG #141: per-event decode errors always skip-and-
+            // continue; only stream-level / configuration errors
+            // halt under `Stop`.
+            let recoverable_decode = err.is_recoverable_decode();
             match policy {
-                FoldErrorPolicy::Stop => true,
-                FoldErrorPolicy::LogAndContinue => {
+                FoldErrorPolicy::Stop if !recoverable_decode => true,
+                FoldErrorPolicy::Stop | FoldErrorPolicy::LogAndContinue => {
                     // Watermark was already advanced inside the lock
                     // above; just notify waiters.
                     inner.notify.notify_waiters();

@@ -31,7 +31,7 @@ Extended scope (#121 onward): a fourth multi-agent sweep covered the subtrees ex
 
 ## Status (running tally)
 
-**Outstanding:** #55, #56, #57, #59, #60, #62, #64, #68, #75, #76, #77, #78, #104, #106, #107, #117, #121, #123, #126, #127, #130, #135, #139, #141, #148, #153, #154
+**Outstanding:** #55, #56, #57, #59, #60, #62, #64, #76, #78, #104, #106, #107, #117, #121, #123, #127, #130, #135, #141, #148, #153, #154
 
 **Fixed on 2026-04-30 (with regression tests where reasonable):**
 - **#80** — `Net::shutdown` now routes through `EventBus::shutdown_via_ref(&self)`, an idempotent reference-based shutdown that runs regardless of outstanding `Arc<EventBus>` clones. Tests: `sdk/tests/shutdown_regression.rs::{shutdown_runs_even_with_outstanding_event_stream, shutdown_via_ref_is_idempotent}`.
@@ -108,10 +108,15 @@ Extended scope (#121 onward): a fourth multi-agent sweep covered the subtrees ex
 - **#73** — `Ordering::InsertionTs` lexicographic id-tiebreak is now documented as a hard adapter contract: ids MUST compare lexicographically the same way they compare in the source stream's natural order. Built-in adapters all satisfy this (Redis `{ms}-{seq}`, JetStream zero-padded seqs, ULID/UUID/hex hashes); unpadded-numeric adapters would silently invert ordering on this code path. The tiebreak chain `(insertion_ts, shard_id, id)` resolves common cases (same insertion_ts across shards) at `shard_id` before reaching `id`, and `insertion_ts` is monotonic per-shard so the same-shard `id` tiebreak is unreachable in practice — but the contract is now load-bearing for any future adapter / code path. Doc-only fix.
 - **#74** — `net_shutdown`'s `&NetHandle` borrow is now scoped into an inner block, ending its lifetime explicitly before the `&mut`-via-raw-pointer `ManuallyDrop::take` calls. Pre-fix NLL likely terminated the borrow at last use, but the pattern (live `&` adjacent to `&mut` through the same provenance) was fragile under stacked/tree borrow models. Structural fix; the existing FFI shutdown tests still pass.
 - **#79** — `net_poll` and `net_stats` now return `NetError::IntOverflow` instead of `NetError::BufferTooSmall` when the response byte count exceeds `c_int::MAX`. The data was already copied into the caller's buffer, so `BufferTooSmall` told them to "resize and retry" when the buffer was actually large enough — they couldn't make progress by resizing. `NetError::IntOverflow` is the documented variant for this case.
+- **#68** — `JetStreamAdapterConfig::validate` rejects negative `max_messages` / `max_bytes` (the fields are typed `i64` for wire-compat with the NATS API but only non-negative values make sense). Pre-fix a `with_max_messages(-1)` call passed validation and surfaced as a runtime adapter error at stream-create time minutes later. Tests: `config::tests::{validate_rejects_negative_max_messages, validate_rejects_negative_max_bytes, validate_accepts_zero_and_positive_max_messages}`.
+- **#75** — `add_shard_internal`'s rollback path now mirrors `remove_shard_internal`'s teardown when `activate_shard` errors: drops the new sender from `batch_senders`, aborts both batch+drain `JoinHandle`s in `batch_workers`, and unmaps the `Provisioning` entry from the mapper. Pre-fix an `activate_shard` error left all three pieces in place — the drain worker looped indefinitely on an empty ring buffer, and each retry allocated a fresh id while the dead one squatted (compounding zombie workers across repeated scale-up failures).
+- **#77** — `RingBuffer<T>` SPSC thread-tracking guards now compile under `#[cfg(any(test, debug_assertions))]` instead of `#[cfg(test)]` only — matching the documented contract that promised dev-build runs catch SPSC violations even outside `cargo test`. Pre-fix the safety net was absent from any non-`cargo test` build, including the unoptimized debug binaries developers actually run. Field declarations, initializers, all five method-entry guards (`try_push`, `evict_oldest`, `try_pop`, `pop_batch`, `pop_batch_into`), and the `Drop`-side reset were all widened. The `mod tests {}` block and the test-only helpers (`capacity()`, `free_slots()`) stay `#[cfg(test)]`.
+- **#126** — `Tasks/MemoriesAdapter::ingest_typed` now load+CAS-commits `app_seq` rather than `fetch_add`-then-ingest. The new flow: load the current counter, build the envelope at that value, attempt `inner.ingest`, and only if it succeeds do we CAS-commit the counter advance. Pre-fix `app_seq` advanced before the inner ingest, so a `RedexError`/`Closed`/`FoldStopped` failure left a phantom `seq_or_ts` permanently advanced — snapshots persisted the inflated counter, on restore future ingests picked up at the higher value (permanent gap), and adapters sharing the same `origin_hash` produced `seq_or_ts` collisions when recovering via on-disk scan. CAS contention surfaces as a recoverable Encode error advising snapshot-rebuild. Existing cortex integration suites cover the success path (and the new contention error path is structurally clear).
+- **#139** — `MetadataStore::clear` now drains entries from `nodes` ONE AT A TIME via `remove`, routing each through `remove_from_indexes` before clearing the index maps as defense-in-depth. Pre-fix `nodes.clear()` first then six index `clear()`s in sequence let a concurrent `upsert` land mid-clear: the upsert observed `nodes.get(&id) → None`, skipped `remove_from_indexes`, called `add_to_indexes` (writing into the index maps the clear was about to wipe), then `nodes.insert` succeeded — final state was a node visible only via the full-scan branch. Now intermediate states stay consistent (nodes alongside their indexes throughout the drain).
 
 **Refuted on verification:** #96 (`read_timestamps` torn-tail alignment — alignment is preserved by construction, see entry); #137 (`Sampler::should_sample` `RateLimited` over-sample — the entire arm runs inside `last_reset.lock()`, so the check+increment is already serialized, see entry).
 
-**Verified (read end-to-end on 2026-04-30):** #58, #61, #63, #65, #66, #67, #69, #70, #71, #72, #73, #74, #79, #80, #81, #82, #83, #85, #86, #87, #88, #89, #90, #91, #92, #93, #94, #95, #98, #110, #111, #112, #114, #122, #124, #125, #128, #129, #131, #132, #133, #134, #136, #138, #143, #144, #146, #147, #149, #150, #151, #152, #155. #84 was found to be **mis-located** — the cited code is correct; the bug is at the upstream caller `mesh.rs:3000-3008` (see entry).
+**Verified (read end-to-end on 2026-04-30):** #58, #61, #63, #65, #66, #67, #68, #69, #70, #71, #72, #73, #74, #75, #77, #79, #80, #81, #82, #83, #85, #86, #87, #88, #89, #90, #91, #92, #93, #94, #95, #98, #110, #111, #112, #114, #122, #124, #125, #126, #128, #129, #131, #132, #133, #134, #136, #138, #139, #143, #144, #146, #147, #149, #150, #151, #152, #155. #84 was found to be **mis-located** — the cited code is correct; the bug is at the upstream caller `mesh.rs:3000-3008` (see entry).
 
 ## High
 
@@ -142,8 +147,10 @@ Issue #9's fix prepends a per-process nonce to `Nats-Msg-Id` so legitimate same-
 
 The in-flight wait deadline (5s, real-time `std::time::Instant`) breaks out with a warning and unconditionally stores `drain_finalize_ready=true`. A slow producer that has already incremented `in_flight_ingests` (and therefore observed `shutdown=false` immediately before pushing) will still complete its push *after* the drain worker has run its final sweep. The event lands in the ring buffer but is never read — directly contradicting the SeqCst handshake comment promising "every observed in-flight ingest completes before the final sweep." Either widen the deadline, abort stalled producer tasks before flipping the gate, or re-document this as a known data-loss path.
 
-### 75. `add_shard_internal` leaks workers and routing state if `activate_shard` fails
+### 75. `add_shard_internal` leaks workers and routing state if `activate_shard` fails — **[FIXED 2026-04-30]**
 **File:** `bus.rs:307-355`
+
+**Fix:** rollback now drops sender, aborts both join handles, and unmaps the provisioning entry on `activate_shard` error. See the **Fixed on 2026-04-30** block above.
 
 The two-phase shard add introduced by #46's fix (`provision → spawn workers + register sender → activate`) has no rollback if step 3 errors. On `Err` from `activate_shard` (line 343-345) the function returns leaving:
 - the new sender still in `batch_senders` (inserted at line 327),
@@ -607,8 +614,10 @@ There is no `base.version == diff.base_version` check, despite `DiffError::Versi
 
 Fix: require the caller to thread the live version into `apply`, or store it on `CapabilitySet` and check at the top of `apply`. At minimum, document the contract loudly so callers don't trust the empty-promise variant.
 
-### 126. `Tasks/MemoriesAdapter::ingest_typed` advances `app_seq` BEFORE the inner ingest succeeds — phantom seq on failure
+### 126. `Tasks/MemoriesAdapter::ingest_typed` advances `app_seq` BEFORE the inner ingest succeeds — phantom seq on failure — **[FIXED 2026-04-30]**
 **File:** `adapter/net/cortex/tasks/adapter.rs:312-327`, `adapter/net/cortex/memories/adapter.rs:305-320`
+
+**Fix:** load → build envelope → ingest → CAS-commit. Counter only advances when `inner.ingest` returns `Ok`. See the **Fixed on 2026-04-30** block above.
 
 Both adapters call `self.app_seq.fetch_add(1, ...)` to allocate `seq_or_ts`, then call `inner.ingest(payload, meta)`. If `inner.ingest` fails (closed adapter, RedEX append error, fold error under `Stop` policy), the local counter is permanently advanced past a `seq_or_ts` that was never written to the log. After restore, the snapshot's persisted `app_seq` reflects the higher counter — a future ingest picks up at the higher value, leaving a permanent gap. A second adapter sharing the same `origin_hash` (a documented configuration in the cortex layer) and recovering via on-disk scan rather than snapshot disagrees on `app_seq`, producing duplicate `seq_or_ts` collisions when both come back online. Fix: only commit `app_seq.fetch_add` after `inner.ingest` returns Ok — load + CAS retry, or roll back on Err.
 
@@ -714,8 +723,10 @@ In the `RateLimited` arm: each thread reads `count.load`, compares to `max_per_s
 
 
 
-### 68. `JetStreamAdapterConfig::max_messages` / `max_bytes` typed `i64`, not validated for negatives
-`config.rs:499, 503, 549, 555` (validator at `:575-597`) — accepts `with_max_messages(-1)` etc. NATS rejects negatives at stream-create time, surfacing as a runtime adapter error instead of at startup `validate()` (which is the documented purpose). Switch to `Option<u64>` (or `Option<NonZeroU64>`).
+### 68. `JetStreamAdapterConfig::max_messages` / `max_bytes` typed `i64`, not validated for negatives — **[FIXED 2026-04-30]**
+`config.rs:499, 503, 549, 555` (validator at `:575-597`) — accepts `with_max_messages(-1)` etc. NATS rejects negatives at stream-create time, surfacing as a runtime adapter error instead of at startup `validate()` (which is the documented purpose).
+
+**Fix:** `validate()` rejects negative `max_messages` / `max_bytes` with a `ConfigError::InvalidValue`. The original suggestion to switch to `Option<u64>` was deferred — the `i64` type is still wire-compat with the NATS API, and validation closes the surface that matters today. See the **Fixed on 2026-04-30** block above for tests.
 
 ### 69. Bus scaling monitor and drain worker read `shutdown` with `Relaxed` while writers use `SeqCst` — **[FIXED 2026-04-30]**
 `bus.rs:906, 1137` — currently sound because the Acquire/Release handshake on `drain_finalize_ready` provides the needed happens-before, but the inconsistency is a footgun: any future code change adding a producer-side path that piggybacks on `shutdown`'s ordering would silently break. The drain worker's comment claiming "same rationale as ingest" is misleading — `try_enter_ingest` (`bus.rs:454`) uses SeqCst.
@@ -747,8 +758,10 @@ In the `RateLimited` arm: each thread reads `count.load`, compares to `max_per_s
 
 **Fix:** `&NetHandle` borrow is now block-scoped, ending its lifetime explicitly before the `ManuallyDrop::take` calls. See the **Fixed on 2026-04-30** block above. NLL likely ends the immutable borrow before line 987, but the `&mut`-via-raw-pointer adjacent to a live `&` is fragile under stacked/tree borrows. The function's own doc comment hints at the soundness concern. Restructure to drop the `&NetHandle` binding explicitly before taking the field, or move the `ManuallyDrop::take` calls into a block scoped after `handle_ref` is no longer reachable.
 
-### 77. RingBuffer SPSC thread guards are gated on `cfg(test)` despite docs claiming `debug_assertions`
-`shard/ring_buffer.rs:89-97, 132-135, 146-163, 198-222, 244-261, 287-303` — the doc and SAFETY comments explicitly advertise *"active under `debug_assertions`, not just `cfg(test)`, so dev runs of the binary catch SPSC violations even outside of unit tests"* (lines 89-92, 198-203). The actual attribute on every `producer_thread`/`consumer_thread` field, initializer, and `assert_eq!` site is `#[cfg(test)]`. The runtime safety net the doc promises is therefore absent in any non-`cargo test` build — including the unoptimized debug binaries that consumers run during development — defeating the explicit goal of catching new SPSC-violating callers (the same threat-model #35 calls out) before release. Either swap every `#[cfg(test)]` site to `#[cfg(debug_assertions)]` (matching the contract) or correct the doc.
+### 77. RingBuffer SPSC thread guards are gated on `cfg(test)` despite docs claiming `debug_assertions` — **[FIXED 2026-04-30]**
+`shard/ring_buffer.rs:89-97, 132-135, 146-163, 198-222, 244-261, 287-303` — the doc and SAFETY comments explicitly advertise *"active under `debug_assertions`, not just `cfg(test)`, so dev runs of the binary catch SPSC violations even outside of unit tests"*
+
+**Fix:** every field-decl / initializer / method-entry guard / drop-reset site is now `#[cfg(any(test, debug_assertions))]`. See the **Fixed on 2026-04-30** block above. (lines 89-92, 198-203). The actual attribute on every `producer_thread`/`consumer_thread` field, initializer, and `assert_eq!` site is `#[cfg(test)]`. The runtime safety net the doc promises is therefore absent in any non-`cargo test` build — including the unoptimized debug binaries that consumers run during development — defeating the explicit goal of catching new SPSC-violating callers (the same threat-model #35 calls out) before release. Either swap every `#[cfg(test)]` site to `#[cfg(debug_assertions)]` (matching the contract) or correct the doc.
 
 ### 78. RingBuffer `head`/`tail` `usize` wraparound permanently wedges the buffer on 32-bit targets
 `shard/ring_buffer.rs:165-184, 245-279` — `try_push` computes `len = head.wrapping_sub(tail)` and rejects if `len >= capacity - 1` (lines 169-172). Sound on 64-bit (~58 years to wrap at 10 G events/sec). On 32-bit (wasm32 is in the test matrix per `test_parse_poll_request_limit_overflows_usize_on_32bit`), `head` wraps after 2³² pushes — ~7 minutes per shard at 10 M events/sec, ~12 hours at 100 K events/sec. Once `head` laps `tail` and the wrapping distance exceeds `capacity-1`, `try_push` rejects forever and the buffer is permanently wedged; no compaction or counter recovery exists. Either widen the cursors to `u64` on 32-bit or modulo-reduce after each store so the wrap point coincides with capacity.
@@ -772,8 +785,10 @@ In the `RateLimited` arm: each thread reads `count.load`, compares to `max_per_s
 
 **Fix:** `MAX_DIFF_BYTES = 64 KiB` byte cap (pre-parse) + `MAX_DIFF_OPS = 1024` op cap (post-parse). Kept the `Option<Self>` return so existing callers don't need to migrate; both caps surface as `None` (the existing malformed-input outcome). The `Result<...DeserializeError>` API change suggested in the original finding is deferred — `from_bytes` only has two callers (a bench and a test), so distinguishing malformed-vs-absent has no production consumer today. See the **Fixed on 2026-04-30** block above for tests.
 
-### 139. `MetadataStore::clear` races with concurrent `upsert`, leaving nodes without index entries
-`adapter/net/behavior/metadata.rs:1035-1043` — `clear()` calls `nodes.clear()` then six other `clear()`s sequentially, with no global lock. A concurrent `upsert` between `nodes.clear()` and `by_status.clear()` reads `nodes.get(&id)` → `None`, skips `remove_from_indexes`, calls `add_to_indexes` (writes to `by_status`/`by_tier`/etc), then `nodes.insert` succeeds. `clear()` then wipes the indexes, leaving a node in `nodes` with NO index entries — invisible to any indexed query (status, continent, tier, tag, role, owner). Only the full-scan branch (`query` line 922) finds it. Fix: drain `nodes` first, then iterate the drained set calling `remove_from_indexes`, then clear the indexes — making intermediate states consistent.
+### 139. `MetadataStore::clear` races with concurrent `upsert`, leaving nodes without index entries — **[FIXED 2026-04-30]**
+`adapter/net/behavior/metadata.rs:1035-1043` — `clear()` calls `nodes.clear()` then six other `clear()`s sequentially, with no global lock.
+
+**Fix:** drain `nodes` one entry at a time via `remove`, routing each through `remove_from_indexes`, then clear residual indexes as defense-in-depth. See the **Fixed on 2026-04-30** block above. A concurrent `upsert` between `nodes.clear()` and `by_status.clear()` reads `nodes.get(&id)` → `None`, skips `remove_from_indexes`, calls `add_to_indexes` (writes to `by_status`/`by_tier`/etc), then `nodes.insert` succeeds. `clear()` then wipes the indexes, leaving a node in `nodes` with NO index entries — invisible to any indexed query (status, continent, tier, tag, role, owner). Only the full-scan branch (`query` line 922) finds it. Fix: drain `nodes` first, then iterate the drained set calling `remove_from_indexes`, then clear the indexes — making intermediate states consistent.
 
 ### 140. `ObservedHorizon::observe` uses plain `+= 1` while `merge` uses `saturating_add`, debug-panicking on overflow inconsistently
 `adapter/net/state/horizon.rs:28-34, 64-76` — `observe` does `self.logical_time += 1` (debug-panics on overflow); `merge` does `saturating_add(1)`. The comment at lines 71-74 acknowledges the convention. Adversarial high-cardinality observes panic in debug builds while the same overflow saturates in release; merge-driven overflow saturates in both. Make `observe` use `saturating_add(1)` for consistency.
@@ -889,8 +904,8 @@ Inside `ingest_raw_batch`, routing-miss events (concurrent scale-down removed th
 20. ~~**#110** — Capability index admits expired announcements with a fresh local TTL (replay vector for revoked capabilities)~~ — **fixed 2026-04-30**
 21. ~~**#63** — NaN thresholds silently disable auto-scaling~~ — **fixed 2026-04-30**
 22. **#64** — `scale_up_provisioning` + `activate` over-allocates past `max_shards`
-23. **#66** — `update_from_events` cursor regression on unsorted input (re-delivery)
-24. **#75** — `add_shard_internal` permanent worker leak on activate failure
+23. ~~**#66** — `update_from_events` cursor regression on unsorted input (re-delivery)~~ — **fixed 2026-04-30**
+24. ~~**#75** — `add_shard_internal` permanent worker leak on activate failure~~ — **fixed 2026-04-30**
 25. **#76** — `flush()` phase-2 barrier collapses to one window (re-introduces #16-class loss on many-shard configs)
 26. **#127** — `IdentityEnvelope::open` accepts attacker-chosen `signer_pub`, AAD is empty (identity-substitution hole on the migration path; the migration handler's cross-check is the only line of defense)
 27. **#121** — `PermissionToken::issue` / `delegate` panic across FFI on a public-only keypair (any post-migration daemon's FFI caller crashes)
@@ -898,7 +913,7 @@ Inside `ingest_raw_batch`, routing-miss events (concurrent scale-down removed th
 29. ~~**#124** — `NodeMetadata` deserialize is unbounded; peer-supplied tags / custom-map flood~~ — **fixed 2026-04-30**
 30. **#123** — `MetadataStore::upsert` non-atomic 5-step update produces permanent index drift (queries return wrong / duplicate nodes after concurrent writes)
 31. ~~**#122** — `SnapshotStore::store` allows older snapshots to overwrite newer (state rewind on replay/race)~~ — **fixed 2026-04-30**
-32. **#126** — `Tasks/MemoriesAdapter::ingest_typed` advances `app_seq` before successful append (phantom seq on failure, snowballs into duplicate keys on cross-handle restore)
+32. ~~**#126** — `Tasks/MemoriesAdapter::ingest_typed` advances `app_seq` before successful append (phantom seq on failure, snowballs into duplicate keys on cross-handle restore)~~ — **fixed 2026-04-30**
 33. ~~**#131** — Subprotocol manifest exposes forwarding-only entries as locally-handled (silent RPC drop)~~ — **fixed 2026-04-30**
 34. ~~**#132** — `read_manifest_entry` accepts `min_compatible > version` (peer can blacklist subprotocols at will)~~ — **fixed 2026-04-30**
 35. **#153** — stranded-flush batch from `remove_shard_internal` collides with original first-batch msg-ids under JetStream dedup (the recovery path #47 was added for now silently throws those events away)

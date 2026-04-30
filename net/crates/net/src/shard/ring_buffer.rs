@@ -89,11 +89,15 @@ pub(crate) struct RingBuffer<T> {
     /// Thread ID of the producer (debug-build SPSC enforcement —
     /// active under `debug_assertions`, not just `cfg(test)`, so dev
     /// runs of the binary catch SPSC violations even outside of unit
-    /// tests).
-    #[cfg(test)]
+    /// tests). BUG #77: pre-fix every `#[cfg(test)]` gate below
+    /// claimed to honor the `debug_assertions` contract advertised
+    /// in this doc but actually only compiled under `cargo test`,
+    /// leaving the safety net absent from any non-test build.
+    #[cfg(any(test, debug_assertions))]
     producer_thread: std::sync::Mutex<Option<std::thread::ThreadId>>,
-    /// Thread ID of the consumer (debug-build SPSC enforcement).
-    #[cfg(test)]
+    /// Thread ID of the consumer (debug-build SPSC enforcement —
+    /// see `producer_thread`).
+    #[cfg(any(test, debug_assertions))]
     consumer_thread: std::sync::Mutex<Option<std::thread::ThreadId>>,
 }
 
@@ -129,9 +133,9 @@ impl<T> RingBuffer<T> {
             mask: capacity - 1,
             head: CachePadded::new(AtomicUsize::new(0)),
             tail: CachePadded::new(AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             producer_thread: std::sync::Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             consumer_thread: std::sync::Mutex::new(None),
         }
     }
@@ -145,7 +149,7 @@ impl<T> RingBuffer<T> {
     /// wrapping in `Shard` upholds this trivially.
     #[inline]
     pub fn try_push(&self, value: T) -> Result<(), BufferFullError> {
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         {
             let current = std::thread::current().id();
             let mut guard = self
@@ -203,7 +207,7 @@ impl<T> RingBuffer<T> {
     /// the same way `try_push`/`try_pop` are.
     #[inline]
     pub(crate) fn evict_oldest(&self) -> Option<T> {
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         {
             let current = std::thread::current().id();
             let mut guard = self
@@ -243,7 +247,7 @@ impl<T> RingBuffer<T> {
     /// in-crate mutex on `Shard`.
     #[inline]
     pub fn try_pop(&self) -> Option<T> {
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         {
             let current = std::thread::current().id();
             let mut guard = self
@@ -286,7 +290,7 @@ impl<T> RingBuffer<T> {
     /// Same single-consumer contract as `try_pop`.
     #[inline]
     pub fn pop_batch(&self, max: usize) -> Vec<T> {
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         {
             let current = std::thread::current().id();
             let mut guard = self
@@ -364,7 +368,7 @@ impl<T> RingBuffer<T> {
     /// [`pop_batch`]: Self::pop_batch
     #[inline]
     pub fn pop_batch_into(&self, dst: &mut Vec<T>, max: usize) -> usize {
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         {
             let current = std::thread::current().id();
             let mut guard = self
@@ -451,8 +455,9 @@ impl<T> Drop for RingBuffer<T> {
         // Reset thread tracking — &mut self guarantees exclusive access,
         // so draining from any thread is safe here. unwrap_or_else
         // recovers from poisoned mutexes (a spawned thread may have
-        // panicked during SPSC violation detection).
-        #[cfg(test)]
+        // panicked during SPSC violation detection). BUG #77: gate
+        // matches the field-declaration gate.
+        #[cfg(any(test, debug_assertions))]
         {
             *self
                 .producer_thread

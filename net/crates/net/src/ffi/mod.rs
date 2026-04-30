@@ -269,34 +269,46 @@ fn enter_ffi_op(handle: &NetHandle) -> Result<FfiOpGuard<'_>, c_int> {
 /// ```
 #[unsafe(no_mangle)]
 pub extern "C" fn net_init(config_json: *const c_char) -> *mut NetHandle {
-    // Create runtime
+    // BUG #62: parse and validate the config BEFORE constructing
+    // the tokio runtime. Pre-fix the runtime was constructed first,
+    // and any subsequent early-return path (`CStr::to_str` Err,
+    // `parse_config_json` returning None, `EventBus::new`
+    // returning Err) dropped the local `Runtime` on function
+    // return. Dropping a multi-thread tokio runtime from inside
+    // ANOTHER tokio runtime's worker thread panics with "Cannot
+    // drop a runtime in a context where blocking is not allowed",
+    // unwinding across this `extern "C"` boundary into a Python /
+    // Go-cgo / NAPI / PyO3 caller — undefined behaviour. By
+    // validating inputs first, the runtime is only built once we
+    // know it will be installed into the `NetHandle` and survive
+    // the call.
+    let config = if config_json.is_null() {
+        EventBusConfig::default()
+    } else {
+        let config_str = match unsafe { CStr::from_ptr(config_json) }.to_str() {
+            Ok("") => EventBusConfig::default(),
+            Ok(s) => match parse_config_json(s) {
+                Some(cfg) => cfg,
+                None => return ptr::null_mut(),
+            },
+            Err(_) => return ptr::null_mut(),
+        };
+        config_str
+    };
+
+    // Now construct the runtime — its lifetime is tied to the
+    // returned `NetHandle` (via `create_with_config`), so the only
+    // remaining drop is on `net_shutdown`, which already handles
+    // it via `runtime.block_on(...)` (see #74) outside any other
+    // tokio context.
     let runtime = match Runtime::new() {
         Ok(rt) => rt,
         Err(_) => return ptr::null_mut(),
     };
 
-    // Parse config
-    let config = if config_json.is_null() {
-        EventBusConfig::default()
-    } else {
-        let config_str = match unsafe { CStr::from_ptr(config_json) }.to_str() {
-            Ok("") => return create_with_default(runtime),
-            Ok(s) => s,
-            Err(_) => return ptr::null_mut(),
-        };
-
-        match parse_config_json(config_str) {
-            Some(cfg) => cfg,
-            None => return ptr::null_mut(),
-        }
-    };
-
     create_with_config(runtime, config)
 }
 
-fn create_with_default(runtime: Runtime) -> *mut NetHandle {
-    create_with_config(runtime, EventBusConfig::default())
-}
 
 /// Parse JSON configuration into EventBusConfig.
 ///
@@ -460,7 +472,22 @@ fn parse_config_json(json_str: &str) -> Option<EventBusConfig> {
 fn create_with_config(runtime: Runtime, config: EventBusConfig) -> *mut NetHandle {
     let bus = match runtime.block_on(EventBus::new(config)) {
         Ok(bus) => bus,
-        Err(_) => return ptr::null_mut(),
+        Err(_) => {
+            // BUG #62: send the runtime off to a fresh OS thread
+            // for dropping. Dropping a multi-thread tokio
+            // `Runtime` from inside another tokio runtime's worker
+            // thread panics ("Cannot drop a runtime in a context
+            // where blocking is not allowed"); a panic here would
+            // unwind across this `extern "C"` frame. The fresh
+            // thread guarantees a non-tokio context, so the drop
+            // is sound regardless of the caller's runtime
+            // environment. We don't `join()` the thread — the
+            // drop completes on its own and the caller has
+            // already been told `net_init` failed (returning
+            // null).
+            std::thread::spawn(move || drop(runtime));
+            return ptr::null_mut();
+        }
     };
 
     let handle = Box::new(NetHandle {

@@ -135,6 +135,11 @@ fn token_err_to_code(e: &CoreTokenError) -> c_int {
         CoreTokenError::DelegationExhausted => NET_ERR_TOKEN_DELEGATION_EXHAUSTED,
         CoreTokenError::DelegationNotAllowed => NET_ERR_TOKEN_DELEGATION_NOT_ALLOWED,
         CoreTokenError::NotAuthorized => NET_ERR_TOKEN_NOT_AUTHORIZED,
+        // BUG #121: maps to `NET_ERR_IDENTITY` since a public-only
+        // keypair is fundamentally an identity-availability issue,
+        // not a token-content issue. The error message in
+        // `Display` makes the cause clear to the caller.
+        CoreTokenError::ReadOnly => NET_ERR_IDENTITY,
     }
 }
 
@@ -1989,14 +1994,22 @@ pub extern "C" fn net_identity_issue_token(
         return NET_ERR_IDENTITY;
     };
     let h = unsafe { &*signer };
-    let token = PermissionToken::issue(
+    // BUG #121: route through `try_issue` so a public-only signer
+    // keypair (post-migration zeroize, etc.) surfaces as
+    // `TokenError::ReadOnly` → `NET_ERR_IDENTITY` instead of
+    // panic-unwinding across this `extern "C"` frame into the
+    // caller's binding.
+    let token = match PermissionToken::try_issue(
         &h.keypair,
         subject_id,
         scope,
         channel_hash,
         u64::from(ttl_seconds),
         delegation_depth,
-    );
+    ) {
+        Ok(t) => t,
+        Err(e) => return token_err_to_code(&e),
+    };
     alloc_bytes(&token.to_bytes(), out_token, out_token_len)
 }
 

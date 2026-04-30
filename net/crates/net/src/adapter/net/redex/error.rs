@@ -70,4 +70,26 @@ impl RedexError {
     pub fn io(err: std::io::Error) -> Self {
         Self::Io(err.to_string())
     }
+
+    /// Returns `true` when this error represents a per-event
+    /// recoverable failure (a single bad event, NOT an
+    /// underlying-storage failure that affects every subsequent
+    /// event). The fold-error-policy interpreter treats these as
+    /// "always skip-and-continue" even under
+    /// [`super::super::cortex::config::FoldErrorPolicy::Stop`]
+    /// — otherwise a single corrupt postcard tail (or a 32-bit
+    /// checksum collision; see BUG #135) wedges the fold task
+    /// permanently and DoSes a multi-tenant cortex instance via
+    /// one bad event. (BUG #141.)
+    ///
+    /// `Encode` covers postcard decode failures and `EventMeta`
+    /// shape mismatches — both per-event. `Io` / `Closed` /
+    /// `Lagged` are stream-level and properly halt under `Stop`.
+    /// `PayloadTooLarge` / `SegmentOffsetOverflow` /
+    /// `SeqOutOfRange` / `Channel` / `Unauthorized` are
+    /// configuration / authorization issues that benefit from
+    /// halting rather than silently skipping; not recoverable.
+    pub fn is_recoverable_decode(&self) -> bool {
+        matches!(self, Self::Encode(_))
+    }
 }

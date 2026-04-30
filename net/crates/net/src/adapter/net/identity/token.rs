@@ -143,6 +143,14 @@ impl PermissionToken {
     /// wrapping the timestamp or panicking. Callers who want to
     /// reject pathological TTLs should range-check at the SDK
     /// layer.
+    ///
+    /// **Panics** if `issuer_keypair` is public-only (the migration-
+    /// source path zeroizes its keypair after `ActivateAck`, leaving
+    /// such a keypair). FFI callers and any path that may receive a
+    /// public-only keypair must use [`Self::try_issue`] instead;
+    /// `issue` is preserved as a convenience wrapper for callers
+    /// (notably tests) that own a freshly-generated keypair and
+    /// know it has its signing half (BUG #121).
     pub fn issue(
         issuer_keypair: &EntityKeypair,
         subject: EntityId,
@@ -151,6 +159,31 @@ impl PermissionToken {
         duration_secs: u64,
         delegation_depth: u8,
     ) -> Self {
+        Self::try_issue(
+            issuer_keypair,
+            subject,
+            scope,
+            channel_hash,
+            duration_secs,
+            delegation_depth,
+        )
+        .expect("PermissionToken::issue called with a public-only keypair — use try_issue (BUG #121)")
+    }
+
+    /// Fallible counterpart to [`Self::issue`]: returns
+    /// [`TokenError::ReadOnly`] when the issuer keypair lacks its
+    /// signing half (post-migration / public-only keypair) instead
+    /// of panicking. The FFI bindings route through this function
+    /// (BUG #121) so a panic doesn't unwind across `extern "C"` into
+    /// C/Go-cgo/NAPI/PyO3 callers — undefined behaviour.
+    pub fn try_issue(
+        issuer_keypair: &EntityKeypair,
+        subject: EntityId,
+        scope: TokenScope,
+        channel_hash: u16,
+        duration_secs: u64,
+        delegation_depth: u8,
+    ) -> Result<Self, TokenError> {
         let now = current_timestamp();
         // BUG #150: abort on `getrandom` failure rather than
         // panic-unwinding through the FFI boundary. Token nonces
@@ -180,9 +213,13 @@ impl PermissionToken {
         };
 
         let payload = token.signed_payload();
-        let sig = issuer_keypair.sign(&payload);
+        // BUG #121: use `try_sign` to surface a public-only keypair
+        // as `TokenError::ReadOnly` instead of panicking.
+        let sig = issuer_keypair
+            .try_sign(&payload)
+            .map_err(|_| TokenError::ReadOnly)?;
         token.signature = sig.to_bytes();
-        token
+        Ok(token)
     }
 
     /// Verify the token's signature against the issuer's public key.
@@ -332,7 +369,15 @@ impl PermissionToken {
             signature: [0u8; 64],
         };
         let payload = child.signed_payload();
-        let sig = signer.sign(&payload);
+        // BUG #121: use `try_sign` so a public-only `signer` (post-
+        // migration zeroize) surfaces as `TokenError::ReadOnly`
+        // instead of panicking — same hazard / fix as `try_issue`.
+        // The `delegate` signature already returns
+        // `Result<Self, TokenError>`, so callers naturally observe
+        // the new variant without an API change.
+        let sig = signer
+            .try_sign(&payload)
+            .map_err(|_| TokenError::ReadOnly)?;
         child.signature = sig.to_bytes();
         Ok(child)
     }
@@ -648,6 +693,10 @@ pub enum TokenError {
     NotAuthorized,
     /// Wire format is too short or malformed.
     InvalidFormat,
+    /// Issuer/signer keypair is public-only (post-migration zeroize
+    /// or other read-only construction). The caller's signing
+    /// operation is not possible. (BUG #121.)
+    ReadOnly,
 }
 
 impl std::fmt::Display for TokenError {
@@ -660,6 +709,7 @@ impl std::fmt::Display for TokenError {
             Self::DelegationNotAllowed => write!(f, "delegation not allowed by scope"),
             Self::NotAuthorized => write!(f, "not authorized"),
             Self::InvalidFormat => write!(f, "invalid token format"),
+            Self::ReadOnly => write!(f, "signer keypair is public-only"),
         }
     }
 }
@@ -1859,5 +1909,87 @@ mod tests {
             .find(|t| t.scope.bits() == 0x10_0000)
             .expect("scope 0x10_0000 must still be present");
         assert_eq!(refreshed.nonce, 1111, "refresh-of-existing-scope must succeed at cap");
+    }
+
+    // ========================================================================
+    // BUG #121: try_issue / delegate must NOT panic on public-only keypair
+    // ========================================================================
+
+    /// `try_issue` returns `TokenError::ReadOnly` instead of
+    /// panicking when the issuer keypair is public-only (e.g.
+    /// post-migration zeroize). FFI bindings route through this
+    /// to avoid panic-unwinding across `extern "C"`.
+    #[test]
+    fn try_issue_returns_read_only_on_public_only_keypair() {
+        let full = EntityKeypair::generate();
+        // Build a public-only sibling that shares the same entity_id.
+        let public_only = EntityKeypair::public_only(full.entity_id().clone());
+        assert!(public_only.try_sign(b"x").is_err());
+
+        let subject = EntityKeypair::generate();
+        let result = PermissionToken::try_issue(
+            &public_only,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0,
+            3600,
+            0,
+        );
+        assert!(
+            matches!(result, Err(TokenError::ReadOnly)),
+            "try_issue must surface public-only keypair as ReadOnly (BUG #121), got {:?}",
+            result.map(|_| "Ok"),
+        );
+    }
+
+    /// `delegate` likewise surfaces a public-only signer as
+    /// `TokenError::ReadOnly`. The original `delegate` already
+    /// returns `Result`, so no API change was needed — only the
+    /// internal `sign` call was switched to `try_sign`.
+    #[test]
+    fn delegate_returns_read_only_on_public_only_signer() {
+        let issuer = EntityKeypair::generate();
+        let subject_full = EntityKeypair::generate();
+        let target = EntityKeypair::generate();
+
+        let parent = PermissionToken::issue(
+            &issuer,
+            subject_full.entity_id().clone(),
+            TokenScope::PUBLISH.union(TokenScope::DELEGATE),
+            0xCAFE,
+            3600,
+            3,
+        );
+
+        // Subject becomes public-only (post-migration zeroize).
+        let subject_pub = EntityKeypair::public_only(subject_full.entity_id().clone());
+        let result = parent.delegate(
+            &subject_pub,
+            target.entity_id().clone(),
+            TokenScope::PUBLISH,
+        );
+        assert!(
+            matches!(result, Err(TokenError::ReadOnly)),
+            "delegate must surface public-only signer as ReadOnly (BUG #121), got {:?}",
+            result.map(|_| "Ok"),
+        );
+    }
+
+    /// `try_issue` succeeds with a full keypair — pins the success
+    /// path so a future tightening doesn't accidentally over-reject.
+    #[test]
+    fn try_issue_succeeds_with_full_keypair() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let token = PermissionToken::try_issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0,
+            3600,
+            0,
+        )
+        .expect("try_issue must succeed with a full keypair");
+        assert!(token.verify().is_ok());
     }
 }

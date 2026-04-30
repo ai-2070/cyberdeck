@@ -593,6 +593,29 @@ impl JetStreamAdapterConfig {
                 "jetstream replicas must be >= 1".into(),
             ));
         }
+        // BUG #68: NATS rejects negative `max_messages` / `max_bytes`
+        // at stream-create time, surfacing as a runtime adapter
+        // error instead of at startup `validate()` (the documented
+        // purpose of this method). The fields are typed `i64` for
+        // wire-compat with the NATS API but only non-negative values
+        // make sense — a builder's `with_max_messages(-1)` would
+        // happily store the negative and explode minutes later.
+        // Reject at validation time so the misconfig is caught
+        // before any connection attempt.
+        if let Some(n) = self.max_messages {
+            if n < 0 {
+                return Err(ConfigError::InvalidValue(format!(
+                    "jetstream max_messages must be non-negative (got {n})"
+                )));
+            }
+        }
+        if let Some(n) = self.max_bytes {
+            if n < 0 {
+                return Err(ConfigError::InvalidValue(format!(
+                    "jetstream max_bytes must be non-negative (got {n})"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -1137,5 +1160,36 @@ mod tests {
             .adapter(AdapterConfig::JetStream(js))
             .build();
         assert!(result.is_err(), "jetstream replicas == 0 must reject");
+    }
+
+    /// BUG #68: `JetStreamAdapterConfig::validate` rejects negative
+    /// `max_messages` / `max_bytes`. NATS rejects negatives at
+    /// stream-create time, so without validate-time enforcement the
+    /// misconfig surfaces as a runtime adapter error minutes later.
+    #[cfg(feature = "jetstream")]
+    #[test]
+    fn validate_rejects_negative_max_messages() {
+        let js = JetStreamAdapterConfig::new("nats://localhost:4222").with_max_messages(-1);
+        let err = js.validate().expect_err("negative max_messages must reject");
+        let msg = format!("{err}");
+        assert!(msg.contains("max_messages"), "error must mention the field, got: {msg}");
+    }
+
+    #[cfg(feature = "jetstream")]
+    #[test]
+    fn validate_rejects_negative_max_bytes() {
+        let js = JetStreamAdapterConfig::new("nats://localhost:4222").with_max_bytes(-100);
+        let err = js.validate().expect_err("negative max_bytes must reject");
+        let msg = format!("{err}");
+        assert!(msg.contains("max_bytes"), "error must mention the field, got: {msg}");
+    }
+
+    #[cfg(feature = "jetstream")]
+    #[test]
+    fn validate_accepts_zero_and_positive_max_messages() {
+        let js = JetStreamAdapterConfig::new("nats://localhost:4222").with_max_messages(0);
+        assert!(js.validate().is_ok(), "zero must be accepted");
+        let js = JetStreamAdapterConfig::new("nats://localhost:4222").with_max_messages(1_000_000);
+        assert!(js.validate().is_ok(), "positive must be accepted");
     }
 }
