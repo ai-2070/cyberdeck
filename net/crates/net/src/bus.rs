@@ -728,20 +728,14 @@ impl EventBus {
         // workers/senders may already be partially torn down.
         if self
             .shutdown
-            .compare_exchange(
-                false,
-                true,
-                AtomicOrdering::SeqCst,
-                AtomicOrdering::SeqCst,
-            )
+            .compare_exchange(false, true, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst)
             .is_err()
         {
             // Bound the wait so a `Drop`-only path (which sets
             // `shutdown=true` but never sets `shutdown_completed`)
             // doesn't spin forever. After the deadline, return Ok
             // — the bus is at least signalled to stop.
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while !self.shutdown_completed.load(AtomicOrdering::Acquire) {
                 if std::time::Instant::now() >= deadline {
                     return Ok(());
@@ -902,9 +896,7 @@ impl EventBus {
         let mut finalized: std::collections::HashSet<u16> = std::collections::HashSet::new();
         let target: std::collections::HashSet<u16> = drained_ids.iter().copied().collect();
 
-        while finalized.len() < target.len()
-            && std::time::Instant::now() < deadline
-        {
+        while finalized.len() < target.len() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let stopped = mapper.finalize_draining();
             for shard_id in stopped {

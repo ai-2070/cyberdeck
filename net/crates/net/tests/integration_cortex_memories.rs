@@ -799,13 +799,7 @@ async fn re_store_preserves_pinned_flag_and_created_ns() {
 
     // 1. Initial store at created_ns=100.
     memories
-        .store(
-            1,
-            "first content",
-            vec!["initial".into()],
-            "alice",
-            100,
-        )
+        .store(1, "first content", vec!["initial".into()], "alice", 100)
         .unwrap();
     let seq = memories.pin(1, 110).unwrap();
     memories.wait_for_seq(seq).await;
@@ -821,13 +815,7 @@ async fn re_store_preserves_pinned_flag_and_created_ns() {
 
     // 2. Re-store with new content at now_ns=200.
     let seq = memories
-        .store(
-            1,
-            "updated content",
-            vec!["updated".into()],
-            "bob",
-            200,
-        )
+        .store(1, "updated content", vec!["updated".into()], "bob", 200)
         .unwrap();
     memories.wait_for_seq(seq).await;
 
@@ -835,10 +823,7 @@ async fn re_store_preserves_pinned_flag_and_created_ns() {
     let guard = state.read();
     let m = guard.get(1).unwrap();
     // Pre-fix: pinned would be false, created_ns would be 200.
-    assert!(
-        m.pinned,
-        "pinned flag must be preserved across re-store"
-    );
+    assert!(m.pinned, "pinned flag must be preserved across re-store");
     assert_eq!(
         m.created_ns, 100,
         "created_ns must be preserved across re-store"

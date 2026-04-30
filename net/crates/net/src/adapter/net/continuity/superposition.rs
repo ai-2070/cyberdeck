@@ -323,7 +323,13 @@ mod tests {
 
         // Source's head is event[3]; target replayed up to event[2].
         let events: Vec<_> = log.range(1, 5).into_iter().cloned().collect();
-        assert_eq!(events.len(), 5, "got {} events: {:?}", events.len(), events.iter().map(|e| e.link.sequence).collect::<Vec<_>>());
+        assert_eq!(
+            events.len(),
+            5,
+            "got {} events: {:?}",
+            events.len(),
+            events.iter().map(|e| e.link.sequence).collect::<Vec<_>>()
+        );
         let source_head_link = events[3].link;
         let target_head_link = events[2].link;
 

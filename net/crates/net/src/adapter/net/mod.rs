@@ -172,12 +172,23 @@ pub use routing::{route_to_shard, stream_id_from_bytes, stream_id_from_key};
 ///
 /// Shared utility — avoids duplicating this across `causal.rs`, `snapshot.rs`,
 /// `observation.rs`, `migration.rs`, `session.rs`, and `token.rs`.
+///
+/// BUG #118: pre-fix, `as u64` silently truncated the `u128`
+/// returned by `Duration::as_nanos()`. Practical wraparound
+/// from monotonic flow doesn't happen until ~year 2554, but a
+/// system whose clock was misconfigured to a far-future date
+/// produced a tiny truncated timestamp — immediately tripping
+/// `is_timed_out` everywhere. `unwrap_or_default()` returning
+/// `Duration::ZERO` for a pre-epoch clock also produced
+/// identical timestamps that broke ordering. Saturate via
+/// `try_from` so future-dated clocks land at `u64::MAX`
+/// instead of wrapping near 0.
 #[inline]
 pub(crate) fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
+    let elapsed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
+        .unwrap_or_default();
+    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Fast xxh3-based routing utilities for Net streams.

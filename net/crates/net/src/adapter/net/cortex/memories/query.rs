@@ -89,23 +89,27 @@ impl MemoriesFilterSpec {
                 return false;
             }
         }
+        // BUG #142: see `cortex/tasks/query.rs` for context —
+        // strict `>` / `<` bounds dropped events at the cutoff,
+        // breaking pagination using "last sync ns" and dropping
+        // one of two events written in the same ns. Inclusive.
         if let Some(ns) = self.created_after_ns {
-            if m.created_ns <= ns {
+            if m.created_ns < ns {
                 return false;
             }
         }
         if let Some(ns) = self.created_before_ns {
-            if m.created_ns >= ns {
+            if m.created_ns > ns {
                 return false;
             }
         }
         if let Some(ns) = self.updated_after_ns {
-            if m.updated_ns <= ns {
+            if m.updated_ns < ns {
                 return false;
             }
         }
         if let Some(ns) = self.updated_before_ns {
-            if m.updated_ns >= ns {
+            if m.updated_ns > ns {
                 return false;
             }
         }

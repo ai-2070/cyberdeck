@@ -53,23 +53,32 @@ impl TasksFilterSpec {
                 return false;
             }
         }
+        // BUG #142: pre-fix used strict `>` / `<` (rejection
+        // via `<=` / `>=`), so an event with `created_ns ==
+        // cutoff` was dropped by both `created_after(cutoff)`
+        // and `created_before(cutoff)` — fell through holes
+        // between paginations using "last sync ns" as cutoff.
+        // Inclusive bounds (rejection via `<` / `>`) close that
+        // gap and also handle two events written in the same
+        // ns (achievable on Windows where wall-clock granularity
+        // is ~15ms).
         if let Some(ns) = self.created_after_ns {
-            if t.created_ns <= ns {
+            if t.created_ns < ns {
                 return false;
             }
         }
         if let Some(ns) = self.created_before_ns {
-            if t.created_ns >= ns {
+            if t.created_ns > ns {
                 return false;
             }
         }
         if let Some(ns) = self.updated_after_ns {
-            if t.updated_ns <= ns {
+            if t.updated_ns < ns {
                 return false;
             }
         }
         if let Some(ns) = self.updated_before_ns {
-            if t.updated_ns >= ns {
+            if t.updated_ns > ns {
                 return false;
             }
         }

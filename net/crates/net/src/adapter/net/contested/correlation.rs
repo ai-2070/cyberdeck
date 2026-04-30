@@ -261,11 +261,7 @@ impl CorrelatedFailureDetector {
         // `Ord` rustdoc).
         let mut entries: Vec<(SubnetId, usize)> =
             subnet_counts.iter().map(|(&s, &c)| (s, c)).collect();
-        entries.sort_by(|a, b| {
-            b.0.depth()
-                .cmp(&a.0.depth())
-                .then_with(|| a.0.cmp(&b.0))
-        });
+        entries.sort_by(|a, b| b.0.depth().cmp(&a.0.depth()).then_with(|| a.0.cmp(&b.0)));
 
         let mut best_subnet = None;
         let mut best_depth = 0u8;
@@ -452,7 +448,10 @@ mod tests {
             // visited last in iteration order.
             let verdict = det.record_failures(&[0, 1, 2, 3, 4, 5], 20);
             assert!(verdict.is_mass_failure());
-            if let CorrelationVerdict::MassFailure { suspected_cause, .. } = &verdict {
+            if let CorrelationVerdict::MassFailure {
+                suspected_cause, ..
+            } = &verdict
+            {
                 match suspected_cause {
                     FailureCause::SubnetFailure { subnet, .. } => {
                         // Deterministic tiebreak: lower id wins

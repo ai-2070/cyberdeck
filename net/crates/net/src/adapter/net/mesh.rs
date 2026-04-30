@@ -183,10 +183,12 @@ impl Drop for PeerRegistrationGuard {
         // value we wrote. A concurrent retry for the same peer
         // may have already replaced them with a fresh, valid
         // registration — we must not overwrite that.
-        self.peers
-            .remove_if(&self.peer_node_id, |_, pi| pi.addr == self.registered_next_hop);
-        self.peer_addrs
-            .remove_if(&self.peer_node_id, |_, addr| *addr == self.registered_next_hop);
+        self.peers.remove_if(&self.peer_node_id, |_, pi| {
+            pi.addr == self.registered_next_hop
+        });
+        self.peer_addrs.remove_if(&self.peer_node_id, |_, addr| {
+            *addr == self.registered_next_hop
+        });
         self.router
             .routing_table()
             .remove_route_if_next_hop_is(self.peer_node_id, self.registered_next_hop);
@@ -6313,9 +6315,7 @@ impl MeshNode {
                     // entry without forwarding. Should not happen
                     // unless start() shut down; treat as timeout.
                     self.pending_direct_initiators.remove(&peer_addr);
-                    return Err(AdapterError::Connection(
-                        "handshake channel dropped".into(),
-                    ));
+                    return Err(AdapterError::Connection("handshake channel dropped".into()));
                 }
                 Err(_) => {
                     // Timeout — the responder never replied or its
@@ -6336,16 +6336,13 @@ impl MeshNode {
 
             let parsed = tokio::time::timeout(timeout, async {
                 loop {
-                    let mut recv_buf =
-                        bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
+                    let mut recv_buf = bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
                     recv_buf.resize(protocol::MAX_PACKET_SIZE, 0);
 
                     let (n, source) = socket_arc
                         .recv_from(&mut recv_buf)
                         .await
-                        .map_err(|e| {
-                            AdapterError::Connection(format!("recv failed: {}", e))
-                        })?;
+                        .map_err(|e| AdapterError::Connection(format!("recv failed: {}", e)))?;
 
                     if source != peer_addr {
                         continue;
@@ -7398,12 +7395,7 @@ mod heartbeat_aead_tests {
     #[test]
     fn aead_authenticated_heartbeat_passes_verification() {
         let (init_keys, resp_keys) = make_session_keys();
-        let resp_session = NetSession::new(
-            resp_keys,
-            "127.0.0.1:5000".parse().unwrap(),
-            4,
-            false,
-        );
+        let resp_session = NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false);
         let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
         let bytes = builder.build_heartbeat();
 
@@ -7420,28 +7412,21 @@ mod heartbeat_aead_tests {
     #[test]
     fn unauthenticated_heartbeat_fails_verification() {
         let (_init_keys, resp_keys) = make_session_keys();
-        let resp_session = NetSession::new(
-            resp_keys,
-            "127.0.0.1:5000".parse().unwrap(),
-            4,
-            false,
-        );
+        let resp_session = NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false);
 
         // Attacker forges a heartbeat header with the right
         // session_id but garbage 16-byte tail. Pre-fix this passed
         // through; post-fix it must fail.
         let mut forged = bytes::BytesMut::new();
-        let mut header_bytes =
-            NetHeader::heartbeat(resp_session.session_id()).to_bytes();
+        let mut header_bytes = NetHeader::heartbeat(resp_session.session_id()).to_bytes();
         // Stamp a plausible nonce so the receiver gets to decrypt
         // (otherwise it bails earlier on the counter check).
         header_bytes[12..16].copy_from_slice(&[0u8; 4]);
         header_bytes[16..24].copy_from_slice(&1u64.to_le_bytes());
         forged.extend_from_slice(&header_bytes);
         forged.extend_from_slice(&[0xAAu8; 16]); // garbage tag
-        let parsed =
-            ParsedPacket::parse(forged.freeze(), "127.0.0.1:5000".parse().unwrap())
-                .expect("forged heartbeat must still parse — verification is downstream");
+        let parsed = ParsedPacket::parse(forged.freeze(), "127.0.0.1:5000".parse().unwrap())
+            .expect("forged heartbeat must still parse — verification is downstream");
         assert!(parsed.header.flags.is_heartbeat());
 
         assert!(
@@ -7483,12 +7468,7 @@ mod heartbeat_aead_tests {
         // a minimal session and check post-Drop that the entry
         // is gone.
         let (init_keys, _resp_keys) = make_session_keys();
-        let session = Arc::new(NetSession::new(
-            init_keys,
-            next_hop,
-            4,
-            false,
-        ));
+        let session = Arc::new(NetSession::new(init_keys, next_hop, 4, false));
         peers.insert(
             peer_id,
             PeerInfo {
@@ -7543,12 +7523,7 @@ mod heartbeat_aead_tests {
         );
 
         let (init_keys, _resp_keys) = make_session_keys();
-        let session = Arc::new(NetSession::new(
-            init_keys,
-            next_hop,
-            4,
-            false,
-        ));
+        let session = Arc::new(NetSession::new(init_keys, next_hop, 4, false));
         peers.insert(
             peer_id,
             PeerInfo {
@@ -7602,12 +7577,7 @@ mod heartbeat_aead_tests {
         );
 
         let (init_keys, _resp_keys) = make_session_keys();
-        let session = Arc::new(NetSession::new(
-            init_keys,
-            fresh,
-            4,
-            false,
-        ));
+        let session = Arc::new(NetSession::new(init_keys, fresh, 4, false));
         // Concurrent retry has overwritten with `fresh` — the
         // stale guard about to drop should NOT remove this.
         peers.insert(
@@ -7664,12 +7634,7 @@ mod heartbeat_aead_tests {
     #[test]
     fn packet_pool_and_thread_local_pool_have_independent_counters() {
         let (init_keys, _resp_keys) = make_session_keys();
-        let session = NetSession::new(
-            init_keys,
-            "127.0.0.1:5001".parse().unwrap(),
-            4,
-            false,
-        );
+        let session = NetSession::new(init_keys, "127.0.0.1:5001".parse().unwrap(), 4, false);
 
         // Acquire from packet_pool. PooledBuilder emits its first
         // packet at the pool's current counter (starts at 0).
@@ -7701,7 +7666,10 @@ mod heartbeat_aead_tests {
         // session sees two streams of packets with overlapping
         // counters. The receiver's `rx_cipher.update_rx_counter`
         // would accept the first counter=0 and reject the second.
-        assert_ne!(h1_counter, h2_counter, "successive packet_pool builds must increment");
+        assert_ne!(
+            h1_counter, h2_counter,
+            "successive packet_pool builds must increment"
+        );
         assert!(
             h1_counter == d1_counter || h2_counter == d1_counter,
             "packet_pool and thread_local_pool MUST have overlapping \
@@ -7735,12 +7703,7 @@ mod heartbeat_aead_tests {
             4,
             false,
         );
-        let resp_session = NetSession::new(
-            resp_keys,
-            "127.0.0.1:5000".parse().unwrap(),
-            4,
-            false,
-        );
+        let resp_session = NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false);
 
         // Mirror the production sender at `mesh.rs:3220` —
         // acquire from the session's pool, not a fresh builder.
@@ -7776,12 +7739,7 @@ mod heartbeat_aead_tests {
     #[test]
     fn replay_of_authenticated_heartbeat_fails_verification_on_second_try() {
         let (init_keys, resp_keys) = make_session_keys();
-        let resp_session = NetSession::new(
-            resp_keys,
-            "127.0.0.1:5000".parse().unwrap(),
-            4,
-            false,
-        );
+        let resp_session = NetSession::new(resp_keys, "127.0.0.1:5000".parse().unwrap(), 4, false);
         let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
         let bytes = builder.build_heartbeat();
         let parsed = ParsedPacket::parse(bytes, "127.0.0.1:5000".parse().unwrap()).unwrap();

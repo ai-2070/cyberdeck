@@ -235,8 +235,13 @@ mod tests {
         let ch = make_channel("test/global", Visibility::Global, &reg);
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
-        let decision =
-            gw.should_forward(SubnetId::new(&[1, 1]), SubnetId::new(&[2, 1]), ch, TEST_TTL, 0);
+        let decision = gw.should_forward(
+            SubnetId::new(&[1, 1]),
+            SubnetId::new(&[2, 1]),
+            ch,
+            TEST_TTL,
+            0,
+        );
         assert_eq!(decision, ForwardDecision::Forward);
     }
 
@@ -246,8 +251,13 @@ mod tests {
         let ch = make_channel("test/local", Visibility::SubnetLocal, &reg);
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
-        let decision =
-            gw.should_forward(SubnetId::new(&[1, 1]), SubnetId::new(&[1, 2]), ch, TEST_TTL, 0);
+        let decision = gw.should_forward(
+            SubnetId::new(&[1, 1]),
+            SubnetId::new(&[1, 2]),
+            ch,
+            TEST_TTL,
+            0,
+        );
         assert_eq!(decision, ForwardDecision::Drop(DropReason::SubnetLocal));
     }
 
@@ -263,8 +273,13 @@ mod tests {
         assert_eq!(decision, ForwardDecision::Forward);
 
         // Sibling to sibling — not allowed
-        let decision =
-            gw.should_forward(SubnetId::new(&[1, 2]), SubnetId::new(&[1, 3]), ch, TEST_TTL, 0);
+        let decision = gw.should_forward(
+            SubnetId::new(&[1, 2]),
+            SubnetId::new(&[1, 3]),
+            ch,
+            TEST_TTL,
+            0,
+        );
         assert_eq!(decision, ForwardDecision::Drop(DropReason::NotAncestor));
     }
 
@@ -277,13 +292,11 @@ mod tests {
         gw.export_channel(ch, vec![SubnetId::new(&[2])]);
 
         // Forward to exported target
-        let decision =
-            gw.should_forward(SubnetId::new(&[1]), SubnetId::new(&[2]), ch, TEST_TTL, 0);
+        let decision = gw.should_forward(SubnetId::new(&[1]), SubnetId::new(&[2]), ch, TEST_TTL, 0);
         assert_eq!(decision, ForwardDecision::Forward);
 
         // Drop to non-exported target
-        let decision =
-            gw.should_forward(SubnetId::new(&[1]), SubnetId::new(&[3]), ch, TEST_TTL, 0);
+        let decision = gw.should_forward(SubnetId::new(&[1]), SubnetId::new(&[3]), ch, TEST_TTL, 0);
         assert_eq!(decision, ForwardDecision::Drop(DropReason::NotExported));
     }
 
@@ -342,8 +355,13 @@ mod tests {
         let reg = ChannelConfigRegistry::new();
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
-        let decision =
-            gw.should_forward(SubnetId::new(&[1]), SubnetId::new(&[2]), 0x9999, TEST_TTL, 0);
+        let decision = gw.should_forward(
+            SubnetId::new(&[1]),
+            SubnetId::new(&[2]),
+            0x9999,
+            TEST_TTL,
+            0,
+        );
         assert_eq!(decision, ForwardDecision::Drop(DropReason::SubnetLocal));
     }
 
@@ -397,9 +415,27 @@ mod tests {
         let ch_local = make_channel("test/stats-local", Visibility::SubnetLocal, &reg);
         let gw = SubnetGateway::new(SubnetId::new(&[1]), reg);
 
-        gw.should_forward(SubnetId::new(&[1]), SubnetId::new(&[2]), ch_global, TEST_TTL, 0);
-        gw.should_forward(SubnetId::new(&[1]), SubnetId::new(&[2]), ch_local, TEST_TTL, 0);
-        gw.should_forward(SubnetId::new(&[1]), SubnetId::new(&[2]), ch_global, TEST_TTL, 0);
+        gw.should_forward(
+            SubnetId::new(&[1]),
+            SubnetId::new(&[2]),
+            ch_global,
+            TEST_TTL,
+            0,
+        );
+        gw.should_forward(
+            SubnetId::new(&[1]),
+            SubnetId::new(&[2]),
+            ch_local,
+            TEST_TTL,
+            0,
+        );
+        gw.should_forward(
+            SubnetId::new(&[1]),
+            SubnetId::new(&[2]),
+            ch_global,
+            TEST_TTL,
+            0,
+        );
 
         assert_eq!(gw.forwarded_count(), 2);
         assert_eq!(gw.dropped_count(), 1);

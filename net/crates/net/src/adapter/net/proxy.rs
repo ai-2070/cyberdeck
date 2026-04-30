@@ -230,9 +230,17 @@ impl NetProxy {
         self.next_hop.insert(dest_id, next_hop);
     }
 
-    /// Remove a route
+    /// Remove a route.
+    ///
+    /// BUG #116: pre-fix this only removed the next_hop entry
+    /// and left `hop_stats[dest_id]` in place. A peer churning
+    /// through many destinations grew `hop_stats` indefinitely
+    /// (memory ∝ total-distinct-dest-ids-ever-seen, not active
+    /// dest count). Now `remove_route` also drops the matching
+    /// `hop_stats` entry.
     pub fn remove_route(&self, dest_id: u64) {
         self.next_hop.remove(&dest_id);
+        self.hop_stats.remove(&dest_id);
     }
 
     /// Lookup next hop for destination
@@ -601,6 +609,40 @@ mod tests {
             ForwardResult::Dropped(ProxyError::NoRoute) => {}
             _ => panic!("expected no route"),
         }
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #116: pre-fix
+    /// `remove_route(dest_id)` only deleted the next_hop entry
+    /// and left `hop_stats[dest_id]` in place. A peer churning
+    /// through many destinations grew `hop_stats` linearly with
+    /// total-distinct-dest-ids-ever-seen, not active dest count
+    /// — unbounded memory growth. Post-fix `remove_route` also
+    /// drops the matching `hop_stats` entry.
+    #[tokio::test]
+    async fn remove_route_also_drops_hop_stats() {
+        let config = ProxyConfig::new(0x1234, "127.0.0.1:0".parse().unwrap());
+        let proxy = NetProxy::new(config).await.unwrap();
+
+        let next_hop: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        proxy.add_route(0x5678, next_hop);
+
+        // Force hop_stats to populate by recording activity.
+        proxy.record_hop_forward(0x5678, 100, 1000);
+        proxy.record_hop_drop(0x5678);
+        assert!(
+            proxy.hop_stats(0x5678).is_some(),
+            "hop_stats must be present after recording activity"
+        );
+
+        // Remove the route — pre-fix would leave the hop_stats
+        // entry behind. Post-fix it's dropped.
+        proxy.remove_route(0x5678);
+
+        assert!(
+            proxy.hop_stats(0x5678).is_none(),
+            "hop_stats entry must be dropped along with the route — \
+             pre-fix this leaked memory linearly with churned destinations"
+        );
     }
 
     #[test]

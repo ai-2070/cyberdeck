@@ -554,16 +554,35 @@ impl LocalGraph {
         // origin_ids are blocked. Combined with periodic eviction
         // this bounds memory while preserving liveness for
         // already-known peers.
-        if !self.nodes.contains_key(&pw.origin_id)
-            && self.nodes.len() >= MAX_GRAPH_NODES
-        {
+        if !self.nodes.contains_key(&pw.origin_id) && self.nodes.len() >= MAX_GRAPH_NODES {
             return None;
         }
         self.nodes
             .entry(pw.origin_id)
             .and_modify(|n| {
-                // Only update if this is a newer sequence or closer hop
-                if pw.seq > n.last_seq || hops < n.hops {
+                // BUG #120: pre-fix this only updated when
+                // `pw.seq > n.last_seq || hops < n.hops`. When
+                // a peer restarts, its `next_seq` resets to 1
+                // — but our recorded `n.last_seq` is still the
+                // old high-water mark (e.g. 10000). Incoming
+                // pingwaves at seq=1, 2, ... were dropped from
+                // updating, so `last_seen` never advanced and
+                // the node went `is_stale` after 30s while the
+                // peer was still sending pingwaves. In the gap,
+                // capability lookups against the stale entry
+                // returned outdated capabilities.
+                //
+                // Detect a likely restart: the new seq is far
+                // below the recorded high-water (`<= last_seq/2`,
+                // arbitrary but conservative — a peer that
+                // legitimately bursts after a stall might
+                // produce pw.seq slightly below n.last_seq, but
+                // not half), AND the new pingwave isn't trivially
+                // older (pw.seq is small, indicating a fresh
+                // restart). On restart, accept the regression
+                // and reset our recorded state.
+                let likely_restart = n.last_seq > 1 && pw.seq < n.last_seq.saturating_div(2);
+                if pw.seq > n.last_seq || hops < n.hops || likely_restart {
                     n.last_seq = pw.seq;
                     n.hops = hops;
                     n.addr = from;
@@ -891,6 +910,87 @@ mod tests {
         );
     }
 
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #120: pre-fix
+    /// `on_pingwave` only updated `last_seq`/`last_seen` when
+    /// `pw.seq > n.last_seq`. After a peer restart its
+    /// `next_seq` resets to 1; with our `n.last_seq` still at
+    /// the old high-water mark, every post-restart pingwave was
+    /// dropped from updating. The node entered `is_stale` after
+    /// 30s and got removed by cleanup — capability lookups
+    /// against the stale entry returned outdated info in the
+    /// gap.
+    ///
+    /// Post-fix: a likely restart (`pw.seq <= n.last_seq / 2`
+    /// when `n.last_seq > 1`) accepts the regression and
+    /// resets our recorded state.
+    #[test]
+    fn on_pingwave_accepts_seq_regression_on_likely_peer_restart() {
+        let graph = LocalGraph::new(0x1, 8);
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        // Bring the peer up to a high seq.
+        for seq in [100u64, 200, 500, 1000].iter() {
+            let pw = Pingwave::new(0xCAFE, *seq, 3);
+            graph.on_pingwave(pw, from);
+        }
+        let pre_restart_last_seq = graph.nodes.get(&0xCAFE).map(|n| n.last_seq).unwrap();
+        assert_eq!(pre_restart_last_seq, 1000);
+
+        // Peer "restarts" — fresh seq=1 (well below 1000/2 = 500).
+        let restart_from: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let pw = Pingwave::new(0xCAFE, 1, 3);
+        graph.on_pingwave(pw, restart_from);
+
+        // Snapshot the values via .map so the DashMap Ref guard
+        // is released before we issue the next on_pingwave call.
+        let (post_restart_last_seq, post_restart_addr) = graph
+            .nodes
+            .get(&0xCAFE)
+            .map(|n| (n.last_seq, n.addr))
+            .unwrap();
+        // Pre-fix: last_seq would still be 1000 and addr would
+        // still be the old `from`. Post-fix: restart accepted
+        // and state updated.
+        assert_eq!(
+            post_restart_last_seq, 1,
+            "restart pingwave with seq << last_seq must update last_seq"
+        );
+        assert_eq!(
+            post_restart_addr, restart_from,
+            "restart pingwave must update the recorded address"
+        );
+
+        // A subsequent regular advance also works.
+        let pw2 = Pingwave::new(0xCAFE, 2, 3);
+        graph.on_pingwave(pw2, restart_from);
+        let final_last_seq = graph.nodes.get(&0xCAFE).map(|n| n.last_seq).unwrap();
+        assert_eq!(final_last_seq, 2);
+    }
+
+    /// Sanity: a small seq regression that is NOT below
+    /// `last_seq / 2` should still be ignored — protects against
+    /// out-of-order pingwaves on a non-restarted peer.
+    #[test]
+    fn on_pingwave_ignores_small_seq_regression_without_restart_signal() {
+        let graph = LocalGraph::new(0x1, 8);
+        let from: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        for seq in [10u64, 20].iter() {
+            let pw = Pingwave::new(0xCAFE, *seq, 3);
+            graph.on_pingwave(pw, from);
+        }
+
+        // seq=15 is below 20 but above 20/2=10 — out-of-order,
+        // not a restart. Don't update.
+        let pw = Pingwave::new(0xCAFE, 15, 3);
+        graph.on_pingwave(pw, from);
+        let last_seq = graph.nodes.get(&0xCAFE).map(|n| n.last_seq).unwrap();
+        assert_eq!(
+            last_seq, 20,
+            "small seq regression (out-of-order) must NOT update last_seq"
+        );
+    }
+
     #[test]
     fn on_pingwave_drops_novel_origin_when_nodes_is_at_cap() {
         let graph = LocalGraph::new(0x1, 8);
@@ -899,9 +999,7 @@ mod tests {
         // Pre-populate `nodes` to the cap with synthetic ids.
         for i in 0..MAX_GRAPH_NODES as u64 {
             let id = 0xDEAD_BEEF_0000 + i;
-            graph
-                .nodes
-                .insert(id, NodeInfo::new(id, from, 1));
+            graph.nodes.insert(id, NodeInfo::new(id, from, 1));
         }
         assert_eq!(graph.nodes.len(), MAX_GRAPH_NODES);
 

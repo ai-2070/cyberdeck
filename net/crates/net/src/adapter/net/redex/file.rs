@@ -986,9 +986,7 @@ impl RedexFile {
             let surviving_index: Vec<RedexEntry> = state.index[drop..].to_vec();
             let surviving_timestamps: Vec<u64> = state.timestamps[drop..].to_vec();
             let disk = disk.clone();
-            if let Err(e) =
-                disk.compact_to(&surviving_index, &surviving_timestamps, dat_base)
-            {
+            if let Err(e) = disk.compact_to(&surviving_index, &surviving_timestamps, dat_base) {
                 tracing::warn!(
                     error = %e,
                     "redex sweep_retention: disk compaction failed; \
@@ -1637,12 +1635,13 @@ mod tests {
         f.append(b"AAAAAAAAA").unwrap();
         let dat_path = dir.join("t_rollback").join("idx_meta").join("dat");
         let pre_dat_len = std::fs::metadata(&dat_path).unwrap().len();
-        assert_eq!(
-            pre_dat_len, 9,
-            "primed payload must be 9 bytes on disk"
-        );
+        assert_eq!(pre_dat_len, 9, "primed payload must be 9 bytes on disk");
 
-        f.inner.disk.as_ref().unwrap().arm_next_idx_metadata_failure();
+        f.inner
+            .disk
+            .as_ref()
+            .unwrap()
+            .arm_next_idx_metadata_failure();
 
         let err = f.append(b"BBBBBBBBB").unwrap_err();
         assert!(matches!(err, RedexError::Io(_)));
@@ -1677,7 +1676,11 @@ mod tests {
         let pre_dat_len = std::fs::metadata(&dat_path).unwrap().len();
         let pre_idx_len = std::fs::metadata(&idx_path).unwrap().len();
 
-        f.inner.disk.as_ref().unwrap().arm_next_ts_metadata_failure();
+        f.inner
+            .disk
+            .as_ref()
+            .unwrap()
+            .arm_next_ts_metadata_failure();
 
         let err = f.append(b"BBBBBBBBB").unwrap_err();
         assert!(matches!(err, RedexError::Io(_)));
@@ -2602,8 +2605,7 @@ mod tests {
         // replays a consistent picture.
         f.sweep_retention();
 
-        let post_sweep: Vec<u64> =
-            f.inner.state.lock().index.iter().map(|e| e.seq).collect();
+        let post_sweep: Vec<u64> = f.inner.state.lock().index.iter().map(|e| e.seq).collect();
         assert_eq!(
             post_sweep,
             vec![0, 1, 2, 3, 4],
@@ -2674,8 +2676,7 @@ mod tests {
 
             // Confirm the in-memory state believes everything is
             // present before close.
-            let pre_close: Vec<u64> =
-                f.inner.state.lock().index.iter().map(|e| e.seq).collect();
+            let pre_close: Vec<u64> = f.inner.state.lock().index.iter().map(|e| e.seq).collect();
             assert_eq!(
                 pre_close,
                 vec![3, 4, 5, 6],
@@ -2698,8 +2699,7 @@ mod tests {
                     .with_retention_max_events(2),
             )
             .unwrap();
-        let restored_seqs: Vec<u64> =
-            f2.inner.state.lock().index.iter().map(|e| e.seq).collect();
+        let restored_seqs: Vec<u64> = f2.inner.state.lock().index.iter().map(|e| e.seq).collect();
         assert!(
             restored_seqs.contains(&5),
             "post-sweep append seq=5 must survive restart, got {:?}",

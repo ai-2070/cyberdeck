@@ -25,11 +25,20 @@ impl ObservedHorizon {
     }
 
     /// Record an observation of an entity at a given sequence.
+    ///
+    /// BUG #140: pre-fix this used `self.logical_time += 1`,
+    /// which debug-panics on overflow (u64::MAX → wrap) and
+    /// silently wraps to 0 in release. The `merge` path at
+    /// line 75 already uses `saturating_add(1)` and the comment
+    /// there acknowledges the convention; observe was the
+    /// outlier. Adversarial high-cardinality observe streams
+    /// could panic the receive loop in debug builds.
+    /// `saturating_add(1)` makes both paths consistent.
     pub fn observe(&mut self, origin_hash: u32, sequence: u64) {
         let entry = self.entries.entry(origin_hash).or_insert(0);
         if sequence > *entry {
             *entry = sequence;
-            self.logical_time += 1;
+            self.logical_time = self.logical_time.saturating_add(1);
         }
     }
 
@@ -188,6 +197,36 @@ mod tests {
         assert!(h.has_observed(0xAAAA, 5));
         assert!(h.has_observed(0xAAAA, 10));
         assert!(!h.has_observed(0xAAAA, 11));
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #140:
+    /// `observe` previously used `+= 1`, which debug-panics on
+    /// overflow at `u64::MAX`. Adversarial high-cardinality
+    /// observe streams (or a long-running process that just
+    /// happens to hit the wraparound) crashed the receive loop
+    /// in debug builds while the same overflow saturated in
+    /// release — inconsistent and panic-prone. Post-fix
+    /// `observe` uses `saturating_add(1)` matching `merge`.
+    #[test]
+    fn observe_saturates_logical_time_at_u64_max() {
+        let mut h = ObservedHorizon::new();
+        // Force logical_time to u64::MAX directly — the public
+        // path can't reach it in test time, but the saturating
+        // semantics must be tested.
+        h.logical_time = u64::MAX;
+
+        // Pre-fix: this would `+= 1` and panic in debug builds
+        // (the wrap-to-0 in release was equally a bug).
+        h.observe(0xAAAA, 1);
+
+        // Post-fix: saturated, no panic.
+        assert_eq!(
+            h.logical_time(),
+            u64::MAX,
+            "saturating_add must clamp at u64::MAX, not wrap to 0"
+        );
+        // Sanity: the observation was still recorded.
+        assert_eq!(h.get(0xAAAA), Some(1));
     }
 
     #[test]

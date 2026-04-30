@@ -735,8 +735,8 @@ impl LoadBalancer {
                 // `try_record_request` (max-conn cap, race), we
                 // release the probe slot so it doesn't leak — the
                 // next selection cycle can re-claim it.
-                let claimed_probe = state.circuit_open.load(Ordering::Acquire)
-                    && state.try_claim_half_open_probe();
+                let claimed_probe =
+                    state.circuit_open.load(Ordering::Acquire) && state.try_claim_half_open_probe();
                 if state.try_record_request(max_conn) {
                     return Ok(selection);
                 }

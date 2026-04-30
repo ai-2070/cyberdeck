@@ -1554,9 +1554,7 @@ mod tests {
 
         // Manually pre-populate `recently_closed` with entries
         // whose timestamps are well past the quarantine window.
-        let stale_inserted_at = Instant::now()
-            - GRANT_QUARANTINE_WINDOW
-            - Duration::from_secs(1);
+        let stale_inserted_at = Instant::now() - GRANT_QUARANTINE_WINDOW - Duration::from_secs(1);
         session.recently_closed.insert(0xAAAA, stale_inserted_at);
         session.recently_closed.insert(0xBBBB, stale_inserted_at);
 

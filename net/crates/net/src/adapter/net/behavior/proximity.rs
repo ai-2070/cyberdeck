@@ -1120,7 +1120,10 @@ mod tests {
             u8::MAX,
             "saturating_add must clamp at u8::MAX, NOT wrap to 0"
         );
-        assert_ne!(node.hops, 0, "a 255-hop peer must NOT be reported as 0 hops");
+        assert_ne!(
+            node.hops, 0,
+            "a 255-hop peer must NOT be reported as 0 hops"
+        );
     }
 
     #[test]

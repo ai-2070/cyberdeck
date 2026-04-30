@@ -247,6 +247,65 @@ async fn test_query_through_live_adapter() {
     assert!(guard.query().where_status(TaskStatus::Pending).exists());
 }
 
+/// Regression for BUG_AUDIT_2026_04_30_CORE.md #142: pre-fix
+/// `created_after`/`created_before` were strict (`>` / `<`), so
+/// an event with `created_ns == cutoff` was dropped by both
+/// `created_after(cutoff)` AND `created_before(cutoff)`. A
+/// caller paginating using "last sync ns" as cutoff would
+/// silently lose events at the boundary. Two events written in
+/// the same nanosecond (achievable on Windows with ~15ms wall-
+/// clock granularity) would have one elided in any window
+/// using either bound.
+///
+/// Post-fix the comparators are inclusive (`>=` / `<=`).
+#[tokio::test]
+async fn time_filter_cutoff_is_inclusive() {
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).unwrap();
+
+    // Three tasks at distinct timestamps; cutoff = exactly one
+    // of them.
+    tasks.create(1, "before", 1000).unwrap();
+    tasks.create(2, "at-cutoff", 2000).unwrap();
+    let last = tasks.create(3, "after", 3000).unwrap();
+    tasks.wait_for_seq(last).await;
+
+    let state = tasks.state();
+    let guard = state.read();
+
+    // created_after(2000) MUST include id 2 post-fix (pre-fix
+    // dropped it because 2000 was not strictly > 2000).
+    let mut after_2000: Vec<u64> = guard
+        .query()
+        .created_after(2000)
+        .collect()
+        .iter()
+        .map(|t| t.id)
+        .collect();
+    after_2000.sort();
+    assert_eq!(
+        after_2000,
+        vec![2, 3],
+        "created_after must include the cutoff itself (inclusive)"
+    );
+
+    // created_before(2000) MUST include id 2 too — the cutoff
+    // is in BOTH directions because both bounds are inclusive.
+    let mut before_2000: Vec<u64> = guard
+        .query()
+        .created_before(2000)
+        .collect()
+        .iter()
+        .map(|t| t.id)
+        .collect();
+    before_2000.sort();
+    assert_eq!(
+        before_2000,
+        vec![1, 2],
+        "created_before must include the cutoff itself (inclusive)"
+    );
+}
+
 #[tokio::test]
 async fn test_watch_initial_emission() {
     // A watcher opened against a non-empty state should yield the

@@ -1883,10 +1883,7 @@ mod tests {
             Err(ValidationError::RecursionLimitExceeded { limit }) => {
                 assert_eq!(limit, MAX_SCHEMA_DEPTH);
             }
-            other => panic!(
-                "expected RecursionLimitExceeded, got {:?}",
-                other
-            ),
+            other => panic!("expected RecursionLimitExceeded, got {:?}", other),
         }
     }
 

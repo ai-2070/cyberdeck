@@ -960,8 +960,20 @@ impl MetadataStore {
             })
             .collect();
 
-        // Sort by distance
-        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        // BUG #145: pre-fix used `partial_cmp(...).unwrap_or(Equal)`,
+        // which on NaN produces a non-total order — `sort_by`
+        // permutes arbitrarily and `truncate(limit)` then drops
+        // random items. `LocationInfo::distance_to` computes
+        // `(...).asin()` for near-antipodal points where FP
+        // rounding can push the asin argument > 1.0 → NaN.
+        // `total_cmp` on a NaN-sentinel score (or `f64::INFINITY`
+        // here so NaN distances sink to the end) gives a
+        // deterministic total order.
+        results.sort_by(|a, b| {
+            let a_dist = if a.1.is_nan() { f64::INFINITY } else { a.1 };
+            let b_dist = if b.1.is_nan() { f64::INFINITY } else { b.1 };
+            a_dist.total_cmp(&b_dist)
+        });
         results.truncate(limit);
 
         results
@@ -982,8 +994,14 @@ impl MetadataStore {
             })
             .collect();
 
-        // Sort by score descending
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // BUG #145: same hazard as `find_nearby` above. Sort
+        // descending with `total_cmp`; NaN scores sink to the
+        // end (treated as `f64::NEG_INFINITY` for descending).
+        results.sort_by(|a, b| {
+            let a_score = if a.1.is_nan() { f64::NEG_INFINITY } else { a.1 };
+            let b_score = if b.1.is_nan() { f64::NEG_INFINITY } else { b.1 };
+            b_score.total_cmp(&a_score)
+        });
         results.truncate(limit);
 
         results.into_iter().map(|(m, _)| m).collect()

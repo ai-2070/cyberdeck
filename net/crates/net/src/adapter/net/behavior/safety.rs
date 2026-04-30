@@ -1256,16 +1256,18 @@ impl SafetyEnforcer {
         // trigger). The matching tokens/cost paths already use
         // `fetch_update` + `saturating_sub` for exactly this
         // reason; mirror that here.
-        let _ = self.usage.concurrent.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_sub(claim.concurrent_slots)),
-        );
-        let _ = self.usage.memory_mb.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_sub(claim.memory_mb)),
-        );
+        let _ =
+            self.usage
+                .concurrent
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_sub(claim.concurrent_slots))
+                });
+        let _ =
+            self.usage
+                .memory_mb
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_sub(claim.memory_mb))
+                });
         // Release tokens and cost that were acquired — without this,
         // both counters grow monotonically, hitting limits prematurely.
         let _ = self
@@ -1904,9 +1906,7 @@ mod tests {
             ..Default::default()
         }));
         let req = SafetyRequest::new();
-        let claim = ResourceClaim::new()
-            .with_concurrent(5)
-            .with_memory_mb(100);
+        let claim = ResourceClaim::new().with_concurrent(5).with_memory_mb(100);
 
         // Acquire (no-op in Disabled — counters stay at 0) +
         // drop (release runs, would have wrapped u32 to ~4B
