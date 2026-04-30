@@ -346,9 +346,33 @@ impl MigrationSubprotocolHandler {
                 };
 
                 // Chunk the snapshot for transport
+                //
+                // BUG #128: oversized state/bindings now surfaces as a
+                // `MigrationFailed` reply (StateFailed) rather than a
+                // panic in the dispatch task. The orchestrator
+                // consumes the reply and retry semantics kick in, the
+                // same shape as `maybe_seal_envelope` failure above.
+                let snapshot_bytes = match snapshot.try_to_bytes() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = self.source_handler.abort(daemon_origin);
+                        let reason =
+                            crate::adapter::net::compute::MigrationFailureReason::StateFailed(
+                                format!("snapshot serialization failed: {e}"),
+                            );
+                        outbound.push(OutboundMigrationMessage {
+                            dest_node: from_node,
+                            payload: wire::encode(&MigrationMessage::MigrationFailed {
+                                daemon_origin,
+                                reason,
+                            })?,
+                        });
+                        return Ok(outbound);
+                    }
+                };
                 let chunks = crate::adapter::net::compute::orchestrator::chunk_snapshot(
                     daemon_origin,
-                    snapshot.to_bytes(),
+                    snapshot_bytes,
                     snapshot.through_seq,
                 )?;
                 let orch = self

@@ -919,7 +919,12 @@ impl MigrationOrchestrator {
                     MigrationError::StateFailed("daemon is stateless or snapshot failed".into())
                 })?;
 
-            let snapshot_bytes = snapshot.to_bytes();
+            // BUG #128: surface oversized-snapshot errors as a
+            // MigrationError instead of a panic that would crash the
+            // dispatch task without releasing locks.
+            let snapshot_bytes = snapshot
+                .try_to_bytes()
+                .map_err(|e| MigrationError::StateFailed(e.to_string()))?;
             let seq_through = snapshot.through_seq;
 
             state.set_snapshot(snapshot)?;

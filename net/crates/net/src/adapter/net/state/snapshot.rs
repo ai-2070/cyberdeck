@@ -39,6 +39,43 @@ const V1_MAGIC: [u8; 4] = *b"CDS1";
 /// [`StateSnapshot::from_bytes`].
 pub const SNAPSHOT_VERSION: u8 = 1;
 
+/// Errors from snapshot serialization.
+///
+/// BUG #128: previously `StateSnapshot::to_bytes` panicked via
+/// `expect("...exceeds 4 GiB")` whenever `state.len()` or
+/// `bindings_bytes.len()` overflowed the `u32` length-prefix field.
+/// `to_bytes` is on the migration / snapshot-send path, so a panic
+/// crashes the dispatch task without releasing locks. The
+/// fallible counterpart is now [`StateSnapshot::try_to_bytes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotError {
+    /// The snapshot's `state` or `bindings_bytes` exceeds the
+    /// `u32::MAX` (4 GiB) wire-format cap.
+    ExceedsWireFormat {
+        /// `self.state.len()` at the time of the failure.
+        state_len: usize,
+        /// `self.bindings_bytes.len()` at the time of the failure.
+        bindings_len: usize,
+    },
+}
+
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExceedsWireFormat {
+                state_len,
+                bindings_len,
+            } => write!(
+                f,
+                "snapshot exceeds wire-format cap (state_len={}, bindings_len={}, max=u32::MAX)",
+                state_len, bindings_len
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
 /// A serializable state snapshot at a point in the causal chain.
 #[derive(Debug, Clone)]
 pub struct StateSnapshot {
@@ -209,6 +246,51 @@ impl StateSnapshot {
     /// the caller from the head event before invoking restore (see
     /// the field's doc).
     pub fn to_bytes(&self) -> Vec<u8> {
+        // Tests and well-known internal callers know their state is
+        // bounded; production callers (compute orchestrator, migration
+        // handler) should use `try_to_bytes` so an oversized snapshot
+        // surfaces as a `MigrationError::StateFailed(...)` rather than a
+        // panic that unwinds across the dispatch task.
+        self.try_to_bytes()
+            .expect("StateSnapshot::to_bytes — call try_to_bytes for fallible serialization (BUG #128)")
+    }
+
+    /// Fallible serialization to bytes.
+    ///
+    /// Returns `SnapshotError::ExceedsWireFormat { .. }` when
+    /// `state.len()` or `bindings_bytes.len()` exceeds the
+    /// `u32::MAX` wire-format cap (4 GiB). The wire format encodes
+    /// each as a `u32` length prefix; a payload that overflows
+    /// would be permanently un-decodable.
+    ///
+    /// BUG #128: pre-fix `to_bytes` called
+    /// `u32::try_from(...).expect("...exceeds 4 GiB")` which
+    /// panicked. `to_bytes` is on the migration / snapshot-send
+    /// path, where a panic crashes the dispatch task without
+    /// releasing locks. `state` is opaque caller-supplied bytes
+    /// (compute orchestrator, FFI clients) and `bindings_bytes` is
+    /// opaque externally-controlled migration metadata, so the
+    /// >4 GiB case is reachable from outside-controlled inputs.
+    /// Production callers should use `try_to_bytes` and surface
+    /// the error; the legacy `to_bytes` wrapper is kept for
+    /// well-known-bounded test callers.
+    pub fn try_to_bytes(&self) -> Result<Vec<u8>, SnapshotError> {
+        // Validate state and bindings sizes BEFORE allocating the
+        // output buffer — a 4+ GiB heap allocation on a known-bad
+        // input would itself be a (smaller) availability hit.
+        let state_len = u32::try_from(self.state.len()).map_err(|_| {
+            SnapshotError::ExceedsWireFormat {
+                state_len: self.state.len(),
+                bindings_len: self.bindings_bytes.len(),
+            }
+        })?;
+        let bindings_len = u32::try_from(self.bindings_bytes.len()).map_err(|_| {
+            SnapshotError::ExceedsWireFormat {
+                state_len: self.state.len(),
+                bindings_len: self.bindings_bytes.len(),
+            }
+        })?;
+
         let envelope_bytes_len = if self.identity_envelope.is_some() {
             IDENTITY_ENVELOPE_SIZE
         } else {
@@ -224,12 +306,9 @@ impl StateSnapshot {
         buf.extend_from_slice(&self.through_seq.to_le_bytes());
         buf.extend_from_slice(&self.chain_link.to_bytes());
         buf.extend_from_slice(&self.created_at.to_le_bytes());
-        let state_len = u32::try_from(self.state.len()).expect("state snapshot exceeds 4 GiB");
         buf.extend_from_slice(&state_len.to_le_bytes());
         buf.extend_from_slice(&self.state);
 
-        let bindings_len = u32::try_from(self.bindings_bytes.len())
-            .expect("bindings_bytes exceeds 4 GiB — this is almost certainly a bug");
         buf.extend_from_slice(&bindings_len.to_le_bytes());
         buf.extend_from_slice(&self.bindings_bytes);
 
@@ -241,7 +320,7 @@ impl StateSnapshot {
             }
         }
 
-        buf
+        Ok(buf)
     }
 
     /// Deserialize from bytes.
@@ -713,6 +792,102 @@ mod tests {
             Bytes::from_static(b"first"),
             "first-stored snapshot must remain authoritative on equal through_seq",
         );
+    }
+
+    // ========================================================================
+    // BUG #128: try_to_bytes must NOT panic on oversized state / bindings
+    // ========================================================================
+
+    /// `try_to_bytes` returns `SnapshotError::ExceedsWireFormat`
+    /// when `bindings_bytes` exceeds the `u32::MAX` cap, instead
+    /// of panicking via `expect`. Pre-fix `to_bytes` was on the
+    /// migration / snapshot-send path, so a panic crashed the
+    /// dispatch task without releasing locks.
+    ///
+    /// Building a >4 GiB `state` payload is impractical in a unit
+    /// test, but `bindings_bytes` is `Vec<u8>` and we can flip its
+    /// length to overflow `u32::MAX` via the `set_len` unsafe
+    /// vector trick on a zero-capacity allocation only if we have
+    /// genuine memory — also impractical. Instead we use
+    /// `Bytes::from_static(&[..])` for `state` and exploit the
+    /// fact that `Bytes::len()` reports the slice length: we
+    /// can't actually allocate 5 GiB, but we CAN exercise the
+    /// guard by mocking via `Bytes::from(Vec::with_capacity(0))`
+    /// and patching state with a forged length... that's also a
+    /// no-go in safe Rust.
+    ///
+    /// What we CAN test cheaply: pin the boundary by checking
+    /// that `try_to_bytes` succeeds at the largest realistic
+    /// payload we can construct (a few MiB), and that a
+    /// hand-constructed `SnapshotError::ExceedsWireFormat`
+    /// value's `Display` impl reports the lengths so callers
+    /// surfacing the error get a useful message. The actual
+    /// >4 GiB path is exercised by the `try_from`'s contract
+    /// (`u32::try_from(usize > u32::MAX)` is a documented `Err`).
+    #[test]
+    fn try_to_bytes_succeeds_at_realistic_payload_sizes() {
+        let kp = EntityKeypair::generate();
+        let entity_id = kp.entity_id().clone();
+        let mut builder = CausalChainBuilder::new(kp.origin_hash());
+        builder.append(Bytes::from_static(b"e"), 0).unwrap();
+
+        // 4 MiB state — a realistic-large daemon snapshot.
+        let big_state = Bytes::from(vec![0u8; 4 * 1024 * 1024]);
+        let snapshot = StateSnapshot::new(
+            entity_id,
+            *builder.head(),
+            big_state.clone(),
+            ObservedHorizon::new(),
+        );
+        let bytes = snapshot
+            .try_to_bytes()
+            .expect("4 MiB state must serialize without error");
+        assert!(bytes.len() > big_state.len(), "envelope adds header bytes");
+    }
+
+    /// `SnapshotError::ExceedsWireFormat` `Display` impl reports
+    /// both lengths so the caller's surfaced
+    /// `MigrationError::StateFailed(...)` carries enough context
+    /// to debug.
+    #[test]
+    fn snapshot_error_exceeds_wire_format_display_includes_lengths() {
+        let err = SnapshotError::ExceedsWireFormat {
+            state_len: 5_000_000_000,
+            bindings_len: 0,
+        };
+        let s = format!("{}", err);
+        assert!(s.contains("5000000000"));
+        assert!(s.contains("u32::MAX"));
+    }
+
+    /// `try_to_bytes` returns ExceedsWireFormat when bindings
+    /// overflow u32. We construct an already-overflowing
+    /// `bindings_bytes` only if memory permits; this test is
+    /// gated to skip on a host that can't allocate ~5 GiB. The
+    /// `try_from` contract is itself the load-bearing check —
+    /// this test is included for clarity and only exercises the
+    /// path opportunistically.
+    #[test]
+    #[ignore = "requires ~5 GiB of memory; the try_from u32 guard is the load-bearing check"]
+    fn try_to_bytes_rejects_oversized_bindings() {
+        let kp = EntityKeypair::generate();
+        let entity_id = kp.entity_id().clone();
+        let mut builder = CausalChainBuilder::new(kp.origin_hash());
+        builder.append(Bytes::from_static(b"e"), 0).unwrap();
+
+        let mut snapshot = StateSnapshot::new(
+            entity_id,
+            *builder.head(),
+            Bytes::from_static(b"small state"),
+            ObservedHorizon::new(),
+        );
+        // 4 GiB + 1 byte bindings_bytes — overflows u32.
+        snapshot.bindings_bytes = vec![0u8; (u32::MAX as usize) + 1];
+
+        let err = snapshot
+            .try_to_bytes()
+            .expect_err("oversized bindings_bytes must surface as SnapshotError, not panic");
+        assert!(matches!(err, SnapshotError::ExceedsWireFormat { .. }));
     }
 
     /// Strictly newer `through_seq` is accepted — pins the success

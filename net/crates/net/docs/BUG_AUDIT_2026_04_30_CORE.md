@@ -31,7 +31,7 @@ Extended scope (#121 onward): a fourth multi-agent sweep covered the subtrees ex
 
 ## Status (running tally)
 
-**Outstanding:** #55, #56, #57, #58, #59, #60, #61, #62, #63, #64, #65, #66, #67, #68, #69, #70, #71, #72, #73, #74, #75, #76, #77, #78, #79, #98, #104, #106, #107, #111, #112, #117, #121, #123, #124, #126, #127, #128, #130, #131, #133, #134, #135, #136, #137, #139, #141, #143, #144, #147, #148, #150, #151, #152, #153, #154, #155
+**Outstanding:** #55, #56, #57, #58, #59, #60, #61, #62, #64, #65, #66, #67, #68, #69, #70, #71, #72, #73, #74, #75, #76, #77, #78, #79, #98, #104, #106, #107, #111, #112, #117, #121, #123, #124, #126, #127, #130, #133, #134, #135, #136, #139, #141, #143, #144, #147, #148, #150, #153, #154, #155
 
 **Fixed on 2026-04-30 (with regression tests where reasonable):**
 - **#80** — `Net::shutdown` now routes through `EventBus::shutdown_via_ref(&self)`, an idempotent reference-based shutdown that runs regardless of outstanding `Arc<EventBus>` clones. Tests: `sdk/tests/shutdown_regression.rs::{shutdown_runs_even_with_outstanding_event_stream, shutdown_via_ref_is_idempotent}`.
@@ -80,7 +80,7 @@ Extended scope (#121 onward): a fourth multi-agent sweep covered the subtrees ex
 - **#149** — `SubprotocolManifest::from_registry` now sorts entries by `id` ascending so `to_bytes()` is deterministic across runs and builds. Pre-fix `registry.list()` walked a `DashMap` whose iteration order is non-deterministic, producing different byte sequences for identical content. Today the manifest is unsigned and not used in any digest dedup (so the non-determinism was dormant), but any future signed-manifest scheme or "same manifest? skip re-negotiation" optimisation downstream would silently break without this sort. Tests: `subprotocol::negotiation::tests::{from_registry_produces_deterministic_byte_output, from_registry_returns_entries_sorted_by_id}`.
 - **#129** — `EntityLog::prune_through(seq)` now only advances `snapshot_seq` when at least one event was actually pruned (`last_pruned.is_some()`). Pre-fix the marker was bumped unconditionally — calling `prune_through` on an empty log (or with `seq` below the first event's sequence) advanced `snapshot_seq` while `base_link.sequence` stayed put, producing a permanent desync where `head_seq().max(snapshot_seq())` returned a value the next append couldn't agree with. Callers that need to install an externally-coordinated snapshot anchor on an empty log should use `from_snapshot` instead. Tests: `state::log::tests::{prune_through_on_empty_log_does_not_advance_snapshot_seq, prune_through_below_first_event_does_not_advance_snapshot_seq, prune_through_advances_snapshot_seq_when_events_pruned}`.
 
-**Refuted on verification:** #96 (`read_timestamps` torn-tail alignment — alignment is preserved by construction, see entry).
+**Refuted on verification:** #96 (`read_timestamps` torn-tail alignment — alignment is preserved by construction, see entry); #137 (`Sampler::should_sample` `RateLimited` over-sample — the entire arm runs inside `last_reset.lock()`, so the check+increment is already serialized, see entry).
 
 **Verified (read end-to-end on 2026-04-30):** #80, #81, #82, #83, #85, #86, #87, #88, #89, #90, #91, #92, #93, #94, #95, #110, #114, #122, #125, #129, #132, #138, #146, #149. #84 was found to be **mis-located** — the cited code is correct; the bug is at the upstream caller `mesh.rs:3000-3008` (see entry).
 
@@ -646,8 +646,10 @@ Doc on `LiveOnly` says "use when `State` is rehydrated from an external snapshot
 
 When the store is at capacity, `cleanup_expired` is called inline (synchronous, scans entire `DashMap`). Two threads inserting at exactly capacity will both call `cleanup_expired` in parallel, then both pass the recheck (line 825), and both insert (line 842). Worse, between the recheck and the insert, a third thread can insert. There is no atomic "insert-if-under-cap" — under sustained load the map grows unbounded past `max_traces`. Combined with the W3C `from_traceparent` resetting `hop_count: 1` and `max_hops: None` (line 654), a peer storming with synthetic traces via `continue_context` defeats both the trace-loop guard and the cap. Fix: serialize via `DashMap::entry` with a coordinated counter, or use a single coarse insert-lock when at the cap.
 
-### 137. `Sampler::should_sample` `RateLimited` over-samples by `num_threads-1` per second under contention
+### 137. `Sampler::should_sample` `RateLimited` over-samples by `num_threads-1` per second under contention — **[REFUTED 2026-04-30]**
 **File:** `adapter/net/behavior/context.rs:710-722`
+
+**Refutation:** the audit's claim that "the check + fetch_add is not atomic" mis-reads the code. The `RateLimited` arm acquires `self.last_reset.lock()` at the top of the block; the `MutexGuard` is bound to a `let mut last_reset` that lives until the end of the enclosing scope, so the entire arm — including the `count.fetch_add(1, ...)` and the subsequent comparison — runs inside the critical section. The check+increment IS serialized. Even setting the Mutex aside, `fetch_add` returns a unique post-increment value per thread, so the comparison `current < max_per_second` uses a unique value per caller and at most `max_per_second` threads can observe `current < max` per window. No code change.
 
 In the `RateLimited` arm: each thread reads `count.load`, compares to `max_per_second`, then `fetch_add`s. The check + fetch_add is not atomic — N concurrent threads can all observe `current < max_per_second` and all increment, producing `max + N - 1` samples in a window. Not catastrophic, but the documented invariant is violated, and a downstream consumer relying on the rate-limit to bound sampler-driven write traffic over the wire (e.g., trace-emit telemetry) can see the rate burst by `num_threads × max_per_second`. Fix: use a `compare_exchange` loop or `fetch_update` to atomically gate on the cap.
 
