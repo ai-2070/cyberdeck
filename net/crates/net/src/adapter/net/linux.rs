@@ -270,6 +270,7 @@ impl BatchedTransport {
     }
 
     /// Receive multiple packets, blocking until at least one is available.
+    #[allow(dead_code)]
     pub fn recv_batch_blocking(
         &mut self,
         max_count: usize,
