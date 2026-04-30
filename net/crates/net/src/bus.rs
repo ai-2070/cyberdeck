@@ -835,14 +835,43 @@ impl EventBus {
         // increment) or completes its single non-blocking push and
         // decrements. Both paths take constant time; the total
         // wait is O(producer threads).
+        //
+        // BUG #59: pre-fix this loop's documentation in `shutdown`
+        // promised "every observed in-flight ingest completes
+        // before the final sweep" — that's true under normal
+        // conditions, but the 5-second deadline below forces the
+        // gate open even when producers are still in their push
+        // window. A producer that has incremented
+        // `in_flight_ingests` (and so observed `shutdown=false`)
+        // but whose push is delayed past the deadline (heavy
+        // contention, debugger hit, etc.) will complete its push
+        // AFTER the final sweep — its event lands in the ring
+        // buffer and is never read. The deadline exists so a
+        // stuck producer can't deadlock shutdown indefinitely;
+        // the trade-off is documented data loss past the 5s
+        // window, surfaced via the `events_dropped` stat (so the
+        // loss is observable to operators) and the `WARN` log
+        // below (so it's diagnosable). The "no stranding"
+        // promise on the happy path stands; the deadline path is
+        // the documented escape hatch.
         let in_flight_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while self.in_flight_ingests.load(AtomicOrdering::SeqCst) > 0 {
             if std::time::Instant::now() >= in_flight_deadline {
+                let stranded = self.in_flight_ingests.load(AtomicOrdering::SeqCst);
                 tracing::warn!(
-                    in_flight = self.in_flight_ingests.load(AtomicOrdering::SeqCst),
-                    "shutdown timed out waiting for in-flight ingests; \
-                     proceeding with potential event loss"
+                    in_flight = stranded,
+                    "shutdown timed out waiting for in-flight ingests after 5s; \
+                     proceeding — up to {} events may strand in the ring buffer \
+                     past final drain (BUG #59 documented data-loss path)",
+                    stranded,
                 );
+                // Surface the stranded count via `events_dropped`
+                // so SDK consumers reading `bus.stats()` see the
+                // loss, matching the bus's at-least-once-or-
+                // surfaced-as-dropped contract.
+                self.stats
+                    .events_dropped
+                    .fetch_add(stranded as u64, AtomicOrdering::Relaxed);
                 break;
             }
             tokio::task::yield_now().await;

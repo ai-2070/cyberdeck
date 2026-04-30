@@ -34,9 +34,15 @@ impl RedexFold<MemoriesState> for MemoriesFold {
             .ok_or_else(|| RedexError::Decode("bad EventMeta prefix".into()))?;
         let tail = &ev.payload[EVENT_META_SIZE..];
 
-        // Verify the checksum stamped at ingest against the tail we
-        // received from RedEX. Catches disk corruption, tampered
-        // on-disk files, and truncated tails.
+        // Verify the corruption-detection checksum stamped at
+        // ingest against the tail we received from RedEX.
+        //
+        // BUG #135: this catches accidental disk corruption
+        // (stray bit flips, truncated writes, mis-aligned
+        // reads). It is NOT a tamper detector — the 32-bit
+        // unkeyed xxh3 truncation is recomputable by any party
+        // that can write to the underlying file. See
+        // `compute_checksum`'s doc for the full scope.
         let expected = compute_checksum(tail);
         if meta.checksum != expected {
             return Err(RedexError::Decode(format!(

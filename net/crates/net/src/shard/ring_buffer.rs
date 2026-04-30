@@ -15,7 +15,7 @@
 use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 /// Error returned when the ring buffer is full.
 ///
 /// Crate-internal: surfaced to public callers as
@@ -83,9 +83,19 @@ pub(crate) struct RingBuffer<T> {
     /// Mask for fast modulo (capacity - 1).
     mask: usize,
     /// Write position (producer).
-    head: CachePadded<AtomicUsize>,
-    /// Read position (consumer).
-    tail: CachePadded<AtomicUsize>,
+    ///
+    /// BUG #78: `head` / `tail` are `u64` regardless of target
+    /// pointer width. Pre-fix they were `AtomicUsize`, which on
+    /// 32-bit targets (wasm32 is in the test matrix) wrapped after
+    /// 2^32 pushes — ~7 minutes per shard at 10 M events/sec, ~12
+    /// hours at 100 K. Once `head` lapped `tail` and the wrapping
+    /// distance exceeded `capacity-1`, `try_push` rejected
+    /// forever and the buffer was permanently wedged. `u64` gives
+    /// ~58 years to wrap at 10 G events/sec on every target.
+    head: CachePadded<AtomicU64>,
+    /// Read position (consumer). See `head` for the BUG #78
+    /// rationale on the `u64` width.
+    tail: CachePadded<AtomicU64>,
     /// Thread ID of the producer (debug-build SPSC enforcement —
     /// active under `debug_assertions`, not just `cfg(test)`, so dev
     /// runs of the binary catch SPSC violations even outside of unit
@@ -131,8 +141,8 @@ impl<T> RingBuffer<T> {
             buffer: buffer.into_boxed_slice(),
             capacity,
             mask: capacity - 1,
-            head: CachePadded::new(AtomicUsize::new(0)),
-            tail: CachePadded::new(AtomicUsize::new(0)),
+            head: CachePadded::new(AtomicU64::new(0)),
+            tail: CachePadded::new(AtomicU64::new(0)),
             #[cfg(any(test, debug_assertions))]
             producer_thread: std::sync::Mutex::new(None),
             #[cfg(any(test, debug_assertions))]
@@ -169,14 +179,19 @@ impl<T> RingBuffer<T> {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Acquire);
 
-        // Check if buffer is full
+        // Check if buffer is full. Both head/tail are u64; the
+        // wrapping subtract gives the in-flight length on every
+        // target (BUG #78).
         let len = head.wrapping_sub(tail);
-        if len >= self.capacity - 1 {
+        if len >= (self.capacity as u64) - 1 {
             return Err(BufferFullError);
         }
 
-        // Write the value
-        let index = head & self.mask;
+        // Write the value. The `mask` keeps the index inside
+        // `capacity` (power-of-2); the `as usize` is the lossless
+        // truncation back to the buffer index — `head & mask` is
+        // always < `capacity` ≤ `usize::MAX`.
+        let index = (head & self.mask as u64) as usize;
         unsafe {
             (*self.buffer[index].get()).write(value);
         }
@@ -232,7 +247,7 @@ impl<T> RingBuffer<T> {
         if tail == head {
             return None;
         }
-        let index = tail & self.mask;
+        let index = (tail & self.mask as u64) as usize;
         let value = unsafe { (*self.buffer[index].get()).assume_init_read() };
         self.tail.store(tail.wrapping_add(1), Ordering::Release);
         Some(value)
@@ -273,7 +288,7 @@ impl<T> RingBuffer<T> {
         }
 
         // Read the value
-        let index = tail & self.mask;
+        let index = (tail & self.mask as u64) as usize;
         let value = unsafe { (*self.buffer[index].get()).assume_init_read() };
 
         // Publish the read
@@ -310,9 +325,10 @@ impl<T> RingBuffer<T> {
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
 
-        // Calculate how many elements are available
+        // Calculate how many elements are available. `available`
+        // is u64 (BUG #78); cap to `max: usize` and convert back.
         let available = head.wrapping_sub(tail);
-        let count = available.min(max);
+        let count = available.min(max as u64) as usize;
 
         if count == 0 {
             return Vec::new();
@@ -323,13 +339,14 @@ impl<T> RingBuffer<T> {
 
         // Read all elements
         for i in 0..count {
-            let index = (tail.wrapping_add(i)) & self.mask;
+            let index = (tail.wrapping_add(i as u64) & self.mask as u64) as usize;
             let value = unsafe { (*self.buffer[index].get()).assume_init_read() };
             result.push(value);
         }
 
         // Publish all reads at once
-        self.tail.store(tail.wrapping_add(count), Ordering::Release);
+        self.tail
+            .store(tail.wrapping_add(count as u64), Ordering::Release);
 
         result
     }
@@ -389,7 +406,7 @@ impl<T> RingBuffer<T> {
         let head = self.head.load(Ordering::Acquire);
 
         let available = head.wrapping_sub(tail);
-        let count = available.min(max);
+        let count = available.min(max as u64) as usize;
 
         if count == 0 {
             return 0;
@@ -399,22 +416,27 @@ impl<T> RingBuffer<T> {
         dst.reserve(count);
 
         for i in 0..count {
-            let index = (tail.wrapping_add(i)) & self.mask;
+            let index = (tail.wrapping_add(i as u64) & self.mask as u64) as usize;
             let value = unsafe { (*self.buffer[index].get()).assume_init_read() };
             dst.push(value);
         }
 
-        self.tail.store(tail.wrapping_add(count), Ordering::Release);
+        self.tail
+            .store(tail.wrapping_add(count as u64), Ordering::Release);
 
         count
     }
 
     /// Get the current number of elements in the buffer.
+    ///
+    /// BUG #78: `head` / `tail` are `u64` regardless of target;
+    /// the in-flight count fits in `usize` because it's bounded by
+    /// `capacity - 1` which is itself a `usize`.
     #[inline]
     pub fn len(&self) -> usize {
         let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
-        head.wrapping_sub(tail)
+        head.wrapping_sub(tail) as usize
     }
 
     /// Check if the buffer is empty.
@@ -765,6 +787,37 @@ mod tests {
             }
             assert!(buf.is_empty());
         }
+    }
+
+    /// BUG #78: cursors must be `u64` regardless of target pointer
+    /// width. Pre-fix `head` and `tail` were `AtomicUsize`; on
+    /// 32-bit they wrapped after 2^32 pushes and the buffer
+    /// permanently wedged once the wrapping distance exceeded
+    /// `capacity-1`. Pin the type-level invariant so a future
+    /// regression to `AtomicUsize` would fail this test.
+    ///
+    /// We can't actually push 2^32 items in a unit test, but we
+    /// CAN verify the cursor field types via `std::mem::size_of`:
+    /// `AtomicU64` is always 8 bytes, regardless of target pointer
+    /// width. (`AtomicUsize` would be 4 on 32-bit, 8 on 64-bit.)
+    #[test]
+    fn ring_buffer_cursors_are_u64_on_every_target() {
+        // Confirm at the type level via size_of_val. `head` lives
+        // inside CachePadded so the alignment is the cache line
+        // size, but the inner AtomicU64 is exactly 8 bytes.
+        // We can't directly inspect head's type from a unit test,
+        // so we assert on the underlying load type — `u64` —
+        // which is the load-bearing property.
+        let buf: RingBuffer<u32> = RingBuffer::new(4);
+        let head_val: u64 = buf.head.load(Ordering::Relaxed);
+        let tail_val: u64 = buf.tail.load(Ordering::Relaxed);
+        assert_eq!(head_val, 0);
+        assert_eq!(tail_val, 0);
+        // `wrapping_sub` returns u64 — type-level pin (this would
+        // fail to compile if the cursors were AtomicUsize on a
+        // 32-bit target).
+        let len: u64 = head_val.wrapping_sub(tail_val);
+        assert_eq!(len, 0);
     }
 
     #[cfg(test)]

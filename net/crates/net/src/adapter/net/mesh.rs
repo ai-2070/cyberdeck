@@ -7621,75 +7621,15 @@ mod heartbeat_aead_tests {
         assert_eq!(router.routing_table().lookup(peer_id), Some(fresh));
     }
 
-    /// Regression: the heartbeat sender must use the same pool
-    /// as the data path (`thread_local_pool`), not a separate one
-    /// (`packet_pool`). Each pool owns its own `tx_counter`; the
-    /// receiver verifies all packets against a single `rx_cipher`
-    /// with a single replay window, so two senders with separate
-    /// counters will collide on counter=0 (etc.) and the receiver
-    /// will replay-reject one of them.
-    ///
-    /// This pins the invariant by:
-    ///   1. Acquiring two heartbeats from `packet_pool`.
-    ///   2. Acquiring one packet from `thread_local_pool`
-    ///      (mirroring the data path).
-    ///   3. Verifying that the packet_pool heartbeats and the
-    ///      thread_local_pool packet have OVERLAPPING counter
-    ///      values — i.e., they're independent counters.
-    ///
-    /// If a future change routes heartbeats through `packet_pool`,
-    /// this test will demonstrate the counter overlap that breaks
-    /// the receiver. The production path uses `thread_local_pool`
-    /// for both, which keeps counters monotonically increasing
-    /// across heartbeats AND data.
-    #[test]
-    fn packet_pool_and_thread_local_pool_have_independent_counters() {
-        let (init_keys, _resp_keys) = make_session_keys();
-        let session = NetSession::new(init_keys, "127.0.0.1:5001".parse().unwrap(), 4, false);
-
-        // Acquire from packet_pool. PooledBuilder emits its first
-        // packet at the pool's current counter (starts at 0).
-        let h1 = {
-            let mut pooled = session.packet_pool().get();
-            pooled.build_heartbeat()
-        };
-        // Pull the counter out of the wire bytes (NetHeader nonce
-        // bytes 16..24 carry the LE-encoded counter — see
-        // `pool.rs:215`).
-        let h1_counter = u64::from_le_bytes(h1[16..24].try_into().unwrap());
-
-        let h2 = {
-            let mut pooled = session.packet_pool().get();
-            pooled.build_heartbeat()
-        };
-        let h2_counter = u64::from_le_bytes(h2[16..24].try_into().unwrap());
-
-        // Now from thread_local_pool — the data path's pool.
-        let d1 = {
-            let mut pooled = session.thread_local_pool().get();
-            pooled.build_heartbeat()
-        };
-        let d1_counter = u64::from_le_bytes(d1[16..24].try_into().unwrap());
-
-        // packet_pool produced counters 0 and 1.
-        // thread_local_pool produced counter 0 — overlapping with
-        // packet_pool's first heartbeat. THIS is the bug: a single
-        // session sees two streams of packets with overlapping
-        // counters. The receiver's `rx_cipher.update_rx_counter`
-        // would accept the first counter=0 and reject the second.
-        assert_ne!(
-            h1_counter, h2_counter,
-            "successive packet_pool builds must increment"
-        );
-        assert!(
-            h1_counter == d1_counter || h2_counter == d1_counter,
-            "packet_pool and thread_local_pool MUST have overlapping \
-             counters — they're independent. h1={h1_counter} h2={h2_counter} d1={d1_counter}. \
-             If this assertion ever fails because the pools share a \
-             counter, the production heartbeat sender can be moved \
-             back to packet_pool safely."
-        );
-    }
+    /// BUG #106: removed test
+    /// `packet_pool_and_thread_local_pool_have_independent_counters`.
+    /// The pre-fix test pinned the BUG state — that the two pools
+    /// had independent counters, the very condition that produced
+    /// the cross-pool nonce-reuse hazard. Since the BUG #106 fix
+    /// REMOVED the `packet_pool` field and getter from
+    /// `NetSession`, the test no longer compiles and is no longer
+    /// meaningful: the data path uses `thread_local_pool`
+    /// exclusively for tx AEAD operations.
 
     /// Regression for BUG_AUDIT_2026_04_30_CORE.md #97: the
     /// production heartbeat path must (a) build with the

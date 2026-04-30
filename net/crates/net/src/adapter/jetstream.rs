@@ -438,9 +438,36 @@ impl Adapter for JetStreamAdapter {
         // Track every sequence we observe (regardless of deserialize
         // outcome) so the cursor can advance past corrupt entries
         // instead of stalling on them.
+        //
+        // BUG #60: pre-fix the loop's `current_seq > max_seq` short-
+        // circuit fired against the `max_seq` sampled ONCE before
+        // the loop, so a producer that wrote new messages during
+        // the read was silently truncated — `has_more=false` came
+        // back even though the stream tail had more events. The
+        // consumer then slept thinking the stream was drained and
+        // only caught the new tail on the next poll cycle.
+        // `max_seq_re_checked` tracks whether we've already paid
+        // the one bounded re-read, so a relentless producer can't
+        // spin us forever in a re-info loop.
         let mut last_seen_seq: Option<u64> = None;
+        let mut max_seq = max_seq;
+        let mut max_seq_re_checked = false;
         while events.len() < fetch_limit {
             if current_seq > max_seq {
+                // BUG #60: before declaring drain, re-read
+                // `info()` once to catch concurrent writes that
+                // appeared after our initial sample. One bounded
+                // re-read per poll preserves the loop's O(span)
+                // worst-case while closing the truncation hole.
+                if !max_seq_re_checked {
+                    max_seq_re_checked = true;
+                    if let Ok(info) = stream.info().await {
+                        if info.state.last_sequence > max_seq {
+                            max_seq = info.state.last_sequence;
+                            continue;
+                        }
+                    }
+                }
                 // Searched too far without finding enough events
                 break;
             }

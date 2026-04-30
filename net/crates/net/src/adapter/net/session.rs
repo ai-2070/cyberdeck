@@ -15,7 +15,10 @@ use std::time::Instant;
 use crate::event::StoredEvent;
 
 use super::crypto::{PacketCipher, SessionKeys};
-use super::pool::{SharedLocalPool, SharedPacketPool};
+// BUG #106: `SharedPacketPool` import dropped — the field has
+// been removed from `NetSession`. Only `SharedLocalPool` is
+// used now (single TX-side AEAD source).
+use super::pool::SharedLocalPool;
 use super::reliability::{create_reliability_mode, ReliabilityMode};
 use super::stream::DEFAULT_STREAM_WINDOW_BYTES;
 
@@ -38,25 +41,42 @@ pub struct NetSession {
     session_id: u64,
     /// Remote peer address
     peer_addr: SocketAddr,
-    /// TX cipher (ChaCha20-Poly1305 with counter-based nonces)
-    tx_cipher: PacketCipher,
     /// RX cipher (ChaCha20-Poly1305 with counter-based nonces)
     rx_cipher: PacketCipher,
-    /// Raw TX key. Retained alongside `tx_cipher` so that callers
-    /// outside the cipher hot path (notably `mesh.rs`'s heartbeat
-    /// timer) can construct `PacketBuilder` instances bound to the
-    /// session's actual key. BUG #97 was caused by callers
-    /// substituting `&[0u8; 32]` here, producing heartbeats that
-    /// the receiver's AEAD verify (BUG #85 fix) correctly
-    /// rejected.
+    /// Raw TX key. Used by callers (notably `mesh.rs`'s heartbeat
+    /// timer) that need to construct `PacketBuilder` instances
+    /// bound to the session's actual key. BUG #97 was caused by
+    /// callers substituting `&[0u8; 32]` here, producing
+    /// heartbeats that the receiver's AEAD verify (BUG #85 fix)
+    /// correctly rejected.
+    ///
+    /// BUG #106: pre-fix this struct also held a separate
+    /// `tx_cipher: PacketCipher` and `packet_pool:
+    /// SharedPacketPool`, both constructed with the same TX key
+    /// as `thread_local_pool` but with INDEPENDENT
+    /// `Arc<AtomicU64>` counters. Each pool's internal regression
+    /// tests (`pool.rs:952, 992`) prevented within-pool counter
+    /// reuse, but cross-pool reuse was guaranteed by construction:
+    /// the moment a caller obtained `session.packet_pool()` or
+    /// `session.tx_cipher()` and encrypted a packet, ChaCha20-
+    /// Poly1305 nonce reuse against the corresponding counter
+    /// slot in `thread_local_pool` was assured (same key + same
+    /// nonce), giving an attacker XOR access to the plaintext.
+    /// In practice the issue was dormant — the only caller of
+    /// `packet_pool()` was a regression test, and `tx_cipher()`
+    /// had no callers — but the API surface invited future
+    /// misuse. Both fields and getters have been removed; the
+    /// data path uses `thread_local_pool` exclusively for tx
+    /// AEAD operations.
     tx_key: [u8; 32],
     /// Per-stream state
     streams: DashMap<u64, StreamState>,
     /// Last activity timestamp (for session timeout)
     last_activity: AtomicU64,
-    /// Packet pool for zero-allocation building
-    packet_pool: SharedPacketPool,
-    /// Thread-local pool for zero-contention hot path
+    /// Thread-local pool for zero-contention hot path. The single
+    /// authoritative source of TX-side AEAD encryptions for this
+    /// session — see the `tx_key` doc-comment for BUG #106
+    /// rationale.
     thread_local_pool: SharedLocalPool,
     /// Default reliability mode for new streams
     default_reliable: bool,
@@ -101,10 +121,14 @@ impl NetSession {
         pool_size: usize,
         default_reliable: bool,
     ) -> Self {
-        let tx_cipher = PacketCipher::new(&keys.tx_key, keys.session_id);
         let rx_cipher = PacketCipher::new(&keys.rx_key, keys.session_id);
 
-        let packet_pool = super::pool::shared_pool(pool_size, &keys.tx_key, keys.session_id);
+        // BUG #106: only `thread_local_pool` is constructed with
+        // the TX key. Pre-fix we also constructed `tx_cipher` and
+        // `packet_pool` with the same key but independent counters
+        // — see the `tx_key` doc-comment for the cross-pool nonce-
+        // reuse hazard. The data path uses `thread_local_pool`
+        // exclusively.
         let thread_local_pool =
             super::pool::shared_local_pool(pool_size, &keys.tx_key, keys.session_id);
 
@@ -112,12 +136,10 @@ impl NetSession {
         Self {
             session_id: keys.session_id,
             peer_addr,
-            tx_cipher,
             rx_cipher,
             tx_key,
             streams: DashMap::new(),
             last_activity: AtomicU64::new(current_timestamp()),
-            packet_pool,
             thread_local_pool,
             default_reliable,
             active: AtomicBool::new(true),
@@ -158,12 +180,6 @@ impl NetSession {
         self.peer_addr
     }
 
-    /// Get the TX cipher
-    #[inline]
-    pub fn tx_cipher(&self) -> &PacketCipher {
-        &self.tx_cipher
-    }
-
     /// Get the raw TX key. Used by callers (such as the mesh
     /// heartbeat timer) that need to construct ad-hoc
     /// `PacketBuilder` instances bound to this session's key.
@@ -171,6 +187,10 @@ impl NetSession {
     /// `&[0u8; 32]` here, producing AEAD-tagged heartbeats whose
     /// tag the receiver could never verify against the session's
     /// actual key.
+    ///
+    /// BUG #106: the previous `tx_cipher()` getter has been
+    /// removed — see `tx_key` field doc for the cross-pool
+    /// nonce-reuse rationale.
     #[inline]
     pub fn tx_key(&self) -> &[u8; 32] {
         &self.tx_key
@@ -595,12 +615,6 @@ impl NetSession {
         stream_id: u64,
     ) -> Option<dashmap::mapref::one::Ref<'_, u64, StreamState>> {
         self.streams.get(&stream_id)
-    }
-
-    /// Get the packet pool
-    #[inline]
-    pub fn packet_pool(&self) -> &SharedPacketPool {
-        &self.packet_pool
     }
 
     /// Get the thread-local pool for zero-contention packet building
