@@ -704,13 +704,28 @@ impl DiffEngine {
             DiffOp::UpdateRateLimit(rpm) => {
                 caps.limits.rate_limit_rpm = *rpm;
             }
-            DiffOp::SetField { path: _, value: _ } => {
-                // Custom field operations would require JSON manipulation
-                // For now, this is a no-op placeholder
-            }
-            DiffOp::UnsetField { path: _ } => {
-                // Custom field operations would require JSON manipulation
-                // For now, this is a no-op placeholder
+            DiffOp::SetField { path, .. } | DiffOp::UnsetField { path } => {
+                // BUG #151: SetField/UnsetField are unimplemented
+                // (the JSON-path primitive that would back them
+                // hasn't been built). Pre-fix `apply_op` returned
+                // `Ok(())` even under `strict=true`, so a peer
+                // shipping a `SetField{path: "tags", value: [...]}`
+                // got `Ok` from `apply` but nothing changed —
+                // sender's view diverged from receiver's silently
+                // and `validate_chain` couldn't catch it. Now
+                // strict=true surfaces the gap as
+                // `DiffError::NotApplicable(path)`; non-strict
+                // continues to no-op (preserving the historic
+                // best-effort behavior for callers that don't
+                // care). When the JSON-path primitive lands, this
+                // arm should switch to a real mutation and drop
+                // the strict-mode error.
+                if strict {
+                    return Err(DiffError::NotApplicable(format!(
+                        "SetField/UnsetField unimplemented (path: {})",
+                        path
+                    )));
+                }
             }
         }
         Ok(())
@@ -719,9 +734,32 @@ impl DiffEngine {
     /// Validate that a chain of diffs is consistent
     ///
     /// Checks that version numbers are sequential and base versions match.
+    ///
+    /// BUG #152: pre-fix this function only chained
+    /// `prev.new_version == curr.base_version` between adjacent
+    /// diffs, but did NOT enforce the within-diff invariant
+    /// `new_version > base_version`. A peer could ship
+    /// `base_version=5, new_version=3` (a "rollback while applying
+    /// ops") and validation accepted it — combined with
+    /// historical [`Self::apply`] (which ignored versions
+    /// entirely; see BUG #125), a receiver advanced state forward
+    /// but its tracked version went backward. Now each diff is
+    /// also required to satisfy `curr.new_version >
+    /// curr.base_version`.
     pub fn validate_chain(diffs: &[CapabilityDiff]) -> bool {
         if diffs.is_empty() {
             return true;
+        }
+
+        // BUG #152 within-diff check: every diff must move the
+        // version forward (strictly). A diff with
+        // `new_version <= base_version` is incoherent — there's
+        // nothing to "apply forward" if the version is going
+        // backward or staying put.
+        for diff in diffs {
+            if diff.new_version <= diff.base_version {
+                return false;
+            }
         }
 
         for i in 1..diffs.len() {
@@ -1147,6 +1185,117 @@ mod tests {
             matches!(err, DiffError::VersionMismatch { expected: 10, actual: 5 }),
             "expected VersionMismatch {{ expected: 10, actual: 5 }}, got {:?}",
             err,
+        );
+    }
+
+    // ========================================================================
+    // BUG #151: SetField/UnsetField are silent no-ops despite documentation
+    // ========================================================================
+
+    /// Strict-mode `apply` of a `SetField` diff returns
+    /// `DiffError::NotApplicable` rather than silently returning
+    /// `Ok(())`. Pre-fix the silent-success behavior let a sender
+    /// believe the receiver mutated state (it didn't), so views
+    /// diverged silently and `validate_chain` couldn't catch it.
+    /// Non-strict mode preserves the historic best-effort no-op
+    /// for callers that intentionally tolerate unimplemented
+    /// variants.
+    #[test]
+    fn apply_strict_surfaces_not_applicable_for_set_field() {
+        let caps = sample_capability_set();
+        let diff = CapabilityDiff::new(
+            1,
+            1,
+            2,
+            vec![DiffOp::SetField {
+                path: "custom.foo".into(),
+                value: serde_json::json!("bar"),
+            }],
+        );
+        let err = DiffEngine::apply(&caps, &diff, true)
+            .expect_err("strict apply must surface SetField as NotApplicable");
+        assert!(
+            matches!(err, DiffError::NotApplicable(_)),
+            "expected NotApplicable, got {:?}",
+            err,
+        );
+    }
+
+    #[test]
+    fn apply_strict_surfaces_not_applicable_for_unset_field() {
+        let caps = sample_capability_set();
+        let diff = CapabilityDiff::new(
+            1,
+            1,
+            2,
+            vec![DiffOp::UnsetField {
+                path: "custom.foo".into(),
+            }],
+        );
+        let err = DiffEngine::apply(&caps, &diff, true)
+            .expect_err("strict apply must surface UnsetField as NotApplicable");
+        assert!(matches!(err, DiffError::NotApplicable(_)));
+    }
+
+    #[test]
+    fn apply_non_strict_still_no_ops_set_field() {
+        let caps = sample_capability_set();
+        let diff = CapabilityDiff::new(
+            1,
+            1,
+            2,
+            vec![DiffOp::SetField {
+                path: "custom.foo".into(),
+                value: serde_json::json!("bar"),
+            }],
+        );
+        let result = DiffEngine::apply(&caps, &diff, false)
+            .expect("non-strict apply preserves the historic no-op");
+        // No mutation expected — caps unchanged.
+        assert_eq!(result.tags, caps.tags);
+        assert_eq!(result.hardware, caps.hardware);
+    }
+
+    // ========================================================================
+    // BUG #152: validate_chain must reject diffs with new_version <= base_version
+    // ========================================================================
+
+    /// A diff with `base_version=5, new_version=3` is rejected by
+    /// `validate_chain`. Pre-fix it was accepted because the chain
+    /// loop only checked adjacency (`prev.new_version ==
+    /// curr.base_version`), not the within-diff progression.
+    #[test]
+    fn validate_chain_rejects_within_diff_version_regression() {
+        let mut backwards = CapabilityDiff::new(1, 5, 3, vec![DiffOp::AddTag("x".into())]);
+        backwards.timestamp_ns = 1_000_000;
+        assert!(
+            !DiffEngine::validate_chain(&[backwards]),
+            "validate_chain must reject new_version < base_version (BUG #152)",
+        );
+    }
+
+    /// Equal versions (`base_version == new_version`) are also
+    /// rejected — there's nothing to apply forward.
+    #[test]
+    fn validate_chain_rejects_equal_base_and_new_version() {
+        let stalled = CapabilityDiff::new(1, 5, 5, vec![DiffOp::AddTag("x".into())]);
+        assert!(
+            !DiffEngine::validate_chain(&[stalled]),
+            "validate_chain must reject new_version == base_version",
+        );
+    }
+
+    /// A multi-diff chain where the last diff individually
+    /// regresses must be rejected even when the inter-diff chain
+    /// would otherwise check out.
+    #[test]
+    fn validate_chain_rejects_chain_with_one_regressing_diff() {
+        let d1 = CapabilityDiff::new(1, 1, 2, vec![DiffOp::AddTag("a".into())]);
+        let mut d2 = CapabilityDiff::new(1, 2, 1, vec![DiffOp::AddTag("b".into())]); // regresses
+        d2.timestamp_ns = d1.timestamp_ns.saturating_add(1000);
+        assert!(
+            !DiffEngine::validate_chain(&[d1, d2]),
+            "chain containing a regressing diff must be rejected",
         );
     }
 

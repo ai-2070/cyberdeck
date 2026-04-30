@@ -37,7 +37,7 @@ pub struct ManifestEntry {
 impl SubprotocolManifest {
     /// Build a manifest from the local registry.
     ///
-    /// BUG #149: entries are now sorted by `id` so the wire bytes
+    /// BUG #149: entries are sorted by `id` so the wire bytes
     /// are deterministic across runs and builds. Pre-fix
     /// `registry.list()` walked a `DashMap` whose iteration order
     /// is non-deterministic, producing different `to_bytes()`
@@ -48,10 +48,26 @@ impl SubprotocolManifest {
     /// "exchanged during session setup," a surface that typically
     /// ends up signed once a security model is added; sort by id
     /// preempts that breakage.
+    ///
+    /// BUG #131: forwarding-only descriptors (`handler_present ==
+    /// false`) are now filtered out before serialization. Pre-fix
+    /// the manifest advertised every registered descriptor, but the
+    /// 6-byte wire format has no `handler_present` flag and
+    /// `from_bytes` reconstructs every entry as
+    /// `handler_present: true`. After `negotiate()`, the receiver
+    /// then believed the sender had a local handler for every
+    /// id in the manifest — scheduling RPCs to that id would
+    /// silently drop on the sender. The parallel
+    /// `capability_tags()` discovery path already filters by
+    /// `handler_present`; this direct-manifest path now mirrors
+    /// that filter so the two channels agree. Forwarding-only
+    /// peers can still receive opaque-forward traffic; they just
+    /// don't claim to handle it locally.
     pub fn from_registry(registry: &SubprotocolRegistry) -> Self {
         let mut entries: Vec<ManifestEntry> = registry
             .list()
             .into_iter()
+            .filter(|d| d.handler_present)
             .map(|d| ManifestEntry {
                 id: d.id,
                 version: d.version,
@@ -410,5 +426,88 @@ mod tests {
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted, "manifest entries must be sorted by id");
+    }
+
+    // ========================================================================
+    // BUG #131: from_registry must NOT advertise forwarding-only descriptors
+    // ========================================================================
+
+    /// A forwarding-only descriptor (registered via
+    /// `.forwarding_only()`) must not appear in the manifest. Pre-
+    /// fix it was advertised, then `from_bytes` reconstructed it
+    /// with `handler_present: true` (the wire format has no
+    /// handler_present flag), and `negotiate()` marked it
+    /// compatible — but the sender had no local handler so any
+    /// dispatched RPC silently dropped. The parallel
+    /// `capability_tags()` discovery path already filters by
+    /// `handler_present`; this test pins that the manifest path
+    /// agrees.
+    #[test]
+    fn from_registry_excludes_forwarding_only_descriptors() {
+        let reg = SubprotocolRegistry::new();
+        // Register a real handler at 0x0400.
+        reg.register(SubprotocolDescriptor::new(
+            0x0400,
+            "real",
+            SubprotocolVersion::new(1, 0),
+        ));
+        // Register a forwarding-only entry at 0x1000.
+        reg.register(
+            SubprotocolDescriptor::new(0x1000, "forward", SubprotocolVersion::new(1, 0))
+                .forwarding_only(),
+        );
+        // Sanity: registry has both.
+        assert_eq!(reg.list().len(), 2);
+
+        let manifest = SubprotocolManifest::from_registry(&reg);
+        let ids: std::collections::HashSet<u16> =
+            manifest.entries.iter().map(|e| e.id).collect();
+        assert!(
+            ids.contains(&0x0400),
+            "real handler must be advertised",
+        );
+        assert!(
+            !ids.contains(&0x1000),
+            "forwarding-only entry must NOT be advertised (BUG #131)",
+        );
+    }
+
+    /// `capability_tags()` and the manifest path agree on which
+    /// subprotocols the local node actually handles. This is the
+    /// invariant the dispatch layer relies on.
+    #[test]
+    fn from_registry_and_capability_tags_advertise_the_same_subprotocols() {
+        let reg = SubprotocolRegistry::new();
+        reg.register(SubprotocolDescriptor::new(
+            0x0400,
+            "a",
+            SubprotocolVersion::new(1, 0),
+        ));
+        reg.register(SubprotocolDescriptor::new(
+            0x0500,
+            "b",
+            SubprotocolVersion::new(1, 0),
+        ));
+        reg.register(
+            SubprotocolDescriptor::new(0x1000, "c", SubprotocolVersion::new(1, 0))
+                .forwarding_only(),
+        );
+
+        let manifest = SubprotocolManifest::from_registry(&reg);
+        let manifest_ids: std::collections::HashSet<u16> =
+            manifest.entries.iter().map(|e| e.id).collect();
+        let tag_ids: std::collections::HashSet<u16> = reg
+            .capability_tags()
+            .iter()
+            .filter_map(|t| {
+                // capability_tag format: "subprotocol:0x0400"
+                t.strip_prefix("subprotocol:0x")
+                    .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+            })
+            .collect();
+        assert_eq!(
+            manifest_ids, tag_ids,
+            "manifest and capability_tags must advertise the same subprotocols",
+        );
     }
 }

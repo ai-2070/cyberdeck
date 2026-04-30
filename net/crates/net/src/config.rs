@@ -727,10 +727,32 @@ impl ScalingPolicy {
     }
 
     /// Validate the policy.
+    ///
+    /// BUG #63: NaN thresholds slip past raw `<=` / `>` comparisons
+    /// (every comparison against `f64::NaN` returns `false`), so a
+    /// config deserialized from `0.0/0.0`-style arithmetic or an
+    /// unfortunate environment-templated string used to "validate"
+    /// successfully and then sit inert at runtime — `mapper.rs:560`
+    /// does `m.fill_ratio > self.policy.fill_ratio_threshold`,
+    /// which is always `false` against NaN, so the scaler never
+    /// fires (mirror hazard for scale-down). The pre-fix range
+    /// checks below were necessary but not sufficient; the new
+    /// `is_finite()` guards reject NaN and ±∞ explicitly before
+    /// the range check runs.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if !self.fill_ratio_threshold.is_finite() {
+            return Err(ConfigError::InvalidValue(
+                "fill_ratio_threshold must be finite (NaN/±inf rejected)".into(),
+            ));
+        }
         if self.fill_ratio_threshold <= 0.0 || self.fill_ratio_threshold > 1.0 {
             return Err(ConfigError::InvalidValue(
                 "fill_ratio_threshold must be in (0.0, 1.0]".into(),
+            ));
+        }
+        if !self.underutilized_threshold.is_finite() {
+            return Err(ConfigError::InvalidValue(
+                "underutilized_threshold must be finite (NaN/±inf rejected)".into(),
             ));
         }
         if self.underutilized_threshold < 0.0 || self.underutilized_threshold > 1.0 {
@@ -912,6 +934,77 @@ mod tests {
         assert!(policy.validate().is_err());
         policy.fill_ratio_threshold = 1.1;
         assert!(policy.validate().is_err());
+    }
+
+    // ========================================================================
+    // BUG #63: validate() must reject NaN / ±inf thresholds
+    // ========================================================================
+
+    /// `validate()` rejects `f64::NaN` for both threshold fields.
+    /// Pre-fix the raw `<=` / `>` range checks accepted NaN
+    /// because every comparison with NaN returns `false`; the
+    /// "validated" config then sat inert at runtime since the
+    /// scaler's `m.fill_ratio > policy.fill_ratio_threshold` was
+    /// always false against NaN.
+    #[test]
+    fn validate_rejects_nan_fill_ratio_threshold() {
+        let policy = ScalingPolicy {
+            fill_ratio_threshold: f64::NAN,
+            ..Default::default()
+        };
+        assert!(
+            policy.validate().is_err(),
+            "NaN fill_ratio_threshold must be rejected (BUG #63)",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_nan_underutilized_threshold() {
+        let policy = ScalingPolicy {
+            underutilized_threshold: f64::NAN,
+            ..Default::default()
+        };
+        assert!(
+            policy.validate().is_err(),
+            "NaN underutilized_threshold must be rejected (BUG #63)",
+        );
+    }
+
+    /// `validate()` also rejects `±inf` for both threshold fields.
+    /// A config that arithmetic'd to infinity (e.g. divide-by-tiny)
+    /// would have slipped through the `> 1.0` check on positive
+    /// infinity (which IS rejected) but not on a negative infinity
+    /// against the lower bound for `fill_ratio_threshold` —
+    /// `-inf <= 0.0` is true, so it would have been rejected
+    /// already; for `underutilized_threshold` the lower bound
+    /// `-inf < 0.0` is also true. The explicit `is_finite()` guard
+    /// pins these edge cases regardless of which bound check would
+    /// have fired.
+    #[test]
+    fn validate_rejects_infinity_thresholds() {
+        let p1 = ScalingPolicy {
+            fill_ratio_threshold: f64::INFINITY,
+            ..Default::default()
+        };
+        assert!(p1.validate().is_err());
+
+        let p2 = ScalingPolicy {
+            fill_ratio_threshold: f64::NEG_INFINITY,
+            ..Default::default()
+        };
+        assert!(p2.validate().is_err());
+
+        let p3 = ScalingPolicy {
+            underutilized_threshold: f64::INFINITY,
+            ..Default::default()
+        };
+        assert!(p3.validate().is_err());
+
+        let p4 = ScalingPolicy {
+            underutilized_threshold: f64::NEG_INFINITY,
+            ..Default::default()
+        };
+        assert!(p4.validate().is_err());
     }
 
     #[test]
