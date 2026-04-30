@@ -1,0 +1,41 @@
+net/crates/net/src/adapter/net/session.rs
+  36b642b129ab4a5e 45-52,111,117,167-178
+net/crates/net/src/adapter/net/redex/disk.rs
+  36b642b129ab4a5e 190-204,475-478,666-694,719-752,891-914,932-961,1057-1075
+net/crates/net/src/adapter/net/linux.rs
+  36b642b129ab4a5e 213-226,297-305,514-545
+net/crates/net/docs/BUG_AUDIT_2026_04_30_CORE.md
+  36b642b129ab4a5e 26-38
+net/crates/net/src/adapter/net/subnet/gateway.rs
+  36b642b129ab4a5e 111-126,226-231,238-239,249-250,261-262,266-267,280-281,285-286,306-335,345-346,387,400-402
+net/crates/net/src/adapter/net/mod.rs
+  36b642b129ab4a5e 840-859
+net/crates/net/src/bus.rs
+  36b642b129ab4a5e 871-886,892,894-918,1442-1495
+net/crates/net/src/adapter/net/mesh.rs
+  36b642b129ab4a5e 662-690,2397-2415,3217-3243,7184-7298
+net/crates/net/src/adapter/net/redex/file.rs
+  36b642b129ab4a5e 1616-1700
+net/crates/net/src/shard/mod.rs
+  36b642b129ab4a5e 823,871-887
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "e531b617e9ff4ad726d120115eeb524d26664f73",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 6901,
+      "total_deletions": 776,
+      "accepted_lines": 725,
+      "overriden_lines": 0
+    }
+  }
+}
