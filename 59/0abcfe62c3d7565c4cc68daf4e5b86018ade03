@@ -1,0 +1,29 @@
+net/crates/net/docs/BUG_AUDIT_2026_04_30_CORE.md
+  36b642b129ab4a5e 878,881-883
+net/crates/net/tests/integration_cortex_tasks.rs
+  36b642b129ab4a5e 684-776
+net/crates/net/tests/integration_cortex_memories.rs
+  36b642b129ab4a5e 515-604
+net/crates/net/src/adapter/net/cortex/watermark.rs
+  36b642b129ab4a5e 104-145,147-338
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "590abcfe62c3d7565c4cc68daf4e5b86018ade03",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 183,
+      "total_deletions": 0,
+      "accepted_lines": 423,
+      "overriden_lines": 1
+    }
+  }
+}
