@@ -1684,6 +1684,103 @@ mod tests {
         f.close().unwrap();
     }
 
+    /// Phase 3 invariant: an fsync error inside the EveryN worker
+    /// must be logged and recovered from, NOT propagated as a worker
+    /// termination. The failed sync doesn't bump `sync_count`, but
+    /// the worker keeps looping and a subsequent successful sync
+    /// goes through.
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_fsync_policy_every_n_worker_survives_sync_error() {
+        let dir = tmp_persistent_dir("fsync_sync_err");
+        let f = make_persistent_with_policy(
+            "fsync/sync_err",
+            &dir,
+            super::FsyncPolicy::EveryN(1),
+        );
+
+        // Arm a one-shot sync failure. The next `sync()` (whether
+        // worker- or close-driven) returns Err before touching disk.
+        let disk = f.disk().expect("persistent file has disk").clone();
+        disk.arm_next_sync_failure();
+
+        // First append → notify → worker runs sync → injected fail.
+        f.append(b"first").unwrap();
+        // Yield generously so the worker observes the notify, calls
+        // the (failing) sync, logs, and re-parks.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            f.sync_count(),
+            Some(0),
+            "failed sync must NOT bump sync_count"
+        );
+
+        // Second append → fresh notify → worker runs sync → succeeds
+        // (the one-shot fail flag was consumed on the failed call).
+        f.append(b"second").unwrap();
+        let observed = wait_for_sync_count(&f, 1, 50).await;
+        assert_eq!(
+            observed, 1,
+            "worker must recover from prior sync error and process \
+             subsequent notifies normally"
+        );
+
+        f.close().unwrap();
+    }
+
+    /// Phase 3 invariant: after `close()` the EveryN worker must
+    /// observe shutdown and drop its `Arc<DiskSegment>` clone, so
+    /// the segment can eventually be freed once all RedexFile
+    /// handles are dropped. Without this, a closed-but-not-dropped
+    /// file would pin the disk segment until runtime shutdown.
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_close_releases_worker_disk_reference() {
+        let dir = tmp_persistent_dir("fsync_release");
+        let f = make_persistent_with_policy(
+            "fsync/release",
+            &dir,
+            super::FsyncPolicy::EveryN(1),
+        );
+
+        // Snapshot the strong count: file's own ref + worker's clone
+        // + this local clone = 3.
+        let disk = f.disk().expect("persistent file has disk").clone();
+        let initial = Arc::strong_count(&disk);
+        assert_eq!(
+            initial, 3,
+            "expected 3 refs at steady state (file + worker + test); \
+             got {}",
+            initial,
+        );
+
+        f.close().unwrap();
+
+        // close() fires shutdown; the worker observes it on its next
+        // select poll, returns from the spawned future, and its
+        // captured `task_disk` is dropped. Yield until the count
+        // drops or we exhaust the budget.
+        let mut final_count = Arc::strong_count(&disk);
+        for _ in 0..50 {
+            if final_count < initial {
+                break;
+            }
+            tokio::task::yield_now().await;
+            final_count = Arc::strong_count(&disk);
+        }
+
+        assert_eq!(
+            final_count,
+            initial - 1,
+            "worker must drop its DiskSegment Arc clone after \
+             observing shutdown (was {}, now {})",
+            initial,
+            final_count,
+        );
+    }
+
     #[cfg(feature = "redex-disk")]
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_fsync_policy_interval_fires_on_timer() {

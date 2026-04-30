@@ -103,6 +103,12 @@ pub(super) struct DiskSegment {
     /// hazard.
     #[cfg(test)]
     fail_after_dat_write: AtomicBool,
+    /// Test-only injection: when set, the next `sync()` returns
+    /// `RedexError::Io` before touching any file. Used to verify
+    /// the EveryN background worker logs and continues rather than
+    /// terminating on a sync error.
+    #[cfg(test)]
+    fail_next_sync: AtomicBool,
     /// Test-only counter: cumulative successful `sync()` calls —
     /// close-time, append-driven (EveryN), or external
     /// (Interval / explicit). Lets policy tests assert the observed
@@ -350,6 +356,8 @@ impl DiskSegment {
                 fail_next_append: AtomicBool::new(false),
                 #[cfg(test)]
                 fail_after_dat_write: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_next_sync: AtomicBool::new(false),
                 #[cfg(test)]
                 sync_count: AtomicU64::new(0),
             },
@@ -697,6 +705,10 @@ impl DiskSegment {
     /// than the dat, which the torn-tail truncation logic on reopen
     /// already handles correctly.
     pub(super) fn sync(&self) -> Result<(), RedexError> {
+        #[cfg(test)]
+        if self.fail_next_sync.swap(false, Ordering::AcqRel) {
+            return Err(RedexError::Io("test-injected sync failure".into()));
+        }
         self.dat_file.lock().sync_all().map_err(RedexError::io)?;
         self.idx_file.lock().sync_all().map_err(RedexError::io)?;
         // The ts sidecar is fsynced last — same dat-before-idx
@@ -708,6 +720,15 @@ impl DiskSegment {
         #[cfg(test)]
         self.sync_count.fetch_add(1, Ordering::AcqRel);
         Ok(())
+    }
+
+    /// Test-only: arm a one-shot failure on the next `sync()` call.
+    /// Used to verify the EveryN background worker logs and continues
+    /// rather than terminating on a sync error. The flag is consumed
+    /// on the next `sync()` (success or failure clears it).
+    #[cfg(test)]
+    pub(super) fn arm_next_sync_failure(&self) {
+        self.fail_next_sync.store(true, Ordering::Release);
     }
 
     /// Compact the on-disk segment to the surviving in-memory
