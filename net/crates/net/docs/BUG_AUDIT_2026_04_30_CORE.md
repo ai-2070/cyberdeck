@@ -31,7 +31,7 @@ Extended scope (#121 onward): a fourth multi-agent sweep covered the subtrees ex
 
 ## Status (running tally)
 
-**Outstanding:** #56, #57, #104, #130, #148, #153, #154
+**Outstanding (deferred — broader-than-audit-pass changes):** #56, #57 (cross-process retry duplicates — JetStream/Redis at-least-once semantics, require persistent nonce / server-side dedup state), #104 (local-source migration state mutation across cutover — rearchitecture), #130 (`HorizonEncoder::might_contain` bloom saturation — wire-format change to `horizon_encoded`), #148 (`open_from_snapshot` redundant re-read — Arc-shared counter + async API break; see entry for details), #153, #154 (`remove_shard_internal` stranded-flush msg-id collision + `finalize_draining` mpsc accounting — require BatchWorker `last_sequence` threading + per-shard `pending_in_channel` counter).
 
 **Fixed on 2026-04-30 (with regression tests where reasonable):**
 - **#80** — `Net::shutdown` now routes through `EventBus::shutdown_via_ref(&self)`, an idempotent reference-based shutdown that runs regardless of outstanding `Arc<EventBus>` clones. Tests: `sdk/tests/shutdown_regression.rs::{shutdown_runs_even_with_outstanding_event_stream, shutdown_via_ref_is_idempotent}`.
@@ -867,8 +867,10 @@ In the `RateLimited` arm: each thread reads `count.load`, compares to `max_per_s
 
 **Fix:** the dispatcher now iterates the full event vector and applies each grant. See the **Fixed on 2026-04-30** block above. A peer that batches grants for several streams into one event-frame packet (the codec supports multiple events per frame, and `StreamWindow::decode` is fixed at 16 bytes per grant) sees only the first stream credited; the rest stall until the sender retransmits. `apply_authoritative_grant` is monotonic so retransmits eventually catch up — efficiency loss, not data loss. Either iterate the full event vector, or document that grant frames must contain exactly one event and reject violators.
 
-### 148. `Tasks/MemoriesAdapter::open_from_snapshot` redundantly re-reads events the inner fold task already folded
+### 148. `Tasks/MemoriesAdapter::open_from_snapshot` redundantly re-reads events the inner fold task already folded — **[DEFERRED]**
 `adapter/net/cortex/tasks/adapter.rs:286-301`, `adapter/net/cortex/memories/adapter.rs:281-296` — after `CortexAdapter::open_from_snapshot` spawns the fold-tail task, this code does `read_range(replay_start, replay_end)` on the same payloads just to extract `EventMeta::seq_or_ts` for the local origin. Doubles startup IO and CPU on large logs; payloads are read twice. Piggyback `app_seq` discovery onto the fold (read `seq_or_ts` from EventMeta inside the fold callback), or compute it from `TasksState`/`MemoriesState` once caught up.
+
+**Status:** efficiency-only, no correctness impact (the audit explicitly characterized this as "doubles startup IO and CPU"). The piggyback fix requires threading `Arc<AtomicU64>` through both the adapter struct (`app_seq: AtomicU64` → `Arc<AtomicU64>`) AND a new `WatermarkingFold<F>` wrapper that updates the shared counter via `fetch_max` per event. The state-based-computation alternative needs to wait on `wait_for_seq(replay_end - 1)`, which means making `open_from_snapshot` async — a public API break. Both options are wider than fits an audit-cleanup pass; deferred to a follow-up that can address the API shape with broader review. The current synchronous `read_range` loop is correctness-conservative.
 
 ### 149. Subprotocol manifest serialization order is non-deterministic (DashMap iteration) — **[FIXED 2026-04-30]**
 `adapter/net/subprotocol/negotiation.rs:39-50` calling `registry.list()` at `registry.rs:96-98` — `DashMap` iteration is non-deterministic across runs and builds, so `from_registry` produces different byte sequences on identical content.
