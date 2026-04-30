@@ -8,3 +8,6 @@ net/crates/net/bindings/python/python/net/*.so
 net/crates/net/.claude/settings.local.json
 
 package-lock.json
+
+memex/
+l0/
