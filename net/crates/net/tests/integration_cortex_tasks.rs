@@ -492,21 +492,17 @@ async fn test_regression_open_from_snapshot_rejects_u64_max_last_seq() {
 
 #[tokio::test]
 async fn test_regression_fold_rejects_checksum_mismatch() {
-    // Regression: neither `TasksFold` nor `MemoriesFold` used to
-    // verify `EventMeta::checksum` against the payload tail. A
-    // corrupted RedEX record (disk corruption, tampered on-disk
-    // file, truncated tail) would fold into state anyway, silently
-    // poisoning the materialized view. The fix recomputes
-    // `compute_checksum(tail)` in both folds and returns
-    // `RedexError::Encode` on mismatch.
+    // Regression (originally): neither `TasksFold` nor `MemoriesFold`
+    // verified `EventMeta::checksum` against the payload tail.
     //
-    // We can't easily corrupt bytes mid-RedEX without reaching into
-    // private state. The direct surface: construct an
-    // `EventEnvelope` with a WRONG `EventMeta.checksum`, ingest via
-    // the raw `CortexAdapter` path (which bypasses `compute_checksum`
-    // stamping), and observe the fold task halt. The TasksAdapter's
-    // typed `create`/`rename`/etc. always stamp the correct checksum,
-    // so we use the raw path here.
+    // Updated for BUG #141 (2026-04-30): both folds now stamp
+    // `RedexError::Decode` on checksum mismatch (instead of
+    // `Encode`), and the cortex adapter's `Stop` policy treats
+    // `Decode` as skip-and-continue. The original test asserted
+    // the fold halted on checksum mismatch; that was a DoS vector
+    // (one bad event wedges a multi-tenant cortex). The new
+    // contract: the bad event is logged + skipped, fold_errors
+    // increments by one, and state is NOT poisoned.
     use bytes::Bytes;
     use net::adapter::net::cortex::tasks::{TasksFold, TasksState};
     use net::adapter::net::cortex::{
@@ -528,10 +524,7 @@ async fn test_regression_fold_rejects_checksum_mismatch() {
     )
     .unwrap();
 
-    // Stamp an EventMeta with a deliberately-wrong checksum. The
-    // checksum check runs BEFORE dispatch-routing + tail decode, so
-    // the tail bytes don't need to be well-formed — the fold must
-    // halt on the checksum comparison before ever looking at them.
+    // Stamp an EventMeta with a deliberately-wrong checksum.
     let tail = b"any bytes would have matched some xxh3 except this one".to_vec();
     let wrong_checksum = compute_checksum(&tail).wrapping_add(1);
     let wrong_meta = EventMeta::new(
@@ -545,17 +538,23 @@ async fn test_regression_fold_rejects_checksum_mismatch() {
         .ingest(EventEnvelope::new(wrong_meta, Bytes::from(tail)))
         .unwrap();
 
-    // Drive the fold task forward; wait_for_seq returns when the
-    // adapter has processed the event OR when the fold task has
-    // stopped — under Stop policy, checksum mismatch is terminal.
     adapter.wait_for_seq(seq).await;
 
+    // Post-#141: the fold task is STILL running — Decode-class
+    // errors are recoverable per-event failures, not stream-fatal.
     assert!(
-        !adapter.is_running(),
-        "fold task must have stopped after checksum mismatch under FoldErrorPolicy::Stop"
+        adapter.is_running(),
+        "fold task must continue after checksum mismatch (BUG #141 — \
+         decode errors are recoverable under Stop policy)"
+    );
+    assert_eq!(
+        adapter.fold_errors(),
+        1,
+        "the bad event must be counted in fold_errors"
     );
 
-    // State must NOT contain the poisoned task.
+    // State must NOT contain the poisoned task — the fold rejected
+    // the event before mutating state.
     let state = adapter.state();
     let guard = state.read();
     assert!(
