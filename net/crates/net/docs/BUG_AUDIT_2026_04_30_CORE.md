@@ -21,9 +21,17 @@ Extended scope (#97 onward): a third multi-agent sweep covered the remaining UDP
 - `adapter/net/cortex/memories/fold.rs`
 - `adapter/net/traversal/portmap/natpmp.rs`
 
+Extended scope (#121 onward): a fourth multi-agent sweep covered the subtrees explicitly called out as "still not re-audited" in the prior pass.
+- `adapter/net/state/{causal.rs, horizon.rs, log.rs, snapshot.rs}`
+- `adapter/net/cortex/{adapter.rs, config.rs, envelope.rs, error.rs, meta.rs, mod.rs, tasks/*, memories/*}` (excluding `memories/fold.rs`, already audited)
+- `adapter/net/netdb/{db.rs, error.rs, mod.rs}`
+- `adapter/net/identity/{entity.rs, envelope.rs, origin.rs, token.rs}`
+- `adapter/net/subprotocol/{descriptor.rs, negotiation.rs, registry.rs, stream_window.rs}`
+- `adapter/net/behavior/{context.rs, metadata.rs, diff.rs}`
+
 ## Status (running tally)
 
-**Outstanding:** #55, #56, #57, #58, #59, #60, #61, #62, #63, #64, #65, #66, #67, #68, #69, #70, #71, #72, #73, #74, #75, #76, #77, #78, #79, #98, #99, #100, #101, #102, #103, #104, #105, #106, #107, #108, #109, #110, #111, #112, #113, #114, #115, #116, #117, #118, #119, #120
+**Outstanding:** #55, #56, #57, #58, #59, #60, #61, #62, #63, #64, #65, #66, #67, #68, #69, #70, #71, #72, #73, #74, #75, #76, #77, #78, #79, #98, #99, #100, #101, #102, #103, #104, #105, #106, #107, #108, #109, #110, #111, #112, #113, #114, #115, #116, #117, #118, #119, #120, #121, #122, #123, #124, #125, #126, #127, #128, #129, #130, #131, #132, #133, #134, #135, #136, #137, #138, #139, #140, #141, #142, #143, #144, #145, #146, #147, #148, #149, #150, #151, #152
 
 **Fixed on 2026-04-30 (with regression tests where reasonable):**
 - **#80** — `Net::shutdown` now routes through `EventBus::shutdown_via_ref(&self)`, an idempotent reference-based shutdown that runs regardless of outstanding `Arc<EventBus>` clones. Tests: `sdk/tests/shutdown_regression.rs::{shutdown_runs_even_with_outstanding_event_stream, shutdown_via_ref_is_idempotent}`.
@@ -466,7 +474,146 @@ When a `STORED` event lands for an existing memory id, the fold unconditionally 
 
 `on_recovery` resolves `recovered_addr = peer_addrs.get(&recovered_node_id)`, then filters `saved_routes` by `entry.next_hop == recovered_addr` (line 231). When a peer reconnects from a different `SocketAddr` (NAT rebind, reconnect on different port, mobile network change), `peer_addrs` reflects the new address but `saved_routes` was keyed on the old `next_hop`. The filter returns empty, no routes are restored, and the `saved_routes` entry persists indefinitely (DashMap entries are only dropped on successful match in line 242). **Adverse outcome:** routes stay pinned to alternate paths after the peer has actually recovered, causing avoidable extra-hop traffic; `saved_routes` grows without bound across mobile / NAT-changing peers. Index `saved_routes` by `node_id` rather than `next_hop`, and rewrite it on `peer_addrs` updates.
 
-## Low
+### 121. `PermissionToken::issue` and `delegate` panic on a public-only signer keypair across the FFI boundary
+**File:** `adapter/net/identity/token.rs:172` (`issue`); `adapter/net/identity/token.rs:313` (`delegate`)
+
+`issue` calls `issuer_keypair.sign(&payload)` and `delegate` calls `signer.sign(&payload)` directly — neither uses `try_sign`. `EntityKeypair::sign` panics with `"public-only keypair"` when the signing half is absent (`identity/entity.rs:263-266`). The same module exposes `EntityKeypair::public_only` (`entity.rs:215`) and `zeroize` (`entity.rs:319`); the migration-source path explicitly invokes `zeroize` after `ActivateAck` (`entity.rs:309-318`) — so a daemon that finished migrating its identity holds exactly such a keypair.
+
+The FFI bindings `net_identity_issue_token` (`ffi/mesh.rs:1938`) and `net_identity_delegate_token` (`ffi/mesh.rs:2149`) read a user-supplied handle's keypair and feed it to `issue` / `delegate`. After a daemon migrates and the source zeroizes its key, any subsequent FFI caller asking that source to mint or delegate a token panics inside Rust and unwinds across `extern "C"` — undefined behaviour, identical in shape to #58 / #61. Fix: switch both functions to `try_sign`, surface a `TokenError::ReadOnly` (or `NotAuthorized`) variant, and return `Result` from `issue` (signature change).
+
+### 122. `SnapshotStore::store` allows older snapshots to overwrite newer ones (no monotonicity check)
+**File:** `adapter/net/state/snapshot.rs:451-454`
+
+```rust
+pub fn store(&self, snapshot: StateSnapshot) {
+    let key = *snapshot.entity_id.as_bytes();
+    self.snapshots.insert(key, snapshot);
+}
+```
+
+There is no comparison against the existing entry's `through_seq` or `created_at`. A delayed/reordered snapshot delivery (or migration message arriving from a stale node) installs a snapshot at sequence N, replacing one at sequence N+M already present — subsequent restore reads the older state. Two threads concurrently storing snapshots race; whichever DashMap insert lands last wins regardless of which is fresher. There is no AEAD on the storage path, so an attacker who replays a captured archived snapshot rewinds state. Fix: gate the insert on `existing.through_seq < snapshot.through_seq` (e.g. via `DashMap::entry`/`alter`) or return a "stale snapshot ignored" signal.
+
+### 123. `MetadataStore::upsert` non-atomic 5-step update produces permanent index drift under concurrent updates
+**File:** `adapter/net/behavior/metadata.rs:826-849`
+
+`upsert` is a 5-step sequence with no overarching lock: (1) capacity check, (2) `nodes.get(&node_id)` to read old, (3) `remove_from_indexes(&old)`, (4) `add_to_indexes(&metadata)`, (5) `nodes.insert`. Two threads upserting the same node concurrently both read the same `old` at step 2, both remove its index entries at step 3 (second is a no-op), and both add to indexes at step 4 — in two *different* index buckets if the metadata differs. Whichever `nodes.insert` lands second wins, but the loser's index entries are never removed.
+
+Concrete failure: thread A sets node X to `Online` with tag `t1`; thread B sets the same node to `Degraded` with tag `t2`. Final `nodes` has the second write's metadata, but `by_status[Online]` *and* `by_status[Degraded]` both contain X, and both `by_tag[t1]` and `by_tag[t2]` retain it. Stats over-count, queries return X under wrong filters, and the drift persists forever — no rebuild path exists. Fix: serialize the entire upsert via `DashMap::entry` on `nodes` (so step 2-5 hold the per-shard write lock), or version-check + retry, or use a coarse per-node mutex.
+
+### 124. `NodeMetadata` deserialize is unbounded — peer-supplied DoS via giant tags / custom map
+**File:** `adapter/net/behavior/metadata.rs:382-411` (and `add_to_indexes` at `:1062-1083`)
+
+`NodeMetadata` derives `Deserialize` over `HashMap<String, String> custom`, `HashSet<String> tags`, `HashSet<String> roles`, `Vec<NodeId> preferred_peers`, `HashMap<String, u8> hop_distances`, `Vec<IpAddr> public_addresses`, plus several `String`s. None of these have size limits in the deserialize path. A malicious peer ships `NodeMetadata` with millions of unique tags or a multi-megabyte custom map; `serde_json::from_slice` allocates it; `MetadataStore::upsert` then stores it (capacity is on count, not bytes). `add_to_indexes` faithfully inserts each tag into `by_tag.entry(tag.clone()).or_default().insert(node_id)` — turning one peer's announcement into N DashMap entries with no upper bound.
+
+Combined with `with_capacity` defaulting to `None`, an attacker registers a single node with 1M unique tags and creates 1M `by_tag` entries. Fix: validate after deserialize — cap name/description length, tag/role counts, custom-map size, preferred_peers length — and reject in `upsert` (or before).
+
+### 125. `DiffEngine::apply` declares `VersionMismatch` but never checks the version, accepting stale diffs against fresher state
+**File:** `adapter/net/behavior/diff.rs:518-530` (variant defined at `:226-233`)
+
+```rust
+pub fn apply(base: &CapabilitySet, diff: &CapabilityDiff, strict: bool) -> Result<CapabilitySet, DiffError> {
+    let mut result = base.clone();
+    for op in &diff.ops {
+        Self::apply_op(&mut result, op, strict)?;
+    }
+    Ok(result)
+}
+```
+
+There is no `base.version == diff.base_version` check, despite `DiffError::VersionMismatch` being a documented error variant. A receiver at v5 (state with X, Y, Z added at v3-v5) accepts an old diff `base_version=2 → new_version=3` containing `RemoveModel("Y")`. The receiver removes Y and silently bumps its tracked version to v3 — diverging from peers that already applied v3-v5. Subsequent diffs against v3 are then accepted, snowballing the divergence.
+
+Fix: require the caller to thread the live version into `apply`, or store it on `CapabilitySet` and check at the top of `apply`. At minimum, document the contract loudly so callers don't trust the empty-promise variant.
+
+### 126. `Tasks/MemoriesAdapter::ingest_typed` advances `app_seq` BEFORE the inner ingest succeeds — phantom seq on failure
+**File:** `adapter/net/cortex/tasks/adapter.rs:312-327`, `adapter/net/cortex/memories/adapter.rs:305-320`
+
+Both adapters call `self.app_seq.fetch_add(1, ...)` to allocate `seq_or_ts`, then call `inner.ingest(payload, meta)`. If `inner.ingest` fails (closed adapter, RedEX append error, fold error under `Stop` policy), the local counter is permanently advanced past a `seq_or_ts` that was never written to the log. After restore, the snapshot's persisted `app_seq` reflects the higher counter — a future ingest picks up at the higher value, leaving a permanent gap. A second adapter sharing the same `origin_hash` (a documented configuration in the cortex layer) and recovering via on-disk scan rather than snapshot disagrees on `app_seq`, producing duplicate `seq_or_ts` collisions when both come back online. Fix: only commit `app_seq.fetch_add` after `inner.ingest` returns Ok — load + CAS retry, or roll back on Err.
+
+### 127. `IdentityEnvelope::open` accepts any attacker-chosen `signer_pub`; AEAD AAD is empty
+**File:** `adapter/net/identity/envelope.rs:261-334` (specifically lines 269-276, 296-299)
+
+The envelope-open primitive verifies that `signer_pub`'s signature over `target_static_pub || chain_link` is valid (line 270-276) and that the decrypted seed reconstructs to the same `signer_pub` (line 329). Crucially it does NOT take an `expected_signer_pub` (or `expected_origin_hash`) parameter from the caller — any well-formed envelope from any keypair passes. The AEAD payload uses `aad: &[]` (line 298), so the chain_link is bound only to the signature, not the ciphertext.
+
+Failure scenario: a malicious peer in the migration-source's path injects a substituted envelope built from the attacker's keypair, with `target_static_pub` set correctly to the actual target. The target `open`s it, reconstructs the attacker's keypair, and (if the migration handler doesn't cross-check) registers it as the migrated daemon's identity — then signs subsequent capability announcements / tokens under the attacker's identity. The doc-comment at lines 105-106 acknowledges "the primitive returns the keypair and the caller cross-checks" — but the primitive itself is unsafe by default. Fix: add `expected_signer_pub: &EntityId` (or `expected_origin_hash: u32`) as a parameter and reject early; pass `chain_link.to_bytes()` as AAD on encrypt/decrypt so a tampered link breaks both the signature *and* AEAD.
+
+### 128. `StateSnapshot::to_bytes` panics in release on >4 GiB state or bindings
+**File:** `adapter/net/state/snapshot.rs:227, 232`
+
+```rust
+let state_len = u32::try_from(self.state.len()).expect("state snapshot exceeds 4 GiB");
+...
+let bindings_len = u32::try_from(self.bindings_bytes.len())
+    .expect("bindings_bytes exceeds 4 GiB — this is almost certainly a bug");
+```
+
+`state` is opaque daemon state passed in from any caller (compute orchestrator, FFI clients), and `bindings_bytes` is opaque externally-controlled migration metadata. An adversarial or buggy producer with >4 GiB content makes serialization panic — and `to_bytes` is on the migration / snapshot-send path, where a panic crashes the dispatch task without releasing locks. Compare against `write_causal_events` in `causal.rs`, which gracefully *skips* oversized events and returns `events_skipped`. Fix: change `to_bytes` to return `Result<Vec<u8>, SnapshotError>` and bail with an error variant instead of `expect`-panicking.
+
+### 129. `EntityLog::prune_through` desyncs `snapshot_seq` from `base_link.sequence` on an already-empty log
+**File:** `adapter/net/state/log.rs:163-194`
+
+When `prune_through(seq)` is called on an empty log, `events.iter().rev().find(...)` returns `None`. The `events.is_empty()` branch fires but the inner `if let Some(...)` does nothing — yet `snapshot_seq` is unconditionally bumped to `seq` if `seq > self.snapshot_seq`. Result: `snapshot_seq` advances to an arbitrary `seq` while `base_link.sequence` stays at its previous value (e.g., 0 for a fresh genesis log).
+
+Failure scenario: caller restored a fresh log via `from_snapshot(_, snapshot_seq=0, head_link=genesis, ..)`, then took an externally-coordinated snapshot at sequence 1000 and called `prune_through(1000)`. `head_seq()` reports 0 (base_link.sequence), but `snapshot_seq()` returns 1000. Code that prefers `head_seq().max(snapshot_seq())` to decide where the next event must start gets contradictory answers; the next `append` will only accept sequence == 1, not 1001 — silently dropping legitimate events from peers that observed the actual snapshot point. Fix: clamp `snapshot_seq = snapshot_seq.max(seq).min(head_seq())`, or only bump when `last_pruned.is_some()`.
+
+### 130. `HorizonEncoder::might_contain` saturates after ~8 origins, collapsing causal-concurrency detection to "always concurrent"
+**File:** `adapter/net/state/horizon.rs:91-141`
+
+The bloom filter is 16 bits with two 4-bit hash positions per origin (`h & 0xF`, `(h >> 4) & 0xF`). Each insert sets two of 16 bits — by the birthday bound, after only ~6-8 inserted origins the bloom is fully saturated and `might_contain` returns true for *every* `origin_hash`. At that point `potentially_concurrent` always returns false, meaning the system claims "every event has observed every other event" — defeating causal concurrency detection on any non-tiny mesh. A node observing 8+ peer entities encodes a saturated bloom into every outgoing `CausalLink::horizon_encoded`. Receivers using `potentially_concurrent` to schedule conflict resolution / merging see all events as causally-ordered and skip the resolution they should be running. Fix: widen the bloom space (`horizon_encoded` is u32 but only the high 16 bits are bloom — the low 16 carry seq), or document a hard cardinality ceiling of ~6 origins, or use a counting/sliding sketch sized for realistic entity counts.
+
+### 131. Subprotocol manifest exposes forwarding-only entries as if they were locally handled
+**File:** `adapter/net/subprotocol/negotiation.rs:39-50, 55-70`
+
+`SubprotocolManifest::from_registry` calls `registry.list()` which returns *every* descriptor regardless of `handler_present`. The 6-byte wire format (id, version, min_compatible) has no flag for `handler_present`, and `to_bytes` forces every entry to deserialize back as `handler_present: true` (line 65). After `negotiate()` produces the `compatible` set, the receiving peer believes the sender has a local handler for every advertised id — including ones registered via `.forwarding_only()`.
+
+Failure scenario: Node B registers subprotocol 0x1000 forwarding-only because it lacks the daemon but participates in routing it. B's manifest still advertises 0x1000. Node A negotiates → marks 0x1000 compatible → schedules a 0x1000-bound RPC to B → B has no handler → silent drop. The `capability_tags()` pathway (negotiation.rs:119) correctly filters forwarding-only entries; this direct-manifest path does not. Two parallel discovery channels disagree. Fix: filter `from_registry` to only emit `handler_present` entries, mirroring `capability_tags`, OR extend the wire format with a flag byte (bumping `MANIFEST_ENTRY_SIZE` to 7).
+
+### 132. `read_manifest_entry` accepts `min_compatible > version`, enabling phantom-incompatibility DoS
+**File:** `adapter/net/subprotocol/descriptor.rs:133-143`, `subprotocol/negotiation.rs:99-110`
+
+Neither `read_manifest_entry` nor `SubprotocolManifest::from_bytes` validates the wire-format invariant that `min_compatible <= version`. A peer that advertises `version = 1.0, min_compatible = 255.255` passes parsing. In `negotiate()`, every honest peer's `local_entry.version.satisfies(remote_entry.min_compatible)` returns false, so the subprotocol is added to `incompatible` rather than `compatible`. The attacker thereby unilaterally evicts any subprotocol from negotiation between the victim and its peers — without ever actually being a peer that handles it.
+
+`with_min_compatible` in `SubprotocolDescriptor::new` is also `pub`, so any local builder can produce malformed descriptors that violate `is_compatible_with`'s contract. Fix: in both `read_manifest_entry` and `with_min_compatible`, reject when `min_compatible > version`.
+
+### 133. `NetDb::close` early-returns on first adapter close failure, leaking subsequent fold tasks
+**File:** `adapter/net/netdb/db.rs:95-103`
+
+```rust
+pub fn close(&self) -> Result<(), NetDbError> {
+    if let Some(t) = &self.tasks {
+        t.close()?;          // ?-short-circuits
+    }
+    if let Some(m) = &self.memories {
+        m.close()?;
+    }
+    Ok(())
+}
+```
+
+When `tasks.close()` errors, `?` short-circuits and `memories.close()` is never invoked. The memories adapter retains its fold task and keeps consuming events, even though the caller has been told `close` failed and likely treats the whole NetDb as torn down. Combined with the "fold task outlives builder" hazard the build path explicitly guards against (lines 175-187), this leaks fold tasks per-NetDb-close-failure. Fix: attempt both closes regardless, then surface the first error.
+
+### 134. `CortexAdapter::open` accepts arbitrary `initial_state` with `FromSeq(n>0)` / `LiveOnly`, falsely advancing `wait_for_seq`
+**File:** `adapter/net/cortex/adapter.rs:181-263` (watermark init at lines 207-211)
+
+`open` takes `initial_state: State` and `start_seq` is derived from `adapter_config.start`. With `StartPosition::FromSeq(n)` (n > 0) or `LiveOnly`, the adapter starts folding at `n` and never reads events `[0, n-1]`. `initial_watermark` is set to `start_seq - 1`, so `wait_for_seq(k)` for any `k <= start_seq-1` returns immediately — the adapter claims those seqs are "applied" while state has never seen them. A consumer using `FromSeq(n)` to skip an old prefix gets a state that pretends those events were applied, producing silently wrong query results until live events overwrite the keys.
+
+Doc on `LiveOnly` says "use when `State` is rehydrated from an external snapshot", but `open` doesn't enforce that — only `open_from_snapshot` does. Fix: restrict `FromSeq` / `LiveOnly` to `open_from_snapshot` (drop them from raw `open`), or require a snapshot-source proof on `open`.
+
+### 135. `EventMeta::compute_checksum` truncates xxh3 64→32 bits, defeating the documented tamper-detection property
+**File:** `adapter/net/cortex/meta.rs:111-114` (used at `cortex/tasks/fold.rs:36-43`, `cortex/memories/fold.rs:37-43`)
+
+`compute_checksum` does `xxh3_64(tail) as u32`, throwing away 32 bits. The fold doctstrings claim this catches "tampered on-disk files". A 32-bit checksum has ~1-in-2^16 birthday collision probability across the file's lifetime; even worse, it's an unkeyed hash, so an attacker who can write to the on-disk redex file can compute the matching checksum trivially. As an accidental-corruption detector for stray bit flips, 32 bits is marginal; as a tamper detector (per the docstring), it's nearly meaningless. Fix: either downgrade the docstring claim to "corruption detector" or use a keyed MAC stamped at append.
+
+### 136. `ContextStore::create_context` capacity check is non-atomic; sustained load grows the map past the cap
+**File:** `adapter/net/behavior/context.rs:822-829, 871-878`
+
+When the store is at capacity, `cleanup_expired` is called inline (synchronous, scans entire `DashMap`). Two threads inserting at exactly capacity will both call `cleanup_expired` in parallel, then both pass the recheck (line 825), and both insert (line 842). Worse, between the recheck and the insert, a third thread can insert. There is no atomic "insert-if-under-cap" — under sustained load the map grows unbounded past `max_traces`. Combined with the W3C `from_traceparent` resetting `hop_count: 1` and `max_hops: None` (line 654), a peer storming with synthetic traces via `continue_context` defeats both the trace-loop guard and the cap. Fix: serialize via `DashMap::entry` with a coordinated counter, or use a single coarse insert-lock when at the cap.
+
+### 137. `Sampler::should_sample` `RateLimited` over-samples by `num_threads-1` per second under contention
+**File:** `adapter/net/behavior/context.rs:710-722`
+
+In the `RateLimited` arm: each thread reads `count.load`, compares to `max_per_second`, then `fetch_add`s. The check + fetch_add is not atomic — N concurrent threads can all observe `current < max_per_second` and all increment, producing `max + N - 1` samples in a window. Not catastrophic, but the documented invariant is violated, and a downstream consumer relying on the rate-limit to bound sampler-driven write traffic over the wire (e.g., trace-emit telemetry) can see the rate burst by `num_threads × max_per_second`. Fix: use a `compare_exchange` loop or `fetch_update` to atomically gate on the cap.
+
+
 
 ### 68. `JetStreamAdapterConfig::max_messages` / `max_bytes` typed `i64`, not validated for negatives
 `config.rs:499, 503, 549, 555` (validator at `:575-597`) — accepts `with_max_messages(-1)` etc. NATS rejects negatives at stream-create time, surfacing as a runtime adapter error instead of at startup `validate()` (which is the documented purpose). Switch to `Option<u64>` (or `Option<NonZeroU64>`).
@@ -507,6 +654,51 @@ When a `STORED` event lands for an existing memory id, the fold unconditionally 
 ### 120. `LocalGraph::on_pingwave` rejects restart-induced sequence regressions, leaving stale node info
 `adapter/net/swarm.rs:510-515` — `and_modify` only updates a node's `addr`/`hops`/`last_seq`/`last_seen` if `pw.seq > n.last_seq || hops < n.hops`. When a peer restarts, `next_seq` resets to 1; the local node's `n.last_seq` is still the old high-water-mark (e.g. 10000). Incoming pingwaves with seq=1, 2, ... are dropped from updating, so neither `hops` nor `last_seen` advance. The node enters `is_stale` after 30s and gets removed by cleanup, only to be re-inserted as new — in the gap, capability lookups against the stale entry return outdated capabilities. Accept seq regression when the new value is much smaller than the recorded one (indicating a restart), or fall back to wall-time-based staleness independent of seq monotonicity.
 
+### 138. `CapabilityDiff::from_bytes` swallows all deserialize errors and accepts unbounded ops
+`adapter/net/behavior/diff.rs:215-217` — returns `Option<Self>`, dropping error context. There is no input-size cap, no `ops.len()` cap, and `serde_json::from_slice` will faithfully expand a peer-supplied 1M-`SetField` diff. `apply` then iterates all 1M ops (each currently a no-op for `SetField`/`UnsetField`, see #151) — CPU/RAM burned for no useful effect. Cap `data.len()` before parsing, cap `diff.ops.len()` after, and return `Result<Self, DeserializeError>` so callers can distinguish malformed from absent.
+
+### 139. `MetadataStore::clear` races with concurrent `upsert`, leaving nodes without index entries
+`adapter/net/behavior/metadata.rs:1035-1043` — `clear()` calls `nodes.clear()` then six other `clear()`s sequentially, with no global lock. A concurrent `upsert` between `nodes.clear()` and `by_status.clear()` reads `nodes.get(&id)` → `None`, skips `remove_from_indexes`, calls `add_to_indexes` (writes to `by_status`/`by_tier`/etc), then `nodes.insert` succeeds. `clear()` then wipes the indexes, leaving a node in `nodes` with NO index entries — invisible to any indexed query (status, continent, tier, tag, role, owner). Only the full-scan branch (`query` line 922) finds it. Fix: drain `nodes` first, then iterate the drained set calling `remove_from_indexes`, then clear the indexes — making intermediate states consistent.
+
+### 140. `ObservedHorizon::observe` uses plain `+= 1` while `merge` uses `saturating_add`, debug-panicking on overflow inconsistently
+`adapter/net/state/horizon.rs:28-34, 64-76` — `observe` does `self.logical_time += 1` (debug-panics on overflow); `merge` does `saturating_add(1)`. The comment at lines 71-74 acknowledges the convention. Adversarial high-cardinality observes panic in debug builds while the same overflow saturates in release; merge-driven overflow saturates in both. Make `observe` use `saturating_add(1)` for consistency.
+
+### 141. `Tasks/MemoriesFold` `Stop` policy lets a single corrupt tail wedge fold task forever
+`adapter/net/cortex/tasks/fold.rs:46-79`, `adapter/net/cortex/memories/fold.rs:47-87` — under `OnFoldError::Stop` (the default), a postcard decode failure halts the fold task permanently. The 32-bit checksum (#135) catches most disk corruption first, but it's not a strong tamper detector — an attacker who can craft a tail with matching truncated checksum (or the 1-in-2^32 collision case) DoSes a multi-tenant cortex instance via a single bad event. Classify recoverable decode errors (bad postcard) separately from unrecoverable storage errors so the default policy can skip-and-continue without halting; or strengthen the checksum.
+
+### 142. Filter `created_after`/`created_before`/`updated_after`/`updated_before` are strict, dropping events at the cutoff
+`adapter/net/cortex/tasks/query.rs:56-74`, `adapter/net/cortex/memories/query.rs:92-110` (docs at `cortex/tasks/filter.rs:24-31`, `cortex/memories/filter.rs:30-37`) — comparators are `>` and `<` exclusive. An event with `created_ns == cutoff` is dropped by both `created_after(cutoff)` and `created_before(cutoff)` filters — falls through holes between paginations using "last sync ns" as cutoff. Worse, two events written in the same nanosecond (achievable on Windows where wall-clock granularity is ~15ms) produce identical timestamps; one of them is elided in any window using either bound. Use inclusive comparators or expose explicit `_inclusive` variants.
+
+### 143. `*Watcher::stream` `skip_while` against captured initial deadlocks subscribers under oscillating predicate
+`adapter/net/cortex/tasks/watch.rs:154-177`, `adapter/net/cortex/memories/watch.rs:177-200` — the watcher is fed from a `tokio::sync::watch` (single-slot). On a sequence (A → B → A) collapsed by watch into final A, `skip_while` (sticky: only stops skipping once it sees a non-equal item) silently skips the surviving A, then no further state changes ever produce a stream item, and the consumer is permanently starved of legitimate state changes. Use a one-shot dedup (e.g. `skip(1)`) rather than a sticky-data equality check.
+
+### 144. `CortexAdapter::changes` silently drops `BroadcastStream::Lagged` errors, hiding subscriber data-loss
+`adapter/net/cortex/adapter.rs:154-157` — `filter_map(|r| async move { r.ok() })` discards `Lagged(n)` signals from `BroadcastStream`. Watchers downstream see fewer-than-expected seqs without any signal. The eventual emission still reflects latest state (so the visible symptom is a delay, not corruption), but a watcher that wants to surface "you missed N changes" for telemetry / back-pressure cannot retrieve the count. Expose a separate `changes_with_lag()` or convert lag errors to a re-emit-latest signal.
+
+### 145. `MetadataStore::find_nearby` / `find_best_for_routing` sort comparators are non-deterministic on NaN
+`adapter/net/behavior/metadata.rs:964, 986` — `a.1.partial_cmp(&b.1).unwrap_or(Equal)` on NaN produces a non-total order; `sort_by` then permutes arbitrarily and `truncate(limit)` drops random items. `LocationInfo::distance_to` (lines 124-139) computes `(...).asin()`; for *near*-antipodal points FP rounding can push `a` to slightly > 1.0, producing NaN. Filter NaN distances out before sorting, or use `total_cmp` on a sentinel-replaced score.
+
+### 146. `TokenCache` slot map is unbounded; signed-token flooding fills memory linearly
+`adapter/net/identity/token.rs:405-457` — `DashMap<([u8;32], u16), Vec<PermissionToken>>` has no size cap. Distinct `(subject, channel_hash)` tuples create distinct slots; within a slot, distinct scope bitfields stack. `evict_expired` only reclaims past-deadline entries — a long-TTL flood survives. Any caller that processes peer-supplied tokens through `insert` (or any service that issues tokens at attacker request) can grow the cache linearly with `(subject × channel × scope)` cardinality. Add an LRU/size cap or per-issuer rate limit.
+
+### 147. Mesh stream-window dispatch consumes only the first event of a batched grant packet
+`adapter/net/mesh.rs:2925-2955` interacting with `subprotocol/stream_window.rs:69-84` — the handler does `events.into_iter().next()`. A peer that batches grants for several streams into one event-frame packet (the codec supports multiple events per frame, and `StreamWindow::decode` is fixed at 16 bytes per grant) sees only the first stream credited; the rest stall until the sender retransmits. `apply_authoritative_grant` is monotonic so retransmits eventually catch up — efficiency loss, not data loss. Either iterate the full event vector, or document that grant frames must contain exactly one event and reject violators.
+
+### 148. `Tasks/MemoriesAdapter::open_from_snapshot` redundantly re-reads events the inner fold task already folded
+`adapter/net/cortex/tasks/adapter.rs:286-301`, `adapter/net/cortex/memories/adapter.rs:281-296` — after `CortexAdapter::open_from_snapshot` spawns the fold-tail task, this code does `read_range(replay_start, replay_end)` on the same payloads just to extract `EventMeta::seq_or_ts` for the local origin. Doubles startup IO and CPU on large logs; payloads are read twice. Piggyback `app_seq` discovery onto the fold (read `seq_or_ts` from EventMeta inside the fold callback), or compute it from `TasksState`/`MemoriesState` once caught up.
+
+### 149. Subprotocol manifest serialization order is non-deterministic (DashMap iteration)
+`adapter/net/subprotocol/negotiation.rs:39-50` calling `registry.list()` at `registry.rs:96-98` — `DashMap` iteration is non-deterministic across runs and builds, so `from_registry` produces different byte sequences on identical content. Today the manifest is unsigned and not used in any digest dedup, so this is dormant. But the architecture comment at `negotiation.rs:18-19` describes the manifest as "exchanged during session setup" — a surface that typically *does* end up signed once a security model is added. The non-determinism would silently break signature verification on retransmits and any "same manifest? skip re-negotiation" optimisation. Sort by `id` in `from_registry` before emitting.
+
+### 150. RNG `expect` panics across the FFI boundary in identity-layer ops
+`adapter/net/identity/envelope.rs:200`, `adapter/net/identity/entity.rs:177`, `adapter/net/identity/token.rs:156, 298` — `getrandom::fill(...).expect("getrandom failed")`. Same hazard pattern as #58 / #61: under FD pressure / sandbox restrictions / kernel hang, `getrandom` returns an error and the unwind crosses `extern "C"` (these helpers are reachable from the FFI bindings under `ffi/mesh.rs`). Surface dedicated error variants instead of panicking.
+
+### 151. `DiffOp::SetField` / `UnsetField` are silent no-ops despite documented as operations
+`adapter/net/behavior/diff.rs:634-641` — `apply_op` for these variants does nothing, even under `strict=true` (no error). A peer ships a `SetField{path: "tags", value: [...]}` expecting a state mutation; receiver state is unchanged but `apply` reports `Ok`. Sender's view diverges from receiver's silently, and a `validate_chain` over a sequence of such diffs will not catch the divergence. Either return `DiffError::NotApplicable` for the unimplemented variants, or remove the variants entirely.
+
+### 152. `validate_chain` accepts diffs where `new_version <= base_version` (forward roll-back)
+`adapter/net/behavior/diff.rs:649-675` — chains `prev.new_version == curr.base_version` and `prev.timestamp_ns <= curr.timestamp_ns`, but does not check `curr.new_version > curr.base_version` within a single diff. A peer can ship `base_version=5, new_version=3` (a "rollback while applying ops"), and validation accepts it; combined with #125 (no version check in `apply`), a receiver advances state forward but its tracked version goes backward. Add the within-diff `new_version > base_version` assertion.
+
 ---
 
 ## Notably clean
@@ -540,11 +732,20 @@ When a `STORED` event lands for an existing memory id, the fold unconditionally 
 23. **#66** — `update_from_events` cursor regression on unsorted input (re-delivery)
 24. **#75** — `add_shard_internal` permanent worker leak on activate failure
 25. **#76** — `flush()` phase-2 barrier collapses to one window (re-introduces #16-class loss on many-shard configs)
+26. **#127** — `IdentityEnvelope::open` accepts attacker-chosen `signer_pub`, AAD is empty (identity-substitution hole on the migration path; the migration handler's cross-check is the only line of defense)
+27. **#121** — `PermissionToken::issue` / `delegate` panic across FFI on a public-only keypair (any post-migration daemon's FFI caller crashes)
+28. **#125** — `DiffEngine::apply` declares `VersionMismatch` but never checks the version (silent state divergence under stale diff replay)
+29. **#124** — `NodeMetadata` deserialize is unbounded; peer-supplied tags / custom-map flood
+30. **#123** — `MetadataStore::upsert` non-atomic 5-step update produces permanent index drift (queries return wrong / duplicate nodes after concurrent writes)
+31. **#122** — `SnapshotStore::store` allows older snapshots to overwrite newer (state rewind on replay/race)
+32. **#126** — `Tasks/MemoriesAdapter::ingest_typed` advances `app_seq` before successful append (phantom seq on failure, snowballs into duplicate keys on cross-handle restore)
+33. **#131** — Subprotocol manifest exposes forwarding-only entries as locally-handled (silent RPC drop)
+34. **#132** — `read_manifest_entry` accepts `min_compatible > version` (peer can blacklist subprotocols at will)
 
 ## Out of scope (deferred)
 
-The `adapter/net/` UDP transport stack — `cortex/`, `swarm/`, `traversal/`, `state/`, `behavior/`, `compute/`, `continuity/` — was deferred in the second pass and has now been spot-checked in the third pass (#97–#120). The earliest audit ([BUG_AUDIT_2026_04_30.md](./BUG_AUDIT_2026_04_30.md)) covers some of those subsystems through #54.
+The `adapter/net/` UDP transport stack — `cortex/`, `swarm/`, `traversal/`, `state/`, `behavior/`, `compute/`, `continuity/` — was deferred in the second pass, spot-checked in the third pass (#97–#120), and the previously-deferred subtrees were systematically swept in the fourth pass (#121–#152). The earliest audit ([BUG_AUDIT_2026_04_30.md](./BUG_AUDIT_2026_04_30.md)) covers some of those subsystems through #54.
 
-Spot-checked across passes 2 and 3: `redex/`, `mesh.rs`, `session.rs`, `router.rs`, `linux.rs`, `subnet/gateway.rs`, `contested/correlation.rs`, `sdk/src/net.rs`, `adapter/net/{mod.rs, pool.rs, reliability.rs, failure.rs, crypto.rs, protocol.rs}`, `swarm.rs`, `route.rs`, `reroute.rs`, `proxy.rs`, `traversal/{classify.rs, portmap/natpmp.rs}`, `behavior/{safety.rs, loadbalance.rs, capability.rs, proximity.rs, api.rs, rules.rs}`, `compute/{orchestrator.rs, standby_group.rs, migration_target.rs, migration_source.rs}`, `subprotocol/migration_handler.rs`, `continuity/{chain.rs, superposition.rs, discontinuity.rs}`, `cortex/memories/fold.rs`. These are targeted point-checks, not a systematic re-audit — additional defects in those files may remain.
+Audited across passes 2-4: `redex/`, `mesh.rs`, `session.rs`, `router.rs`, `linux.rs`, `subnet/gateway.rs`, `contested/correlation.rs`, `sdk/src/net.rs`, `adapter/net/{mod.rs, pool.rs, reliability.rs, failure.rs, crypto.rs, protocol.rs}`, `swarm.rs`, `route.rs`, `reroute.rs`, `proxy.rs`, `traversal/{classify.rs, portmap/natpmp.rs}`, all of `behavior/` (`{safety, loadbalance, capability, proximity, api, rules, context, metadata, diff}.rs`), `compute/{orchestrator, standby_group, migration_target, migration_source}.rs`, all of `subprotocol/` (`{descriptor, migration_handler, mod, negotiation, registry, stream_window}.rs`), `continuity/{chain, superposition, discontinuity}.rs`, all of `cortex/` (`{adapter, config, envelope, error, meta, mod}.rs` + `tasks/*` + `memories/*`), all of `state/` (`{causal, horizon, log, snapshot}.rs`), `netdb/`, and `identity/`.
 
-Still **not re-audited** in any pass: most of `adapter/net/state/`, `cortex/` beyond `memories/fold.rs`, `netdb/`, `identity/`, `subprotocol/` beyond `migration_handler.rs`, and the `behavior/` files not listed above (`context.rs`, `metadata.rs`, `diff.rs`).
+Still **not re-audited** in any pass: `adapter/net/{batch.rs, config.rs, stream.rs, transport.rs}`, `adapter/net/channel/` (entire subtree: `config.rs, guard.rs, membership.rs, mod.rs, name.rs, publisher.rs, roster.rs`), `adapter/net/contested/{partition.rs, reconcile.rs}` (only `correlation.rs` was covered), most of `adapter/net/redex/` (only `disk.rs` and `file.rs` were spot-checked — `entry.rs, event.rs, fold.rs, index.rs, manager.rs, ordered.rs, retention.rs, segment.rs, typed.rs` remain), `adapter/net/subnet/{assignment.rs, id.rs}` (only `gateway.rs` was covered), `adapter/net/traversal/{config.rs, reflex.rs, rendezvous.rs}` and `traversal/portmap/{gateway.rs, sequential.rs, upnp.rs}` (only `classify.rs` and `portmap/natpmp.rs` were covered). Pass 4 was a systematic sweep of the explicitly-listed deferred subtrees but is not a continuous re-audit — code added or modified after this date may contain new defects.
