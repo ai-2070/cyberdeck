@@ -2,12 +2,15 @@
 //!
 //! Feature-gated behind `redex-disk`. When `RedexFileConfig::persistent`
 //! is set and the owning [`super::Redex`] manager was given a
-//! persistent directory, appends are mirrored to two append-only files
-//! per channel:
+//! persistent directory, appends are mirrored to three append-only
+//! files per channel:
 //!
 //! - `<base>/<channel_path>/idx` — 20-byte [`RedexEntry`] records.
 //! - `<base>/<channel_path>/dat` — payload bytes (offsets match the
 //!   in-memory [`super::segment::HeapSegment`]).
+//! - `<base>/<channel_path>/ts` — 8-byte little-endian unix-nanos
+//!   timestamps, one per `idx` record. Restores age-based retention
+//!   across restart.
 //!
 //! The heap segment remains authoritative during normal operation; the
 //! disk files exist for crash recovery. On reopen the full `dat` file
@@ -15,16 +18,48 @@
 //! (the disk files grow unbounded; operators delete old files manually
 //! between runs when that matters). v2 will reconcile this.
 //!
-//! Durability policy:
+//! # Durability policy
 //!
-//! - Append-path fsync is governed by [`super::FsyncPolicy`], threaded
-//!   in as `fsync_every_n` at open time. `0` disables append-side
-//!   syncing; a positive value triggers a fsync every `n`th append.
-//! - `close()` always fsyncs both files, regardless of policy.
-//! - Explicit `super::RedexFile::sync()` always fsyncs both files.
-//! - Order matters inside [`DiskSegment::sync`]: dat fsyncs before
-//!   idx so a crash can only leave the index shorter than dat,
-//!   which the reopen-time truncation handles.
+//! Append-path fsync is governed by [`super::FsyncPolicy`], threaded
+//! into the segment at open time as two thresholds:
+//!
+//! - `fsync_every_n` — notify after every Nth successful append
+//!   (`EveryN(N)`).
+//! - `fsync_max_bytes` — notify after `max_bytes` of accumulated
+//!   writes across `dat` + `idx` + `ts`
+//!   (`IntervalOrBytes { max_bytes, .. }`).
+//!
+//! Each threshold is independent and either may be zero (disabled).
+//! Crossing a threshold fires `fsync_signal` (a `tokio::sync::Notify`);
+//! the actual fsync runs on a background worker spawned by
+//! [`super::RedexFile::open_persistent`], so the appender returns as
+//! soon as the bytes land in the page cache. Multiple notifies that
+//! arrive while the worker is mid-sync coalesce into a single
+//! follow-up sync — `Notify`'s single-permit semantics are exactly
+//! what the durability contract wants.
+//!
+//! `close()` and explicit [`super::RedexFile::sync()`] always run a
+//! full synchronous fsync of all three files, regardless of policy —
+//! they are the caller's explicit durability barriers.
+//!
+//! # Invariants (do not regress)
+//!
+//! 1. **No seeks on the hot path.** `idx`, `dat`, `ts` open with
+//!    `OpenOptions::new().append(true)`; `set_len` only fires on
+//!    rollback (partial-write recovery) or on reopen (torn-tail
+//!    truncation). Any new append-time path must preserve this.
+//! 2. **Write order is `dat → idx → ts`.** The reopen-time recovery
+//!    walk depends on `dat` being durable before `idx`, and `idx`
+//!    before `ts`. Reordering is a silent corruption risk.
+//! 3. **Lock acquisition order is `dat → idx → ts`.** Append paths
+//!    only ever hold one file lock at a time, so the order is
+//!    incidentally fine today; compaction is the one path that
+//!    holds all three simultaneously and must follow this order.
+//! 4. **Fsync order inside [`DiskSegment::sync`] is `dat → idx → ts`.**
+//!    A crash mid-sync can only leave `idx` shorter than `dat` (or
+//!    `ts` shorter than `idx`), which the reopen-time truncation
+//!    logic already handles. Reversing the order would let the index
+//!    reference dat bytes that were never flushed.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -241,7 +276,6 @@ impl DiskSegment {
         // one.
         let ts_path = dir.join("ts");
         let original_timestamps = read_timestamps(&ts_path, index.len())?;
-        let _ = idx_len_truncated;
 
         // Verify per-entry checksums during recovery. Without
         // this check, on-disk corruption (torn writes, bit-rot,
@@ -443,18 +477,19 @@ impl DiskSegment {
         self.fail_next_append.store(true, Ordering::Release);
     }
 
-    /// Append an entry and (for heap entries) its payload to disk.
-    /// Inline entries skip the dat write — their payload rides in the
-    /// 20-byte idx record.
-    ///
-    /// Writes go through the OS page cache. Append-time fsync is
-    /// governed by [`super::FsyncPolicy`] via `fsync_every_n`:
-    /// `Never` / `Interval` skip it here entirely; `EveryN(n)`
-    /// triggers a sync every `n`th successful append. Explicit
-    /// `sync()` / `close()` still fsync regardless of policy.
     /// Append an entry with an explicit timestamp (unix nanos).
-    /// The timestamp is persisted to the `ts` sidecar so age-based
-    /// retention survives restart.
+    /// Inline entries skip the dat write — their payload rides in
+    /// the 20-byte idx record. The timestamp is persisted to the
+    /// `ts` sidecar so age-based retention survives restart.
+    ///
+    /// Writes go through the OS page cache. After a successful
+    /// append, [`Self::maybe_sync_after_append`] bumps the per-append
+    /// and per-byte counters and signals the background fsync worker
+    /// if either threshold (`fsync_every_n` / `fsync_max_bytes`) is
+    /// crossed — the actual fsync runs off the appender thread, so
+    /// this call returns as soon as the bytes land in the page cache.
+    /// Explicit [`Self::sync`] and `close()` still fsync
+    /// synchronously regardless of policy.
     #[allow(dead_code)]
     pub(super) fn append_entry_at(
         &self,
@@ -605,8 +640,10 @@ impl DiskSegment {
     /// each file's buffered write is contiguous). Inline entries only
     /// touch the idx file.
     ///
-    /// Same fsync semantics as [`Self::append_entry`] — a batch of N
-    /// counts as N applied appends against the `EveryN` cadence.
+    /// Same fsync semantics as [`Self::append_entry`]: a batch of N
+    /// counts as N applied appends against the `EveryN` cadence and
+    /// `dat_buf.len() + idx_buf.len() + ts_buf.len()` bytes against
+    /// the byte threshold. At most one notify fires per batch.
     #[allow(dead_code)]
     pub(super) fn append_entries(
         &self,
@@ -819,8 +856,16 @@ impl DiskSegment {
         // Drop the cached append handles before the rename so
         // the original files aren't held open. We'll re-open
         // them at the end of this method.
-        let mut idx_guard = self.idx_file.lock();
+        //
+        // Acquire in dat → idx → ts order to match the global lock
+        // discipline documented in the module rustdoc. This is the
+        // only path that holds all three simultaneously; append paths
+        // only ever hold one at a time, so the order is incidentally
+        // safe today, but a future change that overlaps locks on the
+        // append path could deadlock if compaction held them in any
+        // other order.
         let mut dat_guard = self.dat_file.lock();
+        let mut idx_guard = self.idx_file.lock();
         let mut ts_guard = self.ts_file.lock();
 
         // Build the new idx, ts contents in-memory; the dat tail

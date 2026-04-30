@@ -35,6 +35,16 @@ pub enum FsyncPolicy {
     /// **point**, plus the bytes from any fsync that was in flight
     /// when the crash interrupted it. `0` and `1` both collapse to
     /// "signal on every append."
+    ///
+    /// Under heavy concurrent appends the bound loosens slightly:
+    /// the threshold check (`fetch_add` then `if cross { reset }`)
+    /// is not a CAS, so K appenders racing past the threshold can
+    /// each cross before any of them resets the counter. The next
+    /// sync covers all K of those entries; the durability contract
+    /// still holds (no entry survives unsynced past the next
+    /// fsync), but the practical bound becomes
+    /// `(N − 1) + (concurrent appenders at threshold)`. Pick a
+    /// smaller N if you need a tighter bound under contention.
     EveryN(u64),
     /// Fsync on a timer, independent of append rate. A per-file
     /// background tokio task drives the sync; `close()` cancels it.
@@ -46,16 +56,31 @@ pub enum FsyncPolicy {
     ///
     /// Use this for bursty workloads where a long `period` would
     /// leave too much data unsynced under load, but a short `period`
-    /// would over-fsync when idle. `period == 0` disables the timer
-    /// arm entirely (effectively no worker spawned); `max_bytes == 0`
-    /// disables the byte arm (equivalent to `Interval(period)`).
+    /// would over-fsync when idle.
+    ///
+    /// Configuration matrix:
+    ///
+    /// | `period` | `max_bytes` | Behavior |
+    /// |----------|-------------|----------|
+    /// | `> 0`    | `> 0`       | Full both-arms worker (timer + byte signal) |
+    /// | `> 0`    | `0`         | Timer-only worker (equivalent to `Interval(period)`) |
+    /// | `0`      | `> 0`       | Byte-only worker (no timer arm); fsyncs when the byte threshold crosses |
+    /// | `0`      | `0`         | No worker; equivalent to `Never` |
+    ///
+    /// The same concurrency caveat as [`Self::EveryN`] applies to
+    /// the byte arm: K concurrent appenders can each cross the
+    /// threshold before any of them resets the counter, so the
+    /// effective bound is
+    /// `max_bytes + (concurrent appenders' bytes at threshold)`.
     IntervalOrBytes {
         /// Maximum wall-clock interval between syncs. `0` disables
-        /// the timer arm (no worker is spawned).
+        /// the timer arm; pair with a non-zero `max_bytes` to get a
+        /// byte-only worker.
         period: Duration,
         /// Maximum bytes (across dat + idx + ts) accumulated since
         /// the last sync before the worker is signaled. `0`
-        /// disables the byte arm.
+        /// disables the byte arm; pair with a non-zero `period` to
+        /// get a timer-only worker (equivalent to `Interval`).
         max_bytes: u64,
     },
 }

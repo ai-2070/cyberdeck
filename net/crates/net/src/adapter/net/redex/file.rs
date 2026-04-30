@@ -252,9 +252,7 @@ impl RedexFile {
             // byte-threshold signal — whichever fires first triggers
             // a sync. The byte signal is fired by the appender via
             // `maybe_sync_after_append`, which checks `fsync_max_bytes`
-            // (already plumbed into the segment above). If period is
-            // ZERO, no worker is spawned (degenerate config — the
-            // user should use Never instead).
+            // (already plumbed into the segment above).
             FsyncPolicy::IntervalOrBytes { period, .. } if period > std::time::Duration::ZERO => {
                 let shutdown = Arc::new(Notify::new());
                 let task_shutdown = shutdown.clone();
@@ -272,6 +270,36 @@ impl RedexFile {
                                     );
                                 }
                             }
+                            _ = task_signal.notified() => {
+                                if let Err(e) = task_disk.sync() {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "IntervalOrBytes (bytes) fsync failed; continuing"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                });
+                Some(shutdown)
+            }
+            // `period == ZERO && max_bytes > 0` is the byte-only
+            // variant: skip the timer arm entirely but still react to
+            // the appender's byte-threshold notify. Without a worker
+            // the notify would just store an unread permit and the
+            // bytes would never auto-sync until close — almost
+            // certainly not what the caller meant by "byte-only."
+            FsyncPolicy::IntervalOrBytes { period, max_bytes }
+                if period == std::time::Duration::ZERO && max_bytes > 0 =>
+            {
+                let shutdown = Arc::new(Notify::new());
+                let task_shutdown = shutdown.clone();
+                let task_disk = disk.clone();
+                let task_signal = disk.fsync_signal.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = task_shutdown.notified() => return,
                             _ = task_signal.notified() => {
                                 if let Err(e) = task_disk.sync() {
                                     tracing::warn!(
@@ -2013,20 +2041,65 @@ mod tests {
         f.close().unwrap();
     }
 
-    /// Phase 4: `period == ZERO` falls through the spawn match's
-    /// guard and produces no worker — degenerate config, but must
-    /// not crash. The file still works for explicit appends and
-    /// `close()`-time fsync.
+    /// Phase 4: `period == ZERO && max_bytes > 0` is the byte-only
+    /// variant. A byte-only worker spawns (no timer arm) and reacts
+    /// to the appender's threshold notify. The earlier "no worker
+    /// at all when period is zero" behavior was a footgun: a caller
+    /// who explicitly asked for byte-only triggering would have
+    /// silently received no auto-sync until `close()`.
     #[cfg(feature = "redex-disk")]
     #[tokio::test(flavor = "current_thread")]
-    async fn test_fsync_policy_interval_or_bytes_zero_period_no_worker() {
-        let dir = tmp_persistent_dir("fsync_iob_zero_period");
+    async fn test_fsync_policy_interval_or_bytes_zero_period_byte_only_worker() {
+        let dir = tmp_persistent_dir("fsync_iob_byte_only");
+        // Tight `max_bytes=100` so the threshold fires quickly. The
+        // counter charges idx(20) + ts(8) + payload bytes per heap
+        // append, so a single 80-byte payload (108 B total) crosses.
         let f = make_persistent_with_policy(
-            "fsync/iob_zero_period",
+            "fsync/iob_byte_only",
             &dir,
             super::FsyncPolicy::IntervalOrBytes {
                 period: std::time::Duration::ZERO,
-                max_bytes: 1000,
+                max_bytes: 100,
+            },
+        );
+
+        // 3 refs: file + worker clone + this local clone.
+        let disk = f.disk().expect("persistent file has disk").clone();
+        assert_eq!(
+            Arc::strong_count(&disk),
+            3,
+            "period=ZERO with max_bytes>0 must spawn a byte-only worker \
+             (file + worker + test clone = 3 refs)"
+        );
+
+        // Cross the threshold once — worker should observe the
+        // notify and run a sync. No timer advance is involved; if a
+        // sync lands here, it can only be the byte arm.
+        f.append(&[b'x'; 80]).unwrap();
+        let observed = wait_for_sync_count(&f, 1, 50).await;
+        assert_eq!(
+            observed, 1,
+            "byte-only worker must auto-sync on threshold crossing \
+             without any timer advance"
+        );
+
+        f.close().unwrap();
+    }
+
+    /// Phase 4: `period == ZERO && max_bytes == 0` is the fully
+    /// degenerate config — equivalent to `Never`. No worker spawns.
+    /// The file still works for explicit appends and `close()`-time
+    /// fsync.
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_fsync_policy_interval_or_bytes_both_zero_no_worker() {
+        let dir = tmp_persistent_dir("fsync_iob_both_zero");
+        let f = make_persistent_with_policy(
+            "fsync/iob_both_zero",
+            &dir,
+            super::FsyncPolicy::IntervalOrBytes {
+                period: std::time::Duration::ZERO,
+                max_bytes: 0,
             },
         );
 
@@ -2036,21 +2109,18 @@ mod tests {
         assert_eq!(
             Arc::strong_count(&disk),
             2,
-            "period=ZERO must spawn no worker (file + test clone = \
+            "both arms zero must spawn no worker (file + test clone = \
              2 refs)"
         );
 
-        // File still functional. Bytes accumulate but no auto-sync.
+        // File still functional. No threshold and no timer means no
+        // auto-sync regardless of write volume.
         f.append(b"manual-only-A").unwrap();
         f.append(b"manual-only-B").unwrap();
         for _ in 0..20 {
             tokio::task::yield_now().await;
         }
-        assert_eq!(
-            f.sync_count(),
-            Some(0),
-            "no worker means no auto-syncs even past the byte threshold"
-        );
+        assert_eq!(f.sync_count(), Some(0), "no worker means no auto-syncs");
 
         // close() is the only durability barrier and must still
         // fsync regardless of policy.
