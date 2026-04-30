@@ -255,9 +255,7 @@ impl RedexFile {
             // (already plumbed into the segment above). If period is
             // ZERO, no worker is spawned (degenerate config — the
             // user should use Never instead).
-            FsyncPolicy::IntervalOrBytes { period, .. }
-                if period > std::time::Duration::ZERO =>
-            {
+            FsyncPolicy::IntervalOrBytes { period, .. } if period > std::time::Duration::ZERO => {
                 let shutdown = Arc::new(Notify::new());
                 let task_shutdown = shutdown.clone();
                 let task_disk = disk.clone();
@@ -1703,11 +1701,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn test_fsync_policy_every_n_coalesces_under_burst() {
         let dir = tmp_persistent_dir("fsync_coalesce");
-        let f = make_persistent_with_policy(
-            "fsync/coalesce",
-            &dir,
-            super::FsyncPolicy::EveryN(1),
-        );
+        let f = make_persistent_with_policy("fsync/coalesce", &dir, super::FsyncPolicy::EveryN(1));
         // No yields between appends — current_thread runtime can't
         // schedule the worker until we hit an await, so all 50
         // notifies arrive while the worker is parked. Notify stores
@@ -1733,11 +1727,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn test_fsync_policy_every_n_worker_survives_sync_error() {
         let dir = tmp_persistent_dir("fsync_sync_err");
-        let f = make_persistent_with_policy(
-            "fsync/sync_err",
-            &dir,
-            super::FsyncPolicy::EveryN(1),
-        );
+        let f = make_persistent_with_policy("fsync/sync_err", &dir, super::FsyncPolicy::EveryN(1));
 
         // Arm a one-shot sync failure. The next `sync()` (whether
         // worker- or close-driven) returns Err before touching disk.
@@ -1902,6 +1892,176 @@ mod tests {
         f.close().unwrap();
     }
 
+    /// Phase 4: inline appends bump `bytes_since_sync` by exactly
+    /// `idx_record(20) + ts(8) = 28` (no dat write, since the
+    /// payload rides inside the 20-byte idx record). With
+    /// `max_bytes = 100`, four inline appends cross the threshold
+    /// (4·28 = 112). Pins the inline branch of the bytes-written
+    /// calc — a regression that accidentally counted the inline
+    /// payload as dat bytes would trigger after just 2 appends
+    /// (2·36 = 72 still under 100, so actually different — but
+    /// 4·36 = 144 vs 4·28 = 112 still both cross at N=4 here, so
+    /// pick a tighter threshold). Use `max_bytes = 100` and
+    /// require exactly 4 appends → 1 sync.
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_fsync_policy_interval_or_bytes_byte_threshold_counts_inline() {
+        let dir = tmp_persistent_dir("fsync_iob_inline");
+        let f = make_persistent_with_policy(
+            "fsync/iob_inline",
+            &dir,
+            super::FsyncPolicy::IntervalOrBytes {
+                period: std::time::Duration::from_secs(60),
+                max_bytes: 100,
+            },
+        );
+
+        let payload: [u8; INLINE_PAYLOAD_SIZE] = *b"inline_8";
+        // Three inline appends = 84 bytes, under 100. No sync.
+        for _ in 0..3 {
+            f.append_inline(&payload).unwrap();
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            f.sync_count(),
+            Some(0),
+            "3 inline appends (3·28 = 84 < 100) must NOT trigger a sync"
+        );
+
+        // Fourth crosses (4·28 = 112 ≥ 100).
+        f.append_inline(&payload).unwrap();
+        let observed = wait_for_sync_count(&f, 1, 50).await;
+        assert_eq!(
+            observed, 1,
+            "4th inline append crosses the byte threshold (4·28 = \
+             112 ≥ 100); inline path must NOT charge payload bytes \
+             against dat (dat is skipped for inline)"
+        );
+
+        f.close().unwrap();
+    }
+
+    /// Phase 4: batch appends compute bytes-written as
+    /// `dat_buf + idx_buf + ts_buf`. A batch of 3 × 50-byte heap
+    /// payloads writes 150 + 60 + 24 = 234 bytes — one syscall to
+    /// each file. Pins the batch-path bookkeeping; a regression
+    /// that miscounted (e.g. only counted dat) would silently
+    /// raise the effective threshold.
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_fsync_policy_interval_or_bytes_byte_threshold_counts_batch() {
+        let dir = tmp_persistent_dir("fsync_iob_batch");
+        let f = make_persistent_with_policy(
+            "fsync/iob_batch",
+            &dir,
+            super::FsyncPolicy::IntervalOrBytes {
+                period: std::time::Duration::from_secs(60),
+                max_bytes: 200,
+            },
+        );
+
+        let payloads: Vec<Bytes> = (0..3).map(|_| Bytes::from(vec![b'z'; 50])).collect();
+        f.append_batch(&payloads).unwrap();
+        let observed = wait_for_sync_count(&f, 1, 50).await;
+        assert_eq!(
+            observed, 1,
+            "1 batch of 3·50B (234 bytes total across dat/idx/ts) \
+             must trigger 1 sync at max_bytes=200"
+        );
+
+        f.close().unwrap();
+    }
+
+    /// Phase 4: `max_bytes == 0` disables the byte arm entirely;
+    /// the policy is then equivalent to `Interval(period)`. Heavy
+    /// writes alone must NOT trigger a sync — only the timer can.
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_fsync_policy_interval_or_bytes_zero_max_bytes_disables_byte_arm() {
+        let dir = tmp_persistent_dir("fsync_iob_zero_bytes");
+        let f = make_persistent_with_policy(
+            "fsync/iob_zero_bytes",
+            &dir,
+            super::FsyncPolicy::IntervalOrBytes {
+                period: std::time::Duration::from_secs(60),
+                max_bytes: 0,
+            },
+        );
+
+        // Write 100 KB. With max_bytes=0 the byte arm is gated off
+        // (`if self.fsync_max_bytes > 0`), so this should produce
+        // zero auto-syncs — and we don't advance time, so the
+        // timer is silent too.
+        let payload = vec![b'y'; 1024];
+        for _ in 0..100 {
+            f.append(&payload).unwrap();
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            f.sync_count(),
+            Some(0),
+            "max_bytes=0 must disable the byte arm; no auto-syncs \
+             expected before any timer advance"
+        );
+
+        f.close().unwrap();
+    }
+
+    /// Phase 4: `period == ZERO` falls through the spawn match's
+    /// guard and produces no worker — degenerate config, but must
+    /// not crash. The file still works for explicit appends and
+    /// `close()`-time fsync.
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_fsync_policy_interval_or_bytes_zero_period_no_worker() {
+        let dir = tmp_persistent_dir("fsync_iob_zero_period");
+        let f = make_persistent_with_policy(
+            "fsync/iob_zero_period",
+            &dir,
+            super::FsyncPolicy::IntervalOrBytes {
+                period: std::time::Duration::ZERO,
+                max_bytes: 1000,
+            },
+        );
+
+        // file's own ref + this local clone = 2; no worker means
+        // no third ref.
+        let disk = f.disk().expect("persistent file has disk").clone();
+        assert_eq!(
+            Arc::strong_count(&disk),
+            2,
+            "period=ZERO must spawn no worker (file + test clone = \
+             2 refs)"
+        );
+
+        // File still functional. Bytes accumulate but no auto-sync.
+        f.append(b"manual-only-A").unwrap();
+        f.append(b"manual-only-B").unwrap();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            f.sync_count(),
+            Some(0),
+            "no worker means no auto-syncs even past the byte threshold"
+        );
+
+        // close() is the only durability barrier and must still
+        // fsync regardless of policy.
+        f.close().unwrap();
+        assert_eq!(
+            f.sync_count(),
+            Some(1),
+            "close() always fsyncs regardless of policy"
+        );
+    }
+
     /// Phase 3 invariant: after `close()` the EveryN worker must
     /// observe shutdown and drop its `Arc<DiskSegment>` clone, so
     /// the segment can eventually be freed once all RedexFile
@@ -1911,11 +2071,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn test_close_releases_worker_disk_reference() {
         let dir = tmp_persistent_dir("fsync_release");
-        let f = make_persistent_with_policy(
-            "fsync/release",
-            &dir,
-            super::FsyncPolicy::EveryN(1),
-        );
+        let f = make_persistent_with_policy("fsync/release", &dir, super::FsyncPolicy::EveryN(1));
 
         // Snapshot the strong count: file's own ref + worker's clone
         // + this local clone = 3.

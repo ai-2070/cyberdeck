@@ -439,11 +439,20 @@ Retention runs as an on-demand `sweep_retention()` call (no background task in v
 
 - **Count** (`retention_max_events`) — keep newest K entries
 - **Size** (`retention_max_bytes`) — keep newest M bytes of payload
-- **Age** (`retention_max_age_ns`) — drop entries older than D nanoseconds (wall-clock at append time; persistent files lose age info across reopen in v1)
+- **Age** (`retention_max_age_ns`) — drop entries older than D nanoseconds (wall-clock at append time; persistent files preserve age across reopen via a `ts` sidecar — see Durability below)
 
 `RedexFold<State>` is the integration hook that higher layers consume. RedEX defines the trait and drives it on a tail stream spawned by the caller; CortEX installs its `TasksFold` / `MemoriesFold` against it.
 
-Durability is opt-in behind the `redex-disk` feature and `RedexFileConfig::persistent`. Each persistent file writes two append-only files at `<base>/<channel_path>/{idx,dat}`. On reopen, the full `dat` is replayed into a fresh `HeapSegment` and `idx` restores the index; a torn trailing record from a crash (partial 20-byte write) is truncated on recovery. `close()` and explicit `sync()` fsync `dat` before `idx` — the crash-consistency ordering is "payload before index," so the worst case after a power cut is an index shorter than the payload, which the torn-tail logic already handles.
+Durability is opt-in behind the `redex-disk` feature and `RedexFileConfig::persistent`. Each persistent file writes three append-only files at `<base>/<channel_path>/{idx,dat,ts}`: `idx` carries the 20-byte records, `dat` carries heap payloads, and the `ts` sidecar carries 8-byte unix-nanos per entry so age-based retention survives restart. On reopen, the full `dat` is replayed into a fresh `HeapSegment`, `idx` restores the index, `ts` rehydrates per-entry timestamps, and a torn trailing record from a crash (partial 20-byte write or `dat`-shorter-than-`idx` from a crash mid-batch) is truncated on recovery. Per-entry checksums are verified during recovery and entries with mismatched checksums (mid-file bit-rot) are dropped without aborting reopen. `close()` and explicit `sync()` fsync `dat` → `idx` → `ts` in that order — the crash-consistency ordering is "payload before index, index before timestamps," so the worst case after a power cut is an index shorter than the payload (truncated by torn-tail logic) or a `ts` shorter than the index (recovered entries past the gap fall back to `now()`).
+
+Append-path fsyncs are governed by `FsyncPolicy`:
+
+- **`Never`** (default) — page cache only; `close()` is the durability barrier.
+- **`EveryN(N)`** — fsync after every N appends. The fsync runs on a background tokio worker — the appender returns as soon as bytes land in the page cache and signals the worker via `tokio::sync::Notify`. Concurrent notifies during an in-flight fsync coalesce into a single follow-up.
+- **`Interval(d)`** — fsync on a per-file timer.
+- **`IntervalOrBytes { period, max_bytes }`** — fsync when **either** `period` elapses **or** `max_bytes` of accumulated writes (across `dat` + `idx` + `ts`) crosses the threshold, whichever comes first. Same background-worker shape as `EveryN`; the byte arm is signal-driven (no polling).
+
+Batched appends are syscall-coalesced: `append_batch` issues at most three `write_all` calls per batch (one each to `dat`, `idx`, `ts`) instead of three per entry, and the heap segment commits the whole batch with a single `append_many` call. See [`docs/REDEX_DISK_THROUGHPUT_PLAN.md`](docs/REDEX_DISK_THROUGHPUT_PLAN.md) for the full design and shipped invariants.
 
 ACL enforcement happens at `open_file` via the optional `AuthGuard`. The check keys on the canonical `ChannelName` (not the 16-bit wire hash), so two distinct channels can never alias into the same ACL decision — see the Channels section for the two-tier authorization design.
 

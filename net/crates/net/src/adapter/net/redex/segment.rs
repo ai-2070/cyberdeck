@@ -265,8 +265,7 @@ mod tests {
         seg.append(&big).unwrap();
         // Now at MAX exactly. A two-payload batch totaling 2 bytes
         // must still be rejected.
-        let payloads: Vec<Bytes> =
-            vec![Bytes::from_static(b"x"), Bytes::from_static(b"y")];
+        let payloads: Vec<Bytes> = vec![Bytes::from_static(b"x"), Bytes::from_static(b"y")];
         assert!(matches!(
             seg.append_many(&payloads),
             Err(RedexError::PayloadTooLarge { .. })

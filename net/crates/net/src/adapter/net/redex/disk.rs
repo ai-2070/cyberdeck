@@ -29,10 +29,10 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -581,7 +581,11 @@ impl DiskSegment {
         // Bytes written across all three files this call. ts is 8
         // bytes, idx is REDEX_ENTRY_SIZE, dat is payload.len() for
         // heap entries (inline entries skip dat).
-        let dat_bytes = if entry.is_inline() { 0 } else { payload.len() as u64 };
+        let dat_bytes = if entry.is_inline() {
+            0
+        } else {
+            payload.len() as u64
+        };
         let total_bytes = dat_bytes + REDEX_ENTRY_SIZE as u64 + 8;
         self.maybe_sync_after_append(1, total_bytes);
         Ok(())

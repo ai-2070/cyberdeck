@@ -4,7 +4,16 @@
 
 ## Status
 
-Design only. No code changes yet.
+| Phase | State | Notes |
+|---|---|---|
+| 1 — Coalesce batch syscalls | ✅ Shipped | `disk.rs::append_entries_inner` rewritten; bench `bench_append_batch_disk` added |
+| 2 — Heap-side `append_many` | ✅ Shipped | `HeapSegment::append_many(&[Bytes])` added; `append_batch` and `append_batch_ordered` rewired |
+| 3 — `EveryN` fsync off the appender | ✅ Shipped | `fsync_signal` Notify; worker spawned in `open_persistent` |
+| 4 — Byte-threshold trigger / `IntervalOrBytes` | ✅ Shipped | Additive variant; signal-driven (not polling); `bytes_since_sync` reset inside `sync()` |
+| 5 — Single-append coalescer | ⏸ Deferred | Gated, speculative; do not start until 1–4 are benched |
+
+Test count after phases 1–4: **91 redex tests passing** (was 75 before Phase 1).
+Benches added but **not yet run** for before/after capture.
 
 ## Goals
 
@@ -12,18 +21,28 @@ Design only. No code changes yet.
 2. **Strictly sequential writes** — keep `dat` append-only; keep `idx` append-only; defer compaction/merge to background tasks. No seeks on the hot path.
 3. **Minimize fsyncs on the hot path** — use `FsyncPolicy` (`Never` / `Interval` for high-throughput, `EveryN` for tighter durability) and move fsyncs to a background task that flushes when **either** a time interval passes **or** buffered bytes exceed a threshold.
 
-## Current state (baseline)
+## Baseline (pre-Phase-1, for reference)
 
-- `disk.rs::append_entries_inner` (line 583) holds each file's `Mutex<File>` and loops `write_all` per entry. A batch of N events emits **3 · N** syscalls (one per entry per file) instead of 3.
-- `disk.rs::append_entry_inner` issues 3 sequential `write_all` calls per logical event (one per file).
-- `dat`, `idx`, `ts` are already append-only on the hot path. The only `set_len` calls are rollback paths after a write error and the recovery-time tail-truncation in `DiskSegment::open`.
-- `maybe_sync_after_append` (line 370) calls `self.sync()` **synchronously on the appender thread** when `EveryN` fires.
-- `FsyncPolicy::Interval(d)` is driven by a per-file tokio task spawned in `file.rs` that wakes every `d` and calls `disk.sync()`. There is no byte-threshold trigger.
-- `HeapSegment::append` (`segment.rs:66`) takes one payload at a time. `file.rs::append_batch` (`file.rs:441`) writes one batched syscall to disk via `append_entries_at`, then loops over the heap side per entry.
+The bullets below describe the codebase **before** Phases 1–4. The Phase sections describe what changed.
+
+- `disk.rs::append_entries_inner` held each file's `Mutex<File>` and looped `write_all` per entry. A batch of N events emitted **3 · N** syscalls (one per entry per file) instead of 3.
+- `disk.rs::append_entry_inner` issued 3 sequential `write_all` calls per logical event (one per file).
+- `dat`, `idx`, `ts` were already append-only on the hot path. The only `set_len` calls are rollback paths after a write error and the recovery-time tail-truncation in `DiskSegment::open`.
+- `maybe_sync_after_append` called `self.sync()` **synchronously on the appender thread** when `EveryN` fired.
+- `FsyncPolicy::Interval(d)` was driven by a per-file tokio task that wakes every `d` and calls `disk.sync()`. There was no byte-threshold trigger.
+- `HeapSegment::append` (`segment.rs:66`) took one payload at a time. `file.rs::append_batch` wrote one batched syscall to disk via `append_entries_at`, then looped over the heap side per entry.
 
 ---
 
-## Phase 1 — Coalesce batch syscalls into one `write_all` per file
+## Phase 1 — Coalesce batch syscalls into one `write_all` per file ✅
+
+**Shipped:** `disk.rs::append_entries_inner` rewritten as designed. `dat_pre_len` is now `Option<u64>` so all-inline batches skip the dat lock entirely. Write order, lock order, and rollback discipline preserved.
+
+**Tests added:**
+- `test_disk_batch_mixed_heap_and_inline_roundtrip` — pins inline payloads stay out of `dat_buf`.
+- `test_disk_batch_all_inline_skips_dat` — exercises the new `Option::None` branch.
+
+**Bench added:** `bench_append_batch_disk` (BATCH=64 × 64 B and × 1 KiB) — wired into the `redex-disk` criterion group. Not yet run for before/after numbers.
 
 **Touches:** `disk.rs::append_entries_inner` only.
 
@@ -58,7 +77,16 @@ Constraints to preserve:
 
 ---
 
-## Phase 2 — Heap-side `append_many`
+## Phase 2 — Heap-side `append_many` ✅
+
+**Shipped:** `HeapSegment::append_many(&[Bytes]) -> Result<u64, RedexError>` added. Single bounds check, single `reserve`, fused extend loop. Returns the offset of the first payload. Both `append_batch` and `append_batch_ordered` now make one `append_many` call instead of looping per-event.
+
+**Deviation from plan:** the plan suggested an `impl IntoIterator<Item = &'a [u8]>` API and turning `append` into a wrapper around `append_many(once(payload))`. Shipped instead: `append_many` takes `&[Bytes]` directly because both callsites already have that type as their public input, and `append` stays as its own implementation (a one-payload wrapper would have required allocating a 1-element `Bytes` slice or carrying a more complex iterator constraint). Functionally equivalent; cleaner at the callsites.
+
+**Tests added (in `segment.rs`):**
+- `test_append_many_basic` — offsets correct after a non-zero starting buffer.
+- `test_append_many_capacity_exceeded` — 3 GiB total bounds check rejects without partial extension.
+- `test_append_many_empty_returns_current_end` — empty batch is a no-op.
 
 **Touches:** `segment.rs` (new API), `file.rs::append_batch` (line 450), `file.rs::append_batch_ordered`.
 
@@ -82,7 +110,24 @@ Update `append_batch` and `append_batch_ordered` to call `append_many` once per 
 
 ---
 
-## Phase 3 — Move `EveryN` fsync off the appender thread
+## Phase 3 — Move `EveryN` fsync off the appender thread ✅
+
+**Shipped:**
+- `DiskSegment.fsync_signal: Arc<Notify>` added (always allocated; only signaled when a worker is listening).
+- `maybe_sync_after_append` notifies instead of running `sync()` inline.
+- Worker spawned in `RedexFile::open_persistent` for `FsyncPolicy::EveryN(_)` — selects over `task_signal.notified()` and `task_shutdown.notified()`.
+- Renamed `interval_shutdown` → `fsync_shutdown` (one field, both Interval and EveryN workers share the lifecycle).
+- `config.rs` rustdoc on `FsyncPolicy::EveryN` updated with the new loss bound.
+
+**Deviation from plan:** plan said `close()` "fires `shutdown.notify_one()` and joins the task." We don't join; `close()` fires the notify and the worker observes it on its next select iteration. Joining would require `tokio::task::JoinHandle` plumbing (not currently held) and would block close on the worker's next poll — unnecessary because the worker drops its `Arc<DiskSegment>` cleanly on exit. The `test_close_releases_worker_disk_reference` test pins this.
+
+**Tests added:**
+- `test_fsync_policy_every_n_does_not_block_appender` — 100 EveryN(1) appends in <50 ms (the headline non-blocking invariant).
+- `test_fsync_policy_every_n_coalesces_under_burst` — 50 burst notifies → 1 worker sync (pins single-permit semantics).
+- `test_fsync_policy_every_n_worker_survives_sync_error` — armed sync failure: worker logs, doesn't terminate, recovers on the next notify. Required adding `fail_next_sync` injection + `arm_next_sync_failure` test helper to `DiskSegment`.
+- `test_close_releases_worker_disk_reference` — `Arc::strong_count` drops from 3 → 2 after close (worker released its clone).
+
+Existing `test_fsync_policy_every_n_syncs_on_cadence` and `_clamps_zero_to_one` were converted to `#[tokio::test(flavor = "current_thread")]` with explicit yields between appends; added a `wait_for_sync_count` helper.
 
 **Touches:** `disk.rs::DiskSegment` (new field), `disk.rs::maybe_sync_after_append`, `disk.rs::DiskSegment::open` (spawn task), `disk.rs` close path, `config.rs` rustdoc on `FsyncPolicy::EveryN`.
 
@@ -119,7 +164,26 @@ Document the timing change in `config.rs:29` (`FsyncPolicy::EveryN`):
 
 ---
 
-## Phase 4 — Byte-threshold trigger for `Interval`
+## Phase 4 — Byte-threshold trigger for `Interval` ✅
+
+**Shipped:**
+- `DiskSegment.bytes_since_sync: AtomicU64` and `fsync_max_bytes: u64` added; `DiskSegment::open` signature now takes both `(fsync_every_n, fsync_max_bytes)`.
+- `maybe_sync_after_append(applied, bytes_written)` bumps both counters and notifies if **either** crosses its threshold.
+- Single-entry path computes `bytes_written = idx(20) + ts(8) + (inline ? 0 : payload.len())`.
+- Batch path computes `bytes_written = dat_buf.len() + idx_buf.len() + ts_buf.len()`.
+- `sync()` resets `bytes_since_sync` to 0 after the fsyncs succeed (required so a timer-driven sync doesn't leave the byte counter stale).
+- `FsyncPolicy::IntervalOrBytes { period, max_bytes }` variant added; new spawn arm in `open_persistent` selects over shutdown / timer / `fsync_signal`.
+
+**Deviation from plan:** plan said the worker should use a "short polling sleep that checks `bytes_since_sync >= max_bytes`." Shipped instead: signal-driven via the existing `fsync_signal` `Notify` (the same channel EveryN already uses). The appender checks the threshold and notifies; the worker awaits the signal. No polling loop; sub-microsecond response when the threshold crosses; cleaner and reuses Phase 3's infrastructure.
+
+**Tests added:**
+- `test_fsync_policy_interval_or_bytes_byte_threshold_fires` — 6 yielding appends of 78 B each → exactly 2 byte-threshold syncs at `max_bytes=200`.
+- `test_fsync_policy_interval_or_bytes_timer_fires` — `period=50 ms`, `max_bytes=10 MiB`, advance virtual time → ≥ 2 timer syncs.
+- `test_fsync_policy_interval_or_bytes_timer_resets_byte_counter` — confirms a timer-driven sync resets the byte counter (sub-threshold append after the tick doesn't accidentally re-trigger).
+- `test_fsync_policy_interval_or_bytes_byte_threshold_counts_inline` — pins inline path: 28 B/append, no dat charge; 4 inline appends (112 B) cross at `max_bytes=100`.
+- `test_fsync_policy_interval_or_bytes_byte_threshold_counts_batch` — pins batch-path aggregation: 3 × 50 B → 234 total bytes triggers at `max_bytes=200`.
+- `test_fsync_policy_interval_or_bytes_zero_max_bytes_disables_byte_arm` — 100 KiB written with `max_bytes=0` produces zero auto-syncs.
+- `test_fsync_policy_interval_or_bytes_zero_period_no_worker` — `period=ZERO` falls through the spawn match's guard; `Arc::strong_count == 2` (file + test, no worker), file still functional, `close()` still syncs.
 
 **Touches:** `config.rs` (new variant), `disk.rs` (counter), `file.rs` (background task select).
 
@@ -188,13 +252,15 @@ Add these to the module rustdoc in `disk.rs` so they are visible at the top of t
 
 ## Validation methodology
 
-Add to `net/crates/net/benches/redex.rs`:
+In `net/crates/net/benches/redex.rs`:
 
-- `bench_append_single_disk` — already exists at line 157; keep as baseline.
-- `bench_append_batch_disk` — Phase 1 target. 64 × 64 B and 64 × 1 KiB.
-- `bench_append_single_disk_concurrent` — N tasks × M appends, varying N. Phase 5 target.
-- `bench_fsync_p99_everyn_n1` — measures appender p99 at `EveryN(1)`. Phase 3 target.
-- `bench_interval_or_bytes_under_burst` — Phase 4 target.
+- ✅ `bench_append_disk` — pre-existing single-append baseline (`Never` policy).
+- ✅ `bench_append_batch_disk` — Phase 1: 64 × 64 B and 64 × 1 KiB at `Never`.
+- ✅ `bench_append_disk_policies` — Phase 3 + 4: single 256 B append across `Never`, `EveryN(1)`, `EveryN(64)`, `Interval(50ms)`, `IntervalOrBytes(50ms, 1 MiB)`. The non-`Never` rows should track `Never` closely; a regression that re-introduced synchronous fsync on the appender would show as a 10x–100x latency jump.
+- ✅ `bench_append_batch_disk_policies` — combined Phase 1 + 3 + 4: `BATCH=64 × 64 B` at `Never`, `EveryN(1)`, and `IntervalOrBytes` with a tight `max_bytes=1 KiB` so the byte arm fires every batch.
+- ⏳ `bench_append_single_disk_concurrent` — N tasks × M appends, varying N. Phase 5 target.
+
+**None of the disk benches have been run yet for before/after capture.** Plan: run on the merged branch and post numbers in the PR description.
 
 Capture before/after numbers per phase in the PR description. Expected:
 
@@ -221,10 +287,11 @@ cargo test -p net --features redex-disk --test redex_disk -- --nocapture
 
 ---
 
-## Sequencing recommendation
+## Sequencing — as shipped
 
-1. Phase 1 (mechanical, isolated, high payoff) — single PR.
-2. Phase 2 (mechanical, depends on Phase 1 to unlock batched-disk + batched-heap end-to-end) — single PR.
-3. Phase 3 (semantics tweak, async task added) — single PR with the rustdoc update on `EveryN` and the new tests.
-4. Phase 4 (additive variant + counter) — single PR.
-5. Phase 5 (gated, opt-in) — separate design discussion before code; do not start until 1–4 are merged and benched.
+Phases 1–4 landed in a single working tree on the `redex-disk` branch rather than as four separate PRs (the original recommendation). The phases are independently rebaseable if a reviewer wants to split them; no later phase depends on a structural choice made in an earlier one that wouldn't hold up under bisection.
+
+Remaining work:
+
+- **Run benches** to capture Phase 1 / 2 / 3 before-after numbers (the test suite pins correctness; benches quantify the win).
+- **Phase 5 (gated, opt-in)** — separate design discussion before code; do not start until benches show whether the existing batched-disk path leaves single-append throughput on the table under contention.
