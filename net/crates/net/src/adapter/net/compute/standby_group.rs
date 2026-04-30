@@ -319,7 +319,11 @@ impl StandbyGroup {
                 continue; // already promoted or is the new active
             }
 
-            let _ = registry.unregister(self.coord.members()[index as usize].origin_hash);
+            // BUG_REPORT.md #7: place BEFORE touching the
+            // registry so a placement failure leaves the slot
+            // recoverable. Mirror of replica_group / fork_group
+            // fixes.
+            let old_origin_hash = self.coord.members()[index as usize].origin_hash;
 
             let keypair = EntityKeypair::from_bytes(self.members[index as usize].keypair_secret);
             let entity_id_bytes: NodeId = *keypair.entity_id().as_bytes();
@@ -327,12 +331,31 @@ impl StandbyGroup {
             let placement =
                 match GroupCoordinator::place_with_spread(scheduler, &requirements, &exclude) {
                     Ok(p) => p,
-                    Err(_) => continue,
+                    Err(e) => {
+                        tracing::warn!(
+                            index,
+                            error = %e,
+                            "StandbyGroup::on_node_failure: place_with_spread failed; \
+                             slot left registered for later recovery (#7)"
+                        );
+                        continue;
+                    }
                 };
+
+            // Standby keypairs are stored per-member; new
+            // origin_hash matches old, so unregister before
+            // register.
+            let _ = registry.unregister(old_origin_hash);
 
             let daemon = daemon_factory();
             let host = DaemonHost::new(daemon, keypair, self.config.host_config.clone());
-            if registry.register(host).is_err() {
+            if let Err(e) = registry.register(host) {
+                tracing::warn!(
+                    index,
+                    error = %e,
+                    "StandbyGroup::on_node_failure: registry.register failed after \
+                     unregister; slot is now degraded (#7)"
+                );
                 continue;
             }
 

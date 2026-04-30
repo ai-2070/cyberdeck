@@ -96,10 +96,26 @@ impl BatchedTransport {
 
     /// Send multiple packets in a single syscall.
     ///
-    /// Returns the number of packets successfully sent.
+    /// Returns the number of packets successfully sent — equal to
+    /// `packets.len().min(MAX_BATCH_SIZE)` on full success.
+    ///
+    /// BUG_REPORT.md #13: previously returned `Ok(sent as usize)`
+    /// after a single `sendmmsg`. Linux can return `0 < sent <
+    /// count` on partial sends; the caller in this crate just
+    /// recorded `sent` without re-queueing the tail, so packets
+    /// `[sent..count)` were silently lost. For reliable streams
+    /// `on_send` had already stashed each packet's bytes for
+    /// retransmit, so they sat in `pending` "in flight" without
+    /// ever reaching the wire — eventually NACK'd, but with extra
+    /// latency that didn't need to happen.
+    ///
+    /// The fix is a small inner loop: re-issue `sendmmsg` on the
+    /// unsent tail until either all packets ship, or the syscall
+    /// returns a hard error, or we make zero progress (which we
+    /// return as `Ok(sent_so_far)` rather than spinning forever).
     pub fn send_batch(&mut self, packets: &[Bytes], target: SocketAddr) -> io::Result<usize> {
-        let count = packets.len().min(MAX_BATCH_SIZE);
-        if count == 0 {
+        let total = packets.len().min(MAX_BATCH_SIZE);
+        if total == 0 {
             return Ok(0);
         }
 
@@ -120,8 +136,11 @@ impl BatchedTransport {
             }
         };
 
-        // Setup messages
-        for (i, packet) in packets.iter().take(count).enumerate() {
+        // Setup messages for the full batch up front. The retry
+        // loop below issues sendmmsg against the tail starting
+        // at `&self.msgs[sent_so_far]`, so the slot contents
+        // remain valid for the entire call.
+        for (i, packet) in packets.iter().take(total).enumerate() {
             self.iovecs[i] = libc::iovec {
                 iov_base: packet.as_ptr() as *mut _,
                 iov_len: packet.len(),
@@ -141,21 +160,46 @@ impl BatchedTransport {
             self.msgs[i].msg_len = 0;
         }
 
-        // Send
-        let sent = unsafe {
-            libc::sendmmsg(
-                self.socket_fd,
-                self.msgs.as_mut_ptr(),
-                count as u32,
-                0, // flags
-            )
-        };
+        // Retry tail until either all packets ship, the kernel
+        // returns a hard error, or we make zero progress.
+        let mut sent_so_far: usize = 0;
+        while sent_so_far < total {
+            let remaining = total - sent_so_far;
+            let sent = unsafe {
+                libc::sendmmsg(
+                    self.socket_fd,
+                    self.msgs.as_mut_ptr().add(sent_so_far),
+                    remaining as u32,
+                    0,
+                )
+            };
 
-        if sent < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(sent as usize)
+            if sent < 0 {
+                let err = io::Error::last_os_error();
+                // EINTR is benign — retry the tail. Same for
+                // EAGAIN/EWOULDBLOCK only when *no* progress has
+                // been made; otherwise we surface the partial
+                // count and let the caller decide.
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if sent_so_far > 0 {
+                    return Ok(sent_so_far);
+                }
+                return Err(err);
+            }
+            let sent = sent as usize;
+            if sent == 0 {
+                // Zero progress — bail with what we got. Should
+                // not happen on a healthy socket; treating it as
+                // an indefinite spin would be worse than
+                // surfacing the partial count.
+                break;
+            }
+            sent_so_far += sent;
         }
+
+        Ok(sent_so_far)
     }
 
     /// Receive multiple packets in a single syscall.

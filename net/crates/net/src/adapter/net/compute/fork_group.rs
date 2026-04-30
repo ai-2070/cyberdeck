@@ -258,13 +258,18 @@ impl ForkGroup {
         for index in affected {
             self.coord.mark_unhealthy(index);
 
-            let member = self
+            let old_origin_hash = self
                 .coord
                 .members()
                 .iter()
                 .find(|m| m.index == index)
-                .unwrap();
-            let _ = registry.unregister(member.origin_hash);
+                .unwrap()
+                .origin_hash;
+
+            // BUG_REPORT.md #7: try `place_with_spread` BEFORE
+            // touching the registry so a placement failure
+            // doesn't leave the slot unregistered (and therefore
+            // unrecoverable via `on_node_recovery`).
 
             // Recover the same keypair from stored secret
             let fork_info = match self.forks.get(index as usize) {
@@ -277,15 +282,27 @@ impl ForkGroup {
             let keypair = EntityKeypair::from_bytes(fork_info.keypair_secret);
             let entity_id_bytes: NodeId = *keypair.entity_id().as_bytes();
 
-            // Re-create the chain from the fork point
             let chain_builder =
                 CausalChainBuilder::from_head(fork_info.record.fork_genesis, bytes::Bytes::new());
 
             let placement =
                 match GroupCoordinator::place_with_spread(scheduler, &requirements, &exclude) {
                     Ok(p) => p,
-                    Err(_) => continue,
+                    Err(e) => {
+                        tracing::warn!(
+                            index,
+                            error = %e,
+                            "ForkGroup::on_node_failure: place_with_spread failed; \
+                             slot left registered for later recovery (#7)"
+                        );
+                        continue;
+                    }
                 };
+
+            // Fork keypairs are deterministic per (parent_origin,
+            // fork_seq) — old and new origin_hash match — so we
+            // must unregister before re-registering.
+            let _ = registry.unregister(old_origin_hash);
 
             let daemon = daemon_factory();
             let host = DaemonHost::from_fork(
@@ -294,7 +311,13 @@ impl ForkGroup {
                 chain_builder,
                 self.config.host_config.clone(),
             );
-            if registry.register(host).is_err() {
+            if let Err(e) = registry.register(host) {
+                tracing::warn!(
+                    index,
+                    error = %e,
+                    "ForkGroup::on_node_failure: registry.register failed after \
+                     unregister; slot is now degraded (#7)"
+                );
                 continue;
             }
 

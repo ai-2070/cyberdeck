@@ -869,6 +869,17 @@ impl SafetyEnforcer {
     }
 
     /// Acquire resources for a request
+    ///
+    /// BUG_REPORT.md #8: previously this did `load + compare` in
+    /// `check_resource_limits`, then unconditionally `fetch_add`'d
+    /// each counter. N concurrent acquirers all observed
+    /// `current=0` and all proceeded past the cap — the kill-switch
+    /// / safety envelope was breakable under load. The fix uses
+    /// `fetch_update` (compare-and-swap loop) for each cumulative
+    /// counter so the check + add is atomic per resource, and
+    /// rolls back any partial successes if a later resource fails.
+    /// `tokens` is per-request (not cumulative) so it stays as a
+    /// straight load.
     pub fn acquire(
         self: &Arc<Self>,
         req: &SafetyRequest,
@@ -888,22 +899,113 @@ impl SafetyEnforcer {
         // Check kill switch
         self.check_kill_switch()?;
 
-        // Check resource limits
-        self.check_resource_limits(&claim, &envelope)?;
+        let limits = &envelope.resource_limits;
+        let enforce = envelope.mode == EnforcementMode::Enforce;
 
-        // Acquire resources atomically
-        self.usage
-            .concurrent
-            .fetch_add(claim.concurrent_slots, Ordering::Relaxed);
+        // tokens is per-request (not cumulative) so a plain
+        // compare against the per-request cap is fine.
+        if enforce && claim.tokens > limits.max_tokens_per_request {
+            return Err(SafetyViolation::ResourceLimitExceeded {
+                resource: ResourceType::Tokens,
+                requested: claim.tokens as u64,
+                available: limits.max_tokens_per_request as u64,
+            });
+        }
+
+        // Reset the cost window before the cost CAS so a stale
+        // accumulator doesn't reject a legitimate request right
+        // after the hour rollover.
+        self.usage.maybe_reset_hourly();
+
+        // Helper: atomically `fetch_update` an `AtomicU32`
+        // counter so that `add` only commits if `current + add
+        // <= max`. Returns Err with the current value on cap
+        // exceeded.
+        fn try_fetch_add_capped_u32(
+            counter: &std::sync::atomic::AtomicU32,
+            add: u32,
+            max: u32,
+        ) -> Result<(), u32> {
+            counter
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    let next = current.saturating_add(add);
+                    if next > max { None } else { Some(next) }
+                })
+                .map(|_| ())
+                .map_err(|cur| cur)
+        }
+
+        // 1. Concurrent slots.
+        if enforce {
+            if let Err(cur) = try_fetch_add_capped_u32(
+                &self.usage.concurrent,
+                claim.concurrent_slots,
+                limits.max_concurrent,
+            ) {
+                return Err(SafetyViolation::ResourceLimitExceeded {
+                    resource: ResourceType::Concurrent,
+                    requested: claim.concurrent_slots as u64,
+                    available: limits.max_concurrent.saturating_sub(cur) as u64,
+                });
+            }
+        } else {
+            self.usage
+                .concurrent
+                .fetch_add(claim.concurrent_slots, Ordering::Relaxed);
+        }
+
+        // 2. Memory. On failure, roll back concurrent.
+        if enforce {
+            if let Err(cur) = try_fetch_add_capped_u32(
+                &self.usage.memory_mb,
+                claim.memory_mb,
+                limits.max_memory_mb,
+            ) {
+                self.usage
+                    .concurrent
+                    .fetch_sub(claim.concurrent_slots, Ordering::Relaxed);
+                return Err(SafetyViolation::ResourceLimitExceeded {
+                    resource: ResourceType::Memory,
+                    requested: claim.memory_mb as u64,
+                    available: limits.max_memory_mb.saturating_sub(cur) as u64,
+                });
+            }
+        } else {
+            self.usage
+                .memory_mb
+                .fetch_add(claim.memory_mb, Ordering::Relaxed);
+        }
+
+        // 3. Hourly cost. On failure, roll back concurrent + memory.
+        if enforce {
+            if let Err(cur) = try_fetch_add_capped_u32(
+                &self.usage.cost_cents_per_hour,
+                claim.cost_cents,
+                limits.max_cost_per_hour_cents,
+            ) {
+                self.usage
+                    .concurrent
+                    .fetch_sub(claim.concurrent_slots, Ordering::Relaxed);
+                self.usage
+                    .memory_mb
+                    .fetch_sub(claim.memory_mb, Ordering::Relaxed);
+                return Err(SafetyViolation::ResourceLimitExceeded {
+                    resource: ResourceType::Cost,
+                    requested: claim.cost_cents as u64,
+                    available: limits.max_cost_per_hour_cents.saturating_sub(cur) as u64,
+                });
+            }
+        } else {
+            self.usage
+                .cost_cents_per_hour
+                .fetch_add(claim.cost_cents, Ordering::Relaxed);
+        }
+
+        // tokens is a free-running counter (not capped here —
+        // cap is per-request and was checked above).
         self.usage
             .tokens
             .fetch_add(claim.tokens as u64, Ordering::Relaxed);
-        self.usage
-            .memory_mb
-            .fetch_add(claim.memory_mb, Ordering::Relaxed);
-        self.usage
-            .cost_cents_per_hour
-            .fetch_add(claim.cost_cents, Ordering::Relaxed);
 
         // Record rate limit usage
         self.rate_limiter
@@ -1647,6 +1749,89 @@ mod tests {
             ),
             "overflow must be rejected, got {:?}",
             result
+        );
+    }
+
+    /// Regression: BUG_REPORT.md #8 — `acquire` previously did
+    /// `load + compare` (`check_resource_limits`) then
+    /// `fetch_add`. N concurrent acquirers all observed the same
+    /// pre-add value and all proceeded past the cap. The fix
+    /// uses `fetch_update` per cumulative resource so the check +
+    /// add is atomic per counter.
+    ///
+    /// We pin this by spawning many threads that each try to
+    /// acquire 1 concurrent slot against a cap of K. Pre-fix,
+    /// the final `concurrent` counter could exceed K. Post-fix,
+    /// the cap is honored exactly: we see at most K successful
+    /// `acquire`s and the rest fail with `ResourceLimitExceeded`.
+    #[test]
+    fn acquire_concurrent_cap_is_atomic_under_contention() {
+        use std::sync::Arc;
+        use std::sync::Barrier;
+        use std::thread;
+
+        const CAP: u32 = 5;
+        const ATTEMPTS: usize = 100;
+
+        // Build an enforcer with `max_concurrent = CAP` and very
+        // permissive other limits, so the race surfaces only on
+        // `concurrent`.
+        let limits = ResourceEnvelope {
+            max_concurrent: CAP,
+            max_tokens_per_request: 1_000_000,
+            max_memory_mb: 1_000_000,
+            max_time_ms: 1_000_000,
+            max_cost_per_hour_cents: u32::MAX,
+        };
+        let envelope = SafetyEnvelope {
+            mode: EnforcementMode::Enforce,
+            resource_limits: limits,
+            ..Default::default()
+        };
+        let enforcer = Arc::new(SafetyEnforcer::with_envelope(envelope));
+
+        let barrier = Arc::new(Barrier::new(ATTEMPTS));
+        let handles: Vec<_> = (0..ATTEMPTS)
+            .map(|_| {
+                let enf = Arc::clone(&enforcer);
+                let b = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    b.wait();
+                    let req = SafetyRequest::new();
+                    let claim = ResourceClaim {
+                        concurrent_slots: 1,
+                        tokens: 1,
+                        memory_mb: 0,
+                        time_ms: 0,
+                        cost_cents: 0,
+                    };
+                    enf.acquire(&req, claim)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let successes: Vec<_> = results
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // The crucial invariant: no more than CAP concurrent
+        // claims actually committed. Pre-fix this would routinely
+        // exceed CAP under high contention.
+        assert!(
+            successes.len() as u32 <= CAP,
+            "TOCTOU regression (#8): {} concurrent acquires committed against \
+             cap of {}",
+            successes.len(),
+            CAP
+        );
+
+        // And the counter itself reflects exactly that — never
+        // higher than CAP.
+        assert!(
+            enforcer.usage.concurrent.load(Ordering::Relaxed) <= CAP,
+            "concurrent counter exceeds cap"
         );
     }
 }

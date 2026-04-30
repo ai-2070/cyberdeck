@@ -633,7 +633,21 @@ impl LoadBalancer {
         const MAX_RESERVATION_RETRIES: usize = 4;
         let max_conn = self.config.max_connections_per_endpoint;
 
-        for _ in 0..MAX_RESERVATION_RETRIES {
+        // BUG_REPORT.md #39: round-robin strategies advance
+        // `rr_counter` inside their selection function. The retry
+        // loop below could call them up to 4 times per logical
+        // `select()`, which inflated the rotation counter
+        // proportionally and distorted the observed RR sequence
+        // — weighted-RR distribution tests indirectly assumed
+        // 1:1. We pre-compute the RR offset once for this whole
+        // logical selection and step deterministically across
+        // retries via `(rr_offset + attempt)`, so the counter
+        // advances exactly once per `select()` regardless of
+        // how many reservation retries occur.
+        let rr_offset_for_this_select =
+            self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+
+        for attempt in 0..MAX_RESERVATION_RETRIES {
             let available = self.get_available_endpoints(ctx)?;
 
             if available.is_empty() {
@@ -641,10 +655,19 @@ impl LoadBalancer {
                 return Err(LoadBalancerError::NoEndpointsAvailable);
             }
 
-            // Apply strategy
+            // Apply strategy. Round-robin variants take a
+            // pre-computed offset; non-RR strategies are
+            // unaffected by retries (their selection is content-
+            // or metric-based).
             let selection = match self.config.strategy {
-                Strategy::RoundRobin => self.select_round_robin(&available),
-                Strategy::WeightedRoundRobin => self.select_weighted_round_robin(&available),
+                Strategy::RoundRobin => self.select_round_robin_at(
+                    &available,
+                    rr_offset_for_this_select.wrapping_add(attempt),
+                ),
+                Strategy::WeightedRoundRobin => self.select_weighted_round_robin_at(
+                    &available,
+                    rr_offset_for_this_select.wrapping_add(attempt) as u64,
+                ),
                 Strategy::LeastConnections => self.select_least_connections(&available),
                 Strategy::WeightedLeastConnections => {
                     self.select_weighted_least_connections(&available)
@@ -745,7 +768,19 @@ impl LoadBalancer {
     }
 
     fn select_round_robin(&self, endpoints: &[Arc<EndpointState>]) -> Selection {
-        let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize % endpoints.len();
+        let offset = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+        self.select_round_robin_at(endpoints, offset)
+    }
+
+    /// BUG_REPORT.md #39: offset-based variant used by the
+    /// retry loop in `select()` so a logical select advances the
+    /// `rr_counter` exactly once across all reservation retries.
+    fn select_round_robin_at(
+        &self,
+        endpoints: &[Arc<EndpointState>],
+        offset: usize,
+    ) -> Selection {
+        let idx = offset % endpoints.len();
         let state = &endpoints[idx];
         Selection {
             node_id: state.node_id,
@@ -756,10 +791,22 @@ impl LoadBalancer {
     }
 
     fn select_weighted_round_robin(&self, endpoints: &[Arc<EndpointState>]) -> Selection {
+        let counter = self.rr_counter.fetch_add(1, Ordering::Relaxed);
+        self.select_weighted_round_robin_at(endpoints, counter)
+    }
+
+    /// BUG_REPORT.md #39: offset-based variant used by `select()`
+    /// across reservation retries so the `rr_counter` advances
+    /// exactly once per logical select.
+    fn select_weighted_round_robin_at(
+        &self,
+        endpoints: &[Arc<EndpointState>],
+        counter: u64,
+    ) -> Selection {
         let total_weight: f64 = endpoints.iter().map(|e| e.effective_weight()).sum();
 
         if total_weight <= 0.0 {
-            return self.select_round_robin(endpoints);
+            return self.select_round_robin_at(endpoints, counter as usize);
         }
 
         // Reduce the counter modulo `total_weight` in integer space
@@ -773,7 +820,6 @@ impl LoadBalancer {
         // fractional precision (negligible for any real load-balancer
         // configuration), while keeping the rotation length
         // comparable to the integer-weight sum.
-        let counter = self.rr_counter.fetch_add(1, Ordering::Relaxed);
         let total_ceil = (total_weight.ceil() as u64).max(1);
         let target = (counter % total_ceil) as f64;
 

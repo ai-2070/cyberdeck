@@ -579,20 +579,28 @@ impl PortMapperTask {
         // advertisement before revoke fires.
         const RETRY_BACKOFF: Duration = Duration::from_millis(200);
 
-        let effective_interval = || -> Duration {
-            let configured = if self.renewal_interval.is_zero() {
+        // Free helper rather than a closure so it doesn't capture
+        // `mapping` (which we mutate inside the loop). Borrowing
+        // a closure across the `mapping = next;` reassignment
+        // would deny the assignment under the borrow checker.
+        fn effective_interval(
+            renewal_interval: Duration,
+            ttl: Duration,
+        ) -> Duration {
+            let configured = if renewal_interval.is_zero() {
                 Duration::from_secs(1)
             } else {
-                self.renewal_interval
+                renewal_interval
             };
-            let half_ttl = mapping.ttl / 2;
+            let half_ttl = ttl / 2;
             if !half_ttl.is_zero() && half_ttl < configured {
                 half_ttl
             } else {
                 configured
             }
-        };
-        let mut ticker = tokio::time::interval(effective_interval());
+        }
+        let mut ticker =
+            tokio::time::interval(effective_interval(self.renewal_interval, mapping.ttl));
         // First tick is immediate; skip — we just installed.
         ticker.tick().await;
 
@@ -628,7 +636,8 @@ impl PortMapperTask {
                             mapping = next;
                             // Re-derive ticker if the new lease's
                             // TTL changed our effective cadence.
-                            let new_interval = effective_interval();
+                            let new_interval =
+                                effective_interval(self.renewal_interval, mapping.ttl);
                             if new_interval != ticker.period() {
                                 ticker = tokio::time::interval(new_interval);
                                 ticker.tick().await; // immediate first tick
