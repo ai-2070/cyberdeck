@@ -1,0 +1,45 @@
+net/crates/net/src/adapter/net/state/snapshot.rs
+  4f40616bb3482b98 348-354,819-861
+net/crates/net/src/adapter/net/route.rs
+  4f40616bb3482b98 231-241,248-257
+net/crates/net/src/adapter/net/state/log.rs
+  4f40616bb3482b98 77-88
+net/crates/net/src/adapter/net/state/causal.rs
+  4f40616bb3482b98 235-261,263-273,275-276,284-286,288,295-300,527-530
+net/crates/net/src/adapter/net/behavior/proximity.rs
+  4f40616bb3482b98 191-198,203-204,1008-1045
+net/crates/net/src/adapter/net/subprotocol/negotiation.rs
+  4f40616bb3482b98 73-83,90,92-94,99,102-106,305-358
+net/crates/net/src/ffi/mesh.rs
+  4f40616bb3482b98 159-170,172,176,179-184,190-192,208-210,363,590,597,860,898,1069,1144-1155,1172-1174,1205-1207,1240-1242,1424,1500,1533,1614,1624,1926,1932,1992,2143,2163,2601,2630,2796,2799,2881,2926,2929,2965,3081-3145
+net/crates/net/src/ffi/mod.rs
+  4f40616bb3482b98 221-225,923-934,949-950
+net/crates/net/src/adapter/net/contested/reconcile.rs
+  4f40616bb3482b98 160-171,177-206
+net/crates/net/docs/BUG_AUDIT_2026_04_30.md
+  4f40616bb3482b98 7-9,12-19,21
+net/crates/net/src/adapter/net/compute/replica_group.rs
+  4f40616bb3482b98 177-186,195,454-488
+net/crates/net/src/ffi/cortex.rs
+  4f40616bb3482b98 100-103,109-111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "59947a280ac8e7a82df15a4c0d11ed0a48d786e5",
+  "prompts": {
+    "4f40616bb3482b98": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4364a44-daa1-40ed-9f76-d0eea8143568",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1178,
+      "total_deletions": 133,
+      "accepted_lines": 522,
+      "overriden_lines": 0
+    }
+  }
+}
