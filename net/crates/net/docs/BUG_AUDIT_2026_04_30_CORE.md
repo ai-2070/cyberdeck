@@ -118,6 +118,11 @@ Fix options:
 
 Option 1 is the smaller delta. Option 2 keeps the format consistent with the in-memory representation and avoids any future drift.
 
+**Decision:** go with option 1 — renormalize `state.index` offsets by `dat_base` inside `sweep_retention`, and ensure `segment.base_offset` is reset consistently so that subsequent appends compute offsets against a 0-based segment. Then add a regression test that:
+
+- appends → `sweep_retention` → appends again → `close` → reopen,
+- and asserts the post-sweep append survives restart (e.g. seq numbers `[3, 4, 5, 6]` — surviving pair plus two post-sweep appends — are all present after reopen).
+
 ### 93. Redex `compact_to` non-atomic three-rename sequence with no parent-dir fsync
 **File:** `adapter/net/redex/disk.rs:1086-1089`
 
