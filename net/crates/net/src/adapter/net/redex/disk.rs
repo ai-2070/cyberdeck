@@ -29,11 +29,13 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
+use tokio::sync::Notify;
 
 use super::super::channel::ChannelName;
 use super::entry::{RedexEntry, REDEX_ENTRY_SIZE};
@@ -74,13 +76,20 @@ pub(super) struct DiskSegment {
     /// together so no entry can be on disk without its timestamp.
     ts_file: Mutex<File>,
     /// Append-path fsync interval: after `fsync_every_n` successful
-    /// appends, the segment invokes `sync()` itself. `0` disables
-    /// append-side syncing (Never or Interval policies — the latter
-    /// is driven externally by a per-file background task).
+    /// appends, the segment notifies the background fsync worker.
+    /// `0` disables append-side syncing (Never or Interval policies
+    /// — the latter is driven by a per-file timer task).
     fsync_every_n: u64,
     /// Appends since the last append-driven sync (successful or not).
     /// Only meaningful when `fsync_every_n > 0`.
     appends_since_sync: AtomicU64,
+    /// Wake-up signal for the EveryN background fsync worker. The
+    /// appender notifies this when `appends_since_sync` reaches the
+    /// `fsync_every_n` threshold, then returns immediately — the
+    /// fsync runs off the appender thread. Always allocated (cheap);
+    /// only signaled when `fsync_every_n > 0` AND a worker is
+    /// listening (spawned by `RedexFile::open_persistent`).
+    pub(super) fsync_signal: Arc<Notify>,
     /// Test-only injection: when set, the next `append_entry` /
     /// `append_entries` call returns `RedexError::Io` before touching
     /// either file. Exercises the caller's rollback paths without
@@ -336,6 +345,7 @@ impl DiskSegment {
                 ts_file: Mutex::new(ts_file),
                 fsync_every_n,
                 appends_since_sync: AtomicU64::new(0),
+                fsync_signal: Arc::new(Notify::new()),
                 #[cfg(test)]
                 fail_next_append: AtomicBool::new(false),
                 #[cfg(test)]
@@ -355,14 +365,15 @@ impl DiskSegment {
         self.sync_count.load(Ordering::Acquire)
     }
 
-    /// Bump the per-append counter and, if `fsync_every_n` is set,
-    /// call `sync()` when the counter reaches it. Counter resets after
-    /// each sync so the cadence stays periodic rather than
-    /// exponentially triggered. An fsync error at this boundary is
-    /// logged but **not** propagated — the caller's append already
-    /// succeeded in the page cache, and a blocked-fsync error here
-    /// would surface as a spurious append failure. Explicit
-    /// `sync()` / `close()` still surface errors.
+    /// Bump the per-append counter and, if `fsync_every_n` is set
+    /// and the counter reaches it, notify the background fsync
+    /// worker. The actual fsync runs off the appender thread; this
+    /// returns immediately after the page-cache write so the
+    /// appender's caller doesn't block on disk durability.
+    ///
+    /// Counter resets after each notify so the cadence stays
+    /// periodic. Explicit `sync()` / `close()` are unaffected and
+    /// continue to fsync synchronously, surfacing any error.
     fn maybe_sync_after_append(&self, applied: u64) {
         if self.fsync_every_n == 0 || applied == 0 {
             return;
@@ -372,12 +383,14 @@ impl DiskSegment {
         if now < self.fsync_every_n {
             return;
         }
-        // Reset unconditionally before syncing so a concurrent appender
-        // sees a clean counter even if sync is slow.
+        // Reset unconditionally before signaling so a concurrent
+        // appender sees a clean counter even if the worker is slow.
         self.appends_since_sync.store(0, Ordering::Release);
-        if let Err(e) = self.sync() {
-            tracing::warn!(error = %e, "EveryN fsync failed; tail may be unsynced");
-        }
+        // notify_one stores a permit if no worker is parked yet —
+        // covers the open→first-poll window. If multiple notifies
+        // arrive while the worker is mid-sync, they coalesce into a
+        // single follow-up sync, which is the intended semantics.
+        self.fsync_signal.notify_one();
     }
 
     /// Test-only: arm a one-shot failure on the next

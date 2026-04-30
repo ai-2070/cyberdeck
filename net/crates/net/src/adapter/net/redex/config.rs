@@ -23,9 +23,16 @@ pub enum FsyncPolicy {
     /// fine for telemetry / best-effort logs.
     #[default]
     Never,
-    /// Fsync after every N successful appends. Bounds worst-case loss
-    /// at (N − 1) entries from the last sync point. `0` and `1` both
-    /// collapse to "fsync on every append."
+    /// Fsync after every N successful appends. The fsync runs on a
+    /// background task — the appender returns as soon as the bytes
+    /// land in the page cache and signals the worker; the worker
+    /// runs `fsync_all` off the hot path. Concurrent notifies during
+    /// an in-flight fsync coalesce into a single follow-up.
+    ///
+    /// Worst-case loss bound: (N − 1) entries since the last sync
+    /// **point**, plus the bytes from any fsync that was in flight
+    /// when the crash interrupted it. `0` and `1` both collapse to
+    /// "signal on every append."
     EveryN(u64),
     /// Fsync on a timer, independent of append rate. A per-file
     /// background tokio task drives the sync; `close()` cancels it.
