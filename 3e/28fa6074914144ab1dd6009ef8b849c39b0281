@@ -1,0 +1,69 @@
+net/crates/net/src/adapter/net/compute/orchestrator.rs
+  36b642b129ab4a5e 1169-1184
+net/crates/net/src/adapter/net/subprotocol/migration_handler.rs
+  36b642b129ab4a5e 675-685
+net/crates/net/src/adapter/net/cortex/adapter.rs
+  36b642b129ab4a5e 36-54,169-171,180-205,229-265,430-432,624-812
+net/crates/net/docs/BUG_AUDIT_2026_04_30_CORE.md
+  36b642b129ab4a5e 34,82-110,114,133,136-137,280,283-284,334,337-338,346,349-350,358,361-362,365,368-369,372,375-376,509,512-513,516,519-520,582,585-586,622,625-626,650,653-654,668,671-672,687,690-691,701,704-705,720,723-725,728-736,738,740-741,743-748,756-759,787-788,790-795,805-808,818-821,823-824,826-831,848,851-852,872,879,890,898,902
+net/crates/net/src/adapter/net/behavior/metadata.rs
+  36b642b129ab4a5e 382-414,447-552,967-974,1200-1222,1224-1239,1569-1634
+net/crates/net/src/adapter/net/mesh.rs
+  36b642b129ab4a5e 2927-2937,2940
+net/crates/net/src/consumer/merge.rs
+  36b642b129ab4a5e 93-108,111-120,380-402,453-459,480,490-508,513-521,596-601,606-607,611-650
+net/crates/net/src/adapter/jetstream.rs
+  36b642b129ab4a5e 198-213
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  36b642b129ab4a5e 205-215,217-231,235-240,333-351,363-413
+net/crates/net/src/adapter/net/cortex/tasks/query.rs
+  36b642b129ab4a5e 318-322,336-337,352-355
+net/crates/net/src/adapter/net/identity/token.rs
+  36b642b129ab4a5e 155-160,162-167,308-313,315-320
+net/crates/net/src/ffi/mesh.rs
+  36b642b129ab4a5e 146-155,160-171,1714-1730,1747-1761,1767-1775,3094-3123
+net/crates/net/src/adapter/net/identity/envelope.rs
+  36b642b129ab4a5e 199-204,206-211
+net/crates/net/src/adapter/net/identity/entity.rs
+  36b642b129ab4a5e 175-187,190-195
+net/crates/net/src/adapter/net/behavior/context.rs
+  36b642b129ab4a5e 797-804,819,823-854,862-870,872-873,875,887-889,924-925,927,938-939,985-987,989-990,992-996,1000-1003,1015-1018,1429-1512
+net/crates/net/src/bus.rs
+  36b642b129ab4a5e 281-295,301,358-392,602,608-614,848-863,873-875,1057-1066,1296-1305
+net/crates/net/src/ffi/mod.rs
+  36b642b129ab4a5e 789-794,797,855-857,860,917-971,974-981,983-995,1003-1006
+net/crates/net/src/adapter/net/netdb/db.rs
+  36b642b129ab4a5e 95-106,108-121
+net/crates/net/src/adapter/net/continuity/chain.rs
+  36b642b129ab4a5e 71-81,113-130,135-151,153-163,166-173,175-185,187-189,192-197,200-207,345-361,376-389,585-679
+net/crates/net/src/adapter/redis.rs
+  36b642b129ab4a5e 234-248
+net/crates/net/src/shard/mod.rs
+  36b642b129ab4a5e 584-599,601,612,633,656,1081,1083,1145,1147,1158
+net/crates/net/src/ffi/cortex.rs
+  36b642b129ab4a5e 67-69,74-85
+net/crates/net/src/adapter/net/cortex/error.rs
+  36b642b129ab4a5e 26-40
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  36b642b129ab4a5e 203-209,213-218,310-314,326-351
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "3e28fa6074914144ab1dd6009ef8b849c39b0281",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 9803,
+      "total_deletions": 299,
+      "accepted_lines": 1824,
+      "overriden_lines": 0
+    }
+  }
+}
