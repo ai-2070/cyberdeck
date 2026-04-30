@@ -928,7 +928,11 @@ impl SafetyEnforcer {
             counter
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     let next = current.saturating_add(add);
-                    if next > max { None } else { Some(next) }
+                    if next > max {
+                        None
+                    } else {
+                        Some(next)
+                    }
                 })
                 .map(|_| ())
                 .map_err(|cur| cur)
@@ -1811,10 +1815,7 @@ mod tests {
             .collect();
 
         let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        let successes: Vec<_> = results
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect();
+        let successes: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
 
         // The crucial invariant: no more than CAP concurrent
         // claims actually committed. Pre-fix this would routinely

@@ -1651,7 +1651,10 @@ mod tests {
             // Find the second entry (seq == 1) and flip a byte at
             // its payload_offset.
             let entry = state.index.iter().find(|e| e.seq == 1).copied().unwrap();
-            assert!(!entry.is_inline(), "test premise: seq=1 must be heap-stored");
+            assert!(
+                !entry.is_inline(),
+                "test premise: seq=1 must be heap-stored"
+            );
             // Flip the first byte of the payload.
             let off = entry.payload_offset as usize;
             let old = state.segment.bytes_for_test_mut()[off];
@@ -1694,12 +1697,7 @@ mod tests {
             let f = make_persistent(name, &dir);
             f.append(b"hello").unwrap();
             f.append(b"world").unwrap();
-            captured_ts = f
-                .inner
-                .state
-                .lock()
-                .timestamps
-                .clone();
+            captured_ts = f.inner.state.lock().timestamps.clone();
             f.close().unwrap();
         }
         // Sleep long enough that a "fresh" timestamp would be
@@ -1769,14 +1767,8 @@ mod tests {
 
             // Sweep — should evict 0, 1, 2 (keeping last 2).
             f.sweep_retention();
-            let surviving_in_mem: Vec<u64> = f
-                .inner
-                .state
-                .lock()
-                .index
-                .iter()
-                .map(|e| e.seq)
-                .collect();
+            let surviving_in_mem: Vec<u64> =
+                f.inner.state.lock().index.iter().map(|e| e.seq).collect();
             assert_eq!(
                 surviving_in_mem,
                 vec![3, 4],
@@ -1800,14 +1792,7 @@ mod tests {
                     .with_retention_max_events(2),
             )
             .unwrap();
-        let restored_seqs: Vec<u64> = f2
-            .inner
-            .state
-            .lock()
-            .index
-            .iter()
-            .map(|e| e.seq)
-            .collect();
+        let restored_seqs: Vec<u64> = f2.inner.state.lock().index.iter().map(|e| e.seq).collect();
         assert_eq!(
             restored_seqs,
             vec![3, 4],

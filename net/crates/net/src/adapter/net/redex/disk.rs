@@ -1278,13 +1278,7 @@ mod tests {
         // This call writes dat bytes, then bails. The rollback
         // must truncate dat back to `dat_len_after_a`.
         let p2 = b"would-strand-these-bytes";
-        let e2 = RedexEntry::new_heap(
-            1,
-            p1.len() as u32,
-            p2.len() as u32,
-            0,
-            payload_checksum(p2),
-        );
+        let e2 = RedexEntry::new_heap(1, p1.len() as u32, p2.len() as u32, 0, payload_checksum(p2));
         let result = recovered.disk.append_entry(&e2, p2);
         assert!(result.is_err(), "injected failure must surface as Err");
 

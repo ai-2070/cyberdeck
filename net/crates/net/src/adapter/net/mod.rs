@@ -522,10 +522,7 @@ impl NetAdapter {
                         if p.header.flags.is_handshake() {
                             // Per-source pacing: drop packets from
                             // sources that exceed the budget.
-                            let allowed = self
-                                .handshake_pacer
-                                .lock()
-                                .check_and_record(source);
+                            let allowed = self.handshake_pacer.lock().check_and_record(source);
                             if !allowed {
                                 tracing::debug!(
                                     %source,
@@ -633,10 +630,7 @@ impl NetAdapter {
             // The "payload" of a heartbeat is just the 16-byte
             // AEAD tag. Decrypting an empty plaintext over the
             // tag is the verification step.
-            if rx_cipher
-                .decrypt(counter, &aad, &parsed.payload)
-                .is_err()
-            {
+            if rx_cipher.decrypt(counter, &aad, &parsed.payload).is_err() {
                 return;
             }
             if !rx_cipher.update_rx_counter(counter) {

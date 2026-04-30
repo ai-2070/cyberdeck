@@ -899,8 +899,7 @@ mod tests {
             .unwrap();
 
         let new_active_snap = reg.snapshot(new_active).unwrap().unwrap();
-        let new_active_value =
-            u64::from_le_bytes(new_active_snap.state[..8].try_into().unwrap());
+        let new_active_value = u64::from_le_bytes(new_active_snap.state[..8].try_into().unwrap());
         assert_eq!(
             new_active_value, 8,
             "promoted active must hold sync-state (5) + buffered events (3) = 8; \

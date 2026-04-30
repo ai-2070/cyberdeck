@@ -643,8 +643,7 @@ impl LoadBalancer {
         // retries via `(rr_offset + attempt)`, so the counter
         // advances exactly once per `select()` regardless of how many
         // reservation retries occur.
-        let rr_offset_for_this_select =
-            self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+        let rr_offset_for_this_select = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
 
         for attempt in 0..MAX_RESERVATION_RETRIES {
             let available = self.get_available_endpoints(ctx)?;
@@ -774,11 +773,7 @@ impl LoadBalancer {
     /// Offset-based variant used by the retry loop in `select()` so
     /// a logical select advances the `rr_counter` exactly once across
     /// all reservation retries.
-    fn select_round_robin_at(
-        &self,
-        endpoints: &[Arc<EndpointState>],
-        offset: usize,
-    ) -> Selection {
+    fn select_round_robin_at(&self, endpoints: &[Arc<EndpointState>], offset: usize) -> Selection {
         let idx = offset % endpoints.len();
         let state = &endpoints[idx];
         Selection {

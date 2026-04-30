@@ -1304,8 +1304,8 @@ mod tests {
             cooldown: std::time::Duration::from_nanos(1),
             ..Default::default()
         };
-        let manager = ShardManager::with_mapper(2, 1024, BackpressureMode::DropNewest, policy)
-            .unwrap();
+        let manager =
+            ShardManager::with_mapper(2, 1024, BackpressureMode::DropNewest, policy).unwrap();
 
         // Drain 1 of 2 shards via the public API.
         let mapper = manager.mapper().unwrap().clone();
@@ -1370,8 +1370,8 @@ mod tests {
             cooldown: std::time::Duration::from_nanos(1),
             ..Default::default()
         };
-        let manager = ShardManager::with_mapper(2, 1024, BackpressureMode::DropNewest, policy)
-            .unwrap();
+        let manager =
+            ShardManager::with_mapper(2, 1024, BackpressureMode::DropNewest, policy).unwrap();
 
         // Pin the routing for shard 1 by ingesting events with a
         // hash known to land there. We don't actually need

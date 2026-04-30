@@ -251,10 +251,7 @@ impl DaemonHost {
     /// everything that had happened before the most recent sync.
     ///
     /// [`from_snapshot`]: Self::from_snapshot
-    pub fn restore_from_snapshot(
-        &mut self,
-        snapshot: &StateSnapshot,
-    ) -> Result<(), DaemonError> {
+    pub fn restore_from_snapshot(&mut self, snapshot: &StateSnapshot) -> Result<(), DaemonError> {
         // Push the daemon's state across.
         self.daemon.restore(snapshot.state.clone())?;
 

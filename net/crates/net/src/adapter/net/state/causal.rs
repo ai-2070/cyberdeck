@@ -266,10 +266,7 @@ pub struct WriteCausalEventsResult {
 /// on oversized input a DoS vector. Callers MUST use the returned
 /// `events_written` as the framing count, not the input slice's
 /// length, or the reader will parse past valid data into noise.
-pub fn write_causal_events(
-    events: &[CausalEvent],
-    buf: &mut BytesMut,
-) -> WriteCausalEventsResult {
+pub fn write_causal_events(events: &[CausalEvent], buf: &mut BytesMut) -> WriteCausalEventsResult {
     let start = buf.len();
     let mut events_written = 0usize;
     let mut events_skipped = 0usize;

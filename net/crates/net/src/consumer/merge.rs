@@ -1869,9 +1869,7 @@ mod tests {
         let mut prior_order: Option<Vec<String>> = None;
         for iter in 0..20 {
             let r = merger
-                .poll(
-                    ConsumeRequest::new(10).ordering(Ordering::InsertionTs),
-                )
+                .poll(ConsumeRequest::new(10).ordering(Ordering::InsertionTs))
                 .await
                 .unwrap();
             let ids: Vec<String> = r.events.iter().map(|e| e.id.clone()).collect();

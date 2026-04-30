@@ -829,9 +829,12 @@ impl ShardMapper {
     /// the `on_shard_created` callback exactly once.
     pub fn activate(&self, shard_id: u16) -> Result<(), ScalingError> {
         let mut shards = self.shards.write();
-        let shard = shards.iter_mut().find(|s| s.id == shard_id).ok_or_else(|| {
-            ScalingError::InvalidPolicy(format!("activate: shard {} not found", shard_id))
-        })?;
+        let shard = shards
+            .iter_mut()
+            .find(|s| s.id == shard_id)
+            .ok_or_else(|| {
+                ScalingError::InvalidPolicy(format!("activate: shard {} not found", shard_id))
+            })?;
         match shard.state {
             ShardState::Active => return Ok(()),
             ShardState::Provisioning => {
@@ -876,10 +879,7 @@ impl ShardMapper {
             .iter_mut()
             .find(|s| s.id == shard_id)
             .ok_or_else(|| {
-                ScalingError::InvalidPolicy(format!(
-                    "drain_specific: shard {} not found",
-                    shard_id
-                ))
+                ScalingError::InvalidPolicy(format!("drain_specific: shard {} not found", shard_id))
             })?;
         match shard.state {
             ShardState::Active => {
@@ -1826,13 +1826,13 @@ mod tests {
         // last_scaling.
         let before_ts = *mapper.last_scaling.read();
         let r = mapper.scale_up(0);
-        assert!(r.is_ok(), "scale_up(0) should succeed as a no-op, got {r:?}");
+        assert!(
+            r.is_ok(),
+            "scale_up(0) should succeed as a no-op, got {r:?}"
+        );
         assert_eq!(r.unwrap().len(), 0);
         let after_ts = *mapper.last_scaling.read();
-        assert_eq!(
-            before_ts, after_ts,
-            "scale_up(0) bumped cooldown timestamp"
-        );
+        assert_eq!(before_ts, after_ts, "scale_up(0) bumped cooldown timestamp");
 
         // Also: position the allocator at u16::MAX and verify a
         // count==0 call doesn't trip the sentinel check.
@@ -1981,7 +1981,8 @@ mod tests {
             let mut shards = mapper.shards.write();
             let s = shards.iter_mut().find(|s| s.id == 0).unwrap();
             s.metrics.current_len.store(0, AtomicOrdering::Relaxed);
-            s.metrics.pushes_since_drain_start
+            s.metrics
+                .pushes_since_drain_start
                 .store(0, AtomicOrdering::Relaxed);
             // Backdate drain_started so the elapsed > 100ms gate trips.
             s.drain_started = Some(Instant::now() - Duration::from_secs(1));

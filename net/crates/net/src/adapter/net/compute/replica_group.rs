@@ -521,7 +521,11 @@ mod tests {
             "all 4 replicas should land on distinct nodes — \
              colocation indicates BUG_REPORT.md #6 has regressed; \
              got node ids {:?}",
-            group.replicas().iter().map(|r| r.node_id).collect::<Vec<_>>()
+            group
+                .replicas()
+                .iter()
+                .map(|r| r.node_id)
+                .collect::<Vec<_>>()
         );
     }
 

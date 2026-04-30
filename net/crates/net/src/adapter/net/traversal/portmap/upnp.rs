@@ -185,12 +185,7 @@ impl PortMapperClient for UpnpMapper {
             // `add_any_port` returns the actually-mapped external
             // port, which we record in the `PortMapping`.
             let actual_external_port = gw
-                .add_any_port(
-                    PortMappingProtocol::UDP,
-                    local,
-                    lease,
-                    UPNP_DESCRIPTION,
-                )
+                .add_any_port(PortMappingProtocol::UDP, local, lease, UPNP_DESCRIPTION)
                 .await
                 .map_err(add_any_port_err_to_port_mapping)?;
             Ok::<_, PortMappingError>(PortMapping {

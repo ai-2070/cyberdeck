@@ -626,10 +626,7 @@ impl EventBus {
                 break;
             }
             if start.elapsed() >= timeout {
-                tracing::warn!(
-                    "flush: ring buffers not fully drained after {:?}",
-                    timeout
-                );
+                tracing::warn!("flush: ring buffers not fully drained after {:?}", timeout);
                 break;
             }
             tokio::time::sleep(backoff).await;

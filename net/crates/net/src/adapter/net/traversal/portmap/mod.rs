@@ -581,10 +581,7 @@ impl PortMapperTask {
         // `mapping` (which we mutate inside the loop). Borrowing
         // a closure across the `mapping = next;` reassignment
         // would deny the assignment under the borrow checker.
-        fn effective_interval(
-            renewal_interval: Duration,
-            ttl: Duration,
-        ) -> Duration {
+        fn effective_interval(renewal_interval: Duration, ttl: Duration) -> Duration {
             let configured = if renewal_interval.is_zero() {
                 Duration::from_secs(1)
             } else {

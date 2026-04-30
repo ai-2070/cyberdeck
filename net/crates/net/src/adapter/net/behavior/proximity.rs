@@ -1013,8 +1013,7 @@ mod tests {
     /// so the caller drops the malformed pingwave entirely.
     #[test]
     fn from_bytes_rejects_unknown_health_discriminant() {
-        let pw = EnhancedPingwave::new(make_node_id(1), 1, 3)
-            .with_load(64, HealthStatus::Healthy);
+        let pw = EnhancedPingwave::new(make_node_id(1), 1, 3).with_load(64, HealthStatus::Healthy);
         let mut bytes = pw.to_bytes().to_vec();
 
         // Sanity: round-trip works at the legitimate value.

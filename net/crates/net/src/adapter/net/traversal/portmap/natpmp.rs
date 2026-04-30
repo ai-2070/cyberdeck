@@ -532,8 +532,7 @@ impl PortMapperClient for NatPmpMapper {
         // log a warning so operators can investigate stale mappings;
         // on a successful recv with a non-zero result code, we log
         // the failure verbatim.
-        const REMOVE_DEADLINE: std::time::Duration =
-            std::time::Duration::from_millis(200);
+        const REMOVE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(200);
 
         let req = NatPmpRequest::MapUdp {
             internal_port: mapping.internal_port,
