@@ -1,10 +1,22 @@
-net/crates/net/sdk-ts/dist/
-
 # macOS cruft
 .DS_Store
 **/.DS_Store
-net/crates/net/bindings/python/python/net/*.so
+
+# Claude
 .claude/settings.local.json
+
+# Net misc files
+net/crates/net/sdk-ts/dist/
+net/crates/net/bindings/python/python/net/*.so
 net/crates/net/.claude/settings.local.json
 
+# Env variables
+.env
+.env.*
+
+# Lockfiles
 package-lock.json
+
+# Copies of libraries
+memex/
+l0/

@@ -302,42 +302,33 @@ impl BatchedPacketReceiver {
         let thread = std::thread::Builder::new()
             .name("net-batch-recv".into())
             .spawn(move || {
-                // Set a receive timeout so recvmmsg unblocks periodically,
-                // giving the thread a chance to check the shutdown flag.
-                let has_timeout = unsafe {
-                    let timeout = libc::timeval {
-                        tv_sec: 0,
-                        tv_usec: 500_000, // 500ms
-                    };
-                    libc::setsockopt(
-                        fd,
-                        libc::SOL_SOCKET,
-                        libc::SO_RCVTIMEO,
-                        &timeout as *const _ as *const libc::c_void,
-                        std::mem::size_of::<libc::timeval>() as u32,
-                    ) == 0
-                };
-
-                if !has_timeout {
-                    tracing::warn!(
-                        "SO_RCVTIMEO failed, falling back to non-blocking recv with polling"
-                    );
-                }
-
+                // Do NOT set `SO_RCVTIMEO` on the shared
+                // `Arc<UdpSocket>`. The previous code installed a
+                // 500ms timeout to give the receive thread a chance
+                // to check `shutdown`, but `SO_RCVTIMEO` is a
+                // *socket-level* option — every other consumer of
+                // the same `Arc<UdpSocket>` (the sync handshake recv
+                // at `mod.rs:396` and `mesh.rs:6098-6101`) inherited
+                // that timeout.
+                //
+                // Use `recv_batch` instead, which passes
+                // `MSG_DONTWAIT` per-call. That flag is per-syscall,
+                // not per-fd, so no other consumer is affected. The
+                // existing fallback path (non-blocking + 1ms sleep
+                // when empty) is the design that keeps the shared
+                // socket clean. The `SO_RCVTIMEO` path is gone.
                 let mut transport = super::linux::BatchedTransport::new(fd);
 
                 while !thread_shutdown.load(Ordering::Acquire) {
-                    // Use blocking recv if we have a timeout, otherwise
-                    // non-blocking recv + sleep to avoid hanging on shutdown.
-                    let result = if has_timeout {
-                        transport.recv_batch_blocking(super::linux::MAX_BATCH_SIZE)
-                    } else {
-                        transport.recv_batch(super::linux::MAX_BATCH_SIZE)
-                    };
+                    let result = transport.recv_batch(super::linux::MAX_BATCH_SIZE);
 
                     match result {
                         Ok(packets) => {
-                            if packets.is_empty() && !has_timeout {
+                            if packets.is_empty() {
+                                // No data available right now — yield
+                                // for 1ms and re-check shutdown. The
+                                // sleep is short enough that shutdown
+                                // is observed promptly.
                                 std::thread::sleep(std::time::Duration::from_millis(1));
                                 continue;
                             }
@@ -351,10 +342,10 @@ impl BatchedPacketReceiver {
                             if thread_shutdown.load(Ordering::Acquire) {
                                 return;
                             }
-                            // Timeout or interrupt — just retry
                             if e.kind() == io::ErrorKind::WouldBlock
                                 || e.kind() == io::ErrorKind::Interrupted
                             {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
                                 continue;
                             }
                             tracing::warn!(error = %e, "batched receive error");

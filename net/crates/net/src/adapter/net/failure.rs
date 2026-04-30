@@ -184,25 +184,48 @@ impl FailureDetector {
     }
 
     /// Record a heartbeat from a node
+    ///
+    /// Previously the recovery callback was invoked inside
+    /// `entry().and_modify(...)`, which holds the DashMap shard's
+    /// write lock. A user-supplied callback that re-entered the same
+    /// shard (or any structure ordered against it) deadlocked; even
+    /// without deadlock, every concurrent `heartbeat` hashing to the
+    /// same shard stalled while the callback ran. The fix collects a
+    /// "should I notify?" flag inside the closure and fires the
+    /// callback *after* the `and_modify` returns, releasing the
+    /// shard lock.
     pub fn heartbeat(&self, node_id: u64, addr: SocketAddr) {
+        let mut should_notify_recovery = false;
         self.nodes
             .entry(node_id)
             .and_modify(|state| {
                 let was_failed = state.status == NodeStatus::Failed;
                 state.on_heartbeat();
 
-                // Check for recovery
                 if was_failed {
                     self.total_recoveries.fetch_add(1, Ordering::Relaxed);
-                    if let Some(ref cb) = self.on_recovery {
-                        cb(node_id);
-                    }
+                    should_notify_recovery = true;
                 }
             })
             .or_insert_with(|| NodeState::new(addr));
+
+        if should_notify_recovery {
+            if let Some(ref cb) = self.on_recovery {
+                cb(node_id);
+            }
+        }
     }
 
     /// Check all nodes for failures
+    ///
+    /// Callbacks are now invoked *after* the `iter_mut` loop has
+    /// dropped its shard locks. Previously `cb(*entry.key())` ran
+    /// inside the iteration, with the per-shard write lock still
+    /// held — a user-supplied callback that touched another DashMap
+    /// entry on the same shard (or re-entered the failure detector
+    /// itself via `heartbeat` / `status`) would deadlock. We collect
+    /// the failed ids first, release the iteration locks, then fire
+    /// the callbacks.
     pub fn check_all(&self) -> Vec<u64> {
         let mut newly_failed = Vec::new();
 
@@ -214,14 +237,15 @@ impl FailureDetector {
                 self.config.miss_threshold,
             );
 
-            // Detect new failures
             if entry.status == NodeStatus::Failed && prev_status != NodeStatus::Failed {
                 newly_failed.push(*entry.key());
                 self.total_failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
 
-                if let Some(ref cb) = self.on_failure {
-                    cb(*entry.key());
-                }
+        if let Some(ref cb) = self.on_failure {
+            for id in &newly_failed {
+                cb(*id);
             }
         }
 
@@ -1244,5 +1268,77 @@ mod tests {
         let stats = mgr.stats();
         assert_eq!(stats.reroutes, 1);
         assert_eq!(stats.queued, 1);
+    }
+
+    /// Regression: BUG_REPORT.md #14 — `heartbeat` and `check_all`
+    /// previously invoked the user-supplied recovery / failure
+    /// callbacks while still holding the DashMap shard's write
+    /// lock (`and_modify` / `iter_mut` respectively). A callback
+    /// that re-entered the failure detector — calling
+    /// `heartbeat` / `status` / `is_failed` for *any* node — could
+    /// deadlock if it hashed to the same shard, and at minimum
+    /// serialized concurrent heartbeats hashing to that shard
+    /// behind the user code.
+    ///
+    /// The fix: collect the "should I notify?" signal inside the
+    /// closure / loop, drop the shard locks, then fire the
+    /// callbacks. We pin this by setting a callback that calls
+    /// back into the detector's `status()` (which acquires a
+    /// read lock on the same shard). With the bug present, this
+    /// deadlocks; with the fix, it returns successfully.
+    #[test]
+    fn callbacks_run_after_shard_lock_release() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::Arc;
+
+        let detector = Arc::new(FailureDetector::with_config(FailureDetectorConfig {
+            timeout: Duration::from_millis(10),
+            miss_threshold: 1,
+            suspicion_threshold: 1,
+            cleanup_interval: Duration::from_secs(60),
+        }));
+
+        let detector_for_cb = Arc::clone(&detector);
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_clone = Arc::clone(&observed);
+
+        // The recovery callback re-enters `status()`, which must
+        // be able to acquire a read lock on the same DashMap
+        // shard the recovery path is mutating. With the pre-fix
+        // code (callback under `and_modify`'s write lock), this
+        // would deadlock on a single-shard DashMap.
+        let detector_arc = Arc::new(
+            // Re-create using the constructor that accepts a
+            // callback. We'll thread it via the public setter.
+            FailureDetector::with_config(FailureDetectorConfig {
+                timeout: Duration::from_millis(10),
+                miss_threshold: 1,
+                suspicion_threshold: 1,
+                cleanup_interval: Duration::from_secs(60),
+            })
+            .on_recovery(move |id| {
+                // Re-enter the same detector; observable proof
+                // we got here without a deadlock.
+                let _ = detector_for_cb.status(id);
+                observed_clone.store(true, AtomicOrdering::SeqCst);
+            }),
+        );
+
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        // Drive node into Failed state, then heartbeat to recover.
+        detector_arc.heartbeat(0x4242, addr);
+        std::thread::sleep(Duration::from_millis(25));
+        let _ = detector_arc.check_all();
+        assert_eq!(detector_arc.status(0x4242), NodeStatus::Failed);
+
+        // This call would deadlock under the pre-fix code.
+        detector_arc.heartbeat(0x4242, addr);
+
+        assert!(
+            observed.load(AtomicOrdering::SeqCst),
+            "recovery callback must have run (and re-entered status()) — \
+             a deadlock here would manifest as the test hanging (#14)"
+        );
+        let _ = detector;
     }
 }

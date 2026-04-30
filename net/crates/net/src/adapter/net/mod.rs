@@ -119,7 +119,7 @@ pub use redex::{
     FsyncPolicy, IndexOp, IndexStart, OrderedAppender, Redex, RedexEntry, RedexError, RedexEvent,
     RedexFile, RedexFileConfig, RedexFlags, RedexFold, RedexIndex, TypedRedexFile,
 };
-pub use reliability::{FireAndForget, ReliabilityMode, ReliableStream};
+pub use reliability::{FireAndForget, ReliabilityMode, ReliableStream, RetransmitDescriptor};
 pub use reroute::ReroutePolicy;
 pub use route::{
     AggregateStats, RouteEntry, RouteFlags, RoutingHeader, RoutingTable, SchedulerStreamStats,
@@ -282,6 +282,81 @@ mod routing {
 /// Shared inbound queue type
 type InboundQueues = Arc<DashMap<u16, SegQueue<StoredEvent>>>;
 
+/// Per-source rate limiter for the handshake responder loop.
+///
+/// The responder used to accept whichever source emitted msg1
+/// first, with no per-source pacing — an attacker who knows the PSK
+/// (PSKs are typically multi-tenant) could race the legitimate
+/// initiator's msg1; even without the PSK an attacker could flood
+/// handshake-flagged datagrams to monopolize the recv loop.
+///
+/// `HandshakePacer` keeps a rolling count of recent attempts per
+/// source and rejects sources that exceed the budget within the
+/// window. Expired entries are garbage-collected on a periodic
+/// schedule rather than on every check, so a sustained flood from
+/// many distinct sources doesn't pay an O(n) sweep per packet.
+pub(crate) struct HandshakePacer {
+    /// Per-source `(count_in_window, window_start)`.
+    entries: std::collections::HashMap<std::net::SocketAddr, (u32, std::time::Instant)>,
+    /// Maximum attempts per source within `window`.
+    max_per_window: u32,
+    /// Window length.
+    window: std::time::Duration,
+    /// Last time we ran the GC pass.
+    last_gc: std::time::Instant,
+    /// Soft cap on `entries` size before forcing a GC pass even
+    /// before the periodic deadline. Keeps memory bounded against
+    /// an attacker fanning across many spoofed source addresses.
+    gc_size_threshold: usize,
+}
+
+impl HandshakePacer {
+    pub(crate) fn new(max_per_window: u32, window: std::time::Duration) -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            max_per_window,
+            window,
+            last_gc: std::time::Instant::now(),
+            // 4096 entries × ~40 bytes each ≈ 160 KiB — comfortable
+            // ceiling that still triggers GC well before any
+            // realistic memory issue.
+            gc_size_threshold: 4096,
+        }
+    }
+
+    /// Record an attempt from `source`. Returns `true` if the source
+    /// is within budget (caller may proceed); `false` if it has
+    /// exceeded the rate limit (caller must drop the packet).
+    pub(crate) fn check_and_record(&mut self, source: std::net::SocketAddr) -> bool {
+        let now = std::time::Instant::now();
+        // Amortized GC: only run the O(n) `retain` sweep when one
+        // of two thresholds trips:
+        //   1. We haven't GC'd in `window` (entries are valid for
+        //      at most `2 * window` so a once-per-`window` cadence
+        //      is sufficient to keep the map proportional to the
+        //      active source set).
+        //   2. The map exceeds `gc_size_threshold`, indicating a
+        //      flood attempt across many spoofed sources.
+        if now.duration_since(self.last_gc) >= self.window
+            || self.entries.len() >= self.gc_size_threshold
+        {
+            let cutoff = self.window.saturating_mul(2);
+            self.entries
+                .retain(|_, (_, start)| now.duration_since(*start) < cutoff);
+            self.last_gc = now;
+        }
+
+        let entry = self.entries.entry(source).or_insert((0, now));
+        if now.duration_since(entry.1) > self.window {
+            // Window expired; reset the counter.
+            entry.0 = 0;
+            entry.1 = now;
+        }
+        entry.0 = entry.0.saturating_add(1);
+        entry.0 <= self.max_per_window
+    }
+}
+
 /// Net adapter for high-performance UDP transport.
 pub struct NetAdapter {
     /// Configuration
@@ -302,6 +377,11 @@ pub struct NetAdapter {
     shutdown_notify: Arc<Notify>,
     /// Initialization state
     initialized: AtomicBool,
+    /// Per-source rate limiter for the handshake responder loop.
+    /// Without this, an attacker can flood handshake-flagged
+    /// datagrams to monopolize the recv path or race a legitimate
+    /// initiator's msg1.
+    handshake_pacer: parking_lot::Mutex<HandshakePacer>,
 }
 
 impl NetAdapter {
@@ -321,6 +401,13 @@ impl NetAdapter {
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
             initialized: AtomicBool::new(false),
+            // 5 attempts per second per source, plenty for any
+            // legitimate initiator (RTT-limited) and tight enough
+            // to throttle a flooder on consumer-grade hardware.
+            handshake_pacer: parking_lot::Mutex::new(HandshakePacer::new(
+                5,
+                std::time::Duration::from_secs(1),
+            )),
         })
     }
 
@@ -436,7 +523,11 @@ impl NetAdapter {
                 .ok_or_else(|| AdapterError::Fatal("missing static keypair".into()))?;
 
             // Wait for an initiator handshake message, discarding any
-            // non-handshake datagrams that arrive on the shared socket.
+            // non-handshake datagrams that arrive on the shared
+            // socket. Per-source pacing throttles flooders so the
+            // legitimate initiator's msg1 can land — without it,
+            // an attacker could blast handshake-flagged datagrams
+            // and monopolize this recv loop.
             let (parsed, source) = tokio::time::timeout(timeout, async {
                 loop {
                     let mut recv_buf = bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
@@ -452,6 +543,17 @@ impl NetAdapter {
 
                     if let Some(p) = ParsedPacket::parse(data, source) {
                         if p.header.flags.is_handshake() {
+                            // Per-source pacing: drop packets from
+                            // sources that exceed the budget.
+                            let allowed = self.handshake_pacer.lock().check_and_record(source);
+                            if !allowed {
+                                tracing::debug!(
+                                    %source,
+                                    "handshake responder: dropping packet from \
+                                     rate-limited source"
+                                );
+                                continue;
+                            }
                             return Ok::<_, AdapterError>((p, source));
                         }
                     }
@@ -526,13 +628,38 @@ impl NetAdapter {
             return;
         }
 
-        // Heartbeats must come from the authenticated peer address and carry
-        // the correct session_id. Without source validation, an off-path
-        // attacker who can guess the session_id could keep a session alive.
+        // Heartbeats are AEAD-tagged: the empty payload encrypts to
+        // a 16-byte Poly1305 tag, and the receiver verifies the
+        // tag here. Without this check, an off-path attacker who
+        // observed or guessed the session_id could spoof
+        // heartbeats and keep a session alive (the source-address
+        // check on UDP is itself spoofable, and session_id is in
+        // cleartext on every prior packet).
+        //
+        // We still require `source == peer_addr` as a cheap
+        // first-line filter so an unauthenticated flood doesn't
+        // get to do the AEAD verify.
         if parsed.header.flags.is_heartbeat() {
-            if source == session.peer_addr() {
-                session.touch();
+            if source != session.peer_addr() {
+                return;
             }
+            let aad = parsed.header.aad();
+            let counter =
+                u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
+            let rx_cipher = session.rx_cipher();
+            if !rx_cipher.is_valid_rx_counter(counter) {
+                return;
+            }
+            // The "payload" of a heartbeat is just the 16-byte
+            // AEAD tag. Decrypting an empty plaintext over the
+            // tag is the verification step.
+            if rx_cipher.decrypt(counter, &aad, &parsed.payload).is_err() {
+                return;
+            }
+            if !rx_cipher.update_rx_counter(counter) {
+                return;
+            }
+            session.touch();
             return;
         }
 
@@ -566,22 +693,46 @@ impl NetAdapter {
             0
         };
 
-        {
+        // Previously the boolean result of `r.on_receive(seq)` was
+        // discarded — a duplicate (NACK retransmit, rebroadcast,
+        // etc.) returned `false` but the events were still queued for
+        // poll_shard, breaking exactly-once delivery on reliable
+        // streams. The cipher's replay window doesn't catch this
+        // because each retransmit is re-encrypted with a fresh outer
+        // counter.
+        //
+        // Now: if `on_receive` reports a duplicate, we still call
+        // `session.touch()` (the peer is alive) but skip the queue
+        // step entirely — the original delivery already queued the
+        // events.
+        let is_fresh = {
             let stream = session.get_or_create_stream(stream_id);
-            stream.with_reliability(|r| {
-                r.on_receive(parsed.header.sequence);
-            });
+            // `with_reliability` always invokes the closure (it
+            // locks an internal `Mutex<Box<dyn ReliabilityMode>>`).
+            // For streams without a meaningful reliability mode the
+            // implementation returns `true` for every `on_receive`,
+            // matching the historical "always queue" behavior.
+            let fresh = stream.with_reliability(|r| r.on_receive(parsed.header.sequence));
             stream.update_rx_seq(parsed.header.sequence);
-        }
+            fresh
+        };
 
-        // Queue events for poll_shard
-        let queue = inbound.entry(shard_id).or_default();
-        let seq = parsed.header.sequence;
-        for (i, event_data) in events.into_iter().enumerate() {
-            use std::fmt::Write;
-            let mut event_id = String::with_capacity(24);
-            let _ = write!(event_id, "{}:{}", seq, i);
-            queue.push(StoredEvent::new(event_id, event_data, seq, shard_id));
+        if is_fresh {
+            // Queue events for poll_shard
+            let queue = inbound.entry(shard_id).or_default();
+            let seq = parsed.header.sequence;
+            for (i, event_data) in events.into_iter().enumerate() {
+                use std::fmt::Write;
+                let mut event_id = String::with_capacity(24);
+                let _ = write!(event_id, "{}:{}", seq, i);
+                queue.push(StoredEvent::new(event_id, event_data, seq, shard_id));
+            }
+        } else {
+            tracing::debug!(
+                seq = parsed.header.sequence,
+                stream_id,
+                "Dropping duplicate packet"
+            );
         }
 
         session.touch();
@@ -840,10 +991,21 @@ impl Adapter for NetAdapter {
                     .await
                     .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
 
-                // Track for reliability (brief lock)
+                // Track for reliability with PRE-encryption inputs.
+                // Stashing the encrypted bytes was unsound: the
+                // receiver's replay window rejects retransmits that
+                // carry a stale wire counter. The descriptor lets
+                // the retransmit driver call `builder.build` again
+                // with a fresh counter.
                 if reliable {
+                    let descriptor = reliability::RetransmitDescriptor {
+                        seq,
+                        stream_id,
+                        events: current_batch.clone(),
+                        flags,
+                    };
                     let stream = session.get_or_create_stream(stream_id);
-                    stream.with_reliability(|r| r.on_send(seq, packet));
+                    stream.with_reliability(|r| r.on_send(descriptor));
                 }
 
                 current_batch.clear();
@@ -876,8 +1038,14 @@ impl Adapter for NetAdapter {
                 .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
 
             if reliable {
+                let descriptor = reliability::RetransmitDescriptor {
+                    seq,
+                    stream_id,
+                    events: current_batch.clone(),
+                    flags,
+                };
                 let stream = session.get_or_create_stream(stream_id);
-                stream.with_reliability(|r| r.on_send(seq, packet));
+                stream.with_reliability(|r| r.on_send(descriptor));
             }
         }
 
@@ -1485,6 +1653,197 @@ mod tests {
         assert!(
             rx_cipher.is_valid_rx_counter(0),
             "counter 0 should be valid initially"
+        );
+    }
+
+    /// Regression: BUG_REPORT.md #5 — `process_packet` previously
+    /// discarded the bool returned by `r.on_receive(seq)` on the
+    /// reliability layer, queueing events even for duplicates.
+    /// Each retransmit re-encrypts with a fresh outer counter, so
+    /// the cipher's replay window does not catch this; without
+    /// honoring `on_receive`, the inbound queue accumulates
+    /// duplicates and breaks exactly-once delivery on reliable
+    /// streams.
+    ///
+    /// We construct the duplicate-detection scenario by building
+    /// two distinct packets that share the same stream sequence.
+    /// On a reliable session the second one's `on_receive` returns
+    /// `false`, so `process_packet` must not enqueue its events.
+    /// (The cipher's outer counter is fresh on both packets, so
+    /// the replay window can't filter them — only the reliability
+    /// layer's check stops the duplicate.)
+    #[test]
+    fn process_packet_drops_duplicates_per_reliability_decision() {
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let (init_keys, resp_keys) = make_session_keys();
+
+        // Reliable session — its streams use `ReliableStream`,
+        // whose `on_receive` returns `false` for `seq <
+        // next_expected` (duplicates).
+        let resp_session = Arc::new(NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            true, // default_reliable
+        ));
+        let inbound: InboundQueues = Arc::new(DashMap::new());
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // Two packets on stream 7. First carries sequences 0..1,
+        // second is a duplicate (same seq=0) that should be
+        // filtered. We deliver seq=0 then seq=1 first to advance
+        // `next_expected` past 0, then a packet with seq=0 — that
+        // last one is the duplicate.
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let packet0 = builder.build(7, 0, &[Bytes::from(r#"{"first":0}"#)], PacketFlags::NONE);
+        let packet1 = builder.build(7, 1, &[Bytes::from(r#"{"first":1}"#)], PacketFlags::NONE);
+        // Re-encrypted retransmit of seq=0 — same stream, same seq,
+        // different payload. This is the scenario the bug allowed
+        // through.
+        let packet0_dup = builder.build(
+            7,
+            0,
+            &[Bytes::from(r#"{"dup":"should_not_appear"}"#)],
+            PacketFlags::NONE,
+        );
+
+        NetAdapter::process_packet(packet0, source, &resp_session, &inbound, 1);
+        NetAdapter::process_packet(packet1, source, &resp_session, &inbound, 1);
+        NetAdapter::process_packet(packet0_dup, source, &resp_session, &inbound, 1);
+
+        let queue = inbound.get(&0).expect("shard 0 should exist");
+        assert_eq!(
+            queue.len(),
+            2,
+            "duplicate packet must NOT enqueue (BUG_REPORT.md #5); \
+             got {} events, expected exactly 2 (seq=0 and seq=1, no dup)",
+            queue.len()
+        );
+
+        // Drain in FIFO order and assert no `should_not_appear`
+        // event sneaked through.
+        let e0 = queue.pop().unwrap();
+        assert_eq!(&e0.raw[..], br#"{"first":0}"#);
+        let e1 = queue.pop().unwrap();
+        assert_eq!(&e1.raw[..], br#"{"first":1}"#);
+        assert!(queue.is_empty());
+    }
+
+    /// Regression: heartbeats must be AEAD-authenticated so an
+    /// off-path attacker who knows or observes the session_id
+    /// cannot spoof them. Pre-fix the receiver only checked
+    /// `source == peer_addr` (UDP source — spoofable) and
+    /// `session_id` match (in cleartext on every packet); now the
+    /// 16-byte Poly1305 tag binds the heartbeat to the session
+    /// key.
+    #[test]
+    fn heartbeat_is_aead_authenticated() {
+        use crate::adapter::net::pool::PacketBuilder;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let (init_keys, resp_keys) = make_session_keys();
+
+        let resp_session = Arc::new(NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        ));
+        let inbound: InboundQueues = Arc::new(DashMap::new());
+        let source: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // Build a legitimate heartbeat with the initiator's
+        // session key and tag it.
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let heartbeat = builder.build_heartbeat();
+        let last_activity_before = resp_session.last_activity_ns();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        // Process: this must succeed and call session.touch().
+        NetAdapter::process_packet(heartbeat, source, &resp_session, &inbound, 1);
+        let last_activity_after = resp_session.last_activity_ns();
+        assert!(
+            last_activity_after > last_activity_before,
+            "legitimate AEAD-tagged heartbeat must call session.touch()"
+        );
+
+        // Forge an unauthenticated heartbeat: header-only, no tag.
+        // Pre-fix this would have passed; post-fix it must be
+        // rejected.
+        let mut forged = bytes::BytesMut::new();
+        let header = NetHeader::heartbeat(resp_session.session_id());
+        forged.extend_from_slice(&header.to_bytes());
+        let forged = forged.freeze();
+        let last_activity_before = resp_session.last_activity_ns();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        NetAdapter::process_packet(forged, source, &resp_session, &inbound, 1);
+        let last_activity_after = resp_session.last_activity_ns();
+        assert_eq!(
+            last_activity_before, last_activity_after,
+            "unauthenticated heartbeat (no AEAD tag) must NOT touch the session"
+        );
+
+        // Forge a heartbeat with the right session_id but a
+        // garbage 16-byte "tag". Tag verification fails.
+        let mut forged_tag = bytes::BytesMut::new();
+        let mut header_bytes = NetHeader::heartbeat(resp_session.session_id()).to_bytes();
+        // Stamp a plausible nonce so the receiver gets to the
+        // decrypt step (otherwise it bails earlier on counter).
+        header_bytes[12..16].copy_from_slice(&[0u8; 4]);
+        header_bytes[16..24].copy_from_slice(&1u64.to_le_bytes());
+        forged_tag.extend_from_slice(&header_bytes);
+        forged_tag.extend_from_slice(&[0xAAu8; 16]); // garbage tag
+        let forged_tag = forged_tag.freeze();
+        let last_activity_before = resp_session.last_activity_ns();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        NetAdapter::process_packet(forged_tag, source, &resp_session, &inbound, 1);
+        let last_activity_after = resp_session.last_activity_ns();
+        assert_eq!(
+            last_activity_before, last_activity_after,
+            "heartbeat with garbage AEAD tag must NOT touch the session"
+        );
+    }
+
+    /// Regression: the handshake responder must rate-limit per
+    /// source so a flooder can't monopolize the recv loop.
+    /// `HandshakePacer` is the building block: it tracks
+    /// `(count, window_start)` per source and rejects after
+    /// `max_per_window` attempts within `window`.
+    #[test]
+    fn handshake_pacer_rejects_floods_per_source() {
+        use std::time::Duration;
+        let mut pacer = HandshakePacer::new(3, Duration::from_millis(50));
+
+        let attacker: std::net::SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let legit: std::net::SocketAddr = "10.0.0.2:9000".parse().unwrap();
+
+        // Attacker fires 3 attempts — all allowed (within budget).
+        for _ in 0..3 {
+            assert!(pacer.check_and_record(attacker));
+        }
+        // Fourth and beyond — rejected.
+        for _ in 0..10 {
+            assert!(
+                !pacer.check_and_record(attacker),
+                "attacker exceeding budget must be dropped"
+            );
+        }
+
+        // The legitimate initiator (different source) is unaffected
+        // by the attacker's burst — the budget is per-source.
+        assert!(
+            pacer.check_and_record(legit),
+            "legitimate source must still get through despite attacker flood"
+        );
+
+        // After the window expires the attacker's budget refills.
+        std::thread::sleep(Duration::from_millis(55));
+        assert!(
+            pacer.check_and_record(attacker),
+            "attacker budget must refill after window"
         );
     }
 }

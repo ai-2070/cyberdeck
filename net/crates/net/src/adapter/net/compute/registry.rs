@@ -59,6 +59,20 @@ impl DaemonRegistry {
         }
     }
 
+    /// Atomically replace the daemon at `host.origin_hash()`, or
+    /// insert if absent. Used by group lifecycles
+    /// (replica/fork/standby) where the new daemon's origin_hash is
+    /// deterministic and matches whatever is currently there — the
+    /// old `register`-after-`unregister` pattern had a small window
+    /// where placement could succeed but the re-register failed
+    /// (concurrent registration race) and left the slot orphaned.
+    /// `replace` collapses the swap into a single map operation so
+    /// the slot is never empty between callers.
+    pub fn replace(&self, host: DaemonHost) {
+        let origin_hash = host.origin_hash();
+        self.daemons.insert(origin_hash, Arc::new(Mutex::new(host)));
+    }
+
     /// Unregister a daemon. Drops the registry's ownership of the
     /// host; any in-flight `Arc` clones (e.g. a
     /// [`Self::with_host`] closure currently running on another
@@ -110,6 +124,27 @@ impl DaemonRegistry {
             .ok_or(DaemonError::NotFound(origin_hash))?;
         let host = arc.lock();
         Ok(host.take_snapshot())
+    }
+
+    /// Restore a daemon's state from a snapshot taken on another
+    /// daemon (typically the active member of a standby group).
+    /// Mutates the existing host in place — keypair and registry
+    /// entry stay put; only daemon-state bytes, chain head, and
+    /// horizon are replaced.
+    ///
+    /// Used by `StandbyGroup::sync_standbys` to push the active's
+    /// state onto each standby so a promoted standby has the same
+    /// state the active had at snapshot time.
+    pub fn restore_from_snapshot(
+        &self,
+        origin_hash: u32,
+        snapshot: &StateSnapshot,
+    ) -> Result<(), DaemonError> {
+        let arc = self
+            .get_arc(origin_hash)
+            .ok_or(DaemonError::NotFound(origin_hash))?;
+        let mut host = arc.lock();
+        host.restore_from_snapshot(snapshot)
     }
 
     /// Get stats for a specific daemon.

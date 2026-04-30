@@ -153,21 +153,45 @@ pub fn reconcile_entity(
             let our_len = our_events.len() - idx;
             let their_len = their_events.len() - idx;
 
-            // Longest chain wins. Tie: lower payload hash wins.
-            // parent_hash is identical at the divergence point (both diverge
-            // from the same parent), so we hash each side's divergent payload
-            // for a perspective-independent tiebreak.
+            // Longest chain wins. Tie: lower payload hash, then
+            // lexicographic on the divergent payload bytes.
+            // parent_hash is identical at the divergence point
+            // (both diverge from the same parent), so this is a
+            // perspective-independent ordering — peer A computing
+            // `(our=A, their=B)` produces the inverse of peer B
+            // computing `(our=B, their=A)`, so both peers reach
+            // the same canonical winner.
+            //
+            // The divergence detection at line ~106 only enters
+            // the conflict branch when `our_events[idx].payload
+            // != their_events[idx].payload`, so the payload-bytes
+            // comparison is guaranteed to return `Less` or
+            // `Greater` — `Equal` is unreachable. We assert that
+            // explicitly so a future change to the divergence
+            // detection (e.g. relaxing the byte-equality check)
+            // would surface as a clear panic rather than a silent
+            // permanent partition like the original `<=` bug.
             let winning_side = if our_len > their_len {
                 Side::Ours
             } else if their_len > our_len {
                 Side::Theirs
             } else {
-                let our_payload_hash = xxhash_rust::xxh3::xxh3_64(&our_events[idx].payload);
-                let their_payload_hash = xxhash_rust::xxh3::xxh3_64(&their_events[idx].payload);
-                if our_payload_hash <= their_payload_hash {
-                    Side::Ours
-                } else {
-                    Side::Theirs
+                let our_payload = &our_events[idx].payload;
+                let their_payload = &their_events[idx].payload;
+                let our_hash = xxhash_rust::xxh3::xxh3_64(our_payload);
+                let their_hash = xxhash_rust::xxh3::xxh3_64(their_payload);
+                use std::cmp::Ordering::{Equal, Greater, Less};
+                match our_hash
+                    .cmp(&their_hash)
+                    .then_with(|| our_payload.as_ref().cmp(their_payload.as_ref()))
+                {
+                    Less => Side::Ours,
+                    Greater => Side::Theirs,
+                    Equal => unreachable!(
+                        "reconcile_entity: divergence at idx={} but payloads are \
+                         byte-identical — divergence detection contract violated",
+                        idx
+                    ),
                 }
             };
 

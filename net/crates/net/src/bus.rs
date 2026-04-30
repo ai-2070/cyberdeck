@@ -260,12 +260,12 @@ impl EventBus {
     /// Start the scaling monitor (if dynamic scaling is enabled).
     /// This spawns a background task that periodically evaluates scaling decisions.
     ///
-    /// BUG_REPORT.md #24: the spawned task holds a `Weak<Self>`
-    /// rather than a strong `Arc<Self>` clone. With a strong clone
-    /// the task kept the bus alive forever, and `shutdown(self)`
-    /// (which consumes by value) was unreachable: callers with an
-    /// `Arc<EventBus>` could not `Arc::try_unwrap` to consume it
-    /// because the spawned task always held one of the strong refs.
+    /// The spawned task holds a `Weak<Self>` rather than a strong
+    /// `Arc<Self>` clone. With a strong clone the task kept the bus
+    /// alive forever, and `shutdown(self)` (which consumes by value)
+    /// was unreachable: callers with an `Arc<EventBus>` could not
+    /// `Arc::try_unwrap` to consume it because the spawned task always
+    /// held one of the strong refs.
     ///
     /// With a `Weak`, the monitor task upgrades each tick. Once the
     /// last caller-held `Arc` is dropped, the upgrade fails and the
@@ -287,13 +287,31 @@ impl EventBus {
     }
 
     /// Internal: Add a new shard with its workers.
+    ///
+    /// The previous implementation called `shard_manager.add_shard()`
+    /// first, which atomically marked the shard `Active` and published
+    /// it to the routing table. So `select_shard` could route producer
+    /// pushes to the new id *before* any drain or batch worker existed,
+    /// leaving events queued in a buffer with no consumer (and
+    /// triggering the configured backpressure mode if the buffer
+    /// filled).
+    ///
+    /// The fix uses the two-phase API on `ShardManager`:
+    ///   1. `add_shard()` allocates the id and metrics collector,
+    ///      adds the shard to the routing table in `Provisioning`
+    ///      state — so `with_shard` works (which the drain worker
+    ///      needs) but `select_shard` skips it.
+    ///   2. Spawn batch + drain workers and register the sender.
+    ///   3. `activate_shard()` flips state to `Active`. Only now
+    ///      does `select_shard` start routing producer pushes.
     async fn add_shard_internal(&self) -> Result<u16, AdapterError> {
+        // Step 1: provisioning add — not yet selectable.
         let new_id = self
             .shard_manager
             .add_shard()
             .map_err(|e| AdapterError::Fatal(e.to_string()))?;
 
-        // Create batch worker for the new shard
+        // Step 2: spawn workers and register the sender.
         let (tx, rx) = mpsc::channel::<Vec<crate::event::InternalEvent>>(1024);
 
         let batch = spawn_batch_worker(BatchWorkerParams {
@@ -306,10 +324,8 @@ impl EventBus {
             batch_retries: self.config.adapter_batch_retries,
         });
 
-        // Add sender
         self.batch_senders.write().insert(new_id, tx.clone());
 
-        // Spawn drain worker for the new shard
         let drain = spawn_drain_worker_for_shard(
             new_id,
             self.shard_manager.clone(),
@@ -318,10 +334,15 @@ impl EventBus {
             self.drain_finalize_ready.clone(),
         );
 
-        // Add workers
         self.batch_workers
             .lock()
             .insert(new_id, ShardWorkers { batch, drain });
+
+        // Step 3: workers are live — flip the shard to Active so
+        // `select_shard` will route to it.
+        self.shard_manager
+            .activate_shard(new_id)
+            .map_err(|e| AdapterError::Fatal(e.to_string()))?;
 
         // Update poll merger
         self.poll_merger.store(Arc::new(PollMerger::new(
@@ -334,17 +355,75 @@ impl EventBus {
     }
 
     /// Internal: Remove a stopped shard.
+    ///
+    /// Previously this dropped the worker `JoinHandle`s and unmapped
+    /// the shard without first draining its ring buffer. Any events
+    /// still queued at the moment of removal — even just a few from a
+    /// producer that pushed concurrently with the scale-down decision
+    /// — were silently stranded once the drain worker exited on
+    /// `with_shard → None`.
+    ///
+    /// The fix:
+    ///   1. Wait for the drain worker we're about to retire to flush
+    ///      the channel, by closing the bus-side sender first.
+    ///   2. Call `remove_shard`, which atomically pops the
+    ///      ring-buffer remnants and unmaps the shard. The drained
+    ///      events come back to us as a `Vec`.
+    ///   3. Hand those events directly to the adapter as a
+    ///      single-shot batch — bypassing the per-shard pipeline
+    ///      that's already being torn down — so they reach durable
+    ///      storage.
     async fn remove_shard_internal(&self, shard_id: u16) -> Result<(), AdapterError> {
-        // Remove sender (workers will terminate when channel closes)
+        // Step 1: drop the bus-side sender. The drain worker still
+        // has its own clone and will keep draining; we want it to
+        // exit when its `with_shard` call returns `None` after
+        // step 2's unmap.
         self.batch_senders.write().remove(&shard_id);
 
-        // Remove and drop worker handles for this shard
-        self.batch_workers.lock().remove(&shard_id);
-
-        // Remove from shard manager
-        self.shard_manager
+        // Step 2: atomically drain whatever's in the ring buffer and
+        // unmap. After this, `with_shard(shard_id)` returns `None`
+        // and the drain worker exits at its next poll.
+        let stranded = self
+            .shard_manager
             .remove_shard(shard_id)
             .map_err(|e| AdapterError::Fatal(e.to_string()))?;
+
+        // Step 3: drop worker handles. The drain worker should have
+        // exited (or be about to). The batch worker exits when its
+        // channel closes — once the drain worker drops its sender
+        // clone, the channel is closed.
+        self.batch_workers.lock().remove(&shard_id);
+
+        // Step 4: flush the stranded ring-buffer events through the
+        // adapter in one shot. We construct a single `Batch` and
+        // push it through the same `dispatch_batch` helper the
+        // batch worker uses, so retry / timeout semantics match.
+        if !stranded.is_empty() {
+            let count = stranded.len();
+            let batch = crate::event::Batch::new(shard_id, stranded, 0);
+            let dispatched = dispatch_batch(
+                &*self.adapter,
+                batch,
+                shard_id,
+                self.config.adapter_timeout,
+                self.config.adapter_batch_retries,
+            )
+            .await;
+            if dispatched {
+                tracing::info!(
+                    shard_id,
+                    count,
+                    "Removed shard: flushed stranded ring-buffer events to adapter"
+                );
+            } else {
+                tracing::error!(
+                    shard_id,
+                    count,
+                    "Removed shard: adapter rejected stranded ring-buffer events; \
+                     events lost"
+                );
+            }
+        }
 
         // Update poll merger
         self.poll_merger.store(Arc::new(PollMerger::new(
@@ -523,14 +602,25 @@ impl EventBus {
 
     /// Flush all pending batches.
     ///
-    /// Waits for all shard ring buffers to drain (up to 5 seconds) before
-    /// flushing the adapter, rather than relying on a fixed sleep.
+    /// Waits for all shard ring buffers to drain, then for the
+    /// per-shard mpsc channels to drain, then for any pending batch
+    /// inside each batch worker to time out and dispatch — and only
+    /// then calls `adapter.flush()`. Bounded by 5 s overall.
+    ///
+    /// The previous implementation slept a single `batch.max_delay`
+    /// (default 10 ms) after the ring buffers drained and immediately
+    /// called `adapter.flush()`. Events still in transit through the
+    /// per-shard mpsc channel, the batch worker's pending batch, or
+    /// the in-progress `adapter.on_batch` call (bounded only by
+    /// `adapter_timeout`, default 30 s) could miss the flush. Callers
+    /// using `flush()` as a delivery barrier silently lost events.
     pub async fn flush(&self) -> Result<(), AdapterError> {
-        // Wait until all ring buffers are empty, polling with adaptive backoff.
         let start = tokio::time::Instant::now();
         let timeout = Duration::from_secs(5);
         let mut backoff = Duration::from_micros(100);
 
+        // Phase 1: wait for ring buffers to drain (drain workers
+        // pump them into the per-shard mpsc channels).
         loop {
             if self.shard_manager.all_shards_empty() {
                 break;
@@ -543,13 +633,53 @@ impl EventBus {
             backoff = (backoff * 2).min(Duration::from_millis(10));
         }
 
-        // Ring buffers are empty, but events may still be in-flight in the
-        // drain→batch worker pipeline (mpsc channels, pending batches).
-        // Wait for the batch workers' max_delay to ensure any pending batch
-        // has been flushed to the adapter before we call adapter.flush().
-        tokio::time::sleep(self.config.batch.max_delay).await;
+        // Phase 2: wait for the per-shard mpsc channels to be
+        // empty. We approximate this by sleeping `batch.max_delay`
+        // — the batch worker's `recv_timeout` cap — at least once
+        // per shard's worth of pending batch state, so any
+        // partially-filled batch has a chance to time out and
+        // dispatch.
+        //
+        // We can't directly observe channel depth (mpsc::Receiver
+        // doesn't expose len without consuming), so use the
+        // worst-case timing: `max_delay` per outstanding batch
+        // worker. With the default 10 ms `max_delay` and a
+        // typical 8-shard config, that's ~80 ms.
+        let n_workers = self.batch_workers.lock().len();
+        let phase2_budget = self
+            .config
+            .batch
+            .max_delay
+            .saturating_mul(n_workers.max(1) as u32);
+        let phase2_deadline =
+            tokio::time::Instant::now() + phase2_budget.min(Duration::from_secs(2));
+        // Sleep one `max_delay` window at a time. After each sleep,
+        // if the ring buffers are still empty (no late drain refilled
+        // them), we've given the in-flight batches at least one
+        // `max_delay`-sized opportunity to time out and dispatch —
+        // good enough to declare phase 2 complete. Without this
+        // early-break, every `flush()` always paid the full budget
+        // (up to 2s) even on an idle system.
+        while tokio::time::Instant::now() < phase2_deadline {
+            tokio::time::sleep(self.config.batch.max_delay).await;
+            if self.shard_manager.all_shards_empty() {
+                break;
+            }
+        }
 
-        self.adapter.flush().await
+        // Phase 3: tell the adapter to flush whatever it has
+        // buffered. Bounded by `adapter_timeout` so a hanging
+        // adapter can't pin us forever.
+        match tokio::time::timeout(self.config.adapter_timeout, self.adapter.flush()).await {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!(
+                    "flush: adapter.flush timed out after {:?}",
+                    self.config.adapter_timeout
+                );
+                Err(AdapterError::Fatal("adapter flush timed out".into()))
+            }
+        }
     }
 
     /// Gracefully shut down the event bus.
@@ -579,12 +709,12 @@ impl EventBus {
         // below.
         self.shutdown.store(true, AtomicOrdering::SeqCst);
 
-        // 1a. BUG_REPORT.md #6: wait for in-flight ingests to drain
-        // BEFORE the drain workers do their final ring-buffer sweep.
-        // Otherwise a producer that observed `shutdown=false` could
-        // push *after* the drain worker's last `pop_batch_into`
-        // returned zero, leaving the event stranded in the ring
-        // buffer when the bus is dropped.
+        // 1a. Wait for in-flight ingests to drain BEFORE the drain
+        // workers do their final ring-buffer sweep. Otherwise a
+        // producer that observed `shutdown=false` could push *after*
+        // the drain worker's last `pop_batch_into` returned zero,
+        // leaving the event stranded in the ring buffer when the bus
+        // is dropped.
         //
         // This is bounded: every producer either bails on the
         // SeqCst-synchronized shutdown check (no progress past the
@@ -700,7 +830,16 @@ impl Drop for EventBus {
         // workers, scaling monitor) observe the flag and exit. We
         // cannot await futures in Drop, but setting the atomic flag
         // triggers eventual termination.
-        self.shutdown.store(true, AtomicOrdering::Release);
+        //
+        // Previously used `Release` here while `try_enter_ingest`
+        // and `shutdown()` use `SeqCst` on the same flag. `&mut self`
+        // exclusion makes that sound today (no concurrent ingest can
+        // observe a half-published shutdown). The mismatch is purely
+        // defensive — switching to `SeqCst` matches the rest of the
+        // lifecycle and removes a footgun if a future change ever
+        // opened a path where `Drop` overlaps an in-flight
+        // `try_enter_ingest`.
+        self.shutdown.store(true, AtomicOrdering::SeqCst);
         // Also release the drain-finalize gate so any drain worker
         // already parked waiting for it can proceed and exit. Without
         // this, drop-without-shutdown leaves drain workers blocked on
@@ -709,16 +848,15 @@ impl Drop for EventBus {
         // Best-effort durability: drop never gets the in-flight wait,
         // so any push that lands after this point is still lost.
         self.drain_finalize_ready
-            .store(true, AtomicOrdering::Release);
+            .store(true, AtomicOrdering::SeqCst);
 
-        // BUG_REPORT.md #17: if `shutdown()` was never awaited, any
-        // events still in the per-shard ring buffers or mpsc
-        // channels are lost — the adapter's `flush()` and
-        // `shutdown()` won't run, so durable backends never see
-        // them. We can't fix that from `Drop` (no async), but we
-        // *can* surface the data-loss risk loudly so it doesn't
-        // hide. The check is bounded to "shutdown was never
-        // started"; an in-progress shutdown is fine because the
+        // If `shutdown()` was never awaited, any events still in the
+        // per-shard ring buffers or mpsc channels are lost — the
+        // adapter's `flush()` and `shutdown()` won't run, so durable
+        // backends never see them. We can't fix that from `Drop` (no
+        // async), but we *can* surface the data-loss risk loudly so
+        // it doesn't hide. The check is bounded to "shutdown was
+        // never started"; an in-progress shutdown is fine because the
         // call site is awaiting it.
         if !self.shutdown_completed.load(AtomicOrdering::Acquire) {
             let stats = self.shard_manager.stats();
@@ -739,17 +877,23 @@ impl Drop for EventBus {
 /// upgrades it once per tick so the spawned task does not keep the
 /// bus alive past the caller's last `Arc` reference. Without this,
 /// `Arc::try_unwrap` (which the consuming `shutdown(self)` API
-/// requires) would fail forever (BUG_REPORT.md #24).
+/// requires) would fail forever.
 async fn run_scaling_monitor_via_weak(weak: std::sync::Weak<EventBus>) {
-    let interval = match weak.upgrade() {
-        Some(bus) => match &bus.config.scaling {
-            Some(p) => p.metrics_window,
-            None => return,
-        },
-        None => return,
-    };
-
+    // Refresh `interval` from the policy on every tick. The previous
+    // version cached it once at task start, so any future runtime
+    // policy update would not be adopted by the monitor without a
+    // process restart. Today `EventBusConfig` is immutable
+    // post-construction so this is a no-op — but reading it each tick
+    // is cheap (one atomic / RwLock read) and removes the latent
+    // footgun.
     loop {
+        let interval = match weak.upgrade() {
+            Some(bus) => match &bus.config.scaling {
+                Some(p) => p.metrics_window,
+                None => return,
+            },
+            None => return,
+        };
         tokio::time::sleep(interval).await;
 
         let bus = match weak.upgrade() {
@@ -991,15 +1135,15 @@ fn spawn_drain_worker_for_shard(
         loop {
             // Relaxed: same rationale as ingest — see `EventBus::ingest`.
             if shutdown.load(AtomicOrdering::Relaxed) {
-                // BUG_REPORT.md #6: before doing the final sweep, wait
-                // for `shutdown()` to release the finalize gate. The
-                // gate is set only after the in-flight ingest counter
-                // reaches zero, which means every producer that read
-                // `shutdown=false` has completed its push. Without
-                // this wait, the drain worker can race ahead of a
-                // late push under shard-mutex serialization (drain
-                // takes the lock first, sees nothing, exits; producer
-                // then takes the lock and pushes — event stranded).
+                // Before doing the final sweep, wait for `shutdown()`
+                // to release the finalize gate. The gate is set only
+                // after the in-flight ingest counter reaches zero,
+                // which means every producer that read `shutdown=false`
+                // has completed its push. Without this wait, the drain
+                // worker can race ahead of a late push under
+                // shard-mutex serialization (drain takes the lock
+                // first, sees nothing, exits; producer then takes the
+                // lock and pushes — event stranded).
                 //
                 // Acquire pairs with the Release in `EventBus::shutdown`
                 // and `EventBus::drop`, transitively making every
@@ -1445,6 +1589,74 @@ mod tests {
             "shutdown stranded events: {successes} ingested successfully, \
              only {delivered} reached the adapter"
         );
+    }
+
+    /// Regression: BUG_REPORT.md #16 — `flush()` must be a delivery
+    /// barrier: after it returns successfully, every event the
+    /// caller successfully ingested before `flush()` was called
+    /// must have been handed to the adapter via `on_batch`.
+    /// The previous implementation slept a single `batch.max_delay`
+    /// after the ring buffers drained, which left a window where
+    /// events could still be sitting in the per-shard mpsc channel
+    /// or inside a partially-filled batch awaiting timeout — those
+    /// events were silently dropped from the flush guarantee.
+    #[tokio::test]
+    async fn flush_is_a_delivery_barrier() {
+        let received = Arc::new(AtomicU64::new(0));
+        let adapter: Box<dyn crate::adapter::Adapter> = Box::new(CountingAdapter {
+            received: received.clone(),
+        });
+
+        // Use a deliberately *long* batch.max_delay (250ms) so that a
+        // partially-filled batch sitting in the batch worker's
+        // pending state would survive past the old single-`max_delay`
+        // sleep. min_size > burst forces the partial-batch path.
+        let config = EventBusConfig::builder()
+            .num_shards(2)
+            .ring_buffer_capacity(1024)
+            .batch(crate::config::BatchConfig {
+                min_size: 1_000,
+                max_size: 10_000,
+                max_delay: Duration::from_millis(250),
+                adaptive: false,
+                velocity_window: Duration::from_millis(100),
+            })
+            .build()
+            .unwrap();
+        let bus = EventBus::new_with_adapter(config, adapter).await.unwrap();
+
+        // A small burst — far below `min_size`, so the batch worker
+        // will sit on a partial batch waiting for `max_delay`.
+        let burst = 50usize;
+        let mut successes = 0u64;
+        for i in 0..burst {
+            if bus.ingest(Event::new(json!({"i": i}))).is_ok() {
+                successes += 1;
+            }
+        }
+
+        // Time the flush call to confirm we waited long enough for
+        // the partial batch to time out. The previous code slept
+        // ~10ms total in the post-empty phase; the fix waits up to
+        // `max_delay * num_workers` (here 500ms cap, capped at 2s).
+        let t0 = std::time::Instant::now();
+        bus.flush().await.unwrap();
+        let elapsed = t0.elapsed();
+
+        // After flush returns, every successful ingest must have
+        // been delivered to the adapter. With the old code this
+        // assertion would fail: events sit in the partial batch
+        // until `max_delay` (250ms) elapses, but flush returned
+        // after only ~10ms.
+        let delivered = received.load(AtomicOrdering::SeqCst);
+        assert_eq!(
+            delivered, successes,
+            "flush() returned but only {delivered} of {successes} \
+             events reached the adapter (#16); flush waited {:?}",
+            elapsed
+        );
+
+        bus.shutdown().await.unwrap();
     }
 
     /// Regression: BUG_REPORT.md #6 — drop-without-shutdown must

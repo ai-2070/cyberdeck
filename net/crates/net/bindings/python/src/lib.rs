@@ -1328,6 +1328,7 @@ mod mesh_bindings {
                     0,
                 )],
                 sequence_start: 0,
+                process_nonce: net::event::batch_process_nonce(),
             };
 
             self.runtime

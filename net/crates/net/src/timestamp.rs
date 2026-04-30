@@ -65,13 +65,13 @@ impl TimestampGenerator {
     /// (the moment the underlying `quanta::Clock` was created). This
     /// operation is lock-free and does not invoke any syscalls.
     ///
-    /// BUG_REPORT.md #14: previously returned the raw TSC tick
-    /// count. The docstring claimed nanoseconds, but on a 3.5 GHz
-    /// core the value was ~3.5× larger than ns-since-epoch, breaking
-    /// any consumer that read `insertion_ts` and tried to correlate
-    /// it with wall-clock-derived timestamps from elsewhere.
-    /// Converting via `delta_as_nanos` here costs ~1ns extra per
-    /// call and gives consumers a unit they can actually use.
+    /// Previously returned the raw TSC tick count. The docstring
+    /// claimed nanoseconds, but on a 3.5 GHz core the value was ~3.5×
+    /// larger than ns-since-epoch, breaking any consumer that read
+    /// `insertion_ts` and tried to correlate it with wall-clock-derived
+    /// timestamps from elsewhere. Converting via `delta_as_nanos` here
+    /// costs ~1ns extra per call and gives consumers a unit they can
+    /// actually use.
     ///
     /// # Performance
     ///

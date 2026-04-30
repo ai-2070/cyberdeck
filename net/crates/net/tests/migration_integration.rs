@@ -1783,16 +1783,21 @@ fn test_standby_sync_promote_state_continuity() {
     assert_eq!(group.buffered_event_count(), 0);
 
     // Phase 5: Deliver a new event to the promoted active
-    // The standby daemon started fresh (count=0) and replayed 3 buffered events
-    // (count became 3). Now delivering one more should produce count=4.
+    // After `sync_standbys` restored the active's state (count=10) onto the
+    // standby and `promote` replayed the 3 buffered post-sync events
+    // (count=13), this 14th event must observe full state continuity:
+    // count=14, with no events lost across the promotion boundary.
     let event = make_event(0xFFFF, 14);
     let outputs = reg.deliver(new_active, &event).unwrap();
     assert_eq!(outputs.len(), 1);
     let val = u64::from_le_bytes(outputs[0].payload[..8].try_into().unwrap());
-    assert_eq!(val, 4); // 3 replayed + 1 new
+    assert_eq!(val, 14); // 10 synced + 3 replayed + 1 new
 
-    // The new active's output should carry its own origin_hash
-    assert_eq!(outputs[0].link.origin_hash, new_active);
+    // After the standby restores the active's chain head from the snapshot,
+    // post-promotion outputs continue extending the active's chain. The
+    // origin_hash on emitted events stays the active's, preserving causal
+    // continuity for downstream observers across the failover boundary.
+    assert_eq!(outputs[0].link.origin_hash, active);
 }
 
 /// Integration test: Promote then continue processing.
@@ -1831,14 +1836,18 @@ fn test_standby_promote_then_continue() {
         .promote(|| Box::new(CounterDaemon::new()), &reg, &sched)
         .unwrap();
 
-    // Deliver 10 more events to the new active — verify sequential output
+    // Deliver 10 more events to the new active — verify sequential output.
+    // After `sync_standbys` restored the active's state (count=5) onto the
+    // standby, the promoted new active continues from count=5, so the next
+    // 10 events produce 6..=15. Emitted events extend the original active's
+    // causal chain (same origin_hash) for downstream continuity.
     for seq in 1..=10 {
         let event = make_event(0xFFFF, 100 + seq);
         let outputs = reg.deliver(new_active, &event).unwrap();
         assert_eq!(outputs.len(), 1);
         let val = u64::from_le_bytes(outputs[0].payload[..8].try_into().unwrap());
-        assert_eq!(val, seq); // fresh daemon counts from 0
-        assert_eq!(outputs[0].link.origin_hash, new_active);
+        assert_eq!(val, 5 + seq); // 5 synced + seq new events
+        assert_eq!(outputs[0].link.origin_hash, active);
     }
 
     // Verify the new active's role

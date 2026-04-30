@@ -176,17 +176,20 @@ impl PortMapperClient for UpnpMapper {
                 .get_external_ip()
                 .await
                 .map_err(|_| PortMappingError::Transport("get_external_ip failed".into()))?;
-            gw.add_port(
-                PortMappingProtocol::UDP,
-                internal_port,
-                local,
-                lease,
-                UPNP_DESCRIPTION,
-            )
-            .await
-            .map_err(add_port_err_to_port_mapping)?;
+            // Previously called `add_port`, which assumes the
+            // requested external port equals the internal port. Some
+            // IGD implementations silently re-map `NewExternalPort`
+            // to a free port and return success — the returned
+            // `PortMapping` then carried the wrong external port and
+            // the mesh advertised an unreachable address.
+            // `add_any_port` returns the actually-mapped external
+            // port, which we record in the `PortMapping`.
+            let actual_external_port = gw
+                .add_any_port(PortMappingProtocol::UDP, local, lease, UPNP_DESCRIPTION)
+                .await
+                .map_err(add_any_port_err_to_port_mapping)?;
             Ok::<_, PortMappingError>(PortMapping {
-                external: SocketAddr::new(external_ip, internal_port),
+                external: SocketAddr::new(external_ip, actual_external_port),
                 internal_port,
                 ttl: Duration::from_secs(lease as u64),
                 protocol: Protocol::Upnp,
@@ -248,6 +251,7 @@ fn search_err_to_port_mapping(err: igd_next::SearchError) -> PortMappingError {
 /// Map `igd-next::AddPortError` into our stable vocabulary.
 /// `PortInUse` / `SamePortValuesRequired` / `OnlyPermanentLeasesSupported`
 /// are router-policy refusals; other variants are transport.
+#[allow(dead_code)]
 fn add_port_err_to_port_mapping(err: igd_next::AddPortError) -> PortMappingError {
     use igd_next::AddPortError;
     match err {
@@ -266,6 +270,34 @@ fn add_port_err_to_port_mapping(err: igd_next::AddPortError) -> PortMappingError
         }
         AddPortError::RequestError(e) => PortMappingError::Transport(format!("IGD request: {e}")),
         AddPortError::ActionNotAuthorized => {
+            PortMappingError::Refused("action-not-authorized".into())
+        }
+    }
+}
+
+/// Companion mapper for `AddAnyPortError`. `ExternalPortInUse` /
+/// `NoPortsAvailable` / `OnlyPermanentLeasesSupported` are
+/// router-policy refusals; other variants are transport.
+fn add_any_port_err_to_port_mapping(err: igd_next::AddAnyPortError) -> PortMappingError {
+    use igd_next::AddAnyPortError;
+    match err {
+        AddAnyPortError::ExternalPortInUse => {
+            PortMappingError::Refused("external-port-in-use".into())
+        }
+        AddAnyPortError::NoPortsAvailable => PortMappingError::Refused("no-ports-available".into()),
+        AddAnyPortError::OnlyPermanentLeasesSupported => {
+            PortMappingError::Refused("only-permanent-leases-supported".into())
+        }
+        AddAnyPortError::DescriptionTooLong => {
+            PortMappingError::Transport("description too long".into())
+        }
+        AddAnyPortError::InternalPortZeroInvalid => {
+            PortMappingError::Transport("zero port invalid".into())
+        }
+        AddAnyPortError::RequestError(e) => {
+            PortMappingError::Transport(format!("IGD request: {e}"))
+        }
+        AddAnyPortError::ActionNotAuthorized => {
             PortMappingError::Refused("action-not-authorized".into())
         }
     }

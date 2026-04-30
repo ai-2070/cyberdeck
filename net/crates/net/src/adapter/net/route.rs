@@ -228,13 +228,31 @@ impl RoutingHeader {
     }
 
     /// Decrement TTL and increment hop count (for forwarding)
+    ///
+    /// `hop_count` is `u8`, so on a 256+-hop path the saturating_add
+    /// pins it at 255 and the `hop_count + 2` indirect-route metric
+    /// used downstream undercounts the true distance. Routing
+    /// correctness is preserved — `ttl` (separate, larger) still
+    /// bounds loops — but best-route selection may pick a path with
+    /// bogus metrics. Log once at saturation so an operator can
+    /// notice and reconfigure path lengths or upgrade `hop_count` to
+    /// `u16`. (Changing the wire format is a breaking change held
+    /// off until consumers migrate.)
     #[inline]
     pub fn forward(&mut self) -> bool {
         if self.ttl == 0 {
             return false;
         }
         self.ttl -= 1;
-        self.hop_count = self.hop_count.saturating_add(1);
+        if self.hop_count == u8::MAX {
+            tracing::warn!(
+                "RoutingHeader::forward: hop_count saturated at {}; \
+                 indirect-route metrics on this packet are inaccurate",
+                u8::MAX
+            );
+        } else {
+            self.hop_count = self.hop_count.saturating_add(1);
+        }
         true
     }
 }

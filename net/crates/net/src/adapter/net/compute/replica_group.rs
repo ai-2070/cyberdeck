@@ -174,7 +174,15 @@ impl ReplicaGroup {
 
         if n > current {
             let requirements = daemon_factory().requirements();
-            let used_nodes: HashSet<u64> = self.coord.members().iter().map(|m| m.node_id).collect();
+            // `used_nodes` must be `mut` and updated inside the loop.
+            // Without this insert, `place_with_spread` sees the same
+            // exclusion set every iteration and returns the same
+            // first non-excluded node — colocating every new replica
+            // on a single node, defeating the spread invariant.
+            // `fork_group.rs:185-199` already did this correctly;
+            // bring this loop into parity.
+            let mut used_nodes: HashSet<u64> =
+                self.coord.members().iter().map(|m| m.node_id).collect();
 
             for index in current..n {
                 let keypair = derive_replica_keypair(&self.config.group_seed, index);
@@ -183,6 +191,7 @@ impl ReplicaGroup {
 
                 let placement =
                     GroupCoordinator::place_with_spread(scheduler, &requirements, &used_nodes)?;
+                used_nodes.insert(placement.node_id);
 
                 let daemon = daemon_factory();
                 let host = DaemonHost::new(daemon, keypair, self.config.host_config.clone());
@@ -231,29 +240,47 @@ impl ReplicaGroup {
         for index in affected {
             self.coord.mark_unhealthy(index);
 
-            let member = self
+            let old_origin_hash = self
                 .coord
                 .members()
                 .iter()
                 .find(|m| m.index == index)
-                .unwrap();
-            let _ = registry.unregister(member.origin_hash);
+                .unwrap()
+                .origin_hash;
 
-            // Re-derive the same keypair (deterministic)
+            // Try `place_with_spread` BEFORE touching the registry.
+            // On placement failure, the old slot is still registered
+            // (under `old_origin_hash`), so recovery / scale_to can
+            // make it healthy again later.
+            //
+            // On placement success we use `registry.replace` —
+            // atomic upsert at the deterministic origin_hash. The
+            // older `unregister` → `register` two-step had a
+            // window where the second step could fail (concurrent
+            // race) and leave the slot orphaned; `replace` collapses
+            // the swap into a single map operation, so the slot is
+            // never empty between callers.
+            let _ = old_origin_hash; // retained as a doc anchor for the comment above.
             let keypair = derive_replica_keypair(&self.config.group_seed, index);
             let entity_id_bytes: NodeId = *keypair.entity_id().as_bytes();
 
             let placement =
                 match GroupCoordinator::place_with_spread(scheduler, &requirements, &exclude) {
                     Ok(p) => p,
-                    Err(_) => continue,
+                    Err(e) => {
+                        tracing::warn!(
+                            index,
+                            error = %e,
+                            "ReplicaGroup::on_node_failure: place_with_spread failed; \
+                             slot left registered for later recovery (#7)"
+                        );
+                        continue;
+                    }
                 };
 
             let daemon = daemon_factory();
             let host = DaemonHost::new(daemon, keypair, self.config.host_config.clone());
-            if registry.register(host).is_err() {
-                continue;
-            }
+            registry.replace(host);
 
             self.coord
                 .update_member_placement(index, placement.node_id, entity_id_bytes);
@@ -441,6 +468,45 @@ mod tests {
         assert_eq!(reg.count(), 4);
     }
 
+    /// Regression: BUG_REPORT.md #6 — `scale_to` previously
+    /// computed `used_nodes` once before the placement loop and
+    /// never inserted the newly-chosen node id between iterations.
+    /// `place_with_spread` saw the same exclusion set every
+    /// iteration and returned the same first non-excluded node,
+    /// so every newly-added replica got colocated on a single
+    /// node — the spread invariant was silently violated.
+    /// `fork_group.rs:185-199` had the correct `used_nodes.insert`
+    /// pattern; this test pins `replica_group` to that contract.
+    #[test]
+    fn scale_up_does_not_colocate_new_replicas() {
+        let reg = DaemonRegistry::new();
+        let sched = make_scheduler();
+
+        // Start with 1 replica, scale to 4 — the test scheduler
+        // exposes 4 distinct nodes (0x1111..0x4444), so all 4
+        // replicas should land on distinct nodes.
+        let mut group =
+            ReplicaGroup::spawn(test_config(1), || Box::new(NoopDaemon), &sched, &reg).unwrap();
+
+        group
+            .scale_to(4, || Box::new(NoopDaemon), &sched, &reg)
+            .unwrap();
+
+        let node_ids: HashSet<u64> = group.replicas().iter().map(|r| r.node_id).collect();
+        assert_eq!(
+            node_ids.len(),
+            4,
+            "all 4 replicas should land on distinct nodes — \
+             colocation indicates BUG_REPORT.md #6 has regressed; \
+             got node ids {:?}",
+            group
+                .replicas()
+                .iter()
+                .map(|r| r.node_id)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_scale_down() {
         let reg = DaemonRegistry::new();
@@ -529,5 +595,74 @@ mod tests {
             ReplicaGroup::spawn(test_config(1), || Box::new(NoopDaemon), &sched, &reg2).unwrap();
 
         assert_eq!(g1.group_id(), g2.group_id());
+    }
+
+    /// Regression: BUG_REPORT.md #7 — `on_node_failure` previously
+    /// called `mark_unhealthy` + `unregister` BEFORE attempting
+    /// `place_with_spread`. If placement failed (no spare nodes
+    /// available) the loop `continue`d without restoring state —
+    /// the slot was left unhealthy AND unregistered, and
+    /// `on_node_recovery` only re-marks slots whose origin_hash
+    /// is still in the registry. Result: permanent degradation.
+    ///
+    /// We trigger placement failure by using a single-node
+    /// scheduler: when that node "fails" and is excluded from the
+    /// candidate set, no spare exists. Pre-fix the slot ends up
+    /// unregistered. Post-fix it stays registered so recovery
+    /// can repair it.
+    #[test]
+    fn place_failure_does_not_strand_slot_in_unregistered_state() {
+        // Build a scheduler with exactly one node so the
+        // exclude-the-failed-node candidate search returns nothing.
+        fn single_node_scheduler() -> Scheduler {
+            let index = Arc::new(CapabilityIndex::new());
+            let eid = crate::adapter::net::identity::EntityId::from_bytes([0u8; 32]);
+            index.index(CapabilityAnnouncement::new(
+                0x9999,
+                eid,
+                1,
+                CapabilitySet::new(),
+            ));
+            Scheduler::new(index, 0x9999, CapabilitySet::new())
+        }
+
+        let reg = DaemonRegistry::new();
+        let sched = single_node_scheduler();
+        let mut group =
+            ReplicaGroup::spawn(test_config(1), || Box::new(NoopDaemon), &sched, &reg).unwrap();
+
+        let failed_node = group.replicas()[0].node_id;
+        let failed_origin = group.replicas()[0].origin_hash;
+        assert_eq!(failed_node, 0x9999);
+        assert!(reg.contains(failed_origin));
+
+        // Trigger failure on the only node. `place_with_spread`
+        // excludes it and finds no candidates → returns Err.
+        let replaced = group
+            .on_node_failure(failed_node, || Box::new(NoopDaemon), &sched, &reg)
+            .unwrap();
+        assert!(
+            replaced.is_empty(),
+            "with no spare nodes, placement must fail and no replacement is recorded"
+        );
+
+        // The crucial invariant: the slot's origin_hash is still
+        // in the registry, so on_node_recovery can fix it.
+        // Pre-fix: this assertion failed because `unregister` ran
+        // before `place_with_spread` and was never undone.
+        assert!(
+            reg.contains(failed_origin),
+            "BUG_REPORT.md #7: slot must remain registered when placement \
+             fails — otherwise on_node_recovery cannot restore it"
+        );
+
+        // Recovery on the same node restores the slot to healthy.
+        group.on_node_recovery(failed_node, &reg);
+        assert_eq!(
+            group.health(),
+            GroupHealth::Healthy,
+            "after recovery the slot must be healthy again — the pre-fix \
+             code left it permanently unhealthy + unregistered"
+        );
     }
 }

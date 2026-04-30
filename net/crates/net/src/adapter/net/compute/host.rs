@@ -127,9 +127,27 @@ impl DaemonHost {
         // Restore daemon state
         daemon.restore(snapshot.state.clone())?;
 
-        // Rebuild chain from snapshot head. Use the snapshot state as the
-        // head payload so the next event's parent_hash is computed correctly.
-        let chain = CausalChainBuilder::from_head(snapshot.chain_link, snapshot.state.clone());
+        // Rebuild chain from snapshot head. Use the head event's
+        // payload (NOT `snapshot.state`, which is the daemon's
+        // serialized state — a different thing entirely). The next
+        // event's `parent_hash` is `xxh3(prev_link_bytes ++ prev_payload)`,
+        // and any third-party validator that derives `prev_payload`
+        // from the actual head event would mismatch us if we used
+        // `snapshot.state` here.
+        //
+        // `head_payload` is a runtime-only field on the snapshot (not
+        // on the wire). Callers populate it from the head event
+        // before invoking restore. If it's empty (e.g. a snapshot
+        // deserialized from wire bytes without out-of-band payload
+        // transfer), we fall back to `snapshot.state` to preserve
+        // the prior behavior — but this fallback only works when
+        // the source side made the same choice.
+        let head_payload = if snapshot.head_payload.is_empty() {
+            snapshot.state.clone()
+        } else {
+            snapshot.head_payload.clone()
+        };
+        let chain = CausalChainBuilder::from_head(snapshot.chain_link, head_payload);
 
         // Rehydrate the subscription ledger. Empty bytes → empty
         // ledger; malformed bytes → reject. The migration-target
@@ -218,6 +236,38 @@ impl DaemonHost {
             snapshot.bindings_bytes = bindings.to_bytes();
         }
         Some(snapshot)
+    }
+
+    /// Restore this host's daemon state and chain head from a
+    /// snapshot taken on another daemon (typically the active in a
+    /// standby group). Unlike [`from_snapshot`], this mutates an
+    /// existing host in place — the keypair stays put, only the
+    /// daemon-state bytes and chain head are updated.
+    ///
+    /// Used by `StandbyGroup::sync_standbys` to actually copy state
+    /// from the active onto each standby; previously sync only
+    /// updated bookkeeping and standbys stayed in their initial
+    /// default-constructed state, so a promoted standby lost
+    /// everything that had happened before the most recent sync.
+    ///
+    /// [`from_snapshot`]: Self::from_snapshot
+    pub fn restore_from_snapshot(&mut self, snapshot: &StateSnapshot) -> Result<(), DaemonError> {
+        // Push the daemon's state across.
+        self.daemon.restore(snapshot.state.clone())?;
+
+        // Rebuild the chain head so the next event this host
+        // produces (or validates) extends from the snapshot's
+        // head_link with the right `parent_hash`. Same fallback
+        // logic as `from_snapshot` for the runtime-only
+        // `head_payload`.
+        let head_payload = if snapshot.head_payload.is_empty() {
+            snapshot.state.clone()
+        } else {
+            snapshot.head_payload.clone()
+        };
+        self.chain = CausalChainBuilder::from_head(snapshot.chain_link, head_payload);
+        self.horizon = snapshot.horizon.clone();
+        Ok(())
     }
 
     /// Record a subscription in the daemon's ledger.

@@ -112,6 +112,14 @@ impl HeapSegment {
         self.base_offset = base;
     }
 
+    /// Test-only: mutable access to the underlying byte buffer.
+    /// Used by checksum-on-read regression tests to simulate
+    /// on-disk corruption without going through a real I/O path.
+    #[cfg(test)]
+    pub(super) fn bytes_for_test_mut(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+
     /// Evict the prefix of the segment strictly below `new_base` in
     /// the absolute offset space.
     ///

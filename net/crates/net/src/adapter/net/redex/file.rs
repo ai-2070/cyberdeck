@@ -68,6 +68,31 @@ struct RedexFileInner {
     interval_shutdown: Option<Arc<Notify>>,
 }
 
+/// Dropping the last `RedexFile` clone without calling `close()`
+/// previously leaked the `FsyncPolicy::Interval` background task —
+/// it kept a strong `Arc<DiskSegment>` and a shutdown `Notify` whose
+/// only firing site was inside `close()`. `redex/index.rs` already
+/// had a Drop impl that mirrored this pattern; we mirror it here so
+/// a misbehaving caller (or a panic path that bypasses the explicit
+/// close) doesn't leak the task for the lifetime of the runtime.
+///
+/// Drop is best-effort: it fires the notify so the spawned task
+/// observes the signal and exits at the next select. We do NOT
+/// flush or fsync from Drop because that would require an async
+/// runtime context that may not be available.
+impl Drop for RedexFileInner {
+    fn drop(&mut self) {
+        #[cfg(feature = "redex-disk")]
+        if let Some(notify) = self.interval_shutdown.as_ref() {
+            // `notify_one` stores a permit even if no waiter is
+            // currently parked, so a task that hasn't yet reached
+            // its first `notified().await` will still observe the
+            // signal on its next select.
+            notify.notify_one();
+        }
+    }
+}
+
 /// A handle to a RedEX file. Cheap to clone.
 ///
 /// Created via [`super::Redex::open_file`].
@@ -127,11 +152,29 @@ impl RedexFile {
         let next_seq = recovered.index.last().map(|e| e.seq + 1).unwrap_or(0);
 
         let segment = HeapSegment::from_existing(recovered.payload_bytes);
-        // Recovered entries get "now" as their fake timestamp. v1
-        // age-retention limitation: persistent files lose age info
-        // across reopen. v2 mmap tier will persist timestamps.
-        let now = now_ns();
-        let timestamps = vec![now; recovered.index.len()];
+        // Use the persisted timestamps if they're present and match
+        // the recovered index length; otherwise fall back to `now()`
+        // and warn so operators know age-based retention is degraded
+        // for this run. Without the ts sidecar (or when it's torn /
+        // missing), every recovered entry would be timestamped "now"
+        // and eligible-for-age-eviction status would be wrong for a
+        // full retention window after every restart.
+        let timestamps = match recovered.timestamps {
+            Some(ts) if ts.len() == recovered.index.len() => ts,
+            _ => {
+                if !recovered.index.is_empty() {
+                    tracing::warn!(
+                        channel = %name.as_str(),
+                        entries = recovered.index.len(),
+                        "ts sidecar missing or mismatched — recovered entries get \
+                         `now()` as timestamp, age-based retention degraded for \
+                         this run"
+                    );
+                }
+                let now = now_ns();
+                vec![now; recovered.index.len()]
+            }
+        };
         let state = FileState {
             index: recovered.index,
             timestamps,
@@ -255,7 +298,7 @@ impl RedexFile {
         // that was never durably persisted.
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.disk() {
-            if let Err(e) = disk.append_entry(&entry, payload) {
+            if let Err(e) = disk.append_entry_at(&entry, payload, ts) {
                 self.inner.next_seq.fetch_sub(1, Ordering::AcqRel);
                 return Err(e);
             }
@@ -299,7 +342,7 @@ impl RedexFile {
 
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.disk() {
-            if let Err(e) = disk.append_entry(&entry, payload) {
+            if let Err(e) = disk.append_entry_at(&entry, payload, ts) {
                 self.inner.next_seq.fetch_sub(1, Ordering::AcqRel);
                 return Err(e);
             }
@@ -395,7 +438,7 @@ impl RedexFile {
                 .iter()
                 .map(|e| (e.entry, e.payload.as_ref()))
                 .collect();
-            if let Err(e) = disk.append_entries(&pairs) {
+            if let Err(e) = disk.append_entries_at(&pairs, &vec![ts; pairs.len()]) {
                 self.inner
                     .next_seq
                     .fetch_sub(payloads.len() as u64, Ordering::AcqRel);
@@ -465,7 +508,7 @@ impl RedexFile {
 
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.disk() {
-            if let Err(e) = disk.append_entry(&entry, payload) {
+            if let Err(e) = disk.append_entry_at(&entry, payload, ts) {
                 self.inner.next_seq.fetch_sub(1, Ordering::AcqRel);
                 return Err(e);
             }
@@ -505,7 +548,7 @@ impl RedexFile {
 
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.disk() {
-            if let Err(e) = disk.append_entry(&entry, payload) {
+            if let Err(e) = disk.append_entry_at(&entry, payload, ts) {
                 self.inner.next_seq.fetch_sub(1, Ordering::AcqRel);
                 return Err(e);
             }
@@ -587,7 +630,7 @@ impl RedexFile {
                 .iter()
                 .map(|e| (e.entry, e.payload.as_ref()))
                 .collect();
-            if let Err(e) = disk.append_entries(&pairs) {
+            if let Err(e) = disk.append_entries_at(&pairs, &vec![ts; pairs.len()]) {
                 self.inner
                     .next_seq
                     .fetch_sub(payloads.len() as u64, Ordering::AcqRel);
@@ -810,6 +853,50 @@ impl RedexFile {
             let cur = state.segment.base_offset() + state.segment.live_bytes() as u64;
             state.segment.evict_prefix_to(cur);
         }
+
+        // Persist the eviction. Without this, `sweep_retention`
+        // mutated only memory; the on-disk idx + dat files grew
+        // unbounded across restart, and on reopen the full dat
+        // was replayed — entries previously evicted came back
+        // from the dead. We call into `disk.compact_to` to
+        // atomically rewrite idx + dat + ts to match the
+        // post-sweep in-memory state.
+        //
+        // The state lock is held *across* `compact_to`. Releasing
+        // it earlier opens a window where a concurrent
+        // `append_entry_at` can land on disk with the in-memory
+        // state updated to match — but `compact_to` then reads the
+        // post-append on-disk dat and writes a new idx/ts derived
+        // from the pre-append `surviving_index` snapshot. The
+        // racing append's idx record is overwritten, leaving its
+        // payload bytes as orphaned dat tail that recovery's
+        // `retained_dat_end` truncation drops on next reopen — the
+        // append survives in memory until restart, then vanishes.
+        // Holding the lock makes appends queue behind this
+        // compaction.
+        #[cfg(feature = "redex-disk")]
+        if let Some(disk) = self.inner.disk.as_ref() {
+            let surviving_index = state.index.clone();
+            let surviving_timestamps = state.timestamps.clone();
+            // The disk's old dat had offsets [0..segment.base_offset() +
+            // segment.live_bytes()]. The new starts at
+            // segment.base_offset(). For inline-only surviving
+            // entries, base_offset is past the end of the live
+            // segment — every byte of dat goes.
+            let dat_base = state.segment.base_offset();
+            let disk = disk.clone();
+            if let Err(e) = disk.compact_to(&surviving_index, &surviving_timestamps, dat_base) {
+                tracing::warn!(
+                    error = %e,
+                    "redex sweep_retention: disk compaction failed; \
+                     in-memory eviction succeeded but on-disk files retain \
+                     evicted entries"
+                );
+            }
+            // `state` drops at the end of the function — all
+            // subsequent appenders see the post-compaction layout.
+            std::mem::drop(state);
+        }
     }
 
     /// Close the file. Outstanding tail streams receive `RedexError::Closed`.
@@ -900,12 +987,33 @@ impl std::fmt::Debug for RedexFile {
 
 // -- helpers ---------------------------------------------------------------
 
+/// Verify the entry's stored checksum against the actual payload
+/// bytes on every read. The 28-bit xxh3 is computed at append
+/// time; without verification at read time, on-disk corruption
+/// (torn writes, bit-rot, external tampering) would flow through
+/// `materialize` as a valid event and silently poison every
+/// downstream consumer. We surface a checksum mismatch by
+/// returning `None` (same channel `materialize` already uses for
+/// "couldn't construct an event" signals).
 fn materialize(entry: &RedexEntry, segment: &HeapSegment) -> Option<RedexEvent> {
     let payload = if entry.is_inline() {
         Bytes::copy_from_slice(&entry.inline_payload()?)
     } else {
         segment.read(entry.payload_offset as u64, entry.payload_len)?
     };
+
+    let stored = entry.checksum();
+    let computed = super::entry::payload_checksum(&payload);
+    if stored != computed {
+        tracing::error!(
+            seq = entry.seq,
+            stored_checksum = format_args!("{:#x}", stored),
+            computed_checksum = format_args!("{:#x}", computed),
+            "RedexFile::materialize: checksum mismatch — payload corrupt; dropping entry"
+        );
+        return None;
+    }
+
     Some(RedexEvent {
         entry: *entry,
         payload,
@@ -1509,5 +1617,190 @@ mod tests {
             )
             .unwrap();
         assert_eq!(f2.len(), 10, "all 10 entries must persist across close");
+    }
+
+    /// Regression: previously, the 28-bit xxh3 stored on every
+    /// `RedexEntry` was computed at append but never verified at
+    /// read. On-disk corruption (torn writes, bit-rot, external
+    /// tampering) flowed through `materialize` as a valid event.
+    /// The fix verifies the stored checksum matches the recomputed
+    /// payload checksum on every read; mismatched entries are
+    /// dropped from the result with an error log.
+    ///
+    /// We simulate corruption by mutating the in-memory segment
+    /// bytes after append and asserting `read_range` no longer
+    /// returns the corrupt entry.
+    #[test]
+    fn read_path_drops_entries_with_bad_checksum() {
+        let f = make_file("checksum_verify");
+
+        // Append three heap-stored entries (payload > inline size of
+        // 8 bytes, so they live in the segment).
+        f.append(b"first-payload-bytes").unwrap();
+        f.append(b"second-payload-bytes").unwrap();
+        f.append(b"third-payload-bytes").unwrap();
+
+        // Sanity: all three round-trip cleanly.
+        let events = f.read_range(0, 100);
+        assert_eq!(events.len(), 3);
+
+        // Corrupt the second entry's bytes in the heap segment.
+        // We mutate the byte at the entry's offset directly via the
+        // shared state lock — same access pattern `materialize` will
+        // use, just with a write.
+        {
+            let mut state = f.inner.state.lock();
+            // Find the second entry (seq == 1) and flip a byte at
+            // its payload_offset.
+            let entry = state.index.iter().find(|e| e.seq == 1).copied().unwrap();
+            assert!(
+                !entry.is_inline(),
+                "test premise: seq=1 must be heap-stored"
+            );
+            // Flip the first byte of the payload.
+            let off = entry.payload_offset as usize;
+            let old = state.segment.bytes_for_test_mut()[off];
+            state.segment.bytes_for_test_mut()[off] = old.wrapping_add(1);
+        }
+
+        // The corrupted entry must be dropped on read; the other
+        // two survive.
+        let events = f.read_range(0, 100);
+        assert_eq!(
+            events.len(),
+            2,
+            "corrupt entry must be dropped from read_range result"
+        );
+        let surviving_seqs: Vec<u64> = events.iter().map(|e| e.entry.seq).collect();
+        assert_eq!(surviving_seqs, vec![0, 2]);
+    }
+
+    /// Regression: recovered entries used to get `now()` as their
+    /// timestamp (no on-disk persistence), so a 1-hour age-retention
+    /// on a process restarted every 30 minutes never evicted
+    /// anything — every reopen reset the age clock to zero. The fix
+    /// adds a `ts` sidecar that persists per-entry timestamps; on
+    /// reopen, `read_timestamps` returns the stored values and
+    /// age-based retention works correctly across restart.
+    ///
+    /// We pin this by:
+    ///   1. Creating a persistent file and appending an entry.
+    ///   2. Capturing the timestamp.
+    ///   3. Reopening the file and verifying the entry's timestamp
+    ///      survived (NOT a fresh `now()` from the second open).
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn ts_sidecar_preserves_timestamps_across_reopen() {
+        let dir = tmp_persistent_dir("ts_sidecar_persist");
+        let name = "ts/persist";
+
+        let captured_ts;
+        {
+            let f = make_persistent(name, &dir);
+            f.append(b"hello").unwrap();
+            f.append(b"world").unwrap();
+            captured_ts = f.inner.state.lock().timestamps.clone();
+            f.close().unwrap();
+        }
+        // Sleep long enough that a "fresh" timestamp would be
+        // distinguishable from the captured one.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // Reopen and verify timestamps survived.
+        let f2 = make_persistent(name, &dir);
+        let restored_ts = f2.inner.state.lock().timestamps.clone();
+        assert_eq!(
+            restored_ts.len(),
+            captured_ts.len(),
+            "timestamp count must match index count"
+        );
+        // Each restored timestamp should match what we captured —
+        // pre-fix, restored_ts would be ~20ms newer than
+        // captured_ts (because they were sampled at reopen time,
+        // not from the sidecar).
+        for (i, (cap, restored)) in captured_ts.iter().zip(restored_ts.iter()).enumerate() {
+            assert_eq!(
+                *cap, *restored,
+                "timestamp[{}] must round-trip across reopen (captured={}, restored={})",
+                i, cap, restored
+            );
+        }
+        f2.close().unwrap();
+    }
+
+    /// Regression: `sweep_retention` mutated only the in-memory
+    /// state — the on-disk idx + dat files grew unbounded and on
+    /// reopen the full dat was replayed, resurrecting entries that
+    /// the previous generation evicted. Now `sweep_retention` calls
+    /// into `disk.compact_to` which atomically rewrites idx + dat +
+    /// ts to match the post-sweep in-memory state.
+    ///
+    /// We pin this by:
+    ///   1. Append more entries than the retention max allows.
+    ///   2. Run `sweep_retention`.
+    ///   3. Close and reopen.
+    ///   4. Verify the reopened file holds only the surviving
+    ///      entries — not the evicted ones.
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn sweep_retention_persists_eviction_to_disk() {
+        let dir = tmp_persistent_dir("sweep_persist");
+        let name = "sweep/persist";
+
+        {
+            // Use Redex with a retention limit set in the config.
+            use super::super::manager::Redex;
+            let r = Redex::new().with_persistent_dir(&dir);
+            let f = r
+                .open_file(
+                    &ChannelName::new(name).unwrap(),
+                    RedexFileConfig::default()
+                        .with_persistent(true)
+                        .with_retention_max_events(2),
+                )
+                .unwrap();
+
+            // Append 5 heap-stored entries (payloads > 8 bytes).
+            f.append(b"AAAAAAAAA").unwrap();
+            f.append(b"BBBBBBBBB").unwrap();
+            f.append(b"CCCCCCCCC").unwrap();
+            f.append(b"DDDDDDDDD").unwrap();
+            f.append(b"EEEEEEEEE").unwrap();
+
+            // Sweep — should evict 0, 1, 2 (keeping last 2).
+            f.sweep_retention();
+            let surviving_in_mem: Vec<u64> =
+                f.inner.state.lock().index.iter().map(|e| e.seq).collect();
+            assert_eq!(
+                surviving_in_mem,
+                vec![3, 4],
+                "in-memory eviction should keep last 2"
+            );
+
+            f.close().unwrap();
+        }
+
+        // Reopen — pre-fix, this would resurrect entries 0/1/2/3/4
+        // because the on-disk dat still had every byte. Post-fix,
+        // the disk was compacted, so only entries 3 and 4 are
+        // present.
+        use super::super::manager::Redex;
+        let r2 = Redex::new().with_persistent_dir(&dir);
+        let f2 = r2
+            .open_file(
+                &ChannelName::new(name).unwrap(),
+                RedexFileConfig::default()
+                    .with_persistent(true)
+                    .with_retention_max_events(2),
+            )
+            .unwrap();
+        let restored_seqs: Vec<u64> = f2.inner.state.lock().index.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            restored_seqs,
+            vec![3, 4],
+            "after reopen, only the entries that survived sweep should be present \
+             (pre-fix all 5 would resurrect because sweep didn't touch disk)"
+        );
+        f2.close().unwrap();
     }
 }

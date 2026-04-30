@@ -48,11 +48,48 @@ pub trait MeshDaemon: Send + Sync {
         None
     }
 
+    /// Whether this daemon carries persistent state that
+    /// migration / restart paths must preserve.
+    ///
+    /// The default `restore` previously accepted any bytes silently
+    /// for daemons that didn't override it, including ones that
+    /// *should* have been stateful but forgot to provide a `restore`
+    /// impl. The new default restores correctly: it matches
+    /// `is_stateful()`'s answer. Stateless daemons leave
+    /// `is_stateful` at `false` (matches `snapshot() = None`);
+    /// stateful daemons override `is_stateful` to `true` AND
+    /// `snapshot` / `restore`.
+    ///
+    /// The migration path can use this to refuse to migrate a
+    /// stateful daemon's snapshot bytes into a stateless target,
+    /// surfacing the misconfiguration rather than silently
+    /// dropping state.
+    fn is_stateful(&self) -> bool {
+        false
+    }
+
     /// Restore from a previous snapshot.
     ///
     /// Called before any `process()` calls after migration.
-    /// The default implementation accepts any state (for stateless daemons).
-    fn restore(&mut self, _state: Bytes) -> Result<(), DaemonError> {
+    ///
+    /// The default implementation now refuses non-empty state on
+    /// stateless daemons (`is_stateful() == false`) — silently
+    /// discarding a stateful source's snapshot into a stateless
+    /// target loses every byte of state with no signal. Stateful
+    /// daemons must override both `is_stateful` and `restore`. An
+    /// empty `state` is still accepted (it's what
+    /// `snapshot() -> None` produces under the migration adapter),
+    /// so genuine stateless-to-stateless migrations
+    /// continue to work.
+    fn restore(&mut self, state: Bytes) -> Result<(), DaemonError> {
+        if !self.is_stateful() && !state.is_empty() {
+            return Err(DaemonError::RestoreFailed(format!(
+                "stateless daemon (is_stateful=false) cannot restore \
+                 {}-byte snapshot — override is_stateful() + restore() \
+                 if this daemon is actually stateful",
+                state.len()
+            )));
+        }
         Ok(())
     }
 }

@@ -87,8 +87,8 @@ impl EventBusConfig {
                 "adapter_timeout must be > 0".into(),
             ));
         }
-        // BUG_REPORT.md #3: `Sample { rate: 0 }` was accepted but
-        // crashed downstream sampling (counter % 0).
+        // `Sample { rate: 0 }` was accepted but crashed downstream
+        // sampling (counter % 0).
         if let BackpressureMode::Sample { rate: 0 } = self.backpressure_mode {
             return Err(ConfigError::InvalidValue(
                 "BackpressureMode::Sample.rate must be > 0".into(),
@@ -746,11 +746,10 @@ impl ScalingPolicy {
                 "max_shards must be >= min_shards".into(),
             ));
         }
-        // BUG_REPORT.md #3: zero durations on the scaling path
-        // either div-by-zero (`metrics_window`), thrash the scaler
-        // (`cooldown`), or scale down on the first underutilized
-        // sample (`scale_down_delay`). Reject all three at config
-        // time.
+        // Zero durations on the scaling path either div-by-zero
+        // (`metrics_window`), thrash the scaler (`cooldown`), or scale
+        // down on the first underutilized sample (`scale_down_delay`).
+        // Reject all three at config time.
         if self.cooldown.is_zero() {
             return Err(ConfigError::InvalidValue("cooldown must be > 0".into()));
         }

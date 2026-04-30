@@ -51,7 +51,7 @@ pub struct JetStreamAdapter {
     /// `HashMap<u16, Stream>` cache, both call `get_stream` /
     /// `create_stream`, and both insert — extra RPCs on cold start
     /// and a hazard if create_stream configs ever diverge between
-    /// callers (BUG_REPORT.md #10.3).
+    /// callers.
     streams: Mutex<HashMap<u16, Arc<OnceCell<Stream>>>>,
     /// Whether the adapter has been initialized.
     initialized: AtomicBool,
@@ -126,8 +126,8 @@ impl JetStreamAdapter {
     /// the actual create-once happens inside
     /// `OnceCell::get_or_try_init`, which serializes initialization
     /// across all callers and surfaces the same `Stream` clone (or
-    /// the same error) to each (BUG_REPORT.md #10.3). On error the
-    /// cell stays uninitialized and a subsequent call will retry.
+    /// the same error) to each. On error the cell stays
+    /// uninitialized and a subsequent call will retry.
     async fn get_or_create_stream(&self, shard_id: u16) -> Result<Stream, AdapterError> {
         let cell = {
             let mut streams = self.streams.lock();
@@ -261,13 +261,25 @@ impl Adapter for JetStreamAdapter {
         // window discards the prior copies via `Nats-Msg-Id`.
         //
         // The message-id buffer (`Nats-Msg-Id` header) is reused
-        // across iterations: the `{shard_id}:{seq_start}` prefix is
-        // the same for every event in the batch, so we render it once
-        // and only rewrite the trailing `:{i}` per event, eliminating
-        // the per-event `format!` allocation.
+        // across iterations: the `{nonce}:{shard_id}:{seq_start}`
+        // prefix is the same for every event in the batch, so we
+        // render it once and only rewrite the trailing `:{i}` per
+        // event, eliminating the per-event `format!` allocation.
+        //
+        // The leading `{nonce}` segment is the per-process nonce
+        // sampled at construction; without it, a producer that
+        // restarted within JetStream's dedup window collided with its
+        // prior incarnation's `shard:0:0…` ids and the new batches
+        // were silently discarded.
+        // Use the batch's process_nonce — globally consistent
+        // across all adapters in this process.
         let mut acks = Vec::with_capacity(serialized.len());
         let mut msg_id_buf = String::new();
-        let _ = write!(msg_id_buf, "{}:{}", batch.shard_id, batch.sequence_start);
+        let _ = write!(
+            msg_id_buf,
+            "{:x}:{}:{}",
+            batch.process_nonce, batch.shard_id, batch.sequence_start
+        );
         let prefix_len = msg_id_buf.len();
 
         for (i, data) in serialized.into_iter().enumerate() {
@@ -441,7 +453,8 @@ impl Adapter for JetStreamAdapter {
         // Prefer the last *seen* sequence over the last successfully
         // deserialized event id. Otherwise a run of trailing corrupt
         // entries leaves the cursor stuck, re-fetching them forever
-        // (analog of BUG_REPORT.md #4 for the JetStream path).
+        // (analog of the Redis adapter's `last_seen_seq` fix for the
+        // JetStream path).
         let next_id = last_seen_seq
             .map(|s| s.to_string())
             .or_else(|| events.last().map(|e| e.id.clone()));

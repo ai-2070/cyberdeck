@@ -576,6 +576,14 @@ impl NetSession {
             .store(current_timestamp(), Ordering::Release);
     }
 
+    /// Nanoseconds since epoch of the last activity. Useful for
+    /// tests / diagnostics that need to observe whether `touch`
+    /// has been called.
+    #[inline]
+    pub fn last_activity_ns(&self) -> u64 {
+        self.last_activity.load(Ordering::Acquire)
+    }
+
     /// Check if session has timed out
     #[inline]
     pub fn is_timed_out(&self, timeout: Duration) -> bool {
@@ -1009,6 +1017,17 @@ impl StreamState {
         if self.tx_window == 0 {
             return;
         }
+        // Clamp `total_consumed` to the sender-side `tx_bytes_sent`
+        // watermark before the CAS. Without this, a malformed or
+        // hostile grant carrying `total_consumed = u64::MAX` advanced
+        // `max_consumed_seen` to MAX, and every subsequent honest
+        // grant tripped the `total_consumed <= prev` early-return —
+        // the stream stalled forever. The clamp is safe under honest
+        // operation (a receiver can't have consumed bytes the sender
+        // hasn't committed) and acts as a safety bound
+        // otherwise.
+        let sent_watermark = self.tx_bytes_sent.load(Ordering::Acquire);
+        let total_consumed = total_consumed.min(sent_watermark);
         // Monotonic CAS update — the value advanced by the successful
         // CAS is the amount of newly-acknowledged bytes.
         let mut prev = self.max_consumed_seen.load(Ordering::Acquire);
@@ -1575,11 +1594,18 @@ mod tests {
         // `total_consumed` claims more bytes than the sender has
         // actually committed would otherwise mint credit above
         // `tx_window` — the sender could then exceed its configured
-        // ceiling on subsequent admits. The fetch_update clamps at
-        // `tx_window` so credit is capped at the window regardless of
-        // the reported delta. `max_consumed_seen` still advances
-        // (monotonic property holds) so subsequent stale grants
-        // continue to be filtered.
+        // ceiling on subsequent admits.
+        //
+        // BUG_REPORT.md #12 (additional fix): we now clamp
+        // `total_consumed.min(tx_bytes_sent)` *before* the CAS so
+        // the malformed advancement isn't sticky either. Previously
+        // a single malformed grant of `u64::MAX` advanced
+        // `max_consumed_seen` to MAX, and every subsequent honest
+        // grant tripped the `total_consumed <= prev` early-return
+        // — the stream stalled forever. With the clamp, a
+        // malformed `total_consumed` is bounded by the actual
+        // sender-side watermark, so honest grants below the
+        // (genuinely sent) watermark remain admittable.
         let state = StreamState::new_full(false, 1, 100);
         assert!(state.try_acquire_tx_credit(40));
         assert_eq!(state.tx_credit_remaining(), 60);
@@ -1593,13 +1619,52 @@ mod tests {
             100,
             "malformed grant must not push credit above tx_window",
         );
-        assert_eq!(state.max_consumed_seen(), 500);
-        // A subsequent honest grant below the malformed high-water
-        // mark is still ignored as stale — the malformed advancement
-        // is sticky.
-        state.apply_authoritative_grant(50);
-        assert_eq!(state.max_consumed_seen(), 500);
-        assert_eq!(state.tx_credit_remaining(), 100);
+        // Per the #12 clamp, max_consumed_seen advances to the
+        // sender-side watermark (40), NOT to the malformed value.
+        assert_eq!(
+            state.max_consumed_seen(),
+            40,
+            "max_consumed_seen must be clamped to tx_bytes_sent (#12)",
+        );
+        // A subsequent honest grant of 50 — but only after another
+        // 50 bytes are actually sent (so tx_bytes_sent rises to 90).
+        // The clamp keeps the watermark accurate.
+        assert!(state.try_acquire_tx_credit(50));
+        state.apply_authoritative_grant(70);
+        assert_eq!(state.max_consumed_seen(), 70);
+    }
+
+    /// Regression: BUG_REPORT.md #12 — a single malformed grant
+    /// claiming `total_consumed = u64::MAX` used to permanently
+    /// lock out future grants. The clamp prevents the stuck-state.
+    #[test]
+    fn test_authoritative_grant_u64_max_does_not_lock_out_future_grants() {
+        let state = StreamState::new_full(false, 1, 100);
+        assert!(state.try_acquire_tx_credit(40));
+
+        // Hostile grant: claims the receiver consumed every
+        // representable byte. Pre-fix this would set
+        // max_consumed_seen to u64::MAX and every subsequent
+        // grant would early-return.
+        state.apply_authoritative_grant(u64::MAX);
+        assert_eq!(
+            state.max_consumed_seen(),
+            40,
+            "max_consumed_seen must be clamped to tx_bytes_sent, \
+             not advanced to u64::MAX"
+        );
+
+        // Send more, then the receiver issues an honest grant.
+        // Pre-fix: rejected as stale because 80 < u64::MAX.
+        // Post-fix: accepted because max_consumed_seen is at 40.
+        assert!(state.try_acquire_tx_credit(40));
+        state.apply_authoritative_grant(80);
+        assert_eq!(
+            state.max_consumed_seen(),
+            80,
+            "honest grants must not be locked out by a prior malformed \
+             u64::MAX grant (#12)"
+        );
     }
 
     #[test]

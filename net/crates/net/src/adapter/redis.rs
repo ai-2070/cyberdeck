@@ -296,17 +296,16 @@ impl Adapter for RedisAdapter {
 
         // Execute pipeline with command timeout.
         //
-        // BUG_REPORT.md #12: `tokio::time::timeout` cancels the
-        // future locally but does NOT roll back bytes already on
-        // the wire. Redis can still execute the EXEC after the
-        // future is dropped, so a timeout-then-retry can produce
-        // duplicate XADDs (each with a fresh `*` auto-id). The
-        // delivery semantics are therefore at-least-once *with
-        // duplicates on retry* — not exactly-once. Consumers must
-        // be idempotent (e.g. dedup on the event's `r.id` field).
-        // Removing this footgun would require a per-event dedup
-        // token gated by a server-side Lua script; that has not
-        // been wired up yet.
+        // `tokio::time::timeout` cancels the future locally but does
+        // NOT roll back bytes already on the wire. Redis can still
+        // execute the EXEC after the future is dropped, so a
+        // timeout-then-retry can produce duplicate XADDs (each with a
+        // fresh `*` auto-id). The delivery semantics are therefore
+        // at-least-once *with duplicates on retry* — not
+        // exactly-once. Consumers must be idempotent (e.g. dedup on
+        // the event's `r.id` field). Removing this footgun would
+        // require a per-event dedup token gated by a server-side Lua
+        // script; that has not been wired up yet.
         let fut = pipe.query_async::<()>(&mut conn);
         tokio::time::timeout(self.config.command_timeout, fut)
             .await

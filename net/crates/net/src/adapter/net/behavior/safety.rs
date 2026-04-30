@@ -531,6 +531,7 @@ impl RateLimiter {
         Ok(())
     }
 
+    #[allow(dead_code)] // retained for tests; production path uses try_acquire_*
     fn record_request(&self, source: Option<&NodeId>, tokens: u64) {
         self.global_requests.fetch_add(1, Ordering::Relaxed);
         self.global_tokens.fetch_add(tokens, Ordering::Relaxed);
@@ -541,6 +542,112 @@ impl RateLimiter {
                 .or_insert_with(|| AtomicU64::new(0));
             counter.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// CAS-based "check and increment" for the global RPM cap. The
+    /// request commits ONLY if the post-increment value still
+    /// honors the cap; otherwise nothing is mutated and an Err is
+    /// returned. Without this, the `check_global_rpm` + later
+    /// `record_request` flow lets N concurrent acquirers all
+    /// observe the pre-add value, all pass `check`, and all
+    /// `record_request` past the cap.
+    fn try_acquire_global_rpm(&self, limit: u32, burst: f32) -> Result<(), SafetyViolation> {
+        self.maybe_reset();
+        let effective_limit = (limit as f32 * burst) as u64;
+        match self
+            .global_requests
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                if current >= effective_limit {
+                    None
+                } else {
+                    Some(current + 1)
+                }
+            }) {
+            Ok(_) => Ok(()),
+            Err(current) => Err(SafetyViolation::RateLimitExceeded {
+                limit_type: RateLimitType::GlobalRpm,
+                current,
+                limit: effective_limit,
+            }),
+        }
+    }
+
+    /// CAS-based "check and increment" for per-source RPM. Same
+    /// commit-or-rollback contract as `try_acquire_global_rpm`.
+    fn try_acquire_source_rpm(
+        &self,
+        source: &NodeId,
+        limit: u32,
+        burst: f32,
+    ) -> Result<(), SafetyViolation> {
+        self.maybe_reset();
+        let counter = self
+            .per_source
+            .entry(*source)
+            .or_insert_with(|| AtomicU64::new(0));
+        let effective_limit = (limit as f32 * burst) as u64;
+        match counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            if current >= effective_limit {
+                None
+            } else {
+                Some(current + 1)
+            }
+        }) {
+            Ok(_) => Ok(()),
+            Err(current) => Err(SafetyViolation::RateLimitExceeded {
+                limit_type: RateLimitType::PerSourceRpm,
+                current,
+                limit: effective_limit,
+            }),
+        }
+    }
+
+    /// CAS-based "check and add" for the tokens-per-minute counter.
+    /// Treats `current + tokens` overflow as "definitely over limit"
+    /// to avoid wrap-around DoS.
+    fn try_acquire_tokens(
+        &self,
+        tokens: u64,
+        limit: u64,
+        burst: f32,
+    ) -> Result<(), SafetyViolation> {
+        self.maybe_reset();
+        let effective_limit = (limit as f64 * burst as f64) as u64;
+        match self
+            .global_tokens
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                let next = current.checked_add(tokens)?;
+                if next > effective_limit {
+                    None
+                } else {
+                    Some(next)
+                }
+            }) {
+            Ok(_) => Ok(()),
+            Err(current) => Err(SafetyViolation::RateLimitExceeded {
+                limit_type: RateLimitType::TokensPerMinute,
+                current,
+                limit: effective_limit,
+            }),
+        }
+    }
+
+    /// Roll back a previous successful `try_acquire_*` commit.
+    /// Called from `acquire()` when a later step fails so the
+    /// counter doesn't overcount.
+    fn rollback_global_rpm(&self) {
+        self.global_requests.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn rollback_source_rpm(&self, source: &NodeId) {
+        if let Some(counter) = self.per_source.get(source) {
+            counter.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    #[allow(dead_code)] // symmetric with rollback_global_rpm / rollback_source_rpm
+    fn rollback_tokens(&self, tokens: u64) {
+        self.global_tokens.fetch_sub(tokens, Ordering::Relaxed);
     }
 }
 
@@ -869,6 +976,16 @@ impl SafetyEnforcer {
     }
 
     /// Acquire resources for a request
+    ///
+    /// Previously this did `load + compare` in
+    /// `check_resource_limits`, then unconditionally `fetch_add`'d
+    /// each counter. N concurrent acquirers all observed `current=0`
+    /// and all proceeded past the cap — the kill-switch / safety
+    /// envelope was breakable under load. The fix uses `fetch_update`
+    /// (compare-and-swap loop) for each cumulative counter so the
+    /// check + add is atomic per resource, and rolls back any partial
+    /// successes if a later resource fails. `tokens` is per-request
+    /// (not cumulative) so it stays as a straight load.
     pub fn acquire(
         self: &Arc<Self>,
         req: &SafetyRequest,
@@ -888,26 +1005,227 @@ impl SafetyEnforcer {
         // Check kill switch
         self.check_kill_switch()?;
 
-        // Check resource limits
-        self.check_resource_limits(&claim, &envelope)?;
+        let limits = &envelope.resource_limits;
+        let enforce = envelope.mode == EnforcementMode::Enforce;
 
-        // Acquire resources atomically
-        self.usage
-            .concurrent
-            .fetch_add(claim.concurrent_slots, Ordering::Relaxed);
+        // tokens is per-request (not cumulative) so a plain
+        // compare against the per-request cap is fine.
+        if enforce && claim.tokens > limits.max_tokens_per_request {
+            return Err(SafetyViolation::ResourceLimitExceeded {
+                resource: ResourceType::Tokens,
+                requested: claim.tokens as u64,
+                available: limits.max_tokens_per_request as u64,
+            });
+        }
+
+        // Reset the cost window before the cost CAS so a stale
+        // accumulator doesn't reject a legitimate request right
+        // after the hour rollover.
+        self.usage.maybe_reset_hourly();
+
+        // Helper: atomically `fetch_update` an `AtomicU32`
+        // counter so that `add` only commits if `current + add
+        // <= max`. Returns Err with the current value on cap
+        // exceeded.
+        fn try_fetch_add_capped_u32(
+            counter: &std::sync::atomic::AtomicU32,
+            add: u32,
+            max: u32,
+        ) -> Result<(), u32> {
+            counter
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    let next = current.saturating_add(add);
+                    if next > max {
+                        None
+                    } else {
+                        Some(next)
+                    }
+                })
+                .map(|_| ())
+        }
+
+        // 1. Concurrent slots.
+        if enforce {
+            if let Err(cur) = try_fetch_add_capped_u32(
+                &self.usage.concurrent,
+                claim.concurrent_slots,
+                limits.max_concurrent,
+            ) {
+                return Err(SafetyViolation::ResourceLimitExceeded {
+                    resource: ResourceType::Concurrent,
+                    requested: claim.concurrent_slots as u64,
+                    available: limits.max_concurrent.saturating_sub(cur) as u64,
+                });
+            }
+        } else {
+            self.usage
+                .concurrent
+                .fetch_add(claim.concurrent_slots, Ordering::Relaxed);
+        }
+
+        // 2. Memory. On failure, roll back concurrent.
+        if enforce {
+            if let Err(cur) = try_fetch_add_capped_u32(
+                &self.usage.memory_mb,
+                claim.memory_mb,
+                limits.max_memory_mb,
+            ) {
+                self.usage
+                    .concurrent
+                    .fetch_sub(claim.concurrent_slots, Ordering::Relaxed);
+                return Err(SafetyViolation::ResourceLimitExceeded {
+                    resource: ResourceType::Memory,
+                    requested: claim.memory_mb as u64,
+                    available: limits.max_memory_mb.saturating_sub(cur) as u64,
+                });
+            }
+        } else {
+            self.usage
+                .memory_mb
+                .fetch_add(claim.memory_mb, Ordering::Relaxed);
+        }
+
+        // 3. Hourly cost. On failure, roll back concurrent + memory.
+        if enforce {
+            if let Err(cur) = try_fetch_add_capped_u32(
+                &self.usage.cost_cents_per_hour,
+                claim.cost_cents,
+                limits.max_cost_per_hour_cents,
+            ) {
+                self.usage
+                    .concurrent
+                    .fetch_sub(claim.concurrent_slots, Ordering::Relaxed);
+                self.usage
+                    .memory_mb
+                    .fetch_sub(claim.memory_mb, Ordering::Relaxed);
+                return Err(SafetyViolation::ResourceLimitExceeded {
+                    resource: ResourceType::Cost,
+                    requested: claim.cost_cents as u64,
+                    available: limits.max_cost_per_hour_cents.saturating_sub(cur) as u64,
+                });
+            }
+        } else {
+            self.usage
+                .cost_cents_per_hour
+                .fetch_add(claim.cost_cents, Ordering::Relaxed);
+        }
+
+        // 4. Rate limits — global RPM, per-source RPM, tokens-per-
+        //    minute. Previously these were checked only in `check()`
+        //    (load + compare) with the increment happening separately
+        //    via `record_request`. N concurrent acquirers could all
+        //    pass `check()`, then all `record_request` past the cap
+        //    — same TOCTOU as the resource limits. CAS-ifying the
+        //    check + add per counter (with cross-counter rollback)
+        //    closes the race.
+        let rate = &envelope.rate_limits;
+        let rate_burst = rate.burst_multiplier;
+
+        if enforce {
+            if let Err(e) = self
+                .rate_limiter
+                .try_acquire_global_rpm(rate.global_rpm, rate_burst)
+            {
+                self.usage
+                    .concurrent
+                    .fetch_sub(claim.concurrent_slots, Ordering::Relaxed);
+                self.usage
+                    .memory_mb
+                    .fetch_sub(claim.memory_mb, Ordering::Relaxed);
+                self.usage
+                    .cost_cents_per_hour
+                    .fetch_sub(claim.cost_cents, Ordering::Relaxed);
+                self.log_event(
+                    AuditEventType::RateLimitHit,
+                    req.source_node,
+                    AuditOutcome::Blocked,
+                );
+                return Err(e);
+            }
+        }
+
+        if enforce {
+            if let Some(ref source) = req.source_node {
+                if let Err(e) = self.rate_limiter.try_acquire_source_rpm(
+                    source,
+                    rate.per_source_rpm,
+                    rate_burst,
+                ) {
+                    self.rate_limiter.rollback_global_rpm();
+                    self.usage
+                        .concurrent
+                        .fetch_sub(claim.concurrent_slots, Ordering::Relaxed);
+                    self.usage
+                        .memory_mb
+                        .fetch_sub(claim.memory_mb, Ordering::Relaxed);
+                    self.usage
+                        .cost_cents_per_hour
+                        .fetch_sub(claim.cost_cents, Ordering::Relaxed);
+                    self.log_event(
+                        AuditEventType::RateLimitHit,
+                        req.source_node,
+                        AuditOutcome::Blocked,
+                    );
+                    return Err(e);
+                }
+            }
+        }
+
+        if enforce {
+            if let Err(e) = self.rate_limiter.try_acquire_tokens(
+                claim.tokens as u64,
+                rate.tokens_per_minute,
+                rate_burst,
+            ) {
+                if let Some(ref source) = req.source_node {
+                    self.rate_limiter.rollback_source_rpm(source);
+                }
+                self.rate_limiter.rollback_global_rpm();
+                self.usage
+                    .concurrent
+                    .fetch_sub(claim.concurrent_slots, Ordering::Relaxed);
+                self.usage
+                    .memory_mb
+                    .fetch_sub(claim.memory_mb, Ordering::Relaxed);
+                self.usage
+                    .cost_cents_per_hour
+                    .fetch_sub(claim.cost_cents, Ordering::Relaxed);
+                self.log_event(
+                    AuditEventType::RateLimitHit,
+                    req.source_node,
+                    AuditOutcome::Blocked,
+                );
+                return Err(e);
+            }
+        } else {
+            // Audit-only: still increment so observers see realistic
+            // counters without any commit failing.
+            self.rate_limiter
+                .global_tokens
+                .fetch_add(claim.tokens as u64, Ordering::Relaxed);
+        }
+
+        // tokens (per-request `usage` counter) — free-running,
+        // already-bounded by the per-request cap above.
         self.usage
             .tokens
             .fetch_add(claim.tokens as u64, Ordering::Relaxed);
-        self.usage
-            .memory_mb
-            .fetch_add(claim.memory_mb, Ordering::Relaxed);
-        self.usage
-            .cost_cents_per_hour
-            .fetch_add(claim.cost_cents, Ordering::Relaxed);
 
-        // Record rate limit usage
-        self.rate_limiter
-            .record_request(req.source_node.as_ref(), claim.tokens as u64);
+        if !enforce {
+            // Audit-only / Disabled: bump RPM counters too so observed
+            // rates still reflect actual traffic.
+            self.rate_limiter
+                .global_requests
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(ref source) = req.source_node {
+                let counter = self
+                    .rate_limiter
+                    .per_source
+                    .entry(*source)
+                    .or_insert_with(|| AtomicU64::new(0));
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
 
         // Log acquisition
         self.log_event(
@@ -1087,6 +1405,7 @@ impl SafetyEnforcer {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn check_resource_limits(
         &self,
         claim: &ResourceClaim,
@@ -1647,6 +1966,164 @@ mod tests {
             ),
             "overflow must be rejected, got {:?}",
             result
+        );
+    }
+
+    /// Regression: BUG_REPORT.md #8 — `acquire` previously did
+    /// `load + compare` (`check_resource_limits`) then
+    /// `fetch_add`. N concurrent acquirers all observed the same
+    /// pre-add value and all proceeded past the cap. The fix
+    /// uses `fetch_update` per cumulative resource so the check +
+    /// add is atomic per counter.
+    ///
+    /// We pin this by spawning many threads that each try to
+    /// acquire 1 concurrent slot against a cap of K. Pre-fix,
+    /// the final `concurrent` counter could exceed K. Post-fix,
+    /// the cap is honored exactly: we see at most K successful
+    /// `acquire`s and the rest fail with `ResourceLimitExceeded`.
+    #[test]
+    fn acquire_concurrent_cap_is_atomic_under_contention() {
+        use std::sync::Arc;
+        use std::sync::Barrier;
+        use std::thread;
+
+        const CAP: u32 = 5;
+        const ATTEMPTS: usize = 100;
+
+        // Build an enforcer with `max_concurrent = CAP` and very
+        // permissive other limits, so the race surfaces only on
+        // `concurrent`.
+        let limits = ResourceEnvelope {
+            max_concurrent: CAP,
+            max_tokens_per_request: 1_000_000,
+            max_memory_mb: 1_000_000,
+            max_time_ms: 1_000_000,
+            max_cost_per_hour_cents: u32::MAX,
+        };
+        let envelope = SafetyEnvelope {
+            mode: EnforcementMode::Enforce,
+            resource_limits: limits,
+            ..Default::default()
+        };
+        let enforcer = Arc::new(SafetyEnforcer::with_envelope(envelope));
+
+        let barrier = Arc::new(Barrier::new(ATTEMPTS));
+        let handles: Vec<_> = (0..ATTEMPTS)
+            .map(|_| {
+                let enf = Arc::clone(&enforcer);
+                let b = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    b.wait();
+                    let req = SafetyRequest::new();
+                    let claim = ResourceClaim {
+                        concurrent_slots: 1,
+                        tokens: 1,
+                        memory_mb: 0,
+                        time_ms: 0,
+                        cost_cents: 0,
+                    };
+                    enf.acquire(&req, claim)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let successes: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
+
+        // The crucial invariant: no more than CAP concurrent
+        // claims actually committed. Pre-fix this would routinely
+        // exceed CAP under high contention.
+        assert!(
+            successes.len() as u32 <= CAP,
+            "TOCTOU regression (#8): {} concurrent acquires committed against \
+             cap of {}",
+            successes.len(),
+            CAP
+        );
+
+        // And the counter itself reflects exactly that — never
+        // higher than CAP.
+        assert!(
+            enforcer.usage.concurrent.load(Ordering::Relaxed) <= CAP,
+            "concurrent counter exceeds cap"
+        );
+    }
+
+    /// Regression: the rate-limit half of #8. Previously the
+    /// global / per-source RPM and tokens-per-minute checks were
+    /// load+compare in `check()` while the increment was a
+    /// separate `record_request` in `acquire()`. Multiple
+    /// concurrent acquirers could all pass the load+compare,
+    /// then all increment past the cap. The fix CAS-ifies the
+    /// check + add inside `acquire()` so the rate-limit cap is
+    /// honored exactly under contention.
+    #[test]
+    fn acquire_global_rpm_cap_is_atomic_under_contention() {
+        use std::sync::Arc;
+        use std::sync::Barrier;
+        use std::thread;
+
+        const RPM_CAP: u32 = 5;
+        const ATTEMPTS: usize = 100;
+
+        let envelope = SafetyEnvelope {
+            mode: EnforcementMode::Enforce,
+            // Loose resource limits so concurrent / memory / cost
+            // never trip; we want only the RPM cap to be the
+            // contended counter.
+            resource_limits: ResourceEnvelope {
+                max_concurrent: u32::MAX,
+                max_tokens_per_request: 1_000_000,
+                max_memory_mb: u32::MAX,
+                max_time_ms: u32::MAX,
+                max_cost_per_hour_cents: u32::MAX,
+            },
+            rate_limits: RateEnvelope {
+                global_rpm: RPM_CAP,
+                per_source_rpm: u32::MAX,
+                tokens_per_minute: u64::MAX,
+                burst_multiplier: 1.0,
+            },
+            ..Default::default()
+        };
+        let enforcer = Arc::new(SafetyEnforcer::with_envelope(envelope));
+
+        let barrier = Arc::new(Barrier::new(ATTEMPTS));
+        let handles: Vec<_> = (0..ATTEMPTS)
+            .map(|_| {
+                let enf = Arc::clone(&enforcer);
+                let b = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    b.wait();
+                    let req = SafetyRequest::new();
+                    let claim = ResourceClaim {
+                        concurrent_slots: 1,
+                        tokens: 1,
+                        memory_mb: 0,
+                        time_ms: 0,
+                        cost_cents: 0,
+                    };
+                    enf.acquire(&req, claim)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let successes: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
+
+        assert!(
+            successes.len() as u32 <= RPM_CAP,
+            "RPM TOCTOU regression (#8): {} acquires committed against cap {}",
+            successes.len(),
+            RPM_CAP,
+        );
+        assert!(
+            enforcer
+                .rate_limiter
+                .global_requests
+                .load(Ordering::Relaxed)
+                <= RPM_CAP as u64,
+            "global_requests counter exceeds RPM cap",
         );
     }
 }

@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use net::adapter::net::{NetAdapterConfig, PacketFlags, ReliabilityConfig, StaticKeypair};
 use net::adapter::Adapter;
-use net::event::{Batch, InternalEvent};
+use net::event::{batch_process_nonce, Batch, InternalEvent};
 use tokio::net::UdpSocket;
 use tokio::sync::Barrier;
 
@@ -154,6 +154,7 @@ async fn test_net_send_receive_fire_and_forget() {
             shard_id: 0,
             events,
             sequence_start: 0,
+            process_nonce: batch_process_nonce(),
         };
 
         adapter.on_batch(batch).await.expect("send failed");
@@ -233,6 +234,7 @@ async fn test_net_reliable_mode() {
             shard_id: 0,
             events,
             sequence_start: 0,
+            process_nonce: batch_process_nonce(),
         };
 
         adapter.on_batch(batch).await.expect("send failed");
@@ -308,6 +310,7 @@ async fn test_net_multiple_streams() {
                 shard_id: 0,
                 events: events0,
                 sequence_start: 0,
+                process_nonce: batch_process_nonce(),
             })
             .await
             .expect("send to shard 0 failed");
@@ -323,6 +326,7 @@ async fn test_net_multiple_streams() {
                 shard_id: 1,
                 events: events1,
                 sequence_start: 0,
+                process_nonce: batch_process_nonce(),
             })
             .await
             .expect("send to shard 1 failed");
@@ -462,6 +466,7 @@ async fn test_net_large_batch() {
             shard_id: 0,
             events,
             sequence_start: 0,
+            process_nonce: batch_process_nonce(),
         };
 
         adapter.on_batch(batch).await.expect("send failed");
@@ -593,6 +598,7 @@ async fn test_net_responder_to_initiator() {
                 shard_id: 0,
                 events,
                 sequence_start: 0,
+                process_nonce: batch_process_nonce(),
             })
             .await
             .expect("responder send failed");

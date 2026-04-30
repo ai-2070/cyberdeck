@@ -234,14 +234,49 @@ impl PacketBuilder {
         self.packet.split().freeze()
     }
 
-    /// Build a heartbeat packet
+    /// Build an AEAD-authenticated heartbeat packet.
+    ///
+    /// Heartbeats used to be cleartext (header only, no auth tag) —
+    /// the receiver only checked `source == peer_addr` (UDP source,
+    /// spoofable) and `session_id` match (64-bit, observable in
+    /// flight). An off-path attacker who guessed or observed the
+    /// session_id could call `session.touch()` indefinitely,
+    /// defeating both the idle timeout and the failure detector.
+    ///
+    /// Now: encrypt an empty payload with the session's TX cipher
+    /// so the heartbeat carries a 16-byte Poly1305 tag over the
+    /// header's AAD. An off-path attacker without the session key
+    /// cannot forge a tag that decrypts.
     #[inline]
     pub fn build_heartbeat(&mut self) -> Bytes {
+        self.payload.clear();
         self.packet.clear();
 
+        // No payload bytes — encryption produces just the tag.
         let header = NetHeader::heartbeat(self.session_id);
-        self.packet.extend_from_slice(&header.to_bytes());
+        let aad = header.aad();
+        let mut header_bytes = header.to_bytes();
 
+        let counter = match self.cipher.encrypt_in_place(&aad, &mut self.payload) {
+            Ok(c) => c,
+            Err(e) => panic!(
+                "BUG: heartbeat AEAD encryption failed (session={:016x}): {}",
+                self.session_id, e
+            ),
+        };
+
+        // Patch nonce + counter into the header bytes, same as
+        // `build` does for data packets.
+        header_bytes[12..16].copy_from_slice(&session_prefix_from_id(self.session_id));
+        header_bytes[16..24].copy_from_slice(&counter.to_le_bytes());
+
+        // payload_len is 0 (the tag rides outside the declared
+        // payload length, like every other AEAD-tagged packet).
+        let payload_len = 0u16;
+        header_bytes[60..62].copy_from_slice(&payload_len.to_le_bytes());
+
+        self.packet.extend_from_slice(&header_bytes);
+        self.packet.extend_from_slice(&self.payload); // just the 16-byte tag
         self.packet.split().freeze()
     }
 

@@ -560,17 +560,42 @@ impl PortMapperTask {
 
         self.sink.apply_install(&mapping);
 
-        // Step 3: renewal loop. Tick on `renewal_interval`;
-        // revoke after RENEWAL_FAILURE_THRESHOLD consecutive
-        // renew() failures. `nonzero_interval`-style guard
-        // inlined: a zero interval would make `tokio::time::
-        // interval` panic.
-        let interval = if self.renewal_interval.is_zero() {
-            Duration::from_secs(1)
-        } else {
-            self.renewal_interval
-        };
-        let mut ticker = tokio::time::interval(interval);
+        // Step 3: renewal loop.
+        //
+        // Respect the granted lease TTL — a gateway that grants 60s
+        // leases should be renewed on a ~30s cadence, not the
+        // configured 30-minute default. We pick
+        // `min(renewal_interval, mapping.ttl/2)` as the effective
+        // tick so a short-lease gateway doesn't leave the mesh
+        // advertising a dead address for ~29 of every 30 minutes.
+        //
+        // On a transient renewal failure we wait a short
+        // `RETRY_BACKOFF` (200ms) and try again before counting it
+        // against `RENEWAL_FAILURE_THRESHOLD`. Previously a single
+        // hiccup ate the full ticker interval before the next attempt
+        // — with a 60s lease and 30min ticker that's 90+ minutes of
+        // dead-address advertisement before revoke fires.
+        const RETRY_BACKOFF: Duration = Duration::from_millis(200);
+
+        // Free helper rather than a closure so it doesn't capture
+        // `mapping` (which we mutate inside the loop). Borrowing
+        // a closure across the `mapping = next;` reassignment
+        // would deny the assignment under the borrow checker.
+        fn effective_interval(renewal_interval: Duration, ttl: Duration) -> Duration {
+            let configured = if renewal_interval.is_zero() {
+                Duration::from_secs(1)
+            } else {
+                renewal_interval
+            };
+            let half_ttl = ttl / 2;
+            if !half_ttl.is_zero() && half_ttl < configured {
+                half_ttl
+            } else {
+                configured
+            }
+        }
+        let mut ticker =
+            tokio::time::interval(effective_interval(self.renewal_interval, mapping.ttl));
         // First tick is immediate; skip — we just installed.
         ticker.tick().await;
 
@@ -583,11 +608,35 @@ impl PortMapperTask {
             tokio::select! {
                 _ = self.shutdown_notify.notified() => break,
                 _ = ticker.tick() => {
-                    match self.client.renew(&mapping).await {
+                    let outcome = match self.client.renew(&mapping).await {
+                        Ok(next) => Ok(next),
+                        Err(e) => {
+                            // #22: short-retry once before giving up.
+                            tokio::time::sleep(RETRY_BACKOFF).await;
+                            if self.shutdown.load(Ordering::Acquire) {
+                                break;
+                            }
+                            tracing::debug!(
+                                error = %e,
+                                "PortMapper renew: transient failure, retrying after {:?}",
+                                RETRY_BACKOFF
+                            );
+                            self.client.renew(&mapping).await
+                        }
+                    };
+                    match outcome {
                         Ok(next) => {
                             consecutive_failures = 0;
                             self.sink.apply_renewal(&next);
                             mapping = next;
+                            // Re-derive ticker if the new lease's
+                            // TTL changed our effective cadence.
+                            let new_interval =
+                                effective_interval(self.renewal_interval, mapping.ttl);
+                            if new_interval != ticker.period() {
+                                ticker = tokio::time::interval(new_interval);
+                                ticker.tick().await; // immediate first tick
+                            }
                         }
                         Err(_) => {
                             consecutive_failures = consecutive_failures.saturating_add(1);

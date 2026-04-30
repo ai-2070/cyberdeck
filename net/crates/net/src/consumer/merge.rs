@@ -318,12 +318,12 @@ impl PollMerger {
         // adapter-side framing bugs invisible to operators — only
         // *unfiltered* polls would surface the bad event.
         //
-        // BUG_REPORT.md #2 / #23: the previous `Ordering::None` path
-        // had a `break` once `kept.len() >= limit + 1`, which discarded
-        // events from later shards without ever filtering them. Combined
-        // with the cursor advancing past every fetched event, that meant
-        // matching events on un-inspected shards were silently lost. The
-        // fix uses a single full `retain` pass for both ordering modes;
+        // The previous `Ordering::None` path had a `break` once
+        // `kept.len() >= limit + 1`, which discarded events from later
+        // shards without ever filtering them. Combined with the cursor
+        // advancing past every fetched event, that meant matching
+        // events on un-inspected shards were silently lost. The fix
+        // uses a single full `retain` pass for both ordering modes;
         // the `lazy parse` micro-optimization is gone, but per-event
         // filter-matching is cheap and consistent semantics with the
         // sort path is worth more than parse-skip on over-fetches.
@@ -337,16 +337,36 @@ impl PollMerger {
                 // Keep arbitrary order
             }
             Ordering::InsertionTs => {
-                all_events.sort_by_key(|e| e.insertion_ts);
+                // `insertion_ts` is monotonic *per shard*, not
+                // globally (see `event.rs:233`), so two events from
+                // different shards can carry the same timestamp. With
+                // a stable sort on `insertion_ts` alone, ties were
+                // broken by the input order — which depends on
+                // `futures::future::join_all`'s completion ordering
+                // and is non-deterministic across polls. Combined
+                // with `truncate(limit)` and the cursor-rollback step,
+                // the same logical event could be returned twice or
+                // skipped at the limit boundary across consecutive
+                // polls.
+                //
+                // Add `(shard_id, id)` as deterministic
+                // tiebreakers. `id` is the storage backend's
+                // identifier and is unique within a shard, so the
+                // composite is a strict total order.
+                all_events.sort_by(|a, b| {
+                    a.insertion_ts
+                        .cmp(&b.insertion_ts)
+                        .then(a.shard_id.cmp(&b.shard_id))
+                        .then(a.id.cmp(&b.id))
+                });
             }
         }
 
-        // BUG_REPORT.md #23: track per-shard match counts *before*
-        // truncate. After truncation, any shard whose match count
-        // shrank means matches were dropped — and those matches must
-        // be re-fetched on the next poll, otherwise they are silently
-        // lost (the cursor would otherwise advance past them via
-        // `new_cursor`).
+        // Track per-shard match counts *before* truncate. After
+        // truncation, any shard whose match count shrank means matches
+        // were dropped — and those matches must be re-fetched on the
+        // next poll, otherwise they are silently lost (the cursor
+        // would otherwise advance past them via `new_cursor`).
         let mut matched_per_shard: std::collections::HashMap<u16, usize> =
             std::collections::HashMap::new();
         if request.filter.is_some() {
@@ -424,12 +444,32 @@ impl PollMerger {
         // When filtering removed everything but we did advance past fetched
         // events, signal has_more so the caller keeps polling forward.
         let all_filtered = request.filter.is_some() && all_events.is_empty() && cursor_advanced;
-        let has_more = any_has_more || had_extra || all_filtered;
+        // Previously `has_more = any_has_more || had_extra ||
+        // all_filtered`. If a single adapter returned
+        // `ShardPollResult { events: [], next_id: None,
+        // has_more: true }` (legal under the trait contract — nothing
+        // forbids it), then `any_has_more=true` propagated even
+        // though we made *no* progress. The caller observed
+        // `(has_more=true, next_id=None)` and re-polled from the
+        // same starting cursor indefinitely.
+        //
+        // Suppress `has_more` when the merger itself made no progress
+        // at all (no events returned AND the cursor didn't advance).
+        // The caller then sees a clean "nothing to do right now"
+        // response and must back off rather than spin.
+        let we_made_progress = !all_events.is_empty() || cursor_advanced;
+        let has_more = (any_has_more || had_extra || all_filtered) && we_made_progress;
+        if any_has_more && !we_made_progress {
+            tracing::warn!(
+                "PollMerger: an adapter reported has_more=true with no events \
+                 and no cursor advance — suppressing to avoid caller infinite-loop"
+            );
+        }
         // Return the cursor even when all events were filtered out, so the
         // caller advances past the filtered region instead of re-fetching
         // the same events forever. The cursor is None only when nothing was
         // fetched at all (truly empty shards).
-        let next_id = if !all_events.is_empty() || cursor_advanced {
+        let next_id = if we_made_progress {
             Some(final_cursor.encode())
         } else {
             None
@@ -1731,5 +1771,123 @@ mod tests {
             vec!["0-1", "0-2", "0-3", "1-1", "1-2", "1-3"],
             "matches from the late-ts shard must not be lost to truncation"
         );
+    }
+
+    /// Regression: BUG_REPORT.md #50 — if any adapter returns
+    /// `has_more: true` with no events and no `next_id`, the merger
+    /// previously forwarded that as `(has_more=true, next_id=None)`,
+    /// causing the caller to re-poll from the same starting cursor
+    /// indefinitely. The fix suppresses `has_more` whenever the
+    /// merger itself made no observable progress (no events AND no
+    /// cursor advance).
+    #[tokio::test]
+    async fn has_more_is_suppressed_when_no_progress() {
+        struct LiarAdapter;
+
+        #[async_trait]
+        impl Adapter for LiarAdapter {
+            async fn init(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn on_batch(&self, _batch: Batch) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn flush(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn poll_shard(
+                &self,
+                _shard_id: u16,
+                _from_id: Option<&str>,
+                _limit: usize,
+            ) -> Result<ShardPollResult, AdapterError> {
+                // The pathological case: claim has_more without
+                // returning events or advancing the cursor.
+                Ok(ShardPollResult {
+                    events: Vec::new(),
+                    next_id: None,
+                    has_more: true,
+                })
+            }
+            fn name(&self) -> &'static str {
+                "liar"
+            }
+        }
+
+        let adapter: Arc<dyn Adapter> = Arc::new(LiarAdapter);
+        let merger = PollMerger::new(adapter, 2);
+        let response = merger.poll(ConsumeRequest::new(100)).await.unwrap();
+
+        assert!(
+            response.events.is_empty(),
+            "no events were emitted, but merger returned {}",
+            response.events.len()
+        );
+        // The whole point of this fix: don't let a misbehaving
+        // adapter trick the caller into an infinite re-poll.
+        assert!(
+            !response.has_more,
+            "has_more must be suppressed when merger made no progress (#50)"
+        );
+        assert!(
+            response.next_id.is_none(),
+            "next_id must remain None when no progress was made (#50)"
+        );
+    }
+
+    /// Regression: BUG_REPORT.md #52 — `sort_by_key(|e| e.insertion_ts)`
+    /// is stable but ties across shards depend on `join_all`'s
+    /// completion order, which is non-deterministic. Combined with
+    /// `truncate(limit)`, this could drop or duplicate events at the
+    /// limit boundary across consecutive polls. The fix breaks ties
+    /// deterministically on `(shard_id, id)`.
+    #[tokio::test]
+    async fn sort_breaks_ties_deterministically_across_shards() {
+        // Two shards with events that share `insertion_ts` so the
+        // tiebreaker controls the order.
+        let adapter = Arc::new(MockAdapter::new());
+        adapter.add_events(
+            0,
+            vec![
+                StoredEvent::from_value("0-a".to_string(), json!({}), 100, 0),
+                StoredEvent::from_value("0-b".to_string(), json!({}), 100, 0),
+            ],
+        );
+        adapter.add_events(
+            1,
+            vec![
+                StoredEvent::from_value("1-a".to_string(), json!({}), 100, 1),
+                StoredEvent::from_value("1-b".to_string(), json!({}), 100, 1),
+            ],
+        );
+
+        // Poll many times; the order must be stable.
+        let merger = PollMerger::new(adapter, 2);
+        let mut prior_order: Option<Vec<String>> = None;
+        for iter in 0..20 {
+            let r = merger
+                .poll(ConsumeRequest::new(10).ordering(Ordering::InsertionTs))
+                .await
+                .unwrap();
+            let ids: Vec<String> = r.events.iter().map(|e| e.id.clone()).collect();
+            if let Some(prev) = &prior_order {
+                assert_eq!(
+                    &ids, prev,
+                    "iter {iter}: order is non-deterministic — sort tie-break failed (#52)"
+                );
+            }
+            prior_order = Some(ids);
+        }
+
+        // And the order must match `(shard_id, id)`.
+        let r = merger
+            .poll(ConsumeRequest::new(10).ordering(Ordering::InsertionTs))
+            .await
+            .unwrap();
+        let ids: Vec<String> = r.events.iter().map(|e| e.id.clone()).collect();
+        assert_eq!(ids, vec!["0-a", "0-b", "1-a", "1-b"]);
     }
 }

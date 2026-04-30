@@ -410,6 +410,7 @@ impl Mesh {
             shard_id: 0,
             events: vec![net::event::InternalEvent::new(Bytes::from(json), 0, 0)],
             sequence_start: 0,
+            process_nonce: net::event::batch_process_nonce(),
         };
         self.node.send_to_peer(addr, batch).await?;
         Ok(())
@@ -426,6 +427,7 @@ impl Mesh {
             shard_id: 0,
             events: vec![net::event::InternalEvent::new(Bytes::from(json), 0, 0)],
             sequence_start: 0,
+            process_nonce: net::event::batch_process_nonce(),
         };
         self.node.send_routed(dest_node_id, batch).await?;
         Ok(())
@@ -444,6 +446,7 @@ impl Mesh {
                 0,
             )],
             sequence_start: 0,
+            process_nonce: net::event::batch_process_nonce(),
         };
         self.node.send_to_peer(addr, batch).await?;
         Ok(())

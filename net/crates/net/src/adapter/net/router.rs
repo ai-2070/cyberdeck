@@ -152,8 +152,16 @@ pub struct FairScheduler {
     total_queued: AtomicU64,
     /// Total packets dropped
     total_dropped: AtomicU64,
-    /// Rotation index for round-robin fairness across dequeue calls
+    /// Rotation index for round-robin fairness across dequeue calls.
+    /// Only advances when a dequeue actually pops a packet, so
+    /// rotation correlates with service events rather than poll
+    /// frequency.
     round_robin_idx: AtomicU64,
+    /// Counter incremented on every `dequeue` call (regardless of
+    /// whether a packet was popped) for the modulo-1024 cleanup
+    /// trigger. Decoupled from `round_robin_idx` so the rotation fix
+    /// doesn't accidentally suppress cleanup.
+    dequeue_call_count: AtomicU64,
 }
 
 impl FairScheduler {
@@ -168,6 +176,7 @@ impl FairScheduler {
             total_queued: AtomicU64::new(0),
             total_dropped: AtomicU64::new(0),
             round_robin_idx: AtomicU64::new(0),
+            dequeue_call_count: AtomicU64::new(0),
         }
     }
 
@@ -216,11 +225,14 @@ impl FairScheduler {
     pub fn dequeue(&self) -> Option<QueuedPacket> {
         // Periodically clean up empty stream queues to prevent unbounded growth
         // of the DashMap. Check every 1024 dequeue calls (cheap modular check).
-        if self
-            .round_robin_idx
-            .load(Ordering::Relaxed)
-            .is_multiple_of(1024)
-        {
+        // Tracked on a separate counter from `round_robin_idx` so
+        // that decoupling rotation from poll frequency doesn't
+        // suppress the cleanup trigger.
+        let call_count = self
+            .dequeue_call_count
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        if call_count.is_multiple_of(1024) {
             self.cleanup_empty();
         }
 
@@ -234,7 +246,22 @@ impl FairScheduler {
         if keys.is_empty() {
             return None;
         }
-        let start = self.round_robin_idx.fetch_add(1, Ordering::Relaxed) as usize % keys.len();
+        // Advance the round-robin cursor only when we actually pop a
+        // packet. Previously this used `fetch_add(1)` unconditionally,
+        // so every empty poll advanced the rotation as if we'd
+        // serviced a stream. The result was that under bursty mixed
+        // traffic, polls that found no packet still nudged the cursor
+        // past the stream that *would* have had a packet on the next
+        // tick, biasing service away from streams that became
+        // non-empty
+        // mid-pass.
+        //
+        // Now: read the cursor for the starting offset, then
+        // commit a `fetch_add(1)` only inside the successful pop
+        // arm. Behavioral effect is the same when packets are
+        // available; the difference shows up under contention
+        // and on dequeues that find nothing.
+        let start = self.round_robin_idx.load(Ordering::Relaxed) as usize % keys.len();
 
         // Round-robin across streams, starting from the rotated index.
         // Each stream's quantum is `base_quantum × stream.weight`, so
@@ -247,6 +274,9 @@ impl FairScheduler {
                 if queue.sent_this_round() < stream_quantum && !queue.is_empty() {
                     if let Some(packet) = queue.pop() {
                         queue.increment_sent();
+                        // Advance the rotation cursor only on
+                        // successful pop.
+                        self.round_robin_idx.fetch_add(1, Ordering::Relaxed);
                         return Some(packet);
                     }
                 }
@@ -277,6 +307,7 @@ impl FairScheduler {
                 if let Some(queue) = self.streams.get(&key) {
                     if let Some(packet) = queue.pop() {
                         queue.increment_sent();
+                        self.round_robin_idx.fetch_add(1, Ordering::Relaxed);
                         return Some(packet);
                     }
                 }
@@ -958,6 +989,53 @@ mod tests {
             "weight-1 stream should ship <= 1 packet before round reset; \
              saw {}",
             counts[1]
+        );
+    }
+
+    /// Regression: BUG_REPORT.md #31 — `round_robin_idx` was
+    /// `fetch_add(1)`-ed unconditionally on every `dequeue` call,
+    /// so polls that returned `None` (no streams have packets)
+    /// still rotated the cursor. Under bursty mixed traffic this
+    /// biased service away from streams that became non-empty
+    /// mid-pass. The fix advances the cursor only when a packet
+    /// is actually popped.
+    #[test]
+    fn round_robin_idx_advances_only_on_successful_pop() {
+        let scheduler = FairScheduler::new(1, 64);
+
+        // Empty scheduler: many polls must NOT advance the index.
+        let initial = scheduler.round_robin_idx.load(Ordering::Relaxed);
+        for _ in 0..1000 {
+            assert!(scheduler.dequeue().is_none());
+        }
+        assert_eq!(
+            scheduler.round_robin_idx.load(Ordering::Relaxed),
+            initial,
+            "empty-poll dequeues must not advance round_robin_idx (#31)"
+        );
+
+        // Now enqueue + drain. Each successful pop should advance
+        // the index by exactly 1.
+        for stream in 0..5u64 {
+            scheduler.enqueue(QueuedPacket {
+                data: Bytes::from(vec![0u8; 8]),
+                dest: "127.0.0.1:9000".parse().unwrap(),
+                stream_id: stream,
+                priority: false,
+                queued_at: Instant::now(),
+            });
+        }
+        let before_drain = scheduler.round_robin_idx.load(Ordering::Relaxed);
+        let mut popped = 0;
+        while scheduler.dequeue().is_some() {
+            popped += 1;
+        }
+        let after_drain = scheduler.round_robin_idx.load(Ordering::Relaxed);
+        assert_eq!(popped, 5);
+        assert_eq!(
+            after_drain.wrapping_sub(before_drain),
+            popped as u64,
+            "round_robin_idx must advance by exactly the number of successful pops (#31)"
         );
     }
 }
