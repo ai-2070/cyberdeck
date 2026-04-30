@@ -1,0 +1,29 @@
+net/crates/net/src/adapter/net/redex/file.rs
+  3b00aa059b4a8250 1895-2064
+net/crates/net/README.md
+  3b00aa059b4a8250 442,446-455
+net/crates/net/docs/REDEX_DISK_THROUGHPUT_PLAN.md
+  3b00aa059b4a8250 7-16,24-26,28-33,37-45,80-89,113-130,167-186,255-261,263,290-294,296-297
+net/crates/net/benches/redex.rs
+  3b00aa059b4a8250 13-17,26-27,204,213-257,259-300,302-306,369-370
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "5fbdb2cd9ab0a4feca08cf449d420958a1eca03d",
+  "prompts": {
+    "3b00aa059b4a8250": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e663fe89-01fb-417f-a16e-c34e9a5214c7",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 4444,
+      "total_deletions": 33,
+      "accepted_lines": 537,
+      "overriden_lines": 136
+    }
+  }
+}
