@@ -1,0 +1,45 @@
+net/crates/net/src/adapter/net/transport.rs
+  4f40616bb3482b98 305-319,323,327-331,348
+net/crates/net/src/adapter/net/compute/daemon.rs
+  4f40616bb3482b98 51-70,74-92
+net/crates/net/src/adapter/net/behavior/safety.rs
+  4f40616bb3482b98 872-882,902-903,905-1005,1754-1836
+net/crates/net/src/adapter/net/compute/standby_group.rs
+  4f40616bb3482b98 322-326,334-342,345-349,352-358
+net/crates/net/src/adapter/net/traversal/portmap/mod.rs
+  4f40616bb3482b98 582-590,593,595,601-603,639-640
+net/crates/net/src/adapter/net/compute/fork_group.rs
+  4f40616bb3482b98 261,266-272,291-299,302-306,314-320
+net/crates/net/src/adapter/net/linux.rs
+  4f40616bb3482b98 99-115,117-118,139-143,163-175,177-199,201-202
+net/crates/net/src/adapter/net/compute/replica_group.rs
+  4f40616bb3482b98 244,249-274,281-289,292-296,299-305,619-687
+net/crates/net/src/adapter/jetstream.rs
+  4f40616bb3482b98 58-68,74-85,92,288-298,301-305
+net/crates/net/docs/BUG_AUDIT_2026_04_30.md
+  4f40616bb3482b98 7-9,12-13,15-18
+net/crates/net/src/adapter/net/behavior/loadbalance.rs
+  4f40616bb3482b98 636-650,658-661,663-670,771-783,794-805,809
+net/crates/net/src/adapter/net/traversal/portmap/upnp.rs
+  4f40616bb3482b98 179-196,198,260,284-307
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "4afd52bcd872fac61fac7a601e55ea4ed7e1374a",
+  "prompts": {
+    "4f40616bb3482b98": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f4364a44-daa1-40ed-9f76-d0eea8143568",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3013,
+      "total_deletions": 205,
+      "accepted_lines": 658,
+      "overriden_lines": 0
+    }
+  }
+}
