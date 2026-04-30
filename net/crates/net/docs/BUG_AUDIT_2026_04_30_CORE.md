@@ -933,6 +933,20 @@ Tests:
 
 **Fix:** `ShardManager::ingest_raw_batch` now returns `(success, unrouted)`; the bus subtracts `unrouted` from the buffer-fullness drop count. See the **Fixed on 2026-04-30** block above.
 
+### 156. `RingBuffer` SPSC tripwire pinned the first OS thread to ever push/pop, false-firing on tokio task migration — **[FIXED 2026-05-01]**
+**File:** `shard/ring_buffer.rs:96-111` (was `producer_thread` / `consumer_thread`)
+
+Pre-fix the debug-build SPSC sanity check stored the OS thread ID of the first caller into `Mutex<Option<ThreadId>>` and asserted every subsequent caller's `ThreadId` matched. The doc on the type itself acknowledges that the SPSC contract is about *non-concurrency*, not thread identity (tokio multi-threaded runtimes legitimately migrate a task between OS threads across `await` points), but the assertion enforced thread identity anyway. As a result, every test that touched the bus under `#[tokio::test(flavor = "multi_thread")]` could panic from a false positive — `tests/bus_shutdown_drain.rs` (`shutdown_delivers_all_pending_events_to_adapter`, `dispatch_batch_retries_eventually_deliver_all_events`, `shutdown_drains_events_in_flight_when_flag_is_set`) failed on master under the multi-threaded runtime, as did `tests/ffi_shutdown_race.rs` cases. The actual SPSC violation (concurrent multi-producer or multi-consumer) was masked by the noise of false positives.
+
+**Fix:** the thread-identity check is replaced with a concurrency tripwire — a `producer_in_progress: AtomicBool` and `consumer_in_progress: AtomicBool` plus an RAII `InProgressGuard`. On entry to a producer- or consumer-side method the guard's `enter()` swaps the relevant flag from `false` to `true`; observing `true` means another caller is mid-execution on the same side, which is a genuine SPSC violation, and the assertion fires. On Drop the flag clears. Sequential cross-thread access (the legitimate task-migration case) is now allowed; concurrent access still panics. The guard's RAII `Drop` covers both the early-return path (`count == 0` in `pop_batch_into`) and the panic-unwind path (the work block panicking before the function returns).
+
+Tests (replace the prior thread-identity tests, which were checking the wrong invariant):
+- `sequential_cross_thread_push_is_allowed` / `_pop_is_allowed` / `_evict_oldest_is_allowed` — pin the new "task migration is fine" semantics.
+- `concurrent_producer_panics_via_simulated_in_progress_flag` / `_consumer_panics_via_…` / `_evict_oldest_panics_via_…` — pre-set the in-progress flag (modelling "another caller is mid-execution") and verify the tripwire fires deterministically. Same invariant the prior tests *meant* to check, now tested correctly.
+- `guard_releases_flag_on_early_return` — pin that the RAII `Drop` clears the flag on the empty-buffer fast-path return; otherwise the tripwire would latch on permanently and silence future real violations.
+
+`tests/bus_shutdown_drain.rs` and `tests/ffi_shutdown_race.rs` now pass — they always WOULD have, modulo the false-positive panics.
+
 ```rust
 let total = events.len();
 let success = self.shard_manager.ingest_raw_batch(events);
