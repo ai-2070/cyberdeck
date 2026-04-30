@@ -217,6 +217,19 @@ struct DispatchCtx {
     /// In-flight initiator handshakes; dispatch completes them when a
     /// matching routed msg2 arrives.
     pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
+    /// In-flight DIRECT initiator handshakes, keyed by the peer's
+    /// socket address. Closes BUG #86: pre-fix, `try_handshake_initiator`
+    /// polled `socket_arc.recv_from` directly, racing the dispatch
+    /// receive loop after `start()` had spawned it. Tokio dispatches
+    /// each datagram to exactly one waiter, so the handshake
+    /// response could be swallowed by either side. Now the initiator
+    /// registers a oneshot here BEFORE sending msg1; the dispatch
+    /// loop's direct-handshake branch looks up the source, forwards
+    /// the parsed payload bytes through the oneshot, and removes
+    /// the entry. If no entry matches the source (e.g., the
+    /// responder side or pre-start invocations), the dispatcher
+    /// falls through to its drop-direct-handshake behaviour.
+    pending_direct_initiators: Arc<DashMap<SocketAddr, oneshot::Sender<Bytes>>>,
     /// Our Noise static keypair — needed to construct responder state
     /// when a routed msg1 arrives for us.
     static_keypair: StaticKeypair,
@@ -1015,6 +1028,12 @@ pub struct MeshNode {
     /// node_id. Populated by `connect_via`; consumed by the dispatch
     /// loop when the matching msg2 arrives.
     pending_handshakes: Arc<DashMap<u64, PendingHandshake>>,
+    /// In-flight direct-handshake initiators, keyed by the peer's
+    /// `SocketAddr`. Populated by `try_handshake_initiator` BEFORE
+    /// sending msg1; consumed by the dispatch loop when a matching
+    /// direct handshake response arrives. Closes BUG #86 — see
+    /// the matching field on `DispatchCtx` for context.
+    pending_direct_initiators: Arc<DashMap<SocketAddr, oneshot::Sender<Bytes>>>,
     /// Proximity graph — topology awareness from pingwave propagation
     proximity_graph: Arc<ProximityGraph>,
     /// Automatic reroute policy
@@ -1393,6 +1412,8 @@ impl MeshNode {
         .on_recovery(move |node_id| rp_recovery.on_recovery(node_id));
 
         let pending_handshakes: Arc<DashMap<u64, PendingHandshake>> = Arc::new(DashMap::new());
+        let pending_direct_initiators: Arc<DashMap<SocketAddr, oneshot::Sender<Bytes>>> =
+            Arc::new(DashMap::new());
 
         // Hoist the subnet knobs before `config` is moved into the
         // struct literal; the publish + subscribe paths read these
@@ -1421,6 +1442,7 @@ impl MeshNode {
             inbound: Arc::new(DashMap::new()),
             migration_handler: Arc::new(ArcSwapOption::empty()),
             pending_handshakes,
+            pending_direct_initiators,
             proximity_graph,
             reroute_policy,
             peer_addrs,
@@ -2141,6 +2163,7 @@ impl MeshNode {
             num_shards: self.config.num_shards,
             migration_handler: self.migration_handler.clone(),
             pending_handshakes: self.pending_handshakes.clone(),
+            pending_direct_initiators: self.pending_direct_initiators.clone(),
             static_keypair: self.static_keypair.clone(),
             psk: self.config.psk,
             socket: self.socket.clone(),
@@ -2438,6 +2461,18 @@ impl MeshNode {
         };
 
         if parsed.header.flags.is_handshake() {
+            // BUG #86: pre-fix `try_handshake_initiator` polled
+            // `socket_arc.recv_from` directly, racing this
+            // dispatch loop. Tokio routes a UDP datagram to
+            // exactly one waiter — the response could be
+            // swallowed by either consumer. Now: if a direct
+            // initiator has registered an oneshot keyed by this
+            // source, forward the parsed payload bytes through
+            // it. Otherwise (no entry, e.g. responder side or
+            // unsolicited handshake) fall through to drop.
+            if let Some((_, tx)) = ctx.pending_direct_initiators.remove(&source) {
+                let _ = tx.send(parsed.payload);
+            }
             return;
         }
 
@@ -3320,13 +3355,16 @@ impl MeshNode {
                             //     reject every subsequent one as
                             //     a replay.
                             //
-                            // Acquire from the session's pooled
-                            // builder so the heartbeat shares the
-                            // session's persistent `tx_counter`
-                            // (counter increments atomically per
-                            // packet) and is built with the
-                            // session's actual TX key.
-                            let mut pooled = session.packet_pool().get();
+                            // Use `thread_local_pool` (the same
+                            // pool the data path uses) so heartbeats
+                            // and data share a single `tx_counter`.
+                            // Routing heartbeats through
+                            // `packet_pool` (a separate counter)
+                            // would make the receiver's `rx_cipher`
+                            // see the same counter value twice —
+                            // once from each pool — and replay-
+                            // reject one of them.
+                            let mut pooled = session.thread_local_pool().get();
                             let packet = pooled.build_heartbeat();
                             let _ = socket.send_to(&packet, peer_addr).await;
                             // Pingwave (raw UDP — not encrypted, topology is public)
@@ -6223,7 +6261,6 @@ impl MeshNode {
         peer_node_id: u64,
     ) -> Result<SessionKeys, AdapterError> {
         let timeout = self.config.handshake_timeout;
-        let socket_arc = self.socket.socket_arc();
 
         // Prologue uses the 32-bit `routing_id` projection of the node
         // ids — the same projection routed handshakes use, so the two
@@ -6242,41 +6279,95 @@ impl MeshNode {
         let mut builder = PacketBuilder::new(&[0u8; 32], 0);
         let packet = builder.build_handshake(&msg1);
 
-        self.socket
-            .send_to(&packet, peer_addr)
-            .await
-            .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
+        // BUG #86: previously this polled `socket_arc.recv_from`
+        // directly, which races `spawn_receive_loop`'s consumer
+        // post-`start()` (tokio dispatches a UDP datagram to
+        // exactly one waiter). The fix:
+        //   - Pre-`start()`: use `recv_from`; the dispatcher isn't
+        //     running, so there's no race. This preserves the
+        //     existing init-time ordering where `connect()` is
+        //     called before `start()`.
+        //   - Post-`start()`: register an oneshot in
+        //     `pending_direct_initiators`, then send msg1, then
+        //     await the oneshot. The dispatcher's direct-handshake
+        //     branch forwards the parsed payload bytes through.
+        // Concurrent direct connects on the same node also work
+        // — each registers under its own peer_addr.
+        let payload_bytes = if self.started.load(Ordering::Acquire) {
+            let (tx, rx) = oneshot::channel::<Bytes>();
+            // Register BEFORE sending msg1 so we can't miss a
+            // fast responder that replies before we'd otherwise
+            // be ready to receive. `insert` replaces any prior
+            // entry for the same `peer_addr` — last writer wins.
+            self.pending_direct_initiators.insert(peer_addr, tx);
 
-        // Wait for response
-        let parsed = tokio::time::timeout(timeout, async {
-            loop {
-                let mut recv_buf = bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
-                recv_buf.resize(protocol::MAX_PACKET_SIZE, 0);
+            if let Err(e) = self.socket.send_to(&packet, peer_addr).await {
+                self.pending_direct_initiators.remove(&peer_addr);
+                return Err(AdapterError::Connection(format!("send failed: {}", e)));
+            }
 
-                let (n, source) = socket_arc
-                    .recv_from(&mut recv_buf)
-                    .await
-                    .map_err(|e| AdapterError::Connection(format!("recv failed: {}", e)))?;
-
-                if source != peer_addr {
-                    continue;
+            match tokio::time::timeout(timeout, rx).await {
+                Ok(Ok(payload)) => payload,
+                Ok(Err(_)) => {
+                    // Sender dropped — the dispatcher removed our
+                    // entry without forwarding. Should not happen
+                    // unless start() shut down; treat as timeout.
+                    self.pending_direct_initiators.remove(&peer_addr);
+                    return Err(AdapterError::Connection(
+                        "handshake channel dropped".into(),
+                    ));
                 }
-
-                recv_buf.truncate(n);
-                let data = recv_buf.freeze();
-
-                if let Some(p) = ParsedPacket::parse(data, source) {
-                    if p.header.flags.is_handshake() {
-                        return Ok::<_, AdapterError>(p);
-                    }
+                Err(_) => {
+                    // Timeout — the responder never replied or its
+                    // reply arrived for a different source. Clean up.
+                    self.pending_direct_initiators.remove(&peer_addr);
+                    return Err(AdapterError::Connection("handshake timeout".into()));
                 }
             }
-        })
-        .await
-        .map_err(|_| AdapterError::Connection("handshake timeout".into()))??;
+        } else {
+            // Pre-start fallback: dispatcher is not running, so
+            // there's nothing to forward through the registry.
+            // Poll the socket directly — no race exists yet.
+            let socket_arc = self.socket.socket_arc();
+            self.socket
+                .send_to(&packet, peer_addr)
+                .await
+                .map_err(|e| AdapterError::Connection(format!("send failed: {}", e)))?;
+
+            let parsed = tokio::time::timeout(timeout, async {
+                loop {
+                    let mut recv_buf =
+                        bytes::BytesMut::with_capacity(protocol::MAX_PACKET_SIZE);
+                    recv_buf.resize(protocol::MAX_PACKET_SIZE, 0);
+
+                    let (n, source) = socket_arc
+                        .recv_from(&mut recv_buf)
+                        .await
+                        .map_err(|e| {
+                            AdapterError::Connection(format!("recv failed: {}", e))
+                        })?;
+
+                    if source != peer_addr {
+                        continue;
+                    }
+
+                    recv_buf.truncate(n);
+                    let data = recv_buf.freeze();
+
+                    if let Some(p) = ParsedPacket::parse(data, source) {
+                        if p.header.flags.is_handshake() {
+                            return Ok::<_, AdapterError>(p);
+                        }
+                    }
+                }
+            })
+            .await
+            .map_err(|_| AdapterError::Connection("handshake timeout".into()))??;
+            parsed.payload
+        };
 
         handshake
-            .read_message(&parsed.payload)
+            .read_message(&payload_bytes)
             .map_err(|e| AdapterError::Connection(format!("read_message failed: {}", e)))?;
 
         handshake
@@ -7549,6 +7640,78 @@ mod heartbeat_aead_tests {
         assert_eq!(router.routing_table().lookup(peer_id), Some(fresh));
     }
 
+    /// Regression: the heartbeat sender must use the same pool
+    /// as the data path (`thread_local_pool`), not a separate one
+    /// (`packet_pool`). Each pool owns its own `tx_counter`; the
+    /// receiver verifies all packets against a single `rx_cipher`
+    /// with a single replay window, so two senders with separate
+    /// counters will collide on counter=0 (etc.) and the receiver
+    /// will replay-reject one of them.
+    ///
+    /// This pins the invariant by:
+    ///   1. Acquiring two heartbeats from `packet_pool`.
+    ///   2. Acquiring one packet from `thread_local_pool`
+    ///      (mirroring the data path).
+    ///   3. Verifying that the packet_pool heartbeats and the
+    ///      thread_local_pool packet have OVERLAPPING counter
+    ///      values — i.e., they're independent counters.
+    ///
+    /// If a future change routes heartbeats through `packet_pool`,
+    /// this test will demonstrate the counter overlap that breaks
+    /// the receiver. The production path uses `thread_local_pool`
+    /// for both, which keeps counters monotonically increasing
+    /// across heartbeats AND data.
+    #[test]
+    fn packet_pool_and_thread_local_pool_have_independent_counters() {
+        let (init_keys, _resp_keys) = make_session_keys();
+        let session = NetSession::new(
+            init_keys,
+            "127.0.0.1:5001".parse().unwrap(),
+            4,
+            false,
+        );
+
+        // Acquire from packet_pool. PooledBuilder emits its first
+        // packet at the pool's current counter (starts at 0).
+        let h1 = {
+            let mut pooled = session.packet_pool().get();
+            pooled.build_heartbeat()
+        };
+        // Pull the counter out of the wire bytes (NetHeader nonce
+        // bytes 16..24 carry the LE-encoded counter — see
+        // `pool.rs:215`).
+        let h1_counter = u64::from_le_bytes(h1[16..24].try_into().unwrap());
+
+        let h2 = {
+            let mut pooled = session.packet_pool().get();
+            pooled.build_heartbeat()
+        };
+        let h2_counter = u64::from_le_bytes(h2[16..24].try_into().unwrap());
+
+        // Now from thread_local_pool — the data path's pool.
+        let d1 = {
+            let mut pooled = session.thread_local_pool().get();
+            pooled.build_heartbeat()
+        };
+        let d1_counter = u64::from_le_bytes(d1[16..24].try_into().unwrap());
+
+        // packet_pool produced counters 0 and 1.
+        // thread_local_pool produced counter 0 — overlapping with
+        // packet_pool's first heartbeat. THIS is the bug: a single
+        // session sees two streams of packets with overlapping
+        // counters. The receiver's `rx_cipher.update_rx_counter`
+        // would accept the first counter=0 and reject the second.
+        assert_ne!(h1_counter, h2_counter, "successive packet_pool builds must increment");
+        assert!(
+            h1_counter == d1_counter || h2_counter == d1_counter,
+            "packet_pool and thread_local_pool MUST have overlapping \
+             counters — they're independent. h1={h1_counter} h2={h2_counter} d1={d1_counter}. \
+             If this assertion ever fails because the pools share a \
+             counter, the production heartbeat sender can be moved \
+             back to packet_pool safely."
+        );
+    }
+
     /// Regression for BUG_AUDIT_2026_04_30_CORE.md #97: the
     /// production heartbeat path must (a) build with the
     /// session's actual TX key — not `&[0u8; 32]` — and (b) use a
@@ -7582,11 +7745,11 @@ mod heartbeat_aead_tests {
         // Mirror the production sender at `mesh.rs:3220` —
         // acquire from the session's pool, not a fresh builder.
         let h1_bytes = {
-            let mut pooled = init_session.packet_pool().get();
+            let mut pooled = init_session.thread_local_pool().get();
             pooled.build_heartbeat()
         };
         let h2_bytes = {
-            let mut pooled = init_session.packet_pool().get();
+            let mut pooled = init_session.thread_local_pool().get();
             pooled.build_heartbeat()
         };
 

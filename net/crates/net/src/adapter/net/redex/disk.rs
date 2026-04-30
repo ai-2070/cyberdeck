@@ -1258,9 +1258,24 @@ impl DiskSegment {
         *worker_ts_guard = null_ts_worker;
 
         // Atomic renames.
+        //
+        // BUG #93: this is still a *three-rename* sequence rather
+        // than one atomic flip — a crash between renames N and
+        // N+1 leaves a mixed-version on-disk state that recovery
+        // cannot distinguish from a clean half-finished compact.
+        // A full fix is a manifest-pointer scheme (write versioned
+        // filenames, atomically swap a single "manifest" pointer),
+        // which is a format change deferred to a follow-up audit.
+        // The interim mitigation is the parent-dir fsync below:
+        // on POSIX, individual renames are not durable until the
+        // dirent is fsynced, so without that fsync a power loss
+        // could leave the directory pointing at the OLD inodes
+        // even after all three rename calls returned successfully.
+        // The fsync narrows but does not close the cross-file gap.
         std::fs::rename(&idx_tmp, &idx_path).map_err(RedexError::io)?;
         std::fs::rename(&dat_tmp, &dat_path).map_err(RedexError::io)?;
         std::fs::rename(&ts_tmp, &ts_path).map_err(RedexError::io)?;
+        fsync_dir(&self.dir).map_err(RedexError::io)?;
 
         // Re-open the cached append handles on the new files, then
         // re-clone for the worker slots. Both kinds again share the
@@ -1318,6 +1333,36 @@ fn channel_dir(base_dir: &Path, name: &ChannelName) -> PathBuf {
         p.push(seg);
     }
     p
+}
+
+/// Fsync a directory inode so any prior `rename()` calls into
+/// it become durable.
+///
+/// On POSIX, `rename` only updates the dirent in memory — the
+/// directory's on-disk metadata isn't flushed until the dir
+/// itself is fsynced. Without this, a power-loss between a
+/// successful `rename` syscall return and a subsequent fsync
+/// can leave the directory pointing at the OLD inodes, making
+/// the rename's apparent atomicity a lie. Closes part of BUG
+/// #93 — the `compact_to` rename sequence now fsyncs the
+/// containing directory after the renames complete.
+///
+/// On Windows, rename durability is governed by separate APIs
+/// (`MoveFileEx` with `MOVEFILE_WRITE_THROUGH`) and the
+/// stdlib's `std::fs::rename` does not expose them.
+/// Opening a directory as a `File` and calling `sync_all` is
+/// not a defined operation on Windows; we no-op here. Power-
+/// loss durability of `compact_to` on Windows is therefore
+/// best-effort under the current implementation.
+#[cfg(unix)]
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+#[allow(dead_code)]
+fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Read the full idx file into a `Vec<RedexEntry>`.
@@ -2183,5 +2228,33 @@ mod tests {
         );
 
         cleanup(&base);
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #93: the
+    /// `fsync_dir` helper added to make `compact_to`'s rename
+    /// sequence durable on POSIX must complete cleanly on a
+    /// normal directory and on a directory with `O_RDONLY`
+    /// access (the open mode `File::open` uses).
+    ///
+    /// On Windows the helper is a no-op and returns `Ok(())`
+    /// regardless of input. This test pins both behaviours:
+    /// it MUST succeed without error on a freshly-created
+    /// `tempdir`.
+    #[test]
+    fn fsync_dir_helper_succeeds_on_a_normal_directory() {
+        let tmp = std::env::temp_dir().join(format!(
+            "redex-fsync-dir-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).expect("create tempdir");
+
+        super::fsync_dir(&tmp).expect("fsync_dir must succeed on a normal dir");
+
+        // Cleanup. Best-effort; not load-bearing for the test.
+        let _ = std::fs::remove_dir(&tmp);
     }
 }

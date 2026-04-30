@@ -837,25 +837,38 @@ impl NetAdapter {
                             break;
                         }
 
-                        // BUG #97: previously this used
-                        // `PacketBuilder::new(&[0u8; 32],
-                        // session.session_id())` — a fresh builder
-                        // with an all-zero key and a fresh
-                        // counter starting at 0 each tick. Two
-                        // problems compounded once the receiver
-                        // started AEAD-verifying heartbeats (BUG
-                        // #85): (a) the all-zero key didn't match
-                        // the session's RX key; (b) successive
-                        // heartbeats reused counter=0, so the
-                        // receiver's replay window rejected every
-                        // heartbeat after the first.
+                        // BUG #97 / #97-followup: this previously
+                        // used `PacketBuilder::new(&[0u8; 32],
+                        // session.session_id())` — fresh builder,
+                        // all-zero key, fresh counter starting at
+                        // 0 each tick. Two problems compounded
+                        // once the receiver started AEAD-verifying
+                        // heartbeats (BUG #85): (a) the all-zero
+                        // key didn't match the session's RX key;
+                        // (b) successive heartbeats reused
+                        // counter=0, so the receiver's replay
+                        // window rejected every heartbeat after
+                        // the first.
                         //
-                        // Acquire from the session's pooled
-                        // builder so the heartbeat shares the
-                        // session's persistent `tx_counter` and
-                        // is built with the session's actual TX
-                        // key.
-                        let mut pooled = session.packet_pool().get();
+                        // The first round of #97 fix routed
+                        // heartbeats through `session.packet_pool`
+                        // — that fixed (a)+(b) but introduced a
+                        // counter conflict with the data path:
+                        // `packet_pool` and `thread_local_pool`
+                        // each own their own `tx_counter`, and
+                        // the data path uses `thread_local_pool`
+                        // (see `on_batch` at `:982`). The receiver
+                        // verifies all packets against a single
+                        // `rx_cipher`, so heartbeats and data
+                        // must share the SAME counter on the
+                        // sender side or one will be replay-
+                        // rejected.
+                        //
+                        // Use `thread_local_pool` here too — same
+                        // pool, same shared counter, so heartbeats
+                        // and data interleave correctly on the
+                        // wire.
+                        let mut pooled = session.thread_local_pool().get();
                         let packet = pooled.build_heartbeat();
 
                         if let Err(e) = socket.send_to(&packet, peer_addr).await {
