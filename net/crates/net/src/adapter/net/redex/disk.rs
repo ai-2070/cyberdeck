@@ -1554,11 +1554,13 @@ mod tests {
     /// `append_entries_at` path. The disk-layer batch API stitches
     /// `dat_buf` from heap payloads only while idx/ts cover every
     /// entry; this test pins three things at once:
+    ///
     ///   1. inline payloads do NOT leak into dat,
     ///   2. heap-payload bytes land at the offsets their idx records
     ///      claim,
     ///   3. each per-entry timestamp pairs with the matching idx
     ///      record on reopen.
+    ///
     /// A zip-mismatch or wrong-buffer regression would surface as
     /// either a checksum failure on reopen or a misaligned timestamp.
     #[test]
