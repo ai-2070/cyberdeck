@@ -152,11 +152,29 @@ impl RedexFile {
         let next_seq = recovered.index.last().map(|e| e.seq + 1).unwrap_or(0);
 
         let segment = HeapSegment::from_existing(recovered.payload_bytes);
-        // Recovered entries get "now" as their fake timestamp. v1
-        // age-retention limitation: persistent files lose age info
-        // across reopen. v2 mmap tier will persist timestamps.
-        let now = now_ns();
-        let timestamps = vec![now; recovered.index.len()];
+        // Use the persisted timestamps if they're present and match
+        // the recovered index length; otherwise fall back to `now()`
+        // and warn so operators know age-based retention is degraded
+        // for this run. Without the ts sidecar (or when it's torn /
+        // missing), every recovered entry would be timestamped "now"
+        // and eligible-for-age-eviction status would be wrong for a
+        // full retention window after every restart.
+        let timestamps = match recovered.timestamps {
+            Some(ts) if ts.len() == recovered.index.len() => ts,
+            _ => {
+                if !recovered.index.is_empty() {
+                    tracing::warn!(
+                        channel = %name.as_str(),
+                        entries = recovered.index.len(),
+                        "ts sidecar missing or mismatched — recovered entries get \
+                         `now()` as timestamp, age-based retention degraded for \
+                         this run"
+                    );
+                }
+                let now = now_ns();
+                vec![now; recovered.index.len()]
+            }
+        };
         let state = FileState {
             index: recovered.index,
             timestamps,
@@ -280,7 +298,7 @@ impl RedexFile {
         // that was never durably persisted.
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.disk() {
-            if let Err(e) = disk.append_entry(&entry, payload) {
+            if let Err(e) = disk.append_entry_at(&entry, payload, ts) {
                 self.inner.next_seq.fetch_sub(1, Ordering::AcqRel);
                 return Err(e);
             }
@@ -324,7 +342,7 @@ impl RedexFile {
 
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.disk() {
-            if let Err(e) = disk.append_entry(&entry, payload) {
+            if let Err(e) = disk.append_entry_at(&entry, payload, ts) {
                 self.inner.next_seq.fetch_sub(1, Ordering::AcqRel);
                 return Err(e);
             }
@@ -420,7 +438,7 @@ impl RedexFile {
                 .iter()
                 .map(|e| (e.entry, e.payload.as_ref()))
                 .collect();
-            if let Err(e) = disk.append_entries(&pairs) {
+            if let Err(e) = disk.append_entries_at(&pairs, &vec![ts; pairs.len()]) {
                 self.inner
                     .next_seq
                     .fetch_sub(payloads.len() as u64, Ordering::AcqRel);
@@ -490,7 +508,7 @@ impl RedexFile {
 
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.disk() {
-            if let Err(e) = disk.append_entry(&entry, payload) {
+            if let Err(e) = disk.append_entry_at(&entry, payload, ts) {
                 self.inner.next_seq.fetch_sub(1, Ordering::AcqRel);
                 return Err(e);
             }
@@ -530,7 +548,7 @@ impl RedexFile {
 
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.disk() {
-            if let Err(e) = disk.append_entry(&entry, payload) {
+            if let Err(e) = disk.append_entry_at(&entry, payload, ts) {
                 self.inner.next_seq.fetch_sub(1, Ordering::AcqRel);
                 return Err(e);
             }
@@ -612,7 +630,7 @@ impl RedexFile {
                 .iter()
                 .map(|e| (e.entry, e.payload.as_ref()))
                 .collect();
-            if let Err(e) = disk.append_entries(&pairs) {
+            if let Err(e) = disk.append_entries_at(&pairs, &vec![ts; pairs.len()]) {
                 self.inner
                     .next_seq
                     .fetch_sub(payloads.len() as u64, Ordering::AcqRel);
@@ -834,6 +852,48 @@ impl RedexFile {
             // payload segment.
             let cur = state.segment.base_offset() + state.segment.live_bytes() as u64;
             state.segment.evict_prefix_to(cur);
+        }
+
+        // Persist the eviction. Without this, `sweep_retention`
+        // mutated only memory; the on-disk idx + dat files grew
+        // unbounded across restart, and on reopen the full dat
+        // was replayed — entries previously evicted came back
+        // from the dead. The fix calls into `disk.compact_to` to
+        // atomically rewrite idx + dat + ts to match the
+        // post-sweep in-memory state.
+        #[cfg(feature = "redex-disk")]
+        if let Some(disk) = self.inner.disk.as_ref() {
+            // Collect references first so we can release the
+            // shard-state lock around the I/O — `compact_to`
+            // does several writes/fsyncs and we don't want to
+            // block other readers / writers on it longer than
+            // needed.
+            let surviving_index = state.index.clone();
+            let surviving_timestamps = state.timestamps.clone();
+            // The segment's base_offset reflects the new dat
+            // origin in the in-memory view. The disk's current
+            // dat file still starts at 0; the bytes preceding
+            // `surviving_index[0].payload_offset_in_old_dat`
+            // are what need to be trimmed off the front.
+            //
+            // For inline-only surviving entries, base_offset is
+            // past the end of the live segment — every byte of
+            // dat goes.
+            //
+            // The disk's old dat had offsets [0..segment.base_offset() +
+            // segment.live_bytes()]. The new starts at
+            // segment.base_offset().
+            let dat_base = state.segment.base_offset();
+            std::mem::drop(state);
+            let disk = disk.clone();
+            if let Err(e) = disk.compact_to(&surviving_index, &surviving_timestamps, dat_base) {
+                tracing::warn!(
+                    error = %e,
+                    "redex sweep_retention: disk compaction failed; \
+                     in-memory eviction succeeded but on-disk files retain \
+                     evicted entries"
+                );
+            }
         }
     }
 
@@ -1608,5 +1668,152 @@ mod tests {
         );
         let surviving_seqs: Vec<u64> = events.iter().map(|e| e.entry.seq).collect();
         assert_eq!(surviving_seqs, vec![0, 2]);
+    }
+
+    /// Regression: recovered entries used to get `now()` as their
+    /// timestamp (no on-disk persistence), so a 1-hour age-retention
+    /// on a process restarted every 30 minutes never evicted
+    /// anything — every reopen reset the age clock to zero. The fix
+    /// adds a `ts` sidecar that persists per-entry timestamps; on
+    /// reopen, `read_timestamps` returns the stored values and
+    /// age-based retention works correctly across restart.
+    ///
+    /// We pin this by:
+    ///   1. Creating a persistent file and appending an entry.
+    ///   2. Capturing the timestamp.
+    ///   3. Reopening the file and verifying the entry's timestamp
+    ///      survived (NOT a fresh `now()` from the second open).
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn ts_sidecar_preserves_timestamps_across_reopen() {
+        let dir = tmp_persistent_dir("ts_sidecar_persist");
+        let name = "ts/persist";
+
+        let captured_ts;
+        {
+            let f = make_persistent(name, &dir);
+            f.append(b"hello").unwrap();
+            f.append(b"world").unwrap();
+            captured_ts = f
+                .inner
+                .state
+                .lock()
+                .timestamps
+                .clone();
+            f.close().unwrap();
+        }
+        // Sleep long enough that a "fresh" timestamp would be
+        // distinguishable from the captured one.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // Reopen and verify timestamps survived.
+        let f2 = make_persistent(name, &dir);
+        let restored_ts = f2.inner.state.lock().timestamps.clone();
+        assert_eq!(
+            restored_ts.len(),
+            captured_ts.len(),
+            "timestamp count must match index count"
+        );
+        // Each restored timestamp should match what we captured —
+        // pre-fix, restored_ts would be ~20ms newer than
+        // captured_ts (because they were sampled at reopen time,
+        // not from the sidecar).
+        for (i, (cap, restored)) in captured_ts.iter().zip(restored_ts.iter()).enumerate() {
+            assert_eq!(
+                *cap, *restored,
+                "timestamp[{}] must round-trip across reopen (captured={}, restored={})",
+                i, cap, restored
+            );
+        }
+        f2.close().unwrap();
+    }
+
+    /// Regression: `sweep_retention` mutated only the in-memory
+    /// state — the on-disk idx + dat files grew unbounded and on
+    /// reopen the full dat was replayed, resurrecting entries that
+    /// the previous generation evicted. Now `sweep_retention` calls
+    /// into `disk.compact_to` which atomically rewrites idx + dat +
+    /// ts to match the post-sweep in-memory state.
+    ///
+    /// We pin this by:
+    ///   1. Append more entries than the retention max allows.
+    ///   2. Run `sweep_retention`.
+    ///   3. Close and reopen.
+    ///   4. Verify the reopened file holds only the surviving
+    ///      entries — not the evicted ones.
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn sweep_retention_persists_eviction_to_disk() {
+        let dir = tmp_persistent_dir("sweep_persist");
+        let name = "sweep/persist";
+
+        {
+            // Use Redex with a retention limit set in the config.
+            use super::super::manager::Redex;
+            let r = Redex::new().with_persistent_dir(&dir);
+            let f = r
+                .open_file(
+                    &ChannelName::new(name).unwrap(),
+                    RedexFileConfig::default()
+                        .with_persistent(true)
+                        .with_retention_max_events(2),
+                )
+                .unwrap();
+
+            // Append 5 heap-stored entries (payloads > 8 bytes).
+            f.append(b"AAAAAAAAA").unwrap();
+            f.append(b"BBBBBBBBB").unwrap();
+            f.append(b"CCCCCCCCC").unwrap();
+            f.append(b"DDDDDDDDD").unwrap();
+            f.append(b"EEEEEEEEE").unwrap();
+
+            // Sweep — should evict 0, 1, 2 (keeping last 2).
+            f.sweep_retention();
+            let surviving_in_mem: Vec<u64> = f
+                .inner
+                .state
+                .lock()
+                .index
+                .iter()
+                .map(|e| e.seq)
+                .collect();
+            assert_eq!(
+                surviving_in_mem,
+                vec![3, 4],
+                "in-memory eviction should keep last 2"
+            );
+
+            f.close().unwrap();
+        }
+
+        // Reopen — pre-fix, this would resurrect entries 0/1/2/3/4
+        // because the on-disk dat still had every byte. Post-fix,
+        // the disk was compacted, so only entries 3 and 4 are
+        // present.
+        use super::super::manager::Redex;
+        let r2 = Redex::new().with_persistent_dir(&dir);
+        let f2 = r2
+            .open_file(
+                &ChannelName::new(name).unwrap(),
+                RedexFileConfig::default()
+                    .with_persistent(true)
+                    .with_retention_max_events(2),
+            )
+            .unwrap();
+        let restored_seqs: Vec<u64> = f2
+            .inner
+            .state
+            .lock()
+            .index
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(
+            restored_seqs,
+            vec![3, 4],
+            "after reopen, only the entries that survived sweep should be present \
+             (pre-fix all 5 would resurrect because sweep didn't touch disk)"
+        );
+        f2.close().unwrap();
     }
 }
