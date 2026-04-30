@@ -1,17 +1,19 @@
 # Bug Audit (Core Modules) — 2026-04-30
 
-Follow-up audit focused on the core bus/event/adapter/consumer/FFI/shard surfaces of `net/crates/net/src/`. Continues the numbering of [BUG_AUDIT_2026_04_30.md](./BUG_AUDIT_2026_04_30.md) starting at #55. Excludes the broader `adapter/net/` UDP transport stack (cortex/redex/swarm/traversal) — that subtree is out of scope here.
+Follow-up audit focused on the core bus/event/adapter/consumer/FFI/shard surfaces of `net/crates/net/src/`. Continues the numbering of [BUG_AUDIT_2026_04_30.md](./BUG_AUDIT_2026_04_30.md) starting at #55.
 
-Scope of this pass:
-- `bus.rs`, `event.rs`, `config.rs`, `timestamp.rs`, `error.rs`, `lib.rs`
-- `adapter/{mod.rs, jetstream.rs, redis.rs, noop.rs}`
-- `consumer/{filter.rs, merge.rs, mod.rs}`
-- `ffi/{mod.rs, cortex.rs, mesh.rs}`
-- `shard/{mod.rs, mapper.rs, batch.rs, ring_buffer.rs}`
+Original scope (passes 1–N): `bus.rs`, `event.rs`, `config.rs`, `timestamp.rs`, `error.rs`, `lib.rs`, `adapter/{mod.rs, jetstream.rs, redis.rs, noop.rs}`, `consumer/{filter.rs, merge.rs, mod.rs}`, `ffi/{mod.rs, cortex.rs, mesh.rs}`, `shard/{mod.rs, mapper.rs, batch.rs, ring_buffer.rs}`.
+
+Extended scope (#80 onward): a follow-up multi-agent sweep added point-checks across the previously-deferred `adapter/net/` UDP transport stack and the `sdk/` surface. The new findings are spot-checks, not a systematic re-audit of those subtrees — additional defects may remain.
+- `sdk/src/{net.rs, ...}`
+- `adapter/net/redex/{disk.rs, file.rs}`
+- `adapter/net/{mesh.rs, session.rs, router.rs, linux.rs}`
+- `adapter/net/subnet/gateway.rs`
+- `adapter/net/contested/correlation.rs`
 
 ## Status (running tally)
 
-**Outstanding:** #55, #56, #57, #58, #59, #60, #61, #62, #63, #64, #65, #66, #67, #68, #69, #70, #71, #72, #73, #74, #75, #76, #77, #78, #79
+**Outstanding:** #55, #56, #57, #58, #59, #60, #61, #62, #63, #64, #65, #66, #67, #68, #69, #70, #71, #72, #73, #74, #75, #76, #77, #78, #79, #80, #81, #82, #83, #84, #85, #86, #87, #88, #89, #90, #91, #92, #93, #94, #95, #96
 
 ## High
 
@@ -49,6 +51,66 @@ The two-phase shard add introduced by #46's fix (`provision → spawn workers + 
 - the `Provisioning` `MappedShard` still in the mapper.
 
 The drain worker for the orphaned id then loops indefinitely on an empty ring buffer — its `with_shard` call still finds the entry (it's mapped, just `Provisioning`), and `select_shard` skips Provisioning so producer pushes never reach the buffer — burning a 100µs sleep per cycle until process shutdown. The mapper's `next_shard_id` stays advanced, so a subsequent retry allocates a higher id while the dead one squats. The compounding hazard is repeated scale-ups: each failed `activate_shard` adds another zombie drain worker and another orphan provisioning entry. Mirror `remove_shard_internal`'s teardown: on `activate_shard` Err, drop the sender, abort both join handles, and call `remove_shard` to unmap the provisioning entry before returning.
+
+### 80. `Net::shutdown` silently no-ops when any `Arc<EventBus>` clone is outstanding
+**File:** `sdk/src/net.rs:236-246`
+
+```rust
+match Arc::try_unwrap(self.bus) {
+    Ok(bus) => bus.shutdown().await?,
+    Err(_) => Err(SdkError::Adapter("cannot shutdown: outstanding references exist".into())),
+}
+```
+
+When `Arc::try_unwrap` fails, `bus.shutdown()` is never invoked. Background tasks keep running, pending events in ring buffers are silently lost, and the adapter's `flush()` / `shutdown()` never executes. The SDK's `subscribe` (#81) clones the inner Arc into every `EventStream`, so the failure mode is the default for any caller that ever subscribed and then attempts a graceful shutdown. The mesh-FFI side has an explicit regression test (`net_mesh_shutdown_runs_even_with_outstanding_arc_refs`) for this exact pattern — the SDK still has the legacy gating. Mirror the FFI fix: signal shutdown via a flag on the inner `Arc` rather than gating on `try_unwrap`, and let outstanding-handle paths consume the signal.
+
+### 81. `Net::subscribe` perpetuates `Arc<EventBus>` clones, making #80 the default outcome
+**File:** `sdk/src/net.rs:191-193`
+
+`EventStream::new(self.bus.clone(), opts)` increments the strong count of `Arc<EventBus>`. Even after the user drops the `EventStream`, any in-flight poll future the stream spawned can still hold the clone, so `Net::shutdown`'s `Arc::try_unwrap` fails (#80). The SDK provides no escape hatch — there is no `shutdown_async`-after-flush, no synchronous drain primitive — for the documented "subscribe → done streaming → shutdown" pattern. Fix is paired with #80: once shutdown is signal-based, surviving clones become benign.
+
+### 84. `RxCreditState::on_bytes_consumed` issues a matching grant for every byte consumed, defeating receive-side backpressure
+**File:** `adapter/net/session.rs:781-788`
+
+```rust
+let new_consumed = self.consumed.fetch_add(bytes, Ordering::AcqRel) + bytes;
+self.granted.fetch_add(bytes, Ordering::AcqRel);
+```
+
+Each consumed byte is paired with an immediate matching grant of the same size, so `granted - consumed` never falls below the initial window regardless of how slowly the application drains the inbound queue — the receiver never applies backpressure on a stream. The "round-trip credit window" docstring promises threshold-based grants (issue a window when outstanding ≤ `window_bytes / 2`); no such threshold is implemented, every byte auto-grants. The two `fetch_add`s are also not atomic together, so a concurrent reader observes momentary `consumed > granted` and `outstanding()` saturates to 0. The sender's credit therefore drops only when the receiver stops calling `on_bytes_consumed`, not when the receiver buffer is bounded. Replace the immediate auto-grant with a threshold check, or make the two updates an atomic CAS pair.
+
+### 85. Mesh dispatch path skips AEAD verification on heartbeat packets
+**File:** `adapter/net/mesh.rs:2367-2371` (compare with `adapter/net/mod.rs:642-663` and `adapter/net/pool.rs:237-249`)
+
+```rust
+if parsed.header.flags.is_heartbeat() {
+    failure_detector.heartbeat(peer_node_id, source);
+    session.touch();
+    return;
+}
+```
+
+The mesh dispatch loop fast-paths `is_heartbeat()` packets — touching the failure detector and session timestamp — without invoking AEAD verification. The legacy single-peer adapter (`mod.rs:642-663`) explicitly verifies the tag for the same packet shape, and the comment on `pool.rs:237-249` claims heartbeats are now AEAD-authenticated specifically to prevent off-path spoofing. An off-path attacker with the cleartext `session_id` (visible on every prior data packet) and the source UDP address can spoof heartbeat-flagged 64-byte headers from `peer_addr`, indefinitely defeating session-idle timeout and triggering false `failure_detector.heartbeat(...)` notifications. Either route heartbeats through the same AEAD-verify path as data packets, or document this as a known design limitation. (Worth verifying whether mesh has its own gate elsewhere before AAD-skip is concluded.)
+
+### 92. Redex `compact_to` keeps in-memory index offsets absolute while on-disk offsets become segment-relative — appends after retention sweep silently lost on restart
+**File:** `adapter/net/redex/disk.rs:917-1010` (offset rewrite at `~977`)
+
+`compact_to` rewrites surviving on-disk idx records with offsets *relative* to the new dat (`payload_offset.saturating_sub(dat_base) as u32`). The corresponding in-memory `state.index` entries are NOT renormalized — their offsets remain absolute in the segment's pre-compaction logical space. Subsequent appends route through `RedexEntry::new_heap(seq, offset_u32, ...)` which writes the absolute in-memory offset to disk verbatim. The on-disk idx file ends up with mixed semantics: pre-compaction records have small relative offsets, post-compaction records have large absolute offsets. On reopen, the recovery walk in `disk.rs::open` (~lines 247-266) detects every post-compaction record's `(offset+len)` exceeds `dat_len` and truncates the tail. Result: every event appended after a retention sweep is silently dropped on restart. Repro: persistent `RedexFile` with `retention_max_events=2`; append 5 entries → sweep → append 2 → reopen → last 2 gone. Fix requires either renormalizing in-memory index entries during `compact_to`, or storing offsets uniformly (always absolute, with a per-segment `dat_base`).
+
+### 93. Redex `compact_to` non-atomic three-rename sequence with no parent-dir fsync
+**File:** `adapter/net/redex/disk.rs:1086-1089`
+
+The atomic-rewrite pattern uses three sequential `std::fs::rename` calls (idx → dat → ts) without bracketing them in a single dirent flip and without fsyncing the parent directory afterward. A power loss between the first and second rename leaves the new (renormalized) idx alongside the old dat + old ts; on reopen, recovery's checksum verification fails for every entry because the new idx's offsets index into the wrong dat bytes, and all entries are dropped. On POSIX, even a successful series of renames is not durable until the directory inode is fsynced. Combined with #92, a crash during retention sweep can corrupt the entire segment with no recovery path. Either move to a single rename of a packed manifest, or fence the three renames inside an explicit dir-fsync.
+
+### 94. Redex `metadata()?` early-return mid-batch leaves orphaned idx/dat bytes without rollback
+**File:** `adapter/net/redex/disk.rs:638, 663, 802, 820`
+
+In both `append_entry_inner` and `append_entries_inner`, the `pre_*_len = file.metadata()?` lines use `?` to early-return. By that point, dat (and possibly idx) has already been written successfully. Only the rollback inside the explicit `if let Err(e) = file.write_all(...)` block performs file rollback — a `metadata()` error skips it entirely. The on-disk state ends up with orphaned idx/dat bytes; the caller is told the append failed and rolls back `next_seq` in memory. On restart, `read_timestamps` returns None for the length mismatch (idx longer than ts), so all recovered entries get `now()` as their timestamp and age-based retention silently breaks for the affected window. Replace each `?` with explicit error handling that triggers the existing rollback path before returning.
+
+### 95. Redex `sweep_retention` commits in-memory eviction even when `compact_to` fails
+**File:** `adapter/net/redex/file.rs:919-1003` (failure point ~line 991)
+
+`sweep_retention` mutates in-memory state (drains `index`, `timestamps`, calls `evict_prefix_to`) before invoking `disk.compact_to`. If `compact_to` fails, the function logs a warning and returns `Ok(())` — but in-memory state has already evicted the head, while on-disk dat/idx/ts still contain everything. On the next reopen, recovery replays the full on-disk state, resurrecting the entries that were just evicted in memory. The inline comment on ~line 992 acknowledges the divergence but treats it as benign; combined with #92 it becomes a corruption vector (post-failure appends now interleave with resurrected entries on disk). Either roll back in-memory eviction on `compact_to` failure, or perform the disk compaction first and only mutate in-memory state on success.
 
 ## Medium
 
