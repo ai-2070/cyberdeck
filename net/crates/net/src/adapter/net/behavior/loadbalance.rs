@@ -359,9 +359,23 @@ impl EndpointState {
 
     /// Returns true if new requests should be rejected for this endpoint.
     ///
-    /// When the recovery window has elapsed, exactly one request is admitted
-    /// as a probe (half-open state). All others continue to see the circuit
-    /// as open until the probe's outcome is recorded via `record_completion`.
+    /// **Pure predicate** (BUG #101): post-fix, this method has no
+    /// side effects. The half-open probe slot is claimed lazily at
+    /// selection time via [`try_claim_half_open_probe`] — only the
+    /// endpoint actually chosen by the selector claims the probe,
+    /// preventing the N-1 leaked-slot scenario the audit
+    /// described.
+    ///
+    /// Pre-fix this method had two roles: it tested whether the
+    /// circuit was open AND CAS-claimed the half-open probe slot
+    /// when the recovery window had elapsed. Since
+    /// `get_available_endpoints` calls this for every endpoint
+    /// being filtered, a multi-endpoint outage past its recovery
+    /// window had every endpoint claim the probe slot in the
+    /// scan, while only one (or zero) was selected. The N-1
+    /// others held a `half_open_probe == true` with no in-flight
+    /// request and no completion path — every subsequent
+    /// `is_circuit_open` then returned true forever.
     fn is_circuit_open(&self, recovery_time: Duration) -> bool {
         if !self.circuit_open.load(Ordering::Acquire) {
             return false;
@@ -373,11 +387,38 @@ impl EndpointState {
         if open_time.elapsed() < recovery_time {
             return true;
         }
-        // Recovery window elapsed — try to claim the single probe slot. If
-        // CAS fails, another probe is in flight and we keep rejecting.
+        // Recovery window has elapsed — the endpoint is admitting
+        // a half-open probe. If the probe slot is already taken,
+        // another request is in flight and we keep rejecting.
+        // Otherwise we admit (the caller will CAS-claim the slot
+        // via `try_claim_half_open_probe` only on the endpoint it
+        // actually selects).
+        self.half_open_probe.load(Ordering::Acquire)
+    }
+
+    /// Try to claim the half-open probe slot. Returns `true` if
+    /// claimed (caller is now the in-flight probe and MUST drive
+    /// the request to completion so `record_completion` clears
+    /// the flag), or `false` if another probe already holds it.
+    ///
+    /// Closes BUG #101 — the load balancer's selection path
+    /// claims this only on the chosen endpoint, never on the
+    /// filter-time scan.
+    fn try_claim_half_open_probe(&self) -> bool {
         self.half_open_probe
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
+            .is_ok()
+    }
+
+    /// Release the half-open probe slot without recording a
+    /// completion outcome. Used by the load balancer when a
+    /// selected endpoint's `try_record_request` fails (max-conn
+    /// cap, race with another selector) AFTER the probe was
+    /// claimed — without this, the probe slot would leak just
+    /// like the pre-fix code path. The next selection cycle will
+    /// re-test the circuit and may re-claim the slot.
+    fn release_half_open_probe(&self) {
+        self.half_open_probe.store(false, Ordering::Release);
     }
 }
 
@@ -682,8 +723,27 @@ impl LoadBalancer {
             // Atomically reserve the connection slot. If a concurrent
             // selector filled the cap, re-run selection against fresh state.
             if let Some(state) = self.endpoints.get(&selection.node_id) {
+                // BUG #101: claim the half-open probe slot ONLY on
+                // the endpoint we actually selected, AFTER the
+                // pure-predicate `is_circuit_open` check has
+                // already admitted the endpoint into `available`.
+                // This prevents the filter-time slot-leak the
+                // pre-fix code had on multi-endpoint outages.
+                //
+                // If the circuit is open + recovery elapsed +
+                // probe slot is free, we claim it. If we then fail
+                // `try_record_request` (max-conn cap, race), we
+                // release the probe slot so it doesn't leak — the
+                // next selection cycle can re-claim it.
+                let claimed_probe = state.circuit_open.load(Ordering::Acquire)
+                    && state.try_claim_half_open_probe();
                 if state.try_record_request(max_conn) {
                     return Ok(selection);
+                }
+                // try_record_request failed — release any probe
+                // slot we just claimed so it doesn't strand.
+                if claimed_probe {
+                    state.release_half_open_probe();
                 }
             }
         }
@@ -1732,5 +1792,97 @@ mod tests {
 
         // Breaker is now fully closed — subsequent requests go through.
         assert!(lb.select(&ctx).is_ok(), "successful probe closes breaker");
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #101: pre-fix
+    /// `is_circuit_open` was both a predicate AND CAS-claimed
+    /// the half-open probe slot when called past the recovery
+    /// window. `get_available_endpoints` calls it for every
+    /// endpoint being filtered; with N circuit-open endpoints
+    /// past their recovery window, all N got the probe slot
+    /// claimed but only one was actually selected. The N-1
+    /// others permanently held `half_open_probe == true` with
+    /// no in-flight request — every subsequent
+    /// `is_circuit_open` then returned true forever, and the
+    /// breaker never recovered until process restart.
+    ///
+    /// We pin the fix by:
+    ///   1. Building a load balancer with 3 endpoints.
+    ///   2. Tripping each endpoint's breaker.
+    ///   3. Waiting past the recovery window.
+    ///   4. Calling `select` once — this triggers
+    ///      `get_available_endpoints`, which scans all 3
+    ///      endpoints. Only the SELECTED endpoint should claim
+    ///      the probe slot; the other 2 must NOT.
+    ///   5. Asserting the unselected endpoints have
+    ///      `half_open_probe == false`.
+    #[test]
+    fn circuit_breaker_does_not_leak_probe_slot_on_multi_endpoint_scan() {
+        let config = LoadBalancerConfig {
+            strategy: Strategy::RoundRobin,
+            circuit_recovery_time_ms: 50,
+            ..Default::default()
+        };
+        let lb = LoadBalancer::new(config);
+        for i in 1..=3 {
+            lb.add_endpoint(Endpoint::new(make_node_id(i)));
+        }
+        let ctx = RequestContext::new();
+
+        // Trip every endpoint's breaker. Default failure
+        // threshold is 5 consecutive failures.
+        for _ in 0..5 {
+            for i in 1..=3 {
+                let nid = make_node_id(i);
+                // Manually trip via record_completion(false). We
+                // use a dummy connection-counter via select() to
+                // keep the connection counter consistent; if no
+                // endpoint is selectable, force it.
+                if let Some(ep) = lb.endpoints.get(&nid) {
+                    // Simulate a request lifecycle.
+                    ep.try_record_request(u32::MAX);
+                }
+                lb.record_completion(&nid, false);
+            }
+        }
+
+        // All breakers should be open. select() rejects pre-recovery.
+        assert!(
+            lb.select(&ctx).is_err(),
+            "all breakers open pre-recovery — select must fail"
+        );
+
+        // Wait past recovery window.
+        std::thread::sleep(Duration::from_millis(75));
+
+        // First select: scans all 3 endpoints. Selects ONE. The
+        // other 2 must NOT have their probe slots claimed.
+        let probe = lb.select(&ctx).expect("recovery elapsed → probe admitted");
+
+        // Audit the half_open_probe state on each endpoint:
+        // exactly one (the selected) should be true; the other
+        // two MUST be false. Pre-fix all three would be true.
+        let mut claimed = 0u32;
+        for i in 1..=3 {
+            let nid = make_node_id(i);
+            let ep = lb.endpoints.get(&nid).unwrap();
+            if ep.half_open_probe.load(Ordering::Acquire) {
+                claimed += 1;
+                // The claimed slot must be on the selected endpoint.
+                assert_eq!(
+                    nid, probe.node_id,
+                    "only the selected endpoint may have its probe slot claimed"
+                );
+            }
+        }
+        assert_eq!(
+            claimed, 1,
+            "exactly one endpoint should have a claimed probe slot — \
+             pre-fix this was 3 (the filter-time scan claimed all)"
+        );
+
+        // Probe success → selected endpoint's breaker closes;
+        // the other two are still in their post-recovery state.
+        lb.record_completion(&probe.node_id, true);
     }
 }

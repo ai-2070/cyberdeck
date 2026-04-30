@@ -1243,12 +1243,29 @@ impl SafetyEnforcer {
 
     /// Release resources (called by ResourceGuard on drop)
     fn release(&self, claim: &ResourceClaim) {
-        self.usage
-            .concurrent
-            .fetch_sub(claim.concurrent_slots, Ordering::Relaxed);
-        self.usage
-            .memory_mb
-            .fetch_sub(claim.memory_mb, Ordering::Relaxed);
+        // BUG #102: previously this used raw `fetch_sub` on
+        // `concurrent` and `memory_mb`. `acquire()` short-circuits
+        // in `EnforcementMode::Disabled` and returns a guard
+        // WITHOUT incrementing those counters; the matching
+        // release would then `fetch_sub` from a counter at 0,
+        // wrapping it to ~`u32::MAX`. The next `Enforce`-mode
+        // `acquire` would see `current.saturating_add(claim) >
+        // max_concurrent` and reject every request forever (mode
+        // is hot-swappable via `update_envelope`, so warm-up in
+        // `Disabled` then flip to `Enforce` was the real-world
+        // trigger). The matching tokens/cost paths already use
+        // `fetch_update` + `saturating_sub` for exactly this
+        // reason; mirror that here.
+        let _ = self.usage.concurrent.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(claim.concurrent_slots)),
+        );
+        let _ = self.usage.memory_mb.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(claim.memory_mb)),
+        );
         // Release tokens and cost that were acquired — without this,
         // both counters grow monotonically, hitting limits prematurely.
         let _ = self
@@ -1860,6 +1877,71 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #102: pre-fix
+    /// `release()` used raw `fetch_sub` on `concurrent` and
+    /// `memory_mb`. `acquire()` short-circuits in `Disabled`
+    /// mode WITHOUT incrementing those counters; the matching
+    /// release would then `fetch_sub` from 0, wrapping `u32` to
+    /// ~4 billion. The next `Enforce`-mode `acquire` would see
+    /// the wrapped value, decide the cap was exceeded, and reject
+    /// every request forever (envelope is hot-swappable at
+    /// runtime — operators warm-up in `Disabled` then flip).
+    ///
+    /// We pin the fix by:
+    ///   1. Building an enforcer in `Disabled` mode.
+    ///   2. Acquiring + dropping a guard with non-zero claim.
+    ///   3. Asserting `concurrent` and `memory_mb` are still 0
+    ///      (saturating_sub kept them clamped).
+    ///   4. Switching to `Enforce` mode and acquiring again to
+    ///      confirm the next acquire path doesn't see a wrapped
+    ///      counter.
+    #[test]
+    fn release_does_not_underflow_concurrent_or_memory_in_disabled_mode() {
+        let enforcer = Arc::new(SafetyEnforcer::with_envelope(SafetyEnvelope {
+            mode: EnforcementMode::Disabled,
+            ..Default::default()
+        }));
+        let req = SafetyRequest::new();
+        let claim = ResourceClaim::new()
+            .with_concurrent(5)
+            .with_memory_mb(100);
+
+        // Acquire (no-op in Disabled — counters stay at 0) +
+        // drop (release runs, would have wrapped u32 to ~4B
+        // pre-fix).
+        let guard = enforcer.acquire(&req, claim).unwrap();
+        drop(guard);
+
+        let stats = enforcer.usage();
+        assert_eq!(
+            stats.concurrent, 0,
+            "concurrent must stay clamped at 0 when releasing in \
+             Disabled mode (pre-fix this wrapped to u32::MAX-4)"
+        );
+        assert_eq!(
+            stats.memory_mb, 0,
+            "memory_mb must stay clamped at 0 when releasing in \
+             Disabled mode (pre-fix this wrapped to u32::MAX-99)"
+        );
+
+        // Hot-swap to Enforce. The next acquire must NOT see a
+        // wrapped counter — it must see 0 and admit the request.
+        let new_envelope = SafetyEnvelope {
+            mode: EnforcementMode::Enforce,
+            ..Default::default()
+        };
+        enforcer.update_envelope(new_envelope);
+
+        let req2 = SafetyRequest::new();
+        let claim2 = ResourceClaim::new().with_concurrent(1);
+        // Pre-fix: this would error with `ResourceLimitExceeded`
+        // because the wrapped counter exceeded `max_concurrent`.
+        let guard2 = enforcer
+            .acquire(&req2, claim2)
+            .expect("Enforce-mode acquire after a Disabled-mode release must succeed");
+        drop(guard2);
     }
 
     #[test]

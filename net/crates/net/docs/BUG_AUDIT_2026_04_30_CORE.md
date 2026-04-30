@@ -31,7 +31,7 @@ Extended scope (#121 onward): a fourth multi-agent sweep covered the subtrees ex
 
 ## Status (running tally)
 
-**Outstanding:** #55, #56, #57, #58, #59, #60, #61, #62, #63, #64, #65, #66, #67, #68, #69, #70, #71, #72, #73, #74, #75, #76, #77, #78, #79, #98, #99, #100, #101, #102, #103, #104, #105, #106, #107, #108, #109, #110, #111, #112, #113, #114, #115, #116, #117, #118, #119, #120, #121, #122, #123, #124, #125, #126, #127, #128, #129, #130, #131, #132, #133, #134, #135, #136, #137, #138, #139, #140, #141, #142, #143, #144, #145, #146, #147, #148, #149, #150, #151, #152
+**Outstanding:** #55, #56, #57, #58, #59, #60, #61, #62, #63, #64, #65, #66, #67, #68, #69, #70, #71, #72, #73, #74, #75, #76, #77, #78, #79, #98, #100, #104, #105, #106, #107, #108, #109, #110, #111, #112, #113, #114, #115, #116, #117, #118, #119, #120, #121, #122, #123, #124, #125, #126, #127, #128, #129, #130, #131, #132, #133, #134, #135, #136, #137, #138, #139, #140, #141, #142, #143, #144, #145, #146, #147, #148, #149, #150, #151, #152, #153, #154, #155
 
 **Fixed on 2026-04-30 (with regression tests where reasonable):**
 - **#80** — `Net::shutdown` now routes through `EventBus::shutdown_via_ref(&self)`, an idempotent reference-based shutdown that runs regardless of outstanding `Arc<EventBus>` clones. Tests: `sdk/tests/shutdown_regression.rs::{shutdown_runs_even_with_outstanding_event_stream, shutdown_via_ref_is_idempotent}`.
@@ -53,6 +53,10 @@ Extended scope (#121 onward): a fourth multi-agent sweep covered the subtrees ex
 - **#89** — `RoutingTable::record_in/out/drop` now gate insertions on a soft cap of `MAX_STREAM_STATS = 65_536` (set at `route.rs`). Existing entries always continue to record; novel `stream_id`s are only admitted while the map is below the cap. `cleanup_idle_streams` reclaims slots for legitimate streams as they idle out, after which new IDs may be admitted again. Tests: `route::tests::{record_in_stops_admitting_new_streams_at_cap, cap_admits_new_streams_after_cleanup_reclaims_slots}`.
 - **#91** — `analyze_subnet_correlation` now sorts `subnet_counts` entries by `(depth desc, subnet_id asc)` before scanning for the threshold-meeting subnet. Ties at the same depth resolve to the lower `SubnetId` (derived `Ord` on the inner `u32`) deterministically across process invocations — pre-fix, hash iteration order picked an arbitrary winner. Test: `correlation::tests::ties_resolve_deterministically_across_runs` (32-iteration loop with two equally-deep subnets at threshold).
 - **#81** — implicitly fixed by #80 (entry already updated above to reflect this).
+- **#99** — `SuperpositionState::continuity_proof` previously used `head.parent_hash` as the proof's hash but anchored `from_seq`/`to_seq` at `head.sequence`. Since `parent_hash` is the forward hash of the *previous* event (event at `sequence - 1`), the verifier (`compute_parent_hash` of event AT from_seq) would never match. The fix anchors at `head.sequence - 1` so the seq aligns with the hash bytes. Pre-fix also mixed identities when `target.seq < source.seq` (`from_seq` was target's but `from_hash` was source's parent_hash); the new lo/hi-by-seq pattern picks the head matching each anchor. Tests: `superposition::tests::test_continuity_proof` (updated assertions), `superposition::tests::continuity_proof_round_trips_through_entity_log` (new — builds a real `EntityLog` via `CausalChainBuilder`, derives a SuperpositionState from it, and verifies the resulting proof against the log; pre-fix this fails with `HashMismatch`).
+- **#101** — `EndpointState::is_circuit_open` is now a pure predicate (no side effects). The half-open probe slot is claimed lazily at selection time via the new `try_claim_half_open_probe` method, called only on the endpoint actually chosen by the selector. If `try_record_request` then fails (max-conn cap, race), the new `release_half_open_probe` reverts the claim so it doesn't strand. Pre-fix, `is_circuit_open`'s CAS-claim ran during the filter scan over all endpoints — a multi-endpoint outage past its recovery window claimed the probe slot on every candidate, while only one was selected; the N-1 others were stranded forever. Tests: `loadbalance::tests::circuit_breaker_does_not_leak_probe_slot_on_multi_endpoint_scan` (3-endpoint outage; recovery elapses; one select call must claim the probe slot on EXACTLY one endpoint, not all three). All 23 existing loadbalance tests still pass.
+- **#102** — `SafetyEnforcer::release` now uses `fetch_update` + `saturating_sub` for `concurrent` and `memory_mb`, mirroring the tokens/cost paths. Pre-fix `release` ran raw `fetch_sub`; combined with `Disabled`-mode `acquire` (which short-circuits without incrementing those counters), a release in `Disabled` mode would underflow `u32` to ~4 billion. Hot-swapping to `Enforce` then made every subsequent acquire fail with `ResourceLimitExceeded` until process restart. Test: `safety::tests::release_does_not_underflow_concurrent_or_memory_in_disabled_mode` (acquire+drop in Disabled, hot-swap to Enforce, acquire again — must succeed).
+- **#103** — `StandbyGroup::promote` now searches for `best_standby` BEFORE mutating the old active's role/health. Pre-fix it marked the old active `Unhealthy`/`Standby` first, then searched; on `NoHealthyMember` it returned `Err` but left the group with a demoted, unhealthy "active" pointer. `on_node_recovery` only restores health, not the `Active` role, so the group was silently demoted forever. Test: `standby_group::tests::promote_does_not_half_mutate_on_no_healthy_member` (3-member group, mark all standbys unhealthy, promote → asserts `NoHealthyMember` AND that the active's role/health/index are unchanged).
 
 **Refuted on verification:** #96 (`read_timestamps` torn-tail alignment — alignment is preserved by construction, see entry).
 
@@ -699,6 +703,33 @@ In the `RateLimited` arm: each thread reads `count.load`, compares to `max_per_s
 ### 152. `validate_chain` accepts diffs where `new_version <= base_version` (forward roll-back)
 `adapter/net/behavior/diff.rs:649-675` — chains `prev.new_version == curr.base_version` and `prev.timestamp_ns <= curr.timestamp_ns`, but does not check `curr.new_version > curr.base_version` within a single diff. A peer can ship `base_version=5, new_version=3` (a "rollback while applying ops"), and validation accepts it; combined with #125 (no version check in `apply`), a receiver advances state forward but its tracked version goes backward. Add the within-diff `new_version > base_version` assertion.
 
+### 153. `remove_shard_internal` flushes stranded events with `sequence_start = 0`, colliding with the original BatchWorker's first batch under JetStream dedup
+**File:** `bus.rs:401-411`
+
+```rust
+let batch = crate::event::Batch::new(shard_id, stranded, 0);
+let dispatched = dispatch_batch(&*self.adapter, batch, shard_id, ...).await;
+```
+
+The hardcoded `0` is the new batch's `sequence_start`. Every `BatchWorker` for a given `shard_id` also starts its sequence at 0 (`shard/batch.rs:163`). The JetStream adapter builds `Nats-Msg-Id = {nonce}:{shard_id}:{sequence_start}:{i}` (`adapter/jetstream.rs:281`). The shard's *original* first batch wrote msg-ids `{nonce}:{sid}:0:{i}`; this stranded-flush batch writes the same ids. JetStream's default 2-min dedup window silently discards them — the events that the post-#47 fix went out of its way to recover are then thrown away by the adapter. Severity: **high** — extension of #9 / #17 / #56 to the `remove_shard_internal` path, which post-#47 fix is the *primary* place stranded events meet the adapter. Fix: thread the BatchWorker's last `next_sequence` through `remove_shard_internal` (it already drops the worker handle at line 395 — capture the sequence before that), or use a sentinel sequence (e.g. `u64::MAX`) reserved for stranded-flush.
+
+### 154. `finalize_draining` declares emptiness from ring-buffer fill alone, ignoring the per-shard mpsc channel and the BatchWorker's pending batch
+**File:** `shard/mapper.rs:912-944`
+
+The predicate is `fill_ratio == 0.0 && pushes_since_drain_start == 0`. Both probes look only at the ring buffer / producer-side counter. The drain worker pumps from the ring buffer into a per-shard mpsc channel (cap 1024, `bus.rs:315`); the BatchWorker assembles `current_batch` from that channel. Neither the channel depth nor `BatchWorker.current_batch.len()` enters the predicate. So a Draining shard can finalize → `on_shard_removed` fires → `remove_shard_internal` runs while the BatchWorker still has events in flight. Combined with #153, those in-flight events race the stranded-flush batch through dedup — and since `remove_shard_internal` drops the BatchWorker `JoinHandle` (line 395) without awaiting it, the worker can also be cut short mid-`on_batch`. Severity: **medium**. Fix: track per-shard `pending_in_channel` (incremented on `tx.send`, decremented on `rx.recv` in the batch worker) and require it == 0 alongside the existing checks; alternatively, await the `JoinHandle` in `remove_shard_internal` before invoking the stranded-flush dispatch.
+
+### 155. `events_unrouted` is double-counted as `events_dropped` in `ingest_raw_batch` bus stats
+**File:** `bus.rs:548-567` (interaction with `shard/mod.rs:617-620`)
+
+```rust
+let total = events.len();
+let success = self.shard_manager.ingest_raw_batch(events);
+let dropped = total.saturating_sub(success);
+if dropped > 0 { self.stats.events_dropped.fetch_add(dropped as u64, ...); }
+```
+
+Inside `ingest_raw_batch`, routing-miss events (concurrent scale-down removed the chosen shard) increment `events_unrouted` on the manager — #44 introduced exactly this distinction so callers can tell routing failures from buffer-fullness drops. But the bus then reads `total - success`, sees the unrouted events as missing-from-success, and bumps `events_dropped` for them too. The same event is now counted once in `events_unrouted` and once in `events_dropped` in the public stats surfaced through `bus.stats()`; SDK consumers reading `Stats::events_dropped` over-report backpressure-class drops by exactly the unrouted count. Severity: **low** (cosmetic stats divergence; no event-loss impact). Fix: change `ShardManager::ingest_raw_batch` to return both counts (`success`, `unrouted`) so the bus subtracts `unrouted` from `dropped` before publishing.
+
 ---
 
 ## Notably clean
@@ -741,6 +772,8 @@ In the `RateLimited` arm: each thread reads `count.load`, compares to `max_per_s
 32. **#126** — `Tasks/MemoriesAdapter::ingest_typed` advances `app_seq` before successful append (phantom seq on failure, snowballs into duplicate keys on cross-handle restore)
 33. **#131** — Subprotocol manifest exposes forwarding-only entries as locally-handled (silent RPC drop)
 34. **#132** — `read_manifest_entry` accepts `min_compatible > version` (peer can blacklist subprotocols at will)
+35. **#153** — stranded-flush batch from `remove_shard_internal` collides with original first-batch msg-ids under JetStream dedup (the recovery path #47 was added for now silently throws those events away)
+36. **#154** — `finalize_draining` ignores mpsc channel + BatchWorker pending; combined with #153, the BatchWorker can be cut short while events are still mid-flight
 
 ## Out of scope (deferred)
 
