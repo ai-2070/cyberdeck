@@ -52,17 +52,23 @@ The two-phase shard add introduced by #46's fix (`provision → spawn workers + 
 
 The drain worker for the orphaned id then loops indefinitely on an empty ring buffer — its `with_shard` call still finds the entry (it's mapped, just `Provisioning`), and `select_shard` skips Provisioning so producer pushes never reach the buffer — burning a 100µs sleep per cycle until process shutdown. The mapper's `next_shard_id` stays advanced, so a subsequent retry allocates a higher id while the dead one squats. The compounding hazard is repeated scale-ups: each failed `activate_shard` adds another zombie drain worker and another orphan provisioning entry. Mirror `remove_shard_internal`'s teardown: on `activate_shard` Err, drop the sender, abort both join handles, and call `remove_shard` to unmap the provisioning entry before returning.
 
-### 80. `Net::shutdown` silently no-ops when any `Arc<EventBus>` clone is outstanding
+### 80. `Net::shutdown` discards the `Arc<EventBus>` and skips `bus.shutdown()` when any clone is outstanding (verified)
 **File:** `sdk/src/net.rs:236-246`
 
 ```rust
-match Arc::try_unwrap(self.bus) {
-    Ok(bus) => bus.shutdown().await?,
-    Err(_) => Err(SdkError::Adapter("cannot shutdown: outstanding references exist".into())),
+pub async fn shutdown(self) -> Result<()> {
+    match Arc::try_unwrap(self.bus) {
+        Ok(bus) => bus.shutdown().await?,
+        Err(_) => Err(SdkError::Adapter("cannot shutdown: outstanding references exist".into())),
+    }
 }
 ```
 
-When `Arc::try_unwrap` fails, `bus.shutdown()` is never invoked. Background tasks keep running, pending events in ring buffers are silently lost, and the adapter's `flush()` / `shutdown()` never executes. The SDK's `subscribe` (#81) clones the inner Arc into every `EventStream`, so the failure mode is the default for any caller that ever subscribed and then attempts a graceful shutdown. The mesh-FFI side has an explicit regression test (`net_mesh_shutdown_runs_even_with_outstanding_arc_refs`) for this exact pattern — the SDK still has the legacy gating. Mirror the FFI fix: signal shutdown via a flag on the inner `Arc` rather than gating on `try_unwrap`, and let outstanding-handle paths consume the signal.
+The user does receive an `Err` (not a silent return), but the `Err(_)` arm **drops the `Arc` returned by `try_unwrap`** rather than retrying or signalling shutdown via the inner state — the only effect on the bus is decrementing the strong count by one. `bus.shutdown()` is never invoked, so the drain barrier doesn't run, the adapter's `flush()` / `shutdown()` never execute, background tasks keep running, and any pending events in ring buffers ride on the bus's normal `Drop` semantics whenever the last `Arc` clone happens to be released. There is no SDK escape hatch — no `shutdown_async`-after-flush, no synchronous drain primitive — so a caller that ever subscribed (which always perpetuates an Arc clone via `EventStream`, see #81) is stuck.
+
+**Verification (2026-04-30):** read `sdk/src/net.rs:191-193` and `:236-246`. Confirmed `EventStream::new(self.bus.clone(), opts)` clones the Arc on every subscribe, and the `Err(_)` arm above takes ownership of the Arc back from `try_unwrap` only to drop it — no inner-flag signalling exists.
+
+The mesh-FFI side has an explicit regression test (`net_mesh_shutdown_runs_even_with_outstanding_arc_refs`) for this exact pattern; the SDK still has the legacy gating. Mirror the FFI fix: signal shutdown via a flag on the inner `Arc` rather than gating on `try_unwrap`, and let outstanding-handle paths consume the signal as they finish their work.
 
 ### 81. `Net::subscribe` perpetuates `Arc<EventBus>` clones, making #80 the default outcome
 **File:** `sdk/src/net.rs:191-193`
@@ -92,10 +98,25 @@ if parsed.header.flags.is_heartbeat() {
 
 The mesh dispatch loop fast-paths `is_heartbeat()` packets — touching the failure detector and session timestamp — without invoking AEAD verification. The legacy single-peer adapter (`mod.rs:642-663`) explicitly verifies the tag for the same packet shape, and the comment on `pool.rs:237-249` claims heartbeats are now AEAD-authenticated specifically to prevent off-path spoofing. An off-path attacker with the cleartext `session_id` (visible on every prior data packet) and the source UDP address can spoof heartbeat-flagged 64-byte headers from `peer_addr`, indefinitely defeating session-idle timeout and triggering false `failure_detector.heartbeat(...)` notifications. Either route heartbeats through the same AEAD-verify path as data packets, or document this as a known design limitation. (Worth verifying whether mesh has its own gate elsewhere before AAD-skip is concluded.)
 
-### 92. Redex `compact_to` keeps in-memory index offsets absolute while on-disk offsets become segment-relative — appends after retention sweep silently lost on restart
-**File:** `adapter/net/redex/disk.rs:917-1010` (offset rewrite at `~977`)
+### 92. Redex `compact_to` keeps in-memory index offsets absolute while on-disk offsets become segment-relative — appends after retention sweep silently lost on restart (verified)
+**File:** `adapter/net/redex/disk.rs:917-1010` (offset rewrite at `:977-979`); caller `adapter/net/redex/file.rs:919-1003` (sweep) and `:368-414` (append); recovery walk `adapter/net/redex/disk.rs:245-269`
 
-`compact_to` rewrites surviving on-disk idx records with offsets *relative* to the new dat (`payload_offset.saturating_sub(dat_base) as u32`). The corresponding in-memory `state.index` entries are NOT renormalized — their offsets remain absolute in the segment's pre-compaction logical space. Subsequent appends route through `RedexEntry::new_heap(seq, offset_u32, ...)` which writes the absolute in-memory offset to disk verbatim. The on-disk idx file ends up with mixed semantics: pre-compaction records have small relative offsets, post-compaction records have large absolute offsets. On reopen, the recovery walk in `disk.rs::open` (~lines 247-266) detects every post-compaction record's `(offset+len)` exceeds `dat_len` and truncates the tail. Result: every event appended after a retention sweep is silently dropped on restart. Repro: persistent `RedexFile` with `retention_max_events=2`; append 5 entries → sweep → append 2 → reopen → last 2 gone. Fix requires either renormalizing in-memory index entries during `compact_to`, or storing offsets uniformly (always absolute, with a per-segment `dat_base`).
+`compact_to` rewrites surviving on-disk idx records with offsets *relative* to the new dat (`e.payload_offset = (entry.payload_offset as u64).saturating_sub(dat_base) as u32` at `disk.rs:977-979`). The local `e` is a copy; the corresponding in-memory `state.index` entries are NOT renormalized — their `payload_offset` fields remain absolute in the segment's pre-compaction logical space. The next append computes `offset = state.segment.base_offset() + current_live` (`file.rs:384-388`), which is also absolute (because `evict_prefix_to(new_base)` advanced `base_offset` to the surviving entry's old absolute position), and writes that value verbatim to disk via `entry.to_bytes()` in `append_entry_inner` (`disk.rs:639`). The on-disk idx ends up with mixed semantics: pre-compaction records have small relative offsets, post-compaction records have large absolute offsets that index past the end of the new dat. On reopen, the torn-tail recovery walk (`disk.rs:245-269`) detects every post-compaction record's `(offset+len) > dat_len` and truncates the tail.
+
+**Verification (2026-04-30):** read disk.rs and file.rs end-to-end and traced concretely:
+
+- Setup: `retention_max_events=2`, append 5×100-byte heap entries (seq 0–4). Pre-sweep state: `segment.base_offset=0`, `live_bytes=500`, in-mem index offsets `[0,100,200,300,400]`, on-disk idx mirrors.
+- `sweep_retention` (`file.rs:919-1003`): `state.index.drain(..3)` leaves `[(seq=3,off=300),(seq=4,off=400)]` with **absolute** offsets retained; `state.segment.evict_prefix_to(300)` advances `base_offset` to 300; `dat_base = state.segment.base_offset() = 300` (`file.rs:989`); `compact_to(clone, ts, 300)` writes new on-disk idx with offsets `[0, 100]` (relative) and 200-byte new dat — but `state.index` is unchanged.
+- Next append (seq=5, 100 bytes): `offset = 300 + 200 = 500` (`file.rs:387`); `disk.append_entry_at` writes `(seq=5, off=500, len=100)` verbatim. On-disk dat now 300 bytes; idx now `[(off=0,len=100),(off=100,len=100),(off=500,len=100)]`.
+- Reopen (`disk.rs:245-269`): walking backward, seq=5 has `end=500+100=600 > dat_len=300` → torn → `truncate_at = 2`. seq=4 has `end=200 ≤ 300` → break. `index.truncate(2)` — seq=5 silently dropped.
+
+The existing regression test `sweep_retention_persists_eviction_to_disk` (`file.rs:2373`) appends 5 → sweeps → closes → reopens, but does **not** append between sweep and close, so it does not exercise this path.
+
+Fix options:
+1. Renormalize `state.index` entries during `sweep_retention` (subtract the same `dat_base` from each surviving entry's `payload_offset` before releasing the lock), so subsequent appends land on a 0-based segment.
+2. Or change `compact_to` to leave on-disk offsets **absolute** as well (skip the `saturating_sub(dat_base)`) and store `dat_base` in a per-segment header that the recovery walk consults — this avoids touching in-memory state but requires a header format change.
+
+Option 1 is the smaller delta. Option 2 keeps the format consistent with the in-memory representation and avoids any future drift.
 
 ### 93. Redex `compact_to` non-atomic three-rename sequence with no parent-dir fsync
 **File:** `adapter/net/redex/disk.rs:1086-1089`
