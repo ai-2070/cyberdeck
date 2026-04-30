@@ -1,0 +1,23 @@
+net/crates/net/src/adapter/net/redex/disk.rs
+  e06e3b5ea7554152 465-494,1842-1864,1866-2012
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "986ca6b2c38241e695f14a07051b9df1445bfe40",
+  "prompts": {
+    "e06e3b5ea7554152": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e445b28f-7533-44eb-8f11-403766bd7b19",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 2226,
+      "total_deletions": 0,
+      "accepted_lines": 200,
+      "overriden_lines": 1
+    }
+  }
+}
