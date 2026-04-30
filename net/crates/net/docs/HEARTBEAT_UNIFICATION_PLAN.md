@@ -1,127 +1,128 @@
-# Heartbeat Unification Plan — 2026-04-30
+# Heartbeat Unification Plan — 2026-04-30 (revised)
 
-The same primitive — "AEAD-tagged keep-alive packet for a session" — has three independent implementations in the tree. They have the same shape on the wire and overlapping (but inconsistent) verification logic. The audit findings #11, #85, and #97 are all symptoms of the duplication; #56 / #106 / #97 also rhyme. This plan replaces the three implementations with one helper on `NetSession` and reduces every call site to a single line.
+The same primitive — "AEAD-tagged keep-alive packet for a session" — used to have three independent implementations in the tree, with the same wire shape but inconsistent verification logic. Audit findings #11, #85, and #97 were all symptoms.
 
-## Current state
+**Update (post-implementation):** the security-critical correctness bugs have been fixed. Heartbeats are now built and verified consistently on the wire. The remaining unification work is cleanup — removing duplicated code paths and locking the API door so the bugs cannot recur. This document tracks what changed vs. the original plan and what's still open.
 
-Three call sites for build, two for verify:
+## Current state (post-fix)
 
-| Path | Build site | Verify site |
-|---|---|---|
-| Legacy `NetAdapter` | `adapter/net/mod.rs:841` — `PacketBuilder::new(&[0u8;32], session.session_id())` (zero key, **#97**) | `adapter/net/mod.rs:642-664` — full AEAD verify via `session.rx_cipher` (correct since **#11** fix) |
-| Mesh `MeshNode` | `adapter/net/mesh.rs:3170` — same zero-key shape as legacy | `adapter/net/mesh.rs:2367-2371` — fast-path **skips** AEAD verify (**#85**), then touches `failure_detector` + session |
-| Pool primitive | `adapter/net/pool.rs:251-281` — `PacketBuilder::build_heartbeat()` (correct given a correctly-keyed builder) | n/a |
-
-What `NetSession` exposes today (`adapter/net/session.rs`): `tx_cipher()`, `rx_cipher()`, `touch()`, `thread_local_pool()`. **No** "build a heartbeat for this session" helper, **no** "verify this inbound heartbeat" helper. Every call site reassembles the primitive in-line; that is why two of the three reach the same wrong key.
-
-## Goal
-
-One blessed way to (a) build a heartbeat for a session, (b) verify-and-observe an inbound heartbeat. After this lands, every call site is a single function call and bugs #11, #85, #97 cannot be reintroduced without a structural change to `NetSession`.
-
-## Proposed API
-
-Add two methods to `NetSession` (`adapter/net/session.rs`):
+Send side, both call sites identical:
 
 ```rust
-impl NetSession {
-    /// Build an authenticated heartbeat packet for this session.
-    /// AEAD-encrypts an empty payload under the session's TX cipher and
-    /// assigns the next TX counter. Routed through `thread_local_pool` so
-    /// the counter is shared with the data-path builders (closes #106).
-    pub fn build_heartbeat(&self) -> Result<Vec<u8>, BuildError>;
+let mut pooled = session.thread_local_pool().get();
+let packet = pooled.build_heartbeat();
+```
 
-    /// Verify an inbound heartbeat. On success: validates source matches
-    /// `peer_addr`, the counter is in the rx replay window, AEAD tag
-    /// verifies, then commits the counter and refreshes `last_activity`.
-    /// On failure: returns an error and does NOT mutate session state.
-    pub fn verify_inbound_heartbeat(
-        &self,
-        parsed: &ParsedPacket,
-        source: SocketAddr,
-    ) -> Result<(), VerifyError>;
+- Legacy: `adapter/net/mod.rs:888-889` (in `spawn_heartbeat`).
+- Mesh: `adapter/net/mesh.rs:3380-3381` (in `spawn_heartbeat_loop`).
+
+Both now use the session's `thread_local_pool` — the same pool the data path uses, so heartbeats and data share a single TX counter. This closes both the wrong-key half of #97 and the counter-conflict variant: a fresh `PacketBuilder::new(&[0u8;32], ...)` builder owned its own counter starting at 0, so successive heartbeats reused counter=0 and the receiver replay-rejected every heartbeat after the first. Pinned by `aead_authenticated_heartbeat_passes_verification` (`mesh.rs:7407`) and the `process_packet` heartbeat suite (`mod.rs:1786`).
+
+Receive side, two implementations of the same logic:
+
+| Path | Location | Shape |
+|---|---|---|
+| Legacy `NetAdapter` | `mod.rs:659-680` (22 lines, inline) | full AEAD verify: source check → counter validity → decrypt → counter commit → touch |
+| Mesh `MeshNode` | `mesh.rs:2500-2522` calls free fn `verify_heartbeat_aead(&parsed, &session)` at `mesh.rs:760-771` | same logic minus the source check (handled upstream by session lookup) and minus the touch (caller does it explicitly so `failure_detector.heartbeat` runs first) |
+
+Both pass identical regression tests: `unauthenticated_heartbeat_fails_verification` (`mesh.rs:7424`) and the `process_packet` heartbeat suite. **The bugs are closed.** What remains is two implementations that should be one.
+
+`Session` API surface (`adapter/net/session.rs`) post-fix:
+- `rx_cipher()` exposed at line 201.
+- `thread_local_pool()` exposed at line 622.
+- `tx_cipher()` **removed** — no longer in the public API.
+- `packet_pool()` getter **removed** — there is now exactly one pool reachable per session.
+
+The two latent footguns behind #106 (parallel pools, parallel ciphers) are gone. The remaining heartbeat unification is purely cosmetic: collapse the two-line build pattern into one method and the duplicated verify into one call.
+
+## Outstanding work
+
+The four steps below are *cleanup* — they do not fix new bugs, but they remove ~30 lines of duplication and prevent regression.
+
+### Step 1 — Move `verify_heartbeat_aead` from `mesh.rs` to `session.rs` (or to a shared module) and rewrite the legacy receive path to call it
+
+`verify_heartbeat_aead` (`mesh.rs:760-771`) is a free function that operates on `(&ParsedPacket, &NetSession)`. It belongs alongside the session it verifies against, not inside the mesh module. Moving it (and exposing it `pub(crate)`) lets the legacy path replace 22 lines (`mod.rs:659-680`) with:
+
+```rust
+if parsed.header.flags.is_heartbeat() {
+    if source != session.peer_addr() {
+        return;
+    }
+    if !verify_heartbeat_aead(&parsed, &session) {
+        return;
+    }
+    session.touch();
+    return;
 }
 ```
 
-Design choices:
-- `build_heartbeat` returns owned bytes; per-peer fan-out in mesh stays at the caller.
-- `verify_inbound_heartbeat` performs the side effects internally (`update_rx_counter` + `touch`) so callers cannot get the order wrong.
-- The function does **not** touch `failure_detector` — that observation is mesh-specific and stays at the call site, immediately after a successful verify.
-- `BuildError` / `VerifyError` are local to `session.rs` and convert into the existing adapter-level error types.
+Why keep the source check at the call site, not inside the helper: mesh dispatch resolves the session by `session_id` first (so it doesn't have a single canonical "expected source"), while the legacy adapter has exactly one peer per session. Centralizing the source check would force the helper to either accept `Option<SocketAddr>` or duplicate again. The cheapest fix is to leave the source-check at the legacy call site and let the helper own the AEAD-only portion that's actually shared.
 
-## Migration
+### Step 2 — Wrap the build-side two-liner in `NetSession::build_heartbeat()`
 
-1. **Implement** `NetSession::build_heartbeat` and `verify_inbound_heartbeat` (`adapter/net/session.rs`). Both are thin wrappers — `build_heartbeat` calls `self.thread_local_pool.build_heartbeat(...)`; `verify_inbound_heartbeat` lifts the verify sequence verbatim from `mod.rs:642-664`.
-2. **Legacy send.** Replace `adapter/net/mod.rs:841-842`:
-   ```rust
-   // before
-   let mut builder = PacketBuilder::new(&[0u8; 32], session.session_id());
-   let packet = builder.build_heartbeat();
-   // after
-   let packet = session.build_heartbeat()?;
-   ```
-3. **Legacy receive.** Replace the body of the heartbeat fast-path at `mod.rs:642-664` with:
-   ```rust
-   if parsed.header.flags.is_heartbeat() {
-       if session.verify_inbound_heartbeat(&parsed, source).is_err() {
-           return;
-       }
-       return;
-   }
-   ```
-4. **Mesh send.** Replace `mesh.rs:3170-3172` with `let packet = session.build_heartbeat()?;`. The per-peer loop scaffolding (cadence, shutdown gate, partition filter) stays — only the primitive changes.
-5. **Mesh receive.** Replace `mesh.rs:2367-2371` with:
-   ```rust
-   if parsed.header.flags.is_heartbeat() {
-       if session.verify_inbound_heartbeat(&parsed, source).is_err() {
-           return;
-       }
-       failure_detector.heartbeat(peer_node_id, source);
-       return;
-   }
-   ```
-   This is the only structural difference between the two receive paths after unification: mesh has one extra line for the failure detector.
-6. **Lock the door.** Demote `PacketBuilder::new` from `pub` to `pub(crate)` (`adapter/net/pool.rs`). Heartbeats already go through `Session`; data-path builders go through the pool. No legitimate external caller needs raw key bytes. This is the structural guarantee that #97-shape bugs cannot recur.
-7. **Drop the dead getter** `Session::packet_pool()` (`session.rs:562`) and the parallel `tx_cipher` if unused after step 1 — both are the latent surface area behind #106. If any caller surfaces, route it through the unified API instead of re-exposing the raw cipher.
+Both call sites do:
+```rust
+let mut pooled = session.thread_local_pool().get();
+let packet = pooled.build_heartbeat();
+```
 
-## Test plan
+Replace with:
+```rust
+impl NetSession {
+    pub fn build_heartbeat(&self) -> Bytes {
+        self.thread_local_pool().get().build_heartbeat()
+    }
+}
+```
 
-- **Round-trip:** `Session::build_heartbeat` for an init session, `verify_inbound_heartbeat` on the responder session, assert `Ok(())` and `last_activity` advanced. Pin #97.
-- **Tag tamper:** flip one byte of the built packet's tag, assert `verify_inbound_heartbeat` returns `Err` and `last_activity` is **unchanged**. Pin #85.
-- **Source mismatch:** valid packet from the wrong `SocketAddr`, assert reject + no state change.
-- **Replay:** verify, then re-submit the same bytes, assert the second verify rejects via the rx counter window.
-- **Counter monotonicity:** call `build_heartbeat` N times, assert the TX counter monotonically increases and is consistent with `thread_local_pool`'s counter (closes the dormant variant of #106 on this path).
-- **Static check:** a `compile_fail` test (or a CI `rg`) asserting that no `*.rs` outside `pool.rs` calls `PacketBuilder::new`. Catches future drift.
+Each call site becomes `let packet = session.build_heartbeat();`. Two lines saved per site, but more importantly the next person who needs to build a heartbeat doesn't have to know about `thread_local_pool` — and won't accidentally reach for `PacketBuilder::new(&[0u8; 32], ...)` again.
 
-## Out of scope
+### Step 3 — Demote `PacketBuilder::new` from `pub` to `pub(crate)`
 
-- **#56** (cross-process JetStream nonce) — different layer.
-- **#106** (full dual-pool counter consolidation) — this plan removes the failure mode for the heartbeat path; the broader consolidation is a separate cleanup.
-- Subnet-gateway heartbeat handling — gateways don't process heartbeats today; if that changes, the new code must call `Session::verify_inbound_heartbeat` rather than re-rolling the verify sequence.
+After Steps 1–2, `PacketBuilder::new` has no remaining heartbeat callers in production. The remaining `PacketBuilder::new(&[0u8; 32], 0)` call sites are all handshake builders (e.g. `mod.rs:484, 596`; `mesh.rs:2637`) — handshakes don't have a session key yet, so the zero-key construction is correct there. Those handshake call sites are all inside `adapter/net/`, so demoting `pub` → `pub(crate)` does not break them.
+
+This is the structural guarantee that #97-shape bugs cannot recur from outside the crate. Verify nothing in `bindings/`, `sdk/`, `sdk-py/`, `sdk-ts/`, or `cli/` calls `PacketBuilder::new` directly before flipping the modifier.
+
+### Step 4 — Static check
+
+Add a CI grep (or a `compile_fail` test) asserting that no `*.rs` file outside `adapter/net/` constructs a `PacketBuilder::new` and that no file outside `session.rs` and `pool.rs` calls `build_heartbeat()` on anything other than the session helper. Catches future drift cheaply.
+
+## What's already done
+
+- ✅ Send-side bug (#97): both call sites route through `session.thread_local_pool()`. Heartbeat counter is shared with the data path.
+- ✅ Receive-side bug (#85): mesh dispatch verifies AEAD before touching `failure_detector` or session state.
+- ✅ Dual-pool / dual-cipher footgun (#106 surface): `Session::tx_cipher()` and `Session::packet_pool()` removed.
+- ✅ Regression tests: `aead_authenticated_heartbeat_passes_verification`, `unauthenticated_heartbeat_fails_verification` (mesh side); the `process_packet` heartbeat suite at `mod.rs:1786` covering legitimate / no-tag / garbage-tag / `session.touch()` invariants.
+
+## What's deliberately not done
+
+- **`Session::verify_inbound_heartbeat` (the original Step 1 of this plan).** The receive paths diverge enough — mesh's session lookup precedes verify; legacy's source check precedes verify; only mesh wants `failure_detector.heartbeat` after verify — that an opinionated "verify and touch" wrapper either needs flags (failure detector? source check?) or duplicates state-mutation logic in the caller anyway. The simpler `verify_heartbeat_aead(&parsed, &session) -> bool` predicate (currently in `mesh.rs`) covers the actually-shared portion and lets each caller compose the rest. Step 1 above moves that helper to its proper home rather than escalating it into a method.
+- **#56** (JetStream cross-process nonce) — different layer.
+- **Subnet-gateway heartbeat handling** — gateways don't process heartbeats today.
 
 ## Risks
 
-- **Per-peer fan-out in mesh.** The mesh send loop iterates peers and calls `build_heartbeat` once per peer per tick. The session-internal `thread_local_pool` must remain per-session, not per-peer; a session is held by the mesh loop while iterating, so this is structurally fine, but worth confirming in the implementation review (the alternative — accidentally reaching for a per-peer pool — would re-introduce #106).
-- **Fan-out cost.** If a session has 1000 peers and `Session::build_heartbeat` runs sequentially per peer, throughput is bounded by AEAD throughput × peer count per tick. The current code has the same cost; verify there is no regression.
-- **`pub` → `pub(crate)` on `PacketBuilder::new`.** Any downstream crate that constructed `PacketBuilder` directly breaks. This crate is workspace-internal and `PacketBuilder::new` is not in the documented SDK surface, but check the bindings (`bindings/`, `sdk*/`) before flipping.
+- **`pub` → `pub(crate)` on `PacketBuilder::new`.** Any external caller breaks. The constructor is not in the documented SDK surface, but the bindings (`bindings/`, `sdk*/`) need a quick grep before flipping.
+- **Moving `verify_heartbeat_aead` out of `mesh.rs`.** Tests at `mesh.rs:7407, 7424, 7676, 7682, 7698, 7702` reference the symbol via `super::*`. They keep working as long as the symbol is re-exported `pub(crate)` from its new location and the mesh module imports it. Verify the test imports compile after the move.
 
-## Acceptance criteria
+## Acceptance criteria for the remaining work
 
-- All five call sites in `mod.rs` and `mesh.rs` reduced to one-line `Session::build_heartbeat` / `Session::verify_inbound_heartbeat` calls.
-- `PacketBuilder::new` not callable from outside `adapter/net/`.
-- New tests pinning #11, #85, #97 (round-trip, tag tamper, source mismatch, replay).
-- No new findings introduced (re-run the relevant audits in `BUG_AUDIT_2026_04_30_CORE.md` against the changed files).
+- Legacy receive path (`mod.rs:659-680`) calls a single shared `verify_heartbeat_aead`-style helper rather than re-implementing AEAD verify.
+- Both build sites read `let packet = session.build_heartbeat();` (single line each).
+- `PacketBuilder::new` is `pub(crate)`.
+- Existing regression tests still pass; no new tests required for the cleanup itself (the helper is exercised by the same tests that already pin #85 and #97).
 
 ## Status
 
-| Step | Outstanding |
+| Step | State |
 |---|---|
-| 1 — `Session::build_heartbeat` / `verify_inbound_heartbeat` | not started |
-| 2 — legacy send rewrite | not started |
-| 3 — legacy receive rewrite | not started |
-| 4 — mesh send rewrite | not started |
-| 5 — mesh receive rewrite | not started |
-| 6 — `PacketBuilder::new` → `pub(crate)` | not started |
-| 7 — drop unused `Session::packet_pool` getter | not started |
-| Tests | not started |
+| Send-side fix (#97) — route through `thread_local_pool` | ✅ done |
+| Mesh receive-side fix (#85) — `verify_heartbeat_aead` helper | ✅ done |
+| Drop `Session::tx_cipher` / `Session::packet_pool` getters | ✅ done |
+| Regression tests for #85 and #97 | ✅ done |
+| 1 — Move `verify_heartbeat_aead` to `session.rs`, port legacy receive to call it | outstanding |
+| 2 — `NetSession::build_heartbeat()` wrapper, port both build sites | outstanding |
+| 3 — `PacketBuilder::new` → `pub(crate)` | outstanding |
+| 4 — Static check / CI grep | outstanding |
 
-Closes audit findings: **#11**, **#85**, **#97**. Reduces surface area for **#106**.
+Closed by the implementation: **#11**, **#85**, **#97**, surface area for **#106**. Outstanding steps reduce duplication only; they do not fix new bugs.
