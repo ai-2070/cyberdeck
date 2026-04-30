@@ -62,7 +62,7 @@ pub struct MemoriesAdapter {
     /// Producer identity stamped on every `EventMeta`.
     origin_hash: u32,
     /// Monotonic per-origin counter for `EventMeta::seq_or_ts`.
-    /// Shared with the inner [`WatermarkingFold`] wrapper around
+    /// Shared with the inner `WatermarkingFold` wrapper around
     /// [`MemoriesFold`] (BUG #148): the fold task advances this
     /// counter via `fetch_max(seq_or_ts + 1)` for every replayed
     /// event whose `origin_hash` matches ours, so `ingest_typed`
@@ -77,7 +77,7 @@ impl MemoriesAdapter {
     /// full history into state on open.
     ///
     /// `async` because the constructor awaits the fold task's catch-up
-    /// before returning (BUG #148): the inner [`WatermarkingFold`]
+    /// before returning (BUG #148): the inner `WatermarkingFold`
     /// observes every replayed event's `EventMeta` and advances
     /// `app_seq` past any pre-existing same-origin `seq_or_ts`, so
     /// the first `ingest_typed` after `open` cannot collide with an
