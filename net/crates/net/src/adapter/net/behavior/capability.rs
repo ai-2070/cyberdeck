@@ -1521,8 +1521,34 @@ impl CapabilityIndex {
         }
     }
 
-    /// Index a capability announcement
+    /// Index a capability announcement.
+    ///
+    /// BUG #110: pre-fix this never called `ann.is_expired()` and
+    /// stored `ttl: Duration::from_secs(ann.ttl_secs)` from
+    /// `Instant::now()`, making the index entry alive for
+    /// `ttl_secs` seconds *from local indexing time*, not from
+    /// origin time. An attacker who saved an old (still
+    /// cryptographically valid) announcement could replay it to
+    /// a fresh node and get the stale capabilities reinstated
+    /// with a fresh local lease — useful for re-introducing a
+    /// model/tag/scope an operator deliberately removed, or an
+    /// old `reflex_addr` to misdirect NAT traversal.
+    ///
+    /// Now: reject `is_expired()` up-front, and when computing
+    /// the entry's TTL, take the lesser of "now + ttl_secs" and
+    /// "origin_timestamp + ttl_secs" so a clock-skew or replay
+    /// scenario doesn't extend the announcement's effective
+    /// lifetime past what the origin signed.
     pub fn index(&self, ann: CapabilityAnnouncement) {
+        // Reject already-expired announcements (BUG #110), but
+        // exempt the legitimate `ttl_secs == 0` "announce-and-
+        // forget" diagnostic case — those are intentionally
+        // short-lived and the next `gc()` sweep evicts them
+        // (see `gc_evicts_entries_with_ttl_zero`).
+        if ann.ttl_secs > 0 && ann.is_expired() {
+            return;
+        }
+
         let node_id = ann.node_id;
 
         // Hold the versions entry across the whole update. This serializes
@@ -1550,13 +1576,32 @@ impl CapabilityIndex {
         // Add to inverted indexes
         self.add_to_indexes(node_id, &ann.capabilities);
 
+        // BUG #110: cap the local TTL by the origin's remaining
+        // lifetime. `origin_remaining_ns = ann.timestamp_ns +
+        // ttl_secs*1e9 - now_ns`. If positive, that's the
+        // remaining lifetime according to the origin. The local
+        // TTL is `min(local_ttl, origin_remaining)` so a replayed
+        // announcement near its origin-side expiry doesn't get a
+        // freshly-extended local lease.
+        let local_ttl = Duration::from_secs(ann.ttl_secs as u64);
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        let origin_expiry_ns = ann
+            .timestamp_ns
+            .saturating_add((ann.ttl_secs as u64).saturating_mul(1_000_000_000));
+        let origin_remaining_ns = origin_expiry_ns.saturating_sub(now_ns);
+        let origin_remaining = Duration::from_nanos(origin_remaining_ns);
+        let effective_ttl = local_ttl.min(origin_remaining);
+
         // Store node
         let indexed = IndexedNode {
             node_id,
             capabilities: ann.capabilities,
             version: ann.version,
             indexed_at: Instant::now(),
-            ttl: Duration::from_secs(ann.ttl_secs as u64),
+            ttl: effective_ttl,
             reflex_addr: ann.reflex_addr,
         };
         self.nodes.insert(node_id, indexed);
@@ -2494,6 +2539,113 @@ mod tests {
         index.index(ann2);
         assert_eq!(index.gc(), 0, "u32::MAX TTL must survive gc");
         assert!(index.get(10).is_some());
+    }
+
+    // ========================================================================
+    // BUG #110: replayed/expired announcements must not be admitted
+    // ========================================================================
+
+    /// An already-expired announcement (origin timestamp older than
+    /// `ttl_secs`) must be rejected by `index()` rather than stored
+    /// with a freshly-extended local lease. Pre-fix, `index()` had
+    /// no `is_expired()` check, so a captured-and-replayed
+    /// announcement reinstated stale capabilities indefinitely on
+    /// any node that received it.
+    #[test]
+    fn index_rejects_already_expired_announcement() {
+        let index = CapabilityIndex::new();
+        let mut ann = CapabilityAnnouncement::new(1, test_entity(), 1, sample_capability_set());
+        // Origin signed this 1 hour ago with a 60s TTL — long expired.
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        ann.timestamp_ns = now_ns.saturating_sub(3600 * 1_000_000_000);
+        ann.ttl_secs = 60;
+        assert!(ann.is_expired(), "test setup: ann must be expired");
+
+        index.index(ann);
+
+        assert_eq!(
+            index.stats().node_count,
+            0,
+            "expired announcement must not be indexed (BUG #110)",
+        );
+        assert!(index.get(1).is_none());
+    }
+
+    /// A near-expiry replay (still cryptographically valid by
+    /// `is_expired()`'s inclusive bound, but most of its lifetime
+    /// already burned) must have its local TTL clamped by the
+    /// origin's remaining lifetime — not reset to a fresh
+    /// `ttl_secs` from `Instant::now()`. This pins the
+    /// `effective_ttl = local_ttl.min(origin_remaining)` clamp:
+    /// pre-fix, an attacker could capture an announcement at
+    /// age=ttl-1s and replay it to gain ~ttl seconds of fresh
+    /// lease per replay.
+    #[test]
+    fn index_clamps_local_ttl_to_origin_remaining_lifetime() {
+        let index = CapabilityIndex::new();
+        let mut ann = CapabilityAnnouncement::new(2, test_entity(), 1, sample_capability_set());
+        // Origin signed 200s ago with 300s TTL — 100s remaining.
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        ann.timestamp_ns = now_ns.saturating_sub(200 * 1_000_000_000);
+        ann.ttl_secs = 300;
+        assert!(!ann.is_expired(), "test setup: ann must still be live");
+
+        index.index(ann);
+
+        // Access the IndexedNode via private `nodes` field — `get()`
+        // returns only the CapabilitySet, but BUG #110's clamp lives
+        // on `IndexedNode::ttl`.
+        let stored_ttl = index
+            .nodes
+            .get(&2)
+            .map(|n| n.ttl)
+            .expect("near-expiry ann must still be admitted");
+        // The local TTL should be clamped to ~100s (origin_remaining),
+        // not the full 300s. Allow generous slack for clock skew /
+        // scheduling between `timestamp_ns` capture and `index()`.
+        assert!(
+            stored_ttl <= Duration::from_secs(105),
+            "effective_ttl must be clamped to origin_remaining (~100s), \
+             got {:?} — pre-fix bug would leave ttl=300s",
+            stored_ttl,
+        );
+        assert!(
+            stored_ttl >= Duration::from_secs(90),
+            "effective_ttl must not over-clamp; expected ~100s, got {:?}",
+            stored_ttl,
+        );
+    }
+
+    /// Zero-TTL announcements remain admitted (and immediately
+    /// gc-eligible). The `ttl_secs > 0 && is_expired()` guard in
+    /// `index()` exempts them so the documented "announce-and-
+    /// forget" diagnostic flow keeps working — guarded by
+    /// `gc_evicts_entries_with_ttl_zero` already, but pinned here
+    /// alongside the BUG #110 cluster so a future tightening of
+    /// the rejection rule can't silently break zero-TTL.
+    #[test]
+    fn index_admits_zero_ttl_announcement_even_though_is_expired_returns_true() {
+        let index = CapabilityIndex::new();
+        let mut ann = CapabilityAnnouncement::new(3, test_entity(), 1, sample_capability_set());
+        ann.ttl_secs = 0;
+        assert!(
+            ann.is_expired(),
+            "is_expired() returns true for ttl_secs=0 by inclusive-bound rule",
+        );
+
+        index.index(ann);
+
+        assert_eq!(
+            index.stats().node_count,
+            1,
+            "zero-TTL exemption must keep announce-and-forget working",
+        );
     }
 
     // ========================================================================

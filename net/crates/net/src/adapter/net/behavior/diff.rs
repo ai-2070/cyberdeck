@@ -155,6 +155,24 @@ impl DiffOp {
 // Capability Diff
 // ============================================================================
 
+/// Maximum byte length for a wire-format `CapabilityDiff`. Chosen at
+/// 64 KiB — generous against real diffs (`estimated_size()` for a
+/// busy capability set with several model and tag changes is well
+/// under 4 KiB) while blocking the balloon-DoS vector documented in
+/// BUG #138 where a peer ships a 100 MB JSON to make `from_slice`
+/// allocate that much heap.
+pub const MAX_DIFF_BYTES: usize = 64 * 1024;
+
+/// Maximum number of operations per `CapabilityDiff`. A real
+/// announcement-driven diff has O(changed-fields) ops (typically
+/// well under 50); 1024 is far past that and still bounds the cost
+/// of `apply` to a constant rather than O(peer-controlled) — see
+/// BUG #138. Chosen so a fully-packed op-flood payload (each op is
+/// the smallest JSON encoding, e.g. `{"AddTag":"t0"}`) stays well
+/// under `MAX_DIFF_BYTES`, keeping both caps coherent: byte cap
+/// guards heap during parsing, op cap guards CPU during `apply`.
+pub const MAX_DIFF_OPS: usize = 1024;
+
 /// Capability diff message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityDiff {
@@ -211,9 +229,26 @@ impl CapabilityDiff {
         serde_json::to_vec(self).unwrap_or_default()
     }
 
-    /// Deserialize from bytes
+    /// Deserialize from bytes.
+    ///
+    /// BUG #138: pre-fix this had no size or op-count cap, so a
+    /// peer-supplied 100 MB JSON would expand into a `Vec<DiffOp>`
+    /// of arbitrary length. `apply` then iterated every op (each
+    /// currently a no-op for `SetField`/`UnsetField`) — peer-
+    /// controlled CPU/RAM burn for no useful effect. Now we
+    /// reject inputs over `MAX_DIFF_BYTES` before parsing, and
+    /// reject diffs over `MAX_DIFF_OPS` after parsing. Both
+    /// failure modes return `None` — the existing
+    /// "malformed-or-too-large" outcome callers already handle.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        serde_json::from_slice(data).ok()
+        if data.len() > MAX_DIFF_BYTES {
+            return None;
+        }
+        let parsed: Self = serde_json::from_slice(data).ok()?;
+        if parsed.ops.len() > MAX_DIFF_OPS {
+            return None;
+        }
+        Some(parsed)
     }
 }
 
@@ -959,5 +994,81 @@ mod tests {
         assert_eq!(diff.base_version, parsed.base_version);
         assert_eq!(diff.new_version, parsed.new_version);
         assert_eq!(diff.ops.len(), parsed.ops.len());
+    }
+
+    // ========================================================================
+    // BUG #138: from_bytes must reject oversized / op-flooded payloads
+    // ========================================================================
+
+    /// A wire-format diff larger than `MAX_DIFF_BYTES` is rejected
+    /// before `serde_json::from_slice` is called, so a peer-shipped
+    /// balloon JSON cannot pre-allocate arbitrary heap during
+    /// parsing. Pre-fix `from_bytes` had no length cap and would
+    /// faithfully expand the payload into a `Vec<DiffOp>` regardless
+    /// of size.
+    #[test]
+    fn from_bytes_rejects_payload_over_max_diff_bytes() {
+        // Vec of bytes longer than the cap. Content doesn't matter
+        // — the size guard runs before any parse work.
+        let oversized = vec![b'x'; MAX_DIFF_BYTES + 1];
+        assert!(
+            CapabilityDiff::from_bytes(&oversized).is_none(),
+            "from_bytes must reject inputs larger than MAX_DIFF_BYTES",
+        );
+    }
+
+    /// A diff parseable but containing more than `MAX_DIFF_OPS` ops
+    /// is rejected post-parse. Pre-fix `apply` iterated every op
+    /// (each currently a no-op for SetField/UnsetField); a peer
+    /// could exhaust CPU by shipping a small JSON expanding to a
+    /// large `Vec`. Now `from_bytes` returns `None` and `apply` is
+    /// never called.
+    #[test]
+    fn from_bytes_rejects_diff_with_too_many_ops() {
+        // Build a diff with MAX_DIFF_OPS + 1 trivial ops. Use
+        // very short tag strings so the JSON encoding stays well
+        // under MAX_DIFF_BYTES (otherwise the byte-size guard
+        // would fire first and we wouldn't be testing the op-count
+        // guard specifically).
+        let ops: Vec<DiffOp> = (0..(MAX_DIFF_OPS + 1))
+            .map(|i| DiffOp::AddTag(format!("t{}", i % 10)))
+            .collect();
+        let diff = CapabilityDiff::new(1, 1, 2, ops);
+        let bytes = diff.to_bytes();
+
+        // Sanity-check: the wire payload fits under the byte cap,
+        // so the op-count guard is the discriminator.
+        assert!(
+            bytes.len() <= MAX_DIFF_BYTES,
+            "test setup: encoded diff must stay within byte cap to test op-count guard \
+             (got {} bytes, cap is {})",
+            bytes.len(),
+            MAX_DIFF_BYTES,
+        );
+
+        assert!(
+            CapabilityDiff::from_bytes(&bytes).is_none(),
+            "from_bytes must reject diffs with more than MAX_DIFF_OPS ops",
+        );
+    }
+
+    /// A diff with exactly `MAX_DIFF_OPS` ops is accepted — pins
+    /// the boundary so a future tightening that flips `>` to `>=`
+    /// can't silently break legitimate large-but-bounded diffs.
+    #[test]
+    fn from_bytes_accepts_diff_at_exact_max_diff_ops() {
+        let ops: Vec<DiffOp> = (0..MAX_DIFF_OPS)
+            .map(|i| DiffOp::AddTag(format!("t{}", i % 10)))
+            .collect();
+        let diff = CapabilityDiff::new(1, 1, 2, ops);
+        let bytes = diff.to_bytes();
+        // Defence-in-depth: if MAX_DIFF_OPS is later raised past
+        // what fits in MAX_DIFF_BYTES, this `assert!` fires and the
+        // test author can adjust either cap rather than chase a
+        // surprising byte-cap failure here.
+        assert!(bytes.len() <= MAX_DIFF_BYTES);
+        let parsed = CapabilityDiff::from_bytes(&bytes)
+            .expect("diff at the exact MAX_DIFF_OPS boundary must be accepted");
+        assert_eq!(parsed.ops.len(), MAX_DIFF_OPS);
     }
 }

@@ -388,6 +388,26 @@ impl std::fmt::Debug for PermissionToken {
     }
 }
 
+/// Soft cap on the number of `(subject, channel_hash)` slots in a
+/// [`TokenCache`]. Set well above any realistic deployment (a node
+/// with 65 K distinct subject-channel pairs is itself an outlier)
+/// while bounding the memory cost of a peer-driven flood (BUG
+/// #146): pre-cap, `insert`/`insert_unchecked` admitted unlimited
+/// novel keys and a peer issuing or replaying signed tokens grew
+/// the cache linearly in `(subject × channel)` cardinality.
+/// Existing entries always refresh; only NEW slot keys are
+/// rejected at the cap. `evict_expired` reclaims slots as their
+/// tokens lapse, so admission resumes once memory pressure eases.
+pub const MAX_TOKEN_SLOTS: usize = 65_536;
+
+/// Soft cap on the number of distinct-scope tokens stored within a
+/// single `(subject, channel_hash)` slot. `TokenScope` is a u32
+/// bitfield, so up to 2^32 distinct values are theoretically
+/// possible — in practice issuers compose from a small set of
+/// {PUBLISH, SUBSCRIBE, ADMIN, DELEGATE, WILDCARD}, so 32 is far
+/// past real usage while bounding within-slot growth (BUG #146).
+pub const MAX_TOKENS_PER_SLOT: usize = 32;
+
 /// Fast permission lookup cache.
 ///
 /// Keyed by `(subject EntityId, channel_hash)`. Each slot holds a
@@ -402,6 +422,10 @@ impl std::fmt::Debug for PermissionToken {
 /// Entries are not evicted automatically — callers should check
 /// `is_valid()` on retrieved tokens, or call [`Self::evict_expired`]
 /// on a cadence.
+///
+/// Capacity is bounded by [`MAX_TOKEN_SLOTS`] (slot count) and
+/// [`MAX_TOKENS_PER_SLOT`] (tokens-with-distinct-scope per slot)
+/// (BUG #146).
 pub struct TokenCache {
     tokens: DashMap<([u8; 32], u16), Vec<PermissionToken>>,
 }
@@ -439,6 +463,14 @@ impl TokenCache {
     /// own `channel_hash` field — that slot is where `check()` looks
     /// for a cross-channel fallback. Non-wildcard tokens live in
     /// their exact `channel_hash` slot.
+    ///
+    /// BUG #146: bounded by [`MAX_TOKEN_SLOTS`] and
+    /// [`MAX_TOKENS_PER_SLOT`]. When the slot cap is hit, novel
+    /// keys are silently dropped (existing slot keys still
+    /// refresh); when the within-slot cap is hit, novel scope
+    /// bitfields are silently dropped (existing-scope refresh
+    /// still wins). `evict_expired` reclaims slots as tokens
+    /// lapse, restoring admission.
     pub fn insert_unchecked(&self, token: PermissionToken) {
         let slot_channel = if token.scope.contains(TokenScope::WILDCARD) {
             0
@@ -446,12 +478,26 @@ impl TokenCache {
             token.channel_hash
         };
         let key = (*token.subject.as_bytes(), slot_channel);
+
+        // BUG #146 slot cap: only refuse NOVEL keys at the cap so
+        // existing peers' token refreshes still work under flood
+        // pressure. The cap is read from the DashMap atomically
+        // per shard; the `contains_key` + `len` race is benign for
+        // a soft cap (overshoot by O(shards) is tolerable).
+        if !self.tokens.contains_key(&key) && self.tokens.len() >= MAX_TOKEN_SLOTS {
+            return;
+        }
+
         let mut entry = self.tokens.entry(key).or_default();
         // Replace any existing token with exactly the same scope;
         // otherwise push so distinct-scope tokens coexist.
         if let Some(slot) = entry.iter_mut().find(|t| t.scope == token.scope) {
             *slot = token;
-        } else {
+        } else if entry.len() < MAX_TOKENS_PER_SLOT {
+            // BUG #146 within-slot cap: drop novel-scope tokens
+            // when the slot is already at capacity. Refresh of an
+            // existing scope still hits the branch above, so this
+            // only fires on attempts to stack a new scope.
             entry.push(token);
         }
     }
@@ -1571,5 +1617,225 @@ mod tests {
             Err(TokenError::NotAuthorized) => {}
             other => panic!("expected NotAuthorized after TTL + evict; got {other:?}"),
         }
+    }
+
+    // ========================================================================
+    // BUG #146: TokenCache must bound slot growth and within-slot growth
+    // ========================================================================
+
+    /// Helper: build a token whose subject is the bytes of `subject_seed`
+    /// padded into an EntityId, on `channel_hash`. We bypass the
+    /// `insert(...)` signature-verify path by issuing real tokens —
+    /// this is a fast-enough way to get many distinct subjects.
+    fn issue_token_for(seed: u64, channel_hash: u16, scope: TokenScope) -> PermissionToken {
+        let issuer = EntityKeypair::generate();
+        // EntityKeypair::generate uses entropy; we just need many
+        // distinct subjects, so a per-iteration generate is fine
+        // (the test caps iteration counts).
+        let _ = seed;
+        let subject = EntityKeypair::generate();
+        PermissionToken::issue(&issuer, subject.entity_id().clone(), scope, channel_hash, 3600, 0)
+    }
+
+    /// Once `MAX_TOKEN_SLOTS` distinct slot keys are present,
+    /// further `insert_unchecked` calls with NOVEL keys must NOT
+    /// admit a new slot. Existing-slot refresh paths still work
+    /// (covered by `replays_existing_subject_when_slot_cap_is_full`
+    /// below). Pre-fix the cache grew linearly with peer-supplied
+    /// `(subject, channel_hash)` cardinality.
+    ///
+    /// Setup uses a single subject and varies `channel_hash` so
+    /// the slot keys differ — this avoids spending O(slots) ed25519
+    /// keypair generations.
+    #[test]
+    fn insert_unchecked_drops_novel_slot_when_at_max_token_slots() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let cache = TokenCache::new();
+
+        // Fill the cache to capacity using the same subject with
+        // varying channel_hash. `MAX_TOKEN_SLOTS` is 65_536 and
+        // channel_hash is u16 (also 65_536 distinct values), so
+        // we can pack the cache exactly to capacity. Building
+        // 65_536 PermissionTokens would do 65_536 ed25519 signs,
+        // which is too slow for a unit test — instead we
+        // pre-build one template token and clone-with-mutated
+        // channel_hash. The signature stops being valid after the
+        // mutation, but `insert_unchecked` skips verify, so the
+        // cache shape under test is identical to the real path.
+        let template = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0,
+            3600,
+            0,
+        );
+        // u16 has exactly MAX_TOKEN_SLOTS (= 65_536) distinct
+        // values; `0..MAX_TOKEN_SLOTS as u16` would be `0..0` (cast
+        // overflow), so iterate inclusively instead.
+        for ch in 0u32..MAX_TOKEN_SLOTS as u32 {
+            let mut t = template.clone();
+            t.channel_hash = ch as u16;
+            cache.insert_unchecked(t);
+        }
+        // Note: u16 has exactly MAX_TOKEN_SLOTS distinct values, so
+        // the cache should hold exactly MAX_TOKEN_SLOTS slots now.
+        // (We can't iterate beyond u16::MAX; this is a deliberate
+        // alignment with the cap.)
+        let len_before_overflow = cache.tokens.len();
+        assert_eq!(
+            len_before_overflow, MAX_TOKEN_SLOTS,
+            "test setup: cache must be filled to capacity",
+        );
+
+        // A NOVEL slot key — different subject, channel_hash=0 — must
+        // be dropped at the cap.
+        let other_subject = EntityKeypair::generate();
+        let novel = PermissionToken::issue(
+            &issuer,
+            other_subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0,
+            3600,
+            0,
+        );
+        cache.insert_unchecked(novel);
+
+        assert_eq!(
+            cache.tokens.len(),
+            MAX_TOKEN_SLOTS,
+            "novel slot must be rejected at MAX_TOKEN_SLOTS cap",
+        );
+    }
+
+    /// At capacity, refreshing an EXISTING slot key (same subject
+    /// + same channel_hash) must still succeed — we only refuse
+    /// novel keys. Pins that the cap doesn't accidentally lock out
+    /// legitimate token refreshes once a peer-driven flood has
+    /// filled the cache.
+    #[test]
+    fn insert_unchecked_replays_existing_subject_when_slot_cap_is_full() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let cache = TokenCache::new();
+
+        // Fill to capacity.
+        let template = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            0,
+            3600,
+            0,
+        );
+        // u16 has exactly MAX_TOKEN_SLOTS (= 65_536) distinct
+        // values; `0..MAX_TOKEN_SLOTS as u16` would be `0..0` (cast
+        // overflow), so iterate inclusively instead.
+        for ch in 0u32..MAX_TOKEN_SLOTS as u32 {
+            let mut t = template.clone();
+            t.channel_hash = ch as u16;
+            cache.insert_unchecked(t);
+        }
+        assert_eq!(cache.tokens.len(), MAX_TOKEN_SLOTS);
+
+        // Refresh an existing slot (subject + channel_hash=42 already
+        // present). Must succeed — same scope replaces same scope.
+        let mut refresh = template.clone();
+        refresh.channel_hash = 42;
+        refresh.nonce = 9999;
+        cache.insert_unchecked(refresh);
+
+        assert_eq!(cache.tokens.len(), MAX_TOKEN_SLOTS, "slot count unchanged");
+        let slot = cache.tokens.get(&(*subject.entity_id().as_bytes(), 42)).unwrap();
+        assert_eq!(slot.value().len(), 1, "still one token in slot");
+        assert_eq!(slot.value()[0].nonce, 9999, "refresh replaced the token");
+    }
+
+    /// Within a single slot, novel scope bitfields stack up to
+    /// `MAX_TOKENS_PER_SLOT`; beyond that the new-scope path drops
+    /// silently. Refreshing an existing scope still wins.
+    #[test]
+    fn insert_unchecked_caps_within_slot_token_count() {
+        let issuer = EntityKeypair::generate();
+        let subject = EntityKeypair::generate();
+        let cache = TokenCache::new();
+
+        // Pack the slot with MAX_TOKENS_PER_SLOT distinct-scope
+        // tokens. We use the bitfield directly via from_bits to
+        // produce many distinct scope values cheaply. Each token
+        // stays at the same (subject, channel_hash) so they share
+        // a slot.
+        let channel = 0xCAFE;
+        let template = PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            TokenScope::PUBLISH,
+            channel,
+            3600,
+            0,
+        );
+        for i in 0..MAX_TOKENS_PER_SLOT as u32 {
+            let mut t = template.clone();
+            // Vary the high bits so each scope value is distinct
+            // AND has the WILDCARD bit (0b1_0000 / 0x10) consistently
+            // *un*set — otherwise tokens with WILDCARD set would
+            // route to `slot_channel = 0` and split off into a
+            // different slot, dodging the within-slot cap test.
+            // Shift `i` past the WILDCARD bit so it never
+            // accidentally lights up.
+            t.scope = TokenScope::from_bits(0x10_0000 | (i << 8));
+            cache.insert_unchecked(t);
+        }
+        let slot_before = cache
+            .tokens
+            .get(&(*subject.entity_id().as_bytes(), channel))
+            .unwrap();
+        assert_eq!(
+            slot_before.value().len(),
+            MAX_TOKENS_PER_SLOT,
+            "test setup: slot must be packed to within-slot cap",
+        );
+        drop(slot_before); // release DashMap ref before the next op
+
+        // A token with a NOVEL scope bitfield must be dropped.
+        // Use a value that ALSO doesn't set the WILDCARD bit so it
+        // routes to the same slot as the packed entries.
+        let novel_scope_bits = 0x20_0000u32;
+        let mut over = template.clone();
+        over.scope = TokenScope::from_bits(novel_scope_bits);
+        cache.insert_unchecked(over);
+        let slot_after = cache
+            .tokens
+            .get(&(*subject.entity_id().as_bytes(), channel))
+            .unwrap();
+        assert_eq!(
+            slot_after.value().len(),
+            MAX_TOKENS_PER_SLOT,
+            "novel scope must be rejected at MAX_TOKENS_PER_SLOT",
+        );
+        assert!(
+            slot_after.value().iter().all(|t| t.scope.bits() != novel_scope_bits),
+            "the dropped scope must not be present in the slot",
+        );
+
+        // Refresh of an EXISTING scope still wins, even at cap.
+        let _ = issue_token_for; // silence unused warning if future tests don't need it
+        drop(slot_after);
+        // Refresh the i=0 entry — its scope was 0x10_0000.
+        let mut refresh = template.clone();
+        refresh.scope = TokenScope::from_bits(0x10_0000);
+        refresh.nonce = 1111;
+        cache.insert_unchecked(refresh);
+        let slot_after_refresh = cache
+            .tokens
+            .get(&(*subject.entity_id().as_bytes(), channel))
+            .unwrap();
+        let refreshed = slot_after_refresh
+            .value()
+            .iter()
+            .find(|t| t.scope.bits() == 0x10_0000)
+            .expect("scope 0x10_0000 must still be present");
+        assert_eq!(refreshed.nonce, 1111, "refresh-of-existing-scope must succeed at cap");
     }
 }

@@ -6,6 +6,7 @@
 
 use crate::adapter::net::state::causal::compute_parent_hash;
 use crate::adapter::net::state::log::EntityLog;
+use crate::adapter::net::state::snapshot::StateSnapshot;
 
 /// The continuity status of an entity from an observer's perspective.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,7 +172,27 @@ impl ContinuityProof {
 ///
 /// Walks the log and validates every consecutive pair. Returns the
 /// first problem found, or `Continuous` if the chain is intact.
-pub fn assess_continuity(log: &EntityLog) -> ContinuityStatus {
+///
+/// # Genesis / snapshot anchoring (BUG #114)
+///
+/// Pair-wise linkage alone is not enough: after `prune_through(N)`,
+/// a log only contains events with `seq > N`, and a corrupt restore
+/// (or a malicious party) could ship a log starting at e.g. seq 100
+/// with consistent pair-wise hashes but no evidence that events
+/// `0..99` ever existed. To detect that, this function requires the
+/// log to be anchored either at genesis (the first event has
+/// `sequence == 1`, the genesis-successor) or at a known snapshot
+/// (`snapshot.through_seq + 1 == first_event.sequence`). If neither
+/// holds, returns `Unverifiable { last_verified_seq: 0, gap_start: 0 }`.
+///
+/// Pass `None` for `snapshot` when the log is expected to start at
+/// genesis (no prior pruning); pass `Some(&snapshot)` when the log
+/// was restored from `snapshot` and should pick up at the next event
+/// after the snapshot's `through_seq`.
+pub fn assess_continuity(
+    log: &EntityLog,
+    snapshot: Option<&StateSnapshot>,
+) -> ContinuityStatus {
     let events = log.range(0, u64::MAX);
 
     if events.is_empty() {
@@ -179,6 +200,21 @@ pub fn assess_continuity(log: &EntityLog) -> ContinuityStatus {
             genesis_hash: 0,
             head_seq: log.head_seq(),
             head_hash: 0,
+        };
+    }
+
+    // BUG #114: anchor check. A pair-wise-consistent chain is not
+    // continuous if it doesn't start at genesis (seq 1, post-genesis
+    // successor) or at a verified snapshot boundary.
+    let first_seq = events[0].link.sequence;
+    let anchored = first_seq == 1
+        || snapshot
+            .map(|s| s.through_seq.saturating_add(1) == first_seq)
+            .unwrap_or(false);
+    if !anchored {
+        return ContinuityStatus::Unverifiable {
+            last_verified_seq: 0,
+            gap_start: 0,
         };
     }
 
@@ -280,7 +316,7 @@ mod tests {
     #[test]
     fn test_assess_continuous() {
         let (log, _) = build_log(10);
-        let status = assess_continuity(&log);
+        let status = assess_continuity(&log, None);
         assert!(matches!(
             status,
             ContinuityStatus::Continuous { head_seq: 10, .. }
@@ -291,8 +327,118 @@ mod tests {
     fn test_assess_empty_log() {
         let kp = EntityKeypair::generate();
         let log = EntityLog::new(kp.entity_id().clone());
-        let status = assess_continuity(&log);
+        let status = assess_continuity(&log, None);
         assert!(matches!(status, ContinuityStatus::Continuous { .. }));
+    }
+
+    // ========================================================================
+    // BUG #114: pruned-no-snapshot logs must not report Continuous
+    // ========================================================================
+
+    /// A log whose first event has `sequence > 1` (e.g. because
+    /// earlier events were pruned, or the log was reconstructed
+    /// from a partial backup) must be reported as
+    /// `Unverifiable { gap_start: 0 }` when no snapshot is supplied
+    /// to bridge the gap. Pre-fix this returned `Continuous` and
+    /// downstream peers believed the chain was intact even when
+    /// genesis-to-first events were entirely missing.
+    #[test]
+    fn assess_continuity_unverifiable_when_log_starts_past_genesis_without_snapshot() {
+        let (mut log, _) = build_log(20);
+        // Prune through seq 10 — the log now starts at seq 11 with
+        // no snapshot reference.
+        log.prune_through(10);
+        assert!(!log.is_empty(), "test setup: log must still have events 11..20");
+
+        let status = assess_continuity(&log, None);
+        assert!(
+            matches!(
+                status,
+                ContinuityStatus::Unverifiable {
+                    last_verified_seq: 0,
+                    gap_start: 0,
+                }
+            ),
+            "pruned log without snapshot must be Unverifiable, got {:?}",
+            status,
+        );
+    }
+
+    /// Same pruned log, but with a snapshot whose `through_seq`
+    /// matches the gap — must report `Continuous`. Pins the
+    /// snapshot-bridges-gap acceptance path so a future tightening
+    /// can't reject legitimately-restored logs.
+    #[test]
+    fn assess_continuity_continuous_when_snapshot_bridges_gap() {
+        use crate::adapter::net::state::causal::CausalLink;
+        use crate::adapter::net::state::horizon::ObservedHorizon;
+
+        let (mut log, _) = build_log(20);
+        log.prune_through(10);
+
+        // Build a fake snapshot whose `through_seq == 10` so the
+        // first remaining event (seq 11) is anchored. The snapshot's
+        // other fields are irrelevant to the continuity-anchor check
+        // — we only inspect `through_seq`.
+        let snapshot = StateSnapshot {
+            version: 1,
+            entity_id: log.entity_id().clone(),
+            through_seq: 10,
+            chain_link: CausalLink::genesis(log.origin_hash(), 0),
+            state: bytes::Bytes::new(),
+            horizon: ObservedHorizon::default(),
+            created_at: 0,
+            bindings_bytes: Vec::new(),
+            identity_envelope: None,
+            head_payload: bytes::Bytes::new(),
+        };
+
+        let status = assess_continuity(&log, Some(&snapshot));
+        assert!(
+            matches!(status, ContinuityStatus::Continuous { head_seq: 20, .. }),
+            "snapshot.through_seq + 1 == first_event.sequence must anchor, got {:?}",
+            status,
+        );
+    }
+
+    /// A snapshot whose `through_seq` does NOT match the log's gap
+    /// (e.g. caller passed the wrong snapshot) must NOT anchor —
+    /// this would let a forged "I have this snapshot" claim
+    /// silently bypass the genesis check.
+    #[test]
+    fn assess_continuity_unverifiable_when_snapshot_through_seq_does_not_bridge() {
+        use crate::adapter::net::state::causal::CausalLink;
+        use crate::adapter::net::state::horizon::ObservedHorizon;
+
+        let (mut log, _) = build_log(20);
+        log.prune_through(10);
+
+        // Mismatched snapshot — claims through_seq=5 but log starts at 11.
+        let snapshot = StateSnapshot {
+            version: 1,
+            entity_id: log.entity_id().clone(),
+            through_seq: 5,
+            chain_link: CausalLink::genesis(log.origin_hash(), 0),
+            state: bytes::Bytes::new(),
+            horizon: ObservedHorizon::default(),
+            created_at: 0,
+            bindings_bytes: Vec::new(),
+            identity_envelope: None,
+            head_payload: bytes::Bytes::new(),
+        };
+
+        let status = assess_continuity(&log, Some(&snapshot));
+        assert!(
+            matches!(
+                status,
+                ContinuityStatus::Unverifiable {
+                    last_verified_seq: 0,
+                    gap_start: 0,
+                }
+            ),
+            "mismatched snapshot must not anchor, got {:?}",
+            status,
+        );
     }
 
     #[test]
