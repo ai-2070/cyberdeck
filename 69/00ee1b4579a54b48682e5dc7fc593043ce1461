@@ -1,0 +1,33 @@
+net/crates/net/src/adapter/net/redex/segment.rs
+  36b642b129ab4a5e 139-153
+net/crates/net/sdk/src/net.rs
+  36b642b129ab4a5e 12,236-243,245-246
+net/crates/net/src/adapter/net/redex/disk.rs
+  36b642b129ab4a5e 183-189,458-459,915-924,942-945
+net/crates/net/src/bus.rs
+  36b642b129ab4a5e 705-752,836-849
+net/crates/net/sdk/tests/shutdown_regression.rs
+  36b642b129ab4a5e 1-62
+net/crates/net/src/adapter/net/redex/file.rs
+  36b642b129ab4a5e 945-957,959-971,978-983,986-987,989-991,995-997,999-1028,1030,1032-1035,2466-2629
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "6900ee1b4579a54b48682e5dc7fc593043ce1461",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 578,
+      "total_deletions": 343,
+      "accepted_lines": 416,
+      "overriden_lines": 0
+    }
+  }
+}
