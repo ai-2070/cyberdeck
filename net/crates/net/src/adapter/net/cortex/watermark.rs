@@ -101,3 +101,238 @@ where
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit-level coverage for the `WatermarkingFold` wrapper. The
+    //! integration tests in `tests/integration_cortex_{tasks,memories}.rs`
+    //! exercise the wrapper end-to-end through the typed adapters; these
+    //! tests pin its individual behaviors without spinning up a Redex
+    //! file or fold task.
+    //!
+    //! We construct synthetic `RedexEvent`s directly. The entry's
+    //! `seq` / `flags_and_checksum` fields don't matter for the
+    //! wrapper — it only inspects `ev.payload[..EVENT_META_SIZE]`.
+    use super::*;
+
+    use bytes::Bytes;
+
+    use super::super::super::redex::{RedexEntry, RedexEvent};
+
+    /// Inner fold that just records every (seq, dispatch) pair the
+    /// wrapper hands it, and optionally fails on a specific seq to
+    /// exercise the error-propagation path.
+    struct MockFold {
+        seen: Vec<(u64, u8)>,
+        fail_at_seq: Option<u64>,
+    }
+
+    impl MockFold {
+        fn new() -> Self {
+            Self {
+                seen: Vec::new(),
+                fail_at_seq: None,
+            }
+        }
+        fn fail_on(seq: u64) -> Self {
+            Self {
+                seen: Vec::new(),
+                fail_at_seq: Some(seq),
+            }
+        }
+    }
+
+    impl RedexFold<Vec<(u64, u8)>> for MockFold {
+        fn apply(&mut self, ev: &RedexEvent, state: &mut Vec<(u64, u8)>) -> Result<(), RedexError> {
+            if Some(ev.entry.seq) == self.fail_at_seq {
+                return Err(RedexError::Decode("forced failure".into()));
+            }
+            let dispatch = ev.payload.first().copied().unwrap_or(0);
+            self.seen.push((ev.entry.seq, dispatch));
+            state.push((ev.entry.seq, dispatch));
+            Ok(())
+        }
+    }
+
+    /// Build a synthetic `RedexEvent` whose payload is `EventMeta` (with
+    /// the given origin/seq_or_ts) followed by `tail`.
+    fn ev_with_meta(seq: u64, origin_hash: u32, seq_or_ts: u64, tail: &[u8]) -> RedexEvent {
+        let meta = EventMeta::new(0xAB, 0, origin_hash, seq_or_ts, 0);
+        let mut payload = Vec::with_capacity(EVENT_META_SIZE + tail.len());
+        payload.extend_from_slice(&meta.to_bytes());
+        payload.extend_from_slice(tail);
+        RedexEvent {
+            entry: RedexEntry::new_heap(seq, 0, payload.len() as u32, 0, 0),
+            payload: Bytes::from(payload),
+        }
+    }
+
+    /// Build a `RedexEvent` whose payload is shorter than
+    /// `EVENT_META_SIZE` — exercises the defensive guard.
+    fn ev_short(seq: u64, len: usize) -> RedexEvent {
+        let payload = vec![0u8; len];
+        RedexEvent {
+            entry: RedexEntry::new_heap(seq, 0, len as u32, 0, 0),
+            payload: Bytes::from(payload),
+        }
+    }
+
+    const ORIGIN_US: u32 = 0xAAAA_BBBB;
+    const ORIGIN_OTHER: u32 = 0xCCCC_DDDD;
+
+    #[test]
+    fn matching_origin_advances_app_seq_via_fetch_max() {
+        let app_seq = Arc::new(AtomicU64::new(0));
+        let mut wf = WatermarkingFold::new(MockFold::new(), app_seq.clone(), ORIGIN_US);
+        let mut state = Vec::new();
+
+        wf.apply(&ev_with_meta(0, ORIGIN_US, 5, b""), &mut state)
+            .unwrap();
+        assert_eq!(app_seq.load(Ordering::Acquire), 6);
+    }
+
+    #[test]
+    fn other_origin_does_not_advance_app_seq() {
+        let app_seq = Arc::new(AtomicU64::new(0));
+        let mut wf = WatermarkingFold::new(MockFold::new(), app_seq.clone(), ORIGIN_US);
+        let mut state = Vec::new();
+
+        wf.apply(&ev_with_meta(0, ORIGIN_OTHER, 999, b""), &mut state)
+            .unwrap();
+        assert_eq!(
+            app_seq.load(Ordering::Acquire),
+            0,
+            "events from another origin must not move our watermark",
+        );
+        // Inner fold still saw the event — wrapper does NOT filter
+        // delivery, only the watermark update.
+        assert_eq!(state.len(), 1);
+        assert_eq!(state[0].0, 0);
+    }
+
+    #[test]
+    fn fetch_max_keeps_watermark_monotonic_under_out_of_order_seq_or_ts() {
+        // Two adapters writing to the same channel can interleave their
+        // per-origin counters, so a single matching-origin tail can
+        // legitimately arrive in non-monotonic seq_or_ts order. The
+        // watermark must track the MAX, not the latest.
+        let app_seq = Arc::new(AtomicU64::new(0));
+        let mut wf = WatermarkingFold::new(MockFold::new(), app_seq.clone(), ORIGIN_US);
+        let mut state = Vec::new();
+
+        wf.apply(&ev_with_meta(0, ORIGIN_US, 10, b""), &mut state)
+            .unwrap();
+        assert_eq!(app_seq.load(Ordering::Acquire), 11);
+
+        // A later RedEX seq with a SMALLER seq_or_ts must NOT pull the
+        // watermark back down.
+        wf.apply(&ev_with_meta(1, ORIGIN_US, 3, b""), &mut state)
+            .unwrap();
+        assert_eq!(
+            app_seq.load(Ordering::Acquire),
+            11,
+            "fetch_max must keep the watermark from regressing",
+        );
+    }
+
+    #[test]
+    fn short_payload_is_silently_skipped() {
+        // A third-party writer that appended raw bytes (no `EventMeta`
+        // prefix) would produce a payload < EVENT_META_SIZE. The
+        // wrapper must defensively skip rather than corrupt the
+        // watermark with a bogus parse.
+        let app_seq = Arc::new(AtomicU64::new(7));
+        let mut wf = WatermarkingFold::new(MockFold::new(), app_seq.clone(), ORIGIN_US);
+        let mut state = Vec::new();
+
+        // 19 bytes — one short of EVENT_META_SIZE (20).
+        wf.apply(&ev_short(0, 19), &mut state).unwrap();
+        assert_eq!(
+            app_seq.load(Ordering::Acquire),
+            7,
+            "watermark must be untouched when payload is too short to parse",
+        );
+    }
+
+    #[test]
+    fn inner_fold_error_propagates_and_does_not_advance_watermark() {
+        // BUG #148 fix: the watermark only advances on a *successful*
+        // inner-fold apply. If the user fold rejects the event, the
+        // wrapper must surface the error AND leave app_seq alone — the
+        // event was effectively skipped (Continue policy) or halted
+        // the task (Stop policy), and either way the per-origin
+        // counter must not include it.
+        let app_seq = Arc::new(AtomicU64::new(0));
+        let mut wf = WatermarkingFold::new(MockFold::fail_on(0), app_seq.clone(), ORIGIN_US);
+        let mut state = Vec::new();
+
+        let r = wf.apply(&ev_with_meta(0, ORIGIN_US, 42, b""), &mut state);
+        assert!(matches!(r, Err(RedexError::Decode(_))));
+        assert_eq!(
+            app_seq.load(Ordering::Acquire),
+            0,
+            "watermark must NOT advance for an event the inner fold rejected",
+        );
+    }
+
+    #[test]
+    fn watermark_holds_when_pre_set_value_already_exceeds_observed_seq_or_ts() {
+        // `open_from_snapshot` pre-loads `app_seq` from the snapshot
+        // payload. If the snapshot value already covers every same-
+        // origin event in the replay tail, the wrapper's fetch_max is
+        // a no-op. Pin that semantics so `open_from_snapshot` doesn't
+        // accidentally regress the counter when the tail is empty
+        // for our origin.
+        let app_seq = Arc::new(AtomicU64::new(100));
+        let mut wf = WatermarkingFold::new(MockFold::new(), app_seq.clone(), ORIGIN_US);
+        let mut state = Vec::new();
+
+        wf.apply(&ev_with_meta(0, ORIGIN_US, 5, b""), &mut state)
+            .unwrap();
+        assert_eq!(app_seq.load(Ordering::Acquire), 100);
+    }
+
+    #[test]
+    fn mixed_origin_stream_only_advances_for_matching_origin() {
+        // Realistic shape: a channel shared by us and another origin,
+        // events interleaved in the log.
+        let app_seq = Arc::new(AtomicU64::new(0));
+        let mut wf = WatermarkingFold::new(MockFold::new(), app_seq.clone(), ORIGIN_US);
+        let mut state = Vec::new();
+
+        let stream = [
+            (0, ORIGIN_OTHER, 100),
+            (1, ORIGIN_US, 0),
+            (2, ORIGIN_OTHER, 200),
+            (3, ORIGIN_US, 1),
+            (4, ORIGIN_OTHER, 300),
+            (5, ORIGIN_US, 2),
+        ];
+        for (seq, origin, seq_or_ts) in stream {
+            wf.apply(&ev_with_meta(seq, origin, seq_or_ts, b""), &mut state)
+                .unwrap();
+        }
+
+        assert_eq!(
+            app_seq.load(Ordering::Acquire),
+            3,
+            "watermark must reflect only our origin's max+1 (saw seq_or_ts 0,1,2)",
+        );
+        // Inner fold saw every event (delivery is not filtered).
+        assert_eq!(state.len(), 6);
+    }
+
+    #[test]
+    fn saturating_add_pins_watermark_at_u64_max() {
+        // Unreachable in practice (would require 2^64 ingests under
+        // one origin) but cheap to pin: a `seq_or_ts == u64::MAX`
+        // entry must NOT wrap the watermark to 0 via overflow.
+        let app_seq = Arc::new(AtomicU64::new(0));
+        let mut wf = WatermarkingFold::new(MockFold::new(), app_seq.clone(), ORIGIN_US);
+        let mut state = Vec::new();
+
+        wf.apply(&ev_with_meta(0, ORIGIN_US, u64::MAX, b""), &mut state)
+            .unwrap();
+        assert_eq!(app_seq.load(Ordering::Acquire), u64::MAX);
+    }
+}

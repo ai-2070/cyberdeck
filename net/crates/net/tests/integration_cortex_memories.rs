@@ -512,6 +512,97 @@ async fn test_regression_snapshot_restore_preserves_app_seq_monotonicity() {
 }
 
 #[tokio::test]
+async fn test_open_returns_with_state_already_caught_up() {
+    // BUG #148 fix: `MemoriesAdapter::open[_with_config]` awaits the
+    // inner fold task's catch-up before returning. State is fully
+    // visible synchronously — no `wait_for_seq` required.
+    let redex = Redex::new();
+    {
+        let a = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
+        a.store(1, "first", vec!["a".into()], "src", 100).unwrap();
+        a.store(2, "second", vec!["b".into()], "src", 200).unwrap();
+        let seq = a.store(3, "third", vec!["c".into()], "src", 300).unwrap();
+        a.wait_for_seq(seq).await;
+        a.close().unwrap();
+    }
+
+    let b = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
+    let state = b.state();
+    let guard = state.read();
+    assert_eq!(
+        guard.len(),
+        3,
+        "post-open state must be fully caught up — saw {} memories, expected 3",
+        guard.len(),
+    );
+}
+
+#[tokio::test]
+async fn test_open_on_empty_redex_does_not_block() {
+    // Edge case: `open` on a fresh empty Redex must not block on
+    // `wait_for_seq`. Wrap in a 2s timeout so a regression that
+    // awaits an unreachable seq surfaces as a test failure, not a
+    // hung run.
+    let redex = Redex::new();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        MemoriesAdapter::open(&redex, ORIGIN),
+    )
+    .await;
+    assert!(
+        matches!(result, Ok(Ok(_))),
+        "open() on an empty Redex must complete promptly; got {result:?}",
+    );
+}
+
+#[tokio::test]
+async fn test_open_from_snapshot_with_empty_replay_tail_keeps_snapshot_app_seq() {
+    // When the snapshot's `last_seq` already covers every event in
+    // the file, the wrapper sees nothing during catch-up and the
+    // snapshot's persisted `app_seq` survives. The first post-restore
+    // ingest stamps `seq_or_ts = persisted_app_seq`.
+    let redex = Redex::new();
+    let memories = MemoriesAdapter::open(&redex, ORIGIN).await.unwrap();
+    memories
+        .store(1, "a", vec!["x".into()], "src", 100)
+        .unwrap();
+    memories
+        .store(2, "b", vec!["y".into()], "src", 200)
+        .unwrap();
+    let seq = memories
+        .store(3, "c", vec!["z".into()], "src", 300)
+        .unwrap();
+    memories.wait_for_seq(seq).await;
+
+    let (state_bytes, last_seq) = memories.snapshot().unwrap();
+    memories.close().unwrap();
+
+    let redex2 = Redex::new();
+    let restored = MemoriesAdapter::open_from_snapshot(&redex2, ORIGIN, &state_bytes, last_seq)
+        .await
+        .unwrap();
+
+    let new_seq = restored
+        .store(4, "d", vec!["w".into()], "src", 400)
+        .unwrap();
+    restored.wait_for_seq(new_seq).await;
+
+    let file = redex2
+        .open_file(
+            &ChannelName::new(MEMORIES_CHANNEL).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+    let events = file.read_range(new_seq, new_seq + 1);
+    let meta = EventMeta::from_bytes(&events[0].payload[..EVENT_META_SIZE]).unwrap();
+    assert_eq!(
+        meta.seq_or_ts, 3,
+        "post-restore counter must continue from snapshot's persisted app_seq (got {}, expected 3)",
+        meta.seq_or_ts,
+    );
+}
+
+#[tokio::test]
 async fn test_regression_open_advances_app_seq_past_existing_same_origin_events() {
     // Regression for BUG #148 secondary-fix: pre-fix
     // `MemoriesAdapter::open` set `app_seq = AtomicU64::new(0)`

@@ -875,8 +875,12 @@ In the `RateLimited` arm: each thread reads `count.load`, compares to `max_per_s
 The fix also closes a latent secondary hole: pre-fix `open_with_config` set `app_seq = AtomicU64::new(0)` unconditionally, so reopening against a Redex (or a persistent file) that already had same-origin events produced a duplicate `seq_or_ts = 0` on the very first ingest. The watermarking wrapper handles both paths — `open` and `open_from_snapshot` — uniformly.
 
 Tests:
+- Unit tests on the wrapper itself in `adapter/net/cortex/watermark.rs::tests` (8 cases): origin match, origin mismatch, fetch_max monotonicity under out-of-order `seq_or_ts`, short-payload defensive skip, inner-fold-error propagation (no watermark advance), pre-set watermark holds when observed values are lower (snapshot pre-load case), mixed-origin stream isolation, `saturating_add` overflow pin at `u64::MAX`.
 - `tests/integration_cortex_tasks.rs::test_regression_open_advances_app_seq_past_existing_same_origin_events` and the `MemoriesAdapter` mirror — pin the new same-origin replay-aware behavior on the `open` path.
 - `tests/integration_cortex_tasks.rs::test_regression_open_ignores_other_origins_when_advancing_app_seq` and the memories mirror — pin the cross-origin isolation: an adapter for origin A reopening against a file written by origin B sees `app_seq = 0` for its own first ingest.
+- `test_open_returns_with_state_already_caught_up` (tasks + memories) — pin the new "fully caught up" guarantee: state is visible synchronously after `open` returns, no `wait_for_seq` required.
+- `test_open_on_empty_redex_does_not_block` (tasks + memories) — pin the empty-file edge case: `open` against `next_seq == 0` returns promptly, doesn't await an unreachable seq. Bounded by a 2 s `tokio::time::timeout` so a regression surfaces as a test failure rather than a hung run.
+- `test_open_from_snapshot_with_empty_replay_tail_keeps_snapshot_app_seq` (tasks + memories) — pin the no-op-fetch-max path: when the snapshot's `last_seq` already covers every event, the wrapper sees nothing during catch-up and the persisted `app_seq` survives unchanged.
 - The pre-existing `test_regression_snapshot_restore_preserves_app_seq_monotonicity` and `test_regression_open_from_snapshot_bumps_app_seq_past_replayed_events` continue to pass against the new piggyback path.
 
 API break: typed constructors and `NetDbBuilder::{build,build_from_snapshot}` are now async. Acceptable here because the library has not shipped a stable release yet.

@@ -681,6 +681,100 @@ async fn test_regression_snapshot_restore_preserves_app_seq_monotonicity() {
 }
 
 #[tokio::test]
+async fn test_open_returns_with_state_already_caught_up() {
+    // BUG #148 fix changed `TasksAdapter::open[_with_config]` to await
+    // the inner fold task's catch-up before returning. After this
+    // change a fresh adapter opened against a non-empty Redex sees
+    // the full state synchronously — no `wait_for_seq` required.
+    //
+    // Pre-fix the constructor returned immediately and the fold task
+    // ran concurrently, so reading state right after `open` could
+    // observe a partial replay. Pin the new "fully caught up" guarantee.
+    let redex = Redex::new();
+    {
+        let a = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
+        a.create(1, "first", 100).unwrap();
+        a.create(2, "second", 200).unwrap();
+        let seq = a.create(3, "third", 300).unwrap();
+        a.wait_for_seq(seq).await;
+        a.close().unwrap();
+    }
+
+    // Reopen and read state IMMEDIATELY — no wait_for_seq.
+    let b = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
+    let state = b.state();
+    let guard = state.read();
+    assert_eq!(
+        guard.len(),
+        3,
+        "post-open state must be fully caught up — saw {} tasks, expected 3",
+        guard.len(),
+    );
+}
+
+#[tokio::test]
+async fn test_open_on_empty_redex_does_not_block() {
+    // Edge case: `open` against a fresh empty Redex must not block
+    // on `wait_for_seq` (file.next_seq() == 0 → no events to await).
+    // Wrap in a tight tokio::time::timeout so a regression that
+    // accidentally awaits an unreachable seq surfaces as a test
+    // failure rather than a hung CI run.
+    let redex = Redex::new();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        TasksAdapter::open(&redex, ORIGIN),
+    )
+    .await;
+    assert!(
+        matches!(result, Ok(Ok(_))),
+        "open() on an empty Redex must complete promptly; got {result:?}",
+    );
+}
+
+#[tokio::test]
+async fn test_open_from_snapshot_with_empty_replay_tail_keeps_snapshot_app_seq() {
+    // When a snapshot's `last_seq` already covers every event in the
+    // file, the wrapper fold sees nothing during catch-up and the
+    // snapshot's persisted `app_seq` survives unchanged. The first
+    // post-restore ingest stamps `seq_or_ts = persisted_app_seq`.
+    let redex = Redex::new();
+    let tasks = TasksAdapter::open(&redex, ORIGIN).await.unwrap();
+    tasks.create(1, "a", 100).unwrap();
+    tasks.create(2, "b", 200).unwrap();
+    let seq = tasks.create(3, "c", 300).unwrap();
+    tasks.wait_for_seq(seq).await;
+
+    // Snapshot covers every event — replay tail will be empty.
+    let (state_bytes, last_seq) = tasks.snapshot().unwrap();
+    tasks.close().unwrap();
+
+    // Restore on a fresh Redex so `next_seq == 0` post-restore.
+    let redex2 = Redex::new();
+    let restored = TasksAdapter::open_from_snapshot(&redex2, ORIGIN, &state_bytes, last_seq)
+        .await
+        .unwrap();
+
+    // Persisted app_seq was 3 (three pre-snapshot ingests). The first
+    // post-restore ingest must stamp seq_or_ts = 3.
+    let new_seq = restored.create(4, "d", 400).unwrap();
+    restored.wait_for_seq(new_seq).await;
+
+    let file = redex2
+        .open_file(
+            &ChannelName::new(TASKS_CHANNEL).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+    let events = file.read_range(new_seq, new_seq + 1);
+    let meta = EventMeta::from_bytes(&events[0].payload[..EVENT_META_SIZE]).unwrap();
+    assert_eq!(
+        meta.seq_or_ts, 3,
+        "post-restore counter must continue from snapshot's persisted app_seq (got {}, expected 3)",
+        meta.seq_or_ts,
+    );
+}
+
+#[tokio::test]
 async fn test_regression_open_advances_app_seq_past_existing_same_origin_events() {
     // Regression for BUG #148 secondary-fix: pre-fix
     // `TasksAdapter::open` set `app_seq = AtomicU64::new(0)`
