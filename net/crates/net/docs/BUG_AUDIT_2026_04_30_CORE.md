@@ -159,6 +159,75 @@ The budget gate compares `active_count + count <= max_shards`, ignoring already-
 
 The phase-2 loop is meant to give "at least `max_delay × n_workers`" for in-flight batches sitting in the per-shard mpsc channels and the batch worker's pending-batch buffer to time out and dispatch (comment at lines 636-647 — explicitly added because #16's old single-window wait was too short). The early-break inside the loop calls `all_shards_empty()`, but that probes ring-buffer fill (`table.shards.iter().all(|s| s.lock().is_empty())`), which phase 1 already drained. With no concurrent ingest the predicate is constant-true after the first sleep window, so the early-break fires after exactly one `max_delay` regardless of `n_workers` — and the documented multi-worker budget is never observed. Phase 2 collapses back to the single-window behavior that #16 was supposed to replace; a flush-as-barrier caller on a many-shard config (default 8+) returning during a partial-batch dispatch sees the same pre-#16 silent loss. Either probe per-shard mpsc-channel depth directly (e.g. via a `pending_in_channel` counter incremented on `tx.send` and decremented on `rx.recv` in the batch worker), gate the break on a "no batches dispatched in last window" signal, or remove the early-break and pay the full budget.
 
+### 82. `manual_scale_down` strands events on drained shards
+**File:** `bus.rs:815-824` (compare scaling-monitor finalize at `bus.rs:935-952`)
+
+`manual_scale_down` calls `mapper.scale_down(count)` to mark shards `Draining` and returns the drained ids. Unlike the scaling-monitor path, it never calls `mapper.finalize_draining()` or `bus.remove_shard_internal(...)`. Events still queued in those shards' ring buffers (and any pushes that arrived between the read-locked early budget check and the write-locked state transition) sit unread until the scaling monitor catches up — which only fires if a monitor is running and reaches its next tick before `bus.shutdown()`. Bus configs without an active monitor lose those events on shutdown. Either drive the finalize loop synchronously inside `manual_scale_down`, or document the API as "requires `start_scaling_monitor` before use" and assert it at call time.
+
+### 83. `ShardManager::remove_shard` never drops the entry from `ShardMapper.shards` — unbounded growth across scale-up/down cycles
+**File:** `shard/mod.rs:819-872`
+
+`remove_shard` rebuilds the routing table (removing from `ShardTable`), drains the ring buffer, and decrements `num_shards`, but never asks the mapper to drop the corresponding `MappedShard` record. The mapper's `shards: RwLock<Vec<MappedShard>>` keeps growing — every scale-up appends an entry, and `remove_stopped_shards` is the only API that deletes them, but no production caller invokes it (only tests reference it). Long-running services with frequent scaling activity accumulate `Stopped` entries indefinitely; `evaluate_scaling` filters by state but still iterates the full list, so per-tick cost grows with cumulative scaling history. Wire `remove_shard` to call `mapper.remove_stopped_shards()` after the manager-level removal completes, or remove the specific id directly.
+
+### 86. Direct handshake `recv_from` on `Arc<UdpSocket>` races the dispatch receive loop
+**File:** `adapter/net/mesh.rs:6093-6118, 6155-6176` (dispatch loop spawn at `~2032`)
+
+`try_handshake_initiator` and `try_handshake_responder` poll `socket_arc.recv_from` directly. Once `start()` has spawned `spawn_receive_loop`, both consumers race for each datagram on the same `Arc<UdpSocket>`; tokio dispatches a UDP datagram to exactly one waiter. The handshake response can be swallowed by the dispatch loop, which then drops it because no matching session exists yet (~lines 2349-2364), and the handshake times out. Concurrent direct connects on the same node also steal each other's responses. Either bridge handshakes through an in-memory channel populated by the dispatch loop (forward msg2/msg3 datagrams to a per-pending-handshake oneshot keyed by `session_id`), or synchronize handshake initiation to suspend dispatch dequeue for the matching session.
+
+### 87. Mesh post-handshake `tokio::spawn` is fire-and-forget and can wedge peer/session/route on cancellation
+**File:** `adapter/net/mesh.rs:2553-2569` (state insert at `2524-2534`)
+
+After completing the responder handshake, the code inserts session, peer entry, routing entry, and `peer_addrs`, then `tokio::spawn`s a fire-and-forget `socket.send_to(&payload, next_hop).await` whose only rollback fires from inside the spawned future on socket-send error. If the runtime is shutting down or the spawned task is cancelled before the send completes, rollback never runs and the peer/session/route survive in an unsendable state — the responder holds session keys the initiator never received the matching msg2 for. There is no JoinHandle tracking. Either await the send synchronously on the handshake task, or track the JoinHandle alongside the rollback closure so cancellation triggers cleanup.
+
+### 88. Subnet gateway interprets `hop_ttl == 0` as unlimited rather than expired
+**File:** `adapter/net/subnet/gateway.rs:112` (AAD definition at `adapter/net/protocol.rs:319`)
+
+```rust
+if hop_ttl > 0 && hop_count >= hop_ttl {
+    // drop
+}
+```
+
+`NetHeader::new` defaults `hop_ttl` to 0, so any packet with default headers forwards regardless of `hop_count`. `hop_count` is excluded from AAD (per `protocol.rs:319`) and is mutable in transit, so an attacker or buggy peer can craft `hop_ttl=0` packets that loop through gateways with no Net-layer bound. Routing-layer TTL still bounds end-to-end loops for routed packets, but pure subnet-gateway forwarding paths (no routing header) lack any cap. Either treat `hop_ttl == 0` as expired (drop), set a sensible non-zero default in `NetHeader::new`, or pull `hop_ttl` into AAD so it cannot be downgraded mid-flight.
+
+### 89. Router `stream_stats` keyed by AEAD-unverified bytes — DashMap flood
+**File:** `adapter/net/router.rs:475-481`
+
+```rust
+let stream_id = if data.len() >= ROUTING_HEADER_SIZE + HEADER_SIZE {
+    let net_header = &data[ROUTING_HEADER_SIZE..ROUTING_HEADER_SIZE + HEADER_SIZE];
+    u64::from_le_bytes(net_header[32..40].try_into().unwrap_or([0; 8]))
+} else {
+    0
+};
+```
+
+The router extracts the inner `stream_id` from raw packet bytes before AEAD verification and inserts an entry into the `stream_stats` DashMap keyed by that value. A malicious peer can spam routed packets with random `stream_id` values to exhaust router memory; `cleanup_idle_streams` runs on an interval, so growth is bounded only by the cleanup period. Either gate `stream_stats` insertion on a successful AEAD verify, cap the DashMap with an LRU/size-bounded policy, or restrict accounting to known/registered `stream_id`s.
+
+### 90. `BatchedTransport::recv_batch` indexes empty `recv_buffers` constructed via `new_send_only`
+**File:** `adapter/net/linux.rs:215, 285` (constructor at `48-50`)
+
+`BatchedTransport::new_send_only` intentionally skips the `recv_buffers` allocation. Both `recv_batch` and `recv_batch_blocking` then unconditionally do `self.recv_buffers[i].resize(MAX_PACKET_SIZE, 0)` for `i in 0..count`, which panics with index-out-of-bounds for any send-only-constructed instance. The doc comment on `new_send_only` only states the contract verbally; there is no runtime guard. Either return an `InvalidOperation` error from the recv methods when `recv_buffers` is empty, or split the type so send-only construction returns a different type that lacks the recv methods at compile time.
+
+### 91. `analyze_subnet_correlation` returns a non-deterministic subnet on tied depth
+**File:** `adapter/net/contested/correlation.rs:249-257`
+
+```rust
+for (&subnet, &count) in &subnet_counts {
+    if count >= threshold && subnet.depth() >= best_depth {
+        best_subnet = Some(subnet);
+        best_depth = subnet.depth();
+    }
+}
+```
+
+`HashMap` iteration is unordered, and the predicate uses `>=` on depth as the tie-breaker, so when two subnets at the same `best_depth` both meet the threshold, the chosen subnet depends on hash iteration order (randomized per process). Downstream `partition.rs::detect` uses the chosen subnet to brand the partition record, and recovery scope flips between runs given identical inputs. Switch to a deterministic tiebreaker (e.g. lowest subnet id at equal depth, or strictly `>` with a documented "first seen wins" semantic that uses an ordered iterator).
+
+### 96. Redex `read_timestamps` accepts ts file with stale per-position semantics after torn-tail recovery
+**File:** `adapter/net/redex/disk.rs:298-310` (rewrite branch at `384-399`)
+
+`read_timestamps` accepts a ts file as long as `bytes.len() >= expected_entries * 8` and returns the first `expected_entries` u64s. This assumes the ts file's per-position semantics align with idx's, but if a previous run truncated idx via the torn-tail walk (`open` ~lines 247-266) without rewriting ts, the surviving entries' timestamps are misaligned (the first N timestamps refer to the *first* N entries the ts file ever held, not the surviving ones after truncation). The recovery code only rewrites ts when `bad_entries > 0`; torn-tail truncations skip the rewrite. Age-based retention then operates on wrong timestamps. Either rewrite ts whenever idx is truncated for any reason (capturing the surviving timestamps and rewriting in order), or store timestamps inside idx records.
+
 ## Low
 
 ### 68. `JetStreamAdapterConfig::max_messages` / `max_bytes` typed `i64`, not validated for negatives
@@ -199,17 +268,24 @@ The phase-2 loop is meant to give "at least `max_delay × n_workers`" for in-fli
 
 ## Top priorities to fix first
 
-1. **#55** — JetStream `direct_get` retention-rollover stall (consumer DoS after MAXLEN trim)
-2. **#57** — Redis MULTI/EXEC timeout duplicates (silent stream corruption)
-3. **#58** — `net_free_bytes` panic-across-FFI on adversarial `len`
-4. **#59** — Bus shutdown timeout strands events despite the "no stranding" contract
-5. **#56** — JetStream cross-process retry duplicates (inverse trade-off of #9's fix)
-6. **#63** — NaN thresholds silently disable auto-scaling
-7. **#64** — `scale_up_provisioning` + `activate` over-allocates past `max_shards`
-8. **#66** — `update_from_events` cursor regression on unsorted input (re-delivery)
-9. **#75** — `add_shard_internal` permanent worker leak on activate failure
-10. **#76** — `flush()` phase-2 barrier collapses to one window (re-introduces #16-class loss on many-shard configs)
+1. **#80** — `Net::shutdown` silently no-ops with outstanding Arc clones (silent data loss on the documented graceful-shutdown path; trivially reproducible via `subscribe`)
+2. **#92** — Redex `compact_to` in-memory vs on-disk offset divergence (every event after retention sweep silently lost on restart — directly breaks the "redex-disk" merge's stated goal)
+3. **#55** — JetStream `direct_get` retention-rollover stall (consumer DoS after MAXLEN trim)
+4. **#57** — Redis MULTI/EXEC timeout duplicates (silent stream corruption)
+5. **#58** — `net_free_bytes` panic-across-FFI on adversarial `len`
+6. **#84** — `RxCreditState` auto-grants every consumed byte, defeating receive-side backpressure entirely
+7. **#59** — Bus shutdown timeout strands events despite the "no stranding" contract
+8. **#56** — JetStream cross-process retry duplicates (inverse trade-off of #9's fix)
+9. **#93** — Redex `compact_to` non-atomic three-rename + missing dir fsync (compounds #92 into segment corruption on crash)
+10. **#85** — Mesh dispatch fast-paths heartbeats without AEAD verify (off-path heartbeat spoofing defeats idle timeout)
+11. **#63** — NaN thresholds silently disable auto-scaling
+12. **#64** — `scale_up_provisioning` + `activate` over-allocates past `max_shards`
+13. **#66** — `update_from_events` cursor regression on unsorted input (re-delivery)
+14. **#75** — `add_shard_internal` permanent worker leak on activate failure
+15. **#76** — `flush()` phase-2 barrier collapses to one window (re-introduces #16-class loss on many-shard configs)
 
 ## Out of scope (deferred)
 
-The `adapter/net/` UDP transport stack — `cortex/`, `redex/`, `swarm/`, `traversal/`, `state/`, `behavior/`, `compute/`, `continuity/` — was not re-audited in this pass. The previous audit ([BUG_AUDIT_2026_04_30.md](./BUG_AUDIT_2026_04_30.md)) covers those subsystems through #54.
+The `adapter/net/` UDP transport stack — `cortex/`, `swarm/`, `traversal/`, `state/`, `behavior/`, `compute/`, `continuity/` — was not re-audited in this pass. The previous audit ([BUG_AUDIT_2026_04_30.md](./BUG_AUDIT_2026_04_30.md)) covers those subsystems through #54.
+
+The follow-up sweep that produced #80–#96 did spot-check `redex/`, `mesh.rs`, `session.rs`, `router.rs`, `linux.rs`, `subnet/gateway.rs`, `contested/correlation.rs`, and `sdk/src/net.rs`, but those were targeted point-checks, not a systematic re-audit — additional defects in those files may remain.
