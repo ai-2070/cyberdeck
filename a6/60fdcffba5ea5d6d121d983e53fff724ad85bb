@@ -1,0 +1,36 @@
+net/crates/net/docs/BUG_AUDIT_2026_04_30_CORE.md
+  e6249cc4d0fbb4d9 24-31,34,477-616,657-701,735-743,747,749,751
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "a660fdcffba5ea5d6d121d983e53fff724ad85bb",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3584,
+      "total_deletions": 70,
+      "accepted_lines": 367,
+      "overriden_lines": 0
+    },
+    "e6249cc4d0fbb4d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "66b90dd2-a816-46e4-bc95-27b99d9a39ff",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 207,
+      "total_deletions": 6,
+      "accepted_lines": 206,
+      "overriden_lines": 0
+    }
+  }
+}
