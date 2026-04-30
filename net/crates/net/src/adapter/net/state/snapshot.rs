@@ -345,10 +345,10 @@ impl StateSnapshot {
         }
 
         let state = Bytes::copy_from_slice(&cursor[..state_len]);
-        // BUG_REPORT.md #40: enforce strict length. The v1 path
-        // already does this; v0 silently accepted trailing bytes,
-        // which made the parser tolerant to corrupted / partial
-        // input that should be rejected.
+        // Enforce strict length. The v1 path already does this; v0
+        // silently accepted trailing bytes, which made the parser
+        // tolerant to corrupted / partial input that should be
+        // rejected.
         if cursor.len() != state_len {
             return None;
         }

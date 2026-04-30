@@ -71,15 +71,14 @@ impl SubprotocolManifest {
 
     /// Deserialize from bytes.
     ///
-    /// BUG_REPORT.md #10: previously this accepted trailing
-    /// garbage past the declared `count` entries, and never
-    /// de-duplicated entry `id`s. A peer could advertise the
-    /// same subprotocol id twice — once with a strict version,
-    /// once with a permissive one — and whichever landed last
-    /// in `remote_by_id` would win, enabling a downgrade
-    /// attack. Now both inputs are rejected with `None`,
-    /// matching the strict-length contract on
-    /// `IdentityEnvelope::from_bytes` and
+    /// Previously this accepted trailing garbage past the declared
+    /// `count` entries, and never de-duplicated entry `id`s. A peer
+    /// could advertise the same subprotocol id twice — once with a
+    /// strict version, once with a permissive one — and whichever
+    /// landed last in `remote_by_id` would win, enabling a downgrade
+    /// attack. Now both inputs are rejected with `None`, matching
+    /// the strict-length contract on `IdentityEnvelope::from_bytes`
+    /// and
     /// `PermissionToken::from_bytes`.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < 2 {

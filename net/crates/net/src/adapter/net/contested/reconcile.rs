@@ -158,15 +158,15 @@ pub fn reconcile_entity(
             // from the same parent), so we hash each side's divergent payload
             // for a perspective-independent tiebreak.
             //
-            // BUG_REPORT.md #24: previously `our <= their` picked
-            // `Side::Ours` on equality. On a true xxh3 collision —
-            // OR identical payloads at divergence (easy under
-            // idempotent retries from both peers) — both sides
-            // evaluated `our <= their` to true and picked
-            // `Side::Ours` locally, so partitions never converged.
-            // Add a second-tier tiebreak on the raw payload bytes
-            // (lex order); if the bytes are identical too,
-            // tiebreak on `origin_hash` of the *parent* chain so
+            // Previously `our <= their` picked `Side::Ours` on
+            // equality. On a true xxh3 collision — OR identical
+            // payloads at divergence (easy under idempotent retries
+            // from both peers) — both sides evaluated `our <= their`
+            // to true and picked `Side::Ours` locally, so partitions
+            // never converged. Add a second-tier tiebreak on the raw
+            // payload bytes (lex order); if the bytes are identical
+            // too, tiebreak on `origin_hash` of the *parent* chain
+            // so
             // both sides agree without consulting a randomized
             // identifier.
             let winning_side = if our_len > their_len {

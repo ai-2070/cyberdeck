@@ -185,15 +185,15 @@ impl FailureDetector {
 
     /// Record a heartbeat from a node
     ///
-    /// BUG_REPORT.md #14: previously the recovery callback was
-    /// invoked inside `entry().and_modify(...)`, which holds the
-    /// DashMap shard's write lock. A user-supplied callback that
-    /// re-entered the same shard (or any structure ordered against
-    /// it) deadlocked; even without deadlock, every concurrent
-    /// `heartbeat` hashing to the same shard stalled while the
-    /// callback ran. The fix collects a "should I notify?" flag
-    /// inside the closure and fires the callback *after* the
-    /// `and_modify` returns, releasing the shard lock.
+    /// Previously the recovery callback was invoked inside
+    /// `entry().and_modify(...)`, which holds the DashMap shard's
+    /// write lock. A user-supplied callback that re-entered the same
+    /// shard (or any structure ordered against it) deadlocked; even
+    /// without deadlock, every concurrent `heartbeat` hashing to the
+    /// same shard stalled while the callback ran. The fix collects a
+    /// "should I notify?" flag inside the closure and fires the
+    /// callback *after* the `and_modify` returns, releasing the
+    /// shard lock.
     pub fn heartbeat(&self, node_id: u64, addr: SocketAddr) {
         let mut should_notify_recovery = false;
         self.nodes
@@ -218,14 +218,14 @@ impl FailureDetector {
 
     /// Check all nodes for failures
     ///
-    /// BUG_REPORT.md #14: callbacks are now invoked *after* the
-    /// `iter_mut` loop has dropped its shard locks. Previously
-    /// `cb(*entry.key())` ran inside the iteration, with the
-    /// per-shard write lock still held — a user-supplied callback
-    /// that touched another DashMap entry on the same shard (or
-    /// re-entered the failure detector itself via `heartbeat` /
-    /// `status`) would deadlock. We collect the failed ids first,
-    /// release the iteration locks, then fire the callbacks.
+    /// Callbacks are now invoked *after* the `iter_mut` loop has
+    /// dropped its shard locks. Previously `cb(*entry.key())` ran
+    /// inside the iteration, with the per-shard write lock still
+    /// held — a user-supplied callback that touched another DashMap
+    /// entry on the same shard (or re-entered the failure detector
+    /// itself via `heartbeat` / `status`) would deadlock. We collect
+    /// the failed ids first, release the iteration locks, then fire
+    /// the callbacks.
     pub fn check_all(&self) -> Vec<u64> {
         let mut newly_failed = Vec::new();
 

@@ -234,13 +234,13 @@ pub fn validate_chain_link(
 ///
 /// Result of a `write_causal_events` call.
 ///
-/// BUG_REPORT.md #43: callers of this writer typically pass the
-/// pre-write `events.len()` to a downstream framing layer (e.g. as
-/// the `count` field on the next packet header) so the reader can
-/// know how many `[len][link][payload]` triples to expect. If the
-/// writer silently `continue`s past oversized events, the framing
-/// count and the actual events serialized mismatch — and
-/// `read_causal_events` parses junk for the missing slots.
+/// Callers of this writer typically pass the pre-write `events.len()`
+/// to a downstream framing layer (e.g. as the `count` field on the
+/// next packet header) so the reader can know how many
+/// `[len][link][payload]` triples to expect. If the writer silently
+/// `continue`s past oversized events, the framing count and the
+/// actual events serialized mismatch — and `read_causal_events`
+/// parses junk for the missing slots.
 ///
 /// Surface both numbers so the caller can either:
 ///   - Use `events_written` as the framing count (correct), or
@@ -265,8 +265,7 @@ pub struct WriteCausalEventsResult {
 /// an FFI path forwarding arbitrary `Bytes` could — making a crash
 /// on oversized input a DoS vector. Callers MUST use the returned
 /// `events_written` as the framing count, not the input slice's
-/// length, or the reader will parse past valid data into noise
-/// (BUG_REPORT.md #43).
+/// length, or the reader will parse past valid data into noise.
 pub fn write_causal_events(
     events: &[CausalEvent],
     buf: &mut BytesMut,

@@ -189,12 +189,11 @@ impl ForkRecord {
     /// callers framing this type inside a larger payload could
     /// smuggle extra bytes past the parser.
     ///
-    /// BUG_REPORT.md #42: also runs `verify()` before returning,
-    /// so a structurally-bogus record (sentinel mismatch, origin
-    /// collision, etc.) cannot reach a caller that forgot to
-    /// call `verify` themselves. Callers that need the raw
-    /// bytes-only parse for diagnostics can use
-    /// [`Self::from_bytes_unchecked`].
+    /// Also runs `verify()` before returning, so a
+    /// structurally-bogus record (sentinel mismatch, origin collision,
+    /// etc.) cannot reach a caller that forgot to call `verify`
+    /// themselves. Callers that need the raw bytes-only parse for
+    /// diagnostics can use [`Self::from_bytes_unchecked`].
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         let parsed = Self::from_bytes_unchecked(data)?;
         if !parsed.verify() {

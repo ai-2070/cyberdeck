@@ -156,14 +156,13 @@ fn runtime() -> &'static Arc<Runtime> {
     })
 }
 
-/// BUG_REPORT.md #18: `'a` is now bound to the lifetime of an
-/// input reference (`&p`) so the caller cannot pick `'static` and
-/// produce a dangling borrow. The borrow lives only as long as
-/// the local stack frame holding the pointer — which is the
-/// caller's responsibility to keep valid for the duration of any
-/// resulting `&str` use, but no longer. Compare `cortex.rs::
-/// c_str_to_owned` which sidesteps the issue entirely by
-/// returning `Option<String>`.
+/// `'a` is now bound to the lifetime of an input reference (`&p`)
+/// so the caller cannot pick `'static` and produce a dangling
+/// borrow. The borrow lives only as long as the local stack frame
+/// holding the pointer — which is the caller's responsibility to
+/// keep valid for the duration of any resulting `&str` use, but no
+/// longer. Compare `cortex.rs::c_str_to_owned` which sidesteps the
+/// issue entirely by returning `Option<String>`.
 ///
 /// # Safety
 /// Caller must ensure `p` is null or points to a NUL-terminated C
@@ -176,12 +175,11 @@ unsafe fn c_str_to_str<'a>(p: &'a *const c_char) -> Option<&'a str> {
     CStr::from_ptr(*p).to_str().ok()
 }
 
-/// BUG_REPORT.md #45: null-check `out_ptr` and `out_len` before
-/// writing through them. The helper is callable from any FFI
-/// boundary; a future caller forgetting to check produced UB
-/// (write through null). Returns `NetError::NullPointer` so the
-/// FFI caller can distinguish "I forgot to provide outputs" from
-/// "the operation failed."
+/// Null-check `out_ptr` and `out_len` before writing through them.
+/// The helper is callable from any FFI boundary; a future caller
+/// forgetting to check produced UB (write through null). Returns
+/// `NetError::NullPointer` so the FFI caller can distinguish "I
+/// forgot to provide outputs" from "the operation failed."
 fn write_json_out<T: Serialize>(
     value: &T,
     out_ptr: *mut *mut c_char,
@@ -1141,12 +1139,12 @@ unsafe fn collect_payloads(
     Some(out)
 }
 
-/// BUG_REPORT.md #19: ensure the supplied stream handle was
-/// created by the supplied node handle. Without this check,
-/// `net_mesh_send` would happily route bytes through whichever
-/// `MeshNode` was passed, even if the stream belonged to a
-/// different one — silent cross-session traffic. `Arc::ptr_eq`
-/// is O(1) and definitive: stream handles cache the originating
+/// Ensure the supplied stream handle was created by the supplied
+/// node handle. Without this check, `net_mesh_send` would happily
+/// route bytes through whichever `MeshNode` was passed, even if the
+/// stream belonged to a different one — silent cross-session
+/// traffic. `Arc::ptr_eq` is O(1) and definitive: stream handles
+/// cache the originating
 /// node Arc in `_node` for exactly this purpose.
 #[inline]
 fn handles_match(sh: &MeshStreamHandle, nh: &MeshNodeHandle) -> bool {

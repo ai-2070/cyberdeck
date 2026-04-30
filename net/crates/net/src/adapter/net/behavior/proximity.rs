@@ -188,13 +188,12 @@ impl EnhancedPingwave {
             capability_hash: u64::from_le_bytes(buf[50..58].try_into().ok()?),
             capability_version: u32::from_le_bytes(buf[58..62].try_into().ok()?),
             load_level: buf[62],
-            // BUG_REPORT.md #38: previously coerced any unknown
-            // byte to `HealthStatus::Unknown`. A flipped byte
-            // downgrades the peer to `Unknown`, which
-            // `can_receive_traffic()` treats as unroutable —
-            // silent peer eviction on a single bit-flip.
-            // `from_bytes` callers already handle `None` (this
-            // returns `Option<Self>`), so refuse the parse on
+            // Previously coerced any unknown byte to
+            // `HealthStatus::Unknown`. A flipped byte downgrades the
+            // peer to `Unknown`, which `can_receive_traffic()` treats
+            // as unroutable — silent peer eviction on a single
+            // bit-flip. `from_bytes` callers already handle `None`
+            // (this returns `Option<Self>`), so refuse the parse on
             // unknown discriminants instead of guessing.
             health: match buf[63] {
                 0 => HealthStatus::Healthy,

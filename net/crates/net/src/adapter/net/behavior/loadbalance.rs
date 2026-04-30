@@ -633,17 +633,16 @@ impl LoadBalancer {
         const MAX_RESERVATION_RETRIES: usize = 4;
         let max_conn = self.config.max_connections_per_endpoint;
 
-        // BUG_REPORT.md #39: round-robin strategies advance
-        // `rr_counter` inside their selection function. The retry
-        // loop below could call them up to 4 times per logical
-        // `select()`, which inflated the rotation counter
-        // proportionally and distorted the observed RR sequence
-        // — weighted-RR distribution tests indirectly assumed
-        // 1:1. We pre-compute the RR offset once for this whole
-        // logical selection and step deterministically across
+        // Round-robin strategies advance `rr_counter` inside their
+        // selection function. The retry loop below could call them up
+        // to 4 times per logical `select()`, which inflated the
+        // rotation counter proportionally and distorted the observed
+        // RR sequence — weighted-RR distribution tests indirectly
+        // assumed 1:1. We pre-compute the RR offset once for this
+        // whole logical selection and step deterministically across
         // retries via `(rr_offset + attempt)`, so the counter
-        // advances exactly once per `select()` regardless of
-        // how many reservation retries occur.
+        // advances exactly once per `select()` regardless of how many
+        // reservation retries occur.
         let rr_offset_for_this_select =
             self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
 
@@ -772,9 +771,9 @@ impl LoadBalancer {
         self.select_round_robin_at(endpoints, offset)
     }
 
-    /// BUG_REPORT.md #39: offset-based variant used by the
-    /// retry loop in `select()` so a logical select advances the
-    /// `rr_counter` exactly once across all reservation retries.
+    /// Offset-based variant used by the retry loop in `select()` so
+    /// a logical select advances the `rr_counter` exactly once across
+    /// all reservation retries.
     fn select_round_robin_at(
         &self,
         endpoints: &[Arc<EndpointState>],
@@ -795,9 +794,9 @@ impl LoadBalancer {
         self.select_weighted_round_robin_at(endpoints, counter)
     }
 
-    /// BUG_REPORT.md #39: offset-based variant used by `select()`
-    /// across reservation retries so the `rr_counter` advances
-    /// exactly once per logical select.
+    /// Offset-based variant used by `select()` across reservation
+    /// retries so the `rr_counter` advances exactly once per logical
+    /// select.
     fn select_weighted_round_robin_at(
         &self,
         endpoints: &[Arc<EndpointState>],

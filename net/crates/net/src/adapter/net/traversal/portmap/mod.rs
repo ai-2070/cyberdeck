@@ -562,21 +562,19 @@ impl PortMapperTask {
 
         // Step 3: renewal loop.
         //
-        // BUG_REPORT.md #21: respect the granted lease TTL — a
-        // gateway that grants 60s leases should be renewed on
-        // a ~30s cadence, not the configured 30-minute default.
-        // We pick `min(renewal_interval, mapping.ttl/2)` as the
-        // effective tick so a short-lease gateway doesn't leave
-        // the mesh advertising a dead address for ~29 of every
-        // 30 minutes.
+        // Respect the granted lease TTL — a gateway that grants 60s
+        // leases should be renewed on a ~30s cadence, not the
+        // configured 30-minute default. We pick
+        // `min(renewal_interval, mapping.ttl/2)` as the effective
+        // tick so a short-lease gateway doesn't leave the mesh
+        // advertising a dead address for ~29 of every 30 minutes.
         //
-        // BUG_REPORT.md #22: on a transient renewal failure we
-        // wait a short `RETRY_BACKOFF` (200ms) and try again
-        // before counting it against `RENEWAL_FAILURE_THRESHOLD`.
-        // Previously a single hiccup ate the full ticker
-        // interval before the next attempt — with a 60s lease
-        // and 30min ticker that's 90+ minutes of dead-address
-        // advertisement before revoke fires.
+        // On a transient renewal failure we wait a short
+        // `RETRY_BACKOFF` (200ms) and try again before counting it
+        // against `RENEWAL_FAILURE_THRESHOLD`. Previously a single
+        // hiccup ate the full ticker interval before the next attempt
+        // — with a 60s lease and 30min ticker that's 90+ minutes of
+        // dead-address advertisement before revoke fires.
         const RETRY_BACKOFF: Duration = Duration::from_millis(200);
 
         // Free helper rather than a closure so it doesn't capture

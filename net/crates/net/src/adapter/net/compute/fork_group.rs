@@ -266,10 +266,10 @@ impl ForkGroup {
                 .unwrap()
                 .origin_hash;
 
-            // BUG_REPORT.md #7: try `place_with_spread` BEFORE
-            // touching the registry so a placement failure
-            // doesn't leave the slot unregistered (and therefore
-            // unrecoverable via `on_node_recovery`).
+            // Try `place_with_spread` BEFORE touching the registry
+            // so a placement failure doesn't leave the slot
+            // unregistered (and therefore unrecoverable via
+            // `on_node_recovery`).
 
             // Recover the same keypair from stored secret
             let fork_info = match self.forks.get(index as usize) {

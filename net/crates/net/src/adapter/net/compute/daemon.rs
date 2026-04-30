@@ -51,14 +51,14 @@ pub trait MeshDaemon: Send + Sync {
     /// Whether this daemon carries persistent state that
     /// migration / restart paths must preserve.
     ///
-    /// BUG_REPORT.md #23: the default `restore` previously
-    /// accepted any bytes silently for daemons that didn't
-    /// override it, including ones that *should* have been
-    /// stateful but forgot to provide a `restore` impl. The new
-    /// default restores correctly: it matches `is_stateful()`'s
-    /// answer. Stateless daemons leave `is_stateful` at `false`
-    /// (matches `snapshot() = None`); stateful daemons override
-    /// `is_stateful` to `true` AND `snapshot` / `restore`.
+    /// The default `restore` previously accepted any bytes silently
+    /// for daemons that didn't override it, including ones that
+    /// *should* have been stateful but forgot to provide a `restore`
+    /// impl. The new default restores correctly: it matches
+    /// `is_stateful()`'s answer. Stateless daemons leave
+    /// `is_stateful` at `false` (matches `snapshot() = None`);
+    /// stateful daemons override `is_stateful` to `true` AND
+    /// `snapshot` / `restore`.
     ///
     /// The migration path can use this to refuse to migrate a
     /// stateful daemon's snapshot bytes into a stateless target,
@@ -72,14 +72,14 @@ pub trait MeshDaemon: Send + Sync {
     ///
     /// Called before any `process()` calls after migration.
     ///
-    /// BUG_REPORT.md #23: the default implementation now refuses
-    /// non-empty state on stateless daemons (`is_stateful() ==
-    /// false`) — silently discarding a stateful source's snapshot
-    /// into a stateless target loses every byte of state with no
-    /// signal. Stateful daemons must override both `is_stateful`
-    /// and `restore`. An empty `state` is still accepted (it's
-    /// what `snapshot() -> None` produces under the migration
-    /// adapter), so genuine stateless-to-stateless migrations
+    /// The default implementation now refuses non-empty state on
+    /// stateless daemons (`is_stateful() == false`) — silently
+    /// discarding a stateful source's snapshot into a stateless
+    /// target loses every byte of state with no signal. Stateful
+    /// daemons must override both `is_stateful` and `restore`. An
+    /// empty `state` is still accepted (it's what
+    /// `snapshot() -> None` produces under the migration adapter),
+    /// so genuine stateless-to-stateless migrations
     /// continue to work.
     fn restore(&mut self, state: Bytes) -> Result<(), DaemonError> {
         if !self.is_stateful() && !state.is_empty() {

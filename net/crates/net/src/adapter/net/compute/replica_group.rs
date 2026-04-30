@@ -174,11 +174,10 @@ impl ReplicaGroup {
 
         if n > current {
             let requirements = daemon_factory().requirements();
-            // BUG_REPORT.md #6: `used_nodes` must be `mut` and
-            // updated inside the loop. Without this insert,
-            // `place_with_spread` sees the same exclusion set
-            // every iteration and returns the same first
-            // non-excluded node — colocating every new replica
+            // `used_nodes` must be `mut` and updated inside the loop.
+            // Without this insert, `place_with_spread` sees the same
+            // exclusion set every iteration and returns the same
+            // first non-excluded node — colocating every new replica
             // on a single node, defeating the spread invariant.
             // `fork_group.rs:185-199` already did this correctly;
             // bring this loop into parity.
@@ -249,13 +248,12 @@ impl ReplicaGroup {
                 .unwrap()
                 .origin_hash;
 
-            // BUG_REPORT.md #7: previously we did `unregister`
-            // *before* `place_with_spread`. If placement
-            // failed, the loop `continue`d with the slot
-            // marked unhealthy AND unregistered — and
-            // `on_node_recovery` only re-marks members that are
-            // still registered, so the slot was effectively dead
-            // until the next external `scale_to`.
+            // Previously we did `unregister` *before*
+            // `place_with_spread`. If placement failed, the loop
+            // `continue`d with the slot marked unhealthy AND
+            // unregistered — and `on_node_recovery` only re-marks
+            // members that are still registered, so the slot was
+            // effectively dead until the next external `scale_to`.
             //
             // The fix: try `place_with_spread` BEFORE touching
             // the registry. On placement failure, the slot is

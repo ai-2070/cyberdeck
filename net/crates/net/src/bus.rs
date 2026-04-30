@@ -260,12 +260,12 @@ impl EventBus {
     /// Start the scaling monitor (if dynamic scaling is enabled).
     /// This spawns a background task that periodically evaluates scaling decisions.
     ///
-    /// BUG_REPORT.md #24: the spawned task holds a `Weak<Self>`
-    /// rather than a strong `Arc<Self>` clone. With a strong clone
-    /// the task kept the bus alive forever, and `shutdown(self)`
-    /// (which consumes by value) was unreachable: callers with an
-    /// `Arc<EventBus>` could not `Arc::try_unwrap` to consume it
-    /// because the spawned task always held one of the strong refs.
+    /// The spawned task holds a `Weak<Self>` rather than a strong
+    /// `Arc<Self>` clone. With a strong clone the task kept the bus
+    /// alive forever, and `shutdown(self)` (which consumes by value)
+    /// was unreachable: callers with an `Arc<EventBus>` could not
+    /// `Arc::try_unwrap` to consume it because the spawned task always
+    /// held one of the strong refs.
     ///
     /// With a `Weak`, the monitor task upgrades each tick. Once the
     /// last caller-held `Arc` is dropped, the upgrade fails and the
@@ -288,13 +288,13 @@ impl EventBus {
 
     /// Internal: Add a new shard with its workers.
     ///
-    /// BUG_REPORT.md #46: the previous implementation called
-    /// `shard_manager.add_shard()` first, which atomically marked
-    /// the shard `Active` and published it to the routing table. So
-    /// `select_shard` could route producer pushes to the new id
-    /// *before* any drain or batch worker existed, leaving events
-    /// queued in a buffer with no consumer (and triggering the
-    /// configured backpressure mode if the buffer filled).
+    /// The previous implementation called `shard_manager.add_shard()`
+    /// first, which atomically marked the shard `Active` and published
+    /// it to the routing table. So `select_shard` could route producer
+    /// pushes to the new id *before* any drain or batch worker existed,
+    /// leaving events queued in a buffer with no consumer (and
+    /// triggering the configured backpressure mode if the buffer
+    /// filled).
     ///
     /// The fix uses the two-phase API on `ShardManager`:
     ///   1. `add_shard()` allocates the id and metrics collector,
@@ -356,12 +356,12 @@ impl EventBus {
 
     /// Internal: Remove a stopped shard.
     ///
-    /// BUG_REPORT.md #47: previously this dropped the worker
-    /// `JoinHandle`s and unmapped the shard without first draining
-    /// its ring buffer. Any events still queued at the moment of
-    /// removal — even just a few from a producer that pushed
-    /// concurrently with the scale-down decision — were silently
-    /// stranded once the drain worker exited on `with_shard → None`.
+    /// Previously this dropped the worker `JoinHandle`s and unmapped
+    /// the shard without first draining its ring buffer. Any events
+    /// still queued at the moment of removal — even just a few from a
+    /// producer that pushed concurrently with the scale-down decision
+    /// — were silently stranded once the drain worker exited on
+    /// `with_shard → None`.
     ///
     /// The fix:
     ///   1. Wait for the drain worker we're about to retire to flush
@@ -607,14 +607,13 @@ impl EventBus {
     /// inside each batch worker to time out and dispatch — and only
     /// then calls `adapter.flush()`. Bounded by 5 s overall.
     ///
-    /// BUG_REPORT.md #16: the previous implementation slept a
-    /// single `batch.max_delay` (default 10 ms) after the ring
-    /// buffers drained and immediately called `adapter.flush()`.
-    /// Events still in transit through the per-shard mpsc channel,
-    /// the batch worker's pending batch, or the in-progress
-    /// `adapter.on_batch` call (bounded only by `adapter_timeout`,
-    /// default 30 s) could miss the flush. Callers using `flush()`
-    /// as a delivery barrier silently lost events.
+    /// The previous implementation slept a single `batch.max_delay`
+    /// (default 10 ms) after the ring buffers drained and immediately
+    /// called `adapter.flush()`. Events still in transit through the
+    /// per-shard mpsc channel, the batch worker's pending batch, or
+    /// the in-progress `adapter.on_batch` call (bounded only by
+    /// `adapter_timeout`, default 30 s) could miss the flush. Callers
+    /// using `flush()` as a delivery barrier silently lost events.
     pub async fn flush(&self) -> Result<(), AdapterError> {
         let start = tokio::time::Instant::now();
         let timeout = Duration::from_secs(5);
@@ -711,12 +710,12 @@ impl EventBus {
         // below.
         self.shutdown.store(true, AtomicOrdering::SeqCst);
 
-        // 1a. BUG_REPORT.md #6: wait for in-flight ingests to drain
-        // BEFORE the drain workers do their final ring-buffer sweep.
-        // Otherwise a producer that observed `shutdown=false` could
-        // push *after* the drain worker's last `pop_batch_into`
-        // returned zero, leaving the event stranded in the ring
-        // buffer when the bus is dropped.
+        // 1a. Wait for in-flight ingests to drain BEFORE the drain
+        // workers do their final ring-buffer sweep. Otherwise a
+        // producer that observed `shutdown=false` could push *after*
+        // the drain worker's last `pop_batch_into` returned zero,
+        // leaving the event stranded in the ring buffer when the bus
+        // is dropped.
         //
         // This is bounded: every producer either bails on the
         // SeqCst-synchronized shutdown check (no progress past the
@@ -833,14 +832,14 @@ impl Drop for EventBus {
         // cannot await futures in Drop, but setting the atomic flag
         // triggers eventual termination.
         //
-        // BUG_REPORT.md #34: previously used `Release` here while
-        // `try_enter_ingest` and `shutdown()` use `SeqCst` on the
-        // same flag. `&mut self` exclusion makes that sound today
-        // (no concurrent ingest can observe a half-published
-        // shutdown). The mismatch is purely defensive — switching
-        // to `SeqCst` matches the rest of the lifecycle and removes
-        // a footgun if a future change ever opened a path where
-        // `Drop` overlaps an in-flight `try_enter_ingest`.
+        // Previously used `Release` here while `try_enter_ingest`
+        // and `shutdown()` use `SeqCst` on the same flag. `&mut self`
+        // exclusion makes that sound today (no concurrent ingest can
+        // observe a half-published shutdown). The mismatch is purely
+        // defensive — switching to `SeqCst` matches the rest of the
+        // lifecycle and removes a footgun if a future change ever
+        // opened a path where `Drop` overlaps an in-flight
+        // `try_enter_ingest`.
         self.shutdown.store(true, AtomicOrdering::SeqCst);
         // Also release the drain-finalize gate so any drain worker
         // already parked waiting for it can proceed and exit. Without
@@ -852,14 +851,13 @@ impl Drop for EventBus {
         self.drain_finalize_ready
             .store(true, AtomicOrdering::SeqCst);
 
-        // BUG_REPORT.md #17: if `shutdown()` was never awaited, any
-        // events still in the per-shard ring buffers or mpsc
-        // channels are lost — the adapter's `flush()` and
-        // `shutdown()` won't run, so durable backends never see
-        // them. We can't fix that from `Drop` (no async), but we
-        // *can* surface the data-loss risk loudly so it doesn't
-        // hide. The check is bounded to "shutdown was never
-        // started"; an in-progress shutdown is fine because the
+        // If `shutdown()` was never awaited, any events still in the
+        // per-shard ring buffers or mpsc channels are lost — the
+        // adapter's `flush()` and `shutdown()` won't run, so durable
+        // backends never see them. We can't fix that from `Drop` (no
+        // async), but we *can* surface the data-loss risk loudly so
+        // it doesn't hide. The check is bounded to "shutdown was
+        // never started"; an in-progress shutdown is fine because the
         // call site is awaiting it.
         if !self.shutdown_completed.load(AtomicOrdering::Acquire) {
             let stats = self.shard_manager.stats();
@@ -880,15 +878,15 @@ impl Drop for EventBus {
 /// upgrades it once per tick so the spawned task does not keep the
 /// bus alive past the caller's last `Arc` reference. Without this,
 /// `Arc::try_unwrap` (which the consuming `shutdown(self)` API
-/// requires) would fail forever (BUG_REPORT.md #24).
+/// requires) would fail forever.
 async fn run_scaling_monitor_via_weak(weak: std::sync::Weak<EventBus>) {
-    // BUG_REPORT.md #54: refresh `interval` from the policy on
-    // every tick. The previous version cached it once at task
-    // start, so any future runtime policy update would not be
-    // adopted by the monitor without a process restart. Today
-    // `EventBusConfig` is immutable post-construction so this is
-    // a no-op — but reading it each tick is cheap (one atomic /
-    // RwLock read) and removes the latent footgun.
+    // Refresh `interval` from the policy on every tick. The previous
+    // version cached it once at task start, so any future runtime
+    // policy update would not be adopted by the monitor without a
+    // process restart. Today `EventBusConfig` is immutable
+    // post-construction so this is a no-op — but reading it each tick
+    // is cheap (one atomic / RwLock read) and removes the latent
+    // footgun.
     loop {
         let interval = match weak.upgrade() {
             Some(bus) => match &bus.config.scaling {
@@ -1138,15 +1136,15 @@ fn spawn_drain_worker_for_shard(
         loop {
             // Relaxed: same rationale as ingest — see `EventBus::ingest`.
             if shutdown.load(AtomicOrdering::Relaxed) {
-                // BUG_REPORT.md #6: before doing the final sweep, wait
-                // for `shutdown()` to release the finalize gate. The
-                // gate is set only after the in-flight ingest counter
-                // reaches zero, which means every producer that read
-                // `shutdown=false` has completed its push. Without
-                // this wait, the drain worker can race ahead of a
-                // late push under shard-mutex serialization (drain
-                // takes the lock first, sees nothing, exits; producer
-                // then takes the lock and pushes — event stranded).
+                // Before doing the final sweep, wait for `shutdown()`
+                // to release the finalize gate. The gate is set only
+                // after the in-flight ingest counter reaches zero,
+                // which means every producer that read `shutdown=false`
+                // has completed its push. Without this wait, the drain
+                // worker can race ahead of a late push under
+                // shard-mutex serialization (drain takes the lock
+                // first, sees nothing, exits; producer then takes the
+                // lock and pushes — event stranded).
                 //
                 // Acquire pairs with the Release in `EventBus::shutdown`
                 // and `EventBus::drop`, transitively making every

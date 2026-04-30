@@ -176,15 +176,14 @@ impl PortMapperClient for UpnpMapper {
                 .get_external_ip()
                 .await
                 .map_err(|_| PortMappingError::Transport("get_external_ip failed".into()))?;
-            // BUG_REPORT.md #20: previously called `add_port`,
-            // which assumes the requested external port equals
-            // the internal port. Some IGD implementations
-            // silently re-map `NewExternalPort` to a free port
-            // and return success — the returned `PortMapping`
-            // then carried the wrong external port and the mesh
-            // advertised an unreachable address. `add_any_port`
-            // returns the actually-mapped external port, which
-            // we record in the `PortMapping`.
+            // Previously called `add_port`, which assumes the
+            // requested external port equals the internal port. Some
+            // IGD implementations silently re-map `NewExternalPort`
+            // to a free port and return success — the returned
+            // `PortMapping` then carried the wrong external port and
+            // the mesh advertised an unreachable address.
+            // `add_any_port` returns the actually-mapped external
+            // port, which we record in the `PortMapping`.
             let actual_external_port = gw
                 .add_any_port(
                     PortMappingProtocol::UDP,
@@ -281,10 +280,9 @@ fn add_port_err_to_port_mapping(err: igd_next::AddPortError) -> PortMappingError
     }
 }
 
-/// BUG_REPORT.md #20: companion mapper for `AddAnyPortError`.
-/// `ExternalPortInUse` / `NoPortsAvailable` /
-/// `OnlyPermanentLeasesSupported` are router-policy refusals;
-/// other variants are transport.
+/// Companion mapper for `AddAnyPortError`. `ExternalPortInUse` /
+/// `NoPortsAvailable` / `OnlyPermanentLeasesSupported` are
+/// router-policy refusals; other variants are transport.
 fn add_any_port_err_to_port_mapping(err: igd_next::AddAnyPortError) -> PortMappingError {
     use igd_next::AddAnyPortError;
     match err {

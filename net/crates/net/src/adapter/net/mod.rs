@@ -566,13 +566,13 @@ impl NetAdapter {
             0
         };
 
-        // BUG_REPORT.md #5: previously the boolean result of
-        // `r.on_receive(seq)` was discarded — a duplicate (NACK
-        // retransmit, rebroadcast, etc.) returned `false` but the
-        // events were still queued for poll_shard, breaking
-        // exactly-once delivery on reliable streams. The cipher's
-        // replay window doesn't catch this because each retransmit
-        // is re-encrypted with a fresh outer counter.
+        // Previously the boolean result of `r.on_receive(seq)` was
+        // discarded — a duplicate (NACK retransmit, rebroadcast,
+        // etc.) returned `false` but the events were still queued for
+        // poll_shard, breaking exactly-once delivery on reliable
+        // streams. The cipher's replay window doesn't catch this
+        // because each retransmit is re-encrypted with a fresh outer
+        // counter.
         //
         // Now: if `on_receive` reports a duplicate, we still call
         // `session.touch()` (the peer is alive) but skip the queue
@@ -604,7 +604,7 @@ impl NetAdapter {
             tracing::debug!(
                 seq = parsed.header.sequence,
                 stream_id,
-                "Dropping duplicate packet (BUG_REPORT.md #5)"
+                "Dropping duplicate packet"
             );
         }
 

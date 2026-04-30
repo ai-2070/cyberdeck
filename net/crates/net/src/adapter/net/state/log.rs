@@ -76,15 +76,15 @@ impl EntityLog {
 
         // Duplicate check.
         //
-        // BUG_REPORT.md #37: previously this was guarded by
-        // `current_seq > 0`, which silently skipped the duplicate
-        // check for any incoming event when the head was at
-        // sequence `0` (i.e. immediately after genesis). The chain
-        // validator backstopped the case in practice (a duplicate
-        // genesis would fail `validate_chain_link`), but that's a
-        // structural-incidental defense. Tighten the guard so we
-        // only skip the check when the log is genuinely empty
-        // (no events yet — head_link returns the sentinel).
+        // Previously this was guarded by `current_seq > 0`, which
+        // silently skipped the duplicate check for any incoming
+        // event when the head was at sequence `0` (i.e. immediately
+        // after genesis). The chain validator backstopped the case
+        // in practice (a duplicate genesis would fail
+        // `validate_chain_link`), but that's a structural-incidental
+        // defense. Tighten the guard so we only skip the check when
+        // the log is genuinely empty (no events yet — head_link
+        // returns the sentinel).
         if !self.events.is_empty() && event.link.sequence <= current_seq {
             return Err(LogError::Duplicate(event.link.sequence));
         }

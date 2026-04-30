@@ -153,14 +153,14 @@ pub struct FairScheduler {
     /// Total packets dropped
     total_dropped: AtomicU64,
     /// Rotation index for round-robin fairness across dequeue calls.
-    /// BUG_REPORT.md #31: only advances when a dequeue actually
-    /// pops a packet, so rotation correlates with service events
-    /// rather than poll frequency.
+    /// Only advances when a dequeue actually pops a packet, so
+    /// rotation correlates with service events rather than poll
+    /// frequency.
     round_robin_idx: AtomicU64,
     /// Counter incremented on every `dequeue` call (regardless of
     /// whether a packet was popped) for the modulo-1024 cleanup
-    /// trigger. Decoupled from `round_robin_idx` so the BUG #31
-    /// fix doesn't accidentally suppress cleanup.
+    /// trigger. Decoupled from `round_robin_idx` so the rotation fix
+    /// doesn't accidentally suppress cleanup.
     dequeue_call_count: AtomicU64,
 }
 
@@ -225,9 +225,9 @@ impl FairScheduler {
     pub fn dequeue(&self) -> Option<QueuedPacket> {
         // Periodically clean up empty stream queues to prevent unbounded growth
         // of the DashMap. Check every 1024 dequeue calls (cheap modular check).
-        // BUG_REPORT.md #31: tracked on a separate counter from
-        // `round_robin_idx` so that decoupling rotation from poll
-        // frequency doesn't suppress the cleanup trigger.
+        // Tracked on a separate counter from `round_robin_idx` so
+        // that decoupling rotation from poll frequency doesn't
+        // suppress the cleanup trigger.
         let call_count = self
             .dequeue_call_count
             .fetch_add(1, Ordering::Relaxed)
@@ -246,14 +246,14 @@ impl FairScheduler {
         if keys.is_empty() {
             return None;
         }
-        // BUG_REPORT.md #31: advance the round-robin cursor only
-        // when we actually pop a packet. Previously this used
-        // `fetch_add(1)` unconditionally, so every empty poll
-        // advanced the rotation as if we'd serviced a stream.
-        // The result was that under bursty mixed traffic, polls
-        // that found no packet still nudged the cursor past the
-        // stream that *would* have had a packet on the next tick,
-        // biasing service away from streams that became non-empty
+        // Advance the round-robin cursor only when we actually pop a
+        // packet. Previously this used `fetch_add(1)` unconditionally,
+        // so every empty poll advanced the rotation as if we'd
+        // serviced a stream. The result was that under bursty mixed
+        // traffic, polls that found no packet still nudged the cursor
+        // past the stream that *would* have had a packet on the next
+        // tick, biasing service away from streams that became
+        // non-empty
         // mid-pass.
         //
         // Now: read the cursor for the starting offset, then

@@ -97,10 +97,9 @@ unsafe fn c_str_to_owned(p: *const c_char) -> Option<String> {
 /// success writes the pointer to `*out_ptr` and the length to
 /// `*out_len` (excluding the null terminator) and returns `0`. The
 /// caller must free the string with `net_free_string`.
-/// BUG_REPORT.md #45: null-check `out_ptr` and `out_len` before
-/// writing through them. Returns `NetError::NullPointer` so the
-/// FFI caller can distinguish "I forgot output pointers" from
-/// "the operation failed."
+/// Null-checks `out_ptr` and `out_len` before writing through them.
+/// Returns `NetError::NullPointer` so the FFI caller can distinguish
+/// "I forgot output pointers" from "the operation failed."
 fn write_json_out<T: Serialize>(
     value: &T,
     out_ptr: *mut *mut c_char,

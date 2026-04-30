@@ -182,15 +182,14 @@ impl ShardMetricsCollector {
     /// `finalize_draining` only counts pushes that arrived after the
     /// drain began.
     ///
-    /// BUG_REPORT.md #33: a concurrent `record_push` can interleave
-    /// with the store-zero on `pushes_since_drain_start` and leave
-    /// the counter at `1` rather than `0`. That's not a correctness
-    /// bug — it just defers finalization of this shard by one
-    /// metrics tick — but the previous code did the store-zero on
-    /// the counter *before* publishing the `draining=true` flag,
-    /// which made the window slightly larger than necessary.
-    /// Publishing the flag first means any push that *observes*
-    /// `draining=true` (per #51 a future tightening) is naturally
+    /// A concurrent `record_push` can interleave with the store-zero
+    /// on `pushes_since_drain_start` and leave the counter at `1`
+    /// rather than `0`. That's not a correctness bug — it just defers
+    /// finalization of this shard by one metrics tick — but the
+    /// previous code did the store-zero on the counter *before*
+    /// publishing the `draining=true` flag, which made the window
+    /// slightly larger than necessary. Publishing the flag first
+    /// means any push that *observes* `draining=true` is naturally
     /// sequenced after the reset; pushes that beat the flag publish
     /// race the reset just like before.
     ///
@@ -313,8 +312,8 @@ pub enum ShardState {
     /// in place, but `select_shard` must not route to it yet because
     /// upstream workers (drain / batch) have not been spawned. Caller
     /// transitions to `Active` via `activate` once the workers are
-    /// ready. Closes the BUG_REPORT.md #46 race where a freshly-added
-    /// shard accepted producer pushes before any consumer existed.
+    /// ready. Closes the race where a freshly-added shard accepted
+    /// producer pushes before any consumer existed.
     Provisioning,
     /// Shard is active and accepting producers.
     Active,
@@ -356,12 +355,12 @@ pub struct ShardMapper {
     active_count: AtomicU16,
     /// Scaling policy.
     ///
-    /// BUG_REPORT.md #53: this field is immutable for the lifetime of
-    /// the mapper. The previous `set_policy(&mut self, …)` API was
-    /// unreachable in practice — every production callsite holds the
-    /// mapper behind an `Arc`, and `Arc::get_mut` requires a strong
-    /// count of 1, which never holds once the worker pool clones the
-    /// `Arc`. The method has been removed; recreate the mapper (and
+    /// This field is immutable for the lifetime of the mapper. The
+    /// previous `set_policy(&mut self, …)` API was unreachable in
+    /// practice — every production callsite holds the mapper behind
+    /// an `Arc`, and `Arc::get_mut` requires a strong count of 1,
+    /// which never holds once the worker pool clones the `Arc`. The
+    /// method has been removed; recreate the mapper (and
     /// the bus that owns it) to change the policy.
     policy: ScalingPolicy,
     /// Ring buffer capacity for new shards.
@@ -475,15 +474,15 @@ impl ShardMapper {
             .collect();
 
         if active.is_empty() {
-            // BUG_REPORT.md #51: previously fell back to `find(|s|
-            // s.state != ShardState::Stopped)`, which silently routed
-            // to a `Draining` shard. Pushes to a draining shard
-            // increment `pushes_since_drain_start`, blocking
-            // finalization indefinitely.
+            // Previously fell back to `find(|s| s.state !=
+            // ShardState::Stopped)`, which silently routed to a
+            // `Draining` shard. Pushes to a draining shard increment
+            // `pushes_since_drain_start`, blocking finalization
+            // indefinitely.
             //
             // `Provisioning` shards aren't routable either — they
             // exist in the mapper but the routing table doesn't have
-            // them yet (#46), so any caller that tries to push lands
+            // them yet, so any caller that tries to push lands
             // in `resolve_idx → None` and surfaces as "unrouted" via
             // the manager-level counter. That's the correct signal:
             // the system has no destination for this event, the
@@ -598,15 +597,15 @@ impl ShardMapper {
     /// immediately available for routing. Use [`scale_up_provisioning`]
     /// if upstream workers (drain / batch) need to be wired up before
     /// the shard becomes selectable — otherwise producer pushes can
-    /// race ahead of consumer creation (BUG_REPORT.md #46).
+    /// race ahead of consumer creation.
     ///
     /// [`scale_up_provisioning`]: Self::scale_up_provisioning
     pub fn scale_up(&self, count: u16) -> Result<Vec<u16>, ScalingError> {
-        // BUG_REPORT.md #32: short-circuit `count == 0` so a no-op
-        // call doesn't bump the cooldown timestamp or trip the
-        // `u16::MAX` sentinel check below (which previously fired
-        // spuriously when `first_id == u16::MAX` even though zero ids
-        // were being allocated).
+        // Short-circuit `count == 0` so a no-op call doesn't bump the
+        // cooldown timestamp or trip the `u16::MAX` sentinel check
+        // below (which previously fired spuriously when
+        // `first_id == u16::MAX` even though zero ids were being
+        // allocated).
         if count == 0 {
             return Ok(Vec::new());
         }
@@ -734,8 +733,7 @@ impl ShardMapper {
     /// workers, mpsc channels, etc.) must be wired up *before* the
     /// shard becomes selectable. Without this gating, producers can
     /// observe the shard via `select_shard`, push into its ring
-    /// buffer, and never have those events drained — the BUG_REPORT.md
-    /// #46 race.
+    /// buffer, and never have those events drained.
     ///
     /// Returns the allocated ids in order. Cooldown / `max_shards`
     /// gating matches `scale_up` so that staged allocation cannot be
@@ -860,14 +858,14 @@ impl ShardMapper {
     /// Drain a specific shard by id, transitioning it from `Active`
     /// to `Draining`.
     ///
-    /// BUG_REPORT.md #48: companion to `ShardManager::drain_shard`.
-    /// The previous implementation only flipped the metrics
-    /// collector's `draining` atomic; this version atomically updates
-    /// `MappedShard.state` (so `select_shard` stops routing to the
-    /// shard) and decrements `active_count` (so `evaluate_scaling`'s
-    /// budget math stays consistent with `scale_down`). Returns an
-    /// error if the shard is not in `Active` state, or if doing so
-    /// would push the active count below `min_shards`.
+    /// Companion to `ShardManager::drain_shard`. The previous
+    /// implementation only flipped the metrics collector's `draining`
+    /// atomic; this version atomically updates `MappedShard.state`
+    /// (so `select_shard` stops routing to the shard) and decrements
+    /// `active_count` (so `evaluate_scaling`'s budget math stays
+    /// consistent with `scale_down`). Returns an error if the shard
+    /// is not in `Active` state, or if doing so would push the active
+    /// count below `min_shards`.
     pub fn drain_specific(&self, shard_id: u16) -> Result<(), ScalingError> {
         let mut shards = self.shards.write();
         let current_active = self.active_count.load(AtomicOrdering::Acquire);
@@ -994,16 +992,16 @@ impl ShardMapper {
                 } else {
                     0.0
                 };
-                // BUG_REPORT.md #9: previously read `events_in_window`
-                // here, which `collect_and_reset` zeros every metrics
-                // tick. A producer push that landed in the window
-                // between two ticks could be silently zeroed out, so a
-                // draining shard whose buffer transiently emptied was
-                // finalized with a producer still attached.
-                // `pushes_since_drain_start` is a separate counter that
-                // is only reset by `set_draining(true)`, so any push
-                // observed since the drain began is sticky — exactly
-                // the signal we want.
+                // Previously read `events_in_window` here, which
+                // `collect_and_reset` zeros every metrics tick. A
+                // producer push that landed in the window between two
+                // ticks could be silently zeroed out, so a draining
+                // shard whose buffer transiently emptied was finalized
+                // with a producer still attached.
+                // `pushes_since_drain_start` is a separate counter
+                // that is only reset by `set_draining(true)`, so any
+                // push observed since the drain began is sticky —
+                // exactly the signal we want.
                 let pushes_after_drain = shard
                     .metrics
                     .pushes_since_drain_start
@@ -1020,13 +1018,13 @@ impl ShardMapper {
             }
         }
 
-        // BUG_REPORT.md #49: drop the write lock BEFORE notifying.
-        // The callback is user-supplied and may re-enter the mapper
-        // (`shard_state`, `select_shard`, `metrics_collector`, …),
-        // each of which acquires `shards.read()`. `parking_lot::RwLock`
-        // is not recursive, so a re-entrant read attempt while we
-        // hold a write would deadlock. `scale_up`'s callback path
-        // already releases its lock before calling out — mirror that
+        // Drop the write lock BEFORE notifying. The callback is
+        // user-supplied and may re-enter the mapper (`shard_state`,
+        // `select_shard`, `metrics_collector`, …), each of which
+        // acquires `shards.read()`. `parking_lot::RwLock` is not
+        // recursive, so a re-entrant read attempt while we hold a
+        // write would deadlock. `scale_up`'s callback path already
+        // releases its lock before calling out — mirror that
         // here.
         drop(shards);
 
@@ -1097,11 +1095,11 @@ impl ShardMapper {
     pub fn policy(&self) -> &ScalingPolicy {
         &self.policy
     }
-    // BUG_REPORT.md #53: `set_policy` previously took `&mut self`
-    // and was unreachable through the `Arc<ShardMapper>` that the
-    // production code holds (`Arc::get_mut` fails once the worker
-    // pool has cloned the Arc). The method has been removed —
-    // recreate the mapper / bus to change the policy.
+    // `set_policy` previously took `&mut self` and was unreachable
+    // through the `Arc<ShardMapper>` that the production code holds
+    // (`Arc::get_mut` fails once the worker pool has cloned the Arc).
+    // The method has been removed — recreate the mapper / bus to
+    // change the policy.
 }
 
 #[cfg(test)]

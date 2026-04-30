@@ -99,15 +99,14 @@ impl BatchedTransport {
     /// Returns the number of packets successfully sent — equal to
     /// `packets.len().min(MAX_BATCH_SIZE)` on full success.
     ///
-    /// BUG_REPORT.md #13: previously returned `Ok(sent as usize)`
-    /// after a single `sendmmsg`. Linux can return `0 < sent <
-    /// count` on partial sends; the caller in this crate just
-    /// recorded `sent` without re-queueing the tail, so packets
-    /// `[sent..count)` were silently lost. For reliable streams
-    /// `on_send` had already stashed each packet's bytes for
-    /// retransmit, so they sat in `pending` "in flight" without
-    /// ever reaching the wire — eventually NACK'd, but with extra
-    /// latency that didn't need to happen.
+    /// Previously returned `Ok(sent as usize)` after a single
+    /// `sendmmsg`. Linux can return `0 < sent < count` on partial
+    /// sends; the caller in this crate just recorded `sent` without
+    /// re-queueing the tail, so packets `[sent..count)` were silently
+    /// lost. For reliable streams `on_send` had already stashed each
+    /// packet's bytes for retransmit, so they sat in `pending` "in
+    /// flight" without ever reaching the wire — eventually NACK'd,
+    /// but with extra latency that didn't need to happen.
     ///
     /// The fix is a small inner loop: re-issue `sendmmsg` on the
     /// unsent tail until either all packets ship, or the syscall

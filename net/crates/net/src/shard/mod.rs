@@ -20,7 +20,7 @@ pub use mapper::{
 // uphold the SPSC contract via `Mutex<Shard>`. Exposing the raw ring
 // buffer publicly was a silent-UB footgun — anyone wrapping it in an
 // `Arc` and pushing from two threads got data corruption with no
-// compile-time signal (BUG_REPORT.md #5). `BufferFullError` is not
+// compile-time signal. `BufferFullError` is not
 // re-exported here either: callers see it as `IngestionError::Backpressure`.
 pub(crate) use ring_buffer::RingBuffer;
 
@@ -227,7 +227,6 @@ impl Shard {
     /// what is normally a consumer-side operation). Safe because
     /// the outer shard mutex serializes this against any concurrent
     /// `try_pop` from the legitimate consumer (the batch worker).
-    /// See BUG_REPORT.md #8.
     #[inline]
     pub(crate) fn evict_oldest(&mut self) -> Option<InternalEvent> {
         self.ring_buffer.evict_oldest()
@@ -493,10 +492,10 @@ impl ShardManager {
                     // spurious drop count, evict the oldest (which is the real
                     // drop), and retry with the same ref-counted bytes.
                     //
-                    // BUG_REPORT.md #8: use the producer-side
-                    // `evict_oldest` rather than `try_pop`. Calling
-                    // `try_pop` from the producer thread would
-                    // violate the SPSC consumer contract (the
+                    // Use the producer-side `evict_oldest` rather
+                    // than `try_pop`. Calling `try_pop` from the
+                    // producer thread would violate the SPSC consumer
+                    // contract (the
                     // legitimate consumer is the batch worker, on a
                     // different task / thread).
                     shard
@@ -531,8 +530,8 @@ impl ShardManager {
         let shard_id = self.select_shard_by_hash(hash);
 
         let table = self.table.load();
-        // BUG_REPORT.md #44: surface "no routable destination" as
-        // `Unrouted` (not `Backpressure`) and bump the manager-level
+        // Surface "no routable destination" as `Unrouted` (not
+        // `Backpressure`) and bump the manager-level
         // `events_unrouted` counter so per-event vs. batch-path
         // accounting agree. The secondary `table.shards.get(idx)`
         // miss should be impossible by the `shard_index ↔ shards`
@@ -561,7 +560,7 @@ impl ShardManager {
         let shard_id = self.select_shard_by_hash(event.hash());
 
         let table = self.table.load();
-        // See `ingest` above for the BUG_REPORT.md #44 rationale.
+        // See `ingest` above for the `Unrouted` rationale.
         let Some(idx) = self.resolve_idx(&table, shard_id) else {
             self.events_unrouted.fetch_add(1, AtomicOrdering::Relaxed);
             return Err(IngestionError::Unrouted);
@@ -721,14 +720,14 @@ impl ShardManager {
     /// and ready to be the destination of `select_shard` calls
     /// **only after** [`activate_shard`] is called for it.
     ///
-    /// BUG_REPORT.md #46: previously the mapper marked the shard
-    /// `Active` *before* the routing table was rebuilt and *before*
-    /// any worker was wired up to drain its ring buffer. Producers
-    /// could `select_shard` to the new id, push into its ring
-    /// buffer, and have the events stranded with no consumer. The
-    /// fix uses `scale_up_provisioning` so the mapper records the
-    /// shard but `select_shard` skips it, then `activate_shard`
-    /// flips it to `Active` once workers are ready.
+    /// Previously the mapper marked the shard `Active` *before* the
+    /// routing table was rebuilt and *before* any worker was wired up
+    /// to drain its ring buffer. Producers could `select_shard` to
+    /// the new id, push into its ring buffer, and have the events
+    /// stranded with no consumer. The fix uses
+    /// `scale_up_provisioning` so the mapper records the shard but
+    /// `select_shard` skips it, then `activate_shard` flips it to
+    /// `Active` once workers are ready.
     ///
     /// [`activate_shard`]: Self::activate_shard
     pub fn add_shard(&self) -> Result<u16, ScalingError> {
@@ -789,14 +788,13 @@ impl ShardManager {
 
     /// Start draining a shard (for dynamic scaling).
     ///
-    /// BUG_REPORT.md #48: previously only flipped the metrics
-    /// collector's `draining` atomic, leaving `MappedShard.state`
-    /// untouched. Result: `select_shard` (which filters on
-    /// `state == Active`) still routed new producers to the shard.
-    /// The fix calls into the mapper, which atomically transitions
-    /// the state to `Draining` and (for accounting) decrements
-    /// `active_count`, mirroring `scale_down(N)` for a single
-    /// targeted shard.
+    /// Previously only flipped the metrics collector's `draining`
+    /// atomic, leaving `MappedShard.state` untouched. Result:
+    /// `select_shard` (which filters on `state == Active`) still
+    /// routed new producers to the shard. The fix calls into the
+    /// mapper, which atomically transitions the state to `Draining`
+    /// and (for accounting) decrements `active_count`, mirroring
+    /// `scale_down(N)` for a single targeted shard.
     pub fn drain_shard(&self, shard_id: u16) -> Result<(), ScalingError> {
         let mapper = self.mapper.as_ref().ok_or(ScalingError::InvalidPolicy(
             "Dynamic scaling not enabled".into(),
@@ -806,14 +804,14 @@ impl ShardManager {
 
     /// Remove a shard from the routing table.
     ///
-    /// BUG_REPORT.md #47: previously this only unmapped the shard
-    /// from the routing table. The drain worker, on its next
-    /// `with_shard` call, observed `None` and exited — leaving any
-    /// events still in the ring buffer permanently stranded. The fix
-    /// drains the ring buffer into a caller-supplied scratch `Vec`
-    /// **before** the unmap, then returns the drained events so the
-    /// caller (typically `EventBus::remove_shard_internal`) can
-    /// flush them through to the adapter rather than dropping them.
+    /// Previously this only unmapped the shard from the routing
+    /// table. The drain worker, on its next `with_shard` call,
+    /// observed `None` and exited — leaving any events still in the
+    /// ring buffer permanently stranded. The fix drains the ring
+    /// buffer into a caller-supplied scratch `Vec` **before** the
+    /// unmap, then returns the drained events so the caller
+    /// (typically `EventBus::remove_shard_internal`) can flush them
+    /// through to the adapter rather than dropping them.
     ///
     /// Returns `Ok(events)` where `events` is whatever was still
     /// queued in the ring buffer at unmap time (possibly empty).

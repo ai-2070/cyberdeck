@@ -319,10 +319,9 @@ impl StandbyGroup {
                 continue; // already promoted or is the new active
             }
 
-            // BUG_REPORT.md #7: place BEFORE touching the
-            // registry so a placement failure leaves the slot
-            // recoverable. Mirror of replica_group / fork_group
-            // fixes.
+            // Place BEFORE touching the registry so a placement
+            // failure leaves the slot recoverable. Mirror of
+            // replica_group / fork_group fixes.
             let old_origin_hash = self.coord.members()[index as usize].origin_hash;
 
             let keypair = EntityKeypair::from_bytes(self.members[index as usize].keypair_secret);

@@ -523,16 +523,15 @@ impl PortMapperClient for NatPmpMapper {
     async fn remove(&self, mapping: &PortMapping) {
         // Lifetime=0 is the RFC 6886 §3.3 "drop mapping" signal.
         //
-        // BUG_REPORT.md #41: previously fire-and-forget — UDP
-        // delivery to the gateway is not the same as gateway-side
-        // processing, and some routers refuse `lifetime=0` (or
-        // are already torn down on our side) without our knowing.
-        // Now we do a *short-deadline* recv (200 ms) so a healthy
-        // gateway's ack confirms removal, but a misbehaving one
-        // doesn't stall shutdown. On timeout we log a warning so
-        // operators can investigate stale mappings; on a successful
-        // recv with a non-zero result code, we log the failure
-        // verbatim.
+        // Previously fire-and-forget — UDP delivery to the gateway
+        // is not the same as gateway-side processing, and some
+        // routers refuse `lifetime=0` (or are already torn down on
+        // our side) without our knowing. Now we do a *short-deadline*
+        // recv (200 ms) so a healthy gateway's ack confirms removal,
+        // but a misbehaving one doesn't stall shutdown. On timeout we
+        // log a warning so operators can investigate stale mappings;
+        // on a successful recv with a non-zero result code, we log
+        // the failure verbatim.
         const REMOVE_DEADLINE: std::time::Duration =
             std::time::Duration::from_millis(200);
 
@@ -586,7 +585,7 @@ impl PortMapperClient for NatPmpMapper {
                 tracing::warn!(
                     internal_port = mapping.internal_port,
                     "NAT-PMP remove: gateway did not ack within {}ms — \
-                     mapping may still be live (BUG_REPORT.md #41)",
+                     mapping may still be live",
                     REMOVE_DEADLINE.as_millis()
                 );
             }

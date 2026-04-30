@@ -870,16 +870,15 @@ impl SafetyEnforcer {
 
     /// Acquire resources for a request
     ///
-    /// BUG_REPORT.md #8: previously this did `load + compare` in
+    /// Previously this did `load + compare` in
     /// `check_resource_limits`, then unconditionally `fetch_add`'d
-    /// each counter. N concurrent acquirers all observed
-    /// `current=0` and all proceeded past the cap — the kill-switch
-    /// / safety envelope was breakable under load. The fix uses
-    /// `fetch_update` (compare-and-swap loop) for each cumulative
-    /// counter so the check + add is atomic per resource, and
-    /// rolls back any partial successes if a later resource fails.
-    /// `tokens` is per-request (not cumulative) so it stays as a
-    /// straight load.
+    /// each counter. N concurrent acquirers all observed `current=0`
+    /// and all proceeded past the cap — the kill-switch / safety
+    /// envelope was breakable under load. The fix uses `fetch_update`
+    /// (compare-and-swap loop) for each cumulative counter so the
+    /// check + add is atomic per resource, and rolls back any partial
+    /// successes if a later resource fails. `tokens` is per-request
+    /// (not cumulative) so it stays as a straight load.
     pub fn acquire(
         self: &Arc<Self>,
         req: &SafetyRequest,

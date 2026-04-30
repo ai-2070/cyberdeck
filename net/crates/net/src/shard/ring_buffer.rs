@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 ///
 /// Crate-internal: surfaced to public callers as
 /// `IngestionError::Backpressure`. Kept `pub(crate)` for symmetry
-/// with the `pub(crate) RingBuffer` (BUG_REPORT.md #5).
+/// with the `pub(crate) RingBuffer`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BufferFullError;
 
@@ -196,12 +196,11 @@ impl<T> RingBuffer<T> {
     /// this producer-side method and the consumer-side `try_pop`
     /// at different times.
     ///
-    /// BUG_REPORT.md #35: previously this had no debug-build
-    /// thread guard at all. The thread it expects matches
-    /// `try_push` (the producer); we assert that here so a future
-    /// caller using `evict_oldest` from the consumer thread or
-    /// from a third thread is caught at test time the same way
-    /// `try_push`/`try_pop` are.
+    /// Previously this had no debug-build thread guard at all. The
+    /// thread it expects matches `try_push` (the producer); we assert
+    /// that here so a future caller using `evict_oldest` from the
+    /// consumer thread or from a third thread is caught at test time
+    /// the same way `try_push`/`try_pop` are.
     #[inline]
     pub(crate) fn evict_oldest(&self) -> Option<T> {
         #[cfg(test)]

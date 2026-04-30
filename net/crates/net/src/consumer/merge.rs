@@ -318,12 +318,12 @@ impl PollMerger {
         // adapter-side framing bugs invisible to operators — only
         // *unfiltered* polls would surface the bad event.
         //
-        // BUG_REPORT.md #2 / #23: the previous `Ordering::None` path
-        // had a `break` once `kept.len() >= limit + 1`, which discarded
-        // events from later shards without ever filtering them. Combined
-        // with the cursor advancing past every fetched event, that meant
-        // matching events on un-inspected shards were silently lost. The
-        // fix uses a single full `retain` pass for both ordering modes;
+        // The previous `Ordering::None` path had a `break` once
+        // `kept.len() >= limit + 1`, which discarded events from later
+        // shards without ever filtering them. Combined with the cursor
+        // advancing past every fetched event, that meant matching
+        // events on un-inspected shards were silently lost. The fix
+        // uses a single full `retain` pass for both ordering modes;
         // the `lazy parse` micro-optimization is gone, but per-event
         // filter-matching is cheap and consistent semantics with the
         // sort path is worth more than parse-skip on over-fetches.
@@ -337,18 +337,17 @@ impl PollMerger {
                 // Keep arbitrary order
             }
             Ordering::InsertionTs => {
-                // BUG_REPORT.md #52: `insertion_ts` is monotonic
-                // *per shard*, not globally (see `event.rs:233`),
-                // so two events from different shards can carry
-                // the same timestamp. With a stable sort on
-                // `insertion_ts` alone, ties were broken by the
-                // input order — which depends on
-                // `futures::future::join_all`'s completion
-                // ordering and is non-deterministic across polls.
-                // Combined with `truncate(limit)` and the
-                // cursor-rollback step, the same logical event
-                // could be returned twice or skipped at the limit
-                // boundary across consecutive polls.
+                // `insertion_ts` is monotonic *per shard*, not
+                // globally (see `event.rs:233`), so two events from
+                // different shards can carry the same timestamp. With
+                // a stable sort on `insertion_ts` alone, ties were
+                // broken by the input order — which depends on
+                // `futures::future::join_all`'s completion ordering
+                // and is non-deterministic across polls. Combined
+                // with `truncate(limit)` and the cursor-rollback step,
+                // the same logical event could be returned twice or
+                // skipped at the limit boundary across consecutive
+                // polls.
                 //
                 // Add `(shard_id, id)` as deterministic
                 // tiebreakers. `id` is the storage backend's
@@ -363,12 +362,11 @@ impl PollMerger {
             }
         }
 
-        // BUG_REPORT.md #23: track per-shard match counts *before*
-        // truncate. After truncation, any shard whose match count
-        // shrank means matches were dropped — and those matches must
-        // be re-fetched on the next poll, otherwise they are silently
-        // lost (the cursor would otherwise advance past them via
-        // `new_cursor`).
+        // Track per-shard match counts *before* truncate. After
+        // truncation, any shard whose match count shrank means matches
+        // were dropped — and those matches must be re-fetched on the
+        // next poll, otherwise they are silently lost (the cursor
+        // would otherwise advance past them via `new_cursor`).
         let mut matched_per_shard: std::collections::HashMap<u16, usize> =
             std::collections::HashMap::new();
         if request.filter.is_some() {
@@ -446,8 +444,8 @@ impl PollMerger {
         // When filtering removed everything but we did advance past fetched
         // events, signal has_more so the caller keeps polling forward.
         let all_filtered = request.filter.is_some() && all_events.is_empty() && cursor_advanced;
-        // BUG_REPORT.md #50: previously `has_more = any_has_more ||
-        // had_extra || all_filtered`. If a single adapter returned
+        // Previously `has_more = any_has_more || had_extra ||
+        // all_filtered`. If a single adapter returned
         // `ShardPollResult { events: [], next_id: None,
         // has_more: true }` (legal under the trait contract — nothing
         // forbids it), then `any_has_more=true` propagated even
@@ -464,8 +462,7 @@ impl PollMerger {
         if any_has_more && !we_made_progress {
             tracing::warn!(
                 "PollMerger: an adapter reported has_more=true with no events \
-                 and no cursor advance — suppressing to avoid caller infinite-loop \
-                 (BUG_REPORT.md #50)"
+                 and no cursor advance — suppressing to avoid caller infinite-loop"
             );
         }
         // Return the cursor even when all events were filtered out, so the

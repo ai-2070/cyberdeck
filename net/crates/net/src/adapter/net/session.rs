@@ -1009,15 +1009,14 @@ impl StreamState {
         if self.tx_window == 0 {
             return;
         }
-        // BUG_REPORT.md #12: clamp `total_consumed` to the
-        // sender-side `tx_bytes_sent` watermark before the CAS.
-        // Without this, a malformed or hostile grant carrying
-        // `total_consumed = u64::MAX` advanced `max_consumed_seen`
-        // to MAX, and every subsequent honest grant tripped the
-        // `total_consumed <= prev` early-return — the stream
-        // stalled forever. The clamp is safe under honest
-        // operation (a receiver can't have consumed bytes the
-        // sender hasn't committed) and acts as a safety bound
+        // Clamp `total_consumed` to the sender-side `tx_bytes_sent`
+        // watermark before the CAS. Without this, a malformed or
+        // hostile grant carrying `total_consumed = u64::MAX` advanced
+        // `max_consumed_seen` to MAX, and every subsequent honest
+        // grant tripped the `total_consumed <= prev` early-return —
+        // the stream stalled forever. The clamp is safe under honest
+        // operation (a receiver can't have consumed bytes the sender
+        // hasn't committed) and acts as a safety bound
         // otherwise.
         let sent_watermark = self.tx_bytes_sent.load(Ordering::Acquire);
         let total_consumed = total_consumed.min(sent_watermark);

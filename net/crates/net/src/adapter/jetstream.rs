@@ -51,32 +51,32 @@ pub struct JetStreamAdapter {
     /// `HashMap<u16, Stream>` cache, both call `get_stream` /
     /// `create_stream`, and both insert — extra RPCs on cold start
     /// and a hazard if create_stream configs ever diverge between
-    /// callers (BUG_REPORT.md #10.3).
+    /// callers.
     streams: Mutex<HashMap<u16, Arc<OnceCell<Stream>>>>,
     /// Whether the adapter has been initialized.
     initialized: AtomicBool,
     /// Per-process nonce woven into `Nats-Msg-Id` so a restarted
     /// producer cannot collide with the prior process's
     /// `(shard_id, sequence_start, i)` triple within JetStream's
-    /// dedup window. BUG_REPORT.md #9: `BatchWorker::next_sequence`
-    /// resets to 0 on restart; if the prior process published
-    /// `shard:0:0…` within the dedup window (default 2 min), the
-    /// new process's first batches were discarded as duplicates.
-    /// The nonce is sampled once at adapter construction from the
-    /// system clock; a UUIDv7-style 64-bit value would also work
-    /// but adds a dep we don't need for the uniqueness window.
+    /// dedup window. `BatchWorker::next_sequence` resets to 0 on
+    /// restart; if the prior process published `shard:0:0…` within
+    /// the dedup window (default 2 min), the new process's first
+    /// batches were discarded as duplicates. The nonce is sampled
+    /// once at adapter construction from the system clock; a
+    /// UUIDv7-style 64-bit value would also work but adds a dep we
+    /// don't need for the uniqueness window.
     process_nonce: u64,
 }
 
 impl JetStreamAdapter {
     /// Create a new JetStream adapter.
     pub fn new(config: JetStreamAdapterConfig) -> Result<Self, AdapterError> {
-        // BUG_REPORT.md #9: derive a per-process nonce from the
-        // wall clock (in nanos) XOR'd with the process id. This
-        // is unique-enough to avoid msg-id collisions within
-        // JetStream's dedup window across restarts. Two processes
-        // launched within a single tick would still collide on
-        // the time-only component, hence the pid mix-in.
+        // Derive a per-process nonce from the wall clock (in nanos)
+        // XOR'd with the process id. This is unique-enough to avoid
+        // msg-id collisions within JetStream's dedup window across
+        // restarts. Two processes launched within a single tick would
+        // still collide on the time-only component, hence the pid
+        // mix-in.
         let now_nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -150,8 +150,8 @@ impl JetStreamAdapter {
     /// the actual create-once happens inside
     /// `OnceCell::get_or_try_init`, which serializes initialization
     /// across all callers and surfaces the same `Stream` clone (or
-    /// the same error) to each (BUG_REPORT.md #10.3). On error the
-    /// cell stays uninitialized and a subsequent call will retry.
+    /// the same error) to each. On error the cell stays
+    /// uninitialized and a subsequent call will retry.
     async fn get_or_create_stream(&self, shard_id: u16) -> Result<Stream, AdapterError> {
         let cell = {
             let mut streams = self.streams.lock();
@@ -290,12 +290,11 @@ impl Adapter for JetStreamAdapter {
         // render it once and only rewrite the trailing `:{i}` per
         // event, eliminating the per-event `format!` allocation.
         //
-        // BUG_REPORT.md #9: the leading `{nonce}` segment is the
-        // per-process nonce sampled at construction; without it,
-        // a producer that restarted within JetStream's dedup
-        // window collided with its prior incarnation's
-        // `shard:0:0…` ids and the new batches were silently
-        // discarded.
+        // The leading `{nonce}` segment is the per-process nonce
+        // sampled at construction; without it, a producer that
+        // restarted within JetStream's dedup window collided with its
+        // prior incarnation's `shard:0:0…` ids and the new batches
+        // were silently discarded.
         let mut acks = Vec::with_capacity(serialized.len());
         let mut msg_id_buf = String::new();
         let _ = write!(
@@ -476,7 +475,8 @@ impl Adapter for JetStreamAdapter {
         // Prefer the last *seen* sequence over the last successfully
         // deserialized event id. Otherwise a run of trailing corrupt
         // entries leaves the cursor stuck, re-fetching them forever
-        // (analog of BUG_REPORT.md #4 for the JetStream path).
+        // (analog of the Redis adapter's `last_seen_seq` fix for the
+        // JetStream path).
         let next_id = last_seen_seq
             .map(|s| s.to_string())
             .or_else(|| events.last().map(|e| e.id.clone()));

@@ -302,14 +302,14 @@ impl BatchedPacketReceiver {
         let thread = std::thread::Builder::new()
             .name("net-batch-recv".into())
             .spawn(move || {
-                // BUG_REPORT.md #30: do NOT set `SO_RCVTIMEO` on
-                // the shared `Arc<UdpSocket>`. The previous code
-                // installed a 500ms timeout to give the receive
-                // thread a chance to check `shutdown`, but
-                // `SO_RCVTIMEO` is a *socket-level* option — every
-                // other consumer of the same `Arc<UdpSocket>` (the
-                // sync handshake recv at `mod.rs:396` and
-                // `mesh.rs:6098-6101`) inherited that timeout.
+                // Do NOT set `SO_RCVTIMEO` on the shared
+                // `Arc<UdpSocket>`. The previous code installed a
+                // 500ms timeout to give the receive thread a chance
+                // to check `shutdown`, but `SO_RCVTIMEO` is a
+                // *socket-level* option — every other consumer of
+                // the same `Arc<UdpSocket>` (the sync handshake recv
+                // at `mod.rs:396` and `mesh.rs:6098-6101`) inherited
+                // that timeout.
                 //
                 // Use `recv_batch` instead, which passes
                 // `MSG_DONTWAIT` per-call. That flag is per-syscall,
