@@ -1,0 +1,23 @@
+net/crates/net/tests/integration_cortex_adapter.rs
+  36b642b129ab4a5e 29,134-137,142,144,148,150-151,186-193,197,199-200
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "654cccff65ab21e4e8150bac0129da80fd07f3bc",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3075,
+      "total_deletions": 11,
+      "accepted_lines": 21,
+      "overriden_lines": 0
+    }
+  }
+}
