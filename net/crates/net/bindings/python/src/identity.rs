@@ -37,7 +37,8 @@ pyo3::create_exception!(
     "Raised when a token fails validation. The message has the form \
      `token: <kind>` where `<kind>` is one of `invalid_signature` | \
      `not_yet_valid` | `expired` | `delegation_exhausted` | \
-     `delegation_not_allowed` | `not_authorized` | `invalid_format`."
+     `delegation_not_allowed` | `not_authorized` | `invalid_format` | \
+     `read_only`."
 );
 
 pub(crate) fn token_error_kind(e: &CoreTokenError) -> &'static str {
@@ -49,6 +50,7 @@ pub(crate) fn token_error_kind(e: &CoreTokenError) -> &'static str {
         CoreTokenError::DelegationNotAllowed => "delegation_not_allowed",
         CoreTokenError::NotAuthorized => "not_authorized",
         CoreTokenError::InvalidFormat => "invalid_format",
+        CoreTokenError::ReadOnly => "read_only",
     }
 }
 

@@ -38,8 +38,9 @@ fn identity_err(msg: impl Into<String>) -> Error {
 fn token_err(kind: &str) -> Error {
     // `kind` is one of: invalid_signature | not_yet_valid | expired |
     // delegation_exhausted | delegation_not_allowed | not_authorized |
-    // invalid_format. Kept as a stable discriminator so the TS layer
-    // can build a `.kind`-tagged exception without parsing prose.
+    // invalid_format | read_only. Kept as a stable discriminator so
+    // the TS layer can build a `.kind`-tagged exception without
+    // parsing prose.
     Error::from_reason(format!("{} {}", ERR_TOKEN_PREFIX, kind))
 }
 
@@ -52,6 +53,7 @@ fn token_error_kind(e: &TokenError) -> &'static str {
         TokenError::DelegationNotAllowed => "delegation_not_allowed",
         TokenError::NotAuthorized => "not_authorized",
         TokenError::InvalidFormat => "invalid_format",
+        TokenError::ReadOnly => "read_only",
     }
 }
 

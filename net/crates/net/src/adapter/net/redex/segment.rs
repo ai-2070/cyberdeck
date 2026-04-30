@@ -147,6 +147,7 @@ impl HeapSegment {
     /// offsets (e.g. `RedexEntry::payload_offset` values stored in
     /// the index) by the prior `base_offset` value before calling
     /// this — otherwise reads through `read_at` will misalign.
+    #[cfg(feature = "redex-disk")]
     pub(super) fn rebase_to_zero(&mut self) {
         self.base_offset = 0;
     }
