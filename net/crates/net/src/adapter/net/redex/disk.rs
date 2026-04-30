@@ -2,12 +2,15 @@
 //!
 //! Feature-gated behind `redex-disk`. When `RedexFileConfig::persistent`
 //! is set and the owning [`super::Redex`] manager was given a
-//! persistent directory, appends are mirrored to two append-only files
-//! per channel:
+//! persistent directory, appends are mirrored to three append-only
+//! files per channel:
 //!
 //! - `<base>/<channel_path>/idx` — 20-byte [`RedexEntry`] records.
 //! - `<base>/<channel_path>/dat` — payload bytes (offsets match the
 //!   in-memory [`super::segment::HeapSegment`]).
+//! - `<base>/<channel_path>/ts` — 8-byte little-endian unix-nanos
+//!   timestamps, one per `idx` record. Restores age-based retention
+//!   across restart.
 //!
 //! The heap segment remains authoritative during normal operation; the
 //! disk files exist for crash recovery. On reopen the full `dat` file
@@ -15,16 +18,62 @@
 //! (the disk files grow unbounded; operators delete old files manually
 //! between runs when that matters). v2 will reconcile this.
 //!
-//! Durability policy:
+//! # Durability policy
 //!
-//! - Append-path fsync is governed by [`super::FsyncPolicy`], threaded
-//!   in as `fsync_every_n` at open time. `0` disables append-side
-//!   syncing; a positive value triggers a fsync every `n`th append.
-//! - `close()` always fsyncs both files, regardless of policy.
-//! - Explicit `super::RedexFile::sync()` always fsyncs both files.
-//! - Order matters inside [`DiskSegment::sync`]: dat fsyncs before
-//!   idx so a crash can only leave the index shorter than dat,
-//!   which the reopen-time truncation handles.
+//! Append-path fsync is governed by [`super::FsyncPolicy`], threaded
+//! into the segment at open time as two thresholds:
+//!
+//! - `fsync_every_n` — notify after every Nth successful append
+//!   (`EveryN(N)`).
+//! - `fsync_max_bytes` — notify after `max_bytes` of accumulated
+//!   writes across `dat` + `idx` + `ts`
+//!   (`IntervalOrBytes { max_bytes, .. }`).
+//!
+//! Each threshold is independent and either may be zero (disabled).
+//! Crossing a threshold fires `fsync_signal` (a `tokio::sync::Notify`);
+//! the actual fsync runs on a background worker spawned by
+//! [`super::RedexFile::open_persistent`], so the appender returns as
+//! soon as the bytes land in the page cache. Multiple notifies that
+//! arrive while the worker is mid-sync coalesce into a single
+//! follow-up sync — `Notify`'s single-permit semantics are exactly
+//! what the durability contract wants.
+//!
+//! `close()` and explicit [`super::RedexFile::sync()`] always run a
+//! full synchronous fsync of all three files, regardless of policy —
+//! they are the caller's explicit durability barriers.
+//!
+//! Each of the three files is held twice: once behind the appender's
+//! `Mutex<File>` (locked for `write_all`) and once behind a parallel
+//! worker `Mutex<File>` (locked only by [`DiskSegment::sync`] and
+//! [`DiskSegment::compact_to`]). The two slots are cloned from the
+//! same `OpenOptions::new().append(true)` handle via
+//! [`std::fs::File::try_clone`], so they share the underlying OS
+//! file — `sync_all` on either flushes the same pending writes — but
+//! the worker's `sync_all` doesn't contend with the appender's
+//! `write_all`. Without this split, a high-cadence policy
+//! (`EveryN(1)`, byte-threshold-every-batch) would serialize every
+//! appender behind the worker's millisecond-range fsync.
+//!
+//! # Invariants (do not regress)
+//!
+//! 1. **No seeks on the hot path.** `idx`, `dat`, `ts` open with
+//!    `OpenOptions::new().append(true)`; `set_len` only fires on
+//!    rollback (partial-write recovery) or on reopen (torn-tail
+//!    truncation). Any new append-time path must preserve this.
+//! 2. **Write order is `dat → idx → ts`.** The reopen-time recovery
+//!    walk depends on `dat` being durable before `idx`, and `idx`
+//!    before `ts`. Reordering is a silent corruption risk.
+//! 3. **Lock acquisition order is appender-dat → appender-idx →
+//!    appender-ts → worker-dat → worker-idx → worker-ts.** Appender,
+//!    worker, and rollback paths only ever hold one file lock at a
+//!    time, so the order is incidentally fine today; compaction is
+//!    the one path that holds multiple simultaneously and must
+//!    follow this order.
+//! 4. **Fsync order inside [`DiskSegment::sync`] is `dat → idx → ts`.**
+//!    A crash mid-sync can only leave `idx` shorter than `dat` (or
+//!    `ts` shorter than `idx`), which the reopen-time truncation
+//!    logic already handles. Reversing the order would let the index
+//!    reference dat bytes that were never flushed.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -32,8 +81,10 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
+use tokio::sync::Notify;
 
 use super::super::channel::ChannelName;
 use super::entry::{RedexEntry, REDEX_ENTRY_SIZE};
@@ -73,14 +124,43 @@ pub(super) struct DiskSegment {
     /// `append_entry` writes both, and rollback covers both
     /// together so no entry can be on disk without its timestamp.
     ts_file: Mutex<File>,
+    /// Worker-only fsync handles. Cloned via [`File::try_clone`]
+    /// from the appender handles above; both clones share the
+    /// underlying OS file, so `sync_all` on the worker handle
+    /// flushes the same pending writes the appender just made.
+    /// The point is that the worker doesn't go through the
+    /// appender's `Mutex<File>` — at high `EveryN` cadences the
+    /// worker would otherwise hold the appender's lock for the
+    /// duration of `sync_all` (millisecond-range on Windows
+    /// NVMe), stalling every concurrent `write_all`. Only
+    /// [`Self::sync`] and [`Self::compact_to`] touch these.
+    worker_idx_file: Mutex<File>,
+    worker_dat_file: Mutex<File>,
+    worker_ts_file: Mutex<File>,
     /// Append-path fsync interval: after `fsync_every_n` successful
-    /// appends, the segment invokes `sync()` itself. `0` disables
-    /// append-side syncing (Never or Interval policies — the latter
-    /// is driven externally by a per-file background task).
+    /// appends, the segment notifies the background fsync worker.
+    /// `0` disables append-count-based syncing.
     fsync_every_n: u64,
+    /// Append-path byte threshold for `IntervalOrBytes`: after
+    /// `fsync_max_bytes` bytes have accumulated since the last
+    /// successful sync, the segment notifies the worker. `0`
+    /// disables byte-based syncing.
+    fsync_max_bytes: u64,
     /// Appends since the last append-driven sync (successful or not).
     /// Only meaningful when `fsync_every_n > 0`.
     appends_since_sync: AtomicU64,
+    /// Bytes appended since the last successful sync. Bumped from
+    /// the append paths, reset to 0 inside `sync()` after the
+    /// fsyncs succeed. Only meaningful when `fsync_max_bytes > 0`.
+    bytes_since_sync: AtomicU64,
+    /// Wake-up signal for the background fsync worker. The
+    /// appender notifies this when either threshold (appends or
+    /// bytes) is crossed, then returns immediately — the fsync
+    /// runs off the appender thread. Always allocated (cheap);
+    /// only signaled when at least one threshold is configured
+    /// AND a worker is listening (spawned by
+    /// `RedexFile::open_persistent`).
+    pub(super) fsync_signal: Arc<Notify>,
     /// Test-only injection: when set, the next `append_entry` /
     /// `append_entries` call returns `RedexError::Io` before touching
     /// either file. Exercises the caller's rollback paths without
@@ -94,6 +174,12 @@ pub(super) struct DiskSegment {
     /// hazard.
     #[cfg(test)]
     fail_after_dat_write: AtomicBool,
+    /// Test-only injection: when set, the next `sync()` returns
+    /// `RedexError::Io` before touching any file. Used to verify
+    /// the EveryN background worker logs and continues rather than
+    /// terminating on a sync error.
+    #[cfg(test)]
+    fail_next_sync: AtomicBool,
     /// Test-only counter: cumulative successful `sync()` calls —
     /// close-time, append-driven (EveryN), or external
     /// (Interval / explicit). Lets policy tests assert the observed
@@ -106,14 +192,20 @@ impl DiskSegment {
     /// Open (or create) the idx + dat files for `name` under `base_dir`
     /// and recover the index from disk.
     ///
-    /// `fsync_every_n` is derived from [`super::FsyncPolicy`] at the
-    /// `RedexFile` layer: `EveryN(n)` forwards `n`; `Never` and
-    /// `Interval` (handled by the per-file background task) both
-    /// forward `0`, disabling append-side syncs on this segment.
+    /// `fsync_every_n` and `fsync_max_bytes` are derived from
+    /// [`super::FsyncPolicy`] at the `RedexFile` layer:
+    ///
+    /// - `EveryN(n)` → `(n.max(1), 0)`
+    /// - `IntervalOrBytes { max_bytes, .. }` → `(0, max_bytes)`
+    /// - `Never` / `Interval` → `(0, 0)`
+    ///
+    /// Each nonzero threshold enables one trigger of the background
+    /// fsync worker; `0` disables that trigger.
     pub(super) fn open(
         base_dir: &Path,
         name: &ChannelName,
         fsync_every_n: u64,
+        fsync_max_bytes: u64,
     ) -> Result<RecoveredSegment, RedexError> {
         let dir = channel_dir(base_dir, name);
         std::fs::create_dir_all(&dir).map_err(RedexError::io)?;
@@ -211,7 +303,6 @@ impl DiskSegment {
         // one.
         let ts_path = dir.join("ts");
         let original_timestamps = read_timestamps(&ts_path, index.len())?;
-        let _ = idx_len_truncated;
 
         // Verify per-entry checksums during recovery. Without
         // this check, on-disk corruption (torn writes, bit-rot,
@@ -328,18 +419,34 @@ impl DiskSegment {
             .open(&ts_path)
             .map_err(RedexError::io)?;
 
+        // Worker handles share the underlying OS file with the
+        // appender handles via `try_clone`, but live behind their
+        // own mutexes so the worker's `sync_all` never contends
+        // with the appender's `write_all`.
+        let worker_idx_file = idx_file.try_clone().map_err(RedexError::io)?;
+        let worker_dat_file = dat_file.try_clone().map_err(RedexError::io)?;
+        let worker_ts_file = ts_file.try_clone().map_err(RedexError::io)?;
+
         Ok(RecoveredSegment {
             disk: DiskSegment {
                 dir,
                 idx_file: Mutex::new(idx_file),
                 dat_file: Mutex::new(dat_file),
                 ts_file: Mutex::new(ts_file),
+                worker_idx_file: Mutex::new(worker_idx_file),
+                worker_dat_file: Mutex::new(worker_dat_file),
+                worker_ts_file: Mutex::new(worker_ts_file),
                 fsync_every_n,
+                fsync_max_bytes,
                 appends_since_sync: AtomicU64::new(0),
+                bytes_since_sync: AtomicU64::new(0),
+                fsync_signal: Arc::new(Notify::new()),
                 #[cfg(test)]
                 fail_next_append: AtomicBool::new(false),
                 #[cfg(test)]
                 fail_after_dat_write: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_next_sync: AtomicBool::new(false),
                 #[cfg(test)]
                 sync_count: AtomicU64::new(0),
             },
@@ -355,28 +462,77 @@ impl DiskSegment {
         self.sync_count.load(Ordering::Acquire)
     }
 
-    /// Bump the per-append counter and, if `fsync_every_n` is set,
-    /// call `sync()` when the counter reaches it. Counter resets after
-    /// each sync so the cadence stays periodic rather than
-    /// exponentially triggered. An fsync error at this boundary is
-    /// logged but **not** propagated — the caller's append already
-    /// succeeded in the page cache, and a blocked-fsync error here
-    /// would surface as a spurious append failure. Explicit
-    /// `sync()` / `close()` still surface errors.
-    fn maybe_sync_after_append(&self, applied: u64) {
-        if self.fsync_every_n == 0 || applied == 0 {
-            return;
+    /// Test-only: lengths reported by the three worker-side file
+    /// handles. After a successful append, these must match the
+    /// on-disk file lengths — that's the proof the worker handles
+    /// share the same OS file as the appender handles
+    /// (`try_clone` correctness) and, after `compact_to`, that the
+    /// worker handles were re-cloned from the new appender handles
+    /// rather than left pointing at the temp-dir placeholder.
+    #[cfg(test)]
+    pub(super) fn worker_file_lens(&self) -> (u64, u64, u64) {
+        let dat = self
+            .worker_dat_file
+            .lock()
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let idx = self
+            .worker_idx_file
+            .lock()
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let ts = self
+            .worker_ts_file
+            .lock()
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(0);
+        (dat, idx, ts)
+    }
+
+    /// Bump per-append and per-byte counters; if either crosses its
+    /// configured threshold, notify the background fsync worker.
+    /// The actual fsync runs off the appender thread; this returns
+    /// immediately after the page-cache write so the appender's
+    /// caller doesn't block on disk durability.
+    ///
+    /// Each counter resets independently when its threshold fires
+    /// so the cadence stays periodic. Explicit `sync()` / `close()`
+    /// are unaffected and continue to fsync synchronously,
+    /// surfacing any error.
+    fn maybe_sync_after_append(&self, applied: u64, bytes_written: u64) {
+        let mut should_signal = false;
+        if self.fsync_every_n > 0 && applied > 0 {
+            let prev = self.appends_since_sync.fetch_add(applied, Ordering::AcqRel);
+            let now = prev.saturating_add(applied);
+            if now >= self.fsync_every_n {
+                self.appends_since_sync.store(0, Ordering::Release);
+                should_signal = true;
+            }
         }
-        let prev = self.appends_since_sync.fetch_add(applied, Ordering::AcqRel);
-        let now = prev.saturating_add(applied);
-        if now < self.fsync_every_n {
-            return;
+        if self.fsync_max_bytes > 0 && bytes_written > 0 {
+            let prev = self
+                .bytes_since_sync
+                .fetch_add(bytes_written, Ordering::AcqRel);
+            let now = prev.saturating_add(bytes_written);
+            if now >= self.fsync_max_bytes {
+                // Reset before notify so concurrent appenders don't
+                // double-fire on already-counted bytes. The worker's
+                // sync() also stores 0; the redundant store here
+                // closes the appender-side race.
+                self.bytes_since_sync.store(0, Ordering::Release);
+                should_signal = true;
+            }
         }
-        // Reset unconditionally before syncing so a concurrent appender
-        // sees a clean counter even if sync is slow.
-        self.appends_since_sync.store(0, Ordering::Release);
-        if let Err(e) = self.sync() {
-            tracing::warn!(error = %e, "EveryN fsync failed; tail may be unsynced");
+        if should_signal {
+            // notify_one stores a permit if no worker is parked yet
+            // — covers the open→first-poll window. If multiple
+            // notifies arrive while the worker is mid-sync, they
+            // coalesce into a single follow-up sync, which is the
+            // intended semantics.
+            self.fsync_signal.notify_one();
         }
     }
 
@@ -389,18 +545,19 @@ impl DiskSegment {
         self.fail_next_append.store(true, Ordering::Release);
     }
 
-    /// Append an entry and (for heap entries) its payload to disk.
-    /// Inline entries skip the dat write — their payload rides in the
-    /// 20-byte idx record.
-    ///
-    /// Writes go through the OS page cache. Append-time fsync is
-    /// governed by [`super::FsyncPolicy`] via `fsync_every_n`:
-    /// `Never` / `Interval` skip it here entirely; `EveryN(n)`
-    /// triggers a sync every `n`th successful append. Explicit
-    /// `sync()` / `close()` still fsync regardless of policy.
     /// Append an entry with an explicit timestamp (unix nanos).
-    /// The timestamp is persisted to the `ts` sidecar so age-based
-    /// retention survives restart.
+    /// Inline entries skip the dat write — their payload rides in
+    /// the 20-byte idx record. The timestamp is persisted to the
+    /// `ts` sidecar so age-based retention survives restart.
+    ///
+    /// Writes go through the OS page cache. After a successful
+    /// append, [`Self::maybe_sync_after_append`] bumps the per-append
+    /// and per-byte counters and signals the background fsync worker
+    /// if either threshold (`fsync_every_n` / `fsync_max_bytes`) is
+    /// crossed — the actual fsync runs off the appender thread, so
+    /// this call returns as soon as the bytes land in the page cache.
+    /// Explicit [`Self::sync`] and `close()` still fsync
+    /// synchronously regardless of policy.
     #[allow(dead_code)]
     pub(super) fn append_entry_at(
         &self,
@@ -526,7 +683,16 @@ impl DiskSegment {
         }
         drop(ts);
 
-        self.maybe_sync_after_append(1);
+        // Bytes written across all three files this call. ts is 8
+        // bytes, idx is REDEX_ENTRY_SIZE, dat is payload.len() for
+        // heap entries (inline entries skip dat).
+        let dat_bytes = if entry.is_inline() {
+            0
+        } else {
+            payload.len() as u64
+        };
+        let total_bytes = dat_bytes + REDEX_ENTRY_SIZE as u64 + 8;
+        self.maybe_sync_after_append(1, total_bytes);
         Ok(())
     }
 
@@ -542,8 +708,10 @@ impl DiskSegment {
     /// each file's buffered write is contiguous). Inline entries only
     /// touch the idx file.
     ///
-    /// Same fsync semantics as [`Self::append_entry`] — a batch of N
-    /// counts as N applied appends against the `EveryN` cadence.
+    /// Same fsync semantics as [`Self::append_entry`]: a batch of N
+    /// counts as N applied appends against the `EveryN` cadence and
+    /// `dat_buf.len() + idx_buf.len() + ts_buf.len()` bytes against
+    /// the byte threshold. At most one notify fires per batch.
     #[allow(dead_code)]
     pub(super) fn append_entries(
         &self,
@@ -585,89 +753,154 @@ impl DiskSegment {
         if self.fail_next_append.swap(false, Ordering::AcqRel) {
             return Err(RedexError::Io("test-injected append failure".into()));
         }
-        let mut dat = self.dat_file.lock();
-        let dat_pre_len = dat.metadata().map_err(RedexError::io)?.len();
-        for (entry, payload) in entries_and_payloads {
+
+        // Build one contiguous buffer per file in a single pass, then
+        // issue one `write_all` per file. A batch of N entries used to
+        // emit 3·N syscalls (one per entry per file); now it emits at
+        // most 3. Write order — dat → idx → ts — is preserved so
+        // recovery's torn-tail logic still holds: a crash mid-batch
+        // can only leave dat ahead of idx (or idx ahead of ts), never
+        // the reverse.
+        let total_dat: usize = entries_and_payloads
+            .iter()
+            .filter(|(e, _)| !e.is_inline())
+            .map(|(_, p)| p.len())
+            .sum();
+        let mut dat_buf: Vec<u8> = Vec::with_capacity(total_dat);
+        let mut idx_buf: Vec<u8> =
+            Vec::with_capacity(entries_and_payloads.len() * REDEX_ENTRY_SIZE);
+        let mut ts_buf: Vec<u8> = Vec::with_capacity(timestamps.len() * 8);
+        for ((entry, payload), &t) in entries_and_payloads.iter().zip(timestamps) {
             if !entry.is_inline() {
-                if let Err(e) = dat.write_all(payload) {
-                    drop(dat);
-                    let dat_path = self.dir.join("dat");
-                    if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                        let _ = f.set_len(dat_pre_len);
-                    }
-                    return Err(RedexError::io(e));
-                }
+                dat_buf.extend_from_slice(payload);
             }
+            idx_buf.extend_from_slice(&entry.to_bytes());
+            ts_buf.extend_from_slice(&t.to_le_bytes());
         }
-        drop(dat);
+
+        // Skip dat entirely when every entry is inline. Track
+        // `dat_pre_len` only when we actually wrote, so the idx/ts
+        // rollback paths know whether a dat truncation is needed.
+        let dat_pre_len: Option<u64> = if !dat_buf.is_empty() {
+            let mut dat = self.dat_file.lock();
+            let pre_len = dat.metadata().map_err(RedexError::io)?.len();
+            if let Err(e) = dat.write_all(&dat_buf) {
+                drop(dat);
+                let dat_path = self.dir.join("dat");
+                if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
+                    let _ = f.set_len(pre_len);
+                }
+                return Err(RedexError::io(e));
+            }
+            drop(dat);
+            Some(pre_len)
+        } else {
+            None
+        };
 
         let mut idx = self.idx_file.lock();
         let idx_pre_len = idx.metadata().map_err(RedexError::io)?.len();
-        for (entry, _) in entries_and_payloads {
-            if let Err(e) = idx.write_all(&entry.to_bytes()) {
-                drop(idx);
-                let idx_path = self.dir.join("idx");
-                if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
-                    let _ = f.set_len(idx_pre_len);
-                }
+        if let Err(e) = idx.write_all(&idx_buf) {
+            drop(idx);
+            let idx_path = self.dir.join("idx");
+            if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
+                let _ = f.set_len(idx_pre_len);
+            }
+            if let Some(pre_len) = dat_pre_len {
                 let dat_path = self.dir.join("dat");
                 if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                    let _ = f.set_len(dat_pre_len);
+                    let _ = f.set_len(pre_len);
                 }
-                return Err(RedexError::io(e));
             }
+            return Err(RedexError::io(e));
         }
         drop(idx);
 
-        // Persist timestamps. Same rollback discipline as the
-        // single-entry path.
         let mut ts = self.ts_file.lock();
         let ts_pre_len = ts.metadata().map_err(RedexError::io)?.len();
-        for &t in timestamps {
-            if let Err(e) = ts.write_all(&t.to_le_bytes()) {
-                drop(ts);
-                let ts_path = self.dir.join("ts");
-                if let Ok(f) = OpenOptions::new().write(true).open(&ts_path) {
-                    let _ = f.set_len(ts_pre_len);
-                }
-                let idx_path = self.dir.join("idx");
-                if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
-                    let _ = f.set_len(idx_pre_len);
-                }
+        if let Err(e) = ts.write_all(&ts_buf) {
+            drop(ts);
+            let ts_path = self.dir.join("ts");
+            if let Ok(f) = OpenOptions::new().write(true).open(&ts_path) {
+                let _ = f.set_len(ts_pre_len);
+            }
+            let idx_path = self.dir.join("idx");
+            if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
+                let _ = f.set_len(idx_pre_len);
+            }
+            if let Some(pre_len) = dat_pre_len {
                 let dat_path = self.dir.join("dat");
                 if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
-                    let _ = f.set_len(dat_pre_len);
+                    let _ = f.set_len(pre_len);
                 }
-                return Err(RedexError::io(e));
             }
+            return Err(RedexError::io(e));
         }
         drop(ts);
 
-        self.maybe_sync_after_append(entries_and_payloads.len() as u64);
+        let total_bytes = (dat_buf.len() + idx_buf.len() + ts_buf.len()) as u64;
+        self.maybe_sync_after_append(entries_and_payloads.len() as u64, total_bytes);
         Ok(())
     }
 
-    /// Flush both files to durable storage. Order matters for crash
-    /// consistency: the payload (`dat`) must be durable before the
-    /// index entry (`idx`) that references it. A crash between the
-    /// two syncs with the old order could leave an index entry
-    /// pointing at bytes that were never flushed — on recovery the
-    /// index would reference torn payload data. With dat-first the
-    /// worst case is an index that's one or more entries shorter
-    /// than the dat, which the torn-tail truncation logic on reopen
-    /// already handles correctly.
+    /// Flush all three files to durable storage. Order matters for
+    /// crash consistency: the payload (`dat`) must be durable before
+    /// the index entry (`idx`) that references it, and `idx` before
+    /// `ts`. A crash between syncs in the wrong order could leave
+    /// an index entry pointing at bytes that were never flushed —
+    /// on recovery the index would reference torn payload data.
+    /// With dat-first the worst case is an index that's one or more
+    /// entries shorter than the dat, which the torn-tail truncation
+    /// logic on reopen already handles correctly.
+    ///
+    /// Goes through the *worker* handles, not the appender handles.
+    /// Both share the same OS file (via `try_clone` at open time),
+    /// so `sync_all` here flushes the same pending writes the
+    /// appender just made — but acquiring a lock the appender
+    /// doesn't touch means the appender's `write_all` doesn't stall
+    /// for the duration of the fsync. This is the fix that lets
+    /// `EveryN(1)` keep up with the appender instead of serializing
+    /// behind it.
     pub(super) fn sync(&self) -> Result<(), RedexError> {
-        self.dat_file.lock().sync_all().map_err(RedexError::io)?;
-        self.idx_file.lock().sync_all().map_err(RedexError::io)?;
+        #[cfg(test)]
+        if self.fail_next_sync.swap(false, Ordering::AcqRel) {
+            return Err(RedexError::Io("test-injected sync failure".into()));
+        }
+        self.worker_dat_file
+            .lock()
+            .sync_all()
+            .map_err(RedexError::io)?;
+        self.worker_idx_file
+            .lock()
+            .sync_all()
+            .map_err(RedexError::io)?;
         // The ts sidecar is fsynced last — same dat-before-idx
         // logic: a crash that loses the ts tail just means the
         // recovered timestamps for the trailing N entries fall
         // back to `now()`. Losing the idx tail without the dat
         // would be worse, so dat-first.
-        self.ts_file.lock().sync_all().map_err(RedexError::io)?;
+        self.worker_ts_file
+            .lock()
+            .sync_all()
+            .map_err(RedexError::io)?;
+        // All bytes accumulated up to this point are now durable.
+        // Reset the byte counter so `IntervalOrBytes` measures from
+        // here forward; the timer-driven sync path relies on this
+        // (it doesn't cross a threshold itself, so without the
+        // reset, byte-trigger would over-fire on subsequent appends).
+        self.bytes_since_sync.store(0, Ordering::Release);
         #[cfg(test)]
         self.sync_count.fetch_add(1, Ordering::AcqRel);
         Ok(())
+    }
+
+    /// Test-only: arm a one-shot failure on the next `sync()` call.
+    /// Used to verify the EveryN background worker logs and continues
+    /// rather than terminating on a sync error. The flag is consumed
+    /// on the next `sync()` (success or failure clears it).
+    #[cfg(test)]
+    pub(super) fn arm_next_sync_failure(&self) {
+        self.fail_next_sync.store(true, Ordering::Release);
     }
 
     /// Compact the on-disk segment to the surviving in-memory
@@ -709,9 +942,27 @@ impl DiskSegment {
         // Drop the cached append handles before the rename so
         // the original files aren't held open. We'll re-open
         // them at the end of this method.
-        let mut idx_guard = self.idx_file.lock();
+        //
+        // Acquire in (appender) dat → idx → ts → (worker) dat → idx
+        // → ts order to match the global lock discipline documented
+        // in the module rustdoc. This is the only path that holds
+        // multiple file locks simultaneously; the appender and the
+        // worker each only hold one at a time, so the order is
+        // incidentally safe today, but a future change that
+        // overlaps locks on either path could deadlock if compaction
+        // held them in any other order.
+        //
+        // Worker handles also point at the destination paths (they
+        // were `try_clone`d at open time), so they pin the OS files
+        // the same way the appender handles do — both must be
+        // swapped to placeholders before the rename can succeed
+        // on Windows.
         let mut dat_guard = self.dat_file.lock();
+        let mut idx_guard = self.idx_file.lock();
         let mut ts_guard = self.ts_file.lock();
+        let mut worker_dat_guard = self.worker_dat_file.lock();
+        let mut worker_idx_guard = self.worker_idx_file.lock();
+        let mut worker_ts_guard = self.worker_ts_file.lock();
 
         // Build the new idx, ts contents in-memory; the dat tail
         // we rewrite by reading the surviving range from the old
@@ -818,16 +1069,28 @@ impl DiskSegment {
             .truncate(false)
             .open(&placeholder_ts)
             .map_err(RedexError::io)?;
+        // Clone the placeholders for the worker slots — cheaper
+        // than opening three more temp files, and works for our
+        // purposes since the placeholder is just "any valid File
+        // value to park in the slot until we re-open."
+        let null_idx_worker = null_idx.try_clone().map_err(RedexError::io)?;
+        let null_dat_worker = null_dat.try_clone().map_err(RedexError::io)?;
+        let null_ts_worker = null_ts.try_clone().map_err(RedexError::io)?;
         *idx_guard = null_idx;
         *dat_guard = null_dat;
         *ts_guard = null_ts;
+        *worker_idx_guard = null_idx_worker;
+        *worker_dat_guard = null_dat_worker;
+        *worker_ts_guard = null_ts_worker;
 
         // Atomic renames.
         std::fs::rename(&idx_tmp, &idx_path).map_err(RedexError::io)?;
         std::fs::rename(&dat_tmp, &dat_path).map_err(RedexError::io)?;
         std::fs::rename(&ts_tmp, &ts_path).map_err(RedexError::io)?;
 
-        // Re-open the cached append handles on the new files.
+        // Re-open the cached append handles on the new files, then
+        // re-clone for the worker slots. Both kinds again share the
+        // same OS file post-compaction.
         *idx_guard = OpenOptions::new()
             .create(true)
             .read(true)
@@ -846,6 +1109,9 @@ impl DiskSegment {
             .append(true)
             .open(&ts_path)
             .map_err(RedexError::io)?;
+        *worker_idx_guard = idx_guard.try_clone().map_err(RedexError::io)?;
+        *worker_dat_guard = dat_guard.try_clone().map_err(RedexError::io)?;
+        *worker_ts_guard = ts_guard.try_clone().map_err(RedexError::io)?;
 
         // Clean up placeholders. Best-effort; if the rename
         // succeeded we can tolerate a stray file in the OS temp
@@ -974,7 +1240,7 @@ mod tests {
         let name = ChannelName::new("t/disk1").unwrap();
 
         {
-            let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+            let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
             assert!(recovered.index.is_empty());
             assert!(recovered.payload_bytes.is_empty());
 
@@ -991,7 +1257,7 @@ mod tests {
         }
 
         // Reopen; recover both entries and their payload.
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         assert_eq!(recovered.index.len(), 2);
         assert_eq!(recovered.index[0].seq, 0);
         assert_eq!(recovered.index[1].seq, 1);
@@ -1006,14 +1272,14 @@ mod tests {
         let base = tmpdir();
         let name = ChannelName::new("t/inline").unwrap();
 
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         let payload = *b"abcdefgh";
         let entry = RedexEntry::new_inline(0, &payload, payload_checksum(&payload));
         recovered.disk.append_entry(&entry, &payload).unwrap();
         recovered.disk.sync().unwrap();
         drop(recovered);
 
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         assert_eq!(recovered.index.len(), 1);
         assert!(recovered.index[0].is_inline());
         // Dat file should be empty — inline payload lives in idx.
@@ -1029,7 +1295,7 @@ mod tests {
 
         // Write one good entry.
         {
-            let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+            let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
             let p = b"ok";
             let e = RedexEntry::new_heap(0, 0, p.len() as u32, 0, payload_checksum(p));
             recovered.disk.append_entry(&e, p).unwrap();
@@ -1044,7 +1310,7 @@ mod tests {
         drop(f);
 
         // Reopen: partial tail must be truncated; one entry recovered.
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         assert_eq!(recovered.index.len(), 1);
         assert_eq!(recovered.index[0].seq, 0);
 
@@ -1097,7 +1363,7 @@ mod tests {
 
         // Phase 1 — write the layout.
         {
-            let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+            let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
 
             recovered
                 .disk
@@ -1170,7 +1436,7 @@ mod tests {
             .unwrap();
 
         // Phase 3 — reopen and assert.
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         let seqs: Vec<u64> = recovered.index.iter().map(|e| e.seq).collect();
         assert_eq!(
             seqs,
@@ -1235,7 +1501,7 @@ mod tests {
         let h3_payload = b"heap3";
 
         {
-            let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+            let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
 
             recovered
                 .disk
@@ -1284,7 +1550,7 @@ mod tests {
             .set_len(5)
             .unwrap();
 
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         let seqs: Vec<u64> = recovered.index.iter().map(|e| e.seq).collect();
         assert_eq!(
             seqs,
@@ -1325,7 +1591,7 @@ mod tests {
         let name = ChannelName::new("t/rollback").unwrap();
         let dat_path = channel_dir(&base, &name).join("dat");
 
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
 
         // Successful first append establishes a known starting
         // point.
@@ -1372,7 +1638,7 @@ mod tests {
 
         // And recovery sees the right entries.
         drop(recovered);
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         assert_eq!(recovered.index.len(), 2);
         assert_eq!(&recovered.payload_bytes[..p1.len()], p1);
         assert_eq!(&recovered.payload_bytes[p1.len()..p1.len() + p2.len()], p2);
@@ -1396,7 +1662,7 @@ mod tests {
         // Append four entries with distinct, recognizable timestamps.
         // Use the explicit-timestamp variant so we can pin which
         // ts pairs with which idx record.
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         let payloads: [&[u8]; 4] = [b"AAAAAAAAA", b"BBBBBBBBB", b"CCCCCCCCC", b"DDDDDDDDD"];
         let timestamps: [u64; 4] = [1000, 2000, 3000, 4000];
         let mut offset = 0u32;
@@ -1423,7 +1689,7 @@ mod tests {
         // Reopen — recovery's checksum filter must drop entry 1
         // (B) and pair the surviving entries with their original
         // timestamps (1000, 3000, 4000), NOT (1000, 2000, 3000).
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         assert_eq!(recovered.index.len(), 3, "one corrupt entry must drop");
         let surviving_seqs: Vec<u64> = recovered.index.iter().map(|e| e.seq).collect();
         assert_eq!(surviving_seqs, vec![0, 2, 3], "B should be dropped");
@@ -1435,6 +1701,311 @@ mod tests {
             "surviving timestamps must come from the original index \
              positions of the surviving entries; pre-fix this would \
              have been [1000, 2000, 3000]"
+        );
+
+        cleanup(&base);
+    }
+
+    /// Mixed heap + inline batch round-trip through the buffered
+    /// `append_entries_at` path. The disk-layer batch API stitches
+    /// `dat_buf` from heap payloads only while idx/ts cover every
+    /// entry; this test pins three things at once:
+    ///
+    ///   1. inline payloads do NOT leak into dat,
+    ///   2. heap-payload bytes land at the offsets their idx records
+    ///      claim,
+    ///   3. each per-entry timestamp pairs with the matching idx
+    ///      record on reopen.
+    ///
+    /// A zip-mismatch or wrong-buffer regression would surface as
+    /// either a checksum failure on reopen or a misaligned timestamp.
+    #[test]
+    fn test_disk_batch_mixed_heap_and_inline_roundtrip() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/batch_mixed").unwrap();
+
+        let h1 = b"heap-one";
+        let inline_a = *b"inline_A"; // 8 bytes
+        let h2 = b"heap-two-longer";
+        let inline_b = *b"inline_B";
+
+        let h1_off = 0u32;
+        let h2_off = h1_off + h1.len() as u32;
+
+        let entries = [
+            (
+                RedexEntry::new_heap(10, h1_off, h1.len() as u32, 0, payload_checksum(h1)),
+                h1.as_slice(),
+            ),
+            (
+                RedexEntry::new_inline(11, &inline_a, payload_checksum(&inline_a)),
+                inline_a.as_slice(),
+            ),
+            (
+                RedexEntry::new_heap(12, h2_off, h2.len() as u32, 0, payload_checksum(h2)),
+                h2.as_slice(),
+            ),
+            (
+                RedexEntry::new_inline(13, &inline_b, payload_checksum(&inline_b)),
+                inline_b.as_slice(),
+            ),
+        ];
+        let timestamps = [11_000u64, 22_000, 33_000, 44_000];
+
+        {
+            let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+            recovered
+                .disk
+                .append_entries_at(&entries, &timestamps)
+                .unwrap();
+            recovered.disk.sync().unwrap();
+        }
+
+        // dat must contain exactly h1 || h2 — inline bytes must NOT
+        // have been appended to the dat buffer during stitching.
+        let dat_path = channel_dir(&base, &name).join("dat");
+        let dat_bytes = std::fs::read(&dat_path).unwrap();
+        assert_eq!(dat_bytes.len(), h1.len() + h2.len());
+        assert_eq!(&dat_bytes[..h1.len()], h1);
+        assert_eq!(&dat_bytes[h1.len()..], h2);
+
+        // Reopen: all four entries survive with their correct seqs,
+        // inline flags, and timestamps.
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let seqs: Vec<u64> = recovered.index.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![10, 11, 12, 13]);
+        assert!(!recovered.index[0].is_inline());
+        assert!(recovered.index[1].is_inline());
+        assert!(!recovered.index[2].is_inline());
+        assert!(recovered.index[3].is_inline());
+        let ts = recovered.timestamps.expect("ts sidecar present");
+        assert_eq!(ts, vec![11_000, 22_000, 33_000, 44_000]);
+
+        cleanup(&base);
+    }
+
+    /// All-inline batch must skip the dat lock entirely (the new
+    /// `dat_pre_len: Option<u64>` branch). dat file stays at zero
+    /// bytes; idx and ts both receive their batched writes.
+    #[test]
+    fn test_disk_batch_all_inline_skips_dat() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/batch_all_inline").unwrap();
+
+        let p1 = *b"alpha___";
+        let p2 = *b"beta____";
+        let p3 = *b"gamma___";
+        let entries = [
+            (
+                RedexEntry::new_inline(0, &p1, payload_checksum(&p1)),
+                p1.as_slice(),
+            ),
+            (
+                RedexEntry::new_inline(1, &p2, payload_checksum(&p2)),
+                p2.as_slice(),
+            ),
+            (
+                RedexEntry::new_inline(2, &p3, payload_checksum(&p3)),
+                p3.as_slice(),
+            ),
+        ];
+        let timestamps = [100u64, 200, 300];
+
+        {
+            let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+            recovered
+                .disk
+                .append_entries_at(&entries, &timestamps)
+                .unwrap();
+            recovered.disk.sync().unwrap();
+        }
+
+        // dat file was created by `open` but should still be empty —
+        // no heap payloads means the dat write path was skipped.
+        let dat_path = channel_dir(&base, &name).join("dat");
+        assert_eq!(
+            std::fs::metadata(&dat_path).unwrap().len(),
+            0,
+            "all-inline batch must not write to dat"
+        );
+
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        assert_eq!(recovered.index.len(), 3);
+        for e in &recovered.index {
+            assert!(e.is_inline());
+        }
+        let ts = recovered.timestamps.expect("ts sidecar present");
+        assert_eq!(ts, vec![100, 200, 300]);
+
+        cleanup(&base);
+    }
+
+    /// Worker-side file handles are cloned from the appender's via
+    /// `File::try_clone` so they share the same underlying OS file.
+    /// This is the contract that lets the background worker call
+    /// `sync_all` without holding the appender's mutex; if a
+    /// regression accidentally opened a separate file, the worker
+    /// would fsync the wrong descriptor and durability would
+    /// silently break.
+    ///
+    /// The check: after appending through the appender path, the
+    /// worker handles' `metadata().len()` must equal the on-disk
+    /// file length. Different File instances of the same OS file
+    /// see the same length; different files would not.
+    #[test]
+    fn test_worker_handles_share_os_file_with_appender() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/worker_share").unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+
+        let p1 = b"alpha";
+        let e1 = RedexEntry::new_heap(0, 0, p1.len() as u32, 0, payload_checksum(p1));
+        recovered.disk.append_entry(&e1, p1).unwrap();
+        let p2 = b"beta_payload";
+        let e2 = RedexEntry::new_heap(1, p1.len() as u32, p2.len() as u32, 0, payload_checksum(p2));
+        recovered.disk.append_entry(&e2, p2).unwrap();
+
+        // Worker handles must observe the same file lengths the
+        // appender just produced.
+        let (dat_w, idx_w, ts_w) = recovered.disk.worker_file_lens();
+        assert_eq!(
+            dat_w,
+            (p1.len() + p2.len()) as u64,
+            "worker dat handle must reflect the appender's heap writes"
+        );
+        assert_eq!(idx_w, 2 * REDEX_ENTRY_SIZE as u64);
+        assert_eq!(ts_w, 2 * 8);
+
+        // Cross-check against the on-disk files. If the worker
+        // handles pointed at separate files (regression scenario),
+        // these would diverge.
+        let dat_path = channel_dir(&base, &name).join("dat");
+        let idx_path = channel_dir(&base, &name).join("idx");
+        let ts_path = channel_dir(&base, &name).join("ts");
+        assert_eq!(dat_w, std::fs::metadata(&dat_path).unwrap().len());
+        assert_eq!(idx_w, std::fs::metadata(&idx_path).unwrap().len());
+        assert_eq!(ts_w, std::fs::metadata(&ts_path).unwrap().len());
+
+        // sync() goes through the worker handles. It must succeed
+        // without locking against the appender (the test runs
+        // single-threaded so we're really only confirming
+        // operational correctness here, not the no-contention
+        // property which lives in the bench).
+        recovered.disk.sync().unwrap();
+
+        cleanup(&base);
+    }
+
+    /// `compact_to` does a placeholder swap → atomic rename →
+    /// re-open of the appender handles; the worker handles must be
+    /// re-cloned from the new appender handles afterward, otherwise
+    /// they're left pointing at the temp-dir placeholder file. A
+    /// regression that forgot the re-clone would have `sync()`
+    /// silently fsync the placeholder instead of the channel files
+    /// — durable on close (the appender handles still work) but
+    /// not on the policy-driven worker path.
+    ///
+    /// The check: after `compact_to`, the worker handles' lengths
+    /// must equal the post-compaction file lengths. A subsequent
+    /// append through the appender then `sync()` then reopen must
+    /// round-trip both the surviving compacted entry and the new
+    /// post-compaction append.
+    #[test]
+    fn test_compact_to_re_clones_worker_handles() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/compact_workers").unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+
+        // Three heap appends with explicit timestamps so the
+        // surviving entry's ts is predictable.
+        let payloads: [&[u8]; 3] = [b"first_one", b"second_one", b"third_one_"];
+        let mut offset = 0u32;
+        for (i, p) in payloads.iter().enumerate() {
+            let e = RedexEntry::new_heap(i as u64, offset, p.len() as u32, 0, payload_checksum(p));
+            recovered
+                .disk
+                .append_entry_at(&e, p, 1_000 * (i as u64 + 1))
+                .unwrap();
+            offset += p.len() as u32;
+        }
+        recovered.disk.sync().unwrap();
+
+        // Compact down to the third entry only. `compact_to`
+        // rewrites its `payload_offset` to be relative to the new
+        // dat file (so 0 in the compacted file).
+        let third_dat_base = (payloads[0].len() + payloads[1].len()) as u64;
+        let surviving = vec![RedexEntry::new_heap(
+            2,
+            third_dat_base as u32,
+            payloads[2].len() as u32,
+            0,
+            payload_checksum(payloads[2]),
+        )];
+        let surviving_ts = vec![3_000u64];
+        recovered
+            .disk
+            .compact_to(&surviving, &surviving_ts, third_dat_base)
+            .unwrap();
+
+        // Worker handles must now reflect the compacted file sizes,
+        // not the placeholder (which had size 0). This is the
+        // direct probe for the re-clone in `compact_to`.
+        let dat_path = channel_dir(&base, &name).join("dat");
+        let idx_path = channel_dir(&base, &name).join("idx");
+        let ts_path = channel_dir(&base, &name).join("ts");
+        let on_disk_dat = std::fs::metadata(&dat_path).unwrap().len();
+        let on_disk_idx = std::fs::metadata(&idx_path).unwrap().len();
+        let on_disk_ts = std::fs::metadata(&ts_path).unwrap().len();
+        assert_eq!(on_disk_dat, payloads[2].len() as u64, "sanity");
+        assert_eq!(on_disk_idx, REDEX_ENTRY_SIZE as u64, "sanity");
+        assert_eq!(on_disk_ts, 8, "sanity");
+        let (dat_w, idx_w, ts_w) = recovered.disk.worker_file_lens();
+        assert_eq!(
+            dat_w, on_disk_dat,
+            "worker dat handle must point at the compacted dat file, \
+             not the placeholder"
+        );
+        assert_eq!(
+            idx_w, on_disk_idx,
+            "worker idx handle must point at the compacted idx file"
+        );
+        assert_eq!(
+            ts_w, on_disk_ts,
+            "worker ts handle must point at the compacted ts file"
+        );
+
+        // Append a new entry through the appender; with the worker
+        // handles re-cloned correctly, `sync()` flushes the right
+        // file and the post-compact append is durable across reopen.
+        let new_payload = b"after_compact";
+        let new_entry = RedexEntry::new_heap(
+            99,
+            on_disk_dat as u32,
+            new_payload.len() as u32,
+            0,
+            payload_checksum(new_payload),
+        );
+        recovered
+            .disk
+            .append_entry_at(&new_entry, new_payload, 4_000)
+            .unwrap();
+        recovered.disk.sync().unwrap();
+
+        drop(recovered);
+        let recovered2 = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let seqs: Vec<u64> = recovered2.index.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![2, 99],
+            "post-compact reopen must show the surviving entry and \
+             the post-compaction append"
+        );
+        let ts = recovered2.timestamps.expect("ts sidecar present");
+        assert_eq!(
+            ts,
+            vec![3_000, 4_000],
+            "timestamps must pair with the right index records after \
+             compaction + post-compact append"
         );
 
         cleanup(&base);

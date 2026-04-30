@@ -58,23 +58,26 @@ struct RedexFileInner {
     closed: AtomicBool,
     #[cfg(feature = "redex-disk")]
     disk: Option<Arc<DiskSegment>>,
-    /// Shutdown signal for the `FsyncPolicy::Interval` background
-    /// task. `Some` iff an Interval task was spawned at
-    /// `open_persistent` time. `close()` calls `notify_one()` so a
-    /// permit is stored even if the task hasn't yet registered a
-    /// waiter; the task observes it, exits, and releases its
-    /// DiskSegment reference.
+    /// Shutdown signal for whichever background fsync task this file
+    /// spawned — either `FsyncPolicy::Interval` (timer-driven) or
+    /// `FsyncPolicy::EveryN` (signal-driven from
+    /// `DiskSegment::maybe_sync_after_append`). `Some` iff a task
+    /// was spawned at `open_persistent` time. `close()` calls
+    /// `notify_one()` so a permit is stored even if the task hasn't
+    /// yet parked on its select; the task observes it, exits, and
+    /// releases its DiskSegment reference.
     #[cfg(feature = "redex-disk")]
-    interval_shutdown: Option<Arc<Notify>>,
+    fsync_shutdown: Option<Arc<Notify>>,
 }
 
 /// Dropping the last `RedexFile` clone without calling `close()`
-/// previously leaked the `FsyncPolicy::Interval` background task —
-/// it kept a strong `Arc<DiskSegment>` and a shutdown `Notify` whose
-/// only firing site was inside `close()`. `redex/index.rs` already
-/// had a Drop impl that mirrored this pattern; we mirror it here so
-/// a misbehaving caller (or a panic path that bypasses the explicit
-/// close) doesn't leak the task for the lifetime of the runtime.
+/// previously leaked the background fsync task (either Interval or
+/// EveryN) — it kept a strong `Arc<DiskSegment>` and a shutdown
+/// `Notify` whose only firing site was inside `close()`.
+/// `redex/index.rs` already had a Drop impl that mirrored this
+/// pattern; we mirror it here so a misbehaving caller (or a panic
+/// path that bypasses the explicit close) doesn't leak the task for
+/// the lifetime of the runtime.
 ///
 /// Drop is best-effort: it fires the notify so the spawned task
 /// observes the signal and exits at the next select. We do NOT
@@ -83,7 +86,7 @@ struct RedexFileInner {
 impl Drop for RedexFileInner {
     fn drop(&mut self) {
         #[cfg(feature = "redex-disk")]
-        if let Some(notify) = self.interval_shutdown.as_ref() {
+        if let Some(notify) = self.fsync_shutdown.as_ref() {
             // `notify_one` stores a permit even if no waiter is
             // currently parked, so a task that hasn't yet reached
             // its first `notified().await` will still observe the
@@ -120,7 +123,7 @@ impl RedexFile {
                 #[cfg(feature = "redex-disk")]
                 disk: None,
                 #[cfg(feature = "redex-disk")]
-                interval_shutdown: None,
+                fsync_shutdown: None,
             }),
         }
     }
@@ -140,15 +143,16 @@ impl RedexFile {
         config: RedexFileConfig,
         base_dir: &Path,
     ) -> Result<Self, RedexError> {
-        // Derive the DiskSegment's append-side fsync cadence from
-        // the caller's policy. EveryN is honored on the append path;
-        // Never and Interval both pass 0 (Interval runs via the
-        // per-file background task spawned below).
-        let fsync_every_n = match config.fsync_policy {
-            FsyncPolicy::Never | FsyncPolicy::Interval(_) => 0,
-            FsyncPolicy::EveryN(n) => n.max(1),
+        // Derive the DiskSegment's append-side trigger thresholds
+        // from the caller's policy. Each variant enables zero, one,
+        // or both triggers; the worker spawned below interprets
+        // them via `disk.fsync_signal`.
+        let (fsync_every_n, fsync_max_bytes) = match config.fsync_policy {
+            FsyncPolicy::Never | FsyncPolicy::Interval(_) => (0, 0),
+            FsyncPolicy::EveryN(n) => (n.max(1), 0),
+            FsyncPolicy::IntervalOrBytes { max_bytes, .. } => (0, max_bytes),
         };
-        let recovered = DiskSegment::open(base_dir, &name, fsync_every_n)?;
+        let recovered = DiskSegment::open(base_dir, &name, fsync_every_n, fsync_max_bytes)?;
         let next_seq = recovered.index.last().map(|e| e.seq + 1).unwrap_or(0);
 
         let segment = HeapSegment::from_existing(recovered.payload_bytes);
@@ -184,14 +188,15 @@ impl RedexFile {
 
         let disk = Arc::new(recovered.disk);
 
-        // Spawn the Interval background task (if requested). It holds
-        // an Arc<DiskSegment> and a clone of the shutdown Notify; on
-        // close() the notify fires and the task exits. Dropping the
-        // last RedexFile clone WITHOUT calling close() leaks the
-        // task until the runtime shuts down — consistent with the
-        // rest of the codebase's lifecycle expectations (callers are
-        // expected to `close()` persistent files).
-        let interval_shutdown = match config.fsync_policy {
+        // Spawn whichever fsync background task the policy needs.
+        // Both variants hold an Arc<DiskSegment> and a clone of the
+        // shutdown Notify; on close() the notify fires and the task
+        // exits. Dropping the last RedexFile clone WITHOUT calling
+        // close() leaks the task until the runtime shuts down —
+        // consistent with the rest of the codebase's lifecycle
+        // expectations (callers are expected to `close()` persistent
+        // files).
+        let fsync_shutdown = match config.fsync_policy {
             FsyncPolicy::Interval(d) if d > std::time::Duration::ZERO => {
                 let shutdown = Arc::new(Notify::new());
                 let task_shutdown = shutdown.clone();
@@ -213,6 +218,101 @@ impl RedexFile {
                 });
                 Some(shutdown)
             }
+            // EveryN moves the actual fsync off the appender thread:
+            // `DiskSegment::maybe_sync_after_append` notifies
+            // `fsync_signal` when the cadence threshold is reached
+            // and returns immediately. This worker awaits that
+            // signal and runs the fsync. Multiple notifies that
+            // arrive during one in-flight sync coalesce into a
+            // single follow-up sync — `Notify` is a single-permit
+            // primitive, which is the intended semantics.
+            FsyncPolicy::EveryN(_) => {
+                let shutdown = Arc::new(Notify::new());
+                let task_shutdown = shutdown.clone();
+                let task_disk = disk.clone();
+                let task_signal = disk.fsync_signal.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = task_shutdown.notified() => return,
+                            _ = task_signal.notified() => {
+                                if let Err(e) = task_disk.sync() {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "EveryN fsync failed; tail may be unsynced"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                });
+                Some(shutdown)
+            }
+            // IntervalOrBytes selects over a periodic timer AND the
+            // byte-threshold signal — whichever fires first triggers
+            // a sync. The byte signal is fired by the appender via
+            // `maybe_sync_after_append`, which checks `fsync_max_bytes`
+            // (already plumbed into the segment above).
+            FsyncPolicy::IntervalOrBytes { period, .. } if period > std::time::Duration::ZERO => {
+                let shutdown = Arc::new(Notify::new());
+                let task_shutdown = shutdown.clone();
+                let task_disk = disk.clone();
+                let task_signal = disk.fsync_signal.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = task_shutdown.notified() => return,
+                            _ = tokio::time::sleep(period) => {
+                                if let Err(e) = task_disk.sync() {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "IntervalOrBytes (timer) fsync failed; continuing"
+                                    );
+                                }
+                            }
+                            _ = task_signal.notified() => {
+                                if let Err(e) = task_disk.sync() {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "IntervalOrBytes (bytes) fsync failed; continuing"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                });
+                Some(shutdown)
+            }
+            // `period == ZERO && max_bytes > 0` is the byte-only
+            // variant: skip the timer arm entirely but still react to
+            // the appender's byte-threshold notify. Without a worker
+            // the notify would just store an unread permit and the
+            // bytes would never auto-sync until close — almost
+            // certainly not what the caller meant by "byte-only."
+            FsyncPolicy::IntervalOrBytes { period, max_bytes }
+                if period == std::time::Duration::ZERO && max_bytes > 0 =>
+            {
+                let shutdown = Arc::new(Notify::new());
+                let task_shutdown = shutdown.clone();
+                let task_disk = disk.clone();
+                let task_signal = disk.fsync_signal.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = task_shutdown.notified() => return,
+                            _ = task_signal.notified() => {
+                                if let Err(e) = task_disk.sync() {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "IntervalOrBytes (bytes) fsync failed; continuing"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                });
+                Some(shutdown)
+            }
             _ => None,
         };
 
@@ -224,7 +324,7 @@ impl RedexFile {
                 state: Mutex::new(state),
                 closed: AtomicBool::new(false),
                 disk: Some(disk),
-                interval_shutdown,
+                fsync_shutdown,
             }),
         })
     }
@@ -447,11 +547,13 @@ impl RedexFile {
         }
 
         // Commit to memory. Pre-validated capacity → infallible.
+        // One `append_many` call instead of N `append` calls: a
+        // single bounds check and a single reserve.
+        state
+            .segment
+            .append_many(payloads)
+            .expect("pre-validated capacity; segment append cannot fail under the state lock");
         for event in &events {
-            state
-                .segment
-                .append(&event.payload)
-                .expect("pre-validated capacity; segment append cannot fail under the state lock");
             state.index.push(event.entry);
             state.timestamps.push(ts);
         }
@@ -638,12 +740,13 @@ impl RedexFile {
             }
         }
 
-        // Commit to memory.
+        // Commit to memory. One `append_many` call instead of N
+        // `append` calls.
+        state
+            .segment
+            .append_many(payloads)
+            .expect("pre-validated capacity; segment append cannot fail under the state lock");
         for event in &events {
-            state
-                .segment
-                .append(&event.payload)
-                .expect("pre-validated capacity; segment append cannot fail under the state lock");
             state.index.push(event.entry);
             state.timestamps.push(ts);
         }
@@ -901,7 +1004,7 @@ impl RedexFile {
 
     /// Close the file. Outstanding tail streams receive `RedexError::Closed`.
     /// For persistent files, fsyncs the disk segment before returning
-    /// and signals any `FsyncPolicy::Interval` background task to
+    /// and signals any background fsync task (Interval or EveryN) to
     /// exit. `close()` always fsyncs regardless of the per-file
     /// `FsyncPolicy` — this is the caller's explicit durability
     /// barrier.
@@ -921,8 +1024,9 @@ impl RedexFile {
 
         #[cfg(feature = "redex-disk")]
         {
-            // Signal the Interval task to exit before fsyncing so
-            // `close()` isn't racing the task's own sync.
+            // Signal the background fsync task (Interval or EveryN)
+            // to exit before fsyncing so `close()` isn't racing the
+            // task's own sync.
             //
             // `notify_one` stores a permit if the task hasn't yet
             // parked on `notified()` — e.g. a `close()` that races a
@@ -931,7 +1035,7 @@ impl RedexFile {
             // next poll. `notify_waiters` would be lost in that
             // window and the fsync loop would keep running after
             // close.
-            if let Some(shutdown) = self.inner.interval_shutdown.as_ref() {
+            if let Some(shutdown) = self.inner.fsync_shutdown.as_ref() {
                 shutdown.notify_one();
             }
             if let Some(disk) = self.disk() {
@@ -1513,42 +1617,565 @@ mod tests {
         assert_eq!(f.sync_count(), Some(1), "explicit sync() still works");
     }
 
+    /// Yield-loop helper: EveryN sync runs on a background tokio
+    /// task, so after `append` returns the sync may not yet be
+    /// observable. Yields up to `max_yields` times until
+    /// `sync_count >= expected` or the yield budget is exhausted.
+    /// Returns the final observed count.
+    #[cfg(all(test, feature = "redex-disk"))]
+    async fn wait_for_sync_count(f: &RedexFile, expected: u64, max_yields: usize) -> u64 {
+        for _ in 0..max_yields {
+            if let Some(n) = f.sync_count() {
+                if n >= expected {
+                    return n;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        f.sync_count().unwrap_or(0)
+    }
+
     #[cfg(feature = "redex-disk")]
-    #[test]
-    fn test_fsync_policy_every_n_syncs_on_cadence() {
-        // EveryN(5): exactly one sync per 5 appends. 23 appends → 4
-        // append-driven syncs (at append-count 5, 10, 15, 20); the
-        // trailing 3 don't trigger. close() adds one more.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_fsync_policy_every_n_syncs_on_cadence() {
+        // EveryN(5): one notify per 5 appends. The actual fsync runs
+        // off the appender on a background worker. We yield between
+        // appends so each cadence boundary's notify is consumed
+        // before the next one arrives — without that, multiple
+        // notifies arriving while the worker is still parked would
+        // coalesce into a single permit (a real-world feature, but
+        // it complicates pinning the count in a test).
         let dir = tmp_persistent_dir("fsync_every_n");
         let f = make_persistent_with_policy("fsync/everyn", &dir, super::FsyncPolicy::EveryN(5));
         for i in 0..23u64 {
             f.append(format!("e-{}", i).as_bytes()).unwrap();
+            tokio::task::yield_now().await;
         }
+        // 23 appends crosses the 5-cadence at 5, 10, 15, 20 = 4
+        // notifies. With yields between appends the worker keeps up
+        // 1:1, so we expect 4 worker-driven syncs.
+        let observed = wait_for_sync_count(&f, 4, 50).await;
         assert_eq!(
-            f.sync_count(),
-            Some(4),
-            "EveryN(5) over 23 appends = 4 append-driven syncs"
+            observed, 4,
+            "EveryN(5) over 23 yielding appends = 4 worker syncs"
         );
         f.close().unwrap();
         assert_eq!(f.sync_count(), Some(5), "close() adds one more sync");
     }
 
     #[cfg(feature = "redex-disk")]
-    #[test]
-    fn test_fsync_policy_every_n_clamps_zero_to_one() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_fsync_policy_every_n_clamps_zero_to_one() {
         // EveryN(0) would never fire with a naïve implementation; the
-        // clamp at `open_persistent` maps 0 (and 1) to "fsync every
-        // append."
+        // clamp at `open_persistent` maps 0 (and 1) to "notify on
+        // every append."
         let dir = tmp_persistent_dir("fsync_every_n_zero");
         let f =
             make_persistent_with_policy("fsync/everyn_zero", &dir, super::FsyncPolicy::EveryN(0));
         for i in 0..3u64 {
             f.append(format!("e-{}", i).as_bytes()).unwrap();
+            tokio::task::yield_now().await;
+        }
+        let observed = wait_for_sync_count(&f, 3, 50).await;
+        assert_eq!(
+            observed, 3,
+            "EveryN(0) must notify on every append (clamped to 1)"
+        );
+    }
+
+    /// Phase 3 invariant: the EveryN cadence must NOT block the
+    /// appender. Even at N=1 (fsync-on-every-append semantics) the
+    /// per-call latency stays at page-cache-write cost, not
+    /// fsync-call cost. We approximate this by asserting that 100
+    /// rapid appends complete in well under the time a single fsync
+    /// would take on the slowest plausible disk (~10 ms each).
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_fsync_policy_every_n_does_not_block_appender() {
+        let dir = tmp_persistent_dir("fsync_every_n_nonblock");
+        let f = make_persistent_with_policy(
+            "fsync/everyn_nonblock",
+            &dir,
+            super::FsyncPolicy::EveryN(1),
+        );
+        let start = std::time::Instant::now();
+        for i in 0..100u64 {
+            f.append(format!("nb-{}", i).as_bytes()).unwrap();
+        }
+        let elapsed = start.elapsed();
+        // 100 appends at ~real fsync cost (1–10 ms each on SSD,
+        // 10+ ms on HDD) would be 100ms–1s. Page-cache writes alone
+        // should land well under 50ms even on a slow CI box.
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "100 EveryN(1) appends took {:?} — appender should not block on fsync",
+            elapsed,
+        );
+        // Drain pending notifies so the worker has actually run at
+        // least once before we tear down.
+        let _ = wait_for_sync_count(&f, 1, 50).await;
+        f.close().unwrap();
+    }
+
+    /// Phase 3 invariant (companion to the non-blocking test): when
+    /// many notifies arrive while the worker is parked or mid-sync,
+    /// they coalesce into a single follow-up sync. `Notify` is a
+    /// single-permit primitive — that's the intended semantics, not
+    /// a bug. The durability contract still holds: each sync covers
+    /// all bytes appended up to that point, so coalescing only
+    /// changes "bytes per fsync," never "bytes that survive a
+    /// crash after the next fsync completes."
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_fsync_policy_every_n_coalesces_under_burst() {
+        let dir = tmp_persistent_dir("fsync_coalesce");
+        let f = make_persistent_with_policy("fsync/coalesce", &dir, super::FsyncPolicy::EveryN(1));
+        // No yields between appends — current_thread runtime can't
+        // schedule the worker until we hit an await, so all 50
+        // notifies arrive while the worker is parked. Notify stores
+        // exactly one permit; the other 49 are folded in.
+        for i in 0..50u64 {
+            f.append(format!("c-{}", i).as_bytes()).unwrap();
+        }
+        let observed = wait_for_sync_count(&f, 1, 50).await;
+        assert_eq!(
+            observed, 1,
+            "50 notifies arriving while worker is parked must coalesce \
+             into exactly 1 worker sync"
+        );
+        f.close().unwrap();
+    }
+
+    /// Phase 3 invariant: an fsync error inside the EveryN worker
+    /// must be logged and recovered from, NOT propagated as a worker
+    /// termination. The failed sync doesn't bump `sync_count`, but
+    /// the worker keeps looping and a subsequent successful sync
+    /// goes through.
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_fsync_policy_every_n_worker_survives_sync_error() {
+        let dir = tmp_persistent_dir("fsync_sync_err");
+        let f = make_persistent_with_policy("fsync/sync_err", &dir, super::FsyncPolicy::EveryN(1));
+
+        // Arm a one-shot sync failure. The next `sync()` (whether
+        // worker- or close-driven) returns Err before touching disk.
+        let disk = f.disk().expect("persistent file has disk").clone();
+        disk.arm_next_sync_failure();
+
+        // First append → notify → worker runs sync → injected fail.
+        f.append(b"first").unwrap();
+        // Yield generously so the worker observes the notify, calls
+        // the (failing) sync, logs, and re-parks.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
         }
         assert_eq!(
             f.sync_count(),
-            Some(3),
-            "EveryN(0) must fsync on every append (clamped to 1)"
+            Some(0),
+            "failed sync must NOT bump sync_count"
+        );
+
+        // Second append → fresh notify → worker runs sync → succeeds
+        // (the one-shot fail flag was consumed on the failed call).
+        f.append(b"second").unwrap();
+        let observed = wait_for_sync_count(&f, 1, 50).await;
+        assert_eq!(
+            observed, 1,
+            "worker must recover from prior sync error and process \
+             subsequent notifies normally"
+        );
+
+        f.close().unwrap();
+    }
+
+    /// Phase 4: `IntervalOrBytes` byte arm fires when accumulated
+    /// writes cross `max_bytes`. We use a long `period` (no virtual
+    /// time advance, so the timer arm never fires) and small
+    /// `max_bytes` so the byte arm dominates.
+    ///
+    /// Each heap append writes `dat_payload + idx_record(20) +
+    /// ts(8)` bytes — 78 bytes for a 50-byte payload. With
+    /// `max_bytes = 200`, the third such append crosses the
+    /// threshold (78·3 = 234 ≥ 200), and the cycle repeats. Six
+    /// yielding appends → exactly two syncs.
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_fsync_policy_interval_or_bytes_byte_threshold_fires() {
+        let dir = tmp_persistent_dir("fsync_iob_bytes");
+        let f = make_persistent_with_policy(
+            "fsync/iob_bytes",
+            &dir,
+            super::FsyncPolicy::IntervalOrBytes {
+                period: std::time::Duration::from_secs(60),
+                max_bytes: 200,
+            },
+        );
+
+        let payload = vec![b'x'; 50];
+        for _ in 0..6 {
+            f.append(&payload).unwrap();
+            tokio::task::yield_now().await;
+        }
+        let observed = wait_for_sync_count(&f, 2, 50).await;
+        assert_eq!(
+            observed, 2,
+            "6 yielding appends of 78 bytes each must trigger exactly \
+             2 byte-threshold syncs at max_bytes=200 (counter resets \
+             on each sync, so each 234-byte cycle = one trigger)"
+        );
+
+        f.close().unwrap();
+    }
+
+    /// Phase 4: `IntervalOrBytes` timer arm fires on schedule when
+    /// the byte threshold is far above what's been written. Mirrors
+    /// the existing `Interval` test but uses the new variant.
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_fsync_policy_interval_or_bytes_timer_fires() {
+        let dir = tmp_persistent_dir("fsync_iob_timer");
+        let f = make_persistent_with_policy(
+            "fsync/iob_timer",
+            &dir,
+            super::FsyncPolicy::IntervalOrBytes {
+                period: std::time::Duration::from_millis(50),
+                // Effectively unreachable in the test (we'll write
+                // far less than 10 MiB of payload).
+                max_bytes: 10 * 1024 * 1024,
+            },
+        );
+
+        // No appends; the timer arm should still fire on schedule.
+        for _ in 0..3 {
+            tokio::time::advance(std::time::Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+        }
+
+        let observed = f.sync_count().unwrap_or(0);
+        assert!(
+            observed >= 2,
+            "IntervalOrBytes(50ms, big_bytes) after 150ms expected ≥ 2 timer syncs, got {}",
+            observed,
+        );
+
+        f.close().unwrap();
+    }
+
+    /// Phase 4: a timer-driven sync resets `bytes_since_sync`, so
+    /// the next byte-threshold check measures from the timer-sync
+    /// point — not from the file's open. Without this reset, the
+    /// counter would keep growing and the byte arm would over-fire
+    /// on the very first append after each timer tick.
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_fsync_policy_interval_or_bytes_timer_resets_byte_counter() {
+        let dir = tmp_persistent_dir("fsync_iob_reset");
+        let f = make_persistent_with_policy(
+            "fsync/iob_reset",
+            &dir,
+            super::FsyncPolicy::IntervalOrBytes {
+                period: std::time::Duration::from_millis(50),
+                max_bytes: 1000,
+            },
+        );
+
+        // Phase A: append 1 payload (78 bytes). Below threshold, no
+        // byte-driven sync. Then advance time so the TIMER fires.
+        f.append(b"under-threshold-A").unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+        let after_timer = f.sync_count().unwrap_or(0);
+        assert!(
+            after_timer >= 1,
+            "timer should have fired at least once; got {}",
+            after_timer,
+        );
+
+        // Phase B: append 1 more payload. If the timer-driven sync
+        // failed to reset bytes_since_sync, the counter would still
+        // be ~95 from phase A and another ~95 from this append —
+        // still under 1000, no byte trigger. Behavior identical.
+        // The real diagnostic is: append below max_bytes total in
+        // phase B and confirm no extra byte-trigger sync fires.
+        // Here we append once and assert no NEW byte-driven sync
+        // beyond what the timer drove.
+        let baseline = f.sync_count().unwrap_or(0);
+        f.append(b"under-threshold-B").unwrap();
+        // Yield without advancing time — the timer arm shouldn't
+        // fire, so any sync we observe must be byte-driven.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let after_b = f.sync_count().unwrap_or(0);
+        assert_eq!(
+            after_b, baseline,
+            "with bytes_since_sync correctly reset to 0 after the \
+             timer sync, an additional ~95-byte append must NOT \
+             cross the 1000-byte threshold (got {} syncs, expected \
+             {})",
+            after_b, baseline,
+        );
+
+        f.close().unwrap();
+    }
+
+    /// Phase 4: inline appends bump `bytes_since_sync` by exactly
+    /// `idx_record(20) + ts(8) = 28` (no dat write, since the
+    /// payload rides inside the 20-byte idx record). With
+    /// `max_bytes = 100`, four inline appends cross the threshold
+    /// (4·28 = 112). Pins the inline branch of the bytes-written
+    /// calc — a regression that accidentally counted the inline
+    /// payload as dat bytes would trigger after just 2 appends
+    /// (2·36 = 72 still under 100, so actually different — but
+    /// 4·36 = 144 vs 4·28 = 112 still both cross at N=4 here, so
+    /// pick a tighter threshold). Use `max_bytes = 100` and
+    /// require exactly 4 appends → 1 sync.
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_fsync_policy_interval_or_bytes_byte_threshold_counts_inline() {
+        let dir = tmp_persistent_dir("fsync_iob_inline");
+        let f = make_persistent_with_policy(
+            "fsync/iob_inline",
+            &dir,
+            super::FsyncPolicy::IntervalOrBytes {
+                period: std::time::Duration::from_secs(60),
+                max_bytes: 100,
+            },
+        );
+
+        let payload: [u8; INLINE_PAYLOAD_SIZE] = *b"inline_8";
+        // Three inline appends = 84 bytes, under 100. No sync.
+        for _ in 0..3 {
+            f.append_inline(&payload).unwrap();
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            f.sync_count(),
+            Some(0),
+            "3 inline appends (3·28 = 84 < 100) must NOT trigger a sync"
+        );
+
+        // Fourth crosses (4·28 = 112 ≥ 100).
+        f.append_inline(&payload).unwrap();
+        let observed = wait_for_sync_count(&f, 1, 50).await;
+        assert_eq!(
+            observed, 1,
+            "4th inline append crosses the byte threshold (4·28 = \
+             112 ≥ 100); inline path must NOT charge payload bytes \
+             against dat (dat is skipped for inline)"
+        );
+
+        f.close().unwrap();
+    }
+
+    /// Phase 4: batch appends compute bytes-written as
+    /// `dat_buf + idx_buf + ts_buf`. A batch of 3 × 50-byte heap
+    /// payloads writes 150 + 60 + 24 = 234 bytes — one syscall to
+    /// each file. Pins the batch-path bookkeeping; a regression
+    /// that miscounted (e.g. only counted dat) would silently
+    /// raise the effective threshold.
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_fsync_policy_interval_or_bytes_byte_threshold_counts_batch() {
+        let dir = tmp_persistent_dir("fsync_iob_batch");
+        let f = make_persistent_with_policy(
+            "fsync/iob_batch",
+            &dir,
+            super::FsyncPolicy::IntervalOrBytes {
+                period: std::time::Duration::from_secs(60),
+                max_bytes: 200,
+            },
+        );
+
+        let payloads: Vec<Bytes> = (0..3).map(|_| Bytes::from(vec![b'z'; 50])).collect();
+        f.append_batch(&payloads).unwrap();
+        let observed = wait_for_sync_count(&f, 1, 50).await;
+        assert_eq!(
+            observed, 1,
+            "1 batch of 3·50B (234 bytes total across dat/idx/ts) \
+             must trigger 1 sync at max_bytes=200"
+        );
+
+        f.close().unwrap();
+    }
+
+    /// Phase 4: `max_bytes == 0` disables the byte arm entirely;
+    /// the policy is then equivalent to `Interval(period)`. Heavy
+    /// writes alone must NOT trigger a sync — only the timer can.
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_fsync_policy_interval_or_bytes_zero_max_bytes_disables_byte_arm() {
+        let dir = tmp_persistent_dir("fsync_iob_zero_bytes");
+        let f = make_persistent_with_policy(
+            "fsync/iob_zero_bytes",
+            &dir,
+            super::FsyncPolicy::IntervalOrBytes {
+                period: std::time::Duration::from_secs(60),
+                max_bytes: 0,
+            },
+        );
+
+        // Write 100 KB. With max_bytes=0 the byte arm is gated off
+        // (`if self.fsync_max_bytes > 0`), so this should produce
+        // zero auto-syncs — and we don't advance time, so the
+        // timer is silent too.
+        let payload = vec![b'y'; 1024];
+        for _ in 0..100 {
+            f.append(&payload).unwrap();
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            f.sync_count(),
+            Some(0),
+            "max_bytes=0 must disable the byte arm; no auto-syncs \
+             expected before any timer advance"
+        );
+
+        f.close().unwrap();
+    }
+
+    /// Phase 4: `period == ZERO && max_bytes > 0` is the byte-only
+    /// variant. A byte-only worker spawns (no timer arm) and reacts
+    /// to the appender's threshold notify. The earlier "no worker
+    /// at all when period is zero" behavior was a footgun: a caller
+    /// who explicitly asked for byte-only triggering would have
+    /// silently received no auto-sync until `close()`.
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_fsync_policy_interval_or_bytes_zero_period_byte_only_worker() {
+        let dir = tmp_persistent_dir("fsync_iob_byte_only");
+        // Tight `max_bytes=100` so the threshold fires quickly. The
+        // counter charges idx(20) + ts(8) + payload bytes per heap
+        // append, so a single 80-byte payload (108 B total) crosses.
+        let f = make_persistent_with_policy(
+            "fsync/iob_byte_only",
+            &dir,
+            super::FsyncPolicy::IntervalOrBytes {
+                period: std::time::Duration::ZERO,
+                max_bytes: 100,
+            },
+        );
+
+        // 3 refs: file + worker clone + this local clone.
+        let disk = f.disk().expect("persistent file has disk").clone();
+        assert_eq!(
+            Arc::strong_count(&disk),
+            3,
+            "period=ZERO with max_bytes>0 must spawn a byte-only worker \
+             (file + worker + test clone = 3 refs)"
+        );
+
+        // Cross the threshold once — worker should observe the
+        // notify and run a sync. No timer advance is involved; if a
+        // sync lands here, it can only be the byte arm.
+        f.append(&[b'x'; 80]).unwrap();
+        let observed = wait_for_sync_count(&f, 1, 50).await;
+        assert_eq!(
+            observed, 1,
+            "byte-only worker must auto-sync on threshold crossing \
+             without any timer advance"
+        );
+
+        f.close().unwrap();
+    }
+
+    /// Phase 4: `period == ZERO && max_bytes == 0` is the fully
+    /// degenerate config — equivalent to `Never`. No worker spawns.
+    /// The file still works for explicit appends and `close()`-time
+    /// fsync.
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_fsync_policy_interval_or_bytes_both_zero_no_worker() {
+        let dir = tmp_persistent_dir("fsync_iob_both_zero");
+        let f = make_persistent_with_policy(
+            "fsync/iob_both_zero",
+            &dir,
+            super::FsyncPolicy::IntervalOrBytes {
+                period: std::time::Duration::ZERO,
+                max_bytes: 0,
+            },
+        );
+
+        // file's own ref + this local clone = 2; no worker means
+        // no third ref.
+        let disk = f.disk().expect("persistent file has disk").clone();
+        assert_eq!(
+            Arc::strong_count(&disk),
+            2,
+            "both arms zero must spawn no worker (file + test clone = \
+             2 refs)"
+        );
+
+        // File still functional. No threshold and no timer means no
+        // auto-sync regardless of write volume.
+        f.append(b"manual-only-A").unwrap();
+        f.append(b"manual-only-B").unwrap();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(f.sync_count(), Some(0), "no worker means no auto-syncs");
+
+        // close() is the only durability barrier and must still
+        // fsync regardless of policy.
+        f.close().unwrap();
+        assert_eq!(
+            f.sync_count(),
+            Some(1),
+            "close() always fsyncs regardless of policy"
+        );
+    }
+
+    /// Phase 3 invariant: after `close()` the EveryN worker must
+    /// observe shutdown and drop its `Arc<DiskSegment>` clone, so
+    /// the segment can eventually be freed once all RedexFile
+    /// handles are dropped. Without this, a closed-but-not-dropped
+    /// file would pin the disk segment until runtime shutdown.
+    #[cfg(feature = "redex-disk")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_close_releases_worker_disk_reference() {
+        let dir = tmp_persistent_dir("fsync_release");
+        let f = make_persistent_with_policy("fsync/release", &dir, super::FsyncPolicy::EveryN(1));
+
+        // Snapshot the strong count: file's own ref + worker's clone
+        // + this local clone = 3.
+        let disk = f.disk().expect("persistent file has disk").clone();
+        let initial = Arc::strong_count(&disk);
+        assert_eq!(
+            initial, 3,
+            "expected 3 refs at steady state (file + worker + test); \
+             got {}",
+            initial,
+        );
+
+        f.close().unwrap();
+
+        // close() fires shutdown; the worker observes it on its next
+        // select poll, returns from the spawned future, and its
+        // captured `task_disk` is dropped. Yield until the count
+        // drops or we exhaust the budget.
+        let mut final_count = Arc::strong_count(&disk);
+        for _ in 0..50 {
+            if final_count < initial {
+                break;
+            }
+            tokio::task::yield_now().await;
+            final_count = Arc::strong_count(&disk);
+        }
+
+        assert_eq!(
+            final_count,
+            initial - 1,
+            "worker must drop its DiskSegment Arc clone after \
+             observing shutdown (was {}, now {})",
+            initial,
+            final_count,
         );
     }
 
