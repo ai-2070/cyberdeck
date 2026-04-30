@@ -77,18 +77,27 @@ pub(super) struct DiskSegment {
     ts_file: Mutex<File>,
     /// Append-path fsync interval: after `fsync_every_n` successful
     /// appends, the segment notifies the background fsync worker.
-    /// `0` disables append-side syncing (Never or Interval policies
-    /// — the latter is driven by a per-file timer task).
+    /// `0` disables append-count-based syncing.
     fsync_every_n: u64,
+    /// Append-path byte threshold for `IntervalOrBytes`: after
+    /// `fsync_max_bytes` bytes have accumulated since the last
+    /// successful sync, the segment notifies the worker. `0`
+    /// disables byte-based syncing.
+    fsync_max_bytes: u64,
     /// Appends since the last append-driven sync (successful or not).
     /// Only meaningful when `fsync_every_n > 0`.
     appends_since_sync: AtomicU64,
-    /// Wake-up signal for the EveryN background fsync worker. The
-    /// appender notifies this when `appends_since_sync` reaches the
-    /// `fsync_every_n` threshold, then returns immediately — the
-    /// fsync runs off the appender thread. Always allocated (cheap);
-    /// only signaled when `fsync_every_n > 0` AND a worker is
-    /// listening (spawned by `RedexFile::open_persistent`).
+    /// Bytes appended since the last successful sync. Bumped from
+    /// the append paths, reset to 0 inside `sync()` after the
+    /// fsyncs succeed. Only meaningful when `fsync_max_bytes > 0`.
+    bytes_since_sync: AtomicU64,
+    /// Wake-up signal for the background fsync worker. The
+    /// appender notifies this when either threshold (appends or
+    /// bytes) is crossed, then returns immediately — the fsync
+    /// runs off the appender thread. Always allocated (cheap);
+    /// only signaled when at least one threshold is configured
+    /// AND a worker is listening (spawned by
+    /// `RedexFile::open_persistent`).
     pub(super) fsync_signal: Arc<Notify>,
     /// Test-only injection: when set, the next `append_entry` /
     /// `append_entries` call returns `RedexError::Io` before touching
@@ -121,14 +130,18 @@ impl DiskSegment {
     /// Open (or create) the idx + dat files for `name` under `base_dir`
     /// and recover the index from disk.
     ///
-    /// `fsync_every_n` is derived from [`super::FsyncPolicy`] at the
-    /// `RedexFile` layer: `EveryN(n)` forwards `n`; `Never` and
-    /// `Interval` (handled by the per-file background task) both
-    /// forward `0`, disabling append-side syncs on this segment.
+    /// `fsync_every_n` and `fsync_max_bytes` are derived from
+    /// [`super::FsyncPolicy`] at the `RedexFile` layer:
+    /// - `EveryN(n)` → `(n.max(1), 0)`
+    /// - `IntervalOrBytes { max_bytes, .. }` → `(0, max_bytes)`
+    /// - `Never` / `Interval` → `(0, 0)`
+    /// Each nonzero threshold enables one trigger of the background
+    /// fsync worker; `0` disables that trigger.
     pub(super) fn open(
         base_dir: &Path,
         name: &ChannelName,
         fsync_every_n: u64,
+        fsync_max_bytes: u64,
     ) -> Result<RecoveredSegment, RedexError> {
         let dir = channel_dir(base_dir, name);
         std::fs::create_dir_all(&dir).map_err(RedexError::io)?;
@@ -350,7 +363,9 @@ impl DiskSegment {
                 dat_file: Mutex::new(dat_file),
                 ts_file: Mutex::new(ts_file),
                 fsync_every_n,
+                fsync_max_bytes,
                 appends_since_sync: AtomicU64::new(0),
+                bytes_since_sync: AtomicU64::new(0),
                 fsync_signal: Arc::new(Notify::new()),
                 #[cfg(test)]
                 fail_next_append: AtomicBool::new(false),
@@ -373,32 +388,48 @@ impl DiskSegment {
         self.sync_count.load(Ordering::Acquire)
     }
 
-    /// Bump the per-append counter and, if `fsync_every_n` is set
-    /// and the counter reaches it, notify the background fsync
-    /// worker. The actual fsync runs off the appender thread; this
-    /// returns immediately after the page-cache write so the
-    /// appender's caller doesn't block on disk durability.
+    /// Bump per-append and per-byte counters; if either crosses its
+    /// configured threshold, notify the background fsync worker.
+    /// The actual fsync runs off the appender thread; this returns
+    /// immediately after the page-cache write so the appender's
+    /// caller doesn't block on disk durability.
     ///
-    /// Counter resets after each notify so the cadence stays
-    /// periodic. Explicit `sync()` / `close()` are unaffected and
-    /// continue to fsync synchronously, surfacing any error.
-    fn maybe_sync_after_append(&self, applied: u64) {
-        if self.fsync_every_n == 0 || applied == 0 {
-            return;
+    /// Each counter resets independently when its threshold fires
+    /// so the cadence stays periodic. Explicit `sync()` / `close()`
+    /// are unaffected and continue to fsync synchronously,
+    /// surfacing any error.
+    fn maybe_sync_after_append(&self, applied: u64, bytes_written: u64) {
+        let mut should_signal = false;
+        if self.fsync_every_n > 0 && applied > 0 {
+            let prev = self.appends_since_sync.fetch_add(applied, Ordering::AcqRel);
+            let now = prev.saturating_add(applied);
+            if now >= self.fsync_every_n {
+                self.appends_since_sync.store(0, Ordering::Release);
+                should_signal = true;
+            }
         }
-        let prev = self.appends_since_sync.fetch_add(applied, Ordering::AcqRel);
-        let now = prev.saturating_add(applied);
-        if now < self.fsync_every_n {
-            return;
+        if self.fsync_max_bytes > 0 && bytes_written > 0 {
+            let prev = self
+                .bytes_since_sync
+                .fetch_add(bytes_written, Ordering::AcqRel);
+            let now = prev.saturating_add(bytes_written);
+            if now >= self.fsync_max_bytes {
+                // Reset before notify so concurrent appenders don't
+                // double-fire on already-counted bytes. The worker's
+                // sync() also stores 0; the redundant store here
+                // closes the appender-side race.
+                self.bytes_since_sync.store(0, Ordering::Release);
+                should_signal = true;
+            }
         }
-        // Reset unconditionally before signaling so a concurrent
-        // appender sees a clean counter even if the worker is slow.
-        self.appends_since_sync.store(0, Ordering::Release);
-        // notify_one stores a permit if no worker is parked yet —
-        // covers the open→first-poll window. If multiple notifies
-        // arrive while the worker is mid-sync, they coalesce into a
-        // single follow-up sync, which is the intended semantics.
-        self.fsync_signal.notify_one();
+        if should_signal {
+            // notify_one stores a permit if no worker is parked yet
+            // — covers the open→first-poll window. If multiple
+            // notifies arrive while the worker is mid-sync, they
+            // coalesce into a single follow-up sync, which is the
+            // intended semantics.
+            self.fsync_signal.notify_one();
+        }
     }
 
     /// Test-only: arm a one-shot failure on the next
@@ -547,7 +578,12 @@ impl DiskSegment {
         }
         drop(ts);
 
-        self.maybe_sync_after_append(1);
+        // Bytes written across all three files this call. ts is 8
+        // bytes, idx is REDEX_ENTRY_SIZE, dat is payload.len() for
+        // heap entries (inline entries skip dat).
+        let dat_bytes = if entry.is_inline() { 0 } else { payload.len() as u64 };
+        let total_bytes = dat_bytes + REDEX_ENTRY_SIZE as u64 + 8;
+        self.maybe_sync_after_append(1, total_bytes);
         Ok(())
     }
 
@@ -691,7 +727,8 @@ impl DiskSegment {
         }
         drop(ts);
 
-        self.maybe_sync_after_append(entries_and_payloads.len() as u64);
+        let total_bytes = (dat_buf.len() + idx_buf.len() + ts_buf.len()) as u64;
+        self.maybe_sync_after_append(entries_and_payloads.len() as u64, total_bytes);
         Ok(())
     }
 
@@ -717,6 +754,12 @@ impl DiskSegment {
         // back to `now()`. Losing the idx tail without the dat
         // would be worse, so dat-first.
         self.ts_file.lock().sync_all().map_err(RedexError::io)?;
+        // All bytes accumulated up to this point are now durable.
+        // Reset the byte counter so `IntervalOrBytes` measures from
+        // here forward; the timer-driven sync path relies on this
+        // (it doesn't cross a threshold itself, so without the
+        // reset, byte-trigger would over-fire on subsequent appends).
+        self.bytes_since_sync.store(0, Ordering::Release);
         #[cfg(test)]
         self.sync_count.fetch_add(1, Ordering::AcqRel);
         Ok(())
@@ -1035,7 +1078,7 @@ mod tests {
         let name = ChannelName::new("t/disk1").unwrap();
 
         {
-            let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+            let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
             assert!(recovered.index.is_empty());
             assert!(recovered.payload_bytes.is_empty());
 
@@ -1052,7 +1095,7 @@ mod tests {
         }
 
         // Reopen; recover both entries and their payload.
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         assert_eq!(recovered.index.len(), 2);
         assert_eq!(recovered.index[0].seq, 0);
         assert_eq!(recovered.index[1].seq, 1);
@@ -1067,14 +1110,14 @@ mod tests {
         let base = tmpdir();
         let name = ChannelName::new("t/inline").unwrap();
 
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         let payload = *b"abcdefgh";
         let entry = RedexEntry::new_inline(0, &payload, payload_checksum(&payload));
         recovered.disk.append_entry(&entry, &payload).unwrap();
         recovered.disk.sync().unwrap();
         drop(recovered);
 
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         assert_eq!(recovered.index.len(), 1);
         assert!(recovered.index[0].is_inline());
         // Dat file should be empty — inline payload lives in idx.
@@ -1090,7 +1133,7 @@ mod tests {
 
         // Write one good entry.
         {
-            let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+            let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
             let p = b"ok";
             let e = RedexEntry::new_heap(0, 0, p.len() as u32, 0, payload_checksum(p));
             recovered.disk.append_entry(&e, p).unwrap();
@@ -1105,7 +1148,7 @@ mod tests {
         drop(f);
 
         // Reopen: partial tail must be truncated; one entry recovered.
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         assert_eq!(recovered.index.len(), 1);
         assert_eq!(recovered.index[0].seq, 0);
 
@@ -1158,7 +1201,7 @@ mod tests {
 
         // Phase 1 — write the layout.
         {
-            let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+            let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
 
             recovered
                 .disk
@@ -1231,7 +1274,7 @@ mod tests {
             .unwrap();
 
         // Phase 3 — reopen and assert.
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         let seqs: Vec<u64> = recovered.index.iter().map(|e| e.seq).collect();
         assert_eq!(
             seqs,
@@ -1296,7 +1339,7 @@ mod tests {
         let h3_payload = b"heap3";
 
         {
-            let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+            let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
 
             recovered
                 .disk
@@ -1345,7 +1388,7 @@ mod tests {
             .set_len(5)
             .unwrap();
 
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         let seqs: Vec<u64> = recovered.index.iter().map(|e| e.seq).collect();
         assert_eq!(
             seqs,
@@ -1386,7 +1429,7 @@ mod tests {
         let name = ChannelName::new("t/rollback").unwrap();
         let dat_path = channel_dir(&base, &name).join("dat");
 
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
 
         // Successful first append establishes a known starting
         // point.
@@ -1433,7 +1476,7 @@ mod tests {
 
         // And recovery sees the right entries.
         drop(recovered);
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         assert_eq!(recovered.index.len(), 2);
         assert_eq!(&recovered.payload_bytes[..p1.len()], p1);
         assert_eq!(&recovered.payload_bytes[p1.len()..p1.len() + p2.len()], p2);
@@ -1457,7 +1500,7 @@ mod tests {
         // Append four entries with distinct, recognizable timestamps.
         // Use the explicit-timestamp variant so we can pin which
         // ts pairs with which idx record.
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         let payloads: [&[u8]; 4] = [b"AAAAAAAAA", b"BBBBBBBBB", b"CCCCCCCCC", b"DDDDDDDDD"];
         let timestamps: [u64; 4] = [1000, 2000, 3000, 4000];
         let mut offset = 0u32;
@@ -1484,7 +1527,7 @@ mod tests {
         // Reopen — recovery's checksum filter must drop entry 1
         // (B) and pair the surviving entries with their original
         // timestamps (1000, 3000, 4000), NOT (1000, 2000, 3000).
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         assert_eq!(recovered.index.len(), 3, "one corrupt entry must drop");
         let surviving_seqs: Vec<u64> = recovered.index.iter().map(|e| e.seq).collect();
         assert_eq!(surviving_seqs, vec![0, 2, 3], "B should be dropped");
@@ -1546,7 +1589,7 @@ mod tests {
         let timestamps = [11_000u64, 22_000, 33_000, 44_000];
 
         {
-            let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+            let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
             recovered
                 .disk
                 .append_entries_at(&entries, &timestamps)
@@ -1564,7 +1607,7 @@ mod tests {
 
         // Reopen: all four entries survive with their correct seqs,
         // inline flags, and timestamps.
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         let seqs: Vec<u64> = recovered.index.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, vec![10, 11, 12, 13]);
         assert!(!recovered.index[0].is_inline());
@@ -1605,7 +1648,7 @@ mod tests {
         let timestamps = [100u64, 200, 300];
 
         {
-            let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+            let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
             recovered
                 .disk
                 .append_entries_at(&entries, &timestamps)
@@ -1622,7 +1665,7 @@ mod tests {
             "all-inline batch must not write to dat"
         );
 
-        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
         assert_eq!(recovered.index.len(), 3);
         for e in &recovered.index {
             assert!(e.is_inline());

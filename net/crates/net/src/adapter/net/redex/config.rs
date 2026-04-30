@@ -13,10 +13,12 @@ use std::time::Duration;
 /// | `Never` | Loses the tail since last close / `sync()` | Same |
 /// | `EveryN(N)` | Loses ≤ (N−1) entries from the last sync point | Same |
 /// | `Interval(d)` | Loses ≤ `d` seconds of writes | Same |
+/// | `IntervalOrBytes { period, max_bytes }` | Loses ≤ min(`period` of writes, `max_bytes` of writes) | Same |
 ///
 /// Default is [`FsyncPolicy::Never`], matching the pre-`FsyncPolicy`
 /// behavior — OS page cache only, fsync on close. Callers that need
-/// tighter bounds opt into `EveryN` or `Interval`.
+/// tighter bounds opt into `EveryN`, `Interval`, or
+/// `IntervalOrBytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FsyncPolicy {
     /// Never fsync on append. `close()` still syncs. Lowest latency;
@@ -37,6 +39,25 @@ pub enum FsyncPolicy {
     /// Fsync on a timer, independent of append rate. A per-file
     /// background tokio task drives the sync; `close()` cancels it.
     Interval(Duration),
+    /// Fsync when **either** `period` elapses **or** `max_bytes` of
+    /// writes have accumulated since the last sync, whichever comes
+    /// first. The byte threshold counts every byte written to dat,
+    /// idx, and ts.
+    ///
+    /// Use this for bursty workloads where a long `period` would
+    /// leave too much data unsynced under load, but a short `period`
+    /// would over-fsync when idle. `period == 0` disables the timer
+    /// arm entirely (effectively no worker spawned); `max_bytes == 0`
+    /// disables the byte arm (equivalent to `Interval(period)`).
+    IntervalOrBytes {
+        /// Maximum wall-clock interval between syncs. `0` disables
+        /// the timer arm (no worker is spawned).
+        period: Duration,
+        /// Maximum bytes (across dat + idx + ts) accumulated since
+        /// the last sync before the worker is signaled. `0`
+        /// disables the byte arm.
+        max_bytes: u64,
+    },
 }
 
 /// Per-file configuration supplied at `Redex::open_file` time.
