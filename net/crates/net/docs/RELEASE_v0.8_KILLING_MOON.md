@@ -82,11 +82,12 @@ machine does, packet by packet, with cryptographic receipts.
 v0.8 is the version of Net we are willing to put a name on. "Killing
 Moon" — the song is about the part of yourself you don't get to
 negotiate with. The release ships when it's ready, not when it's
-convenient.
+convenient. It happens to ship on May 1, 2026, under a full moon. We
+didn't plan that. We're taking it.
 
 ## Codename
 
-"Killing Moon" — Echo & the Bunnymen, 1984.
+"Killing Moon" — Echo & the Bunnymen, 1984. Released May 1, 2026.
 
 ## License
 
