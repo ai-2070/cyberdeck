@@ -110,6 +110,14 @@ pub struct EventBus {
 struct ShardWorkers {
     batch: JoinHandle<()>,
     drain: JoinHandle<()>,
+    /// Bus-owned mirror of the BatchWorker's `next_sequence`.
+    /// `remove_shard_internal` reads this AFTER awaiting `batch`
+    /// to learn the worker's final post-flush sequence, then uses
+    /// it as the `sequence_start` for the stranded-ring-buffer
+    /// flush so the stranded msg-ids fall strictly past every
+    /// msg-id the worker emitted (BUG #153 — JetStream dedup
+    /// silently dropped the stranded batch when both used 0).
+    next_sequence: Arc<AtomicU64>,
 }
 
 /// RAII guard for an in-flight ingest. Decrements
@@ -217,6 +225,8 @@ impl EventBus {
         for shard_id in 0..config.num_shards {
             let (tx, rx) = mpsc::channel::<Vec<crate::event::InternalEvent>>(1024);
 
+            let next_sequence = Arc::new(AtomicU64::new(0));
+
             let batch = spawn_batch_worker(BatchWorkerParams {
                 shard_id,
                 rx,
@@ -225,6 +235,7 @@ impl EventBus {
                 config: config.batch.clone(),
                 adapter_timeout: config.adapter_timeout,
                 batch_retries: config.adapter_batch_retries,
+                next_sequence: next_sequence.clone(),
             });
 
             let drain = spawn_drain_worker_for_shard(
@@ -235,7 +246,14 @@ impl EventBus {
                 drain_finalize_ready.clone(),
             );
 
-            batch_workers.insert(shard_id, ShardWorkers { batch, drain });
+            batch_workers.insert(
+                shard_id,
+                ShardWorkers {
+                    batch,
+                    drain,
+                    next_sequence,
+                },
+            );
             batch_senders.insert(shard_id, tx);
         }
 
@@ -329,6 +347,8 @@ impl EventBus {
         // Step 2: spawn workers and register the sender.
         let (tx, rx) = mpsc::channel::<Vec<crate::event::InternalEvent>>(1024);
 
+        let next_sequence = Arc::new(AtomicU64::new(0));
+
         let batch = spawn_batch_worker(BatchWorkerParams {
             shard_id: new_id,
             rx,
@@ -337,6 +357,7 @@ impl EventBus {
             config: self.config.batch.clone(),
             adapter_timeout: self.config.adapter_timeout,
             batch_retries: self.config.adapter_batch_retries,
+            next_sequence: next_sequence.clone(),
         });
 
         self.batch_senders.write().insert(new_id, tx.clone());
@@ -349,9 +370,14 @@ impl EventBus {
             self.drain_finalize_ready.clone(),
         );
 
-        self.batch_workers
-            .lock()
-            .insert(new_id, ShardWorkers { batch, drain });
+        self.batch_workers.lock().insert(
+            new_id,
+            ShardWorkers {
+                batch,
+                drain,
+                next_sequence,
+            },
+        );
 
         // Step 3: workers are live — flip the shard to Active so
         // `select_shard` will route to it.
@@ -435,19 +461,75 @@ impl EventBus {
             .remove_shard(shard_id)
             .map_err(|e| AdapterError::Fatal(e.to_string()))?;
 
-        // Step 3: drop worker handles. The drain worker should have
-        // exited (or be about to). The batch worker exits when its
-        // channel closes — once the drain worker drops its sender
-        // clone, the channel is closed.
-        self.batch_workers.lock().remove(&shard_id);
+        // Step 3: take ownership of the worker handles (move them
+        // OUT of the mutex map so we can `await` them — `await`
+        // consumes a `JoinHandle`). With the bus-side sender already
+        // dropped (step 1) and the shard unmapped (step 2), the
+        // drain worker exits at its next poll and drops its sender
+        // clone, which closes the BatchWorker's `rx`. The
+        // BatchWorker then flushes any pending `current_batch` and
+        // any events still buffered in the channel, dispatches them
+        // via the standard `dispatch_batch` path with their PROPER
+        // `next_sequence` values, and exits.
+        //
+        // Awaiting both handles closes BUG #154's race: pre-fix the
+        // `JoinHandle`s were dropped without await, so a draining
+        // shard whose ring buffer transiently emptied could finalize
+        // and remove while the BatchWorker still had events in
+        // its `current_batch` or in the mpsc channel — those events
+        // would be dispatched (the worker keeps running on a dropped
+        // handle) but their dispatch could overlap with this
+        // function's own stranded-flush, racing through JetStream
+        // dedup with their msg-ids. Awaiting first means we observe
+        // a quiescent worker before constructing the stranded batch.
+        let workers = self.batch_workers.lock().remove(&shard_id);
+        let final_next_sequence = if let Some(workers) = workers {
+            // Errors here mean the task panicked or was cancelled.
+            // We log and proceed — the stranded-flush still runs
+            // either way, and the atomic was last written under the
+            // worker's last successful flush so it remains a valid
+            // upper bound (just possibly stale by one batch's worth
+            // of events the worker never finished dispatching).
+            if let Err(e) = workers.batch.await {
+                tracing::warn!(
+                    shard_id,
+                    error = %e,
+                    "BatchWorker JoinHandle errored on await; \
+                     proceeding with stranded-flush using last \
+                     published next_sequence",
+                );
+            }
+            if let Err(e) = workers.drain.await {
+                tracing::warn!(
+                    shard_id,
+                    error = %e,
+                    "drain worker JoinHandle errored on await; \
+                     drain worker should have already exited via \
+                     `with_shard -> None`",
+                );
+            }
+            workers.next_sequence.load(AtomicOrdering::Acquire)
+        } else {
+            // No worker registered for this shard — shouldn't
+            // happen on the normal scale-down path, but defensively
+            // fall back to 0. This branch only activates if a
+            // caller manages to call `remove_shard_internal` for a
+            // shard that was never spawned (or already removed).
+            0
+        };
 
         // Step 4: flush the stranded ring-buffer events through the
-        // adapter in one shot. We construct a single `Batch` and
-        // push it through the same `dispatch_batch` helper the
-        // batch worker uses, so retry / timeout semantics match.
+        // adapter in one shot, using `final_next_sequence` (NOT 0)
+        // as the `sequence_start`. This closes BUG #153's
+        // collision: pre-fix both this batch and the worker's very
+        // first batch wrote msg-ids `{nonce}:{shard_id}:0:{i}`,
+        // and JetStream's 2 min dedup window silently dropped the
+        // duplicate. Now the stranded batch's msg-ids are
+        // `{nonce}:{shard_id}:{final_next_sequence}:{i}` —
+        // strictly past every msg-id the worker emitted.
         if !stranded.is_empty() {
             let count = stranded.len();
-            let batch = crate::event::Batch::new(shard_id, stranded, 0);
+            let batch = crate::event::Batch::new(shard_id, stranded, final_next_sequence);
             let dispatched = dispatch_batch(
                 &*self.adapter,
                 batch,
@@ -460,12 +542,14 @@ impl EventBus {
                 tracing::info!(
                     shard_id,
                     count,
+                    sequence_start = final_next_sequence,
                     "Removed shard: flushed stranded ring-buffer events to adapter"
                 );
             } else {
                 tracing::error!(
                     shard_id,
                     count,
+                    sequence_start = final_next_sequence,
                     "Removed shard: adapter rejected stranded ring-buffer events; \
                      events lost"
                 );
@@ -902,7 +986,7 @@ impl EventBus {
         // overlap them.
         let (drains, batch_handles): (Vec<_>, Vec<_>) = workers
             .into_iter()
-            .map(|(_shard_id, ShardWorkers { batch, drain })| (drain, batch))
+            .map(|(_shard_id, ShardWorkers { batch, drain, .. })| (drain, batch))
             .unzip();
         // We don't care about individual results — `JoinError` from
         // a panicking drain worker would already have surfaced
@@ -1229,6 +1313,12 @@ struct BatchWorkerParams {
     config: BatchConfig,
     adapter_timeout: Duration,
     batch_retries: u32,
+    /// Bus-owned mirror of `BatchWorker::next_sequence`. The worker
+    /// stores its post-flush sequence here on every dispatch so the
+    /// bus can read it after the worker exits — see
+    /// `ShardWorkers::next_sequence` for the consumer side and
+    /// BUG #153 for the rationale.
+    next_sequence: Arc<AtomicU64>,
 }
 
 fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
@@ -1240,9 +1330,10 @@ fn spawn_batch_worker(params: BatchWorkerParams) -> JoinHandle<()> {
         config,
         adapter_timeout,
         batch_retries,
+        next_sequence,
     } = params;
     tokio::spawn(async move {
-        let mut worker = BatchWorker::new(shard_id, config.clone());
+        let mut worker = BatchWorker::new(shard_id, config.clone(), next_sequence);
 
         loop {
             // Wait for events with timeout. The batch worker exits
