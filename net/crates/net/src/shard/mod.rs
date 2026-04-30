@@ -820,7 +820,7 @@ impl ShardManager {
         &self,
         shard_id: u16,
     ) -> Result<Vec<crate::event::InternalEvent>, ScalingError> {
-        let _mapper = self.mapper.as_ref().ok_or(ScalingError::InvalidPolicy(
+        let mapper = self.mapper.as_ref().ok_or(ScalingError::InvalidPolicy(
             "Dynamic scaling not enabled".into(),
         ))?;
 
@@ -867,6 +867,24 @@ impl ShardManager {
             self.num_shards
                 .fetch_sub(1, std::sync::atomic::Ordering::Release);
         }
+
+        // BUG #83: previously this method only updated the routing
+        // table and decremented `num_shards` — it never asked the
+        // mapper to drop the corresponding `MappedShard` record.
+        // The mapper's `shards: RwLock<Vec<MappedShard>>` kept
+        // growing across scale-up/down cycles (every scale-up
+        // appended a fresh entry; `Stopped` entries were only
+        // removed by an explicit `remove_stopped_shards` call that
+        // no production caller invoked). `evaluate_scaling` filters
+        // by state but still iterates the full list, so per-tick
+        // cost grew with cumulative scaling history.
+        //
+        // The scaling monitor calls `mapper.finalize_draining()`
+        // before invoking `bus.remove_shard_internal(id)` (which is
+        // what calls us), so by the time we run the matching
+        // `MappedShard` is already in `Stopped` state. Sweep the
+        // mapper here so it stays bounded.
+        mapper.remove_stopped_shards();
 
         Ok(drained)
     }

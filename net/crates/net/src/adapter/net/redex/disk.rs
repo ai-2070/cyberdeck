@@ -187,6 +187,21 @@ pub(super) struct DiskSegment {
     /// untouched so reopen replays a consistent picture.
     #[cfg(test)]
     fail_next_compact: AtomicBool,
+    /// Test-only injection: when set, the next `idx.metadata()`
+    /// call inside an append path returns `RedexError::Io`. Used
+    /// to exercise the BUG #94 rollback path — that an idx
+    /// metadata failure after a successful dat write rolls the
+    /// dat back rather than leaving orphan bytes on disk. The
+    /// flag is consumed on the next idx-metadata call (success
+    /// or failure clears it).
+    #[cfg(test)]
+    fail_next_idx_metadata: AtomicBool,
+    /// Test-only injection: when set, the next `ts.metadata()`
+    /// call inside an append path returns `RedexError::Io`. Used
+    /// to exercise the BUG #94 rollback path — that a ts metadata
+    /// failure after successful dat + idx writes rolls both back.
+    #[cfg(test)]
+    fail_next_ts_metadata: AtomicBool,
     /// Test-only counter: cumulative successful `sync()` calls —
     /// close-time, append-driven (EveryN), or external
     /// (Interval / explicit). Lets policy tests assert the observed
@@ -457,6 +472,10 @@ impl DiskSegment {
                 #[cfg(test)]
                 fail_next_compact: AtomicBool::new(false),
                 #[cfg(test)]
+                fail_next_idx_metadata: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_next_ts_metadata: AtomicBool::new(false),
+                #[cfg(test)]
                 sync_count: AtomicU64::new(0),
             },
             index,
@@ -644,7 +663,35 @@ impl DiskSegment {
             ));
         }
         let mut idx = self.idx_file.lock();
-        let pre_idx_len = idx.metadata().map_err(RedexError::io)?.len();
+        // BUG #94: `idx.metadata()?` can fail (file handle invalidated
+        // after compact_to placeholder swap, fs error, etc.) AFTER
+        // the dat write at line 607 has already committed bytes to
+        // disk. The `?` early-return skips the rollback block below,
+        // leaving orphan dat bytes on disk while the caller is told
+        // the append failed. Wrap explicitly so the dat rollback
+        // runs on this path too.
+        #[cfg(test)]
+        let idx_metadata = if self.fail_next_idx_metadata.swap(false, Ordering::AcqRel) {
+            Err(std::io::Error::other("test-injected idx.metadata failure"))
+        } else {
+            idx.metadata()
+        };
+        #[cfg(not(test))]
+        let idx_metadata = idx.metadata();
+        let pre_idx_len = match idx_metadata {
+            Ok(m) => m.len(),
+            Err(e) => {
+                drop(idx);
+                if !entry.is_inline() {
+                    let dat_path = self.dir.join("dat");
+                    if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
+                        let cur = f.metadata().map(|m| m.len()).unwrap_or(0);
+                        let _ = f.set_len(cur.saturating_sub(payload.len() as u64));
+                    }
+                }
+                return Err(RedexError::io(e));
+            }
+        };
         if let Err(e) = idx.write_all(&entry.to_bytes()) {
             drop(idx);
             let idx_path = self.dir.join("idx");
@@ -669,7 +716,40 @@ impl DiskSegment {
         // roll back idx (and dat) so the on-disk index never
         // reaches an entry without a matching timestamp.
         let mut ts = self.ts_file.lock();
-        let pre_ts_len = ts.metadata().map_err(RedexError::io)?.len();
+        // BUG #94: `ts.metadata()?` can fail AFTER both dat AND idx
+        // have committed bytes to disk. The `?` early-return skips
+        // the rollback block below, leaving the on-disk idx with a
+        // record whose ts entry never landed (so on reopen
+        // `read_timestamps` returns None for the length mismatch
+        // and every recovered entry gets `now()` as its timestamp,
+        // breaking age-based retention). Wrap explicitly so the
+        // idx + dat rollback runs on this path too.
+        #[cfg(test)]
+        let ts_metadata = if self.fail_next_ts_metadata.swap(false, Ordering::AcqRel) {
+            Err(std::io::Error::other("test-injected ts.metadata failure"))
+        } else {
+            ts.metadata()
+        };
+        #[cfg(not(test))]
+        let ts_metadata = ts.metadata();
+        let pre_ts_len = match ts_metadata {
+            Ok(m) => m.len(),
+            Err(e) => {
+                drop(ts);
+                let idx_path = self.dir.join("idx");
+                if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
+                    let _ = f.set_len(pre_idx_len);
+                }
+                if !entry.is_inline() {
+                    let dat_path = self.dir.join("dat");
+                    if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
+                        let cur = f.metadata().map(|m| m.len()).unwrap_or(0);
+                        let _ = f.set_len(cur.saturating_sub(payload.len() as u64));
+                    }
+                }
+                return Err(RedexError::io(e));
+            }
+        };
         if let Err(e) = ts.write_all(&timestamp_ns.to_le_bytes()) {
             drop(ts);
             let ts_path = self.dir.join("ts");
@@ -808,7 +888,30 @@ impl DiskSegment {
         };
 
         let mut idx = self.idx_file.lock();
-        let idx_pre_len = idx.metadata().map_err(RedexError::io)?.len();
+        // BUG #94: same hazard as `append_entry_inner` — `metadata()?`
+        // can fail after the dat write at line 787 has committed
+        // bytes. Wrap explicitly so the dat rollback runs.
+        #[cfg(test)]
+        let idx_metadata = if self.fail_next_idx_metadata.swap(false, Ordering::AcqRel) {
+            Err(std::io::Error::other("test-injected idx.metadata failure"))
+        } else {
+            idx.metadata()
+        };
+        #[cfg(not(test))]
+        let idx_metadata = idx.metadata();
+        let idx_pre_len = match idx_metadata {
+            Ok(m) => m.len(),
+            Err(e) => {
+                drop(idx);
+                if let Some(pre_len) = dat_pre_len {
+                    let dat_path = self.dir.join("dat");
+                    if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
+                        let _ = f.set_len(pre_len);
+                    }
+                }
+                return Err(RedexError::io(e));
+            }
+        };
         if let Err(e) = idx.write_all(&idx_buf) {
             drop(idx);
             let idx_path = self.dir.join("idx");
@@ -826,7 +929,36 @@ impl DiskSegment {
         drop(idx);
 
         let mut ts = self.ts_file.lock();
-        let ts_pre_len = ts.metadata().map_err(RedexError::io)?.len();
+        // BUG #94: `metadata()?` can fail after dat AND idx have
+        // both committed bytes. Wrap explicitly so the full rollback
+        // runs on this path too — without it the on-disk idx ends
+        // up with records whose ts never landed, breaking
+        // `read_timestamps` alignment and age-based retention.
+        #[cfg(test)]
+        let ts_metadata = if self.fail_next_ts_metadata.swap(false, Ordering::AcqRel) {
+            Err(std::io::Error::other("test-injected ts.metadata failure"))
+        } else {
+            ts.metadata()
+        };
+        #[cfg(not(test))]
+        let ts_metadata = ts.metadata();
+        let ts_pre_len = match ts_metadata {
+            Ok(m) => m.len(),
+            Err(e) => {
+                drop(ts);
+                let idx_path = self.dir.join("idx");
+                if let Ok(f) = OpenOptions::new().write(true).open(&idx_path) {
+                    let _ = f.set_len(idx_pre_len);
+                }
+                if let Some(pre_len) = dat_pre_len {
+                    let dat_path = self.dir.join("dat");
+                    if let Ok(f) = OpenOptions::new().write(true).open(&dat_path) {
+                        let _ = f.set_len(pre_len);
+                    }
+                }
+                return Err(RedexError::io(e));
+            }
+        };
         if let Err(e) = ts.write_all(&ts_buf) {
             drop(ts);
             let ts_path = self.dir.join("ts");
@@ -920,6 +1052,25 @@ impl DiskSegment {
     #[cfg(test)]
     pub(super) fn arm_next_compact_failure(&self) {
         self.fail_next_compact.store(true, Ordering::Release);
+    }
+
+    /// Test-only: arm a one-shot failure on the next idx
+    /// `metadata()` call inside an append path. Used to exercise
+    /// the BUG #94 rollback path — verifies that a metadata error
+    /// after a successful dat write rolls the dat back instead of
+    /// leaving orphan bytes on disk.
+    #[cfg(test)]
+    pub(super) fn arm_next_idx_metadata_failure(&self) {
+        self.fail_next_idx_metadata.store(true, Ordering::Release);
+    }
+
+    /// Test-only: arm a one-shot failure on the next ts
+    /// `metadata()` call inside an append path. Used to exercise
+    /// the BUG #94 rollback path — verifies that a metadata error
+    /// after successful dat + idx writes rolls both back.
+    #[cfg(test)]
+    pub(super) fn arm_next_ts_metadata_failure(&self) {
+        self.fail_next_ts_metadata.store(true, Ordering::Release);
     }
 
     /// Compact the on-disk segment to the surviving in-memory

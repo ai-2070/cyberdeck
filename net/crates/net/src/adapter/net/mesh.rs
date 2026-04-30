@@ -659,6 +659,35 @@ fn routing_id(node_id: u64) -> u64 {
     (node_id as u32) as u64
 }
 
+/// Verify the AEAD tag on an inbound heartbeat packet.
+///
+/// Heartbeats carry no payload — the "payload" field of the
+/// `ParsedPacket` is the 16-byte Poly1305 tag from
+/// `PacketBuilder::build_heartbeat`. Decrypting empty plaintext
+/// over that tag against the session's RX cipher is the
+/// verification step. Returns `true` only when the tag verifies
+/// against the session's key AND the replay window admits the
+/// counter.
+///
+/// Closes BUG #85: the mesh dispatch loop previously fast-pathed
+/// `is_heartbeat()` packets without invoking AEAD verification,
+/// letting an off-path attacker who observed the cleartext
+/// `session_id` and source UDP address spoof heartbeats
+/// indefinitely (defeating session-idle timeout and injecting
+/// false failure-detector signals).
+fn verify_heartbeat_aead(parsed: &ParsedPacket, session: &NetSession) -> bool {
+    let aad = parsed.header.aad();
+    let counter = u64::from_le_bytes(parsed.header.nonce[4..12].try_into().unwrap_or([0u8; 8]));
+    let rx_cipher = session.rx_cipher();
+    if !rx_cipher.is_valid_rx_counter(counter) {
+        return false;
+    }
+    if rx_cipher.decrypt(counter, &aad, &parsed.payload).is_err() {
+        return false;
+    }
+    rx_cipher.update_rx_counter(counter)
+}
+
 /// 64-bit origin-hash projection used as the `AuthGuard` key.
 ///
 /// A prior version truncated to `u32` so the key matched the
@@ -2365,6 +2394,25 @@ impl MeshNode {
         };
 
         if parsed.header.flags.is_heartbeat() {
+            // BUG #85: previously this branch fast-pathed the
+            // heartbeat — touched `failure_detector` and `session`
+            // without verifying the AEAD tag. The legacy single-
+            // peer adapter (`mod.rs:642-663`) explicitly verifies
+            // the tag for the same packet shape; the comment on
+            // `pool.rs:237-249` documents that heartbeats are now
+            // AEAD-authenticated specifically to prevent off-path
+            // spoofing. An attacker with the cleartext `session_id`
+            // (visible on every prior data packet) and the source
+            // UDP address could spoof heartbeats from `peer_addr`,
+            // indefinitely defeating session-idle timeout and
+            // injecting false `failure_detector.heartbeat(...)`
+            // notifications.
+            //
+            // Now: do the same AEAD verify the legacy path does
+            // BEFORE touching any session state.
+            if !verify_heartbeat_aead(&parsed, &session) {
+                return;
+            }
             failure_detector.heartbeat(peer_node_id, source);
             session.touch();
             return;
@@ -3166,10 +3214,33 @@ impl MeshNode {
                                 continue;
                             }
                             let session = &entry.value().session;
-                            let mut builder =
-                                PacketBuilder::new(&[0u8; 32], session.session_id());
-                            // Heartbeat
-                            let packet = builder.build_heartbeat();
+                            // BUG #97: previously this constructed
+                            // a fresh `PacketBuilder::new(&[0u8;
+                            // 32], session.session_id())` for each
+                            // heartbeat. Two compounding problems:
+                            //
+                            // (a) the all-zero key didn't match
+                            //     the session's RX key — so every
+                            //     heartbeat tag would have failed
+                            //     AEAD verify. Pre-#85-fix the
+                            //     receiver didn't verify; the bug
+                            //     was latent.
+                            // (b) each fresh builder owned a
+                            //     fresh `tx_counter` starting at
+                            //     0, so successive heartbeats
+                            //     reused counter=0 — the receiver
+                            //     would accept the first and
+                            //     reject every subsequent one as
+                            //     a replay.
+                            //
+                            // Acquire from the session's pooled
+                            // builder so the heartbeat shares the
+                            // session's persistent `tx_counter`
+                            // (counter increments atomically per
+                            // packet) and is built with the
+                            // session's actual TX key.
+                            let mut pooled = session.packet_pool().get();
+                            let packet = pooled.build_heartbeat();
                             let _ = socket.send_to(&packet, peer_addr).await;
                             // Pingwave (raw UDP — not encrypted, topology is public)
                             let _ = socket.send_to(&pw_bytes, peer_addr).await;
@@ -7108,5 +7179,120 @@ mod reclassify_override_race_tests {
 
         assert_eq!(node.nat_class(), NatClass::Cone);
         assert_eq!(node.reflex_addr(), Some(probed));
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_aead_tests {
+    //! Regression for BUG_AUDIT_2026_04_30_CORE.md #85: the mesh
+    //! dispatch loop's heartbeat fast-path used to skip AEAD
+    //! verification, letting an off-path attacker who observed the
+    //! cleartext `session_id` and source UDP address spoof
+    //! heartbeats indefinitely. The fix routes through
+    //! [`verify_heartbeat_aead`] before calling
+    //! `failure_detector.heartbeat` or `session.touch`. These
+    //! tests pin the verifier itself at the same coverage bar the
+    //! legacy single-peer adapter has at
+    //! `mod.rs::heartbeat_is_aead_authenticated`.
+    use super::*;
+    use crate::adapter::net::crypto::{NoiseHandshake, StaticKeypair};
+    use crate::adapter::net::pool::PacketBuilder;
+    use crate::adapter::net::protocol::NetHeader;
+
+    fn make_session_keys() -> (
+        crate::adapter::net::crypto::SessionKeys,
+        crate::adapter::net::crypto::SessionKeys,
+    ) {
+        let psk = [0x42u8; 32];
+        let responder_kp = StaticKeypair::generate();
+        let mut initiator = NoiseHandshake::initiator(&psk, &responder_kp.public).unwrap();
+        let mut responder = NoiseHandshake::responder(&psk, &responder_kp).unwrap();
+        let msg1 = initiator.write_message(&[]).unwrap();
+        responder.read_message(&msg1).unwrap();
+        let msg2 = responder.write_message(&[]).unwrap();
+        initiator.read_message(&msg2).unwrap();
+        (
+            initiator.into_session_keys().unwrap(),
+            responder.into_session_keys().unwrap(),
+        )
+    }
+
+    #[test]
+    fn aead_authenticated_heartbeat_passes_verification() {
+        let (init_keys, resp_keys) = make_session_keys();
+        let resp_session = NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        );
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let bytes = builder.build_heartbeat();
+
+        let parsed = ParsedPacket::parse(bytes, "127.0.0.1:5000".parse().unwrap())
+            .expect("legitimate heartbeat must parse");
+        assert!(parsed.header.flags.is_heartbeat());
+
+        assert!(
+            verify_heartbeat_aead(&parsed, &resp_session),
+            "AEAD-authenticated heartbeat must verify against the matched session"
+        );
+    }
+
+    #[test]
+    fn unauthenticated_heartbeat_fails_verification() {
+        let (_init_keys, resp_keys) = make_session_keys();
+        let resp_session = NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        );
+
+        // Attacker forges a heartbeat header with the right
+        // session_id but garbage 16-byte tail. Pre-fix this passed
+        // through; post-fix it must fail.
+        let mut forged = bytes::BytesMut::new();
+        let mut header_bytes =
+            NetHeader::heartbeat(resp_session.session_id()).to_bytes();
+        // Stamp a plausible nonce so the receiver gets to decrypt
+        // (otherwise it bails earlier on the counter check).
+        header_bytes[12..16].copy_from_slice(&[0u8; 4]);
+        header_bytes[16..24].copy_from_slice(&1u64.to_le_bytes());
+        forged.extend_from_slice(&header_bytes);
+        forged.extend_from_slice(&[0xAAu8; 16]); // garbage tag
+        let parsed =
+            ParsedPacket::parse(forged.freeze(), "127.0.0.1:5000".parse().unwrap())
+                .expect("forged heartbeat must still parse — verification is downstream");
+        assert!(parsed.header.flags.is_heartbeat());
+
+        assert!(
+            !verify_heartbeat_aead(&parsed, &resp_session),
+            "heartbeat with garbage AEAD tag must NOT verify — pre-fix the \
+             mesh dispatcher would have called session.touch() / \
+             failure_detector.heartbeat() unconditionally"
+        );
+    }
+
+    #[test]
+    fn replay_of_authenticated_heartbeat_fails_verification_on_second_try() {
+        let (init_keys, resp_keys) = make_session_keys();
+        let resp_session = NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        );
+        let mut builder = PacketBuilder::new(&init_keys.tx_key, init_keys.session_id);
+        let bytes = builder.build_heartbeat();
+        let parsed = ParsedPacket::parse(bytes, "127.0.0.1:5000".parse().unwrap()).unwrap();
+
+        assert!(verify_heartbeat_aead(&parsed, &resp_session));
+        // Replay: counter is now committed, so the second attempt
+        // must fail at the replay-window check.
+        assert!(
+            !verify_heartbeat_aead(&parsed, &resp_session),
+            "replay of an already-accepted heartbeat must fail"
+        );
     }
 }

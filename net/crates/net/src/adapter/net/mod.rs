@@ -837,9 +837,26 @@ impl NetAdapter {
                             break;
                         }
 
-                        // Build and send heartbeat
-                        let mut builder = PacketBuilder::new(&[0u8; 32], session.session_id());
-                        let packet = builder.build_heartbeat();
+                        // BUG #97: previously this used
+                        // `PacketBuilder::new(&[0u8; 32],
+                        // session.session_id())` — a fresh builder
+                        // with an all-zero key and a fresh
+                        // counter starting at 0 each tick. Two
+                        // problems compounded once the receiver
+                        // started AEAD-verifying heartbeats (BUG
+                        // #85): (a) the all-zero key didn't match
+                        // the session's RX key; (b) successive
+                        // heartbeats reused counter=0, so the
+                        // receiver's replay window rejected every
+                        // heartbeat after the first.
+                        //
+                        // Acquire from the session's pooled
+                        // builder so the heartbeat shares the
+                        // session's persistent `tx_counter` and
+                        // is built with the session's actual TX
+                        // key.
+                        let mut pooled = session.packet_pool().get();
+                        let packet = pooled.build_heartbeat();
 
                         if let Err(e) = socket.send_to(&packet, peer_addr).await {
                             tracing::warn!(error = %e, "heartbeat send failed");

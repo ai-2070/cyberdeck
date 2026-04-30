@@ -1613,6 +1613,91 @@ mod tests {
         assert_eq!(f.len(), 1, "index must not grow on batch disk failure");
     }
 
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #94: when the
+    /// idx `metadata()` call inside `append_entry_inner` failed
+    /// AFTER a successful dat write, the original `?` early-return
+    /// skipped the dat-rollback block, leaving orphan dat bytes on
+    /// disk while the caller was told the append failed. On reopen
+    /// those bytes were trimmed by `retained_dat_end`, but the
+    /// rollback contract was violated and the seq counter
+    /// disagreed with the durable record.
+    ///
+    /// The fix wraps `metadata()` in an explicit match so the
+    /// dat-rollback block runs on this path too. We pin this by
+    /// arming a one-shot idx-metadata failure, observing the
+    /// caller's Err, then asserting the on-disk dat file size
+    /// matches the pre-failure size (no orphan bytes).
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn append_rolls_back_dat_on_idx_metadata_failure() {
+        let dir = tmp_persistent_dir("append_rollback_idx_meta");
+        let f = make_persistent("t_rollback/idx_meta", &dir);
+
+        // Prime with one entry so the dat file has known content.
+        f.append(b"AAAAAAAAA").unwrap();
+        let dat_path = dir.join("t_rollback").join("idx_meta").join("dat");
+        let pre_dat_len = std::fs::metadata(&dat_path).unwrap().len();
+        assert_eq!(
+            pre_dat_len, 9,
+            "primed payload must be 9 bytes on disk"
+        );
+
+        f.inner.disk.as_ref().unwrap().arm_next_idx_metadata_failure();
+
+        let err = f.append(b"BBBBBBBBB").unwrap_err();
+        assert!(matches!(err, RedexError::Io(_)));
+
+        // Pre-fix: dat would be 18 bytes (orphan "BBBBBBBBB" tail).
+        // Post-fix: dat is back to 9 bytes — the rollback ran.
+        let post_dat_len = std::fs::metadata(&dat_path).unwrap().len();
+        assert_eq!(
+            post_dat_len, pre_dat_len,
+            "idx metadata failure must roll back the dat write — \
+             pre-fix this left {pre_dat_len} bytes; orphan tail bug",
+        );
+        assert_eq!(f.next_seq(), 1, "next_seq must be rolled back");
+        assert_eq!(f.len(), 1, "in-memory index must not grow");
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #94: same hazard
+    /// but for the ts metadata path — a failure here previously
+    /// left orphaned dat AND idx bytes (the latter being more
+    /// serious because torn-tail recovery resurrects them as
+    /// entries with `now()` timestamps when ts is shorter than
+    /// idx).
+    #[cfg(feature = "redex-disk")]
+    #[test]
+    fn append_rolls_back_dat_and_idx_on_ts_metadata_failure() {
+        let dir = tmp_persistent_dir("append_rollback_ts_meta");
+        let f = make_persistent("t_rollback/ts_meta", &dir);
+
+        f.append(b"AAAAAAAAA").unwrap();
+        let dat_path = dir.join("t_rollback").join("ts_meta").join("dat");
+        let idx_path = dir.join("t_rollback").join("ts_meta").join("idx");
+        let pre_dat_len = std::fs::metadata(&dat_path).unwrap().len();
+        let pre_idx_len = std::fs::metadata(&idx_path).unwrap().len();
+
+        f.inner.disk.as_ref().unwrap().arm_next_ts_metadata_failure();
+
+        let err = f.append(b"BBBBBBBBB").unwrap_err();
+        assert!(matches!(err, RedexError::Io(_)));
+
+        let post_dat_len = std::fs::metadata(&dat_path).unwrap().len();
+        let post_idx_len = std::fs::metadata(&idx_path).unwrap().len();
+        assert_eq!(
+            post_dat_len, pre_dat_len,
+            "ts metadata failure must roll back the dat write"
+        );
+        assert_eq!(
+            post_idx_len, pre_idx_len,
+            "ts metadata failure must roll back the idx write — \
+             pre-fix this left a record whose ts never landed, \
+             producing a length mismatch on next reopen"
+        );
+        assert_eq!(f.next_seq(), 1, "next_seq must be rolled back");
+        assert_eq!(f.len(), 1, "in-memory index must not grow");
+    }
+
     // ---- FsyncPolicy tests (Stage 1 of v2 closeout) ----
 
     #[cfg(feature = "redex-disk")]

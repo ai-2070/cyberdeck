@@ -868,15 +868,54 @@ impl EventBus {
     }
 
     /// Manually trigger a scale-down (for testing or manual intervention).
-    pub fn manual_scale_down(&self, count: u16) -> Result<Vec<u16>, AdapterError> {
+    ///
+    /// Marks `count` shards as `Draining`, waits for them to empty,
+    /// finalizes them to `Stopped`, and removes them from the
+    /// routing table — mirroring the scaling monitor's per-tick
+    /// finalize loop. Returns the IDs of shards that were
+    /// successfully drained AND removed (subset of those marked
+    /// Draining if any failed to empty within the deadline).
+    ///
+    /// BUG #82: previously this only called `mapper.scale_down`,
+    /// which marks shards `Draining` but does NOT finalize them —
+    /// finalization was the scaling monitor's responsibility. Bus
+    /// configs without an active monitor (or callers that
+    /// shut down before the monitor's next tick) lost any events
+    /// queued in those shards' ring buffers. Now this method
+    /// drives the full lifecycle synchronously.
+    pub async fn manual_scale_down(&self, count: u16) -> Result<Vec<u16>, AdapterError> {
         let mapper = self
             .shard_manager
             .mapper()
             .ok_or_else(|| AdapterError::Fatal("Dynamic scaling not enabled".into()))?;
 
-        mapper
+        let drained_ids = mapper
             .scale_down(count)
-            .map_err(|e| AdapterError::Fatal(e.to_string()))
+            .map_err(|e| AdapterError::Fatal(e.to_string()))?;
+
+        // `finalize_draining` requires the shard to have been
+        // Draining for >100ms with an empty ring buffer and no
+        // pushes since drain start. Poll until every requested
+        // shard finalizes, capped by an outer deadline so a wedged
+        // producer can't pin this method forever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut finalized: std::collections::HashSet<u16> = std::collections::HashSet::new();
+        let target: std::collections::HashSet<u16> = drained_ids.iter().copied().collect();
+
+        while finalized.len() < target.len()
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let stopped = mapper.finalize_draining();
+            for shard_id in stopped {
+                if target.contains(&shard_id) {
+                    let _ = self.remove_shard_internal(shard_id).await;
+                    finalized.insert(shard_id);
+                }
+            }
+        }
+
+        Ok(finalized.into_iter().collect())
     }
 }
 
@@ -1395,6 +1434,60 @@ mod tests {
         assert_eq!(
             bus.stats().events_ingested.load(AtomicOrdering::Relaxed),
             100
+        );
+
+        bus.shutdown().await.unwrap();
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #82: previously
+    /// `manual_scale_down` only called `mapper.scale_down(count)`,
+    /// which marks shards as `Draining` but does NOT finalize them.
+    /// Bus configs without an active scaling monitor (or callers
+    /// shutting down before the monitor's next tick) lost any
+    /// events queued in the drained shards' ring buffers because
+    /// `remove_shard_internal` was never invoked. The fix runs the
+    /// full lifecycle synchronously: scale_down → poll for empty →
+    /// finalize_draining → remove_shard_internal.
+    ///
+    /// We pin this by scaling up, manually scaling down, and
+    /// asserting that `num_shards` actually decreases — pre-fix
+    /// the count would still reflect the Draining shards.
+    #[tokio::test]
+    async fn manual_scale_down_finalizes_and_removes_drained_shards() {
+        let policy = ScalingPolicy {
+            min_shards: 2,
+            max_shards: 8,
+            cooldown: Duration::from_nanos(1),
+            ..Default::default()
+        };
+        let config = EventBusConfig::builder()
+            .num_shards(2)
+            .ring_buffer_capacity(1024)
+            .scaling(policy)
+            .build()
+            .unwrap();
+        let bus = EventBus::new(config).await.unwrap();
+
+        // Scale up to 4, then back down to 2.
+        let added = bus.manual_scale_up(2).await.unwrap();
+        assert_eq!(added.len(), 2);
+        assert_eq!(bus.num_shards(), 4);
+
+        let removed = bus.manual_scale_down(2).await.unwrap();
+        assert_eq!(
+            removed.len(),
+            2,
+            "manual_scale_down must complete the lifecycle for both \
+             requested shards (mark Draining → wait → finalize → remove)"
+        );
+
+        // Pre-fix: `num_shards` would still be 4 because shards
+        // were only marked Draining (and the routing-table removal
+        // path never ran). Post-fix: it's back to 2.
+        assert_eq!(
+            bus.num_shards(),
+            2,
+            "drained shards must be removed from the routing table"
         );
 
         bus.shutdown().await.unwrap();

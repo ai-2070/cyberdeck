@@ -210,6 +210,20 @@ impl BatchedTransport {
             return Ok(Vec::new());
         }
 
+        // BUG #90: a `BatchedTransport` constructed via
+        // `new_send_only` skipped the `recv_buffers` allocation,
+        // so indexing into them below would panic with
+        // index-out-of-bounds. Surface the misuse as an explicit
+        // error instead — the doc on `new_send_only` only stated
+        // the contract verbally before this guard.
+        if self.recv_buffers.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "BatchedTransport constructed via `new_send_only` cannot \
+                 receive packets — use `new` if recv is needed",
+            ));
+        }
+
         // Setup receive buffers
         for i in 0..count {
             self.recv_buffers[i].resize(MAX_PACKET_SIZE, 0);
@@ -278,6 +292,15 @@ impl BatchedTransport {
         let count = max_count.min(MAX_BATCH_SIZE);
         if count == 0 {
             return Ok(Vec::new());
+        }
+
+        // BUG #90: see `recv_batch` for context.
+        if self.recv_buffers.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "BatchedTransport constructed via `new_send_only` cannot \
+                 receive packets — use `new` if recv is needed",
+            ));
         }
 
         // Setup receive buffers
@@ -487,5 +510,37 @@ mod tests {
 
         // Should not fail
         configure_socket_for_throughput(fd).unwrap();
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #90:
+    /// `BatchedTransport::new_send_only` skips the `recv_buffers`
+    /// allocation, leaving the vector empty. Pre-fix, calling
+    /// `recv_batch` on a send-only transport panicked with
+    /// index-out-of-bounds at the first `self.recv_buffers[i]
+    /// .resize(...)` line. The fix surfaces the misuse as an
+    /// `io::ErrorKind::Unsupported` instead.
+    #[test]
+    fn recv_batch_returns_unsupported_for_send_only_transport() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fd = socket.as_raw_fd();
+        let mut transport = BatchedTransport::new_send_only(fd);
+
+        let err = transport
+            .recv_batch(8)
+            .expect_err("send-only recv must surface Unsupported, not panic");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+
+        let err_blocking = transport
+            .recv_batch_blocking(8)
+            .expect_err("send-only recv_batch_blocking must also surface Unsupported");
+        assert_eq!(err_blocking.kind(), io::ErrorKind::Unsupported);
+
+        // Sanity: a `new()` (recv-capable) transport doesn't trip
+        // the guard. We don't actually assert success of recv (no
+        // packets are arriving), just that the guard isn't fired.
+        let mut recv_transport = BatchedTransport::new(fd);
+        // 0-count is the explicit no-op path before the guard.
+        let zero = recv_transport.recv_batch(0).unwrap();
+        assert!(zero.is_empty());
     }
 }

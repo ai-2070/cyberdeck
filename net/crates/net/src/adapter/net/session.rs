@@ -42,6 +42,14 @@ pub struct NetSession {
     tx_cipher: PacketCipher,
     /// RX cipher (ChaCha20-Poly1305 with counter-based nonces)
     rx_cipher: PacketCipher,
+    /// Raw TX key. Retained alongside `tx_cipher` so that callers
+    /// outside the cipher hot path (notably `mesh.rs`'s heartbeat
+    /// timer) can construct `PacketBuilder` instances bound to the
+    /// session's actual key. BUG #97 was caused by callers
+    /// substituting `&[0u8; 32]` here, producing heartbeats that
+    /// the receiver's AEAD verify (BUG #85 fix) correctly
+    /// rejected.
+    tx_key: [u8; 32],
     /// Per-stream state
     streams: DashMap<u64, StreamState>,
     /// Last activity timestamp (for session timeout)
@@ -100,11 +108,13 @@ impl NetSession {
         let thread_local_pool =
             super::pool::shared_local_pool(pool_size, &keys.tx_key, keys.session_id);
 
+        let tx_key = keys.tx_key;
         Self {
             session_id: keys.session_id,
             peer_addr,
             tx_cipher,
             rx_cipher,
+            tx_key,
             streams: DashMap::new(),
             last_activity: AtomicU64::new(current_timestamp()),
             packet_pool,
@@ -152,6 +162,18 @@ impl NetSession {
     #[inline]
     pub fn tx_cipher(&self) -> &PacketCipher {
         &self.tx_cipher
+    }
+
+    /// Get the raw TX key. Used by callers (such as the mesh
+    /// heartbeat timer) that need to construct ad-hoc
+    /// `PacketBuilder` instances bound to this session's key.
+    /// Closes BUG #97 — pre-fix, the heartbeat sender substituted
+    /// `&[0u8; 32]` here, producing AEAD-tagged heartbeats whose
+    /// tag the receiver could never verify against the session's
+    /// actual key.
+    #[inline]
+    pub fn tx_key(&self) -> &[u8; 32] {
+        &self.tx_key
     }
 
     /// Get the RX cipher
