@@ -132,9 +132,11 @@ impl DiskSegment {
     ///
     /// `fsync_every_n` and `fsync_max_bytes` are derived from
     /// [`super::FsyncPolicy`] at the `RedexFile` layer:
+    ///
     /// - `EveryN(n)` → `(n.max(1), 0)`
     /// - `IntervalOrBytes { max_bytes, .. }` → `(0, max_bytes)`
     /// - `Never` / `Interval` → `(0, 0)`
+    ///
     /// Each nonzero threshold enables one trigger of the background
     /// fsync worker; `0` disables that trigger.
     pub(super) fn open(
