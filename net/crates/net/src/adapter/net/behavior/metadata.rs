@@ -963,6 +963,22 @@ impl MetadataStore {
     }
 
     /// Insert or update node metadata
+    ///
+    /// BUG #123: pre-fix this was a 5-step sequence with no
+    /// overarching lock — (1) capacity check, (2) `nodes.get(&id)`,
+    /// (3) `remove_from_indexes(&old)`, (4) `add_to_indexes(&new)`,
+    /// (5) `nodes.insert`. Two threads upserting the same node
+    /// concurrently could both observe the same `old` at step 2,
+    /// both remove its index entries at step 3 (second a no-op),
+    /// and both add to indexes at step 4 — into DIFFERENT buckets
+    /// if the metadata differed. Whichever `nodes.insert` landed
+    /// second won, but the loser's index entries were never
+    /// removed, producing permanent index drift (queries return
+    /// the node under the wrong filter; stats over-count). Now
+    /// the entire (read-old, remove-from-indexes, add-to-indexes,
+    /// insert) sequence runs inside `DashMap::entry`'s shard
+    /// write lock, serializing all concurrent upserts on the same
+    /// node_id.
     pub fn upsert(&self, metadata: NodeMetadata) -> Result<(), MetadataError> {
         // BUG #124: bound peer-supplied metadata before touching
         // the indexes — without this, one peer could ship a single
@@ -974,23 +990,58 @@ impl MetadataStore {
 
         let node_id = metadata.node_id;
 
-        // Check capacity
+        // Capacity check BEFORE entering the entry guard —
+        // `self.nodes.len()` walks all shards and would deadlock
+        // if called while we hold a write guard on one of them.
+        // The soft-cap race window (a concurrent upsert lands
+        // between this check and the entry-acquire below) is
+        // acceptable: the cap is best-effort, mirroring the
+        // pattern used by `TokenCache::insert_unchecked` and
+        // `ContextStore::create_context` after BUG #136.
         if let Some(max) = self.max_capacity {
             if !self.nodes.contains_key(&node_id) && self.nodes.len() >= max {
                 return Err(MetadataError::CapacityExceeded);
             }
         }
 
-        // Remove old indexes if updating
-        if let Some(old) = self.nodes.get(&node_id) {
-            self.remove_from_indexes(&old);
+        // BUG #123: take the per-shard write lock on the node_id
+        // entry FIRST. Holding it serializes all concurrent
+        // upserts on this id, so the (remove_from_indexes,
+        // add_to_indexes, insert) sequence is observed by other
+        // upserts as a single atomic transition. Pre-fix the read-
+        // old at step 2 happened OUTSIDE any lock, so two threads
+        // could both observe the same `old`, both
+        // `remove_from_indexes(&old)`, both `add_to_indexes` into
+        // different buckets, and the loser's entries leaked into
+        // permanent index drift.
+        //
+        // `add_to_indexes` / `remove_from_indexes` write to
+        // OTHER DashMap instances (`by_status`, `by_tag`, etc.).
+        // The lock-order convention is: hold `nodes` entry FIRST,
+        // then write the index DashMaps. As long as no other
+        // operation locks an index DashMap and then reaches into
+        // `nodes`, we're deadlock-free. The `query` path takes
+        // index DashMap snapshots first, then reads `nodes`
+        // afterwards — that order is the inverse of ours, but
+        // each step's lock is released before the next is taken,
+        // so there's no held-lock chain to deadlock.
+        use dashmap::mapref::entry::Entry;
+        match self.nodes.entry(node_id) {
+            Entry::Vacant(slot) => {
+                self.add_to_indexes(&metadata);
+                slot.insert(Arc::new(metadata));
+            }
+            Entry::Occupied(mut slot) => {
+                // Read the old metadata WHILE holding the entry
+                // lock — this is the critical change vs. pre-fix,
+                // where the read-old happened before the lock and
+                // could be invalidated by a concurrent upsert.
+                let old = slot.get().clone();
+                self.remove_from_indexes(&old);
+                self.add_to_indexes(&metadata);
+                slot.insert(Arc::new(metadata));
+            }
         }
-
-        // Add to indexes
-        self.add_to_indexes(&metadata);
-
-        // Store
-        self.nodes.insert(node_id, Arc::new(metadata));
         self.update_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
@@ -1630,6 +1681,133 @@ mod tests {
         store
             .upsert(node)
             .expect("metadata at the exact boundaries must be accepted");
+    }
+
+    // ========================================================================
+    // BUG #123: upsert must serialize concurrent writers on the same node_id
+    // ========================================================================
+
+    /// Concurrent `upsert`s on the same `node_id` with DIFFERENT
+    /// metadata must leave the inverted indexes consistent —
+    /// exactly one (status, tag) pairing per node, matching the
+    /// final stored metadata. Pre-fix the read-old happened
+    /// outside any lock, so two threads could observe the same
+    /// `old`, both `remove_from_indexes(old)`, both
+    /// `add_to_indexes(new_a)` / `add_to_indexes(new_b)` into
+    /// different buckets, and the loser's index entries leaked
+    /// permanently.
+    #[test]
+    fn upsert_serializes_concurrent_writes_on_same_node_id() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let store = Arc::new(MetadataStore::new());
+        let node_id = make_node_id(42);
+
+        // Seed the store so both threads see an existing entry to
+        // remove from indexes — the original race vector.
+        let seed = NodeMetadata::new(node_id)
+            .with_status(NodeStatus::Online)
+            .with_tag("seed")
+            .with_topology(TopologyHints::new(NetworkTier::Consumer));
+        store.upsert(seed).unwrap();
+
+        // Two threads upsert different metadata on the same id.
+        // Each contends with the other for the node's shard write
+        // guard.
+        let n_iters = 50;
+        let store_a = store.clone();
+        let store_b = store.clone();
+        let h_a = thread::spawn(move || {
+            for i in 0..n_iters {
+                let node = NodeMetadata::new(node_id)
+                    .with_status(NodeStatus::Online)
+                    .with_tag(format!("a-{}", i))
+                    .with_topology(TopologyHints::new(NetworkTier::Premium));
+                store_a.upsert(node).unwrap();
+            }
+        });
+        let h_b = thread::spawn(move || {
+            for i in 0..n_iters {
+                let node = NodeMetadata::new(node_id)
+                    .with_status(NodeStatus::Degraded)
+                    .with_tag(format!("b-{}", i))
+                    .with_topology(TopologyHints::new(NetworkTier::Datacenter));
+                store_b.upsert(node).unwrap();
+            }
+        });
+        h_a.join().unwrap();
+        h_b.join().unwrap();
+
+        // Final metadata: one of the two threads' last write
+        // landed last. Whatever it is, the inverted indexes must
+        // reflect ONLY that final metadata — no leftover
+        // status/tag entries from the other thread.
+        let final_meta = store.get(&node_id).expect("node must still exist");
+        let final_status = final_meta.status;
+        let final_tags: std::collections::HashSet<&str> =
+            final_meta.tags.iter().map(|s| s.as_str()).collect();
+
+        // No status bucket OTHER than the final one may contain
+        // this node_id.
+        for status in [
+            NodeStatus::Online,
+            NodeStatus::Offline,
+            NodeStatus::Degraded,
+            NodeStatus::Starting,
+            NodeStatus::Maintenance,
+        ] {
+            let bucket_has_node = store
+                .by_status
+                .get(&status)
+                .map(|s| s.contains(&node_id))
+                .unwrap_or(false);
+            if status == final_status {
+                assert!(
+                    bucket_has_node,
+                    "final status {:?} bucket must contain the node",
+                    status
+                );
+            } else {
+                assert!(
+                    !bucket_has_node,
+                    "stale status {:?} bucket must NOT contain the node (BUG #123)",
+                    status
+                );
+            }
+        }
+
+        // No tag bucket OTHER than the final tags may contain
+        // this node_id. Walk every tag bucket the threads might
+        // have touched.
+        for i in 0..n_iters {
+            for prefix in ["a-", "b-"] {
+                let tag = format!("{}{}", prefix, i);
+                if final_tags.contains(tag.as_str()) {
+                    continue;
+                }
+                let bucket_has_node = store
+                    .by_tag
+                    .get(&tag)
+                    .map(|s| s.contains(&node_id))
+                    .unwrap_or(false);
+                assert!(
+                    !bucket_has_node,
+                    "stale tag '{}' bucket must NOT contain the node (BUG #123)",
+                    tag
+                );
+            }
+        }
+        // The seed tag must also be gone.
+        let seed_bucket_has_node = store
+            .by_tag
+            .get("seed")
+            .map(|s| s.contains(&node_id))
+            .unwrap_or(false);
+        assert!(
+            !seed_bucket_has_node,
+            "the original seed tag must have been removed (BUG #123)"
+        );
     }
 
     #[test]

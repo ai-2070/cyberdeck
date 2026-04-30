@@ -707,15 +707,40 @@ impl EventBus {
         let phase2_deadline =
             tokio::time::Instant::now() + phase2_budget.min(Duration::from_secs(2));
         // Sleep one `max_delay` window at a time. After each sleep,
-        // if the ring buffers are still empty (no late drain refilled
-        // them), we've given the in-flight batches at least one
-        // `max_delay`-sized opportunity to time out and dispatch —
-        // good enough to declare phase 2 complete. Without this
-        // early-break, every `flush()` always paid the full budget
-        // (up to 2s) even on an idle system.
+        // gate the early-break on the bus-level `batches_dispatched`
+        // counter being unchanged across the window — that's the
+        // load-bearing "no batch worker made progress this window"
+        // signal.
+        //
+        // BUG #76: pre-fix this used `all_shards_empty()` (a
+        // ring-buffer-fill probe) which Phase 1 had already drained,
+        // so the check was constant-true after the first sleep
+        // and Phase 2 always exited after exactly ONE `max_delay`
+        // — collapsing the documented multi-worker budget back to
+        // the single-window behavior #16 was supposed to replace.
+        // A flush-as-barrier caller on a many-shard config (default
+        // 8+) returning during a partial-batch dispatch saw the
+        // pre-#16 silent loss.
+        //
+        // The new gate: read `batches_dispatched` before each sleep,
+        // sleep one `max_delay`, then early-break only if the
+        // counter hasn't moved AND the ring buffers are still
+        // empty (defense-in-depth — a producer push during the
+        // window means new batches will appear and we shouldn't
+        // exit yet).
+        let mut last_dispatched = self
+            .stats
+            .batches_dispatched
+            .load(AtomicOrdering::Acquire);
         while tokio::time::Instant::now() < phase2_deadline {
             tokio::time::sleep(self.config.batch.max_delay).await;
-            if self.shard_manager.all_shards_empty() {
+            let now_dispatched = self
+                .stats
+                .batches_dispatched
+                .load(AtomicOrdering::Acquire);
+            let dispatched_progress = now_dispatched != last_dispatched;
+            last_dispatched = now_dispatched;
+            if !dispatched_progress && self.shard_manager.all_shards_empty() {
                 break;
             }
         }

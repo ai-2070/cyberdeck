@@ -205,15 +205,26 @@ impl StateSnapshot {
         match &self.identity_envelope {
             None => Ok(None),
             Some(env) => {
-                let kp = env.open(target_x25519_priv, &self.chain_link)?;
+                // BUG #127: pass the snapshot's `entity_id` as
+                // `expected_signer_pub` so a substituted envelope
+                // (built by an attacker with the correct
+                // `target_static_pub` but a different signer
+                // identity) is rejected EARLY — before any
+                // cryptographic work. The post-decrypt
+                // `kp.entity_id() != self.entity_id` check is
+                // retained as defense-in-depth.
+                let kp = env.open(
+                    target_x25519_priv,
+                    &self.chain_link,
+                    Some(self.entity_id.as_bytes()),
+                )?;
                 // Belt-and-braces: the decrypted keypair's
                 // `origin_hash` must match the snapshot's
-                // `entity_id`. `IdentityEnvelope::open` already
-                // checks that the decrypted pub matches the
-                // envelope's `signer_pub`, but the snapshot's
-                // `entity_id` is a second, separately-signed
-                // commitment that the decrypted identity must
-                // also match.
+                // `entity_id`. The early-reject above catches the
+                // common case where signer_pub differs; this
+                // covers the (now-vanishingly-rare) case where
+                // the decrypted seed produces a derived pub that
+                // doesn't match what the envelope claimed.
                 if kp.entity_id() != &self.entity_id {
                     return Err(crate::adapter::net::identity::EnvelopeError::OriginHashMismatch);
                 }
@@ -1167,7 +1178,13 @@ mod tests {
             .open_identity_envelope(&target_priv)
             .expect_err("impostor envelope must be rejected");
         use crate::adapter::net::identity::EnvelopeError;
-        assert_eq!(err, EnvelopeError::OriginHashMismatch);
+        // BUG #127: post-fix the early `expected_signer_pub` check
+        // fires first (before any cryptographic work) and surfaces
+        // `InvalidSignerKey`. The pre-fix rejection was at the
+        // post-decrypt cross-check (`OriginHashMismatch`) — same
+        // outcome (envelope rejected) but the new path is faster
+        // and avoids unnecessary AEAD work.
+        assert_eq!(err, EnvelopeError::InvalidSignerKey);
     }
 
     #[test]

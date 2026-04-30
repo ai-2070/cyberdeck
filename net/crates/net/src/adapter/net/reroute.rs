@@ -17,9 +17,24 @@ use super::behavior::proximity::ProximityGraph;
 use super::route::RoutingTable;
 
 /// Saved original route before reroute, for recovery.
+///
+/// BUG #117: pre-fix this stored the original `next_hop:
+/// SocketAddr` and `on_recovery` filtered by
+/// `entry.next_hop == recovered_addr`. After a NAT rebind / peer
+/// reconnect on a different port / mobile-network change, the
+/// peer's entry in `peer_addrs` reflects the NEW address but the
+/// saved entry was keyed on the OLD address — the filter returned
+/// empty, no routes were restored, and the saved entry persisted
+/// indefinitely (DashMap entries were only dropped on successful
+/// match). Now we store the peer's stable `node_id` instead;
+/// `on_recovery` re-resolves the current addr from `peer_addrs` at
+/// recovery time, surviving NAT rebinds.
 struct SavedRoute {
-    /// Original next-hop address
-    next_hop: SocketAddr,
+    /// Node ID of the peer whose failure caused this reroute. The
+    /// concrete `next_hop` SocketAddr at the time of saving may
+    /// have changed (NAT rebind), so we re-resolve from
+    /// `peer_addrs[failed_node_id]` at recovery time.
+    failed_node_id: u64,
     /// The alternate we rerouted to
     #[allow(dead_code)]
     alternate: SocketAddr,
@@ -152,7 +167,7 @@ impl ReroutePolicy {
                 .entry(*dest_id)
                 .and_modify(|existing| existing.alternate = alt_addr)
                 .or_insert(SavedRoute {
-                    next_hop: failed_addr,
+                    failed_node_id,
                     alternate: alt_addr,
                 });
             self.routing_table.add_route(*dest_id, alt_addr);
@@ -218,17 +233,29 @@ impl ReroutePolicy {
     /// Restores original routes that were rerouted when this peer failed.
     /// The direct path is typically better (fewer hops, lower latency)
     /// than the alternate.
+    ///
+    /// BUG #117: filter is now `entry.failed_node_id ==
+    /// recovered_node_id` rather than `entry.next_hop ==
+    /// recovered_addr`. The pre-fix addr-based filter missed every
+    /// reroute when the peer reconnected from a different
+    /// SocketAddr (NAT rebind, mobile network change, reconnect on
+    /// different port) — `saved_routes` then accumulated
+    /// indefinitely across mobile / NAT-changing peers, and routes
+    /// stayed pinned to alternates after the peer had actually
+    /// recovered. Identity-based filter survives addr changes;
+    /// `recovered_addr` is re-resolved from `peer_addrs` at
+    /// recovery time so the restored route uses the current addr.
     pub fn on_recovery(&self, recovered_node_id: u64) {
         let recovered_addr = match self.peer_addrs.get(&recovered_node_id) {
             Some(addr) => *addr,
             None => return,
         };
 
-        // Find routes that were rerouted away from this peer
+        // Find routes that were rerouted away from this peer.
         let to_restore: Vec<u64> = self
             .saved_routes
             .iter()
-            .filter(|e| e.value().next_hop == recovered_addr)
+            .filter(|e| e.value().failed_node_id == recovered_node_id)
             .map(|e| *e.key())
             .collect();
 
@@ -236,7 +263,9 @@ impl ReroutePolicy {
             return;
         }
 
-        // Restore original routes
+        // Restore original routes — using the CURRENT addr, which
+        // may differ from the addr at on_failure time if the peer
+        // rebinds.
         for dest_id in &to_restore {
             self.routing_table.add_route(*dest_id, recovered_addr);
             self.saved_routes.remove(dest_id);
@@ -398,6 +427,102 @@ mod tests {
             restored, addr_b,
             "recovery must restore the true original next_hop (B), not a \
              previously chosen alternate"
+        );
+    }
+
+    // ========================================================================
+    // BUG #117: on_recovery must match by node_id, not next_hop addr,
+    // so NAT rebinds / reconnects on different ports still restore.
+    // ========================================================================
+
+    /// A peer fails, then recovers from a DIFFERENT SocketAddr (NAT
+    /// rebind, reconnect on different port, mobile network change).
+    /// `on_recovery` must restore the saved routes to the new addr.
+    /// Pre-fix the filter `entry.next_hop == recovered_addr` missed
+    /// because the saved `next_hop` held the OLD addr while
+    /// `recovered_addr` was the NEW one — no routes restored, and
+    /// the saved entry leaked.
+    #[test]
+    fn on_recovery_restores_routes_after_nat_rebind() {
+        let rt = make_routing_table();
+        let peers = Arc::new(DashMap::new());
+
+        let addr_b_old: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let addr_b_new: SocketAddr = "127.0.0.1:2999".parse().unwrap(); // post-rebind
+        let addr_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+
+        peers.insert(0x2222u64, addr_b_old);
+        peers.insert(0x3333u64, addr_c);
+
+        // Route to 0x5555 originally goes through B.
+        rt.add_route(0x5555, addr_b_old);
+
+        let policy = ReroutePolicy::new(rt.clone(), peers.clone());
+
+        // B fails — route is rerouted to C.
+        policy.on_failure(0x2222);
+        assert_eq!(
+            rt.lookup(0x5555).unwrap(),
+            addr_c,
+            "reroute must pick the alternate after failure"
+        );
+        assert_eq!(policy.active_reroutes(), 1);
+
+        // B comes back from a different SocketAddr (NAT rebind):
+        // peer_addrs now reflects the new addr.
+        peers.insert(0x2222u64, addr_b_new);
+        policy.on_recovery(0x2222);
+
+        // Pre-fix: nothing happens (filter on next_hop addr fails).
+        // Post-fix: the route is restored to the NEW addr because
+        //  the filter is on node_id, and the addr is re-resolved
+        //  from peer_addrs.
+        assert_eq!(
+            rt.lookup(0x5555).unwrap(),
+            addr_b_new,
+            "BUG #117: recovery after NAT rebind must restore the route to the NEW addr"
+        );
+        assert_eq!(
+            policy.active_reroutes(),
+            0,
+            "saved_routes entry must be dropped after recovery (no leak)"
+        );
+    }
+
+    /// Variant: peer fails, several saved routes through it, then
+    /// reconnects from a different addr — ALL saved routes must
+    /// restore. Pre-fix the addr-based filter missed all of them
+    /// and `saved_routes` leaked entries linearly with the number
+    /// of dest_ids that were ever rerouted through a NAT-changing
+    /// peer.
+    #[test]
+    fn on_recovery_restores_multiple_routes_after_nat_rebind() {
+        let rt = make_routing_table();
+        let peers = Arc::new(DashMap::new());
+
+        let addr_b_old: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let addr_b_new: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let addr_c: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+
+        peers.insert(0x2222u64, addr_b_old);
+        peers.insert(0x3333u64, addr_c);
+
+        rt.add_route(0x4444, addr_b_old);
+        rt.add_route(0x5555, addr_b_old);
+
+        let policy = ReroutePolicy::new(rt.clone(), peers.clone());
+        policy.on_failure(0x2222);
+        assert_eq!(policy.active_reroutes(), 2);
+
+        peers.insert(0x2222u64, addr_b_new);
+        policy.on_recovery(0x2222);
+
+        assert_eq!(rt.lookup(0x4444).unwrap(), addr_b_new);
+        assert_eq!(rt.lookup(0x5555).unwrap(), addr_b_new);
+        assert_eq!(
+            policy.active_reroutes(),
+            0,
+            "all saved_routes entries must be dropped after recovery",
         );
     }
 

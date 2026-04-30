@@ -218,13 +218,21 @@ impl IdentityEnvelope {
         let mut key = derive_key(shared.as_bytes(), KDF_DOMAIN_KEY);
         let nonce = derive_nonce(eph_pk.as_bytes(), &target_static_pub);
 
+        // BUG #127: bind `chain_link` to the AEAD via AAD so a
+        // tampered link breaks BOTH the attestation signature
+        // (already covered) AND the AEAD tag. Pre-fix used
+        // `aad: &[]`, leaving the chain_link bound only to the
+        // signature — an attacker who can swap the on-the-wire
+        // chain_link for a different one (and re-attest) didn't
+        // also break the AEAD, narrowing the verification surface.
+        let aad_bytes = chain_link.to_bytes();
         let aead = XChaCha20Poly1305::new((&key).into());
         let ciphertext = aead
             .encrypt(
                 (&nonce).into(),
                 Payload {
                     msg: &seed,
-                    aad: &[],
+                    aad: &aad_bytes,
                 },
             )
             .expect("XChaCha20Poly1305 encrypt with fresh key+nonce cannot fail on 32-byte msg");
@@ -260,20 +268,51 @@ impl IdentityEnvelope {
     /// Verify the attestation and unseal the sealed seed, returning
     /// a fresh full [`EntityKeypair`] reconstructed from the seed.
     ///
+    /// `expected_signer_pub`, when `Some`, asserts the envelope was
+    /// produced by the named source identity. The check fires
+    /// BEFORE any cryptographic work — an attacker who can inject
+    /// a substituted envelope built from THEIR keypair (with
+    /// `target_static_pub` set correctly to the actual target)
+    /// no longer reaches signature verification or AEAD decrypt
+    /// when the caller knows which source they expected. Pass
+    /// `None` for the legacy "primitive returns the keypair,
+    /// caller cross-checks" pattern; the existing snapshot path
+    /// uses the post-decrypt `kp.entity_id() != snapshot.entity_id`
+    /// cross-check (`state/snapshot.rs::open_identity_envelope`),
+    /// so passing `None` there is sound. New call sites should
+    /// pass `Some` whenever the expected source identity is known
+    /// up front. (BUG #127.)
+    ///
     /// # Errors
     ///
     /// - [`EnvelopeError::InvalidSignerKey`] if `signer_pub` is not
-    ///   a valid ed25519 point.
+    ///   a valid ed25519 point, OR (when `expected_signer_pub` is
+    ///   `Some`) if the envelope's `signer_pub` doesn't match.
     /// - [`EnvelopeError::InvalidAttestation`] if the attestation
     ///   signature does not verify against the transcript built from
     ///   `target_static_pub || chain_link`.
     /// - [`EnvelopeError::SealOpenFailed`] if the XChaCha AEAD fails
-    ///   (wrong target key, tampered ciphertext, etc.).
+    ///   (wrong target key, tampered ciphertext, tampered chain_link
+    ///   AAD post-fix, etc.).
     pub fn open(
         &self,
         target_static_priv: &X25519Secret,
         chain_link: &CausalLink,
+        expected_signer_pub: Option<&[u8; 32]>,
     ) -> Result<EntityKeypair, EnvelopeError> {
+        // Step 0 (BUG #127): early-reject if the caller knows
+        // which source identity they expected and this envelope's
+        // `signer_pub` doesn't match. Constant-time-ish compare not
+        // strictly needed (the field is public and an attacker
+        // can already inspect it), but avoiding the cryptographic
+        // work below for every wrong envelope is the load-bearing
+        // benefit.
+        if let Some(expected) = expected_signer_pub {
+            if &self.signer_pub != expected {
+                return Err(EnvelopeError::InvalidSignerKey);
+            }
+        }
+
         // Step 1: verify the attestation. We do this BEFORE
         // unsealing so a tampered envelope can't get anywhere near
         // the decryption path.
@@ -304,9 +343,20 @@ impl IdentityEnvelope {
         let mut key = derive_key(shared.as_bytes(), KDF_DOMAIN_KEY);
         let nonce = derive_nonce(eph_pk.as_bytes(), &self.target_static_pub);
 
+        // BUG #127: AAD must match what `seal` used so the AEAD
+        // tag binds the chain_link to the ciphertext. A tampered
+        // link will fail the signature check above AND the AEAD
+        // tag here.
+        let aad_bytes = chain_link.to_bytes();
         let aead = XChaCha20Poly1305::new((&key).into());
         let mut seed_vec = aead
-            .decrypt((&nonce).into(), Payload { msg: ct, aad: &[] })
+            .decrypt(
+                (&nonce).into(),
+                Payload {
+                    msg: ct,
+                    aad: &aad_bytes,
+                },
+            )
             .map_err(|_| EnvelopeError::SealOpenFailed)?;
         if seed_vec.len() != SEED_LEN {
             // Even on a length-mismatch error, scrub the buffer
@@ -511,7 +561,7 @@ mod tests {
         let link = chain_link_at(7);
 
         let env = IdentityEnvelope::new(&source, target_pk, &link).expect("seal");
-        let opened = env.open(&target_sk, &link).expect("open");
+        let opened = env.open(&target_sk, &link, None).expect("open");
 
         assert_eq!(opened.entity_id(), source.entity_id());
         assert_eq!(opened.origin_hash(), source.origin_hash());
@@ -531,7 +581,7 @@ mod tests {
         env.signature[0] ^= 0xFF;
 
         assert_eq!(
-            env.open(&target_sk, &link).expect_err("must reject"),
+            env.open(&target_sk, &link, None).expect_err("must reject"),
             EnvelopeError::InvalidAttestation,
         );
     }
@@ -548,7 +598,7 @@ mod tests {
         env.sealed_seed[40] ^= 0xFF;
 
         assert_eq!(
-            env.open(&target_sk, &link).expect_err("must reject"),
+            env.open(&target_sk, &link, None).expect_err("must reject"),
             EnvelopeError::SealOpenFailed,
         );
     }
@@ -564,7 +614,7 @@ mod tests {
         // `different_sk` is not the private key matching `target_pk`
         // — opening must refuse before even trying the AEAD.
         assert_eq!(
-            env.open(&different_sk, &link).expect_err("must reject"),
+            env.open(&different_sk, &link, None).expect_err("must reject"),
             EnvelopeError::SealOpenFailed,
         );
     }
@@ -581,10 +631,71 @@ mod tests {
         let env = IdentityEnvelope::new(&source, target_pk, &link).expect("seal");
         let later_link = chain_link_at(8);
         assert_eq!(
-            env.open(&target_sk, &later_link)
+            env.open(&target_sk, &later_link, None)
                 .expect_err("replay at later link must reject"),
             EnvelopeError::InvalidAttestation,
         );
+    }
+
+    /// BUG #127: when the caller passes `Some(expected)`, an
+    /// envelope built by a different source identity is rejected
+    /// EARLY (before any cryptographic work) with
+    /// `EnvelopeError::InvalidSignerKey`. Pre-fix the primitive
+    /// accepted any well-formed envelope and relied on the caller
+    /// to cross-check post-decrypt — a substituted envelope from
+    /// an attacker's keypair (with `target_static_pub` set
+    /// correctly) reached the AEAD decrypt path.
+    #[test]
+    fn seal_open_with_expected_signer_pub_rejects_substituted_envelope() {
+        let attacker = EntityKeypair::generate();
+        let expected = EntityKeypair::generate();
+        let (target_sk, target_pk) = fresh_x25519();
+        let link = chain_link_at(1);
+
+        // Attacker builds a perfectly-valid envelope to the actual
+        // target, but using THEIR keypair as the signer.
+        let env = IdentityEnvelope::new(&attacker, target_pk, &link).expect("seal");
+
+        // Caller knows it expected `expected`, not `attacker`.
+        let err = env
+            .open(&target_sk, &link, Some(expected.entity_id().as_bytes()))
+            .expect_err("substituted envelope must be rejected with expected_signer_pub");
+        assert_eq!(err, EnvelopeError::InvalidSignerKey);
+    }
+
+    /// `expected_signer_pub == None` preserves the legacy "primitive
+    /// returns the keypair, caller cross-checks" pattern — pins
+    /// the contract so callers like `state::snapshot::open_identity_envelope`
+    /// (which has its own post-decrypt cross-check on `entity_id`)
+    /// keep working.
+    #[test]
+    fn seal_open_with_none_expected_preserves_legacy_behavior() {
+        let source = EntityKeypair::generate();
+        let (target_sk, target_pk) = fresh_x25519();
+        let link = chain_link_at(1);
+
+        let env = IdentityEnvelope::new(&source, target_pk, &link).expect("seal");
+        let opened = env
+            .open(&target_sk, &link, None)
+            .expect("legacy None path must still succeed");
+        assert_eq!(opened.entity_id(), source.entity_id());
+    }
+
+    /// `expected_signer_pub == Some(matching)` succeeds — pins the
+    /// happy-path so a future tightening of the early-reject
+    /// (e.g. constant-time-compare drift) can't lock out
+    /// legitimate callers.
+    #[test]
+    fn seal_open_with_matching_expected_signer_pub_succeeds() {
+        let source = EntityKeypair::generate();
+        let (target_sk, target_pk) = fresh_x25519();
+        let link = chain_link_at(1);
+
+        let env = IdentityEnvelope::new(&source, target_pk, &link).expect("seal");
+        let opened = env
+            .open(&target_sk, &link, Some(source.entity_id().as_bytes()))
+            .expect("matching expected_signer_pub must succeed");
+        assert_eq!(opened.entity_id(), source.entity_id());
     }
 
     #[test]
@@ -604,7 +715,7 @@ mod tests {
         env.target_static_pub = target_pk_b;
 
         assert_eq!(
-            env.open(&target_sk_b, &link).expect_err("must reject"),
+            env.open(&target_sk_b, &link, None).expect_err("must reject"),
             EnvelopeError::InvalidAttestation,
         );
     }
@@ -633,7 +744,7 @@ mod tests {
         let link = chain_link_at(42);
 
         let env = IdentityEnvelope::new(&source, target_pk, &link).unwrap();
-        let opened = env.open(&target_sk, &link).unwrap();
+        let opened = env.open(&target_sk, &link, None).unwrap();
         assert_eq!(opened.entity_id().as_bytes(), &env.signer_pub);
     }
 }

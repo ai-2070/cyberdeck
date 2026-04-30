@@ -765,6 +765,25 @@ impl ShardMapper {
         match shard.state {
             ShardState::Active => return Ok(()),
             ShardState::Provisioning => {
+                // BUG #64: gate activation on
+                // `active_count < max_shards`. Pre-fix the budget
+                // gate at `check_scale_up_budget` only counted
+                // ALREADY-active shards — multiple
+                // `scale_up_provisioning(1)` calls could each pass
+                // (they don't bump `active_count`), and then each
+                // `activate` unconditionally `fetch_add(1)`'d past
+                // `max_shards`. Subsequent
+                // `evaluate_scaling`'s `max_shards - active_count`
+                // arithmetic underflowed u16 (debug-build panic;
+                // release wraps to ~65530). Now activate-time
+                // re-checks the budget with the lock held; the
+                // Provisioning shard stays in Provisioning state
+                // and the caller (e.g. `add_shard_internal`'s #75
+                // rollback) is responsible for tearing it down.
+                let current = self.active_count.load(AtomicOrdering::Acquire);
+                if current >= self.policy.max_shards {
+                    return Err(ScalingError::AtMaxShards);
+                }
                 shard.state = ShardState::Active;
             }
             ShardState::Draining | ShardState::Stopped => {
@@ -777,6 +796,8 @@ impl ShardMapper {
         drop(shards);
 
         // Bump active_count to mirror what `scale_up` would have done.
+        // The budget gate above ensures we can never push past
+        // `max_shards`.
         self.active_count.fetch_add(1, AtomicOrdering::Release);
 
         if let Some(callback) = self.on_shard_created.read().as_ref() {
@@ -1333,6 +1354,51 @@ mod tests {
             "should never exceed max_shards, got {}",
             mapper.active_shard_count()
         );
+    }
+
+    /// BUG #64: multiple `scale_up_provisioning(1)` calls must
+    /// never push `active_count` past `max_shards` via subsequent
+    /// `activate()` calls. Pre-fix the budget gate
+    /// (`check_scale_up_budget`) only counted ALREADY-active
+    /// shards, so several `scale_up_provisioning` calls could each
+    /// pass and then each `activate()` unconditionally bumped
+    /// `active_count` past the cap.
+    ///
+    /// Setup: at the budget edge, allocate two Provisioning shards
+    /// in sequence (both pass the gate because `active_count`
+    /// hasn't moved). The first `activate()` fills the budget;
+    /// the second must surface `AtMaxShards` rather than overflow.
+    #[test]
+    fn activate_rejects_when_active_count_would_exceed_max_shards() {
+        let policy = ScalingPolicy {
+            min_shards: 1,
+            max_shards: 4,
+            cooldown: Duration::from_nanos(1),
+            ..Default::default()
+        };
+        let mapper = ShardMapper::new(3, 1024, policy).unwrap();
+        // active_count = 3, max = 4. Allocate TWO Provisioning
+        // shards; both pass the budget gate (it sees active_count=3).
+        let ids_a = mapper.scale_up_provisioning(1).unwrap();
+        let ids_b = mapper.scale_up_provisioning(1).unwrap();
+        assert_eq!(ids_a.len(), 1);
+        assert_eq!(ids_b.len(), 1);
+
+        // First activate succeeds (active_count goes 3 → 4 = max).
+        mapper.activate(ids_a[0]).expect("first activate must succeed");
+        assert_eq!(mapper.active_shard_count(), 4);
+
+        // Second activate must REFUSE — it would push past max.
+        let err = mapper
+            .activate(ids_b[0])
+            .expect_err("second activate must reject (BUG #64)");
+        assert!(
+            matches!(err, ScalingError::AtMaxShards),
+            "expected AtMaxShards, got {:?}",
+            err
+        );
+        // active_count must still be at the cap, not over it.
+        assert_eq!(mapper.active_shard_count(), 4);
     }
 
     /// Two concurrent `scale_up(1)` calls must never both succeed
