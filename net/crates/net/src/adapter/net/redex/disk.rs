@@ -462,6 +462,36 @@ impl DiskSegment {
         self.sync_count.load(Ordering::Acquire)
     }
 
+    /// Test-only: lengths reported by the three worker-side file
+    /// handles. After a successful append, these must match the
+    /// on-disk file lengths — that's the proof the worker handles
+    /// share the same OS file as the appender handles
+    /// (`try_clone` correctness) and, after `compact_to`, that the
+    /// worker handles were re-cloned from the new appender handles
+    /// rather than left pointing at the temp-dir placeholder.
+    #[cfg(test)]
+    pub(super) fn worker_file_lens(&self) -> (u64, u64, u64) {
+        let dat = self
+            .worker_dat_file
+            .lock()
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let idx = self
+            .worker_idx_file
+            .lock()
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let ts = self
+            .worker_ts_file
+            .lock()
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(0);
+        (dat, idx, ts)
+    }
+
     /// Bump per-append and per-byte counters; if either crosses its
     /// configured threshold, notify the background fsync worker.
     /// The actual fsync runs off the appender thread; this returns
@@ -1806,6 +1836,177 @@ mod tests {
         }
         let ts = recovered.timestamps.expect("ts sidecar present");
         assert_eq!(ts, vec![100, 200, 300]);
+
+        cleanup(&base);
+    }
+
+    /// Worker-side file handles are cloned from the appender's via
+    /// `File::try_clone` so they share the same underlying OS file.
+    /// This is the contract that lets the background worker call
+    /// `sync_all` without holding the appender's mutex; if a
+    /// regression accidentally opened a separate file, the worker
+    /// would fsync the wrong descriptor and durability would
+    /// silently break.
+    ///
+    /// The check: after appending through the appender path, the
+    /// worker handles' `metadata().len()` must equal the on-disk
+    /// file length. Different File instances of the same OS file
+    /// see the same length; different files would not.
+    #[test]
+    fn test_worker_handles_share_os_file_with_appender() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/worker_share").unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+
+        let p1 = b"alpha";
+        let e1 = RedexEntry::new_heap(0, 0, p1.len() as u32, 0, payload_checksum(p1));
+        recovered.disk.append_entry(&e1, p1).unwrap();
+        let p2 = b"beta_payload";
+        let e2 = RedexEntry::new_heap(1, p1.len() as u32, p2.len() as u32, 0, payload_checksum(p2));
+        recovered.disk.append_entry(&e2, p2).unwrap();
+
+        // Worker handles must observe the same file lengths the
+        // appender just produced.
+        let (dat_w, idx_w, ts_w) = recovered.disk.worker_file_lens();
+        assert_eq!(
+            dat_w,
+            (p1.len() + p2.len()) as u64,
+            "worker dat handle must reflect the appender's heap writes"
+        );
+        assert_eq!(idx_w, 2 * REDEX_ENTRY_SIZE as u64);
+        assert_eq!(ts_w, 2 * 8);
+
+        // Cross-check against the on-disk files. If the worker
+        // handles pointed at separate files (regression scenario),
+        // these would diverge.
+        let dat_path = channel_dir(&base, &name).join("dat");
+        let idx_path = channel_dir(&base, &name).join("idx");
+        let ts_path = channel_dir(&base, &name).join("ts");
+        assert_eq!(dat_w, std::fs::metadata(&dat_path).unwrap().len());
+        assert_eq!(idx_w, std::fs::metadata(&idx_path).unwrap().len());
+        assert_eq!(ts_w, std::fs::metadata(&ts_path).unwrap().len());
+
+        // sync() goes through the worker handles. It must succeed
+        // without locking against the appender (the test runs
+        // single-threaded so we're really only confirming
+        // operational correctness here, not the no-contention
+        // property which lives in the bench).
+        recovered.disk.sync().unwrap();
+
+        cleanup(&base);
+    }
+
+    /// `compact_to` does a placeholder swap → atomic rename →
+    /// re-open of the appender handles; the worker handles must be
+    /// re-cloned from the new appender handles afterward, otherwise
+    /// they're left pointing at the temp-dir placeholder file. A
+    /// regression that forgot the re-clone would have `sync()`
+    /// silently fsync the placeholder instead of the channel files
+    /// — durable on close (the appender handles still work) but
+    /// not on the policy-driven worker path.
+    ///
+    /// The check: after `compact_to`, the worker handles' lengths
+    /// must equal the post-compaction file lengths. A subsequent
+    /// append through the appender then `sync()` then reopen must
+    /// round-trip both the surviving compacted entry and the new
+    /// post-compaction append.
+    #[test]
+    fn test_compact_to_re_clones_worker_handles() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/compact_workers").unwrap();
+        let recovered = DiskSegment::open(&base, &name, 0, 0).unwrap();
+
+        // Three heap appends with explicit timestamps so the
+        // surviving entry's ts is predictable.
+        let payloads: [&[u8]; 3] = [b"first_one", b"second_one", b"third_one_"];
+        let mut offset = 0u32;
+        for (i, p) in payloads.iter().enumerate() {
+            let e = RedexEntry::new_heap(i as u64, offset, p.len() as u32, 0, payload_checksum(p));
+            recovered
+                .disk
+                .append_entry_at(&e, p, 1_000 * (i as u64 + 1))
+                .unwrap();
+            offset += p.len() as u32;
+        }
+        recovered.disk.sync().unwrap();
+
+        // Compact down to the third entry only. `compact_to`
+        // rewrites its `payload_offset` to be relative to the new
+        // dat file (so 0 in the compacted file).
+        let third_dat_base = (payloads[0].len() + payloads[1].len()) as u64;
+        let surviving = vec![RedexEntry::new_heap(
+            2,
+            third_dat_base as u32,
+            payloads[2].len() as u32,
+            0,
+            payload_checksum(payloads[2]),
+        )];
+        let surviving_ts = vec![3_000u64];
+        recovered
+            .disk
+            .compact_to(&surviving, &surviving_ts, third_dat_base)
+            .unwrap();
+
+        // Worker handles must now reflect the compacted file sizes,
+        // not the placeholder (which had size 0). This is the
+        // direct probe for the re-clone in `compact_to`.
+        let dat_path = channel_dir(&base, &name).join("dat");
+        let idx_path = channel_dir(&base, &name).join("idx");
+        let ts_path = channel_dir(&base, &name).join("ts");
+        let on_disk_dat = std::fs::metadata(&dat_path).unwrap().len();
+        let on_disk_idx = std::fs::metadata(&idx_path).unwrap().len();
+        let on_disk_ts = std::fs::metadata(&ts_path).unwrap().len();
+        assert_eq!(on_disk_dat, payloads[2].len() as u64, "sanity");
+        assert_eq!(on_disk_idx, REDEX_ENTRY_SIZE as u64, "sanity");
+        assert_eq!(on_disk_ts, 8, "sanity");
+        let (dat_w, idx_w, ts_w) = recovered.disk.worker_file_lens();
+        assert_eq!(
+            dat_w, on_disk_dat,
+            "worker dat handle must point at the compacted dat file, \
+             not the placeholder"
+        );
+        assert_eq!(
+            idx_w, on_disk_idx,
+            "worker idx handle must point at the compacted idx file"
+        );
+        assert_eq!(
+            ts_w, on_disk_ts,
+            "worker ts handle must point at the compacted ts file"
+        );
+
+        // Append a new entry through the appender; with the worker
+        // handles re-cloned correctly, `sync()` flushes the right
+        // file and the post-compact append is durable across reopen.
+        let new_payload = b"after_compact";
+        let new_entry = RedexEntry::new_heap(
+            99,
+            on_disk_dat as u32,
+            new_payload.len() as u32,
+            0,
+            payload_checksum(new_payload),
+        );
+        recovered
+            .disk
+            .append_entry_at(&new_entry, new_payload, 4_000)
+            .unwrap();
+        recovered.disk.sync().unwrap();
+
+        drop(recovered);
+        let recovered2 = DiskSegment::open(&base, &name, 0, 0).unwrap();
+        let seqs: Vec<u64> = recovered2.index.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![2, 99],
+            "post-compact reopen must show the surviving entry and \
+             the post-compaction append"
+        );
+        let ts = recovered2.timestamps.expect("ts sidecar present");
+        assert_eq!(
+            ts,
+            vec![3_000, 4_000],
+            "timestamps must pair with the right index records after \
+             compaction + post-compact append"
+        );
 
         cleanup(&base);
     }
