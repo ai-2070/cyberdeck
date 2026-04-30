@@ -694,6 +694,85 @@ mod tests {
         );
     }
 
+    // ========================================================================
+    // BUG #141: Stop policy must skip-and-continue on per-event Decode errors
+    // ========================================================================
+
+    struct FailDecodeAtSeq(u64);
+    impl RedexFold<u64> for FailDecodeAtSeq {
+        fn apply(&mut self, ev: &RedexEvent, state: &mut u64) -> Result<(), RedexError> {
+            if ev.entry.seq == self.0 {
+                // Decode-class error: simulates a corrupt postcard
+                // tail / EventMeta shape mismatch / checksum miss
+                // — exactly what the cortex fold paths surface as
+                // RedexError::Decode after BUG #141.
+                Err(RedexError::Decode(format!(
+                    "deliberate decode failure at seq {}",
+                    ev.entry.seq
+                )))
+            } else {
+                *state += 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// Under `Stop` policy, a `RedexError::Decode` MUST NOT halt
+    /// the fold task — it's a per-event recoverable failure
+    /// (corrupt event payload past the 32-bit checksum, or an
+    /// attacker-crafted matching collision). Pre-fix this hung
+    /// the task on the first bad event, DoSing the cortex via one
+    /// payload. Post-fix: the bad event is logged + skipped, the
+    /// watermark advances, and subsequent events still fold.
+    #[tokio::test]
+    async fn stop_policy_skips_recoverable_decode_error() {
+        let redex = Redex::new();
+        let adapter = CortexAdapter::<u64>::open(
+            &redex,
+            &cn("cortex/decode-skip"),
+            RedexFileConfig::default(),
+            CortexAdapterConfig::default(), // Stop is default
+            FailDecodeAtSeq(3),
+            0u64,
+        )
+        .unwrap();
+
+        for i in 0..10u64 {
+            let meta = EventMeta::new(0, 0, 0, i, 0);
+            let env = EventEnvelope::new(meta, Bytes::from_static(b""));
+            let seq = adapter.ingest(env).unwrap();
+            adapter.wait_for_seq(seq).await;
+        }
+
+        // Fold task is still running — the decode error didn't
+        // halt it. fold_errors counts the one bad event.
+        assert!(
+            adapter.is_running(),
+            "Stop policy must NOT halt on RedexError::Decode (BUG #141)"
+        );
+        assert_eq!(adapter.fold_errors(), 1);
+        // Seqs 0,1,2,4,5,6,7,8,9 folded; seq 3 skipped.
+        assert_eq!(*adapter.state().read(), 9);
+    }
+
+    /// `Encode` errors (storage / user-fold-level) STILL halt
+    /// under `Stop` — pins the conservative boundary so the BUG
+    /// #141 carve-out is strictly limited to per-event decode
+    /// failures. The pre-existing `test_stop_policy_halts_on_first_error`
+    /// already exercises this with `RedexError::Encode`, but we
+    /// pin the contract explicitly here so a future expansion of
+    /// `is_recoverable_decode` (e.g. accidentally including
+    /// `Encode`) is caught.
+    #[test]
+    fn redex_error_recoverable_decode_classification_is_decode_only() {
+        assert!(RedexError::Decode("x".into()).is_recoverable_decode());
+        assert!(!RedexError::Encode("x".into()).is_recoverable_decode());
+        assert!(!RedexError::Closed.is_recoverable_decode());
+        assert!(!RedexError::Io("x".into()).is_recoverable_decode());
+        assert!(!RedexError::Lagged.is_recoverable_decode());
+        assert!(!RedexError::Unauthorized.is_recoverable_decode());
+    }
+
     /// `FromSeq(0)` is equivalent to `FromBeginning` (no events
     /// skipped) and must still be accepted — pins the boundary so
     /// the BUG #134 guard doesn't accidentally lock out the

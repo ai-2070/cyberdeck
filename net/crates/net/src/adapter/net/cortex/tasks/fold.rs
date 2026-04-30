@@ -17,25 +17,32 @@ pub struct TasksFold;
 
 impl RedexFold<TasksState> for TasksFold {
     fn apply(&mut self, ev: &RedexEvent, state: &mut TasksState) -> Result<(), RedexError> {
+        // BUG #141: per-event decode failures use `RedexError::Decode`
+        // (a recoverable variant the fold-error-policy interpreter
+        // treats as skip-and-continue even under `Stop`). Pre-fix
+        // these all returned `Encode`, which halts the fold task
+        // under `Stop` — a single corrupt event could wedge the
+        // fold task forever, DoSing a multi-tenant cortex via one
+        // bad event past the 32-bit checksum (#135). User-level
+        // fold errors and storage-side encode failures still use
+        // `Encode` and properly halt under `Stop`.
         if ev.payload.len() < EVENT_META_SIZE {
-            return Err(RedexError::Encode(format!(
+            return Err(RedexError::Decode(format!(
                 "tasks payload too short: {} bytes (need >= {})",
                 ev.payload.len(),
                 EVENT_META_SIZE
             )));
         }
         let meta = EventMeta::from_bytes(&ev.payload[..EVENT_META_SIZE])
-            .ok_or_else(|| RedexError::Encode("bad EventMeta prefix".into()))?;
+            .ok_or_else(|| RedexError::Decode("bad EventMeta prefix".into()))?;
         let tail = &ev.payload[EVENT_META_SIZE..];
 
         // Verify the checksum stamped at ingest against the tail we
         // received from RedEX. Catches disk corruption, tampered
-        // on-disk files, and truncated tails. Under
-        // `FoldErrorPolicy::Stop` this halts the fold task; under
-        // `LogAndContinue` the event is counted and skipped.
+        // on-disk files, and truncated tails.
         let expected = compute_checksum(tail);
         if meta.checksum != expected {
-            return Err(RedexError::Encode(format!(
+            return Err(RedexError::Decode(format!(
                 "tasks fold: EventMeta checksum mismatch at seq {} (got {:#010x}, tail hashes to {:#010x})",
                 ev.entry.seq, meta.checksum, expected
             )));
@@ -44,7 +51,7 @@ impl RedexFold<TasksState> for TasksFold {
         match meta.dispatch {
             DISPATCH_TASK_CREATED => {
                 let p: TaskCreatedPayload =
-                    postcard::from_bytes(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
                 state.tasks.insert(
                     p.id,
                     Task {
@@ -58,7 +65,7 @@ impl RedexFold<TasksState> for TasksFold {
             }
             DISPATCH_TASK_RENAMED => {
                 let p: TaskRenamedPayload =
-                    postcard::from_bytes(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
                 if let Some(t) = state.tasks.get_mut(&p.id) {
                     t.title = p.new_title;
                     t.updated_ns = p.now_ns;
@@ -69,7 +76,7 @@ impl RedexFold<TasksState> for TasksFold {
             }
             DISPATCH_TASK_COMPLETED => {
                 let p: TaskCompletedPayload =
-                    postcard::from_bytes(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
                 if let Some(t) = state.tasks.get_mut(&p.id) {
                     t.status = TaskStatus::Completed;
                     t.updated_ns = p.now_ns;
@@ -77,7 +84,7 @@ impl RedexFold<TasksState> for TasksFold {
             }
             DISPATCH_TASK_DELETED => {
                 let p: TaskDeletedPayload =
-                    postcard::from_bytes(tail).map_err(|e| RedexError::Encode(e.to_string()))?;
+                    postcard::from_bytes(tail).map_err(|e| RedexError::Decode(e.to_string()))?;
                 state.tasks.remove(&p.id);
             }
             other => {
