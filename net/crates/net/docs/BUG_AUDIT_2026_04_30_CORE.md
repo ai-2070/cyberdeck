@@ -933,6 +933,21 @@ Tests:
 
 **Fix:** `ShardManager::ingest_raw_batch` now returns `(success, unrouted)`; the bus subtracts `unrouted` from the buffer-fullness drop count. See the **Fixed on 2026-04-30** block above.
 
+### 157. `EventBusStats::batches_dispatched` declared but never incremented; `flush()`'s Phase 2 barrier raced the BatchWorker's first timeout — **[FIXED 2026-05-01]**
+**File:** `bus.rs::EventBusStats` + `flush()` (Phase 2)
+
+Pre-fix the `batches_dispatched: AtomicU64` field on `EventBusStats` was declared but never written anywhere — `record_batch_dispatch` only bumped the SHARD-level counter (`shard/mod.rs:275`), never the bus-level one. `flush()`'s Phase 2 progress probe (BUG #76 fix) read `self.stats.batches_dispatched` and gated the early-break on "did the counter advance this `max_delay` window?". The counter NEVER advanced, so `dispatched_progress` was always `false`, and Phase 2 always early-broke after a single `max_delay` sleep — race-narrow against the BatchWorker's first `recv_timeout`. On Windows-class timer resolution (~15 ms granularity) `flush_is_a_delivery_barrier` flaked frequently across the audit pass; on Linux multi-threaded runtimes it was less common but still observable.
+
+**Fix (two-part):**
+
+1. *Wire up the counters.* `EventBusStats` gains a companion `events_dispatched` field (sum of batch lengths from successful dispatches). Both counters are now incremented from the BatchWorker spawn after every successful `dispatch_batch`, and from `remove_shard_internal`'s stranded-flush path (BUG #153 fix's dispatch site). Stats are now wrapped in `Arc<EventBusStats>` so the spawn task can hold a clone — the `EventBus::stats()` accessor is unchanged from the caller's perspective (returns `&EventBusStats` via `Arc` deref). `BatchWorkerParams` carries the `Arc<EventBusStats>` clone.
+
+2. *Replace Phase 2's progress heuristic with an actual delivery barrier.* Pre-fix Phase 2 read a "no-progress this window" signal — even with the counters now wired up, that signal can race the BatchWorker's first timeout (Phase 2's first sleep window can elapse before the worker's `batch_start + max_delay` timer fires, particularly when the worker received its first events just as flush() entered Phase 2). Post-fix Phase 2 snapshots `events_ingested` at flush entry and polls until `events_dispatched + (events_dropped - dropped_at_start) >= target`, with a 1 ms / `max_delay/16` poll cadence (whichever is larger) and the existing `max_delay * num_workers` deadline as the fallback. The new barrier is the actual semantic the test pins — "every pre-flush ingest is accounted for" — not a timing approximation of it.
+
+Tests:
+- New regression `bus::tests::dispatch_increments_bus_level_event_and_batch_counters` directly pins that both counters increment on dispatch (a future refactor dropping either increment fails this test, not the timing-sensitive `flush_is_a_delivery_barrier`).
+- The pre-existing `flush_is_a_delivery_barrier` was the original flake; it now passes 20+ consecutive runs locally on Windows.
+
 ### 156. `RingBuffer` SPSC tripwire pinned the first OS thread to ever push/pop, false-firing on tokio task migration — **[FIXED 2026-05-01]**
 **File:** `shard/ring_buffer.rs:96-111` (was `producer_thread` / `consumer_thread`)
 
