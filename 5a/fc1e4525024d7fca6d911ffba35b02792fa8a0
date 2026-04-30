@@ -1,0 +1,27 @@
+net/crates/net/src/adapter/net/redex/file.rs
+  3b00aa059b4a8250 146-153,155,251-289,1770-1901
+net/crates/net/src/adapter/net/redex/config.rs
+  3b00aa059b4a8250 16,20-21,42-60
+net/crates/net/src/adapter/net/redex/disk.rs
+  3b00aa059b4a8250 80,82-86,90-100,133-139,144,366,368,391-395,397-423,425-431,581-586,730-731,757-762,1081,1098,1113,1120,1136,1151,1204,1277,1342,1391,1432,1479,1503,1530,1592,1610,1651,1668
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "5afc1e4525024d7fca6d911ffba35b02792fa8a0",
+  "prompts": {
+    "3b00aa059b4a8250": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e663fe89-01fb-417f-a16e-c34e9a5214c7",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 1978,
+      "total_deletions": 64,
+      "accepted_lines": 300,
+      "overriden_lines": 0
+    }
+  }
+}
