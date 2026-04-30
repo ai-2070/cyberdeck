@@ -55,41 +55,17 @@ pub struct JetStreamAdapter {
     streams: Mutex<HashMap<u16, Arc<OnceCell<Stream>>>>,
     /// Whether the adapter has been initialized.
     initialized: AtomicBool,
-    /// Per-process nonce woven into `Nats-Msg-Id` so a restarted
-    /// producer cannot collide with the prior process's
-    /// `(shard_id, sequence_start, i)` triple within JetStream's
-    /// dedup window. `BatchWorker::next_sequence` resets to 0 on
-    /// restart; if the prior process published `shard:0:0…` within
-    /// the dedup window (default 2 min), the new process's first
-    /// batches were discarded as duplicates. The nonce is sampled
-    /// once at adapter construction from the system clock; a
-    /// UUIDv7-style 64-bit value would also work but adds a dep we
-    /// don't need for the uniqueness window.
-    process_nonce: u64,
 }
 
 impl JetStreamAdapter {
     /// Create a new JetStream adapter.
     pub fn new(config: JetStreamAdapterConfig) -> Result<Self, AdapterError> {
-        // Derive a per-process nonce from the wall clock (in nanos)
-        // XOR'd with the process id. This is unique-enough to avoid
-        // msg-id collisions within JetStream's dedup window across
-        // restarts. Two processes launched within a single tick would
-        // still collide on the time-only component, hence the pid
-        // mix-in.
-        let now_nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        let process_nonce = now_nanos ^ (std::process::id() as u64);
-
         Ok(Self {
             client: None,
             jetstream: None,
             config,
             streams: Mutex::new(HashMap::new()),
             initialized: AtomicBool::new(false),
-            process_nonce,
         })
     }
 
@@ -296,10 +272,7 @@ impl Adapter for JetStreamAdapter {
         // prior incarnation's `shard:0:0…` ids and the new batches
         // were silently discarded.
         // Use the batch's process_nonce — globally consistent
-        // across all adapters in this process. The adapter's own
-        // `process_nonce` field still exists as a fallback for
-        // pre-Batch-nonce code paths but the canonical source is
-        // `batch.process_nonce`.
+        // across all adapters in this process.
         let mut acks = Vec::with_capacity(serialized.len());
         let mut msg_id_buf = String::new();
         let _ = write!(

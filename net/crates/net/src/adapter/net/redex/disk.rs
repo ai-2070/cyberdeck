@@ -273,7 +273,7 @@ impl DiskSegment {
         // operators know age-retention is degraded for this run.
         let ts_path = dir.join("ts");
         let timestamps = read_timestamps(&ts_path, index.len())?;
-        if timestamps.is_some() && index.len() > 0 {
+        if timestamps.is_some() && !index.is_empty() {
             // We're going to truncate the ts file alongside the
             // idx truncation we just did, so they stay in sync.
             // (If `idx_len_truncated` rolled the index back, the
@@ -374,6 +374,7 @@ impl DiskSegment {
         self.append_entry_inner(entry, payload, timestamp_ns)
     }
 
+    #[allow(dead_code)]
     pub(super) fn append_entry(
         &self,
         entry: &RedexEntry,
@@ -742,19 +743,19 @@ impl DiskSegment {
             .create(true)
             .write(true)
             .truncate(false)
-            .open(&self.dir.join(".compact-placeholder-idx"))
+            .open(self.dir.join(".compact-placeholder-idx"))
             .map_err(RedexError::io)?;
         let null_dat = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
-            .open(&self.dir.join(".compact-placeholder-dat"))
+            .open(self.dir.join(".compact-placeholder-dat"))
             .map_err(RedexError::io)?;
         let null_ts = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
-            .open(&self.dir.join(".compact-placeholder-ts"))
+            .open(self.dir.join(".compact-placeholder-ts"))
             .map_err(RedexError::io)?;
         *idx_guard = null_idx;
         *dat_guard = null_dat;

@@ -935,7 +935,6 @@ impl SafetyEnforcer {
                     }
                 })
                 .map(|_| ())
-                .map_err(|cur| cur)
         }
 
         // 1. Concurrent slots.

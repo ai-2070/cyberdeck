@@ -204,7 +204,7 @@ impl ForkRecord {
 
     /// Deserialize without `verify()`. Useful for diagnostics
     /// (e.g. inspecting a malformed record before deciding what
-    /// to do); production callers should prefer [`from_bytes`].
+    /// to do); production callers should prefer [`Self::from_bytes`].
     pub fn from_bytes_unchecked(data: &[u8]) -> Option<Self> {
         if data.len() != Self::WIRE_SIZE {
             return None;

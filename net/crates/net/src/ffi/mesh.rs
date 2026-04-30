@@ -156,19 +156,20 @@ fn runtime() -> &'static Arc<Runtime> {
     })
 }
 
-/// `'a` is now bound to the lifetime of an input reference (`&p`)
-/// so the caller cannot pick `'static` and produce a dangling
-/// borrow. The borrow lives only as long as the local stack frame
-/// holding the pointer — which is the caller's responsibility to
-/// keep valid for the duration of any resulting `&str` use, but no
-/// longer. Compare `cortex.rs::c_str_to_owned` which sidesteps the
-/// issue entirely by returning `Option<String>`.
+/// The output borrow's lifetime is tied (via Rust's elision rules)
+/// to the input reference's lifetime, so the caller cannot pick
+/// `'static` and produce a dangling borrow. The borrow lives only
+/// as long as the local stack frame holding the pointer — which is
+/// the caller's responsibility to keep valid for the duration of
+/// any resulting `&str` use, but no longer. Compare
+/// `cortex.rs::c_str_to_owned` which sidesteps the issue entirely
+/// by returning `Option<String>`.
 ///
 /// # Safety
 /// Caller must ensure `p` is null or points to a NUL-terminated C
 /// string valid for at least the duration of the returned `&str`.
 #[inline]
-unsafe fn c_str_to_str<'a>(p: &'a *const c_char) -> Option<&'a str> {
+unsafe fn c_str_to_str(p: &*const c_char) -> Option<&str> {
     if p.is_null() {
         return None;
     }

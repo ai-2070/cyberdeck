@@ -1962,8 +1962,8 @@ mod tests {
         // this acquires `shards.read()` while finalize_draining
         // still holds `shards.write()`, deadlocking on parking_lot's
         // non-recursive RwLock.
-        let observed_states: Arc<Mutex<Vec<(u16, Option<ShardState>)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        type Observation = (u16, Option<ShardState>);
+        let observed_states: Arc<Mutex<Vec<Observation>>> = Arc::new(Mutex::new(Vec::new()));
         {
             let mapper_for_cb = Arc::clone(&mapper);
             let observed = Arc::clone(&observed_states);

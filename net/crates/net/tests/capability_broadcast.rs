@@ -192,6 +192,7 @@ async fn migration_identity_context_unseals_envelope_without_exposing_key() {
         created_at: 0,
         bindings_bytes: Vec::new(),
         identity_envelope: Some(envelope),
+        head_payload: bytes::Bytes::new(),
     };
 
     // Unseal via B's migration-identity context. The private key

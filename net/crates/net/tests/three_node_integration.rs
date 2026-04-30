@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use net::adapter::net::{NetAdapterConfig, StaticKeypair};
 use net::adapter::Adapter;
-use net::event::{Batch, InternalEvent};
+use net::event::{batch_process_nonce, Batch, InternalEvent};
 use tokio::net::UdpSocket;
 use tokio::sync::Barrier;
 
@@ -238,6 +238,7 @@ fn make_batch(shard_id: u16, count: usize, tag: &str) -> Batch {
         shard_id,
         events,
         sequence_start: 0,
+        process_nonce: batch_process_nonce(),
     }
 }
 
@@ -1275,6 +1276,7 @@ async fn test_eventbus_bidirectional_over_net() {
                 shard_id: 0,
                 events,
                 sequence_start: 0,
+                process_nonce: batch_process_nonce(),
             })
             .await
             .expect("B send failed");
