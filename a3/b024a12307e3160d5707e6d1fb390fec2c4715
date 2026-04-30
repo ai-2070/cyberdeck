@@ -1,0 +1,49 @@
+net/crates/net/src/adapter/net/netdb/db.rs
+  36b642b129ab4a5e 204,208,214,244,248-260,265-266,272-276
+net/crates/net/src/adapter/net/cortex/tasks/adapter.rs
+  36b642b129ab4a5e 17-18,63-71,80-88,93,103-104,110,113-124,128,288-290,303,308,320-328,334,339-342,344-346,352
+net/crates/net/tests/integration_cortex_memories.rs
+  36b642b129ab4a5e 515-595
+net/crates/net/bindings/python/src/cortex.rs
+  36b642b129ab4a5e 536-538,570,999,1031
+net/crates/net/src/ffi/cortex.rs
+  36b642b129ab4a5e 497-499,979
+net/crates/net/docs/BUG_AUDIT_2026_04_30_CORE.md
+  36b642b129ab4a5e 34,870-871,873-882
+net/crates/net/sdk/tests/cortex_surface.rs
+  36b642b129ab4a5e 23,43-44,64,94,112
+net/crates/net/benches/cortex.rs
+  36b642b129ab4a5e 48-50,61-63,100-104,116-120,143-145,161-163,325-332
+net/crates/net/tests/integration_cortex_tasks.rs
+  36b642b129ab4a5e 684-781
+net/crates/net/bindings/node/src/cortex.rs
+  36b642b129ab4a5e 596,622,1072,1097,1427,1438,1467,1470,1489,1492
+net/crates/net/src/adapter/net/cortex/watermark.rs
+  36b642b129ab4a5e 1-103
+net/crates/net/src/adapter/net/cortex/memories/adapter.rs
+  36b642b129ab4a5e 17-18,65-70,78-86,90,100-101,107,110-121,125,265-267,280,285,300-307,313,319-321,327
+net/crates/net/src/adapter/net/cortex/mod.rs
+  36b642b129ab4a5e 25-26
+net/crates/net/tests/integration_netdb.rs
+  36b642b129ab4a5e 25,39,53,75,127,205,234,269,283,298,335-336,348
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "a3b024a12307e3160d5707e6d1fb390fec2c4715",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 8318,
+      "total_deletions": 10627,
+      "accepted_lines": 505,
+      "overriden_lines": 0
+    }
+  }
+}
