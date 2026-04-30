@@ -926,6 +926,18 @@ impl ShardMapper {
     /// Check draining shards and finalize those that are empty.
     ///
     /// Returns IDs of shards that were stopped.
+    ///
+    /// BUG #154 note: this predicate looks ONLY at the ring buffer
+    /// (`current_len` + `pushes_since_drain_start`); it does NOT
+    /// probe the per-shard mpsc channel or the BatchWorker's
+    /// `current_batch`. A shard that the predicate flags as empty
+    /// can still have events queued in those two places. The
+    /// correctness gate is therefore `bus::remove_shard_internal`,
+    /// which awaits the BatchWorker's `JoinHandle` before
+    /// constructing the stranded-flush batch — see that function's
+    /// step 3 for the rationale. Tightening this predicate is a
+    /// defense-in-depth follow-up; a stricter ring-buffer-empty
+    /// signal here would only narrow an already-closed window.
     pub fn finalize_draining(&self) -> Vec<u16> {
         let mut shards = self.shards.write();
         let mut stopped = Vec::new();

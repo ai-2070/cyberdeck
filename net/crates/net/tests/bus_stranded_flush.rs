@@ -33,7 +33,6 @@
 //! distinguish "batch was delivered" from "batch was deduped" and
 //! pin both fixes directly.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,22 +53,21 @@ struct BatchObservation {
     len: usize,
 }
 
+type BatchHandle = Arc<Mutex<Vec<BatchObservation>>>;
+type MsgIdHandle = Arc<Mutex<Vec<(u16, u64, usize)>>>;
+
 /// Adapter that records every batch verbatim and emits a
 /// `(shard_id, sequence_start, i)` "msg-id" tuple per event so the
 /// test can detect collisions the same way JetStream's dedup window
 /// would.
 #[derive(Clone)]
 struct RecordingAdapter {
-    batches: Arc<Mutex<Vec<BatchObservation>>>,
-    msg_ids: Arc<Mutex<Vec<(u16, u64, usize)>>>,
+    batches: BatchHandle,
+    msg_ids: MsgIdHandle,
 }
 
 impl RecordingAdapter {
-    fn new() -> (
-        Self,
-        Arc<Mutex<Vec<BatchObservation>>>,
-        Arc<Mutex<Vec<(u16, u64, usize)>>>,
-    ) {
+    fn new() -> (Self, BatchHandle, MsgIdHandle) {
         let batches = Arc::new(Mutex::new(Vec::new()));
         let msg_ids = Arc::new(Mutex::new(Vec::new()));
         (
@@ -296,6 +294,117 @@ async fn events_in_flight_at_finalize_reach_adapter() {
         ids.len(),
         "duplicate msg-id tuples observed during in-flight finalize — \
          BatchWorker's pending batch raced with stranded-flush (BUG #153 + #154)",
+    );
+}
+
+/// `SlowRecordingAdapter` sleeps for `delay` inside `on_batch`,
+/// which lets the BatchWorker's mpsc channel back up + lets events
+/// pile in the ring buffer while a scale-down is in flight. This
+/// is what actually exercises the stranded-flush code path —
+/// without it, the ring buffer drains so quickly that
+/// `remove_shard()` returns an empty `stranded` `Vec` and
+/// `remove_shard_internal` never builds a stranded batch at all.
+struct SlowRecordingAdapter {
+    inner: RecordingAdapter,
+    delay: Duration,
+}
+
+#[async_trait]
+impl Adapter for SlowRecordingAdapter {
+    async fn init(&mut self) -> Result<(), AdapterError> {
+        Ok(())
+    }
+    async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.on_batch(batch).await
+    }
+    async fn flush(&self) -> Result<(), AdapterError> {
+        self.inner.flush().await
+    }
+    async fn shutdown(&self) -> Result<(), AdapterError> {
+        self.inner.shutdown().await
+    }
+    async fn poll_shard(
+        &self,
+        _shard_id: u16,
+        _from_id: Option<&str>,
+        _limit: usize,
+    ) -> Result<ShardPollResult, AdapterError> {
+        Ok(ShardPollResult::empty())
+    }
+    fn name(&self) -> &'static str {
+        "slow_recording"
+    }
+}
+
+/// Pin BUG #153 + #154 directly by *forcing* the stranded-flush path
+/// to run with a non-empty `stranded` Vec. The slow adapter backs
+/// up the BatchWorker's mpsc channel, which backs up the drain
+/// worker, which leaves events sitting in the ring buffer at the
+/// moment of `remove_shard()`. The fix's `final_next_sequence` read
+/// MUST be strictly past every `(shard_id, sequence_start, i)` the
+/// worker emitted before exit.
+///
+/// Without the fix this test fails: the stranded batch's msg-ids
+/// (`sequence_start = 0`) collide with the worker's first batch's
+/// msg-ids — duplicates show up in `msg_ids`.
+#[tokio::test]
+async fn stranded_flush_with_real_stranded_events_uses_post_worker_sequence() {
+    let (recording, batches, msg_ids) = RecordingAdapter::new();
+    let slow = SlowRecordingAdapter {
+        inner: recording,
+        delay: Duration::from_millis(5),
+    };
+
+    let policy = ScalingPolicy {
+        min_shards: 1,
+        max_shards: 16,
+        cooldown: Duration::from_nanos(1),
+        ..Default::default()
+    };
+    let config = EventBusConfig::builder()
+        .num_shards(2)
+        .ring_buffer_capacity(2048)
+        .scaling(policy)
+        .build()
+        .unwrap();
+
+    let bus = EventBus::new_with_adapter(config, Box::new(slow))
+        .await
+        .unwrap();
+
+    let added = bus.manual_scale_up(2).await.unwrap();
+    assert_eq!(added.len(), 2);
+
+    // Push events very rapidly. With the slow adapter (5 ms per
+    // batch), the BatchWorker's 1024-slot mpsc channel backs up,
+    // the drain worker stalls on `sender.send().await`, and events
+    // queue up in the ring buffer. By the time `manual_scale_down`
+    // runs, the marked-Draining shard has both:
+    //   - emitted batches with sequence_starts 0, k, 2k, … (worker
+    //     sequence advances on every flush)
+    //   - leftover events in the ring buffer (stranded)
+    for i in 0..5_000u64 {
+        let _ = bus.ingest(Event::new(json!({"i": i})));
+    }
+
+    let _ = bus.manual_scale_down(2).await.unwrap();
+    bus.shutdown().await.unwrap();
+
+    // Verify there are NO duplicate msg-ids — the stranded batch's
+    // sequence_start was past the worker's emitted ones.
+    let ids = msg_ids.lock().clone();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        ids.len(),
+        "duplicate msg-id tuples observed in stranded-flush path \
+         (BUG #153). Total batches: {}, total msg-ids: {}, unique: {}",
+        batches.lock().len(),
+        ids.len(),
+        sorted.len(),
     );
 }
 
