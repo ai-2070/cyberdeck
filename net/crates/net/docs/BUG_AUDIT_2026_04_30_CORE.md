@@ -23,7 +23,11 @@ Extended scope (#97 onward): a third multi-agent sweep covered the remaining UDP
 
 ## Status (running tally)
 
-**Outstanding:** #55, #56, #57, #58, #59, #60, #61, #62, #63, #64, #65, #66, #67, #68, #69, #70, #71, #72, #73, #74, #75, #76, #77, #78, #79, #80, #81, #82, #83, #84, #85, #86, #87, #88, #89, #90, #91, #92, #93, #94, #95, #96, #97, #98, #99, #100, #101, #102, #103, #104, #105, #106, #107, #108, #109, #110, #111, #112, #113, #114, #115, #116, #117, #118, #119, #120
+**Outstanding:** #55, #56, #57, #58, #59, #60, #61, #62, #63, #64, #65, #66, #67, #68, #69, #70, #71, #72, #73, #74, #75, #76, #77, #78, #79, #80, #81, #82, #83, #84, #85, #86, #87, #88, #89, #90, #91, #92, #93, #94, #95, #97, #98, #99, #100, #101, #102, #103, #104, #105, #106, #107, #108, #109, #110, #111, #112, #113, #114, #115, #116, #117, #118, #119, #120
+
+**Refuted on verification:** #96 (`read_timestamps` torn-tail alignment — alignment is preserved by construction, see entry).
+
+**Verified (read end-to-end on 2026-04-30):** #80, #81, #82, #83, #85, #86, #87, #88, #89, #90, #91, #92, #93, #94, #95. #84 was found to be **mis-located** — the cited code is correct; the bug is at the upstream caller `mesh.rs:3000-3008` (see entry).
 
 ## High
 
@@ -80,22 +84,34 @@ The user does receive an `Err` (not a silent return), but the `Err(_)` arm **dro
 
 The mesh-FFI side has an explicit regression test (`net_mesh_shutdown_runs_even_with_outstanding_arc_refs`) for this exact pattern; the SDK still has the legacy gating. Mirror the FFI fix: signal shutdown via a flag on the inner `Arc` rather than gating on `try_unwrap`, and let outstanding-handle paths consume the signal as they finish their work.
 
-### 81. `Net::subscribe` perpetuates `Arc<EventBus>` clones, making #80 the default outcome
+### 81. `Net::subscribe` perpetuates `Arc<EventBus>` clones, making #80 the default outcome (verified)
 **File:** `sdk/src/net.rs:191-193`
 
 `EventStream::new(self.bus.clone(), opts)` increments the strong count of `Arc<EventBus>`. Even after the user drops the `EventStream`, any in-flight poll future the stream spawned can still hold the clone, so `Net::shutdown`'s `Arc::try_unwrap` fails (#80). The SDK provides no escape hatch — there is no `shutdown_async`-after-flush, no synchronous drain primitive — for the documented "subscribe → done streaming → shutdown" pattern. Fix is paired with #80: once shutdown is signal-based, surviving clones become benign.
 
-### 84. `RxCreditState::on_bytes_consumed` issues a matching grant for every byte consumed, defeating receive-side backpressure
-**File:** `adapter/net/session.rs:781-788`
+**Verification (2026-04-30):** confirmed by reading `sdk/src/net.rs:191-193` (subscribe) and `:198-203` (subscribe_typed) — both call `self.bus.clone()` into the stream constructor.
+
+### 84. `RxCreditState::on_bytes_consumed` is *itself* correct — but the dispatcher calls it on every accepted packet, refunding credit before the application has actually consumed (refined location)
+**File:** `adapter/net/mesh.rs:3000-3008` (caller); `adapter/net/session.rs:781-788` (callee, correct per docstring)
+
+The original entry pinned the bug at `RxCreditState::on_bytes_consumed` itself. **Verification (2026-04-30) showed the function is correct per its docstring:** it is documented as "called when bytes are consumed by the application" and emits an authoritative grant covering whatever has been consumed so far (`session.rs:773-780`). The bug is upstream — `mesh.rs:3000-3008`:
 
 ```rust
-let new_consumed = self.consumed.fetch_add(bytes, Ordering::AcqRel) + bytes;
-self.granted.fetch_add(bytes, Ordering::AcqRel);
+if accepted {
+    stream.update_rx_seq(parsed.header.sequence);
+    stream.on_bytes_consumed(payload_bytes)
+} else {
+    None
+}
 ```
 
-Each consumed byte is paired with an immediate matching grant of the same size, so `granted - consumed` never falls below the initial window regardless of how slowly the application drains the inbound queue — the receiver never applies backpressure on a stream. The "round-trip credit window" docstring promises threshold-based grants (issue a window when outstanding ≤ `window_bytes / 2`); no such threshold is implemented, every byte auto-grants. The two `fetch_add`s are also not atomic together, so a concurrent reader observes momentary `consumed > granted` and `outstanding()` saturates to 0. The sender's credit therefore drops only when the receiver stops calling `on_bytes_consumed`, not when the receiver buffer is bounded. Replace the immediate auto-grant with a threshold check, or make the two updates an atomic CAS pair.
+The dispatcher invokes `on_bytes_consumed` immediately on packet *acceptance* (delivery into the reliability layer's in-order buffer), not on the application actually draining bytes off the receive queue. As a result, every accepted byte triggers an authoritative grant for that same byte count. The window opens just-in-time for whatever the network delivered, and the receiver never applies backpressure regardless of how slowly the application reads — the only effective "backpressure" is whatever the reliability layer's NACK/SACK behaviour buys.
 
-### 85. Mesh dispatch path skips AEAD verification on heartbeat packets
+**Trigger:** open a stream with `window_bytes = 65_536`; have the dispatcher accept 100 KB of inbound traffic without the application reading; sender's credit replenishes 1:1 with what arrives, never blocks.
+
+Fix: move the `on_bytes_consumed` call to the application-side read path (whatever drains payloads off the per-stream queue), or rename it `on_bytes_delivered` and add a separate `on_bytes_consumed` that the application drives. The audit's previously-suggested "threshold check inside `RxCreditState`" would not actually fix this — the function is doing what it's told.
+
+### 85. Mesh dispatch path skips AEAD verification on heartbeat packets (verified)
 **File:** `adapter/net/mesh.rs:2367-2371` (compare with `adapter/net/mod.rs:642-663` and `adapter/net/pool.rs:237-249`)
 
 ```rust
@@ -106,7 +122,11 @@ if parsed.header.flags.is_heartbeat() {
 }
 ```
 
-The mesh dispatch loop fast-paths `is_heartbeat()` packets — touching the failure detector and session timestamp — without invoking AEAD verification. The legacy single-peer adapter (`mod.rs:642-663`) explicitly verifies the tag for the same packet shape, and the comment on `pool.rs:237-249` claims heartbeats are now AEAD-authenticated specifically to prevent off-path spoofing. An off-path attacker with the cleartext `session_id` (visible on every prior data packet) and the source UDP address can spoof heartbeat-flagged 64-byte headers from `peer_addr`, indefinitely defeating session-idle timeout and triggering false `failure_detector.heartbeat(...)` notifications. Either route heartbeats through the same AEAD-verify path as data packets, or document this as a known design limitation. (Worth verifying whether mesh has its own gate elsewhere before AAD-skip is concluded.)
+The mesh dispatch loop fast-paths `is_heartbeat()` packets — touching the failure detector and session timestamp — without invoking AEAD verification. The legacy single-peer adapter (`mod.rs:642-663`) explicitly verifies the tag for the same packet shape (calls `rx_cipher.decrypt(counter, &aad, &parsed.payload)` at `mod.rs:656`), and the comment on `pool.rs:237-249` claims heartbeats are now AEAD-authenticated specifically to prevent off-path spoofing. An off-path attacker with the cleartext `session_id` (visible on every prior data packet) and the source UDP address can spoof heartbeat-flagged 64-byte headers from `peer_addr`, indefinitely defeating session-idle timeout and triggering false `failure_detector.heartbeat(...)` notifications.
+
+**Verification (2026-04-30):** the mesh path matches a session by `session_id` (`mesh.rs:2348-2364`), then calls `failure_detector.heartbeat()` and `session.touch()` with no `rx_cipher.decrypt(...)` call before the early `return`. The legacy `mod.rs:642-663` path correctly calls `rx_cipher.decrypt` at line 656.
+
+Either route heartbeats through the same AEAD-verify path as data packets, or document this as a known design limitation.
 
 ### 92. Redex `compact_to` keeps in-memory index offsets absolute while on-disk offsets become segment-relative — appends after retention sweep silently lost on restart (verified)
 **File:** `adapter/net/redex/disk.rs:917-1010` (offset rewrite at `:977-979`); caller `adapter/net/redex/file.rs:919-1003` (sweep) and `:368-414` (append); recovery walk `adapter/net/redex/disk.rs:245-269`
@@ -133,20 +153,26 @@ Option 1 is the smaller delta. Option 2 keeps the format consistent with the in-
 - appends → `sweep_retention` → appends again → `close` → reopen,
 - and asserts the post-sweep append survives restart (e.g. seq numbers `[3, 4, 5, 6]` — surviving pair plus two post-sweep appends — are all present after reopen).
 
-### 93. Redex `compact_to` non-atomic three-rename sequence with no parent-dir fsync
+### 93. Redex `compact_to` non-atomic three-rename sequence with no parent-dir fsync (verified)
 **File:** `adapter/net/redex/disk.rs:1086-1089`
 
-The atomic-rewrite pattern uses three sequential `std::fs::rename` calls (idx → dat → ts) without bracketing them in a single dirent flip and without fsyncing the parent directory afterward. A power loss between the first and second rename leaves the new (renormalized) idx alongside the old dat + old ts; on reopen, recovery's checksum verification fails for every entry because the new idx's offsets index into the wrong dat bytes, and all entries are dropped. On POSIX, even a successful series of renames is not durable until the directory inode is fsynced. Combined with #92, a crash during retention sweep can corrupt the entire segment with no recovery path. Either move to a single rename of a packed manifest, or fence the three renames inside an explicit dir-fsync.
+The atomic-rewrite pattern uses three sequential `std::fs::rename` calls (idx → dat → ts) without bracketing them in a single dirent flip and without fsyncing the parent directory afterward. A power loss between the first and second rename leaves the new (renormalized) idx alongside the old dat + old ts; on reopen, recovery's checksum verification (`disk.rs:322-348`) fails for every entry because the new idx's offsets index into the wrong dat bytes, and all entries are dropped. On POSIX, even a successful series of renames is not durable until the directory inode is fsynced. Combined with #92, a crash during retention sweep can corrupt the entire segment with no recovery path.
 
-### 94. Redex `metadata()?` early-return mid-batch leaves orphaned idx/dat bytes without rollback
-**File:** `adapter/net/redex/disk.rs:638, 663, 802, 820`
+**Verification (2026-04-30):** read `compact_to` in full. No `File::open(&dir).sync_all()` exists in the function; the three renames at `:1087`, `:1088`, `:1089` are unbracketed; placeholder cleanup (`:1119-1121`) is best-effort. Fix: either move to a single rename of a packed manifest, or fence the three renames inside an explicit dir-fsync.
 
-In both `append_entry_inner` and `append_entries_inner`, the `pre_*_len = file.metadata()?` lines use `?` to early-return. By that point, dat (and possibly idx) has already been written successfully. Only the rollback inside the explicit `if let Err(e) = file.write_all(...)` block performs file rollback — a `metadata()` error skips it entirely. The on-disk state ends up with orphaned idx/dat bytes; the caller is told the append failed and rolls back `next_seq` in memory. On restart, `read_timestamps` returns None for the length mismatch (idx longer than ts), so all recovered entries get `now()` as their timestamp and age-based retention silently breaks for the affected window. Replace each `?` with explicit error handling that triggers the existing rollback path before returning.
+### 94. Redex `metadata()?` early-return after a prior file write leaves orphaned bytes without rollback (verified, lines refined)
+**File:** `adapter/net/redex/disk.rs:638, 663` (`append_entry_inner`); `:802, 820` (`append_entries_inner`)
 
-### 95. Redex `sweep_retention` commits in-memory eviction even when `compact_to` fails
-**File:** `adapter/net/redex/file.rs:919-1003` (failure point ~line 991)
+In `append_entry_inner` the order is: dat write (`:607`) → idx metadata (`:638`) → idx write (`:639`) → ts metadata (`:663`) → ts write (`:664`). The bug is at the **second and third** metadata calls: by the time `idx.metadata()?` runs at `:638`, the dat write at `:607` has already committed bytes to disk; by the time `ts.metadata()?` runs at `:663`, both dat and idx have committed. Each `?` early-returns via `RedexError::io(...)` without entering the explicit `if let Err(e) = file.write_all(...)` rollback block, which is the only place that issues `set_len` truncations. Result: the on-disk state ends up with orphaned dat (or dat+idx) bytes; the caller is told the append failed and rolls back `next_seq` in memory. The same pattern holds for the batch path: dat write (`:787`) → idx metadata (`:802`) → idx write (`:803`) → ts metadata (`:820`).
 
-`sweep_retention` mutates in-memory state (drains `index`, `timestamps`, calls `evict_prefix_to`) before invoking `disk.compact_to`. If `compact_to` fails, the function logs a warning and returns `Ok(())` — but in-memory state has already evicted the head, while on-disk dat/idx/ts still contain everything. On the next reopen, recovery replays the full on-disk state, resurrecting the entries that were just evicted in memory. The inline comment on ~line 992 acknowledges the divergence but treats it as benign; combined with #92 it becomes a corruption vector (post-failure appends now interleave with resurrected entries on disk). Either roll back in-memory eviction on `compact_to` failure, or perform the disk compaction first and only mutate in-memory state on success.
+**Verification (2026-04-30):** read both functions end-to-end. The first metadata call in each (`:606`, `:786`) is fine because no writes have happened yet. The bug is real for `:638`, `:663`, `:802`, `:820`. On restart with orphaned dat (idx-metadata failure case), the torn-tail recovery walk at `disk.rs:245-269` will trim dat to `retained_dat_end`, so the orphan dat alone is harmless. But for orphaned dat+idx (ts-metadata failure case), the surplus idx record references a payload offset whose bytes still exist in dat → the entry is "recovered" without a matching ts entry, so `read_timestamps` returns None for the length mismatch and all recovered entries get `now()` as their timestamp; age-based retention silently breaks for the affected window. Fix: replace each `?` with explicit error handling that triggers the existing rollback path before returning.
+
+### 95. Redex `sweep_retention` commits in-memory eviction even when `compact_to` fails (verified)
+**File:** `adapter/net/redex/file.rs:919-1003` (failure point at `:991-998`)
+
+`sweep_retention` mutates in-memory state (drains `index`, `timestamps`, calls `evict_prefix_to`) at `:946-957` before invoking `disk.compact_to` at `:991`. If `compact_to` fails, lines `:992-997` log a warning whose message literally reads "in-memory eviction succeeded but on-disk files retain evicted entries" — the comment is an explicit acknowledgment. The function returns implicitly with `()` (no `Result`); there is no rollback (no re-prepending to `state.index`, no restoration of segment base). On the next reopen, recovery replays the full on-disk state, resurrecting the entries that were just evicted in memory. Combined with #92 it becomes a corruption vector (post-failure appends interleave with resurrected entries on disk).
+
+**Verification (2026-04-30):** read `sweep_retention` end-to-end. Fix: either roll back in-memory eviction on `compact_to` failure, or perform the disk compaction first and only mutate in-memory state on success.
 
 ### 97. Legacy `NetAdapter` builds heartbeats with an all-zero key — every heartbeat fails AEAD verify on the receiver
 **File:** `adapter/net/mod.rs:841`
@@ -250,28 +276,36 @@ The budget gate compares `active_count + count <= max_shards`, ignoring already-
 
 The phase-2 loop is meant to give "at least `max_delay × n_workers`" for in-flight batches sitting in the per-shard mpsc channels and the batch worker's pending-batch buffer to time out and dispatch (comment at lines 636-647 — explicitly added because #16's old single-window wait was too short). The early-break inside the loop calls `all_shards_empty()`, but that probes ring-buffer fill (`table.shards.iter().all(|s| s.lock().is_empty())`), which phase 1 already drained. With no concurrent ingest the predicate is constant-true after the first sleep window, so the early-break fires after exactly one `max_delay` regardless of `n_workers` — and the documented multi-worker budget is never observed. Phase 2 collapses back to the single-window behavior that #16 was supposed to replace; a flush-as-barrier caller on a many-shard config (default 8+) returning during a partial-batch dispatch sees the same pre-#16 silent loss. Either probe per-shard mpsc-channel depth directly (e.g. via a `pending_in_channel` counter incremented on `tx.send` and decremented on `rx.recv` in the batch worker), gate the break on a "no batches dispatched in last window" signal, or remove the early-break and pay the full budget.
 
-### 82. `manual_scale_down` strands events on drained shards
+### 82. `manual_scale_down` strands events on drained shards (verified)
 **File:** `bus.rs:815-824` (compare scaling-monitor finalize at `bus.rs:935-952`)
 
-`manual_scale_down` calls `mapper.scale_down(count)` to mark shards `Draining` and returns the drained ids. Unlike the scaling-monitor path, it never calls `mapper.finalize_draining()` or `bus.remove_shard_internal(...)`. Events still queued in those shards' ring buffers (and any pushes that arrived between the read-locked early budget check and the write-locked state transition) sit unread until the scaling monitor catches up — which only fires if a monitor is running and reaches its next tick before `bus.shutdown()`. Bus configs without an active monitor lose those events on shutdown. Either drive the finalize loop synchronously inside `manual_scale_down`, or document the API as "requires `start_scaling_monitor` before use" and assert it at call time.
+`manual_scale_down` calls `mapper.scale_down(count)` to mark shards `Draining` and returns the drained ids. Unlike the scaling-monitor path, it never calls `mapper.finalize_draining()` or `bus.remove_shard_internal(...)`. Events still queued in those shards' ring buffers (and any pushes that arrived between the read-locked early budget check and the write-locked state transition) sit unread until the scaling monitor catches up — which only fires if a monitor is running and reaches its next tick before `bus.shutdown()`. Bus configs without an active monitor lose those events on shutdown.
 
-### 83. `ShardManager::remove_shard` never drops the entry from `ShardMapper.shards` — unbounded growth across scale-up/down cycles
+**Verification (2026-04-30):** confirmed by reading `bus.rs:815-824`. The function is six lines: it acquires the mapper, calls `mapper.scale_down(count)`, and returns the drained ids. There is no finalize call, no `remove_shard_internal`, no integration with the drain-worker shutdown path. Fix: either drive the finalize loop synchronously inside `manual_scale_down`, or document the API as "requires `start_scaling_monitor` before use" and assert it at call time.
+
+### 83. `ShardManager::remove_shard` never drops the entry from `ShardMapper.shards` — unbounded growth across scale-up/down cycles (verified)
 **File:** `shard/mod.rs:819-872`
 
-`remove_shard` rebuilds the routing table (removing from `ShardTable`), drains the ring buffer, and decrements `num_shards`, but never asks the mapper to drop the corresponding `MappedShard` record. The mapper's `shards: RwLock<Vec<MappedShard>>` keeps growing — every scale-up appends an entry, and `remove_stopped_shards` is the only API that deletes them, but no production caller invokes it (only tests reference it). Long-running services with frequent scaling activity accumulate `Stopped` entries indefinitely; `evaluate_scaling` filters by state but still iterates the full list, so per-tick cost grows with cumulative scaling history. Wire `remove_shard` to call `mapper.remove_stopped_shards()` after the manager-level removal completes, or remove the specific id directly.
+`remove_shard` drains the ring buffer (`:833-839`), rebuilds the routing table (`:842-864`), and decrements `num_shards` (`:866-868`), but never asks the mapper to drop the corresponding `MappedShard` record. The function's only mapper interaction is `let _mapper = self.mapper.as_ref().ok_or(...)` at `:823` — a guard against calling on a non-scaling configuration; no method is invoked on the bound. The mapper's `shards: RwLock<Vec<MappedShard>>` keeps growing — every scale-up appends an entry, and `remove_stopped_shards` is the only API that deletes them, but no production caller invokes it (only tests reference it). Long-running services with frequent scaling activity accumulate `Stopped` entries indefinitely; `evaluate_scaling` filters by state but still iterates the full list, so per-tick cost grows with cumulative scaling history.
 
-### 86. Direct handshake `recv_from` on `Arc<UdpSocket>` races the dispatch receive loop
-**File:** `adapter/net/mesh.rs:6093-6118, 6155-6176` (dispatch loop spawn at `~2032`)
+**Verification (2026-04-30):** read `shard/mod.rs:819-872` end-to-end. Fix: wire `remove_shard` to call `mapper.remove_stopped_shards()` after the manager-level removal completes, or remove the specific id directly via a new mapper method.
 
-`try_handshake_initiator` and `try_handshake_responder` poll `socket_arc.recv_from` directly. Once `start()` has spawned `spawn_receive_loop`, both consumers race for each datagram on the same `Arc<UdpSocket>`; tokio dispatches a UDP datagram to exactly one waiter. The handshake response can be swallowed by the dispatch loop, which then drops it because no matching session exists yet (~lines 2349-2364), and the handshake times out. Concurrent direct connects on the same node also steal each other's responses. Either bridge handshakes through an in-memory channel populated by the dispatch loop (forward msg2/msg3 datagrams to a per-pending-handshake oneshot keyed by `session_id`), or synchronize handshake initiation to suspend dispatch dequeue for the matching session.
+### 86. Direct handshake `recv_from` on `Arc<UdpSocket>` races the dispatch receive loop (verified)
+**File:** `adapter/net/mesh.rs:6093-6118, 6155-6176` (dispatch loop spawn at `:2032`)
 
-### 87. Mesh post-handshake `tokio::spawn` is fire-and-forget and can wedge peer/session/route on cancellation
-**File:** `adapter/net/mesh.rs:2553-2569` (state insert at `2524-2534`)
+`try_handshake_initiator` and `try_handshake_responder` poll `socket_arc.recv_from` directly. Once `start()` has spawned `spawn_receive_loop` (`mesh.rs:2032-2092`, which consumes from the same `self.socket.socket_arc()` at `:2033` via `PacketReceiver`), both consumers race for each datagram on the same `Arc<UdpSocket>`; tokio dispatches a UDP datagram to exactly one waiter. The handshake response can be swallowed by the dispatch loop, which then drops it because `dispatch_packet` at `:2344-2346` returns when `is_handshake()` is true on the direct path — there is no handshake channel forwarding unmatched-session datagrams. Concurrent direct connects on the same node also steal each other's responses.
 
-After completing the responder handshake, the code inserts session, peer entry, routing entry, and `peer_addrs`, then `tokio::spawn`s a fire-and-forget `socket.send_to(&payload, next_hop).await` whose only rollback fires from inside the spawned future on socket-send error. If the runtime is shutting down or the spawned task is cancelled before the send completes, rollback never runs and the peer/session/route survive in an unsendable state — the responder holds session keys the initiator never received the matching msg2 for. There is no JoinHandle tracking. Either await the send synchronously on the handshake task, or track the JoinHandle alongside the rollback closure so cancellation triggers cleanup.
+**Verification (2026-04-30):** confirmed there is no documented "must call before `start()`" invariant on `connect()` (`mesh.rs:1619-1627`) or `accept()` (`:1678-1679`); both are public API. Fix: bridge handshakes through an in-memory channel populated by the dispatch loop (forward msg2/msg3 datagrams to a per-pending-handshake oneshot keyed by `session_id`), or synchronize handshake initiation to suspend dispatch dequeue for the matching session.
 
-### 88. Subnet gateway interprets `hop_ttl == 0` as unlimited rather than expired
-**File:** `adapter/net/subnet/gateway.rs:112` (AAD definition at `adapter/net/protocol.rs:319`)
+### 87. Mesh post-handshake `tokio::spawn` is fire-and-forget and can wedge peer/session/route on cancellation (verified)
+**File:** `adapter/net/mesh.rs:2553-2569` (state insert at `:2524-2534`)
+
+After completing the responder handshake, the code inserts session, peer entry, routing entry, and `peer_addrs` (`:2524-2534`), then `tokio::spawn`s a fire-and-forget `socket.send_to(&payload, next_hop).await` whose only rollback fires from inside the spawned future on socket-send error (`:2563-2567`). The spawn is a bare `tokio::spawn(async move { ... })` with no `JoinHandle` retained anywhere. If the runtime is shutting down or the spawned task is cancelled before the send completes, the rollback at `:2563-2567` never runs but the peer/session/route state at `:2524-2534` is already wedged. There is no idle-session sweeper that reaps unsendable peer entries — `cleanup_idle_streams` (`route.rs:624-635`) only cleans `stream_stats`, not peer/route entries.
+
+**Verification (2026-04-30):** confirmed no `JoinHandle` capture. Fix: either await the send synchronously on the handshake task, or track the JoinHandle alongside the rollback closure so cancellation triggers cleanup.
+
+### 88. Subnet gateway interprets `hop_ttl == 0` as unlimited rather than expired (verified)
+**File:** `adapter/net/subnet/gateway.rs:112` (header constructor at `adapter/net/protocol.rs:206-224`; AAD definition at `:319-344`)
 
 ```rust
 if hop_ttl > 0 && hop_count >= hop_ttl {
@@ -279,10 +313,12 @@ if hop_ttl > 0 && hop_count >= hop_ttl {
 }
 ```
 
-`NetHeader::new` defaults `hop_ttl` to 0, so any packet with default headers forwards regardless of `hop_count`. `hop_count` is excluded from AAD (per `protocol.rs:319`) and is mutable in transit, so an attacker or buggy peer can craft `hop_ttl=0` packets that loop through gateways with no Net-layer bound. Routing-layer TTL still bounds end-to-end loops for routed packets, but pure subnet-gateway forwarding paths (no routing header) lack any cap. Either treat `hop_ttl == 0` as expired (drop), set a sensible non-zero default in `NetHeader::new`, or pull `hop_ttl` into AAD so it cannot be downgraded mid-flight.
+`NetHeader::new` defaults `hop_ttl` to 0 (`protocol.rs:212`), so any packet with default headers forwards regardless of `hop_count`. `aad()` at `protocol.rs:319-344` includes `hop_ttl` (`:326`) but explicitly excludes `hop_count` (`:327`: "aad[6] = 0: hop_count excluded from AAD"). Any sender that uses default `NetHeader::new` and crosses a gateway will have `hop_ttl == 0`, which short-circuits the TTL check entirely — packets forward forever. Routing-layer TTL still bounds end-to-end loops for routed packets, but pure subnet-gateway forwarding paths (no routing header) lack any cap.
 
-### 89. Router `stream_stats` keyed by AEAD-unverified bytes — DashMap flood
-**File:** `adapter/net/router.rs:475-481`
+**Verification (2026-04-30):** confirmed by reading `gateway.rs:112` and `NetHeader` constructor + `aad()` in `protocol.rs`. Fix: treat `hop_ttl == 0` as expired (drop), set a sensible non-zero default in `NetHeader::new`, or both.
+
+### 89. Router `stream_stats` keyed by AEAD-unverified bytes — DashMap flood (verified)
+**File:** `adapter/net/router.rs:475-481` (record_in at `route.rs:567-571`, DashMap declaration at `route.rs:391, 406`)
 
 ```rust
 let stream_id = if data.len() >= ROUTING_HEADER_SIZE + HEADER_SIZE {
@@ -293,15 +329,19 @@ let stream_id = if data.len() >= ROUTING_HEADER_SIZE + HEADER_SIZE {
 };
 ```
 
-The router extracts the inner `stream_id` from raw packet bytes before AEAD verification and inserts an entry into the `stream_stats` DashMap keyed by that value. A malicious peer can spam routed packets with random `stream_id` values to exhaust router memory; `cleanup_idle_streams` runs on an interval, so growth is bounded only by the cleanup period. Either gate `stream_stats` insertion on a successful AEAD verify, cap the DashMap with an LRU/size-bounded policy, or restrict accounting to known/registered `stream_id`s.
+`route_packet` parses `RoutingHeader` only (no AEAD verify possible — keys are per-session, router is per-node), extracts `stream_id` from raw bytes at `router.rs:481`, then calls `self.routing_table.record_in(stream_id, len)` at `:487`. `record_in` (`route.rs:567-571`) does `self.stream_stats.entry(stream_id).or_default()` — unbounded insert into a `DashMap<u64, SchedulerStreamStats>` with no size cap; `cleanup_idle_streams` (`route.rs:624-635`) is interval-driven. An attacker can pick 2^64 random `stream_id` values and exhaust router memory between cleanup ticks.
 
-### 90. `BatchedTransport::recv_batch` indexes empty `recv_buffers` constructed via `new_send_only`
-**File:** `adapter/net/linux.rs:215, 285` (constructor at `48-50`)
+**Verification (2026-04-30):** confirmed via direct trace through `route_packet` → `record_in` → DashMap insert; no AEAD gate exists at the router layer because the router is upstream of session keys. Fix: gate `stream_stats` insertion on a successful AEAD verify (will require restructuring), cap the DashMap with an LRU/size-bounded policy, or restrict accounting to known/registered `stream_id`s.
 
-`BatchedTransport::new_send_only` intentionally skips the `recv_buffers` allocation. Both `recv_batch` and `recv_batch_blocking` then unconditionally do `self.recv_buffers[i].resize(MAX_PACKET_SIZE, 0)` for `i in 0..count`, which panics with index-out-of-bounds for any send-only-constructed instance. The doc comment on `new_send_only` only states the contract verbally; there is no runtime guard. Either return an `InvalidOperation` error from the recv methods when `recv_buffers` is empty, or split the type so send-only construction returns a different type that lacks the recv methods at compile time.
+### 90. `BatchedTransport::recv_batch` indexes empty `recv_buffers` constructed via `new_send_only` (verified)
+**File:** `adapter/net/linux.rs:215, 285` (constructor at `:48-50`, `:52-60`)
 
-### 91. `analyze_subnet_correlation` returns a non-deterministic subnet on tied depth
-**File:** `adapter/net/contested/correlation.rs:249-257`
+`BatchedTransport::new_send_only` (`:48-50`) intentionally skips the `recv_buffers` allocation — `new_inner(_, false)` initializes `recv_buffers = Vec::new()` (`:59`). Both `recv_batch` (`:207-234`) and `recv_batch_blocking` then unconditionally do `self.recv_buffers[i].resize(MAX_PACKET_SIZE, 0)` for `i in 0..count` (`:215`), which panics with index-out-of-bounds for any send-only-constructed instance. The doc comment on `new_send_only` (`:44-47`) only states the contract verbally; there is no runtime guard.
+
+**Verification (2026-04-30):** confirmed by reading `linux.rs:40-60, 200-235`. Fix: either return an `InvalidOperation` error from the recv methods when `recv_buffers` is empty, or split the type so send-only construction returns a different type that lacks the recv methods at compile time.
+
+### 91. `analyze_subnet_correlation` returns a non-deterministic subnet on tied depth (verified)
+**File:** `adapter/net/contested/correlation.rs:249-257` (HashMap declaration at `:221`; downstream consumer at `:262-265`)
 
 ```rust
 for (&subnet, &count) in &subnet_counts {
@@ -312,12 +352,16 @@ for (&subnet, &count) in &subnet_counts {
 }
 ```
 
-`HashMap` iteration is unordered, and the predicate uses `>=` on depth as the tie-breaker, so when two subnets at the same `best_depth` both meet the threshold, the chosen subnet depends on hash iteration order (randomized per process). Downstream `partition.rs::detect` uses the chosen subnet to brand the partition record, and recovery scope flips between runs given identical inputs. Switch to a deterministic tiebreaker (e.g. lowest subnet id at equal depth, or strictly `>` with a documented "first seen wins" semantic that uses an ordered iterator).
+`subnet_counts` is declared as `let mut subnet_counts: HashMap<SubnetId, usize> = HashMap::new();` at `:221` — std `HashMap` with randomized iteration order. The predicate uses `>=` on depth (`:253`), so on tied `best_depth` the last subnet visited in iteration order wins. With `subnet_counts` populated by walking parent chains (`:228-237`), ties at the same depth are absolutely possible (e.g. two sibling subnets each with the same number of failures both rolled up to a shared parent depth). The downstream `FailureCause::SubnetFailure { subnet, ... }` at `:262-265` carries that subnet to the recovery path — non-determinism propagates.
 
-### 96. Redex `read_timestamps` accepts ts file with stale per-position semantics after torn-tail recovery
-**File:** `adapter/net/redex/disk.rs:298-310` (rewrite branch at `384-399`)
+**Verification (2026-04-30):** confirmed both the iteration order risk and the propagation. Fix: switch to a deterministic tiebreaker (e.g. lowest subnet id at equal depth) by iterating a sorted view, or use strictly `>` with a documented "first seen wins" semantic over an ordered iterator (e.g. `BTreeMap`).
 
-`read_timestamps` accepts a ts file as long as `bytes.len() >= expected_entries * 8` and returns the first `expected_entries` u64s. This assumes the ts file's per-position semantics align with idx's, but if a previous run truncated idx via the torn-tail walk (`open` ~lines 247-266) without rewriting ts, the surviving entries' timestamps are misaligned (the first N timestamps refer to the *first* N entries the ts file ever held, not the surviving ones after truncation). The recovery code only rewrites ts when `bad_entries > 0`; torn-tail truncations skip the rewrite. Age-based retention then operates on wrong timestamps. Either rewrite ts whenever idx is truncated for any reason (capturing the surviving timestamps and rewriting in order), or store timestamps inside idx records.
+### 96. Redex `read_timestamps` accepts ts file with stale per-position semantics after torn-tail recovery — **REFUTED**
+**File:** `adapter/net/redex/disk.rs:298-310` (rewrite branch at `:384-399`)
+
+**Original claim:** `read_timestamps` accepts ts as long as length matches; after torn-tail truncation of idx without rewriting ts, surviving entries' timestamps are misaligned.
+
+**Verification (2026-04-30):** the claim is wrong about the recovery flow. `read_timestamps` is called at `disk.rs:305`, which is *after* the torn-tail walk at `:247-269` has already truncated the on-disk idx and the in-memory `index` vec. Crucially, ts is append-only and the surviving N idx entries are the **first N** of the original idx — torn-tail truncation only chops the tail, so per-position alignment between idx and ts is preserved by construction. The first N timestamps in ts correspond exactly to the surviving entries. The rewrite branch at `:384-399` (which only fires for mid-file checksum drops) handles the only case where positions could shift; pure torn-tail does not produce that case. Age-based retention reads timestamps that ARE correctly aligned. Removed from outstanding tally.
 
 ### 105. `recently_closed` quarantine map grows unbounded under stream open/close churn
 **File:** `adapter/net/session.rs:67-68, 464-487`
