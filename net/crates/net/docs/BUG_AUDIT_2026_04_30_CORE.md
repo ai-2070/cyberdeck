@@ -31,7 +31,7 @@ Extended scope (#121 onward): a fourth multi-agent sweep covered the subtrees ex
 
 ## Status (running tally)
 
-**Outstanding:** #55, #56, #57, #58, #59, #60, #61, #62, #63, #64, #65, #66, #67, #68, #69, #70, #71, #72, #73, #74, #75, #76, #77, #78, #79, #98, #104, #106, #107, #111, #112, #117, #121, #122, #123, #124, #125, #126, #127, #128, #129, #130, #131, #132, #133, #134, #135, #136, #137, #139, #141, #143, #144, #147, #148, #149, #150, #151, #152, #153, #154, #155
+**Outstanding:** #55, #56, #57, #58, #59, #60, #61, #62, #63, #64, #65, #66, #67, #68, #69, #70, #71, #72, #73, #74, #75, #76, #77, #78, #79, #98, #104, #106, #107, #111, #112, #117, #121, #123, #124, #126, #127, #128, #130, #131, #133, #134, #135, #136, #137, #139, #141, #143, #144, #147, #148, #150, #151, #152, #153, #154, #155
 
 **Fixed on 2026-04-30 (with regression tests where reasonable):**
 - **#80** — `Net::shutdown` now routes through `EventBus::shutdown_via_ref(&self)`, an idempotent reference-based shutdown that runs regardless of outstanding `Arc<EventBus>` clones. Tests: `sdk/tests/shutdown_regression.rs::{shutdown_runs_even_with_outstanding_event_stream, shutdown_via_ref_is_idempotent}`.
@@ -74,10 +74,15 @@ Extended scope (#121 onward): a fourth multi-agent sweep covered the subtrees ex
 - **#138** — `CapabilityDiff::from_bytes` now caps wire-format input length at `MAX_DIFF_BYTES = 64 KiB` (rejected before `serde_json::from_slice` allocates) and op-count at `MAX_DIFF_OPS = 1024` (rejected post-parse before `apply` iterates). Pre-fix, a peer-shipped multi-MB JSON expanded into an arbitrarily-long `Vec<DiffOp>` and `apply` iterated all of them — peer-controlled CPU/RAM burn. Both failure modes return `None` (existing malformed-input outcome). The two caps are coherent: byte cap bounds heap during parsing, op cap bounds CPU during `apply`, and `MAX_DIFF_OPS * smallest-op-encoding` fits comfortably under `MAX_DIFF_BYTES`. Tests: `behavior::diff::tests::{from_bytes_rejects_payload_over_max_diff_bytes, from_bytes_rejects_diff_with_too_many_ops, from_bytes_accepts_diff_at_exact_max_diff_ops}`.
 - **#114** — `assess_continuity` now takes an `Option<&StateSnapshot>` and requires the log to be anchored either at genesis (first event has `sequence == 1`) or at the supplied snapshot (`snapshot.through_seq + 1 == first_event.sequence`). Pre-fix it only validated pair-wise linkage, so a pruned-no-snapshot log carrying events 100..200 with consistent hashes reported `Continuous` even though events 0..99 were entirely missing. Now reports `Unverifiable { last_verified_seq: 0, gap_start: 0 }` in that case. Signature change is safe — no production callers of `assess_continuity` exist (only the unit tests in `chain.rs`, all updated to pass `None`). Tests: `chain::tests::{assess_continuity_unverifiable_when_log_starts_past_genesis_without_snapshot, assess_continuity_continuous_when_snapshot_bridges_gap, assess_continuity_unverifiable_when_snapshot_through_seq_does_not_bridge}`.
 - **#146** — `TokenCache::insert_unchecked` now soft-caps slot count at `MAX_TOKEN_SLOTS = 65_536` and within-slot token count at `MAX_TOKENS_PER_SLOT = 32`. Existing slot keys still refresh under cap pressure; only NOVEL `(subject, channel_hash)` keys are dropped at the slot cap, and only NOVEL scope bitfields are dropped at the within-slot cap. `evict_expired` reclaims slots as their tokens lapse, restoring admission once memory pressure eases. Pre-fix the cache grew linearly with peer-controlled `(subject × channel × scope)` cardinality with no cap. Tests: `identity::token::tests::{insert_unchecked_drops_novel_slot_when_at_max_token_slots, insert_unchecked_replays_existing_subject_when_slot_cap_is_full, insert_unchecked_caps_within_slot_token_count}`.
+- **#125** — `DiffEngine::apply_with_version(base, current_version, diff, strict)` is the new version-checked entry point — returns `DiffError::VersionMismatch { expected: diff.base_version, actual: current_version }` when the live version doesn't match what the diff was generated against. The version-naive `apply` is preserved as a thin wrapper for hand-built diffs / tests; production callers (once they exist — the dispatch handler isn't merged yet) must use `apply_with_version`. Pre-fix `apply` ignored `diff.base_version` despite `VersionMismatch` being a documented error variant — a stale diff was silently accepted, snowballing divergence. Tests: `behavior::diff::tests::{apply_with_version_rejects_stale_diff, apply_with_version_accepts_aligned_diff, apply_with_version_rejects_future_dated_diff}`.
+- **#122** — `SnapshotStore::store(snapshot)` now returns `bool` and uses `DashMap::entry` to atomically reject snapshots whose `through_seq` is not strictly higher than the existing entry's. Older / replayed / equal-seq snapshots return `false` and the existing entry is preserved. Pre-fix `store` called `insert(...)` unconditionally — concurrent stores raced (last-write-wins regardless of freshness) and an attacker who replayed an archived snapshot could rewind state. The 3 test callers in `snapshot.rs` were updated to `assert!(store.store(...))`. Tests: `state::snapshot::tests::{store_rejects_older_snapshot_against_newer_existing_entry, store_rejects_equal_through_seq_against_existing_entry, store_accepts_strictly_newer_snapshot}`.
+- **#132** — `read_manifest_entry` now rejects entries with `min_compatible > version` (returns `None`); `SubprotocolDescriptor::with_min_compatible(min)` clamps `min` to `self.version` instead of allowing the higher floor. Pre-fix a peer could advertise `version=1.0, min_compatible=255.255` and every honest peer's `negotiate()` would mark the subprotocol `incompatible` (because `local.version.satisfies(remote.min)` is false for any `local`), unilaterally evicting subprotocols from negotiation — a phantom-incompatibility DoS that requires no actual presence on the channel. Tests: `subprotocol::descriptor::tests::{read_manifest_entry_rejects_min_compatible_above_version, read_manifest_entry_accepts_min_compatible_equal_to_version, with_min_compatible_clamps_to_version, with_min_compatible_preserves_lower_floor}`.
+- **#149** — `SubprotocolManifest::from_registry` now sorts entries by `id` ascending so `to_bytes()` is deterministic across runs and builds. Pre-fix `registry.list()` walked a `DashMap` whose iteration order is non-deterministic, producing different byte sequences for identical content. Today the manifest is unsigned and not used in any digest dedup (so the non-determinism was dormant), but any future signed-manifest scheme or "same manifest? skip re-negotiation" optimisation downstream would silently break without this sort. Tests: `subprotocol::negotiation::tests::{from_registry_produces_deterministic_byte_output, from_registry_returns_entries_sorted_by_id}`.
+- **#129** — `EntityLog::prune_through(seq)` now only advances `snapshot_seq` when at least one event was actually pruned (`last_pruned.is_some()`). Pre-fix the marker was bumped unconditionally — calling `prune_through` on an empty log (or with `seq` below the first event's sequence) advanced `snapshot_seq` while `base_link.sequence` stayed put, producing a permanent desync where `head_seq().max(snapshot_seq())` returned a value the next append couldn't agree with. Callers that need to install an externally-coordinated snapshot anchor on an empty log should use `from_snapshot` instead. Tests: `state::log::tests::{prune_through_on_empty_log_does_not_advance_snapshot_seq, prune_through_below_first_event_does_not_advance_snapshot_seq, prune_through_advances_snapshot_seq_when_events_pruned}`.
 
 **Refuted on verification:** #96 (`read_timestamps` torn-tail alignment — alignment is preserved by construction, see entry).
 
-**Verified (read end-to-end on 2026-04-30):** #80, #81, #82, #83, #85, #86, #87, #88, #89, #90, #91, #92, #93, #94, #95, #110, #114, #138, #146. #84 was found to be **mis-located** — the cited code is correct; the bug is at the upstream caller `mesh.rs:3000-3008` (see entry).
+**Verified (read end-to-end on 2026-04-30):** #80, #81, #82, #83, #85, #86, #87, #88, #89, #90, #91, #92, #93, #94, #95, #110, #114, #122, #125, #129, #132, #138, #146, #149. #84 was found to be **mis-located** — the cited code is correct; the bug is at the upstream caller `mesh.rs:3000-3008` (see entry).
 
 ## High
 
@@ -506,8 +511,10 @@ When a `STORED` event lands for an existing memory id, the fold unconditionally 
 
 The FFI bindings `net_identity_issue_token` (`ffi/mesh.rs:1938`) and `net_identity_delegate_token` (`ffi/mesh.rs:2149`) read a user-supplied handle's keypair and feed it to `issue` / `delegate`. After a daemon migrates and the source zeroizes its key, any subsequent FFI caller asking that source to mint or delegate a token panics inside Rust and unwinds across `extern "C"` — undefined behaviour, identical in shape to #58 / #61. Fix: switch both functions to `try_sign`, surface a `TokenError::ReadOnly` (or `NotAuthorized`) variant, and return `Result` from `issue` (signature change).
 
-### 122. `SnapshotStore::store` allows older snapshots to overwrite newer ones (no monotonicity check)
+### 122. `SnapshotStore::store` allows older snapshots to overwrite newer ones (no monotonicity check) — **[FIXED 2026-04-30]**
 **File:** `adapter/net/state/snapshot.rs:451-454`
+
+**Fix:** `store` returns `bool` and uses `DashMap::entry` to atomically reject snapshots with `through_seq <= existing.through_seq`. See the **Fixed on 2026-04-30** block above for tests.
 
 ```rust
 pub fn store(&self, snapshot: StateSnapshot) {
@@ -532,8 +539,10 @@ Concrete failure: thread A sets node X to `Online` with tag `t1`; thread B sets 
 
 Combined with `with_capacity` defaulting to `None`, an attacker registers a single node with 1M unique tags and creates 1M `by_tag` entries. Fix: validate after deserialize — cap name/description length, tag/role counts, custom-map size, preferred_peers length — and reject in `upsert` (or before).
 
-### 125. `DiffEngine::apply` declares `VersionMismatch` but never checks the version, accepting stale diffs against fresher state
+### 125. `DiffEngine::apply` declares `VersionMismatch` but never checks the version, accepting stale diffs against fresher state — **[FIXED 2026-04-30]**
 **File:** `adapter/net/behavior/diff.rs:518-530` (variant defined at `:226-233`)
+
+**Fix:** added `apply_with_version(base, current_version, diff, strict)` as the version-checked entry point; legacy `apply` is preserved for version-naive callers. See the **Fixed on 2026-04-30** block above for tests.
 
 ```rust
 pub fn apply(base: &CapabilitySet, diff: &CapabilityDiff, strict: bool) -> Result<CapabilitySet, DiffError> {
@@ -573,8 +582,10 @@ let bindings_len = u32::try_from(self.bindings_bytes.len())
 
 `state` is opaque daemon state passed in from any caller (compute orchestrator, FFI clients), and `bindings_bytes` is opaque externally-controlled migration metadata. An adversarial or buggy producer with >4 GiB content makes serialization panic — and `to_bytes` is on the migration / snapshot-send path, where a panic crashes the dispatch task without releasing locks. Compare against `write_causal_events` in `causal.rs`, which gracefully *skips* oversized events and returns `events_skipped`. Fix: change `to_bytes` to return `Result<Vec<u8>, SnapshotError>` and bail with an error variant instead of `expect`-panicking.
 
-### 129. `EntityLog::prune_through` desyncs `snapshot_seq` from `base_link.sequence` on an already-empty log
+### 129. `EntityLog::prune_through` desyncs `snapshot_seq` from `base_link.sequence` on an already-empty log — **[FIXED 2026-04-30]**
 **File:** `adapter/net/state/log.rs:163-194`
+
+**Fix:** the `snapshot_seq` bump is now gated on `last_pruned.is_some()` — a no-op prune (empty log, or seq below first event) does not advance the marker. See the **Fixed on 2026-04-30** block above for tests.
 
 When `prune_through(seq)` is called on an empty log, `events.iter().rev().find(...)` returns `None`. The `events.is_empty()` branch fires but the inner `if let Some(...)` does nothing — yet `snapshot_seq` is unconditionally bumped to `seq` if `seq > self.snapshot_seq`. Result: `snapshot_seq` advances to an arbitrary `seq` while `base_link.sequence` stays at its previous value (e.g., 0 for a fresh genesis log).
 
@@ -592,8 +603,10 @@ The bloom filter is 16 bits with two 4-bit hash positions per origin (`h & 0xF`,
 
 Failure scenario: Node B registers subprotocol 0x1000 forwarding-only because it lacks the daemon but participates in routing it. B's manifest still advertises 0x1000. Node A negotiates → marks 0x1000 compatible → schedules a 0x1000-bound RPC to B → B has no handler → silent drop. The `capability_tags()` pathway (negotiation.rs:119) correctly filters forwarding-only entries; this direct-manifest path does not. Two parallel discovery channels disagree. Fix: filter `from_registry` to only emit `handler_present` entries, mirroring `capability_tags`, OR extend the wire format with a flag byte (bumping `MANIFEST_ENTRY_SIZE` to 7).
 
-### 132. `read_manifest_entry` accepts `min_compatible > version`, enabling phantom-incompatibility DoS
+### 132. `read_manifest_entry` accepts `min_compatible > version`, enabling phantom-incompatibility DoS — **[FIXED 2026-04-30]**
 **File:** `adapter/net/subprotocol/descriptor.rs:133-143`, `subprotocol/negotiation.rs:99-110`
+
+**Fix:** `read_manifest_entry` returns `None` when `min_compatible > version`; `with_min_compatible(min)` clamps to `self.version`. See the **Fixed on 2026-04-30** block above for tests.
 
 Neither `read_manifest_entry` nor `SubprotocolManifest::from_bytes` validates the wire-format invariant that `min_compatible <= version`. A peer that advertises `version = 1.0, min_compatible = 255.255` passes parsing. In `negotiate()`, every honest peer's `local_entry.version.satisfies(remote_entry.min_compatible)` returns false, so the subprotocol is added to `incompatible` rather than `compatible`. The attacker thereby unilaterally evicts any subprotocol from negotiation between the victim and its peers — without ever actually being a peer that handles it.
 
@@ -716,8 +729,10 @@ In the `RateLimited` arm: each thread reads `count.load`, compares to `max_per_s
 ### 148. `Tasks/MemoriesAdapter::open_from_snapshot` redundantly re-reads events the inner fold task already folded
 `adapter/net/cortex/tasks/adapter.rs:286-301`, `adapter/net/cortex/memories/adapter.rs:281-296` — after `CortexAdapter::open_from_snapshot` spawns the fold-tail task, this code does `read_range(replay_start, replay_end)` on the same payloads just to extract `EventMeta::seq_or_ts` for the local origin. Doubles startup IO and CPU on large logs; payloads are read twice. Piggyback `app_seq` discovery onto the fold (read `seq_or_ts` from EventMeta inside the fold callback), or compute it from `TasksState`/`MemoriesState` once caught up.
 
-### 149. Subprotocol manifest serialization order is non-deterministic (DashMap iteration)
-`adapter/net/subprotocol/negotiation.rs:39-50` calling `registry.list()` at `registry.rs:96-98` — `DashMap` iteration is non-deterministic across runs and builds, so `from_registry` produces different byte sequences on identical content. Today the manifest is unsigned and not used in any digest dedup, so this is dormant. But the architecture comment at `negotiation.rs:18-19` describes the manifest as "exchanged during session setup" — a surface that typically *does* end up signed once a security model is added. The non-determinism would silently break signature verification on retransmits and any "same manifest? skip re-negotiation" optimisation. Sort by `id` in `from_registry` before emitting.
+### 149. Subprotocol manifest serialization order is non-deterministic (DashMap iteration) — **[FIXED 2026-04-30]**
+`adapter/net/subprotocol/negotiation.rs:39-50` calling `registry.list()` at `registry.rs:96-98` — `DashMap` iteration is non-deterministic across runs and builds, so `from_registry` produces different byte sequences on identical content.
+
+**Fix:** `from_registry` sorts entries by `id` ascending before assembling the manifest, making `to_bytes()` deterministic. See the **Fixed on 2026-04-30** block above for tests. Today the manifest is unsigned and not used in any digest dedup, so this is dormant. But the architecture comment at `negotiation.rs:18-19` describes the manifest as "exchanged during session setup" — a surface that typically *does* end up signed once a security model is added. The non-determinism would silently break signature verification on retransmits and any "same manifest? skip re-negotiation" optimisation. Sort by `id` in `from_registry` before emitting.
 
 ### 150. RNG `expect` panics across the FFI boundary in identity-layer ops
 `adapter/net/identity/envelope.rs:200`, `adapter/net/identity/entity.rs:177`, `adapter/net/identity/token.rs:156, 298` — `getrandom::fill(...).expect("getrandom failed")`. Same hazard pattern as #58 / #61: under FD pressure / sandbox restrictions / kernel hang, `getrandom` returns an error and the unwind crosses `extern "C"` (these helpers are reachable from the FFI bindings under `ffi/mesh.rs`). Surface dedicated error variants instead of panicking.
@@ -790,13 +805,13 @@ Inside `ingest_raw_batch`, routing-miss events (concurrent scale-down removed th
 25. **#76** — `flush()` phase-2 barrier collapses to one window (re-introduces #16-class loss on many-shard configs)
 26. **#127** — `IdentityEnvelope::open` accepts attacker-chosen `signer_pub`, AAD is empty (identity-substitution hole on the migration path; the migration handler's cross-check is the only line of defense)
 27. **#121** — `PermissionToken::issue` / `delegate` panic across FFI on a public-only keypair (any post-migration daemon's FFI caller crashes)
-28. **#125** — `DiffEngine::apply` declares `VersionMismatch` but never checks the version (silent state divergence under stale diff replay)
+28. ~~**#125** — `DiffEngine::apply` declares `VersionMismatch` but never checks the version (silent state divergence under stale diff replay)~~ — **fixed 2026-04-30**
 29. **#124** — `NodeMetadata` deserialize is unbounded; peer-supplied tags / custom-map flood
 30. **#123** — `MetadataStore::upsert` non-atomic 5-step update produces permanent index drift (queries return wrong / duplicate nodes after concurrent writes)
-31. **#122** — `SnapshotStore::store` allows older snapshots to overwrite newer (state rewind on replay/race)
+31. ~~**#122** — `SnapshotStore::store` allows older snapshots to overwrite newer (state rewind on replay/race)~~ — **fixed 2026-04-30**
 32. **#126** — `Tasks/MemoriesAdapter::ingest_typed` advances `app_seq` before successful append (phantom seq on failure, snowballs into duplicate keys on cross-handle restore)
 33. **#131** — Subprotocol manifest exposes forwarding-only entries as locally-handled (silent RPC drop)
-34. **#132** — `read_manifest_entry` accepts `min_compatible > version` (peer can blacklist subprotocols at will)
+34. ~~**#132** — `read_manifest_entry` accepts `min_compatible > version` (peer can blacklist subprotocols at will)~~ — **fixed 2026-04-30**
 35. **#153** — stranded-flush batch from `remove_shard_internal` collides with original first-batch msg-ids under JetStream dedup (the recovery path #47 was added for now silently throws those events away)
 36. **#154** — `finalize_draining` ignores mpsc channel + BatchWorker pending; combined with #153, the BatchWorker can be cut short while events are still mid-flight
 

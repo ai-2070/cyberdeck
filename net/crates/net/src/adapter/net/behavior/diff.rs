@@ -546,10 +546,20 @@ impl DiffEngine {
         }
     }
 
-    /// Apply diff operations to a capability set
+    /// Apply diff operations to a capability set.
     ///
     /// Returns the updated capability set or an error if application fails.
     /// The `strict` parameter controls whether missing items cause errors.
+    ///
+    /// BUG #125: pre-fix this function ignored
+    /// `diff.base_version` entirely, even though
+    /// [`DiffError::VersionMismatch`] was a documented error variant.
+    /// A receiver at v5 happily accepted an old `base_version=2 →
+    /// new_version=3` diff and silently rolled state back. Callers
+    /// must now thread the live version into [`apply_with_version`];
+    /// this method is a thin wrapper that skips the check (kept for
+    /// callers that genuinely don't track a version, e.g. unit tests
+    /// applying a hand-built diff to a fresh `CapabilitySet`).
     pub fn apply(
         base: &CapabilitySet,
         diff: &CapabilityDiff,
@@ -562,6 +572,34 @@ impl DiffEngine {
         }
 
         Ok(result)
+    }
+
+    /// Apply diff operations to a capability set, asserting that
+    /// the diff was generated against `current_version` (the version
+    /// the caller has authoritative state for).
+    ///
+    /// Returns [`DiffError::VersionMismatch`] when
+    /// `current_version != diff.base_version` — i.e. the diff is
+    /// stale (older than what we hold) or out-of-order (newer than
+    /// what we have a base for). This is the correct contract for
+    /// any production caller; [`Self::apply`] is reserved for
+    /// version-naive contexts (tests, hand-built diffs, etc.).
+    ///
+    /// BUG #125: introduced as the version-checked counterpart to
+    /// `apply`, which historically silently accepted stale diffs.
+    pub fn apply_with_version(
+        base: &CapabilitySet,
+        current_version: u64,
+        diff: &CapabilityDiff,
+        strict: bool,
+    ) -> Result<CapabilitySet, DiffError> {
+        if current_version != diff.base_version {
+            return Err(DiffError::VersionMismatch {
+                expected: diff.base_version,
+                actual: current_version,
+            });
+        }
+        Self::apply(base, diff, strict)
     }
 
     /// Apply a single diff operation
@@ -1049,6 +1087,66 @@ mod tests {
         assert!(
             CapabilityDiff::from_bytes(&bytes).is_none(),
             "from_bytes must reject diffs with more than MAX_DIFF_OPS ops",
+        );
+    }
+
+    // ========================================================================
+    // BUG #125: apply_with_version must reject diffs against stale state
+    // ========================================================================
+
+    /// `apply_with_version` rejects when the live version doesn't
+    /// match `diff.base_version`. Pre-fix `apply` silently accepted
+    /// any diff regardless of version, allowing a stale diff (e.g.
+    /// `base_version=2` arriving at a v5 receiver) to roll state
+    /// back. The new entry point surfaces
+    /// [`DiffError::VersionMismatch`].
+    #[test]
+    fn apply_with_version_rejects_stale_diff() {
+        let caps = sample_capability_set();
+        // Live state is at v5; the diff is generated against v2.
+        let diff = CapabilityDiff::new(1, 2, 3, vec![DiffOp::AddTag("training".into())]);
+
+        let err = DiffEngine::apply_with_version(&caps, 5, &diff, false)
+            .expect_err("must reject stale diff");
+        assert!(
+            matches!(
+                err,
+                DiffError::VersionMismatch { expected: 2, actual: 5 }
+            ),
+            "expected VersionMismatch {{ expected: 2, actual: 5 }}, got {:?}",
+            err,
+        );
+    }
+
+    /// `apply_with_version` accepts when the live version matches.
+    /// Pins the success path so a future overzealous tightening
+    /// can't lock out legitimately-aligned diffs.
+    #[test]
+    fn apply_with_version_accepts_aligned_diff() {
+        let caps = sample_capability_set();
+        let diff = CapabilityDiff::new(1, 7, 8, vec![DiffOp::AddTag("training".into())]);
+
+        let applied = DiffEngine::apply_with_version(&caps, 7, &diff, false)
+            .expect("must accept aligned diff");
+        assert!(applied.has_tag("training"));
+    }
+
+    /// Future-dated diffs (`diff.base_version` ahead of
+    /// `current_version`) must also be rejected — the caller doesn't
+    /// have the intermediate state needed for the diff to make
+    /// sense, and silent acceptance would leave them with a forked
+    /// view of the capability set.
+    #[test]
+    fn apply_with_version_rejects_future_dated_diff() {
+        let caps = sample_capability_set();
+        let diff = CapabilityDiff::new(1, 10, 11, vec![DiffOp::AddTag("training".into())]);
+
+        let err = DiffEngine::apply_with_version(&caps, 5, &diff, false)
+            .expect_err("must reject future-dated diff");
+        assert!(
+            matches!(err, DiffError::VersionMismatch { expected: 10, actual: 5 }),
+            "expected VersionMismatch {{ expected: 10, actual: 5 }}, got {:?}",
+            err,
         );
     }
 

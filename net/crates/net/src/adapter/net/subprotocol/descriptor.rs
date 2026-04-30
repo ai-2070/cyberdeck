@@ -81,8 +81,27 @@ impl SubprotocolDescriptor {
     }
 
     /// Set the minimum compatible version.
+    ///
+    /// BUG #132: enforces the wire-format invariant
+    /// `min_compatible <= version` — pre-fix, a descriptor could be
+    /// built with `min_compatible > version`, which would break
+    /// `is_compatible_with`'s contract (every honest peer
+    /// computes `local.version.satisfies(other.min_compatible)`,
+    /// which silently fails for any version of `local` once
+    /// `other.min_compatible > other.version`). On the wire-format
+    /// side this enabled a phantom-incompatibility DoS where a
+    /// peer advertised `min_compatible=255.255` against
+    /// `version=1.0` and unilaterally evicted the subprotocol
+    /// from negotiation. The constructor (`new`) initializes
+    /// `min_compatible = version` so the invariant holds by
+    /// default; this setter clamps `min` to `self.version` if a
+    /// caller passes a higher value.
     pub fn with_min_compatible(mut self, min: SubprotocolVersion) -> Self {
-        self.min_compatible = min;
+        self.min_compatible = if min > self.version {
+            self.version
+        } else {
+            min
+        };
         self
     }
 
@@ -130,6 +149,18 @@ pub fn write_manifest_entry(desc: &SubprotocolDescriptor, buf: &mut impl BufMut)
 }
 
 /// Deserialize a manifest entry from bytes.
+///
+/// BUG #132: now rejects entries that violate the wire-format
+/// invariant `min_compatible <= version`. Pre-fix, a peer could
+/// advertise `version=1.0, min_compatible=255.255` and every
+/// honest peer's `negotiate()` would mark the subprotocol
+/// `incompatible` (because `local.version.satisfies(remote.min)`
+/// fails for any local), unilaterally evicting that subprotocol
+/// from negotiation between the victim and its peers — a
+/// phantom-incompatibility DoS that requires no actual presence
+/// on the channel. Returning `None` for such entries makes them
+/// surface as a parse error to the caller (the manifest is
+/// already structured to skip parse failures gracefully).
 pub fn read_manifest_entry(
     buf: &mut impl Buf,
 ) -> Option<(u16, SubprotocolVersion, SubprotocolVersion)> {
@@ -139,6 +170,9 @@ pub fn read_manifest_entry(
     let id = buf.get_u16_le();
     let version = SubprotocolVersion::new(buf.get_u8(), buf.get_u8());
     let min_compat = SubprotocolVersion::new(buf.get_u8(), buf.get_u8());
+    if min_compat > version {
+        return None;
+    }
     Some((id, version, min_compat))
 }
 
@@ -225,5 +259,78 @@ mod tests {
     fn test_descriptor_display() {
         let d = SubprotocolDescriptor::new(0x0400, "causal", SubprotocolVersion::new(1, 0));
         assert_eq!(format!("{}", d), "causal(0x0400) v1.0");
+    }
+
+    // ========================================================================
+    // BUG #132: read_manifest_entry / with_min_compatible must reject
+    // min_compatible > version (phantom-incompatibility DoS)
+    // ========================================================================
+
+    /// A manifest entry advertising `version=1.0, min_compat=255.255`
+    /// is rejected by `read_manifest_entry`. Pre-fix, every honest
+    /// peer would mark the subprotocol `incompatible` (because
+    /// `local.version.satisfies(remote.min_compat)` fails for any
+    /// local), letting an attacker unilaterally evict subprotocols.
+    #[test]
+    fn read_manifest_entry_rejects_min_compatible_above_version() {
+        // Hand-craft a manifest entry where min_compat > version.
+        // Wire layout: id(2) | version(2) | min_compat(2)
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0x1234u16.to_le_bytes()); // id
+        buf.extend_from_slice(&[1, 0]); // version 1.0
+        buf.extend_from_slice(&[255, 255]); // min_compat 255.255
+
+        let mut cursor = &buf[..];
+        let parsed = read_manifest_entry(&mut cursor);
+        assert!(
+            parsed.is_none(),
+            "read_manifest_entry must reject min_compat > version (BUG #132)",
+        );
+    }
+
+    /// `min_compatible == version` is accepted (it's the default
+    /// produced by `SubprotocolDescriptor::new`). Pins the
+    /// inclusive boundary so a future tightening that flips the
+    /// `>` to `>=` doesn't reject legitimate descriptors that
+    /// haven't bumped past their floor yet.
+    #[test]
+    fn read_manifest_entry_accepts_min_compatible_equal_to_version() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0x4242u16.to_le_bytes());
+        buf.extend_from_slice(&[3, 7]);
+        buf.extend_from_slice(&[3, 7]);
+
+        let mut cursor = &buf[..];
+        let (id, version, min_compat) =
+            read_manifest_entry(&mut cursor).expect("equal min_compat must be accepted");
+        assert_eq!(id, 0x4242);
+        assert_eq!(version, SubprotocolVersion::new(3, 7));
+        assert_eq!(min_compat, SubprotocolVersion::new(3, 7));
+    }
+
+    /// `with_min_compatible` clamps to `self.version` instead of
+    /// allowing a higher floor than the descriptor's own version.
+    /// Without the clamp, a local builder could produce a
+    /// descriptor that violates `is_compatible_with`'s wire-format
+    /// contract (no peer at any version could satisfy
+    /// `min > version`).
+    #[test]
+    fn with_min_compatible_clamps_to_version() {
+        let desc = SubprotocolDescriptor::new(0x1000, "x", SubprotocolVersion::new(1, 0))
+            .with_min_compatible(SubprotocolVersion::new(2, 5));
+        assert_eq!(
+            desc.min_compatible,
+            SubprotocolVersion::new(1, 0),
+            "with_min_compatible must clamp to self.version",
+        );
+    }
+
+    /// A legitimate downward-floor `min_compat <= version` is
+    /// preserved by the clamp.
+    #[test]
+    fn with_min_compatible_preserves_lower_floor() {
+        let desc = SubprotocolDescriptor::new(0x1000, "x", SubprotocolVersion::new(2, 5))
+            .with_min_compatible(SubprotocolVersion::new(1, 0));
+        assert_eq!(desc.min_compatible, SubprotocolVersion::new(1, 0));
     }
 }

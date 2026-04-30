@@ -36,8 +36,20 @@ pub struct ManifestEntry {
 
 impl SubprotocolManifest {
     /// Build a manifest from the local registry.
+    ///
+    /// BUG #149: entries are now sorted by `id` so the wire bytes
+    /// are deterministic across runs and builds. Pre-fix
+    /// `registry.list()` walked a `DashMap` whose iteration order
+    /// is non-deterministic, producing different `to_bytes()`
+    /// output for identical content. Today the manifest is
+    /// unsigned and not used in any digest dedup, so the
+    /// non-determinism was dormant — but the architecture comment
+    /// at the top of this module describes the manifest as
+    /// "exchanged during session setup," a surface that typically
+    /// ends up signed once a security model is added; sort by id
+    /// preempts that breakage.
     pub fn from_registry(registry: &SubprotocolRegistry) -> Self {
-        let entries = registry
+        let mut entries: Vec<ManifestEntry> = registry
             .list()
             .into_iter()
             .map(|d| ManifestEntry {
@@ -46,6 +58,7 @@ impl SubprotocolManifest {
                 min_compatible: d.min_compatible,
             })
             .collect();
+        entries.sort_by_key(|e| e.id);
         Self { entries }
     }
 
@@ -354,5 +367,48 @@ mod tests {
              can advertise both `causal v1.0` and `causal v0.1` and \
              trigger a downgrade (#10)"
         );
+    }
+
+    // ========================================================================
+    // BUG #149: from_registry must produce deterministic byte output
+    // ========================================================================
+
+    /// `from_registry().to_bytes()` is deterministic across
+    /// invocations — entries are sorted by `id` rather than left in
+    /// `DashMap` iteration order. Pre-fix, two calls on the same
+    /// registry could produce different byte sequences, which
+    /// silently breaks any signed-manifest or "same manifest? skip
+    /// re-negotiation" optimisation that lives downstream of this
+    /// API.
+    #[test]
+    fn from_registry_produces_deterministic_byte_output() {
+        let reg = SubprotocolRegistry::with_defaults();
+        // Take ten samples — DashMap iteration order across multiple
+        // shards is reliably non-deterministic given a populated
+        // registry, so ten samples either all match (proving the
+        // sort-by-id makes the output stable) or quickly diverge
+        // (proving the sort is missing).
+        let baseline = SubprotocolManifest::from_registry(&reg).to_bytes();
+        for i in 0..10 {
+            let sample = SubprotocolManifest::from_registry(&reg).to_bytes();
+            assert_eq!(
+                sample, baseline,
+                "from_registry().to_bytes() iteration {i} must match baseline — \
+                 non-determinism here breaks any future signed-manifest scheme",
+            );
+        }
+    }
+
+    /// Entries inside a manifest from `from_registry` are sorted by
+    /// `id` ascending. This is the structural invariant the byte-
+    /// determinism test rests on.
+    #[test]
+    fn from_registry_returns_entries_sorted_by_id() {
+        let reg = SubprotocolRegistry::with_defaults();
+        let manifest = SubprotocolManifest::from_registry(&reg);
+        let ids: Vec<u16> = manifest.entries.iter().map(|e| e.id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "manifest entries must be sorted by id");
     }
 }

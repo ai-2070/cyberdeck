@@ -447,10 +447,42 @@ impl SnapshotStore {
         }
     }
 
-    /// Store a snapshot (replaces any existing snapshot for this entity).
-    pub fn store(&self, snapshot: StateSnapshot) {
+    /// Store a snapshot if it is newer than the existing entry.
+    ///
+    /// Returns `true` when the snapshot was stored, `false` when an
+    /// existing snapshot with a strictly higher (or equal)
+    /// `through_seq` blocked the write — i.e. an older / replayed
+    /// snapshot tried to overwrite a fresher one.
+    ///
+    /// BUG #122: pre-fix this method called
+    /// `self.snapshots.insert(key, snapshot)` unconditionally, with
+    /// no comparison against the existing entry's `through_seq`. A
+    /// reordered or replayed snapshot delivery silently rewrote
+    /// state at sequence N over an existing one at N+M — and
+    /// concurrent stores raced (whichever DashMap insert landed
+    /// last won regardless of freshness). Now uses
+    /// `DashMap::entry` to make the read-compare-write atomic per
+    /// shard. Equal `through_seq` is also rejected so a re-
+    /// emission of the *same* snapshot from a stale producer doesn't
+    /// thrash the entry (refresh-with-equal must explicitly
+    /// `remove` first if intentional).
+    pub fn store(&self, snapshot: StateSnapshot) -> bool {
+        use dashmap::mapref::entry::Entry;
         let key = *snapshot.entity_id.as_bytes();
-        self.snapshots.insert(key, snapshot);
+        match self.snapshots.entry(key) {
+            Entry::Vacant(slot) => {
+                slot.insert(snapshot);
+                true
+            }
+            Entry::Occupied(mut slot) => {
+                if snapshot.through_seq > slot.get().through_seq {
+                    slot.insert(snapshot);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
     }
 
     /// Get the latest snapshot for an entity.
@@ -542,7 +574,8 @@ mod tests {
             ObservedHorizon::new(),
         );
 
-        store.store(snapshot);
+        let stored = store.store(snapshot);
+        assert!(stored, "first store of an entity must succeed");
         assert_eq!(store.count(), 1);
 
         let retrieved = store.get(&entity_id).unwrap();
@@ -562,7 +595,7 @@ mod tests {
             Bytes::from_static(b"state-v1"),
             ObservedHorizon::new(),
         );
-        store.store(snap1);
+        assert!(store.store(snap1));
 
         let mut builder = CausalChainBuilder::new(origin_hash);
         builder.append(Bytes::from_static(b"e1"), 0).unwrap();
@@ -573,7 +606,7 @@ mod tests {
             Bytes::from_static(b"state-v2"),
             ObservedHorizon::new(),
         );
-        store.store(snap2);
+        assert!(store.store(snap2));
 
         assert_eq!(store.count(), 1);
         let retrieved = store.get(&entity_id).unwrap();
@@ -584,6 +617,129 @@ mod tests {
     #[test]
     fn test_from_bytes_too_short() {
         assert!(StateSnapshot::from_bytes(&[0u8; 10]).is_none());
+    }
+
+    // ========================================================================
+    // BUG #122: store() must reject older snapshots (no rewind)
+    // ========================================================================
+
+    /// Building snapshots via the chain helper makes the
+    /// `chain_link.sequence` actually-match `through_seq`, which is
+    /// the wire-level invariant `from_bytes` enforces. Tests below
+    /// drive the real public API rather than poking through_seq
+    /// directly so the regression resembles the production failure
+    /// mode (signed snapshots arriving in non-monotonic order).
+    fn snap_at(
+        entity_id: EntityId,
+        builder: &mut CausalChainBuilder,
+        state_bytes: &'static [u8],
+    ) -> StateSnapshot {
+        StateSnapshot::new(
+            entity_id,
+            *builder.head(),
+            Bytes::from_static(state_bytes),
+            ObservedHorizon::new(),
+        )
+    }
+
+    /// An older snapshot (lower `through_seq`) arriving after a
+    /// newer one must NOT overwrite the newer entry. Pre-fix
+    /// `store` unconditionally inserted, so a replayed or reordered
+    /// older snapshot silently rolled state back. Now `store`
+    /// returns `false` and the existing entry is preserved.
+    #[test]
+    fn store_rejects_older_snapshot_against_newer_existing_entry() {
+        let store = SnapshotStore::new();
+        let kp = EntityKeypair::generate();
+        let entity_id = kp.entity_id().clone();
+        let mut builder = CausalChainBuilder::new(kp.origin_hash());
+
+        // newer snapshot at seq 5
+        for _ in 0..5 {
+            builder.append(Bytes::from_static(b"e"), 0).unwrap();
+        }
+        let newer = snap_at(entity_id.clone(), &mut builder, b"v5");
+        assert_eq!(newer.through_seq, 5);
+        assert!(store.store(newer), "first store must succeed");
+
+        // older snapshot at seq 2 (rebuild a fresh chain)
+        let mut older_builder = CausalChainBuilder::new(kp.origin_hash());
+        for _ in 0..2 {
+            older_builder.append(Bytes::from_static(b"e"), 0).unwrap();
+        }
+        let older = snap_at(entity_id.clone(), &mut older_builder, b"v2");
+        assert_eq!(older.through_seq, 2);
+        let stored = store.store(older);
+
+        assert!(!stored, "older snapshot must be rejected");
+        let retrieved = store.get(&entity_id).unwrap();
+        assert_eq!(
+            retrieved.state,
+            Bytes::from_static(b"v5"),
+            "newer snapshot must be preserved despite older arrival",
+        );
+        assert_eq!(retrieved.through_seq, 5);
+    }
+
+    /// Equal `through_seq` is rejected too — a re-emission from a
+    /// stale producer shouldn't churn the entry. Callers that
+    /// genuinely need to refresh-at-same-seq (e.g. legitimate
+    /// rebind) must `remove` first.
+    #[test]
+    fn store_rejects_equal_through_seq_against_existing_entry() {
+        let store = SnapshotStore::new();
+        let kp = EntityKeypair::generate();
+        let entity_id = kp.entity_id().clone();
+        let mut builder = CausalChainBuilder::new(kp.origin_hash());
+        for _ in 0..3 {
+            builder.append(Bytes::from_static(b"e"), 0).unwrap();
+        }
+        let first = snap_at(entity_id.clone(), &mut builder, b"first");
+        assert_eq!(first.through_seq, 3);
+        assert!(store.store(first));
+
+        let mut other = CausalChainBuilder::new(kp.origin_hash());
+        for _ in 0..3 {
+            other.append(Bytes::from_static(b"e"), 0).unwrap();
+        }
+        let second = snap_at(entity_id.clone(), &mut other, b"second");
+        assert_eq!(second.through_seq, 3);
+        let stored = store.store(second);
+
+        assert!(!stored, "equal through_seq must be rejected");
+        let retrieved = store.get(&entity_id).unwrap();
+        assert_eq!(
+            retrieved.state,
+            Bytes::from_static(b"first"),
+            "first-stored snapshot must remain authoritative on equal through_seq",
+        );
+    }
+
+    /// Strictly newer `through_seq` is accepted — pins the success
+    /// path so a future tightening that flips `>` to `>=` can't
+    /// silently break legitimate progressive snapshots.
+    #[test]
+    fn store_accepts_strictly_newer_snapshot() {
+        let store = SnapshotStore::new();
+        let kp = EntityKeypair::generate();
+        let entity_id = kp.entity_id().clone();
+        let mut builder = CausalChainBuilder::new(kp.origin_hash());
+        for _ in 0..2 {
+            builder.append(Bytes::from_static(b"e"), 0).unwrap();
+        }
+        let earlier = snap_at(entity_id.clone(), &mut builder, b"v2");
+        assert!(store.store(earlier));
+
+        for _ in 0..3 {
+            builder.append(Bytes::from_static(b"e"), 0).unwrap();
+        }
+        let later = snap_at(entity_id.clone(), &mut builder, b"v5");
+        assert_eq!(later.through_seq, 5);
+        assert!(store.store(later), "newer snapshot must be accepted");
+
+        let retrieved = store.get(&entity_id).unwrap();
+        assert_eq!(retrieved.through_seq, 5);
+        assert_eq!(retrieved.state, Bytes::from_static(b"v5"));
     }
 
     // ---- Regression tests for Cubic AI findings ----
