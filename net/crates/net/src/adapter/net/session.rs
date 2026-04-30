@@ -805,8 +805,39 @@ impl RxCreditState {
             return None;
         }
         let new_consumed = self.consumed.fetch_add(bytes, Ordering::AcqRel) + bytes;
-        self.granted.fetch_add(bytes, Ordering::AcqRel);
-        Some(new_consumed)
+
+        // BUG #84: previously this unconditionally bumped
+        // `granted` by `bytes`, so `granted - consumed` stayed
+        // pinned at the initial window forever — the sender's
+        // remaining credit never dropped regardless of how
+        // slowly the application drained, defeating receive-side
+        // backpressure entirely. The docstring on this struct
+        // (~lines 723-726) explicitly promises a *threshold*-
+        // emit pattern: "When the sender's implicit remaining
+        // credit dips below half the window, a `StreamWindow`
+        // grant is emitted and `granted` is bumped." The fix
+        // implements that contract.
+        //
+        // Emit a grant only when outstanding has dipped to or
+        // below half the window. The returned `Some(consumed)`
+        // is what the caller ships on the wire as the
+        // `total_consumed` field of a `StreamWindow` packet, so
+        // the sender can recompute its remaining credit
+        // authoritatively. When this returns `None`, the
+        // receiver has accepted the bytes but is below the
+        // emit threshold, and the sender's credit count
+        // continues to draw down.
+        let granted_before = self.granted.load(Ordering::Acquire);
+        let outstanding = granted_before.saturating_sub(new_consumed);
+        if outstanding <= (self.window_bytes as u64) / 2 {
+            // Bump granted by one window chunk so subsequent
+            // calls don't immediately re-fire the threshold.
+            self.granted
+                .fetch_add(self.window_bytes as u64, Ordering::AcqRel);
+            Some(new_consumed)
+        } else {
+            None
+        }
     }
 }
 
@@ -1816,13 +1847,61 @@ mod tests {
 
     #[test]
     fn test_rx_credit_emits_authoritative_total_consumed() {
-        // Every `on_bytes_consumed` returns the receiver's running
-        // cumulative consumed count, which the caller ships as the
-        // `total_consumed` field of an authoritative grant.
+        // After BUG #84 fix: `on_bytes_consumed` returns
+        // `Some(consumed)` only when outstanding has dipped to or
+        // below `window_bytes / 2` (the threshold-emit pattern the
+        // docstring promises). The returned value is the running
+        // cumulative consumed-byte count.
+        //
+        // window_bytes=100, threshold=50, initial granted=100.
         let state = StreamState::new_full(false, 1, 100);
+
+        // 60 bytes consumed → outstanding = 100-60 = 40 ≤ 50.
+        // Threshold hit → emit grant (granted bumps to 200) and
+        // return Some(60).
         assert_eq!(state.on_bytes_consumed(60), Some(60));
-        assert_eq!(state.on_bytes_consumed(14), Some(74));
-        assert_eq!(state.on_bytes_consumed(1), Some(75));
+
+        // 14 more bytes → consumed=74, outstanding = 200-74=126 > 50.
+        // Below threshold → no grant, return None.
+        assert_eq!(state.on_bytes_consumed(14), None);
+
+        // 1 more byte → consumed=75, outstanding = 200-75=125 > 50.
+        // Below threshold → no grant, return None.
+        assert_eq!(state.on_bytes_consumed(1), None);
+
+        // Drive consumed past the next threshold (250-150=100 > 50,
+        // so we need consumed ≥ 150 for outstanding ≤ 50). At
+        // consumed=150, outstanding = 200-150=50 ≤ 50 → emit.
+        assert_eq!(state.on_bytes_consumed(75), Some(150));
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #84: previously
+    /// `on_bytes_consumed` unconditionally bumped `granted` by
+    /// `bytes`, so `granted - consumed` (sender's effective
+    /// remaining credit from the receiver's POV) stayed pinned at
+    /// the initial window forever — the receiver never applied
+    /// backpressure regardless of how slowly the application
+    /// drained. This test pins the threshold-emit invariant: the
+    /// receiver's `outstanding` must actually drop as bytes flow
+    /// in, and only re-replenish via discrete grant emissions.
+    #[test]
+    fn rx_credit_outstanding_drops_as_bytes_flow() {
+        let state = StreamState::new_full(false, 1, 100);
+        // Initial state: granted=100, consumed=0, outstanding=100.
+
+        // 30 bytes: outstanding = 100-30 = 70 > 50. No grant.
+        assert_eq!(state.on_bytes_consumed(30), None);
+        // Pre-fix: outstanding would have stayed at 100 forever.
+        // Post-fix: outstanding has actually dropped.
+
+        // 20 more bytes: outstanding = 100-50 = 50 ≤ 50. Grant
+        // fires; granted goes to 200; outstanding now 200-50=150.
+        assert_eq!(state.on_bytes_consumed(20), Some(50));
+
+        // 100 more bytes without crossing the next threshold (the
+        // next emit fires when consumed reaches 150 → outstanding
+        // = 200-150 = 50 ≤ 50). 50 + 100 = 150, exactly at threshold.
+        assert_eq!(state.on_bytes_consumed(100), Some(150));
     }
 
     #[test]
@@ -1849,12 +1928,14 @@ mod tests {
         // fastest if the invariant regresses.
         let state = StreamState::new_full(true, 1, 100); // reliable
 
-        // First packet at seq=0: accepted → credit the bytes.
+        // First packet at seq=0: accepted. Use a payload size that
+        // crosses the emit threshold (≤ window/2 = 50 outstanding):
+        // 60 bytes consumed → outstanding = 100-60 = 40 ≤ 50 → emit.
         assert!(
             state.with_reliability(|r| r.on_receive(0)),
             "new seq must be accepted"
         );
-        assert_eq!(state.on_bytes_consumed(40), Some(40));
+        assert_eq!(state.on_bytes_consumed(60), Some(60));
 
         // Replay of seq=0: rejected. The dispatcher MUST NOT call
         // `on_bytes_consumed` in this branch. We document that
@@ -1866,12 +1947,14 @@ mod tests {
             "duplicate seq must be rejected by the reliability layer"
         );
 
-        // Sanity: the rx-credit state reflects only the one
-        // accepted packet — `granted = window_bytes + 40`,
-        // `consumed = 40`.
+        // Sanity: the rx-credit state reflects the one accepted
+        // packet that crossed threshold. After the threshold-emit
+        // fix (#84), `granted` bumps by `window_bytes` (100), not
+        // by `bytes` (60). So `granted = 100 (initial) + 100
+        // (one window chunk) = 200`, `consumed = 60`.
         let rx = state.rx_credit();
-        assert_eq!(rx.consumed(), 40);
-        assert_eq!(rx.granted(), 100 + 40);
+        assert_eq!(rx.consumed(), 60);
+        assert_eq!(rx.granted(), 200);
     }
 
     fn session_with_stream(stream_id: u64, tx_window: u32) -> Arc<NetSession> {

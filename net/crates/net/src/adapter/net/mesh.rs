@@ -126,6 +126,73 @@ fn graph_id_to_node_id(graph_id: &[u8; 32]) -> u64 {
 /// as if the network link is severed.
 pub type PartitionFilter = Arc<dashmap::DashSet<SocketAddr>>;
 
+/// Cancellation-safe rollback for a freshly registered peer
+/// session + addr map + routing entry.
+///
+/// `handle_routed_handshake` (BUG #87) used to spawn a fire-and-
+/// forget `tokio::spawn` whose only rollback was inside the spawned
+/// future's error arm. If that future was cancelled (runtime
+/// shutdown, parent task abort) before the send completed, the
+/// rollback never ran and the responder kept session keys the
+/// initiator never received the matching msg2 for — wedged forever
+/// with no idle sweeper to reap it.
+///
+/// This guard moves the rollback into `Drop`, which runs
+/// synchronously whenever the spawned future is dropped. The
+/// successful-send arm calls `commit()` to consume the guard
+/// without invoking `Drop` (`std::mem::forget`); cancellation,
+/// panic, or any non-success path lets the guard drop naturally,
+/// and `Drop` reverts all three registrations.
+struct PeerRegistrationGuard {
+    peer_node_id: u64,
+    registered_next_hop: SocketAddr,
+    peers: Arc<DashMap<u64, PeerInfo>>,
+    peer_addrs: Arc<DashMap<u64, SocketAddr>>,
+    router: Arc<NetRouter>,
+}
+
+impl PeerRegistrationGuard {
+    /// Mark the registration as durable. Drops `self` *without*
+    /// running the rollback — the post-handshake send completed
+    /// successfully, so the registrations should stay in place.
+    fn commit(self) {
+        // `mem::forget` skips `Drop`. The Arc fields would
+        // normally decrement on drop, but since we want them
+        // alive (they're shared with the rest of the bus), we
+        // need to drop them manually before forgetting the
+        // wrapper. SAFETY: reading the Arc fields out of the
+        // struct via `ptr::read` and forgetting the rest is the
+        // standard cancel-Drop pattern.
+        let me = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `me` is `ManuallyDrop`, so its fields won't be
+        // dropped automatically. We read them out and let them
+        // drop normally, which decrements the Arc strong counts
+        // — exactly what would happen on a non-guarded path.
+        unsafe {
+            let _peers = std::ptr::read(&me.peers);
+            let _peer_addrs = std::ptr::read(&me.peer_addrs);
+            let _router = std::ptr::read(&me.router);
+        }
+    }
+}
+
+impl Drop for PeerRegistrationGuard {
+    fn drop(&mut self) {
+        // Match the original inline rollback's semantics: only
+        // remove entries whose addr / next-hop still equals the
+        // value we wrote. A concurrent retry for the same peer
+        // may have already replaced them with a fresh, valid
+        // registration — we must not overwrite that.
+        self.peers
+            .remove_if(&self.peer_node_id, |_, pi| pi.addr == self.registered_next_hop);
+        self.peer_addrs
+            .remove_if(&self.peer_node_id, |_, addr| *addr == self.registered_next_hop);
+        self.router
+            .routing_table()
+            .remove_route_if_next_hop_is(self.peer_node_id, self.registered_next_hop);
+    }
+}
+
 /// Shared context for the packet dispatch loop.
 struct DispatchCtx {
     local_node_id: u64,
@@ -2592,27 +2659,47 @@ impl MeshNode {
         // pointing at `source` — if a concurrent handshake for the same
         // `peer_node_id` already installed a newer (valid) route, we must
         // not overwrite it.
+        //
+        // BUG #87: previously this was a fire-and-forget `tokio::spawn`
+        // whose only rollback fired from inside the spawned future on
+        // socket-send error. If the runtime was shutting down or the
+        // spawned task was cancelled before the send completed, the
+        // rollback never ran and the peer/session/route survived in an
+        // unsendable state — the responder held session keys the
+        // initiator never received the matching msg2 for, with no idle
+        // sweeper to reap unsendable peer entries. Now: a Drop guard
+        // owns the rollback. The send marks the guard `completed` only
+        // on success; cancellation, panic, or any non-success drops the
+        // guard, which runs the rollback. Drop is invoked synchronously
+        // when the spawned future is dropped (whether by cancellation
+        // or normal completion), so the rollback is no longer dependent
+        // on the future actually awaiting through to its error arm.
         let socket = ctx.socket.clone();
-        let peers = ctx.peers.clone();
-        let peer_addrs = ctx.peer_addrs.clone();
-        let router = ctx.router.clone();
-        let registered_next_hop = source;
         let payload = routed.freeze();
+        let guard = PeerRegistrationGuard {
+            peer_node_id,
+            registered_next_hop: source,
+            peers: ctx.peers.clone(),
+            peer_addrs: ctx.peer_addrs.clone(),
+            router: ctx.router.clone(),
+        };
         tokio::spawn(async move {
-            if let Err(e) = socket.send_to(&payload, next_hop).await {
-                tracing::warn!(
-                    peer = format!("{:#x}", peer_node_id),
-                    error = %e,
-                    "routed handshake: msg2 send failed; unregistering peer"
-                );
-                // Only remove entries that still match what we wrote;
-                // a concurrent retry for the same peer may have already
-                // replaced them with a fresh, valid registration.
-                peers.remove_if(&peer_node_id, |_, pi| pi.addr == registered_next_hop);
-                peer_addrs.remove_if(&peer_node_id, |_, addr| *addr == registered_next_hop);
-                router
-                    .routing_table()
-                    .remove_route_if_next_hop_is(peer_node_id, registered_next_hop);
+            match socket.send_to(&payload, next_hop).await {
+                Ok(_) => {
+                    // `commit` consumes the guard via `mem::forget`,
+                    // so the rollback Drop is skipped and the
+                    // registrations stay in place.
+                    guard.commit();
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        peer = format!("{:#x}", peer_node_id),
+                        error = %e,
+                        "routed handshake: msg2 send failed; unregistering peer"
+                    );
+                    // `guard` drops at end of scope, running the
+                    // rollback.
+                }
             }
         });
     }
@@ -7271,6 +7358,255 @@ mod heartbeat_aead_tests {
             "heartbeat with garbage AEAD tag must NOT verify — pre-fix the \
              mesh dispatcher would have called session.touch() / \
              failure_detector.heartbeat() unconditionally"
+        );
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #87: dropping
+    /// a `PeerRegistrationGuard` whose `completed` flag is still
+    /// `false` (cancellation, panic, or non-success path) must
+    /// run the same rollback the legacy inline error arm did —
+    /// remove the peer entry, peer-addr mapping, and routing
+    /// table entry, but only if those entries still match the
+    /// values this handshake wrote (a concurrent retry may have
+    /// replaced them).
+    #[tokio::test]
+    async fn peer_registration_guard_rolls_back_on_drop_when_not_completed() {
+        let peer_id = 0xDEAD_BEEFu64;
+        let next_hop: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+
+        let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let router = Arc::new(
+            NetRouter::new(crate::adapter::net::router::RouterConfig::new(
+                0xCAFE_BABE,
+                "127.0.0.1:0".parse().unwrap(),
+            ))
+            .await
+            .unwrap(),
+        );
+
+        // Simulate the post-handshake registration: insert peer,
+        // peer-addr, and a route. We can't construct a fully-
+        // populated `PeerInfo` without the matched session keys,
+        // but the rollback only inspects `pi.addr`, so we build
+        // a minimal session and check post-Drop that the entry
+        // is gone.
+        let (init_keys, _resp_keys) = make_session_keys();
+        let session = Arc::new(NetSession::new(
+            init_keys,
+            next_hop,
+            4,
+            false,
+        ));
+        peers.insert(
+            peer_id,
+            PeerInfo {
+                node_id: peer_id,
+                addr: next_hop,
+                session,
+                remote_static_pub: [0u8; 32],
+            },
+        );
+        peer_addrs.insert(peer_id, next_hop);
+        router.add_route(peer_id, next_hop);
+
+        // Drop guard without committing.
+        {
+            let _guard = PeerRegistrationGuard {
+                peer_node_id: peer_id,
+                registered_next_hop: next_hop,
+                peers: peers.clone(),
+                peer_addrs: peer_addrs.clone(),
+                router: router.clone(),
+            };
+        } // Drop runs here.
+
+        assert!(
+            !peers.contains_key(&peer_id),
+            "peers entry must be removed by Drop rollback"
+        );
+        assert!(
+            !peer_addrs.contains_key(&peer_id),
+            "peer_addrs entry must be removed by Drop rollback"
+        );
+        assert!(
+            router.routing_table().lookup(peer_id).is_none(),
+            "route must be removed by Drop rollback"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_registration_guard_is_no_op_on_drop_when_completed() {
+        let peer_id = 0xCAFE_F00Du64;
+        let next_hop: SocketAddr = "10.0.0.2:9000".parse().unwrap();
+
+        let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let router = Arc::new(
+            NetRouter::new(crate::adapter::net::router::RouterConfig::new(
+                0xCAFE_BABE,
+                "127.0.0.1:0".parse().unwrap(),
+            ))
+            .await
+            .unwrap(),
+        );
+
+        let (init_keys, _resp_keys) = make_session_keys();
+        let session = Arc::new(NetSession::new(
+            init_keys,
+            next_hop,
+            4,
+            false,
+        ));
+        peers.insert(
+            peer_id,
+            PeerInfo {
+                node_id: peer_id,
+                addr: next_hop,
+                session,
+                remote_static_pub: [0u8; 32],
+            },
+        );
+        peer_addrs.insert(peer_id, next_hop);
+        router.add_route(peer_id, next_hop);
+
+        {
+            let guard = PeerRegistrationGuard {
+                peer_node_id: peer_id,
+                registered_next_hop: next_hop,
+                peers: peers.clone(),
+                peer_addrs: peer_addrs.clone(),
+                router: router.clone(),
+            };
+            // Successful-send path consumes the guard without
+            // running Drop's rollback.
+            guard.commit();
+        }
+
+        assert!(peers.contains_key(&peer_id));
+        assert!(peer_addrs.contains_key(&peer_id));
+        assert!(router.routing_table().lookup(peer_id).is_some());
+    }
+
+    /// Regression: if a concurrent retry has overwritten the
+    /// peer-addr / route to a different next-hop, the guard's
+    /// rollback must NOT clobber the newer (valid) registration.
+    /// Mirrors the `remove_if`/`remove_route_if_next_hop_is`
+    /// guarantees from the original inline rollback.
+    #[tokio::test]
+    async fn peer_registration_guard_preserves_concurrent_overwrite() {
+        let peer_id = 0xFACE_F00Du64;
+        let stale: SocketAddr = "10.0.0.3:9000".parse().unwrap();
+        let fresh: SocketAddr = "10.0.0.4:9000".parse().unwrap();
+
+        let peers: Arc<DashMap<u64, PeerInfo>> = Arc::new(DashMap::new());
+        let peer_addrs: Arc<DashMap<u64, SocketAddr>> = Arc::new(DashMap::new());
+        let router = Arc::new(
+            NetRouter::new(crate::adapter::net::router::RouterConfig::new(
+                0xCAFE_BABE,
+                "127.0.0.1:0".parse().unwrap(),
+            ))
+            .await
+            .unwrap(),
+        );
+
+        let (init_keys, _resp_keys) = make_session_keys();
+        let session = Arc::new(NetSession::new(
+            init_keys,
+            fresh,
+            4,
+            false,
+        ));
+        // Concurrent retry has overwritten with `fresh` — the
+        // stale guard about to drop should NOT remove this.
+        peers.insert(
+            peer_id,
+            PeerInfo {
+                node_id: peer_id,
+                addr: fresh,
+                session,
+                remote_static_pub: [0u8; 32],
+            },
+        );
+        peer_addrs.insert(peer_id, fresh);
+        router.add_route(peer_id, fresh);
+
+        {
+            let _guard = PeerRegistrationGuard {
+                peer_node_id: peer_id,
+                registered_next_hop: stale, // NOT what's currently in the maps
+                peers: peers.clone(),
+                peer_addrs: peer_addrs.clone(),
+                router: router.clone(),
+            };
+        }
+
+        assert!(
+            peers.contains_key(&peer_id),
+            "peers must keep the fresh (concurrent-retry) entry"
+        );
+        assert_eq!(*peer_addrs.get(&peer_id).unwrap(), fresh);
+        assert_eq!(router.routing_table().lookup(peer_id), Some(fresh));
+    }
+
+    /// Regression for BUG_AUDIT_2026_04_30_CORE.md #97: the
+    /// production heartbeat path must (a) build with the
+    /// session's actual TX key — not `&[0u8; 32]` — and (b) use a
+    /// **shared** `tx_counter` across builders so successive
+    /// heartbeats don't all encrypt under counter=0 and trigger
+    /// the receiver's replay window. Both bugs were latent before
+    /// #85 wired up AEAD verification on the mesh receiver; this
+    /// test pins the post-fix invariant by acquiring two builders
+    /// from the SAME session pool (mirroring what the heartbeat
+    /// timer at `mesh.rs:3220` does on each tick) and verifying
+    /// that BOTH heartbeats verify against the peer session in
+    /// order. Pre-fix behavior with the all-zero key would fail
+    /// the first verify; pre-fix behavior with per-builder
+    /// counters would fail the second.
+    #[test]
+    fn pooled_heartbeat_builds_succeed_in_sequence_and_verify() {
+        let (init_keys, resp_keys) = make_session_keys();
+        let init_session = NetSession::new(
+            init_keys.clone(),
+            "127.0.0.1:5001".parse().unwrap(),
+            4,
+            false,
+        );
+        let resp_session = NetSession::new(
+            resp_keys,
+            "127.0.0.1:5000".parse().unwrap(),
+            4,
+            false,
+        );
+
+        // Mirror the production sender at `mesh.rs:3220` —
+        // acquire from the session's pool, not a fresh builder.
+        let h1_bytes = {
+            let mut pooled = init_session.packet_pool().get();
+            pooled.build_heartbeat()
+        };
+        let h2_bytes = {
+            let mut pooled = init_session.packet_pool().get();
+            pooled.build_heartbeat()
+        };
+
+        let p1 = ParsedPacket::parse(h1_bytes, "127.0.0.1:5001".parse().unwrap())
+            .expect("first heartbeat must parse");
+        let p2 = ParsedPacket::parse(h2_bytes, "127.0.0.1:5001".parse().unwrap())
+            .expect("second heartbeat must parse");
+
+        assert!(
+            verify_heartbeat_aead(&p1, &resp_session),
+            "first pooled heartbeat must verify — pre-fix the \
+             all-zero key would have produced an AEAD tag the \
+             receiver couldn't decrypt"
+        );
+        assert!(
+            verify_heartbeat_aead(&p2, &resp_session),
+            "second pooled heartbeat must also verify — pre-fix, \
+             a per-builder fresh counter would reuse counter=0 \
+             and the receiver's replay window would reject this \
+             as a duplicate"
         );
     }
 

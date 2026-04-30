@@ -18,7 +18,15 @@ pub const MAX_DEPTH: u8 = 4;
 /// Zero (`0x00000000`) means global / no subnet. Trailing zeros mean
 /// "no sub-level specified" — `SubnetId::new(&[3, 7])` represents
 /// region=3, fleet=7, with no vehicle or subsystem restriction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+///
+/// `Ord` is derived on the inner `u32` representation. The order
+/// has no semantic meaning for the hierarchy (it does NOT match
+/// ancestor/descendant relationships); it exists purely as a
+/// deterministic tiebreaker for callers that need a total order
+/// over `SubnetId`s — e.g. `correlation.rs::analyze_subnet_correlation`
+/// (BUG #91) needs ties at the same depth to resolve consistently
+/// across runs rather than depending on `HashMap` iteration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 pub struct SubnetId(u32);
 
 impl SubnetId {

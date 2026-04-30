@@ -23,10 +23,11 @@ Extended scope (#97 onward): a third multi-agent sweep covered the remaining UDP
 
 ## Status (running tally)
 
-**Outstanding:** #55, #56, #57, #58, #59, #60, #61, #62, #63, #64, #65, #66, #67, #68, #69, #70, #71, #72, #73, #74, #75, #76, #77, #78, #79, #81, #84, #86, #87, #89, #91, #93, #98, #99, #100, #101, #102, #103, #104, #105, #106, #107, #108, #109, #110, #111, #112, #113, #114, #115, #116, #117, #118, #119, #120
+**Outstanding:** #55, #56, #57, #58, #59, #60, #61, #62, #63, #64, #65, #66, #67, #68, #69, #70, #71, #72, #73, #74, #75, #76, #77, #78, #79, #84, #86, #87, #89, #91, #93, #98, #99, #100, #101, #102, #103, #104, #105, #106, #107, #108, #109, #110, #111, #112, #113, #114, #115, #116, #117, #118, #119, #120
 
 **Fixed on 2026-04-30 (with regression tests where reasonable):**
 - **#80** — `Net::shutdown` now routes through `EventBus::shutdown_via_ref(&self)`, an idempotent reference-based shutdown that runs regardless of outstanding `Arc<EventBus>` clones. Tests: `sdk/tests/shutdown_regression.rs::{shutdown_runs_even_with_outstanding_event_stream, shutdown_via_ref_is_idempotent}`.
+- **#81** — implicitly fixed by #80. With `shutdown_via_ref` no longer gating on `Arc::try_unwrap`, `EventStream`'s perpetuated `Arc<EventBus>` clones are now benign — shutdown still runs, in-flight poll futures observe the `shutdown_completed` flag on their next operation, and the inner bus drops when the last clone is released. Same tests as #80.
 - **#82** — `manual_scale_down` now drives the full lifecycle (scale_down → poll for empty → finalize_draining → remove_shard_internal) rather than only marking shards `Draining`. Now async. Test: `bus::tests::manual_scale_down_finalizes_and_removes_drained_shards`.
 - **#83** — `ShardManager::remove_shard` now calls `mapper.remove_stopped_shards()` after the manager-level removal, so the mapper's `shards: RwLock<Vec<MappedShard>>` no longer accumulates `Stopped` entries indefinitely across scale-up/down cycles. Implicitly covered by `manual_scale_down` regression test (which would underflow `num_shards` if mapper-side cleanup was missing).
 - **#85** — Mesh dispatch now invokes the new `verify_heartbeat_aead` helper (which mirrors the legacy adapter's AEAD verification) before touching `failure_detector` or `session.touch()`. Tests: `mesh::heartbeat_aead_tests::{aead_authenticated_heartbeat_passes_verification, unauthenticated_heartbeat_fails_verification, replay_of_authenticated_heartbeat_fails_verification_on_second_try}`.
@@ -35,7 +36,7 @@ Extended scope (#97 onward): a third multi-agent sweep covered the remaining UDP
 - **#92** — `sweep_retention` now renormalizes `state.index` offsets to be segment-relative and rebases `segment.base_offset` to 0 after a successful `compact_to`. Test: `redex::file::tests::sweep_retention_post_sweep_appends_survive_restart`.
 - **#94** — `append_entry_inner` and `append_entries_inner` now wrap the second/third `metadata()` calls in an explicit `match` that runs the dat (and dat+idx) rollback before returning, instead of relying on `?` which short-circuits the rollback paths. Tests: `redex::file::tests::{append_rolls_back_dat_on_idx_metadata_failure, append_rolls_back_dat_and_idx_on_ts_metadata_failure}`.
 - **#95** — `sweep_retention` now performs `disk.compact_to` BEFORE mutating in-memory state. Test: `redex::file::tests::sweep_retention_keeps_in_memory_state_when_disk_compact_fails`.
-- **#97** (third-pass entry) — both heartbeat senders (`mesh.rs:3220` and the legacy `mod.rs:841`) now acquire from the session's shared `packet_pool()` instead of constructing fresh `PacketBuilder::new(&[0u8; 32], ...)` on every tick. The all-zero key meant the AEAD tag never matched the receiver's RX cipher; the fresh `tx_counter` per-builder meant successive heartbeats reused counter=0 (replay-rejected post-#85). The session pool fixes both — same key, persistent counter. Implicitly verified by `failure_detector_matrix::*` (which exercise heartbeats end-to-end across real Mesh nodes); broke without this fix once #85 verification went live.
+- **#97** (third-pass entry) — both heartbeat senders (`mesh.rs:3220` and the legacy `mod.rs:841`) now acquire from the session's shared `packet_pool()` instead of constructing fresh `PacketBuilder::new(&[0u8; 32], ...)` on every tick. The all-zero key meant the AEAD tag never matched the receiver's RX cipher; the fresh `tx_counter` per-builder meant successive heartbeats reused counter=0 (replay-rejected post-#85). The session pool fixes both — same key, persistent counter. Tests: targeted unit test `mesh::heartbeat_aead_tests::pooled_heartbeat_builds_succeed_in_sequence_and_verify` (acquires two heartbeats from the same session pool and verifies both decode against the peer's RX cipher in order — pins both the key and the counter dimensions); end-to-end coverage from `failure_detector_matrix::*` (drives real Mesh handshakes and depends on legitimate heartbeats keeping unaffected peers `Healthy` — these tests broke without this fix once #85 verification went live).
 
 **Refuted on verification:** #96 (`read_timestamps` torn-tail alignment — alignment is preserved by construction, see entry).
 
@@ -102,6 +103,8 @@ The mesh-FFI side has an explicit regression test (`net_mesh_shutdown_runs_even_
 `EventStream::new(self.bus.clone(), opts)` increments the strong count of `Arc<EventBus>`. Even after the user drops the `EventStream`, any in-flight poll future the stream spawned can still hold the clone, so `Net::shutdown`'s `Arc::try_unwrap` fails (#80). The SDK provides no escape hatch — there is no `shutdown_async`-after-flush, no synchronous drain primitive — for the documented "subscribe → done streaming → shutdown" pattern. Fix is paired with #80: once shutdown is signal-based, surviving clones become benign.
 
 **Verification (2026-04-30):** confirmed by reading `sdk/src/net.rs:191-193` (subscribe) and `:198-203` (subscribe_typed) — both call `self.bus.clone()` into the stream constructor.
+
+**Status: implicitly fixed by #80** (2026-04-30). The #80 fix changed `Net::shutdown` to call `bus.shutdown_via_ref(&self)` directly — no more `Arc::try_unwrap` gate. Perpetuated `Arc<EventBus>` clones from `EventStream` and `TypedEventStream` are now benign: shutdown's CAS + drain runs regardless of strong-ref count, in-flight poll futures see the bus's `shutdown_completed` flag flip on their next operation, and the inner `EventBus` drops when the last clone is released. The two regression tests for #80 (`shutdown_runs_even_with_outstanding_event_stream` and `shutdown_via_ref_is_idempotent`) cover this path: the first explicitly holds an `EventStream` (which clones the Arc) across the shutdown call and asserts shutdown still succeeds.
 
 ### 84. `RxCreditState::on_bytes_consumed` is *itself* correct — but the dispatcher calls it on every accepted packet, refunding credit before the application has actually consumed (refined location)
 **File:** `adapter/net/mesh.rs:3000-3008` (caller); `adapter/net/session.rs:781-788` (callee, correct per docstring)
@@ -186,15 +189,20 @@ In `append_entry_inner` the order is: dat write (`:607`) → idx metadata (`:638
 
 **Verification (2026-04-30):** read `sweep_retention` end-to-end. Fix: either roll back in-memory eviction on `compact_to` failure, or perform the disk compaction first and only mutate in-memory state on success.
 
-### 97. Legacy `NetAdapter` builds heartbeats with an all-zero key — every heartbeat fails AEAD verify on the receiver
-**File:** `adapter/net/mod.rs:841`
+### 97. Heartbeat senders build with an all-zero key + fresh per-tick counter — every heartbeat would fail AEAD verify (verified, fixed)
+**File:** `adapter/net/mod.rs:841` (legacy NetAdapter); also independently present at `adapter/net/mesh.rs:3220` (Mesh heartbeat timer)
 
-```rust
-let mut builder = PacketBuilder::new(&[0u8; 32], session.session_id());
-let packet = builder.build_heartbeat();
-```
+**Original claim:** `build_heartbeat` (`pool.rs:251`) AEAD-encrypts an empty payload with the builder's cipher. The builder was constructed with `&[0u8; 32]` so the Poly1305 tag was computed under key=0; the receiver verifies with `session.rx_cipher()` (the real session key) and would always fail.
 
-`build_heartbeat` (`pool.rs:251`) AEAD-encrypts an empty payload with the builder's cipher. The builder is constructed with key `&[0u8; 32]`, so the on-wire Poly1305 tag is computed under key=0. The receiver in `process_packet` (`mod.rs:646-662`) verifies the tag with `session.rx_cipher()`, which holds the real session key derived from the Noise handshake. Verification therefore fails on every legitimate heartbeat → drop at line 657 → `session.touch()` is never called via heartbeats. The regression test at `mod.rs:1742` builds the heartbeat with the **real** `init_keys.tx_key` (line 1760) and asserts `touch()` runs; the production sender path uses `&[0u8; 32]` and would fail that same assertion. Inverse of #11 (heartbeat now AEAD-tagged on receive, but the sender uses the wrong key). Distinct from #85 — that one is the mesh-dispatch receiver fast-path skipping AEAD; this one is the legacy single-peer adapter sender. Pass `session.tx_cipher` key or wire heartbeat through the same pool builder used for data packets.
+**Verification (2026-04-30):** the bug had a *second* compounding dimension that surfaced once #85 was fixed (mesh receiver started AEAD-verifying heartbeats). Each fresh `PacketBuilder::new(...)` owns its own `tx_counter: Arc<AtomicU64>` starting at 0 (`crypto.rs:523`), so even with the right key, successive heartbeats would all encrypt under counter=0, and the receiver's replay window would accept the first and reject every subsequent one. The legacy `mod.rs:1742` regression test happened to test only one heartbeat, so this dimension was invisible until end-to-end Mesh tests started failing (`failure_detector_matrix::*`) once AEAD verify was wired up.
+
+The same bug pattern existed at `mesh.rs:3220` — also with an all-zero key, also building a fresh PacketBuilder per heartbeat tick. Caught while validating the #85 fix end-to-end.
+
+**Fix:** both senders now acquire from `session.packet_pool().get()`. The pool's builders are constructed once per session with the right key and a single shared `tx_counter: Arc<AtomicU64>` (`pool.rs:341`), so:
+- Every heartbeat uses the session's actual TX key → AEAD verify succeeds against the receiver's RX cipher.
+- The shared counter increments atomically per packet → no replay-window collisions.
+
+**Regression coverage:** the three end-to-end `failure_detector_matrix::*` tests (`partition_of_one_peer_does_not_mark_unrelated_peers_failed`, `partition_heal_recovers_peer_to_healthy_status`, `peer_failure_clears_capability_index_via_harness`) drive real Mesh handshakes and depend on legitimate heartbeats keeping unaffected peers `Healthy`. Without this fix (after #85 lands), all three fail. With it, all five tests in that file pass. The pre-existing legacy-adapter unit test `mod.rs::heartbeat_is_aead_authenticated` still passes (it builds the heartbeat directly with the right key, exercising the receiver-side verify only).
 
 ### 98. `ContinuityProof::verify_against` only checks the two endpoint events, never validates the chain in between
 **File:** `adapter/net/continuity/chain.rs:103-137`
