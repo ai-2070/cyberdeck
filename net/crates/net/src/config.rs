@@ -1170,9 +1170,14 @@ mod tests {
     #[test]
     fn validate_rejects_negative_max_messages() {
         let js = JetStreamAdapterConfig::new("nats://localhost:4222").with_max_messages(-1);
-        let err = js.validate().expect_err("negative max_messages must reject");
+        let err = js
+            .validate()
+            .expect_err("negative max_messages must reject");
         let msg = format!("{err}");
-        assert!(msg.contains("max_messages"), "error must mention the field, got: {msg}");
+        assert!(
+            msg.contains("max_messages"),
+            "error must mention the field, got: {msg}"
+        );
     }
 
     #[cfg(feature = "jetstream")]
@@ -1181,7 +1186,10 @@ mod tests {
         let js = JetStreamAdapterConfig::new("nats://localhost:4222").with_max_bytes(-100);
         let err = js.validate().expect_err("negative max_bytes must reject");
         let msg = format!("{err}");
-        assert!(msg.contains("max_bytes"), "error must mention the field, got: {msg}");
+        assert!(
+            msg.contains("max_bytes"),
+            "error must mention the field, got: {msg}"
+        );
     }
 
     #[cfg(feature = "jetstream")]

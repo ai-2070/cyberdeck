@@ -556,7 +556,7 @@ impl DiffEngine {
     /// [`DiffError::VersionMismatch`] was a documented error variant.
     /// A receiver at v5 happily accepted an old `base_version=2 →
     /// new_version=3` diff and silently rolled state back. Callers
-    /// must now thread the live version into [`apply_with_version`];
+    /// must now thread the live version into [`Self::apply_with_version`];
     /// this method is a thin wrapper that skips the check (kept for
     /// callers that genuinely don't track a version, e.g. unit tests
     /// applying a hand-built diff to a fresh `CapabilitySet`).
@@ -1149,7 +1149,10 @@ mod tests {
         assert!(
             matches!(
                 err,
-                DiffError::VersionMismatch { expected: 2, actual: 5 }
+                DiffError::VersionMismatch {
+                    expected: 2,
+                    actual: 5
+                }
             ),
             "expected VersionMismatch {{ expected: 2, actual: 5 }}, got {:?}",
             err,
@@ -1182,7 +1185,13 @@ mod tests {
         let err = DiffEngine::apply_with_version(&caps, 5, &diff, false)
             .expect_err("must reject future-dated diff");
         assert!(
-            matches!(err, DiffError::VersionMismatch { expected: 10, actual: 5 }),
+            matches!(
+                err,
+                DiffError::VersionMismatch {
+                    expected: 10,
+                    actual: 5
+                }
+            ),
             "expected VersionMismatch {{ expected: 10, actual: 5 }}, got {:?}",
             err,
         );

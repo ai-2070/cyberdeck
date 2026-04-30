@@ -7621,15 +7621,15 @@ mod heartbeat_aead_tests {
         assert_eq!(router.routing_table().lookup(peer_id), Some(fresh));
     }
 
-    /// BUG #106: removed test
-    /// `packet_pool_and_thread_local_pool_have_independent_counters`.
-    /// The pre-fix test pinned the BUG state — that the two pools
-    /// had independent counters, the very condition that produced
-    /// the cross-pool nonce-reuse hazard. Since the BUG #106 fix
-    /// REMOVED the `packet_pool` field and getter from
-    /// `NetSession`, the test no longer compiles and is no longer
-    /// meaningful: the data path uses `thread_local_pool`
-    /// exclusively for tx AEAD operations.
+    // BUG #106: removed test
+    // `packet_pool_and_thread_local_pool_have_independent_counters`.
+    // The pre-fix test pinned the BUG state — that the two pools
+    // had independent counters, the very condition that produced
+    // the cross-pool nonce-reuse hazard. Since the BUG #106 fix
+    // REMOVED the `packet_pool` field and getter from
+    // `NetSession`, the test no longer compiles and is no longer
+    // meaningful: the data path uses `thread_local_pool`
+    // exclusively for tx AEAD operations.
 
     /// Regression for BUG_AUDIT_2026_04_30_CORE.md #97: the
     /// production heartbeat path must (a) build with the

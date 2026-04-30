@@ -167,7 +167,9 @@ impl PermissionToken {
             duration_secs,
             delegation_depth,
         )
-        .expect("PermissionToken::issue called with a public-only keypair — use try_issue (BUG #121)")
+        .expect(
+            "PermissionToken::issue called with a public-only keypair — use try_issue (BUG #121)",
+        )
     }
 
     /// Fallible counterpart to [`Self::issue`]: returns
@@ -1706,7 +1708,14 @@ mod tests {
         // (the test caps iteration counts).
         let _ = seed;
         let subject = EntityKeypair::generate();
-        PermissionToken::issue(&issuer, subject.entity_id().clone(), scope, channel_hash, 3600, 0)
+        PermissionToken::issue(
+            &issuer,
+            subject.entity_id().clone(),
+            scope,
+            channel_hash,
+            3600,
+            0,
+        )
     }
 
     /// Once `MAX_TOKEN_SLOTS` distinct slot keys are present,
@@ -1781,11 +1790,11 @@ mod tests {
         );
     }
 
-    /// At capacity, refreshing an EXISTING slot key (same subject
-    /// + same channel_hash) must still succeed — we only refuse
-    /// novel keys. Pins that the cap doesn't accidentally lock out
-    /// legitimate token refreshes once a peer-driven flood has
-    /// filled the cache.
+    /// At capacity, refreshing an EXISTING slot key (same subject +
+    /// same channel_hash) must still succeed — we only refuse novel
+    /// keys. Pins that the cap doesn't accidentally lock out
+    /// legitimate token refreshes once a peer-driven flood has filled
+    /// the cache.
     #[test]
     fn insert_unchecked_replays_existing_subject_when_slot_cap_is_full() {
         let issuer = EntityKeypair::generate();
@@ -1819,7 +1828,10 @@ mod tests {
         cache.insert_unchecked(refresh);
 
         assert_eq!(cache.tokens.len(), MAX_TOKEN_SLOTS, "slot count unchanged");
-        let slot = cache.tokens.get(&(*subject.entity_id().as_bytes(), 42)).unwrap();
+        let slot = cache
+            .tokens
+            .get(&(*subject.entity_id().as_bytes(), 42))
+            .unwrap();
         assert_eq!(slot.value().len(), 1, "still one token in slot");
         assert_eq!(slot.value()[0].nonce, 9999, "refresh replaced the token");
     }
@@ -1887,7 +1899,10 @@ mod tests {
             "novel scope must be rejected at MAX_TOKENS_PER_SLOT",
         );
         assert!(
-            slot_after.value().iter().all(|t| t.scope.bits() != novel_scope_bits),
+            slot_after
+                .value()
+                .iter()
+                .all(|t| t.scope.bits() != novel_scope_bits),
             "the dropped scope must not be present in the slot",
         );
 
@@ -1908,7 +1923,10 @@ mod tests {
             .iter()
             .find(|t| t.scope.bits() == 0x10_0000)
             .expect("scope 0x10_0000 must still be present");
-        assert_eq!(refreshed.nonce, 1111, "refresh-of-existing-scope must succeed at cap");
+        assert_eq!(
+            refreshed.nonce, 1111,
+            "refresh-of-existing-scope must succeed at cap"
+        );
     }
 
     // ========================================================================

@@ -1385,7 +1385,9 @@ mod tests {
         assert_eq!(ids_b.len(), 1);
 
         // First activate succeeds (active_count goes 3 → 4 = max).
-        mapper.activate(ids_a[0]).expect("first activate must succeed");
+        mapper
+            .activate(ids_a[0])
+            .expect("first activate must succeed");
         assert_eq!(mapper.active_shard_count(), 4);
 
         // Second activate must REFUSE — it would push past max.

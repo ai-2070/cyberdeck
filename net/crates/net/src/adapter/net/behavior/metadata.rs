@@ -1648,10 +1648,7 @@ mod tests {
         for i in 0..(MAX_METADATA_CUSTOM_ENTRIES + 1) {
             node.custom.insert(format!("k{}", i), "v".to_string());
         }
-        assert!(matches!(
-            store.upsert(node),
-            Err(MetadataError::Invalid(_))
-        ));
+        assert!(matches!(store.upsert(node), Err(MetadataError::Invalid(_))));
     }
 
     /// A single string field over the per-string cap is rejected.
@@ -1660,10 +1657,7 @@ mod tests {
         let store = MetadataStore::new();
         let huge = "x".repeat(MAX_METADATA_STRING_LEN + 1);
         let node = NodeMetadata::new(make_node_id(3)).with_name(huge);
-        assert!(matches!(
-            store.upsert(node),
-            Err(MetadataError::Invalid(_))
-        ));
+        assert!(matches!(store.upsert(node), Err(MetadataError::Invalid(_))));
     }
 
     /// Metadata at exactly the boundaries is accepted — pins the

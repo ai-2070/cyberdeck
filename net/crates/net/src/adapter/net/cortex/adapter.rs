@@ -255,7 +255,14 @@ impl<State: Send + Sync + 'static> CortexAdapter<State> {
             }
             StartPosition::FromSeq(_) => {} // FromSeq(0) is equivalent to FromBeginning
         }
-        Self::open_unchecked(redex, name, redex_config, adapter_config, fold, initial_state)
+        Self::open_unchecked(
+            redex,
+            name,
+            redex_config,
+            adapter_config,
+            fold,
+            initial_state,
+        )
     }
 
     /// Internal open path that bypasses the BUG #134 start-position
@@ -660,10 +667,7 @@ mod tests {
             0u64,
         );
         assert!(
-            matches!(
-                result,
-                Err(CortexAdapterError::InvalidStartPosition(_))
-            ),
+            matches!(result, Err(CortexAdapterError::InvalidStartPosition(_))),
             "open must reject FromSeq(n>0) (BUG #134), got {:?}",
             result.map(|_| "Ok"),
         );
@@ -685,10 +689,7 @@ mod tests {
             0u64,
         );
         assert!(
-            matches!(
-                result,
-                Err(CortexAdapterError::InvalidStartPosition(_))
-            ),
+            matches!(result, Err(CortexAdapterError::InvalidStartPosition(_))),
             "open must reject LiveOnly (BUG #134), got {:?}",
             result.map(|_| "Ok"),
         );

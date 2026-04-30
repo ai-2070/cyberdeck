@@ -325,29 +325,27 @@ impl MemoriesAdapter {
         let checksum = compute_checksum(&tail);
         let payload_bytes = Bytes::from(tail);
 
-        loop {
-            let app_seq = self.app_seq.load(Ordering::Acquire);
-            let meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, checksum);
-            let env = EventEnvelope::new(meta, payload_bytes.clone());
-            let seq = self.inner.ingest(env)?;
+        // See `tasks/adapter.rs::ingest_typed` for the full
+        // load → ingest → CAS-commit rationale.
+        let app_seq = self.app_seq.load(Ordering::Acquire);
+        let meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, checksum);
+        let env = EventEnvelope::new(meta, payload_bytes);
+        let seq = self.inner.ingest(env)?;
 
-            match self.app_seq.compare_exchange(
-                app_seq,
-                app_seq + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(seq),
-                Err(_actual) => {
-                    return Err(CortexAdapterError::Redex(
-                        super::super::super::redex::RedexError::Encode(format!(
-                            "concurrent ingest_typed produced duplicate app_seq={}; \
-                             rebuild adapter from snapshot to reconcile",
-                            app_seq
-                        )),
-                    ));
-                }
-            }
+        match self.app_seq.compare_exchange(
+            app_seq,
+            app_seq + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(seq),
+            Err(_actual) => Err(CortexAdapterError::Redex(
+                super::super::super::redex::RedexError::Encode(format!(
+                    "concurrent ingest_typed produced duplicate app_seq={}; \
+                     rebuild adapter from snapshot to reconcile",
+                    app_seq
+                )),
+            )),
         }
     }
 }

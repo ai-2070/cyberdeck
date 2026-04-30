@@ -309,7 +309,6 @@ pub extern "C" fn net_init(config_json: *const c_char) -> *mut NetHandle {
     create_with_config(runtime, config)
 }
 
-
 /// Parse JSON configuration into EventBusConfig.
 ///
 /// Supports:

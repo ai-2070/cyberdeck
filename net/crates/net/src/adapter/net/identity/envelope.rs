@@ -614,7 +614,8 @@ mod tests {
         // `different_sk` is not the private key matching `target_pk`
         // — opening must refuse before even trying the AEAD.
         assert_eq!(
-            env.open(&different_sk, &link, None).expect_err("must reject"),
+            env.open(&different_sk, &link, None)
+                .expect_err("must reject"),
             EnvelopeError::SealOpenFailed,
         );
     }
@@ -715,7 +716,8 @@ mod tests {
         env.target_static_pub = target_pk_b;
 
         assert_eq!(
-            env.open(&target_sk_b, &link, None).expect_err("must reject"),
+            env.open(&target_sk_b, &link, None)
+                .expect_err("must reject"),
             EnvelopeError::InvalidAttestation,
         );
     }

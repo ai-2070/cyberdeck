@@ -460,12 +460,8 @@ mod tests {
         assert_eq!(reg.list().len(), 2);
 
         let manifest = SubprotocolManifest::from_registry(&reg);
-        let ids: std::collections::HashSet<u16> =
-            manifest.entries.iter().map(|e| e.id).collect();
-        assert!(
-            ids.contains(&0x0400),
-            "real handler must be advertised",
-        );
+        let ids: std::collections::HashSet<u16> = manifest.entries.iter().map(|e| e.id).collect();
+        assert!(ids.contains(&0x0400), "real handler must be advertised",);
         assert!(
             !ids.contains(&0x1000),
             "forwarding-only entry must NOT be advertised (BUG #131)",

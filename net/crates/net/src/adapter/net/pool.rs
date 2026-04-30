@@ -502,13 +502,13 @@ impl std::fmt::Debug for PooledBuilder<'_> {
     }
 }
 
-/// Shared fast packet pool (thread-safe)
-pub type SharedPacketPool = Arc<PacketPool>;
-
-/// Create a shared fast packet pool
-pub fn shared_pool(size: usize, key: &[u8; 32], session_id: u64) -> SharedPacketPool {
-    Arc::new(PacketPool::new(size, key, session_id))
-}
+// BUG #106: `SharedPacketPool` and `shared_pool` removed.
+// They were the wrappers around `PacketPool`; the audit's
+// remove-the-unused-getters fix dropped `NetSession::packet_pool`
+// (which was their only consumer). `PacketPool` itself is still
+// the underlying type used by the thread-local pool internally.
+// Keeping those wrappers with no caller would re-invite the
+// cross-pool nonce-reuse hazard described in BUG #106.
 
 // ============================================================================
 // Thread-Local Pool (Zero-Contention Hot Path)

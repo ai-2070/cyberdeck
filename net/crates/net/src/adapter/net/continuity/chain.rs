@@ -261,10 +261,7 @@ impl ContinuityProof {
 /// genesis (no prior pruning); pass `Some(&snapshot)` when the log
 /// was restored from `snapshot` and should pick up at the next event
 /// after the snapshot's `through_seq`.
-pub fn assess_continuity(
-    log: &EntityLog,
-    snapshot: Option<&StateSnapshot>,
-) -> ContinuityStatus {
+pub fn assess_continuity(log: &EntityLog, snapshot: Option<&StateSnapshot>) -> ContinuityStatus {
     let events = log.range(0, u64::MAX);
 
     if events.is_empty() {
@@ -451,7 +448,10 @@ mod tests {
         // Prune through seq 10 — the log now starts at seq 11 with
         // no snapshot reference.
         log.prune_through(10);
-        assert!(!log.is_empty(), "test setup: log must still have events 11..20");
+        assert!(
+            !log.is_empty(),
+            "test setup: log must still have events 11..20"
+        );
 
         let status = assess_continuity(&log, None);
         assert!(
@@ -612,7 +612,7 @@ mod tests {
         let kp = EntityKeypair::generate();
         let mut peer_log = EntityLog::new(full_log.entity_id().clone());
         let _ = kp; // silence unused — we need the same origin
-        // Replicate full_log's chain into peer_log so origin matches.
+                    // Replicate full_log's chain into peer_log so origin matches.
         for ev in full_log.range(1, 5) {
             peer_log.append((*ev).clone()).unwrap();
         }

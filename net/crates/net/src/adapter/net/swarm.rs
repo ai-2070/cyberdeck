@@ -446,8 +446,18 @@ impl EdgeInfo {
 /// thousand nodes rarely populate more than a few thousand
 /// distinct origin_ids in the graph.
 pub const MAX_GRAPH_NODES: usize = 65_536;
+
+/// Soft cap on the `seen_pingwaves` dedup map (BUG #100).
+/// 4× `MAX_GRAPH_NODES` to absorb a typical multi-second pingwave
+/// burst per node before reaching the cap. Exceeding the cap
+/// drops novel `(origin_id, seq)` pairs at admission; legitimate
+/// peers still update existing entries.
 pub const MAX_SEEN_PINGWAVES: usize = 262_144;
 
+/// Local view of the swarm: known nodes, edges, and a dedup
+/// cache for incoming pingwaves. Holds the proximity-routing
+/// state — see `BehaviorContext::propagate` for the consumer
+/// side and `mesh.rs` pingwave dispatch for the producer side.
 pub struct LocalGraph {
     /// Local node ID
     my_id: u64,

@@ -106,19 +106,15 @@ impl NetDb {
     /// adapters and is uninteresting to disambiguate.
     pub fn close(&self) -> Result<(), NetDbError> {
         let tasks_result = self.tasks.as_ref().map(|t| t.close()).unwrap_or(Ok(()));
-        let memories_result = self
-            .memories
-            .as_ref()
-            .map(|m| m.close())
-            .unwrap_or(Ok(()));
+        let memories_result = self.memories.as_ref().map(|m| m.close()).unwrap_or(Ok(()));
 
         // Surface the first error; if both errored, the tasks one
         // wins by convention (matches the pre-fix shape where tasks
         // ran first).
         match (tasks_result, memories_result) {
             (Ok(()), Ok(())) => Ok(()),
-            (Err(e), _) => Err(e),
-            (Ok(()), Err(e)) => Err(e),
+            (Err(e), _) => Err(e.into()),
+            (Ok(()), Err(e)) => Err(e.into()),
         }
     }
 

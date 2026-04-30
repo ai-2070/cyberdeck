@@ -107,7 +107,12 @@ pub use identity::{
 pub use mesh::{MeshNode, MeshNodeConfig, PartitionFilter};
 #[cfg(feature = "netdb")]
 pub use netdb::{MemoriesFilter, NetDb, NetDbBuilder, NetDbError, NetDbSnapshot, TasksFilter};
-pub use pool::{PacketBuilder, PacketPool, SharedLocalPool, SharedPacketPool, ThreadLocalPool};
+// BUG #106: `SharedPacketPool` removed from re-exports — see
+// `pool.rs` for the audit rationale (cross-pool nonce-reuse
+// hazard). `PacketPool` itself stays exposed because tests
+// reference it; only the `Arc<PacketPool>` wrapper alias and
+// its constructor were dropped.
+pub use pool::{PacketBuilder, PacketPool, SharedLocalPool, ThreadLocalPool};
 pub use protocol::{
     EventFrame, NackPayload, NetHeader, PacketFlags, HEADER_SIZE, NONCE_SIZE, TAG_SIZE,
 };
@@ -143,7 +148,8 @@ pub use subprotocol::{
     SUBPROTOCOL_NEGOTIATION,
 };
 pub use swarm::{
-    Capabilities, CapabilityAd, EdgeInfo, GraphStats, LocalGraph, NodeInfo, Pingwave, PINGWAVE_SIZE,
+    Capabilities, CapabilityAd, EdgeInfo, GraphStats, LocalGraph, NodeInfo, Pingwave,
+    MAX_GRAPH_NODES, MAX_SEEN_PINGWAVES, PINGWAVE_SIZE,
 };
 pub use transport::{NetSocket, PacketReceiver, PacketSender, ParsedPacket, SocketBufferConfig};
 

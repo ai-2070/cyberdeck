@@ -728,16 +728,10 @@ impl EventBus {
         // empty (defense-in-depth — a producer push during the
         // window means new batches will appear and we shouldn't
         // exit yet).
-        let mut last_dispatched = self
-            .stats
-            .batches_dispatched
-            .load(AtomicOrdering::Acquire);
+        let mut last_dispatched = self.stats.batches_dispatched.load(AtomicOrdering::Acquire);
         while tokio::time::Instant::now() < phase2_deadline {
             tokio::time::sleep(self.config.batch.max_delay).await;
-            let now_dispatched = self
-                .stats
-                .batches_dispatched
-                .load(AtomicOrdering::Acquire);
+            let now_dispatched = self.stats.batches_dispatched.load(AtomicOrdering::Acquire);
             let dispatched_progress = now_dispatched != last_dispatched;
             last_dispatched = now_dispatched;
             if !dispatched_progress && self.shard_manager.all_shards_empty() {

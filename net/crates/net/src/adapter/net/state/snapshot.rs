@@ -262,8 +262,9 @@ impl StateSnapshot {
         // handler) should use `try_to_bytes` so an oversized snapshot
         // surfaces as a `MigrationError::StateFailed(...)` rather than a
         // panic that unwinds across the dispatch task.
-        self.try_to_bytes()
-            .expect("StateSnapshot::to_bytes — call try_to_bytes for fallible serialization (BUG #128)")
+        self.try_to_bytes().expect(
+            "StateSnapshot::to_bytes — call try_to_bytes for fallible serialization (BUG #128)",
+        )
     }
 
     /// Fallible serialization to bytes.
@@ -281,7 +282,7 @@ impl StateSnapshot {
     /// releasing locks. `state` is opaque caller-supplied bytes
     /// (compute orchestrator, FFI clients) and `bindings_bytes` is
     /// opaque externally-controlled migration metadata, so the
-    /// >4 GiB case is reachable from outside-controlled inputs.
+    /// `>4 GiB` case is reachable from outside-controlled inputs.
     /// Production callers should use `try_to_bytes` and surface
     /// the error; the legacy `to_bytes` wrapper is kept for
     /// well-known-bounded test callers.
@@ -289,12 +290,11 @@ impl StateSnapshot {
         // Validate state and bindings sizes BEFORE allocating the
         // output buffer — a 4+ GiB heap allocation on a known-bad
         // input would itself be a (smaller) availability hit.
-        let state_len = u32::try_from(self.state.len()).map_err(|_| {
-            SnapshotError::ExceedsWireFormat {
+        let state_len =
+            u32::try_from(self.state.len()).map_err(|_| SnapshotError::ExceedsWireFormat {
                 state_len: self.state.len(),
                 bindings_len: self.bindings_bytes.len(),
-            }
-        })?;
+            })?;
         let bindings_len = u32::try_from(self.bindings_bytes.len()).map_err(|_| {
             SnapshotError::ExceedsWireFormat {
                 state_len: self.state.len(),
@@ -833,7 +833,7 @@ mod tests {
     /// hand-constructed `SnapshotError::ExceedsWireFormat`
     /// value's `Display` impl reports the lengths so callers
     /// surfacing the error get a useful message. The actual
-    /// >4 GiB path is exercised by the `try_from`'s contract
+    /// `>4 GiB` path is exercised by the `try_from`'s contract
     /// (`u32::try_from(usize > u32::MAX)` is a documented `Err`).
     #[test]
     fn try_to_bytes_succeeds_at_realistic_payload_sizes() {

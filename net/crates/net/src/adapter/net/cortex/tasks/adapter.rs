@@ -362,53 +362,53 @@ impl TasksAdapter {
         let checksum = compute_checksum(&tail);
         let payload_bytes = Bytes::from(tail);
 
-        loop {
-            let app_seq = self.app_seq.load(Ordering::Acquire);
-            let meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, checksum);
-            let env = EventEnvelope::new(meta, payload_bytes.clone());
-            let seq = self.inner.ingest(env)?;
+        // Load → build envelope → ingest → CAS-commit. Both
+        // branches of the CAS return immediately, so this is a
+        // single-pass block (not a `loop`); a CAS-failure here
+        // surfaces as a `RedexError::Encode` rather than a retry,
+        // because `inner.ingest` already committed the envelope
+        // to the log under our (now-stale) `app_seq`.
+        let app_seq = self.app_seq.load(Ordering::Acquire);
+        let meta = EventMeta::new(dispatch, 0, self.origin_hash, app_seq, checksum);
+        let env = EventEnvelope::new(meta, payload_bytes);
+        let seq = self.inner.ingest(env)?;
 
-            // Commit the counter advance now that the log has
-            // accepted the entry. CAS to defend against a concurrent
-            // ingest that moved the counter past `app_seq` between
-            // our load and the inner ingest — in that case we'd be
-            // stamping the SAME `seq_or_ts` as another envelope,
-            // producing a dup. The inner.ingest above already
-            // succeeded, so a CAS failure means our envelope landed
-            // at a stale `seq_or_ts`; we surface this as an Encode
-            // error so the caller knows the ingest is not
-            // counter-monotonic.
-            //
-            // In practice every external caller goes through a
-            // single shared `&TasksAdapter` instance and this
-            // function is the only counter writer, so contention is
-            // dominated by single-thread sequential ingest where the
-            // CAS always succeeds on the first try. Multi-threaded
-            // ingest produces ordering uncertainty regardless of
-            // counter primitive — the user-visible app_seq just
-            // tracks insertion order at the call site.
-            match self.app_seq.compare_exchange(
-                app_seq,
-                app_seq + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(seq),
-                Err(_actual) => {
-                    // A concurrent ingest stamped the same
-                    // `seq_or_ts`. The log already has our event,
-                    // so we can't roll back; surface a recoverable
-                    // error. The caller's options are: rebuild the
-                    // adapter from snapshot (scans the log to
-                    // reconcile app_seq), or accept the duplicate.
-                    return Err(CortexAdapterError::Redex(
-                        super::super::super::redex::RedexError::Encode(format!(
-                            "concurrent ingest_typed produced duplicate app_seq={}; \
-                             rebuild adapter from snapshot to reconcile",
-                            app_seq
-                        )),
-                    ));
-                }
+        // Commit the counter advance now that the log has
+        // accepted the entry. CAS to defend against a concurrent
+        // ingest that moved the counter past `app_seq` between
+        // our load and the inner ingest — in that case we'd be
+        // stamping the SAME `seq_or_ts` as another envelope,
+        // producing a dup.
+        //
+        // In practice every external caller goes through a single
+        // shared `&TasksAdapter` instance and this function is
+        // the only counter writer, so contention is dominated by
+        // single-thread sequential ingest where the CAS always
+        // succeeds on the first try. Multi-threaded ingest
+        // produces ordering uncertainty regardless of counter
+        // primitive — the user-visible app_seq just tracks
+        // insertion order at the call site.
+        match self.app_seq.compare_exchange(
+            app_seq,
+            app_seq + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(seq),
+            Err(_actual) => {
+                // A concurrent ingest stamped the same
+                // `seq_or_ts`. The log already has our event, so
+                // we can't roll back; surface a recoverable
+                // error. The caller's options are: rebuild the
+                // adapter from snapshot (scans the log to
+                // reconcile app_seq), or accept the duplicate.
+                Err(CortexAdapterError::Redex(
+                    super::super::super::redex::RedexError::Encode(format!(
+                        "concurrent ingest_typed produced duplicate app_seq={}; \
+                         rebuild adapter from snapshot to reconcile",
+                        app_seq
+                    )),
+                ))
             }
         }
     }

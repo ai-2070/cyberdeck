@@ -114,8 +114,7 @@ impl CompositeCursor {
                     // Don't regress.
                 }
                 _ => {
-                    self.positions
-                        .insert(event.shard_id, Arc::from(new_id));
+                    self.positions.insert(event.shard_id, Arc::from(new_id));
                 }
             }
         }
@@ -455,8 +454,7 @@ impl PollMerger {
         // than every shard with a returned event, which would
         // throw away the adapter's `next_id` advance for shards
         // that returned all their matches).
-        let mut rolled_back: std::collections::HashSet<u16> =
-            std::collections::HashSet::new();
+        let mut rolled_back: std::collections::HashSet<u16> = std::collections::HashSet::new();
         if request.filter.is_some() && had_extra {
             let mut returned_per_shard: std::collections::HashMap<u16, usize> =
                 std::collections::HashMap::new();
@@ -510,8 +508,8 @@ impl PollMerger {
             std::collections::HashSet::with_capacity(shards.len());
         for event in all_events.iter().rev() {
             if seen_shards.insert(event.shard_id) {
-                let should_override = request.filter.is_none()
-                    || rolled_back.contains(&event.shard_id);
+                let should_override =
+                    request.filter.is_none() || rolled_back.contains(&event.shard_id);
                 if should_override {
                     final_cursor.set(event.shard_id, event.id.clone());
                 }

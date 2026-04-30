@@ -263,17 +263,14 @@ impl CorrelatedFailureDetector {
             subnet_counts.iter().map(|(&s, &c)| (s, c)).collect();
         entries.sort_by(|a, b| b.0.depth().cmp(&a.0.depth()).then_with(|| a.0.cmp(&b.0)));
 
+        // Sort (above) guarantees the entries are visited deepest-
+        // first within the threshold-meeting set, so the first hit
+        // is the deterministic winner. We `break` immediately on
+        // the first hit; no `best_depth` tracking needed.
         let mut best_subnet = None;
-        let mut best_depth = 0u8;
         for (subnet, count) in entries {
-            if count >= threshold && subnet.depth() >= best_depth {
-                // Sort guarantees: first hit at any depth is the
-                // deterministic winner for that depth class. We
-                // still loop so the first hit at a deeper class
-                // (which the sort visits earlier) wins over later
-                // shallower ones.
+            if count >= threshold {
                 best_subnet = Some(subnet);
-                best_depth = subnet.depth();
                 break;
             }
         }

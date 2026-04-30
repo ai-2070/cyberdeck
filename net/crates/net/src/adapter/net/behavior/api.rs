@@ -580,7 +580,6 @@ impl SchemaType {
             }
 
             (SchemaType::AnyOf { schemas }, v) => {
-                let mut hit_recursion_limit = false;
                 for schema in schemas {
                     match schema.validate_with_depth(v, depth + 1) {
                         Ok(()) => return Ok(()),
@@ -593,7 +592,6 @@ impl SchemaType {
                         Err(_) => {}
                     }
                 }
-                let _ = hit_recursion_limit;
                 Err(ValidationError::AnyOfFailed {
                     schema_count: schemas.len(),
                 })
