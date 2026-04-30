@@ -591,6 +591,78 @@ impl ShardMapper {
         ScalingDecision::None
     }
 
+    /// Validate cooldown + max-shards budget for an `add count`
+    /// scale-up request. Cheap pre-check that doesn't take the
+    /// write lock — callers re-check under the lock.
+    fn check_scale_up_budget(&self, count: u16) -> Result<(), ScalingError> {
+        let current = self.active_count.load(AtomicOrdering::Acquire);
+        let would_be = current
+            .checked_add(count)
+            .ok_or(ScalingError::AtMaxShards)?;
+        if would_be > self.policy.max_shards {
+            return Err(ScalingError::AtMaxShards);
+        }
+        let last = self.last_scaling.read();
+        if let Some(ts) = *last {
+            if ts.elapsed() < self.policy.cooldown {
+                return Err(ScalingError::InCooldown);
+            }
+        }
+        Ok(())
+    }
+
+    /// Allocate `count` shard ids and push their `MappedShard`
+    /// records into `shards` with the supplied `state`. The caller
+    /// already holds `self.shards.write()` and is responsible for
+    /// dropping it before notifying callbacks. Returns the allocated
+    /// ids in order.
+    ///
+    /// Performs the budget + cooldown re-check under the write lock,
+    /// the next_shard_id allocation, and the per-shard push. Does NOT
+    /// touch `active_count` — `scale_up` bumps it for `Active` shards;
+    /// `Provisioning` shards bump it later when `activate` fires.
+    fn allocate_shards_inner(
+        &self,
+        count: u16,
+        state: ShardState,
+        shards: &mut Vec<MappedShard>,
+    ) -> Result<Vec<u16>, ScalingError> {
+        // Re-check budget under the write lock — two concurrent
+        // scale-up callers could both pass the read-locked early
+        // check, both serialize through `shards.write()`, and both
+        // succeed without this re-check.
+        self.check_scale_up_budget(count)?;
+
+        let first_id = self.next_shard_id.load(AtomicOrdering::Relaxed);
+        let last_needed = first_id
+            .checked_add(count.saturating_sub(1))
+            .ok_or(ScalingError::AtMaxShards)?;
+        // Reserve `u16::MAX` as a sentinel so the post-allocation
+        // store cannot wrap.
+        if last_needed == u16::MAX {
+            return Err(ScalingError::AtMaxShards);
+        }
+        self.next_shard_id
+            .store(first_id + count, AtomicOrdering::Relaxed);
+
+        let mut new_ids = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let new_id = first_id + i;
+            shards.push(MappedShard {
+                id: new_id,
+                state,
+                metrics: Arc::new(ShardMetricsCollector::new(
+                    new_id,
+                    self.ring_buffer_capacity,
+                )),
+                drain_started: None,
+                last_metrics: ShardMetrics::new(new_id),
+            });
+            new_ids.push(new_id);
+        }
+        Ok(new_ids)
+    }
+
     /// Execute a scale-up operation.
     ///
     /// Creates new shards in the `Active` state and makes them
@@ -603,106 +675,20 @@ impl ShardMapper {
     pub fn scale_up(&self, count: u16) -> Result<Vec<u16>, ScalingError> {
         // Short-circuit `count == 0` so a no-op call doesn't bump the
         // cooldown timestamp or trip the `u16::MAX` sentinel check
-        // below (which previously fired spuriously when
+        // (which previously fired spuriously when
         // `first_id == u16::MAX` even though zero ids were being
         // allocated).
         if count == 0 {
             return Ok(Vec::new());
         }
 
-        // Early checks (may race, but avoid acquiring the write lock).
-        // Use `checked_add` so that `current + count` can never wrap
-        // past `u16::MAX` into a small value that slips under the
-        // `max_shards` cap. The id-exhaustion gate at line ~557 also
-        // catches overflow, but this keeps the primary budget check
-        // authoritative.
-        let current = self.active_count.load(AtomicOrdering::Acquire);
-        let would_be = current
-            .checked_add(count)
-            .ok_or(ScalingError::AtMaxShards)?;
-        if would_be > self.policy.max_shards {
-            return Err(ScalingError::AtMaxShards);
-        }
-        {
-            let last = self.last_scaling.read();
-            if let Some(ts) = *last {
-                if ts.elapsed() < self.policy.cooldown {
-                    return Err(ScalingError::InCooldown);
-                }
-            }
-        }
+        self.check_scale_up_budget(count)?;
 
         let mut shards = self.shards.write();
-
-        // Re-check max_shards under the lock to prevent race conditions.
-        let current = self.active_count.load(AtomicOrdering::Acquire);
-        let would_be = current
-            .checked_add(count)
-            .ok_or(ScalingError::AtMaxShards)?;
-        if would_be > self.policy.max_shards {
-            return Err(ScalingError::AtMaxShards);
-        }
-        // Re-check cooldown under the same write lock that gates
-        // mutation. Without this, two concurrent scale_up calls
-        // could both pass the read-locked early check, both
-        // serialize through `shards.write()`, and both succeed —
-        // breaking the cooldown contract and (with a unit-count
-        // call) potentially exceeding `max_shards` between the
-        // outer check and the inner check.
-        {
-            let last = self.last_scaling.read();
-            if let Some(ts) = *last {
-                if ts.elapsed() < self.policy.cooldown {
-                    return Err(ScalingError::InCooldown);
-                }
-            }
-        }
-
-        let mut new_ids = Vec::with_capacity(count as usize);
-
-        // Allocate monotonically from `next_shard_id`. Reusing
-        // `shards.iter().max()` would give the same id back to a new
-        // shard whenever the previous occupant of that id had been
-        // drained-and-removed, conflating two distinct shard
-        // lifetimes in external metric / checkpoint systems.
-        // Pre-check that we have room for `count` more allocations
-        // without overflowing `u16`.
-        let first_id = self.next_shard_id.load(AtomicOrdering::Relaxed);
-        let last_needed = first_id
-            .checked_add(count.saturating_sub(1))
-            .ok_or(ScalingError::AtMaxShards)?;
-        // Reserve `u16::MAX` as a sentinel so the post-allocation
-        // `next_shard_id.store(first_id + count, ...)` below cannot
-        // wrap (the next call would observe `first_id == u16::MAX`
-        // and attempt `MAX + 1`).
-        if last_needed == u16::MAX {
-            return Err(ScalingError::AtMaxShards);
-        }
-        // CAS-bump the allocator. The write lock on `shards` already
-        // serializes scale_up with itself, so a relaxed `fetch_add`
-        // here would also be sound; using a check + store keeps the
-        // pre-check authoritative.
-        self.next_shard_id
-            .store(first_id + count, AtomicOrdering::Relaxed);
-
-        for i in 0..count {
-            let new_id = first_id + i;
-            let new_shard = MappedShard {
-                id: new_id,
-                state: ShardState::Active,
-                metrics: Arc::new(ShardMetricsCollector::new(
-                    new_id,
-                    self.ring_buffer_capacity,
-                )),
-                drain_started: None,
-                last_metrics: ShardMetrics::new(new_id),
-            };
-            shards.push(new_shard);
-            new_ids.push(new_id);
-        }
+        let new_ids = self.allocate_shards_inner(count, ShardState::Active, &mut shards)?;
 
         // Update counts. `fetch_add` cannot wrap here — the
-        // `checked_add` gate above ensures `current + count <=
+        // `check_scale_up_budget` gate above ensures `current + count <=
         // max_shards <= u16::MAX` — but keep the ordering explicit
         // so the next contender's cooldown re-check sees the fresh
         // timestamp.
@@ -713,7 +699,6 @@ impl ShardMapper {
         // are user-supplied and may take arbitrary time.
         drop(shards);
 
-        // Notify callback
         if let Some(callback) = self.on_shard_created.read().as_ref() {
             for &id in &new_ids {
                 callback(id);
@@ -745,73 +730,15 @@ impl ShardMapper {
         if count == 0 {
             return Ok(Vec::new());
         }
-        // Same budget gate as `scale_up`. We compare against the
-        // already-active count because Provisioning shards eventually
-        // become Active — letting the count grow past `max_shards`
-        // here would just defer the error to `activate`.
-        let current = self.active_count.load(AtomicOrdering::Acquire);
-        let would_be = current
-            .checked_add(count)
-            .ok_or(ScalingError::AtMaxShards)?;
-        if would_be > self.policy.max_shards {
-            return Err(ScalingError::AtMaxShards);
-        }
-        {
-            let last = self.last_scaling.read();
-            if let Some(ts) = *last {
-                if ts.elapsed() < self.policy.cooldown {
-                    return Err(ScalingError::InCooldown);
-                }
-            }
-        }
+
+        self.check_scale_up_budget(count)?;
 
         let mut shards = self.shards.write();
+        let new_ids = self.allocate_shards_inner(count, ShardState::Provisioning, &mut shards)?;
 
-        // Re-check under the write lock.
-        let current = self.active_count.load(AtomicOrdering::Acquire);
-        let would_be = current
-            .checked_add(count)
-            .ok_or(ScalingError::AtMaxShards)?;
-        if would_be > self.policy.max_shards {
-            return Err(ScalingError::AtMaxShards);
-        }
-        {
-            let last = self.last_scaling.read();
-            if let Some(ts) = *last {
-                if ts.elapsed() < self.policy.cooldown {
-                    return Err(ScalingError::InCooldown);
-                }
-            }
-        }
-
-        let first_id = self.next_shard_id.load(AtomicOrdering::Relaxed);
-        let last_needed = first_id
-            .checked_add(count.saturating_sub(1))
-            .ok_or(ScalingError::AtMaxShards)?;
-        if last_needed == u16::MAX {
-            return Err(ScalingError::AtMaxShards);
-        }
-        self.next_shard_id
-            .store(first_id + count, AtomicOrdering::Relaxed);
-
-        let mut new_ids = Vec::with_capacity(count as usize);
-        for i in 0..count {
-            let new_id = first_id + i;
-            shards.push(MappedShard {
-                id: new_id,
-                state: ShardState::Provisioning,
-                metrics: Arc::new(ShardMetricsCollector::new(
-                    new_id,
-                    self.ring_buffer_capacity,
-                )),
-                drain_started: None,
-                last_metrics: ShardMetrics::new(new_id),
-            });
-            new_ids.push(new_id);
-        }
-
-        // Update cooldown timestamp but NOT active_count — these
-        // shards are not active yet. `activate` bumps it.
+        // Bump cooldown but NOT active_count — these shards are
+        // not active yet. `activate` bumps active_count when each
+        // becomes selectable.
         *self.last_scaling.write() = Some(Instant::now());
         drop(shards);
         // Intentionally do NOT fire `on_shard_created` here — the

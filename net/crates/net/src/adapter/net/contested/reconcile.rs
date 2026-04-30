@@ -153,22 +153,24 @@ pub fn reconcile_entity(
             let our_len = our_events.len() - idx;
             let their_len = their_events.len() - idx;
 
-            // Longest chain wins. Tie: lower payload hash wins.
-            // parent_hash is identical at the divergence point (both diverge
-            // from the same parent), so we hash each side's divergent payload
-            // for a perspective-independent tiebreak.
+            // Longest chain wins. Tie: lower payload hash, then
+            // lexicographic on the divergent payload bytes.
+            // parent_hash is identical at the divergence point
+            // (both diverge from the same parent), so this is a
+            // perspective-independent ordering — peer A computing
+            // `(our=A, their=B)` produces the inverse of peer B
+            // computing `(our=B, their=A)`, so both peers reach
+            // the same canonical winner.
             //
-            // Previously `our <= their` picked `Side::Ours` on
-            // equality. On a true xxh3 collision — OR identical
-            // payloads at divergence (easy under idempotent retries
-            // from both peers) — both sides evaluated `our <= their`
-            // to true and picked `Side::Ours` locally, so partitions
-            // never converged. Add a second-tier tiebreak on the raw
-            // payload bytes (lex order); if the bytes are identical
-            // too, tiebreak on `origin_hash` of the *parent* chain
-            // so
-            // both sides agree without consulting a randomized
-            // identifier.
+            // The divergence detection at line ~106 only enters
+            // the conflict branch when `our_events[idx].payload
+            // != their_events[idx].payload`, so the payload-bytes
+            // comparison is guaranteed to return `Less` or
+            // `Greater` — `Equal` is unreachable. We assert that
+            // explicitly so a future change to the divergence
+            // detection (e.g. relaxing the byte-equality check)
+            // would surface as a clear panic rather than a silent
+            // permanent partition like the original `<=` bug.
             let winning_side = if our_len > their_len {
                 Side::Ours
             } else if their_len > our_len {
@@ -185,25 +187,11 @@ pub fn reconcile_entity(
                 {
                     Less => Side::Ours,
                     Greater => Side::Theirs,
-                    // True duplicate-payload divergence — both
-                    // sides have functionally the same event with
-                    // a different parent linkage. Pick the side
-                    // whose chain head sequence is lower, so both
-                    // peers agree deterministically. If they're
-                    // also equal, tie remains and we fall through
-                    // to `Side::Theirs` so AT LEAST ONE side
-                    // converges (the historical `Side::Ours`-on-
-                    // equality choice meant both sides kept their
-                    // own chain — the partition was permanent).
-                    Equal => {
-                        if our_log.head_link().sequence
-                            <= their_events.last().map(|e| e.link.sequence).unwrap_or(0)
-                        {
-                            Side::Ours
-                        } else {
-                            Side::Theirs
-                        }
-                    }
+                    Equal => unreachable!(
+                        "reconcile_entity: divergence at idx={} but payloads are \
+                         byte-identical — divergence detection contract violated",
+                        idx
+                    ),
                 }
             };
 

@@ -858,33 +858,32 @@ impl RedexFile {
         // mutated only memory; the on-disk idx + dat files grew
         // unbounded across restart, and on reopen the full dat
         // was replayed — entries previously evicted came back
-        // from the dead. The fix calls into `disk.compact_to` to
+        // from the dead. We call into `disk.compact_to` to
         // atomically rewrite idx + dat + ts to match the
         // post-sweep in-memory state.
+        //
+        // The state lock is held *across* `compact_to`. Releasing
+        // it earlier opens a window where a concurrent
+        // `append_entry_at` can land on disk with the in-memory
+        // state updated to match — but `compact_to` then reads the
+        // post-append on-disk dat and writes a new idx/ts derived
+        // from the pre-append `surviving_index` snapshot. The
+        // racing append's idx record is overwritten, leaving its
+        // payload bytes as orphaned dat tail that recovery's
+        // `retained_dat_end` truncation drops on next reopen — the
+        // append survives in memory until restart, then vanishes.
+        // Holding the lock makes appends queue behind this
+        // compaction.
         #[cfg(feature = "redex-disk")]
         if let Some(disk) = self.inner.disk.as_ref() {
-            // Collect references first so we can release the
-            // shard-state lock around the I/O — `compact_to`
-            // does several writes/fsyncs and we don't want to
-            // block other readers / writers on it longer than
-            // needed.
             let surviving_index = state.index.clone();
             let surviving_timestamps = state.timestamps.clone();
-            // The segment's base_offset reflects the new dat
-            // origin in the in-memory view. The disk's current
-            // dat file still starts at 0; the bytes preceding
-            // `surviving_index[0].payload_offset_in_old_dat`
-            // are what need to be trimmed off the front.
-            //
-            // For inline-only surviving entries, base_offset is
-            // past the end of the live segment — every byte of
-            // dat goes.
-            //
             // The disk's old dat had offsets [0..segment.base_offset() +
             // segment.live_bytes()]. The new starts at
-            // segment.base_offset().
+            // segment.base_offset(). For inline-only surviving
+            // entries, base_offset is past the end of the live
+            // segment — every byte of dat goes.
             let dat_base = state.segment.base_offset();
-            std::mem::drop(state);
             let disk = disk.clone();
             if let Err(e) = disk.compact_to(&surviving_index, &surviving_timestamps, dat_base) {
                 tracing::warn!(
@@ -894,6 +893,9 @@ impl RedexFile {
                      evicted entries"
                 );
             }
+            // `state` drops at the end of the function — all
+            // subsequent appenders see the post-compaction layout.
+            std::mem::drop(state);
         }
     }
 

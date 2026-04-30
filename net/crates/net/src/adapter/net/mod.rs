@@ -292,8 +292,9 @@ type InboundQueues = Arc<DashMap<u16, SegQueue<StoredEvent>>>;
 ///
 /// `HandshakePacer` keeps a rolling count of recent attempts per
 /// source and rejects sources that exceed the budget within the
-/// window. Garbage-collects expired entries lazily on every
-/// check, so memory stays bounded under a steady-state attack.
+/// window. Expired entries are garbage-collected on a periodic
+/// schedule rather than on every check, so a sustained flood from
+/// many distinct sources doesn't pay an O(n) sweep per packet.
 pub(crate) struct HandshakePacer {
     /// Per-source `(count_in_window, window_start)`.
     entries: std::collections::HashMap<std::net::SocketAddr, (u32, std::time::Instant)>,
@@ -301,6 +302,12 @@ pub(crate) struct HandshakePacer {
     max_per_window: u32,
     /// Window length.
     window: std::time::Duration,
+    /// Last time we ran the GC pass.
+    last_gc: std::time::Instant,
+    /// Soft cap on `entries` size before forcing a GC pass even
+    /// before the periodic deadline. Keeps memory bounded against
+    /// an attacker fanning across many spoofed source addresses.
+    gc_size_threshold: usize,
 }
 
 impl HandshakePacer {
@@ -309,6 +316,11 @@ impl HandshakePacer {
             entries: std::collections::HashMap::new(),
             max_per_window,
             window,
+            last_gc: std::time::Instant::now(),
+            // 4096 entries × ~40 bytes each ≈ 160 KiB — comfortable
+            // ceiling that still triggers GC well before any
+            // realistic memory issue.
+            gc_size_threshold: 4096,
         }
     }
 
@@ -317,11 +329,22 @@ impl HandshakePacer {
     /// exceeded the rate limit (caller must drop the packet).
     pub(crate) fn check_and_record(&mut self, source: std::net::SocketAddr) -> bool {
         let now = std::time::Instant::now();
-        // Lazy GC: evict entries whose window has fully expired.
-        // Done every call (not amortized) — entries are cheap and
-        // the responder is not in a hot path.
-        self.entries
-            .retain(|_, (_, start)| now.duration_since(*start) < self.window.saturating_mul(2));
+        // Amortized GC: only run the O(n) `retain` sweep when one
+        // of two thresholds trips:
+        //   1. We haven't GC'd in `window` (entries are valid for
+        //      at most `2 * window` so a once-per-`window` cadence
+        //      is sufficient to keep the map proportional to the
+        //      active source set).
+        //   2. The map exceeds `gc_size_threshold`, indicating a
+        //      flood attempt across many spoofed sources.
+        if now.duration_since(self.last_gc) >= self.window
+            || self.entries.len() >= self.gc_size_threshold
+        {
+            let cutoff = self.window.saturating_mul(2);
+            self.entries
+                .retain(|_, (_, start)| now.duration_since(*start) < cutoff);
+            self.last_gc = now;
+        }
 
         let entry = self.entries.entry(source).or_insert((0, now));
         if now.duration_since(entry.1) > self.window {

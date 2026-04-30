@@ -361,22 +361,17 @@ impl StandbyGroup {
                     }
                 };
 
-            // Standby keypairs are stored per-member; new
-            // origin_hash matches old, so unregister before
-            // register.
-            let _ = registry.unregister(old_origin_hash);
+            // Standby keypairs are stored per-member; the new
+            // origin_hash matches the old. Atomic upsert via
+            // `replace` — a single map operation that never leaves
+            // the slot empty (the older `unregister` → `register`
+            // sequence had a small window where the second step
+            // could fail and orphan the slot).
+            let _ = old_origin_hash;
 
             let daemon = daemon_factory();
             let host = DaemonHost::new(daemon, keypair, self.config.host_config.clone());
-            if let Err(e) = registry.register(host) {
-                tracing::warn!(
-                    index,
-                    error = %e,
-                    "StandbyGroup::on_node_failure: registry.register failed after \
-                     unregister; slot is now degraded (#7)"
-                );
-                continue;
-            }
+            registry.replace(host);
 
             self.coord
                 .update_member_placement(index, placement.node_id, entity_id_bytes);

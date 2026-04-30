@@ -248,28 +248,19 @@ impl ReplicaGroup {
                 .unwrap()
                 .origin_hash;
 
-            // Previously we did `unregister` *before*
-            // `place_with_spread`. If placement failed, the loop
-            // `continue`d with the slot marked unhealthy AND
-            // unregistered — and `on_node_recovery` only re-marks
-            // members that are still registered, so the slot was
-            // effectively dead until the next external `scale_to`.
+            // Try `place_with_spread` BEFORE touching the registry.
+            // On placement failure, the old slot is still registered
+            // (under `old_origin_hash`), so recovery / scale_to can
+            // make it healthy again later.
             //
-            // The fix: try `place_with_spread` BEFORE touching
-            // the registry. On placement failure, the slot is
-            // still registered (under the old origin_hash), so a
-            // recovery callback or scale_to can later make it
-            // healthy again.
-            //
-            // After a successful place, we unregister + register
-            // (replica keypairs are deterministic so the
-            // origin_hash is the same, and the registry rejects
-            // duplicates — the old must come out before the new
-            // goes in). If the second register fails (rare —
-            // typically only a concurrent registration race), we
-            // log a warning and `continue` rather than panic;
-            // the slot ends up unregistered but the operator
-            // sees the failure.
+            // On placement success we use `registry.replace` —
+            // atomic upsert at the deterministic origin_hash. The
+            // older `unregister` → `register` two-step had a
+            // window where the second step could fail (concurrent
+            // race) and leave the slot orphaned; `replace` collapses
+            // the swap into a single map operation, so the slot is
+            // never empty between callers.
+            let _ = old_origin_hash; // retained as a doc anchor for the comment above.
             let keypair = derive_replica_keypair(&self.config.group_seed, index);
             let entity_id_bytes: NodeId = *keypair.entity_id().as_bytes();
 
@@ -287,22 +278,9 @@ impl ReplicaGroup {
                     }
                 };
 
-            // Same origin_hash: must drop the old before
-            // inserting the new, since `registry.register`
-            // rejects duplicates.
-            let _ = registry.unregister(old_origin_hash);
-
             let daemon = daemon_factory();
             let host = DaemonHost::new(daemon, keypair, self.config.host_config.clone());
-            if let Err(e) = registry.register(host) {
-                tracing::warn!(
-                    index,
-                    error = %e,
-                    "ReplicaGroup::on_node_failure: registry.register failed after \
-                     unregister; slot is now degraded (#7)"
-                );
-                continue;
-            }
+            registry.replace(host);
 
             self.coord
                 .update_member_placement(index, placement.node_id, entity_id_bytes);

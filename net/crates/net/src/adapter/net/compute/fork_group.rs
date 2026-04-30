@@ -300,9 +300,13 @@ impl ForkGroup {
                 };
 
             // Fork keypairs are deterministic per (parent_origin,
-            // fork_seq) — old and new origin_hash match — so we
-            // must unregister before re-registering.
-            let _ = registry.unregister(old_origin_hash);
+            // fork_seq) — the new origin_hash matches the old.
+            // Use `registry.replace` for an atomic upsert: a single
+            // map operation that never leaves the slot empty
+            // between callers (the older `unregister` →
+            // `register` sequence had a small window where the
+            // second step could fail and orphan the slot).
+            let _ = old_origin_hash;
 
             let daemon = daemon_factory();
             let host = DaemonHost::from_fork(
@@ -311,15 +315,7 @@ impl ForkGroup {
                 chain_builder,
                 self.config.host_config.clone(),
             );
-            if let Err(e) = registry.register(host) {
-                tracing::warn!(
-                    index,
-                    error = %e,
-                    "ForkGroup::on_node_failure: registry.register failed after \
-                     unregister; slot is now degraded (#7)"
-                );
-                continue;
-            }
+            registry.replace(host);
 
             self.coord
                 .update_member_placement(index, placement.node_id, entity_id_bytes);

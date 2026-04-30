@@ -202,6 +202,17 @@ impl DiskSegment {
             payload_bytes.truncate(retained_dat_end as usize);
         }
 
+        // Read ts sidecar BEFORE the checksum filter so we have a
+        // timestamp for every original index position. The checksum
+        // filter below can drop entries from anywhere in the file
+        // (mid-file bit-rot, not just the tail); pairing surviving
+        // entries with the **first N** timestamps after the filter
+        // would misalign every surviving entry that follows a dropped
+        // one.
+        let ts_path = dir.join("ts");
+        let original_timestamps = read_timestamps(&ts_path, index.len())?;
+        let _ = idx_len_truncated;
+
         // Verify per-entry checksums during recovery. Without
         // this check, on-disk corruption (torn writes, bit-rot,
         // FS bug, or external tampering) is silently accepted
@@ -210,19 +221,24 @@ impl DiskSegment {
         // self-contained 8-byte payloads carried inside the
         // index record; we still verify them in case the index
         // file itself was corrupted.
-        let mut bad_entries = 0usize;
-        index.retain(|e| {
+        //
+        // Use a manual loop (not `retain`) so we can track which
+        // original indices survived. The survivor indices are then
+        // used to pick matching timestamps from `original_timestamps`
+        // — without this, dropping mid-file entries would shift the
+        // ts↔index pairing.
+        let mut survivors: Vec<usize> = Vec::with_capacity(index.len());
+        for (i, e) in index.iter().enumerate() {
             let payload: &[u8] = if e.is_inline() {
                 let Some(inline) = e.inline_payload() else {
-                    bad_entries += 1;
-                    return false;
+                    continue;
                 };
                 let computed = super::entry::payload_checksum(&inline);
                 if e.checksum() != computed {
-                    bad_entries += 1;
-                    return false;
+                    continue;
                 }
-                return true;
+                survivors.push(i);
+                continue;
             } else {
                 let off = e.payload_offset as usize;
                 let len = e.payload_len as usize;
@@ -230,20 +246,25 @@ impl DiskSegment {
                 if end > payload_bytes.len() {
                     // Should be impossible after the truncation
                     // pass above, but stay defensive.
-                    bad_entries += 1;
-                    return false;
+                    continue;
                 }
                 &payload_bytes[off..end]
             };
             let computed = super::entry::payload_checksum(payload);
-            if e.checksum() != computed {
-                bad_entries += 1;
-                false
-            } else {
-                true
+            if e.checksum() == computed {
+                survivors.push(i);
             }
-        });
+        }
+        let bad_entries = index.len() - survivors.len();
         if bad_entries > 0 {
+            // Compact `index` to surviving entries. The corresponding
+            // ts compaction below picks `original_timestamps[i]` for
+            // each `i in survivors`.
+            let mut compacted = Vec::with_capacity(survivors.len());
+            for &i in &survivors {
+                compacted.push(index[i]);
+            }
+            index = compacted;
             tracing::error!(
                 bad_entries,
                 surviving = index.len(),
@@ -251,6 +272,40 @@ impl DiskSegment {
                  on-disk dat may have torn writes or be corrupt",
                 bad_entries
             );
+        }
+
+        // Compact timestamps to match the surviving index. If the
+        // ts sidecar was missing/corrupt, propagate `None` so the
+        // file.rs layer falls back to `now()`.
+        let timestamps = original_timestamps.as_ref().map(|all_ts| {
+            survivors
+                .iter()
+                .map(|&i| all_ts.get(i).copied().unwrap_or(0))
+                .collect::<Vec<u64>>()
+        });
+
+        // If we dropped mid-file entries, the on-disk ts file no
+        // longer matches the surviving index byte-for-byte. Rewrite
+        // it with the compacted timestamps so the next reopen sees a
+        // file of length `surviving * 8` whose i-th entry pairs with
+        // `index[i]`. When no entries were dropped, just truncate
+        // the trailing slack from the tail-truncation step.
+        if let Some(ts) = timestamps.as_ref() {
+            if bad_entries > 0 {
+                if let Ok(mut file) = OpenOptions::new().write(true).truncate(true).open(&ts_path) {
+                    use std::io::Write as _;
+                    let mut buf = Vec::with_capacity(ts.len() * 8);
+                    for &t in ts {
+                        buf.extend_from_slice(&t.to_le_bytes());
+                    }
+                    let _ = file.write_all(&buf);
+                }
+            } else if !index.is_empty() {
+                // No mid-file drops; just align length with idx.
+                if let Ok(file) = OpenOptions::new().write(true).open(&ts_path) {
+                    let _ = file.set_len((index.len() * 8) as u64);
+                }
+            }
         }
 
         let idx_file = OpenOptions::new()
@@ -265,24 +320,6 @@ impl DiskSegment {
             .append(true)
             .open(&dat_path)
             .map_err(RedexError::io)?;
-
-        // Read the ts sidecar if present. We accept it only when
-        // its length is exactly `index.len() * 8` — any
-        // mismatch (corrupted, partial-write, missing entirely)
-        // means we fall back to `now()` and surface a warning so
-        // operators know age-retention is degraded for this run.
-        let ts_path = dir.join("ts");
-        let timestamps = read_timestamps(&ts_path, index.len())?;
-        if timestamps.is_some() && !index.is_empty() {
-            // We're going to truncate the ts file alongside the
-            // idx truncation we just did, so they stay in sync.
-            // (If `idx_len_truncated` rolled the index back, the
-            // ts file may now be longer.)
-            if let Ok(file) = OpenOptions::new().write(true).open(&ts_path) {
-                let _ = file.set_len((index.len() * 8) as u64);
-            }
-        }
-        let _ = idx_len_truncated;
 
         let ts_file = OpenOptions::new()
             .create(true)
@@ -737,25 +774,49 @@ impl DiskSegment {
 
         // Drop the old open append handles before rename. On
         // Windows, an open handle to the destination prevents
-        // rename; POSIX is more permissive but consistency is
+        // rename; POSIX is more permissive but the consistency is
         // valuable.
+        //
+        // We need each `File` slot to hold a valid `File` value
+        // (it's not `Option<File>`), so swap in a throwaway file
+        // outside the channel directory. Using `std::env::temp_dir`
+        // keeps the channel dir clean — the OS reclaims the
+        // placeholder if a crash mid-compaction prevents our
+        // explicit `remove_file` below from running. A unique
+        // suffix (process id + nanos) prevents two concurrent
+        // compactions across different channels from colliding on
+        // the same placeholder name.
+        let placeholder_suffix = format!(
+            "{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let placeholder_idx =
+            std::env::temp_dir().join(format!("redex-compact-idx-{}", placeholder_suffix));
+        let placeholder_dat =
+            std::env::temp_dir().join(format!("redex-compact-dat-{}", placeholder_suffix));
+        let placeholder_ts =
+            std::env::temp_dir().join(format!("redex-compact-ts-{}", placeholder_suffix));
         let null_idx = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
-            .open(self.dir.join(".compact-placeholder-idx"))
+            .open(&placeholder_idx)
             .map_err(RedexError::io)?;
         let null_dat = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
-            .open(self.dir.join(".compact-placeholder-dat"))
+            .open(&placeholder_dat)
             .map_err(RedexError::io)?;
         let null_ts = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
-            .open(self.dir.join(".compact-placeholder-ts"))
+            .open(&placeholder_ts)
             .map_err(RedexError::io)?;
         *idx_guard = null_idx;
         *dat_guard = null_dat;
@@ -786,10 +847,12 @@ impl DiskSegment {
             .open(&ts_path)
             .map_err(RedexError::io)?;
 
-        // Clean up placeholders.
-        let _ = std::fs::remove_file(self.dir.join(".compact-placeholder-idx"));
-        let _ = std::fs::remove_file(self.dir.join(".compact-placeholder-dat"));
-        let _ = std::fs::remove_file(self.dir.join(".compact-placeholder-ts"));
+        // Clean up placeholders. Best-effort; if the rename
+        // succeeded we can tolerate a stray file in the OS temp
+        // dir.
+        let _ = std::fs::remove_file(&placeholder_idx);
+        let _ = std::fs::remove_file(&placeholder_dat);
+        let _ = std::fs::remove_file(&placeholder_ts);
 
         Ok(())
     }
@@ -1313,6 +1376,66 @@ mod tests {
         assert_eq!(recovered.index.len(), 2);
         assert_eq!(&recovered.payload_bytes[..p1.len()], p1);
         assert_eq!(&recovered.payload_bytes[p1.len()..p1.len() + p2.len()], p2);
+
+        cleanup(&base);
+    }
+
+    /// Regression: when the checksum filter drops a *mid-file*
+    /// entry, the surviving timestamps must be picked by original
+    /// index position — not by sequential prefix. Previously we
+    /// read `read_timestamps(.., index.len())` AFTER the filter,
+    /// which returned `[ts0, ts1, …, ts_{N-bad-1}]` from the start
+    /// of the ts file, misaligning every surviving entry that
+    /// followed a dropped one.
+    #[test]
+    fn checksum_filter_preserves_ts_pairing_on_mid_file_drop() {
+        let base = tmpdir();
+        let name = ChannelName::new("t/ts_pair").unwrap();
+        let dat_path = channel_dir(&base, &name).join("dat");
+
+        // Append four entries with distinct, recognizable timestamps.
+        // Use the explicit-timestamp variant so we can pin which
+        // ts pairs with which idx record.
+        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        let payloads: [&[u8]; 4] = [b"AAAAAAAAA", b"BBBBBBBBB", b"CCCCCCCCC", b"DDDDDDDDD"];
+        let timestamps: [u64; 4] = [1000, 2000, 3000, 4000];
+        let mut offset = 0u32;
+        for (i, p) in payloads.iter().enumerate() {
+            let e = RedexEntry::new_heap(i as u64, offset, p.len() as u32, 0, payload_checksum(p));
+            recovered
+                .disk
+                .append_entry_at(&e, p, timestamps[i])
+                .unwrap();
+            offset += p.len() as u32;
+        }
+        recovered.disk.sync().unwrap();
+        drop(recovered);
+
+        // Corrupt the SECOND payload's bytes on disk so its
+        // checksum no longer verifies. We mutate `dat` in place;
+        // the idx record still claims the original checksum.
+        {
+            let mut bytes = std::fs::read(&dat_path).unwrap();
+            bytes[payloads[0].len()] ^= 0xFF; // flip a byte inside p2
+            std::fs::write(&dat_path, &bytes).unwrap();
+        }
+
+        // Reopen — recovery's checksum filter must drop entry 1
+        // (B) and pair the surviving entries with their original
+        // timestamps (1000, 3000, 4000), NOT (1000, 2000, 3000).
+        let recovered = DiskSegment::open(&base, &name, 0).unwrap();
+        assert_eq!(recovered.index.len(), 3, "one corrupt entry must drop");
+        let surviving_seqs: Vec<u64> = recovered.index.iter().map(|e| e.seq).collect();
+        assert_eq!(surviving_seqs, vec![0, 2, 3], "B should be dropped");
+
+        let ts = recovered.timestamps.expect("ts sidecar present");
+        assert_eq!(
+            ts,
+            vec![1000, 3000, 4000],
+            "surviving timestamps must come from the original index \
+             positions of the surviving entries; pre-fix this would \
+             have been [1000, 2000, 3000]"
+        );
 
         cleanup(&base);
     }

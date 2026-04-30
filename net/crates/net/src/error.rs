@@ -148,6 +148,10 @@ mod tests {
             "event dropped due to sampling"
         );
         assert_eq!(
+            IngestionError::Unrouted.to_string(),
+            "event has no routable shard"
+        );
+        assert_eq!(
             IngestionError::ShuttingDown.to_string(),
             "event bus is shutting down"
         );

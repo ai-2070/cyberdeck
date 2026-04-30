@@ -305,18 +305,65 @@ pub struct Batch {
 }
 
 /// Per-process nonce used by [`Batch::process_nonce`]. Sampled once
-/// (lazy) from the wall clock XOR'd with the process id, so two
-/// processes launched within a single nanosecond tick still differ
-/// on the pid component.
+/// (lazy) from a mix of entropy sources so two processes launched on
+/// the same machine within a single nanosecond tick are still
+/// distinguishable.
+///
+/// We don't use `getrandom` here because it's a feature-gated
+/// optional dep — `event.rs` is in the always-compiled core. Instead
+/// we run xxh3 over multiple sources whose joint state is effectively
+/// never identical across two adjacent process starts: wall-clock
+/// nanos, monotonic-clock nanos (resilient to wall-clock skew),
+/// pid, the address of a stack-local (gives an ASLR component),
+/// and the current thread id. Plain XOR of two sources (the
+/// previous implementation) collapses to zero whenever the
+/// components happen to share bit patterns; xxh3 mixes them so any
+/// single non-degenerate source dominates the output.
 pub fn batch_process_nonce() -> u64 {
     use std::sync::OnceLock;
     static NONCE: OnceLock<u64> = OnceLock::new();
     *NONCE.get_or_init(|| {
-        let now_nanos = std::time::SystemTime::now()
+        use std::hash::{Hash, Hasher};
+        use std::time::Instant;
+
+        let wall_nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        now_nanos ^ (std::process::id() as u64)
+        // `Instant::now()` is monotonic — distinct entropy from
+        // `SystemTime` (the OS may slew wall-clock backwards but
+        // never the monotonic source). `Instant` doesn't expose a
+        // public u64 accessor, so we mix the bytes of its `Debug`
+        // repr.
+        let mono_marker = format!("{:?}", Instant::now());
+        let pid = std::process::id() as u64;
+        // Address of a stack local — adds an ASLR-derived
+        // component that differs across process starts even when
+        // the time / pid components happen to collide.
+        let stack_marker: usize = &pid as *const u64 as usize;
+        let mut tid_hasher = std::collections::hash_map::DefaultHasher::new();
+        std::thread::current().id().hash(&mut tid_hasher);
+        let tid = tid_hasher.finish();
+
+        let mut buf = [0u8; 64];
+        buf[..8].copy_from_slice(&wall_nanos.to_le_bytes());
+        buf[8..16].copy_from_slice(&pid.to_le_bytes());
+        buf[16..24].copy_from_slice(&(stack_marker as u64).to_le_bytes());
+        buf[24..32].copy_from_slice(&tid.to_le_bytes());
+        // Pack as much of the monotonic marker bytes as fits.
+        let mono_bytes = mono_marker.as_bytes();
+        let n = mono_bytes.len().min(32);
+        buf[32..32 + n].copy_from_slice(&mono_bytes[..n]);
+
+        let nonce = xxhash_rust::xxh3::xxh3_64(&buf);
+        // Refuse `0` — some consumers treat 0 as a sentinel.
+        // Probability of xxh3 returning exactly 0 is 2^-64; we
+        // map it to 1.
+        if nonce == 0 {
+            1
+        } else {
+            nonce
+        }
     })
 }
 

@@ -653,14 +653,16 @@ impl EventBus {
             .saturating_mul(n_workers.max(1) as u32);
         let phase2_deadline =
             tokio::time::Instant::now() + phase2_budget.min(Duration::from_secs(2));
+        // Sleep one `max_delay` window at a time. After each sleep,
+        // if the ring buffers are still empty (no late drain refilled
+        // them), we've given the in-flight batches at least one
+        // `max_delay`-sized opportunity to time out and dispatch —
+        // good enough to declare phase 2 complete. Without this
+        // early-break, every `flush()` always paid the full budget
+        // (up to 2s) even on an idle system.
         while tokio::time::Instant::now() < phase2_deadline {
-            // No direct way to test "channel empty"; sleep one
-            // max_delay window and re-check ring buffers in case a
-            // late drain refilled them.
             tokio::time::sleep(self.config.batch.max_delay).await;
-            if self.shard_manager.all_shards_empty()
-                && tokio::time::Instant::now() >= phase2_deadline
-            {
+            if self.shard_manager.all_shards_empty() {
                 break;
             }
         }
