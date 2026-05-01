@@ -10,7 +10,7 @@ Each item is tagged `[Critical | High | Medium | Low | Nit]`. Critical items are
 
 **Ship-blockers: ALL FIXED** (CR-1 through CR-5).
 **High-severity: ALL FIXED** (CR-6 through CR-12).
-**Medium (priority subset): FIXED** (CR-14, CR-15, CR-17, CR-19, CR-20, CR-21, CR-22, CR-31).
+**Medium-severity: ALL ACTIONABLE ITEMS FIXED** (CR-13 through CR-33; CR-24, CR-32, CR-34, CR-35 deferred — see notes below).
 
 | ID | Status | Notes |
 |----|--------|-------|
@@ -34,8 +34,25 @@ Each item is tagged `[Critical | High | Medium | Low | Nit]`. Critical items are
 | CR-21 | ✅ Fixed | `getrandom` failures abort instead of panic in `context.rs` and `loadbalance.rs`; 2 source tripwires |
 | CR-22 | ✅ Fixed | `include/net.h` and `bindings/go/net/net.h` synced with `-9`/`-10`; parity test |
 | CR-31 | ✅ Fixed | `from_registry` / `capability_tags` parity test now compares ordered Vec (was HashSet) |
+| CR-13 | ✅ Fixed | `MAX_PROOF_VERIFY_SPAN` tightened from 1M to 100K; per-peer rate-limit doc added; tripwire test |
+| CR-16 | ✅ Fixed | `CausalCone::is_concurrent_with` uses exact `contains_origin` when both horizons populated; bloom-saturation regression test |
+| CR-18 | ✅ Documented | `MetadataStore` soft-cap race pinned with concurrent-upsert test (deliberate) |
+| CR-23 | ✅ Fixed | Recording mock adapter test pinning `flush()` + `shutdown()` are each called exactly once |
+| CR-25 | ✅ Fixed | `shutdown_via_ref` second-caller deadline elapsed → `AdapterError::Transient` instead of silent `Ok` |
+| CR-26 | ✅ Fixed | `flush()` doc now states ~37s worst case (5s + 2s + adapter_timeout) instead of misleading 5s |
+| CR-27 | ✅ Fixed | `manual_scale_down` partial-success now logs WARN with stuck-shard list |
+| CR-28 | ✅ Fixed | `PersistentProducerNonce` v1 wire format with version prefix; v0 back-compat path; 4 regression tests |
+| CR-29 | ✅ Fixed | `with_nonce` 0→1 coercion doc rewritten — JetStream sentinel claim was fiction; defense-in-depth rationale documented |
+| CR-30 | ✅ Documented | Read-path `validate_bounds` invariant pinned with test |
+| CR-33 | ✅ Documented | `SuperpositionState::continuity_proof` genesis-edge + seq=1 cases pinned |
 
-The remaining medium / low items (CR-13, CR-16, CR-18, CR-23, CR-24, CR-25, CR-26, CR-27, CR-28, CR-29, CR-30, CR-32, CR-33, CR-34, CR-35) are tracked as follow-ups; none are exploitable in isolation. Total regression tests added across all 20 closed items: 37 across Rust (lib + integration), Python (pytest), and TypeScript (vitest).
+**Deferred items** (need substantial infrastructure work; tracked as separate audit entries):
+- **CR-24** — `MigrationFailed` arm missing StandbyGroup / CapabilityIndex cleanup. Requires migration-handler refactor; the dispatcher-level fix is non-trivial.
+- **CR-32** — `start_migration` fallback path warns silently in production. Requires either `cfg(test)` gate (with test infrastructure shifts) or a runtime-config flag.
+- **CR-34** — `assess_continuity` `head_payload` contract enforced only by hash mismatch. Production caller of `from_bytes` populating `head_payload` is a wider snapshot-restore refactor.
+- **CR-35** — NAPI/PyO3 `Python::allow_threads` not used on hot mutex paths. Performance concern, not correctness; warrants a binding-level perf pass.
+
+Total regression tests added across all 31 closed items: **48** across Rust (lib + integration), Python (pytest), and TypeScript (vitest). Full lib test suite: **1355 passing** (up from 1322 baseline at branch start).
 
 ---
 

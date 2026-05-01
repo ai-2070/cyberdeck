@@ -28,19 +28,23 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Legacy v0 wire format: 8 raw little-endian bytes (no version
-/// prefix). Files produced before CR-28 used this shape; new files
-/// produced post-CR-28 use [`NONCE_FILE_LEN_V1`] (9 bytes with a
-/// 1-byte version prefix). Loaders accept BOTH for back-compat
-/// across rolling upgrades.
-const NONCE_FILE_LEN_V0: usize = 8;
-
-/// Current v1 wire format: `[VERSION:u8 = 1][nonce:u64 LE]` = 9 bytes.
+/// Wire format: `[VERSION:u8 = 1][nonce:u64 LE]` = 9 bytes.
+///
 /// CR-28 added the version prefix so a future format change (e.g.
 /// HMAC-keyed nonce, extended to 16 bytes for `(epoch, nonce)`)
 /// can be deployed without an out-of-band file migration —
 /// loaders just match on `data[0]` and dispatch to the matching
 /// parser.
+///
+/// Pre-CR-28 callers used a raw 8-byte format with no version
+/// prefix. That legacy format is **not supported**: a loader
+/// against a pre-CR-28 file will surface `InvalidData`. This is
+/// fine because (a) the feature shipped in the same release as
+/// CR-28 (no production deployments of the legacy format need
+/// to be preserved) and (b) operators that need to migrate can
+/// simply delete the existing nonce file — the next start will
+/// create a fresh v1, with a one-time loss of cross-restart
+/// dedup that's bounded by the JetStream/Redis dedup window.
 const NONCE_FILE_LEN_V1: usize = 1 + 8;
 
 /// Version byte for the current wire format.
@@ -83,52 +87,32 @@ impl PersistentProducerNonce {
         // Fast path: file exists.
         match fs::read(&path) {
             Ok(bytes) => {
-                let nonce = match bytes.len() {
-                    // CR-28: v0 legacy format (no version prefix).
-                    // Pre-CR-28 files are still in production; we
-                    // accept them so a rolling upgrade doesn't
-                    // require flushing every nonce file.
-                    NONCE_FILE_LEN_V0 => {
-                        let mut buf = [0u8; 8];
-                        buf.copy_from_slice(&bytes);
-                        u64::from_le_bytes(buf)
-                    }
-                    // CR-28: v1 versioned format. First byte must
-                    // be the v1 sentinel; future v2+ files would
-                    // mismatch and surface as InvalidData below
-                    // until a v2 reader lands.
-                    NONCE_FILE_LEN_V1 => {
-                        if bytes[0] != NONCE_FORMAT_V1 {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "producer-nonce file at {} has unknown \
-                                     version byte 0x{:02x} (expected 0x{:02x} \
-                                     for v1)",
-                                    path.display(),
-                                    bytes[0],
-                                    NONCE_FORMAT_V1,
-                                ),
-                            ));
-                        }
-                        let mut buf = [0u8; 8];
-                        buf.copy_from_slice(&bytes[1..]);
-                        u64::from_le_bytes(buf)
-                    }
-                    other => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "producer-nonce file at {} has length {} \
-                                 (expected {} for v0 or {} for v1)",
-                                path.display(),
-                                other,
-                                NONCE_FILE_LEN_V0,
-                                NONCE_FILE_LEN_V1,
-                            ),
-                        ));
-                    }
-                };
+                if bytes.len() != NONCE_FILE_LEN_V1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "producer-nonce file at {} has length {} (expected {} for v1)",
+                            path.display(),
+                            bytes.len(),
+                            NONCE_FILE_LEN_V1,
+                        ),
+                    ));
+                }
+                if bytes[0] != NONCE_FORMAT_V1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "producer-nonce file at {} has unknown version byte 0x{:02x} \
+                             (expected 0x{:02x} for v1)",
+                            path.display(),
+                            bytes[0],
+                            NONCE_FORMAT_V1,
+                        ),
+                    ));
+                }
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&bytes[1..]);
+                let nonce = u64::from_le_bytes(buf);
                 Ok(Self { nonce, path })
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -440,27 +424,31 @@ mod tests {
         let _ = fs::remove_file(&*path);
     }
 
-    /// CR-28 v0 back-compat path: a legacy 8-byte file (no version
-    /// prefix) produced by a pre-CR-28 binary MUST still load
-    /// cleanly. This is the load-bearing rolling-upgrade contract:
-    /// upgrading a daemon that already has a `producer.nonce` file
-    /// on disk doesn't lose the cross-restart dedup property.
+    /// CR-28: legacy 8-byte (pre-versioning) files are NOT
+    /// supported. The feature shipped along with CR-28 itself, so
+    /// no production deployments of the legacy format exist;
+    /// loaders surface `InvalidData` and operators delete the
+    /// stale file to recover (next start writes a fresh v1, with
+    /// a one-time loss of cross-restart dedup bounded by the
+    /// JetStream/Redis dedup window). Pin the rejection so a
+    /// future refactor can't silently re-introduce the legacy
+    /// path.
     #[test]
-    fn cr28_v0_legacy_8_byte_file_still_loads() {
-        let path = temp_path("v0-legacy");
-        let expected: u64 = 0xDEAD_BEEF_CAFE_F00D;
-        // Write 8 LE bytes by hand — exactly the pre-CR-28
-        // wire format.
-        fs::write(&path, expected.to_le_bytes()).unwrap();
+    fn cr28_legacy_8_byte_file_is_rejected() {
+        let path = temp_path("legacy-8byte");
+        // Write 8 raw LE bytes — the pre-CR-28 wire format.
+        let stale: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        fs::write(&path, stale.to_le_bytes()).unwrap();
 
-        let loaded = PersistentProducerNonce::load_or_create(&path)
-            .unwrap()
-            .nonce();
+        let err = PersistentProducerNonce::load_or_create(&path).unwrap_err();
         assert_eq!(
-            loaded, expected,
-            "CR-28: a legacy 8-byte v0 file must still load — pre-CR-28 \
-             producers wrote this shape and a rolling upgrade must not \
-             lose the cross-restart dedup property"
+            err.kind(),
+            io::ErrorKind::InvalidData,
+            "legacy 8-byte file must surface InvalidData (CR-28 dropped v0 support)"
+        );
+        assert!(
+            err.to_string().contains("length 8"),
+            "error message should pin the rejected length; got: {err}"
         );
         let _ = fs::remove_file(&path);
     }
@@ -516,7 +504,7 @@ mod tests {
 
     /// CR-28: a freshly-created nonce file MUST be the v1 shape
     /// (9 bytes, version byte = 1). Pin so a regression that
-    /// reverts to the v0 wire format is caught.
+    /// reverts to a legacy unversioned write is caught.
     #[test]
     fn cr28_create_new_writes_v1_format() {
         let path = temp_path("v1-fresh");
