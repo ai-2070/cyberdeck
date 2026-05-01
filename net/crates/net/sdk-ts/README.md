@@ -116,7 +116,7 @@ JetStream and Redis adapters key dedup on `(producer_nonce, shard,
 sequence_start, i)`. Without persistence the nonce is fresh per
 process — a producer that crashes mid-batch and restarts gets a
 new nonce, retransmits look fresh, and the backend persists the
-partial half twice (BUG #56). Configure
+partial half twice. Configure
 `producerNoncePath` to make the nonce durable:
 
 ```typescript
@@ -148,14 +148,21 @@ import { RedisStreamDedup } from '@ai2070/net';
 import { createClient } from 'redis';
 
 // Sizing: ~10k events/sec * 1 min dedup window → ~600,000.
-const dedup = new RedisStreamDedup(64_000);
+const dedup = new RedisStreamDedup(600_000);
 
 const r = createClient();
 await r.connect();
 
 let cursor = '0';
 while (true) {
-  const entries = await r.xRange('net:shard:0', cursor, '+', { COUNT: 100 });
+  // XRANGE bounds are INCLUSIVE on both ends. After the first
+  // page we must use the exclusive form `(<id>` so we don't
+  // re-read the entry the cursor points at — a vanilla
+  // `xRange(stream, cursor, '+')` loop spins forever once the
+  // cursor reaches the tail and the same entry is returned every
+  // iteration.
+  const start = cursor === '0' ? cursor : `(${cursor}`;
+  const entries = await r.xRange('net:shard:0', start, '+', { COUNT: 100 });
   if (entries.length === 0) break;
   for (const entry of entries) {
     const dedupId = entry.message.dedup_id;

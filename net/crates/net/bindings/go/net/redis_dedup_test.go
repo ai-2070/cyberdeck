@@ -138,3 +138,96 @@ func TestRedisStreamDedup_Checked_NullHandleAfterClose(t *testing.T) {
 		t.Errorf("IsDuplicateChecked after Close: got err=%v, want ErrNullPointer", err)
 	}
 }
+
+// Cubic-ai P2: embedded NUL bytes in dedupID must be rejected
+// before the C-string conversion. `C.CString` truncates at the
+// first NUL, so two distinct Go strings that share a prefix and
+// differ after a NUL would otherwise collide on the C side and
+// be reported as the same dedup_id — silently dropping the
+// second event as a "duplicate."
+func TestRedisStreamDedup_RejectsEmbeddedNul(t *testing.T) {
+	d := NewRedisStreamDedup(8)
+	defer d.Close()
+
+	// Two ids that share a prefix and differ AFTER a NUL.
+	// Pre-fix both became `"foo"` on the C side; post-fix both
+	// surface ErrInvalidDedupID before the C call.
+	withNulA := "foo\x00bar"
+	withNulB := "foo\x00baz"
+
+	dup, err := d.IsDuplicateChecked(withNulA)
+	if err != ErrInvalidDedupID {
+		t.Errorf("expected ErrInvalidDedupID for embedded NUL, got err=%v", err)
+	}
+	if dup {
+		t.Errorf("embedded NUL must surface as error, not duplicate (fail-open)")
+	}
+
+	dup, err = d.IsDuplicateChecked(withNulB)
+	if err != ErrInvalidDedupID {
+		t.Errorf("expected ErrInvalidDedupID for embedded NUL (B), got err=%v", err)
+	}
+	if dup {
+		t.Errorf("embedded NUL (B) must surface as error, not silent duplicate")
+	}
+
+	// Neither call should have mutated the helper.
+	if got := d.Len(); got != 0 {
+		t.Errorf("rejected NUL ids must not enter the LRU; got len %d", got)
+	}
+}
+
+// Cubic-ai P1: the Go-side mutex must protect handle lifetime
+// against a concurrent Close() while a method is mid-C-call.
+// Pre-fix `Close()` could free `d.handle` and nil it while another
+// goroutine had already loaded the raw pointer for an in-flight
+// `C.net_redis_dedup_*` call — use-after-free, UB.
+//
+// We can't deterministically reproduce the exact race in a unit
+// test (it's microseconds wide), but a stress test running N
+// goroutines hammering IsDuplicate while another races Close()
+// reliably triggers the UB pre-fix on Linux/macOS under the
+// race detector. Post-fix the lock makes the test deterministically
+// safe — it must complete without panic, double-free, or
+// data-race report.
+func TestRedisStreamDedup_CloseRaceSafety(t *testing.T) {
+	const goroutines = 8
+	const iters = 200
+
+	for trial := 0; trial < 5; trial++ {
+		d := NewRedisStreamDedup(64)
+		done := make(chan struct{}, goroutines)
+
+		// Hammer goroutines: each does many IsDuplicate calls.
+		for g := 0; g < goroutines; g++ {
+			go func(g int) {
+				defer func() { done <- struct{}{} }()
+				for i := 0; i < iters; i++ {
+					id := fmt.Sprintf("trial%d-g%d-i%d", trial, g, i)
+					// Don't fail the test on results — once Close
+					// races in, the answer is "false, ErrNullPointer"
+					// and that's fine. We're testing for absence
+					// of UB, not specific return values.
+					_ = d.IsDuplicate(id)
+				}
+			}(g)
+		}
+
+		// Closer: races against the hammers. Sleep is omitted so
+		// the close lands at an arbitrary point in the workload —
+		// exactly the race we want to exercise.
+		go func() {
+			defer func() { done <- struct{}{} }()
+			d.Close()
+		}()
+
+		// Drain. The closer counts as the last (goroutines+1)th
+		// finisher.
+		for i := 0; i < goroutines+1; i++ {
+			<-done
+		}
+
+		// Idempotent close: must not double-free.
+		d.Close()
+	}
+}

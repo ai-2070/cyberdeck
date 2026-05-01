@@ -406,7 +406,11 @@ impl Batch {
             shard_id,
             events,
             sequence_start,
-            process_nonce: if producer_nonce == 0 { 1 } else { producer_nonce },
+            process_nonce: if producer_nonce == 0 {
+                1
+            } else {
+                producer_nonce
+            },
         }
     }
 

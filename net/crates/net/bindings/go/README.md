@@ -501,17 +501,17 @@ The Net Redis adapter writes a stable `dedup_id` field on every
 XADD entry of the form
 `{producer_nonce:hex}:{shard_id}:{sequence_start}:{i}`. Combined
 with the bus's persistent producer-nonce path (`producer_nonce_path`
-on `EventBusConfig`, BUG #56), the id is stable across both
+on `EventBusConfig`), the id is stable across both
 within-process retries AND cross-process restart — the
 `MULTI/EXEC`-timeout race that drops two stream entries for one
-logical event (BUG #57) becomes filterable at consume time.
+logical event becomes filterable at consume time.
 
 `RedisStreamDedup` is the consumer-side helper:
 
 ```go
 import (
     "fmt"
-    netbinding "github.com/ai2070/net/bindings/go/net"
+    netbinding "github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net"
     "github.com/redis/go-redis/v9"
 )
 
@@ -519,12 +519,21 @@ func consume(ctx context.Context, rdb *redis.Client, stream string) error {
     // ~10k events/sec * 1 min dedup window → capacity ~600,000.
     // The default of 4096 is fine for low-throughput / short-window
     // deployments.
-    dedup := netbinding.NewRedisStreamDedup(64_000)
+    dedup := netbinding.NewRedisStreamDedup(600_000)
     defer dedup.Close()
 
     cursor := "0"
     for {
-        entries, err := rdb.XRange(ctx, stream, cursor, "+").Result()
+        // XRANGE bounds are INCLUSIVE on both ends. After the first
+        // page we must use the exclusive form `(<id>` so we don't
+        // re-read the entry the cursor points at — a vanilla
+        // `XRange(ctx, stream, cursor, "+")` loop spins forever
+        // once the cursor reaches the tail.
+        start := cursor
+        if cursor != "0" {
+            start = "(" + cursor
+        }
+        entries, err := rdb.XRange(ctx, stream, start, "+").Result()
         if err != nil { return err }
 
         for _, entry := range entries {
@@ -549,9 +558,7 @@ func consume(ctx context.Context, rdb *redis.Client, stream string) error {
 
 The helper is transport-agnostic — bring your own `go-redis` /
 `redigo` / equivalent client; it just answers the dedup question
-against an in-memory LRU. See
-[`docs/BUG_AUDIT_2026_04_30_CORE.md`](../../docs/BUG_AUDIT_2026_04_30_CORE.md)
-(entries #56 and #57) for the full producer-side contract.
+against an in-memory LRU.
 
 ### Concurrency
 

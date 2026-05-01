@@ -113,7 +113,7 @@ shard, sequence_start, i)` tuple. Without persistence, the nonce
 is fresh per process — a producer that crashes mid-batch and
 restarts gets a new nonce, retransmits look fresh to the
 backend, and the partial-batch's accepted half is persisted
-twice (BUG #56).
+twice.
 
 Configure `EventBusConfig::producer_nonce_path` to make the
 nonce survive restart:
@@ -138,7 +138,7 @@ XADD, filterable consumer-side via the helper below.
 use net_sdk::RedisStreamDedup;
 
 // Sizing: ~10k events/sec * 1 min dedup window → ~600,000.
-let mut dedup = RedisStreamDedup::with_capacity(64_000);
+let mut dedup = RedisStreamDedup::with_capacity(600_000);
 
 // Read entries from your Redis client of choice; pull the
 // `dedup_id` field from each XADD entry's field map.

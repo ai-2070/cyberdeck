@@ -158,10 +158,6 @@ The helper is transport-agnostic — bring your own `hiredis` /
 min dedup window → capacity ~600,000. Default 4096 fits
 low-throughput / short-window deployments.
 
-See [`docs/BUG_AUDIT_2026_04_30_CORE.md`] (entries #56–#57) for
-the producer-side dedup contract and the cross-restart nonce
-persistence model.
-
 ## Types
 
 ```c

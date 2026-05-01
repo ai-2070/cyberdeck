@@ -2248,7 +2248,7 @@ mod tests {
             "two bus instances against the same producer_nonce_path \
              must stamp the same nonce — pre-fix this regenerated on \
              every restart and JetStream's dedup window saw new \
-             msg-ids as fresh batches (BUG #56)",
+             msg-ids as fresh batches",
         );
 
         // Cleanup.
@@ -2359,7 +2359,7 @@ mod tests {
                 "batch {i} stamped a different nonce ({n:#x}) than the first \
                  batch ({first:#x}) — at least one spawn site (initial-shard \
                  loop or `add_shard_internal`) failed to inherit the bus's \
-                 producer_nonce (BUG #56)",
+                 producer_nonce",
             );
         }
 

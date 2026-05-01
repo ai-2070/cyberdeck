@@ -86,7 +86,7 @@ fn helper_filters_cross_restart_duplicates_via_stable_nonce() {
             dedup.is_duplicate(&id),
             "post-restart retry must be filtered by the consumer — \
              the persistent nonce makes the dedup_id stable across \
-             restarts (BUG #56 + #57)",
+             restarts",
         );
     }
 }

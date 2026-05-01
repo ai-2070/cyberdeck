@@ -56,15 +56,24 @@ import "C"
 import (
 	"errors"
 	"runtime"
+	"strings"
+	"sync"
 	"unsafe"
 )
 
 // ErrInvalidDedupID indicates the dedup_id passed to
-// [RedisStreamDedup.IsDuplicate] was not valid UTF-8. Should
-// never happen for ids produced by the Net Redis adapter (which
-// emits ASCII-only `nonce:shard:seq:i` tuples); typically signals
-// a corrupted entry on the consumer side.
-var ErrInvalidDedupID = errors.New("invalid UTF-8 in dedup_id")
+// [RedisStreamDedup.IsDuplicate] was not valid UTF-8 OR contained
+// an embedded NUL byte. Should never happen for ids produced by
+// the Net Redis adapter (which emits ASCII-only `nonce:shard:seq:i`
+// tuples); typically signals a corrupted entry on the consumer
+// side.
+//
+// Cubic-ai P2: pre-fix the helper called `C.CString(dedupID)`
+// without validating embedded NULs. `C.CString` truncates at the
+// first NUL, so two distinct Go strings `"foo\x00bar"` and
+// `"foo\x00baz"` both become C string `"foo"` and the helper
+// would treat them as the same dedup_id — silent collision.
+var ErrInvalidDedupID = errors.New("invalid dedup_id (non-UTF-8 or embedded NUL)")
 
 // RedisStreamDedup is a consumer-side dedup helper that filters
 // duplicate Redis Streams entries by their `dedup_id` field.
@@ -73,7 +82,17 @@ var ErrInvalidDedupID = errors.New("invalid UTF-8 in dedup_id")
 // [RedisStreamDedup.Close]. Concurrent use across goroutines is
 // safe (each call serializes through an internal mutex), but the
 // expected pattern is one helper per consumer goroutine.
+//
+// Cubic-ai P1: the Go-side `mu` lock guards `handle` against
+// use-after-free. Pre-fix, a goroutine reading `d.handle` for a
+// C call could race a concurrent `Close()` (or the
+// `runtime.SetFinalizer` backstop) that frees the handle and
+// nils the field; the C-side mutex inside the handle is no help
+// once the handle's backing memory has been freed. The Go lock
+// is held across each C call so that for the duration of the
+// call, the handle cannot be freed.
 type RedisStreamDedup struct {
+	mu     sync.Mutex
 	handle *C.net_redis_dedup_t
 }
 
@@ -98,8 +117,17 @@ func NewRedisStreamDedup(capacity uint) *RedisStreamDedup {
 // Close releases the helper's C-side handle. After Close, all
 // methods on this instance are no-ops (the underlying handle is
 // NULL). Safe to call multiple times.
+//
+// Cubic-ai P1: takes the Go mutex so a concurrent in-flight
+// method (already past its handle-nil guard but mid-C-call)
+// completes before we free.
 func (d *RedisStreamDedup) Close() {
-	if d == nil || d.handle == nil {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.handle == nil {
 		return
 	}
 	C.net_redis_dedup_free(d.handle)
@@ -125,10 +153,26 @@ func (d *RedisStreamDedup) IsDuplicate(dedupID string) bool {
 
 // IsDuplicateChecked is like [RedisStreamDedup.IsDuplicate] but
 // returns the underlying error from the C-side check (NULL
-// handle, NULL dedup_id, or invalid UTF-8) so callers can branch
-// on it.
+// handle, embedded NUL, NULL dedup_id, or invalid UTF-8) so
+// callers can branch on it.
 func (d *RedisStreamDedup) IsDuplicateChecked(dedupID string) (bool, error) {
-	if d == nil || d.handle == nil {
+	if d == nil {
+		return false, ErrNullPointer
+	}
+	// Cubic-ai P2: reject embedded NULs BEFORE the C-string
+	// conversion. `C.CString` truncates at the first NUL, so
+	// without this guard `"foo\x00bar"` and `"foo\x00baz"` would
+	// both serialize to the C string `"foo"` and the helper
+	// would silently treat them as the same dedup_id (false
+	// duplicate → dropped event). We reject upfront with a
+	// dedicated error rather than letting the C call see a
+	// truncated id.
+	if strings.IndexByte(dedupID, 0) >= 0 {
+		return false, ErrInvalidDedupID
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.handle == nil {
 		return false, ErrNullPointer
 	}
 	cID := C.CString(dedupID)
@@ -151,7 +195,12 @@ func (d *RedisStreamDedup) IsDuplicateChecked(dedupID string) (bool, error) {
 // Len returns the number of distinct ids currently tracked.
 // Returns 0 on a closed/nil helper.
 func (d *RedisStreamDedup) Len() uint {
-	if d == nil || d.handle == nil {
+	if d == nil {
+		return 0
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.handle == nil {
 		return 0
 	}
 	return uint(C.net_redis_dedup_len(d.handle))
@@ -160,7 +209,12 @@ func (d *RedisStreamDedup) Len() uint {
 // Capacity returns the configured LRU capacity. Returns 0 on a
 // closed/nil helper.
 func (d *RedisStreamDedup) Capacity() uint {
-	if d == nil || d.handle == nil {
+	if d == nil {
+		return 0
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.handle == nil {
 		return 0
 	}
 	return uint(C.net_redis_dedup_capacity(d.handle))
@@ -169,7 +223,12 @@ func (d *RedisStreamDedup) Capacity() uint {
 // IsEmpty returns true if no ids are tracked yet. Also returns
 // true on a closed/nil helper (mirrors the "no ids" semantic).
 func (d *RedisStreamDedup) IsEmpty() bool {
-	if d == nil || d.handle == nil {
+	if d == nil {
+		return true
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.handle == nil {
 		return true
 	}
 	return C.net_redis_dedup_is_empty(d.handle) == 1
@@ -179,7 +238,12 @@ func (d *RedisStreamDedup) IsEmpty() bool {
 // rebalance to reset the dedup window without losing the helper
 // instance.
 func (d *RedisStreamDedup) Clear() {
-	if d == nil || d.handle == nil {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.handle == nil {
 		return
 	}
 	C.net_redis_dedup_clear(d.handle)

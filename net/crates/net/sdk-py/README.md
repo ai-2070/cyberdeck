@@ -124,7 +124,7 @@ node = NetNode(
     mesh_peer_public_key='...',
 )
 
-# Persistent producer nonce (BUG #56) — required for cross-restart
+# Persistent producer nonce — required for cross-restart
 # dedup against JetStream / Redis adapters. The bus loads (or
 # creates on first run) a u64 nonce at this path and stamps it on
 # every batch, so retries from a crashed-and-restarted producer

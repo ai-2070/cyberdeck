@@ -27,9 +27,13 @@
 //! void   net_redis_dedup_clear(net_redis_dedup_t*);
 //! ```
 //!
-//! `capacity == 0` is clamped to `1` (matches the Rust helper).
-//! NULL handles return `-1` from any operation; callers can treat
-//! that as a hard error and abort.
+//! `capacity == 0` selects the helper default (4096) — matches
+//! `RedisStreamDedup::new()`. Callers that need a tiny LRU should
+//! pass `1` explicitly. NULL-handle behavior is operation-specific:
+//! `is_duplicate` and `is_empty` return `-1`; `len` and `capacity`
+//! return `0`; `clear` and `free` are no-ops. (Cubic-ai P3: pre-fix
+//! this comment claimed "clamped to 1" and "NULL → -1 from any
+//! operation," neither of which matches the implementation.)
 //!
 //! # Thread safety
 //!

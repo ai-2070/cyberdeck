@@ -422,8 +422,7 @@ async fn stranded_flush_uses_bus_producer_nonce() {
             obs.process_nonce, first_nonce,
             "batch {i} (shard {}, seq {}, len {}) stamped a different \
              nonce ({:#x}) than the first batch ({:#x}) — the \
-             stranded-flush path must use the bus's producer_nonce \
-             (BUG #56 + #153 interaction)",
+             stranded-flush path must use the bus's producer_nonce",
             obs.shard_id, obs.sequence_start, obs.len, obs.process_nonce, first_nonce,
         );
     }

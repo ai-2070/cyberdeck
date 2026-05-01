@@ -299,9 +299,9 @@ emission is forwarded through instead of dropped — see
 The Net Redis adapter writes a stable `dedup_id` field on every
 XADD entry: `{producer_nonce:hex}:{shard_id}:{sequence_start}:{i}`.
 Combined with the bus's persistent producer-nonce path
-(`producer_nonce_path` on `EventBusConfig`, BUG #56), the id is
+(`producer_nonce_path` on `EventBusConfig`), the id is
 stable across both within-process retries AND cross-process
-restart — the `MULTI/EXEC`-timeout race (BUG #57) becomes
+restart — the `MULTI/EXEC`-timeout race becomes
 filterable at consume time.
 
 `RedisStreamDedup` is the consumer-side helper, exposed on the
@@ -312,12 +312,18 @@ from net import RedisStreamDedup
 import redis
 
 # ~10k events/sec * 1 min dedup window → ~600,000.
-dedup = RedisStreamDedup(capacity=64_000)
+dedup = RedisStreamDedup(capacity=600_000)
 
 r = redis.Redis(host="localhost", port=6379)
 cursor = "0"
 while True:
-    entries = r.xrange("net:shard:0", min=cursor, max="+", count=100)
+    # XRANGE bounds are INCLUSIVE on both ends. After the first
+    # page we must use the exclusive form `(<id>` so we don't
+    # re-read the entry the cursor points at — a vanilla
+    # `min=cursor` loop spins forever once the cursor reaches the
+    # tail and the same entry is returned every iteration.
+    start = cursor if cursor == "0" else f"({cursor}"
+    entries = r.xrange("net:shard:0", min=start, max="+", count=100)
     for entry_id, fields in entries:
         dedup_id = fields.get(b"dedup_id", b"").decode()
         if not dedup_id:
@@ -350,9 +356,6 @@ question against an in-memory LRU. Concurrency: each handle
 wraps a Rust `Mutex<RedisStreamDedup>`, so concurrent calls from
 multiple Python threads are safe but serialize. Production-shape
 is one helper per consumer thread.
-
-Background: [`docs/BUG_AUDIT_2026_04_30_CORE.md`](../../docs/BUG_AUDIT_2026_04_30_CORE.md)
-entries #56 and #57.
 
 ## Security Surface (Stage A–E)
 

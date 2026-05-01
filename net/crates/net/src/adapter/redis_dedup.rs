@@ -52,6 +52,7 @@
 
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::rc::Rc;
 
 /// LRU-bounded set of recently-seen `dedup_id` strings.
 ///
@@ -59,12 +60,27 @@ use std::collections::VecDeque;
 /// `capacity * (avg_id_len + per-entry overhead)`. With the
 /// default 4096 capacity and ~24-byte ids, that's ~100 KiB —
 /// noise for any non-embedded consumer.
+///
+/// Cubic-ai P2: ids are stored as `Rc<str>` so the queue and the
+/// lookup index can share one underlying allocation per id. The
+/// pre-fix shape stored two `String`s (one in `order`, one in
+/// `seen`), costing two allocations + a `memcpy` on every new
+/// `is_duplicate` call. With `Rc<str>`, insert is one allocation
+/// + a refcount bump.
+///
+/// `RedisStreamDedup` is `!Sync` (the `Rc` is shared internally),
+/// matching the documented "wrap in `Mutex` if multiple consumer
+/// threads share the same window" contract — switching the storage
+/// to `Arc<str>` would gain nothing (each helper instance is
+/// single-threaded by construction).
 pub struct RedisStreamDedup {
-    /// Insertion-ordered queue, used for LRU eviction.
-    order: VecDeque<String>,
-    /// Lookup index. Holds the same strings as `order` (cloned)
-    /// so membership checks don't need to scan the deque.
-    seen: HashSet<String>,
+    /// Insertion-ordered queue, used for LRU eviction. Each entry
+    /// is `Rc::clone`-shared with `seen` so we don't pay a second
+    /// allocation per insert.
+    order: VecDeque<Rc<str>>,
+    /// Lookup index. Shares its `Rc<str>` entries with `order` —
+    /// every id lives in exactly one heap allocation, refcounted.
+    seen: HashSet<Rc<str>>,
     /// Maximum number of distinct ids tracked. Older ids are
     /// evicted on insert when the set is at capacity.
     capacity: usize,
@@ -132,27 +148,34 @@ impl RedisStreamDedup {
     /// }
     /// ```
     pub fn is_duplicate(&mut self, dedup_id: &str) -> bool {
+        // Lookup uses the `Borrow<str>` impl on `Rc<str>`, so we
+        // can probe the set with the borrowed `&str` — no
+        // allocation on the duplicate (hot) path.
         if self.seen.contains(dedup_id) {
             return true;
         }
 
         // Evict the oldest id if we're at capacity. The eviction
         // is amortized O(1) — `pop_front` on `VecDeque` and
-        // `remove` on the `HashSet`. The `seen` set holds the
-        // same strings as `order`; both are kept consistent.
+        // `remove` on the `HashSet`. Both containers hold the
+        // SAME `Rc<str>`; popping the queue drops one strong
+        // count, and the set's `remove` drops the other, freeing
+        // the underlying allocation.
         if self.seen.len() >= self.capacity {
             if let Some(evicted) = self.order.pop_front() {
                 self.seen.remove(&evicted);
             }
         }
 
-        // Insert. We allocate one `String` for the id, shared by
-        // the queue and the set (cheap clone — small refcounted
-        // alloc). This is the only allocation per is_duplicate
-        // call on the not-yet-seen path.
-        let id_owned = dedup_id.to_owned();
-        self.order.push_back(id_owned.clone());
-        self.seen.insert(id_owned);
+        // Insert. ONE heap allocation per new id (`Rc::from(&str)`
+        // copies the bytes once into a refcounted slice). The
+        // `Rc::clone` on the next line is a refcount bump, not
+        // an allocation. Pre-fix this path did two allocations:
+        // `to_owned()` for the lookup-set entry plus a separate
+        // `.clone()` (= alloc + memcpy) for the queue entry.
+        let id: Rc<str> = Rc::from(dedup_id);
+        self.order.push_back(Rc::clone(&id));
+        self.seen.insert(id);
         false
     }
 
