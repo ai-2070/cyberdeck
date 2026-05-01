@@ -77,8 +77,13 @@ jobs:
         run: npm i
 
       - name: Build native module
+        # `--features` is already baked into the `build` script in
+        # package.json (redis,net,cortex,compute,groups). Don't pass
+        # it again here — `@napi-rs/cli` 3.x forwards the second
+        # `--features <name>` to cargo as a positional, and cargo
+        # rejects it with "unexpected argument 'name' found".
         run: |
-          npm run build -- --target ${{ matrix.target }} --features redis
+          npm run build -- --target ${{ matrix.target }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
