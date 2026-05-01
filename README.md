@@ -472,13 +472,21 @@ Net is a working protocol, not a paper design. ~1,573 unit tests plus ~469 integ
 
 All SDKs wrap the same Rust core. The SDK is the developer experience, the engine is Rust.
 
-| SDK | Package | Docs |
-|-----|---------|------|
-| **Rust** | [`net-sdk`](net/crates/net/sdk) | [README](net/crates/net/sdk/README.md) |
-| **TypeScript** | [`@ai2070/net-sdk`](net/crates/net/sdk-ts) | [README](net/crates/net/sdk-ts/README.md) |
-| **Python** | [`net-sdk`](net/crates/net/sdk-py) | [README](net/crates/net/sdk-py/README.md) |
-| **C** | [`net.h`](net/crates/net/include/net.h) | [README](net/crates/net/include/README.md) |
-| **Go** | [`net`](net/crates/net/bindings/go) | [README](net/crates/net/bindings/go/README.md) |
+| SDK | Package | Install |
+|-----|---------|---------|
+| **Rust** | [`ai2070-net-sdk`](https://crates.io/crates/ai2070-net-sdk) ([source](net/crates/net/sdk)) | `cargo add ai2070-net-sdk` |
+| **TypeScript** | [`@ai2070/net-sdk`](https://www.npmjs.com/package/@ai2070/net-sdk) ([source](net/crates/net/sdk-ts)) | `npm install @ai2070/net-sdk @ai2070/net` |
+| **Python** | [`ai2070-net-sdk`](https://pypi.org/project/ai2070-net-sdk/) ([source](net/crates/net/sdk-py)) | `pip install ai2070-net-sdk` |
+| **C** | [`net.h`](net/crates/net/include/net.h) | `cargo build --release --features ffi,net` (build cdylib + bundle the header) |
+| **Go** | [`net`](net/crates/net/bindings/go) | `go get github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net` |
+
+Lower-level bindings (skip the SDK ergonomics, talk directly to the engine):
+
+| Binding | Package | Install |
+|---------|---------|---------|
+| **Rust core** | [`ai2070-net`](https://crates.io/crates/ai2070-net) | `cargo add ai2070-net` |
+| **Node binding** | [`@ai2070/net`](https://www.npmjs.com/package/@ai2070/net) | `npm install @ai2070/net` |
+| **Python binding** | [`ai2070-net`](https://pypi.org/project/ai2070-net/) | `pip install ai2070-net` |
 
 ## Benchmarks
 

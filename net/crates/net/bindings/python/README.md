@@ -5,8 +5,10 @@ High-performance, schema-agnostic event bus for AI runtime workloads.
 ## Installation
 
 ```bash
-pip install net
+pip install ai2070-net
 ```
+
+The package publishes as `ai2070-net` on PyPI but imports as `from net import ...` (the in-source module name is preserved). For the higher-level Pythonic surface (generators, typed channels, dataclass/Pydantic support), install [`ai2070-net-sdk`](../../sdk-py/) instead — it depends on this package.
 
 ## Quick Start
 

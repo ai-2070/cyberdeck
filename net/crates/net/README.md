@@ -732,13 +732,15 @@ net = { path = ".", features = ["net"] }
 
 All SDKs wrap the same Rust core. Every language gets the same performance.
 
-| SDK | Package | Docs | Highlights |
-|-----|---------|------|------------|
-| **Rust** | [`net-sdk`](sdk/) | [README](sdk/README.md) | Builder pattern, async streams, typed subscriptions |
-| **TypeScript** | [`@ai2070/net-sdk`](sdk-ts/) | [README](sdk-ts/README.md) | AsyncIterator, typed channels, Zod support |
-| **Python** | [`net-sdk`](sdk-py/) | [README](sdk-py/README.md) | Generators, dataclass/Pydantic, context manager |
-| **Go** | [`net`](bindings/go/) | [README](bindings/go/README.md) | CGO bindings, zero allocations on raw ingest |
-| **C** | [`net.h`](include/net.h) | [README](include/README.md) | One header, structured types, zero JSON overhead |
+| SDK | Package | Install | Highlights |
+|-----|---------|---------|------------|
+| **Rust** | [`ai2070-net-sdk`](https://crates.io/crates/ai2070-net-sdk) | `cargo add ai2070-net-sdk` | Builder pattern, async streams, typed subscriptions |
+| **TypeScript** | [`@ai2070/net-sdk`](https://www.npmjs.com/package/@ai2070/net-sdk) | `npm install @ai2070/net-sdk @ai2070/net` | AsyncIterator, typed channels, Zod support |
+| **Python** | [`ai2070-net-sdk`](https://pypi.org/project/ai2070-net-sdk/) | `pip install ai2070-net-sdk` | Generators, dataclass/Pydantic, context manager |
+| **Go** | [`net`](bindings/go/) | `go get github.com/ai-2070/cyberdeck/net/crates/net/bindings/go/net` | CGO bindings, zero allocations on raw ingest |
+| **C** | [`net.h`](include/net.h) | `cargo build --release --features ffi,net` then bundle the header | One header, structured types, zero JSON overhead |
+
+The Rust SDK imports as `use net_sdk::...`; the TypeScript SDK as `from '@ai2070/net-sdk'`; the Python SDK as `from net_sdk import ...`. The Rust core (`ai2070-net`), Node binding (`@ai2070/net`), and Python binding (`ai2070-net`) are the lower-level packages — useful when you want to skip the SDK ergonomics. Crate / module names inside the code (`net::`, `net._net`) stayed stable across the rename via package aliasing.
 
 ### Rust
 

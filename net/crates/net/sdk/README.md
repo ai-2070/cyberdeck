@@ -6,12 +6,26 @@ The core `net` crate is the engine. This SDK is what Rust developers import.
 
 ## Install
 
-```toml
-[dependencies]
-net-sdk = { path = "sdk" }
+```bash
+cargo add ai2070-net-sdk
 ```
 
+Or in `Cargo.toml`:
+
+```toml
+[dependencies]
+ai2070-net-sdk = "0.8"
+```
+
+The crate publishes as `ai2070-net-sdk` on crates.io but imports as `use net_sdk::...` (the in-source crate name is preserved via package aliasing).
+
 Features: `redis`, `jetstream`, `net` (mesh transport), `nat-traversal` (classifier + `connect_direct`, opt-in), `port-mapping` (NAT-PMP + UPnP, opt-in), `cortex` (event-sourced tasks/memories + NetDb), `compute` (daemons + migration), `groups` (replica / fork / standby), `local` (bundles `net` + `cortex` + `compute` + `groups`), `full` (bundles `local` + `redis` + `jetstream`). NAT features stay opt-in — they are *not* pulled in by `full`.
+
+```bash
+cargo add ai2070-net-sdk --features full        # everything bundled
+cargo add ai2070-net-sdk --features local       # mesh + storage, no external transports
+cargo add ai2070-net-sdk --features net,redis   # mesh + Redis Streams adapter
+```
 
 ## Quick Start
 

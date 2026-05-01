@@ -7,10 +7,10 @@ Wraps the `net` PyO3 bindings with generators, typed events, typed channels, and
 ## Install
 
 ```bash
-pip install net-sdk
+pip install ai2070-net-sdk
 ```
 
-Requires the `net` native package (PyO3 bindings).
+The package publishes as `ai2070-net-sdk` on PyPI but imports as `from net_sdk import ...` (the in-source module name is preserved). The native binding `ai2070-net` is pulled in transitively as a dependency.
 
 ## Quick Start
 
