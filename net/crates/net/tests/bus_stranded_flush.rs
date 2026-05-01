@@ -51,6 +51,10 @@ struct BatchObservation {
     shard_id: u16,
     sequence_start: u64,
     len: usize,
+    /// Stamped by the bus from its loaded `producer_nonce` (BUG #56).
+    /// Recorded so tests can pin that the stranded-flush path uses
+    /// the same nonce as the worker batches.
+    process_nonce: u64,
 }
 
 type BatchHandle = Arc<Mutex<Vec<BatchObservation>>>;
@@ -107,6 +111,7 @@ impl Adapter for RecordingAdapter {
             shard_id,
             sequence_start,
             len,
+            process_nonce: batch.process_nonce,
         });
         Ok(())
     }
@@ -335,6 +340,95 @@ impl Adapter for SlowRecordingAdapter {
     fn name(&self) -> &'static str {
         "slow_recording"
     }
+}
+
+/// Pin BUG #56 + BUG #153 interaction: when the bus is configured
+/// with a persistent `producer_nonce_path`, the stranded-flush
+/// batch (constructed in `remove_shard_internal`) MUST stamp the
+/// same `process_nonce` as the worker's own batches. JetStream's
+/// `Nats-Msg-Id` keys dedup on this nonce; a stranded batch with a
+/// different nonce would land outside the producer-identity dedup
+/// scope and cross-restart retries wouldn't recognize it as a
+/// duplicate of the prior incarnation's stranded events.
+///
+/// The fix at `bus.rs::remove_shard_internal` uses `Batch::with_nonce(..., self.producer_nonce)`;
+/// a future refactor that reverted to `Batch::new` (which calls the
+/// per-process fallback `batch_process_nonce()`) would silently
+/// regress this for buses configured with a persistent path.
+///
+/// We use the same `SlowRecordingAdapter` pattern from the BUG
+/// #153 test below to actually exercise the stranded-flush path
+/// — without back-pressure on the worker pipeline `flush()`
+/// drains the ring buffer cleanly and `remove_shard_internal`'s
+/// `if !stranded.is_empty()` block doesn't run.
+#[tokio::test]
+async fn stranded_flush_uses_bus_producer_nonce() {
+    let (recording, batches, _msg_ids) = RecordingAdapter::new();
+    let slow = SlowRecordingAdapter {
+        inner: recording,
+        delay: Duration::from_millis(5),
+    };
+
+    // Per-test temp file so concurrent runs don't collide.
+    let mut nonce_path = std::env::temp_dir();
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    nonce_path.push(format!("net-test-stranded-nonce-{pid}-{nanos}"));
+
+    let policy = ScalingPolicy {
+        min_shards: 1,
+        max_shards: 16,
+        cooldown: Duration::from_nanos(1),
+        ..Default::default()
+    };
+    let config = EventBusConfig::builder()
+        .num_shards(2)
+        .ring_buffer_capacity(2048)
+        .scaling(policy)
+        .producer_nonce_path(&nonce_path)
+        .build()
+        .unwrap();
+
+    let bus = EventBus::new_with_adapter(config, Box::new(slow))
+        .await
+        .unwrap();
+
+    let added = bus.manual_scale_up(2).await.unwrap();
+    assert_eq!(added.len(), 2);
+
+    // Push events fast enough that the slow adapter backs up the
+    // BatchWorker channel and events accumulate in the ring buffer
+    // — by the time `manual_scale_down` runs, the marked-Draining
+    // shards still have events queued and the stranded-flush
+    // dispatch fires.
+    for i in 0..5_000u64 {
+        let _ = bus.ingest(Event::new(json!({"i": i})));
+    }
+
+    let _ = bus.manual_scale_down(2).await.unwrap();
+    bus.shutdown().await.unwrap();
+
+    let observations = batches.lock().clone();
+    assert!(
+        !observations.is_empty(),
+        "expected the recording adapter to have observed at least one batch",
+    );
+    let first_nonce = observations[0].process_nonce;
+    for (i, obs) in observations.iter().enumerate() {
+        assert_eq!(
+            obs.process_nonce, first_nonce,
+            "batch {i} (shard {}, seq {}, len {}) stamped a different \
+             nonce ({:#x}) than the first batch ({:#x}) — the \
+             stranded-flush path must use the bus's producer_nonce \
+             (BUG #56 + #153 interaction)",
+            obs.shard_id, obs.sequence_start, obs.len, obs.process_nonce, first_nonce,
+        );
+    }
+
+    let _ = std::fs::remove_file(&nonce_path);
 }
 
 /// Pin BUG #153 + #154 directly by *forcing* the stranded-flush path

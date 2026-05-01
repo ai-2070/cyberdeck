@@ -2251,6 +2251,117 @@ mod tests {
         let _ = std::fs::remove_file(&nonce_path);
     }
 
+    /// Pin that ALL spawn sites — both the static initial-shard
+    /// loop in `new_with_adapter` and the dynamic-add path in
+    /// `add_shard_internal` — clone the bus's loaded
+    /// `producer_nonce` correctly. Pre-#56 there was no nonce
+    /// concept at the bus layer; if any future refactor drops the
+    /// `producer_nonce: self.producer_nonce` line from one of the
+    /// spawn sites (or stops loading the persistent path), the
+    /// post-scale-up shard's batches would carry a different nonce
+    /// and JetStream's cross-restart dedup would silently break for
+    /// events ingested into the dynamic shard. Pin all observed
+    /// batches across the static + dynamic shards share the bus's
+    /// nonce.
+    #[tokio::test]
+    async fn multi_shard_bus_stamps_consistent_nonce_across_static_and_dynamic_shards() {
+        let mut nonce_path = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        nonce_path.push(format!("net-test-multi-shard-nonce-{pid}-{nanos}"));
+
+        struct CollectingAdapter {
+            nonces: Arc<parking_lot::Mutex<Vec<u64>>>,
+        }
+        #[async_trait::async_trait]
+        impl crate::adapter::Adapter for CollectingAdapter {
+            async fn init(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn on_batch(&self, batch: Batch) -> Result<(), AdapterError> {
+                self.nonces.lock().push(batch.process_nonce);
+                Ok(())
+            }
+            async fn flush(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn poll_shard(
+                &self,
+                _: u16,
+                _: Option<&str>,
+                _: usize,
+            ) -> Result<crate::adapter::ShardPollResult, AdapterError> {
+                Ok(crate::adapter::ShardPollResult::empty())
+            }
+            fn name(&self) -> &'static str {
+                "collecting"
+            }
+        }
+
+        let nonces = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let policy = ScalingPolicy {
+            min_shards: 1,
+            max_shards: 8,
+            cooldown: Duration::from_nanos(1),
+            ..Default::default()
+        };
+        let config = EventBusConfig::builder()
+            .num_shards(2)
+            .ring_buffer_capacity(1024)
+            .scaling(policy)
+            .producer_nonce_path(&nonce_path)
+            .build()
+            .unwrap();
+
+        let bus = EventBus::new_with_adapter(
+            config,
+            Box::new(CollectingAdapter {
+                nonces: nonces.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Drive the two static shards.
+        for i in 0..200u64 {
+            let _ = bus.ingest(Event::new(json!({"i": i})));
+        }
+        bus.flush().await.unwrap();
+
+        // Add a dynamic shard and drive it too.
+        let _ = bus.manual_scale_up(1).await.unwrap();
+        for i in 200..400u64 {
+            let _ = bus.ingest(Event::new(json!({"i": i})));
+        }
+        bus.flush().await.unwrap();
+
+        bus.shutdown().await.unwrap();
+
+        let observed = nonces.lock().clone();
+        assert!(
+            !observed.is_empty(),
+            "expected the adapter to have observed at least one batch",
+        );
+        let first = observed[0];
+        for (i, &n) in observed.iter().enumerate() {
+            assert_eq!(
+                n, first,
+                "batch {i} stamped a different nonce ({n:#x}) than the first \
+                 batch ({first:#x}) — at least one spawn site (initial-shard \
+                 loop or `add_shard_internal`) failed to inherit the bus's \
+                 producer_nonce (BUG #56)",
+            );
+        }
+
+        let _ = std::fs::remove_file(&nonce_path);
+    }
+
     /// Negative test: without `producer_nonce_path`, two bus
     /// instances produce DIFFERENT nonces. This documents the
     /// at-most-once-across-restart fallback behavior — callers who

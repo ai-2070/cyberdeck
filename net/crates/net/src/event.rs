@@ -735,6 +735,27 @@ mod tests {
     ///   2. Multiple `Batch::new` calls in the same process yield
     ///      the same nonce (so retries within a process land on
     ///      the same dedup key).
+
+    /// Pin that `Batch::with_nonce` writes the passed value into the
+    /// `process_nonce` field. The bus relies on this to stamp the
+    /// loaded persistent nonce on every emitted batch (BUG #56);
+    /// a future refactor that ignored the parameter would silently
+    /// regress JetStream cross-restart dedup.
+    #[test]
+    fn batch_with_nonce_round_trips_the_passed_value() {
+        let events: Vec<InternalEvent> = (0..3)
+            .map(|i| InternalEvent::from_value(serde_json::json!({"i": i}), i, 0))
+            .collect();
+        let nonce: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        let batch = Batch::with_nonce(7, events, 42, nonce);
+        assert_eq!(batch.shard_id, 7);
+        assert_eq!(batch.sequence_start, 42);
+        assert_eq!(
+            batch.process_nonce, nonce,
+            "Batch::with_nonce must write the passed nonce verbatim",
+        );
+    }
+
     #[test]
     fn batch_process_nonce_is_stable_within_process() {
         let nonce_a = batch_process_nonce();
