@@ -145,23 +145,42 @@ impl PersistentProducerNonce {
         }
         let buf = nonce.to_le_bytes();
 
-        // Atomic write: create a sibling tempfile, fsync it, rename
-        // over the target. Concurrent first-loaders racing on the
-        // same path may both create temp files, but only one rename
-        // wins; the loser overwrites the winner with the same bytes
-        // (different nonces since each sampled independently —
-        // last-rename-wins is the intended semantic, callers MUST
-        // serialize the first-create externally if they care).
-        // The probability of two-process race here is vanishingly
-        // small in practice (caller is the bus's `new` path, which
-        // runs once at startup); we don't add a lockfile because
-        // the more common-by-far failure mode is a stale
-        // tempfile from a prior crashed init, which `fs::rename`
-        // happily overwrites.
+        // Atomic write: create a per-call-unique sibling tempfile,
+        // fsync it, rename over the target.
+        //
+        // Cubic-ai P1: pre-fix the tempfile was always `<path>.tmp`,
+        // a fixed sibling. Concurrent first-loaders racing on the
+        // same path (two threads in one process, OR two daemons
+        // misconfigured to point at the same nonce file) both wrote
+        // to the same tempfile; the writes could interleave at the
+        // OS layer and produce a corrupted 8-byte sequence, or one
+        // rename would `ENOENT` because the other already moved the
+        // tempfile, surfacing as a load_or_create failure. Either
+        // outcome breaks startup. The fix: stamp the tempfile name
+        // with `pid + tid + nanos` so each caller writes to its own
+        // file. Last rename still wins (intended semantic — the
+        // first-loader race is rare and the cap on nonce divergence
+        // is "different per call" anyway, since each call samples
+        // fresh entropy), but each renamed file is now a complete,
+        // valid 8-byte nonce — no interleaved-write corruption.
         let tmp_path = {
+            use std::hash::{Hash, Hasher};
             let mut p = path.clone();
             let mut name = p.file_name().map(|n| n.to_os_string()).unwrap_or_default();
-            name.push(".tmp");
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let mut tid_hasher = std::collections::hash_map::DefaultHasher::new();
+            std::thread::current().id().hash(&mut tid_hasher);
+            let tid = tid_hasher.finish();
+            // Mix in the freshly-sampled nonce too so the tempfile
+            // name is unique even if the wall clock tick is shared
+            // and the same thread retries (e.g., after a stale
+            // tempfile cleanup). The nonce is the load-bearing
+            // entropy source; this just borrows it for naming.
+            name.push(format!(".{pid}.{tid:x}.{nanos}.{nonce:x}.tmp"));
             p.set_file_name(name);
             p
         };
@@ -176,6 +195,11 @@ impl PersistentProducerNonce {
         if let Ok(f) = fs::File::open(&tmp_path) {
             let _ = f.sync_all();
         }
+        // `fs::rename` is `MoveFileEx(MOVEFILE_REPLACE_EXISTING)` on
+        // Windows / `rename(2)` on Unix — atomic replace on POSIX,
+        // best-effort on Windows. Per-call-unique source means the
+        // rename can't race against a sibling's rename (each
+        // `tmp_path` is its own file).
         fs::rename(&tmp_path, &path)?;
 
         Ok(Self { nonce, path })
@@ -278,6 +302,86 @@ mod tests {
         );
         let _ = fs::remove_file(&a);
         let _ = fs::remove_file(&b);
+    }
+
+    /// Cubic-ai P1: concurrent first-loaders against the SAME path
+    /// must not corrupt the on-disk nonce or fail startup. Pre-fix
+    /// every caller wrote to `<path>.tmp`, so two threads racing
+    /// the first-create could either:
+    ///   - interleave writes at the OS layer (resulting in a
+    ///     corrupted 8-byte sequence — our `from_le_bytes` would
+    ///     decode garbage, or a future length check would reject),
+    ///   - or one's `fs::rename` would ENOENT because the other
+    ///     already moved the tempfile (surfacing as
+    ///     `load_or_create` failure → `EventBus::new` failure).
+    ///
+    /// The test races N threads on a single path. Each MUST return
+    /// successfully; the resulting on-disk file MUST be exactly 8
+    /// bytes (no corruption); and a subsequent `load_or_create`
+    /// MUST decode a non-zero u64 (cross-thread last-rename-wins
+    /// stable state). Any pre-fix interleave or ENOENT would surface
+    /// as a panic in one of the threads.
+    #[test]
+    fn concurrent_first_load_does_not_corrupt_or_fail() {
+        use std::sync::Arc;
+        use std::thread;
+
+        const N: usize = 16;
+        let path = Arc::new(temp_path("concurrent-first-load"));
+
+        let barrier = Arc::new(std::sync::Barrier::new(N));
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let path = Arc::clone(&path);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                // Pre-fix this could panic on `fs::rename` ENOENT
+                // when another thread already moved the shared
+                // tempfile. Post-fix every thread owns its own
+                // tempfile, so every load_or_create returns Ok.
+                PersistentProducerNonce::load_or_create(&*path)
+                    .expect("concurrent first-load must succeed")
+                    .nonce()
+            }));
+        }
+        let nonces: Vec<u64> = handles
+            .into_iter()
+            .map(|h| h.join().expect("worker must not panic"))
+            .collect();
+
+        // Every thread got a non-zero nonce.
+        assert!(
+            nonces.iter().all(|&n| n != 0),
+            "every concurrent first-loader must observe a non-zero nonce, \
+             got: {nonces:?}",
+        );
+
+        // The on-disk file is exactly 8 bytes — no interleaved-write
+        // corruption. (Pre-fix two threads could write to the same
+        // tempfile and the OS could split their writes mid-byte; the
+        // resulting file might be 4 + 4 bytes from different nonces.)
+        let on_disk = fs::read(&*path).expect("path must exist after concurrent first-load");
+        assert_eq!(
+            on_disk.len(),
+            NONCE_FILE_LEN,
+            "on-disk nonce must be exactly 8 bytes (no interleaved-write corruption)",
+        );
+
+        // A subsequent load returns the nonce of whichever thread
+        // won the last rename — and it MUST equal one of the
+        // observed nonces. (If we got a value none of the threads
+        // produced, the file is corrupt.)
+        let post_load = PersistentProducerNonce::load_or_create(&*path)
+            .unwrap()
+            .nonce();
+        assert!(
+            nonces.contains(&post_load),
+            "post-load nonce {post_load:#x} must match one of the in-race \
+             samples {nonces:?} — anything else implies corruption",
+        );
+
+        let _ = fs::remove_file(&*path);
     }
 
     #[test]

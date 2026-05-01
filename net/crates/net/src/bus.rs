@@ -2366,16 +2366,22 @@ mod tests {
         let _ = std::fs::remove_file(&nonce_path);
     }
 
-    /// Negative test: without `producer_nonce_path`, two bus
-    /// instances produce DIFFERENT nonces. This documents the
-    /// at-most-once-across-restart fallback behavior — callers who
-    /// need cross-restart dedup must configure the path.
+    /// Pin the within-process caching contract for the fallback
+    /// (no-`producer_nonce_path`) path: two bus instances created
+    /// in the same process see the SAME `batch_process_nonce()`
+    /// because the helper is `OnceLock`-cached. The
+    /// "different-across-restarts" semantic is a *process-level*
+    /// guarantee — restart the process to get a fresh nonce — and
+    /// is pinned by `persistent_producer_nonce_survives_bus_restart`
+    /// (which uses a path; the without-path branch of #56 has no
+    /// cross-restart guarantee by design).
     ///
-    /// (The probability of two `batch_process_nonce()` samples
-    /// collapsing to the same u64 is ~2^-63 — if this test ever
-    /// flakes, suspect entropy collapse, not a real regression.)
+    /// Cubic-ai P3: this test was previously named
+    /// `process_nonce_fallback_differs_across_bus_instances`, which
+    /// contradicted its own assertion (`assert_eq!(n_a, n_b)`).
+    /// Renamed to match what it actually pins.
     #[tokio::test]
-    async fn process_nonce_fallback_differs_across_bus_instances() {
+    async fn process_nonce_fallback_is_cached_within_process() {
         struct NonceRecordingAdapter {
             nonce: Arc<parking_lot::Mutex<Option<u64>>>,
         }
