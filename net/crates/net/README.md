@@ -518,6 +518,29 @@ NetDB ships the same surface on Rust, Node (`@ai2070/net` napi bindings), and Py
 
 ## Module Map
 
+Top-level `src/` is the event-bus core; the heavy mesh code lives under `adapter/net/`.
+
+```
+src/
+├── lib.rs                 # Crate root, re-exports
+├── config.rs              # EventBusConfig, AdapterConfig, ScalingPolicy
+├── error.rs               # Crate-wide error types
+├── event.rs               # Event, Batch, StoredEvent
+├── timestamp.rs           # TimestampGenerator (per-shard monotonic)
+├── bus/                   # EventBus orchestrator over shards + adapters
+├── shard/                 # SPSC ring buffers, batch assembly, ShardManager
+├── consumer/              # Cross-shard poll merging, JSON-predicate filtering
+├── ffi/                   # C ABI for Python / Node / Go / C consumers
+└── adapter/               # Pluggable durability backends (see below)
+    ├── mod.rs             #   Adapter trait, dispatch
+    ├── noop.rs            #   NoopAdapter (testing / benchmarking)
+    ├── dedup_state.rs     #   PersistentProducerNonce — cross-restart producer identity
+    ├── redis.rs           #   RedisAdapter (feature `redis`)
+    ├── redis_dedup.rs     #   RedisStreamDedup (feature `redis`)
+    ├── jetstream.rs       #   JetStreamAdapter (feature `jetstream`)
+    └── net/               #   NetAdapter — UDP mesh transport (feature `net`)
+```
+
 ```
 src/adapter/net/
 ├── mod.rs                 # NetAdapter, routing utilities
@@ -648,6 +671,7 @@ src/adapter/net/
 │   ├── config.rs          #   CortexAdapterConfig, StartPosition, FoldErrorPolicy
 │   ├── error.rs           #   CortexAdapterError
 │   ├── adapter.rs         #   CortexAdapter<State>: fold task, wait_for_seq, changes() broadcast
+│   ├── watermark.rs       #   WatermarkingFold — discovers per-origin app_seq during replay
 │   │
 │   ├── tasks/             # First CortEX model — mutate-by-id CRUD (feature `cortex`)
 │   │   ├── types.rs       #     Task, TaskStatus, TaskId + serde payload structs
@@ -864,51 +888,51 @@ cargo build --release --all-features
 ## Tests
 
 ```bash
-# Unit tests (944 with every cortex/redex/netdb feature on)
-cargo test --lib --features "net redex redex-disk cortex netdb"
+# Unit tests (~1,573 with every feature on)
+cargo test --all-features --lib
 
 # Migration & group integration tests (53 tests)
 cargo test --test migration_integration --features net
 
-# Three-node mesh integration tests (65 tests)
+# Three-node mesh integration tests (66 tests)
 cargo test --test three_node_integration --features net
 
 # Two-node transport integration (13 tests)
 cargo test --test integration_net --features net
 
-# RedEX integration tests (22 tests: heap + persistent + age retention + ordered appender + typed wrappers)
+# RedEX integration tests (27 tests: heap + persistent + age retention + ordered appender + typed wrappers)
 cargo test --test integration_redex --features "redex redex-disk"
 
-# CortEX adapter core (8 tests)
+# CortEX adapter core (9 tests)
 cargo test --test integration_cortex_adapter --features cortex
 
-# CortEX tasks model (17 tests: CRUD + query + watch + replay + snapshot)
+# CortEX tasks model (32 tests: CRUD + query + watch + replay + snapshot)
 cargo test --test integration_cortex_tasks --features cortex
 
-# CortEX memories model (14 tests: CRUD + tag queries + watch + coexistence + snapshot)
+# CortEX memories model (25 tests: CRUD + tag queries + watch + coexistence + snapshot)
 cargo test --test integration_cortex_memories --features cortex
 
-# NetDB unified façade (9 tests: build, CRUD, filters, whole-db snapshot/restore)
+# NetDB unified façade (13 tests: build, CRUD, filters, whole-db snapshot/restore)
 cargo test --test integration_netdb --features netdb
 
 # Rust SDK smoke tests (2 async + 3 doctests)
 cargo test --features net -p net-sdk
 
-# Node SDK smoke tests (36 tests — CortEX tasks + memories over napi, incl. watch/AsyncIterator, disk durability, snapshot/restore round-trip, NetDb handle, and classified CortexError/NetDbError from @ai2070/net/errors)
+# Node SDK smoke tests (62 tests — CortEX tasks + memories over napi, plus ABI stability, errors, NetDb handle, RedEX, and integration coverage. Includes watch/AsyncIterator, disk durability, snapshot/restore round-trip, and classified CortexError/NetDbError from @ai2070/net/errors)
 cd bindings/node && npx napi build --platform --no-default-features -F cortex && npx vitest run
 
-# Python SDK smoke tests (33 tests — CortEX tasks + memories via PyO3, incl. sync watch iterators, disk durability, snapshot/restore round-trip, NetDb handle, and typed CortexError / NetDbError from net._net)
+# Python SDK smoke tests (~190 collected — CortEX, NetDB, RedEX, channels + auth, capabilities, identity, compute + groups, snapshot/watch, subnets, ABI stability, and the Redis dedup helper. Total varies by enabled features.)
 cd bindings/python && uv venv .venv && source .venv/bin/activate && \
     uv pip install -e '.[test]' maturin && \
-    maturin develop --no-default-features --features cortex && \
-    python -m pytest tests/test_cortex.py tests/test_netdb.py
+    maturin develop && \
+    python -m pytest
 
 # Backend adapters (requires running services)
 cargo test --test integration_redis --features redis
 cargo test --test integration_jetstream --features jetstream
 ```
 
-**1,146 tests total across the Rust stack** — lib (944) + migration (53) + three_node (65) + integration_net (13) + integration_redex (22) + integration_cortex_{adapter,tasks,memories} (8+17+14) + integration_netdb (9) + SDK doctest (1). Plus 36 Node SDK smoke tests (vitest) and 33 Python SDK smoke tests (pytest), both covering CRUD, filtered queries, reactive watchers, multi-model coexistence, disk-durability round-trips, whole-db `NetDb` snapshot/restore, per-adapter `open_from_snapshot`, and classified `CortexError` / `NetDbError` via the `@ai2070/net/errors` subpath (Node) / `net._net` module (Python) — all via the `cortex` / `netdb` features (which pull in `redex-disk`).
+**~1,811 tests total across the Rust stack** — lib (1,573) + migration (53) + three_node (66) + integration_net (13) + integration_redex (27) + integration_cortex_{adapter,tasks,memories} (9+32+25) + integration_netdb (13). Plus 62 Node SDK smoke tests (vitest) and ~190 Python SDK smoke tests (pytest), both covering CRUD, filtered queries, reactive watchers, multi-model coexistence, disk-durability round-trips, whole-db `NetDb` snapshot/restore, per-adapter `open_from_snapshot`, and classified `CortexError` / `NetDbError` via the `@ai2070/net/errors` subpath (Node) / `net._net` module (Python).
 
 ### Test Architecture
 
@@ -973,9 +997,10 @@ cargo bench --bench parallel
 | `0x0600` | Subprotocol negotiation |
 | `0x0700..0x0702` | Continuity / fork announce / continuity proof |
 | `0x0800..0x0801` | Partition / reconciliation |
-| `0x0900` | Replica group coordination (reserved) |
+| `0x0900` | Replica group coordination |
 | `0x0A00` | Channel membership (subscribe / unsubscribe / ack) |
 | `0x0B00` | Stream credit window (v2 backpressure — receiver→sender grants, 12-byte fixed message; see [`STREAM_BACKPRESSURE_PLAN_V2.md`](docs/STREAM_BACKPRESSURE_PLAN_V2.md)) |
+| `0x0C00` | Capability announcement (signed capability broadcast for find_nodes / scope filtering) |
 | `0x0D00` | NAT reflex probe (request / response, `nat-traversal` feature) |
 | `0x0D01` | NAT rendezvous (`PunchRequest` / `PunchIntroduce` / `PunchAck`, `nat-traversal` feature) |
 | `0x1000..0xEFFF` | Vendor / third-party |
