@@ -1,0 +1,25 @@
+net/crates/net/src/adapter/net/continuity/cone.rs
+  64958cb6fb55fe73 396-454
+net/crates/net/src/bus.rs
+  64958cb6fb55fe73 1017-1024,1029,1318-1348,2233-2362
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "92f87d3b90c5db777ed57df7bdf781a8807a70d8",
+  "prompts": {
+    "64958cb6fb55fe73": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e81cf66b-69b3-455c-bab9-06a87305bb12",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 715,
+      "total_deletions": 37,
+      "accepted_lines": 904,
+      "overriden_lines": 0
+    }
+  }
+}

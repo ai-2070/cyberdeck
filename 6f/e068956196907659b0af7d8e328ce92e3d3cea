@@ -1,0 +1,23 @@
+net/crates/net/docs/BUG_130_HORIZON_BLOOM_PLAN.md
+  36b642b129ab4a5e 1-203
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "6fe068956196907659b0af7d8e328ce92e3d3cea",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 203,
+      "total_deletions": 0,
+      "accepted_lines": 203,
+      "overriden_lines": 0
+    }
+  }
+}

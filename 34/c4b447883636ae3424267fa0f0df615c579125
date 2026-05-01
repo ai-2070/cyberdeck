@@ -1,0 +1,31 @@
+net/crates/net/src/bus.rs
+  64958cb6fb55fe73 811-828,993-1016,1020-1027,1236-1256,2097-2198
+net/crates/net/src/event.rs
+  64958cb6fb55fe73 390-392,394-408
+net/crates/net/src/adapter/dedup_state.rs
+  64958cb6fb55fe73 31-47,86-131,193-199,413-418,422-424,443-447,449-450,452-453,461-535
+net/crates/net/src/adapter/net/behavior/metadata.rs
+  64958cb6fb55fe73 1654-1759
+net/crates/net/src/adapter/net/continuity/superposition.rs
+  64958cb6fb55fe73 373-423
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "34c4b447883636ae3424267fa0f0df615c579125",
+  "prompts": {
+    "64958cb6fb55fe73": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e81cf66b-69b3-455c-bab9-06a87305bb12",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 522,
+      "total_deletions": 52,
+      "accepted_lines": 1186,
+      "overriden_lines": 0
+    }
+  }
+}

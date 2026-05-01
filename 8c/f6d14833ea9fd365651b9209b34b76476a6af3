@@ -1,0 +1,31 @@
+net/crates/net/src/adapter/net/mesh.rs
+  87a1155ef08e0372 2474-2479,2481-2488,3341-3342,3345,7342-7348,7374,7384-7388,7390,7393-7396,7400,7419-7421,7423,7428-7432,7643-7647,7655,7661,7677,7681
+net/crates/net/src/adapter/net/mod.rs
+  87a1155ef08e0372 659-663,665-666,858-863
+net/crates/net/src/adapter/net/session.rs
+  87a1155ef08e0372 6,25,628-687,1413-1506
+net/crates/net/docs/HEARTBEAT_UNIFICATION_PLAN.md
+  87a1155ef08e0372 156,159-192
+net/crates/net/src/adapter/net/pool.rs
+  87a1155ef08e0372 34-46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "8cf6d14833ea9fd365651b9209b34b76476a6af3",
+  "prompts": {
+    "87a1155ef08e0372": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b5ea4d3-c78f-41ae-8a52-1fab2ec6aaba",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 12274,
+      "total_deletions": 13427,
+      "accepted_lines": 271,
+      "overriden_lines": 0
+    }
+  }
+}

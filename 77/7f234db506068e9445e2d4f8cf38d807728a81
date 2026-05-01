@@ -1,0 +1,27 @@
+net/crates/net/src/bus.rs
+  36b642b129ab4a5e 2369-2377,2379-2382,2384
+net/crates/net/src/adapter/dedup_state.rs
+  36b642b129ab4a5e 148-165,167,170-183,198-202,307-386
+net/crates/net/src/event.rs
+  36b642b129ab4a5e 389-397,409,788-819
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "777f234db506068e9445e2d4f8cf38d807728a81",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 3947,
+      "total_deletions": 23,
+      "accepted_lines": 174,
+      "overriden_lines": 0
+    }
+  }
+}

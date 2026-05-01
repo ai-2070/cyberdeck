@@ -1,0 +1,23 @@
+net/crates/net/docs/BUG_104_LOCAL_MIGRATION_PLAN.md
+  36b642b129ab4a5e 1-111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "70e5a2711a15765b6d9ee7040782611707a8b1f2",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 320,
+      "total_deletions": 0,
+      "accepted_lines": 320,
+      "overriden_lines": 0
+    }
+  }
+}

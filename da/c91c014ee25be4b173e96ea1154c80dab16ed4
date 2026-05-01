@@ -1,0 +1,25 @@
+net/crates/net/docs/CODE_REVIEW_2026_05_01_BUGFIXES_7.md
+  64958cb6fb55fe73 13,37-55
+net/crates/net/src/adapter/dedup_state.rs
+  64958cb6fb55fe73 31-32,38-47,90-115,427-435,437-441,443,445-451,507
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "dac91c014ee25be4b173e96ea1154c80dab16ed4",
+  "prompts": {
+    "64958cb6fb55fe73": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e81cf66b-69b3-455c-bab9-06a87305bb12",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 984,
+      "total_deletions": 75,
+      "accepted_lines": 755,
+      "overriden_lines": 0
+    }
+  }
+}

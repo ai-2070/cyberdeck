@@ -1,0 +1,31 @@
+net/crates/net/src/adapter/net/behavior/context.rs
+  36b642b129ab4a5e 945-953,961-963,1496-1538
+net/crates/net/src/adapter/net/cortex/memories/query.rs
+  36b642b129ab4a5e 196,202,208,214
+net/crates/net/src/adapter/net/continuity/chain.rs
+  36b642b129ab4a5e 7,248,260-279,298-318,323-332,524-530,537,543,594-710
+net/crates/net/src/adapter/net/cortex/tasks/query.rs
+  36b642b129ab4a5e 159,165,171,177
+net/crates/net/src/adapter/net/behavior/metadata.rs
+  36b642b129ab4a5e 544-555,562-583,1867-1955
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "1d6b234428aa9527603ce2d5b460d01e4a002102",
+  "prompts": {
+    "36b642b129ab4a5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57165cb8-6215-45f0-84f7-e385fbf3db57",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "LZL0",
+      "messages": [],
+      "total_additions": 11037,
+      "total_deletions": 10696,
+      "accepted_lines": 365,
+      "overriden_lines": 0
+    }
+  }
+}
