@@ -721,21 +721,6 @@ mod tests {
         );
     }
 
-    /// Regression: every `Batch` constructed in this process must
-    /// carry the same `process_nonce`. Adapters that persist
-    /// `(shard_id, sequence_start)` for dedup compose it with this
-    /// nonce so two processes that both happen to start sequencing
-    /// at zero (the default after `BatchWorker::new`) don't collide
-    /// on `(shard, 0, 0…)` in the backend's dedup window.
-    ///
-    /// We pin two contracts:
-    ///   1. The nonce is non-zero (a process started at exactly
-    ///      `UNIX_EPOCH` with pid 0 would defeat the XOR — defend
-    ///      against trivially predictable values).
-    ///   2. Multiple `Batch::new` calls in the same process yield
-    ///      the same nonce (so retries within a process land on
-    ///      the same dedup key).
-
     /// Pin that `Batch::with_nonce` writes the passed value into the
     /// `process_nonce` field. The bus relies on this to stamp the
     /// loaded persistent nonce on every emitted batch (BUG #56);
@@ -756,6 +741,21 @@ mod tests {
         );
     }
 
+    /// Regression: every `Batch` constructed in this process via
+    /// `Batch::new` (the per-process-fallback constructor) must
+    /// carry the same `process_nonce`. Adapters that persist
+    /// `(shard_id, sequence_start)` for dedup compose it with this
+    /// nonce so two processes that both happen to start sequencing
+    /// at zero (the default after `BatchWorker::new`) don't collide
+    /// on `(shard, 0, 0…)` in the backend's dedup window.
+    ///
+    /// We pin two contracts:
+    /// 1. The nonce is non-zero (a process started at exactly
+    ///    `UNIX_EPOCH` with pid 0 would defeat the XOR — defend
+    ///    against trivially predictable values).
+    /// 2. Multiple `Batch::new` calls in the same process yield
+    ///    the same nonce (so retries within a process land on the
+    ///    same dedup key).
     #[test]
     fn batch_process_nonce_is_stable_within_process() {
         let nonce_a = batch_process_nonce();
